@@ -167,11 +167,24 @@ impl Resolver<'_> {
             Special::Stop(class) => {
                 Value::Image(self.bounds(|it| it == class, format_args!("{class:?}"))?.1)
             }
-            Special::Section { name, end } => {
-                let (start, stop) = self.bounds(
-                    |it| matches!(it, Class::Named { name: n, .. } if n == name),
-                    format_args!("section `{name}`"),
-                )?;
+            Special::Section { name, end } | Special::WeakSection { name, end } => {
+                let named = |it: &Class| matches!(it, Class::Named { name: n, .. } if n == name);
+                if !self.regions.iter().any(|it| named(&it.class)) {
+                    // No section of the name: the name is undefined, as it is to GNU ld and
+                    // lld, which define it only for an output section that exists. 0 to weak
+                    // references, as any undefined weak symbol (its GOT cell holds 0).
+                    if matches!(special, Special::WeakSection { .. }) {
+                        return Ok(Value::Absolute(0));
+                    }
+                    // alloc: error path
+                    return Err(Why::Special(format!(
+                        "undefined symbol {}: the linker defines it as the {} of section \
+                         `{name}`, and no input has a section `{name}`",
+                        self.symbols.describe(sym),
+                        if *end { "end" } else { "start" },
+                    )));
+                }
+                let (start, stop) = self.bounds(named, format_args!("section `{name}`"))?;
                 Value::Image(if *end { stop } else { start })
             }
             Special::Placed(at) => Value::Image(at(self.regions)),

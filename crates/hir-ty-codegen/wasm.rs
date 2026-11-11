@@ -36,10 +36,10 @@ pub use v128::{INSTRUCTION, Instruction};
 
 use blaze_codegen::wasm as format;
 use cranelift_codegen::{
-    entity::{EntityRef, SecondaryMap},
+    entity::{EntityRef, SecondaryMap, packed_option::PackedOption},
     ir::{
         self, AtomicRmwOp, Block, BlockArg, BlockCall, ExternalName, Function, GlobalValueData,
-        InstructionData, LibCall, Opcode, Signature, Type, Value,
+        InstructionData, LibCall, Opcode, Signature, Type, Value, ValueDef,
         condcodes::{FloatCC, IntCC},
         types,
     },
@@ -514,8 +514,18 @@ struct Lower<'a> {
     /// The locals after the parameters.
     locals: Vec<ValType>,
     param_count: u32,
-    /// The first local of each value, plus one.
+    /// The first local of each value, plus one; [`RELEASED`] once the value's local went back
+    /// to `free`.
     values: SecondaryMap<Value, u32>,
+    /// Which values keep a local for the whole function, and where each other one is last read.
+    lives: Lives,
+    /// The locals no value or temporary holds now, by [`Held`]: the next of that kind takes one.
+    free: [Vec<u32>; Held::COUNT],
+    /// The temporaries the instruction being lowered took, which its end gives back.
+    taken: Vec<(u32, Held)>,
+    /// Whether an instruction is being lowered: a temporary taken outside one (the frame's,
+    /// the next block's) is the function's.
+    in_inst: bool,
     /// The place of each block in the layout, plus one.
     order: SecondaryMap<Block, u32>,
     block_count: u32,
@@ -531,6 +541,106 @@ struct Lower<'a> {
 }
 
 const MEMORY: u32 = 0;
+
+/// [`Lower::values`] of a value whose local was given back after its last read.
+const RELEASED: u32 = u32::MAX;
+
+/// What a local holds, which decides which freed local the next value or temporary may take:
+/// one wasm value, or the two consecutive `i64` of an `i128`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    I32,
+    I64,
+    F32,
+    F64,
+    V128,
+    Pair,
+}
+
+impl Held {
+    const COUNT: usize = 6;
+
+    fn of(class: Class) -> Held {
+        match class {
+            Class::Word(_) => Held::I32,
+            Class::Long => Held::I64,
+            Class::Pair => Held::Pair,
+            Class::F32 => Held::F32,
+            Class::F64 => Held::F64,
+            Class::V128 => Held::V128,
+        }
+    }
+
+    fn wasm(self) -> ValType {
+        match self {
+            Held::I32 => ValType::I32,
+            Held::I64 | Held::Pair => ValType::I64,
+            Held::F32 => ValType::F32,
+            Held::F64 => ValType::F64,
+            Held::V128 => ValType::V128,
+        }
+    }
+}
+
+/// How long each value of a function needs its local.
+///
+/// A WebAssembly function has at most 50 000 locals (the limit every engine has, Wasmtime's
+/// `MAX_WASM_FUNCTION_LOCALS`), and unoptimized code of one long block has more values than
+/// that (sha2's unrolled `compress_block`, built into rust-embed-impl). So a value read only
+/// by instructions of the block that defines it gives its local back after the last of them,
+/// and the next value of its kind takes it. That is sound because each instruction is
+/// lowered whole before the next ([`Lower::inst`]), a block's code runs from its first
+/// instruction to its last with no other block's between, and a value is written before it
+/// is read. A block's parameter, and a value another block reads, keep a local of their own:
+/// `own`.
+struct Lives {
+    own: SecondaryMap<Value, bool>,
+    /// The last instruction that reads the value, or the one that defines it when none does.
+    last: SecondaryMap<Value, PackedOption<ir::Inst>>,
+}
+
+impl Lives {
+    fn of(func: &Function) -> Lives {
+        let mut lives = Lives { own: SecondaryMap::new(), last: SecondaryMap::new() };
+        for block in func.layout.blocks() {
+            for &param in func.dfg.block_params(block) {
+                lives.own[param] = true;
+            }
+            for inst in func.layout.block_insts(block) {
+                for value in func.dfg.inst_values(inst) {
+                    let value = func.dfg.resolve_aliases(value);
+                    match func.dfg.value_def(value) {
+                        ValueDef::Result(def, _) if func.layout.inst_block(def) == Some(block) => {
+                            lives.last[value] = inst.into();
+                        }
+                        _ => lives.own[value] = true,
+                    }
+                }
+                for &result in func.dfg.inst_results(inst) {
+                    if lives.last[result].is_none() {
+                        lives.last[result] = inst.into();
+                    }
+                }
+            }
+        }
+        lives
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: no local is given back, as before values shared them.
+    static KEEPS_EVERY_LOCAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the test on this thread planted [`KEEPS_EVERY_LOCAL`]; never outside a test.
+fn keeps_every_local() -> bool {
+    #[cfg(test)]
+    let planted = KEEPS_EVERY_LOCAL.get();
+    #[cfg(not(test))]
+    let planted = false;
+    planted
+}
 
 /// The first local of each value a call returns.
 type Returns = SmallVec<[u32; 8]>;
@@ -583,6 +693,12 @@ impl<'a> Lower<'a> {
             // alloc: once per function, its locals as the body declares them
             locals: Vec::new(),
             values: SecondaryMap::new(),
+            lives: Lives::of(func),
+            // alloc: empty, allocates nothing until a local is given back
+            free: Default::default(),
+            // alloc: as above
+            taken: Vec::new(),
+            in_inst: false,
             order,
             block_count,
             next_block: None,
@@ -598,7 +714,7 @@ impl<'a> Lower<'a> {
             stack_pointer_fixups: Vec::new(),
         };
         if size != 0 || !this.slot_offsets.is_empty() {
-            let frame = this.temp(address.wasm().into());
+            let frame = this.address_temp();
             this.frame = Some((frame, size.next_multiple_of(16)));
         }
         Ok(this)
@@ -651,7 +767,7 @@ impl<'a> Lower<'a> {
             })
         });
         if backwards {
-            self.next_block = Some(self.temp(ValType::I32));
+            self.next_block = Some(self.temp(Held::I32));
             self.i(&I::Loop(BlockType::Empty));
         }
         for _ in 0..self.block_count {
@@ -668,7 +784,10 @@ impl<'a> Lower<'a> {
                 continue;
             }
             for inst in func.layout.block_insts(block) {
+                self.in_inst = true;
                 self.inst(block, inst)?;
+                self.in_inst = false;
+                self.release(inst);
             }
         }
         if backwards {
@@ -766,14 +885,66 @@ impl<'a> Lower<'a> {
         self.i(&if self.address.is_64() { I::I64Add } else { I::I32Add });
     }
 
-    /// A fresh local that holds an address.
+    /// A local that holds an address until the instruction ends.
     fn address_temp(&mut self) -> u32 {
-        self.temp(self.address.wasm().into())
+        self.temp(if self.address.is_64() { Held::I64 } else { Held::I32 })
     }
 
-    fn temp(&mut self, ty: ValType) -> u32 {
-        self.locals.push(ty);
-        self.param_count + self.locals.len() as u32 - 1
+    /// A local of `held` nothing holds: one given back, or a new one. The first of the two
+    /// of a [`Held::Pair`].
+    fn take(&mut self, held: Held) -> u32 {
+        if let Some(local) = self.free[held as usize].pop() {
+            return local;
+        }
+        self.locals.push(held.wasm());
+        let local = self.param_count + self.locals.len() as u32 - 1;
+        if held == Held::Pair {
+            self.locals.push(ValType::I64);
+        }
+        local
+    }
+
+    /// [`Self::temp`] of what holds a `class`: an `i128`'s two locals are consecutive.
+    fn temp_class(&mut self, class: Class) -> u32 {
+        self.temp(Held::of(class))
+    }
+
+    /// A local of `held` for the instruction being lowered, given back when it ends
+    /// ([`Self::release`]); the function's own when none is.
+    fn temp(&mut self, held: Held) -> u32 {
+        let local = self.take(held);
+        if self.in_inst {
+            self.taken.push((local, held));
+        }
+        local
+    }
+
+    /// Gives back what `inst`, just lowered, was the last to hold: its temporaries, and the
+    /// local of each value it reads or defines that no later instruction reads ([`Lives`]).
+    fn release(&mut self, inst: ir::Inst) {
+        if keeps_every_local() {
+            self.taken.clear();
+            return;
+        }
+        for (local, held) in self.taken.drain(..) {
+            self.free[held as usize].push(local);
+        }
+        let func = self.func;
+        let read = func.dfg.inst_values(inst);
+        for value in read.chain(func.dfg.inst_results(inst).iter().copied()) {
+            let value = func.dfg.resolve_aliases(value);
+            if self.lives.own[value] || self.lives.last[value].expand() != Some(inst) {
+                continue;
+            }
+            let at = std::mem::replace(&mut self.values[value], RELEASED);
+            if at == 0 || at == RELEASED {
+                continue;
+            }
+            // A value that has a local has a class: `local` gave it one.
+            if let Ok(class) = Class::of(func.dfg.value_type(value)) {
+                self.free[Held::of(class) as usize].push(at - 1);
+            }
+        }
     }
 
     fn ty(&self, value: Value) -> Type {
@@ -787,14 +958,21 @@ impl<'a> Lower<'a> {
     /// The first local of a value.
     fn local(&mut self, value: Value) -> Result<u32, String> {
         let value = self.func.dfg.resolve_aliases(value);
-        if self.values[value] != 0 {
-            return Ok(self.values[value] - 1);
+        match self.values[value] {
+            0 => {}
+            // The lowering read a value at an instruction that is not one of its uses, so
+            // `Lives` gave its local to another: refused, never read as whatever holds it now.
+            RELEASED => {
+                // alloc: the error's message
+                return Err(format!(
+                    "wasm: {value} is read after {}, the last instruction that uses it, gave its local back",
+                    self.lives.last[value].expand().map_or_else(|| "none".to_owned(), |it| it.to_string()),
+                ));
+            }
+            at => return Ok(at - 1),
         }
         let class = self.class(value)?;
-        let local = self.temp(class.wasm().into());
-        if class == Class::Pair {
-            self.temp(ValType::I64);
-        }
+        let local = self.take(Held::of(class));
         self.values[value] = local + 1;
         Ok(local)
     }
@@ -1196,8 +1374,8 @@ impl<'a> Lower<'a> {
             Class::F64 => self.i(&I::F64Store(mem(offset))),
             Class::V128 => self.i(&I::V128Store(mem(offset))),
             Class::Pair => {
-                let high = self.temp(ValType::I64);
-                let low = self.temp(ValType::I64);
+                let high = self.temp(Held::I64);
+                let low = self.temp(Held::I64);
                 let address = self.address_temp();
                 self.i(&I::LocalSet(high));
                 self.i(&I::LocalSet(low));
@@ -1259,13 +1437,7 @@ impl<'a> Lower<'a> {
             Some(name) => self.call_named(name, signature)?,
             None => self.call_slot(signature)?,
         }
-        let mut local_of = |this: &mut Self, class: Class| {
-            let local = this.temp(class.wasm().into());
-            if class == Class::Pair {
-                this.temp(ValType::I64);
-            }
-            local
-        };
+        let local_of = |this: &mut Self, class: Class| this.temp_class(class);
         match Returned::of(signature)? {
             Returned::Nothing => Ok(Returns::new()),
             Returned::Value(class) => {
@@ -1400,7 +1572,7 @@ impl<'a> Lower<'a> {
             let mut returned = Returns::new();
             for ret in &signature.returns {
                 let wide = ret.value_type == types::I64;
-                let local = self.temp(if wide { ValType::I64 } else { ValType::I32 });
+                let local = self.temp(if wide { Held::I64 } else { Held::I32 });
                 let to = *args.first().ok_or("wasm: a memory routine of no address")?;
                 self.get(to)?;
                 match (self.ty(to) == types::I64, wide) {
@@ -2253,7 +2425,7 @@ impl<'a> Lower<'a> {
                         true => (-(1i32 << (bits - 1)), (1i32 << (bits - 1)) - 1),
                         false => (0, (1i32 << bits) - 1),
                     };
-                    let value = self.temp(ValType::I32);
+                    let value = self.temp(Held::I32);
                     for (bound, keep) in [(high, Op::LtS), (low, Op::GtS)] {
                         let keep = if signed { keep } else { keep.strict_unsigned() };
                         self.i(&I::LocalTee(value));
@@ -2274,7 +2446,7 @@ impl<'a> Lower<'a> {
 
     /// Reverses the bytes of the integer on the stack.
     fn swap_bytes(&mut self, long: bool, bits: u8) {
-        let value = self.temp(if long { ValType::I64 } else { ValType::I32 });
+        let value = self.temp(if long { Held::I64 } else { Held::I32 });
         // Neighbouring bytes change places, then neighbouring pairs of them, and so on.
         let steps: &[(i64, u64)] = match bits {
             16 => &[(8, 0x00ff)],
@@ -2286,7 +2458,7 @@ impl<'a> Lower<'a> {
 
     /// Reverses the bits of the integer on the stack, which is `bits` wide.
     fn reverse_bits(&mut self, long: bool, bits: u8) {
-        let value = self.temp(if long { ValType::I64 } else { ValType::I32 });
+        let value = self.temp(if long { Held::I64 } else { Held::I32 });
         let ones = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
         let steps = [
             (1, 0x5555_5555_5555_5555 & ones),
@@ -2416,7 +2588,7 @@ impl<'a> Lower<'a> {
                     self.op(if left { Op::Rotl } else { Op::Rotr }, long);
                 } else {
                     // Two shifts that meet: the second amount is what is left of the width.
-                    let amount = self.temp(ValType::I32);
+                    let amount = self.temp(Held::I32);
                     let (there, back) =
                         if left { (Op::Shl, Op::ShrU) } else { (Op::ShrU, Op::Shl) };
                     self.amount(b, false)?;
@@ -2489,7 +2661,7 @@ impl<'a> Lower<'a> {
             Opcode::SaddOverflow | Opcode::SsubOverflow | Opcode::SmulOverflow if !long => {
                 // In 64 bits nothing overflows: the result fits the type when extending its
                 // low bits gives it back.
-                let exact = self.temp(ValType::I64);
+                let exact = self.temp(Held::I64);
                 for value in [a, b] {
                     self.get_signed(value)?;
                     self.i(&I::I64ExtendI32S);
@@ -2514,7 +2686,7 @@ impl<'a> Lower<'a> {
                 return self.set(results[1]);
             }
             Opcode::UmulOverflow if !long => {
-                let exact = self.temp(ValType::I64);
+                let exact = self.temp(Held::I64);
                 for value in [a, b] {
                     self.get(value)?;
                     self.i(&I::I64ExtendI32U);
@@ -2559,7 +2731,7 @@ impl<'a> Lower<'a> {
 
     /// Pushes the upper 64 bits of the product of two `i64` locals.
     fn multiply_high(&mut self, a: u32, b: u32, signed: bool) {
-        let [low, cross] = [(); 2].map(|()| self.temp(ValType::I64));
+        let [low, cross] = [self.temp(Held::I64), self.temp(Held::I64)];
         let half = |this: &mut Self, local: u32, upper: bool| {
             this.i(&I::LocalGet(local));
             if upper {
@@ -2646,7 +2818,7 @@ impl<'a> Lower<'a> {
                     Opcode::Smin => Op::LtS,
                     _ => Op::GtS,
                 };
-                let first = self.temp(ValType::I32);
+                let first = self.temp(Held::I32);
                 self.compare(pick, a, b)?;
                 self.i(&I::LocalSet(first));
                 for half in [0, 1] {
@@ -2661,8 +2833,8 @@ impl<'a> Lower<'a> {
             }
             Opcode::Rotl | Opcode::Rotr => {
                 // A rotation right is one left by what is left of the width.
-                let amount = self.temp(ValType::I64);
-                let [low, high] = [(); 2].map(|()| self.temp(ValType::I64));
+                let amount = self.temp(Held::I64);
+                let [low, high] = [self.temp(Held::I64), self.temp(Held::I64)];
                 if opcode == Opcode::Rotr {
                     self.i(&I::I64Const(0));
                 }
@@ -2711,7 +2883,7 @@ impl<'a> Lower<'a> {
                 let add =
                     matches!(opcode, Opcode::Iadd | Opcode::UaddOverflow | Opcode::SaddOverflow);
                 let op = if add { Op::Add } else { Op::Sub };
-                let [low, high] = [(); 2].map(|()| self.temp(ValType::I64));
+                let [low, high] = [self.temp(Held::I64), self.temp(Held::I64)];
                 self.get_low(a)?;
                 self.get_low(b)?;
                 self.op(op, true);
@@ -2781,7 +2953,7 @@ impl<'a> Lower<'a> {
             }
             Opcode::Imul => {
                 let (x, y) = (self.local(a)?, self.local(b)?);
-                let [low, high] = [(); 2].map(|()| self.temp(ValType::I64));
+                let [low, high] = [self.temp(Held::I64), self.temp(Held::I64)];
                 self.i(&I::LocalGet(x));
                 self.i(&I::LocalGet(y));
                 self.i(&I::I64Mul);
@@ -2804,8 +2976,8 @@ impl<'a> Lower<'a> {
             }
             Opcode::Ishl | Opcode::Ushr | Opcode::Sshr => {
                 let x = self.local(a)?;
-                let amount = self.temp(ValType::I64);
-                let [low, high] = [(); 2].map(|()| self.temp(ValType::I64));
+                let amount = self.temp(Held::I64);
+                let [low, high] = [self.temp(Held::I64), self.temp(Held::I64)];
                 self.amount(b, true)?;
                 self.i(&I::I64Const(127));
                 self.i(&I::I64And);
@@ -2882,6 +3054,205 @@ impl Op {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use cranelift_codegen::{ir::UserFuncName, isa::CallConv};
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+    /// `fn(i32, i64) -> i64` of one block of `rounds` rounds, six values each, with a value
+    /// of the block's start read at its end and an `i128` carried through.
+    fn long_block(rounds: u32) -> Function {
+        let mut signature = Signature::new(CallConv::SystemV);
+        signature.params.push(ir::AbiParam::new(types::I32));
+        signature.params.push(ir::AbiParam::new(types::I64));
+        signature.returns.push(ir::AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::default(), signature);
+        let mut context = FunctionBuilderContext::new();
+        let mut b = FunctionBuilder::new(&mut func, &mut context);
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        b.seal_block(entry);
+        let (x, y) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+        let three = b.ins().iconst(types::I64, 3);
+        let kept = b.ins().iadd(y, three);
+        let (mut a, mut l) = (x, y);
+        let mut w = b.ins().uextend(types::I128, y);
+        for round in 0..rounds {
+            let k = b.ins().iconst(types::I32, i64::from(round.wrapping_mul(2_654_435_761) | 1));
+            let sum = b.ins().iadd(a, k);
+            a = b.ins().imul(sum, k);
+            let wide = b.ins().uextend(types::I64, a);
+            l = b.ins().bxor(l, wide);
+            if round % 16 == 0 {
+                let more = b.ins().uextend(types::I128, l);
+                let shifted = b.ins().iadd(w, w);
+                w = b.ins().iadd(shifted, more);
+            }
+        }
+        let (low, high) = b.ins().isplit(w);
+        let halves = b.ins().bxor(low, high);
+        let mixed = b.ins().bxor(halves, l);
+        let out = b.ins().iadd(mixed, kept);
+        b.ins().return_(&[out]);
+        b.finalize();
+        func
+    }
+
+    /// What [`long_block`]'s function gives, by its IR's meaning.
+    fn long_block_model(rounds: u32, x: i32, y: i64) -> i64 {
+        let kept = y.wrapping_add(3);
+        let (mut a, mut l) = (x as u32, y as u64);
+        let mut w = u128::from(y as u64);
+        for round in 0..rounds {
+            let k = round.wrapping_mul(2_654_435_761) | 1;
+            a = a.wrapping_add(k).wrapping_mul(k);
+            l ^= u64::from(a);
+            if round % 16 == 0 {
+                w = w.wrapping_add(w).wrapping_add(u128::from(l));
+            }
+        }
+        ((w as u64 ^ (w >> 64) as u64 ^ l) as i64).wrapping_add(kept)
+    }
+
+    /// `fn(i32) -> i64` with a loop: the sum of `i * i` for `i` from the argument down to 1,
+    /// times 7, plus twice the argument, which the entry block computes and the last reads.
+    fn looped() -> Function {
+        let mut signature = Signature::new(CallConv::SystemV);
+        signature.params.push(ir::AbiParam::new(types::I32));
+        signature.returns.push(ir::AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::default(), signature);
+        let mut context = FunctionBuilderContext::new();
+        let mut b = FunctionBuilder::new(&mut func, &mut context);
+        let (entry, body, exit) = (b.create_block(), b.create_block(), b.create_block());
+        b.append_block_params_for_function_params(entry);
+        let i = b.append_block_param(body, types::I32);
+        let acc = b.append_block_param(body, types::I64);
+        let total = b.append_block_param(exit, types::I64);
+        b.switch_to_block(entry);
+        let n = b.block_params(entry)[0];
+        let twice = b.ins().iadd(n, n);
+        let zero = b.ins().iconst(types::I64, 0);
+        b.ins().jump(body, &[n.into(), zero.into()]);
+        b.switch_to_block(body);
+        let square = b.ins().imul(i, i);
+        let wide = b.ins().uextend(types::I64, square);
+        let sum = b.ins().iadd(acc, wide);
+        let one = b.ins().iconst(types::I32, 1);
+        let next = b.ins().isub(i, one);
+        b.ins().brif(next, body, &[next.into(), sum.into()], exit, &[sum.into()]);
+        b.switch_to_block(exit);
+        let seven = b.ins().iconst(types::I64, 7);
+        let scaled = b.ins().imul(total, seven);
+        let more = b.ins().uextend(types::I64, twice);
+        let out = b.ins().iadd(scaled, more);
+        b.ins().return_(&[out]);
+        b.seal_all_blocks();
+        b.finalize();
+        func
+    }
+
+    /// How many locals the body declares after its parameters.
+    fn declared_locals(body: &[u8]) -> u64 {
+        fn leb(bytes: &[u8], at: &mut usize) -> u64 {
+            let (mut value, mut shift) = (0u64, 0);
+            loop {
+                let byte = bytes[*at];
+                *at += 1;
+                value |= u64::from(byte & 0x7F) << shift;
+                shift += 7;
+                if byte & 0x80 == 0 {
+                    return value;
+                }
+            }
+        }
+        let mut at = 0;
+        let runs = leb(body, &mut at);
+        (0..runs)
+            .map(|_| {
+                let count = leb(body, &mut at);
+                at += 1;
+                count
+            })
+            .sum()
+    }
+
+    /// A module of the one function `lowered`, exported as `f`: it calls nothing and has no
+    /// frame, so its body has nothing for a linker to fill in.
+    fn module_of(lowered: &WasmFunction) -> Vec<u8> {
+        assert!(lowered.type_fixups.is_empty() && lowered.stack_pointer_fixups.is_empty());
+        let mut module = wasm_encoder::Module::new();
+        let mut types = wasm_encoder::TypeSection::new();
+        let of = |it: &[WasmType]| it.iter().map(|&it| ValType::from(it)).collect::<Vec<_>>();
+        types.ty().function(of(&lowered.signature.params), of(&lowered.signature.results));
+        let mut functions = wasm_encoder::FunctionSection::new();
+        functions.function(0);
+        let mut exports = wasm_encoder::ExportSection::new();
+        exports.export("f", wasm_encoder::ExportKind::Func, 0);
+        let mut code = wasm_encoder::CodeSection::new();
+        code.raw(&lowered.body);
+        module.section(&types).section(&functions).section(&exports).section(&code);
+        module.finish()
+    }
+
+    /// The invariant: a function of more values than a WebAssembly function may have locals
+    /// (50 000) is lowered to a body an engine takes, and it computes what its IR says: a
+    /// value read only in its own block gives its local back after its last read, so the
+    /// body's locals are as many as are live at once, not as many as there are values. sha2's
+    /// unrolled `compress_block`, in rust-embed-impl's module, was refused by Wasmtime
+    /// ("too many locals") when each value had a local of its own.
+    #[test]
+    fn a_block_of_more_values_than_wasm_has_locals_runs_and_computes_what_its_ir_says() {
+        const ROUNDS: u32 = 14_000;
+        let func = long_block(ROUNDS);
+        assert!(func.dfg.num_values() > 50_000, "{} values", func.dfg.num_values());
+        let (lowered, relocs) = lower(&func, Address::Bits32).expect("lowers");
+        assert!(relocs.is_empty());
+        let locals = declared_locals(&lowered.body);
+        assert!(locals < 32, "{locals} locals for a block with a dozen values live at once");
+        let engine = wasmtime::Engine::default();
+        let module = wasmtime::Module::new(&engine, module_of(&lowered)).expect("the engine takes it");
+        let mut store = wasmtime::Store::new(&engine, ());
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("instantiates");
+        let f = instance.get_typed_func::<(i32, i64), i64>(&mut store, "f").expect("`f`");
+        for (x, y) in [(0, 0), (1, -1), (0x7FFF_FFFF, i64::MIN), (-7, 0x0123_4567_89AB_CDEF)] {
+            let got = f.call(&mut store, (x, y)).expect("runs");
+            assert_eq!(got, long_block_model(ROUNDS, x, y), "f({x}, {y})");
+        }
+    }
+
+    /// The control of the invariant above: with no local given back, the same function has
+    /// more locals than an engine takes, and Wasmtime refuses its module naming them.
+    #[test]
+    fn the_oracle_catches_a_local_kept_for_every_value() {
+        KEEPS_EVERY_LOCAL.set(true);
+        let lowered = lower(&long_block(14_000), Address::Bits32);
+        KEEPS_EVERY_LOCAL.set(false);
+        let (lowered, _) = lowered.expect("lowers");
+        assert!(declared_locals(&lowered.body) > 50_000);
+        let engine = wasmtime::Engine::default();
+        let refused = wasmtime::Module::new(&engine, module_of(&lowered))
+            .err()
+            .expect("an engine refuses more than 50 000 locals");
+        assert!(format!("{refused:?}").contains("locals"), "{refused:?}");
+    }
+
+    /// A value another block reads, and a block's parameters, keep their locals while the
+    /// values of a loop's body share theirs: the loop computes what its IR says each time
+    /// around.
+    #[test]
+    fn values_read_across_blocks_keep_their_locals_while_a_loops_body_shares_its_own() {
+        let (lowered, _) = lower(&looped(), Address::Bits32).expect("lowers");
+        let engine = wasmtime::Engine::default();
+        let module = wasmtime::Module::new(&engine, module_of(&lowered)).expect("the engine takes it");
+        let mut store = wasmtime::Store::new(&engine, ());
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("instantiates");
+        let f = instance.get_typed_func::<i32, i64>(&mut store, "f").expect("`f`");
+        for n in [1i32, 2, 3, 100, 1000] {
+            let squares: i64 = (1..=i64::from(n)).map(|i| i * i).sum();
+            let got = f.call(&mut store, n).expect("runs");
+            assert_eq!(got, squares * 7 + i64::from(n) * 2, "f({n})");
+        }
+    }
 
     /// What `WasmFunction::encode` wrote before the linker's format: a 4-byte length, then
     /// the header as postcard, then the body. The reference the fields are checked against.

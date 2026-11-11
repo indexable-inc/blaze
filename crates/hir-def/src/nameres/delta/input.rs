@@ -50,7 +50,8 @@ pub(super) struct Delta {
 /// alone reads other crates at round 0 (the injected std prelude, `#[macro_use] extern crate`),
 /// and `root_decl` holds only their roots. The root's log is read again too when the crate was
 /// given proc macros (`written.proc_macros`): it lists their expanders, as `#[proc_macro]`
-/// functions are only at the root.
+/// functions are only at the root; and the root's group runs again whatever its log says
+/// ([`given_proc_macros`]).
 pub(super) fn read(
     db: &Db,
     krate: Crate,
@@ -73,7 +74,44 @@ pub(super) fn read(
     }
     include_readers(state, written, &mut delta);
     expansion_readers(state, written, &mut delta);
+    if written.proc_macros.binary_search(&krate).is_ok() {
+        given_proc_macros(state, &mut delta);
+    }
     delta
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: a crate given its proc macros runs its root's group again only
+    /// when the root's round-0 log changed.
+    pub(in crate::nameres) static GIVEN_READS_THE_LOG_ALONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A crate given its proc macros: its root's group is a seed, with a possible removal, whatever
+/// its round-0 log says. The log holds the expander of a `#[proc_macro]` function the root
+/// file declares, so it changes for that one; a function under an attribute macro
+/// (`#[proc_macro] #[proc_macro_error] pub fn sol`, alloy-sol-macro's) is declared by the
+/// attribute's expansion, which the log leaves out and the group's run collects, with the
+/// crate's list as it is then. Left to the log, `sol` kept the expander it had before the
+/// crate's module was loaded, none, and every `sol!` failed on a crate that "loaded and
+/// exports no macro of this name".
+fn given_proc_macros(state: &CrateState, delta: &mut Delta) {
+    #[cfg(test)]
+    if GIVEN_READS_THE_LOG_ALONE.get() {
+        return;
+    }
+    let root = state.root;
+    if !state.groups.contains_key(&root) {
+        return;
+    }
+    // A change of the root's log that only inserted name-free ops is no run: this is one.
+    delta.direct.retain(|(group, _)| *group != root);
+    if !delta.seeds.contains(&root) {
+        delta.seeds.push(root);
+    }
+    if !delta.removing.contains(&root) {
+        delta.removing.push(root);
+    }
 }
 
 /// Whether each parent from the root down to `group` still declares the key below it: a key may

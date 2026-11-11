@@ -1234,6 +1234,156 @@ fn a_proc_macro_crate_given_its_macros_after_its_map_was_read_resolves_them_agai
     assert!(failures.is_empty(), "{failures}");
 }
 
+/// An attribute macro's crate resolved before its macros were built names no expander for it,
+/// and an item under the attribute expands to nothing; given its macros later, the item is
+/// expanded again however the attribute is named: by path, by a `use`, through the
+/// `#[macro_use]` prelude, and through another crate's re-export in that prelude
+/// (alloy-sol-macro's `#[macro_use] extern crate proc_macro_error3;` over `#[proc_macro]
+/// #[proc_macro_error] pub fn sol`, whose `sol` was left out of the crate's list of macros).
+#[test]
+fn an_item_under_an_attribute_macro_given_after_its_map_was_read_is_expanded_again() {
+    use hir_expand::proc_macro::ProcMacros;
+
+    const REEXPORT: &str = "//- /reexp.rs crate:reexp\npub use proc_macros::identity;\n";
+    let forms: [(&str, &str, &str); 4] = [
+        ("by path", "", "#[proc_macros::identity]\npub fn sol() {}\n"),
+        ("by a `use`", "", "use proc_macros::identity;\n#[identity]\npub fn sol() {}\n"),
+        (
+            "through the `#[macro_use]` prelude",
+            "",
+            "#[macro_use]\nextern crate proc_macros;\n#[identity]\npub fn sol() {}\n",
+        ),
+        (
+            "through a re-export in the `#[macro_use]` prelude",
+            REEXPORT,
+            "#[macro_use]\nextern crate reexp;\n#[identity]\npub fn sol() {}\n",
+        ),
+    ];
+    let mut failures = String::new();
+    for (form, reexport, text) in forms {
+        let deps = if reexport.is_empty() { "" } else { " deps:reexp" };
+        let mut loaded = Loaded::new(&format!(
+            "//- proc_macros: identity\n//- /main.rs crate:main{deps}\n{text}{reexport}"
+        ));
+        let main = loaded.file("/main.rs");
+        let db = &loaded.db;
+        let main =
+            *all_crates(db).iter().find(|it| it.data(db).root_file_id == main).expect("`main`");
+        let macros = *all_crates(db)
+            .iter()
+            .find(|it| it.data(db).target_kind.is_proc_macro())
+            .expect("`proc_macros`");
+        let built = ProcMacros::get_for_crate(db, macros)
+            .and_then(|it| it.macros().map(<[_]>::to_vec))
+            .expect("listed");
+        let has = |db: &Db| {
+            let map = crate_local_def_map(db, main).def_map(db);
+            map.module(db, map.root).scope(db).get(&name("sol")).take_values().is_some()
+        };
+        assert!(has(&loaded.db), "{form}: loaded with its macros built: no `sol`");
+        ProcMacros::give(
+            &mut loaded.db,
+            [(macros, Err(base_db::ProcMacroLoadingError::NotYetBuilt))],
+        );
+        // Read while the macro has no expander, as a build reads a crate before its macros'.
+        let _ = has(&loaded.db);
+        ProcMacros::give(&mut loaded.db, [(macros, Ok(built))]);
+        if !has(&loaded.db) {
+            failures.push_str(&format!(
+                "{form}: given its built macros after its map was read: no `sol`\n"
+            ));
+        }
+        check_db(&loaded.db, form, &Exempt::NONE, true, &mut failures);
+    }
+    assert!(failures.is_empty(), "{failures}");
+}
+
+/// The expanders of the macros `names` of the proc-macro crate `pm`, in its own map: whether
+/// each is one the crate's list gave.
+fn own_expanders(db: &Db, pm: Crate, names: &[&str]) -> Vec<bool> {
+    use crate::MacroId;
+    let map = crate_local_def_map(db, pm).def_map(db);
+    names
+        .iter()
+        .map(|it| match map.module(db, map.root).scope(db).get(&name(it)).take_macros() {
+            Some(MacroId::ProcMacroId(id)) => !id.loc(db).expander.is_missing(),
+            other => panic!("`{it}` is not a proc macro of the crate: {other:?}"),
+        })
+        .collect()
+}
+
+/// A proc-macro crate with a macro its root file declares (`plain`) and one an attribute
+/// macro's expansion declares (`sol`), with no macros given yet; and the two given.
+fn under_an_attribute() -> (Loaded, Crate, Vec<hir_expand::proc_macro::ProcMacro>) {
+    use hir_expand::proc_macro::{ProcMacroKind, ProcMacros};
+    let loaded = Loaded::new(
+        "//- proc_macros: identity\n//- /pm.rs crate:proc-macro:pm\n#[proc_macro]\npub fn plain(input: TokenStream) -> TokenStream { input }\n#[proc_macro]\n#[proc_macros::identity]\npub fn sol(input: TokenStream) -> TokenStream { input }\n",
+    );
+    let file = loaded.file("/pm.rs");
+    let db = &loaded.db;
+    let pm = *all_crates(db).iter().find(|it| it.data(db).root_file_id == file).expect("`pm`");
+    let fixtures = *all_crates(db)
+        .iter()
+        .find(|it| **it != pm && it.data(db).target_kind.is_proc_macro())
+        .expect("`proc_macros`");
+    let identity = ProcMacros::get_for_crate(db, fixtures)
+        .and_then(|it| it.macros().map(<[_]>::to_vec))
+        .expect("listed")
+        .into_iter()
+        .next()
+        .expect("`identity`");
+    let given = ["plain", "sol"]
+        .into_iter()
+        .map(|it| hir_expand::proc_macro::ProcMacro {
+            name: Symbol::intern(it),
+            kind: ProcMacroKind::Bang,
+            // clone: an `Arc`, the fixture's expander under another name
+            expander: identity.expander.clone(),
+            disabled: false,
+        })
+        .collect();
+    (loaded, pm, given)
+}
+
+/// The invariant: a proc-macro crate given its macros names the expander of each in its map,
+/// the one its root file declares and the one an attribute macro's expansion declares
+/// (alloy-sol-macro's `#[proc_macro] #[proc_macro_error] pub fn sol`): the crate's map is
+/// read before its module is built, when no macro of it has an expander, and resolves again
+/// when the list is given.
+#[test]
+fn a_proc_macro_under_an_attribute_macro_names_its_expander_once_its_crate_is_given_its_macros() {
+    use hir_expand::proc_macro::ProcMacros;
+    let (mut loaded, pm, given) = under_an_attribute();
+    assert_eq!(
+        own_expanders(&loaded.db, pm, &["plain", "sol"]),
+        [false, false],
+        "before its macros are built"
+    );
+    ProcMacros::give(&mut loaded.db, [(pm, Ok(given))]);
+    assert_eq!(
+        own_expanders(&loaded.db, pm, &["plain", "sol"]),
+        [true, true],
+        "given its built macros after its map was read"
+    );
+    let mut failures = String::new();
+    check_db(&loaded.db, "given built macros", &Exempt::NONE, true, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}
+
+/// The control of the invariant above: with the root's group run again only when its round-0
+/// log changed, the macro under the attribute keeps no expander, as `sol` did.
+#[test]
+fn the_oracle_catches_a_given_crate_whose_root_runs_again_only_for_its_log() {
+    use hir_expand::proc_macro::ProcMacros;
+    let (mut loaded, pm, given) = under_an_attribute();
+    let _ = own_expanders(&loaded.db, pm, &["plain", "sol"]);
+    super::input::GIVEN_READS_THE_LOG_ALONE.set(true);
+    ProcMacros::give(&mut loaded.db, [(pm, Ok(given))]);
+    let after = own_expanders(&loaded.db, pm, &["plain", "sol"]);
+    super::input::GIVEN_READS_THE_LOG_ALONE.set(false);
+    assert_eq!(after, [true, false], "the planted bug leaves `sol` with no expander");
+}
+
 /// Three crates: `main` globs `lib`, and `other` depends on neither and neither on it.
 const REACH: &str = "//- /main.rs crate:main deps:lib\npub use lib::*;\n//- /lib.rs crate:lib\npub struct A;\n//- /other.rs crate:other\npub struct O;\n";
 

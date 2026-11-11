@@ -47,9 +47,24 @@ pub(super) const OUT_DIR: &str = "OUT_DIR";
 /// The directories a macro may read, each its real path.
 pub(super) struct Roots {
     dirs: [Option<String>; 2],
+    /// Each path the walk of a root's own spelling passed on its way to the root: its
+    /// ancestors, and every link it followed.
+    passed: Vec<String>,
 }
 
 impl Roots {
+    /// Whether the real path `path`, outside every root, is one a root's own walk passed: `/`,
+    /// an ancestor directory of a root, or a link its spelling goes through. That it is there,
+    /// and is a directory or that link, is what the root's being where it is already says (the
+    /// expansion is keyed by the two variables and the roots are walked from them), so a look
+    /// at it (a `stat`, a `readlink`: `realpath` makes one of each prefix of a path, and so
+    /// std's `canonicalize`) is answered. What is in it is not: an open or a listing of it is
+    /// refused as any path outside the roots.
+    fn on_the_way(&self, path: &str) -> bool {
+        self.dirs.iter().any(Option::is_some)
+            && (path == "/" || self.passed.iter().any(|it| it == path))
+    }
+
     /// The root `path` is below or is, when it is in one.
     fn holding(&self, path: &str) -> Option<&str> {
         self.dirs.iter().flatten().map(String::as_str).find(|root| under(path, root))
@@ -177,13 +192,16 @@ pub(super) enum Form {
 /// Walks the absolute path `given` as the kernel does, each `.`, `..` and link resolved, the
 /// last link only with `follow`, leaving the real path in `out` (`rest` is the walk's own).
 /// `start` is a real directory `given` is in, whose own walk is skipped. A missing path's
-/// real path is that of the first part that is missing.
+/// real path is that of the first part that is missing. Each path the walk finds something at
+/// (a directory it goes through, a link it follows or ends at, what it ends at) is pushed onto
+/// `passed`, when one is given.
 pub(super) fn walk(
     given: &str,
     follow: bool,
     start: Option<&str>,
     out: &mut String,
     rest: &mut String,
+    mut passed: Option<&mut Vec<String>>,
 ) -> Result<Found, Fail> {
     out.clear();
     rest.clear();
@@ -235,6 +253,10 @@ pub(super) fn walk(
             }
             Err(error) => return Err(Fail::Io(error)),
         };
+        if let Some(passed) = &mut passed {
+            // alloc: a root's walk, once per expansion that reads a path
+            passed.push(out.clone());
+        }
         if meta.is_symlink() && (!last || follow || slash) {
             links += 1;
             if links > MAX_LINKS {
@@ -292,6 +314,8 @@ impl<'a> Os<'a> {
         self.trace.note(Noted::Seen(Seen::Env), MANIFEST_DIR);
         self.trace.note(Noted::Seen(Seen::Env), OUT_DIR);
         let mut dirs = [None, None];
+        // alloc: setup, once per expansion that reads a path
+        let mut passed = Vec::new();
         for (dir, name) in dirs.iter_mut().zip([MANIFEST_DIR, OUT_DIR]) {
             let Some((_, value)) = self.env.iter().find(|it| it.0 == name) else { continue };
             if !value.starts_with('/') {
@@ -299,12 +323,12 @@ impl<'a> Os<'a> {
             }
             // A root that is not there is walked as far as it is, so that a path below it
             // is the same path a walk of the path itself makes.
-            if walk(value, true, None, &mut self.real, &mut self.rest).is_ok() {
+            if walk(value, true, None, &mut self.real, &mut self.rest, Some(&mut passed)).is_ok() {
                 // alloc: setup, once per expansion that reads a path
                 *dir = Some(self.real.clone());
             }
         }
-        self.roots = Some(Roots { dirs });
+        self.roots = Some(Roots { dirs, passed });
     }
 
     /// The real path of the working directory ([`Os::cwd`]), walked once, in
@@ -317,7 +341,7 @@ impl<'a> Os<'a> {
         let dir = self.cwd;
         let real = match dir.starts_with('/') {
             // A directory that is not there is walked as far as it is, as a root is.
-            true => match walk(dir, true, None, &mut self.real, &mut self.rest) {
+            true => match walk(dir, true, None, &mut self.real, &mut self.rest, None) {
                 // alloc: once per expansion that names a relative path or asks its directory
                 Ok(_) => Some(self.real.clone()),
                 Err(_) => None,
@@ -409,7 +433,7 @@ impl<'a> Os<'a> {
         self.ready();
         let roots = self.roots.as_ref();
         let start = roots.and_then(|roots| roots.holding(&self.given));
-        let walked = walk(&self.given, follow, start, &mut self.real, &mut self.rest);
+        let walked = walk(&self.given, follow, start, &mut self.real, &mut self.rest, None);
         let found = match walked {
             Ok(found) => found,
             Err(Fail::Io(error)) => {
@@ -434,6 +458,17 @@ impl<'a> Os<'a> {
             }
         };
         if !self.roots.as_ref().is_some_and(|roots| roots.holding(&self.real).is_some()) {
+            // A look at what a root's own walk passed (an ancestor directory of a root, a link
+            // its spelling goes through) says only that it is that directory or that link:
+            // nothing the roots' being where they are does not say, so it is answered, noted as
+            // nothing and refused nowhere, as the look at the working directory above. Only a
+            // look: an open or a listing of it (`Seen::Read`) is refused below, by name.
+            if seen == Seen::Looked
+                && let Found::Is(kind @ (Kind::Dir | Kind::Link), size) = found
+                && self.roots.as_ref().is_some_and(|roots| roots.on_the_way(&self.real))
+            {
+                return Ok(Ok((kind, size)));
+            }
             self.trace.note(Noted::RefusedRead, &self.real);
             if self.refusal_stops {
                 return Err(self.refusal(path));

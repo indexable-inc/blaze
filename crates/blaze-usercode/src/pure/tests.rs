@@ -371,7 +371,12 @@ fn what_a_run_printed_and_wrote_is_checked_against_the_proof() {
         files,
     };
     let file =
-        || OutFile { path: "x.rs".into(), executable: false, bytes: Some(b"fn x() {}".to_vec()) };
+        || OutFile {
+            path: "x.rs".into(),
+            executable: false,
+            bytes: Some(b"fn x() {}".to_vec()),
+            link: None,
+        };
     checked_value("p", &proof(), &value(b"cargo:rustc-cfg=x\n", vec![file()])).unwrap();
     let mut silent = proof();
     silent.prints = false;
@@ -449,6 +454,7 @@ fn a_kept_pure_result_is_found_until_a_variable_or_file_it_read_changes() {
             path: "x.rs".into(),
             executable: false,
             bytes: Some(b"fn x() {}".to_vec()),
+            link: None,
         }],
     };
     let read = vec![(PathBuf::from("/ws/p/data.txt"), Some([3; 32]))];

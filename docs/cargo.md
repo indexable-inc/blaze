@@ -384,6 +384,7 @@ lld's) on Linux. What blaze's linker implements:
 | a shared library's exports | `-exported_symbol _NAME` (added to the crate's) | |
 | the main thread's stack | `-stack_size SIZE` (hex, whole 4 KiB pages) | |
 | never unloaded | | `-z nodelete` |
+| an executable's dynamic symbols | | `--export-dynamic-symbol PATTERN`, `--export-dynamic-symbol=PATTERN`: each name the image defines that the pattern matches (`*`, `?`, `[a-z]`, as `fnmatch`) is in `.dynsym` and kept for it; nothing for a shared library, which exports what its crate exports |
 
 Taken because blaze's linker always does it: ld64's `-dead_strip`, `-pie`, `-search_paths_first`,
 `-adhoc_codesign`, `-undefined error` for an executable; GNU's `--gc-sections`, `--as-needed`,
@@ -684,10 +685,12 @@ it goes into every rustc and linker run of its package and of what links it. A
 `rustc-link-search` (or `rustc-flags`' `-L`) names a directory in its `OUT_DIR`, its package,
 the target directory's build directory (its dependencies' `OUT_DIR`s), a system directory
 (`/usr/lib`, `/lib64`, `/usr/local/lib`, the Nix store, Homebrew's, Apple's SDKs), one of
-`build-script-link-dirs`, or the layout of a [pinned native input](#pinned-native-inputs) the
-script was given; a `rustc-link-arg` is one of a short list (`-pthread`, `-rdynamic`,
-`-Wl,--as-needed`, `-Wl,-z,now`, `-Wl,-soname,NAME`, `-lNAME`, ...) or an rpath to `$ORIGIN`
-or a directory a search may name; a `rustc-env` sets no variable cargo or rustc gives the crate
+`build-script-link-dirs`, or a layout of a [pinned native input](#pinned-native-inputs) in
+blaze's own store (`<BLAZE_HOME>/native/sha256-<digest>`), whether the script was given it or
+a variable of the shell points it there; a `rustc-link-arg` is one of a short list (`-pthread`,
+`-rdynamic`, `-Wl,--as-needed`, `-Wl,-z,now`, `-lNAME`, ...), a prefix with one value that is
+no further linker word (`-Wl,-soname,NAME`, `-Wl,--export-dynamic-symbol,PATTERN`,
+`-Wl,--version-script=FILE`), or an rpath to `$ORIGIN` or a directory a search may name; a `rustc-env` sets no variable cargo or rustc gives the crate
 itself (`CARGO_PKG_*`, `CARGO_MANIFEST_DIR`, `OUT_DIR`, `RUSTC*`, ...); what cargo gives only
 build scripts (`CARGO_CFG_*`, `CARGO_FEATURE_*`, `CARGO_ENCODED_RUSTFLAGS`) it may forward, as
 rav1e's does. Anything

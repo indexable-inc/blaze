@@ -821,7 +821,7 @@ impl<'a> Roots<'a> {
     /// kept here alone, with no copy. An error when the automaton that scans the files could
     /// not be built ([`Scan::of`]): nothing is kept on a scan that did not run.
     pub fn stored(&self, value: &Value) -> Result<(Value, RoleSet), aho_corasick::BuildError> {
-        let stored = Value {
+        let mut stored = Value {
             code: value.code,
             signal: value.signal,
             stdout: self.ported(&value.stdout).into_owned(),
@@ -829,6 +829,25 @@ impl<'a> Roots<'a> {
             files: value.files.clone(), // clone: the value kept, once per run kept
         };
         let mut left = self.embedded(&stored.stdout).union(self.embedded(&stored.stderr));
+        // A link it left into its package ([`crate::run::OutFile::link`]): kept as the
+        // package's placeholder and the rest, which another checkout's reuse makes into its
+        // own package. One that no root starts (a run with no package root) is this
+        // checkout's path, and ties the value to every root.
+        for file in &mut stored.files {
+            let Some(link) = &mut file.link else { continue };
+            let ported = match self.ported(link.as_bytes()) {
+                Cow::Borrowed(_) => None,
+                Cow::Owned(it) => Some(it),
+            };
+            let kept = ported.as_deref().unwrap_or(link.as_bytes());
+            if !(kept.first() == Some(&MARK) && kept.get(1).is_some_and(|it| *it != MARK)) {
+                left = left.union(self.all());
+            }
+            if let Some(ported) = ported {
+                // A ported string is UTF-8 when what was ported is ([`Roots::os`]).
+                *link = String::from_utf8(ported).expect("a UTF-8 string ported is UTF-8");
+            }
+        }
         // The files it wrote (an `OUT_DIR` can be hundreds of MB): one pass over each with
         // every spelling at once ([`Scan`]), and none once one root is found, since any root
         // left keeps the run here alone, marked with every root, whatever else is found.
@@ -863,6 +882,20 @@ impl<'a> Roots<'a> {
         }
         if let Some(it) = stderr {
             value.stderr = it;
+        }
+        // A link into the package, made into this run's.
+        for file in &mut value.files {
+            let Some(link) = &mut file.link else { continue };
+            let here = match self.unport(link.as_bytes())? {
+                Cow::Borrowed(_) => None,
+                Cow::Owned(it) => Some(it),
+            };
+            if let Some(here) = here {
+                *link = String::from_utf8(here).map_err(|error| NoRoot {
+                    what: String::from_utf8_lossy(error.as_bytes()).into_owned(), // alloc: error path
+                    why: "a kept link is not UTF-8 with this run's roots",
+                })?;
+            }
         }
         Ok(value)
     }

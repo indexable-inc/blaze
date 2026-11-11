@@ -149,10 +149,14 @@ impl Lowered {
     }
 }
 
-/// Whether every proc macro `krate` reaches through its dependencies has its expanders loaded
+/// Whether every proc macro `krate` reaches through its dependencies has had its load
 /// ([`Lowered::macros`]): until then what its attributes and derives expand to (a
 /// `#[tokio::test]`'s `#[test]`) is not in its items, so nothing listing them is made yet. A
-/// proc macro that failed to load never is: the crate's build stops on it.
+/// proc macro whose load failed has had it: it never loads, so a crate that reaches it is
+/// listed from the items it has, and a use of that macro fails at the use, naming why. A
+/// crate may reach one it never calls (i18n-embed-fl reaches rust-embed-impl through
+/// i18n-embed): waiting for it left the crate's wasm module without its glue, built and
+/// linked, and every `fl!` failed on a module with no `blaze_proc_macro_alloc`.
 pub fn macros_loaded(db: &Db, krate: Crate) -> bool {
     let by_crate = ProcMacros::get(db).by_crate(db);
     // alloc: once a test crate a write, its closure walked
@@ -163,7 +167,10 @@ pub fn macros_loaded(db: &Db, krate: Crate) -> bool {
             if !seen.insert(dep.crate_id) {
                 continue;
             }
-            if by_crate.get(&dep.crate_id).is_some_and(|it| it.macros().is_none()) {
+            let unbuilt = by_crate.get(&dep.crate_id).is_some_and(|it| {
+                matches!(it.get_error(), Some(base_db::ProcMacroLoadingError::NotYetBuilt))
+            });
+            if unbuilt {
                 return false;
             }
             stack.push(dep.crate_id);
