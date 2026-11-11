@@ -151,6 +151,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     reflection, not an auto trait, a proc macro or a special case in the compiler, wherever
     reflection is the more powerful; where reflection cannot yet say something that is possible,
     improve the language until it can. Skill: `compiler-correctness`.
+57. **verified-compiler**: The goal is a formally verified blaze: one executable Lean semantics of MIR
+    is the specification, every MIR pass is proved or translation-validated against it, proofs are
+    checked in the gate, and what is still trusted is listed. Skill: `testing`.
 
 ## Code Review Rules
 
