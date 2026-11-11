@@ -4,7 +4,7 @@ import Blaze.Mir.Opt.Borrow
 Statements keep what a pointer may name: the invariant dead-store elimination rests on,
 third piece.
 
-`OkAt B ids st`: the state's frames are `ids` and every pointer in its memory is one
+`OkAt B ids st`: `ids` lists the state's frames and every pointer in its memory is one
 `PtrOk B ids` allows. An operator gives a value with no pointer in it; an operand, a value
 read from memory; a `ref`, the pointer its place evaluates to, which `PtrOk` allows when the
 place's base local may be borrowed or the place goes through a dereference (`RvalueFine`:
@@ -171,20 +171,43 @@ theorem State.moveOut_ok {P : Pointer → Prop} {st : State} (hm : MemOk P st) :
 
 /-! The invariant with the frames named. -/
 
-/-- The state's frames are `ids`, and every pointer in its memory is one `PtrOk B ids`
+/-- `ids` lists each of the state's frames with its function. It may list more: the frames
+that returned. -/
+def Covers (ids : List (Nat × FnId)) (st : State) : Prop :=
+  ∀ (e : Nat × FnId), e ∈ st.ids → fnOfIds ids e.1 = some e.2
+
+theorem Covers.of_ids {ids : List (Nat × FnId)} {st st' : State} (e : st'.ids = st.ids)
+    (h : Covers ids st) : Covers ids st' := by
+  intro x hx
+  rw [e] at hx
+  exact h x hx
+
+/-- `ids` lists the state's frames, and every pointer in its memory is one `PtrOk B ids`
 allows. -/
 def OkAt (B : FnId → Local → Prop) (ids : List (Nat × FnId)) (st : State) : Prop :=
-  st.ids = ids ∧ MemOk (PtrOk B ids) st
+  Covers ids st ∧ MemOk (PtrOk B ids) st
+
+/-- The running frame's local `b` is one `PtrOk` allows when its function may borrow it. -/
+theorem covers_top (B : FnId → Local → Prop) (ids : List (Nat × FnId)) (b : Local) :
+    ∀ (st : State), Covers ids st → B st.topFn b →
+      PtrOk B ids { frame := st.top, slot := b, path := [] }
+  | { base := _, stack := [], next := _ }, _, _ => Or.inl rfl
+  | { base := _, stack := fr :: rest, next := _ }, hc, hb => by
+    have found : fnOfIds ids fr.id = some fr.fn :=
+      hc (fr.id, fr.fn) (List.mem_cons.mpr (Or.inl rfl))
+    have has : FrameHas B b (fnOfIds ids fr.id) := by
+      rw [found]
+      exact hb
+    exact Or.inr has
 
 theorem evalPlace_okAt {B : FnId → Local → Prop} {ids : List (Nat × FnId)} {st : State}
     (hs : OkAt B ids st) (place : Place)
     (hb : B st.topFn place.base ∨ hasDeref place.proj = true) :
     Outcome.All (PtrOk B ids) (evalPlace st place) := by
-  have e : st.ids = ids := And.left hs
-  subst e
   intro q h
   exact evalProj_ptr (And.right hs) place.proj { frame := st.top, slot := place.base, path := [] }
-    q (hb.elim (fun b => Or.inl (top_ptr B place.base st b)) (fun hd => Or.inr hd)) h
+    q (hb.elim (fun b => Or.inl (covers_top B ids place.base st (And.left hs) b))
+      (fun hd => Or.inr hd)) h
 
 theorem evalOperand_okAt {B : FnId → Local → Prop} {ids : List (Nat × FnId)} (st : State)
     (hs : OkAt B ids st) :
@@ -200,7 +223,7 @@ theorem evalOperand_okAt {B : FnId → Local → Prop} {ids : List (Nat × FnId)
       Outcome.all_bind (fun v h => State.read_ok (And.right hs) ptr v h) (fun _ hv =>
         Outcome.all_ok
           (And.intro hv
-            (And.intro ((State.moveOut_ids st ptr).trans (And.left hs))
+            (And.intro (Covers.of_ids (State.moveOut_ids st ptr) (And.left hs))
               (State.moveOut_ok (And.right hs) ptr)))))
   | Operand.const c => Outcome.all_ok (And.intro (constValue_ok (PtrOk B ids) c) hs)
 
@@ -310,7 +333,7 @@ theorem execStmt_okAt {B : FnId → Local → Prop} {ids : List (Nat × FnId)} (
       Outcome.all_bind (Outcome.all_true _) (fun ptr _ =>
         (fun st' h =>
           And.intro
-            ((State.write_ids r.2 ptr r.1 st' h).trans (And.left (And.right hr)))
+            (Covers.of_ids (State.write_ids r.2 ptr r.1 st' h) (And.left (And.right hr)))
             (State.write_ok (And.right (And.right hr)) ptr r.1 (And.left hr) st' h))))
   | Statement.storageLive _, _ => Outcome.all_ok hs
   | Statement.storageDead _, _ => Outcome.all_ok hs

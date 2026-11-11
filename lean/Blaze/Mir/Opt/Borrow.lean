@@ -5,8 +5,8 @@ import Blaze.Mir.Opt.Ptr
 What a pointer may name: the invariant dead-store elimination rests on, second piece.
 
 `B fn l` says function `fn` may have a pointer to its local `l` (the locals it borrows).
-`PtrOk B ids p`: the pointer names frame 0 (what the entry function's references point to), a
-frame that is gone, or a local its frame's function may have a pointer to. `StateOk B st`:
+`PtrOk B ids p`: the pointer names frame 0 (what the entry function's references point to),
+or a local that the function of its frame, one of `ids`, may have a pointer to. `StateOk B st`:
 every pointer in the state's memory is such a pointer (`MemOk`, `Opt/Ptr.lean`).
 
 Here: writes and moves keep `StateOk`, and a place evaluates to such a pointer when its base
@@ -33,10 +33,11 @@ theorem fnOfIds_cons (e : Nat × FnId) (rest : List (Nat × FnId)) (id : Nat) :
 
 def FrameHas (B : FnId → Local → Prop) (slot : Nat) : Option FnId → Prop
   | some fn => B fn slot
-  | none => True
+  | none => False
 
-/-- The pointer names frame 0, a frame that is gone, or a local its frame's function may
-have a pointer to. -/
+/-- The pointer names frame 0, or a local that the function of its frame may have a pointer
+to, the frame being one `ids` lists. A list that keeps the frames that returned, and has none
+with an id not yet given, says so of every pointer a run can make (`Opt/BorrowStep.lean`). -/
 def PtrOk (B : FnId → Local → Prop) (ids : List (Nat × FnId)) (p : Pointer) : Prop :=
   p.frame = 0 ∨ FrameHas B p.slot (fnOfIds ids p.frame)
 
