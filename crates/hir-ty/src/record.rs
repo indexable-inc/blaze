@@ -127,3 +127,30 @@ fn name_list(names: Const<'_>) -> Option<Box<str>> {
     }
     String::from_utf8(list).ok().map(String::into_boxed_str)
 }
+
+/// The function a record value takes its defaults from, and which of its parameters (`self`
+/// first) the value is the argument of: `arg` is an argument of a call to a function by name
+/// (`f(arg)`, or `x.method(arg)`) in `store`. `None` for a record value anywhere else: an
+/// argument of a call through a function pointer, a closure or a `Fn` value, or of a tuple
+/// struct's constructor, which declare no defaults.
+pub fn record_argument_callee(
+    store: &hir_def::expr_store::ExpressionStore,
+    infer: &crate::InferenceResult<'_>,
+    arg: hir_def::hir::ExprId,
+) -> Option<(hir_def::FunctionId, u32)> {
+    use hir_def::hir::Expr;
+    store.exprs().find_map(|(id, expr)| match expr {
+        Expr::Call { callee, args } => {
+            let at = args.iter().position(|&it| it == arg)?;
+            let TyKind::FnDef(def, _) = infer.expr_ty(callee).kind() else { return None };
+            let crate::CallableDefId::FunctionId(function) = def.0 else { return None };
+            Some((function, at as u32))
+        }
+        Expr::MethodCall { args, .. } => {
+            let at = args.iter().position(|&it| it == arg)?;
+            let (function, _) = infer.method_resolution(id)?;
+            Some((function, at as u32 + 1))
+        }
+        _ => None,
+    })
+}

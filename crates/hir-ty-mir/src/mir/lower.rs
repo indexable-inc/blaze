@@ -1672,6 +1672,16 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 self.lower_become(expr, expr_id, current)
             }
             Expr::Yield { .. } => not_supported!("yield"),
+            // blaze: a record value `{ a: 1, b }` (`#![blaze::records]`), whose path is core's
+            // `Record` and whose fields are the record's, not the struct's.
+            Expr::RecordLit { fields, spread, .. }
+                if let Some(of) = crate::record::record_fields(
+                    self.lang_items(),
+                    self.expr_ty_without_adjust(expr_id),
+                ) =>
+            {
+                self.lower_record_value(expr_id, &of, fields, spread, place, current)
+            }
             Expr::RecordLit { fields, path, spread, .. } => {
                 let variant_id =
                     self.infer.variant_resolution_for_expr(expr_id).ok_or_else(|| {
@@ -2527,12 +2537,117 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         Ok(place)
     }
 
+    /// Lowers the record value `expr_id` (`{ a: 1, b }`, blaze's `#![blaze::records]`) of the
+    /// record `of` into `place`: the tuple of its fields in canonical order, then core's
+    /// `Record` around it. The fields written are evaluated in the order written; the rest
+    /// are copied from the base (`..base`, evaluated after them) or are the callee's defaults
+    /// (`..`), which are constants, placed in the callee's declaration order.
+    fn lower_record_value(
+        &mut self,
+        expr_id: ExprId,
+        of: &crate::record::RecordFields<'db>,
+        fields: &[RecordLitField],
+        spread: RecordSpread,
+        place: Place<'db>,
+        mut current: BasicBlockId,
+    ) -> Result<'db, Option<BasicBlockId>> {
+        let TyKind::Adt(_, args) = self.expr_ty_without_adjust(expr_id).kind() else {
+            return Err(MirLowerError::TypeError("a record value whose type is no record"));
+        };
+        let record = self.lang_items().Record.ok_or(MirLowerError::LangItemNotFound)?;
+        let count = of.len();
+        let mut operands = Vec::with_capacity_in(count, self.frame);
+        operands.resize_with(count, || None);
+        let declared = self.declared_locals();
+        for RecordLitField { name, expr } in fields.iter() {
+            let at = of.index_of(name.as_str()).ok_or(MirLowerError::UnresolvedField)?;
+            let Some((op, c)) = self.lower_expr_to_some_operand(*expr, current)? else {
+                return Ok(None);
+            };
+            current = c;
+            // What unwinds from the next field drops this one first.
+            self.declare_operands_last(expr_id, declared, std::iter::once(&op));
+            operands[at] = Some(op);
+        }
+        self.declare_operands_last(expr_id, declared, operands.iter().flatten());
+        match spread {
+            RecordSpread::None => {}
+            RecordSpread::Expr(base) => {
+                let Some((base, c)) = self.lower_expr_as_place(current, base, true)? else {
+                    return Ok(None);
+                };
+                current = c;
+                let inner = base.project(ProjectionElem::Field(FieldIndex(0)));
+                for (at, operand) in operands.iter_mut().enumerate() {
+                    if operand.is_none() {
+                        let field = inner.project(ProjectionElem::Field(FieldIndex(at as u32)));
+                        *operand =
+                            Some(Operand { kind: OperandKind::Copy(field.store()), span: None });
+                    }
+                }
+            }
+            RecordSpread::FieldDefaults => {
+                let (function, param) =
+                    crate::record::record_argument_callee(self.store, self.infer, expr_id).ok_or(
+                        MirLowerError::TypeError(
+                            "a record value's `..` outside a call to a function by name",
+                        ),
+                    )?;
+                for (at, name) in of.names().enumerate() {
+                    if operands[at].is_some() {
+                        continue;
+                    }
+                    let field = Name::new_root(name);
+                    let default = crate::record_param_default(self.db, function, param, field)
+                        .ok_or(MirLowerError::TypeError(
+                            "a record field left out that its callee declares no default for",
+                        ))?;
+                    // A default names no parameter of its function, so it is the same
+                    // constant at every call.
+                    let konst = default.get_with(|it| it.as_ref()).skip_binder();
+                    let ty = of.ty(at).ok_or(MirLowerError::UnresolvedField)?;
+                    operands[at] = Some(Operand {
+                        kind: OperandKind::Constant { konst: konst.store(), ty: ty.store() },
+                        span: Some(expr_id.into()),
+                    });
+                }
+            }
+        }
+        // alloc: the fields, kept in the body
+        let mut values = Vec::with_capacity(count);
+        for it in operands {
+            values.push(it.ok_or(MirLowerError::TypeError("missing field in record value"))?);
+        }
+        let tuple_ty = of.tuple(self.interner());
+        let tuple: Place<'db> = self.temp(tuple_ty, current, expr_id.into())?.into();
+        let fields = Rvalue::Aggregate(AggregateKind::Tuple(tuple_ty.store()), values.into());
+        self.push_assignment(current, tuple, fields, expr_id.into());
+        let whole = Operand { kind: OperandKind::Move(tuple.store()), span: None };
+        let rvalue = Rvalue::Aggregate(
+            AggregateKind::Adt(VariantId::StructId(record), args.store()),
+            [whole].into(),
+        );
+        self.push_assignment(current, place, rvalue, expr_id.into());
+        Ok(Some(current))
+    }
+
     fn push_field_projection(
         &mut self,
         place: &mut Place<'db>,
         expr_id: ExprId,
     ) -> Result<'db, ()> {
         if let Expr::Field { expr, name } = self.store.expr(expr_id) {
+            // blaze: `r.a` on a record (`#![blaze::records]`) is the one field of core's
+            // `Record`, then the field's place in the tuple it holds.
+            if let Some(of) =
+                crate::record::record_fields(self.lang_items(), self.expr_ty_after_adjustments(expr))
+            {
+                let at = of.index_of(name.as_str()).ok_or(MirLowerError::UnresolvedField)?;
+                *place = place
+                    .project(ProjectionElem::Field(FieldIndex(0)))
+                    .project(ProjectionElem::Field(FieldIndex(at as u32)));
+                return Ok(());
+            }
             if let TyKind::Tuple(tys) = self.expr_ty_after_adjustments(expr).kind() {
                 let index =
                     name.as_tuple_index().ok_or(MirLowerError::TypeError("named field on tuple"))?
