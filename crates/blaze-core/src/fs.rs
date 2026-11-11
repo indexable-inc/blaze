@@ -259,21 +259,6 @@ pub(crate) fn read(path: &Path, at: u64, len: usize) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-fn read_at(file: &std::fs::File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
-    std::os::unix::fs::FileExt::read_at(file, buffer, at)
-}
-
-#[cfg(windows)]
-fn read_at(file: &std::fs::File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
-    std::os::windows::fs::FileExt::seek_read(file, buffer, at)
-}
-
-#[cfg(target_os = "wasi")]
-fn read_at(file: &std::fs::File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
-    std::os::wasi::fs::FileExt::read_at(file, buffer, at)
-}
-
 /// [`crate::Effect::Append`]: `bytes` at the end of the file at `path`, made with its
 /// directories where it is missing.
 pub(crate) fn append(path: &Path, bytes: &[u8]) -> io::Result<()> {
