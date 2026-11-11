@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-80 theorems: 67 in `lean`, 13 in `lean/analysis`.
+81 theorems: 68 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -765,4 +765,20 @@ theorem select_tangent (c a0 a1 a2 t0 t1 t2 o : ℝ) (n : Blaze.I32) (p : Prop) 
 
 ```lean
 theorem rewrites_sound : Rewrite.AllSound
+```
+
+## V11
+
+**`Blaze.Mir.execStmt_putFar`** (`Blaze.Mir.Opt.SlotExecFar`, `lean`): A statement does the same whatever a slot of a frame that is not running holds, when no pointer in memory is into it.
+
+```lean
+theorem execStmt_putFar {B : FnId → Local → Prop} {g : List (Nat × FnId)} {f l : Nat}
+    (adts : List AdtDecl) {st : State} (h : HidesFar B g f l st) (sl : Slot) (fn : FnId)
+    (hfn : st.topFn = fn) :
+    ∀ (s : Statement), StmtFine B fn s →
+      execStmt adts (st.put f l sl) s =
+        Outcome.map (fun x => State.put x f l sl) (execStmt adts st s)
+  | Statement.assign p rv, hB =>
+    Outcome.bind_commutes_map (evalRvalue_putFar adts h sl rv) (fun r hr =>
+      have hr2 : HidesFar B g f l r.2
 ```

@@ -702,7 +702,7 @@ programs; it is the specification of the Rust pass of the same name.
     borrow, a statement that mentions the local neither as a place's base nor as an index
     does the same whatever the slot holds (`execStmt_put`), through every function of
     `Step.lean` up to `execStmt`.
-  - **`removeOverwritten`** (`Opt/RemoveOverwritten.lean`; checked at cc0f8f3ee7, `removeOverwritten_call` after it): the end
+  - **`removeOverwritten`** (`Opt/RemoveOverwritten.lean`; checked at 9aabce8584): the end
     theorem of the pieces above. In a block, `l = rv1; ..; l = rv2` becomes
     `nop; ..; l = rv2` when `l` is a whole local its function never borrows, `rv1` is a copy
     of a place with no index or a constant, and nothing between mentions `l`. A step runs a
@@ -745,8 +745,9 @@ programs; it is the specification of the Rust pass of the same name.
     drops it from the list (`State.write_setSlot_same`); a removed store adds one; a call
     leaves the caller's list as it is and starts the callee with none; a return drops the
     callee's.
-  - **What to build, in order:** `execStmt_put` for any frame (the running frame's fine
-    conditions only when the slot is in it); the list of replacements with its commutation
+  - **Built so far:** (a) `Opt/SlotExecFar.lean`, `execStmt_putFar`: a statement does the
+    same whatever a hidden slot of a frame that is not running holds (not yet elaborated).
+  - **What to build, in order:** ~~`execStmt_put` for any frame~~ (a, above); the list of replacements with its commutation
     through a statement; `checkLiveness` and its two facts (a local dead on entry and not
     written is dead on exit; the removed store's local is dead after it); terminators,
     calls and returns on related states; `removeDead_refines` through `run_refines_inv`
@@ -755,7 +756,7 @@ programs; it is the specification of the Rust pass of the same name.
   programs have one normal form under the proved rewrites; `validate_sound`: an accepted
   pair runs alike for every fuel and state. It takes no witness and accepts only what the
   normal form identifies.
-- **A validator that takes a witness** (`Opt/Witness.lean`; checked at 7e339a7395, `removeOverwritten` as a rewrite after it). The witness
+- **A validator that takes a witness** (`Opt/Witness.lean`; checked at 9aabce8584). The witness
   is a script: the proved rewrites, in order, that take the program before a pass to the
   program after it (`Rewrite`: the block-local passes, `switchToGoto`, both threadings,
   merging, dead-block removal, a block permutation with its orders as data).
@@ -767,17 +768,17 @@ programs; it is the specification of the Rust pass of the same name.
   `removeOverwritten` is a rewrite too, proved for the calls whose caller hands over
   pointers into frame 0 only (`FrameZero`): `validateWith_sound` is for scripts without it
   (`allPlain`), `validateWith_sound_frameZero` for any script and those calls.
-  **The validator by symbolic execution, first piece** (`Opt/Sym.lean`; not yet
-  elaborated): `Expr`, what a local holds as a function of the locals when its block began,
+  **The validator by symbolic execution, first piece** (`Opt/Sym.lean`; checked at
+  9aabce8584): `Expr`, what a local holds as a function of the locals when its block began,
   with `Expr.eval`; a symbolic store, and `Reads` (the state agrees with it);
   `evalRvalue_sym`: an rvalue of the subset (`use`, `binary`, `checked`, `withOverflow`,
   `unary`, `cast` on constants and copies of whole locals: no move, no projection, no
   `ref`) evaluates to the value of its expression and leaves the state.
-  **Second piece** (`Opt/SymBlock.lean`; not yet elaborated): a block's statements as a
+  **Second piece** (`Opt/SymBlock.lean`; checked at 9aabce8584): a block's statements as a
   trace, the locals assigned in order with their expressions (`symStmts`), and what a trace
   means (`den`); `execStmts_sym`: executing the statements is the meaning of their trace,
   so statement lists with one trace do the same from every state (`execStmts_same`).
-  **Third piece** (`Opt/SymEq.lean`; not yet elaborated): a terminator with a symbolic
+  **Third piece** (`Opt/SymEq.lean`; checked at 9aabce8584): a terminator with a symbolic
   condition (`symTerm`), a block as its trace and symbolic terminator (`symBlock`,
   `execBlock_sym`), `symEq a b` (the same types and, block by block, blocks that are equal
   or have one symbolic form) with `symEq_sound` (they run alike, for every fuel and state),
