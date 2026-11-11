@@ -1035,9 +1035,10 @@ impl Persist for InferenceRecord {
         // 25: `comptime_loops`, after the named pattern types in the side table words.
         // 26: `SolverDiagnosticKind::ReflectedMemberUnmet` (solver kind 9).
         // 27: `InferenceDiagnostic::PrivateField::at`, an `offset_of!` field's position.
-        // 28: `InferenceDiagnostic::WholeValueWriteThroughRefinement` (tag 90).
-        // 28: `Adjust::ErrorUnion` (adjust code 16).
-        Part::U64(28),
+        // 28: `InferenceDiagnostic::WholeValueWriteThroughRefinement` (tag 90) and
+        //     `Adjust::ErrorUnion` (adjust code 16).
+        // 29: `InferenceDiagnostic::UnresolvedMethodCall::numeric_var`.
+        Part::U64(29),
         Part::Schema(<InferRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = InferenceRecordRef<'a>;
@@ -2275,6 +2276,7 @@ impl Sink {
                 name,
                 field_with_same_name,
                 assoc_func_with_same_name,
+                numeric_var,
             } => {
                 self.words.extend([9, local(*expr)]);
                 self.ty(tys, receiver);
@@ -2287,6 +2289,11 @@ impl Sink {
                         self.id(*it);
                     }
                 }
+                self.word(match numeric_var {
+                    None => 0,
+                    Some(crate::infer::NumericVar::Integer) => 1,
+                    Some(crate::infer::NumericVar::Float) => 2,
+                });
             }
             D::UnresolvedAssocItem { id, ty, name } => {
                 self.word(10);
@@ -3371,6 +3378,12 @@ impl Source<'_> {
                     1 => Some(self.id()?),
                     _ => return Err(self.invalid("an optional function of no kind")),
                 },
+                numeric_var: match self.word()? {
+                    0 => None,
+                    1 => Some(crate::infer::NumericVar::Integer),
+                    2 => Some(crate::infer::NumericVar::Float),
+                    _ => return Err(self.invalid("a numeric variable of no kind")),
+                },
             },
             10 => {
                 D::UnresolvedAssocItem { id: self.node()?, ty: self.ty(tys)?, name: self.name()? }
@@ -4069,6 +4082,7 @@ mod tests {
                 name: Name::new_root("frobnicate"),
                 field_with_same_name: Some(ty(types.unit)),
                 assoc_func_with_same_name: Some(FunctionId::from_id(id(7))),
+                numeric_var: Some(crate::infer::NumericVar::Float),
             },
             D::UnresolvedMethodCall {
                 expr: expr(6),
@@ -4076,6 +4090,15 @@ mod tests {
                 name: Name::new_root(""),
                 field_with_same_name: None,
                 assoc_func_with_same_name: None,
+                numeric_var: None,
+            },
+            D::UnresolvedMethodCall {
+                expr: expr(6),
+                receiver: ty(types.i32),
+                name: Name::new_root("saturating_add"),
+                field_with_same_name: None,
+                assoc_func_with_same_name: None,
+                numeric_var: Some(crate::infer::NumericVar::Integer),
             },
             D::UnresolvedAssocItem {
                 id: pat(6).into(),

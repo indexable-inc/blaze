@@ -57,7 +57,16 @@ fn crate_named(db: &Db, name: &str) -> Crate {
 
 /// The field types of `krate`'s struct `V`, in order, and the diagnostics of lowering them.
 fn fields(krate: &str, check: impl FnOnce(&Db, &[Ty<'_>], &[TyLoweringDiagnostic])) {
-    let db = fixture::db(FIXTURE).into_db();
+    fields_of(FIXTURE, krate, check)
+}
+
+/// [`fields`] in `fixture`.
+fn fields_of(
+    fixture: &str,
+    krate: &str,
+    check: impl FnOnce(&Db, &[Ty<'_>], &[TyLoweringDiagnostic]),
+) {
+    let db = fixture::db(fixture).into_db();
     blaze_query::db::attach(&db, || {
         let krate = crate_named(&db, krate);
         let v = crate_def_map(&db, krate)
@@ -123,11 +132,66 @@ fn a_member_that_is_not_a_known_named_type_is_refused_naming_why() {
     });
 }
 
-/// `other` shares `main`'s source root, so its file parses with the union; hir-ty refuses it,
-/// as the crate lacks the attribute.
+/// `other` lacks the attribute, so its file parses as Rust's though it shares `main`'s source
+/// root (a file is read under its own crate's extensions): its `A | B` is the syntax error it
+/// is in Rust, and no union of it reaches hir-ty. `main`'s file, read under `main`'s, has none.
 #[test]
-fn a_crate_without_the_attribute_is_refused() {
-    fields("other", |_, _, diagnostics| {
+fn a_crate_without_the_attribute_parses_no_union() {
+    let db = fixture::db(FIXTURE).into_db();
+    blaze_query::db::attach(&db, || {
+        let (main, other) = (crate_named(&db, "main"), crate_named(&db, "other"));
+        assert!(main.extensions(&db).error_unions());
+        assert!(other.extensions(&db).is_none());
+        let (main, other) = (main.root_file_id(&db), other.root_file_id(&db));
+        assert!(main.extensions(&db).error_unions() && other.extensions(&db).is_none());
+        let errors = main.parse(&db).errors();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!other.parse(&db).errors().is_empty(), "`A | B` is no type in `other`");
+    })
+}
+
+/// Unions a macro carries: `main`, with the attribute, writes one in its macro's definition
+/// and hands one to a macro; `plain`, without it, calls `main`'s macro.
+const IN_MACROS: &str = r#"
+//- minicore: sized, error_union
+//- /main.rs crate:main
+#![blaze::error_unions]
+pub struct A;
+pub struct B;
+#[macro_export]
+macro_rules! union_of { ($a:ty, $b:ty) => { $a | $b }; }
+macro_rules! same { ($t:ty) => { $t }; }
+struct V {
+    written: union_of!(A, B),
+    handed: same!(B | A),
+    outside: A | B,
+}
+//- /plain.rs crate:plain deps:main
+struct V {
+    written: main::union_of!(main::A, main::B),
+}
+"#;
+
+/// In a crate with the attribute, `A | B` written by the crate's macro or handed to one is
+/// the union it is outside a macro: a token is parsed under the extensions of the crate that
+/// wrote it, in a matcher's `$t:ty` and in the expansion.
+#[test]
+fn a_union_in_a_gated_crates_macro_is_the_union() {
+    fields_of(IN_MACROS, "main", |_, tys, diagnostics| {
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let [written, handed, outside] = tys else { panic!("{tys:?}") };
+        assert!(matches!(outside.kind(), TyKind::Adt(..)), "{outside:?}");
+        assert_eq!(written, outside);
+        assert_eq!(handed, outside);
+    });
+}
+
+/// The `|` of `main`'s macro is `main`'s, so its expansion in `plain` parses to a union type
+/// (no syntax error there), and lowering refuses it by `plain`'s missing attribute, naming
+/// the rule: the type is never quietly another one.
+#[test]
+fn a_gated_crates_macro_union_is_refused_in_a_crate_without_the_attribute() {
+    fields_of(IN_MACROS, "plain", |_, _, diagnostics| {
         assert_eq!(refusals(diagnostics), [ErrorUnionRefusal::NotEnabled], "{diagnostics:?}");
     });
 }
@@ -170,6 +234,12 @@ fn needs_clone<E: Clone>(_: &E) {}
 fn in_return(a: A) -> AB { a }
 fn as_argument(b: B) { take(b) }
 fn in_typed_let(b: B) { let _x: A | B = b; }
+macro_rules! union_of { ($a:ty, $b:ty) => { $a | $b }; }
+macro_rules! typed_let { ($t:ty, $e:expr) => { { let _x: $t = $e; } }; }
+fn in_macro_written(a: A) -> union_of!(A, B) { a }
+fn in_macro_handed(b: B) { typed_let!(A | B, b) }
+#[test]
+fn under_test() { let _x: A | B = B; }
 fn in_err(a: A) -> Result<(), AB> { Err(a) }
 fn subset_union(ab: AB) -> ABC { ab }
 fn same_union(ab: B | A) -> AB { ab }
@@ -233,6 +303,19 @@ fn assert_clean(name: &str, result: &InferenceResult<'_>) {
 #[test]
 fn a_member_coerces_to_the_union_wherever_a_union_is_expected() {
     for name in ["in_return", "as_argument", "in_typed_let", "in_err", "subset_union"] {
+        inferred("main", name, |_, result, widened| {
+            assert_clean(name, result);
+            assert_eq!(widened, 1, "{name} widens once");
+        });
+    }
+}
+
+/// A union a macro's definition writes, one handed to a macro, and one in a function under
+/// `#[test]` (read as the attribute macro's expansion) type-check as one outside a macro
+/// does: the member coerces to it, once.
+#[test]
+fn a_member_coerces_to_a_union_a_macro_carries() {
+    for name in ["in_macro_written", "in_macro_handed", "under_test"] {
         inferred("main", name, |_, result, widened| {
             assert_clean(name, result);
             assert_eq!(widened, 1, "{name} widens once");

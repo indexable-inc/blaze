@@ -67,9 +67,9 @@ fn type_or_union(p: &mut Parser<'_>, allow_bounds: bool) {
 }
 
 /// Whether the parser is at the `|` between two members of an error union: a lone `|`, not
-/// the first of `||` or `|=`.
+/// the first of `||` or `|=`, that a crate with the extension wrote.
 fn at_union_bar(p: &Parser<'_>) -> bool {
-    p.at(T![|]) && !p.at(T![||]) && !p.at(T![|=])
+    p.at(T![|]) && !p.at(T![||]) && !p.at(T![|=]) && p.union_bar_gate()
 }
 
 fn type_with_bounds_cond(p: &mut Parser<'_>, allow_bounds: bool) {

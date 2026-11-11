@@ -82,11 +82,6 @@ impl SyntaxTreeBuilder {
     }
 
     /// The tree and the errors given; a tree with lazy nodes expands them with
-    /// [`crate::parsing::expand_lazy`] in `edition` and under `gates`.
-    pub(crate) fn finish_raw(
-        mut self,
-        edition: parser::Edition,
-        gates: parser::SyntaxGates,
     /// [`crate::parsing::expand_lazy`] in `edition` and under `extensions`.
     pub(crate) fn finish_raw(
         mut self,
@@ -94,7 +89,6 @@ impl SyntaxTreeBuilder {
         extensions: parser::Extensions,
     ) -> (FlatTree, Vec<SyntaxError>) {
         if self.lazy {
-            let data = crate::parsing::lazy_data(edition, gates);
             let data = crate::parsing::lazy_data(edition, extensions);
             self.inner.expand_with(crate::parsing::expand_lazy, data);
         }
@@ -111,7 +105,6 @@ impl SyntaxTreeBuilder {
     }
 
     fn finish_as<T>(self) -> Parse<T> {
-        let (tree, errors) = self.finish_raw(parser::Edition::CURRENT, parser::SyntaxGates::NONE);
         let (tree, errors) = self.finish_raw(parser::Edition::CURRENT, parser::Extensions::NONE);
         let tree = Tree(Arc::new(tree)); // alloc: the tree's one shared box, once per parse
         // Disable block validation, see https://github.com/rust-lang/rust-analyzer/pull/10357

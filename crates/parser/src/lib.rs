@@ -43,7 +43,6 @@ mod tests;
 
 pub(crate) use token_set::TokenSet;
 
-pub use edition::{Edition, SyntaxGates};
 pub use edition::{Edition, Extensions};
 
 pub use crate::{

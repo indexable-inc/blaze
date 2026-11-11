@@ -142,7 +142,7 @@ pub fn fix(
             );
         }
         let edition = krate.edition(db);
-        let gates = krate.syntax_gates(db);
+        let extensions = krate.extensions(db);
         let mut made = Vec::with_capacity(planned.len());
         for (file, mut fixes) in planned {
             fixes.sort_by_key(|it| (it.parts[0].0.start(), it.parts[0].0.end()));
@@ -160,7 +160,7 @@ pub fn fix(
                     }
                 }
             }
-            let id = EditionedFileId::new_gated(db, file, edition, gates);
+            let id = EditionedFileId::new_with_extensions(db, file, edition, extensions);
             let parse = id.parse(db).clone(); // clone: two `Arc` counts, the working copy's
             let text = db.file_text(file);
             let appended = text.appended_root_module(db);
@@ -190,11 +190,8 @@ pub fn fix(
             for (file, appended, working) in &made {
                 if working.parse.errors().is_empty() {
                     let content = FileText::content_of(working.bytes(), *appended);
-                    EditionedFileId::new_gated(db, *file, edition, gates).seed_parse(
-                        db,
-                        content,
-                        &working.parse,
-                    );
+                    let id = EditionedFileId::new_with_extensions(db, *file, edition, extensions);
+                    id.seed_parse(db, content, &working.parse);
                 }
             }
         });

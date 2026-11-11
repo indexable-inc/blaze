@@ -367,10 +367,10 @@ impl Crate {
         self.id.data(db).edition
     }
 
-    /// The syntax gates the crate turns on (`#![blaze::uniq]`): its files parse and print
-    /// under them ([`base_db::Crate::syntax_gates`]).
-    pub fn syntax_gates(self, db: &Db) -> span::SyntaxGates {
-        self.id.syntax_gates(db)
+    /// The syntax extensions the crate turns on (`#![blaze::uniq]`): its files parse and print
+    /// under them ([`base_db::Crate::extensions`]).
+    pub fn extensions(self, db: &Db) -> span::Extensions {
+        self.id.extensions(db)
     }
 
     pub fn version(self, db: &Db) -> Option<String> {
@@ -6171,6 +6171,19 @@ impl<'db> Type<'db> {
     /// A type within this one, which holds no rigid aliases as this one holds none.
     fn derived(&self, ty: Ty<'db>) -> Self {
         Type { owner: self.owner, ty: EarlyBinder::bind_no_rigid_aliases(ty) }
+    }
+
+    /// Every numeric primitive type, the integers and the floats, each a type of the same
+    /// owner as `self`, so its methods are looked up from the crate `self` is of: the types a
+    /// number whose type is not decided yet (`{integer}`, `{float}`) can still become.
+    pub fn numeric_primitives(&self, db: &'db Db) -> Vec<Type<'db>> {
+        use hir_def::builtin_type::BuiltinType as Builtin;
+        let interner = DbInterner::new_no_crate(db);
+        Builtin::all_builtin_types()
+            .into_iter()
+            .filter(|(_, it)| matches!(it, Builtin::Int(_) | Builtin::Uint(_) | Builtin::Float(_)))
+            .map(|(_, it)| self.derived(Ty::from_builtin_type(interner, it)))
+            .collect() // alloc: an error's candidates, on the error path
     }
 
     /// The type as the front end has it, for rustc's printing and checks outside `hir`.

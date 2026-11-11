@@ -121,6 +121,7 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::LossyAs
         | Lint::GlobalState
         | Lint::AsyncFn
+        | Lint::MutRef
         // Kept with `#[expect(..)]` on the function: a mark is the item's choice, not a line's.
         | Lint::UnmarkedPure
         | Lint::UnmarkedNopanic

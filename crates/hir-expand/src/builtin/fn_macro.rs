@@ -405,10 +405,17 @@ fn stringify_expand<'f>(
 
 /// Formats the binary operators and paths in the expression reported by a failed assertion.
 /// `stringify!` instead preserves the token spacing supplied by the caller. Appended to `out`.
-pub(crate) fn write_assert_condition(out: &mut String, tokens: &str, edition: Edition) {
+/// `tokens` is read in `edition` and under `extensions`, those of the crate that wrote the
+/// assertion, so it is shown as that crate parses it.
+pub(crate) fn write_assert_condition(
+    out: &mut String,
+    tokens: &str,
+    edition: Edition,
+    extensions: span::Extensions,
+) {
     use syntax::{SyntaxKind, T};
 
-    let parse = syntax::ast::Expr::parse(tokens, edition);
+    let parse = syntax::ast::Expr::parse_with(tokens, edition, extensions);
     let expr = parse.root();
     let start = out.len();
     let mut whitespace = false;
@@ -465,7 +472,8 @@ fn assert_expand<'f>(
         const HEAD: &str = "assertion failed: ";
         let mut message = blaze_mem::scratch::lend_string();
         message.push_str(HEAD);
-        write_assert_condition(&mut message, &tokens, span.ctx.edition(db));
+        let extensions = span.anchor.file_id.extensions();
+        write_assert_condition(&mut message, &tokens, span.ctx.edition(db), extensions);
         message
     });
     let panic_2021 = message.is_none() && use_panic_2021(db, span);
@@ -1171,8 +1179,8 @@ fn relative_file(
     if res == call_site && !allow_recursion {
         Err(ExpandError::other(err_span, format!("recursive inclusion of `{path_str}`"))) // alloc: an error's message, on the error path
     } else {
-        let (edition, gates) = (lookup.krate.data(db).edition, lookup.krate.syntax_gates(db));
-        Ok(EditionedFileId::new_gated(db, res, edition, gates))
+        let (edition, extensions) = (lookup.krate.data(db).edition, lookup.krate.extensions(db));
+        Ok(EditionedFileId::new_with_extensions(db, res, edition, extensions))
     }
 }
 
@@ -1643,6 +1651,7 @@ mod assert_condition_tests {
             &mut out,
             r#"value<= Self :: MAX && "A :: B".is_empty()"#,
             Edition::CURRENT,
+            span::Extensions::NONE,
         );
         assert_eq!(out, r#"value <= Self::MAX && "A :: B".is_empty()"#);
     }
@@ -1652,10 +1661,10 @@ mod assert_condition_tests {
     #[test]
     fn appends_after_the_head() {
         let mut out = String::from("assertion failed: ");
-        write_assert_condition(&mut out, "!x", Edition::CURRENT);
+        write_assert_condition(&mut out, "!x", Edition::CURRENT, span::Extensions::NONE);
         assert_eq!(out, "assertion failed: !x");
         let mut out = String::from("assertion failed: ");
-        write_assert_condition(&mut out, "a ==b", Edition::CURRENT);
+        write_assert_condition(&mut out, "a ==b", Edition::CURRENT, span::Extensions::NONE);
         assert_eq!(out, "assertion failed: a == b");
     }
 }

@@ -64,7 +64,7 @@ use blaze_query::db::{Durability, Setter};
 use cfg::CfgOptions;
 use intern::{Symbol, sym};
 use itertools::Itertools;
-use span::Edition;
+use span::{Edition, Extensions};
 use std::alloc::Global;
 use test_utils::{
     CURSOR_MARKER, ESCAPED_CURSOR_MARKER, Fixture as FixtureFile, FixtureWithProjectMeta, MiniCore,
@@ -266,7 +266,11 @@ impl Fixture {
         self.db
     }
 
-    /// The fixture's own files, in its order (not minicore's or the proc macros').
+    /// The fixture's own files, in its order (not minicore's or the proc macros'). Each is
+    /// read as a file of its crate, in its edition and under the crate's syntax extensions
+    /// (`#![blaze::uniq]`, ...), so it is the id the crate's own queries make of it. A file's
+    /// crate is the one whose root is the nearest crate root at or before it in the fixture
+    /// (the first crate's, for a file before every root).
     pub fn files(&self) -> &[EditionedFileId] {
         &self.files
     }
@@ -468,6 +472,11 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
         }
     }
     let own_files = planned.len();
+    // The fixture's crate roots, in its order: what `Fixture::files` finds a file's crate by.
+    let mut root_files: Vec<usize> = crates.iter().map(|it| it.file).collect();
+    if root_files.is_empty() {
+        root_files.extend(default_root.as_ref().map(|(file, _)| *file));
+    }
 
     // `roots[i]` is the source root of the files `Planned::root` puts in `i`: the fixture's,
     // then minicore's, then the proc macros'. Their IDs are as rust-analyzer's fixture numbered
@@ -652,13 +661,19 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
             crates_id_map
         });
 
-    let files = ids[..own_files]
-        .iter()
-        .zip(&editions)
-        .map(|(&file, &edition)| EditionedFileId::new(&db, file, edition))
-        .collect();
-    let marked =
-        marked.map(|(at, edition, marks)| (EditionedFileId::new(&db, ids[at], edition), marks));
+    let all = all_crates(&db);
+    // The syntax extensions of the crate of the fixture's `at`th file (`Fixture::files`).
+    let extensions = |at: usize| -> Extensions {
+        let root = root_files.iter().rev().find(|&&root| root <= at).or(root_files.first());
+        let Some(&root) = root else { return Extensions::NONE };
+        let krate = all.iter().find(|krate| krate.data(&db).root_file_id == ids[root]);
+        krate.map_or(Extensions::NONE, |krate| krate.extensions(&db))
+    };
+    let id = |at: usize, edition: Edition| {
+        EditionedFileId::new_with_extensions(&db, ids[at], edition, extensions(at))
+    };
+    let files = editions.iter().enumerate().map(|(at, &edition)| id(at, edition)).collect();
+    let marked = marked.map(|(at, edition, marks)| (id(at, edition), marks));
     let paths = planned.into_iter().take(own_files).map(|it| it.path).collect();
     Fixture { db, files, paths, lines, sysroot_files, marked }
 }

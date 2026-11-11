@@ -93,50 +93,12 @@ impl fmt::Display for Edition {
     }
 }
 
-/// blaze's crate-level syntax gates: what a crate root's inner attributes turn on that changes
-/// how the crate's files parse (docs/v2/plan/design/edition.md). Each is off unless the crate
-/// asks for it, so a crate that asks for none parses exactly as rustc's grammar says. A file's
-/// tree is a function of its text, its [`Edition`] and these, and every key of a parse holds
-/// all three (span's `EditionedFileId` carries them beside the edition).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct SyntaxGates(u8);
-
-impl SyntaxGates {
-    /// No gate: rustc's grammar.
-    pub const NONE: SyntaxGates = SyntaxGates(0);
-    /// `#![blaze::uniq]`: `&uniq T`, `&'a uniq T`, `&uniq expr`, `&uniq self` and
-    /// `ref uniq x` are the unique reference, spelled for what it guarantees; each is exactly
-    /// its `mut` spelling from the syntax tree on.
-    pub const UNIQ: SyntaxGates = SyntaxGates(1);
-    /// How many low bits the gates take.
-    pub const BITS: u32 = 1;
-
-    /// The gates as their bits, for a key or an encoding.
-    pub const fn bits(self) -> u8 {
-        self.0
-    }
-
-    /// The gates of `bits`, `None` when a bit names no gate.
-    pub const fn from_bits(bits: u8) -> Option<SyntaxGates> {
-        match bits >> Self::BITS {
-            0 => Some(SyntaxGates(bits)),
-            _ => None,
-        }
-    }
-
-    /// Whether `#![blaze::uniq]` is on.
-    pub const fn uniq(self) -> bool {
-        self.0 & Self::UNIQ.0 != 0
-    }
-
-    /// These gates and `other`'s.
-    pub const fn with(self, other: SyntaxGates) -> SyntaxGates {
-        SyntaxGates(self.0 | other.0)
 /// blaze's syntax extensions a crate turns on with a crate attribute, which change what the
-/// parser accepts: with none on, the parser is Rust's, error for error. A file is parsed with
-/// its crate's set (the `span` crate's `EditionedFileId` carries it beside the edition), so the
-/// set is part of every key a parse is stored under. Each bit is one extension; the set is
-/// closed, and an unknown bit is refused when read back ([`Extensions::from_bits`]).
+/// parser accepts (docs/v2/plan/design/edition.md): with none on, the parser is Rust's, error
+/// for error. A file's tree is a function of its text, its [`Edition`] and this set, and every
+/// key of a parse holds all three (the `span` crate's `EditionedFileId` carries the set beside
+/// the edition). Each bit is one extension; the set is closed, and an unknown bit is refused
+/// when read back ([`Extensions::from_bits`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Extensions {
     bits: u8,
@@ -145,13 +107,22 @@ pub struct Extensions {
 impl Extensions {
     /// No extension: Rust's syntax.
     pub const NONE: Extensions = Extensions { bits: 0 };
+    /// `#![blaze::uniq]`: `&uniq T`, `&'a uniq T`, `&uniq expr`, `&uniq self`, `ref uniq x`
+    /// and the pattern `&uniq pat` are the unique reference, spelled for what it guarantees; each is exactly
+    /// its `mut` spelling from the syntax tree on (docs/v2/plan/design/edition.md, change 10).
+    pub const UNIQ: Extensions = Extensions { bits: 1 << 0 };
     /// `#![blaze::error_unions]`: `A | B` in type position (docs/v2/plan/design/edition.md,
     /// change 2).
-    pub const ERROR_UNIONS: Extensions = Extensions { bits: 1 };
+    pub const ERROR_UNIONS: Extensions = Extensions { bits: 1 << 1 };
+    /// Every extension, in bit order: what a test walks to cover each set.
+    pub const ALL: [Extensions; 2] = [Extensions::UNIQ, Extensions::ERROR_UNIONS];
+    /// How many low bits the set takes: one per extension.
+    pub const BITS: u32 = Self::ALL.len() as u32;
     /// Every bit some extension has.
-    const KNOWN: u8 = 1;
+    const KNOWN: u8 = (1 << Self::BITS) - 1;
 
-    /// The set as one byte, as [`Extensions::from_bits`] reads it back.
+    /// The set as one byte, for a key or an encoding, as [`Extensions::from_bits`] reads it
+    /// back.
     pub const fn bits(self) -> u8 {
         self.bits
     }
@@ -173,6 +144,11 @@ impl Extensions {
     /// Whether no extension is on.
     pub const fn is_none(self) -> bool {
         self.bits == 0
+    }
+
+    /// Whether `#![blaze::uniq]` is on.
+    pub const fn uniq(self) -> bool {
+        self.bits & Self::UNIQ.bits != 0
     }
 
     /// Whether `#![blaze::error_unions]` is on.

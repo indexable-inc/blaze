@@ -175,7 +175,7 @@ impl<'h, 't> Printer<'h, 't> {
     /// that says `#![blaze::uniq]` (docs/v2/plan/design/edition.md, change 10), which writes
     /// it so, else rustc's `mut `.
     pub(crate) fn unique_ref(&self) -> &'static str {
-        match self.host.is_some_and(|host| host.krate().syntax_gates(self.db).uniq()) {
+        match self.host.is_some_and(|host| host.krate().extensions(self.db).uniq()) {
             true => "uniq ",
             false => "mut ",
         }

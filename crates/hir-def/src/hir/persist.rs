@@ -1147,7 +1147,7 @@ impl Code for span::EditionedFileId {
         match Self::is_valid_raw(raw) {
             true => Ok(Self::from_raw(raw)),
             false => Err(r.invalid(
-                "a file id with reserved bits, an edition out of range or unknown syntax gates",
+                "a file id with reserved bits, an edition out of range or an unknown syntax extension",
             )),
         }
     }

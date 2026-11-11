@@ -153,8 +153,8 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::unmarked_nopanic",
             "blaze::unmarked_noalloc",
             "blaze::unmarked_nonblocking",
+            "blaze::mut_ref",
         ],
-        &["blaze::lossy_as", "blaze::global_state", "blaze::async_fn", "blaze::mut_ref"],
     ),
     (
         "blaze::internal",

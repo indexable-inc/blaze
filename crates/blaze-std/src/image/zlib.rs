@@ -313,7 +313,7 @@ pub(crate) fn compress<A: Allocator + Clone>(data: &[u8], alloc: A) -> Result<Ve
     let hash = |at: usize| -> usize {
         ((usize::from(data[at]) << 10) ^ (usize::from(data[at + 1]) << 5) ^ usize::from(data[at + 2])) & (HASH_SIZE - 1)
     };
-    let mut pos = 0;
+    let mut pos = 0usize;
     loop {
         let start = pos;
         let end = start.saturating_add(BLOCK).min(n);

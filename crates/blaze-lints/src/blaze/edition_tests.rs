@@ -1,14 +1,10 @@
-//! The lints of `blaze::edition` (`lossy_as`, `global_state`, `async_fn`): what each finds and
-//! leaves alone, and that the group is off until turned on, over an `std` of their own: a
-//! `thread_local!` that declares one `const` key per item and calls itself for the rest, as
-//! std's does, and an atomic holding an `UnsafeCell`. Then the four `unmarked_*` lints, over
-//! the effects tests' toolchain (an `Allocator`, a `Vec` that allocates through one, a
-//! `Mutex::lock`, `env::var` and `SystemTime::now` at the paths the models name): what each
-//! finds, what it leaves, and where each fix writes its attribute.
 //! The lints of `blaze::edition` (`lossy_as`, `global_state`, `async_fn`, `mut_ref`): what each
 //! finds and leaves alone, `mut_ref`'s fix, and that the group is off until turned on, over an
 //! `std` of their own: a `thread_local!` that declares one `const` key per item and calls itself
-//! for the rest, as std's does, and an atomic holding an `UnsafeCell`.
+//! for the rest, as std's does, and an atomic holding an `UnsafeCell`. Then the four
+//! `unmarked_*` lints, over the effects tests' toolchain (an `Allocator`, a `Vec` that
+//! allocates through one, a `Mutex::lock`, `env::var` and `SystemTime::now` at the paths the
+//! models name): what each finds, what it leaves, and where each fix writes its attribute.
 
 use std::path::PathBuf;
 
@@ -740,10 +736,14 @@ pub fn mix(a: u32, b: u32) -> u32 {
     for word in ["pure", "noalloc", "nonblocking"] {
         assert!(on.contains(&format!("`fn mix` is proved {word} ")), "{word}:\n{on}");
     }
+}
+
+// mut_ref
+
 /// `mut_ref`'s crate: each unique reference spelled with `mut` (receivers with and without a
 /// lifetime, types, borrows, one whose operand starts with `<`, a `ref mut` binding), beside
 /// what it leaves alone (a `&uniq` already, `let mut`, a `mut` binding, `*mut`, `&raw mut`,
-/// and what a macro writes).
+/// and what a macro's definition writes).
 const UNIQ_MAIN: &str = r#"
 #![blaze::uniq]
 pub struct S { pub n: u32 }
@@ -824,6 +824,107 @@ fn mut_ref_fix_respells_mut_as_uniq() {
         assert!(after.contains(want), "{want:?} in:\n{after}");
     }
     assert_eq!(after.matches("uniq").count(), 1 + 1 + 8, "{after}");
+}
+
+/// A crate that hands a macro call unique references spelled with `mut`: the arguments of a
+/// `macro_rules!` call, and what the macro's own definition writes (left alone).
+const UNIQ_HANDED: &str = r#"
+#![blaze::uniq]
+pub fn take(r: &uniq u32) { *r = 1; }
+macro_rules! pass {
+    ($e:expr) => { { let mut own = 0u32; take(&mut own); $e } };
+}
+pub fn handed() {
+    let mut x = 0u32;
+    pass!(take(&mut x));
+    pass!(take(&uniq x));
+}
+"#;
+
+/// What a macro call of the file is handed is found where the file writes it and fixed there,
+/// and the fixed call still expands, parses and lints clean (`fixed_mut_ref` lints it again):
+/// a token keeps its crate's syntax through the macro. What the macro's definition wrote is
+/// left alone.
+#[test]
+fn mut_ref_finds_and_fixes_what_a_macro_call_is_handed() {
+    let found = only("mut_ref", UNIQ_HANDED);
+    assert_eq!(found.matches("which `#![blaze::uniq]` spells").count(), 1, "{found}");
+    assert!(found.contains("pass!(take(&mut x));"), "at the call's own text:\n{found}");
+    let after = fixed_mut_ref(UNIQ_HANDED);
+    for want in [
+        "    pass!(take(&uniq x));\n    pass!(take(&uniq x));\n",
+        "($e:expr) => { { let mut own = 0u32; take(&mut own); $e } };",
+        "let mut x = 0u32;",
+    ] {
+        assert!(after.contains(want), "{want:?} in:\n{after}");
+    }
+}
+
+/// A function under an attribute macro (`#[test]`), which is linted as the expansion the
+/// macro makes of it: its `&mut` is found and fixed in the file, and the fixed function, read
+/// again through the expansion, lints clean.
+#[test]
+fn mut_ref_finds_and_fixes_a_function_under_an_attribute_macro() {
+    const MAIN: &str = r#"
+#![blaze::uniq]
+pub fn take(r: &uniq u32) { *r = 1; }
+#[test]
+fn under_test() {
+    let mut x = 0u32;
+    take(&mut x);
+}
+"#;
+    let found = only("mut_ref", MAIN);
+    assert_eq!(found.matches("which `#![blaze::uniq]` spells").count(), 1, "{found}");
+    let after = fixed_mut_ref(MAIN);
+    assert!(after.contains("    take(&uniq x);\n"), "{after}");
+    assert!(after.contains("let mut x = 0u32;"), "{after}");
+}
+
+/// Reference patterns spelled with `mut` (over a tuple, a tuple struct and a binding), beside
+/// one already spelled `uniq`, a shared one, and a `mut` binding.
+const UNIQ_PATS: &str = r#"
+#![blaze::uniq]
+pub struct P(pub u32);
+pub fn pats(r: &uniq (u32, u32), q: &uniq P, o: Option<&uniq u32>) {
+    let &mut (ref a, _) = r;
+    let &mut P(ref b) = q;
+    if let Some(&mut c) = o { let _ = c; }
+    let _ = (a, b);
+}
+pub fn kept(r: &uniq u32, s: &u32) {
+    let &uniq d = r;
+    let &e = s;
+    let mut f = d;
+    f = e;
+    let _ = f;
+}
+"#;
+
+/// A reference pattern `&mut pat` is found and respelled `&uniq pat`, which is the same
+/// pattern (the fixed file lints clean and has no new error); `&uniq pat`, `&pat` and a `mut`
+/// binding are left alone.
+#[test]
+fn mut_ref_finds_and_fixes_reference_patterns() {
+    let found = only("mut_ref", UNIQ_PATS);
+    assert_eq!(found.matches("which `#![blaze::uniq]` spells `&uniq`").count(), 3, "{found}");
+    assert_eq!(
+        found.matches("the reference pattern in `fn pats` is spelled `&mut`").count(),
+        3,
+        "{found}"
+    );
+    assert!(!found.contains("in `fn kept`"), "{found}");
+    let after = fixed_mut_ref(UNIQ_PATS);
+    for want in [
+        "let &uniq (ref a, _) = r;",
+        "let &uniq P(ref b) = q;",
+        "if let Some(&uniq c) = o { let _ = c; }",
+        "let &uniq d = r;",
+        "let &e = s;",
+        "let mut f = d;",
+    ] {
+        assert!(after.contains(want), "{want:?} in:\n{after}");
+    }
 }
 
 /// In a crate without `#![blaze::uniq]`, `uniq` is no keyword, so `mut_ref` says nothing.

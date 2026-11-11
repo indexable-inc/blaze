@@ -2347,12 +2347,20 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     _ => None,
                 };
 
+                // rustc's `report_failed_method_call_on_numerical_infer_var`: the receiver is
+                // an integer or float variable here, whatever a later use decides it to be.
+                let numeric_var = match receiver_ty.kind() {
+                    TyKind::Infer(InferTy::IntVar(_)) => Some(super::NumericVar::Integer),
+                    TyKind::Infer(InferTy::FloatVar(_)) => Some(super::NumericVar::Float),
+                    _ => None,
+                };
                 self.push_diagnostic(InferenceDiagnostic::UnresolvedMethodCall {
                     expr: tgt_expr,
                     receiver: receiver_ty.store(),
                     name: *method_name,
                     field_with_same_name: field_with_same_name_exists.map(|it| it.store()),
                     assoc_func_with_same_name: assoc_func_with_same_name.map(|it| it.def_id),
+                    numeric_var,
                 });
 
                 let recovered = match assoc_func_with_same_name {

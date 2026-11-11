@@ -451,6 +451,50 @@ fn a_program_without_unions_parses_the_same_under_the_extension() {
     }
 }
 
+/// Each extension is its own bit: one turns on its syntax and leaves the other's the error
+/// it is in Rust, both turn on both, and none is today's parse.
+#[test]
+fn each_extension_turns_on_its_own_syntax_only() {
+    use crate::Extensions;
+    let uniq_text = "fn f(r: &uniq u32) {}\n";
+    let union_text = "fn f(e: A | B) {}\n";
+    let parse = |text: &str, extensions| {
+        SourceFile::parse_shared_with(text, Edition::CURRENT, extensions)
+    };
+    let both = Extensions::UNIQ.with(Extensions::ERROR_UNIONS);
+    for (extensions, uniq, unions) in [
+        (Extensions::NONE, false, false),
+        (Extensions::UNIQ, true, false),
+        (Extensions::ERROR_UNIONS, false, true),
+        (both, true, true),
+    ] {
+        let (r, e) = (parse(uniq_text, extensions), parse(union_text, extensions));
+        assert_eq!(r.errors().is_empty(), uniq, "`&uniq T` under {extensions:?}");
+        assert_eq!(e.errors().is_empty(), unions, "`A | B` under {extensions:?}");
+        assert_eq!(union_types(&e), usize::from(unions), "{extensions:?}");
+        assert_eq!((r.extensions(), e.extensions()), (extensions, extensions));
+    }
+    for text in [uniq_text, union_text] {
+        let none = parse(text, Extensions::NONE);
+        assert_eq!(none, SourceFile::parse_shared(text, Edition::CURRENT));
+    }
+}
+
+#[test]
+fn extensions_round_trip_their_bits_and_refuse_unknown_ones() {
+    use crate::Extensions;
+    let both = Extensions::UNIQ.with(Extensions::ERROR_UNIONS);
+    for extensions in [Extensions::NONE, Extensions::UNIQ, Extensions::ERROR_UNIONS, both] {
+        assert_eq!(Extensions::from_bits(extensions.bits()), Some(extensions));
+    }
+    assert!(Extensions::NONE.is_none() && !Extensions::UNIQ.is_none());
+    assert!(both.uniq() && both.error_unions());
+    assert!(Extensions::UNIQ.uniq() && !Extensions::UNIQ.error_unions());
+    assert!(!Extensions::ERROR_UNIONS.uniq() && Extensions::ERROR_UNIONS.error_unions());
+    assert_eq!(Extensions::from_bits(1 << Extensions::BITS), None);
+    assert_eq!(Extensions::from_bits(0x80), None);
+}
+
 #[test]
 fn an_outline_parses_its_lazy_bodies_under_its_extensions() {
     let text = "fn f() { let x: A | B = y; }\n";

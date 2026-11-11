@@ -18,7 +18,6 @@
 
 use std::cell::Cell;
 
-use parser::{Edition, LexedStr, OutlineStep, Reparser, Step, SyntaxGates};
 use parser::{Edition, Extensions, LexedStr, OutlineStep, Reparser, Step};
 use syntax_tree::{FlatTree, Language, Splice, Text};
 
@@ -41,8 +40,6 @@ const AFTER_ITEM: usize = 16;
 
 /// The tree of `tree`'s text with `delete` replaced by `insert`, its errors (`errors`, those
 /// of `tree`, merged with those of what was parsed again) and the range of the old text parsed
-/// again. `outline` is the edition of an outline; `gates` are the syntax gates `tree` was
-/// parsed under, which every part parsed again is parsed under too.
 /// again. `outline` is the edition of an outline; `extensions` are the syntax extensions the
 /// tree was parsed under, which the parse again is too.
 pub(crate) fn incremental_reparse(
@@ -51,7 +48,6 @@ pub(crate) fn incremental_reparse(
     insert: &str,
     errors: impl IntoIterator<Item = SyntaxError>,
     edition: Edition,
-    gates: SyntaxGates,
     extensions: Extensions,
     outline: Option<Edition>,
 ) -> Option<(FlatTree, Vec<SyntaxError>, TextRange)> {
@@ -65,7 +61,6 @@ pub(crate) fn incremental_reparse(
         insert,
         &source[usize::from(delete.end())..],
     ]);
-    reparse_onto(tree, delete, insert, &new_source, errors, edition, gates, outline)
     reparse_onto(tree, delete, insert, &new_source, errors, edition, extensions, outline)
 }
 
@@ -77,7 +72,6 @@ pub(crate) fn incremental_reparse_onto(
     new_source: &Text,
     errors: impl IntoIterator<Item = SyntaxError>,
     edition: Edition,
-    gates: SyntaxGates,
     extensions: Extensions,
     outline: Option<Edition>,
 ) -> Option<(FlatTree, Vec<SyntaxError>, TextRange)> {
@@ -89,7 +83,6 @@ pub(crate) fn incremental_reparse_onto(
         .checked_sub(tree.source().len())
         .expect("the edit deletes no more than the old text has");
     let insert = &new_source[start..start + insert_len];
-    reparse_onto(tree, delete, insert, new_source, errors, edition, gates, outline)
     reparse_onto(tree, delete, insert, new_source, errors, edition, extensions, outline)
 }
 
@@ -100,11 +93,9 @@ fn reparse_onto(
     new_source: &Text,
     errors: impl IntoIterator<Item = SyntaxError>,
     edition: Edition,
-    gates: SyntaxGates,
     extensions: Extensions,
     outline: Option<Edition>,
 ) -> Option<(FlatTree, Vec<SyntaxError>, TextRange)> {
-    let edit = Edit::new(tree, delete, insert, new_source, 0, edition, gates, outline.is_some());
     let edit =
         Edit::new(tree, delete, insert, new_source, 0, edition, extensions, outline.is_some());
     let mut unit = edit.unit()?;
@@ -126,7 +117,6 @@ pub(crate) fn reparse_all(
     new_source: &Text,
     errors: impl IntoIterator<Item = SyntaxError>,
     edition: Edition,
-    gates: SyntaxGates,
     extensions: Extensions,
     outline: Option<Edition>,
 ) -> Option<(FlatTree, Vec<SyntaxError>)> {
@@ -147,7 +137,6 @@ pub(crate) fn reparse_all(
             let before = edits.get(next).map_or(TextSize::of(&**tree.source()), |it| it.0.start());
             let bounds = TextRange::new(after, before);
             let attempt =
-                group.edit(tree, new_source, bounds, edition, gates, outline.is_some());
                 group.edit(tree, new_source, bounds, edition, extensions, outline.is_some());
             let unit = attempt.unit();
             let reach = attempt.reach.get();
@@ -198,15 +187,12 @@ impl Group {
         new_source: &'a Text,
         bounds: TextRange,
         edition: Edition,
-        gates: SyntaxGates,
         extensions: Extensions,
         outline: bool,
     ) -> Edit<'a> {
         let start = u32::from(self.delete.start()) as i64 + self.shift;
         let end = u32::from(self.delete.end()) as i64 + self.shift + self.grown;
         let insert = &new_source[start as usize..end as usize];
-        let edit =
-            Edit::new(tree, self.delete, insert, new_source, self.shift, edition, gates, outline);
         let edit = Edit::new(
             tree,
             self.delete,
@@ -303,9 +289,6 @@ struct Edit<'a> {
     /// it is not known from this edit alone.
     bounds: TextRange,
     edition: Edition,
-    /// The syntax gates the tree was parsed under ([`SyntaxGates`]): each part parsed again is
-    /// parsed under them.
-    gates: SyntaxGates,
     /// The syntax extensions the tree was parsed under, which each part parsed again is too.
     extensions: Extensions,
     outline: bool,
@@ -321,13 +304,11 @@ impl<'a> Edit<'a> {
         new_source: &'a Text,
         shift: i64,
         edition: Edition,
-        gates: SyntaxGates,
         extensions: Extensions,
         outline: bool,
     ) -> Edit<'a> {
         let reach = Cell::new(delete);
         let bounds = TextRange::up_to(TextSize::of(&**tree.source()));
-        Edit { tree, delete, insert, new_source, shift, bounds, edition, gates, outline, reach }
         Edit {
             tree,
             delete,
@@ -511,7 +492,6 @@ impl Edit<'_> {
         // clone: a count of the new text, which the node's tree shares
         let mut builder = SyntaxTreeBuilder::sourced_range(self.new_source.clone(), range);
         builder.lazy(BLOCK_EXPR, TextSize::of(text));
-        let (with, _no_errors) = builder.finish_raw(self.edition, self.gates);
         let (with, _no_errors) = builder.finish_raw(self.edition, self.extensions);
         self.parsed(at, Some(with), lexer_errors(&lexed, TextSize::new(0)).collect())
     }
@@ -531,9 +511,7 @@ impl Edit<'_> {
             return None;
         }
         let input = lexed.to_input(self.edition);
-        let tokens = input.tokens().with_gates(self.gates);
-        let mut input = lexed.to_input(self.edition);
-        input.set_extensions(self.extensions);
+        let tokens = input.tokens().with_extensions(self.extensions);
         let output = match in_full {
             true => reparser.parse(tokens),
             false => reparser.parse_outline(tokens),
@@ -541,7 +519,6 @@ impl Edit<'_> {
         // clone: a count of the new text, which the node's tree shares
         let source = self.new_source.clone();
         let (with, errors) =
-            build_node(source, range, &lexed, &output, self.edition, self.gates, kind)?;
             build_node(source, range, &lexed, &output, self.edition, self.extensions, kind)?;
         self.parsed(at, Some(with), errors)
     }
@@ -583,9 +560,7 @@ impl Edit<'_> {
         // `lexes_alone` showed the lexer ends a token where the item ends.
         let ahead = LexedStr::new(self.edition, &tree.source()[usize::from(range.end())..ahead]);
         let input = lexed.to_input_followed_by(&ahead, self.edition);
-        let tokens = input.tokens().with_gates(self.gates);
-        let mut input = lexed.to_input_followed_by(&ahead, self.edition);
-        input.set_extensions(self.extensions);
+        let tokens = input.tokens().with_extensions(self.extensions);
         let output = match in_full {
             true => Reparser::top_level_item().parse(tokens),
             false => Reparser::top_level_item().parse_outline(tokens),
@@ -609,7 +584,6 @@ impl Edit<'_> {
         // clone: a count of the new text, which the node's tree shares
         let source = self.new_source.clone();
         let (with, errors) =
-            build_node(source, new, &lexed, &output, self.edition, self.gates, kind)?;
             build_node(source, new, &lexed, &output, self.edition, self.extensions, kind)?;
         self.parsed(at, Some(with), errors)
     }
@@ -844,7 +818,6 @@ mod tests {
                 replace_with,
                 before.errors.as_deref().unwrap_or_default().iter().cloned(),
                 Edition::CURRENT,
-                SyntaxGates::NONE,
                 Extensions::NONE,
                 None,
             )
@@ -1160,7 +1133,6 @@ enum Foo {
             "2 + 3",
             [],
             Edition::CURRENT,
-            SyntaxGates::NONE,
             Extensions::NONE,
             Some(Edition::CURRENT),
         )
