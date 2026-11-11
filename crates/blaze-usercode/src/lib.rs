@@ -24,6 +24,7 @@ pub mod confine;
 pub mod index;
 pub mod inputs;
 pub mod pool;
+pub mod provider;
 pub mod pure;
 pub mod roots;
 pub mod rule;

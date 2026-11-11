@@ -171,12 +171,23 @@ pub fn prepare(
     // The script's environment, and last the launcher's [`GIVEN`]: the names its key has,
     // which the program's environment holds alone; every other variable is lent to it and
     // traced as it is read.
-    let mut command_env = Vec::with_capacity(vars.len() + 1); // alloc: setup, the command's environment
+    let mut command_env = Vec::with_capacity(vars.len() + 2); // alloc: setup, the command's environment
     command_env.extend(vars.iter().cloned()); // clone: setup, as above; the check keeps its own
     command_env.push((
         GIVEN.into(),
         crate::confine::given_value(names.iter().map(OsString::as_os_str)).map_err(Error)?,
     ));
+    // The run's provider, after the launcher's `GIVEN` as no variable of the script's
+    // ([`Prepared::script_env`]): its seed is made of the key, so it adds nothing to it, and
+    // its wall clock is the build's `SOURCE_DATE_EPOCH`, which the run is traced as reading
+    // when it asks the time.
+    let epoch = vars
+        .iter()
+        .find(|(name, _)| name.as_os_str() == OsStr::new(crate::provider::SOURCE_DATE_EPOCH))
+        .map(|(_, value)| value.as_os_str());
+    let provider =
+        crate::provider::Provider::of(RunKind::BuildScript, &key, epoch).map_err(Error)?;
+    command_env.push(provider.entry());
     let command = Command {
         program: unit.script.clone(), // clone: setup, the command owns its program
         args: Vec::new(),             // alloc: none, an empty list
