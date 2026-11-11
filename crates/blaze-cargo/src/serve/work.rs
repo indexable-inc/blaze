@@ -777,6 +777,11 @@ pub trait Writer<S: Steps>: Send + 'static {
     fn began(&mut self, unit: usize) {
         let _ = unit;
     }
+    /// On the loop, as unit `unit` began and was found kept ([`Front::fresh`]): its compile
+    /// replays its record, and makes nothing in the front end for a release to let go.
+    fn found_kept(&mut self, unit: usize) {
+        let _ = unit;
+    }
     /// On the loop, as unit `unit`'s compile ended (its last phase gave its outcome, ok or
     /// not): nothing of this build compiles it again, and what its front end keeps for it
     /// alone may be let go, by a write [`Writer::waiting`] asks for.

@@ -5624,6 +5624,9 @@ impl<S: Steps> Jobs<S> {
         }
         build.writer.began(at);
         let fresh = build.is_fresh(at);
+        if fresh {
+            build.writer.found_kept(at);
+        }
         match fresh {
             true => job.fresh += 1,
             false => job.compiled += 1,

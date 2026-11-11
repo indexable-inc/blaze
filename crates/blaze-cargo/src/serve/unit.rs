@@ -884,6 +884,10 @@ impl Writer<Real> for UnitWriter {
         self.release.began(unit);
     }
 
+    fn found_kept(&mut self, unit: usize) {
+        self.release.kept(unit);
+    }
+
     fn compiled(&mut self, unit: usize) {
         self.release.compiled(unit);
     }
