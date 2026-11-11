@@ -2786,7 +2786,7 @@ impl Filed {
             span.record("bytes", bytes.len());
             return Ok(Written::Linked(bytes, root));
         }
-        let runs = || {
+        let runs = || -> Result<Written, blaze_link::LinkError> {
             let span = tracing::info_span!(
                 target: "blaze",
                 "link copy",
