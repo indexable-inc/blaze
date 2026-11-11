@@ -91,3 +91,18 @@ rust-src https://static.rust-lang.org/dist/2026-10-27/rust-src-nightly.tar.xz a9
 #   `PartialOrd`, `Ord`, `Hash` and `Default`, each when the tuple has it; and `Debug` over the
 #   trait `Fields` of tuples of up to twelve types. Unstable under `blaze_records`; nothing
 #   else in library/ refers to it (docs/v2/plan/design/records.md).
+# - std/src/sys/provider/ (new: mod.rs, derive.rs, given.rs) with its `pub mod provider;` in
+#   std/src/sys/mod.rs: where a process gets its randomness and its wall clock
+#   (docs/v2/plan/design/determinism.md, section A). The default is the system's and changes
+#   nothing. A process started with `__BLAZE_PROVIDER=1:<seed>:<wall>` in its environment (blaze
+#   does, for the build scripts it runs) takes the keys of `RandomState` and `fill_bytes` from
+#   the seed (SipHash-1-3, derive.rs, which blaze's `blaze_usercode::provider` includes by
+#   path: keep the file `core`-only) and, when `<wall>` is a time, `SystemTime::now` from it.
+#   The call sites, each under a `// blaze:` line and each a no-op for a process given none:
+#   `fill_bytes` and `hashmap_random_keys` in std/src/sys/random/linux.rs, `fill_bytes` in
+#   std/src/sys/random/apple.rs, the generic `hashmap_random_keys` in
+#   std/src/sys/random/mod.rs, `SystemTime::now` in std/src/sys/time/unix.rs,
+#   `sys::provider::init()` at the end of `init` in std/src/rt.rs, and
+#   `sys::provider::spawning()` at the top of `Command::spawn` and `Command::exec` in
+#   std/src/sys/process/unix/unix.rs, which gives each child a seed of its own through
+#   `replace_entry` (new) in std/src/sys/env/unix.rs.
