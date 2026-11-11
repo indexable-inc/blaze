@@ -22,13 +22,29 @@ const DEP: &str = "/dep";
 const LAYOUT: &str = "/b/layout";
 /// A directory's `since` while its watch is not confirmed.
 const UNCONFIRMED: u64 = u64::MAX;
+/// The checkout's source, a file of its one crate, by its path from the view's root.
+const SOURCE: &str = "src/lib.rs";
+/// A Rust file of the checkout the build script reads by its bytes.
+const HELD: &str = "gen/input.rs";
+/// The lock file.
+const LOCK: &str = "Cargo.lock";
 
 /// Everything a build of the model's checkout reads, and its output.
 #[derive(Clone, Debug)]
 struct World {
-    /// Two files of the checkout, by content: a source and the lock file.
+    /// Two files of the checkout, by content: a source (its tokens) and the lock file.
     source: u8,
     lock: u8,
+    /// The text of a `//` comment at the end of a line of the source: in no code text, so in
+    /// no key of a unit keyed by code text, and in the line a diagnostic quotes.
+    comment: u8,
+    /// The text of such a comment in [`HELD`], which the build script reads by its bytes.
+    held_comment: u8,
+    /// Whether the crate's unit is keyed by its code text (not when a lint of it reads
+    /// comments: clippy's, then keyed by its files' bytes).
+    narrow: bool,
+    /// Whether the build has a warning that quotes the source's commented line.
+    warns: bool,
     /// A header outside the view the build script read, under [`INCLUDE`].
     header: u8,
     /// How many files a directory the build script listed holds, when it lists one: no watch
@@ -66,6 +82,10 @@ impl World {
         World {
             source: 0,
             lock: 0,
+            comment: 0,
+            held_comment: 0,
+            narrow: true,
+            warns: false,
             header: 0,
             lists,
             listed: 0,
@@ -94,18 +114,22 @@ impl World {
         &mut self.outputs[usize::from(self.release)]
     }
 
-    /// What the build script makes in its `OUT_DIR`: a function of the header it reads.
+    /// What the build script makes in its `OUT_DIR`: a function of the header it reads and
+    /// of the bytes of [`HELD`].
     fn generated(&self) -> String {
-        format!("generated from header {}", self.header)
+        format!("generated from header {} and input {}", self.header, self.held_comment)
     }
 
-    /// What a walk of every unit says of this state, with nothing to make: a function of
-    /// every input a build reads, and of none it does not (`shlvl`).
-    fn answer(&self) -> String {
+    /// What the build's outputs are made from: every input a build reads, and none it does
+    /// not (`shlvl`; the source's comment, for a unit keyed by code text).
+    fn made_from(&self) -> String {
         let listed = if self.lists { self.listed } else { 0 };
+        // A lint that reads comments reads this one.
+        let read = if self.narrow { 0 } else { self.comment };
         format!(
-            "source {} lock {} header {} listed {listed} cc {} features {} release {} color {} dep {} layout {}",
+            "source {} read {read} input {} lock {} header {} listed {listed} cc {} features {} release {} color {} dep {} layout {}",
             self.source,
+            self.held_comment,
             self.lock,
             self.header,
             self.cc,
@@ -116,6 +140,44 @@ impl World {
             self.layout,
         )
     }
+
+    /// What a walk of every unit says of this state, with nothing to make: what its outputs
+    /// are made from and, when it warns, the source's line as it is now, comment and all,
+    /// under the file's name.
+    fn answer(&self) -> String {
+        match self.warns {
+            true => format!("{}\n --> {SOURCE} | code // {}", self.made_from(), self.comment),
+            false => self.made_from(),
+        }
+    }
+
+    /// The checkout's files as a view holds them: what its root is of.
+    fn files(&self) -> [u8; 4] {
+        [self.source, self.comment, self.held_comment, self.lock]
+    }
+}
+
+/// The still text of a Rust file whose tokens are `tokens`: nothing of its comments.
+fn still_of(tokens: u8) -> ContentId {
+    id(&format!("still {tokens}"))
+}
+
+/// The files that differ between two views of the checkout, as the daemon reads them: each
+/// Rust one with its still texts, the lock file with none.
+fn edits(was: [u8; 4], now: [u8; 4]) -> Vec<FileEdit> {
+    let mut edits = Vec::new();
+    if was[3] != now[3] {
+        edits.push(FileEdit { path: LOCK.to_owned(), still: None });
+    }
+    if was[2] != now[2] {
+        // Its tokens never change in the model: only its comment does.
+        edits.push(FileEdit { path: HELD.to_owned(), still: Some((still_of(0), still_of(0))) });
+    }
+    if was[0] != now[0] || was[1] != now[1] {
+        let still = Some((still_of(was[0]), still_of(now[0])));
+        edits.push(FileEdit { path: SOURCE.to_owned(), still });
+    }
+    edits
 }
 
 /// The watches outside views, as [`blaze_vfs::outside`] keeps them: a generation, the last
@@ -203,6 +265,10 @@ enum Input {
     Color,
     Dependency,
     Layout,
+    /// The `//` comment at the end of a line of the source says something else.
+    Comment,
+    /// The `//` comment in the file the build script reads says something else.
+    HeldComment,
 }
 
 /// A step of a run.
@@ -278,14 +344,17 @@ struct Daemon {
     /// The path dependency as it was last read, and the watches' generation read before.
     dep_read: u8,
     dep_generation: u64,
-    /// The header each profile's kept script run is of, and what this daemon left in each
+    /// The header and the input each profile's kept script run is of, and what this daemon left in each
     /// `OUT_DIR` (the files' identity and their stamps as one: a foreign write moves them).
-    script_of: [Option<u8>; 2],
+    script_of: [Option<(u8, u8)>; 2],
     left: [Option<String>; 2],
     /// The last walk wrote under a directory of outputs: its echo is yet to be heard.
     echo: bool,
     /// How many requests the lane answered.
     answered: u32,
+    /// The files of the view the last walk that may be kept read: what the daemon holds a
+    /// view of, to read what differs from it.
+    walked: Option<[u8; 4]>,
 }
 
 impl Daemon {
@@ -303,6 +372,7 @@ impl Daemon {
             left: [None, None],
             echo: false,
             answered: 0,
+            walked: None,
         }
     }
 
@@ -342,7 +412,7 @@ impl Daemon {
         };
         let config_id = Hasher::new("the no-op lane's test config").part(&config.encode()).finish();
         Inputs {
-            view: id(&format!("view {} {}", world.source, world.lock)),
+            view: id(&format!("view {:?}", world.files())),
             config: Arc::new(config),
             config_id,
             request: id(&format!("request {}", world.color)),
@@ -370,13 +440,28 @@ impl Daemon {
         }
         self.watches.layout = world.layout;
         let inputs = self.inputs(world);
+        // What the daemon reads of the files, only where the answer's view is another root.
+        let read = match (&self.last, self.walked) {
+            (Ok(answer), Some(was)) if !answer.files_known(&inputs.view) => {
+                Some(edits(was, world.files()))
+            }
+            _ => None,
+        };
         let asked = Asked {
             inputs: &inputs,
+            edited: match &read {
+                Some(edits) => Edited::Files(edits),
+                None => Edited::Unread("the roots are one, or no view is held"),
+            },
             traced: false,
             alone: !world.other_job,
             locals_vouched: self.dep_vouched(world),
         };
-        match ask(&self.last, &asked, &self.watches) {
+        let found = ask(&self.last, &asked, &self.watches);
+        if found.is_ok() {
+            answered(&mut self.last, inputs.view);
+        }
+        match found {
             Ok((responses, _)) => {
                 self.answered += 1;
                 let (again, walk) = (text_of(&responses), world.answer());
@@ -424,7 +509,19 @@ impl Daemon {
                 }
                 false => absent.push(PathBuf::from(LAYOUT)),
             }
-            Recording::new(inputs, self.watches.generation, self.looks, dirs, absent)
+            self.walked = Some(world.files());
+            let mut recording =
+                Recording::new(inputs, self.watches.generation, self.looks, dirs, absent);
+            // The front end's word: the source, when its unit is keyed by code text; never
+            // the file the build script reads.
+            recording.vouch(match world.narrow {
+                true => Ok(vec![StillFile {
+                    path: SOURCE.to_owned(),
+                    edition: ::span::Edition::CURRENT,
+                }]),
+                false => Err("a lint of the unit reads comments".to_owned()),
+            });
+            recording
         });
         if recording.is_none() {
             self.last = Err(Unkept::Planned);
@@ -444,26 +541,28 @@ impl Daemon {
         if world.lists {
             self.looks += 1;
         }
-        let answer = world.answer();
+        let (answer, made_from) = (world.answer(), world.made_from());
         let profile = usize::from(world.release);
         // The build script: run again when its traced input moved, which makes something;
         // else reused, its `OUT_DIR` written again only when it is not in place as this
         // daemon left it, which no count of what a build made sees.
         let generated = Some(world.generated());
-        let reran = self.script_of[profile] != Some(world.header);
+        let reran = self.script_of[profile] != Some((world.header, world.held_comment));
         let in_place = world.out_dirs[profile] == generated && self.left[profile] == generated;
         if reran || !in_place || bug == Some(Bug::ReplayWrites) {
             world.out_dirs[profile] = generated.clone();
             self.left[profile] = generated;
-            self.script_of[profile] = Some(world.header);
+            self.script_of[profile] = Some((world.header, world.held_comment));
             self.watches.change(world.out());
             self.echo = true;
         }
-        let placed = world.output().as_ref() == Some(&answer);
-        let made_nothing = !reran && placed && self.known[profile].as_ref() == Some(&answer);
-        self.known[profile] = Some(answer.clone());
+        // The outputs are of what they are made from; a warning's quoted line is rendered
+        // again by every walk and is in none of them.
+        let placed = world.output().as_ref() == Some(&made_from);
+        let made_nothing = !reran && placed && self.known[profile].as_ref() == Some(&made_from);
+        self.known[profile] = Some(made_from.clone());
         if !placed {
-            *world.output() = Some(answer.clone());
+            *world.output() = Some(made_from);
             self.watches.change(world.out());
         }
         if tamper {
@@ -517,6 +616,8 @@ fn runs(mut world: World, ops: &[Op], bug: Option<Bug>) -> Result<u32, String> {
                     world.layout = !world.layout;
                     daemon.watches.change(LAYOUT);
                 }
+                Input::Comment => world.comment += 1,
+                Input::HeldComment => world.held_comment += 1,
             },
             Op::Touch => daemon.watches.change(INCLUDE),
             Op::DeleteOutput => {
@@ -543,7 +644,7 @@ fn runs(mut world: World, ops: &[Op], bug: Option<Bug>) -> Result<u32, String> {
 
 #[hegel::composite]
 fn op(tc: &TestCase) -> Op {
-    match tc.draw(gs::integers::<u8>().max_value(21)) {
+    match tc.draw(gs::integers::<u8>().max_value(25)) {
         0 => Op::Edit(Input::Source),
         1 => Op::Edit(Input::Lock),
         2 => Op::Edit(Input::Header),
@@ -561,6 +662,8 @@ fn op(tc: &TestCase) -> Op {
         14 => Op::Build { tamper: true },
         15 => Op::Evict,
         16 => Op::EditOutDir,
+        17 | 18 => Op::Edit(Input::Comment),
+        19 => Op::Edit(Input::HeldComment),
         _ => Op::Build { tamper: false },
     }
 }
@@ -578,15 +681,20 @@ fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
 /// edits of the checkout's files and its lock file, of a traced header, a listed directory,
 /// a path dependency and the layout profiles outside it, of the request's environment,
 /// features, profile and colors, of touches, deleted outputs, other jobs and requests, with
-/// the watches confirmed in time or late. `HEGEL_TEST_CASES=<n>` runs it longer.
+/// the watches confirmed in time or late; and of a `//` comment at a line's end, in the
+/// source (its unit keyed by code text or, a lint reading comments, by bytes; its build
+/// warning of the commented line or not) and in a file the build script reads by its bytes.
+/// `HEGEL_TEST_CASES=<n>` runs it longer.
 #[test]
 fn a_kept_answer_is_said_again_only_while_a_walk_would_say_the_same() {
     run_cases(256, |tc| {
-        let world = World::new(
+        let mut world = World::new(
             tc.draw(gs::booleans()),
             tc.draw(gs::booleans()),
             tc.draw(gs::booleans()),
         );
+        world.narrow = tc.draw(gs::booleans());
+        world.warns = tc.draw(gs::booleans());
         let ops = tc.draw(gs::vecs(op()).min_size(1).max_size(40));
         if let Err(why) = runs(world.clone(), &ops, None) {
             panic!("{world:?}, {ops:?}: {why}");
@@ -806,7 +914,90 @@ fn a_traced_request_is_never_answered_by_the_lane() {
         looked_at: None,
         worked: None,
     });
-    let asked = |traced| Asked { inputs: &inputs, traced, alone: true, locals_vouched: true };
+    let asked = |traced| Asked {
+        inputs: &inputs,
+        edited: Edited::Unread("the roots are one"),
+        traced,
+        alone: true,
+        locals_vouched: true,
+    };
     assert!(ask(&last, &asked(false), &daemon.watches).is_ok());
     assert_eq!(ask(&last, &asked(true), &daemon.watches).err(), Some(NotReplayed::Traced));
+}
+
+/// An edit of what no code text holds ends at the file: a `//` comment at a line's end of a
+/// source keyed by code text is answered by the lane, again and again, and so is the build
+/// after it with nothing changed. A token of the same file walks.
+#[test]
+fn a_comment_edit_is_answered_by_the_lane() {
+    let comment = Op::Edit(Input::Comment);
+    assert_eq!(runs(plain(), &kept_then(&[comment, BUILD, BUILD]), None), Ok(2));
+    assert_eq!(runs(plain(), &kept_then(&[comment, BUILD, comment, comment, BUILD]), None), Ok(2));
+    assert_eq!(runs(plain(), &kept_then(&[Op::Edit(Input::Source), BUILD]), None), Ok(0));
+    // A comment edit beside a token's: the file's still text moved.
+    let ops = kept_then(&[comment, Op::Edit(Input::Source), BUILD]);
+    assert_eq!(runs(plain(), &ops, None), Ok(0));
+    // Beside the lock file's: a file that is no source.
+    assert_eq!(runs(plain(), &kept_then(&[comment, Op::Edit(Input::Lock), BUILD]), None), Ok(0));
+    // And with the request's features changed, the files as they were to every key: the
+    // config is compared whatever the files are.
+    let ops = kept_then(&[comment, Op::Edit(Input::Features), BUILD]);
+    assert_eq!(runs(plain(), &ops, None), Ok(0));
+}
+
+/// What does not qualify walks: a comment in a file the build script reads by its bytes
+/// (the script runs again), one in a source a lint reads the comments of (its unit is keyed
+/// by its bytes), and one a warning of the kept answer quotes (the walk renders it again).
+#[test]
+fn a_comment_edit_something_reads_walks() {
+    let held = kept_then(&[Op::Edit(Input::HeldComment), BUILD]);
+    assert_eq!(runs(plain(), &held, None), Ok(0));
+    let comment = kept_then(&[Op::Edit(Input::Comment), BUILD]);
+    let linted = World { narrow: false, ..plain() };
+    assert_eq!(runs(linted, &comment, None), Ok(0));
+    let warned = World { warns: true, ..plain() };
+    assert_eq!(runs(warned.clone(), &comment, None), Ok(0));
+    // The warning is said again while nothing changed, as any answer is.
+    assert_eq!(runs(warned, &kept_then(&[BUILD]), None), Ok(1));
+}
+
+/// A lane keyed by code text that takes any change of a source for a comment's says the
+/// last answer over a body edit.
+#[test]
+fn the_oracle_catches_a_lane_keyed_by_code_text_that_misses_a_token_change() {
+    let ops = kept_then(&[Op::Edit(Input::Source), BUILD]);
+    assert!(caught(plain(), &ops, Bug::Lane(Plant::IgnoresTokens)).contains("said again"));
+}
+
+/// A lane that takes a file of one still text for a source held by code text says the last
+/// answer over a comment in a file the build script reads, and one a lint reads.
+#[test]
+fn the_oracle_catches_a_lane_that_takes_bytes_something_reads_for_still() {
+    let ops = kept_then(&[Op::Edit(Input::HeldComment), BUILD]);
+    assert!(caught(plain(), &ops, Bug::Lane(Plant::IgnoresHeld)).contains("said again"));
+    // A lint's: the unit's own front end vouched for no source, which a lane that held
+    // every file would not ask. The plant is of the file's place in the list, so the
+    // refusal here is the list's absence.
+    let linted = World { narrow: false, ..plain() };
+    let ops = kept_then(&[Op::Edit(Input::Comment), BUILD]);
+    assert_eq!(runs(linted, &ops, Some(Bug::Lane(Plant::IgnoresHeld))), Ok(0));
+}
+
+/// A lane that says an answer again over a changed file its diagnostics quote says the
+/// quoted line with the comment the file no longer has.
+#[test]
+fn the_oracle_catches_a_replayed_diagnostic_with_stale_quoted_text() {
+    let warned = World { warns: true, ..plain() };
+    let ops = kept_then(&[Op::Edit(Input::Comment), BUILD]);
+    let why = caught(warned, &ops, Bug::Lane(Plant::ReplaysQuotes));
+    assert!(why.contains("said again") && why.contains("code //"), "{why}");
+}
+
+/// What `blaze why` names of a file that changed: the file, where the lane read which.
+#[test]
+fn a_refusal_names_the_file() {
+    let moved = NotReplayed::Moved(Moved::File(LOCK.to_owned()));
+    assert_eq!(moved.input().as_deref(), Some("the checkout's file Cargo.lock"));
+    let quoted = NotReplayed::Quoted(SOURCE.to_owned()).input();
+    assert!(quoted.is_some_and(|it| it.contains("src/lib.rs")));
 }

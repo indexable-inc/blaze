@@ -106,7 +106,10 @@ use std::alloc::Global;
 
 use blaze_mem::{Handle, MemError, Tag as MemTag};
 
-use self::noop::{Asked as NoopAsked, Inputs, Last, Recording, Unkept, Vouches, Walk};
+use self::noop::{
+    Asked as NoopAsked, Edited, FileEdit, Inputs, Last, Recording, StillFile, Unkept, Vouches,
+    Walk,
+};
 use self::slab::{Table, Tagged};
 use super::{
     heads::Heads,
@@ -1258,6 +1261,24 @@ impl Vouches for Watched {
     }
 }
 
+/// The still text (`blaze_lower::still_text`) of the file at `path` of the open view `view`,
+/// parsed as a file of `edition`: none for a file that is not there, is not UTF-8 text, is
+/// longer than the lane parses ([`noop::MOST_BYTES`]) or does not read. One parse, in a span.
+fn still_in(vfs: &Vfs, view: ViewId, path: &str, edition: ::span::Edition) -> Option<ContentId> {
+    let file = vfs.read(view, path).ok()??;
+    if file.bytes.len() > noop::MOST_BYTES {
+        return None;
+    }
+    let text = std::str::from_utf8(file.bytes).ok()?;
+    let _span = tracing::info_span!(
+        target: "blaze",
+        "no-op answer: a changed file's still text",
+        bytes = text.len(),
+    )
+    .entered();
+    Some(blaze_lower::still_text(text, edition))
+}
+
 /// The hash of a request's work and its whole `Targets` ([`Inputs::request`]): what the
 /// view's config does not hold of it. `None` for work the lane does not answer.
 fn request_id(work: &Work) -> Option<ContentId> {
@@ -1609,6 +1630,13 @@ struct Roots<S: Steps> {
     /// Why what its last build left to settle after its answer was not kept ([`Jobs::lose`]),
     /// until its next build or check takes it as a miss `blaze why` says ([`Job::ended`]).
     lost: Vec<Option<String>>,
+    /// The files of the view its answer's walk read, held open in the VFS from that walk's
+    /// start until its next job walks: what a request on another root is read against
+    /// ([`Jobs::edited`]), so the root and its files stay whatever the head moved to.
+    walked: Vec<Option<ViewId>>,
+    /// The still text of each file of `walked` the lane has read, by path: a file is parsed
+    /// as it was once, however many requests it differs in.
+    stills: Vec<Vec<(String, Option<ContentId>)>>,
 }
 
 impl<S: Steps> Roots<S> {
@@ -1621,6 +1649,8 @@ impl<S: Steps> Roots<S> {
             outputs: Vec::new(), // alloc: none until the first checkout
             answers: Vec::new(), // alloc: none until the first checkout
             lost: Vec::new(),    // alloc: none until the first checkout
+            walked: Vec::new(),  // alloc: none until the first checkout
+            stills: Vec::new(),  // alloc: none until the first checkout
         }
     }
 
@@ -1636,6 +1666,8 @@ impl<S: Steps> Roots<S> {
         self.outputs.push(None);
         self.answers.push(Err(Unkept::None));
         self.lost.push(None);
+        self.walked.push(None);
+        self.stills.push(Vec::new()); // alloc: none
         id
     }
 }
@@ -3562,6 +3594,11 @@ impl<S: Steps> Jobs<S> {
         // ([`Jobs::record_answer`]).
         if let Some(at) = root {
             self.roots.answers[at as usize] = Err(Unkept::None);
+            // The view the answer just dropped was of is let go with it.
+            if let Some(walked) = self.roots.walked[at as usize].take() {
+                w.vfs.close(walked);
+            }
+            self.roots.stills[at as usize].clear();
             if let Some(request) = request {
                 let inputs = Inputs {
                     view: opened.view.root,
@@ -3570,6 +3607,12 @@ impl<S: Steps> Jobs<S> {
                     request,
                 };
                 self.record_answer(id, at, key, inputs);
+                // A walk that may be kept holds its view's files, opened here in constant
+                // time: a later request on another root is read against them. A root the
+                // tree lacks holds none, and such a request walks.
+                if self.recordings.iter().any(|it| it.job == id) {
+                    self.roots.walked[at as usize] = w.vfs.open(opened.view).ok();
+                }
             }
         }
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
@@ -3642,6 +3685,8 @@ impl<S: Steps> Jobs<S> {
             request,
         };
         drop(keying);
+        // The files that differ from the kept answer's view, where the root is another.
+        let read = self.edited(w, root, opened);
         let comparing = tracing::info_span!(
             target: "blaze",
             "no-op answer: compare with the kept answer",
@@ -3657,8 +3702,15 @@ impl<S: Steps> Jobs<S> {
         // made nothing, and stands while that settles.
         let alone = self.order.is_empty();
         let locals_vouched = w.mounts.stale_locals(vouched_local, super::fetch::local::absent).is_empty();
-        let asked = NoopAsked { inputs: &inputs, traced, alone, locals_vouched };
+        let edited = match &read {
+            Ok(edits) => Edited::Files(edits),
+            Err(why) => Edited::Unread(*why),
+        };
+        let asked = NoopAsked { inputs: &inputs, edited, traced, alone, locals_vouched };
         let found = noop::ask(&self.roots.answers[root as usize], &asked, &Watched);
+        if found.is_ok() {
+            noop::answered(&mut self.roots.answers[root as usize], inputs.view);
+        }
         drop(comparing);
         let (responses, worked) = match found {
             Ok(found) => found,
@@ -3697,6 +3749,74 @@ impl<S: Steps> Jobs<S> {
         }
         w.said.push(Said::Finish(id, true, None, None));
         Ok(())
+    }
+
+    /// The files that differ between the view checkout `root`'s kept answer is of and
+    /// `opened`, each with its still text in both where it is a source the answer's walk held
+    /// by code text ([`noop::FileEdit`]); or why they are not read ([`Edited::Unread`]): no
+    /// answer is kept, the view is one the answer is known of, its walk vouched for no
+    /// source, its view is not held, or more files differ than the lane reads.
+    ///
+    /// The cost is the edit's: a diff of the two roots, which descends only where they
+    /// differ, and for each changed source one parse of it as it is now and, the first time
+    /// it differs, one of it as it was (`blaze_lower::still_text`: no database, no query).
+    /// Bounded by [`noop::MOST_EDITS`] files of [`noop::MOST_BYTES`] each; all of it is the
+    /// span `no-op answer: read the files that differ`, each parse a child.
+    fn edited(
+        &mut self,
+        w: &World<'_, S>,
+        root: u32,
+        opened: &Opened,
+    ) -> Result<Vec<FileEdit>, &'static str> {
+        let at = root as usize;
+        let Ok(answer) = &self.roots.answers[at] else { return Err("no answer is kept") };
+        if answer.files_known(&opened.view.root) {
+            return Err("the view is one the kept answer is known of");
+        }
+        let Ok(still) = &answer.still else {
+            return Err("the kept answer's build vouched for no source");
+        };
+        let Some(walked) = self.roots.walked[at] else {
+            return Err("the kept answer's view is not held");
+        };
+        let was = answer.inputs.view;
+        if !w.vfs.has(was) || !w.vfs.has(opened.view.root) {
+            return Err("a root of the two views is not in the tree");
+        }
+        let reading = tracing::info_span!(
+            target: "blaze",
+            "no-op answer: read the files that differ",
+            root,
+            files = tracing::field::Empty,
+        )
+        .entered();
+        let changes = w.vfs.diff(was, opened.view.root);
+        reading.record("files", changes.len());
+        if changes.len() > noop::MOST_EDITS {
+            return Err("more files differ than the lane reads");
+        }
+        let stills = &mut self.roots.stills[at];
+        let mut edits = Vec::with_capacity(changes.len()); // alloc: once a request on another root, a file or a few
+        for Change { kind, path } in changes {
+            let held = still.binary_search_by(|it| it.path.as_str().cmp(path.as_str())).ok();
+            let texts = match (kind, held) {
+                (blaze_vfs::ChangeKind::Modified, Some(held)) => {
+                    let edition = still[held].edition;
+                    let was = match stills.iter().find(|(it, _)| *it == path) {
+                        Some((_, was)) => *was,
+                        None => {
+                            let was = still_in(&*w.vfs, walked, &path, edition);
+                            stills.push((path.clone(), was)); // clone: a path, once a file that differs
+                            was
+                        }
+                    };
+                    was.zip(still_in(&*w.vfs, opened.files, &path, edition))
+                }
+                _ => None,
+            };
+            edits.push(FileEdit { path, still: texts });
+        }
+        Ok(edits)
     }
 
     /// Job `id` noted as one that may become checkout `root`'s kept answer: when it is about
@@ -6335,6 +6455,32 @@ impl<S: Steps> Jobs<S> {
             for note in served.iter().filter_map(noted).chain(writer.goals_noted()) {
                 w.said.push(Said::Report(id, Response::Diagnostic(note)));
             }
+        }
+        // A build that may become its checkout's kept answer and made nothing so far says
+        // which sources its keys held by code text alone: what the lane answers a comment
+        // edit by ([`noop::LastAnswer::still`]). Inputs and the store's index read, no query.
+        if ok
+            && job.compiled == 0
+            && job.missed == 0
+            && !job.placed_any
+            && !job.shared
+            && let Some(recorded) = self.recordings.iter_mut().find(|it| it.job == id)
+        {
+            let still = tracing::info_span!(
+                target: "blaze",
+                "no-op answer: the sources the build held by code text",
+                files = tracing::field::Empty,
+            );
+            let vouched = still.in_scope(|| writer.still());
+            if let Ok(files) = &vouched {
+                still.record("files", files.len());
+            }
+            recorded.recording.vouch(vouched.map(|files| {
+                files
+                    .into_iter()
+                    .map(|(path, edition)| StillFile { path, edition })
+                    .collect() // alloc: once a build that walked and made nothing
+            }));
         }
         // The documentation's front end is not kept: it sets `cfg(doc)`.
         let documenting = match documents {

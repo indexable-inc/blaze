@@ -389,6 +389,24 @@ impl Steps for Real {
                 let fresh = session.is_none();
                 if fresh {
                     blaze_item_hash::impls::install(lowered.served_db());
+                    // Which front end computes a body's identity, told before any is asked:
+                    // the one the goal store and the item store are given below. Until
+                    // 2026-11-10 nothing told it, so every identity was `Err("no front-end
+                    // build is set")` behind an untracked read of the singleton's absence:
+                    // the item store refused every body (`Refusal::NoIdentity`), and
+                    // `identity_of` ran again for every body it was asked of in every
+                    // revision (about 10,000 runs a build, all `ran_untracked`). A database
+                    // lowered into again was told when it was made.
+                    blaze_item_hash::identity::set_build(lowered.served_db(), deps::front_end()?);
+                }
+                // The guard: a build whose database was not told stops here, naming it, where
+                // it used to go on with no identity and an untracked read a body.
+                if blaze_item_hash::identity::FrontEnd::try_get(lowered.db()).is_none() {
+                    // alloc: an error, once
+                    return Err(Failed::Error(ApiError::new(
+                        "the front end's database was not told which front end computes its bodies' identities (`blaze_item_hash::identity::set_build`), so each would be asked again in every revision and none filed",
+                        None,
+                    )));
                 }
                 let mut session = match session {
                     Some(session) => session,
@@ -1057,6 +1075,44 @@ impl Writer<Real> for UnitWriter {
         deps::noted(self.flushed.as_ref(), self.session.item_steps().as_ref())
     }
 
+    /// The sources of the view every key of this build held by code text alone: each Rust
+    /// file of a workspace package all of whose units were found under their narrow record
+    /// key ([`compile::found_narrow`]; `blaze_lower::Lowered::still_sources` says the rest),
+    /// less every file a build script's kept run read ([`script::ReadBytes`], by its last
+    /// name), by its path from the view's root. None, with the reason, when a build script's
+    /// run was not found kept by `fresh` (its reads are not noted), when one hashed a whole
+    /// directory, or when the front end vouches for none.
+    fn still(&self) -> Result<Vec<(String, ::span::Edition)>, String> {
+        let job = &self.job;
+        let reads = job.script_reads.lock();
+        for (unit, it) in job.units().graph.units.iter().enumerate() {
+            if it.mode == Mode::RunCustomBuild && !reads.noted(unit) {
+                // alloc: a reason, once a build
+                return Err(format!(
+                    "what the build script of {} read is not noted: its run was not found kept as the build began",
+                    it.pkg_id
+                ));
+            }
+        }
+        if reads.trees {
+            // alloc: a reason, once a build
+            return Err("a build script reads a whole directory by its bytes".to_owned());
+        }
+        let sources = self
+            .front
+            .still_sources(|unit| compile::found_narrow(job, unit))
+            .map_err(str::to_owned)?; // alloc: a reason, once a build
+        let root = job.input.config.invocation.root.trim_end_matches('/');
+        Ok(sources
+            .into_iter()
+            .filter_map(|it| {
+                let path = it.path.strip_prefix(root)?.strip_prefix('/')?;
+                let name = path.rsplit('/').next().unwrap_or(path);
+                (!reads.reads(name)).then(|| (path.to_owned(), it.edition)) // alloc: the edge
+            })
+            .collect()) // alloc: once a build that walked and made nothing
+    }
+
     fn keep(mut self) -> Result<KeptLowered, ApiError> {
         // The writes still asked for are applied. With none, only that no reader is alive is
         // asked: a release that is due stays for the task that stores the front end.
@@ -1364,6 +1420,9 @@ pub(crate) struct Job {
     /// Each build script run prepared by `fresh`, taken by `script`, so it is prepared once.
     /// Only the loop touches it: the lock is never contended.
     pub(crate) starts: Box<[Lock<Option<Box<script::Start>>>]>,
+    /// What the build scripts' runs found kept read by their bytes ([`script::ReadBytes`]),
+    /// noted by `fresh` and read by the writer's `still`, both on the loop: never contended.
+    pub(crate) script_reads: Lock<script::ReadBytes>,
     /// The profiles its units' `-C profile-use`s name, read and given to the code generator
     /// once, and held while the job lives.
     pub(crate) profiles: OnceLock<codegen::Profiles>,
@@ -1442,6 +1501,7 @@ impl Job {
             inert: (0..slots).map(|_| Default::default()).collect(),
             pure: (0..slots).map(|_| Default::default()).collect(),
             starts: (0..slots).map(|_| Lock::new("serve.unit.starts", None)).collect(),
+            script_reads: Lock::new("serve.unit.script_reads", script::ReadBytes::default()),
             profiles: Default::default(),
             counted: (0..slots).map(|_| Default::default()).collect(),
             lint_profiles: Default::default(),

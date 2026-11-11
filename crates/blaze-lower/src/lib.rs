@@ -65,7 +65,7 @@ pub use base_db::{Db, ProcMacroLoadingError};
 pub use hir_expand::proc_macro::{ProcMacro, ProcMacroLoadResult};
 
 pub use self::answer::{SubRequest, SubResponse, answer};
-pub use self::code::{CodeText, code_identity, code_text_of};
+pub use self::code::{CodeText, code_identity, code_text_of, still_text, still_text_of};
 pub use self::crates::{lint_flags, local, target_data};
 pub use self::doctests::DoctestProgram;
 pub use self::harness::{Appended, macros_loaded, wasm_macro};
@@ -1061,6 +1061,92 @@ impl Lowered {
         narrow.own.then_some(Narrowed { code: narrow.code, checked: narrow.checked })
     }
 
+    /// The workspace sources a build keyed by code texts alone can vouch for
+    /// ([`StillSource`]): each Rust file with text of a workspace package's source root every
+    /// unit of which `narrow` says is keyed by its crate's code text, found under that key
+    /// (blaze-cargo's narrow record key), by path, sorted. An edit of such a file that leaves
+    /// its still text ([`code::still_text_of`]) leaves every one of those keys, as the still
+    /// text's invariant says. Why none can be vouched for, else:
+    ///
+    /// - a proc-macro expansion of the build read something (the log of
+    ///   [`base_db::Files::expansions_read`]): what it read is filed by value, and may be any
+    ///   file;
+    /// - nothing else here: a package one unit of which is not narrow gives no file, and a
+    ///   file a macro read off the disk (`include_str!`, `include!`, a `#[path]` outside the
+    ///   tree) is left out by its name, whichever package's it is.
+    ///
+    /// It reads inputs alone (source roots, crates' data, paths): no query runs, so the loop
+    /// may ask it. What else reads a source by its bytes is not known here: a build script's
+    /// traced reads and a record under what its diagnostics quote are the caller's to take out.
+    pub fn still_sources(
+        &self,
+        narrow: impl Fn(usize) -> bool,
+    ) -> Result<Vec<StillSource>, &'static str> {
+        let db = &self.db;
+        if !db.files().expansions_read().is_empty() {
+            return Err("a proc-macro expansion of the build read a file or a variable");
+        }
+        // Each set's verdict: whether every unit of it is narrow (never, for a library's:
+        // none of its files is the view's to edit), its crates' one edition, and a root file
+        // of it, to find its source root by. `narrow` reads the store, so it is asked only of
+        // a unit whose set still stands.
+        // alloc: once a build that walked and made nothing, a package each
+        let mut sets: Vec<Option<(bool, span::Edition, FileId)>> = vec![None; self.crates.sets];
+        for (unit, lowering) in self.crates.units.iter().enumerate() {
+            let Some(krate) = lowering.krate else { continue };
+            let data = krate.data(db);
+            let Some(slot) = sets.get_mut(lowering.set) else {
+                return Err("a unit of the build is of no source root of it");
+            };
+            let (was, edition, root) = match *slot {
+                Some(it) => it,
+                None => {
+                    let root = db.source_root(db.file_source_root(data.root_file_id).source_root_id(db));
+                    (!root.source_root_ref(db).is_library, data.edition, data.root_file_id)
+                }
+            };
+            *slot = Some((was && edition == data.edition && narrow(unit), edition, root));
+        }
+        // What a macro read off the disk, by its last name: a file of the tree named through
+        // a link is another path, and one name.
+        let files = db.files();
+        let last = |path: &str| path.rsplit('/').next().unwrap_or(path).to_owned(); // alloc: a name, once a file read off the disk
+        // alloc: the names of the files macros read off the disk, a few
+        let mut read: Vec<String> = files.included_files().iter().map(|it| last(it.as_str())).collect();
+        read.extend(files.included_sources().iter().map(|(path, _)| last(path.as_str())));
+        read.sort_unstable();
+        read.dedup();
+        let mut still = Vec::new(); // alloc: once a build that walked and made nothing
+        for (ok, edition, root) in sets.into_iter().flatten() {
+            if !ok {
+                continue;
+            }
+            let root = db.source_root(db.file_source_root(root).source_root_id(db));
+            let set = root.source_root_ref(db);
+            if set.is_library {
+                continue;
+            }
+            for file in set.iter() {
+                let Some(path) =
+                    set.path_for_file(&file).and_then(|it| it.as_path()).map(|it| it.as_str())
+                else {
+                    continue;
+                };
+                if !path.ends_with(".rs") || !db.has_file_text(file) {
+                    continue;
+                }
+                let name = path.rsplit('/').next().unwrap_or(path);
+                if read.binary_search_by(|it| it.as_str().cmp(name)).is_ok() {
+                    continue;
+                }
+                still.push(StillSource { path: path.to_owned(), edition }); // alloc: the edge
+            }
+        }
+        still.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        still.dedup_by(|a, b| a.path == b.path);
+        Ok(still)
+    }
+
     /// Gives each library crate of unit `unit`'s closure (a registry's, a git's, any library
     /// source root's but the standard library's) its own narrowed identity, before
     /// [`Lowered::narrowed`] is asked of the unit: without it such a crate is its bytes to
@@ -1697,6 +1783,15 @@ pub enum IdentityPart {
     Spelling(ContentId),
     /// A crate it depends on, by the name its code uses, with that crate's identity.
     Dependency { krate: Crate, name: String, identity: ContentId },
+}
+
+/// A Rust source of a workspace package that every key of a build holds by its code text
+/// alone ([`Lowered::still_sources`]): its path as the front end names it, and the edition
+/// its crates parse it in.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StillSource {
+    pub path: String,
+    pub edition: span::Edition,
 }
 
 /// A crate as the keys that leave trivia out know it ([`Lowered::narrowed`]).

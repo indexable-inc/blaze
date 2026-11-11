@@ -1453,6 +1453,22 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
     })
 }
 
+/// Whether `unit`'s record is in the store under its narrow key ([`narrow_key`]), the first
+/// of the keys a lookup asks ([`record_keys`]): then the unit is replayed from what its
+/// crate's code texts say alone, and an edit that leaves every code text finds it again. Not
+/// for a unit with no narrow key (its lints read comments, its crate keeps its whole text),
+/// nor one whose record is under what its diagnostics quote or its whole key, which hold its
+/// files' bytes. What the job's front end asks of each unit before it vouches for a source
+/// (`UnitWriter::still`); read in place, as [`fresh`] reads.
+pub(crate) fn found_narrow(job: &Job, unit: usize) -> bool {
+    let Ok(Some(narrow)) = narrow_key(job, unit) else { return false };
+    let guard = blaze_cas::enter();
+    let found_in = |store: &blaze_cas::Reader, std: bool| {
+        matches!(filed_in(job, store, std, &guard, narrow), Ok(Some(_)))
+    };
+    found_in(&job.input.store, false) || (shared(job, unit) && found_in(&job.input.std, true))
+}
+
 /// The narrowed identities of library crates the writer worked out and no unit gave the loop
 /// yet ([`Job::library_narrows`]): each put once, by the first unit replayed or stored after
 /// it was made.

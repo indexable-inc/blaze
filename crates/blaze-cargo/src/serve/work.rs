@@ -832,6 +832,17 @@ pub trait Writer<S: Steps>: Send + 'static {
     fn run_log(&self) -> blaze_query::db::Taken {
         blaze_query::db::Taken::default()
     }
+    /// On the loop, once every task of a build that made nothing so far has ended and before
+    /// it is kept: the Rust sources of the view that every key of the build held by code text
+    /// alone, each by its path from the view's root with the edition its crates parse it in,
+    /// so that an edit of one that leaves its still text (`blaze_lower::still_text_of`)
+    /// leaves every key, and the no-op lane says the build's answer again over it
+    /// (`serve::job::noop`, "An edit that changes no code"). Or why it vouches for none: a
+    /// reason, never an empty list. It runs no query and reads no file: inputs, what the
+    /// build noted, and the store's index. A front end that does not say vouches for none.
+    fn still(&self) -> Result<Vec<(String, ::span::Edition)>, String> {
+        Err("its front end does not say which sources it held by code text".to_owned()) // alloc: a reason, once a build
+    }
     /// Under `-v`: the note of what storing the kept front end this build lowered into did with
     /// the goals its build offered to the persistent goal cache. None when nothing was kept.
     fn goals_noted(&self) -> Option<blaze_api::Diagnostic>;

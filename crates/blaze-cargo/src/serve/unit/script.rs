@@ -735,7 +735,11 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
     let Some(start) = slot.as_mut() else { return false };
     let start = &mut **start;
     match &start.how {
-        How::Inert => true,
+        How::Inert => {
+            // It is not run and reads nothing.
+            job.script_reads.lock().note(unit, ReadBytes::default());
+            true
+        }
         How::Outside(_) => false,
         // Checked: it runs again whatever the store has.
         How::Sandboxed(prepared) if prepared.spec.mode == blaze_usercode::run::Mode::Verify => {
@@ -743,8 +747,11 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
         }
         How::Sandboxed(prepared) => {
             let guard = blaze_cas::enter();
-            let mut inputs = Rooted::new(prepared.spec.roots.view(), &mut start.disk);
-            matches!(
+            // Every input the kept run is checked against is asked through this: what a
+            // hit read by its bytes is noted for the no-op lane ([`ReadBytes`]).
+            let mut noting = Noting { inner: &mut start.disk, read: ReadBytes::default() };
+            let mut inputs = Rooted::new(prepared.spec.roots.view(), &mut noting);
+            let hit = matches!(
                 blaze_usercode::index::find(
                     &job.input.store,
                     &guard,
@@ -752,8 +759,105 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
                     &mut inputs
                 ),
                 Ok(blaze_usercode::index::Found::Hit { .. })
-            )
+            );
+            if hit {
+                job.script_reads.lock().note(unit, noting.read);
+            }
+            hit
         }
+    }
+}
+
+/// What the build scripts' runs found kept ([`fresh`]) read by their bytes, noted as each
+/// is found: the last name of each Rust file a run read, and whether any hashed a whole
+/// directory. What the job's front end takes out of the sources it vouches are held by code
+/// text alone (`UnitWriter::still`): a comment edit in a file a script reads runs the script
+/// again. A file is noted by its last name, not its path: a script may read a file of the
+/// checkout through a link, by another path, and no name is another file's.
+#[derive(Default)]
+pub(crate) struct ReadBytes {
+    /// The runs whose reads are noted here: every one found kept, and every inert one.
+    pub(crate) runs: Vec<u32>,
+    /// Sorted when read ([`ReadBytes::reads`]).
+    pub(crate) names: Vec<String>,
+    /// A run hashed everything below a directory (`rerun-if-changed` of one, or a package
+    /// whole): any file may be under it.
+    pub(crate) trees: bool,
+}
+
+impl ReadBytes {
+    /// Run `unit` was found kept, having read `read`.
+    fn note(&mut self, unit: usize, read: ReadBytes) {
+        // `fresh` may ask of a run more than once: what it read is the same.
+        if self.noted(unit) {
+            return;
+        }
+        self.runs.push(unit as u32);
+        self.names.extend(read.names);
+        self.trees |= read.trees;
+    }
+
+    /// Whether the reads of run `unit` are noted.
+    pub(crate) fn noted(&self, unit: usize) -> bool {
+        self.runs.contains(&(unit as u32))
+    }
+
+    /// Whether a noted run read a Rust file whose last name is `name`.
+    pub(crate) fn reads(&self, name: &str) -> bool {
+        self.names.iter().any(|it| it == name)
+    }
+}
+
+/// `inner` with each read by bytes noted in `read`: what [`fresh`] asks a kept run's inputs
+/// through.
+struct Noting<'a, I> {
+    inner: &'a mut I,
+    read: ReadBytes,
+}
+
+impl<I: blaze_usercode::trace::Inputs> blaze_usercode::trace::Inputs for Noting<'_, I> {
+    type Error = I::Error;
+
+    fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, I::Error> {
+        // Only a Rust file can be a source held by code text: the others are not noted.
+        if let Some(name) = path.file_name().and_then(|it| it.to_str())
+            && name.ends_with(".rs")
+        {
+            self.read.names.push(name.to_owned()); // alloc: a name, once a Rust file a kept run read
+        }
+        self.inner.file(path)
+    }
+
+    fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, I::Error> {
+        // A listing's names, no file's bytes.
+        self.inner.dir(path)
+    }
+
+    fn env(&mut self, name: &std::ffi::OsStr) -> Option<&std::ffi::OsStr> {
+        self.inner.env(name)
+    }
+
+    fn env_all(&mut self) -> &[(OsString, OsString)] {
+        self.inner.env_all()
+    }
+
+    fn names(
+        &mut self,
+        path: &Path,
+        out: &mut blaze_usercode::trace::Names<'_>,
+    ) -> Result<bool, I::Error> {
+        self.read.trees = true;
+        self.inner.names(path, out)
+    }
+
+    fn entry(&mut self, path: &Path) -> Result<blaze_usercode::trace::Entry, I::Error> {
+        self.read.trees = true;
+        self.inner.entry(path)
+    }
+
+    fn tree(&mut self, dir: &Path, package: bool) -> Result<Option<[u8; 32]>, I::Error> {
+        self.read.trees = true;
+        self.inner.tree(dir, package)
     }
 }
 
