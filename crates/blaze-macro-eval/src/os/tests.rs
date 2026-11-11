@@ -4,7 +4,7 @@ use base_db::Env;
 use blaze_usercode::trace::{ALL_ENV, Seen};
 
 use super::{
-    Answer, Call, Os, Shim,
+    Answer, At, Call, Os, Shim,
     files::{MANIFEST_DIR, OUT_DIR},
     target::{Errno, Field, Kind, STAT_MAX, Stat, System, Target},
 };
@@ -227,6 +227,105 @@ fn a_file_outside_the_package_is_refused_and_not_an_input() {
     assert!(run.open("/etc/hosts", 0).unwrap() == -1);
     let out = format!("{}/gen.rs", scratch.out);
     assert_eq!(run.open(&out, 0).unwrap(), 3, "OUT_DIR is read too");
+}
+
+/// What `include_dir!("$CARGO_MANIFEST_DIR/data/")` does on wasm (aquamarine 0.6.0): std's
+/// `canonicalize` is wasi-libc's `realpath`, which asks `path_readlink` of each prefix of the
+/// path from `/` (`root`, `root/src`, ...), each an ancestor of the package before it is in it.
+/// An ancestor is answered as the directory it is (`EINVAL`: no link), so the walk reaches the
+/// package and the directory is opened and listed; nothing of an ancestor is an input.
+#[test]
+fn canonicalize_walks_the_ancestors_of_the_package_and_reads_none_of_them() {
+    let scratch = Scratch::new("ancestors");
+    let env = scratch.env();
+    let mut os = Os::wasm_in(&env, manifest_dir(&env));
+    let dir = format!("{}/data/", scratch.pkg);
+    let parts: Vec<&str> = dir.split('/').filter(|it| !it.is_empty()).collect();
+    let mut ancestors = 0;
+    for n in 1..=parts.len() {
+        // As wasi-libc hands a prefix to the host: relative to `/`, its one directory.
+        let prefix = parts[..n].join("/");
+        let link = os.link_target((At::Root, &prefix)).unwrap_or_else(|stop| {
+            panic!("`path_readlink` of the prefix `{prefix}` stopped the expansion: {stop}")
+        });
+        assert_eq!(link.unwrap_err(), Errno::Inval, "`{prefix}` is no link");
+        let stat = os.look((At::Root, &prefix), true).unwrap().unwrap();
+        assert_eq!(stat.kind, Kind::Dir, "`{prefix}`");
+        ancestors += usize::from(format!("/{prefix}").len() < scratch.pkg.len());
+    }
+    assert!(ancestors >= 2, "the scratch package has ancestors: {dir}");
+    let root = os.look((At::Root, "."), true).unwrap().unwrap();
+    assert_eq!(root.kind, Kind::Dir, "`/` itself");
+    let fd = os.open_path((At::Root, &dir[1..]), true, true).unwrap().unwrap();
+    let mut names = Vec::new();
+    let mut n = 0;
+    while let Some(entry) = os.dir_entry(fd, n).unwrap() {
+        names.push(String::from_utf8(entry.name.to_vec()).unwrap());
+        n += 1;
+    }
+    assert_eq!(names, [".", "..", "a.txt", "b.txt"]);
+    assert_eq!(os.refused().count(), 0, "{:?}", os.refused().collect::<Vec<_>>());
+    let seen: Vec<_> = os.seen().filter(|it| it.0 != Seen::Env).collect();
+    assert!(
+        seen.iter().all(|it| it.1.starts_with(&scratch.pkg)),
+        "an ancestor of the package is an input: {seen:?}"
+    );
+}
+
+/// The control of the test above: only a look at an ancestor is answered. Opening the
+/// package's parent (to list it), and looking at or reading its sibling, stop the expansion
+/// naming the path.
+#[test]
+fn an_ancestor_is_not_opened_and_a_sibling_of_the_package_is_refused_by_name() {
+    let scratch = Scratch::new("sibling");
+    let env = scratch.env();
+    let top = scratch.top.to_str().unwrap().to_owned();
+    let refused = |stop: Stop, path: &str| {
+        assert!(
+            stop.0.starts_with(&format!("reads `{path}`"))
+                && stop.0.contains("outside the directories a proc macro may read")
+                && stop.0.contains(&scratch.pkg),
+            "{stop}"
+        );
+    };
+
+    let mut os = Os::wasm_in(&env, manifest_dir(&env));
+    assert_eq!(os.look((At::Root, &top[1..]), true).unwrap().unwrap().kind, Kind::Dir);
+    refused(os.open_path((At::Root, &top[1..]), true, true).unwrap_err(), &top[1..]);
+    assert_eq!(os.refused().collect::<Vec<_>>(), [top.as_str()]);
+
+    let mut os = Os::wasm_in(&env, manifest_dir(&env));
+    let secret = &scratch.secret[1..];
+    refused(os.look((At::Root, secret), true).unwrap_err(), secret);
+    refused(os.link_target((At::Root, secret)).unwrap_err(), secret);
+    refused(os.open_path((At::Root, secret), true, false).unwrap_err(), secret);
+    // A directory beside the package that no root's path goes through is not looked at
+    // either: only the ancestors are.
+    fs::create_dir_all(scratch.top.join("beside")).unwrap();
+    let beside = format!("{}/beside", &top[1..]);
+    refused(os.look((At::Root, &beside), true).unwrap_err(), &beside);
+}
+
+/// A root spelt through a link (macOS's `/tmp`, a home that is a link): `realpath` reads the
+/// link on its way, which is answered with its target, as the root's own walk followed it.
+#[cfg(unix)]
+#[test]
+fn a_link_the_packages_path_goes_through_is_read_as_that_link() {
+    let scratch = Scratch::new("through");
+    std::os::unix::fs::symlink("pkg", scratch.top.join("alias")).unwrap();
+    let top = scratch.top.to_str().unwrap().to_owned();
+    let mut env = Env::default();
+    env.set(MANIFEST_DIR, format!("{top}/alias"));
+    let mut os = Os::wasm_in(&env, manifest_dir(&env));
+    let alias = format!("{}/alias", &top[1..]);
+    let target = os.link_target((At::Root, &alias)).unwrap().unwrap();
+    assert_eq!(target.to_str(), Some("pkg"));
+    let stat = os.look((At::Root, &format!("{alias}/data/a.txt")), true).unwrap().unwrap();
+    assert_eq!((stat.kind, stat.size), (Kind::File, 12));
+    // The link out of the package is still only what it leads to: refused.
+    let escape = format!("{alias}/escape");
+    let stop = os.open_path((At::Root, &escape), true, false).unwrap_err();
+    assert!(stop.0.contains(&scratch.secret), "{stop}");
 }
 
 #[test]

@@ -27,6 +27,10 @@
 //!   through the bridge's `current_dir`) before its macro runs: a relative path then starts
 //!   where it starts under rustc. `chdir`'s look at that directory is answered as a directory
 //!   even when it is outside the roots (a workspace's root); what is in it is not.
+//!   So is a look at an ancestor of a root (`path_filestat_get`, or the `path_readlink` of each
+//!   prefix that wasi-libc's `realpath`, std's `canonicalize`, makes: `root`, `root/src`, ... of
+//!   `/root/src/pkg`): a directory, or the link the root's own path goes through, and nothing
+//!   of what it holds; opening or listing it stops the expansion as any path outside the roots.
 //! - A wait (`poll_oneoff`, which `thread::sleep` makes) or an exit stops the expansion.
 //!
 //! [`Os`]: crate::os::Os
