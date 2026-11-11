@@ -338,6 +338,24 @@ impl Requests {
             let tried: anyhow::Result<()> = async {
                 let mut opened =
                     self.open(&url, &headers, (at, Some(to)), if_range.as_deref(), bounds).await?;
+                // A server that has the same body (its `ETag` is the first answer's) and yet
+                // answers the whole of it does not honour `If-Range` (static.crates.io's CDN:
+                // 200 to a `Range` with `If-Range`, 206 to the `Range` alone, 2026-11-11). The
+                // range is asked for alone, and the piece is held to that same `ETag`, which is
+                // what `If-Range` was for.
+                if opened.status == 200
+                    && if_range.is_some()
+                    && opened.header("etag") == if_range.as_deref()
+                {
+                    opened = self.open(&url, &headers, (at, Some(to)), None, bounds).await?;
+                    if opened.header("etag") != if_range.as_deref() {
+                        anyhow::bail!(
+                            "{} answered a request for bytes {at}-{to} with another `ETag` than \
+                             its first answer's: its body changed since the download began",
+                            opened.said,
+                        );
+                    }
+                }
                 let said = opened.header("content-range").and_then(content_range);
                 if opened.status != 206 || said.and_then(|it| it.0) != Some((at, to)) {
                     let error = anyhow::anyhow!(
