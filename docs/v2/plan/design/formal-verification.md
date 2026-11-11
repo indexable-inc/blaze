@@ -667,7 +667,7 @@ programs; it is the specification of the Rust pass of the same name.
     blocks in place with predecessor counts kept as it goes, merges a target that ends in a
     call, rewrites a `switchInt` on a `move`, merges empty `unreachable` blocks), so
     `after = spec before` is to be tried per body, and no pair is in `BlazeValidated` yet.
-  - **Dead-store elimination: first piece** (`Opt/Ptr.lean`; not yet elaborated).
+  - **Dead-store elimination: first piece** (`Opt/Ptr.lean`; checked at eadd58c04c).
     `MemOk P st` says every pointer in every slot of the state satisfies `P`; a read gives a
     value whose pointers do (`State.read_ok`) and a write of such a value keeps it
     (`State.write_ok`). The rest is below.
