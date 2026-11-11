@@ -2362,7 +2362,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut described_functions = Vec::new();
         let fresh = match self.kept {
             None => Some(Fresh::Unkept),
-            Some(kept) if kept.is_empty() => Some(Fresh::Restart),
+            Some(kept) if kept.is_empty() => Some(kept.empty_because()),
             Some(_) => None,
         };
         let mut nodes: blaze_hash::HashMap<InstanceKey, Node<B>, Global> =

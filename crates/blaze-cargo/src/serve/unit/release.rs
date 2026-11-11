@@ -17,7 +17,8 @@
 //!   release lowers past its share. The build stops its readers for it (each task under way
 //!   ends first; none is cancelled), and the front end's values kept by bytes are swept under
 //!   the squeeze's caps too ([`blaze_query::db::Storage::sweep_values`]), not only at the next
-//!   view.
+//!   view. The walks codegen keeps for the next build go then too
+//!   ([`hir_ty_codegen::v2::let_go_kept_walks`]): a cold build of blaze held 13 GiB of them.
 //! - **Once the front end is kept**, its build over: every MIR goes then, of every goal and
 //!   under any limit or none ([`Release::end`]). MIR is the request's: a value of the build
 //!   that made it, read again by the next build only as its memo (verified against, made
@@ -327,6 +328,7 @@ impl Release<Crate> {
             solver_caches = tracing::field::Empty,
             intern_tables = tracing::field::Empty,
             unread = tracing::field::Empty,
+            kept_describes = tracing::field::Empty,
             left = tracing::field::Empty,
             query_storage = tracing::field::Empty,
         );
@@ -339,6 +341,19 @@ impl Release<Crate> {
         }
         if pressed {
             db.storage_mut().sweep_values(&Squeeze::caps(before));
+            // The walks codegen keeps for the next build's (each function's describe, each
+            // program's walk and lists) are a cache on the global heap under no budget: memory
+            // short takes them as it takes the values above. No walk is in flight (a walk reads
+            // the front end, which is exclusive here); the next begins with nothing kept and
+            // says so (`blaze_codegen::driver::Fresh::LetGo`).
+            let describes = hir_ty_codegen::v2::let_go_kept_walks();
+            span.record("kept_describes", describes);
+            if describes != 0 {
+                crate::serve::said::logged!(INFO,
+                    "blaze serve: front end release (memory): let go of the {describes} describes \
+                     codegen's walks kept for the next build's"
+                );
+            }
         }
         // The build is over: what neither it nor the build before it read of the front end's
         // evictable values goes, the results of revisions no edit since has asked for. Only
