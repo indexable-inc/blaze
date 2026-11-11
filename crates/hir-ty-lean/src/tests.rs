@@ -791,12 +791,15 @@ fn fnv1a(db: &Db) -> FunctionId {
     function(db, "blaze_graph", "fnv1a_from")
 }
 
-/// The invariant (proved: crates/blaze-graph/lean/BlazeGraph/Ledger.lean): the ledger's
+/// The invariant: the ledger's
 /// checksum loop `fnv1a_from` never panics (no index out of bounds, no counter overflow) and
 /// returns FNV-1a's fold of the seed over the bytes, for every seed and every slice. The
 /// proof is of the model this test holds to the tree's source: the function's text is read
 /// from crates/blaze-graph/src/ledger.rs, its emitted Lean must be the checked-in module the
 /// proof imports, and its structured MIR runs to the same fold on the inputs here.
+/// A Lean proof of it is written (crates/blaze-graph/lean/BlazeGraph/Ledger.lean) and Lean has
+/// not checked it: this statement says `(proved: ..)` once `lake build` of `lean/` passes in
+/// the gate (ledger V5), never before.
 #[test]
 fn fnv1a_from_is_the_fold_of_its_bytes() {
     let db = db(&fnv1a_fixture());
