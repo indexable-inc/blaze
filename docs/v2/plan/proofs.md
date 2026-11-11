@@ -568,7 +568,7 @@ theorem checkBorrows_sound (borrowed : Body → Local → Bool) (prog : Program)
     (h : checkBorrows borrowed prog = true) : ProgFine (BorrowedIn borrowed prog) prog
 ```
 
-**`Blaze.Mir.Opt.removeOverwritten_refines`** (`Blaze.Mir.Opt.RemoveOverwritten`, `lean`): Removing a store that its own block overwrites before its local is mentioned refines the program, from every state the borrow invariant holds of.
+**`Blaze.Mir.Opt.removeOverwritten_refines`** (`Blaze.Mir.Opt.RemoveOverwritten`, `lean`): Removing a store that its own block overwrites before its local is mentioned refines the program, from every state the borrow invariant holds of; the Rust DeadStoreElimination also removes stores dead by liveness across blocks and unwinding, which is not specified (ledger V11).
 
 ```lean
 theorem removeOverwritten_refines (borrowed : Body → Local → Bool) (prog : Program)
