@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-107 invariants, 18 refinements, 7 reference models.
-By level: 93 tested, 31 simulated, 1 model-checked, 0 proved.
+108 invariants, 18 refinements, 7 reference models.
+By level: 94 tested, 31 simulated, 1 model-checked, 0 proved.
 
 ## Invariants
 
@@ -193,6 +193,8 @@ By level: 93 tested, 31 simulated, 1 model-checked, 0 proved.
 
 ### blaze-query
 
+- **`a_stale_head_of_another_tasks_cycle_is_waited_for_never_run`** *tested* (`crates/blaze-query/src/db/tests/stale_head.rs`): a provisional row is run and written only by the task whose stack holds its cycle's head. A task that comes to hold the flight of a stale inner head of another task's cycle waits for the head instead, so every task gets the fixpoint a single task computes, and no run finds its own row emptied under it.
+  Controls: `a_stale_head_run_by_a_task_that_does_not_head_its_cycle`.
 - **`a_restored_image_names_only_what_it_holds`** *model-checked* (`crates/blaze-query/src/tests.rs`): a database restored from an image holds no record that names a memo, an edge or bytes of the blob the image lacks: each is refused as the image is opened, naming the section and the record, never met by the first request that reads it. An image the database wrote passes, and written again unchanged it still does.
   Controls: `a_table_slot_naming_a_memo_the_image_lacks`.
 

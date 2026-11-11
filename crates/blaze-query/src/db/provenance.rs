@@ -321,8 +321,11 @@ pub(crate) fn name_ids(text: String) -> String {
             continue;
         }
         let Some(id) = text[digits..end].parse::<u32>().ok().and_then(Id::new) else { continue };
-        out.push_str(&text[copied..end]);
-        copied = end;
+        // Through the ID's own `)`, which the check above found at `end`: the name follows
+        // the ID whole, `Id(7) = name`, so the ID's text is in the named row as it is in one
+        // no namer knows.
+        out.push_str(&text[copied..=end]);
+        copied = end + 1;
         let at = out.len();
         out.push_str(" = ");
         if !named(&text[open - word..open], id, &mut out) {
