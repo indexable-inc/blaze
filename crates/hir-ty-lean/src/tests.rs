@@ -804,9 +804,12 @@ fn fnv1a(db: &Db) -> FunctionId {
 /// proof is of the model this test holds to the tree's source: the function's text is read
 /// from crates/blaze-graph/src/ledger.rs, its emitted Lean must be the checked-in module the
 /// proof imports, and its structured MIR runs to the same fold on the inputs here.
-/// A Lean proof of it is written (crates/blaze-graph/lean/BlazeGraph/Ledger.lean) and Lean has
-/// not checked it: this statement says `(proved: ..)` once `lake build` of `lean/` passes in
-/// the gate (ledger V5), never before.
+/// Lean 4.20.0 accepts the proof of the model (crates/blaze-graph/lean/BlazeGraph/Ledger.lean)
+/// and a proof is written that the model is what the function's MIR runs to
+/// (BlazeGraph/LedgerMir.lean, objective V7). This statement says `(proved: ..)` once three
+/// things hold on one commit, never before: this test and
+/// `fnv1a_from_is_embedded_as_the_body_its_proof_walks` pass (the model and the embedded body
+/// are what blaze emits), and `lake build` of `lean/` passes in the gate with both proofs.
 #[test]
 fn fnv1a_from_is_the_fold_of_its_bytes() {
     let db = db(&fnv1a_fixture());
@@ -1069,7 +1072,7 @@ fn validation_head() -> String {
     )
 }
 
-/// The refinement: a MIR pass with a Lean specification does, on each body here, exactly
+/// A MIR pass with a Lean specification does, on each body here, exactly
 /// what the specification does (`after = spec before`, decided by Lean's kernel when
 /// `lake build` checks lean/BlazeValidated/passes.lean); the specification is proved to
 /// preserve every run (`Blaze.Mir.Opt.removeStorageMarkers_correct`,
