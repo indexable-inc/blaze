@@ -254,6 +254,19 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let (value, shadow) = self.reflected_some(fn_ptr, value, locals)?;
                 self.write_shadowed(destination.addr, &value, &shadow)?;
             }
+            Intrinsic::BlazeTypeNameOf => {
+                // `core::reflect::name_of`: the type as a diagnostic of the evaluating crate
+                // names it (`Shared<Parent>`), so a refusal built from ids reads as the
+                // source does. Any type has one: nothing is refused.
+                let [id] = args else { not_supported!("blaze_type_name_of args") };
+                let ty = self.type_id_of(id)?;
+                let target = hir_ty::display::DisplayTarget::from_crate(
+                    self.db,
+                    self.param_env.krate,
+                );
+                let name = hir_ty::display::HirDisplay::display(&ty, self.db, target).to_string(); // alloc: reflection shim, once per name a refusal shows
+                self.write_str(destination, &name)?;
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -770,11 +783,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     ) -> Result<'db, Made<M::Shadow>> {
         let variant = match ty.kind() {
             // rustc writes a tuple's fields into the field of `TypeKind::Tuple`, which at the
-            // pinned nightly has none, and so ICEs.
-            TyKind::Tuple(_) => not_supported!(
-                "the `Type` of the tuple {ty:?}: rustc at the pinned nightly ICEs on it, \
-                 writing its fields into `TypeKind::Tuple`, which has none"
-            ),
+            // pinned nightly has none, and so ICEs: no program it builds asks. blaze answers
+            // the variant as the library declares it, with no field, so code that walks any
+            // type by its kind (`bstd::own::reach`) can tell a tuple from what it cannot see
+            // into; the fields are read through `type_id_fields`, which answers a tuple's.
+            TyKind::Tuple(_) => "Tuple",
             TyKind::Array(..) => "Array",
             TyKind::Slice(_) => "Slice",
             TyKind::Adt(adt, _) => match adt.def_id() {

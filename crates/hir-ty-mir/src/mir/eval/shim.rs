@@ -842,7 +842,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             | Intrinsic::FieldRepresentingTypeName
             | Intrinsic::FieldRepresentingTypeOffset
             | Intrinsic::TypeIdGenerics
-            | Intrinsic::TypeIdFunctionPtr => {
+            | Intrinsic::TypeIdFunctionPtr
+            | Intrinsic::BlazeTypeNameOf => {
                 return self.exec_reflection_intrinsic(intrinsic, args, destination, locals);
             }
             Intrinsic::Sqrt

@@ -359,6 +359,17 @@ pub const fn code_id_of<F: FnItem>() -> [u8; 32] {
     const { intrinsics::blaze_code_id::<F>() }
 }
 
+/// The type `id` is of, as blaze's diagnostics name it: `Shared<Parent>`, not
+/// `type_name`'s full paths. For code that walks types by their ids
+/// (`core::mem::type_info`) and has to say which one it stopped at; `type_name::<T>()` needs
+/// the type itself. Only at compile time.
+#[unstable(feature = "blaze_comptime", issue = "none")]
+#[rustc_const_unstable(feature = "blaze_comptime", issue = "none")]
+#[rustc_comptime]
+pub fn name_of(id: crate::any::TypeId) -> &'static str {
+    intrinsics::blaze_type_name_of(id)
+}
+
 /// Const facts about a function item or a closure, from [`fn_info`].
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
@@ -473,4 +484,9 @@ mod intrinsics {
     #[rustc_intrinsic]
     #[rustc_comptime]
     pub(super) fn blaze_code_id<F>() -> [u8; 32];
+
+    /// The type `id` is of, as a diagnostic names it ([`super::name_of`]).
+    #[rustc_intrinsic]
+    #[rustc_comptime]
+    pub(super) fn blaze_type_name_of(id: crate::any::TypeId) -> &'static str;
 }

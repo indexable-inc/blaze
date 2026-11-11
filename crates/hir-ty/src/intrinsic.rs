@@ -235,6 +235,10 @@ pub enum Intrinsic {
     /// a fn item or closure type, answered only by blaze's const evaluator, from
     /// `hir_ty_identity::fn_code_id` through [`crate::providers::CodeIdentity`].
     BlazeCodeId,
+    /// `core::reflect::name_of`'s (`#![feature(blaze_comptime)]`): the type a `TypeId` is of,
+    /// as diagnostics name it, answered only by blaze's const evaluator. A walk over ids
+    /// (`bstd::own::reach`) names the types on a refused path with it.
+    BlazeTypeNameOf,
 }
 
 const _: () = assert!(size_of::<Intrinsic>() == 2);
@@ -1100,6 +1104,8 @@ intrinsics! {
     382 blaze_int_cast => BlazeIntCast,
     // `core::reflect::code_id_of`'s.
     383 blaze_code_id => BlazeCodeId,
+    // `core::reflect::name_of`'s.
+    384 blaze_type_name_of => BlazeTypeNameOf,
 }
 
 #[cfg(test)]
@@ -1197,6 +1203,7 @@ mod tests {
             (381, "blaze_variant_index"),
             (382, "blaze_int_cast"),
             (383, "blaze_code_id"),
+            (384, "blaze_type_name_of"),
         ] {
             let intrinsic = Intrinsic::from_symbol(&Symbol::intern(name)).expect(name);
             assert_eq!(intrinsic.index(), index, "{name}");

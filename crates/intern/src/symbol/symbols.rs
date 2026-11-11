@@ -921,7 +921,7 @@ define_symbols! {
     blaze_variant_view, blaze_variant_representing_type, blaze_variant_of, blaze_fields,
     blaze_only_marked, blaze_only_unmarked, blaze_variants, blaze_fn_item, blaze_adt_name,
     blaze_field_index, blaze_field_attrs, blaze_variant_index, blaze_variant_discriminant,
-    blaze_fn_info, blaze_memo_point, blaze_code_id,
+    blaze_fn_info, blaze_memo_point, blaze_code_id, blaze_type_name_of,
     // `#[blaze::contract_test]`, the builtin attribute `core::blaze::contract_test`
     // (docs/v2/plan/design/contracts.md, part 2).
     contract_test,

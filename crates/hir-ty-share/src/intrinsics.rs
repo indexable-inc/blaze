@@ -59,7 +59,9 @@ pub fn classify(intrinsic: Intrinsic) -> Class {
         | BlazeVariantDiscriminant
         | BlazeVariantIndex
         // `core::reflect::code_id_of`'s: the code of its type argument, by full identity.
-        | BlazeCodeId => Class::Identity,
+        | BlazeCodeId
+        // `core::reflect::name_of`'s: the name of the type an id is of.
+        | BlazeTypeNameOf => Class::Identity,
         Autodiff | Offload => Class::PerInstance,
         Atomic(..)
         | Simd(_)

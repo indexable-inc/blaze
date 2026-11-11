@@ -76,6 +76,7 @@
 //! | [`map`], [`set`], [`hash`] | the one hash map and set, the identity and content hashers | blaze-hash |
 //! | [`id`] | content ids, dense indices, the interner | blaze-ids |
 //! | [`sync`], [`cell`] | `Shared`, named locks, `Atomic`, token cells, the spin, reclamation | std, blaze-core, blaze-spin, blaze-reclaim |
+//! | [`own`] | ownership properties derived by reflection (`Acyclic`), `Shared` and `Shares` | new |
 //! | [`sort`], [`phf`] | the radix sort; perfect hashes of fixed name sets | blaze-radix, blaze-phf |
 //! | [`digest`] | BLAKE3 and SHA-256 | blaze-ids' `b3`, blaze-sha256 |
 //! | [`rng`] | the seeded generator | blaze-rng |
@@ -94,9 +95,24 @@
     allocator_api,
     allocator_ext,
     blaze_comptime,
+    coerce_unsized,
+    const_cmp,
+    const_trait_impl,
+    core_intrinsics,
     custom_inner_attributes,
     generic_atomic,
-    register_tool
+    generic_const_exprs,
+    marker_trait_attr,
+    register_tool,
+    type_info,
+    unsize
+)]
+#![allow(
+    internal_features,
+    incomplete_features,
+    reason = "`core_intrinsics` for the one reflection intrinsic `own::raw` asks directly \
+              (`type_id_vtable`, of an unsized type); `generic_const_exprs` is blaze's own \
+              (docs/v2/plan/design/ownership.md), which rustc calls incomplete"
 )]
 #![register_tool(blaze)]
 
@@ -150,6 +166,14 @@ mod narrow;
 pub mod net;
 /// Handing a URL to the user's default application: `Opener`, narrowed to a scheme.
 pub mod opener;
+/// Ownership properties derived by reflection (`Acyclic`, `NoCapability`), the walk they are
+/// instances of, and the handles built on them: `Shared`, `LocalShared`, `Shares`.
+#[expect(
+    unsafe_code,
+    reason = "the trusted assertions of how std's containers hold their contents, the derived \
+              impls of the `unsafe` property traits, and `Shares`' one pointer, each with its SAFETY"
+)]
+pub mod own;
 pub mod path;
 pub mod pending;
 /// Power: the battery, and keeping the machine awake.

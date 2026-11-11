@@ -1,11 +1,14 @@
 //! Shared mutation across threads, and its cheaper one-thread versions (docs/v2/plan/design/std.md,
 //! "Shared mutation"): the plain name is safe across threads, `Local` marks the version for one
-//! thread. Each is the one structure its rule names, re-exported under bstd's name, so each is
-//! the same type as the original and code moves to the new name with no conversion.
+//! thread. Each but the first is the one structure its rule names, re-exported under bstd's
+//! name, so each is the same type as the original and code moves to the new name with no
+//! conversion. [`Shared`] and [`LocalShared`] are bstd's own handles over `Arc` and `Rc`
+//! ([`crate::own`]): the same calls for an ordinary value, and over an acyclic type they hold a
+//! linear one, released by hand.
 //!
 //! | bstd | the original |
 //! |---|---|
-//! | [`Shared`] / [`LocalShared`] | `std::sync::Arc` / `std::rc::Rc` |
+//! | [`Shared`] / [`LocalShared`] | handles over `std::sync::Arc` / `std::rc::Rc` ([`crate::own`]) |
 //! | [`Lock`], [`RwLock`] | `blaze_core::lock::{Lock, ReadLock}`, the named locks (rule `standard-structures`) |
 //! | [`LocalLock`] | `std::cell::RefCell` |
 //! | [`Once`], [`Lazy`] / [`LocalOnce`], [`LocalLazy`] | `OnceLock`, `LazyLock` / `OnceCell`, `LazyCell` |
@@ -30,12 +33,13 @@
 
 pub use std::{
     cell::{LazyCell as LocalLazy, OnceCell as LocalOnce, RefCell as LocalLock},
-    rc::Rc as LocalShared,
     sync::{
-        Arc as Shared, LazyLock as Lazy, OnceLock as Once,
+        LazyLock as Lazy, OnceLock as Once,
         atomic::{Atomic, Ordering},
     },
 };
+
+pub use crate::own::{LocalShared, Released, Shared};
 
 pub use blaze_core::lock::{Lock, LockGuard, ReadGuard, ReadLock as RwLock, Signal, WriteGuard};
 pub use blaze_spin::SpinWait;

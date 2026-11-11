@@ -2389,6 +2389,7 @@ fn pure_intrinsic(intrinsic: Intrinsic) -> bool {
         | I::BlazeFieldIndex
         | I::BlazeVariantDiscriminant
         | I::BlazeVariantIndex
-        | I::BlazeCodeId => true,
+        | I::BlazeCodeId
+        | I::BlazeTypeNameOf => true,
     }
 }
