@@ -226,7 +226,8 @@ jobs:
             "$HOME/.elan/bin/elan" toolchain install "$pin"
           fi
           "$lake" --version
-      - run: uv run --frozen python harness/v2/lean_gate.py '{"command": "check"}'
+      - run: |
+          uv run --frozen python harness/v2/lean_gate.py '{"command": "check"}'
 
   # Every workflow parses and holds together (actionlint): a workflow whose YAML does not parse
   # fails on push with no jobs and says so nowhere (release.yaml, promote.yaml and yank.yaml after
