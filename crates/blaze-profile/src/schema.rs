@@ -452,7 +452,11 @@ pub const BUILDS: Table = Table {
             "ok, failed, cancelled, stalled, running or crashed (its daemon died while it ran; written by the postmortem of the daemon's flight recorder)",
         ),
         opt("hits", Type::U64, "nodes the memo settled without running them"),
-        opt("misses", Type::U64, "nodes that ran their task"),
+        opt(
+            "misses",
+            Type::U64,
+            "the things it computed again: how many rows `misses` holds of it (until 2026-11-11, the plane's nodes that ran a task)",
+        ),
         opt("joined", Type::U64, "nodes that took a task another node ran"),
         opt(
             "tree",

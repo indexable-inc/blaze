@@ -1716,7 +1716,7 @@ impl<'a> Ctx<'a> {
                 subject: "misses".to_owned(),
                 title: format!("the build counted {counted} misses and the misses table explains {explained}"),
                 evidence: Vec::new(),
-                fix: "give every node that ran its task a misses row with its cause, or define builds.misses as what the table counts".to_owned(),
+                fix: "builds.misses is the count of the build's rows in `misses` (since 2026-11-11): a build that counts more was written by an older blaze, whose count was the plane's nodes that ran a task, or its history lost rows".to_owned(),
             });
         }
         let r = self.facts.recorder;

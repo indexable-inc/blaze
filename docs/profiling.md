@@ -337,7 +337,7 @@ rests on these numbers.
 | started_unix_ns | i64? | when it was taken, on the wall clock |
 | outcome | dict | ok, failed, cancelled, stalled, running or crashed |
 | hits | u64? | nodes the memo settled without running them |
-| misses | u64? | nodes that ran their task |
+| misses | u64? | the things it computed again: how many rows `misses` holds of it (until 2026-11-11, the plane's nodes that ran a task) |
 | joined | u64? | nodes that took a task another node ran |
 | tree | utf8? | the digest of the workspace's source tree when the build ended, as `blaze-v2-proof tree <dir>` prints it with `target` and `.git` skipped; null for a build of no directory. Compare it with the same digest of a checkout to tell which tree a build tested: `commit` is null for a snapshot that is not a git checkout |
 | blaze | utf8? | the BLAKE3 hash of the blaze executable that ran the build |

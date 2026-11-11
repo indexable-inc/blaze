@@ -2787,7 +2787,12 @@ impl<S: Steps> Job<S> {
             started_unix_ns: self.opened_unix_ns,
             outcome,
             hits: stats.map(|it| it.cached),
-            misses: stats.map(|it| it.ran),
+            // How many rows of `misses` the build has: counted where they are written, by the
+            // history's thread once it explained them (`observe::keep`), never here. Until
+            // 2026-11-11 this was the plane's count of nodes that ran a task (353 on every
+            // build of ripgrep, a no-op's too, beside 3 rows in `misses`): two things under
+            // one name. The plane's count is the `memo misses` counter and the `task` spans.
+            misses: None,
             joined: stats.map(|it| it.joined),
             tree: None,
             blaze: None,

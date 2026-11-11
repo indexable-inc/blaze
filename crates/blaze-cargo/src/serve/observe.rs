@@ -863,6 +863,9 @@ fn keep(
                 if row.commit.is_none() {
                     row.commit = commit_of(Path::new(&row.workspace));
                 }
+                // `builds.misses` is what `misses` lists of the build, counted from the very
+                // rows written (one-concept-one-home): `blaze slow` holds the two equal.
+                row.misses = Some(misses.len() as u64);
                 // No flush, and nothing given to the history a flush of another kind (the
                 // timer's, a reader's) would write: the build's answer comes first
                 // ([`ToHistory::Answered`]). The span is open until then, so the profile says
