@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: The blaze edition. Rust with ten opt-in changes (handles that copy themselves, error unions, view types, records, contexts, effects at the border, values that must be used up, contracts and pattern types, compile-time reflection, `&uniq`), what it removes, the lints that get a crate ready for it, and the order it is built in.
+summary: The blaze edition. Rust with eleven opt-in changes (handles that copy themselves, error unions, view types, records, contexts, effects at the border, values that must be used up, contracts and pattern types, compile-time reflection, `&uniq`, early drop), what it removes, the lints that get a crate ready for it, and the order it is built in.
 date: 2026-11-09
 ---
 # The blaze edition
@@ -27,7 +27,7 @@ Three tests decide what goes in:
    functions and written on every `pub` one.
 3. **Each addition deletes something**: a pattern, a crate or a tool people use today.
 
-## The ten changes
+## The changes
 
 Each is its own feature attribute first (`#![blaze::handles]`, ...), usable in any crate, and the
 edition turns them all on. The spec column is where the design lives; this page does not repeat
@@ -45,6 +45,7 @@ it.
 | 8 | **Contracts and pattern types.** `requires` and `ensures` on a function; `usize is 1..` puts a range in the type, and `Conn is Conn::Open { .. }` a variant. | preconditions in doc comments, restated checks, `unreachable!()` after a match already made | [contracts](contracts.md), here | medium |
 | 9 | **Compile-time reflection.** `for const f in fields_of::<T>()` in ordinary typed code. | most derive proc macros | [comptime](comptime.md) | large |
 | 10 | **`&uniq T`.** The unique reference is spelled for what it guarantees. `&mut T` means the same and is the old spelling. | the belief that `&` means immutable and `&mut` means mutable | here | small |
+| 11 | **Early drop.** A value whose destructor only frees memory (`Vec`, `String`, `Box`, a struct of them, a type marked `#[blaze::drop(early)]`) is dropped after its last use; a guard keeps its scope. `#![blaze::early_drop]`. | `drop(x);` written to end a borrow, blocks opened to end one, memory held to the end of a long function | [early-drop](early-drop.md) | medium |
 
 ### Rules for the four that have no spec yet
 
@@ -172,6 +173,7 @@ is an error. Where a mechanical fix exists, `blaze check --fix` applies it.
 | `blaze::handle_clone` | `.clone()` on a `Handle` (once change 1 exists) | removes it |
 | `blaze::error_wrapper` | an error enum that is only `From` variants (once change 2 exists) | rewrites to a union |
 | `blaze::unmarked_pure`, `unmarked_nopanic`, `unmarked_noalloc`, `unmarked_nonblocking` | a function the effects walk proves has that property and that lacks its attribute; `pub` functions by default, every function with `unmarked-effects-private = true` | adds the attribute; never one the check would then refuse |
+| `blaze::unused_guard` | `let _ = expr;` where `expr`'s type keeps its scope's drop (a guard): it is dropped at once (once change 11 exists) | `let _guard = expr;` |
 | `blaze::derivable_by_reflection` | a derive that reflection covers (once change 9 exists) | none at first |
 
 The first three need nothing new and are built first. `lossy_as` is one lint with one message in
@@ -193,6 +195,7 @@ Payoff per unit of compiler work, and what leans on what.
 | E6 | Capabilities as parameters (change 5): blaze's crates on bstd; the `with` clause deferred | S1 to S3 of [std](std.md) |
 | E7 | Effects inferred and declared at the border; closures pass their effects through; `async` removed for crates on fibers (change 6) | E6 |
 | E8 | Linear values, contracts and pattern types, reflection (changes 7 to 9), each finishing its own spec | their specs |
+| E14 | Early drop (change 11) and `unused_guard` | nothing |
 | E9 | `edition = "blaze-2026.11"`: everything above on, everything removed an error, `blaze fix --edition` | E1 to E8, S5 |
 
 Every change follows the rules for an extension: semantics in the front end's query crates, the

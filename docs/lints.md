@@ -1101,6 +1101,19 @@ and make the calls on the wrapper. A `BufWriter` writes what is left when droppe
 **Allowing it.** `#[expect(blaze::unbuffered_io, reason = "..")]`, where each call must reach
 the system on its own (a log that must survive a crash).
 
+## `unused_guard`
+
+Planned with `#![blaze::early_drop]` ([early-drop](v2/plan/design/early-drop.md), objective
+E14), in the group `blaze::edition`; `blaze check` does not report it yet.
+
+**What it will catch.** `let _ = expr;` where a value of `expr`'s type keeps its scope's drop
+under early drop (a lock guard, a file, anything with a `Drop` impl that is not marked
+`#[blaze::drop(early)]`). `_` binds nothing, so the value is dropped at once: the lock is
+released on the same line.
+
+**How to fix it.** `let _guard = expr;` keeps it to the end of the scope (the fix `blaze check
+--fix` will apply); `drop(expr);` says the immediate drop is meant.
+
 ## `unwind_across_ffi`
 
 **What it catches.** A function written in Rust with a foreign ABI that can't unwind
