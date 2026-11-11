@@ -1779,6 +1779,13 @@ struct Build<S: Steps> {
     /// Of a build of only the units a view's front end applies ([`Jobs::next`]): how far it
     /// is, as its nodes settle; none for a build the job ends with.
     applying: Option<Applying>,
+    /// Open from the units' nodes being posted until the first unit not found kept begins
+    /// (or, when every unit is kept, until the build's units end): the stretch in which the
+    /// build does nothing but find its dependencies' units kept, a node a phase of each, in
+    /// dependency order, before the unit an edit changed can start. On ripgrep 2026-11-10
+    /// this stretch of a body edit of `rg::main` was 650 ms that no span named
+    /// (slow-is-p0-traced); the unit tasks inside it are its children by time.
+    made_wait: Option<tracing::Span>,
 }
 
 /// Why the daemon lets go of the front ends it keeps ([`Jobs::let_go`]).
@@ -5571,6 +5578,12 @@ impl<S: Steps> Jobs<S> {
             fresh: fresh_units,
             verdicts,
             applying: applying.then_some(Applying { left: count, failed: false }),
+            made_wait: (count > 0).then(|| {
+                tracing::info_span!(
+                    target: "blaze",
+                    "the build's first made unit waits behind the units found kept"
+                )
+            }),
         }));
         if count > 0 {
             self.add(w, id, nodes, Some(work), true);
@@ -5636,6 +5649,9 @@ impl<S: Steps> Jobs<S> {
         let fresh = build.is_fresh(at);
         if fresh {
             build.writer.found_kept(at);
+        } else {
+            // The first unit this build makes begins: the wait behind the kept ones is over.
+            build.made_wait = None;
         }
         match fresh {
             true => job.fresh += 1,
