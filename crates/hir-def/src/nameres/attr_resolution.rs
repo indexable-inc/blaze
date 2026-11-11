@@ -144,6 +144,12 @@ impl DefMap {
                         // `#![blaze::records]`, read off the crate root's tokens by
                         // `base_db::crate_extensions` (docs/v2/plan/design/records.md).
                         | "records"
+                        // `#![blaze::early_drop]`, from `DefMap::early_drop`, and
+                        // `#[blaze::drop(early)]` and `#[blaze::drop(scoped)]` on a type, from
+                        // `AttrFlags::DROP_EARLY` and `AttrFlags::DROP_SCOPED`
+                        // (docs/v2/plan/design/early-drop.md).
+                        | "early_drop"
+                        | "drop"
                         // `#[blaze::reflect]`, from `AttrFlags::BLAZE_REFLECT`
                         // (`hir_ty_comptime::struct_domain`, docs/v2/plan/design/comptime.md).
                         | "reflect"

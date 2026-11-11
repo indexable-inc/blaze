@@ -2067,6 +2067,7 @@ impl Enc<'_> {
             no_std,
             proc_macro,
             arbitrary_ints,
+            early_drop,
             edition,
             recursion_limit,
         } = &**data;
@@ -2080,6 +2081,7 @@ impl Enc<'_> {
         self.bool(*no_core);
         self.bool(*no_std);
         self.bool(*arbitrary_ints);
+        self.bool(*early_drop);
         self.option(*recursion_limit, |enc, it| {
             enc.u32(it);
             Ok(())
@@ -3469,6 +3471,7 @@ impl Dec<'_> {
         data.no_core = self.bool()?;
         data.no_std = self.bool()?;
         data.arbitrary_ints = self.bool()?;
+        data.early_drop = self.bool()?;
         data.recursion_limit = self.option(Self::u32)?;
         data.registered_tools = self.many(Self::symbol)?;
         let mut features = UnstableFeatures::default();

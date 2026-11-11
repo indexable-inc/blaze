@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-52 invariants, 16 refinements, 5 reference models.
-By level: 49 tested, 19 simulated, 0 model-checked, 0 proved.
+53 invariants, 16 refinements, 5 reference models.
+By level: 50 tested, 19 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -162,6 +162,11 @@ By level: 49 tested, 19 simulated, 0 model-checked, 0 proved.
 
 - **`fnv1a_from_is_the_fold_of_its_bytes`** *tested* (`crates/hir-ty-lean/src/tests.rs`): the ledger's checksum loop `fnv1a_from` never panics (no index out of bounds, no counter overflow) and returns FNV-1a's fold of the seed over the bytes, for every seed and every slice. The proof is of the model this test holds to the tree's source: the function's text is read from crates/blaze-graph/src/ledger.rs, its emitted Lean must be the checked-in module the proof imports, and its structured MIR runs to the same fold on the inputs here. A Lean proof of it is written (crates/blaze-graph/lean/BlazeGraph/Ledger.lean) and Lean has not checked it: this statement says `(proved: ..)` once `lake build` of `lean/` passes in the gate (ledger V5), never before.
   Controls: `a_continue_made_a_break`, `an_else_branch_dropped_at_a_join`, `an_xor_made_an_add`.
+
+### hir-ty-mir
+
+- **`early_drops_keep_every_program_as_rust_runs_it`** *tested* (`crates/hir-ty-mir/src/mir/early_drop/frontier.rs`): under early drop no local is dropped while a loan of it is live, no local is used after its drop, every initialized local is dropped exactly once on every path, the locals of one edge drop in scope order, and a scoped local drops where Rust drops it.
+  Controls: `a_drop_before_the_last_use_of_a_reborrow`, `a_conditional_move_with_no_drop_flag`, `a_scoped_guard_dropped_early`, `two_locals_dropped_in_hash_order`.
 
 ### hir-ty-pure
 

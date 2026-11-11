@@ -162,6 +162,13 @@ pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData> {
             for feature in ["portable_simd", "blaze_simd"] {
                 crate_data.unstable_features.enable(Symbol::intern(feature));
             }
+        // `#![blaze::early_drop]`: a local whose destructor only frees memory is dropped after
+        // its last use (`DefMap::early_drop`, docs/v2/plan/design/early-drop.md).
+        if let [tool, name] = attr.path.segments()
+            && tool.symbol().as_str() == "blaze"
+            && name.symbol().as_str() == "early_drop"
+        {
+            crate_data.early_drop = true;
             continue;
         }
         let Some(attr_name) = attr.path.as_ident() else { continue };

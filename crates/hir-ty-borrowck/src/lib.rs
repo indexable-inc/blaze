@@ -51,6 +51,8 @@ mod differential;
 #[cfg(test)]
 mod dropck_tests;
 #[cfg(test)]
+mod early_drop_tests;
+#[cfg(test)]
 mod flow_tests;
 #[cfg(test)]
 mod missing_body_tests;
