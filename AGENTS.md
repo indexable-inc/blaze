@@ -158,6 +158,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 58. **build-the-missing-piece**: When the right design needs something the tree does not have (a
     compiler feature, a library module, a tool), build it and add it to the tree; never ship the
     weaker form because the piece was missing. Skill: `changing-code`.
+59. **unease-is-work**: When anything seems iffy, suboptimal or makes you uneasy, stop and find the core
+    reason it is that way, then fix that reason at its root, whatever it takes: a redesign, a
+    language change, addition or removal. Skill: `changing-code`.
 
 ## Code Review Rules
 
