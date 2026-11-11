@@ -866,3 +866,70 @@ fn a_token_keeps_its_crates_syntax_extensions_through_a_macro() {
     let (_, dump, errors) = expanded_across(Extensions::UNIQ, union, none, "A, B");
     assert!(errors > 0 && !dump.contains("UNION_TYPE"), "{dump}");
 }
+
+/// The error, if any, of expanding `arg` by the `macro_rules` rules `decl`.
+fn expansion_error(decl: &str, arg: &str) -> Option<String> {
+    let db = base_db::Db::for_tests();
+    let anchor = |file: u32| SpanAnchor {
+        file_id: EditionedFileId::new(FileId::from_raw(file), Edition::CURRENT),
+        ast_id: ROOT_ERASED_FILE_AST_ID,
+    };
+    let ctx = SyntaxContext::root(Edition::CURRENT);
+    let decl_tt =
+        syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor(0), ctx, decl).unwrap();
+    let mac = DeclarativeMacro::parse_macro_rules(&decl_tt, |_| Edition::CURRENT);
+    let arg_tt = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor(1), ctx, arg).unwrap();
+    let res = mac.expand(
+        &db,
+        &arg_tt,
+        |_| (),
+        crate::MacroCallStyle::FnLike,
+        Span { range: TextRange::up_to(TextSize::of(arg)), anchor: anchor(1), ctx },
+    );
+    res.err.map(|err| format!("{err:?}"))
+}
+
+/// konst 0.2.20's `__declare_string_cmp_fns` (reth, tempo): a doc comment between two
+/// `key = $value:ident,` pairs of a matcher. rustc's matcher steps over a matcher's doc comment
+/// (`macro_parser.rs`, `MatcherLoc::Token`), so the call that has no comment there matches.
+#[test]
+fn a_doc_comment_in_a_matcher_matches_nothing() {
+    let decl = r#"
+(
+    ordering_fn = $cmp:ident,
+    /// Equivalent to ordering_fn, but returns a U8Ordering
+    ordering_fn_inner = $inner:ident,
+    $(
+        /** one per key */
+        $key:ident
+    )*
+    //! an inner one, last
+) => { fn $cmp() {} fn $inner() {} };
+"#;
+    let call = "ordering_fn = cmp_str, ordering_fn_inner = cmp_str_inner, a b";
+    assert_eq!(expansion_error(decl, call), None);
+}
+
+/// The control of `a_doc_comment_in_a_matcher_matches_nothing`: only a comment is stepped
+/// over. An attribute written out in the matcher is still tokens the call has to have, and a
+/// call's own doc comment is still its attribute, which a matcher's comment does not take.
+#[test]
+fn a_doc_attribute_in_a_matcher_is_still_matched() {
+    let decl = r#"
+(#[doc = "written out"] $name:ident) => { fn $name() {} };
+"#;
+    assert_eq!(expansion_error(decl, r#"#[doc = "written out"] f"#), None);
+    assert!(expansion_error(decl, "f").is_some(), "the attribute is no comment");
+
+    let commented = r#"
+(
+    /// a comment
+    $name:ident
+) => { fn $name() {} };
+"#;
+    assert_eq!(expansion_error(commented, "f"), None);
+    assert!(
+        expansion_error(commented, "/// the call's\nf").is_some(),
+        "a call's doc comment is its `#[doc]` attribute, which nothing here matches"
+    );
+}
