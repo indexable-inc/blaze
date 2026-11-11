@@ -25,7 +25,9 @@ use crate::span;
 /// `outcome` says `ran` or `untracked read` (no file before 4 has a `provenance` row). At 5: `events.message` is the message alone (it
 /// was the message, then each other field as `name=value`); an event's other fields are rows of
 /// `event_fields`, joined on `process` and `events.event_id`. A file of version 4 or older has no
-/// `event_id` and its fields are in its `message`.
+/// `event_id` and its fields are in its `message`. Still 5 with `spans.fields` (2026-11-11), the
+/// last typed column of the span registry, nullable and at the table's end: a file from before
+/// reads it as null through the table's schema file.
 pub const VERSION: u32 = 5;
 
 /// A version before [`VERSION`] whose files a reader reads as [`VERSION`]'s, and what reading

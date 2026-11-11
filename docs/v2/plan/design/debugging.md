@@ -90,12 +90,24 @@ trip.
 
 `awaits`, `what` and `function` recorded on a span reached no column.
 
-`spans.fields` (schema 6) holds every field of an ad hoc span that fills no column of its own,
-as `key=value` text in the order the callsite declares them, so adding a field needs no schema
-change: `WHERE fields LIKE '%why=memory%'`. Fields that name a column (`crate`, `function`,
-`unit`, `awaits`, their aliases) still fill it. The lint `blaze::span_field_unrecorded` now
-refuses only a field whose name is malformed for that text (not an identifier) or collides
-with a span column only a kind may write (`owner`, `steps`, ...).
+`spans.fields` holds every field of an ad hoc span that fills no column of its own, as
+`key=value` text in the order the span recorded them (cut at 1 KiB), so adding a field needs no
+schema change: `WHERE fields LIKE '%why=memory%'`. Fields that name a column (`crate`,
+`function`, `unit`, `awaits`, their aliases) still fill it; a value given later
+(`span.record`) is added to the text. A span too short for a row of its own (`folded`) loses
+its fields as it loses its `function`. The lint `blaze::span_field_unrecorded` now refuses
+only a field whose name the text can't hold apart (not letters, digits and `_`) or that is a
+span column only a kind may write (`owner`, `steps`, ...).
+
+The schema's version stays 5: `fields` is a nullable column at the end of `spans` (the last
+typed column of the registry), which `schema.rs` says never bumps it; a file from before reads
+it as null through the table's schema file. The flight recorder's mapping is refused across
+the change by its own fingerprint, which hashes the typed columns' names.
+
+A text column was chosen over rows of a `span_fields` table (as `event_fields` is to
+`events`): a span's columns are words of its slot, written as its row closes, so one more
+name costs a hash and a thread-local lookup; a row a field would cost a ring row each for
+every span that says one, on a path events are not on.
 
 ## c. Time with no span says where (built in `blaze slow`; the watchdog specified)
 

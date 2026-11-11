@@ -118,6 +118,9 @@ struct Site {
     meta: &'static Meta,
     fields: u32,
     held: bool,
+    /// It has a field that fills no column of its own and is kept in `fields`
+    /// ([`span::ad_hoc_field_refused`]): its spans' fields are read even when `fields` is 0.
+    rest: bool,
 }
 
 /// The field that makes a callsite's spans held: open across the steps of a state machine
@@ -138,6 +141,17 @@ const _: () = assert!(span::COLUMNS <= 32, "a callsite's fields are bits of a u3
 fn field_of(name: &str) -> u32 {
     span::ad_hoc_column(name).map_or(0, |at| 1 << at)
 }
+
+/// Whether an ad hoc span's field named `name` is kept as `name=value` in the span's `fields`
+/// column: it fills no column of its own, is not [`HELD_FIELD`], and its name is one the text
+/// holds apart ([`span::ad_hoc_field_refused`]).
+fn kept_as_text(name: &str) -> bool {
+    field_of(name) == 0 && name != HELD_FIELD && span::ad_hoc_field_refused(name).is_none()
+}
+
+/// The most bytes of `fields` text a span keeps: past it the text ends in `...`. A name's
+/// definition is rows of its ring, so a span's fields cost at most 20 rows.
+pub const FIELDS_TEXT_MAX: usize = 1024;
 
 /// The callsites recorded, open-addressed by the address of their metadata: written under
 /// [`TAKEN`] as a callsite registers, read with no lock by every span.
@@ -178,7 +192,8 @@ pub(crate) fn register(meta: &'static Meta) -> Option<u16> {
     }
     let fields = meta.fields().iter().fold(0, |all, it| all | field_of(it.name()));
     let held = meta.fields().field(HELD_FIELD).is_some();
-    _ = SITES[at].set(Site { meta, fields, held });
+    let rest = meta.fields().iter().any(|it| kept_as_text(it.name()));
+    _ = SITES[at].set(Site { meta, fields, held, rest });
     *taken += 1;
     // Under `TAKEN`: the mapping's site records have one writer at a time.
     postmortem::site_registered(at as u16 + 1, meta);
@@ -2895,6 +2910,10 @@ thread_local! {
     /// Where a field's value that is not a string is written before it is interned.
     // alloc: once per thread, grown to its longest field
     static TEXT: RefCell<String> = const { RefCell::new(String::new()) };
+    /// Where the fields of the span being made that fill no column are gathered as
+    /// `name=value` text before it is interned as the span's `fields` ([`Fields::finish`]).
+    // alloc: once per thread, grown to FIELDS_TEXT_MAX at most
+    static REST: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 /// The innermost span this thread is inside now, `None` for none or a thread with no ring yet:
@@ -2998,34 +3017,116 @@ fn claim() -> Option<&'static Ring> {
 /// each a name's ([`span::ad_hoc_column`]), so a value is kept as its text.
 struct Fields {
     wanted: u32,
+    /// The site has fields kept as text ([`Site::rest`]): they are gathered in [`REST`].
+    rest: bool,
+    /// A field was gathered: [`Fields::finish`] has a `fields` text to give.
+    gathered: bool,
     said: Said,
 }
 
 impl Fields {
+    /// The reader of a span's fields as it is made, or as it is given values later (`before`
+    /// the columns it has so far): [`REST`] begins as the `fields` text it has, so a value
+    /// given later is added to it.
+    fn of(site: u16, before: Said) -> Fields {
+        let (wanted, rest) =
+            SITES[usize::from(site) - 1].get().map_or((0, false), |it| (it.fields, it.rest));
+        if rest {
+            let had = before.get(span::FIELDS_AT);
+            _ = REST.try_with(|text| {
+                if let Ok(mut text) = text.try_borrow_mut() {
+                    text.clear();
+                    if let Some(had) = (had != 0).then(|| token_text(had)).flatten() {
+                        text.push_str(&had);
+                    }
+                }
+            });
+        }
+        Fields { wanted, rest, gathered: false, said: before }
+    }
+
+    /// Whether the site's spans have any field the profile keeps.
+    fn reads(&self) -> bool {
+        self.wanted != 0 || self.rest
+    }
+
     /// `field` is one bit of [`Site::fields`].
     fn set(&mut self, field: u32, value: &str) {
         self.said.set(field.trailing_zeros() as usize, intern(value));
+    }
+
+    /// A field of no column: `name=value` added to the span's `fields` text, a space before
+    /// it when it is not the first, up to [`FIELDS_TEXT_MAX`] bytes.
+    fn gather(&mut self, name: &str, value: &str) {
+        if !self.rest || !kept_as_text(name) {
+            return;
+        }
+        let gathered = REST.try_with(|text| {
+            // A field's `Debug` that opens a span of its own finds the text taken: lost.
+            let Ok(mut text) = text.try_borrow_mut() else { return false };
+            if text.len() >= FIELDS_TEXT_MAX {
+                return true;
+            }
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(name);
+            text.push('=');
+            text.push_str(value);
+            if text.len() > FIELDS_TEXT_MAX {
+                let mut cut = FIELDS_TEXT_MAX - 3;
+                while !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                text.truncate(cut);
+                text.push_str("...");
+                // Past the bound by nothing a later field can add to.
+                while text.len() < FIELDS_TEXT_MAX {
+                    text.push('.');
+                }
+            }
+            true
+        });
+        self.gathered |= gathered.unwrap_or(false);
+    }
+
+    /// Gives the span its `fields` column: the text gathered, interned as one name.
+    fn finish(&mut self) {
+        if !self.gathered {
+            return;
+        }
+        let token = REST
+            .try_with(|text| text.try_borrow().ok().filter(|it| !it.is_empty()).map(|it| intern(&it)))
+            .ok()
+            .flatten();
+        if let Some(token) = token {
+            self.said.set(span::FIELDS_AT, token);
+        }
     }
 }
 
 impl tracing::field::Visit for Fields {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        let field = field_of(field.name()) & self.wanted;
-        if field != 0 {
-            self.set(field, value);
+        match field_of(field.name()) & self.wanted {
+            0 => self.gather(field.name(), value),
+            column => self.set(column, value),
         }
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        let field = field_of(field.name()) & self.wanted;
-        if field == 0 {
+        let column = field_of(field.name()) & self.wanted;
+        if column == 0 && !(self.rest && kept_as_text(field.name())) {
             return;
         }
         _ = TEXT.try_with(|text| {
-            let mut text = text.borrow_mut();
+            // A field's `Debug` that opens a span finds the text taken: that field is lost.
+            let Ok(mut text) = text.try_borrow_mut() else { return };
             text.clear();
             _ = write!(text, "{value:?}");
-            self.set(field, &text);
+            match column {
+                0 => self.gather(field.name(), &text),
+                column => self.set(column, &text),
+            }
         });
     }
 }
@@ -3035,10 +3136,10 @@ impl tracing::field::Visit for Fields {
 /// entered: its row is written as its last handle drops ([`closed`]).
 #[inline]
 pub(crate) fn opened(span: &tracing::span::Attributes<'_>, site: u16) -> u64 {
-    let wanted = SITES[usize::from(site) - 1].get().map_or(0, |it| it.fields);
-    let mut fields = Fields { wanted, said: Said::EMPTY };
-    if wanted != 0 {
+    let mut fields = Fields::of(site, Said::EMPTY);
+    if fields.reads() {
         span.record(&mut fields);
+        fields.finish();
     }
     let parent =
         if span.is_root() { Some(0) } else { span.parent().map(tracing::span::Id::into_u64) };
@@ -3186,12 +3287,12 @@ pub(crate) fn recorded(id: u64, values: &tracing::span::Record<'_>) {
     }
     let Some(ring) = by_number(ring_of(id)) else { return };
     let Some(opened) = ring.opened(id) else { return };
-    let wanted = SITES[usize::from(opened.site) - 1].get().map_or(0, |it| it.fields);
-    if wanted == 0 {
+    let mut fields = Fields::of(opened.site, opened.said());
+    if !fields.reads() {
         return;
     }
-    let mut fields = Fields { wanted, said: opened.said() };
     values.record(&mut fields);
+    fields.finish();
     if let Some(slot) = ring.slot_of(id) {
         store_said(slot, &fields.said);
     }
@@ -3382,7 +3483,11 @@ pub(crate) fn closed(id: u64) -> Option<u64> {
     // no frame, and saying no typed column (a `job`, `hold` and every other kind that says one
     // is the model's), or a wait too short to have parked ([`WAIT_FOLD_BELOW`]).
     let wait = Some(opened.site) == <span::Wait as span::Span>::site();
-    let below = if opened.typed == [0; TYPED] {
+    // Its `fields` text is no kind's column: a short ad hoc span that said one folds as any
+    // other, and its fields go with it, as its `function` does.
+    const FIELDS: usize = span::FIELDS_AT - span::GENERIC;
+    let says_typed = opened.typed.iter().enumerate().any(|(at, it)| *it != 0 && at != FIELDS);
+    let below = if !says_typed {
         fold_ticks()
     } else if wait {
         wait_fold_ticks()

@@ -900,7 +900,7 @@ SELECT
     CAST(s.thread_name AS VARCHAR) AS thread,
     s.depth,
     CAST(s.name AS VARCHAR) AS name,
-    coalesce(s.function, s.awaits, s.unit, CAST(s.crate AS VARCHAR)) AS what
+    coalesce(s.function, s.awaits, s.unit, CAST(s.crate AS VARCHAR), s.fields) AS what
 FROM spans AS s, bounds
 WHERE (s.build_id = $build OR (s.build_id IS NULL AND s.start_ns >= bounds.t0 AND s.start_ns < bounds.t1))
     AND s.dur_ns >= $min_ms * 1e6
@@ -914,7 +914,7 @@ SELECT
     round(s.self_cpu_ns / 1e6, 3) AS cpu_ms,
     CAST(s.thread_name AS VARCHAR) AS thread,
     CAST(s.name AS VARCHAR) AS name,
-    coalesce(s.function, s.awaits, s.unit, CAST(s.crate AS VARCHAR)) AS what,
+    coalesce(s.function, s.awaits, s.unit, CAST(s.crate AS VARCHAR), s.fields) AS what,
     round((s.start_ns - (SELECT min(started_ns) FROM builds WHERE build_id = $build)) / 1e6, 3) AS at_ms
 FROM spans AS s
 WHERE s.build_id = $build AND s.dur_ns >= $min_ms * 1e6
@@ -1012,7 +1012,7 @@ SELECT
     round(s.dur_ns / 1e6, 3) AS ms,
     CAST(s.thread_name AS VARCHAR) AS thread,
     CAST(s.name AS VARCHAR) AS name,
-    coalesce(s.function, s.unit, CAST(s.crate AS VARCHAR)) AS what
+    coalesce(s.fields, s.function, s.unit, CAST(s.crate AS VARCHAR)) AS what
 FROM spans AS s, bounds
 WHERE s.start_ns >= bounds.t0 AND s.start_ns < bounds.t1
     AND (s.name LIKE '%kept%' OR s.name LIKE '%let go%' OR s.name LIKE 'store %' OR s.name LIKE '%settl%')
