@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-47 theorems: 34 in `lean`, 13 in `lean/analysis`.
+49 theorems: 36 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -324,6 +324,28 @@ theorem threadGotos_call_source (prog : Program) (n : Nat) (id : FnId) (base : L
 theorem threadGotos_call_target (prog : Program) (n : Nat) (id : FnId) (base : List Slot)
     (args : List Value) (hne : (threadGotos prog).call n id base args ≠ Outcome.diverge) :
     prog.call (2 * n) id base args = (threadGotos prog).call n id base args
+```
+
+**`Blaze.Mir.Opt.threadGotosN_target`** (`Blaze.Mir.Opt.Thread`, `lean`): After k rounds of goto threading, a run that ends in n steps is the program's run of 2 ^ k * n steps.
+
+```lean
+theorem threadGotosN_target (prog : Program) :
+    ∀ (k n : Nat) (st : State), run (threadGotosN k prog) n st ≠ Outcome.diverge →
+      run prog (twoPow k * n) st = run (threadGotosN k prog) n st
+  | 0, n, st, _ => congrTo (fun j => run prog j st) (Nat.one_mul n)
+  | k + 1, n, st, hne => by
+    have t1 : run (threadGotosN k prog) (2 * n) st = run (threadGotos (threadGotosN k prog)) n st
+```
+
+**`Blaze.Mir.Opt.threadGotosN_source`** (`Blaze.Mir.Opt.Thread`, `lean`): A run of the program that ends in n steps is the run of n steps after any number of rounds of goto threading.
+
+```lean
+theorem threadGotosN_source (prog : Program) :
+    ∀ (k n : Nat) (st : State), run prog n st ≠ Outcome.diverge →
+      run (threadGotosN k prog) n st = run prog n st
+  | 0, _, _, _ => rfl
+  | k + 1, n, st, hne => by
+    have ih : run (threadGotosN k prog) n st = run prog n st
 ```
 
 ## V10

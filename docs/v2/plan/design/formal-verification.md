@@ -595,8 +595,8 @@ programs; it is the specification of the Rust pass of the same name.
   folds constants or only removes `nop`s, so those two have no pair to check.
 - **`Sim`** (`Opt/Sim.lean`). A lockstep simulation through a map on states, under an
   invariant, gives equal runs (`Sim.run`). Its clients are the two renumbering passes below.
-- **Written, not yet elaborated (2026-11-10): the CFG passes.** Until a build of `lean/`
-  passes with them, each line below is a claim Lean has not checked.
+- **The CFG passes: checked by Lean** (`lake build` of `lean/` at 4357e681bf, 2026-11-11;
+  what was written after that commit is marked).
   - **Control is not memory** (`Opt/Ctl.lean`). Every function of `Step.lean` up to
     `execStmt` leaves each frame's function, block and return target as they were
     (`execStmt_ctl`). Each proof below that depends on where control is rests on it.
@@ -619,10 +619,13 @@ programs; it is the specification of the Rust pass of the same name.
     (`Stutter`): one step of the target is `k + 1` steps of the source, `k` below a bound
     `K`. The fuel is stated: a target run of `n` steps that ends is the source's run of
     `K * n` (`Stutter.run_target`), and a source run of `n` steps that ends is the target's
-    run of `n` (`Stutter.run_source`). For threading `K` is 2.
-  - **Where these cover less than the Rust `SimplifyCfg`** (`optimize/cfg.rs`): it follows a
-    whole chain of gotos at once and threads a call's return target too (the specification
-    is one hop and leaves call targets, so that no state is renamed); it merges a block into
+    run of `n` (`Stutter.run_source`). For threading `K` is 2. Whole chains are the pass
+    again: `threadGotosN k` threads chains of up to `k` empty blocks, with the bounds
+    composed, `2 ^ k * n` one way and `n` the other (`threadGotosN_target`,
+    `threadGotosN_source`; not yet elaborated).
+  - **Where these cover less than the Rust `SimplifyCfg`** (`optimize/cfg.rs`): it threads a
+    call's return target too (the specification leaves call targets, so that no state is
+    renamed); it merges a block into
     its only predecessor and turns a `switchInt` whose arms all agree into a `goto`; and
     `remove_dead_blocks` merges every empty `unreachable` block into one. None of those is
     specified, so `BlazeValidated` has no `after = spec before` pair for a CFG pass, and

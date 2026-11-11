@@ -376,6 +376,9 @@ example : isInt ScalarTy.U32 4 ((Opt.threadGotos constantSimplified).call 2 0 []
 
 example : isDiverge (constantSimplified.call 2 0 [] []) = true := by decide
 
+/-- Two rounds leave what one round made: `constantSimplified` has no chain of two. -/
+example : Opt.threadGotosN 2 constantSimplified = Opt.threadGotos constantSimplified := by decide
+
 /-! Dead-block removal keeps what block 0 reaches, in its old order, and renames the
 targets. The check its theorem takes is evaluated, and the theorem is applied. -/
 

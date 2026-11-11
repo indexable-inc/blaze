@@ -367,4 +367,48 @@ theorem threadGotos_call_target (prog : Program) (n : Nat) (id : FnId) (base : L
           ((start_thread prog id base args).trans hst)).trans hd))).symm)
   exact h.symm
 
+/-! Whole chains: the pass again, as often as the longest chain is long. Each round at most
+doubles the steps the program takes for one of the threaded program's. -/
+
+/-- `threadGotos`, `k` times: a chain of up to `k` empty blocks is threaded through. -/
+def threadGotosN : Nat → Program → Program
+  | 0, prog => prog
+  | k + 1, prog => threadGotos (threadGotosN k prog)
+
+/-- The fuel bound of `k` rounds: `2 ^ k`. -/
+def twoPow : Nat → Nat
+  | 0 => 1
+  | k + 1 => 2 * twoPow k
+
+/-- A run of the program that ends in `n` steps is the run of `n` steps after any number of
+rounds. -/
+theorem threadGotosN_source (prog : Program) :
+    ∀ (k n : Nat) (st : State), run prog n st ≠ Outcome.diverge →
+      run (threadGotosN k prog) n st = run prog n st
+  | 0, _, _, _ => rfl
+  | k + 1, n, st, hne => by
+    have ih : run (threadGotosN k prog) n st = run prog n st :=
+      threadGotosN_source prog k n st hne
+    have hne' : run (threadGotosN k prog) n st ≠ Outcome.diverge :=
+      fun hd => hne (ih.symm.trans hd)
+    exact (threadGotos_source (threadGotosN k prog) n st hne').trans ih
+
+/-- A run after `k` rounds that ends in `n` steps is the program's run of `2 ^ k * n`. -/
+theorem threadGotosN_target (prog : Program) :
+    ∀ (k n : Nat) (st : State), run (threadGotosN k prog) n st ≠ Outcome.diverge →
+      run prog (twoPow k * n) st = run (threadGotosN k prog) n st
+  | 0, n, st, _ => congrTo (fun j => run prog j st) (Nat.one_mul n)
+  | k + 1, n, st, hne => by
+    have t1 : run (threadGotosN k prog) (2 * n) st = run (threadGotos (threadGotosN k prog)) n st :=
+      threadGotos_target (threadGotosN k prog) n st hne
+    have hne2 : run (threadGotosN k prog) (2 * n) st ≠ Outcome.diverge :=
+      fun hd => hne (t1.symm.trans hd)
+    have ih : run prog (twoPow k * (2 * n)) st = run (threadGotosN k prog) (2 * n) st :=
+      threadGotosN_target prog k (2 * n) st hne2
+    have e : 2 * twoPow k * n = twoPow k * (2 * n) := by
+      rw [Nat.mul_comm 2 (twoPow k), Nat.mul_assoc]
+    have fuel : run prog (twoPow (k + 1) * n) st = run prog (twoPow k * (2 * n)) st :=
+      congrTo (fun j => run prog j st) e
+    exact fuel.trans (ih.trans t1)
+
 end Blaze.Mir.Opt
