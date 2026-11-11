@@ -1,4 +1,5 @@
 import Blaze.Mir.Opt.SimplifyCfg
+import Blaze.Mir.Opt.RemoveOverwritten
 import Blaze.Mir.Opt.SimplifyConstCondition
 import Blaze.Mir.Opt.RemoveStorageMarkers
 import Blaze.Mir.Opt.ConstFold
@@ -63,6 +64,55 @@ theorem threadGotos_preserves : Preserves threadGotos :=
   fun prog n id base args _ h hd _ =>
     (threadGotos_call_source prog n id base args (fun e => hd (h.symm.trans e))).trans h
 
+/-! A rewrite proved for calls whose caller hands over pointers into frame 0 only. -/
+
+/-- The pointer is into frame 0: what the entry function's references point to. -/
+def ZeroPtr (p : Pointer) : Prop := p.frame = 0
+
+/-- Every pointer in the base slots and the arguments of a call is into frame 0. -/
+def FrameZero (base : List Slot) (args : List Value) : Prop :=
+  SlotsOk ZeroPtr base ∧ ∀ (v : Value), v ∈ args → Value.Ok ZeroPtr v
+
+/-- The pass keeps every call that meets `C`, ends, and not in undefined behaviour. -/
+def PreservesWhen (C : List Slot → List Value → Prop) (f : Program → Program) : Prop :=
+  ∀ (prog : Program) (n : Nat) (id : FnId) (base : List Slot) (args : List Value)
+    (r : Outcome Value), C base args →
+    prog.call n id base args = r → r ≠ Outcome.diverge →
+      (∀ (why : Undefined), r ≠ Outcome.undefined why) → (f prog).call n id base args = r
+
+theorem Preserves.when {f : Program → Program} (h : Preserves f)
+    (C : List Slot → List Value → Prop) : PreservesWhen C f :=
+  fun prog n id base args r _ hr hd hu => h prog n id base args r hr hd hu
+
+/-- `removeOverwritten` with the references the body takes as its borrowed locals, where the
+program takes references only to those (`checkBorrows`); the program otherwise. -/
+def removeOverwrittenChecked (prog : Program) : Program :=
+  if checkBorrows refsOf prog = true then removeOverwritten refsOf prog else prog
+
+theorem removeOverwrittenChecked_preserves : PreservesWhen FrameZero removeOverwrittenChecked := by
+  intro prog n id base args r hz h _ hu
+  show (if checkBorrows refsOf prog = true then removeOverwritten refsOf prog
+    else prog).call n id base args = r
+  by_cases hc : checkBorrows refsOf prog = true
+  · rw [if_pos hc]
+    have zero : ∀ (q : Pointer), ZeroPtr q → PtrOk (BorrowedIn refsOf prog) [] q :=
+      fun _ hq => Or.inl hq
+    have hbase : SlotsOk (PtrOk (BorrowedIn refsOf prog) []) base :=
+      slotsOk_mono zero (And.left hz)
+    have hargs : ∀ (v : Value), v ∈ args → Value.Ok (PtrOk (BorrowedIn refsOf prog) []) v :=
+      fun v hv => Value.Ok.mono zero v (And.right hz v hv)
+    have hr : (∃ why, prog.call n id base args = Outcome.undefined why) ∨
+        (removeOverwritten refsOf prog).call n id base args = prog.call n id base args :=
+      removeOverwritten_call refsOf prog (checkBorrows_sound refsOf prog hc) n id base args
+        hbase hargs
+    cases hr with
+    | inl undef =>
+      have ⟨why, e⟩ := undef
+      exact absurd (h.symm.trans e) (hu why)
+    | inr same => exact same.trans h
+  · rw [if_neg hc]
+    exact h
+
 /-- One proved rewrite, with what it takes. -/
 inductive Rewrite where
   | removeNops
@@ -77,6 +127,27 @@ inductive Rewrite where
   /-- A permutation of each function's blocks: per function, the old numbers in their new
   order. -/
   | permute (orders : List (List BlockId))
+  /-- A store its own block overwrites, removed: proved for calls whose caller hands over
+  pointers into frame 0 only. -/
+  | removeOverwritten
+
+/-- The rewrite is proved for every call. -/
+def Rewrite.plain : Rewrite → Bool
+  | Rewrite.removeOverwritten => false
+  | Rewrite.removeNops => true
+  | Rewrite.removeStorageMarkers => true
+  | Rewrite.constFold => true
+  | Rewrite.simplifyConstCondition => true
+  | Rewrite.switchToGoto => true
+  | Rewrite.threadGotos => true
+  | Rewrite.threadAll => true
+  | Rewrite.mergeSuccessors => true
+  | Rewrite.removeDeadBlocks => true
+  | Rewrite.permute _ => true
+
+def allPlain : List Rewrite → Bool
+  | [] => true
+  | r :: rest => r.plain && allPlain rest
 
 def Rewrite.apply : Rewrite → Program → Program
   | Rewrite.removeNops => Opt.removeNops
@@ -89,43 +160,82 @@ def Rewrite.apply : Rewrite → Program → Program
   | Rewrite.mergeSuccessors => Opt.mergeSuccessors
   | Rewrite.removeDeadBlocks => Opt.removeDeadChecked
   | Rewrite.permute orders => Opt.permuteChecked orders
+  | Rewrite.removeOverwritten => Opt.removeOverwrittenChecked
 
-/-- Each rewrite keeps every call that ends, and not in undefined behaviour. -/
-theorem Rewrite.preserves : ∀ (r : Rewrite), Preserves r.apply
-  | Rewrite.removeNops => removeNops_preserves
-  | Rewrite.removeStorageMarkers => mapBlocks_preserves removeMarkersBlock removeMarkersBlock_preserving
-  | Rewrite.constFold => mapBlocks_preserves foldBlock foldBlock_preserving
-  | Rewrite.simplifyConstCondition => mapBlocks_preserves simplifyBlock simplifyBlock_preserving
-  | Rewrite.switchToGoto => switchToGoto_preserves
-  | Rewrite.threadGotos => threadGotos_preserves
-  | Rewrite.threadAll => threadAll_preserves
-  | Rewrite.mergeSuccessors => mergeSuccessors_preserves
-  | Rewrite.removeDeadBlocks => removeDeadChecked_preserves
-  | Rewrite.permute orders => permuteChecked_preserves orders
+/-- Each plain rewrite keeps every call that ends, and not in undefined behaviour. -/
+theorem Rewrite.preserves : ∀ (r : Rewrite), r.plain = true → Preserves r.apply
+  | Rewrite.removeNops, _ => removeNops_preserves
+  | Rewrite.removeStorageMarkers, _ =>
+    mapBlocks_preserves removeMarkersBlock removeMarkersBlock_preserving
+  | Rewrite.constFold, _ => mapBlocks_preserves foldBlock foldBlock_preserving
+  | Rewrite.simplifyConstCondition, _ => mapBlocks_preserves simplifyBlock simplifyBlock_preserving
+  | Rewrite.switchToGoto, _ => switchToGoto_preserves
+  | Rewrite.threadGotos, _ => threadGotos_preserves
+  | Rewrite.threadAll, _ => threadAll_preserves
+  | Rewrite.mergeSuccessors, _ => mergeSuccessors_preserves
+  | Rewrite.removeDeadBlocks, _ => removeDeadChecked_preserves
+  | Rewrite.permute orders, _ => permuteChecked_preserves orders
+  | Rewrite.removeOverwritten, h => false_eq_true_elim h
+
+/-- Every rewrite keeps every such call whose caller hands over pointers into frame 0 only. -/
+theorem Rewrite.preservesWhen (r : Rewrite) : PreservesWhen FrameZero r.apply := by
+  cases hp : r.plain with
+  | true => exact Preserves.when (Rewrite.preserves r hp) FrameZero
+  | false =>
+    cases r with
+    | removeOverwritten => exact removeOverwrittenChecked_preserves
+    | removeNops => exact false_eq_true_elim hp.symm
+    | removeStorageMarkers => exact false_eq_true_elim hp.symm
+    | constFold => exact false_eq_true_elim hp.symm
+    | simplifyConstCondition => exact false_eq_true_elim hp.symm
+    | switchToGoto => exact false_eq_true_elim hp.symm
+    | threadGotos => exact false_eq_true_elim hp.symm
+    | threadAll => exact false_eq_true_elim hp.symm
+    | mergeSuccessors => exact false_eq_true_elim hp.symm
+    | removeDeadBlocks => exact false_eq_true_elim hp.symm
+    | permute orders => exact false_eq_true_elim hp.symm
 
 /-- The script, replayed. -/
 def applyAll : List Rewrite → Program → Program
   | [], prog => prog
   | r :: rest, prog => applyAll rest (r.apply prog)
 
-theorem applyAll_preserves : ∀ (w : List Rewrite), Preserves (applyAll w)
-  | [] => fun _ _ _ _ _ _ h _ _ => h
-  | r :: rest => fun prog n id base args out h hd hu =>
-    applyAll_preserves rest (r.apply prog) n id base args out
-      (Rewrite.preserves r prog n id base args out h hd hu) hd hu
+theorem applyAll_preserves :
+    ∀ (w : List Rewrite), allPlain w = true → Preserves (applyAll w)
+  | [], _ => fun _ _ _ _ _ _ h _ _ => h
+  | r :: rest, hp => fun prog n id base args out h hd hu =>
+    applyAll_preserves rest (and_true_right hp) (r.apply prog) n id base args out
+      (Rewrite.preserves r (and_true_left hp) prog n id base args out h hd hu) hd hu
+
+theorem applyAll_preservesWhen : ∀ (w : List Rewrite), PreservesWhen FrameZero (applyAll w)
+  | [] => fun _ _ _ _ _ _ _ h _ _ => h
+  | r :: rest => fun prog n id base args out hz h hd hu =>
+    applyAll_preservesWhen rest (r.apply prog) n id base args out hz
+      (Rewrite.preservesWhen r prog n id base args out hz h hd hu) hd hu
 
 /-- Whether the script `w` takes `a` to `b`. -/
 def validateWith (a b : Program) (w : List Rewrite) : Bool := decide (applyAll w a = b)
 
-/-- The validator is sound: when a script of proved rewrites takes `a` to `b`, every call of
-`a` that ends, and not in undefined behaviour, gives the same outcome in `b` with the same
-fuel. -/
+/-- The validator is sound: when a script of rewrites proved for every call takes `a` to
+`b`, every call of `a` that ends, and not in undefined behaviour, gives the same outcome in
+`b` with the same fuel. -/
 theorem validateWith_sound (a b : Program) (w : List Rewrite) (h : validateWith a b w = true)
-    (n : Nat) (id : FnId) (base : List Slot) (args : List Value) (r : Outcome Value)
+    (hp : allPlain w = true) (n : Nat) (id : FnId) (base : List Slot) (args : List Value)
+    (r : Outcome Value) (hr : a.call n id base args = r) (hd : r ≠ Outcome.diverge)
+    (hu : ∀ (why : Undefined), r ≠ Outcome.undefined why) : b.call n id base args = r := by
+  have e : applyAll w a = b := of_decide_eq_true h
+  rw [← e]
+  exact applyAll_preserves w hp a n id base args r hr hd hu
+
+/-- The same for any script, `removeOverwritten` among its rewrites, for the calls whose
+caller hands over pointers into frame 0 only. -/
+theorem validateWith_sound_frameZero (a b : Program) (w : List Rewrite)
+    (h : validateWith a b w = true) (n : Nat) (id : FnId) (base : List Slot)
+    (args : List Value) (hz : FrameZero base args) (r : Outcome Value)
     (hr : a.call n id base args = r) (hd : r ≠ Outcome.diverge)
     (hu : ∀ (why : Undefined), r ≠ Outcome.undefined why) : b.call n id base args = r := by
   have e : applyAll w a = b := of_decide_eq_true h
   rw [← e]
-  exact applyAll_preserves w a n id base args r hr hd hu
+  exact applyAll_preservesWhen w a n id base args r hz hr hd hu
 
 end Blaze.Mir.Opt
