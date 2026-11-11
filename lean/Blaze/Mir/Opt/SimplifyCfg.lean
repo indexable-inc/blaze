@@ -118,19 +118,31 @@ theorem removeDeadChecked_preserves : Preserves removeDeadChecked := by
 def cfgRound (prog : Program) : Program :=
   mergeSuccessors (removeDeadChecked (switchToGoto (threadAll prog)))
 
-theorem cfgRound_preserves : Preserves cfgRound :=
-  Preserves.comp
-    (Preserves.comp (Preserves.comp threadAll_preserves switchToGoto_preserves)
-      removeDeadChecked_preserves)
-    mergeSuccessors_preserves
+theorem cfgRound_preserves : Preserves cfgRound := by
+  have h1 : Preserves (fun prog => switchToGoto (threadAll prog)) :=
+    Preserves.comp (f := threadAll) (g := switchToGoto) threadAll_preserves
+      switchToGoto_preserves
+  have h2 : Preserves (fun prog => removeDeadChecked (switchToGoto (threadAll prog))) :=
+    Preserves.comp (f := fun prog => switchToGoto (threadAll prog)) (g := removeDeadChecked) h1
+      removeDeadChecked_preserves
+  have h3 : Preserves
+      (fun prog => mergeSuccessors (removeDeadChecked (switchToGoto (threadAll prog)))) :=
+    Preserves.comp (f := fun prog => removeDeadChecked (switchToGoto (threadAll prog)))
+      (g := mergeSuccessors) h2 mergeSuccessors_preserves
+  exact h3
 
 /-- `SimplifyCfg` with `k` rounds of its loop. -/
 def simplifyCfg (k : Nat) (prog : Program) : Program :=
   removeDeadChecked (rounds cfgRound k (removeNops prog))
 
-theorem simplifyCfg_preserves (k : Nat) : Preserves (simplifyCfg k) :=
-  Preserves.comp (Preserves.comp removeNops_preserves (Preserves.rounds cfgRound_preserves k))
-    removeDeadChecked_preserves
+theorem simplifyCfg_preserves (k : Nat) : Preserves (simplifyCfg k) := by
+  have h1 : Preserves (fun prog => rounds cfgRound k (removeNops prog)) :=
+    Preserves.comp (f := removeNops) (g := rounds cfgRound k) removeNops_preserves
+      (Preserves.rounds cfgRound_preserves k)
+  have h2 : Preserves (fun prog => removeDeadChecked (rounds cfgRound k (removeNops prog))) :=
+    Preserves.comp (f := fun prog => rounds cfgRound k (removeNops prog))
+      (g := removeDeadChecked) h1 removeDeadChecked_preserves
+  exact h2
 
 /-- `SimplifyCfg` keeps every call that ends, and not in undefined behaviour: the same
 outcome with the same fuel. -/
