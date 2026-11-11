@@ -564,6 +564,7 @@ pub(super) fn link(
         gpu_msl: None,
         records: Vec::new(),
         made_files: Vec::new(),
+        side_files: Vec::new(),
         quoted: None,
     };
     let runner = match runner {
@@ -668,6 +669,7 @@ pub(super) fn link(
                 // alloc: once per image linked
                 making.links.push((it.path.clone(), linked.how));
                 making.files.push((it.path.clone(), linked.written, true)); // clone: as above
+                making.side_files.extend(linked.side);
             }
             Err(failed) => match it.at {
                 // alloc: a verdict's words, once per example that fails to link

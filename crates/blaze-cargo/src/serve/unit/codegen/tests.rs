@@ -78,6 +78,30 @@ fn debug_info_goes_beside_the_image_unless_the_profile_says_off() {
     assert!(refused.contains("`split`") && refused.contains("unpacked"), "{refused}");
 }
 
+/// A side file's runs are the blocks of it that hold anything, joined where they touch, and
+/// written back over a file of holes of its length they give its bytes: what the loop
+/// places is the file, with none of its sections' room written.
+#[test]
+fn a_side_files_runs_are_its_blocks_that_hold_bytes() {
+    let block = super::SIDE_BLOCK;
+    let mut bytes = vec![0u8; 5 * block + 17];
+    bytes[1] = 7; // block 0
+    bytes[block] = 8; // block 1, touching block 0's
+    bytes[4 * block + 3] = 9; // block 4
+    bytes[5 * block + 16] = 1; // the short last block
+    let file = super::sparse_of(&bytes);
+    assert_eq!(file.len, bytes.len() as u64);
+    assert_eq!(file.check(), Ok(()));
+    let at: Vec<(u64, usize)> = file.runs.iter().map(|it| (it.0, it.1.len())).collect();
+    assert_eq!(at, [(0, 2 * block), (4 * block as u64, block + 17)]);
+    let mut back = vec![0u8; bytes.len()];
+    for (at, run) in &file.runs {
+        back[*at as usize..*at as usize + run.len()].copy_from_slice(run);
+    }
+    assert_eq!(back, bytes);
+    assert!(super::sparse_of(&vec![0u8; 3 * block]).runs.is_empty(), "a file of zeros is all holes");
+}
+
 #[test]
 fn llvm_and_no_backend_leave_the_choice_to_blaze() {
     for level in [OptLevel::O0, OptLevel::O3] {
@@ -370,6 +394,7 @@ fn kept(path: &str, output: &blaze_link::Output) -> KeptImage {
         slotted: Vec::new(),
         assumed: Vec::new(),
         given: None,
+        side: None,
     };
     KeptImage { path: path.to_owned(), kept }
 }

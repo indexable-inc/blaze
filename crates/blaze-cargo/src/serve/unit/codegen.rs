@@ -1312,6 +1312,11 @@ pub struct Linked {
     /// What its last link was given, as one id ([`kept::Rows::given`]); `None` before one. A
     /// link that is given the same changes nothing, so it is not staged.
     given: Option<ContentId>,
+    /// Its debug side file as its last link left it, whole ([`debug_side`]); `None` before
+    /// one, and for an image with none. Held so the next link's update is a patch of bytes
+    /// in memory and the file at each path is written new from them: no file on the disk is
+    /// read or copied to make the next one.
+    side: Option<Vec<u8>>,
 }
 
 impl Linked {
@@ -1336,6 +1341,7 @@ impl Linked {
             + names
             + rows(&self.slotted)
             + rows(&self.assumed)
+            + self.side.as_ref().map_or(0, |it| it.capacity() as u64)
     }
 
     /// Whether a run maps it now: a dev executable one of whose runs or test processes is
@@ -1631,6 +1637,10 @@ pub(crate) struct LinkMade {
     /// (`blaze_cas::Store::place_made`): the build made it, so its place reads, clones and
     /// waits for no file of the store. None for a wasm module, which is not placed to run.
     pub(crate) made: Option<blaze_cas::Sparse>,
+    /// The image's debug side file and what goes with it, each by the path it goes at
+    /// ([`debug_side`], [`SideFile`]): for the loop to place from these bytes, after the
+    /// build's answer. Empty for an image with none, and for a link that changed nothing.
+    pub(crate) side: Vec<SideFile>,
     pub(crate) read: Vec<Read>,
     pub(crate) table: Option<blaze_codegen::ExecTable>,
     pub(crate) how: Linking,
@@ -1679,84 +1689,77 @@ fn side_path(format: blaze_link::Format, exe: &str, name: &str) -> std::path::Pa
     }
 }
 
-/// Writes `write` at `to`: a clone of the file there with the ranges written, or a new file
-/// for a whole one, renamed over it. `false`, with nothing changed, when the file there is not
-/// the one a patch is of (it is gone, or carries another build id). Not synced: the side file
-/// is made again from the image whenever it is not the one expected, so a torn one costs a
-/// whole write, never a wrong line.
-fn write_side(
-    to: &std::path::Path,
-    format: blaze_link::Format,
-    write: &blaze_link::DebugWrite,
-) -> Result<bool, String> {
-    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
-    // alloc: error path
-    let failed = |what: &str, error: std::io::Error| format!("{}: {what}: {error}", to.display());
-    if let Some(dir) = to.parent() {
-        std::fs::create_dir_all(dir).map_err(|it| failed("making its directory", it))?;
-    }
-    // alloc: once per side file written, the name its next file is written at
-    let mut next = to.as_os_str().to_owned();
-    next.push(".blaze-next");
-    let next = std::path::PathBuf::from(next);
-    let mut file = match write.base {
-        Some(base) => {
-            if std::fs::copy(to, &next).is_err() {
-                return Ok(false);
-            }
-            let mut file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&next)
-                .map_err(|it| failed("opening its clone", it))?;
-            // Its build id is in its first bytes, wherever its format keeps it.
-            let mut head = Vec::with_capacity(128); // alloc: once per side file patched
-            let held = match (&mut file).take(128).read_to_end(&mut head) {
-                Ok(_) => blaze_link::debug_file_id(format, &head),
-                Err(_) => None,
-            };
-            if held != Some(base) {
-                drop(file);
-                std::fs::remove_file(&next).map_err(|it| failed("removing its clone", it))?;
-                return Ok(false);
-            }
-            file
-        }
-        None => std::fs::File::create(&next).map_err(|it| failed("creating it", it))?,
-    };
-    file.set_len(write.len).map_err(|it| failed("sizing it", it))?;
-    for (at, bytes) in &write.writes {
-        file.seek(SeekFrom::Start(*at)).map_err(|it| failed("writing it", it))?;
-        file.write_all(bytes).map_err(|it| failed("writing it", it))?;
-    }
-    drop(file);
-    std::fs::rename(&next, to).map_err(|it| failed("renaming it into place", it))?;
-    Ok(true)
+/// A file of an image's debug info for the loop to place ([`debug_side`]): the side file at
+/// one of its paths, or a `.dSYM` bundle's `Info.plist`.
+#[derive(Clone, Debug)] // clone: a path, a key and a refcount, once per path it is placed at
+pub(crate) struct SideFile {
+    /// Where it goes, absolute.
+    pub(crate) path: String,
+    /// What names its bytes for the loop's record of the path: the side file's by the build
+    /// id of the executable it describes, the plist's by its bytes.
+    pub(crate) key: blaze_cas::Key,
+    /// The file as the runs of it that hold bytes, shared by the paths it goes at.
+    pub(crate) file: Arc<blaze_cas::Sparse>,
 }
 
-/// The debug side file of the image `linked` was just committed as, written beside `path`
-/// and beside the copy cargo makes of it; nothing for an image with none. Derived data: it is
-/// not in the store, and a build that places the executable from the store without linking it
-/// writes none (the executable then backtraces by its symbol table, without lines, until its
-/// next link).
+/// The size of the blocks [`sparse_of`] looks at: one that is all zeros is left a hole.
+const SIDE_BLOCK: usize = 4096;
+
+/// `bytes` as the runs of it that hold anything, by [`SIDE_BLOCK`]: a side file's sections
+/// have room after them (`blaze_link`'s `beside`), which is zeros and stays holes.
+fn sparse_of(bytes: &[u8]) -> blaze_cas::Sparse {
+    // alloc: once per side file made, its runs, which the paths' writes own
+    let mut runs: Vec<(u64, Vec<u8>)> = Vec::new();
+    for (index, block) in bytes.chunks(SIDE_BLOCK).enumerate() {
+        if block.iter().all(|it| *it == 0) {
+            continue;
+        }
+        let at = (index * SIDE_BLOCK) as u64;
+        match runs.last_mut() {
+            Some((start, run)) if *start + run.len() as u64 == at => run.extend_from_slice(block),
+            _ => runs.push((at, block.to_vec())), // alloc: a run's bytes, as above
+        }
+    }
+    blaze_cas::Sparse { len: bytes.len() as u64, runs }
+}
+
+/// The debug side file of the image `linked` was just committed as, for the loop to place
+/// beside `path` and beside the copy cargo makes of it; nothing for an image with none, and
+/// for a link that changed nothing of it. Derived data: it is in no record of the store,
+/// and a build that places the executable from the store without linking it places none
+/// (the executable then backtraces by its symbol table, without lines, until its next link).
 ///
-/// Called in the link today, in its own span (`link debug file`), so an edit waits for it:
-/// what it costs is the span's. It reads nothing of the link's but the committed image, so
-/// the job can call it from its settling path instead, after the answer
-/// (docs/v2/plan/design/debug-side-file.md, "Not built").
+/// Off the answer's path, and no copy of a file (docs/v2/plan/design/debug-side-file.md,
+/// "The write after the answer"). Until 2026-11-11 this ran in the link and wrote the files
+/// itself: 72 ms of a 171 ms `unit link` on ripgrep, almost all of it two copies of the
+/// whole file. Why there were two: a file renamed into place is never written again (a
+/// program still running may hold it mapped), so to patch the few records an edit changed
+/// the last file was copied whole first, the only place its other bytes were; and the
+/// executable is at two paths (its own and cargo's copy of it), each of which a debugger
+/// looks beside, so the patched file was copied whole again. Neither is needed once the
+/// daemon holds the file's bytes with the image they describe ([`Linked::side`]): the
+/// update is [`blaze_link::DebugWrite::apply`] on those bytes, in memory, and each path is
+/// written new from them, once, by the loop (`blaze_cas::Store::place_made`: the runs that
+/// hold bytes into a file of holes, renamed onto the path).
 ///
 /// Who reads the side file, and when: std's backtrace in the built program (as it panics),
-/// gdb and lldb (as someone debugs it), `blaze perf` (as it names a run's lines). Each is
-/// after the build's answer, and none is the build. What the update costs is not the patch
-/// (the changed functions' records) but two copies of the whole file: the one last written
-/// copied to be patched ([`write_side`]; a file renamed into place is never written again,
-/// since a program still running may hold it mapped), and the patched one copied beside the
-/// executable's uplifted copy, which on a file system that shares blocks is a clone of a
-/// file just written and so waits for its write-back. Each is a span of its own under
-/// `link debug file` (72 ms of a 171 ms `unit link` on ripgrep, 2026-11-11).
-fn debug_side(job: &Job, unit: usize, path: &str, linked: &mut Linked) -> Result<(), LinkCause> {
+/// gdb and lldb (as someone debugs it), `blaze perf` (as it names a run's lines). No
+/// artifact names it, so the build's answer does not wait for it (`serve::job`'s
+/// `Job::names`): it is placed after the answer, a run of the daemon's own (`blaze run`,
+/// `blaze test`) starts only once it is, and a reader outside the daemon finds the last
+/// side file whole until the rename (on ELF std reads it with the edited function's lines
+/// stale and gdb refuses it by CRC; on macOS both refuse it by UUID and use symbols).
+///
+/// What the link still pays is this span: the changed functions' rows encoded
+/// (`Image::debug_file`), one copy of the bytes in memory, and the scan for its runs.
+fn debug_side(
+    job: &Job,
+    unit: usize,
+    path: &str,
+    linked: &mut Linked,
+) -> Result<Vec<SideFile>, LinkCause> {
     if linked.output.debug != blaze_link::Debug::Beside {
-        return Ok(());
+        return Ok(Vec::new()); // alloc: none, empty
     }
     let format = linked.output.format;
     let span = tracing::info_span!(
@@ -1770,34 +1773,38 @@ fn debug_side(job: &Job, unit: usize, path: &str, linked: &mut Linked) -> Result
         encoded = tracing::field::Empty,
         all = tracing::field::Empty,
         whole = tracing::field::Empty,
+        placed_bytes = tracing::field::Empty,
     )
     .entered();
     let linker = |error: blaze_link::LinkError| LinkCause::Linker { step: LinkStep::Debug, error };
     let Some(mut write) = linked.image.debug_file().map_err(linker)? else {
-        return Ok(());
+        return Ok(Vec::new()); // alloc: none, empty
     };
-    let first = side_path(format, path, &write.name);
-    let patching =
-        tracing::info_span!(target: "blaze", "link debug file: copy and patch", unit = %path)
-            .entered();
-    let patched = write_side(&first, format, &write).map_err(LinkCause::Given)?;
-    drop(patching);
-    if !patched {
-        // The file there is not the one the patch is of: someone removed it, or another
-        // build's is there. Made whole from the image, and said.
-        let Some(whole) = linked.image.debug_file_whole().map_err(linker)? else {
-            return Ok(());
-        };
-        write = whole;
-        write.whole = Some("the side file on the disk is not the one last written");
-        if !write_side(&first, format, &write).map_err(LinkCause::Given)? {
-            // alloc: error path
-            return Err(LinkCause::Given(format!(
-                "{}: a whole debug side file was not written: it is a patch of none",
-                first.display()
-            )));
-        }
+    // A link that changed nothing of it leaves the file at each path as its last link
+    // placed it: nothing is written.
+    if write.base.is_some() && write.writes.is_empty() && linked.side.is_some() {
+        span.record("bytes", write.len);
+        span.record("written", 0u64);
+        return Ok(Vec::new()); // alloc: none, empty
     }
+    let patching =
+        tracing::info_span!(target: "blaze", "link debug file: patch in memory", unit = %path)
+            .entered();
+    let bytes = match write.apply(format, linked.side.as_deref()) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            // The bytes held are not the ones the patch is of (none are held: the image was
+            // kept across a link that failed before its side file was made). Made whole
+            // from the image, and said.
+            let Some(whole) = linked.image.debug_file_whole().map_err(linker)? else {
+                return Ok(Vec::new()); // alloc: none, empty
+            };
+            write = whole;
+            write.whole = Some("the daemon holds no side file of the image's last link");
+            write.apply(format, None).map_err(LinkCause::Given)?
+        }
+    };
+    drop(patching);
     span.record("bytes", write.len);
     span.record("written", write.written());
     span.record("ranges", write.writes.len());
@@ -1811,43 +1818,50 @@ fn debug_side(job: &Job, unit: usize, path: &str, linked: &mut Linked) -> Result
     if let Some(why) = write.whole {
         span.record("whole", why);
     }
-    write_plist(&first, &write)?;
-    let plan = job.plan(unit).map_err(|it| LinkCause::Given(it.what))?;
-    if let Some(copy) = super::artifact::uplifted(path, plan) {
-        // The copy's side file is the same bytes: cloned where the volume can.
-        let to = side_path(format, copy, &write.name);
-        // alloc: error path
-        let failed = |what: &str, error: std::io::Error| {
-            LinkCause::Given(format!("{}: {what}: {error}", to.display()))
-        };
-        if let Some(dir) = to.parent() {
-            std::fs::create_dir_all(dir).map_err(|it| failed("making its directory", it))?;
-        }
-        let mut next = to.as_os_str().to_owned();
-        next.push(".blaze-next");
-        let _copying =
-            tracing::info_span!(target: "blaze", "link debug file: copy beside", unit = %copy)
+    let file = {
+        let _span =
+            tracing::info_span!(target: "blaze", "link debug file: its runs", unit = %path)
                 .entered();
-        std::fs::copy(&first, &next).map_err(|it| failed("copying the side file to it", it))?;
-        std::fs::rename(&next, &to).map_err(|it| failed("renaming it into place", it))?;
-        write_plist(&to, &write)?;
+        Arc::new(sparse_of(&bytes)) // alloc: once per side file made, shared by its paths
+    };
+    span.record("placed_bytes", file.bytes());
+    linked.side = Some(bytes);
+    let key = blaze_cas::Key(ContentId::of("blaze v2 serve debug side file", &write.id));
+    let plist = write.plist.as_ref().map(|bytes| {
+        let key = blaze_cas::Key(ContentId::of("blaze v2 serve debug side plist", bytes));
+        // alloc: once per side file made, a bundle's plist of a few hundred bytes
+        let file = blaze_cas::Sparse { len: bytes.len() as u64, runs: vec![(0, bytes.clone())] };
+        (key, Arc::new(file)) // alloc: as above, shared by its paths
+    });
+    let plan = job.plan(unit).map_err(|it| LinkCause::Given(it.what))?;
+    let exes = std::iter::once(path).chain(super::artifact::uplifted(path, plan));
+    let mut files = Vec::new(); // alloc: once per side file made, a path or two
+    for exe in exes {
+        let side = side_path(format, exe, &write.name);
+        // A `.dSYM` bundle's `Info.plist` (`NAME.dSYM/Contents/Resources/DWARF/NAME`); none
+        // for a side file that is no bundle.
+        if let (Some((key, file)), Some(contents)) = (&plist, side.ancestors().nth(3)) {
+            files.push(SideFile {
+                path: named(contents.join("Info.plist"))?,
+                key: *key,
+                file: Arc::clone(file), // clone: a refcount
+            });
+        }
+        // clone: a refcount
+        files.push(SideFile { path: named(side)?, key, file: Arc::clone(&file) });
     }
-    Ok(())
+    Ok(files)
 }
 
-/// A `.dSYM` bundle's `Info.plist` for the side file at `side`
-/// (`NAME.dSYM/Contents/Resources/DWARF/NAME`), written where the side file was laid out
-/// whole or the bundle has none; nothing for a side file that is no bundle.
-fn write_plist(side: &std::path::Path, write: &blaze_link::DebugWrite) -> Result<(), LinkCause> {
-    let (Some(bytes), Some(contents)) = (&write.plist, side.ancestors().nth(3)) else {
-        return Ok(());
-    };
-    let to = contents.join("Info.plist");
-    if write.base.is_some() && to.is_file() {
-        return Ok(());
-    }
-    // alloc: error path
-    std::fs::write(&to, bytes).map_err(|it| LinkCause::Given(format!("{}: writing it: {it}", to.display())))
+/// `path` as the text the loop names an output's path by.
+fn named(path: std::path::PathBuf) -> Result<String, LinkCause> {
+    path.into_os_string().into_string().map_err(|it| {
+        // alloc: error path
+        LinkCause::Given(format!(
+            "{}: a debug side file's path is not UTF-8, and the loop names an output by text",
+            std::path::Path::new(&it).display()
+        ))
+    })
 }
 
 /// What the build says when a splice was refused for a thunk it could not place and the
@@ -2167,7 +2181,7 @@ fn link_at(
     // The image's debug info, beside it: derived from the image as committed.
     let debug = match &made {
         Ok(_) => debug_side(job, unit, path, &mut linked),
-        Err(_) => Ok(()),
+        Err(_) => Ok(Vec::new()), // alloc: none, empty
     };
     // The file's identity as the last commit left it: the blocks this link wrote, hashed.
     let root = match &made {
@@ -2212,7 +2226,7 @@ fn link_at(
     let (written, runs, read, table, laid, told) = made?;
     mapped?;
     perf_mapped?;
-    debug?;
+    let side = debug?;
     let how = match (&whole, relaid && changed.is_some_and(OutputFields::is_empty)) {
         (Some((reason, _)), _) => Linking::Full(*reason),
         (None, true) => Linking::Full(Full::Layout),
@@ -2222,7 +2236,16 @@ fn link_at(
         super::run::inproc::Told::Restart { why } => Some(why),
         super::run::inproc::Told::Nothing | super::run::inproc::Told::Patched { .. } => None,
     };
-    Ok(LinkMade { written, made: runs, read, table, how, restart, whole: whole.map(|it| it.1) })
+    Ok(LinkMade {
+        written,
+        made: runs,
+        side,
+        read,
+        table,
+        how,
+        restart,
+        whole: whole.map(|it| it.1),
+    })
 }
 
 /// The image to link `output` laid out by profile `layout` into at `path`, taken out of
@@ -2272,6 +2295,7 @@ pub(crate) fn fresh_image(
         slotted: Vec::new(),
         assumed: Vec::new(),
         given: None,
+        side: None,
     })
 }
 
