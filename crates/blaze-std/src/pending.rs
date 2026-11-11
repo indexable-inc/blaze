@@ -2,7 +2,7 @@
 //! [`crate::fs::File::read_into`], [`crate::fs::File::write_from`],
 //! [`crate::net::Conn::read_into`] and [`crate::net::Conn::write_from`] return. The op is
 //! handed to the driver when the call returns; [`Pending::wait`] waits for its outcome and
-//! [`Pending::cancel`] gives it up. Both consume it, and both end only once the driver is done
+//! [`Pending::cancel`] gives it up, waiting for its end until a deadline its caller names. Both consume it, and both end only once the driver is done
 //! with the op, so nothing it does (a write landing, bytes read) happens after they return.
 //! Each blocking call is its op waited for at once: `file.read_into(buf, at).wait(cx)`.
 //!
@@ -54,7 +54,9 @@ pub struct Pending<'buf, T> {
 /// The op's tag and its abandonment path.
 struct Settle {
     io: Io,
-    tag: Tag,
+    /// The op's tag; `None` for an op that was refused before it started ([`refused`]), which
+    /// has nothing in flight to wait for.
+    tag: Option<Tag>,
     span: &'static str,
     /// Whether the op is still this value's to end: cleared by `wait` and `cancel`.
     armed: bool,
@@ -65,8 +67,9 @@ impl Drop for Settle {
         if !self.armed {
             return;
         }
+        let Some(tag) = self.tag else { return };
         let until = Deadline::after(self.io.now(), ABANDON_WAIT);
-        let what = match self.io.settle(self.tag, until, self.span) {
+        let what = match self.io.settle(tag, until, self.span) {
             Ok(_) => "pending: abandoned, ended",
             Err(_) => "pending: abandoned, still in flight",
         };
@@ -88,7 +91,19 @@ pub(crate) fn start<'buf, T>(
         from: PhantomData,
         // alloc: once per op, its outcome's maker (bounded: freed when the op is finished).
         finish: Box::new(finish),
-        settle: Settle { io: io.clone(), tag, span, armed: true },
+        settle: Settle { io: io.clone(), tag: Some(tag), span, armed: true },
+    }
+}
+
+/// An op refused before it started (a write past its capability's budget): nothing is handed
+/// to the driver, and waiting for it or cancelling it gives `outcome` at once.
+pub(crate) fn refused<'buf, T: 'buf>(io: &Io, span: &'static str, outcome: T) -> Pending<'buf, T> {
+    Pending {
+        into: &mut [],
+        from: PhantomData,
+        // alloc: once per op, its outcome's holder (freed when the op is finished).
+        finish: Box::new(move |_: &mut [u8], _| outcome),
+        settle: Settle { io: io.clone(), tag: None, span, armed: true },
     }
 }
 
@@ -100,24 +115,33 @@ impl<T> Pending<'_, T> {
     pub fn wait(self, cx: &Cx) -> T {
         let Pending { into, from: _, finish, mut settle } = self;
         settle.armed = false;
-        let done = cx.wait(&settle.io, settle.tag, Ends::Once);
+        let done = match settle.tag {
+            Some(tag) => cx.wait(&settle.io, tag, Ends::Once),
+            // Refused before it started: its outcome is made already and reads no completion.
+            None => Err(Stopped::Cancelled { span: settle.span }),
+        };
         finish(into, done)
     }
 
     /// The op given up: blaze-core cannot cancel an effect in flight, so this waits, heeding
-    /// no cancellation, for the op to end, until the later of `cx`'s deadline and
-    /// [`ABANDON_WAIT`] from now. Its outcome is what the op did: done, or why the wait stopped
-    /// (then the op may still be in flight, and the stop says so).
+    /// no cancellation, for the op to end, until `give_up`: the caller's bound on a wait that
+    /// by design outlasts a cancelled or expired `cx` (it was once the later of `cx`'s
+    /// deadline and [`ABANDON_WAIT`] from now, picked here). Its outcome is what the op did:
+    /// done, or why the wait stopped (then the op may still be in flight, and the stop says
+    /// so). `cx` names the span the wait is recorded in.
     #[blaze::consumes]
-    pub fn cancel(self, cx: &Cx) -> T {
+    pub fn cancel(self, cx: &Cx, give_up: Deadline) -> T {
         let Pending { into, from: _, finish, mut settle } = self;
         settle.armed = false;
+        let Some(tag) = settle.tag else {
+            // Refused before it started: nothing is in flight to wait for.
+            return finish(into, Err(Stopped::Cancelled { span: cx.name() }));
+        };
         if cx.plant() == Plant::CancelSkipsWait {
-            settle.io.forget(settle.tag, Ends::Once);
+            settle.io.forget(tag, Ends::Once);
             return finish(into, Err(Stopped::Cancelled { span: cx.name() }));
         }
-        let until = cx.deadline().max(Deadline::after(settle.io.now(), ABANDON_WAIT));
-        let done = settle.io.settle(settle.tag, until, cx.name());
+        let done = settle.io.settle(tag, give_up, cx.name());
         finish(into, done)
     }
 }

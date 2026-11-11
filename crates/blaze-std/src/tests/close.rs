@@ -1,6 +1,7 @@
-//! Closing a writable file finishes it: `File::close` syncs, so a close that returned `Ok` has
-//! made every append durable (a crash right after keeps them all), and a close whose sync the
-//! disk fails returns that failure, op `Close`, never `Ok`.
+//! Closing a writable file synced finishes it: `File::close_synced` flushes it and syncs the
+//! name of a file it made, so a close that returned `Ok` has made the file and every append
+//! durable (a crash right after keeps them all), and a close whose flush the disk fails
+//! returns that failure, op `Close`, never `Ok`.
 //!
 //! Plant: [`Plant::CloseSkipsSync`], a close that says it closed without syncing.
 
@@ -12,7 +13,7 @@ use hegel::TestCase;
 use super::{Draw, Drawn, Seeds, check, control, path, root};
 use crate::{
     Cx, Plant,
-    fs::{File, FsKind, FsOp, ReadWrite},
+    fs::{File, FsKind, FsOp, ReadWrite, Unsynced},
     io::{Io, SimWorld},
 };
 
@@ -37,7 +38,7 @@ fn appends(plan: &Plan, cx: &Cx, file: &File<ReadWrite>) -> Result<Vec<u8>, Stri
     let mut written = Vec::new();
     for (at, &len) in plan.appends.iter().enumerate() {
         let bytes: Vec<u8> = (0..len).map(|i| (at * 17 + i) as u8).collect();
-        file.append(cx, &bytes).map_err(|e| format!("harness: append {at}: {e}"))?;
+        file.append_unsynced(cx, &bytes, Unsynced::No).map_err(|e| format!("harness: append {at}: {e}"))?;
         written.extend_from_slice(&bytes);
     }
     Ok(written)
@@ -59,7 +60,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
         let name = dir.name().clone();
         io.with_sim(|sim| sim.fail_syncs(name));
     }
-    let closed = file.close(&cx);
+    let closed = file.close_synced(&cx).map(|_| ());
     let written = written?;
     match (plan.fail, closed) {
         (true, Err(error)) if error.op == FsOp::Close && matches!(error.kind, FsKind::Driver(_)) => Ok(()),
@@ -83,6 +84,9 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     }
 }
 
+/// The invariant: a `File::close_synced` that returned `Ok` has made the file and every append
+/// durable (a crash right after keeps them all), and one whose flush the disk fails returns
+/// that failure, op `Close`, never `Ok`.
 #[hegel::test(test_cases = 100)]
 fn closing_a_file_syncs_it_or_says_why_not(tc: TestCase) {
     check(plan(&mut Drawn(&tc)), run);

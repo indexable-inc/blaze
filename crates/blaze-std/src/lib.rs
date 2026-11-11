@@ -14,8 +14,9 @@
 //!   [`task::Scope::spawn`] a [`task::Task`] ([`task`]), in the `Inline` layout.
 //! - What must be finished is linear (`#[blaze::linear]`, crates/hir-ty-linear): a
 //!   [`task::Scope`] and its [`task::Task`]s are joined, an op in flight
-//!   ([`pending::Pending`]) is waited for or cancelled, a writable [`fs::File`] is closed and a
-//!   [`net::Conn`] or [`net::Listener`] is finished. Leaving one is a compile error; a panic
+//!   ([`pending::Pending`]) is waited for or cancelled, a writable [`fs::File`] is closed, a
+//!   buffered writer ([`fs::Buffered`]) is finished and a [`net::Conn`] or [`net::Listener`]
+//!   is finished. Leaving one is a compile error; a panic
 //!   that unwinds past one runs its abandonment path, which each type's doc names.
 //! - A capability the host does not offer is `None` at the root ([`io::Io::fs`], ...;
 //!   [`io::Offers`]), with a `need_` form whose [`io::Missing`] names it.
@@ -26,6 +27,25 @@
 //!   a [`Path`], an [`env::VarName`], a [`net::HostPort`], each checked as it is made, and a
 //!   literal checked as the crate compiles ([`path!`], [`var!`], [`host!`]).
 //! - Every wait ends in a typed outcome: what it waited for, or a [`Stopped`].
+//! - A cost or a guarantee the caller should decide is an argument or a type, never a default
+//!   (std.md, "The second rule"): how durable a file change is ([`fs::Durable`], and
+//!   [`fs::Written`] against [`fs::Flushed`]), how big a task's frame is, how a request
+//!   talks on the wire. The simulated disk counts what was paid ([`io::Io::disk`]).
+//! - The rest of the capability set (std.md, "The rest of the set", "Sound, and the device
+//!   capabilities") exists as types with their narrowing: [`term::Term`], [`keys::Keys`],
+//!   [`roots::Roots`], [`locale::Locale`], [`user::User`], [`procs::Procs`], [`code::Code`],
+//!   [`window::Window`], [`automation::Automation`], [`opener::Opener`], [`power::Power`],
+//!   [`audio::AudioOut`] and [`audio::AudioIn`], and the devices of [`device`]. blaze-core has
+//!   no effect for any of them yet, so only the simulation provides them
+//!   ([`hosted::SimHost`]) and a native `Io` withholds them.
+//! - A lower capability makes the higher one (std.md, "Capabilities are layered"): a `Net`
+//!   gives a [`resolver::Resolver`] and [`requests::Http`] ([`requests::Http::over`]), a
+//!   [`fs::Dir`] gives [`kv::Kv`], [`blobs::Blobs`] and [`local::Local`]. Each of those has a
+//!   real provider. [`streams::Streams`] has a handler and the simulation only.
+//! - Budgets ride the same way ([`budget`]): [`net::Net::limit`] is a byte limit and
+//!   [`fs::Dir::quota`] a quota, each counted by bstd and ending in a typed outcome.
+//! - How a pure function's value is got is a value too: [`eval::Eval`] runs a memo point
+//!   (`#[blaze::memo]`), remembers it or hands it to a handler ([`eval`]).
 //! - Media as pure cores: [`image`] (PNG decode and encode, functions of bytes, an allocator
 //!   and limits) and [`video`] (an MP4 muxer, and an HEVC [`video::Encoder`] whose one provider
 //!   is VideoToolbox on macOS, made from a [`gpu::Gpu`], a placeholder had only from
@@ -70,33 +90,94 @@
 //! allocator ([`mem::Bytes`]).
 
 #![deny(unsafe_code)]
-#![feature(allocator_api, generic_atomic, register_tool, custom_inner_attributes)]
+#![feature(
+    allocator_api,
+    allocator_ext,
+    blaze_comptime,
+    custom_inner_attributes,
+    generic_atomic,
+    register_tool
+)]
 #![register_tool(blaze)]
 
 pub mod args;
+/// Sound: `AudioOut` and `AudioIn`, PCM streams pulled by the device.
+pub mod audio;
+/// Driving other applications: `Automation`, narrowed to one.
+pub mod automation;
+/// An object store beneath a directory: `Blobs`, bytes under the BLAKE3 of what they are.
+pub mod blobs;
+/// Budgets: the byte limit of a `Net` and the quota of a `Dir`, and the `Over` each ends in.
+pub mod budget;
 #[expect(
     unsafe_code,
     reason = "a token cell's two views of its value and its `Sync`, each with its SAFETY"
 )]
 pub mod cell;
 pub mod clock;
+/// Turning data into instructions: `Code`, executable memory and native modules.
+pub mod code;
 pub mod cx;
+/// The device capabilities: `Camera`, `Screen`, `Location`, `Bluetooth`, `Usb`, `Serial`,
+/// `Clipboard`, `Notify`.
+pub mod device;
+/// The simulated disk's ledger: what file calls paid, and which names a crash may undo.
+pub mod disk;
 pub mod env;
+/// Who decides how a pure function is computed: `Eval` and its providers, memo points, keys.
+pub mod eval;
 pub mod fs;
 pub mod gpu;
 pub mod host;
 pub mod image;
+/// The simulated host behind the capabilities blaze-core has no effect for, and how a call
+/// on one fails.
+pub mod hosted;
 pub mod io;
+/// The keychain: `Keys`, by named key, and the `Secret` a fetch gives.
+pub mod keys;
+/// A key-value store beneath a directory: `Kv`, by typed `Key`.
+pub mod kv;
+/// Local connections: an in-memory `Pair` of linear `End`s, and `Local`, the named sockets
+/// beneath a directory.
+pub mod local;
+/// The locale: time zone, language and formats, as plain data.
+pub mod locale;
 pub mod mem;
+/// Typed names: a key's, a device's, a module's, an application's.
+pub mod name;
+mod narrow;
 pub mod net;
+/// Handing a URL to the user's default application: `Opener`, narrowed to a scheme.
+pub mod opener;
 pub mod path;
 pub mod pending;
+/// Power: the battery, and keeping the machine awake.
+pub mod power;
+/// Other processes: `Procs`, from `Host`, narrowed to one.
+pub mod procs;
 pub mod quic;
+/// Making requests: `Http`, one type over a `Net`, the host or a handler.
+pub mod requests;
+/// Name lookup alone: `Resolver`, from a `Net`, with no connect.
+pub mod resolver;
 pub mod rng;
+/// Whom TLS trusts: `Roots`, a set of trust anchors.
+pub mod roots;
+/// Streams to an origin: `Streams`, from the host or a handler.
+pub mod streams;
 pub mod sync;
 pub mod task;
+/// The terminal as a device: `Term`, its size, raw mode, styled text and keys.
+pub mod term;
 pub mod trace;
 pub mod video;
+/// Addresses as types: `Scheme`, `Origin`, `Url`.
+pub mod url;
+/// Who is running: `User`, its name, ids and home directory.
+pub mod user;
+/// The program's windows: `Window`, a surface's size and its events.
+pub mod window;
 
 /// Bytes held without a copy: their own `Arc`, a range their owner keeps in place, or a
 /// `'static` slice (blaze-bytes). Not [`mem::Bytes`], which are bytes being written into an
@@ -226,11 +307,14 @@ pub use crate::{
     clock::Clock,
     cx::Cx,
     env::VarName,
+    eval::Eval,
     io::{Io, Missing, Offers},
     net::HostPort,
     path::Path,
     pending::Pending,
+    requests::Http,
     task::{Scope, Task},
+    url::{Origin, Url},
 };
 pub use blaze_core::wait::Deadline;
 
@@ -296,16 +380,43 @@ pub(crate) enum Plant {
     WaitIgnoresCancel,
     /// An arena is made with no limit of its own.
     ArenaUnlimited,
-    /// `File::sync` says it synced without asking the driver.
+    /// `File::flush` says it flushed without asking the driver.
     SyncSkipped,
     /// `Env::only` replaces what is allowed rather than narrowing it.
     EnvOnlyReplaces,
     /// `Pending::cancel` returns without waiting for its op to end.
     CancelSkipsWait,
-    /// `File::close` says it closed without syncing.
+    /// `File::close_synced` says it closed without flushing.
     CloseSkipsSync,
     /// `Scope::join` returns `Ok` though a task failed.
     JoinDropsFailure,
     /// Every root accessor of `Io` hands its capability out, offered or not.
     OffersIgnored,
+    /// A narrowing of the capabilities on `narrow::Allowed` (`Keys::only`, `Opener::only`, ...)
+    /// and of `Location` and `Clipboard` gives what was asked for, reached before or not.
+    OnlyWidens,
+    /// `Kv::put_synced` publishes the value unsynced: nothing of it is flushed and its name
+    /// is not synced, so a crash loses or tears it.
+    KvPutUnsynced,
+    /// A write to a local pair behind bytes not yet read says it wrote its chunk and drops it.
+    LocalDropsChunk,
+    /// `Http::only` hands back the capability it was given.
+    HttpOnlyIgnored,
+    /// A `Net`'s byte limit and a `Dir`'s quota are looked at after the bytes are sent or
+    /// written, not before.
+    BudgetCheckedAfter,
+    /// A tuple's key leaves its last element out: two calls that differ only there share one.
+    KeyIgnoresLast,
+    /// `Eval::memo` never drops a generation: its entries pass its limit.
+    MemoNeverEvicts,
+    /// `Eval::memo` keeps every entry under one point: two points with equal arguments share.
+    MemoSharesPoints,
+    /// A nested call is handed its caller's parent as its own: provenance skips a level.
+    NestedUnderGrandparent,
+    /// A publish hands its rename to the driver and reports done without waiting for it.
+    PublishBeforeRename,
+    /// A `_synced` file call skips the sync of its directory's names.
+    DurableSkipsNameSync,
+    /// `Written::flush` asks for the flush and hands out its `Flushed` without waiting for it.
+    FlushedBeforeFlush,
 }

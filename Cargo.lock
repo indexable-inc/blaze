@@ -1841,6 +1841,7 @@ dependencies = [
  "blaze-sha256",
  "blaze-spin",
  "hegeltest",
+ "http",
 ]
 
 [[package]]
@@ -3886,6 +3887,7 @@ dependencies = [
  "hir-ty",
  "hir-ty-mir",
  "hir-ty-share",
+ "inventory",
  "rustc_abi",
  "rustc_type_ir",
  "smallvec",

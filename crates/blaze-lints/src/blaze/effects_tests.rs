@@ -465,6 +465,38 @@ impl Transform for Configured {
     assert!(!out.contains("lib.rs:11"), "`Same`'s `run` reads only its input:\n{out}");
 }
 
+/// `#[blaze::memo]` holds its function to `#[blaze::pure]` (docs/v2/plan/design/std.md, "Eval"):
+/// a memo point that reads the clock is refused at the function, naming it, the attribute and
+/// the rule; one that reads only its arguments passes; and a function with neither attribute is
+/// not checked at all (remove the cause, the refusal goes).
+#[test]
+fn a_memo_point_that_is_not_pure_is_refused() {
+    let fixture = format!(
+        "{MINICORE}{TOOLCHAIN}//- /src/lib.rs crate:main deps:alloc,std\n{}",
+        r#"#[blaze::memo]
+pub fn stamped(x: u32) -> u32 {
+    let _ = std::time::SystemTime::now();
+    x
+}
+#[blaze::memo]
+pub fn doubled(x: u32) -> u32 {
+    x + x
+}
+pub fn unmarked(x: u32) -> u32 {
+    let _ = std::time::SystemTime::now();
+    x
+}
+"#
+    );
+    let out = lint(&fixture, "-A clippy::all --deny=blaze::pure");
+    let found = findings(&out, "pure");
+    assert_eq!(found.len(), 1, "{out}");
+    assert!(out.contains("`stamped` is `#[blaze::memo]`, and a memo point must be pure"), "{out}");
+    assert!(out.contains("reads the clock"), "{out}");
+    assert!(!out.contains("`doubled`"), "`doubled` reads only its argument:\n{out}");
+    assert!(!out.contains("`unmarked`"), "`unmarked` is no memo point:\n{out}");
+}
+
 /// An attribute with anything but `trusted = ".."` is a finding, never read as unmarked.
 #[test]
 fn a_malformed_attribute_is_refused() {

@@ -82,6 +82,9 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     Ok(())
 }
 
+/// The invariant: a child `Cx` never has a later deadline than its parent. Whatever tree of
+/// `until`, `span`, scopes and tasks grows from the root, each context's deadline is at or
+/// before the one it was made from.
 #[hegel::test(test_cases = 200)]
 fn a_child_context_never_has_a_later_deadline(tc: TestCase) {
     check(plan(&mut Drawn(&tc)), run);

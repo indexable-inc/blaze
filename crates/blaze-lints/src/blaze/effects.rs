@@ -1,4 +1,4 @@
-//! `nopanic`, `noalloc`, `nonblocking` and `pure` (lane pure's, docs/v2/plan/design/pure-fns.md) (`deny` by default; each fires only where the code
+//! `nopanic`, `noalloc`, `nonblocking` and `pure` (lane pure's, docs/v2/plan/design/pure-fns.md; a `#[blaze::memo]` function is held to `pure` too, docs/v2/plan/design/std.md "Eval") (`deny` by default; each fires only where the code
 //! asks for it, docs/v2/plan/design/effects.md): a function marked `#[blaze::nopanic]`,
 //! `#[blaze::noalloc]` or `#[blaze::nonblocking]` (or a method of an impl of, or a default
 //! method of, a trait so marked) that may, through any call, panic, call the global allocator or
@@ -22,7 +22,8 @@
 //! or without one builds byte for byte the same.
 
 use hir_def::{
-    AttrDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, attrs::PureAttr,
+    AttrDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup,
+    attrs::{AttrFlags, PureAttr},
 };
 use hir_ty::db::HirDatabase as _;
 use hir_ty_mir::mir::overflow::crate_checks_overflow;
@@ -160,8 +161,22 @@ fn find(cx: &Cx<'_, '_>, lint: Lint) -> Option<(Finding, Vec<StepNote>)> {
         }
         PureAttr::Checked => {
             let refusal = hir_ty_pure::check_generic(db, func, effect).err()?;
+            // A memo point is held pure by `#[blaze::memo]` itself (`AttrFlags::pure_attr`):
+            // the refusal says which attribute asked, and why it must hold.
+            let memo = matches!(lint, Lint::Pure) && {
+                let flags = AttrFlags::query(db, AttrDefId::FunctionId(func));
+                flags.contains(AttrFlags::BLAZE_MEMO) && !flags.contains(AttrFlags::PURE)
+            };
+            let asked = if memo {
+                // alloc: a message
+                format!(
+                    "`{name}` is `#[blaze::memo]`, and a memo point must be pure (an evaluator keeps its result by its code and arguments alone): "
+                )
+            } else {
+                String::new() // alloc: empty, allocates nothing
+            };
             // alloc: a message
-            let message = format!("{}{profile}", refusal.said());
+            let message = format!("{asked}{}{profile}", refusal.said());
             Some((finding(message), step_notes(db, krate, &refusal)))
         }
     }

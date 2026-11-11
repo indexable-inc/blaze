@@ -6,7 +6,7 @@
 
 use hegel::TestCase;
 
-use super::{Draw, Drawn, Seeds, check, control, path, root, world};
+use super::{Draw, Drawn, Seeds, check, control, path, root, world, write_synced};
 use crate::Plant;
 
 /// The names a call picks from: some written before, some never.
@@ -44,15 +44,15 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let io = world(plan.seed, plant);
     let cx = root(&io);
     let top = io.need_fs().map_err(|e| format!("harness: {e}"))?.open_dir(&cx, &path("top")).map_err(|e| format!("harness: {e}"))?;
-    top.write(&cx, &path("secret"), b"parent's").map_err(|e| format!("harness: {e}"))?;
+    write_synced(&cx, &top, &path("secret"), b"parent's").map_err(|e| format!("harness: {e}"))?;
     let sub = top.subdir(&path("sub"));
     // Where `sub` is: the oracle's yardstick, whatever the narrowing says.
     let beneath = blaze_core::FileName::new("top/sub").ok_or("harness: the name top/sub")?;
     if plant == Plant::None && sub.name() != &beneath {
         return Err(format!("subdir sub of top is named {}, not {beneath}", sub.name()));
     }
-    sub.write(&cx, &path("f"), b"one").map_err(|e| format!("harness: {e}"))?;
-    sub.write(&cx, &path("deep/h"), b"two").map_err(|e| format!("harness: {e}"))?;
+    write_synced(&cx, &sub, &path("f"), b"one").map_err(|e| format!("harness: {e}"))?;
+    write_synced(&cx, &sub, &path("deep/h"), b"two").map_err(|e| format!("harness: {e}"))?;
     let read_only = sub.read_only();
     io.record();
     for (at, &(call, name, through_read_only)) in plan.calls.iter().enumerate() {
@@ -67,15 +67,16 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
                 Call::ReadAll => read_only.read_all(&cx, &name, &mut into).map(|_| ()),
             };
         } else {
-            // A writable file is linear: each opened is closed, which syncs it beneath `sub`.
+            // A writable file is linear: each opened is closed, synced, beneath `sub`. A
+            // publish's temporary file is beside its path, so beneath `sub` too.
             let _ = match call {
-                Call::Write => sub.write(&cx, &name, b"call"),
+                Call::Write => write_synced(&cx, &sub, &name, b"call"),
                 Call::Create => match sub.create(&cx, &name) {
-                    Ok(file) => file.close(&cx),
+                    Ok(file) => file.close_synced(&cx).map(|_| ()),
                     Err(error) => Err(error),
                 },
                 Call::Open => match sub.open(&cx, &name) {
-                    Ok(file) => file.close(&cx),
+                    Ok(file) => file.close_synced(&cx).map(|_| ()),
                     Err(error) => Err(error),
                 },
                 Call::Stat => sub.stat(&cx, &name).map(|_| ()),
@@ -95,6 +96,8 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     Ok(())
 }
 
+/// The invariant: narrowing never widens. Every file a call through `top/sub` names is beneath
+/// `top/sub`, and a call through its read-only narrowing changes nothing.
 #[hegel::test(test_cases = 100)]
 fn a_narrowed_directory_reaches_only_beneath_it(tc: TestCase) {
     check(plan(&mut Drawn(&tc)), run);

@@ -1901,6 +1901,7 @@ impl<'db> Interner for DbInterner<'db> {
             SolverTraitLangItem::ReflectEnum => lang_items.ReflectEnum,
             SolverTraitLangItem::ReflectField => lang_items.ReflectField,
             SolverTraitLangItem::ReflectFnItem => lang_items.ReflectFnItem,
+            SolverTraitLangItem::ReflectMemoPoint => lang_items.ReflectMemoPoint,
             SolverTraitLangItem::ReflectStruct => lang_items.ReflectStruct,
             SolverTraitLangItem::ReflectVariant => lang_items.ReflectVariant,
         };
@@ -1971,6 +1972,7 @@ impl<'db> Interner for DbInterner<'db> {
             ReflectEnum,
             ReflectField,
             ReflectFnItem,
+            ReflectMemoPoint,
             ReflectStruct,
             ReflectVariant,
         )
@@ -2040,6 +2042,7 @@ impl<'db> Interner for DbInterner<'db> {
             ReflectEnum,
             ReflectField,
             ReflectFnItem,
+            ReflectMemoPoint,
             ReflectStruct,
             ReflectVariant,
         )
@@ -2071,6 +2074,10 @@ impl<'db> Interner for DbInterner<'db> {
 
     fn reflect_is_enum(self, ty: Ty<'db>) -> bool {
         matches!(ty.kind(), TyKind::Adt(def, _) if matches!(def.def_id(), AdtId::EnumId(_)))
+    }
+
+    fn reflect_is_memo_point(self, ty: Ty<'db>) -> bool {
+        crate::comptime::reflect_is_memo_point(self, ty)
     }
 
     fn param_env_with_clauses(

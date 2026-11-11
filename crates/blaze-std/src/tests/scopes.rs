@@ -17,7 +17,8 @@ use crate::{
     Cx, Plant,
     clock::Clock,
     fs::{File, ReadWrite},
-    io::Io,
+    io::{ABANDON_WAIT, Io},
+    mem::TASK_FRAME,
     task::{TaskError, TaskWhy},
 };
 
@@ -96,13 +97,13 @@ fn act(cx: &Cx, kind: Kind, clock: &Clock, file: &File<ReadWrite>) -> Result<(),
         Kind::Writes { cancel } => {
             let bytes = [7u8; 8];
             let pending = file.write_from(&bytes, 0);
-            let _ = if cancel { pending.cancel(cx) } else { pending.wait(cx) };
+            let _ = if cancel { pending.cancel(cx, cx.deadline().max(clock.after(ABANDON_WAIT))) } else { pending.wait(cx) };
             Ok(())
         }
         Kind::Reads { cancel } => {
             let mut buf = [0u8; 8];
             let pending = file.read_into(&mut buf, 0);
-            let _ = if cancel { pending.cancel(cx) } else { pending.wait(cx) };
+            let _ = if cancel { pending.cancel(cx, cx.deadline().max(clock.after(ABANDON_WAIT))) } else { pending.wait(cx) };
             Ok(())
         }
     }
@@ -118,7 +119,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
         Err(error) => return Err(format!("harness: {error}")),
     };
     let checked = scoped(plan, &io, &cx, &clock, &file);
-    let closed = file.close(&cx);
+    let closed = file.close_synced(&cx).map(|_| ());
     match (checked, closed) {
         (Err(why), _) => Err(why),
         (Ok(()), Ok(())) => Ok(()),
@@ -137,7 +138,7 @@ fn scoped(plan: &Plan, io: &Io, cx: &Cx, clock: &Clock, file: &File<ReadWrite>) 
             scope.cancel();
         }
         let log = &log;
-        let task = scope.spawn(NAMES[at], move |cx| -> Result<(), String> {
+        let task = scope.spawn(NAMES[at], TASK_FRAME, move |cx| -> Result<(), String> {
             log.started.borrow_mut().push(at);
             let _ends = Ends(log, at);
             let did = act(cx, kind, clock, file);
@@ -182,6 +183,9 @@ fn scoped(plan: &Plan, io: &Io, cx: &Cx, clock: &Clock, file: &File<ReadWrite>) 
     }
 }
 
+/// The invariant: when `Scope::join` returns its tasks have all ended. Nothing a task started
+/// is still in flight in the driver, each `Task::join` gives exactly what its closure did, and
+/// the scope's own join gives the first failure, naming the task.
 #[hegel::test(test_cases = 150)]
 fn a_scopes_tasks_have_all_ended_when_it_joins(tc: TestCase) {
     check(plan(&mut Drawn(&tc)), run);

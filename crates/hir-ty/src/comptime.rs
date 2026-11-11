@@ -248,6 +248,20 @@ pub(crate) fn reflect_is_struct<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> 
     })
 }
 
+/// `Interner::reflect_is_memo_point`: whether `ty` is the item type of a function written
+/// `#[blaze::memo]` (`AttrFlags::BLAZE_MEMO`), which `bstd::eval` takes as a memo point. A
+/// constructor's item type, a closure and a function pointer are not.
+pub(crate) fn reflect_is_memo_point<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> bool {
+    let TyKind::FnDef(def, _) = ty.kind() else {
+        return false;
+    };
+    let hir_def::CallableDefId::FunctionId(func) = def.0 else {
+        return false;
+    };
+    hir_def::attrs::AttrFlags::query(interner.db, hir_def::AttrDefId::FunctionId(func))
+        .contains(hir_def::attrs::AttrFlags::BLAZE_MEMO)
+}
+
 /// `Interner::reflect_variant_view`.
 pub(crate) fn reflect_variant_view<'db>(
     interner: DbInterner<'db>,

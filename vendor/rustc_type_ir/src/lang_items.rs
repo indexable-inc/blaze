@@ -77,6 +77,8 @@ pub enum SolverTraitLangItem {
     ReflectField,
     /// blaze: `core::reflect::FnItem`: fn item and closure types.
     ReflectFnItem,
+    /// blaze: `core::reflect::MemoPoint`: the item type of a function written `#[blaze::memo]`.
+    ReflectMemoPoint,
     /// blaze: `core::reflect::Struct`: a struct whose fields reflection may read, a tuple, or
     /// a variant view.
     ReflectStruct,

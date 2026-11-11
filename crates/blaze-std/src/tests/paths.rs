@@ -8,7 +8,7 @@
 use blaze_core::{Done, Effect};
 use hegel::TestCase;
 
-use super::{Draw, Drawn, Seeds, check, control, path, root, world};
+use super::{Draw, Drawn, Seeds, check, control, path, root, world, write_synced};
 use crate::{Plant, path::Path};
 
 const PARTS: [&str; 7] = ["a", "b", "..", ".", "", "c.d", "..."];
@@ -54,7 +54,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
                     if text != raw || text.starts_with('/') || text.split('/').any(|it| matches!(it, "" | "." | "..")) {
                         return Err(format!("Path::new took {raw:?} as {text:?}: not plain and relative"));
                     }
-                    jail.write(&cx, &made, b"x").map_err(|e| format!("harness: {e}"))?;
+                    write_synced(&cx, &jail, &made, b"x").map_err(|e| format!("harness: {e}"))?;
                 }
                 Err(refused) => {
                     if refused.path != *raw {
@@ -72,6 +72,9 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     Ok(())
 }
 
+/// The invariant: a `Path` never escapes its `Dir`. Whatever text a path is made of, what
+/// `Path::new` takes is plain and relative, and a write through `jail/in` of it names a file
+/// beneath `jail/in`.
 #[hegel::test(test_cases = 200)]
 fn a_path_never_escapes_its_directory(tc: TestCase) {
     check(plan(&mut Drawn(&tc)), run);

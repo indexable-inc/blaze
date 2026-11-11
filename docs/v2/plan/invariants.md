@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-36 invariants, 7 refinements, 2 reference models.
-By level: 24 tested, 19 simulated, 0 model-checked, 0 proved.
+56 invariants, 8 refinements, 2 reference models.
+By level: 39 tested, 25 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -122,6 +122,49 @@ By level: 24 tested, 19 simulated, 0 model-checked, 0 proved.
 - **`every_row_is_in_the_history_once_after_any_crash`** *simulated* (`crates/blaze-profile/src/history/files/tests.rs`): whatever the faults, wherever the power goes out, every row handed to the history is listed, handed back or left to read, exactly once, and the history opens.
   Controls: `a_rename_with_no_sync_before`, `what_a_flush_consumed_marked_after_its_commit`.
 
+### blaze-std
+
+- **`an_arena_never_hands_out_more_than_its_limit`** *tested* (`crates/blaze-std/src/tests/arena.rs`): an arena never hands out more than its limit. Whatever appends are made to bytes in a named arena, its use stays within its limit, an append past it is `Stopped::OutOfMemory` naming the arena and changes nothing, and the bytes are exactly the appends that were taken.
+  Controls: `an_arena_with_no_limit`.
+- **`a_net_never_passes_its_byte_limit`** *tested* (`crates/blaze-std/src/tests/budget.rs`): a `Net` with a byte limit never passes it and spends it exactly. What the peer was sent and what was received from it, counted outside bstd, fit the limit; a send that does not fit is a typed `Over` and moves nothing.
+  Controls: `a_limit_checked_after_the_send`, `a_quota_checked_after_the_write`.
+- **`a_directory_never_passes_its_quota`** *tested* (`crates/blaze-std/src/tests/budget.rs`): a `Dir` with a quota never passes it and spends it exactly. The lengths of the files on the simulated disk fit the quota; a write that does not fit is a typed `Over` and writes nothing.
+  Controls: `a_limit_checked_after_the_send`, `a_quota_checked_after_the_write`.
+- **`cancelling_a_scope_ends_its_waits_with_cancelled`** *tested* (`crates/blaze-std/src/tests/cancel.rs`): cancelling a scope ends its waits with `Stopped::Cancelled`. Once a task of a scope fails or panics, or the scope is cancelled, every wait of its later tasks ends with `Cancelled`, the ones before it ended as they would have, and the scope returns its first failure, naming the task.
+  Controls: `a_wait_that_ignores_cancellation`.
+- **`closing_a_file_syncs_it_or_says_why_not`** *simulated* (`crates/blaze-std/src/tests/close.rs`): a `File::close_synced` that returned `Ok` has made the file and every append durable (a crash right after keeps them all), and one whose flush the disk fails returns that failure, op `Close`, never `Ok`.
+  Controls: `a_close_that_skips_its_sync`.
+- **`a_child_context_never_has_a_later_deadline`** *tested* (`crates/blaze-std/src/tests/contexts.rs`): a child `Cx` never has a later deadline than its parent. Whatever tree of `until`, `span`, scopes and tasks grows from the root, each context's deadline is at or before the one it was made from.
+  Controls: `until_that_widens`.
+- **`write_then_read_round_trips_through_crashes`** *simulated* (`crates/blaze-std/src/tests/crash.rs`): write then read round-trips through crashes. Before a crash a read is everything written; after one it is everything a returned flush or synced publish made durable, followed by a prefix of what came after it, never less and never anything else.
+  Controls: `a_sync_that_skips_the_disk`.
+- **`a_deadline_always_ends_a_wait`** *simulated* (`crates/blaze-std/src/tests/deadlines.rs`): a deadline always ends a wait. Under `cx.until(d)` no call returns with the driver's clock past `d` (unless it was past already), a call that stopped with `Stopped::Deadline` did so once `d` had passed, and a call that cannot finish ends with `Stopped::Deadline`, not later and not otherwise.
+  Controls: `a_wait_that_ignores_its_deadline`.
+- **`files_keep_what_their_calls_said_through_crashes`** *simulated* (`crates/blaze-std/src/tests/durable.rs`): a file call's durability is what its caller said and nothing else. A read after a publish or a remove returned gives what it said; a crash keeps exactly what was synced, and of what was not, the last synced state or an unsynced change cut short; a clone of a `Flushed` forces no writeback; nothing told `No` waits for the device; and `Started`, which no driver can do yet, is refused with nothing changed.
+  Controls: `a_publish_that_reports_done_before_its_rename`, `a_durable_yes_that_skipped_the_directory_sync`, `a_flushed_handed_out_before_the_flush_completed`.
+- **`env_only_never_widens`** *tested* (`crates/blaze-std/src/tests/env.rs`): `Env::only` never widens. After any chain of narrowings a variable reads only if every narrowing in the chain named it, and then reads as the world set it.
+  Controls: `only_that_replaces`.
+- **`a_call_gives_the_points_own_value`** *tested* (`crates/blaze-std/src/tests/eval.rs`): `Eval` gives a memo point's own value. Under `direct` and `memo`, every call gives what the plain function gives and what the same call gave before, for two points called with the same arguments.
+  Controls: `a_key_that_ignores_an_argument`, `two_points_sharing_entries`, `a_memo_that_never_evicts`, `calls_put_under_the_grandparent`.
+- **`a_memo_stays_within_its_limit`** *tested* (`crates/blaze-std/src/tests/eval.rs`): a memo never holds more entries or bytes than its limit, and until it has dropped or refused an entry each distinct call's body runs at most once.
+  Controls: `a_key_that_ignores_an_argument`, `two_points_sharing_entries`, `a_memo_that_never_evicts`, `calls_put_under_the_grandparent`.
+- **`provenance_records_the_calls_made`** *tested* (`crates/blaze-std/src/tests/eval.rs`): the graph `Provenance` writes holds exactly the calls made, each under the call whose body made it, in order.
+  Controls: `a_key_that_ignores_an_argument`, `two_points_sharing_entries`, `a_memo_that_never_evicts`, `calls_put_under_the_grandparent`.
+- **`a_finished_op_never_lands_later`** *simulated* (`crates/blaze-std/src/tests/inflight.rs`): an op in flight is finished. Once `Pending::wait` or `Pending::cancel` has returned, the driver holds nothing of it and nothing it does happens later: the file holds what the model says then and once the world has moved on.
+  Controls: `a_cancel_that_skips_its_wait`.
+- **`kv_agrees_with_a_model_through_crashes`** *simulated* (`crates/blaze-std/src/tests/kv.rs`): `Kv` agrees with a model map through crashes. A get gives exactly what the model holds and a list exactly its keys; a `put_synced` or a `delete_synced` that returned is kept by a crash, whole: never a part of a value, never an older one.
+  Controls: `a_put_without_a_sync`.
+- **`a_local_pair_delivers_in_order_exactly_once`** *tested* (`crates/blaze-std/src/tests/local.rs`): a local pair delivers bytes in order, exactly once. Each read gives the next bytes written and not yet read, a write that stops half way says how many bytes it wrote, and once an end is finished its peer reads what was left, then 0.
+  Controls: `a_dropped_chunk`.
+- **`a_withheld_capability_is_missing_and_named`** *tested* (`crates/blaze-std/src/tests/missing.rs`): a capability the host withholds is missing at the root. Each root accessor of `Io` is `Some` exactly when the host offers it, and its `need_` form is `Ok` then and otherwise a `Missing` naming it, for every flag of `Offers`.
+  Controls: `accessors_that_ignore_the_offers`.
+- **`a_narrowed_directory_reaches_only_beneath_it`** *tested* (`crates/blaze-std/src/tests/narrowing.rs`): narrowing never widens. Every file a call through `top/sub` names is beneath `top/sub`, and a call through its read-only narrowing changes nothing.
+  Controls: `a_subdir_that_keeps_its_parent`, `a_read_only_open_that_creates`.
+- **`a_path_never_escapes_its_directory`** *tested* (`crates/blaze-std/src/tests/paths.rs`): a `Path` never escapes its `Dir`. Whatever text a path is made of, what `Path::new` takes is plain and relative, and a write through `jail/in` of it names a file beneath `jail/in`.
+  Controls: `a_parent_resolved_by_text`.
+- **`a_scopes_tasks_have_all_ended_when_it_joins`** *tested* (`crates/blaze-std/src/tests/scopes.rs`): when `Scope::join` returns its tasks have all ended. Nothing a task started is still in flight in the driver, each `Task::join` gives exactly what its closure did, and the scope's own join gives the first failure, naming the task.
+  Controls: `a_join_that_drops_a_failure`.
+
 ### blaze-storemodel
 
 - **`what_is_kept_after_an_answer_survives_any_crash_and_no_lost_value_is_served`** *tested* (`crates/blaze-storemodel/src/tests.rs`): an answer may be sent on results not yet durable; nothing derived from that answer is reused across a crash unless its tickets were durable. After any crash the restore serves no value whose bytes were lost, holds everything the store called durable and everything an answered build kept, and every answer's settling ended kept or said lost. Two builds on shared and separate keys with a reader, and a snapshot beside a build, each build answering before it flushes: every schedule, a crash after every IO step, so at every point between an answer sent and its results durable; with an IO failure anywhere, so a settling that ends with the store stopped. Then two kernel gets of one identity in two worlds racing for one shape slot, each answering at once and keeping what it left once it and every store before it is durable, with an IO failure anywhere and effects completing in any order.
@@ -152,6 +195,11 @@ By level: 24 tested, 19 simulated, 0 model-checked, 0 proved.
   Controls: `a_removed_entry_left_in_the_root`.
 - **`a_patched_file_behaves_as_a_fresh_link`** *tested* (`crates/blaze-link/src/tests/patch.rs`): after any sequence of edits (a body changed at the same size, smaller or larger than the room it had, a function added or removed, a callee set changed, a frame entry gained or lost, a static read, dropped or given another value), the file the patches make behaves as a fresh full link of the same program: the same entry, each function's code, each call resolved through its slot to the same function, each static read holding the same bytes, an unwind lookup of each function finding an entry that covers it, and the same function names in the symbol table. Each patch is of the file the last one left, never lays the image out whole, and the digest it gives is the patched file's hashed whole.
   Controls: `a_stale_unwind_entry`, `a_slot_left_on_the_old_body`, `a_removed_function_still_exported`, `a_write_the_digest_missed`, `a_check_of_the_length_alone`.
+
+### blaze-std
+
+- **`a_handler_and_a_net_answer_alike`** *tested* (`crates/blaze-std/src/tests/requests.rs`): `Http::handler` over a function and `Http::over` a `Net` whose peer runs the same function behind HTTP/1.1 give the same answer to the same request (status and body), and narrowed to one origin both refuse a request to the other, the same way.
+  Controls: `an_only_that_is_ignored`.
 
 ### linked
 

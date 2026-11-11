@@ -626,6 +626,17 @@ impl File<ReadWrite> {
 
 fn open_rw() -> File<ReadWrite> { File { name: 0, rights: ReadWrite(()) } }
 fn open_ro() -> File<ReadOnly> { File { name: 0, rights: ReadOnly } }
+
+#[blaze::linear]
+struct Buffered<'f> { file: &'f u32, held: usize }
+
+impl Buffered<'_> {
+    fn push(&mut self, more: usize) { self.held = more; }
+    #[blaze::consumes]
+    fn finish(self, _cx: &Cx) -> Result<usize, u32> { Ok(self.held) }
+}
+
+fn buffered(file: &u32) -> Buffered<'_> { Buffered { file, held: 0 } }
 ";
 
 #[test]
@@ -659,6 +670,14 @@ fn bstd_a_writable_file_left_unclosed_is_an_error() {
         found.iter().all(|(message, at)| message.contains("file") && message.contains("ReadWrite") && at == "}"),
         "{found:#?}"
     );
+}
+
+#[test]
+fn bstd_a_buffered_writer_left_unfinished_is_an_error() {
+    let found = check(&format!(
+        "{BSTD}\nfn f(file: &u32) {{\n    let mut writer = buffered(file);\n    writer.push(3);\n}}\n"
+    ));
+    expect(&found, &[(&["`writer`", "Buffered", "at the end of its scope"], "}")]);
 }
 
 #[test]
@@ -701,6 +720,10 @@ fn f(cx: &Cx, buf: &mut [u8; 4]) -> Result<u32, u32> {{
     let file = open_rw();
     let closed = file.close(cx);
     let _read_only = open_ro();
+    let name = 0;
+    let mut writer = buffered(&name);
+    writer.push(3);
+    let _finished = writer.finish(cx);
     let joined = scope.join(cx);
     match (got, closed, joined) {{
         (Ok(v), Ok(()), Ok(())) => Ok(v),

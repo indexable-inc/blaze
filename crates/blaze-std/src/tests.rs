@@ -13,6 +13,11 @@
 //! - [`arena`]: an arena never hands out more than its limit.
 //! - [`crash`]: write then read round-trips through crashes: what a read gives after one is
 //!   what was durable plus a prefix of what was not.
+//! - [`durable`]: the file-durability invariant: a synced publish or remove survives a
+//!   crash exactly, an unsynced one is lost or torn and never anything else, a clone of a
+//!   flushed file forces no writeback, and no `_unsynced` call waits for the device.
+//! - [`explicit`]: each cost or guarantee an API used to pick is now its caller's: one
+//!   example test a change.
 //! - [`env`]: `Env::only` never widens.
 //! - [`world`]: `Args`, `Host`, the trace and `spawn_concurrent`'s refusal under `Inline`, each
 //!   once.
@@ -23,7 +28,19 @@
 //!   outcome.
 //! - [`inflight`]: a `Pending` op waited for or cancelled never lands after it returned.
 //! - [`missing`]: a withheld capability is `None` at the root and its `need_` names it.
-//! - [`close`]: closing a writable file syncs it, or returns the sync's failure.
+//! - [`close`]: `close_synced` flushes a writable file and syncs its name, or returns the
+//!   sync's failure.
+//! - [`eval`]: an evaluator gives a memo point's own value, a memo stays within its limit, and
+//!   provenance records exactly the calls made.
+//! - [`narrows`]: narrowing never widens, for every capability of "The rest of the set" that
+//!   has a narrowing: one harness over a trait of cases, one control a case.
+//! - [`kv`]: `Kv`, put and deleted synced, agrees with a model map through crashes.
+//! - [`local`]: a local pair delivers bytes in order, exactly once.
+//! - [`budget`]: a `Net`'s byte limit and a `Dir`'s quota are never exceeded, and spent
+//!   exactly.
+//! - [`requests`]: `Http::handler` and `Http::over` give the same answer to the same request,
+//!   and refuse the same ones once narrowed.
+//! - [`hosted`]: each simulated provider once, a scripted value in and a recorded one out.
 //!
 //! The compile-time half, that dropping a `Scope`, `Task`, `Pending` or `File<ReadWrite>`
 //! unfinished is an error, is in crates/hir-ty-linear's fixtures (`bstd_*`): that harness
@@ -37,20 +54,29 @@
 //! the plan that caught its plant.
 
 mod arena;
+mod budget;
 mod cancel;
 mod cell;
 mod close;
 mod contexts;
 mod crash;
 mod deadlines;
+mod durable;
 mod env;
+mod eval;
+mod explicit;
+mod hosted;
 mod inflight;
+mod kv;
+mod local;
 mod missing;
 mod image;
 mod mp4;
 mod names;
 mod narrowing;
+mod narrows;
 mod paths;
+mod requests;
 mod scopes;
 mod world;
 
@@ -62,7 +88,9 @@ use hegel::{TestCase, generators as gs};
 use crate::{
     Plant,
     cx::Cx,
+    fs::{Content, Dir, FsError, ReadWrite},
     io::{Io, SimWorld},
+    mem::TASK_FRAME,
     path::Path,
 };
 
@@ -141,7 +169,12 @@ fn world(seed: u64, plant: Plant) -> Io {
 
 /// The root context of `io`.
 fn root(io: &Io) -> Cx {
-    io.cx(BUDGET).expect("a test's root frame is made")
+    io.cx(BUDGET, TASK_FRAME).expect("a test's root frame is made")
+}
+
+/// `bytes` published at `at` beneath `dir`, synced: a test's file, there through a crash.
+fn write_synced(cx: &Cx, dir: &Dir<ReadWrite>, at: &Path, bytes: &[u8]) -> Result<(), FsError> {
+    dir.publish_synced(cx, at, Content::bytes(bytes)).map(|_| ())
 }
 
 /// `raw`, which a test knows is a path.

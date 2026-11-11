@@ -16,7 +16,7 @@ use super::{Draw, Drawn, Seeds, check, control, path, root};
 use crate::{
     Cx, Plant,
     fs::{File, ReadWrite},
-    io::{Io, SimWorld},
+    io::{ABANDON_WAIT, Io, SimWorld},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -54,12 +54,18 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
         Err(error) => return Err(format!("harness: {error}")),
     };
     let checked = ops(plan, &io, &cx, &file);
-    let closed = file.close(&cx);
+    let closed = file.close_synced(&cx).map(|_| ());
     match (checked, closed) {
         (Err(why), _) => Err(why),
         (Ok(()), Ok(())) => Ok(()),
         (Ok(()), Err(error)) => Err(format!("harness: close: {error}")),
     }
+}
+
+/// How long a cancel waits for its op's end: the later of the context's deadline and
+/// [`ABANDON_WAIT`] from now, said here by the caller.
+fn give_up(io: &Io, cx: &Cx) -> Deadline {
+    cx.deadline().max(Deadline::after(io.now(), ABANDON_WAIT))
 }
 
 /// What the simulated disk holds of `file` now, synced or not.
@@ -74,7 +80,7 @@ fn ops(plan: &Plan, io: &Io, cx: &Cx, file: &File<ReadWrite>) -> Result<(), Stri
         if op.write {
             let bytes: Vec<u8> = (0..op.len).map(|i| (at * 31 + i) as u8 | 1).collect();
             let pending = file.write_from(&bytes, op.at);
-            let ended = if op.cancel { pending.cancel(cx) } else { pending.wait(cx) };
+            let ended = if op.cancel { pending.cancel(cx, give_up(io, cx)) } else { pending.wait(cx) };
             if ended.is_ok() {
                 if model.len() < start + bytes.len() {
                     model.resize(start + bytes.len(), 0);
@@ -84,7 +90,7 @@ fn ops(plan: &Plan, io: &Io, cx: &Cx, file: &File<ReadWrite>) -> Result<(), Stri
         } else {
             let mut buf = [0u8; 16];
             let pending = file.read_into(&mut buf[..op.len], op.at);
-            let ended = if op.cancel { pending.cancel(cx) } else { pending.wait(cx) };
+            let ended = if op.cancel { pending.cancel(cx, give_up(io, cx)) } else { pending.wait(cx) };
             if let Ok(read) = ended {
                 let want = model.get(start..).map_or(&[][..], |rest| &rest[..rest.len().min(op.len)]);
                 if buf[..read] != *want {
@@ -111,6 +117,9 @@ fn ops(plan: &Plan, io: &Io, cx: &Cx, file: &File<ReadWrite>) -> Result<(), Stri
     Ok(())
 }
 
+/// The invariant: an op in flight is finished. Once `Pending::wait` or `Pending::cancel` has
+/// returned, the driver holds nothing of it and nothing it does happens later: the file holds
+/// what the model says then and once the world has moved on.
 #[hegel::test(test_cases = 150)]
 fn a_finished_op_never_lands_later(tc: TestCase) {
     check(plan(&mut Drawn(&tc)), run);

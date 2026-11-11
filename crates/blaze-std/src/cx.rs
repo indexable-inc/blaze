@@ -14,6 +14,11 @@
 //!   and every context made from it are gone.
 //! - The one wait ([`Cx::wait`]): every call in bstd that waits (IO, sleeps) waits through it,
 //!   until the deadline, ending ready or in [`Stopped::Deadline`] or [`Stopped::Cancelled`].
+//! - Effects: what only reads the context ([`Cx::deadline`], [`Cx::name`],
+//!   [`Cx::cancelled`], [`Cx::check`]) is `#[blaze::noalloc]` and `#[blaze::nonblocking]`,
+//!   checked: the one line a long computation calls never waits and never allocates.
+//!   [`Cx::span`] and [`Cx::event`] take the world's lock to record, and [`Cx::wait`] is the
+//!   wait; none of the three is marked.
 //! - Tasks: [`Cx::scope`] makes a scope of tasks, a linear [`Scope`] value joined with
 //!   [`Scope::join`] ([`crate::task`]); [`Cx::scope_with`] runs a closure as one. There is no
 //!   `io.tasks()`.
@@ -110,21 +115,31 @@ impl Cx {
     }
 
     /// The deadline every wait under it ends by.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn deadline(&self) -> Deadline {
         self.deadline
     }
 
     /// The span's name.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn name(&self) -> &'static str {
         self.span
     }
 
     /// Whether its scope, or a scope it is inside, was cancelled.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn cancelled(&self) -> bool {
         self.cancel.is_set()
     }
 
     /// [`Stopped::Cancelled`] once its scope was cancelled: the line a long computation calls.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn check(&self) -> Result<(), Stopped> {
         match self.cancelled() {
             true => Err(Stopped::Cancelled { span: self.span }),
@@ -210,6 +225,40 @@ impl Cx {
                     }
                 }
                 return Err(stopped);
+            }
+            match io.poll(deadline) {
+                0 => idle += 1,
+                _ => idle = 0,
+            }
+        }
+    }
+
+    /// The one wait, for a condition bstd keeps itself rather than a completion of the
+    /// driver's (bytes in an in-memory pipe, a key the simulated terminal will send): until
+    /// `ready` gives a value, or this context's deadline or cancellation, with the same typed
+    /// stops as [`Cx::wait`]. `ready` is asked before each poll of the driver.
+    ///
+    /// In S1's `Inline` layout nothing else runs while a task waits, so a condition only
+    /// another task could make true ends here at the deadline; a fiber layout parks the task
+    /// on the condition's key instead, and its maker wakes it.
+    pub(crate) fn wait_for<T>(&self, io: &Io, mut ready: impl FnMut() -> Option<T>) -> Result<T, Stopped> {
+        let deadline = match self.plant {
+            Plant::WaitIgnoresDeadline => Deadline::NEVER,
+            _ => self.deadline,
+        };
+        let mut idle = 0;
+        loop {
+            if let Some(got) = ready() {
+                return Ok(got);
+            }
+            if self.plant != Plant::WaitIgnoresCancel && self.cancelled() {
+                return Err(Stopped::Cancelled { span: self.span });
+            }
+            if deadline.passed(io.now()) {
+                return Err(Stopped::Deadline { span: self.span, at: deadline.get() });
+            }
+            if idle == POLL_FUEL {
+                return Err(Stopped::Stalled { span: self.span, polls: idle });
             }
             match io.poll(deadline) {
                 0 => idle += 1,

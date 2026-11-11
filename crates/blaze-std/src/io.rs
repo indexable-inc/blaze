@@ -24,6 +24,14 @@
 //! it, whose [`Missing`] names it. A native `Io` offers what its target can
 //! ([`crate::host::OFFERS`]); [`Io::sim`] offers everything, and [`Io::sim_with`] lets a test
 //! withhold some.
+//!
+//! **Capabilities with no effect yet.** A capability is a type whenever it is authority; its
+//! real provider exists only where a blaze-core effect supports it. The terminal, the
+//! keychain, trust anchors, the locale, the user, other processes, executable memory, windows,
+//! automation, the opener, power, sound, the devices, and requests and streams made by the
+//! host have none, so a native `Io` withholds
+//! them ([`Offers::NATIVE`]) and a simulated one answers them from its
+//! [`SimHost`] ([`Io::script`]). Nothing stands in for a missing provider.
 
 use std::{fmt, sync::Arc, time::Duration};
 
@@ -39,16 +47,32 @@ use blaze_rng::SplitMix64;
 use crate::{
     Plant, Stopped,
     args::Args,
+    audio::Audio,
+    automation::Automation,
     clock::Clock,
+    code::Code,
     cx::Cx,
+    device::{Bluetooth, Camera, Clipboard, Location, Notify, Screen, Serial, Usb},
+    disk::{Disk, DiskCounts},
     env::Env,
     fs::Fs,
     gpu::Gpu,
     host::{Exit, Host, HostFacts},
-    mem::{Mem, TASK_FRAME},
+    hosted::SimHost,
+    keys::Keys,
+    locale::Locale,
+    mem::Mem,
     net::Net,
+    opener::Opener,
+    power::Power,
+    requests::Http,
     rng::Rng,
+    roots::Roots,
+    streams::Streams,
+    term::Term,
     trace::{Record, RecordKind, Trace},
+    user::User,
+    window::Window,
 };
 
 /// The most polls in a row that bring nothing while the deadline has not passed: a driver
@@ -163,6 +187,14 @@ struct World {
     host: HostFacts,
     /// The status the simulated process exited with.
     exited: Option<i32>,
+    /// The simulated host behind the capabilities blaze-core has no effect for: `None` in a
+    /// real world, which has no provider for them.
+    // alloc: once per simulated world.
+    hosted: Option<Box<SimHost>>,
+    /// The simulated disk's ledger ([`crate::disk`]): what was paid, and which names a crash
+    /// may undo. `None` in a real world.
+    // alloc: once per simulated world.
+    disk: Option<Box<Disk>>,
     plant: Plant,
 }
 
@@ -175,36 +207,109 @@ pub struct Io {
     offers: Offers,
 }
 
-/// Which capabilities a host offers: a table fixed when the [`Io`] is made, never discovered
-/// by an op failing halfway through (docs/v2/plan/design/std.md, "When a capability is
-/// missing"). One flag a root accessor of [`Io`].
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Offers {
-    pub fs: bool,
-    pub net: bool,
-    pub env: bool,
-    pub args: bool,
-    pub clock: bool,
-    pub rng: bool,
-    pub mem: bool,
-    pub host: bool,
+/// The table of what a host offers, one flag a root capability, and what is made from it.
+macro_rules! offers {
+    ($($(#[$doc:meta])* $name:ident,)*) => {
+        /// Which capabilities a host offers: a table fixed when the [`Io`] is made, never
+        /// discovered by an op failing halfway through (docs/v2/plan/design/std.md, "When a
+        /// capability is missing"). One flag a root capability; a small `Copy` value.
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+        pub struct Offers {
+            $($(#[$doc])* pub $name: bool,)*
+        }
+
+        impl Offers {
+            /// Every capability.
+            pub const ALL: Offers = Offers { $($name: true,)* };
+
+            /// None: a host that hands its program nothing but its context.
+            pub const NONE: Offers = Offers { $($name: false,)* };
+
+            /// Each capability's name, as its flag is called, in the order of
+            /// [`Offers::bits`].
+            pub const NAMES: &'static [&'static str] = &[$(stringify!($name),)*];
+
+            /// The table as bits, the capability at `at` of [`Offers::NAMES`] being bit `at`.
+            pub fn bits(self) -> u64 {
+                let flags = [$(self.$name,)*];
+                flags.iter().enumerate().fold(0, |bits, (at, on)| bits | (u64::from(*on) << at))
+            }
+
+            /// The table `bits` spell, as [`Offers::bits`] gives them; bits past the last
+            /// capability say nothing.
+            pub fn from_bits(bits: u64) -> Offers {
+                let mut flags = (0..u64::BITS).map(|at| bits & (1 << at) != 0);
+                Offers { $($name: flags.next().unwrap_or(false),)* }
+            }
+
+            /// Whether the capability called `name` is offered; `None` for a name that is no
+            /// capability's.
+            pub fn offers(self, name: &str) -> Option<bool> {
+                match name {
+                    $(stringify!($name) => Some(self.$name),)*
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+offers! {
+    fs,
+    net,
+    env,
+    args,
+    clock,
+    rng,
+    mem,
+    host,
+    /// The terminal as a device ([`Io::term`]).
+    term,
+    /// The keychain ([`Io::keys`]).
+    keys,
+    /// The machine's trust anchors ([`Io::roots`]).
+    roots,
+    locale,
+    user,
+    /// Other processes ([`crate::host::Host::procs`]).
+    procs,
+    /// Executable memory and native modules ([`Io::code`]).
+    code,
+    windows,
+    automation,
+    opener,
+    power,
+    /// Sound, and playing it ([`Io::audio`]).
+    audio,
+    /// Recording sound ([`crate::audio::Audio::input`]).
+    audio_in,
+    camera,
+    screen,
+    location,
+    bluetooth,
+    usb,
+    serial,
+    clipboard,
+    notify,
+    /// Requests the host makes for the program ([`Io::http`]).
+    http,
+    /// Streams the host carries for the program ([`Io::streams`]).
+    streams,
 }
 
 impl Offers {
-    /// Every capability.
-    pub const ALL: Offers =
-        Offers { fs: true, net: true, env: true, args: true, clock: true, rng: true, mem: true, host: true };
-
-    /// None: a host that hands its program nothing but its context.
-    pub const NONE: Offers = Offers {
-        fs: false,
-        net: false,
-        env: false,
-        args: false,
-        clock: false,
-        rng: false,
-        mem: false,
-        host: false,
+    /// What a native world can offer today: the capabilities blaze-core has effects for. The
+    /// rest (see the module's doc) have a simulated provider only.
+    pub const NATIVE: Offers = Offers {
+        fs: true,
+        net: true,
+        env: true,
+        args: true,
+        clock: true,
+        rng: true,
+        mem: true,
+        host: true,
+        ..Offers::NONE
     };
 }
 
@@ -281,6 +386,8 @@ struct Start {
     args: Vec<String>,
     host: HostFacts,
     offers: Offers,
+    hosted: Option<Box<SimHost>>,
+    disk: Option<Box<Disk>>,
     plant: Plant,
 }
 
@@ -327,6 +434,10 @@ impl Io {
             args: world.args,
             host: world.host,
             offers: world.offers,
+            // alloc: once per simulated world, its host.
+            hosted: Some(Box::new(SimHost::new())),
+            // alloc: once per simulated world, its disk's ledger.
+            disk: Some(Box::new(Disk::new(world.seed))),
             plant,
         })
     }
@@ -351,12 +462,14 @@ impl Io {
             args: world.args,
             host: HostFacts { pid: std::process::id(), cores, name: world.host_name },
             offers: crate::host::OFFERS,
+            hosted: None,
+            disk: None,
             plant: Plant::None,
         }))
     }
 
     fn over(start: Start) -> Io {
-        let Start { driver, seed, env, args, host, offers, plant } = start;
+        let Start { driver, seed, env, args, host, offers, hosted, disk, plant } = start;
         let world = World {
             driver,
             next: 0,
@@ -375,6 +488,8 @@ impl Io {
             trace: Trace::new(),
             host,
             exited: None,
+            hosted,
+            disk,
             plant,
         };
         Io {
@@ -388,11 +503,13 @@ impl Io {
         }
     }
 
-    /// The root context: named `main`, never cancelled, with a frame of its own, ending
-    /// `budget` from now on the driver's clock. Every wait under it ends by then.
-    pub fn cx(&self, budget: Duration) -> Result<Cx, Stopped> {
-        let frame = Frame::with_reserve(TASK_FRAME, blaze_mem::Tag::Frames)
-            .map_err(|_| Stopped::OutOfMemory { arena: "main's frame", asked: TASK_FRAME })?;
+    /// The root context: named `main`, never cancelled, ending `budget` from now on the
+    /// driver's clock, with a frame of its own that hands out at most `scratch` bytes
+    /// ([`crate::mem::TASK_FRAME`] is the usual value; it is named at the call, never
+    /// assumed). Every wait under it ends by `budget`.
+    pub fn cx(&self, budget: Duration, scratch: usize) -> Result<Cx, Stopped> {
+        let frame = Frame::with_reserve(scratch, blaze_mem::Tag::Frames)
+            .map_err(|_| Stopped::OutOfMemory { arena: "main's frame", asked: scratch })?;
         Ok(Cx::root(Deadline::after(self.now(), budget), frame, self.clone()))
     }
 
@@ -402,7 +519,7 @@ impl Io {
     }
 
     /// Whether the host offers the capability `of` picks from the table.
-    fn offered(&self, of: fn(&Offers) -> bool) -> bool {
+    pub(crate) fn offered(&self, of: fn(&Offers) -> bool) -> bool {
         of(&self.offers) || self.plant() == Plant::OffersIgnored
     }
 
@@ -488,6 +605,220 @@ impl Io {
         Gpu::offered(native)
     }
 
+    /// The terminal as a device, if the host offers one (the simulation does).
+    pub fn term(&self) -> Option<Term> {
+        self.offered(|it| it.term).then(|| Term::new(self.clone()))
+    }
+
+    pub fn need_term(&self) -> Result<Term, Missing> {
+        self.term().ok_or(Missing { capability: "term" })
+    }
+
+    /// The keychain, if the host offers one (the simulation does).
+    pub fn keys(&self) -> Option<Keys> {
+        self.offered(|it| it.keys).then(|| Keys::new(self.clone()))
+    }
+
+    pub fn need_keys(&self) -> Result<Keys, Missing> {
+        self.keys().ok_or(Missing { capability: "keys" })
+    }
+
+    /// The machine's trust anchors, if the host offers them (the simulation does); narrow
+    /// them with [`Roots::only`]. [`Roots::none`] needs no host.
+    pub fn roots(&self) -> Option<Roots> {
+        if !self.offered(|it| it.roots) {
+            return None;
+        }
+        // clone: the anchors handed out, refcounts; alloc: once per call, their list.
+        let anchors: Arc<[crate::roots::Anchor]> = self.script(|host| host.roots.iter().cloned().collect())?;
+        Some(Roots::new(anchors, self.plant()))
+    }
+
+    pub fn need_roots(&self) -> Result<Roots, Missing> {
+        self.roots().ok_or(Missing { capability: "roots" })
+    }
+
+    /// The machine's locale, as data, if the host offers it (the simulation does).
+    pub fn locale(&self) -> Option<Locale> {
+        if !self.offered(|it| it.locale) {
+            return None;
+        }
+        // clone: the locale handed out, plain data.
+        self.script(|host| host.locale.clone())
+    }
+
+    pub fn need_locale(&self) -> Result<Locale, Missing> {
+        self.locale().ok_or(Missing { capability: "locale" })
+    }
+
+    /// Who is running, if the host says (the simulation does).
+    pub fn user(&self) -> Option<User> {
+        if !self.offered(|it| it.user) {
+            return None;
+        }
+        // clone: the user's facts handed out, plain data.
+        let facts = self.script(|host| host.user.clone())?;
+        Some(User::new(self.clone(), facts))
+    }
+
+    pub fn need_user(&self) -> Result<User, Missing> {
+        self.user().ok_or(Missing { capability: "user" })
+    }
+
+    /// Making memory executable and loading native code, if the host offers it (the simulation does).
+    pub fn code(&self) -> Option<Code> {
+        self.offered(|it| it.code).then(|| Code::new(self.clone()))
+    }
+
+    pub fn need_code(&self) -> Result<Code, Missing> {
+        self.code().ok_or(Missing { capability: "code" })
+    }
+
+    /// The program's windows, if the host offers them (the simulation does).
+    pub fn windows(&self) -> Option<Window> {
+        self.offered(|it| it.windows).then(|| Window::new(self.clone()))
+    }
+
+    pub fn need_windows(&self) -> Result<Window, Missing> {
+        self.windows().ok_or(Missing { capability: "windows" })
+    }
+
+    /// Driving other applications, if the host offers it (the simulation does).
+    pub fn automation(&self) -> Option<Automation> {
+        self.offered(|it| it.automation).then(|| Automation::new(self.clone()))
+    }
+
+    pub fn need_automation(&self) -> Result<Automation, Missing> {
+        self.automation().ok_or(Missing { capability: "automation" })
+    }
+
+    /// The user's default applications, if the host offers them (the simulation does).
+    pub fn opener(&self) -> Option<Opener> {
+        self.offered(|it| it.opener).then(|| Opener::new(self.clone()))
+    }
+
+    pub fn need_opener(&self) -> Result<Opener, Missing> {
+        self.opener().ok_or(Missing { capability: "opener" })
+    }
+
+    /// The machine's power, if the host offers it (the simulation does).
+    pub fn power(&self) -> Option<Power> {
+        self.offered(|it| it.power).then(|| Power::new(self.clone()))
+    }
+
+    pub fn need_power(&self) -> Result<Power, Missing> {
+        self.power().ok_or(Missing { capability: "power" })
+    }
+
+    /// Sound, if the host offers it (the simulation does): playing, and recording where that is offered too.
+    pub fn audio(&self) -> Option<Audio> {
+        self.offered(|it| it.audio).then(|| Audio::new(self.clone()))
+    }
+
+    pub fn need_audio(&self) -> Result<Audio, Missing> {
+        self.audio().ok_or(Missing { capability: "audio" })
+    }
+
+    /// Cameras, if the host offers them (the simulation does).
+    pub fn camera(&self) -> Option<Camera> {
+        self.offered(|it| it.camera).then(|| Camera::new(self.clone()))
+    }
+
+    pub fn need_camera(&self) -> Result<Camera, Missing> {
+        self.camera().ok_or(Missing { capability: "camera" })
+    }
+
+    /// The screen's contents, if the host offers them (the simulation does).
+    pub fn screen(&self) -> Option<Screen> {
+        self.offered(|it| it.screen).then(|| Screen::new(self.clone()))
+    }
+
+    pub fn need_screen(&self) -> Result<Screen, Missing> {
+        self.screen().ok_or(Missing { capability: "screen" })
+    }
+
+    /// Where the machine is, if the host says (the simulation does).
+    pub fn location(&self) -> Option<Location> {
+        self.offered(|it| it.location).then(|| Location::new(self.clone()))
+    }
+
+    pub fn need_location(&self) -> Result<Location, Missing> {
+        self.location().ok_or(Missing { capability: "location" })
+    }
+
+    /// Bluetooth, if the host offers it (the simulation does).
+    pub fn bluetooth(&self) -> Option<Bluetooth> {
+        self.offered(|it| it.bluetooth).then(|| Bluetooth::new(self.clone()))
+    }
+
+    pub fn need_bluetooth(&self) -> Result<Bluetooth, Missing> {
+        self.bluetooth().ok_or(Missing { capability: "bluetooth" })
+    }
+
+    /// USB devices, if the host offers them (the simulation does).
+    pub fn usb(&self) -> Option<Usb> {
+        self.offered(|it| it.usb).then(|| Usb::new(self.clone()))
+    }
+
+    pub fn need_usb(&self) -> Result<Usb, Missing> {
+        self.usb().ok_or(Missing { capability: "usb" })
+    }
+
+    /// Serial ports, if the host offers them (the simulation does).
+    pub fn serial(&self) -> Option<Serial> {
+        self.offered(|it| it.serial).then(|| Serial::new(self.clone()))
+    }
+
+    pub fn need_serial(&self) -> Result<Serial, Missing> {
+        self.serial().ok_or(Missing { capability: "serial" })
+    }
+
+    /// The clipboard, if the host offers it (the simulation does).
+    pub fn clipboard(&self) -> Option<Clipboard> {
+        self.offered(|it| it.clipboard).then(|| Clipboard::new(self.clone()))
+    }
+
+    pub fn need_clipboard(&self) -> Result<Clipboard, Missing> {
+        self.clipboard().ok_or(Missing { capability: "clipboard" })
+    }
+
+    /// Notifications, if the host offers them (the simulation does).
+    pub fn notify(&self) -> Option<Notify> {
+        self.offered(|it| it.notify).then(|| Notify::new(self.clone()))
+    }
+
+    pub fn need_notify(&self) -> Result<Notify, Missing> {
+        self.notify().ok_or(Missing { capability: "notify" })
+    }
+
+    /// Requests the host makes for the program, if it offers that (a wasm worker's `fetch`;
+    /// today the simulation's routes alone). A program that has a `Net` makes its own with
+    /// [`Http::over`].
+    pub fn http(&self) -> Option<Http> {
+        self.offered(|it| it.http).then(|| Http::host(self.clone()))
+    }
+
+    pub fn need_http(&self) -> Result<Http, Missing> {
+        self.http().ok_or(Missing { capability: "http" })
+    }
+
+    /// Streams the host carries for the program, if it offers that (a browser's WebTransport;
+    /// today the simulation's alone).
+    pub fn streams(&self) -> Option<Streams> {
+        self.offered(|it| it.streams).then(|| Streams::host(self.clone()))
+    }
+
+    pub fn need_streams(&self) -> Result<Streams, Missing> {
+        self.streams().ok_or(Missing { capability: "streams" })
+    }
+
+    /// `f` on the simulated host, for a test to script what its devices will say and read
+    /// what was done to them, and for the capabilities it answers; `None` in a real world,
+    /// which has no provider for them.
+    pub fn script<R>(&self, f: impl FnOnce(&mut SimHost) -> R) -> Option<R> {
+        self.world.lock().hosted.as_deref_mut().map(f)
+    }
+
     /// `f` on the simulation, for a test to change the world (advance the clock, fail syncs,
     /// hold a lock); `None` on a real driver.
     pub fn with_sim<R>(&self, f: impl FnOnce(&mut Sim) -> R) -> Option<R> {
@@ -495,12 +826,17 @@ impl Io {
     }
 
     /// The simulated machine loses power ([`Sim::crash`]): every effect in flight is gone,
-    /// and with it what this `Io` kept for their waiters. `false` on a real driver.
+    /// and with it what this `Io` kept for their waiters; each file keeps what was flushed
+    /// and a prefix of what was not, and the name changes no name sync covered are kept as a
+    /// prefix too, the rest undone ([`crate::disk`]). `false` on a real driver.
     pub fn crash(&self) -> bool {
         let mut world = self.world.lock();
-        let World { driver, got, abandoned, polled, effects, .. } = &mut *world;
+        let World { driver, got, abandoned, polled, effects, disk, .. } = &mut *world;
         let Some(sim) = driver.sim() else { return false };
         sim.crash();
+        if let Some(disk) = disk {
+            disk.crashed(sim);
+        }
         got.clear();
         abandoned.clear();
         polled.clear();
@@ -587,10 +923,52 @@ impl Io {
         if world.record {
             touch(&mut world.touched, &effect);
         }
-        let World { driver, effects, .. } = &mut *world;
+        let World { driver, effects, disk, .. } = &mut *world;
+        if let (Some(disk), Some(sim)) = (disk.as_deref_mut(), driver.sim()) {
+            disk.submitted(sim, &effect);
+        }
         effects.push(effect);
         driver.submit(effects);
         tag
+    }
+
+    /// A number no other call of this world was given: a tag's, taken for a name made beside
+    /// another (a publish's temporary file).
+    pub(crate) fn fresh(&self) -> u64 {
+        let mut world = self.world.lock();
+        let fresh = world.next;
+        world.next += 1;
+        fresh
+    }
+
+    /// What the simulated disk was asked to do so far ([`DiskCounts`]): bytes written and
+    /// read, flushes, waits for the device, clones and the bytes they forced out. `None` on a
+    /// real driver, which keeps no ledger.
+    pub fn disk(&self) -> Option<DiskCounts> {
+        self.world.lock().disk.as_deref().map(Disk::counts)
+    }
+
+    /// A caller waited for the device (a flush it did not return before): counted.
+    pub(crate) fn waited_for_device(&self) {
+        if let Some(disk) = self.world.lock().disk.as_deref_mut() {
+            disk.waited();
+        }
+    }
+
+    /// The names of the directory `dir` made durable, waited for: `true` once the simulated
+    /// disk has synced them. `false` on a real driver: blaze-core has no effect that syncs a
+    /// directory (its rename syncs its own), so nothing was done and the caller decides
+    /// whether that is a refusal. A `cx` that stopped already asks nothing.
+    pub(crate) fn sync_names(&self, cx: &Cx, dir: &str) -> Result<bool, Stopped> {
+        cx.stopped_by(self.now())?;
+        match self.world.lock().disk.as_deref_mut() {
+            Some(disk) => {
+                disk.sync_names(dir);
+                disk.waited();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// How many effects the driver holds that have not completed: a test's view of whether
@@ -646,9 +1024,12 @@ impl Io {
     /// step of [`Cx::wait`], the one wait.
     pub(crate) fn poll(&self, until: Deadline) -> usize {
         let mut world = self.world.lock();
-        let World { driver, polled, got, abandoned, .. } = &mut *world;
+        let World { driver, polled, got, abandoned, disk, .. } = &mut *world;
         let moved = driver.poll(polled, until);
         for completion in polled.drain(..) {
+            if let Some(disk) = disk.as_deref_mut() {
+                disk.completed(&completion);
+            }
             keep(got, abandoned, completion);
         }
         if moved == 0 {
@@ -684,12 +1065,12 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
         | Effect::ReadLink { file, .. }
         | Effect::Stat { file, .. }
         | Effect::Lstat { file, .. }
-        | Effect::ReadInto { file, .. }
         | Effect::Map { file, .. } => named(file, false),
         Effect::Append { file, .. }
         | Effect::Sync { file, .. }
         | Effect::Truncate { file, .. }
         | Effect::Write { file, .. }
+        | Effect::WriteUnsynced { file, .. }
         | Effect::WriteAt { file, .. }
         | Effect::WriteFrom { file, .. }
         | Effect::Mode { file, .. }
@@ -697,12 +1078,15 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
         | Effect::Times { file, .. }
         | Effect::Remove { file, .. }
         | Effect::Lock { file, .. } => named(file, true),
-        Effect::Rename { from, to, .. } | Effect::Clone { from, to, .. } | Effect::Link { from, to, .. } => {
+        Effect::Rename { from, to, .. }
+        | Effect::RenameUnsynced { from, to, .. }
+        | Effect::Clone { from, to, .. }
+        | Effect::Link { from, to, .. } => {
             named(from, true);
             named(to, true);
         }
         Effect::List { dir, .. } | Effect::Entries { dir, .. } | Effect::Watch { dir, .. } => named(dir, false),
-        Effect::Private { dir, .. } => named(dir, true),
+        Effect::Private { dir, .. } | Effect::MakeDir { dir, .. } | Effect::RemoveDir { dir, .. } => named(dir, true),
         Effect::Journal { dir, .. } => named(dir, false),
         Effect::Unlock { .. }
         | Effect::Unwatch { .. }
@@ -717,7 +1101,17 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
         | Effect::Recv { .. }
         | Effect::Send { .. }
         | Effect::Hangup { .. }
-        | Effect::Pressure { .. } => {}
+        | Effect::Pressure { .. }
+        // The host effects name no file: a socket, a standard stream, the clock, the
+        // system's random source.
+        | Effect::Bind { .. }
+        | Effect::SendTo { .. }
+        | Effect::RecvFrom { .. }
+        | Effect::Unbind { .. }
+        | Effect::ReadStdin { .. }
+        | Effect::WriteOut { .. }
+        | Effect::Now { .. }
+        | Effect::Random { .. } => {}
     }
 }
 

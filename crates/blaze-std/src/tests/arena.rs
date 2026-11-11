@@ -50,6 +50,10 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     Ok(())
 }
 
+/// The invariant: an arena never hands out more than its limit. Whatever appends are made to
+/// bytes in a named arena, its use stays within its limit, an append past it is
+/// `Stopped::OutOfMemory` naming the arena and changes nothing, and the bytes are exactly the
+/// appends that were taken.
 #[hegel::test(test_cases = 200)]
 fn an_arena_never_hands_out_more_than_its_limit(tc: TestCase) {
     check(plan(&mut Drawn(&tc)), run);

@@ -758,7 +758,8 @@ where
                     | SolverTraitLangItem::ReflectEnum
                     | SolverTraitLangItem::ReflectField
                     | SolverTraitLangItem::ReflectVariant
-                    | SolverTraitLangItem::ReflectFnItem),
+                    | SolverTraitLangItem::ReflectFnItem
+                    | SolverTraitLangItem::ReflectMemoPoint),
                 ) => G::consider_builtin_reflect_candidate(self, goal, item),
                 Some(SolverTraitLangItem::ErrorUnionFrom) => {
                     G::consider_builtin_error_union_from_candidate(self, goal)

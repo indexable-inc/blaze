@@ -22,12 +22,14 @@ use std::{fmt, net::SocketAddr, sync::Arc};
 use blaze_core::{Address, Done, Effect, Tag};
 
 use crate::{
-    Stopped,
+    Plant, Stopped,
+    budget::{Budget, Over},
     cx::Cx,
     io::{Ends, Io},
     mem::Bytes,
     path::Path,
     pending::{self, Pending},
+    resolver::Resolver,
 };
 
 /// Where to connect or listen.
@@ -322,7 +324,7 @@ macro_rules! host {
 
 /// Which addresses a [`Net`] may reach one way.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: a refcount or a copy
-enum Allowed {
+pub(crate) enum Allowed {
     Any,
     Only(Addr),
     Nothing,
@@ -338,7 +340,7 @@ impl Allowed {
         }
     }
 
-    fn allows(&self, at: &Addr) -> bool {
+    pub(crate) fn allows(&self, at: &Addr) -> bool {
         match self {
             Allowed::Any => true,
             Allowed::Only(only) => only == at,
@@ -359,6 +361,8 @@ pub enum NetOp {
     Close,
     /// [`Conn::finish`].
     Finish,
+    /// [`crate::resolver::Resolver::lookup`].
+    Lookup,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
@@ -367,6 +371,10 @@ pub enum NetKind {
     NotAllowed,
     /// The host is a DNS name, and blaze-core has no effect that looks one up yet.
     NoLookup,
+    /// The name service has no such name.
+    NoSuchName,
+    /// The `Net` it came from has a byte limit ([`Net::limit`]) with no room for it.
+    OverLimit(Over),
     /// [`Listener::close`] took more than [`CLOSE_MOST`] connections made while it closed,
     /// and stopped waiting for the listen's end.
     Unending { accepted: usize },
@@ -397,6 +405,10 @@ impl fmt::Display for NetError {
                 "bstd::net {op:?} to {addr}: its host is a name, and blaze-core has no effect that \
                  looks a name up yet: give its IP address"
             ),
+            NetKind::NoSuchName => write!(f, "bstd::net {op:?} of {addr}: the name service has no such name"),
+            NetKind::OverLimit(over) => {
+                write!(f, "bstd::net {op:?} to {addr}: this Net's byte limit: {over}")
+            }
             NetKind::Unending { accepted } => write!(
                 f,
                 "bstd::net {op:?} to {addr}: {accepted} connections were made while it closed, more \
@@ -413,7 +425,7 @@ impl fmt::Display for NetError {
 
 impl std::error::Error for NetError {}
 
-fn error(op: NetOp, addr: &Addr, kind: NetKind) -> NetError {
+pub(crate) fn error(op: NetOp, addr: &Addr, kind: NetKind) -> NetError {
     // clone: an error's address.
     NetError { op, addr: addr.clone(), kind }
 }
@@ -434,21 +446,55 @@ pub struct Net {
     io: Io,
     connect: Allowed,
     listen: Allowed,
+    /// The bytes its connections may still send and receive, if it has a limit.
+    budget: Option<Arc<Budget>>,
 }
 
 impl Net {
     pub(crate) fn new(io: Io) -> Net {
-        Net { io, connect: Allowed::Any, listen: Allowed::Any }
+        Net { io, connect: Allowed::Any, listen: Allowed::Any, budget: None }
+    }
+
+    /// The world it is in.
+    pub(crate) fn io(&self) -> &Io {
+        &self.io
+    }
+
+    /// Name lookup alone, for the hosts this may connect to: for code that should resolve and
+    /// not connect (docs/v2/plan/design/std.md, "The rest of the set", `Resolver`).
+    pub fn resolver(&self) -> Resolver {
+        // clone: authority held, narrowed: a refcount or a copy.
+        Resolver::new(self.io.clone(), self.connect.clone())
     }
 
     /// Connects only to `at`, of what this connects to, and listens nowhere.
     pub fn connect_only(&self, at: &Addr) -> Net {
-        Net { io: self.io.clone(), connect: self.connect.narrowed(at), listen: Allowed::Nothing }
+        // clone: the budget shared, a refcount.
+        Net { io: self.io.clone(), connect: self.connect.narrowed(at), listen: Allowed::Nothing, budget: self.budget.clone() }
     }
 
     /// Listens only on `at`, of what this listens on, and connects nowhere.
     pub fn listen_only(&self, at: &Addr) -> Net {
-        Net { io: self.io.clone(), connect: Allowed::Nothing, listen: self.listen.narrowed(at) }
+        // clone: the budget shared, a refcount.
+        Net { io: self.io.clone(), connect: Allowed::Nothing, listen: self.listen.narrowed(at), budget: self.budget.clone() }
+    }
+
+    /// The same reach with a byte limit: every connection made from the `Net` this returns,
+    /// and from any narrowed from it, sends and receives at most `bytes` between them, counted
+    /// by bstd. A send or receive with no room left ends in [`NetKind::OverLimit`], and
+    /// nothing of it is sent. A limit set on a `Net` that has one is inside it: both count,
+    /// so it never raises what is left (docs/v2/plan/design/std.md, "Budgets ride the same
+    /// way"). A rate limit is not written yet.
+    pub fn limit(&self, bytes: u64) -> Net {
+        // clone: authority held, narrowed: refcounts or copies.
+        let (connect, listen) = (self.connect.clone(), self.listen.clone());
+        // clone: the budget this one is inside, a refcount.
+        Net { io: self.io.clone(), connect, listen, budget: Some(Budget::new(bytes, self.budget.clone())) }
+    }
+
+    /// The bytes its connections may still send and receive; `None` with no limit.
+    pub fn limit_left(&self) -> Option<u64> {
+        self.budget.as_deref().map(Budget::left)
     }
 
     /// A connection to `at`: finished with [`Conn::finish`].
@@ -463,7 +509,7 @@ impl Net {
             .map_err(|stopped| error(NetOp::Connect, at, NetKind::Stopped(stopped)))?;
         match done {
             // clone: the connection's peer, for its errors.
-            Done::Connected { conn } => Ok(Conn::new(&self.io, conn, at.clone())),
+            Done::Connected { conn } => Ok(Conn::new(&self.io, conn, at.clone(), self.budget.clone())),
             done => Err(unexpected(NetOp::Connect, at, done)),
         }
     }
@@ -478,8 +524,8 @@ impl Net {
         let address = at.reach(NetOp::Listen)?;
         let tag = self.io.submit(|tag| Effect::Listen { at: address, tag });
         let listening = Listening { io: self.io.clone(), tag, open: true };
-        // clone: the listener's address, for its errors.
-        Ok(Listener { listening, at: at.clone() })
+        // clone: the listener's address, for its errors; the budget shared, a refcount.
+        Ok(Listener { listening, at: at.clone(), budget: self.budget.clone() })
     }
 }
 
@@ -494,6 +540,8 @@ pub const CLOSE_MOST: usize = 1024;
 pub struct Listener {
     listening: Listening,
     at: Addr,
+    /// The byte limit of the `Net` it came from, which its connections count against.
+    budget: Option<Arc<Budget>>,
 }
 
 /// A listen's tag and its abandonment path.
@@ -523,7 +571,7 @@ impl Listener {
             .map_err(|stopped| error(NetOp::Accept, &self.at, NetKind::Stopped(stopped)))?;
         match done {
             // clone: the connection's address, for its errors.
-            Done::Accepted { conn } => Ok(Conn::new(&listening.io, conn, self.at.clone())),
+            Done::Accepted { conn } => Ok(Conn::new(&listening.io, conn, self.at.clone(), self.budget.clone())),
             done => {
                 // A failed listen has ended: nothing more comes of its tag.
                 listening.open = false;
@@ -575,6 +623,8 @@ impl Listener {
 pub struct Conn {
     link: Link,
     peer: Addr,
+    /// The byte limit of the `Net` it came from, which its sends and receives count against.
+    budget: Option<Arc<Budget>>,
 }
 
 /// A connection's driver handle and its abandonment path.
@@ -596,8 +646,8 @@ impl Drop for Link {
 }
 
 impl Conn {
-    fn new(io: &Io, conn: blaze_core::Conn, peer: Addr) -> Conn {
-        Conn { link: Link { io: io.clone(), conn, open: true }, peer }
+    fn new(io: &Io, conn: blaze_core::Conn, peer: Addr, budget: Option<Arc<Budget>>) -> Conn {
+        Conn { link: Link { io: io.clone(), conn, open: true }, peer, budget }
     }
 
     pub fn peer(&self) -> &Addr {
@@ -605,45 +655,92 @@ impl Conn {
     }
 
     /// A send of all of `from`, in flight. The bytes are copied as it starts (see
-    /// [`crate::pending`]), and stay lent until it ends.
+    /// [`crate::pending`]), and stay lent until it ends. Under a byte limit ([`Net::limit`])
+    /// the bytes are taken from it before anything is sent; with no room for them the send
+    /// never starts, and its outcome is [`NetKind::OverLimit`].
     pub fn write_from<'buf>(&'buf self, from: &'buf [u8]) -> Pending<'buf, Result<(), NetError>> {
         let conn = self.link.conn;
+        let peer = &self.peer;
+        let asked = from.len() as u64;
+        let over = move |over| error(NetOp::Send, peer, NetKind::OverLimit(over));
+        // The planted bug of the budget tests: the limit is looked at once the bytes are gone.
+        let after = self.link.io.plant() == Plant::BudgetCheckedAfter;
+        let budget = self.budget.as_deref();
+        let short = match budget {
+            Some(budget) if !after => budget.take(asked).err(),
+            _ => None,
+        };
+        if let Some(short) = short {
+            return pending::refused(&self.link.io, "bstd::net write_from", Err(over(short)));
+        }
         // alloc: the effect's bytes, which blaze-core's `Effect` owns.
         let bytes = from.to_vec();
-        let peer = &self.peer;
         let effect = |tag| Effect::Send { conn, bytes, tag };
         pending::start(&self.link.io, "bstd::net write_from", &mut [], effect, move |_: &mut [u8], done| {
             match done {
-                Ok(Done::Sent(_)) => Ok(()),
+                Ok(Done::Sent(_)) => match budget {
+                    Some(budget) if after => budget.take(asked).map_err(over),
+                    _ => Ok(()),
+                },
                 Ok(done) => Err(unexpected(NetOp::Send, peer, done)),
                 Err(stopped) => Err(error(NetOp::Send, peer, NetKind::Stopped(stopped))),
             }
         })
     }
 
-    /// All of `bytes` sent: its [`Conn::write_from`], waited for.
-    pub fn send(&self, cx: &Cx, bytes: &[u8]) -> Result<(), NetError> {
+    /// All of `bytes` sent, or an error: never a part said sent. Its [`Conn::write_from`],
+    /// waited for. The bytes are handed to the driver as one send with nothing kept back or
+    /// joined to another: there is no buffer between a call and the socket.
+    pub fn send_all(&self, cx: &Cx, bytes: &[u8]) -> Result<(), NetError> {
         cx.stopped_by(self.link.io.now())
             .map_err(|stopped| error(NetOp::Send, &self.peer, NetKind::Stopped(stopped)))?;
         self.write_from(bytes).wait(cx)
     }
 
     /// A receive into `into` of the bytes the peer sent since the last receive, at most
-    /// `into.len()`, in flight: its outcome is how many, 0 once the peer has hung up.
+    /// `into.len()`, in flight: its outcome is how many, 0 once the peer has hung up. Under a
+    /// byte limit ([`Net::limit`]) it asks for no more than the limit has left, takes that
+    /// much from it as it starts and gives back what did not come; with nothing left the
+    /// receive never starts, and its outcome is [`NetKind::OverLimit`].
     pub fn read_into<'buf>(&'buf self, into: &'buf mut [u8]) -> Pending<'buf, Result<usize, NetError>> {
         let conn = self.link.conn;
-        let most = into.len();
         let peer = &self.peer;
+        let budget = self.budget.as_deref();
+        let mut most = into.len();
+        if let Some(budget) = budget {
+            most = most.min(usize::try_from(budget.left()).unwrap_or(usize::MAX));
+            let short = match most {
+                0 if !into.is_empty() => Some(budget.over(into.len() as u64)),
+                _ => budget.take(most as u64).err(),
+            };
+            if let Some(short) = short {
+                let over = error(NetOp::Recv, peer, NetKind::OverLimit(short));
+                return pending::refused(&self.link.io, "bstd::net read_into", Err(over));
+            }
+        }
+        // What was taken from the limit and did not come is given back.
+        let unused = move |came: usize| {
+            if let Some(budget) = budget {
+                budget.give_back((most - came) as u64);
+            }
+        };
         // alloc: the effect's buffer, which blaze-core's `Effect` owns.
         let effect = |tag| Effect::Recv { conn, most, into: Vec::new(), tag };
         pending::start(&self.link.io, "bstd::net read_into", into, effect, move |into: &mut [u8], done| {
             match done {
-                Ok(Done::Read(bytes)) if bytes.len() <= into.len() => {
+                Ok(Done::Read(bytes)) if bytes.len() <= most => {
                     into[..bytes.len()].copy_from_slice(&bytes);
+                    unused(bytes.len());
                     Ok(bytes.len())
                 }
-                Ok(done) => Err(unexpected(NetOp::Recv, peer, done)),
-                Err(stopped) => Err(error(NetOp::Recv, peer, NetKind::Stopped(stopped))),
+                Ok(done) => {
+                    unused(0);
+                    Err(unexpected(NetOp::Recv, peer, done))
+                }
+                Err(stopped) => {
+                    unused(0);
+                    Err(error(NetOp::Recv, peer, NetKind::Stopped(stopped)))
+                }
             }
         })
     }
@@ -700,6 +797,6 @@ impl fmt::Debug for Listener {
 
 impl fmt::Debug for Net {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Net(connect {:?}, listen {:?})", self.connect, self.listen)
+        write!(f, "Net(connect {:?}, listen {:?}, limit {:?})", self.connect, self.listen, self.budget)
     }
 }

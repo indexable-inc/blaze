@@ -162,6 +162,9 @@ impl DefMap {
                         // `#![blaze::capabilities]`, from `AttrFlags::CAPABILITIES`
                         // (blaze-lints' `blaze::capabilities`, docs/v2/plan/design/std.md).
                         | "capabilities"
+                        // `#[blaze::memo]`, from `AttrFlags::BLAZE_MEMO`: a memo point of
+                        // `bstd::eval` (`AttrFlags::pure_attr`, `core::reflect::MemoPoint`).
+                        | "memo"
                 )
             {
                 return true;
