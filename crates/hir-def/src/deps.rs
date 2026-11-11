@@ -42,7 +42,7 @@ pub use crate::deps::signatures::{BODY_KEY_DOMAIN, IdKind, PortableId, PortableI
 pub use crate::deps::{
     filed::{checked_reads, closure_expansion_reads, file_by_reads, find_by_reads, outside_reads},
     image::{Held, IMAGE_SCHEMA, ImageBuf, ImageError, ImageRef, Part, PartBytes, write_image},
-    key::{KEY_DOMAIN, KeyInputs, PRODUCER, absolute, eligible, key_inputs, keys},
+    key::{KEY_DOMAIN, KeyInputs, KeyWalk, PRODUCER, absolute, eligible, key_inputs, keys},
     reads::{READS_DOMAIN, Reads, SLOTS, image_key, slot},
     serve::{ImageStore, ReadThrough, Refused, Served, Stored, serve, store},
 };

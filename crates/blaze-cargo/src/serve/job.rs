@@ -1632,6 +1632,10 @@ struct Roots<S: Steps> {
     /// Why what its last build left to settle after its answer was not kept ([`Jobs::lose`]),
     /// until its next build or check takes it as a miss `blaze why` says ([`Job::ended`]).
     lost: Vec<Option<String>>,
+    /// Its last build or check, when that did not end well ([`Unfinished`]): set as the job
+    /// is answered, none again once one ends well. Its next build says it first and takes it
+    /// as a row `blaze why` says ([`Job::ended`]).
+    unfinished: Vec<Option<Unfinished>>,
     /// The files of the view its answer's walk read, held open in the VFS from that walk's
     /// start until its next job walks: what a request on another root is read against
     /// ([`Jobs::edited`]), so the root and its files stay whatever the head moved to.
@@ -1651,6 +1655,7 @@ impl<S: Steps> Roots<S> {
             outputs: Vec::new(), // alloc: none until the first checkout
             answers: Vec::new(), // alloc: none until the first checkout
             lost: Vec::new(),    // alloc: none until the first checkout
+            unfinished: Vec::new(), // alloc: none until the first checkout
             walked: Vec::new(),  // alloc: none until the first checkout
             stills: Vec::new(),  // alloc: none until the first checkout
         }
@@ -1668,6 +1673,7 @@ impl<S: Steps> Roots<S> {
         self.outputs.push(None);
         self.answers.push(Err(Unkept::None));
         self.lost.push(None);
+        self.unfinished.push(None);
         self.walked.push(None);
         self.stills.push(Vec::new()); // alloc: none
         id
@@ -1781,6 +1787,13 @@ struct Build<S: Steps> {
     /// Of a build of only the units a view's front end applies ([`Jobs::next`]): how far it
     /// is, as its nodes settle; none for a build the job ends with.
     applying: Option<Applying>,
+    /// Open from the units' nodes being posted until the first unit not found kept begins
+    /// (or, when every unit is kept, until the build's units end): the stretch in which the
+    /// build does nothing but find its dependencies' units kept, a node a phase of each, in
+    /// dependency order, before the unit an edit changed can start. On ripgrep 2026-11-10
+    /// this stretch of a body edit of `rg::main` was 650 ms that no span named
+    /// (slow-is-p0-traced); the unit tasks inside it are its children by time.
+    made_wait: Option<tracing::Span>,
 }
 
 /// Why the daemon lets go of the front ends it keeps ([`Jobs::let_go`]).
@@ -1915,6 +1928,20 @@ impl<S: Steps> Build<S> {
             (true, None) if last => Verdict::Done,
             (true, None) => return,
         };
+    }
+
+    /// How its units stand, counted from their verdicts ([`Left`]).
+    fn left(&self) -> Left {
+        let mut left = Left { units: self.verdicts.len() as u32, ..Left::default() };
+        for verdict in &self.verdicts {
+            match verdict {
+                Verdict::Done => {}
+                Verdict::Failed { .. } => left.failed += 1,
+                Verdict::Skipped { .. } => left.skipped += 1,
+                Verdict::Unsettled => left.unsettled += 1,
+            }
+        }
+        left
     }
 
     /// What the build left unchecked behind its failures and what it checked against a unit
@@ -2180,6 +2207,16 @@ struct Job<S: Steps> {
     /// as its view opened: a miss of its own when it ends ([`Job::ended`]), so `blaze why`
     /// says the previous build's results were not kept and why.
     lost: Option<String>,
+    /// Its checkout's last build, which did not end well ([`Roots::unfinished`]), taken as its
+    /// view opened and said then: a row of its own when it ends having run anything
+    /// ([`Job::ended`]).
+    after: Option<Unfinished>,
+    /// The checkout it is of, in [`Jobs::roots`], with its root directory, from its view's
+    /// opening; none before, and for an agent's view.
+    checkout: Option<(u32, String)>,
+    /// How its units stood as its plane request ended not ok, for its checkout's next build
+    /// ([`Unfinished::left`]).
+    left: Option<Left>,
 }
 
 /// A job's kept front end being stored ([`Jobs::store_kept`]), by one task of a plane request
@@ -2270,8 +2307,67 @@ pub struct Lost {
 /// How many losses the jobs keep to show ([`Jobs::lost`]): the last ones.
 const LOST_SHOWN: usize = 16;
 
-/// The step a loss is under in `blaze why` ([`blaze_kernel::Miss::step`]).
-const SETTLING_STEP: &str = "results kept after the answer";
+/// A checkout's last build or check, which did not end well ([`Roots::unfinished`]): what its
+/// next one says first and `blaze why` says of it, so the time it spends on what that one left
+/// is never read as a slow build of nothing (2026-11-10: after a failed cold build the next
+/// three builds of an unchanged tree took 56 s, 10 s and 22 s, exited 0 and said nothing).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Unfinished {
+    /// Its number in the history (its plane request); none when it ended before it had one.
+    build: Option<u32>,
+    command: String,
+    /// It was cancelled, not failed.
+    cancelled: bool,
+    /// What became of its units, when it reached them.
+    left: Option<Left>,
+}
+
+/// How a build's units stood as its plane request ended not ok ([`Build::left`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Left {
+    units: u32,
+    failed: u32,
+    /// Skipped behind a failure.
+    skipped: u32,
+    /// Neither built, failed nor skipped: not reached, or not part of the build.
+    unsettled: u32,
+}
+
+impl Unfinished {
+    /// What the next build of `root` says of it: one line, facts only.
+    fn said(&self, root: &str) -> String {
+        let Unfinished { build, command, cancelled, left } = self;
+        let which = match build {
+            Some(build) => format!("build {build}, `{command}`"), // alloc: once a build after one that did not end well
+            None => format!("`{command}`"), // alloc: as above
+        };
+        let how = if *cancelled { "was cancelled" } else { "failed" };
+        let left = match left {
+            Some(Left { units, failed, skipped, unsettled }) if failed + skipped + unsettled > 0 => {
+                // alloc: as above
+                format!(
+                    " with {} of its {units} units not built ({failed} failed, {skipped} skipped \
+                     behind a failure, {unsettled} not reached)",
+                    failed + skipped + unsettled
+                )
+            }
+            _ => String::new(),
+        };
+        // alloc: as above
+        format!(
+            "the last build of {root} ({which}) {how}{left}: this build first does the work that \
+             one left, so its time is not a no-op's"
+        )
+    }
+}
+
+/// The step what a build did after its checkout's last build did not end well is under in
+/// `blaze why` ([`Unfinished`]).
+const UNFINISHED_STEP: &str = super::why::UNFINISHED;
+
+/// The step a loss is under in `blaze why` ([`blaze_kernel::Miss::step`]), and what `blaze
+/// slow` ranks first by.
+const SETTLING_STEP: &str = blaze_profile::slow::NOT_KEPT_STEP;
 
 /// A job's lowering waiting for its root's front end, which is being stored
 /// ([`Jobs::lower`]): posted as the store ends, into the front end it gives back. It has no
@@ -2693,7 +2789,12 @@ impl<S: Steps> Job<S> {
             started_unix_ns: self.opened_unix_ns,
             outcome,
             hits: stats.map(|it| it.cached),
-            misses: stats.map(|it| it.ran),
+            // How many rows of `misses` the build has: counted where they are written, by the
+            // history's thread once it explained them (`observe::keep`), never here. Until
+            // 2026-11-11 this was the plane's count of nodes that ran a task (353 on every
+            // build of ripgrep, a no-op's too, beside 3 rows in `misses`): two things under
+            // one name. The plane's count is the `memo misses` counter and the `task` spans.
+            misses: None,
             joined: stats.map(|it| it.joined),
             tree: None,
             blaze: None,
@@ -2765,6 +2866,34 @@ impl<S: Steps> Job<S> {
         misses.sort_unstable();
         misses.dedup();
         self.missed = misses.len() as u64;
+        // What it ran after its checkout's last build did not end well: a row `blaze why`
+        // says first, so that build's remainder is not read as this one's slowness. Only when
+        // it ran a task (a build the memo settled whole did none of that work). Not counted
+        // in `missed`: it is why the work was there, not a thing computed again, and a build
+        // that computed nothing again may still be kept as its checkout's answer.
+        if let Some(after) = self.after.take()
+            && let Some(ran) = stats.map(|it| it.ran).filter(|ran| *ran > 0)
+        {
+            let root = self.checkout.as_ref().map_or("", |(_, dir)| dir.as_str());
+            misses.push(blaze_kernel::Miss {
+                step: UNFINISHED_STEP,
+                subject: Hasher::new("blaze v2 serve unfinished subject")
+                    .part(root.as_bytes())
+                    .finish(),
+                item: format!("the last build of {root}"), // alloc: once a build after one that did not end well
+                // alloc: as above
+                missed: blaze_kernel::Missed::Always(format!(
+                    "{}; it ran {ran} tasks",
+                    after.said(root)
+                )),
+                key: ContentId::default(),
+                kept: None,
+                parts: Vec::new(), // alloc: none
+                beyond: None,
+                via: None,
+            });
+            misses.sort_unstable();
+        }
         // A build that computed nothing again, and walked though its checkout's kept answer
         // could have been said again: what `blaze why` says of it is the input that moved or
         // that nothing covers ([`noop::NotReplayed::input`]). Not counted in `missed`: it computed
@@ -3042,6 +3171,10 @@ pub struct Jobs<S: Steps> {
     /// The plane requests that ended, as the profile history's rows, for the daemon to hand
     /// to its history.
     pub rows: Vec<Ended>,
+    /// The builds (plane requests, by number) whose answer was said this turn, in the order
+    /// said: the daemon tells its history once the answers are with the driver
+    /// (`Observe::answered`), and only then is a build's profile flushed.
+    pub answered: Vec<u64>,
     /// The plane requests that opened, as their rows of outcome running ([`Job::row`]), for the
     /// daemon to hand to its history at once.
     pub started: Vec<BuildRow>,
@@ -3166,6 +3299,7 @@ impl<S: Steps> Jobs<S> {
             cold: false,
             ended: false,
             rows: Vec::new(),        // alloc: none until a build ends, then reused
+            answered: Vec::new(),    // alloc: none until a build is answered, then reused
             started: Vec::new(),     // alloc: none until a build opens, then reused
             held_leases: Vec::new(), // alloc: none until a stall
             lowering: Vec::new(), // alloc: none until a job lowers while its root's front end is stored
@@ -3275,6 +3409,7 @@ impl<S: Steps> Jobs<S> {
     /// kept for the checkout's next build or check, whose `blaze why` says it ([`Roots::lost`]).
     fn lose(&mut self, job: JobId, command: &str, checkout: Option<&str>, what: String) {
         let of = checkout.unwrap_or("no checkout");
+        // logged: the warn event below, with the job, command and checkout as fields
         eprintln!(
             "blaze serve: the results of `{command}` in {of} (job {job}) were not kept after its answer was sent: {what}"
         );
@@ -3456,6 +3591,9 @@ impl<S: Steps> Jobs<S> {
             placed_any: false,
             walks,
             lost: None,
+            after: None,
+            checkout: None,
+            left: None,
         };
         if self.jobs.put(key_of(id), job).is_err() {
             // alloc: an error the session's free list can't give
@@ -3623,7 +3761,17 @@ impl<S: Steps> Jobs<S> {
             && let Some(at) = root
         {
             job.lost = self.roots.lost[at as usize].take();
+            // And what its last build left by not ending well: said now, the first thing
+            // this build says, before any of that work is done.
+            // clone: once a build after one that did not end well
+            if let Some(after) = self.roots.unfinished[at as usize].clone() {
+                let note = Diagnostic::note(after.said(&root_dir));
+                w.said.push(Said::Report(id, Response::Diagnostic(note)));
+                job.after = Some(after);
+            }
         }
+        // clone: a path, once a view
+        job.checkout = root.map(|at| (at, root_dir.clone()));
         if reuses_plans(&job.work)
             && let Some(at) = root
             && let Some(Some(last)) = self.roots.plans.get(at as usize)
@@ -4050,12 +4198,12 @@ impl<S: Steps> Jobs<S> {
             for (root, &id) in self.roots.ids.iter() {
                 if let Some(front) = self.roots.fronts[id as usize].take() {
                     match why {
-                        LetGo::Short(short) => eprintln!(
+                        LetGo::Short(short) => crate::serve::said::logged!(WARN,
                             "blaze serve: the kept front end of {root} is let go, and its next build lowers anew: \
                              a task waits for {:.2} GiB the process holds besides its tasks",
                             short as f64 / f64::from(1u32 << 30)
                         ),
-                        LetGo::Pressure => eprintln!(
+                        LetGo::Pressure => crate::serve::said::logged!(WARN,
                             "blaze serve: the kept front end of {root} is let go, and its next build lowers anew: \
                              the system says memory is short"
                         ),
@@ -5117,7 +5265,9 @@ impl<S: Steps> Jobs<S> {
     /// where the store is of what its job left to settle ([`Jobs::settling`]); none while the
     /// job still lives. The tickets of what was put go there, to settle after the answer. A
     /// store that failed, or panicked, changes no answer: it is a loss ([`Jobs::lose`]), its
-    /// front end dropped, and the root's next job lowers anew.
+    /// front end dropped, and the root's next job lowers anew. A store that kept everything
+    /// but a record its key does not hold ([`Steps::kept_refusal`]) is a loss said the same
+    /// way, of that record alone: the front end is the root's again.
     fn stored_kept(
         &mut self,
         w: &mut World<'_, S>,
@@ -5129,7 +5279,7 @@ impl<S: Steps> Jobs<S> {
         self.roots.storing[root as usize] -= 1;
         let mut tickets = blaze_cas::Tickets::default();
         let mut lost: Option<String> = match value {
-            Some((front, Ok(puts))) => {
+            Some((mut front, Ok(puts))) => {
                 let mut failed = None;
                 let put = !puts.is_empty();
                 for super::work::KeptPut { put, what } in puts {
@@ -5158,6 +5308,13 @@ impl<S: Steps> Jobs<S> {
                     w.store.flush(w.effects);
                 }
                 if failed.is_none() {
+                    // A record the store would not keep of a build whose every other was
+                    // kept: said as a loss, and the front end stays the root's
+                    // ([`Steps::kept_refusal`]).
+                    failed = front.as_mut().and_then(|it| w.steps.kept_refusal(it)).map(|why| {
+                        // alloc: a loss, once
+                        format!("storing what the build of {checkout} left for the store: {why}")
+                    });
                     self.roots.fronts[root as usize] = front;
                 }
                 failed
@@ -5563,6 +5720,12 @@ impl<S: Steps> Jobs<S> {
             fresh: fresh_units,
             verdicts,
             applying: applying.then_some(Applying { left: count, failed: false }),
+            made_wait: (count > 0).then(|| {
+                tracing::info_span!(
+                    target: "blaze",
+                    "the build's first made unit waits behind the units found kept"
+                )
+            }),
         }));
         if count > 0 {
             self.add(w, id, nodes, Some(work), true);
@@ -5628,6 +5791,9 @@ impl<S: Steps> Jobs<S> {
         let fresh = build.is_fresh(at);
         if fresh {
             build.writer.found_kept(at);
+        } else {
+            // The first unit this build makes begins: the wait behind the kept ones is over.
+            build.made_wait = None;
         }
         match fresh {
             true => job.fresh += 1,
@@ -5984,6 +6150,13 @@ impl<S: Steps> Jobs<S> {
                 }
                 continue;
             }
+            // A file this compile linked is placed from the bytes it made, whatever the path
+            // holds: no file of the store is read, cloned or waited for, so the answer is
+            // held by no clone and no write-back (docs/v2/plan/design/clone-out.md).
+            if let Some(made) = output.made {
+                self.place_made(w, id, path, output.key, output.executable, &made);
+                continue;
+            }
             let placed = self.paths.placed[path as usize].as_ref().is_some_and(|it| {
                 it.key == output.key && it.executable == output.executable && it.meta.is_some()
             });
@@ -6053,6 +6226,45 @@ impl<S: Steps> Jobs<S> {
                 job.over.get_or_insert((false, Some(error)));
             }
         }
+    }
+
+    /// `made`, the file of `key` that job `id`'s compile just linked, placed at path `path`
+    /// from those bytes (`blaze_cas::Store::place_made`): its runs written into a file of
+    /// holes beside the path and renamed onto it. The whole file the store kept to clone the
+    /// path's last value from goes, and none is made of this one.
+    fn place_made(
+        &mut self,
+        w: &mut World<'_, S>,
+        id: JobId,
+        path: u32,
+        key: blaze_cas::Key,
+        executable: bool,
+        made: &blaze_cas::Sparse,
+    ) {
+        if let Some(before) = self.paths.placed[path as usize].take()
+            && before.key != key
+        {
+            w.store.unplace_made(&before.key, w.effects);
+        }
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        job.placed_any = true;
+        // clone: the store's effect owns the file's name, once per placement
+        let Some(file) = self.paths.files[path as usize].clone() else {
+            let name = self.paths.names[path as usize].to_string(); // alloc: an error, once
+            // alloc: an error, once
+            job.over.get_or_insert((
+                false,
+                Some(ApiError::new(
+                    format!("{name} is no path an output can be placed at"),
+                    Some(name),
+                )),
+            ));
+            return;
+        };
+        // clone: the runs, which the path's writes own (an effect owns its bytes); once per path
+        let tag = w.store.place_made(file, made.clone(), w.effects);
+        self.placing.insert(tag, Placing { job: id, path, key, executable });
+        self.begin_placing(id, path);
     }
 
     /// An effect of job `id` at path `path` asked: the file is not all there until it ends.
@@ -6350,6 +6562,12 @@ impl<S: Steps> Jobs<S> {
             (false, true) => profile_history::Outcome::Ok,
             (false, false) => profile_history::Outcome::Failed,
         };
+        // How its units stand, for its checkout's next build to say ([`Unfinished`]).
+        if outcome != profile_history::Outcome::Ok
+            && let Stage::Units(build) = &job.stage
+        {
+            job.left = Some(build.left());
+        }
         // A build whose front end is kept has its run log named by the task that stores the
         // front end, after the answer ([`Steps::kept_run_log`]); any other's is named here,
         // before its front end goes. A documentation's front end is not kept.
@@ -6367,7 +6585,7 @@ impl<S: Steps> Jobs<S> {
         #[cfg(test)]
         ENDED_LOST.with_borrow_mut(|it| {
             // alloc: a test's record
-            it.extend(ended.misses.iter().filter(|miss| miss.step == SETTLING_STEP).filter_map(
+            it.extend(ended.misses.iter().filter(|miss| miss.step == SETTLING_STEP || miss.step == UNFINISHED_STEP).filter_map(
                 |miss| match &miss.missed {
                     blaze_kernel::Missed::Always(why) => Some(why.clone()),
                     _ => None,
@@ -6903,6 +7121,7 @@ impl<S: Steps> Jobs<S> {
             if let Some(request) = job.request {
                 let stats = w.plane.stats(request);
                 self.rows.push(job.ended(request, stats, profile_history::Outcome::Stalled, true));
+                self.answered.push(u64::from(request.0));
                 job.cancelled.store(true, Ordering::Release);
                 if w.plane.is_open(request) {
                     w.plane.cancel(w.now, request);
@@ -7182,18 +7401,14 @@ impl<S: Steps> Jobs<S> {
             };
             if let Some(what) = held {
                 if job.held_wait.as_ref().is_none_or(|(_, was)| *was != what) {
-                    // `function` is the field of an ad hoc span the profile keeps as what a
-                    // wait awaits (`blaze_profile::span`'s generic columns: `crate`,
-                    // `function`, `unit`); a field named `awaits` reaches no column, which is
-                    // why this span's reason came out empty.
+                    // `function` and `awaits` are fields of an ad hoc span the profile keeps
+                    // (`blaze_profile::span::ad_hoc_fields`); `what`, `placing` and `runs`
+                    // had no column and are not given (`blaze::span_field_unrecorded`).
                     let span = tracing::info_span!(
                         target: "blaze",
                         "the job's answer waits for what it still does",
                         function = what,
                         awaits = what,
-                        what,
-                        placing = job.placing,
-                        runs = job.runs,
                     );
                     job.held_wait = Some((span, what));
                 }
@@ -7290,6 +7505,25 @@ impl<S: Steps> Jobs<S> {
             self.batches.remove(id);
             self.order.retain(|it| *it != id);
             self.ended = true;
+            // Its checkout's next build says a build or check that did not end well, and
+            // forgets it once one does.
+            if matches!(job.work, Work::Build(_) | Work::Check(_))
+                && let Some((root, _)) = &job.checkout
+            {
+                self.roots.unfinished[*root as usize] = match ok {
+                    true => None,
+                    false => Some(Unfinished {
+                        build: job.request.map(|it| it.0),
+                        command: command_line(&job.work),
+                        cancelled: job.cancelled.load(Ordering::Acquire),
+                        left: job.left,
+                    }),
+                };
+            }
+            // Its profile is flushed from here on, never before ([`Jobs::answered`]).
+            if let Some(request) = job.request {
+                self.answered.push(u64::from(request.0));
+            }
             w.said.push(Said::Finish(id, ok, error, job.built));
         }
         // What answered jobs left to settle: each waits for the store's commit of its tickets,

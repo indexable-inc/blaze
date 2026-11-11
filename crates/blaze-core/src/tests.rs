@@ -101,6 +101,20 @@ fn script(driver: &mut impl Driver) -> BTreeMap<u64, String> {
             21 => Effect::WriteAt { file: name("missing"), at: 0, bytes: vec![1], tag: Tag(22) },
             22 => Effect::Rename { from: name("missing"), to: name("out/m"), tag: Tag(23) },
             23 => Effect::List { dir: name("missing"), tag: Tag(24) },
+            // The effects whose calls are blaze-sys's on Linux (`fs/linux.rs`): a cut, a read
+            // of a range that runs past the end, a sync, and an append after them. (A ranged
+            // read of a file that is not there is not in the script: the simulation reads it
+            // as empty and the native drivers fail it, a difference this lane found and left.)
+            24 => Effect::Truncate { file: name("store/a/moved"), len: 3, tag: Tag(25) },
+            25 => Effect::Read { file: name("store/a/moved"), at: 1, len: 10, tag: Tag(26) },
+            26 => Effect::Sync { file: name("store/a/moved"), tag: Tag(27) },
+            27 => Effect::Append { file: name("store/a/moved"), bytes: b"!".to_vec(), tag: Tag(28) },
+            28 => Effect::ReadAll { file: name("store/a/moved"), tag: Tag(29) },
+            // A write-back of a file that is there and of one that is not, and a directory's
+            // names synced.
+            29 => Effect::WriteBack { file: name("store/a/moved"), tag: Tag(30) },
+            30 => Effect::WriteBack { file: name("missing"), tag: Tag(31) },
+            31 => Effect::SyncDir { dir: name("store/a"), tag: Tag(32) },
             _ => return,
         };
         effects.push(next);
@@ -139,6 +153,13 @@ fn every_driver_ends_the_script_the_same() {
         (&simulated[&22][..], &simulated[&23][..], &simulated[&24][..]),
         ("failed", "failed", "failed")
     );
+    assert_eq!(simulated[&25], format!("{:?}", Done::Truncated));
+    assert_eq!(simulated[&26], format!("{:?}", Done::Read(b"ga".to_vec())));
+    assert_eq!(simulated[&27], format!("{:?}", Done::Synced));
+    assert_eq!(simulated[&29], format!("{:?}", Done::Read(b"aga!".to_vec())));
+    assert_eq!(simulated[&30], format!("{:?}", Done::WrittenBack));
+    assert_eq!(simulated[&31], "failed");
+    assert_eq!(simulated[&32], format!("{:?}", Done::Synced));
     #[cfg(target_os = "linux")]
     {
         let root = dir("uring");
@@ -439,6 +460,28 @@ fn a_lock_excludes_another_until_it_is_let_go_of() {
     assert_eq!(locks(&mut Sim::new(1, Faults::default())), want, "simulated");
     assert_eq!(locks(&mut Threads::new(&dir("locks-threads"), 1)), want, "threads");
     assert_eq!(locks(&mut crate::native(&dir("locks-native"), 1).unwrap()), want, "native");
+}
+
+/// A lock let go of is free at once though another descriptor of its open file is still open,
+/// as a child's is between this process's fork and the child's exec: the unlock lets the lock
+/// go, not the close. (Closing alone left the lock standing until the child's exec, so a test
+/// that spawned beside `a_lock_excludes_another_until_it_is_let_go_of` made its second take
+/// contend.)
+#[cfg(unix)]
+#[test]
+fn a_lock_let_go_of_is_free_though_a_copy_of_its_descriptor_is_open() {
+    let root = dir("locks-copied");
+    let file = name("history/lock");
+    let mut locks = crate::locks::Locks::new();
+    let taken = locks.lock(&root, &file, crate::LockMode::Exclusive, Tag(1)).unwrap();
+    assert_eq!(taken, Done::Locked);
+    // What a fork gives the child: a second descriptor of the same open file.
+    let copy = locks.copy_of(Tag(1)).expect("the lock's file is copied");
+    assert_eq!(locks.unlock(Tag(1)).unwrap(), Done::Unlocked);
+    let again = locks.lock(&root, &file, crate::LockMode::Exclusive, Tag(2)).unwrap();
+    assert_eq!(again, Done::Locked, "the lock is free while the copy is open");
+    drop(copy);
+    assert_eq!(locks.unlock(Tag(2)).unwrap(), Done::Unlocked);
 }
 
 /// A time with nanoseconds below the second, and a whole number of NTFS's 100 ns, so every
@@ -1458,4 +1501,185 @@ fn a_file_name_cloned_into_effects_allocates_nothing() {
     let copy = file.clone();
     assert_eq!(copy, file);
     assert_eq!(copy.as_str().as_ptr(), file.as_str().as_ptr(), "one name, shared");
+}
+
+/// The host's effects on `driver`, what became of each by its tag: two UDP sockets on
+/// loopback, one sending the other a datagram, both unbound; the wall clock (the system's
+/// where `real`, else a simulation's start after 2020); random bytes, and a draw too long;
+/// a directory made twice and removed twice, and one whose parent is not there; an empty write
+/// of the standard error and a read of none of the standard input, which end at once.
+fn host(driver: &mut impl Driver, real: bool) -> BTreeMap<u64, String> {
+    let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let made = || name("made");
+    let mut effects = vec![
+        Effect::Bind { at: loopback, tag: Tag(1) },
+        Effect::Bind { at: loopback, tag: Tag(2) },
+        Effect::Now { tag: Tag(7) },
+        Effect::Random { len: 32, tag: Tag(8) },
+        Effect::Random { len: crate::RANDOM_MOST + 1, tag: Tag(9) },
+        Effect::MakeDir { dir: made(), tag: Tag(10) },
+        Effect::WriteOut { stream: crate::Stream::Stderr, bytes: Vec::new(), tag: Tag(15) },
+        Effect::ReadStdin { most: 0, into: Vec::new(), tag: Tag(16) },
+    ];
+    let mut bound: [Option<(crate::Dgram, std::net::SocketAddr)>; 2] = [None, None];
+    let mut seen = BTreeMap::new();
+    let mut out = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        driver.submit(&mut effects);
+        if driver.in_flight() == 0 || Instant::now() >= deadline {
+            break;
+        }
+        driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(100)));
+        for Completion { tag, done } in out.drain(..) {
+            let shown = match done {
+                Done::Bound { sock, local } => {
+                    bound[tag.0 as usize - 1] = Some((sock, local));
+                    "bound".to_owned()
+                }
+                Done::Datagram { from, bytes } => format!(
+                    "{} from the first: {}",
+                    String::from_utf8_lossy(&bytes),
+                    bound[0].is_some_and(|(_, at)| at == from)
+                ),
+                Done::Wall(wall) => {
+                    let near = match real {
+                        true => {
+                            let system = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap();
+                            wall.abs_diff(system) < Duration::from_secs(60)
+                        }
+                        false => wall > Duration::from_secs(1_600_000_000),
+                    };
+                    format!("now: {near}")
+                }
+                Done::Random(bytes) => format!("random {}", bytes.len()),
+                Done::Sent(bytes) => format!("sent, {} left", bytes.len()),
+                Done::Read(bytes) => format!("read {}", bytes.len()),
+                Done::Unbound => "unbound".to_owned(),
+                Done::MadeDir => "made".to_owned(),
+                Done::RemovedDir => "removed".to_owned(),
+                Done::Failed(_) => "failed".to_owned(),
+                Done::Broken { .. } => "broken".to_owned(),
+                other => format!("{other:?}"),
+            };
+            seen.insert(tag.0, shown);
+            match tag.0 {
+                1 | 2 => {
+                    if let [Some((from, _)), Some((to, at))] = bound {
+                        effects.push(Effect::RecvFrom { sock: to, into: Vec::new(), tag: Tag(4) });
+                        effects.push(Effect::SendTo {
+                            sock: from,
+                            to: at,
+                            bytes: b"ping".to_vec(),
+                            tag: Tag(3),
+                        });
+                    }
+                }
+                4 => {
+                    for (at, tag) in [(0, Tag(5)), (1, Tag(6))] {
+                        if let Some((sock, _)) = bound[at] {
+                            effects.push(Effect::Unbind { sock, tag });
+                        }
+                    }
+                }
+                10 => effects.push(Effect::MakeDir { dir: made(), tag: Tag(11) }),
+                11 => effects.push(Effect::RemoveDir { dir: made(), tag: Tag(12) }),
+                12 => effects.push(Effect::RemoveDir { dir: made(), tag: Tag(13) }),
+                13 => effects.push(Effect::MakeDir { dir: name("missing/made"), tag: Tag(14) }),
+                _ => {}
+            }
+        }
+    }
+    seen
+}
+
+/// What [`host`] ends with: with the sockets and the streams, or with each refused (the IOCP
+/// driver's and WASI's).
+fn host_wanted(sockets_and_streams: bool) -> BTreeMap<u64, String> {
+    let mut want: BTreeMap<u64, String> = [
+        (7, "now: true"),
+        (8, "random 32"),
+        (9, "failed"),
+        (10, "made"),
+        (11, "failed"),
+        (12, "removed"),
+        (13, "failed"),
+        (14, "failed"),
+    ]
+    .into_iter()
+    .map(|(tag, it)| (tag, it.to_owned()))
+    .collect();
+    let rest: &[(u64, &str)] = match sockets_and_streams {
+        true => &[
+            (1, "bound"),
+            (2, "bound"),
+            (3, "sent, 0 left"),
+            (4, "ping from the first: true"),
+            (5, "unbound"),
+            (6, "unbound"),
+            (15, "sent, 0 left"),
+            (16, "read 0"),
+        ],
+        false => &[(1, "failed"), (2, "failed"), (15, "broken"), (16, "broken")],
+    };
+    for &(tag, it) in rest {
+        want.insert(tag, it.to_owned());
+    }
+    want
+}
+
+#[test]
+fn every_driver_runs_the_host_s_effects_or_refuses_them_naming_why() {
+    assert_eq!(host(&mut Sim::new(5, Faults::default()), false), host_wanted(true), "sim");
+    assert_eq!(
+        host(&mut Threads::new(&dir("host-threads"), 2), true),
+        host_wanted(cfg!(unix)),
+        "threads"
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        host(&mut crate::kqueue::Kqueue::new(dir("host-kqueue"), 2).unwrap(), true),
+        host_wanted(true),
+        "kqueue"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        host(&mut crate::uring::Uring::new(dir("host-uring")).unwrap(), true),
+        host_wanted(true),
+        "io_uring"
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        host(&mut crate::iocp::Iocp::new(&dir("host-iocp"), 2).unwrap(), true),
+        host_wanted(false),
+        "iocp"
+    );
+}
+
+/// A bind at an address another socket has fails naming the address; where the native driver
+/// has no sockets (IOCP), the bind is refused naming the effect.
+#[cfg(any(unix, windows))]
+#[test]
+fn a_host_effect_that_fails_names_what_it_is_about() {
+    let mut driver = crate::native(&dir("host-errors"), 1).unwrap();
+    let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut answers = Vec::new();
+    let mut effects = vec![Effect::Bind { at: loopback, tag: Tag(1) }];
+    run_until_idle(&mut driver, &mut effects, |it, _| answers.push(it.done)).unwrap();
+    let local = match answers.pop() {
+        Some(Done::Bound { local, .. }) => local,
+        Some(Done::Failed(error)) if cfg!(windows) => {
+            assert!(error.0.contains("Effect::Bind is refused"), "{error:?}");
+            return;
+        }
+        other => panic!("a bind at {loopback} ended {other:?}"),
+    };
+    let mut effects = vec![Effect::Bind { at: local, tag: Tag(2) }];
+    run_until_idle(&mut driver, &mut effects, |it, _| answers.push(it.done)).unwrap();
+    match answers.pop() {
+        Some(Done::Failed(error)) => assert!(error.0.contains(&local.to_string()), "{error:?}"),
+        other => panic!("a second bind at {local} ended {other:?}"),
+    }
 }

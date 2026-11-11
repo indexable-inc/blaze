@@ -94,10 +94,11 @@ impl fmt::Display for Edition {
 }
 
 /// blaze's syntax extensions a crate turns on with a crate attribute, which change what the
-/// parser accepts: with none on, the parser is Rust's, error for error. A file is parsed with
-/// its crate's set (the `span` crate's `EditionedFileId` carries it beside the edition), so the
-/// set is part of every key a parse is stored under. Each bit is one extension; the set is
-/// closed, and an unknown bit is refused when read back ([`Extensions::from_bits`]).
+/// parser accepts (docs/v2/plan/design/edition.md): with none on, the parser is Rust's, error
+/// for error. A file's tree is a function of its text, its [`Edition`] and this set, and every
+/// key of a parse holds all three (the `span` crate's `EditionedFileId` carries the set beside
+/// the edition). Each bit is one extension; the set is closed, and an unknown bit is refused
+/// when read back ([`Extensions::from_bits`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Extensions {
     bits: u8,
@@ -106,16 +107,27 @@ pub struct Extensions {
 impl Extensions {
     /// No extension: Rust's syntax.
     pub const NONE: Extensions = Extensions { bits: 0 };
+    /// `#![blaze::uniq]`: `&uniq T`, `&'a uniq T`, `&uniq expr`, `&uniq self`, `ref uniq x`
+    /// and the pattern `&uniq pat` are the unique reference, spelled for what it guarantees; each is exactly
+    /// its `mut` spelling from the syntax tree on (docs/v2/plan/design/edition.md, change 10).
+    pub const UNIQ: Extensions = Extensions { bits: 1 << 0 };
+    /// `#![blaze::error_unions]`: `A | B` in type position (docs/v2/plan/design/edition.md,
+    /// change 2).
+    pub const ERROR_UNIONS: Extensions = Extensions { bits: 1 << 1 };
     /// `#![blaze::records]`: the record type `{ a: T, b: U }`, the record value
     /// `{ a: x, b: y }`, the record pattern `{ a, b: p, .. }` and a record parameter's field
     /// defaults (docs/v2/plan/design/records.md; docs/v2/plan/design/edition.md, change 4).
-    /// Bit 2: bits 0 and 1 are `uniq` and `error_unions` on the edition's integration branch,
-    /// so the fold there adds this constant, its accessor and one `EXTENSION_ATTRS` row.
     pub const RECORDS: Extensions = Extensions { bits: 1 << 2 };
+    /// Every extension, in bit order: what a test walks to cover each set.
+    pub const ALL: [Extensions; 3] =
+        [Extensions::UNIQ, Extensions::ERROR_UNIONS, Extensions::RECORDS];
+    /// How many low bits the set takes: one per extension.
+    pub const BITS: u32 = Self::ALL.len() as u32;
     /// Every bit some extension has.
-    const KNOWN: u8 = Self::RECORDS.bits;
+    const KNOWN: u8 = (1 << Self::BITS) - 1;
 
-    /// The set as one byte, as [`Extensions::from_bits`] reads it back.
+    /// The set as one byte, for a key or an encoding, as [`Extensions::from_bits`] reads it
+    /// back.
     pub const fn bits(self) -> u8 {
         self.bits
     }
@@ -137,6 +149,16 @@ impl Extensions {
     /// Whether no extension is on.
     pub const fn is_none(self) -> bool {
         self.bits == 0
+    }
+
+    /// Whether `#![blaze::uniq]` is on.
+    pub const fn uniq(self) -> bool {
+        self.bits & Self::UNIQ.bits != 0
+    }
+
+    /// Whether `#![blaze::error_unions]` is on.
+    pub const fn error_unions(self) -> bool {
+        self.bits & Self::ERROR_UNIONS.bits != 0
     }
 
     /// Whether `#![blaze::records]` is on.

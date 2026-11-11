@@ -348,8 +348,13 @@ impl Loads {
                 self.dropped += 1;
                 continue;
             };
+            // What is prefetched and not yet read, in flight or loaded and still marked, is
+            // charged to the budget: a plan reads ahead only into what is left of it.
             let unread = pool.prefetch_counts().unread() + self.prefetching_pages;
-            let room = (self.budget / PAGE).saturating_sub(unread);
+            let room = match pool.planted(Plant::PrefetchUncharged) {
+                true => u64::MAX,
+                false => (self.budget / PAGE).saturating_sub(unread),
+            };
             if room == 0 {
                 break;
             }
@@ -656,7 +661,9 @@ impl Loads {
                 PageEnd::Abandoned => Word::abandoned(word.version()),
             };
             assert!(
-                word.state() == State::Loading || pool.planted(Plant::LoadedAtAsk),
+                word.state() == State::Loading
+                    || pool.planted(Plant::LoadedAtAsk)
+                    || pool.planted(Plant::DoubleClaim),
                 "page {page} of the store's pool, loaded in slot {slot}, is {word:?}"
             );
             pool.word(page).store(next.0, Ordering::Release);

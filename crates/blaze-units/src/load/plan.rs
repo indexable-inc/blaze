@@ -294,6 +294,12 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
     }
     let config = input.config;
     let workspace_lints = flags::workspace_lints(input.ws_metadata, input.ws_manifest)?;
+    let ratchet_downgrades = flags::ratchet_downgrades(
+        input.config.files(),
+        input.ws_metadata,
+        input.ws_manifest,
+        input.ws_root,
+    )?;
     let lint_profile =
         flags::workspace_profile(input.ws_metadata, input.ws_manifest, input.ws_root)?;
 
@@ -562,7 +568,11 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
                         false => (Vec::new(), Vec::new()),
                     };
                 if it.pkg.is_member && !unit.is_std {
-                    lints.splice(0..0, workspace_lints.iter().cloned());
+                    // The workspace's levels, then the lints the ratchet's baselines hold this
+                    // package at `warn` in, then the package's own `[lints]`: the later wins.
+                    let held = ratchet_downgrades.get(it.pkg.manifest.package_id.name.as_str());
+                    let front = workspace_lints.iter().chain(held.into_iter().flatten());
+                    lints.splice(0..0, front.cloned());
                 }
                 let mut check_cfg = flags::check_cfg(it.pkg.manifest);
                 check_cfg.extend(lint_check_cfg);

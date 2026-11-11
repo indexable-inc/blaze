@@ -77,6 +77,24 @@ const ENDED_BUILD: Arg = Arg {
     default: Some("(SELECT max(build_id) FROM builds WHERE dur_ns IS NOT NULL)"),
 };
 const LIMIT: Arg = Arg { name: "limit", ty: ArgType::U64, default: Some("20") };
+/// One build, or none: a view over the last builds (`problems`) reads them all unless one is
+/// named.
+const ANY_BUILD: Arg = Arg { name: "build", ty: ArgType::U64, default: Some("NULL") };
+/// The limit of a view whose rows are read whole (a build's timeline, its counts): past it the
+/// view is cut, and `limit=N` asks for more.
+const MANY: Arg = Arg { name: "limit", ty: ArgType::U64, default: Some("200") };
+/// A thread's name as `LIKE` matches it, or `loop` for the daemon's loop thread: every
+/// thread unless given.
+const THREAD: Arg = Arg { name: "thread", ty: ArgType::Text, default: Some("'%'") };
+/// Text a row's call or span holds, as `LIKE` matches it: anything unless given.
+const WITHIN: Arg = Arg { name: "within", ty: ArgType::Text, default: Some("'%'") };
+/// The least duration of a span a timeline lists, in milliseconds.
+const MIN_MS: Arg = Arg { name: "min_ms", ty: ArgType::F64, default: Some("1.0") };
+/// The least duration of a span that counts as long, in milliseconds: the loop's budget for a
+/// step (`loop stalled`).
+const LONG_MS: Arg = Arg { name: "min_ms", ty: ArgType::F64, default: Some("20.0") };
+/// How many of the last builds a view of several builds reads when no build is named.
+const BUILDS: Arg = Arg { name: "builds", ty: ArgType::U64, default: Some("5") };
 const EARLIER: Arg = Arg { name: "earlier", ty: ArgType::Text, default: None };
 const LATER: Arg = Arg { name: "later", ty: ArgType::Text, default: None };
 /// The build a key is diffed against: by default, the last at or before the one before the
@@ -138,6 +156,16 @@ pub const VIEWS: &[View] = &[
     const { view("errors_by_kind", &[ENDED_BUILD]) },
     const { view("link_regions", &[BUILD]) },
     const { view("link_code", &[BUILD]) },
+    const { view("problems", &[ANY_BUILD, BUILDS, LIMIT]) },
+    const { view("timeline", &[ENDED_BUILD, MIN_MS, MANY]) },
+    const { view("long_spans", &[BUILD, LONG_MS, LIMIT]) },
+    const { view("waits_by_reason", &[BUILD, LIMIT]) },
+    const { view("counts_by_cause", &[BUILD, MANY]) },
+    const { view("writes", &[BUILD, MANY]) },
+    const { view("scripts", &[BUILD, MANY]) },
+    const { view("pool", &[ENDED_BUILD]) },
+    const { view("kept", &[ENDED_BUILD, MANY]) },
+    const { view("syscalls", &[ENDED_BUILD, THREAD, WITHIN, MIN_MS, MANY]) },
 ];
 
 /// The view named `name`.
@@ -800,6 +828,7 @@ mod tests {
     const FUNCTIONS: &[&str] = &[
         "any_value",
         "arg_max",
+        "arg_min",
         "array_to_string",
         "count",
         "lag",
@@ -822,6 +851,11 @@ mod tests {
         "row_number",
         "regexp_extract",
         "ends_with",
+        "abs",
+        "avg",
+        "floor",
+        "nullif",
+        "split_part",
     ];
 
     /// The identifiers of `sql` outside comments, strings, numbers and `$`/`@` names, each with

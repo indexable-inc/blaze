@@ -275,7 +275,7 @@ ORDER BY peak_mib DESC NULLS LAST, task
 -- says: a build's daemon tasks whose peak passed their grant or stayed under half of it (`task` spans), worst first: the task kind, its crate and unit, its grant and peak, and by how much the grant missed
 SELECT
     function AS task,
-    "crate",
+    crate,
     unit,
     round(granted_bytes / 1048576, 1) AS granted_mib,
     round(peak_bytes / 1048576, 1) AS peak_mib,
@@ -284,7 +284,7 @@ SELECT
 FROM spans
 WHERE build_id = $build AND name = 'task'
     AND (peak_bytes > granted_bytes OR peak_bytes * 2 < granted_bytes)
-ORDER BY missed_mib DESC, task, "crate", unit
+ORDER BY missed_mib DESC, task, crate, unit
 LIMIT $limit
 
 -- name: memory_timeline
@@ -300,9 +300,9 @@ WITH c AS (
 measured AS (SELECT t_ns, value AS kept FROM c WHERE name = 'allocator kept bytes'),
 derived AS (
     SELECT r.t_ns, f.value - h.value - r.value AS kept
-    FROM (SELECT t_ns, value FROM c WHERE name = 'blaze-mem resident bytes') r
-    ASOF JOIN (SELECT t_ns, value FROM c WHERE name = 'heap live bytes') h ON r.t_ns >= h.t_ns
-    ASOF JOIN (SELECT t_ns, value FROM c WHERE name = 'footprint bytes') f ON r.t_ns >= f.t_ns
+    FROM (SELECT t_ns, value FROM c WHERE name = 'blaze-mem resident bytes') AS r
+    ASOF JOIN (SELECT t_ns, value FROM c WHERE name = 'heap live bytes') AS h ON r.t_ns >= h.t_ns
+    ASOF JOIN (SELECT t_ns, value FROM c WHERE name = 'footprint bytes') AS f ON r.t_ns >= f.t_ns
 ),
 kept AS (
     SELECT * FROM measured
@@ -332,7 +332,7 @@ WITH tasks AS (
     SELECT * FROM spans WHERE build_id = $build AND name = 'task' AND peak_bytes IS NOT NULL
 ),
 phases AS (
-    SELECT process, parent, any_value("crate") AS krate, any_value(unit) AS unit
+    SELECT process, parent, any_value(crate) AS krate, any_value(unit) AS unit
     FROM spans
     WHERE build_id = $build
         AND name IN ('unit names', 'unit bodies', 'unit codegen', 'unit link', 'unit store')
@@ -340,7 +340,7 @@ phases AS (
 )
 SELECT
     t.function AS task,
-    coalesce(t."crate", p.krate) AS "crate",
+    coalesce(t.crate, p.krate) AS crate,
     coalesce(t.unit, p.unit) AS unit,
     round(t.peak_bytes / 1073741824, 2) AS peak_gib,
     round(t.granted_bytes / 1073741824, 2) AS granted_gib,
@@ -348,8 +348,8 @@ SELECT
     round(t.heap_freed_bytes / 1073741824, 2) AS heap_freed_gib,
     round(t.heap_allocated_bytes / nullif(t.peak_bytes, 0), 1) AS churn_x_peak,
     round(t.dur_ns / 1e9, 1) AS s
-FROM tasks t
-LEFT JOIN phases p ON p.process = t.process AND p.parent = t.span_id
+FROM tasks AS t
+LEFT JOIN phases AS p ON p.process = t.process AND p.parent = t.span_id
 ORDER BY t.peak_bytes DESC, task
 LIMIT $limit
 
@@ -839,3 +839,248 @@ WITH code AS (
 SELECT image, generation, whole, summed_by, what, pieces, code_bytes
 FROM code
 ORDER BY image, generation, summed_by, code_bytes DESC, what
+
+-- name: problems
+-- says: what blaze itself said was wrong, newest build first, each thing once with how often (`count`) and when in its build (`first_ms`, `last_ms` from the build's start, past its end for what was said after its answer): every event at WARN or ERROR (each line the daemon writes to its log is one), by callsite with its last message and fields; each panic and fatal signal; each `blaze-bug` and `daemon-panic` error; and a build that failed, stalled or crashed. An event of no build is the last build's to start before it. `build`: one build; unset, the last `builds` (5) builds
+WITH picked AS (
+    SELECT build_id AS picked_build, started_ns AS t0
+    FROM builds
+    WHERE CASE WHEN $build IS NULL THEN build_id > (SELECT max(build_id) FROM builds) - $builds ELSE build_id = $build END
+), said AS (
+    SELECT build_id AS tagged, t_ns AS said_ns, CAST(level AS VARCHAR) AS severity,
+        CAST(target AS VARCHAR) || ' ' || CAST(name AS VARCHAR) AS source,
+        coalesce(message, '') || coalesce(' [' || fields || ']', '') AS said_what
+    FROM events_wide
+    WHERE level IN ('ERROR', 'WARN')
+    UNION ALL
+    SELECT build_id, t_ns, CASE WHEN kind = 'signal' THEN 'FATAL' ELSE 'PANIC' END,
+        CASE WHEN kind = 'signal' THEN 'signal ' || coalesce(CAST(signal AS VARCHAR), '?') ELSE 'panic at ' || coalesce(location, '?') END,
+        coalesce(message, '')
+    FROM panics
+    UNION ALL
+    SELECT build_id, t_ns, 'BUG', CAST(kind AS VARCHAR) || coalesce(' ' || function, ''), message || coalesce(': ' || detail, '')
+    FROM errors
+    WHERE kind IN ('blaze-bug', 'daemon-panic')
+    UNION ALL
+    SELECT build_id, started_ns + coalesce(dur_ns, 0), 'BUILD', 'outcome', 'the build ' || CAST(outcome AS VARCHAR) || ': `' || command || '`'
+    FROM builds
+    WHERE outcome IN ('failed', 'stalled', 'crashed')
+), tied AS (
+    SELECT coalesce(said.tagged, earlier.earlier_build) AS of_build, said.said_ns, said.severity, said.source, said.said_what
+    FROM said ASOF LEFT JOIN (SELECT build_id AS earlier_build, started_ns AS earlier_ns FROM builds) AS earlier
+        ON said.said_ns >= earlier.earlier_ns
+)
+SELECT
+    tied.of_build AS build_id,
+    tied.severity AS level,
+    tied.source,
+    arg_max(tied.said_what, coalesce(tied.said_ns, 0)) AS what,
+    count(*) AS count,
+    round((min(tied.said_ns) - picked.t0) / 1e6, 1) AS first_ms,
+    round((max(tied.said_ns) - picked.t0) / 1e6, 1) AS last_ms
+FROM tied
+JOIN picked ON picked.picked_build = tied.of_build
+GROUP BY tied.of_build, tied.severity, tied.source, picked.t0
+ORDER BY tied.of_build DESC,
+    CASE tied.severity WHEN 'FATAL' THEN 0 WHEN 'PANIC' THEN 1 WHEN 'BUG' THEN 2 WHEN 'BUILD' THEN 3 WHEN 'ERROR' THEN 4 ELSE 5 END,
+    count(*) DESC, tied.source
+LIMIT $limit
+
+-- name: timeline
+-- says: a build as rows in the order things began: each span of `min_ms` (1) or longer with when it began from the build's start (`at_ms`), how long it was open (`ms`), its own CPU (`cpu_ms`, less the spans under it), its thread, its depth on that thread, and what it was of (its function, what a wait awaited, its unit, its crate, or its other fields); spans of no build in the build's window are its too. A gap between one row's end and the next row's `at_ms` on the same thread and depth is time under no span of that size. The path across waits to the jobs that ended them is `critical_path`
+WITH bounds AS (
+    SELECT started_ns AS t0, started_ns + dur_ns AS t1
+    FROM builds
+    WHERE build_id = $build
+)
+SELECT
+    round((s.start_ns - bounds.t0) / 1e6, 3) AS at_ms,
+    round(s.dur_ns / 1e6, 3) AS ms,
+    round(s.self_cpu_ns / 1e6, 3) AS cpu_ms,
+    CAST(s.thread_name AS VARCHAR) AS thread,
+    s.depth,
+    CAST(s.name AS VARCHAR) AS name,
+    coalesce(s.function, s.awaits, s.unit, CAST(s.crate AS VARCHAR), s.fields) AS what
+FROM spans AS s, bounds
+WHERE (s.build_id = $build OR (s.build_id IS NULL AND s.start_ns >= bounds.t0 AND s.start_ns < bounds.t1))
+    AND s.dur_ns >= $min_ms * 1e6
+ORDER BY s.start_ns, s.depth
+LIMIT $limit
+
+-- name: long_spans
+-- says: a build's spans of `min_ms` (20) or longer, longest first: how long (`ms`), its own CPU (`cpu_ms`), its thread, its name, what it was of, and when it began from the build's start (`at_ms`); a long span with little CPU that is no `wait` blocked in something no span names
+SELECT
+    round(s.dur_ns / 1e6, 3) AS ms,
+    round(s.self_cpu_ns / 1e6, 3) AS cpu_ms,
+    CAST(s.thread_name AS VARCHAR) AS thread,
+    CAST(s.name AS VARCHAR) AS name,
+    coalesce(s.function, s.awaits, s.unit, CAST(s.crate AS VARCHAR), s.fields) AS what,
+    round((s.start_ns - (SELECT min(started_ns) FROM builds WHERE build_id = $build)) / 1e6, 3) AS at_ms
+FROM spans AS s
+WHERE s.build_id = $build AND s.dur_ns >= $min_ms * 1e6
+ORDER BY s.dur_ns DESC, s.start_ns
+LIMIT $limit
+
+-- name: waits_by_reason
+-- says: a build's waits by what they waited for (`wait` spans by `awaits`, `admission` spans by what held the task back): how many, their time summed over the threads waiting (not wall time), the longest, and a thread that waited; waits too short for a row (`folded`) are not counted
+SELECT
+    CAST(s.name AS VARCHAR) AS waited_in,
+    coalesce(s.awaits, '(unnamed)') AS reason,
+    count(*) AS waits,
+    round(sum(s.dur_ns) / 1e6, 3) AS ms,
+    round(max(s.dur_ns) / 1e6, 3) AS longest_ms,
+    CAST(any_value(s.thread_name) AS VARCHAR) AS a_thread
+FROM spans AS s
+WHERE s.build_id = $build AND s.name IN ('wait', 'admission')
+GROUP BY s.name, s.awaits
+ORDER BY sum(s.dur_ns) DESC, reason
+LIMIT $limit
+
+-- name: counts_by_cause
+-- says: what the query engine counted in a build, per query that ran or input that was written: its runs and, of them, first runs, runs for a changed read, for an untracked read and for a cycle, runs for a value evicted and asked again, runs in a view it had already run in, rows verified without running, and an input's writes; the most run first. An edit's build should run a handful
+SELECT query, executed, ran_new, ran_changed, ran_untracked, ran_cycle, evicted_asked, reran, verified, written
+FROM query_counts
+WHERE build_id = $build AND (executed > 0 OR written > 0)
+ORDER BY executed DESC, written DESC NULLS LAST, query
+LIMIT $limit
+
+-- name: writes
+-- says: the inputs a build wrote, by kind with names: each input a setter wrote (`query_counts.written`, an equal value too), and beside it each of its fields a rerun names as its cause (`provenance.cause_key`: which file, which crate, which module's scope) with how many memos ran again for it; an input written that made nothing run has one row with no field
+WITH wrote AS (
+    SELECT CAST(query AS VARCHAR) AS input, written
+    FROM query_counts
+    WHERE build_id = $build AND written > 0
+), caused AS (
+    SELECT cause_key, count(DISTINCT query_key) AS memos
+    FROM provenance
+    WHERE build_id = $build AND outcome = 'ran' AND cause_kind IN ('input', 'tracked')
+    GROUP BY cause_key
+)
+SELECT wrote.input, wrote.written, caused.cause_key AS field, caused.memos
+FROM wrote
+LEFT JOIN caused ON starts_with(caused.cause_key, '`' || wrote.input || '.')
+ORDER BY caused.memos DESC NULLS LAST, wrote.written DESC, wrote.input, caused.cause_key
+LIMIT $limit
+
+-- name: scripts
+-- says: the build scripts a build ran, slowest first: the unit, how long its process lived, how long making its sandbox took, its CPU, its exit code, and why it ran instead of being reused (`misses` of step `build script run`: the cause and what changed). A script whose kept run was reused has no row: it ran no process
+SELECT
+    p.unit,
+    round((p.exited_ns - p.spawned_ns) / 1e6, 1) AS ms,
+    round(p.sandbox_ns / 1e6, 1) AS sandbox_ms,
+    round((p.user_ns + p.system_ns) / 1e6, 1) AS cpu_ms,
+    p.code,
+    CAST(m.cause AS VARCHAR) AS cause,
+    m.what
+FROM processes AS p
+LEFT JOIN misses AS m
+    ON m.build_id = p.build_id AND m.step = 'build script run'
+    AND (starts_with(p.unit, m.item) OR starts_with(m.item, p.unit))
+WHERE p.build_id = $build AND p.kind = 'build_script'
+ORDER BY p.exited_ns - p.spawned_ns DESC, p.unit
+LIMIT $limit
+
+-- name: pool
+-- says: the pools' counters over a build: the store's buffer pool (`pool resident bytes`, `pool pinned bytes`, `pool loaded bytes`, `pool prefetched bytes`, `pool evicted bytes`, `pool pinned bound waits`) and the worker pool (`pool queued`, `pool running`), each with its value as the build began and ended, its most, and how many readings; a counter that counts up (loaded, evicted, waits) grew by end less start
+WITH bounds AS (
+    SELECT started_ns AS t0, started_ns + dur_ns AS t1
+    FROM builds
+    WHERE build_id = $build
+)
+SELECT
+    CAST(c.name AS VARCHAR) AS counter,
+    CAST(arg_min(c.value, c.t_ns) AS BIGINT) AS at_start,
+    CAST(arg_max(c.value, c.t_ns) AS BIGINT) AS at_end,
+    CAST(max(c.value) AS BIGINT) AS most,
+    count(*) AS readings
+FROM counters AS c, bounds
+WHERE starts_with(CAST(c.name AS VARCHAR), 'pool ')
+    AND (c.build_id = $build OR (c.build_id IS NULL AND c.t_ns >= bounds.t0 AND c.t_ns <= bounds.t1))
+GROUP BY c.name
+ORDER BY counter
+
+-- name: kept
+-- says: what a build kept or lost as it ended and after its answer was sent, to the next build's start: each span about keeping (the front end kept or let go, expansions published, what the store was given, link images evicted), in order, then whether what it left was lost (`misses` of step `results kept after the answer`: `the build before` lost what this build then computed again, `this build` lost what the next one did)
+WITH bounds AS (
+    SELECT started_ns AS t0,
+        coalesce((SELECT min(started_ns) FROM builds WHERE build_id > $build), started_ns + dur_ns + 60000000000) AS t1
+    FROM builds
+    WHERE build_id = $build
+)
+SELECT
+    round((s.start_ns - bounds.t0) / 1e6, 3) AS at_ms,
+    round(s.dur_ns / 1e6, 3) AS ms,
+    CAST(s.thread_name AS VARCHAR) AS thread,
+    CAST(s.name AS VARCHAR) AS name,
+    coalesce(s.fields, s.function, s.unit, CAST(s.crate AS VARCHAR)) AS what
+FROM spans AS s, bounds
+WHERE s.start_ns >= bounds.t0 AND s.start_ns < bounds.t1
+    AND (s.name LIKE '%kept%' OR s.name LIKE '%let go%' OR s.name LIKE 'store %' OR s.name LIKE '%settl%')
+UNION ALL
+SELECT
+    NULL,
+    NULL,
+    CASE WHEN m.build_id = $build THEN 'the build before' ELSE 'this build' END,
+    'LOST: ' || CAST(m.step AS VARCHAR),
+    m.what
+FROM misses AS m
+WHERE m.step = 'results kept after the answer' AND m.build_id IN ($build, $build + 1)
+ORDER BY at_ms NULLS LAST, name
+LIMIT $limit
+
+-- name: syscalls
+-- says: what a build's threads blocked in, as the daemon itself saw it, with no strace: each file call a driver made off its loop (`io call`: a `wait` span whose `awaits` is `io <op> <file>`: a clone, a write-back, a listing, with how long it took and the span it was made in), each step of the daemon's loop that ran in line past its bound (`loop step in line`: the step and its time), and the samples of threads blocked inside a span (`blocked samples`: the stack, outermost first, the span, how many, and the time they stand for at 49 a second), in the order they began. `thread`: a thread's name (`LIKE`), or `loop` for the daemon's loop thread; `within`: text the call or its span holds (`LIKE`); `min_ms`: the least time. A system call no driver times and no sample caught is not here: harness/v2/loop_syscalls.py (strace) sees those
+WITH bounds AS (
+    SELECT started_ns AS t0, started_ns + dur_ns AS t1
+    FROM builds
+    WHERE build_id = $build
+), looped AS (
+    SELECT DISTINCT process AS loop_process, thread AS loop_thread
+    FROM spans
+    WHERE build_id = $build
+        AND (name = 'request: read to reply' OR name = 'loop stalled' OR starts_with(CAST(name AS VARCHAR), 'loop: '))
+), named AS (
+    SELECT process AS named_process, thread AS named_thread, CAST(any_value(thread_name) AS VARCHAR) AS said_name
+    FROM spans
+    WHERE build_id = $build
+    GROUP BY process, thread
+), calls AS (
+    SELECT s.process AS call_process, s.thread AS call_thread, CAST(s.thread_name AS VARCHAR) AS on_thread,
+        s.start_ns AS began_ns, s.dur_ns AS took_ns, 'io call' AS seen_as, s.awaits AS call,
+        CAST(p.name AS VARCHAR) || coalesce(' ' || p.function, '') AS inside, CAST(1 AS BIGINT) AS times
+    FROM spans AS s
+    LEFT JOIN spans AS p ON p.process = s.process AND p.span_id = s.parent
+    CROSS JOIN bounds
+    WHERE s.name = 'wait' AND starts_with(s.awaits, 'io ') AND s.start_ns >= bounds.t0 AND s.start_ns < bounds.t1
+    UNION ALL
+    SELECT s.process, s.thread, CAST(s.thread_name AS VARCHAR), s.start_ns, NULL, 'loop step in line', s.function, NULL, CAST(1 AS BIGINT)
+    FROM spans AS s
+    CROSS JOIN bounds
+    WHERE s.name = 'loop stalled' AND s.start_ns >= bounds.t0 AND s.start_ns < bounds.t1 + 1000000000
+    UNION ALL
+    SELECT m.process, m.thread, any_value(named.said_name), min(m.t_ns), CAST(count(*) * 20408163 AS BIGINT), 'blocked samples',
+        array_to_string(m.stack, ' > '), CAST(p.name AS VARCHAR) || coalesce(' ' || p.function, ''), CAST(count(*) AS BIGINT)
+    FROM samples AS m
+    LEFT JOIN spans AS p ON p.process = m.process AND p.span_id = m.span_id
+    LEFT JOIN named ON named.named_process = m.process AND named.named_thread = m.thread
+    CROSS JOIN bounds
+    WHERE m.cpu = 'off' AND m.t_ns >= bounds.t0 AND m.t_ns < bounds.t1
+    GROUP BY m.process, m.thread, m.span_id, array_to_string(m.stack, ' > '), p.name, p.function
+)
+SELECT
+    round((calls.began_ns - bounds.t0) / 1e6, 3) AS at_ms,
+    round(calls.took_ns / 1e6, 3) AS ms,
+    calls.on_thread AS thread,
+    calls.seen_as,
+    calls.call,
+    calls.inside,
+    calls.times
+FROM calls
+CROSS JOIN bounds
+WHERE (calls.on_thread LIKE $thread
+        OR ($thread = 'loop' AND EXISTS (
+            SELECT 1 FROM looped WHERE looped.loop_process = calls.call_process AND looped.loop_thread = calls.call_thread)))
+    AND (coalesce(calls.inside, '') LIKE $within OR coalesce(calls.call, '') LIKE $within)
+    AND (calls.took_ns IS NULL OR calls.took_ns >= $min_ms * 1e6)
+ORDER BY calls.began_ns, calls.seen_as
+LIMIT $limit

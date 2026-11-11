@@ -23,7 +23,6 @@
 
 use std::{
     collections::VecDeque,
-    fs::{File, OpenOptions},
     io::{self, Write as _},
     path::{Path, PathBuf},
     sync::Arc,
@@ -443,7 +442,22 @@ pub struct Threads {
     conns: Slab<Connection>,
     /// The file locks of [`Effect::Lock`], each taken as it is asked for.
     locks: crate::locks::Locks,
+    /// The datagrams, the standard streams, the clock and randomness ([`crate::host`]).
+    #[cfg(unix)]
+    host: crate::host::Host,
     in_flight: usize,
+}
+
+/// Where the host's effects are told: the driver's mailbox.
+#[cfg(unix)]
+struct HostSink(Arc<Shared>);
+
+#[cfg(unix)]
+impl crate::host::Sink for HostSink {
+    fn tell(&self, completion: Completion) {
+        // A closed mailbox is a driver dropped: nobody asks any more.
+        _ = self.0.done.push(Told::Done(completion));
+    }
 }
 
 impl Threads {
@@ -484,6 +498,9 @@ impl Threads {
             // alloc: none, an empty list.
             Vec::new()
         };
+        // clone: a count of the state the host's threads tell through; alloc: once per driver.
+        #[cfg(unix)]
+        let host = crate::host::Host::new(Arc::new(HostSink(Arc::clone(&shared))));
         Threads {
             start: Instant::now(),
             shared,
@@ -505,6 +522,8 @@ impl Threads {
             confine: None,
             spawn_dirs,
             locks: crate::locks::Locks::new(),
+            #[cfg(unix)]
+            host,
             #[cfg(unix)]
             spawns: Tagged::new(RESERVE),
             #[cfg(unix)]
@@ -979,19 +998,7 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         },
         Effect::ReadLink { file, .. } => read_link(root, &file),
         Effect::Read { file, at: from, len, .. } => {
-            let file = at(root, &file, |path| File::open(path))?;
-            // alloc: the read's payload.
-            let mut bytes = vec![0; len];
-            let mut read = 0;
-            while read < len {
-                let n = read_at(&file, &mut bytes[read..], from + read as u64)?;
-                if n == 0 {
-                    break;
-                }
-                read += n;
-            }
-            bytes.truncate(read);
-            Ok(Done::Read(bytes))
+            Ok(Done::Read(at(root, &file, |path| fs::read(path, from, len))?))
         }
         Effect::ReadInto { file, at: from, into, cache, priority, .. } => {
             let span = crate::spans::resolve(&into, &file, from, cache, "a read into memory of")
@@ -1018,15 +1025,15 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             Ok(Done::Written)
         }
         Effect::Append { file, bytes, .. } => at(root, &file, |path| {
-            let open = || OpenOptions::new().create(true).append(true).open(path);
-            fs::making_parent(path, open)?.write_all(&bytes)?;
+            fs::append(path, &bytes)?;
             Ok(Done::Appended)
         }),
-        // `sync_all` is `F_FULLFSYNC` on Apple's systems, where `fsync` leaves the bytes in the
-        // drive's cache.
         Effect::Sync { file, .. } => at(root, &file, |path| {
-            // durable: carries out `Effect::Sync`, whose asker said why
-            OpenOptions::new().append(true).create(true).open(path)?.sync_all()?;
+            fs::sync(path)?;
+            Ok(Done::Synced)
+        }),
+        Effect::SyncDir { dir, .. } => at(root, &dir, |path| {
+            fs::sync_dir(path)?;
             Ok(Done::Synced)
         }),
         // Waited for on this thread; the asker waits for nothing, and nothing is durable.
@@ -1104,6 +1111,14 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             fs::remove(path)?;
             Ok(Done::Removed)
         }),
+        // `mkdir`: its parent must be there, and nothing at its name.
+        Effect::MakeDir { dir, .. } => at(root, &dir, |path| std::fs::create_dir(path))
+            .map(|()| Done::MadeDir)
+            .map_err(|error| named(&dir, &error)),
+        // `rmdir`: of an empty directory alone, never what is under it or a link to one.
+        Effect::RemoveDir { dir, .. } => at(root, &dir, |path| std::fs::remove_dir(path))
+            .map(|()| Done::RemovedDir)
+            .map_err(|error| named(&dir, &error)),
         Effect::Map { file, .. } => Ok(Done::Mapped(at(root, &file, |path| fs::map(path))?)),
         Effect::Lock { .. } | Effect::Unlock { .. } => {
             unreachable!("file locks are kept by the driver, which takes each as it is asked for")
@@ -1121,8 +1136,19 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         | Effect::Recv { .. }
         | Effect::Send { .. }
         | Effect::Hangup { .. }
-        | Effect::Pressure { .. } => {
-            unreachable!("timers, watches, processes and sockets are kept by the driver")
+        | Effect::Pressure { .. }
+        | Effect::Bind { .. }
+        | Effect::SendTo { .. }
+        | Effect::RecvFrom { .. }
+        | Effect::Unbind { .. }
+        | Effect::ReadStdin { .. }
+        | Effect::WriteOut { .. }
+        | Effect::Now { .. }
+        | Effect::Random { .. } => {
+            unreachable!(
+                "timers, watches, processes, sockets, the standard streams, the clock and \
+                 randomness are kept by the driver"
+            )
         }
     }
 }
@@ -1179,21 +1205,6 @@ fn link_bytes(file: &crate::FileName, target: std::path::PathBuf) -> io::Result<
             format!("{file}: a link's target that is not UTF-8"),
         )),
     }
-}
-
-#[cfg(unix)]
-fn read_at(file: &File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
-    std::os::unix::fs::FileExt::read_at(file, buffer, at)
-}
-
-#[cfg(windows)]
-fn read_at(file: &File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
-    std::os::windows::fs::FileExt::seek_read(file, buffer, at)
-}
-
-#[cfg(target_os = "wasi")]
-fn read_at(file: &File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
-    std::os::wasi::fs::FileExt::read_at(file, buffer, at)
 }
 
 /// The bytes of the symbolic link `file`'s `target`, as [`Effect::ReadLink`] gives them.
@@ -1972,6 +1983,25 @@ impl Driver for Threads {
                         None => Done::Failed(IoError(format!("no connection {conn:?}"))),
                     };
                     self.tell(tag, done);
+                }
+                #[cfg(unix)]
+                effect if crate::host::Host::takes(&effect) => {
+                    self.in_flight += 1;
+                    self.host.submit(effect);
+                }
+                #[cfg(not(unix))]
+                Effect::Now { tag } => self.tell(tag, crate::host::wall()),
+                #[cfg(not(unix))]
+                Effect::Random { len, tag } => self.tell(tag, crate::host::random(len)),
+                #[cfg(not(unix))]
+                effect @ (Effect::Bind { .. }
+                | Effect::SendTo { .. }
+                | Effect::RecvFrom { .. }
+                | Effect::Unbind { .. }
+                | Effect::ReadStdin { .. }
+                | Effect::WriteOut { .. }) => {
+                    let tag = effect.tag();
+                    self.tell(tag, crate::host::refused(effect));
                 }
                 #[cfg(not(unix))]
                 Effect::Kill { .. } => {}

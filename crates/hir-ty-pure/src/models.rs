@@ -73,6 +73,14 @@ pub enum Leaf {
     /// calls `setlocale` and the C locale's text does not change. Windows' `FormatMessageW`
     /// follows the user's language and is not one.
     ErrorText,
+    /// Randomness std draws for the program: the keys of a `RandomState`. A build script's
+    /// are made of its run's key by blaze's provider (docs/v2/plan/design/determinism.md), so
+    /// they are no input of it.
+    Seeded,
+    /// The wall clock: `SystemTime::now`. A build script is told the build's
+    /// `SOURCE_DATE_EPOCH`, which is then a variable its key reads; where the build sets
+    /// none, a script that asks the time is not kept as pure.
+    Wall,
 }
 
 /// How a function's value follows from its arguments' (design section 6), by MIR operand index.
@@ -136,6 +144,8 @@ pub fn apply_leaf(leaf: Leaf, args: &[Abs]) -> Applied {
         Leaf::Print => done(Effects::PRINT),
         Leaf::Exit => done(Effects::EXIT),
         Leaf::Handle | Leaf::Panic | Leaf::Alloc | Leaf::ErrorText => done(Effects::NONE),
+        Leaf::Seeded => done(Effects::SEEDED),
+        Leaf::Wall => done(Effects::WALL),
         Leaf::RawHandle => {
             // alloc: a refusal's text, once per impure script
             Applied::Refused("makes a file handle of a number".to_owned())
@@ -181,6 +191,8 @@ pub fn tag(leaf: Leaf) -> u8 {
         Leaf::Alloc => 10,
         Leaf::RawHandle => 11,
         Leaf::ErrorText => 12,
+        Leaf::Seeded => 13,
+        Leaf::Wall => 14,
     }
 }
 
@@ -501,6 +513,8 @@ const EXIT: Model = Model::Leaf(Leaf::Exit);
 const PANIC: Model = Model::Leaf(Leaf::Panic);
 const ALLOC_LEAF: Model = Model::Leaf(Leaf::Alloc);
 const ERROR_TEXT: Model = Model::Leaf(Leaf::ErrorText);
+const SEEDED: Model = Model::Leaf(Leaf::Seeded);
+const WALL: Model = Model::Leaf(Leaf::Wall);
 const SAME: Model = Model::Transfer(Transfer::Same { arg: 0 });
 const JOIN: Model = Model::Transfer(Transfer::Join { base: 0, rel: 1 });
 const PUSH: Model = Model::Transfer(Transfer::Push { target: 0, rel: 1 });
@@ -645,6 +659,8 @@ const STD: &[Entry] = &[
             ERROR_TEXT,
         ),
     ),
+    method("std::hash::RandomState::new", &["hash", "RandomState"], "new", SEEDED),
+    method("std::time::SystemTime::now", &["time", "SystemTime"], "now", WALL),
     func("std::process::exit", &["process", "exit"], EXIT),
     func("std::process::abort", &["process", "abort"], EXIT),
     func("std::panicking::begin_panic", &["panicking", "begin_panic"], PANIC),

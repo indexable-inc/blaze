@@ -2686,6 +2686,12 @@ impl<'a, B: Prepare> Build<'a, B> {
             let span = tracing::info_span!(
                 target: "blaze",
                 "codegen walk",
+                // The one field of this span the profile keeps a column for (`function`):
+                // whether the walk was patched or ran whole and why, with what it asked and
+                // described, said as the walk ends. The counts below reach a subscriber that
+                // reads fields; the profile's parquet has no column for them, so until
+                // 2026-11-10 a 2 s walk's row said nothing of which walk it was.
+                function = tracing::field::Empty,
                 roots = roots.len(),
                 described = tracing::field::Empty,
                 verified = tracing::field::Empty,
@@ -2717,6 +2723,13 @@ impl<'a, B: Prepare> Build<'a, B> {
                     span.record("resolved", work.resolved);
                     span.record("built_in", work.built_in);
                     span.record("owners", work.owners);
+                    span.record(
+                        "function",
+                        tracing::field::display(format_args!(
+                            "patched: asked {} functions and statics of {} groups, described {}",
+                            work.asked, work.groups, work.described
+                        )),
+                    );
                     (nodes, statics, roots, walk, Some(keep), Some((touched, work)))
                 }
                 Err(why) => {
@@ -2744,6 +2757,13 @@ impl<'a, B: Prepare> Build<'a, B> {
             }
             if let Some(whole) = walk.whole {
                 span.record("whole", whole);
+                span.record(
+                    "function",
+                    tracing::field::display(format_args!(
+                        "whole ({whole}): described {}, verified {}, reached {}",
+                        walk.described, walk.verified, walk.reached
+                    )),
+                );
             }
             walked
         };
@@ -2855,7 +2875,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         self.static_callees =
             statics.values().flat_map(|it| it.refs.iter().filter_map(callee)).collect();
         if !out.errors.is_empty() {
-            let errors = out.finish(names_of(&nodes, Some(&statics))).errors;
+            let errors = out.finish(names_of::<_, _, B>(&nodes, Some(&statics))).errors;
             // A refused build is still the last run, as one whose compiles failed is: a lazy or
             // live compile after it never reads an earlier build's walk.
             // alloc: once per build, the walk its `Later` holds
@@ -2947,7 +2967,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             Err(why) => {
                 let item = nodes.get(&why.unit()).map_or(why.item(), |it| it.unit.item);
                 out.errors.push(error(why.unit(), item, why.to_string()));
-                return Err(out.finish(names_of(&nodes, Some(&statics))).errors);
+                return Err(out.finish(names_of::<_, _, B>(&nodes, Some(&statics))).errors);
             }
         };
         out.statics.sort_by_key(|it| (it.item, it.instance));
@@ -3039,7 +3059,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             used,
             kernel,
             misses,
-        } = out.finish(names_of(&nodes, Some(&statics)));
+        } = out.finish(names_of::<_, _, B>(&nodes, Some(&statics)));
         // alloc: once per build, the walk its `Later` and the kept walk share
         let nodes = Arc::new(nodes);
         // clone: a reference count, once per build
@@ -3118,7 +3138,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             // Kept by row for the next build to patch, where every function is compiled
             // alone; else by its entries, for the next build's delta.
             let now = match keeps_rows {
-                true => match lists::Lists::of_whole(&*nodes, &statics, &built, originals, now, &codes)
+                true => match lists::Lists::of_whole(&*nodes, &statics, &built, &originals, now, &codes)
                 {
                     Ok(lists) => {
                         kept.keep_lists(program_walk, lists);
@@ -3225,7 +3245,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             .map(|(key, _)| *key)
             // alloc: per build, sized by its units
             .collect();
-        self.dev_of(nodes, dev, store, out);
+        self.dev_of(nodes, &dev, store, out);
     }
 
     /// The functions `dev` of `nodes`, none of a release backend, each made of its template:
@@ -3235,7 +3255,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     fn dev_of(
         &self,
         nodes: &Sorted<InstanceKey, Node<B>>,
-        dev: Vec<InstanceKey>,
+        dev: &[InstanceKey],
         store: &impl Lookup,
         out: &mut Out,
     ) {

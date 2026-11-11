@@ -7,7 +7,9 @@
 //! crate's macro, which `unsafe_code` does not report, so the module needs no allow and has no
 //! unsafe of its own.
 
-use span::{EditionedFileId, ErasedFileAstId, Span, SpanAnchor, SyntaxContext, TextRange};
+use span::{
+    EditionedFileId, ErasedFileAstId, Extensions, Span, SpanAnchor, SyntaxContext, TextRange,
+};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// One token tree, 8 bytes. `head` holds the tag in its low two bits and above it:
@@ -119,6 +121,13 @@ impl CompressedSpanPart {
             file_id: EditionedFileId::from_raw(self.file_id),
             ast_id: ErasedFileAstId::from_raw(self.ast_id),
         }
+    }
+
+    /// The syntax extensions of the anchor's file, the crate's whose source the span is in:
+    /// read off the file id's bits, as [`EditionedFileId::extensions`] reads them.
+    #[inline]
+    pub(super) fn extensions(self) -> Extensions {
+        EditionedFileId::from_raw(self.file_id).extensions()
     }
 
     #[inline]

@@ -35,7 +35,7 @@ use crate::{
             SideTable,
         },
         diagnostics::{
-            AssocTypeFailure, AssocTypeQself, CycleQuery, ElidedLifetimeSite,
+            AssocTypeFailure, AssocTypeQself, CycleQuery, ElidedLifetimeSite, ErrorUnionRefusal,
             GenericArgsProhibitedReason, IncorrectGenericsLenKind, MissingLifetimeKind,
             PathGenericsSource, PathLoweringDiagnostic, PatternTypeUnsupported, RecordRefusal,
         },
@@ -912,6 +912,23 @@ pub(crate) fn put_diagnostic(w: &mut Vec<u32>, diagnostic: &TyLoweringDiagnostic
             put_local(w, *source);
             w.push(match reason {
                 PatternTypeUnsupported::Pattern => 0,
+                PatternTypeUnsupported::VariantsNeedGate => 1,
+                PatternTypeUnsupported::VariantsOfNonEnum => 2,
+                PatternTypeUnsupported::NotAVariant => 3,
+                PatternTypeUnsupported::VariantFieldNotWildcard => 4,
+                PatternTypeUnsupported::VariantShape => 5,
+            });
+        }
+        TyLoweringDiagnostic::ErrorUnionRefused { source, reason } => {
+            w.push(41);
+            put_local(w, *source);
+            w.push(match reason {
+                ErrorUnionRefusal::NotEnabled => 0,
+                ErrorUnionRefusal::NoLangItem => 1,
+                ErrorUnionRefusal::TypeParam => 2,
+                ErrorUnionRefusal::NotNamed => 3,
+                ErrorUnionRefusal::Ambiguous => 4,
+                ErrorUnionRefusal::TooMany => 5,
             });
         }
         TyLoweringDiagnostic::RecordRefused { source, reason } => {
@@ -1243,7 +1260,24 @@ impl Words<'_> {
                 source: self.local()?,
                 reason: match self.u32()? {
                     0 => PatternTypeUnsupported::Pattern,
+                    1 => PatternTypeUnsupported::VariantsNeedGate,
+                    2 => PatternTypeUnsupported::VariantsOfNonEnum,
+                    3 => PatternTypeUnsupported::NotAVariant,
+                    4 => PatternTypeUnsupported::VariantFieldNotWildcard,
+                    5 => PatternTypeUnsupported::VariantShape,
                     _ => return Err(self.invalid("a pattern type not lowered for no reason")),
+                },
+            },
+            41 => TyLoweringDiagnostic::ErrorUnionRefused {
+                source: self.local()?,
+                reason: match self.u32()? {
+                    0 => ErrorUnionRefusal::NotEnabled,
+                    1 => ErrorUnionRefusal::NoLangItem,
+                    2 => ErrorUnionRefusal::TypeParam,
+                    3 => ErrorUnionRefusal::NotNamed,
+                    4 => ErrorUnionRefusal::Ambiguous,
+                    5 => ErrorUnionRefusal::TooMany,
+                    _ => return Err(self.invalid("an error union refused for no reason")),
                 },
             },
             42 => TyLoweringDiagnostic::RecordRefused {
@@ -1521,6 +1555,19 @@ mod tests {
                 source,
                 reason: PatternTypeUnsupported::Pattern,
             },
+            TyLoweringDiagnostic::PatternTypeNotLowered {
+                source,
+                reason: PatternTypeUnsupported::VariantsNeedGate,
+            },
+            TyLoweringDiagnostic::PatternTypeNotLowered {
+                source,
+                reason: PatternTypeUnsupported::VariantShape,
+            },
+            TyLoweringDiagnostic::ErrorUnionRefused {
+                source,
+                reason: ErrorUnionRefusal::NotEnabled,
+            },
+            TyLoweringDiagnostic::ErrorUnionRefused { source, reason: ErrorUnionRefusal::TooMany },
             TyLoweringDiagnostic::RecordRefused { source, reason: RecordRefusal::NotEnabled },
             TyLoweringDiagnostic::RecordRefused { source, reason: RecordRefusal::NoLangItem },
             TyLoweringDiagnostic::RecordRefused {

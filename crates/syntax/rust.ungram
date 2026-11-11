@@ -699,6 +699,7 @@ Type =
 | RefType
 | SliceType
 | TupleType
+| UnionType
 | RecordType
 | UnsafeBinderType
 
@@ -744,6 +745,10 @@ UnsafeBinderType =
 
 PatternType =
   'builtin' '#' 'pattern_type' '(' Type 'is' Pat ')'
+
+// `A | B | C`, blaze's error unions (`#![blaze::error_unions]`).
+UnionType =
+  types:(Type ('|' Type)+)
 
 // `{ a: T, b: U = default }`, blaze's record types (`#![blaze::records]`); a field's
 // default is read only in a function parameter.

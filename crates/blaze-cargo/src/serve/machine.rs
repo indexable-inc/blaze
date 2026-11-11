@@ -344,6 +344,7 @@ impl Drop for Machine {
     fn drop(&mut self) {
         if let Err(why) = self.leave() {
             tracing::warn!(target: "blaze", ledger = %self.path.display(), "leaving the machine's memory ledger: {why:#}");
+            // logged: the warn event above
             eprintln!("blaze serve: leaving the machine's memory ledger: {why:#}");
         }
     }

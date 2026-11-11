@@ -171,7 +171,8 @@ impl<'db> SemanticsImpl<'db> {
 
     pub fn attach_first_edition_opt(&self, file: FileId) -> Option<EditionedFileId> {
         let krate = self.file_to_module_defs(file).next()?.krate(self.db);
-        Some(EditionedFileId::new(self.db, file, krate.edition(self.db)))
+        let (edition, extensions) = (krate.edition(self.db), krate.extensions(self.db));
+        Some(EditionedFileId::new_with_extensions(self.db, file, edition, extensions))
     }
 
     pub fn attach_first_edition(&self, file: FileId) -> EditionedFileId {

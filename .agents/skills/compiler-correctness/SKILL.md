@@ -18,14 +18,20 @@ See [docs/no-rustc.md](../../../docs/no-rustc.md).
 ## superset-of-rust (rule 4)
 
 Own every layer from source to running code, never by narrowing what blaze accepts: every program
-the pinned nightly builds must build and behave the same under blaze, with the real std, C
-dependencies, build scripts and proc macros. The allowed differences are sandboxing and soundness:
-where rustc accepts a program because of an objective bug in rustc (a soundness hole that lets safe
-code cause undefined behavior, such as rust-lang/rust#25860, or another clear safety defect), blaze
-refuses it with a hard error naming the hole, never by default copying the bug; a mere disagreement
-with rustc's design is not such a bug. Superset means blaze may also accept more than Rust: an
-extension (new syntax, attributes, semantics) only has to work under blaze, never under rustc, as
-long as it is opt-in and every program that doesn't use it behaves exactly as under rustc.
+the pinned nightly builds must build under blaze, with the real std, C dependencies, build scripts
+and proc macros, and run correctly. Correct means what the Rust language and the pinned standard
+library define (the reference, the library's documented behavior, the program's own tests), not
+whatever rustc and LLVM happen to produce: there is no rule that blaze behaves as rustc does. Where
+rustc or LLVM is wrong, unreliable or unspecified (a miscompile, a float type a target gets wrong,
+an order nothing promises), blaze does the correct or the better thing and says so in the design;
+where real code depends on a behavior, blaze keeps it because the code depends on it, not because
+rustc does it (`useful-not-parity`). The other differences are sandboxing and soundness: where rustc
+accepts a program because of an objective bug in rustc (a soundness hole that lets safe code cause
+undefined behavior, such as rust-lang/rust#25860, or another clear safety defect), blaze refuses it
+with a hard error naming the hole, never by default copying the bug; a mere disagreement with
+rustc's design is not such a bug. Superset means blaze may also accept more than Rust: an extension
+(new syntax, attributes, semantics) only has to work under blaze, never under rustc, as long as it
+is opt-in and changes nothing for a program that doesn't use it.
 
 See [docs/no-rustc.md](../../../docs/no-rustc.md).
 
@@ -41,9 +47,9 @@ constraint either: how cargo or rustc words, colours, lays out or orders a messa
 a summary or a flag is not a reason for blaze to do the same; design it as blaze would from scratch
 (structured data first, rendered for a person on a terminal and as data for an agent) and change it
 freely when a better way is found. Tests check what makes the result useful and correct, never that
-it equals rustc's or cargo's. `superset-of-rust` is unchanged: every program the pinned nightly
-builds still builds and runs as it does under rustc, except one that only builds through a rustc
-soundness bug.
+it equals rustc's or cargo's. `superset-of-rust` still holds what blaze accepts: every program the
+pinned nightly builds still builds, and runs correctly by Rust's semantics, except one that only
+builds through a rustc soundness bug.
 
 ## blaze-uses-its-extensions (rule 6)
 
@@ -137,8 +143,14 @@ the solver refuses), say so, and build the missing piece: finish the nightly fea
 front end where one exists (generic const expressions, specialization as blaze already has it), or
 add the smallest general primitive where none does (`library-over-language`), as an opt-in extension
 that changes no program that does not use it (`superset-of-rust`). Then use it in blaze's own code
-(`blaze-uses-its-extensions`). A workaround written because "stable const generics can't do that" is
-a subpar design to fix (`guard-the-cause`): the spec names the feature it needs and its ledger row.
+(`blaze-uses-its-extensions`). The same holds when nothing is blocked but the code pays for the gap:
+an abstraction that costs at run time (a `dyn` call, a clone, a heap box, a runtime check, a lock)
+only because the language cannot state it statically, boilerplate repeated because the language
+cannot abstract it, or an invariant kept by convention because no type can hold it. blaze's own
+crates are where the language is tried (dogfooding): whoever writes blaze code and finds such a
+place proposes the feature that would make it zero-cost or direct, unasked, as a short spec with its
+ledger row, and builds it. A workaround written because "stable const generics can't do that" is a
+subpar design to fix (`guard-the-cause`): the spec names the feature it needs and its ledger row.
 
 See [docs/v2/plan/design/edition.md](../../../docs/v2/plan/design/edition.md).
 

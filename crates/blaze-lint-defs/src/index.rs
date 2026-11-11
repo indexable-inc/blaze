@@ -111,7 +111,12 @@ const FCW_GROUPS: [&str; 5] = [
 pub(super) const fn fcw_group(lint: &Lint) -> Option<usize> {
     match lint.future_incompatible {
         Some(future) => match future.reason.edition() {
-            Some(edition) => Some(edition as usize),
+            Some(
+                edition @ (Edition::Edition2015
+                | Edition::Edition2018
+                | Edition::Edition2021
+                | Edition::Edition2024),
+            ) => Some(edition as usize),
             None => Some(FCW_GROUPS.len() - 1),
         },
         None => None,

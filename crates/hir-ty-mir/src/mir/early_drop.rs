@@ -26,7 +26,7 @@ mod frontier;
 
 use base_db::Db;
 use blaze_mem::{Frame, Tag, frame};
-use hir_def::{DefWithBodyId, signatures::FunctionSignature};
+use hir_def::{DefWithBodyId, HasModule as _, signatures::FunctionSignature};
 use la_arena::RawIdx;
 use rustc_type_ir::{TypeVisitableExt as _, inherent::IntoKind as _};
 

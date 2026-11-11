@@ -213,6 +213,36 @@ fn a_build_scripts_steps_follow_each_generic_from_the_crate_that_asks_for_it() {
     );
 }
 
+/// std's randomness and wall clock are leaves a build script's provider answers
+/// (docs/v2/plan/design/determinism.md): the walk stops at them, and the proof says which it
+/// uses, so the driver keys the run by `SOURCE_DATE_EPOCH` when it asks the time.
+#[test]
+fn a_hash_maps_keys_and_the_wall_clock_are_the_providers() {
+    pure(
+        r#"
+//- /build.rs crate:build_script deps:std
+fn main() {
+    let keys = std::hash::RandomState::new();
+    let _ = keys.k0;
+    println!("cargo:rustc-cfg=has_x");
+}
+"#,
+        Effects::PRINT.union(Effects::SEEDED),
+        &[],
+    );
+    pure(
+        r#"
+//- /build.rs crate:build_script deps:std
+fn main() {
+    let now = std::time::SystemTime::now();
+    let _ = now.seconds;
+}
+"#,
+        Effects::WALL,
+        &[],
+    );
+}
+
 #[test]
 fn printing_constants_is_pure() {
     pure(

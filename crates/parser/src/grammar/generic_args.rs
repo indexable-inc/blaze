@@ -12,15 +12,17 @@ pub(super) fn opt_generic_arg_list_expr(p: &mut Parser<'_>) {
         return;
     }
 
-    delimited(
-        p,
-        T![<],
-        T![>],
-        T![,],
-        || "expected generic argument".into(),
-        GENERIC_ARG_FIRST,
-        generic_arg,
-    );
+    p.with_unions(true, |p| {
+        delimited(
+            p,
+            T![<],
+            T![>],
+            T![,],
+            || "expected generic argument".into(),
+            GENERIC_ARG_FIRST,
+            generic_arg,
+        )
+    });
     m.complete(p, GENERIC_ARG_LIST);
 }
 

@@ -114,7 +114,8 @@ fn a_builds_history_row_names_its_request_its_command_and_its_workspace() {
     assert_eq!(row.build_id, 41);
     assert_eq!(row.command, "tables");
     assert_eq!(row.workspace, format!("view {}", ContentId([4; 32])));
-    assert_eq!((row.hits, row.misses, row.joined), (Some(5), Some(3), Some(1)));
+    // `misses` is the history's to fill: the count of the build's rows in `misses`.
+    assert_eq!((row.hits, row.misses, row.joined), (Some(5), None, Some(1)));
     assert!(row.dur_ns.is_some_and(|it| it >= 0) && row.started_unix_ns.is_some(), "{row:?}");
     let stalled = agents.row(RequestId(42), None, blaze_profile::history::Outcome::Stalled);
     assert_eq!((stalled.outcome, stalled.hits), (blaze_profile::history::Outcome::Stalled, None));

@@ -40,7 +40,7 @@ use std::ops::ControlFlow;
 use base_db::Db;
 use blaze_mem::Frame;
 use hir_def::{
-    CallableDefId, TraitId, attrs::AttrFlags, hir::ExprId, signatures::FunctionSignature,
+    AdtId, CallableDefId, TraitId, attrs::AttrFlags, hir::ExprId, signatures::FunctionSignature,
     upvars::upvars_mentioned,
 };
 use rustc_ast_ir::Mutability;
@@ -478,6 +478,47 @@ where
         debug!("coerce_borrowed_pointer: succeeded ty={:?} adjustments={:?}", ty, adjustments);
 
         success(adjustments, ty, obligations)
+    }
+
+    /// blaze (`#![blaze::error_unions]`): a value of a member of the error union `b`, or of a
+    /// union of some of its members, coerces to `b` (`Adjust::ErrorUnion`), when
+    /// `b: UnionFrom<a>` holds now (an ambiguous goal does not widen); the solver picks the member
+    /// (`rustc_next_trait_solver`'s `error_union`), the same answer `?` gets through `From`.
+    /// `None` when `b` is no error union, the crate has no unions, or the goal fails, so the
+    /// coercion goes on to plain unification as in Rust.
+    fn coerce_to_error_union(&mut self, a: Ty<'db>, b: Ty<'db>) -> Option<CoerceResult<'db, 'f>> {
+        let TyKind::Adt(def, _) = b.kind() else { return None };
+        let interner = self.interner();
+        let lang = interner.lang_items();
+        let (Some(union), Some(union_from)) = (lang.ErrorUnion, lang.ErrorUnionFrom) else {
+            return None;
+        };
+        if def.def_id() != AdtId::StructId(union) || a == b {
+            return None;
+        }
+        if !interner.krate()?.extensions(self.db()).error_unions() {
+            return None;
+        }
+        let widened = self.commit_if_ok(|this| {
+            let predicate = TraitRef::new(interner, union_from.into(), [b, a]);
+            let obligation = Obligation::new(interner, this.cause, this.param_env(), predicate);
+            let mut ocx = ObligationCtxt::new(this.infcx());
+            ocx.register_obligation(obligation);
+            if !ocx.try_evaluate_obligations().is_empty() {
+                return Err(TypeError::Mismatch);
+            }
+            // Still ambiguous (a member of the source is not yet known well enough to say which
+            // member of the union it is): no widening, so the source unifies with the union, as
+            // rustc's own coercions do when theirs is ambiguous.
+            let pending = ocx.into_pending_obligations();
+            if !pending.is_empty() {
+                return Err(TypeError::Mismatch);
+            }
+            let mut adjustments = Vec::with_capacity_in(1, this.frame);
+            adjustments.push(Adjustment { kind: Adjust::ErrorUnion, target: b.store() });
+            success(adjustments, b, pending)
+        });
+        widened.ok().map(Ok)
     }
 
     /// Performs [unsized coercion] by emulating a fulfillment loop on a

@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: What a link after a one-function edit costs, step by step, and the design that makes it cost the edit. Built - the link as a patch of its file (ranges written, a Merkle digest of the file), link inputs kept beside the database and brought forward by the build's delta, function, static and span rows kept per image with one keyed Merkle digest as the link's id, and the spans that count each. Not built - the address and perf maps as patches, the writer's tables built by block, a store that takes a patch, the patch regions' room out of the file (designed here).
+summary: What a link after a one-function edit costs, step by step, and the design that makes it cost the edit. Built - the link as a patch of its file (ranges written, a Merkle digest of the file), link inputs kept beside the database and brought forward by the build's delta, function, static and span rows kept per image with one keyed Merkle digest as the link's id, and the spans that count each. Not built - the address and perf maps as patches, the writer's tables built by block, the patch regions' room out of the file's length (the compact file, designed here; the room already costs no bytes written, hashed, copied or stored, written 2026-11-11 and not yet built or run).
 date: 2026-11-10
 ---
 # Patch in place
@@ -23,7 +23,7 @@ numbers after it are the main lane's to measure.
 | Slots of a live image | `link delta` | the patchable (workspace) functions, each a search |
 | What running code assumes | `live assumed` | the workspace's items (`crate_hashes` columns), as before |
 | Stage and commit | `link patch` | the linker's: the new code, its callers, the cell, and the writer's tables (see Not built) |
-| Whole file for the store | `link copy` | the file's length, until the store takes a patch |
+| The file for the store | `link copy` | nothing for an edit the store derives; else the bytes of the file's runs, never its length |
 | Maps | `link tables` | nothing unless the target directory keeps layout profiles or a `perf` directory; then the whole map (see Not built) |
 
 ## Why `link inputs` varied
@@ -110,21 +110,67 @@ since the last link".
 - **`blaze why`** names `Full::NoRoom`, `NoThunk`, `Output`, `Layout` on the link line. Why
   the rows or the inputs were made whole is on the spans only (`whole`); a line needs a
   field in `blaze_api::LinkHow`.
-- **A store that takes a patch**, and the dev run's whole-file copy: the store lane's.
 - **A test binary** still reads every span table (`Generated::spans`) for its execution
   table and its tests' selection.
 
-## The patch room out of the file (designed 2026-11-10, not built)
+## The patch room (2026-11-11; written, not built or run)
 
-Hello world's dev executable is 162,021,720 bytes, and at least 134,217,728 of them are the
-room of `Class::Patch` and `Class::PatchData` (64 MiB each, `place.rs` `patch_room`). The
-room is zeros the digest never hashes (its tree is sparse) and a clone never copies; it
-costs where the file is made whole (`Image::file`, `Filed::written`'s `link copy`, a store
-put of `Written::Linked`): 162 MB allocated, zeroed and written. Expected once built: about
-27.8 MB (162,021,720 less 134,217,728, less nothing else: each used part is rounded up to
-64 KiB), a few MB less with the debug info beside it. Measure with `ls -l`, `du`, and
-`readelf -lW` (two more `LOAD`s, `MemSiz` past `FileSiz` on the two that end in a patch
-region).
+Hello world's dev executable is 162,021,720 bytes long, and at least 134,217,728 of them are
+the room of `Class::Patch` and `Class::PatchData` (64 MiB each, `place.rs` `patch_room`).
+
+**The design chosen, for ELF, Mach-O and PE alike: the room is a hole.** Addresses, the order
+of regions and `offset = addr - base` stay, so the room has file offsets (a splice writes the
+code it adds there, a dev run's code memory holds it there, and a live patch names it there)
+and no bytes: no step writes, reads, hashes, copies or stores a byte of room nothing used. A
+splice fills only what it uses, as before. Every step that made the file at its length is
+changed to work on the runs of it that hold bytes:
+
+| Where the room cost | Was, per link that writes the whole file | Now |
+|---|---|---|
+| The file for the store (`link copy`, `Filed::written`) | the file's length allocated, zeroed and copied | `Written::Runs`: the patch's writes moved, or `Image::file_runs`; the span's `bytes` are the runs' |
+| The store's record (`Put`) | the file's length hashed for its content id and chunked (`CHUNK_FROM`) into the pack | the recipe of the runs over the base of holes (`blaze_cas::derived::holes`, 16 KiB of zeros put once): `Kind::Derived`, as an edit's is |
+| The store's file of it (`placed/`) and a place from it | the file's length written twice (where it goes and as the store's file), then written back | the base's clone cut to the length (holes) with the runs written; a place of it is a clone, which keeps holes |
+| A dev run's code memory (`Image::commit_into`, `write_into`) | the gaps of a file written whole filled with zeros and published: the room's length of memory in the object and an instruction-cache pass over it | `CodeMemory::zero` fills only pages something wrote since the object was made |
+| The Mach-O signature (`sign.rs`) | every page of the room gathered and hashed (SHA-256 of 128 MiB) | a page nothing is in takes the zero page's hash (`View::hole`) |
+
+The place of the build that made the file (`Store::place_made`, the file's runs into a file
+of holes), the commit's own file (`Truncate`, then `WriteAt` of the extents) and the digest
+(a sparse Merkle tree) never touched the room.
+
+What this leaves: the file's *length* is still its addresses' (`ls -l` says 162 MB, `du`
+says the content), each segment's file size still spans the hole (`readelf -l` shows the room
+as file bytes of `LOAD`s), and Mach-O's signature still holds 32 bytes a 4 KiB page of room
+(about 1 MiB). A tool that copies without looking for holes (`cat`, an upload) writes the
+zeros. The key of a link is unchanged: what decides the layout (`Output::incremental`) was in
+it already.
+
+**Why not the room as memory only (`p_filesz = 0`, `vmsize > filesize`).** The room is in the
+middle of its segment (code, room, stubs; data, room, thread-locals), so it splits each into
+three; on ELF the room of the code would be anonymous executable memory, which SELinux's
+`execmem` refuses where a mapping of a file's hole is ordinary; on Mach-O an executable page
+must be in the signed file. And it would save nothing the hole does not: the kernel reads no
+disk for a hole.
+
+**Why not no room in the file's offsets (the compact file, below).** It is the better file:
+its length is its content. It needs two coordinates (the file's offset and the image's),
+segments split at each hole, and what follows a room moved in the file when the room's used
+part doubles. It is still the design to build, with the linker's tests and a dev run at each
+step; nothing here is in its way, since every consumer above already takes runs.
+
+**Release.** `Output::incremental` stays on for every native profile. `blaze_lazy::allow`
+decides only live patching; the room is what makes the next `blaze build` of a release
+profile a splice of its file (`Linking::Spliced`), which no profile refuses, and what lets an
+image nothing changed keep its file byte for byte (`relink`'s `unchanged`). A release file
+without room is a decision of release edit time against a file that copies whole anywhere;
+it is not made here.
+
+**`strip`.** Not honoured in the writer (ledger D44's lane). `strip --strip-debug` on an
+image fails to load because the tool lays the file out again by its section headers: the
+relro `PT_LOAD` ends in memory past its file bytes with file-backed segments after it, and
+every offset is an address, neither of which it keeps (read from the writer, `elf/image.rs`;
+not run).
+
+### The compact file (designed 2026-11-10, not built)
 
 - **Why it is not a change of the writers alone.** Every writer gives a region the offset
   `addr - base` (`elf.rs` `offset`), and three things rest on that: a dev run's code memory
@@ -164,6 +210,13 @@ region).
   each step.
 
 ## Tests
+
+- The room: `crates/blaze-cas/src/tests/place_crash.rs`, the invariant
+  `an_image_put_as_its_runs_over_holes_is_placed_writing_its_runs_and_none_of_its_room` and
+  its control `the_oracle_catches_an_image_put_whole_with_its_room`;
+  `crates/blaze-cas/src/derived.rs` `a_file_of_runs_over_the_base_of_holes_is_a_recipe_of_its_runs_alone`;
+  `crates/blaze-inproc/src/tests.rs` `zeroing_fills_only_the_pages_that_were_written`;
+  `crates/blaze-link/src/macho/sign.rs` `a_view_with_room_signs_as_the_assembled_file`.
 
 - `crates/blaze-ids/src/keyed.rs`: the refinement
   `a_keyed_set_kept_by_edits_is_the_set_made_whole`, control

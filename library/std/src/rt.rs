@@ -117,6 +117,10 @@ unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
     unsafe {
         sys::init(argc, argv, sigpipe)
     };
+
+    // blaze: the provider this process was given, read before `main` can change the
+    // environment (`sys::provider`).
+    sys::provider::init();
 }
 
 /// Clean up the thread-local runtime state. This *should* be run after all other

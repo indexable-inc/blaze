@@ -221,6 +221,12 @@ impl<'db> Spell<'db> {
                 self.ty(element)?;
                 self.konst(len)?;
             }
+            // blaze: a refinement by enum variants (`#![blaze::pattern_types]`) has its base
+            // enum's layout, ABI and code, so its identity is its base type's: the code of
+            // `f::<Conn is Conn::Open { .. }>` is the code of `f::<Conn>`.
+            TyKind::Pat(base, pattern) if pattern.kind().is_variants() => {
+                self.ty(base)?;
+            }
             TyKind::Pat(base, pattern) => {
                 self.u8(9);
                 self.ty(base)?;
@@ -445,6 +451,10 @@ impl<'db> Spell<'db> {
                 }
             }
             PatternKind::NotNull => self.u8(2),
+            PatternKind::Variant { index } => {
+                self.u8(3);
+                self.u32(index);
+            }
         }
         Ok(())
     }

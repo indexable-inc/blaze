@@ -447,11 +447,59 @@ pub struct NeverGiven {
     pub thread: String,
     /// The call stack of the ask ([`std::backtrace::Backtrace::force_capture`]).
     pub backtrace: String,
+    /// The persisted state this process restored from ([`note_restored`]): a key decoded from
+    /// it is the first suspect. `None` for a process that restored nothing.
+    pub restored: Option<RestoredFrom>,
+}
+
+/// The persisted state a process restored its state from, as a host noted it
+/// ([`note_restored`]): what a [`NeverGiven`] names, so the report of a key no database gave
+/// says which file may hold it and what checks that file.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RestoredFrom {
+    /// The file, as a person names it: `/home/v2/db/image`.
+    pub file: String,
+    /// Its format: the layout it was written in.
+    pub format: String,
+    /// Its content hash, as the host's log names it.
+    pub hash: String,
+}
+
+static RESTORED: std::sync::OnceLock<RestoredFrom> = std::sync::OnceLock::new();
+
+/// Notes that this process restored its state from `from`. The first note stands (a process
+/// restores once, at its start).
+pub fn note_restored(from: RestoredFrom) {
+    _ = RESTORED.set(from);
+}
+
+/// What [`note_restored`] was told, if anything.
+pub fn restored_from() -> Option<&'static RestoredFrom> {
+    RESTORED.get()
+}
+
+impl NeverGiven {
+    /// What the report says of the persisted state: the file to suspect and the command that
+    /// checks it, or that the process restored nothing so no file is the cause.
+    fn restore_said(&self) -> String {
+        match &self.restored {
+            // alloc: an error's text, once
+            Some(RestoredFrom { file, format, hash }) => format!(
+                "this process restored its state from {file} (format {format}, hash {hash}), \
+                 so that restore is suspect: `blaze doctor` checks the file and prints the \
+                 command that sets it aside"
+            ),
+            // alloc: as above
+            None => "this process restored no persisted state, so no restored file holds the key"
+                .to_owned(),
+        }
+    }
 }
 
 impl fmt::Display for NeverGiven {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let NeverGiven { query, key, page, pages, view, asker, frames, thread, backtrace } = self;
+        let NeverGiven { query, key, page, pages, view, asker, frames, thread, backtrace, .. } =
+            self;
         write!(
             f,
             "`{query}` was asked for the key Id({key}), an ID this database never gave (its page \
@@ -475,7 +523,11 @@ impl fmt::Display for NeverGiven {
             )?,
             None => f.write_str("; asked from outside any query")?,
         }
-        write!(f, ", on thread `{thread}`; the call stack of the ask:\n{backtrace}")
+        write!(
+            f,
+            ", on thread `{thread}`; {}; the call stack of the ask:\n{backtrace}",
+            self.restore_said()
+        )
     }
 }
 
@@ -508,6 +560,7 @@ pub(crate) fn never_given(storage: &Storage, index: u32, id: Id) -> ! {
         frames,
         thread: thread.name().unwrap_or("(unnamed)").to_owned(), // alloc: an error's text, once
         backtrace: std::backtrace::Backtrace::force_capture().to_string(), // alloc: as above
+        restored: restored_from().cloned(), // clone: an error's text, once
     };
     tracing::error!(target: "blaze", never_given = %out, "a query was asked for a key its database never gave and fails");
     std::panic::resume_unwind(Box::new(out)) // alloc: an unwind's payload

@@ -468,6 +468,9 @@ pub enum ComptimeForm {
     BinderBound,
     /// `const static { .. }`, a `const` block evaluated with no const checking.
     Block,
+    /// `where const { COND }`, a where predicate that is a `bool` constant over the generic
+    /// parameters.
+    WhereConst,
 }
 
 impl ComptimeForm {
@@ -478,6 +481,7 @@ impl ComptimeForm {
             ComptimeForm::ReflectedField => "a reflected field access `base.[field]`",
             ComptimeForm::BinderBound => "a bounded type parameter in a `for<..>` binder",
             ComptimeForm::Block => "a `const static { .. }` block",
+            ComptimeForm::WhereConst => "a `where const { .. }` condition",
         }
     }
 
@@ -485,9 +489,10 @@ impl ComptimeForm {
     /// evaluation of any code at compile time.
     pub fn part(self) -> &'static str {
         match self {
-            ComptimeForm::ForConst | ComptimeForm::ReflectedField | ComptimeForm::BinderBound => {
-                "compile-time reflection"
-            }
+            ComptimeForm::ForConst
+            | ComptimeForm::ReflectedField
+            | ComptimeForm::BinderBound
+            | ComptimeForm::WhereConst => "compile-time reflection",
             ComptimeForm::Block => "compile-time evaluation",
         }
     }
@@ -1981,7 +1986,7 @@ impl ExpressionStore {
                     visitor.on_anon_const_expr(default.expr);
                 }
             }
-            TypeRef::Tuple(types) => visitor.on_types(types),
+            TypeRef::Tuple(types) | TypeRef::Union(types) => visitor.on_types(types),
             TypeRef::Path(path) => visitor.on_path(path),
             TypeRef::RawPtr(inner, _) | TypeRef::Slice(inner) => visitor.on_type(inner),
             TypeRef::Reference(RefType { ty, lifetime, mutability: _ }) => {

@@ -309,6 +309,14 @@ impl Printer<'_> {
                 }
             }
             ast::Type::MacroType(it) => self.source(it.syntax()),
+            ast::Type::UnionType(it) => {
+                for (at, member) in it.types().enumerate() {
+                    if at > 0 {
+                        self.word(" | ");
+                    }
+                    self.opt_ty(Some(member));
+                }
+            }
             // blaze's record type (`#![blaze::records]`), as written.
             ast::Type::RecordType(it) => self.source(it.syntax()),
             ast::Type::UnsafeBinderType(it) => {

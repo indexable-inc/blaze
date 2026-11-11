@@ -72,6 +72,14 @@ impl Probe for Recorder {
         crate::wait_ended(token);
     }
 
+    /// A `wait` span of kind io whose `awaits` is `io <op> <file>`: a driver's thread off its
+    /// loop in a clone, a write-back or a listing (`blaze_core::lock::io_wait`).
+    fn io_begin(&self, op: &'static str, file: &str) -> Option<u64> {
+        // alloc: once a file call off a driver's loop, its span's `awaits` (interned by the span)
+        let awaited = format!("io {op} {file}");
+        Some(crate::wait_began(WaitKind::Io, &awaited, None))
+    }
+
     fn record(&self, wait: &LockWait) {
         record(wait);
     }

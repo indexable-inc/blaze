@@ -106,11 +106,19 @@ impl fmt::Display for SqlError {
             SqlError::Io { path, doing, error } => {
                 write!(f, "blaze debug sql: {doing} {}: {error}", path.display())
             }
-            SqlError::Duckdb { message, sql, script } => write!(
-                f,
-                "DuckDB refused the query: {message}\nthe query:\n{sql}\nthe script DuckDB ran: {}",
-                script.display()
-            ),
+            SqlError::Duckdb { message, sql, script } => {
+                write!(
+                    f,
+                    "DuckDB refused the query: {message}\nthe query:\n{sql}\nthe script DuckDB ran: {}",
+                    script.display()
+                )?;
+                // A column it does not know: the columns the query's tables do have, so the
+                // next query is right without a look at the schema's source.
+                match crate::describe::hint(message, sql) {
+                    Some(hint) => write!(f, "\n{hint}"),
+                    None => Ok(()),
+                }
+            }
             SqlError::Answer { path, error } => {
                 write!(f, "reading DuckDB's answer {}: {error}", path.display())
             }

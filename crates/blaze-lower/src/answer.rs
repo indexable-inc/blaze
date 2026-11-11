@@ -193,10 +193,10 @@ fn anchor(
         // alloc: the message of a question refused.
         return Err(format!("file_id {raw_file:#x} has its reserved bit set"));
     }
-    if (raw_file & Raw::EDITION_MASK) >> Raw::FILE_ID_BITS > span::Edition::LATEST as u32 {
+    if !Raw::is_valid_raw(raw_file) {
         // alloc: the message of a question refused.
         return Err(format!(
-            "file_id {raw_file:#x} names an edition past {}",
+            "file_id {raw_file:#x} names an edition past {} or syntax extensions there are not",
             span::Edition::LATEST
         ));
     }

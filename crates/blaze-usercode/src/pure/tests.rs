@@ -111,6 +111,47 @@ fn an_effect_the_proof_said_absent_is_an_error_naming_the_script() {
     assert!(refused(listed, &proof()).contains("listed /ws/p/src"));
 }
 
+/// A pure script refused for randomness says which process read it, by which system call and
+/// from where: on 2026-11-10 the error said `Random` alone, and the script's processes could
+/// not be traced from outside (its launcher starts them).
+#[test]
+fn an_untraceable_read_names_the_process_that_made_it() {
+    use crate::calls::{self, Call, Made, Module, Phase};
+    let tools: Vec<PathBuf> = TOOLS.iter().map(PathBuf::from).collect();
+    let places = places(&tools);
+    let made = Made {
+        what: "random".to_owned(),
+        pid: 4711,
+        inside_pid: Some(7),
+        program: places.program.display().to_string(),
+        argv0: "build-script-build".to_owned(),
+        syscall: "getrandom".to_owned(),
+        number: 318,
+        phase: Phase::Loading,
+        ip: 0x7f1c_2a0e_4b2d,
+        module: "/usr/lib/libc.so.6".to_owned(),
+        kind: Module::Libc,
+    };
+    calls::left(places.program, vec![Call::Made(made)]);
+    let mut random = traced(&[]);
+    random.untraceable.push(Untraceable::Random);
+    let error = check("p v0.1.0", &proof(), &places, &random).unwrap_err().0;
+    calls::left(places.program, Vec::new());
+    assert!(error.starts_with("the build script of `p v0.1.0` was proved pure"), "{error}");
+    for part in [
+        "(Random)",
+        "by process 4711 (7 in the sandbox)",
+        "(argv[0] `build-script-build`), made `getrandom` (system call 318)",
+        "from libc (`/usr/lib/libc.so.6`, at 0x7f1c2a0e4b2d)",
+        "before the program's `main` (a heuristic",
+    ] {
+        assert!(error.contains(part), "{part}: {error}");
+    }
+    // With no caller described, the error says so: never a caller of another kind or run.
+    let error = check("p v0.1.0", &proof(), &places, &random).unwrap_err().0;
+    assert!(error.contains("which process read it is not known"), "{error}");
+}
+
 #[test]
 fn what_a_run_printed_and_wrote_is_checked_against_the_proof() {
     let value = |stdout: &[u8], files: Vec<OutFile>| Value {

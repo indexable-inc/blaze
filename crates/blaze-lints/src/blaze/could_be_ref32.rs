@@ -143,7 +143,7 @@ fn fix(
                         return None;
                     }
                     let (file, whole) = at(init.expr)?;
-                    let (_, inner) = at(*receiver)?;
+                    let (_, inner) = at(receiver)?;
                     let text = db.file_text(file).text(db);
                     let kept = text.get(usize::from(inner.start())..usize::from(inner.end()))?;
                     edits.push((diag::of_file(file, whole), kept.to_owned()));

@@ -49,7 +49,7 @@ mod flags;
 mod handle;
 #[cfg_attr(
     not(test),
-    allow(dead_code, reason = "lane 4b of docs/v2/plan/design/store-pool.md: the pinned read and the sweep are the readers' to call once they are on the pool (the read port's step 3)")
+    allow(dead_code, reason = "docs/v2/plan/design/store-pool.md: a pinned read through a pump (`Hot::pin_pack`) is a test's on the simulation; the index slots and files of their own are not on the pool yet")
 )]
 mod hot;
 mod index;
@@ -101,8 +101,10 @@ pub use crate::driven::Driven;
 use crate::flags::{FLAGS, Flag, Row};
 pub use crate::handle::Handle;
 pub use crate::peers::SharedConfig;
+pub use crate::pool::counts::{PoolCounts, pool_counts};
 pub use crate::pump::{Inline, Pump, PumpError};
 pub use crate::read::Pinned;
+pub use crate::publish::Sparse;
 use crate::publish::{Content, Flushed, Patching};
 use crate::read::{
     ExternalView, Index, Look, PackView, Place, Seg, Shared, Spot, TierView, View, carry_flags,
@@ -531,18 +533,20 @@ impl Config {
     }
 }
 
-/// How a store loads the pages a read needs that are not in memory
-/// (docs/v2/plan/design/store-pool.md, lane 4b). The store itself does no IO either way: a miss
-/// asks for its pages as effects, and this says who completes them. Nothing reads it until the
-/// store's reads are on its buffer pool; a store maps what it reads until then.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+/// How a store loads the pages of its packs a read needs that are not in memory
+/// (docs/v2/plan/design/store-pool.md, lane 4b): every read of a pack goes through the
+/// store's buffer pool, and no pack is mapped.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Loader {
-    /// A thread of the store's own drives the pool's reads on the target's native driver, and a
-    /// task that reads waits for its load through the one deadline wait: the daemon's.
-    #[default]
-    Thread,
-    /// Whoever drives the store's effects loads a miss by pumping them to completion where the
-    /// read is made: a test on the simulation, a tool. The store starts no thread.
+    /// A thread of the store's own drives the pool's reads on the target's native driver over
+    /// `root` (the root of the driver that drives the store: its file names are under it),
+    /// and a task that reads waits for its load in a span naming the pages: the daemon's.
+    /// Pages are loaded as they are read and given back by the sweep within the pool's
+    /// budget.
+    Thread { root: std::path::PathBuf },
+    /// The store starts no thread, and whoever drives its effects carries out its loads: a
+    /// test on the simulation, a tool. A read can carry out no effect, so the store asks for
+    /// what each pack commits as the pack opens, and holds it in memory from then on.
     Pumped,
 }
 
@@ -776,6 +780,12 @@ pub(crate) enum PlacePlant {
     /// A whole file is cloned from as soon as it is sealed, its write-back begun but not
     /// waited for: the clone forces the file's dirty data out and waits for it.
     ClonesUnflushed,
+    /// An output placed from its maker's bytes ([`Store::place_made`]) is written into a file
+    /// under `placed/` and cloned from it to its path at once ([`publish::Plant`]).
+    MadeClonesUnflushed,
+    /// As [`PlacePlant::MadeClonesUnflushed`], with the file's write-back waited for before
+    /// the clone: the answer waits for a write-back.
+    MadeWaitsForWriteBack,
 }
 
 /// Whether a value can be the base of a derived one ([`Reader::derivable`]).
@@ -926,6 +936,9 @@ pub struct Store {
     /// The outputs being made of a clone of their base with ranges written
     /// ([`Content::Patch`]), by the tag their place was asked with.
     patching: HashMap<Tag, Patching, Global>, // alloc: the store's own table, for its life
+    /// The outputs being written from the runs their maker holds ([`Content::Sparse`],
+    /// [`Store::place_made`]), by the tag their place was asked with.
+    writing: HashMap<Tag, publish::Writing, Global>, // alloc: the store's own table, for its life
     /// The whole files of outputs placed by cloning ([`CLONE_FROM`]), by content.
     files: ByHash<ContentId, PlacedFile, Global>, // alloc: the store's own table, for its life
     /// The whole files that are derived values' ([`Kind::Derived`]), each by its key's hash
@@ -986,6 +999,12 @@ pub struct Store {
     /// no writer's segment, so a flush makes nothing durable and a reopen has lost every put.
     #[cfg(test)]
     plant_no_drain: bool,
+    /// A test's hold on the moves of the batches committed while it is set, as a mapping
+    /// still to come held them before packs were read through the pool: the window between
+    /// a commit's head and its moves, which a file of its own still opens, kept open until
+    /// [`Store::release_moves`].
+    #[cfg(test)]
+    hold_moves: bool,
 }
 
 /// A way to read a store from any thread, with no lock: [`Store::reader`].
@@ -1031,6 +1050,25 @@ impl Reader {
         self.look(guard).has(key)
     }
 
+    /// A hint that the values of `keys` are about to be read: the pages of the store's pool
+    /// their records are in and that are not in memory are read ahead of the reads, as one
+    /// plan, records that are neighbours in a pack in one read
+    /// (docs/v2/plan/design/store-pool.md, section 5). What a step that knows what it is
+    /// about to read calls first (codegen, with the templates of the functions it compiles).
+    ///
+    /// It only plans: it reads nothing itself and waits for nothing. The pool's loader issues
+    /// the reads while no read a task waits for is in flight, and within the prefetch budget
+    /// (an eighth of the pool's budget, and never more than the room left in it), so a hint
+    /// neither delays a demand read nor makes one give pages back. A plan replaces the plan
+    /// before it. On a store with no loader (its misses pumped) the packs are in memory
+    /// already, and nothing is handed on.
+    pub fn prefetch(&self, guard: &Guard, keys: &[Key]) -> Prefetch {
+        let runs = self.look(guard).runs_of(keys);
+        let mut hint = Prefetch::of(&runs);
+        hint.handed = self.shared.side().is_some_and(|side| side.prefetch(runs));
+        hint
+    }
+
     /// Whether the value of `base` can be the base of a derived one ([`Kind::Derived`]): it
     /// is there, kept as a whole file (an output long enough, or a derived value), and fewer
     /// than half of [`derived::CHAIN_MOST`] derived values in a row end at it, so no chain
@@ -1066,6 +1104,65 @@ impl Reader {
         Derivable::No(NoBase::Chain(most))
     }
 
+    /// The file the value of `key` is, as bytes: its own bytes, or for a derived value
+    /// ([`Kind::Derived`], whose bytes are a recipe) its base's file with each recipe's
+    /// ranges written and its length set, down the chain to a value that is no recipe.
+    /// `None` when the store has no value of `key`. For a caller that reads an output back by
+    /// its bytes (a dev executable adopted from a record): [`Reader::get`] of a derived value
+    /// gives the recipe, never the file. Bounded by [`derived::CHAIN_MOST`]; a longer chain,
+    /// a base the store lacks and a recipe that cannot be read are errors naming the key.
+    pub fn file_of(&self, guard: &Guard, key: &Key) -> Result<Option<Vec<u8>>, String> {
+        let look = self.look(guard);
+        // alloc: the recipes' keys, newest first; once per file read back
+        let mut chain: Vec<Key> = Vec::new();
+        let mut at = *key;
+        let mut out = loop {
+            // alloc: the error of a corrupt value
+            let entry = look.get(&at).map_err(|corrupt| corrupt.to_string())?;
+            let entry = match entry {
+                Some(entry) => entry,
+                None if chain.is_empty() => return Ok(None),
+                // alloc: an error, once
+                None => {
+                    return Err(format!(
+                        "the derived value {key:?} is made from {at:?}, which the store does not hold"
+                    ));
+                }
+            };
+            if entry.kind != Kind::Derived {
+                // alloc: the file, which the caller owns
+                break entry.bytes.to_vec();
+            }
+            if chain.len() as u32 > derived::CHAIN_MOST {
+                // alloc: an error, once
+                return Err(format!(
+                    "the derived value {key:?} is the last of more than {} derived values in a row",
+                    derived::CHAIN_MOST
+                ));
+            }
+            let recipe = derived::decode(entry.bytes)
+                // alloc: an error, once
+                .map_err(|why| format!("the derived value {at:?} holds {why}"))?;
+            chain.push(at);
+            at = recipe.base;
+        };
+        // Oldest first: each recipe over the file before it.
+        for at in chain.iter().rev() {
+            // alloc: the error of a corrupt value
+            let entry = look.get(at).map_err(|corrupt| corrupt.to_string())?;
+            let recipe = entry
+                .and_then(|entry| derived::decode(entry.bytes).ok())
+                // alloc: an error, once
+                .ok_or_else(|| format!("the derived value {at:?} went while its file was made"))?;
+            out.resize(recipe.len as usize, 0);
+            for (offset, bytes) in recipe.ranges() {
+                let offset = offset as usize;
+                out[offset..offset + bytes.len()].copy_from_slice(bytes);
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// Whether the put that got `ticket` is durable.
     pub fn durable(&self, ticket: Ticket) -> bool {
         self.shared.durable(ticket)
@@ -1073,6 +1170,38 @@ impl Reader {
 
     fn look<'g>(&'g self, guard: &'g Guard) -> Look<'g> {
         Look::new(&self.shared, Held::task(guard))
+    }
+}
+
+/// A store's pool as one walk of its pages' state words found it ([`Store::pool_census`]):
+/// a sample, exact only while nothing else runs. Bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PoolCensus {
+    /// In memory or on their way in or out: the pool's charge.
+    pub loaded: u64,
+    /// Of `loaded`, pinned by a reader, a value held past its task or a commit.
+    pub pinned: u64,
+    /// Of `loaded`, what a sweep could give back now.
+    pub evictable: u64,
+    /// Of `loaded`, prefetched and not yet read.
+    pub unread: u64,
+}
+
+/// What a prefetch hint planned ([`Reader::prefetch`], [`Store::prefetch`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Prefetch {
+    /// Runs of pages planned: one read each, where a run is at most a megabyte.
+    pub runs: usize,
+    /// Bytes of the pages in them.
+    pub bytes: u64,
+    /// Whether the plan was handed to the pool's loads.
+    pub handed: bool,
+}
+
+impl Prefetch {
+    fn of(runs: &[pool::Run]) -> Prefetch {
+        let bytes = runs.iter().map(|it| u64::from(it.pages) * pool::PAGE).sum();
+        Prefetch { runs: runs.len(), bytes, handed: false }
     }
 }
 
@@ -1101,8 +1230,13 @@ struct Batch {
     chunks: Vec<(usize, ChunkRef)>,
     /// Each segment's puts drained in all, by number.
     puts: Vec<u64>,
-    /// Mappings still to come before the moves are made.
+    /// Mappings still to come before the moves are made: those of the files of their own
+    /// the commit wrote. (A pack is not mapped: what a commit wrote of it is read through
+    /// the pool as soon as the head names it.)
     maps: usize,
+    /// A test holds its moves back ([`Store::hold_moves`]), counted in `maps`.
+    #[cfg(test)]
+    held: bool,
 }
 
 /// A record copied from a segment into a pack, its key to be pointed at the pack.
@@ -1340,6 +1474,12 @@ enum Op {
     PatchRename {
         asked: Tag,
     },
+    /// A step of the output place `asked` written from its maker's runs
+    /// ([`publish::Writing`]).
+    Runs {
+        asked: Tag,
+        step: publish::Step,
+    },
     /// The name the derived whole file `id` is made under ([`Store::deriving_file`]) removed,
     /// so the whole file of its base, `base` (`from`), can be cloned there.
     DeriveClear {
@@ -1382,26 +1522,11 @@ enum Mapped {
     Index {
         covers: Option<u64>,
     },
-    /// `usable` is how much of the file is the store's as of the commit that asked; `batch`,
-    /// the batch of moves waiting for it.
-    Pack {
-        pack: usize,
-        usable: u64,
-        batch: Option<u64>,
-    },
+    /// `batch` is the batch of moves waiting for it.
     External {
         content: ContentId,
         batch: Option<u64>,
     },
-}
-
-impl Mapped {
-    fn usable(&self) -> u64 {
-        match self {
-            Mapped::Pack { usable, .. } => *usable,
-            _ => 0,
-        }
-    }
 }
 
 /// A store's directory as it was read and as it is being written.
@@ -1411,8 +1536,11 @@ struct Tier {
     head: Head,
     head_read: bool,
     opened: bool,
-    /// Mappings of the opening still to come.
+    /// Mappings and checks of the opening still to come.
     waiting: usize,
+    /// Packs of the opening a pumped store is still loading into its pool
+    /// ([`hot::Hot::load_whole`]): the opening goes on once all are in.
+    loading: usize,
     /// The index table, mapped and checked.
     index: Option<Arc<Index>>,
     packs: Vec<Pack>,
@@ -1440,6 +1568,7 @@ impl Tier {
             head_read: false,
             opened: false,
             waiting: 0,
+            loading: 0,
             index: None,
             // alloc: empty, allocates nothing
             packs: Vec::new(),
@@ -1486,11 +1615,7 @@ impl Tier {
                 .packs
                 .iter()
                 // clone: the published view owns its names and mappings; once per pack a view
-                .map(|it| PackView {
-                    file: it.file.clone(),
-                    mapping: it.mapping.clone(),
-                    usable: it.usable,
-                })
+                .map(|it| PackView { file: it.file.clone(), base: it.base, usable: it.usable })
                 // alloc: the view's packs, exactly sized; once per view
                 .collect(),
             externals: self
@@ -1512,12 +1637,18 @@ struct Pack {
     /// Its [`Unit`]'s number.
     unit: u32,
     file: FileName,
-    mapping: Option<Mapping>,
-    /// How much of `mapping` is the store's.
+    /// The byte of the store's pool its first byte lives at, while it is open there: its
+    /// committed bytes are read through the pool, never mapped.
+    base: Option<u64>,
+    /// How much of it readers read through the pool: what is committed.
     usable: u64,
-    /// The bytes from `usable` to `end`, held until a mapping covers them. Only the store
-    /// reads them: a record not yet mapped is read from its segment.
+    /// The bytes from `usable` to `end`: what was drained and no commit has made durable
+    /// yet, which the next commit writes through the pool. Only the store reads them: a
+    /// record not yet committed is read from its segment.
     memory: Vec<u8>,
+    /// Why a page of it could not be loaded as a pumped store opened it, the first: what the
+    /// open says when its scan cannot read the pack.
+    load_failed: Option<String>,
     /// What the head on disk says is the store's.
     committed: u64,
     /// The check of each block of its committed bytes ([`checks`]): what `checks-<n>` holds as
@@ -1532,16 +1663,36 @@ struct Pack {
 }
 
 impl Pack {
-    fn bytes(&self, at: u64, len: u64) -> Option<&[u8]> {
+    /// Its `len` bytes at `at`: committed, pinned through the store's pool for as long as
+    /// `look`'s table of pins lives; or drained and not yet committed, its own. `None` when
+    /// they are neither, or cannot be read (the pin's error is the reader's to report:
+    /// [`Pack::committed_bytes`]).
+    fn bytes<'a>(&'a self, look: Look<'a>, at: u64, len: u64) -> Option<&'a [u8]> {
         let end = at.checked_add(len)?;
         if end <= self.usable {
-            let bytes = self.mapping.as_ref()?.bytes();
-            bytes.get(usize::try_from(at).ok()?..usize::try_from(end).ok()?)
+            self.committed_bytes(look, at, len).ok()
         } else if at >= self.usable && end <= self.end {
             self.memory.get((at - self.usable) as usize..(end - self.usable) as usize)
         } else {
             None
         }
+    }
+}
+
+impl Pack {
+    /// Its `len` committed bytes at `at`, pinned through the store's pool.
+    fn committed_bytes<'a>(&self, look: Look<'a>, at: u64, len: u64) -> Result<&'a [u8], String> {
+        let end = at.checked_add(len).filter(|&end| end <= self.usable);
+        let (Some(_), Some(base)) = (end, self.base) else {
+            // alloc: the error of a read that fails
+            return Err(format!(
+                "bytes {at}..{} are not among the {} it commits in the store's pool",
+                at.saturating_add(len),
+                self.usable
+            ));
+        };
+        // alloc: the error of a read that fails
+        look.pinned_at(base + at, len).map_err(|why| why.to_string())
     }
 }
 
@@ -1743,8 +1894,9 @@ impl Store {
         let columns = Arc::<Encodings>::default();
         // clone: setup, once per store
         let view = View { tiers: tiers.iter().map(Tier::view).collect(), columns: columns.clone() };
+        let hot = hot::Hot::new(config.load_tags, &config.loader);
         // alloc: setup, once per store
-        let shared = Arc::new(Shared::new(view));
+        let shared = Arc::new(Shared::new(view, hot.side()));
         let own = Own::new(0);
         // clone: setup, the store's own segment's `Arc`, once per store
         shared.add_segment(own.segment().clone());
@@ -1754,7 +1906,6 @@ impl Store {
         // names it, tells its staged names from those of any other daemon's store.
         let staging = ContentId::of(STAGING_DOMAIN, config.dir.as_str().as_bytes());
         let staging = u64::from_le_bytes(staging.0[..8].try_into().expect("8 bytes"));
-        let hot = hot::Hot::new(config.load_tags);
         let mut store = Store {
             tags: Tags { range: blaze_core::Tags::new(config.tags), ops: HashMap::new_in(Global) }, // alloc: the store's own table, for its life
             config,
@@ -1786,6 +1937,7 @@ impl Store {
             placed: Vec::new(),
             place_spans: HashMap::new_in(Global), // alloc: the store's own table, for its life
             patching: HashMap::new_in(Global), // alloc: the store's own table, for its life
+            writing: HashMap::new_in(Global), // alloc: the store's own table, for its life
             files: ByHash::new_in(Global), // alloc: the store's own table, for its life
             derived: ByHash::new_in(Global), // alloc: the store's own table, for its life
             derive_depth: 0,
@@ -1811,6 +1963,8 @@ impl Store {
             plant_head_before_syncs: false,
             #[cfg(test)]
             plant_no_drain: false,
+            #[cfg(test)]
+            hold_moves: false,
         };
         // A pool the system refused to reserve stops the store, naming why: nothing is read
         // another way.
@@ -1949,6 +2103,53 @@ impl Store {
         self.look().has(key)
     }
 
+    /// [`Reader::prefetch`], from the store's own thread. On a store whose misses are pumped
+    /// the plan's reads go into `effects`, for its driver: its packs are in memory from their
+    /// opening, so they read only what a sweep gave back since.
+    pub fn prefetch(&mut self, keys: &[Key], effects: &mut Vec<Effect>) -> Prefetch {
+        let runs = self.look().runs_of(keys);
+        let mut hint = Prefetch::of(&runs);
+        hint.handed = match self.hot.pumped() {
+            true => self.hot.prefetch_pumped(runs, hot::Side::prefetch_budget(), effects) > 0,
+            false => self.shared.side().is_some_and(|side| side.prefetch(runs)),
+        };
+        hint
+    }
+
+    /// At least `bytes` of its pool's pages given back to the kernel, if the sweep finds that
+    /// many neither pinned nor read since it last came by: what the daemon's ceiling guard
+    /// asks before it gives up, and the pool's part of the one evictor
+    /// (docs/v2/plan/design/store-pool.md, section 4). The bytes given back. The pins of
+    /// tasks that have ended are let go first, so their pages are the sweep's to take.
+    ///
+    /// On a store whose misses are pumped nothing loads a page again but its opening, so it
+    /// gives none back: 0.
+    pub fn evict_pool(&mut self, bytes: u64) -> u64 {
+        self.tidy();
+        if self.hot.pumped() {
+            return 0;
+        }
+        // The readers' table of pins is let go, whatever it holds: the pins of every task
+        // that has ended go back as its grace passes (at once, when no task runs), and
+        // those of running tasks stay.
+        let old = self.shared.fresh_owned();
+        self.limbo.retire(old);
+        self.limbo.collect();
+        self.shared.pins_let_go();
+        self.hot.evict(bytes).map_or(0, |swept| swept.freed)
+    }
+
+    /// Its pool's pages now, from one walk of their state words: bytes loaded, bytes of them
+    /// pinned, and bytes a sweep could give back. `None` when it has no pool.
+    pub fn pool_census(&self) -> Option<PoolCensus> {
+        self.hot.census().map(|it| PoolCensus {
+            loaded: it.loaded,
+            pinned: it.pinned,
+            evictable: it.evictable,
+            unread: it.unread,
+        })
+    }
+
     /// Its own reads: what they find is valid while it is borrowed, since only its `&mut`
     /// methods free anything.
     fn look(&self) -> Look<'_> {
@@ -2085,7 +2286,8 @@ impl Store {
                     }
                     let pack = &self.tiers[0].packs[loc.pack as usize];
                     let payload = loc.offset.checked_add(RECORD_HEADER);
-                    let Some(raw) = payload.and_then(|at| pack.bytes(at, loc.raw)) else {
+                    let look = Look::new(&self.shared, Held::writer(&*self.shared));
+                    let Some(raw) = payload.and_then(|at| pack.bytes(look, at, loc.raw)) else {
                         continue;
                     };
                     // A record met by an earlier settle, or put while the store is open, is
@@ -2395,14 +2597,15 @@ impl Store {
     fn live_records(&mut self, at: usize) -> Option<Vec<(RecordHeader, Vec<u8>)>> {
         let own = &self.tiers[0];
         let pack = &own.packs[at];
+        let look = Look::new(&self.shared, Held::writer(&*self.shared));
         // alloc: once per pack a settle (idle) rewrites, its live records
         let mut live = Vec::new();
         let mut offset = PACK_HEADER;
         let mut why = None;
         while offset < pack.committed {
-            let Some(start) = pack.bytes(offset, 4) else {
+            let Some(start) = pack.bytes(look, offset, 4) else {
                 // alloc: a problem reported
-                why = Some(format!("at {offset} is not mapped"));
+                why = Some(format!("at {offset} could not be read through the store's pool"));
                 break;
             };
             if start == [0; 4] {
@@ -2415,7 +2618,7 @@ impl Store {
                 offset = next;
                 continue;
             }
-            let header = match pack.bytes(offset, RECORD_HEADER).map(RecordHeader::decode) {
+            let header = match pack.bytes(look, offset, RECORD_HEADER).map(RecordHeader::decode) {
                 Some(Ok(header)) => header,
                 Some(Err(what)) => {
                     // alloc: a problem reported
@@ -2433,7 +2636,7 @@ impl Store {
                 Some(Ok(found)) if matches!(found.place, Place::Pack(loc) if loc.pack as usize == at && loc.offset == offset)
             );
             if here && header.form != Form::Dictionary {
-                let Some(payload) = pack.bytes(offset + RECORD_HEADER, header.stored) else {
+                let Some(payload) = pack.bytes(look, offset + RECORD_HEADER, header.stored) else {
                     // alloc: a problem reported
                     why = Some(format!("the record at {offset} runs past the pack"));
                     break;
@@ -2656,6 +2859,102 @@ impl Store {
         Some(tag)
     }
 
+    /// Asks for `file`, an output the build that asks just made, to be written at `to` from
+    /// the bytes its maker holds: the edit path's place. How it went comes through
+    /// [`Store::placed`], under the tag returned.
+    ///
+    /// Nothing of the store is read, cloned or waited for: the runs are written into a file
+    /// of holes under a staged name beside `to`, which is then renamed onto `to`
+    /// ([`publish::Writing`]); none of it is synced ([`Durable::No`]). So the answer of the
+    /// build is held by no clone of a file with data not written back and by no write-back,
+    /// whatever state the store's own files are in: there is no state of them this reads.
+    /// The value itself is the caller's to put ([`Store::put`], a recipe of what the link
+    /// changed or the whole file), and becomes durable with the store's next commit, after
+    /// the answer; a place of it with no bytes at hand (another checkout's, a record replayed
+    /// after a restart) is [`Store::place`].
+    ///
+    /// What is at `to` after a crash is its old file, the new one, or (the rename not being
+    /// synced, nor the data) what the power left of the new one: an output is derived data
+    /// that the build after the restart places again, since a daemon that starts knows of no
+    /// file it placed. Nothing records `to` as holding the value until this place is done.
+    pub fn place_made(&mut self, to: FileName, file: Sparse, effects: &mut Vec<Effect>) -> Tag {
+        assert!(
+            !self.tiers.iter().any(|tier| to.is_under(&tier.dir)),
+            "{to} is in the store: values are placed outside it"
+        );
+        self.tidy();
+        let tag = self.tags.fresh();
+        // As [`Store::place`]'s: open until the answer, with no parent.
+        let span = tracing::info_span!(
+            target: "blaze",
+            parent: None,
+            "place",
+            %to,
+            how = tracing::field::Empty,
+            bytes = tracing::field::Empty,
+            waits = tracing::field::Empty,
+        );
+        self.place_spans.insert(tag, span);
+        self.publish(tag, to, Content::Sparse(file), Durable::No, 0, effects);
+        tag
+    }
+
+    /// How a step of an output written from its maker's runs went ([`publish::Writing`]): the
+    /// next effects asked, or its place answered. One that fails removes what it made under
+    /// its staged name and refuses the place, naming the path and the step.
+    fn runs_step(&mut self, asked: Tag, step: publish::Step, done: &Done, effects: &mut Vec<Effect>) {
+        let Some(writing) = self.writing.get_mut(&asked) else { return };
+        let tags = &mut self.tags;
+        let next = writing.step(step, done, |step| tags.ask(Op::Runs { asked, step }), effects);
+        let result = match next {
+            publish::Next::Going => return,
+            publish::Next::Done(wrote) => Ok(wrote),
+            publish::Next::Failed(why) => Err(why),
+        };
+        let Some(publish::Writing { to, temp, .. }) = self.writing.remove(&asked) else { return };
+        match result {
+            Ok(wrote) => {
+                let bytes = PlacedBytes { cloned: 0, written: 0, copied: wrote };
+                self.answer(Placed { tag: asked, to, result: Ok(()), bytes });
+            }
+            Err(why) => {
+                // clone: the effect and the op each own the name; once per place that fails
+                let tag = self.tags.ask(Op::Discard { file: temp.clone() });
+                effects.push(Effect::Remove { file: temp, tag });
+                // alloc: an error, once per place that fails
+                let result = Err(format!("writing {to} from its maker's bytes: {why}"));
+                self.answer(Placed { tag: asked, to, result, bytes: PlacedBytes::default() });
+            }
+        }
+    }
+
+    /// Lets go of the whole file kept to place `key`'s value by cloning ([`CLONE_FROM`]), for
+    /// a path that now holds an output placed from its maker's bytes ([`Store::place_made`]),
+    /// once no clone of it is in flight. As [`Store::unplace`], but nothing is begun in its
+    /// place: the new output was written where it goes, so no whole file of it is made, and
+    /// none is cloned, derived or written back on the edit path. Only a file this run knows
+    /// of goes (one it made, checked or is making): a value placed from its maker's bytes
+    /// has none, and one an earlier run left under `placed/` is the open's to keep.
+    pub fn unplace_made(&mut self, key: &Key, effects: &mut Vec<Effect>) {
+        self.tidy();
+        let Ok(Ok(Whole { id, len, base })) = whole_of(self.look(), key) else { return };
+        if !self.files.contains_key(&id) {
+            return;
+        }
+        if base.is_some() {
+            self.derived.insert(id, len);
+        }
+        match (self.placed_looked, &self.broken) {
+            (true, _) => self.let_go(id, effects),
+            // alloc: once per output built again while the open's look runs
+            (false, None) => {
+                self.waiting_for_look();
+                self.held_unplaces.push(id);
+            }
+            (false, Some(_)) => {}
+        }
+    }
+
     /// A place answered: its span ends, saying how many bytes its path was given.
     fn answer(&mut self, placed: Placed) {
         if let Some(span) = self.place_spans.remove(&placed.tag) {
@@ -2702,7 +3001,7 @@ impl Store {
             match &content {
                 Content::File { of: Some(source), .. } => self.cloned(source.content, effects),
                 Content::Patch { base_id, .. } => self.cloned(*base_id, effects),
-                Content::File { of: None, .. } | Content::Bytes(_) => {}
+                Content::File { of: None, .. } | Content::Bytes(_) | Content::Sparse(_) => {}
             }
             // alloc: an error, once per place refused
             let why = format!(
@@ -2728,6 +3027,39 @@ impl Store {
                 effects.push(publish::write(to.clone(), bytes, durable, asked));
                 let op = Op::Place { asked, to, staged: None, of: None, bytes: placed };
                 self.tags.ops.insert(asked, op);
+            }
+            Content::Sparse(file) => {
+                if let Err(why) = file.check() {
+                    // alloc: an error, once per place refused
+                    let why = format!("{to} was to be written from runs that are no file: {why}");
+                    return self.answer(Placed {
+                        tag: asked,
+                        to,
+                        result: Err(why),
+                        bytes: PlacedBytes::default(),
+                    });
+                }
+                let temp = self.staging_name(&to, asked);
+                // The planted bugs: written under `placed/`, as the store's own files are,
+                // and cloned from there.
+                #[cfg(test)]
+                let (temp, plant) = match self.plant {
+                    PlacePlant::MadeClonesUnflushed => (
+                        self.tiers[0].file(&format!("placed/made-{:x}", asked.0)),
+                        Some(publish::Plant::ClonesUnflushed),
+                    ),
+                    PlacePlant::MadeWaitsForWriteBack => (
+                        self.tiers[0].file(&format!("placed/made-{:x}", asked.0)),
+                        Some(publish::Plant::WaitsForWriteBack),
+                    ),
+                    _ => (temp, None),
+                };
+                let (writing, clear) = publish::Writing::begin(to, temp, file, asked);
+                #[cfg(test)]
+                let writing = writing.planted_with(plant);
+                self.writing.insert(asked, writing);
+                self.tags.ops.insert(asked, Op::Runs { asked, step: publish::Step::Clear });
+                effects.push(clear);
             }
             Content::File { from, content, of, len } => {
                 let bytes = PlacedBytes { cloned: len, written, copied: 0 };
@@ -3816,7 +4148,7 @@ impl Store {
         // The planted bug: cloned from now, its write-back begun and not waited for.
         #[cfg(test)]
         if self.plant == PlacePlant::ClonesUnflushed {
-            return self.there(content, file.flushed(), waiting, written, false, effects);
+            return self.there(content, &file.planted_flushed(), waiting, written, false, effects);
         }
         // No parent: the write-back ends on a later completion, under whatever request is
         // current then.
@@ -3838,7 +4170,7 @@ impl Store {
     fn there(
         &mut self,
         content: ContentId,
-        file: Flushed,
+        file: &Flushed,
         waiting: Vec<Waiter>,
         written: u64,
         doomed: bool,
@@ -3864,7 +4196,7 @@ impl Store {
         for (at, waiter) in waiting.into_iter().enumerate() {
             // The first place made the file: its bytes are written once, for all.
             let written = if at == 0 { written } else { 0 };
-            self.serve(content, &file, waiter, written, effects);
+            self.serve(content, file, waiter, written, effects);
         }
     }
 
@@ -3945,24 +4277,29 @@ impl Store {
             (
                 Op::WriteBack { .. },
                 PlacedFile::Flushing { waiting, written, file, doomed, span },
-                Done::WrittenBack,
+                done,
             ) => {
-                // The write-back's span ends here: the file is clean, and may be cloned.
+                // The write-back's span ends here.
                 drop(span);
-                self.there(content, file.flushed(), waiting, written, doomed, effects);
-            }
-            (Op::WriteBack { .. }, PlacedFile::Flushing { waiting, file, .. }, done) => {
-                // Not known written back, so never cloned from: it goes, what waited for it
-                // is refused by name, and the next place writes it again.
-                // alloc: an error, once per place that fails
-                let why = format!(
-                    "writing {} back before it is cloned from: {}",
-                    file.name(),
-                    describe(&done)
-                );
-                self.refuse_waiting(waiting, &why);
-                // alloc: empty, allocates nothing
-                self.remove_file(content, Vec::new(), effects);
+                // The witness: only this completion, of this file's write-back, makes the
+                // file one a clone is asked of ([`publish::Written::flushed`]).
+                match file.flushed(&done) {
+                    // The file is clean, and may be cloned.
+                    Ok(file) => self.there(content, &file, waiting, written, doomed, effects),
+                    Err(file) => {
+                        // Not known written back, so never cloned from: it goes, what waited
+                        // for it is refused by name, and the next place writes it again.
+                        // alloc: an error, once per place that fails
+                        let why = format!(
+                            "writing {} back before it is cloned from: {}",
+                            file.name(),
+                            describe(&done)
+                        );
+                        self.refuse_waiting(waiting, &why);
+                        // alloc: empty, allocates nothing
+                        self.remove_file(content, Vec::new(), effects);
+                    }
+                }
             }
             (Op::Seal { .. }, PlacedFile::Sealing { waiting, .. }, done) => {
                 // A file not made read-only is not cloned from: it goes. Where the name was a
@@ -4188,7 +4525,7 @@ impl Store {
                 }
             },
             Op::Map { tier, file, what } => match done {
-                Done::Mapped(mapping) => self.install(tier, file, what, mapping),
+                Done::Mapped(mapping) => self.install(tier, file, what, mapping, effects),
                 done if self.is_peer(tier) => self.peer_failed(tier, file, describe(&done)),
                 done => {
                     if self.retry(&file, &done) {
@@ -4366,6 +4703,7 @@ impl Store {
             | Op::PatchRename { .. }) => {
                 self.patch_step(op, done, effects);
             }
+            Op::Runs { asked, step } => self.runs_step(asked, step, &done, effects),
             op @ (Op::DeriveClear { .. }
             | Op::DeriveClone { .. }
             | Op::DeriveWrite { .. }
@@ -4410,22 +4748,24 @@ impl Store {
         Vec::new()
     }
 
-    /// Takes a mapping it asked for. Separate from [`Store::complete`] for drivers that map
-    /// by themselves at start.
-    pub fn mapped(&mut self, file: &FileName, mapping: Mapping) {
+    /// Takes a mapping it asked for (of an index table or a file of its own; no pack is
+    /// mapped). Separate from [`Store::complete`] for drivers that map by themselves at
+    /// start. What the opening asks next (a pumped store's loads of its packs) goes into
+    /// `effects`.
+    pub fn mapped(&mut self, file: &FileName, mapping: Mapping, effects: &mut Vec<Effect>) {
         self.tidy();
         let asked = self
             .tags
             .ops
             .iter()
             .filter_map(|(tag, op)| match op {
-                Op::Map { file: it, what, .. } if it == file => Some((what.usable(), *tag)),
+                Op::Map { file: it, .. } if it == file => Some(*tag),
                 _ => None,
             })
             .max();
-        let Some((_, tag)) = asked else { return };
+        let Some(tag) = asked else { return };
         if let Some(Op::Map { tier, file, what }) = self.tags.ops.remove(&tag) {
-            self.install(tier, file, what, mapping);
+            self.install(tier, file, what, mapping, effects);
         }
     }
 
@@ -4445,10 +4785,11 @@ impl Store {
         own.packs.push(Pack {
             unit: unit.0,
             file,
-            mapping: None,
+            base: None,
             usable: 0,
             // alloc: once per pack made (a unit's first, or one past `PACK_MOST`); appends then reuse it
             memory: disk::pack_header(unit.0).to_vec(),
+            load_failed: None,
             committed: 0,
             // alloc: empty, allocates nothing
             checks: Vec::new(),
@@ -4957,6 +5298,16 @@ impl Store {
         self.publish_view();
     }
 
+    /// Lets go of a test's hold ([`Store::hold_moves`]) on the moves of batch `id`.
+    #[cfg(test)]
+    pub(crate) fn release_moves(&mut self, id: u64) {
+        if let Some(batch) = self.pending.iter_mut().find(|it| it.id == id && it.held) {
+            batch.held = false;
+            batch.maps -= 1;
+        }
+        self.finish_batches();
+    }
+
     /// Publishes what readers see, and frees the view it replaces at task boundaries.
     fn publish_view(&mut self) {
         // clone: the view readers share, made once a publish (see `Tier::view`), with an `Arc` of the encodings
@@ -4966,6 +5317,9 @@ impl Store {
         };
         let old = self.shared.publish(view);
         self.limbo.retire(old);
+        // What was removed before this view is in no view a task can load from now on: its
+        // pages go back once the tasks that began before have ended.
+        self.hot.published();
     }
 
     /// What every `&mut` entry point does first, before it finds anything: frees what passed
@@ -4974,13 +5328,21 @@ impl Store {
     fn tidy(&mut self) {
         // alloc: none, `Limbo::collect` frees what passed its grace; it is not `Iterator::collect`
         self.limbo.collect();
+        // A table of pins freed just now let its pages go: a read waiting at the pinned bound
+        // looks again.
+        self.shared.pins_let_go();
         let own = &self.tiers[0];
         for table in std::iter::once(&own.delta).chain(&own.prev) {
             // alloc: none, `Table::collect` drops swapped-out values and keeps their slots; it is not `Iterator::collect`
             table.collect();
         }
         self.end_migration();
-        if self.shared.owned(Held::writer(&*self.shared)).bytes() > OWNED_MOST {
+        // The table also holds the pins of the packs' pages its readers read: let go once
+        // they are a quarter of the pinned bound, so the pins of tasks that ended are given
+        // back long before running tasks reach the bound.
+        let owned = self.shared.owned(Held::writer(&*self.shared));
+        let pins_most = pool::counts::pinned_bound(pool::counts::budget()) / 4;
+        if owned.bytes() > OWNED_MOST || owned.pinned() > pins_most {
             let old = self.shared.fresh_owned();
             self.limbo.retire(old);
         }
@@ -5531,10 +5893,18 @@ impl Store {
         commit.steps += 1;
     }
 
-    /// A read of the pool's loads completed: a pack's last committed page, which an append of
-    /// the commit in flight waits to pin. The append goes on, or the commit fails with why.
+    /// A read of the pool's loads completed, on a pumped store: of a pack's last committed
+    /// page, which an append of the commit in flight waits to pin (the append goes on, or the
+    /// commit fails with why); or of what a pack commits, which its tier's opening waits for.
     fn tail_loaded(&mut self, completion: Completion, effects: &mut Vec<Effect>) -> Vec<Ticket> {
-        for (pack, begun) in self.hot.loaded(completion, effects) {
+        for loaded in self.hot.loaded(completion, effects) {
+            let (pack, begun) = match loaded {
+                hot::Loaded::Append(pack, begun) => (pack, begun),
+                hot::Loaded::Opened { tier, opening, pack, failed } => {
+                    self.pack_loaded(tier, opening, pack, failed);
+                    continue;
+                }
+            };
             // No commit in flight: the append, begun for none, gives its pin back.
             let Some(commit) = self.commit.as_mut() else { continue };
             commit.steps -= 1;
@@ -5570,26 +5940,32 @@ impl Store {
         own.head = commit.head;
         // What the commit wrote of each pack is durable and named: the pages it wrote from are
         // the pack's loaded pages, read in place from now on.
-        for (n, &(at, _)) in commit.packs.iter().enumerate() {
+        // No mapping is asked for: readers read them through the pool as far as `usable`, once
+        // the view that says so is published (`finish_batches`), and what the pack held of
+        // them in memory for the write goes.
+        for (n, &(at, to)) in commit.packs.iter().enumerate() {
             let append = commit.appends[n].take().expect("a pack the commit wrote has its append");
-            self.hot.committed(at, append, &commit.checks[n]);
+            let base = self.hot.committed(at, append, &commit.checks[n]);
+            let pack = &mut self.tiers[0].packs[at];
+            pack.base = Some(base);
+            if to >= pack.usable {
+                pack.memory.drain(..(to - pack.usable) as usize);
+                pack.usable = to;
+            }
         }
         self.hot.commit_ended();
         for at in 0..self.tiers[0].packs.len() {
             let pack = &mut self.tiers[0].packs[at];
             if std::mem::take(&mut pack.retiring) {
                 pack.removed = true;
-                pack.mapping = None;
+                pack.base = None;
                 // alloc: empty, allocates nothing; it lets go of the pack's memory
                 pack.memory = Vec::new();
                 // alloc: empty, allocates nothing; it lets go of the pack's checks
                 pack.checks = Vec::new();
                 self.remove_pack(at, effects);
-                if let Err(why) = self.hot.pack_removed(0, at) {
-                    let file = &self.tiers[0].packs[at].file;
-                    // alloc: a problem reported
-                    self.problems.push(format!("{file} was removed and its pages are kept: {why}"));
-                }
+                // Its pages go back once no reader can reach them (`Hot::published`).
+                self.hot.pack_removed(0, at);
             }
         }
         let mut batch = commit.batch;
@@ -5606,17 +5982,12 @@ impl Store {
                 effects,
             );
         }
-        for &(at, to) in &commit.packs {
-            // clone: the op and the effect own the name; once per pack a commit
-            let file = self.tiers[0].packs[at].file.clone();
-            self.ask_map(
-                0,
-                file,
-                Mapped::Pack { pack: at, usable: to, batch: Some(batch.id) },
-                effects,
-            );
+        batch.maps = commit.externals.len();
+        #[cfg(test)]
+        if self.hold_moves {
+            batch.held = true;
+            batch.maps += 1;
         }
-        batch.maps = commit.externals.len() + commit.packs.len();
         if let Some((slot, covers)) = commit.index {
             let file = self.tiers[0].file(&disk::index_file(slot));
             self.ask_map(0, file, Mapped::Index { covers: Some(covers) }, effects);
@@ -5711,7 +6082,7 @@ impl Store {
             let tier = &mut self.tiers[at];
             tier.waiting -= 1;
             if tier.waiting == 0 && tier.head_read {
-                self.finish_open(at);
+                self.finish_open(at, effects);
             }
         }
     }
@@ -5739,10 +6110,11 @@ impl Store {
             .map(|(number, it)| Pack {
                 unit: it.unit,
                 file: tier.file(&disk::pack_file(number)),
-                mapping: None,
+                base: None,
                 usable: it.committed,
                 // alloc: empty, allocates nothing
                 memory: Vec::new(),
+                load_failed: None,
                 committed: it.committed,
                 // alloc: empty, allocates nothing: read from its file below
                 checks: Vec::new(),
@@ -5775,10 +6147,6 @@ impl Store {
         let mut maps = Vec::new();
         if let Some(index) = head.index {
             maps.push((tier.file(&disk::index_file(index.slot)), Mapped::Index { covers: None }));
-        }
-        for (pack, it) in packs.iter().enumerate().filter(|(_, it)| !it.removed) {
-            // clone: opening, once per pack; the op and the effect own the name
-            maps.push((it.file.clone(), Mapped::Pack { pack, usable: it.committed, batch: None }));
         }
         let removed: Vec<usize> =
             // alloc: opening, once per tier
@@ -5829,32 +6197,22 @@ impl Store {
             }
         }
         if self.tiers[at].waiting == 0 {
-            self.finish_open(at);
+            self.finish_open(at, effects);
         }
     }
 
-    fn install(&mut self, at: usize, file: FileName, what: Mapped, mapping: Mapping) {
+    fn install(
+        &mut self,
+        at: usize,
+        file: FileName,
+        what: Mapped,
+        mapping: Mapping,
+        effects: &mut Vec<Effect>,
+    ) {
         let opening = !self.tiers[at].opened;
         let len = mapping.bytes().len() as u64;
         let tier = &mut self.tiers[at];
         match what {
-            Mapped::Pack { pack, usable, batch } => {
-                if len < usable {
-                    return self.tier_failed(
-                        at,
-                        file,
-                        // alloc: the error that breaks the store
-                        format!("it is {len} bytes, shorter than the {usable} its head names"),
-                    );
-                }
-                let pack = &mut tier.packs[pack];
-                if !pack.removed && usable >= pack.usable {
-                    pack.memory.drain(..(usable - pack.usable) as usize);
-                    pack.usable = usable;
-                    pack.mapping = Some(mapping);
-                }
-                self.mapped_for(batch);
-            }
             Mapped::External { content, batch } => {
                 if let Some(external) = tier.externals.get_mut(&content) {
                     let named = external.len;
@@ -5891,13 +6249,56 @@ impl Store {
             let tier = &mut self.tiers[at];
             tier.waiting -= 1;
             if tier.waiting == 0 && tier.head_read {
-                self.finish_open(at);
+                self.finish_open(at, effects);
             }
         }
     }
 
-    fn finish_open(&mut self, at: usize) {
-        match open_tier(&mut self.tiers[at]).and_then(|()| self.open_in_pool(at)) {
+    /// Tier `at`'s head, index table, files of their own and checks are read: its packs are
+    /// opened in the store's pool, and the opening goes on ([`Store::finish_open_loaded`]),
+    /// at once where a loader's thread loads what the opening's scan reads, or, on a pumped
+    /// store, once what each pack commits is in memory (asked here, into `effects`).
+    fn finish_open(&mut self, at: usize, effects: &mut Vec<Effect>) {
+        if let Err((file, why)) = self.open_in_pool(at) {
+            return self.tier_failed(at, file, why);
+        }
+        let mut loading = 0;
+        if self.hot.pumped() {
+            for number in 0..self.tiers[at].packs.len() {
+                if !self.tiers[at].packs[number].removed && self.hot.load_whole(at, number, effects) {
+                    loading += 1;
+                }
+            }
+        }
+        self.tiers[at].loading = loading;
+        if loading == 0 {
+            self.finish_open_loaded(at);
+        }
+    }
+
+    /// A pumped store's load of what pack `pack` of tier `at` commits ended, for the opening
+    /// `opening` of the tier: the tier's opening goes on once every pack's has.
+    fn pack_loaded(&mut self, at: usize, opening: u8, pack: usize, failed: Option<String>) {
+        // Of an opening given up (another writer's tier, read again): not this one's.
+        if self.hot.opening_of(at) != Some(opening) {
+            return;
+        }
+        let tier = &mut self.tiers[at];
+        if let (Some(why), Some(pack)) = (failed, tier.packs.get_mut(pack)) {
+            pack.load_failed.get_or_insert(why);
+        }
+        if tier.opened || tier.loading == 0 {
+            return;
+        }
+        tier.loading -= 1;
+        if tier.loading == 0 {
+            self.finish_open_loaded(at);
+        }
+    }
+
+    fn finish_open_loaded(&mut self, at: usize) {
+        let look = Look::new(&self.shared, Held::writer(&*self.shared));
+        match open_tier(&mut self.tiers[at], look) {
             Ok(()) => {
                 let tier = &mut self.tiers[at];
                 tier.opened = true;
@@ -5915,14 +6316,16 @@ impl Store {
     /// place of what the pool held of the tier as it was open before (another writer's store
     /// whose head changed is opened afresh).
     fn open_in_pool(&mut self, at: usize) -> Result<(), (FileName, String)> {
-        let tier = &self.tiers[at];
+        let tier = &mut self.tiers[at];
         // clone: the error that stops the opening
         self.hot.tier_closed(at).map_err(|why| (tier.dir.clone(), why))?;
-        for (number, pack) in tier.packs.iter().enumerate().filter(|(_, it)| !it.removed) {
-            self.hot
+        for (number, pack) in tier.packs.iter_mut().enumerate().filter(|(_, it)| !it.removed) {
+            let base = self
+                .hot
                 .pack_opened(at, number, &pack.file, pack.committed, &pack.checks)
                 // clone: the error that stops the opening
                 .map_err(|why| (pack.file.clone(), why))?;
+            pack.base = Some(base);
         }
         Ok(())
     }
@@ -5989,9 +6392,10 @@ impl Drop for Store {
     }
 }
 
-/// Checks what a tier's head names against what was mapped, and reads the records past its
-/// index table and its dictionaries.
-fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
+/// Checks what a tier's head names against what was mapped of its index table, and reads,
+/// through the store's pool, the records past its index table and its dictionaries: of each
+/// pack its header and what it commits past what the index holds, never the whole of it.
+fn open_tier(tier: &mut Tier, look: Look<'_>) -> Result<(), (FileName, String)> {
     if let Some(index) = tier.head.index {
         let file = tier.index_file();
         // clone: the error that stops the opening
@@ -6024,26 +6428,36 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
     for (number, pack) in tier.packs.iter().enumerate().filter(|(_, it)| !it.removed) {
         // clone: the error that stops the opening
         let fail = |why: String| (pack.file.clone(), why);
-        let all = pack.mapping.as_ref().ok_or_else(|| fail("it was not mapped".into()))?.bytes();
-        let all = usize::try_from(pack.committed)
-            .ok()
-            .and_then(|committed| all.get(..committed))
-            .ok_or_else(
+        // What a pin of its bytes failed for: on a pumped store, what its load said of the
+        // first page that could not be read (the pin itself only says the page is refused).
+        let unread = |why: String| {
+            let why = pack.load_failed.clone().unwrap_or(why); // clone: the error that stops the opening
             // alloc: the error that stops the opening
-            || {
-                fail(format!(
-                    "it is {} bytes, shorter than the {} its head names",
-                    all.len(),
-                    pack.committed
-                ))
-            },
-        )?;
-        disk::check_pack_header(all, pack.unit).map_err(|why| fail(why.into()))?;
+            fail(format!("{why}; its blocks are checked against {}", disk::checks_file(number)))
+        };
+        if pack.committed < PACK_HEADER {
+            // alloc: the error that stops the opening
+            return Err(fail(format!(
+                "its head names {} bytes of it, shorter than a pack's header",
+                pack.committed
+            )));
+        }
+        let header = pack.committed_bytes(look, 0, PACK_HEADER).map_err(unread)?;
+        disk::check_pack_header(header, pack.unit).map_err(|why| fail(why.into()))?;
+        // The scan's bytes, from the block it starts in: `all[n]` is the pack's byte
+        // `from + n`.
+        let first = pack.indexed.max(PACK_HEADER).min(pack.committed);
+        let from = first / disk::BLOCK * disk::BLOCK;
+        let all = pack.committed_bytes(look, from, pack.committed - from).map_err(unread)?;
+        let get = |at: u64, len: u64| {
+            let start = usize::try_from(at.checked_sub(from)?).ok()?;
+            all.get(start..start.checked_add(usize::try_from(len).ok()?)?)
+        };
         let mut at = pack.indexed.max(PACK_HEADER);
         while at < pack.committed {
-            if all.get(at as usize..at as usize + 4).is_none_or(|start| start == [0; 4]) {
+            if get(at, 4).is_none_or(|start| start == [0; 4]) {
                 let next = at.next_multiple_of(disk::BLOCK);
-                if next == at || all[at as usize..next as usize].iter().any(|&it| it != 0) {
+                if next == at || get(at, next - at).is_none_or(|it| it.iter().any(|&it| it != 0)) {
                     // alloc: the error that stops the opening
                     return Err(fail(format!(
                         "at {at} is neither a record nor the zeros that end a commit"
@@ -6052,7 +6466,7 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
                 at = next;
                 continue;
             }
-            let header = RecordHeader::decode(&all[at as usize..])
+            let header = RecordHeader::decode(&all[(at - from) as usize..])
                 // alloc: the error that stops the opening
                 .map_err(|why| fail(format!("the record at {at}: {why}")))?;
             let end =
@@ -6083,11 +6497,14 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
             }
             at = end;
         }
-        // Every block the scan read, against the pack's checks: a record's header is checked
-        // by its own CRC above, and this is what says its payload is the bytes committed.
-        let scanned = pack.indexed.max(PACK_HEADER).min(pack.committed) / disk::BLOCK
-            ..pack.committed / disk::BLOCK;
-        if let Some(block) = checks::first_bad(&pack.checks, all, scanned) {
+        // Every block the scan read, against the pack's checks, as the pool checked each as
+        // it loaded it: a record's header is checked by its own CRC above, and this is what
+        // says its payload is the bytes committed. `all` starts at block `from / BLOCK`.
+        let skipped = from / disk::BLOCK;
+        let scanned = 0..pack.committed / disk::BLOCK - skipped;
+        let checks = pack.checks.get(skipped as usize..).unwrap_or_default();
+        if let Some(block) = checks::first_bad(checks, all, scanned) {
+            let block = block + skipped;
             // alloc: the error that stops the opening
             return Err(fail(format!(
                 "its block {block} (bytes {}..{}) does not match its check in {}",
@@ -6111,7 +6528,7 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
         let pack = &packs[dictionary.pack as usize];
         let at = dictionary.offset;
         dictionary.bytes = pack
-            .bytes(at, RECORD_HEADER)
+            .bytes(look, at, RECORD_HEADER)
             // alloc: the error of a dictionary that cannot be read
             .ok_or_else(|| format!("at {at} is outside {}", pack.file))
             // alloc: the error of a dictionary that cannot be read
@@ -6122,7 +6539,7 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
             .and_then(|header| {
                 match header.form == Form::Dictionary && header.kind == dictionary.kind {
                     true => pack
-                        .bytes(at + RECORD_HEADER, header.stored)
+                        .bytes(look, at + RECORD_HEADER, header.stored)
                         .filter(|bytes| content_of(bytes) == header.content)
                         // alloc: opening, once per dictionary, whose bytes the prepared dictionary keeps
                         .map(|bytes| bytes.to_vec())

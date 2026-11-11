@@ -1367,6 +1367,64 @@ pub fn not_found(file: &File, create: bool) -> u8 {
     assert_eq!(out.matches("bare `bool`s by position").count(), 2, "{out}");
 }
 
+/// `default_policy`: a type with a field marked `#[blaze::policy]` is found where it
+/// implements `Default`, derives it, or has a `new()` that takes nothing; a constructor that
+/// takes the field, a named constant, and a type with no marked field are not.
+#[test]
+fn default_policy_finds_a_marked_field_chosen_for_the_caller() {
+    let out = lint_only(
+        r#"
+pub struct Limits {
+    #[blaze::policy]
+    pub abandon_wait: u64,
+    pub name: u32,
+}
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits { abandon_wait: 1, name: 0 }
+    }
+}
+impl Limits {
+    pub const USUAL: Limits = Limits { abandon_wait: 1, name: 0 };
+    pub fn new() -> Limits {
+        Limits { abandon_wait: 1, name: 0 }
+    }
+    pub fn with(abandon_wait: u64) -> Limits {
+        Limits { abandon_wait, name: 0 }
+    }
+}
+#[derive(Default)]
+pub struct Wire {
+    #[blaze::policy]
+    pub body_most: usize,
+}
+pub struct Plain {
+    pub count: u32,
+}
+impl Default for Plain {
+    fn default() -> Plain {
+        Plain { count: 0 }
+    }
+}
+impl Plain {
+    pub fn new() -> Plain {
+        Plain { count: 0 }
+    }
+}
+"#,
+        "default_policy",
+    );
+    assert!(out.contains("`impl Default for Limits` picks its `abandon_wait`"), "{out}");
+    assert!(out.contains("`Limits::new()` takes nothing, so it picks `abandon_wait`"), "{out}");
+    assert!(out.contains("`Wire` derives `Default`, which picks its `body_most`"), "{out}");
+    assert!(out.contains("marked `#[blaze::policy]`"), "{out}");
+    // The control: the same shapes on a type with no marked field, a constructor that takes
+    // the field and a named constant are not findings.
+    assert!(!out.contains("Plain"), "a type with no marked field is not checked:\n{out}");
+    assert!(!out.contains("Limits::with"), "a constructor that takes the field is not a finding:\n{out}");
+    assert_eq!(out.matches("blaze::default_policy").count() >= 3, true, "{out}");
+}
+
 /// `bool_param`: a `bool` parameter of a public, crate-visible or private function, and of a
 /// trait's declaration, is found, the enum named from the parameter; a setter of one `bool`,
 /// a trait impl's method, a closure and an `extern "C"` function are not.

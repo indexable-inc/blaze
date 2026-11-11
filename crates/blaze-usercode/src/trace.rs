@@ -45,7 +45,11 @@ pub enum Seen {
     /// `E`: an environment variable read by name, or `*` for the whole environment (a
     /// process that walked `environ`, or one whose reads by name can't be seen).
     Env,
-    /// `T`: something that can't be traced: `clock`, `random`, `network` or `descriptor`.
+    /// `T`: something the run got that is no file, directory or variable. Either something
+    /// that can't be traced (`clock`, `random`, `network` or `descriptor`), or something the
+    /// sandbox answered from the run's provider ([`ANSWERED_RANDOM`], [`ANSWERED_DEVICE`]),
+    /// which is no input: what was answered is made of the run's key
+    /// ([`crate::provider`]). A blaze that does not know a name takes it for the first.
     Untraceable,
     /// `W`: a write the sandbox refused. Not an input: the refusal is the same every run.
     RefusedWrite,
@@ -82,6 +86,18 @@ impl Seen {
             _ => return None,
         })
     }
+}
+
+/// In a `T` line: the sandbox answered a `getrandom` from the run's provider.
+pub const ANSWERED_RANDOM: &str = "answered random";
+/// In a `T` line: the sandbox answered an open of `/dev/urandom` or `/dev/random` with a file
+/// of the run's provider.
+pub const ANSWERED_DEVICE: &str = "answered device";
+
+/// Whether `what`, of a `T` line, names something the sandbox answered from the run's
+/// provider, which is no input of the run.
+pub fn answered(what: &str) -> bool {
+    what == ANSWERED_RANDOM || what == ANSWERED_DEVICE
 }
 
 /// The name of an [`Untraceable`] in a `T` line.
@@ -461,6 +477,7 @@ pub fn assemble_seen<'a, I: Inputs>(
                 Seen::Listed => dirs.push(what),
                 Seen::Env if whole_env(what) => all_env = true,
                 Seen::Env => env.push(what),
+                Seen::Untraceable if answered(what) => {}
                 // A name this blaze doesn't know is something it can't trace either.
                 Seen::Untraceable => {
                     untraceable.push(untraceable_of(what).unwrap_or(Untraceable::Descriptor))
@@ -1092,6 +1109,31 @@ mod tests {
         // With the reason an interposer gives, it is the same whole environment.
         let why = [Line::new(Seen::Env, "", "* cc does not export __blaze_std_says_walks")];
         assert_eq!(assemble(&why, None, &mut fixed()).unwrap().env, traced.env);
+    }
+
+    /// What the sandbox answered from the run's provider is no input and nothing that can't
+    /// be traced: a run with only such lines is kept as any traced run, and a pure script's
+    /// check (`pure::check`) passes it.
+    #[test]
+    fn what_the_sandbox_answered_is_not_what_cannot_be_traced() {
+        let lines = [
+            Line::new(Seen::Untraceable, "", ANSWERED_RANDOM),
+            Line::new(Seen::Untraceable, "", ANSWERED_DEVICE),
+        ];
+        let traced = assemble(&lines, None, &mut fixed()).unwrap();
+        assert_eq!(traced.untraceable, Vec::new());
+        assert_eq!((traced.files.len(), traced.dirs.len(), traced.env.len()), (0, 0, 0));
+    }
+
+    /// The control: randomness the sandbox did not answer is still what can't be traced.
+    #[test]
+    fn the_oracle_catches_randomness_that_was_not_answered() {
+        let lines = [
+            Line::new(Seen::Untraceable, "", ANSWERED_RANDOM),
+            Line::new(Seen::Untraceable, "", "random"),
+        ];
+        let traced = assemble(&lines, None, &mut fixed()).unwrap();
+        assert_eq!(traced.untraceable, vec![Untraceable::Random]);
     }
 
     /// [`Fixed`], noting what it was asked in the order it was asked.

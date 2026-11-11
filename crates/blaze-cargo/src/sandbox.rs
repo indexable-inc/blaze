@@ -165,6 +165,10 @@ pub struct Live {
     pub start: u64,
     /// Why a line could not be added to it, once one could not: the run's record is not whole.
     pub failed: std::cell::RefCell<Option<String>>,
+    /// Who made the calls the run can't be traced for, and the programs it started, as the
+    /// sandbox's supervisor described them ([`blaze_usercode::calls`]): given as the run ends,
+    /// for the launcher to leave beside its report. No key is made of them.
+    pub calls: std::cell::RefCell<Vec<blaze_usercode::calls::Call>>,
 }
 
 impl Live {
@@ -458,6 +462,16 @@ pub struct Recorder {
     /// The sandbox's own directories, whose paths are no inputs: the kernel's views and the
     /// empty directories.
     own: Vec<String>,
+    /// Who made the calls the run can't be traced for and the programs it started, each
+    /// described once ([`Recorder::described`]), in the order seen; never a line of the record.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    calls: Vec<blaze_usercode::calls::Call>,
+    /// How many of `calls` are programs started, and how many calls and programs past the
+    /// bounds were not described.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    execs: usize,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    undescribed: u64,
 }
 
 impl Recorder {
@@ -497,6 +511,10 @@ impl Recorder {
             known: HashSet::new_in(Global),
             interposed: false,
             pending: HashMap::new_in(Global),
+            // alloc: once per sandbox; a run that makes no such call keeps it empty.
+            calls: Vec::new(),
+            execs: 0,
+            undescribed: 0,
             reads: spec.record_reads,
             // alloc: once per sandbox, the paths that are no input by name.
             not_inputs: spec.not_inputs.iter().map(|it| tidy(it)).collect(),
@@ -773,12 +791,93 @@ impl Recorder {
         self.note(Seen::Untraceable, self.scope_id(thread), trace::untraceable_name(it));
     }
 
+    /// The sandbox answered `thread` from the run's provider: `what` is one of
+    /// [`trace::ANSWERED_RANDOM`] and [`trace::ANSWERED_DEVICE`]. No input of the run: what it
+    /// was given is made of its key.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn answered(&mut self, thread: u64, what: &str) {
+        self.note(Seen::Untraceable, self.scope_id(thread), what);
+    }
+
+    /// `thread` read the variable `name` in a way the sandbox saw itself: the wall clock a
+    /// provider gives is the build's `SOURCE_DATE_EPOCH`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn read_var(&mut self, thread: u64, name: &str) {
+        self.note(Seen::Env, self.scope_id(thread), name);
+    }
+
     /// Randomness was read. What a process read of it stays in it (`std` keeps the keys of its
     /// hash maps), whatever scope it is in later: it is every scope's.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn random(&mut self) {
         let name = trace::untraceable_name(blaze_core::Untraceable::Random);
         self.note(Seen::Untraceable, NO_SCOPE, name);
+    }
+
+    /// Whether a call of `process` that got `what` (`random`, `clock`, `network`) is still to
+    /// be described: reads are recorded, no call of that process and kind is described yet, and
+    /// the run is under its bound ([`blaze_usercode::calls::MOST`]; one past it is counted).
+    /// Asked before the caller's `/proc` is read, so a process that reads the clock a million
+    /// times is described once.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn describes(&mut self, process: u64, what: &str) -> bool {
+        use blaze_usercode::calls::{self, Call};
+        if !self.reads {
+            return false;
+        }
+        let seen = self.calls.iter().any(|it| {
+            matches!(it, Call::Made(it) if u64::from(it.pid) == process && it.what == what)
+        });
+        if seen {
+            return false;
+        }
+        if self.calls.len() - self.execs >= calls::MOST {
+            self.undescribed += 1;
+            return false;
+        }
+        true
+    }
+
+    /// Whether a program started is still to be described: reads are recorded and the run is
+    /// under its bound of them ([`blaze_usercode::calls::EXECS_MOST`]; one past it is counted).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn describes_exec(&mut self) -> bool {
+        if !self.reads {
+            return false;
+        }
+        if self.execs >= blaze_usercode::calls::EXECS_MOST {
+            self.undescribed += 1;
+            return false;
+        }
+        true
+    }
+
+    /// `made`, a call [`Recorder::describes`] (or [`Recorder::describes_exec`]) asked for.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn described(&mut self, made: blaze_usercode::calls::Made) {
+        if made.what == blaze_usercode::calls::EXEC {
+            self.execs += 1;
+        }
+        self.calls.push(blaze_usercode::calls::Call::Made(made));
+    }
+
+    /// Whether `process` ran a program and has not said the sandbox's library loaded since
+    /// (its loader is still loading its libraries); `None` when the run's processes load none,
+    /// so nothing says.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn loading(&self, process: u64) -> Option<bool> {
+        (self.interposed && self.reads).then(|| self.pending.contains_key(&process))
+    }
+
+    /// The calls described, with how many were not as the last: taken as the run ends.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn take_calls(&mut self) -> Vec<blaze_usercode::calls::Call> {
+        let mut calls = std::mem::take(&mut self.calls);
+        if self.undescribed > 0 {
+            calls.push(blaze_usercode::calls::Call::More(self.undescribed));
+        }
+        (self.execs, self.undescribed) = (0, 0);
+        calls
     }
 
     /// `process` runs the program `path`, in `scope`: when the processes load the interposer,
@@ -1039,7 +1138,12 @@ fn probe(kind: Probe) -> Result<(), String> {
             ..Spec::default()
         },
     };
-    let live = Live { path: dir.join("live"), start: 0, failed: Default::default() };
+    let live = Live {
+        path: dir.join("live"),
+        start: 0,
+        failed: Default::default(),
+        calls: Default::default(),
+    };
     let also = match kind {
         Probe::V2 => {
             // alloc: the error, once.
@@ -1194,6 +1298,52 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&live).unwrap(), written, "no line twice");
         assert_eq!(recorder.live_failed(), None);
         _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A process's call of a kind is described once, a run's calls and programs up to their
+    /// bounds, and what was not described is counted as the last of what the run leaves: a
+    /// list cut short says so.
+    #[test]
+    fn a_call_is_described_once_a_process_and_kind_and_the_rest_are_counted() {
+        use blaze_usercode::calls::{self, Call, Made, Module, Phase};
+        let made = |what: &str, pid: u32| Made {
+            what: what.to_owned(),
+            pid,
+            inside_pid: None,
+            program: "/p".to_owned(),
+            argv0: "p".to_owned(),
+            syscall: "getrandom".to_owned(),
+            number: 318,
+            phase: Phase::NotKnown,
+            ip: 1,
+            module: String::new(),
+            kind: Module::NotKnown,
+        };
+        let mut recorder = Recorder::new(&Spec { record_reads: true, ..Spec::default() }, &[]);
+        assert_eq!(recorder.loading(7), None, "a run that loads no library of the sandbox's");
+        assert!(recorder.describes(7, "random"));
+        recorder.described(made("random", 7));
+        assert!(!recorder.describes(7, "random"), "once a process and kind");
+        assert!(recorder.describes(7, "clock") && recorder.describes(8, "random"));
+        for pid in 100..100 + calls::MOST as u32 - 1 {
+            assert!(recorder.describes(u64::from(pid), "random"));
+            recorder.described(made("random", pid));
+        }
+        // Programs started have a bound of their own: a run of many children still says who
+        // read randomness.
+        for _ in 0..calls::EXECS_MOST {
+            assert!(recorder.describes_exec());
+            recorder.described(made(calls::EXEC, 9));
+        }
+        assert!(!recorder.describes_exec() && !recorder.describes(999, "random"));
+        let left = recorder.take_calls();
+        assert_eq!(left.len(), calls::MOST + calls::EXECS_MOST + 1);
+        assert_eq!(left.last(), Some(&Call::More(2)));
+        assert_eq!(recorder.take_calls(), Vec::new(), "taken once");
+        // A run that records no reads describes none.
+        let mut untraced = Recorder::new(&Spec::default(), &[]);
+        assert!(!untraced.describes(7, "random") && !untraced.describes_exec());
+        assert_eq!(untraced.take_calls(), Vec::new());
     }
 
     /// A name that is not UTF-8 is read as `String::from_utf8_lossy` reads it, into the room

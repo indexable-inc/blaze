@@ -118,6 +118,9 @@ const CONTEXTUAL: &[(&str, SyntaxKind, Option<Edition>)] = &[
     ("invariant", INVARIANT_KW, None),
     ("recommends", RECOMMENDS_KW, None),
     ("requires", REQUIRES_KW, None),
+    // `#![blaze::uniq]`'s unique reference (docs/v2/plan/design/edition.md, change 10): a
+    // keyword only where the grammar's gated rules say (`grammar/uniq.rs`).
+    ("uniq", UNIQ_KW, None),
 ];
 
 const fn names<const N: usize, T: Copy, U: Copy>(
@@ -451,6 +454,7 @@ mod tests {
             "invariant" => INVARIANT_KW,
             "recommends" => RECOMMENDS_KW,
             "requires" => REQUIRES_KW,
+            "uniq" => UNIQ_KW,
             "yeet" => YEET_KW,
             _ => return None,
         };

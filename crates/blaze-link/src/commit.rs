@@ -191,7 +191,9 @@ impl Image {
     /// Writes a commit's or rollback's file into `memory`'s image part, as the file's effects
     /// leave it: a full write's file starts as zeros, so the gaps between its writes, and what
     /// the last file had past it, are zeroed; a shorter file zeroes what it no longer has.
-    /// Each range written is published. Nothing is written when the file doesn't fit.
+    /// Zeroing writes only where the memory was written before (`CodeMemory::zero`), so the
+    /// patch room of an image, a gap of 64 MiB or more, costs a first link nothing. Each
+    /// range written is published. Nothing is written when the file doesn't fit.
     pub(crate) fn write_into(
         &self,
         writes: &Writes,
@@ -223,12 +225,13 @@ impl Image {
             what: format!("writing {to} into its code memory: {error}"),
             refusal: None,
         };
+        // Zeros where the memory holds anything: a page of it never written (an image's
+        // patch room, most of the file) is zeros already and is not touched.
         let zero = |memory: &mut CodeMemory, offset: u64, len: u64| -> Result<(), LinkError> {
             if len == 0 {
                 return Ok(());
             }
-            memory.fill(offset, len, 0).map_err(fail)?;
-            memory.publish(CodeRange { offset, len }).map_err(fail)
+            memory.zero(offset, len).map(|_| ()).map_err(fail)
         };
         let mut at = 0;
         for (offset, bytes) in &writes.writes {

@@ -259,6 +259,7 @@ fn old_match_attr_flags(
                     "blaze" if &*second_segment == "may" => attr_flags.insert(AttrFlags::MAY),
                     "blaze" if &*second_segment == "multiversion" => {
                         attr_flags.insert(AttrFlags::BLAZE_MULTIVERSION)
+                    }
                     "blaze" if &*second_segment == "drop" => {
                         // The words of the list, as `tt_has_token` finds them.
                         let text = tt.syntax().text().to_string();
@@ -384,6 +385,7 @@ fn old_match_attr_flags(
                     "blaze" => match &*second_segment {
                         "may_suspend" => attr_flags.insert(AttrFlags::MAY_SUSPEND),
                         "sans_io" => attr_flags.insert(AttrFlags::SANS_IO),
+                        "capabilities" => attr_flags.insert(AttrFlags::CAPABILITIES),
                         "checkfree" => attr_flags.insert(AttrFlags::CHECKFREE),
                         "pure" => attr_flags.insert(AttrFlags::PURE),
                         "differentiable" => attr_flags.insert(AttrFlags::DIFFERENTIABLE),
@@ -401,10 +403,12 @@ fn old_match_attr_flags(
                         // here, each a word attribute under `blaze` as those above.
                         "linear" => attr_flags.insert(AttrFlags::LINEAR),
                         "consumes" => attr_flags.insert(AttrFlags::CONSUMES),
+                        "holds" => attr_flags.insert(AttrFlags::HOLDS),
+                        "memo" => attr_flags.insert(AttrFlags::BLAZE_MEMO),
                         "reflect" => attr_flags.insert(AttrFlags::BLAZE_REFLECT),
                         "sealed" => attr_flags.insert(AttrFlags::BLAZE_SEALED),
+                        "norefcount" => attr_flags.insert(AttrFlags::NOREFCOUNT),
                         "multiversion" => attr_flags.insert(AttrFlags::BLAZE_MULTIVERSION),
-                        "acyclic" => attr_flags.insert(AttrFlags::BLAZE_ACYCLIC),
                         "program_lifetime" => {
                             attr_flags.insert(AttrFlags::BLAZE_PROGRAM_LIFETIME)
                         }
@@ -2396,7 +2400,4 @@ fn no_two_attr_flags_share_a_bit() {
         }
         owner[bit] = Some(name);
     }
-    // The two this lane added keep the bits their commit says.
-    assert_eq!(AttrFlags::BLAZE_ACYCLIC.bits(), 1 << 125);
-    assert_eq!(AttrFlags::BLAZE_PROGRAM_LIFETIME.bits(), 1 << 126);
 }

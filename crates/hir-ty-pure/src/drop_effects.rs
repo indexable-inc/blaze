@@ -8,7 +8,7 @@
 //! attribute to the impl, for `blaze check` to report per type.
 
 use base_db::{CrateOrigin, Db};
-use hir_def::{AdtId, AttrDefId, FunctionId, HasModule, attrs::AttrFlags};
+use hir_def::{AdtId, AssocItemId, AttrDefId, FunctionId, HasModule, attrs::AttrFlags};
 use hir_expand::name::Name;
 use hir_ty::{
     ParamEnvAndCrate,
@@ -37,7 +37,11 @@ pub const FREES_ONLY_TOOLCHAIN: EffectSet =
 /// The `drop` of `adt`'s `Drop` impl, if it has one.
 pub fn drop_fn(db: &Db, adt: AdtId) -> Option<FunctionId> {
     let imp = destructor(db, adt)?;
-    imp.impl_items(db).method_by_name(&Name::new_symbol_root(sym::drop))
+    let drop = Name::new_symbol_root(sym::drop);
+    imp.impl_items(db).items.iter().find_map(|(name, item)| match item {
+        AssocItemId::FunctionId(it) if *name == drop => Some(*it),
+        _ => None,
+    })
 }
 
 /// Every kind of effect `adt`'s `Drop::drop` may have, in the impl's own where-clauses, its

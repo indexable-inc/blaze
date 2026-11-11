@@ -112,6 +112,18 @@ null, not counted; it has no `provenance` rows) and one of version 2 as 5 too (i
 refuses any other, naming the file: version 1 named a job by its slot alone, and the
 generation version 2 needs was never written.
 
+**Asking the schema.** `blaze debug schema [TABLE] [--json]` prints the tables, the span
+views (`span_macro_expand`) and the named views with what each holds, or one table's columns
+with their types and meaning, from `schema.rs` itself: it is the schema of the blaze that prints
+it, and needs no DuckDB and no daemon. `blaze debug sql "DESCRIBE spans"` and `"SHOW TABLES"`
+are answered the same way before DuckDB is started, and when DuckDB refuses a query for a
+column it does not know, the error ends with the columns of each table the query names, the
+nearest names first (`crates/blaze-profile/src/describe.rs`). The tables below are written by
+hand: a test holds every column they list to the schema, and where they lack a table or a
+column (`job_intervals`, `span_time`, `path_links` and `core_busy`, which `blaze debug time`
+derives, are described under [Utilization](#utilization-where-a-builds-wall-time-goes)),
+`blaze debug schema` has it.
+
 **Time.** Every `*_ns` instant is in nanoseconds on the machine's monotonic clock: Linux
 `CLOCK_MONOTONIC`, macOS `CLOCK_UPTIME_RAW` (`mach_absolute_time`). It is the same clock in
 every process on the machine, so the client's, the daemon's and the build scripts' spans line
@@ -166,6 +178,7 @@ column.
 | node | u64? | the plane node a daemon `task` ran as |
 | heap_allocated_bytes | u64? | the bytes a daemon `task`'s work allocated from the global heap in all, never netted against its frees, its fan-out's included (`blaze_graph::arena::Spent`): far past `peak_bytes`, the task churns the heap; null for a task that gave way or panicked |
 | heap_freed_bytes | u64? | the bytes a daemon `task`'s work freed to the global heap in all, whoever allocated them; null as `heap_allocated_bytes` is |
+| fields | utf8? | an ad hoc span's fields that fill no other column, as `key=value` text in the order it recorded them, a space between (cut at 1 KiB): a field of any name is kept, so adding one needs no column (`WHERE fields LIKE '%why=memory%'`). Null for a span with none, for a span of a kind, for one too short for a row of its own (`folded`), and in files of a blaze before 2026-11-11 |
 
 The columns from `awaits` on are typed: only a span kind fills them, never an ad hoc span's fields. A span kind is a struct declared once in the registry `span_kinds!` at the end of `crates/blaze-profile/src/span.rs`: `unit names`, `unit bodies`, `unit codegen`, `unit link` and `unit store` (`krate`, `unit`), `macro expand` (`path`, `krate`, and as it ends `steps`, `peak_bytes`, `outcome`), `wait` (`awaits`, `function`, `owner`, `on`), `hold` (`what`, `holder`), `job` (`kind`, `job`, `creator`), `worker` (`doing` in `function`: a pool worker's `search`, `idle` or `switch` between jobs), `macro module` (`module` in `function`, and as it ends `module_from`, `code_bytes`) `build script proof` (`krate`, `unit`, and as it ends `steps`), `admission` (a plane task's wait from ready to start: `kind` in `function`, `node`, and as it ends `waited_for` in `awaits` (memory, a work or io thread, nothing), `passed`, `granted`; detached, on no thread's stack, as no thread waits in it; `blaze explain admission_waits`) and `task` (a daemon plane task run on a thread, `crates/blaze-cargo/src/serve/plane.rs`: `kind` in `function` as `unit bodies (infer)`, `node`, `granted`, `passed`, `krate` in `crate` and `unit` in `unit` (the unit it is a phase of, as the unit phase spans name it; none for a task of no unit), and as it ends `peak` in `peak_bytes`, `heap_allocated` in `heap_allocated_bytes` and `heap_freed` in `heap_freed_bytes`; `blaze explain task_memory`, `task_grants`, `admission_waits` and `memory` read it). Each field names its column by type, so a site that leaves out a field, gives one of the wrong type, or names a column that does not exist does not compile, and a typed column no kind writes fails the build. The kind writes its fields straight into its open span's slot, with no field visitor. `span::read` reads a ring's row back as its kind and `span::read_batch` a `spans` batch; every kind has a view of its rows with its fields as columns, `span_<name>` with spaces as underscores (`span_macro_expand`, whose `path` is `function`). An ad hoc `tracing::info_span!(target: "blaze", ..)` fills `crate`, `function` and `unit` from fields of those names (`krate`, `subject` and `cgu` too); its other fields are kept nowhere.
 
@@ -256,7 +269,6 @@ are the `query_counts` table.
 | reran | u64 | of its runs, those in a view the row had already run in |
 | evicted_asked | u64 | of its runs, those for a value evicted earlier and asked for again: what eviction cost |
 | evicted | u64 | its values a sweep let go past its cap |
-| refused | u64 | of those, the ones recency alone would have kept |
 | dropped | u64 | its values an explicit `evict_values` or `evict_values_of` let go |
 | reads_recorded | u64 | the reads its runs recorded, a row read again later in the same run included: over `reads_kept`, how often its runs re-read the same rows |
 | reads_kept | u64 | the reads its runs' rows kept: each run's distinct reads, summed |
@@ -325,7 +337,7 @@ rests on these numbers.
 | started_unix_ns | i64? | when it was taken, on the wall clock |
 | outcome | dict | ok, failed, cancelled, stalled, running or crashed |
 | hits | u64? | nodes the memo settled without running them |
-| misses | u64? | nodes that ran their task |
+| misses | u64? | the things it computed again: how many rows `misses` holds of it (until 2026-11-11, the plane's nodes that ran a task) |
 | joined | u64? | nodes that took a task another node ran |
 | tree | utf8? | the digest of the workspace's source tree when the build ended, as `blaze-v2-proof tree <dir>` prints it with `target` and `.git` skipped; null for a build of no directory. Compare it with the same digest of a checkout to tell which tree a build tested: `commit` is null for a snapshot that is not a git checkout |
 | blaze | utf8? | the BLAKE3 hash of the blaze executable that ran the build |
@@ -736,6 +748,17 @@ before each, and `blaze explain link_code` its code by backend and crate, both f
 typed fields (`event_values`). A link refused for
 reach or room (`OutOfReach`, `NoRoom`, a field a value does not fit) shows the same regions in
 its message, the reach's two ends marked.
+
+**A build script's run, as events.** As a build script's run ends the daemon writes what its
+trace saw as INFO events of the target `blaze` (`crates/blaze-cargo/src/serve/unit/script/said.rs`),
+which `blaze explain script UNIT [--json]` reads, joined with the run's `processes` row:
+`script run traced` (fields `unit`, `program`, how many `files`, `dirs` and `env` it read, what
+of it was `untraceable`, how many `calls` and `execs` were described, and the names read as
+`files_named`, `dirs_named`, `env_named`); a `script call` for each untraceable call and each
+program started that the sandbox's supervisor described (`unit`, `what`, `pid`, `inside_pid`,
+`program`, `argv0`, `syscall`, `number`, `phase`, `before_main` (a heuristic, said as one),
+`ip`, `module`, `module_kind`); and `script calls not described` with how many `more` there
+were past the bound of 32 a run.
 
 ### `errors`: one row an error a build said: a diagnostic of level error, or each function a refused-functions error names
 
@@ -1156,6 +1179,13 @@ process (daemons of a blaze before 2026-11-03, which could each number a build 1
 `blaze slow` and `blaze debug time` refuse the build, naming each process with its rows and
 time, rather than read them as one build of all their workers.
 
+Before anything it worked out, the report lists what blaze itself said was wrong in the build
+(`problems`, report version 8): each row of the `problems` view for the build (`blaze explain
+problems`): a WARN or ERROR event by callsite with how often it was said (every line the daemon
+writes to its log is one, `serve::said`), a panic, a fatal signal, a `blaze-bug`, the build's
+own failure. `blaze why` lists the same rows first. On 2026-11-10 the daemon wrote that a
+build's results were not kept after every build for hours, to a log no command read.
+
 Each finding has these fields:
 - a kind;
 - the fix, in words;
@@ -1177,6 +1207,8 @@ same rows give the same bytes. Findings that save less than 1% of the wall time 
 
 | kind | what it finds | estimated saving |
 |---|---|---|
+| `not_kept` | the checkout's last build lost what it left for the store after its answer (a `misses` row of step `results kept after the answer`); ranked first | unknown |
+| `unfinished` | the checkout's last build failed or was cancelled, and this build first did the work it left (a `misses` row of step `work the last build left unfinished`); ranked first, with `not_kept` | unknown |
 | `serial` | critical-path running time, grouped by the innermost span it ran in, while most workers were idle | its path time x (1 - busy workers / workers) |
 | `starved` | the same, but the spans' `self_cpu_ns` was under 25% of their running time (1 s or more of running): on a core, or blocked outside any `wait` span, yet getting no CPU | its path time x (1 - CPU / running) |
 | `starved_workers` | workers whose CPU per running second is under a third of the median of the top half | the path's time on them x (1 - their rate / the reference) |
@@ -1230,6 +1262,19 @@ What the profile could not see is listed after the findings, as blind spots, nev
   only refusal left is a build whose unended spans alone pass the bound, which takes a recorder
   that left millions of spans open.
 
+
+Where the unnamed time is, not only how much (`gaps`, report version 9): each stretch of the
+critical path of 20 ms or more (`slow::GAP_NS`, the bound of the loop's `loop stalled` and of
+`budgets.py`'s `gap_ms`) that its lane ran inside no span (`no_span`), or of which the record
+says nothing (`between_spans`, `cut`, `no_end`), the longest first, at most 16. Each has when
+it began and how long it was, its lane, its thread by name, the span of its lane that closed
+last before it and the one that opened first after it, its bounds on the history's clock, and
+the stacks sampled on its thread in it, on the CPU and blocked (`slow::load::gap_stacks`); with
+no sample in it the text says how to find what ran (its thread's `switches`, and
+`harness/v2/loop_syscalls.py` from outside). `budgets.py` fails an edit on the same stretches.
+The daemon's loop says a step of a turn that ran past 20 ms twice: as a `loop stalled` span
+whose `function` is the step and its time (`held`, so it is never folded into a count), and as
+a WARN event with `step` and `ms`, which makes it a problem.
 
 Its header says the recorder's loss on a line of its own, even when it lost nothing
 (`recorder: lost no rows; summed N spans under 20us into folded (S); cost C (X ns a span over N spans, R thread-CPU reads)`), and `--json` has it as

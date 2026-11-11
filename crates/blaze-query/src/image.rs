@@ -16,9 +16,11 @@
 //! - **blob** ([`SectionId::DB_BLOB`]): values (each at a 16-byte boundary, read in place),
 //!   keys' bytes, paths. Records name offsets into it.
 //!
-//! Opening reads no byte of them: it finds the five in the spine `blaze-image` checked and
-//! checks their lengths. Each group of a section is checked by its CRC32C the first time a read
-//! reaches it. A group that fails is [`Corrupt`]: every request reading a key whose memos it
+//! Opening finds the five in the spine `blaze-image` checked, checks their lengths, and reads
+//! the table, the memo records and the inputs whole to check that every record names only
+//! records and bytes the image holds ([`ImageMap::check_references`]: a record that does not
+//! is [`DbError::Dangling`], and the database does not open). It reads no edge and no value.
+//! Each group of a section is checked by its CRC32C the first time a read reaches it. A group that fails is [`Corrupt`]: every request reading a key whose memos it
 //! held fails naming it (never computing the key again), no image is written while it stands,
 //! and it is noted once for the daemon to report. Bytes that pass their CRC
 //! but are not what [`write`] writes (a table slot past the memos, edges past the edge section)
@@ -245,6 +247,16 @@ pub(crate) struct ImageMap {
     corrupt: ShortLock<Found>,
 }
 
+/// What [`ImageMap::check_references`] checked of an image: how many of each record it holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Checked {
+    pub memos: u64,
+    /// The keys the memos are of: as many as the table names.
+    pub keys: u64,
+    pub edges: u64,
+    pub inputs: u64,
+}
+
 /// The groups found corrupt: each reported once.
 #[derive(Default)]
 struct Found {
@@ -320,6 +332,125 @@ impl ImageMap {
             table_len,
             input_count,
             corrupt: ShortLock::new("query.image.corrupt", Found::default()),
+        })
+    }
+
+    /// Checks, at open, every reference the image's records make to another record or to the
+    /// blob: each table slot names a memo the image holds, and as many keys as the memos have;
+    /// each memo's edges are in the edge section; each memo's value (at a 16-byte boundary)
+    /// and key bytes, and each input's path, are in the blob. The count of what was checked.
+    ///
+    /// The invariant: a reference [`write`] wrote names bytes it wrote. Bytes that pass their
+    /// CRC and break it are [`DbError::Dangling`], said here, when the image is opened (at a
+    /// restore, and when a daemon settles onto the image it wrote), never as a panic of the
+    /// first request that reads the record (2026-11-11: a daemon restored a bad image and
+    /// failed builds of unrelated crates until its directory was moved aside by hand). A group
+    /// that fails its CRC is [`DbError::Corrupt`].
+    ///
+    /// It reads the table, the memo records and the input records whole (not the edges and
+    /// not the blob): 8 bytes a slot, [`MEMO_RECORD`] a memo.
+    pub(crate) fn check_references(&self) -> Result<Checked, DbError> {
+        let get = |section: &Section, at: u64, len: u64| {
+            self.image.range(section, at, len).map_err(DbError::Corrupt)
+        };
+        let dangling = |section: &Section, record: usize, what, names: u64, bound: u64| {
+            DbError::Dangling { section: section.id, record: record as u64, what, names, bound }
+        };
+        // Whether `len` bytes at `at` are in the blob.
+        let in_blob = |at: u64, len: u64| at.checked_add(len).is_some_and(|end| end <= self.blob.len);
+        let mut named = 0u64;
+        for slot in 0..self.table_len {
+            let first = u64_at(get(&self.table, slot as u64 * 8, 8)?, 0);
+            if first == 0 {
+                continue;
+            }
+            if first - 1 >= self.memo_count as u64 {
+                return Err(dangling(
+                    &self.table,
+                    slot,
+                    "the memo",
+                    first - 1,
+                    self.memo_count as u64,
+                ));
+            }
+            named += 1;
+        }
+        let mut keys = 0u64;
+        let mut last: Option<QueryKey> = None;
+        for index in 0..self.memo_count {
+            let record = get(&self.memos, (index * MEMO_RECORD) as u64, MEMO_RECORD as u64)?;
+            let key = key_at(record, 0);
+            if last != Some(key) {
+                keys += 1;
+                last = Some(key);
+            }
+            let edges_end = u64::from(u32_at(record, 152)) + u64::from(u32_at(record, 156));
+            if edges_end > self.edge_count as u64 {
+                return Err(dangling(
+                    &self.memos,
+                    index,
+                    "edges ending at edge",
+                    edges_end,
+                    self.edge_count as u64,
+                ));
+            }
+            let (value_at, value_len) = (u64_at(record, 160), u64_at(record, 168));
+            if value_len != EVICTED {
+                if value_at % 16 != 0 {
+                    return Err(dangling(
+                        &self.memos,
+                        index,
+                        "a value off a 16-byte boundary, at blob byte",
+                        value_at,
+                        self.blob.len,
+                    ));
+                }
+                if !in_blob(value_at, value_len) {
+                    return Err(dangling(
+                        &self.memos,
+                        index,
+                        "a value ending at blob byte",
+                        value_at.saturating_add(value_len),
+                        self.blob.len,
+                    ));
+                }
+            }
+            let (bytes_at, key_len) = (u64_at(record, 176), u64_at(record, 184));
+            if !in_blob(bytes_at, key_len) {
+                return Err(dangling(
+                    &self.memos,
+                    index,
+                    "key bytes ending at blob byte",
+                    bytes_at.saturating_add(key_len),
+                    self.blob.len,
+                ));
+            }
+        }
+        // A key's memos are in a row and the table names each key's first: a key the table
+        // does not name is never found, and a slot naming a memo that is no key's first is
+        // read as that key's.
+        if named != keys {
+            return Err(dangling(&self.table, self.table_len, "keys, counted,", named, keys));
+        }
+        for index in 0..self.input_count {
+            let record =
+                get(&self.inputs, (index * INPUT_RECORD) as u64, INPUT_RECORD as u64)?;
+            let (path_at, path_len) = (u64_at(record, 48), u64_at(record, 56));
+            if !in_blob(path_at, path_len) {
+                return Err(dangling(
+                    &self.inputs,
+                    index,
+                    "a path ending at blob byte",
+                    path_at.saturating_add(path_len),
+                    self.blob.len,
+                ));
+            }
+        }
+        Ok(Checked {
+            memos: self.memo_count as u64,
+            keys,
+            edges: self.edge_count as u64,
+            inputs: self.input_count as u64,
         })
     }
 

@@ -45,6 +45,9 @@ pub mod vec {
                 Err(_) => loop {},
             }
         }
+        pub fn len(&self) -> usize {
+            self.len
+        }
     }
 }
 //- /std.rs crate:std deps:alloc
@@ -462,6 +465,38 @@ impl Transform for Configured {
     assert!(!out.contains("lib.rs:11"), "`Same`'s `run` reads only its input:\n{out}");
 }
 
+/// `#[blaze::memo]` holds its function to `#[blaze::pure]` (docs/v2/plan/design/std.md, "Eval"):
+/// a memo point that reads the clock is refused at the function, naming it, the attribute and
+/// the rule; one that reads only its arguments passes; and a function with neither attribute is
+/// not checked at all (remove the cause, the refusal goes).
+#[test]
+fn a_memo_point_that_is_not_pure_is_refused() {
+    let fixture = format!(
+        "{MINICORE}{TOOLCHAIN}//- /src/lib.rs crate:main deps:alloc,std\n{}",
+        r#"#[blaze::memo]
+pub fn stamped(x: u32) -> u32 {
+    let _ = std::time::SystemTime::now();
+    x
+}
+#[blaze::memo]
+pub fn doubled(x: u32) -> u32 {
+    x + x
+}
+pub fn unmarked(x: u32) -> u32 {
+    let _ = std::time::SystemTime::now();
+    x
+}
+"#
+    );
+    let out = lint(&fixture, "-A clippy::all --deny=blaze::pure");
+    let found = findings(&out, "pure");
+    assert_eq!(found.len(), 1, "{out}");
+    assert!(out.contains("`stamped` is `#[blaze::memo]`, and a memo point must be pure"), "{out}");
+    assert!(out.contains("reads the clock"), "{out}");
+    assert!(!out.contains("`doubled`"), "`doubled` reads only its argument:\n{out}");
+    assert!(!out.contains("`unmarked`"), "`unmarked` is no memo point:\n{out}");
+}
+
 /// An attribute with anything but `trusted = ".."` is a finding, never read as unmarked.
 #[test]
 fn a_malformed_attribute_is_refused() {
@@ -473,4 +508,94 @@ pub fn f() {}
 "#,
     );
     assert!(out.contains("the attribute takes nothing, or `trusted = \"why\"`"), "{out}");
+}
+
+// capabilities
+
+/// What `capabilities` says of `main`, with `head` (the crate's attributes, or nothing) first.
+fn capabilities_of(head: &str, main: &str) -> String {
+    let fixture = format!(
+        "{MINICORE}{TOOLCHAIN}//- /src/lib.rs crate:main deps:alloc,std\n{head}{}",
+        main.trim_start_matches('\n')
+    );
+    lint(&fixture, "-A clippy::all --deny=blaze::capabilities")
+}
+
+/// The findings of `capabilities` refusing `effect` in `out`.
+fn refusing<'o>(out: &'o str, effect: &str) -> Vec<&'o str> {
+    let marker = format!("is in a `#![blaze::capabilities]` crate, which refuses `{effect}`");
+    out.lines().filter(|line| line.contains(&marker)).collect()
+}
+
+const CAPABLE: &str = r#"
+pub struct Frame {
+    base: *mut u8,
+}
+unsafe impl core::alloc::Allocator for &Frame {
+    fn allocate(&self, _layout: core::alloc::Layout) -> Result<*mut u8, core::alloc::AllocError> {
+        Ok(self.base)
+    }
+    unsafe fn deallocate(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {}
+}
+pub fn scratch(frame: &Frame) -> alloc::vec::Vec<u32, &Frame> {
+    alloc::vec::Vec::with_capacity_in(4, frame)
+}
+pub fn heap() -> alloc::vec::Vec<u32> {
+    alloc::vec::Vec::with_capacity(4)
+}
+fn configured() -> bool {
+    match std::env::var("MODE") {
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+pub fn mode() -> bool {
+    configured()
+}
+fn write(at: &mut u8) {
+    let ptr = at as *mut u8;
+    unsafe { *ptr = 1 }
+}
+pub fn poke(at: &mut u8) {
+    write(at)
+}
+"#;
+
+/// In a `#![blaze::capabilities]` crate each function is checked: the environment read, the
+/// `unsafe` block and the global heap are refused with their call paths; a `Vec` in a frame
+/// the code is handed is not the global heap.
+#[test]
+fn capabilities_refuses_each_effect_with_its_path() {
+    let out = capabilities_of("#![blaze::capabilities]\n", CAPABLE);
+    let ambient = refusing(&out, "ambient");
+    assert!(
+        ambient.iter().any(|it| it.contains("`main::mode`")
+            && it.contains("`main::configured`")
+            && it.contains("reads the environment through ambient authority")),
+        "{out}"
+    );
+    let unsafe_ = refusing(&out, "unsafe");
+    assert!(
+        unsafe_.iter().any(|it| it.contains("`main::poke`")
+            && it.contains("`main::write`")
+            && it.contains("runs an `unsafe` block")),
+        "{out}"
+    );
+    let global = refusing(&out, "global_alloc");
+    assert!(global.iter().any(|it| it.contains("`main::heap`")), "{out}");
+    assert!(
+        !global.iter().any(|it| it.contains("`main::scratch`")),
+        "`scratch` allocates in its frame:\n{out}"
+    );
+    assert!(
+        !out.lines().any(|it| it.contains("`main::scratch` is in a")),
+        "`scratch` reaches no effect:\n{out}"
+    );
+}
+
+/// The same crate without the attribute is not checked.
+#[test]
+fn capabilities_leaves_a_crate_without_the_attribute() {
+    let out = capabilities_of("", CAPABLE);
+    assert!(!out.contains("#![blaze::capabilities]"), "{out}");
 }

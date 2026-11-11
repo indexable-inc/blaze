@@ -27,6 +27,53 @@ This skill says how to read it and how to turn a reading into a proved cause.
 Speed work also follows the `perf-and-tracing` rule (a span names the time before the fix).
 This skill is the general method behind it, for reruns, memory and cycles too.
 
+## The first three commands
+
+Before any query, on the daemon that showed it:
+
+1. `blaze explain problems`: what blaze itself said was wrong, newest build first, each thing
+   once with how often: every WARN and ERROR event (each line the daemon writes to its log is
+   one), panics, fatal signals, blaze bugs, builds that failed. A build whose daemon said its
+   results were not kept, or that a job panicked, or that its loop stalled, is explained here
+   and nowhere cheaper. `build=N` for one build.
+2. `blaze slow [--build N]`: the build's problems again, then where its time went (findings
+   ranked by what fixing each would save; `not_kept` and `unfinished` first), then each stretch
+   of the critical path of 20 ms or more under no span with its thread, the spans around it
+   and the stacks sampled in it (`gaps`), then what the profile could not see.
+3. `blaze why [ITEM]`: the build's problems again, then what it computed again and why. A
+   reason says what was recorded; where it says "not recorded" it names the command that reads
+   what is left.
+
+Then the rows. `blaze debug schema [TABLE]` lists the tables and views, or a table's columns
+with their meaning; `blaze debug sql "DESCRIBE spans"` and `"SHOW TABLES"` answer the same. Never
+guess a column: a query DuckDB refuses for one is answered with the table's real columns.
+
+## Before trusting a measurement
+
+- **The binary.** `blaze --version` prints `binary: <BLAKE3>`; `builds.blaze` is the BLAKE3 of
+  the blaze that ran each build. A stage that failed to build leaves the old binary in place:
+  compare the two before reading a number. A daemon of another binary answering `status`,
+  `debug`, `explain`, `why` or `slow` says so in one warning line: read it.
+- **The tree.** `builds.tree` is the digest of the tree a build ended on; quote it with the
+  number (rule `measure-the-exact-tree`).
+- **The build succeeded.** `builds.outcome` is `ok`, and its exit code is the build's own, not
+  a helper's (`cp`, `tee`, a pipe's last command). A build after a failed one says "the last
+  build ... failed ...: this build first does the work that one left" and has an `unfinished`
+  finding: its time is not an edit's.
+- **The daemon is the one you think.** One `BLAZE_HOME` per experiment; `blaze status` names
+  the daemon's pid and build. Build numbers are per home.
+- **Compare from the second edit on.** The first build after a cold one lets go of every
+  body's results and makes the edited crate's again once.
+- **No problems.** `blaze explain problems` is empty for the builds you compare, or you say
+  what it lists.
+
+`blaze debug edits KIND [--file F] [--fn NAME] [--runs N] [--json]` does all of this for an
+edit loop (no-op, comment, body, signature, add-item, dep-body): it applies the edit, builds
+with this very executable, repeats, and prints per run the wall time, the daemon's time, the
+timeline, the bounded counters and the problems, with the binary and the tree; it fails
+rather than time a build that failed or that another binary answered, and leaves the file as
+it found it. Use it in place of a shell loop.
+
 ## The method
 
 1. **Reproduce.** Find the smallest build that shows it: one edit, one command, one daemon.
@@ -80,6 +127,12 @@ hand, set `BLAZE_DUCKDB` to that path.
   the last build: `blaze debug sql "SELECT * FROM what_reran"`.
 - `blaze slow [--build N]` is the one-screen answer to "what made it slow". `blaze why [ITEM]`
   says what the daemon computed again and why, item by item.
+- `blaze debug schema [TABLE] [--json]` prints the schema this blaze reads, with no DuckDB and
+  no daemon. `blaze debug syscalls [--loop | --thread NAME] [--unit TEXT] [--over MS]` prints
+  what a build's threads blocked in (the `syscalls` view). `blaze explain script UNIT` prints a
+  build script's last run: what it read, what could not be traced and which process did it,
+  the programs it started, its exit and time. `blaze doctor` checks the persisted state when a
+  daemon will not start or panics on an id, and prints the command that sets it aside.
 - For files outside a daemon (a CI artifact, another machine's home), call DuckDB directly on
   the files the manifest lists, never a glob: `files=$(jq -r '.tables.provenance // {} | keys |
   map("<dir>/" + .) | tojson' <dir>/manifest.json)`, then `$BLAZE_DUCKDB -c "SELECT ... FROM
@@ -121,6 +174,24 @@ hand, set `BLAZE_DUCKDB` to that path.
 
 Each query below is a named view (`blaze explain <name>`) unless it says otherwise. Defaults:
 `build` is the last build, `limit` is 20.
+
+**One build at a glance** (the queries written by hand most often, 2026-11-10):
+- `blaze explain timeline [min_ms=1]`: the build as rows in the order things began: `at_ms`,
+  `ms`, `cpu_ms`, `thread`, `depth`, `name`, `what`. A hole between rows of one thread and
+  depth is time under no span of that size.
+- `blaze explain long_spans [min_ms=20]`: the longest spans, with their own CPU: long with
+  little CPU and not a `wait` is blocked in something no span names.
+- `blaze explain waits_by_reason`: `wait` and `admission` spans by what they waited for.
+- `blaze explain counts_by_cause`: `query_counts` with the cause columns, the most run first.
+  An edit's build runs a handful.
+- `blaze explain writes`: the inputs the build wrote, and for each the fields reruns name as
+  their cause (which file, which crate, which module's scope) with how many memos reran.
+- `blaze explain scripts`: the build scripts that ran, with why each was not reused.
+- `blaze explain pool`: the store's buffer pool's and the worker pool's counters over the build.
+- `blaze explain kept`: what the build kept or lost as it ended and after its answer.
+- `blaze explain syscalls thread=loop`: what the loop thread blocked in.
+- A span's fields that have no column are in `spans.fields` as `key=value` text:
+  `WHERE fields LIKE '%why=memory%'`.
 
 **Top time by span.** `blaze explain time_by_span_name build=N` gives time per span kind.
 `blaze explain slowest_queries` lists the slowest query spans. For own CPU time by function:
@@ -217,9 +288,12 @@ WHERE a.hash IS DISTINCT FROM b.hash ORDER BY item, part
 
 ## Limits to keep in mind
 
-- A key's name is its `Debug`, which may still hold ids (`FunctionId(..)`) where the type
-  prints no path, and an input other than a file's text is named by its id. Compare across
-  daemons by query and count, or through `key_parts` and `misses`, which name items by path.
+- A key's name is its `Debug` with each id the front end can name followed by its name
+  (`Crate(Id(21548) = serde v1.0.219 (lib))`, `FunctionId(Id(77) = serde::de::value::f)`), and
+  an input's row is named where a namer knows it (a file by its path, a crate, a module's
+  scope by its path). An id with no name after it is one no namer knows
+  (`hir_def::span_names::name_row` is where to add it); never guess what it is. Ids differ
+  across daemons: compare by name, or through `key_parts` and `misses`.
 - The counts are process-wide (two overlapping builds share them); the run log is the front
   end's own.
 - `admission` says memory only when the task was passed over for it; a wait behind another

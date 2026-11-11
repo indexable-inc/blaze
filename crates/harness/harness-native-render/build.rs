@@ -35,13 +35,8 @@ fn main() {
         ("ios", _) => ("iphoneos", Some("-mios-version-min=17.0")),
         _ => panic!("harness-native-render draws with Metal: it builds for macOS and iOS, not {os}"),
     };
-    for name in SHADERS {
-        slang(&out, name, sdk, min);
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
-        panic!("harness-native-render is macOS only (AppKit + Metal)");
-    }
     for name in SLANG {
-        slang(&out, name);
+        slang(&out, name, sdk, min);
     }
 }
 

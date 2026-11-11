@@ -78,9 +78,9 @@ pub use hir_def::{
 pub use hir_expand::BuiltinChild;
 pub use hir_ty::solver_errors::{TypeAnnotationNeeded, UnreportedSolverError};
 pub use hir_ty::{
-    AssocTypeFailure, CycleQuery, GenericArgsProhibitedReason, IncorrectGenericsLenKind,
-    MissingLifetimeKind, PatternTypeUnsupported, RecordProblem, RecordRefusal, ReturnKind,
-    StructPathDef,
+    AssocTypeFailure, CycleQuery, ERROR_UNION_MAX_MEMBERS, ErrorUnionRefusal,
+    GenericArgsProhibitedReason, IncorrectGenericsLenKind, MissingLifetimeKind,
+    PatternTypeUnsupported, RecordProblem, RecordRefusal, ReturnKind, StructPathDef,
     StructPathFound,
     const_param_ty::ConstParamTyReason,
     consteval::CreateConstError,
@@ -192,6 +192,7 @@ diagnostics![AnyDiagnostic<'db> ->
     MissingSelfDefaultParams,
     ObjectWithoutTrait,
     PatternTypeNotLowered,
+    ErrorUnionRefused,
     RecordRefused,
     QueryCycle,
     InactiveCode,
@@ -284,6 +285,7 @@ diagnostics![AnyDiagnostic<'db> ->
     InheritedRefMutabilityMismatch,
     FnTraitArgsNotTuple,
     SelfCtorNotTupleOrUnit<'db>,
+    WholeValueWriteThroughRefinement<'db>,
     ConstParamTyNotAllowed<'db>,
     ValTreeError<'db>,
     UnplacedDiagnostic,
@@ -912,6 +914,10 @@ pub struct UnresolvedMethodCall<'db> {
     pub name: Name,
     pub field_with_same_name: Option<Type<'db>>,
     pub assoc_func_with_same_name: Option<Function>,
+    /// Set when the method was looked up on an integer or float whose type was not decided
+    /// yet (`{integer}`, `{float}`): `receiver` is then what the variable became afterwards,
+    /// a type it did not have at the call.
+    pub numeric_var: Option<hir_ty::NumericVar>,
 }
 
 #[derive(Debug)]
@@ -1506,6 +1512,8 @@ pub enum SolverGoal<'db> {
         a: Type<'db>,
         b: Type<'db>,
     },
+    /// blaze: a `where const { .. }` condition, as the phrase an error says: "the `where
+    /// const` condition `..` holds", with why it does not when its evaluation says.
     ConstEvaluatable(String),
     ConstArgHasType {
         ct: String,
@@ -1699,6 +1707,14 @@ pub struct PatternTypeNotLowered {
     pub reason: PatternTypeUnsupported,
 }
 
+/// An error union (`A | B`, `#![blaze::error_unions]`) refused for `reason`, at `ty`: the
+/// member refused, or the whole union.
+#[derive(Debug)]
+pub struct ErrorUnionRefused {
+    pub ty: InFile<AstPtr<ast::Type>>,
+    pub reason: ErrorUnionRefusal,
+}
+
 /// The record type `ty` (`{ a: T, .. }`, `#![blaze::records]`) refused for `reason`.
 #[derive(Debug)]
 pub struct RecordRefused {
@@ -1786,6 +1802,11 @@ pub struct UnimplementedTrait<'db> {
     /// For each of `parent_impls`, the impl's bound the step went through (rustc's
     /// `impl_def_predicate_index`), where "unsatisfied trait bound introduced here" goes.
     pub parent_impl_bounds: Vec<Option<BoundSource>>,
+    /// blaze: why the bound does not hold through an impl with a `where const { .. }`
+    /// condition (`#![feature(blaze_comptime)]`): the message the condition's evaluation
+    /// panicked with, which is its own reason (the field path `bstd::own::none` found), or
+    /// that it is `false`. `None` when no such impl of the trait matches the bound.
+    pub condition: Option<String>,
 }
 
 /// Where a predicate of an item comes from, its written bound found in syntax: for rustc's
@@ -1826,6 +1847,8 @@ pub(crate) fn bound_source(db: &Db, def: GenericDefId, bound_index: u32) -> Opti
         PredicateSource::ConstParamType(id) => {
             BoundSource::ConstParamType(crate::ConstParam { id })
         }
+        // A `where const { .. }` condition is no bound on a type: nothing points at it yet.
+        PredicateSource::WhereConst { .. } => return None,
         PredicateSource::Written { def, index } => {
             let (params, _, source_map) = GenericParams::with_source_map(db, def);
             let bound = match *params.where_predicates().get(index as usize)? {
@@ -2156,6 +2179,14 @@ pub struct FnTraitArgsNotTuple {
 pub struct SelfCtorNotTupleOrUnit<'db> {
     pub expr: InFile<ExprOrPatPtr>,
     pub self_ty: Type<'db>,
+}
+
+/// blaze: a whole-value write to `place`, of the refinement `ty` (`#![blaze::pattern_types]`),
+/// through a unique reference (rule pattern-types-unique-ref).
+#[derive(Debug)]
+pub struct WholeValueWriteThroughRefinement<'db> {
+    pub place: InFile<ExprOrPatPtr>,
+    pub ty: Type<'db>,
 }
 
 /// rustc's two errors of `check_expr_unsafe_binder_cast`: for `Wrap`, "`wrap_binder!()` can
@@ -3983,6 +4014,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                     parent_trait_predicates: Vec::new(), // alloc: empty
                     parent_impls: Vec::new(),            // alloc: empty
                     parent_impl_bounds: Vec::new(),      // alloc: empty
+                    condition: None,
                 }
                 .into(),
                 rustc_type_ir::ClauseKind::Projection(projection) => {
@@ -4416,6 +4448,7 @@ impl<'db> AnyDiagnostic<'db> {
                 name,
                 field_with_same_name,
                 assoc_func_with_same_name,
+                numeric_var,
             } => {
                 let expr = expr_syntax(*expr)?;
                 UnresolvedMethodCall {
@@ -4426,6 +4459,7 @@ impl<'db> AnyDiagnostic<'db> {
                         .as_ref()
                         .map(|ty| new_ty(ty.as_ref())),
                     assoc_func_with_same_name: assoc_func_with_same_name.map(Into::into),
+                    numeric_var: *numeric_var,
                 }
                 .into()
             }
@@ -4918,6 +4952,13 @@ impl<'db> AnyDiagnostic<'db> {
                 }
                 .into()
             }
+            InferenceDiagnostic::WholeValueWriteThroughRefinement { place, ty } => {
+                WholeValueWriteThroughRefinement {
+                    place: expr_syntax(*place)?,
+                    ty: new_ty(ty.as_ref()),
+                }
+                .into()
+            }
             InferenceDiagnostic::UnsafeBinderCastOfNonBinder { expr, kind, found } => {
                 UnsafeBinderCastOfNonBinder {
                     expr: expr_syntax(*expr)?,
@@ -5069,6 +5110,13 @@ impl<'db> AnyDiagnostic<'db> {
                 parent_trait_predicates,
                 parent_impls,
             } => {
+                // The reason of a `where const` condition, evaluated again here: only for an
+                // error, and its evaluation is the one the solver made (a memoized query).
+                let condition = hir_ty::where_const::bound_refusal(
+                    interner,
+                    trait_predicate.get(interner).trait_ref,
+                )
+                .map(|failure| failure.text());
                 let trait_predicate =
                     crate::TraitClause::new(interner, type_owner, trait_predicate.get(interner));
                 let parent_trait_predicates = parent_trait_predicates
@@ -5101,6 +5149,7 @@ impl<'db> AnyDiagnostic<'db> {
                     parent_trait_predicates,
                     parent_impls,
                     parent_impl_bounds,
+                    condition,
                 }
                 .into()
             }
@@ -5222,7 +5271,22 @@ impl<'db> AnyDiagnostic<'db> {
             StoredGoal::WellFormed { term: wf } => SolverGoal::WellFormed(term(wf)),
             StoredGoal::Subtype { a, b } => SolverGoal::Subtype { a: ty(a), b: ty(b) },
             StoredGoal::Coerce { a, b } => SolverGoal::Coerce { a: ty(a), b: ty(b) },
-            StoredGoal::ConstEvaluatable { ct } => SolverGoal::ConstEvaluatable(text(ct)),
+            // blaze's one use of the goal is a `where const { .. }` condition: the goal as
+            // a phrase, with why it does not hold when its evaluation says.
+            StoredGoal::ConstEvaluatable { ct } => SolverGoal::ConstEvaluatable(
+                match ct.as_ref().konst().and_then(|it| {
+                    hir_ty::where_const::refusal(interner, it)
+                }) {
+                    // alloc: error path, the goal's text
+                    Some(failure) => format!(
+                        "the `where const` condition `{}` holds; it does not: {}",
+                        text(ct),
+                        failure.text()
+                    ),
+                    // alloc: error path, the goal's text
+                    None => format!("the `where const` condition `{}` holds", text(ct)),
+                },
+            ),
             StoredGoal::ConstArgHasType { ct, ty: of } => {
                 SolverGoal::ConstArgHasType { ct: text(ct), ty: ty(of) }
             }
@@ -5500,6 +5564,11 @@ impl<'db> AnyDiagnostic<'db> {
                 }
                 .into()
             }
+            TyLoweringDiagnostic::ErrorUnionRefused { source, reason } => ErrorUnionRefused {
+                ty: Self::type_syntax(*source, source_map)?,
+                reason: *reason,
+            }
+            .into(),
             TyLoweringDiagnostic::RecordRefused { source, reason } => {
                 RecordRefused { ty: Self::type_syntax(*source, source_map)?, reason: *reason }
                     .into()
@@ -5806,6 +5875,18 @@ fn unplaced_inference_text<'db>(
         InferenceDiagnostic::UnresolvedField { receiver, name, .. } => {
             format!("E0609: no field `{}` on type `{}`", name.as_str(), ty(receiver))
         }
+        InferenceDiagnostic::UnresolvedMethodCall {
+            name, numeric_var: Some(numeric), ..
+        } => {
+            let var = match numeric {
+                hir_ty::NumericVar::Integer => "{integer}",
+                hir_ty::NumericVar::Float => "{float}",
+            };
+            format!(
+                "E0689: method `{}` is called on `{var}`, a number whose type is not decided where the method is looked up",
+                name.as_str()
+            )
+        }
         InferenceDiagnostic::UnresolvedMethodCall { receiver, name, .. } => {
             format!("E0599: no method named `{}` found for `{}`", name.as_str(), ty(receiver))
         }
@@ -5971,6 +6052,11 @@ fn unplaced_inference_text<'db>(
             "the `Self` constructor can only be used with tuple or unit structs, and `Self` is `{}`",
             ty(self_ty)
         ),
+        InferenceDiagnostic::WholeValueWriteThroughRefinement { ty: refined, .. } => format!(
+            "a whole value of `{}` is written through a unique reference; only its fields may be \
+             (rule pattern-types-unique-ref)",
+            ty(refined)
+        ),
     };
     let place = match d {
         InferenceDiagnostic::SolverDiagnostic(it) => {
@@ -6118,7 +6204,7 @@ fn goal_text<'db>(db: &'db Db, target: DisplayTarget, goal: &'db StoredGoal) -> 
         StoredGoal::Subtype { a, b } => format!("{} <: {}", ty(a), ty(b)),
         StoredGoal::Coerce { a, b } => format!("{} coerces to {}", ty(a), ty(b)),
         StoredGoal::ConstEvaluatable { ct } => {
-            format!("the constant `{}` can be evaluated", arg(ct))
+            format!("the `where const` condition `{}` holds", arg(ct))
         }
         StoredGoal::ConstArgHasType { ct, ty: of } => {
             format!("the constant `{}` has type `{}`", arg(ct), ty(of))

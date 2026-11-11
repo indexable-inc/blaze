@@ -148,7 +148,7 @@ impl Lists {
         nodes: &Sorted<InstanceKey, FnNode<I, S>>,
         statics: &Sorted<StaticId, StaticNode<I, S>>,
         built: &Built,
-        originals: Originals,
+        originals: &Originals,
         last: Last,
         codes: &[(InstanceKey, ContentId)],
     ) -> Result<Lists, Last> {
@@ -448,8 +448,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 kept = nodes.len() - touched.functions.len(),
             )
             .entered();
-            // clone: per build, the keys of the functions it makes again
-            self.dev_of(nodes, touched.functions.clone(), store, &mut out);
+            self.dev_of(nodes, &touched.functions, store, &mut out);
         }
         if self.frontend.stopped() {
             // alloc: an error, once

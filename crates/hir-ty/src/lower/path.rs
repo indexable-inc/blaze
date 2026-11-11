@@ -877,9 +877,10 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                         let GenericParamId::ConstParamId(const_id) = param_id else {
                             unreachable!("non-const param ID for const param");
                         };
+                        let generic = self.ctx.ctx.const_exprs();
                         self.ctx
                             .ctx
-                            .lower_const(konst, const_param_ty(self.ctx.ctx.db, const_id), false)
+                            .lower_const(konst, const_param_ty(self.ctx.ctx.db, const_id), generic)
                             .into()
                     }
                     _ => unreachable!("unmatching param kinds were passed to `provided_kind()`"),

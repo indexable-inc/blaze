@@ -2080,6 +2080,11 @@ impl<'db> Cx<'db> {
                 }
             }
             PatternKind::NotNull => f.u8(2),
+            // blaze: a variant refinement (`#![blaze::pattern_types]`), by the variant's index.
+            PatternKind::Variant { index } => {
+                f.u8(3);
+                f.u32(index);
+            }
         }
     }
 

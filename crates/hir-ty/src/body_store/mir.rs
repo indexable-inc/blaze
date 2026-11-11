@@ -118,7 +118,7 @@ blaze_format::record! {
 const _: () = assert!(size_of::<MirAnswerRoot>() == 48);
 
 /// The schema of a MIR answer and of everything its bytes are made with; [`place`] adds the
-/// owner's place to it.
+/// owner's place to it, and [`super::with_crate_attrs`] the crate attributes that change MIR.
 const SCHEMA: SchemaHash = schema_of(&[
     Part::Str("blaze v2 item store MIR 1"),
     Part::Schema(<MirAnswerRoot as Record>::SCHEMA),

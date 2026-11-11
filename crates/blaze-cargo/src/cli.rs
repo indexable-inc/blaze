@@ -33,7 +33,9 @@ pub mod clean;
 pub mod client_rows;
 pub mod daemon;
 pub mod doc;
+pub mod doctor;
 mod duckdb;
+pub mod edits;
 pub mod fetch_url;
 pub mod fix;
 pub mod inspect;
@@ -57,6 +59,7 @@ pub mod terminal;
 pub mod test;
 #[cfg(feature = "native")]
 pub mod tree;
+pub mod which;
 
 use std::{
     ffi::OsString,
@@ -308,6 +311,7 @@ const COMMANDS: &[&str] = &[
     "why",
     "reach",
     "slow",
+    "doctor",
     "pprof",
     "perf",
 ];
@@ -390,6 +394,14 @@ pub fn command(words: Vec<OsString>) -> i32 {
             Exit::Failed.code()
         }
     };
+    // A command that only asks the daemon says first when that daemon is another build of
+    // blaze than this binary (`which.rs`): its answer is of that build's work.
+    if matches!(
+        asked,
+        Asked::Status(_) | Asked::Debug(_) | Asked::Explain(_) | Asked::Why(_) | Asked::Slow(_)
+    ) {
+        which::warn_if_other(auto_color());
+    }
     match asked {
         Asked::Help(None) => {
             print!("{HELP}");
@@ -400,7 +412,8 @@ pub fn command(words: Vec<OsString>) -> i32 {
             0
         }
         Asked::Version => {
-            println!("{}", crate::version());
+            // The release line, then which binary this is (`which.rs`).
+            print!("{}", which::version());
             0
         }
         Asked::Unknown(name) => {
@@ -450,6 +463,7 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Why(words) => observe::why(words, auto_color()),
         Asked::Reach(words) => reach::main(words, auto_color()),
         Asked::Slow(words) => observe::slow(words, auto_color()),
+        Asked::Doctor(words) => doctor::main(words, auto_color()),
         #[cfg(feature = "native")]
         Asked::Pprof(words) => pprof::main(words, auto_color()),
         #[cfg(not(feature = "native"))]

@@ -187,7 +187,9 @@ impl PrefixEntryPoint {
             PrefixEntryPoint::Item => grammar::entry::prefix::item,
             PrefixEntryPoint::MetaItem => grammar::entry::prefix::meta_item,
         };
-        let mut p = parser::Parser::new(input);
+        // A fragment never takes a bare `T is PAT`, so `$t:ty` matches what it matched before
+        // `#![blaze::pattern_types]` existed.
+        let mut p = parser::Parser::new_fragment(input);
         entry_point(&mut p);
         let (events, errors) = p.finish();
         event::process(events, errors)

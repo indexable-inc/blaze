@@ -25,6 +25,7 @@ mod simple;
 mod trait_aliases;
 mod traits;
 mod variance;
+mod where_const;
 
 use base_db::{Crate, EditionedFileId};
 use blaze_hash::HashMap;

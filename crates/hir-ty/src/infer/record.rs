@@ -78,7 +78,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 
     /// Whether the crate being checked turns records on.
     fn records_enabled(&self) -> bool {
-        base_db::crate_extensions(self.db, self.resolver.krate()).records()
+        self.resolver.krate().extensions(self.db).records()
     }
 
     /// Notes each of `args` that is a record value as an argument of a call to `function`:

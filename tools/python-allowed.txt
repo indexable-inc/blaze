@@ -117,8 +117,10 @@ harness/v2/guards.py
 harness/v2/incraudit.py
 harness/v2/lean_differential.py
 harness/v2/lean_gate.py
+harness/v2/loop_syscalls.py
 harness/v2/macroeval_corpus.py
 harness/v2/mir_semantics.py
+harness/v2/nostd.py
 harness/v2/oracle.py
 harness/v2/pins.py
 harness/v2/proof.py

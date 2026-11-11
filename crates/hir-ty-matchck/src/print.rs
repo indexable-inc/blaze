@@ -285,7 +285,8 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// `write_struct_like`.
     fn write_struct_like(&self, out: &mut String, pat: &Witness<'a, 'db>) {
         let db = self.db;
-        let ty = *pat.ty();
+        // blaze: a witness of a refinement `T is PAT` names its base's variants.
+        let ty = hir_ty::pattern_types::base(*pat.ty());
         let lang = self.infcx.interner.lang_items();
         // The variant and the name it is written with: `Some`, `Ok` without their enum.
         let named = match ty.kind() {

@@ -11,6 +11,7 @@ use crate::read::Found;
 mod block_checks;
 mod model_check;
 mod place_crash;
+mod place_made;
 mod place_race;
 
 fn name(it: &str) -> FileName {
@@ -486,10 +487,35 @@ fn output_of(long: &[u8], tail: impl FnOnce(&[u8]) -> Vec<u8>) -> Vec<u8> {
     out
 }
 
-/// [`drive`], with the completions of the maps `hold` picks kept back in `held`, in the order
-/// they came: what a driver does whose maps answer out of order (the sim's poll shuffles what
-/// is due, a thread pool answers as each map ends), for as long as a test wants.
+/// The tag of the marker `drive_holding` leaves in `held` for a batch whose moves it holds:
+/// this, plus the batch's id. No store asks with a tag this high.
+const HELD_MOVES: u64 = 1 << 62;
+
+/// [`drive`], with the moves of every batch committed meanwhile held back
+/// (`Store::hold_moves`) and the completions of the maps `hold` picks kept back in `held`, in
+/// the order they came: the window between a commit's head and its moves, for as long as a
+/// test wants. A pack is read through the pool and waits for no map, so what holds a batch of
+/// packs alone is the store's own hold, which a marker in `held` stands for.
 fn drive_holding(
+    sim: &mut Sim,
+    store: &mut Store,
+    effects: &mut Vec<Effect>,
+    held: &mut Vec<Completion>,
+    hold: impl Fn(&Mapped) -> bool,
+) {
+    let before: Vec<u64> = store.pending.iter().map(|it| it.id).collect();
+    store.hold_moves = true;
+    drive_keeping(sim, store, effects, held, hold);
+    store.hold_moves = false;
+    for batch in store.pending.iter().filter(|it| it.held && !before.contains(&it.id)) {
+        held.push(Completion {
+            tag: blaze_core::Tag(HELD_MOVES + batch.id),
+            done: blaze_core::Done::Synced,
+        });
+    }
+}
+
+fn drive_keeping(
     sim: &mut Sim,
     store: &mut Store,
     effects: &mut Vec<Effect>,
@@ -512,7 +538,7 @@ fn drive_holding(
 
 /// Every map a commit asks for before its batch's moves are made.
 fn batch_map(what: &Mapped) -> bool {
-    matches!(what, Mapped::Pack { batch: Some(_), .. } | Mapped::External { batch: Some(_), .. })
+    matches!(what, Mapped::External { batch: Some(_), .. })
 }
 
 /// A flush whose maps `hold` picks are kept back in `held`: its commit is durable, and its
@@ -532,7 +558,10 @@ fn flush_holding(
 fn release(sim: &mut Sim, store: &mut Store, held: Vec<Completion>) {
     let mut effects = Vec::new();
     for completion in held {
-        store.complete(completion, &mut effects);
+        match completion.tag.0.checked_sub(HELD_MOVES) {
+            Some(batch) => store.release_moves(batch),
+            None => _ = store.complete(completion, &mut effects),
+        }
     }
     drive(sim, store, &mut effects);
 }
@@ -749,11 +778,11 @@ fn assert_dead_is_exact(store: &Store) {
         let mut unfound = 0;
         let mut offset = PACK_HEADER;
         while offset < pack.end {
-            if pack.bytes(offset, 4).unwrap() == [0; 4] {
+            if pack.bytes(look, offset, 4).unwrap() == [0; 4] {
                 offset = (offset + 1).next_multiple_of(disk::BLOCK);
                 continue;
             }
-            let header = RecordHeader::decode(pack.bytes(offset, RECORD_HEADER).unwrap()).unwrap();
+            let header = RecordHeader::decode(pack.bytes(look, offset, RECORD_HEADER).unwrap()).unwrap();
             let found = matches!(
                 look.find(&header.key),
                 Some(Ok(found)) if matches!(found.place, Place::Pack(loc) if loc.pack as usize == at && loc.offset == offset)
@@ -965,12 +994,13 @@ fn end_the_migration(store: &mut Store) {
 fn assert_spots_hold_their_value(store: &Store, key: &Key) {
     let own = &store.tiers[0];
     let held = Held::writer(&*store.shared);
+    let look = store.look();
     for (name, table) in
         std::iter::once(("the delta", &own.delta)).chain(own.prev.iter().map(|it| ("prev", it)))
     {
         let Some((_, spot)) = table.get(held, key) else { continue };
         let header = match spot.place {
-            Place::Pack(loc) => own.packs[loc.pack as usize].bytes(loc.offset, RECORD_HEADER),
+            Place::Pack(loc) => own.packs[loc.pack as usize].bytes(look, loc.offset, RECORD_HEADER),
             // SAFETY: a chunk a table's spot names is freed only after a move takes the spot and
             // a grace passes, and this thread, the store's, makes the moves.
             Place::Segment(seg) => unsafe { seg.chunk.get().bytes(seg.offset, RECORD_HEADER) },
@@ -1755,13 +1785,11 @@ fn a_pack_a_batch_waiting_on_its_maps_moves_records_into_is_not_retired() {
         store.put(key(n), Kind::Code, &value(n)).unwrap();
     }
     let mut held = Vec::new();
-    flush_holding(&mut sim, &mut store, &mut held, |what| {
-        matches!(what, Mapped::Pack { pack: 1, batch: Some(_), .. })
-    });
-    assert_eq!(store.pending.len(), 1, "the batch waits on its map of pack 1");
+    flush_holding(&mut sim, &mut store, &mut held, batch_map);
+    assert_eq!(store.pending.len(), 1, "the batch's moves are held back");
     let pack = &store.tiers[0].packs[0];
     assert!(store.tiers[0].packs.len() == 2 && store.tiers[0].dictionaries.is_empty());
-    assert!(pack.usable == pack.committed, "pack 0 is mapped");
+    assert!(pack.usable == pack.committed, "pack 0 is read as far as it is committed");
     assert!(pack.dead * 2 >= pack.committed - PACK_HEADER, "pack 0 is half dead");
     assert!(
         store.pending[0].moves.iter().any(|it| it.to.pack == 0),
@@ -3141,11 +3169,15 @@ fn a_store_that_cannot_write_stops_and_says_where() {
     assert!(broken.what.contains("injected"), "{broken}");
 }
 
+/// A driver that maps by itself hands the store the mapping of a file of its own (no pack is
+/// mapped: packs are read through the pool), and the opening goes on from it.
 #[test]
 fn a_driver_may_hand_over_mappings_by_itself() {
     let mut sim = Sim::new(17, quiet());
     let mut store = open(&mut sim, "store");
-    store.put(key(1), Kind::Code, b"mapped").unwrap();
+    store.put(key(1), Kind::Code, b"read through the pool").unwrap();
+    let whole = noise(EXTERNAL_FROM + 100, 2);
+    store.put(key(2), Kind::Query, &whole).unwrap();
     flush(&mut sim, &mut store);
     drop(store);
     let mut effects = Vec::new();
@@ -3158,13 +3190,22 @@ fn a_driver_may_hand_over_mappings_by_itself() {
         maps.extend(effects.extract_if(.., |it| matches!(it, Effect::Map { .. })));
     }).expect("the effects end");
     assert!(!store.ready());
+    assert!(
+        maps.iter().all(|it| !matches!(it, Effect::Map { file, .. } if file.as_str().contains("pack-"))),
+        "a pack is never mapped: {maps:?}"
+    );
+    assert!(!maps.is_empty(), "the file of its own is mapped");
+    let mut effects = Vec::new();
     for effect in maps {
         let Effect::Map { file, .. } = effect else { unreachable!() };
         let bytes = sim.contents(&file);
-        store.mapped(&file, Mapping::copy(&bytes));
+        store.mapped(&file, Mapping::copy(&bytes), &mut effects);
     }
+    // The packs' loads the opening asked once its last mapping came.
+    drive(&mut sim, &mut store, &mut effects);
     assert!(store.ready(), "{:?}", store.broken());
-    assert_eq!(bytes_of(&store, &key(1)).unwrap(), b"mapped");
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), b"read through the pool");
+    assert_eq!(bytes_of(&store, &key(2)).unwrap(), whole);
 }
 
 /// Every commit leaves each pack a whole number of blocks long, so every append can be written
@@ -3256,7 +3297,7 @@ fn a_long_cold_value_is_compressed_without_a_dictionary_over_a_long_window() {
     flush(&mut sim, &mut store);
     let loc = store.loc_of(&key(1));
     let header = RecordHeader::decode(
-        store.tiers[0].packs[loc.pack as usize].bytes(loc.offset, RECORD_HEADER).unwrap(),
+        store.tiers[0].packs[loc.pack as usize].bytes(store.look(), loc.offset, RECORD_HEADER).unwrap(),
     );
     assert_eq!(header.unwrap().dictionary, NO_DICTIONARY);
     drop(store);

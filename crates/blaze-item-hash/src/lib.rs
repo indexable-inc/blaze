@@ -36,7 +36,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use base_db::Db;
 use blaze_ids::ContentId;
-use hir_def::{DefWithBodyId, HasModule as _};
+use hir_def::DefWithBodyId;
 use hir_ty::{
     body_store::{BodyFacts, Classified, Step},
     next_solver::{SolverDefId, goal_store::FactRef},
@@ -63,7 +63,7 @@ impl BodyFacts for Bodies {
     }
 
     fn value(&self, db: &Db, def: DefWithBodyId, fact: FactRef) -> Option<ContentId> {
-        values::value(db, def.krate(db), fact)
+        values::value_in(db, def, fact)
     }
 
     fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {

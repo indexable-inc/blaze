@@ -528,7 +528,7 @@ fn wildcard_pat(p: &mut Parser<'_>) -> CompletedMarker {
 //     let &(0..=1) = ();
 // }
 /// `&pat`, `&mut pat`, `&pin const pat` and `&pin mut pat` (rustc's `parse_pat_deref`, with
-/// `parse_pin_and_mut`).
+/// `parse_pin_and_mut`), and under `#![blaze::uniq]` `&uniq pat`.
 fn ref_pat(p: &mut Parser<'_>) -> CompletedMarker {
     assert!(p.at(T![&]));
     let m = p.start();
@@ -538,8 +538,9 @@ fn ref_pat(p: &mut Parser<'_>) -> CompletedMarker {
         if !p.eat(T![mut]) {
             p.bump(T![const]);
         }
-    } else {
-        p.eat(T![mut]);
+    } else if !p.eat(T![mut]) && uniq::at_ref_pat(p) {
+        // `&uniq pat` (`#![blaze::uniq]`): the `mut` of `&mut pat`, spelled `uniq`.
+        p.bump_remap(T![mut]);
     }
     let (_, range_op) = pattern_single_r(p, PAT_RECOVERY_SET);
     ban_pat_range_if_ambiguous(p, range_op);
@@ -641,8 +642,12 @@ fn pat_list(p: &mut Parser<'_>, ket: SyntaxKind) {
 fn ident_pat(p: &mut Parser<'_>, with_at: bool) -> CompletedMarker {
     assert!(matches!(p.current(), T![ref] | T![mut] | IDENT));
     let m = p.start();
-    p.eat(T![ref]);
-    p.eat(T![mut]);
+    if p.eat(T![ref]) && !p.eat(T![mut]) && uniq::at_ref_binding(p) {
+        // `ref uniq x` (`#![blaze::uniq]`): the `mut` of `ref mut x`, spelled `uniq`.
+        p.bump_remap(T![mut]);
+    } else {
+        p.eat(T![mut]);
+    }
     name_r(p, PAT_RECOVERY_SET);
     if with_at && p.eat(T![@]) {
         pattern_single(p);

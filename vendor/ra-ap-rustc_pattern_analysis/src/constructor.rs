@@ -974,6 +974,11 @@ pub enum VariantVisibility {
     /// is enabled. Like `Hidden`, it will not be mentioned in diagnostics unless the user mentioned
     /// it first.
     Empty,
+    /// blaze: a variant the type itself leaves out, one outside the set of a refinement by
+    /// variants (`Conn is Conn::Open { .. }`, `#![blaze::pattern_types]`). No value of the type
+    /// is it, whatever the place's validity: it is never missing, and a pattern for it matches
+    /// nothing, so its arm is unreachable.
+    Excluded,
 }
 
 /// Describes the set of all constructors for a type. For details, in particular about the emptiness
@@ -1108,6 +1113,10 @@ impl<Cx: PatCx> ConstructorSet<Cx> {
 
                 for (idx, visibility) in variants.iter_enumerated() {
                     let ctor = Variant(idx);
+                    if matches!(visibility, VariantVisibility::Excluded) {
+                        // blaze: neither present nor missing; rows of it are never specialized.
+                        continue;
+                    }
                     if seen_set.contains(idx) {
                         present.push(ctor);
                     } else {
@@ -1116,6 +1125,7 @@ impl<Cx: PatCx> ConstructorSet<Cx> {
                             VariantVisibility::Visible => missing.push(ctor),
                             VariantVisibility::Hidden => skipped_a_hidden_variant = true,
                             VariantVisibility::Empty => missing_empty.push(ctor),
+                            VariantVisibility::Excluded => {}
                         }
                     }
                 }
@@ -1216,7 +1226,9 @@ impl<Cx: PatCx> ConstructorSet<Cx> {
                 !*non_exhaustive
                     && variants
                         .iter()
-                        .all(|visibility| matches!(visibility, VariantVisibility::Empty))
+                        .all(|visibility| {
+                            matches!(visibility, VariantVisibility::Empty | VariantVisibility::Excluded)
+                        })
             }
             ConstructorSet::Slice { array_len, subtype_is_empty } => {
                 *subtype_is_empty && matches!(array_len, Some(1..))

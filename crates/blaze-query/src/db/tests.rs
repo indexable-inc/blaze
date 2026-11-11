@@ -1429,6 +1429,24 @@ fn a_key_the_database_never_gave_is_refused_naming_the_query_and_the_database_st
         assert!(message.contains("asked from outside any query"), "{message}");
         assert!(message.contains("a key of another database, forged"), "{message}");
         assert!(message.contains("the call stack of the ask"), "{message}");
+        // No test of this binary notes a restore, so it says no restored file holds the key;
+        // with one noted, it names the file, its format and what checks it.
+        assert!(message.contains("restored no persisted state"), "{message}");
+        let restored = super::NeverGiven {
+            restored: Some(super::RestoredFrom {
+                file: "/home/v2/db/image".to_owned(),
+                format: "layout-7".to_owned(),
+                hash: "abc".to_owned(),
+            }),
+            ..never.clone()
+        };
+        let message = restored.to_string();
+        assert!(
+            message.contains("restored its state from /home/v2/db/image (format layout-7, hash abc)")
+                && message.contains("that restore is suspect")
+                && message.contains("`blaze doctor`"),
+            "{message}"
+        );
     }
     assert_eq!(*get::<Double>(&db, cell), 6);
 
