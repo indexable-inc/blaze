@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: What a link after a one-function edit costs, step by step, and the design that makes it cost the edit. Built - the link as a patch of its file (ranges written, a Merkle digest of the file), link inputs kept beside the database and brought forward by the build's delta, function, static and span rows kept per image with one keyed Merkle digest as the link's id, and the spans that count each. Not built - the address and perf maps as patches, the writer's tables built by block, a store that takes a patch, one link for two paths.
+summary: What a link after a one-function edit costs, step by step, and the design that makes it cost the edit. Built - the link as a patch of its file (ranges written, a Merkle digest of the file), link inputs kept beside the database and brought forward by the build's delta, function, static and span rows kept per image with one keyed Merkle digest as the link's id, and the spans that count each. Not built - the address and perf maps as patches, the writer's tables built by block, a store that takes a patch.
 date: 2026-11-10
 ---
 # Patch in place
@@ -102,11 +102,9 @@ since the last link".
 - **The writer's tables by block.** `file.rs` rebuilds each synthetic region (symbols,
   names, unwind header) every stage and compares it with the last in 4 KiB blocks. Building
   only the blocks that can have changed is a change of each format's writer.
-- **One link for two paths.** `out/hello` and `debug/hello` are two kept images because
-  both are outputs the unit's plan lists (`artifact::made`), and each image's build id is
-  of its own path. One link needs the caller (`compile.rs`) to pass every path of the unit
-  that is the same output, the first as the image's and the rest as places of its file, and
-  the dev run held under each (`DevRuns::adopt` with `runs_from`).
+- **One link for two paths**: built 2026-11-10 ([debug-side-file.md](debug-side-file.md)).
+  `artifact::made` lists a program with no hash in its name once, the profile directory's
+  file is its copy (`uplifted`), and an image's build id is of its file name, not its path.
 - **`blaze why`** names `Full::NoRoom`, `NoThunk`, `Output`, `Layout` on the link line. Why
   the rows or the inputs were made whole is on the spans only (`whole`); a line needs a
   field in `blaze_api::LinkHow`.

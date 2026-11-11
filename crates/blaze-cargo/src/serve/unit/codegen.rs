@@ -1634,6 +1634,175 @@ pub(crate) struct LinkMade {
     pub(crate) whole: Option<String>,
 }
 
+/// Where an image's debug info goes, given its level, its format and the profile's
+/// `split-debuginfo`: beside the image unless the profile says `off`, which puts it inside as
+/// before. `packed` and `unpacked` are both the one side file blaze writes (it has no
+/// per-crate objects to leave debug info in). An image with no debug info has none either
+/// way, and a format blaze writes no side file for (PE, wasm) keeps what it had.
+pub(crate) fn debug_place(
+    debug: blaze_link::Debug,
+    format: blaze_link::Format,
+    split: Option<&str>,
+) -> Result<blaze_link::Debug, String> {
+    use blaze_link::{Debug, Format};
+    match (debug, split) {
+        (Debug::None, _) => Ok(Debug::None),
+        (_, Some("off")) => Ok(Debug::Lines),
+        (_, None | Some("packed" | "unpacked")) => Ok(match format {
+            Format::Elf | Format::MachO => Debug::Beside,
+            Format::Pe | Format::Wasm => debug,
+        }),
+        // alloc: error path
+        (_, Some(other)) => Err(format!(
+            "split-debuginfo `{other}` is none rustc takes: `off`, `packed` or `unpacked`"
+        )),
+    }
+}
+
+/// Where the side file named `name` ([`blaze_link::DebugWrite::name`], from the image's own
+/// file name) goes for the executable at `exe`. ELF: beside it under the name its
+/// `.gnu_debuglink` holds, whatever the copy is called. Mach-O: the bundle a debugger looks
+/// for beside the executable, `<its file name>.dSYM`.
+fn side_path(format: blaze_link::Format, exe: &str, name: &str) -> std::path::PathBuf {
+    let exe = std::path::Path::new(exe);
+    let dir = exe.parent().unwrap_or(std::path::Path::new(""));
+    match (format, exe.file_name().and_then(|it| it.to_str())) {
+        (blaze_link::Format::MachO, Some(own)) => {
+            // alloc: once per side file written, its path
+            dir.join(format!("{own}.dSYM")).join("Contents/Resources/DWARF").join(own)
+        }
+        _ => dir.join(name),
+    }
+}
+
+/// Writes `write` at `to`: a clone of the file there with the ranges written, or a new file
+/// for a whole one, renamed over it. `false`, with nothing changed, when the file there is not
+/// the one a patch is of (it is gone, or carries another build id). Not synced: the side file
+/// is made again from the image whenever it is not the one expected, so a torn one costs a
+/// whole write, never a wrong line.
+fn write_side(
+    to: &std::path::Path,
+    format: blaze_link::Format,
+    write: &blaze_link::DebugWrite,
+) -> Result<bool, String> {
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+    // alloc: error path
+    let failed = |what: &str, error: std::io::Error| format!("{}: {what}: {error}", to.display());
+    if let Some(dir) = to.parent() {
+        std::fs::create_dir_all(dir).map_err(|it| failed("making its directory", it))?;
+    }
+    // alloc: once per side file written, the name its next file is written at
+    let mut next = to.as_os_str().to_owned();
+    next.push(".blaze-next");
+    let next = std::path::PathBuf::from(next);
+    let mut file = match write.base {
+        Some(base) => {
+            if std::fs::copy(to, &next).is_err() {
+                return Ok(false);
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&next)
+                .map_err(|it| failed("opening its clone", it))?;
+            // Its build id is in its first bytes, wherever its format keeps it.
+            let mut head = Vec::with_capacity(128); // alloc: once per side file patched
+            let held = match (&mut file).take(128).read_to_end(&mut head) {
+                Ok(_) => blaze_link::debug_file_id(format, &head),
+                Err(_) => None,
+            };
+            if held != Some(base) {
+                drop(file);
+                std::fs::remove_file(&next).map_err(|it| failed("removing its clone", it))?;
+                return Ok(false);
+            }
+            file
+        }
+        None => std::fs::File::create(&next).map_err(|it| failed("creating it", it))?,
+    };
+    file.set_len(write.len).map_err(|it| failed("sizing it", it))?;
+    for (at, bytes) in &write.writes {
+        file.seek(SeekFrom::Start(*at)).map_err(|it| failed("writing it", it))?;
+        file.write_all(bytes).map_err(|it| failed("writing it", it))?;
+    }
+    drop(file);
+    std::fs::rename(&next, to).map_err(|it| failed("renaming it into place", it))?;
+    Ok(true)
+}
+
+/// The debug side file of the image `linked` was just committed as, written beside `path`
+/// and beside the copy cargo makes of it; nothing for an image with none. Derived data: it is
+/// not in the store, and a build that places the executable from the store without linking it
+/// writes none (the executable then backtraces by its symbol table, without lines, until its
+/// next link).
+///
+/// Called in the link today, in its own span (`link debug file`), so an edit waits for it:
+/// what it costs is the span's. It reads nothing of the link's but the committed image, so
+/// the job can call it from its settling path instead, after the answer
+/// (docs/v2/plan/design/debug-side-file.md, "Not built").
+fn debug_side(job: &Job, unit: usize, path: &str, linked: &mut Linked) -> Result<(), LinkCause> {
+    if linked.output.debug != blaze_link::Debug::Beside {
+        return Ok(());
+    }
+    let format = linked.output.format;
+    let span = tracing::info_span!(
+        target: "blaze",
+        "link debug file",
+        unit = %path,
+        bytes = tracing::field::Empty,
+        written = tracing::field::Empty,
+        ranges = tracing::field::Empty,
+        records = tracing::field::Empty,
+        whole = tracing::field::Empty,
+    )
+    .entered();
+    let linker = |error: blaze_link::LinkError| LinkCause::Linker { step: LinkStep::Debug, error };
+    let Some(mut write) = linked.image.debug_file().map_err(linker)? else {
+        return Ok(());
+    };
+    let first = side_path(format, path, &write.name);
+    if !write_side(&first, format, &write).map_err(LinkCause::Given)? {
+        // The file there is not the one the patch is of: someone removed it, or another
+        // build's is there. Made whole from the image, and said.
+        let Some(whole) = linked.image.debug_file_whole().map_err(linker)? else {
+            return Ok(());
+        };
+        write = whole;
+        write.whole = Some("the side file on the disk is not the one last written");
+        if !write_side(&first, format, &write).map_err(LinkCause::Given)? {
+            // alloc: error path
+            return Err(LinkCause::Given(format!(
+                "{}: a whole debug side file was not written: it is a patch of none",
+                first.display()
+            )));
+        }
+    }
+    span.record("bytes", write.len);
+    span.record("written", write.written());
+    span.record("ranges", write.writes.len());
+    span.record("records", write.records);
+    if let Some(why) = write.whole {
+        span.record("whole", why);
+    }
+    let plan = job.plan(unit).map_err(|it| LinkCause::Given(it.what))?;
+    if let Some(copy) = super::artifact::uplifted(path, plan) {
+        // The copy's side file is the same bytes: cloned where the volume can.
+        let to = side_path(format, copy, &write.name);
+        // alloc: error path
+        let failed = |what: &str, error: std::io::Error| {
+            LinkCause::Given(format!("{}: {what}: {error}", to.display()))
+        };
+        if let Some(dir) = to.parent() {
+            std::fs::create_dir_all(dir).map_err(|it| failed("making its directory", it))?;
+        }
+        let mut next = to.as_os_str().to_owned();
+        next.push(".blaze-next");
+        std::fs::copy(&first, &next).map_err(|it| failed("copying the side file to it", it))?;
+        std::fs::rename(&next, &to).map_err(|it| failed("renaming it into place", it))?;
+    }
+    Ok(())
+}
+
 /// What the build says when a splice was refused for a thunk it could not place and the
 /// image is linked from scratch in its place: `branch` is the linker's words for the branch
 /// ([`blaze_link::LinkError::no_thunk`]).
@@ -1717,6 +1886,8 @@ pub(crate) enum LinkStep {
     Stage,
     /// Taking the staged image's bytes.
     Bytes,
+    /// Making the image's debug side file.
+    Debug,
 }
 
 impl LinkStep {
@@ -1727,6 +1898,7 @@ impl LinkStep {
             LinkStep::Image => "making the image",
             LinkStep::Stage => "staging the change",
             LinkStep::Bytes => "writing the image",
+            LinkStep::Debug => "making the debug side file",
         }
     }
 }
@@ -1790,6 +1962,10 @@ fn link_at(
         false => blaze_link::target::output(triple(job, u), shared, debug, true),
     };
     let mut output = output.map_err(linker(LinkStep::Output))?;
+    // Debug info goes beside the image unless the profile says `split-debuginfo = "off"`
+    // ([`debug_place`]): the image an edit writes, hashes and places carries none.
+    output.debug = debug_place(output.debug, output.format, u.profile.split_debuginfo.as_deref())
+        .map_err(LinkCause::Given)?;
     // Code built to take edits ([`policy`]) is linked as a dev executable: the live descriptor
     // and the start hook's reservations, committed into the daemon's code memory ([`relink`]).
     // A doctest's programs run as processes of their own under its runner, never mapped.
@@ -1941,6 +2117,11 @@ fn link_at(
         Err(_) => Ok(()),
     };
     drop(tables);
+    // The image's debug info, beside it: derived from the image as committed.
+    let debug = match &made {
+        Ok(_) => debug_side(job, unit, path, &mut linked),
+        Err(_) => Ok(()),
+    };
     // The file's identity as the last commit left it: the blocks this link wrote, hashed.
     let root = match &made {
         Ok(_) => linked
@@ -1963,6 +2144,7 @@ fn link_at(
     let (written, read, table, laid, told) = made?;
     mapped?;
     perf_mapped?;
+    debug?;
     let how = match (&whole, relaid && changed.is_some_and(OutputFields::is_empty)) {
         (Some((reason, _)), _) => Linking::Full(*reason),
         (None, true) => Linking::Full(Full::Layout),

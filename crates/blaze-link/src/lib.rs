@@ -20,6 +20,7 @@
 
 pub mod args;
 mod arena;
+mod beside;
 mod commit;
 mod counter;
 mod cow;
@@ -77,6 +78,7 @@ pub use layout::Heat;
 pub use live::descriptor_of;
 pub use lazy::{LazyPlacer, Slots};
 pub use patch::Patch;
+pub use beside::{DebugWrite, crc32 as debuglink_crc32, id_of as debug_file_id};
 pub use output::{
     Debug, DevRun, Format, LinkArgs, Live, Native, NativeKind, Output, OutputKind, Platform,
     Undefined,
@@ -370,6 +372,9 @@ pub struct Image {
     placed_pairs: Vec<(symbols::IdNo, u32)>,
     /// The file's identity, kept as commits change it ([`Image::digest`]).
     filed: patch::Filed,
+    /// The debug side file as last given ([`Image::debug_file`]), of an image whose debug
+    /// info is beside it ([`Debug::Beside`]); empty for every other.
+    beside: beside::Kept,
 }
 
 impl Image {
@@ -427,6 +432,15 @@ impl Image {
         if output.live.is_some() && !output.incremental {
             return Err(fail("a live image must be incremental: it keeps room for patches".into()));
         }
+        if output.debug == Debug::Beside && !matches!(output.format, Format::Elf | Format::MachO)
+        {
+            // alloc: error path
+            return Err(fail(format!(
+                "{to}: debug info beside a {:?} image, which blaze writes no side file for: link it with its debug \
+                 info inside (`split-debuginfo = \"off\"`) or with none",
+                output.format
+            )));
+        }
         let writer = model::writer(&output)?;
         let mut plan = writer.plan();
         if let Some(place) = &place {
@@ -477,6 +491,7 @@ impl Image {
             // alloc: none until the lazy placer gives a pair
             placed_pairs: Vec::new(),
             filed: patch::Filed::new(),
+            beside: beside::Kept::new(),
         })
     }
 
@@ -929,6 +944,7 @@ impl Image {
             + inputs
             + objects
             + self.scratch.capacity() as u64
+            + self.beside.held()
     }
 
     /// Gives back what the image keeps only for its next stage to start warm: its stage
@@ -972,6 +988,100 @@ impl Image {
     /// [`Image::functions`] of this image maps the address back to its function.
     pub fn build_id(&self) -> [u8; 16] {
         self.state.image_id()
+    }
+
+    /// What to write of the image's debug side file so it describes the image as last
+    /// committed ([`Debug::Beside`], docs/v2/plan/design/debug-side-file.md); `None` for an
+    /// image with no side file. Derived from the committed state alone, so it is called after
+    /// the link is answered, never for it: each Rust function's address, size, name and rows
+    /// are compared with the record the last call left (a hash per function), and only the
+    /// records that differ are written, with the build id and, on ELF, the four bytes that
+    /// keep the file's CRC-32 the one the executable names. A rollback needs nothing said:
+    /// the next call compares against the state rolled back to. An error before the first
+    /// commit or while one is in flight, or naming the function whose rows no span table
+    /// holds.
+    pub fn debug_file(&mut self) -> Result<Option<DebugWrite>, LinkError> {
+        if self.output.debug != Debug::Beside {
+            return Ok(None);
+        }
+        let fail = |what: String| LinkError { function: None, refusal: None, what };
+        if !self.state.laid_out || self.pending.is_some() {
+            // alloc: error path
+            return Err(fail(format!(
+                "{}: no committed image to describe: it is not laid out, or a commit is in flight",
+                self.to
+            )));
+        }
+        let (state, symbols) = (&self.state, &self.symbols);
+        // alloc: once per side file update, a view per Rust function and a row per line
+        let mut functions: Vec<beside::Func<'_>> = Vec::new();
+        let mut lines: Vec<beside::Lined<'_>> = Vec::new();
+        let mut last: Option<(&blaze_ids::ContentId, &position::Spans)> = None;
+        for piece in state.live_pieces() {
+            if !piece.placed() {
+                continue;
+            }
+            let Some(info) = piece.function() else { continue };
+            let start = lines.len() as u32;
+            for line in state.lines(info) {
+                let anchor = &line.span.anchor;
+                let table = match last {
+                    Some((it, table)) if it == anchor => table,
+                    _ => {
+                        let table = symbols
+                            .find_id(anchor)
+                            .and_then(|id| state.span_table(id))
+                            .ok_or_else(|| LinkError {
+                                function: Some(info.key),
+                                refusal: None,
+                                // alloc: error path
+                                what: format!("a line in {anchor:?}, whose span table the link was not given"),
+                            })?;
+                        last = Some((anchor, table));
+                        table
+                    }
+                };
+                let span = table.span(line.span.index).ok_or_else(|| LinkError {
+                    function: Some(info.key),
+                    refusal: None,
+                    // alloc: error path
+                    what: format!("span {} of {anchor:?}, past its table", line.span.index),
+                })?;
+                lines.push(beside::Lined {
+                    at: line.at,
+                    file: table.file(span.file),
+                    line: span.line,
+                    column: span.column,
+                });
+            }
+            functions.push(beside::Func {
+                key: info.key,
+                addr: piece.addr,
+                size: piece.size,
+                name: state.debug_name(info.id).map(|it| symbols.str(it)),
+                lines: start..lines.len() as u32,
+            });
+        }
+        functions.sort_unstable_by_key(|it| (it.addr, it.key));
+        let input = beside::Input {
+            format: self.output.format,
+            name: &self.name,
+            id: state.image_id(),
+            functions: &functions,
+            lines: &lines,
+        };
+        let file = file::FileBytes::of(state);
+        let exe = |at: u64, out: &mut [u8]| file.copy(at, out);
+        // alloc: error path
+        self.beside.update(&input, &exe).map(Some).map_err(|what| fail(format!("{}: {what}", self.to)))
+    }
+
+    /// [`Image::debug_file`] with nothing kept of the side file last given: the whole file.
+    /// For whoever finds the side file on the disk missing, torn or of another build id
+    /// ([`DebugWrite::apply`]'s refusal): derived data is made again, never trusted.
+    pub fn debug_file_whole(&mut self) -> Result<Option<DebugWrite>, LinkError> {
+        self.beside.forget();
+        self.debug_file()
     }
 
     /// Each Rust function's code, by address: its instance key, its address as the file
@@ -1124,6 +1234,12 @@ fn dev_run_fits(
 
 /// What an image is across its generations: its first full link's pieces and inputs. Once
 /// per image.
+///
+/// Of where the image is written, only its file name is an input: the name is in the file (a
+/// Mach-O signature's identifier, an import library's DLL, an ELF `.gnu_debuglink`), its
+/// directory is nowhere in it (the debug info's `DW_AT_comp_dir` is `.`, and
+/// [`Output::rpaths`] are the output's, hashed with it). So one program linked for two
+/// directories is one lineage and one build id, and its file can be placed at both.
 fn lineage(stage: &Stage<'_>, to: &FileName) -> [u8; 16] {
     let pieces = stage.new.piece_count() as usize;
     let mut bytes: Vec<u8> = Vec::with_capacity(pieces * 40);
@@ -1135,9 +1251,10 @@ fn lineage(stage: &Stage<'_>, to: &FileName) -> [u8; 16] {
     }
     let key = |it: &(u32, u32)| &bytes[it.0 as usize..(it.0 + it.1) as usize];
     let order = lineage_order(&keys, key);
-    let mut hasher = Hasher::new("blaze v2 link lineage 3");
+    let mut hasher = Hasher::new("blaze v2 link lineage 4");
     // alloc: once per image, at its first full link
-    hasher.part(to.as_str().as_bytes()).part(format!("{:?}", stage.output).as_bytes());
+    let name = to.as_str().rsplit('/').next().unwrap_or(to.as_str());
+    hasher.part(name.as_bytes()).part(format!("{:?}", stage.output).as_bytes());
     for (_, at) in &order {
         hasher.part(key(&keys[*at as usize]));
     }

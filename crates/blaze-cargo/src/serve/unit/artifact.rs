@@ -183,13 +183,37 @@ fn dir_of(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |it| it.0)
 }
 
+/// A file name as rustc and cargo both spell it: cargo's copy of `my_app` is `my-app`.
+fn same_name(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes().zip(b.bytes()).all(|(a, b)| a == b || (matches!(a, b'-' | b'_') && matches!(b, b'-' | b'_')))
+}
+
+/// Whether `path`, of a unit with no `extra_filename`, is the copy cargo makes of one of the
+/// unit's own files: it is outside the unit's output directory (where its first output is),
+/// and a listed output of the same name is in it (`target/debug/app` of
+/// `target/debug/build/app/0123/out/app`, cargo's new layout, which names no file by hash).
+/// A path with no such original is the unit's own, wherever it is.
+fn copy_of_unhashed<'a>(path: &str, plan: &'a UnitPlan) -> Option<&'a str> {
+    let output_dir = dir_of(plan.outputs.first()?);
+    if dir_of(path) == output_dir {
+        return None;
+    }
+    plan.outputs
+        .iter()
+        .map(String::as_str)
+        .find(|it| listed(it) && dir_of(it) == output_dir && same_name(file_name(it), file_name(path)))
+}
+
 /// Whether `path` is a file rustc writes, named with the unit's `extra_filename`
 /// (`deps/foo-0123`, `build/foo-0123/build_script_build-0123`) in the unit's output directory
 /// (where its first output is), not a copy cargo makes: a test's program placed to run from
-/// `target/debug/deps` keeps its name, and is a copy by where it is.
+/// `target/debug/deps` keeps its name, and is a copy by where it is. A unit with no
+/// `extra_filename` writes every output but the copies of its own ([`copy_of_unhashed`]):
+/// one program is one file made, and one link.
 fn rustc_writes(path: &str, plan: &UnitPlan) -> bool {
     if plan.extra_filename.is_empty() {
-        return true;
+        return copy_of_unhashed(path, plan).is_none();
     }
     let output_dir = plan.outputs.first().map(|it| dir_of(it));
     file_name(path).contains(plan.extra_filename.as_str())
@@ -202,7 +226,12 @@ fn rustc_writes(path: &str, plan: &UnitPlan) -> bool {
 /// `deps` (`target/debug/deps/it-0123` of `build/app/0123/out/it-0123`), which it runs from.
 pub(crate) fn uplifted<'a>(path: &str, plan: &'a UnitPlan) -> Option<&'a str> {
     if plan.extra_filename.is_empty() {
-        return None;
+        // The output elsewhere that is this file's copy ([`copy_of_unhashed`]).
+        return plan
+            .outputs
+            .iter()
+            .map(String::as_str)
+            .find(|it| listed(it) && copy_of_unhashed(it, plan) == Some(path));
     }
     let own = file_name(path);
     let name = own.replacen(&plan.extra_filename, "", 1);

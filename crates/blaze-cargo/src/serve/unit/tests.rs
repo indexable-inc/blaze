@@ -502,6 +502,30 @@ fn a_test_runs_from_deps_beside_the_packages_binaries() {
     );
 }
 
+/// A program built in its unit's own directory with no hash in its name (cargo's new layout)
+/// is one file made and one link: the profile directory's is its copy, by where it is, and a
+/// file elsewhere that is no output's copy is the unit's own.
+#[test]
+fn a_program_with_no_hash_in_its_name_is_made_once() {
+    let out = "/w/target/debug/build/p/4567/out";
+    let it = plan(
+        "",
+        &[
+            format!("{out}/my_app").as_str(),
+            "/w/target/debug/my-app",
+            format!("{out}/my_app.d").as_str(),
+            "/w/target/debug/other",
+        ],
+    );
+    assert_eq!(artifact::made(&it), [format!("{out}/my_app").as_str(), "/w/target/debug/other"]);
+    assert_eq!(artifact::uplifted(&format!("{out}/my_app"), &it), Some("/w/target/debug/my-app"));
+    assert_eq!(artifact::uplifted("/w/target/debug/my-app", &it), None);
+    assert_eq!(artifact::uplifted("/w/target/debug/other", &it), None);
+    // A library's files are all in one directory: each is made.
+    let lib = plan("", &["/w/target/debug/deps/libp.so", "/w/target/debug/deps/libp.rlib"]);
+    assert_eq!(artifact::made(&lib).len(), 2);
+}
+
 #[test]
 fn a_build_scripts_artifact_is_cargos() {
     let script =
