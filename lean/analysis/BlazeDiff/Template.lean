@@ -192,13 +192,15 @@ theorem eval_powiDown (env : ℕ → ℝ) (cx : Cx) :
   by_cases h : cx.exponent.val = Blaze.ScalarTy.min .I32
   · have e1 : cx.powiDown = Expr.bin .div cx.out cx.a0 := if_pos h
     have e2 : (cx.eval env).powiDown = (cx.eval env).out / (cx.eval env).a0 := if_pos h
-    rw [e1, e2] <;> rfl
+    rw [e1, e2]
+    rfl
   · have e1 : cx.powiDown = Expr.powi (Blaze.Scalar.wrap .I32 (cx.exponent.val - 1)) cx.a0 :=
       if_neg h
     have e2 : (cx.eval env).powiDown =
         (cx.eval env).a0 ^ (Blaze.Scalar.wrap .I32 ((cx.eval env).exponent.val - 1)).val :=
       if_neg h
-    rw [e1, e2] <;> rfl
+    rw [e1, e2]
+    rfl
 
 /-- The term a template builds means the value the template has: every case is the two
 definitions unfolding to the same thing, by the induction hypotheses. -/
@@ -214,25 +216,32 @@ theorem eval_inst (env : ℕ → ℝ) (cx : Cx) (p : P) :
   | powiDown => exact eval_powiDown env cx
   | add x y ihx ihy =>
     show (P.inst cx x).eval env + (P.inst cx y).eval env = _
-    rw [ihx, ihy] <;> rfl
+    rw [ihx, ihy]
+    rfl
   | sub x y ihx ihy =>
     show (P.inst cx x).eval env - (P.inst cx y).eval env = _
-    rw [ihx, ihy] <;> rfl
+    rw [ihx, ihy]
+    rfl
   | mul x y ihx ihy =>
     show (P.inst cx x).eval env * (P.inst cx y).eval env = _
-    rw [ihx, ihy] <;> rfl
+    rw [ihx, ihy]
+    rfl
   | div x y ihx ihy =>
     show (P.inst cx x).eval env / (P.inst cx y).eval env = _
-    rw [ihx, ihy] <;> rfl
+    rw [ihx, ihy]
+    rfl
   | neg x ihx =>
     show -(P.inst cx x).eval env = _
-    rw [ihx] <;> rfl
+    rw [ihx]
+    rfl
   | call op x ihx =>
     show evalUn op ((P.inst cx x).eval env) = _
-    rw [ihx] <;> rfl
+    rw [ihx]
+    rfl
   | powf x y ihx ihy =>
     show (P.inst cx x).eval env ^ (P.inst cx y).eval env = _
-    rw [ihx, ihy] <;> rfl
+    rw [ihx, ihy]
+    rfl
   | sel c l r x y ihl ihr ihx ihy =>
     show pick (holdsBin c.op ((P.inst cx l).eval env) ((P.inst cx r).eval env)
         ((P.inst cx l).holds env) ((P.inst cx r).holds env))
@@ -241,6 +250,7 @@ theorem eval_inst (env : ℕ → ℝ) (cx : Cx) (p : P) :
     cases c <;> rfl
   | selCond x y ihx ihy =>
     show pick (cx.a0.holds env) ((P.inst cx x).eval env) ((P.inst cx y).eval env) = _
-    rw [ihx, ihy] <;> rfl
+    rw [ihx, ihy]
+    rfl
 
 end BlazeDiff
