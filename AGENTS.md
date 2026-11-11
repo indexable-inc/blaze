@@ -143,6 +143,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 54. **guard-the-cause**: When you find bad code or a bad decision, find why it was made and remove that
     cause with a guard (a lint, a check in the gate, a rule or a skill's instruction), so it cannot
     be written again; do this unasked. Skill: `changing-code`.
+55. **own-the-language**: blaze owns its compiler: never design around what stable Rust lacks; when the
+    right design needs a feature Rust has not stabilized or does not have (const generic
+    expressions, for one), build it properly in blaze as an opt-in extension. Skill:
+    `compiler-correctness`.
 
 ## Code Review Rules
 

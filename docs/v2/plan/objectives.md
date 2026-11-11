@@ -13,7 +13,7 @@ remembered. How rows are picked, worked and landed is
 `harness/v2/ledger.py`. A check in *italics* is not written yet, and writing it is the first
 part of the work. `?` is not measured; "last known" is a lead, not a status.
 
-94 objectives: 0 met, 0 open, 0 blocked, 94 not measured.
+95 objectives: 0 met, 0 open, 0 blocked, 95 not measured.
 
 ## Targets
 
@@ -124,6 +124,7 @@ The parts of [the design](../plan.md#the-design) no check has shown yet.
 | E11 | Effects are declared by what a function may do: #[blaze::may(panic, alloc, block, diverge)], with undeclared_effect, unneeded_effect and negative_effect | *write: the lints' tests on a stage 1; no rule accepts a `for` loop as bounded* | written on terminates-effect, unbuilt (2026-11-10) | ? |
 | E12 | A workspace's proc macros and its build scripts' ambient std uses are linted, warn once their replacements are in the tree | *write: the lints' tests on a stage 1; three of four are allow until reflection phase 2 and bstd land* | written on lints-macros-scripts-1110, unbuilt (2026-11-10) | ? |
 | S6 | No bstd API hides a cost or a guarantee: durability, waits, allocation, buffering and policy are arguments or types | *write: the explicitness tables of design/std.md and the file-durability simulation test* |  | ? |
+| E16 | Const generic arguments may be expressions over generic parameters (generic const expressions), checked and unified by blaze's own front end under an opt-in attribute | *write: a spec, then fixtures: arithmetic on const arguments in types and bounds unifies and is refused where it overflows or is not well formed; a crate without the attribute is unchanged* | not started; asked for 2026-11-10 (fractional shares counted in the type need it) | ? |
 
 ## The agent app
 

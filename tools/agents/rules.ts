@@ -502,6 +502,14 @@ export const rules = [
 		reason: "Andrew, 2026-11-10, after a day of finding that every edit dropped the front end, held its answer for a disk sync and hung inside the sandbox, none of it seen because the budget harness was broken and the gate bypassed: \"think about why these design decisions were made and try to fix root cause ... if see bad code proactively make lints or etc or better instructions to avoid it or systems to avoid\".",
 		link: "docs/contributing.md#what-a-change-needs",
 	},
+	{
+		id: "own-the-language",
+		skill: "compiler-correctness",
+		line: "blaze owns its compiler: never design around what stable Rust lacks; when the right design needs a feature Rust has not stabilized or does not have (const generic expressions, for one), build it properly in blaze as an opt-in extension.",
+		info: "blaze has its own front end and its own pinned nightly, so the limits of stable Rust, and of rustc's unfinished features, are not blaze's limits. When a design is being bent around something the language cannot say (arithmetic on const generic arguments, a bound a parameter cannot state, a type the solver refuses), say so, and build the missing piece: finish the nightly feature in blaze's own front end where one exists (generic const expressions, specialization as blaze already has it), or add the smallest general primitive where none does (`library-over-language`), as an opt-in extension that changes no program that does not use it (`superset-of-rust`). Then use it in blaze's own code (`blaze-uses-its-extensions`). A workaround written because \"stable const generics can't do that\" is a subpar design to fix (`guard-the-cause`): the spec names the feature it needs and its ledger row.",
+		reason: "Andrew, 2026-11-10, when a design for fractional shares was being bent around const generic arithmetic: \"we have our own thing and should be able to do proper const generics\".",
+		link: "docs/v2/plan/design/edition.md",
+	},
 ] as const satisfies readonly Rule[];
 
 /**
