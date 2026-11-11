@@ -211,6 +211,14 @@ pub enum ExpandErrorKind {
     Builtin(Box<BuiltinError>),
 }
 
+impl ExpandErrorKind {
+    /// Whether this is a proc macro that ran, or was to, and gave no expansion: the tree in
+    /// its place is the empty one `ProcMacroExpander::expand` leaves, not the macro's.
+    pub fn proc_macro_gave_no_expansion(&self) -> bool {
+        matches!(self, ExpandErrorKind::ProcMacroPanic(_))
+    }
+}
+
 /// An error of a builtin macro or derive as `rustc_builtin_macros` words it: the message, its
 /// error code, the primary spans it has besides the error's own, and the notes and helps under
 /// it, in rustc's order.
@@ -675,9 +683,21 @@ impl MacroCallId {
         })
     }
 
+    /// The errors of this call: why it did not expand, and the parse errors of its expansion.
+    /// A proc macro that did not give an expansion (it panicked, or was refused: a read
+    /// outside its sandbox stops it so) leaves the empty tree in its place, and that tree's
+    /// parse errors ("macro expansion ends with an incomplete expression" where an expression
+    /// was called for) are of nothing the macro wrote: the one error is why it gave none, as
+    /// rustc reports the panic and parses nothing (`rustc_expand`'s `DummyResult`).
     pub fn parse_macro_expansion_error(self, db: &Db) -> Option<ExpandResult<Arc<[SyntaxError]>>> {
-        let e: ExpandResult<Arc<[SyntaxError]>> =
-            self.parse_macro_expansion(db).as_ref().map(|it| Arc::from(it.0.errors()));
+        let parsed = self.parse_macro_expansion(db);
+        let gave_none =
+            parsed.err.as_ref().is_some_and(|err| err.kind().proc_macro_gave_no_expansion());
+        let e: ExpandResult<Arc<[SyntaxError]>> = parsed.as_ref().map(|it| match gave_none {
+            // alloc: error path, an empty slice
+            true => Arc::from(&[][..]),
+            false => Arc::from(it.0.errors()),
+        });
         if e.value.is_empty() && e.err.is_none() { None } else { Some(e) }
     }
 

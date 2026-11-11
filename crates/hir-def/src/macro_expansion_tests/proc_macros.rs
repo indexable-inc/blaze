@@ -299,6 +299,56 @@ struct S;
     );
 }
 
+/// A proc macro that panicked where an expression is called for (`include_dir!` refused a
+/// read, in aquamarine 0.6.0) has one error, its panic: the empty tree left in its place is
+/// not parsed into a second "macro expansion ends with an incomplete expression". The control
+/// is a macro that ran and wrote half an expression, whose parse error is still given.
+#[test]
+fn a_proc_macro_that_panicked_has_its_panic_and_no_parse_error_of_its_empty_expansion() {
+    use hir_expand::{ExpandErrorKind, fixture};
+
+    use crate::{
+        ModuleDefId, expr_store::Body, nameres::crate_def_map, test_db::TestDBExt as _,
+    };
+
+    let db = fixture::db(
+        r#"
+//- proc_macros: issue_17479, mirror
+static PANICKED: u32 = proc_macros::issue_17479!();
+static HALF: u32 = proc_macros::mirror!(+ 1);
+"#,
+    )
+    .into_db();
+    let krate = db.fetch_test_crate();
+    let def_map = crate_def_map(&db, krate);
+    let mut panicked = 0;
+    let mut half = 0;
+    for decl in def_map.module(&db, def_map.root).scope(&db).declarations() {
+        let ModuleDefId::StaticId(it) = decl else { continue };
+        let (_, source_map) = Body::with_source_map(&db, it.into());
+        for (_, call) in source_map.macro_calls() {
+            let errors = call.parse_macro_expansion_error(&db).expect("the call has an error");
+            match errors.err.as_ref().map(|err| err.kind()) {
+                Some(ExpandErrorKind::ProcMacroPanic(message)) => {
+                    assert_eq!(&**message, "incorrect Input");
+                    assert!(
+                        errors.value.is_empty(),
+                        "a second error for the panicked macro: {:?}",
+                        errors.value
+                    );
+                    panicked += 1;
+                }
+                Some(other) => panic!("an expansion error of the macro that ran: {other:?}"),
+                None => {
+                    assert!(!errors.value.is_empty(), "`1 +` parsed as an expression");
+                    half += 1;
+                }
+            }
+        }
+    }
+    assert_eq!((panicked, half), (1, 1), "each static's macro call was found in its body");
+}
+
 #[test]
 fn cfg_evaluated_before_attr_macros() {
     check_errors(
