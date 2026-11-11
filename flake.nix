@@ -94,7 +94,7 @@
             pkgs.mold
             pkgs.wild
           ] ++ [
-            # dx, for harness/hotpatch.py's subsecond (Dioxus hot-patching).
+            # dx (Dioxus hot-patching): harness/hotpatch.py, which used it, is deleted; it goes with the flake.
             pkgs.dioxus-cli
           ];
           BLAZE_NIGHTLY = "${nightly}";

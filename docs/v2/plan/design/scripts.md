@@ -11,39 +11,41 @@ every remaining script becomes a single-file Rust script that blaze builds and r
 ## The audit (2026-11-11, at 7bda937633)
 
 200 tracked `.py` files, 72,402 lines. A file is LIVE when something that runs reaches it: a
-workflow or composite action step, a ledger check (`docs/v2/plan/objectives.json`), a `current`
-doc or a skill that names it, Rust or another tracked file that names it (a generated file's
-header, a test, a manifest), or a live Python file that imports or starts it. DEAD is everything
-else, including a file only `record` or `superseded` docs or other dead files name: deleted.
-UNSURE is kept: named only by a plan, a unit test of a live script that no workflow runs, or
-upstream's file.
+workflow or composite action step, a ledger check (`docs/v2/plan/objectives.json`), a procedure
+of a `current` doc that has a person run it, Rust or another tracked file that names it (a
+generated file's header, a test, a manifest), or a live Python file that imports or starts it.
+DEAD is everything else: deleted. The first pass deleted what only `record` or `superseded`
+docs or other dead files named (8 files); the second (Andrew: "if you think they can go, go")
+what only a plan named, and the 18 older measuring and one-off harnesses that only
+`docs/harness.md`'s catalogue named, which that page said were written against v1 and had never
+measured v2 (26 files). Kept though nothing runs them: the unit tests of two live scripts, until
+their script is ported, and upstream's two files in `library/compiler-builtins`.
 
-| directory | live | dead (deleted) | unsure (kept) |
-|---|---|---|---|
-| .github/scripts | 15 files, 4,088 lines | 0 | 0 |
-| crates | 5 files, 880 lines | 0 | 0 |
-| demo | 0 | 1 files, 16 lines | 0 |
-| docs | 2 files, 355 lines | 0 | 0 |
-| harness | 104 files, 33,102 lines | 3 files, 1,846 lines | 5 files, 770 lines |
-| harness/v2 | 32 files, 21,946 lines | 0 | 2 files, 1,369 lines |
-| library | 0 | 0 | 2 files, 822 lines |
-| site | 3 files, 263 lines | 0 | 0 |
-| tools | 19 files, 5,025 lines | 4 files, 982 lines | 3 files, 938 lines |
-| total | 180 files, 65,659 lines | 8 files, 2,844 lines | 12 files, 3,899 lines |
+| directory | live | dead (deleted) |
+|---|---|---|
+| .github/scripts | 15 files, 4,088 lines | 0 |
+| crates | 5 files, 880 lines | 0 |
+| demo | 0 | 1 files, 16 lines |
+| docs | 2 files, 355 lines | 0 |
+| harness | 86 files, 29,825 lines | 26 files, 5,893 lines |
+| harness/v2 | 32 files, 21,946 lines | 2 files, 1,369 lines |
+| library | 2 files, 822 lines | 0 |
+| site | 3 files, 263 lines | 0 |
+| tools | 21 files, 5,638 lines | 5 files, 1,307 lines |
+| total | 166 files, 63,817 lines | 34 files, 8,585 lines |
 
-Deleted with the dead scripts, and beside them what nothing named any more: `harness/soak/` and
-`harness/SOAKROWS.md` (soakrows.py's), `tools/similar/` (its own project and lock), and the
-orphans of scripts deleted earlier: `harness/CARGO-BLAZE.md`, `harness/CARGO-BLAZE-LLVM.md`,
+Deleted with the dead scripts, and beside them what nothing named any more: `harness/soak/`,
+`harness/SOAKROWS.md`, `harness/hotpatch/`, `harness/constmacros/`, `harness/norustc/wrap.sh`,
+`tools/layout/`, `tools/similar/` (its own project and lock), and the orphans of scripts deleted
+earlier: `harness/CARGO-BLAZE.md`, `harness/CARGO-BLAZE-LLVM.md`,
 `harness/INVALIDATION-regex_automata.md`, `harness/benches.json`, `harness/bench2/`,
 `harness/rung/`, `harness/sweep1000.txt`. No workflow step was removed: none ran a dead file.
+Four plans name a deleted script as the check they will have (clone-out, item-hash, code-layout,
+gpu/shaders): each writes it again, in Rust, when it is built.
 
 The older harness (`harness/` outside `v2/`) is not dead. Workflows run 30 of its scripts
 directly; `harness/ci.py`, which `blaze-platform.yaml` and `focused.yaml` run, reaches 37 more;
-14 are imported or started by those. 19 are live only because `docs/harness.md` or another
-current doc lists them (coldprof, cpufold, genws, heap, heapfold, hotpatch, leanprof, linkbench,
-memsplit, nightly_features, outdirwarn, realbench, sandboxbench, selfrestore, spaces, spare,
-testselectbench, tierbench, warmstart): they are the next to delete, each with its row of
-`docs/harness.md`, once someone who may run them finds they no longer run.
+14 are imported or started by those.
 
 Other script languages, out of scope and left: TypeScript (`site/` 58 files and `crates/harness`
 62, which are products: the site, its worker and the app's UI; `tools/remote-cache` 16, a
@@ -51,7 +53,7 @@ Cloudflare Worker; `tools/agents/rules.ts`, run by bun, which moves to a Rust sc
 checkers; `crates/blaze-napi` 2, the Node binding's types and test), JavaScript
 (`crates/blaze-doc/static/blaze.js`, `crates/blaze-napi/index.js`,
 `tools/bench/remote-cache/index_v1.mjs`) and shell (`site/install.sh`, the installer users pipe
-to sh, which stays shell; `harness/benchrunner.sh`, `harness/vendor.sh`, `harness/norustc/wrap.sh`
+to sh, which stays shell; `harness/benchrunner.sh`, `harness/vendor.sh`
 and three fixtures under `crates/blaze-resolve/tests`, which go with the Python that starts them).
 Recommendation: what ships to a browser, a Worker or a user's shell stays in its language; what
 is a repository script (`rules.ts`, the harness's `.sh`) follows the Python.
@@ -87,7 +89,7 @@ Plain Rust on `std` plus `crates/blaze-script`, as ordinary binaries of one work
     blaze run -p scripts --bin ledger -- '{"command": "check"}'
 
 Stage 0 builds that today. `blaze-script` is small and has what the audit found the Python
-uses (imports counted over the 192 files left): the typed input (`typed_input`, 80 files),
+uses (imports counted over the 192 files left after the first pass): the typed input (`typed_input`, 80 files),
 JSON (92), processes with captured output and exit status (`subprocess`, `asyncio`; 96),
 files, directories and temporary directories (`os`, `pathlib`, `shutil`, `tempfile`), regular
 expressions (59), TOML reading (14), SHA-256 and BLAKE3 (31), tar (7), HTTP GET and PUT (12,
@@ -178,18 +180,18 @@ S4) and the missing pieces above; reflection phase 2 with `bstd::data`; the edit
 
 Nothing is ported one for one that can be deleted instead. Sizes are from the audit.
 
-1. **Checkers** (13 files, 4,752 lines): `tools/docs.py`, harness/v2's `ledger`, `invariants`,
+1. **Checkers** (13 files, 4,841 lines): `tools/docs.py`, harness/v2's `ledger`, `invariants`,
    `guards`, `changed`, `diff_rules`, `lean_gate`, then `tools/v2/domains.py`,
    `harness/rustcsites.py`, `harness/failures.py`, `harness/imports.py`,
    `.github/scripts/gate_changes.py`, with `typed_input` itself. Pure functions over files; they
    need `blaze-script`'s input, JSON, TOML, regex and `git` runs. `tools/agents/rules.ts` goes
    with them.
-2. **harness/v2's harnesses** (28 files, 20,546 lines): they need the engine handle
+2. **harness/v2's harnesses** (26 files, 19,177 lines): they need the engine handle
    (`engine.py`), the report (`report.py`) and process running with deadlines.
-3. **The older harness** (106 files, 32,567 lines): each script is deleted, or becomes a row
+3. **The older harness** (83 files, 28,520 lines): each script is deleted, or becomes a row
    of a harness/v2 harness, before any is translated; `storelib` and `blaze_cli` (68 importers)
    are the helpers to settle first.
-4. **tools/ and the generators** (29 files, 6,957 lines): each generator when its output is
+4. **tools/ and the generators** (28 files, 6,632 lines): each generator when its output is
    next regenerated.
 5. **.github/scripts** (14 files, 3,914 lines) last: `land`, the release and the uploads, once
    a release has proved the tiers on everything before them.
@@ -249,10 +251,10 @@ no `.py` file at all.
 | harness/ci.py | 468 | LIVE | run by .github/workflows/blaze-platform.yaml (+2) |
 | harness/clippy_registry.py | 127 | LIVE | named in crates/blaze-lints/src/registry/clippy.rs (+1) |
 | harness/coldbuild.py | 413 | LIVE | used by live harness/ci.py (+1) |
-| harness/coldprof.py | 180 | LIVE | current doc docs/harness.md |
-| harness/constmacros.py | 92 | UNSURE | no workflow, ledger row or current doc; the plan docs/future/const-macros.md measures with its fixture harness/constmacros |
+| harness/coldprof.py | 180 | DEAD | second pass: only docs/harness.md or another current doc named it; written against v1, never run on v2 |
+| harness/constmacros.py | 92 | DEAD | second pass: only a plan names it, nothing that runs |
 | harness/counters.py | 491 | LIVE | run by .github/workflows/bench-counts.yaml |
-| harness/cpufold.py | 223 | LIVE | current doc docs/harness.md |
+| harness/cpufold.py | 223 | DEAD | second pass: only docs/harness.md or another current doc named it; written against v1, never run on v2 |
 | harness/debuginfo.py | 997 | LIVE | run by .github/workflows/blaze-platform.yaml |
 | harness/deriveerrors.py | 84 | LIVE | used by live harness/ci.py |
 | harness/doctestonce.py | 131 | LIVE | used by live harness/ci.py |
@@ -269,57 +271,57 @@ no `.py` file at all.
 | harness/fuzz/gen.py | 2598 | LIVE | used by live harness/fuzz/edits.py |
 | harness/fuzz/scenes.py | 600 | LIVE | used by live harness/fuzz/gen.py |
 | harness/fuzz/store.py | 228 | LIVE | used by live harness/ci.py (+1) |
-| harness/genws.py | 482 | LIVE | current doc docs/benchmarks.md |
+| harness/genws.py | 482 | DEAD | second pass: only docs/harness.md or another current doc named it; written against v1, never run on v2 |
 | harness/growth.py | 237 | LIVE | used by live harness/ci.py |
-| harness/heap.py | 107 | LIVE | current doc docs/harness.md |
-| harness/heapfold.py | 57 | LIVE | current doc docs/harness.md |
+| harness/heap.py | 107 | DEAD | second pass: only docs/harness.md or another current doc named it; written against v1, never run on v2 |
+| harness/heapfold.py | 57 | DEAD | second pass: only docs/harness.md or another current doc named it; written against v1, never run on v2 |
 | harness/hermetic.py | 260 | LIVE | used by live harness/ci.py |
-| harness/hotpatch.py | 182 | LIVE | current doc docs/benchmarks.md (+1) |
+| harness/hotpatch.py | 182 | DEAD | second pass: only docs/harness.md or another current doc named it; written against v1, never run on v2 |
 | harness/imports.py | 42 | LIVE | run by .github/workflows/blaze.yaml |
 | harness/includes.py | 218 | LIVE | used by live harness/ci.py |
 | harness/incremental.py | 588 | LIVE | used by live harness/ci.py |
 | harness/keys.py | 253 | LIVE | used by live harness/ci.py |
 | harness/latelisted.py | 112 | LIVE | used by live harness/ci.py |
-| harness/leanprof.py | 111 | LIVE | current doc docs/harness.md |
+| harness/leanprof.py | 111 | DEAD | second pass: only docs/harness.md or another current doc named it; written against v1, never run on v2 |
 | harness/library.py | 429 | LIVE | run by .github/workflows/release.yaml |
 | harness/libraryfetch.py | 124 | LIVE | used by live harness/ci.py |
-| harness/linkbench.py | 90 | LIVE | current doc docs/harness.md |
+| harness/linkbench.py | 90 | DEAD | second pass: only docs/harness.md or another current doc named it; written against v1, never run on v2 |
 | harness/live_e2e.py | 331 | LIVE | run by .github/workflows/live-debug.yaml (+1) |
 | harness/live_latency.py | 315 | LIVE | run by .github/workflows/live-latency.yaml |
 | harness/live_types.py | 226 | LIVE | used by live harness/ci.py |
 | harness/loadretry.py | 97 | LIVE | used by live harness/ci.py |
 | harness/machoimage.py | 230 | LIVE | used by live harness/ci.py |
 | harness/memory.py | 413 | LIVE | used by live harness/bench.py (+4) |
-| harness/memsplit.py | 127 | LIVE | current doc docs/harness.md |
+| harness/memsplit.py | 127 | DEAD | second pass: only docs/harness.md or another current doc named it; written against v1, never run on v2 |
 | harness/nativespans.py | 83 | LIVE | used by live harness/ci.py |
-| harness/nightly_features.py | 896 | LIVE | current doc docs/harness.md (+1) |
+| harness/nightly_features.py | 896 | LIVE | docs/toolchain.md's bump procedure, step 6, has a person run it after each bump |
 | harness/norustc.py | 258 | LIVE | used by live harness/blaze_cli.py (+1) |
-| harness/norustc/classify.py | 171 | UNSURE | only count.py and setup.py name it (see setup.py) |
-| harness/norustc/count.py | 172 | UNSURE | only setup.py, classify.py and wrap.sh name it (see setup.py) |
-| harness/norustc/setup.py | 204 | UNSURE | only count.py, wrap.sh and pyproject.toml's lint list name it; ported to typed input recently; measures rule no-rustc on big projects by hand |
-| harness/outdirwarn.py | 119 | LIVE | current doc docs/harness.md |
+| harness/norustc/classify.py | 171 | DEAD | second pass: only its own siblings and wrap.sh named it |
+| harness/norustc/count.py | 172 | DEAD | second pass: only its own siblings and wrap.sh named it |
+| harness/norustc/setup.py | 204 | DEAD | second pass: only its own siblings and wrap.sh named it |
+| harness/outdirwarn.py | 119 | DEAD | second pass: only docs/harness.md or another current doc named it; written against v1, never run on v2 |
 | harness/own_inputs.py | 218 | LIVE | used by live harness/ci.py |
-| harness/pfmdiff.py | 131 | UNSURE | only the plan docs/future/gpu/shaders.md runs it |
+| harness/pfmdiff.py | 131 | DEAD | second pass: only a plan names it, nothing that runs |
 | harness/profile_fixtures.py | 269 | LIVE | used by live harness/profile_gate.py |
 | harness/profile_gate.py | 282 | LIVE | run by .github/workflows/blaze-platform.yaml |
 | harness/profile_trend.py | 221 | LIVE | run by .github/workflows/profile-nightly.yaml |
 | harness/programs.py | 97 | LIVE | used by live harness/ci.py |
 | harness/reachmacros.py | 178 | LIVE | used by live harness/editmacros.py |
-| harness/realbench.py | 403 | LIVE | current doc docs/harness.md |
+| harness/realbench.py | 403 | DEAD | second pass: only docs/harness.md or another current doc named it; written against v1, never run on v2 |
 | harness/realdebug.py | 271 | LIVE | used by live harness/dwarf.py |
 | harness/rebuild.py | 193 | LIVE | used by live harness/ci.py (+6) |
 | harness/rival.py | 554 | LIVE | run by .github/workflows/rival.yaml |
 | harness/rustcsites.py | 130 | LIVE | run by .github/workflows/blaze.yaml |
 | harness/rustsrc.py | 53 | LIVE | used by live harness/ci.py |
-| harness/sandboxbench.py | 289 | LIVE | current doc docs/cargo.md (+1) |
+| harness/sandboxbench.py | 289 | DEAD | second pass: only docs/harness.md or another current doc named it; written against v1, never run on v2 |
 | harness/scriptenv.py | 126 | LIVE | used by live harness/ci.py |
 | harness/selects.py | 119 | LIVE | used by live harness/ci.py |
-| harness/selfrestore.py | 179 | LIVE | current doc docs/harness.md |
+| harness/selfrestore.py | 179 | DEAD | second pass: only docs/harness.md or another current doc named it; written against v1, never run on v2 |
 | harness/servoprep.py | 36 | LIVE | used by live harness/bench.py (+1) |
 | harness/smoke.py | 454 | LIVE | run by .github/workflows/blaze-platform.yaml (+2) |
 | harness/soakrows.py | 1081 | DEAD | only docs/CHANGELOG.md (record) and its own report harness/SOAKROWS.md; with it harness/soak/ and SOAKROWS.md |
-| harness/spaces.py | 125 | LIVE | current doc docs/harness.md |
-| harness/spare.py | 138 | LIVE | current doc docs/harness.md |
+| harness/spaces.py | 125 | DEAD | second pass: only docs/harness.md or another current doc named it; written against v1, never run on v2 |
+| harness/spare.py | 138 | DEAD | second pass: only docs/harness.md or another current doc named it; written against v1, never run on v2 |
 | harness/staticcallbacks.py | 71 | LIVE | used by live harness/ci.py |
 | harness/storecorrupts.py | 220 | LIVE | used by live harness/ci.py |
 | harness/storefull.py | 249 | LIVE | used by live harness/ci.py |
@@ -331,8 +333,8 @@ no `.py` file at all.
 | harness/stress-corpus/gen.py | 305 | LIVE | named in harness/stress-corpus/big-file/src/items.rs (+3) |
 | harness/stress.py | 301 | LIVE | used by live harness/ci.py (+1) |
 | harness/testselect.py | 535 | LIVE | run by .github/workflows/focused.yaml |
-| harness/testselectbench.py | 176 | LIVE | current doc docs/harness.md |
-| harness/tierbench.py | 167 | LIVE | current doc docs/harness.md |
+| harness/testselectbench.py | 176 | DEAD | second pass: only docs/harness.md or another current doc named it; written against v1, never run on v2 |
+| harness/tierbench.py | 167 | DEAD | second pass: only docs/harness.md or another current doc named it; written against v1, never run on v2 |
 | harness/tiers.py | 253 | LIVE | run by .github/workflows/nix-live.yaml |
 | harness/toolchain_bump.py | 423 | LIVE | run by .github/workflows/toolchain-bump.yaml |
 | harness/toolchain_pins.py | 127 | LIVE | used by live harness/blaze_cli.py (+1) |
@@ -343,7 +345,7 @@ no `.py` file at all.
 | harness/v2/bounds.py | 166 | LIVE | used by live harness/v2/budgets.py |
 | harness/v2/budgets.py | 2238 | LIVE | run by .github/workflows/blaze-platform.yaml (+1) |
 | harness/v2/changed.py | 316 | LIVE | run by .github/workflows/blaze.yaml |
-| harness/v2/clone_out.py | 344 | UNSURE | only the plan docs/v2/plan/design/clone-out.md names it (its check) |
+| harness/v2/clone_out.py | 344 | DEAD | second pass: only a plan names it, nothing that runs |
 | harness/v2/constspec.py | 540 | LIVE | named in harness/v2/constspec/modes.rs |
 | harness/v2/corpus.py | 876 | LIVE | a ledger check in docs/v2/plan/objectives.json |
 | harness/v2/dbsp/edits.py | 1774 | LIVE | a ledger check in docs/v2/plan/objectives.json |
@@ -354,7 +356,7 @@ no `.py` file at all.
 | harness/v2/fixture.py | 1053 | LIVE | run by .github/workflows/blaze-platform.yaml |
 | harness/v2/frontend/borrowck_flow.py | 348 | LIVE | named in crates/hir-ty-borrowck/src/flow_tests.rs |
 | harness/v2/frontend/cases.py | 1199 | LIVE | used by live harness/v2/dbsp/edits.py |
-| harness/v2/frontend/item_store.py | 1025 | UNSURE | only the plan docs/v2/plan/design/item-hash.md names it (its check) |
+| harness/v2/frontend/item_store.py | 1025 | DEAD | second pass: only a plan names it, nothing that runs |
 | harness/v2/guards.py | 646 | LIVE | run by .github/workflows/blaze-platform.yaml (+1) |
 | harness/v2/incraudit.py | 1171 | LIVE | a ledger check in docs/v2/plan/objectives.json |
 | harness/v2/invariants.py | 289 | LIVE | run by .github/workflows/blaze.yaml |
@@ -375,13 +377,13 @@ no `.py` file at all.
 | harness/v2/tightmemory.py | 573 | LIVE | a ledger check in docs/v2/plan/objectives.json |
 | harness/v2/worktree_keys.py | 1017 | LIVE | a ledger check in docs/v2/plan/objectives.json |
 | harness/warm_ci.py | 299 | LIVE | run by .github/workflows/warm.yaml |
-| harness/warmstart.py | 122 | LIVE | current doc docs/harness.md |
+| harness/warmstart.py | 122 | DEAD | second pass: only docs/harness.md or another current doc named it; written against v1, never run on v2 |
 | harness/wasmcmacro.py | 150 | LIVE | used by live harness/ci.py |
 | harness/wasmpairmacro.py | 213 | LIVE | used by live harness/ci.py |
 | harness/wholeprogram.py | 147 | LIVE | used by live harness/ci.py |
 | harness/worktrees.py | 148 | LIVE | used by live harness/ci.py (+1) |
-| library/compiler-builtins/ci/ci-util.py | 525 | UNSURE | upstream's file in the vendored standard library; nothing here runs it |
-| library/compiler-builtins/etc/update-api-list.py | 297 | UNSURE | upstream's file in the vendored standard library; nothing here runs it |
+| library/compiler-builtins/ci/ci-util.py | 525 | LIVE | upstream's file in the vendored standard library; nothing here runs it: stays, vendored |
+| library/compiler-builtins/etc/update-api-list.py | 297 | LIVE | upstream's file in the vendored standard library; nothing here runs it: stays, vendored |
 | site/flecs/build.py | 55 | LIVE | skill or root doc .agents/skills/flecs/SKILL.md |
 | site/renderer/build.py | 98 | LIVE | run by .github/workflows/site.yaml |
 | site/renderer/fetch.py | 110 | LIVE | run by .github/workflows/site.yaml |
@@ -391,12 +393,12 @@ no `.py` file at all.
 | tools/cpus.py | 241 | LIVE | run by .github/workflows/toolchain-bump.yaml |
 | tools/devirt/bench.py | 220 | LIVE | named in tools/devirt/dyn_loop/src/main.rs |
 | tools/docs.py | 259 | LIVE | run by .github/workflows/blaze.yaml |
-| tools/layout/bench.py | 325 | UNSURE | only the plan docs/v2/plan/design/code-layout.md names it |
+| tools/layout/bench.py | 325 | DEAD | second pass: only a plan names it, nothing that runs |
 | tools/nix/life_launch.py | 132 | LIVE | named in crates/blaze-live/Cargo.toml (+1) |
 | tools/nix/unit_build.py | 175 | LIVE | used by live tools/nix/unit_graph.py |
 | tools/nix/unit_graph.py | 248 | LIVE | run by .github/workflows/nix-live.yaml |
 | tools/pgo/pgo.py | 992 | LIVE | run by .github/workflows/pgo.yaml (+1) |
-| tools/pgo/test_pgo.py | 386 | UNSURE | unit tests of the live tools/pgo/pgo.py; no workflow runs them |
+| tools/pgo/test_pgo.py | 386 | LIVE | unit tests of the live tools/pgo/pgo.py; no workflow runs them: kept until its script is ported |
 | tools/remote-cache/smoke.py | 133 | LIVE | named in tools/remote-cache/README.md |
 | tools/rename.py | 252 | DEAD | only docs/rename.md (record); the ra-jit rename of 2026-10-28, done |
 | tools/similar/src/similar/__init__.py | 509 | DEAD | nothing names it but pyproject.toml's exclude and lint list; with it tools/similar/'s pyproject.toml and uv.lock |
@@ -409,5 +411,5 @@ no `.py` file at all.
 | tools/v2/repro/repro.py | 369 | LIVE | named in crates/blaze-engine/tests/repro.rs |
 | tools/v2/solver_sync.py | 284 | LIVE | used by live harness/toolchain_bump.py |
 | tools/v2/test_manifest_lint.py | 104 | DEAD | nothing runs it |
-| tools/v2/test_solver_sync.py | 227 | UNSURE | unit tests of the live tools/v2/solver_sync.py; no workflow runs them |
+| tools/v2/test_solver_sync.py | 227 | LIVE | unit tests of the live tools/v2/solver_sync.py; no workflow runs them: kept until its script is ported |
 | tools/vendor/sync.py | 502 | LIVE | named in Cargo.toml |
