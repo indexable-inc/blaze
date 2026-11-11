@@ -142,6 +142,11 @@ impl DefMap {
                         | "reflect"
                         // `#[blaze::sealed]`, from `AttrFlags::BLAZE_SEALED` (`hir-ty-coherence`).
                         | "sealed"
+                        // `#![blaze::simd]`, read from the crate root's attributes where
+                        // `#![feature]` is, and `#[blaze::multiversion]`, from
+                        // `AttrFlags::BLAZE_MULTIVERSION` (docs/v2/plan/design/simd.md).
+                        | "simd"
+                        | "multiversion"
                 )
             {
                 return true;
