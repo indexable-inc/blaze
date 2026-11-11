@@ -205,7 +205,8 @@ function Install-Blaze {
             $new = Join-Path $bin ".$name.blaze-new"
             Copy-Item -LiteralPath $from -Destination $new -Force
             if (Test-Path -LiteralPath $to) {
-                $old = Join-Path $bin "$name.$PID.blaze-old"
+                # Its own name each time: one still running from an earlier install holds its name.
+                $old = Join-Path $bin ("$name." + [Guid]::NewGuid().ToString('N').Substring(0, 8) + '.blaze-old')
                 Move-Item -LiteralPath $to -Destination $old -Force
                 Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
             }
@@ -226,10 +227,17 @@ function Install-Blaze {
         # an earlier `blaze update` installed goes; and a canary install has `blaze update` follow
         # canary, unless its settings name a channel already.
         $blazeHome = if ($env:BLAZE_HOME) { $env:BLAZE_HOME } else { Join-Path $env:USERPROFILE '.blaze' }
-        Remove-Item -LiteralPath (Join-Path $blazeHome 'default') -Force -ErrorAction SilentlyContinue
+        # A default that stays would be the blaze that runs, not the one just copied: no default is
+        # fine, one that cannot be removed is an error.
+        $default = Join-Path $blazeHome 'default'
+        if (Test-Path -LiteralPath $default) {
+            try { Remove-Item -LiteralPath $default -Force }
+            catch { Fail "the default blaze that an update chose, $default, could not be removed, so the blaze just installed would not be the one that runs." $_.Exception.Message }
+        }
         if ($Channel -eq 'canary' -and -not $Version) {
             $config = Join-Path $blazeHome 'config.toml'
-            $lines = if (Test-Path -LiteralPath $config) { @(Get-Content -LiteralPath $config) } else { @() }
+            # @(): an `if` hands back a file of one line as a string, and `$lines[0]` is its first character.
+            $lines = @(if (Test-Path -LiteralPath $config) { Get-Content -LiteralPath $config })
             # config.toml read as TOML enough for this: a table header (comments after it allowed),
             # and the key `channel` in the table [update] (or `update.channel` before any table).
             $here = $false; $top = $true; $named = $false; $header = -1

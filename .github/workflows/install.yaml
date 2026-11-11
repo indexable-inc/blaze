@@ -315,10 +315,39 @@ jobs:
           Start-Sleep -Seconds 1
           & ./site/install.ps1
           if ($LASTEXITCODE) { throw "install.ps1 over a running blaze.exe failed: $LASTEXITCODE" }
-          $stopped = $running.HasExited
-          Stop-Process -Id $running.Id -Force -ErrorAction SilentlyContinue
-          if ($stopped) { throw 'the blaze.exe that was running was stopped' }
           if ((Get-Item "$env:CARGO_HOME\bin\blaze.exe").Length -eq (Get-Item "$env:SystemRoot\System32\PING.EXE").Length) { throw 'blaze.exe is still the old one' }
+          # Again, from this same shell, with the first one still running: its name is taken.
+          Copy-Item "$env:SystemRoot\System32\PING.EXE" "$env:CARGO_HOME\bin\blaze.exe" -Force
+          $second = Start-Process -PassThru -WindowStyle Hidden "$env:CARGO_HOME\bin\blaze.exe" -ArgumentList '-t', 'localhost'
+          Start-Sleep -Seconds 1
+          & ./site/install.ps1
+          if ($LASTEXITCODE) { throw "the second install over a running blaze.exe failed: $LASTEXITCODE" }
+          $stopped = $running.HasExited -or $second.HasExited
+          Stop-Process -Id $running.Id, $second.Id -Force -ErrorAction SilentlyContinue
+          if ($stopped) { throw 'a blaze.exe that was running was stopped' }
+      # The settings the installer reads and writes in BLAZE_HOME.
+      - name: the update settings
+        env:
+          BLAZE_ARCHIVE: ${{ env.ARCHIVE }}
+        run: |
+          New-Item -ItemType Directory -Force $env:BLAZE_HOME | Out-Null
+          # A file of one line that names the channel is kept as it is (not read as a string).
+          Set-Content "$env:BLAZE_HOME\config.toml" 'update.channel = "stable"'
+          & ./site/install.ps1 -Channel canary
+          if ($LASTEXITCODE) { throw "install.ps1 -Channel canary failed: $LASTEXITCODE" }
+          if ((Get-Content "$env:BLAZE_HOME\config.toml" -Raw).Trim() -ne 'update.channel = "stable"') { throw 'a channel the settings name was changed' }
+          # One that names none gets [update] channel = "canary".
+          Set-Content "$env:BLAZE_HOME\config.toml" '# mine'
+          & ./site/install.ps1 -Channel canary
+          if ((Get-Content "$env:BLAZE_HOME\config.toml" -Raw) -notmatch '(?m)^\[update\]\s+channel = "canary"') { throw 'canary was not written to the settings' }
+          # A default blaze that cannot be removed is an error, not a blaze that quietly does not run.
+          Set-Content "$env:BLAZE_HOME\default" 'v0'
+          $held = [IO.File]::Open("$env:BLAZE_HOME\default", 'Open', 'Read', 'None')
+          try {
+            $said = & ./site/install.ps1 *>&1 | Out-String
+            if ($said -notmatch 'could not be removed') { throw "the held default was not reported: $said" }
+          } finally { $held.Close() }
+          $global:LASTEXITCODE = 0
       - name: a release that is not there says so
         env:
           BLAZE_ARCHIVE: ""
