@@ -13,9 +13,14 @@
 //! not compile; a field whose type is not its column's does not compile ([`FieldOf`]); and a
 //! typed column no kind writes fails the build (`WRITTEN`), so no column is null by construction.
 //!
-//! Ad hoc `tracing::info_span!(target: "blaze", ..)` spans keep working: they fill the generic
-//! columns (`crate`, `function`, `unit`) from fields of those names, as before. The typed
-//! columns (`awaits`, `owner`, `steps`, ...) only a kind writes.
+//! Ad hoc `tracing::info_span!(target: "blaze", ..)` spans keep working: a field fills the column
+//! [`ad_hoc_column`] names for it, which is every column that holds a name: the generic ones
+//! (`crate`, `function`, `unit`, each by its field names) and the typed ones whose value is a
+//! [`Name`] (`awaits`), by the column's own name. The typed columns of numbers and enums
+//! (`owner`, `steps`, `job`, `outcome`, ...) mean what their kind says (a pool job, a plane
+//! node), so only a kind writes them. A field of any other name reaches no column, and
+//! `blaze::span_field_unrecorded` refuses it where it is written ([`ad_hoc_fields`] is the
+//! lint's list).
 
 use std::{
     cell::RefCell,
@@ -811,10 +816,18 @@ macro_rules! span_kinds {
         /// Every column, generic then typed, as `batches.rs` writes it.
         pub static CELLS: [Cells; COLUMNS] = [$( Cells::of::<col::$G>(), )* $( Cells::of::<col::$T>(), )*];
 
-        /// The generic column a field of an ad hoc span named `field` fills.
-        pub(crate) fn generic_of(field: &str) -> Option<usize> {
+        /// The names of the fields of an ad hoc span that fill a generic column, in the
+        /// columns' order.
+        const GENERIC_FIELDS: &[&str] = &[$( $($galias,)+ )*];
+
+        /// The column a field of an ad hoc span named `field` fills: a generic column by one
+        /// of its field names, or a typed column that holds a name ([`Value::SYM`]) by the
+        /// column's own name. None for any other field, a typed column of numbers or of an
+        /// enum included: what those hold is a kind's to say.
+        pub(crate) fn ad_hoc_column(field: &str) -> Option<usize> {
             match field {
                 $( $($galias)|+ => Some(Index::$G as usize), )*
+                $( $tname => <$tval as Value>::SYM.then_some(Index::$T as usize), )*
                 _ => None,
             }
         }
@@ -1022,6 +1035,22 @@ span_kinds! {
     }
 }
 
+/// The names of the fields of an ad hoc span (`tracing::info_span!(target: "blaze", ..)`) that
+/// reach the profile, in the columns' order: those [`ad_hoc_column`] gives a column, and
+/// [`flight::HELD_FIELD`], which the recorder reads as the span's being held. The one list of
+/// them, made from the columns' declaration above: `blaze::span_field_unrecorded` refuses a
+/// span's field that is not in it.
+pub fn ad_hoc_fields() -> impl Iterator<Item = &'static str> {
+    let typed = CELLS[GENERIC..].iter().filter(|it| SYM_COLUMNS[it.at]).map(|it| it.column.name);
+    GENERIC_FIELDS.iter().copied().chain(typed).chain([flight::HELD_FIELD])
+}
+
+/// Whether the field `field` of an ad hoc span reaches the profile: it is one of
+/// [`ad_hoc_fields`].
+pub fn ad_hoc_field_recorded(field: &str) -> bool {
+    ad_hoc_column(field).is_some() || field == flight::HELD_FIELD
+}
+
 /// The names of the unit phase spans, in the order a unit runs them.
 pub const UNIT_PHASES: [&str; 5] =
     [UnitNames::NAME, UnitBodies::NAME, UnitCodegen::NAME, UnitLink::NAME, UnitStore::NAME];
@@ -1164,6 +1193,73 @@ mod tests {
             "a typed column goes at the end, keeping `VERSION`"
         );
         assert_eq!(spans.columns[schema::SPANS_GENERIC_AT].name, "crate");
+    }
+
+    /// The shape of the daemon's "the job's answer waits for what it still does"
+    /// (`blaze_cargo::serve::job`): an ad hoc span made with `function` and `awaits` as text,
+    /// kept in a value, never entered, and dropped later. Its row has both, in the ring and in
+    /// the `spans` batch a profile file is written from.
+    #[test]
+    fn an_ad_hoc_span_never_entered_has_its_function_and_awaits_in_its_row() {
+        const NAME: &str = "span kinds held, never entered";
+        crate::install();
+        let tid = std::thread::spawn(|| {
+            let what: &'static str = "its outputs, being placed";
+            let held = Some((
+                tracing::info_span!(target: "blaze", "span kinds held, never entered", function = what, awaits = what),
+                what,
+            ));
+            // Something else of the thread's between its start and its close.
+            drop(Hold { what: Name::of("span kinds between"), holder: 3 }.open());
+            drop(held);
+            crate::sampler::os_tid() as u32
+        })
+        .join()
+        .unwrap();
+        let rows = rows_of(tid);
+        let at = rows
+            .iter()
+            .position(|it| flight::meta(it.site).map(|it| it.name()) == Some(NAME))
+            .unwrap_or_else(|| panic!("`{NAME}` is a row, entered or not"));
+        let what = Some("its outputs, being placed");
+        assert_eq!(rows[at].get::<col::Function>().and_then(Name::text).as_deref(), what);
+        assert_eq!(rows[at].get::<col::Awaits>().and_then(Name::text).as_deref(), what);
+
+        let batch =
+            batches::spans(&rows, Process { pid: 1, name: "span kinds test", commit: None })
+                .unwrap();
+        let cell = |column: &str| {
+            let column = batch.column(schema::SPANS.column(column).unwrap()).as_string::<i32>();
+            column.is_valid(at).then(|| column.value(at).to_owned())
+        };
+        assert_eq!(cell("function").as_deref(), what, "the `function` column");
+        assert_eq!(cell("awaits").as_deref(), what, "the `awaits` column");
+    }
+
+    /// [`ad_hoc_fields`], the list `blaze::span_field_unrecorded` holds a span's fields to, is
+    /// the columns of `spans` that hold a name and nothing else: each of its fields fills such
+    /// a column, each such column is filled by the field of its own name, and a column of
+    /// numbers or of an enum takes no ad hoc field.
+    #[test]
+    fn the_ad_hoc_fields_are_the_spans_columns_that_hold_a_name() {
+        let spans = schema::SPANS;
+        for field in ad_hoc_fields().filter(|it| *it != flight::HELD_FIELD) {
+            let at = ad_hoc_column(field).unwrap_or_else(|| panic!("`{field}` fills a column"));
+            assert!(SYM_COLUMNS[at], "`{field}` fills a column that holds a name");
+            assert!(spans.column(CELLS[at].column.name).is_some(), "`{field}`'s is a spans column");
+            assert!(ad_hoc_field_recorded(field), "`{field}`");
+        }
+        for cells in &CELLS {
+            let named = SYM_COLUMNS[cells.at].then_some(cells.at);
+            let name = cells.column.name;
+            assert_eq!(ad_hoc_column(name), named, "the column `{name}`");
+            assert_eq!(ad_hoc_fields().any(|it| it == name), named.is_some(), "the column `{name}`");
+        }
+        assert!(ad_hoc_field_recorded(flight::HELD_FIELD), "the recorder reads `held`");
+        for unrecorded in ["what", "placing", "runs", "owner", "steps", "message"] {
+            assert!(!ad_hoc_field_recorded(unrecorded), "`{unrecorded}` reaches no column");
+            assert!(ad_hoc_fields().all(|it| it != unrecorded), "`{unrecorded}`");
+        }
     }
 
     #[test]

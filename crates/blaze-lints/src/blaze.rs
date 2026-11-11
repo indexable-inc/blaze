@@ -117,6 +117,7 @@ mod seqcst_unexplained;
 mod shared_collection_lock;
 mod small_map;
 mod soa_candidate;
+mod span_field_unrecorded;
 mod stable_sort_needless;
 mod std_use;
 #[cfg(test)]
@@ -283,6 +284,7 @@ pub enum Lint {
     ProgramLifetime,
     CouldBeProgramLifetime,
     CouldBeRef32,
+    SpanFieldUnrecorded,
 }
 
 /// Which workspaces a lint is for.
@@ -520,6 +522,7 @@ impl Lint {
         Lint::ProgramLifetime,
         Lint::CouldBeProgramLifetime,
         Lint::CouldBeRef32,
+        Lint::SpanFieldUnrecorded,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -653,7 +656,10 @@ impl Lint {
             // deadline names its waker, and hashes become an identity only in `blaze_ids::keyed`.
             | Lint::DurableWrite
             | Lint::UnboundedWait
-            | Lint::CombinedIdentity => Kind::Internal,
+            | Lint::CombinedIdentity
+            // Rule guard-the-cause for the profile: a span's field that reaches no column of
+            // `spans` (`blaze_profile::span::ad_hoc_fields`) is refused where it is written.
+            | Lint::SpanFieldUnrecorded => Kind::Internal,
             // docs/v2/plan/design/facts.md: the check of `#[blaze::program_lifetime]` and the
             // two lints that say where the attribute and `Ref32` would pay.
             Lint::ProgramLifetime | Lint::CouldBeProgramLifetime | Lint::CouldBeRef32 => {
@@ -792,6 +798,7 @@ impl Lint {
             Lint::ProgramLifetime => "program_lifetime",
             Lint::CouldBeProgramLifetime => "could_be_program_lifetime",
             Lint::CouldBeRef32 => "could_be_ref32",
+            Lint::SpanFieldUnrecorded => "span_field_unrecorded",
         }
     }
 
@@ -909,6 +916,7 @@ impl Lint {
             Lint::ProgramLifetime | Lint::CouldBeProgramLifetime | Lint::CouldBeRef32 => {
                 concat!(general_docs!(), "#program_lifetime-could_be_program_lifetime-could_be_ref32")
             }
+            Lint::SpanFieldUnrecorded => concat!(docs!(), "#span_field_unrecorded"),
             Lint::FiberBoundary => {
                 "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan.md"
             }
@@ -979,6 +987,9 @@ impl Lint {
             }
             Lint::CombinedIdentity => {
                 "keep the set in a `blaze_ids::keyed::Keyed` and take its root, or hash every entry with `blaze_ids::Hasher`; an XOR or a sum that makes no identity says so with `// identity: <why>` on its line or the line above"
+            }
+            Lint::SpanFieldUnrecorded => {
+                "name the field for the column it fills (`function` for what the span is of, `awaits` for what it waits for), say it in the span's name, write it as an event inside the span (every field of an event is a row of `event_fields`), or make the span a kind with typed fields in `blaze_profile::span`"
             }
             Lint::BlockingOnPool => {
                 "wait through the scheduler (`blaze_graph::sched::wait`, an `Event`, a `Wait::Key`), or move the blocking call to a driver thread"
@@ -1379,6 +1390,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     }
     unrecorded_span::check(cx, node);
     std_use::check_declaration(cx, node);
+    span_field_unrecorded::check(cx, node);
     if node == cx.root() && cx.in_file() {
         error_debug::check(cx);
         dropped_error::check(cx);

@@ -93,7 +93,9 @@ enum FileAsk {
 }
 
 struct Shared<G: Give> {
-    pool: Pool<G>,
+    /// Counted, so a value held past its task ([`Loader::pin_through`] with a count of it)
+    /// keeps the pool's pages reserved for as long as its pins live.
+    pool: Arc<Pool<G>>,
     asks: ArrayQueue<Load>,
     files: SegQueue<FileAsk>,
     plans: SegQueue<PlanAsk>,
@@ -123,6 +125,18 @@ impl<G: Give + Send + Sync + 'static> Loader<G> {
     /// `tags..tags + 2^32` and reading through `cache` (the store's go around it).
     pub(crate) fn start<D: Driver + 'static>(
         pool: Pool<G>,
+        driver: impl FnOnce() -> io::Result<D> + Send + 'static,
+        tags: u64,
+        cache: Cache,
+    ) -> io::Result<Loader<G>> {
+        // alloc: the pool's count, once per loader
+        Loader::start_shared(Arc::new(pool), driver, tags, cache)
+    }
+
+    /// [`Loader::start`], of a pool its maker keeps a count of (the store, whose commit
+    /// writes through the same pool).
+    pub(crate) fn start_shared<D: Driver + 'static>(
+        pool: Arc<Pool<G>>,
         driver: impl FnOnce() -> io::Result<D> + Send + 'static,
         tags: u64,
         cache: Cache,
@@ -227,11 +241,25 @@ impl<G: Give + Send + Sync + 'static> Loader<G> {
     /// It runs its reading to its end: every load it asked has ended by the time it returns, so
     /// no pin or slot is left behind.
     pub(crate) fn pin(&self, at: u64, len: u64) -> Result<Pins<G, &Pool<G>>, PoolError> {
-        let pool = &self.shared.pool;
+        let pool: &Pool<G> = &self.shared.pool;
+        self.pin_through(&pool, at, len)
+    }
+
+    /// [`Loader::pin`], the guard reaching the pool through a clone of `handle`: a borrow for
+    /// a value read within a task, a count of it (an `Arc`) for one held past it.
+    /// `handle` is this loader's pool.
+    pub(crate) fn pin_through<P: std::ops::Deref<Target = Pool<G>> + Clone>(
+        &self,
+        handle: &P,
+        at: u64,
+        len: u64,
+    ) -> Result<Pins<G, P>, PoolError> {
+        let pool: &Pool<G> = &self.shared.pool;
+        debug_assert!(std::ptr::eq(pool, &**handle), "a pin through another pool's handle");
         let mut reading = Reading::new(at, len);
         let mut spin = SpinWait::new();
         let result = loop {
-            match reading.step(&pool) {
+            match reading.step(handle) {
                 ReadStep::Pinned(pins) => break Ok(pins),
                 ReadStep::Failed(error) => break Err(error),
                 ReadStep::NeedSlot => match self.slot() {
@@ -291,6 +319,17 @@ impl<G: Give + Send + Sync + 'static> Loader<G> {
 
     /// `load` asked of the loader and waited for: how it ended.
     fn load(&self, load: Load) -> Result<(), LoadFailure> {
+        // The miss, named: its pages and bytes are its fields, its time the span's.
+        let bytes = u64::from(load.pages) * super::PAGE;
+        let span = tracing::info_span!(
+            target: "blaze",
+            "store pool load",
+            first = load.first,
+            pages = load.pages,
+            bytes,
+        );
+        let _in = span.enter();
+        super::counts::loaded(bytes);
         let slot = &self.shared.slots[load.slot as usize];
         // Armed for this load: the slot came off the free list after its last load's end armed
         // it again, and only this load's end fires it.
@@ -308,7 +347,7 @@ impl<G: Give + Send + Sync + 'static> Loader<G> {
     }
 
     /// Waits for the load in `slot` another asker made, if `page` is still in it.
-    fn wait_on(&self, page: u64, slot: u16) {
+    pub(crate) fn wait_on(&self, page: u64, slot: u16) {
         let done = self.shared.slots[slot as usize].event.lock().waiter();
         let word = self.shared.pool.word_now(page);
         if word.state() == State::Loading && word.slot() == slot {
@@ -362,27 +401,27 @@ fn run<G: Give, D: Driver>(shared: &Shared<G>, mut driver: D, tags: u64, cache: 
         take_files(shared, &mut loads);
         while let Some(plan) = shared.plans.pop() {
             match plan {
-                PlanAsk::Runs(runs) => loads.prefetch(&shared.pool, runs),
+                PlanAsk::Runs(runs) => loads.prefetch(&*shared.pool, runs),
                 PlanAsk::Budget(bytes) => loads.set_budget(bytes),
             }
         }
         if shared.stop.load(Ordering::Acquire) {
             // Stopping: nothing more is prefetched.
-            loads.prefetch(&shared.pool, std::iter::empty());
+            loads.prefetch(&*shared.pool, std::iter::empty());
         }
         while let Some(load) = shared.asks.pop() {
             // An ask can be seen before the file it reads, pushed first on another queue.
             if !loads.knows(load.first) {
                 take_files(shared, &mut loads);
             }
-            loads.ask(&shared.pool, load, &mut effects, &mut ended);
+            loads.ask(&*shared.pool, load, &mut effects, &mut ended);
         }
         // Said before the pump reads the counts: a first read after this wakes the loader, so
         // none that makes room is missed between the pump and the park.
         let queued = loads.queued() > 0;
         shared.waiting.store(queued, Ordering::Release);
         // After every demand ask: a prefetch is never ahead of a demand read in a submission.
-        loads.pump(&shared.pool, &mut effects, &mut ended);
+        loads.pump(&*shared.pool, &mut effects, &mut ended);
         driver.submit(&mut effects);
         tell(shared, &mut ended);
         if driver.in_flight() == 0 {
@@ -396,7 +435,7 @@ fn run<G: Give, D: Driver>(shared: &Shared<G>, mut driver: D, tags: u64, cache: 
         for completion in out.drain(..) {
             debug_assert!(loads.owns(completion.tag), "the store pool's driver told of {completion:?}");
             if loads.owns(completion.tag) {
-                loads.complete(&shared.pool, completion, &mut ended);
+                loads.complete(&*shared.pool, completion, &mut ended);
             }
         }
         tell(shared, &mut ended);

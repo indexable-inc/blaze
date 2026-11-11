@@ -38,6 +38,8 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::SharedCollectionLock
         | Lint::OpenWaitLoop
         | Lint::UnrecordedSpan
+        // No comment makes the profile keep a field: the fix is the field's name.
+        | Lint::SpanFieldUnrecorded
         // Kept with `#[expect(blaze::fixed_key_lookup, reason = ..)]`: a table is a choice of
         // the item, not of one line.
         | Lint::FixedKeyLookup

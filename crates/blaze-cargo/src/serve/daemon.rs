@@ -88,6 +88,53 @@ const STILL_TIMER: Tag = Tag(OWN + 4);
 const DIAL: Tag = Tag(OWN + 6);
 const UNLINK: Tag = Tag(OWN + 7);
 const HANG_UP: Tag = Tag(OWN + 8);
+/// The longest one step of a loop turn may run in line before it is said ([`Stalled`]).
+const STEP_BOUND_NS: i64 = 20_000_000;
+
+/// The loop's own watchdog: each step of a turn after its wait is timed on the profile's
+/// clock, and one that ran longer than [`STEP_BOUND_NS`] is said as a span named `loop
+/// stalled` whose `function` is the step and how long it took. The loop thread serves every
+/// request, so 20 ms of one step is 20 ms every client waits; the budgets harness fails an
+/// edit whose build has such a row (harness/v2/budgets.py). The span is opened once the step
+/// has ended, so its own length is nothing: the time is in its `function`. The turn's wait
+/// (the driver's poll) is not a step: what a driver does in line there is held by
+/// harness/v2/loop_syscalls.py, which times the thread's system calls.
+struct Stalled {
+    step: &'static str,
+    began: i64,
+}
+
+impl Stalled {
+    fn begin(step: &'static str) -> Stalled {
+        Stalled { step, began: blaze_profile::clock::mono_ns() }
+    }
+
+    /// The step under way ended and `step` began.
+    fn next(&mut self, step: &'static str) {
+        let now = blaze_profile::clock::mono_ns();
+        self.say(now);
+        *self = Stalled { step, began: now };
+    }
+
+    fn end(self) {
+        self.say(blaze_profile::clock::mono_ns());
+    }
+
+    fn say(&self, now: i64) {
+        let Some(ms) = stalled_ms(self.began, now) else { return };
+        // alloc: once a step past its bound, the span's `function`
+        let function = format!("{}: {ms} ms", self.step);
+        tracing::info_span!(target: "blaze", "loop stalled", function = %function).in_scope(|| {});
+    }
+}
+
+/// How many milliseconds a step from `began` to `now` ran, where that is past
+/// [`STEP_BOUND_NS`].
+fn stalled_ms(began: i64, now: i64) -> Option<i64> {
+    let ran = now.saturating_sub(began);
+    (ran > STEP_BOUND_NS).then_some(ran / 1_000_000)
+}
+
 /// A stall's trace, written once: the daemon stops after it.
 const STALL: Tag = Tag(OWN + 9);
 /// The image's placing (its clone, writes, sync and rename, one in flight at a time) and its
@@ -373,6 +420,12 @@ pub struct Options {
     pub sources: FileName,
     /// The daemon as a writer of that store: one per state directory.
     pub writer: ContentId,
+    /// How its stores load the pages of their packs a read finds not in memory
+    /// ([`blaze_cas::Loader`]): by a thread of each store's own on the target's native
+    /// driver, over the root of the driver the daemon runs on (`blaze serve`); or, where the
+    /// daemon's driver is the simulation and its files are in no file system, as effects of
+    /// the store's that the daemon's driver completes.
+    pub store_loader: blaze_cas::Loader,
     /// The socket it listens on; `None` takes requests from this process alone
     /// ([`Daemon::connect_local`]): the seed's one-shot build ([`super::once`]).
     pub socket: Option<FileName>,
@@ -1232,7 +1285,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 layers: Vec::new(),
                 tags: STORE,
                 load_tags: LOADS,
-                loader: blaze_cas::Loader::Thread,
+                // clone: once per daemon started, a path
+                loader: options.store_loader.clone(),
             };
         let mut store = Store::open(store_config, &mut effects);
         store.encode_columns(blaze_format::Spans::columns());
@@ -1242,7 +1296,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             writer: options.writer,
             tags: STD_STORE,
             load_tags: STD_LOADS,
-            loader: blaze_cas::Loader::Thread,
+            // clone: once per daemon started, a path
+            loader: options.store_loader.clone(),
         };
         let mut std = Store::open_shared(shared, &mut effects);
         let mut read =
@@ -1943,6 +1998,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// `#[blaze::nonblocking(trusted = "why")]` where it is defined, never allowed here.
     #[blaze::nonblocking]
     fn turn_after_wait(&mut self, mut done: Vec<Completion>) -> bool {
+        let mut step = Stalled::begin("completions");
         for completion in &done {
             self.ended(completion);
         }
@@ -1972,10 +2028,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         self.expire_jobs();
         drop(part);
+        step.next("the plane's step");
         let part = spanned
             .then(|| tracing::info_span!(target: "blaze", "loop turn: the plane's step").entered());
         self.step_plane();
         drop(part);
+        step.next("observe, watch and say");
         // What the turn has to send so far (an answer, a flush asked) is handed to the driver
         // before the work between requests below (the collections, the image's step): an
         // answer never waits behind them.
@@ -1991,6 +2049,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.doing();
         self.plot();
         drop(part);
+        step.next("after the answers");
         let _between = spanned.then(|| {
             tracing::info_span!(target: "blaze", "loop turn: after the answers").entered()
         });
@@ -2045,6 +2104,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         self.stepping_stop();
         self.submit();
+        step.end();
         self.pulse.turned(self.completions + self.settled + self.job_effects);
         !matches!(self.stopping, Some(Stopping::Over))
     }
@@ -3053,6 +3113,15 @@ mod tests {
     use blaze_image::{Cause, SectionId};
 
     use super::*;
+
+    /// A step of a loop turn is said as stalled only past its bound, with its milliseconds.
+    #[test]
+    fn a_step_is_stalled_only_past_its_bound() {
+        assert_eq!(stalled_ms(0, STEP_BOUND_NS), None);
+        assert_eq!(stalled_ms(5, 5 + STEP_BOUND_NS + 1), Some(20));
+        assert_eq!(stalled_ms(0, 735_000_000), Some(735));
+        assert_eq!(stalled_ms(10, 3), None, "a clock read out of order is no stall");
+    }
 
     fn corrupt(section: SectionId) -> Corrupt {
         Corrupt { section, group: 3, cause: Cause::Crc { found: 1, wanted: 2 } }

@@ -1139,12 +1139,12 @@ impl Front<Fake> for FakeFront {
         if SCRIPT_OUTPUT.get() == Some(unit) {
             let key = blaze_cas::Key(ContentId::of("blaze serve tests output", SCRIPT));
             puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: SCRIPT.to_vec() });
-            outputs.push(Output { path: SCRIPT_AT.into(), key, executable: true });
+            outputs.push(Output { path: SCRIPT_AT.into(), key, executable: true, made: None });
         }
         if unit == 3 && OUTPUT.get() {
             let key = blaze_cas::Key(ContentId::of("blaze serve tests output", APP));
             puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: APP.to_vec() });
-            outputs.push(Output { path: APP_AT.into(), key, executable: true });
+            outputs.push(Output { path: APP_AT.into(), key, executable: true, made: None });
         }
         let diagnostics = match unit == 3 && WARNS.get() {
             true => {
@@ -1350,6 +1350,9 @@ fn options() -> Options {
         builds: name("cache/blaze/build"),
         sources: name("cache/blaze/sources"),
         writer: Hasher::new("blaze v2 test writer").part(STATE.as_bytes()).finish(),
+        // The simulation's files are in no file system a loader's thread could read: the
+        // stores load their packs through the daemon's driver.
+        store_loader: blaze_cas::Loader::Pumped,
         socket: Some(name(SOCKET)),
         http: None,
         budget: None,

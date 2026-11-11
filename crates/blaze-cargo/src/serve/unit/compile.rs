@@ -1859,6 +1859,9 @@ struct Making {
     /// The records of images keyed by all they are made from before they are built (a
     /// doctest's examples), each filed once its output is keyed ([`doctest`]).
     records: Vec<ImageRecord>,
+    /// Each image this compile linked, by its path, as the runs of its file that hold bytes
+    /// (`codegen::LinkMade::made`): what the loop places it from.
+    made_files: Vec<(String, Arc<blaze_cas::Sparse>)>,
     /// How many of `diagnostics` its check's are, in front, and every file they point into, by
     /// the name they give it ([`quoted_key`]); none where that is not known (a doctest's).
     quoted: Option<(usize, Vec<String>)>,
@@ -2045,7 +2048,7 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
             outputs: record
                 .outputs
                 .into_iter()
-                .map(|(path, key, executable)| Output { path, key, executable })
+                .map(|(path, key, executable)| Output { path, key, executable, made: None })
                 .collect(),
             artifact: record.artifact.map(|it| Artifact { fresh: true, ..it }),
             macros: None,
@@ -2573,6 +2576,7 @@ fn store(
         macros,
         gpu_msl,
         records,
+        made_files,
         quoted,
     } = *making;
     puts.extend(library_puts(job));
@@ -2705,6 +2709,11 @@ fn store(
             let found = keyed.iter().find(|it| it.0 == *path).or_else(|| {
                 keyed.iter().find(|it| artifact::uplifted(&it.0, plan) == Some(path.as_str()))
             });
+            // The file this compile linked, for the path and for the copy cargo makes of it.
+            let made = found.and_then(|(at, ..)| {
+                // clone: a refcount, once per output
+                made_files.iter().find(|it| it.0 == *at).map(|it| it.1.clone())
+            });
             let (key, executable) = match found {
                 Some((_, key, executable)) => (*key, *executable),
                 None if path.ends_with(".d") => {
@@ -2715,7 +2724,7 @@ fn store(
                 // their line tables, and write none beside them.
                 None => continue,
             };
-            outputs.push(Output { path: path.clone(), key, executable });
+            outputs.push(Output { path: path.clone(), key, executable, made });
         }
         let main = artifact::main(u, plan);
         // A library's doctests: each example's program and their verdicts, beside the runner
@@ -2726,7 +2735,12 @@ fn store(
             for (path, key, executable) in &keyed {
                 if doctest::beside(main, path) {
                     // clone: a path, once per example stored
-                    outputs.push(Output { path: path.clone(), key: *key, executable: *executable });
+                    outputs.push(Output {
+                        path: path.clone(),
+                        key: *key,
+                        executable: *executable,
+                        made: None,
+                    });
                 }
             }
         }
@@ -3276,6 +3290,7 @@ fn assemble(
         macros: None,
         gpu_msl: None,
         records: Vec::new(),
+        made_files: Vec::new(),
         // clone: the files its diagnostics point into, once per unit that fails or builds nothing
         quoted: Some(quoted.clone()),
     };
@@ -3301,6 +3316,7 @@ fn assemble(
     let mut links = Vec::new(); // alloc: none until a link
     // What each file rustc would write holds: (path, bytes, executable).
     let mut files: Vec<(String, Written, bool)> = Vec::new();
+    let mut made_files = Vec::new(); // alloc: none until a link
     let identity = named_identity(job, unit)?;
     if inert {
         // A build script that does nothing is not run, so not built: what it prints is known.
@@ -3500,6 +3516,10 @@ fn assemble(
                         // the link as, where the store derives the file from the one before
                         // it, else the whole file (`codegen::LinkMade::written`).
                         files.push((path.to_owned(), linked.written, true));
+                        if let Some(made) = linked.made {
+                            // alloc: once per image linked, shared by the paths it is placed at
+                            made_files.push((path.to_owned(), Arc::new(made)));
+                        }
                     }
                     Err(failed) => {
                         // alloc: error path
@@ -3525,6 +3545,7 @@ fn assemble(
         macros: None,
         gpu_msl: None,
         records: Vec::new(),
+        made_files,
         quoted: Some(quoted),
     })
 }

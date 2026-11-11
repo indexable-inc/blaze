@@ -132,6 +132,29 @@ pub trait Probe: Sync {
     /// Takes one wait. Called while the waiter holds the lock it waited for, so it must not
     /// take that lock: a lock on the recording path itself is [`Lock::unrecorded`].
     fn record(&self, wait: &LockWait);
+    /// Opens the span of a file call that may wait for a device, made on a driver's thread
+    /// off its loop ([`io_wait`]): `op` is what the call does (`clone`, `write back`) and
+    /// `file` the file it is made on. Its token is given back to [`Probe::wait_end`]; `None`
+    /// from a probe that names no such call (a test's), which is the default.
+    fn io_begin(&self, op: &'static str, file: &str) -> Option<u64> {
+        let _ = (op, file);
+        None
+    }
+}
+
+/// Runs `call`, a file call that may wait for a device (a clone, a write-back, a listing),
+/// under a span of the process's probe that names `op` and `file` (rule
+/// every-wait-says-what): where a driver's thread off its loop spends its time is then in the
+/// profile by file, where before the loop's own wait was all that showed. With no probe
+/// installed the call runs as it is.
+pub fn io_wait<R>(op: &'static str, file: &str, call: impl FnOnce() -> R) -> R {
+    let probe = installed();
+    let token = probe.and_then(|it| it.io_begin(op, file));
+    let result = call();
+    if let (Some(probe), Some(token)) = (probe, token) {
+        probe.wait_end(token);
+    }
+    result
 }
 
 /// The process's probe; null for none.

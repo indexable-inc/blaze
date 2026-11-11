@@ -110,12 +110,13 @@ const SITES_MAX: usize = SLOTS / 2;
 
 type Meta = tracing::Metadata<'static>;
 
-/// A callsite recorded, and which of the generic span columns its fields fill: bit `i` for
-/// the column at [`span::Said::get`]'s `i` ([`span::generic_of`]). The typed columns only a
-/// span kind fills ([`crate::span`]). `held`: its spans are [`HELD_FIELD`] ones.
+/// A callsite recorded, and which of the span columns its fields fill: bit `i` for the column
+/// at [`span::Said::get`]'s `i` ([`span::ad_hoc_column`]: the columns that hold a name, the
+/// generic ones and `awaits`). The typed columns of numbers and enums only a span kind fills
+/// ([`crate::span`]). `held`: its spans are [`HELD_FIELD`] ones.
 struct Site {
     meta: &'static Meta,
-    fields: u8,
+    fields: u32,
     held: bool,
 }
 
@@ -131,10 +132,11 @@ pub const HELD_FIELD: &str = "held";
 const HELD_BIT: u64 = 1 << 15;
 const _: () = assert!(SITE_BITS < 15, "the held bit is above a site");
 
-const _: () = assert!(span::GENERIC <= 8, "a callsite's generic fields are bits of a u8");
+const _: () = assert!(span::COLUMNS <= 32, "a callsite's fields are bits of a u32");
 
-fn field_of(name: &str) -> u8 {
-    span::generic_of(name).map_or(0, |at| 1 << at)
+/// The bit of the column an ad hoc span's field named `name` fills; 0 for a field of no column.
+fn field_of(name: &str) -> u32 {
+    span::ad_hoc_column(name).map_or(0, |at| 1 << at)
 }
 
 /// The callsites recorded, open-addressed by the address of their metadata: written under
@@ -1454,6 +1456,13 @@ const _: () = assert!(
 /// Fields of an event kept: `tracing`'s macros write at most 32 a callsite. A field's index
 /// is 6 bits of its slot.
 pub const EVENT_FIELDS: usize = 32;
+
+/// Whether the field at `index` of an event's callsite is kept, a row of `event_fields`
+/// whatever its name: one of its first [`EVENT_FIELDS`]. The rule [`Logged`] keeps a field by,
+/// and the one `blaze::span_field_unrecorded` holds an event's fields to.
+pub const fn event_field_recorded(index: usize) -> bool {
+    index < EVENT_FIELDS
+}
 const _: () = assert!(EVENT_FIELDS <= 1 << (FIELD_SLOT_BITS - 3), "a field's index fits its slot");
 /// The bits of an event's id that are its row's place in its ring; above them, the ring's number.
 const EVENT_INDEX_BITS: u32 = 48;
@@ -1555,7 +1564,7 @@ impl Logged {
 
     fn put(&mut self, field: &tracing::field::Field, value: FieldValue) {
         let index = field.index();
-        if self.len == EVENT_FIELDS || index >= EVENT_FIELDS {
+        if self.len == EVENT_FIELDS || !event_field_recorded(index) {
             FIELDS_LOST.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -2985,16 +2994,16 @@ fn claim() -> Option<&'static Ring> {
 
 // --- What spans do ----------------------------------------------------------------------
 
-/// The generic columns of an ad hoc span, from its fields, as it is made: those of
-/// [`Site::fields`].
+/// The columns of an ad hoc span, from its fields, as it is made: those of [`Site::fields`],
+/// each a name's ([`span::ad_hoc_column`]), so a value is kept as its text.
 struct Fields {
-    wanted: u8,
+    wanted: u32,
     said: Said,
 }
 
 impl Fields {
     /// `field` is one bit of [`Site::fields`].
-    fn set(&mut self, field: u8, value: &str) {
+    fn set(&mut self, field: u32, value: &str) {
         self.said.set(field.trailing_zeros() as usize, intern(value));
     }
 }
@@ -3022,7 +3031,8 @@ impl tracing::field::Visit for Fields {
 }
 
 /// Makes the ad hoc span `span` of `site` beginning now on this thread: its id, or
-/// [`UNRECORDED`]. Its fields fill the generic columns its site names.
+/// [`UNRECORDED`]. Its fields fill the columns its site names, whether or not it is ever
+/// entered: its row is written as its last handle drops ([`closed`]).
 #[inline]
 pub(crate) fn opened(span: &tracing::span::Attributes<'_>, site: u16) -> u64 {
     let wanted = SITES[usize::from(site) - 1].get().map_or(0, |it| it.fields);
@@ -3168,7 +3178,7 @@ pub(crate) fn cloned(id: u64) {
 }
 
 /// The ad hoc span `id`, still open, was given values after it was made: those of its
-/// generic columns replace the ones it began with. A value given after the span closed is not
+/// columns replace the ones it began with. A value given after the span closed is not
 /// kept.
 pub(crate) fn recorded(id: u64, values: &tracing::span::Record<'_>) {
     if id == UNRECORDED {
