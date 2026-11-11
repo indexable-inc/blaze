@@ -5175,9 +5175,15 @@ mod tests {
         // the other's lock.
         let (ran_out, has_ran_out) = crossbeam_channel::unbounded();
         let (asked_out, has_asked_out) = crossbeam_channel::unbounded::<()>();
+        // The run goes on for 300 ms from the moment the asker is about to ask, however late
+        // its thread starts: on a loaded machine the asker began 230 ms into a run that slept
+        // 300 ms from its own start, and its wait was 68 ms.
+        let (asking_now, is_asking) = crossbeam_channel::unbounded::<()>();
         let runner = std::thread::spawn(move || {
             let got = flights.get_or_run_named(key, named, || {
                 started.send(()).unwrap();
+                // Ends when the asker says it asks, or when its thread ended without asking.
+                _ = is_asking.recv();
                 blaze_graph::spin::busy(Duration::from_millis(300));
                 Ok(5)
             });
@@ -5189,6 +5195,7 @@ mod tests {
         let asker = std::thread::spawn(move || {
             let asking = tracing::info_span!(target: "blaze", "flight asking").entered();
             let asking_id = asking.id().unwrap().into_u64();
+            asking_now.send(()).unwrap();
             let got = flights.get_or_run_named(key, named, || Ok(0));
             drop(asking);
             has_ran_out.recv().unwrap();
@@ -5229,7 +5236,7 @@ mod tests {
         assert_eq!((wait.parent, wait.depth), (asking_id, 1));
         assert!(
             wait.dur_ns >= 100_000_000,
-            "the wait lasted while the run slept: {} ns",
+            "the wait lasted while the run went on after the asker asked: {} ns",
             wait.dur_ns
         );
         let waited: i64 = named_on(asker, "wait")
@@ -5265,10 +5272,12 @@ mod tests {
                 .expect("no one holds it");
             held.send(()).unwrap();
             blaze_graph::spin::busy(Duration::from_millis(200));
+            // On the rows' clock, just before the hold ends: no wait behind it is over sooner.
+            let ending_ns = crate::clock::mono_ns();
             hold.end(&9);
             ended.send(()).unwrap();
             _ = has_waited.recv();
-            crate::sampler::os_tid() as u32
+            (crate::sampler::os_tid() as u32, ending_ns)
         });
         has_held.recv().unwrap();
         let waiter = std::thread::spawn(move || {
@@ -5278,7 +5287,7 @@ mod tests {
         });
         let (waiter, got) = waiter.join().unwrap();
         drop(waited);
-        let holder = holder.join().unwrap();
+        let (holder, ending_ns) = holder.join().unwrap();
         assert_eq!(got, Ok(9), "the waiter took the hold's value");
         let mut read = Read::default();
         window(Duration::from_secs(60), &mut read);
@@ -5301,9 +5310,19 @@ mod tests {
             "the wait names the hold's holder as whose it waits on"
         );
         assert!(hold.dur_ns >= 150_000_000, "the hold lasted until it ended: {} ns", hold.dur_ns);
+        // The wait began inside the hold and lasted to the hold's end: it began after the hold
+        // did and before the holder ended it, and was not over before then (1 ms for the two
+        // readings of the clock). How long after the hold's end the waiter's thread ran again
+        // is the machine's, not the recorder's: until 2026-11-11 this held it to 50 ms, which a
+        // loaded machine passed.
+        let wait_end_ns = wait.start_ns + wait.dur_ns;
         assert!(
             hold.start_ns <= wait.start_ns
-                && wait.start_ns + wait.dur_ns <= hold.start_ns + hold.dur_ns + 50_000_000
+                && wait.start_ns <= ending_ns
+                && wait_end_ns + 1_000_000 >= ending_ns,
+            "the wait {}..{wait_end_ns} ns is not inside the hold from {} ns to its end at {ending_ns} ns",
+            wait.start_ns,
+            hold.start_ns
         );
     }
 
