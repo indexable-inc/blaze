@@ -186,6 +186,37 @@ N functions, C changed or new, D their referrers, G groups, L functions asked ea
 each; `the_work_of_an_edit_is_the_same_among_a_hundred_functions_and_ten_thousand` holds
 them to the edit.
 
+## The first edit after a cold build (2026-11-11; read, not yet measured)
+
+Measured on ripgrep 15.1.0, 64 cores, one daemon: the first body edit after a cold build
+5.7 s, each later one 0.95 s. Read from the code, what the first edit makes that a later one
+finds:
+
+- **Kept by a cold build, so not the difference:** its walk and lists (a whole build that is
+  not lazy and ends well keeps both under its program; `codegen delta` now says `walk_kept`
+  and `lists_kept`, `yes` or the reason), the describes' memos, the bodies' and modules'
+  check memos (`body_check_clean`, `module_check_clean`: every unit's check is
+  `Plan::of_every_body`), and the image's rows the link's delta is made against.
+- **Let go by the cold build's release, and read again by value:** the edited crate's
+  inference (by name, as the crate finished), and every crate's MIR and constants' values
+  (by tag, at each release with no unit open and at the build's end). The check memos hold,
+  so no check task reads a body; the readers are the lints of bodies
+  (blaze-diagnostics' `lints/bodies.rs`, `before_abort` and `after_abort`), which read every
+  body's inference, built MIR and runtime MIR in one loop on one thread. On ripgrep's
+  binary crate that is about 1,165 bodies of each made again one after another, where the
+  cold build had made them on all cores.
+
+Done: a build that is no edit's holds the inference of the workspace crates it finished
+last, at most `EDIT_CRATES` (blaze-cargo's `serve/unit/release.rs`, `Release::plan_of`),
+so the first edit infers what changed. Not done, and what is left of the difference: the
+MIR goes by its tag, which keeps none by crate, so the first edit still lowers each body's
+built and runtime MIR again on that one thread. Either closes it: the lints of bodies run
+a body a task on all cores, as the check does (then any state of the values costs the
+cores' share, a restart's and a memory squeeze's too), or the release keeps the held
+crates' `mir_body_query` and `runtime_mir_body_query` values, which needs an eviction by
+tag that takes keys to leave. To tell from a profile: the first edit's `query_counts` rows
+with `evicted_asked` (made again because let go) against `ran_changed` (an input changed).
+
 ## Not built
 
 - **The changed set from the engine** (above), which replaces `group`: until it is built
