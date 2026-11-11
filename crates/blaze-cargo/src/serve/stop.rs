@@ -138,9 +138,9 @@ fn guard(pipe: std::fs::File, bound: Duration, pulse: &Pulse, over: &Receiver<()
                 Some(quiet) => format!(
                     "nothing moved for {} s, its bound ({})",
                     quiet.for_ns / 1_000_000_000,
-                    quiet.at
+                    counted(&quiet.at, pool.working())
                 ), // alloc: once, as the process ends
-                None => format!("asked to stop again ({progress})"), // alloc: as above
+                None => format!("asked to stop again ({})", counted(&progress, pool.working())), // alloc: as above
             };
             let said = stalled(std::process::id(), &why);
             tracing::error!(target: "blaze", "{said}");
@@ -154,6 +154,22 @@ fn guard(pipe: std::fs::File, bound: Duration, pulse: &Pulse, over: &Receiver<()
             Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
         }
     }
+}
+
+/// What a guard off the loop counted, as its stall says it. The guards here count no look
+/// that found work running ([`Progress::working`] is the loop's own, and they watch a loop
+/// that may not turn), so `at`'s `working` is not said as a count of 0, which read as "no
+/// worker was working" of a daemon whose every worker was (2026-11-11). `working_now` is the
+/// workers inside a job's code as the stall is said (`blaze_graph::pool::Pool::working`): not
+/// counted as moving, because a job blocked on a lock is inside its code too.
+fn counted(at: &Progress, working_now: usize) -> String {
+    // alloc: once, as the process ends
+    format!(
+        "{} jobs ended, {} queries completed and {} tasks or steps ended; {working_now} workers \
+         are inside a job's code now, which this guard does not count as moving (a job blocked \
+         on a lock is inside its code too)",
+        at.jobs, at.queries, at.steps
+    )
 }
 
 /// Watches the loop's turns until a stop: SIGTERM or SIGINT, or the daemon's own stop, as a
@@ -202,7 +218,7 @@ fn watch_turns(
             let why = format!(
                 "the loop has not finished a turn and nothing moved for {} s, its bound ({}): it ends with exit status {}",
                 quiet.for_ns / 1_000_000_000,
-                quiet.at,
+                counted(&quiet.at, pool.working()),
                 Exit::LoopStalled
             );
             let said = stuck_line(pid, &why);

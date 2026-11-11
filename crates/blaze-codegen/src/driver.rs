@@ -2682,6 +2682,9 @@ impl<'a, B: Prepare> Build<'a, B> {
             (Some(kept), None) => kept.take_lists(program_walk),
             _ => None,
         };
+        // Why the build's own walk is not one the next build of the program can patch, when
+        // it is not: said as the build ends (`codegen delta`'s `walk_kept`).
+        let mut unkept: Option<&'static str> = None;
         let (nodes, statics, root_keys, mut walk, keep, touched) = {
             let span = tracing::info_span!(
                 target: "blaze",
@@ -2746,9 +2749,19 @@ impl<'a, B: Prepare> Build<'a, B> {
                         &mut out.errors,
                     );
                     walk.whole = Some(why);
+                    let described = side.is_some();
                     let keep = side.and_then(|side| {
                         self.keep_of(&nodes, &statics, side, roots, static_roots, check)
                     });
+                    unkept = match (&keep, self.kept, later) {
+                        (Some(_), _, _) => None,
+                        (None, None, _) => Some("the build keeps no walk"),
+                        (None, Some(_), Some(_)) => Some("a lazy build's walk order is not kept"),
+                        (None, Some(_), None) if !described => Some("the walk had an error"),
+                        (None, Some(_), None) => {
+                            Some("the walk's tables do not agree with what its roots reach")
+                        }
+                    };
                     (nodes, statics, root_keys, walk, keep, None)
                 }
             };
@@ -3116,6 +3129,12 @@ impl<'a, B: Prepare> Build<'a, B> {
             added = tracing::field::Empty,
             changed = tracing::field::Empty,
             removed = tracing::field::Empty,
+            // Whether the next build of the program has a walk and lists to patch (`yes`),
+            // or why it has none: a first edit that walks whole after a cold build is
+            // explained by the cold build's own row.
+            walk_kept = tracing::field::Empty,
+            lists_kept = tracing::field::Empty,
+            kept_functions = tracing::field::Empty,
         );
         let _entered = span.enter();
         let program = kept::program(&(roots, static_roots, check, policy_id.0, later));
@@ -3139,6 +3158,11 @@ impl<'a, B: Prepare> Build<'a, B> {
         span.record("removed", built.delta.functions.removed.len());
         walk.dropped = built.delta.functions.removed.len();
         built.walk = walk;
+        let mut lists_unkept: Option<&'static str> = match (self.kept, later) {
+            (None, _) => Some("the build keeps no walk"),
+            (Some(_), Some(_)) => Some("a lazy build's lists are kept by its entries"),
+            (Some(_), None) => None,
+        };
         if let Some(kept) = self.kept {
             // Kept by row for the next build to patch, where every function is compiled
             // alone; else by its entries, for the next build's delta.
@@ -3150,7 +3174,13 @@ impl<'a, B: Prepare> Build<'a, B> {
                         kept.forget_built(program);
                         None
                     }
-                    Err(now) => Some(now),
+                    Err(now) => {
+                        lists_unkept = Some(
+                            "a function is folded or built by a release backend, or the \
+                             build's lists are not a row a function",
+                        );
+                        Some(now)
+                    }
                 },
                 false => Some(now),
             };
@@ -3159,6 +3189,21 @@ impl<'a, B: Prepare> Build<'a, B> {
                 kept.built(program, Arc::new(now));
             }
         }
+        if unkept.is_none() && view.is_none() {
+            unkept = Some("the front end tells no durable view");
+        }
+        let (walk_kept, lists_kept) = (unkept.unwrap_or("yes"), lists_unkept.unwrap_or("yes"));
+        span.record("walk_kept", walk_kept);
+        span.record("lists_kept", lists_kept);
+        span.record("kept_functions", built.inputs.len());
+        tracing::info!(
+            target: "blaze",
+            owner = self.owner,
+            walk_kept,
+            lists_kept,
+            functions = built.inputs.len(),
+            "what the build keeps of its program for the next build to patch"
+        );
         // The walk of a build that ended well is the one the next build of the program
         // patches: with the front end's views from before its describes.
         if let (Some(keep), Some(view)) = (keep, view) {

@@ -875,7 +875,13 @@ pub fn par_for_each(count: usize, task: impl Fn(usize) + Sync) {
     // The caller's attached database (or none), lent to each task too: a task formats what
     // its caller would, on whichever worker it runs, not whatever that worker had.
     let lent = Lent(local::with(|local| local.attached));
-    let task = |at: usize| lent.within(|| task(at));
+    let task = |at: usize| {
+        lent.within(|| task(at));
+        // An item that ran to its end (one that gave way or panicked unwound past here) is
+        // work ended, which the stall watchdog reads ([`completed`]): the loop's jobs each
+        // run many items, so none of them ends while the loop lasts.
+        function::complete_one();
+    };
     let again = pump_barrier(|| {
         blaze_graph::par::for_each_giving_way(count, &task, |panic| {
             matches!(panic.downcast_ref::<Cancelled>(), Some(Cancelled::WouldWaitOnItself { .. }))

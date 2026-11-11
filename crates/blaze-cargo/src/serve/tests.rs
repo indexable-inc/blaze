@@ -1419,6 +1419,7 @@ fn options() -> Options {
         activated: None,
         profiling: None,
         machine: None,
+        without: super::daemon::Without::default(),
     }
 }
 
