@@ -256,6 +256,9 @@ const PLUMBING: &[&str] = &[
     "blaze_engine::heaps",
     "<blaze_engine::heaps",
     "blaze_engine::malloc",
+    // The global allocator's shims, as blaze names them (`__blaze_global_alloc`, `_zeroed`,
+    // `_realloc`): every Rust allocation of a blaze-built daemon passes through one.
+    "blaze_engine::__blaze_global",
     "_Unwind_",
     "__rust_",
     "__rdl_",
