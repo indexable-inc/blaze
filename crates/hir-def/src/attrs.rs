@@ -1254,13 +1254,13 @@ bitflags::bitflags! {
         /// (docs/v2/plan/design/early-drop.md): the impl must only free memory
         /// (`hir_ty_pure::drop_effects`), unless [`AttrFlags::DROP_TRUSTED`] says otherwise.
         /// Bit 101 is `NOREFCOUNT`'s on `edition-e2-handles-1109`.
-        const DROP_EARLY = 1 << 102;
+        const DROP_EARLY = 1 << 105;
         /// `#[blaze::drop(scoped)]` on a type: a value of it, and of any type that holds one,
         /// is dropped where its scope ends, as in Rust, whatever its destructor does.
-        const DROP_SCOPED = 1 << 103;
+        const DROP_SCOPED = 1 << 106;
         /// `#[blaze::drop(early, trusted = "why")]`: [`AttrFlags::DROP_EARLY`] asserted, the
         /// destructor not checked (a pooled buffer whose drop gives it back to its pool).
-        const DROP_TRUSTED = 1 << 104;
+        const DROP_TRUSTED = 1 << 107;
         /// `#[blaze::linear]`, a word: a blaze extension (inert under rustc with
         /// `#![register_tool(blaze)]`), read by `hir-ty-linear`
         /// (docs/v2/plan/design/linear.md). On a struct or enum: a value of it may not be
@@ -1307,7 +1307,7 @@ bitflags::bitflags! {
         /// docs/v2/plan/design/facts.md "Acyclic"), so nothing in the compiler analyses it
         /// and nothing reads the bit until that lane's assertion does. It changes
         /// diagnostics, never code: no codegen key reads the bit.
-        const BLAZE_ACYCLIC = 1 << 125;
+        const BLAZE_ACYCLIC = 1 << 108;
         /// `#[blaze::program_lifetime]`, a word, on a struct or enum: a blaze extension (inert
         /// under rustc with `#![register_tool(blaze)]`), a declared type fact
         /// (docs/v2/plan/design/facts.md): instances live until the program exits. `hir-ty-pure`'s
