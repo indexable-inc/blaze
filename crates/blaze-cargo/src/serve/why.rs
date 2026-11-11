@@ -617,8 +617,17 @@ impl Ledger {
     }
 
     /// [`Ledger::prune`] with at most `tombs` tombstones kept.
+    ///
+    /// The cap is of what shrinking frees: the parts, ends and kept entries of the subjects
+    /// still whole. A tombstone's own bytes are bounded by `tombs`, not by `cap`. Until
+    /// 2026-11-11 the cap was held against every subject's weight, tombstones included, which
+    /// shrinking cannot lower: in a home whose tombstones alone weighed more than the goal,
+    /// every compaction shrank every whole subject, the ones the last build had just
+    /// computed too, so each build's misses read "blaze why's ledger dropped its records"
+    /// for subjects of the open workspace (ripgrep's seven build script runs, every build).
     fn prune_to(&mut self, cap: usize, tombs: usize) -> usize {
-        let mut total: usize = self.items.values().map(weight).sum();
+        let mut total: usize =
+            self.items.values().filter(|it| !it.tomb).map(|it| weight(it) - bare(it)).sum();
         let mut changed = 0;
         if total > cap {
             // alloc: once a compaction past the cap, on the history's thread
@@ -748,6 +757,11 @@ pub fn compact_due(len: u64, live: u64) -> bool {
 }
 
 /// About how many bytes `last` takes in the file: the bound [`Ledger::prune`] keeps.
+/// What a subject weighs as a tombstone: [`weight`] with no part, end or `beyond`.
+fn bare(last: &Last) -> usize {
+    160 + last.step.len() + last.item.len()
+}
+
 fn weight(last: &Last) -> usize {
     let part = |it: &Kept| {
         56 + it.name.len()
@@ -1956,6 +1970,18 @@ mod tests {
         assert_eq!(ends(&evicted, RG), by_cap);
         assert_eq!(ends(&evicted, "main"), by_cap);
         assert!(said(&evicted).contains("ledger dropped its records"), "{}", said(&evicted));
+        // The cap is of what shrinking frees: tombstones, however many, shrink no subject
+        // that is whole. The build above computed some again; with the cap at exactly what
+        // those hold beyond a tombstone's bytes, nothing goes, though the ledger's whole
+        // weight (the tombstones' with it) is past that cap.
+        let whole = |ledger: &Ledger| -> usize {
+            ledger.items.values().filter(|it| !it.tomb).map(|it| weight(it) - bare(it)).sum()
+        };
+        let all: usize = daemon.ledger.items.values().map(weight).sum();
+        let held = whole(&daemon.ledger);
+        assert!(held > 0 && all > held, "some subjects are whole and some are tombstones");
+        assert_eq!(daemon.ledger.prune_to(held, TOMBS), 0, "the last build's records stay whole");
+        assert_eq!(whole(&daemon.ledger), held);
         // Written whole and read back, a tombstone is one still.
         let restored = Ledger::restore(&daemon.ledger.file()).ledger;
         assert_eq!(restored.items, daemon.ledger.items);
