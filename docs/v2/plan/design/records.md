@@ -5,9 +5,8 @@ date: 2026-11-10
 ---
 # Records and named arguments
 
-Deletes: builders, options structs, one-off structs. Off unless a crate says
-`#![blaze::records]` among the inner attributes that open its root (rule `superset-of-rust`); a
-crate without it parses and builds as before, error for error.
+Deletes builders, options structs and one-off structs. Off unless a crate's root opens with
+`#![blaze::records]`; a crate without it parses and builds as before (rule `superset-of-rust`).
 
 ## Syntax
 
@@ -50,7 +49,7 @@ generic struct per sorted name list" with the list as an argument, as error unio
   type is an ordinary generic instance of one core item. There is no id of blaze's own to keep
   stable, and a default is no part of it.
 - **Layout and ABI** are the tuple's (`repr(Rust)` over the sorted fields); code without
-  records sees no change. A function of a non-Rust ABI cannot take a record.
+  records sees no change. A function of another ABI cannot take a record.
 - **Traits** come from core, as a tuple's do: `Clone`, `Copy`, `PartialEq`, `Eq`, `Hash`,
   `Default`, `PartialOrd` and `Ord` (in sorted-name order) when the tuple has them, so up to
   twelve fields beyond `Clone` and `Copy`; `Debug` prints `{a: 1, b: 2}`.
@@ -88,8 +87,8 @@ refused in this slice), never another parameter.
 - A call through a function pointer, a closure or a `Fn` value has no callee to ask: `..` there
   is an error saying so. A trait method's defaults are its declaration's; an impl repeats the
   types and writes none (an error naming the field), so a call on a `dyn Trait` or a type
-  parameter has them too, the declaration being known statically.
-- No positional-to-named conversion, no reordering of other parameters, no overloading.
+  parameter has them too, the declaration being known statically. Nothing else changes about
+  a call: no positional-to-named conversion, no reordering, no overloading.
 
 ## Lints (allow by default; errors under the edition)
 
@@ -110,8 +109,8 @@ checking (`hir-ty-matchck/src/lower.rs`). Coarser but correct: the capture walk 
 ## Not built in this slice
 
 A spelling for "every default"; records inside a macro call (see Gate); `options_struct`; a
-"name it" help on E0116 and E0117 for a record; a record in the return type of an `extern`
-function is not refused (a parameter is); defaults that name the function's generic parameters.
+"name it" help on E0116 and E0117; refusing a record an `extern` function returns (a parameter
+is refused); defaults that name the function's generic parameters.
 
 ## Use in blaze
 
