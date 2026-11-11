@@ -168,6 +168,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     (no-op, comment, body edit, first edit, edit after restart, memory while warm); design so cold
     builds can be fast too, but do not spend on them ahead of incremental for now. Skill:
     `perf-and-tracing`.
+61. **claims-from-evidence**: State as fact only what a tool call in this session showed (a query's
+    rows, a command's output, the code read); anything else is said as a guess or as not measured,
+    never as a cause, a number or a status. Skill: `debugging`.
 
 ## Code Review Rules
 
