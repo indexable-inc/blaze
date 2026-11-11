@@ -933,5 +933,9 @@ pub(crate) fn leaf_kinds(leaf: crate::models::Leaf) -> (EffectSet, &'static str)
         Leaf::Panic => (EffectSet::one(Rule::Panic), "panics"),
         Leaf::Alloc => (EffectSet::one(Rule::Alloc), "allocates or frees memory"),
         Leaf::ErrorText => (EffectSet::of(&[Rule::Alloc, Rule::Panic]), "gives an error's text"),
+        // What `#[blaze::pure]` refuses of them is unchanged: only a build script's run is
+        // given a provider.
+        Leaf::Seeded => (EffectSet::one(Rule::Random), "uses randomness"),
+        Leaf::Wall => (EffectSet::one(Rule::Clock), "reads the clock"),
     }
 }

@@ -77,6 +77,12 @@ impl Effects {
     pub const PROBE: Effects = Effects(1 << 3);
     /// Ends the run with `process::exit` or `process::abort`.
     pub const EXIT: Effects = Effects(1 << 4);
+    /// Draws randomness from std (`RandomState::new`): the run's provider gives it, made of
+    /// the run's key.
+    pub const SEEDED: Effects = Effects(1 << 5);
+    /// Asks the wall clock (`SystemTime::now`): the run's provider gives the build's
+    /// `SOURCE_DATE_EPOCH`, a variable of its key.
+    pub const WALL: Effects = Effects(1 << 6);
 
     pub const fn union(self, other: Effects) -> Effects {
         Effects(self.0 | other.0)
