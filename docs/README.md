@@ -35,6 +35,7 @@ How blaze is now. Kept true: CI checks their links, paths and settings against t
 
 Designs not (fully) built, newest first.
 
+- [v2/plan/design/scripts.md](v2/plan/design/scripts.md) (2026-11-11): Python leaves the repository: what was deleted, and Rust scripts run by blaze (`blaze run script.rs`, bstd, typed input, stage 0) replacing the rest.
 - [v2/plan/design/why.md](v2/plan/design/why.md) (2026-11-10): Why blaze recomputed each step of a build, said after every build and by `blaze why`, as a chain from the step through the key parts that differ down to a real input change (a file, a variable, a flag) or one of a closed set of other terminal reasons; an unexplained recompute is a blaze bug and is counted.
 - [v2/plan/design/simd.md](v2/plan/design/simd.md) (2026-11-10): Portable SIMD in blaze. The vector types are the pinned nightly's `core::simd`, with no feature gate under `#![blaze::simd]` (the edition turns it on); blaze adds one macro, `simd::native_lanes!`, and `#[blaze::multiversion]`, which compiles a function once per CPU level and picks one when the program starts; how the differentiator and the GPU kernels use the same types.
 - [v2/plan/design/records.md](v2/plan/design/records.md) (2026-11-10): Records and named arguments (edition change 4, ledger row E5). Under `#![blaze::records]`, `{ a: T, b: U }` is a structural type (core's `Record` over the tuple of its fields sorted by name), `{ a: x, b }` its value and `{ a, b: p }` its pattern; a record parameter whose fields have defaults is how arguments are named and left out. What the edition page left open is decided here.
@@ -139,6 +140,6 @@ Research, reports and measurements, true on their date and not brought up to dat
 - [platforms.md](platforms.md) (2026-10-30): The state of each platform under blaze v1 (rustc's link line, the splice, `blaze-engine weaken`), from v1's last CI run that covered them all. v2 has not been run on any platform yet.
 - [fn-cache.md](fn-cache.md) (2026-10-30): #[blaze::cache]: results of pure functions kept across runs, keyed by the code they reach. Its library crates were deleted on 2026-10-30.
 - [doc.md](doc.md) (2026-10-30): blaze doc as blaze v1 did it (the engine's doc.rs, over a workspace loaded into rust-analyzer): HTML documentation written from the front end's HIR, with no rustdoc. v2 has no `blaze doc` yet.
-- [rename.md](rename.md) (2026-10-28): The rename from ra-jit and cargo blaze to blaze (#270), and what tools/rename.py changes.
+- [rename.md](rename.md) (2026-10-28): The rename from ra-jit and cargo blaze to blaze (#270), and what its script, tools/rename.py (deleted 2026-11-11), changed.
 - [results.md](results.md) (2026-10-27): Results: every number with the harness, commit and report it came from.
 - [flat-syntax.md](flat-syntax.md) (2026-10-22): Flat syntax trees for files nobody edits (#42): the design and its memory and time, measured.
