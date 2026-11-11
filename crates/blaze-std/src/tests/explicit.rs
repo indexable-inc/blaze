@@ -136,7 +136,7 @@ fn no_unsynced_call_waits_for_the_device_and_each_synced_one_does() {
 }
 
 #[test]
-fn started_is_refused_before_anything_changes() {
+fn started_begins_the_writeback_and_waits_for_nothing() {
     let io = world(8, Plant::None);
     let (cx, dir) = data(&io);
     write_synced(&cx, &dir, &path("f"), b"old").expect("a file");
