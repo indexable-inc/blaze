@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-44 invariants, 14 refinements, 4 reference models.
-By level: 38 tested, 20 simulated, 0 model-checked, 0 proved.
+47 invariants, 14 refinements, 4 reference models.
+By level: 40 tested, 21 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -43,6 +43,8 @@ By level: 38 tested, 20 simulated, 0 model-checked, 0 proved.
   Controls: `a_head_written_before_its_syncs`.
 - **`a_place_gives_its_values_bytes_whole_through_any_crash`** *simulated* (`crates/blaze-cas/src/tests/place_crash.rs`): whatever is put, placed, replaced and derived, with `placed/` full or not, and wherever the power goes, (1) a place that ends well leaves its path holding exactly its value's bytes, so a whole file of `placed/` is cloned from only when its bytes are its value's: one written or derived by this run, or one an earlier run left that hashes to its name (a derived value's is never kept: it is made again from its base and its ranges); (2) until a place ends well its path holds what it held or the new value whole, never a part; (3) after a crash a path holds nothing, or the whole of a value once placed there, or what the power left of a place of one (nothing of a place is synced: any of the sectors of a value written where it goes, or a derived value's base with any of its ranges written), never bytes of anything else; (4) no clone the store asks for is of a file with data not written back, so no place waits for a write-back a clone forced; and the store opens. `HEGEL_TEST_CASES=<n>` runs it longer.
   Controls: `a_placed_file_used_after_a_crash_unchecked`, `a_rename_before_the_clones_bytes_are_complete`, `a_derive_that_skipped_a_range`, `a_derived_file_accepted_as_a_crash_left_it`, `a_clone_of_a_dirty_file_on_the_edit_path`.
+- **`a_made_output_is_placed_with_no_clone_and_no_wait_for_a_write_back`** *simulated* (`crates/blaze-cas/src/tests/place_made.rs`): an output placed from its maker's bytes ([`Store::place_made`]), whatever the store's own whole files are doing beside it (written, sealed, their write-backs in flight or held for ever) and wherever the power goes, (1) asks the driver for no clone, no write-back and nothing that waits for a sync, so no clone of a file with data not written back is made for it and none of its bytes are forced out by one; (2) is answered once its own effects have completed, with write-backs the disk never completes still held: its answer waits for no write-back; (3) ends with its path holding exactly its file, the runs over zeros at its length, and reports the runs' bytes as written there; (4) until it ends its path holds what it held or the new file whole, never a part; (5) after a crash its path holds nothing, a value once placed there whole, or what the power left of one (each byte the value's or a zero), never bytes of anything else; and the store opens. `HEGEL_TEST_CASES=<n>` runs it longer.
+  Controls: `a_made_output_cloned_from_a_file_just_written`, `a_made_output_whose_answer_waits_for_a_write_back`.
 - **`two_stores_placing_one_value_at_one_path_both_succeed_in_any_order`** *simulated* (`crates/blaze-cas/src/tests/place_race.rs`): any schedule of two stores placing the same value at one shared path ends with both Ok and the path holding the value. `HEGEL_TEST_CASES=<n>` runs it longer.
   Controls: `a_remove_then_clone_onto_the_path`.
 
@@ -107,6 +109,11 @@ By level: 38 tested, 20 simulated, 0 model-checked, 0 proved.
 - **`the_images_file_is_always_one_image_whole`** *simulated* (`crates/blaze-image/src/place/tests.rs`): after any run of images placed, let go, failed and cut by a crash, the image's file holds one image whole, byte for byte what a fresh build wrote: the one placed once the placing said so (and after a crash then), the one before it when the placing was let go, and one of the two when it failed or the power went; and it opens and verifies. `HEGEL_TEST_CASES=<n>` runs it longer.
   Controls: `a_rename_without_its_sync`, `blocks_shared_from_bytes_the_file_no_longer_holds`.
 
+### blaze-item-hash
+
+- **`bodies_alike_but_for_their_names_list_one_shape`** *tested* (`crates/blaze-item-hash/src/tests/classify.rs`): two bodies of one identity that read the same of themselves list one shape for each step, so the store keeps one shape and one answer for both, and a rename keeps a body's records. A body's identity writes its own item as "self"; a fact about that item (its inference as its MIR reads it, its MIR and match check as its borrow check does) names it as [`values::OWN`], and its value is the body's own ([`values::value_in`]). Until 2026-11-10 such a fact named the item by its key: `FIRST` and `SECOND` filed two shapes of their MIR under one base key in one flush, which the daemon's store refused ("keeping the shape of the MIR of StaticId(..): two images were made under ..") after every build of ripgrep.
+  Controls: `a_shape_that_names_its_own_body_by_key`.
+
 ### blaze-link
 
 - **`a_torn_patch_is_never_taken_for_the_links_file`** *tested* (`crates/blaze-link/src/tests/patch.rs`): a file a patch did not wholly reach is never taken for the last link's. Whatever part of a patch's writes a crash kept, [`Image::verify`] refuses the file unless it is byte for byte the link's, naming it torn, and the link from scratch that follows writes the whole file, which verifies and behaves as the program.
@@ -148,6 +155,11 @@ By level: 38 tested, 20 simulated, 0 model-checked, 0 proved.
 
 - **`a_write_of_a_file_has_a_job_for_its_crate_and_those_above_it_alone`** *tested* (`crates/hir-def/src/nameres/delta/tests.rs`): a crate with no job in a write (`delta::unreached`) is one whose job would change nothing, so after any write every crate's maintained map is the one a fresh resolution makes (`check_db`). And the cost: a write of a file has a job for its crate and the crates above it alone, not one for every crate of the graph.
   Controls: `a_crate_above_a_written_one_left_without_a_job`.
+
+### hir-ty
+
+- **`a_flush_keeps_two_shapes_of_one_base_key`** *tested* (`crates/hir-ty/src/body_store/tests.rs`): every step a flush is given is kept, whatever else the same flush holds; two shapes of one base key take two slots, in a store that shows no put before its driver made it. Until 2026-11-10 the second shape was placed against the store alone, found slot 0 free, and was refused by the put the first had buffered ("keeping the shape of the MIR of StaticId(..): two images were made under .."), which lost everything the build left for the store and its front end with it: every build of ripgrep, whose crates have statics and functions alike but for their names.
+  Controls: `a_flush_that_forgets_what_it_placed`.
 
 ## Refinements
 
