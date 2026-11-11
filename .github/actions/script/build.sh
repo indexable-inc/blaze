@@ -10,6 +10,9 @@
 # no-fallback). Where each binary is comes from the build itself, the `executable` of its
 # `compiler-artifact` line under --message-format=json (crates/blaze-cargo/src/cli/json.rs,
 # `artifact`), and it is copied into DIR, which may be on any file system.
+#
+# `--profile script` (the root Cargo.toml): dev's opt-levels without debug info, so the cached
+# binaries are small enough for the Actions cache and a fast restore.
 set -euo pipefail
 die() { echo "::error::$*" >&2; echo "build.sh: $*" >&2; exit 1; }
 [ $# = 2 ] || die "takes DIR and KEY, not: $*"
@@ -29,7 +32,7 @@ for name in $(env | sed -nE 's/^(CARGO_PROFILE_[A-Z0-9_]*|CARGO_TARGET_[A-Z0-9_]
 unset CARGO_TARGET_DIR
 said="$dir.build.json"
 mkdir -p "$(dirname "$dir")"
-blaze build -p scripts --bins --message-format=json > "$said" || die "blaze build -p scripts --bins --message-format=json failed (its JSON lines: $said)"
+blaze build -p scripts --bins --profile script --message-format=json > "$said" || die "blaze build -p scripts --bins --profile script --message-format=json failed (its JSON lines: $said)"
 
 fresh="$dir.new"
 rm -rf "$fresh"
