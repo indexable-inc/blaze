@@ -3,6 +3,7 @@ import Blaze.Mir.Opt.RemoveOverwritten
 import Blaze.Mir.Opt.SimplifyConstCondition
 import Blaze.Mir.Opt.RemoveStorageMarkers
 import Blaze.Mir.Opt.ConstFold
+import Blaze.Mir.Opt.RemoveDead
 
 /-!
 A translation validator that takes a witness (objective V8's second half; Pnueli, Siegel and
@@ -113,6 +114,40 @@ theorem removeOverwrittenChecked_preserves : PreservesWhen FrameZero removeOverw
   · rw [if_neg hc]
     exact h
 
+/-- `removeDead` with the certificate given and the references the body takes as its borrowed
+locals, where the certificate is consistent (`checkLiveness`) and the program takes
+references only to those (`checkBorrows`); the program otherwise. -/
+def removeDeadStoresChecked (cert : List (List (List (List Local)))) (prog : Program) : Program :=
+  if (checkBorrows refsOf prog && checkLiveness prog cert) = true then
+    removeDead cert refsOf prog
+  else prog
+
+theorem removeDeadStoresChecked_preserves (cert : List (List (List (List Local)))) :
+    PreservesWhen FrameZero (removeDeadStoresChecked cert) := by
+  intro prog n id base args r hz h _ hu
+  show (if (checkBorrows refsOf prog && checkLiveness prog cert) = true then
+      removeDead cert refsOf prog
+    else prog).call n id base args = r
+  by_cases hc : (checkBorrows refsOf prog && checkLiveness prog cert) = true
+  · rw [if_pos hc]
+    have zero : ∀ (q : Pointer), ZeroPtr q → PtrOk (BorrowedIn refsOf prog) [] q :=
+      fun _ hq => Or.inl hq
+    have hbase : SlotsOk (PtrOk (BorrowedIn refsOf prog) []) base :=
+      slotsOk_mono zero (And.left hz)
+    have hargs : ∀ (v : Value), v ∈ args → Value.Ok (PtrOk (BorrowedIn refsOf prog) []) v :=
+      fun v hv => Value.Ok.mono zero v (And.right hz v hv)
+    have hr : (∃ why, prog.call n id base args = Outcome.undefined why) ∨
+        (removeDead cert refsOf prog).call n id base args = prog.call n id base args :=
+      removeDead_call cert refsOf prog (and_true_right hc) (and_true_left hc) n id base args
+        hbase hargs
+    cases hr with
+    | inl undef =>
+      have ⟨why, e⟩ := undef
+      exact absurd (h.symm.trans e) (hu why)
+    | inr same => exact same.trans h
+  · rw [if_neg hc]
+    exact h
+
 /-- One proved rewrite, with what it takes. -/
 inductive Rewrite where
   | removeNops
@@ -130,10 +165,15 @@ inductive Rewrite where
   /-- A store its own block overwrites, removed: proved for calls whose caller hands over
   pointers into frame 0 only. -/
   | removeOverwritten
+  /-- Every store a liveness certificate says is dead, removed (global dead-store
+  elimination): the certificate is per function, per block, per point, the locals live
+  there. Proved for the same calls. -/
+  | removeDead (cert : List (List (List (List Local))))
 
 /-- The rewrite is proved for every call. -/
 def Rewrite.plain : Rewrite → Bool
   | Rewrite.removeOverwritten => false
+  | Rewrite.removeDead _ => false
   | Rewrite.removeNops => true
   | Rewrite.removeStorageMarkers => true
   | Rewrite.constFold => true
@@ -161,6 +201,7 @@ def Rewrite.apply : Rewrite → Program → Program
   | Rewrite.removeDeadBlocks => Opt.removeDeadChecked
   | Rewrite.permute orders => Opt.permuteChecked orders
   | Rewrite.removeOverwritten => Opt.removeOverwrittenChecked
+  | Rewrite.removeDead cert => Opt.removeDeadStoresChecked cert
 
 /-- Each plain rewrite keeps every call that ends, and not in undefined behaviour. -/
 theorem Rewrite.preserves : ∀ (r : Rewrite), r.plain = true → Preserves r.apply
@@ -176,6 +217,7 @@ theorem Rewrite.preserves : ∀ (r : Rewrite), r.plain = true → Preserves r.ap
   | Rewrite.removeDeadBlocks, _ => removeDeadChecked_preserves
   | Rewrite.permute orders, _ => permuteChecked_preserves orders
   | Rewrite.removeOverwritten, h => false_eq_true_elim h
+  | Rewrite.removeDead _, h => false_eq_true_elim h
 
 /-- Every rewrite keeps every such call whose caller hands over pointers into frame 0 only. -/
 theorem Rewrite.preservesWhen (r : Rewrite) : PreservesWhen FrameZero r.apply := by
@@ -184,6 +226,7 @@ theorem Rewrite.preservesWhen (r : Rewrite) : PreservesWhen FrameZero r.apply :=
   | false =>
     cases r with
     | removeOverwritten => exact removeOverwrittenChecked_preserves
+    | removeDead cert => exact removeDeadStoresChecked_preserves cert
     | removeNops => exact false_eq_true_elim hp.symm
     | removeStorageMarkers => exact false_eq_true_elim hp.symm
     | constFold => exact false_eq_true_elim hp.symm

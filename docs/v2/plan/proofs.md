@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-84 theorems: 71 in `lean`, 13 in `lean/analysis`.
+90 theorems: 77 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -598,7 +598,7 @@ theorem validateWith_sound (a b : Program) (w : List Rewrite) (h : validateWith 
     (hu : ∀ (why : Undefined), r ≠ Outcome.undefined why) : b.call n id base args = r
 ```
 
-**`Blaze.Mir.Opt.validateWith_sound_frameZero`** (`Blaze.Mir.Opt.Witness`, `lean`): The same for any script, removeOverwritten among its rewrites, for the calls whose base slots and arguments have pointers into frame 0 only.
+**`Blaze.Mir.Opt.validateWith_sound_frameZero`** (`Blaze.Mir.Opt.Witness`, `lean`): The same for any script, removeOverwritten and removeDead among its rewrites, for the calls whose base slots and arguments have pointers into frame 0 only.
 
 ```lean
 theorem validateWith_sound_frameZero (a b : Program) (w : List Rewrite)
@@ -817,4 +817,84 @@ theorem execStmt_absorb {B : FnId → Local → Prop} {g : List (Nat × FnId)} (
 theorem stmtLive_dead (n : Nat) (before after : List Local) (s : Statement) (l : Local)
     (h : stmtLive n before after s = true) (hl : l < n) (hd : has l before = false) :
     isOverwrite l s = true ∨ (stmtFine l s = true ∧ has l after = false)
+```
+
+**`Blaze.Mir.ret_puts`** (`Blaze.Mir.Opt.PutsTerm`, `lean`): A return through a list of replaced slots: the entries that are the destination's whole slot leave the list, and those of the frame that returned replace nothing.
+
+```lean
+theorem ret_puts (st : State) (c : Frame) (rest : List Frame) (hsk : st.skel = c :: rest)
+    (hpos : ¬ c.id = 0) (hu : ∀ (x : Frame), x ∈ rest → ¬ x.id = c.id) (reps : List Rep)
+    (h0 : ∀ (r : Rep), r ∈ reps → Off r.1 r.2.1 { frame
+```
+
+**`Blaze.Mir.callOn_puts`** (`Blaze.Mir.Opt.PutsTerm`, `lean`): A call through a list of replaced slots: entering a function keeps the list, and an intrinsic's write of its destination forgets the entries that are its whole slot.
+
+```lean
+theorem callOn_puts (sig : FnId → Option FnSig) (reps : List Rep) (st : State)
+    (args : List Value) (dest : Pointer) (target : Option BlockId)
+    (hnext : ∀ (r : Rep), r ∈ reps → ¬ r.1 = st.next)
+    (hargs : ∀ (p : Pointer), Value.ref p ∈ args → ∀ (r : Rep), r ∈ reps → Off r.1 r.2.1 p)
+    (hd : ∀ (r : Rep), r ∈ reps → atPtr dest r = true ∨ Off r.1 r.2.1 dest) :
+    ∀ (callee : Callee),
+      callOn sig (puts st reps) callee args dest target =
+        Outcome.map (Next.map (fun x => puts x (callReps callee dest reps)))
+          (callOn sig st callee args dest target)
+  | Callee.fn id => by
+    simp only [callOn]
+    cases hs : sig id with
+    | none => rfl
+    | some s => exact enter_puts id s args dest target reps st hnext
+  | Callee.intrinsic i =>
+    Outcome.bind_commutes
+      (Intrinsic.eval_same st (puts st reps) i args (fun p m => read_puts reps st p (hargs p m)))
+      (fun v _ =>
+        Outcome.bind_commutes_map (write_puts dest v reps st hd) (fun st1 _ =>
+          jump?_puts (dropAt dest reps) st1 target))
+
+/-! Returns: the running frame goes, and its entries replace nothing. -/
+
+def dropTop : List Frame → List Frame
+  | [] => []
+  | _ :: rest => rest
+
+/-- The state without its running frame. -/
+def State.pop (st : State) : State
+```
+
+**`Blaze.Mir.run_refines_rel`** (`Blaze.Mir.Opt.RemoveOverwritten`, `lean`): When from related states the source's step is undefined or the two programs' steps are related, every run of the target refines the source's run from a related state.
+
+```lean
+theorem run_refines_rel (src tgt : Program) (R : State → State → Prop)
+    (hstep : ∀ (s t : State), R s t →
+      (∃ why, step src s = Outcome.undefined why) ∨ StepRel R (step src s) (step tgt t)) :
+    ∀ (fuel : Nat) (s t : State), R s t → (run tgt fuel t).Refines (run src fuel s)
+```
+
+**`Blaze.Mir.Opt.removeDead_refines`** (`Blaze.Mir.Opt.RemoveDead`, `lean`): Global dead-store elimination under a liveness certificate the check accepts refines the program: every run is the program's, unless the program's is undefined, from every state the borrow invariant holds of whose frames are ordered.
+
+```lean
+theorem removeDead_refines (cert : List (List (List (List Local))))
+    (borrowed : Body → Local → Bool) (prog : Program) (hlive : checkLiveness prog cert = true)
+    (hb : checkBorrows borrowed prog = true) (fuel : Nat) (st : State)
+    (hinv : ∃ g, Borrows (BorrowedIn borrowed prog) g st) (hord : Ordered st.skel) :
+    (run (removeDead cert borrowed prog) fuel st).Refines (run prog fuel st)
+```
+
+**`Blaze.Mir.Opt.removeDead_call`** (`Blaze.Mir.Opt.RemoveDead`, `lean`): Global dead-store elimination refines every call whose base slots and arguments have pointers into frame 0 only.
+
+```lean
+theorem removeDead_call (cert : List (List (List (List Local))))
+    (borrowed : Body → Local → Bool) (prog : Program) (hlive : checkLiveness prog cert = true)
+    (hb : checkBorrows borrowed prog = true) (fuel : Nat) (id : FnId) (base : List Slot)
+    (args : List Value) (hbase : SlotsOk (PtrOk (BorrowedIn borrowed prog) []) base)
+    (hargs : ∀ (v : Value), v ∈ args → Value.Ok (PtrOk (BorrowedIn borrowed prog) []) v) :
+    ((removeDead cert borrowed prog).call fuel id base args).Refines
+      (prog.call fuel id base args)
+```
+
+**`Blaze.Mir.Opt.removeDeadStoresChecked_preserves`** (`Blaze.Mir.Opt.Witness`, `lean`): Global dead-store elimination with its certificate is a rewrite of the witness validator: it keeps every call that ends, and not in undefined behaviour, whose base slots and arguments have pointers into frame 0 only.
+
+```lean
+theorem removeDeadStoresChecked_preserves (cert : List (List (List (List Local)))) :
+    PreservesWhen FrameZero (removeDeadStoresChecked cert)
 ```
