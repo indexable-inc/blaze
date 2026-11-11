@@ -16,9 +16,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 
 1. **no-rustc**: blaze never runs rustc, rustdoc or a cargo that runs them; each place that still does
    is a bug to remove, never to extend. Skill: `compiler-correctness`.
-2. **blaze-builds-blaze**: Build, check, test, bench and release blaze only with blaze, never cargo,
-   rustc or sccache, anywhere (dev loop, CI, harnesses, release); stage 0 is a blaze binary; when
-   blaze fails on blaze, that failure is the work. Skill: `build-and-test`.
+2. **blaze-builds-blaze**: Until blaze builds blaze fast, cargo with the pinned nightly is the dev-loop
+   builder of blaze (check, build, unit tests), and the tree stays accepted by both; blaze still
+   builds blaze as the proof, every verdict about blaze's behaviour comes from a blaze, and when
+   blaze fails on blaze that failure is still the work. Skill: `build-and-test`.
 3. **no-fallback**: No fallback, ever, and failures are loud: when blaze can't do something it stops
    with an error naming what and where; nothing is accepted and ignored, skipped quietly or answered
    with an empty result. Skill: `runtime-code`.
