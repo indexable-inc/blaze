@@ -40,7 +40,8 @@ const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live 
                            | blaze debug hot [--top N] [--last-build] | blaze debug time [--build N] [--by unit|item|wait] [--top N] \
                            [--match TEXT] [--cores [LINES]] [--html FILE] [--trace FILE] \
                            | blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE] \
-                           | blaze debug locks [--build N] [--top N] [--json]";
+                           | blaze debug locks [--build N] [--top N] [--json] \
+                           | blaze debug edits KIND [--file PATH] [--fn NAME[:LINE]] [--runs N] [--json] [-- BUILD ARGS]";
 const EXPLAIN_USAGE: &str =
     "blaze explain RULE | PACKAGE [--json] | memory [BUILD] [limit=N] [--json] | VIEW [NAME=VALUE ...] [--json]";
 const MEMORY_USAGE: &str = "blaze explain memory [BUILD] [limit=N] [--json]";
@@ -130,6 +131,8 @@ pub fn debug(words: Vec<OsString>, color: bool) -> i32 {
         Some("time") => time(words.collect()),
         Some("gate") => gate(words.collect()),
         Some("locks") => locks(words.collect()),
+        // The edit loop as one command (`edits.rs`), which says its own usage and exit code.
+        Some("edits") => return super::edits::main(words.collect(), color),
         _ => Err(Refusal::Usage(DEBUG_USAGE.to_owned())),
     };
     said(result, color)
@@ -838,6 +841,15 @@ fn argument(view: &views::View, key: &str, value: &str) -> Result<Value, Refusal
             .ok_or_else(wrong)?,
         views::ArgType::Text => Value::from(value),
     })
+}
+
+/// `sql`'s rows over the flushed history as JSON lines ([`json`]), for the CLI's commands that
+/// read the profile themselves (`edits.rs`); the error is the reader's, as text.
+pub(super) fn rows_json(sql: &str) -> Result<String, String> {
+    let batches = run(sql).map_err(|refusal| match refusal {
+        Refusal::Usage(what) | Refusal::Failed(what) => what,
+    })?;
+    json(&batches)
 }
 
 /// `sql` over the history in the daemon's state directory, by the DuckDB `duckdb.rs`
