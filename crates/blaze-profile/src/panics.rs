@@ -325,7 +325,8 @@ pub(crate) fn system_thread_name(out: &mut [u8]) -> usize {
 }
 
 /// Where the newest panic raised with `message` (`None` for a payload that is no text) that no
-/// catcher took yet was raised, `<file:line:column> on thread <name>`, taking it: what the plane
+/// catcher took yet was raised, `<file:line:column> on thread <name>`, then the spans the thread
+/// was inside (`, inside `outer` > `inner``, where it was inside any), taking it: what the plane
 /// says of a task's panic it caught. `None` when the ring holds no such panic: one raised past
 /// [`KEPT`] ago, or an unwind no hook saw (the query engine's typed payloads).
 pub fn claim(message: Option<&str>) -> Option<String> {
@@ -340,13 +341,22 @@ pub fn claim(message: Option<&str>) -> Option<String> {
         }
         let location = slot.location.text().unwrap_or_else(|| "an unknown place".to_owned()); // alloc: a panic caught, once
         let thread = slot.thread.text().unwrap_or_default();
+        // The spans the thread was inside as it panicked, outermost first: what it was doing,
+        // which the location alone (a solver's assertion, say) does not tell.
+        let opened = (slot.opened.load(Ordering::Relaxed) as usize).min(OPEN);
+        let mut inside = String::new(); // alloc: none until a span is named; a panic caught, once
+        for name in slot.open[..opened].iter().filter_map(|it| it.text()) {
+            inside.push_str(if inside.is_empty() { ", inside `" } else { " > `" });
+            inside.push_str(&name);
+            inside.push('`');
+        }
         fence(Ordering::Acquire);
         if slot.seq.load(Ordering::Relaxed) != 2 * n + 2 {
             continue;
         }
         // alloc: a panic caught, once
         return Some(format!(
-            "{location} on thread {}",
+            "{location} on thread {}{inside}",
             if thread.is_empty() { "<unnamed>" } else { &thread }
         ));
     }

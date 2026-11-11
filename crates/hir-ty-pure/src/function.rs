@@ -553,9 +553,15 @@ fn params<'db>(
     let db = cx.db;
     let sig =
         db.callable_item_signature(func.into()).instantiate(cx.interner, args).skip_norm_wip();
+    // The signature's binder is instantiated, never skipped: the scan normalizes what it
+    // reaches, and a projection that still names the function's late-bound lifetime
+    // (`<Slice<'a> as Reader>::Offset` in `fn f<'a>(unit: &'a Unit<Slice<'a>>)`) is no goal
+    // the solver takes. Erased, as the bodies the walk reads have them: the scan asks nothing
+    // of a lifetime.
+    let sig = cx.interner.instantiate_bound_regions_with_erased(sig);
     let mut scan =
         Params { cx, def, generic, seen: HashSet::new_in(Global), trouble: None, refuses, found };
-    for input in sig.skip_binder().inputs().iter().copied() {
+    for input in sig.inputs().iter().copied() {
         scan.ty(input, false, false);
         if scan.trouble.is_some() {
             break;
