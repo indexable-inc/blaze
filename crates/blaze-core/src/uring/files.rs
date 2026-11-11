@@ -58,6 +58,9 @@ pub(super) const SIZED: u8 = 1;
 const READING: u8 = 7;
 /// A read of a file no request keeps, waiting for room among [`LOADS`].
 const QUEUED: u8 = 8;
+/// A write at an offset done, its slot being emptied: its completion is told only once the
+/// file is closed ([`Uring::wrote_at`]).
+const CLOSING: u8 = 9;
 
 /// The most reads of files no request keeps that hold a descriptor at once (fewer where the
 /// table, sized to `RLIMIT_NOFILE`, is smaller): a batch of 50 000 opens whose reads wait
@@ -766,6 +769,16 @@ impl Uring {
                 };
                 1
             }
+            (Kind::WriteAt, CLOSING) => {
+                sqes[0] = Sqe {
+                    opcode: OP_CLOSE,
+                    fd: 0,
+                    splice_fd_in: cold.slots[0] as i32 + 1,
+                    user_data: ud(0),
+                    ..Sqe::default()
+                };
+                1
+            }
             (Kind::WriteAt, STATTING) => {
                 sqes[0] = statx(name(0), STATX_DIOALIGN, name(4), ud(0));
                 1
@@ -997,6 +1010,15 @@ impl Uring {
     }
 
     fn wrote_at(&mut self, id: Id, hot: Hot, results: [i32; LINKS]) -> Step {
+        if hot.phase == CLOSING {
+            // Closed (or the close failed, and the request's end empties the slot as any
+            // other's does): only now is the write told. Until here the slot held the file
+            // open for writing, and an exec of it met `ETXTBSY`.
+            if results[0] >= 0 {
+                self.ops.cold_mut(id).opened[0] = false;
+            }
+            return Step::Ends(Some(Done::Written));
+        }
         if hot.phase == STATTING {
             let res = results[0];
             if res < 0 {
@@ -1027,7 +1049,7 @@ impl Uring {
         }
         let len = self.ops.buf(id).len();
         if len == 0 {
-            return Step::Ends(Some(Done::Written));
+            return self.close_written(id);
         }
         let res = results[1];
         if res < 0 {
@@ -1036,10 +1058,29 @@ impl Uring {
         let put = self.progress(id, res);
         self.ops.get_mut(id).expect("in flight").phase = OPENED;
         match (put < len, res) {
-            (false, _) => Step::Ends(Some(Done::Written)),
+            (false, _) => self.close_written(id),
             (true, 0) => Step::Ends(failed(-libc::EIO)),
             (true, _) => Step::Again,
         }
+    }
+
+    /// The write at an offset `id` has written all of its bytes: its slot is emptied through
+    /// the ring before its completion is told ([`CLOSING`]). A file's writer hears `Written`
+    /// only once the driver holds the file open for writing no more, so what it does next
+    /// with the file (a rename onto an executable's path, then a run of it) never meets a
+    /// descriptor of the driver's own: an exec of a file open for writing is `ETXTBSY`. Told
+    /// as the write ended, with the close left to follow, a build script placed from its
+    /// maker's runs (a write a run) was run with slots still open, 3.4 to 4.1 s of retries a
+    /// run (2026-11-10).
+    fn close_written(&mut self, id: Id) -> Step {
+        let hot = self.ops.get_mut(id).expect("in flight");
+        // Counted as a direct write where it was one, which its end reads off the phase.
+        if hot.flags & DIRECT != 0 {
+            self.direct_writes += 1;
+        }
+        let hot = self.ops.get_mut(id).expect("in flight");
+        hot.phase = CLOSING;
+        Step::Again
     }
 
     fn wrote(&mut self, id: Id, hot: Hot, results: [i32; LINKS]) -> Step {
@@ -1467,6 +1508,7 @@ impl Uring {
                 }
             }
             Kind::WriteAt => {
+                // One that reached its close counted itself ([`Uring::close_written`]).
                 self.direct_writes += u64::from(hot.flags & DIRECT != 0 && hot.phase == OPENED);
                 if hot.buffer != ops::NO_BUFFER {
                     self.unbuffer(hot.buffer);
