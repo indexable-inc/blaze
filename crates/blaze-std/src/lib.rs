@@ -97,12 +97,18 @@
     allocator_api,
     allocator_ext,
     blaze_comptime,
+    blaze_verify,
     custom_inner_attributes,
     generic_atomic,
     register_tool
 )]
 #![register_tool(blaze)]
 
+// Contracts (ledger V3; docs/v2/plan/design/contracts.md): bstd's functions state what they
+// promise as native `requires` and `ensures` clauses (`blaze_verify`), checked in the dev and
+// test profiles. The first are on `budget`, `clock`, `kv` and `fs` (std.md, "Contracts");
+// each `ensures` names only its return and by-value arguments, which is what the lowering is
+// known to take.
 extern crate alloc;
 
 pub mod args;

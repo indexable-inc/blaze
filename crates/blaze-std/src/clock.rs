@@ -24,9 +24,13 @@ impl Instant {
 
     /// Time from `earlier` to this; `None` when `earlier` is the later of the two (it was
     /// once zero then, unsaid).
+    ///
+    /// The contract: it answers exactly when `earlier` is not the later one.
     #[blaze::noalloc]
     #[blaze::nonblocking]
-    pub fn since(self, earlier: Instant) -> Option<Duration> {
+    pub fn since(self, earlier: Instant) -> (r: Option<Duration>)
+        ensures r.is_some() == (earlier.0 <= self.0)
+    {
         self.0.checked_sub(earlier.0)
     }
 

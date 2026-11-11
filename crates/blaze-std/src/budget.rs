@@ -60,9 +60,17 @@ impl Budget {
 
     /// `bytes` taken from this budget and from each it is inside, or from none of them: the
     /// first with no room says so.
+    ///
+    /// The contract: a refusal names what was asked, and what it says was used never passes
+    /// the limit it names.
     #[blaze::noalloc]
     #[blaze::nonblocking]
-    pub(crate) fn take(&self, bytes: u64) -> Result<(), Over> {
+    pub(crate) fn take(&self, bytes: u64) -> (r: Result<(), Over>)
+        ensures match &r {
+            Ok(()) => true,
+            Err(over) => over.asked == bytes && over.used <= over.limit,
+        }
+    {
         self.take_here(bytes)?;
         let Some(outer) = &self.outer else { return Ok(()) };
         if let Err(over) = outer.take(bytes) {

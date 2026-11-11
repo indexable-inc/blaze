@@ -997,6 +997,30 @@ uses the `try_` forms (`try_push`, `try_reserve`), which return the error.
 Until S4's runtime ([sys](sys.md), "Runtime"), `alloc`'s global allocator still exists underneath; the `ambient` check treats a use of
 it in a capabilities crate as an effect (`global_alloc`), which replaces the `// alloc:` comment.
 
+### Contracts
+
+bstd's public functions carry `requires` and `ensures` (ledger V3), in the native clause syntax
+([contracts](contracts.md); `#![feature(blaze_verify)]`), checked in the dev and test profiles.
+
+| function | contract | generated test |
+|---|---|---|
+| `budget::Budget::take` | a refusal names what was asked, and its `used` never passes its `limit` | no: a method |
+| `clock::Instant::since` | it answers exactly when `earlier` is not the later | no: a method |
+| `kv::Key::new` | a key is 1 to `KEY_MOST` bytes | no: an associated function |
+| `fs::Dir::quota` | the directory given has at most `bytes` left | no: a method |
+
+Written and not yet stated, because each needs `self` or a borrowed argument in its `ensures`,
+which no test of the lowering shows it takes: `Kv::get` after `put_synced` reads the value put;
+`Blobs::put` returns the BLAKE3 of its bytes and `get` hands back only bytes whose BLAKE3 is the
+id; `Budget::left` is at most the limit; `Clock::after(wait)` is `now + wait`; a `_synced` call
+leaves `device_waits` higher and an `_unsynced` one does not.
+
+What the generator (`#[blaze::contract_test]`) needs before these are run as property tests: it
+refuses methods and associated functions (bstd has almost nothing else), so it needs a receiver
+(drawn, or built by a constructor the type names); a `&Cx` and capabilities, made from
+`Io::sim(seed)` with the seed drawn; `&mut` arguments (`Bytes`); and a `Debug` bound it can do
+without for capabilities. The crate-wide `#![blaze::contract_tests]` is also not built.
+
 ### The page pool: one home for bytes that come from outside
 
 The store's buffer pool (`docs/v2/plan/design/store-pool.md`) is not a store feature. It is how bstd

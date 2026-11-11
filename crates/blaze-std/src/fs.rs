@@ -737,7 +737,14 @@ impl Dir<ReadWrite> {
     /// its bytes, not the hole before them. So the files written through it by appends and
     /// publishes of bytes never hold more than the quota; bytes held on the disk are the
     /// driver's to bound, with an effect blaze-core does not have yet.
-    pub fn quota(&self, bytes: u64) -> Dir<ReadWrite> {
+    ///
+    /// The contract: the directory it gives has at most `bytes` left, whatever it is inside.
+    pub fn quota(&self, bytes: u64) -> (r: Dir<ReadWrite>)
+        ensures match r.quota_left() {
+            Some(left) => left <= bytes,
+            None => false,
+        }
+    {
         // clone: authority held, narrowed: a refcount each, the budget this one is inside too.
         let quota = Some(Budget::new(bytes, self.quota.clone()));
         Dir { io: self.io.clone(), base: self.base.clone(), quota, rights: PhantomData }

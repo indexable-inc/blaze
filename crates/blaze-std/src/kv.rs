@@ -107,7 +107,15 @@ pub const fn refused(raw: &str) -> Option<KeyWhy> {
 }
 
 impl Key {
-    pub fn new(raw: &str) -> Result<Key, KeyError> {
+    /// `raw` as a key, or why it is none.
+    ///
+    /// The contract: a key is 1 to [`KEY_MOST`] bytes.
+    pub fn new(raw: &str) -> (r: Result<Key, KeyError>)
+        ensures match &r {
+            Ok(key) => !key.as_str().is_empty() && key.as_str().len() <= KEY_MOST,
+            Err(_) => true,
+        }
+    {
         if let Some(why) = refused(raw) {
             // alloc: an error's message.
             return Err(KeyError { key: raw.to_owned(), why });
