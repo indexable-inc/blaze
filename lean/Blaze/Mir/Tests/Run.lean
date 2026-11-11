@@ -593,4 +593,14 @@ example : Opt.validateWith constantSimplified oneBlock [] = false := by decide
 
 example : isInt ScalarTy.U32 4 (oneBlock.call 1 0 [] []) = true := by decide
 
+/-- A script with `removeOverwritten` in it: the store to local 1 that its block overwrites
+goes, then the `nop`s. -/
+example :
+    Opt.validateWith (storeTwice false)
+        (Opt.removeNops (Opt.removeOverwritten Opt.refsOf (storeTwice false)))
+        [Opt.Rewrite.removeOverwritten, Opt.Rewrite.removeNops] = true := by
+  decide
+
+example : Opt.allPlain cfgScript = true := by decide
+
 end Blaze.Mir.Tests

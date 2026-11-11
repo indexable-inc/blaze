@@ -723,7 +723,7 @@ programs; it is the specification of the Rust pass of the same name.
   programs have one normal form under the proved rewrites; `validate_sound`: an accepted
   pair runs alike for every fuel and state. It takes no witness and accepts only what the
   normal form identifies.
-- **A validator that takes a witness** (`Opt/Witness.lean`; not yet elaborated). The witness
+- **A validator that takes a witness** (`Opt/Witness.lean`; checked at 7e339a7395, `removeOverwritten` as a rewrite after it). The witness
   is a script: the proved rewrites, in order, that take the program before a pass to the
   program after it (`Rewrite`: the block-local passes, `switchToGoto`, both threadings,
   merging, dead-block removal, a block permutation with its orders as data).
@@ -732,6 +732,9 @@ programs; it is the specification of the Rust pass of the same name.
   in undefined behaviour, the same outcome with the same fuel. The Rust pass is then not
   trusted and need not be a fixed specification block for block: a script that reproduces
   its output is the evidence, and the pass can say which rewrites it applied.
+  `removeOverwritten` is a rewrite too, proved for the calls whose caller hands over
+  pointers into frame 0 only (`FrameZero`): `validateWith_sound` is for scripts without it
+  (`allPlain`), `validateWith_sound_frameZero` for any script and those calls.
   **Not written: the validator by symbolic execution**, which needs no script and accepts
   rewrites nobody proved one by one (copy propagation, local renumbering, reordering of
   independent statements). It needs an expression language whose evaluation is proved to

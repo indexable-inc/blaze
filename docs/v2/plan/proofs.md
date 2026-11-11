@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-74 theorems: 61 in `lean`, 13 in `lean/analysis`.
+75 theorems: 62 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -589,11 +589,21 @@ theorem removeOverwritten_call (borrowed : Body → Local → Bool) (prog : Prog
       (prog.call fuel id base args)
 ```
 
-**`Blaze.Mir.Opt.validateWith_sound`** (`Blaze.Mir.Opt.Witness`, `lean`): The witness validator is sound: when a script of proved rewrites takes one program to another, every call that ends, and not in undefined behaviour, gives the same outcome with the same fuel.
+**`Blaze.Mir.Opt.validateWith_sound`** (`Blaze.Mir.Opt.Witness`, `lean`): The witness validator is sound: when a script of rewrites proved for every call takes one program to another, every call that ends, and not in undefined behaviour, gives the same outcome with the same fuel.
 
 ```lean
 theorem validateWith_sound (a b : Program) (w : List Rewrite) (h : validateWith a b w = true)
-    (n : Nat) (id : FnId) (base : List Slot) (args : List Value) (r : Outcome Value)
+    (hp : allPlain w = true) (n : Nat) (id : FnId) (base : List Slot) (args : List Value)
+    (r : Outcome Value) (hr : a.call n id base args = r) (hd : r ≠ Outcome.diverge)
+    (hu : ∀ (why : Undefined), r ≠ Outcome.undefined why) : b.call n id base args = r
+```
+
+**`Blaze.Mir.Opt.validateWith_sound_frameZero`** (`Blaze.Mir.Opt.Witness`, `lean`): The same for any script, removeOverwritten among its rewrites, for the calls whose base slots and arguments have pointers into frame 0 only.
+
+```lean
+theorem validateWith_sound_frameZero (a b : Program) (w : List Rewrite)
+    (h : validateWith a b w = true) (n : Nat) (id : FnId) (base : List Slot)
+    (args : List Value) (hz : FrameZero base args) (r : Outcome Value)
     (hr : a.call n id base args = r) (hd : r ≠ Outcome.diverge)
     (hu : ∀ (why : Undefined), r ≠ Outcome.undefined why) : b.call n id base args = r
 ```
