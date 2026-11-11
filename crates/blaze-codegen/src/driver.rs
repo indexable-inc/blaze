@@ -2700,7 +2700,9 @@ impl<'a, B: Prepare> Build<'a, B> {
                 fresh = tracing::field::Empty,
                 whole = tracing::field::Empty,
                 asked = tracing::field::Empty,
-                groups = tracing::field::Empty,
+                named = tracing::field::Empty,
+                held = tracing::field::Empty,
+                each_build = tracing::field::Empty,
                 graph = tracing::field::Empty,
                 claims = tracing::field::Empty,
                 classified = tracing::field::Empty,
@@ -2716,7 +2718,9 @@ impl<'a, B: Prepare> Build<'a, B> {
             let walked = match patched {
                 Ok(patch::Patched { nodes, statics, roots, walk, keep, touched, work }) => {
                     span.record("asked", work.asked);
-                    span.record("groups", work.groups);
+                    span.record("named", work.named);
+                    span.record("held", work.held);
+                    span.record("each_build", work.each_build);
                     span.record("graph", work.graph);
                     span.record("claims", work.claims);
                     span.record("classified", work.classified);
@@ -2726,8 +2730,9 @@ impl<'a, B: Prepare> Build<'a, B> {
                     span.record(
                         "function",
                         tracing::field::display(format_args!(
-                            "patched: asked {} functions and statics of {} groups, described {}",
-                            work.asked, work.groups, work.described
+                            "patched: asked {} functions and statics ({} each build, {} of {} \
+                             named changed), described {}",
+                            work.asked, work.each_build, work.held, work.named, work.described
                         )),
                     );
                     (nodes, statics, roots, walk, Some(keep), Some((touched, work)))

@@ -204,6 +204,24 @@ pub struct Counted {
     pub heads_own_path: bool,
 }
 
+/// What a front end says may have changed since a view of it ([`Frontend::changed_since`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Changed<I, S> {
+    /// Everything whose answer may be another, in the front end's own order (the walk sorts
+    /// what it asks by its own items, so the order decides nothing); one may be named twice.
+    Named {
+        /// Functions whose describe may be another, each with whose code asks for it.
+        functions: Vec<(I, Origin)>,
+        /// Instances whose count ([`Frontend::counted`]) may be another: a count is of the
+        /// instance, whoever asks for it, so the walk asks of each function it holds of one.
+        counted: Vec<I>,
+        /// Statics whose describe may be another.
+        statics: Vec<S>,
+    },
+    /// The front end cannot name them, and why: the walk asks of everything it holds.
+    Unknown(String),
+}
+
 /// The front end of a build: which instances there are and what they refer to.
 pub trait Frontend: Sync {
     /// A function instance, as the front end holds it. Never hashed: its content is
@@ -269,57 +287,48 @@ pub trait Frontend: Sync {
         self.describe(instance, requester).map(Some)
     }
 
-    /// Whether what this front end says of `instance` for `requester` ([`Self::describe`],
-    /// [`Self::counted`]) was made of durable inputs alone: ones whose every write moves
-    /// [`Self::durable_view`]. Asked after a describe of it in this build. `true` promises
-    /// that for as long as the durable view is the same, a describe and a count give what
-    /// they gave, so the driver asks nothing of it. The default is `false`: asked each build.
-    fn durable(&self, instance: &Self::Instance, requester: &Origin) -> bool {
-        let _ = (instance, requester);
-        false
-    }
-
-    /// A number that is another after any write of an input a durable describe may read
+    /// A number that is another after any write of an input a library's describe may read
     /// (a library's source, a frozen table); `None` for a front end that tells none, whose
-    /// walk is then never patched.
+    /// walk is then never patched. A kept walk is patched only while it is the same.
     fn durable_view(&self) -> Option<u64> {
         None
     }
 
     /// The front end's view: a number that is another after any write of any input, and that
-    /// [`Self::written_since`] is asked against; `None` for a front end that tells none,
-    /// whose every function that is not durable is asked again each build. Read once a
-    /// build, before any describe.
+    /// [`Self::changed_since`] is asked from; `None` for a front end that tells none, whose
+    /// every function and static is asked again each build. Read once a build, before any
+    /// describe.
     fn view(&self) -> Option<u64> {
         None
     }
 
-    /// Brings the front end's query engine up to its view before a patched walk asks: the
-    /// engine walks from what was written to the memos that changed (its changed set), so
-    /// each describe and count asked afterwards that the writes did not reach answers with
-    /// no verification of what it read. Gives the rows the engine visited, the reverse edges
-    /// it followed and the nodes that changed, for the walk's span; `None` (the default) for
-    /// a front end with no such engine, whose asks cost what they cost.
-    fn settle(&self) -> Option<(u64, u64, u64)> {
-        None
+    /// What this front end says may be other than it was when its view was `view`
+    /// ([`Self::view`], as a build read it before its walk): the functions whose describe
+    /// may be, the instances whose count may be, the statics whose describe may be
+    /// ([`Changed`]). A patched walk asks again only what it holds of these, and what is
+    /// asked each build ([`Self::each_build`]). It may name more than changed (each costs
+    /// one ask) and what the walk never held (ignored); it never leaves out one whose answer
+    /// is another, but for those asked each build. A front end that cannot say gives
+    /// [`Changed::Unknown`] with why, and the walk asks of everything it holds: the default.
+    fn changed_since(&self, view: u64) -> Changed<Self::Instance, Self::Static> {
+        let _ = view;
+        // alloc: once a build, of a front end with no query engine
+        Changed::Unknown("the front end names no changed set".to_owned())
     }
 
-    /// The group of inputs a describe and a count of `instance` for `requester` hang on
-    /// beside durable ones, where the front end can name one whose writes it tells
-    /// ([`Self::written_since`]): a workspace crate's sources, say. Asked after a describe of
-    /// it in this build, with [`Self::durable`]. `Some` promises that while no input of the
-    /// group is written and the durable view is the same, a describe and a count give what
-    /// they gave, so a build after a write to another group asks nothing of it. The default
-    /// is `None`: asked each build.
-    fn group(&self, instance: &Self::Instance, requester: &Origin) -> Option<u64> {
+    /// Whether the describe of `instance` for `requester` reads what [`Self::changed_since`]
+    /// does not cover (what the build calls a file its body names, say), so a patched walk
+    /// asks of it each build. Asked after a describe of it in this build, and again whenever
+    /// the walk asks of it. `false` promises that a describe of it is another only when
+    /// [`Self::changed_since`] names it. The default is `true`.
+    fn each_build(&self, instance: &Self::Instance, requester: &Origin) -> bool {
         let _ = (instance, requester);
-        None
+        true
     }
 
-    /// Whether an input of `group` ([`Self::group`]) was written since the front end's view
-    /// was `view` ([`Self::view`]). Exact, or `true`: the default, which asks.
-    fn written_since(&self, group: u64, view: u64) -> bool {
-        let _ = (group, view);
+    /// [`Self::each_build`] of the static `value`.
+    fn static_each_build(&self, value: &Self::Static) -> bool {
+        let _ = value;
         true
     }
 

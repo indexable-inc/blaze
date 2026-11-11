@@ -183,12 +183,22 @@ pub struct Walk {
 /// whole, which counts nothing: its work is the program's.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Work {
-    /// Functions and statics the front end was asked of again.
+    /// Functions and statics the front end was asked of again: those asked each build and
+    /// those the front end named that the walk holds, each once; every one the walk holds
+    /// when the front end named no changed set.
     pub asked: usize,
-    /// Groups of inputs the front end was asked whether written ([`Frontend::group`]).
+    /// Functions, counted instances and statics the front end named as changed
+    /// ([`Frontend::changed_since`]): 0 when it named no set. A regression of the front
+    /// end's changed set shows here: growing with the program where the edit did not.
     ///
-    /// [`Frontend::group`]: crate::backend::Frontend::group
-    pub groups: usize,
+    /// [`Frontend::changed_since`]: crate::backend::Frontend::changed_since
+    pub named: usize,
+    /// Functions and statics of the walk that those names are of, each once.
+    pub held: usize,
+    /// Functions and statics asked each build ([`Frontend::each_build`]).
+    ///
+    /// [`Frontend::each_build`]: crate::backend::Frontend::each_build
+    pub each_build: usize,
     /// Describes taken anew: of kept functions and statics that changed, and of new ones.
     pub described: usize,
     /// Items the reachability graph looked at: entered, dropped or brought back.

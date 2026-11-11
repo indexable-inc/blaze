@@ -28,20 +28,27 @@ as one origin's code asks for it, a static) with its describe, key and count; th
 what each refers to with two sets over it (`support.rs`: `ALL`, what the check's roots and
 the build's reach; `BUILT`, what the build's own roots reach); the nodes and statics in
 `rows::Rows`, a sorted map in 64-entry chunks shared by reference count, so a change copies
-one chunk; and when each function is asked again.
+one chunk; and what finds an item from the front end's name of it (by instance and
+requester, by instance, by static) with the lists of those asked each build.
 
 ## Finding the changed set
 
-A function is asked again (`redescribe` and `counted`, on all cores) by what its inputs are:
-never while the durable view is the same (`Frontend::durable`); when an input of its group
-was written since the kept view (`Frontend::group`, `written_since`, `view`); else each build.
-Statics are asked each build. blaze-query has no reverse index from written fields to rows,
-and a row's Bloom summary is all ones once it reads a crate's name resolution, so the engine
-cannot name the changed memos; it gained `plumbing::input_written_since::<I>(storage, id,
-view)` (a load per field, exact or `true` after renumbering) for a front end to tell a
-group's writes by. **`HirFrontend` does not implement `group` yet**
-(crates/hir-ty-codegen/v2/frontend.rs, beside `durable`): until it does, every function that
-is not durable is asked each build.
+The codegen walk starts from the set the front end names (written 2026-11-11, unbuilt and
+untested). `patched` asks `Frontend::changed_since(view)` with the view the kept walk was
+made in (`Walked::seen`) and gets the functions (instance and requester) whose describe, the
+instances whose count and the statics whose describe may be another, or `Unknown` with why.
+It asks again (`redescribe` and `counted`, on all cores) only the items it holds of those,
+each found by a lookup (`Keep::functions`, `instances`, `values`), and the items asked each
+build (`Frontend::each_build`, `static_each_build`): those whose describe reads beside the
+database, a body or a static's value that names a file. A name the walk holds no item of is
+ignored. `Unknown` (a front end with no engine, a view from before the engine's log, a walk
+kept with no view) asks of everything the walk holds, and the `ask functions` span says why.
+`HirFrontend` answers from `described_memo::changed_since`, `counted_memo::changed_since`
+and `described_static_memo::changed_since`, each key read back by the query's `arguments`
+(crates/hir-ty-codegen/v2/frontend.rs). `Frontend::durable`, `group`, `written_since`,
+`settle` and the walk's `Hangs` are gone; the durable view is still compared, and another
+one walks whole. `Work` counts `asked`, `named` (what the front end named), `held` (what
+the walk holds of it) and `each_build`.
 
 ### The changed set from the engine (2026-11-11; written, unbuilt and untested)
 
@@ -83,8 +90,8 @@ What is built (crates/blaze-query/src/db/reverse.rs, the core, and frontier.rs, 
 4. **What a walk leaves**: every row made before it is verified in its view or unchanged.
    So until the next write, a pull of a row not verified in the view marks it with no look
    at its edges (`frontier::clean`): a host's pass over everything it holds costs a few
-   loads a row. This is what the codegen walk (`Frontend::settle`, before it asks) and the
-   body check (`Plan::new`) use today: both still visit every item, at that cost.
+   loads a row. This is what the body check (`Plan::new`) uses today: it still visits
+   every item, at that cost. The codegen walk asks only what item 5 names.
 5. **Naming**: `plumbing::changed_since::<F>(db, view) -> Changed<F::Key>` and each tracked
    query's generated `changed_since` (IDs): the keys of `F` whose value changed since
    `view`, from a log of the last 256 walks (2^20 nodes), or `Unknown` naming why (asked
@@ -119,9 +126,10 @@ a rerun's new edges not folded, a changed reader that does not pass the walk on,
 not applied, an evicted row passed over. Not in the simulation: cycles, tracked fields,
 two tasks at once, and a verification that unwinds.
 
-Next. The hosts start from the named set instead of visiting every item: `patched` asks
-`described_memo::changed_since` and `counted_memo::changed_since` (and the statics') and
-the functions whose describe names a file, `Hangs` and `group` go, and the body check
+Next. The codegen walk starts from the named set ("Finding the changed set"); its
+refinement and controls are in `driver/tests/kept.rs` (a changed function the set does not
+name, a function asked each build that is not asked, the asks of one edit among 100 and
+10,000 functions). The body check is to do the same: it
 posts a task only for the bodies and modules of `body_check_clean::changed_since`, which
 needs the plan to keep its last answers between builds. The refinements of
 `driver/tests/kept.rs` already hold a patched walk to the whole walk's.
@@ -196,11 +204,12 @@ hir-ty-codegen index and slice: they are copied from the rows each build (`Work:
 
 ## Cost after an edit
 
-N functions, C changed or new, D their referrers, G groups, L functions asked each build.
+N functions, C changed or new, D their referrers, L functions and statics asked each build
+(those that name a file), M what the front end names as changed.
 
 | Pass | Cost | Still linear because |
 |---|---|---|
-| asking | O(L + G + statics) asks of a few loads each after the engine's walk, on all cores; the walk itself O(rows the edit reaches) | the hosts do not start from the named set yet |
+| asking | O(L + M) asks on all cores, each name a lookup; the engine's walk itself O(rows the edit reaches); O(N) when the front end names no set (`Unknown`) | |
 | describes | O(C) | |
 | graph, slots, places, built-in, symbols, owners | O(C + D) | |
 | recursion limit | O(C), or O(N + edges) array steps when a body has more instances than the least limit | rustc's claim order is one depth-first walk; its state at the first changed claim is not kept |
