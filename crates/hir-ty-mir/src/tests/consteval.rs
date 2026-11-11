@@ -33,6 +33,7 @@ mod const_traits;
 mod deps;
 mod intrinsics;
 mod memo;
+mod records;
 mod trivial;
 mod word;
 
