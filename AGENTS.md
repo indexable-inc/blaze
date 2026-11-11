@@ -93,8 +93,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     deterministic CBOR. Skill: `docs-and-scripts`.
 34. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run on the Mac or in an ix VM, never
     on AWS. Skill: `build-and-test`.
-35. **fan-out-write-only**: Subagents only write code; the main agent applies all of it to one tree and
-    runs `blaze check` and `blaze test` once. Skill: `build-and-test`.
+35. **fan-out-write-only**: A lane with its own ix VM builds, checks and tests its own work there; a
+    lane without one only writes. The main agent keeps the merges to main, the measurements claims
+    rest on, persisted-state and bootstrap changes, and one check of the exact tip before anything
+    lands. Skill: `build-and-test`.
 36. **worktree-per-lane**: One uniquely named worktree per lane; never `git stash`. Skill:
     `build-and-test`.
 37. **land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`;
