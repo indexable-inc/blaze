@@ -1475,7 +1475,13 @@ impl Sim {
             return;
         }
         let sim = self.files.get_mut(file).expect("looked up above");
-        sim.ops.extend(landed);
+        // Each landed sector waits for a sync as a write from memory does: a crash before
+        // one keeps it whole or not at all (`Op::Sectors`), never a prefix of it, which an
+        // `Op::At` cut short would leave.
+        sim.ops.extend(landed.into_iter().map(|op| match op {
+            Op::At(at, sector) => Op::Sectors(at, sector),
+            op => op,
+        }));
         self.changed(file);
     }
 
@@ -3464,11 +3470,18 @@ mod tests {
 
     /// A crash keeps each sector of a write from memory that was not synced whole or not at
     /// all, never a part of one, on every seed; across seeds it keeps none, all, and some.
+    ///
+    /// A crash keeps each of the write's eight sectors or not by a coin of the seed's, so one
+    /// that keeps none of them is one seed in a few hundred: over 200 seeds whether one
+    /// turned up hung on which numbers the simulation had drawn before the crash, and any
+    /// change to what it draws (a completion shuffled, a span scribbled) failed this test
+    /// with nothing wrong. Over 4000 seeds none fails to turn up once in a hundred thousand
+    /// such changes.
     #[test]
     fn a_crash_tears_a_write_from_memory_by_sectors() {
         let file = name("pool/pack-1");
         let (mut none, mut all, mut some) = (false, false, false);
-        for seed in 0..200 {
+        for seed in 0..4000 {
             let mut sim = Sim::new(seed, Faults::default());
             let mut memory = memory(4096);
             memory.fill(0, 4096, b'x');
