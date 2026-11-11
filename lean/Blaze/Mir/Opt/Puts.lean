@@ -32,6 +32,12 @@ theorem Outcome.map_map {α β γ : Type} (f : α → β) (g : β → γ) :
   | Outcome.undefined _ => rfl
   | Outcome.diverge => rfl
 
+theorem Outcome.map_same {α : Type} : ∀ (x : Outcome α), Outcome.map (fun a => a) x = x
+  | Outcome.ok _ => rfl
+  | Outcome.panic _ => rfl
+  | Outcome.undefined _ => rfl
+  | Outcome.diverge => rfl
+
 /-- The entry can be carried through the statement `s` run by the frame `top`: its slot
 holds a value the invariant allows, no allowed pointer is into it, and it is of another
 frame or of a local `s` does not mention. -/
@@ -74,12 +80,7 @@ theorem execStmt_puts {B : FnId → Local → Prop} {g : List (Nat × FnId)} (ad
       (∀ (r : Rep), r ∈ reps → RepOk B g st.top s r) →
         execStmt adts (puts st reps) s =
           Outcome.map (fun x => puts x reps) (execStmt adts st s)
-  | [], st, _, _, _ => by
-    cases execStmt adts st s with
-    | ok st' => rfl
-    | panic e => rfl
-    | undefined why => rfl
-    | diverge => rfl
+  | [], st, _, _, _ => (Outcome.map_same (execStmt adts st s)).symm
   | r :: rest, st, hs, hfn, hreps => by
     have hr : RepOk B g st.top s r := hreps r (List.mem_cons.mpr (Or.inl rfl))
     have single : execStmt adts (st.put r.1 r.2.1 r.2.2) s =
