@@ -34,6 +34,8 @@ use super::{
     say,
 };
 
+mod script;
+
 const EXPLORE_USAGE: &str = "blaze explore [--dev] [--print]: the explorer's link, opened in the browser (`--print`: printed only; \
                              `--dev`: the page's development server, http://localhost:5173, may connect too)";
 const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live | blaze debug sql [--json] QUERY \
@@ -713,6 +715,9 @@ fn explained(words: Vec<OsString>) -> Result<(), Refusal> {
     }
     if name == "memory" {
         return memory(words);
+    }
+    if name == "script" {
+        return script::explain(words);
     }
     if !views::VIEWS.iter().any(|it| it.name == name)
         && let Some(report) = failure_of(&name)?

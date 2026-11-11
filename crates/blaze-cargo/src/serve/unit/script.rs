@@ -2015,6 +2015,9 @@ impl ScriptRun {
                     disk,
                     |exit| script::cargo_rule(unit, env, exit),
                     |traced| {
+                        // What the run read and who read it, as events of the build's
+                        // profile, before its key takes anything out of the trace.
+                        said::run(unit, traced);
                         checked = pure::check(&job, run_unit, unit, traced);
                         script::keyed(prepared, traced)
                     },
@@ -2179,6 +2182,7 @@ impl ScriptRun {
 }
 
 pub(crate) mod pure;
+mod said;
 
 #[cfg(test)]
 mod tests;

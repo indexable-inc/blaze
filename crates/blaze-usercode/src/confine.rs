@@ -353,6 +353,12 @@ impl Confine for Launcher {
     }
 
     fn traced(&self, command: &Command, scratch: &Path) -> Result<Traced, String> {
+        // Who made the calls the run can't be traced for, and the programs it started, as its
+        // sandbox described them: the program's last run's from here on (`crate::calls`),
+        // read now, before the scratch directory goes with the run.
+        let calls = crate::calls::read(scratch)
+            .map_err(|why| format!("{}: its sandbox's calls: {why}", command.program.display()))?; // alloc: error path
+        crate::calls::left(&command.program, calls);
         match Launcher::report(scratch)? {
             Report::NotMade(why) => {
                 Err(format!("{}: no sandbox could be made: {why}", command.program.display())) // alloc: error path

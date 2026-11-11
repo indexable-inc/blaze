@@ -689,6 +689,11 @@ fn run_in(
     if let (Some(live), Some(why)) = (also.live, recorder.live_failed()) {
         live.failed(why);
     }
+    if let Some(live) = also.live {
+        // Who made the calls the run can't be traced for, for the launcher to leave beside its
+        // report ([`blaze_usercode::calls`]).
+        live.calls.borrow_mut().extend(recorder.take_calls());
+    }
     Ok(ended(status))
 }
 
@@ -2497,10 +2502,12 @@ fn noted(
             return None;
         }
         Does::Random => {
+            describe(notif, "random", None, process, recorder, &mut scratch.procs);
             recorder.random();
             return None;
         }
         Does::Clock(_) => {
+            describe(notif, "clock", None, process, recorder, &mut scratch.procs);
             recorder.untraceable(thread, Untraceable::Clock);
             return None;
         }
@@ -2533,6 +2540,7 @@ fn noted(
         // With the network every address is the machine's, the loopback too: what comes back
         // is not traced.
         Some(Address::Ip { .. }) if watch.network => {
+            describe(notif, "network", None, process, recorder, &mut scratch.procs);
             recorder.untraceable(thread, Untraceable::Network)
         }
         // Confined, the loopback is the machine's, and every address a call reaches is refused
@@ -2593,6 +2601,12 @@ fn noted(
             if scratch.raw.starts_with(MARK.as_bytes()) {
                 watch.forked(recorder, thread, process, &mut scratch.procs);
             }
+            if scratch.raw == super::CLOCK_MARK.as_bytes() {
+                // The sandbox's library says a clock read that made no system call: the call
+                // seen is its lookup of the marker, and the process is the one that read.
+                let said = "a clock read through the vDSO, which makes no system call: said by the sandbox's library's lookup of its marker";
+                describe(notif, "clock", Some(said), process, recorder, &mut scratch.procs);
+            }
             if recorder.marked(thread, process, &scratch.raw) {
                 continue;
             }
@@ -2621,9 +2635,11 @@ fn noted(
             Does::Look | Does::Access(_) => recorder.looked(thread, path),
             Does::Run => {
                 recorder.read(thread, path);
-                ran(recorder, pid, thread, process, path, &mut scratch.inside);
+                let (room, procs) = (&mut scratch.inside, &mut scratch.procs);
+                ran(recorder, notif, thread, process, path, room, procs);
             }
             Does::Open(_) | Does::Change if path == "/dev/random" || path == "/dev/urandom" => {
+                describe(notif, "random", None, process, recorder, &mut scratch.procs);
                 recorder.random()
             }
             _ => recorder.read(thread, path),
@@ -2638,12 +2654,14 @@ fn noted(
 /// whose scope it can't be told to keep: the process is in none from then on.
 fn ran(
     recorder: &mut Recorder,
-    pid: u32,
+    notif: &Notif,
     thread: u64,
     process: u64,
     path: &str,
     room: &mut Vec<u8>,
+    procs: &mut Procs,
 ) {
+    let pid = notif.pid;
     inside(room, pid, path);
     room.push(0);
     let runnable = CStr::from_bytes_with_nul(room).ok().and_then(|it| raw::stat(it, true));
@@ -2651,6 +2669,14 @@ fn ran(
         .is_some_and(|it| it.st_mode & libc::S_IFMT == libc::S_IFREG && it.st_mode & 0o111 != 0);
     if !runnable {
         return;
+    }
+    // The program started, by the process as it is before the new image replaces it: what
+    // `blaze explain script` lists as the run's children.
+    if recorder.describes_exec() {
+        let mut made = caller(notif, blaze_usercode::calls::EXEC, None, process, recorder, procs);
+        // alloc: once a program started that is described.
+        made.program = path.to_owned();
+        recorder.described(made);
     }
     let elsewhere = thread != process && recorder.scope_of(thread) != recorder.scope_of(process);
     let scope = match elsewhere {
@@ -2661,6 +2687,144 @@ fn ran(
         false => recorder.scope_of(thread),
     };
     recorder.runs(process, path, scope);
+}
+
+/// Describes the process that made the call `notif`, which got `what` (`random`, `clock`,
+/// `network`), once a process and kind and within the run's bound ([`Recorder::describes`]):
+/// what a refusal of the run names beside the effect, and what `blaze explain script` lists.
+/// `said` names the call where the system call seen is not the read itself.
+fn describe(
+    notif: &Notif,
+    what: &str,
+    said: Option<&str>,
+    process: u64,
+    recorder: &mut Recorder,
+    procs: &mut Procs,
+) {
+    if recorder.describes(process, what) {
+        let made = caller(notif, what, said, process, recorder, procs);
+        recorder.described(made);
+    }
+}
+
+/// The process `process` as it is now, held in the call `notif` (the kernel answers it only
+/// after this returns, so its maps and its program are the ones the call came from): its
+/// program, `argv[0]` and id inside the sandbox by `/proc`, and where its instruction pointer
+/// is by its maps. Four reads of `/proc`, asked once a process and kind of call. What can't
+/// be read (the process was killed meanwhile) is left empty, which is said as not known.
+fn caller(
+    notif: &Notif,
+    what: &str,
+    said: Option<&str>,
+    process: u64,
+    recorder: &Recorder,
+    procs: &mut Procs,
+) -> blaze_usercode::calls::Made {
+    use blaze_usercode::calls::{self, Made, Module, Phase};
+    let mut name = [0u8; 64];
+    let program = proc_path(&mut name, format_args!("/proc/{process}/exe"))
+        .and_then(|it| link_text(it, &mut procs.file))
+        .unwrap_or_default();
+    let argv0 = match proc_path(&mut name, format_args!("/proc/{process}/cmdline")) {
+        Some(path) if read_file(path, &mut procs.file) => calls::argv0(&procs.file),
+        _ => String::new(), // alloc: none, empty
+    };
+    let inside_pid = match proc_path(&mut name, format_args!("/proc/{process}/status")) {
+        Some(path) if read_file(path, &mut procs.file) => {
+            std::str::from_utf8(&procs.file).ok().and_then(calls::inside_pid)
+        }
+        _ => None,
+    };
+    let ip = notif.instruction_pointer;
+    let placed = match proc_path(&mut name, format_args!("/proc/{process}/maps")) {
+        Some(path) if read_file(path, &mut procs.file) => {
+            std::str::from_utf8(&procs.file).ok().and_then(|maps| calls::module_at(maps, ip))
+        }
+        _ => None,
+    };
+    let (module, kind) = match placed {
+        // alloc: once a call described, its module's path.
+        Some(path) => (path.to_owned(), Module::of_mapping(path, &program)),
+        None => (String::new(), Module::NotKnown), // alloc: none, empty
+    };
+    // A heuristic, as `Phase` says: the loader's own calls come before `main`, and so does
+    // any call of a process whose loader has not yet loaded the sandbox's library.
+    let phase = match (kind, recorder.loading(process)) {
+        (Module::Loader, _) => Phase::Loader,
+        (_, Some(true)) => Phase::Loading,
+        (_, Some(false)) => Phase::Loaded,
+        (_, None) => Phase::NotKnown,
+    };
+    Made {
+        what: what.to_owned(), // alloc: once a call described
+        pid: u32::try_from(process).unwrap_or(notif.pid),
+        inside_pid,
+        program,
+        argv0,
+        // alloc: once a call described
+        syscall: said.map_or_else(|| call_name(notif.nr), str::to_owned),
+        number: i64::from(notif.nr),
+        phase,
+        ip,
+        module,
+        kind,
+    }
+}
+
+/// The link of `/proc` at `path`, as text; `None` when it can't be read or is longer than a
+/// path may be.
+fn link_text(path: &CStr, room: &mut Vec<u8>) -> Option<String> {
+    room.clear();
+    room.reserve(libc::PATH_MAX as usize);
+    let read = raw::readlink_into(path, room);
+    // alloc: once a call described, its program's path.
+    (read >= 0 && (read as usize) < room.capacity())
+        .then(|| String::from_utf8_lossy(room).into_owned())
+}
+
+/// The names of the system calls a described call can be ([`describe`]): those of [`CALLS`]
+/// that read what can't be traced, start a program, or carry the sandbox's library's marker.
+#[cfg(target_arch = "x86_64")]
+const CALL_NAMES: &[(i32, &str)] = &[
+    (2, "open"),
+    (21, "access"),
+    (42, "connect"),
+    (44, "sendto"),
+    (46, "sendmsg"),
+    (59, "execve"),
+    (96, "gettimeofday"),
+    (201, "time"),
+    (228, "clock_gettime"),
+    (257, "openat"),
+    (269, "faccessat"),
+    (318, "getrandom"),
+    (322, "execveat"),
+    (437, "openat2"),
+    (439, "faccessat2"),
+];
+#[cfg(target_arch = "aarch64")]
+const CALL_NAMES: &[(i32, &str)] = &[
+    (48, "faccessat"),
+    (56, "openat"),
+    (113, "clock_gettime"),
+    (169, "gettimeofday"),
+    (203, "connect"),
+    (206, "sendto"),
+    (211, "sendmsg"),
+    (221, "execve"),
+    (278, "getrandom"),
+    (281, "execveat"),
+    (437, "openat2"),
+    (439, "faccessat2"),
+];
+
+/// The system call numbered `nr` by name, or `system call N` for one [`CALL_NAMES`] lacks:
+/// its number is said beside it either way.
+fn call_name(nr: i32) -> String {
+    match CALL_NAMES.iter().find(|it| it.0 == nr) {
+        Some((_, name)) => (*name).to_owned(), // alloc: once a call described
+        None => format!("system call {nr}"),   // alloc: as above
+    }
 }
 
 /// `path` as the process `pid` sees it, through its root (`/proc/PID/root`), into `into`.
@@ -3251,6 +3415,74 @@ for it in "$OUT"/*; do :; done
         let listed = super::tidy(&out);
         assert!(lines.iter().any(|it| it.seen == Seen::Listed && it.what == listed), "{text}");
         assert_eq!(lines[0], trace::Line::new(Seen::Env, "", trace::ALL_ENV));
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A traced run that reads randomness leaves, beside its report, who read it: the
+    /// process (`head`, not the shell that started it), the system call, and where in the
+    /// process the call came from; and each program the run started. On 2026-11-10 a build
+    /// script was refused for `Random` with nothing saying which of its processes read it.
+    /// Skipped where no sandbox can be made, unless `BLAZE_VIEW_TESTS=require`.
+    #[test]
+    fn a_traced_run_that_reads_randomness_says_which_process_did() {
+        use blaze_usercode::{
+            calls::{self, Call, Module},
+            confine,
+        };
+        if let Err(why) = alone::probe(crate::sandbox::Probe::V2) {
+            let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
+            assert!(!required, "{why}");
+            eprintln!("skipped: {why}");
+            return;
+        }
+        let dir = scratch("who-read-random");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        // The fixture script: a child reads four bytes of randomness, and nothing else does
+        // by name.
+        let script = "head -c 4 /dev/urandom > \"$OUT/four\"";
+        let spec = confine::Spec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            env: vec![("OUT".into(), out.clone().into()), ("PATH".into(), "/usr/bin:/bin".into())],
+            dir: out.clone(),
+            read: vec![dir.clone()],
+            write: vec![out.clone()],
+            network: false,
+            trace: true,
+            services: Vec::new(),
+            live: dir.join("live"),
+            report: dir.join("report"),
+            not_inputs: vec!["/bin/sh".into()],
+            given: None,
+        };
+        assert_eq!(alone::launch(&spec), 0);
+        assert_eq!(std::fs::read(out.join("four")).unwrap().len(), 4);
+        let said = calls::read(&dir).unwrap();
+        let made: Vec<&calls::Made> = said
+            .iter()
+            .filter_map(|it| match it {
+                Call::Made(it) => Some(it),
+                Call::More(_) => None,
+            })
+            .collect();
+        let by_head = made
+            .iter()
+            .find(|it| it.what == "random" && it.argv0 == "head")
+            .unwrap_or_else(|| panic!("no call of `head` for randomness among {said:#?}"));
+        assert!(by_head.pid > 0 && by_head.inside_pid.is_some(), "{by_head:?}");
+        assert!(by_head.program.starts_with('/'), "its program by path: {by_head:?}");
+        assert!(by_head.number >= 0 && !by_head.syscall.starts_with("system call"), "{by_head:?}");
+        assert_ne!(by_head.kind, Module::NotKnown, "its maps were read: {by_head:?}");
+        assert!(by_head.ip != 0, "{by_head:?}");
+        // The program `head` is, started by the shell: one of the run's children.
+        assert!(
+            made.iter().any(|it| it.what == calls::EXEC && it.program.ends_with("/head")),
+            "{said:#?}"
+        );
+        // The refusal's text names it.
+        let text = calls::said(&said, "random");
+        assert!(text.contains("by process") && text.contains("argv[0] `head`"), "{text}");
         _ = std::fs::remove_dir_all(&dir);
     }
 
