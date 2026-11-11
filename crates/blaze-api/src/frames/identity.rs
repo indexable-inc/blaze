@@ -544,6 +544,7 @@ impl Gen {
                 linked_paths: self.texts(depth),
             }),
             7 => Response::Work(Worked {
+                why: self.maybe(|g| g.many(depth, |g| g.report(depth + 1))),
                 link: match self.yes() {
                     true => LinkKind::Patched,
                     false => LinkKind::Placed,

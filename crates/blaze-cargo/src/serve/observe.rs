@@ -1249,6 +1249,18 @@ impl Observe {
         self.why_asked(to, Ask { all, cwd, item, build: None, unexplained: false }, now, out);
     }
 
+    /// Why build `build` recomputed what it did ([`blaze_api::Rebuilt::summary`]), when the
+    /// history's thread has explained it and the loop has heard so by now: what the build's
+    /// own `Work` then carries ([`blaze_api::Worked::why`]), so its client asks nothing
+    /// after its `Done`. `None` when it is not explained yet: nothing waits for it here (an
+    /// answer is never held for the profile), and the client asks as before
+    /// ([`Observe::why_asked`], which waits for the explanation off the build's path).
+    pub fn summary_of(&self, build: u64) -> Option<Vec<blaze_api::Report>> {
+        let ask = Ask { all: false, cwd: None, item: None, build: Some(build), unexplained: false };
+        let rebuilt = self.answers.asked(&ask);
+        (rebuilt.build == Some(build)).then_some(rebuilt.summary)
+    }
+
     /// [`Observe::rebuilt`] of all an ask can say ([`Ask`]): one build's own summary, asked by
     /// its client once it has its `Done`, and the steps blaze has no reason for.
     pub fn why_asked(&mut self, to: RequestRef, ask: Ask, now: Duration, out: &mut Vec<Reply>) {

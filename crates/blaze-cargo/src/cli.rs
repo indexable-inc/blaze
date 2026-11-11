@@ -843,6 +843,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
         }
         if let ResponseRef::Work(worked) = &response {
             client_rows::heard(worked.build_id, worked.misses);
+            client_rows::summarized(worked.build_id, worked.why.as_deref());
         }
         let printed = match response {
             ResponseRef::Documented(documented) => {

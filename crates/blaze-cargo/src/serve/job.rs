@@ -3968,6 +3968,7 @@ impl<S: Steps> Jobs<S> {
         if let Some(worked) = worked {
             // No build of its own: no id in the history, no time of nodes it never ran.
             let worked = Worked {
+                why: None,
                 build_id: None,
                 steps_us: Vec::new(), // alloc: none
                 critical_path_us: 0,
@@ -7239,6 +7240,9 @@ impl<S: Steps> Jobs<S> {
         let (stats, fresh, compiled) = (job.stats, job.fresh, job.compiled);
         let links = std::mem::take(&mut job.links);
         let worked = Worked {
+            // Given as it is said, by the daemon, when the build is explained by then
+            // (`Daemon::said_as`): the jobs have no reasons of their own.
+            why: None,
             reran: stats.ran,
             // What its history row took ([`Job::ended`], before this): the misses the
             // history's thread explains, so 0 here is an empty summary there.

@@ -36,6 +36,27 @@ static BUILD: AtomicU64 = AtomicU64::new(0);
 /// 0 until a build is heard, and for one that recomputed nothing, whose summary is empty.
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
+/// Why that build computed again what it did, as its own `Work` carried it
+/// ([`blaze_api::Worked::why`]): set once, by the one request a client process makes. Unset
+/// when the daemon had not explained the build as it answered, and then the client asks
+/// ([`observe::recomputed`]).
+static SUMMARY: std::sync::OnceLock<(u64, Vec<blaze_api::Report>)> = std::sync::OnceLock::new();
+
+/// The daemon said why build `build` recomputed what it did, in the build's own answer.
+pub fn summarized(build: Option<u64>, why: Option<&[blaze_api::Report]>) {
+    if let (Some(build), Some(why)) = (build, why) {
+        // clone: the summary, a few reports, once a build; a second `Work` of the process
+        // (there is none) would be dropped
+        let _ = SUMMARY.set((build, why.to_vec()));
+    }
+}
+
+/// The summary of build `build` its answer carried, if it carried one.
+pub fn summary(build: u64) -> Option<Vec<blaze_api::Report>> {
+    // clone: the summary, a few reports, once a build
+    SUMMARY.get().filter(|it| it.0 == build).map(|it| it.1.clone())
+}
+
 /// The build the daemon said this client's request is, 0 for none heard.
 pub fn build() -> u64 {
     BUILD.load(Ordering::Relaxed)

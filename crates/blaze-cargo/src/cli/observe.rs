@@ -368,6 +368,18 @@ pub(super) fn recomputed() -> Result<Vec<blaze_api::Report>, String> {
     if build == 0 || super::client_rows::misses() == 0 || !cfg!(feature = "native") {
         return Ok(Vec::new());
     }
+    // The build's own answer said it, when the daemon had explained the build by then: no
+    // second request.
+    if let Some(summary) = super::client_rows::summary(build) {
+        tracing::info_span!(
+            target: "blaze",
+            "client: why the build recomputed, from its answer",
+            build,
+            reports = summary.len(),
+        )
+        .in_scope(|| {});
+        return Ok(summary);
+    }
     let _span =
         tracing::info_span!(target: "blaze", "client: ask why the build recomputed", build)
             .entered();

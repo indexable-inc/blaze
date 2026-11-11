@@ -26,7 +26,7 @@
 use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 use blaze_api::{
-    ApiError, Arrived, Reply, Request, RequestRef,
+    ApiError, Arrived, Reply, Request, RequestRef, Response,
     server::{Abandoned, Config as ServerConfig, Http, Server, Unix},
     session::{self, Session},
 };
@@ -2902,6 +2902,26 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 }
             } else {
                 it
+            };
+            // A build that computed something again says why in its `Work` when the history's
+            // thread has explained it by now ([`Observe::summary_of`]): one round trip for
+            // its client, and no wait here when it has not.
+            let it = match it {
+                Said::Report(job, Response::Work(mut worked)) => {
+                    if let (Some(build), true) = (worked.build_id, worked.misses > 0) {
+                        let _span = tracing::info_span!(
+                            target: "blaze",
+                            "loop: why the build recomputed, for its answer",
+                            build,
+                            explained = tracing::field::Empty,
+                        )
+                        .entered();
+                        worked.why = self.observe.summary_of(build);
+                        _span.record("explained", worked.why.is_some());
+                    }
+                    Said::Report(job, Response::Work(worked))
+                }
+                it => it,
             };
             // Every word of a job passes here once, as it is told: a build that may be answered
             // again later has what it says noted ([`Jobs::heard`]).

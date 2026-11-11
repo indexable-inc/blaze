@@ -318,6 +318,7 @@ pub fn drive<A: Api>(
     let called = api.call(request, |response, more| {
         if let ResponseRef::Work(worked) = &response {
             super::client_rows::heard(worked.build_id, worked.misses);
+            super::client_rows::summarized(worked.build_id, worked.why.as_deref());
         }
         let printed = match response {
             // The board stands for cargo's `Compiling` lines.

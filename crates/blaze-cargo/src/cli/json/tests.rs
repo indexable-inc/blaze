@@ -82,6 +82,7 @@ fn work_counts_each_link_by_how() {
     use blaze_api::{LinkHow, Linked};
     let link = |how| Linked { how, path: "target/debug/foo".to_owned() };
     let worked = blaze_api::Worked {
+        why: None,
         link: blaze_api::LinkKind::Placed,
         found: 5,
         green: 0,

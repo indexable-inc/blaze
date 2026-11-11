@@ -238,6 +238,7 @@ fn a_units_summary_comes_as_it_ends_and_once() {
 #[test]
 fn what_a_request_did_is_one_json_line_of_blazes() {
     let worked = blaze_api::Worked {
+        why: None,
         link: blaze_api::LinkKind::Patched,
         found: 3,
         green: 40,
@@ -289,6 +290,7 @@ fn what_a_request_did_is_one_json_line_of_blazes() {
 fn each_dependency_crate_is_one_served_line_after_the_work() {
     use blaze_api::{ServedCrate, ServedPart};
     let worked = blaze_api::Worked {
+        why: None,
         link: blaze_api::LinkKind::Placed,
         found: 0,
         green: 0,
