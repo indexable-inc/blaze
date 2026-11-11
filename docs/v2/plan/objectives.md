@@ -13,7 +13,7 @@ remembered. How rows are picked, worked and landed is
 `harness/v2/ledger.py`. A check in *italics* is not written yet, and writing it is the first
 part of the work. `?` is not measured; "last known" is a lead, not a status.
 
-94 objectives: 0 met, 0 open, 0 blocked, 94 not measured.
+95 objectives: 0 met, 0 open, 0 blocked, 95 not measured.
 
 ## Targets
 
@@ -124,6 +124,7 @@ The parts of [the design](../plan.md#the-design) no check has shown yet.
 | E11 | Effects are declared by what a function may do: #[blaze::may(panic, alloc, block, diverge)], with undeclared_effect, unneeded_effect and negative_effect | *write: the lints' tests on a stage 1; no rule accepts a `for` loop as bounded* | written on terminates-effect, unbuilt (2026-11-10) | ? |
 | E12 | A workspace's proc macros and its build scripts' ambient std uses are linted, warn once their replacements are in the tree | *write: the lints' tests on a stage 1; three of four are allow until reflection phase 2 and bstd land* | written on lints-macros-scripts-1110, unbuilt (2026-11-10) | ? |
 | S6 | No bstd API hides a cost or a guarantee: durability, waits, allocation, buffering and policy are arguments or types | *write: the explicitness tables of design/std.md and the file-durability simulation test* |  | ? |
+| E13 | Portable SIMD needs no feature gate in the edition, with a native width and #[blaze::multiversion] selected at load | *write: run on a stage-1 blaze: hir-def blaze_simd_turns_on_portable_simd_and_blaze_simd and multiversion_levels_are_the_attributes_strings_in_order; blaze-diagnostics core_simd_needs_no_feature_under_blaze_simd and core_simd_without_blaze_simd_is_gated_as_before; hir-ty-mir native_lanes_is_the_widest_enabled_vector; target-features multiversion::tests (the_selected_clone_is_supported_and_the_best, clones_never_share_a_feature_set, their the_oracle_catches_* controls); hir-ty-codegen a_units_features_are_its_baselines_with_its_toolchains. Still to write, with the clones: a driver test of the instances and feature sets a multiversioned function compiles to with its cell, and a release build of a multiversioned dot over drawn inputs whose every clone returns the baseline's bits* | spec and slice 1 written on simd-1110, unbuilt (2026-11-10) | ? |
 
 ## The agent app
 

@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-36 invariants, 7 refinements, 2 reference models.
-By level: 24 tested, 19 simulated, 0 model-checked, 0 proved.
+38 invariants, 7 refinements, 2 reference models.
+By level: 26 tested, 19 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -126,6 +126,13 @@ By level: 24 tested, 19 simulated, 0 model-checked, 0 proved.
 
 - **`what_is_kept_after_an_answer_survives_any_crash_and_no_lost_value_is_served`** *tested* (`crates/blaze-storemodel/src/tests.rs`): an answer may be sent on results not yet durable; nothing derived from that answer is reused across a crash unless its tickets were durable. After any crash the restore serves no value whose bytes were lost, holds everything the store called durable and everything an answered build kept, and every answer's settling ended kept or said lost. Two builds on shared and separate keys with a reader, and a snapshot beside a build, each build answering before it flushes: every schedule, a crash after every IO step, so at every point between an answer sent and its results durable; with an IO failure anywhere, so a settling that ends with the store stopped. Then two kernel gets of one identity in two worlds racing for one shape slot, each answering at once and keeping what it left once it and every store before it is durable, with an IO failure anywhere and effects completing in any order.
   Controls: `a_kept_answer_relied_on_before_its_tickets_were_durable`, `a_settling_failure_dropped_silently`.
+
+### target-features
+
+- **`the_selected_clone_is_supported_and_the_best`** *tested* (`crates/target-features/src/multiversion.rs`): the clone selected is supported by the CPU (every feature it adds to the unit is present), and no supported clone is declared after it; the baseline is selected only when no clone is supported.
+  Controls: `a_clone_the_cpu_lacks`, `the_baseline_chosen_over_a_supported_clone`, `two_clones_of_one_set`.
+- **`clones_never_share_a_feature_set`** *tested* (`crates/target-features/src/multiversion.rs`): no two clones of a plan have one feature set, and none has the unit's, so the baseline and the clones are compiled with pairwise different sets and (their feature names being part of an instance's shape) never share a code identity.
+  Controls: `a_clone_the_cpu_lacks`, `the_baseline_chosen_over_a_supported_clone`, `two_clones_of_one_set`.
 
 ## Refinements
 
