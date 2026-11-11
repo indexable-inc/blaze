@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-102 invariants, 19 refinements, 7 reference models.
-By level: 90 tested, 30 simulated, 1 model-checked, 0 proved.
+103 invariants, 19 refinements, 7 reference models.
+By level: 91 tested, 30 simulated, 1 model-checked, 0 proved.
 
 ## Invariants
 
@@ -155,6 +155,7 @@ By level: 90 tested, 30 simulated, 1 model-checked, 0 proved.
 ### blaze-lints
 
 - **`an_unmeasured_crate_takes_any_count_until_a_bless_records_it`** *tested* (`crates/blaze-lints/src/baseline.rs`): an unmeasured crate passes any count and is never over, is stale until a bless, and a bless gives it the run's count or drops it at zero, so the ratchet's first measured run only turns `unmeasured` into numbers or into `deny`.
+  Controls: `an_unmeasured_crate_read_as_a_count_of_zero`, `a_bless_that_keeps_a_crate_unmeasured`.
 
 ### blaze-lower
 
@@ -246,12 +247,16 @@ By level: 90 tested, 30 simulated, 1 model-checked, 0 proved.
 ### blaze-units
 
 - **`the_ratchet_is_read_in_place_of_the_levels_table`** *tested* (`crates/blaze-units/src/load/plan/tests.rs`): where a workspace has `[workspace.metadata.blaze.lints-ratchet]`, this blaze reads its levels in place of `[workspace.metadata.blaze.lints]` (which a released blaze reads) and after `lints-when-ready`, so the ratchet's level of a lint is the one that holds.
+  Controls: `the_levels_table_read_beside_the_ratchet`, `lints_when_ready_read_after_the_ratchet`, `an_unmeasured_crate_dropped_from_the_downgrades`, `a_crate_held_from_a_clippy_baseline`.
 - **`a_crate_its_baseline_lists_is_held_at_warn_and_no_other`** *tested* (`crates/blaze-units/src/load/plan/tests.rs`): a member is held at `warn` on exactly the blaze lints whose baseline lists it, `unmeasured` or counted; a crate no baseline lists gets no flag, so the ratchet's `deny` holds for it. A baseline that does not read is an error naming it, never a crate dropped.
+  Controls: `the_levels_table_read_beside_the_ratchet`, `lints_when_ready_read_after_the_ratchet`, `an_unmeasured_crate_dropped_from_the_downgrades`, `a_crate_held_from_a_clippy_baseline`.
 
 ### blaze-usercode
 
 - **`a_process_is_given_its_own_stream_whoever_else_asks`** *tested* (`crates/blaze-usercode/src/provider.rs`): what a process is given by `getrandom` is its own stream's bytes in order, a function of the seed and the process alone, however the asks of the run's processes interleave and however each cut its own.
   Controls: `a_count_shared_by_all_processes`.
+- **`what_the_sandbox_answered_is_not_what_cannot_be_traced`** *tested* (`crates/blaze-usercode/src/trace.rs`): what the sandbox answered from the run's provider is no input and nothing that can't be traced, and only what it answered: a run with only such lines is kept as any traced run, and a pure script's check (`pure::check`) passes it, while randomness it did not answer, beside an answer, is still what can't be traced.
+  Controls: `randomness_that_was_not_answered`, `an_answer_taken_for_what_cannot_be_traced`.
 
 ### hir
 

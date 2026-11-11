@@ -455,16 +455,57 @@ mod tests {
         assert!(!baseline.off(&map(&[("a", 2)])).iter().any(Off::over));
     }
 
+    /// What `off` and `blessed`, a run of `now` against `baseline`, did with each of the
+    /// baseline's unmeasured crates, against the invariant below: the first way they broke it.
+    fn unmeasured_held(
+        baseline: &Baseline,
+        now: &BTreeMap<String, u32>,
+        off: &[Off],
+        blessed: &Baseline,
+    ) -> Result<(), String> {
+        let krate_of = |it: &Off| match it {
+            Off::Grew { krate, .. }
+            | Off::New { krate, .. }
+            | Off::Shrank { krate, .. }
+            | Off::Unmeasured { krate, .. } => Some(krate.clone()),
+            Off::Unbaselined { .. } => None,
+        };
+        for (krate, held) in &baseline.counts {
+            if *held != Held::Unmeasured {
+                continue;
+            }
+            let count = now.get(krate).copied().unwrap_or(0);
+            let said: Vec<&Off> = off.iter().filter(|it| krate_of(it).as_ref() == Some(krate)).collect();
+            if said != [&Off::Unmeasured { krate: krate.clone(), now: count }] {
+                return Err(format!("unmeasured `{krate}` at {count} was said as {said:?}, not as stale"));
+            }
+            match (count, blessed.counts.get(krate)) {
+                (0, None) => {}
+                (count, Some(Held::Count(got))) if count > 0 && *got == count => {}
+                (count, got) => {
+                    return Err(format!("a bless of unmeasured `{krate}` at {count} gave {got:?}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The baseline of [`an_unmeasured_crate_takes_any_count_until_a_bless_records_it`] and
+    /// the run it is checked against: `b` and `c` unmeasured, `b` at 40 and `c` at none.
+    fn unmeasured_case() -> (Baseline, BTreeMap<String, u32>) {
+        let mut counts = held(&[("a", 2)]);
+        counts.insert("b".to_owned(), Held::Unmeasured);
+        counts.insert("c".to_owned(), Held::Unmeasured);
+        (Baseline { counts }, map(&[("a", 2), ("b", 40)]))
+    }
+
     /// The invariant: an unmeasured crate passes any count and is never over, is stale until a
     /// bless, and a bless gives it the run's count or drops it at zero, so the ratchet's first
     /// measured run only turns `unmeasured` into numbers or into `deny`.
     #[test]
     fn an_unmeasured_crate_takes_any_count_until_a_bless_records_it() {
-        let mut counts = held(&[("a", 2)]);
-        counts.insert("b".to_owned(), Held::Unmeasured);
-        counts.insert("c".to_owned(), Held::Unmeasured);
-        let baseline = Baseline { counts };
-        let now = map(&[("a", 2), ("b", 40)]);
+        let (baseline, now) = unmeasured_case();
+        unmeasured_held(&baseline, &now, &baseline.off(&now), &baseline.blessed(&now)).unwrap();
         assert_eq!(
             baseline.off(&now),
             [
@@ -474,8 +515,41 @@ mod tests {
         );
         assert!(!baseline.off(&now).iter().any(Off::over), "no count is over `unmeasured`");
         assert_eq!(baseline.blessed(&now).counts, held(&[("a", 2), ("b", 40)]));
-        // The control: once measured, the same count over it is over.
+        // Once measured, the same count over it is over.
         assert!(baseline.blessed(&now).off(&map(&[("b", 41)])).iter().any(Off::over));
+    }
+
+    #[test]
+    fn the_oracle_catches_an_unmeasured_crate_read_as_a_count_of_zero() {
+        let (baseline, now) = unmeasured_case();
+        // The planted bug: `unmeasured` read as a count of 0, so any finding is over it.
+        let zero = Baseline {
+            counts: baseline
+                .counts
+                .iter()
+                .map(|(krate, held)| {
+                    (krate.clone(), if *held == Held::Unmeasured { Held::Count(0) } else { *held })
+                })
+                .collect(),
+        };
+        let why = unmeasured_held(&baseline, &now, &zero.off(&now), &baseline.blessed(&now))
+            .expect_err("the oracle missed an unmeasured crate held at zero");
+        assert!(why.contains("unmeasured `b` at 40 was said as [Grew"), "{why}");
+    }
+
+    #[test]
+    fn the_oracle_catches_a_bless_that_keeps_a_crate_unmeasured() {
+        let (baseline, now) = unmeasured_case();
+        // The planted bug: a bless that lowers counts and leaves `unmeasured` as it was.
+        let mut kept = baseline.blessed(&now);
+        for (krate, held) in &baseline.counts {
+            if *held == Held::Unmeasured {
+                kept.counts.insert(krate.clone(), Held::Unmeasured);
+            }
+        }
+        let why = unmeasured_held(&baseline, &now, &baseline.off(&now), &kept)
+            .expect_err("the oracle missed a bless that kept `unmeasured`");
+        assert!(why.contains("a bless of unmeasured `b` at 40 gave Some(Unmeasured)"), "{why}");
     }
 
     #[test]

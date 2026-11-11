@@ -44,6 +44,8 @@ pub(crate) struct Built {
     pub packages: Vec<PackagePlan>,
     pub lock: Option<LockWrite>,
     pub warnings: Vec<String>,
+    /// blaze's notes of the load ([`crate::query::Units::notes`]).
+    pub notes: Vec<String>,
     pub target_dir: String,
     pub build_dir: String,
     pub finished: String,
@@ -510,6 +512,20 @@ pub(crate) fn units(
         }
     }
 
+    // A foreign load builds another build's dependencies, whose profile is that build's.
+    let notes = match &spec.foreign {
+        Some(_) => Vec::new(),
+        None => strip_notes(
+            &profiles.strips(),
+            graph
+                .units
+                .iter()
+                .zip(&plans)
+                .filter(|(unit, _)| !unit.is_std)
+                .map(|(_, plan)| plan.rustflags.as_slice()),
+        ),
+    };
+
     let checksums = resolved.resolve.checksums();
     let const_macros_on = super::sandbox::const_macros_on(ws.custom_metadata());
     let mut packages: Vec<PackagePlan> = Vec::with_capacity(by_id.len());
@@ -582,6 +598,7 @@ pub(crate) fn units(
         packages,
         lock: resolved.lock,
         warnings,
+        notes,
         target_dir: target_dir.display().to_string(),
         build_dir: build_dir.display().to_string(),
         finished: planned.finished,
@@ -590,6 +607,40 @@ pub(crate) fn units(
         sandboxed_tests: opt_out.sandboxed_tests,
         native,
     }))
+}
+
+/// What a build says of each `strip` it accepts and does not honour yet (ledger D44): one note
+/// per setting the requested profile makes (`strips`, from [`Profiles::strips`]), then one per
+/// value of `-C strip` the workspace's units' `rustflags` pass (`-C strip=none` asks for
+/// nothing). Not a refusal: real projects set `strip = true` (superset-of-rust); a named note on
+/// every build that sets it, so the setting is never quietly dropped (no-fallback).
+pub(crate) fn strip_notes<'a>(
+    strips: &[(String, String)],
+    rustflags: impl IntoIterator<Item = &'a [String]>,
+) -> Vec<String> {
+    const NOT_YET: &str = "blaze accepts it and does not strip yet: its linker writes the symbol \
+                           table and debug info all the same (ledger D44)";
+    // alloc: a note per setting, once per load
+    let mut notes: Vec<String> =
+        strips.iter().map(|(at, value)| format!("{at} sets `strip = {value}`: {NOT_YET}")).collect();
+    let mut values: Vec<&str> = Vec::new(); // alloc: each `-C strip` value, once per load
+    for flags in rustflags {
+        let mut words = flags.iter().map(String::as_str);
+        while let Some(word) = words.next() {
+            let option = match word {
+                "-C" | "--codegen" => words.next(),
+                _ => word.strip_prefix("-C").or_else(|| word.strip_prefix("--codegen=")),
+            };
+            match option.and_then(|it| it.strip_prefix("strip=")) {
+                Some("none") | None => {}
+                Some(value) => values.push(value),
+            }
+        }
+    }
+    values.sort_unstable();
+    values.dedup();
+    notes.extend(values.into_iter().map(|value| format!("the rustflags pass `-C strip={value}`: {NOT_YET}")));
+    notes
 }
 
 /// `-j` or `build.jobs` as cargo's `JobsConfig` reads it, when it names a number of jobs; none

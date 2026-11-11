@@ -482,6 +482,9 @@ pub struct Units {
     pub lock: Option<LockWrite>,
     /// cargo's warnings of the load, each as cargo prints it after `warning: `.
     pub warnings: Vec<String>,
+    /// blaze's notes of the load, each as it is printed after `note: `: a setting it accepts
+    /// and does not honour yet, said on every build that sets it.
+    pub notes: Vec<String>,
     pub target_dir: String,
     pub build_dir: String,
     /// The profile as cargo's `Finished` line names it: "`dev` profile [unoptimized + debuginfo]".

@@ -1,9 +1,9 @@
 //! Paths as Python's `os.path` and `glob` treat them on a POSIX system, so a ported script
 //! finds the same files and names them the same way: [`normpath`], [`join`], [`abspath`],
-//! [`relpath`], [`glob`] and the [`fnmatch`] it matches names with, and [`pure_path`], a path
-//! as `pathlib.Path` writes it.
+//! [`relpath`], [`glob`] and the [`fnmatch`] it matches names with, [`pure_path`], a path
+//! as `pathlib.Path` writes it, and [`rglob`], `Path.rglob`'s walk.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// `os.path.normpath`: `.` and empty parts dropped, `a/..` folded, a leading `/` kept (two when
 /// there were exactly two), `.` for nothing.
@@ -206,9 +206,50 @@ fn glob_in(pattern: &str, dirs_only: bool) -> Vec<String> {
     out
 }
 
+/// Every path under `top` (not `top` itself) whose file name `matches`, files and directories
+/// alike, as Python 3.13's `Path(top).rglob(pattern)` walks: hidden directories are entered, a
+/// symlinked directory is not, and a directory that cannot be listed is passed over. In no
+/// order: sorting the paths (`Path`'s order, part by part) is Python's `sorted()` of them.
+pub fn rglob(top: &Path, matches: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut dirs = vec![top.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|it| it.is_dir()) {
+                dirs.push(path.clone());
+            }
+            if entry.file_name().to_str().is_some_and(&matches) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rglob_walks_as_pythons_rglob() {
+        let top = crate::TempDir::new("blaze-script-rglob-").unwrap();
+        let at = |rel: &str| top.path().join(rel);
+        for dir in ["a/.hidden", "a-b", "real"] {
+            std::fs::create_dir_all(at(dir)).unwrap();
+        }
+        for file in ["x.rs", "a/y.rs", "a/.hidden/z.rs", "a-b/w.rs", "real/v.rs", "a/not.txt"] {
+            std::fs::write(at(file), "").unwrap();
+        }
+        std::os::unix::fs::symlink(at("real"), at("a/linked")).unwrap();
+        let mut found = rglob(top.path(), |name| name.ends_with(".rs"));
+        found.sort();
+        let rel: Vec<String> =
+            found.iter().map(|it| it.strip_prefix(top.path()).unwrap().display().to_string()).collect();
+        // Part by part, as Python sorts paths: `a/..` before `a-b/..`, where text puts `-` first.
+        assert_eq!(rel, ["a/.hidden/z.rs", "a/y.rs", "a-b/w.rs", "real/v.rs", "x.rs"]);
+    }
 
     // Each expectation is what Python 3.13's os.path and fnmatch give.
     #[test]
