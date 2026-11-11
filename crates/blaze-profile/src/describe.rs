@@ -407,7 +407,13 @@ mod tests {
         // A table named only inside a string is not one the query reads.
         assert_eq!(hint(message, "SELECT thread_nam FROM other WHERE x = 'spans'"), None);
         assert_eq!(hint("Parser Error: syntax error at or near \"FORM\"", "SELECT 1 FORM spans"), None);
-        assert_eq!(nearest("kind", ["query_kind", "name", "wait_kind", "k"].into_iter(), 3), ["query_kind", "wait_kind", "k"]);
+        // Names that hold the one asked for (or are held by it) come before one that only looks
+        // like it, the nearest of them first.
+        assert_eq!(
+            nearest("kind", ["query_kind", "name", "wait_kind", "kin"].into_iter(), 3),
+            ["kin", "wait_kind", "query_kind"]
+        );
+        assert_eq!(nearest("nam", ["mane", "name", "x"].into_iter(), 2), ["name", "mane"]);
     }
 
     /// The invariant: docs/profiling.md lists no column the schema lacks. Its tables are
