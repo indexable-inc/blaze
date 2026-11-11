@@ -1178,6 +1178,9 @@ pub(crate) fn engine(
         builds: file_name(&builds()?)?,
         sources: file_name(&sources)?,
         writer: writer_of(&paths.state)?,
+        // The root of the native driver the daemon runs on, made below: its stores' file
+        // names are under it.
+        store_loader: blaze_cas::Loader::Thread { root: std::path::PathBuf::from("/") },
         socket: paths.socket.as_deref().map(file_name).transpose()?,
         http: serving.http.zip(token),
         budget: Some(budget),

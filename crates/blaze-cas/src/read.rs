@@ -4,8 +4,15 @@
 //!   their own, dictionaries and encodings) with one release swap, and frees the one it
 //!   replaced at task boundaries through its limbo. A reader loads it with one acquire load.
 //! - A record not in the mapped index table is a [`Spot`] in its tier's delta table: published
-//!   by one compare-and-swap, moved (from a writer's segment to its pack once that is mapped,
-//!   or by a settle) by one swap, the old spot freed at task boundaries.
+//!   by one compare-and-swap, moved (from a writer's segment to its pack once its commit is
+//!   durable, or by a settle) by one swap, the old spot freed at task boundaries.
+//! - A pack's bytes are read through the store's buffer pool
+//!   (docs/v2/plan/design/store-pool.md): a read pins the pages of what it reads
+//!   ([`crate::hot::Side::pin`], which loads the ones not in memory), and the pins are kept in
+//!   the [`Owned`] table, by run of pages, until the store lets the table go at a task
+//!   boundary. So the bytes a read hands out stay as they are for as long as the task that
+//!   read them runs, as a value made whole does, and a second read of a page the table pins
+//!   touches no shared word. No pack is mapped.
 //! - A value made whole to be read (decompressed, or put together from chunks) is published
 //!   once into the [`Owned`] table and read in place from then on; the store swaps in a fresh
 //!   table when the old one holds too much and frees the old one at task boundaries.
@@ -27,9 +34,14 @@ use crate::{
     flags::{Flag, FlagColumns, Row},
     index, location,
     segment::{ChunkRef, Segment},
+    hot::{HeldPins, PinError, Side},
+    pool::{PAGE, Run, counts},
     table::{Held, Keyed, Table},
 };
-use blaze_core::{FileName, Mapping};
+use blaze_core::{
+    FileName, Mapping,
+    lock::{Lock, Signal},
+};
 use blaze_format::{Aligned, SchemaHash};
 use blaze_ids::ContentId;
 use blaze_reclaim::Limbo;
@@ -40,6 +52,12 @@ pub(crate) const SEGMENTS_MOST: usize = 4096;
 
 /// The most a chunked value reserves before its pieces are read: past it, it grows as they are.
 const LIST_RESERVE: u64 = 64 << 20;
+
+/// How long a read waits at the pinned bound at a time before it looks again, and how many
+/// times: five seconds in all, then the read fails, naming the bound (rule
+/// `bounded-progress`).
+const BOUND_TICK: std::time::Duration = std::time::Duration::from_millis(50);
+const BOUND_TICKS: u32 = 100;
 
 /// What the store and every reader and writer of it share.
 pub(crate) struct Shared {
@@ -53,11 +71,45 @@ pub(crate) struct Shared {
     /// a clone of one waits for its write-back. Written by the store alone, as a file's
     /// state changes; held for one insert, remove or lookup.
     unflushed: blaze_core::lock::Lock<crate::ByHashSet<ContentId, Global>>,
+    /// The store's side of its buffer pool: what a read of a pack's bytes pins through.
+    /// `None` when the pool could not be made: the store is broken, and has no pack to read.
+    side: Option<Arc<Side>>,
+    /// What a read at the pinned bound waits on: notified by the store as it frees what
+    /// passed its grace, a table of pins among it ([`Shared::pins_let_go`]).
+    bound: Lock<()>,
+    unpinned: Signal,
+}
+
+/// A read found the pool's pinned bytes at their bound through every wait for the store to
+/// let pins go.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct AtBound {
+    pub(crate) pinned: u64,
+    pub(crate) bound: u64,
+    pub(crate) need: u64,
+}
+
+impl std::fmt::Display for AtBound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the store's pool holds {} bytes pinned by readers, and its bound is {} (half of \
+             its budget, pool::counts::pinned_bound): {} more could not be pinned through {:?} \
+             of waiting for tasks to end and let their pins go",
+            self.pinned,
+            self.bound,
+            self.need,
+            BOUND_TICK * BOUND_TICKS
+        )
+    }
 }
 
 impl Shared {
-    pub(crate) fn new(view: View) -> Shared {
+    pub(crate) fn new(view: View, side: Option<Arc<Side>>) -> Shared {
         Shared {
+            side,
+            bound: Lock::new("store.pool.pinned", ()),
+            unpinned: Signal::new("store.pool.unpinned"),
             // alloc: once per store opened, the view readers load
             view: AtomicPtr::new(Box::into_raw(Box::new(view))),
             // alloc: once per store opened, the table of values made whole
@@ -84,6 +136,72 @@ impl Shared {
     /// Whether the store wrote the whole file `id` and has not seen it written back.
     pub(crate) fn is_unflushed(&self, id: &ContentId) -> bool {
         self.unflushed.lock().contains(id)
+    }
+
+    /// The store's side of its buffer pool.
+    pub(crate) fn side(&self) -> Option<&Side> {
+        self.side.as_deref()
+    }
+
+    /// The store freed what passed its grace: a read waiting at the pinned bound looks again.
+    pub(crate) fn pins_let_go(&self) {
+        self.unpinned.notify_all();
+    }
+
+    /// Room under the pinned bound for `need` more bytes: at once when there is, else after
+    /// waiting, in a span naming the bound, for the store to let go of the pins of tasks
+    /// that ended.
+    ///
+    /// The bound: readers pin at most half of the pool's budget
+    /// ([`counts::pinned_bound`]), so at least half of it is always the sweep's to take. A
+    /// task's pins live until the store frees the table they are in, which it does once the
+    /// table holds a quarter of the bound and every task that could have read from it has
+    /// ended; so the bound is met only when tasks running at once read more than it between
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// [`AtBound`], after [`BOUND_TICKS`] waits of [`BOUND_TICK`]: the read fails, naming the
+    /// bound. It never blocks without end, and never pins past the bound.
+    fn pin_room(&self, need: u64) -> Result<(), AtBound> {
+        self.pin_room_within(need, counts::pinned_bound(counts::budget()), BOUND_TICKS)
+    }
+
+    /// [`Shared::pin_room`] under `bound`, waiting at most `ticks` times.
+    pub(crate) fn pin_room_within(&self, need: u64, bound: u64, ticks: u32) -> Result<(), AtBound> {
+        let most = ticks;
+        let over = || counts::pinned_now().saturating_add(need) > bound;
+        if !over() {
+            return Ok(());
+        }
+        counts::bound_waited();
+        let span = tracing::info_span!(
+            target: "blaze",
+            "store pool: pinned bound",
+            pinned = counts::pinned_now(),
+            bound,
+            need,
+        );
+        let _in = span.enter();
+        let waited = blaze_graph::wait::wait(
+            blaze_graph::wait::WaitOn::Io("store pool: readers' pins at their bound"),
+            None,
+            || {
+                let mut guard = self.bound.lock();
+                let mut ticks = 0;
+                // Bounded: `most` waits (`BOUND_TICKS`) of `BOUND_TICK` each.
+                while over() && ticks < most {
+                    // wakes: the store's `tidy`, as it frees what passed its grace (`Shared::pins_let_go`), notifies `unpinned`; each wait also ends at its tick
+                    self.unpinned.wait_for(&mut guard, BOUND_TICK);
+                    ticks += 1;
+                }
+                !over()
+            },
+        );
+        match waited {
+            true => Ok(()),
+            false => Err(AtBound { pinned: counts::pinned_now(), bound, need }),
+        }
     }
 
     pub(crate) fn view<'a>(&'a self, _held: Held<'a>) -> &'a View {
@@ -180,15 +298,18 @@ pub(crate) struct TierView {
 
 pub(crate) struct PackView {
     pub(crate) file: FileName,
-    pub(crate) mapping: Option<Mapping>,
-    /// How much of `mapping` is the store's.
+    /// The byte of the store's pool its first byte lives at, while it is open there
+    /// ([`crate::hot::Hot::pack_opened`]): its byte `at` is the pool's `base + at`.
+    pub(crate) base: Option<u64>,
+    /// How much of it is committed, and so a reader's to read through the pool.
     pub(crate) usable: u64,
 }
 
 impl PackView {
-    fn bytes(&self, at: u64, len: u64) -> Option<&[u8]> {
-        let end = at.checked_add(len).filter(|&end| end <= self.usable)?;
-        self.mapping.as_ref()?.bytes().get(usize::try_from(at).ok()?..usize::try_from(end).ok()?)
+    /// The pool's byte its `len` bytes at `at` start at, when they are committed.
+    fn place(&self, at: u64, len: u64) -> Option<u64> {
+        at.checked_add(len).filter(|&end| end <= self.usable)?;
+        Some(self.base? + at)
     }
 }
 
@@ -316,10 +437,57 @@ impl Keyed for Spot {
     }
 }
 
-/// Values made whole to be read, by where their record is.
+/// Values made whole to be read, by where their record is; and the pins of the packs' pages
+/// its readers read, by run of pages. Both live until the store lets the table go.
 pub(crate) struct Owned {
     table: Table<Decoded>,
     bytes: AtomicU64,
+    pins: Table<PinnedRun>,
+    /// Bytes of the runs `pins` holds.
+    pinned: AtomicU64,
+}
+
+/// A run of the pool's pages pinned for as long as it lives, counted in the pool's pinned
+/// bytes ([`counts`]): an entry of a table of pins, or what a [`Pinned`] holds.
+pub(crate) struct PinnedRun {
+    pins: HeldPins,
+}
+
+impl PinnedRun {
+    fn new(pins: HeldPins) -> PinnedRun {
+        counts::pinned(u64::from(pins.run().pages) * PAGE);
+        PinnedRun { pins }
+    }
+
+    /// Pages `run` of the pool pinned whole, loading those not in memory.
+    fn pin(side: &Side, run: Run) -> Result<PinnedRun, PinError> {
+        side.pin(run.first * PAGE, u64::from(run.pages) * PAGE).map(PinnedRun::new)
+    }
+
+    /// The `len` bytes at the pool's byte `at`, which its run covers.
+    fn bytes(&self, at: u64, len: u64) -> &[u8] {
+        let start = (at - self.pins.at()) as usize;
+        &self.pins.bytes()[start..start + len as usize]
+    }
+}
+
+impl Drop for PinnedRun {
+    fn drop(&mut self) {
+        counts::unpinned(u64::from(self.pins.run().pages) * PAGE);
+    }
+}
+
+impl Keyed for PinnedRun {
+    type Key = (u64, u64);
+
+    fn key(&self) -> (u64, u64) {
+        let run = self.pins.run();
+        (run.first, u64::from(run.pages))
+    }
+
+    fn hash(key: &(u64, u64)) -> u64 {
+        <Decoded as Keyed>::hash(key)
+    }
 }
 
 struct Decoded {
@@ -343,12 +511,52 @@ impl Keyed for Decoded {
 
 impl Owned {
     fn new() -> Owned {
-        Owned { table: Table::new(1024, 0), bytes: AtomicU64::new(0) }
+        Owned {
+            table: Table::new(1024, 0),
+            bytes: AtomicU64::new(0),
+            pins: Table::new(1024, 0),
+            pinned: AtomicU64::new(0),
+        }
     }
 
     /// How many bytes it holds.
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// How many bytes of the pool's pages it pins.
+    pub(crate) fn pinned(&self) -> u64 {
+        self.pinned.load(Ordering::Relaxed)
+    }
+
+    /// The `len` (at least one) bytes at the pool's byte `at`, their pages pinned by this
+    /// table until it is let go: found pinned already (no shared word is written), or pinned
+    /// now, loading the pages not in memory. Of two readers that pin one run at once, one
+    /// pin is kept and both read through it.
+    fn pin<'a>(
+        &'a self,
+        held: Held<'a>,
+        shared: &Shared,
+        side: &Side,
+        at: u64,
+        len: u64,
+    ) -> Result<&'a [u8], PinFailed> {
+        let run = Run::of(at, len);
+        let id = (run.first, u64::from(run.pages));
+        if let Some((_, it)) = self.pins.get(held, &id) {
+            return Ok(it.bytes(at, len));
+        }
+        let bytes = u64::from(run.pages) * PAGE;
+        shared.pin_room(bytes).map_err(PinFailed::AtBound)?;
+        let pinned = PinnedRun::pin(side, run).map_err(PinFailed::Pin)?;
+        match self.pins.insert(held, pinned) {
+            Ok((_, it)) => {
+                self.pinned.fetch_add(bytes, Ordering::Relaxed);
+                Ok(it.bytes(at, len))
+            }
+            // Another reader's pin of the run landed first: this one goes back.
+            Err((_, (_, it))) => Ok(it.bytes(at, len)),
+        }
     }
 
     fn get<'a>(&'a self, held: Held<'a>, id: (u64, u64)) -> Option<(ContentId, &'a [u8])> {
@@ -372,6 +580,25 @@ impl Owned {
                 &it.bytes
             }
             Err((_, (_, it))) => &it.bytes,
+        }
+    }
+}
+
+/// Why a pack's bytes could not be pinned.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum PinFailed {
+    /// The store has no pool.
+    NoPool,
+    AtBound(AtBound),
+    Pin(PinError),
+}
+
+impl std::fmt::Display for PinFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PinFailed::NoPool => write!(f, "the store has no buffer pool to read it through"),
+            PinFailed::AtBound(at) => write!(f, "{at}"),
+            PinFailed::Pin(err) => write!(f, "{err}"),
         }
     }
 }
@@ -607,12 +834,78 @@ impl<'a> Look<'a> {
         }
     }
 
-    /// The bytes of a pack, in the view the record was found in or, for a record published
-    /// after it, the one published since: a view never loses a mapping a found record names.
-    fn pack_bytes(self, found: Found<'a>, loc: Loc, at: u64, len: u64) -> Option<&'a [u8]> {
-        let of =
-            |view: &'a View| view.tiers[found.tier].packs.get(loc.pack as usize)?.bytes(at, len);
-        of(found.view).or_else(|| of(self.view()))
+    /// The bytes of a pack, pinned through the store's pool until the table of pins is let
+    /// go ([`Owned::pin`]): where the view the record was found in commits them or, for a
+    /// record published after it, where the one published since does. `Err(None)` when
+    /// neither commits them.
+    fn pack_bytes(
+        self,
+        found: Found<'a>,
+        loc: Loc,
+        at: u64,
+        len: u64,
+    ) -> Result<&'a [u8], Option<PinFailed>> {
+        self.pool_bytes(found.tier, found.view, loc.pack, at, len)
+    }
+
+    /// As [`Look::pack_bytes`], of pack `pack` of tier `tier` as `view` or the view
+    /// published since has it.
+    pub(crate) fn pool_bytes(
+        self,
+        tier: usize,
+        view: &'a View,
+        pack: u32,
+        at: u64,
+        len: u64,
+    ) -> Result<&'a [u8], Option<PinFailed>> {
+        let of = |view: &'a View| view.tiers.get(tier)?.packs.get(pack as usize)?.place(at, len);
+        let Some(place) = of(view).or_else(|| of(self.view())) else { return Err(None) };
+        self.pinned_at(place, len).map_err(Some)
+    }
+
+    /// The pages of the store's pool the records of `keys` are in, as runs in address order,
+    /// those that touch or follow each other merged into one: what a prefetch of them reads,
+    /// a run of neighbours in one read. A key with no record in a pack (not kept, or still in
+    /// its writer's segment, which is memory already) has none. For a value kept in chunks
+    /// this is its list of chunks, not the chunks: they are named by the list, which is not
+    /// read here.
+    pub(crate) fn runs_of(self, keys: &[Key]) -> Vec<Run> {
+        // alloc: a prefetch's plan, once per hint, handed to the loads
+        let mut runs: Vec<Run> = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(Ok(found)) = self.find(key) else { continue };
+            let Place::Pack(loc) = found.place else { continue };
+            let len = RECORD_HEADER + loc.stored;
+            let pack = found.view.tiers[found.tier].packs.get(loc.pack as usize);
+            if let Some(place) = pack.and_then(|it| it.place(loc.offset, len)) {
+                runs.push(Run::of(place, len));
+            }
+        }
+        runs.sort_unstable_by_key(|it| it.first);
+        let mut merged = 0;
+        for at in 1..runs.len() {
+            let (last, run) = (runs[merged], runs[at]);
+            let end = last.first + u64::from(last.pages);
+            if run.first <= end {
+                let end = end.max(run.first + u64::from(run.pages));
+                runs[merged].pages = (end - last.first) as u32;
+            } else {
+                merged += 1;
+                runs[merged] = run;
+            }
+        }
+        runs.truncate(if runs.is_empty() { 0 } else { merged + 1 });
+        runs
+    }
+
+    /// The `len` bytes at the pool's byte `place`, which a pack open there commits: pinned
+    /// until the table of pins is let go, loaded first where they are not in memory.
+    pub(crate) fn pinned_at(self, place: u64, len: u64) -> Result<&'a [u8], PinFailed> {
+        if len == 0 {
+            return Ok(&[]);
+        }
+        let side = self.shared.side().ok_or(PinFailed::NoPool)?;
+        self.shared.owned(self.held).pin(self.held, self.shared, side, place, len)
     }
 
     fn external(self, found: Found<'a>, content: &ContentId) -> Result<&'a [u8], Option<FileName>> {
@@ -655,17 +948,24 @@ impl<'a> Look<'a> {
                     )));
                 }
                 let at = loc.offset;
-                let header = self
-                    .pack_bytes(found, loc, at, RECORD_HEADER)
+                let header = self.pack_bytes(found, loc, at, RECORD_HEADER).map_err(|why| {
                     // alloc: the error's message
-                    .ok_or_else(|| corrupt(format!("its record at {at} is outside the pack")))?;
+                    corrupt(match why {
+                        None => format!("its record at {at} is outside the pack"),
+                        Some(why) => format!("its record at {at} could not be read: {why}"),
+                    })
+                })?;
                 let header =
                     // alloc: the error's message
                     RecordHeader::decode(header).map_err(|what| corrupt(format!("the record at {at}: {what}")))?;
-                let payload = self
-                    .pack_bytes(found, loc, at + RECORD_HEADER, header.stored)
-                    // alloc: the error's message
-                    .ok_or_else(|| corrupt(format!("the record at {at} runs past the pack")))?;
+                let payload =
+                    self.pack_bytes(found, loc, at + RECORD_HEADER, header.stored).map_err(|why| {
+                        // alloc: the error's message
+                        corrupt(match why {
+                            None => format!("the record at {at} runs past the pack"),
+                            Some(why) => format!("the record at {at} could not be read: {why}"),
+                        })
+                    })?;
                 (at, header, payload)
             }
             Place::Segment(seg) => {
@@ -930,20 +1230,62 @@ impl<'a> Look<'a> {
         let Some(found) = self.find(key) else { return Ok(None) };
         let found = found?;
         let entry = self.read(found, key)?;
-        let bytes = match self.mapping_holding(found, &entry) {
-            Some((mapping, start, file)) => {
+        let bytes = match (self.pins_holding(found, &entry, key)?, self.mapping_holding(found, &entry)) {
+            (Some((run, at)), _) => PinnedBytes::Pool { run, at, len: entry.bytes.len() as u64 },
+            (None, Some((mapping, start, file))) => {
                 PinnedBytes::Mapped { mapping, start, len: entry.bytes.len(), file }
             }
             // alloc: a value made whole and held past the task: one aligned copy per pin
-            None => PinnedBytes::Copied(Arc::new(Aligned::copy_from(entry.bytes))),
+            (None, None) => PinnedBytes::Copied(Arc::new(Aligned::copy_from(entry.bytes))),
         };
         Ok(Some(Pinned { key: entry.key, kind: entry.kind, content: entry.content, bytes }))
     }
 
+    /// Pins of its own of the pages `entry`'s bytes are in, and the pool's byte they start
+    /// at, when they are a raw record of a pack at a multiple of [`disk::ALIGN`]: what holds
+    /// the value past the task, whose own pins go with the table they are in. The pages are
+    /// in memory (the read just pinned them), so this loads nothing.
+    fn pins_holding(
+        self,
+        found: Found<'a>,
+        entry: &Entry<'a>,
+        key: &Key,
+    ) -> Result<Option<(Arc<PinnedRun>, u64)>, Corrupt> {
+        let Place::Pack(loc) = found.place else { return Ok(None) };
+        if loc.form != Form::Raw
+            || entry.bytes.is_empty()
+            || !(entry.bytes.as_ptr() as usize).is_multiple_of(disk::ALIGN as usize)
+        {
+            return Ok(None);
+        }
+        let (at, len) = (loc.offset + RECORD_HEADER, entry.bytes.len() as u64);
+        let of = |view: &'a View| view.tiers.get(found.tier)?.packs.get(loc.pack as usize)?.place(at, len);
+        let (Some(place), Some(side)) = (of(found.view).or_else(|| of(self.view())), self.shared.side())
+        else {
+            return Ok(None);
+        };
+        // alloc: the error's message
+        let corrupt = |why: String| Corrupt { key: *key, pack: self.file_of(found), what: why };
+        let run = Run::of(place, len);
+        self.shared
+            .pin_room(u64::from(run.pages) * PAGE)
+            // alloc: the error's message
+            .map_err(|why| corrupt(format!("it could not be held past its task: {why}")))?;
+        let pinned = PinnedRun::pin(side, run)
+            // alloc: the error's message
+            .map_err(|why| corrupt(format!("it could not be held past its task: {why}")))?;
+        debug_assert_eq!(pinned.bytes(place, len).as_ptr(), entry.bytes.as_ptr(), "{loc:?}");
+        // alloc: a count of the pins, so a clone of the value shares them
+        Ok(Some((Arc::new(pinned), place)))
+    }
+
     /// The mapping `entry`'s bytes are a range of, and where in it they start, when they are
-    /// one and start at a multiple of [`disk::ALIGN`]: a raw record of a pack, or a file of its
-    /// own. A value made whole (decompressed, from chunks or columns) or still in a writer's
-    /// segment is in none. For a file of its own, also the file, which holds the value whole.
+    /// one and start at a multiple of [`disk::ALIGN`]: a file of its own, which holds the
+    /// value whole (the one kind of store file still mapped: a [`Kind::Machine`] module's
+    /// loader maps it, and the others wait for block checks of their own to move onto the
+    /// pool). A raw record of a pack is held by pins ([`Look::pins_holding`]); a value made
+    /// whole (decompressed, from chunks or columns) or still in a writer's segment is in
+    /// neither.
     fn mapping_holding(
         self,
         found: Found<'a>,
@@ -958,7 +1300,6 @@ impl<'a> Look<'a> {
         let of = |view: &'a View| -> Option<(&'a Mapping, Option<&'a FileName>)> {
             let tier = view.tiers.get(found.tier)?;
             match loc.form {
-                Form::Raw => Some((tier.packs.get(loc.pack as usize)?.mapping.as_ref()?, None)),
                 Form::External => {
                     let external = tier.externals.get(&entry.content)?;
                     Some((external.mapping.as_ref()?, Some(&external.file)))
@@ -981,10 +1322,13 @@ impl<'a> Look<'a> {
 
 /// A value of the store held past the task it was read in: [`crate::Reader::pinned`].
 ///
-/// Its bytes start at a multiple of 16 and stay as they are while it lives: a range of its
-/// pack's or file's mapping, which a clone of the [`Mapping`] keeps mapped (the store replaces a
-/// file only by renaming another over it), or an aligned copy of a value that had to be made
-/// whole. Verified against the content hash it was put with before it was made.
+/// Its bytes start at a multiple of 16 and stay as they are while it lives: a raw record of
+/// a pack in the pages of the store's pool, which pins of its own keep in memory (counted in
+/// the pool's pinned bytes, and never the sweep's to take, until it is dropped); a range of
+/// the mapping of a file of its own, which a clone of the [`Mapping`] keeps mapped (the
+/// store replaces a file only by renaming another over it); or an aligned copy of a value
+/// that had to be made whole. Verified against the content hash it was put with before it
+/// was made.
 #[derive(Clone)]
 pub struct Pinned {
     pub key: Key,
@@ -996,6 +1340,12 @@ pub struct Pinned {
 
 #[derive(Clone)]
 enum PinnedBytes {
+    /// `len` bytes at the pool's byte `at`, in pages `run` pins.
+    Pool {
+        run: Arc<PinnedRun>,
+        at: u64,
+        len: u64,
+    },
     /// `file` is the file of its own the value is the whole of, when it is one.
     Mapped {
         mapping: Mapping,
@@ -1009,7 +1359,7 @@ enum PinnedBytes {
 impl Pinned {
     /// Whether its bytes are the store's own, in place, rather than a copy.
     pub fn in_place(&self) -> bool {
-        matches!(self.bytes, PinnedBytes::Mapped { .. })
+        matches!(self.bytes, PinnedBytes::Mapped { .. } | PinnedBytes::Pool { .. })
     }
 
     /// The file under the driver's root whose bytes are exactly the value, when the value is a
@@ -1020,7 +1370,7 @@ impl Pinned {
     pub fn file(&self) -> Option<&FileName> {
         match &self.bytes {
             PinnedBytes::Mapped { file, .. } => file.as_ref(),
-            PinnedBytes::Copied(_) => None,
+            PinnedBytes::Pool { .. } | PinnedBytes::Copied(_) => None,
         }
     }
 }
@@ -1031,6 +1381,7 @@ impl std::ops::Deref for Pinned {
     #[inline]
     fn deref(&self) -> &[u8] {
         match &self.bytes {
+            PinnedBytes::Pool { run, at, len } => run.bytes(*at, *len),
             PinnedBytes::Mapped { mapping, start, len, .. } => {
                 &mapping.bytes()[*start..*start + *len]
             }

@@ -373,6 +373,12 @@ pub struct Options {
     pub sources: FileName,
     /// The daemon as a writer of that store: one per state directory.
     pub writer: ContentId,
+    /// How its stores load the pages of their packs a read finds not in memory
+    /// ([`blaze_cas::Loader`]): by a thread of each store's own on the target's native
+    /// driver, over the root of the driver the daemon runs on (`blaze serve`); or, where the
+    /// daemon's driver is the simulation and its files are in no file system, as effects of
+    /// the store's that the daemon's driver completes.
+    pub store_loader: blaze_cas::Loader,
     /// The socket it listens on; `None` takes requests from this process alone
     /// ([`Daemon::connect_local`]): the seed's one-shot build ([`super::once`]).
     pub socket: Option<FileName>,
@@ -1232,7 +1238,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 layers: Vec::new(),
                 tags: STORE,
                 load_tags: LOADS,
-                loader: blaze_cas::Loader::Thread,
+                // clone: once per daemon started, a path
+                loader: options.store_loader.clone(),
             };
         let mut store = Store::open(store_config, &mut effects);
         store.encode_columns(blaze_format::Spans::columns());
@@ -1242,7 +1249,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             writer: options.writer,
             tags: STD_STORE,
             load_tags: STD_LOADS,
-            loader: blaze_cas::Loader::Thread,
+            // clone: once per daemon started, a path
+            loader: options.store_loader.clone(),
         };
         let mut std = Store::open_shared(shared, &mut effects);
         let mut read =

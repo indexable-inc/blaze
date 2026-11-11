@@ -17,7 +17,9 @@
 //!   it says: mimalloc's count, which a purge never lowers), `blaze-mem resident bytes`
 //!   (blaze-mem's committed pages less the purged ones), `chunks warm bytes` and `chunks cold
 //!   bytes` (free chunks resident and purged), and `blocks live bytes`, `blocks warm bytes`
-//!   and `blocks cold bytes` (kept values' size classes).
+//!   and `blocks cold bytes` (kept values' size classes), and the stores' buffer pools
+//!   ([`blaze_cas::pool_counts`]): `pool resident bytes`, `pool pinned bytes`, `pool loaded
+//!   bytes`, `pool prefetched bytes`, `pool evicted bytes` and `pool pinned bound waits`.
 //!
 //! What the footprint holds past the live heap and blaze-mem's resident pages, the memory the
 //! allocators keep, is `footprint bytes` less `heap live bytes` less `blaze-mem resident
@@ -116,6 +118,16 @@ pub(super) fn plot(memory: &Snapshot, heap: u64, shown: &mut Shown) {
     plot_named("blocks live bytes", blocks.live());
     plot_named("blocks warm bytes", blocks.warm);
     plot_named("blocks cold bytes", blocks.cold);
+    // The stores' buffer pools: what they hold resident is `Tag::Pool`'s live bytes above;
+    // these say how much of it readers pin (not the sweep's to take), the bound on that, the
+    // budget the sweep holds the pools to, and what moved through them.
+    let pool = blaze_cas::pool_counts();
+    plot_named("pool resident bytes", pool.resident);
+    plot_named("pool pinned bytes", pool.pinned);
+    plot_named("pool loaded bytes", pool.loaded);
+    plot_named("pool prefetched bytes", pool.prefetched);
+    plot_named("pool evicted bytes", pool.evicted);
+    plot_named("pool pinned bound waits", pool.bound_waits);
 }
 
 #[cfg(test)]

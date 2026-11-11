@@ -1343,6 +1343,9 @@ fn options() -> Options {
         builds: name("cache/blaze/build"),
         sources: name("cache/blaze/sources"),
         writer: Hasher::new("blaze v2 test writer").part(STATE.as_bytes()).finish(),
+        // The simulation's files are in no file system a loader's thread could read: the
+        // stores load their packs through the daemon's driver.
+        store_loader: blaze_cas::Loader::Pumped,
         socket: Some(name(SOCKET)),
         http: None,
         budget: None,
