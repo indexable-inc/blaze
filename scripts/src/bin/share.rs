@@ -289,9 +289,17 @@ fn case() -> Case {
     Case { name: "type_id".to_owned(), source: PathBuf::from("type_id.rs"), expected: "false\ntrue\ntrue\nfalse\n".to_owned() }
 }
 
-/// Python's `assert holds, what`, as the selftest prints the `AssertionError`.
-fn check(holds: bool, what: String) -> Result<(), String> {
-    if holds { Ok(()) } else { Err(format!("AssertionError: {what}")) }
+/// Python's `assert cond, what`, as the selftest prints the `AssertionError`: `what` is said
+/// (and made) only when `cond` does not hold; `assert!(cond)` says nothing after the type.
+macro_rules! py_assert {
+    ($cond:expr) => {
+        py_assert!($cond, "")
+    };
+    ($cond:expr, $what:expr) => {
+        if !$cond {
+            return Err(format!("AssertionError: {}", $what));
+        }
+    };
 }
 
 fn test_cases() -> Result<(), String> {
@@ -304,60 +312,63 @@ fn test_cases() -> Result<(), String> {
     }
     let (found, lone) = cases(top);
     let got: Vec<(&str, &str)> = found.iter().map(|c| (c.name.as_str(), c.expected.as_str())).collect();
-    check(got == [("a", ""), ("b", "x\n")], format!("{got:?}"))?;
-    check(lone == ["lone.rs"], format!("{lone:?}"))?;
+    py_assert!(got == [("a", ""), ("b", "x\n")], format!("{got:?}"));
+    py_assert!(lone == ["lone.rs"], format!("{lone:?}"));
     let (found, lone) = cases(&engine::root().join(PROGRAMS));
     let names: Vec<&str> = found.iter().map(|c| c.name.as_str()).collect();
-    check(
+    py_assert!(
         lone.is_empty() && names.len() >= 9 && ["type_id", "statics", "drop_order"].iter().all(|n| names.contains(n)),
-        format!("({names:?}, {lone:?})"),
-    )
+        format!("({names:?}, {lone:?})")
+    );
+    Ok(())
 }
 
 fn test_judge() -> Result<(), String> {
     let c = case();
     let good = ran(0, &c.expected, "");
-    check(judge(&c, &ran(0, "", ""), Some(&good), None) == (Verdict::Pass, String::new()), String::new())?;
+    py_assert!(judge(&c, &ran(0, "", ""), Some(&good), None) == (Verdict::Pass, String::new()));
     let crlf = ran(0, &c.expected.replace('\n', "\r\n"), "");
-    check(judge(&c, &ran(0, "", ""), Some(&crlf), None) == (Verdict::Pass, String::new()), String::new())?;
+    py_assert!(judge(&c, &ran(0, "", ""), Some(&crlf), None) == (Verdict::Pass, String::new()));
     let (verdict, detail) = judge(&c, &ran(0, "", ""), Some(&ran(0, "false\ntrue\ntrue\n", "")), None);
-    check(verdict == Verdict::Fail && detail.contains("blaze's stdout is not type_id.stdout") && detail.contains("line 4"), detail.clone())?;
-    check(detail.contains("expected:\n    false") && detail.contains("blaze printed:\n    false"), detail)?;
+    py_assert!(verdict == Verdict::Fail && detail.contains("blaze's stdout is not type_id.stdout") && detail.contains("line 4"), detail);
+    py_assert!(detail.contains("expected:\n    false") && detail.contains("blaze printed:\n    false"), detail);
     let (verdict, detail) = judge(&c, &ran(101, "", "error: x"), None, None);
-    check(verdict == Verdict::Fail && detail.contains("blaze does not build type_id (exit 101)") && detail.contains("error: x"), detail)?;
+    py_assert!(verdict == Verdict::Fail && detail.contains("blaze does not build type_id (exit 101)") && detail.contains("error: x"), detail);
     let (verdict, detail) = judge(&c, &ran(0, "", ""), Some(&ran(101, &c.expected, "panicked")), None);
-    check(verdict == Verdict::Fail && detail.contains("blaze's type_id exits 101"), detail)?;
+    py_assert!(verdict == Verdict::Fail && detail.contains("blaze's type_id exits 101"), detail);
     let (verdict, detail) = judge(&c, &ran(0, "", ""), None, Some("cargo: no daemon"));
-    check(verdict == Verdict::Fail && detail.contains("not blaze's: cargo: no daemon"), detail)?;
+    py_assert!(verdict == Verdict::Fail && detail.contains("not blaze's: cargo: no daemon"), detail);
     // A wrong exit and a wrong stdout: both are said.
     let (verdict, detail) = judge(&c, &ran(0, "", ""), Some(&ran(1, "y\n", "")), None);
-    check(verdict == Verdict::Fail && detail.contains("exits 1") && detail.contains("blaze's stdout"), detail)
+    py_assert!(verdict == Verdict::Fail && detail.contains("exits 1") && detail.contains("blaze's stdout"), detail);
+    Ok(())
 }
 
 fn test_package() -> Result<(), String> {
     let text = manifest("drop_order");
-    check(
-        text.contains("[package]\nname = \"drop_order\"") && text.contains("edition = \"2024\"") && text.ends_with("[workspace]\n"),
-        String::new(),
-    )
+    py_assert!(
+        text.contains("[package]\nname = \"drop_order\"") && text.contains("edition = \"2024\"") && text.ends_with("[workspace]\n")
+    );
+    Ok(())
 }
 
 fn test_input() -> Result<(), String> {
     let read = |text: &str| input::read(text).and_then(|value| input::of::<Args>(&value, ""));
     let args = read(r#"{"engine": {"kind": "v2", "blaze": "b"}, "out": "", "programs": ["type_id"]}"#).map_err(|e| e.0)?;
-    check(args.programs == ["type_id"] && args.dir == PROGRAMS && args.jobs == 4, String::new())?;
+    py_assert!(args.programs == ["type_id"] && args.dir == PROGRAMS && args.jobs == 4);
     let statics = Case { name: "statics".to_owned(), source: PathBuf::from("s.rs"), expected: String::new() };
     let picked: Vec<String> = chosen(&args, &[case(), statics])?.into_iter().map(|c| c.name).collect();
-    check(picked == ["type_id"], String::new())?;
+    py_assert!(picked == ["type_id"]);
     let unknown = Args { programs: vec!["nope".to_owned()], ..args };
     match chosen(&unknown, &[case()]) {
-        Err(said) => check(said.contains("nope"), said)?,
+        Err(said) => py_assert!(said.contains("nope"), said),
         Ok(_) => return Err("AssertionError: an unknown program was taken".to_owned()),
     }
     match read(r#"{"engine": {"kind": "v2", "blaze": "b"}, "out": "", "program": []}"#) {
-        Err(said) => check(said.0.contains("no field program"), said.0),
-        Ok(_) => Err("AssertionError: an unknown field was taken".to_owned()),
+        Err(said) => py_assert!(said.0.contains("no field program"), said.0),
+        Ok(_) => return Err("AssertionError: an unknown field was taken".to_owned()),
     }
+    Ok(())
 }
 
 type Test = (&'static str, fn() -> Result<(), String>);
