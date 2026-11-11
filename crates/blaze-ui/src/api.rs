@@ -858,6 +858,7 @@ mod tests {
     fn work_is_one_json_line_in_the_form_proof_reads() {
         let worked = Worked {
             why: None,
+            tiers: None,
             reran: 12,
             misses: 0,
             green: 300,
@@ -911,6 +912,7 @@ mod tests {
         );
         let worked = Worked {
             why: None,
+            tiers: None,
             reran: 0,
             misses: 0,
             green: 0,

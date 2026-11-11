@@ -1544,6 +1544,7 @@ fn agent() -> Targets {
     Targets {
         packages: Vec::new(),
         profile: String::new(),
+        goal: None,
         target: None,
         features: Vec::new(),
         all_features: false,
@@ -2183,6 +2184,7 @@ fn an_agents_targets_are_the_views_invocation() {
     let targets = Targets {
         packages: vec!["app".into()],
         profile: "release".into(),
+        goal: None,
         target: None,
         features: vec!["x".into()],
         all_features: false,

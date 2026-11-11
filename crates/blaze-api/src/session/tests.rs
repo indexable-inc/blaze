@@ -148,6 +148,7 @@ fn targets() -> Targets {
     Targets {
         packages: Vec::new(),
         profile: "dev".to_owned(),
+        goal: None,
         target: None,
         features: Vec::new(),
         all_features: false,
@@ -864,6 +865,7 @@ fn worked() -> Response {
         critical_path_us: 70,
         steps_us: vec![(crate::NodeKind::Codegen, 70)],
         placed: crate::PlacedBytes::default(),
+        tiers: Some(crate::Tiers::of(crate::Goal::Edit).with(1, 4)),
     })
 }
 

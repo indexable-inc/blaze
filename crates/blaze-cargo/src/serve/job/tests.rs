@@ -11,6 +11,7 @@ fn targets() -> Targets {
     Targets {
         packages: vec!["a".into(), "b".into()],
         profile: "release".into(),
+        goal: None,
         target: Some("wasm32-unknown-unknown".into()),
         features: vec!["x".into(), "y".into()],
         all_features: false,

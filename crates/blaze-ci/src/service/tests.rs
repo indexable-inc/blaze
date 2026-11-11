@@ -10,6 +10,7 @@ fn targets() -> TargetsConfig {
     TargetsConfig {
         packages: Vec::new(),
         profile: "dev".to_owned(),
+        goal: None,
         target: None,
         features: Vec::new(),
         all_features: false,

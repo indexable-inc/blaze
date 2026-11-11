@@ -384,6 +384,7 @@ pub fn targets(asked: &Invocation, cargo: Cargo) -> Result<Targets, Refused> {
     Ok(Targets {
         packages: flags.packages.clone(),
         profile: asked.profile(),
+        goal: flags.goal,
         target,
         features: flags.features.clone(),
         all_features: flags.all_features,
