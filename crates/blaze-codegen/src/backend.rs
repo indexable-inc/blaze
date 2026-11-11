@@ -294,6 +294,16 @@ pub trait Frontend: Sync {
         None
     }
 
+    /// Brings the front end's query engine up to its view before a patched walk asks: the
+    /// engine walks from what was written to the memos that changed (its changed set), so
+    /// each describe and count asked afterwards that the writes did not reach answers with
+    /// no verification of what it read. Gives the rows the engine visited, the reverse edges
+    /// it followed and the nodes that changed, for the walk's span; `None` (the default) for
+    /// a front end with no such engine, whose asks cost what they cost.
+    fn settle(&self) -> Option<(u64, u64, u64)> {
+        None
+    }
+
     /// The group of inputs a describe and a count of `instance` for `requester` hang on
     /// beside durable ones, where the front end can name one whose writes it tells
     /// ([`Self::written_since`]): a workspace crate's sources, say. Asked after a describe of

@@ -142,6 +142,28 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
     /// [`every_body`](super::every_body)), listed: one batch of the database's tasks, a file
     /// module each.
     pub fn new(db: &Db, crates: &[Crate], asked: &'f F) -> Plan<'f, F> {
+        // First the engine's changed set: a walk from the inputs written since the last one
+        // to the memos that changed, with early cutoff (blaze-query's `frontier`). After it
+        // a memo the edit did not reach ([`body_check_clean`], [`module_check_clean`], a
+        // module's list) is marked unchanged where the plan and the sweep ask it, a few
+        // loads each, with no walk of what it read. Its span says what the engine did for
+        // this edit; a second plan of the same view finds the walk done.
+        {
+            let settling = tracing::info_span!(
+                target: "blaze",
+                "body check: changed set",
+                visited = tracing::field::Empty,
+                edges = tracing::field::Empty,
+                changed = tracing::field::Empty,
+                unwound = tracing::field::Empty,
+            )
+            .entered();
+            let work = blaze_query::db::plumbing::walk_changed_set(db);
+            settling.record("visited", work.visited);
+            settling.record("edges", work.edges);
+            settling.record("changed", work.changed);
+            settling.record("unwound", work.unwound);
+        }
         let mut modules = Vec::new();
         let mut crate_ends = Vec::with_capacity(crates.len());
         for &krate in crates {
@@ -252,13 +274,14 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
         let home = ptr::from_ref(db).cast::<()>().addr();
         // The sweep: a task a module and a body of the plan, each of which asks the engine
         // whether its memo still holds ([`body_check_clean`], [`module_check_clean`]) and is
-        // checked again only where it does not. It visits every one, so its cost is the
-        // crate's and not the edit's (on ripgrep's binary, 2026-11-11: `unit bodies` 484 ms,
-        // 283 ms of CPU, `body_check_clean` executed 6 and verified 1,149). What makes it the
-        // edit's is the engine naming the memos that changed
-        // (docs/v2/plan/design/incremental-walk.md, "The changed set from the engine");
-        // until then this span holds the sweep's wall time, and the queries that ran under
-        // it name the bodies checked again.
+        // checked again only where it does not. It visits every one; what a visit costs is
+        // the engine's: before the changed set, a verification of the memo's reads (on
+        // ripgrep's binary, 2026-11-11: `unit bodies` 484 ms, 283 ms of CPU,
+        // `body_check_clean` executed 6 and verified 1,149); after the walk [`Plan::new`]
+        // asked for, a memo the edit did not reach is marked unchanged in a few loads
+        // (docs/v2/plan/design/incremental-walk.md, "The changed set from the engine"), so
+        // the sweep costs a task a body and the bodies the edit changed. This span holds
+        // its wall time, and the queries that ran under it name the bodies checked again.
         let _sweep = tracing::info_span!(
             target: "blaze",
             "body check sweep",

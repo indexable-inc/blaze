@@ -1152,6 +1152,17 @@ impl Frontend for HirFrontend<'_> {
         })
     }
 
+    /// The query engine's changed-set walk (`blaze_query::db::plumbing::walk_changed_set`):
+    /// from the inputs written since the last walk to the memos that changed, with early
+    /// cutoff. After it [`described_memo`], [`counted_memo`] and [`described_static_memo`]
+    /// of what the writes did not reach are marked unchanged where they are asked.
+    fn settle(&self) -> Option<(u64, u64, u64)> {
+        self.with(|db| {
+            let work = blaze_query::db::plumbing::walk_changed_set(db);
+            Some((work.visited, work.edges, work.changed))
+        })
+    }
+
     /// The view the last write of a library input opened in the database
     /// (`Storage::durable_view`).
     fn durable_view(&self) -> Option<u64> {

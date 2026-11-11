@@ -746,10 +746,13 @@ fn set_apart(frontier: &Frontier, node: u32) -> bool {
 /// Walks the changed set of this view if a walk is due: what a host calls once after its
 /// writes and before it asks for what it holds, so each row it asks that the edit did not
 /// reach answers by [`clean`]. Returns what the last walk did. For a caller outside any
-/// query.
+/// query: asked from inside one (a query on this task's stack) it starts no walk, since a
+/// walk waits for rows the caller's own stack may hold, and gives the last walk's work.
 pub fn walk_changed_set<D: Database>(db: &D) -> ChangedSetWork {
     let storage = db.storage();
-    bring_to_date(std::ptr::from_ref(db).cast(), storage);
+    if local::with(|local| local.task_frames()) == 0 {
+        bring_to_date(std::ptr::from_ref(db).cast(), storage);
+    }
     storage.changed_set_work()
 }
 

@@ -432,6 +432,24 @@ impl<'a, B: Prepare> Build<'a, B> {
         // The asking is the part of a patched walk that is still the program's size, not the
         // edit's (docs/v2/plan/design/incremental-walk.md, "The changed set from the engine"):
         // its own span, so the profile says how much of `codegen walk` it is.
+        // First the engine's changed set (`Frontend::settle`): after it, a function the
+        // edit did not reach answers its ask in a few loads, so the asking below costs the
+        // functions asked a load each and the edit's own describes, not a verification each.
+        // Its span says what the engine did for this edit.
+        let settling = tracing::info_span!(
+            target: "blaze",
+            "codegen walk: changed set",
+            visited = tracing::field::Empty,
+            edges = tracing::field::Empty,
+            changed = tracing::field::Empty,
+        )
+        .entered();
+        if let Some((visited, edges, changed)) = self.frontend.settle() {
+            settling.record("visited", visited);
+            settling.record("edges", edges);
+            settling.record("changed", changed);
+        }
+        drop(settling);
         let asking = tracing::info_span!(
             target: "blaze",
             "codegen walk: ask functions",
