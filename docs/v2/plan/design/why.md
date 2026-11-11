@@ -139,7 +139,7 @@ kind, most first, naming at most 3 items and counting the rest:
 | trivia only | warning, `why:wasted` | `recomputed N steps because PATH changed, though no item in it did (comments only): wasted work, a bug in blaze's keys` |
 | first time | note, `why:first` | `computed N steps for the first time`, no facts: a cold build is one line |
 | evicted | note, `why:evicted` | `recomputed N steps because blaze why's ledger dropped its records of them to stay under its cap` |
-| previous failed | note, `why:failed` | `recomputed N steps because the last compute of each failed or was stopped` |
+| previous failed | note, `why:failed` | `recomputed N steps because the build that last computed each did not end well and kept nothing of it` |
 | forced | note, `why:forced` | `recomputed N steps because that was asked for: HOW` |
 | key unstable | warning, `why:unstable` | ``recomputed N steps because `PART` came out different from the same inputs (a determinism bug in blaze)`` |
 | unexplained | warning, `why:unexplained` | ``N steps recomputed for no recorded reason: a blaze bug (`blaze why --unexplained`)`` |
@@ -233,3 +233,17 @@ read as slow no-ops. Now:
 - Test: `a_build_after_one_that_failed_says_so_first_and_only_until_one_ends_well`
   (`crates/blaze-cargo/src/serve/tests.rs`), and `what_the_last_build_left_unfinished_is_said_before_the_work`
   (`serve/why.rs`).
+
+## No reason is a guess (2026-11-11)
+
+`blaze why` prints what the daemon recorded. Where the record does not tell two things apart
+(a compute that kept nothing, or an entry collected since), the reason says both and that
+which is not recorded. Where the record is gone or was never made, it says why and the command
+that reads what is left: a subject the ledger shrank to stay under its cap names
+`blaze explain key_part_diff after=<this build> before=<its last>` (the history's `key_parts`);
+a subject last computed in a build that did not end well names that build's `errors` rows; a
+daemon with no build to answer of names the query over the history's `misses`. No text says
+"likely". Tests: `no_reason_is_a_guess` and
+`an_explanation_that_is_unavailable_says_why_and_where_to_read_it` (`crates/blaze-ui/src/why.rs`).
+The ledger's cap is held against what shrinking frees (commit 2449b43295), so the last
+build's records are never the ones dropped.

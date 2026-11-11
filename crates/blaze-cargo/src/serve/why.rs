@@ -113,9 +113,9 @@ struct Last {
     parts: Vec<Kept>,
     beyond: Option<String>,
     subject: ContentId,
-    /// Whether the build that computed it did not end well (failed, or was stopped): a compute
-    /// of the same key that kept nothing then likely failed or was stopped
-    /// ([`RebuildCause::Unfinished`]).
+    /// Whether the build that computed it did not end well (failed, or was stopped): what a
+    /// miss of the same key with nothing kept says ([`RebuildCause::Unfinished`]). Whether the
+    /// compute itself failed is not recorded here; that build's `errors` rows say.
     unfinished: bool,
 }
 
@@ -756,12 +756,12 @@ pub fn compact_due(len: u64, live: u64) -> bool {
     len > COMPACT_MIN && len > live.saturating_mul(2)
 }
 
-/// About how many bytes `last` takes in the file: the bound [`Ledger::prune`] keeps.
 /// What a subject weighs as a tombstone: [`weight`] with no part, end or `beyond`.
 fn bare(last: &Last) -> usize {
     160 + last.step.len() + last.item.len()
 }
 
+/// About how many bytes `last` takes in the file: the bound [`Ledger::prune`] keeps.
 fn weight(last: &Last) -> usize {
     let part = |it: &Kept| {
         56 + it.name.len()
@@ -1340,7 +1340,7 @@ fn because(ends: &[Reason], count: u64, steps_word: &str) -> (Text, (bool, &'sta
                 (1, "their results were dropped from the store", None, (false, "why:evicted"))
             }
             Reason::PreviousFailed { .. } => {
-                (2, "the last compute of each failed or was stopped", None, (false, "why:failed"))
+                (2, "the build that last computed each did not end well and kept nothing of it", None, (false, "why:failed"))
             }
             Reason::Forced { how } => {
                 (3, "that was asked for: ", Some(how.as_str()), (false, "why:forced"))
