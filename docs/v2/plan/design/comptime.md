@@ -668,6 +668,13 @@ Two more pieces of the feature, for properties derived by a const walk over `typ
   `hir_ty::where_const`; the solver's `ConstEvaluatable` goal asks the delegate.
 - **`core::reflect::name_of(id)`** (intrinsic `blaze_type_name_of`): the type a `TypeId` is of,
   as a diagnostic names it. A walk over ids names the types on its path with it.
+- **A constant of `TypeId`s read by another evaluation** (`walk(id::<T>(), &Q::ASK)`, where
+  `Q::ASK` holds ids): an id's bytes in the evaluator are its place in the list of the
+  evaluation that made it, and the constant carries what type each is of
+  (`ComplexMemoryMap::type_ids`). Copying the constant into a reader gives each id the walk by
+  type reaches the reader's id of the same type (`Evaluator::own_type_id`), so the value is the
+  same whoever reads it and nothing is evaluated twice. A constant whose type could hide an id
+  from that walk (a raw pointer, a `dyn`, a union that may hold one) is refused by name.
 - Phase 1 answers a tuple's `TypeKind` (`Tuple`), which it refused as rustc ICEs: a walk by
   kind has to tell a tuple from what it cannot see into.
 

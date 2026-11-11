@@ -3945,9 +3945,19 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         nested: Mutability,
     ) -> Result<'db, ()> {
         let AllocationData { ty, memory: ref v, ref memory_map } = *allocation;
-        // Its ids are of the evaluation that made it, and mean another type here.
-        if memory_map.has_type_ids() {
-            not_supported!("a constant computed from a `TypeId`, read by another evaluation");
+        // Its ids are of the evaluation that made it, and mean another type here: each one the
+        // walk by type reaches is given this evaluation's id of the same type
+        // ([`Self::patch_addresses`]), so the value read is the constant's whoever reads it.
+        // One the walk could not reach would be left meaning another type: refused.
+        if memory_map.has_type_ids()
+            && !self.type_ids_in_view(ty, &mut HashSet::new_in(std::alloc::Global))
+        {
+            // alloc: error path
+            return Err(MirEvalError::NotSupported(format!(
+                "{} (of `{ty:?}`), computed from a `TypeId` and read by {}: its type has a raw                  pointer, a `dyn` or a union that may hold a `TypeId`, where the id of the                  evaluation that made it cannot be found and given this one's",
+                whose(),
+                evaluated(self.db, self.owner)
+            )));
         }
         let mut frozen: SmallVec<[Interval; 4]> = SmallVec::new();
         let freezes = M::CHECKS && nested == Mutability::Not;
@@ -4966,6 +4976,96 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
     }
 
+    /// Whether every `TypeId` a value of the type may hold is where the walk by type of
+    /// [`Self::patch_addresses`] finds it: in a field, an element, or behind a reference to
+    /// those. Behind a raw pointer or a `dyn`, or in a union that may hold one, it is not.
+    fn type_ids_in_view(
+        &self,
+        ty: Ty<'db>,
+        seen: &mut HashSet<Ty<'db>, std::alloc::Global>,
+    ) -> bool {
+        if !seen.insert(ty) {
+            return true;
+        }
+        match ty.kind() {
+            TyKind::Bool
+            | TyKind::Char
+            | TyKind::Int(_)
+            | TyKind::Uint(_)
+            | TyKind::Float(_)
+            | TyKind::Str
+            | TyKind::Never
+            | TyKind::FnDef(..)
+            | TyKind::FnPtr(..) => true,
+            TyKind::Array(inner, _)
+            | TyKind::Pat(inner, _)
+            | TyKind::Slice(inner)
+            | TyKind::Ref(_, inner, _) => self.type_ids_in_view(inner, seen),
+            TyKind::Tuple(fields) => fields.iter().all(|it| self.type_ids_in_view(it, seen)),
+            TyKind::Alias(..) => {
+                let normalized =
+                    super::normalize_or_keep(&self.infcx, self.param_env.param_env, ty);
+                !matches!(normalized.kind(), TyKind::Alias(..))
+                    && self.type_ids_in_view(normalized, seen)
+            }
+            TyKind::Adt(adt, subst) => {
+                if self.lang_items().TypeId.is_some_and(|it| adt.def_id() == AdtId::StructId(it)) {
+                    return true;
+                }
+                let mut variants = match adt.def_id() {
+                    AdtId::StructId(it) => Either::Left(iter::once(VariantId::from(it))),
+                    // Walked as words, not as its fields.
+                    AdtId::UnionId(_) => {
+                        return self.holds_no_type_id(ty, &mut HashSet::new_in(std::alloc::Global));
+                    }
+                    AdtId::EnumId(it) => Either::Right(
+                        it.enum_variants(self.db)
+                            .variants
+                            .values()
+                            .map(|&(v, _)| VariantId::from(v)),
+                    ),
+                };
+                variants.all(|variant| {
+                    self.db.field_types(variant).iter().all(|(_, field)| {
+                        let field = field.ty().instantiate(self.interner(), subst).skip_norm_wip();
+                        self.type_ids_in_view(field, seen)
+                    })
+                })
+            }
+            _ => false,
+        }
+    }
+
+    /// The `TypeId` at `addr`, copied from the constant `source`, as this evaluation's: the
+    /// id of the same type here, made when it is the first asked for. The bytes of an id are
+    /// its place in the list of the evaluation that made it ([`Self::type_id`]), and
+    /// `source` says what type each of its own is of.
+    fn own_type_id(
+        &mut self,
+        source: &MemoryMap<'db>,
+        addr: Address,
+        size: usize,
+    ) -> Result<'db, ()> {
+        if !source.has_type_ids() {
+            return Ok(());
+        }
+        if size != 16 {
+            not_supported!("a `TypeId` of {size} bytes in a constant read by another evaluation");
+        }
+        let id = from_bytes!(u128, self.peek_memory(addr, size)?);
+        // No id: bytes nothing wrote one to.
+        if id == 0 {
+            return Ok(());
+        }
+        let Some(ty) = source.type_id_ty(id) else {
+            not_supported!(
+                "a `TypeId` in a constant read by another evaluation, which the evaluation that                  made the constant did not make (its bytes are {id:#x})"
+            );
+        };
+        let own = self.type_id(ty);
+        self.write_memory(addr, &own)
+    }
+
     fn create_memory_map(
         &self,
         bytes: &[u8],
@@ -5619,6 +5719,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             TyKind::Adt(id, args) => match id.def_id() {
                 // A `#[blaze::bits]` struct is an integer: no field holds an address.
                 AdtId::StructId(s) if crate::layout::is_bits_struct(self.db, s) => {}
+                // An id of the constant's evaluation once (`walked`): this one's from here.
+                AdtId::StructId(s) if self.lang_items().TypeId == Some(s) => {
+                    self.own_type_id(source, addr, my_size)?
+                }
                 AdtId::StructId(s) => {
                     for (i, (_, field)) in self.db.field_types(s.into()).iter().enumerate() {
                         let offset = layout.fields.offset(i).bytes_usize();
