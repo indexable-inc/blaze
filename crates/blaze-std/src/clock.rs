@@ -14,13 +14,19 @@ pub struct Instant(Duration);
 
 impl Instant {
     /// Time since the driver began.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn since_start(self) -> Duration {
         self.0
     }
 
-    /// Time from `earlier` to this, zero if `earlier` is later.
-    pub fn since(self, earlier: Instant) -> Duration {
-        self.0.saturating_sub(earlier.0)
+    /// Time from `earlier` to this; `None` when `earlier` is the later of the two (it was
+    /// once zero then, unsaid).
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn since(self, earlier: Instant) -> Option<Duration> {
+        self.0.checked_sub(earlier.0)
     }
 
     /// The deadline at this moment.

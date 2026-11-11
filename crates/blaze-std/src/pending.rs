@@ -2,7 +2,7 @@
 //! [`crate::fs::File::read_into`], [`crate::fs::File::write_from`],
 //! [`crate::net::Conn::read_into`] and [`crate::net::Conn::write_from`] return. The op is
 //! handed to the driver when the call returns; [`Pending::wait`] waits for its outcome and
-//! [`Pending::cancel`] gives it up. Both consume it, and both end only once the driver is done
+//! [`Pending::cancel`] gives it up, waiting for its end until a deadline its caller names. Both consume it, and both end only once the driver is done
 //! with the op, so nothing it does (a write landing, bytes read) happens after they return.
 //! Each blocking call is its op waited for at once: `file.read_into(buf, at).wait(cx)`.
 //!
@@ -124,11 +124,13 @@ impl<T> Pending<'_, T> {
     }
 
     /// The op given up: blaze-core cannot cancel an effect in flight, so this waits, heeding
-    /// no cancellation, for the op to end, until the later of `cx`'s deadline and
-    /// [`ABANDON_WAIT`] from now. Its outcome is what the op did: done, or why the wait stopped
-    /// (then the op may still be in flight, and the stop says so).
+    /// no cancellation, for the op to end, until `give_up`: the caller's bound on a wait that
+    /// by design outlasts a cancelled or expired `cx` (it was once the later of `cx`'s
+    /// deadline and [`ABANDON_WAIT`] from now, picked here). Its outcome is what the op did:
+    /// done, or why the wait stopped (then the op may still be in flight, and the stop says
+    /// so). `cx` names the span the wait is recorded in.
     #[blaze::consumes]
-    pub fn cancel(self, cx: &Cx) -> T {
+    pub fn cancel(self, cx: &Cx, give_up: Deadline) -> T {
         let Pending { into, from: _, finish, mut settle } = self;
         settle.armed = false;
         let Some(tag) = settle.tag else {
@@ -139,8 +141,7 @@ impl<T> Pending<'_, T> {
             settle.io.forget(tag, Ends::Once);
             return finish(into, Err(Stopped::Cancelled { span: cx.name() }));
         }
-        let until = cx.deadline().max(Deadline::after(settle.io.now(), ABANDON_WAIT));
-        let done = settle.io.settle(tag, until, cx.name());
+        let done = settle.io.settle(tag, give_up, cx.name());
         finish(into, done)
     }
 }

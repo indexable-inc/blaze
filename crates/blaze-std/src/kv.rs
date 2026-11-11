@@ -6,12 +6,25 @@
 //! Rights are the directory's: a `Kv<ReadOnly>` gets and lists, a `Kv<ReadWrite>` also puts
 //! and deletes, and [`Kv::read_only`] narrows.
 //!
+//! **Durability is said at every put and delete**, as for files ([`crate::fs`]): each has an
+//! `_unsynced` form that never waits for the device, a `_synced` form that does, and a form
+//! that takes a [`Durable`] and picks one at run time. There is no default.
+//!
+//! | call | after a crash the key holds |
+//! |---|---|
+//! | `put_synced` returned | exactly the value |
+//! | `put_unsynced` returned | what it held durably before, or any prefix of the value |
+//! | `delete_synced` returned | nothing |
+//! | `delete_unsynced` returned | nothing, or what it held |
+//!
+//! A reader always sees a key's old value or its new, never a part, crash or no crash
+//! between: a put replaces all at once.
+//!
 //! **Provider.** Real, over [`Dir`]: a key is a file of its name beneath the store's
-//! directory. A put is [`Dir::write`], blaze-core's whole-file write, which is durable and all
-//! at once (the driver's write to a temporary file, sync and rename), so a crash keeps a key's
-//! old value or its new, never a part, and a put that returned is kept. bstd adds no rename of
-//! its own on top. A delete is a remove. A host that offers a store directly (a wasm
-//! worker's) would be a second provider; none exists yet.
+//! directory, a put is a [`Dir::publish`] of the value's bytes (a temporary file beside the
+//! key, renamed over it; its name starts with a `.`, which no key does, so one left by a
+//! crash is never listed), and a delete is a remove. A host that offers a store directly (a
+//! wasm worker's) would be a second provider; none exists yet.
 
 use std::fmt;
 
@@ -20,7 +33,7 @@ use blaze_mem::Frame;
 use crate::{
     Plant, Stopped,
     cx::Cx,
-    fs::{Dir, FsError, FsKind, ReadOnly, ReadWrite, Rights},
+    fs::{Content, Dir, Durable, FsError, FsKind, ReadOnly, ReadWrite, Rights, Unsynced},
     mem::Bytes,
     path::Path,
 };
@@ -242,18 +255,54 @@ impl<#[blaze::linear] P: Rights> Kv<P> {
 }
 
 impl Kv<ReadWrite> {
+    /// `key` made to hold `value`, as durably as `durable` says: [`Kv::put_unsynced`] or
+    /// [`Kv::put_synced`], chosen at run time.
+    pub fn put(&self, cx: &Cx, key: &Key, value: &[u8], durable: Durable) -> Result<(), KvError> {
+        match durable.unsynced() {
+            Some(unsynced) => self.put_unsynced(cx, key, value, unsynced),
+            None => self.put_synced(cx, key, value),
+        }
+    }
+
+    /// `key` made to hold `value`, all at once for a reader, with nothing synced: it never
+    /// waits for the device. After a crash the key holds what it held durably before, or any
+    /// prefix of `value`.
+    pub fn put_unsynced(&self, cx: &Cx, key: &Key, value: &[u8], unsynced: Unsynced) -> Result<(), KvError> {
+        match self.dir.publish_unsynced(cx, key.path(), Content::bytes(value), unsynced) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(Self::refuse(KvOp::Put, Some(key), error)),
+        }
+    }
+
     /// `key` made to hold `value`, durably and all at once: once this returns, a crash keeps
-    /// it; before, a crash keeps the old value or the new, never a part.
-    pub fn put(&self, cx: &Cx, key: &Key, value: &[u8]) -> Result<(), KvError> {
+    /// it; before, a crash keeps the old value or the new, never a part. It waits for the
+    /// device.
+    pub fn put_synced(&self, cx: &Cx, key: &Key, value: &[u8]) -> Result<(), KvError> {
         let put = match cx.plant() {
-            Plant::KvPutUnsynced => self.dir.write_unsynced(cx, key.path(), value),
-            _ => self.dir.write(cx, key.path(), value),
+            Plant::KvPutUnsynced => self.dir.publish_unsynced(cx, key.path(), Content::bytes(value), Unsynced::No).map(|_| ()),
+            _ => self.dir.publish_synced(cx, key.path(), Content::bytes(value)).map(|_| ()),
         };
         put.map_err(|error| Self::refuse(KvOp::Put, Some(key), error))
     }
 
-    /// `key` gone from the store; gone already is done.
-    pub fn delete(&self, cx: &Cx, key: &Key) -> Result<(), KvError> {
-        self.dir.remove(cx, key.path()).map_err(|error| Self::refuse(KvOp::Delete, Some(key), error))
+    /// `key` gone from the store, as durably as `durable` says; gone already is done.
+    /// [`Kv::delete_unsynced`] or [`Kv::delete_synced`], chosen at run time.
+    pub fn delete(&self, cx: &Cx, key: &Key, durable: Durable) -> Result<(), KvError> {
+        match durable.unsynced() {
+            Some(unsynced) => self.delete_unsynced(cx, key, unsynced),
+            None => self.delete_synced(cx, key),
+        }
+    }
+
+    /// `key` gone from the store, with nothing synced: a crash may bring it back.
+    pub fn delete_unsynced(&self, cx: &Cx, key: &Key, unsynced: Unsynced) -> Result<(), KvError> {
+        self.dir
+            .remove_unsynced(cx, key.path(), unsynced)
+            .map_err(|error| Self::refuse(KvOp::Delete, Some(key), error))
+    }
+
+    /// `key` gone from the store, and a crash keeps it gone. It waits for the device.
+    pub fn delete_synced(&self, cx: &Cx, key: &Key) -> Result<(), KvError> {
+        self.dir.remove_synced(cx, key.path()).map_err(|error| Self::refuse(KvOp::Delete, Some(key), error))
     }
 }

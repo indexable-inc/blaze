@@ -14,7 +14,7 @@ use hegel::TestCase;
 use super::{Draw, Drawn, Seeds, check, control, path, root, world};
 use crate::{
     Cx, Plant,
-    fs::{Dir, FsKind, ReadWrite},
+    fs::{Content, Dir, FsKind, ReadWrite, Unsynced},
     io::Io,
     net::{Addr, Conn, HostPort, Listener, NetKind},
 };
@@ -63,7 +63,7 @@ fn flows(plan: &NetPlan, io: &Io, cx: &Cx, conn: &Conn, peer: blaze_core::Conn, 
             Flow::Send(len) => {
                 let bytes = vec![at as u8; len];
                 let fits = used + len as u64 <= limit;
-                let sent = conn.send(cx, &bytes);
+                let sent = conn.send_all(cx, &bytes);
                 let got = io.with_sim(|sim| sim.peer_received(peer)).ok_or("harness: the world is not simulated")?;
                 delivered += got.len() as u64;
                 match (sent, fits) {
@@ -209,9 +209,10 @@ fn append(cx: &Cx, limited: &Dir<ReadWrite>, name: &str, len: usize) -> Result<O
         Err(error) if error.kind == FsKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("harness: {error}")),
     };
-    let appended = file.append(cx, &vec![7; len]);
-    match file.close(cx) {
-        Ok(()) => Ok(Some(appended)),
+    let appended = file.append_unsynced(cx, &vec![7; len], Unsynced::No);
+    // Nothing here is read after a crash: closed unsynced, which cannot fail or wait.
+    match file.close_unsynced(Unsynced::No) {
+        Ok(_) => Ok(Some(appended)),
         Err(error) => Err(format!("harness: close: {error}")),
     }
 }
@@ -225,7 +226,7 @@ fn quota_run(plan: &QuotaPlan, plant: Plant) -> Result<(), String> {
     let mut used: u64 = 0;
     for (at, &change) in plan.changes.iter().enumerate() {
         let (file, len, changed) = match change {
-            Change::Write(file, len) => (file, len, Some(limited.write(&cx, &path(FILES[file]), &vec![3; len]))),
+            Change::Write(file, len) => (file, len, Some(limited.publish_unsynced(&cx, &path(FILES[file]), Content::bytes(&vec![3; len]), Unsynced::No).map(|_| ()))),
             Change::Append(file, len) => (file, len, append(&cx, &limited, FILES[file], len)?),
         };
         let fits = used + len as u64 <= plan.quota;

@@ -43,7 +43,12 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
         for (i, name) in names.iter().enumerate() {
             let may = allowed & (1 << i) != 0;
             let want = (may && name.as_str() != "UNSET").then(|| format!("{name} value"));
-            if env.get(name).map(str::to_owned) != want || env.may_read(name) != may {
+            // A variable narrowed away is refused, never read as unset.
+            let got = env.get(name);
+            if got.is_ok() != may {
+                return Err(format!("after narrowing {at}, a get of {name} gave {got:?}, but the chain allows it: {may}"));
+            }
+            if got.ok().flatten().map(str::to_owned) != want || env.may_read(name) != may {
                 return Err(format!(
                     "after narrowing {at}, {name} reads {:?} (may read: {}), but the chain allows it: {may}",
                     env.get(name),

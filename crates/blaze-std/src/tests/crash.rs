@@ -1,10 +1,10 @@
-//! Write then read round-trips through crashes: a file's appends, syncs and whole-file
-//! replaces, crashed at any point (with syncs that fail, in a swarm, and completions that come
-//! late), read back as follows. Before a crash a read is everything written; after one it is
-//! everything a returned sync or replace made durable, followed by a prefix of what came after
-//! it, never less and never anything else.
+//! Write then read round-trips through crashes: a file's unsynced appends, flushes and synced
+//! publishes over it, crashed at any point (with flushes that fail, in a swarm, and
+//! completions that come late), read back as follows. Before a crash a read is everything
+//! written; after one it is everything a returned flush or synced publish made durable,
+//! followed by a prefix of what came after it, never less and never anything else.
 //!
-//! Plant: [`Plant::SyncSkipped`], a sync that says it synced without asking the disk.
+//! Plant: [`Plant::SyncSkipped`], a flush that says it flushed without asking the disk.
 
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use hegel::TestCase;
 use super::{Draw, Drawn, Seeds, check, control, path, root};
 use crate::{
     Cx, Plant,
-    fs::{Dir, File, FsKind, ReadWrite},
+    fs::{Content, Dir, File, FsKind, ReadWrite, Unsynced},
     io::{Io, SimWorld},
 };
 
@@ -64,8 +64,14 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
         Ok(file) => file,
         Err(error) => return Err(format!("harness: {error}")),
     };
-    let acted = acts(plan, &io, &cx, &dir, &file);
-    let closed = file.close(&cx);
+    // The file's name is made durable before the acts: a flush is of a file's bytes, and a
+    // file whose name a crash undid would read as empty whatever was flushed.
+    let named = dir.sync_names(&cx);
+    let acted = match named {
+        Ok(()) => acts(plan, &io, &cx, &dir, &file),
+        Err(error) => Err(format!("harness: {error}")),
+    };
+    let closed = file.close_synced(&cx).map(|_| ());
     match (acted, closed) {
         (Err(why), _) => Err(why),
         (Ok(()), Ok(())) => Ok(()),
@@ -104,19 +110,26 @@ fn acts(plan: &Plan, io: &Io, cx: &Cx, dir: &Dir<ReadWrite>, file: &File<ReadWri
         match act {
             Act::Append(len) => {
                 let bytes = next(len);
-                file.append(cx, &bytes).map_err(|e| format!("harness: act {at}: {e}"))?;
+                file.append_unsynced(cx, &bytes, Unsynced::No).map_err(|e| format!("harness: act {at}: {e}"))?;
                 pending.extend_from_slice(&bytes);
             }
-            Act::Sync => match file.sync(cx) {
+            Act::Sync => match file.flush(cx) {
                 Ok(()) => durable.append(&mut pending),
                 Err(error) if plan.fail_syncs && matches!(error.kind, FsKind::Driver(_)) => {}
                 Err(error) => return Err(format!("harness: act {at}: {error}")),
             },
             Act::Replace(len) => {
                 let bytes = next(len);
-                file.replace(cx, &bytes).map_err(|e| format!("harness: act {at}: {e}"))?;
-                durable = bytes;
-                pending.clear();
+                match dir.publish_synced(cx, &path("log"), Content::bytes(&bytes)) {
+                    Ok(_) => {
+                        durable = bytes;
+                        pending.clear();
+                    }
+                    // A synced publish flushes its new file before it renames it over the
+                    // old: a flush the disk fails leaves the old file as it was.
+                    Err(error) if plan.fail_syncs && matches!(error.kind, FsKind::Driver(_)) => {}
+                    Err(error) => return Err(format!("harness: act {at}: {error}")),
+                }
             }
             Act::Read => {
                 let got = read(at)?;

@@ -42,19 +42,24 @@ use crate::{
     url::{Origin, Url},
 };
 
-/// The most bytes of an answer's body [`Http::over`] reads: past it the request fails
-/// ([`HttpKind::TooBig`]).
-pub const BODY_MOST: usize = 64 << 20;
-
-/// The most receives [`Http::over`] makes for one answer before it stops waiting for its end
-/// (rule bounded-progress).
-pub const READS_MOST: usize = 1 << 16;
+/// How [`Http::over`] talks on the wire and where it stops: what it calls itself and the
+/// two bounds of reading an answer. Each is its caller's to decide, so each is a field with
+/// no default and [`Http::over`] takes the whole value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Wire {
+    /// The `User-Agent` of every request.
+    pub user_agent: &'static str,
+    /// The most bytes of an answer's body that are read: past it the request fails
+    /// ([`HttpKind::TooBig`]). The bytes go to the caller's [`Bytes`], whose arena has its
+    /// own limit; this one is the peer's.
+    pub body_most: usize,
+    /// The most receives made for one answer before it stops waiting for its end
+    /// ([`HttpKind::Unending`]; rule bounded-progress).
+    pub reads_most: usize,
+}
 
 /// The most bytes one receive of [`Http::over`] asks for.
 const RECV: usize = 16 << 10;
-
-/// What [`Http::over`] calls itself.
-const USER_AGENT: &str = "bstd";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Method {
@@ -174,10 +179,10 @@ pub enum HttpKind {
     Stopped(Stopped),
     /// The answer is not HTTP/1.1 as the core reads it, which said this.
     Protocol(String),
-    /// The answer's body passed [`BODY_MOST`] bytes.
-    TooBig,
-    /// [`READS_MOST`] receives did not bring the answer's end.
-    Unending,
+    /// The answer's body passed its [`Wire::body_most`], `most` bytes.
+    TooBig { most: usize },
+    /// Its [`Wire::reads_most`], `reads` receives, did not bring the answer's end.
+    Unending { reads: usize },
 }
 
 /// A request that failed: the call, the URL and how.
@@ -203,9 +208,11 @@ impl fmt::Display for HttpError {
             HttpKind::Net(under) => write!(f, "{under}"),
             HttpKind::Stopped(stopped) => write!(f, "{stopped}"),
             HttpKind::Protocol(said) => write!(f, "{said}"),
-            HttpKind::TooBig => write!(f, "its answer's body is more than {BODY_MOST} bytes"),
-            HttpKind::Unending => {
-                write!(f, "{READS_MOST} receives did not bring its answer's end (rule bounded-progress)")
+            HttpKind::TooBig { most } => {
+                write!(f, "its answer's body is more than the {most} bytes its Http was made to read")
+            }
+            HttpKind::Unending { reads } => {
+                write!(f, "{reads} receives did not bring its answer's end (rule bounded-progress)")
             }
         }
     }
@@ -252,6 +259,7 @@ enum Provider {
         /// Kept for TLS; trusted for nothing until then.
         #[expect(dead_code, reason = "held for TLS, which over refuses today; see the module's doc")]
         roots: Roots,
+        wire: Wire,
     },
     Host(Io),
     Handler(Arc<Handler>),
@@ -266,12 +274,13 @@ pub struct Http {
 }
 
 impl Http {
-    /// Requests made by bstd itself, over connections from `net`: plain `http://` only (see
-    /// the module's doc for what it refuses and why).
-    pub fn over(net: &Net, clock: &Clock, roots: &Roots) -> Http {
+    /// Requests made by bstd itself, over connections from `net`, talking as `wire` says:
+    /// plain `http://` only (see the module's doc for what it refuses and why). It makes one
+    /// connection a request and never retries, redirects or pools.
+    pub fn over(net: &Net, clock: &Clock, roots: &Roots, wire: Wire) -> Http {
         let plant = net.io().plant();
         // clone: authority held, copied: refcounts.
-        let provider = Provider::Over { net: net.clone(), clock: clock.clone(), roots: roots.clone() };
+        let provider = Provider::Over { net: net.clone(), clock: clock.clone(), roots: roots.clone(), wire };
         Http { provider, allowed: Allowed::Any, plant }
     }
 
@@ -311,12 +320,12 @@ impl Http {
             "http" | "https" => {}
             _ => return Err(refuse(HttpKind::NotHttp)),
         }
-        let net = match &self.provider {
+        let (net, wire) = match &self.provider {
             // clone: the handler, a refcount.
             Provider::Handler(handler) => return Ok(Exchange { request: *request, state: State::Handler(Arc::clone(handler)) }),
             // clone: the world, a refcount.
             Provider::Host(io) => return Ok(Exchange { request: *request, state: State::Host(io.clone()) }),
-            Provider::Over { net, .. } => net,
+            Provider::Over { net, wire, .. } => (net, *wire),
         };
         if origin.scheme().as_str() == "https" {
             return Err(refuse(HttpKind::NoTls));
@@ -332,17 +341,17 @@ impl Http {
         let headers: Vec<(String, String)> =
             request.headers.iter().map(|it| (it.name().to_owned(), it.value().to_owned())).collect();
         // alloc: once per request, its head and body as sent.
-        let mut wire = Vec::new();
+        let mut sent = Vec::new();
         let method = request.method.of_core();
-        h1::write_request(&mut wire, &method, request.url.target(), &host, USER_AGENT, false, &headers, request.body.len(), None);
-        wire.extend_from_slice(request.body);
+        h1::write_request(&mut sent, &method, request.url.target(), &host, wire.user_agent, false, &headers, request.body.len(), None);
+        sent.extend_from_slice(request.body);
         // clone: the address connected to, a refcount.
         let conn = match net.connect(cx, &Addr::Tcp(origin.at().clone())) {
             Ok(conn) => conn,
             Err(error) => return Err(refuse(HttpKind::Net(error))),
         };
-        match conn.send(cx, &wire) {
-            Ok(()) => Ok(Exchange { request: *request, state: State::Wire(conn) }),
+        match conn.send_all(cx, &sent) {
+            Ok(()) => Ok(Exchange { request: *request, state: State::Wire(conn, wire) }),
             Err(error) => {
                 // The send's failure is the one told; the hangup's would say less.
                 let _ = conn.finish(cx);
@@ -385,8 +394,8 @@ pub struct Exchange<'a> {
 enum State {
     Handler(Arc<Handler>),
     Host(Io),
-    /// Sent on this connection, which the answer is read from.
-    Wire(Conn),
+    /// Sent on this connection, which the answer is read from, within these bounds.
+    Wire(Conn, Wire),
 }
 
 impl Exchange<'_> {
@@ -399,8 +408,8 @@ impl Exchange<'_> {
         let answered = match state {
             State::Handler(handler) => handler(cx, &request, into).map_err(HttpKind::Stopped),
             State::Host(io) => hosted(&io, cx, &request, into),
-            State::Wire(conn) => {
-                let answered = read_answer(cx, &conn, &request, into);
+            State::Wire(conn, wire) => {
+                let answered = read_answer(cx, &conn, &request, wire, into);
                 // The answer, or why there is none, is the one told; the hangup's failure
                 // would say less.
                 let _ = conn.finish(cx);
@@ -443,8 +452,14 @@ fn hosted(io: &Io, cx: &Cx, request: &Request<'_>, into: &mut Bytes<'_>) -> Resu
 
 /// The driver of [`Http::over`]: receives from `conn` fed to blaze-http's h1 core until the
 /// answer to `request` is whole, its body added to `into`; its status. Bounded by `cx`'s
-/// deadline, [`READS_MOST`] receives and [`BODY_MOST`] bytes of body.
-fn read_answer(cx: &Cx, conn: &Conn, request: &Request<'_>, into: &mut Bytes<'_>) -> Result<u16, HttpKind> {
+/// deadline, [`Wire::reads_most`] receives and [`Wire::body_most`] bytes of body.
+fn read_answer(
+    cx: &Cx,
+    conn: &Conn,
+    request: &Request<'_>,
+    wire: Wire,
+    into: &mut Bytes<'_>,
+) -> Result<u16, HttpKind> {
     let cx = cx.span("bstd::requests: an answer's bytes");
     let start = into.len();
     // alloc: the core's input and output: blaze-http's h1 parses a head from, and decodes a
@@ -452,7 +467,7 @@ fn read_answer(cx: &Cx, conn: &Conn, request: &Request<'_>, into: &mut Bytes<'_>
     let (mut unread, mut decoded): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
     let mut received = cx.bytes();
     let mut head: Option<h1::Head> = None;
-    for _ in 0..READS_MOST {
+    for _ in 0..wire.reads_most {
         if head.is_none() {
             match h1::parse_head(&unread, request.method == Method::Head).map_err(HttpKind::Protocol)? {
                 Some(parsed) => {
@@ -471,8 +486,8 @@ fn read_answer(cx: &Cx, conn: &Conn, request: &Request<'_>, into: &mut Bytes<'_>
             unread.drain(..took);
             into.try_extend(&decoded)?;
             decoded.clear();
-            if into.len() - start > BODY_MOST {
-                return Err(HttpKind::TooBig);
+            if into.len() - start > wire.body_most {
+                return Err(HttpKind::TooBig { most: wire.body_most });
             }
             if ended {
                 return Ok(head.status);
@@ -490,5 +505,5 @@ fn read_answer(cx: &Cx, conn: &Conn, request: &Request<'_>, into: &mut Bytes<'_>
         }
         unread.extend_from_slice(received.as_slice());
     }
-    Err(HttpKind::Unending)
+    Err(HttpKind::Unending { reads: wire.reads_most })
 }

@@ -17,7 +17,7 @@ use crate::{
     Cx, Plant, Stopped,
     mem::Bytes,
     net::{Addr, Conn, HostPort, Listener},
-    requests::{Http, HttpError, HttpKind, Method, Request, Response},
+    requests::{Http, HttpError, HttpKind, Method, Request, Response, Wire},
     roots::Roots,
     url::Url,
 };
@@ -28,6 +28,9 @@ const AT: [&str; 2] = ["127.0.0.1:8001", "127.0.0.2:8002"];
 const TARGETS: [&str; 4] = ["/ok", "/missing", "/big?x=1", "/echo"];
 
 const METHODS: [Method; 4] = [Method::Get, Method::Post, Method::Put, Method::Delete];
+
+/// How the tests' `Http::over` talks: every field said, as its caller must.
+const WIRE: Wire = Wire { user_agent: "bstd-test", body_most: 1 << 20, reads_most: 1 << 10 };
 
 /// How the test's server frames an answer's body.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -160,7 +163,7 @@ fn answer(cx: &Cx, conn: &Conn, origin: usize, framing: Framing) -> Result<(), S
             wire.extend_from_slice(made);
         }
     }
-    conn.send(cx, &wire).map_err(|e| format!("harness: the server's send: {e}"))
+    conn.send_all(cx, &wire).map_err(|e| format!("harness: the server's send: {e}"))
 }
 
 /// One connection accepted by `listener` and served.
@@ -234,7 +237,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let net = io.need_net().map_err(|e| format!("harness: {e}"))?;
     let clock = io.need_clock().map_err(|e| format!("harness: {e}"))?;
     let fake = Http::handler(|_: &Cx, request: &Request<'_>, into: &mut Bytes<'_>| application(request, into));
-    let real = Http::over(&net, &clock, &Roots::none());
+    let real = Http::over(&net, &clock, &Roots::none(), WIRE);
     let (fake, real) = match plan.only {
         Some(only) => {
             let url = url(&Ask { origin: only, target: 0, method: 0, body: 0, framing: Framing::Length });
@@ -281,7 +284,7 @@ fn over_a_net_refuses_https_naming_what_is_missing() {
     let io = world(1, Plant::None);
     let cx = root(&io);
     let (net, clock) = (io.need_net().expect("the simulation has a net"), io.need_clock().expect("and a clock"));
-    let http = Http::over(&net, &clock, &Roots::none());
+    let http = Http::over(&net, &clock, &Roots::none(), WIRE);
     let url = Url::parse("https://127.0.0.1/secure").expect("a test's URL");
     let error = http.request(&cx, &Request::get(&url), &mut cx.bytes()).expect_err("https is refused");
     assert_eq!(error.kind, HttpKind::NoTls);

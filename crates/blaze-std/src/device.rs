@@ -324,8 +324,9 @@ impl Bluetooth {
         }
     }
 
-    /// `bytes` written to the service `service` of the device `device`.
-    pub fn write(&self, cx: &Cx, device: &DeviceName, service: &ServiceName, bytes: &[u8]) -> Result<(), DeviceError> {
+    /// All of `bytes` written to the service `service` of the device `device`, or an error:
+    /// never a part said written.
+    pub fn write_all(&self, cx: &Cx, device: &DeviceName, service: &ServiceName, bytes: &[u8]) -> Result<(), DeviceError> {
         // clone: an error's name of its device, a refcount.
         let refuse = |kind| DeviceError { capability: "Bluetooth", op: DeviceOp::Write, device: Some(device.clone()), kind };
         if !self.devices.allows(device) || !self.services.allows(service) {
@@ -366,8 +367,9 @@ macro_rules! byte_device {
                 read(&self.io, cx, stringify!($name), $kind, &self.allowed, device, into)
             }
 
-            /// `bytes` written to the device `device`.
-            pub fn write(&self, cx: &Cx, device: &DeviceName, bytes: &[u8]) -> Result<(), DeviceError> {
+            /// All of `bytes` written to the device `device`, or an error: never a part said
+            /// written.
+            pub fn write_all(&self, cx: &Cx, device: &DeviceName, bytes: &[u8]) -> Result<(), DeviceError> {
                 write(&self.io, cx, stringify!($name), $kind, &self.allowed, device, bytes)
             }
         }

@@ -5,6 +5,10 @@
 //!
 //! A budget made from a capability that has one already is inside it: bytes are taken from
 //! both, so a narrowing can only lower what is left, never raise it.
+//!
+//! Counting is atomics only: every take, give-back and look is `#[blaze::noalloc]` and
+//! `#[blaze::nonblocking]`, checked, so a budget never adds a wait or an allocation to the
+//! call it meters.
 
 use std::sync::{
     Arc,
@@ -44,6 +48,8 @@ impl Budget {
     }
 
     /// `bytes` taken from this budget alone, if it has room.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn take_here(&self, bytes: u64) -> Result<(), Over> {
         let took = self.used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
             used.checked_add(bytes).filter(|after| *after <= self.limit)
@@ -56,6 +62,8 @@ impl Budget {
 
     /// `bytes` taken from this budget and from each it is inside, or from none of them: the
     /// first with no room says so.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn take(&self, bytes: u64) -> Result<(), Over> {
         self.take_here(bytes)?;
         let Some(outer) = &self.outer else { return Ok(()) };
@@ -67,6 +75,8 @@ impl Budget {
     }
 
     /// `bytes` taken before and not used after all, given back here and to each it is inside.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn give_back(&self, bytes: u64) {
         let mut at = Some(self);
         while let Some(budget) = at {
@@ -77,6 +87,8 @@ impl Budget {
 
     /// The most bytes a take could still be given: the least left of this and each it is
     /// inside.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn left(&self) -> u64 {
         let mut left = u64::MAX;
         let mut at = Some(self);

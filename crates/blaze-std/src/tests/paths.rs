@@ -8,7 +8,7 @@
 use blaze_core::{Done, Effect};
 use hegel::TestCase;
 
-use super::{Draw, Drawn, Seeds, check, control, path, root, world};
+use super::{Draw, Drawn, Seeds, check, control, path, root, world, write_synced};
 use crate::{Plant, path::Path};
 
 const PARTS: [&str; 7] = ["a", "b", "..", ".", "", "c.d", "..."];
@@ -54,7 +54,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
                     if text != raw || text.starts_with('/') || text.split('/').any(|it| matches!(it, "" | "." | "..")) {
                         return Err(format!("Path::new took {raw:?} as {text:?}: not plain and relative"));
                     }
-                    jail.write(&cx, &made, b"x").map_err(|e| format!("harness: {e}"))?;
+                    write_synced(&cx, &jail, &made, b"x").map_err(|e| format!("harness: {e}"))?;
                 }
                 Err(refused) => {
                     if refused.path != *raw {

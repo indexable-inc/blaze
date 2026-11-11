@@ -6,6 +6,8 @@
 //! The generator itself is re-exported as it is ([`SplitMix64`], its [`mix`] and [`GAMMA`]),
 //! for a sans-IO core that is handed a seed rather than the capability.
 
+use std::num::NonZero;
+
 pub use blaze_rng::{GAMMA, SplitMix64, mix};
 
 /// A generator of its own. Not `Clone`: a copy would draw the same numbers; [`Rng::fork`]
@@ -28,9 +30,10 @@ impl Rng {
         self.draws.next_u64()
     }
 
-    /// A number in `0..n` (0 for `n` 0).
-    pub fn below(&mut self, n: u64) -> u64 {
-        self.draws.below(n)
+    /// A number in `0..n`. An empty range cannot be asked for: `n` is not zero (it was once
+    /// answered 0, a number not in the range, unsaid).
+    pub fn below(&mut self, n: NonZero<u64>) -> u64 {
+        self.draws.below(n.get())
     }
 
     pub fn fill(&mut self, out: &mut [u8]) {

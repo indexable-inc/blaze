@@ -14,6 +14,11 @@
 //!   and every context made from it are gone.
 //! - The one wait ([`Cx::wait`]): every call in bstd that waits (IO, sleeps) waits through it,
 //!   until the deadline, ending ready or in [`Stopped::Deadline`] or [`Stopped::Cancelled`].
+//! - Effects: what only reads the context ([`Cx::deadline`], [`Cx::name`],
+//!   [`Cx::cancelled`], [`Cx::check`]) is `#[blaze::noalloc]` and `#[blaze::nonblocking]`,
+//!   checked: the one line a long computation calls never waits and never allocates.
+//!   [`Cx::span`] and [`Cx::event`] take the world's lock to record, and [`Cx::wait`] is the
+//!   wait; none of the three is marked.
 //! - Tasks: [`Cx::scope`] makes a scope of tasks, a linear [`Scope`] value joined with
 //!   [`Scope::join`] ([`crate::task`]); [`Cx::scope_with`] runs a closure as one. There is no
 //!   `io.tasks()`.
@@ -110,21 +115,31 @@ impl Cx {
     }
 
     /// The deadline every wait under it ends by.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn deadline(&self) -> Deadline {
         self.deadline
     }
 
     /// The span's name.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn name(&self) -> &'static str {
         self.span
     }
 
     /// Whether its scope, or a scope it is inside, was cancelled.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn cancelled(&self) -> bool {
         self.cancel.is_set()
     }
 
     /// [`Stopped::Cancelled`] once its scope was cancelled: the line a long computation calls.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn check(&self) -> Result<(), Stopped> {
         match self.cancelled() {
             true => Err(Stopped::Cancelled { span: self.span }),

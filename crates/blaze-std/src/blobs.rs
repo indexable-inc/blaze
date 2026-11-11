@@ -1,7 +1,9 @@
 //! An object store (docs/v2/plan/design/std.md, "The rest of the set", `Blobs`): bytes kept
 //! under the BLAKE3 of what they are, a [`BlobId`]. Made from a [`Dir`] ([`Blobs::beneath`]),
 //! over [`Kv`]: a blob is the key that spells its id in hex, so everything [`crate::kv`] says
-//! of durability holds here.
+//! of durability holds here, with the same three forms of put and delete. A blob put
+//! unsynced and torn by a crash is refused by its next get ([`BlobsKind::Corrupt`]), never
+//! handed back.
 //!
 //! A get checks what it read against the id it was asked for and refuses bytes that are not
 //! it ([`BlobsKind::Corrupt`]): the store is never trusted for what it did not verify.
@@ -15,7 +17,7 @@ use blaze_mem::Frame;
 use crate::{
     Stopped,
     cx::Cx,
-    fs::{Dir, ReadOnly, ReadWrite, Rights},
+    fs::{Dir, Durable, ReadOnly, ReadWrite, Rights, Unsynced},
     kv::{Key, Kv, KvError},
     mem::Bytes,
 };
@@ -188,20 +190,55 @@ impl<#[blaze::linear] P: Rights> Blobs<P> {
 }
 
 impl Blobs<ReadWrite> {
-    /// `bytes` kept: their id. Durable once this returns, as [`Kv::put`] is; a blob the store
-    /// has already is written again as the same bytes.
-    pub fn put(&self, cx: &Cx, bytes: &[u8]) -> Result<BlobId, BlobsError> {
+    /// `bytes` kept, as durably as `durable` says: their id. [`Blobs::put_unsynced`] or
+    /// [`Blobs::put_synced`], chosen at run time.
+    pub fn put(&self, cx: &Cx, bytes: &[u8], durable: Durable) -> Result<BlobId, BlobsError> {
+        match durable.unsynced() {
+            Some(unsynced) => self.put_unsynced(cx, bytes, unsynced),
+            None => self.put_synced(cx, bytes),
+        }
+    }
+
+    /// `bytes` kept with nothing synced: their id. It never waits for the device; a crash
+    /// may lose the blob or tear it, and a get of a torn one is [`BlobsKind::Corrupt`].
+    pub fn put_unsynced(&self, cx: &Cx, bytes: &[u8], unsynced: Unsynced) -> Result<BlobId, BlobsError> {
         let id = BlobId::of(bytes);
-        match self.kv.put(cx, &id.key(), bytes) {
+        match self.kv.put_unsynced(cx, &id.key(), bytes, unsynced) {
             Ok(()) => Ok(id),
             Err(error) => Err(BlobsError { op: BlobsOp::Put, blob: Some(id), kind: BlobsKind::Store(error) }),
         }
     }
 
-    /// The blob `id` gone from the store; gone already is done.
-    pub fn delete(&self, cx: &Cx, id: &BlobId) -> Result<(), BlobsError> {
+    /// `bytes` kept: their id. Durable once this returns, as [`Kv::put_synced`] is; a blob
+    /// the store has already is written again as the same bytes. It waits for the device.
+    pub fn put_synced(&self, cx: &Cx, bytes: &[u8]) -> Result<BlobId, BlobsError> {
+        let id = BlobId::of(bytes);
+        match self.kv.put_synced(cx, &id.key(), bytes) {
+            Ok(()) => Ok(id),
+            Err(error) => Err(BlobsError { op: BlobsOp::Put, blob: Some(id), kind: BlobsKind::Store(error) }),
+        }
+    }
+
+    /// The blob `id` gone from the store, as durably as `durable` says; gone already is
+    /// done. [`Blobs::delete_unsynced`] or [`Blobs::delete_synced`], chosen at run time.
+    pub fn delete(&self, cx: &Cx, id: &BlobId, durable: Durable) -> Result<(), BlobsError> {
+        match durable.unsynced() {
+            Some(unsynced) => self.delete_unsynced(cx, id, unsynced),
+            None => self.delete_synced(cx, id),
+        }
+    }
+
+    /// The blob `id` gone from the store, with nothing synced: a crash may bring it back.
+    pub fn delete_unsynced(&self, cx: &Cx, id: &BlobId, unsynced: Unsynced) -> Result<(), BlobsError> {
         self.kv
-            .delete(cx, &id.key())
+            .delete_unsynced(cx, &id.key(), unsynced)
+            .map_err(|error| BlobsError { op: BlobsOp::Delete, blob: Some(*id), kind: BlobsKind::Store(error) })
+    }
+
+    /// The blob `id` gone from the store, and a crash keeps it gone. It waits for the device.
+    pub fn delete_synced(&self, cx: &Cx, id: &BlobId) -> Result<(), BlobsError> {
+        self.kv
+            .delete_synced(cx, &id.key())
             .map_err(|error| BlobsError { op: BlobsOp::Delete, blob: Some(*id), kind: BlobsKind::Store(error) })
     }
 }

@@ -10,7 +10,7 @@ use std::time::Duration;
 use blaze_core::{FileName, sim::Faults};
 use hegel::TestCase;
 
-use super::{Draw, Drawn, Seeds, check, control, path, root};
+use super::{Draw, Drawn, Seeds, check, control, path, root, write_synced};
 use crate::{
     Cx, Plant, Stopped,
     clock::{Clock, SleepError},
@@ -25,7 +25,7 @@ const SLOW: Duration = Duration::from_millis(50);
 enum Call {
     Sleep { ms: u64 },
     SlowWrite,
-    /// A sync under `held`, which the disk never completes.
+    /// A flush under `held`, which the disk never completes.
     HeldSync,
 }
 
@@ -74,7 +74,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
         sim.hold_syncs(held_name);
     });
     let called = calls(plan, &cx, &clock, &slow, &file);
-    let _ = file.close(&cx.until(clock.after(Duration::from_millis(1))));
+    let _ = file.close_synced(&cx.until(clock.after(Duration::from_millis(1))));
     called
 }
 
@@ -90,15 +90,15 @@ fn calls(plan: &Plan, cx: &Cx, clock: &Clock, slow: &Dir<ReadWrite>, file: &File
                 Err(SleepError::Stopped(stopped)) => Err(stopped),
                 Err(other) => return Err(format!("harness: call {at}: {other}")),
             },
-            Call::SlowWrite => match slow.write(&cx, &path("w"), b"bytes") {
+            Call::SlowWrite => match write_synced(&cx, slow, &path("w"), b"bytes") {
                 Ok(()) => Ok(()),
                 Err(error) => match error.stopped() {
                     Some(stopped) => Err(stopped.clone()),
                     None => return Err(format!("harness: call {at}: {error}")),
                 },
             },
-            Call::HeldSync => match file.sync(&cx) {
-                Ok(()) => return Err(format!("call {at}: a sync the disk holds for ever returned")),
+            Call::HeldSync => match file.flush(&cx) {
+                Ok(()) => return Err(format!("call {at}: a flush the disk holds for ever returned")),
                 Err(error) => match error.stopped() {
                     Some(stopped) => Err(stopped.clone()),
                     None => return Err(format!("harness: call {at}: {error}")),

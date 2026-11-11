@@ -53,13 +53,14 @@ use crate::{
     code::Code,
     cx::Cx,
     device::{Bluetooth, Camera, Clipboard, Location, Notify, Screen, Serial, Usb},
+    disk::{Disk, DiskCounts},
     env::Env,
     fs::Fs,
     host::{Exit, Host, HostFacts},
     hosted::SimHost,
     keys::Keys,
     locale::Locale,
-    mem::{Mem, TASK_FRAME},
+    mem::Mem,
     net::Net,
     opener::Opener,
     power::Power,
@@ -189,6 +190,10 @@ struct World {
     /// real world, which has no provider for them.
     // alloc: once per simulated world.
     hosted: Option<Box<SimHost>>,
+    /// The simulated disk's ledger ([`crate::disk`]): what was paid, and which names a crash
+    /// may undo. `None` in a real world.
+    // alloc: once per simulated world.
+    disk: Option<Box<Disk>>,
     plant: Plant,
 }
 
@@ -381,6 +386,7 @@ struct Start {
     host: HostFacts,
     offers: Offers,
     hosted: Option<Box<SimHost>>,
+    disk: Option<Box<Disk>>,
     plant: Plant,
 }
 
@@ -429,6 +435,8 @@ impl Io {
             offers: world.offers,
             // alloc: once per simulated world, its host.
             hosted: Some(Box::new(SimHost::new())),
+            // alloc: once per simulated world, its disk's ledger.
+            disk: Some(Box::new(Disk::new(world.seed))),
             plant,
         })
     }
@@ -454,12 +462,13 @@ impl Io {
             host: HostFacts { pid: std::process::id(), cores, name: world.host_name },
             offers: crate::host::OFFERS,
             hosted: None,
+            disk: None,
             plant: Plant::None,
         }))
     }
 
     fn over(start: Start) -> Io {
-        let Start { driver, seed, env, args, host, offers, hosted, plant } = start;
+        let Start { driver, seed, env, args, host, offers, hosted, disk, plant } = start;
         let world = World {
             driver,
             next: 0,
@@ -479,6 +488,7 @@ impl Io {
             host,
             exited: None,
             hosted,
+            disk,
             plant,
         };
         Io {
@@ -492,11 +502,13 @@ impl Io {
         }
     }
 
-    /// The root context: named `main`, never cancelled, with a frame of its own, ending
-    /// `budget` from now on the driver's clock. Every wait under it ends by then.
-    pub fn cx(&self, budget: Duration) -> Result<Cx, Stopped> {
-        let frame = Frame::with_reserve(TASK_FRAME, blaze_mem::Tag::Frames)
-            .map_err(|_| Stopped::OutOfMemory { arena: "main's frame", asked: TASK_FRAME })?;
+    /// The root context: named `main`, never cancelled, ending `budget` from now on the
+    /// driver's clock, with a frame of its own that hands out at most `scratch` bytes
+    /// ([`crate::mem::TASK_FRAME`] is the usual value; it is named at the call, never
+    /// assumed). Every wait under it ends by `budget`.
+    pub fn cx(&self, budget: Duration, scratch: usize) -> Result<Cx, Stopped> {
+        let frame = Frame::with_reserve(scratch, blaze_mem::Tag::Frames)
+            .map_err(|_| Stopped::OutOfMemory { arena: "main's frame", asked: scratch })?;
         Ok(Cx::root(Deadline::after(self.now(), budget), frame, self.clone()))
     }
 
@@ -806,12 +818,17 @@ impl Io {
     }
 
     /// The simulated machine loses power ([`Sim::crash`]): every effect in flight is gone,
-    /// and with it what this `Io` kept for their waiters. `false` on a real driver.
+    /// and with it what this `Io` kept for their waiters; each file keeps what was flushed
+    /// and a prefix of what was not, and the name changes no name sync covered are kept as a
+    /// prefix too, the rest undone ([`crate::disk`]). `false` on a real driver.
     pub fn crash(&self) -> bool {
         let mut world = self.world.lock();
-        let World { driver, got, abandoned, polled, effects, .. } = &mut *world;
+        let World { driver, got, abandoned, polled, effects, disk, .. } = &mut *world;
         let Some(sim) = driver.sim() else { return false };
         sim.crash();
+        if let Some(disk) = disk {
+            disk.crashed(sim);
+        }
         got.clear();
         abandoned.clear();
         polled.clear();
@@ -898,10 +915,52 @@ impl Io {
         if world.record {
             touch(&mut world.touched, &effect);
         }
-        let World { driver, effects, .. } = &mut *world;
+        let World { driver, effects, disk, .. } = &mut *world;
+        if let (Some(disk), Some(sim)) = (disk.as_deref_mut(), driver.sim()) {
+            disk.submitted(sim, &effect);
+        }
         effects.push(effect);
         driver.submit(effects);
         tag
+    }
+
+    /// A number no other call of this world was given: a tag's, taken for a name made beside
+    /// another (a publish's temporary file).
+    pub(crate) fn fresh(&self) -> u64 {
+        let mut world = self.world.lock();
+        let fresh = world.next;
+        world.next += 1;
+        fresh
+    }
+
+    /// What the simulated disk was asked to do so far ([`DiskCounts`]): bytes written and
+    /// read, flushes, waits for the device, clones and the bytes they forced out. `None` on a
+    /// real driver, which keeps no ledger.
+    pub fn disk(&self) -> Option<DiskCounts> {
+        self.world.lock().disk.as_deref().map(Disk::counts)
+    }
+
+    /// A caller waited for the device (a flush it did not return before): counted.
+    pub(crate) fn waited_for_device(&self) {
+        if let Some(disk) = self.world.lock().disk.as_deref_mut() {
+            disk.waited();
+        }
+    }
+
+    /// The names of the directory `dir` made durable, waited for: `true` once the simulated
+    /// disk has synced them. `false` on a real driver: blaze-core has no effect that syncs a
+    /// directory (its rename syncs its own), so nothing was done and the caller decides
+    /// whether that is a refusal. A `cx` that stopped already asks nothing.
+    pub(crate) fn sync_names(&self, cx: &Cx, dir: &str) -> Result<bool, Stopped> {
+        cx.stopped_by(self.now())?;
+        match self.world.lock().disk.as_deref_mut() {
+            Some(disk) => {
+                disk.sync_names(dir);
+                disk.waited();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// How many effects the driver holds that have not completed: a test's view of whether
@@ -957,9 +1016,12 @@ impl Io {
     /// step of [`Cx::wait`], the one wait.
     pub(crate) fn poll(&self, until: Deadline) -> usize {
         let mut world = self.world.lock();
-        let World { driver, polled, got, abandoned, .. } = &mut *world;
+        let World { driver, polled, got, abandoned, disk, .. } = &mut *world;
         let moved = driver.poll(polled, until);
         for completion in polled.drain(..) {
+            if let Some(disk) = disk.as_deref_mut() {
+                disk.completed(&completion);
+            }
             keep(got, abandoned, completion);
         }
         if moved == 0 {

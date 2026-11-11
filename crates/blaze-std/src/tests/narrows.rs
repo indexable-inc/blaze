@@ -527,7 +527,7 @@ impl Narrows for BluetoothCase {
 
     fn reaches(cap: &Bluetooth, _: &Io, cx: &Cx, thing: usize) -> Result<bool, String> {
         let (at, of) = (&three(device)[thing / 2], &three(service)[thing % 2]);
-        reached(cap.write(cx, at, of, b"x"), |error| &error.kind)
+        reached(cap.write_all(cx, at, of, b"x"), |error| &error.kind)
     }
 }
 
@@ -552,7 +552,7 @@ impl Narrows for UsbCase {
     }
 
     fn reaches(cap: &Usb, _: &Io, cx: &Cx, thing: usize) -> Result<bool, String> {
-        reached(cap.write(cx, &three(device)[thing], b"x"), |error| &error.kind)
+        reached(cap.write_all(cx, &three(device)[thing], b"x"), |error| &error.kind)
     }
 }
 

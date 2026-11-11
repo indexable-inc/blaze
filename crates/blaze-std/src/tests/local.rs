@@ -10,7 +10,7 @@
 //! Plant: [`Plant::LocalDropsChunk`], a write behind unread bytes that says it wrote its chunk
 //! and drops it.
 
-use std::{collections::VecDeque, time::Duration};
+use std::{collections::VecDeque, num::NonZero, time::Duration};
 
 use hegel::TestCase;
 
@@ -32,13 +32,13 @@ enum Act {
 #[derive(Debug)]
 struct Plan {
     seed: u64,
-    capacity: usize,
+    capacity: NonZero<usize>,
     acts: Vec<Act>,
 }
 
 fn plan(d: &mut impl Draw) -> Plan {
     let seed = d.int(0, u64::MAX);
-    let capacity = d.pick(&[1, 4, 16, 64]);
+    let capacity = NonZero::new(d.pick(&[1usize, 4, 16, 64])).expect("a test's capacity is not zero");
     let acts = (0..d.int(1, 40))
         .map(|_| match d.coin() {
             true => Act::Write { by_first: d.coin(), len: d.int(0, 24) as usize },
@@ -78,9 +78,9 @@ fn acts(
                         written
                     })
                     .collect();
-                let room = plan.capacity - pipe.len();
+                let room = plan.capacity.get() - pipe.len();
                 let fits = len.min(room);
-                match end.write(&short, &bytes) {
+                match end.write_all(&short, &bytes) {
                     Ok(()) if fits == len => {}
                     Ok(()) => return Err(format!("act {at}: a write of {len} into room for {room} said it wrote them all")),
                     Err(error) if fits < len && error.moved == fits && matches!(error.kind, LocalKind::Stopped(Stopped::Deadline { .. })) => {}
@@ -150,7 +150,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
         Err(why) => Err(why),
     };
     // A write to an end that was finished is refused, not lost.
-    let refused = match second.write(&cx, b"late") {
+    let refused = match second.write_all(&cx, b"late") {
         Err(error) if error.kind == LocalKind::Closed && error.moved == 0 => Ok(()),
         Err(error) => Err(format!("a write to a finished end: {error}")),
         Ok(()) => Err("a write to a finished end said it wrote".to_owned()),

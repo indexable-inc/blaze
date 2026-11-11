@@ -151,8 +151,8 @@ impl Stream {
         StreamsError { op, origin: self.origin.clone(), kind }
     }
 
-    /// All of `bytes` sent.
-    pub fn send(&mut self, cx: &Cx, bytes: &[u8]) -> Result<(), StreamsError> {
+    /// All of `bytes` sent, or an error: never a part said sent.
+    pub fn send_all(&mut self, cx: &Cx, bytes: &[u8]) -> Result<(), StreamsError> {
         let sent = match &self.provider {
             Provider::Host(io) => hosted::call(io, cx, |host| {
                 // clone: the simulated host's record: refcounts, and alloc: the bytes sent.

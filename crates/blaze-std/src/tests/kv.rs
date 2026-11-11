@@ -1,10 +1,11 @@
 //! `Kv` against a model map, through crashes: after any sequence of puts, deletes and crashes
 //! (with completions that come late), a get gives exactly what the model holds and a list
-//! exactly its keys. A put or a delete that returned is kept by a crash, whole: never a part
-//! of a value, never an older one.
+//! exactly its keys. A `put_synced` or a `delete_synced` that returned is kept by a crash,
+//! whole: never a part of a value, never an older one. (What an unsynced put may lose is the
+//! `durable` test's.)
 //!
-//! Plant: [`Plant::KvPutUnsynced`], a put that empties the key's file and appends the value
-//! with no sync, which a crash tears.
+//! Plant: [`Plant::KvPutUnsynced`], a `put_synced` that publishes its value unsynced, which
+//! a crash loses or tears.
 
 use std::{collections::BTreeMap, time::Duration};
 
@@ -104,11 +105,11 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
                         written
                     })
                     .collect();
-                kv.put(&cx, &key(index), &value).map_err(|e| format!("harness: act {at}: {e}"))?;
+                kv.put_synced(&cx, &key(index), &value).map_err(|e| format!("harness: act {at}: {e}"))?;
                 model.insert(index, value);
             }
             Act::Delete(index) => {
-                kv.delete(&cx, &key(index)).map_err(|e| format!("harness: act {at}: {e}"))?;
+                kv.delete_synced(&cx, &key(index)).map_err(|e| format!("harness: act {at}: {e}"))?;
                 model.remove(&index);
             }
             Act::Get(_) | Act::List => agrees(&cx, &kv, &model, at, "read")?,

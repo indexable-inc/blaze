@@ -5,7 +5,7 @@
 
 use std::{collections::VecDeque, time::Duration};
 
-use super::{path, root, world};
+use super::{path, root, world, write_synced};
 use crate::{
     Plant, Stopped,
     audio::{PERIOD, Pcm},
@@ -125,7 +125,7 @@ fn the_locale_and_the_user_are_the_hosts() {
     // The home is a directory, with a directory's authority: a file written through it is
     // where the host says the home is.
     let home = user.home();
-    home.write(&cx, &path("notes"), b"mine").expect("a write beneath the home");
+    write_synced(&cx, &home, &path("notes"), b"mine").expect("a write beneath the home");
     let fs = io.need_fs().expect("a file tree");
     let mut read = cx.bytes();
     fs.open_dir(&cx, &path("home/sim")).expect("the home").read_all(&cx, &path("notes"), &mut read).expect("a read");
@@ -287,10 +287,10 @@ fn each_device_reads_its_script_and_records_what_it_was_sent() {
     io.need_screen().expect("a screen").capture(&cx, &display, &mut read).expect("a capture");
     let usb = io.need_usb().expect("usb");
     usb.read(&cx, &name, &mut read).expect("a read");
-    usb.write(&cx, &name, b"usb out").expect("a write");
+    usb.write_all(&cx, &name, b"usb out").expect("a write");
     let serial = io.need_serial().expect("serial");
     serial.read(&cx, &name, &mut read).expect("a read");
-    serial.write(&cx, &name, b"serial out").expect("a write");
+    serial.write_all(&cx, &name, b"serial out").expect("a write");
     assert_eq!(read.as_slice(), b"framepixelsusb inserial in");
     assert_eq!(output(DeviceKind::Usb).as_deref(), Some(&b"usb out"[..]));
     assert_eq!(output(DeviceKind::Serial).as_deref(), Some(&b"serial out"[..]));
@@ -298,7 +298,7 @@ fn each_device_reads_its_script_and_records_what_it_was_sent() {
     let bluetooth = io.need_bluetooth().expect("bluetooth");
     assert_eq!(bluetooth.scan(&cx, cx.frame()).expect("a scan").as_slice(), std::slice::from_ref(&name));
     let service = crate::name::ServiceName::new("heart-rate").expect("a name");
-    bluetooth.write(&cx, &name, &service, b"\x01").expect("a write");
+    bluetooth.write_all(&cx, &name, &service, b"\x01").expect("a write");
     assert_eq!(io.script(|host| host.bluetooth_sent.len()), Some(1));
 
     let location = io.need_location().expect("a location");
@@ -341,7 +341,7 @@ fn blobs_are_kept_under_what_they_are_and_checked_as_they_are_read() {
     let cx = root(&io);
     let dir = io.need_fs().expect("a file tree").open_dir(&cx, &path("objects")).expect("a directory");
     let blobs = Blobs::beneath(&dir);
-    let id = blobs.put(&cx, b"some bytes").expect("a put");
+    let id = blobs.put_synced(&cx, b"some bytes").expect("a put");
     assert_eq!(id, BlobId::of(b"some bytes"));
     let mut read = cx.bytes();
     assert_eq!(blobs.get(&cx, &id, &mut read).expect("a get"), Some(10));
@@ -350,11 +350,11 @@ fn blobs_are_kept_under_what_they_are_and_checked_as_they_are_read() {
     assert_eq!(blobs.list(&cx, cx.frame()).expect("a list").as_slice(), [id]);
     assert_eq!(blobs.get(&cx, &BlobId::of(b"other"), &mut read).expect("a get"), None);
     // Bytes under an id that are not its are refused, and nothing of them is handed back.
-    dir.write(&cx, &path(&id.to_string()), b"tampered").expect("a write behind the store's back");
+    write_synced(&cx, &dir, &path(&id.to_string()), b"tampered").expect("a write behind the store's back");
     let corrupt = blobs.read_only().get(&cx, &id, &mut read).expect_err("the bytes are not the blob");
     assert_eq!(corrupt.kind, BlobsKind::Corrupt { found: BlobId::of(b"tampered") });
     assert_eq!(read.as_slice(), b"some bytes");
-    blobs.delete(&cx, &id).expect("a delete");
+    blobs.delete_synced(&cx, &id).expect("a delete");
     assert!(!blobs.has(&cx, &id).expect("a has"));
 }
 
@@ -384,7 +384,7 @@ fn local_sockets_beneath_a_directory_connect_and_a_read_only_one_does_not_listen
         Ok(client) => {
             let said = match listener.accept(&cx) {
                 Ok(server) => {
-                    let sent = client.send(&cx, b"hello");
+                    let sent = client.send_all(&cx, b"hello");
                     let received = server.recv(&cx, 16, &mut got);
                     let finished = server.finish(&cx);
                     sent.is_ok() && received.is_ok() && finished.is_ok()
@@ -414,7 +414,7 @@ fn streams_from_a_handler_reply_and_from_the_host_record() {
     // A stream is linear: finished whatever it carried, and checked after.
     let carried = match shout.open(&cx, origin) {
         Ok(mut stream) => {
-            let sent = stream.send(&cx, b"quiet");
+            let sent = stream.send_all(&cx, b"quiet");
             let first = stream.recv(&cx, 3, &mut heard);
             let rest = stream.recv(&cx, 64, &mut heard);
             let end = stream.recv(&cx, 64, &mut heard);
@@ -431,7 +431,7 @@ fn streams_from_a_handler_reply_and_from_the_host_record() {
     let mut greeted = cx.bytes();
     let carried = match hosted.open(&cx, origin) {
         Ok(mut stream) => {
-            let sent = stream.send(&cx, b"hi");
+            let sent = stream.send_all(&cx, b"hi");
             let received = stream.recv(&cx, 64, &mut greeted);
             let finished = stream.finish(&cx);
             sent.is_ok() && received == Ok(7) && finished.is_ok()

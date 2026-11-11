@@ -2,15 +2,17 @@
 //!
 //! ```text
 //! let scope = cx.scope();
-//! let a = scope.spawn("a", |cx| read(cx, &dir));
-//! let b = scope.spawn("b", |cx| read(cx, &dir));
+//! let a = scope.spawn("a", TASK_FRAME, |cx| read(cx, &dir));
+//! let b = scope.spawn("b", TASK_FRAME, |cx| read(cx, &dir));
 //! let (a, b) = (a.join(cx), b.join(cx));
 //! scope.join(cx)?;
 //! ```
 //!
 //! There is no `Tasks` capability: starting work is something a [`Cx`] does. Each task gets its
 //! own `Cx`, borrowed for the task's run so it cannot outlive the scope: its name, its own
-//! frame, the scope's deadline and cancellation. A task's closure may borrow from the frame
+//! frame of the size its spawn names (`scratch`: the most bytes the task's frame hands out;
+//! [`crate::mem::TASK_FRAME`] is the usual value, said at the call), the scope's deadline and
+//! cancellation. A task's closure may borrow from the frame
 //! that holds the scope. A task's error or panic cancels the scope; a task learns it only as
 //! [`Stopped::Cancelled`] from its next wait, never by being dropped. [`Task::join`] gives a
 //! task's own outcome, [`Scope::join`] the scope's first failure, typed. [`Cx::scope_with`] is
@@ -47,7 +49,6 @@ use crate::{
     cx::Cx,
     host::Exit,
     io::ABANDON_WAIT,
-    mem::TASK_FRAME,
 };
 
 /// How a waiting task's frames are stored (std.md, "Layouts").
@@ -212,17 +213,22 @@ impl<'p> Scope<'p> {
     /// `Inline`, now, to completion). An error it returns, or a panic, cancels the scope: the
     /// next wait of each task after it ends with [`Stopped::Cancelled`], and the scope fails
     /// with the first. A `Task` value of a process's exit is never made: the exit unwinds on.
+    ///
+    /// `scratch` is the most bytes the task's frame (`cx.frame()`) hands out: an allocation
+    /// past it is the task's [`Stopped::OutOfMemory`], naming the task. It is reserved as
+    /// address space here and committed as it is used.
     pub fn spawn<T, E: fmt::Display>(
         &self,
         name: &'static str,
+        scratch: usize,
         task: impl FnOnce(&Cx) -> Result<T, E>,
     ) -> Task<'_, T> {
         let live = &self.live;
         live.last.set(name);
-        let frame = match Frame::with_reserve(TASK_FRAME, blaze_mem::Tag::Frames) {
+        let frame = match Frame::with_reserve(scratch, blaze_mem::Tag::Frames) {
             Ok(frame) => frame,
             Err(_) => {
-                let stopped = Stopped::OutOfMemory { arena: name, asked: TASK_FRAME };
+                let stopped = Stopped::OutOfMemory { arena: name, asked: scratch };
                 let error = live.fail(name, TaskWhy::OutOfMemory(stopped));
                 return Task { name, outcome: Err(error), scope: PhantomData };
             }
@@ -246,14 +252,18 @@ impl<'p> Scope<'p> {
     }
 
     /// Runs `task` overlapping what follows it in the scope. The `Inline` layout cannot: the
-    /// task does not run, and it and the scope fail with [`TaskWhy::CannotOverlap`].
+    /// task does not run, and it and the scope fail with [`TaskWhy::CannotOverlap`]. `scratch`
+    /// is the task's frame, as [`Scope::spawn`]'s; no frame is made for a task that does not
+    /// run.
     pub fn spawn_concurrent<T, E: fmt::Display>(
         &self,
         name: &'static str,
+        scratch: usize,
         task: impl FnOnce(&Cx) -> Result<T, E>,
     ) -> Task<'_, T> {
         match LAYOUT {
             Layout::Inline => {
+                let _: usize = scratch;
                 drop(task);
                 self.live.last.set(name);
                 let error = self.live.fail(name, TaskWhy::CannotOverlap { layout: LAYOUT });

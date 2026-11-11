@@ -112,6 +112,8 @@ pub mod cx;
 /// The device capabilities: `Camera`, `Screen`, `Location`, `Bluetooth`, `Usb`, `Serial`,
 /// `Clipboard`, `Notify`.
 pub mod device;
+/// The simulated disk's ledger: what file calls paid, and which names a crash may undo.
+pub mod disk;
 pub mod env;
 /// Who decides how a pure function is computed: `Eval` and its providers, memo points, keys.
 pub mod eval;
@@ -366,13 +368,13 @@ pub(crate) enum Plant {
     WaitIgnoresCancel,
     /// An arena is made with no limit of its own.
     ArenaUnlimited,
-    /// `File::sync` says it synced without asking the driver.
+    /// `File::flush` says it flushed without asking the driver.
     SyncSkipped,
     /// `Env::only` replaces what is allowed rather than narrowing it.
     EnvOnlyReplaces,
     /// `Pending::cancel` returns without waiting for its op to end.
     CancelSkipsWait,
-    /// `File::close` says it closed without syncing.
+    /// `File::close_synced` says it closed without flushing.
     CloseSkipsSync,
     /// `Scope::join` returns `Ok` though a task failed.
     JoinDropsFailure,
@@ -381,8 +383,8 @@ pub(crate) enum Plant {
     /// A narrowing of the capabilities on `narrow::Allowed` (`Keys::only`, `Opener::only`, ...)
     /// and of `Location` and `Clipboard` gives what was asked for, reached before or not.
     OnlyWidens,
-    /// `Kv::put` empties the key's file and appends the value without a sync, where it should
-    /// replace it durably and all at once.
+    /// `Kv::put_synced` publishes the value unsynced: nothing of it is flushed and its name
+    /// is not synced, so a crash loses or tears it.
     KvPutUnsynced,
     /// A write to a local pair behind bytes not yet read says it wrote its chunk and drops it.
     LocalDropsChunk,
@@ -399,4 +401,10 @@ pub(crate) enum Plant {
     MemoSharesPoints,
     /// A nested call is handed its caller's parent as its own: provenance skips a level.
     NestedUnderGrandparent,
+    /// A publish hands its rename to the driver and reports done without waiting for it.
+    PublishBeforeRename,
+    /// A `_synced` file call skips the sync of its directory's names.
+    DurableSkipsNameSync,
+    /// `Written::flush` asks for the flush and hands out its `Flushed` without waiting for it.
+    FlushedBeforeFlush,
 }

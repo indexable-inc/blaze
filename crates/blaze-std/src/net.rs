@@ -688,8 +688,10 @@ impl Conn {
         })
     }
 
-    /// All of `bytes` sent: its [`Conn::write_from`], waited for.
-    pub fn send(&self, cx: &Cx, bytes: &[u8]) -> Result<(), NetError> {
+    /// All of `bytes` sent, or an error: never a part said sent. Its [`Conn::write_from`],
+    /// waited for. The bytes are handed to the driver as one send with nothing kept back or
+    /// joined to another: there is no buffer between a call and the socket.
+    pub fn send_all(&self, cx: &Cx, bytes: &[u8]) -> Result<(), NetError> {
         cx.stopped_by(self.link.io.now())
             .map_err(|stopped| error(NetOp::Send, &self.peer, NetKind::Stopped(stopped)))?;
         self.write_from(bytes).wait(cx)

@@ -19,7 +19,7 @@
 //! the bytes or the room are there already; under a fiber layout the other end's task wakes
 //! it.
 
-use std::{collections::VecDeque, fmt, sync::Arc};
+use std::{collections::VecDeque, fmt, num::NonZero, sync::Arc};
 
 use blaze_core::lock::Lock;
 
@@ -141,9 +141,11 @@ pub struct Pair {
 }
 
 /// A connected pair in memory named `name`, each direction holding at most `capacity` bytes
-/// written and not yet read (at least one).
-pub fn pair(name: &'static str, capacity: usize) -> Pair {
-    let capacity = capacity.max(1);
+/// written and not yet read: the pair's one buffer, sized by its maker and never grown. A
+/// capacity of zero cannot be asked for (it was once raised to one unsaid). The two buffers
+/// are made in the global heap, once, here.
+pub fn pair(name: &'static str, capacity: NonZero<usize>) -> Pair {
+    let capacity = capacity.get();
     let pipe = |lock: &'static str| {
         // alloc: once per pair, a direction's buffer, never grown past its capacity.
         let bytes = VecDeque::with_capacity(capacity);
@@ -162,15 +164,15 @@ impl End {
         self.half.link.name
     }
 
-    /// All of `bytes` written, in order, each byte once. Where the pipe is full it waits for
-    /// the other end to read, until `cx`'s deadline; an error says how many bytes it had
-    /// written by then.
-    pub fn write(&self, cx: &Cx, bytes: &[u8]) -> Result<(), LocalError> {
+    /// All of `bytes` written, in order, each byte once, or an error that says how many
+    /// bytes it had written by then ([`LocalError::moved`]): never a part said whole. Where
+    /// the pipe is full it waits for the other end to read, until `cx`'s deadline.
+    pub fn write_all(&self, cx: &Cx, bytes: &[u8]) -> Result<(), LocalError> {
         let name = self.half.link.name;
         let refuse = |kind, moved| LocalError { op: LocalOp::Write, pair: name, kind, moved };
         let io = cx.io();
         cx.stopped_by(io.now()).map_err(|stopped| refuse(LocalKind::Stopped(stopped), 0))?;
-        let cx = cx.span("bstd::local write: room in the pipe");
+        let cx = cx.span("bstd::local write_all: room in the pipe");
         let drops = cx.plant() == Plant::LocalDropsChunk;
         let mut moved = 0;
         let waited = cx.wait_for(io, || {

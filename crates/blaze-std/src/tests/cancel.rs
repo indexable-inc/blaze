@@ -9,10 +9,11 @@ use std::time::Duration;
 
 use hegel::TestCase;
 
-use super::{Draw, Drawn, Seeds, check, control, path, root, world};
+use super::{Draw, Drawn, Seeds, check, control, path, root, world, write_synced};
 use crate::{
     Plant, Stopped,
     clock::SleepError,
+    mem::TASK_FRAME,
     task::{TaskError, TaskWhy},
 };
 
@@ -61,7 +62,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let cx = root(&io);
     let clock = io.need_clock().map_err(|e| format!("harness: {e}"))?;
     let dir = io.need_fs().map_err(|e| format!("harness: {e}"))?.open_dir(&cx, &path("data")).map_err(|e| format!("harness: {e}"))?;
-    dir.write(&cx, &path("f"), b"bytes").map_err(|e| format!("harness: {e}"))?;
+    write_synced(&cx, &dir, &path("f"), b"bytes").map_err(|e| format!("harness: {e}"))?;
     let mut ended: Vec<(usize, Ended, Ended)> = Vec::new();
     let result = cx.scope_with(|s| {
         for (at, &kind) in plan.tasks.iter().enumerate() {
@@ -70,7 +71,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
             }
             let ended = &mut ended;
             let (clock, dir) = (&clock, &dir);
-            let task = s.spawn(NAMES[at], move |cx| -> Result<(), String> {
+            let task = s.spawn(NAMES[at], TASK_FRAME, move |cx| -> Result<(), String> {
                 match kind {
                     Kind::Fails => return Err("this task fails".to_owned()),
                     Kind::Panics => panic!("this task panics (a planted panic of the cancel test)"),

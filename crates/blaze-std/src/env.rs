@@ -119,6 +119,21 @@ macro_rules! var {
     }};
 }
 
+/// A variable an [`Env`] was asked for and may not read: it was narrowed away from it
+/// ([`Env::only`]). Whether the variable is set is not said.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
+pub struct NotAllowed {
+    pub name: VarName,
+}
+
+impl fmt::Display for NotAllowed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "bstd::env get of {}: this Env was narrowed to other variables (Env::only) and may not read it", self.name)
+    }
+}
+
+impl std::error::Error for NotAllowed {}
+
 /// The variables a holder may read.
 #[derive(Clone)]
 pub struct Env {
@@ -133,12 +148,15 @@ impl Env {
         Env { vars, allowed: None, plant }
     }
 
-    /// The variable `name`, if it is set and this may read it.
-    pub fn get(&self, name: &VarName) -> Option<&str> {
+    /// The variable `name`: its value, `None` when it is not set, or [`NotAllowed`] when
+    /// this may not read it. The two are never one answer: a program that was narrowed away
+    /// from a variable does not take it for unset.
+    pub fn get(&self, name: &VarName) -> Result<Option<&str>, NotAllowed> {
         if !self.may_read(name) {
-            return None;
+            // clone: an error's name of its variable, a refcount.
+            return Err(NotAllowed { name: name.clone() });
         }
-        self.vars.iter().find(|(it, _)| it.as_str() == name.as_str()).map(|(_, value)| value.as_str())
+        Ok(self.vars.iter().find(|(it, _)| it.as_str() == name.as_str()).map(|(_, value)| value.as_str()))
     }
 
     /// Whether this may read `name`, set or not.
