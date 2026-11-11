@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-81 theorems: 68 in `lean`, 13 in `lean/analysis`.
+82 theorems: 69 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -781,4 +781,23 @@ theorem execStmt_putFar {B : FnId → Local → Prop} {g : List (Nat × FnId)} {
   | Statement.assign p rv, hB =>
     Outcome.bind_commutes_map (evalRvalue_putFar adts h sl rv) (fun r hr =>
       have hr2 : HidesFar B g f l r.2
+```
+
+**`Blaze.Mir.execStmt_puts`** (`Blaze.Mir.Opt.Puts`, `lean`): A statement does the same through a list of replaced slots, each hidden and of another frame or of a local the statement does not mention.
+
+```lean
+theorem execStmt_puts {B : FnId → Local → Prop} {g : List (Nat × FnId)} (adts : List AdtDecl)
+    (fn : FnId) (s : Statement) (hB : StmtFine B fn s) :
+    ∀ (reps : List Rep) (st : State), OkAt B g st → st.topFn = fn →
+      (∀ (r : Rep), r ∈ reps → RepOk B g st.top s r) →
+        execStmt adts (puts st reps) s =
+          Outcome.map (fun x => puts x reps) (execStmt adts st s)
+  | [], st, _, _, _ => by
+    cases execStmt adts st s with
+    | ok st' => rfl
+    | panic e => rfl
+    | undefined why => rfl
+    | diverge => rfl
+  | r :: rest, st, hs, hfn, hreps => by
+    have hr : RepOk B g st.top s r
 ```

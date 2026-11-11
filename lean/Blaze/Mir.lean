@@ -34,6 +34,7 @@ import Blaze.Mir.Opt.Sym
 import Blaze.Mir.Opt.SymBlock
 import Blaze.Mir.Opt.SymEq
 import Blaze.Mir.Opt.SlotExecFar
+import Blaze.Mir.Opt.Puts
 import Blaze.Mir.Opt.RemoveNops
 import Blaze.Mir.Opt.ConstFold
 import Blaze.Mir.Opt.Validate
