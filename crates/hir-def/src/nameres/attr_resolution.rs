@@ -137,6 +137,12 @@ impl DefMap {
                         // `#![blaze::arbitrary_ints]`, from `DefMap::arbitrary_ints`
                         // (docs/v2/plan/design/arbitrary-ints.md).
                         | "arbitrary_ints"
+                        // `#![blaze::early_drop]`, from `DefMap::early_drop`, and
+                        // `#[blaze::drop(early)]` and `#[blaze::drop(scoped)]` on a type, from
+                        // `AttrFlags::DROP_EARLY` and `AttrFlags::DROP_SCOPED`
+                        // (docs/v2/plan/design/early-drop.md).
+                        | "early_drop"
+                        | "drop"
                         // `#[blaze::reflect]`, from `AttrFlags::BLAZE_REFLECT`
                         // (`hir_ty_comptime::struct_domain`, docs/v2/plan/design/comptime.md).
                         | "reflect"

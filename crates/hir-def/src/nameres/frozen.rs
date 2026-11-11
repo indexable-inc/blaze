@@ -83,7 +83,7 @@ const KEYED_NAME: &str = "\0";
 /// The version of what this module writes, for the key frozen bytes are stored under: it
 /// changes with every change to the bytes [`Enc`] writes, the list of lang items included, so
 /// bytes of another version are never read.
-pub const ENCODING: &str = "blaze frozen def map 20";
+pub const ENCODING: &str = "blaze frozen def map 21";
 
 /// What name resolution does with the frozen bytes of a crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2067,6 +2067,7 @@ impl Enc<'_> {
             no_std,
             proc_macro,
             arbitrary_ints,
+            early_drop,
             edition,
             recursion_limit,
         } = &**data;
@@ -2080,6 +2081,7 @@ impl Enc<'_> {
         self.bool(*no_core);
         self.bool(*no_std);
         self.bool(*arbitrary_ints);
+        self.bool(*early_drop);
         self.option(*recursion_limit, |enc, it| {
             enc.u32(it);
             Ok(())
@@ -3469,6 +3471,7 @@ impl Dec<'_> {
         data.no_core = self.bool()?;
         data.no_std = self.bool()?;
         data.arbitrary_ints = self.bool()?;
+        data.early_drop = self.bool()?;
         data.recursion_limit = self.option(Self::u32)?;
         data.registered_tools = self.many(Self::symbol)?;
         let mut features = UnstableFeatures::default();

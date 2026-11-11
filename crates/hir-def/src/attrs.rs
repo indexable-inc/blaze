@@ -587,6 +587,20 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                     (Some(Word::blaze), Some(Word::nonblocking)) => {
                         attr_flags.insert(AttrFlags::NONBLOCKING)
                     }
+                    // `#[blaze::drop(early)]`, `#[blaze::drop(early, trusted = "why")]` and
+                    // `#[blaze::drop(scoped)]` on a type; anything else sets no flag, and
+                    // both words set both, which `hir_ty_mir::mir::early_drop` refuses.
+                    (Some(Word::blaze), Some(Word::drop)) => {
+                        if tt_has_token(tt, "early") {
+                            attr_flags.insert(AttrFlags::DROP_EARLY);
+                            if tt_has_token(tt, "trusted") {
+                                attr_flags.insert(AttrFlags::DROP_TRUSTED);
+                            }
+                        }
+                        if tt_has_token(tt, "scoped") {
+                            attr_flags.insert(AttrFlags::DROP_SCOPED);
+                        }
+                    }
                     _ => {}
                 },
             }
@@ -907,6 +921,7 @@ name_set! {
     diagnostic,
     do_not_recommend,
     doc,
+    drop,
     export_name,
     fundamental,
     has_significant_drop,
@@ -1192,6 +1207,19 @@ bitflags::bitflags! {
         /// bounded by it counts as local in its crate's orphan check
         /// (`TraitFlags::SEALED`, `hir_ty::sealed_local_bound`, `hir-ty-coherence`).
         const BLAZE_SEALED = 1 << 100;
+        /// `#[blaze::drop(early)]` on a struct, enum or union with a `Drop` impl: a blaze
+        /// extension (inert under rustc with `#![register_tool(blaze)]`). Under
+        /// `#![blaze::early_drop]` a value of the type is dropped after its last use
+        /// (docs/v2/plan/design/early-drop.md): the impl must only free memory
+        /// (`hir_ty_pure::drop_effects`), unless [`AttrFlags::DROP_TRUSTED`] says otherwise.
+        /// Bit 101 is `NOREFCOUNT`'s on `edition-e2-handles-1109`.
+        const DROP_EARLY = 1 << 102;
+        /// `#[blaze::drop(scoped)]` on a type: a value of it, and of any type that holds one,
+        /// is dropped where its scope ends, as in Rust, whatever its destructor does.
+        const DROP_SCOPED = 1 << 103;
+        /// `#[blaze::drop(early, trusted = "why")]`: [`AttrFlags::DROP_EARLY`] asserted, the
+        /// destructor not checked (a pooled buffer whose drop gives it back to its pool).
+        const DROP_TRUSTED = 1 << 104;
         /// `#[blaze::linear]`, a word: a blaze extension (inert under rustc with
         /// `#![register_tool(blaze)]`), read by `hir-ty-linear`
         /// (docs/v2/plan/design/linear.md). On a struct or enum: a value of it may not be

@@ -287,6 +287,7 @@ pub(super) struct CCrateData<'a> {
     pub(super) no_std: bool,
     pub(super) proc_macro: bool,
     pub(super) arbitrary_ints: bool,
+    pub(super) early_drop: bool,
     pub(super) edition: Edition,
     pub(super) recursion_limit: Option<u32>,
 }
@@ -857,6 +858,7 @@ impl<'a> Projector<'a> {
             no_std,
             proc_macro,
             arbitrary_ints,
+            early_drop,
             edition,
             recursion_limit,
         } = data;
@@ -887,6 +889,7 @@ impl<'a> Projector<'a> {
             no_std: *no_std,
             proc_macro: *proc_macro,
             arbitrary_ints: *arbitrary_ints,
+            early_drop: *early_drop,
             edition: *edition,
             recursion_limit: *recursion_limit,
         }

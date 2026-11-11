@@ -253,6 +253,23 @@ fn old_match_attr_flags(
                     "blaze" if &*second_segment == "nonblocking" => {
                         attr_flags.insert(AttrFlags::NONBLOCKING)
                     }
+                    "blaze" if &*second_segment == "drop" => {
+                        // The words of the list, as `tt_has_token` finds them.
+                        let text = tt.syntax().text().to_string();
+                        let has = |word: &str| {
+                            text.split(|c: char| !c.is_alphanumeric() && c != '_')
+                                .any(|it| it == word)
+                        };
+                        if has("early") {
+                            attr_flags.insert(AttrFlags::DROP_EARLY);
+                            if has("trusted") {
+                                attr_flags.insert(AttrFlags::DROP_TRUSTED);
+                            }
+                        }
+                        if has("scoped") {
+                            attr_flags.insert(AttrFlags::DROP_SCOPED);
+                        }
+                    }
                     _ => {}
                 },
             }
