@@ -42,6 +42,12 @@ impl View {
     pub fn as_u64(self) -> u64 {
         self.0
     }
+
+    /// The view a host kept as its number ([`View::as_u64`]). A number that is no view of
+    /// the storage it is asked of is told apart there (`ChangedUnknown::NotAView`).
+    pub fn from_u64(view: u64) -> View {
+        View(view)
+    }
 }
 
 /// What [`Storage::end_epoch`] let go of.

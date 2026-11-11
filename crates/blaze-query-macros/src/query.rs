@@ -325,6 +325,19 @@ impl Query<'_> {
             }
         };
 
+        let changed = quote! {
+            /// The IDs of this query's keys whose value changed since view `since`
+            /// (`blaze_query::db::plumbing::changed_ids_since`): the engine's changed set,
+            /// walked from what was written. A caller reads a key's arguments from its ID.
+            #[allow(clippy::needless_lifetimes, dead_code)]
+            #vis fn changed_since<#db_lt>(
+                db: &#db_lt #db_ty,
+                since: #db::View,
+            ) -> #db::Changed<#db::Id> {
+                #plumbing::changed_ids_since::<#config>(db, since)
+            }
+        };
+
         let evict = if evictable {
             let evict_of = if self.direct_key() {
                 let arg = &args[0];
@@ -482,6 +495,7 @@ impl Query<'_> {
                 impl #name {
                     #fetch
                     #durable
+                    #changed
                     #evict
                     #arguments
                 }

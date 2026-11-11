@@ -63,7 +63,7 @@ pub mod plumbing {
     pub use blaze_mem::Tag;
 
     pub use super::{
-        frontier::changed_since,
+        frontier::{changed_ids_since, changed_since},
         function::{
             CycleKind, Function, MAX_ROUNDS, durable, evict_values, evict_values_of, fetch,
         },

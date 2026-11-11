@@ -359,6 +359,19 @@ impl std::fmt::Display for Unknown {
 /// puts its row in every walk.
 pub fn changed_since<F: Function>(db: &F::Db, since: View) -> Changed<F::Key> {
     let storage = db.storage();
+    match changed_ids_since::<F>(db, since) {
+        Changed::Keys(ids) => Changed::Keys(
+            // alloc: the caller's answer
+            ids.into_iter().filter_map(|id| F::Key::from_id_in(storage, id)).collect(),
+        ),
+        Changed::Unknown(why) => Changed::Unknown(why),
+    }
+}
+
+/// [`changed_since`], the keys as their IDs: what a generated query's `changed_since` gives,
+/// for its caller to read the arguments of (`arguments`), in ID order.
+pub fn changed_ids_since<F: Function>(db: &F::Db, since: View) -> Changed<Id> {
+    let storage = db.storage();
     bring_to_date(std::ptr::from_ref(db).cast(), storage);
     let index = F::ingredient().index();
     let (log, floor) = {
@@ -383,9 +396,7 @@ pub fn changed_since<F: Function>(db: &F::Db, since: View) -> Changed<F::Key> {
     }
     ids.sort_unstable();
     ids.dedup();
-    // alloc: the caller's answer
-    let keys = ids.into_iter().filter_map(|id| F::Key::from_id_in(storage, Id::from_u32(id)));
-    Changed::Keys(keys.collect())
+    Changed::Keys(ids.into_iter().map(Id::from_u32).collect()) // alloc: the caller's answer
 }
 
 /// Whether a walk is due: a view opened since the last, or a node said it changed.
