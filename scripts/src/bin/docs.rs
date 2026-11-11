@@ -55,8 +55,8 @@ const STATUSES: [&str; 4] = ["current", "plan", "record", "superseded"];
 const FRONT_FIELDS: [&str; 4] = ["status", "summary", "date", "superseded_by"];
 /// Top-level directories whose paths a doc names in backticks; anything else in backticks is a
 /// command, a type or a relative path, not checked.
-const TREE: [&str; 10] =
-    ["crates", "harness", "tools", "docs", "site", "library", "vendor", ".github", "demo", "licenses"];
+const TREE: [&str; 11] =
+    ["crates", "harness", "tools", "docs", "site", "library", "vendor", ".github", "demo", "licenses", "scripts"];
 /// Not checked for the docs they name: docs/ itself (its links are), the history, others' code,
 /// harness (its own workspace) and the flecs skills, about other projects.
 const NOT_OURS: [&str; 6] =
@@ -67,11 +67,10 @@ const ALLOWED_HEAD: &str = "# The Python files left (docs/v2/plan/design/scripts
 ";
 
 /// The patterns of tools/docs.py, compiled once. The ones Python wrote with a lookaround or a
-/// backreference (`SETTING`, `DOC_NAMED`, `SPAN`) are a pattern here plus a check in code:
-/// `settings`, `docs_named`, `spans`.
+/// backreference (`SETTING`, `DOC_NAMED`, `SPAN`) are code here (`settings`, `spans`) or a
+/// pattern plus a check in code (`docs_named`).
 struct Patterns {
     path: Regex,
-    setting: Regex,
     doc_named: Regex,
     link: Regex,
     ref_link: Regex,
@@ -93,7 +92,6 @@ impl Patterns {
         let tree: Vec<String> = TREE.iter().map(|it| blaze_script::regex::escape(it)).collect();
         Patterns {
             path: re(&format!(r"^(?:{})/[\w./@+-]*$", tree.join("|"))),
-            setting: re(r"\bBLAZE_[A-Z0-9_]*"),
             doc_named: re(r"docs/[\w./-]+\.md\b"),
             link: re(r#"!?\[(?:[^\[\]]|\[[^\]]*\])*\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)"#),
             ref_link: re(r"(?m)^\s{0,3}\[[^\]]+\]:\s*<?(\S+?)>?(?:\s|$)"),
@@ -111,16 +109,28 @@ impl Patterns {
     /// run of `[A-Z0-9_]` is a word character, so only the whole run can be followed by something
     /// that is not: the match is the whole run, when it ends in a letter or a digit and what
     /// follows is neither a word character nor `*`.
+    ///
+    /// Hand-written, not a regex: it runs over every tracked file, and a substring search for
+    /// `BLAZE_` is what makes `check` fast (a Unicode `\b` keeps the regex crate off its DFA).
     fn settings<'t>(&self, text: &'t str) -> Vec<&'t str> {
-        self.setting
-            .find_iter(text)
-            .filter(|m| {
-                let ends = m.as_str().chars().next_back().is_some_and(|c| c != '_');
-                let next = text[m.end()..].chars().next();
-                ends && !next.is_some_and(|c| word(c) || c == '*')
-            })
-            .map(|m| m.as_str())
-            .collect()
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(at) = text[from..].find("BLAZE_").map(|at| from + at) {
+            // `\b` before `B`: what comes before is no word character.
+            let starts = !text[..at].chars().next_back().is_some_and(word);
+            let name = |b: &u8| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_';
+            let end = at + text[at..].bytes().take_while(name).count();
+            from = if starts { end } else { at + 1 };
+            if !starts {
+                continue;
+            }
+            let ends = text[..end].chars().next_back().is_some_and(|c| c != '_');
+            let next = text[end..].chars().next();
+            if ends && !next.is_some_and(|c| word(c) || c == '*') {
+                out.push(&text[at..end]);
+            }
+        }
+        out
     }
 
     /// Python's `DOC_NAMED.findall`: `(?<![\w./:-])docs/[\w./-]+\.md\b`.
@@ -574,11 +584,19 @@ fn check(root: &Path, p: &Patterns) -> Vec<String> {
         }
         let Some(text) = read_text(&root.join(&path)) else { continue };
         let markdown = path.ends_with(".md");
-        if !markdown {
+        if !markdown && text.contains("BLAZE_") {
             settings.extend(p.settings(&text).into_iter().map(str::to_owned));
+        }
+        // Most files name no doc: the substring search skips them, and every line but the
+        // few that hold `docs/`, before any regex runs.
+        if !text.contains("docs/") {
+            continue;
         }
         let text = if markdown { strip_fences(p, &text) } else { text };
         for (n, line) in text.split('\n').enumerate() {
+            if !line.contains("docs/") {
+                continue;
+            }
             for named in p.docs_named(line) {
                 if !root.join(named).exists() {
                     errors.push(format!("{path}:{}: names {named}, which does not exist", n + 1));
