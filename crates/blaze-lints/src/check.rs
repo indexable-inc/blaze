@@ -2154,6 +2154,24 @@ struct LintAttr {
 fn lint_attrs(cfg: &CfgOptions, owner: ast::AnyHasAttrs<'_>) -> Vec<LintAttr> {
     let mut found = Vec::new();
     for_each_meta(cfg, ast::attrs_including_inner(&owner), |meta| {
+        // `#![blaze::capabilities]` (docs/v2/plan/design/std.md) sets what it asks for to
+        // `warn` beneath it, as a `warn` attribute naming that lint would, in its place among
+        // the others: a later `#![allow(blaze::std_use)]` wins.
+        if let ast::Meta::PathMeta(meta) = meta {
+            if let Some(path) = meta.path()
+                && is_capabilities(path.syntax().text())
+            {
+                let lint = crate::level::capabilities_asks_for();
+                found.push(LintAttr {
+                    level: Level::Warn,
+                    target: Target::Blaze(lint.bit()),
+                    name: format!("blaze::{}", lint.name()),
+                    range: path.syntax().text_range(),
+                    reason: None,
+                });
+            }
+            return;
+        }
         let ast::Meta::TokenTreeMeta(meta) = meta else { return };
         let Some(level) = meta
             .path()
@@ -2172,6 +2190,14 @@ fn lint_attrs(cfg: &CfgOptions, owner: ast::AnyHasAttrs<'_>) -> Vec<LintAttr> {
         }
     });
     found
+}
+
+/// Whether an attribute's path, as written, is `blaze::capabilities`.
+fn is_capabilities(path: &str) -> bool {
+    let mut parts = path.split("::").map(str::trim);
+    parts.next() == Some("blaze")
+        && parts.next() == Some(crate::level::CAPABILITIES)
+        && parts.next().is_none()
 }
 
 /// A lint name as rustc keeps it: without spaces, with `_` for `-`.

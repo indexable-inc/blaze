@@ -9,7 +9,7 @@ use edition::Edition::{Edition2018, Edition2021, Edition2024};
 
 use super::{
     Level::{Allow, Deny, Warn},
-    Lint,
+    Lint, ready,
     Reason::{
         Custom, EditionAndFutureReleaseError, EditionAndFutureReleaseSemanticsChange, EditionError,
         EditionSemanticsChange, FutureReleaseError,
@@ -1086,6 +1086,19 @@ pub(super) const BLAZE: &[Lint] = &[
     l("blaze::unbounded_wait", Allow, "detects a park or a condition wait with no deadline and no `// wakes: <who>` naming what always wakes it")
         .externally_loaded(),
     l("blaze::combined_identity", Allow, "detects hashes combined into an identity by XOR or a wrapping sum outside `blaze_ids::keyed`")
+    // The lints of code blaze cannot analyse (group `blaze::edition`): each warns by default once
+    // what its help names is in the tree (`ready`), and is allowed until then.
+    l("blaze::proc_macro_derive", ready::level(ready::REFLECTION_REPLACES_MACROS), "detects a derive procedural macro a workspace crate defines, opaque code that rewrites tokens at build time, which a generic impl over the type's fields by compile-time reflection replaces")
+        .externally_loaded(),
+    l("blaze::proc_macro_attribute", ready::level(ready::REFLECTION_REPLACES_MACROS), "detects an attribute procedural macro a workspace crate defines, opaque code that rewrites tokens at build time, which reflection over the item and a generic function replace")
+        .externally_loaded(),
+    l("blaze::proc_macro_fn_like", Warn, "detects a function-like procedural macro a workspace crate defines, opaque code that rewrites tokens at build time, which a `const fn` or a `const` block replaces unless it parses a foreign syntax")
+        .externally_loaded(),
+    l("blaze::build_script_ambient", ready::level(ready::CAPABILITIES_FOR_BUILD_SCRIPTS), "detects a build script of the workspace that reaches the file system, the environment, a process, the network or the clock through the standard library by itself, where a capability it is handed says what it can touch")
+        .externally_loaded(),
+    // `allow` whatever `ready::BSTD_IN_TREE` says: a crate asks for it (`#![blaze::capabilities]`),
+    // and a workspace does in its `lints-when-ready` table.
+    l("blaze::std_use", Allow, "detects a use of an item of Rust's standard library that blaze's own standard library replaces or forbids (ambient authority, a hidden cost, a global-heap allocation, a renamed type), once per item per function, naming what is written instead")
         .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
     l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),

@@ -163,6 +163,20 @@ Interface first, bottom last, so nothing waits on the runtime and every step lan
 S1 and S2 do not depend on each other. S3 is the long one: about 270 files name `std::fs`, 280
 `std::env`, 200 `std::process`, 200 `std::thread`, 160 the clock, and 410 `std::sync`.
 
+**S3's worklist is a lint.** `blaze::std_use` ([lints.md](../../../lints.md#std_use)) finds
+each use of an item of Rust's `std` that bstd replaces, by what the use resolves to, once per
+item per function, and names what is written instead from one table of rows (ambient
+authority, hidden cost, global-heap allocation, renamed) that is revised as bstd's API
+settles. `harness/v2/std_uses.py` runs it over the workspace and writes, per crate, the
+findings by kind and item, how many have a fix, and the number of functions whose signature
+changes, with the crates in layers: a layer depends on no findings of its own, so it is one
+batch, leaves first. S3 is met when that script reports no finding and every crate has the
+attribute. Only the renames are mechanical (`blaze check --fix` writes `bstd::sync::Shared`
+for `Arc`, and the like); taking a capability is a change of signatures, made by hand a layer
+at a time. The lint is `allow` until a crate has `#![blaze::capabilities]`; blaze's own
+workspace has it at `warn` from the day `BSTD_IN_TREE` (`crates/blaze-lint-defs/src/ready.rs`)
+is turned on, which is when S1 compiles on a stage-1 blaze and S3 starts.
+
 Ordinary-edition dependencies stay usable: the walk proves, from source, that what the program
 reaches in them has neither effect. Most pure libraries pass unchanged; one that fails is refused
 with its path, or put on the trusted list with a reason.

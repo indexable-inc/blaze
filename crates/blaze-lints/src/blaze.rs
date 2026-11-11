@@ -21,6 +21,7 @@ mod bounded_heap_field;
 mod bounds_check_in_loop;
 mod box_large_new;
 mod boxed_recursive_node;
+mod build_script_ambient;
 mod checkfree;
 mod clone;
 mod cold_error;
@@ -75,6 +76,8 @@ mod lock_held_across_slow;
 mod loops;
 mod missing_size_hint;
 mod native_contracts;
+#[cfg(test)]
+mod opaque_tests;
 mod open_wait_loop;
 mod outline_generic_body;
 mod packable;
@@ -88,6 +91,7 @@ mod perf_general_tests;
 #[cfg(test)]
 mod perf_tests;
 mod pod_serialized_by_field;
+mod proc_macro;
 #[cfg(test)]
 mod profile_tests;
 mod profiled;
@@ -101,6 +105,9 @@ mod shared_collection_lock;
 mod small_map;
 mod soa_candidate;
 mod stable_sort_needless;
+mod std_use;
+#[cfg(test)]
+mod std_use_tests;
 mod stdout_lock_in_loop;
 mod string_key;
 mod struct_update;
@@ -123,6 +130,7 @@ mod wide_index;
 mod wildcard_arm;
 
 use base_db::Db;
+use blaze_diagnostics::lints::registry::ready;
 use hir_def::{DefWithBodyId, FunctionId, HasModule as _, TraitId, hir::Expr};
 use hir_ty::{ParamEnvAndCrate, db::HirDatabase as _, next_solver::DbInterner};
 use intern::sym;
@@ -242,6 +250,11 @@ pub enum Lint {
     DurableWrite,
     UnboundedWait,
     CombinedIdentity,
+    ProcMacroDerive,
+    ProcMacroAttribute,
+    ProcMacroFnLike,
+    BuildScriptAmbient,
+    StdUse,
 }
 
 /// Which workspaces a lint is for.
@@ -258,6 +271,11 @@ pub(crate) enum Kind {
     /// depends on) or it can't see whether the code is hot: allowed until a workspace or crate
     /// turns it, or the group `blaze::pedantic_perf`, on.
     PedanticPerf,
+    /// It flags what the blaze edition removes (docs/v2/plan/design/edition.md), here the code
+    /// blaze cannot analyse and what blaze's standard library replaces (`std_use`): the group
+    /// `blaze::edition`, allowed until a workspace or crate turns it on, but for a lint whose
+    /// advice this blaze already has ([`Lint::warns_by_default`]), which warns everywhere.
+    Edition,
 }
 
 /// The lints that are `deny` by default rather than their kind's level: they fire only where
@@ -273,6 +291,27 @@ pub(crate) const DENY_BY_DEFAULT: &[Lint] = &[
     Lint::Pure,
     Lint::UndeclaredEffect,
 ];
+
+/// Each lint of [`Kind::Edition`] with whether what its help tells code to move to is in this
+/// blaze, so that it warns by default and not only where a workspace turns `blaze::edition`
+/// on. `const fn` and `const` blocks are Rust's, so a function-like macro's lint warns now; the
+/// others wait for one switch each (`blaze_lint_defs::ready`, which the compile's registry
+/// reads for the same default).
+pub(crate) const EDITION_READY: &[(Lint, bool)] = &[
+    (Lint::ProcMacroDerive, ready::REFLECTION_REPLACES_MACROS),
+    (Lint::ProcMacroAttribute, ready::REFLECTION_REPLACES_MACROS),
+    (Lint::ProcMacroFnLike, true),
+    (Lint::BuildScriptAmbient, ready::CAPABILITIES_FOR_BUILD_SCRIPTS),
+    // Never by default, in any workspace: a crate asks for it (`#![blaze::capabilities]`), and
+    // blaze's own workspace does once bstd is in the tree (its manifest's `lints-when-ready`
+    // table and `ready::BSTD_IN_TREE`).
+    (Lint::StdUse, false),
+];
+
+/// The group `blaze::proc_macro`: one lint per kind of procedural macro a workspace crate
+/// defines, so each kind has its own default level and one name sets all three.
+pub(crate) const PROC_MACRO: &[Lint] =
+    &[Lint::ProcMacroDerive, Lint::ProcMacroAttribute, Lint::ProcMacroFnLike];
 
 /// The group `blaze::hot`: every lint of hot code, a hasher nobody chose included
 /// (`default_hasher`, which grew from `hot_lint.py`'s SipHash maps), and a value that leaves
@@ -418,6 +457,11 @@ impl Lint {
         Lint::DurableWrite,
         Lint::UnboundedWait,
         Lint::CombinedIdentity,
+        Lint::ProcMacroDerive,
+        Lint::ProcMacroAttribute,
+        Lint::ProcMacroFnLike,
+        Lint::BuildScriptAmbient,
+        Lint::StdUse,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -481,6 +525,14 @@ impl Lint {
             Lint::DeepDropAtExit | Lint::PodSerializedByField | Lint::Packable | Lint::SoaCandidate => {
                 Kind::PedanticPerf
             }
+            // Code blaze cannot analyse, which the blaze edition removes; right for any
+            // workspace once the replacement exists ([`Lint::warns_by_default`]).
+            Lint::ProcMacroDerive
+            | Lint::ProcMacroAttribute
+            | Lint::ProcMacroFnLike
+            | Lint::BuildScriptAmbient
+            // What blaze's standard library replaces, which the edition's `std` no longer has.
+            | Lint::StdUse => Kind::Edition,
             // `blaze::hot` and its comments (`// clone:`, `// alloc:`, `// dyn:`).
             Lint::HotClone
             | Lint::HotAlloc
@@ -533,6 +585,19 @@ impl Lint {
             | Lint::UnboundedWait
             | Lint::CombinedIdentity => Kind::Internal,
         }
+    }
+
+    /// Whether a lint of [`Kind::Edition`] warns by default: what its help tells code to move
+    /// to is in this blaze ([`EDITION_READY`]). `false` for a lint of another kind.
+    pub(crate) const fn warns_by_default(self) -> bool {
+        let mut at = 0;
+        while at < EDITION_READY.len() {
+            if EDITION_READY[at].0 as u8 == self as u8 {
+                return EDITION_READY[at].1;
+            }
+            at += 1;
+        }
+        false
     }
 
     /// The lint `name`, after `blaze::`, stands for: its own, or the one it was renamed to
@@ -633,6 +698,11 @@ impl Lint {
             Lint::DurableWrite => "durable_write",
             Lint::UnboundedWait => "unbounded_wait",
             Lint::CombinedIdentity => "combined_identity",
+            Lint::ProcMacroDerive => "proc_macro_derive",
+            Lint::ProcMacroAttribute => "proc_macro_attribute",
+            Lint::ProcMacroFnLike => "proc_macro_fn_like",
+            Lint::BuildScriptAmbient => "build_script_ambient",
+            Lint::StdUse => "std_use",
         }
     }
 
@@ -731,6 +801,11 @@ impl Lint {
             Lint::DurableWrite => concat!(docs!(), "#durable_write"),
             Lint::UnboundedWait => concat!(docs!(), "#unbounded_wait"),
             Lint::CombinedIdentity => concat!(docs!(), "#combined_identity"),
+            Lint::ProcMacroDerive | Lint::ProcMacroAttribute | Lint::ProcMacroFnLike => {
+                concat!(general_docs!(), "#proc_macro")
+            }
+            Lint::BuildScriptAmbient => concat!(general_docs!(), "#build_script_ambient"),
+            Lint::StdUse => concat!(general_docs!(), "#std_use"),
             Lint::FiberBoundary => {
                 "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan.md"
             }
@@ -996,6 +1071,37 @@ impl Lint {
             Lint::DynInHotField => {
                 "take the implementation as a type parameter (`struct S<F: Fn(..)>`) so the call is direct and inlinable, which costs one copy of the code per type used; or say why with `#[expect(blaze::dyn_in_hot_field, reason = \"..\")]`"
             }
+            Lint::ProcMacroDerive => {
+                if ready::REFLECTION_REPLACES_MACROS {
+                    "write the derive as a generic impl over the type's fields by compile-time reflection: `for const f in fields_of::<T>()` reading `value.[f]`, bounded by `for<F: Field<T>> F::Type: Trait`, under `#![feature(blaze_comptime)]` (docs/v2/plan/design/comptime.md); or say why the macro stays with `#[expect(blaze::proc_macro_derive, reason = \"..\")]`"
+                } else {
+                    "nothing to change yet: the replacement is a generic impl over the type's fields by compile-time reflection (`for const f in fields_of::<T>()`), phase 2 of docs/v2/plan/design/comptime.md, which is behind the opt-in `#![feature(blaze_comptime)]` and not complete in this blaze; this lint is `allow` by default until it is"
+                }
+            }
+            Lint::ProcMacroAttribute => {
+                if ready::REFLECTION_REPLACES_MACROS {
+                    "write what the attribute generates as a generic function over the item by compile-time reflection: its fields with `for const f in fields_of::<T>()`, a function's facts with `fn_info(&f)`, under `#![feature(blaze_comptime)]` (docs/v2/plan/design/comptime.md), called where the impls or the registration are needed; or say why the macro stays with `#[expect(blaze::proc_macro_attribute, reason = \"..\")]`"
+                } else {
+                    "nothing to change yet: the replacement is reflection over the item (`fields_of::<T>()`, `fn_info(&f)`) and a generic function that does what the generated impls or registrations do, phase 2 of docs/v2/plan/design/comptime.md, which is behind the opt-in `#![feature(blaze_comptime)]` and not complete in this blaze; this lint is `allow` by default until it is"
+                }
+            }
+            Lint::ProcMacroFnLike => {
+                "a macro that builds data at compile time is a `const fn` or a `const { .. }` block, which blaze checks once, analyses and caches as ordinary code (`core::mem::type_info` answers there, docs/v2/plan/design/comptime.md); a macro that parses a foreign syntax (a DSL in a string or in tokens) is not replaced by reflection and may stay: say so with `#[expect(blaze::proc_macro_fn_like, reason = \"parses ..\")]`"
+            }
+            Lint::BuildScriptAmbient => {
+                if ready::CAPABILITIES_FOR_BUILD_SCRIPTS {
+                    "take the capability as a parameter instead (`Fs`, `Env`, `Process`, `Net`, `Clock` of blaze's standard library, docs/v2/plan/design/std.md): the script's signature then states what it can touch, blaze proves what it reads, and reruns it only when that changes; or say why with `#[expect(blaze::build_script_ambient, reason = \"..\")]`"
+                } else {
+                    "nothing to change yet: the replacement is a capability the script is handed (`Fs`, `Env`, `Process`, `Net`, `Clock` of blaze's standard library, docs/v2/plan/design/std.md), which states in the script's signature what it can touch, lets blaze prove what it reads, and reruns it only when that changes; that library is not in this blaze, and this lint is `allow` by default until it is"
+                }
+            }
+            Lint::StdUse => {
+                if ready::BSTD_IN_TREE {
+                    "take the capability, or write the form of blaze's standard library, that the finding names (bstd, docs/v2/plan/design/std.md): a function then says in its signature everything it can touch, wait for and allocate from; where the finding has a fix, `blaze check --fix` makes it; or say why std's stays with `#[expect(blaze::std_use, reason = \"..\")]`"
+                } else {
+                    "nothing to change yet: what the finding names is of blaze's standard library (bstd, docs/v2/plan/design/std.md), which is not in this blaze; this lint is `allow` by default, a crate asks for it with `#![blaze::capabilities]`, and blaze's own workspace has it at `warn` once bstd is in the tree"
+                }
+            }
             Lint::FrozenCollection => {
                 "make the field a `Box<[T]>` (`Box<str>` for a string), built once with `into_boxed_slice()` / `into_boxed_str()`; or say why it stays growable with `#[expect(blaze::frozen_collection, reason = \"..\")]`"
             }
@@ -1062,6 +1168,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         cold_error::check_fn(cx, f);
         profiled::check_fn(cx, f);
         native_contracts::check(cx, f);
+        proc_macro::check(cx, f);
     }
     if let Some(item) = ast::Enum::cast(node) {
         large_move::check_enum(cx, item);
@@ -1094,6 +1201,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         shared_collection_lock::check_declaration(cx, node);
     }
     unrecorded_span::check(cx, node);
+    std_use::check_declaration(cx, node);
     if node == cx.root() && cx.in_file() {
         error_debug::check(cx);
         dropped_error::check(cx);
@@ -1145,6 +1253,8 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         front_vec_ops::check(cx);
         fmt_allocates::check(cx);
         stable_sort_needless::check(cx);
+        build_script_ambient::check(cx);
+        std_use::check(cx);
         check_body(cx);
     }
 }
