@@ -270,12 +270,12 @@ theorem Stutter.run_source_le {src tgt : Program} {f : State → State} {Inv : S
       · -- The source ended before its `k + 1` steps: those steps are how it ended.
         have up : Blaze.Mir.run src (m' + 1 + (k - m')) st = Blaze.Mir.run src (m' + 1) st :=
           run_mono src (m' + 1) (k - m') st (Blaze.Mir.run src (m' + 1) st) rfl hne
-        have e3 : k + 1 + 0 = m' + 1 + (k - m') := by omega
+        have e3 : m' + 1 + (k - m') = k + 1 + 0 := by omega
+        have same : Blaze.Mir.run src (m' + 1 + (k - m')) st = Blaze.Mir.run src (k + 1 + 0) st :=
+          congrArg (fun j => Blaze.Mir.run src j st) e3
         have r0 : Blaze.Mir.run src (m' + 1) st =
-            afterStep (Blaze.Mir.run src 0) (steps src (k + 1) st) := by
-          have r := run_steps src (k + 1) 0 st
-          rw [e3, up] at r
-          exact r
+            afterStep (Blaze.Mir.run src 0) (steps src (k + 1) st) :=
+          up.symm.trans (same.trans (run_steps src (k + 1) 0 st))
         rw [r0]
         rw [r0] at hne
         revert hne

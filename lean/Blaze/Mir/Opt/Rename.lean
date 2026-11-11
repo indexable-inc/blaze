@@ -86,7 +86,7 @@ theorem State.slots?_rename (ρ : FnId → BlockId → BlockId) (st : State) (fr
 
 theorem State.slot_rename (ρ : FnId → BlockId → BlockId) (st : State) (p : Pointer) :
     (st.rename ρ).slot p = st.slot p :=
-  congrArg (slotIn p.slot) (State.slots?_rename ρ st p.frame)
+  congrTo (slotIn p.slot) (State.slots?_rename ρ st p.frame)
 
 theorem State.read_rename (ρ : FnId → BlockId → BlockId) (st : State) (p : Pointer) :
     (st.rename ρ).read p = st.read p :=
@@ -122,7 +122,7 @@ theorem setFrame_renameStack (ρ : FnId → BlockId → BlockId) (id : Nat) (slo
           slots).trans (if_pos h')
       have right : setFrame (fr :: rest) id slots = fr.withLocals slots :: rest :=
         (setFrame_cons fr rest id slots).trans (if_pos h)
-      exact left.trans (congrArg (renameStack ρ) right).symm
+      exact left.trans (congrTo (renameStack ρ) right).symm
     · have h' : ¬ (fr.rename ρ (headFn (rest.map ctlOf))).id = id := h
       have left : setFrame (renameStack ρ (fr :: rest)) id slots =
           fr.rename ρ (headFn (rest.map ctlOf)) :: setFrame (renameStack ρ rest) id slots :=
@@ -131,13 +131,13 @@ theorem setFrame_renameStack (ρ : FnId → BlockId → BlockId) (id : Nat) (slo
       have right : setFrame (fr :: rest) id slots = fr :: setFrame rest id slots :=
         (setFrame_cons fr rest id slots).trans (if_neg h)
       have hd : headFn ((setFrame rest id slots).map ctlOf) = headFn (rest.map ctlOf) :=
-        congrArg headFn (setFrame_ctl id slots rest)
+        congrTo headFn (setFrame_ctl id slots rest)
       have last : fr.rename ρ (headFn (rest.map ctlOf)) :: renameStack ρ (setFrame rest id slots) =
           renameStack ρ (fr :: setFrame rest id slots) :=
-        congrArg (fun c => fr.rename ρ c :: renameStack ρ (setFrame rest id slots)) hd.symm
+        congrTo (fun c => fr.rename ρ c :: renameStack ρ (setFrame rest id slots)) hd.symm
       exact left.trans
-        ((congrArg (fun t => fr.rename ρ (headFn (rest.map ctlOf)) :: t) ih).trans
-          (last.trans (congrArg (renameStack ρ) right).symm))
+        ((congrTo (fun t => fr.rename ρ (headFn (rest.map ctlOf)) :: t) ih).trans
+          (last.trans (congrTo (renameStack ρ) right).symm))
 
 theorem State.setSlots_rename (ρ : FnId → BlockId → BlockId) (st : State) (f : Nat)
     (slots : List Slot) : (st.rename ρ).setSlots f slots = (st.setSlots f slots).rename ρ := by
@@ -147,7 +147,7 @@ theorem State.setSlots_rename (ρ : FnId → BlockId → BlockId) (st : State) (
       (State.setSlots_def (st.rename ρ) f slots).trans (if_pos hf)
     have right : st.setSlots f slots = { base := slots, stack := st.stack, next := st.next } :=
       (State.setSlots_def st f slots).trans (if_pos hf)
-    exact left.trans (congrArg (State.rename ρ) right).symm
+    exact left.trans (congrTo (State.rename ρ) right).symm
   · have left : (st.rename ρ).setSlots f slots =
         { base := st.base, stack := setFrame (renameStack ρ st.stack) f slots,
           next := st.next } :=
@@ -158,9 +158,9 @@ theorem State.setSlots_rename (ρ : FnId → BlockId → BlockId) (st : State) (
     have mid : ({ base := st.base, stack := setFrame (renameStack ρ st.stack) f slots,
           next := st.next } : State) =
         State.rename ρ { base := st.base, stack := setFrame st.stack f slots, next := st.next } :=
-      congrArg (fun s => ({ base := st.base, stack := s, next := st.next } : State))
+      congrTo (fun s => ({ base := st.base, stack := s, next := st.next } : State))
         (setFrame_renameStack ρ f slots st.stack)
-    exact left.trans (mid.trans (congrArg (State.rename ρ) right).symm)
+    exact left.trans (mid.trans (congrTo (State.rename ρ) right).symm)
 
 theorem State.setSlotIn_rename (ρ : FnId → BlockId → BlockId) (st : State) (p : Pointer)
     (slot : Slot) :
@@ -171,14 +171,14 @@ theorem State.setSlotIn_rename (ρ : FnId → BlockId → BlockId) (st : State) 
 
 theorem State.setSlot_rename (ρ : FnId → BlockId → BlockId) (st : State) (p : Pointer)
     (slot : Slot) : (st.rename ρ).setSlot p slot = (st.setSlot p slot).rename ρ :=
-  (congrArg ((st.rename ρ).setSlotIn p slot) (State.slots?_rename ρ st p.frame)).trans
+  (congrTo ((st.rename ρ).setSlotIn p slot) (State.slots?_rename ρ st p.frame)).trans
     (State.setSlotIn_rename ρ st p slot (st.slots? p.frame))
 
 theorem State.write_rename (ρ : FnId → BlockId → BlockId) (st : State) (p : Pointer)
     (v : Value) : (st.rename ρ).write p v = Outcome.map (State.rename ρ) (st.write p v) :=
   Outcome.bind_commutes (State.slot_rename ρ st p) (fun _ _ =>
     Outcome.bind_commutes rfl (fun slot' _ =>
-      congrArg Outcome.ok (State.setSlot_rename ρ st p slot')))
+      congrTo Outcome.ok (State.setSlot_rename ρ st p slot')))
 
 theorem stateOr_rename (ρ : FnId → BlockId → BlockId) (st : State) :
     ∀ (x : Outcome State),
@@ -193,7 +193,7 @@ theorem State.moveOut_rename (ρ : FnId → BlockId → BlockId) (st : State) :
   | { frame := frame, slot := slot, path := [] } =>
     State.setSlot_rename ρ st { frame := frame, slot := slot, path := [] } Slot.moved
   | { frame := frame, slot := slot, path := e :: rest } =>
-    (congrArg (stateOr (st.rename ρ))
+    (congrTo (stateOr (st.rename ρ))
         (State.write_rename ρ st { frame := frame, slot := slot, path := e :: rest }
           Value.dead)).trans
       (stateOr_rename ρ st
@@ -209,7 +209,7 @@ theorem projStep_rename (ρ : FnId → BlockId → BlockId) (st : State) (p : Po
   | ProjElem.index l =>
     have top : (st.rename ρ).read { frame := (st.rename ρ).top, slot := l, path := [] } =
         st.read { frame := st.top, slot := l, path := [] } :=
-      (congrArg (fun f => (st.rename ρ).read { frame := f, slot := l, path := [] })
+      (congrTo (fun f => (st.rename ρ).read { frame := f, slot := l, path := [] })
           (State.top_rename ρ st)).trans
         (State.read_rename ρ st { frame := st.top, slot := l, path := [] })
     Outcome.bind_congr top (fun _ _ =>
@@ -224,7 +224,7 @@ theorem evalProj_rename (ρ : FnId → BlockId → BlockId) (st : State) :
 
 theorem evalPlace_rename (ρ : FnId → BlockId → BlockId) (st : State) (place : Place) :
     evalPlace (st.rename ρ) place = evalPlace st place :=
-  (congrArg (fun f => evalProj (st.rename ρ) { frame := f, slot := place.base, path := [] }
+  (congrTo (fun f => evalProj (st.rename ρ) { frame := f, slot := place.base, path := [] }
       place.proj) (State.top_rename ρ st)).trans
     (evalProj_rename ρ st place.proj { frame := st.top, slot := place.base, path := [] })
 
@@ -240,7 +240,7 @@ theorem evalOperand_rename (ρ : FnId → BlockId → BlockId) (st : State) :
   | Operand.move p =>
     Outcome.bind_commutes (evalPlace_rename ρ st p) (fun ptr _ =>
       Outcome.bind_commutes (State.read_rename ρ st ptr) (fun v _ =>
-        congrArg (fun s => Outcome.ok (v, s)) (State.moveOut_rename ρ st ptr)))
+        congrTo (fun s => Outcome.ok (v, s)) (State.moveOut_rename ρ st ptr)))
   | Operand.const _ => rfl
 
 theorem evalOperands_rename (ρ : FnId → BlockId → BlockId) :
@@ -354,8 +354,8 @@ theorem switchTarget_rename (r : BlockId → BlockId) (key : Int) (otherwise : B
         if key = arm.1 then arm.2 else switchTarget key rest otherwise :=
       switchTarget_cons key arm rest otherwise
     by_cases h : key = arm.1
-    · exact (left.trans (if_pos h)).trans (congrArg r (right.trans (if_pos h))).symm
-    · exact (left.trans (if_neg h)).trans (ih.trans (congrArg r (right.trans (if_neg h))).symm)
+    · exact (left.trans (if_pos h)).trans (congrTo r (right.trans (if_pos h))).symm
+    · exact (left.trans (if_neg h)).trans (ih.trans (congrTo r (right.trans (if_neg h))).symm)
 
 theorem switchOn_rename (ρ : FnId → BlockId → BlockId) (st : State) (fn : FnId)
     (hfn : st.topFn = fn) (arms : List (Int × BlockId)) (otherwise : BlockId) :
@@ -363,7 +363,7 @@ theorem switchOn_rename (ρ : FnId → BlockId → BlockId) (st : State) (fn : F
       switchOn (st.rename ρ) (renameArms (ρ fn) arms) (ρ fn otherwise) key =
         Outcome.map (Next.map (State.rename ρ)) (switchOn st arms otherwise key)
   | some key =>
-    (congrArg (State.jump (st.rename ρ)) (switchTarget_rename (ρ fn) key otherwise arms)).trans
+    (congrTo (State.jump (st.rename ρ)) (switchTarget_rename (ρ fn) key otherwise arms)).trans
       (State.jump_rename ρ st fn hfn (switchTarget key arms otherwise))
   | none => rfl
 
@@ -385,13 +385,13 @@ theorem assertOn_rename (ρ : FnId → BlockId → BlockId) (st : State) (fn : F
       have right : assertOn st expected kind target (Value.bool b) = st.jump target :=
         (assertOn_bool st expected kind target b).trans (if_pos h)
       exact left.trans ((State.jump_rename ρ st fn hfn target).trans
-        (congrArg (Outcome.map (Next.map (State.rename ρ))) right).symm)
+        (congrTo (Outcome.map (Next.map (State.rename ρ))) right).symm)
     · have left : assertOn (st.rename ρ) expected kind (ρ fn target) (Value.bool b) =
           Outcome.panic kind :=
         (assertOn_bool (st.rename ρ) expected kind (ρ fn target) b).trans (if_neg h)
       have right : assertOn st expected kind target (Value.bool b) = Outcome.panic kind :=
         (assertOn_bool st expected kind target b).trans (if_neg h)
-      exact left.trans (congrArg (Outcome.map (Next.map (State.rename ρ))) right).symm
+      exact left.trans (congrTo (Outcome.map (Next.map (State.rename ρ))) right).symm
   | Value.unit => rfl
   | Value.int _ _ => rfl
   | Value.adt _ _ => rfl
@@ -425,7 +425,7 @@ theorem enterState_rename (ρ : FnId → BlockId → BlockId) (st : State) (fn :
     enterState (st.rename ρ) id sig args dest (mapTarget (ρ fn) target) =
       (enterState st id sig args dest target).rename ρ := by
   subst hfn
-  exact congrArg
+  exact congrTo
     (fun b =>
       ({ base := st.base,
          stack :=
@@ -455,15 +455,15 @@ theorem State.enter_rename (ρ : FnId → BlockId → BlockId) (st : State) (fn 
           (enterState (st.rename ρ) id sig args dest (mapTarget (ρ fn) target))) : Outcome Next) =
         Outcome.map (Next.map (State.rename ρ))
           (Outcome.ok (Next.state (enterState st id sig args dest target))) :=
-      congrArg (fun s => (Outcome.ok (Next.state s) : Outcome Next))
+      congrTo (fun s => (Outcome.ok (Next.state s) : Outcome Next))
         (enterState_rename ρ st fn hfn id sig args dest target h0)
-    exact left.trans (mid.trans (congrArg (Outcome.map (Next.map (State.rename ρ))) right).symm)
+    exact left.trans (mid.trans (congrTo (Outcome.map (Next.map (State.rename ρ))) right).symm)
   · have left : (st.rename ρ).enter id sig args dest (mapTarget (ρ fn) target) =
         Outcome.undefined Undefined.illFormed :=
       (State.enter_eq (st.rename ρ) id sig args dest (mapTarget (ρ fn) target)).trans (if_neg hl)
     have right : st.enter id sig args dest target = Outcome.undefined Undefined.illFormed :=
       (State.enter_eq st id sig args dest target).trans (if_neg hl)
-    exact left.trans (congrArg (Outcome.map (Next.map (State.rename ρ))) right).symm
+    exact left.trans (congrTo (Outcome.map (Next.map (State.rename ρ))) right).symm
 
 /-- The running frame returns: its caller goes on at the renamed target. -/
 theorem State.ret_rename (ρ : FnId → BlockId → BlockId) (st : State) :

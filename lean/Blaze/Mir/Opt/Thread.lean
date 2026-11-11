@@ -101,7 +101,7 @@ theorem execBlock_emptyGoto (adts : List AdtDecl) (sig : FnId → Option FnSig) 
       cases term with
       | goto t =>
         have e : t = c := Option.some.inj h
-        exact congrArg (State.jump st) e
+        exact congrTo (State.jump st) e
       | switchInt discr arms otherwise => exact none_eq_some_elim h
       | call callee args dest target => exact none_eq_some_elim h
       | ret => exact none_eq_some_elim h
@@ -144,7 +144,7 @@ theorem switchOn_thread (τ : BlockId → BlockId) (s : State) (arms : List (Int
         (switchOn s (renameArms τ arms) (τ otherwise) key)
   | some key =>
     Or.inr ⟨s, switchTarget key arms otherwise, rfl, rfl,
-      congrArg (State.jump s) (switchTarget_rename τ key otherwise arms)⟩
+      congrTo (State.jump s) (switchTarget_rename τ key otherwise arms)⟩
   | none => Or.inl rfl
 
 theorem assertOn_thread (τ : BlockId → BlockId) (s : State) (expected : Bool) (kind : Error)
@@ -245,10 +245,10 @@ theorem thread_exec (prog : Program) (st : State) (fn : FnId) (hfn : st.topFn = 
     have ⟨s, t, hs, hsrc, htgt⟩ := moved
     cases hg : emptyGoto? (nth? body.blocks t) with
     | none =>
-      have e : threadTarget body.blocks t = t := congrArg (orSelf t) hg
-      exact Or.inl (htgt.trans ((congrArg (State.jump s) e).trans hsrc.symm))
+      have e : threadTarget body.blocks t = t := congrTo (orSelf t) hg
+      exact Or.inl (htgt.trans ((congrTo (State.jump s) e).trans hsrc.symm))
     | some c =>
-      have e : threadTarget body.blocks t = c := congrArg (orSelf t) hg
+      have e : threadTarget body.blocks t = c := congrTo (orSelf t) hg
       have ⟨blk2, hb2, hg2⟩ := emptyGoto?_some (nth? body.blocks t) c hg
       have hblock : prog.block s.topFn t = some blk2 := by
         show blockOf t (nth? prog.fns s.topFn) = some blk2
@@ -257,11 +257,11 @@ theorem thread_exec (prog : Program) (st : State) (fn : FnId) (hfn : st.topFn = 
       cases jump_then prog c t blk2 hg2 s hblock with
       | inl same =>
         exact Or.inl
-          (htgt.trans ((congrArg (State.jump s) e).trans (same.symm.trans hsrc.symm)))
+          (htgt.trans ((congrTo (State.jump s) e).trans (same.symm.trans hsrc.symm)))
       | inr two =>
         have ⟨s1, hj, hstep⟩ := two
         exact Or.inr
-          ⟨s1, hsrc.trans hj, htgt.trans ((congrArg (State.jump s) e).trans hstep.symm)⟩
+          ⟨s1, hsrc.trans hj, htgt.trans ((congrTo (State.jump s) e).trans hstep.symm)⟩
 
 theorem thread_block (prog : Program) (st : State) (fn : FnId) (hfn : st.topFn = fn)
     (b : BlockId) :
@@ -353,7 +353,7 @@ theorem threadGotos_call_source (prog : Program) (n : Nat) (id : FnId) (base : L
     (threadGotos prog).call n id base args = prog.call n id base args :=
   Outcome.bind_congr (start_thread prog id base args) (fun st hst =>
     threadGotos_source prog n st (fun hd =>
-      hne ((congrArg (fun x => Outcome.bind x (run prog n)) hst).trans hd)))
+      hne ((congrTo (fun x => Outcome.bind x (run prog n)) hst).trans hd)))
 
 /-- A call of the threaded program that ends in `n` steps ends the same in the program with
 `2 * n`. -/
@@ -363,7 +363,7 @@ theorem threadGotos_call_target (prog : Program) (n : Nat) (id : FnId) (base : L
   have h : (threadGotos prog).call n id base args = prog.call (2 * n) id base args :=
     Outcome.bind_congr (start_thread prog id base args) (fun st hst =>
       (threadGotos_target prog n st (fun hd =>
-        hne ((congrArg (fun x => Outcome.bind x (run (threadGotos prog) n))
+        hne ((congrTo (fun x => Outcome.bind x (run (threadGotos prog) n))
           ((start_thread prog id base args).trans hst)).trans hd))).symm)
   exact h.symm
 

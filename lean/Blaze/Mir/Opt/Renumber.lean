@@ -45,7 +45,7 @@ theorem nth?_ge {α : Type} : ∀ (l : List α) (k : Nat), l.length ≤ k → nt
 
 theorem length_map' {α β : Type} (g : α → β) : ∀ (l : List α), (l.map g).length = l.length
   | [] => rfl
-  | _ :: l => congrArg (fun n => n + 1) (length_map' g l)
+  | _ :: l => congrTo (fun n => n + 1) (length_map' g l)
 
 /-- A map that knows each element's index, from `i` up. -/
 def mapFrom {α β : Type} (f : Nat → α → β) : Nat → List α → List β
@@ -99,12 +99,12 @@ theorem nth?_position {β : Type} (g : BlockId → β) (b : BlockId) :
     intro h
     by_cases e : a = b
     · have p : position b (a :: rest) = 0 := (position_cons b a rest).trans (if_pos e)
-      exact (congrArg (nth? (List.map g (a :: rest))) p).trans
-        (congrArg (fun x => some (g x)) e)
+      exact (congrTo (nth? (List.map g (a :: rest))) p).trans
+        (congrTo (fun x => some (g x)) e)
     · have p : position b (a :: rest) = position b rest + 1 :=
         (position_cons b a rest).trans (if_neg e)
       have h' : has b rest = true := ((has_cons b a rest).trans (if_neg e)).symm.trans h
-      exact (congrArg (nth? (List.map g (a :: rest))) p).trans (ih h')
+      exact (congrTo (nth? (List.map g (a :: rest))) p).trans (ih h')
 
 /-- A block not listed has the order's length as its position. -/
 theorem position_not_has (b : BlockId) :
@@ -122,7 +122,7 @@ theorem position_not_has (b : BlockId) :
     · have p : position b (a :: rest) = position b rest + 1 :=
         (position_cons b a rest).trans (if_neg e)
       have h' : has b rest = false := ((has_cons b a rest).trans (if_neg e)).symm.trans h
-      exact p.trans (congrArg (fun n => n + 1) (ih h'))
+      exact p.trans (congrTo (fun n => n + 1) (ih h'))
 
 /-- So nothing is there in the renumbered blocks. -/
 theorem nth?_position_none {β : Type} (g : BlockId → β) (b : BlockId) (order : List BlockId)
@@ -283,21 +283,21 @@ theorem block_renumber (orders : FnId → List BlockId) (prog : Program) (fn : F
     (k : BlockId) :
     (renumber orders prog).block fn k =
       blockOf k ((nth? prog.fns fn).map (fun body => renumberBody (orders fn) body)) :=
-  congrArg (blockOf k)
+  congrTo (blockOf k)
     (nth?_mapFrom_zero (fun i body => renumberBody (orders i) body) prog.fns fn)
 
 theorem block_of_none (prog : Program) (fn : FnId) (b : BlockId)
     (h : nth? prog.fns fn = none) : prog.block fn b = none :=
-  congrArg (blockOf b) h
+  congrTo (blockOf b) h
 
 theorem block_of_some (prog : Program) (fn : FnId) (b : BlockId) (body : Body)
     (h : nth? prog.fns fn = some body) : prog.block fn b = nth? body.blocks b :=
-  congrArg (blockOf b) h
+  congrTo (blockOf b) h
 
 theorem block_renumber_none (orders : FnId → List BlockId) (prog : Program) (fn : FnId)
     (k : BlockId) (h : nth? prog.fns fn = none) : (renumber orders prog).block fn k = none :=
   (block_renumber orders prog fn k).trans
-    (congrArg (fun o => blockOf k (Option.map (fun body => renumberBody (orders fn) body) o)) h)
+    (congrTo (fun o => blockOf k (Option.map (fun body => renumberBody (orders fn) body) o)) h)
 
 theorem block_renumber_some (orders : FnId → List BlockId) (prog : Program) (fn : FnId)
     (k : BlockId) (body : Body) (h : nth? prog.fns fn = some body) :
@@ -305,7 +305,7 @@ theorem block_renumber_some (orders : FnId → List BlockId) (prog : Program) (f
       nth? ((orders fn).map (fun old =>
         (blockAt body.blocks old).rename (fun b => position b (orders fn)))) k :=
   (block_renumber orders prog fn k).trans
-    (congrArg (fun o => blockOf k (Option.map (fun body => renumberBody (orders fn) body) o)) h)
+    (congrTo (fun o => blockOf k (Option.map (fun body => renumberBody (orders fn) body) o)) h)
 
 /-- A listed block of the program is, renamed, at its position in the renumbered program. -/
 theorem block_kept (orders : FnId → List BlockId) (prog : Program) (fn : FnId) (b : BlockId)
@@ -322,11 +322,11 @@ theorem block_kept (orders : FnId → List BlockId) (prog : Program) (fn : FnId)
       ((nth?_position
           (fun old => (blockAt body.blocks old).rename (fun x => position x (orders fn))) b
           (orders fn) hb).trans
-        (congrArg
+        (congrTo
           (fun o => some ((orUnreachable o).rename (fun x => position x (orders fn)))) hblk))
   have right : (prog.block fn b).map (BasicBlock.rename (renumbering orders fn)) =
       some (blk.rename (renumbering orders fn)) :=
-    congrArg (Option.map (BasicBlock.rename (renumbering orders fn)))
+    congrTo (Option.map (BasicBlock.rename (renumbering orders fn)))
       ((block_of_some prog fn b body hbody).trans hblk)
   exact left.trans right.symm
 
@@ -336,7 +336,7 @@ theorem block_no_fn (orders : FnId → List BlockId) (prog : Program) (fn : FnId
     (renumber orders prog).block fn (renumbering orders fn b) =
       (prog.block fn b).map (BasicBlock.rename (renumbering orders fn)) :=
   (block_renumber_none orders prog fn (renumbering orders fn b) hbody).trans
-    (congrArg (Option.map (BasicBlock.rename (renumbering orders fn)))
+    (congrTo (Option.map (BasicBlock.rename (renumbering orders fn)))
       (block_of_none prog fn b hbody)).symm
 
 /-- `c i body` holds of each function `body`, `i` its index from `i` up. -/
@@ -371,7 +371,7 @@ theorem sig_some (prog : Program) (id : FnId) (s : FnSig) (h : prog.sig id = som
   | some body => exact ⟨body, rfl⟩
   | none =>
     have e : prog.sig id = none :=
-      congrArg
+      congrTo
         (Option.map (fun body => ({ args := body.args, locals := body.locals.length } : FnSig)))
         hb
     exact none_eq_some_elim (e.symm.trans h)
@@ -417,7 +417,7 @@ theorem renumbers_total (orders : FnId → List BlockId) (prog : Program)
         | none =>
           have right : prog.block fn b = none := (block_of_some prog fn b body hbody).trans hsrc
           exact left.trans
-            (congrArg (Option.map (BasicBlock.rename (renumbering orders fn))) right).symm
+            (congrTo (Option.map (BasicBlock.rename (renumbering orders fn))) right).symm
         | some blk =>
           have hlt : b < body.blocks.length := nth?_lt body.blocks b blk hsrc
           have listed : has b (orders fn) = true :=
@@ -514,7 +514,7 @@ theorem closed_kept (orders : FnId → List BlockId) (prog : Program)
           (and_true_right (and_true_right hc)) hb
       have hn : nth? body.blocks b = some blk :=
         (block_of_some prog fn b body hbody).symm.trans hblk
-      have hat : blockAt body.blocks b = blk := congrArg orUnreachable hn
+      have hat : blockAt body.blocks b = blk := congrTo orUnreachable hn
       rw [hat] at ht
       exact termIn_live (orders fn) blk.terminator ht
 

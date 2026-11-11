@@ -12,6 +12,14 @@ what Lean checks at each use is a definitional unfolding of the function at hand
 
 namespace Blaze.Mir
 
+/-- `congrArg` whose two sides are stated by the goal: `x` is `f a` and `y` is `f b` by
+unfolding, checked after `a` and `b` are known from `h`. Plain `congrArg` under an expected
+type lets the goal choose `b`, and it chooses wrongly when the goal's side is `f` of
+something else that only unfolds to the same. -/
+theorem congrTo.{u, v} {α : Sort u} {β : Sort v} (f : α → β) {a b : α} (h : a = b) {x y : β}
+    (hx : x = f a := by rfl) (hy : f b = y := by rfl) : x = y :=
+  hx.trans ((congrArg f h).trans hy)
+
 theorem Outcome.map_ok {α β : Type} (t : α → β) (a : α) :
     Outcome.map t (Outcome.ok a) = Outcome.ok (t a) := rfl
 
@@ -26,7 +34,7 @@ theorem Outcome.bind_congr_same {α β : Type} {x : Outcome α} {f g : α → Ou
 
 theorem Outcome.bind_congr {α β : Type} {x x' : Outcome α} {f g : α → Outcome β}
     (hx : x' = x) (h : ∀ (a : α), x = Outcome.ok a → f a = g a) : x'.bind f = x.bind g :=
-  (congrArg (fun y => Outcome.bind y f) hx).trans (Outcome.bind_congr_same h)
+  (congrArg (fun y => Outcome.bind y f) hx : _).trans (Outcome.bind_congr_same h)
 
 /-- A bind commutes with a map of its result when its continuation does. -/
 theorem Outcome.bind_commutes_same {α β γ : Type} {t : β → γ} {x : Outcome α}
@@ -43,7 +51,7 @@ theorem Outcome.bind_commutes {α β γ : Type} {t : β → γ} {x x' : Outcome 
     {f : α → Outcome γ} {g : α → Outcome β} (hx : x' = x)
     (h : ∀ (a : α), x = Outcome.ok a → f a = Outcome.map t (g a)) :
     x'.bind f = Outcome.map t (x.bind g) :=
-  (congrArg (fun y => Outcome.bind y f) hx).trans (Outcome.bind_commutes_same h)
+  (congrArg (fun y => Outcome.bind y f) hx : _).trans (Outcome.bind_commutes_same h)
 
 /-- The same when the bound outcome is itself a map of the other's. -/
 theorem Outcome.bind_commutes_map_same {α α' β γ : Type} {s : α → α'} {t : β → γ}
@@ -61,7 +69,7 @@ theorem Outcome.bind_commutes_map {α α' β γ : Type} {s : α → α'} {t : β
     (hx : x' = Outcome.map s x)
     (h : ∀ (a : α), x = Outcome.ok a → f (s a) = Outcome.map t (g a)) :
     x'.bind f = Outcome.map t (x.bind g) :=
-  (congrArg (fun y => Outcome.bind y f) hx).trans (Outcome.bind_commutes_map_same h)
+  (congrArg (fun y => Outcome.bind y f) hx : _).trans (Outcome.bind_commutes_map_same h)
 
 /-- A bind of a mapped outcome is the bind of the outcome, when the continuations agree
 through the map. -/
@@ -78,7 +86,7 @@ theorem Outcome.bind_map_congr_same {α α' β : Type} {s : α → α'} {x : Out
 theorem Outcome.bind_map_congr {α α' β : Type} {s : α → α'} {x : Outcome α}
     {x' : Outcome α'} {f : α' → Outcome β} {g : α → Outcome β} (hx : x' = Outcome.map s x)
     (h : ∀ (a : α), x = Outcome.ok a → f (s a) = g a) : x'.bind f = x.bind g :=
-  (congrArg (fun y => Outcome.bind y f) hx).trans (Outcome.bind_map_congr_same h)
+  (congrArg (fun y => Outcome.bind y f) hx : _).trans (Outcome.bind_map_congr_same h)
 
 /-! Equations between different constructors, as eliminations. -/
 

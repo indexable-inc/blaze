@@ -30,7 +30,7 @@ def State.ctl (st : State) : List Ctl := st.stack.map ctlOf
 def State.topFn (st : State) : FnId := headFn st.ctl
 
 theorem State.topFn_of_ctl {st st' : State} (e : st'.ctl = st.ctl) : st'.topFn = st.topFn :=
-  congrArg headFn e
+  congrTo headFn e
 
 /-! Memory writes. -/
 
@@ -43,21 +43,21 @@ theorem setFrame_ctl (id : Nat) (slots : List Slot) :
     by_cases h : fr.id = id
     · have e : setFrame (fr :: rest) id slots = fr.withLocals slots :: rest :=
         (setFrame_cons fr rest id slots).trans (if_pos h)
-      exact congrArg (List.map ctlOf) e
+      exact congrTo (List.map ctlOf) e
     · have e : setFrame (fr :: rest) id slots = fr :: setFrame rest id slots :=
         (setFrame_cons fr rest id slots).trans (if_neg h)
-      exact (congrArg (List.map ctlOf) e).trans (congrArg (fun t => ctlOf fr :: t) ih)
+      exact (congrTo (List.map ctlOf) e).trans (congrTo (fun t => ctlOf fr :: t) ih)
 
 theorem State.setSlots_ctl (st : State) (f : Nat) (slots : List Slot) :
     (st.setSlots f slots).ctl = st.ctl := by
   by_cases hf : f = 0
   · have e : st.setSlots f slots = { base := slots, stack := st.stack, next := st.next } :=
       (State.setSlots_def st f slots).trans (if_pos hf)
-    exact congrArg State.ctl e
+    exact congrTo State.ctl e
   · have e : st.setSlots f slots =
         { base := st.base, stack := setFrame st.stack f slots, next := st.next } :=
       (State.setSlots_def st f slots).trans (if_neg hf)
-    exact (congrArg State.ctl e).trans (setFrame_ctl f slots st.stack)
+    exact (congrTo State.ctl e).trans (setFrame_ctl f slots st.stack)
 
 theorem State.setSlotIn_ctl (st : State) (p : Pointer) (slot : Slot) :
     ∀ (o : Option (List Slot)), (st.setSlotIn p slot o).ctl = st.ctl
