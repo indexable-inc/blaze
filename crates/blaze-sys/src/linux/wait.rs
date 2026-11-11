@@ -2,7 +2,7 @@
 //! makes each of its calls with. Nothing here loops or recomputes a time: `wait::until` does,
 //! from the wait's clock, before each call (rules deadline-waits, bounded-progress).
 
-use core::{mem::MaybeUninit, sync::atomic::AtomicU32};
+use core::sync::atomic::AtomicU32;
 
 use super::{nr, raw};
 use crate::{Errno, Fd, Timespec};
@@ -116,9 +116,11 @@ impl SigSet {
     #[blaze::nopanic]
     pub const fn with(self, signal: u32) -> SigSet {
         match signal {
-            // Wrapping forms: the arm's range keeps both in bounds, and no overflow check
-            // (a panic path) is compiled in.
-            1..=64 => SigSet(self.0 | 1u64.wrapping_shl(signal.wrapping_sub(1))),
+            // Bit `signal - 1`. The arm's range keeps both in bounds; written with forms that
+            // have no check in them (a check is a panic path): `<<` checks its amount and
+            // `wrapping_shl` reaches `unchecked_shl`'s precondition check, where a rotation
+            // of 1 is the same shift and checks nothing.
+            1..=64 => SigSet(self.0 | 1u64.rotate_left(signal.wrapping_sub(1))),
             _ => self,
         }
     }
@@ -174,11 +176,13 @@ impl ClockId {
 #[blaze::noalloc]
 #[blaze::nopanic]
 pub fn clock_gettime(clock: ClockId) -> Result<Timespec, Errno> {
-    let mut now = MaybeUninit::<Timespec>::zeroed();
-    // SAFETY: `now` is a live `__kernel_timespec` the kernel writes.
-    raw::check(unsafe { raw::syscall2(nr::CLOCK_GETTIME, clock.raw(), now.as_mut_ptr() as usize) })?;
-    // SAFETY: zeroed bytes are a valid `Timespec`, and the kernel filled it.
-    Ok(unsafe { now.assume_init() })
+    let mut now = Timespec::ZERO;
+    // SAFETY: `now` is a live `__kernel_timespec` (two 64-bit integers, any bytes valid) the
+    // kernel writes and keeps no pointer to.
+    raw::check(unsafe {
+        raw::syscall2(nr::CLOCK_GETTIME, clock.raw(), core::ptr::from_mut(&mut now) as usize)
+    })?;
+    Ok(now)
 }
 
 /// One `clock_nanosleep(TIMER_ABSTIME)`: sleeps until `at` on `clock`. `Ok` once the time

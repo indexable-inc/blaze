@@ -1,7 +1,5 @@
 //! Files and names: what the file effects and the beneath-only opens use.
 
-use core::mem::MaybeUninit;
-
 use super::{nr, raw};
 use crate::{Errno, Fd, Path};
 
@@ -459,7 +457,41 @@ pub struct Statx {
     spare3: [u64; 12],
 }
 
+impl StatxTime {
+    /// The epoch: every field zero.
+    const ZERO: StatxTime = StatxTime { sec: 0, nsec: 0, reserved: 0 };
+}
+
 impl Statx {
+    /// Every field zero: what [`statx`] hands the kernel to fill, so a field the kernel
+    /// does not write (its mask says which it did) reads as 0.
+    const ZERO: Statx = Statx {
+        mask: 0,
+        blksize: 0,
+        attributes: 0,
+        nlink: 0,
+        uid: 0,
+        gid: 0,
+        mode: 0,
+        spare0: 0,
+        ino: 0,
+        size: 0,
+        blocks: 0,
+        attributes_mask: 0,
+        atime: StatxTime::ZERO,
+        btime: StatxTime::ZERO,
+        ctime: StatxTime::ZERO,
+        mtime: StatxTime::ZERO,
+        rdev_major: 0,
+        rdev_minor: 0,
+        dev_major: 0,
+        dev_minor: 0,
+        mnt_id: 0,
+        dio_mem_align: 0,
+        dio_offset_align: 0,
+        spare3: [0; 12],
+    };
+
     /// `S_IFMT`: the bits of `mode` that are the file's type.
     pub const TYPE_MASK: u16 = 0o170000;
     /// `S_IFDIR`.
@@ -483,9 +515,10 @@ impl Statx {
 #[blaze::noalloc]
 #[blaze::nopanic]
 pub fn statx(dir: Fd, path: Path<'_>, flags: AtFlags, mask: StatxMask) -> Result<Statx, Errno> {
-    let mut stat = MaybeUninit::<Statx>::zeroed();
+    let mut stat = Statx::ZERO;
     // SAFETY: `path` is a live NUL-terminated string the kernel reads; `stat` is 256 live
-    // bytes it writes a `struct statx` into; it keeps neither.
+    // bytes (integers only, any bytes valid) it writes a `struct statx` into; it keeps
+    // neither.
     raw::check(unsafe {
         raw::syscall5(
             nr::STATX,
@@ -493,11 +526,10 @@ pub fn statx(dir: Fd, path: Path<'_>, flags: AtFlags, mask: StatxMask) -> Result
             path.as_ptr() as usize,
             flags.bits() as usize,
             mask.bits() as usize,
-            stat.as_mut_ptr() as usize,
+            core::ptr::from_mut(&mut stat) as usize,
         )
     })?;
-    // SAFETY: zeroed bytes are a valid `Statx` (integers only), and the kernel filled it.
-    Ok(unsafe { stat.assume_init() })
+    Ok(stat)
 }
 
 /// What a directory entry is (`d_type`).

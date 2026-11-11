@@ -57,6 +57,20 @@ macro_rules! errnos {
                     Errno::Unlisted(_) => "an error this table does not list",
                 }
             }
+
+            /// The error a number names: the listed one, or [`Errno::Unlisted`] with the
+            /// number. `from_raw(e.raw()) == e` for every listed `e`, and
+            /// `from_raw(n).raw() == n` for every `n` (the round trip the tests check).
+            #[blaze::noalloc]
+            #[blaze::nopanic]
+            pub const fn from_raw(code: u16) -> Errno {
+                // One comparison per listed error, in the table's order; no two share a
+                // number on a target (the tests check), so the order decides nothing.
+                $(if code == pick($linux, $macos) {
+                    return Errno::$variant;
+                })*
+                Errno::Unlisted(code)
+            }
         }
     };
 }
@@ -123,22 +137,6 @@ errnos! {
     Stale = "ESTALE", 116, 70, "a stale file handle";
     DQuot = "EDQUOT", 122, 69, "over the disk quota";
     Canceled = "ECANCELED", 125, 89, "the operation was cancelled";
-}
-
-impl Errno {
-    /// The error a number names: the listed one, or [`Errno::Unlisted`] with the number.
-    /// `from_raw(e.raw()) == e` for every listed `e`, and `from_raw(n).raw() == n` for every
-    /// `n` (the round trip the tests check).
-    #[blaze::noalloc]
-    #[blaze::nopanic]
-    pub fn from_raw(code: u16) -> Errno {
-        for &(errno, _, number) in Errno::LISTED {
-            if number == code {
-                return errno;
-            }
-        }
-        Errno::Unlisted(code)
-    }
 }
 
 impl core::fmt::Display for Errno {

@@ -14,13 +14,17 @@ use core::arch::asm;
 
 use crate::Errno;
 
+/// The largest result that is a value: the 4095 above it are errors on every architecture
+/// (`IS_ERR_VALUE`). A constant, so the subtraction is done as the crate compiles and
+/// [`check`] has no overflow check in it.
+const LAST_VALUE: usize = usize::MAX - 4095;
+
 /// The call's value, or the error its result names.
 #[inline]
 #[blaze::noalloc]
 #[blaze::nopanic]
 pub(super) fn check(result: usize) -> Result<usize, Errno> {
-    // The top 4095 values are errors on every architecture (`IS_ERR_VALUE`).
-    if result > usize::MAX - 4095 {
+    if result > LAST_VALUE {
         Err(Errno::from_raw(result.wrapping_neg() as u16))
     } else {
         Ok(result)
@@ -37,7 +41,7 @@ macro_rules! raw_calls {
             /// The caller upholds the kernel's contract for call `nr` with these arguments:
             /// every pointer among them is valid for what that call reads or writes.
             #[inline]
-            #[blaze::noalloc]
+            #[blaze::noalloc(trusted = "one system call instruction: the kernel runs on its own stack and calls no code of this process, so no allocator runs")]
             #[blaze::nopanic]
             pub(super) unsafe fn $name(nr: usize, $($arg: usize),*) -> usize {
                 let result: usize;

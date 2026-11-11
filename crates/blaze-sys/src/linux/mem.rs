@@ -105,7 +105,14 @@ pub unsafe fn mmap(
         raw::syscall6(nr::MMAP, hint, len, prot.bits() as usize, flags.bits() as usize, fd, offset as usize)
     })?;
     // A successful mapping is never at address 0 (`mmap_min_addr`).
-    NonNull::new(at as *mut u8).ok_or(Errno::NoMem)
+    mapped(at).ok_or(Errno::NoMem)
+}
+
+/// The address the kernel mapped, as a pointer; `None` for address 0.
+#[blaze::noalloc]
+#[blaze::nopanic(trusted = "NonNull::new aborts only in new_unchecked's check that the pointer is not null, which new itself tests before it calls it")]
+fn mapped(at: usize) -> Option<NonNull<u8>> {
+    NonNull::new(at as *mut u8)
 }
 
 /// `munmap`: the pages of `at..at + len` unmapped.

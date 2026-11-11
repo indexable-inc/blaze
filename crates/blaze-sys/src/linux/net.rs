@@ -113,7 +113,7 @@ impl SockAddr {
     #[blaze::noalloc]
     #[blaze::nopanic]
     pub fn unix(path: &[u8]) -> Result<SockAddr, Errno> {
-        if path.is_empty() || path.contains(&0) {
+        if path.is_empty() {
             return Err(Errno::Inval);
         }
         let mut address = UnixAddr { family: Family::Unix.raw(), path: [0; 108] };
@@ -121,8 +121,16 @@ impl SockAddr {
         let Some(room) = address.path.get_mut(..path.len()).filter(|_| path.len() < 108) else {
             return Err(Errno::NameTooLong);
         };
-        for (to, from) in room.iter_mut().zip(path) {
-            *to = *from;
+        // By index with `get`: `contains` and a slice's iterator both have a check that
+        // aborts, which no nopanic function may reach. `room` is as long as `path`.
+        let mut at = 0usize;
+        while let (Some(&byte), Some(to)) = (path.get(at), room.get_mut(at)) {
+            if byte == 0 {
+                return Err(Errno::Inval);
+            }
+            *to = byte;
+            // Below `path.len()`, so it cannot wrap; the wrapping form has no overflow check.
+            at = at.wrapping_add(1);
         }
         Ok(SockAddr::Unix(address))
     }

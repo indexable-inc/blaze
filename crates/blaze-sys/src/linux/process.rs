@@ -1,7 +1,7 @@
 //! Processes, their exits and their signals: what a spawn, a reap and the sandbox's own
 //! setup use.
 
-use core::{ffi::CStr, mem::MaybeUninit};
+use core::ffi::CStr;
 
 use super::{
     fs::{OwnedFd, arg, owned},
@@ -81,14 +81,20 @@ pub fn waitid(children: Children, options: WaitOptions) -> Result<Option<Waited>
     };
     // Zeroed, so that a child still running, of which the kernel writes nothing it need not,
     // reads as pid 0.
-    let mut info = MaybeUninit::<SigInfo>::zeroed();
-    // SAFETY: `info` is 128 live bytes the kernel writes a `siginfo_t` into; no `rusage` is
-    // asked for (null); it keeps no pointer.
+    let mut info = SigInfo([0; 32]);
+    // SAFETY: `info` is 128 live bytes (integers only, any bytes valid) the kernel writes a
+    // `siginfo_t` into; no `rusage` is asked for (null); it keeps no pointer.
     raw::check(unsafe {
-        raw::syscall5(nr::WAITID, which, id, info.as_mut_ptr() as usize, options.bits() as usize, 0)
+        raw::syscall5(
+            nr::WAITID,
+            which,
+            id,
+            core::ptr::from_mut(&mut info) as usize,
+            options.bits() as usize,
+            0,
+        )
     })?;
-    // SAFETY: zeroed bytes are a valid `SigInfo` (integers only).
-    let SigInfo(words) = unsafe { info.assume_init() };
+    let SigInfo(words) = info;
     let [_signo, _errno, code, _pad, pid, _uid, status, ..] = words;
     if pid == 0 {
         return Ok(None);
@@ -123,22 +129,22 @@ pub fn wait4_now(pid: i32) -> Result<Option<(i32, Rusage)>, Errno> {
     /// `WNOHANG`.
     const NO_HANG: usize = 1;
     let mut status = 0i32;
-    let mut rusage = MaybeUninit::<Rusage>::zeroed();
-    // SAFETY: `status` and `rusage` are live locals the kernel writes and does not keep.
+    let mut rusage = Rusage { user: [0; 2], system: [0; 2], max_rss_kb: 0, rest: [0; 13] };
+    // SAFETY: `status` (an `int`) and `rusage` (144 bytes of integers, any bytes valid) are
+    // live locals the kernel writes and does not keep.
     let reaped = raw::check(unsafe {
         raw::syscall4(
             nr::WAIT4,
             pid as isize as usize,
             core::ptr::from_mut(&mut status) as usize,
             NO_HANG,
-            rusage.as_mut_ptr() as usize,
+            core::ptr::from_mut(&mut rusage) as usize,
         )
     })?;
     if reaped == 0 {
         return Ok(None);
     }
-    // SAFETY: zeroed bytes are a valid `Rusage` (integers only), and the kernel filled it.
-    Ok(Some((status, unsafe { rusage.assume_init() })))
+    Ok(Some((status, rusage)))
 }
 
 flag_set! {

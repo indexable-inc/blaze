@@ -364,7 +364,7 @@ fn a_file_is_written_read_renamed_and_removed() {
         .unwrap()
         .map(|entry| (entry.name.to_vec(), entry.kind))
         .collect();
-    names.sort();
+    names.sort_by(|(a, _), (b, _)| a.cmp(b));
     assert_eq!(names.iter().map(|(name, _)| name.as_slice()).collect::<Vec<_>>(), [&b"."[..], b"..", b"b"]);
     assert!(matches!(names[2].1, EntryKind::Regular | EntryKind::Unknown));
     assert_eq!(getdents64(dir.fd(), &mut buffer).unwrap().count(), 0, "the directory's end");
