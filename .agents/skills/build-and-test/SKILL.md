@@ -123,8 +123,8 @@ From [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#wo
   `blaze test`, keep-going (the default), every failure handed back with the tree, command and error.
 - Checking agents' work fast, per commit, without waiting for the build
   ([docs/contributing.md#checking-a-change-fast](../../../docs/contributing.md#checking-a-change-fast)):
-  `blaze check $(uv run --frozen python harness/v2/changed.py '{"base": "<the commit before>", "print": "args"}') --lib --tests`
-  in the lane's VM, in parallel with the build. `changed.py` prints the packages the commit
+  `blaze check $(blaze run -q -p scripts --bin changed -- '{"base": "<the commit before>", "print": "args"}') --lib --tests`
+  in the lane's VM, in parallel with the build. `changed` prints the packages the commit
   touched and their dependents in the order to check; hand the first error back to the agent
   that wrote the code. Never let thousands of lines pile up unchecked behind an hour-long build.
 - A lane script, a harness and your own loop check every command's exit status and stop at the

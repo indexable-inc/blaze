@@ -259,11 +259,11 @@ machines have; when that is the only loop, thousands of lines are written before
 compiles them, and the first error (2026-11-10: a shadowed binding, then a struct named like
 its crate) arrives an hour in, with the next one an hour after.
 
-`harness/v2/changed.py` names what a change touches: the packages its files are in and the
+`scripts/src/bin/changed.rs` names what a change touches: the packages its files are in and the
 packages that depend on them, each after what it needs, so the first error is the earliest
 cause.
 
-    blaze check $(uv run --frozen python harness/v2/changed.py '{"base": "origin/main", "print": "args"}') --lib --tests
+    blaze check $(blaze run -q -p scripts --bin changed -- '{"base": "origin/main", "print": "args"}') --lib --tests
 
 - The session that integrates agents' work (rule fan-out-write-only) runs that in the lane's
   VM after each commit it takes, with `"base"` the commit before, in parallel with the build:

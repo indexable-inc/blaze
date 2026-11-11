@@ -56,7 +56,6 @@ const CODE: &[&str] = &[
     "harness/v2/fixture.py",
     "harness/v2/report.py",
     "harness/storelib.py",
-    "harness/v2/changed.py",
     "flake.nix",
     "flake.lock",
     ".github/blaze-version",
@@ -65,7 +64,8 @@ const CODE: &[&str] = &[
     ".github/workflows/blaze-platform.yaml",
     ".github/actions/toolchain/",
     ".github/actions/blaze/",
-    // The package of the repository's scripts, a workspace member the build checks.
+    // The package of the repository's scripts, a workspace member the build checks, among them
+    // the workspace check's fast tier (`changed`).
     "scripts/",
 ];
 /// What the warm tier (a push to main) reads besides.

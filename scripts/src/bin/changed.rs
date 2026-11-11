@@ -1,22 +1,22 @@
 //! changed: the packages a change touches and the packages that depend on them, in the order to
-//! check them. The port of `harness/v2/changed.py`, line for line: the same one JSON argument,
-//! `selftest`, text printed and exit status (docs/v2/plan/design/scripts.md, "Ports and their
-//! parity"). `DOC` below is the Python's docstring, which its usage error prints.
+//! check them. The port of `harness/v2/changed.py`, deleted once both were run on the same tree
+//! and agreed (docs/v2/plan/design/scripts.md, "Ports and their parity"). `DOC` below is what its
+//! usage error prints.
 //!
 //!     blaze run -q -p scripts --bin changed -- '{"base": "origin/main"}'
 //!     blaze run -q -p scripts --bin changed -- selftest
 //!
-//! Where this differs from the Python: a manifest that is not TOML is refused in the toml
+//! Where this differed from the Python: a manifest that is not TOML is refused in the toml
 //! crate's words, not tomllib's.
 
-/// harness/v2/changed.py's docstring, as its usage error prints it.
+/// What the usage error prints: harness/v2/changed.py's docstring, with this script's commands.
 const DOC: &str = r#"changed.py: the packages a change touches and the packages that depend on them, in the order
 to check them: what `blaze check -p ...` takes to check a change in minutes, not the workspace
 in an hour.
 
-    uv run --frozen python harness/v2/changed.py '{"base": "origin/main"}'
-    uv run --frozen python harness/v2/changed.py '{"base": "HEAD~3", "print": "args", "dependents": false}'
-    uv run --frozen python harness/v2/changed.py selftest
+    blaze run -q -p scripts --bin changed -- '{"base": "origin/main"}'
+    blaze run -q -p scripts --bin changed -- '{"base": "HEAD~3", "print": "args", "dependents": false}'
+    blaze run -q -p scripts --bin changed -- selftest
 
 The rule it serves: code is checked as it is written, a commit at a time, on the packages it
 touched (docs/contributing.md, "Checking a change fast"); thousands of lines nobody compiled are

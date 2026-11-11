@@ -63,8 +63,6 @@ CODE = (
     "harness/v2/fixture.py",
     "harness/v2/report.py",
     "harness/storelib.py",
-    # The workspace check's fast tier: which packages a change touches (its first step).
-    "harness/v2/changed.py",
     "flake.nix",
     "flake.lock",
     # The release of blaze that builds and tests blaze (.github/actions/blaze), and its installer.
@@ -76,7 +74,8 @@ CODE = (
     ".github/actions/toolchain/",
     ".github/actions/blaze/",
     # The package of the repository's scripts (scripts/src/bin/<name>.rs), a workspace member the
-    # build checks; their library is crates/blaze-script, under crates/ above.
+    # build checks, among them the workspace check's fast tier (`changed`, which packages a change
+    # touches); their library is crates/blaze-script, under crates/ above.
     "scripts/",
 )
 # What the warm tier (a push to main) reads besides: the std cases of the smoke corpus, run

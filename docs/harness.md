@@ -466,11 +466,11 @@ guards](#the-smokes-guards). The rest are not in CI yet.
 | `budgets.py` | The targets of [v2/plan/targets.md](v2/plan/objectives.md) as rows, each with the number measured, the budget and today's figure: edit to result, signature and formatting edits, no-op, warm start, memory against cargo, dev and release code speed, a big crate, the cold build's core use and critical path, CI for a small PR. [v2/plan/data.md](v2/plan/design/data.md)'s rows: bytes per token, node, expression, statement, memo, edge and relocation, memory per thousand lines, and cache misses per edit. `projects` and `budgets` choose rows, each empty for all; a budget named with no row for any project named (or a project with no row for any budget named) stops the run naming it, never a quiet subset. `{"command": "smoke", ...}` is the smoke above |
 | `std_uses.py` | The worklist of moving blaze's crates onto its own standard library ([v2/plan/design/std.md](v2/plan/design/std.md), step S3) and the check of ledger row S3: `blaze check` over the workspace with the lint `blaze::std_use` ([lints.md](lints.md#std_use)) at `warn`, its findings read from the JSON messages into one table per crate (by kind and item, how many have a fix, how many functions change), the crates in layers, leaves first. Passes when no finding is left (with `attribute`, also when every crate has `#![blaze::capabilities]`); a check that does not finish, or a finding it cannot read, is an error, never a pass. `{"command": "fix", ...}` applies the machine-applicable fixes crate by crate and stops at the first crate whose check then fails, naming it; `{"command": "read", "messages": ...}` makes the table from a check's saved messages |
 
-`changed.py '{"base": REF}'` checks nothing itself: it prints the workspace packages a change
-touches and the packages that depend on them, each after what it needs, as `-p` arguments
-(`"print": "args"`), for `blaze check` of a change in minutes
-([contributing.md](contributing.md#checking-a-change-fast)); the gate's workspace check runs it
-first.
+`blaze run -q -p scripts --bin changed -- '{"base": REF}'` (scripts/src/bin/changed.rs) checks
+nothing itself: it prints the workspace packages a change touches and the packages that depend
+on them, each after what it needs, as `-p` arguments (`"print": "args"`), for `blaze check` of a
+change in minutes ([contributing.md](contributing.md#checking-a-change-fast)); the gate's
+workspace check runs it first.
 
 #### The smoke's guards
 

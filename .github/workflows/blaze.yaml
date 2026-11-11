@@ -150,10 +150,10 @@ jobs:
       - run: uv run --frozen python harness/v2/budgets.py selftest
       # The smoke's guards (harness/v2/guards.py): each finding a bound is for, in miniature, is
       # refused by its bound and the fixed state passes; the known list reads; a result with a
-      # guard missing is refused. And which packages a change touches (harness/v2/changed.py).
+      # guard missing is refused. And which packages a change touches (scripts/src/bin/changed.rs).
       - run: |
           uv run --frozen python harness/v2/guards.py selftest
-          uv run --frozen python harness/v2/changed.py selftest
+          blaze run -q -p scripts --bin changed -- selftest
       # Every stated invariant has a control beside it, and docs/v2/plan/invariants.md lists them
       # (scripts/src/bin/invariants.rs).
       - run: |
@@ -400,7 +400,7 @@ jobs:
           job: check
           llvm: true
       # The fast tier: the packages the change touches and those that depend on them, each
-      # after what it needs (harness/v2/changed.py), checked before the workspace, so a change's
+      # after what it needs (scripts/src/bin/changed.rs), checked before the workspace, so a change's
       # first compile error comes in minutes and names the earliest cause. What it checks the
       # workspace check below finds checked. Against the base itself: the checkout is shallow.
       - name: blaze check of the packages this change touches
@@ -410,7 +410,7 @@ jobs:
           if [ -z "$BASE" ] || ! git fetch -q --depth=1 origin "$BASE"; then
             echo "no base to compare with: the workspace check below is the check"; exit 0
           fi
-          args=$(PYTHONPATH=tools/typed-input/src python3 harness/v2/changed.py "{\"base\": \"$BASE\", \"direct\": true, \"print\": \"args\"}")
+          args=$(blaze run -q -p scripts --bin changed -- "{\"base\": \"$BASE\", \"direct\": true, \"print\": \"args\"}")
           if [ -z "$args" ] || [ "$args" = --workspace ]; then
             echo "nothing narrower than the workspace to check first: ${args:-no package changed}"; exit 0
           fi
