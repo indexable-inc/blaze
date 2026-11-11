@@ -919,7 +919,13 @@ method of an impl of a trait so marked, that may, through any call:
 - `nopanic`: panic or abort: a panic entry point, an `Assert` the MIR keeps (a bounds check, a
   division check; an overflow check when the crate is built with `overflow-checks`, which the
   lint says), a foreign function whose ABI may unwind. An assert the constants decide
-  (`arr[2]` on a `[T; 4]`) is not one.
+  (`arr[2]` on a `[T; 4]`) is not one. Nor is the library's check of an `unsafe` precondition
+  (`core::ub_checks::assert_unsafe_precondition!`, which aborts in a build with debug
+  assertions) reached through a safe function of the toolchain: `wrapping_shl`, a slice's
+  iterator, `NonNull::new`, `MaybeUninit::zeroed` and `CStr::to_bytes` uphold what they call,
+  and the toolchain is trusted for `unsafe`. Calling the `unsafe fn` yourself
+  (`unchecked_add`, `NonNull::new_unchecked`, `hint::assert_unchecked`) still counts: the
+  precondition is yours to uphold, and the finding names the call.
 - `noalloc`: call the global allocator (`Vec::new`, `Box::new`, `to_owned`, `malloc`). An
   allocator the code names (`Vec::new_in(frame)`) is allowed.
 - `nonblocking`: block the thread: std's and `parking_lot`'s locks, condvars and channels,

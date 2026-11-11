@@ -6,8 +6,8 @@ use super::{
     fns::fn_named,
 };
 use crate::{
-    PURE, check_generic,
-    effect_attrs::{NOALLOC, NONBLOCKING},
+    PURE, Rule, check_generic,
+    effect_attrs::{NOALLOC, NONBLOCKING, NOPANIC},
 };
 
 /// The pinned core's `unsafe` precondition checks (`unchecked_add`'s, under every
@@ -126,5 +126,79 @@ pub fn raw(raw: &mut Raw, input: &u8) -> u8 {
         };
         let said = refusal.said();
         assert!(said.contains("takes the raw pointer `*const u8`"), "{said}");
+    });
+}
+
+/// The pinned library's `unsafe` precondition checks (`assert_unsafe_precondition!`'s
+/// `precondition_check`, which aborts) are not a panic of a safe toolchain function that
+/// reaches one: its contract is that it upholds the precondition, and the toolchain is trusted
+/// for `unsafe` (`wrapping_shl`, slice iteration, `NonNull::new`, `MaybeUninit::zeroed` and
+/// `CStr::to_bytes` at the pin, each a safe function over an `unsafe fn` with a check). A
+/// workspace call of the `unsafe fn` still counts: there the workspace upholds it, and a build
+/// with the checks on aborts when it does not. A panic that is no precondition check counts
+/// wherever it is, and so does a function that only has the check's name.
+#[test]
+fn an_unsafe_precondition_check_is_a_panic_only_to_who_must_uphold_it() {
+    let db = db_with(
+        r#"
+//- /lib.rs crate:kernel deps:std
+pub fn through_a_safe_function(n: usize) -> usize {
+    std::unchecked::to_bytes(n)
+}
+
+pub fn through_a_closure_of_a_safe_function() -> usize {
+    std::unchecked::zeroed()
+}
+
+pub fn calls_the_unsafe_function(n: usize) -> usize {
+    // SAFETY: none given: the fixture's point.
+    unsafe { std::unchecked::new_unchecked(n) }
+}
+
+pub fn calls_the_checked_function_itself(n: usize) {
+    // SAFETY: as above.
+    unsafe { std::unchecked::assert_unchecked(n != 0) }
+}
+
+pub fn a_real_panic(value: Option<usize>) -> usize {
+    std::unchecked::unwrap(value)
+}
+
+pub fn only_the_name(n: usize) {
+    std::unchecked::precondition_check(n != 0)
+}
+"#,
+    );
+    let krate = crate_named(&db, "kernel");
+    blaze_query::db::attach(&db, || {
+        for clean in ["through_a_safe_function", "through_a_closure_of_a_safe_function"] {
+            if let Err(refusal) = check_generic(&db, fn_named(&db, krate, clean), &NOPANIC) {
+                panic!("`{clean}` should be nopanic, but {}", refusal.said());
+            }
+        }
+        for (refused, names) in [
+            ("calls_the_unsafe_function", "new_unchecked"),
+            ("calls_the_checked_function_itself", "assert_unchecked"),
+        ] {
+            let Err(refusal) = check_generic(&db, fn_named(&db, krate, refused), &NOPANIC) else {
+                panic!("`{refused}` calls an `unsafe fn` whose precondition it must uphold");
+            };
+            let said = refusal.said();
+            assert_eq!(refusal.rule, Rule::Panic, "{said}");
+            assert!(
+                said.contains(names)
+                    && said.contains("an `unsafe fn` of the toolchain whose precondition check"),
+                "{said}"
+            );
+        }
+        for (refused, names) in [("a_real_panic", "unwrap"), ("only_the_name", "precondition_check")]
+        {
+            let Err(refusal) = check_generic(&db, fn_named(&db, krate, refused), &NOPANIC) else {
+                panic!("`{refused}` reaches a panic that is no precondition check");
+            };
+            let said = refusal.said();
+            assert_eq!(refusal.rule, Rule::Panic, "{said}");
+            assert!(said.contains(names) && said.contains("which panics"), "{said}");
+        }
     });
 }

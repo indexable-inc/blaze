@@ -608,6 +608,58 @@ pub mod process {
         unsafe { crate::sys::exit(code) }
     }
 }
+
+/// The shapes of the pinned library's `unsafe` precondition checks
+/// (`core::ub_checks::assert_unsafe_precondition!`): the check is a function written inside
+/// the `unsafe fn` whose precondition it is, and aborts when the caller broke it.
+pub mod unchecked {
+    /// `core::hint::assert_unchecked`.
+    pub unsafe fn assert_unchecked(cond: bool) {
+        #[rustc_no_mir_inline]
+        #[rustc_nounwind]
+        fn precondition_check(cond: bool) {
+            if !cond {
+                core::panicking::panic("unsafe precondition(s) violated: hint::assert_unchecked");
+            }
+        }
+        precondition_check(cond);
+    }
+
+    /// An `unsafe fn` over another, as `NonNull::new_unchecked` is over the pointer's check.
+    pub unsafe fn new_unchecked(at: usize) -> usize {
+        unsafe { assert_unchecked(at != 0) };
+        at
+    }
+
+    /// A safe function that upholds what it calls, as `CStr::to_bytes` does.
+    pub fn to_bytes(len: usize) -> usize {
+        // SAFETY: the stand-in's: what it asserts holds.
+        unsafe { assert_unchecked(true) };
+        len
+    }
+
+    /// The same through a closure, as `MaybeUninit::zeroed` and the iterators are written.
+    pub fn zeroed() -> usize {
+        // SAFETY: as above.
+        let make = || unsafe { new_unchecked(1) };
+        make()
+    }
+
+    /// A panic that is no precondition check: `Option::unwrap`'s.
+    pub fn unwrap(value: Option<usize>) -> usize {
+        match value {
+            Some(it) => it,
+            None => core::panicking::panic("called `Option::unwrap()` on a `None` value"),
+        }
+    }
+
+    /// Named as the check is, but not one: at the module's level, with no attribute.
+    pub fn precondition_check(cond: bool) {
+        if !cond {
+            core::panicking::panic("not a precondition check");
+        }
+    }
+}
 "#;
 
 /// The database of the toolchain with `crates` appended (each starting `//- /path crate:..`).

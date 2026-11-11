@@ -18,7 +18,7 @@
 
 use std::cmp::Ordering;
 
-use base_db::{Crate, Db};
+use base_db::{Crate, CrateOrigin, Db};
 use blaze_hash::{HashMap, HashSet};
 use blaze_query::db::{AsId, FromId};
 use hir_def::{
@@ -580,8 +580,16 @@ pub(crate) fn summary_in(db: &Db, env: StoredParamEnvAndCrate, instance: Instanc
 
 /// The kinds an effect keeps in a summary's set: those it refuses, and [`Rule::Open`], which a
 /// generic check reports as left to each instance.
+/// The kinds a summary keeps for `effect`: those it refuses, a call only an instance decides,
+/// and, for an effect that refuses a panic, an `unsafe` precondition check not answered for
+/// yet ([`Rule::Precondition`]), which is a panic where code outside the toolchain calls the
+/// `unsafe fn`.
 pub(crate) fn kept(effect: &EffectDef) -> EffectSet {
-    effect.refuses.union(EffectSet::one(Rule::Open))
+    let kept = effect.refuses.union(EffectSet::one(Rule::Open));
+    match effect.refuses.has(Rule::Panic) {
+        true => kept.union(EffectSet::one(Rule::Precondition)),
+        false => kept,
+    }
 }
 
 /// Bit `i` set for each effect `EFFECTS[i]` that `func` is trusted for.
@@ -971,6 +979,16 @@ impl Fold {
             };
         self.kinds = self.kinds.union(row).union(callee.kinds);
         let trusted = self.trusted_for(db, def_crate(db, Def::Body(def)));
+        // The toolchain's `unsafe` precondition checks (`Rule::Precondition`): what the check
+        // itself aborts with is the precondition of the function it is written in; a safe
+        // function of the toolchain upholds what it calls; a body outside the toolchain that
+        // calls one still pending (an `unsafe fn` of the toolchain) has to uphold it itself.
+        let toolchain = |krate: Crate| matches!(krate.data(db).origin, CrateOrigin::Lang(_));
+        let here = toolchain(self.home);
+        let check = func.is_some_and(|it| effects::precondition_check(db, it));
+        let upholds = func.is_some_and(|it| {
+            !check && toolchain(it.krate(db)) && !FunctionSignature::of(db, it).is_unsafe()
+        });
         for (index, effect) in EFFECTS.iter().enumerate() {
             if trusted & 1 << index != 0 || !Fold::counts(db, func, effect) {
                 continue;
@@ -987,6 +1005,28 @@ impl Fold {
                 let depth = match rule {
                     Rule::Recursion => RECURSION_DEPTH,
                     _ => callee.witness(index, rule).map_or(0, |it| it.depth).saturating_add(1),
+                };
+                let rule = match rule {
+                    Rule::Panic if check && here => Rule::Precondition,
+                    Rule::Precondition if upholds => continue,
+                    Rule::Precondition if !here => {
+                        self.add(index, Rule::Panic, 1, || How::Site {
+                            site: at,
+                            said: Some(
+                                match func {
+                                    // alloc: a witness's text
+                                    Some(func) => format!(
+                                        "calls {}, an `unsafe fn` of the toolchain whose precondition check aborts when its caller breaks the precondition",
+                                        fn_name(db, func)
+                                    ),
+                                    None => "calls code of the toolchain with an `unsafe` precondition, whose check aborts when its caller breaks it".to_owned(), // alloc: a witness's text
+                                }
+                                .into(),
+                            ),
+                        });
+                        continue;
+                    }
+                    rule => rule,
                 };
                 self.add(index, rule, depth, || How::Site { site: at, said: None });
             }

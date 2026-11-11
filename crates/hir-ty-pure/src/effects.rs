@@ -70,10 +70,19 @@ pub enum Rule {
     /// `dyn`: what it reaches was walked where the pointer or vtable was made, but it may
     /// reach the caller again, a recursion no cycle of instances shows.
     Indirect,
+    /// The abort of an `unsafe` precondition check of the toolchain (the `precondition_check`
+    /// of `core::ub_checks::assert_unsafe_precondition!`), not answered for yet. It goes up
+    /// through the toolchain's `unsafe fn`s to the first safe function of the toolchain, whose
+    /// contract is that it upholds the precondition (dropped there: the toolchain is trusted
+    /// for `unsafe`), or to code outside the toolchain that calls the `unsafe fn`, which has to
+    /// uphold it itself: there it is a [`Rule::Panic`] (`walk::Fold::callee`). Kept only in
+    /// the sets of an effect that refuses a panic, never a kind of [`crate::walk::Summary`]'s
+    /// `kinds`, and never refused itself.
+    Precondition,
 }
 
 impl Rule {
-    pub const ALL: [Rule; 21] = [
+    pub const ALL: [Rule; 22] = [
         Rule::Io,
         Rule::Env,
         Rule::Clock,
@@ -95,6 +104,7 @@ impl Rule {
         Rule::Loop,
         Rule::Recursion,
         Rule::Indirect,
+        Rule::Precondition,
     ];
 
     /// What an instance with this kind does: "reads the environment".
@@ -121,6 +131,7 @@ impl Rule {
             Rule::Loop => "has a loop not known to end",
             Rule::Recursion => "may call itself again",
             Rule::Indirect => "makes a call that may reach it again",
+            Rule::Precondition => "has an `unsafe` precondition its caller upholds",
         }
     }
 
@@ -148,6 +159,7 @@ impl Rule {
             Rule::Loop => "loop",
             Rule::Recursion => "recursion",
             Rule::Indirect => "indirect",
+            Rule::Precondition => "precondition",
         }
     }
 }
@@ -334,6 +346,28 @@ pub(crate) fn bound_mask(db: &Db, method: FunctionId) -> u32 {
         .enumerate()
         .filter(|(_, effect)| effect.word.is_some_and(|word| !may.has(word)))
         .fold(0, |mask, (index, _)| mask | 1 << index)
+}
+
+/// Whether `func` is the check of an `unsafe` precondition in the pinned library: the
+/// `precondition_check` that `core::ub_checks::assert_unsafe_precondition!` declares inside the
+/// function whose precondition it is, `#[rustc_no_mir_inline]` and `#[rustc_nounwind]`, which
+/// aborts through `panic_nounwind_fmt` when the caller of that function broke its contract.
+/// Only a function of the toolchain written inside a body with both attributes is one: a
+/// function of that name anywhere else is not.
+pub(crate) fn precondition_check(db: &Db, func: FunctionId) -> bool {
+    use hir_def::HasModule as _;
+    if !matches!(func.krate(db).data(db).origin, CrateOrigin::Lang(_)) {
+        return false;
+    }
+    let ItemContainerId::ModuleId(module) = func.lookup(db).container else { return false };
+    if !module.is_block_module(db) {
+        return false;
+    }
+    let flags = AttrFlags::query(db, AttrDefId::FunctionId(func));
+    flags.contains(AttrFlags::RUSTC_NO_MIR_INLINE)
+        && flags.contains(AttrFlags::RUSTC_NOUNWIND)
+        && hir_def::signatures::FunctionSignature::of(db, func).name.as_str()
+            == "precondition_check"
 }
 
 /// Whether a body of `krate` is the code a person writes: a crate of the workspace. The address
