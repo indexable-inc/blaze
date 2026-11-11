@@ -304,9 +304,17 @@ pub fn of_run(mut all: Vec<Blocked>, is_root: impl Fn(&Blocked) -> bool) -> (Vec
     (out, more)
 }
 
-/// What each process running `program`, and each process it started, is blocked in now.
+/// What each process running `program`, and each process it started, is blocked in now,
+/// read within [`WITHIN`].
 #[cfg(target_os = "linux")]
 pub fn of_program(program: &Path) -> Outcome {
+    of_program_within(program, WITHIN)
+}
+
+/// [`of_program`] with its wall-time bound given: the walk of `/proc` is cut once it has
+/// taken more than `within`, and says so.
+#[cfg(target_os = "linux")]
+fn of_program_within(program: &Path, within: Duration) -> Outcome {
     let began = std::time::Instant::now();
     let entries = match std::fs::read_dir("/proc") {
         Ok(entries) => entries,
@@ -321,9 +329,12 @@ pub fn of_program(program: &Path) -> Outcome {
             cut = Some(format!("/proc lists more than {SCAN_MOST} entries, the most looked at"));
             break;
         }
-        if began.elapsed() > WITHIN {
+        if began.elapsed() > within {
             // alloc: error path
-            cut = Some(format!("reading /proc took more than {} ms, its bound", WITHIN.as_millis()));
+            cut = Some(format!(
+                "reading /proc took more than {} ms, its bound, with {seen} of its entries looked at",
+                within.as_millis()
+            ));
             break;
         }
         let Some(pid) = entry.file_name().to_str().and_then(|it| it.parse::<u32>().ok()) else {
@@ -484,14 +495,45 @@ mod tests {
     }
 
     /// Where there is a `/proc`, this process is found by its own program and is not cut.
+    /// The walk is given a minute, not [`WITHIN`]: `/proc` lists processes oldest first, so
+    /// this one is among the last, and a walk cut at 200 ms on a machine busy with other work
+    /// ends before it (on 2026-11-11 a run beside a build found none). What the bound does is
+    /// the test below's.
     #[cfg(target_os = "linux")]
     #[test]
     fn this_process_is_found_by_its_program() {
         let program = std::env::current_exe().unwrap();
-        let Outcome::Read { processes, .. } = of_program(&program) else {
+        let outcome = of_program_within(&program, Duration::from_secs(60));
+        let Outcome::Read { processes, cut } = &outcome else {
+            panic!("/proc was not read: {outcome:?}")
+        };
+        assert_eq!(*cut, None, "the walk was cut");
+        // Its pid as `/proc` lists it, which is not `std::process::id()` where `/proc` is of
+        // another pid namespace than the process.
+        let own: u32 = std::fs::read_link("/proc/self")
+            .unwrap()
+            .to_str()
+            .and_then(|it| it.parse().ok())
+            .expect("/proc/self names a pid");
+        assert!(
+            processes.iter().any(|it| it.pid == own),
+            "process {own} (`std::process::id()` says {}) running {} is not among {processes:#?}",
+            std::process::id(),
+            program.display()
+        );
+    }
+
+    /// A walk out of time is cut and says so, with what it found until then: never a list
+    /// that reads as whole.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_walk_out_of_time_says_it_was_cut() {
+        let program = std::env::current_exe().unwrap();
+        // No time at all: the first entry's check finds the bound passed.
+        let Outcome::Read { cut, .. } = of_program_within(&program, Duration::ZERO) else {
             panic!("/proc was not read")
         };
-        let own = std::process::id();
-        assert!(processes.iter().any(|it| it.pid == own), "{processes:#?}");
+        let cut = cut.expect("a walk with no time is cut");
+        assert!(cut.contains("its bound"), "{cut}");
     }
 }
