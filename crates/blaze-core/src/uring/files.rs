@@ -44,8 +44,6 @@ const OPENING: u8 = 0;
 const OPENED: u8 = 1;
 /// Making the directories its path is in, one at a time.
 const MAKING: u8 = 2;
-/// A write at an offset's `statx`, which says whether it may bypass the page cache.
-const STATTING: u8 = 3;
 /// Unlinking what it made before it failed: a whole file's temporary, a clone's target.
 const UNLINKING: u8 = 4;
 /// A kept file's descriptor being put in its slot of the table.
@@ -292,8 +290,8 @@ impl Uring {
 
     /// The name `n` of the request `id`. Each caller asks for a name its kind's push put there
     /// (0 and 1 the paths, 2 and 3 a rename's directories) or, for 4, the directory
-    /// `next_parent` put there before the `made` that asks; never `write_at`'s `statx` room,
-    /// which only `statx_of` reads.
+    /// `next_parent` put there before the `made` that asks; never a `statx`'s room, which
+    /// only `statx_of` reads.
     fn name_of(&self, id: Id, n: usize) -> &CStr {
         let hot = self.ops.get(id).expect("a request in flight");
         // SAFETY: as above, `names[n]` starts a NUL-terminated name in the request's arena,
@@ -310,8 +308,18 @@ impl Uring {
         Step::Ends(Some(Done::Failed(IoError(format!("{what} {name}: {}", error(res))))))
     }
 
-    /// Starts [`Effect::WriteAt`] `tag` of `bytes` at `at` of `file`: a `statx` first where
-    /// the write may bypass the page cache, then the open into a slot linked to the write.
+    /// Starts [`Effect::WriteAt`] `tag` of `bytes` at `at` of `file`: the open into a slot
+    /// linked to the write.
+    ///
+    /// Through the page cache, whatever its size and alignment: the write completes once the
+    /// kernel holds the bytes and waits for no device, as its effect says (durable only once
+    /// a later sync of the file completes). Until 2026-11-11 a write of a MiB or more at a
+    /// sector's offset was opened `O_DIRECT` here, on the driver's own judgement: a linked
+    /// image's runs are cut at multiples of 8 MiB, so every run of an edit's output placed
+    /// from its maker's bytes (`blaze_cas::Store::place_made`) waited for the device, a MiB
+    /// a piece through four buffers, behind whatever else the disk was doing (the profile's
+    /// fsync: 1513 ms of an edit's 2760). A write around the cache is asked for by name
+    /// ([`Effect::WriteFrom`] with [`crate::Cache::Bypassed`]), never chosen here.
     pub(super) fn write_at(
         &mut self,
         tag: Tag,
@@ -319,11 +327,7 @@ impl Uring {
         at: u64,
         bytes: Vec<u8>,
     ) -> io::Result<()> {
-        const SECTOR: u64 = 512;
-        let len = bytes.len();
-        let candidate = len >= DIRECT_LEAST && at % SECTOR == 0 && len as u64 % SECTOR == 0;
-        let mut hot = Hot::new(tag, Kind::WriteAt, 0);
-        hot.phase = if candidate { STATTING } else { OPENING };
+        let hot = Hot::new(tag, Kind::WriteAt, 0);
         let cold = Cold { at, ..Cold::EMPTY };
         self.named(
             hot,
@@ -331,9 +335,6 @@ impl Uring {
             cold,
             |path, names, at| {
                 at[0] = push_c(names, path.as_os_str().as_bytes())?;
-                if candidate {
-                    at[4] = push_zeros(names, STATX_SIZE)?;
-                }
                 Ok(())
             },
             file,
@@ -779,45 +780,16 @@ impl Uring {
                 };
                 1
             }
-            (Kind::WriteAt, STATTING) => {
-                sqes[0] = statx(name(0), STATX_DIOALIGN, name(4), ud(0));
-                1
-            }
             (Kind::WriteAt, _) => {
                 let slot = cold.slots[0];
-                let write = if hot.flags & DIRECT != 0 {
-                    debug_assert_ne!(
-                        hot.buffer,
-                        ops::NO_BUFFER,
-                        "a registered buffer, given before it is queued"
-                    );
-                    let piece = (buf.len() - done).min(DIRECT_PIECE);
-                    let to = self.registered.at(hot.buffer);
-                    // SAFETY: the buffer is this request's alone (lent by `Lent` until it ends),
-                    // `DIRECT_PIECE` long, and the kernel reads it only for this request, which
-                    // it is not given before this; `piece` is at most what is left of `buf`.
-                    unsafe { ptr::copy_nonoverlapping(buf[done..].as_ptr(), to, piece) };
-                    Sqe {
-                        opcode: OP_WRITE_FIXED,
-                        flags: SQE_FIXED_FILE,
-                        fd: slot as i32,
-                        off: cold.at + hot.done,
-                        addr: to as u64,
-                        len: piece as u32,
-                        buf_index: hot.buffer,
-                        user_data: ud(1),
-                        ..Sqe::default()
-                    }
-                } else {
-                    let off = cold.at + hot.done;
-                    Sqe { off, addr: rest, len: left, ..on_slot(OP_WRITE, slot, 0, ud(1)) }
-                };
+                let off = cold.at + hot.done;
+                let write = Sqe { off, addr: rest, len: left, ..on_slot(OP_WRITE, slot, 0, ud(1)) };
                 if hot.phase == OPENED {
                     sqes[0] = write;
                     return 1;
                 }
-                let flags =
-                    libc::O_WRONLY | if hot.flags & DIRECT != 0 { libc::O_DIRECT } else { 0 };
+                // Through the page cache, always ([`Uring::write_at`]): never `O_DIRECT`.
+                let flags = libc::O_WRONLY;
                 // An empty write only opens the file, which must be there.
                 let more = !buf.is_empty();
                 sqes[0] = open(name(0), flags, 0, slot, if more { SQE_IO_LINK } else { 0 }, ud(0));
@@ -1019,33 +991,8 @@ impl Uring {
             }
             return Step::Ends(Some(Done::Written));
         }
-        if hot.phase == STATTING {
-            let res = results[0];
-            if res < 0 {
-                return self.failed_on(id, "opening", 0, res);
-            }
-            let (at, len) = (self.ops.cold(id).at, self.ops.buf(id).len() as u64);
-            let statx = self.statx_of(id, &hot);
-            // `stx_dio_offset_align`, where the mask says it is filled in.
-            let align = u64::from(if word(&statx, 0) & STATX_DIOALIGN != 0 {
-                word(&statx, 156)
-            } else {
-                0
-            });
-            let hot = self.ops.get_mut(id).expect("in flight");
-            if align != 0 && DIRECT_PIECE as u64 % align == 0 && at % align == 0 && len % align == 0
-            {
-                hot.flags |= DIRECT;
-            }
-            hot.phase = OPENING;
-            return Step::Again;
-        }
         if hot.phase == OPENING && !self.opened_slot(id, 0, results[0]) {
-            let what = match hot.flags & DIRECT {
-                0 => "opening",
-                _ => "opening, to bypass the page cache its file system says it takes,",
-            };
-            return self.failed_on(id, what, 0, results[0]);
+            return self.failed_on(id, "opening", 0, results[0]);
         }
         let len = self.ops.buf(id).len();
         if len == 0 {
@@ -1073,11 +1020,6 @@ impl Uring {
     /// maker's runs (a write a run) was run with slots still open, 3.4 to 4.1 s of retries a
     /// run (2026-11-10).
     fn close_written(&mut self, id: Id) -> Step {
-        let hot = self.ops.get_mut(id).expect("in flight");
-        // Counted as a direct write where it was one, which its end reads off the phase.
-        if hot.flags & DIRECT != 0 {
-            self.direct_writes += 1;
-        }
         let hot = self.ops.get_mut(id).expect("in flight");
         hot.phase = CLOSING;
         Step::Again
@@ -1480,7 +1422,7 @@ impl Uring {
 
     /// What the request on a path `hot` held let go as it ends: its names, each slot its
     /// opens filled emptied through the ring (one not filled free again at once), its kept
-    /// file's use, the name a whole file's write makes another file, its registered buffer.
+    /// file's use, the name a whole file's write makes another file.
     pub(super) fn path_end(&mut self, hot: &Hot, mut cold: Cold) {
         self.paths.release(arena_of(hot));
         let mut freed = false;
@@ -1505,13 +1447,6 @@ impl Uring {
             Kind::Write => {
                 if let Some(file) = cold.file.take() {
                     self.forget(&file);
-                }
-            }
-            Kind::WriteAt => {
-                // One that reached its close counted itself ([`Uring::close_written`]).
-                self.direct_writes += u64::from(hot.flags & DIRECT != 0 && hot.phase == OPENED);
-                if hot.buffer != ops::NO_BUFFER {
-                    self.unbuffer(hot.buffer);
                 }
             }
             Kind::Load if hot.phase != QUEUED => {

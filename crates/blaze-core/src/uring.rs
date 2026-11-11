@@ -7,9 +7,10 @@
 //! timers are a [`Wheel`] whose next deadline ends the ring's wait. A file is opened once,
 //! kept open and registered in the ring's table of files, so requests name its slot. A whole
 //! file's write is one linked chain (written, synced, renamed over the old, its directory
-//! synced), and a rename is linked to its directories' syncs. A large aligned write at an
-//! offset bypasses the page cache from a registered buffer. A truncation is an open of its name
-//! and a call made where it is submitted, never through a kept descriptor.
+//! synced), and a rename is linked to its directories' syncs. A write at an offset goes through
+//! the page cache whatever its size (only a read into or a write from the asker's own memory
+//! that asks to goes around it). A truncation is an open of its name and a call made where it
+//! is submitted, never through a kept descriptor.
 //!
 //! A spawned process is watched through the ring too: a poll of its pidfd for its exit, its
 //! output pipes read and its input written by the ring. A listen's accepts (one multishot
@@ -82,7 +83,6 @@ use crate::{
 /// `IORING_OP_NOP`: completes with 0 and does nothing, where a chain's sync is left out.
 const OP_NOP: u8 = 0;
 const OP_FSYNC: u8 = 3;
-const OP_WRITE_FIXED: u8 = 5;
 const OP_POLL_ADD: u8 = 6;
 const OP_ACCEPT: u8 = 13;
 const OP_ASYNC_CANCEL: u8 = 14;
@@ -148,7 +148,6 @@ const ASYNC_CANCEL_ANY: u32 = 1 << 2;
 
 const REGISTER_FILES2: libc::c_uint = 13;
 const REGISTER_FILES_UPDATE2: libc::c_uint = 14;
-const REGISTER_BUFFERS2: libc::c_uint = 15;
 const REGISTER_PBUF_RING: libc::c_uint = 22;
 const UNREGISTER_PBUF_RING: libc::c_uint = 23;
 const REGISTER_FILE_ALLOC_RANGE: libc::c_uint = 25;
@@ -157,12 +156,6 @@ const RSRC_REGISTER_SPARSE: u32 = 1 << 0;
 /// The most slots of the table of registered files; fewer where `RLIMIT_NOFILE` is lower,
 /// which the kernel holds the table to.
 const TABLE: u32 = 1 << 16;
-/// Registered buffers for writes that bypass the page cache, each a piece of such a write.
-const DIRECT_BUFFERS: u16 = 4;
-const DIRECT_PIECE: usize = 1 << 20;
-/// A `WriteAt` of at least this many bytes, its offset and length aligned to its file
-/// system's blocks, bypasses the page cache (`O_DIRECT`).
-const DIRECT_LEAST: usize = 1 << 20;
 /// The provided buffers a connection's receives take from, and the size of each.
 const RECV_BUFFERS: u16 = 64;
 const RECV_BUFFER: usize = 16 << 10;
@@ -176,8 +169,6 @@ const INBOX: usize = 4 << 20;
 /// notification, of ~1 µs together; below ~10 KiB the copy is the cheaper (the kernel's
 /// `msg_zerocopy.rst`). A Unix socket has no zero-copy sends, so its sends always copy.
 const ZERO_COPY_LEAST: usize = 32 << 10;
-/// `statx`'s mask bit of the alignment a write that bypasses the cache needs (Linux 6.1).
-const STATX_DIOALIGN: u32 = 0x2000;
 /// What a [`Stamp`] is made of, as `statx`'s mask asks for it (`linux/stat.h`; `libc` has these
 /// only for some C libraries).
 const STATX_STAMP: u32 = 0x0001 | 0x0002 | 0x0040 | 0x0080 | 0x0100 | 0x0200;
@@ -611,54 +602,6 @@ impl Drop for Fixed {
     }
 }
 
-/// Registered buffers (`IORING_REGISTER_BUFFERS2`), page-aligned, for the pieces of writes
-/// that bypass the page cache (`WRITE_FIXED`), which need memory aligned to the device's
-/// blocks. Pinned once, so no request pins pages of its own; lent one per write by
-/// [`ops::Lent`].
-struct Registered {
-    map: Map,
-}
-
-impl Registered {
-    fn new(ring: RawFd) -> io::Result<Registered> {
-        let map = anonymous(DIRECT_BUFFERS as usize * DIRECT_PIECE)?;
-        let iovecs: Vec<libc::iovec> = (0..DIRECT_BUFFERS as usize)
-            .map(|n| libc::iovec {
-                iov_base: map.at.wrapping_add(n * DIRECT_PIECE).cast(),
-                iov_len: DIRECT_PIECE,
-            })
-            .collect(); // alloc: setup, once per driver.
-        let buffers = RsrcRegister {
-            nr: DIRECT_BUFFERS.into(),
-            flags: 0,
-            resv2: 0,
-            data: iovecs.as_ptr() as u64,
-            tags: 0,
-        };
-        let nr = size_of::<RsrcRegister>() as libc::c_uint;
-        register(ring, REGISTER_BUFFERS2, &raw const buffers, nr, "registered buffers", "5.13").map_err(|error| {
-            match error.raw_os_error() {
-                Some(libc::ENOMEM) => io::Error::new(
-                    error.kind(),
-                    // alloc: the error of a setup that failed.
-                    format!(
-                        "{error}: pinning {} MiB of buffers needs RLIMIT_MEMLOCK of that much (ulimit -l) or CAP_IPC_LOCK",
-                        DIRECT_BUFFERS as usize * DIRECT_PIECE >> 20
-                    ),
-                ),
-                _ => error,
-            }
-        })?;
-        Ok(Registered { map })
-    }
-
-    /// The start of buffer `index`, checked to be one of the [`DIRECT_BUFFERS`] in every build.
-    fn at(&self, index: u16) -> *mut u8 {
-        assert!(index < DIRECT_BUFFERS, "registered buffer {index} of {DIRECT_BUFFERS}");
-        self.map.at.wrapping_add(index as usize * DIRECT_PIECE)
-    }
-}
-
 /// The buffers a connection's multishot receive takes from (`IORING_REGISTER_PBUF_RING`): the
 /// kernel picks one per completion, and each is given back once its bytes are copied out. The
 /// buffers given back during a reap are published to the kernel together, one store of the
@@ -879,38 +822,6 @@ fn pbuf_refused(reg: &BufReg, check: ReservedCheck, error: &io::Error) -> io::Er
             reg.ring_entries, reg.ring_addr, reg.bgid, reg.flags, reg.resv[0], reg.resv[1], reg.resv[2],
         ),
     )
-}
-
-/// What `statx` says of a descriptor's file: its device, and the alignment of offset and
-/// length a write bypassing the page cache needs (0 where its file system has none).
-#[cfg(test)]
-fn direct_alignment(fd: RawFd) -> io::Result<(u64, u32)> {
-    #[repr(C, align(8))]
-    struct Statx([u8; 256]);
-    let mut statx = Statx([0; 256]);
-    // SAFETY: an open descriptor, an empty path with `AT_EMPTY_PATH`, and a buffer of the
-    // size of `struct statx` to write.
-    let got = unsafe {
-        libc::syscall(
-            libc::SYS_statx,
-            fd,
-            c"".as_ptr(),
-            libc::AT_EMPTY_PATH,
-            STATX_DIOALIGN,
-            statx.0.as_mut_ptr(),
-        )
-    };
-    if got != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let word = |at: usize| u32::from_ne_bytes(statx.0[at..at + 4].try_into().expect("four bytes"));
-    let device = (u64::from(word(136)) << 32) | u64::from(word(140));
-    // `stx_dio_offset_align`, where the mask says it is filled in.
-    let align = match word(0) & STATX_DIOALIGN {
-        0 => 0,
-        _ => word(156),
-    };
-    Ok((device, align))
 }
 
 /// A mapping of the ring's memory, unmapped when dropped.
@@ -1770,11 +1681,8 @@ pub struct Uring {
     root: Arc<Path>,
     ring: Ring,
     table: Rc<Table>,
-    registered: Registered,
     /// Not freed while the kernel may still write into it (see `Drop`).
     provided: ManuallyDrop<Provided>,
-    /// The registered buffers' lending to writes that bypass the page cache.
-    lent: ops::Lent,
     /// Each file opened, for reading and appending, and the name each is kept under.
     kept: Slab<Kept>,
     names: HashMap<FileName, Handle<Kept>, Global>,
@@ -1801,8 +1709,6 @@ pub struct Uring {
     closes: usize,
     /// Slots of the table requests on paths hold.
     slots_held: usize,
-    /// Writes that bypassed the page cache, ended.
-    direct_writes: u64,
     /// Sends that went from the asker's pages (`IORING_OP_SEND_ZC`), ended.
     zero_copy_sends: u64,
     /// Completions to hand out at the next poll, in order.
@@ -1852,7 +1758,6 @@ impl Uring {
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Uring> {
         let ring = Ring::new(ENTRIES, COMPLETIONS)?;
         let table = Table::new(&ring.fd)?;
-        let registered = Registered::new(ring.fd.as_raw_fd())?;
         let provided = ManuallyDrop::new(Provided::new(ring.fd.as_raw_fd())?);
         fn slab<T>(max: u32) -> io::Result<Slab<T>> {
             Slab::new(max, MemTag::Io).map_err(io::Error::other)
@@ -1864,9 +1769,7 @@ impl Uring {
             root,
             ring,
             table,
-            registered,
             provided,
-            lent: ops::Lent::new(DIRECT_BUFFERS),
             kept: slab(KEPT)?,
             names: HashMap::new_in(Global),
             positional: HashMap::new_in(Global),
@@ -1882,7 +1785,6 @@ impl Uring {
             load_waiting: VecDeque::with_capacity(ENTRIES as usize), // alloc: setup, as above.
             closes: 0,
             slots_held: 0,
-            direct_writes: 0,
             zero_copy_sends: 0,
             ready: Vec::new(), // alloc: empty, nothing allocated; reused after.
             watches: HashMap::new_in(Global),
@@ -2238,11 +2140,6 @@ impl Uring {
         };
         connection.recvs.push_back((tag, most, into));
         self.deliver(conn);
-    }
-
-    /// Writes that bypassed the page cache (`O_DIRECT`) and ended, since the driver was made.
-    pub fn direct_writes(&self) -> u64 {
-        self.direct_writes
     }
 }
 
@@ -3476,57 +3373,90 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// Aligned writes of a MiB or more, more at once than there are registered buffers, each
-    /// read back as written; where the file system takes `O_DIRECT` they bypassed the cache.
-    /// A write that is not aligned goes through the cache.
+    /// The invariant: a write at an offset goes through the page cache whatever its size and
+    /// alignment, so it completes without waiting for a device. Writes of 8 MiB at multiples
+    /// of 8 MiB (a linked image's runs, as an edit's output is placed) and one unaligned: the
+    /// open of each asks for no `O_DIRECT`, each is one buffered write on its slot, and each
+    /// reads back as written. Its control is
+    /// `the_oracle_catches_a_write_at_an_offset_opened_around_the_cache`.
     #[test]
-    fn aligned_writes_read_back_equal() {
-        let root = dir("uring-direct");
-        std::fs::create_dir_all(&root).unwrap();
+    fn a_write_at_an_offset_goes_through_the_page_cache() {
+        const RUN: usize = 8 << 20;
+        let root = dir("uring-buffered-runs");
+        std::fs::create_dir_all(root.join("build")).unwrap();
         let mut driver = Uring::new(&root).unwrap();
-        let pack = FileName::new("store/pack").unwrap();
-        let piece = 3 * DIRECT_PIECE / 2;
-        let count = 2 * DIRECT_BUFFERS as usize;
-        let bytes =
-            |n: usize| -> Vec<u8> { (0..piece).map(|at| (at * 31 + n * 7) as u8).collect() };
-        std::fs::create_dir_all(root.join("store")).unwrap();
-        std::fs::write(root.join("store/pack"), b"").unwrap();
+        let image = FileName::new("build/image").unwrap();
+        let count = 3;
+        let bytes = |n: usize| -> Vec<u8> { (0..RUN).map(|at| (at * 31 + n * 7) as u8).collect() };
+        std::fs::write(root.join("build/image"), b"").unwrap();
         let mut effects: Vec<Effect> = (0..count)
             .map(|n| Effect::WriteAt {
-                file: pack.clone(),
-                at: (n * piece) as u64,
+                file: image.clone(),
+                at: (n * RUN) as u64,
                 bytes: bytes(n),
                 tag: Tag(n as u64),
             })
             .collect();
-        let odd = (count * piece) as u64 + 7;
+        let odd = (count * RUN) as u64 + 7;
         effects.push(Effect::WriteAt {
-            file: pack.clone(),
+            file: image.clone(),
             at: odd,
-            bytes: vec![9; DIRECT_PIECE + 1],
+            bytes: vec![9; RUN + 1],
             tag: Tag(99),
         });
+        driver.submit(&mut effects);
+        let writes: Vec<Id> = (driver.ops.iter())
+            .filter(|(_, hot)| hot.kind == Kind::WriteAt)
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(writes.len(), count + 1);
+        for id in writes {
+            let mut sqes = [Sqe::default(); ops::LINKS];
+            let n = driver.path_sqes(id, &mut sqes);
+            assert_eq!(around_the_cache(&sqes[..n]), None);
+        }
         let mut seen = Vec::new();
         run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done))
         .expect("the effects end");
         assert_eq!(seen, vec![Done::Written; count + 1]);
-        let file = std::fs::read(root.join("store/pack")).unwrap();
+        let file = std::fs::read(root.join("build/image")).unwrap();
         for n in 0..count {
-            assert!(file[n * piece..(n + 1) * piece] == bytes(n), "piece {n}");
+            assert!(file[n * RUN..(n + 1) * RUN] == bytes(n), "run {n}");
         }
         assert!(file[odd as usize..].iter().all(|&it| it == 9));
-        let fd = std::fs::File::open(root.join("store/pack")).unwrap();
-        let (_, align) = direct_alignment(fd.as_raw_fd()).unwrap();
-        let aligned =
-            align != 0 && piece % align as usize == 0 && DIRECT_PIECE % align as usize == 0;
-        let direct = if aligned { count as u64 } else { 0 };
-        assert_eq!(driver.direct_writes(), direct, "alignment {align}");
-        assert_eq!(
-            (driver.lent.free(), driver.lent.waiters().count()),
-            (DIRECT_BUFFERS as usize, 0)
-        );
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Which of a request's `sqes` goes around the page cache, and how: an open with
+    /// `O_DIRECT`, or a write from a registered buffer (`IORING_OP_WRITE_FIXED`, 5). The oracle
+    /// of `a_write_at_an_offset_goes_through_the_page_cache`.
+    fn around_the_cache(sqes: &[Sqe]) -> Option<String> {
+        sqes.iter().find_map(|sqe| match sqe.opcode {
+            OP_OPENAT if sqe.op_flags & libc::O_DIRECT as u32 != 0 => {
+                Some("an open asks for O_DIRECT".to_owned())
+            }
+            5 => Some("a write is from a registered buffer (WRITE_FIXED)".to_owned()),
+            _ => None,
+        })
+    }
+
+    /// The planted bug: the chain the driver made until 2026-11-11 for a write of a MiB or
+    /// more at a sector's offset, its open `O_DIRECT`. The oracle names it.
+    #[test]
+    fn the_oracle_catches_a_write_at_an_offset_opened_around_the_cache() {
+        let planted = Sqe {
+            opcode: OP_OPENAT,
+            op_flags: (libc::O_WRONLY | libc::O_DIRECT) as u32,
+            ..Sqe::default()
+        };
+        let write = Sqe { opcode: OP_WRITE, ..Sqe::default() };
+        let said = around_the_cache(&[planted, write]);
+        assert_eq!(said.as_deref(), Some("an open asks for O_DIRECT"));
+        let fixed = Sqe { opcode: 5, ..Sqe::default() };
+        assert!(around_the_cache(&[fixed]).is_some_and(|it| it.contains("WRITE_FIXED")));
+        let buffered = Sqe { opcode: OP_OPENAT, op_flags: libc::O_WRONLY as u32, ..Sqe::default() };
+        assert_eq!(around_the_cache(&[buffered, write]), None);
     }
 
     /// Many sends, one after another, received by one multishot receive through a ring of

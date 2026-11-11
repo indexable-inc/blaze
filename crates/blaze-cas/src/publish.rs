@@ -180,7 +180,12 @@ impl Sparse {
 /// its place was asked with: its staged name cleared, cut to the file's length (a file of
 /// holes), each run written at its offset, then the whole renamed onto its path, which until
 /// then holds what it held. Nothing is synced and nothing is cloned: every step is one a
-/// driver carries out without waiting for a device.
+/// driver carries out without waiting for a device. That is the driver's to keep: a write at
+/// an offset goes through the page cache on every driver (until 2026-11-11 io_uring's opened
+/// a run of a MiB or more `O_DIRECT`, and an image's runs, cut at 8 MiB, each waited for
+/// the disk: 1513 ms of an edit's answer, behind the profile's fsync). Each step is a span
+/// of its own (`place step`, `function` saying which), so a place that is slow again names
+/// the step it waited in.
 ///
 /// A new file renamed over the path, never the path's file written in place: a program
 /// running the path's last file holds that file (on Linux a write of it is refused,
@@ -198,6 +203,9 @@ pub(crate) struct Writing {
     failed: Option<String>,
     /// The bytes its runs wrote.
     wrote: u64,
+    /// The step in flight, open from its effects asked to the last of their completions
+    /// (slow-is-p0-traced): never entered, as the place's own span is not.
+    span: tracing::Span,
     /// The planted bug of `tests::place_made`, and how far it got.
     #[cfg(test)]
     plant: Option<Plant>,
@@ -241,6 +249,13 @@ pub(crate) enum Next {
     Failed(String),
 }
 
+/// The span of one step of a [`Writing`] of `to`: `function` says which step, `bytes` what its
+/// writes carry. No parent: it is opened under whatever completion asked its effects and
+/// ends under another, as the place's own span does.
+fn step_span(to: &FileName, step: &'static str, bytes: u64) -> tracing::Span {
+    tracing::info_span!(target: "blaze", parent: None, "place step", function = step, %to, bytes)
+}
+
 impl Writing {
     /// The write of `file` to `to` under `temp` begun for the place `asked`: the effect that
     /// clears the staged name, whose completion is its first step ([`Step::Clear`]).
@@ -248,6 +263,7 @@ impl Writing {
         // clone: the effect and the state each own the name; once per place
         let clear = Effect::Remove { file: temp.clone(), tag: asked };
         let Sparse { len, runs } = file;
+        let span = step_span(&to, "clear its staged name", 0);
         let writing = Writing {
             to,
             temp,
@@ -256,6 +272,7 @@ impl Writing {
             left: 0,
             failed: None,
             wrote: 0,
+            span,
             #[cfg(test)]
             plant: None,
             #[cfg(test)]
@@ -280,6 +297,7 @@ impl Writing {
                 // and takes no block.
                 // clone: the effect owns the name; once per place
                 let file = self.temp.clone();
+                self.span = step_span(&self.to, "cut it to its length", 0);
                 effects.push(Effect::Truncate { file, len: self.len, tag: ask(Step::Cut) });
                 Next::Going
             }
@@ -289,6 +307,8 @@ impl Writing {
                     return self.commit(ask, effects);
                 }
                 self.left = runs.len() as u32;
+                let bytes = runs.iter().map(|it| it.1.len() as u64).sum();
+                self.span = step_span(&self.to, "write its runs", bytes);
                 for (at, bytes) in runs {
                     self.wrote += bytes.len() as u64;
                     // clone: each write's effect owns the name
@@ -346,6 +366,7 @@ impl Writing {
         }
         // clone: the effect owns the names; once per place
         let (from, to) = (self.temp.clone(), self.to.clone());
+        self.span = step_span(&self.to, "rename it onto its path", 0);
         effects.push(rename(from, to, Durable::No, ask(Step::Rename)));
         Next::Going
     }
