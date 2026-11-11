@@ -267,10 +267,10 @@ theorem assigned_some (l : Local) :
   | some e, _, h => ⟨e, rfl, Option.some.inj (Option.some.inj h)⟩
   | none, _, h => none_eq_some_elim h
 
-theorem assigned_not_none (l : Local) :
-    ∀ (o : Option Expr) {C : Prop}, assigned l o = some none → C
-  | some _, _, h => none_eq_some_elim (Option.some.inj h).symm
-  | none, _, h => none_eq_some_elim h
+theorem assigned_not_none (l : Local) {C : Prop} :
+    ∀ (o : Option Expr), assigned l o = some none → C
+  | some _, h => none_eq_some_elim (Option.some.inj h).symm
+  | none, h => none_eq_some_elim h
 
 theorem consTrace_some (entry : Local × Expr) :
     ∀ (o : Option (List (Local × Expr))) (tr : List (Local × Expr)),
