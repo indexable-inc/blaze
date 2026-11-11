@@ -28,6 +28,7 @@ import Blaze.Mir.Opt.NextId
 import Blaze.Mir.Opt.BorrowStep
 import Blaze.Mir.Opt.SlotAlgebra
 import Blaze.Mir.Opt.SlotExec
+import Blaze.Mir.Opt.RemoveOverwritten
 import Blaze.Mir.Opt.RemoveNops
 import Blaze.Mir.Opt.ConstFold
 import Blaze.Mir.Opt.Validate

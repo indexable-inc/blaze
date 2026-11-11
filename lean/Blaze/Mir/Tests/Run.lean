@@ -521,4 +521,48 @@ example :
 example : isInt ScalarTy.U32 4 ((Opt.simplifyCfg 1 constantSimplified).call 1 0 [] []) = true := by
   decide
 
+/-! A store overwritten in its own block, before its local is mentioned, goes. -/
+
+def storeTwice (read : Bool) : Program :=
+  { adts := [],
+    fns :=
+      [{ name := "storeTwice", args := 0, locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32],
+         blocks :=
+           [{ stmts :=
+                [Statement.assign (Place.mk 1 [])
+                   (Rvalue.use (Operand.const (Const.int ScalarTy.U32 5))),
+                 (if read then
+                   Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 1 [])))
+                 else Statement.nop),
+                 Statement.assign (Place.mk 1 [])
+                   (Rvalue.use (Operand.const (Const.int ScalarTy.U32 7))),
+                 Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 1 [])))],
+              terminator := Terminator.ret }] }] }
+
+example : Opt.checkBorrows Opt.refsOf (storeTwice false) = true := by decide
+
+example :
+    (Opt.removeOverwritten Opt.refsOf (storeTwice false)).fns.map
+        (fun body => body.blocks.map (fun blk => blk.stmts.map Opt.isNop)) =
+      [[[true, true, false, false]]] := by
+  decide
+
+/-- With the first store read before the second, it stays; the store to local 0 that the last
+statement overwrites goes instead. -/
+example :
+    (Opt.removeOverwritten Opt.refsOf (storeTwice true)).fns.map
+        (fun body => body.blocks.map (fun blk => blk.stmts.map Opt.isNop)) =
+      [[[false, true, false, false]]] := by
+  decide
+
+example :
+    isInt ScalarTy.U32 7
+        ((Opt.removeOverwritten Opt.refsOf (storeTwice true)).call 2 0 [] []) = true := by
+  decide
+
+example :
+    isInt ScalarTy.U32 7
+        ((Opt.removeOverwritten Opt.refsOf (storeTwice false)).call 2 0 [] []) = true := by
+  decide
+
 end Blaze.Mir.Tests

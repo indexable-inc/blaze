@@ -690,29 +690,32 @@ programs; it is the specification of the Rust pass of the same name.
     to a local that the function of its frame may borrow. A call adds its frame to `g`, a
     return leaves it. `step_borrows`: every step keeps it, for a program whose every `ref`
     is of a place that may be borrowed or goes through a dereference (`ProgFine`).
-  - **Dead-store elimination: fifth piece, first part** (`Opt/SlotAlgebra.lean`; not yet
-    elaborated). The two programs' states are the same but in one slot, which is stated
+  - **Dead-store elimination: fifth piece, first part** (`Opt/SlotAlgebra.lean`; checked
+    at 9d978075d2). The two programs' states are the same but in one slot, which is stated
     with a map (the one is the other with that slot replaced), so the proof computes with
     replacements: two of different slots commute (`State.setSlot_comm`), a write elsewhere
     commutes with one (`State.write_setSlot_other`), and a write of the whole slot forgets
     it (`State.write_setSlot_same`).
-  - **Dead-store elimination: fifth piece, second part** (`Opt/SlotExec.lean`; not yet
-    elaborated). When a slot is the running frame's, of a local its function does not
+  - **Dead-store elimination: fifth piece, second part** (`Opt/SlotExec.lean`; checked at
+    9d978075d2). When a slot is the running frame's, of a local its function does not
     borrow, a statement that mentions the local neither as a place's base nor as an index
     does the same whatever the slot holds (`execStmt_put`), through every function of
-    `Step.lean` up to `execStmt`. The rest is below.
-  - **Dead-store elimination: what is not written.** It needs a relation, not a map: two states
-    equal but on dead locals. The Rust pass (`optimize/dse.rs`) removes the whole assignment
-    of an rvalue it holds to be free of effects (all but a pointer-to-address cast), to a
-    local that is not live after and is never borrowed. In this semantics an rvalue can
-    panic (a checked operation, a division, an index), be undefined (an uninitialized or
-    moved-out read) or move, so the specification must either keep those or prove only a
-    refinement; and a read through a pointer must be shown never to reach a dead local,
-    which needs an invariant over every pointer a state holds (a never-borrowed local has
-    no pointer to it). Start: a relation on states `st ~[D] st'` (equal but on the slots
-    `D` of the running frame), the `Opt/Ctl.lean` lemmas for which frame that is, and
-    relational forms of `State.read`, `evalPlace` and `evalOperand` for places whose base is
-    outside `D`.
+    `Step.lean` up to `execStmt`.
+  - **`removeOverwritten`** (`Opt/RemoveOverwritten.lean`; not yet elaborated): the end
+    theorem of the pieces above. In a block, `l = rv1; ..; l = rv2` becomes
+    `nop; ..; l = rv2` when `l` is a whole local its function never borrows, `rv1` is a copy
+    of a place with no index or a constant, and nothing between mentions `l`. A step runs a
+    whole block, so the two programs' states are equal at every step:
+    `removeOverwritten_refines` is `run_refines_inv` (a refinement of runs under an invariant
+    the source's steps keep) with the block lemma, from every state the borrow invariant
+    holds of, for a program `checkBorrows` accepts (evaluated by the kernel, proved sound).
+  - **What the Rust `DeadStoreElimination` does beyond it, none specified** (ledger V11):
+    liveness over the whole control-flow graph, unwinding included; every rvalue but a
+    pointer-to-address cast removable, where here only one that cannot panic or move is;
+    `Deinit`; a copy into a call made a move; unused storage markers removed. The global
+    form needs the two states related across steps (equal but, per frame, on the locals
+    dead at its resume point), on `Opt/Ptr`, `Opt/Borrow`, `Opt/BorrowStep`,
+    `Opt/SlotAlgebra`, `Opt/SlotExec`. So no `BlazeValidated` pair for DSE.
 - **A validator proved sound** (`Opt/Validate.lean`). `validate a b` accepts when the two
   programs have one normal form under the proved rewrites; `validate_sound`: an accepted
   pair runs alike for every fuel and state. It takes no witness and accepts only what the

@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-69 theorems: 56 in `lean`, 13 in `lean/analysis`.
+72 theorems: 59 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -550,6 +550,31 @@ theorem execStmt_put {B : FnId → Local → Prop} {g : List (Nat × FnId)} {f l
   | Statement.assign p rv, hB, hfine =>
     Outcome.bind_commutes_map (evalRvalue_put adts h sl rv (and_true_right hfine)) (fun r hr =>
       have hr2 : Hides B g f l r.2
+```
+
+**`Blaze.Mir.run_refines_inv`** (`Blaze.Mir.Opt.RemoveOverwritten`, `lean`): When every step of the target refines the step of the source on the states an invariant holds of, and the source's steps keep it, every run from such a state refines.
+
+```lean
+theorem run_refines_inv (src tgt : Program) (Inv : State → Prop)
+    (hstep : ∀ (st : State), Inv st → (step tgt st).Refines (step src st))
+    (hpres : ∀ (st st' : State), Inv st → step src st = Outcome.ok (Next.state st') → Inv st') :
+    ∀ (fuel : Nat) (st : State), Inv st → (run tgt fuel st).Refines (run src fuel st)
+```
+
+**`Blaze.Mir.Opt.checkBorrows_sound`** (`Blaze.Mir.Opt.RemoveOverwritten`, `lean`): A program checkBorrows accepts takes references only to locals its borrowed-set lists, or through a dereference.
+
+```lean
+theorem checkBorrows_sound (borrowed : Body → Local → Bool) (prog : Program)
+    (h : checkBorrows borrowed prog = true) : ProgFine (BorrowedIn borrowed prog) prog
+```
+
+**`Blaze.Mir.Opt.removeOverwritten_refines`** (`Blaze.Mir.Opt.RemoveOverwritten`, `lean`): Removing a store that its own block overwrites before its local is mentioned refines the program, from every state the borrow invariant holds of.
+
+```lean
+theorem removeOverwritten_refines (borrowed : Body → Local → Bool) (prog : Program)
+    (hfine : ProgFine (BorrowedIn borrowed prog) prog) (fuel : Nat) (st : State)
+    (hinv : ∃ g, Borrows (BorrowedIn borrowed prog) g st) :
+    (run (removeOverwritten borrowed prog) fuel st).Refines (run prog fuel st)
 ```
 
 **`Blaze.Mir.Opt.simplifyCfg_call`** (`Blaze.Mir.Opt.SimplifyCfg`, `lean`): SimplifyCfg composed from the proved passes keeps every call that ends, and not in undefined behaviour: the same outcome with the same fuel.
