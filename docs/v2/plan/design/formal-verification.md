@@ -671,8 +671,8 @@ programs; it is the specification of the Rust pass of the same name.
     `MemOk P st` says every pointer in every slot of the state satisfies `P`; a read gives a
     value whose pointers do (`State.read_ok`) and a write of such a value keeps it
     (`State.write_ok`).
-  - **Dead-store elimination: second piece** (`Opt/Ids.lean`, `Opt/Borrow.lean`; not yet
-    elaborated). `PtrOk B ids p`: the pointer names frame 0, a frame that is gone, or a
+  - **Dead-store elimination: second piece** (`Opt/Ids.lean`, `Opt/Borrow.lean`; checked at
+    b248b3e485). `PtrOk B ids p`: the pointer names frame 0, a frame that is gone, or a
     local its frame's function may borrow (`B`); `StateOk B st`: every pointer in memory is
     such. Writes and moves keep it, and a place whose base may be borrowed, or that goes
     through a dereference, evaluates to such a pointer (`evalPlace_ptr`). A frame's id and
