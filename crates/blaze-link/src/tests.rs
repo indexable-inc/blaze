@@ -1695,7 +1695,119 @@ fn start_and_stop_symbols_bound_a_named_section() {
         ..Change::default()
     };
     let error = image.stage(change).unwrap_err();
-    assert!(error.what.contains("section `missing`"), "{error}");
+    assert!(
+        error.what.contains("undefined symbol `__start_missing`")
+            && error.what.contains("no input has a section `missing`"),
+        "{error}"
+    );
+}
+
+/// An x86-64 ELF object defining `c_counters`, `mov rax, [rip + start@GOTPCREL]; ret`, with
+/// `__start___libfuzzer_extra_counters` undefined, weakly when `weak`: libFuzzer's
+/// `FuzzerExtraCounters.cpp`, which declares the bounds `__attribute__((weak))`.
+fn counters_object(weak: bool) -> Vec<u8> {
+    let mut b = Builder::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let text = b.section_id(StandardSection::Text);
+    let at = b.append_section_data(text, &[0x48, 0x8b, 0x05, 0, 0, 0, 0, 0xc3], 16);
+    b.add_symbol(Def {
+        name: "c_counters".into(),
+        value: at,
+        size: 8,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Dynamic,
+        weak: false,
+        section: SymbolSection::Section(text),
+        flags: SymbolFlags::None,
+    });
+    let start = b.add_symbol(Def {
+        name: "__start___libfuzzer_extra_counters".into(),
+        value: 0,
+        size: 0,
+        kind: SymbolKind::Unknown,
+        scope: SymbolScope::Dynamic,
+        weak,
+        section: SymbolSection::Undefined,
+        flags: SymbolFlags::None,
+    });
+    b.add_relocation(
+        text,
+        Relocation {
+            offset: at + 3,
+            symbol: start,
+            addend: -4,
+            flags: RelocationFlags::Elf { r_type: elf::R_X86_64_GOTPCREL },
+        },
+    )
+    .unwrap();
+    b.write().unwrap()
+}
+
+/// An x86-64 ELF object whose only section is `__libfuzzer_extra_counters`, eight bytes.
+fn counted_object() -> Vec<u8> {
+    let mut b = Builder::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let counters = b.add_section(
+        Vec::new(),
+        b"__libfuzzer_extra_counters".to_vec(),
+        object::SectionKind::Data,
+    );
+    b.append_section_data(counters, &[0; 8], 8);
+    b.write().unwrap()
+}
+
+/// `__start_X` with no section `X` in any input is an undefined symbol, as it is to GNU ld and
+/// lld: 0 to a weak reference, its GOT cell included (tempo's `parse_attestation` fuzz target:
+/// libFuzzer reads `__start___libfuzzer_extra_counters` through the GOT), and the undefined
+/// symbol error to a strong one. With the section it is the section's start to both.
+#[test]
+fn a_start_symbol_of_no_section_is_zero_to_a_weak_reference() {
+    let start = function(1, &CALLER, vec![rel32(1, Target::Extern("c_counters".into()))]);
+    let link = |objects: &[(&'static str, std::sync::Arc<[u8]>)]| {
+        let mut image = Image::new(name(TO), output(false)).unwrap();
+        let mut disk = Disk::default();
+        let natives = (objects.iter().enumerate())
+            .map(|(at, (file, bytes))| Native {
+                id: id(60 + at as u8),
+                name: file,
+                bytes,
+                kind: NativeKind::Object,
+                order: at as u32,
+            })
+            .collect();
+        let change = Change {
+            added: vec![&start],
+            names: vec![("_start".into(), Target::Direct(key(1)))],
+            debug_names: vec![(key(1), "start".into())],
+            natives,
+            ..Change::default()
+        };
+        disk.link(&mut image, change).map(|_| Linked::of(disk.file(TO)))
+    };
+    // The cell `c_counters` loads: what its `mov` reads.
+    let cell = |linked: &Linked| {
+        let counters = linked.rel32(linked.symbol("start") + 1);
+        linked.u64_at(linked.rel32(counters + 3))
+    };
+
+    let linked = link(&[("counters.o", counters_object(true).into())]).unwrap();
+    assert_eq!(cell(&linked), 0, "an undefined weak symbol's GOT cell holds 0");
+
+    let error = link(&[("counters.o", counters_object(false).into())]).unwrap_err();
+    assert!(
+        error.what.contains("undefined symbol `__start___libfuzzer_extra_counters`")
+            && error.what.contains("no input has a section `__libfuzzer_extra_counters`"),
+        "{error}"
+    );
+
+    // The control: with the section, weak or not, the name is the section's start.
+    for weak in [true, false] {
+        let linked = link(&[
+            ("counters.o", counters_object(weak).into()),
+            ("counted.o", counted_object().into()),
+        ])
+        .unwrap();
+        let (at, size) = section_of(&linked, "__libfuzzer_extra_counters");
+        assert_eq!((cell(&linked), size), (at, 8), "weak: {weak}");
+    }
 }
 
 /// A static's writable object (rustc's global of a nested mutable allocation) is placed

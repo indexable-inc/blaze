@@ -276,6 +276,16 @@ pub(crate) enum Special {
         name: SectionName,
         end: bool,
     },
+    /// [`Special::Section`] for a name every reference to is weak, on ELF: 0 when no region
+    /// has the name. GNU ld and lld define `__start_X` and `__stop_X` only when an output
+    /// section `X` exists; without one the name is an undefined symbol like any other, 0 to a
+    /// weak reference (libFuzzer's `__start___libfuzzer_extra_counters`) and an error to a
+    /// strong one. Decided when the image is written, where the kept regions are known, so
+    /// that a section a later change adds is bounded then.
+    WeakSection {
+        name: SectionName,
+        end: bool,
+    },
     /// An address the writer computes from the placed regions (ELF's `_end`, `etext`,
     /// `__bss_start`, `_DYNAMIC`).
     Placed(fn(&[Region]) -> u64),
