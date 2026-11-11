@@ -25,11 +25,21 @@ pub mod expr;
 pub mod print;
 pub mod simplify;
 
+/// The tables, generated from `crates/blaze-diff/rules.json` by `harness/v2/diff_rules.py`
+/// (whose `check` holds the file to its bytes): [`diff::RULES`] and [`simplify::REWRITES`] are
+/// these. Included, not a module file, so a formatter leaves the generated text alone.
+mod rules_gen {
+    include!("rules_gen.rs");
+}
+
 #[cfg(test)]
 mod tests;
 
 pub use diff::{Choice, DiffError, Policy};
 pub use expr::{Graph, Id, Node, Op, Sort, Width};
+/// Every operation with its arity and sort as `rules.json` lists them, which the Lean `Op` is
+/// generated from; the same as [`Op::ALL`], [`Op::arity`] and [`Op::sort`], by a test.
+pub use rules_gen::OPS;
 pub use simplify::{CostModel, Fuel, Options, Simplified, Stop};
 
 /// The derivatives of `roots` by variable `var`, simplified: [`diff::Differentiator`] by

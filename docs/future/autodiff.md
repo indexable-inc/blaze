@@ -112,6 +112,12 @@ Two crates, written 2026-11-10. Nothing in the build calls them yet: no program 
   `and`/`or`/`not` and `select`. Ids are given in insertion order and an argument's id is below
   its user's, so id order is a topological order and no order comes from a hash map. A tuple or
   array is several roots.
+- `crates/blaze-diff/rules.json`: the one source of the two tables below.
+  `harness/v2/diff_rules.py` writes the Rust tables from it (`src/rules_gen.rs`) and the Lean
+  ones the proofs are about; see
+  [formal-verification.md, "Derivatives"](../v2/plan/design/formal-verification.md#derivatives-2026-11-10):
+  the rules are proved to give the derivative over the reals wherever their domain holds, and
+  the `fast_math` rewrites to be identities over the reals.
 - `crates/blaze-diff/src/diff.rs`: derivatives. `RULES` is the one table, 19 rules, one per float
   operation: the node's tangent as a template over its arguments, itself and their tangents, the
   domain the rule holds on, and its kink if it has one. One pass in id order keeps each node's
@@ -128,7 +134,8 @@ Two crates, written 2026-11-10. Nothing in the build calls them yet: no program 
 - `crates/blaze-diff/src/print.rs`: an expression as a Rust function (`let` for each shared
   node) and as one line of math (`x²`, `2x`).
 - `crates/blaze-diff/src/eval.rs`: evaluation in `f32` or `f64`, and the one place an
-  operation's value is defined.
+  operation's value is defined. `eval::dual` is forward-mode differentiation by dual numbers, the
+  independent method the tests hold the symbolic derivative to; it does not read `RULES`.
 
 **`crates/blaze-diff-mir`**: the compiler's side. A crate of its own, not a pass in
 `crates/hir-ty-mir/src/mir/optimize`: it is not one of rustc's passes, no body goes through it

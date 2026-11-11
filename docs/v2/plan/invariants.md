@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-54 invariants, 17 refinements, 5 reference models.
-By level: 52 tested, 19 simulated, 0 model-checked, 0 proved.
+55 invariants, 18 refinements, 5 reference models.
+By level: 54 tested, 19 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -81,8 +81,10 @@ By level: 52 tested, 19 simulated, 0 model-checked, 0 proved.
 
 - **`the_symbolic_derivative_agrees_with_finite_differences`** *tested* (`crates/blaze-diff/src/tests/derivative.rs`): the symbolic derivative of an expression is its derivative: for a drawn expression over every operation and a drawn point inside each operation's domain and away from its kinks, the value of `d(e)/dx` agrees with the central finite difference of `e`, within a tolerance relative to the derivative's size; and so does its exact simplification.
   Controls: `a_wrong_quotient_rule_sign`, `a_missing_chain_rule_factor_for_tanh`, `a_derivative_that_drops_a_shared_nodes_second_use`.
+- **`each_exact_rewrite_keeps_every_bit_f32_sampled`** *tested* (`crates/blaze-diff/src/tests/simplify.rs`): an exact rewrite of one float variable keeps every bit, on `f32` inputs: at the edge patterns and one pattern in every 65,521, the two sides are the same bits (any NaN being any NaN). `each_exact_rewrite_keeps_every_bit_f32_exhaustive` is the same over all 2^32 patterns.
+  Controls: `x_minus_x_rewritten_to_zero`, `x_plus_zero_called_exact_at_minus_zero_alone`, `a_union_without_a_rebuild`.
 - **`a_rebuilt_egraph_is_closed_under_congruence`** *tested* (`crates/blaze-diff/src/tests/simplify.rs`): after a rebuild the e-graph is closed under congruence: every e-node's arguments are class roots, and two e-nodes of the same operation, payload and argument classes are in one class, whatever unions came before.
-  Controls: `x_minus_x_rewritten_to_zero`, `a_union_without_a_rebuild`.
+  Controls: `x_minus_x_rewritten_to_zero`, `x_plus_zero_called_exact_at_minus_zero_alone`, `a_union_without_a_rebuild`.
 
 ### blaze-engine
 
@@ -207,8 +209,10 @@ By level: 52 tested, 19 simulated, 0 model-checked, 0 proved.
 
 ### blaze-diff
 
+- **`the_symbolic_derivative_is_the_dual_tangent`** *tested* (`crates/blaze-diff/src/tests/dual.rs`): the symbolic differentiator computes what forward-mode dual numbers compute: for a drawn expression over every operation, a drawn variable and a drawn point inside each operation's domain and away from its kinks, the value of `d(e)/dx` built by the rule table equals the tangent dual arithmetic carries through `e`, within `TOLERANCE` of the sum of the tangent's terms (exactly where there are none); and central finite differences, a third method, do not contradict it. (The rule table itself is proved over the reals in Lean, `BlazeDiff.diff_correct`.)
+  Controls: `a_sign_flipped_in_one_rule`, `a_chain_rule_factor_dropped`, `a_shared_nodes_second_use_dropped`, `an_error_finite_differences_let_through`.
 - **`exact_simplification_preserves_every_value`** *tested* (`crates/blaze-diff/src/tests/simplify.rs`): simplifying by the exact rewrites preserves the value: for a drawn term over every operation and drawn inputs, signed zeros, infinities, NaN and subnormals included, the simplified term evaluates to the same bits as the term (any NaN is any NaN), whether or not the fuel stopped the run.
-  Controls: `x_minus_x_rewritten_to_zero`, `a_union_without_a_rebuild`.
+  Controls: `x_minus_x_rewritten_to_zero`, `x_plus_zero_called_exact_at_minus_zero_alone`, `a_union_without_a_rebuild`.
 
 ### blaze-diff-mir
 

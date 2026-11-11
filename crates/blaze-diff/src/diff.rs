@@ -33,7 +33,8 @@ pub enum P {
     Choice,
     /// A `powi` node's exponent, as a float.
     Exponent,
-    /// A `powi` node's argument to the exponent less one.
+    /// A `powi` node's argument to the exponent less one (the node over its argument when the
+    /// exponent is `i32::MIN`, which has no `i32` below it).
     PowiDown,
     Add(&'static P, &'static P),
     Sub(&'static P, &'static P),
@@ -129,179 +130,13 @@ pub struct Rule {
     pub ieee: &'static str,
 }
 
-const A0: P = P::A(0);
-const A1: P = P::A(1);
-const T0: P = P::T(0);
-const T1: P = P::T(1);
-const T2: P = P::T(2);
-const OUT: P = P::Out;
-const ONE: P = P::Lit(1.0);
-const TWO: P = P::Lit(2.0);
-const ZERO: P = P::Lit(0.0);
-const MINUS_ONE: P = P::Lit(-1.0);
-/// `out * out`: `tan²`, `tanh²`.
-const OUT_SQUARED: P = P::Mul(&OUT, &OUT);
-/// At a tie, `choice` of the first operand's derivative and the rest of the second's.
-const TIE: P = P::Add(&P::Mul(&P::Choice, &T0), &P::Mul(&P::Sub(&ONE, &P::Choice), &T1));
-
-const FINITE: &str = "finite operands and a finite result";
-
 /// The derivative rules: one per float operation, in [`Op`]'s order. The one owner: the
 /// differentiator, the tests' generator and `blaze explain` read this table and nothing else
-/// says what a derivative is.
-pub const RULES: &[Rule] = &[
-    Rule {
-        op: Op::Add,
-        tangent: P::Add(&T0, &T1),
-        kink: None,
-        domain: Domain::Everywhere,
-        ieee: FINITE,
-    },
-    Rule {
-        op: Op::Sub,
-        tangent: P::Sub(&T0, &T1),
-        kink: None,
-        domain: Domain::Everywhere,
-        ieee: FINITE,
-    },
-    Rule {
-        op: Op::Mul,
-        tangent: P::Add(&P::Mul(&T0, &A1), &P::Mul(&A0, &T1)),
-        kink: None,
-        domain: Domain::Everywhere,
-        ieee: FINITE,
-    },
-    // (a / b)' = (a' - (a / b) * b') / b: the quotient itself is shared.
-    Rule {
-        op: Op::Div,
-        tangent: P::Div(&P::Sub(&T0, &P::Mul(&OUT, &T1)), &A1),
-        kink: None,
-        domain: Domain::DivisorNonZero,
-        ieee: "finite operands, a divisor that is not 0",
-    },
-    Rule {
-        op: Op::Neg,
-        tangent: P::Neg(&T0),
-        kink: None,
-        domain: Domain::Everywhere,
-        ieee: FINITE,
-    },
-    Rule {
-        op: Op::Powi,
-        tangent: P::Mul(&T0, &P::Mul(&P::Exponent, &P::PowiDown)),
-        kink: None,
-        domain: Domain::PowiBase,
-        ieee: "a finite base, not 0 when the exponent is below 1",
-    },
-    // The exponent's term is dropped when the exponent does not depend on the variable, so a
-    // constant exponent needs no positive base.
-    Rule {
-        op: Op::Powf,
-        tangent: P::Add(
-            &P::Mul(&T0, &P::Mul(&A1, &P::Powf(&A0, &P::Sub(&A1, &ONE)))),
-            &P::Mul(&T1, &P::Mul(&OUT, &P::Call(Op::Ln, &A0))),
-        ),
-        kink: None,
-        domain: Domain::ArgPositive,
-        ieee: "a finite base above 0 (any base that `powf` takes when the exponent is constant)",
-    },
-    Rule {
-        op: Op::Sqrt,
-        tangent: P::Select(
-            C::Eq(&A0, &ZERO),
-            &P::Mul(&P::Choice, &T0),
-            &P::Div(&T0, &P::Mul(&TWO, &OUT)),
-        ),
-        kink: Some(Kink { point: "0", at: KinkAt::Value }),
-        domain: Domain::ArgPositive,
-        ieee: "a finite argument above 0",
-    },
-    Rule {
-        op: Op::Exp,
-        tangent: P::Mul(&T0, &OUT),
-        kink: None,
-        domain: Domain::Everywhere,
-        ieee: FINITE,
-    },
-    Rule {
-        op: Op::Ln,
-        tangent: P::Div(&T0, &A0),
-        kink: None,
-        domain: Domain::ArgPositive,
-        ieee: "a finite argument above 0",
-    },
-    Rule {
-        op: Op::Sin,
-        tangent: P::Mul(&T0, &P::Call(Op::Cos, &A0)),
-        kink: None,
-        domain: Domain::Everywhere,
-        ieee: FINITE,
-    },
-    Rule {
-        op: Op::Cos,
-        tangent: P::Neg(&P::Mul(&T0, &P::Call(Op::Sin, &A0))),
-        kink: None,
-        domain: Domain::Everywhere,
-        ieee: FINITE,
-    },
-    Rule {
-        op: Op::Tan,
-        tangent: P::Mul(&T0, &P::Add(&ONE, &OUT_SQUARED)),
-        kink: None,
-        domain: Domain::AwayFromPoles,
-        ieee: "a finite argument away from the poles of `tan`",
-    },
-    Rule {
-        op: Op::Tanh,
-        tangent: P::Mul(&T0, &P::Sub(&ONE, &OUT_SQUARED)),
-        kink: None,
-        domain: Domain::Everywhere,
-        ieee: FINITE,
-    },
-    Rule {
-        op: Op::Abs,
-        tangent: P::Mul(
-            &T0,
-            &P::Select(
-                C::Gt(&A0, &ZERO),
-                &ONE,
-                &P::Select(C::Lt(&A0, &ZERO), &MINUS_ONE, &P::Choice),
-            ),
-        ),
-        kink: Some(Kink { point: "0", at: KinkAt::Value }),
-        domain: Domain::ArgNonZero,
-        ieee: "a finite argument that is not 0 or NaN",
-    },
-    Rule {
-        op: Op::Min,
-        tangent: P::Select(C::Lt(&A0, &A1), &T0, &P::Select(C::Lt(&A1, &A0), &T1, &TIE)),
-        kink: Some(Kink { point: "a tie of its operands", at: KinkAt::Value }),
-        domain: Domain::ArgsDiffer,
-        ieee: "finite operands that differ, neither NaN",
-    },
-    Rule {
-        op: Op::Max,
-        tangent: P::Select(C::Gt(&A0, &A1), &T0, &P::Select(C::Gt(&A1, &A0), &T1, &TIE)),
-        kink: Some(Kink { point: "a tie of its operands", at: KinkAt::Value }),
-        domain: Domain::ArgsDiffer,
-        ieee: "finite operands that differ, neither NaN",
-    },
-    Rule {
-        op: Op::MulAdd,
-        tangent: P::Add(&P::Add(&P::Mul(&T0, &A1), &P::Mul(&A0, &T1)), &T2),
-        kink: None,
-        domain: Domain::Everywhere,
-        ieee: FINITE,
-    },
-    // The taken arm's derivative: never a product with an untaken arm's, which may be NaN.
-    Rule {
-        op: Op::Select,
-        tangent: P::Select(C::Cond, &T1, &T2),
-        kink: Some(Kink { point: "the boundary of its condition", at: KinkAt::Condition }),
-        domain: Domain::Everywhere,
-        ieee: "a condition that does not change near the point",
-    },
-];
+/// says what a derivative is. Its source is `crates/blaze-diff/rules.json`, which
+/// `harness/v2/diff_rules.py` writes this table and the Lean one from
+/// (`lean/analysis/BlazeDiff/Rules.lean`): the table blaze runs is the table
+/// `BlazeDiff.diff_correct` is proved about.
+pub const RULES: &[Rule] = crate::rules_gen::RULES;
 
 /// The rule of `op` in `rules`.
 pub fn rule_of(rules: &[Rule], op: Op) -> Option<&Rule> {
@@ -517,10 +352,14 @@ fn instantiate(graph: &mut Graph, template: &P, cx: &Cx) -> Tan {
         P::Lit(value) => literal(graph, value),
         P::Choice => literal(graph, cx.choice),
         P::Exponent => literal(graph, f64::from(cx.node.exponent())),
-        P::PowiDown => match cx.node.exponent().wrapping_sub(1) {
-            0 => Tan::One,
-            1 => Tan::Node(cx.node.args[0]),
-            down => Tan::Node(graph.powi(cx.node.args[0], down)),
+        P::PowiDown => match cx.node.exponent().checked_sub(1) {
+            Some(0) => Tan::One,
+            Some(1) => Tan::Node(cx.node.args[0]),
+            Some(down) => Tan::Node(graph.powi(cx.node.args[0], down)),
+            // The exponent is `i32::MIN` and one less is no `i32`: `x^(n - 1)` is `x^n / x`,
+            // the node over its argument (the rule's domain has `x` not 0 below exponent 1).
+            // Wrapping here made the derivative `n * x^i32::MAX`.
+            None => Tan::Node(graph.binary(Op::Div, cx.id, cx.node.args[0])),
         },
         P::Add(a, b) => {
             let (a, b) = (instantiate(graph, a, cx), instantiate(graph, b, cx));

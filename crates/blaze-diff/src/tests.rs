@@ -1,8 +1,10 @@
-//! The tests: the derivative against finite differences ([`derivative`]), simplification
+//! The tests: the derivative against finite differences ([`derivative`]) and against forward-mode
+//! dual numbers ([`dual`]), simplification
 //! against evaluation and the e-graph against a reference model ([`simplify`]), and printing
 //! ([`print`]). What they share is here: drawing a term.
 
 mod derivative;
+mod dual;
 mod print;
 mod simplify;
 
