@@ -510,6 +510,14 @@ export const rules = [
 		reason: "Andrew, 2026-11-10, when a design for fractional shares was being bent around const generic arithmetic: \"we have our own thing and should be able to do proper const generics\".",
 		link: "docs/v2/plan/design/edition.md",
 	},
+	{
+		id: "reflection-first",
+		skill: "compiler-correctness",
+		line: "Derive a property of a type or a function with blaze's compile-time reflection, not an auto trait, a proc macro or a special case in the compiler, wherever reflection is the more powerful; where reflection cannot yet say something that is possible, improve the language until it can.",
+		info: "A property that follows from the shape of a type or the body of a function (it holds no capability, it cannot own itself, every field is in its key, it is serializable) is written once as compile-time Rust over reflected code (docs/v2/plan/design/comptime.md) and stated as a trait with a blanket impl over what the reflection finds: it can ask the real question (does a shared, mutable pointer lead back to this type), is decided per instance, and its refusal names the field path. An auto trait can only say \"every field has it\" and fails with no reason; a proc macro is opaque to blaze (`blaze::proc_macro`); a check built into the compiler serves one property. Use those only where reflection is not the more powerful, and say why. When reflection cannot express what is needed (a bound that depends on a const expression, a body it cannot read, a type it cannot name), that is the work: extend reflection or the language with the smallest general primitive (`own-the-language`, `library-over-language`), never ship the weaker approximation in its place.",
+		reason: "Andrew, 2026-11-10, choosing how `Acyclic` is derived: \"prefer our const time reflection over auto trait if more powerful and if something doesn't work but is possible improve the language\".",
+		link: "docs/v2/plan/design/comptime.md",
+	},
 ] as const satisfies readonly Rule[];
 
 /**
