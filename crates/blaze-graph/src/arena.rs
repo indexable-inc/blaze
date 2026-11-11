@@ -1522,14 +1522,46 @@ fn linux_in_use(root: &Path, own: u64) -> io::Result<Option<(u64, String)>> {
             return Err(io::Error::new(why.kind(), format!("{}: {why}", count.display())));
         }
     };
-    let others = current.saturating_sub(own);
+    // What the group counts includes the page cache of files its processes wrote or read
+    // (an earlier build's outputs in the same unit): pages the kernel gives back when memory is
+    // asked for, so no one's use. The kernel's count of them is `memory.stat`'s `file` (v1 names
+    // the hierarchy's `total_cache`): the same count the daemon's own footprint leaves out
+    // (`blaze_cargo::raw::memory::charged`), so the ceiling and the footprint measure one
+    // thing. On 2026-11-11 a second build in one systemd unit was given a ceiling of
+    // 4.66 GB on a machine with 185 GB free, because 84 GB of the first build's outputs were
+    // still cached.
+    let stat = count.with_file_name("memory.stat");
+    let (cache, shared) =
+        if file == "memory.current" { ("file", "shmem") } else { ("total_cache", "total_shmem") };
+    let text = std::fs::read_to_string(&stat)
+        // alloc: the error's message
+        .map_err(|why| io::Error::new(why.kind(), format!("{}: {why}", stat.display())))?;
+    let field = |key: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix(' ')?.trim().parse::<u64>().ok())
+            // alloc: the error's message
+            .ok_or_else(|| invalid(&stat, format!("no count of `{key}`")))
+    };
+    // Shared memory and tmpfs are file pages too, and with no swap they stay: they are use.
+    let cached = field(cache)?.saturating_sub(field(shared)?);
+    let others = current.saturating_sub(cached).saturating_sub(own);
     // alloc: the budget's name, once per daemon start
-    let from = format!(
-        "{} others use in cgroup {group} ({file} {} less blaze's own {})",
-        gb(others),
-        gb(current),
-        gb(own)
-    );
+    let from = match cached {
+        0 => format!(
+            "{} others use in cgroup {group} ({file} {} less blaze's own {})",
+            gb(others),
+            gb(current),
+            gb(own)
+        ),
+        _ => format!(
+            "{} others use in cgroup {group} ({file} {} less {} of file cache the kernel gives \
+             back and blaze's own {})",
+            gb(others),
+            gb(current),
+            gb(cached),
+            gb(own)
+        ),
+    };
     Ok(Some((others, from)))
 }
 
@@ -2057,6 +2089,7 @@ mod tests {
                 ("proc/self/cgroup", "0::/lane.scope\n"),
                 ("sys/fs/cgroup/lane.scope/memory.max", "4294967296\n"),
                 ("sys/fs/cgroup/lane.scope/memory.current", "3221225472\n"),
+                ("sys/fs/cgroup/lane.scope/memory.stat", "anon 1\nfile 0\nfile_mapped 5\nshmem 0\n"),
             ],
         );
         let in_use = linux_in_use(&tree.0, 2 * GB).unwrap();
@@ -2085,6 +2118,28 @@ mod tests {
         );
         // Blaze holding more than the count says (it counts late) leaves others none.
         assert_eq!(linux_in_use(&tree.0, 4 * GB).unwrap().map(|it| it.0), Some(0));
+        // The file cache the kernel gives back is no one's use: an earlier build's outputs,
+        // still cached in the same cgroup, do not shrink the budget. The control: counted as
+        // use, the same group would leave others 3 GB.
+        let cached = Tree::new(
+            "current-cached",
+            &[
+                ("proc/self/cgroup", "0::/lane.scope\n"),
+                ("sys/fs/cgroup/lane.scope/memory.current", "4294967296\n"),
+                ("sys/fs/cgroup/lane.scope/memory.stat", "anon 9\nfile 3758096384\nfile_mapped 0\nshmem 536870912\n"),
+            ],
+        );
+        let in_use = linux_in_use(&cached.0, 0).unwrap().unwrap();
+        assert_eq!(in_use.0, GB);
+        assert!(in_use.1.contains("less 3.00 GB of file cache the kernel gives back"), "{}", in_use.1);
+        assert_ne!(in_use.0, 4 * GB, "the cache counted as use");
+        // A group with a count and no `memory.stat`, or one that names no file cache
+        // count, is an error naming the file, never a guess.
+        let none = Tree::new(
+            "current-nostat",
+            &[("proc/self/cgroup", "0::/x\n"), ("sys/fs/cgroup/x/memory.current", "1\n")],
+        );
+        assert!(linux_in_use(&none.0, 0).unwrap_err().to_string().contains("memory.stat"));
         // Others that leave nothing are an error naming them.
         let full = least(vec![(4 * GB, "x".to_owned())], Some(&(4 * GB, "y".to_owned())), 0);
         let why = full.unwrap_err();
@@ -2099,6 +2154,7 @@ mod tests {
             &[
                 ("proc/self/cgroup", "4:memory:/a/b\n0::/\n"),
                 ("sys/fs/cgroup/memory/a/b/memory.usage_in_bytes", "1073741824\n"),
+                ("sys/fs/cgroup/memory/a/b/memory.stat", "cache 0\ntotal_cache 0\ntotal_shmem 0\n"),
             ],
         );
         assert_eq!(linux_in_use(&tree.0, 0).unwrap().map(|it| it.0), Some(1 << 30));
