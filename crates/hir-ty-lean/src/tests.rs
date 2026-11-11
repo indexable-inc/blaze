@@ -468,7 +468,7 @@ fn function(db: &Db, krate: &str, function: &str) -> FunctionId {
             }
         }
     }
-    panic!("no function `{function}` in `{krate}`")
+    panic!("no function `{function}` in `{krate:?}`")
 }
 
 /// A fixture: minicore's flags, the crate (with overflow checks, as a dev build has), then
