@@ -77,6 +77,12 @@ thread_local! {
     /// The planted bug: no job's errors are noted for the history ([`Jobs::note_errors`]),
     /// as before 2026-11-11.
     pub(super) static PLANT_NO_ERROR_ROWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How many units each build sized the sources of ([`Jobs::build`]), in the order built:
+    /// none for a build of the units its checkout's last build sized.
+    pub(super) static SIZED_UNITS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
+    /// The planted bug: a plan asked again is units of their own whatever they hold
+    /// ([`Jobs::planned`]), as before 2026-11-11.
+    pub(super) static PLANT_PLAN_ANEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The planted bug: a job's answer waits for no placement, named or not
     /// ([`Jobs::wind_up`]).
     pub(super) static PLANT_ANSWER_WAITS_FOR_NO_OUTPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1645,6 +1651,9 @@ struct Roots<S: Steps> {
     storing: Vec<u32>,
     /// The outputs of its last units, as ids.
     outputs: Vec<Option<Arc<Outputs>>>,
+    /// The source bytes of each unit of its last units (`unit::source_bytes`), `u64::MAX` for
+    /// one not sized yet: read once a plan, not once a build ([`Jobs::build`]).
+    sized: Vec<Option<(Arc<Units>, Vec<u64>)>>,
     /// The answer of its last build that made nothing ([`noop::LastAnswer`]), until a job of
     /// it walks; or why it has none.
     answers: Vec<Last>,
@@ -1672,6 +1681,7 @@ impl<S: Steps> Roots<S> {
             fronts: Vec::new(),  // alloc: none until the first checkout
             storing: Vec::new(), // alloc: none until the first checkout
             outputs: Vec::new(), // alloc: none until the first checkout
+            sized: Vec::new(),   // alloc: none until the first checkout
             answers: Vec::new(), // alloc: none until the first checkout
             lost: Vec::new(),    // alloc: none until the first checkout
             unfinished: Vec::new(), // alloc: none until the first checkout
@@ -1690,6 +1700,7 @@ impl<S: Steps> Roots<S> {
         self.fronts.push(None);
         self.storing.push(0);
         self.outputs.push(None);
+        self.sized.push(None);
         self.answers.push(Err(Unkept::None));
         self.lost.push(None);
         self.unfinished.push(None);
@@ -2134,6 +2145,12 @@ struct Job<S: Steps> {
     /// Of `placing`, how many are at a path its answer names ([`Job::names`]): what its
     /// answer waits for ([`Jobs::wind_up`]). The rest go on after it ([`Settling::placing`]).
     needed: usize,
+    /// How many times the loop wound up while it lived ([`Jobs::wind_up`], once each
+    /// completion of a placement, a look or a run), and how long those took in all: said on
+    /// its answer's span (`wind_ups`, `wind_up_us`), since each is too short for a span of
+    /// its own and a build of many outputs makes thousands (slow-is-p0-traced).
+    wind_ups: u32,
+    wind_up_ns: i64,
     /// The paths its answer names, as [`Paths`] ids: each file of each unit's artifact
     /// ([`Artifact::path`], [`Artifact::filenames`], [`Artifact::executable`]: what `Built`
     /// says was made, and what a person or a tool runs or reads next) and each lock file it
@@ -3660,6 +3677,8 @@ impl<S: Steps> Jobs<S> {
             worked: None,
             busy: HashMap::new_in(Global),
             needed: 0,
+            wind_ups: 0,
+            wind_up_ns: 0,
             names: HashSet::new_in(Global),
             held: Vec::new(), // alloc: none until a run waits for its program
             look: 0,
@@ -5117,7 +5136,31 @@ impl<S: Steps> Jobs<S> {
             }
             Planned::Ready(mut units) => {
                 let lock = units.lock.take();
-                let units = Arc::new(units); // alloc: once per plan, shared by the job's tasks
+                // An edit of a source file moves the view's root, so the plan is asked again
+                // and comes back as a value of its own, equal to the checkout's last in all
+                // but identity. What is kept by the units' identity (their outputs' path ids,
+                // their source sizes, [`Jobs::build`]) was then made again each edit, the
+                // sizes by a walk of every unit's source directories on the loop's thread.
+                // The same units are the same `Arc`: compared here, once a plan, in a span
+                // that says how it went.
+                let same = prep.root.and_then(|root| {
+                    let last = self.roots.plans[root as usize].as_ref()?;
+                    let _span = tracing::info_span!(
+                        target: "blaze",
+                        "loop: the plan compared with the checkout's last",
+                        units = units.graph.units.len(),
+                        same = tracing::field::Empty,
+                    )
+                    .entered();
+                    #[cfg(test)]
+                    let same = !PLANT_PLAN_ANEW.get() && *last.units == units;
+                    #[cfg(not(test))]
+                    let same = *last.units == units;
+                    _span.record("same", same);
+                    same.then(|| Arc::clone(&last.units)) // clone: a refcount, once per plan
+                });
+                // alloc: once per plan that differs from the last, shared by the job's tasks
+                let units = same.unwrap_or_else(|| Arc::new(units));
                 let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
                 if let Some(root) = prep.root
                     && reuses_plans(&job.work)
@@ -5792,9 +5835,29 @@ impl<S: Steps> Jobs<S> {
         let mut next = first.0;
         // Each unit's source bytes, what its phases' memory is predicted from
         // (`Plane::push_sized`): a stat of each `.rs` file under its modules' directories,
-        // once a directory a build, named so its time is its own (rule 16).
-        let sizing = tracing::info_span!(target: "blaze", "unit source sizes", units = built);
+        // once a directory, named so its time is its own (rule 16).
+        //
+        // Read once a plan of a checkout, not once a build: the walk is of every unit's
+        // directories (the standard library's and every dependency's among them: thousands
+        // of files for hello world, tens of thousands for a large workspace), in line on the
+        // loop's thread, before a single unit of the build is posted, and an edit changes
+        // none of it by more than the bytes it typed. It is a prediction's input and never
+        // an input of what is built (`unit::source_bytes`), and what a kind of task held is
+        // learned from its runs besides (`cost_key`), so the sizes of the plan's first build
+        // stand for the builds of the same units after it; new units (a manifest changed, a
+        // target added) are sized anew. `read` says how many units this build sized.
+        let sizing = tracing::info_span!(
+            target: "blaze",
+            "unit source sizes",
+            units = built,
+            read = tracing::field::Empty,
+        );
         let mut seen = HashMap::new_in(Global); // alloc: once per build, a directory an entry
+        let mut sizes = match root.and_then(|root| self.roots.sized[root as usize].take()) {
+            Some((of, sizes)) if Arc::ptr_eq(&of, &input.units) && sizes.len() == all.len() => sizes,
+            _ => vec![u64::MAX; all.len()], // alloc: once a plan
+        };
+        let mut sized = 0u32;
         for offset in 0..built {
             let at = unit_at(offset);
             let unit = &all[at];
@@ -5816,7 +5879,16 @@ impl<S: Steps> Jobs<S> {
                 next += 1;
                 continue;
             }
-            let source = sizing.in_scope(|| super::unit::source_bytes(unit, &mut seen));
+            let source = match sizes[at] {
+                u64::MAX => {
+                    let read = sizing.in_scope(|| super::unit::source_bytes(unit, &mut seen));
+                    // Never the mark of a unit not sized: one of that many bytes reads again.
+                    sizes[at] = read.min(u64::MAX - 1);
+                    sized += 1;
+                    read
+                }
+                kept => kept,
+            };
             let base = next;
             let of = |phase: Phase| {
                 let index = phases
@@ -5866,6 +5938,13 @@ impl<S: Steps> Jobs<S> {
                 }
                 next += 1;
             }
+        }
+        sizing.record("read", sized);
+        #[cfg(test)]
+        SIZED_UNITS.with_borrow_mut(|it| it.push(sized));
+        if let Some(root) = root {
+            // clone: a refcount, once per build
+            self.roots.sized[root as usize] = Some((input.units.clone(), sizes));
         }
         // clone: refcounts, once per build
         let work = Step::of(
@@ -7731,6 +7810,17 @@ impl<S: Steps> Jobs<S> {
     /// [`Jobs::wind_up`], judging whether a wait for the store ran out of time only when
     /// `judge` is set ([`gave_up`]).
     fn wind_up_judging(&mut self, w: &mut World<'_, S>, judge: bool) {
+        let began = blaze_profile::clock::mono_ns();
+        self.wind_up_timed(w, judge);
+        let took = blaze_profile::clock::mono_ns() - began;
+        for job in self.jobs.values_mut() {
+            job.wind_ups += 1;
+            job.wind_up_ns += took;
+        }
+    }
+
+    /// [`Jobs::wind_up_judging`], which counts it and its time for each job that lives on.
+    fn wind_up_timed(&mut self, w: &mut World<'_, S>, judge: bool) {
         self.release_queued(w);
         self.release_held(w);
         self.release_ready(w);
@@ -7859,9 +7949,17 @@ impl<S: Steps> Jobs<S> {
         }
         for (id, ok, error) in over.drain(..) {
             let Some(mut job) = self.jobs.remove(key_of(id)) else { continue };
-            let _answering =
-                tracing::info_span!(target: "blaze", "loop: a job's answer", job = %id, ok)
-                    .entered();
+            // `wind_ups` and `wind_up_us`: the loop's windings up while the job lived, this
+            // one not counted, and their time in all.
+            let _answering = tracing::info_span!(
+                target: "blaze",
+                "loop: a job's answer",
+                job = %id,
+                ok,
+                wind_ups = job.wind_ups,
+                wind_up_us = job.wind_up_ns / 1000,
+            )
+            .entered();
             if let Some(recorded) = self.recordings.iter_mut().find(|it| it.job == id) {
                 let made_nothing = ok
                     && error.is_none()

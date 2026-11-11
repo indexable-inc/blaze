@@ -2414,6 +2414,56 @@ fn the_oracle_catches_a_failed_build_with_no_error_row() {
     assert!(rows.is_empty(), "the plant notes nothing, and the oracle's check would fail: {rows:#?}");
 }
 
+/// How many units each of two builds of `/w` sized the sources of, a source file edited
+/// between them (so the view's root moves and the plan is asked again, the same as it was).
+fn sized_across_an_edit(seed: u64) -> Vec<u32> {
+    use super::job::SIZED_UNITS;
+    SIZED_UNITS.with_borrow_mut(Vec::clear);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    for text in [None, Some(&b"fn main() { }\n"[..])] {
+        if let Some(text) = text {
+            daemon.driver().change(&name("w/src/main.rs"), text);
+        }
+        let id = client.send(
+            &mut daemon,
+            Request::Build { view: ViewRef::Head("/w".into()), targets: agent() },
+        );
+        let got = client.wait(&mut daemon, id);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+        settle(&mut daemon, &mut client);
+    }
+    SIZED_UNITS.with_borrow_mut(std::mem::take)
+}
+
+/// The invariant: a build whose plan is the units its checkout's last build had (an edit of
+/// a source file: the plan is asked again and is the same) walks no unit's source
+/// directories again: what is kept by the units is found by them, because equal units of one
+/// checkout are one value. The walk was of every unit's sources, the standard library's and
+/// each dependency's among them, on the loop's thread before any unit was posted.
+#[test]
+fn an_edit_that_leaves_the_plan_as_it_was_sizes_no_unit_again() {
+    let sized = sized_across_an_edit(200);
+    assert_eq!(sized.len(), 2, "two builds: {sized:?}");
+    assert!(sized[0] > 0, "the first build of a plan sizes its units: {sized:?}");
+    assert_eq!(sized[1], 0, "the build after the edit sized units again: {sized:?}");
+}
+
+/// The planted-bug control: a plan asked again taken as units of their own, as it was, and
+/// every unit is sized again after the edit.
+#[test]
+fn the_oracle_catches_a_plan_asked_again_taken_as_new_units() {
+    use super::job::PLANT_PLAN_ANEW;
+    PLANT_PLAN_ANEW.set(true);
+    let sized = sized_across_an_edit(200);
+    PLANT_PLAN_ANEW.set(false);
+    assert_eq!(sized.len(), 2, "two builds: {sized:?}");
+    assert_eq!(sized[1], sized[0], "the oracle missed units sized again after an edit: {sized:?}");
+}
+
 fn second_checkout(sim: &mut Sim) {
     sim.change(&name("v/Cargo.toml"), b"[package]\nname = \"app\"\n");
     sim.change(&name("v/src/main.rs"), b"fn main() {}\n");

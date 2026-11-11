@@ -66,6 +66,8 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         worked: None,
         busy: HashMap::new_in(std::alloc::Global),
         needed: 0,
+        wind_ups: 0,
+        wind_up_ns: 0,
         names: HashSet::new_in(std::alloc::Global),
         held: Vec::new(),
         look: 0,
