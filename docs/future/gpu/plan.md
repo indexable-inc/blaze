@@ -9,7 +9,7 @@ A user writes a `#[gpu::kernel]` function next to `main`, in the same crate, and
 Metal, Vulkan, CUDA or the CPU with one typed call. blaze compiles host and device code in one
 session, so generic kernels, shared structs and the borrow checker work across the boundary.
 
-Nothing here is built yet. The front matter uses the fields `tools/docs.py` checks, so this file
+Nothing here is built yet. The front matter uses the fields `scripts/src/bin/docs.rs` checks, so this file
 can move under `docs/v2/plan/` unchanged once it's adopted.
 
 The 10-29 decision "no GPU" in [decisions.md](../../v2/plan.md) and

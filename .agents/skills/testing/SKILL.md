@@ -51,10 +51,11 @@ simulated (the deterministic simulation with faults and crashes), model-checked 
 to a bound), proved (Lean, from the same contract and model; say it as `/// The invariant (proved:
 <proof file>):`). Durable, concurrent and crash-recovering code is at least simulated; prove the
 sans-IO cores and what must never be wrong; a disagreement between two levels is a bug in one of
-them. `harness/v2/invariants.py` collects every statement with its level into
-`docs/v2/plan/invariants.md` (`write`) and fails the gate (`check`) when one has no control, names a
-missing proof, or the list is stale. Before changing or regenerating code, read the invariants its
-crate states: they are what the new code is judged against.
+them. `scripts/src/bin/invariants.rs` (`blaze run -q -p scripts --bin invariants -- '<json>'`)
+collects every statement with its level into `docs/v2/plan/invariants.md` (`write`) and fails the
+gate (`check`) when one has no control, names a missing proof, or the list is stale. Before changing
+or regenerating code, read the invariants its crate states: they are what the new code is judged
+against.
 
 See [docs/v2/plan.md#11-proof-by-check-not-by-review](../../../docs/v2/plan.md#11-proof-by-check-not-by-review).
 

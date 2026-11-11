@@ -79,12 +79,12 @@ When a lane is done, delete its build directory (`blaze clean`), worktree, ix VM
 
 The ledger is `docs/v2/plan/objectives.json`, one row per objective: the outcome, the check that
 decides it as a command, its paths, its status (`docs/v2/plan/objectives.md` is its generated
-table). `harness/v2/ledger.py` picks work that does not collide (`pick`), runs a row's check and
-writes its status with the commit (`run`), and regenerates the table (`write`); never type a status
-by hand, except `blocked` with why. Before starting a row, run its check on main. A row with no
-check gets one written first, as part of the work. Done means the check passes on a named commit and
-has joined the gate or the release train, so it cannot regress silently. A row that fails twice
-records what blocks it and stops.
+table). `scripts/src/bin/ledger.rs` (`blaze run -q -p scripts --bin ledger -- '<json>'`) picks work
+that does not collide (`pick`), runs a row's check and writes its status with the commit (`run`),
+and regenerates the table (`write`); never type a status by hand, except `blocked` with why. Before
+starting a row, run its check on main. A row with no check gets one written first, as part of the
+work. Done means the check passes on a named commit and has joined the gate or the release train, so
+it cannot regress silently. A row that fails twice records what blocks it and stops.
 
 See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
 
@@ -123,8 +123,8 @@ From [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#wo
   `blaze test`, keep-going (the default), every failure handed back with the tree, command and error.
 - Checking agents' work fast, per commit, without waiting for the build
   ([docs/contributing.md#checking-a-change-fast](../../../docs/contributing.md#checking-a-change-fast)):
-  `blaze check $(uv run --frozen python harness/v2/changed.py '{"base": "<the commit before>", "print": "args"}') --lib --tests`
-  in the lane's VM, in parallel with the build. `changed.py` prints the packages the commit
+  `blaze check $(blaze run -q -p scripts --bin changed -- '{"base": "<the commit before>", "print": "args"}') --lib --tests`
+  in the lane's VM, in parallel with the build. `changed` prints the packages the commit
   touched and their dependents in the order to check; hand the first error back to the agent
   that wrote the code. Never let thousands of lines pile up unchecked behind an hour-long build.
 - A lane script, a harness and your own loop check every command's exit status and stop at the

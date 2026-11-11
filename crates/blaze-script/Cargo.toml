@@ -1,0 +1,26 @@
+[package]
+name = "blaze-script"
+description = "What a repository script needs and nothing of blaze's: the one typed JSON input, JSON written as the Python scripts wrote it, a program run with its output captured. Built by the pinned released blaze, so it depends on no crate of crates/ (docs/v2/plan/design/scripts.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# Both keep a JSON object's and a table's keys in the order they were written, as Python's do.
+serde_json = { workspace = true, features = ["preserve_order"] }
+toml = { workspace = true, features = ["preserve_order"] }
+# `unicode-case`: Python's `re.IGNORECASE` on a str pattern folds case by Unicode's rules
+# (`ſ` matches `s`), and a ported pattern's `(?i)` must do the same; the workspace's regex leaves
+# it out.
+regex = { workspace = true, features = ["unicode-case"] }
+
+[lints]
+workspace = true

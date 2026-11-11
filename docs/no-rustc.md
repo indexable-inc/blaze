@@ -51,7 +51,7 @@ below still finds is the list after it.
 
 | Step | What it removed |
 |---|---|
-| A | nothing: every rustc run counted, new ones refused (`harness/rustcsites.py`, `harness/norustc.py`) |
+| A | nothing: every rustc run counted, new ones refused (`scripts/src/bin/rustcsites.rs`, `harness/norustc.py`) |
 | B | every question asked of rustc (`-vV`, `--print cfg`): blaze answers |
 | C | the assembler run for `asm!` |
 | D | the fallback on an error: blaze's verdict is the final word |
@@ -67,7 +67,7 @@ below still finds is the list after it.
 
 ## What is left
 
-`python3 harness/rustcsites.py` (CI's `scripts` job) counts, per file under `crates/`, the places
+`blaze run -q -p scripts --bin rustcsites` (CI's `scripts` job) counts, per file under `crates/`, the places
 that start rustc, rustdoc, cargo or rustup or read which one to start, and holds them to
 `harness/norustc/sites.json`: one more in a file fails, and a place that goes lowers the count
 (`--record`). On 2026-11-10 it counts three places in two files, and none of them starts rustc:

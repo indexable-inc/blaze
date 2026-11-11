@@ -25,8 +25,8 @@ pub mod expr;
 pub mod print;
 pub mod simplify;
 
-/// The tables, generated from `crates/blaze-diff/rules.json` by `harness/v2/diff_rules.py`
-/// (whose `check` holds the file to its bytes): [`diff::RULES`] and [`simplify::REWRITES`] are
+/// The tables, generated from `crates/blaze-diff/rules.json` by
+/// `scripts/src/bin/diff_rules.rs` (whose `check` holds the file to its bytes): [`diff::RULES`] and [`simplify::REWRITES`] are
 /// these. Included, not a module file, so a formatter leaves the generated text alone.
 mod rules_gen {
     include!("rules_gen.rs");

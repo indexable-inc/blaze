@@ -212,9 +212,9 @@ crash-recovering code is at least simulated; what must never be wrong (a key's h
 round trip) is proved. When two levels disagree, one of them has a bug, and that is a finding.
 
 In the code, a statement is a doc comment opening `/// The invariant:`, `/// The refinement:` or
-`/// The reference model:`. `harness/v2/invariants.py` collects them, with the level each has
-reached, into [invariants.md](plan/invariants.md), and fails the gate when one has no planted-bug
-control beside it or names a proof that is not there. So what blaze guarantees, and how strongly,
+`/// The reference model:`. `scripts/src/bin/invariants.rs` collects them, with the level each
+has reached, into [invariants.md](plan/invariants.md), and fails the gate when one has no
+planted-bug control beside it or names a proof that is not there. So what blaze guarantees, and how strongly,
 is read in one place; dropping or weakening a guarantee is a visible line in a pull request; and
 generated code is judged against that list, not against itself.
 
@@ -264,7 +264,7 @@ This replaces it.
 
 **The ledger decides.** The ledger is data, `plan/objectives.json`: one row per objective, with
 the outcome, the check that decides it as a command, the paths it touches, what it needs first,
-and its status. `harness/v2/ledger.py` runs a row's check and writes the status with the commit
+and its status. `scripts/src/bin/ledger.rs` runs a row's check and writes the status with the commit
 (`run`), says what to work on next without two tasks colliding (`pick`), and writes the table
 people read, [objectives.md](plan/objectives.md) (`write`). Nobody types "done" and nobody argues
 it. An objective without a check says which one is missing, and writing it is the first part of
@@ -277,9 +277,9 @@ processes exist ([tasks](plan/design/tasks.md)).
 
 **The loop**, run by one coordinator (the main agent of a session):
 
-1. **Measure.** `ledger.py` `run` on main's exact tree, for the rows about to be worked on. Never
+1. **Measure.** `ledger` `run` on main's exact tree, for the rows about to be worked on. Never
    start from a status someone remembered.
-2. **Pick.** `ledger.py` `pick` gives rows that are ready and whose paths do not overlap, in the
+2. **Pick.** `ledger` `pick` gives rows that are ready and whose paths do not overlap, in the
    ledger's order; take fewer when one is large.
 3. **Brief.** Each task gets the objective's row, the section of this page and the spec it
    belongs to, the paths it may touch, and what "done" prints. A row that needs a design gets

@@ -2,6 +2,8 @@
 members = [
     "crates/*",
     "fuzz",
+    # The repository's scripts, built by the pinned released blaze (docs/v2/plan/design/scripts.md).
+    "scripts",
     # ix's linter and rewriter (tools/astlog/UPSTREAM).
     "tools/astlog/cli",
     "tools/astlog/core",
@@ -256,6 +258,22 @@ blaze-inproc-rt.opt-level = 3
 # reruns on every edit of them: optimized, as a build dependency is not by default.
 blake3.opt-level = 3
 blaze-codegen-code.opt-level = 3
+# The tier 0 scripts (`blaze run -p scripts --bin <name>`) are run, not developed: `docs check`
+# reads every tracked file, and unoptimized it took 26.5 s. The scripts and what they parse with
+# are optimized in dev builds too.
+scripts.opt-level = 3
+blaze-script.opt-level = 3
+regex.opt-level = 3
+regex-automata.opt-level = 3
+regex-syntax.opt-level = 3
+aho-corasick.opt-level = 3
+memchr.opt-level = 3
+serde_json.opt-level = 3
+indexmap.opt-level = 3
+toml.opt-level = 3
+toml_parser.opt-level = 3
+toml_datetime.opt-level = 3
+winnow.opt-level = 3
 
 [profile.release]
 # Set this to 1 or 2 to get more useful backtraces in debugger.
@@ -381,6 +399,7 @@ blaze-explore = { path = "crates/blaze-explore" }
 blaze-explore-core = { path = "crates/blaze-explore-core" }
 blaze-protocol = { path = "crates/blaze-protocol" }
 blaze-report = { path = "crates/blaze-report" }
+blaze-script = { path = "crates/blaze-script" }
 blaze-serde = { path = "crates/blaze-serde" }
 blaze-serde-derive = { path = "crates/blaze-serde-derive" }
 blaze-ui = { path = "crates/blaze-ui" }
