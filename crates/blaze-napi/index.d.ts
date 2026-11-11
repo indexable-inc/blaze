@@ -1,5 +1,5 @@
 // blaze's daemon from TypeScript (docs/client.md). The shapes are the agent API's
-// (crates/blaze-api/src/lib.rs, schema 48) as its JSON rendering writes them, and
+// (crates/blaze-api/src/lib.rs, schema 49) as its JSON rendering writes them, and
 // blaze-client's options and outcome (crates/blaze-client/src/ask.rs), written here by hand:
 // a field renamed there is renamed here in the same change.
 //
@@ -141,6 +141,8 @@ export interface Artifact {
 export type LinkHow = 'First' | 'Spliced' | 'Unchanged' | { Full: { why: string[] } };
 
 export interface Worked {
+  /** Why the build recomputed what it did, when the daemon had it as it answered; else null. */
+  why: Report[] | null;
   link: 'Patched' | 'Placed';
   found: number;
   green: number;

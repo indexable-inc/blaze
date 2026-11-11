@@ -1869,6 +1869,10 @@ struct Making {
     /// Each image this compile linked, by its path, as the runs of its file that hold bytes
     /// (`codegen::LinkMade::made`): what the loop places it from.
     made_files: Vec<(String, Arc<blaze_cas::Sparse>)>,
+    /// The debug side files its links made, each by the path it goes at
+    /// (`codegen::LinkMade::side`): outputs the loop places from these bytes after the
+    /// build's answer, in no record.
+    side_files: Vec<codegen::SideFile>,
     /// How many of `diagnostics` its check's are, in front, and every file they point into, by
     /// the name they give it ([`quoted_key`]); none where that is not known (a doctest's).
     quoted: Option<(usize, Vec<String>)>,
@@ -2595,6 +2599,7 @@ fn store(
         gpu_msl,
         records,
         made_files,
+        side_files,
         quoted,
     } = *making;
     puts.extend(library_puts(job));
@@ -2904,6 +2909,14 @@ fn store(
     }
     if let Some(slot) = job.made.get(unit) {
         let _ = slot.set(made);
+    }
+    // The debug side files its links made, after its record is encoded: outputs of this
+    // compile alone, placed by the loop from the bytes the link holds. They are in no
+    // record (a build that replays the record links nothing and has none to place, and a
+    // key of theirs is in no store), and no artifact names them, so the build's answer
+    // does not wait for them (`serve::job`'s `Job::names`).
+    for codegen::SideFile { path, key, file } in side_files {
+        compiled.outputs.push(Output { path, key, executable: false, made: Some(file) });
     }
     Ok(compiled)
 }
@@ -3351,6 +3364,7 @@ fn assemble(
         gpu_msl: None,
         records: Vec::new(),
         made_files: Vec::new(),
+        side_files: Vec::new(),
         // clone: the files its diagnostics point into, once per unit that fails or builds nothing
         quoted: Some(quoted.clone()),
     };
@@ -3377,6 +3391,7 @@ fn assemble(
     // What each file rustc would write holds: (path, bytes, executable).
     let mut files: Vec<(String, Written, bool)> = Vec::new();
     let mut made_files = Vec::new(); // alloc: none until a link
+    let mut side_files = Vec::new(); // alloc: none until a link with a debug side file
     let identity = named_identity(job, unit)?;
     if inert {
         // A build script that does nothing is not run, so not built: what it prints is known.
@@ -3580,6 +3595,7 @@ fn assemble(
                             // alloc: once per image linked, shared by the paths it is placed at
                             made_files.push((path.to_owned(), Arc::new(made)));
                         }
+                        side_files.extend(linked.side);
                     }
                     Err(failed) => {
                         // alloc: error path
@@ -3606,6 +3622,7 @@ fn assemble(
         gpu_msl: None,
         records: Vec::new(),
         made_files,
+        side_files,
         quoted: Some(quoted),
     })
 }

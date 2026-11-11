@@ -65,6 +65,10 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         placed: blaze_cas::PlacedBytes::default(),
         worked: None,
         busy: HashMap::new_in(std::alloc::Global),
+        needed: 0,
+        wind_ups: 0,
+        wind_up_ns: 0,
+        names: HashSet::new_in(std::alloc::Global),
         held: Vec::new(),
         look: 0,
         awaiting: None,
@@ -99,6 +103,9 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         placed_any: false,
         walks: None,
         lost: None,
+        after: None,
+        checkout: None,
+        left: None,
     }
 }
 
@@ -467,6 +474,63 @@ fn a_path_is_placed_once_every_effect_placing_it_has_ended() {
     let gone = JobId { slot: 1, generation: 0 };
     jobs.begin_placing(gone, 4);
     assert!(jobs.end_placing(gone, 4).is_none(), "a job no longer there counts nothing");
+}
+
+/// A job's answer waits for what it has under way at the paths it names, and for nothing at
+/// any other: an effect counts as needed from its begin when its path is named by then, and
+/// from the naming when it began before; each end takes off what its begin added.
+#[test]
+fn an_answer_waits_for_the_paths_it_names_alone() {
+    let mut jobs = Jobs::<Real>::new(setup(0, 0)).unwrap();
+    let id = JobId { slot: 0, generation: 0 };
+    assert!(jobs.jobs.put(key_of(id), job(Vec::new())).is_ok());
+    let counts = |jobs: &Jobs<Real>| {
+        let job = jobs.jobs.get(key_of(id)).unwrap();
+        (job.placing, job.needed)
+    };
+    jobs.name(id, 4);
+    jobs.begin_placing(id, 4);
+    jobs.begin_placing(id, 5);
+    assert_eq!(counts(&jobs), (2, 1), "path 4 is named, path 5 is not");
+    jobs.begin_placing(id, 6);
+    jobs.name(id, 6);
+    assert_eq!(counts(&jobs), (3, 2), "an effect begun before its path was named counts from the naming");
+    jobs.end_placing(id, 4);
+    jobs.end_placing(id, 6);
+    assert_eq!(counts(&jobs), (1, 0), "only the unnamed path's effect is left: the answer waits for none");
+    jobs.end_placing(id, 5);
+    assert_eq!(counts(&jobs), (0, 0));
+    assert!(jobs.flying.is_empty(), "no path has an effect in flight");
+}
+
+/// What an answered job left being placed is counted by what it left to settle, and its
+/// path stays busy for whoever asks next, until the effect ends.
+#[test]
+fn an_answered_jobs_placement_is_its_settlings_and_keeps_its_path_busy() {
+    let mut jobs = Jobs::<Real>::new(setup(0, 0)).unwrap();
+    let id = JobId { slot: 3, generation: 1 };
+    jobs.settling.push(Settling {
+        job: id,
+        command: "build".into(),
+        checkout: None,
+        view: "none".into(),
+        storing: None,
+        stored: blaze_cas::Tickets::default(),
+        durable: blaze_cas::Tickets::default(),
+        placing: 1,
+        placing_span: None,
+        leases: None,
+        since: None,
+        wait: None,
+    });
+    // Its placement's next step (a mode, a look) begins under it, as under the job.
+    jobs.begin_placing(id, 7);
+    assert_eq!((jobs.settling[0].placing, jobs.flying.get(&7).copied()), (2, Some(1)));
+    assert!(jobs.owned(id) && jobs.idle(), "it is no job, and it is still answered for");
+    assert!(jobs.end_placing(id, 7).is_none());
+    assert_eq!(jobs.settling[0].placing, 1);
+    assert!(jobs.flying.is_empty());
+    assert_eq!(jobs.placing_after(), 1);
 }
 
 #[test]

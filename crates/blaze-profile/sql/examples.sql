@@ -57,7 +57,7 @@ ORDER BY coalesce(ran_changed, 0) + coalesce(ran_untracked, 0) + coalesce(ran_cy
 LIMIT $limit
 
 -- name: critical_path
--- says: a build's critical path, first step first: from the work that ended the build back through each wait to whoever ran what it waited on (a wait's owner), each step what ran on which lane (a fiber job, or a thread) and for how long, a wait nobody owns a step of its own; on every row the whole path's seconds, its share of the wall time (near 100: the path bounds the build) the build's parallelism (busy threads on average), and whether the walk reached the build's start within its bound of 100000 steps (false: the path is cut short)
+-- says: a build's critical path, first step first: from the work that ended the build back through each wait to whoever ran what it waited on (a wait's owner: a job as `switches.job` names it, generation and slot, the numbering since schema 2), each step what ran on which lane (a fiber job, or a thread) and for how long, a wait nobody owns a step of its own; on every row the whole path's seconds, its share of the wall time (near 100: the path bounds the build) the build's parallelism (busy threads on average), and whether the walk reached the build's start within its bound of 100000 steps (false: the path is cut short)
 WITH RECURSIVE bounds AS (
     SELECT started_ns AS t0, started_ns + dur_ns AS t1
     FROM builds
@@ -70,21 +70,19 @@ WITH RECURSIVE bounds AS (
 ), waits AS (
     SELECT process, span_id, lane, awaits, owner, start_ns, end_ns FROM laned WHERE name = 'wait'
 ), job_starts AS (
-    SELECT process, job, job & 4294967295 AS slot, t_ns
+    SELECT process, job, min(t_ns) AS t_ns
     FROM switches, bounds
     WHERE event = 'started' AND t_ns <= t1
-), job_ends AS (
-    SELECT process, job, min(t_ns) AS ended_ns FROM switches WHERE event = 'ended' GROUP BY process, job
-), matched AS (
-    SELECT waits.*, job_starts.job AS slot_job
-    FROM waits ASOF LEFT JOIN job_starts
-        ON job_starts.process = waits.process AND job_starts.slot = waits.owner - 1 AND job_starts.t_ns <= waits.end_ns
+    GROUP BY process, job
 ), owned AS (
-    -- A slot's last job to start is the owner only if it had not ended when the wait began: a
-    -- runner on no fiber (a client thread's job) has no switches, and its slot's older job is not it.
-    SELECT matched.*,
-        CASE WHEN job_ends.ended_ns IS NULL OR job_ends.ended_ns >= matched.start_ns THEN matched.slot_job END AS owner_lane
-    FROM matched LEFT JOIN job_ends ON job_ends.process = matched.process AND job_ends.job = matched.slot_job
+    -- A wait's `owner` is its runner's job as the switches name it (generation << 32 | slot),
+    -- so the owner's lane is that job's, if it has one: a runner on no fiber (a thread's own
+    -- job) has no switches, and the wait stays on its lane. Until 2026-11-11 this matched the
+    -- owner as schema 1 numbered it (slot + 1), which no file since schema 2 holds: the walk
+    -- crossed no wait.
+    SELECT waits.*,
+        CASE WHEN job_starts.t_ns <= waits.end_ns THEN job_starts.job END AS owner_lane
+    FROM waits LEFT JOIN job_starts ON job_starts.process = waits.process AND job_starts.job = waits.owner
 ), stepped AS (
     SELECT owned.*,
         CASE WHEN owner_lane IS NOT NULL AND owner_lane <> lane THEN owner_lane ELSE lane END AS next_lane,
@@ -886,6 +884,54 @@ ORDER BY tied.of_build DESC,
     count(*) DESC, tied.source
 LIMIT $limit
 
+-- name: wait_owner
+-- says: a build's `wait` spans of `min_ms` (20) or longer, longest first, each with who ended it and what that owner was doing meanwhile: `awaits`, how long (`ms`), the waiter's thread and when the wait began from the build's start (`at_ms`), `owned_by` (job, the scope's jobs, whoever sends, the kernel, the lock's holder, the daemon, not said), the `owner` job, and for a job's the spans of that job that overlapped the wait, the most overlap first (`owner_did`: each span's name and what it was of with the milliseconds of the wait it covered, so a wait behind a query's run shows the run and the queries under it, and a wait behind a verify shows no run of the awaited key at all) with the owner's thread; `owner_did` null with a job owner means that job has no span in the wait's window (it was parked or queued itself: see `critical_path`)
+WITH bounds AS (
+    SELECT min(started_ns) AS t0 FROM builds WHERE build_id = $build
+), waits AS (
+    SELECT process, span_id, CAST(thread_name AS VARCHAR) AS thread, awaits, owner,
+        CAST(owned_by AS VARCHAR) AS owned_by, CAST(waits_on AS VARCHAR) AS waits_on,
+        start_ns, start_ns + dur_ns AS end_ns, dur_ns
+    FROM spans
+    WHERE build_id = $build AND name = 'wait' AND dur_ns >= $min_ms * 1e6
+), runs AS (
+    SELECT process, thread, t_ns, CASE WHEN event = 'started' OR event = 'resumed' THEN job END AS on_job
+    FROM switches
+), laned AS (
+    SELECT s.process, CAST(s.thread_name AS VARCHAR) AS thread, CAST(s.name AS VARCHAR) AS name, s.function, s.unit,
+        s.start_ns, s.start_ns + s.dur_ns AS end_ns, runs.on_job
+    FROM spans AS s ASOF LEFT JOIN runs
+        ON s.process = runs.process AND s.thread = runs.thread AND s.start_ns >= runs.t_ns
+    WHERE s.name NOT IN ('wait', 'job', 'worker')
+), covered AS (
+    SELECT waits.process, waits.span_id, laned.thread, laned.name, coalesce(laned.function, laned.unit) AS what,
+        sum(least(laned.end_ns, waits.end_ns) - greatest(laned.start_ns, waits.start_ns)) AS ns
+    FROM waits JOIN laned
+        ON laned.process = waits.process AND laned.on_job = waits.owner
+        AND laned.start_ns < waits.end_ns AND laned.end_ns > waits.start_ns
+    GROUP BY ALL
+), did AS (
+    SELECT process, span_id, any_value(thread) AS owner_thread,
+        string_agg(name || coalesce(' ' || what, '') || ' ' || CAST(round(ns / 1e6, 1) AS VARCHAR) || ' ms', '; ' ORDER BY ns DESC, name, what) AS owner_did
+    FROM (SELECT *, row_number() OVER (PARTITION BY process, span_id ORDER BY ns DESC, name, what) AS rank FROM covered)
+    WHERE rank <= 8
+    GROUP BY process, span_id
+)
+SELECT
+    round(waits.dur_ns / 1e6, 3) AS ms,
+    waits.awaits,
+    waits.waits_on,
+    waits.thread,
+    round((waits.start_ns - bounds.t0) / 1e6, 3) AS at_ms,
+    coalesce(waits.owned_by, CASE WHEN waits.owner IS NULL THEN 'not recorded (a blaze before owned_by)' ELSE 'job' END) AS owned_by,
+    waits.owner,
+    did.owner_thread,
+    did.owner_did
+FROM waits CROSS JOIN bounds
+LEFT JOIN did ON did.process = waits.process AND did.span_id = waits.span_id
+ORDER BY waits.dur_ns DESC, waits.start_ns
+LIMIT $limit
+
 -- name: timeline
 -- says: a build as rows in the order things began: each span of `min_ms` (1) or longer with when it began from the build's start (`at_ms`), how long it was open (`ms`), its own CPU (`cpu_ms`, less the spans under it), its thread, its depth on that thread, and what it was of (its function, what a wait awaited, its unit, its crate, or its other fields); spans of no build in the build's window are its too. A gap between one row's end and the next row's `at_ms` on the same thread and depth is time under no span of that size. The path across waits to the jobs that ended them is `critical_path`
 WITH bounds AS (
@@ -922,14 +968,15 @@ ORDER BY s.dur_ns DESC, s.start_ns
 LIMIT $limit
 
 -- name: waits_by_reason
--- says: a build's waits by what they waited for (`wait` spans by `awaits`, `admission` spans by what held the task back): how many, their time summed over the threads waiting (not wall time), the longest, and a thread that waited; waits too short for a row (`folded`) are not counted
+-- says: a build's waits by what they waited for (`wait` spans by `awaits`, `admission` spans by what held the task back): how many, their time summed over the threads waiting (not wall time), the longest, a thread that waited, and who ends such a wait (`owned_by`; what its owner did meanwhile is `wait_owner`); waits too short for a row (`folded`) are not counted
 SELECT
     CAST(s.name AS VARCHAR) AS waited_in,
     coalesce(s.awaits, '(unnamed)') AS reason,
     count(*) AS waits,
     round(sum(s.dur_ns) / 1e6, 3) AS ms,
     round(max(s.dur_ns) / 1e6, 3) AS longest_ms,
-    CAST(any_value(s.thread_name) AS VARCHAR) AS a_thread
+    CAST(any_value(s.thread_name) AS VARCHAR) AS a_thread,
+    CAST(any_value(s.owned_by) AS VARCHAR) AS owned_by
 FROM spans AS s
 WHERE s.build_id = $build AND s.name IN ('wait', 'admission')
 GROUP BY s.name, s.awaits

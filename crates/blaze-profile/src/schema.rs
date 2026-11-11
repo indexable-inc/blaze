@@ -27,7 +27,9 @@ use crate::span;
 /// `event_fields`, joined on `process` and `events.event_id`. A file of version 4 or older has no
 /// `event_id` and its fields are in its `message`. Still 5 with `spans.fields` (2026-11-11), the
 /// last typed column of the span registry, nullable and at the table's end: a file from before
-/// reads it as null through the table's schema file.
+/// reads it as null through the table's schema file. Still 5 with `spans.owned_by` after it
+/// (2026-11-11), who ends a `wait`, said by every one: null in a file from before, where a null
+/// `owner` meant "not known".
 pub const VERSION: u32 = 5;
 
 /// A version before [`VERSION`] whose files a reader reads as [`VERSION`]'s, and what reading
@@ -1012,7 +1014,7 @@ pub const JOB_INTERVALS: Table = Table {
         opt(
             "waker",
             Type::Utf8,
-            "for a wait: how its waker is known: ready (its ready row), awaited (the job it waited on), owner (the key's runner), no_job (woken from no fiber), no_lane (a job with no switch rows) or unknown (no row names it)",
+            "for a wait: how its waker is known: ready (its ready row), awaited (the job it waited on), owner (the key's runner), answer (a client's wait for its daemon, crossed to the thread that made the daemon's answer), no_job (woken from no fiber), no_lane (a job with no switch rows) or unknown (no row names it)",
         ),
         opt("span_id", Type::U64, "the innermost span of its lane open just before it ended"),
         opt(

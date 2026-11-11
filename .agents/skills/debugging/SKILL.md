@@ -64,7 +64,8 @@ guess a column: a query DuckDB refuses for one is answered with the table's real
   the daemon's pid and build. Build numbers are per home.
 - **Compare from the second edit on.** The first build after a cold one lets go of every
   body's results and makes the edited crate's again once.
-- **No problems.** `blaze explain problems` is empty for the builds you compare, or you say
+- **No problems.** `blaze explain problems` says nothing was wrong in the builds you compare
+  (it names the builds it read; a build that is not in the history is an error), or you say
   what it lists.
 
 `blaze debug edits KIND [--file F] [--fn NAME] [--runs N] [--json]` does all of this for an
@@ -182,6 +183,8 @@ Each query below is a named view (`blaze explain <name>`) unless it says otherwi
 - `blaze explain long_spans [min_ms=20]`: the longest spans, with their own CPU: long with
   little CPU and not a `wait` is blocked in something no span names.
 - `blaze explain waits_by_reason`: `wait` and `admission` spans by what they waited for.
+- `blaze explain wait_owner [min_ms=20]`: the long waits, each with who ends it (`owned_by`,
+  `owner`) and what that owner's job did meanwhile (`owner_did`: `query verify`, a query's run).
 - `blaze explain counts_by_cause`: `query_counts` with the cause columns, the most run first.
   An edit's build runs a handful.
 - `blaze explain writes`: the inputs the build wrote, and for each the fields reruns name as
@@ -249,7 +252,9 @@ WHERE a.hash IS DISTINCT FROM b.hash ORDER BY item, part
   build first.
 
 **Memory by task.**
-- `blaze explain memory [N]` is the one-screen answer to "who owned the memory": the timeline per
+- `blaze explain memory [N]` (with no N: the last build that has memory rows, said when that
+  is not the last build; a build named that has none is an error, never empty tables)
+  is the one-screen answer to "who owned the memory": the timeline per
   minute (footprint, live heap, blaze-mem, kept), the tasks with the largest peaks with crate,
   unit and global-heap churn (`heap_allocated_bytes` against `peak_bytes`), the breakdown by tag
   at the footprint's peak (the `tag ... bytes: <tag>` counters), and the call sites that

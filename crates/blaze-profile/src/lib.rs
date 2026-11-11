@@ -97,6 +97,7 @@ fn carry_with_fiber_jobs() {
         _ = pump::span_waits(pump::WaitSpans {
             begin: wait_began,
             end: wait_ended,
+            woken: wait_woken,
             held: hold_began,
         });
         _ = pool::span_jobs(pool::JobSpans {
@@ -154,10 +155,15 @@ fn job_ended(outer: u64) {
 }
 
 /// Opens and enters the span `wait` ([`span::Wait`]), its `awaits` (and `function`) what it
-/// waits for and its `owner` the task running that: its id. The span outlives this call,
-/// closed by [`wait_ended`]. A scope's wait names what the scope is for, the span its caller
-/// opened it in: `scope 13 of unit codegen serde v1.0.219 (build script)`.
-fn wait_began(kind: blaze_graph::wait::WaitKind, awaited: &str, owner: Option<u64>) -> u64 {
+/// waits for, its `owned_by` who ends it and its `owner` the job when that is one: its id. The
+/// span outlives this call, closed by [`wait_ended`]. A scope's wait names what the scope is
+/// for, the span its caller opened it in: `scope 13 of unit codegen serde v1.0.219 (build
+/// script)`.
+fn wait_began(
+    kind: blaze_graph::wait::WaitKind,
+    awaited: &str,
+    owner: blaze_graph::wait::Owner,
+) -> u64 {
     // alloc: once a scope's wait, which suspends
     let mut named = String::new();
     let awaited = if kind == blaze_graph::wait::WaitKind::Scope {
@@ -171,7 +177,19 @@ fn wait_began(kind: blaze_graph::wait::WaitKind, awaited: &str, owner: Option<u6
         awaited
     };
     let awaited = span::Name::of(awaited);
-    span::open_raw(span::Wait { awaits: awaited, function: awaited, owner, on: kind })
+    span::open_raw(span::Wait {
+        awaits: awaited,
+        function: awaited,
+        owner: owner.job(),
+        on: kind,
+        by: owner.by(),
+    })
+}
+
+/// The wait of the span [`wait_began`] opened, still open, was woken by job `by`: its owner
+/// from now on.
+fn wait_woken(span: u64, by: u64) {
+    span::woken_raw(span, by);
 }
 
 /// Opens and enters the span `hold` ([`span::Hold`]), its `function` what is held and its
@@ -456,6 +474,105 @@ mod tests {
                 Some("scope 14 of no span")
             ],
             "the innermost span that names what it is of, past one that names nothing"
+        );
+    }
+
+    /// The invariant: every `wait` row says who ends it. A wait opened through any of
+    /// blaze-graph's waits has `owned_by` in its ring row and in the `spans` batch a profile
+    /// file is written from; `owner` names a job exactly when `owned_by` is `job`; a wait that
+    /// learns its waker as it ends names that job; and a client's wait for its daemon says the
+    /// daemon.
+    #[test]
+    fn every_wait_row_says_who_ends_it_in_the_ring_and_in_the_batch() {
+        use blaze_graph::wait::{OwnedBy, WaitOn, wait, wait_for_daemon, wait_woken};
+        install();
+        let tid = std::thread::spawn(|| {
+            wait(WaitOn::Key("owned key"), Some(7 << 32 | 3), || {});
+            wait(WaitOn::Key("unsaid key"), None, || {});
+            wait(WaitOn::Lock("owned lock"), None, || {});
+            wait(WaitOn::Channel("owned channel"), None, || {});
+            wait(WaitOn::Io("owned io"), None, || {});
+            wait(WaitOn::Child(42), None, || {});
+            wait(WaitOn::Scope(15), None, || {});
+            wait_woken(WaitOn::Channel("woken channel"), || ((), Some(9 << 32 | 4)));
+            wait_woken(WaitOn::Channel("woken by none"), || ((), None));
+            wait_for_daemon("the daemon's answer to the request", || {});
+            sampler::os_tid() as u32
+        })
+        .join()
+        .unwrap();
+        let mut read = flight::Read::default();
+        flight::window(Duration::from_secs(60), &mut read);
+        // alloc: a test's rows
+        let rows: Vec<flight::SpanRow> =
+            read.spans.into_iter().filter(|it| it.thread == tid).collect();
+        let expected = [
+            ("owned key", Some(7u64 << 32 | 3), OwnedBy::Job),
+            ("unsaid key", None, OwnedBy::Unsaid),
+            ("lock owned lock", None, OwnedBy::Holder),
+            ("channel owned channel", None, OwnedBy::Sender),
+            ("io owned io", None, OwnedBy::Kernel),
+            ("child 42", None, OwnedBy::Child),
+            ("scope 15 of no span", None, OwnedBy::ScopeJobs),
+            ("channel woken channel", Some(9 << 32 | 4), OwnedBy::Job),
+            ("channel woken by none", None, OwnedBy::Sender),
+            ("io the daemon's answer to the request", None, OwnedBy::Daemon),
+        ];
+        let said = |waits: Vec<span::Typed<span::Wait>>| {
+            waits
+                .into_iter()
+                .map(|it| (it.fields.awaits.text(), it.fields.owner, it.fields.by))
+                // alloc: a test's rows
+                .collect::<Vec<_>>()
+        };
+        let check = |from: &str,
+                     mut got: Vec<(Option<std::sync::Arc<str>>, Option<u64>, OwnedBy)>| {
+            // A contended lock of the recorder's own would be a wait of this thread too.
+            got.retain(|it| expected.iter().any(|want| Some(want.0) == it.0.as_deref()));
+            assert_eq!(got.len(), expected.len(), "{from}: one row a wait: {got:?}");
+            for ((awaits, owner, by), (want, want_owner, want_by)) in got.iter().zip(expected) {
+                assert_eq!(awaits.as_deref(), Some(want), "{from}");
+                assert_eq!((*owner, *by), (want_owner, want_by), "{from}: `{want}`");
+                assert_eq!(owner.is_some(), *by == OwnedBy::Job, "{from}: `{want}`");
+            }
+        };
+        // alloc: a test's rows
+        let ring: Vec<_> =
+            rows.iter().filter_map(|it| span::read::<span::Wait>(it).unwrap()).collect();
+        check("the ring", said(ring));
+        let batch = batches::spans(
+            &rows,
+            batches::Process { pid: 1, name: "wait owners test", commit: None },
+        )
+        .unwrap();
+        // `read_batch` refuses a `wait` row whose `owned_by` is null ([`span::KindError::Unsaid`]):
+        // that every row reads back is that none leaves who ends it unsaid.
+        check("the batch", said(span::read_batch::<span::Wait>(&batch).unwrap()));
+    }
+
+    /// The control of [`every_wait_row_says_who_ends_it_in_the_ring_and_in_the_batch`]: a row
+    /// whose `owned_by` was never said (as a blaze before the column wrote it) does not read
+    /// back as a `wait`, so the oracle's read of each row is what holds a wait to saying it.
+    #[test]
+    fn the_oracle_catches_a_wait_that_says_no_owner() {
+        let mut said = span::Said::EMPTY;
+        let awaits = span::Name::of("a wait of a blaze before `owned_by`");
+        span::Fields::write(
+            span::Wait {
+                awaits,
+                function: awaits,
+                owner: None,
+                on: blaze_graph::wait::WaitKind::Channel,
+                by: blaze_graph::wait::OwnedBy::Sender,
+            },
+            &mut said,
+        );
+        assert!(<span::Wait as span::Fields>::read(&said).is_some());
+        said.set(<span::col::OwnedBy as span::Column>::AT, 0);
+        assert_eq!(
+            <span::Wait as span::Fields>::read(&said),
+            None,
+            "a wait with `owned_by` unsaid is refused, not read with a guessed owner"
         );
     }
 

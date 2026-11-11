@@ -12,9 +12,9 @@ use std::{
 };
 
 use blaze_api::{
-    ApiError, Artifact, CrateType, Diagnostic, Envelope, FetchVerb, Level, Reach, Request,
-    Response, SCHEMA, Table, TargetKind, Targets, TestOutcome, TestResult, Ub, UnitOf, UnitTarget,
-    Verb, ViewRef,
+    ApiError, Artifact, ArtifactKind, CrateType, Diagnostic, Envelope, FetchVerb, Level, Reach,
+    Request, Response, SCHEMA, Table, TargetKind, Targets, TestOutcome, TestResult, Ub, UnitOf,
+    UnitProfile, UnitTarget, Verb, ViewRef,
     frames::{self, Frames},
 };
 use blaze_cas::Store;
@@ -128,8 +128,12 @@ thread_local! {
     static KEPT_READS: Cell<usize> = const { Cell::new(0) };
     /// How many times the standard library's files were read.
     static LIBRARY_READS: Cell<usize> = const { Cell::new(0) };
-    /// Whether the program's compile gives [`APP`] as its output at [`APP_AT`].
+    /// Whether the program's compile gives [`APP`] as its output at [`APP_AT`], the file its
+    /// artifact names ([`app_artifact`]): what the build's answer waits for.
     static OUTPUT: Cell<bool> = const { Cell::new(false) };
+    /// Whether the program's compile also gives [`SIDE`] at [`SIDE_AT`], a file its artifact
+    /// does not name (as a program's hashed copy under `deps`): placed after the answer.
+    static SIDE_OUTPUT: Cell<bool> = const { Cell::new(false) };
     /// Whether the program's compile warns twice, as its unit.
     static WARNS: Cell<bool> = const { Cell::new(false) };
     /// Whether a writer's apply fails as a whole, an error of the writer's own that no unit's
@@ -187,6 +191,44 @@ const SCRIPT_AT: &str = "/w/target/debug/build/app-b/build-script-build";
 
 const APP: &[u8] = b"\x7fELF the program\n";
 const APP_AT: &str = "/w/target/debug/app";
+
+const SIDE: &[u8] = b"\x7fELF the program, under the name with its hash\n";
+const SIDE_AT: &str = "/w/target/debug/deps/app-0123";
+
+/// The program's artifact as its compile reports it: it names [`APP_AT`] and nothing else.
+fn app_artifact() -> Artifact {
+    Artifact {
+        env: Vec::new(),
+        kind: ArtifactKind::Bin,
+        path: APP_AT.into(),
+        fresh: false,
+        runner: Vec::new(),
+        target: UnitTarget {
+            doc: false,
+            kind: TargetKind::Bin,
+            name: "app".into(),
+            test: false,
+            doctest: false,
+            edition: "2021".into(),
+            src_path: "/w/src/main.rs".into(),
+            crate_types: vec![CrateType::Bin],
+        },
+        content: ContentId::of("blaze serve tests output", APP),
+        harness: true,
+        package: "path+file:///w#0.1.0".into(),
+        profile: UnitProfile {
+            test: false,
+            debuginfo: 2,
+            opt_level: "0".into(),
+            overflow_checks: true,
+            debug_assertions: true,
+        },
+        features: Vec::new(),
+        filenames: vec![APP_AT.into()],
+        executable: Some(APP_AT.into()),
+        manifest_path: "/w/Cargo.toml".into(),
+    }
+}
 
 /// A warning of the program's unit, as its compile gives it.
 fn warning_of_app(message: &str) -> Diagnostic {
@@ -1146,6 +1188,12 @@ impl Front<Fake> for FakeFront {
             puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: APP.to_vec() });
             outputs.push(Output { path: APP_AT.into(), key, executable: true, made: None });
         }
+        if unit == 3 && SIDE_OUTPUT.get() {
+            let key = blaze_cas::Key(ContentId::of("blaze serve tests output", SIDE));
+            puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: SIDE.to_vec() });
+            outputs.push(Output { path: SIDE_AT.into(), key, executable: true, made: None });
+        }
+        let artifact = (unit == 3 && OUTPUT.get()).then(app_artifact);
         let diagnostics = match unit == 3 && WARNS.get() {
             true => {
                 vec![warning_of_app("unused variable: `x`"), warning_of_app("unused import: `y`")]
@@ -1168,7 +1216,7 @@ impl Front<Fake> for FakeFront {
             puts,
             share,
             outputs,
-            artifact: None,
+            artifact,
             macros: None,
             gpu_msl: None,
             links: Vec::new(),
@@ -2317,6 +2365,105 @@ fn what_a_build_left_for_the_store_is_durable_once_it_settles_and_survives_a_cra
     }
 }
 
+/// The `errors` rows a build of `/w` whose build script's compile errs gave, and how it ended.
+fn failed_build_rows(seed: u64) -> (Option<Response>, Vec<(u64, String, String)>) {
+    use super::job::ERROR_ROWS;
+    ERROR_ROWS.with_borrow_mut(Vec::clear);
+    ERRS_COMPILE.set(Some(1));
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    ERRS_COMPILE.set(None);
+    settle(&mut daemon, &mut client);
+    (got.last().cloned(), ERROR_ROWS.with_borrow_mut(std::mem::take))
+}
+
+/// The invariant: a build that ends not ok and was not cancelled has a row in the history's
+/// `errors` table saying what failed: here the error of the unit whose compile erred, as
+/// the build said it. `builds.outcome = 'failed'` beside an empty `errors` is a failure
+/// with no cause to read (the cold build of ripgrep, 2026-11-11).
+#[test]
+fn a_build_that_fails_has_its_error_among_the_historys_error_rows() {
+    for seed in 190..194 {
+        let (done, rows) = failed_build_rows(seed);
+        assert_eq!(done, Some(Response::Done { ok: false }), "seed {seed}");
+        assert!(!rows.is_empty(), "seed {seed}: the build failed and gave the history no error");
+        assert!(
+            rows.iter().all(|(_, kind, message)| !kind.is_empty() && !message.is_empty()),
+            "seed {seed}: a row with no kind or no message: {rows:#?}"
+        );
+        let build = rows[0].0;
+        assert!(rows.iter().all(|it| it.0 == build), "seed {seed}: rows of two builds: {rows:#?}");
+    }
+}
+
+/// The planted-bug control: a daemon that notes no job's errors, as it was, gives a failed
+/// build no row.
+#[test]
+fn the_oracle_catches_a_failed_build_with_no_error_row() {
+    use super::job::PLANT_NO_ERROR_ROWS;
+    PLANT_NO_ERROR_ROWS.set(true);
+    let (done, rows) = failed_build_rows(190);
+    PLANT_NO_ERROR_ROWS.set(false);
+    assert_eq!(done, Some(Response::Done { ok: false }));
+    assert!(rows.is_empty(), "the plant notes nothing, and the oracle's check would fail: {rows:#?}");
+}
+
+/// How many units each of two builds of `/w` sized the sources of, a source file edited
+/// between them (so the view's root moves and the plan is asked again, the same as it was).
+fn sized_across_an_edit(seed: u64) -> Vec<u32> {
+    use super::job::SIZED_UNITS;
+    SIZED_UNITS.with_borrow_mut(Vec::clear);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    for text in [None, Some(&b"fn main() { }\n"[..])] {
+        if let Some(text) = text {
+            daemon.driver().change(&name("w/src/main.rs"), text);
+        }
+        let id = client.send(
+            &mut daemon,
+            Request::Build { view: ViewRef::Head("/w".into()), targets: agent() },
+        );
+        let got = client.wait(&mut daemon, id);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+        settle(&mut daemon, &mut client);
+    }
+    SIZED_UNITS.with_borrow_mut(std::mem::take)
+}
+
+/// The invariant: a build whose plan is the units its checkout's last build had (an edit of
+/// a source file: the plan is asked again and is the same) walks no unit's source
+/// directories again: what is kept by the units is found by them, because equal units of one
+/// checkout are one value. The walk was of every unit's sources, the standard library's and
+/// each dependency's among them, on the loop's thread before any unit was posted.
+#[test]
+fn an_edit_that_leaves_the_plan_as_it_was_sizes_no_unit_again() {
+    let sized = sized_across_an_edit(200);
+    assert_eq!(sized.len(), 2, "two builds: {sized:?}");
+    assert!(sized[0] > 0, "the first build of a plan sizes its units: {sized:?}");
+    assert_eq!(sized[1], 0, "the build after the edit sized units again: {sized:?}");
+}
+
+/// The planted-bug control: a plan asked again taken as units of their own, as it was, and
+/// every unit is sized again after the edit.
+#[test]
+fn the_oracle_catches_a_plan_asked_again_taken_as_new_units() {
+    use super::job::PLANT_PLAN_ANEW;
+    PLANT_PLAN_ANEW.set(true);
+    let sized = sized_across_an_edit(200);
+    PLANT_PLAN_ANEW.set(false);
+    assert_eq!(sized.len(), 2, "two builds: {sized:?}");
+    assert_eq!(sized[1], sized[0], "the oracle missed units sized again after an edit: {sized:?}");
+}
+
 fn second_checkout(sim: &mut Sim) {
     sim.change(&name("v/Cargo.toml"), b"[package]\nname = \"app\"\n");
     sim.change(&name("v/src/main.rs"), b"fn main() {}\n");
@@ -3453,6 +3600,203 @@ fn a_run_starts_only_once_its_program_is_placed() {
     assert_eq!(daemon.driver().contents(&name(&APP_AT[1..])), APP, "the program is placed whole");
     assert!(got.iter().any(|it| matches!(it, Response::Ran { code: Some(0), .. })), "{got:#?}");
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+}
+
+/// What a build of `/w` whose program has a file its answer names ([`APP_AT`]) and one it
+/// does not ([`SIDE_AT`]) looked like as its answer came, and once what it left had settled.
+struct Answered {
+    done: Option<Response>,
+    /// The named file and the other one, as the answer came.
+    app: Vec<u8>,
+    side: Vec<u8>,
+    /// How many answered jobs still had something settling as the answer came.
+    settling: usize,
+    /// The other file and its mode once all had settled, and what was lost.
+    side_after: Vec<u8>,
+    side_mode: Option<u32>,
+    lost: Vec<String>,
+}
+
+/// One build of `/w` on a disk whose writes under `slow` take 5 s, and under `full`, if
+/// given, find no room.
+fn answered(seed: u64, slow: &str, full: Option<&str>) -> Answered {
+    OUTPUT.set(true);
+    SIDE_OUTPUT.set(true);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    sim.slow_writes(name(slow), Duration::from_secs(5));
+    if let Some(full) = full {
+        sim.fill(name(full), 0);
+    }
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    let (app, side) = (name(&APP_AT[1..]), name(&SIDE_AT[1..]));
+    let (app_then, side_then) = (daemon.driver().contents(&app), daemon.driver().contents(&side));
+    let settling = daemon.jobs_settling();
+    settle(&mut daemon, &mut client);
+    OUTPUT.set(false);
+    SIDE_OUTPUT.set(false);
+    Answered {
+        done: got.last().cloned(),
+        app: app_then,
+        side: side_then,
+        settling,
+        side_after: daemon.driver().contents(&side),
+        side_mode: daemon.driver().mode(&side).map(|it| it & 0o777),
+        lost: daemon.lost().iter().map(|it| it.what.clone()).collect(),
+    }
+}
+
+/// The invariant: as a build is answered, every file its answer names is at its path whole;
+/// an output it does not name holds the answer for nothing, and is at its path whole, with
+/// its mode, once what the build left has settled, nothing lost.
+///
+/// The other output's directory is slow by 5 s: the answer comes with the named program
+/// there and the other file not yet, which is the wait an edit's answer no longer has.
+#[test]
+fn a_builds_answer_waits_for_the_files_it_names_and_places_the_rest_after() {
+    for seed in 150..158 {
+        let it = answered(seed, "w/target/debug/deps", None);
+        assert_eq!(it.done, Some(Response::Done { ok: true }), "seed {seed}");
+        assert_eq!(it.app, APP, "seed {seed}: the file the answer names is whole as it is answered");
+        assert!(
+            it.side.is_empty() && it.settling > 0,
+            "seed {seed}: the answer waited for an output it does not name ({} settling)",
+            it.settling
+        );
+        assert_eq!(it.side_after, SIDE, "seed {seed}: the other output is placed after the answer");
+        assert_eq!(it.side_mode, Some(0o755), "seed {seed}: with its mode, as under the job");
+        assert!(it.lost.is_empty(), "seed {seed}: {:#?}", it.lost);
+    }
+}
+
+/// The planted-bug control: an answer that waits for no placement at all is sent with the
+/// program it names not yet at its path (its directory slow as the other's), which is what
+/// a person's `./target/debug/app` right after the command would run into.
+#[test]
+fn the_oracle_catches_an_answer_sent_before_the_file_it_names_is_placed() {
+    use super::job::PLANT_ANSWER_WAITS_FOR_NO_OUTPUT;
+    let whole = answered(160, "w/target/debug", None);
+    assert_eq!(whole.app, APP, "the daemon as it is waits for the named file, however slow");
+    PLANT_ANSWER_WAITS_FOR_NO_OUTPUT.set(true);
+    let planted = answered(160, "w/target/debug", None);
+    PLANT_ANSWER_WAITS_FOR_NO_OUTPUT.set(false);
+    assert_ne!(planted.app, APP, "the oracle missed an answer sent before its named file was placed");
+}
+
+/// An output that fails to be placed after the answer changes no answer and is never
+/// silent: it is a loss naming the path and why, which `blaze status` shows and the
+/// checkout's next `blaze why` says first ([`super::job::Jobs::lose`]).
+#[test]
+fn an_output_that_fails_to_be_placed_after_the_answer_is_a_loss_said() {
+    let (it, reported) = stdx::assert::reported::expecting("settling", || {
+        answered(170, "w/target/debug/deps", Some("w/target/debug/deps"))
+    });
+    assert_eq!(reported, 1, "the loss is reported once");
+    assert_eq!(it.done, Some(Response::Done { ok: true }), "the answer was sent and stands");
+    assert_eq!(it.app, APP);
+    assert_ne!(it.side_after, SIDE, "the disk had no room for it");
+    assert!(
+        it.lost.len() == 1 && it.lost[0].contains("deps/app-0123"),
+        "the failure is one loss naming the path: {:#?}",
+        it.lost
+    );
+}
+
+/// What a run of `/w` asked right after a build's answer, while the build's other output is
+/// still being placed (its directory slow by 5 s), saw.
+struct RanAfter {
+    /// Still settling as the build was answered: the other output was in flight.
+    settling: usize,
+    /// The outputs the run's job queued behind an effect in flight at their path.
+    queued: Vec<String>,
+    /// The most effects in flight at one path at once.
+    most: u32,
+    /// How many of the run's job's placements were in flight as its program started.
+    started: Vec<usize>,
+    /// The other file as the run ended.
+    side: Vec<u8>,
+    ran: bool,
+    lost: usize,
+}
+
+fn run_after_an_answer(seed: u64) -> RanAfter {
+    use super::job::{MOST_AT_A_PATH, QUEUED_OUTPUTS, RUNS_STARTED_PLACING};
+    RUNS_STARTED_PLACING.with_borrow_mut(Vec::clear);
+    QUEUED_OUTPUTS.with_borrow_mut(Vec::clear);
+    MOST_AT_A_PATH.set(0);
+    OUTPUT.set(true);
+    SIDE_OUTPUT.set(true);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    sim.slow_writes(name("w/target/debug/deps"), Duration::from_secs(5));
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let id = client
+        .send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+    let settling = daemon.jobs_settling();
+    let id = client.send(
+        &mut daemon,
+        Request::Run {
+            view: ViewRef::Head("/w".into()),
+            targets: agent(),
+            bin: None,
+            args: Vec::new(),
+        },
+    );
+    let got = client.wait(&mut daemon, id);
+    let side = daemon.driver().contents(&name(&SIDE_AT[1..]));
+    settle(&mut daemon, &mut client);
+    OUTPUT.set(false);
+    SIDE_OUTPUT.set(false);
+    RanAfter {
+        settling,
+        queued: QUEUED_OUTPUTS.with_borrow_mut(std::mem::take),
+        most: MOST_AT_A_PATH.get(),
+        started: RUNS_STARTED_PLACING.with_borrow_mut(std::mem::take),
+        side,
+        ran: got.iter().any(|it| matches!(it, Response::Ran { code: Some(0), .. }))
+            && got.last() == Some(&Response::Done { ok: true }),
+        lost: daemon.lost().len(),
+    }
+}
+
+/// The invariant: an output is placed at a path only once no effect of an earlier placement
+/// is in flight there, so what the daemon starts after an answer (the next job's run) reads
+/// a file that is whole and is the one its own job made, never one an answered build is
+/// still writing: the run's job queues its output behind the answered build's, and its
+/// program starts only once that and its own look at it have ended.
+#[test]
+fn a_run_asked_right_after_an_answer_waits_for_the_output_still_being_placed() {
+    for seed in 180..188 {
+        let it = run_after_an_answer(seed);
+        assert!(it.settling > 0, "seed {seed}: the build's other output was not in flight as it was answered");
+        assert_eq!(it.queued, [SIDE_AT], "seed {seed}: the run's output waited for the one in flight");
+        assert_eq!(it.most, 1, "seed {seed}: two placements of one path were in flight at once");
+        assert_eq!(it.started, [0], "seed {seed}: the run started with a placement of its job in flight");
+        assert_eq!(it.side, SIDE, "seed {seed}: the file was whole as the run ended");
+        assert!(it.ran && it.lost == 0, "seed {seed}");
+    }
+}
+
+/// The planted-bug control: outputs placed at once whatever is in flight at their path, as
+/// before an output could outlive its job's answer: the run's job places the file while the
+/// answered build's placement of it is still in flight.
+#[test]
+fn the_oracle_catches_an_output_placed_beside_one_in_flight_at_its_path() {
+    use super::job::PLANT_NO_QUEUE;
+    PLANT_NO_QUEUE.set(true);
+    let it = run_after_an_answer(180);
+    PLANT_NO_QUEUE.set(false);
+    assert!(it.queued.is_empty(), "the plant queues nothing");
+    assert!(it.most > 1, "the oracle missed two placements of one path in flight at once");
 }
 
 #[test]

@@ -848,6 +848,7 @@ fn a_duplicate_id_is_refused_without_touching_the_first() {
 
 fn worked() -> Response {
     Response::Work(crate::Worked {
+        why: None,
         reran: 3,
         misses: 0,
         green: 9,

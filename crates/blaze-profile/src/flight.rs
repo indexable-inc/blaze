@@ -5228,6 +5228,7 @@ mod tests {
         );
         assert_eq!(typed.on, blaze_graph::wait::WaitKind::Key);
         assert!(typed.owner.is_some(), "a wait for a run says whose run it is");
+        assert_eq!(typed.by, blaze_graph::wait::OwnedBy::Job, "and that it is a job's");
         assert_eq!(
             asking.get::<span::col::Awaits>(),
             None,
@@ -5793,6 +5794,7 @@ mod tests {
                 function: span::Name::kept("fold wait"),
                 owner: None,
                 on: blaze_graph::wait::WaitKind::Channel,
+                by: blaze_graph::wait::OwnedBy::Sender,
             });
             span::close_raw(wait);
             let mut read = Read::default();

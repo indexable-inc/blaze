@@ -857,6 +857,7 @@ mod tests {
     #[test]
     fn work_is_one_json_line_in_the_form_proof_reads() {
         let worked = Worked {
+            why: None,
             reran: 12,
             misses: 0,
             green: 300,
@@ -909,6 +910,7 @@ mod tests {
              link: target/debug/deps/p.so (not spliced: exports, debug)\n"
         );
         let worked = Worked {
+            why: None,
             reran: 0,
             misses: 0,
             green: 0,

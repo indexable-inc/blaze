@@ -359,6 +359,11 @@ enum ToHistory {
     /// the task that stored the front end ([`super::work::Steps::kept_run_log`]): its
     /// `provenance` rows, written by the flush this asks for.
     Ran(Vec<ProvenanceRow>),
+    /// The errors builds said ([`super::job::Jobs::errors`]), as the history's `errors` rows:
+    /// noted for the next flush, which a build's own is as its answer is told
+    /// ([`ToHistory::Answered`], sent after these), never flushed for themselves: a build's
+    /// answer waits behind nothing of the profile.
+    Errored(Vec<blaze_profile::errors::ErrorRow>),
     /// Flush now, and tell the loop the flush's number ([`Told::Flushed`]): every row recorded
     /// before the ask is drained by this flush, so a reader that reads the manifest it
     /// committed reads them.
@@ -833,6 +838,10 @@ fn keep(
                 history.ran(rows);
                 (history.flush(None).map(drop), false)
             }
+            Ok(ToHistory::Errored(rows)) => {
+                history.errored(rows);
+                (Ok(()), false)
+            }
             Ok(ToHistory::Client(rows)) => {
                 let build = rows.build;
                 doing.set(Step::Flushing, build);
@@ -1151,6 +1160,18 @@ impl Observe {
     }
 
     /// The run log of builds that ended with their front end kept, as the history's rows
+    /// The errors builds said, as the history's `errors` rows (`Jobs::errors`): written by
+    /// the history's thread with its next flush; dropped by a daemon that keeps none.
+    pub fn errored(&mut self, rows: Vec<blaze_profile::errors::ErrorRow>) {
+        let Some(profiling) = &self.profiling else { return };
+        if profiling.ended.send(ToHistory::Errored(rows)).is_err() {
+            self.history_error = Some(
+                "the profile history's thread (`blaze-history`) is gone: no build's errors are written"
+                    .to_owned(),
+            ); // alloc: error path
+        }
+    }
+
     /// (`Jobs::ran`): written by the history's thread; dropped by a daemon that keeps none.
     pub fn ran(&mut self, rows: Vec<ProvenanceRow>) {
         let Some(profiling) = &self.profiling else { return };
@@ -1247,6 +1268,18 @@ impl Observe {
         out: &mut Vec<Reply>,
     ) {
         self.why_asked(to, Ask { all, cwd, item, build: None, unexplained: false }, now, out);
+    }
+
+    /// Why build `build` recomputed what it did ([`blaze_api::Rebuilt::summary`]), when the
+    /// history's thread has explained it and the loop has heard so by now: what the build's
+    /// own `Work` then carries ([`blaze_api::Worked::why`]), so its client asks nothing
+    /// after its `Done`. `None` when it is not explained yet: nothing waits for it here (an
+    /// answer is never held for the profile), and the client asks as before
+    /// ([`Observe::why_asked`], which waits for the explanation off the build's path).
+    pub fn summary_of(&self, build: u64) -> Option<Vec<blaze_api::Report>> {
+        let ask = Ask { all: false, cwd: None, item: None, build: Some(build), unexplained: false };
+        let rebuilt = self.answers.asked(&ask);
+        (rebuilt.build == Some(build)).then_some(rebuilt.summary)
     }
 
     /// [`Observe::rebuilt`] of all an ask can say ([`Ask`]): one build's own summary, asked by

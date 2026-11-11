@@ -26,7 +26,7 @@
 use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 use blaze_api::{
-    ApiError, Arrived, Reply, Request, RequestRef,
+    ApiError, Arrived, Reply, Request, RequestRef, Response,
     server::{Abandoned, Config as ServerConfig, Http, Server, Unix},
     session::{self, Session},
 };
@@ -2063,9 +2063,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // Each part of a turn that has a span is a child of it, so a long turn names what it
         // was inside (slow-is-p0-traced); an idle turn opens none.
         let spanned = _span.is_some();
+        // An output an answered build left being placed is under way as a job is: the work
+        // between requests (the image's pass over the database, the collections) is counted
+        // from the last answer and the last such placement, never run beside one.
         self.quiet_turns = quiet_turns_after(
             self.quiet_turns,
-            !self.jobs.idle(),
+            !self.jobs.idle() || self.jobs.placing_after() != 0,
             !done.is_empty(),
             self.plane.running() != 0,
         );
@@ -2222,6 +2225,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         for row in self.jobs.rows.drain(..) {
             self.observe.ended(row);
+        }
+        // The errors builds said, before their answers are told below: a build's own flush,
+        // as it is answered, writes them.
+        if !self.jobs.errors.is_empty() {
+            self.observe.errored(std::mem::take(&mut self.jobs.errors));
         }
         // After the rows of the same turn (a stalled build's row and its answer are one turn's),
         // and after this turn's answers went to the driver (`turn_after_wait` submits before
@@ -2900,6 +2908,26 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             } else {
                 it
             };
+            // A build that computed something again says why in its `Work` when the history's
+            // thread has explained it by now ([`Observe::summary_of`]): one round trip for
+            // its client, and no wait here when it has not.
+            let it = match it {
+                Said::Report(job, Response::Work(mut worked)) => {
+                    if let (Some(build), true) = (worked.build_id, worked.misses > 0) {
+                        let _span = tracing::info_span!(
+                            target: "blaze",
+                            "loop: why the build recomputed, for its answer",
+                            build,
+                            explained = tracing::field::Empty,
+                        )
+                        .entered();
+                        worked.why = self.observe.summary_of(build);
+                        _span.record("explained", worked.why.is_some());
+                    }
+                    Said::Report(job, Response::Work(worked))
+                }
+                it => it,
+            };
             // Every word of a job passes here once, as it is told: a build that may be answered
             // again later has what it says noted ([`Jobs::heard`]).
             self.jobs.heard(&it);
@@ -3029,7 +3057,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// the image), so a request that arrived meanwhile is taken between them, and the image's
     /// write is let go when one comes ([`Daemon::let_go_of_image`]).
     fn between(&mut self) {
-        if self.stopping.is_some() || !self.jobs.idle() || self.jobs.storing() > 0 {
+        if self.stopping.is_some()
+            || !self.jobs.idle()
+            || self.jobs.storing() > 0
+            || self.jobs.placing_after() != 0
+        {
             return;
         }
         if !self.quiet_between_requests() {

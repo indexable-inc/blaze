@@ -1067,7 +1067,7 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
     /// A literal `line!()` or `column!()` expands to, whose value lowering leaves to the code
     /// generator.
     fn is_placed(&self, expr: ExprId) -> bool {
-        let Ok(source) = self.b.source_map.expr_syntax(expr) else { return false };
+        let Ok(source) = self.b.unmoved_source_map().expr_syntax(expr) else { return false };
         let Some(call) = source.file_id.macro_file() else { return false };
         matches!(
             call.loc(self.db).def.kind,

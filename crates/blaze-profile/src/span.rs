@@ -38,7 +38,7 @@ use arrow_array::{
     cast::AsArray,
     types::{UInt32Type, UInt64Type},
 };
-use blaze_graph::wait::WaitKind;
+use blaze_graph::wait::{OwnedBy, WaitKind};
 use blaze_hash::HashMap;
 use std::alloc::Global;
 
@@ -294,7 +294,7 @@ macro_rules! enum_values {
     )*};
 }
 
-enum_values!(Outcome, WaitKind, ModuleFrom);
+enum_values!(Outcome, WaitKind, ModuleFrom, OwnedBy);
 
 /// The fields a column of value `V` may have: `V`, or `Option<V>` where it may go unsaid.
 pub trait FieldOf<V: Value>: Value {}
@@ -306,7 +306,7 @@ macro_rules! fields_of {
     )*};
 }
 
-fields_of!(Name, u64, Outcome, WaitKind, ModuleFrom);
+fields_of!(Name, u64, Outcome, WaitKind, ModuleFrom, OwnedBy);
 
 // --- Columns ----------------------------------------------------------------------------
 
@@ -606,6 +606,15 @@ pub(crate) fn open_raw<K: Span>(kind: K) -> u64 {
 
 pub(crate) fn close_raw(id: u64) {
     close_id(id);
+}
+
+/// The open `wait` span `id` was woken by job `by`: its `owner` and `owned_by` from now on, for
+/// a wait that knows its waker only as it ends (`blaze_graph::wait::wait_woken`).
+pub(crate) fn woken_raw(id: u64, by: u64) {
+    flight::said_after(id, |said| {
+        put::<col::Owner, Option<u64>>(said, Some(by));
+        put::<col::OwnedBy, OwnedBy>(said, OwnedBy::Job);
+    });
 }
 
 // --- Reading back -----------------------------------------------------------------------
@@ -947,7 +956,7 @@ span_kinds! {
         Awaits = "awaits" (Utf8): Name,
             "what a `wait` waits for: a query's key, a lock, a channel, a scope and the span its caller opened it in; every `wait` has it. For an `admission` span, what held the task back: memory, a work or io thread, or nothing";
         Owner = "owner" (U64): u64,
-            "who runs what a `wait` waits for (for a key, the job running it, as `switches.job` names it; null when not known), or the job that holds a `hold`";
+            "who runs what a `wait` waits for when that is one job (for a key, the job running it, as `switches.job` names it; for a wait that said who woke it as it ended, that job; null when `owned_by` is not `job`), or the job that holds a `hold`";
         Steps = "steps" (U64): u64,
             "the basic blocks a `macro expand` ran on the evaluator, or the instances a `build script proof` walked (the same on a cold, warm or busy daemon: the margin under its bound); null for a compiled run, a run or proof that did not end, and any other span";
         PeakBytes = "peak_bytes" (U64): u64,
@@ -976,6 +985,8 @@ span_kinds! {
             "the bytes a daemon `task`'s work freed to the global heap in all, whoever allocated them (a memo it replaced counts); null as `heap_allocated_bytes` is";
         Fields = "fields" (Utf8): Name,
             "an ad hoc span's fields that fill no other column, as `key=value` text in the order it recorded them, a space between (cut at 1 KiB): a field of any name is kept, so adding one needs no column; null for a span with none, for a span of a kind, and for one too short for a row of its own (`folded`); null in files of a blaze before it";
+        OwnedBy = "owned_by" (Dict): OwnedBy,
+            "who ends a `wait`, said by every one: `job` (its `owner` names it), or what stands in a job's place: `the scope's jobs`, `whoever sends` (a channel or a signal), `the kernel` (io), `the child`, `the lock's holder` (a thread, in `lock_waits`), `the daemon` (a client's wait for its answer, which the critical path crosses at the daemon's answer) or `not said` (a key's wait whose caller named no runner: a bug at that call); null for any other span and in files of a blaze before it";
     }
     kinds {
         /// A unit's names phase: its crate's names resolved, or its record replayed.
@@ -993,8 +1004,10 @@ span_kinds! {
         MacroExpand = "macro expand" { path: Name => Function, krate: Name => Crate }
             => MacroExpanded { steps: Option<u64> => Steps, peak_bytes: Option<u64> => PeakBytes, outcome: Outcome => Outcome }
         /// A thread or fiber blocked on `awaits` (also its `function`, which the sketches key
-        /// by), run by `owner` when known.
-        Wait = "wait" { awaits: Name => Awaits, function: Name => Function, owner: Option<u64> => Owner, on: WaitKind => WaitsOn }
+        /// by), ended by `by`: the job `owner` when `by` is a job, else what stands in a job's
+        /// place. Every wait says `by` (rule every-wait-says-what): a site that leaves it out
+        /// does not compile.
+        Wait = "wait" { awaits: Name => Awaits, function: Name => Function, owner: Option<u64> => Owner, on: WaitKind => WaitsOn, by: OwnedBy => OwnedBy }
         /// A hold of `what` by `holder`: what a waiter's `owner` names.
         Hold = "hold" { what: Name => Function, holder: u64 => Owner }
         /// A job a pool runs, `kind` the type of its closure (or of the plane's runner), from
@@ -1107,7 +1120,13 @@ mod tests {
             outcome: Outcome::MemoryLimit,
         };
         let awaits = Name::of("span kinds key");
-        let wait = Wait { awaits, function: awaits, owner: Some(7), on: WaitKind::Channel };
+        let wait = Wait {
+            awaits,
+            function: awaits,
+            owner: Some(7),
+            on: WaitKind::Channel,
+            by: OwnedBy::Job,
+        };
         let hold = Hold { what: Name::of("span kinds round"), holder: 9 };
         let tid = std::thread::spawn(move || {
             drop(UnitNames { krate, unit }.open());
