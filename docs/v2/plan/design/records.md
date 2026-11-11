@@ -92,9 +92,8 @@ refused in this slice), never another parameter.
 
 ## Lints (allow by default; errors under the edition)
 
-`blaze::many_bools`: a call passing two or more bare `true`/`false` literals by position; no
-fix, the help suggests a record parameter. `blaze::options_struct` is not built: "used only as
-that function's options" needs every use in the workspace, which a lint of one crate lacks.
+`blaze::many_bools`: a call passing two or more bare `bool` literals by position; no fix. Not
+built: `blaze::options_struct`, which needs every use of the struct in the workspace.
 
 ## MIR and codegen
 

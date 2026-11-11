@@ -17,7 +17,9 @@ use hir_def::{
 use hir_expand::name::Name;
 use rustc_type_ir::inherent::{IntoKind as _, Ty as _};
 
-use super::{Expectation, ExprIsRead, InferenceContext, InferenceDiagnostic, pat::PatInfo};
+use super::{
+    Expectation, InferenceContext, InferenceDiagnostic, expr::ExprIsRead, pat::PatInfo,
+};
 use crate::{
     next_solver::{Ty, TyKind},
     record::{RecordFields, record_fields, record_ty},
@@ -66,7 +68,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         }
     }
 
-    fn refuse_record(&self, node: impl Into<hir_def::hir::ExprOrPatIdPacked>, problem: RecordProblem) {
+    fn refuse_record(
+        &self,
+        node: impl Into<hir_def::hir::ExprOrPatIdPacked>,
+        problem: RecordProblem,
+    ) {
         self.push_diagnostic(InferenceDiagnostic::RecordRefused { node: node.into(), problem });
     }
 
@@ -78,7 +84,12 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     /// Notes each of `args` that is a record value as an argument of a call to `function`:
     /// argument `i` is the parameter `first + i` (`first` is 1 for a method call's arguments,
     /// after the receiver). Called before the arguments are checked.
-    pub(super) fn note_record_arguments(&mut self, function: FunctionId, first: u32, args: &[ExprId]) {
+    pub(super) fn note_record_arguments(
+        &mut self,
+        function: FunctionId,
+        first: u32,
+        args: &[ExprId],
+    ) {
         for (at, &arg) in args.iter().enumerate() {
             if let hir_def::hir::Expr::RecordLit { path, .. } = self.store.expr(arg)
                 && self.record_path(path).is_some()

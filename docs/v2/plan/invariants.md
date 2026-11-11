@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-8 invariants, 0 refinements, 1 reference models.
-By level: 1 tested, 7 simulated, 0 model-checked, 0 proved.
+9 invariants, 0 refinements, 1 reference models.
+By level: 2 tested, 7 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -40,6 +40,11 @@ By level: 1 tested, 7 simulated, 0 model-checked, 0 proved.
   Controls: `a_foreign_name_written_with_no_link`, `a_generation_begun_with_no_gen_row`, `a_reader_that_ignores_the_window`, `a_table_kept_across_a_park`.
 - **`every_row_is_in_the_history_once_after_any_crash`** *simulated* (`crates/blaze-profile/src/history/files/tests.rs`): whatever the faults, wherever the power goes out, every row handed to the history is listed, handed back or left to read, exactly once, and the history opens.
   Controls: `a_rename_with_no_sync_before`, `what_a_flush_consumed_marked_after_its_commit`.
+
+### hir-def
+
+- **`records_are_equal_exactly_when_their_field_sets_are`** *tested* (`crates/hir-def/src/record.rs`): two record types are equal exactly when their (name, type) sets are.
+  Controls: `field_order_in_the_key`, `a_default_in_the_type_identity`.
 
 ## Reference models
 

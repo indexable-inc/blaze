@@ -10,7 +10,7 @@
 
 use hir_def::{AdtId, StructId, lang_item::LangItems};
 use rustc_abi::Size;
-use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _, Ty as _};
+use rustc_type_ir::inherent::{IntoKind as _, Ty as _};
 
 use crate::next_solver::{
     Const, ConstKind, Consts, DbInterner, GenericArg, GenericArgKind, GenericArgs, Ty, TyKind,
