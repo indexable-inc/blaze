@@ -156,11 +156,20 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
         )]
         let lists: Vec<std::sync::OnceLock<Vec<Planned>>> =
             modules.iter().map(|_| std::sync::OnceLock::new()).collect();
+        // The listing visits every module of the check each build, edited or not: its own
+        // span, so the profile says what of a unit's check is the plan and what the sweep.
+        let listing = tracing::info_span!(
+            target: "blaze",
+            "body check plan",
+            listed_modules = modules.len(),
+        )
+        .entered();
         db.run_all(Tag::Infer, modules.len(), |db, at| {
             let mut out = Vec::new();
             list_module(db, modules[at].id, asked, &mut out);
             assert!(lists[at].set(out).is_ok(), "a module of a check was listed twice");
         });
+        drop(listing);
         let mut starts = Vec::with_capacity(modules.len() + 1);
         let mut bodies = Vec::new();
         let mut tasks = Vec::with_capacity(modules.len());
@@ -241,6 +250,24 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
             self.bodies.iter().map(|_| std::sync::OnceLock::new()).collect();
         let slots = Slots { modules: &modules, bodies: &bodies };
         let home = ptr::from_ref(db).cast::<()>().addr();
+        // The sweep: a task a module and a body of the plan, each of which asks the engine
+        // whether its memo still holds ([`body_check_clean`], [`module_check_clean`]) and is
+        // checked again only where it does not. It visits every one, so its cost is the
+        // crate's and not the edit's (on ripgrep's binary, 2026-11-11: `unit bodies` 484 ms,
+        // 283 ms of CPU, `body_check_clean` executed 6 and verified 1,149). What makes it the
+        // edit's is the engine naming the memos that changed
+        // (docs/v2/plan/design/incremental-walk.md, "The changed set from the engine");
+        // until then this span holds the sweep's wall time, and the queries that ran under
+        // it name the bodies checked again.
+        let _sweep = tracing::info_span!(
+            target: "blaze",
+            "body check sweep",
+            swept_tasks = self.tasks.len(),
+            swept_bodies = self.bodies.len(),
+            swept_modules = self.modules.len(),
+            memos_kept = self.kept,
+        )
+        .entered();
         db.run_all(Tag::Infer, self.tasks.len(), |task_db, task| {
             assert_eq!(
                 ptr::from_ref(task_db).cast::<()>().addr(),
