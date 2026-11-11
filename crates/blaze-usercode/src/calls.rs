@@ -355,29 +355,36 @@ pub fn argv0(cmdline: &[u8]) -> String {
 }
 
 impl fmt::Display for Made {
-    /// `` `getrandom` (system call 318) by process 4711 (7 in the sandbox), running
-    /// `/t/build/x/build-script-build` (argv[0] `build-script-build`), from libc
+    /// `` process 4711 (7 in the sandbox), running `/t/build/x/build-script-build` (argv[0]
+    /// `build-script-build`), made `getrandom` (system call 318) from libc
     /// (`/usr/lib/libc.so.6`, at 0x7f1c2a0e4b2d), before the program's `main` (a heuristic:
     /// ...) ``.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "`{}` (system call {}) by process {}", self.syscall, self.number, self.pid)?;
+        write!(f, "process {}", self.pid)?;
         if let Some(inside) = self.inside_pid {
             write!(f, " ({inside} in the sandbox)")?;
         }
         // What `/proc` did not give is said as `?`, never left out.
         let shown = |it: &str| if it.is_empty() { "?" } else { it };
         let (program, argv0) = (shown(&self.program), shown(&self.argv0));
+        let (syscall, number) = (&self.syscall, self.number);
         match self.what == EXEC {
-            true => write!(f, ", `{argv0}`, starting `{program}`")?,
-            false => write!(f, ", running `{program}` (argv[0] `{argv0}`)")?,
+            true => write!(
+                f,
+                ", `{argv0}`, started `{program}` by `{syscall}` (system call {number})"
+            )?,
+            false => write!(
+                f,
+                ", running `{program}` (argv[0] `{argv0}`), made `{syscall}` (system call {number})"
+            )?,
         }
         match (self.kind, self.module.is_empty()) {
             (Module::NotKnown, _) => {
-                write!(f, ", from code the sandbox could not place (its maps were not read)")?
+                write!(f, " from code the sandbox could not place (its maps were not read)")?
             }
-            (kind, true) => write!(f, ", from {} (at {:#x})", kind.name(), self.ip)?,
+            (kind, true) => write!(f, " from {} (at {:#x})", kind.name(), self.ip)?,
             (kind, false) => {
-                write!(f, ", from {} (`{}`, at {:#x})", kind.name(), self.module, self.ip)?
+                write!(f, " from {} (`{}`, at {:#x})", kind.name(), self.module, self.ip)?
             }
         }
         write!(f, ", {}", self.phase.says())
@@ -558,8 +565,9 @@ mod tests {
         let text = said(&calls, "random");
         assert_eq!(
             text,
-            "\n  by `getrandom` (system call 318) by process 4711 (7 in the sandbox), running \
-             `/t/debug/build/x-1f/build-script-build` (argv[0] `build-script-build`), from libc \
+            "\n  by process 4711 (7 in the sandbox), running \
+             `/t/debug/build/x-1f/build-script-build` (argv[0] `build-script-build`), made \
+             `getrandom` (system call 318) from libc \
              (`/usr/lib/x86_64-linux-gnu/libc.so.6`, at 0x7f1c2a0e4b2d), after its libraries were \
              loaded: in a library's constructor or in `main`, which the sandbox can't tell apart\
              \n  (2 more calls or programs were not described: a run's first 32 are)"

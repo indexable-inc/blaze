@@ -140,8 +140,8 @@ fn an_untraceable_read_names_the_process_that_made_it() {
     assert!(error.starts_with("the build script of `p v0.1.0` was proved pure"), "{error}");
     for part in [
         "(Random)",
-        "`getrandom` (system call 318) by process 4711 (7 in the sandbox)",
-        "(argv[0] `build-script-build`)",
+        "by process 4711 (7 in the sandbox)",
+        "(argv[0] `build-script-build`), made `getrandom` (system call 318)",
         "from libc (`/usr/lib/libc.so.6`, at 0x7f1c2a0e4b2d)",
         "before the program's `main` (a heuristic",
     ] {
