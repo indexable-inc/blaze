@@ -81,9 +81,11 @@ class Bound:
 
 
 # The one table. The times are for the gate's machine class and loose on purpose; the counts
-# are what the design says: zero where nothing changed.
+# are what the design says: zero where nothing changed. A comment at a line's end is held to
+# what a no-op is (2026-11-10): the no-op lane answers it at the file, with no job, no
+# lowering and no query (blaze-cargo's `serve::job::noop`, "An edit that changes no code").
 BOUNDS: tuple[Bound, ...] = (
-    Bound("ms", "ms", 300, 1000, 2000, "the client's wait: `blaze build` from its spawn to its exit",
+    Bound("ms", "ms", 300, 300, 2000, "the client's wait: `blaze build` from its spawn to its exit",
           "edits that took 25 to 39 s for days (2026-11-10)"),
     Bound("let_go", "spans", 0, 0, 0, "`kept front ends let go for memory` spans since the fixture was warm",
           "every build dropped the kept front end and lowered its program anew"),
@@ -94,11 +96,11 @@ BOUNDS: tuple[Bound, ...] = (
           "a warm edit that ran the library's queries anew, as a new front end does"),
     Bound("ran_untracked", "runs", 0, 0, None, "`query_counts.ran_untracked` summed: runs because of an untracked read",
           "`identity_of`, untracked, ran about 10,000 times on every build"),
-    Bound("executed", "runs", 0, 64, None, "`query_counts.executed` summed: every query run",
+    Bound("executed", "runs", 0, 0, None, "`query_counts.executed` summed: every query run",
           "work on a build that changed nothing"),
-    Bound("lower_ms", "ms", 5, 20, None, "the `lower workspace` spans of the build, summed",
+    Bound("lower_ms", "ms", 5, 5, None, "the `lower workspace` spans of the build, summed",
           "a comment edit spent about 200 ms lowering a workspace that had not changed"),
-    Bound("maintain_ms", "ms", 5, 20, None, "the `maintain` spans of the build, summed (`maintainer reads` is inside them)",
+    Bound("maintain_ms", "ms", 5, 5, None, "the `maintain` spans of the build, summed (`maintainer reads` is inside them)",
           "a comment edit spent about 190 ms in maintainer reads though nothing they read changed"),
     Bound("answer_delay_ms", "ms", 100, 100, 100,
           "from the end of the build's last `task` span to the end of its `request: read to reply` span",
@@ -534,8 +536,8 @@ def refused(what: str, text: str) -> None:
 FIXED: dict[Step, dict[str, float | None]] = {
     "noop": dict(ms=40, let_go=0, let_go_logged=0, ran_new=0, ran_untracked=0, executed=0, lower_ms=0, maintain_ms=0,
                  answer_delay_ms=None, turn_uncovered_ms=2, uncovered_ms=0, tasks=0),
-    "comment": dict(ms=80, let_go=0, let_go_logged=0, ran_new=0, ran_untracked=0, executed=12, lower_ms=3,
-                    maintain_ms=2, answer_delay_ms=1.5, turn_uncovered_ms=3, uncovered_ms=10, tasks=2),
+    "comment": dict(ms=80, let_go=0, let_go_logged=0, ran_new=0, ran_untracked=0, executed=0, lower_ms=0,
+                    maintain_ms=0, answer_delay_ms=1.5, turn_uncovered_ms=3, uncovered_ms=10, tasks=2),
     "body": dict(ms=300, let_go=0, let_go_logged=0, ran_new=20, ran_untracked=0, executed=90, lower_ms=40,
                  maintain_ms=30, answer_delay_ms=4, turn_uncovered_ms=8, uncovered_ms=10, tasks=6),
 }

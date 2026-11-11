@@ -537,14 +537,14 @@ Each number is held to one table, `guards.BOUNDS`, which the script reads and
 
 | Check | Unit | No-op | Comment | Body | What is counted | The finding it catches |
 |---|---|---|---|---|---|---|
-| `ms` | ms | 300 | 1000 | 2000 | the client's wait: `blaze build` from its spawn to its exit | edits that took 25 to 39 s for days (2026-11-10) |
+| `ms` | ms | 300 | 300 | 2000 | the client's wait: `blaze build` from its spawn to its exit | edits that took 25 to 39 s for days (2026-11-10) |
 | `let_go` | spans | 0 | 0 | 0 | `kept front ends let go for memory` spans since the fixture was warm | every build dropped the kept front end and lowered its program anew |
 | `let_go_logged` | lines | 0 | 0 | 0 | lines of the daemon's log, since the fixture was warm, saying a kept front end is let go | the same, from the log: "a task waits for 0.03 GiB" |
 | `ran_new` | runs | 0 | 0 | 256 | `query_counts.ran_new` summed: first runs of a row, in a database that was warm | a warm edit that ran the library's queries anew, as a new front end does |
 | `ran_untracked` | runs | 0 | 0 |  | `query_counts.ran_untracked` summed: runs because of an untracked read | `identity_of`, untracked, ran about 10,000 times on every build |
-| `executed` | runs | 0 | 64 |  | `query_counts.executed` summed: every query run | work on a build that changed nothing |
-| `lower_ms` | ms | 5 | 20 |  | the `lower workspace` spans of the build, summed | a comment edit spent about 200 ms lowering a workspace that had not changed |
-| `maintain_ms` | ms | 5 | 20 |  | the `maintain` spans of the build, summed (`maintainer reads` is inside them) | a comment edit spent about 190 ms in maintainer reads though nothing they read changed |
+| `executed` | runs | 0 | 0 |  | `query_counts.executed` summed: every query run | work on a build that changed nothing |
+| `lower_ms` | ms | 5 | 5 |  | the `lower workspace` spans of the build, summed | a comment edit spent about 200 ms lowering a workspace that had not changed |
+| `maintain_ms` | ms | 5 | 5 |  | the `maintain` spans of the build, summed (`maintainer reads` is inside them) | a comment edit spent about 190 ms in maintainer reads though nothing they read changed |
 | `answer_delay_ms` | ms | 100 | 100 | 100 | from the end of the build's last `task` span to the end of its `request: read to reply` span | a build's answer held 4 s for a disk sync of derived data |
 | `turn_uncovered_ms` | ms | 50 | 50 | 50 | the most time one `loop turn` span has that no child span of it covers | the daemon's loop thread spent 0.8 to 1.1 s in one turn with no span |
 | `uncovered_ms` | ms | 100 | 100 | 100 | the view `uncovered_time` of the build: wall time inside no span | time the profile cannot name (every-wait-says-what, slow-is-p0-traced) |
