@@ -4914,8 +4914,18 @@ pub fn inline_const_at<'db>(
 
 /// `owner`'s body built from its HIR. An `async` block's is the `Future::poll` of the block's
 /// type; by move, the future owns what its `async` closure captured, where the block itself
-/// borrows from the closure.
+/// borrows from the closure. Under `#![blaze::early_drop]` each local whose destructor only
+/// frees memory is then dropped after its last use ([`super::early_drop`]), before anything,
+/// the borrow checker first, reads the body. (`edition-e2-handles-1109` makes the same split
+/// for `#![blaze::handles]`, whose copies come first.)
 pub(crate) fn build_mir_body<'db>(db: &'db Db, owner: MirOwner<'db>) -> Result<'db, MirBody<'db>> {
+    let mut body = lower_mir_body(db, owner)?;
+    super::early_drop::drop_early(db, &mut body)?;
+    Ok(body)
+}
+
+/// `owner`'s body as lowering builds it, before [`super::early_drop`].
+fn lower_mir_body<'db>(db: &'db Db, owner: MirOwner<'db>) -> Result<'db, MirBody<'db>> {
     match owner {
         MirOwner::Body(def) => compute_mir_body(db, def),
         MirOwner::Closure(closure) => {

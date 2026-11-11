@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 #![feature(allocator_api)]
 
+pub mod drop_effects;
 pub mod effect_attrs;
 pub mod effects;
 mod function;

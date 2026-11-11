@@ -21,6 +21,7 @@ pub mod checks;
 pub mod const_check;
 mod ctfe_limit;
 pub mod dispatch;
+pub mod early_drop;
 mod eval;
 mod framed;
 pub mod home;
