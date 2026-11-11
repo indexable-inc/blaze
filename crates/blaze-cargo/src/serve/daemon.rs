@@ -1048,7 +1048,11 @@ impl From<String> for StartError {
 impl fmt::Display for StartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StartError::Image { file, fault } => write!(f, "the daemon image /{file}: {fault}"),
+            StartError::Image { file, fault } => write!(
+                f,
+                "the daemon image /{file}: {fault}; nothing of it is used and the daemon does \
+                 not start: `blaze doctor` checks it and prints the command that sets it aside"
+            ),
             StartError::Other(what) => f.write_str(what),
         }
     }
@@ -1453,6 +1457,13 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 };
                 match Database::from_image_with(config.clone(), opened) {
                     Ok(db) => {
+                        // What a key no database gave names as its first suspect
+                        // (`blaze_query::db::NeverGiven`), with `blaze doctor` to check it.
+                        blaze_query::db::note_restored(blaze_query::db::RestoredFrom {
+                            file: format!("/{image}"), // alloc: once a start
+                            format: blaze_image::LAYOUT.0.to_string(), // alloc: once a start
+                            hash: restored.hash.to_string(), // alloc: once a start
+                        });
                         started.restored = Some(restored);
                         db
                     }
@@ -3236,6 +3247,7 @@ mod tests {
         let said = error.to_string();
         assert!(said.starts_with("the daemon image /state/db/image: "), "{said}");
         assert!(said.contains("starts from no image"), "{said}");
+        assert!(said.contains("the daemon does not start: `blaze doctor` checks it"), "{said}");
     }
 
     #[test]

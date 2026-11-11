@@ -33,7 +33,9 @@ pub mod clean;
 pub mod client_rows;
 pub mod daemon;
 pub mod doc;
+pub mod doctor;
 mod duckdb;
+pub mod edits;
 pub mod fetch_url;
 pub mod fix;
 pub mod inspect;
@@ -308,6 +310,7 @@ const COMMANDS: &[&str] = &[
     "why",
     "reach",
     "slow",
+    "doctor",
     "pprof",
     "perf",
 ];
@@ -450,6 +453,7 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Why(words) => observe::why(words, auto_color()),
         Asked::Reach(words) => reach::main(words, auto_color()),
         Asked::Slow(words) => observe::slow(words, auto_color()),
+        Asked::Doctor(words) => doctor::main(words, auto_color()),
         #[cfg(feature = "native")]
         Asked::Pprof(words) => pprof::main(words, auto_color()),
         #[cfg(not(feature = "native"))]
