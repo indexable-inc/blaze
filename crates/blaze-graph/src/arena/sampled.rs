@@ -268,4 +268,97 @@ mod tests {
         }
         assert_eq!(held(21), 0);
     }
+
+    /// The invariant under threads: with eight threads putting, moving and freeing blocks of
+    /// their own (no two share an address, as no two live blocks do) beside a reader, the
+    /// table ends holding exactly the samples of the blocks each thread still holds, each
+    /// with its own words, less those a full bucket lost. A stress test on real threads, not
+    /// a simulation: the table is atomics the allocator reads in place, which `Sim` does not
+    /// drive.
+    #[test]
+    fn threads_end_with_exactly_their_held_blocks() {
+        keep();
+        const THREADS: u64 = 8;
+        const STEPS: u64 = 20_000;
+        let lost_before = lost();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let held: Vec<Vec<(u64, u64)>> = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    // A reading beside the writers hands out only whole samples: words a
+                    // thread of this test put, its marker first.
+                    each(|words| {
+                        if words[0] >> 32 == 0xb1a2e {
+                            assert_eq!(words[1], words[0] ^ 0x5555, "a torn sample");
+                        }
+                    });
+                }
+            });
+            let workers: Vec<_> = (0..THREADS)
+                .map(|thread| {
+                    scope.spawn(move || {
+                        // Each thread's addresses are its own: 16-byte blocks from its base.
+                        let base = 0x1_0000_0000u64 * (thread + 2);
+                        let mut state = 0x9E37_79B9u64 ^ thread;
+                        let mut next = || {
+                            state ^= state << 13;
+                            state ^= state >> 7;
+                            state ^= state << 17;
+                            state
+                        };
+                        let mut mine: Vec<(u64, u64)> = Vec::new(); // alloc: the test's oracle
+                        let mut made = 0u64;
+                        for _ in 0..STEPS {
+                            match next() % 4 {
+                                0 | 1 if mine.len() < 96 => {
+                                    made += 1;
+                                    let address = base + made * 16;
+                                    let id = 0xb1a2e << 32 | thread << 24 | (made & 0xff_ffff);
+                                    put(address as usize, [id, id ^ 0x5555].into_iter());
+                                    mine.push((address, id));
+                                }
+                                2 if !mine.is_empty() => {
+                                    let at = (next() % mine.len() as u64) as usize;
+                                    let (address, _) = mine.swap_remove(at);
+                                    freed(address as usize as *mut u8);
+                                }
+                                3 if !mine.is_empty() => {
+                                    let at = (next() % mine.len() as u64) as usize;
+                                    made += 1;
+                                    let to = base + made * 16;
+                                    let lifted = lift(mine[at].0 as usize as *mut u8);
+                                    land(lifted, mine[at].0 as usize as *mut u8, to as usize as *mut u8);
+                                    mine[at].0 = to;
+                                }
+                                _ => {}
+                            }
+                        }
+                        mine
+                    })
+                })
+                .collect(); // alloc: the test's threads
+            let held = workers.into_iter().map(|it| it.join().expect("a worker")).collect();
+            stop.store(true, Ordering::Relaxed);
+            reader.join().expect("the reader");
+            held
+        });
+        let mut found: Vec<u64> = Vec::new(); // alloc: the test's reading
+        each(|words| {
+            if words[0] >> 32 == 0xb1a2e {
+                found.push(words[0]);
+            }
+        });
+        found.sort_unstable();
+        let mut expected: Vec<u64> = held.iter().flatten().map(|(_, id)| *id).collect(); // alloc: the oracle
+        expected.sort_unstable();
+        let lost = (lost() - lost_before) as usize;
+        // Every sample found is of a block still held, once; what is missing was lost to a
+        // full bucket (a put or a move), and counted.
+        assert!(found.windows(2).all(|pair| pair[0] != pair[1]), "a sample twice");
+        assert!(found.iter().all(|id| expected.binary_search(id).is_ok()), "a freed block's sample");
+        assert!(expected.len() - found.len() <= lost, "{} missing, {lost} lost", expected.len() - found.len());
+        for (address, _) in held.iter().flatten() {
+            freed(*address as usize as *mut u8);
+        }
+    }
 }
