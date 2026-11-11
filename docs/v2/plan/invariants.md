@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-36 invariants, 7 refinements, 2 reference models.
-By level: 24 tested, 19 simulated, 0 model-checked, 0 proved.
+38 invariants, 7 refinements, 2 reference models.
+By level: 26 tested, 19 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -126,6 +126,13 @@ By level: 24 tested, 19 simulated, 0 model-checked, 0 proved.
 
 - **`what_is_kept_after_an_answer_survives_any_crash_and_no_lost_value_is_served`** *tested* (`crates/blaze-storemodel/src/tests.rs`): an answer may be sent on results not yet durable; nothing derived from that answer is reused across a crash unless its tickets were durable. After any crash the restore serves no value whose bytes were lost, holds everything the store called durable and everything an answered build kept, and every answer's settling ended kept or said lost. Two builds on shared and separate keys with a reader, and a snapshot beside a build, each build answering before it flushes: every schedule, a crash after every IO step, so at every point between an answer sent and its results durable; with an IO failure anywhere, so a settling that ends with the store stopped. Then two kernel gets of one identity in two worlds racing for one shape slot, each answering at once and keeping what it left once it and every store before it is durable, with an IO failure anywhere and effects completing in any order.
   Controls: `a_kept_answer_relied_on_before_its_tickets_were_durable`, `a_settling_failure_dropped_silently`.
+
+### hir-ty-pure
+
+- **`an_accepted_graph_has_no_infinite_path`** *tested* (`crates/hir-ty-pure/src/loops.rs`): a control flow graph the analysis accepts has no infinite path. For random small graphs with random bounding facts, every accepted graph, each fact's block forced through its exit once its bound is used up, has only finite paths (checked by brute force over every state).
+  Controls: `a_self_loop_not_seen_as_a_cycle`, `a_bounding_block_whose_exit_stays_inside`.
+- **`the_checker_accepts_exactly_what_is_within_its_allowance`** *tested* (`crates/hir-ty-pure/src/may.rs`): the checker accepts a crate exactly when every function's inferred effects are within its allowed set, where allowed sets flow as specified: its own mark, else its trait method's, else the nearest module's default, else nothing under the gate and anything outside it; and an impl's own mark is within its trait method's. For random small call graphs with random effect sources and random declarations.
+  Controls: `an_impl_allowed_more_than_its_trait`, `a_module_default_merged_with_a_functions_own_mark`.
 
 ## Refinements
 

@@ -1,4 +1,5 @@
-//! `nopanic`, `noalloc`, `nonblocking` and `pure` (lane pure's, docs/v2/plan/design/pure-fns.md) (`deny` by default; each fires only where the code
+//! `nopanic`, `noalloc`, `nonblocking` (the old spellings; what a function may do, `#[blaze::may(..)]`,
+//! is `may.rs`'s) and `pure` (lane pure's, docs/v2/plan/design/pure-fns.md) (`deny` by default; each fires only where the code
 //! asks for it, docs/v2/plan/design/effects.md): a function marked `#[blaze::nopanic]`,
 //! `#[blaze::noalloc]` or `#[blaze::nonblocking]` (or a method of an impl of, or a default
 //! method of, a trait so marked) that may, through any call, panic, call the global allocator or
@@ -42,12 +43,12 @@ pub(super) fn check(cx: &mut Cx<'_, '_>) {
 }
 
 /// A step of a refusal's chain at its place: the file, the range, and what the step does there.
-type StepNote = (span::FileId, syntax::TextRange, String);
+pub(super) type StepNote = (span::FileId, syntax::TextRange, String);
 
 /// The notes of `refusal`'s steps placed in `krate`'s own files (another crate's file may have
 /// no name in the build, and the message already names each step): each step but the last
 /// calls the next, the last does what the refusal is about.
-fn step_notes(
+pub(super) fn step_notes(
     db: &base_db::Db,
     krate: base_db::Crate,
     refusal: &hir_ty_pure::Refusal,

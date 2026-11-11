@@ -106,6 +106,10 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::Noalloc
         | Lint::Nonblocking
         | Lint::Pure
+        // Kept by the list itself, or with `#[expect(..)]` on the function.
+        | Lint::UndeclaredEffect
+        | Lint::UnneededEffect
+        | Lint::NegativeEffect
         | Lint::Packable
         | Lint::SoaCandidate
         | Lint::BorrowWorkaround

@@ -1076,6 +1076,12 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::lenient_deserialize", Allow, "detects a struct or enum deriving serde's `Deserialize` without `#[serde(deny_unknown_fields)]`, which silently drops a field of its input it doesn't know")
         .externally_loaded(),
+    l("blaze::undeclared_effect", Deny, "detects a function that may panic, allocate from the global heap, block the thread or not return (`diverge`), through any call, where its `#[blaze::may(..)]`, its trait method's, the default of a module around it or `#![blaze::effects]` does not allow it; and an impl's method that lists an effect its trait's method does not")
+        .externally_loaded(),
+    l("blaze::unneeded_effect", Warn, "detects a word of a private function's `#[blaze::may(..)]` for an effect the function is proved not to have")
+        .externally_loaded(),
+    l("blaze::negative_effect", Warn, "detects `#[blaze::nopanic]`, `#[blaze::noalloc]` or `#[blaze::nonblocking]` where effects are declared by what a function may do, `#[blaze::may(..)]`")
+        .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
     l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),
 ];

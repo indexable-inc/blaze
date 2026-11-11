@@ -36,6 +36,9 @@ mod dyn_in_hot_field;
 mod effects;
 #[cfg(test)]
 mod effects_tests;
+mod may;
+#[cfg(test)]
+mod may_tests;
 mod enum_vec_padded;
 mod error_debug;
 #[cfg(test)]
@@ -230,6 +233,9 @@ pub enum Lint {
     ThreadLocalInWaitingFn,
     LenientDeserialize,
     LockHeldAcrossSlow,
+    UndeclaredEffect,
+    UnneededEffect,
+    NegativeEffect,
 }
 
 /// Which workspaces a lint is for.
@@ -250,9 +256,17 @@ pub(crate) enum Kind {
 
 /// The lints that are `deny` by default rather than their kind's level: they fire only where
 /// the code asked for them (`#[blaze::checkfree]`, `#[blaze::nopanic]`, `#[blaze::noalloc]`,
-/// `#[blaze::nonblocking]`, `#[blaze::pure]`), so a finding is a broken promise.
-pub(crate) const DENY_BY_DEFAULT: &[Lint] =
-    &[Lint::Checkfree, Lint::Nopanic, Lint::Noalloc, Lint::Nonblocking, Lint::Pure];
+/// `#[blaze::nonblocking]`, `#[blaze::pure]`, and for `undeclared_effect` a `#[blaze::may(..)]`
+/// on the function, its trait or a module around it, or `#![blaze::effects]`), so a finding is
+/// a broken promise.
+pub(crate) const DENY_BY_DEFAULT: &[Lint] = &[
+    Lint::Checkfree,
+    Lint::Nopanic,
+    Lint::Noalloc,
+    Lint::Nonblocking,
+    Lint::Pure,
+    Lint::UndeclaredEffect,
+];
 
 /// The group `blaze::hot`: every lint of hot code, a hasher nobody chose included
 /// (`default_hasher`, which grew from `hot_lint.py`'s SipHash maps), and a value that leaves
@@ -392,6 +406,9 @@ impl Lint {
         Lint::ThreadLocalInWaitingFn,
         Lint::LenientDeserialize,
         Lint::LockHeldAcrossSlow,
+        Lint::UndeclaredEffect,
+        Lint::UnneededEffect,
+        Lint::NegativeEffect,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -444,7 +461,12 @@ impl Lint {
             // Its fix passes stable Rust's borrow checker too, so it is right for any crate.
             | Lint::BorrowWorkaround
             // Fires only in a crate with `#![feature(blaze_verify)]`.
-            | Lint::NativeContracts => Kind::General,
+            | Lint::NativeContracts
+            // Fire only where the code declares what a function may do (`#[blaze::may(..)]`, a
+            // module's default, `#![blaze::effects]`): `undeclared_effect` is `deny` there.
+            | Lint::UndeclaredEffect
+            | Lint::UnneededEffect
+            | Lint::NegativeEffect => Kind::General,
             // `packable`'s fix is a field with no address and a shift and mask per access,
             // and its `#[blaze::bits]` is an opt-in extension.
             Lint::DeepDropAtExit | Lint::PodSerializedByField | Lint::Packable | Lint::SoaCandidate => {
@@ -591,6 +613,9 @@ impl Lint {
             Lint::ThreadLocalInWaitingFn => "thread_local_in_waiting_fn",
             Lint::LenientDeserialize => "lenient_deserialize",
             Lint::LockHeldAcrossSlow => "lock_held_across_slow",
+            Lint::UndeclaredEffect => "undeclared_effect",
+            Lint::UnneededEffect => "unneeded_effect",
+            Lint::NegativeEffect => "negative_effect",
         }
     }
 
@@ -683,6 +708,9 @@ impl Lint {
             Lint::ThreadLocalInWaitingFn => concat!(docs!(), "#thread_local_in_waiting_fn"),
             Lint::LenientDeserialize => concat!(docs!(), "#lenient_deserialize"),
             Lint::LockHeldAcrossSlow => concat!(docs!(), "#lock_held_across_slow"),
+            Lint::UndeclaredEffect | Lint::UnneededEffect | Lint::NegativeEffect => {
+                concat!(general_docs!(), "#undeclared_effect-unneeded_effect-negative_effect")
+            }
             Lint::FiberBoundary => {
                 "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan.md"
             }
@@ -735,6 +763,15 @@ impl Lint {
             }
             Lint::LockHeldAcrossSlow => {
                 "copy out what the call needs and drop the guard before it, then take the lock again to write the result; or move the state to an atomic, `papaya::HashMap` or one owner thread"
+            }
+            Lint::UndeclaredEffect => {
+                "add the word to the function's `#[blaze::may(..)]` (`blaze check --fix` writes the list), handle the effect so the function no longer has it, or mark a callee proven by hand `#[blaze::may(.., trusted = \"why\")]` without the word"
+            }
+            Lint::UnneededEffect => {
+                "take the word off the list (`blaze check --fix` does), or keep the right to the effect with `#[expect(blaze::unneeded_effect, reason = \"..\")]`"
+            }
+            Lint::NegativeEffect => {
+                "write what the function may do, `#[blaze::may(..)]`, in place of what it may not (`blaze check --fix` rewrites it)"
             }
             Lint::BlockingOnPool => {
                 "wait through the scheduler (`blaze_graph::sched::wait`, an `Event`, a `Wait::Key`), or move the blocking call to a driver thread"
@@ -1071,6 +1108,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         box_large_new::check(cx);
         checkfree::check(cx);
         effects::check(cx);
+        may::check(cx);
         unbuffered_io::check(cx);
         stdout_lock_in_loop::check(cx);
         front_vec_ops::check(cx);

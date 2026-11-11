@@ -3989,6 +3989,7 @@ dependencies = [
  "blaze-mem",
  "blaze-query",
  "either",
+ "hegeltest",
  "hir-def",
  "hir-expand",
  "hir-ty",

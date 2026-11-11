@@ -1,8 +1,9 @@
 //! The effects of the one walk (docs/v2/plan/design/pure-fns.md, "Effects"): every kind of thing
 //! an instance may do ([`Rule`]), as the bitset ([`EffectSet`]) each instance's summary carries
 //! with a witness per kind; the attribute effects that refuse some kinds ([`EffectDef`]:
-//! `#[blaze::pure]` here, `nopanic`, `noalloc` and `nonblocking` beside it); and the toolchain's
-//! entry points a call of which counts as kinds at the call ([`MODELS`]).
+//! `#[blaze::pure]` here; beside it `nopanic`, `noalloc`, `nonblocking` and `terminates`, which
+//! `#[blaze::may(..)]` asks for by the words it leaves out, [`crate::may`]); and the
+//! toolchain's entry points a call of which counts as kinds at the call ([`MODELS`]).
 //!
 //! One walk answers every effect: checking one reads the root's summary, never walks again. A
 //! new effect is an [`EffectDef`] in [`EFFECTS`] over the kinds the walk already records, with
@@ -12,7 +13,7 @@
 use base_db::{CrateOrigin, Db};
 use hir_def::{
     AttrDefId, FunctionId, ItemContainerId, Lookup, TraitId,
-    attrs::{AttrFlags, PureAttr},
+    attrs::{AttrFlags, MayWord, PureAttr},
 };
 use hir_ty::db::HirDatabase;
 use intern::Symbol;
@@ -57,10 +58,19 @@ pub enum Rule {
     ForeignUnwind,
     /// A call only an instance decides (a generic check only).
     Open,
+    /// A loop not known to end: blocks of the body that reach themselves again, with no
+    /// bounding block (`crate::loops`).
+    Loop,
+    /// The instance can call itself again, through any calls (a cycle of instances).
+    Recursion,
+    /// A call through a function pointer or a `dyn`, or the drop of a value that may hold a
+    /// `dyn`: what it reaches was walked where the pointer or vtable was made, but it may
+    /// reach the caller again, a recursion no cycle of instances shows.
+    Indirect,
 }
 
 impl Rule {
-    pub const ALL: [Rule; 17] = [
+    pub const ALL: [Rule; 20] = [
         Rule::Io,
         Rule::Env,
         Rule::Clock,
@@ -78,6 +88,9 @@ impl Rule {
         Rule::ForeignUnknown,
         Rule::ForeignUnwind,
         Rule::Open,
+        Rule::Loop,
+        Rule::Recursion,
+        Rule::Indirect,
     ];
 
     /// What an instance with this kind does: "reads the environment".
@@ -100,6 +113,9 @@ impl Rule {
             Rule::ForeignUnknown => "calls a foreign function no table knows",
             Rule::ForeignUnwind => "calls a foreign function that may unwind",
             Rule::Open => "makes a call only an instance decides",
+            Rule::Loop => "has a loop not known to end",
+            Rule::Recursion => "may call itself again",
+            Rule::Indirect => "makes a call that may reach it again",
         }
     }
 
@@ -123,6 +139,9 @@ impl Rule {
             Rule::ForeignUnknown => "foreign_unknown",
             Rule::ForeignUnwind => "foreign_unwind",
             Rule::Open => "open",
+            Rule::Loop => "loop",
+            Rule::Recursion => "recursion",
+            Rule::Indirect => "indirect",
         }
     }
 }
@@ -179,8 +198,12 @@ impl EffectSet {
 /// impl or trait it is a method of, takes those kinds off every call of it (its body is still
 /// walked for the other effects and for build scripts).
 pub struct EffectDef {
-    /// The attribute's word: "pure".
+    /// The attribute's word: "pure". (`terminates` has no attribute of its own: it is what a
+    /// `#[blaze::may(..)]` without `diverge` asks.)
     pub name: &'static str,
+    /// The word of `#[blaze::may(..)]` that allows what this refuses: a list without it asks
+    /// for this effect. None for `pure`, which no list names.
+    pub word: Option<MayWord>,
     pub refuses: EffectSet,
     /// What the attribute on an item says: checked, trusted with a reason, or malformed.
     pub attr: fn(&Db, AttrDefId) -> Option<PureAttr>,
@@ -210,6 +233,7 @@ pub const PURE_REFUSES: EffectSet = EffectSet::of(&[
 /// `#[blaze::pure]`.
 pub const PURE: EffectDef = EffectDef {
     name: "pure",
+    word: None,
     refuses: PURE_REFUSES,
     attr: AttrFlags::pure_attr,
     says: Rule::said,
@@ -218,12 +242,14 @@ pub const PURE: EffectDef = EffectDef {
 };
 
 /// Every attribute effect, in the order each summary keeps their sets. The effects lane appends
-/// `&NOPANIC, &NOALLOC, &NONBLOCKING` (defined in `effect_attrs`).
+/// `&NOPANIC, &NOALLOC, &NONBLOCKING, &TERMINATES` (defined in `effect_attrs`). A summary's
+/// inline room (`walk::Sets`) is this many.
 pub const EFFECTS: &[&EffectDef] = &[
     &PURE,
     &crate::effect_attrs::NOPANIC,
     &crate::effect_attrs::NOALLOC,
     &crate::effect_attrs::NONBLOCKING,
+    &crate::effect_attrs::TERMINATES,
 ];
 
 /// The index of `effect` in [`EFFECTS`], by name: a copy with fewer `refuses` (a profile's
@@ -243,15 +269,54 @@ pub(crate) fn trusted(
     if let Some(PureAttr::Trusted(why)) = (effect.attr)(db, AttrDefId::FunctionId(func)) {
         return Some((why, None));
     }
+    if let Some(why) = may_trusted(db, AttrDefId::FunctionId(func), effect) {
+        return Some((why, None));
+    }
     let trait_ = match func.lookup(db).container {
         ItemContainerId::TraitId(it) => it,
         ItemContainerId::ImplId(imp) => db.impl_trait(imp)?.skip_binder().def_id.0,
         _ => return None,
     };
+    trusted_trait(db, trait_, effect).map(|why| (why, Some(trait_)))
+}
+
+/// Why `trait_` is trusted for `effect`, if it is: its `#[blaze::<effect>(trusted = "..")]`,
+/// or its `#[blaze::may(.., trusted = "..")]` that leaves the effect's word out.
+pub(crate) fn trusted_trait(db: &Db, trait_: TraitId, effect: &EffectDef) -> Option<Symbol> {
     match (effect.attr)(db, AttrDefId::TraitId(trait_)) {
-        Some(PureAttr::Trusted(why)) => Some((why, Some(trait_))),
-        _ => None,
+        Some(PureAttr::Trusted(why)) => Some(why),
+        _ => may_trusted(db, AttrDefId::TraitId(trait_), effect),
     }
+}
+
+/// The reason of `owner`'s `#[blaze::may(.., trusted = "why")]` when its list leaves out
+/// `effect`'s word: the list is taken at its word, so the item does not have the effect.
+fn may_trusted(db: &Db, owner: AttrDefId, effect: &EffectDef) -> Option<Symbol> {
+    let word = effect.word?;
+    let may = AttrFlags::may_attr(db, owner)?;
+    if may.malformed.is_some() || may.has(word) {
+        return None;
+    }
+    may.trusted
+}
+
+/// Bit `i` set for each effect `EFFECTS[i]` that a call of the trait's method `method` through
+/// a `dyn` or a type parameter cannot have: the method's `#[blaze::may(..)]`, or without one
+/// its trait's, leaves the effect's word out, and every impl's method is held within that list
+/// where it is written (`blaze::undeclared_effect`). Nothing for a method with no list.
+pub(crate) fn bound_mask(db: &Db, method: FunctionId) -> u32 {
+    let ItemContainerId::TraitId(trait_) = method.lookup(db).container else { return 0 };
+    let may = AttrFlags::may_attr(db, AttrDefId::FunctionId(method))
+        .or_else(|| AttrFlags::may_attr(db, AttrDefId::TraitId(trait_)));
+    let Some(may) = may else { return 0 };
+    if may.malformed.is_some() {
+        return 0;
+    }
+    EFFECTS
+        .iter()
+        .enumerate()
+        .filter(|(_, effect)| effect.word.is_some_and(|word| !may.has(word)))
+        .fold(0, |mask, (index, _)| mask | 1 << index)
 }
 
 /// Whether a body of `krate` is the code a person writes: a crate of the workspace. The address

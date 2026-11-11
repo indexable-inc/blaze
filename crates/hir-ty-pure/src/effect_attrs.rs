@@ -1,4 +1,5 @@
-//! `#[blaze::nopanic]`, `#[blaze::noalloc]` and `#[blaze::nonblocking]`
+//! `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]` and the effect a
+//! `#[blaze::may(..)]` without `diverge` asks for, `terminates`
 //! (docs/v2/plan/design/effects.md): their [`EffectDef`]s, and the rules and tables the walk
 //! ([`crate::walk`]) asks for the kinds of a site: an `Assert` ([`assert_rule`]), a method of an
 //! allocator ([`allocator_rule`]), a foreign function ([`foreign_kinds`]), inline assembly
@@ -19,7 +20,7 @@ use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
 use blaze_hash::HashMap;
 use hir_def::{
     AdtId, AttrDefId, FunctionId, HasModule, ItemContainerId, Lookup, ModuleDefId, ModuleId,
-    attrs::{AttrFlags, EffectWord, PureAttr},
+    attrs::{AttrFlags, EffectWord, MayWord, PureAttr},
     nameres::{ModuleData, crate_def_map},
     signatures::{FunctionSignature, StructSignature, TraitSignature},
 };
@@ -48,6 +49,7 @@ use crate::effects::{EffectDef, EffectSet, Rule};
 /// overflow checks included), no foreign call whose ABI may unwind, nothing the walk can't see.
 pub const NOPANIC: EffectDef = EffectDef {
     name: "nopanic",
+    word: Some(MayWord::Panic),
     refuses: EffectSet::of(&[Rule::Panic, Rule::Overflow, Rule::ForeignUnwind, Rule::Unchecked]),
     attr: nopanic_attr,
     says,
@@ -66,6 +68,7 @@ pub const NOPANIC_NO_OVERFLOW_CHECKS: EffectDef = EffectDef {
 /// names (`Vec::new_in(frame)`) is allowed.
 pub const NOALLOC: EffectDef = EffectDef {
     name: "noalloc",
+    word: Some(MayWord::Alloc),
     refuses: EffectSet::of(&[Rule::Alloc, Rule::ForeignUnknown, Rule::Unchecked]),
     attr: noalloc_attr,
     says,
@@ -77,12 +80,47 @@ pub const NOALLOC: EffectDef = EffectDef {
 /// condvars, channels, sleeps, joins; the blocking syscalls of [`FOREIGN`]), transitively.
 pub const NONBLOCKING: EffectDef = EffectDef {
     name: "nonblocking",
+    word: Some(MayWord::Block),
     refuses: EffectSet::of(&[Rule::Block, Rule::ForeignUnknown, Rule::Unchecked]),
     attr: nonblocking_attr,
     says,
     fix: "on a pool thread or fiber wait through the scheduler (a key, a counter, a `sched::Event`) and do IO on a driver thread, or mark a callee proven by hand `#[blaze::nonblocking(trusted = \"why\")]`",
     through_never: true,
 };
+
+/// What a `#[blaze::may(..)]` without `diverge` asks for: the function returns or panics, and
+/// never runs for ever. No loop not known to end (`crate::loops`), no recursion (an instance
+/// that can call itself again, through any calls), no call through a function pointer or a
+/// `dyn` (which may reach the caller again), nothing the walk can't see, transitively. A wait
+/// is not its business: it returns whenever every wait it makes does, and a list without
+/// `block` says there is none. It has no attribute of its own (`attr` finds none): the effect
+/// is spelled only by what a function may do, `diverge`.
+pub const TERMINATES: EffectDef = EffectDef {
+    name: "terminates",
+    word: Some(MayWord::Diverge),
+    refuses: EffectSet::of(&[
+        Rule::Loop,
+        Rule::Recursion,
+        Rule::Indirect,
+        Rule::ForeignUnknown,
+        Rule::Unchecked,
+    ]),
+    attr: no_attr,
+    says,
+    fix: "a function that may not `diverge`, and everything it calls, has only loops known to end (a counted `while i < n`) and no recursion: write it so, list `diverge`, or mark a callee proven to end by hand `#[blaze::may(.., trusted = \"why\")]` without `diverge`",
+    through_never: true,
+};
+
+/// The effect a `#[blaze::may(..)]` that leaves `word` out asks for, in a crate built with
+/// `overflow_checks` (which only `panic` reads: [`nopanic_for`]).
+pub const fn of_word(word: MayWord, overflow_checks: bool) -> &'static EffectDef {
+    match word {
+        MayWord::Panic => nopanic_for(overflow_checks),
+        MayWord::Alloc => &NOALLOC,
+        MayWord::Block => &NONBLOCKING,
+        MayWord::Diverge => &TERMINATES,
+    }
+}
 
 /// The `nopanic` a check uses for a crate built with `overflow_checks`
 /// (`hir_ty_mir::mir::overflow::crate_checks_overflow` of the crate that makes the instance):
@@ -103,6 +141,11 @@ fn nonblocking_attr(db: &Db, owner: AttrDefId) -> Option<PureAttr> {
     AttrFlags::effect_attr(db, owner, EffectWord::Nonblocking)
 }
 
+/// `terminates` has no attribute.
+fn no_attr(_: &Db, _: AttrDefId) -> Option<PureAttr> {
+    None
+}
+
 /// What a kind is said as in these effects' refusals.
 fn says(rule: Rule) -> &'static str {
     match rule {
@@ -117,6 +160,11 @@ fn says(rule: Rule) -> &'static str {
             "calls a foreign function (or runs inline assembly) blaze knows nothing of"
         }
         Rule::Unchecked => "runs code the check can't see",
+        Rule::Loop => "may run for ever: it has a loop that is not known to end",
+        Rule::Recursion => "may run for ever: it may call itself again",
+        Rule::Indirect => {
+            "may run for ever: it makes a call whose target may call it again"
+        }
         other => other.said(),
     }
 }
@@ -177,7 +225,7 @@ fn condition(block: &BasicBlock, cond: &Operand) -> Option<bool> {
 }
 
 /// The local an operand copies or moves, when it is a whole local.
-fn operand_local(operand: &Operand) -> Option<LocalId> {
+pub(crate) fn operand_local(operand: &Operand) -> Option<LocalId> {
     let (OperandKind::Copy(place) | OperandKind::Move(place)) = &operand.kind else { return None };
     place.as_ref().as_local()
 }
@@ -218,7 +266,7 @@ fn known_bits(statements: &[Statement], operand: &Operand) -> Option<u128> {
 
 /// The bits of a constant scalar operand (as `optimize::cfg::constant_bits`, which is private to
 /// the optimizer).
-fn constant_bits(operand: &Operand) -> Option<u128> {
+pub(crate) fn constant_bits(operand: &Operand) -> Option<u128> {
     match &operand.kind {
         OperandKind::Allocation { allocation } => {
             let allocation = allocation.as_ref();

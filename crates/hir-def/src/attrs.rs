@@ -587,6 +587,9 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                     (Some(Word::blaze), Some(Word::nonblocking)) => {
                         attr_flags.insert(AttrFlags::NONBLOCKING)
                     }
+                    // `#[blaze::may(panic, alloc)]`: the list is [`AttrFlags::may_attr`]'s to
+                    // read and refuse.
+                    (Some(Word::blaze), Some(Word::may)) => attr_flags.insert(AttrFlags::MAY),
                     _ => {}
                 },
             }
@@ -726,6 +729,8 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::blaze), Some(Word::nopanic)) => AttrFlags::NOPANIC,
                 (Some(Word::blaze), Some(Word::noalloc)) => AttrFlags::NOALLOC,
                 (Some(Word::blaze), Some(Word::nonblocking)) => AttrFlags::NONBLOCKING,
+                (Some(Word::blaze), Some(Word::may)) => AttrFlags::MAY,
+                (Some(Word::blaze), Some(Word::effects)) => AttrFlags::BLAZE_EFFECTS,
                 (Some(Word::blaze), Some(Word::linear)) => AttrFlags::LINEAR,
                 (Some(Word::blaze), Some(Word::consumes)) => AttrFlags::CONSUMES,
                 (Some(Word::blaze), Some(Word::reflect)) => AttrFlags::BLAZE_REFLECT,
@@ -905,6 +910,7 @@ name_set! {
     define_opaque,
     deprecated,
     diagnostic,
+    effects,
     do_not_recommend,
     doc,
     export_name,
@@ -922,6 +928,7 @@ name_set! {
     macro_export,
     macro_style,
     marker,
+    may,
     may_dangle,
     may_suspend,
     must_not_suspend,
@@ -1186,6 +1193,15 @@ bitflags::bitflags! {
         /// `#[blaze::nonblocking]` or `#[blaze::nonblocking(..)]`: as [`AttrFlags::NOPANIC`],
         /// for no call that blocks the thread (`blaze::nonblocking`).
         const NONBLOCKING = 1 << 99;
+        /// `#[blaze::may]` or `#[blaze::may(..)]` on a function, a trait or (as an inner
+        /// attribute) a module or the crate: the effects it may have, the positive spelling of
+        /// the three above and the only one of `diverge` (docs/v2/plan/design/effects.md). Inert
+        /// under rustc with `#![register_tool(blaze)]`; [`AttrFlags::may_attr`] reads the list.
+        const MAY = 1 << 101;
+        /// `#![blaze::effects]` at a crate's root: every function of the crate with no
+        /// `#[blaze::may(..)]` of its own, and no module's above it, may have no effect, checked
+        /// (the gate the blaze edition will turn on; `blaze::undeclared_effect`).
+        const BLAZE_EFFECTS = 1 << 102;
         /// `#[blaze::sealed]`, a word, on a trait: a blaze extension (inert under rustc with
         /// `#![register_tool(blaze)]`). No crate but the trait's may implement it or name it as
         /// a supertrait, and when every impl of it is for a local type, a type parameter
@@ -1728,6 +1744,10 @@ pub enum EffectWord {
 }
 
 impl EffectWord {
+    /// Every effect word, in the order of its index.
+    pub const ALL: [EffectWord; 3] =
+        [EffectWord::Nopanic, EffectWord::Noalloc, EffectWord::Nonblocking];
+
     /// The word, as written after `blaze::`.
     pub const fn text(self) -> &'static str {
         match self {
@@ -1745,6 +1765,118 @@ impl EffectWord {
             EffectWord::Nonblocking => AttrFlags::NONBLOCKING,
         }
     }
+
+    /// The word of `#[blaze::may(..)]` this spelling promises the absence of.
+    pub const fn may(self) -> MayWord {
+        match self {
+            EffectWord::Nopanic => MayWord::Panic,
+            EffectWord::Noalloc => MayWord::Alloc,
+            EffectWord::Nonblocking => MayWord::Block,
+        }
+    }
+}
+
+/// A word of `#[blaze::may(..)]`: an effect a function is allowed to have. The positive
+/// spelling: what is not listed, the function does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum MayWord {
+    /// `panic`: it may panic or abort (the absence `#[blaze::nopanic]` promises).
+    Panic,
+    /// `alloc`: it may call the global allocator (`#[blaze::noalloc]`).
+    Alloc,
+    /// `block`: it may block the thread (`#[blaze::nonblocking]`).
+    Block,
+    /// `diverge`: it may not return: a loop not proven bounded, or recursion. No negative
+    /// spelling.
+    Diverge,
+}
+
+impl MayWord {
+    /// Every word, in the order of its index and the order a list is written in.
+    pub const ALL: [MayWord; 4] =
+        [MayWord::Panic, MayWord::Alloc, MayWord::Block, MayWord::Diverge];
+
+    /// The word, as written in the list.
+    pub const fn text(self) -> &'static str {
+        match self {
+            MayWord::Panic => "panic",
+            MayWord::Alloc => "alloc",
+            MayWord::Block => "block",
+            MayWord::Diverge => "diverge",
+        }
+    }
+
+    /// The word written `text`.
+    pub fn of(text: &str) -> Option<MayWord> {
+        MayWord::ALL.into_iter().find(|it| it.text() == text)
+    }
+
+    /// Its bit in a [`MayAttr::words`].
+    pub const fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+/// What `#[blaze::may(..)]` on an item says.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MayAttr {
+    /// The words listed, a [`MayWord::bit`] each.
+    pub words: u8,
+    /// `trusted = "why"` after the words: the list is taken at its word, not checked.
+    pub trusted: Option<Symbol>,
+    /// The list's text when it is not words separated by commas with at most one
+    /// `trusted = "why"` at its end.
+    pub malformed: Option<Symbol>,
+}
+
+impl MayAttr {
+    /// Whether `word` is listed.
+    pub const fn has(&self, word: MayWord) -> bool {
+        self.words & word.bit() != 0
+    }
+}
+
+/// What the arguments of `#[blaze::may(..)]` say: words of [`MayWord`] separated by commas
+/// (each once, a trailing comma allowed), then at most one `trusted = "why"`.
+fn may_args(tt: ast::TokenTree<'_>) -> MayAttr {
+    let malformed = |words| MayAttr {
+        words,
+        trusted: None,
+        malformed: Some(Symbol::intern(&tt.syntax().text().to_string())),
+    };
+    let mut words = 0u8;
+    let mut trusted = None;
+    let mut tokens = TokenTreeChildren::new(tt).peekable();
+    while let Some(token) = tokens.next() {
+        let NodeOrToken::Token(key) = token else { return malformed(words) };
+        if key.kind() != SyntaxKind::IDENT || trusted.is_some() {
+            return malformed(words);
+        }
+        if key.text() == "trusted" {
+            let (Some(NodeOrToken::Token(eq)), Some(NodeOrToken::Token(value))) =
+                (tokens.next(), tokens.next())
+            else {
+                return malformed(words);
+            };
+            let reason = ast::String::cast(value).and_then(|it| it.value().ok());
+            match reason {
+                Some(reason) if eq.kind() == T![=] => trusted = Some(Symbol::intern(&reason)),
+                _ => return malformed(words),
+            }
+        } else {
+            match MayWord::of(key.text()) {
+                Some(word) if words & word.bit() == 0 => words |= word.bit(),
+                _ => return malformed(words),
+            }
+        }
+        match tokens.next() {
+            None => break,
+            Some(NodeOrToken::Token(comma)) if comma.kind() == T![,] => {}
+            Some(_) => return malformed(words),
+        }
+    }
+    MayAttr { words, trusted, malformed: None }
 }
 
 /// Whether `path` is the two segments `blaze::<word>`.
@@ -2133,6 +2265,35 @@ impl AttrFlags {
         }
     }
 
+    /// What `#[blaze::may(..)]` on `owner` (a function, a trait, or a module or the crate's root
+    /// for the inner attribute) says ([`MayAttr`]); `None` without it, one bit test.
+    #[inline]
+    pub fn may_attr(db: &Db, owner: AttrDefId) -> Option<MayAttr> {
+        if !AttrFlags::query(db, owner).contains(AttrFlags::MAY) {
+            return None;
+        }
+        return may_attr(db, owner);
+
+        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
+        fn may_attr(db: &Db, owner: AttrDefId) -> Option<MayAttr> {
+            collect_attrs(db, owner, |attr| {
+                let read = match attr {
+                    ast::Meta::PathMeta(attr) if is_blaze_word(attr.path(), "may") => {
+                        MayAttr { words: 0, trusted: None, malformed: None }
+                    }
+                    ast::Meta::TokenTreeMeta(attr) if is_blaze_word(attr.path(), "may") => {
+                        match attr.token_tree() {
+                            Some(tt) => may_args(tt),
+                            None => MayAttr { words: 0, trusted: None, malformed: None },
+                        }
+                    }
+                    _ => return ControlFlow::Continue(()),
+                };
+                ControlFlow::Break(read)
+            })
+        }
+    }
+
     /// What `#[blaze::nopanic]`, `#[blaze::noalloc]` or `#[blaze::nonblocking]` (`effect`) on
     /// `owner` says, in the shape of `#[blaze::pure]`'s ([`PureAttr`]: checked, trusted with
     /// its reason, or malformed); `None` without it, one bit test.
@@ -2144,12 +2305,12 @@ impl AttrFlags {
         // clone: a handle of an interned reason
         return effect_attrs(db, owner)[effect as usize].clone();
 
-        /// The three effect attributes of `owner` at once, by [`EffectWord`]'s index: an
+        /// The effect attributes of `owner` at once, by [`EffectWord`]'s index: an
         /// item with one of them has the others read in the same pass over its attributes.
         #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
         fn effect_attrs(db: &Db, owner: AttrDefId) -> [Option<PureAttr>; 3] {
             let mut read: [Option<PureAttr>; 3] = [None, None, None];
-            for effect in [EffectWord::Nopanic, EffectWord::Noalloc, EffectWord::Nonblocking] {
+            for effect in EffectWord::ALL {
                 let word = effect.text();
                 read[effect as usize] = collect_attrs(db, owner, |attr| {
                     let it = match attr {
