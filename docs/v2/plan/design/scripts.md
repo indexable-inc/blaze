@@ -229,11 +229,18 @@ the row says otherwise.
 | docs | `python3 tools/docs.py check` | `R docs -- check` | on a clean tree: nothing printed, status 0. Then on a tree with each of these planted, one at a time: a new `x.py`; a line `gone.py` added to `tools/python-allowed.txt`; a link to `nope.md` and a link to the anchor `#nope` of `harness.md` in a current doc; `` `crates/nope` `` and `BLAZE_NOPE` in a current doc; a doc with no front matter; `status: draft`: the same lines on standard error, status 1 |
 | docs | `python3 tools/docs.py write` | `R docs -- write` | after each, `git status --short` is empty on a clean tree; with a doc's `summary` changed, `docs/README.md` is the same bytes from both (`git diff` after one, then the other) |
 | docs | `python3 tools/docs.py python '{"left": 0}'`, `'{"left": 166}'`, `'{"lft": 1}'`, `'{}'`, `'{"left": true}'`, `'[1]'` | `R docs -- python <the same>` | all but the JSON syntax error's words after `the input is not JSON:` (none of these inputs has one) |
+| ledger | `uv run --frozen python harness/v2/ledger.py selftest` | `R ledger -- selftest` | output (`ledger.py selftest: ok`), status 0 |
+| ledger | `... ledger.py '{"command": "check"}'` | `R ledger -- '{"command": "check"}'` | clean tree: silent, status 0; with a row's `known` edited in objectives.json: the stale-table line, status 1; with a row's `paths` naming a missing path, an id used twice, `{"command": "chek"}`, `{"comand": "check"}`, no argument (the usage and the docstring): the same lines, status 1 |
+| ledger | `... ledger.py '{"command": "write"}'` | `R ledger -- '{"command": "write"}'` | `git status --short` empty after each on a clean tree; after a row's `known` is edited, objectives.json and objectives.md are the same bytes from both |
+| ledger | `... ledger.py '{"command": "pick", "count": 4}'`, and `"count": 1` | `R ledger -- <the same>` | output, status 0 |
+| ledger | `... ledger.py '{"command": "run", "engine": {"kind": "v2", "blaze": "<blaze>"}, "ids": ["V10"], "work": "/tmp/l-py"}'` | the same with `"work": "/tmp/l-rs"` | the lines printed and the status; objectives.json and objectives.md the same bytes (V10's check, `diff_rules.py check`, needs no blaze); `"ids": ["nope"]`: `ledger.py: no row nope`, status 1; without `engine`: `ledger.py: run needs \`engine\``, status 1 |
 
 Known differences, on purpose: the words of a JSON syntax error are serde_json's; a heading's
 anchor keeps a character by Rust's `char::is_alphanumeric` and a table of combining-mark blocks
 where Python asked `str.isalnum` and Unicode category M (no heading of docs/ tells them apart:
-the clean-tree `check` proves it).
+the clean-tree `check` proves it). The ledger's default `work` directory is
+`/tmp/ledger-<pid>-<nanoseconds>` where Python's `mkdtemp` chose a random name, and its date is
+`date +%Y-%m-%d`'s.
 
 ## Appendix: every Python file
 

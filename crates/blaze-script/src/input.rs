@@ -218,6 +218,52 @@ impl Fields<'_> {
             .collect()
     }
 
+    /// A required `tuple[str, ...]` field.
+    pub fn strs_required(&self, name: &str) -> Result<Vec<String>, InputError> {
+        match self.get(name) {
+            None => self.required(name, None),
+            Some(_) => self.strs(name),
+        }
+    }
+
+    /// A `tuple[Literal[...], ...]` field of strings, `default` when it was not given.
+    pub fn ones_of(&self, name: &str, allowed: &[&str], default: &[&str]) -> Result<Vec<String>, InputError> {
+        let Some(value) = self.get(name) else { return Ok(default.iter().map(|it| (*it).to_owned()).collect()) };
+        let Value::Array(items) = value else { return Err(self.not_a(name, "list", value)) };
+        items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| match item {
+                Value::String(it) if allowed.contains(&it.as_str()) => Ok(it.clone()),
+                other => Err(self.not_one_of(&format!("{name}[{i}]"), allowed, other)),
+            })
+            .collect()
+    }
+
+    /// A `tuple[T, ...]` field of objects, each read into `T`; `required` refuses its absence,
+    /// and otherwise it is empty when not given.
+    pub fn objects<T: Input>(&self, name: &str, required: bool) -> Result<Vec<T>, InputError> {
+        let Some(value) = self.get(name) else {
+            return if required { self.required(name, None) } else { Ok(Vec::new()) };
+        };
+        let Value::Array(items) = value else { return Err(self.not_a(name, "list", value)) };
+        items.iter().enumerate().map(|(i, item)| of::<T>(item, &format!("{}[{i}]", self.at(name)))).collect()
+    }
+
+    /// An `Any` field: the value as given, null when it was not.
+    pub fn any(&self, name: &str) -> Value {
+        self.get(name).cloned().unwrap_or(Value::Null)
+    }
+
+    /// A field that is itself an object read into `T`, required: its absence and a null are
+    /// refused.
+    pub fn object_required<T: Input>(&self, name: &str) -> Result<T, InputError> {
+        match self.get(name) {
+            None => self.required(name, None),
+            Some(value) => of::<T>(value, &self.at(name)),
+        }
+    }
+
     /// A field that is itself an object read into `T`, `None` when it was not given or is null
     /// (`T | None = None`); `required` refuses its absence.
     pub fn object<T: Input>(&self, name: &str, required: bool) -> Result<Option<T>, InputError> {

@@ -6,7 +6,7 @@
 //!   refusals `tools/typed-input` gave, word for word.
 //! - [`pyjson`]: JSON written as Python's `json.dumps` writes it, so a generated file comes out
 //!   byte for byte as the Python script wrote it.
-//! - [`run`], [`git`]: a program run with its output captured.
+//! - [`run`], [`git`], [`run_shown`]: a program run, its output captured or shown.
 //! - [`fail`], [`expect`]: how a script ends in an error, and how its `selftest` checks.
 //!
 //! When a release carries bstd and reflection, a script's `Input::parse` is derived
@@ -74,6 +74,20 @@ pub fn run(argv: &[&str], cwd: &Path) -> Result<Ran, String> {
         .output()
         .map_err(|e| format!("{program} did not start in {}: {e}", cwd.display()))?;
     Ok(Ran { status: done.status.code().unwrap_or(-1), stdout: done.stdout, stderr: done.stderr })
+}
+
+/// Runs `argv` in `cwd` with this process's standard input, output and error, as Python's
+/// `subprocess.run(argv, cwd=cwd)`: its exit status, -1 when a signal ended it.
+pub fn run_shown(argv: &[&str], cwd: &Path) -> Result<i32, String> {
+    let (program, args) = argv.split_first().ok_or_else(|| "no program to run".to_owned())?;
+    #[allow(clippy::disallowed_methods, reason = "as `run`: a script starts a program here; `cwd` is always given")]
+    let mut command = Command::new(program);
+    let status = command
+        .args(args)
+        .current_dir(cwd)
+        .status()
+        .map_err(|e| format!("{program} did not start in {}: {e}", cwd.display()))?;
+    Ok(status.code().unwrap_or(-1))
 }
 
 /// `git <args>` in `root`: its standard output, or `Err` with what it said when it failed.
