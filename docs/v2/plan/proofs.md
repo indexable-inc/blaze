@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-83 theorems: 70 in `lean`, 13 in `lean/analysis`.
+84 theorems: 71 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -809,4 +809,12 @@ theorem execStmt_absorb {B : FnId → Local → Prop} {g : List (Nat × FnId)} (
   | [], st, _, _, _, _ => (Outcome.map_same (execStmt adts st s)).symm
   | r :: rest, st, hs, hfn, htop, hreps => by
     have hr : RepFits B g top s r
+```
+
+**`Blaze.Mir.Opt.stmtLive_dead`** (`Blaze.Mir.Opt.Liveness`, `lean`): Under a liveness certificate the check accepts, a local dead before a statement is stored to whole by it, or is not mentioned and is dead after it.
+
+```lean
+theorem stmtLive_dead (n : Nat) (before after : List Local) (s : Statement) (l : Local)
+    (h : stmtLive n before after s = true) (hl : l < n) (hd : has l before = false) :
+    isOverwrite l s = true ∨ (stmtFine l s = true ∧ has l after = false)
 ```

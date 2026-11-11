@@ -629,4 +629,45 @@ example : Opt.validateSym (viaCopy 2 1) (viaCopy 1 1) [] = true := by decide
 
 example : isInt ScalarTy.U32 6 ((viaCopy 1 1).call 1 0 [] [u32 5]) = true := by decide
 
+/-! Liveness as a certificate. A store dead across blocks: local 1 is stored in block 0 and
+stored again in block 1 before it is read. The certificate lists the locals live before
+each statement and before each terminator; the check accepts it, the pass removes the first
+store, and a certificate that calls local 1 dead where it is read is refused. -/
+
+def storeAcross : Program :=
+  { adts := [],
+    fns :=
+      [{ name := "storeAcross", args := 0, locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32],
+         blocks :=
+           [{ stmts :=
+                [Statement.assign (Place.mk 1 [])
+                   (Rvalue.use (Operand.const (Const.int ScalarTy.U32 5)))],
+              terminator := Terminator.goto 1 },
+            { stmts :=
+                [Statement.assign (Place.mk 1 [])
+                   (Rvalue.use (Operand.const (Const.int ScalarTy.U32 7))),
+                 Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 1 [])))],
+              terminator := Terminator.ret }] }] }
+
+def liveAcross : List (List (List (List Local))) := [[[[], []], [[], [1], [0]]]]
+
+example : Opt.checkLiveness storeAcross liveAcross = true := by decide
+
+/-- Local 1 called dead before the statement that reads it. -/
+example : Opt.checkLiveness storeAcross [[[[], []], [[], [], [0]]]] = false := by decide
+
+/-- Local 0 called dead before the `ret` that returns it. -/
+example : Opt.checkLiveness storeAcross [[[[], []], [[], [1], []]]] = false := by decide
+
+example :
+    (Opt.removeDead liveAcross Opt.refsOf storeAcross).fns.map
+        (fun body => body.blocks.map (fun blk => blk.stmts.map Opt.isNop)) =
+      [[[true], [false, false]]] := by
+  decide
+
+example :
+    isInt ScalarTy.U32 7 ((Opt.removeDead liveAcross Opt.refsOf storeAcross).call 4 0 [] []) =
+      true := by
+  decide
+
 end Blaze.Mir.Tests

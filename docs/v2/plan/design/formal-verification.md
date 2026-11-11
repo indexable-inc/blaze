@@ -751,11 +751,24 @@ programs; it is the specification of the Rust pass of the same name.
     replaced; `execStmt_puts`, a statement through the list (checked at e51837e3a0);
     `execStmt_absorb`, the same with the entries the statement stores to leaving the list
     (`keepReps`), and `puts_append`, a replacement after the list as one more entry, which
-    is what a removed store adds (not yet elaborated).
-  - **Left to build, in order:** (c) `checkLiveness` and its two facts (a local dead on entry and not
-    written is dead on exit; the removed store's local is dead after it); (d) terminators,
-    calls and returns on related states; (e) `removeDead_refines` through `run_refines_inv`
-    with the invariant "related, and the source holds `Borrows`".
+    is what a removed store adds (not yet elaborated). (c) `Opt/Liveness.lean`: the
+    certificate (per function and block, the locals live before each statement and before
+    the terminator), `checkLiveness`, what a passed check says of one statement
+    (`stmtLive_dead`: a local dead before it is stored to whole, or not mentioned and dead
+    after), and the pass `removeDead`, with examples the kernel evaluates (not yet
+    elaborated). There is no theorem about `removeDead` until (d) and (e).
+  - **Left to build, in order.** (d) Terminators on states related by `puts`: operands and
+    places through the list (as `execStmt_puts`, from the single-slot lemmas of
+    `Opt/SlotExec.lean` and `Opt/SlotExecFar.lean`); a jump (`State.put` commutes with
+    `withTopBlock`: `Opt/MemMap.lean`'s `State.setSlot_mapStack`); a call (the new frame's
+    id is above every entry's, so the entries commute with the push); a return (the
+    callee's entries go with its frame, the write of the destination absorbs or commutes).
+    Then the block: an induction over the statements with the points, where a kept
+    statement is `execStmt_absorb` by `stmtLive_dead`, and a removed store puts
+    `(top, l, init v)` in front of the list (`State.write_whole`, `rvalueCalm`).
+    (e) `removeDead_refines` through `run_refines_inv`, with the invariant "the source is
+    `puts` of the target by a list whose entries are dead at their frames' resume points
+    and never borrowed, and the source holds `Borrows`".
 - **A validator proved sound** (`Opt/Validate.lean`). `validate a b` accepts when the two
   programs have one normal form under the proved rewrites; `validate_sound`: an accepted
   pair runs alike for every fuel and state. It takes no witness and accepts only what the
