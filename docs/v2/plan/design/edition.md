@@ -45,6 +45,7 @@ it.
 | 8 | **Contracts and pattern types.** `requires` and `ensures` on a function; `usize is 1..` puts a range in the type, and `Conn is Conn::Open { .. }` a variant. | preconditions in doc comments, restated checks, `unreachable!()` after a match already made | [contracts](contracts.md), here | medium |
 | 9 | **Compile-time reflection.** `for const f in fields_of::<T>()` in ordinary typed code. | most derive proc macros | [comptime](comptime.md) | large |
 | 10 | **`&uniq T`.** The unique reference is spelled for what it guarantees. `&mut T` means the same and is the old spelling. | the belief that `&` means immutable and `&mut` means mutable | here | small |
+| 11 | **Portable SIMD.** The pinned nightly's `core::simd` with no `#![feature]`, `simd::native_lanes!`, and `#[blaze::multiversion]` (`#![blaze::simd]`). Availability and code generation, no new syntax, so it is not counted among the ten. | `#![feature(portable_simd)]`, per-architecture `core::arch` code, hand-written feature dispatch | [simd](simd.md) | medium |
 
 ### Rules for the four that have no spec yet
 

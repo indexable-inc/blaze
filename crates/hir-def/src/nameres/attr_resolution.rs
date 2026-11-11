@@ -157,6 +157,11 @@ impl DefMap {
                         // `blaze::std_use` beneath it; the effects it will make errors are
                         // not built.
                         | "capabilities"
+                        // `#![blaze::simd]`, read from the crate root's attributes where
+                        // `#![feature]` is, and `#[blaze::multiversion]`, from
+                        // `AttrFlags::BLAZE_MULTIVERSION` (docs/v2/plan/design/simd.md).
+                        | "simd"
+                        | "multiversion"
                 )
             {
                 return true;

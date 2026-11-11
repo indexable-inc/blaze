@@ -139,7 +139,9 @@ pub use opaques::{rpit_hidden_types, tait_hidden_types};
 pub use specialization::{
     SpecializationMode, impl_unconstrained_params, specialization_mode, specialized_ancestor,
 };
-pub use target_feature::{TargetFeature, TargetFeatureSet, TargetFeatures, crate_target_features};
+pub use target_feature::{
+    TargetFeature, TargetFeatureSet, TargetFeatures, crate_target_features, multiversion_plan,
+};
 pub use traits::{
     ParamEnvAndCrate, SealedOpen, check_orphan_rules, declares_sealed, param_is_sized,
     relaxed_uncovered_input, sealed_bounds, sealed_closure, sealed_in_graph, sealed_local_bound,

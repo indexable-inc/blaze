@@ -595,6 +595,11 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                     // `#[blaze::may(panic, alloc)]`: the list is [`AttrFlags::may_attr`]'s to
                     // read and refuse.
                     (Some(Word::blaze), Some(Word::may)) => attr_flags.insert(AttrFlags::MAY),
+                    // `#[blaze::multiversion("x86-64-v3", "avx512f")]`; the levels are
+                    // [`AttrFlags::multiversion_levels`]'s to read.
+                    (Some(Word::blaze), Some(Word::multiversion)) => {
+                        attr_flags.insert(AttrFlags::BLAZE_MULTIVERSION)
+                    }
                     _ => {}
                 },
             }
@@ -741,6 +746,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::blaze), Some(Word::consumes)) => AttrFlags::CONSUMES,
                 (Some(Word::blaze), Some(Word::reflect)) => AttrFlags::BLAZE_REFLECT,
                 (Some(Word::blaze), Some(Word::sealed)) => AttrFlags::BLAZE_SEALED,
+                (Some(Word::blaze), Some(Word::multiversion)) => AttrFlags::BLAZE_MULTIVERSION,
                 (Some(Word::clippy), Some(Word::has_significant_drop)) => {
                     AttrFlags::HAS_SIGNIFICANT_DROP
                 }
@@ -938,6 +944,7 @@ name_set! {
     may,
     may_dangle,
     may_suspend,
+    multiversion,
     must_not_suspend,
     must_use,
     naked,
@@ -1253,6 +1260,13 @@ bitflags::bitflags! {
         /// reflection reads and writes every field, private ones too (`hir_ty_comptime`'s
         /// `struct_domain`, docs/v2/plan/design/comptime.md "Which fields").
         const BLAZE_REFLECT = 1 << 124;
+        /// `#[blaze::multiversion]`, a word or with a list of levels, on a function: a blaze
+        /// extension (inert under rustc with `#![register_tool(blaze)]`), the function is
+        /// compiled once per level of target features and the best one the CPU has is picked
+        /// when the program starts (docs/v2/plan/design/simd.md). The levels are
+        /// [`AttrFlags::multiversion_levels`]'s; it changes code generation only, never what
+        /// the function means.
+        const BLAZE_MULTIVERSION = 1 << 125;
         /// `#[clippy::has_significant_drop]`, a word, on a struct or enum: dropping a value of
         /// it does something another part of the program can see (releases a lock, ends a
         /// borrow), read by blaze-lints' `significant_drop_tightening`. It changes diagnostics,
@@ -1950,6 +1964,13 @@ pub enum BitsBacking {
     Explicit(rustc_abi::Integer),
     /// `#[blaze::bits(..)]` with arguments that are none of these: their text, for the error.
     Malformed(Symbol),
+}
+
+/// Whether `path` is the two segments `blaze::multiversion`.
+fn is_blaze_multiversion(path: Option<ast::Path<'_>>) -> bool {
+    path.and_then(up_to_two_segments).is_some_and(|(first, second)| {
+        name_text(first) == "blaze" && second.is_some_and(|it| name_text(it) == "multiversion")
+    })
 }
 
 /// Whether `path` is the two segments `blaze::bits`.
@@ -2685,6 +2706,40 @@ impl AttrFlags {
             ControlFlow::Continue(())
         });
         result
+    }
+
+    /// The levels `#[blaze::multiversion(..)]` on `owner` names, in the order written (least
+    /// preferred first): each string literal of its list. `None` without the attribute, one
+    /// bit test; `Some` of no level for the bare word, which asks for the target's defaults
+    /// (`target_features::multiversion::default_levels`). A token of the list that is no
+    /// string literal is kept as its text, so the plan refuses it by name. Read once per
+    /// multiversioned function a unit compiles, so it is no query.
+    pub fn multiversion_levels(db: &Db, owner: FunctionId) -> Option<Vec<Symbol>> {
+        if !AttrFlags::query(db, owner.into()).contains(AttrFlags::BLAZE_MULTIVERSION) {
+            return None;
+        }
+        // alloc: only a function with `#[blaze::multiversion]`; the caller owns the list
+        let mut levels = Vec::new();
+        collect_attrs::<Infallible>(db, owner.into(), |attr| {
+            if let ast::Meta::TokenTreeMeta(attr) = attr
+                && is_blaze_multiversion(attr.path())
+                && let Some(tt) = attr.token_tree()
+            {
+                for token in TokenTreeChildren::new(tt) {
+                    let NodeOrToken::Token(token) = token else { continue };
+                    if token.kind() == T![,] {
+                        continue;
+                    }
+                    let level = match ast::String::cast(token).and_then(|it| it.value().ok()) {
+                        Some(level) => Symbol::intern(&level),
+                        None => Symbol::intern(token.text()),
+                    };
+                    levels.push(level);
+                }
+            }
+            ControlFlow::Continue(())
+        });
+        Some(levels)
     }
 
     /// What `#[doc(test(attr(..)))]` on `owner` (cfg_attr expanded, a crate root's inner and

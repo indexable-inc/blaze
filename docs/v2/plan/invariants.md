@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-50 invariants, 16 refinements, 5 reference models.
-By level: 47 tested, 19 simulated, 0 model-checked, 0 proved.
+52 invariants, 16 refinements, 5 reference models.
+By level: 49 tested, 19 simulated, 0 model-checked, 0 proved.
 
 ## Invariants
 
@@ -169,6 +169,13 @@ By level: 47 tested, 19 simulated, 0 model-checked, 0 proved.
   Controls: `a_self_loop_not_seen_as_a_cycle`, `a_bounding_block_whose_exit_stays_inside`.
 - **`the_checker_accepts_exactly_what_is_within_its_allowance`** *tested* (`crates/hir-ty-pure/src/may.rs`): the checker accepts a crate exactly when every function's inferred effects are within its allowed set, where allowed sets flow as specified: its own mark, else its trait method's, else the nearest module's default, else nothing under the gate and anything outside it; and an impl's own mark is within its trait method's. For random small call graphs with random effect sources and random declarations.
   Controls: `an_impl_allowed_more_than_its_trait`, `a_module_default_merged_with_a_functions_own_mark`.
+
+### target-features
+
+- **`the_selected_clone_is_supported_and_the_best`** *tested* (`crates/target-features/src/multiversion.rs`): the clone selected is supported by the CPU (every feature it adds to the unit is present), and no supported clone is declared after it; the baseline is selected only when no clone is supported.
+  Controls: `a_clone_the_cpu_lacks`, `the_baseline_chosen_over_a_supported_clone`, `two_clones_of_one_set`.
+- **`clones_never_share_a_feature_set`** *tested* (`crates/target-features/src/multiversion.rs`): no two clones of a plan have one feature set, and none has the unit's, so the baseline and the clones are compiled with pairwise different sets and (their feature names being part of an instance's shape) never share a code identity.
+  Controls: `a_clone_the_cpu_lacks`, `the_baseline_chosen_over_a_supported_clone`, `two_clones_of_one_set`.
 
 ## Refinements
 
