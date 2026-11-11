@@ -171,14 +171,37 @@ pub(super) const STOP_SETTLES_WITHIN: Duration = Duration::from_secs(30);
 /// How many quiet turns after the last request was read the work between requests waits for
 /// (the collections, the settle's image, whose making is a pass over the whole database on
 /// the loop's thread: 65 to 137 ms on a small program, 2026-11-10). A quiet turn took no
-/// completion with no plane task running: the loop's idle poll, 50 ms each, so about half a
-/// second. Counted in turns, not on the clock, so it is the same under the simulation, whose
+/// completion with no plane task running and no job under way ([`quiet_turns_after`]): the
+/// loop's idle poll, 50 ms each, so about half a second after the last answer. Counted in turns, not on the clock, so it is the same under the simulation, whose
 /// clock stands still while nothing is in flight. Requests come in runs (an edit, a build, a
 /// build again): a request read while that work ran waited behind it, 130 ms for an answer
 /// that takes 0.1 ms. The work is for the next start and for memory, never for a request, so
 /// it runs once the daemon has been quiet this long, and not at all while a request is read
 /// and held for its checkout's watcher.
 pub(super) const QUIET_BEFORE_BETWEEN: u32 = 10;
+
+/// [`Daemon::quiet_turns`] after a turn, from the count `before` it: none while a job is under
+/// way (`under_way`), one more for a turn that took no completion (`took`) with no plane task
+/// running (`running`), else as it was.
+///
+/// A job under way is not quiet, whatever its turns take: a build whose outputs were being
+/// placed turned with no completion and no plane task for its whole wait, so the count was
+/// past [`QUIET_BEFORE_BETWEEN`] the turn it was answered, and the image was made in the
+/// turns right after the answer (`image make` 91 ms on the loop), which is when the client
+/// that got the answer asks its next thing: its `why` waited 92 ms behind it (2026-11-11).
+/// Counted from the last answer, the image is made half a second after it.
+pub(super) const fn quiet_turns_after(
+    before: u32,
+    under_way: bool,
+    took: bool,
+    running: bool,
+) -> u32 {
+    match (under_way, took || running) {
+        (true, _) => 0,
+        (false, false) => before.saturating_add(1),
+        (false, true) => before,
+    }
+}
 /// How often the plane's and the memory's plots are written to the flight recorder, at most.
 const PLOT_EVERY: Duration = Duration::from_millis(10);
 /// How often the memory by tag goes to the log while the daemon works, at most.
@@ -594,9 +617,9 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// Each request read and not yet told it is done, with its `request: read to reply` span
     /// ([`Daemon::arrive`], [`Daemon::reply`]); a connection's go as it ends.
     answering: Vec<(RequestRef, tracing::Span)>,
-    /// How many turns in a row, since a request was last read, took no completion with no
-    /// plane task running: the work between requests waits for [`QUIET_BEFORE_BETWEEN`] of
-    /// them ([`Daemon::between`]).
+    /// How many turns in a row, since a request was last read and since a job was last under
+    /// way, took no completion with no plane task running ([`quiet_turns_after`]): the work
+    /// between requests waits for [`QUIET_BEFORE_BETWEEN`] of them ([`Daemon::between`]).
     quiet_turns: u32,
     failed: Option<Failed>,
     /// Its place in the machine's memory ledger ([`Options::machine`]); held so it leaves as the
@@ -2034,9 +2057,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // Each part of a turn that has a span is a child of it, so a long turn names what it
         // was inside (slow-is-p0-traced); an idle turn opens none.
         let spanned = _span.is_some();
-        if done.is_empty() && self.plane.running() == 0 {
-            self.quiet_turns = self.quiet_turns.saturating_add(1);
-        }
+        self.quiet_turns = quiet_turns_after(
+            self.quiet_turns,
+            !self.jobs.idle(),
+            !done.is_empty(),
+            self.plane.running() != 0,
+        );
         let part = spanned.then(|| {
             tracing::info_span!(target: "blaze", "loop turn: completions", count = done.len())
                 .entered()
@@ -3005,7 +3031,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         if self.jobs.ended {
             self.jobs.ended = false;
-            let _span = tracing::info_span!(target: "blaze", "between requests: collect").entered();
+            let _span = tracing::info_span!(
+                target: "blaze",
+                "between requests: collect",
+                quiet_turns = self.quiet_turns
+            )
+            .entered();
             self.db.collect(&[self.steps.plan_key()], &mut self.effects);
             if let Some(db) = Arc::get_mut(&mut self.db) {
                 db.reclaim();
@@ -3028,8 +3059,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             self.jobs.cold = false;
             self.settling = true;
             self.changed_since_settle = false;
-            let _span =
-                tracing::info_span!(target: "blaze", "between requests: ask the image").entered();
+            let _span = tracing::info_span!(
+                target: "blaze",
+                "between requests: ask the image",
+                quiet_turns = self.quiet_turns
+            )
+            .entered();
             self.ask_image(false);
         }
         if self.settling
@@ -3143,6 +3178,53 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
 #[cfg(test)]
 mod tests {
     use blaze_image::{Cause, SectionId};
+
+    /// The turn (counted from 0) at which the work between requests may first run under
+    /// `rule`, for a build that turns `placing` times with no completion and no plane task
+    /// (its outputs being placed), is answered, and leaves the loop idle after: the oracle of
+    /// `the_work_between_requests_waits_for_quiet_turns_after_the_answer`.
+    fn between_first_runs_at(rule: fn(u32, bool, bool, bool) -> u32, placing: u32) -> u32 {
+        let mut quiet = 0;
+        for turn in 0..placing + 4 * QUIET_BEFORE_BETWEEN {
+            quiet = rule(quiet, turn < placing, false, false);
+            if quiet >= QUIET_BEFORE_BETWEEN {
+                return turn;
+            }
+        }
+        u32::MAX
+    }
+
+    /// The invariant: the work between requests (the collections, the image's making, in
+    /// line on the loop) first runs [`QUIET_BEFORE_BETWEEN`] quiet turns after a build's
+    /// answer, however long the build turned with nothing completing: the client that got the
+    /// answer asks its next thing (its rows, why it recomputed) into an idle loop. Its
+    /// control is `the_oracle_catches_quiet_turns_counted_under_a_build`.
+    #[test]
+    fn the_work_between_requests_waits_for_quiet_turns_after_the_answer() {
+        for placing in [0, 1, QUIET_BEFORE_BETWEEN, 40] {
+            assert_eq!(
+                between_first_runs_at(quiet_turns_after, placing),
+                placing + QUIET_BEFORE_BETWEEN - 1,
+                "a build that placed for {placing} turns"
+            );
+        }
+        // A completion or a running task is not quiet, and loses no count.
+        assert_eq!(quiet_turns_after(3, false, true, false), 3);
+        assert_eq!(quiet_turns_after(3, false, false, true), 3);
+        assert_eq!(quiet_turns_after(3, true, false, false), 0);
+    }
+
+    /// The planted bug: the count as it was until 2026-11-11, blind to a job under way. A
+    /// build that places for 40 turns is past the bound before it is answered.
+    #[test]
+    fn the_oracle_catches_quiet_turns_counted_under_a_build() {
+        fn planted(before: u32, _under_way: bool, took: bool, running: bool) -> u32 {
+            if took || running { before } else { before.saturating_add(1) }
+        }
+        let at = between_first_runs_at(planted, 40);
+        assert!(at < 40, "the oracle missed it: the work first ran at turn {at}");
+        assert_eq!(at, QUIET_BEFORE_BETWEEN - 1);
+    }
 
     use super::*;
 
