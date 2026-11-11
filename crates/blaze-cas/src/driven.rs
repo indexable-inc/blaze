@@ -28,7 +28,7 @@ impl Driven {
         // alloc: setup, once a store
         let mut effects = Vec::new();
         // alloc: setup, no layers: allocates nothing
-        let mut store = Store::open(Config { dir, layers: Vec::new(), tags: TAGS }, &mut effects);
+        let mut store = Store::open(Config { dir, layers: Vec::new(), tags: TAGS, load_tags: TAGS + (1 << 32), loader: crate::Loader::Pumped }, &mut effects);
         drive(&mut driver, &mut store, &mut effects)?;
         if let Some(broken) = store.broken() {
             // alloc: the error of a store that cannot open

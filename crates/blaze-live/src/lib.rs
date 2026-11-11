@@ -35,7 +35,7 @@ pub mod format;
 pub mod patch;
 pub mod slots;
 
-pub use slots::{Live, Outcome};
+pub use slots::{Announcements, Live, Outcome};
 
 /// The counters that code the daemon compiled to count its branches adds to, and the function
 /// that code finds them by: the dev runtime's (`blaze_inproc_rt::live`), so every dev executable

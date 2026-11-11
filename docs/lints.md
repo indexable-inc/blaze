@@ -16,8 +16,10 @@ The group `blaze::pedantic_perf` (`deep_drop_at_exit`, `packable`, `pod_serializ
 `soa_candidate`, `vecreport`) is speed advice that trades something else away or can't see whether the code is hot; it is
 allowed unless a workspace or crate turns it on (`pedantic_perf = "warn"`; `vecreport`, which
 the release build reports, only by its flags). `checkfree`,
-`nopanic`, `noalloc` and `nonblocking` are in `blaze::general` but `deny` by default, and fire
-only on functions marked with their attribute (`#[blaze::checkfree]`, `#[blaze::nopanic]`, ...).
+`nopanic`, `noalloc`, `nonblocking` and `undeclared_effect` are in `blaze::general` but `deny` by
+default, and fire only where the code asks: on functions marked with their attribute
+(`#[blaze::checkfree]`, `#[blaze::nopanic]`, ...), and for `undeclared_effect` where a
+`#[blaze::may(..)]` or `#![blaze::effects]` reaches the function.
 
 Several lints come from ideas of the Goose language (no global heap, data stacks, bump
 growth, inline nested data, narrow relative links, variable-size enums, in-place construction
@@ -705,6 +707,62 @@ hand `#[blaze::nopanic(trusted = "why")]` (likewise the others); the reason is k
 proof. Or take the attribute off.
 
 **Allowing it.** `#[expect(blaze::nopanic, reason = "..")]` on the function.
+
+These three are the old spellings of `#[blaze::may(..)]`, next.
+
+## `undeclared_effect`, `unneeded_effect`, `negative_effect`
+
+`#[blaze::may(panic, alloc, block, diverge)]` (a blaze extension, opt-in; it changes
+diagnostics, never code) lists what a function, and everything it calls, may do: panic or
+abort, call the global allocator, block the thread, not return. A word the list leaves out is
+an effect the function does not have. The design, the rules and the tables are in
+[v2/plan/design/effects.md](v2/plan/design/effects.md).
+
+**What they catch.**
+
+- `undeclared_effect` (`deny`): a function with an effect its allowance leaves out. The
+  allowance is the function's own list; else the list of the trait's method it implements (or
+  of the trait); else the `#![blaze::may(..)]` of the nearest module around it; else nothing
+  at all in a crate with `#![blaze::effects]`. The first written holds alone: a function's own
+  list replaces a module's default, it is not added to it. A function none of these reach is
+  not looked at, so a crate that declares nothing is unaffected. The finding says each effect
+  with its witness: the shortest call chain to what has it, each step with its file and line,
+  or for `diverge` the line of a loop not known to end, or the chain of a recursion and which
+  function is called again. Also: an impl's method whose list has a word its trait's method
+  does not allow (an impl may declare fewer effects, never more), a function with both a list
+  and an old spelling, and a list that is not words separated by commas.
+- `unneeded_effect` (`warn`): a word of a private function's list for an effect the function
+  is proved not to have. Not on a function with a visibility written, a trait's method or an
+  impl's method of one: a public signature may reserve the right, and a trait method's list is
+  the bound of its impls. `panic` is found only where the crate is checked with overflow
+  checks, so the shorter list holds in dev and in release.
+- `negative_effect` (`warn`): `#[blaze::nopanic]`, `#[blaze::noalloc]` or `#[blaze::nonblocking]`
+  on a function under a module's default or `#![blaze::effects]`. The old spellings still mean
+  what they meant, everywhere; where effects are declared, the function says what it may do.
+
+`diverge` in short: a counted `while i < n { ..; i += 1; }` is known to end (with the crate's
+overflow checks, any positive step and `<=` too); every other loop (`for`, `while let`,
+`loop`), recursion, and a call through a function pointer or a `dyn` whose trait method has no
+list need the word, until `decreases` clauses exist. What the check can't see (an unknown
+foreign function, a function pointer or unlisted `dyn` parameter) may do anything, so it needs
+every word.
+
+**Why it matters.** A signature that lists what can happen is complete: a reader, and a caller
+on a pool thread, in a signal handler or under a deadline, knows what the call can do without
+reading its body, and the list keeps holding as the code changes, in every crate it reaches.
+
+**How to fix it.** `blaze check --fix` writes each list: the missing words added
+(`undeclared_effect`; under `#![blaze::effects]` that is a `#[blaze::may(..)]` with exactly the
+inferred effects on every function that needs one), the unneeded word taken off
+(`unneeded_effect`), the old spellings rewritten to the list they stand for
+(`negative_effect`: `nopanic` and `nonblocking` on a function that allocates and may not return
+become `#[blaze::may(alloc, diverge)]`). Or handle the effect so the function no longer has it
+(`get` or `checked_*`, the task's frame, the scheduler's wait, a counted loop), or mark a
+callee proven by hand `#[blaze::may(.., trusted = "why")]`: its list is then taken at its word,
+and the reason is kept in the proof.
+
+**Allowing it.** `#[expect(blaze::undeclared_effect, reason = "..")]` (likewise the others) on
+the function.
 
 ## `pure`
 

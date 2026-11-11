@@ -86,10 +86,7 @@ impl<'s, 'c, 'db> Index<'s, 'c, 'db> {
             IndexFile::Here(bytes) => Lines::new(bytes),
             IndexFile::Absent => Lines::empty(),
             IndexFile::Needs(fetch) => {
-                let mut needs = self.needs.borrow_mut();
-                if !needs.iter().any(|it| it.at == fetch.at) {
-                    needs.push(fetch);
-                }
+                fetch.ask_once(&mut self.needs.borrow_mut())?;
                 Lines::empty()
             }
             IndexFile::Failed(error) => return Err(error),

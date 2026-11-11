@@ -419,3 +419,115 @@ never change. A later opt-in extension may print IDs in a program's own panic te
   rename and an edit of the item, `locate` gives the current place, the program's output is
   byte-identical to a build with IDs off, and the `--events` records name the same ID after the
   move and the rename.
+
+## 15. The crate interface identity
+
+What a unit's record key holds of the crates its crate depends on: not their bytes, but what the
+unit can observe of them. Built 2026-11-10 (lane fast-driver) as far as section 12 allows; the
+rest is stated here as what remains.
+
+**What a dependent observes of a dependency, and what covers it.**
+
+| observed | by | covered by |
+|---|---|---|
+| signatures, generics and bounds, types' fields and layout attributes, visibility, re-exports, impls, attributes a check reads (`must_use`, `deprecated`) | every dependent | kept as text in the interface text |
+| exported macros' tokens | expansion in the dependent | kept as text |
+| bodies it instantiates, evaluates, inlines or types through: a type or const parameter (of the fn, its `impl`, its trait), `const`, `#[inline]`, `impl Trait`, `async`, a body that defines an item | check and codegen | kept as text (`blaze_lower::code::plain_body` refuses each) |
+| every other body | codegen only: its walk compiles or finds every instance it reaches, across crates | a unit that builds code is keyed by its dependencies' code text, deeply (`Narrowed::code`); only a unit that only checks is keyed by their interfaces (`Narrowed::checked`) |
+| cfg, features, edition, env, target, a build script's cfgs and `OUT_DIR` files | every dependent | the crate's settings (`Crate::content`) and files, in every identity |
+| what blaze's extensions prove over callee bodies (effects, contracts, `fn_info`'s code identity) | a check | a crate that names them, or depends on a workspace crate that does, takes and gives no interface |
+| a proc macro's, build script's or const macro crate's code | run by the dependent | its interface is its code |
+| comments | clippy's and blaze's lints, rustdoc, doctests; a rendered diagnostic's quoted lines | such units keep the whole key; a record with diagnostics is keyed by the files they quote (`quoted_key`) |
+| positions | see below | never left out |
+
+**Positions.** A dependent reads a dependency's positions through three things: (a) a diagnostic
+that points into it, which the dependent's record holds rendered; (b) `line!()`, `column!()`,
+`file!()` and `Location`s in code of the dependency instantiated in the dependent, which today
+are in the hashed code (section 12, "Today"); (c) span tables and debug info. None of the three
+is a side table apart from the result yet, so no position may be left out of a key. The
+interface is therefore a *text*, not a fold of item hashes: each file with what is left out (a
+comment no macro sees, a plain body) replaced by its shape, the count of its line ends and the
+bytes, characters and UTF-16 units of its last line, so every line and column after it is as
+it was. An edit that moves a line moves every identity above it. A plain `//` comment ends its
+line and moves nothing: it leaves no shape at all. Nor does anything else nothing is after: the
+spaces and tabs before a line's end, and the whitespace and `//` comments after a file's last
+token (`blaze_lower::code`: `Masked::blank`, `code_end`). A block comment that does not end
+keeps its text: it is an error, which a shape would hide.
+
+**What it cuts off today.** An edit that moves no token and no position (a `//` comment added,
+changed or removed at a line's end or after the last line; spaces before a line's end; blank
+lines at a file's end): no unit's key, in the edited crate itself or above it, so no unit, no
+codegen and no link runs. A plain body's edit that keeps its lines: no checking dependent's
+key. Any body edit: every unit that builds code above it, which then finds every function but
+the edited one in the store.
+
+**What it does not, and why.**
+
+- *An edit that moves a line or a column and no token* (a comment on a line of its own, a
+  blank line, reformatting) moves the unit's key and every key above it. The code generator is
+  ready for it (a `Location` is `Target::Position(SpanRef)` into the owner's span table, filled
+  at link; `line!()` in code reads its `Location`'s line, `hir_ty_mir::mir::location::
+  line_literals`; a template is kept under its template code with its own anchors by table),
+  but a unit's record is one value keyed by one text, and what reads a position *by value* is
+  in it: a diagnostic's rendered lines; `column!()`, and `line!()` where it becomes a constant
+  or part of a type (section 3.3); a constant made by a `#[track_caller]` `const fn` (its
+  call's position, with no `line!` written anywhere in the crate that calls it); a proc macro
+  that asks its input's spans for their lines. No text can tell which of these a crate has, so
+  a key that left positions out would keep a stale constant. It needs the unit's steps keyed
+  per item (item 3 below) with positions as presentation slots (section 3.7), and a link step
+  that writes only the span tables into an image whose code is as it was.
+**Diagnostics** (built). A record whose diagnostics are all its check's, each span one the
+code text keeps exactly (`blaze_lower::places`: both ends at a token's edge, nothing between
+them the code text leaves out or keeps as a shape), is under the narrow key and holds the
+check's `Diag`s with the line and byte column of each span end (`compile::Placed`), which
+every text of that key has its tokens at. A replay finds each place's offset in the file as
+it is and renders the diagnostics from those files, so a comment in a quoted file recomputes
+nothing. Any other span (into or over a comment, to a file's end, in a file the view lacks)
+keeps its record under `quoted_key` or the whole key.
+
+**The check's outcome** (built) is an entry of its own (`compile::Checked`, under
+`check_key`: the record's inputs with the crate as a check observes it, `Narrowed::checked`).
+A unit whose record misses for what no check of it reads (a body below it) finds it and runs
+no check. An item's own results were entries already: a body's inference, MIR and borrow
+check in the item store (sections 3 to 8), a function's code under its template key.
+
+**For an edit that moves positions alone**, what is left, each piece on the one before:
+1. Texts with no position in them beside the ones there are (`code`: a token's text and
+   whether whitespace parts it from the one before, a doc comment as its kind, a left-out
+   body as a mark), and places as (file, token index, which edge) in place of line and
+   column, so a kept diagnostic is found again after its line moved.
+2. The positions read by value, as a slot under the position-free key that names the files
+   they are in (as `quotes_slot` names quoted files), the entry then filed under those
+   files' positioned code texts. The readers: `line!()` and `column!()` where they expand
+   (`hir_expand::builtin::fn_macro::place_expand`, which reads the position through the
+   file's text, a tracked read already, so the engine reruns exactly the expansions whose
+   value moved); the evaluator's caller location (`hir_ty_mir::mir::eval::shim`); a proc
+   macro's span answers. Each needs a log in the database beside the `env!` log
+   (`base_db::process_env_reads`), which `reads::Reads` already files records by.
+3. The check entry under that key: a moved line then finds it, and runs no check.
+4. The link: `compile::SpansMoved` (the record whose code this unit's is, and the span tables
+   that differ) is what the unit gives it; the link that writes only those tables is the
+   link lane's. Until it is there a moved line links whole, and `moved/` fails.
+
+**Library crates** (built). A registry or git crate's files are parsed as outlines, and a
+code text needs a full parse. Each such crate but the standard library's has its own narrowed
+identity (`blaze_lower::code::library_narrow`, a full parse of each file, made and dropped)
+kept in the store under `library_key`: the front end's code identity, the text domains, the
+crate's settings, its root's text and its source root's content. `identify` reads it before a
+unit is keyed (`Lowered::library_narrows`) and parses only a crate the store has none of. A
+comment in such a crate moves its bytes, misses once, parses that crate, and gives the
+identity it had: nothing above it recomputes, and its own record is found under its narrow
+key. The standard library keeps its whole text: it is the toolchain's.
+
+**What remains**, in order: (1) sections 12 and 13 (locations and debug info as side tables),
+after which shapes can drop their line counts and a moved line is a data write; (2) the
+interface as a fold of `blaze_items::crate_hashes` (interface and layout hashes, macros by
+tokens, instantiable bodies by code hash) once (1) makes positions unobservable, which also
+cuts off formatting and line-moving body edits; (3) the per-unit steps keyed per item, so a
+unit whose key moved reruns one function's steps (docs/v2/plan.md section 7), not its walk.
+The tests: `the_interface_text_moves_exactly_with_what_a_dependent_observes`,
+`a_units_own_key_moves_exactly_with_what_its_results_depend_on`,
+`a_dependents_key_moves_only_with_what_it_observes_of_a_dependency` (docs/v2/plan/invariants.md);
+the edit harness holds a build to them (`harness/v2/oracle.py`: `over/` for an edit that moves
+nothing, `moved/` for one that moves positions alone, which fails until the first item above is
+built).

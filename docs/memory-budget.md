@@ -190,7 +190,7 @@ machine's limits (section 1: `hw.memsize`, `MemTotal`, cgroup `memory.max`/`memo
 `BLAZE_DAEMON_MEMORY_GB` (`--memory-gb`) is one daemon's ceiling, never more than the machine
 budget.
 
-**The ledger**, `/tmp/blaze-<uid>/machine` (never under `BLAZE_HOME`: two homes are one
+**The ledger**, `/tmp/blaze-<uid>/machine.<layout>` (one file per layout of the ledger, so daemons of two blaze versions keep separate ledgers; never under `BLAZE_HOME`: two homes are one
 machine), a small file of fixed records read and rewritten under `flock`. One record a daemon:
 its pid and process start time (so a reused pid is not mistaken for it), home, version,
 ceiling, and its charge, `max(held, granted)`, rewritten as its plane takes a `Held` (at most
@@ -206,10 +206,17 @@ ledger stops with an error naming the file (no fallback to a budget of its own).
 As built (2026-11-05), where it differs from the above and why:
 - The core is `blaze_graph::ledger`, not `blaze_graph::machine`: that name is the build graph's.
 - Every ledger write is one turn under the lock: read, prune, compute the allowance, give it to
-  the plane (`PlaneInput::Allowance`), write the charge `max(held, granted)`, unlock. Between
-  turns the plane grants only up to its **room**, `min(allowance, max(granted, held))` as of the
-  last turn, so what it grants never passes the charge the others can read. A plane that has
-  never been given an allowance has no room limit, so the plane alone behaves as before.
+  the plane (`PlaneInput::Allowance`), write the charge `max(held, granted)` plus the lease,
+  unlock. Between turns the plane grants only up to its **room**, `min(allowance,
+  max(granted, held) + lease)` as of the last turn, so what it grants never passes the charge
+  the others can read. A plane that has never been given an allowance has no room limit, so
+  the plane alone behaves as before.
+- The **lease** (2026-11-10) is headroom a plane with work (a request not idle that is not
+  over, or a task ready or running) takes at its turn: the larger of 1/16 of its ceiling and
+  twice the largest grant it started since its last turn, at most what the allowance leaves.
+  A task that fits it starts with no turn. Without it nothing was free right after a turn, and
+  every task with memory waited 25 ms for the next. A plane with no work leases nothing, so
+  its record is what it holds.
 - Each record keeps the machine budget its daemon brought, and the budget is the least over the
   live records. Daemons started at different times see different "not blaze's" memory, and
   taking the least keeps the bound one number for all of them. At join, the other daemons'
@@ -218,9 +225,13 @@ As built (2026-11-05), where it differs from the above and why:
 - A task predicted at the whole ceiling (one with no record, which runs alone) starts alone
   with its grant clamped to the allowance once the allowance is above zero. Without the clamp
   it would wait forever for a machine the other daemons share.
-- Besides every 250 ms and moves past 1/64 of the budget, a daemon also turns 25 ms after its
-  plane held a task back for memory, so freed room reaches it quickly.
-- The file is fixed size (a 32-byte header, then 64 records of 128 bytes), checksummed, rewritten
+- Besides every 250 ms and moves past 1/64 of the budget, a daemon turns at once when its
+  plane says a turn would change what it may grant (`Plane::turn_wanted`: a task the room
+  alone holds back, the lease in its last quarter, or a lease held with no work), and 25 ms
+  after its plane held a task back that the allowance itself has no room for, so room another
+  daemon freed reaches it quickly.
+- The file is layout 2 (layout 1 had no lease; a file of another layout is refused, naming
+  both), fixed size (a 32-byte header, then 64 records of 128 bytes), checksummed, rewritten
   whole and never synced: it describes live processes, so after a reboot nothing in it matters.
   A file that fails to decode is an error naming it; it is removed by hand, never reset.
 - Start time is the kernel's own: clock ticks since boot on Linux (`/proc/<pid>/stat`), and

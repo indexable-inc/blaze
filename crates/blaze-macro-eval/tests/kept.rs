@@ -55,6 +55,8 @@ fn kept_in(sim: &mut Sim) -> blaze_cas::Store {
         dir: blaze_core::FileName::new("store").expect("a plain name"),
         layers: Vec::new(),
         tags: 1 << 48,
+        load_tags: (1 << 48) + (1 << 32),
+        loader: blaze_cas::Loader::Pumped,
     };
     let mut store = blaze_cas::Store::open(config, &mut effects);
     blaze_core::run_until_idle(sim, &mut effects, |completion, effects| {

@@ -123,6 +123,9 @@ struct Hot {
     generation: AtomicU64,
     /// The last round of flushes is in: false while one is out, and until the first is in.
     settled: AtomicBool,
+    /// The generation of the last change heard under any directory, and of the last watch
+    /// that stopped vouching ([`Dirs::quiet_since`]).
+    disturbed: AtomicU64,
 }
 
 /// The directories watched outside every view, append-only, in columns over reserved regions
@@ -241,7 +244,11 @@ impl Dirs {
     pub fn try_new() -> Result<Dirs, MemError> {
         let tag = blaze_mem::Tag::Vfs;
         Ok(Dirs {
-            hot: Hot { generation: AtomicU64::new(0), settled: AtomicBool::new(false) },
+            hot: Hot {
+                generation: AtomicU64::new(0),
+                settled: AtomicBool::new(false),
+                disturbed: AtomicU64::new(0),
+            },
             driven: AtomicBool::new(false),
             len: AtomicU32::new(0),
             level: AtomicU32::new(0),
@@ -465,6 +472,25 @@ impl Dirs {
         self.hot.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
+    /// A change was heard, or a watch stopped vouching: the generation it is, which
+    /// [`Dirs::quiet_since`] compares with.
+    fn disturb(&self) -> u64 {
+        let generation = self.bump();
+        self.hot.disturbed.fetch_max(generation, Ordering::AcqRel);
+        generation
+    }
+
+    /// Whether nothing under any watched directory can have changed since `generation` was
+    /// read: no change was heard after it, no watch stopped vouching after it, and the last
+    /// round of flushes is in. One answer for everything the watches vouched for when
+    /// `generation` was read, for a caller that kept no list of what that was: whatever
+    /// [`Dirs::unchanged_since`] or a [`Cover`] said then of a path still holds. It says
+    /// nothing of a path no watch covered then, nor of a directory wanted since. Two loads.
+    pub fn quiet_since(&self, generation: u64) -> bool {
+        self.hot.settled.load(Ordering::Acquire)
+            && self.hot.disturbed.load(Ordering::Acquire) <= generation
+    }
+
     fn settle(&self, settled: bool) {
         self.hot.settled.store(settled, Ordering::Release);
     }
@@ -486,6 +512,59 @@ pub fn dirs() -> &'static Dirs {
 /// [`Dirs::generation`] of the process's table.
 pub fn generation() -> u64 {
     DIRS.generation()
+}
+
+/// [`Dirs::quiet_since`] of the process's table.
+pub fn quiet_since(generation: u64) -> bool {
+    DIRS.quiet_since(generation)
+}
+
+/// How many times this process looked at the disk for what a path outside every view is now,
+/// in place of an answer a watch vouched for ([`looked`]).
+static LOOKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether [`looked`] keeps the path it is told ([`name_looks`]).
+static NAMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The last path [`looked`] was told while looks were named.
+static LAST_LOOK: Lock<PathBuf> = Lock::new("vfs.outside.last_look", PathBuf::new());
+
+/// Counts a look at the disk for what `path`, outside every view, is now (a `stat`, a read, a
+/// listing), made because no watch vouched for the answer kept. Called by each place that
+/// checks such a path: blaze-usercode's `inputs` (a traced file, entry or listing) and
+/// `roots` (a root resolved through a link), base-db's `IncludedFile::read_now` (a file an
+/// `include!` read), blaze-lints' `profile::load` (a lint profile) and the daemon's pinned
+/// native layouts. While looks are named ([`name_looks`]) the path is kept for
+/// [`last_look`].
+pub fn looked(path: &Path) {
+    LOOKS.fetch_add(1, Ordering::Relaxed);
+    if NAMING.load(Ordering::Relaxed) {
+        let mut last = LAST_LOOK.lock();
+        last.clear();
+        last.push(path); // alloc: grows to the longest path looked at, then is used again
+    }
+}
+
+/// Has [`looked`] keep the path of each look from now on, or stop: on while someone will
+/// ask [`last_look`] (the daemon, while a build that may be answered again later walks), so
+/// a build no one asks about pays one load a look.
+pub fn name_looks(on: bool) {
+    NAMING.store(on, Ordering::Relaxed);
+}
+
+/// The last path looked at while looks were named, for a person: which path no watch
+/// vouched for.
+pub fn last_look() -> Option<PathBuf> {
+    let last = LAST_LOOK.lock();
+    // clone: a reason, once a build asked about
+    (!last.as_os_str().is_empty()).then(|| last.clone())
+}
+
+/// How many looks ([`looked`]) this process has made. A stretch of work across which it did
+/// not move checked no path outside every view on the disk: each it checked was vouched for by
+/// a watch, which [`quiet_since`] then covers.
+pub fn looks() -> u64 {
+    LOOKS.load(Ordering::Relaxed)
 }
 
 /// [`Dirs::unchanged_since`] of the process's table.
@@ -620,7 +699,7 @@ impl<'d> Outside<'d> {
         let watch = &mut self.watches[at];
         watch.retired = true;
         watch.restart = false;
-        unconfirm(dir, watch);
+        unconfirm(dirs, dir, watch);
         self.tend(at, effects);
         true
     }
@@ -677,14 +756,14 @@ impl<'d> Outside<'d> {
         let watch = &mut self.watches[at];
         match (kind, completion.done) {
             (WATCH, Done::Changed { files, lost }) => {
-                dir.entry.changed.fetch_max(dirs.bump(), Ordering::AcqRel);
+                dir.entry.changed.fetch_max(dirs.disturb(), Ordering::AcqRel);
                 let replaced = lost || watch.file.as_ref().is_some_and(|it| files.contains(it));
                 if watch.retired {
                     // Its end is asked already; the directory above it hears the rest.
                 } else if replaced {
                     // Replaced or moved, or may have been (what was dropped may be its own
                     // end): its watch may hear nothing more of what is at its name.
-                    unconfirm(dir, watch);
+                    unconfirm(dirs, dir, watch);
                     watch.restart = true;
                 } else if watch.state == State::Watching
                     && !watch.confirmed
@@ -696,7 +775,7 @@ impl<'d> Outside<'d> {
                 }
             }
             (WATCH, done @ (Done::Unwatched | Done::Failed(_))) => {
-                unconfirm(dir, watch);
+                unconfirm(dirs, dir, watch);
                 watch.state = State::Idle;
                 if matches!(done, Done::Failed(_)) && !watch.restart {
                     back_off(watch, round);
@@ -727,7 +806,7 @@ impl<'d> Outside<'d> {
                 match done {
                     Done::Flushed => {}
                     Done::Failed(_) => {
-                        unconfirm(dir, watch);
+                        unconfirm(dirs, dir, watch);
                         back_off(watch, round);
                     }
                     done => unreachable!("a flush completed with {done:?}"),
@@ -827,9 +906,11 @@ impl Drop for Outside<'_> {
     }
 }
 
-fn unconfirm(dir: Dir<'_>, watch: &mut Watch) {
+fn unconfirm(dirs: &Dirs, dir: Dir<'_>, watch: &mut Watch) {
     dir.entry.since.store(UNCONFIRMED, Ordering::Release);
     watch.confirmed = false;
+    // What it vouched for is vouched for no more ([`Dirs::quiet_since`]).
+    dirs.disturb();
 }
 
 fn back_off(watch: &mut Watch, round: u64) {

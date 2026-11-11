@@ -130,7 +130,7 @@ impl Frames {
     }
 
     /// How many bytes are held that are not yet a whole item.
-    pub(crate) fn held(&self) -> usize {
+    pub fn held(&self) -> usize {
         self.end - self.at
     }
 
@@ -228,8 +228,9 @@ pub fn decode<'a, T: Deserialize<'a>>(item: &'a [u8]) -> Result<Envelope<T>, Ref
     }
 }
 
-/// The schema and id of the envelope `item` is, its body unread.
-pub(crate) fn head(item: &[u8]) -> Result<(u32, u64), Refused> {
+/// The schema and id of the envelope `item` is, its body unread: what a client reads a daemon
+/// of another schema by (blaze-client's `Fault::Schema`).
+pub fn head(item: &[u8]) -> Result<(u32, u64), Refused> {
     let envelope: Envelope<IgnoredAny> =
         cbor::from_slice(item).map_err(|error| Refused { id: None, error: undecodable(&error) })?;
     Ok((envelope.schema, envelope.id))

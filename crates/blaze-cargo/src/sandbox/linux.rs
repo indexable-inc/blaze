@@ -40,6 +40,11 @@
 //! from TCP), what it reaches is a `T network` line, and the machine's abstract Unix sockets,
 //! which it would see then, are refused.
 //!
+//! The program's environment says it is in the sandbox (`__BLAZE_SANDBOXED=1`,
+//! [`mark_sandboxed`]), which every program it runs inherits: a blaze among them (the `rustc`
+//! and `rustdoc` a build script runs are blaze) waits with direct system calls, as the filter
+//! refuses it the io_uring its waits are otherwise made on.
+//!
 //! Where a user may not make a user namespace (Ubuntu 23.10 on keeps them from it through
 //! AppArmor, a container's seccomp profile may), a sandbox without a view or overlays is
 //! confined instead ([`confined`]): the first process makes no namespace and has Landlock
@@ -565,7 +570,7 @@ fn run_in(
         .collect();
     // alloc: once per sandbox, the confined program's `TMPDIR`.
     let tmp = scratch.map(|it| ("TMPDIR".to_owned(), it.display().to_string()));
-    let env: Vec<CString> = match also.env {
+    let mut env: Vec<CString> = match also.env {
         None => spec
             .env
             .iter()
@@ -577,6 +582,9 @@ fn run_in(
             .collect(),
         Some(given) => environment(given, tmp.as_ref(), interposer)?,
     };
+    if program.is_some() {
+        mark_sandboxed(&mut env);
+    }
     let Some([supervisor, child]) = raw::stream_pair() else {
         return Err(os("socketpair"));
     };
@@ -682,6 +690,24 @@ fn run_in(
         live.failed(why);
     }
     Ok(ended(status))
+}
+
+/// Marks the program's environment as the sandbox's (`blaze_core::wait::SANDBOXED` set to `1`,
+/// in place of any value it was given): the filter the program runs under refuses io_uring, so
+/// a blaze it runs (as the `rustc` of a build script) waits with direct system calls, which it
+/// chooses by this mark and never by trying its ring (`blaze-core/src/wait/choice.rs`).
+fn mark_sandboxed(env: &mut Vec<CString>) {
+    let name = blaze_core::wait::SANDBOXED.as_bytes();
+    env.retain(|it| {
+        let entry = it.as_bytes();
+        !(entry.starts_with(name) && entry.get(name.len()) == Some(&b'='))
+    });
+    // alloc: once per sandbox, one entry of the program's environment.
+    let mut entry = Vec::with_capacity(name.len() + 2);
+    entry.extend_from_slice(name);
+    entry.extend_from_slice(b"=1");
+    // The name is a constant with no nul in it.
+    env.push(CString::new(entry).unwrap_or_default());
 }
 
 /// The program's environment: `given` as it is, with the confined sandbox's own `tmp` for
@@ -3202,6 +3228,19 @@ for it in "$OUT"/*; do :; done
         );
         let nul = vec![("A".into(), OsString::from_vec(b"x\0y".to_vec()))];
         assert!(super::environment(&nul, None, None).unwrap_err().contains("nul"));
+    }
+
+    /// The program's environment says once that it is the sandbox's, whatever it was given
+    /// under that name; a name that only begins so is another variable.
+    #[test]
+    fn the_programs_environment_is_marked_as_the_sandboxs() {
+        let entry = |it: &str| std::ffi::CString::new(it).unwrap();
+        let mut env =
+            vec![entry("A=1"), entry("__BLAZE_SANDBOXED=0"), entry("__BLAZE_SANDBOXED_TOO=2")];
+        super::mark_sandboxed(&mut env);
+        let env: Vec<&[u8]> = env.iter().map(|it| it.as_bytes()).collect();
+        assert_eq!(env, [&b"A=1"[..], b"__BLAZE_SANDBOXED_TOO=2", b"__BLAZE_SANDBOXED=1"]);
+        assert_eq!(blaze_core::wait::SANDBOXED, "__BLAZE_SANDBOXED");
     }
 
     /// A sandbox confined as it is where no user namespace can be made (Ubuntu's AppArmor):

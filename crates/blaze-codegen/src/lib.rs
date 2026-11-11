@@ -46,7 +46,7 @@ pub mod template;
 pub mod unwind;
 pub mod wasm;
 
-pub use driver::Owner;
+pub use driver::{BuiltId, Changes, Delta, Fresh, Owner, StaticId};
 pub use exec::ExecTable;
 pub use relocs::{Reloc, Relocation, Relocs, RelocsView};
 
@@ -409,6 +409,22 @@ pub enum RelocKind {
     /// LEB of ten bytes; in data eight bytes.
     WasmTable64,
     WasmMemory64,
+}
+
+/// How Rust code defines a symbol outside code names it by ([`backend::Described::symbol`]):
+/// what a whole link does when another input defines the same name. The front end decides it
+/// from the item's `#[linkage]` (hir-ty-codegen's `exported_linkage`); nothing downstream
+/// derives it again.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum Linkage {
+    /// A plain definition: another strong one on the link is the duplicate symbol error.
+    #[default]
+    Strong,
+    /// `#[linkage = "weak"]` (or `weak_odr`, `linkonce`, `linkonce_odr`): a strong definition
+    /// elsewhere on the link wins, as ld64 and lld take it, and every reference to the name,
+    /// Rust's own included, binds to that one. Rust code refers to such a definition only
+    /// by its name ([`Target::Extern`]), never by key, as LLVM treats it as interposable.
+    Weak,
 }
 
 /// What a relocation points at.

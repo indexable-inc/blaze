@@ -3,10 +3,6 @@
 //! its code hash's hex), `blaze trace --out PATH` (the CBOR of `blaze_v2_proof::Trace`) and
 //! `blaze tables --format=json` (`{"<name>": {"elements": N, "bytes": N}}`). Each takes a
 //! build's package, target and profile flags, which name the build it asks about.
-//!
-//! `blaze pack -p PACKAGE --out PATH` is answered the same way: the daemon checks the package
-//! for [`PACK_TARGET`] with debug assertions off, as `--release` does, and the CLI writes the
-//! pack it answers (`blaze_wasm_pack::Pack`'s JSON) to `PATH`, for blaze's in-browser compiler.
 
 use std::{
     ffi::OsString,
@@ -23,16 +19,12 @@ use super::{
     json, place, say,
 };
 
-/// The target `blaze pack` checks for: the in-browser compiler's.
-pub const PACK_TARGET: &str = "wasm32-unknown-unknown";
-
 /// Which look.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Inspected {
     CodegenInputs,
     Trace,
     Tables,
-    Pack,
 }
 
 impl Inspected {
@@ -41,7 +33,6 @@ impl Inspected {
             "codegen-inputs" => Some(Inspected::CodegenInputs),
             "trace" => Some(Inspected::Trace),
             "tables" => Some(Inspected::Tables),
-            "pack" => Some(Inspected::Pack),
             _ => None,
         }
     }
@@ -51,7 +42,6 @@ impl Inspected {
             Inspected::CodegenInputs => "codegen-inputs",
             Inspected::Trace => "trace",
             Inspected::Tables => "tables",
-            Inspected::Pack => "pack",
         }
     }
 }
@@ -59,15 +49,14 @@ impl Inspected {
 /// The command's own flags, and the build's words.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Own {
-    /// `trace`'s and `pack`'s `--out PATH`, as typed.
+    /// `trace`'s `--out PATH`, as typed.
     pub out: Option<PathBuf>,
     pub build: Vec<OsString>,
 }
 
 /// Reads `--format FORMAT` (`json`, the one there is; `codegen-inputs` and `tables` only) and
-/// `--out PATH` (`trace`'s and `pack`'s, which they need), each with `=` or as the next word;
-/// every other word is the build's. `pack` names its own target and profile, so it refuses
-/// `--target`, `--release` and `--profile`.
+/// `--out PATH` (`trace`'s, which it needs), each with `=` or as the next word; every other
+/// word is the build's.
 pub fn own(what: Inspected, words: Vec<OsString>) -> Result<Own, String> {
     let named = what.name();
     let mut own = Own { out: None, build: Vec::with_capacity(words.len()) };
@@ -81,12 +70,6 @@ pub fn own(what: Inspected, words: Vec<OsString>) -> Result<Own, String> {
             Some((flag, value)) => (flag, Some(value.to_owned())),
             None => (text, None),
         };
-        if what == Inspected::Pack && matches!(flag, "--target" | "--release" | "-r" | "--profile")
-        {
-            return Err(format!(
-                "`blaze pack` checks for {PACK_TARGET} with debug assertions off, as `--release`: it takes no `{flag}`"
-            ));
-        }
         if !matches!(flag, "--format" | "--out") {
             own.build.push(word);
             continue;
@@ -111,7 +94,7 @@ pub fn own(what: Inspected, words: Vec<OsString>) -> Result<Own, String> {
                     "`blaze {named}` prints JSON only (`--format=json`), not `{value}`"
                 ));
             }
-            (Inspected::Trace | Inspected::Pack, "--out") => own.out = Some(PathBuf::from(value)),
+            (Inspected::Trace, "--out") => own.out = Some(PathBuf::from(value)),
             (_, flag) => return Err(format!("`blaze {named}` takes no `{flag}`")),
         }
     }
@@ -120,15 +103,10 @@ pub fn own(what: Inspected, words: Vec<OsString>) -> Result<Own, String> {
             "`blaze trace` writes the trace to `--out PATH`, which it was not given".to_owned()
         );
     }
-    if what == Inspected::Pack && own.out.is_none() {
-        return Err(
-            "`blaze pack` writes the pack to `--out PATH`, which it was not given".to_owned()
-        );
-    }
     Ok(own)
 }
 
-/// `blaze codegen-inputs|trace|tables|pack WORDS`: its exit code.
+/// `blaze codegen-inputs|trace|tables WORDS`: its exit code.
 pub fn main(what: Inspected, words: Vec<OsString>, color: bool) -> i32 {
     let refused = |what: &str, code: i32| {
         eprint!("{}", say::error(what, color));
@@ -138,15 +116,7 @@ pub fn main(what: Inspected, words: Vec<OsString>, color: bool) -> i32 {
         Ok(own) => own,
         Err(what) => return refused(&what, Exit::Usage.code()),
     };
-    let mut words = own.build;
-    let command = match what {
-        Inspected::Pack => {
-            words.extend(["--target", PACK_TARGET, "--release"].map(OsString::from));
-            Command::Check
-        }
-        Inspected::CodegenInputs | Inspected::Trace | Inspected::Tables => Command::Build,
-    };
-    let build = match args::command_line(command, words) {
+    let build = match args::command_line(Command::Build, own.build) {
         Ok(build) => build,
         Err(usage) => {
             eprint!("{}", args::refusal(&usage, color));
@@ -172,19 +142,6 @@ pub fn main(what: Inspected, words: Vec<OsString>, color: bool) -> i32 {
             Err(code) => return code,
         },
         Inspected::Tables => Request::Tables { view },
-        Inspected::Pack => {
-            let [program] = &build.flags.packages[..] else {
-                return refused(
-                    "`blaze pack` packs one program: name its package with `-p PACKAGE`",
-                    Exit::Usage.code(),
-                );
-            };
-            let program = program.clone(); // clone: the request owns it, once
-            match targets(cargo) {
-                Ok(targets) => Request::Pack { view, targets, program },
-                Err(code) => return code,
-            }
-        }
     };
     let mut client = match daemon::connect(Start::IfMissing) {
         Ok(Some(client)) => client,
@@ -199,8 +156,8 @@ pub fn main(what: Inspected, words: Vec<OsString>, color: bool) -> i32 {
         .unwrap_or(Exit::Failed.code())
 }
 
-/// `request` sent and its answer printed on `out` (or, for `trace` and `pack`, written to `to`):
-/// the exit code. A pack's check's diagnostics are said on `err` as rustc renders them.
+/// `request` sent and its answer printed on `out` (or, for `trace`, written to `to`): the exit
+/// code.
 pub fn answer<A: Api>(
     api: &mut A,
     what: Inspected,
@@ -212,23 +169,16 @@ pub fn answer<A: Api>(
 ) -> io::Result<i32> {
     let mut answered = None;
     let mut said = Vec::new();
-    let mut packed = None;
-    let mut rendered = String::new();
     // The answers are read owned in place too (`ResponseRef`'s once-a-request responses): each
-    // is moved out whole. A pack is written from the frame's bytes where they lie.
+    // is moved out whole.
     let called = api.call(request, |response, _| match response {
         ResponseRef::CodegenInputs(it) => answered = Some(Response::CodegenInputs(it)),
         ResponseRef::Trace(it) => answered = Some(Response::Trace(it)),
         ResponseRef::Tables(it) => answered = Some(Response::Tables(it)),
-        ResponseRef::Packed { pack } => {
-            packed = Some(to.map_or(Ok(()), |to| std::fs::write(to, pack)))
-        }
-        ResponseRef::Diagnostic(it) if what == Inspected::Pack => rendered.push_str(it.rendered),
         // alloc: error path, the daemon's errors, said once it is done.
         ResponseRef::Error(error) => said.push(error.what.to_owned()),
         _ => {}
     });
-    err.write_all(rendered.as_bytes())?;
     for what in &said {
         err.write_all(say::error(what, color).as_bytes())?;
     }
@@ -259,16 +209,6 @@ pub fn answer<A: Api>(
             };
             if let Err(error) = std::fs::write(to, bytes) {
                 return failed(err, &format!("writing the trace to {}: {error}", to.display()));
-            }
-        }
-        (Inspected::Pack, _) => {
-            let Some(to) = to else { return failed(err, "`blaze pack` was given no `--out PATH`") };
-            match packed {
-                Some(Ok(())) => {}
-                Some(Err(error)) => {
-                    return failed(err, &format!("writing the pack to {}: {error}", to.display()));
-                }
-                None => return failed(err, "the daemon answered `blaze pack` with no pack"),
             }
         }
         _ => {

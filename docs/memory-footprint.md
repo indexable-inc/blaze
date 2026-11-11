@@ -117,6 +117,27 @@ frame limit is not done yet.
 Footprint is the one number admission, the front end's release and the ceiling read (rule
 `one-memory-measure`). Test the ceiling on the release binary with `BLAZE_DAEMON_MEMORY_GB=4`.
 
+Built on `kept-memory-1109` (design: [v2/plan/admission-by-footprint.md](v2/plan/admission-by-footprint.md)):
+
+- The plane charges the larger of its grants and the footprint plus the grants not yet realized,
+  asks a purge before it holds work back or starts a task alone, and fails alone a task that
+  grows past the ceiling (`blaze_graph::footprint`, `TooBig`), proved by a Hegel DST with planted
+  bugs. The ceiling guard purges on its first look past the ceiling and ends the daemon only if
+  the footprint is still past it.
+- A purge reads the footprint only once it took effect. mimalloc 3 keeps freed pages per thread,
+  and only the owning thread may collect them, so `blaze_cargo::raw::memory::purge` asks, wakes
+  the idle workers, waits at most 250 ms under a span until every counted worker gave back
+  (`blaze_mem::tag::give_back`, with its own DST), purges, and reads again. The plane asks it of
+  a purger thread. The daemon also asks when `allocator kept bytes` passes a quarter of the
+  budget.
+- On Linux the footprint is the charge of the daemon's own cgroup where the kernel holds its
+  ceiling there: `memory.current` less the file cache the kernel can drop (`memory.stat`'s `file`
+  less `shmem`). Where no cgroup is delegated it is the process's resident set, and the daemon's
+  own watch is the bound (`blaze_cargo::raw::memory::own_footprint`, on `fast-mem-1110`).
+- `allocator kept bytes` is the footprint less the live heap and blaze-mem's resident committed
+  memory (`blaze_graph::arena::kept_of`). mimalloc's committed count is no measure of it: a
+  purge never lowers it on a release build. `allocator purged bytes` is cumulative.
+
 ### 3. Scratch on frames, reset per item
 
 - Long tasks reset their frame to a marker after each item: a function in a codegen unit, a body in
@@ -124,6 +145,21 @@ Footprint is the one number admission, the front end's release and the ceiling r
 - What step 1 shows still churning the global heap moves onto the frame at its call site.
 - A per-task budget on global-heap bytes fails tests and the self-build, naming the task: the check
   that holds new code to this, where `blaze::implicit_allocator` only judges call sites.
+
+Built on `fast-mem-1110` (2026-11-10), not yet measured:
+
+- A thread's frame shelf keeps one chunk's worth of each span and at most eight spans
+  (`blaze_mem::frame::WARM`, 32 MiB a thread). Before, a span went back to the shelf with every
+  page its task had committed, and nothing called `trim_spare`, so each worker held the peak of
+  the largest tasks it had run.
+- mimalloc gives a freed page back as it frees it (`purge_delay` 0, `heaps::purge_at_once`).
+- A build's end lets go of the evictable query values the last two builds that wrote did not
+  read (`blaze_query::db::Storage::end_epoch`). Values of functions that are not `lru` are
+  still kept for good, as are the rows, edges and interned tables.
+
+Not built: moving global-heap call sites onto frames, and the per-task budget on global-heap
+bytes. Both need `blaze explain memory`'s call sites and task churn from a build of this tree to
+choose the sites and the budget.
 
 ### 4. Outputs as records in the store's buffer pool
 

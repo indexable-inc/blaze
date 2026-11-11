@@ -75,7 +75,10 @@ use std::alloc::Global;
 
 use serde::{Deserialize, Serialize};
 
-use crate::machine::{Error, NodeId, Outcome, Pool, Spec};
+use crate::{
+    footprint::{Charge, Grades},
+    machine::{Error, NodeId, Outcome, Pool, Spec},
+};
 
 /// A request's name, chosen by whoever opens it.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -226,15 +229,35 @@ pub enum PlaneInput {
         #[serde(default)]
         peak: u64,
     },
-    /// The bytes the process holds now, measured.
+    /// The bytes the process holds now, measured: the live bytes alone, which leave out what
+    /// the allocator keeps freed. Admission charges `max(granted, bytes)` until the first
+    /// [`PlaneInput::Footprint`] (`crate::footprint`, the grants mode).
     Held { at_ns: u64, bytes: u64 },
+    /// The process's footprint now, measured, and what of it the allocator keeps freed and
+    /// would give back to a purge. From the first one on, admission charges the footprint and
+    /// the running tasks' grants not yet in it ([`crate::footprint::Charge`]), and asks for a
+    /// purge before it holds work back ([`Plane::purge_due`]).
+    Footprint {
+        at_ns: u64,
+        bytes: u64,
+        kept: u64,
+        /// The driver purged just before it read: what the allocator kept that a purge gives
+        /// back is gone from it.
+        #[serde(default)]
+        purged: bool,
+    },
+    /// The running task `id` has realized `bytes`, its memory account's peak so far. Past its
+    /// grant, its grant grows to that at once; what it realized counts as in the footprint
+    /// from the next [`PlaneInput::Footprint`]. Of a task not running it does nothing.
+    Realized { at_ns: u64, id: NodeId, bytes: u64 },
     /// What the machine's ledger lets this daemon grant now (docs/memory-budget.md, section 7,
     /// [`crate::ledger::Allowance`]): the least of its ceiling and the machine budget less
     /// every other live daemon's charge. Given only while the daemon holds the ledger's lock:
     /// the dispatch that follows may grant up to `bytes`, and from then until the next
-    /// `Allowance` the plane grants no more than its charge after it (`max(granted, held)`,
-    /// at most `bytes`), which is what the ledger records of it as the lock is let go
-    /// ([`Plane::room`]). A plane never told one grants up to its budget alone.
+    /// `Allowance` the plane grants no more than its charge after it (`max(granted, held)`)
+    /// and, while it has work, a lease past it ([`Plane::lease`]), at most `bytes` in all,
+    /// which is what the ledger records of it as the lock is let go ([`Plane::room`]). A plane
+    /// never told one grants up to its budget alone.
     Allowance { at_ns: u64, bytes: u64 },
     /// The most the budget may be while the system says memory is short (docs/memory-budget.md
     /// section 7, "Pressure"; [`crate::pressure::Pressured::cap`]); `None` once it no longer
@@ -255,6 +278,8 @@ impl PlaneInput {
             | PlaneInput::Close { at_ns, .. }
             | PlaneInput::Done { at_ns, .. }
             | PlaneInput::Held { at_ns, .. }
+            | PlaneInput::Footprint { at_ns, .. }
+            | PlaneInput::Realized { at_ns, .. }
             | PlaneInput::Allowance { at_ns, .. }
             | PlaneInput::Cap { at_ns, .. }
             | PlaneInput::Promote { at_ns, .. }
@@ -567,6 +592,11 @@ pub struct Counts {
     /// The most memory granted at once.
     pub granted_most: u64,
 }
+
+/// The share of its ceiling a plane with work leases at a turn of the machine's ledger, at
+/// least ([`Plane::lease`]): 1/16, so a build's waves of tasks start with no turn, and sixteen
+/// daemons with work still each get one.
+const LEASE_SHARE: u64 = 16;
 
 /// What a start moves a request's virtual time on by, over its weight: divisible by every
 /// weight up to 16, so for those the shares are exact.
@@ -1017,6 +1047,12 @@ pub struct Plane<M = NoMemo> {
     running: [usize; 2],
     granted: u64,
     held: u64,
+    /// What admission charges against the budget: the grants and the live bytes, or the
+    /// footprint and the grants not yet in it (`crate::footprint`).
+    charge: Charge<TaskHandle>,
+    /// A task with memory was held back in the last dispatch and the allocator may keep memory
+    /// a purge gives back ([`Plane::purge_due`]).
+    purge: bool,
     /// The pressure cap on the budget, from [`PlaneInput::Cap`]; `None` while the system says
     /// nothing of memory.
     cap: Option<u64>,
@@ -1029,14 +1065,25 @@ pub struct Plane<M = NoMemo> {
     /// ([`PlaneInput::Allowance`]); `u64::MAX` until one is told.
     allowance: u64,
     /// The most the plane grants until the next [`PlaneInput::Allowance`]: its charge after the
-    /// last one's dispatch, `max(granted, held)`, at most that allowance, which is what the
-    /// ledger holds for it. `u64::MAX` while an `Allowance` is being dispatched, and until one
-    /// is told.
+    /// last one's dispatch, `max(granted, held)`, and `leased` past it, at most that allowance,
+    /// which is what the ledger holds for it. `u64::MAX` while an `Allowance` is being
+    /// dispatched, and until one is told.
     room: u64,
+    /// The headroom the last `Allowance` left in `room` past the charge then: what the plane
+    /// may grant with no turn of the ledger. 0 when it had no work, and until one is told.
+    leased: u64,
+    /// The largest grant of a task started since the last `Allowance`, its own dispatch
+    /// counted: what the next lease is sized by.
+    asked: u64,
     /// An `Allowance` came in this step: once its dispatch is done, `room` is what it left.
     allowed: bool,
     /// A task with memory was held back for it in the last dispatch.
     held_back: bool,
+    /// A task held back in the last dispatch fits what the ledger's next turn allows: the room
+    /// alone holds it back.
+    room_short: bool,
+    /// A turn of the ledger now would change what the plane may grant ([`Plane::turn_wanted`]).
+    turn_wanted: bool,
     /// The virtual time of each pool: that of the request not idle that started a task last.
     vclock: [u128; 2],
     /// The same, of the idle requests, which share it among themselves alone.
@@ -1121,12 +1168,18 @@ impl<M: Memo> Plane<M> {
             running: [0; 2],
             granted: 0,
             held: 0,
+            charge: Charge::new(),
+            purge: false,
             cap: None,
             short: 0,
             allowance: u64::MAX,
             room: u64::MAX,
+            leased: 0,
+            asked: 0,
             allowed: false,
             held_back: false,
+            room_short: false,
+            turn_wanted: false,
             vclock: [0; 2],
             idle_vclock: [0; 2],
             // Each `Vec` here is empty scratch the plane keeps: it grows to the most a step needs
@@ -1166,9 +1219,32 @@ impl<M: Memo> Plane<M> {
         self.granted
     }
 
-    /// The bytes the process held at the last [`PlaneInput::Held`].
+    /// The bytes the process held at the last [`PlaneInput::Held`] or
+    /// [`PlaneInput::Footprint`].
     pub fn held(&self) -> u64 {
         self.held
+    }
+
+    /// What admission charges against the budget now: `max(granted, held)` until a
+    /// [`PlaneInput::Footprint`], then the footprint and the running tasks' grants not yet in
+    /// it, at least what is granted.
+    pub fn charged(&self) -> u64 {
+        self.charge.charged(self.granted)
+    }
+
+    /// Whether the driver should purge what the allocator keeps freed, then read the footprint
+    /// again and give it as a [`PlaneInput::Footprint`] with `purged`: a task with memory was
+    /// held back in the last step's dispatch, the allocator may keep memory, and no purge was
+    /// asked since the last purged reading nor within [`crate::footprint::PURGE_EVERY_NS`].
+    /// Said by one step alone: a driver keeps it until it purges.
+    pub fn purge_due(&self) -> bool {
+        self.purge
+    }
+
+    /// How the measured peaks of the tasks that ended compared with their grants, and the
+    /// purges asked ([`crate::footprint::Grades`]).
+    pub fn grades(&self) -> Grades {
+        self.charge.grades()
     }
 
     /// The pressure cap on the budget ([`PlaneInput::Cap`]), while there is one.
@@ -1195,7 +1271,7 @@ impl<M: Memo> Plane<M> {
         }
         let t = &self.tasks[row_of(task)];
         let p = pool_at(t.pool);
-        let alone = self.granted == 0 && self.cap.is_none();
+        let alone = self.granted == 0 && self.cap.is_none() && self.charge.alone_ok();
         !t.running
             && t.memory > free
             && !(t.memory <= whole && alone)
@@ -1224,10 +1300,34 @@ impl<M: Memo> Plane<M> {
         self.room
     }
 
+    /// The lease: what the plane may grant past `max(granted, held)` until the next
+    /// [`PlaneInput::Allowance`], read as that one's step returns, for the ledger to record in
+    /// this daemon's charge ([`crate::ledger::Admits::lease`]). The record is then at least
+    /// [`Plane::room`], so no other daemon is told that room is free. A plane with work (a
+    /// request not idle that is not over, or a task ready or running) takes the larger of 1/16
+    /// of its ceiling and twice the largest grant it started since its last turn, at most what
+    /// the allowance leaves past its charge; a plane with no work takes none, so its record is
+    /// what it holds. 0 until an `Allowance` is told.
+    pub fn lease(&self) -> u64 {
+        if self.room == u64::MAX {
+            return 0;
+        }
+        self.room.saturating_sub(self.held.max(self.granted))
+    }
+
     /// Whether a task with memory was held back for it in the last dispatch: a driver with a
-    /// ledger takes a turn of it soon, as the room it holds may be less than its allowance.
+    /// ledger takes a turn of it soon, as another daemon may have let go of memory since.
     pub fn held_back(&self) -> bool {
         self.held_back
+    }
+
+    /// Whether a turn of the ledger now would change what the plane may grant, as its last
+    /// step left it, so a driver takes one at once: a task is held back that the allowance
+    /// has room for and the room does not, or the charge is within the last quarter of the
+    /// lease with allowance left past the room, or a lease is held with no work left for it.
+    /// `false` as an `Allowance`'s step returns, so one turn is asked for at most once a step.
+    pub fn turn_wanted(&self) -> bool {
+        self.turn_wanted
     }
 
     /// The state of `id`, if it was added.
@@ -1459,6 +1559,7 @@ impl<M: Memo> Plane<M> {
             }
             PlaneInput::Yielded { id, .. } => {
                 let task = self.running_task(id)?;
+                self.charge.ended(task, None);
                 self.yielded(at, task, out, touched);
             }
             PlaneInput::Add { request, nodes, .. } => {
@@ -1503,16 +1604,39 @@ impl<M: Memo> Plane<M> {
                 self.requests[r as usize].closed = true;
                 touched.push(r);
             }
-            PlaneInput::Done { id, outcome, added, group, .. } => {
+            PlaneInput::Done { id, outcome, added, group, peak, .. } => {
                 let task = self.running_task(id)?;
                 let runner = self.tasks[row_of(task)].runner;
                 let r = self.rows[runner as usize].request;
                 self.check(r, &added[..])?;
+                self.charge.ended(task, Some(peak));
                 self.finish_task(at, task, outcome, group, out, touched);
                 self.add(at, r, added, out);
                 touched.push(r);
             }
-            PlaneInput::Held { bytes, .. } => self.held = bytes,
+            PlaneInput::Held { bytes, .. } => {
+                self.held = bytes;
+                self.charge.held(bytes);
+            }
+            PlaneInput::Footprint { bytes, kept, purged, .. } => {
+                self.held = bytes;
+                self.charge.read(bytes, kept, purged);
+            }
+            PlaneInput::Realized { id, bytes, .. } => {
+                // A task that ended or gave way since it was measured: its bytes are the
+                // footprint's to say now.
+                let Ok(task) = self.running_task(id) else { return Ok(()) };
+                let raise = self.charge.realized(task, bytes);
+                if raise > 0 {
+                    let row = &mut self.tasks[row_of(task)];
+                    row.memory += raise;
+                    if row.yielding {
+                        self.yielding_memory += raise;
+                    }
+                    self.granted += raise;
+                    self.counts.granted_most = self.counts.granted_most.max(self.granted);
+                }
+            }
             PlaneInput::Allowance { bytes, .. } => {
                 self.allowance = bytes;
                 self.room = u64::MAX;
@@ -1614,10 +1738,23 @@ impl<M: Memo> Plane<M> {
         self.settle_deferred(at, out, touched);
         self.last_ns = at;
         self.dispatch(at, out);
+        self.purge = self.held_back && self.charge.ask_purge(at);
         if std::mem::take(&mut self.allowed) {
             // What the ledger records of this daemon once the lock is let go, and so all it may
-            // grant until its next turn: more would be room another daemon may grant too.
-            self.room = self.allowance.min(self.granted.max(self.held));
+            // grant until its next turn: more would be room another daemon may grant too. With
+            // work, that is the charge and a lease past it, so a task that fits the lease
+            // starts with no turn; without the lease nothing was free of the room right after
+            // a turn, and every task with memory waited for the next.
+            let charged = self.charged();
+            let want = match &self.config.budget {
+                Some(budget) if self.has_work() => {
+                    (budget.bytes / LEASE_SHARE).max(self.asked.saturating_mul(2))
+                }
+                _ => 0,
+            };
+            self.leased = self.allowance.saturating_sub(charged).min(want);
+            self.room = self.allowance.min(charged.saturating_add(self.leased));
+            self.asked = 0;
         }
         let requests = &self.requests;
         radix::sort_copy_by_key_in(
@@ -1642,6 +1779,37 @@ impl<M: Memo> Plane<M> {
                 }
             }
         }
+        self.turn_wanted = self.wants_turn();
+    }
+
+    /// [`Plane::turn_wanted`], as this step leaves the plane.
+    fn wants_turn(&self) -> bool {
+        if self.room == u64::MAX {
+            return false;
+        }
+        if self.room_short {
+            return true;
+        }
+        if self.leased == 0 {
+            return false;
+        }
+        // The lease's last quarter, where a turn can give more: the room is under what the
+        // allowance (and a pressure cap) allow. At the allowance a turn changes nothing
+        // unless another daemon let go, which is the driver's slower turn to find.
+        let low = self.room.saturating_sub(self.charged()) < self.leased / 4
+            && self.budget_at_turn().is_some_and(|at_turn| self.room < at_turn);
+        low || !self.has_work()
+    }
+
+    /// Whether the plane has work a lease is for: a task running or ready, or a request not
+    /// idle that is not over (its next tasks come as its driver adds them).
+    fn has_work(&self) -> bool {
+        self.running.iter().any(|&it| it > 0)
+            || self.active.iter().any(|it| !it.is_empty())
+            || self.request_index.values().any(|handle| {
+                let request = &self.requests[handle.index() as usize];
+                !request.idle && !request.finished
+            })
     }
 
     fn open_request(&self, request: RequestId) -> Result<u32, Error> {
@@ -2370,7 +2538,7 @@ impl<M: Memo> Plane<M> {
     }
 
     fn memory_free(&self) -> Option<u64> {
-        Some(self.budget_now()?.saturating_sub(self.granted.max(self.held)))
+        Some(self.budget_now()?.saturating_sub(self.charged()))
     }
 
     /// The budget admission counts against now, the one join of every bound on it: the
@@ -2380,8 +2548,15 @@ impl<M: Memo> Plane<M> {
     /// of this daemon ([`Plane::room`]). Every admission decision reads it; only [`too_big`]
     /// reads the configured budget alone.
     pub fn budget_now(&self) -> Option<u64> {
+        Some(self.budget_at_turn()?.min(self.room))
+    }
+
+    /// [`Plane::budget_now`] as the ledger's next turn leaves it: every bound but the room
+    /// between two turns, which that turn lifts. What a task held back for memory is short of
+    /// is counted against this ([`Plane::short`]): a task that fits it only waits for the turn.
+    fn budget_at_turn(&self) -> Option<u64> {
         let budget = self.config.budget.as_ref()?;
-        Some(crate::pressure::budget_under(budget.bytes, self.cap).min(self.allowance).min(self.room))
+        Some(crate::pressure::budget_under(budget.bytes, self.cap).min(self.allowance))
     }
 
     /// The task that holds back the others, while it is still to start and wanted by a
@@ -2408,6 +2583,7 @@ impl<M: Memo> Plane<M> {
     fn dispatch(&mut self, at: u64, out: &mut Vec<PlaneOutput>) {
         self.short = 0;
         self.held_back = false;
+        self.room_short = false;
         for pool in [Pool::Io, Pool::Work] {
             let (p, limit) = (pool_at(pool), self.threads(pool));
             if self.config.budget.is_none() {
@@ -2601,7 +2777,9 @@ impl<M: Memo> Plane<M> {
     /// section 7, the soft ceiling). The one exception is a task predicted the whole ceiling
     /// (one not measured, which `blaze-cargo`'s `push_program` says runs alone): it would wait
     /// until no other daemon holds a byte, so alone it starts with what is allowed, and is
-    /// granted that ([`Plane::start`]).
+    /// granted that ([`Plane::start`]), at a turn of the ledger: between two the room is less
+    /// than what is allowed, and the turn it waits for is taken at once
+    /// ([`Plane::turn_wanted`]).
     ///
     /// Under a pressure cap ([`PlaneInput::Cap`]) the budget is the cap and no task
     /// starts alone: there the wait does end, as the pressure passes or what is held is let go.
@@ -2609,8 +2787,19 @@ impl<M: Memo> Plane<M> {
         let free = self.memory_free().expect("a budget");
         let whole = self.budget_now().expect("a budget");
         let ceiling = self.config.budget.as_ref().expect("a budget").bytes;
-        // Not under pressure: there waiting does make room ([`PlaneInput::Cap`]).
-        let alone = self.granted == 0 && self.cap.is_none();
+        // Not under pressure: there waiting does make room ([`PlaneInput::Cap`]). Nor while the
+        // allocator may keep memory a purge gives back: the task would grow into it
+        // ([`Charge::alone_ok`]); a purge is asked ([`Plane::purge_due`]) and a reading after
+        // it lets the task start.
+        let alone = self.granted == 0 && self.cap.is_none() && self.charge.alone_ok();
+        // The same two as the ledger's next turn leaves them: the room lifted.
+        let whole_at_turn = self.budget_at_turn().expect("a budget");
+        let free_at_turn = whole_at_turn.saturating_sub(self.charged());
+        let fits_at_turn = |memory: u64| {
+            memory <= free_at_turn
+                || (alone && (memory <= whole_at_turn || (memory >= ceiling && whole_at_turn > 0)))
+        };
+        let mut room_short = false;
         let hold = self.hold();
         // An idle request's task passed over holds back no other.
         let counts = !self.requests[r as usize].idle;
@@ -2637,17 +2826,25 @@ impl<M: Memo> Plane<M> {
                         break;
                     }
                 }
+                // A task granted less than it asks starts only at a turn, where the room does
+                // not bind: between two it would be granted the room, not what is allowed.
                 _ if memory <= free
-                    || (alone && (memory <= whole || (memory >= ceiling && whole > 0))) =>
+                    || (alone
+                        && (memory <= whole
+                            || (memory >= ceiling && whole > 0 && whole == whole_at_turn))) =>
                 {
                     picked = me;
                     break;
                 }
-                Some(_) => unfit = me,
+                Some(_) => {
+                    unfit = me;
+                    room_short |= fits_at_turn(memory);
+                }
                 None => {
                     if unfit == NONE {
                         unfit = me;
                     }
+                    room_short |= fits_at_turn(memory);
                     if counts {
                         passed.push(task);
                     }
@@ -2663,14 +2860,24 @@ impl<M: Memo> Plane<M> {
             return Pick::Start(picked);
         }
         self.held_back |= unfit != NONE;
+        // A task the room alone holds back: a turn starts it ([`Plane::turn_wanted`]).
+        self.room_short |= room_short;
         if unfit != NONE && self.short == 0 {
             // The first task held back, of the request whose turn it is: what the process
             // holds besides the grants kept it out by this much.
+            // Against what the ledger's next turn allows, never the room between two turns
+            // ([`Plane::room`]): the room is the charge the last turn recorded, so right after
+            // a turn only the lease is free of it, and a task past the lease is held back until
+            // the next. That wait ends by itself, at the turn the driver then takes at once
+            // ([`Plane::turn_wanted`]); letting go of a kept front end for it made every build lower its program anew (a one-line edit of a
+            // one-file program took 25 s: the daemon's log said "a task waits for 0.03 GiB").
             let memory = self.tasks[row_of(self.rows[unfit as usize].task)].memory;
+            let at_turn = self.budget_at_turn().expect("a budget");
+            let free_at_turn = at_turn.saturating_sub(self.charged());
             let held_besides = self.held.saturating_sub(self.granted);
-            let by_grants = whole.saturating_sub(self.granted);
+            let by_grants = at_turn.saturating_sub(self.granted);
             if memory <= by_grants {
-                self.short = memory.saturating_sub(free).min(held_besides);
+                self.short = memory.saturating_sub(free_at_turn).min(held_besides);
             }
         }
         Pick::None
@@ -2688,6 +2895,7 @@ impl<M: Memo> Plane<M> {
             self.tasks[row_of(task)].memory = whole;
         }
         let t = self.tasks[row_of(task)];
+        self.asked = self.asked.max(t.memory);
         let p = pool_at(t.pool);
         let mut member = t.first;
         while member != NONE {
@@ -2708,6 +2916,7 @@ impl<M: Memo> Plane<M> {
         self.tasks[row_of(task)].running = true;
         self.running[p] += 1;
         self.granted += t.memory;
+        self.charge.started(task, t.memory);
         self.counts.granted_most = self.counts.granted_most.max(self.granted);
         self.counts.ran += 1;
         let mut member = t.first;

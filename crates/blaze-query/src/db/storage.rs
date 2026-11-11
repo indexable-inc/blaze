@@ -43,6 +43,16 @@ impl View {
     }
 }
 
+/// What [`Storage::end_epoch`] let go of.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct Unread {
+    /// How many values went.
+    pub values: usize,
+    /// What they weighed: the `weigh` of each value of a function kept by bytes (`lru`); a
+    /// value let go only when asked (`lru = 0`) is not weighed and counts 0.
+    pub bytes: u64,
+}
+
 /// An input's kind, by how often it changes: workspace files (`LOW`), workspace structure
 /// (`MEDIUM`), libraries and frozen tables (`HIGH`). A row's durability is the lowest kind it
 /// read; a row whose kind did not change since it was verified verifies with one compare.
@@ -222,6 +232,9 @@ pub struct Storage {
     opened: u64,
     /// The last view an input of each kind or above changed in.
     last_changed: [u32; Durability::KINDS],
+    /// `opened` as the last write of kind `HIGH` left it: never renumbered, so a holder that
+    /// kept it across views compares it ([`Storage::durable_view`]).
+    high_opened: u64,
     /// `written[i]`: the OR of the [`input_bits`] of every field written in the last `i + 1`
     /// views.
     written: [Summary; HISTORY],
@@ -274,6 +287,9 @@ pub struct Storage {
     /// What each tag held live at its last pass ([`Storage::sweep`]): a tag over its budget is
     /// weighed again once it has grown by a [`budget::SPARE`]th of the budget since.
     passed_at: [u64; Tag::COUNT],
+    /// The views the last two epochs that wrote ended at, the older first
+    /// ([`Storage::end_epoch`]).
+    epochs: [u32; 2],
     /// The database type of its first function table ([`Storage::check_db`]).
     #[expect(clippy::disallowed_types, reason = "held once per function table made, to check its database type")]
     db_type: blaze_core::lock::Lock<Option<TypeId>>,
@@ -309,6 +325,7 @@ impl Storage {
             view,
             opened: u64::from(view),
             last_changed: [view; Durability::KINDS],
+            high_opened: u64::from(view),
             written: [[0; 2]; HISTORY],
             dirs,
             tables,
@@ -337,6 +354,7 @@ impl Storage {
             swept: 0,
             budgets: [None; Tag::COUNT],
             passed_at: [0; Tag::COUNT],
+            epochs: [view; 2],
             db_type: blaze_core::lock::Lock::new("query.storage.db_type", None),
         }
     }
@@ -344,6 +362,16 @@ impl Storage {
     #[inline]
     pub fn view(&self) -> View {
         View(self.opened)
+    }
+
+    /// The view the last write of kind `HIGH` opened ([`Storage::view`]'s numbering, never
+    /// renumbered): while it is what a holder saw, no library input or frozen table was
+    /// written, so every row that was durable then ([`plumbing::durable`](super::plumbing))
+    /// still holds its value, with no look at the row. A storage made anew (a restart, an
+    /// image loaded) is another storage: a holder keeps the view with which storage it is of.
+    #[inline]
+    pub fn durable_view(&self) -> View {
+        View(self.high_opened)
     }
 
     /// What a current row's `verified` equals, or a word no row has once readers are stopped.
@@ -573,6 +601,9 @@ impl Storage {
         for kind in &mut self.last_changed[..=durability.0 as usize] {
             *kind = self.view;
         }
+        if durability.0 >= Durability::HIGH.0 {
+            self.high_opened = self.opened;
+        }
         self.settle();
         self.sweep();
         self.view
@@ -666,6 +697,9 @@ impl Storage {
         for kind in &mut self.last_changed {
             *kind = restamp.apply(*kind);
         }
+        for epoch in &mut self.epochs {
+            *epoch = restamp.apply(*epoch);
+        }
         for node in 1..self.nodes_made() {
             let painted = self.color_of(node);
             let (verified, changed) = ((painted >> 32) as u32, painted as u32);
@@ -748,6 +782,54 @@ impl Storage {
                 self.passed_at[at] = tag::snapshot().get(tag).live;
             }
         }
+    }
+
+    /// Ends an epoch of the host's (a build), with `&mut`: lets go of every value of an
+    /// evictable function (`lru` or `lru = 0`) that was read in no view of this epoch or the
+    /// one before it, keeping each row's stamp, edges and hash, so a dependent still verifies
+    /// against it and a read makes it again and backdates (`evict`'s contract). Returns what
+    /// went.
+    ///
+    /// This is what lets go of the results of old revisions: a value keyed by something an
+    /// edit removed (a function deleted, a macro call's old expansion, a type no code names
+    /// any more) is never read again, and under a tag with no budget, or within it, nothing
+    /// else lets it go. A value that is unread only because what reads it stayed green is let
+    /// go too and made again if a run asks for it: the cost is time alone, bounded by what the
+    /// next runs read.
+    ///
+    /// An epoch in which nothing was written (the view is the one the last epoch ended at) is
+    /// no epoch: it lets nothing go and ages nothing, so builds that change nothing never empty
+    /// the storage. While [`Storage::keep_every_value`] is set nothing goes either.
+    pub fn end_epoch(&mut self) -> Unread {
+        let [before, last] = self.epochs;
+        if self.keep || self.view == last {
+            return Unread::default();
+        }
+        self.epochs = [last, self.view];
+        // Named, so a build's time walking rows is its own, never its writer's self time
+        // (rule 16).
+        let span = tracing::info_span!(
+            target: "blaze",
+            "unread values",
+            view = self.view,
+            before,
+            values = tracing::field::Empty,
+            bytes = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        // alloc: once an epoch, the live ingredients
+        let indices: Vec<u32> = self.live().collect();
+        let mut gone = Unread::default();
+        for index in indices {
+            if let Some(unread) = ingredient::vtable(index).and_then(|it| it.unread) {
+                let (values, bytes) = unread(self, index, before);
+                gone.values += values;
+                gone.bytes += bytes;
+            }
+        }
+        span.record("values", gone.values);
+        span.record("bytes", gone.bytes);
+        gone
     }
 
     /// Lets go of every value of every function of `tag` whose values go only when asked

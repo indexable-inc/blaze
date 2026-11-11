@@ -38,6 +38,13 @@
 //! child is left a zombie. The plant ([`ReapPlant::ReapInWait`]) waits without `WNOWAIT`, so the
 //! wait reaps the child and its exit is never reported, which
 //! [`the_oracle_catches_a_reaped_child_never_reported`] must find.
+//!
+//! The direct driver (`wait/direct.rs`, the waits of a process where io_uring is refused) runs
+//! the park's and the reap's plans too ([`Through::Direct`], on Linux): the same simulated
+//! kernels answer its calls ([`FutexCalls`], [`ChildCalls`]), their `CLOCK_MONOTONIC` on another
+//! origin than the wait's clock ([`KERNEL_AHEAD`]) so each call's absolute time is made from
+//! the kernel's, and each fault comes back as the error the kernel returns (`EINTR`,
+//! `ETIMEDOUT`). The same oracles hold, and the same plants are caught through it.
 
 use std::{
     cell::{Cell, RefCell},
@@ -51,6 +58,8 @@ use std::{
 
 use hegel::{TestCase, generators as gs};
 
+#[cfg(target_os = "linux")]
+use super::direct::{ChildCalls, Direct, FutexCalls};
 use super::{
     Clock, Deadline, Once, Plant, WaitError, Waited,
     parking::{self, Futex, ParkPlant},
@@ -71,6 +80,21 @@ const REPLAY: (u64, Plant) = (0, Plant::None);
 
 /// Most waits a plan draws.
 const MOST_WAITS: u64 = 24;
+
+/// How a park or a reap reaches its simulated kernel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Through {
+    /// The core on the kernel's own wait, each call retried by [`until`]: the ring's shape.
+    Core,
+    /// The core on the direct driver, which makes the kernel's calls itself.
+    #[cfg(target_os = "linux")]
+    Direct,
+}
+
+/// How far the simulated kernel's `CLOCK_MONOTONIC` is ahead of the wait's clock: the direct
+/// driver gives a futex wait an absolute time on the kernel's, never the wait's.
+#[cfg(target_os = "linux")]
+const KERNEL_AHEAD: Duration = Duration::from_secs(1_000);
 
 /// A clock the test moves.
 struct Virtual<'a>(&'a Cell<Duration>);
@@ -640,8 +664,39 @@ impl Futex for FutexSim<'_> {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl FutexCalls for FutexSim<'_> {
+    fn monotonic(&self) -> io::Result<Duration> {
+        Ok(self.now.get() + KERNEL_AHEAD)
+    }
+
+    fn futex_wait(&self, word: &AtomicU32, expected: u32, at: Option<Duration>) -> io::Result<()> {
+        let left = at.map(|at| at.saturating_sub(self.now.get() + KERNEL_AHEAD));
+        match self.call(word, expected, left)? {
+            // Woken, a word that changed (the kernel's `EAGAIN`, which the driver reads the
+            // same), or a return with nothing.
+            Once::Ready(()) | Once::Spurious => Ok(()),
+            Once::Interrupted => Err(io::Error::from_raw_os_error(libc::EINTR)),
+            Once::TimedOut => Err(io::Error::from_raw_os_error(libc::ETIMEDOUT)),
+        }
+    }
+
+    fn futex_wake(&self, word: &AtomicU32) {
+        Futex::wake(self, word);
+    }
+
+    fn between(&self) {
+        Futex::switch(self);
+    }
+}
+
 /// `plan`'s parks one after another on one word and clock, with `plant`: the first broken rule.
 fn run_parks(plan: &ParkPlan, plant: ParkPlant) -> Result<(), String> {
+    run_parks_through(plan, plant, Through::Core)
+}
+
+/// [`run_parks`], the park reaching the simulated futex as `through` says.
+fn run_parks_through(plan: &ParkPlan, plant: ParkPlant, through: Through) -> Result<(), String> {
     let now = Cell::new(Duration::ZERO);
     let clock = Virtual(&now);
     let word = AtomicU32::new(parking::EMPTY);
@@ -664,7 +719,12 @@ fn run_parks(plan: &ParkPlan, plant: ParkPlant) -> Result<(), String> {
         sim.unparks.borrow_mut().extend(unpark);
         sim.fired.borrow_mut().clear();
         let deadline = round.deadline.map(|it| Deadline::after(start, it));
-        let parked = parking::park(&word, &sim, "a simulated park", deadline, &clock, plant);
+        let what = "a simulated park";
+        let parked = match through {
+            Through::Core => parking::park(&word, &sim, what, deadline, &clock, plant),
+            #[cfg(target_os = "linux")]
+            Through::Direct => parking::park(&word, &Direct(&sim), what, deadline, &clock, plant),
+        };
         let end = now.get();
         let fired = sim.fired.borrow().first().copied();
         // The token as the park began: `token` itself is set again below, for the next park,
@@ -915,8 +975,54 @@ impl Children for ChildSim<'_> {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl ChildCalls for ChildSim<'_> {
+    type Reaped = i32;
+    /// The child's pid: the simulated kernel has no descriptors.
+    type Pidfd = i32;
+
+    fn reap_now(&self, pid: i32) -> io::Result<Option<i32>> {
+        Children::reap_now(self, pid)
+    }
+
+    fn exited_now(&self, pid: i32, keep: bool) -> io::Result<bool> {
+        self.now.set(self.now.get() + self.latency());
+        self.settle();
+        let mut kids = self.kids.borrow_mut();
+        let Some(kid) = kids.get_mut(&pid) else { return Err(ChildSim::no_child(pid)) };
+        match kid.life {
+            Life::Running => Ok(false),
+            Life::Zombie => {
+                if !keep {
+                    // Reaped by the look itself: its status goes to no one.
+                    kid.life = Life::Reaped;
+                }
+                Ok(true)
+            }
+            Life::Reaped => Err(ChildSim::no_child(pid)),
+        }
+    }
+
+    fn pidfd(&self, pid: i32) -> io::Result<i32> {
+        match self.life(pid) {
+            Some(Life::Running | Life::Zombie) => Ok(pid),
+            Some(Life::Reaped) | None => Err(ChildSim::no_child(pid)),
+        }
+    }
+
+    fn poll_exit(&self, fd: &i32, left: Option<Duration>) -> io::Result<Once<()>> {
+        // A poll reaps nothing.
+        self.call(*fd, true, left)
+    }
+}
+
 /// `plan`'s children reaped one after another on one clock, with `plant`: the first broken rule.
 fn run_reaps(plan: &ReapPlan, plant: ReapPlant) -> Result<(), String> {
+    run_reaps_through(plan, plant, Through::Core)
+}
+
+/// [`run_reaps`], the reap reaching the simulated children as `through` says.
+fn run_reaps_through(plan: &ReapPlan, plant: ReapPlant, through: Through) -> Result<(), String> {
     let now = Cell::new(Duration::ZERO);
     let clock = Virtual(&now);
     let sim = ChildSim {
@@ -935,7 +1041,12 @@ fn run_reaps(plan: &ReapPlan, plant: ReapPlant) -> Result<(), String> {
             .borrow_mut()
             .insert(pid, SimChild { exits, status: kid.status, life: Life::Running });
         let deadline = kid.deadline.map(|it| Deadline::after(start, it));
-        let reaped = reaping::reap(what, &sim, pid, deadline, &clock, plant);
+        let reap = |deadline| match through {
+            Through::Core => reaping::reap(what, &sim, pid, deadline, &clock, plant),
+            #[cfg(target_os = "linux")]
+            Through::Direct => reaping::reap(what, &Direct(&sim), pid, deadline, &clock, plant),
+        };
+        let reaped = reap(deadline);
         let end = now.get();
         let life = sim.life(pid);
         let said = |what: &str| {
@@ -978,7 +1089,7 @@ fn run_reaps(plan: &ReapPlan, plant: ReapPlant) -> Result<(), String> {
                     return Err(said("it had exited well before the deadline"));
                 }
                 // No zombie is left: a reap with no deadline reports it.
-                match reaping::reap(what, &sim, pid, None, &clock, plant) {
+                match reap(None) {
                     Ok(Waited::Ready(status))
                         if status == kid.status && sim.life(pid) == Some(Life::Reaped) => {}
                     other => {
@@ -1023,5 +1134,67 @@ fn the_oracle_catches_a_reaped_child_never_reported() {
     }
     panic!(
         "the oracle caught ReapPlant::{plant:?} at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak"
+    );
+}
+
+// --- The direct driver on the same kernels -------------------------------------------------
+
+/// The invariant: on the direct driver (a futex wait to an absolute time on the kernel's clock,
+/// made anew for every call), whatever interrupts it and whenever its unpark comes, no wakeup
+/// is lost and every park ends by its deadline.
+#[cfg(target_os = "linux")]
+#[hegel::test(test_cases = 300)]
+fn no_unpark_is_lost_through_the_direct_driver(tc: TestCase) {
+    let plan = park_plan(&mut Drawn(&tc));
+    if let Err(broke) = run_parks_through(&plan, ParkPlant::None, Through::Direct) {
+        panic!("{broke}\nplan {plan:?}");
+    }
+}
+
+/// The lost wakeup, planted in the park the direct driver waits for: caught through it in one
+/// of [`CONTROL_SEEDS`] seeded plans.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_oracle_catches_a_lost_wakeup_through_the_direct_driver() {
+    let plant = ParkPlant::CheckThenStore;
+    for seed in 0..CONTROL_SEEDS {
+        let plan = park_plan(&mut Rng::new(seed));
+        if let Err(why) = run_parks_through(&plan, plant, Through::Direct) {
+            eprintln!("{plant:?} caught through the direct driver at seed {seed}: {why}");
+            return;
+        }
+    }
+    panic!(
+        "the oracle caught ParkPlant::{plant:?} through the direct driver at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak"
+    );
+}
+
+/// The invariant: on the direct driver (a look with `waitid`, a poll of the child's pidfd, the
+/// look again, then the reap), whatever interrupts the wait and whenever the child exits, every
+/// child is reaped once and its exit reported, by the reap's deadline or after it.
+#[cfg(target_os = "linux")]
+#[hegel::test(test_cases = 300)]
+fn every_reaped_child_is_reported_through_the_direct_driver(tc: TestCase) {
+    let plan = reap_plan(&mut Drawn(&tc));
+    if let Err(broke) = run_reaps_through(&plan, ReapPlant::None, Through::Direct) {
+        panic!("{broke}\nplan {plan:?}");
+    }
+}
+
+/// The unreported child, planted in the reap the direct driver waits for (its `waitid` without
+/// `WNOWAIT`): caught through it in one of [`CONTROL_SEEDS`] seeded plans.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_oracle_catches_a_reaped_child_never_reported_through_the_direct_driver() {
+    let plant = ReapPlant::ReapInWait;
+    for seed in 0..CONTROL_SEEDS {
+        let plan = reap_plan(&mut Rng::new(seed));
+        if let Err(why) = run_reaps_through(&plan, plant, Through::Direct) {
+            eprintln!("{plant:?} caught through the direct driver at seed {seed}: {why}");
+            return;
+        }
+    }
+    panic!(
+        "the oracle caught ReapPlant::{plant:?} through the direct driver at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak"
     );
 }

@@ -63,11 +63,16 @@ fn put(key: u8, value: u8) -> Op {
     Op::Put { key, value }
 }
 
-const BUILD_ENDS: [Op; 2] = [Op::Flush, Op::AwaitAndAnswer];
+/// How a build ends: it answers at once, durable or not; then what it left settles, kept for
+/// reuse across a crash once it is durable, or said lost when the store stopped.
+const BUILD_ENDS: [Op; 3] = [Op::Answer, Op::Flush, Op::Settle];
 
 fn build(name: &'static str, puts: &[Op]) -> Script {
     script(name, &[puts, &BUILD_ENDS].concat())
 }
+
+/// How a snapshot ends: it waits for durability, which is what it is asked for, then answers.
+const SNAPSHOT_ENDS: [Op; 2] = [Op::Flush, Op::AwaitAndAnswer];
 
 const WORLDS: [Dials; 2] =
     [Dials { dial: 0, facts: [10, 11, 12, 13] }, Dials { dial: 1, facts: [10, 11, 12, 13] }];
@@ -177,11 +182,32 @@ fn two_values_under_one_identity_are_refused_never_overwritten() {
     ));
 }
 
-/// Two kernel gets of one identity in two worlds race for one shape slot; each answers once
-/// what it and every store before it is durable (the warm-restart hold), with an IO failure
-/// anywhere and effects completing in any order.
+/// The invariant: an answer may be sent on results not yet durable; nothing derived from that
+/// answer is reused across a crash unless its tickets were durable. After any crash the
+/// restore serves no value whose bytes were lost, holds everything the store called durable
+/// and everything an answered build kept, and every answer's settling ended kept or said lost.
+///
+/// Two builds on shared and separate keys with a reader, and a snapshot beside a build, each
+/// build answering before it flushes: every schedule, a crash after every IO step, so at
+/// every point between an answer sent and its results durable; with an IO failure anywhere,
+/// so a settling that ends with the store stopped. Then two kernel gets of one identity in
+/// two worlds racing for one shape slot, each answering at once and keeping what it left once
+/// it and every store before it is durable, with an IO failure anywhere and effects completing
+/// in any order.
 #[test]
-fn after_a_build_answers_its_results_survive_any_crash() {
+fn what_is_kept_after_an_answer_survives_any_crash_and_no_lost_value_is_served() {
+    passes(store(
+        "two builds that answer before they flush, and a reader",
+        Model { failures: 1, ..ORDERED },
+        Search::Exhaustive,
+        &[build("w0", &[put(1, 1)]), build("w1", &[put(1, 1), put(2, 2)]), script("r", &[Op::Get { key: 2 }])],
+    ));
+    passes(store(
+        "a build that answers before it flushes, and a snapshot that waits",
+        Model { failures: 1, ..ORDERED },
+        Search::Exhaustive,
+        &[build("w0", &[put(1, 1)]), script("s", &[&[put(2, 2)][..], &SNAPSHOT_ENDS].concat())],
+    ));
     passes(kernel(
         "two gets race for one shape slot",
         Model { failures: 1, reorder_io: true, ..ORDERED },
@@ -194,9 +220,10 @@ fn after_a_build_answers_its_results_survive_any_crash() {
     ));
 }
 
-/// Finding: a build that answers once its own puts are durable can answer with a value
+/// Finding: what a build left, kept once its own puts are durable, can rest on a value
 /// another build put and has not yet made durable (a kernel hit, or a shape another get
-/// already kept), so a crash loses what it answered with.
+/// already kept), so a crash loses what was kept. What is kept waits for everything
+/// ([`Wait::Everything`]); the answer waits for nothing either way.
 #[test]
 #[ignore = "finding 3 of the storemodel lane: a hit carries no ticket, so waiting on a build's own puts is not enough"]
 fn a_build_that_waits_on_its_own_puts_alone_keeps_what_it_answered() {
@@ -294,20 +321,51 @@ fn a_restore_on_a_posix_file_system_opens() {
     ));
 }
 
-/// The model's own check (rule 23): a build that answers before its store is durable is
-/// caught, at the crash that loses it, with a schedule that says so.
+/// The model's own check (rule 23): an answer given before its store is durable is no bug
+/// now, and a crash that loses what it answered with is no failure, as long as the loss or
+/// the keeping is said once its settling ends.
 #[test]
-fn the_model_catches_an_answer_given_before_its_store_is_durable() {
-    let result = store(
+fn an_answer_given_before_its_store_is_durable_is_allowed_while_it_settles() {
+    passes(store(
         "an answer before the store",
+        Model { failures: 1, ..ORDERED },
+        Search::Exhaustive,
+        &[script("w0", &[put(1, 1), Op::Answer, Op::Flush, Op::Settle])],
+    ));
+}
+
+/// The control of [`what_is_kept_after_an_answer_survives_any_crash_and_no_lost_value_is_served`]:
+/// what a build answered with, kept for reuse before its tickets were durable, is caught at
+/// the crash that loses it, with a schedule that says so.
+#[test]
+fn the_oracle_catches_a_kept_answer_relied_on_before_its_tickets_were_durable() {
+    let result = store(
+        "kept before the store",
         ORDERED,
         Search::Exhaustive,
-        &[script("w0", &[put(1, 1), Op::AnswerUnwaited, Op::Flush])],
+        &[script("w0", &[put(1, 1), Op::Answer, Op::KeepUnwaited, Op::Flush])],
     );
-    let report = result.expect_err("the model finds the answer that a crash loses");
-    assert_eq!(report.property, properties::ANSWERED_SURVIVES, "{report}");
+    let report = result.expect_err("the model finds what was kept and a crash loses");
+    assert_eq!(report.property, properties::KEPT_SURVIVES, "{report}");
     assert!(report.crash.is_some(), "{report}");
     assert!(report.steps.iter().any(|it| it == "w0: answers"), "{report}");
+}
+
+/// The control of [`what_is_kept_after_an_answer_survives_any_crash_and_no_lost_value_is_served`]:
+/// a settling that ends with the store stopped and says nothing is caught: the build answered,
+/// and what it left was neither kept nor said lost.
+#[test]
+fn the_oracle_catches_a_settling_failure_dropped_silently() {
+    let result = store(
+        "a settling that says nothing",
+        Model { failures: 1, ..ORDERED },
+        Search::Exhaustive,
+        &[script("w0", &[put(1, 1), Op::Answer, Op::Flush, Op::SettleSilently])],
+    );
+    let report = result.expect_err("the model finds the loss no one said");
+    assert_eq!(report.property, properties::LOSS_IS_SAID, "{report}");
+    assert!(report.steps.iter().any(|it| it == "w0: answers"), "{report}");
+    assert!(report.steps.iter().any(|it| it.starts_with("io: fail ")), "{report}");
 }
 
 /// The file system model: an unsynced append may be lost or torn, a synced one is kept, and a

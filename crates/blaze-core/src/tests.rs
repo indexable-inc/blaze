@@ -147,6 +147,82 @@ fn every_driver_ends_the_script_the_same() {
     }
 }
 
+/// A whole-file write and a rename that wait for no sync, with what a reader sees of each:
+/// what became of each step, by its tag.
+fn unsynced_script(driver: &mut impl Driver) -> BTreeMap<u64, String> {
+    let mut seen = BTreeMap::new();
+    // Into a directory not yet there, then over itself, then renamed over another file and
+    // into another directory not yet there; a rename of what is not there fails.
+    let mut effects = vec![Effect::WriteUnsynced {
+        file: name("placed/deep/value"),
+        bytes: b"first".to_vec(),
+        tag: Tag(1),
+    }];
+    run_until_idle(driver, &mut effects, |done, effects| {
+        let shown = match &done.done {
+            Done::Failed(_) => "failed".to_owned(),
+            // A file's time is the file system's.
+            Done::Stat(Some(meta)) => format!("stat {} bytes", meta.len),
+            other => format!("{other:?}"),
+        };
+        seen.insert(done.tag.0, shown);
+        let value = || name("placed/deep/value");
+        let next = match done.tag.0 {
+            1 => Effect::WriteUnsynced { file: value(), bytes: vec![7; 70_000], tag: Tag(2) },
+            2 => Effect::ReadAll { file: value(), tag: Tag(3) },
+            3 => Effect::Write { file: name("out/a"), bytes: b"old".to_vec(), tag: Tag(4) },
+            4 => Effect::RenameUnsynced { from: value(), to: name("out/a"), tag: Tag(5) },
+            5 => Effect::ReadAll { file: name("out/a"), tag: Tag(6) },
+            6 => Effect::Stat { file: value(), tag: Tag(7) },
+            7 => Effect::RenameUnsynced { from: name("out/a"), to: name("new/dir/b"), tag: Tag(8) },
+            8 => Effect::Stat { file: name("new/dir/b"), tag: Tag(9) },
+            9 => Effect::RenameUnsynced { from: value(), to: name("out/c"), tag: Tag(10) },
+            10 => Effect::WriteUnsynced { file: name("out/empty"), bytes: Vec::new(), tag: Tag(11) },
+            11 => Effect::Stat { file: name("out/empty"), tag: Tag(12) },
+            _ => return,
+        };
+        effects.push(next);
+    })
+    .expect("the effects end");
+    seen
+}
+
+/// [`Effect::WriteUnsynced`] and [`Effect::RenameUnsynced`] end on every driver as on the
+/// simulation: the bytes are all there to a reader once each completes, a rename replaces its
+/// target and makes its directories, and one of a file not there fails.
+#[test]
+fn every_driver_writes_and_renames_without_a_sync_the_same() {
+    let mut sim = Sim::new(1, Faults::default());
+    let simulated = unsynced_script(&mut sim);
+    let root = dir("unsynced-threads");
+    assert_eq!(simulated, unsynced_script(&mut Threads::new(&root, 2)));
+    #[cfg(target_os = "macos")]
+    {
+        let root = dir("unsynced-kqueue");
+        let kqueue = unsynced_script(&mut crate::kqueue::Kqueue::new(&root, 2).unwrap());
+        assert_eq!(simulated, kqueue);
+    }
+    #[cfg(windows)]
+    {
+        let root = dir("unsynced-iocp");
+        let iocp = unsynced_script(&mut crate::iocp::Iocp::new(&root, 2).unwrap());
+        assert_eq!(simulated, iocp);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let root = dir("unsynced-uring");
+        let ring = unsynced_script(&mut crate::uring::Uring::new(&root).unwrap());
+        assert_eq!(simulated, ring);
+    }
+    assert_eq!(simulated[&3], format!("{:?}", Done::Read(vec![7; 70_000])));
+    assert_eq!(simulated[&6], format!("{:?}", Done::Read(vec![7; 70_000])));
+    assert_eq!(simulated[&7], format!("{:?}", Done::Stat(None)));
+    assert_eq!(simulated[&9], "stat 70000 bytes");
+    assert_eq!(simulated[&10], "failed");
+    assert_eq!(simulated[&12], "stat 0 bytes");
+    assert_eq!(simulated.len(), 12);
+}
+
 /// This target's [`crate::Native`] driver, as the build path makes it, ends the script as the
 /// threads driver does.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]

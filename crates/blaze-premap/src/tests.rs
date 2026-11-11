@@ -1424,7 +1424,7 @@ fn drive(sim: &mut Sim, store: &mut Store, effects: &mut Vec<Effect>) {
 
 fn open_store(sim: &mut Sim) -> Store {
     let mut effects = Vec::new();
-    let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 40 };
+    let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 40, load_tags: (1 << 40) + (1 << 32), loader: blaze_cas::Loader::Pumped };
     let mut store = Store::open(config, &mut effects);
     drive(sim, &mut store, &mut effects);
     assert!(store.ready(), "{:?}", store.broken());

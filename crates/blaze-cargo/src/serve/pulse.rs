@@ -141,7 +141,13 @@ pub enum CeilingLook {
     Near,
     /// Back under 3/4 of the ceiling after a look that said [`CeilingLook::Near`].
     Eased,
-    /// Past the ceiling: the daemon ends ([`blaze_core::exit::Exit::MemoryCeiling`]).
+    /// Past the ceiling, the first look so since it was last at or under it: the driver purges
+    /// what the allocators keep freed (`raw::memory::purge`) and looks again at once. A freed
+    /// page the allocator keeps is no reason to end a daemon (a build died at 23.04 GiB with
+    /// 7.52 GiB of it freed and kept).
+    Purge,
+    /// Still past the ceiling after a purge: the daemon ends
+    /// ([`blaze_core::exit::Exit::MemoryCeiling`]).
     Passed,
 }
 
@@ -154,6 +160,8 @@ pub enum CeilingLook {
 pub struct CeilingWatch {
     /// The last look that was not under said near, and none has said eased since.
     near: bool,
+    /// A look past the ceiling said purge, and none since was at or under it.
+    purged: bool,
 }
 
 #[cfg(all(unix, feature = "native"))]
@@ -163,11 +171,16 @@ impl CeilingWatch {
     pub fn look(&mut self, footprint: u64, ceiling: u64) -> CeilingLook {
         if ceiling == 0 {
             self.near = false;
+            self.purged = false;
             return CeilingLook::Under;
         }
         if footprint > ceiling {
+            if !std::mem::replace(&mut self.purged, true) {
+                return CeilingLook::Purge;
+            }
             return CeilingLook::Passed;
         }
+        self.purged = false;
         let near = footprint >= ceiling - ceiling / 8;
         let eased = footprint < ceiling / 4 * 3;
         match (self.near, near, eased) {
@@ -295,10 +308,12 @@ mod tests {
     const GIB: u64 = 1 << 30;
 
     /// The guard's decision on a daemon's footprint against a ceiling of 48 GiB: under it, or
-    /// at it exactly, the daemon runs on; one byte past it, it ends. Near (42 GiB, 7/8) and back
+    /// at it exactly, the daemon runs on; one byte past it, it purges, and still past it after
+    /// the purge, it ends. Near (42 GiB, 7/8) and back
     /// under 3/4 (36 GiB) are each said once a crossing, never on every look. Make `look` never
     /// say `Passed` and a daemon past its ceiling runs on; make it compare with `>=` and one
-    /// exactly at its ceiling is ended.
+    /// exactly at its ceiling is ended; make it skip the purge and one whose allocator only
+    /// kept freed pages is ended.
     #[test]
     fn a_footprint_past_its_ceiling_ends_the_daemon_and_near_it_is_said_once() {
         let ceiling = 48 * GIB;
@@ -316,18 +331,26 @@ mod tests {
             30 * GIB,
             47 * GIB,
             ceiling + 1,
+            // The purge gave enough back.
+            ceiling,
+            ceiling + 1,
+            ceiling + 1,
         ];
         let said: Vec<CeilingLook> = looks.iter().map(|&at| watch.look(at, ceiling)).collect();
-        use CeilingLook::{Eased, Near, Passed, Under};
+        use CeilingLook::{Eased, Near, Passed, Purge, Under};
         assert_eq!(
             said,
-            [Under, Under, Under, Near, Under, Under, Under, Under, Eased, Under, Near, Passed]
+            [
+                Under, Under, Under, Near, Under, Under, Under, Under, Eased, Under, Near, Purge,
+                Under, Purge, Passed
+            ]
         );
         // No ceiling is no bound, whatever the footprint.
         assert_eq!(CeilingWatch::default().look(u64::MAX, 0), Under);
         // A tiny ceiling holds as a large one does.
         let mut small = CeilingWatch::default();
         assert_eq!(small.look(8, 8), Near);
+        assert_eq!(small.look(9, 8), Purge);
         assert_eq!(small.look(9, 8), Passed);
     }
 

@@ -1887,12 +1887,19 @@ mod tests {
         image.entry = None;
         let init = image.functions[0].addr;
         image.exports = vec![
-            Export { name: "init".to_owned(), addr: init, size: 4, kind: SymbolKind::Function },
+            Export {
+                name: "init".to_owned(),
+                addr: init,
+                size: 4,
+                kind: SymbolKind::Function,
+                weak: false,
+            },
             Export {
                 name: "__heap_base".to_owned(),
                 addr: DATA + 16,
                 size: 0,
                 kind: SymbolKind::Other,
+                weak: false,
             },
         ];
         let module = image.module().unwrap();

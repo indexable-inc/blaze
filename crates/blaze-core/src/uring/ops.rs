@@ -129,6 +129,11 @@ pub(super) const WHOLE: u8 = 1 << 3;
 pub(super) const MAKE: u8 = 1 << 5;
 /// A request on a path whose missing directories were made once: a second `ENOENT` fails it.
 pub(super) const MADE: u8 = 1 << 7;
+/// A [`Kind::Write`] or a [`Kind::Rename`] that waits for no sync
+/// ([`crate::Effect::WriteUnsynced`], [`crate::Effect::RenameUnsynced`]): each sync of its chain
+/// is a no-op in its place, so the chain's links and results are as a synced one's (the bit
+/// [`WHOLE`] is).
+pub(super) const UNSYNCED: u8 = 1 << 3;
 /// A [`Kind::Stat`] of a symbolic link itself, not followed ([`crate::Effect::Lstat`]; the bit
 /// [`WHOLE`] is).
 pub(super) const NO_FOLLOW: u8 = 1 << 3;

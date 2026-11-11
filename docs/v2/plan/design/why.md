@@ -1,201 +1,213 @@
 ---
 status: plan
-summary: blaze why, which says exactly why the last build computed something again instead of reusing it, by key part, read or reason, never by guess.
-date: 2026-11-02
+summary: Why blaze recomputed each step of a build, said after every build and by `blaze why`, as a chain from the step through the key parts that differ down to a real input change (a file, a variable, a flag) or one of a closed set of other terminal reasons; an unexplained recompute is a blaze bug and is counted.
+date: 2026-11-10
 ---
-# Lane why-miss: `blaze why`
+# Why a build recomputed what it did
 
-## What it is for
-
-A warm build that recompiles too much is slow for a reason somebody has to find. `blaze why`
-says what the last build computed again and why, by name and never by hash:
+Lane why-always (2026-11-10), over lane why-miss (2026-11-02). A warm build that recomputes
+anything did so for a reason, and blaze says it: after every build, in a few lines grouped by
+root cause, and in full with `blaze why`. A reason is a chain that ends at an input that really
+changed, never at a hash and never at "its key changed".
 
 ```
-$ blaze why
-build 12 computed 3 things again:
-
-  2 codegen dev template: `the code of `app::Frame::new`, built in` changed
-    app::render
-    app::draw
-  1 build script run: `env CC` changed
-    ring v0.17.8
-
-$ blaze why app::render
-build 12: app::render (codegen dev template) was computed again: `the code of `app::Frame::new`, built in` (3f.. -> 9a..) changed since build 11 (of 7 in its key)
-  because app::Frame::new (codegen dev template) was computed again: `its code` changed since build 11 (of 5 in its key)
+$ blaze build
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.61s
+note: recomputed 3 steps because crates/core/main.rs changed  [why: input]
+  ┌ codegen dev template: main, rg::main
+  └ unit: ripgrep v15.1.0 (bin "rg")
 ```
 
-`--json` prints the API's answer as it is.
+## The model
 
-With `--all`, every group lists every item; without it the daemon sends each group's first 8
-and its count, so the answer stays small after a cold build. The answer is of the last build of
-the workspace holding the current directory, and names that build's command and workspace.
-Before any build of it has ended since the daemon started, it says so; earlier builds' reasons
-are in the history's `misses` table. A `blaze why` asked while builds that ended before it are
-still being explained on the history's thread waits for those builds, never for ones that end
-after it was asked, so it is never answered from the build before and a stream of builds can't
-hold it. It waits at most 30 seconds on the loop's clock (`WHY_WAIT`); past that it fails,
-naming the oldest build still being explained and what the history's thread is doing (restoring
-the ledger, explaining or appending build N, flushing the history for build N). Once the
-history's thread has ended, a `blaze why` asked after a build it never explained fails, naming
-that build and that `blaze-history` ended, never answered with an older build's reasons.
+1. **A step has an identity that does not depend on its key**: which step, of which item
+   (`blaze_kernel::Miss::step` and `subject`). A unit is its workspace root, package, target,
+   mode, platform, profile and whether it is std's or checked as a test. A codegen dev template
+   is its function (identity, which instance, whose code it is) and its codegen settings, and
+   nothing of the unit that happened to ask for it: the template store is shared by every unit
+   and workspace, and so is its record. A build script's run is its run unit.
+2. **A key is named parts** (`blaze_kernel::Part`), each one of three kinds (`PartKind`):
+   - `Input`: something the build is given: a variable, a flag, a setting, the toolchain, the
+     target, the code identity of blaze itself.
+   - `File`: the bytes of a file, named by its absolute path. A Rust source file of a
+     workspace crate also carries its **code text** hash (`Part::code`, blaze-lower's
+     `code_text`: the text with every comment no macro can see replaced by its shape), so a
+     change of bytes that leaves the code text alone is known to have changed no item.
+   - `Result`: the value of another step, named by that step's item (`Part::names`) where it
+     has one.
+   The parts are recorded when the step is computed (on a miss only, never on a hit), in the
+   ledger, under the step's identity.
+3. **On a recompute the reason is the diff** of the parts against the last record of the same
+   identity (`RebuildCause`, unchanged from lane why-miss: `Parts`, `First`, `Lost`, ...).
+4. **The chain ends in terminal reasons** (`blaze_api::Reason`, a closed set; `Rebuild::ends`),
+   worked out by `Ledger::explain` for every recomputed step:
 
-## How a reason is made
+   | terminal | when |
+   |---|---|
+   | `InputChanged { file, input, trivia }` | an `Input` or `File` part differs. `trivia`: a file whose bytes changed and whose code text did not (comments only): no item changed, so the recompute is wasted work and a bug in the key that held the bytes |
+   | `FirstTime` | no record of the identity, ever |
+   | `Evicted { by: Memory, Age or Cap, when }` | it was computed before and the result or its record was dropped; the dropper recorded that it did |
+   | `PreviousFailed { since }` | its key is the one of its last compute, which was in a build that failed or was stopped and kept nothing |
+   | `Forced { how }` | computed because it was asked for: a build script named in `unsandboxed-build-scripts` runs every build |
+   | `KeyUnstable { part }` | a `Result` part differs though the step it names was not computed in between: the same inputs gave another value, a determinism bug in blaze. Defined and printed, not yet produced: until hits are recorded it cannot be told from a reuse under an older key, so that case is `Unexplained` |
+   | `Unexplained { what }` | anything else. A blaze bug: printed as one, counted (a `blaze` warning event a build, with the count, where the profile's events see it), and the fixtures assert there are none |
 
-1. **At the miss, per build.** Each producer makes a `blaze_kernel::Miss` where its lookup
-   found nothing, never on a hit, and gives it back with what it built, so a build's misses are
-   its own: codegen's `Built::misses` (only when asked, `Build::explain_misses`, which the
-   daemon's units are and nothing else is), a unit's `Compiled::misses`, a run's
-   `RunPuts::misses`. The loop gathers them into the job and hands them over sorted in
-   `Ended::misses`. A miss carries the step, a **subject**, the item by path (for a person
-   only), the key, and the key's parts by name, each with its own hash, each name once.
-   - **The subject** is what an item is across edits, telling apart instances side by side:
-     a unit by its workspace's root, package, target name and kind, mode, platform, profile and
-     whether it is std's or checked as a test (one `BLAZE_HOME`'s ledger holds every
-     workspace's, and a registry crate's package id is the same in each); a function by its
-     identity (item, which instance, type arguments) and whose code it is, within its unit's
-     subject (its settings are a part, so a settings change is named, not read as a first
-     compute); a build script's run by its run unit's subject.
-   - **codegen dev template** (`blaze-codegen` driver, on a store miss): the toolchain, the
-     code, the type arguments' facts, the settings, the kinds of its references, and each body
-     it builds in, named by path (and by whose code it is where two share a path).
-   - **unit** (`serve/unit/compile.rs`, when the record lookup misses): each `RecordInputs`
-     field, and each dependency by the name it is used under. The parts are made from inputs
-     gathered again and refused unless they make the very key the record was looked up under.
-     Past the key, a record is filed under the values of the variables and proc-macro reads it
-     traced (`beyond`). A unit whose front end can't say its inputs is `Always`; one whose
-     identity was not set when looked up is `Failed`, naming that.
-   - **build script run** (`serve/unit/script.rs`, a sandboxed run that starts): the script's
-     code and each part of `Given` (`env CC`, its arguments, its standard input, each named
-     part). Past the key are what it traced when it last ran. A run outside the sandbox is
-     `Always`.
-   - **proc-macro expansion**: not given back. Its key is the call's input tokens, nothing
-     about the call site ties it to its last expansion, and the expander has no per-build out
-     to give a miss through.
-2. **A step the kernel computes** (`Kernel::why`): lazy, and it writes nothing. The caller
-   hands in the key of the entry it saw kept last under the identity (`Got::Computed::key`,
-   kept as `Miss::kept` and remembered by the daemon's ledger); the kernel reads that entry,
-   rehashes its reads and names the first one that changed, with its old and new hash and how
-   many of its reads changed in all. Nothing handed in is `New`, or `Unrecorded` when shapes
-   are kept; an entry not in the store is `Collected` (that compute did not keep it); every
-   read the same yet no shape names it is `Unshaped` (a keep that did not finish). No
-   production step is a kernel `Compute` yet; codegen's dev template is whole-keyed, so it
-   uses parts.
-3. **Against the last compute** (`blaze-cargo` `serve/why.rs`, `Ledger`, sans-IO): a miss
-   with parts is compared with what the ledger holds of the same step and subject, from the
-   last build that computed it, however that build ended: a failed or cancelled build moves
-   the ledger on too (a keep-going build that failed computed what it computed, under the key
-   it names), recorded as not ended well; the next miss of the same key, nothing kept under it,
-   reads as `Unfinished`: that compute likely failed or was stopped. Recording only builds that ended well left a run of failed builds with every miss
-   read as `First`. Builds between may have reused it under another key,
-   so each cause names the build it is compared with ("since it was last computed, in build N").
-   - `First`: the ledger has no record of the subject.
-   - `Parts`: the key changed, and the parts that changed are named.
-   - `Unnamed`: the key changed but every named part is the same, so the key has a part it
-     does not name. That is a bug in the producer.
-   - `Lost`: the key is the same, yet nothing is kept under it now: that compute did not keep
-     it, or it was collected since.
-   - `Unfinished`: the key is the same, nothing is kept under it, and the build that last
-     computed it did not end well: that compute likely failed or was stopped.
-   - `Beyond`: the key is the same, so what the value is filed under past the key differs, or
-     that compute did not keep it. Which of the two it was is not explained yet.
-   - `Twice`: two different misses of one step under one subject in one build. Neither is
-     compared or recorded (rule 18): the subject told them apart by less than their keys.
-   - A record from before a **gap** (a build whose record did not reach the file: an append
-     failed, or the daemon stopped during one) is compared with nothing: `NotExplained`, naming
-     both builds, as the subject may have been computed in the gap.
-4. **Where it runs**: the ledger lives on the `blaze-history` thread (`serve/why/file.rs`),
-   which explains each build's misses, sends the answer to the loop, then appends. The loop
-   only moves the misses over and keeps each workspace's last answer (`Answers`, at most 16
-   workspaces).
-5. **The answer** (`Answers::rebuilt`, on the loop, in a span): sorted by item, so an item's
-   reasons are a binary search and a chain walks each item once. Without an item, groups by
-   step and reason are made on the daemon.
+   A differing `Result` part is followed (`serve/why.rs`, `Ends`):
+   - the step it names was recomputed in this build: its ends are this step's too;
+   - it was not, and the ledger's records of that item are from a build after this step's last
+     compute: their recorded ends (`Last::ends`) are this step's (it changed in a build this
+     step took no part in);
+   - it was not, and every record of it is older: `Unexplained`, saying so (`KeyUnstable`
+     once hits are recorded);
+   - it names no step (a dev template's `its code`): the unit that computed it
+     (`Miss::via`) is followed, since a unit's key covers, deeply, every source its functions'
+     code is made from;
+   - nothing to follow: `Unexplained`, naming the part.
+   The walk visits each step of the build once (bounded by the build's recomputes), and a
+   step keeps at most 8 ends (`ENDS`), the first in order.
+5. **What is not a real reason is `Unexplained`**, each naming what is missing: `Lost` and
+   `Collected` (nothing is kept under the unchanged key, and whoever dropped it did not
+   record doing so: the store's eviction does not tell the ledger yet); `Beyond` for a unit
+   (the values of its traced variables and proc-macro reads are not kept); `Unnamed` and
+   `Twice` (the key or the identity is coarser than it says); `Always` for a unit whose front
+   end can't say its inputs; `Unrecorded`, `Unshaped`, `NotExplained`, `Failed`.
+
+## What each step's parts are
+
+- **unit** (`serve/unit/compile.rs`, `RecordInputs::parts`): each field of the record key as
+  an `Input`, each dependency by the name it is used under, and, in place of the one part
+  "the crate's identity in the front end", what that identity is made of
+  (`blaze_lower::Lowered::identity_parts`, the same values `identity_of` hashes): the crate's
+  own settings (root path, cfgs, env, edition, target) as an `Input`; each file it is made
+  from as a `File` (its root file alone for a crate that reads no other; else every file of
+  its source root, with the code text of a workspace crate's Rust files); how cargo names its
+  root; and each crate it depends on as a `Result` naming that crate's unit. The parts are
+  refused unless inputs gathered again make the very key the record was looked up under. A
+  source root past 4096 files (`FILES_NAMED`) names its first 4096 by path and the rest as
+  one part.
+- **codegen dev template** (`blaze-codegen` driver): the toolchain and settings (`Input`);
+  its code, its type arguments' facts and the kinds of its references (`Result`, of no
+  recorded step: followed through `Miss::via`); each body built in (`Result`, by path).
+- **build script run** (`serve/unit/script.rs`): the script's code (`Result`), each part of
+  `Given` (`Input`), and once the run ends each read it traced (a file as a `File`, a
+  variable, a directory's names; past 1024 the rest are one part).
+- **A step the kernel computes** (`Kernel::why`): the first read that changed; none is in
+  production yet.
+- **Not given back yet**: proc-macro expansion, link, test selection (see "Not yet").
 
 ## Where it is kept
 
-- **History**: the `misses` table (docs/profiling.md), one row for each thing computed again,
-  written by the build's flush.
-- **Ledger**: `why.ledger` in the history's directory. It starts with a 32-byte magic,
-  `blaze why ledger` and the first 16 bytes of the version: a hash of the encoding of a record
-  with every field set and of a naming version (bumped when part names or subjects are made
-  another way), so any change is a new version. Only types the ledger owns are written: one
-  framed deterministic-CBOR record per build, however it ended, the subjects it computed with
-  their key, parts and kept entry; a compacted record also carries the gap and the newest build
-  a dropped subject was last computed in.
-  - **Restore**, on the history's thread after the daemon has started (answers say "still
-    restoring" meanwhile): an empty file or part of the magic is begun again. A last record cut
-    short, or zeros after the last whole record (a file grown before its data landed), is a torn
-    tail: the bytes past the last whole record are copied to `why.ledger.tail.<n>` first, and a
-    gap after the newest record read is marked. The ledger, gap in it, is then written whole
-    over the file (hidden file, renamed), never cut in place first, so a crash before that
-    write finds the tail and the gap again. Only if the whole write fails is the file cut back,
-    and only once the gap is in `why.ledger.gap`; if that can't be written either, the file is
-    left as it was. A tail with no record before it holds no gap and is cut in place. A
-    restart otherwise never rewrites the ledger before answering: a due compaction waits for
-    the first append. A file that can't
-    be read, is another version's or has a record that does not decode is moved aside to
-    `why.ledger.<why>.<n>` and never written over; for a record that does not decode, a gap is
-    marked after the records read before it. Asides keep the newest 4 of each kind. Each is
-    reported in `blaze daemon status`, and a file moved aside with every answer
-    (`Rebuilt::torn`). Stale hidden files of a cut-short whole write are removed. Of two gaps
-    the later is kept.
-  - **Append**: synced, the directory too when it made the file. One that fails is cut back,
-    and the build is marked a gap in memory and in `why.ledger.gap`, which a restart reads (a
-    gap file already there that names an earlier build is replaced whole by the later one);
-    each build then writes the whole ledger until one succeeds.
-  - **Compaction**: once the file is past 4 MiB and twice its last whole write, the whole
-    ledger is written (hidden file, synced, renamed, directory synced), its subjects last
-    computed longest ago dropped past about 64 MiB. Answers note the drop when they hold an
-    item read as computed first (`Rebuilt::dropped`).
-- **API**: `Request::Rebuilt { all, cwd, item }` and `Response::Rebuilt(Rebuilt)` (schema 26),
-  answered by the daemon's loop. `blaze why` is a client of it.
+- **Ledger** (`why.ledger` in the history's directory; `serve/why.rs` the sans-IO core,
+  `serve/why/file.rs` its driver on the `blaze-history` thread): per identity, its last
+  compute: key, parts (name, hash, kind, code text hash, the item named), the item's name, the
+  build, whether that build ended well, and the ends worked out then. One framed
+  deterministic-CBOR record per build; magic and version as before (`NAMING` 6), an older
+  file is moved aside.
+- **The cap never turns a reason into `FirstTime`.** Past `CAP_BYTES` (64 MiB) a compaction
+  shrinks the identities computed longest ago to **tombstones**: identity, build and item,
+  no parts (about 100 bytes plus the name, against 0.5 to 100 KiB whole). A miss of a
+  tombstoned identity is `Evicted { by: Cap, when }`. The latest record of every identity is
+  kept, whole or as a tombstone, up to `TOMBS` (1,000,000) tombstones; only past that are the
+  oldest tombstones removed, which is counted and said (`Rebuilt::dropped`), since their next
+  miss then does read `FirstTime`.
+- **History** (`misses` table): one row per recomputed step, as before; `cause` is the diff's
+  kind. `key_parts` holds each miss's parts.
+- **Restore, append, gap, compaction, "answered before durable"**: unchanged from lane
+  why-miss and documented in `serve/why/file.rs`: a torn tail is copied aside and marks a gap;
+  a failed append marks `why.ledger.gap`; a record from before a gap is compared with nothing
+  (`NotExplained`, so `Unexplained`, naming both builds); another version's file is moved
+  aside, never misread.
 
-### Answered before durable
+## What is printed
 
-The history's thread sends a build's answer to the loop before it appends the build's record
-to the ledger. A `blaze why` can therefore name a build whose record a crash then loses: if the
-daemon dies after the answer is sent and before the append starts, the file has no trace of the
-build, no gap is marked, and the next daemon compares that build's subjects' next misses with
-the record before it. The window is one explain-to-append step on one thread, and the history's
-own `builds` row for that build is lost in the same window (it is written by the flush after
-the append), so the history and the ledger stay consistent with each other. Closing it would
-mean appending before answering, which puts an fsync on every `blaze why` held for a build.
-A failed append is covered: it marks `why.ledger.gap`. A crash during one is covered only once
-some of its bytes reached the disk: a torn tail the restore turns into a gap. A power loss
-before its `sync_data` can leave no trace of it at all, which is the same window as above: no
-gap, and the build's subjects compared with the record before it.
+**After every build that recomputed something** (`blaze build`, `check`, `test`, `run`'s
+build; not yet the live test view, `cli/live.rs`), once `Finished` is out: the CLI asks the daemon for the build's summary
+(`Request::Rebuilt { build: Some(id), .. }`, `Rebuilt::summary`) and draws each report with
+the one renderer (docs/v2/plan/design/structured-output.md). Under `--message-format=json`
+each is a `{"reason":"blaze-report","report":{...}}` line. Nothing is said by a build that
+recomputed nothing, under `-q`, or when no daemon ran the build. A build that recomputed
+nothing says so in its `Work` (`Worked::misses` of 0, the count of the misses the summary
+is made of), and its CLI then asks nothing: a no-op build makes no second round trip.
 
-### Known rule-22 violation: which unit a shared generic's miss goes to
+One `Report` a root cause (the set of ends a step has), the most steps first, at most 4
+(`CAUSES`); past that one line counts the rest and names `blaze why`. Each has a fact a step
+kind, most first, naming at most 3 items and counting the rest:
 
-Dev template keys don't depend on the unit, but codegen misses are re-subjected under the unit
-that reports them (`compile.rs`). Which unit's subject a shared generic's record lands under
-depends on which unit's put landed first, so the ledger and the `misses` rows can change from
-run to run (rule 22), and a later miss under the other unit reads `First` ("no record of
-computing it before"), which is misleading. Making the subject unit-independent brings back
-`Twice` for one function built at two settings, since settings left the subject, so the fix
-needs the hits per template key (the same gap the existing hit and miss counts have). Tracked
-as a known violation: issue to file. Interim wording to consider: for the `codegen dev template`
-step, `First` reads "no record of this unit's instance".
+| root cause | severity, rule | headline |
+|---|---|---|
+| input | note, `why:input` | `recomputed N steps because PATH changed` (or `` `env CC` changed``; inputs joined by `and`; past 3, a count) |
+| trivia only | warning, `why:wasted` | `recomputed N steps because PATH changed, though no item in it did (comments only): wasted work, a bug in blaze's keys` |
+| first time | note, `why:first` | `computed N steps for the first time`, no facts: a cold build is one line |
+| evicted | note, `why:evicted` | `recomputed N steps because blaze why's ledger dropped its records of them to stay under its cap` |
+| previous failed | note, `why:failed` | `recomputed N steps because the last compute of each failed or was stopped` |
+| forced | note, `why:forced` | `recomputed N steps because that was asked for: HOW` |
+| key unstable | warning, `why:unstable` | ``recomputed N steps because `PART` came out different from the same inputs (a determinism bug in blaze)`` |
+| unexplained | warning, `why:unexplained` | ``N steps recomputed for no recorded reason: a blaze bug (`blaze why --unexplained`)`` |
+
+A cause with several kinds of end joins their clauses with `and`. The summary is a function of the
+build's explained misses alone: sorted, no clock, no map order (`deterministic-output`).
+
+**`blaze why`**: the groups by step and diff, as before, each item's chain with `blaze why
+ITEM`, `--all`, `--json`. **`blaze why --unexplained`** lists only the steps with an
+`Unexplained` end, each with what is missing.
+
+## Cost
+
+- **Recording**, paid on a miss only, by the worker that missed, before it computes: the
+  parts hashed one by one. A unit: its record inputs gathered again (as before) and one
+  content ID read per file of its crate (already held by the front end) plus the code text of
+  each workspace Rust file (a memoized query over a parse the compile needs anyway). A dev
+  template: no new hashing.
+- **Bytes per step recorded** (`weight`): 160 + the step's and item's names + 56 a part + each
+  part's name: about 0.5 KiB a dev template, 3 KiB plus 100 B a file for a unit.
+- **Explaining and the summary**: on the `blaze-history` thread, after the build's `Done` has
+  been sent; linear in the build's misses and their ends. The client's one extra request
+  after `Finished` waits for that thread (bounded by `WHY_WAIT`, 30 s; milliseconds
+  expected).
+- None of this is measured yet: the numbers above are from the encoding, not a profile. The
+  check is `blaze slow` on ripgrep before and after, quoted from the spans (`explain a
+  build's misses`, `unit record lookup`).
+
+## Tests
+
+Invariants (`serve/why.rs` tests, over a model of ripgrep's three crates and every way their
+files can be left, commented or edited; each with its planted-bug control, `Plant`):
+- every recomputed step of a build has ends, none `Unexplained`
+  (`the_oracle_catches_a_result_part_not_followed`);
+- an `InputChanged` end names a file the two builds really differ in, as trivia exactly when
+  its code text is the same (`the_oracle_catches_an_unchanged_part_blamed`). It holds for a
+  build against the one before it; with a reuse in between (A, B, A reused, C) the diff is
+  against B, which is the "hits are not tracked" gap below;
+- the summary is the same whatever order the misses arrive in
+  (`the_oracle_catches_ends_in_the_order_reached`).
+
+Fixtures: each terminal reason that is produced (all but `KeyUnstable` and an eviction by
+memory or age); the three edits of ripgrep that started this lane (a body edit, a comment in
+the same file, a comment in a leaf crate), asserting the text names the file and, for the
+comments, says no item changed. These run on the model, with the producers' misses built by
+hand: the producers themselves (`identity_parts`, the driver's parts) have no test yet.
 
 ## Not yet
 
-- The values behind `Beyond`: a unit's traced variables and proc-macro reads, and a build
-  script's traced reads. Their slots keep the names, not the values, so naming the one that
-  changed needs the read's value kept beside its hash.
-- A call-site identity for proc-macro expansions.
-- Test selection's dropped `Why` (`serve/unit/test.rs`) and link's `LinkHow::Full { why }` are
-  not in the answer yet.
+- **Items within a file.** A `File` end says the file and whether any item changed; it does
+  not yet name the items and which of their hashes moved (interface, layout, code). The item
+  layer (`blaze-item-hash`) has them per body; recording them per unit costs a query a body.
+- **Evictions by memory and age.** The store's eviction does not tell the ledger, so a
+  dropped result reads `Unexplained` (`Lost`), which is the bug it is. `blaze clean` likewise
+  is not yet `Forced`.
+- **Steps with no parts**: link (`LinkHow::Full { why }`), test selection's `Why`,
+  proc-macro expansion (no call-site identity), build script compile as its own step, and
+  front-end queries (the `provenance` table has them, the chain does not follow into them).
+- The values behind `Beyond` for a unit (its traced variables and proc-macro reads).
 - A unit that fails before its store phase gives back no misses.
-- Hits are not tracked: after A, B, A (reused), C, C is compared with B (and says build B).
-- Which unit reports a shared generic's miss depends on which unit's put landed first (rule
-  22, see above; issue to file).
-- Frames have no checksum: a bit-rotted length in a middle record reads as a torn tail. The
-  bytes cut are copied aside first, so nothing is lost for good, but the later records are not
-  replayed. A per-frame checksum (and a version bump), with a frame past the end or failing its
-  checksum read as a torn tail only when it is the last one, would tell the two apart.
-- A dependency part names no dependency unit, so a chain does not follow a dependency.
+- Hits are not tracked: after A, B, A (reused), C, C is compared with B.
+- Frames have no checksum: a bit-rotted length in a middle record reads as a torn tail.
 - `--all` after a cold build is not paged.
-- No restart-to-first-answer budget test: the restore no longer holds up the start, and its
-  own cost is bounded by the cap.
-- The end-to-end path (build, edit, `blaze why`) has not been run.
+- A count of unexplained steps as a column of the history (`builds` or `misses`), so `blaze
+  slow` and SQL can gate on it; today it is an event.
+- The summary in the live test view (`cli/live.rs`).
+- A dev template computed under two keys for one function and settings in one build (two
+  units whose builds of a shared generic differ in what is built in) is `Twice`, so
+  `Unexplained`: whether that happens on real projects is not known.
+- The end-to-end path on a real project (ripgrep, the three edits) has not been run on this
+  lane's tree, and nothing here has been compiled.

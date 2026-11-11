@@ -284,8 +284,6 @@ def main(args: Input) -> None:
     if PLATFORM not in ("darwin", "linux"):
         fail(SCRIPT, f"shared blocks are measured on macOS and Linux, not {PLATFORM}")
     eng = engine_of(args.engine)
-    if eng.kind != "v2":
-        fail(SCRIPT, "engine.kind: v2; v1 has no build directory under its home and no store it places from")
     rep = report.Report(SCRIPT, args.engine, args.out)
     work = engine.work_dir(args.work, "bz-clone-out-")
     work.mkdir(parents=True, exist_ok=True)

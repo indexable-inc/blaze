@@ -30,8 +30,8 @@ one level down:
     harness/                  the test harnesses and their fixtures
     tools/                    what builds, releases and measures blaze: agents/ (the agent rules
                               AGENTS.md is generated from), nix/ (the flake's unit graphs), pgo/
-                              (the pinned PGO profiles), bench/results/ (recorded results),
-                              remote-cache/ (the cache gateway Worker), typed-input/ (the Python
+                              (the pinned PGO profiles), bench/remote-cache/ (the cache gateway's
+                              measurements), remote-cache/ (the cache gateway Worker), typed-input/ (the Python
                               workspace's shared helper), v2/ (the lanes' scripts and queue)
     docs/                     these documents; docs/future/ the plans for work not started,
                               fed1eb428d:docs/reports/ working reports, docs/v2/ the v2 plan and the lanes'
@@ -54,7 +54,6 @@ The crates to know first:
     crates/blaze-build-script/ build scripts run as cargo runs them, with no cargo (no-rustc.md, step I)
     crates/blaze-resolve/     cargo's resolver owned by blaze: the package model, Cargo.lock, versions, features
     crates/blaze-registry/    registries read and packages fetched as cargo does, with no cargo
-    crates/blaze-wasm/        experiment: the compiler running in a web page (not in the workspace)
     .github/SECURITY.md       what to know before sharing a store, and how to report a problem
     crates/hir-def/, hir-ty/, syntax/, parser/, ...
                               the front end: crates derived from rust-analyzer (below)
@@ -134,8 +133,8 @@ with blaze's changes made in place. That branch and its history are kept as
 blaze supports one toolchain, the latest nightly, pinned by date in `harness/toolchain`
 (`nightly-2026-10-27`, which says `rustc 1.101.0-nightly (16d1ffac1 2026-10-26)`). Stable
 Rust is not a separate target: what a stable release builds, the nightly builds. blaze
-itself is built with that nightly (`cargo +"$(cat harness/toolchain)"`; in `nix develop`
-plain `cargo` is it), and so are the harnesses' reference builds. The pin is written in that
+itself is built with that nightly by blaze, which brings it (`blaze toolchain`): no rustup, and
+no `cargo` or `rustc` of it is run. The pin is written in that
 one file; everything else reads it or is written from it:
 
 - `crates/blaze-cargo/src/toolchain/pins.txt` (by `harness/toolchain_pins.py '{"write": true}'`): the
@@ -235,14 +234,16 @@ files are, what they hold, the DuckDB queries that answer each question and the 
   main after the merge, and a red train opens or adds to the issue "Release train is red",
   with the commits since the last green one ([harness.md](harness.md#ci)). The gate letting a
   change through is not the harnesses passing on it.
-- blaze builds in the flake's dev shell, against the LLVM it pins:
-  `nix develop -c cargo build -p blaze-engine --release` ([LLVM](#llvm)).
+- blaze builds blaze, never cargo or rustc: with the release `.github/blaze-version` names as
+  stage 0 (`sh site/install.sh --version "$(cat .github/blaze-version)"`, as
+  `.github/actions/blaze` installs it), `blaze build --release --locked -p blaze-engine`, against
+  the LLVM blaze pins and fetches itself ([LLVM](#llvm)).
 - `blaze fmt --all` (nothing checks it, and `fmt.yaml` formats main after the merge, but a
   pull request's diff should be its change), and
-  `cargo test --release -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax` from the root (or
-  `python3 harness/unittests.py`, the one `cargo test` CI runs, with the failures it expects).
-  A test that fails is new unless `harness/known-failures.toml` lists it with an owner:
-  `uv run --frozen harness/failures.py '{"run": {"runner": "blaze", "packages": [...]}}'` runs the
+  `blaze test --release --locked -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax` from the root (or
+  `python3 harness/unittests.py`, what CI runs: every test of the workspace, with the failures it expects).
+  A test that fails is new unless `harness/known-failures.toml` lists it:
+  `uv run --frozen harness/failures.py '{"run": {"packages": [...]}}'` runs the
   crates you touched and says which failures are new ([harness.md](harness.md#ci)).
 - For anything that changes numbers in [results.md](results.md): the command, the commit
   and the machine, so the entry can be replaced and not just appended to.

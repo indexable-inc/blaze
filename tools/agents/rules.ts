@@ -494,6 +494,14 @@ export const rules = [
 		reason: "Andrew, 2026-11-09, on a day when agents wrote about 25,000 lines: \"anyone building with agents and accumulating piles of generated code [should] start making semantics, invariants, and refinement properties first-class artifacts\"; \"try to have this as first class\"; and that tests, the simulation and the Lean verifier should be tied together rather than three separate things.",
 		link: "docs/v2/plan.md#11-proof-by-check-not-by-review",
 	},
+	{
+		id: "guard-the-cause",
+		skill: "changing-code",
+		line: "When you find bad code or a bad decision, find why it was made and remove that cause with a guard (a lint, a check in the gate, a rule or a skill's instruction), so it cannot be written again; do this unasked.",
+		info: "Bad code is a symptom. When you find some (jank, a subpar design, a bug that sat unseen, a wait nobody named, a second way to do one thing), fix it, then ask why it was written that way and why nothing caught it: a missing lint, a harness that was broken or bypassed, a rule that did not say, a skill that told nobody how, an interface that made the wrong thing the easy thing, a measurement nobody ran. Remove that cause in the same change or the next: a blaze lint with a fix that finds every other instance (`fix-through-blaze-lints`), a check that joins the gate, a rule or skill instruction that says what to do instead, or a change to the interface so the mistake cannot be expressed. The fix is not done until the guard exists and has been run over the whole tree. Do it proactively: you do not wait to be asked, and you say in your report what the cause was and what now guards it. A guard that only describes the one instance you found is not one; state the general rule it enforces.",
+		reason: "Andrew, 2026-11-10, after a day of finding that every edit dropped the front end, held its answer for a disk sync and hung inside the sandbox, none of it seen because the budget harness was broken and the gate bypassed: \"think about why these design decisions were made and try to fix root cause ... if see bad code proactively make lints or etc or better instructions to avoid it or systems to avoid\".",
+		link: "docs/contributing.md#what-a-change-needs",
+	},
 ] as const satisfies readonly Rule[];
 
 /**

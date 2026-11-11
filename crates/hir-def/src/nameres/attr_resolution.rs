@@ -111,8 +111,10 @@ impl DefMap {
             // `blaze::sans_io_core` the second from `AttrFlags::SANS_IO`, `blaze::checkfree`
             // the third from `AttrFlags::CHECKFREE`, `hir-ty-pure` the fourth from
             // `AttrFlags::PURE`, the layout and MIR the fifth from `AttrFlags::BLAZE_BITS`),
-            // and `#[blaze::nopanic]`, `#[blaze::noalloc]` and `#[blaze::nonblocking]`
-            // (`hir-ty-effects`, from `AttrFlags::effect_attr`), and `#![blaze::specialization]`
+            // and `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]`,
+            // `#[blaze::may(..)]` and `#![blaze::effects]` (`hir-ty-pure`, from
+            // `AttrFlags::effect_attr`, `AttrFlags::may_attr` and `AttrFlags::BLAZE_EFFECTS`),
+            // and `#![blaze::specialization]`
             // and `#[blaze::specialization_trait]` (`hir-ty-specialization`, from
             // `AttrFlags::BLAZE_SPECIALIZATION` and `TraitFlags::BLAZE_SPECIALIZATION_TRAIT`).
             // `blaze` is no tool namespace: `#[blaze::cache]` stays the `blaze` crate's
@@ -129,6 +131,8 @@ impl DefMap {
                         | "nopanic"
                         | "noalloc"
                         | "nonblocking"
+                        | "may"
+                        | "effects"
                         | "specialization"
                         | "specialization_trait"
                         // `hir-ty-linear`, from `AttrFlags::LINEAR` and `AttrFlags::CONSUMES`.

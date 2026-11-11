@@ -34,6 +34,7 @@ syntax.workspace = true
 
 [dev-dependencies]
 blaze-items.workspace = true
+hegeltest.workspace = true
 
 [lints]
 workspace = true

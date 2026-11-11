@@ -253,8 +253,6 @@ each of up to a few GB: on a 16 GB machine `CARGO_BUILD_JOBS=2` kept it at 9.6 G
 default was killed at 14 GB. wasm-bindgen runs again after every edit, 0.27 to 0.36 s on a hello world
 (reports/WASM32.md). There is no LLVM backend for wasm.
 
-Running the compiler itself in a browser is a separate experiment in `crates/blaze-wasm`.
-
 ## Still refused on every platform
 
 - `sym` in an `asm!` block that is not naked, a `sym` that names a generic function, and

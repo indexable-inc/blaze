@@ -40,7 +40,7 @@ use rustc_type_ir::{
 };
 
 use crate::{
-    effects::{self, EFFECTS, EffectDef, EffectSet, PURE, Rule, effect_index},
+    effects::{self, EFFECTS, EffectDef, EffectSet, PURE, Rule, effect_index, trusted_trait},
     memory::MemoryEffects,
     walk::{Cx, Def, How, Instance, Summary, body_of, never_returns, summary},
 };
@@ -136,6 +136,19 @@ impl Refusal {
     /// (src/lib.rs:12) → `helper` (src/lib.rs:20), which calls `var`, which reads the
     /// environment; a pure function reads the outside world only through its arguments".
     pub fn said(&self) -> String {
+        format!(
+            "`{}` is `#[blaze::{}]`, but {}: {}; {}",
+            self.function,
+            self.effect,
+            self.says,
+            self.witness(),
+            self.fix
+        ) // alloc: said once, when a lint reports it
+    }
+
+    /// The chain and what its last step does: "`kernel::compute` (src/lib.rs:12) → `helper`
+    /// (src/lib.rs:20), which calls `var`, which reads the environment".
+    pub fn witness(&self) -> String {
         let steps: Vec<String> = self // alloc: said once, when a lint reports it
             .chain
             .iter()
@@ -146,15 +159,7 @@ impl Refusal {
                 _ => format!("`{}`", step.name), // alloc: as above
             })
             .collect();
-        format!(
-            "`{}` is `#[blaze::{}]`, but {}: {}, which {}; {}",
-            self.function,
-            self.effect,
-            self.says,
-            steps.join(" → "),
-            self.what,
-            self.fix
-        ) // alloc: as above
+        format!("{}, which {}", steps.join(" → "), self.what) // alloc: as above
     }
 }
 
@@ -203,6 +208,14 @@ pub fn check_generic(
         .as_result()
         .map(Clone::clone)
         .map_err(Clone::clone)
+}
+
+/// Whether `func` is pure with no `#[blaze::pure]` on it: its definition passes the check the
+/// attribute asks for (the same walk and the same scan of its parameters), with no call left
+/// to an instance. What keys on the attribute (a cache of its results) may key on this
+/// instead where it holds: the proof is the same, only nobody wrote the word.
+pub fn derived_pure(db: &Db, func: FunctionId) -> bool {
+    matches!(fn_purity_generic(db, func), FnPurity::Pure(proof) if !proof.open)
 }
 
 /// Every kind of effect the instance `body<args>` may have, `krate`'s impls in scope, no trust
@@ -371,10 +384,19 @@ fn refusal(
     let mut chain: Vec<Step> = Vec::new(); // alloc: the refusal's chain, once
     let mut at = (root.clone(), summary); // clone: reference counts
     let mut what: Box<str> = rule.said().into();
-    // A witness's depth falls by one each call: the bound is the root's, and `LONGEST` past it.
-    let bound = summary.witness(index, rule).map_or(0, |it| usize::from(it.depth)) + 1;
+    // A witness's depth falls by one each call: the bound is the root's. A recursion's does
+    // not (`walk::RECURSION_DEPTH`): its chain ends where the next instance is one already in
+    // it, so it is as long as the instances it names, and `CHAIN` at most.
+    let bound = match rule {
+        Rule::Recursion => CHAIN,
+        _ => summary.witness(index, rule).map_or(0, |it| usize::from(it.depth)) + 1,
+    };
+    let mut named: Vec<Instance> = Vec::new(); // alloc: the instances of a recursion's chain
     for _ in 0..=bound {
         let (instance, summary) = (&at.0, at.1);
+        if rule == Rule::Recursion {
+            named.push(instance.clone()); // clone: reference counts
+        }
         let name = instance_path(db, instance);
         let Some(witness) = summary.witness(index, rule) else {
             chain.push(Step { name, at: None });
@@ -397,6 +419,15 @@ fn refusal(
                     break;
                 }
                 let next = site.instance.clone(); // clone: reference counts
+                if rule == Rule::Recursion && named.contains(&next) {
+                    // alloc: the refusal's text, once
+                    what = format!(
+                        "calls `{}`, which is called again from here: the calls go round",
+                        instance_path(db, &next)
+                    )
+                    .into();
+                    break;
+                }
                 let Def::Body(_) = next.def else {
                     what = format!("calls {}", instance_path(db, &next)).into(); // alloc: the refusal's text, once
                     break;
@@ -416,6 +447,9 @@ fn refusal(
         fix: def.fix,
     }
 }
+
+/// The most steps a recursion's chain names before it stops short.
+const CHAIN: usize = 64;
 
 /// Where `span` of `instance`'s body is written: the body's own source when the span is of a
 /// body inlined into it.
@@ -568,6 +602,11 @@ impl<'db> Params<'_, 'db> {
             }),
             TyKind::Dynamic(bounds, _) => {
                 let door = bounds.principal().map(|it| it.skip_binder().def_id.0);
+                // Every method of the trait is held, in each impl, within a `#[blaze::may(..)]`
+                // that leaves this effect's word out: a call through the `dyn` cannot have it.
+                if door.is_some_and(|it| bounded_trait(cx.db, it, self.def)) {
+                    return;
+                }
                 match door.and_then(|it| trusted_trait(cx.db, it, self.def).map(|why| (it, why))) {
                     Some((trait_, why)) => {
                         for (_, item) in trait_.trait_items(cx.db).items.iter() {
@@ -625,12 +664,20 @@ impl<'db> Params<'_, 'db> {
     }
 }
 
-/// Why `trait_` is trusted for `def`, if it is.
-fn trusted_trait(db: &Db, trait_: TraitId, def: &EffectDef) -> Option<Symbol> {
-    match (def.attr)(db, hir_def::AttrDefId::TraitId(trait_)) {
-        Some(hir_def::attrs::PureAttr::Trusted(why)) => Some(why),
+/// Whether every method of `trait_` (it has one) is bounded for `def` by a `#[blaze::may(..)]`
+/// on it or on the trait ([`effects::bound_mask`]).
+fn bounded_trait(db: &Db, trait_: TraitId, def: &EffectDef) -> bool {
+    let Some(index) = effect_index(def) else { return false };
+    let mut methods = trait_.trait_items(db).items.iter().filter_map(|(_, item)| match *item {
+        hir_def::AssocItemId::FunctionId(method) => Some(method),
         _ => None,
-    }
+    });
+    let mut any = false;
+    let all = methods.all(|method| {
+        any = true;
+        effects::bound_mask(db, method) & 1 << index != 0
+    });
+    any && all
 }
 
 /// Whether `krate` is the toolchain's (core, alloc, std and their kin).

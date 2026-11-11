@@ -129,7 +129,7 @@ struct Listed {
 /// A file by its path as `named` has it, or for what a macro wrote by the call that wrote it.
 fn file_name(
     db: &Db,
-    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
+    // dyn: the build's one resolver, made by blaze-engine (which depends on this crate)
     symbols: &dyn SymbolResolver,
     out: &mut String,
     file: HirFileId,
@@ -186,7 +186,7 @@ const INSTALLED_LIBRARY: &str = "/lib/rustlib/src/rust/";
 /// by the name their place gives them: under a path of this machine's, std's `thread_local!`s
 /// and `thread::min_stack`'s `MIN` were not found, and a program that spawned a thread or made
 /// a `HashMap` was refused (#840).
-// dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
+// dyn: the build's one resolver, made by blaze-engine (which depends on this crate)
 fn place_path(symbols: &dyn SymbolResolver, path: Option<String>) -> Option<String> {
     let library = symbols.library_sources().map(|it| it.here);
     Some(path_everywhere(path?, symbols.cargo_home().as_deref(), library.as_deref()))
@@ -215,7 +215,7 @@ fn path_everywhere(path: String, cargo_home: Option<&str>, library: Option<&str>
 /// `None` for a function outside of any block.
 pub fn block_place(
     db: &Db,
-    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
+    // dyn: the build's one resolver, made by blaze-engine (which depends on this crate)
     symbols: &dyn SymbolResolver,
     func: FunctionId,
 ) -> Option<String> {
@@ -233,7 +233,7 @@ pub fn block_place(
 /// constant), the place names it instead.
 pub fn function_place(
     db: &Db,
-    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
+    // dyn: the build's one resolver, made by blaze-engine (which depends on this crate)
     symbols: &dyn SymbolResolver,
     func: FunctionId,
 ) -> Option<String> {
@@ -248,7 +248,7 @@ pub fn function_place(
 /// Where a static inside a block is written, as [`block_place`] has it of a function.
 pub fn static_place(
     db: &Db,
-    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
+    // dyn: the build's one resolver, made by blaze-engine (which depends on this crate)
     symbols: &dyn SymbolResolver,
     id: hir_def::StaticId,
 ) -> Option<String> {

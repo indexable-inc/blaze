@@ -23,10 +23,12 @@ mod arena;
 mod commit;
 mod counter;
 mod cow;
+pub mod digest;
 mod dwarf;
 mod elf;
 mod file;
 mod intern;
+pub mod keyed;
 mod layout;
 mod lazy;
 mod live;
@@ -34,6 +36,7 @@ mod macho;
 mod model;
 mod native;
 mod output;
+mod patch;
 mod pe;
 mod place;
 mod position;
@@ -74,6 +77,7 @@ use std::alloc::Global;
 pub use layout::Heat;
 pub use live::descriptor_of;
 pub use lazy::{LazyPlacer, Slots};
+pub use patch::Patch;
 pub use output::{
     Debug, DevRun, Format, LinkArgs, Live, Native, NativeKind, Output, OutputKind, Platform,
     Undefined,
@@ -109,6 +113,12 @@ pub struct Change<'a> {
     /// Names Rust code defines (`#[no_mangle]`, `#[export_name]`, the entry point's callee),
     /// for native code and the loader, and names no longer defined.
     pub names: Vec<(String, Target)>,
+    /// Of `names`, those Rust code defines weakly (codegen's [`blaze_codegen::Linkage::Weak`]:
+    /// `#[linkage = "weak"]`, as compiler-builtins' intrinsics are): a strong definition of
+    /// the name elsewhere on the link wins over it, and every reference to the name, Rust's
+    /// own included, binds to that one, as ld64 and lld link it. A name of `names` not here is
+    /// strong. A name here that `names` does not give is the caller's bug, refused.
+    pub weak_names: Vec<String>,
     pub unnamed: Vec<String>,
     /// Names for debuggers, symbol tables and backtraces.
     pub debug_names: Vec<(InstanceKey, String)>,
@@ -202,6 +212,18 @@ pub enum Refusal {
     /// check ([`Refusal::OutOfReach`]) does not cover; its message shows the image's regions
     /// (`shape.rs`). Final: a link from scratch lays the same out the same.
     FieldRange,
+    /// An incremental stage wrote again, where it is, code whose AArch64 `b` or `bl` no longer
+    /// reaches its target (a callee the stage put in the patch region) nor a thunk of it: the
+    /// stage's thunks go in the patch region too (`thunk.rs`), and one in the branch's reach
+    /// would need the code around it moved. A link from scratch ([`Image::new`]) cuts its
+    /// islands through the code and takes the change. `branch` is the branch, its code, its
+    /// target and how far that is, as the build says them.
+    NoThunk { branch: String },
+    /// A file is not the one the image's last link left ([`Image::verify`]): `len` bytes where
+    /// the link state has `kept`, first differing in `block` (of [`digest::BLOCK`] bytes). A
+    /// write cut short by a crash, or a file changed by another hand. The kept image patches
+    /// only the file its digest names, so it is let go and linked from scratch.
+    Torn { block: u64, len: u64, kept: u64 },
 }
 
 /// What a laid-out image is past ([`Refusal::OutOfReach`]).
@@ -257,13 +279,33 @@ pub enum Searched {
 impl LinkError {
     /// The refusal, when the image refused the stage for want of room: [`Refusal::NoRoom`],
     /// `NoRegion`, `TableFull`, `TlsMoved`, or an incremental stage's `OutOfReach`, which a
-    /// link from scratch takes. Never `NotFound` or `FieldRange`, which one does not.
+    /// link from scratch takes. Never `NotFound` or `FieldRange`, which one does not, nor
+    /// `NoThunk`, which is no want of room ([`LinkError::no_thunk`]), nor `Torn`, which is of
+    /// a file and not of the image ([`LinkError::torn`]).
     pub fn no_room(&self) -> Option<&Refusal> {
         self.refusal.as_ref().filter(|it| match it {
-            Refusal::NotFound(_) | Refusal::FieldRange => false,
+            Refusal::NotFound(_)
+            | Refusal::FieldRange
+            | Refusal::NoThunk { .. }
+            | Refusal::Torn { .. } => false,
             Refusal::OutOfReach(reach) => reach.scratch,
             _ => true,
         })
+    }
+
+    /// The branch an incremental stage could place no thunk in reach of
+    /// ([`Refusal::NoThunk`]), when that refused it: a link from scratch takes the change.
+    pub fn no_thunk(&self) -> Option<&str> {
+        match &self.refusal {
+            Some(Refusal::NoThunk { branch }) => Some(branch),
+            _ => None,
+        }
+    }
+
+    /// Whether a file was refused as not the one the image's last link left
+    /// ([`Refusal::Torn`]): the kept image is let go and linked from scratch.
+    pub fn torn(&self) -> bool {
+        matches!(self.refusal, Some(Refusal::Torn { .. }))
     }
 
     /// The limit the laid-out image is past, when that refused it.
@@ -327,6 +369,8 @@ pub struct Image {
     /// The counter pairs [`LazyPlacer`] gave since the last commit, which a commit of a stage
     /// made before them carries over ([`Image::carry_placed_pairs`]).
     placed_pairs: Vec<(symbols::IdNo, u32)>,
+    /// The file's identity, kept as commits change it ([`Image::digest`]).
+    filed: patch::Filed,
 }
 
 impl Image {
@@ -433,6 +477,7 @@ impl Image {
             lazy: None,
             // alloc: none until the lazy placer gives a pair
             placed_pairs: Vec::new(),
+            filed: patch::Filed::new(),
         })
     }
 

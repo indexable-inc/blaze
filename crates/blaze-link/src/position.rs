@@ -187,7 +187,7 @@ pub fn location(name_len: usize, position: Position) -> [u8; LOCATION_SIZE as us
 }
 
 /// `core::panic::Location<'static>` on wasm32, where a pointer is four bytes: the file name's
-/// pointer and length, then `line` and `col`, each four bytes (as `blaze-wasm` lays it out).
+/// pointer and length, then `line` and `col`, each four bytes.
 pub const WASM32_LOCATION_SIZE: u64 = 16;
 pub const WASM32_LOCATION_ALIGN: u64 = 4;
 

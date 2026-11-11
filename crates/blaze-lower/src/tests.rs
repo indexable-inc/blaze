@@ -1122,6 +1122,10 @@ fn a_units_identity_covers_what_it_is_made_from_deeply() {
     };
     assert!(changed(LIB) && changed(LIB_TEST) && changed(BIN));
     assert!(!changed(CORE) && !changed(MACRO));
+    // The build script is `fn main() {}`: it can read no file of its package's source root
+    // but its own root, so the file its run left there (as an edit of the lib's source would)
+    // is nothing it is made from. Remove `code::root_alone` from the identity and this fails.
+    assert!(!changed(BUILD_SCRIPT), "a build script that reads its root file alone");
     first.lowered.ran(RUN, &ran("pub fn gen() { loop {} }\n")).unwrap();
     assert_ne!(first.lowered.identity(LIB), after[2]);
     first.lowered.ran(RUN, &ran("pub fn gen() {}\n")).unwrap();
@@ -1190,9 +1194,9 @@ fn a_units_identity_leaves_out_the_process_environment() {
                 .unwrap();
         [CORE, BUILD_SCRIPT, LIB, MACRO, BIN, LIB_TEST].map(|unit| lowered.identity(unit))
     };
-    let first = identities(&[("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101"), ("SHLVL", "1")]);
+    let first = identities(&[("BLAZE_PROFILE", "/tmp/blaze-profile-0101"), ("SHLVL", "1")]);
     let second = identities(&[
-        ("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0242"),
+        ("BLAZE_PROFILE", "/tmp/blaze-profile-0242"),
         ("OLDPWD", "/elsewhere"),
         ("SHLVL", "3"),
     ]);
@@ -2289,4 +2293,340 @@ fn a_root_passed_two_ways_is_two_crates_with_two_names() {
         refused.contains("/w/r/../library/rt/src") && refused.contains("/w/s/../library/rt/src"),
         "{refused}"
     );
+}
+
+/// The whole identity and the narrowed identities ([`Lowered::narrowed`]) of the lib and of
+/// the bin that depends on it, in the units of [`units`] lowered from nothing over the view
+/// with the lib's root as `lib`.
+fn narrowed_over(lib: &'static [u8]) -> [(ContentId, super::Narrowed); 2] {
+    let mut front = front_over(&[("a/src/lib.rs", Some(lib))]);
+    [LIB, BIN].map(|unit| {
+        let whole = front.identity(unit).unwrap_or_else(|| panic!("unit {unit} has no identity"));
+        let narrowed = front
+            .narrowed(unit)
+            .unwrap_or_else(|| panic!("unit {unit}, a workspace crate's, has no narrowed identity"));
+        (whole, narrowed)
+    })
+}
+
+/// The units of [`units`] lowered from nothing over the view with each of `changes` made.
+fn front_over(changes: &[(&'static str, Option<&'static [u8]>)]) -> Lowered {
+    let tree = MemTree::default();
+    let root = changed(&tree, changes);
+    let config = config(root, library(&tree));
+    let units = units();
+    lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }).unwrap()
+}
+
+/// The lib's root as a plain function, and the same after an edit of each kind.
+const LIB_PLAIN: &[u8] = b"pub fn gen() -> u8 {\n    1\n}\n";
+const LIB_COMMENTED: &[u8] = b"pub fn gen() -> u8 { // made up\n    1 // the value\n}\n";
+/// What else moves no token and no position: spaces before a line's end, and a comment and
+/// blank lines after the last line.
+const LIB_SPACED: &[u8] = b"pub fn gen() -> u8 {  \n    1\t\n}\n";
+const LIB_ENDED: &[u8] = b"pub fn gen() -> u8 {\n    1\n}\n// the end\n\n";
+/// A comment on a line of its own, which moves every line after it, and a doc comment, an
+/// attribute of its item.
+const LIB_HEADED: &[u8] = b"// made up\npub fn gen() -> u8 {\n    1\n}\n";
+const LIB_DOCUMENTED: &[u8] = b"/** Made up. */pub fn gen() -> u8 {\n    1\n}\n";
+const LIB_BODY: &[u8] = b"pub fn gen() -> u8 {\n    2\n}\n";
+const LIB_LINE: &[u8] = b"pub fn gen() -> u8 {\n\n    1\n}\n";
+const LIB_SIGNATURE: &[u8] = b"pub fn gen() -> u16 {\n    1\n}\n";
+
+/// What an edit of the lib's root from [`LIB_PLAIN`] to `lib` must leave as it was and must
+/// move, of the lib's keys and of the bin's above it: the oracle of the narrowed identities.
+/// `comment`: the edit is of comments alone. `body`: of a plain body, keeping its lines.
+/// Any other edit is one every reader observes.
+fn check_edit(lib: &'static [u8], comment: bool, body: bool) -> Result<(), String> {
+    let [(lib_whole, lib_was), (bin_whole, bin_was)] = narrowed_over(LIB_PLAIN);
+    let [(lib_whole_now, lib_now), (bin_whole_now, bin_now)] = narrowed_over(lib);
+    let said = |what: &str| Err(format!("{}: {what}", String::from_utf8_lossy(lib)));
+    // The bytes changed: the whole identities, which the keys of units that read comments
+    // hold, always move.
+    if lib_whole == lib_whole_now || bin_whole == bin_whole_now {
+        return said("a whole identity is as it was");
+    }
+    // What code can observe: a comment edit moves none of it, anything else all of it.
+    if comment != (lib_was.code == lib_now.code) {
+        return said("the lib's code identity");
+    }
+    if comment != (bin_was.code == bin_now.code) {
+        return said("the code identity of the bin, which builds the lib's code");
+    }
+    if comment != (lib_was.checked == lib_now.checked) {
+        return said("the lib's own check's identity");
+    }
+    // What a check of the bin can observe of the lib: its interface, which a comment and a
+    // plain body leave as it was.
+    if (comment || body) != (bin_was.checked == bin_now.checked) {
+        return said("the identity of the bin's check, which reads the lib's interface");
+    }
+    Ok(())
+}
+
+/// The invariant: an edit that leaves a crate's interface as it was (a comment; a plain
+/// function's body that keeps its lines) leaves the key identity of every unit that only
+/// checks against it as it was, and an edit of comments alone leaves every narrowed identity
+/// as it was, in the crate and above it; any other edit (a body, for a unit that builds code;
+/// a line moved; a signature) moves the identity of every unit that can observe it.
+#[test]
+fn a_dependents_key_moves_only_with_what_it_observes_of_a_dependency() {
+    assert_eq!(check_edit(LIB_COMMENTED, true, false), Ok(()));
+    assert_eq!(check_edit(LIB_SPACED, true, false), Ok(()));
+    assert_eq!(check_edit(LIB_ENDED, true, false), Ok(()));
+    assert_eq!(check_edit(LIB_HEADED, false, false), Ok(()));
+    assert_eq!(check_edit(LIB_DOCUMENTED, false, false), Ok(()));
+    assert_eq!(check_edit(LIB_BODY, false, true), Ok(()));
+    assert_eq!(check_edit(LIB_LINE, false, false), Ok(()));
+    assert_eq!(check_edit(LIB_SIGNATURE, false, false), Ok(()));
+}
+
+/// With a check keyed by its dependencies' code, a plain body's edit moves the checking
+/// dependent's key: the cutoff is gone, and the oracle says where.
+#[test]
+fn the_oracle_catches_a_check_keyed_by_its_dependencies_code() {
+    assert_eq!(check_edit(LIB_BODY, false, true), Ok(()));
+    assert_eq!(
+        crate::code::planting(crate::code::Plant::Deep, || check_edit(LIB_BODY, false, true)),
+        Err(format!(
+            "{}: the identity of the bin's check, which reads the lib's interface",
+            String::from_utf8_lossy(LIB_BODY)
+        ))
+    );
+}
+
+/// With a unit that builds code keyed by its dependencies' interfaces, a body's edit leaves
+/// the program's key as it was, a stale program: the oracle says where.
+#[test]
+fn the_oracle_catches_a_program_keyed_by_its_dependencies_interfaces() {
+    assert_eq!(check_edit(LIB_BODY, false, true), Ok(()));
+    assert_eq!(
+        crate::code::planting(crate::code::Plant::Shallow, || check_edit(LIB_BODY, false, true)),
+        Err(format!(
+            "{}: the code identity of the bin, which builds the lib's code",
+            String::from_utf8_lossy(LIB_BODY)
+        ))
+    );
+}
+
+/// What takes the cutoff away, each kept whole: a dependency that runs at compile time (a
+/// proc macro) is read by its code; a crate that names blaze's extensions, whose proofs read
+/// bodies across crates, gives and takes no interface.
+#[test]
+fn a_crate_whose_bodies_a_check_may_read_gives_no_interface() {
+    let [_, (_, plain)] = narrowed_over(LIB_PLAIN);
+    let [_, (_, body)] = narrowed_over(LIB_BODY);
+    assert_eq!(plain.checked, body.checked);
+    let [_, (_, pure)] = narrowed_over(b"#[blaze::pure]\npub fn gen() -> u8 {\n    1\n}\n");
+    let [_, (_, pure_body)] = narrowed_over(b"#[blaze::pure]\npub fn gen() -> u8 {\n    2\n}\n");
+    assert_ne!(pure.checked, pure_body.checked, "an effect is proved over the body");
+    let [_, (_, inline)] = narrowed_over(b"#[inline]\npub fn gen() -> u8 {\n    1\n}\n");
+    let [_, (_, inline_body)] = narrowed_over(b"#[inline]\npub fn gen() -> u8 {\n    2\n}\n");
+    assert_ne!(inline.checked, inline_body.checked, "an `#[inline]` body");
+}
+
+/// The edited crate's own unit, directed: an edit of its root that moves no token and no
+/// position (a comment at a line's end, spaces before one, a comment after the last line)
+/// leaves the identity its record is keyed by as it was, for the unit that builds its code and
+/// for the one that checks it, though its bytes, and so its whole identity, moved; a comment
+/// on a line of its own and a doc comment move it.
+#[test]
+fn a_units_own_key_is_of_its_code_text_and_not_its_bytes() {
+    let [(whole, was), _] = narrowed_over(LIB_PLAIN);
+    for still in [LIB_COMMENTED, LIB_SPACED, LIB_ENDED] {
+        let [(whole_now, now), _] = narrowed_over(still);
+        assert_ne!(whole, whole_now, "{}", String::from_utf8_lossy(still));
+        assert_eq!(was, now, "{}", String::from_utf8_lossy(still));
+    }
+    for moved in [LIB_HEADED, LIB_DOCUMENTED, LIB_LINE, LIB_BODY] {
+        let [(_, now), _] = narrowed_over(moved);
+        assert_ne!(was.code, now.code, "{}", String::from_utf8_lossy(moved));
+        assert_ne!(was.checked, now.checked, "{}", String::from_utf8_lossy(moved));
+    }
+}
+
+/// A file `include_str!` reads is an input by its bytes: one that is not Rust is in every
+/// key of its crate, and of the crates above it, as it is, so what looks like a comment in it
+/// moves them all, while a comment in the crate's own code still moves none.
+#[test]
+fn a_file_read_as_bytes_is_in_every_key_by_its_bytes() {
+    const READS: &[u8] = b"pub fn gen() -> usize {\n    include_str!(\"notes.txt\").len()\n}\n";
+    const READS_NOTED: &[u8] =
+        b"pub fn gen() -> usize { // counts\n    include_str!(\"notes.txt\").len()\n}\n";
+    let over = |lib: &'static [u8], notes: &'static [u8]| {
+        let mut front =
+            front_over(&[("a/src/lib.rs", Some(lib)), ("a/src/notes.txt", Some(notes))]);
+        [LIB, BIN].map(|unit| front.narrowed(unit).expect("a workspace crate's narrowed identity"))
+    };
+    let [lib, bin] = over(READS, b"one\n");
+    assert_eq!([lib, bin], over(READS_NOTED, b"one\n"), "a comment in the code");
+    let [lib_now, bin_now] = over(READS, b"one // two\n");
+    assert_ne!(lib.code, lib_now.code);
+    assert_ne!(lib.checked, lib_now.checked);
+    assert_ne!(bin.code, bin_now.code, "the program is built with the file's bytes in it");
+    assert_ne!(bin.checked, bin_now.checked, "a check of the bin may read the constant");
+}
+
+/// A Rust file `include_str!` reads is read comments and all: its crate keeps its whole text
+/// (no narrowed identity, so its record is under its whole key), and a comment in that file
+/// moves the key of every unit above it.
+#[test]
+fn a_rust_file_read_as_bytes_keeps_its_crates_whole_text() {
+    const READS: &[u8] = b"pub fn gen() -> usize {\n    include_str!(\"more.rs\").len()\n}\n";
+    let over = |more: &'static [u8]| {
+        let mut front =
+            front_over(&[("a/src/lib.rs", Some(READS)), ("a/src/more.rs", Some(more))]);
+        let whole = front.identity(LIB).expect("the lib's identity");
+        (whole, front.narrowed(LIB), front.narrowed(BIN).expect("the bin's narrowed identity"))
+    };
+    let (whole, lib, bin) = over(b"pub fn more() {}\n");
+    let (whole_now, lib_now, bin_now) = over(b"pub fn more() {} // said\n");
+    assert_eq!((lib, lib_now), (None, None), "a crate that reads Rust as bytes is its bytes");
+    assert_ne!(whole, whole_now);
+    assert_ne!(bin.code, bin_now.code);
+    assert_ne!(bin.checked, bin_now.checked);
+}
+
+/// The front end's code identity a test keeps library crates' narrowed identities under.
+const FRONT_END: ContentId = ContentId([7; 32]);
+
+/// [`units`] with the lib's package a registry's: its source root is a library's.
+fn units_with_a_registry_lib() -> Units {
+    let mut units = units();
+    for package in &mut units.packages {
+        if package.name == "a" {
+            package.is_member = false;
+            package.source = Some("registry+https://index.example/".to_owned());
+        }
+    }
+    units
+}
+
+/// What a store holds of library crates' narrowed identities, by key.
+type KeptNarrows = Vec<(ContentId, Vec<u8>)>;
+
+/// The lib, a registry crate with its root as `lib`, and the bin above it, lowered from
+/// nothing and given their library crates' narrowed identities from `store`, which is given
+/// what the store lacked: the lib's whole identity, its narrowed identity and the bin's, and
+/// how many crates were parsed for want of a kept identity.
+fn library_over(
+    lib: &'static [u8],
+    store: &mut KeptNarrows,
+) -> (ContentId, Option<super::Narrowed>, super::Narrowed, usize) {
+    let tree = MemTree::default();
+    let root = changed(&tree, &[("a/src/lib.rs", Some(lib))]);
+    let config = config(root, library(&tree));
+    let units = units_with_a_registry_lib();
+    let mut front =
+        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+            .unwrap();
+    for unit in [LIB, BIN] {
+        let kept = |key: &ContentId| {
+            Ok(store.iter().find(|it| it.0 == *key).map(|it| it.1.clone()))
+        };
+        front.library_narrows(unit, &FRONT_END, kept).unwrap();
+    }
+    let made = front.take_library_narrows();
+    let parsed = made.len();
+    store.extend(made);
+    let whole = front.identity(LIB).expect("the lib's identity");
+    let bin = front.narrowed(BIN).expect("the bin, a workspace crate, has a narrowed identity");
+    (whole, front.narrowed(LIB), bin, parsed)
+}
+
+/// A registry crate is its bytes to every key until it is given a narrowed identity; given
+/// one, a comment in it moves its whole identity and its key in the store, so it is parsed
+/// once, and the narrowed identity that parse gives is the one it had: its own record's key
+/// and the key of everything above it stay. An edit of its code moves them.
+#[test]
+fn a_comment_in_a_registry_crate_moves_no_key_once_it_is_parsed() {
+    // Not given one: no narrowed identity of its own, as before.
+    let mut front = {
+        let tree = MemTree::default();
+        let root = changed(&tree, &[("a/src/lib.rs", Some(LIB_PLAIN))]);
+        let config = config(root, library(&tree));
+        let units = units_with_a_registry_lib();
+        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }).unwrap()
+    };
+    assert!(root_of(front.db(), front.krate(LIB).unwrap()).is_library);
+    assert_eq!(front.narrowed(LIB), None);
+
+    let mut store = KeptNarrows::new();
+    let (whole, lib, bin, parsed) = library_over(LIB_PLAIN, &mut store);
+    assert_eq!(parsed, 1, "the store had none: the lib is parsed, the standard library never");
+    assert!(lib.is_some(), "a registry crate given a narrowed identity has one");
+    let (whole_now, lib_now, bin_now, parsed) = library_over(LIB_COMMENTED, &mut store);
+    assert_ne!(whole, whole_now, "its bytes moved");
+    assert_eq!(parsed, 1, "so its key in the store did, and it is parsed once");
+    assert_eq!((lib, bin), (lib_now, bin_now), "and nothing a key holds of it moved");
+    let (_, lib_body, bin_body, parsed) = library_over(LIB_BODY, &mut store);
+    assert_eq!(parsed, 1);
+    assert_ne!(lib.map(|it| it.code), lib_body.map(|it| it.code));
+    assert_ne!(bin.code, bin_body.code, "the program builds the lib's code");
+    assert_eq!(bin.checked, bin_body.checked, "a check of the bin reads the lib's interface");
+}
+
+/// What the store keeps of a library crate's narrowed identity restores to what a fresh
+/// parse works out, byte for byte: a front end given the kept bytes parses nothing and
+/// gives the very identities the one that parsed gave. Bytes that are no narrowed identity
+/// are refused, naming the crate, never parsed over.
+#[test]
+fn a_kept_narrowed_identity_restores_to_the_one_a_parse_gives() {
+    let mut store = KeptNarrows::new();
+    let fresh = library_over(LIB_COMMENTED, &mut store);
+    assert_eq!(fresh.3, 1);
+    let kept = store.clone();
+    let restored = library_over(LIB_COMMENTED, &mut store);
+    assert_eq!(restored.3, 0, "the store has it: nothing is parsed");
+    assert_eq!(store, kept, "and nothing more is kept");
+    assert_eq!((fresh.0, fresh.1, fresh.2), (restored.0, restored.1, restored.2));
+    // Worked out again from nothing, the bytes kept are the same bytes.
+    let mut again = KeptNarrows::new();
+    library_over(LIB_COMMENTED, &mut again);
+    assert_eq!(again, kept);
+    for (_, bytes) in &kept {
+        let own = crate::code::OwnNarrow::restored(bytes).expect("what was kept restores");
+        assert_eq!(own.kept().as_slice(), bytes.as_slice());
+    }
+
+    // A value cut short, and one with a flag no narrowed identity has.
+    for spoil in [|bytes: &mut Vec<u8>| bytes.truncate(8), |bytes: &mut Vec<u8>| bytes[4] |= 0x80] {
+        let mut spoiled = kept.clone();
+        spoil(&mut spoiled[0].1);
+        let tree = MemTree::default();
+        let root = changed(&tree, &[("a/src/lib.rs", Some(LIB_COMMENTED))]);
+        let config = config(root, library(&tree));
+        let units = units_with_a_registry_lib();
+        let mut front =
+            lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+                .unwrap();
+        let read = |key: &ContentId| {
+            Ok(spoiled.iter().find(|it| it.0 == *key).map(|it| it.1.clone()))
+        };
+        let refused = front.library_narrows(LIB, &FRONT_END, read).expect_err("spoiled bytes");
+        assert!(refused.what.contains("the narrowed identity of the crate"), "{}", refused.what);
+        assert!(front.take_library_narrows().is_empty(), "nothing is worked out in their place");
+    }
+}
+
+/// A narrowed identity is kept under everything it is made from: the front end's code
+/// identity among it, so one made by other code is never read.
+#[test]
+fn a_kept_narrowed_identity_is_under_the_front_ends_code() {
+    let mut store = KeptNarrows::new();
+    library_over(LIB_PLAIN, &mut store);
+    let tree = MemTree::default();
+    let root = changed(&tree, &[("a/src/lib.rs", Some(LIB_PLAIN))]);
+    let config = config(root, library(&tree));
+    let units = units_with_a_registry_lib();
+    let mut front =
+        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+            .unwrap();
+    let other = ContentId([8; 32]);
+    let kept = |key: &ContentId| Ok(store.iter().find(|it| it.0 == *key).map(|it| it.1.clone()));
+    front.library_narrows(LIB, &other, kept).unwrap();
+    let made = front.take_library_narrows();
+    assert_eq!(made.len(), 1, "another front end's code: another key, so it parses");
+    assert_ne!(made[0].0, store[0].0);
+    assert_eq!(made[0].1, store[0].1, "the same code text, as this test's two are one code");
 }

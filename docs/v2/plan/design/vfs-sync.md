@@ -9,7 +9,7 @@ date: 2026-11-04
 has content-addressed nodes, named heads, constant-time views and a file-by-file rebase. This plan
 adds three things:
 
-1. **Sync.** Every machine on a team (the Mac daemon, ix VMs, CI, a browser running blaze-wasm, an
+1. **Sync.** Every machine on a team (the Mac daemon, ix VMs, CI, a browser, an
    agent) holds a replica of the same heads, so it can build without cloning anything.
 2. **Multiplayer.** Several people and agents edit one head live and see each other's edits within
    a round trip.
@@ -217,7 +217,8 @@ test whose oracle checks the invariant (dst-not-review, the `testing` skill), no
 - [ ] WebSocket hub in the head's Durable Object: ops in, ordered `(seq, ops, root)` out
 - [ ] The client keeps pending ops, rebases them on every move it receives, and reports a conflict with its path
 - [ ] Presence (who has which file and cursor) as ephemeral messages, never stored
-- [ ] Browser client: blaze-wasm's `Compiler` reads a synced view, so a page edits and builds the same head
+- [ ] Browser client: a compiler in the page reads a synced view, so a page edits and builds the same head (the
+      in-browser compiler, `crates/blaze-wasm`, was deleted on 2026-11-09; git keeps it)
 - [ ] Done when: two humans and one agent edit one live head and converge to the same root, and p50/p99 from keystroke to remote view are traced (slow-is-p0-traced)
 
 ### Slice 5: changes, stacks, merge, operation log

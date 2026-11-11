@@ -195,6 +195,29 @@ fn the_tokens_before_a_semicolon_are_framed() {
     });
 }
 
+/// An expansion that is one group, the tree's top (a proc macro's lone `{ a; }`, as the wire
+/// gives it and as text of one group is read), ends in its `}`: the `;` last inside it is its
+/// statement's, and none is dropped. The same tokens with no delimiters at the top end in that
+/// `;`.
+#[test]
+fn a_lone_group_expansion_ends_in_no_semicolon() {
+    let lone = syntax_bridge::parse_to_token_tree_static_span(
+        Edition::CURRENT,
+        span(TextRange::empty(TextSize::new(0))),
+        "{ a ; }",
+    )
+    .expect("tokens");
+    assert_eq!(lone.top_subtree().delimiter.kind, tt::DelimiterKind::Brace, "the group is the top");
+    let bare = tt::TopSubtree::from_token_trees(
+        tt::Delimiter::invisible_spanned(span(TextRange::empty(TextSize::new(0)))),
+        lone.view().token_trees(),
+    );
+    blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        assert!(crate::without_last_semicolon(frame, lone.view()).is_none(), "ends in `}`");
+        assert!(crate::without_last_semicolon(frame, bare.view()).is_some(), "ends in `;`");
+    });
+}
+
 /// `concat!` of literals, warm: the text is the worker's string and the expansion the frame's;
 /// the literal's symbol exists after the first run.
 #[test]

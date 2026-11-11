@@ -80,14 +80,17 @@ pub fn runs_at_start(section: &str) -> bool {
 /// end's instance and static), so a run's threads keep it for the run, and each compile is
 /// given the backend, the front end, the memo and the store it reads.
 pub struct Later<I, S> {
-    pub(super) nodes: Sorted<InstanceKey, FnNode<I, S>>,
+    /// Shared with the walk kept for the next build ([`super::patch`]), which patches it
+    /// once this is gone.
+    pub(super) nodes: std::sync::Arc<Sorted<InstanceKey, FnNode<I, S>>>,
     /// The shape of each function whose IR was built for its check.
     pub(super) shapes: HashMap<InstanceKey, ContentId, Global>,
 }
 
 impl<I, S> Default for Later<I, S> {
     fn default() -> Self {
-        Later { nodes: Sorted::default(), shapes: HashMap::new_in(Global) }
+        // alloc: once per build, an empty walk
+        Later { nodes: std::sync::Arc::new(Sorted::default()), shapes: HashMap::new_in(Global) }
     }
 }
 
@@ -483,7 +486,7 @@ impl<I, S> Later<I, S> {
         B::Frontend: Frontend<Instance = I, Static = S>,
         L: Lookup + ?Sized,
     {
-        let node = lazy_node(&self.nodes, key)?;
+        let node = lazy_node(&*self.nodes, key)?;
         if let Some(function) = stored_one(node, node.template_key(), key, store)? {
             // alloc: none, empty
             return Ok((function, Vec::new()));
@@ -492,7 +495,7 @@ impl<I, S> Later<I, S> {
             return memoized(node, key, node.template_key(), shape, template);
         }
         let check = || same_code(frontend, node, key);
-        claimed(backend, frontend, memo, &self.nodes, node, &node.unit, &node.spec, check)
+        claimed(backend, frontend, memo, &*self.nodes, node, &node.unit, &node.spec, check)
             .map(|it| (it.0, it.1))
     }
 
@@ -517,7 +520,7 @@ impl<I, S> Later<I, S> {
         B::Frontend: Frontend<Instance = I, Static = S>,
         L: Lookup + ?Sized,
     {
-        let node = lazy_node(&self.nodes, key)?;
+        let node = lazy_node(&*self.nodes, key)?;
         let (unit, spec) = at_tier(key, node, to, counted)?;
         let tiered = unit.instance.key();
         let at = dev_template_key(
@@ -532,7 +535,7 @@ impl<I, S> Later<I, S> {
             return Ok((function, Vec::new()));
         }
         let check = || same_code(frontend, node, key);
-        claimed(backend, frontend, memo, &self.nodes, node, &unit, &spec, check)
+        claimed(backend, frontend, memo, &*self.nodes, node, &unit, &spec, check)
             .map(|it| (it.0, it.1))
     }
 }

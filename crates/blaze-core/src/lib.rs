@@ -363,6 +363,17 @@ pub enum Effect {
         bytes: Vec<u8>,
         tag: Tag,
     },
+    /// As [`Effect::Write`], waiting for no sync: the file's whole contents replaced by `bytes`
+    /// through a temporary file renamed over it, so a reader sees the old contents or the new,
+    /// never a part. Nothing of it is durable: a crash leaves the old contents (or no file), the
+    /// new, or a file holding any part of the new. For derived data whose reader checks it
+    /// before it uses it after a crash (the store's whole files of outputs, checked against
+    /// their names). Its directories are made. Completes with [`Done::Written`].
+    WriteUnsynced {
+        file: FileName,
+        bytes: Vec<u8>,
+        tag: Tag,
+    },
     /// Every file and directory under `dir`, at any depth, sorted by name, each with its
     /// [`Meta`]. A symbolic link is listed as a file of its own length and not followed.
     /// Completes with [`Done::Listed`]; a `dir` that is not there fails.
@@ -382,6 +393,15 @@ pub enum Effect {
     /// `from` renamed over `to`, atomically: a reader sees the old `to` or the new, and the
     /// new name survives a crash once it completes. Completes with [`Done::Renamed`].
     Rename {
+        from: FileName,
+        to: FileName,
+        tag: Tag,
+    },
+    /// As [`Effect::Rename`], waiting for no sync of either directory: a reader sees the old
+    /// `to` or the new, and a crash may leave the names as they were before it. For a file
+    /// whose bytes are not durable either (an output placed from the store, which a build
+    /// places again). Completes with [`Done::Renamed`].
+    RenameUnsynced {
         from: FileName,
         to: FileName,
         tag: Tag,
@@ -636,9 +656,11 @@ impl Effect {
             | Effect::Sync { tag, .. }
             | Effect::Truncate { tag, .. }
             | Effect::Write { tag, .. }
+            | Effect::WriteUnsynced { tag, .. }
             | Effect::List { tag, .. }
             | Effect::WriteAt { tag, .. }
             | Effect::Rename { tag, .. }
+            | Effect::RenameUnsynced { tag, .. }
             | Effect::Mode { tag, .. }
             | Effect::Seal { tag, .. }
             | Effect::Private { tag, .. }

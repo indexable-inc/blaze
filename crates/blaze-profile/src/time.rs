@@ -5,7 +5,7 @@
 //! driver that reads them from the history, and [`report`], [`path`], [`trace`] and [`html`]
 //! read the model.
 //!
-//! The model (/tmp/blaze-lanes/prob/9-data-layer.md, docs/profiling.md "Where the time went"):
+//! The model (docs/profiling.md "Where the time went"):
 //!
 //! - A job's lifetime is cut into [`Interval`]s, one [`State`] each, end to end: for every job,
 //!   running + parked + queued + parked_or_queued + unrecorded = its lifetime. It begins at its

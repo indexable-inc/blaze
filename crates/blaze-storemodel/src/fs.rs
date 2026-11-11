@@ -20,13 +20,18 @@
 //! - Rename is durable on completion (its directories are synced). Remove is not synced.
 //! - A file that Append or Truncate makes is a new directory entry, durable only once its
 //!   directory is synced, or, under [`Persist::Ordered`], once any sync commits the journal.
+//! - ReadInto fills its registered span with what Read would return of the file as the process
+//!   sees it. WriteFrom is WriteAt of the span's bytes as they are when it completes, unsynced
+//!   until a Sync. A crash tears a write from memory by block, not to a prefix: its first block
+//!   alone, its later half without its first, or all but its last (a system writes a span's
+//!   blocks in any order).
 //! - An effect in flight at the crash may or may not have happened: its change is one more
 //!   unsynced change (a Write in flight is its new contents, synced, behind a rename not yet
 //!   durable).
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use blaze_core::{Completion, Done, Effect, FileName, IoError, Mapping, Meta};
+use blaze_core::{Completion, DIRECT_ALIGN, Done, Effect, FileName, IoError, Mapping, Meta, spans};
 use blaze_ids::{ContentId, Hasher};
 
 /// What a file system keeps of its directory entries across a crash.
@@ -77,6 +82,8 @@ enum Change {
     Append(Vec<u8>),
     Cut(u64),
     At(u64, Vec<u8>),
+    /// A write from memory ([`Effect::WriteFrom`]): as `At`, torn by block.
+    Blocks(u64, Vec<u8>),
 }
 
 impl Change {
@@ -84,7 +91,7 @@ impl Change {
         match self {
             Change::Append(more) => bytes.extend_from_slice(more),
             Change::Cut(len) => bytes.resize(*len as usize, 0),
-            Change::At(at, more) => {
+            Change::At(at, more) | Change::Blocks(at, more) => {
                 let at = *at as usize;
                 if bytes.len() < at + more.len() {
                     bytes.resize(at + more.len(), 0);
@@ -99,13 +106,29 @@ impl Change {
         match self {
             Change::Append(more) => Some(Change::Append(more[..cut].to_vec())),
             Change::At(at, more) => Some(Change::At(*at, more[..cut].to_vec())),
+            // By block, and not only to a prefix. The three cuts a crash state tries (its
+            // first byte, its middle, one short of its end) stand for: its first block alone,
+            // its later half without what comes before, all but its last block.
+            Change::Blocks(at, more) => {
+                let block = DIRECT_ALIGN as usize;
+                let blocks = more.len().div_ceil(block);
+                if blocks < 2 {
+                    return None;
+                }
+                let (from, to) = match cut {
+                    1 => (0, block),
+                    cut if cut + 1 == more.len() => (0, (blocks - 1) * block),
+                    _ => ((blocks / 2) * block, more.len()),
+                };
+                Some(Change::At(*at + from as u64, more[from..to].to_vec()))
+            }
             Change::Cut(_) => None,
         }
     }
 
     fn len(&self) -> usize {
         match self {
-            Change::Append(more) | Change::At(_, more) => more.len(),
+            Change::Append(more) | Change::At(_, more) | Change::Blocks(_, more) => more.len(),
             Change::Cut(_) => 0,
         }
     }
@@ -115,6 +138,9 @@ impl Change {
             Change::Append(more) => format!("append of {} bytes", more.len()),
             Change::Cut(len) => format!("truncate to {len}"),
             Change::At(at, more) => format!("write of {} bytes at {at}", more.len()),
+            Change::Blocks(at, more) => {
+                format!("write from memory of {} bytes at {at}", more.len())
+            }
         }
     }
 }
@@ -200,6 +226,12 @@ pub fn describe(effect: &Effect) -> String {
         Effect::WriteAt { file, at, bytes, .. } => {
             format!("write {} bytes of {file} at {at}", bytes.len())
         }
+        Effect::ReadInto { file, at, into, .. } => {
+            format!("read {} bytes of {file} at {at} into memory", into.len)
+        }
+        Effect::WriteFrom { file, at, from, .. } => {
+            format!("write {} bytes of {file} at {at} from memory", from.len)
+        }
         Effect::Rename { from, to, .. } => format!("rename {from} to {to}"),
         Effect::Remove { file, .. } => format!("remove {file}"),
         Effect::Map { file, .. } => format!("map {file}"),
@@ -279,6 +311,24 @@ impl CrashFs {
                 let bytes = self.contents(&file);
                 let at = (at as usize).min(bytes.len());
                 Done::Read(bytes[at..at.saturating_add(len).min(bytes.len())].to_vec())
+            }
+            Effect::ReadInto { file, at, into, cache, .. } => {
+                let bytes = self.contents(&file);
+                let from = (at as usize).min(bytes.len());
+                match spans::read_into(&into, &file, at, cache, &bytes[from..]) {
+                    Ok(len) => Done::ReadInto { len },
+                    Err(refused) => Done::Failed(refused),
+                }
+            }
+            Effect::WriteFrom { file, at, from, cache, .. } => {
+                match (self.live.contains_key(file.as_str()), spans::written_from(&from, &file, at, cache)) {
+                    (true, Ok(bytes)) => {
+                        self.change(&file, Change::Blocks(at, bytes));
+                        Done::Written
+                    }
+                    (true, Err(refused)) => Done::Failed(refused),
+                    (false, _) => Done::Failed(IoError(format!("{file}: no such file"))),
+                }
             }
             Effect::Append { file, bytes, .. } => {
                 self.change(&file, Change::Append(bytes));
@@ -370,6 +420,19 @@ impl CrashFs {
             Effect::WriteAt { file, at, bytes, .. } if self.live.contains_key(file.as_str()) => {
                 self.change(&file, Change::At(at, bytes[..bytes.len() / 2].to_vec()));
             }
+            // A failed write from memory may have written any of its blocks: here, the whole
+            // blocks of its first half, unsynced.
+            Effect::WriteFrom { file, at, from, cache, .. }
+                if self.live.contains_key(file.as_str()) =>
+            {
+                if let Ok(bytes) = spans::written_from(&from, &file, at, cache) {
+                    let block = DIRECT_ALIGN as usize;
+                    let half = bytes.len() / 2 / block * block;
+                    if half > 0 {
+                        self.change(&file, Change::Blocks(at, bytes[..half].to_vec()));
+                    }
+                }
+            }
             Effect::Sync { file, .. } => {
                 if let Some(&ino) = self.live.get(file.as_str()) {
                     for it in self.inodes[ino].unsynced.iter_mut().take(covers) {
@@ -453,6 +516,22 @@ impl CrashFs {
                         file,
                         Change::At(*at, bytes.clone()),
                     )
+                }
+                // A span being written as the crash comes: the system may have written any of
+                // its blocks, from the memory as it is now. One more unsynced change, torn by
+                // block as `Change::Blocks` is.
+                Effect::WriteFrom { file, at, from, cache, .. }
+                    if live.contains_key(file.as_str()) =>
+                {
+                    if let Ok(bytes) = spans::written_from(from, file, *at, *cache) {
+                        may_change(
+                            &mut inodes,
+                            &mut live,
+                            &mut entries,
+                            file,
+                            Change::Blocks(*at, bytes),
+                        );
+                    }
                 }
                 Effect::Write { file, bytes, .. } => {
                     inodes.push(Inode {

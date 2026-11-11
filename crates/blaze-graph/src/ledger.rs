@@ -2,11 +2,16 @@
 //! blaze daemon of the user on the host, so every daemon admits against one machine budget
 //! rather than each against its own.
 //!
-//! A daemon joins at start, rewrites its charge (`max(held, granted)`) as its plane takes a
-//! `Held`, and leaves at exit; whoever holds the file's lock next prunes a record whose process
+//! A daemon joins at start, rewrites its charge (`max(held, granted)` and its lease) at each
+//! turn, and leaves at exit; whoever holds the file's lock next prunes a record whose process
 //! is gone or whose start time differs (its pid reused). A daemon's [`Allowance`] is the least
 //! of its ceiling and the machine budget less every other live daemon's charge, and its plane
 //! admits against that ([`crate::plane::PlaneInput::Allowance`]).
+//!
+//! The lease is the headroom a daemon with work takes at its turn and may grant with no turn
+//! ([`crate::plane::Plane::lease`]): it is part of the daemon's charge, so every other daemon's
+//! allowance is less by it, and what the daemons may grant between their turns never sums past
+//! the machine budget.
 //!
 //! This is the core: the file's bytes in, the file's bytes out, and the arithmetic. It owns no
 //! file, lock or clock. The driver (blaze-cargo's `serve::machine`) opens
@@ -30,7 +35,7 @@
 //! | 0   | pid (`u32`, 0 only in a free slot)                                   |
 //! | 4   | flags (`u8`: bit 0 the version was cut, bit 1 the home was cut)      |
 //! | 5   | bytes of the version kept (`u8`, at most 24)                         |
-//! | 6   | bytes of the home kept (`u8`, at most 32)                            |
+//! | 6   | bytes of the home kept (`u8`, at most 24)                            |
 //! | 7   | 0                                                                    |
 //! | 8   | process start time (`u64`, the driver's unit)                        |
 //! | 16  | the machine budget this daemon brought                               |
@@ -41,7 +46,8 @@
 //! | 56  | the version's hash                                                   |
 //! | 64  | the home's hash                                                      |
 //! | 72  | the version's first 24 bytes                                         |
-//! | 96  | the home's last 32 bytes                                             |
+//! | 96  | its lease: what it may grant past `max(held, granted)` with no turn  |
+//! | 104 | the home's last 24 bytes                                             |
 //!
 //! The machine budget is the least that any live daemon brought: each computes its own at
 //! start (or is told it, `BLAZE_MACHINE_MEMORY_GB`), and the least is the one that holds for
@@ -62,7 +68,8 @@ mod tests;
 /// The file's first 8 bytes.
 pub const MAGIC: [u8; 8] = *b"blzledgr";
 /// The layout this module reads and writes; a file of another is refused, naming both.
-pub const FORMAT: u32 = 1;
+/// Layout 2 added the lease, in 8 of the bytes layout 1 kept of the home.
+pub const FORMAT: u32 = 2;
 /// The most daemons one machine budget is shared by: joining past it is refused.
 pub const MOST: usize = 64;
 /// The bytes of one record.
@@ -73,7 +80,11 @@ pub const HEADER: usize = 32;
 pub const LEN: usize = HEADER + MOST * RECORD;
 
 const VERSION: usize = 24;
-const HOME: usize = 32;
+const HOME: usize = 24;
+/// Where a record's lease is, and where its home's bytes start.
+const LEASE_AT: usize = 96;
+const HOME_AT: usize = 104;
+const _: () = assert!(HOME_AT + HOME == RECORD && LEASE_AT + 8 == HOME_AT);
 const VERSION_CUT: u8 = 1;
 const HOME_CUT: u8 = 2;
 
@@ -143,6 +154,9 @@ pub struct Record {
     pub ceiling: u64,
     pub held: u64,
     pub granted: u64,
+    /// The headroom it took at its last turn: what it may grant past `max(held, granted)`
+    /// until its next ([`crate::plane::Plane::lease`]); 0 for a daemon with no work.
+    pub lease: u64,
     /// When it was last written, by the writer's wall clock: for a person reading the file.
     pub at_ns: u64,
     pub version: Label<VERSION>,
@@ -151,9 +165,10 @@ pub struct Record {
 
 impl Record {
     /// What the ledger counts against the machine for it: what it holds, or what it granted
-    /// if more (a task granted memory may not have taken it yet).
+    /// if more (a task granted memory may not have taken it yet), and its lease, which it may
+    /// grant before any other daemon reads the ledger again.
     pub fn charge(&self) -> u64 {
-        self.held.max(self.granted)
+        self.held.max(self.granted).saturating_add(self.lease)
     }
 }
 
@@ -179,9 +194,14 @@ pub trait Alive {
 
 /// The plane a [`Ledger::turn`] admits against.
 pub trait Admits {
-    /// Takes `allowance` as the most it may grant: it admits what now fits, and grants no more
-    /// than what it then holds until the next call ([`crate::plane::PlaneInput::Allowance`]).
+    /// Takes `allowance` as the most it may grant: it admits what now fits, and until the next
+    /// call grants no more than what it then holds and its lease
+    /// ([`crate::plane::PlaneInput::Allowance`]).
     fn allow(&mut self, allowance: &Allowance);
+    /// The headroom past `max(held, granted)` it may grant until the next
+    /// [`Admits::allow`], as the last one left it ([`crate::plane::Plane::lease`]). The ledger
+    /// records it in this daemon's charge: one recorded smaller is room two daemons grant.
+    fn lease(&self) -> u64;
     /// What the process holds, as last measured.
     fn held(&self) -> u64;
     /// What its running tasks were granted.
@@ -194,8 +214,10 @@ pub struct Turn {
     pub allowance: Allowance,
     /// The records pruned: processes gone, or pids now another process's.
     pub pruned: u32,
-    /// The charge recorded for this daemon after its plane admitted.
+    /// The charge recorded for this daemon after its plane admitted, its lease in it.
     pub charge: u64,
+    /// The lease in `charge`.
+    pub lease: u64,
 }
 
 /// What went wrong, and in which ledger file.
@@ -362,6 +384,9 @@ pub(crate) enum Plant {
     PruneIgnoresStart,
     /// [`Ledger::allowance`] leaves the first other live daemon's charge out.
     AllowanceSkipsOne,
+    /// [`Ledger::turn`] records no lease, whatever room the plane was given: the room past
+    /// its charge is what another daemon is told is free.
+    LeaseUnrecorded,
 }
 
 /// The ledger, decoded: one slot a daemon, `None` free.
@@ -426,8 +451,8 @@ impl<'p> Ledger<'p> {
                 && row[7] == 0
                 && usize::from(version_kept) <= VERSION
                 && usize::from(home_kept) <= HOME
-                && row[72 + usize::from(version_kept)..96].iter().all(|&it| it == 0)
-                && row[96 + usize::from(home_kept)..RECORD].iter().all(|&it| it == 0);
+                && row[72 + usize::from(version_kept)..LEASE_AT].iter().all(|&it| it == 0)
+                && row[HOME_AT + usize::from(home_kept)..RECORD].iter().all(|&it| it == 0);
             if !fields {
                 return Err(ledger.error(Why::Fields { slot }));
             }
@@ -436,15 +461,16 @@ impl<'p> Ledger<'p> {
                 return Err(ledger.error(Why::Twice { slot, pid, start: process.start }));
             }
             let mut version = [0; VERSION];
-            version.copy_from_slice(&row[72..96]);
+            version.copy_from_slice(&row[72..LEASE_AT]);
             let mut home = [0; HOME];
-            home.copy_from_slice(&row[96..RECORD]);
+            home.copy_from_slice(&row[HOME_AT..RECORD]);
             ledger.slots[slot] = Some(Record {
                 process,
                 budget: u64_at(row, 16),
                 ceiling: u64_at(row, 24),
                 held: u64_at(row, 32),
                 granted: u64_at(row, 40),
+                lease: u64_at(row, LEASE_AT),
                 at_ns: u64_at(row, 48),
                 version: Label {
                     hash: u64_at(row, 56),
@@ -486,8 +512,9 @@ impl<'p> Ledger<'p> {
             put_u64(row, 48, record.at_ns);
             put_u64(row, 56, record.version.hash);
             put_u64(row, 64, record.home.hash);
-            row[72..96].copy_from_slice(&record.version.bytes);
-            row[96..RECORD].copy_from_slice(&record.home.bytes);
+            row[72..LEASE_AT].copy_from_slice(&record.version.bytes);
+            put_u64(row, LEASE_AT, record.lease);
+            row[HOME_AT..RECORD].copy_from_slice(&record.home.bytes);
         }
         let sum = checksum(&out[..]);
         put_u64(out, 24, sum);
@@ -534,18 +561,20 @@ impl<'p> Ledger<'p> {
         Ok(self.slots[slot].take().expect("a joined slot holds a record"))
     }
 
-    /// Rewrites what `me` holds and was granted, at `at_ns` by the writer's clock.
+    /// Rewrites what `me` holds, was granted and leases, at `at_ns` by the writer's clock.
     pub fn charge(
         &mut self,
         me: Process,
         held: u64,
         granted: u64,
+        lease: u64,
         at_ns: u64,
     ) -> Result<(), LedgerError> {
         let slot = self.joined(me)?;
         let record = self.slots[slot].as_mut().expect("a joined slot holds a record");
         record.held = held;
         record.granted = granted;
+        record.lease = lease;
         record.at_ns = at_ns;
         Ok(())
     }
@@ -598,7 +627,8 @@ impl<'p> Ledger<'p> {
     }
 
     /// One turn of `me` under the lock: prune, tell `plane` its allowance (it admits what
-    /// fits), and record the charge it is left with.
+    /// fits), and record the charge it is left with: what it holds or granted, and the lease
+    /// it took of the allowance, all it may grant until its next turn.
     pub fn turn(
         &mut self,
         me: Process,
@@ -609,9 +639,11 @@ impl<'p> Ledger<'p> {
         let pruned = self.prune(alive);
         let allowance = self.allowance(me)?;
         plane.allow(&allowance);
-        let (held, granted) = (plane.held(), plane.granted());
-        self.charge(me, held, granted, at_ns)?;
-        Ok(Turn { allowance, pruned, charge: held.max(granted) })
+        let (held, granted, lease) = (plane.held(), plane.granted(), plane.lease());
+        #[cfg(test)]
+        let lease = if self.plant == Plant::LeaseUnrecorded { 0 } else { lease };
+        self.charge(me, held, granted, lease, at_ns)?;
+        Ok(Turn { allowance, pruned, charge: held.max(granted).saturating_add(lease), lease })
     }
 
     fn find(&self, me: Process) -> Option<usize> {

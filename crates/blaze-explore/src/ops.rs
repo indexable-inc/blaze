@@ -1,6 +1,6 @@
 //! The answer to each op of the `blaze` layer (`hello` is the session's,
 //! `ix_prof::explore::session`), with no transport in it: a header and at most one table.
-//! Everything here may wait (DuckDB runs as a process, Flecs answers on its own thread), so the
+//! Everything here may wait (DuckDB runs as a process), so the
 //! server calls it on tokio's blocking pool.
 
 use std::{fmt, path::PathBuf, sync::Arc, time::Instant};
@@ -9,7 +9,6 @@ use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use blaze_profile::{sql, views};
 use ix_prof::explore::{Answer, Kind as Core, OpError, Table};
-use serde_json::Value;
 
 use crate::{
     tiles::{self, Lane, Range, TilesError},
@@ -49,8 +48,6 @@ impl fmt::Debug for Flush {
 /// What every answer reads.
 pub(crate) struct Context {
     pub(crate) history: History,
-    /// Flecs's world of the builds; `None` when the daemon keeps none.
-    pub(crate) world: Option<Arc<blaze_web::Graphs>>,
 }
 
 /// The answer to `request`. A message on `stop`, or its sender gone, kills a DuckDB query under
@@ -115,7 +112,6 @@ pub(crate) fn answer(cx: &Context, request: Request, stop: &sql::Stop) -> Result
                 .with("tiles_ns", tiles_ns);
             Ok(Answer { table: Table::of(vec![tiles]), ..answer })
         }
-        Request::World { path } => world(cx, &path),
     }
 }
 
@@ -227,45 +223,10 @@ fn views_table() -> Result<Table, OpError> {
     Ok(Table { schema, batches: vec![batch] })
 }
 
-/// Flecs's REST answer to `GET <path>` over the builds' world, its JSON in the header's
-/// `world`.
-fn world(cx: &Context, path: &str) -> Result<Answer, OpError> {
-    let Some(graphs) = &cx.world else {
-        let message = "the daemon keeps no build world: blaze_web::Graphs, the Flecs world of the \
-                       builds' functions, is not made by the v2 daemon (crates/blaze-cargo) or fed \
-                       its builds' records";
-        return Err(
-            OpError::new(Kind::NoWorld, message).with("needs", "blaze_web::Graphs in the daemon")
-        );
-    };
-    if !path.starts_with('/') {
-        return Err(OpError::new(
-            Core::BadArgs,
-            format!("the world's path `{path}` does not start with `/`"),
-        ));
-    }
-    let answered = graphs.rest("GET", path).map_err(|why| OpError::new(Kind::NoWorld, why))?;
-    if answered.code != 200 {
-        let message = format!(
-            "Flecs answered {} to GET {path}: {}",
-            answered.code,
-            String::from_utf8_lossy(&answered.body)
-        );
-        return Err(OpError::new(Kind::World, message).with("code", answered.code));
-    }
-    let world: Value = serde_json::from_slice(&answered.body).map_err(|why| {
-        OpError::new(
-            Kind::World,
-            format!("Flecs's answer to GET {path} is not JSON ({}): {why}", answered.kind),
-        )
-    })?;
-    Ok(Answer::new("world").with("path", path).with("world", world))
-}
-
 #[cfg(test)]
 mod tests {
     use arrow_array::cast::AsArray;
-    use serde_json::Map;
+    use serde_json::{Map, Value};
 
     use super::*;
 
@@ -280,7 +241,6 @@ mod tests {
                 dir: PathBuf::from("/nowhere"),
                 flush: Flush::new(|| Ok(0)),
             },
-            world: None,
         }
     }
 
@@ -330,14 +290,6 @@ mod tests {
             Request::Tiles { build: 1, t0_ns: 0, t1_ns: 10, bucket_ns: 0, lane: Lane::Thread },
         );
         assert_eq!(tiles.err().map(|it| it.kind), Some(Core::BadArgs.name()));
-    }
-
-    #[test]
-    fn with_no_world_the_world_op_names_what_is_missing() {
-        let error =
-            answer(&cx(), Request::World { path: "/entity/flecs".to_owned() }).err().unwrap();
-        assert_eq!(error.kind, Kind::NoWorld.name());
-        assert!(error.message.contains("blaze_web::Graphs"), "{error}");
     }
 
     #[test]

@@ -1,10 +1,18 @@
 //! Cargo's rule, for a run that read what can't be traced (#1450): the clock, randomness,
-//! the network, a descriptor it was given. What it read of those can't be seen again, so it
-//! is rerun when cargo would rerun it, as well as when anything it was seen to read changed:
-//! when a path its `rerun-if-changed` names changed (a directory meaning all below it), or,
-//! with none named, any file of its package; and when a variable its `rerun-if-env-changed`
-//! names changed. Cargo's rule is added to what it was seen to read, never put in its place:
-//! a run is never kept for longer than either would keep it.
+//! the network, a descriptor it was given. What it read of those can't be seen again, so what
+//! the script itself said reruns it is added to what it was seen to read: a path its
+//! `rerun-if-changed` names (a directory meaning all below it) and a variable its
+//! `rerun-if-env-changed` names. Cargo's rule is added to what it was seen to read, never put
+//! in its place: a run is never kept for longer than either would keep it.
+//!
+//! Cargo's default for a script that names no path, any file of its package, is added only
+//! for a run that read a file the sandbox did not see opened ([`Untraceable::Descriptor`]):
+//! only then can a file of the package be an input no read names. The clock, randomness and
+//! the network are no file: no edit of the package changes what they gave, and every file the
+//! run did read is traced, so watching the whole package for them reran the script of a
+//! package on every edit of any of its sources (ripgrep's, which runs `git`, on each edit of
+//! `crates/core/main.rs`) to read nothing other than before (AGENTS.md `useful-not-parity`:
+//! cargo watches the package because it cannot see what a script reads; blaze can).
 
 use std::{
     ffi::{OsStr, OsString},
@@ -12,7 +20,7 @@ use std::{
 };
 
 use blaze_build_script::Watched;
-use blaze_core::Traced;
+use blaze_core::{Traced, Untraceable};
 
 use crate::trace::{self, Inputs, PACKAGE, TREE};
 
@@ -21,7 +29,8 @@ use crate::trace::{self, Inputs, PACKAGE, TREE};
 pub struct CargoRule {
     /// The paths `rerun-if-changed` named, made whole against the package's directory.
     pub paths: Vec<PathBuf>,
-    /// The package's directory, when no `rerun-if-changed` was printed: all of it is watched.
+    /// The package's directory, when no `rerun-if-changed` was printed: all of it is watched
+    /// for a run that read a file the sandbox did not see opened, and for no other ([`widen`]).
     pub package: Option<PathBuf>,
     /// The variables `rerun-if-env-changed` named.
     pub env: Vec<OsString>,
@@ -55,7 +64,10 @@ pub fn widen<I: Inputs>(
             }
         }
     }
-    if let Some(package) = &rule.package {
+    // Any file of the package, only where a file read went unseen (the module's docs).
+    if let Some(package) = &rule.package
+        && traced.untraceable.contains(&Untraceable::Descriptor)
+    {
         match trace::package(inputs, package)? {
             Some(hash) => traced.dirs.push((package.join(PACKAGE), hash)),
             None => traced.files.push((package.join(PACKAGE), None)),
@@ -91,7 +103,6 @@ mod tests {
     use std::{collections::BTreeMap, path::Path};
 
     use blaze_build_script::{Output, watched};
-    use blaze_core::Untraceable;
 
     use super::*;
     use crate::{index::Shape, trace::DIRECTORY};
@@ -176,22 +187,43 @@ mod tests {
         assert_eq!(traced, before);
     }
 
+    /// The whole package is watched for a file read the sandbox did not see, and for nothing
+    /// else that can't be traced: an edit of a file the run never read reruns no script that
+    /// read the clock, randomness or the network.
     #[test]
-    fn a_run_that_read_the_clock_is_watched_as_cargo_watches_it() {
+    fn only_an_unseen_file_read_watches_the_whole_package() {
+        let read = |what: Untraceable| Traced {
+            files: vec![("/p/build.rs".into(), Some([1; 32]))],
+            untraceable: vec![what],
+            ..Traced::default()
+        };
+        let mut changed = fixed();
+        changed.files.insert("/p/src/lib.rs".into(), [9; 32]);
+        for what in [Untraceable::Clock, Untraceable::Random, Untraceable::Network] {
+            let mut traced = read(what);
+            widen(&mut traced, &of_directives(&[], &[]), &mut fixed()).unwrap();
+            assert_eq!(traced, read(what), "{what:?} watches no file it did not read");
+            let shape = Shape::of(&traced);
+            assert_eq!(shape.values(&mut changed).unwrap(), traced, "{what:?}");
+        }
+        let mut traced = read(Untraceable::Descriptor);
+        widen(&mut traced, &of_directives(&[], &[]), &mut fixed()).unwrap();
+        assert_eq!(traced.dirs.len(), 1);
+        assert_eq!(traced.dirs[0].0, Path::new("/p").join(PACKAGE));
+        let shape = Shape::of(&traced);
+        assert_eq!(shape.values(&mut fixed()).unwrap(), traced);
+        assert_ne!(shape.values(&mut changed).unwrap(), traced);
+    }
+
+    #[test]
+    fn a_run_that_read_the_clock_is_watched_by_what_its_script_named() {
         let clock = || Traced {
             files: vec![("/p/build.rs".into(), Some([1; 32]))],
             untraceable: vec![Untraceable::Clock],
             ..Traced::default()
         };
-        let mut traced = clock();
-        widen(&mut traced, &of_directives(&[], &[]), &mut fixed()).unwrap();
-        assert_eq!(traced.dirs.len(), 1);
-        assert_eq!(traced.dirs[0].0, Path::new("/p").join(PACKAGE));
         let mut changed = fixed();
         changed.files.insert("/p/src/lib.rs".into(), [9; 32]);
-        let shape = Shape::of(&traced);
-        assert_eq!(shape.values(&mut fixed()).unwrap(), traced);
-        assert_ne!(shape.values(&mut changed).unwrap(), traced);
 
         let mut named = clock();
         let rule = of_directives(&["data", "build.rs"], &["VERSION"]);

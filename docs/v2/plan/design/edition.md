@@ -40,7 +40,7 @@ it.
 | 3 | **View types.** `fn old_keys(&self.{lru})` says which fields a method borrows. | structs split to please the borrow checker | here | medium |
 | 4 | **Records and named arguments.** `{ a: T, b: U }` is a type, equal to any record with the same fields; fields may have defaults. | builders, options structs, one-off structs | here | medium |
 | 5 | **Capabilities as parameters.** With [bstd](std.md), a function touches only what it is handed, so one with no `Fs` or `Dir` parameter cannot reach the disk. (A `with` clause to pass them by name is deferred.) | ambient files, clock, network, allocator | [std](std.md) | large |
-| 6 | **Effects at the border.** pure, nopanic, noalloc, nonblocking, ambient, unsafe and may-suspend are inferred inside a crate and written on `pub` functions; a function that takes a closure does what the closure does. | `async`/`await`, and the async, const and `try_` twins of every API | [effects](effects.md), [pure-fns](pure-fns.md), [may-suspend](may-suspend.md) | medium |
+| 6 | **Effects are what a function may do.** `#[blaze::may(panic, alloc, block, diverge)]` lists a function's effects, and an unlisted one is checked absent; a module's `#![blaze::may(..)]` is the default of the functions in it; pure is derived; ambient, unsafe and may-suspend follow the same form; a function that takes a closure does what the closure does. | `async`/`await`, and the async, const and `try_` twins of every API | [effects](effects.md), [pure-fns](pure-fns.md), [may-suspend](may-suspend.md) | medium |
 | 7 | **Values that must be used up.** A `#[blaze::linear]` value cannot be dropped; every path hands it to a function that takes it by value. | forgotten commits, drop bombs | [linear](linear.md) | medium |
 | 8 | **Contracts and pattern types.** `requires` and `ensures` on a function; `usize is 1..` puts a range in the type, and `Conn is Conn::Open { .. }` a variant. | preconditions in doc comments, restated checks, `unreachable!()` after a match already made | [contracts](contracts.md), here | medium |
 | 9 | **Compile-time reflection.** `for const f in fields_of::<T>()` in ordinary typed code. | most derive proc macros | [comptime](comptime.md) | large |
@@ -171,7 +171,9 @@ is an error. Where a mechanical fix exists, `blaze check --fix` applies it.
 | `blaze::mut_ref` | `&mut` and `ref mut` where `&uniq` is available | rewrites to `&uniq` and `ref uniq` |
 | `blaze::handle_clone` | `.clone()` on a `Handle` (once change 1 exists) | removes it |
 | `blaze::error_wrapper` | an error enum that is only `From` variants (once change 2 exists) | rewrites to a union |
-| `blaze::unmarked_pure`, `unmarked_nopanic`, `unmarked_noalloc`, `unmarked_nonblocking` | a function the effects walk proves has that property and that lacks its attribute; `pub` functions by default, every function with `unmarked-effects-private = true` | adds the attribute; never one the check would then refuse |
+| `blaze::undeclared_effect` | a function that may panic, allocate from the global heap, block or not return where its `#[blaze::may(..)]`, its trait method's, a module's default or the gate (`#![blaze::effects]`, which the edition turns on) does not allow it ([effects](effects.md)); `deny` wherever something is declared | writes the list with the missing words: under the gate, `#[blaze::may(..)]` with exactly the inferred effects on every function that needs one |
+| `blaze::unneeded_effect` | a word of a private function's list for an effect it is proved not to have | takes the word off |
+| `blaze::negative_effect` | `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]` where effects are declared positively | rewrites to the `#[blaze::may(..)]` they stand for |
 | `blaze::derivable_by_reflection` | a derive that reflection covers (once change 9 exists) | none at first |
 
 The first three need nothing new and are built first. `lossy_as` is one lint with one message in

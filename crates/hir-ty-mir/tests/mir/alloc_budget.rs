@@ -266,26 +266,38 @@ const WARM: u32 = run(5) + 10 + 20;
 const TEN: u32 = run(10);
 const TWENTY: u32 = run(20);
 "#;
-    let fx = fixture::db(LOOPS);
-    let _ = fx.only_file();
-    let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
-        let eval = |name| {
-            measure(|| {
-                db.const_eval(constant(&db, name), GenericArgs::empty(), None)
-                    .expect("the constant")
-            })
-            .1
-            .allocations
-        };
-        // WARM also interns the literals `10` and `20`: a scalar constant's bytes go into a
-        // process-wide table the first time any thread lowers them, so without this TWENTY (or
-        // TEN, after another test) would pay for its literal's row and the table page under it.
-        eval("WARM");
-        // The two constants' bodies and runs are the same but for the count: each round of
-        // the loop and each call of its arithmetic allocates nothing.
-        assert_eq!(eval("TEN"), eval("TWENTY"));
-    });
+    // What an evaluation allocates, by constant, in a database of its own.
+    let evaluate = |measured: &[&str]| -> Vec<u64> {
+        let fx = fixture::db(LOOPS);
+        let _ = fx.only_file();
+        let db = fx.into_db();
+        blaze_query::db::attach(&db, || {
+            let eval = |name: &str| {
+                measure(|| {
+                    db.const_eval(constant(&db, name), GenericArgs::empty(), None)
+                        .expect("the constant")
+                })
+                .1
+                .allocations
+            };
+            // WARM lowers and infers `run` and what it calls, and interns the literals `10`
+            // and `20`, so neither constant measured pays for what both use.
+            eval("WARM");
+            // alloc: the test's own counts
+            measured.iter().map(|&name| eval(name)).collect()
+        })
+    };
+    // Interned constants are rows of process-wide tables that are never freed
+    // (`Allocation`'s, the types'), so what a first evaluation allocates depends on what
+    // every other test of this process has interned: the results `45` and `190` are new rows
+    // unless another test made one of them, and a new row may be the one that grows its
+    // table by a page. The first database's evaluations make every row both constants need;
+    // the second database's are measured, each cold in its own memos and warm in the tables.
+    evaluate(&["TEN", "TWENTY"]);
+    let counts = evaluate(&["TEN", "TWENTY"]);
+    // The two constants' bodies and runs are the same but for the count: each round of
+    // the loop and each call of its arithmetic allocates nothing.
+    assert_eq!(counts[0], counts[1]);
 }
 
 /// What filling `name`'s runtime body without generics allocates beyond its copy.

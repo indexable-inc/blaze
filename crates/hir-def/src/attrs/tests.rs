@@ -253,6 +253,7 @@ fn old_match_attr_flags(
                     "blaze" if &*second_segment == "nonblocking" => {
                         attr_flags.insert(AttrFlags::NONBLOCKING)
                     }
+                    "blaze" if &*second_segment == "may" => attr_flags.insert(AttrFlags::MAY),
                     _ => {}
                 },
             }
@@ -367,6 +368,8 @@ fn old_match_attr_flags(
                         "nopanic" => attr_flags.insert(AttrFlags::NOPANIC),
                         "noalloc" => attr_flags.insert(AttrFlags::NOALLOC),
                         "nonblocking" => attr_flags.insert(AttrFlags::NONBLOCKING),
+                        "may" => attr_flags.insert(AttrFlags::MAY),
+                        "effects" => attr_flags.insert(AttrFlags::BLAZE_EFFECTS),
                         "specialization" => attr_flags.insert(AttrFlags::BLAZE_SPECIALIZATION),
                         "specialization_trait" => {
                             attr_flags.insert(AttrFlags::BLAZE_SPECIALIZATION_TRAIT)
@@ -2223,6 +2226,19 @@ mod marked {
     #[blaze::nopanic]
     #[blaze::noalloc(trusted = "the caller's frame")]
     #[blaze::nonblocking(because)]
+    #[blaze::may(alloc, diverge)]
+    pub fn f(x: u32) -> u32 { x }
+}
+mod listed {
+    #[blaze::may(panic, trusted = "the table is complete")]
+    pub fn f(x: u32) -> u32 { x }
+}
+mod nothing {
+    #[blaze::may]
+    pub fn f(x: u32) -> u32 { x }
+}
+mod wrong {
+    #[blaze::may(panic, fast)]
     pub fn f(x: u32) -> u32 { x }
 }
 mod plain {
@@ -2230,12 +2246,12 @@ mod plain {
 }
 "#;
 
-/// `#[blaze::nopanic]`, `#[blaze::noalloc]` and `#[blaze::nonblocking]` set their bit and say
+/// `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]` and `#[blaze::may(..)]` set their bit and say
 /// what they say, and nothing else: the signature and every other flag of a marked function are
 /// those of the same function unmarked, so no code an unmarked crate builds can differ.
 #[test]
 fn an_effect_attribute_changes_no_signature() {
-    use super::{EffectWord, PureAttr};
+    use super::{EffectWord, MayAttr, MayWord, PureAttr};
     use crate::signatures::FunctionSignature;
 
     let db = fixture::db(EFFECTS).into_db();
@@ -2256,7 +2272,8 @@ fn an_effect_attribute_changes_no_signature() {
             .unwrap_or_else(|| panic!("no fn in {module}"))
     };
     let (marked, plain) = (in_module("marked"), in_module("plain"));
-    let effects = AttrFlags::NOPANIC | AttrFlags::NOALLOC | AttrFlags::NONBLOCKING;
+    let effects =
+        AttrFlags::NOPANIC | AttrFlags::NOALLOC | AttrFlags::NONBLOCKING | AttrFlags::MAY;
 
     let marked_flags = AttrFlags::query(&db, marked.into());
     assert!(marked_flags.contains(effects));
@@ -2270,7 +2287,35 @@ fn an_effect_attribute_changes_no_signature() {
         Some(PureAttr::Trusted(Symbol::intern("the caller's frame")))
     );
     assert!(matches!(said(marked, EffectWord::Nonblocking), Some(PureAttr::Malformed(_))));
-    for word in [EffectWord::Nopanic, EffectWord::Noalloc, EffectWord::Nonblocking] {
+    for word in EffectWord::ALL {
         assert_eq!(said(plain, word), None);
     }
+
+    // The positive spelling: the words listed, `trusted` after them, and anything else refused
+    // with its text.
+    let may = |module: &str| AttrFlags::may_attr(&db, in_module(module).into());
+    let words = |words: &[MayWord]| words.iter().fold(0, |bits, it| bits | it.bit());
+    assert_eq!(
+        may("marked"),
+        Some(MayAttr {
+            words: words(&[MayWord::Alloc, MayWord::Diverge]),
+            trusted: None,
+            malformed: None
+        })
+    );
+    assert_eq!(
+        may("listed"),
+        Some(MayAttr {
+            words: words(&[MayWord::Panic]),
+            trusted: Some(Symbol::intern("the table is complete")),
+            malformed: None
+        })
+    );
+    assert_eq!(may("nothing"), Some(MayAttr { words: 0, trusted: None, malformed: None }));
+    assert!(may("wrong").is_some_and(|it| it.malformed.is_some()));
+    assert_eq!(may("plain"), None);
+    assert_eq!(
+        AttrFlags::query(&db, in_module("nothing").into()) - AttrFlags::MAY,
+        AttrFlags::query(&db, plain.into())
+    );
 }

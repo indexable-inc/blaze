@@ -6,3 +6,15 @@ members = ["harness", "harness-browser", "harness-chat", "harness-mach", "harnes
 # (harness-browser/README.md).
 [patch.crates-io]
 cef-dll-sys = { path = "vendor/cef-dll-sys" }
+
+# The blaze that builds the harness, as blaze's own root pins it (.github/blaze-version): `blaze run -p harness-native`
+# starts the app on the daemon's code memory, where it takes edits while it runs (harness-native/src/app/live.rs).
+[workspace.metadata.blaze]
+version = "0.20261105.4"
+
+[workspace.metadata.blaze.sandbox]
+# libghostty-vt-sys's build script clones Ghostty at its pinned commit and builds it with zig (scripts/zig, through Nix),
+# whose build fetches Ghostty's zig packages: all network, which blaze's sandbox has none of. Until those come in as
+# pinned native inputs (docs/cargo.md, "Pinned native inputs": Ghostty's source and zig packages, and zig), it runs
+# outside the sandbox.
+unsandboxed-build-scripts = ["libghostty-vt-sys"]

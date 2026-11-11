@@ -266,9 +266,26 @@ pub fn heap_committed_by(committed: fn() -> u64) {
     _ = HEAP_COMMITTED.set(committed);
 }
 
-/// How many heap give-backs were asked ([`give_back_heap`]): each thread of the global allocator
-/// gives back the free pages its own heaps keep once it sees this past the count it last did.
-static HEAP_GIVE_BACKS: AtomicU64 = AtomicU64::new(0);
+mod give_back;
+
+pub use give_back::Settle;
+
+/// The heap give-backs asked ([`give_back_heap`]) and which counted threads have given back
+/// since ([`give_back::GiveBacks`]): each thread of the global allocator gives back the free
+/// pages its own heaps keep once it sees the generation past the one it last did.
+static HEAP_GIVE_BACKS: give_back::GiveBacks = give_back::GiveBacks::new();
+
+/// What wakes the threads that count for a give-back where they idle ([`heap_wakes_by`]):
+/// set once, by the worker pool.
+static HEAP_WAKE: OnceLock<fn()> = OnceLock::new();
+
+thread_local! {
+    /// This thread counts for a give-back ([`count_heap_settles`]), and the generation its
+    /// last counted give-back acked ([`heap_gave_back`]). `const`, without a destructor, so the
+    /// allocator's path may read them.
+    static COUNTED: Cell<bool> = const { Cell::new(false) };
+    static ACKED: Cell<Option<u64>> = const { Cell::new(None) };
+}
 
 /// The global allocator's give-back on the calling thread ([`heap_gives_back_by`]): set once,
 /// by an allocator that keeps free pages per thread (mimalloc's theaps).
@@ -285,7 +302,70 @@ pub fn heap_gives_back_by(here: fn()) {
 /// count to, on its allocation path. One relaxed load.
 #[inline]
 pub fn heap_give_backs() -> u64 {
-    HEAP_GIVE_BACKS.load(Ordering::Relaxed)
+    HEAP_GIVE_BACKS.asked()
+}
+
+/// The global allocator's give-back on this thread ended, having begun as it read `generation`
+/// from [`heap_give_backs`]: on a thread that counts ([`count_heap_settles`]) it is acked, once
+/// a generation, so a purge waiting on it ([`heap_give_back_settled`]) hears it. Allocates
+/// nothing and takes no lock: the allocator calls it.
+pub fn heap_gave_back(generation: u64) {
+    if !COUNTED.get() || ACKED.get() == Some(generation) {
+        return;
+    }
+    if HEAP_GIVE_BACKS.gave(generation) {
+        ACKED.set(Some(generation));
+    }
+}
+
+/// Whether every thread that counts gave back for the give-back asked now ([`Settle`]): what
+/// a purge reads after its [`ask_heap_give_back`], until it settles or its deadline passes.
+pub fn heap_give_back_settled() -> Settle {
+    HEAP_GIVE_BACKS.settled()
+}
+
+/// The calling thread counts for every give-back until the guard drops: a pool worker, which
+/// allocates for tasks and idles in the pool, the threads a purge waits on. Dropped on the
+/// thread that made it, as the worker ends. Only where the global allocator gives back per
+/// thread ([`heap_gives_back_by`], set as it makes its first heap, before any worker starts):
+/// under std's allocator no thread would ever ack, and a purge would wait out its deadline.
+pub fn count_heap_settles() -> HeapSettles {
+    if HEAP_GIVE_BACK.get().is_some() && !COUNTED.replace(true) {
+        ACKED.set(None);
+        HEAP_GIVE_BACKS.join();
+    }
+    HeapSettles(std::marker::PhantomData)
+}
+
+/// The calling thread counts for give-backs while this lives ([`count_heap_settles`]); not
+/// `Send`, since it is the thread's count it takes back.
+#[must_use = "the thread counts for give-backs only while this lives"]
+pub struct HeapSettles(std::marker::PhantomData<*const ()>);
+
+impl Drop for HeapSettles {
+    fn drop(&mut self) {
+        if COUNTED.replace(false) {
+            HEAP_GIVE_BACKS.leave(ACKED.take());
+        }
+    }
+}
+
+/// The threads that count for a give-back are woken where they idle with `wake`, so one that
+/// parks gives back now rather than at its next job. The first call wins; it allocates nothing.
+pub fn heap_wakes_by(wake: fn()) {
+    _ = HEAP_WAKE.set(wake);
+}
+
+/// Asks every thread of the global allocator to give back the free pages its heaps keep, wakes
+/// those that idle, and gives back this thread's now; the generation asked, for
+/// [`heap_give_back_settled`].
+pub fn ask_heap_give_back() -> u64 {
+    let generation = HEAP_GIVE_BACKS.ask();
+    if let Some(wake) = HEAP_WAKE.get() {
+        wake();
+    }
+    settle_heap();
+    generation
 }
 
 /// Asks every thread of the global allocator to give the system back the free pages its heaps
@@ -295,10 +375,12 @@ pub fn heap_give_backs() -> u64 {
 /// allocate from, and those they retire empty, are that thread's alone to collect, and a block
 /// another thread frees there is not even seen as free until it looks: each other thread does
 /// its part as it next allocates for a task, or as a pool worker goes idle ([`settle_heap`])
-/// (memcap5, coord-111).
+/// (memcap5, coord-111), and the idle ones are woken for it ([`heap_wakes_by`]). Nothing here
+/// waits for them: a purge that reads the footprint after waits with
+/// [`heap_give_back_settled`] (2026-11-09: a re-read at once still held up to 7.5 GiB the
+/// other threads kept).
 pub fn give_back_heap() {
-    HEAP_GIVE_BACKS.fetch_add(1, Ordering::Relaxed);
-    settle_heap();
+    ask_heap_give_back();
 }
 
 /// Gives back what this thread's heaps keep free if a give-back was asked since it last did

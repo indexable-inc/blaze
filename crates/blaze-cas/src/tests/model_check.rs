@@ -48,29 +48,56 @@ fn kind_of(n: u64) -> Kind {
     [Kind::Query, Kind::Code, Kind::Debug, Kind::Run, Kind::Output][n as usize % 5]
 }
 
-fn reads_back_what_a_map_holds(tc: &TestCase) {
-    let ops = tc.draw(gs::vecs(op()).min_size(1).max_size(40));
-    let mut sim = Sim::new(tc.draw(gs::integers()), quiet());
+/// What a read found or the map holds, for a finding.
+fn said(it: &Option<(Kind, Vec<u8>)>) -> String {
+    match it {
+        Some((kind, bytes)) => format!("{} bytes of kind {}", bytes.len(), kind.name()),
+        None => "nothing".to_owned(),
+    }
+}
+
+/// Runs `ops` against a store on the simulation and a map beside it; `Err` says where the two
+/// first differ. `plant` plants `Store::plant_no_drain` in the store, each time it is opened.
+fn runs_as_a_map_does(ops: Vec<Op>, seed: u64, plant: bool) -> Result<(), String> {
+    let mut sim = Sim::new(seed, quiet());
     let mut store = open(&mut sim, "store");
+    store.plant_no_drain = plant;
     let mut model: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    let read = |store: &Store, n: u64| -> Result<Option<(Kind, Vec<u8>)>, String> {
+        let found = store.get(&key(n)).map_err(|corrupt| format!("key {n}: {corrupt}"))?;
+        Ok(found.map(|it| (it.kind, it.bytes.to_vec())))
+    };
     for op in ops {
         match op {
             Op::Put(n, bytes) => match (store.put(key(n), kind_of(n), &bytes), model.get(&n)) {
                 (Ok(_), None) => {
                     model.insert(n, bytes);
                 }
-                (Ok(_), Some(kept)) => assert_eq!(kept, &bytes, "key {n}: other bytes were taken"),
-                (Err(mismatch), Some(kept)) => {
-                    assert_ne!(kept, &bytes, "key {n}: the same bytes were refused");
-                    assert_eq!((mismatch.key, mismatch.kept), (key(n), content_of(kept)));
-                    assert_eq!(mismatch.given, content_of(&bytes));
+                (Ok(_), Some(kept)) => {
+                    if kept != &bytes {
+                        return Err(format!("key {n}: other bytes were taken"));
+                    }
                 }
-                (Err(mismatch), None) => panic!("key {n}: a first put was refused: {mismatch:?}"),
+                (Err(mismatch), Some(kept)) => {
+                    if kept == &bytes {
+                        return Err(format!("key {n}: the same bytes were refused"));
+                    }
+                    let named = (mismatch.key, mismatch.kept, mismatch.given);
+                    if named != (key(n), content_of(kept), content_of(&bytes)) {
+                        return Err(format!("key {n}: its refusal names other values: {mismatch:?}"));
+                    }
+                }
+                (Err(mismatch), None) => {
+                    return Err(format!("key {n}: a first put was refused: {mismatch:?}"));
+                }
             },
             Op::Get(n) => {
-                let found = store.get(&key(n)).unwrap();
+                let found = read(&store, n)?;
                 let want = model.get(&n).map(|it| (kind_of(n), it.clone()));
-                assert_eq!(found.map(|it| (it.kind, it.bytes.to_vec())), want, "key {n}");
+                if found != want {
+                    let (found, want) = (said(&found), said(&want));
+                    return Err(format!("key {n}: read {found} where the map holds {want}"));
+                }
             }
             Op::Flush => {
                 flush(&mut sim, &mut store);
@@ -86,15 +113,33 @@ fn reads_back_what_a_map_holds(tc: &TestCase) {
                 flush(&mut sim, &mut store);
                 drop(store);
                 store = open(&mut sim, "store");
+                store.plant_no_drain = plant;
             }
         }
-        assert!(store.broken().is_none(), "{:?}", store.broken());
+        if let Some(broken) = store.broken() {
+            return Err(format!("the store stopped: {broken}"));
+        }
     }
     for n in 0..16 {
-        assert_eq!(bytes_of(&store, &key(n)).as_ref(), model.get(&n), "key {n}");
+        let found = read(&store, n)?.map(|(_, bytes)| bytes);
+        if found.as_ref() != model.get(&n) {
+            return Err(format!("key {n}: the store and the map end apart"));
+        }
     }
     flush(&mut sim, &mut store);
-    assert_eq!(store.verify(None), Vec::new());
+    match store.verify(None) {
+        corrupt if corrupt.is_empty() => Ok(()),
+        corrupt => Err(format!("the store does not verify clean: {corrupt:?}")),
+    }
+}
+
+fn reads_back_what_a_map_holds(tc: &TestCase) {
+    let ops = tc.draw(gs::vecs(op()).min_size(1).max_size(40));
+    let seed = tc.draw(gs::integers());
+    let said = format!("{ops:?}");
+    if let Err(why) = runs_as_a_map_does(ops, seed, false) {
+        panic!("seed {seed}, {said}: {why}");
+    }
 }
 
 /// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
@@ -104,8 +149,23 @@ pub(super) fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
     Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
 }
 
-/// `HEGEL_TEST_CASES=<n>` runs it longer.
+/// The refinement: the store is a map. Any run of puts, gets, flushes, settles and reopens
+/// reads back what a `BTreeMap` given the same puts holds, refuses other bytes under a key it
+/// has, and verifies clean. `HEGEL_TEST_CASES=<n>` runs it longer.
 #[test]
 fn the_store_reads_back_what_a_map_holds() {
     run_cases(48, |tc| reads_back_what_a_map_holds(&tc));
+}
+
+/// The planted-bug control: a commit that drains no writer's segment (`Store::plant_no_drain`)
+/// makes a flush durable in name only. The directed case (a put, a reopen, a get) passes with
+/// nothing planted and fails with it as that bug does: the key reads nothing where the map
+/// holds its bytes.
+#[test]
+fn the_oracle_catches_a_flush_that_commits_nothing() {
+    let directed = || vec![Op::Put(1, b"kept across a reopen".to_vec()), Op::Reopen, Op::Get(1)];
+    assert_eq!(runs_as_a_map_does(directed(), 1, false), Ok(()), "the store as it is must pass");
+    let why = runs_as_a_map_does(directed(), 1, true)
+        .expect_err("the oracle missed the planted flush that commits nothing");
+    assert!(why.contains("key 1: read nothing where the map holds"), "{why}");
 }

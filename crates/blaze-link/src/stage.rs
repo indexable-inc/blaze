@@ -468,15 +468,31 @@ impl<'a> Stage<'a> {
         for it in &change.statics {
             self.add_static(it)?;
         }
+        let mut weak = Vec::with_capacity_in(change.weak_names.len(), self.arena);
+        for name in &change.weak_names {
+            if !change.names.iter().any(|it| it.0 == *name) {
+                return Err(error(
+                    None,
+                    // alloc: error path
+                    format!(
+                        "`{name}` is among the change's weak names, and none of its names: a weak name is \
+                         one of `Change::names`, so the change is the caller's bug"
+                    ),
+                ));
+            }
+            weak.push(self.symbols.name(name));
+        }
+        weak.sort_unstable();
         let mut named = Vec::with_capacity_in(change.names.len(), self.arena);
         for (name, target) in &change.names {
             let name = self.symbols.name(name);
-            let sym = self.target_sym(target)?;
-            named.push((name, sym));
+            let target = self.target_sym(target)?;
+            let weak = weak.binary_search(&name).is_ok();
+            named.push((name, crate::state::RustName { target, weak }));
         }
         let symbols = &*self.symbols;
         let names = &self.new.names;
-        let differs = named.iter().any(|(name, sym)| names.get(name) != Some(sym))
+        let differs = named.iter().any(|(name, it)| names.get(name) != Some(it))
             || change
                 .unnamed
                 .iter()
