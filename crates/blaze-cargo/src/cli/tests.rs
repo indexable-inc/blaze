@@ -209,6 +209,60 @@ fn usage_errors_exit_1() {
     assert_eq!(command(words(os(&["blaze", "frobnicate"]))), Exit::Failed.code());
 }
 
+/// The bug this guards (2026-11-10): lane scripts ran `blaze daemon stop`, which is no command,
+/// for hours; the refusal listed thirty commands and never said that `blaze stop` is the one.
+#[test]
+fn a_command_that_does_not_exist_names_the_one_meant_and_still_fails() {
+    let said = no_such_command("daemon stop");
+    assert!(said.starts_with("no such command: `blaze daemon stop`"), "{said}");
+    assert!(said.contains("did you mean `blaze stop`?"), "{said}");
+    assert_eq!(command(words(os(&["blaze", "daemon", "stop"]))), Exit::Failed.code());
+    for (typed, meant) in [
+        ("daemon status", "`blaze status`"),
+        ("daemon start", "`blaze serve`"),
+        ("daemon instal", "`blaze daemon install`"),
+        ("daemon", "`blaze daemon install`"),
+        ("biuld", "`blaze build`"),
+        ("chekc", "`blaze check`"),
+        ("Status", "`blaze status`"),
+        ("clippy", "`blaze check`"),
+    ] {
+        let said = no_such_command(typed);
+        assert!(said.contains(&format!("did you mean {meant}?")), "{typed}: {said}");
+    }
+    assert_eq!(command(words(os(&["blaze", "biuld"]))), Exit::Failed.code());
+}
+
+#[test]
+fn a_word_far_from_every_command_is_given_no_guess_and_the_whole_list() {
+    for typed in ["frobnicate", "daemon frobnicate", "xy"] {
+        let said = no_such_command(typed);
+        assert!(!said.contains("did you mean"), "{typed}: {said}");
+        assert!(said.contains("blaze's commands are build, check, run, test"), "{said}");
+    }
+}
+
+#[test]
+fn every_command_suggested_is_one() {
+    // `blaze daemon` alone is no command: it takes a verb.
+    for name in COMMANDS.iter().filter(|it| **it != "daemon") {
+        assert_ne!(
+            args::parse(vec![OsString::from(*name)]),
+            Ok(Asked::Unknown((*name).to_owned())),
+            "`{name}` is in COMMANDS and is no command"
+        );
+    }
+    for (typed, command, _) in ALIASES {
+        let first = command.split(' ').nth(1).unwrap();
+        assert!(COMMANDS.contains(&first), "`{typed}` points at `{command}`, which is no command");
+        let typed: Vec<OsString> = typed.split(' ').map(OsString::from).collect();
+        assert!(
+            matches!(args::parse(typed.clone()), Ok(Asked::Unknown(_))),
+            "{typed:?} is a command, so its alias is never read"
+        );
+    }
+}
+
 /// Answers every request with `responses`.
 struct FakeApi {
     responses: Vec<Response>,
@@ -318,6 +372,60 @@ fn a_failed_build_runs_nothing() {
     let (then, _, err) = driven(&mut api, &["blaze", "build"], &mut programs);
     assert_eq!(then, Then::Exit(101));
     assert!(err.ends_with("error: the daemon's connection: the daemon hung up\n"), "{err}");
+}
+
+/// A build whose dependency failed exits nonzero and names what was not built, for every
+/// command that builds, whatever the daemon's `Done` says: 0.20261028.7's daemon ended
+/// `blaze build -p blaze-engine --release` ok with blaze-profile failed and both binaries behind
+/// it, and the client exited 0 with nothing placed.
+#[test]
+fn a_build_that_left_units_behind_a_failure_exits_nonzero_and_names_them() {
+    let unchecked = || {
+        Response::Unchecked(blaze_api::Unchecked {
+            open: Vec::new(),
+            tests: Vec::new(),
+            behind: vec![blaze_api::Behind {
+                id: None,
+                why: "errors in its code".to_owned(),
+                unit: "dep v0.1.0 (lib)".to_owned(),
+                units: vec!["foo v0.1.0 (lib)".to_owned(), "foo v0.1.0 (bin \"foo\")".to_owned()],
+            }],
+            stopped: false,
+        })
+    };
+    for words in [
+        &["blaze", "build"][..],
+        &["blaze", "build", "--release"],
+        &["blaze", "check"],
+        &["blaze", "test"],
+        &["blaze", "test", "--fail-fast"],
+        &["blaze", "run"],
+    ] {
+        // The daemon as it is: a failed build's `Done` is not ok. And the planted bug: a daemon
+        // that says ok after it named what it left.
+        for done in [false, true] {
+            let mut api = FakeApi::answering(vec![
+                foo_compiling(),
+                unchecked(),
+                Response::Done { ok: done },
+            ]);
+            let mut programs = Fake::default();
+            let (then, _, err) = driven(&mut api, words, &mut programs);
+            assert_eq!(then, Then::Exit(101), "{words:?}, Done {{ ok: {done} }}: {err}");
+            assert!(programs.ran.is_empty(), "{words:?}: nothing built, nothing runs");
+            assert!(
+                err.contains("2 units not checked, behind what failed:\n")
+                    && err.contains("behind dep v0.1.0 (lib) (errors in its code): 2 units\n")
+                    && err.contains("foo v0.1.0 (bin \"foo\")"),
+                "{words:?}: {err}"
+            );
+            assert_eq!(
+                err.contains("the daemon said the build passed after it left 2 unit(s)"),
+                done,
+                "{words:?}: {err}"
+            );
+        }
+    }
 }
 
 #[test]

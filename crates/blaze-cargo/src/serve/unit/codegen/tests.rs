@@ -11,7 +11,8 @@ use blaze_items::ItemKey;
 
 use super::{
     Full, KeptImage, Laid, LinkCause, Linked, Linking, Mounted, OutputFields, PgoFlag, StaticRow,
-    codegen_backend, function_rows, kept_image, linking, pgo, read_profile, sanitize, static_rows,
+    codegen_backend, full_link_note, function_rows, kept_image, linking, pgo, read_profile,
+    sanitize, static_rows,
 };
 use blaze_codegen::InstanceKey;
 
@@ -56,6 +57,25 @@ fn profile(name: &str, opt_level: &str, backend: Option<&str>) -> Profile {
         hint_mostly_unused: None,
         contract_checks: true,
     }
+}
+
+/// Debug info goes beside an ELF or Mach-O image by default and under either split setting;
+/// `off` puts it inside as before; no debug info is none wherever; a format with no side file
+/// keeps what it had; a setting rustc does not take is refused by name.
+#[test]
+fn debug_info_goes_beside_the_image_unless_the_profile_says_off() {
+    use blaze_link::{Debug, Format};
+    for format in [Format::Elf, Format::MachO] {
+        for split in [None, Some("packed"), Some("unpacked")] {
+            assert_eq!(super::debug_place(Debug::Lines, format, split), Ok(Debug::Beside));
+        }
+        assert_eq!(super::debug_place(Debug::Lines, format, Some("off")), Ok(Debug::Lines));
+        assert_eq!(super::debug_place(Debug::None, format, None), Ok(Debug::None));
+        assert_eq!(super::debug_place(Debug::None, format, Some("off")), Ok(Debug::None));
+    }
+    assert_eq!(super::debug_place(Debug::Lines, Format::Pe, None), Ok(Debug::Lines));
+    let refused = super::debug_place(Debug::Lines, Format::Elf, Some("split")).unwrap_err();
+    assert!(refused.contains("`split`") && refused.contains("unpacked"), "{refused}");
 }
 
 #[test]
@@ -339,8 +359,10 @@ fn kept(path: &str, output: &blaze_link::Output) -> KeptImage {
     let kept = Linked {
         image: blaze_link::Image::new(to, output.clone()).unwrap(),
         output: output.clone(),
-        functions: vec![(InstanceKey(ContentId([9; 32])), ContentId([9; 32]))],
-        statics: Vec::new(),
+        rows: super::kept::Rows {
+            functions: [(InstanceKey(ContentId([9; 32])), ContentId([9; 32]))].into(),
+            ..Default::default()
+        },
         natives: Vec::new(),
         names: Vec::new(),
         layout: None,
@@ -391,6 +413,23 @@ fn how_a_link_went_is_first_only_with_nothing_kept() {
         "not spliced: the output changed: exports"
     );
     assert!(Linking::First.placed() && !Linking::Spliced.placed() && !Linking::Unchanged.placed());
+    // A splice refused for a thunk: the link from scratch is said on the link line, and the
+    // build names the branch.
+    assert!(Linking::Full(Full::NoThunk).placed());
+    // A splice refused for want of room: linked from scratch, and said so.
+    assert!(Linking::Full(Full::NoRoom).placed());
+    assert_eq!(
+        Linking::Full(Full::NoRoom).to_string(),
+        "not spliced: full link: the kept image has no room for the change"
+    );
+    assert_eq!(
+        Linking::Full(Full::NoThunk).to_string(),
+        "not spliced: full link: the splice could not place a thunk in a branch's reach"
+    );
+    assert_eq!(
+        full_link_note("A64Call26 at 0x114 in the function `f`"),
+        "full link: the splice could not place a thunk for A64Call26 at 0x114 in the function `f`"
+    );
 }
 
 /// The image kept at a path is the one the link stages against, taken out of the kept images;
@@ -402,7 +441,7 @@ fn a_kept_image_is_taken_only_for_its_own_output_and_layout() {
     let mut images = vec![kept(path, &output)];
     let (linked, changed, relaid) = kept_image(&mut images, path, &output, None).unwrap();
     assert_eq!(
-        (linked.functions.len(), changed, relaid),
+        (linked.rows.functions.len(), changed, relaid),
         (1, Some(OutputFields::default()), false)
     );
     assert!(images.is_empty(), "taken out for the link");
@@ -411,7 +450,7 @@ fn a_kept_image_is_taken_only_for_its_own_output_and_layout() {
     let heat = Some(ContentId([3; 32]));
     let (fresh, changed, relaid) = kept_image(&mut images, path, &output, heat).unwrap();
     assert!(
-        fresh.functions.is_empty() && fresh.layout == heat && relaid,
+        fresh.rows.functions.is_empty() && fresh.layout == heat && relaid,
         "another profile: laid out again"
     );
     assert_eq!(changed, Some(OutputFields::default()));
@@ -420,13 +459,13 @@ fn a_kept_image_is_taken_only_for_its_own_output_and_layout() {
     images.push(KeptImage { path: path.to_owned(), kept: fresh });
     let other = shared(&["f", "g"]);
     let (fresh, changed, _) = kept_image(&mut images, path, &other, heat).unwrap();
-    assert!(fresh.functions.is_empty() && fresh.output == other);
+    assert!(fresh.rows.functions.is_empty() && fresh.output == other);
     assert_eq!(changed.map(|it| it.to_string()).as_deref(), Some("exports"));
     assert!(images.is_empty(), "the image of the old output is let go");
 
     let (fresh, changed, relaid) = kept_image(&mut images, path, &output, None).unwrap();
     assert!(
-        fresh.functions.is_empty() && changed.is_none() && !relaid,
+        fresh.rows.functions.is_empty() && changed.is_none() && !relaid,
         "nothing kept: a first link"
     );
 
@@ -445,10 +484,12 @@ fn a_kept_image_is_taken_only_for_its_own_output_and_layout() {
     );
 }
 
-/// A link blaze-link refused for want of room names the image, what overflowed and the command
-/// that links it from scratch; any other refusal names no such command.
+/// A link blaze-link refused for want of room, which a link from scratch could not take
+/// either (a kept image out of room is linked from scratch first, `Full::NoRoom`), names the
+/// image, what overflowed and that the limit is the output's; any other refusal says no such
+/// thing.
 #[test]
-fn a_link_out_of_room_names_the_image_and_how_to_link_it_whole() {
+fn a_link_out_of_room_names_the_image_and_whose_limit_it_is() {
     let refused = |refusal| blaze_link::LinkError {
         function: None,
         what: "Patch needs 70000000 bytes and has room for 67108864: link the image from scratch"
@@ -468,6 +509,6 @@ fn a_link_out_of_room_names_the_image_and_how_to_link_it_whole() {
         "{no_room}"
     );
     assert!(no_room.contains("Patch needs 70000000 bytes and has room for 67108864"), "{no_room}");
-    assert!(no_room.contains("`blaze stop`"), "{no_room}");
-    assert!(!failed(None).contains("`blaze stop`"));
+    assert!(no_room.contains("the limit is the output's"), "{no_room}");
+    assert!(!failed(None).contains("the limit is the output's"));
 }

@@ -1115,7 +1115,8 @@ impl Queue {
         }
         let tag = self.tag(For::Write(b as u32));
         // Made empty, with its directory, before the sandbox appends to it.
-        effects.push(Effect::Write { file: record, bytes: Vec::new(), tag }); // alloc: setup, once per server
+        // No sync: the record is of this run alone, and a run a crash ends is run again.
+        effects.push(Effect::WriteUnsynced { file: record, bytes: Vec::new(), tag }); // alloc: setup, once per server
     }
 
     fn written(&mut self, b: usize, done: Done, effects: &mut Vec<Effect>) {

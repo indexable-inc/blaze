@@ -37,8 +37,7 @@ pub(crate) fn contract(db: &Db, func: FunctionId) -> Contract {
     let store = &body.store;
     let mut reader = Reader { db, def, store, resolver: def.resolver(db) };
     let mut contract = Contract { has_requires: false, bound: None };
-    // A group's index among all the function's clause groups is its `ClauseRef::group` in
-    // hir-ty-verus.
+    // A group's index among all the function's clause groups, in source order.
     for (group, &(expr, kind)) in store.spec_clauses().iter().enumerate() {
         match kind {
             SpecClauseKind::Requires => contract.has_requires = true,

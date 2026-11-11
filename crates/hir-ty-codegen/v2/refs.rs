@@ -195,8 +195,10 @@ pub(crate) fn facts<'db>(
 }
 
 /// The digests of the dyn facts the body of `instance` read when it was devirtualized
-/// (`MirBody::inlined.devirtualized`), sorted, each once: what its code is keyed by beside its
-/// body ([`super::devirt::code`]). Empty for a walk without the program's world.
+/// (`MirBody::inlined.devirtualized`) and of the facts of other items its passes relied on
+/// (`MirBody::inlined.relied`), sorted, each once: what its code is keyed by beside its
+/// body ([`super::devirt::code`]). Empty for a walk without the program's world of a body
+/// that relied on nothing.
 pub(crate) fn read<'db>(
     db: &'db Db,
     instance: &HirInstance,
@@ -336,6 +338,10 @@ fn code_refs(
     for (at, (build, body)) in bodies.iter().enumerate() {
         let body = &**body;
         found.read.extend_from_slice(&body.inlined.devirtualized);
+        // The facts of other items the body's passes relied on (`SpendFacts`,
+        // docs/v2/plan/design/facts.md): its code is the code they changed, so they key it
+        // beside the dyn facts, whatever else names the instance.
+        found.read.extend_from_slice(&body.inlined.relied);
         found.read.sort_unstable();
         found.read.dedup();
         pass(db, env, Some(body), tracked, (*build, &mut found), |walk| {
@@ -1272,8 +1278,12 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         (reachable, decided)
     }
 
-    /// `enter_coroutine`: an `async` body dropped before it ran drops what it captured.
+    /// `enter_coroutine`: an `async` body polled after it ended panics
+    /// (`resumed_after_end`), and dropped before it ran drops what it captured.
     fn enter_coroutine(&mut self, body: &'db MirBody<'db>) -> Result<(), String> {
+        for path in crate::RESUMED_AFTER_END {
+            self.panic(path)?;
+        }
         let receiver = body.param_locals[0];
         let Some(ty) = body.locals[receiver].ty.as_ref().builtin_deref(true) else {
             // alloc: the error's message
@@ -1553,39 +1563,32 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         {
             return self.panic(&["panicking", "panic"]);
         }
-        let name = match msg {
-            AssertKind::BoundsCheck { .. } => {
-                return self.panic(&["panicking", "panic_bounds_check"]);
-            }
+        match crate::OverflowOp::of(msg) {
+            Some(Ok(op)) => return self.panic(&["panicking", "panic_const", op.panic()]),
+            // A unit that makes this check refuses it, naming it.
+            Some(Err(_)) if msg.is_optional_overflow_check() => return Ok(()),
+            // alloc: the error's message
+            Some(Err(op)) => return Err(format!("overflow check of {op:?}")),
+            None => (),
+        }
+        match msg {
+            AssertKind::BoundsCheck { .. } => self.panic(&["panicking", "panic_bounds_check"]),
             // The UB checks' (`check_pointers`, `check_enums`): `core::panicking`'s own.
             AssertKind::MisalignedPointerDereference { .. } => {
-                return self.panic(&["panicking", "panic_misaligned_pointer_dereference"]);
+                self.panic(&["panicking", "panic_misaligned_pointer_dereference"])
             }
             AssertKind::NullPointerDereference => {
-                return self.panic(&["panicking", "panic_null_pointer_dereference"]);
+                self.panic(&["panicking", "panic_null_pointer_dereference"])
             }
             AssertKind::NullReferenceConstructed => {
-                return self.panic(&["panicking", "panic_null_reference_constructed"]);
+                self.panic(&["panicking", "panic_null_reference_constructed"])
             }
             AssertKind::InvalidEnumConstruction(_) => {
-                return self.panic(&["panicking", "panic_invalid_enum_construction"]);
+                self.panic(&["panicking", "panic_invalid_enum_construction"])
             }
-            AssertKind::Overflow(BinOp::Add, ..) => "panic_const_add_overflow",
-            AssertKind::Overflow(BinOp::Sub, ..) => "panic_const_sub_overflow",
-            AssertKind::Overflow(BinOp::Mul, ..) => "panic_const_mul_overflow",
-            AssertKind::Overflow(BinOp::Div, ..) => "panic_const_div_overflow",
-            AssertKind::Overflow(BinOp::Rem, ..) => "panic_const_rem_overflow",
-            AssertKind::Overflow(BinOp::Shl, ..) => "panic_const_shl_overflow",
-            AssertKind::Overflow(BinOp::Shr, ..) => "panic_const_shr_overflow",
-            // A unit that makes this check refuses it, naming it.
-            AssertKind::Overflow(..) if msg.is_optional_overflow_check() => return Ok(()),
             // alloc: the error's message
-            AssertKind::Overflow(op, ..) => return Err(format!("overflow check of {op:?}")),
-            AssertKind::OverflowNeg(_) => "panic_const_neg_overflow",
-            AssertKind::DivisionByZero(_) => "panic_const_div_by_zero",
-            AssertKind::RemainderByZero(_) => "panic_const_rem_by_zero",
-        };
-        self.panic(&["panicking", "panic_const", name])
+            _ => Err(format!("{msg:?}, which is no check the walk knows")),
+        }
     }
 
     /// `tail_call`: the one function a `become` jumps to, never built in. What the IR

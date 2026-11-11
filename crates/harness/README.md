@@ -6,9 +6,13 @@ on den's flecs stack, libghostty for terminal state). Imported with its history 
 
 harness is its own cargo workspace with its own `Cargo.lock`, excluded from blaze's workspace
 (blaze's root `Cargo.toml`): blaze's gate does not build or check it, and blaze's astlog rules,
-`harness/rustcsites.py` and `tools/docs.py` skip this directory. Build it with cargo, on the Mac:
+`harness/rustcsites.py` and `tools/docs.py` skip this directory. Build it with blaze, on the Mac:
 
-    cd crates/harness && cargo build --release    # target/release/harness, harness-native, harness-video
+    cd crates/harness && blaze build --release    # harness, harness-native, harness-video
+
+Only blaze can: harness-native-render takes Kip's shaders from blaze's device build of
+harness-native-shaders (`artifact = "gpu"`, docs/future/gpu/shaders.md), a dependency cargo
+refuses to read.
 
 ## Map
 
@@ -22,12 +26,14 @@ harness is its own cargo workspace with its own `Cargo.lock`, excluded from blaz
 | `harness-ghostty-config/` | reads the user's Ghostty config |
 | `harness-native/` | the macOS app, a library with a thin binary: `scene/*.flecs` (tokens, views, keys), fonts, icons, Metal shaders; `harness_native::scene::world()` is the scene every host loads (the app, its tests, harness-video) |
 | `harness-native-render/` | the renderer the app and harness-video share: Metal (Slang shaders), text, vector marks, the paint pass |
+| `harness-native/` | the macOS app: `scene/*.flecs` (tokens, views, keys), fonts, icons, Metal shaders |
+| `harness-native-render/` | the renderer the app and harness-video share: Metal (shaders in Slang and in Rust), text, vector marks, the paint pass |
 | `harness-native-blaze/` | blaze's fire wordmark, live (drop in, catch, burn to embers), and its synthesised soundtrack (from indexable-inc/anim) |
 | `harness-video/` | videos from flecs scenes loaded into the app's own scene (its tokens, prims and `hn.*` widgets), a timeline of `Cue`s as data (blaze's launch video: `scene/launch.flecs`) |
 | `harness-native-*` | the app's layers: model, flecs glue, ECS, UI layout/motion/draw/input/text and their `-api` crates, prims (`harness-native-ui-prims/scene/`), scroll physics |
 | `vendor/` | the hyperion-* crates over flecs (flecs itself is the indexable-inc/flecs fork, pinned by rev in `vendor/hyperion-flecs-c/Cargo.toml`; `vendor/SOURCE.md`) |
 | `scripts/zig` | fetches the pinned zig through Nix |
-| `scripts/harness` | builds and runs the `harness` binary from this checkout |
+| `scripts/harness` | builds (with blaze) and runs the `harness` binary from this checkout |
 | `mcp/` | the Bun/TypeScript kernel the daemon runs (`mcp/src/mcp.ts`; `bun install` in `mcp/`), with its smoke scripts in `mcp/scripts/` |
 | `mcp/skills/` | harness's skills: one topic's instructions each (`<name>.md` with `name` and `description` front matter); the agent's note carries only their index, `await skill('name')` in ts loads one (`harness/src/skills.rs`, `mcp/src/skills.ts`) |
 | `harness/src/system_note/` | the always-on part of every agent's note, one file per topic (`harness/src/profiles.rs`) |

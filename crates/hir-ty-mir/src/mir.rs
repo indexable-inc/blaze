@@ -21,6 +21,7 @@ pub mod checks;
 pub mod const_check;
 mod ctfe_limit;
 pub mod dispatch;
+pub mod early_drop;
 mod eval;
 mod framed;
 pub mod home;
@@ -85,8 +86,8 @@ pub use monomorphization::normalize_or_keep;
 pub use monomorphization::{monomorphized_args, monomorphized_const, monomorphized_ty};
 pub use optimize::{
     BOX_IN_PLACE_MIN, CallerLocation, CloneId, MAX_COPIES, MAX_COPIES_PER_BODY, caller_location,
-    heap_held, owner_of, passes_not_ported, set_interpreter_mir_opt_level, source_span,
-    specialized_mir_body, written_checked_at,
+    heap_held, owner_of, passes_not_ported, relied_on_own_no_unwind,
+    set_interpreter_mir_opt_level, source_span, specialized_mir_body, written_checked_at,
 };
 pub use pretty::{closure_path_suffix, impl_written_at, print_mir_body};
 pub use storage::{FrameStorage, SharedSlots, StorageConflicts, share_greedily};

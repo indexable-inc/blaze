@@ -189,6 +189,11 @@ impl Vtable {
             } else {
                 None
             },
+            unread: if F::EVICTABLE {
+                Some(evict_unread::<F> as fn(&Storage, u32, u32) -> (usize, u64))
+            } else {
+                None
+            },
             relocate: Some(relocate::<F> as fn(&mut Storage, u32, &mut Relocate)),
             restamp: Some(restamp::<F> as fn(&Storage, u32, &mut Restamp<'_>)),
             write_key: Some(write_key::<F> as fn(&Storage, Id, &mut String)),
@@ -221,6 +226,31 @@ pub fn fetch<'db, F: Function>(db: &'db F::Db, key: F::Key) -> &'db F::Value {
         }
     }
     fetch_cold::<F>(db, key)
+}
+
+/// Whether the row of `key` is current in this view (verified, with its value) and durable:
+/// it read nothing below kind `HIGH` and made no untracked read. Such a row's value changes
+/// only in a view a `HIGH` write opens, so a caller that fetched it, saw `true` here and
+/// kept [`Storage::durable_view`] knows, for as long as that view is the same, that the row
+/// holds that value: no fetch, no verification. `false` for a row never run, not current
+/// (fetch it first), or of a lower kind. Records no read: for a caller outside any query.
+pub fn durable<F: Function>(db: &F::Db, key: F::Key) -> bool {
+    let storage = db.storage();
+    let id = key.as_id();
+    let dir = storage.dir(F::ingredient().index());
+    if dir.is_null() {
+        return false;
+    }
+    // SAFETY: a published directory is readable whole for `MAX_PAGES` entries
+    // (`Pages::dir`), and `id.page() < MAX_PAGES` (masked, `Id::page`); it lives as long
+    // as the storage. As [`fetch`].
+    let page = unsafe { &*dir.add(id.page()) }.load(Ordering::Acquire);
+    let Some(page) = NonNull::new(page) else { return false };
+    // SAFETY: the page was made for this function's rows, `id.slot() < PAGE_LEN`.
+    let row = unsafe { row_at::<RowOf<F>>(page, id.slot()) };
+    u64::from(row.header.verified.load(Ordering::Acquire)) == storage.clock()
+        && row.header.meta.load(Ordering::Relaxed) & UNTRACKED == 0
+        && row.header.durability() >= Durability::HIGH.0
 }
 
 /// Records a read of a row's current value into the running query, if any.
@@ -370,27 +400,17 @@ fn fetch_cold<'db, F: Function>(db: &'db F::Db, key: F::Key) -> &'db F::Value {
 ///
 /// When no ingredient owns `id`'s page: an ID this storage never gave (page 0, a page not yet
 /// made, past [`Id::MAX_U32`]), forged or decoded unchecked. Its row would sit in a page no
-/// sweep or drop can name.
+/// sweep or drop can name. The unwind is typed ([`super::NeverGiven`]) and fails the asking
+/// job alone.
 fn row_or_make<F: Function>(storage: &Storage, id: Id) -> (&RowOf<F>, u32) {
     let (table, index) = storage.table_or_make::<FnTable<F>>(F::ingredient());
     if storage.owner(id).is_none() {
-        never_given(index, id);
+        super::never_given(storage, index, id);
     }
     let (size, align) = row::layout::<RowOf<F>>();
     let page = table.pages.page_or_make(id.page(), &storage.heap, size, align);
     // SAFETY: the page was made for `RowOf<F>` rows; `id.slot() < PAGE_LEN`.
     (unsafe { row_at::<RowOf<F>>(page, id.slot()) }, index)
-}
-
-#[cold]
-#[inline(never)]
-fn never_given(index: u32, id: Id) -> ! {
-    panic!(
-        "`{}` was asked for the key {id:?}, an ID this database never gave (its page {} has no \
-         owner): a key forged, or decoded without checking its page's owner",
-        ingredient::name(index),
-        id.page(),
-    )
 }
 
 /// Brings `row` up to this view: with its value when `value`. Returns how the caller may read
@@ -1689,6 +1709,30 @@ fn evict_table<F: Function>(storage: &mut Storage, index: u32) -> usize {
     table.values.fetch_sub(evicted, Ordering::Relaxed);
     counts::add(index, counts::DROPPED, evicted as u64);
     evicted
+}
+
+/// [`Vtable::unread`] of `F`: lets go of each value whose row was last verified in a view
+/// before `before`. A row is stamped with the view of each read of it (a hit needs
+/// `verified == clock`, and the cold path stamps what it verifies or runs), so such a value was
+/// read in no view since. A walk of every row made, for a caller with `&mut` of the storage.
+fn evict_unread<F: Function>(storage: &Storage, index: u32, before: u32) -> (usize, u64) {
+    let Some(table) = storage.table::<FnTable<F>>(index) else { return (0, 0) };
+    let (mut evicted, mut freed) = (0usize, 0u64);
+    for (_, row) in rows::<F>(storage, table) {
+        let word = row.header.verified.load(Ordering::Relaxed);
+        if word & VALUE == 0 || word & VIEW_MASK >= before {
+            continue;
+        }
+        if let Some(bytes) = evict::<F>(table, row) {
+            evicted += 1;
+            freed += bytes;
+        }
+    }
+    table.values.fetch_sub(evicted, Ordering::Relaxed);
+    if evicted != 0 {
+        counts::add(index, counts::EVICTED, evicted as u64);
+    }
+    (evicted, freed)
 }
 
 /// [`Explicit::values`] of `F`: how many of its rows hold a value, from its counter.

@@ -27,6 +27,9 @@ blaze-phf.workspace = true
 # The rule of which spans the flight recorder keeps, for `blaze::unrecorded_span`.
 blaze-profile.workspace = true
 blaze-serde.workspace = true
+# Counts the read of a lint profile as a look at the disk no watch vouches for
+# (`blaze_vfs::outside::looked`).
+blaze-vfs.workspace = true
 cfg.workspace = true
 either.workspace = true
 hir.workspace = true

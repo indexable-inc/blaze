@@ -81,6 +81,13 @@ fn refuse(conn: u64, req: u64, why: &str) {
 /// # Safety
 /// `obj` is a live object whose `sel` getter returns an NSString or nil.
 unsafe fn text(obj: &AnyObject, sel: objc2::runtime::Sel) -> String {
+    // A getter this object does not have is no text, never an exception: an unrecognised selector would end the host.
+    // SAFETY: -respondsToSelector: on a live object.
+    let has: bool = unsafe { msg_send![obj, respondsToSelector: sel] };
+    if !has {
+        eprintln!("harness-browser: places: {:?} has no -{}", obj.class().name(), sel.name().to_string_lossy());
+        return String::new();
+    }
     // SAFETY: the caller's contract.
     let s: Option<Retained<NSString>> = unsafe { msg_send![obj, performSelector: sel] };
     s.map(|s| s.to_string()).unwrap_or_default()
@@ -111,16 +118,28 @@ pub fn request(conn: u64, req: u64, query: &str, latitude: f64, longitude: f64, 
     };
     SEARCHES.with_borrow_mut(|s| s.insert((conn, req), search.clone()));
     let limit = (limit as usize).clamp(1, MAX_PLACES);
+    let query = query.to_owned();
     let done = RcBlock::new(move |response: *mut AnyObject, error: *mut AnyObject| {
         SEARCHES.with_borrow_mut(|s| s.remove(&(conn, req)));
         if response.is_null() {
-            // SAFETY: an NSError when there is no response (the handler's contract); -code is an NSInteger.
-            let code: isize = if error.is_null() { -1 } else { unsafe { msg_send![&*error, code] } };
+            if error.is_null() {
+                return refuse(conn, req, "Apple Maps' search gave neither places nor an error");
+            }
+            // SAFETY: an NSError when there is no response (the handler's contract): -code is an NSInteger, -domain an
+            // NSString.
+            let (code, domain): (isize, String) = unsafe { (msg_send![&*error, code], text(&*error, objc2::sel!(domain))) };
             // MKErrorPlacemarkNotFound (4): nothing matched, which is an answer, not a failure.
-            if code == 4 {
+            if domain == "MKErrorDomain" && code == 4 {
                 return host::answer(conn, &KernelDown::Places { req, places: Vec::new() });
             }
-            return refuse(conn, req, &format!("Apple Maps' search failed with MKError {code} (2 is a network failure, 3 its servers')"));
+            let why = match (domain.as_str(), code) {
+                ("MKErrorDomain", 2) => "a network failure".to_owned(),
+                ("MKErrorDomain", 3) => "Apple's servers are throttling this Mac's searches (wait a little)".to_owned(),
+                ("NSURLErrorDomain", -1001) => "the request to Apple's servers timed out (a slow network)".to_owned(),
+                ("NSURLErrorDomain", -1009) => "this Mac is offline".to_owned(),
+                _ => format!("{domain} error {code}"),
+            };
+            return refuse(conn, req, &format!("Apple Maps' search for {query:?} failed: {why}"));
         }
         // SAFETY: an MKLocalSearchResponse; mapItems is an NSArray of MKMapItem, whose getters return NSStrings, an
         // NSURL and an MKPlacemark (each possibly nil), and the placemark's coordinate a struct of two doubles.
@@ -134,7 +153,11 @@ pub fn request(conn: u64, req: u64, query: &str, latitude: f64, longitude: f64, 
                 let Some(mark) = mark else { continue };
                 let at: Coordinate = msg_send![&*mark, coordinate];
                 let url: Option<Retained<AnyObject>> = msg_send![&*item, url];
+                // MKMapItem.identifier (macOS 15): an MKMapItemIdentifier, or nil; its identifierString is the id's text
+                // (Swift's rawValue; Objective-C has no selector of that name).
+                let ident: Option<Retained<AnyObject>> = msg_send![&*item, identifier];
                 out.push(Place {
+                    id: ident.map(|i| text(&i, objc2::sel!(identifierString))).unwrap_or_default(),
                     name: text(&item, objc2::sel!(name)),
                     latitude: at.latitude,
                     longitude: at.longitude,

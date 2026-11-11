@@ -108,6 +108,13 @@ use hir_ty_mir::mir::{
     owner_of, source_span, written_checked_at,
 };
 
+/// Keeps the analyses behind `hir_ty::facts::facts_of` in every binary that generates code
+/// (docs/v2/plan/design/facts.md): `hir-ty-pure` registers them with `inventory::submit!`,
+/// which a linker keeps only with the object it is in, and this names that object. Without
+/// it `SpendFacts` would prove nothing and change nothing, silently.
+#[used]
+static FACTS_LINKED: fn() = hir_ty_pure::facts::linked_here;
+
 mod asm;
 pub use asm::Assembled;
 mod avx512;
@@ -155,7 +162,7 @@ pub(crate) use spare::with_context;
 mod stable;
 pub use stable::{block_place, function_place, lower_declared, static_place};
 mod target;
-pub use target::{Arch, Calls, Features, ObjectFormat, Target, UnwindFormat, VariableArguments};
+pub use target::{Arch, Features, ObjectFormat, Target, UnwindFormat, VariableArguments};
 pub mod tier;
 
 mod type_id;
@@ -466,7 +473,7 @@ fn x86_lanewise(name: &str) -> Option<(Lanewise, Type)> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum OverflowOp {
+pub(crate) enum OverflowOp {
     Add,
     Sub,
     Mul,
@@ -477,6 +484,48 @@ enum OverflowOp {
     Shr,
     DivByZero,
     RemByZero,
+}
+
+impl OverflowOp {
+    /// The check an `Assert` of `msg` makes, when it is an arithmetic one: `Err` with the
+    /// operator of an overflow check core has no panic for. The one map of them, which the IR
+    /// builder compiles and the reference walk (`v2::refs`) lists.
+    pub(crate) fn of(msg: &AssertKind) -> Option<std::result::Result<Self, BinOp>> {
+        Some(Ok(match msg {
+            AssertKind::Overflow(BinOp::Add, ..) => OverflowOp::Add,
+            AssertKind::Overflow(BinOp::Sub, ..) => OverflowOp::Sub,
+            AssertKind::Overflow(BinOp::Mul, ..) => OverflowOp::Mul,
+            AssertKind::Overflow(BinOp::Div, ..) => OverflowOp::Div,
+            AssertKind::Overflow(BinOp::Rem, ..) => OverflowOp::Rem,
+            AssertKind::Overflow(BinOp::Shl, ..) => OverflowOp::Shl,
+            AssertKind::Overflow(BinOp::Shr, ..) => OverflowOp::Shr,
+            AssertKind::Overflow(op, ..) => return Some(Err(op.clone())),
+            AssertKind::OverflowNeg(_) => OverflowOp::Neg,
+            AssertKind::DivisionByZero(_) => OverflowOp::DivByZero,
+            AssertKind::RemainderByZero(_) => OverflowOp::RemByZero,
+            AssertKind::BoundsCheck { .. }
+            | AssertKind::MisalignedPointerDereference { .. }
+            | AssertKind::NullPointerDereference
+            | AssertKind::NullReferenceConstructed
+            | AssertKind::InvalidEnumConstruction(_) => return None,
+        }))
+    }
+
+    /// Core's `panic_const_*` a failed check of this calls (`FunctionCx::panic_if`).
+    pub(crate) fn panic(self) -> &'static str {
+        match self {
+            OverflowOp::Add => "panic_const_add_overflow",
+            OverflowOp::Sub => "panic_const_sub_overflow",
+            OverflowOp::Mul => "panic_const_mul_overflow",
+            OverflowOp::Div => "panic_const_div_overflow",
+            OverflowOp::Rem => "panic_const_rem_overflow",
+            OverflowOp::Neg => "panic_const_neg_overflow",
+            OverflowOp::Shl => "panic_const_shl_overflow",
+            OverflowOp::Shr => "panic_const_shr_overflow",
+            OverflowOp::DivByZero => "panic_const_div_by_zero",
+            OverflowOp::RemByZero => "panic_const_rem_by_zero",
+        }
+    }
 }
 
 /// How a value crosses a call boundary in rustc's Rust ABI.
@@ -931,8 +980,8 @@ fn regalloc() -> &'static str {
 const LARGE: usize = 50_000;
 
 /// The most instructions a function has that Cranelift gives its usual register allocator,
-/// which spends 1 to 2 µs an instruction on one this large and more on larger ones. On
-/// dev-aws-6 nushell's `main`, of 35 780 instructions, took 75 ms of Cranelift with it and
+/// which spends 1 to 2 µs an instruction on one this large and more on larger ones. On an
+/// x86-64 Linux host nushell's `main`, of 35 780 instructions, took 75 ms of Cranelift with it and
 /// 47 ms with the single-pass one, on every edit to it; the largest functions of a cold build
 /// of nushell took 80 to 220 ms each. The single-pass allocator's code is larger and slower,
 /// and it gives every value live across blocks a stack slot of its own: hir-ty's
@@ -2290,6 +2339,34 @@ pub fn exported_static(db: &Db, id: StaticId) -> Option<intern::Symbol> {
     })
 }
 
+/// How a function or static Rust code defines under a name ([`exported_symbol`],
+/// [`linked_symbol`], [`exported_static`]) is defined, read off its `#[linkage]`: the one
+/// place the linkage of a named definition is decided, which codegen's driver and the linker
+/// take as it is ([`blaze_codegen::Linkage`]). rustc gives `weak`, `weak_odr`, `linkonce` and
+/// `linkonce_odr` a weak symbol in the object (LLVM's `WeakAny`, `WeakODR`, `LinkOnceAny`,
+/// `LinkOnceODR`), and `external` or no attribute a strong one. Any other linkage on a named
+/// definition (`internal`, `private`, `available_externally`, `common`, `appending`,
+/// `extern_weak`) is refused naming it: blaze links every named definition as one global
+/// symbol, and taking it for a strong one would link another program than rustc's.
+pub fn exported_linkage(
+    db: &Db,
+    owner: hir_def::AttrDefId,
+) -> std::result::Result<blaze_codegen::Linkage, String> {
+    let Some(linkage) = AttrFlags::linkage(db, owner) else {
+        return Ok(blaze_codegen::Linkage::Strong);
+    };
+    match linkage.as_str() {
+        "external" => Ok(blaze_codegen::Linkage::Strong),
+        "weak" | "weak_odr" | "linkonce" | "linkonce_odr" => Ok(blaze_codegen::Linkage::Weak),
+        // alloc: the error's message
+        other => Err(format!(
+            "`#[linkage = \"{other}\"]` on a definition outside code names by its symbol: blaze links a named \
+             definition strongly (`external`, or no `#[linkage]`) or weakly (`weak`, `weak_odr`, `linkonce`, \
+             `linkonce_odr`), never as `{other}`"
+        )),
+    }
+}
+
 /// The symbol an item of an `extern` block links to, on its crate's target. A target that
 /// does not load is an error: the symbol depends on it.
 pub fn link_name(db: &Db, func: FunctionId) -> Result<Option<String>> {
@@ -3155,7 +3232,7 @@ fn emit_with(
 ) -> Result<Code> {
     refuse_tail_calls(&ctx.func, target)?;
     if target.is_wasm() {
-        return emit_wasm(&ctx.func, target.calls(), wasm::Address::of(target));
+        return emit_wasm(&ctx.func, wasm::Address::of(target));
     }
     let large = ctx.func.dfg.num_insts() > SINGLE_PASS;
     let kind = if large { Isa::Large } else { Isa::Usual };
@@ -3298,11 +3375,9 @@ fn refuse_tail_calls(func: &ir::Function, target: &'static Target) -> Result<()>
 /// goes through the object like machine code and is made a module of by a linker.
 fn emit_wasm(
     func: &cranelift_codegen::ir::Function,
-    calls: Calls,
     address: wasm::Address,
 ) -> Result<Code> {
-    let (function, mut relocs) =
-        wasm::lower(func, calls, address).map_err(CodegenError::Unsupported)?;
+    let (function, mut relocs) = wasm::lower(func, address).map_err(CodegenError::Unsupported)?;
     let (bytes, body) = function.encode().map_err(CodegenError::Backend)?;
     for reloc in &mut relocs {
         reloc.offset += body;
@@ -3433,36 +3508,53 @@ impl<'db> Relocations<'_, 'db> {
         matches!(self.map, MemoryMap::Complex(_))
     }
 
-    /// Notes that the `size` bytes at `start` of the memory at `kept` are a number.
+    /// Notes that the `size` bytes at `start` of the memory at `kept` are a number. The ranges
+    /// of one memory are kept sorted, disjoint and merged where they touch, so a table of N
+    /// numbers is one range and [`Self::is_number`] is a binary search: a linear scan per word
+    /// made a constant's check quadratic (`half`'s conversion tables held a build 18 minutes).
+    /// A walk goes through a memory in ascending order, so the insert is almost always a push
+    /// or a merge with the last range.
     fn number(&mut self, kept: Option<usize>, start: usize, size: usize) {
-        if size > 0 {
-            // alloc: the numbers of one allocation, for its walk
-            self.numbers.entry(kept).or_insert_with(Vec::new).push((start, start + size));
+        if size == 0 {
+            return;
         }
+        // alloc: the numbers of one allocation, for its walk
+        add_number_range(self.numbers.entry(kept).or_insert_with(Vec::new), start, start + size);
     }
 
     /// Whether a type says every byte of the `word` at `at` of the memory at `kept` is a
-    /// number.
+    /// number: one merged range holds all of them.
     fn is_number(&self, kept: Option<usize>, at: usize, word: usize) -> bool {
-        let Some(ranges) = self.numbers.get(&kept) else { return false };
-        let mut pos = at;
-        // Each step moves `pos` to the end of a range that holds it, so at most one a range.
-        for _ in 0..=ranges.len() {
-            if pos >= at + word {
-                return true;
-            }
-            match ranges.iter().find(|&&(start, end)| start <= pos && pos < end) {
-                Some(&(_, end)) => pos = end,
-                None => return false,
-            }
-        }
-        pos >= at + word
+        self.numbers.get(&kept).is_some_and(|ranges| numbers_cover(ranges, at, at + word))
     }
 
     /// The union the byte at `at` of the memory at `kept` is in, if a walk went through one.
     fn union_at(&self, kept: Option<usize>, at: usize) -> Option<Ty<'db>> {
         (self.unions.iter()).find(|it| it.0 == kept && it.1 <= at && at < it.2).map(|it| it.3)
     }
+}
+
+/// Adds `lo..hi` to `ranges`, kept sorted, disjoint and merged where two touch, so a run of
+/// number bytes is one range. A walk goes through a memory in ascending order, so this is almost
+/// always a push or a merge with the last range.
+fn add_number_range(ranges: &mut Vec<(usize, usize)>, mut lo: usize, mut hi: usize) {
+    // The first range that ends at or after `lo`: it touches or follows the new one.
+    let first = ranges.partition_point(|&(_, end)| end < lo);
+    // Every range from `first` that starts at or before `hi` touches it: merged into one.
+    let mut last = first;
+    while last < ranges.len() && ranges[last].0 <= hi {
+        lo = lo.min(ranges[last].0);
+        hi = hi.max(ranges[last].1);
+        last += 1;
+    }
+    ranges.splice(first..last, [(lo, hi)]);
+}
+
+/// Whether `ranges` (as [`add_number_range`] keeps them) hold every byte of `lo..hi`: merged
+/// ranges never touch, so the run is in exactly one, the last starting at or before `lo`.
+fn numbers_cover(ranges: &[(usize, usize)], lo: usize, hi: usize) -> bool {
+    let after = ranges.partition_point(|&(start, _)| start <= lo);
+    after > 0 && ranges[after - 1].1 >= hi
 }
 
 /// Whether a value of `ty` is a number, with no pointer in it.
@@ -3858,6 +3950,15 @@ const UNRESUMED: i64 = 0;
 const RETURNED: i64 = 1;
 const PANICKED: i64 = 2;
 const SUSPENDED: i64 = 3;
+
+/// The panics of an `async` body polled again after it ended, as rustc's coroutine transform
+/// has them: core's at the first path once it `RETURNED`, at the second once it `PANICKED`.
+/// The one list of them: [`FunctionCx::resumed_after_end`] calls them, and the reference walk
+/// (`v2::refs`) lists them for every `async` body, so the two cannot disagree.
+pub(crate) const RESUMED_AFTER_END: [&[&str]; 2] = [
+    &["panicking", "panic_const", "panic_const_async_fn_resumed"],
+    &["panicking", "panic_const", "panic_const_async_fn_resumed_panic"],
+];
 
 /// The local a body's caller gets the value of. An `async` body computes the value of its
 /// block in the return slot, and hands back a `Poll` of it.
@@ -4839,6 +4940,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     };
                     for (field, ty) in self.cg.db.field_types(variant).iter() {
                         let ty = ty.ty().instantiate(self.interner, subst).skip_norm_wip();
+                        // A field may be a projection the arguments resolve (`T::Inner`).
+                        let ty = self.normalize(ty);
                         let field = layout.fields.offset(u32::from(field.into_raw()) as usize);
                         self.scalar_leaves(ty, offset + field.bytes(), leaves)?;
                     }
@@ -5871,8 +5974,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             held.locals.binary_search(&local).ok()
         };
         // In an `async` body a temporary may be kept in the future where its binding is not.
-        let mut forwarded =
-            if frame.is_none() { forwarded_temps(body) } else { HashMap::new_in(Global) };
+        let mut forwarded = if frame.is_none() {
+            forwarded_temps(body, self.frame)
+        } else {
+            HashMap::new_in(self.frame)
+        };
         let in_place = match self.ret_mode {
             PassMode::Indirect if frame.is_none() => {
                 returned_in_place(body, &forwarded).filter(|it| !forwarded.contains_key(it))
@@ -5885,7 +5991,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         // A local kept in a register gets a slot only when it needs memory: see `local_slot`.
         let mut registers = Vec::new_in(self.frame);
         if frame.is_none() {
-            for local in register_locals(body, &forwarded) {
+            for local in register_locals(body, &forwarded, self.frame) {
                 if !self.locals.contains_idx(local)
                     && let Some(ty) = self.register_ty(body.locals[local].ty.as_ref())
                 {
@@ -5898,13 +6004,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.registers.insert(local, Register { var, ty });
         }
         if frame.is_none() {
-            for (temp, from) in moved_arguments(body, &forwarded) {
+            for (temp, from) in moved_arguments(body, &forwarded, self.frame) {
                 if !self.registers.contains_idx(temp) && !self.registers.contains_idx(from) {
                     forwarded.insert(temp, from);
                 }
             }
         }
-        let unmentioned = unmentioned_locals(body);
+        let unmentioned = unmentioned_locals(body, self.frame);
         let mut shareable: Vec<(LocalId, ir::StackSlot), &Frame> = Vec::new_in(self.frame);
         for (local, data) in body.locals.iter() {
             if self.locals.contains_idx(local)
@@ -6062,7 +6168,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     unsupported!("an async block without a state");
                 };
                 let state = SuspendedState { addr: state, ty: self.scalar(tag)?.ty, held };
-                self.enter_coroutine(body, &state, addr, ty, &layout)?;
+                self.enter_coroutine(body, &reachable, &state, addr, ty, &layout)?;
                 self.suspended = Some(state);
             }
             _ => {
@@ -8661,7 +8767,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if track_caller(db, callee) {
             return self.reified(fn_ty, false);
         }
-        let sig = self.interner.instantiate_bound_regions_with_erased(fn_ty.fn_sig(self.interner));
+        let sig = self.abi_sig(fn_ty)?;
         let inputs = Self::abi_inputs(sig.abi(), sig.inputs())?;
         let abi = self.fn_abi(sig.abi(), sig.output(), inputs.iter().copied())?;
         let mut sig = self.signature(&abi.args, abi.ret);
@@ -9223,18 +9329,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// `panic_const_*`, or for a check of an arbitrary width `checked`, core's `panic` with
     /// the message naming it.
     fn panic_if(&mut self, cond: Value, op: OverflowOp, checked: Option<NarrowInt>) -> Result<()> {
-        let name = match op {
-            OverflowOp::Add => "panic_const_add_overflow",
-            OverflowOp::Sub => "panic_const_sub_overflow",
-            OverflowOp::Mul => "panic_const_mul_overflow",
-            OverflowOp::Div => "panic_const_div_overflow",
-            OverflowOp::Rem => "panic_const_rem_overflow",
-            OverflowOp::Neg => "panic_const_neg_overflow",
-            OverflowOp::Shl => "panic_const_shl_overflow",
-            OverflowOp::Shr => "panic_const_shr_overflow",
-            OverflowOp::DivByZero => "panic_const_div_by_zero",
-            OverflowOp::RemByZero => "panic_const_rem_by_zero",
-        };
+        let name = op.panic();
         let panic_block = self.builder.create_block();
         let ok_block = self.builder.create_block();
         self.builder.set_cold_block(panic_block);
@@ -9345,7 +9440,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         &mut self,
         body: &MirBody<'_>,
         shareable: &[(LocalId, ir::StackSlot)],
-        forwarded: &HashMap<LocalId, LocalId, Global>,
+        forwarded: &HashMap<LocalId, LocalId, &Frame>,
     ) {
         let frame = self.frame;
         // A local kept in a register gets its slot later, if ever: see `local_slot`. In index
@@ -9671,17 +9766,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             self.ub_check_panic_if(failed, name, &[source])?;
                             None
                         }
-                        AssertKind::Overflow(BinOp::Add, ..) => Some(OverflowOp::Add),
-                        AssertKind::Overflow(BinOp::Sub, ..) => Some(OverflowOp::Sub),
-                        AssertKind::Overflow(BinOp::Mul, ..) => Some(OverflowOp::Mul),
-                        AssertKind::Overflow(BinOp::Div, ..) => Some(OverflowOp::Div),
-                        AssertKind::Overflow(BinOp::Rem, ..) => Some(OverflowOp::Rem),
-                        AssertKind::Overflow(BinOp::Shl, ..) => Some(OverflowOp::Shl),
-                        AssertKind::Overflow(BinOp::Shr, ..) => Some(OverflowOp::Shr),
-                        AssertKind::Overflow(op, ..) => unsupported!("overflow check of {op:?}"),
-                        AssertKind::OverflowNeg(_) => Some(OverflowOp::Neg),
-                        AssertKind::DivisionByZero(_) => Some(OverflowOp::DivByZero),
-                        AssertKind::RemainderByZero(_) => Some(OverflowOp::RemByZero),
+                        AssertKind::Overflow(..)
+                        | AssertKind::OverflowNeg(_)
+                        | AssertKind::DivisionByZero(_)
+                        | AssertKind::RemainderByZero(_) => match OverflowOp::of(msg) {
+                            Some(Ok(op)) => Some(op),
+                            Some(Err(op)) => unsupported!("overflow check of {op:?}"),
+                            None => unsupported!("{msg:?}, which is no arithmetic check"),
+                        },
                     };
                     // A check of an arbitrary width names it in the panic.
                     let checked = match msg {
@@ -10163,6 +10255,34 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.copy(field, src, size);
         }
         Ok(tuple)
+    }
+
+    /// The signature of the fn item or fn pointer type `ty` as its ABI is computed from:
+    /// lifetimes erased and every projection normalized under this function's `ParamEnv`, as
+    /// rustc's `fn_sig_for_fn_abi` normalizes erasing regions. A fn item's declared signature
+    /// can name a projection the instance's arguments resolve, as objc2's `define_class!`
+    /// writes a method's return as `<CGRect as ConvertReturn<()>>::Inner`, and a calling
+    /// convention classifies the type it stands for, never the alias. Where it does not
+    /// normalize, the signature is refused, naming `ty`.
+    fn abi_sig(&self, ty: Ty<'db>) -> Result<rustc_type_ir::FnSig<DbInterner<'db>>> {
+        use rustc_type_ir::TypeVisitableExt;
+        let sig = self.interner.instantiate_bound_regions_with_erased(ty.fn_sig(self.interner));
+        if !sig.has_aliases() {
+            return Ok(sig);
+        }
+        let normalized = hir_ty::next_solver::obligation_ctxt::ObligationCtxt::new(&self.infcx)
+            .deeply_normalize(
+                &hir_ty::next_solver::infer::traits::ObligationCause::dummy(),
+                self.env.param_env,
+                sig,
+            );
+        match normalized {
+            Ok(normalized) if !normalized.has_infer() => Ok(normalized),
+            Ok(normalized) => {
+                unsupported!("the signature of `{ty:?}` normalizes to `{normalized:?}`, unsolved")
+            }
+            Err(why) => unsupported!("the signature of `{ty:?}` does not normalize: {why:?}"),
+        }
     }
 
     /// The types a function with this signature is passed, one by one: the final tuple of a
@@ -10892,11 +11012,55 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.cg.callee(closure, parent_args, self.env, &sig)
     }
 
-    /// The `ReifyShim` of a fn item or fn pointer type.
+    /// The `ReifyShim` of a fn item or fn pointer type, of the item the call resolves to
+    /// ([`Self::resolved_fn_item`]).
     fn reified(&mut self, ty: Ty<'db>, receiver: bool) -> Result<FuncId> {
+        let ty = self.resolved_fn_item(ty)?;
         let sig = self.reify_signature(ty, receiver)?.1;
         let args = GenericArgs::new_from_slice(&[ty.into()]);
         self.cg.callee(InstanceDef::ReifyShim { receiver }, args, self.env, &sig)
+    }
+
+    /// The fn item type of the function a call of the fn item `ty` runs: for a trait method
+    /// named through its trait (`<C as Tr>::f`, monomorphized), the method of the impl its
+    /// arguments select, or the trait's default body where the impl has none, as rustc's
+    /// shims call what `Instance::resolve` gives. A `ReifyShim` is keyed and compiled as the
+    /// function it calls (v2's code identity, `frontend::code_of`, reads the item its type
+    /// names), so a shim of the trait's declaration would be one of a function with no body,
+    /// and one of a default body the impl overrides would be keyed by the wrong code. Every
+    /// other type, and a call whose callee is not a plain function (`dyn`'s vtable slot, a
+    /// builtin derive, the compiler's `Clone` or `FnPtr`, an `async` block's `poll`), is `ty`
+    /// itself: the shim's body resolves those as any call does (`call_direct`).
+    fn resolved_fn_item(&self, ty: Ty<'db>) -> Result<Ty<'db>> {
+        let TyKind::FnDef(def, generic_args) = ty.kind() else {
+            return Ok(ty);
+        };
+        let CallableDefId::FunctionId(func) = def.0 else {
+            return Ok(ty);
+        };
+        let generic_args = generic_args.skip_binder();
+        let db = self.cg.db;
+        if FunctionSignature::is_intrinsic(db, func) {
+            return Ok(ty);
+        }
+        let callee =
+            dispatch::callee(&self.infcx, self.env, func, generic_args).map_err(|why| {
+                CodegenError::Refused(no_impl_method(db, func, generic_args, why))
+            })?;
+        Ok(match callee {
+            dispatch::Callee::Fn(callee, callee_args)
+                if callee != func || callee_args != generic_args =>
+            {
+                let def = CallableDefId::FunctionId(callee).into();
+                Ty::new_fn_def(self.interner, def, callee_args)
+            }
+            dispatch::Callee::Fn(..)
+            | dispatch::Callee::Poll(..)
+            | dispatch::Callee::Virtual
+            | dispatch::Callee::Derived(..)
+            | dispatch::Callee::CloneBuiltin(_)
+            | dispatch::Callee::FnPtr(_) => ty,
+        })
     }
 
     /// What a `ReifyShim` is called with and how.
@@ -10908,7 +11072,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if !matches!(ty.kind(), TyKind::FnDef(..) | TyKind::FnPtr(..)) {
             unsupported!("Fn-trait vtable of {ty:?}");
         }
-        let fn_sig = self.interner.instantiate_bound_regions_with_erased(ty.fn_sig(self.interner));
+        let fn_sig = self.abi_sig(ty)?;
         if fn_sig.c_variadic() {
             unsupported!("shim for a variadic function");
         }
@@ -15374,6 +15538,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn enter_coroutine(
         &mut self,
         body: &MirBody<'db>,
+        reachable: &blaze_hash::HashSet<BasicBlockId, Global>,
         state: &SuspendedState,
         addr: Value,
         ty: Ty<'db>,
@@ -15396,7 +15561,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.builder.switch_to_block(poll);
         let mut switch = Switch::new();
         switch.set_entry(UNRESUMED as u128, self.blocks[body.start_block]);
-        for (index, point) in state.held.yields.iter().enumerate() {
+        // The yields that run, by where each resumes. One in a block that never runs
+        // (`if CONST { x.await }`) never stores its state, and its resume and drop blocks are
+        // not compiled, so it has no arm.
+        // alloc: inline, a few yields a body
+        let resumes: smallvec::SmallVec<[BasicBlockId; 8]> = reachable
+            .iter()
+            .filter_map(|&id| match body.basic_blocks[id].terminator.as_ref().map(|it| &it.kind) {
+                Some(TerminatorKind::Yield { resume, .. }) => Some(*resume),
+                _ => None,
+            })
+            .collect();
+        let runs = |index: &usize| resumes.contains(&state.held.yields[*index].resume);
+        for (index, point) in state.held.yields.iter().enumerate().filter(|(it, _)| runs(it)) {
             switch.set_entry(SUSPENDED as u128 + index as u128, self.blocks[point.resume]);
         }
         switch.emit(&mut self.builder, at, finished);
@@ -15413,7 +15590,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.store_state(state.addr, state.ty, RETURNED);
         let mut dropping = Switch::new();
         dropping.set_entry(UNRESUMED as u128, unresumed);
-        for (index, point) in state.held.yields.iter().enumerate() {
+        for (index, point) in state.held.yields.iter().enumerate().filter(|(it, _)| runs(it)) {
             let Some(dropped) = point.drop else {
                 unsupported!("a yield without a drop path");
             };
@@ -15447,14 +15624,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         // rustc's panic here unwinds straight out (`UnwindAction::Continue`): it does not
         // poison the state, so a future polled after it returned says so on every poll.
         self.in_cleanup = true;
-        for (block, name) in [
-            (returned, "panic_const_async_fn_resumed"),
-            (panicked, "panic_const_async_fn_resumed_panic"),
-        ] {
+        for (block, path) in [returned, panicked].into_iter().zip(RESUMED_AFTER_END) {
             self.builder.set_cold_block(block);
             self.builder.switch_to_block(block);
             let location = self.caller_location()?;
-            self.call_panic(&["panicking", "panic_const", name], &[location])?;
+            self.call_panic(path, &[location])?;
             self.builder.ins().trap(TrapCode::user(1).expect("non-zero trap code"));
         }
         self.in_cleanup = false;
@@ -16257,13 +16431,14 @@ fn dump_mir(body: &MirBody<'_>) {
 
 /// The locals that can be kept in a register as far as the body goes: temporaries written
 /// whole by assignments only, that nothing takes the address of.
-fn register_locals(
+fn register_locals<'f>(
     body: &MirBody<'_>,
-    forwarded: &HashMap<LocalId, LocalId, Global>,
-) -> Vec<LocalId> {
+    forwarded: &HashMap<LocalId, LocalId, &Frame>,
+    frame: &'f Frame,
+) -> Vec<LocalId, &'f Frame> {
     let whole = |place: &StoredPlace| place.projection.as_slice().is_empty().then_some(place.local);
     // Every mention of the whole local, and the ones that are a value read or an assignment.
-    let mut mentions: HashMap<LocalId, (usize, usize), Global> = HashMap::new_in(Global);
+    let mut mentions: HashMap<LocalId, (usize, usize), &Frame> = HashMap::new_in(frame);
     body.visit_places(|place| {
         if let Some(local) = whole(place) {
             mentions.entry(local).or_default().0 += 1;
@@ -16299,44 +16474,42 @@ fn register_locals(
             _ => (),
         }
     }
-    let bound: blaze_hash::HashSet<LocalId, Global> = body
-        .binding_locals
-        .values()
-        .chain(&body.param_locals)
-        .copied()
-        .chain(promoted_locals(body))
-        .chain([returned_local(body)])
-        .chain(forwarded.iter().flat_map(|(&temp, &to)| [temp, to]))
-        .collect(); // alloc: once per body, which this function has no frame for
-    body.locals
-        .iter()
-        .map(|(local, _)| local)
-        .filter(|local| {
-            !bound.contains(local) && mentions.get(local).is_none_or(|(all, plain)| all == plain)
-        })
-        .collect() // alloc: the result, once per body, which the caller takes owned
+    let bound: HashSet<LocalId, &Frame> = HashSet::from_iter_in(
+        body.binding_locals
+            .values()
+            .chain(&body.param_locals)
+            .copied()
+            .chain(promoted_locals(body))
+            .chain([returned_local(body)])
+            .chain(forwarded.iter().flat_map(|(&temp, &to)| [temp, to])),
+        frame,
+    );
+    let mut registers = Vec::new_in(frame);
+    registers.extend(body.locals.iter().map(|(local, _)| local).filter(|local| {
+        !bound.contains(local) && mentions.get(local).is_none_or(|(all, plain)| all == plain)
+    }));
+    registers
 }
 
 /// The locals of `body` that no place mentions, which hold nothing the body ever reads: their
 /// storage markers are all there is of them. The parameters, the return slot and the promoted
 /// locals are not among them, whatever mentions them: they are written from outside the body,
 /// or read by it.
-fn unmentioned_locals(body: &MirBody<'_>) -> HashSet<LocalId, Global> {
-    let mut mentioned = HashSet::new_in(Global);
+fn unmentioned_locals<'f>(body: &MirBody<'_>, frame: &'f Frame) -> HashSet<LocalId, &'f Frame> {
+    let mut mentioned: HashSet<LocalId, &Frame> = HashSet::new_in(frame);
     body.visit_places(|place| {
         mentioned.insert(place.local);
     });
-    body.locals
-        .iter()
-        .map(|(local, _)| local)
-        .filter(|local| {
+    HashSet::from_iter_in(
+        body.locals.iter().map(|(local, _)| local).filter(|local| {
             !mentioned.contains(local)
                 && !body.param_locals.contains(local)
                 && *local != returned_local(body)
                 && !is_promoted(body, *local)
                 && !body.upvars_in_place.iter().any(|it| it.0 == *local)
-        })
-        .collect() // alloc: the result, once per body, which the caller takes owned
+        }),
+        frame,
+    )
 }
 
 /// The local every return of `body` moves to the return slot, when nothing else mentions the
@@ -16345,7 +16518,7 @@ fn unmentioned_locals(body: &MirBody<'_>) -> HashSet<LocalId, Global> {
 /// or a fresh binding, so the callee reaches that memory through nothing else.
 fn returned_in_place(
     body: &MirBody<'_>,
-    forwarded: &HashMap<LocalId, LocalId, Global>,
+    forwarded: &HashMap<LocalId, LocalId, &Frame>,
 ) -> Option<LocalId> {
     if body.coroutine.is_some() {
         return None;
@@ -16419,8 +16592,11 @@ fn returned_in_place(
 
 /// How many times each local is dropped by a terminator or read by a `FakeRead`, counted in one
 /// pass: a body of many blocks has many temporaries, and neither is a use of what one holds.
-fn drops_and_fake_reads(body: &MirBody<'_>) -> HashMap<LocalId, usize, Global> {
-    let mut counted: HashMap<LocalId, usize, Global> = HashMap::new_in(Global);
+fn drops_and_fake_reads<'f>(
+    body: &MirBody<'_>,
+    frame: &'f Frame,
+) -> HashMap<LocalId, usize, &'f Frame> {
+    let mut counted: HashMap<LocalId, usize, &Frame> = HashMap::new_in(frame);
     for (_, block) in body.basic_blocks.iter() {
         for statement in &block.statements {
             if let StatementKind::FakeRead(place) = &statement.kind {
@@ -16440,13 +16616,14 @@ fn drops_and_fake_reads(body: &MirBody<'_>) -> HashMap<LocalId, usize, Global> {
 /// `f(value)` moves `value` to a temporary and the temporary to `f`. The two can be one slot,
 /// nothing reading or writing `value` between the move and the call, and the callee then gets
 /// `value`'s memory, as rustc passes a moved local.
-fn moved_arguments(
+fn moved_arguments<'f>(
     body: &MirBody<'_>,
-    forwarded: &HashMap<LocalId, LocalId, Global>,
-) -> Vec<(LocalId, LocalId)> {
+    forwarded: &HashMap<LocalId, LocalId, &Frame>,
+    frame: &'f Frame,
+) -> Vec<(LocalId, LocalId), &'f Frame> {
     let whole = |place: &StoredPlace| place.projection.as_slice().is_empty().then_some(place.local);
     let slot = return_slot();
-    let mut found = Vec::new(); // alloc: the result, once per body, which the caller takes owned
+    let mut found = Vec::new_in(frame);
     for (_, block) in body.basic_blocks.iter() {
         let Some(TerminatorKind::Call { func, args, destination, .. }) =
             block.terminator.as_ref().map(|it| &it.kind)
@@ -16502,20 +16679,21 @@ fn moved_arguments(
     if found.is_empty() {
         return found;
     }
-    let mut mentions: HashMap<LocalId, usize, Global> = HashMap::new_in(Global);
+    let mut mentions: HashMap<LocalId, usize, &Frame> = HashMap::new_in(frame);
     body.visit_places(|place| *mentions.entry(place.local).or_default() += 1);
-    let not_uses = drops_and_fake_reads(body);
+    let not_uses = drops_and_fake_reads(body, frame);
     let dropped_or_read = |local: LocalId| not_uses.get(&local).copied().unwrap_or(0);
-    let bound: blaze_hash::HashSet<LocalId, Global> = body
-        .binding_locals
-        .values()
-        .chain(&body.param_locals)
-        .copied()
-        .chain(promoted_locals(body))
-        .chain(body.upvars_in_place.iter().map(|it| it.0))
-        .chain([slot])
-        .chain(forwarded.values().copied())
-        .collect(); // alloc: once per body with a moved argument, which this has no frame for
+    let bound: HashSet<LocalId, &Frame> = HashSet::from_iter_in(
+        body.binding_locals
+            .values()
+            .chain(&body.param_locals)
+            .copied()
+            .chain(promoted_locals(body))
+            .chain(body.upvars_in_place.iter().map(|it| it.0))
+            .chain([slot])
+            .chain(forwarded.values().copied()),
+        frame,
+    );
     found.retain(|&(temp, from)| {
         !bound.contains(&temp)
             && !forwarded.contains_key(&temp)
@@ -16525,8 +16703,8 @@ fn moved_arguments(
             && mentions[&temp] - dropped_or_read(temp) == 2
             && body.locals[temp].ty == body.locals[from].ty
     });
-    // alloc: once per body with a moved argument, which this has no frame for
-    let temps: blaze_hash::HashSet<LocalId, Global> = found.iter().map(|it| it.0).collect();
+    let temps: HashSet<LocalId, &Frame> =
+        HashSet::from_iter_in(found.iter().map(|it| it.0), frame);
     found.retain(|(_, from)| !temps.contains(from));
     blaze_ids::radix::sort_copy_by_key(&mut found, |&(temp, from)| {
         blaze_ids::radix::pack_32(temp.into_raw().into_u32(), from.into_raw().into_u32())
@@ -16539,9 +16717,12 @@ fn moved_arguments(
 /// after it is written: `let buffer = [0u8; N]` builds the array in a temporary and copies it.
 /// The two can be one slot, the binding holding nothing yet when the temporary is written, and
 /// a frame is not twice the size of what it declares.
-fn forwarded_temps(body: &MirBody<'_>) -> HashMap<LocalId, LocalId, Global> {
+fn forwarded_temps<'f>(
+    body: &MirBody<'_>,
+    frame: &'f Frame,
+) -> HashMap<LocalId, LocalId, &'f Frame> {
     let whole = |place: &StoredPlace| place.projection.as_slice().is_empty().then_some(place.local);
-    let mut forwarded = HashMap::new_in(Global);
+    let mut forwarded = HashMap::new_in(frame);
     if body.coroutine.is_some() {
         return forwarded;
     }
@@ -16592,20 +16773,21 @@ fn forwarded_temps(body: &MirBody<'_>) -> HashMap<LocalId, LocalId, Global> {
         return forwarded;
     }
     // Written once and read once, and by nothing else: the binding is not what it is made of.
-    let mut mentions: HashMap<LocalId, usize, Global> = HashMap::new_in(Global);
+    let mut mentions: HashMap<LocalId, usize, &Frame> = HashMap::new_in(frame);
     body.visit_places(|place| *mentions.entry(place.local).or_default() += 1);
     // A drop of the temporary is not a use: it holds a value only between the two statements,
     // which unwind to nowhere, and a drop of it then finds the slot holding its value.
-    let not_uses = drops_and_fake_reads(body);
+    let not_uses = drops_and_fake_reads(body, frame);
     let dropped_or_read = |local: LocalId| not_uses.get(&local).copied().unwrap_or(0);
-    let bound: blaze_hash::HashSet<LocalId, Global> = body
-        .binding_locals
-        .values()
-        .chain(&body.param_locals)
-        .copied()
-        .chain(promoted_locals(body))
-        .chain([returned_local(body)])
-        .collect(); // alloc: once per body with a forwarded temporary, which this has no frame for
+    let bound: HashSet<LocalId, &Frame> = HashSet::from_iter_in(
+        body.binding_locals
+            .values()
+            .chain(&body.param_locals)
+            .copied()
+            .chain(promoted_locals(body))
+            .chain([returned_local(body)]),
+        frame,
+    );
     forwarded.retain(|&temp, to| {
         !bound.contains(&temp)
             && mentions[&temp] - dropped_or_read(temp) == 2
@@ -16622,6 +16804,47 @@ type LaneValues = smallvec::SmallVec<[Value; 64]>;
 #[cfg(test)]
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
+#[cfg(test)]
+mod number_ranges {
+    use super::{add_number_range, numbers_cover};
+
+    /// The merged ranges answer as the byte set they stand for: every byte of `lo..hi` was
+    /// added. Ranges in a scrambled order, touching, overlapping and apart, against a byte
+    /// model; and a table of many numbers stays one range.
+    #[test]
+    fn number_ranges_answer_as_the_bytes_they_hold() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n) as usize
+        };
+        for _ in 0..200 {
+            let mut ranges = Vec::new();
+            let mut bytes = [false; 96];
+            for _ in 0..next(12) {
+                let lo = next(90);
+                let hi = lo + 1 + next(6);
+                add_number_range(&mut ranges, lo, hi);
+                bytes[lo..hi].iter_mut().for_each(|b| *b = true);
+            }
+            assert!(ranges.windows(2).all(|w| w[0].1 < w[1].0), "sorted, apart: {ranges:?}");
+            for lo in 0..88 {
+                for word in [1, 4, 8] {
+                    let want = bytes[lo..lo + word].iter().all(|&b| b);
+                    assert_eq!(numbers_cover(&ranges, lo, lo + word), want, "{ranges:?} {lo} {word}");
+                }
+            }
+        }
+        let mut table = Vec::new();
+        for i in 0..65_536 {
+            add_number_range(&mut table, i * 4, i * 4 + 4);
+        }
+        assert_eq!(table, [(0, 65_536 * 4)]);
+    }
+}
 
 #[cfg(test)]
 mod tests {

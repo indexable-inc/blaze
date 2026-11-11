@@ -446,6 +446,15 @@ impl<I: Clone + Eq + Hash + std::fmt::Debug, S: Clone + Eq + Hash> Graph<I, S> {
         self.items[item as usize].state = State::Described(edges);
     }
 
+    /// Every function the walk counted, by whose code asked for it, with its count: what a
+    /// kept walk holds its functions to ([`super::patch`]).
+    pub(super) fn counts(&self) -> Vec<((I, Origin), Counted)> {
+        // clone: per build that keeps its walk, the walk's handle of each function
+        let counted = |it: &Item<I>| Some((it.function.clone()?, it.counted?));
+        // alloc: per build that keeps its walk, one per function
+        self.items.iter().filter_map(counted).collect()
+    }
+
     /// Item `item`'s description failed.
     pub(super) fn failed(&mut self, item: u32) {
         self.items[item as usize].state = State::Failed;
@@ -624,6 +633,73 @@ impl<I: Clone + Eq + Hash + std::fmt::Debug, S: Clone + Eq + Hash> Graph<I, S> {
             Some(_) => entry.counted.map(|counted| paths.place(item, &counted, parent, false)),
         }
     }
+}
+
+/// rustc's walk ([`Graph::check`]) over the graph of a kept walk, every item of which is
+/// described: whether it claims an instance past its path's limit, and how many items it
+/// claimed. `roots` are the check's, in its order; `edges` gives what an item refers to, in
+/// its references' order; `counted` gives a function's count, `None` for a static. The same
+/// claims in the same order as the last pass of [`Graph::check`] over the same graph, so
+/// `false` here is a walk whose check refuses nothing, and a walk with no refusal described
+/// everything its roots reach (a deferred instance the check claims within the limit is sent
+/// back, and one it claims past it is a refusal).
+pub(super) fn claims_past<'e>(
+    items: usize,
+    roots: &[u32],
+    edges: impl Fn(u32) -> &'e [u32],
+    counted: impl Fn(u32) -> Option<Counted>,
+) -> (bool, usize) {
+    struct Frame {
+        start: u32,
+        end: u32,
+        next: u32,
+    }
+    let mut paths = Paths::default();
+    // alloc: per check of a kept walk, one flag per item
+    let mut visited = vec![false; items];
+    // alloc: per check, the claimed neighbors of the instances on the path
+    let mut claimed: Vec<(u32, u32)> = Vec::new();
+    let mut stack: Vec<Frame> = Vec::new(); // alloc: per check, the path
+    let mut claims = 0;
+    let claim = |paths: &mut Paths, item: u32, parent: u32| match counted(item) {
+        None => Ok(paths.place_static(parent)),
+        Some(counted) => paths.place(item, &counted, parent, false),
+    };
+    for &root in roots {
+        if std::mem::replace(&mut visited[root as usize], true) {
+            continue;
+        }
+        claims += 1;
+        match claim(&mut paths, root, NONE) {
+            Ok(node) => claimed.push((root, node)),
+            Err(_) => return (true, claims),
+        }
+        if claimed.len() == 1 {
+            stack.push(Frame { start: 0, end: 1, next: 0 });
+        }
+        while let Some(top) = stack.last_mut() {
+            if top.next == top.end {
+                claimed.truncate(top.start as usize);
+                stack.pop();
+                continue;
+            }
+            let (item, node) = claimed[top.next as usize];
+            top.next += 1;
+            let start = claimed.len() as u32;
+            for &edge in edges(item) {
+                if std::mem::replace(&mut visited[edge as usize], true) {
+                    continue;
+                }
+                claims += 1;
+                match claim(&mut paths, edge, node) {
+                    Ok(node) => claimed.push((edge, node)),
+                    Err(_) => return (true, claims),
+                }
+            }
+            stack.push(Frame { start, end: claimed.len() as u32, next: start });
+        }
+    }
+    (false, claims)
 }
 
 /// The error of a front end whose [`Frontend::counted`] gave `given` entries for a level of

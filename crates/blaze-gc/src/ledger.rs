@@ -60,3 +60,31 @@ pub fn read(path: &Path) -> Result<Option<Ledger>, String> {
 pub fn write(path: &Path, ledger: &Ledger) -> Result<(), String> {
     crate::record::write_whole(path, &ledger.encode())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A ledger of the format before this one is refused naming the file and both formats,
+    /// never read as this format's or taken as empty; the daemon says so in its log and in
+    /// status, and only then starts a new one (`serve::gc`).
+    #[test]
+    fn a_file_of_the_previous_layout_is_refused_by_name() {
+        let old = Ledger { format: FORMAT - 1, last_end_ns: Some(7), runs: Vec::new() };
+        let why = Ledger::decode(&old.encode()).expect_err("the format before this one");
+        assert!(
+            why.contains(&format!("format {}", FORMAT - 1)) && why.contains(&format!("reads format {FORMAT}")),
+            "{why}"
+        );
+        let dir = std::env::temp_dir().join(format!("blaze-gc-ledger-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(LEDGER);
+        std::fs::write(&path, old.encode()).unwrap();
+        let said = read(&path).expect_err("the format before this one");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(said.starts_with(&path.display().to_string()), "{said}");
+        assert!(said.contains(&format!("format {}", FORMAT - 1)), "{said}");
+        let now = Ledger { format: FORMAT, ..old };
+        assert_eq!(Ledger::decode(&now.encode()), Ok(now));
+    }
+}

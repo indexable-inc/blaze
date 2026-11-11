@@ -1,0 +1,24 @@
+[package]
+name = "blaze-napi"
+description = "blaze-client as a Node-API addon, for TypeScript on Bun and Node: connect, build, check, test, why, status and request as promises resolved off the JS thread (docs/client.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+doctest = false
+test = false
+
+[dependencies]
+blaze-api.workspace = true
+blaze-client.workspace = true
+crossbeam-channel.workspace = true
+
+[lints]
+workspace = true

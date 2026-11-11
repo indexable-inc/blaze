@@ -12,7 +12,7 @@
 //! `serde::Serialize` for an agent (`blaze slow --json`). The output depends on nothing but the
 //! rows: every map is sorted before it is read out (rule 25).
 //!
-//! What it borrows (/tmp/blaze-lanes/v2-slowreport.md):
+//! What it borrows:
 //! - EngFlow's bazel_invocation_analyzer: independent suggestion providers over one profile, each
 //!   with a potential improvement; its bottleneck estimate (a stretch's time times the share of
 //!   cores left idle) is [`Estimate::IdleCores`].

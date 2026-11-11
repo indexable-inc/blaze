@@ -3111,7 +3111,7 @@ fn main() {
 
 /// The proc-macro bridge's `Decode` impls, each leaving its header's lifetimes out, and
 /// `run_client`'s closure calling `<(ExpnGlobals<Span>, A)>::decode`, whose callee the 00:49
-/// self-run's serde derives found no definition of (queue 01481). `S` counts the decodes, so
+/// self-run's serde derives found no definition of. `S` counts the decodes, so
 /// each call is seen in order.
 #[test]
 fn the_bridges_decode_impls_evaluate_for_run_client() {

@@ -57,10 +57,14 @@ CODE = (
     # The same job's smoke of the budget harness against the blaze the build made: the script,
     # the engine adapter and its layout of a daemon's home, the fixture it builds, its result.
     "harness/v2/budgets.py",
+    "harness/v2/guards.py",
+    "harness/v2/guards-known.toml",
     "harness/v2/engine.py",
     "harness/v2/fixture.py",
     "harness/v2/report.py",
     "harness/storelib.py",
+    # The workspace check's fast tier: which packages a change touches (its first step).
+    "harness/v2/changed.py",
     "flake.nix",
     "flake.lock",
     # The release of blaze that builds and tests blaze (.github/actions/blaze), and its installer.

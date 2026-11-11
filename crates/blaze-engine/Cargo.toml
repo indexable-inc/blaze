@@ -102,6 +102,8 @@ blaze-alloc-count.workspace = true
 llvm-sys.workspace = true
 # as_rustc's tests: what blaze answers `rustc -vV` is a compiler the code identity takes.
 blaze-codegen-code.workspace = true
+# versions.rs's tests pack a release's `.tar.xz`.
+lzma-rust2 = { workspace = true, features = ["std", "xz", "encoder"] }
 
 [features]
 default = ["native"]

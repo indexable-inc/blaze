@@ -15,8 +15,10 @@
 //! ends (it takes another block if it allocates meanwhile), so deep nesting of small tasks
 //! shares one chunk. Past that its chunks come from the thread's shelf ([`SHELF`] chunks, no
 //! atomic), then the process's cache (one compare-and-swap), and go back the same way; its
-//! spans come from and go back to the thread's shelf of spans, their pages committed. So nested
-//! tasks to any depth make no system call and no global allocation once warm. A frame made with
+//! spans come from and go back to the thread's shelf of spans, each with its first chunk's
+//! worth of pages committed and the rest given back to the kernel ([`WARM`]). So nested
+//! tasks to any depth make no global allocation once warm, and no system call while each
+//! span stays within what the shelf kept of it. A frame made with
 //! [`Frame::new`] keeps its blocks across [`Frame::reset`].
 //!
 //! Resetting is a few stores: nothing is freed piecemeal, no destructor of a value placed with
@@ -75,8 +77,21 @@ pub const FRAME_RESERVE: usize = 16 << 20;
 /// Chunks a thread keeps warm for its next tasks, outside the [`Cap`]: 16 MB.
 pub const SHELF: usize = 8;
 
-/// Spans a thread keeps warm, their pages committed.
-const SPANS: usize = 64;
+/// Spans a thread keeps warm, each with its first [`SPAN_WARM`] bytes committed.
+const SPANS: usize = SHELF;
+
+/// What a span keeps committed on a thread's shelf: a chunk's worth, so the next task whose
+/// first big allocation fits it takes no page from the kernel. The pages past it go back as the
+/// task that grew the span ends: a span grows in place however big its task's top allocation
+/// gets, and a shelf that kept every page of it held a task's whole peak, on each thread, for
+/// as long as the thread lived, charged to no task and to no cap (an hour after a build the
+/// daemon still held 5.8 GiB of frames, #1726).
+const SPAN_WARM: usize = CHUNK;
+
+/// The most frame memory a thread keeps warm between tasks ([`spare_bytes`]): [`SHELF`] chunks
+/// and [`SPANS`] spans of [`SPAN_WARM`] bytes each. What a task's frame leaves behind is never
+/// more.
+pub const WARM: usize = SHELF * CHUNK + SPANS * SPAN_WARM;
 
 /// An allocation bigger than this goes in a span rather than a chunk.
 const SPAN_AT: usize = CHUNK / 2;
@@ -1120,14 +1135,19 @@ impl Shelf {
         None
     }
 
-    /// Keeps a span a task's frame gave up (its cap bytes given back), or gives it to the
-    /// kernel when the shelf is full.
+    /// Keeps a span a task's frame gave up (its cap bytes given back), its pages past
+    /// [`SPAN_WARM`] given to the kernel, or gives it whole to the kernel when the shelf is
+    /// full.
     fn give_span(&self, span: *mut Block) {
         if self.span_count.get() >= SPANS {
             drop_span(span);
             return;
         }
         let head = header_mut(span);
+        if let Some(region) = head.span.as_deref_mut() {
+            // A refused decommit leaves the pages committed: memory held, nothing broken.
+            _ = region.decommit_after(SPAN_WARM);
+        }
         head.prev = ptr::null_mut();
         head.next = self.spans.get();
         self.spans.set(span);
@@ -1176,6 +1196,18 @@ impl Shelf {
 
     fn count(&self) -> usize {
         self.len.get() + self.span_count.get()
+    }
+
+    /// The bytes its blocks keep committed: its chunks whole, and each span's committed part.
+    fn bytes(&self) -> usize {
+        let mut bytes = self.len.get() * CHUNK;
+        let mut span = self.spans.get();
+        while !span.is_null() {
+            let head = header(span);
+            bytes += head.span.as_deref().map_or(0, Region::committed);
+            span = head.next;
+        }
+        bytes
     }
 }
 
@@ -1700,6 +1732,12 @@ fn set_thread_peak(peak: usize) {
 /// Blocks of frame memory (chunks and spans) the calling thread keeps warm for its next tasks.
 pub fn spare_frames() -> usize {
     SHELF_OF.try_with(Shelf::count).unwrap_or(0)
+}
+
+/// Bytes of frame memory the calling thread keeps warm for its next tasks, committed and
+/// charged to no task: at most [`WARM`].
+pub fn spare_bytes() -> usize {
+    SHELF_OF.try_with(Shelf::bytes).unwrap_or(0)
 }
 
 /// Trims the frame memory the calling thread keeps warm to `keep` bytes, the rest given back

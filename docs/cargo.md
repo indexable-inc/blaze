@@ -86,6 +86,10 @@ a build first needs it.
     blaze doc   [cargo's flags]                                       (d)
     blaze fmt   [--check] [-p NAME]... [--all] [--manifest-path PATH] [-v|-q] [-- RUSTFMT_ARGS]
     blaze fmt   [RUSTFMT_ARGS] FILE.rs...
+    blaze new   [--bin|--lib] [--name NAME] [--edition YEAR] [--vcs VCS] [--registry NAME] PATH
+    blaze init  [--bin|--lib] [--name NAME] [--edition YEAR] [--vcs VCS] [--registry NAME] [PATH]
+    blaze tree  [cargo tree's flags]
+    blaze metadata [--format-version 1] [--no-deps] [--filter-platform TRIPLE] [the feature flags] [--manifest-path PATH]
     blaze serve [--socket PATH] [--http ADDR] [--activated] [--ready-fd N] [--stall-bound SECS]
     blaze stop
     blaze status [--json]
@@ -94,7 +98,6 @@ a build first needs it.
     blaze codegen-inputs --format=json
     blaze trace --out PATH
     blaze tables --format=json
-    blaze pack -p PACKAGE --out PATH [cargo's flags]
     blaze pin
     blaze --version
 
@@ -107,12 +110,7 @@ the command work as in cargo. `test` alone takes four flags of blaze's own (exte
 not compile a build's error names, the first `N` (16 without it) or every one.
 `serve` is the daemon itself ([below](#the-daemon)); `codegen-inputs`, `trace` and `tables`
 print what the daemon's last build of the checkout did (each instance it made with its code
-hash, every result with its edges as CBOR, the size of each long-lived table); `pack` checks
-the package for `wasm32-unknown-unknown` with debug assertions off (as `--release`), its build
-scripts run and proc macros loaded in the sandbox as any check's, and writes the program's crate
-and every crate it is made of, with each macro expansion its names and bodies needed, to `PATH`
-as one JSON file for the in-browser compiler (`crates/blaze-wasm-pack`, the agent API's
-`Request::Pack`); `check --replace std::sync::Mutex=parking_lot::Mutex` retargets every
+hash, every result with its edges as CBOR, the size of each long-lived table); `check --replace std::sync::Mutex=parking_lot::Mutex` retargets every
 reference that resolves to the item `FROM` names to the item `TO` names, each a def path from a
 crate's name: the daemon's front end finds them by name resolution (imports, renames, globs,
 re-exports, the prelude, a macro's input), never by text, rewrites a `use` of it or a path that
@@ -404,6 +402,17 @@ start-file-less links (`-static`, `-nostartfiles`), `-z lazy`, `-z execstack`, `
 `cargo:rustc-link-lib` with `cargo:rustc-link-search`), and every link argument of a Windows or
 wasm target, which rustc gives `link.exe` or `wasm-ld` directly.
 
+A crate's bundled static libraries (`static` without `-bundle`, from its rustflags' `-l`s, its
+build script's `cargo:rustc-link-lib`s or its `#[link]`s) are found first in the directories its
+own compile searches, the `-L`s rustc is given for that crate: its rustflags', then the build
+scripts' of it and of what it depends on, its own `OUT_DIR` first; then the linked program's
+directories and the toolchain's are searched. So two crates whose build scripts each make a
+static library of one name in their own `OUT_DIR` (two copies of one `-sys` crate) link two
+libraries, each its own crate's, as rustc bundles each into the crate that names it. Every
+other kind (a dylib, a framework, a `-bundle` static library) is found as the final link finds
+it, in the program's directories (`crates/blaze-link/src/target.rs`, `CrateLibs`). The linked
+crates' rustflags' `-L`s are in the program's key.
+
 The rest of the rustflags that are the link's, rather than the code's, are read by
 `crates/blaze-link/src/args/rustflags.rs`, and none is dropped:
 
@@ -415,6 +424,7 @@ The rest of the rustflags that are the link's, rather than the code's, are read 
 | `-C relro-level` | `full` is what blaze's linker always does on ELF; `partial`, `off` and `none` are refused there, and on macOS every value but `none` |
 | `-C link-dead-code` | off is taken; on is refused: blaze's linker always drops unreferenced sections |
 | `-C strip` | `none` is taken, `debuginfo` links the image without debug info, `symbols` is refused: blaze always writes the functions' local symbols |
+| `split-debuginfo` (the profile's) | **differs from cargo**: unset, `packed` and `unpacked` all put the debug info of an image blaze links in one file beside it, on Linux too (cargo's default there is `off`): `NAME.debug`, named by the executable's `.gnu_debuglink` and carrying its build id, or on macOS `NAME.dSYM`, found by `LC_UUID`. The executable keeps its code, data, unwind tables, symbol table and build id, so a panic's backtrace and a debugger show what they showed. `off` puts the debug info inside the executable, as before. Windows and wasm images are as before. The side file is written beside the executable by the link that made it, and is not in the store ([debug-side-file.md](v2/plan/design/debug-side-file.md)) |
 | `-C linker` | taken when it names a C driver or a system linker (`cc`, `gcc`, `clang`, `ld`, `ld.lld`, `mold`, ..., with a version or a cross prefix): blaze's linker writes what it would; any other program (a wrapper script, `zig cc`) is refused, since it can change the link in ways blaze cannot see |
 | `-C linker-flavor` | taken when it is the spelling blaze reads the target's link arguments in (`gcc`, `gnu-cc` on Linux, `darwin-cc` on macOS, `msvc` on Windows, `wasm-ld`); refused otherwise |
 | `-C default-linker-libraries`, `-C link-self-contained`, `-C prefer-dynamic` | off is taken; on is refused |
@@ -558,7 +568,7 @@ private; a test that makes raw system calls, or tampers with the interposer in i
 gets past the recording and the private writes but not Seatbelt's read-only machine or its
 network rule; a sandbox inside the sandbox fails with `EPERM`.
 
-What it cost v1, measured with `harness/sandboxbench.py` on 2026-10-26 (one sandbox per
+What it cost v1, measured with `sandboxbench.py` (since deleted) on 2026-10-26 (one sandbox per
 executable, v1's way, against a sandbox per test). v2's fork server is a third way, one sandbox
 per binary and a fork per test, not measured here; its costs are in
 [v2/plan/lanes/usercode/tests.md](v2/plan.md):
@@ -683,7 +693,7 @@ itself (`CARGO_PKG_*`, `CARGO_MANIFEST_DIR`, `OUT_DIR`, `RUSTC*`, ...); what car
 build scripts (`CARGO_CFG_*`, `CARGO_FEATURE_*`, `CARGO_ENCODED_RUSTFLAGS`) it may forward, as
 rav1e's does. Anything
 else fails the build, naming the script and each line. Over the bench corpus's 587 runs the
-rules refuse none (`tools/bench/results/2026-10-27-bscache/directives.md`).
+rules refuse none (counted 2026-10-27).
 
 and, for a package of the workspace, in its own manifest:
 
@@ -904,9 +914,12 @@ rustc: the link lists each static of the macro's crates its code can write in th
 `blaze.statics` section, and the host writes what the calls before left into each fresh
 instance before the macro runs, then reads back what it changed (`src/wasm/statics.rs`). A
 module without that section is refused at load. A static left holding an address of the heap
-stops the expansion with an error naming the static, since a fresh instance has no such heap.
-A call is kept and found under the state it started from, and only when it left that state as
-it was.
+(a lazily built table, a cache behind a pointer: logos's, `proc-macro-crate`'s) can't be given
+to a fresh instance, which has no such heap; from then on the calling crate's earlier calls of
+the macro run again, in order, in the next call's instance before it, as they ran in one
+process under rustc, and as the evaluator runs them. A call is kept and found under the state
+it started from, and only when it left that state as it was; one after the earlier calls run
+again is never kept.
 
 Each expansion is kept in the store (`crates/proc-macro-api/src/kept.rs`) by the macro's
 library, its name, input and attribute tokens, the crate's variables, its directory and the
@@ -953,7 +966,7 @@ run them instead and send each result, which the client prints in libtest's form
   tries. `--ub` with `--no-run` is refused.
 
 v1's test cache is gone with v1: `BLAZE_TESTS` (`affected`, `verify`, `all`),
-`BLAZE_TESTS_FROM`, `BLAZE_TEST_ENV`, `blaze test --why`, and the `tests-passed`,
+`BLAZE_TESTS_FROM`, its environment setting, `blaze test --why`, and the `tests-passed`,
 `tests-programs` and `target/blaze/tests.ndjson` files it wrote. No v2 crate reads or writes
 them.
 
@@ -1057,6 +1070,38 @@ the stall bound fails with an error naming what each thread is inside, and the d
 --stall-bound SECS` sets another, for a daemon started by hand (`blaze stop` first) on a host
 so loaded that one piece of work can go that long with nothing else moving.
 
+### A build with nothing changed
+
+A `build` or `check` of a checkout (and the build of `run`, `test` and `bench`) with nothing
+changed is answered as the checkout's last one was: its warnings byte for byte, its units and
+its artifacts, with no plan, lowering, task or store commit (`serve/job/noop.rs`). The daemon's
+span `no-op answer` is the whole of it, and the answer's `Work` has no `build_id`
+(`"build_id":null` with `--message-format json`): no build ran, so the client sends no rows.
+
+The answer said again is that of a build that walked every unit and made nothing, so the
+first build after a change builds, the next walks and is kept, and each one after is
+answered. It is said again only while every input of that walk is as it was:
+
+| Input | Covered by |
+|---|---|
+| The checkout's files (sources, manifests, lock file, config in it) | the view's root, which the checkout's watcher commits before the request is seen |
+| Command, arguments, directory, the request's whole environment, config files outside the checkout, fetched sources and path dependencies, toolchain, blaze's version | the view's config, by its bytes |
+| Colors, width, `--refused`, `-v` | the request's own hash |
+| Paths outside the checkout a build script, proc macro or `include!` read | the watches outside views heard nothing since the kept walk began, and that walk looked at no such path on the disk |
+| Path dependencies outside the checkout | each one's watch vouches for it; one named through a link, or a single file, is read again by every build |
+| A manifest above the checkout that is not there | looked at as the request is asked |
+| The outputs | each directory they are in has been watched since before the kept walk and heard nothing |
+| Layout profiles (`<target>/layout`) | watched when there, looked at when not |
+| Other jobs | none is under way |
+
+A request is held until its checkout's watcher and the watches outside it have heard every
+change made before it (the span `the request waits for the watches to hear every change made
+before it`), so an edit saved just before the request is seen. What is not covered walks, which
+is the whole build: a build whose walk listed a directory or read an unwatched path outside
+the checkout, one with `-C profile-use`, one whose outputs are named through a symlink, and one
+with `BLAZE_PROFILE` set (there is then a build to trace). `blaze why` after a build that
+walked and computed nothing names the input that moved or that nothing covers.
+
 ### Cores and priority
 
 By default blaze leaves two cores to the rest of the machine and runs at background priority,
@@ -1104,6 +1149,28 @@ request is read. `blaze serve --http ADDR` listens on TCP as well, only with a b
 
 In a project, the daemon writes the programs and test executables where cargo would in the
 workspace's build directory, under `<profile>/` there.
+
+#### Files that outlive a version
+
+The rule (persisted-state-round-trips): a file one blaze writes and another version of blaze can
+find has a test that a file of its previous layout is handled: refused by name with what to do,
+read, or left alone under a name of its own. Never a refusal to start that names nothing, and
+never bytes of one layout read as another's. A new persisted file adds its row here with its test.
+
+| File | Where | Written by | Layout marker | A blaze of another layout | Test |
+|---|---|---|---|---|---|
+| The machine's memory ledger | `/tmp/blaze-<uid>/machine.<layout>` (outside every home) | every daemon of the user, under its `flock` | the layout in the file's name and in its header (`blzledgr`, a `u32`) | left alone: each layout has a file of its own, so daemons of two layouts share no budget and neither refuses to start; bytes of another layout under this name are refused naming the file, both layouts and "stop every blaze daemon of this user, then remove" it | `a_file_of_the_previous_layout_is_left_alone`, `a_file_of_the_previous_layout_is_refused_by_name_under_this_layouts_name` (`crates/blaze-cargo/src/serve/machine.rs`); `a_file_of_the_layout_before_the_lease_is_refused_naming_both_layouts` (`crates/blaze-graph/src/ledger/tests.rs`) |
+| The daemon's socket | `<home>/v2.sock` | the daemon | the API's schema number, in every frame | refused by name: the client says both schemas and builds; a daemon of another build is stopped and this one started | `another_schema_is_refused_by_name` (`crates/blaze-api/src/client/tests.rs`), `a_daemon_of_another_schema_is_refused_naming_both` (`crates/blaze-cargo/src/cli/daemon/tests.rs`) |
+| The state directory | `<home>/v2` | the daemon | the `v2` in its name | left alone: another generation of the daemon's state has another directory | none: the name is the marker |
+| The store's head, indexes and packs | `<home>/v2/store` | the store | a format number in the head and in each index | refused by name: the store is broken naming the file and both formats, never migrated | `a_head_of_another_format_is_refused_by_name`, `a_store_of_the_format_before_block_checks_is_refused_naming_both` (`crates/blaze-cas/src/tests.rs`) |
+| The daemon image (database, symbols, the plane's history, the estimates) | `<home>/v2/db` | the daemon's stop | the schema hash of each section; the estimates' magic | starts cold saying why (a section of another schema), and a damaged one is a fault | `an_image_of_another_layout_starts_cold_and_a_damaged_one_is_a_fault` (`crates/blaze-cargo/src/serve/daemon.rs`), `a_history_of_another_blaze_or_none_starts_empty_saying_why` (`crates/blaze-cargo/src/serve/image.rs`) |
+| The profile history's manifest | `<home>/v2/profile/manifest.json` | the daemon's flushes and merges | `format` | read: formats from the oldest still read up to this one, rewritten as this one at the next commit; any other refused naming both | `a_manifest_reads_back_what_it_consumed_byte_for_byte` (`crates/blaze-profile/src/history/manifest.rs`) |
+| The flight recorder's mapped rings and the crash record | beside the profile history, `<home>/v2/profile` | every blaze process | a magic and a layout number | refused naming its file; its rows are not recovered | `a_mapping_of_another_layout_is_refused_naming_its_file` (`crates/blaze-profile/src/flight/postmortem.rs`), `a_record_of_another_layout_or_blaze_is_refused` (`crates/blaze-profile/src/crash.rs`) |
+| The collector's ledger | `<home>/v2/gc-ledger.json` | the daemon's collector | `format` | refused by name (the file and both formats) in the log and in status, then a new ledger is started | `a_file_of_the_previous_layout_is_refused_by_name` (`crates/blaze-gc/src/ledger.rs`) |
+| The why ledger | under `<home>/v2` | the daemon | a magic that ends in the blaze version's hash | moved aside as another version's, never written over | the `Fault::Version` case in `crates/blaze-cargo/src/serve/why.rs`'s tests |
+| The daemon's lock | `<home>/v2/serve.lock` | the daemon | none: a pid and ` stopped` as text | read by every version | none yet |
+| The performance history's run rows | the build directory | `blaze perf record` | `format` in each row | refused naming the file, the run and both formats, with what to do (record it again) | none yet |
+| Build directories and fetched sources | `<home>/build`, `<home>/sources` | the daemon | none, on purpose: they keep their place across the daemon's formats | read | none: their contents are checked by content hash |
 
 ### Where a build writes
 
@@ -1298,7 +1365,7 @@ whichever command started it; to change one there, run `blaze stop` first):
 made without being part of a unit's key, so set in the daemon's environment they fail every
 unit, naming the variable (`crates/hir-ty-codegen/v2/backend.rs`, `CHANGES_CODE`); the profile
 picks the backend ([below](#backends)). v1's splice setting, its build-script runner's,
-`BLAZE_TESTS`, `BLAZE_TESTS_FROM`, `BLAZE_TEST_ENV`, `BLAZE_IDLE_SECS`, `BLAZE_MEMORY_MAX`,
+`BLAZE_TESTS`, `BLAZE_TESTS_FROM`, `BLAZE_IDLE_SECS`, `BLAZE_MEMORY_MAX`,
 `BLAZE_MEMORY_BUDGET`, `BLAZE_SPARE` and `BLAZE_LRU` are read by nothing in v2.
 
 ## Backends
@@ -1410,14 +1477,17 @@ plugin (`cargo-<name>` on the path).
 v2's client has only the commands of [Commands](#commands) (`crates/blaze-cargo/src/cli.rs`);
 any other fails with status 101 and does nothing:
 
-    error: no such command: `tree`
+    error: no such command: `vendor`
 
-    help: blaze's commands are build, check, run, test, bench, doc, clean, cache, fmt, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, pack, explore, debug, explain, why, reach and slow
+    help: blaze's commands are build, check, run, test, bench, doc, clean, cache, fmt, new, init, tree, metadata, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, explore, debug, explain, why, reach and slow
 
 The table below is a record of what v1 had (as of 2026-10-30): the crates it names
 (blaze-metadata, blaze-fmt, blaze-lints, ...) are still in the tree, and a command comes back
-once the client asks the daemon for it. None of it runs in v2, except `fmt`, which is back as
-[above](#commands).
+once the client is given it. None of it runs in v2, except `fmt`, `new`, `init`, `tree` and
+`metadata`, which are back as [above](#commands): each runs in the client's process
+(`crates/blaze-cargo/src/cli/new.rs`, `crates/blaze-cargo/src/cli/tree.rs`,
+`crates/blaze-cargo/src/cli/metadata.rs`) and asks the daemon nothing. `tree` and `metadata`
+decide the lock files as a build does ([Lock files](#lock-files)).
 
 | Command | blaze's | What it is, and what it waits for |
 |---|---|---|

@@ -77,7 +77,7 @@ impl PatOrigin {
 }
 
 #[derive(Copy, Clone)]
-struct PatInfo {
+pub(super) struct PatInfo {
     binding_mode: ByRef,
     max_ref_mutbl: MutblCap,
     pat_origin: PatOrigin,
@@ -297,7 +297,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     ///
     /// Outside of this module, `check_pat_top` should always be used.
     /// Conversely, inside this module, `check_pat_top` should never be used.
-    fn infer_pat(&mut self, pat_id: PatId, expected: Ty<'db>, pat_info: PatInfo) {
+    pub(super) fn infer_pat(&mut self, pat_id: PatId, expected: Ty<'db>, pat_info: PatInfo) {
         // For patterns containing paths, we need the path's resolution to determine whether to
         // implicitly dereference the scrutinee before matching.
         let pat = self.store.pat(pat_id);
@@ -479,6 +479,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     }
                     Ok(pr) => panic!("tuple struct pattern resolved to {pr:?}"),
                 }
+            }
+            Pat::Record { path, args: fields, ellipsis: has_rest_pat }
+                if let Some(record) = self.record_path(path) =>
+            {
+                self.infer_record_pattern(pat, record, fields, has_rest_pat, expected, pat_info)
             }
             Pat::Record { args: fields, ellipsis: has_rest_pat, .. } => {
                 match opt_path_res.unwrap() {
@@ -1008,6 +1013,13 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     }
 
     fn resolve_record_pat(&mut self, pat: PatId, path: Path<'_>) -> Result<ResolvedPat<'db>, ()> {
+        // blaze: a record pattern `{ a, b: x }` (`#![blaze::records]`) has no path to resolve;
+        // it is checked against the record the value is (`infer_record_pattern`), and peels
+        // references as a struct pattern does.
+        if let Some(record) = self.record_path(path) {
+            let kind = ResolvedPatKind::Struct { variant: record.into() };
+            return Ok(ResolvedPat { ty: self.types.types.error, kind });
+        }
         // Resolve the path and check the definition for errors.
         let (pat_ty, Some(variant)) = self.resolve_variant(pat.into(), path, false) else {
             self.report_unresolved_pat_path(pat, path);

@@ -73,6 +73,13 @@ pub(crate) fn pack_file(at: usize) -> String {
     format!("pack-{at:06}")
 }
 
+/// The file of the block checks of the pack at `at` ([`crate::checks`]): beside its pack, made,
+/// synced and removed with it.
+pub(crate) fn checks_file(at: usize) -> String {
+    // alloc: a file name, which the effect naming it owns; once per file made or read
+    format!("checks-{at:06}")
+}
+
 pub(crate) fn index_file(slot: u8) -> String {
     // alloc: a file name, which the effect naming it owns; once per file made or mapped
     format!("index-{slot}")

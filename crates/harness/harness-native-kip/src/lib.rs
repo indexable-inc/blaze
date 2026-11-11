@@ -10,7 +10,7 @@
 //! - This module: the character (Kip, baked in), the scene's look, and one frame's [`MascotQuad`]: the picture's rect in
 //!   device pixels and everything its render reads.
 //! - [`act`]: what a `<Kip mood="…"/>` asks of it, a mood or a few in turn.
-//! - harness-native-render draws it with its shaders/mascot.slang (kip.rs there).
+//! - harness-native-render draws it with harness-native-shaders' `mascot` shaders (kip.rs there).
 pub mod act;
 pub mod anim;
 pub mod model;
@@ -118,7 +118,7 @@ pub struct Setup {
     pub tuning: Tuning,
 }
 
-/// `MascotFrame` in shaders/mascot.slang, byte for byte.
+/// `MascotFrame` in harness-native-shaders' `mascot`, byte for byte.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct Uniforms {

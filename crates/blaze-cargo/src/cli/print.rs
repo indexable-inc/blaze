@@ -208,6 +208,9 @@ pub struct Printer<'a, O: Write, E: Write> {
     unbuilt: Vec<blaze_api::Unbuilt>,
     /// The daemon numbered a unit or package past [`IDS`]: said, and the build fails.
     refused: bool,
+    /// How many units the daemon said the build left unchecked or unbuilt behind a failure
+    /// ([`ResponseRef::Unchecked`]); such a build failed whatever its `Done` says.
+    left: usize,
     /// Where a report's paths are shown from: the checkout's root, and home as `~`
     /// ([`Printer::place`]).
     root: String,
@@ -245,6 +248,7 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
             work: None,
             unbuilt: Vec::new(), // alloc: none until a test unit did not build
             refused: false,
+            left: 0,
             root: root.to_string_lossy().into_owned(), // alloc: once a printer
             home: None,
             held: Vec::new(),     // alloc: none until a unit failed with a report
@@ -288,6 +292,21 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         Ok(())
     }
 
+    /// After [`Printer::finish`]: why the build recomputed what it did, a report a root cause
+    /// (`Rebuilt::summary`), each on stderr and, as `--message-format=json`, a line on stdout
+    /// too; written. Nothing under `-q`.
+    pub fn recomputed(&mut self, summary: Vec<Report>) -> io::Result<()> {
+        if self.shown.quiet {
+            return Ok(());
+        }
+        for report in summary {
+            self.report(report)?;
+        }
+        self.flush()?;
+        self.out.flush()?;
+        self.err.flush()
+    }
+
     /// Every report held, printed.
     fn reports(&mut self) -> io::Result<()> {
         for (_, report) in std::mem::take(&mut self.held) {
@@ -322,6 +341,14 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
     /// error: the build is then a failure whatever its Done said.
     pub fn refused(&self) -> bool {
         self.refused
+    }
+
+    /// How many units the daemon said the build did not check or build, behind a failure or
+    /// failed themselves ([`blaze_api::Unchecked`], said only of a failed build): with any, the
+    /// build is a failure whatever its `Done` said, so no command ends 0 with a requested unit
+    /// unbuilt.
+    pub fn left_unchecked(&self) -> usize {
+        self.left
     }
 
     /// The daemon's `index` of a `what` is past [`IDS`]: said as an error, and the build fails.
@@ -509,6 +536,11 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
             // person sees how much the errors above do not cover; under JSON one line an agent
             // reads too.
             ResponseRef::Unchecked(unchecked) => {
+                // At least one: the daemon says this only once a unit failed.
+                self.left += (unchecked.behind.iter().map(|it| it.units.len()).sum::<usize>()
+                    + unchecked.tests.len()
+                    + unchecked.open.len())
+                .max(1);
                 // The failures it is behind, each with what it blocks, first.
                 self.blocks(&unchecked);
                 self.reports()?;

@@ -22,7 +22,7 @@
 //! - an `ensures` whose named return is not a plain binding (`-> ((a, b): T)`) is refused;
 //! - a `become` in a function whose `ensures` is checked is refused: it leaves without a return;
 //! - a clause runs as the program's own code: `n + 1` is machine arithmetic that can overflow
-//!   (and panic in dev), where verus reads it as an unbounded `int`.
+//!   (and panic in dev), where a proof reads it as an unbounded `int`.
 
 use hir_def::{FunctionId, expr_store::SpecClauseKind};
 use intern::Symbol;
@@ -171,7 +171,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
     }
 
     /// An `ensures` reads the parameters as they are at the return; one declared `mut` may
-    /// have changed since the call, and verus reads it as it was passed.
+    /// have changed since the call, and a proof reads it as it was passed.
     fn refuse_mut_param(&self) -> Result<'db, ()> {
         let Some(Contracts { func, mut_param: Some(binding) }) = self.contracts else {
             return Ok(());

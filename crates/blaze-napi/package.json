@@ -1,0 +1,8 @@
+{
+  "name": "blaze-napi",
+  "private": true,
+  "description": "blaze's daemon from TypeScript, on Bun and Node 20+, with no process launch",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts", "blaze.node"]
+}

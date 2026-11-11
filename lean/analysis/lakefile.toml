@@ -1,0 +1,23 @@
+# blaze's proofs that need real analysis (docs/v2/plan/design/formal-verification.md,
+# "Derivatives"): a package of its own, so `lean/` stays core Lean only and builds as fast as
+# before. It reuses `lean/`'s library by path (`Blaze.Scalar` is the `i32` of a `powi` exponent)
+# and takes Mathlib at the commit its tag `v4.20.0` names, the Mathlib built for the pinned Lean
+# (lean-toolchain here equals lean/lean-toolchain). Build: `lake exe cache get` (Mathlib's
+# prebuilt oleans; never compile Mathlib), then `lake build`.
+name = "blazeAnalysis"
+defaultTargets = ["BlazeDiff"]
+
+[[require]]
+name = "mathlib"
+git = "https://github.com/leanprover-community/mathlib4"
+rev = "c211948581bde9846a99e32d97a03f0d5307c31e"
+
+[[require]]
+name = "blaze"
+path = ".."
+
+# blaze-diff's symbolic differentiator and simplifier, over the reals. `Ops.lean`, `Rules.lean`
+# and `Rewrites.lean` are generated from crates/blaze-diff/rules.json by
+# harness/v2/diff_rules.py, as the crate's Rust tables are.
+[[lean_lib]]
+name = "BlazeDiff"

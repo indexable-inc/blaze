@@ -33,8 +33,14 @@ const ERROR: usize = 4;
 
 /// Appends `parse` (its tree, the bodies parsed so far, and its lexer's and parser's errors)
 /// to `out` as a record [`read`] maps back: from the next multiple of 8 of `out`'s length,
-/// which is where in `out` it is.
+/// which is where in `out` it is. Only a parse under no syntax extensions is stored: the
+/// record keeps no extensions, and [`read`] makes a parse under none.
 pub fn write(parse: &Parse<SourceFile>, out: &mut Vec<u8>) -> Range<usize> {
+    assert!(
+        parse.extensions.is_none(),
+        "a parse under syntax extensions {:?} written as a tree image, which keeps none",
+        parse.extensions,
+    );
     pad(out);
     let start = out.len();
     out.resize(start + HEAD * 4, 0);
@@ -140,7 +146,8 @@ pub fn read(
         return Err(wrong("a tree that is not a file of this text's length"));
     }
     // alloc: the parse's shared tree, once per file read
-    Ok(Parse::with_outline(Tree::new(Arc::new(tree)), errors, outline.then_some(edition)))
+    let tree = Tree::new(Arc::new(tree));
+    Ok(Parse::with_outline(tree, errors, outline.then_some(edition), crate::Extensions::NONE))
 }
 
 fn pad(out: &mut Vec<u8>) {

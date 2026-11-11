@@ -482,10 +482,13 @@ impl Kqueue {
             | Effect::ReadLink { .. }
             | Effect::Append { .. }
             | Effect::Sync { .. }
+            | Effect::WriteBack { .. }
             | Effect::Truncate { .. }
             | Effect::Write { .. }
+            | Effect::WriteUnsynced { .. }
             | Effect::WriteAt { .. }
             | Effect::Rename { .. }
+            | Effect::RenameUnsynced { .. }
             | Effect::Mode { .. }
             | Effect::Seal { .. }
             | Effect::Private { .. }

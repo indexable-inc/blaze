@@ -885,13 +885,17 @@ impl Iocp {
                 Ok(())
             }
             effect @ (Effect::Write { .. }
+            | Effect::WriteUnsynced { .. }
             | Effect::Rename { .. }
+            | Effect::RenameUnsynced { .. }
             | Effect::Clone { .. }
             | Effect::Link { .. }
             | Effect::Remove { .. }) => {
                 match &effect {
-                    Effect::Write { file, .. } | Effect::Remove { file, .. } => self.forget(file),
-                    Effect::Rename { from, to, .. } => {
+                    Effect::Write { file, .. }
+                    | Effect::WriteUnsynced { file, .. }
+                    | Effect::Remove { file, .. } => self.forget(file),
+                    Effect::Rename { from, to, .. } | Effect::RenameUnsynced { from, to, .. } => {
                         self.forget(from);
                         self.forget(to);
                     }
@@ -909,6 +913,7 @@ impl Iocp {
             | Effect::WriteFrom { .. }
             | Effect::ReadLink { .. }
             | Effect::Sync { .. }
+            | Effect::WriteBack { .. }
             | Effect::Truncate { .. }
             | Effect::Stat { .. }
             | Effect::Lstat { .. }
@@ -2529,10 +2534,19 @@ fn file(root: &Path, effect: Effect, kept: &mut Kept) -> io::Result<Done> {
             }
         },
         Effect::Write { file, bytes, .. } => {
+            // durable: carries out `Effect::Write`, whose asker said why
             files::write_atomically(joined(at, root, &file), &bytes).map(|()| Done::Written)
+        }
+        // Neither flushed nor written through: derived data, checked by its reader.
+        Effect::WriteUnsynced { file, bytes, .. } => {
+            files::write_unsynced(joined(at, root, &file), &bytes).map(|()| Done::Written)
         }
         Effect::Rename { from, to: into, .. } => {
             files::rename(joined(at, root, &from), joined(to, root, &into)).map(|()| Done::Renamed)
+        }
+        Effect::RenameUnsynced { from, to: into, .. } => {
+            files::rename_unsynced(joined(at, root, &from), joined(to, root, &into))
+                .map(|()| Done::Renamed)
         }
         Effect::Mode { file, mode, .. } => {
             files::set_mode(joined(at, root, &file), mode).map(|()| Done::Moded)

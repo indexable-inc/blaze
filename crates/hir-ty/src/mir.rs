@@ -1803,6 +1803,12 @@ pub struct Inlined<'db> {
     /// with any into no other (LLVM never imports it): its slots would be in the importer's
     /// frame, which may recur.
     pub moved_to_frame: u32,
+    /// What the passes relied on of other items' facts ([`crate::facts::Facts::relied`]: the
+    /// item and the fact): each once, in the order first relied on ([`Inlined::rely`]). Empty
+    /// in every body as it is built. The code generator keys the body's code on them (rule
+    /// 21), and compile identity reads them, so a body compiled on a fact that no longer
+    /// holds is not reused, and proving more of an item no body relied on recompiles nothing.
+    pub relied: Vec<[u8; 32]>,
 }
 
 impl Inlined<'_> {
@@ -1819,6 +1825,14 @@ impl Inlined<'_> {
         }
     }
 
+    /// Records that a pass changed the body because of a fact, by the fact's digest
+    /// ([`crate::facts::Facts::relied`]), once however many sites relied on it.
+    pub fn rely(&mut self, digest: [u8; 32]) {
+        if !self.relied.contains(&digest) {
+            self.relied.push(digest);
+        }
+    }
+
     fn shrink_to_fit(&mut self) {
         let Inlined {
             callees,
@@ -1829,7 +1843,9 @@ impl Inlined<'_> {
             devirtualized,
             specialized,
             moved_to_frame: _,
+            relied,
         } = self;
+        relied.shrink_to_fit();
         devirtualized.shrink_to_fit();
         callees.shrink_to_fit();
         scopes.shrink_to_fit();

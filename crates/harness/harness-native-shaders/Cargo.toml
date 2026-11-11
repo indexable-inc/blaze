@@ -1,0 +1,16 @@
+[package]
+name = "harness-native-shaders"
+description = "The harness renderer's shaders in Rust (docs/future/gpu/shaders.md): shaders/harness.slang and what was shaders/mascot.slang ported function for function, its types shared with the host, its binding table generated from the signatures"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+gpu = { path = "../../gpu" }
+
+[dev-dependencies]
+# The host's own copies of the mascot's buffers, which the layouts here must match byte for byte.
+harness-native-kip = { path = "../harness-native-kip" }
+# Property tests: Hegel, imported as `hegel` (blaze's vendor/hegeltest).
+hegeltest = { path = "../../../vendor/hegeltest", default-features = false, features = ["static-engine"] }

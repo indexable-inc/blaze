@@ -20,18 +20,25 @@
 //! read; its owner drops what lives in it and computes it again from its inputs. Nothing is
 //! read from a group that failed.
 //!
-//! The image is written whole by [`Builder`] and written to disk as one
-//! `blaze_core::Effect::Write`, which writes a temporary file, syncs it and renames it over the
-//! old one: a `kill -9` or a power cut leaves the old image or the new one. A file cut short
-//! some other way is refused by its length, and one with bytes changed by its hash or a CRC.
+//! The image is built whole in memory by [`Builder`] and put at its file by [`place::Placer`]:
+//! a clone of the image there (its blocks shared), the 64 KiB units that differ written into
+//! it, synced and renamed over the old one, or one `blaze_core::Effect::Write` of it all where
+//! there is nothing to share. Either way a `kill -9` or a power cut leaves the old image or the
+//! new one. A file cut short some other way is refused by its length, and one with bytes
+//! changed by its hash or a CRC.
 //!
 //! Cost: open reads the spine (128 bytes, 64 a section, 4 per GiB of image at 64 KiB groups)
 //! and hashes it once; it allocates two bits a group. A read of a checked group is one relaxed
 //! load of its bit; the first read of a group is one CRC32C of it in the CPU's CRC
 //! instructions, about 3 µs for 64 KiB.
 
+// `#![blaze::sans_io]` marks a sans-IO core for `blaze::sans_io_core` (`place`).
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+
 mod build;
 mod image;
+pub mod place;
 mod raw;
 mod spine;
 

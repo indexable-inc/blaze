@@ -181,7 +181,7 @@ impl PickConstraintsForShadowed {
     }
 }
 
-#[derive(Debug, Clone)] // clone: the pick cache's hit copies it until queue 00949 hands it out by reference
+#[derive(Debug, Clone)] // clone: the pick cache's hit copies it until the cache hands it out by reference
 pub struct Pick<'db> {
     pub item: CandidateId,
     pub kind: PickKind<'db>,

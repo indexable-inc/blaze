@@ -259,3 +259,18 @@ mod held {
         _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// The calls of Apple's a spawn rests on resolve at run time (rule macos-private-apis;
+/// docs/macos.md, "Processes"): `posix_spawn_file_actions_addchdir_np`, which starts the child
+/// in its directory with no code of blaze's run in it (in libSystem from macOS 10.15; the
+/// flag `POSIX_SPAWN_CLOEXEC_DEFAULT` beside it is a bit of `posix_spawnattr_setflags`, not a
+/// symbol). A macOS that drops it fails here, naming it.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_np_calls_of_a_spawn_resolve() {
+    for name in [c"posix_spawn_file_actions_addchdir_np"] {
+        // SAFETY: a lookup of a NUL-terminated name in every image loaded.
+        let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+        assert!(!found.is_null(), "{name:?} is gone from this macOS: every spawn needs it");
+    }
+}

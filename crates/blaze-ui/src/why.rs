@@ -2,7 +2,7 @@
 //! again, grouped by reason as the daemon grouped it, most first; with one, its chain of
 //! reasons in order.
 
-use blaze_api::{PartChanged, Rebuild, RebuildCause, Rebuilt};
+use blaze_api::{EvictedBy, PartChanged, Reason, Rebuild, RebuildCause, Rebuilt};
 use blaze_ids::ContentId;
 
 /// `rebuilt` as `blaze why` prints it.
@@ -62,7 +62,36 @@ pub fn lines(out: &mut String, rebuilt: &Rebuilt) {
     put!(out, "\n`blaze why ITEM` gives an item's chain of reasons.\n");
 }
 
-/// An item's reasons, then each item they name, in order.
+/// `rebuilt`, the answer to `blaze why --unexplained`: each step the build recomputed for no
+/// recorded reason, with what is missing.
+pub fn unexplained(out: &mut String, rebuilt: &Rebuilt) {
+    let Some(build) = rebuilt.build else {
+        put!(
+            out,
+            "no build of a workspace holding this directory has ended since the daemon started: earlier builds' reasons are in the history's `misses` table (`blaze debug sql`)\n"
+        );
+        return;
+    };
+    if rebuilt.rebuilt.is_empty() {
+        put!(out, "build {build}: every step it recomputed has a recorded reason\n");
+        return;
+    }
+    put!(
+        out,
+        "build {build} recomputed {} steps for no recorded reason, each a bug in blaze:\n",
+        rebuilt.count
+    );
+    for it in &rebuilt.rebuilt {
+        put!(out, "\n  {} ({})\n", it.item, it.step);
+        for end in &it.ends {
+            if let Reason::Unexplained { what } = end {
+                put!(out, "    {what}\n");
+            }
+        }
+    }
+}
+
+/// An item's reasons, then each item they name, in order, then what the chain ends in.
 fn chain(out: &mut String, build: u64, rebuilt: &[Rebuild]) {
     let Some((first, rest)) = rebuilt.split_first() else {
         put!(out, "build {build}: nothing of that name was computed again\n");
@@ -71,6 +100,37 @@ fn chain(out: &mut String, build: u64, rebuilt: &[Rebuild]) {
     put!(out, "build {build}: {}\n", one(first));
     for it in rest {
         put!(out, "  because {}\n", one(it));
+    }
+    for it in &first.ends {
+        put!(out, "  in the end: {}\n", end(it));
+    }
+}
+
+/// Where a chain ends, in words.
+fn end(it: &Reason) -> String {
+    // alloc: a reason's text, once an end of an item asked
+    match it {
+        Reason::InputChanged { input, trivia: false, .. } => format!("`{input}` changed"),
+        Reason::InputChanged { input, trivia: true, .. } => {
+            format!("`{input}` changed, though no item in it did (comments only)")
+        }
+        Reason::FirstTime => "it was never computed before".to_owned(),
+        Reason::Evicted { by, when } => format!(
+            "it was last computed in build {when}, and {} since",
+            match by {
+                EvictedBy::Memory => "the store dropped its result to free memory",
+                EvictedBy::Age => "the store dropped its result as unused",
+                EvictedBy::Cap => "blaze why's ledger dropped its record to stay under its cap",
+            }
+        ),
+        Reason::PreviousFailed { since } => {
+            format!("its last compute, in build {since}, failed or was stopped")
+        }
+        Reason::Forced { how } => format!("it was asked for: {how}"),
+        Reason::KeyUnstable { part } => format!(
+            "`{part}` came out different from the same inputs (a determinism bug in blaze)"
+        ),
+        Reason::Unexplained { what } => format!("no recorded reason (a bug in blaze): {what}"),
     }
 }
 
@@ -107,6 +167,13 @@ fn reason(cause: &RebuildCause, exact: bool) -> String {
             "its key is the one it had when last computed{}, in a build that did not end well, and nothing is kept under it: that compute likely failed or was stopped",
             match exact {
                 true => format!(", in build {build}"),
+                false => String::new(),
+            }
+        ),
+        RebuildCause::Dropped { since: build } => format!(
+            "it was last computed{}, and blaze why's ledger dropped what its key was made of then to stay under its cap, so what changed since is not known",
+            match exact {
+                true => format!(" in build {build}"),
                 false => String::new(),
             }
         ),

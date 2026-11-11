@@ -61,21 +61,56 @@ pub enum Missed {
     Failed(String),
 }
 
+/// What a part of a key is (docs/v2/plan/design/why.md, "The model"): where a chain of
+/// reasons ends, or what it follows.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub enum PartKind {
+    /// Something the build is given: a variable, a flag, a setting, the toolchain, the target.
+    /// A chain ends at one that changed.
+    #[default]
+    Input,
+    /// The bytes of a file, the part's name its absolute path. A chain ends at one that
+    /// changed.
+    File,
+    /// The value of another step: the one [`Part::names`], or with none the step that
+    /// computed this one ([`Miss::via`]). A chain follows it.
+    Result,
+}
+
 /// One part of a key, by name: what a miss of a key with parts is told apart by.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Part {
-    /// What it is, as a person reads it: `toolchain`, `settings`, `env CC`. One name a part:
-    /// a key with two parts of one name is refused ([`Miss::of_parts`]).
+    /// What it is, as a person reads it: `toolchain`, `settings`, `env CC`; a
+    /// [`PartKind::File`]'s absolute path. One name a part: a key with two parts of one name
+    /// is refused ([`Miss::of_parts`]).
     pub name: String,
     /// Its hash: none when the key has no such part this time (no `-C profile-use` profile).
     pub hash: Option<ContentId>,
     /// The item it is of, when it is another's (a dependency's unit): what a chain follows.
     pub names: Option<String>,
+    pub kind: PartKind,
+    /// For a file of Rust source, the hash of what of it code can observe (its text with each
+    /// comment no macro sees as its shape): a file whose `hash` changed and whose `code` did
+    /// not changed no item.
+    pub code: Option<ContentId>,
 }
 
 impl Part {
+    /// An [`PartKind::Input`] part.
     pub fn new(name: impl Into<String>, hash: Option<ContentId>) -> Part {
-        Part { name: name.into(), hash, names: None }
+        Part { name: name.into(), hash, names: None, kind: PartKind::Input, code: None }
+    }
+
+    /// A [`PartKind::Result`] part: the value of the step of `names`, or with none of a step
+    /// that is not recorded, which the miss's [`Miss::via`] stands in for.
+    pub fn result(name: impl Into<String>, hash: Option<ContentId>, names: Option<String>) -> Part {
+        Part { name: name.into(), hash, names, kind: PartKind::Result, code: None }
+    }
+
+    /// A [`PartKind::File`] part: the file at the absolute `path`, its bytes' `hash` and its
+    /// code text's ([`Part::code`]).
+    pub fn file(path: impl Into<String>, hash: Option<ContentId>, code: Option<ContentId>) -> Part {
+        Part { name: path.into(), hash, names: None, kind: PartKind::File, code }
     }
 }
 
@@ -105,6 +140,10 @@ pub struct Miss {
     /// What the value is filed under past `key` that is not explained yet (a unit's process
     /// variables, a build script's traced reads): what a miss whose key is as it was is down to.
     pub beyond: Option<&'static str>,
+    /// The item of the step that computed this one (a function's unit): what a chain follows
+    /// from a [`PartKind::Result`] part that names no step, since that step's key covers what
+    /// such a part is made from.
+    pub via: Option<String>,
 }
 
 impl Miss {
@@ -128,7 +167,7 @@ impl Miss {
             Some(why) => Missed::Failed(why),
             None => Missed::New,
         };
-        Miss { step, subject, item, missed, key, kept: None, parts, beyond: None }
+        Miss { step, subject, item, missed, key, kept: None, parts, beyond: None, via: None }
     }
 }
 

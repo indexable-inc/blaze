@@ -124,8 +124,8 @@ impl<V: Clone + Send + Sync + 'static> Sharded<V> {
                 return Err(give_way());
             }
             match waiter.state.load(Ordering::Acquire) {
-                // SAFETY: written before `DONE`, which this load read.
                 DONE => {
+                    // SAFETY: written before `DONE`, which this load read.
                     return Ok(unsafe { (*waiter.value.get()).take() }.expect("a value with DONE"));
                 }
                 _ => continue,

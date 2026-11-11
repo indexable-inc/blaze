@@ -303,6 +303,7 @@ impl<T> Mailbox<T> {
                 return None;
             }
             state.waiting += 1;
+            // wakes: a push and the queue's close each notify `ready`; a worker serves until `closed`
             self.ready.wait(&mut state);
             state.waiting -= 1;
         }
@@ -1024,15 +1025,27 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         // `sync_all` is `F_FULLFSYNC` on Apple's systems, where `fsync` leaves the bytes in the
         // drive's cache.
         Effect::Sync { file, .. } => at(root, &file, |path| {
+            // durable: carries out `Effect::Sync`, whose asker said why
             OpenOptions::new().append(true).create(true).open(path)?.sync_all()?;
             Ok(Done::Synced)
+        }),
+        // Waited for on this thread; the asker waits for nothing, and nothing is durable.
+        Effect::WriteBack { file, .. } => at(root, &file, |path| {
+            fs::write_back(path)?;
+            Ok(Done::WrittenBack)
         }),
         Effect::Truncate { file, len, .. } => at(root, &file, |path| {
             fs::truncate(path, len)?;
             Ok(Done::Truncated)
         }),
         Effect::Write { file, bytes, .. } => at(root, &file, |path| {
+            // durable: carries out `Effect::Write`, whose asker said why
             fs::write_atomically(path, &bytes)?;
+            Ok(Done::Written)
+        }),
+        // No sync of the file or its directory: derived data, checked by its reader.
+        Effect::WriteUnsynced { file, bytes, .. } => at(root, &file, |path| {
+            fs::write_unsynced(path, &bytes)?;
             Ok(Done::Written)
         }),
         Effect::WriteAt { file, at: offset, bytes, .. } => at(root, &file, |path| {
@@ -1041,6 +1054,10 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         }),
         Effect::Rename { from, to, .. } => at(root, &from, |from| {
             at(root, &to, |to| fs::rename(from, to))?;
+            Ok(Done::Renamed)
+        }),
+        Effect::RenameUnsynced { from, to, .. } => at(root, &from, |from| {
+            at(root, &to, |to| fs::rename_unsynced(from, to))?;
             Ok(Done::Renamed)
         }),
         Effect::Mode { file, mode, .. } => at(root, &file, |path| {
@@ -1380,6 +1397,7 @@ impl Shared {
                 }
                 return None;
             }
+            // wakes: an errand queued and the pool's close each notify `errand`; an idle errand thread serves until `closed`
             self.errand.wait(&mut errands);
         }
     }
@@ -1676,6 +1694,7 @@ mod linux {
                 if let Some(started) = state.started.take() {
                     return started;
                 }
+                // wakes: the watcher thread, which sets `started` and notifies whether the watch began or failed
                 self.started.wait(&mut state);
             }
         }

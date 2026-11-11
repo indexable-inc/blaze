@@ -75,9 +75,6 @@ pub enum Work {
     Trace(Targets),
     /// [`crate::Response::Tables`]: each table's owner reports its own.
     Tables,
-    /// Checked as [`Work::Check`] is, then [`crate::Response::Packed`] of package `program`
-    /// ([`crate::Request::Pack`]).
-    Pack { targets: Targets, program: String },
     /// Checked as [`Work::Check`] is, then the documentation [`crate::Request::Doc`] asks
     /// for: [`crate::Response::Documented`], then each file a [`crate::Response::DocPage`].
     Doc { targets: Targets, no_deps: bool, private: bool },

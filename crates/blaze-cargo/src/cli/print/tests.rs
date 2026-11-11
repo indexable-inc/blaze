@@ -246,6 +246,7 @@ fn what_a_request_did_is_one_json_line_of_blazes() {
             path: "target/debug/foo".to_owned(),
         }],
         reran: 2,
+        misses: 0,
         served: Vec::new(),
         build_id: None,
         compiled: 1,
@@ -293,6 +294,7 @@ fn each_dependency_crate_is_one_served_line_after_the_work() {
         green: 0,
         links: Vec::new(),
         reran: 1,
+        misses: 0,
         served: vec![
             ServedCrate {
                 why: None,

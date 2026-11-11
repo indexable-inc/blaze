@@ -898,6 +898,117 @@ fn a_task_that_fits_the_budget_starts_alone_whatever_the_process_holds() {
     assert_eq!(runs(&built(&mut plane, 2)), [3]);
 }
 
+/// A task the room between two turns of the machine's ledger holds back is short of nothing:
+/// the next turn starts it, so the driver lets go of no kept front end for it. Counted against
+/// the room it was short of all the process holds besides its grants, at every build.
+#[test]
+fn a_task_that_waits_for_the_ledgers_turn_is_short_of_nothing() {
+    let mut plane = Plane::new(PlaneConfig { budget: budget(10), ..config(1, 2) }).unwrap();
+    open(&mut plane, 1, 1, true);
+    plane.step(PlaneInput::Held { at_ns: 0, bytes: 4 }).unwrap();
+    assert_eq!(runs(&add(&mut plane, 1, vec![node(1, &[], Pool::Work, 1000, None, 2)])), [1]);
+    // A turn: 10 allowed, and the room until the next is what is charged now, 4, and a lease
+    // of twice the grant started since the last, 4.
+    plane.step(PlaneInput::Allowance { at_ns: 0, bytes: 10 }).unwrap();
+    assert_eq!(plane.room(), 8);
+    // 5 fits the 10 allowed beside the 4 held, and not the room: it waits for the turn.
+    assert_eq!(
+        runs(&add(&mut plane, 1, vec![node(2, &[], Pool::Work, 100, None, 5)])),
+        Vec::<u32>::new()
+    );
+    assert!(plane.held_back());
+    assert_eq!(plane.short(), 0, "the turn makes the room; nothing need be let go");
+    let out = plane.step(PlaneInput::Allowance { at_ns: 1, bytes: 10 }).unwrap();
+    assert_eq!(runs(&out), [2]);
+}
+
+/// With work, a turn of the ledger leaves a lease past the charge (1/16 of the ceiling, or
+/// twice the largest grant started since the last turn if more), and a task that fits it
+/// starts in the step that adds it, with no turn between.
+#[test]
+fn a_task_that_fits_the_lease_starts_as_it_is_added_with_no_turn() {
+    let mut plane = Plane::new(PlaneConfig { budget: budget(160), ..config(1, 4) }).unwrap();
+    open(&mut plane, 1, 1, true);
+    plane.step(PlaneInput::Held { at_ns: 0, bytes: 40 }).unwrap();
+    // A turn with a request open and nothing started yet: 40 charged and 160 / 16 leased.
+    assert!(plane.step(PlaneInput::Allowance { at_ns: 0, bytes: 160 }).unwrap().is_empty());
+    assert_eq!((plane.room(), plane.lease()), (50, 10));
+    assert!(!plane.turn_wanted());
+    // 8 fits the 10 leased: it starts in the step that adds it.
+    assert_eq!(runs(&add(&mut plane, 1, vec![node(1, &[], Pool::Work, 100, None, 8)])), [1]);
+    assert!(!plane.held_back() && !plane.turn_wanted());
+    // The 8 granted are within the 40 held, so the lease is whole, and 9 more start too.
+    assert_eq!(runs(&add(&mut plane, 1, vec![node(2, &[], Pool::Work, 100, None, 9)])), [2]);
+    assert_eq!(plane.granted(), 17);
+    assert_eq!(plane.room(), 50, "no turn was taken");
+    // What is held grows to 48: 2 of the lease are left, a quarter of it and no less.
+    plane.step(PlaneInput::Held { at_ns: 1, bytes: 48 }).unwrap();
+    assert!(!plane.turn_wanted());
+    // At 49 the lease is in its last quarter, and the allowance has more: a turn is wanted
+    // now, before a task is held back.
+    plane.step(PlaneInput::Held { at_ns: 1, bytes: 49 }).unwrap();
+    assert!(plane.turn_wanted() && !plane.held_back());
+    // The turn: 49 charged, and twice the largest grant started since the last, 18, leased.
+    plane.step(PlaneInput::Allowance { at_ns: 2, bytes: 160 }).unwrap();
+    assert_eq!((plane.room(), plane.lease()), (67, 18));
+    assert!(!plane.turn_wanted());
+}
+
+/// A task past the lease and within the allowance is held back by the room alone: it is short
+/// of nothing, a turn is wanted at once, and that turn starts it.
+#[test]
+fn a_task_past_the_lease_waits_for_the_turn_and_no_longer() {
+    let mut plane = Plane::new(PlaneConfig { budget: budget(160), ..config(1, 4) }).unwrap();
+    open(&mut plane, 1, 1, true);
+    plane.step(PlaneInput::Held { at_ns: 0, bytes: 40 }).unwrap();
+    plane.step(PlaneInput::Allowance { at_ns: 0, bytes: 160 }).unwrap();
+    assert_eq!(runs(&add(&mut plane, 1, vec![node(1, &[], Pool::Work, 100, None, 8)])), [1]);
+    // 30 is past the 10 leased and within the 120 the allowance leaves beside the 40 held.
+    assert_eq!(
+        runs(&add(&mut plane, 1, vec![node(2, &[], Pool::Work, 10, None, 30)])),
+        Vec::<u32>::new()
+    );
+    assert!(plane.held_back() && plane.turn_wanted());
+    assert_eq!(plane.short(), 0);
+    let out = plane.step(PlaneInput::Allowance { at_ns: 1, bytes: 160 }).unwrap();
+    assert_eq!(runs(&out), [2]);
+    // 40 held (the 38 granted are within it), and twice the 30 started leased.
+    assert_eq!((plane.room(), plane.lease()), (100, 60));
+    assert!(!plane.held_back() && !plane.turn_wanted());
+    // A task the allowance itself holds back wants no turn at once: one changes nothing for
+    // it until another daemon lets go.
+    assert_eq!(
+        runs(&add(&mut plane, 1, vec![node(3, &[], Pool::Work, 1, None, 130)])),
+        Vec::<u32>::new()
+    );
+    assert!(plane.held_back() && !plane.turn_wanted());
+}
+
+/// A plane with no work leases nothing: its room is its charge, so the ledger records what it
+/// holds and no more. A request of the idle class with nothing ready is no work; a lease
+/// held as the work ends is given back at a turn wanted at once.
+#[test]
+fn an_idle_planes_room_has_no_lease() {
+    let mut plane = Plane::new(PlaneConfig { budget: budget(160), ..config(1, 4) }).unwrap();
+    plane.step(PlaneInput::Held { at_ns: 0, bytes: 40 }).unwrap();
+    plane.step(PlaneInput::Allowance { at_ns: 0, bytes: 160 }).unwrap();
+    assert_eq!((plane.room(), plane.lease()), (40, 0));
+    assert!(!plane.turn_wanted());
+    open_as(&mut plane, 1, 1, true, true);
+    plane.step(PlaneInput::Allowance { at_ns: 1, bytes: 160 }).unwrap();
+    assert_eq!((plane.room(), plane.lease()), (40, 0), "an idle request with nothing ready");
+    // A request not idle is work: the next turn leases.
+    open(&mut plane, 2, 1, true);
+    plane.step(PlaneInput::Allowance { at_ns: 2, bytes: 160 }).unwrap();
+    assert_eq!((plane.room(), plane.lease()), (50, 10));
+    // It ends with nothing run: the lease is held for no work, and a turn gives it back.
+    assert_eq!(finished(&close(&mut plane, 2)), [(2, true)]);
+    assert!(plane.turn_wanted());
+    plane.step(PlaneInput::Allowance { at_ns: 3, bytes: 160 }).unwrap();
+    assert_eq!((plane.room(), plane.lease()), (40, 0));
+    assert!(!plane.turn_wanted());
+}
+
 /// Under a pressure cap the budget is held at the cap: tasks start only within it, none starts
 /// alone past it, a task too big is still judged against the configured budget, and lifting
 /// the cap starts what waited for it.
@@ -1066,6 +1177,23 @@ struct Planned {
     batches: u32,
 }
 
+/// The model's handle on the memo the driver writes: a newtype so `Model` can derive `Default` (a named lock has
+/// no default name); a default one is an empty memo of its own, replaced by the driver's in every real run.
+struct ModelDb(Db);
+
+impl Default for ModelDb {
+    fn default() -> Self {
+        ModelDb(Arc::new(Lock::new("graph.test.plane.db", HashMap::default())))
+    }
+}
+
+impl std::ops::Deref for ModelDb {
+    type Target = Db;
+    fn deref(&self) -> &Db {
+        &self.0
+    }
+}
+
 /// What the simulation knows of the plane, from what it said, to check it after every step.
 #[derive(Default)]
 struct Model {
@@ -1082,7 +1210,7 @@ struct Model {
     granted: u64,
     /// What the database has: keys whose task ended well, some that failed, less those
     /// dropped since.
-    db: Db,
+    db: ModelDb,
     finished: HashMap<u32, bool, Global>, // alloc: a test's model
     cancelled: HashSet<u32, Global>,      // alloc: a test's model
     /// The requests idle now.
@@ -1477,7 +1605,7 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
     let by_key: Vec<(u64, Pool)> = (0..keys)
         .map(|_| (memory(&mut random), if random.one_in(3) { Pool::Io } else { Pool::Work }))
         .collect();
-    let mut model = Model { seed, budget, db: Arc::clone(&db), ..Model::default() };
+    let mut model = Model { seed, budget, db: ModelDb(Arc::clone(&db)), ..Model::default() };
     let mut planned: Vec<Planned> = (0..1 + random.below(5))
         .map(|_| Planned {
             weight: 1 + random.below(4) as u32,

@@ -37,7 +37,7 @@ export type ViewInfo = {
  *  it is sure of; altitude when it has one), and when it was measured (Unix ms). */
 export type Fix = { latitude: number; longitude: number; accuracy_m: number; altitude_m?: number; at_ms: number };
 /** One place Apple Maps found (browser.rs `Place`): empty strings where Maps has nothing. */
-export type Place = { name: string; latitude: number; longitude: number; address: string; phone: string; url: string; category: string };
+export type Place = { id: string; name: string; latitude: number; longitude: number; address: string; phone: string; url: string; category: string };
 export type Extension = { id: string; name: string; version: string; enabled: boolean; popup?: string; source: string; path: string };
 
 /** A socket client's message (browser.rs `KernelUp`). */
@@ -379,7 +379,7 @@ export class Page {
 
   #where() { return this.view === null ? `target ${this.target}` : `view ${this.view}`; }
 
-  /** Load `url` and wait for its load event. A cell that calls it shows the page as a live card. */
+  /** Load `url` and wait for its load event. */
   goto(url: string, timeoutMs = 20_000): Promise<void> {
     let host = url;
     try { host = new URL(url).host || url; } catch {}
@@ -452,8 +452,8 @@ export class Page {
 
   close() { return this.session.close().catch(() => {}); }
 
-  /** Opened for the person (browser.open: a view that stays): the app shows it in the browser pane beside the chat,
-   *  where they can scroll, click and type in it, not only as a card. Set by newPage. */
+  /** Opened for the person (browser.open: a view that stays): its step in the chat is a line they press to see it in
+   *  the browser pane, where they can scroll, click and type in it. Set by newPage. */
   kept = false;
 
   /** The card the app draws for it (shown.ts); `pane` when it is the person's to use ([`Page.kept`]). */

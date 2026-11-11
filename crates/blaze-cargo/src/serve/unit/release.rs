@@ -18,10 +18,17 @@
 //!   ends first; none is cancelled), and the front end's values kept by bytes are swept under
 //!   the squeeze's caps too ([`blaze_query::db::Storage::sweep_values`]), not only at the next
 //!   view.
-//! - **As the front end is kept**, its build over: every MIR goes then, of every goal and
+//! - **Once the front end is kept**, its build over: every MIR goes then, of every goal and
 //!   under any limit or none ([`Release::end`]). MIR is the request's: a value of the build
 //!   that made it, read again by the next build only as its memo (verified against, made
-//!   again where read), so nothing of it outlives the build that made it.
+//!   again where read), so nothing of it outlives the build that made it. This release is
+//!   never on the loop and never before the build's answer: it is kept with the front end
+//!   and run by the task that stores the front end, which holds it alone as the writer did
+//!   (`Steps::release_kept`). It only lowers memory, so the checkout's next build never waits
+//!   for it: a request that waits for the front end has it handed back unreleased, and that
+//!   build's own releases, at the latest its end's, let the MIR go. When blaze is past its
+//!   limit's line the release runs all the same, before that build is given the front end:
+//!   memory short stays a reason that stops for nothing but the answer.
 //!
 //! A value let go keeps its memo, so a read of it later in the build, or by the next build of
 //! the head, makes it again and backdates it: nothing read can differ, a re-read costs time and
@@ -75,6 +82,15 @@ pub(crate) struct Finished<K> {
     left: HashMap<K, u32, Global>, // alloc: one entry a crate, once per build
     /// Crates whose every unit compiled, in the order the last one did, not taken yet.
     ready: Vec<K>,
+    /// The units found kept as they began ([`Finished::kept`]): replayed from the store, with
+    /// nothing of the front end made for them in this build.
+    kept: Vec<bool>,
+    /// The crates a unit of which compiled without being found kept: what this build made
+    /// something of in its front end.
+    made: HashMap<K, (), Global>, // alloc: one entry a crate made, once per build
+    /// Whether a crate of `ready` is one of `made`: a release now has something of this
+    /// build's to let go ([`Finished::has_made`]).
+    ready_made: bool,
     /// Units [`Stand::Open`]. A unit that panicked stays open (no compile ends it), and the
     /// build's MIR then goes only when memory is short or the front end is kept.
     open: u32,
@@ -88,7 +104,25 @@ impl<K: Copy + Eq + Hash> Finished<K> {
             *left.entry(*krate).or_insert(0) += 1;
         }
         let stands = vec![Stand::NotBegun; of.len()]; // alloc: a stand a unit, once per build
-        Finished { of, stands, left, ready: Vec::new(), open: 0 }
+        let kept = vec![false; of.len()]; // alloc: a flag a unit, once per build
+        Finished {
+            of,
+            stands,
+            left,
+            ready: Vec::new(),
+            kept,
+            made: HashMap::new_in(Global), // alloc: as the field
+            ready_made: false,
+            open: 0,
+        }
+    }
+
+    /// Unit `unit` was found kept as it began: its record and outputs are in the store, and
+    /// its compile replays them. Told before its compile ends; a unit not told counts as made.
+    pub(crate) fn kept(&mut self, unit: usize) {
+        if let Some(kept) = self.kept.get_mut(unit) {
+            *kept = true;
+        }
     }
 
     /// Unit `unit`'s first task started. A build script's run has no crate and no compile to
@@ -114,10 +148,14 @@ impl<K: Copy + Eq + Hash> Finished<K> {
         }
         *stand = Stand::Compiled;
         let Some(krate) = self.of[unit] else { return };
+        if !self.kept.get(unit).copied().unwrap_or(false) {
+            self.made.insert(krate, ());
+        }
         if let Some(left) = self.left.get_mut(&krate) {
             *left -= 1;
             if *left == 0 {
                 self.ready.push(krate); // alloc: a crate a build, at most
+                self.ready_made |= self.made.contains_key(&krate);
             }
         }
     }
@@ -131,8 +169,16 @@ impl<K: Copy + Eq + Hash> Finished<K> {
         !self.ready.is_empty()
     }
 
+    /// Whether a crate finished since the last take is one this build made something of: a
+    /// unit of it compiled that was not found kept. A crate whose units were all found kept
+    /// is finished and holds nothing of this build's to let go.
+    pub(crate) fn has_made(&self) -> bool {
+        self.ready_made
+    }
+
     /// The crates finished since the last take.
     pub(crate) fn take(&mut self) -> Vec<K> {
+        self.ready_made = false;
         std::mem::take(&mut self.ready)
     }
 }
@@ -204,6 +250,7 @@ impl Release<Crate> {
             const_eval = tracing::field::Empty,
             solver_caches = tracing::field::Empty,
             intern_tables = tracing::field::Empty,
+            unread = tracing::field::Empty,
             left = tracing::field::Empty,
             query_storage = tracing::field::Empty,
         );
@@ -213,6 +260,13 @@ impl Release<Crate> {
         if pressed {
             db.storage_mut().sweep_values(&Squeeze::caps(before));
         }
+        // The build is over: what neither it nor the build before it read of the front end's
+        // evictable values goes, the results of revisions no edit since has asked for. Only
+        // here, with the build's reads all made; a build that wrote nothing lets nothing go.
+        let unread = match ended {
+            true => db.storage_mut().end_epoch(),
+            false => blaze_query::db::Unread::default(),
+        };
         // What was let go goes back to the system now, not when mimalloc's purge delay and the
         // next page taken get to it: this thread's heaps and every freed page at once, each
         // other thread's heaps as it next allocates or idles (memcap5).
@@ -227,6 +281,7 @@ impl Release<Crate> {
         span.record("const_eval", dropped.const_eval);
         span.record("solver_caches", dropped.solver_caches);
         span.record("intern_tables", dropped.intern_tables);
+        span.record("unread", unread.values);
         span.record("left", after.held);
         // What the query storage still holds after the drops. On a release memory made due, by
         // ingredient (memcap6): its rows in use are a walk of every function's rows made, a
@@ -246,7 +301,17 @@ impl Release<Crate> {
         // query storage's largest holders.
         eprintln!(
             "blaze serve: {}",
-            Said { crates: crates.len(), mir, pressed, ended, dropped, before, after, storage }
+            Said {
+                crates: crates.len(),
+                mir,
+                pressed,
+                ended,
+                dropped,
+                unread,
+                before,
+                after,
+                storage,
+            }
         );
     }
 }
@@ -259,6 +324,9 @@ pub(crate) struct Said {
     pub(crate) pressed: bool,
     pub(crate) ended: bool,
     pub(crate) dropped: hir::evict::Dropped,
+    /// What the build's end let go of that two builds left unread
+    /// ([`blaze_query::db::Storage::end_epoch`]).
+    pub(crate) unread: blaze_query::db::Unread,
     pub(crate) before: Pressure,
     pub(crate) after: Pressure,
     pub(crate) storage: Holders,
@@ -334,7 +402,8 @@ impl std::fmt::Display for Holders {
 impl std::fmt::Display for Said {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let gib = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
-        let Said { crates, mir, pressed, ended, dropped, before, after, storage: _ } = self;
+        let Said { crates, mir, pressed, ended, dropped, unread, before, after, storage: _ } =
+            self;
         f.write_str("front end release (")?;
         match (*pressed, before.over) {
             (true, _) if before.squeezed() => write!(
@@ -365,6 +434,9 @@ impl std::fmt::Display for Said {
         if *pressed {
             f.write_str(", and swept the front end's values to their fair shares")?;
         }
+        if unread.values != 0 {
+            write!(f, ", and {} values the last two builds did not read", unread.values)?;
+        }
         write!(f, "; blaze held {:.2} GiB, now {:.2} GiB", gib(before.held), gib(after.held))?;
         match before.held.checked_sub(after.held) {
             Some(freed) => write!(f, " ({:.2} freed)", gib(freed))?,
@@ -389,6 +461,11 @@ impl<K: Copy + Eq + Hash> Release<K> {
 
     pub(crate) fn began(&mut self, unit: usize) {
         self.finished.began(unit);
+    }
+
+    /// Unit `unit` was found kept as it began ([`Finished::kept`]).
+    pub(crate) fn kept(&mut self, unit: usize) {
+        self.finished.kept(unit);
     }
 
     /// Unit `unit` compiled, memory read by `now` (only if it can matter): a check's as any
@@ -419,21 +496,30 @@ impl<K: Copy + Eq + Hash> Release<K> {
         self.pressed = true;
     }
 
-    /// The build is over and its front end is about to be kept, no reader alive: the next
-    /// release lets go of every MIR, of a check as of any build, under any limit or none. What
-    /// a build made of MIR is the build's: kept, it is only what the next build would verify
-    /// its memos against, which needs the memo alone.
+    /// The build is over and its front end is kept, no reader alive: the next release lets go
+    /// of every MIR, of a check as of any build, under any limit or none. What a build made of
+    /// MIR is the build's: kept, it is only what the next build would verify its memos
+    /// against, which needs the memo alone. That release is run after the build's answer, by
+    /// the task that stores the kept front end (the module's list).
     pub(crate) fn end(&mut self) {
         self.ended = true;
     }
 
     /// Whether the build should stop its readers for a release: memory makes one due, the
-    /// build is over, or the build compiles and no unit is open and a crate is finished (no
-    /// reader to wait for).
+    /// build is over, or the build compiles and no unit is open and a crate this build made
+    /// something of is finished (no reader to wait for).
+    ///
+    /// A crate whose units were all found kept makes none due. Until 2026-11-10 it did: a
+    /// warm build finds every dependency's unit kept as it begins, so "no unit open and a
+    /// crate finished" held before the first task, and the loop ran a whole release then
+    /// (`UnitWriter::apply`: every crate's drop, the heap given back, two reads of the
+    /// process's memory; about 100 ms of the first `loop turn` of every body edit) to let go
+    /// of nothing this build had made. Such a crate still goes with the next release, one a
+    /// made crate or memory makes due, or the build's end's, which no loop runs.
     pub(crate) fn due(&self) -> bool {
         self.pressed
             || self.ended
-            || (self.compiles && self.finished.idle() && self.finished.has_ready())
+            || (self.compiles && self.finished.idle() && self.finished.has_made())
     }
 
     /// What a release now lets go of, taking it (a second plan is of what finished since);

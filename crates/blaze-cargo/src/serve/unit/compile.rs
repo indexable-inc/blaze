@@ -14,6 +14,22 @@
 //! proc-macro expansions read outside the tree, with their values ([`reads`]). A unit
 //! whose record and outputs are all in the store is fresh: its diagnostics are replayed as
 //! cargo replays a fresh unit's, and nothing runs.
+//!
+//! A record that holds no diagnostics is kept under a second, narrow key ([`narrow_key`])
+//! in place of that one: the same inputs, with the unit's crate known by what its code can
+//! observe ([`blaze_lower::Narrowed`]) in place of its bytes. An edit of a comment no macro
+//! sees then finds the record, in the unit's own crate and in every crate it depends on; and
+//! for a unit that only checks, so does an edit of a body no other crate's check can read.
+//! Diagnostics quote their files (a line with its comments), which no narrow identity holds.
+//! A record whose diagnostics are its check's, each span of them one the code text keeps
+//! exactly ([`blaze_lower::places`]), is under the narrow key too, and holds them as the
+//! check gave them with the place of each span's ends ([`Placed`]): a replay gives the spans
+//! their offsets in the files as they are and renders them from those files
+//! ([`replayed`]), so an edit of a comment in a file they quote renders them again and makes
+//! nothing again. A record with a span that is no such place (into a comment, to a file's
+//! end) is under the narrow key and the content of each file its diagnostics point into
+//! ([`quoted_key`]). Where a file they point into is not one of the view's, the record stays
+//! under the whole key.
 
 #![forbid(unsafe_code)]
 
@@ -93,6 +109,23 @@ struct Record {
     outputs: Vec<(String, Key, bool)>,
     artifact: Option<Artifact>,
     made: Made,
+    /// Its diagnostics, where `diagnostics` holds none of them: to be rendered from the files
+    /// as they are ([`replayed`]).
+    placed: Option<Placed>,
+}
+
+/// A record's diagnostics as its check gave them, kept in place of their rendering under
+/// the narrow key ([`placed`]): each span's ends are at a place every text of that key has
+/// them at ([`blaze_lower::places`]), so a replay finds their offsets in the files as they are
+/// and renders the diagnostics from those files.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Placed {
+    /// The check's diagnostics cargo shows, in its order, their spans' offsets those of the
+    /// files as they were when the record was made.
+    pub(super) diags: Vec<Diag>,
+    /// Each file they point into, by the name they give it, sorted, with every offset a span
+    /// of theirs has in it and that offset's line and byte column, sorted by offset.
+    files: Vec<(String, Vec<(u32, u32, u32)>)>,
 }
 
 /// [`Record`] as it is written, borrowing what the compile made rather than copying it.
@@ -105,6 +138,7 @@ struct RecordRef<'a> {
     outputs: Vec<(&'a str, Key, bool)>,
     artifact: Option<&'a Artifact>,
     made: &'a Made,
+    placed: Option<&'a Placed>,
 }
 
 /// The domain of a record's key, and the record's format version: bumped by hand on any change
@@ -112,14 +146,29 @@ struct RecordRef<'a> {
 /// how its key is made ([`RecordInputs::key`]), so that no record of another format is read as
 /// this one's. blaze-cargo's own code is of [`crate::serve::RecordCode`] too, so such a change
 /// moves every key even unbumped; the bump says so by name. 9: keyed by
-/// [`crate::serve::RecordMakers`] in place of the executable's bytes.
-const RECORD: &str = "blaze v2 cargo unit record 9";
+/// [`crate::serve::RecordMakers`] in place of the executable's bytes. 10: a library's file
+/// names its crate by its narrowed identity where it has one ([`named_identity`]), and a
+/// record with no diagnostics is under the narrow key ([`narrow_key`]). 11: a record holds
+/// its diagnostics rendered or as places ([`Placed`]).
+const RECORD: &str = "blaze v2 cargo unit record 11";
 const OUTPUT: &str = "blaze v2 cargo output 1";
 
 /// The store's key of an output file's `bytes`: what a record names it by, and what a dev
 /// executable's program is known by in the daemon's code memory ([`super::run::inproc`]).
 pub(crate) fn output_key(bytes: &[u8]) -> Key {
     Key(ContentId::of(OUTPUT, bytes))
+}
+
+const LINKED_OUTPUT: &str = "blaze v2 cargo linked output 1";
+
+/// The store's key of a linked image's file by `root`, the root of the linker's digest of it
+/// ([`blaze_link::Image::digest`]): what [`output_key`] is for a file blaze's linker made,
+/// with no pass over the file. A sound content identity: the root is a collision-resistant
+/// hash that binds the file's length and every one of its blocks
+/// (`blaze_link::digest`), so two files with one root are one file, and one file has one
+/// root. Its domain is its own, so no key of a file hashed whole is one of these.
+pub(crate) fn linked_key(root: &[u8; 32]) -> Key {
+    Key(ContentId::of(LINKED_OUTPUT, root))
 }
 /// A span table's anchor and content, as a test's selection holds it.
 const SPANS: &str = "blaze v2 cargo test spans 1";
@@ -281,6 +330,512 @@ fn identity(job: &Job, unit: usize) -> Option<ContentId> {
     job.identities.get(unit).and_then(|it| it.get()).copied().flatten()
 }
 
+/// What `unit`'s narrow record key ([`narrow_key`]) holds in place of its crate's whole
+/// identity: what a unit that only checks can observe ([`blaze_lower::Narrowed::checked`]),
+/// or what one that builds code can ([`blaze_lower::Narrowed::code`]: the code generator
+/// reads every body its walk reaches, in every crate). None, so the unit has its whole key
+/// alone, where the unit reads what a narrowed identity leaves out: comments, read by
+/// clippy's and blaze's lints (`// SAFETY:`, `// alloc:`) and by rustdoc and its doctests;
+/// and for a crate with no narrowed identity ([`blaze_lower::Lowered::narrowed`]).
+fn narrow_identity(job: &Job, unit: usize) -> Result<Option<ContentId>, ApiError> {
+    let Some(narrowed) = job.narrowed.get(unit).and_then(|it| it.get()).copied().flatten() else {
+        return Ok(None);
+    };
+    let u = job.unit(unit)?;
+    let reads_comments = job.plan(unit)?.clippy.is_some()
+        || !matches!(u.mode, Mode::Build | Mode::Check | Mode::Test);
+    if reads_comments {
+        return Ok(None);
+    }
+    Ok(Some(match checks_only(job.input.goal, u) {
+        true => narrowed.checked,
+        false => narrowed.code,
+    }))
+}
+
+/// The identity a library's file names its crate by ([`crate_record`]): the narrowed one
+/// where the unit has it, else the whole. The file is the same whichever key its record is
+/// under, so a record found under the narrow key holds the bytes a build from nothing writes.
+fn named_identity(job: &Job, unit: usize) -> Result<Option<ContentId>, ApiError> {
+    Ok(narrow_identity(job, unit)?.or(identity(job, unit)))
+}
+
+/// The narrow base key of `unit`'s record: [`RecordInputs::key`] with [`narrow_identity`] in
+/// place of the crate's whole identity, which a record with no diagnostics is filed under
+/// ([`store`]) and looked up by before the whole key ([`record_keys`]). None for a unit with
+/// no narrow identity, and before the writer set the unit's identities. Worked out once per
+/// job and unit.
+///
+/// Sound because everything a record holds but its diagnostics is made from what the narrow
+/// identity covers: the outputs are compiled from the code text (a comment no macro sees is
+/// in no token the compiler keeps, and positions are in the text's shape), and a unit that
+/// only checks reads of another crate what that crate's interface text holds. Its diagnostics
+/// are not (they quote source lines), so only a record with none is under this key; and
+/// whether a unit has any is itself made from the code text, for a unit no lint of which
+/// reads comments ([`narrow_identity`]).
+fn narrow_key(job: &Job, unit: usize) -> Result<Option<Key>, ApiError> {
+    if let Some(key) = job.narrow_keys.get(unit).and_then(|it| it.get()) {
+        return Ok(*key);
+    }
+    if job.identities.get(unit).and_then(|it| it.get()).is_none() {
+        return Ok(None);
+    }
+    let key = match narrow_identity(job, unit)? {
+        Some(identity) => Some(work_out_key(job, unit, identity)?),
+        None => None,
+    };
+    if let Some(slot) = job.narrow_keys.get(unit) {
+        let _ = slot.set(key);
+    }
+    Ok(key)
+}
+
+/// The base keys `unit`'s record may be under, in the order they are asked: the narrow one
+/// (a record with no diagnostics), the narrow one with what its diagnostics quote
+/// ([`quoted_key`], of the files the slot under the narrow key lists), then the whole one.
+fn record_keys(job: &Job, unit: usize) -> Result<[Option<Key>; 3], ApiError> {
+    let narrow = narrow_key(job, unit)?;
+    let quoted = match narrow {
+        Some(narrow) => match quotes(job, narrow)? {
+            Some(names) => quoted_key(job, narrow, &names),
+            None => None,
+        },
+        None => None,
+    };
+    Ok([narrow, quoted, record_key(job, unit)?])
+}
+
+/// The domain of the slot under a narrow key that lists the files its record's diagnostics
+/// point into ([`quotes_slot`]).
+const QUOTES: &str = "blaze v2 cargo unit record quotes 1";
+/// The domain of [`quoted_key`].
+const QUOTED: &str = "blaze v2 cargo unit record quoted 1";
+
+/// Where the names of the files the diagnostics of the record under `narrow` point into are
+/// kept: what a lookup reads to work out [`quoted_key`] before it has the record.
+fn quotes_slot(narrow: Key) -> Key {
+    Key(Hasher::new(QUOTES).id(&narrow.0).finish())
+}
+
+/// The names in the slot under `narrow` ([`quotes_slot`]): none when the store has none. A
+/// read that fails or bytes that do not decode are an error naming the slot (rule 3).
+fn quotes(job: &Job, narrow: Key) -> Result<Option<Vec<String>>, ApiError> {
+    let guard = blaze_cas::enter();
+    let slot = quotes_slot(narrow);
+    let failed = |why: String| {
+        // alloc: error path
+        ApiError::new(
+            format!(
+                "the files the diagnostics of the record under {:x} quote, kept under {:x} in the daemon's store: {why}",
+                narrow.0, slot.0
+            ),
+            None,
+        )
+    };
+    match job.input.store.get(&guard, &slot) {
+        Ok(None) => Ok(None),
+        // alloc: the few names of a record's quoted files, once per lookup of a unit that has any
+        Ok(Some(entry)) => blaze_protocol::cbor::from_slice(entry.bytes)
+            .map(Some)
+            .map_err(|error| failed(format!("they do not decode: {error}"))), // alloc: error path
+        Err(error) => Err(failed(error.to_string())), // alloc: error path
+    }
+}
+
+/// The base key of a record whose diagnostics point into the files `names`: its narrow key
+/// with each of those files' content as the job's view has it, by the name the diagnostics
+/// give it. The diagnostics are rendered from the check's result, which the narrow key
+/// covers, and the text of exactly these files ([`blaze_diagnostics::emit::Sources::unread`]:
+/// every file a span is in, through each macro call and definition), so an edit of a comment
+/// in any other file finds the record, and one in these renders them again. None, so the
+/// record is under its whole key, when one of the files is not the view's file at its path:
+/// a text of the database's own (a root with a module appended), or a file no mount holds.
+fn quoted_key(job: &Job, narrow: Key, names: &[String]) -> Option<Key> {
+    let mut hasher = Hasher::new(QUOTED);
+    hasher.id(&narrow.0).update(&(names.len() as u64).to_le_bytes());
+    for name in names {
+        if blaze_diagnostics::emit::names_text(name) {
+            return None;
+        }
+        let (content, _, _) = job.mounted.read(&job.mounted.absolute(name)).ok()??;
+        hasher.part(name.as_bytes()).id(&content);
+    }
+    Some(Key(hasher.finish()))
+}
+
+/// Each span `diag` writes, to change: its own, its children's and its suggestions', and each
+/// macro call and definition they are in (as `blaze_diagnostics::emit` reads them).
+fn each_span_mut(diag: &mut Diag, f: &mut impl FnMut(&mut blaze_diagnostics::Span)) {
+    fn meet(span: &mut blaze_diagnostics::Span, f: &mut impl FnMut(&mut blaze_diagnostics::Span)) {
+        f(span);
+        if let Some(expansion) = span.expansion.as_deref_mut() {
+            if let Some(def) = &mut expansion.def_site {
+                meet(def, f);
+            }
+            meet(&mut expansion.call_site, f);
+        }
+    }
+    let Diag { span, children, suggestions, .. } = diag;
+    let multi = std::iter::once(span).chain(children.iter_mut().map(|it| &mut it.span));
+    for multi in multi {
+        for span in &mut multi.primary {
+            meet(span, f);
+        }
+        for (span, _) in &mut multi.labels {
+            meet(span, f);
+        }
+    }
+    for suggestion in suggestions {
+        for (span, _) in suggestion.substitutions.iter_mut().flatten() {
+            meet(span, f);
+        }
+    }
+}
+
+/// The text of the view's file the diagnostics name `name`; none for a name of a text that is
+/// not the file at its path, a file no mount holds, bytes that fail their check or are not
+/// UTF-8.
+fn quoted_text(job: &Job, name: &str) -> Option<String> {
+    if blaze_diagnostics::emit::names_text(name) {
+        return None;
+    }
+    let (_, _, bytes) = job.mounted.read(&job.mounted.absolute(name)).ok()??;
+    // alloc: a file's text, once per file a kept record's diagnostics point into
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
+/// `diags`, a unit's check's (those cargo shows), as a record under the narrow key keeps
+/// them ([`Placed`]): none unless every span of theirs is in a file of the view and is one
+/// the code text keeps exactly ([`blaze_lower::places::places`], read with `edition`, the
+/// unit's crate's), in which case the record is under what its diagnostics quote
+/// ([`quoted_key`]) or its whole key, as before.
+fn placed(job: &Job, edition: ::span::Edition, diags: &[Diag]) -> Option<Placed> {
+    // alloc: once per unit stored with diagnostics, those cargo shows
+    let shown: Vec<Diag> = diags.iter().filter(|it| !cargo_hides(&it.message)).cloned().collect();
+    placed_from(|name| quoted_text(job, name), edition, &shown)
+}
+
+/// [`placed`] of every one of `diags`, each file's text as `read` gives it by the name the
+/// diagnostics give the file.
+pub(super) fn placed_from(
+    read: impl Fn(&str) -> Option<String>,
+    edition: ::span::Edition,
+    diags: &[Diag],
+) -> Option<Placed> {
+    // alloc: once per unit stored with diagnostics, what its record holds of them
+    let mut diags: Vec<Diag> = diags.to_vec();
+    // alloc: as above, a span each
+    let mut spans: Vec<(String, u32, u32)> = Vec::new();
+    for diag in &mut diags {
+        // clone: a file's name per span, once per unit stored with diagnostics
+        each_span_mut(diag, &mut |span| spans.push((span.file.clone(), span.lo, span.hi)));
+    }
+    spans.sort_unstable();
+    spans.dedup();
+    let mut files: Vec<(String, Vec<(u32, u32, u32)>)> = Vec::new(); // alloc: as above
+    for of_file in spans.chunk_by(|a, b| a.0 == b.0) {
+        let name = &of_file[0].0;
+        let text = read(name)?;
+        let ends: Vec<(u32, u32)> = of_file.iter().map(|it| (it.1, it.2)).collect(); // alloc: as above
+        let places = blaze_lower::places::places(&text, edition, &ends)?;
+        let mut offsets: Vec<(u32, u32, u32)> = ends
+            .iter()
+            .zip(&places)
+            .flat_map(|(&(lo, hi), (at_lo, at_hi))| {
+                [(lo, at_lo.line, at_lo.column), (hi, at_hi.line, at_hi.column)]
+            })
+            .collect(); // alloc: as above
+        offsets.sort_unstable();
+        offsets.dedup();
+        files.push((name.clone(), offsets)); // clone: as above
+    }
+    Some(Placed { diags, files })
+}
+
+/// The diagnostics `placed` holds with each span's offsets those of its file as the job's
+/// view has it: the offset of the place the record keeps for it
+/// ([`blaze_lower::places::offset_of`]). The record was found under its narrow key, which
+/// every text with those tokens at those places has, so a file that lacks one, or that can't
+/// be read, is an error naming the file and the place: the key failed to cover it (rule 21),
+/// and nothing is rendered from other offsets (rule 3).
+fn replaced(job: &Job, unit: usize, placed: &Placed) -> Result<Vec<Diag>, ApiError> {
+    replaced_from(|name| quoted_text(job, name), unit, placed)
+}
+
+/// [`replaced`], each file's text as `read` gives it now.
+pub(super) fn replaced_from(
+    read: impl Fn(&str) -> Option<String>,
+    unit: usize,
+    placed: &Placed,
+) -> Result<Vec<Diag>, ApiError> {
+    let failed = |name: &str, why: String| {
+        // alloc: error path
+        ApiError::new(
+            format!(
+                "unit {unit}: the diagnostics its record keeps point into `{name}`, {why}; its record's key                  says the file's code is as it was when they were made"
+            ),
+            Some(name.to_owned()),
+        )
+    };
+    // alloc: once per record replayed with diagnostics, an offset each
+    let mut moved: Vec<(&str, Vec<(u32, u32)>)> = Vec::with_capacity(placed.files.len());
+    for (name, offsets) in &placed.files {
+        let Some(text) = read(name) else {
+            return Err(failed(name, "which the view has no text of".to_owned())); // alloc: error path
+        };
+        let mut now = Vec::with_capacity(offsets.len()); // alloc: as above
+        for &(was, line, column) in offsets {
+            let place = blaze_lower::places::Place { line, column };
+            let Some(at) = blaze_lower::places::offset_of(&text, place) else {
+                // alloc: error path
+                return Err(failed(
+                    name,
+                    format!("which has nothing at line {}, byte column {column}", line + 1),
+                ));
+            };
+            now.push((was, at));
+        }
+        moved.push((name.as_str(), now));
+    }
+    let mut diags = placed.diags.clone(); // clone: the diagnostics to render, once per replay
+    let mut lost = None;
+    for diag in &mut diags {
+        each_span_mut(diag, &mut |span| {
+            let of_file = moved.iter().find(|it| it.0 == span.file).map(|it| &it.1);
+            let at = |was: u32| {
+                let offsets = of_file?;
+                offsets.binary_search_by_key(&was, |it| it.0).ok().map(|found| offsets[found].1)
+            };
+            match (at(span.lo), at(span.hi)) {
+                (Some(lo), Some(hi)) => (span.lo, span.hi) = (lo, hi),
+                // clone: error path
+                _ => lost = lost.take().or(Some(span.file.clone())),
+            }
+        });
+    }
+    match lost {
+        // alloc: error path
+        Some(name) => Err(failed(&name, "a span of which the record keeps no place of".to_owned())),
+        None => Ok(diags),
+    }
+}
+
+/// What a replay of a record that keeps its diagnostics as places shows: they with their
+/// offsets in the files as they are ([`replaced`]), rendered from those files as a unit made
+/// renders its own ([`rendered`]).
+fn replayed(job: &Job, unit: usize, placed: &Placed) -> Result<Vec<Diagnostic>, ApiError> {
+    let diags = replaced(job, unit, placed)?;
+    let mut sources = blaze_diagnostics::emit::Sources::default();
+    job.mounted.add_sources(&mut sources, &diags);
+    rendered(job, unit, &diags, &sources)
+}
+
+/// How the job's diagnostics are written: in its colour, at its width, short or not.
+fn style(job: &Job) -> blaze_diagnostics::emit::Style {
+    let mut style = blaze_diagnostics::emit::Style {
+        ansi: job.input.color,
+        short: job.input.short,
+        ..Default::default()
+    };
+    if let Some(width) = job.input.width {
+        style.width = usize::try_from(width).unwrap_or(usize::MAX);
+    }
+    style
+}
+
+/// `diags` as cargo shows them, rendered from `sources`, the text of each file they point
+/// into, in the job's style (its colour, its width, short or not): a unit made's and a
+/// replayed record's alike. A span that can't be placed in its file is the error, naming the
+/// diagnostic.
+fn rendered(
+    job: &Job,
+    unit: usize,
+    diags: &[Diag],
+    sources: &blaze_diagnostics::emit::Sources,
+) -> Result<Vec<Diagnostic>, ApiError> {
+    let u = job.unit(unit)?;
+    let unit_of = job.unit_of(unit)?;
+    let style = style(job);
+    diags
+        .iter()
+        .filter(|it| !cargo_hides(&it.message))
+        .map(|it| {
+            blaze_diagnostics::api::diagnostic(it, sources, style, Some(unit_of.clone()))
+                // alloc: error path, naming the diagnostic whose span can't be placed
+                .map_err(|why| {
+                    format!(
+                        "{why}, in the diagnostic `{}`",
+                        it.message.lines().next().unwrap_or_default()
+                    )
+                })
+        })
+        .collect::<Result<_, _>>()
+        // clone: the unit's name, on the error path
+        .map_err(|why| ApiError::new(why, Some(u.target.name.clone())))
+}
+
+/// What a unit gives its link when an edit moved positions in its crate and no token: its
+/// code is the code of a record the store keeps, and only span tables differ. The link/store
+/// lane's input (docs/v2/plan/design/item-hash.md, sections 12 and 15): with it a link writes
+/// the tables named here into the images of `code`'s record and writes no code.
+///
+/// Not made yet: making it needs the unit's key without its positions (a code text with no
+/// line or column in it, with each position a constant, a type or a macro read by value kept
+/// beside it), under which the record of the same tokens is found after lines moved. Until
+/// then such an edit misses the unit's record and links whole.
+#[allow(dead_code, reason = "the link lane's input, defined before either lane makes or takes it")]
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct SpansMoved {
+    /// The key of the record whose code this unit's is: every template it names and every
+    /// image it wrote are the ones to use, its span tables apart.
+    pub(crate) code: Key,
+    /// Each span table whose positions are not those `code`'s record was linked with: its
+    /// anchor (`blaze_format::SpanRef::anchor`, of the store key of the body or declaration
+    /// it is of, which no edit of positions moves) and the hash of its content now
+    /// ([`Made::spans`]' hash of a table), sorted by anchor, each once. A table that is gone
+    /// or new is a change of code, never listed here.
+    pub(crate) tables: Vec<(ContentId, CodeHash)>,
+}
+
+/// The domain of a unit's check entry's key ([`check_key`]).
+const CHECK: &str = "blaze v2 cargo unit check 1";
+
+/// The outcome of a unit's check, an entry of the store apart from its record
+/// ([`check_key`]): what [`Phase::Bodies`] gives the phases after it. A unit whose record
+/// misses and whose check entry is found runs no check: its code is generated and linked
+/// against the diagnostics the entry keeps.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Checked {
+    /// [`blaze_diagnostics::CrateCheck::items_broken`].
+    pub(super) items_broken: bool,
+    /// The check's diagnostics, every one, as places ([`Placed`]); none for a check that
+    /// gave none.
+    pub(super) placed: Option<Placed>,
+}
+
+impl Checked {
+    /// The entry as the store keeps it: a record's header with no output, native input or
+    /// profile ([`header`]), which a lookup checks in place as it does a record's, then the
+    /// CBOR of the outcome.
+    pub(super) fn encoded(&self) -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new(); // alloc: once per check entry kept
+        header::write(&mut bytes, &[], &[], &[]);
+        blaze_protocol::cbor::append(&mut bytes, self).map_err(|why| why.to_string())?;
+        Ok(bytes)
+    }
+
+    /// What [`Checked::encoded`] wrote as `bytes`, whose body starts at `body`
+    /// ([`header::check`]).
+    pub(super) fn decoded(bytes: &[u8], body: usize) -> Result<Checked, String> {
+        let body = bytes.get(body..).ok_or("it ends before its body starts")?;
+        blaze_protocol::cbor::from_slice(body).map_err(|why| why.to_string())
+    }
+}
+
+/// The base key of `unit`'s check entry: what its check's outcome is made from, which is
+/// what a unit that only checks is keyed by, whatever the unit goes on to build: its record's
+/// inputs ([`RecordInputs`]) with its crate known by what a check can observe of it
+/// ([`blaze_lower::Narrowed::checked`]: its own code text, and of the crates it depends on
+/// their interfaces). So an edit of a body no check of this crate can read, in a crate below
+/// it, moves the unit's record key and leaves this one. Filed, as a record is, by what the
+/// crate's code read ([`reads`]). None for a unit with no narrow identity
+/// ([`narrow_identity`]: its lints read comments, or its crate keeps its whole text), and for
+/// one that only checks, whose record is under this very identity.
+fn check_key(job: &Job, unit: usize) -> Result<Option<Key>, ApiError> {
+    let u = job.unit(unit)?;
+    if checks_only(job.input.goal, u) || narrow_identity(job, unit)?.is_none() {
+        return Ok(None);
+    }
+    let Some(narrowed) = job.narrowed.get(unit).and_then(|it| it.get()).copied().flatten() else {
+        return Ok(None);
+    };
+    let base = work_out_key(job, unit, narrowed.checked)?;
+    Ok(Some(Key(Hasher::new(CHECK).id(&base.0).finish())))
+}
+
+/// The check outcome the store keeps for `unit` ([`Checked`]): its diagnostics with their
+/// offsets in the files as they are ([`replaced`]) and whether they break its items. None
+/// when the unit has no check entry or the store keeps none. An entry that is there and does
+/// not decode is an error naming the unit and its key (rule 3).
+fn kept_check(job: &Job, unit: usize) -> Result<Option<(Vec<Diag>, bool)>, ApiError> {
+    let Some(base) = check_key(job, unit)? else { return Ok(None) };
+    let guard = blaze_cas::enter();
+    let Some((_, entry, body)) = filed_in(job, &job.input.store, false, &guard, base)? else {
+        return Ok(None);
+    };
+    let checked = Checked::decoded(entry.bytes, body).map_err(|why| {
+        // alloc: error path
+        ApiError::new(
+            format!(
+                "unit {unit}: its check's outcome under {:x} in the daemon's store does not decode: {why}",
+                base.0
+            ),
+            None,
+        )
+    })?;
+    let diags = match &checked.placed {
+        Some(placed) => replaced(job, unit, placed)?,
+        None => Vec::new(), // alloc: empty, allocates nothing
+    };
+    Ok(Some((diags, checked.items_broken)))
+}
+
+/// The puts of `unit`'s check entry ([`Checked`]), its check having run in this build and
+/// given `diags`: the entry under where its reads `read` file it, and the slot of their
+/// names where no slot holds them yet. None, so the check runs again when the record
+/// misses, where the unit has no check entry ([`check_key`]), a diagnostic of it is not
+/// kept as places ([`placed_from`]) or points into a text that is no file of the view
+/// (`unmounted`), or every slot of the key holds other names.
+fn check_puts(
+    job: &Job,
+    reader: &UnitReader,
+    unit: usize,
+    read: &reads::Reads,
+    diags: &[Diag],
+    items_broken: bool,
+    unmounted: bool,
+) -> Result<Vec<Put>, ApiError> {
+    let none = Vec::new(); // alloc: empty, allocates nothing
+    if unmounted {
+        return Ok(none);
+    }
+    let Some(base) = check_key(job, unit)? else { return Ok(none) };
+    let u = job.unit(unit)?;
+    let placed = match diags.is_empty() {
+        true => None,
+        false => {
+            let edition = crate_of(job, unit, u)?.data(reader.db()).edition;
+            match placed_from(|name| quoted_text(job, name), edition, diags) {
+                Some(placed) => Some(placed),
+                None => return Ok(none),
+            }
+        }
+    };
+    let failed = |why: String| {
+        // alloc: error path
+        ApiError::new(
+            format!("keeping the check's outcome of unit {unit} (`{}`): {why}", u.target.name),
+            None,
+        )
+    };
+    let filing = {
+        let guard = blaze_cas::enter();
+        reads::file(
+            base,
+            read,
+            &job.input.config.invocation.env,
+            &|manifest| job.units().is_primary_manifest(manifest),
+            |slot| job.input.store.get(&guard, slot).ok().flatten().map(|it| it.bytes),
+        )
+        .map_err(failed)?
+    };
+    let Some(reads::Filing { key, slot }) = filing else { return Ok(none) };
+    let bytes = Checked { items_broken, placed }.encoded().map_err(failed)?;
+    let mut puts = vec![Put { key, kind: Kind::Query, bytes }]; // alloc: once per check entry kept
+    puts.extend(slot.map(|(key, bytes)| Put { key, kind: Kind::Query, bytes }));
+    Ok(puts)
+}
+
 fn work_out_key(job: &Job, unit: usize, identity: ContentId) -> Result<Key, ApiError> {
     with_record_inputs(job, unit, identity, |inputs| inputs.key(unit))
 }
@@ -314,8 +869,10 @@ fn with_record_inputs<T>(
     let lint_profile = lint_profile(job, unit)?.map(|it| it.profile.id);
     // The profiles the images it links are laid out by: their heat is the input
     // (docs/v2/plan/design/code-layout.md).
-    let links =
-        matches!(codegen::makes(u), Ok(Makes::Executable | Makes::Shared { proc_macro: false }));
+    let links = matches!(
+        codegen::makes(u, codegen::asked(job, unit)),
+        Ok(Makes::Executable | Makes::Shared { proc_macro: false })
+    );
     let layout = match links && !checks_only(job.input.goal, u) {
         true => super::layout::key(job, job.plan(unit)?)
             .map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?,
@@ -375,21 +932,14 @@ pub(super) fn unit_subject(job: &Job, u: &Unit) -> Result<ContentId, String> {
     Ok(Hasher::new(SUBJECT).part(&bytes).finish())
 }
 
-/// The subject of a function or a run, `subject` within its build, as one of the unit whose
-/// subject is `unit`: two units' builds of one function are two subjects.
-pub(super) fn within(unit: ContentId, subject: ContentId) -> ContentId {
-    Hasher::new(WITHIN).id(&unit).id(&subject).finish()
-}
-
-/// The domains of [`unit_subject`] and [`within`].
+/// The domain of [`unit_subject`].
 const SUBJECT: &str = "blaze v2 why unit subject 3";
-const WITHIN: &str = "blaze v2 why subject within a unit 1";
 
 /// Why `unit`'s record was not in the store, for `blaze why`: its key's parts by name, which
 /// the daemon tells apart against the unit's last compute. Made on a miss only. The parts are
 /// made from inputs gathered again, and refused unless they make the very key the record was
 /// looked up under, so they never describe other inputs than the key's.
-fn missed(job: &Job, unit: usize) -> blaze_kernel::Miss {
+fn missed(job: &Job, reader: &UnitReader, unit: usize) -> blaze_kernel::Miss {
     use blaze_kernel::{Miss, Missed};
     let (item, subject) = match job.unit(unit) {
         Ok(u) => (span_unit(u), unit_subject(job, u)),
@@ -405,6 +955,7 @@ fn missed(job: &Job, unit: usize) -> blaze_kernel::Miss {
         // alloc: none
         parts: Vec::new(),
         beyond: None,
+        via: None,
     };
     let subject = match subject {
         Ok(it) => it,
@@ -433,10 +984,13 @@ fn missed(job: &Job, unit: usize) -> blaze_kernel::Miss {
             // alloc: once a miss
             return Err("its record has no key, though its crate's identity is set".to_owned());
         };
-        let (key, parts) = with_record_inputs(job, unit, identity, |inputs| {
+        let (key, mut parts) = with_record_inputs(job, unit, identity, |inputs| {
             Ok((inputs.key(unit)?, inputs.parts(unit)?))
         })
         .map_err(|error| error.what)?;
+        // In place of its crate's identity as one part: what that identity is made of, so the
+        // file, setting or dependency that changed is the one named.
+        parts.extend(identity_named(job, unit, reader.identity_parts(unit)?)?);
         if key != looked {
             // alloc: once a miss
             return Err("its inputs changed between its record's lookup and now (a profile it reads was rewritten during the build), so its parts would not describe the key it missed under".to_owned());
@@ -446,6 +1000,54 @@ fn missed(job: &Job, unit: usize) -> blaze_kernel::Miss {
         Ok(miss)
     })();
     made.unwrap_or_else(|why| refused(subject, Missed::Failed(why)))
+}
+
+/// What unit `unit`'s identity in the front end is `made_of`
+/// ([`blaze_lower::Lowered::identity_parts`]) as parts of its record's key: each file by its
+/// path, and each crate it depends on as the result of that crate's unit, which a chain of
+/// reasons follows.
+fn identity_named(
+    job: &Job,
+    unit: usize,
+    made_of: Vec<blaze_lower::IdentityPart>,
+) -> Result<Vec<blaze_kernel::Part>, String> {
+    use blaze_kernel::Part;
+    use blaze_lower::IdentityPart;
+    let u = job.unit(unit).map_err(|error| error.what)?;
+    // The unit whose crate `krate` is: one this unit depends on, else (a crate of the
+    // standard library, which no unit names as a dependency) the first of the job's.
+    let unit_of = |krate| {
+        u.dependencies
+            .iter()
+            .map(|dep| dep.index)
+            .chain(0..job.graph.len())
+            .find(|&at| job.crates.krate(at) == Some(krate))
+            .and_then(|at| job.unit(at).ok())
+            .map(span_unit)
+    };
+    // alloc: once a miss, a part each thing its identity is made of
+    let mut parts = Vec::with_capacity(made_of.len());
+    for part in made_of {
+        parts.push(match part {
+            IdentityPart::Settings(id) => Part::new(
+                "its crate's settings in the front end (its root's path, cfgs, env, edition and target)",
+                Some(id),
+            ),
+            IdentityPart::File { path, content, code } => Part::file(path, Some(content), code),
+            IdentityPart::Files { what, content } => Part::new(what, Some(content)),
+            IdentityPart::Appended(id) => {
+                Part::new("the module the build appends to its root file (a test harness)", Some(id))
+            }
+            IdentityPart::Spelling(id) => Part::new("how cargo passes its root file", Some(id)),
+            // alloc: once a miss, a part's name
+            IdentityPart::Dependency { krate, name, identity } => Part::result(
+                format!("the crate `{name}` it depends on, as the front end has it"),
+                Some(identity),
+                unit_of(krate),
+            ),
+        });
+    }
+    Ok(parts)
 }
 
 /// What a unit's record key is made of. The process's environment is not among it: a record
@@ -467,9 +1069,9 @@ pub(crate) struct RecordInputs<'a> {
     /// package ([`script_link_args`]): its link reads them, and neither its plan (which has
     /// the rustflags' `-C link-arg`s) nor its crate's identity holds them.
     pub(crate) script_link_args: Vec<(String, String)>,
-    /// The `-l`s in the rustflags of the crates it links in beside its own, each with its
-    /// crate's package ([`linked_rustflag_libs`]): its link reads them, and its plan holds only
-    /// its own rustflags (whose `-l`, `-L` and link options it covers).
+    /// The `-l`s and `-L`s in the rustflags of the crates it links in beside its own, each with
+    /// its crate's package ([`linked_rustflag_libs`]): its link reads them, and its plan holds
+    /// only its own rustflags (whose `-l`, `-L` and link options it covers).
     pub(crate) linked_rustflag_libs: Vec<(String, String)>,
     /// The code that makes the record ([`super::deps::record_makers`]): the front end's (its
     /// diagnostics, and the bodies the code generator compiles), the code generator's (the
@@ -524,7 +1126,7 @@ impl RecordInputs<'_> {
                 &mut hasher,
                 scratch,
                 &self.linked_rustflag_libs,
-                "the rustflags' libraries of the crates it links",
+                "the rustflags' libraries and their directories of the crates it links",
                 unit,
             )
         })?;
@@ -556,7 +1158,8 @@ impl RecordInputs<'_> {
 
     /// The parts of [`Self::key`] by name, each hashed alone, for `blaze why`: the unit's own
     /// fields and each dependency by the name it is used as, so a changed feature or profile
-    /// is named. Made on a miss only.
+    /// is named. Made on a miss only. All but [`Self::identity`], which its caller names by
+    /// what it is made of ([`identity_named`]).
     pub(crate) fn parts(&self, unit: usize) -> Result<Vec<blaze_kernel::Part>, ApiError> {
         use blaze_kernel::Part;
         let bytes = |name: &str, bytes: &[u8]| {
@@ -577,10 +1180,6 @@ impl RecordInputs<'_> {
         let u = &self.unit;
         // alloc: once a miss, a part each part of the key
         let mut parts = vec![
-            id(
-                "the crate's identity in the front end (its sources and its dependencies')",
-                Some(&self.identity),
-            ),
             cbor("package", &u.pkg_id)?,
             cbor("target", u.target)?,
             cbor("profile", u.profile)?,
@@ -594,7 +1193,7 @@ impl RecordInputs<'_> {
             cbor("the check-cfgs its build scripts printed", &self.script_check_cfgs)?,
             cbor("the link arguments its build scripts printed", &self.script_link_args)?,
             cbor(
-                "the `-l`s in the rustflags of the crates it links",
+                "the `-l`s and `-L`s in the rustflags of the crates it links",
                 &self.linked_rustflag_libs,
             )?,
             id("the front end's code identity", Some(&self.makers.front_end)),
@@ -645,10 +1244,11 @@ mod erased {
 }
 
 /// The goal as `unit`'s record key holds it. A build script's compile is the same program
-/// whatever the job's goal ([`super::checks_only`] is false for it under every goal), so a
-/// `blaze check` and a `blaze build` share its record; any other unit keys the goal.
+/// whatever the job's goal ([`super::checks_only`] is false for it under every goal), as a
+/// device unit's MSL is, so a `blaze check` and a `blaze build` share its record; any other
+/// unit keys the goal.
 pub(crate) fn keyed_goal(goal: Goal, unit: &Unit) -> u8 {
-    if unit.mode == Mode::Build && unit.target.is_custom_build() {
+    if unit.mode == Mode::Build && (unit.target.is_custom_build() || unit.for_device()) {
         return 1;
     }
     match goal {
@@ -843,12 +1443,38 @@ fn machine_file(
 /// allocation for a record whose code read no process variable. A store it can't read says
 /// not fresh, and the unit's compile, looking again, fails naming why ([`kept`]).
 pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
-    let Ok(Some(base)) = record_key(job, unit) else { return false };
+    let Ok(keys) = record_keys(job, unit) else { return false };
     let guard = blaze_cas::enter();
-    let found_in = |store: &blaze_cas::Reader, std: bool| {
+    let found_in = |store: &blaze_cas::Reader, std: bool, base: Key| {
         matches!(filed_in(job, store, std, &guard, base), Ok(Some(_)))
     };
+    keys.into_iter().flatten().any(|base| {
+        found_in(&job.input.store, false, base)
+            || (shared(job, unit) && found_in(&job.input.std, true, base))
+    })
+}
+
+/// Whether `unit`'s record is in the store under its narrow key ([`narrow_key`]), the first
+/// of the keys a lookup asks ([`record_keys`]): then the unit is replayed from what its
+/// crate's code texts say alone, and an edit that leaves every code text finds it again. Not
+/// for a unit with no narrow key (its lints read comments, its crate keeps its whole text),
+/// nor one whose record is under what its diagnostics quote or its whole key, which hold its
+/// files' bytes. What the job's front end asks of each unit before it vouches for a source
+/// (`UnitWriter::still`); read in place, as [`fresh`] reads.
+pub(crate) fn found_narrow(job: &Job, unit: usize) -> bool {
+    let Ok(Some(narrow)) = narrow_key(job, unit) else { return false };
+    let guard = blaze_cas::enter();
+    let found_in = |store: &blaze_cas::Reader, std: bool| {
+        matches!(filed_in(job, store, std, &guard, narrow), Ok(Some(_)))
+    };
     found_in(&job.input.store, false) || (shared(job, unit) && found_in(&job.input.std, true))
+}
+
+/// The narrowed identities of library crates the writer worked out and no unit gave the loop
+/// yet ([`Job::library_narrows`]): each put once, by the first unit replayed or stored after
+/// it was made.
+fn library_puts(job: &Job) -> Vec<Put> {
+    std::mem::take(&mut *job.library_narrows.lock())
 }
 
 /// The store a record is read from, named for an error: the daemon's, or with `std` the shared
@@ -980,7 +1606,8 @@ pub(crate) fn codegen_inputs(job: &Job) -> Result<Vec<(ContentId, ContentId)>, F
 /// units are looked for in the shared std store too.
 pub(crate) fn recorded_profiles(job: &Job, unit: usize) -> Result<Recorded, ApiError> {
     let name = || job.unit(unit).map_or("", |it| it.target.name.as_str());
-    let Some(base) = record_key(job, unit)? else {
+    let keys = record_keys(job, unit)?;
+    let Some(base) = keys[2] else {
         // alloc: an error
         return Ok(Recorded::Missing(format!(
             "unit {unit} (`{}`): its record key is not known",
@@ -988,15 +1615,24 @@ pub(crate) fn recorded_profiles(job: &Job, unit: usize) -> Result<Recorded, ApiE
         )));
     };
     let guard = blaze_cas::enter();
-    let read = |store: &blaze_cas::Reader, std: bool| -> Result<Option<Vec<_>>, ApiError> {
+    let read = |store: &blaze_cas::Reader,
+                std: bool,
+                base: Key|
+     -> Result<Option<Vec<_>>, ApiError> {
         let Some((_, entry, _)) = filed_in(job, store, std, &guard, base)? else { return Ok(None) };
         recorded_in(job, unit, base, entry.bytes).map(Some)
     };
-    let found = match read(&job.input.store, false)? {
-        Some(profiles) => Some(profiles),
-        None if shared(job, unit) => read(&job.input.std, true)?,
-        None => None,
-    };
+    let mut found = None;
+    for base in keys.into_iter().flatten() {
+        found = match read(&job.input.store, false, base)? {
+            Some(profiles) => Some(profiles),
+            None if shared(job, unit) => read(&job.input.std, true, base)?,
+            None => None,
+        };
+        if found.is_some() {
+            break;
+        }
+    }
     Ok(match found {
         Some(profiles) => Recorded::Read(profiles),
         // alloc: an error
@@ -1043,7 +1679,16 @@ struct Kept {
 /// with the puts that copy it, the slot of what it read and every output it names into the
 /// store. A record key that can't be worked out, or a slot that does not decode, is an error.
 fn kept(job: &Job, unit: usize) -> Result<Option<Kept>, ApiError> {
-    let Some(base) = record_key(job, unit)? else { return Ok(None) };
+    for base in record_keys(job, unit)?.into_iter().flatten() {
+        if let Some(kept) = kept_under(job, unit, base)? {
+            return Ok(Some(kept));
+        }
+    }
+    Ok(None)
+}
+
+/// [`kept`] under the base key `base`, one of the unit's ([`record_keys`]).
+fn kept_under(job: &Job, unit: usize, base: Key) -> Result<Option<Kept>, ApiError> {
     let guard = blaze_cas::enter();
     // A record that is there and does not decode is an error naming the unit, the key and the
     // store, never read as one not kept (rule 3): a record format change is the key's to cover.
@@ -1209,18 +1854,82 @@ struct Making {
     natives: Vec<(String, ContentId)>,
     links: Vec<(String, Linking)>,
     macros: Option<ProcMacroLoadResult>,
+    /// A device unit's MSL, as its link wrote it ([`Compiled::gpu_msl`]).
+    gpu_msl: Option<Vec<u8>>,
     /// The records of images keyed by all they are made from before they are built (a
     /// doctest's examples), each filed once its output is keyed ([`doctest`]).
     records: Vec<ImageRecord>,
+    /// How many of `diagnostics` its check's are, in front, and every file they point into, by
+    /// the name they give it ([`quoted_key`]); none where that is not known (a doctest's).
+    quoted: Option<(usize, Vec<String>)>,
 }
 
 /// What a unit writes at one of its paths ([`Making::files`]).
 pub(crate) enum Written {
     /// These bytes, which the store is given.
     Bytes(Vec<u8>),
+    /// A linked image's bytes, which the store is given under the key of the linker's digest
+    /// of them ([`linked_key`]): the file is not hashed again.
+    Linked(Vec<u8>, [u8; 32]),
+    /// A linked image as what its link changed of the last one: the image of digest `root` is
+    /// the image the store holds under `base`'s key with `writes` (offset and bytes, by
+    /// offset) written over it, `len` bytes long. The store is given that as a recipe
+    /// (`blaze_cas::Kind::Derived`) under [`linked_key`] of `root`, a few kilobytes, and makes
+    /// the file as it places it, of a clone of `base`'s: the whole file is neither copied
+    /// here nor written there ([`Written::linked`]).
+    Derived { base: [u8; 32], root: [u8; 32], len: u64, writes: Vec<(u64, Vec<u8>)> },
     /// The bytes the store keeps under this key, as the path's last build of the same inputs
     /// left them: an image nothing it is made from changed since ([`Linking::Unchanged`]).
     Kept(Key),
+}
+
+impl Written {
+    /// What the store is given of a linked image of digest `root`: where its link was taken
+    /// as a `patch` of the image before it and the store can make that image's file again
+    /// (`blaze_cas::Reader::derivable` of its key: it is there, kept as a whole file, and at
+    /// the end of no long chain of patches), the patch ([`Written::Derived`]), and `whole` is
+    /// not called; else the whole file `whole` gives ([`Written::Linked`]): an image's first
+    /// link or one from scratch (a full patch), a base the store never had or let go of.
+    /// Having no base is not an error, and why is logged; `whole`'s error is the answer's.
+    ///
+    /// A base whose whole file the store wrote and has not seen written back is no base
+    /// either (`blaze_cas::NoBase::Unflushed`, the dirty-base rule): a derive is a clone of
+    /// that file, which would wait for all of it to be written out, so the image is handed
+    /// over whole and written where it goes. That is at most one whole file per write-back
+    /// in flight; the edit after it derives again.
+    ///
+    /// Give no patch for a file the daemon reads back by its bytes (a proc macro's wasm
+    /// module, [`Module::bytes`]): what the store keeps of a patch is the recipe, and only a
+    /// place gives the file.
+    pub(crate) fn linked<E>(
+        store: &blaze_cas::Reader,
+        root: [u8; 32],
+        patch: Option<blaze_link::Patch>,
+        whole: impl FnOnce() -> Result<Vec<u8>, E>,
+    ) -> Result<Written, E> {
+        let derived = patch.filter(|it| !it.full && it.digest == root).and_then(|patch| {
+            let base = patch.base?;
+            let key = linked_key(&base);
+            match store.derivable(&blaze_cas::enter(), &key) {
+                blaze_cas::Derivable::Yes => {
+                    Some(Written::Derived { base, root, len: patch.len, writes: patch.writes })
+                }
+                blaze_cas::Derivable::No(why) => {
+                    tracing::info!(
+                        target: "blaze",
+                        base = ?key,
+                        %why,
+                        "a linked image is put whole: the store cannot derive it from the one before"
+                    );
+                    None
+                }
+            }
+        });
+        match derived {
+            Some(derived) => Ok(derived),
+            None => Ok(Written::Linked(whole()?, root)),
+        }
+    }
 }
 
 /// The record of an image keyed before it is built: under `filing`'s key, its output at
@@ -1311,10 +2020,16 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
         kept(job, unit)?
     };
     if kept.is_none() {
-        let miss = missed(job, unit);
+        let miss = missed(job, reader, unit);
         lock(slot).misses.push(miss);
     }
-    if let Some(Kept { record, puts, profiles }) = kept {
+    if let Some(Kept { mut record, mut puts, profiles }) = kept {
+        puts.extend(library_puts(job));
+        // Its diagnostics kept as places are rendered from the files as they are.
+        if let Some(placed) = record.placed.take() {
+            let _span = tracing::info_span!(target: "blaze", "unit diagnostics replay").entered();
+            record.diagnostics = replayed(job, unit, &placed)?;
+        }
         // What its build did with its profiles, as the record says: counted for this job's
         // check that a profile applied to something ([`codegen::unapplied`]).
         if let Some(slot) = job.counted.get(unit) {
@@ -1334,6 +2049,7 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
                 .collect(),
             artifact: record.artifact.map(|it| Artifact { fresh: true, ..it }),
             macros: None,
+            gpu_msl: None,
             links: Vec::new(),
             // alloc: none
             misses: Vec::new(),
@@ -1367,11 +2083,17 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
     // A library compiled only as a program reaches it has no code of its own to build. A proc
     // macro built for wasm is a program, its module ([`macros`] loads it); any other proc
     // macro's lib has none that is loaded: its expanders run its MIR.
-    let makes = codegen::makes(u);
+    let makes = codegen::makes(u, codegen::asked(job, unit));
     let library_reached = reached && makes.as_ref().is_ok_and(|it| *it == Makes::Library);
     let proc_macro = makes.is_ok_and(|it| it == Makes::Shared { proc_macro: true })
         && !codegen::wasm_macro(job, unit);
-    let builds_code = !inert && !checks_only(job.input.goal, u) && !library_reached && !proc_macro;
+    // A device unit has no native code: its library is a crate record, and its MSL is written
+    // from the front end at its link ([`assemble`]).
+    let builds_code = !inert
+        && !checks_only(job.input.goal, u)
+        && !library_reached
+        && !proc_macro
+        && !u.for_device();
     let served = {
         let _span = tracing::info_span!("unit check served").entered();
         blaze_diagnostics::cache::read(db, reader.checks(), krate, job.mounted.root())
@@ -1395,8 +2117,13 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
                 true,
             )
         }
-        // alloc: once per unit checked, shared by its check and its codegen
-        None => (Some(Arc::new(Checking::new(db, hir::Crate::from(krate)))), None, false),
+        // Its own check's outcome from the store ([`kept_check`]): its record missed for
+        // what no check of it reads (a body below it), so no check runs.
+        None => match kept_check(job, unit)? {
+            Some((diags, items_broken)) => (None, Some(diags), items_broken),
+            // alloc: once per unit checked, shared by its check and its codegen
+            None => (Some(Arc::new(Checking::new(db, hir::Crate::from(krate)))), None, false),
+        },
     };
     let unmounted =
         diags.as_deref().map_or_else(Vec::new, |diags| unmounted(reader, &job.mounted, diags));
@@ -1640,7 +2367,7 @@ fn generate(
     let krate = crate_of(job, unit, u)?;
     // dyn: `HirFrontend::with_checks` takes it; called once a level of the walk
     let checks = checking.as_deref().map(|it| it as &dyn BodyChecks);
-    let generated = codegen::makes(u).map(|makes| {
+    let generated = codegen::makes(u, codegen::asked(job, unit)).map(|makes| {
         let generated = codegen::generate(job, reader, unit, krate, &makes, &job.mounted, checks);
         (makes, generated)
     });
@@ -1664,6 +2391,7 @@ fn link(
 ) -> Result<(), Failed> {
     if let Some(mut kept) = phases.kept.take() {
         kept.macros = macros(job, reader, unit, kept.ok, Module::Kept(&kept));
+        kept.gpu_msl = gpu_msl(job, unit, kept.ok, Module::Kept(&kept))?;
         held(job, unit, &mut kept)?;
         phases.linked = Some(Linked::Kept(kept));
         return Ok(());
@@ -1673,6 +2401,7 @@ fn link(
     }
     let mut making = assemble(job, reader, unit, phases, images)?;
     making.macros = macros(job, reader, unit, making.ok, Module::Linked(&making.files));
+    making.gpu_msl = gpu_msl(job, unit, making.ok, Module::Linked(&making.files))?;
     if !making.nothing
         && let Some(Ok((_, Ok(Ok(parts))))) = &mut phases.generated
     {
@@ -1687,20 +2416,11 @@ fn link(
     if let Some(Ok((_, Ok(Ok(parts))))) = &mut phases.generated
         && !parts.built.misses.is_empty()
     {
-        // Its functions are subjects within the unit: another unit's build of one is another.
-        let subject = unit_subject(job, job.unit(unit)?);
+        // A function's template is the same step whichever unit built it (its subject is
+        // the driver's): the unit is only what a chain of reasons follows from its code.
+        let via = span_unit(job.unit(unit)?);
         for mut miss in std::mem::take(&mut parts.built.misses) {
-            match &subject {
-                Ok(subject) => miss.subject = within(*subject, miss.subject),
-                Err(why) => {
-                    // No subject to compare it by: said, not dropped.
-                    miss.subject = ContentId::default();
-                    // alloc: error path, once a miss
-                    miss.missed =
-                        blaze_kernel::Missed::Failed(format!("its unit has no subject: {why}"));
-                    miss.parts.clear();
-                }
-            }
+            miss.via = Some(via.clone()); // clone: once a miss
             phases.misses.push(miss);
         }
     }
@@ -1818,7 +2538,10 @@ fn store(
     let package = job.package(u)?;
     // Read before the unit's is taken, so a give-way finds it as it was.
     let krate = crate_of(job, unit, u)?;
-    let sources = crate_files(reader, krate);
+    let sources = {
+        let _span = tracing::info_span!(target: "blaze", "unit source files").entered();
+        crate_files(reader, krate)
+    };
     // Everything its closure's code was made from is in the database's logs now: it compiled.
     // An expansion whose reads were not traced read what no key can cover: no record is kept.
     let read = {
@@ -1828,7 +2551,6 @@ fn store(
     if let Err(why) = &read {
         tracing::info!(unit, crate_name = %u.target.name, "unit record not kept: {why}");
     }
-    let key = record_key(job, unit)?.filter(|_| read.is_ok());
     let Some(Linked::Made(making)) = phases.linked.take() else {
         // alloc: error path
         return Err(ApiError::new(
@@ -1849,28 +2571,114 @@ fn store(
         natives,
         links,
         macros,
+        gpu_msl,
         records,
+        quoted,
     } = *making;
+    puts.extend(library_puts(job));
+    // Under the narrow key when it holds no diagnostics; with diagnostics, all of them the
+    // check's, under the narrow key and what they quote ([`quoted_key`]), their files' names
+    // put in the slot a lookup reads; else under the whole one.
+    let narrow = narrow_key(job, unit)?;
+    // Its diagnostics as places, where all of them are its check's and each span is one the
+    // code text keeps exactly: the record is then under the narrow key, as one with none is.
+    let kept_placed = match (narrow, &quoted, &phases.diags) {
+        (Some(_), Some((count, _)), Some(diags))
+            if *count == diagnostics.len() && !diagnostics.is_empty() =>
+        {
+            let _span = tracing::info_span!(target: "blaze", "unit diagnostics places").entered();
+            placed(job, krate.data(reader.db()).edition, diags)
+                .filter(|it| it.diags.len() == diagnostics.len())
+        }
+        _ => None,
+    };
+    let mut quotes_put = None;
+    let key = match (narrow, quoted) {
+        (Some(narrow), _) if diagnostics.is_empty() || kept_placed.is_some() => Some(narrow),
+        (Some(narrow), Some((count, names))) if count == diagnostics.len() => {
+            let slot = quotes_slot(narrow);
+            // The slot as the store has it: one already there with other names (the check's
+            // result moved with a variable its code read, which the key does not hold) is
+            // left as it is, and this record is under its whole key.
+            let kept = quotes(job, narrow)?;
+            match (quoted_key(job, narrow, &names), kept) {
+                (Some(key), None) => {
+                    // alloc: the slot's bytes, once per record first kept with diagnostics
+                    let bytes = blaze_protocol::cbor::to_vec(&names).map_err(|why| {
+                        // alloc: error path
+                        ApiError::new(
+                            format!("encoding the files the diagnostics of unit {unit} quote: {why}"),
+                            None,
+                        )
+                    })?;
+                    quotes_put = Some(Put { key: slot, kind: Kind::Query, bytes });
+                    Some(key)
+                }
+                (Some(key), Some(kept)) if kept == names => Some(key),
+                _ => record_key(job, unit)?,
+            }
+        }
+        _ => record_key(job, unit)?,
+    }
+    .filter(|_| read.is_ok());
     let mut outputs = Vec::new();
     let mut artifact = None;
+    // Each file it wrote hashed whole for its key (a program's image among them), its
+    // dep-info written and its artifact made.
+    let hashing =
+        tracing::info_span!(target: "blaze", "unit outputs hash", files = files.len()).entered();
     if !nothing {
         let mounted = &job.mounted;
         // Each file's bytes go into the store once, moved, under their key; a copy cargo makes
         // of one (`target/debug/foo` of `deps/foo-0123`) is the same key.
         let mut keyed: Vec<(String, Key, bool)> = Vec::with_capacity(files.len());
         let mut output_keys: Vec<Key> = Vec::with_capacity(plan.outputs.len());
-        let mut put_output = |puts: &mut Vec<Put>, bytes: Vec<u8>| {
-            let key = output_key(&bytes);
+        // `linked`: a linked image's key and what is put under it, the whole file or the
+        // recipe that derives it; none for a file keyed by its bytes hashed here.
+        let mut put_output = |puts: &mut Vec<Put>, bytes: Vec<u8>, linked: Option<(Key, Kind)>| {
+            let (key, kind) = match linked {
+                Some(linked) => linked,
+                None => (output_key(&bytes), Kind::Output),
+            };
             if !output_keys.contains(&key) {
                 output_keys.push(key);
-                puts.push(Put { key, kind: Kind::Output, bytes });
+                puts.push(Put { key, kind, bytes });
             }
             key
         };
         let main_file = files.first().map(|it| it.0.clone());
         for (path, written, executable) in files {
             let key = match written {
-                Written::Bytes(bytes) => put_output(&mut puts, bytes),
+                Written::Bytes(bytes) => put_output(&mut puts, bytes, None),
+                Written::Linked(bytes, root) => {
+                    put_output(&mut puts, bytes, Some((linked_key(&root), Kind::Output)))
+                }
+                // The store derives the file as it places it: it is given the recipe, and
+                // the whole image is not handed over.
+                Written::Derived { base, root, len, writes } => {
+                    let recipe = {
+                        let _span = tracing::info_span!(
+                            target: "blaze",
+                            "unit output recipe",
+                            path = %path,
+                            ranges = writes.len(),
+                            len,
+                        )
+                        .entered();
+                        blaze_cas::derived::encode(&linked_key(&base), len, &writes)
+                    };
+                    let recipe = recipe.map_err(|why| {
+                        // alloc: error path
+                        ApiError::new(
+                            format!(
+                                "{}: what its link changed of `{path}` is no recipe the store takes: {why}",
+                                span_unit(u)
+                            ),
+                            None,
+                        )
+                    })?;
+                    put_output(&mut puts, recipe, Some((linked_key(&root), Kind::Derived)))
+                }
                 // In the store already, under the record that names it.
                 Written::Kept(key) => key,
             };
@@ -1901,7 +2709,7 @@ fn store(
                 Some((_, key, executable)) => (*key, *executable),
                 None if path.ends_with(".d") => {
                     let text = dep_info(path, plan, main_file.as_deref(), &sources, mounted);
-                    (put_output(&mut puts, text.into_bytes()), false)
+                    (put_output(&mut puts, text.into_bytes(), None), false)
                 }
                 // Debug info beside an image (`.dSYM`, `.pdb`, `.dwp`): blaze's images carry
                 // their line tables, and write none beside them.
@@ -1941,6 +2749,7 @@ fn store(
             *context = with_natives(*context, &natives);
         }
     }
+    drop(hashing);
     let misses = std::mem::take(&mut phases.misses);
     let why = why.map(str::to_owned); // alloc: a unit that failed, once
     let mut compiled = Compiled {
@@ -1953,6 +2762,7 @@ fn store(
         outputs,
         artifact,
         macros,
+        gpu_msl,
         links,
         misses,
     };
@@ -1982,7 +2792,11 @@ fn store(
             ok: compiled.ok,
             open: compiled.open,
             why: compiled.why.as_deref(),
-            diagnostics: &compiled.diagnostics,
+            diagnostics: match kept_placed {
+                Some(_) => &[],
+                None => compiled.diagnostics.as_slice(),
+            },
+            placed: kept_placed.as_ref(),
             outputs: compiled
                 .outputs
                 .iter()
@@ -2012,6 +2826,14 @@ fn store(
         }
         compiled.puts.push(record);
         compiled.puts.extend(slot);
+        compiled.puts.extend(quotes_put);
+    }
+    // Its check's outcome, when its check ran here, as an entry of its own: found by a later
+    // build whose record misses for what the check does not read.
+    if let (true, Ok(read), Some(diags)) = (phases.checking.is_some(), &read, &phases.diags) {
+        let unmounted = !phases.unmounted.is_empty();
+        let puts = check_puts(job, reader, unit, read, diags, phases.items_broken, unmounted)?;
+        compiled.puts.extend(puts);
     }
     if let Some(slot) = job.made.get(unit) {
         let _ = slot.set(made);
@@ -2037,9 +2859,15 @@ impl Module<'_> {
         let (path, bytes) = match self {
             Module::Linked(files) => match files.iter().find(|(path, _, _)| wasm(path)) {
                 // alloc: once per proc macro linked for wasm, the module's bytes for its load
-                Some((path, Written::Bytes(bytes), _)) => (path.as_str(), bytes.clone()),
-                // Only a doctest's images are kept as they were; a proc macro's is linked.
-                Some((_, Written::Kept(_), _)) | None => return Err(ModuleError::NotLinked),
+                Some((path, Written::Bytes(bytes) | Written::Linked(bytes, _), _)) => {
+                    (path.as_str(), bytes.clone())
+                }
+                // Only a doctest's images are kept as they were; a proc macro's is linked, and
+                // whole: a module is read back by its bytes, so no patch is given of one
+                // ([`Written::linked`]).
+                Some((_, Written::Kept(_) | Written::Derived { .. }, _)) | None => {
+                    return Err(ModuleError::NotLinked);
+                }
             },
             Module::Kept(kept) => {
                 let Some(output) = kept.outputs.iter().find(|it| wasm(&it.path)) else {
@@ -2151,6 +2979,47 @@ impl fmt::Display for ModuleError {
             ),
         }
     }
+}
+
+/// Device unit `unit`'s MSL (`UnitPlan::gpu_msl`), for its dependents' front ends
+/// ([`crate::serve::work::Writer::gpu_msl`]): the output at that exact path, as its link wrote
+/// it or its kept record names it. None for a unit that writes none or did not build. An output
+/// its link did not write, or a record that names none or whose bytes the store lacks, is an
+/// error naming the unit and the path, never MSL found another way.
+fn gpu_msl(job: &Job, unit: usize, ok: bool, module: Module<'_>) -> Result<Option<Vec<u8>>, Failed> {
+    let Some(path) = job.plan(unit)?.gpu_msl.as_deref() else { return Ok(None) };
+    if !ok {
+        return Ok(None);
+    }
+    let name = job.unit(unit).map_or("", |it| it.target.name.as_str());
+    // alloc: error path
+    let error = |why: String| Failed::from(ApiError::new(format!("the MSL of the device crate `{name}` at {path}: {why}"), None));
+    let bytes = match module {
+        Module::Linked(files) => match files.iter().find(|(at, _, _)| at == path) {
+            // alloc: once per device unit linked, the MSL for its dependents
+            Some((_, Written::Bytes(bytes), _)) => bytes.clone(),
+            Some((_, Written::Kept(_), _)) | None => return Err(error("its link wrote no MSL there".to_owned())),
+        },
+        Module::Kept(kept) => {
+            let Some(output) = kept.outputs.iter().find(|it| it.path == path) else {
+                return Err(error("its kept record names no output there".to_owned()));
+            };
+            match kept.puts.iter().find(|it| it.key == output.key) {
+                // alloc: as above
+                Some(put) => put.bytes.clone(),
+                None => {
+                    let guard = blaze_cas::enter();
+                    match job.input.store.get(&guard, &output.key) {
+                        // alloc: as above
+                        Ok(Some(it)) => it.bytes.to_vec(),
+                        Ok(None) => return Err(error(format!("the store does not hold its kept output {:x}", output.key.0))),
+                        Err(corrupt) => return Err(error(format!("reading its kept output {:x}: {corrupt}", output.key.0))),
+                    }
+                }
+            }
+        }
+    };
+    Ok(Some(bytes))
 }
 
 /// The expanders of proc-macro unit `unit`, for the crates that use it
@@ -2274,11 +3143,14 @@ fn script_link_args(job: &Job, unit: usize) -> Result<Vec<(String, String)>, Api
         .collect())
 }
 
-/// The `-l`s of the rustflags of the crates `unit` links in beside its own
+/// The `-l`s and `-L`s of the rustflags of the crates `unit` links in beside its own
 /// ([`codegen::linked_rustflag_libs`]): none for a unit that links nothing.
 fn linked_rustflag_libs(job: &Job, unit: usize) -> Result<Vec<(String, String)>, ApiError> {
     let u = job.unit(unit)?;
-    if !matches!(codegen::makes(u), Ok(Makes::Executable | Makes::Shared { .. })) {
+    if !matches!(
+        codegen::makes(u, codegen::asked(job, unit)),
+        Ok(Makes::Executable | Makes::Shared { .. })
+    ) {
         // alloc: none, empty
         return Ok(Vec::new());
     }
@@ -2364,36 +3236,30 @@ fn assemble(
         );
         return Err(ApiError::new(what, None).into());
     };
+    // Its diagnostics' sources read and each diagnostic rendered: a unit made again does this
+    // whole, whatever of its check was reused.
+    let rendering =
+        tracing::info_span!(target: "blaze", "unit diagnostics render", diags = diags.len())
+            .entered();
     let mut sources = blaze_diagnostics::emit::Sources::default();
     for (name, text) in &phases.unmounted {
         // clone: a file no mount holds, once per unit whose diagnostics point into one
         sources.add(name, Some(text.clone()));
     }
     mounted.add_sources(&mut sources, diags);
-    let mut style = blaze_diagnostics::emit::Style {
-        ansi: color,
-        short: job.input.short,
-        ..Default::default()
-    };
-    if let Some(width) = job.input.width {
-        style.width = usize::try_from(width).unwrap_or(usize::MAX);
-    }
-    let mut diagnostics: Vec<Diagnostic> = diags
-        .iter()
-        .filter(|it| !cargo_hides(&it.message))
-        .map(|it| {
-            blaze_diagnostics::api::diagnostic(it, &sources, style, Some(unit_of.clone()))
-                // alloc: error path, naming the diagnostic whose span can't be placed
-                .map_err(|why| {
-                    format!(
-                        "{why}, in the diagnostic `{}`",
-                        it.message.lines().next().unwrap_or_default()
-                    )
-                })
-        })
-        .collect::<Result<_, _>>()
-        // clone: the unit's name, on the error path
-        .map_err(|why| ApiError::new(why, Some(u.target.name.clone())))?;
+    let style = style(job);
+    let mut diagnostics: Vec<Diagnostic> = rendered(job, unit, diags, &sources)?;
+    drop(rendering);
+    // What those were rendered from beside the check's own result: every file it points into.
+    let quoted: (usize, Vec<String>) = (
+        diagnostics.len(),
+        // alloc: the names of the files a unit's diagnostics point into, once per unit made
+        blaze_diagnostics::emit::Sources::default()
+            .unread(diags)
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+    );
     let failed = diagnostics.iter().any(|it| it.level == Level::Error);
     let mut made = Made::default();
     let nothing = |diagnostics: Vec<Diagnostic>, ok: bool, made: Made| Making {
@@ -2408,7 +3274,10 @@ fn assemble(
         natives: Vec::new(),
         links: Vec::new(),
         macros: None,
+        gpu_msl: None,
         records: Vec::new(),
+        // clone: the files its diagnostics point into, once per unit that fails or builds nothing
+        quoted: Some(quoted.clone()),
     };
     if failed {
         // Failed in its bodies or lints only: its items are sound, and what is checked against
@@ -2432,7 +3301,7 @@ fn assemble(
     let mut links = Vec::new(); // alloc: none until a link
     // What each file rustc would write holds: (path, bytes, executable).
     let mut files: Vec<(String, Written, bool)> = Vec::new();
-    let identity = identity(job, unit);
+    let identity = named_identity(job, unit)?;
     if inert {
         // A build script that does nothing is not run, so not built: what it prints is known.
         return Ok(nothing(diagnostics, true, made));
@@ -2446,12 +3315,32 @@ fn assemble(
             return Err(ApiError::new(format!("unit {unit} ({}) is linked twice in one job: its generated code went with its first link", span_unit(u)), None).into());
         }
         None => {
-            for path in artifact::made(plan) {
+            let msl = plan.gpu_msl.as_deref();
+            for path in artifact::made(plan).into_iter().filter(|it| Some(*it) != msl) {
                 files.push((
                     path.to_owned(),
                     Written::Bytes(crate_record(u, identity, &[])),
                     false,
                 ));
+            }
+            // A device unit of an `artifact = "gpu"` dependency: its `GPU_ENTRIES` lowered,
+            // validated by naga and written as MSL, from the front end as it stands. A refusal
+            // fails the unit naming each construct, never another way to make it.
+            if let Some(path) = msl {
+                let krate = crate_of(job, unit, u)?;
+                let built = {
+                    let _span = tracing::info_span!("unit device build").entered();
+                    blaze_shader::device::device_msl(reader.db(), krate)
+                };
+                match built {
+                    Ok(built) => files.push((path.to_owned(), Written::Bytes(built.msl.into_bytes()), false)),
+                    Err(error) => {
+                        // alloc: error path
+                        let what = format!("{} writes no MSL at {path}: {error}", span_unit(u));
+                        diagnostics.push(say::refused(what, Some(unit_of), color));
+                        return Ok(nothing(diagnostics, false, made));
+                    }
+                }
             }
         }
         Some(Err(what)) => {
@@ -2489,7 +3378,10 @@ fn assemble(
             if job.cancelled() {
                 return Err(Failed::Again);
             }
-            let generated = parts.over(reader, mounted);
+            let generated = {
+                let _span = tracing::info_span!(target: "blaze", "unit generated over").entered();
+                parts.over(reader, mounted)
+            };
             // Lint `blaze::vecreport`: what the optimized code still does in its loops, at
             // the source line, in the order of the positions.
             let reported = generated
@@ -2516,12 +3408,12 @@ fn assemble(
             // has: a reformat that moves a `panic!` changes its message. Every span table of the
             // binary is in each test's selection, so such an edit runs its tests again.
             // alloc: once per test unit, one hash per span table
+            let tables = tracing::info_span!(target: "blaze", "unit span tables").entered();
             let mut spans: Vec<CodeHash> = match generated.roots.tests.is_empty() {
                 true => Vec::new(),
                 false => generated
-                    .side()
+                    .spans()
                     .map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?
-                    .spans
                     .iter()
                     .map(|(anchor, table)| {
                         let mut hasher = Hasher::new(SPANS);
@@ -2533,6 +3425,7 @@ fn assemble(
             spans.sort_unstable();
             spans.dedup();
             made.spans = spans;
+            drop(tables);
             // Each test by name only: what it reaches is walked from the binary's table when a
             // reach request or a kept run asks, not here, where a binary of thousands of tests
             // walked the program once per test (2026-11-01: minutes per binary).
@@ -2586,13 +3479,27 @@ fn assemble(
                                 color,
                             ));
                         }
+                        // The splice was refused and the image linked from scratch: the
+                        // build says so, naming the branch, as the link line says how.
+                        if let Some(why) = &linked.whole {
+                            diagnostics.push(say::cargo(
+                                Level::Note,
+                                // alloc: a note's text, once per link from scratch
+                                format!("`{path}`: {why}"),
+                                Some(unit_of.clone()),
+                                color,
+                            ));
+                        }
                         natives.extend(linked.read);
                         if linked.table.is_some() {
                             made.table = linked.table;
                         }
                         // alloc: once per image linked, a unit links one or two
                         links.push((path.to_owned(), linked.how));
-                        files.push((path.to_owned(), Written::Bytes(linked.bytes), true));
+                        // What the link settled the store is given: the patch the image took
+                        // the link as, where the store derives the file from the one before
+                        // it, else the whole file (`codegen::LinkMade::written`).
+                        files.push((path.to_owned(), linked.written, true));
                     }
                     Err(failed) => {
                         // alloc: error path
@@ -2616,7 +3523,9 @@ fn assemble(
         natives,
         links,
         macros: None,
+        gpu_msl: None,
         records: Vec::new(),
+        quoted: Some(quoted),
     })
 }
 

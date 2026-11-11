@@ -393,7 +393,14 @@ impl Run {
             traced.dirs.retain(|it| !it.0.starts_with(out_dir));
         }
         let files = match &self.spec.out_dir {
-            Some(out_dir) => collect(out_dir).map_err(RunError::OutDir)?,
+            Some(out_dir) => {
+                // Stamped before and after it is read: what was read is what the stamps are
+                // of only when nothing was written between ([`left`]).
+                let before = stamps(out_dir).ok();
+                let files = collect(out_dir).map_err(RunError::OutDir)?;
+                left(out_dir, &files, before);
+                files
+            }
             None => Vec::new(), // alloc: none, an empty list
         };
         let key = self.spec.key;
@@ -743,7 +750,120 @@ fn executable(_: &std::fs::Metadata) -> bool {
     false
 }
 
-/// Writes `files` into `dir`, emptied first: the `OUT_DIR` a run reused left. Each path is
+/// What one entry of an `OUT_DIR` is on the disk, without its bytes: a file by its length,
+/// inode, mode and when it and its inode last changed (a write of it moves the last, which
+/// nothing can set back), a directory by its inode alone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Stamp {
+    dir: bool,
+    len: u64,
+    ino: u64,
+    mode: u32,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+#[cfg(unix)]
+fn stamp(meta: &std::fs::Metadata) -> Stamp {
+    use std::os::unix::fs::MetadataExt as _;
+    match meta.is_dir() {
+        true => Stamp { dir: true, len: 0, ino: meta.ino(), mode: 0, modified: (0, 0), changed: (0, 0) },
+        false => Stamp {
+            dir: false,
+            len: meta.len(),
+            ino: meta.ino(),
+            mode: meta.mode(),
+            modified: (meta.mtime(), meta.mtime_nsec()),
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        },
+    }
+}
+
+/// The [`Stamp`] of everything below `dir`, by path, sorted: a listing of each directory and
+/// an `lstat` of each entry, no file opened. Off Unix nothing says a file was not written
+/// again, so no stamps are had and nothing is ever found in place.
+#[cfg(unix)]
+fn stamps(dir: &Path) -> io::Result<Vec<(String, Stamp)>> {
+    let mut out = Vec::new(); // alloc: once per OUT_DIR looked at, an entry a file
+    let mut stack = vec![PathBuf::new()]; // alloc: once per OUT_DIR looked at
+    while let Some(rel) = stack.pop() {
+        for entry in std::fs::read_dir(dir.join(&rel))? {
+            let rel = rel.join(entry?.file_name());
+            let meta = std::fs::symlink_metadata(dir.join(&rel))?;
+            out.push((rel_name(&rel), stamp(&meta)));
+            if meta.is_dir() {
+                stack.push(rel);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+#[cfg(not(unix))]
+fn stamps(_: &Path) -> io::Result<Vec<(String, Stamp)>> {
+    Err(io::Error::other("no stamp of a file says it was not written again here"))
+}
+
+/// What this process last left in an `OUT_DIR`: the files, by their identity, and the stamp
+/// of each entry as it was left.
+struct Left {
+    id: blaze_ids::ContentId,
+    stamps: Vec<(String, Stamp)>,
+}
+
+/// Each `OUT_DIR` this process left files in ([`left`], [`restore`]), by its path: a few
+/// dozen a build, scanned. In memory only: a restarted daemon restores each once.
+static LEFT: blaze_core::lock::Lock<Vec<(PathBuf, Left)>> =
+    blaze_core::lock::Lock::new("usercode.run.left", Vec::new());
+
+/// The identity of an `OUT_DIR`'s files: each one's path, mode and bytes.
+fn files_id(files: &[OutFile]) -> blaze_ids::ContentId {
+    let mut hasher = blaze_ids::Hasher::new("blaze usercode out dir files");
+    for file in files {
+        hasher
+            .part(file.path.as_bytes())
+            .part(&[u8::from(file.executable)])
+            .opt_part(file.bytes.as_deref());
+    }
+    hasher.finish()
+}
+
+/// Notes that `dir` holds `files` with the stamps `now`, in place of what was noted of it.
+fn note(dir: &Path, id: blaze_ids::ContentId, now: Vec<(String, Stamp)>) {
+    let mut left = LEFT.lock();
+    left.retain(|it| it.0 != dir);
+    left.push((dir.to_owned(), Left { id, stamps: now })); // alloc: once per OUT_DIR left
+}
+
+/// A run left `files` in `dir`, as [`collect`] read them between two looks at its stamps,
+/// `before` and now: noted when both are had and equal, so the stamps are of the bytes read
+/// (a write between the two moves a stamp). Else nothing is noted, and the next reuse writes.
+fn left(dir: &Path, files: &[OutFile], before: Option<Vec<(String, Stamp)>>) {
+    LEFT.lock().retain(|it| it.0 != dir);
+    if let (Some(before), Ok(after)) = (before, stamps(dir))
+        && before == after
+    {
+        note(dir, files_id(files), after);
+    }
+}
+
+/// Whether `dir` holds the files of `id` exactly as this process left them: the same files
+/// were noted of it, and each entry's stamp is the one noted, none more and none fewer. No
+/// file is read: a write of one, by anyone, moved its stamp.
+fn in_place(dir: &Path, id: &blaze_ids::ContentId) -> bool {
+    let noted = |left: &[(PathBuf, Left)]| left.iter().any(|it| it.0 == dir && it.1.id == *id);
+    // The disk is looked at with the lock let go, and the note read again after.
+    if !noted(&LEFT.lock()) {
+        return false;
+    }
+    let Ok(now) = stamps(dir) else { return false };
+    LEFT.lock().iter().any(|it| it.0 == dir && it.1.id == *id && it.1.stamps == now)
+}
+
+/// Writes `files` into `dir`, emptied first: the `OUT_DIR` a run reused left. Nothing is
+/// written when `dir` holds them already as this process left them ([`in_place`]): a reuse
+/// that computes nothing writes nothing, so no watch of `dir` hears of it. Each path is
 /// checked to stay inside it before anything is touched; one that would not is the store's
 /// bytes being wrong, and leaves `dir` as it was.
 ///
@@ -763,6 +883,14 @@ pub fn restore(dir: &Path, files: &[OutFile]) -> Result<(), String> {
             return Err(format!("a kept OUT_DIR names {:?}, which would leave it", file.path)); // alloc: error path
         }
     }
+    let id = files_id(files);
+    if in_place(dir, &id) {
+        return Ok(());
+    }
+    LEFT.lock().retain(|it| it.0 != dir);
+    // Each file's stamp as it was written, read on its descriptor: what is noted is what
+    // was written here, never what another wrote over it before it was looked at again.
+    let mut written: Vec<(&str, Stamp)> = Vec::new(); // alloc: once per OUT_DIR restored
     empty(dir)?;
     // alloc: once per OUT_DIR restored, the directories made in it, lent from `files`
     let mut made = blaze_hash::HashSet::<&str, std::alloc::Global>::default();
@@ -785,7 +913,7 @@ pub fn restore(dir: &Path, files: &[OutFile]) -> Result<(), String> {
                     std::fs::create_dir_all(&parent)
                         .map_err(|error| format!("{}: {error}", parent.display()))?;
                 }
-                let write = || -> std::io::Result<()> {
+                let write = || -> std::io::Result<std::fs::Metadata> {
                     let mut out = std::fs::File::create(&path)?;
                     out.write_all(bytes)?;
                     #[cfg(unix)]
@@ -793,10 +921,24 @@ pub fn restore(dir: &Path, files: &[OutFile]) -> Result<(), String> {
                         use std::os::unix::fs::PermissionsExt as _;
                         out.set_permissions(std::fs::Permissions::from_mode(0o755))?;
                     }
-                    Ok(())
+                    out.metadata()
                 };
-                write().map_err(|error| format!("{}: {error}", path.display()))?; // alloc: error path
+                let meta = write().map_err(|error| format!("{}: {error}", path.display()))?; // alloc: error path
+                #[cfg(unix)]
+                written.push((file.path.as_str(), stamp(&meta)));
+                #[cfg(not(unix))]
+                let _unstamped = (meta, &mut written);
             }
+        }
+    }
+    // Noted when every file is still as it was written: the next reuse of these files finds
+    // them in place.
+    if let Ok(now) = stamps(dir) {
+        let same = |(path, stamp): &(&str, Stamp)| {
+            now.binary_search_by(|it| it.0.as_str().cmp(path)).is_ok_and(|at| now[at].1 == *stamp)
+        };
+        if written.iter().all(same) {
+            note(dir, id, now);
         }
     }
     Ok(())
@@ -875,7 +1017,7 @@ mod tests {
     fn opened(sim: &mut Sim) -> Store {
         let mut effects = Vec::new();
         let config =
-            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
+            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped };
         let mut store = Store::open(config, &mut effects);
         run_until_idle(sim, &mut effects, |completion, effects| {
             store.complete(completion, effects);

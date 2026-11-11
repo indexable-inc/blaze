@@ -1,4 +1,0 @@
-Using local file /root/perf/bin/heapprof/blaze.
-Argument "MSWin32" isn't numeric in numeric eq (==) at /nix/store/w0m7k4c9hrxq9qn3555bjm6lbb8ydjhk-jemalloc-5.4.0/bin/jeprof line 5314.
-Argument "linux" isn't numeric in numeric eq (==) at /nix/store/w0m7k4c9hrxq9qn3555bjm6lbb8ydjhk-jemalloc-5.4.0/bin/jeprof line 5314.
-Using local file /root/perf/heap/tables/build.prof.

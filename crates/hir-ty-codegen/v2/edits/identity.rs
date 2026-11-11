@@ -1,5 +1,5 @@
 //! The identity property of the edit fuzzer's model, as lane identity states it
-//! (docs/v2/plan/design/code-identity.md, /tmp/blaze-lanes/v2-identity.md):
+//! (docs/v2/plan/design/code-identity.md):
 //!
 //! 1. an edit of comments, formatting or item order keeps every function's compile identity
 //!    (`instance_identity`, in a debug and in a release unit, and in a debug unit that moves

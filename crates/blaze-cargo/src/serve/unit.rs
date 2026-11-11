@@ -14,7 +14,6 @@
 //!   run in blaze's MIR evaluator under the checker of undefined behavior, nothing compiled.
 //! - [`run`]: the program `cargo run` picks, run in the tests' sandbox.
 //! - [`reach`]: what a change reaches, from the database's facts.
-//! - [`pack`]: `blaze pack`'s pack of a checked program, for blaze's in-browser compiler.
 //! - [`say`]: cargo's own lines (`error: ...`, `warning: ...`) as diagnostics.
 //! - [`release`]: what a build lets go of its front end once nothing still to compile reads it.
 //!
@@ -41,7 +40,6 @@ mod harness;
 mod intent;
 mod layout;
 mod memo;
-mod pack;
 mod perf;
 mod reach;
 mod reads;
@@ -284,6 +282,27 @@ impl Steps for Real {
         Ok(puts)
     }
 
+    fn kept_run_log(&self, kept: &KeptLowered) -> blaze_query::db::Taken {
+        blaze_query::db::take_log_in(kept.lowered.db())
+    }
+
+    fn release_kept(&self, kept: &mut KeptLowered, wanted: &std::sync::atomic::AtomicBool) {
+        let Some(mut release) = kept.release.take() else { return };
+        // A request of the checkout waits for this front end: it goes back now, and that
+        // build's own releases let go of what this one would have, unless memory is short,
+        // when the release is due before more work is admitted.
+        if wanted.load(Ordering::Acquire) && !blaze_graph::admission::Pressure::now().squeezed() {
+            tracing::info_span!(
+                target: "blaze",
+                "front end release left to the checkout's next build, which waits for the front end",
+                checkout = %kept.root,
+            )
+            .in_scope(|| {});
+            return;
+        }
+        release.release(&mut kept.lowered);
+    }
+
     fn lower(&self, input: &JobInput, kept: Option<KeptLowered>) -> Result<FrontEnd<Real>, Failed> {
         if input.cancelled.load(Ordering::Relaxed) {
             return Err(Failed::Again);
@@ -370,6 +389,24 @@ impl Steps for Real {
                 let fresh = session.is_none();
                 if fresh {
                     blaze_item_hash::impls::install(lowered.served_db());
+                    // Which front end computes a body's identity, told before any is asked:
+                    // the one the goal store and the item store are given below. Until
+                    // 2026-11-10 nothing told it, so every identity was `Err("no front-end
+                    // build is set")` behind an untracked read of the singleton's absence:
+                    // the item store refused every body (`Refusal::NoIdentity`), and
+                    // `identity_of` ran again for every body it was asked of in every
+                    // revision (about 10,000 runs a build, all `ran_untracked`). A database
+                    // lowered into again was told when it was made.
+                    blaze_item_hash::identity::set_build(lowered.served_db(), deps::front_end()?);
+                }
+                // The guard: a build whose database was not told stops here, naming it, where
+                // it used to go on with no identity and an untracked read a body.
+                if blaze_item_hash::identity::FrontEnd::try_get(lowered.db()).is_none() {
+                    // alloc: an error, once
+                    return Err(Failed::Error(ApiError::new(
+                        "the front end's database was not told which front end computes its bodies' identities (`blaze_item_hash::identity::set_build`), so each would be asked again in every revision and none filed",
+                        None,
+                    )));
                 }
                 let mut session = match session {
                     Some(session) => session,
@@ -399,7 +436,7 @@ impl Steps for Real {
                         return Err(Failed::Again);
                     }
                     if waits.ready(unit) {
-                        identify(&mut lowered, &job, unit);
+                        identify(&mut lowered, &job, unit)?;
                     }
                 }
                 // Kept or fresh alike: the session's keys say which crates' keys moved, and a kept
@@ -426,6 +463,7 @@ impl Steps for Real {
                     ready: Vec::new(),
                     runs: Vec::new(),
                     macros: Vec::new(),
+                    msls: Vec::new(),
                     deps,
                     flushed,
                     broke: Vec::new(),
@@ -523,6 +561,7 @@ fn env_miss(kept: &KeptLowered, moved: &EnvMoved) -> blaze_kernel::Miss {
         kept: None,
         parts: Vec::new(), // alloc: none
         beyond: None,
+        via: None,
     }
 }
 
@@ -693,6 +732,10 @@ pub struct KeptLowered {
     /// What its job's builds used of the code generator's memo, kept there while it is kept;
     /// taken by the next job of the head.
     memo: Option<memo::Held>,
+    /// What its build's end lets go of it ([`release::Release::end`]), until the task that
+    /// stores it runs the release or leaves it for a request that waits
+    /// ([`Steps::release_kept`]).
+    release: Option<release::Release>,
 }
 
 /// What a task reads the front end through ([`Steps::Reader`]): a shared reference to the job's
@@ -708,6 +751,14 @@ pub struct UnitReader {
 impl UnitReader {
     pub(crate) fn db(&self) -> &Db {
         self.front.db()
+    }
+
+    /// What unit `unit`'s identity is made of ([`Lowered::identity_parts`]), for `blaze why`.
+    pub(crate) fn identity_parts(
+        &self,
+        unit: usize,
+    ) -> Result<Vec<blaze_lower::IdentityPart>, String> {
+        self.front.identity_parts(unit)
     }
 
     pub(crate) fn checks(&self) -> &blaze_diagnostics::cache::Served {
@@ -782,6 +833,8 @@ pub struct UnitWriter {
     runs: Vec<(usize, Ran)>,
     /// Proc macros' loads asked for, checked, in the order asked.
     macros: Vec<(usize, ProcMacroLoadResult)>,
+    /// Device units' MSL asked for, checked, in the order asked.
+    msls: Vec<(usize, Vec<u8>)>,
     /// What this job's serves served of crates whose key moved ([`deps::serve`]), for the front
     /// end's images to be stored with it: none when no key moved.
     deps: Option<deps::Kept>,
@@ -826,12 +879,22 @@ impl Writer<Real> for UnitWriter {
         Ok(())
     }
 
+    fn gpu_msl(&mut self, unit: usize, msl: Vec<u8>) -> Result<(), ApiError> {
+        self.front.check_gpu_msl(unit).map_err(lower_error)?;
+        self.msls.push((unit, msl));
+        Ok(())
+    }
+
     fn waiting(&self) -> bool {
-        !self.runs.is_empty() || !self.macros.is_empty() || self.release.due()
+        !self.runs.is_empty() || !self.macros.is_empty() || !self.msls.is_empty() || self.release.due()
     }
 
     fn began(&mut self, unit: usize) {
         self.release.began(unit);
+    }
+
+    fn found_kept(&mut self, unit: usize) {
+        self.release.kept(unit);
     }
 
     fn compiled(&mut self, unit: usize) {
@@ -861,7 +924,7 @@ impl Writer<Real> for UnitWriter {
         // First, with the readers stopped for it or for the writes below: what the crates
         // finished so far keep ([`release`]).
         self.release.release(lowered);
-        if self.runs.is_empty() && self.macros.is_empty() {
+        if self.runs.is_empty() && self.macros.is_empty() && self.msls.is_empty() {
             return Ok(true);
         }
         self.ready.clear();
@@ -871,15 +934,22 @@ impl Writer<Real> for UnitWriter {
             .iter()
             .map(|(unit, _)| *unit as u32)
             .chain(self.runs.iter().map(|(run, _)| *run as u32))
+            .chain(self.msls.iter().map(|(unit, _)| *unit as u32))
             .collect();
         let trigger_of =
             touched.iter().map(|&unit| lowered.what(unit as usize)).collect::<Vec<_>>().join(", "); // alloc: as `touched`
         let trigger =
-            Trigger::of("proc macros loaded and build scripts' runs applied", &trigger_of);
+            Trigger::of("proc macros loaded, build scripts' runs and device builds' MSL applied", &trigger_of);
         // alloc: once an apply, the proc macros it loaded
         let mut loaded: Vec<u32> = Vec::with_capacity(self.macros.len());
-        let (waits, ready, broke, macros, runs) =
-            (&mut self.waits, &mut self.ready, &mut self.broke, &mut self.macros, &mut self.runs);
+        let (waits, ready, broke, macros, runs, msls) = (
+            &mut self.waits,
+            &mut self.ready,
+            &mut self.broke,
+            &mut self.macros,
+            &mut self.runs,
+            &mut self.msls,
+        );
         let first = touched[0] as usize;
         // Each write's failure, an error or a panic, is its unit's ([`Writer::broke`]): the
         // writes after it are still applied, and only the units that depend on it are refused.
@@ -898,6 +968,20 @@ impl Writer<Real> for UnitWriter {
                     let applied = applying_fallible(run, "a build script's run", || {
                         lowered.ran(run, &ran).map_err(lower_error)?;
                         waits.applied(run as u32, ready);
+                        Ok(())
+                    });
+                    if let Err(it) = applied {
+                        ready.truncate(from);
+                        broke.push(it);
+                    }
+                }
+                // A device unit's MSL is, to its dependents, what a run is: what their crates
+                // read, once applied ([`graph::flag::GPU_MSL`]).
+                for (unit, msl) in msls.drain(..) {
+                    let from = ready.len();
+                    let applied = applying_fallible(unit, "a device build's MSL", || {
+                        lowered.gpu_msl(unit, &msl).map_err(lower_error)?;
+                        waits.applied(unit as u32, ready);
                         Ok(())
                     });
                     if let Err(it) = applied {
@@ -946,7 +1030,7 @@ impl Writer<Real> for UnitWriter {
             }
         }
         for &unit in &self.ready {
-            identify(lowered, job, unit);
+            identify(lowered, job, unit)?;
         }
         // The units these runs made ready and those a loaded proc macro reaches are served, in a
         // kept front end as in a fresh one: a run applied again with other cfgs, env or
@@ -1025,8 +1109,52 @@ impl Writer<Real> for UnitWriter {
         deps::noted(self.flushed.as_ref(), self.session.item_steps().as_ref())
     }
 
+    /// The sources of the view every key of this build held by code text alone: each Rust
+    /// file of a workspace package all of whose units were found under their narrow record
+    /// key ([`compile::found_narrow`]; `blaze_lower::Lowered::still_sources` says the rest),
+    /// less every file a build script's kept run read ([`script::ReadBytes`], by its last
+    /// name), by its path from the view's root. None, with the reason, when a build script's
+    /// run was not found kept by `fresh` (its reads are not noted), when one hashed a whole
+    /// directory, or when the front end vouches for none.
+    fn still(&self) -> Result<Vec<(String, ::span::Edition)>, String> {
+        let job = &self.job;
+        let reads = job.script_reads.lock();
+        for (unit, it) in job.units().graph.units.iter().enumerate() {
+            if it.mode == Mode::RunCustomBuild && !reads.noted(unit) {
+                // alloc: a reason, once a build
+                return Err(format!(
+                    "what the build script of {} read is not noted: its run was not found kept as the build began",
+                    it.pkg_id
+                ));
+            }
+        }
+        if reads.trees {
+            // alloc: a reason, once a build
+            return Err("a build script reads a whole directory by its bytes".to_owned());
+        }
+        let sources = self
+            .front
+            .still_sources(|unit| compile::found_narrow(job, unit))
+            .map_err(str::to_owned)?; // alloc: a reason, once a build
+        let root = job.input.config.invocation.root.trim_end_matches('/');
+        Ok(sources
+            .into_iter()
+            .filter_map(|it| {
+                let path = it.path.strip_prefix(root)?.strip_prefix('/')?;
+                let name = path.rsplit('/').next().unwrap_or(path);
+                (!reads.reads(name)).then(|| (path.to_owned(), it.edition)) // alloc: the edge
+            })
+            .collect()) // alloc: once a build that walked and made nothing
+    }
+
     fn keep(mut self) -> Result<KeptLowered, ApiError> {
-        if !self.apply()? {
+        // The writes still asked for are applied. With none, only that no reader is alive is
+        // asked: a release that is due stays for the task that stores the front end.
+        let applied = match self.runs.is_empty() && self.macros.is_empty() {
+            true => Arc::get_mut(&mut self.front).is_some(),
+            false => self.apply()?,
+        };
+        if !applied {
             let what = "the front end is kept for the head's next build with no task reading it, and one still does";
             return Err(self.refused(what));
         }
@@ -1034,14 +1162,13 @@ impl Writer<Real> for UnitWriter {
             let what = "the front end is not kept for the head's next build: a write to it panicked, and it may be half written";
             return Err(self.refused(what));
         }
-        // The build is over: what its finished crates keep goes before the front end is kept,
-        // and every MIR it made, of a check as of any build, so the kept front end holds none
-        // of it into the next build (a check's MIR, kept, grew the heap by every check).
+        // The build is over: what its finished crates keep goes, and every MIR it made, of a
+        // check as of any build, so the kept front end holds none of it into the build after
+        // the next (a check's MIR, kept, grew the heap by every check). Not here, on the loop
+        // before the build's answer: the release is kept with the front end and run by the
+        // task that stores it, after the answer ([`Steps::release_kept`]).
         self.release.end();
-        if let Some(lowered) = Arc::get_mut(&mut self.front) {
-            self.release.release(lowered);
-        }
-        let UnitWriter { session, front, job, deps, retractions, .. } = self;
+        let UnitWriter { session, front, job, deps, retractions, release, .. } = self;
         let Some(lowered) = Arc::into_inner(front.into_inner()) else {
             let what = "the front end is kept for the head's next build, and another holder of it is still alive";
             return Err(ApiError::new(what, None));
@@ -1065,6 +1192,7 @@ impl Writer<Real> for UnitWriter {
             flushed: None,
             seeds,
             memo,
+            release: Some(release),
         })
     }
 }
@@ -1143,10 +1271,38 @@ impl<T> Drop for Held<T> {
 
 /// Unit `unit`'s identity set from the front end, once every run of its closure is applied:
 /// from then on nothing changes what its crate is made from.
-fn identify(lowered: &mut Lowered, job: &Job, unit: u32) {
+///
+/// The library crates of its closure (a registry's, a git's) are given their own narrowed
+/// identities first ([`Lowered::library_narrows`]), each read from the store under its key, or
+/// worked out by parsing that crate where the store has none and left in
+/// [`Job::library_narrows`] to be kept. A read of the store that fails, or bytes there that are
+/// no narrowed identity, is the error (rule 3).
+fn identify(lowered: &mut Lowered, job: &Job, unit: u32) -> Result<(), ApiError> {
+    // The narrowed identities first: a reader that finds the identity set finds them set.
+    if let Some(slot) = job.narrowed.get(unit as usize) {
+        let _span = tracing::info_span!(target: "blaze", "unit narrowed identity", unit).entered();
+        let front_end = deps::front_end()?;
+        let guard = blaze_cas::enter();
+        let kept = |key: &ContentId| match job.input.store.get(&guard, &blaze_cas::Key(*key)) {
+            // alloc: a narrowed identity's few bytes, once per library crate per front end
+            Ok(found) => Ok(found.map(|entry| entry.bytes.to_vec())),
+            Err(corrupt) => Err(corrupt.to_string()), // alloc: error path
+        };
+        lowered.library_narrows(unit as usize, &front_end, kept).map_err(lower_error)?;
+        let made = lowered.take_library_narrows();
+        if !made.is_empty() {
+            job.library_narrows.lock().extend(made.into_iter().map(|(key, bytes)| Put {
+                key: blaze_cas::Key(key),
+                kind: blaze_cas::Kind::Query,
+                bytes,
+            }));
+        }
+        let _ = slot.set(lowered.narrowed(unit as usize));
+    }
     if let Some(slot) = job.identities.get(unit as usize) {
         let _ = slot.set(lowered.identity(unit as usize));
     }
+    Ok(())
 }
 
 /// Every file under the library's `dir`, by its path from there. A link is its target's bytes:
@@ -1263,6 +1419,14 @@ pub(crate) struct Job {
     /// Each unit's identity in the front end (what its crate is made from, deeply), set by the
     /// writer once no run left to apply changes it; unset, the unit's record is not known.
     pub(crate) identities: Box<[OnceLock<Option<ContentId>>]>,
+    /// Each unit's crate as the keys that leave trivia out know it
+    /// ([`blaze_lower::Lowered::narrowed`]), set by the writer with its identity: none for a
+    /// crate that keeps its whole text.
+    pub(crate) narrowed: Box<[OnceLock<Option<blaze_lower::Narrowed>>]>,
+    /// The narrowed identities of library crates the writer worked out, the store having none
+    /// ([`identify`]), as puts: taken by the next unit that gives the loop its puts
+    /// ([`compile::library_puts`]), so a later front end reads them and parses no such crate.
+    pub(crate) library_narrows: Lock<Vec<Put>>,
     /// What each build script's run told cargo, by its run unit. Each slot is written once,
     /// when the run ends, and read with no lock by every unit after it.
     pub(crate) scripts: Box<[OnceLock<script::Applied>]>,
@@ -1274,6 +1438,9 @@ pub(crate) struct Job {
     /// Each unit's record key, worked out once: `fresh` on the loop and `compile` on a worker
     /// both read it.
     pub(crate) keys: Box<[OnceLock<Option<blaze_cas::Key>>]>,
+    /// Each unit's narrow record key ([`compile::RecordInputs::key`] of its narrowed identity),
+    /// worked out once, as `keys` is.
+    pub(crate) narrow_keys: Box<[OnceLock<Option<blaze_cas::Key>>]>,
     /// The view and the mounts, as paths.
     pub(crate) mounted: Arc<files::Mounted>,
     /// What each build script prints, by its compile unit, when it provably prints only
@@ -1287,6 +1454,9 @@ pub(crate) struct Job {
     /// Each build script run prepared by `fresh`, taken by `script`, so it is prepared once.
     /// Only the loop touches it: the lock is never contended.
     pub(crate) starts: Box<[Lock<Option<Box<script::Start>>>]>,
+    /// What the build scripts' runs found kept read by their bytes ([`script::ReadBytes`]),
+    /// noted by `fresh` and read by the writer's `still`, both on the loop: never contended.
+    pub(crate) script_reads: Lock<script::ReadBytes>,
     /// The profiles its units' `-C profile-use`s name, read and given to the code generator
     /// once, and held while the job lives.
     pub(crate) profiles: OnceLock<codegen::Profiles>,
@@ -1351,17 +1521,21 @@ impl Job {
             shared,
             graph,
             identities: (0..slots).map(|_| Default::default()).collect(),
+            narrowed: (0..slots).map(|_| Default::default()).collect(),
+            library_narrows: Lock::new("serve.unit.library_narrows", Vec::new()), // alloc: none
             scripts: (0..slots).map(|_| Default::default()).collect(),
             made: (0..slots).map(|_| Default::default()).collect(),
             phases: (0..slots)
                 .map(|_| Lock::new("serve.unit.phases", compile::Phases::default()))
                 .collect(),
             keys: (0..slots).map(|_| Default::default()).collect(),
+            narrow_keys: (0..slots).map(|_| Default::default()).collect(),
             runs: (0..slots).map(|_| Default::default()).collect(),
             mounted,
             inert: (0..slots).map(|_| Default::default()).collect(),
             pure: (0..slots).map(|_| Default::default()).collect(),
             starts: (0..slots).map(|_| Lock::new("serve.unit.starts", None)).collect(),
+            script_reads: Lock::new("serve.unit.script_reads", script::ReadBytes::default()),
             profiles: Default::default(),
             counted: (0..slots).map(|_| Default::default()).collect(),
             lint_profiles: Default::default(),
@@ -1514,6 +1688,9 @@ pub(crate) fn checks_only(goal: Goal, unit: &Unit) -> bool {
     match unit.mode {
         Mode::Check => true,
         Mode::Build if unit.target.is_custom_build() || unit.target.is_proc_macro() => false,
+        // A device unit's link is where its MSL is written (`UnitPlan::gpu_msl`), which a
+        // checked dependent's front end reads as a built one's does: under every goal.
+        Mode::Build if unit.for_device() => false,
         _ => goal == Goal::Check,
     }
 }
@@ -1531,8 +1708,8 @@ pub(crate) fn phases(goal: Goal, unit: &Unit) -> &'static [Phase] {
 /// taught by (`plane::Plane::push_program`), when `unit` builds a program its client runs: a
 /// binary, test, bench, example or `cdylib`. A build script and a proc macro are not: many
 /// and small, they are admitted as any compile. The same program of the same profile and
-/// platform has the same key in every build and daemon.
-pub(crate) fn program_key(unit: &Unit, phase: Phase) -> Option<blaze_graph::Key> {
+/// platform has the same key in every build and daemon. `asked`: [`codegen::asked`].
+pub(crate) fn program_key(unit: &Unit, asked: bool, phase: Phase) -> Option<blaze_graph::Key> {
     // A wasm proc macro's units run in the macro host, never as a program of the client's.
     if unit.target.is_custom_build()
         || unit.macro_wasm
@@ -1541,7 +1718,7 @@ pub(crate) fn program_key(unit: &Unit, phase: Phase) -> Option<blaze_graph::Key>
         return None;
     }
     if !matches!(
-        codegen::makes(unit),
+        codegen::makes(unit, asked),
         Ok(codegen::Makes::Executable | codegen::Makes::Shared { proc_macro: false })
     ) {
         return None;
@@ -1672,6 +1849,12 @@ impl Front<Real> for JobFront {
         say::refused(what, self.0.unit_of(unit).ok(), self.0.input.color)
     }
 
+    fn subject(&self, unit: usize) -> Option<(String, String)> {
+        let of = self.0.unit(unit).ok()?;
+        // alloc: a task span's names, once a phase task
+        Some((of.target.name.clone(), compile::span_unit(of)))
+    }
+
     fn script(&self, unit: usize, tags: u64) -> Result<UnitRuns, ApiError> {
         script::start(&self.0, unit, tags).map(UnitRuns::Script)
     }
@@ -1755,21 +1938,6 @@ impl Front<Real> for JobFront {
         let mut counted = writer.tables()?;
         counted.extend_from_slice(images);
         Ok(summed(counted))
-    }
-
-    fn pack(&self, mut writer: UnitWriter, program: &str) -> Result<Vec<u8>, Failed> {
-        if self.0.cancelled() {
-            return Err(Failed::Again);
-        }
-        if !writer.apply()? {
-            let what = "the pack is made with no task reading the front end, and one still does";
-            return Err(ApiError::new(what, None).into());
-        }
-        let Some(lowered) = Arc::get_mut(&mut writer.front) else {
-            let what = "the pack is made with no task reading the front end, and one still does";
-            return Err(ApiError::new(what, None).into());
-        };
-        cancellable(|| pack::pack(&self.0, lowered, program))?.map_err(Failed::Error)
     }
 
     fn doc(

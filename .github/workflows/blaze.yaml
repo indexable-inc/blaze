@@ -6,7 +6,8 @@
 # docs/harness.md ("CI").
 #
 #   pull request, merge queue (about 5 minutes): the unit tests and the build on Linux AArch64,
-#       `blaze check --workspace` with the release on Linux AArch64,
+#       `blaze check --workspace` and `blaze check --workspace --all-targets` (every crate's
+#       test targets type-check) with the release on Linux AArch64,
 #       the lint baselines (crates/blaze-lints/baselines) with the blaze the tree builds, on
 #       Linux AArch64,
 #       `harness/imports.py` and `harness/rustcsites.py`, actionlint over the workflows. No `blaze fmt --check`: fmt.yaml
@@ -79,16 +80,11 @@ jobs:
     outputs:
       tier: ${{ steps.files.outputs.tier }}
     steps:
-      # The script alone: the job decides in seconds, before a whole checkout. The two flecs
-      # manifests are for the pin check below.
+      # The script alone: the job decides in seconds, before a whole checkout.
       - uses: actions/checkout@v7
         with:
           sparse-checkout: |
             .github/scripts
-            vendor/flecs-c
-            crates/harness/vendor/hyperion-flecs-c
-      # blaze and harness build one flecs: the same indexable-inc/flecs rev in both manifests.
-      - run: python3 .github/scripts/flecs_pin.py
       - id: files
         env:
           GH_TOKEN: ${{ github.token }}
@@ -108,7 +104,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
       # The repository's Python workspace (pyproject.toml, uv.lock): its scripts lint and type-check.
-      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: '0.13.5'
           checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
@@ -118,6 +114,9 @@ jobs:
       # Some scripts ask rustc for the host when imported: after the toolchain is installed. In
       # the workspace's Python, which has its helpers (tools/typed-input) for the scripts that use them.
       - run: uv run --frozen python harness/imports.py
+      # The list of tests that may fail holds together and is as its recorder writes it, and the
+      # comparison and the recording do what they say on made-up results.
+      - run: uv run --frozen python harness/failures.py selftest
       # No new place in blaze's code starts rustc, rustdoc or cargo (docs/no-rustc.md).
       - run: python3 harness/rustcsites.py
       # The agent rules: tools/agents/rules.ts type-checks, and AGENTS.md and the rules in .agents/skills/*/SKILL.md are what it generates.
@@ -127,8 +126,11 @@ jobs:
       - run: bun site/node_modules/.bin/tsc -p tools/agents
       - run: bun tools/agents/rules.ts --check
       # Each doc says what it is, the current ones hold against the tree, and docs/README.md is
-      # their index (tools/docs.py).
-      - run: python3 tools/docs.py check
+      # their index (tools/docs.py). And no Python file is added: tools/python-allowed.txt lists
+      # the ones left and only shrinks (docs/v2/plan/design/scripts.md).
+      - run: |
+          python3 tools/docs.py selftest
+          python3 tools/docs.py check
       # The objectives ledger's rows are well formed and its table is current (harness/v2/ledger.py).
       - run: |
           uv run --frozen python harness/v2/ledger.py selftest
@@ -137,11 +139,29 @@ jobs:
       # against the daemon's rule, the smoke's edit on the fixture (harness/v2/budgets.py). Its
       # smoke, against the blaze a change builds, is blaze-platform.yaml's profile-gate job.
       - run: uv run --frozen python harness/v2/budgets.py selftest
+      # The smoke's guards (harness/v2/guards.py): each finding a bound is for, in miniature, is
+      # refused by its bound and the fixed state passes; the known list reads; a result with a
+      # guard missing is refused. And which packages a change touches (harness/v2/changed.py).
+      - run: |
+          uv run --frozen python harness/v2/guards.py selftest
+          uv run --frozen python harness/v2/changed.py selftest
       # Every stated invariant has a control beside it, and docs/v2/plan/invariants.md lists them
       # (harness/v2/invariants.py).
       - run: |
           uv run --frozen python harness/v2/invariants.py selftest
           uv run --frozen python harness/v2/invariants.py '{"command": "check"}'
+      # blaze-diff's Rust tables and the Lean ones the proofs are about are what
+      # crates/blaze-diff/rules.json generates (harness/v2/diff_rules.py).
+      - run: |
+          uv run --frozen python harness/v2/diff_rules.py selftest
+          uv run --frozen python harness/v2/diff_rules.py '{"command": "check"}'
+      # The Lean proofs, as far as no Lean is needed (harness/v2/lean_gate.py): the list of
+      # theorems (lean/theorems.json) names statements that are there, no source says `sorry`,
+      # `native_decide`, `axiom` or `partial def`, lean/analysis's manifest is checked in at the
+      # pinned Mathlib, and docs/v2/plan/proofs.md is current. The `lean` job builds them.
+      - run: |
+          uv run --frozen python harness/v2/lean_gate.py selftest
+          uv run --frozen python harness/v2/lean_gate.py '{"command": "sources"}'
       # Each hash domain in crates/ is written once outside tests (tools/v2/domains.py).
       - run: |
           uv run --frozen python tools/v2/domains.py '{"root": "."}'
@@ -154,6 +174,60 @@ jobs:
           if [ "$(git show FETCH_HEAD:crates/blaze-profile/src/schema.rs | version)" != "$(version crates/blaze-profile/src/schema.rs)" ]; then
             uv run --frozen python .github/scripts/explore_page.py '{}'
           fi
+
+  # The Lean proofs hold (rule verified-compiler; harness/v2/lean_gate.py, docs/v2/plan/proofs.md):
+  # with the Lean lean/lean-toolchain pins, `lake build` of lean/ (core Lean: the semantics of
+  # MIR, the proved passes, the models and their proofs) and of lean/analysis (the derivative
+  # proofs, on Mathlib's prebuilt files from `lake exe cache get`: Mathlib is never compiled);
+  # no declaration uses `sorry`; and each theorem of lean/theorems.json exists and rests on no
+  # axiom but `propext`, `Classical.choice` and `Quot.sound` (`#print axioms`). On every change:
+  # a proof is about the Rust beside it (the embedded bodies, the rule table), so no list of
+  # paths says when it need not run. elan is the release binary, checked by its sha256; it and
+  # Mathlib's files are cached by the toolchain and lean/analysis's pins, and lean/'s own build
+  # by its sources. About 4 minutes from the caches and about 15 without (not yet measured).
+  lean:
+    name: lean proofs
+    runs-on: [ix, arm64]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.5'
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          enable-cache: false
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.elan
+            lean/analysis/.lake
+          key: lean-${{ runner.arch }}-${{ hashFiles('lean/lean-toolchain', 'lean/analysis/lakefile.toml', 'lean/analysis/lake-manifest.json') }}
+      - uses: actions/cache@v6
+        with:
+          path: lean/.lake
+          key: lean-core-${{ runner.arch }}-${{ hashFiles('lean/lean-toolchain') }}-${{ hashFiles('lean/**/*.lean', 'crates/*/lean/**/*.lean', 'lean/lakefile.toml') }}
+          restore-keys: lean-core-${{ runner.arch }}-${{ hashFiles('lean/lean-toolchain') }}-
+      # The release binary of elan, checked by its sha256, then the toolchain lean/lean-toolchain
+      # pins. The gate names that toolchain's `lake` by its path, never PATH.
+      - name: elan 4.2.4 and the pinned Lean
+        run: |
+          pin=$(cat lean/lean-toolchain)
+          lake="$HOME/.elan/toolchains/$(echo "$pin" | sed 's|/|--|g; s|:|---|g')/bin/lake"
+          if [ ! -x "$lake" ]; then
+            case "$RUNNER_ARCH" in
+              ARM64) arch=aarch64 sum=05febd124d84ebf994b2e7479922a5650b1e950c17ae3bd1ddd776b65bb72bf9 ;;
+              *) echo "::error::no pinned elan for $RUNNER_ARCH"; exit 1 ;;
+            esac
+            tgz="$RUNNER_TEMP/elan.tar.gz"
+            curl -fsSL --retry 3 -o "$tgz" "https://github.com/leanprover/elan/releases/download/v4.2.4/elan-$arch-unknown-linux-gnu.tar.gz"
+            echo "$sum  $tgz" | sha256sum -c -
+            tar -xzf "$tgz" -C "$RUNNER_TEMP" elan-init
+            "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-toolchain none
+            "$HOME/.elan/bin/elan" toolchain install "$pin"
+          fi
+          "$lake" --version
+      - run: |
+          uv run --frozen python harness/v2/lean_gate.py '{"command": "check"}'
 
   # Every workflow parses and holds together (actionlint): a workflow whose YAML does not parse
   # fails on push with no jobs and says so nowhere (release.yaml, promote.yaml and yank.yaml after
@@ -317,7 +391,33 @@ jobs:
         with:
           job: check
           llvm: true
+      # The fast tier: the packages the change touches and those that depend on them, each
+      # after what it needs (harness/v2/changed.py), checked before the workspace, so a change's
+      # first compile error comes in minutes and names the earliest cause. What it checks the
+      # workspace check below finds checked. Against the base itself: the checkout is shallow.
+      - name: blaze check of the packages this change touches
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          if [ -z "$BASE" ] || ! git fetch -q --depth=1 origin "$BASE"; then
+            echo "no base to compare with: the workspace check below is the check"; exit 0
+          fi
+          args=$(PYTHONPATH=tools/typed-input/src python3 harness/v2/changed.py "{\"base\": \"$BASE\", \"direct\": true, \"print\": \"args\"}")
+          if [ -z "$args" ] || [ "$args" = --workspace ]; then
+            echo "nothing narrower than the workspace to check first: ${args:-no package changed}"; exit 0
+          fi
+          echo "blaze check $args --lib --tests"
+          # shellcheck disable=SC2086
+          blaze check $args --lib --tests --message-format short
       - run: blaze check --workspace --message-format short
+      # Every target, the test targets among them: a test that no longer type-checks against
+      # the code it tests fails here, in every crate, where the unit tests job compiles the test
+      # targets of harness/unittests.py's CRATES alone (2026-11-09: blaze-cas's place_race.rs and
+      # hir-ty-mir's tests/consteval/comptime.rs did not compile on main). A step of its own,
+      # after the libraries', so the log says which of the two failed; what the first checked
+      # is not checked again.
+      - name: blaze check --workspace --all-targets (the test targets compile)
+        run: blaze check --workspace --all-targets --message-format short
       # astlog's rules (tools/astlog/rules) over the crates and tools, each file on its own: a
       # finding of an error rule fails the job (tools/astlog/README.md#rules-in-blaze).
       - run: blaze build -p astlog
@@ -370,7 +470,7 @@ jobs:
 
   ci:
     name: ci
-    needs: [changes, scripts, workflows, linux-arm64, linux-6-8, macos, workspace-check]  # lint-baselines joins once the first baselines exist (blaze check --workspace crashes today)
+    needs: [changes, scripts, workflows, lean, linux-arm64, linux-6-8, macos, workspace-check]  # lint-baselines joins once the first baselines exist (blaze check --workspace crashes today)
     if: always()
     runs-on: [ix, arm64]
     timeout-minutes: 5
@@ -380,3 +480,26 @@ jobs:
         run: |
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"'
           ! echo "$NEEDS" | jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' > /dev/null
+      # The budget smoke's guards ran and held (harness/v2/guards.py, `held`): a tier that builds
+      # blaze has the smoke's result, with an outcome that passed for every bound of every step
+      # of both fixtures and for the sandbox's probe. A job that was skipped passes the step
+      # above; a smoke that did not run, or dropped a guard, fails this one. A gate run that
+      # did not run the smoke is red (docs/harness.md, "The smoke's guards").
+      - if: needs.changes.outputs.tier != 'none'
+        uses: actions/checkout@v7
+      - if: needs.changes.outputs.tier != 'none'
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.5'
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          enable-cache: false
+      - if: needs.changes.outputs.tier != 'none'
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: budgets-smoke-linux-arm64
+          path: ${{ runner.temp }}/budgets-smoke
+      - name: the budget smoke's guards ran and held
+        if: needs.changes.outputs.tier != 'none'
+        run: |
+          uv run --frozen --no-dev python harness/v2/guards.py "{\"command\": \"held\", \"result\": \"$RUNNER_TEMP/budgets-smoke/budgets-smoke.json\"}"

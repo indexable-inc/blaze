@@ -130,10 +130,13 @@ pub enum KernelUp {
     Places { req: u64, query: String, latitude: f64, longitude: f64, radius_m: f64, limit: u32 },
 }
 
-/// One place Apple Maps found: its name, where it is (degrees), its address in one line, and what Maps knows of its
+/// One place Apple Maps found: its identity in Apple Maps (`id`, `MKMapItem.identifier`: what a Map's marker names as
+/// `place` to show Apple's own card of it; empty when Maps gives none), its name, where it is (degrees), its address in one line, and what Maps knows of its
 /// phone, its own page and its kind (`Cafe`, `Restaurant`, ...), each empty when Maps has none.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Place {
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub latitude: f64,
     pub longitude: f64,

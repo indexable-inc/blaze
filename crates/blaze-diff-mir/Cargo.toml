@@ -1,0 +1,41 @@
+[package]
+name = "blaze-diff-mir"
+description = "Symbolic derivatives of pure functions (docs/future/autodiff.md, layer 2): lifting a function's monomorphized MIR to blaze-diff's expression graph, lowering a graph back to a MIR body, and `#[blaze::differentiable(symbolic)]`'s derivative body"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The expression graph, the derivative rules, the simplifier and the printer.
+blaze-diff.workspace = true
+# A lowered body's (empty) upvar map.
+blaze-hash.workspace = true
+
+la-arena.workspace = true
+rustc_type_ir.workspace = true
+
+base-db.workspace = true
+hir-def.workspace = true
+hir-expand.workspace = true
+hir-ty.workspace = true
+# MIR, its runtime bodies and where a span is written.
+hir-ty-mir.workspace = true
+# `#[blaze::pure]`'s proof, which `#[blaze::differentiable(symbolic)]` requires.
+hir-ty-pure.workspace = true
+intern.workspace = true
+
+[dev-dependencies]
+blaze-query.workspace = true
+hegeltest.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
+
+[lints]
+workspace = true

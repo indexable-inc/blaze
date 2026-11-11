@@ -138,3 +138,22 @@ pub(super) fn execve(argv: &Strings<'_>, env: &Strings<'_>) {
     // which the kernel refuses (EFAULT). Nothing is written through them.
     unsafe { libc::execve(argv.pointers[0], argv.pointers.as_ptr(), env.pointers.as_ptr()) };
 }
+
+#[cfg(test)]
+mod tests {
+    /// The build-script sandbox rests on the private `sandbox_init_with_parameters` (rule
+    /// macos-private-apis; docs/macos.md, "Sandbox"): it resolves at run time, so a macOS
+    /// that drops it fails here naming it, not at the first build script.
+    #[test]
+    fn sandbox_init_with_parameters_is_in_libsystem() {
+        // SAFETY: `dlsym` reads the nul-terminated name and returns an address or null; nothing
+        // is called through it.
+        let found =
+            unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"sandbox_init_with_parameters".as_ptr()) };
+        assert!(
+            !found.is_null(),
+            "libSystem has no `sandbox_init_with_parameters`, which every sandboxed build \
+             script and proc macro is started through on macOS; there is no other sandbox"
+        );
+    }
+}

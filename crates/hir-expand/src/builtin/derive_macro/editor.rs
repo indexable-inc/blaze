@@ -563,6 +563,13 @@ pub(super) fn coerce_pointee_derive<'f>(
             ast::Type::UnsafeBinderType(ty) => ty
                 .ty()
                 .is_some_and(|ty| substitute_type_in_bound(editor, ty, param_name, replacement)),
+            // blaze's record type (`#![blaze::records]`): its fields' types.
+            ast::Type::RecordType(ty) => {
+                let fields = ty.record_field_list().into_iter().flat_map(|list| list.fields());
+                any_long(fields.filter_map(|field| field.ty()), |ty| {
+                    substitute_type_in_bound(editor, ty, param_name, replacement)
+                })
+            }
             ast::Type::InferType(_) | ast::Type::MacroType(_) | ast::Type::NeverType(_) => false,
         };
 

@@ -37,6 +37,7 @@ mod path;
 pub mod persist;
 mod place_op;
 pub mod prelude_lints;
+mod record;
 mod sized_bound;
 pub(crate) mod unify;
 
@@ -123,6 +124,7 @@ use crate::{
 };
 
 pub use coerce::could_coerce;
+pub use record::RecordProblem;
 pub use unify::{could_unify, could_unify_deeply};
 
 use cast::{CastCheck, CastError, CastPointers};
@@ -477,6 +479,14 @@ pub enum InferenceDiagnostic {
         pat: PatId,
         #[type_visitable(ignore)]
         variant: VariantId,
+    },
+    /// The record value `{ a: 1, .. }` or record pattern `{ a, .. }` at `node` (blaze,
+    /// `#![blaze::records]`) refused for `problem`.
+    RecordRefused {
+        #[type_visitable(ignore)]
+        node: ExprOrPatIdPacked,
+        #[type_visitable(ignore)]
+        problem: RecordProblem,
     },
     UnionPatMustHaveExactlyOneField {
         #[type_visitable(ignore)]
@@ -2515,6 +2525,10 @@ pub(crate) struct InferenceContext<'db, 'f> {
     param_top_pat: Option<PatId>,
     /// What [`InferenceContext::record_trait_pick`] recorded, each pair once.
     traits_in_scope_used: Vec<(ExprOrPatId, TraitId), &'f Frame>,
+    /// The record values (`#![blaze::records]`) that are an argument of a call to a function
+    /// by name, each with that function and the index of the parameter it is the argument of
+    /// (`self` first): where `{ a: 1, .. }` takes the defaults of the fields it leaves out.
+    record_callees: Vec<(ExprId, FunctionId, u32), &'f Frame>,
     /// The goals set aside as stalled on a coroutine of the body, resolved at writeback.
     coroutine_stalled: Vec<(Span, StoredPredicate), &'f Frame>,
     /// The named undecided pattern types of the bodies merged into this one.
@@ -2652,6 +2666,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             unreachable: Vec::new_in(frame),
             param_top_pat: None,
             traits_in_scope_used: Vec::new_in(frame),
+            record_callees: Vec::new_in(frame),
             coroutine_stalled: Vec::new_in(frame),
             named_pat_types: Vec::new_in(frame),
             breakables: Vec::new_in(frame),

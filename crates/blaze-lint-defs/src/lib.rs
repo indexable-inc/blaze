@@ -28,6 +28,7 @@ mod index;
 mod lints;
 mod names;
 mod options;
+pub mod ready;
 mod set;
 
 use std::sync::OnceLock;

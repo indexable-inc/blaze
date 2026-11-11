@@ -72,8 +72,8 @@ pub const STARTED_WITH: &[&str] = &[
     "BLAZE_DUMP_TIER",
     "BLAZE_DUMP_LLVM",
     "BLAZE_FN_CACHE_TRACE",
-    // The prover of `ensures` proofs (hir-ty-verus).
-    "BLAZE_Z3",
+    // The Lean that checks proofs (hir-ty-lean).
+    "BLAZE_LEAN_PROVER",
     // blaze-alloc-count's tracing (`OnceLock`).
     "BLAZE_ALLOC_TRACE",
 ];

@@ -431,6 +431,34 @@ pub enum FetchKind {
     Local { probe: bool },
 }
 
+impl Fetch {
+    /// `self` added to `needs`, what one load step asks the daemon to fetch, once per place:
+    /// every package of one git repository at one commit is in its one checkout, and every
+    /// package of one sparse registry reads its one `config.json`, so they ask for one fetch,
+    /// as the daemon fetches and mounts each place once (and refuses a place asked twice).
+    /// Two different fetches for one place is a key that misses an input, refused naming both.
+    pub(crate) fn ask_once(self, needs: &mut Vec<Fetch>) -> anyhow::Result<()> {
+        match needs.iter().find(|it| it.at == self.at) {
+            None => {
+                needs.push(self);
+                Ok(())
+            }
+            Some(asked) if *asked == self => Ok(()),
+            Some(asked) => Err(anyhow::anyhow!(
+                "the load asks for two different fetches at `{}`, {} from `{}` ({:?}) and {} from \
+                 `{}` ({:?}), and one place holds one source",
+                self.at,
+                asked.what,
+                asked.url,
+                asked.kind,
+                self.what,
+                self.url,
+                self.kind
+            )),
+        }
+    }
+}
+
 /// What cargo says when it can't: its message with its causes (`error: ...`, then
 /// `Caused by:` and each cause indented, as cargo prints an error), and where.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -591,6 +619,13 @@ pub struct UnitPlan {
     /// host's bridge (`proc_macro_bridge`), and a proc macro's links as a WASI reactor the host
     /// loads.
     pub macro_wasm: bool,
+    /// The MSL file the unit writes, absolute, when it is the device build of an
+    /// `artifact = "gpu"` dependency ([`crate::schema::UnitDep::gpu`]): its crate's `GPU_ENTRIES`
+    /// lowered by blaze-shader, validated by naga. Its dependents are given it in
+    /// `BLAZE_GPU_MSL_<CRATE>`. It is among [`UnitPlan::outputs`], beside the library's own
+    /// (another device crate may use it as a library); the front end alone builds the unit, so
+    /// none of them is native code, and no host unit links it.
+    pub gpu_msl: Option<String>,
 }
 
 /// What `check` lints a crate with beyond its compile, as cargo-clippy gives clippy's driver;

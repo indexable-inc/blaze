@@ -6,8 +6,8 @@ A script makes a `Report`, adds an `Outcome` for each thing it checked, and ends
     pass        what was checked holds
     fail        it does not: a finding about the compiler (a wrong program, a stale result,
                 a budget missed, a build that is not byte for byte the same)
-    unmeasured  the engine has no answer to it (`engine.Unmeasurable`): allowed for v1, whose
-                run sets the bar; a failure for v2, which has to measure everything
+    unmeasured  the engine has no answer to it (`engine.Unmeasurable`): a failure, as blaze
+                has to measure everything
     error       the harness could not check it (`engine.Failed`: a command that timed out,
                 an answer of the engine it could not read)
 
@@ -102,9 +102,7 @@ class Report:
         return None
 
     def failing(self) -> list[Outcome]:
-        bad: set[Verdict] = {"fail", "error"}
-        if self.engine.kind == "v2":
-            bad.add("unmeasured")
+        bad: set[Verdict] = {"fail", "error", "unmeasured"}
         return [o for o in self.outcomes if o.verdict in bad]
 
     def finish(self) -> NoReturn:

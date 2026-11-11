@@ -33,7 +33,7 @@ pub use crate::{
     content::{CFG_OPTIONS_DOMAIN, InputId, cfg_options_content},
     crate_attrs::{
         CRATE_ATTR_FILE_NAME, CrateAttrError, applied_crate_attr_files, crate_attr_error,
-        crate_attr_files, crate_attr_owner,
+        crate_attr_files, crate_attr_owner, crate_extensions,
     },
     db::{Db, Reader, RunOrder, Shared, executions, set_run_order},
     editioned_file_id::EditionedFileId,
@@ -453,6 +453,9 @@ impl IncludedFile {
     /// The file at `path` read from disk now, as the front end reads a file outside the VFS
     /// ([`Files::included_file`] reads the path its view has it at).
     pub fn read_now(path: &std::path::Path) -> Result<std::sync::Arc<[u8]>, ReadError> {
+        // Read from the disk every time, and counted as a look at it: no watch vouches for
+        // the file (`blaze_vfs::outside::looks`).
+        blaze_vfs::outside::looked(path);
         std::fs::read(path).map(Into::into).map_err(|it| ReadError::of(&it))
     }
 

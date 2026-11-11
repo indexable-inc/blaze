@@ -219,6 +219,7 @@ impl Files {
         };
         let (a, b) = (pass(0x243f_6a88_85a3_08d3), pass(0x1319_8a2e_0370_7344));
         let mut id = [0; 32];
+        // identity: two seeded passes over one path's bytes mixed into one key of a table that never leaves the process and compares the path on each find; not the identity of a set
         for (at, word) in [a, b, mix(a ^ b), mix(a.wrapping_add(b))].into_iter().enumerate() {
             id[at * 8..at * 8 + 8].copy_from_slice(&word.to_le_bytes());
         }
@@ -244,6 +245,10 @@ impl Files {
             return Ok(answer);
         }
         let generation = self.dirs.generation();
+        // No watch vouched for the answer kept, or none was kept: the disk is looked at, and
+        // counted, so a stretch of checks that looked at nothing can be told
+        // (`blaze_vfs::outside::looks`).
+        blaze_vfs::outside::looked(path);
         let (answer, settled) = self.look(path)?;
         if settled {
             match (known, found) {
@@ -329,6 +334,8 @@ impl Files {
         if path.file_name().is_some_and(|it| it.to_str().is_none()) {
             return Err(refused("its name is not UTF-8, which no view holds"));
         }
+        // Looked at on the disk every time: no watch vouches for an entry.
+        blaze_vfs::outside::looked(path);
         let meta = match std::fs::symlink_metadata(path) {
             Ok(meta) => meta,
             Err(error) if missing(&error) => return Ok(Entry::Missing),
@@ -488,6 +495,8 @@ impl Inputs for Now<'_> {
         // alloc: error path
         let unreadable =
             |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
+        // Listed on the disk every time: no watch vouches for a listing.
+        blaze_vfs::outside::looked(path);
         let entries = match std::fs::read_dir(path) {
             Ok(entries) => entries,
             Err(error) if missing(&error) => return Ok(false),

@@ -104,6 +104,7 @@ fn sample() {
     let mut entries = entries();
     loop {
         let Some(slab) = entries.as_mut().filter(|slab| slab.iter().any(|(_, it)| !it.done)) else {
+            // wakes: a new `Watch` notifies `SAMPLER.wake`; with none to sample the sampler has nothing to do
             SAMPLER.wake.wait(&mut entries);
             continue;
         };

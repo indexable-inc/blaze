@@ -699,6 +699,7 @@ Type =
 | RefType
 | SliceType
 | TupleType
+| RecordType
 | UnsafeBinderType
 
 ParenType =
@@ -743,6 +744,11 @@ UnsafeBinderType =
 
 PatternType =
   'builtin' '#' 'pattern_type' '(' Type 'is' Pat ')'
+
+// `{ a: T, b: U = default }`, blaze's record types (`#![blaze::records]`); a field's
+// default is read only in a function parameter.
+RecordType =
+  RecordFieldList
 
 ImplTraitType =
   'impl' TypeBoundList

@@ -12,16 +12,9 @@ syntax-tree started as rowan 0.17.0 (MIT/Apache-2.0); its license texts are in c
 Hegel (MIT), copyright Antithesis, LLC: vendor/hegeltest, vendor/hegeltest-macros and
 vendor/hegeltest-c, used only by blaze's tests; the license text is in each of those directories.
 
-Verus (MIT), copyright the Verus contributors: vendor/verus (air, vir, vir_macros, builtin, vstd),
-used by crates/hir-ty-verus; the license text is vendor/verus/LICENSE and vendor/verus/SOURCE.md
-says what blaze changed. The parser's Verus syntax follows verus-analyzer's grammar (MIT OR
-Apache-2.0), copyright the verus-analyzer and rust-analyzer developers.
-
-flecs-c (MIT), copyright Andrew Gazelka: vendor/flecs-c, from indexable-inc/flecs-opinionated
-(vendor/flecs-c/SOURCE.md says what blaze changed); the license text is vendor/flecs-c/LICENSE.
-Flecs (MIT), copyright Sander Mertens, is not copied in: vendor/flecs-c compiles it into blaze-web
-from the indexable-inc/flecs fork at the rev pinned in vendor/flecs-c/Cargo.toml, the same rev as
-harness's below; its license text is the fork's LICENSE.
+The parser's specification clauses (crates/parser/src/grammar/verify.rs) follow Verus's syntax
+(MIT, copyright the Verus contributors) as verus-analyzer's grammar has it (MIT OR Apache-2.0,
+copyright the verus-analyzer and rust-analyzer developers).
 
 harness (crates/harness, its own cargo workspace; crates/harness/README.md) carries its own
 licenses: its crates say theirs in their Cargo.toml. Third-party code and data it vendors:

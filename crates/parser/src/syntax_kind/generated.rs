@@ -355,6 +355,9 @@ pub enum SyntaxKind {
     RECOMMENDS_KW,
     REQUIRES_KW,
     SPEC_CLAUSE,
+    // blaze's record types (`#![blaze::records]`, docs/v2/plan/design/records.md), after the
+    // others too.
+    RECORD_TYPE,
     #[doc(hidden)]
     __LAST,
 }
@@ -474,6 +477,7 @@ impl SyntaxKind {
             | UNSAFE_BINDER_CAST_EXPR
             | UNSAFE_BINDER_TYPE
             | SPEC_CLAUSE
+            | RECORD_TYPE
             | OR_PAT
             | PARAM
             | PARAM_LIST

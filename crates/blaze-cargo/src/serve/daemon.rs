@@ -69,6 +69,11 @@ const OUTSIDE_END: u64 = OUTSIDE + blaze_vfs::outside::TAGS;
 /// The shared standard library's store ([`Options::std`]).
 const STD_STORE: u64 = 8 << 32;
 const STD_STORE_END: u64 = 9 << 32;
+/// The reads the store's buffer pool loads its pages with (`blaze_cas::Config::load_tags`), and
+/// the shared standard library's store's.
+const LOADS: u64 = 9 << 32;
+const STD_LOADS: u64 = 10 << 32;
+const STD_LOADS_END: u64 = 11 << 32;
 const WATCHERS: u64 = 1 << 40;
 const RUNS: u64 = 1 << 50;
 const RUNS_END: u64 = 1 << 62;
@@ -85,7 +90,8 @@ const UNLINK: Tag = Tag(OWN + 7);
 const HANG_UP: Tag = Tag(OWN + 8);
 /// A stall's trace, written once: the daemon stops after it.
 const STALL: Tag = Tag(OWN + 9);
-/// The image's write and its map ([`Images`]).
+/// The image's placing (its clone, writes, sync and rename, one in flight at a time) and its
+/// map ([`Images`]).
 const IMAGE: u64 = OWN + 10;
 /// The watch of the system's memory pressure ([`Effect::Pressure`], [`Daemon::pressure`]),
 /// after the image's two.
@@ -94,15 +100,37 @@ const PRESSURE: Tag = Tag(OWN + 12);
 /// How long a stop waits for the driver's last effects once it hung up: past it, the
 /// connections still sending are hung up on ([`Server::abandon`]) and named in a warning.
 pub(super) const LAST_EFFECTS: Duration = Duration::from_secs(2);
+
+/// How long a stop waits for what answered builds left to settle (a kept front end being
+/// stored, puts the store has not made durable) before it goes on without it, saying each as
+/// a loss (bounded-progress). A build's answer does not wait for these; a stop does, so a
+/// `blaze stop` after an answer loses none of it.
+pub(super) const STOP_SETTLES_WITHIN: Duration = Duration::from_secs(30);
+
+/// How many quiet turns after the last request was read the work between requests waits for
+/// (the collections, the settle's image, whose making is a pass over the whole database on
+/// the loop's thread: 65 to 137 ms on a small program, 2026-11-10). A quiet turn took no
+/// completion with no plane task running: the loop's idle poll, 50 ms each, so about half a
+/// second. Counted in turns, not on the clock, so it is the same under the simulation, whose
+/// clock stands still while nothing is in flight. Requests come in runs (an edit, a build, a
+/// build again): a request read while that work ran waited behind it, 130 ms for an answer
+/// that takes 0.1 ms. The work is for the next start and for memory, never for a request, so
+/// it runs once the daemon has been quiet this long, and not at all while a request is read
+/// and held for its checkout's watcher.
+pub(super) const QUIET_BEFORE_BETWEEN: u32 = 10;
 /// How often the plane's and the memory's plots are written to the flight recorder, at most.
 const PLOT_EVERY: Duration = Duration::from_millis(10);
 /// How often the memory by tag goes to the log while the daemon works, at most.
 const MEMORY_LOG_EVERY: Duration = Duration::from_secs(30);
-/// How often, at most, the daemon past its limit's line asks every thread to give back the free
-/// pages its heaps keep (`blaze_mem::tag::give_back_heap`), between releases or with none due
-/// (a check's build releases nothing): a forced collect of each thread's heaps costs it a walk
-/// of their pages, so not at every plot.
+/// How often, at most, the daemon past its limit's line, past [`KEPT_HIGH_WATER`] or pressed
+/// asks the purger for a purge (`crate::raw::memory::Purger::ask`), between releases or with
+/// none due (a check's build releases nothing): a forced collect of each thread's heaps costs
+/// it a walk of their pages, so not at every plot.
 const GIVE_BACK_EVERY: Duration = Duration::from_secs(1);
+/// The share of the budget past which the allocators' kept free pages
+/// ([`blaze_graph::arena::kept_of`]) get a purge whatever the footprint: one in 4. Freed pages
+/// kept past it are memory admission cannot grant and the ceiling counts.
+const KEPT_HIGH_WATER: u64 = 4;
 /// How often, at most, the daemon looks for builds held back for memory to tell their clients
 /// ([`Jobs::tell_paused`]): a quarter of the second a build waits before it is told.
 const PAUSED_EVERY: Duration = Duration::from_millis(250);
@@ -492,6 +520,17 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// What the stop hung up on when [`LAST_EFFECTS`] passed with replies still being sent.
     abandoned: Option<Abandoned>,
     settling: bool,
+    /// A stop waits for what answered builds left to settle (their kept front ends stored,
+    /// their puts durable) before its image: since when on the driver's clock, and the span
+    /// naming the wait ([`Daemon::stop`], bounded by [`STOP_SETTLES_WITHIN`]).
+    stop_settles: Option<(Duration, tracing::Span)>,
+    /// Each request read and not yet told it is done, with its `request: read to reply` span
+    /// ([`Daemon::arrive`], [`Daemon::reply`]); a connection's go as it ends.
+    answering: Vec<(RequestRef, tracing::Span)>,
+    /// How many turns in a row, since a request was last read, took no completion with no
+    /// plane task running: the work between requests waits for [`QUIET_BEFORE_BETWEEN`] of
+    /// them ([`Daemon::between`]).
+    quiet_turns: u32,
     failed: Option<Failed>,
     /// Its place in the machine's memory ledger ([`Options::machine`]); held so it leaves as the
     /// daemon drops, and turned only where there is a ledger (native unix).
@@ -533,6 +572,9 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// `settled` and `job_effects`, and the turns it finished. The stop's guard reads it while
     /// the loop may be stuck inside the stop, or inside any turn.
     pulse: Arc<Pulse>,
+    /// The top stall's line as the guard last said it ([`Pulse::take_stall`]), the loop's own
+    /// copy: taken from the guard's queue once a look at the builds, with no lock.
+    stall: Option<String>,
     /// The effects that end on their own that ended ([`ends_alone`]: writes, reads and runs,
     /// never a client's connect or request, which a stuck daemon still takes).
     completions: u64,
@@ -1185,7 +1227,13 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             effects.push(Effect::Connect { at: Address::Unix(socket.clone()), tag: DIAL });
         }
         let store_config =
-            blaze_cas::Config { dir: under(&state, "store"), layers: Vec::new(), tags: STORE };
+            blaze_cas::Config {
+                dir: under(&state, "store"),
+                layers: Vec::new(),
+                tags: STORE,
+                load_tags: LOADS,
+                loader: blaze_cas::Loader::Thread,
+            };
         let mut store = Store::open(store_config, &mut effects);
         store.encode_columns(blaze_format::Spans::columns());
         store.encode_columns(hir_def::item_tree::ItemTree::columns());
@@ -1193,6 +1241,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             root: under(&options.std, "store"),
             writer: options.writer,
             tags: STD_STORE,
+            load_tags: STD_LOADS,
+            loader: blaze_cas::Loader::Thread,
         };
         let mut std = Store::open_shared(shared, &mut effects);
         let mut read =
@@ -1294,6 +1344,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let macros =
             blaze_macro_eval::Macros::new(proc_macro_api::kept::Keeps::In(keeping), Some(sources));
         let mapping = read.image.flatten();
+        // The image's file as it is on disk, for the next image to share its blocks
+        // ([`Images::new`]).
+        // clone: a count of the mapping, once a start.
+        let on_disk = mapping.clone();
         let mut started = Started::default();
         // clone: a count of the mapping, shared by the VFS and the image the rest read.
         let opened = match mapping.clone().map(|it| opening(Image::open(it))).transpose() {
@@ -1419,7 +1473,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         if let Some(machine) = &mut machine {
             plane.poll(driver.now());
             if let Some(bytes) =
-                machine.turn(driver.now(), &mut plane).map_err(|why| format!("{why:#}"))?
+                machine.first_turn(driver.now(), &mut plane).map_err(|why| format!("{why:#}"))?
             {
                 blaze_graph::admission::set_budgets(bytes);
             }
@@ -1494,7 +1548,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             plane,
             mounts,
             heads: Heads::new(FLUSHES, WATCHERS, RUNS, Outside::new(options.outside, "/", OUTSIDE)),
-            images: Images::new(image, IMAGE),
+            images: Images::new(image, IMAGE, on_disk),
             jobs,
             steps,
             replies: Vec::new(),
@@ -1506,6 +1560,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             changed_since_settle: false,
             abandoned: None,
             settling: false,
+            stop_settles: None,
+            answering: Vec::new(), // alloc: none until a request
+            quiet_turns: 0,
             failed: None,
             machine,
             pid: std::process::id(),
@@ -1523,6 +1580,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             job_effects: 0,
             working: 0,
             pulse: Arc::default(), // alloc: once a daemon
+            stall: None,
             completions: 0,
             plotted: Duration::ZERO,
             broken_down: Duration::ZERO,
@@ -1635,7 +1693,19 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// Whether no job runs and the database has settled onto the image of its last cold
     /// build.
     pub fn settled(&self) -> bool {
-        self.jobs.idle() && !self.jobs.cold && !self.settling
+        self.jobs.quiet() && !self.jobs.cold && !self.settling
+    }
+
+    /// How many answered jobs still have something settling: a kept front end being stored,
+    /// or puts the store has not made durable yet (`Jobs::settling`).
+    pub fn jobs_settling(&self) -> usize {
+        self.jobs.settling()
+    }
+
+    /// The last of what answered jobs left to settle that was not kept, oldest first
+    /// (`Jobs::lost`): each was said in the daemon's log and is a bug in `blaze status`.
+    pub fn lost(&self) -> &[super::job::Lost] {
+        self.jobs.lost()
     }
 
     pub fn vfs(&self) -> &Vfs {
@@ -1749,17 +1819,39 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.observe.stop(&mut replies);
         self.send(replies);
         self.heads.stop(&mut self.effects);
+        // What answered builds left to settle first: the image is of the daemon with every
+        // kept front end back, and the stop's flush then takes what their stores put.
+        let left = self.jobs.settling();
+        if left > 0 {
+            let span = tracing::info_span!(
+                target: "blaze",
+                "the stop waits for what answered builds left to settle",
+                left,
+            );
+            self.stop_settles = Some((self.driver.now(), span));
+            self.store.flush(&mut self.effects);
+            return;
+        }
+        self.stop_image();
+    }
+
+    /// The stop's image asked and every store flushed, once nothing answered builds left is
+    /// still settling ([`Daemon::stop`]).
+    fn stop_image(&mut self) {
         // A settle image asked with nothing changed since is the daemon as it is now: the stop
         // waits for it ([`Images::done`]) rather than makes the same image again after it.
         if !(self.settling && !self.changed_since_settle) {
-            self.ask_image();
+            self.ask_image(true);
         }
         self.store.flush(&mut self.effects);
         self.std.flush(&mut self.effects);
         self.vfs.flush(&mut self.effects);
     }
 
-    fn ask_image(&mut self) {
+    /// Asks for an image of the daemon as it is now. `waited`: someone waits for it (the
+    /// stop), so no request lets go of it; the settle's, asked between requests, is let go
+    /// when one comes ([`Daemon::let_go_of_image`]).
+    fn ask_image(&mut self, waited: bool) {
         let front = self.jobs.front_db();
         let parts = Parts {
             db: &self.db,
@@ -1768,7 +1860,23 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             predict: self.plane.predict(),
             effects: &mut self.effects,
         };
-        self.images.ask(parts);
+        match waited {
+            true => self.images.ask(parts),
+            false => self.images.ask_between(parts),
+        }
+    }
+
+    /// A request is under way while the settle's image is being written: the image is let go
+    /// ([`Images::let_go`]), so the request shares neither the disk nor the loop with it, and
+    /// asked again once the daemon is idle (`between`). The database stays as it is until
+    /// that image is mapped.
+    fn let_go_of_image(&mut self) {
+        // A request read and held for its checkout's watcher is a request under way too.
+        let asked = !self.jobs.idle() || self.heads.waiting() > 0;
+        if self.stopping.is_none() && asked && self.images.let_go() {
+            self.jobs.cold = true;
+            self.settling = false;
+        }
     }
 
     /// One turn of the loop: what is asked submitted, what completed taken, the plane and the
@@ -1820,25 +1928,77 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             let driver = &mut self.driver;
             blaze_graph::wait::wait(woken.on(), None, || driver.poll(&mut done, until));
         }
+        self.turn_after_wait(done)
+    }
+
+    /// What a turn does once its wait ended, with the completions the wait gave: everything of
+    /// a turn but the loop's one wait (`turn_untagged`'s `Driver::poll`).
+    ///
+    /// The rule: the daemon's loop thread waits in one place, the driver's poll, and nothing
+    /// else it runs may block; work that blocks (a file read or written, a lock another thread
+    /// holds for long, a channel with a bound, a child awaited) is an effect the driver carries
+    /// out or a plane task on a worker. `#[blaze::nonblocking]` holds this function and
+    /// everything it calls to that (docs/v2/plan/design/effects.md): `blaze check` refuses a
+    /// blocking call under it, naming the chain. A call proven not to wait is marked
+    /// `#[blaze::nonblocking(trusted = "why")]` where it is defined, never allowed here.
+    #[blaze::nonblocking]
+    fn turn_after_wait(&mut self, mut done: Vec<Completion>) -> bool {
         for completion in &done {
             self.ended(completion);
         }
         // A turn with nothing to do is no span: an idle loop turns every millisecond.
         let _span = (!done.is_empty() || self.plane.ready())
             .then(|| tracing::info_span!("loop turn").entered());
+        // Each part of a turn that has a span is a child of it, so a long turn names what it
+        // was inside (slow-is-p0-traced); an idle turn opens none.
+        let spanned = _span.is_some();
+        if done.is_empty() && self.plane.running() == 0 {
+            self.quiet_turns = self.quiet_turns.saturating_add(1);
+        }
+        let part = spanned.then(|| {
+            tracing::info_span!(target: "blaze", "loop turn: completions", count = done.len())
+                .entered()
+        });
         self.tick();
         for completion in done.drain(..) {
             self.dispatch(completion);
         }
         self.done = done;
+        // What the completions' requests were answered with goes to the driver now: a reply
+        // made as its request was read (the no-op lane's, a status) is written in this turn
+        // before the plane is stepped or anything between requests runs.
+        if !self.effects.is_empty() {
+            self.submit();
+        }
         self.expire_jobs();
+        drop(part);
+        let part = spanned
+            .then(|| tracing::info_span!(target: "blaze", "loop turn: the plane's step").entered());
         self.step_plane();
+        drop(part);
+        // What the turn has to send so far (an answer, a flush asked) is handed to the driver
+        // before the work between requests below (the collections, the image's step): an
+        // answer never waits behind them.
+        if !self.effects.is_empty() {
+            self.submit();
+        }
+        let part = spanned.then(|| {
+            tracing::info_span!(target: "blaze", "loop turn: observe, watch and say").entered()
+        });
         self.store_broke();
         self.observed();
         self.watch();
         self.doing();
         self.plot();
+        drop(part);
+        let _between = spanned.then(|| {
+            tracing::info_span!(target: "blaze", "loop turn: after the answers").entered()
+        });
+        self.let_go_of_image();
         let idle = self.effects.is_empty() && self.driver.in_flight() == 0;
+        // An image someone waits for (a stop's, a snapshot's) is made whatever comes; the
+        // settle's is not made while a request is read and held, nor soon after one.
+        let makes = self.stopping.is_some() || !self.jobs.idle() || self.quiet_between_requests();
         let front = self.jobs.front_db();
         let parts = Parts {
             db: &self.db,
@@ -1847,7 +2007,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             predict: self.plane.predict(),
             effects: &mut self.effects,
         };
-        self.images.step(parts, idle);
+        if makes {
+            self.images.step(parts, idle);
+        }
         self.between();
         // A stalled job's leases end once its tasks let go of it.
         self.jobs.release_leases();
@@ -1934,7 +2096,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let mut replies = std::mem::take(&mut self.replies);
         self.observe.tick(now, |conn| server.waiting(conn), &mut replies);
         for reply in replies.drain(..) {
-            self.server.reply(&reply, &mut self.effects);
+            self.reply(&reply);
         }
         self.replies = replies;
         for row in self.jobs.started.drain(..) {
@@ -1942,6 +2104,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         for row in self.jobs.rows.drain(..) {
             self.observe.ended(row);
+        }
+        // The run logs of builds whose front end was kept, named after their answers.
+        if !self.jobs.ran.is_empty() {
+            self.observe.ran(std::mem::take(&mut self.jobs.ran));
         }
     }
 
@@ -2013,6 +2179,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         );
         tracing::error!("{said}");
         let file = under(&self.state, &format!("stalls/{now}.json"));
+        // durable: a stall's trace is read after the daemon is killed for the stall, and nothing can make it again
         self.effects.push(Effect::Write { file, bytes: stall.trace, tag: STALL });
         // clone: the error, once a stall
         let error = ApiError::new(said.clone(), Some("stall".to_owned()));
@@ -2126,7 +2293,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 }
                 if now.saturating_sub(self.given_back) >= GIVE_BACK_EVERY {
                     self.given_back = now;
-                    blaze_mem::tag::give_back_heap();
+                    crate::raw::memory::purger().ask();
                 }
             }
             Done::Unwatched => self.pressure_watched = false,
@@ -2191,7 +2358,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let memory = doing::memory();
         let pool = blaze_graph::exec::shared();
         let working = pool.working();
-        let stall = self.pulse.stall();
+        self.pulse.take_stall(&mut self.stall);
+        let stall = self.stall.as_deref();
         let look = doing::Look {
             now,
             running: &running,
@@ -2202,7 +2370,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             workers: u32::try_from(pool.workers()).unwrap_or(u32::MAX),
             fetching: &fetching,
             memory: &memory,
-            stall: stall.as_deref(),
+            stall,
         };
         let mut said = self.spare.said.pop().unwrap_or_default();
         let mut builds = std::mem::take(&mut self.builds);
@@ -2226,15 +2394,24 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         blaze_profile::plot(Plot::FrameBytes, memory.get(blaze_mem::Tag::Frames).live);
         blaze_profile::plot(Plot::LiveBytes, memory.live());
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        if let Some(bytes) = crate::raw::memory::footprint(std::process::id()) {
+        if let Some(bytes) = crate::raw::memory::own_footprint() {
             blaze_profile::plot(Plot::Footprint, bytes);
+            let kept = blaze_graph::arena::kept_of(&memory, bytes);
+            blaze_profile::plot(Plot::AllocatorKeptBytes, kept);
             let limit = blaze_graph::admission::limit();
             let pressure = blaze_graph::admission::Pressure { held: bytes, limit, over: None };
-            if pressure.squeezed() && now.saturating_sub(self.given_back) >= GIVE_BACK_EVERY {
+            // Past the limit's line, or keeping more than a quarter of the budget freed (the
+            // high water): the purger's thread gives it back, never the loop, since a purge
+            // waits for each worker's heaps ([`crate::raw::memory::purge`]).
+            let high_water = kept > limit / KEPT_HIGH_WATER;
+            if (pressure.squeezed() || high_water)
+                && now.saturating_sub(self.given_back) >= GIVE_BACK_EVERY
+            {
                 self.given_back = now;
-                blaze_mem::tag::give_back_heap();
+                crate::raw::memory::purger().ask();
             }
         }
+        blaze_profile::plot(Plot::AllocatorPurgedBytes, crate::raw::memory::purged_bytes());
         blaze_profile::plot(Plot::CommittedBytes, memory.committed);
         blaze_profile::plot(Plot::ReservedBytes, memory.reserved);
         let (span_map_bytes, span_map_pieces) = ::span::kept_maps();
@@ -2270,8 +2447,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// Every live job is failed with the store's reason, not only those at their gate, and
     /// that whether or not the daemon already failed for another reason: a build still running
     /// as the daemon stops is answered naming the store, not hung up on.
+    ///
+    /// What answered jobs left to settle is given up then too, each as a loss naming the break:
+    /// their answers were sent and stand (`Jobs::store_broke`).
     fn store_broke(&mut self) {
-        let (tell_jobs, fail) = (!self.jobs.idle(), self.failed.is_none());
+        let (tell_jobs, fail) = (!self.jobs.quiet(), self.failed.is_none());
         if !(tell_jobs || fail) {
             return;
         }
@@ -2331,7 +2511,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 }
             }
             DB..STORE => self.db.complete(completion, &mut self.effects),
-            STORE..FLUSHES => {
+            // The store's own effects, and its pool's reads (a commit loading the page a pack's
+            // committed bytes end in).
+            STORE..FLUSHES | LOADS..STD_LOADS => {
                 debug_assert!(self.store.owns(completion.tag), "the store's tags are its");
                 self.job_effects += 1;
                 self.store.complete(completion, &mut self.effects);
@@ -2343,7 +2525,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 self.jobs.placed(&mut world!(self, said), placed);
                 self.said(said);
             }
-            STD_STORE..STD_STORE_END => {
+            STD_STORE..STD_STORE_END | STD_LOADS..STD_LOADS_END => {
                 debug_assert!(self.std.owns(completion.tag), "the shared store's tags are its");
                 self.std.complete(completion, &mut self.effects);
                 if let Some(broken) = self.std.broken()
@@ -2375,7 +2557,40 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
     }
 
+    /// `reply` handed to the server to send. A request's `Done` ends its `request: read to
+    /// reply` span ([`Daemon::arrive`]).
+    fn reply(&mut self, reply: &Reply) {
+        self.server.reply(reply, &mut self.effects);
+        if matches!(reply.response, blaze_api::Response::Done { .. })
+            && let Some(at) = self.answering.iter().position(|(to, _)| *to == reply.to)
+        {
+            self.answering.swap_remove(at);
+        }
+    }
+
     fn arrive(&mut self, arrived: Arrived) {
+        // From a request read off its connection to its `Done` handed to the server, which
+        // the turn submits before anything else it does: what a client waits for of the
+        // daemon, whatever held the request between (a watcher's flush, a build).
+        match &arrived {
+            Arrived::Request { from, request } => {
+                // A status asked again and again, a stop and a client's rows are no work of a
+                // checkout: they hold nothing between requests back.
+                if !matches!(
+                    request,
+                    Request::Stop | Request::Status | Request::ClientRows { .. }
+                ) {
+                    self.quiet_turns = 0;
+                }
+                let span = tracing::info_span!(
+                    target: "blaze",
+                    "request: read to reply",
+                    request = from.id,
+                );
+                self.answering.push((*from, span)); // alloc: an entry a request under way
+            }
+            Arrived::Gone { conn } => self.answering.retain(|(to, _)| to.conn != *conn),
+        }
         let mut out = self.spare.out.pop().unwrap_or_default();
         self.heads.arrive(&self.vfs, arrived, &mut self.effects, &mut out);
         self.outs(out);
@@ -2438,11 +2653,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                         }
                         Err(error) => (blaze_api::Response::Error(error), false),
                     };
-                    self.server.reply(&Reply { to: from, response }, &mut self.effects);
-                    self.server.reply(
-                        &Reply { to: from, response: blaze_api::Response::Done { ok } },
-                        &mut self.effects,
-                    );
+                    self.reply(&Reply { to: from, response });
+                    self.reply(&Reply { to: from, response: blaze_api::Response::Done { ok } });
                 }
                 // `blaze fetch-url`: fetched on a thread of its own, answered as it ends
                 // ([`super::fetch_url::FetchUrls::take_answers`]).
@@ -2477,10 +2689,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 }
                 Out::Pass(Arrived::Request {
                     from,
-                    request: Request::Rebuilt { all, cwd, item },
+                    request: Request::Rebuilt { all, cwd, item, build, unexplained },
                 }) => {
                     let mut replies = std::mem::take(&mut self.replies);
-                    self.observe.rebuilt(from, cwd, item, all, self.driver.now(), &mut replies);
+                    let ask = crate::serve::why::Ask { all, cwd, item, build, unexplained };
+                    self.observe.why_asked(from, ask, self.driver.now(), &mut replies);
                     self.send(replies);
                 }
                 Out::Pass(arrived) => {
@@ -2496,7 +2709,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                     self.replies = replies;
                     self.after_session();
                 }
-                Out::Answer(reply) => self.server.reply(&reply, &mut self.effects),
+                Out::Answer(reply) => self.reply(&reply),
                 Out::Moved { head, root } => {
                     self.session.head_moved(&mut cx!(self), &head, root);
                     self.after_session();
@@ -2512,7 +2725,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// `replies` sent, and given back as the loop's buffer.
     fn send(&mut self, mut replies: Vec<Reply>) {
         for reply in replies.drain(..) {
-            self.server.reply(&reply, &mut self.effects);
+            self.reply(&reply);
         }
         self.replies = replies;
     }
@@ -2536,7 +2749,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.said(said);
         let mut replies = std::mem::take(&mut self.replies);
         for reply in replies.drain(..) {
-            self.server.reply(&reply, &mut self.effects);
+            self.reply(&reply);
         }
         self.replies = replies;
     }
@@ -2563,6 +2776,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             } else {
                 it
             };
+            // Every word of a job passes here once, as it is told: a build that may be answered
+            // again later has what it says noted ([`Jobs::heard`]).
+            self.jobs.heard(&it);
             match it {
                 Said::Report(job, response) => {
                     self.session.report(&mut cx!(self), job, response, &mut replies)
@@ -2673,13 +2889,31 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
     }
 
+    /// Whether the daemon is between requests: none is read and held for its checkout's
+    /// watcher, and none was read for [`QUIET_BEFORE_BETWEEN`] quiet turns.
+    fn quiet_between_requests(&self) -> bool {
+        self.heads.waiting() == 0 && self.quiet_turns >= QUIET_BEFORE_BETWEEN
+    }
+
     /// Between requests: the collections, and after a cold build the image and the settle.
+    ///
+    /// It runs last in a turn, after the turn's answers were handed to the driver
+    /// ([`Daemon::turn`]), and only while no job is under way and no kept front end is out
+    /// being stored (the image and the collections read the front end's database and the
+    /// roots a store's task reads). It never holds the next request up for more than one of
+    /// its steps: each step is a span, a turn takes one (the collections, then in a later turn
+    /// the image), so a request that arrived meanwhile is taken between them, and the image's
+    /// write is let go when one comes ([`Daemon::let_go_of_image`]).
     fn between(&mut self) {
-        if self.stopping.is_some() || !self.jobs.idle() {
+        if self.stopping.is_some() || !self.jobs.idle() || self.jobs.storing() > 0 {
+            return;
+        }
+        if !self.quiet_between_requests() {
             return;
         }
         if self.jobs.ended {
             self.jobs.ended = false;
+            let _span = tracing::info_span!(target: "blaze", "between requests: collect").entered();
             self.db.collect(&[self.steps.plan_key()], &mut self.effects);
             if let Some(db) = Arc::get_mut(&mut self.db) {
                 db.reclaim();
@@ -2692,12 +2926,19 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             if let Some(corrupt) = corrupt {
                 return self.fail(Failed::Corrupt(corrupt));
             }
+            // The image is asked in a later turn: what arrived during the collections is
+            // taken first.
+            if self.jobs.cold && !self.settling {
+                return;
+            }
         }
         if self.jobs.cold && !self.settling {
             self.jobs.cold = false;
             self.settling = true;
             self.changed_since_settle = false;
-            self.ask_image();
+            let _span =
+                tracing::info_span!(target: "blaze", "between requests: ask the image").entered();
+            self.ask_image(false);
         }
         if self.settling
             && self.images.done()
@@ -2712,7 +2953,14 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             && let Some(db) = Arc::get_mut(&mut self.db)
         {
             let settled = match self.images.take_mapped() {
-                Some(image) => db.settle(image, &mut self.effects).map(|()| db.reclaim()),
+                Some(image) => {
+                    let _span = tracing::info_span!(
+                        target: "blaze",
+                        "between requests: settle the database on the image",
+                    )
+                    .entered();
+                    db.settle(image, &mut self.effects).map(|()| db.reclaim())
+                }
                 None => Ok(()),
             };
             self.settling = false;
@@ -2724,6 +2972,25 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
 
     fn stepping_stop(&mut self) {
         let now = self.driver.now();
+        if let Some((since, _)) = &self.stop_settles {
+            let left = self.jobs.settling();
+            let waited = now.saturating_sub(*since);
+            if left > 0 && waited < STOP_SETTLES_WITHIN {
+                return;
+            }
+            if left > 0 {
+                // alloc: a stop that waited its bound, once
+                let why = format!(
+                    "the stop waited {} s for it and goes on",
+                    STOP_SETTLES_WITHIN.as_secs()
+                );
+                let mut said = self.spare.said.pop().unwrap_or_default();
+                self.jobs.let_go_of_settling(&mut world!(self, said), &why);
+                self.said(said);
+            }
+            self.stop_settles = None;
+            self.stop_image();
+        }
         if let (Some(Stopping::Image), Some(to)) = (&self.stopping, self.stop_from)
             && let Some(doing) = self.images.doing()
             && doing != self.stop_said

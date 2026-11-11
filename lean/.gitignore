@@ -1,0 +1,4 @@
+.lake/
+lake-manifest.json
+# lean/analysis pins Mathlib and what Mathlib needs by its manifest (harness/v2/lean_gate.py).
+!analysis/lake-manifest.json

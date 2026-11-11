@@ -445,8 +445,20 @@ fn an_executable_reads_back() {
     image.rebase = vec![data, got + 8, init, relro];
     image.binds = vec![Bind { addr: data + 8, import: 0, addend: 8 }];
     image.exports = vec![
-        Export { name: "main".into(), addr: text, size: 32, kind: SymbolKind::Function },
-        Export { name: "__blaze_live".into(), addr: rodata, size: 16, kind: SymbolKind::Data },
+        Export {
+            name: "main".into(),
+            addr: text,
+            size: 32,
+            kind: SymbolKind::Function,
+            weak: false,
+        },
+        Export {
+            name: "__blaze_live".into(),
+            addr: rodata,
+            size: 16,
+            kind: SymbolKind::Data,
+            weak: false,
+        },
     ];
     image.functions = vec![
         Function { addr: text, size: 32, fde: None, windows: None, name: Some("main".into()) },
@@ -741,6 +753,7 @@ fn a_shared_library_exports_through_its_hash_table() {
             addr: text + 4 * at as u64,
             size: 4,
             kind: SymbolKind::Function,
+            weak: false,
         })
         .collect();
 
@@ -791,6 +804,98 @@ fn a_shared_library_exports_through_its_hash_table() {
         )
         .is_none()
     );
+}
+
+/// An executable's exports are in `.dynsym` and found through `.gnu.hash`, as a shared
+/// library's are: `malloc` and `free`, which the executable defines and libc does too, so
+/// the loader binds libc's own calls to the executable's. Each is defined, at the
+/// executable's address, with its size, type and binding: a weak definition stays weak. A
+/// name the executable only imports (`strdup`) is undefined and not in the hash table, and
+/// one it does not export (`_start`) is not in `.dynsym` at all. What decides the exports
+/// is resolution's: `crate::tests::natives`.
+#[test]
+fn an_executable_exports_its_malloc_through_its_hash_table() {
+    let counts = Counts {
+        imports: 1,
+        import_names: 6 + 11 + 2,
+        libraries: 1,
+        library_names: 10,
+        exports: 2,
+        export_names: 6 + 4,
+        functions: 1,
+        function_names: 7,
+        ..Counts::default()
+    };
+    let mut image = Fixture::new(executable(), &[(Class::Text, 96, 16)], &counts);
+    let text = image.at(&Class::Text);
+    image.put(&Class::Text, 0, &[0xcc; 96]);
+    image.libraries = vec![Library { name: "libc.so.6".into(), as_needed: true }];
+    image.imports = vec![import("strdup", Some(0), Some("GLIBC_2.2.5"), false)];
+    image.exports = vec![
+        Export {
+            name: "malloc".into(),
+            addr: text + 32,
+            size: 32,
+            kind: SymbolKind::Function,
+            weak: false,
+        },
+        Export {
+            name: "free".into(),
+            addr: text + 64,
+            size: 24,
+            kind: SymbolKind::Function,
+            weak: true,
+        },
+    ];
+    image.functions = vec![Function {
+        addr: text,
+        size: 32,
+        fde: None,
+        windows: None,
+        name: Some("_start".into()),
+    }];
+    image.entry = Some(text);
+
+    let bytes = image.link();
+    let data = &bytes[..];
+    let file = ElfFile64::<Endianness>::parse(data).unwrap();
+    let endian = file.endian();
+    assert_eq!(file.elf_header().e_type(endian), elf::ET_DYN);
+    let sections = file.elf_section_table();
+    let dynsyms = sections.symbols(endian, data, elf::SHT_DYNSYM).unwrap();
+    let versions = sections.versions(endian, data).unwrap().unwrap();
+    let (hash, _) = sections.gnu_hash(endian, data).unwrap().unwrap();
+    let find = |name: &str| {
+        hash.find(endian, name.as_bytes(), elf::gnu_hash(name.as_bytes()), None, &dynsyms, &versions)
+            .map(|it| it.1)
+    };
+    for export in &image.exports {
+        let symbol =
+            find(&export.name).unwrap_or_else(|| panic!("`{}` is not in the hash table", export.name));
+        assert!(!symbol.is_undefined(endian), "`{}` is undefined", export.name);
+        assert_eq!(symbol.st_value(endian), export.addr, "`{}`", export.name);
+        assert_eq!(symbol.st_size(endian), export.size, "`{}`", export.name);
+        assert_eq!(symbol.st_type(), elf::STT_FUNC, "`{}`", export.name);
+        let bind = if export.weak { elf::STB_WEAK } else { elf::STB_GLOBAL };
+        assert_eq!(symbol.st_bind(), bind, "`{}`", export.name);
+    }
+    assert!(find("strdup").is_none(), "an import is not in the hash table");
+    assert!(find("_start").is_none(), "what is not exported is not in the hash table");
+    let named: Vec<&[u8]> =
+        dynsyms.symbols().iter().map(|it| it.name(endian, dynsyms.strings()).unwrap()).collect();
+    assert!(named.contains(&&b"strdup"[..]) && !named.contains(&&b"_start"[..]), "{named:?}");
+    // `.symtab` lists them with the same binding.
+    let symtab = sections.symbols(endian, data, elf::SHT_SYMTAB).unwrap();
+    let listed = |name: &[u8]| {
+        symtab
+            .symbols()
+            .iter()
+            .find(|it| it.name(endian, symtab.strings()).unwrap() == name)
+            .unwrap_or_else(|| panic!("`{}` is not in `.symtab`", String::from_utf8_lossy(name)))
+    };
+    assert_eq!(listed(b"malloc").st_bind(), elf::STB_GLOBAL);
+    assert_eq!(listed(b"free").st_bind(), elf::STB_WEAK);
+    assert_eq!(listed(b"free").st_value(endian), text + 64);
 }
 
 #[test]
@@ -1158,6 +1263,7 @@ fn many_exports_hash_as_the_model_does() {
             addr: text + 4 * at as u64,
             size: 4,
             kind: SymbolKind::Function,
+            weak: false,
         })
         .collect();
     let bytes = image.link();
@@ -1294,6 +1400,7 @@ fn many_functions_are_named_in_the_symbol_table() {
         addr: text + 16,
         size: 16,
         kind: SymbolKind::Function,
+        weak: false,
     }];
     image.libraries = vec![Library { name: "libc.so.6".into(), as_needed: false }];
     image.imports = vec![import("malloc", Some(0), None, false)];
@@ -1469,6 +1576,7 @@ fn shared_library(n: usize) -> Vec<u8> {
             addr: text + 4 * at as u64,
             size: 4,
             kind: SymbolKind::Function,
+            weak: false,
         })
         .collect();
     image.link()
@@ -1546,6 +1654,7 @@ fn many_symbols(n: usize) -> Fixture {
             addr: text + 4 * at as u64,
             size: 4,
             kind: SymbolKind::Function,
+            weak: false,
         })
         .collect();
     image.rebase = (0..n as u64).map(|at| data + 8 * at).collect();

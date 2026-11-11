@@ -264,15 +264,6 @@ pub enum UnwindFormat {
     None,
 }
 
-/// How wasm code calls a function it names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Calls {
-    /// `call`, as rustc's code does.
-    Direct,
-    /// `call_indirect` through the slot the linker gives the function in the function
-    /// table, so that a module loaded later replaces the function by writing its slot.
-    Table,
-}
 
 impl Target {
     /// The target `triple` names, for one unit: each unit's codegen and layout ask its own,
@@ -410,11 +401,6 @@ impl Target {
     /// The triple of what the daemon itself runs on: of the program blaze is, never of a unit
     /// it compiles, which names its own ([`Target::of`]).
     pub fn host() -> &'static str {
-        // The wasm backend writes its own code from Cranelift's IR and only borrows the
-        // settings of an ISA Cranelift has, whatever the compiler itself runs on.
-        if cfg!(feature = "wasm") {
-            return "wasm32-unknown-unknown";
-        }
         // FIXME: the triples of the hosts that have no code emitted for them yet are missing,
         // and `parse` turns those down by name.
         match (std::env::consts::ARCH, std::env::consts::OS) {
@@ -496,21 +482,10 @@ impl Target {
         self.arch == Arch::Wasm64
     }
 
-    /// Whether an object is written as a relocatable wasm object, for a linker. A page links
-    /// what the compiler emits itself, and reads the object Cranelift's writer made.
+    /// Whether an object is written as a relocatable wasm object, for a linker: every wasm
+    /// target's is.
     pub fn writes_wasm_objects(&self) -> bool {
-        self.is_wasm() && self.calls() == Calls::Direct
-    }
-
-    /// How wasm code calls: through the table where functions are replaced in a page. This
-    /// is how the program blaze is links what it compiles, not a property of the code's
-    /// target: the playground (`crates/blaze-wasm`, the `wasm` feature) links every function
-    /// into the page's table itself, and every other blaze hands relocatable objects to a
-    /// linker. The calling convention, the ABI and the addresses are the same either way, and
-    /// the toolchain's id has the feature (`v2::toolchain`), so no code of one is taken for
-    /// the other's.
-    pub fn calls(&self) -> Calls {
-        if cfg!(feature = "wasm") { Calls::Table } else { Calls::Direct }
+        self.is_wasm()
     }
 
     /// The integer an address is.
@@ -1031,43 +1006,6 @@ mod tests {
             (blaze_codegen::Arch::X86_64, blaze_stencil::Os::Windows)
         );
         assert_eq!(Target::of("wasm32-wasip1").expect("a target").stencil(), None);
-    }
-
-    /// blaze's own `wasm` feature (the playground's build, `crates/blaze-wasm`) decides only
-    /// what is about the program blaze is: where it runs ([`Target::host`]) and how it links
-    /// what it compiles ([`Target::calls`]), both in the toolchain's id. A target's ABI,
-    /// address width or anything else of its code is the [`Target`]'s, decided by the unit's
-    /// triple: a `cfg!` of the feature that decided the address width of wasm32's IR
-    /// (dfgalias) and how a pair is returned (wasmabi) made a normal blaze's wasm32 code
-    /// differ from the playground's. Every use of the feature is counted here, by file.
-    #[test]
-    fn blazes_wasm_feature_decides_nothing_of_a_targets_code() {
-        fn walk(dir: &std::path::Path, root: &std::path::Path, uses: &mut Vec<(String, usize)>) {
-            let mut entries: Vec<_> =
-                std::fs::read_dir(dir).unwrap().map(|it| it.unwrap().path()).collect();
-            entries.sort();
-            for path in entries {
-                if path.is_dir() {
-                    walk(&path, root, uses);
-                } else if path.extension().is_some_and(|it| it == "rs") {
-                    let text = std::fs::read_to_string(&path).unwrap();
-                    let count = text.matches(concat!("feature = ", "\"wasm\"")).count();
-                    if count != 0 {
-                        let name =
-                            path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
-                        uses.push((name, count));
-                    }
-                }
-            }
-        }
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut uses = Vec::new();
-        walk(root, root, &mut uses);
-        let expected = [("target.rs".to_owned(), 2), ("v2/toolchain.rs".to_owned(), 1)];
-        assert_eq!(
-            uses, expected,
-            "where hir-ty-codegen reads its `wasm` feature: `host`, `calls` and the toolchain's id"
-        );
     }
 
     #[test]

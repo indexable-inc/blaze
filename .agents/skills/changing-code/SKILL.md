@@ -59,4 +59,34 @@ do the same job (two schedulers, two evaluators, two tiers for one level) are a 
 the better one, delete the other, and ban its name with a `replacement` (`fix-through-blaze-lints`);
 a change that finds a duplicate removes it or files an issue naming both.
 
+## guard-the-cause (rule 54)
+
+Bad code is a symptom. When you find some (jank, a subpar design, a bug that sat unseen, a wait
+nobody named, a second way to do one thing), fix it, then ask why it was written that way and why
+nothing caught it: a missing lint, a harness that was broken or bypassed, a rule that did not say, a
+skill that told nobody how, an interface that made the wrong thing the easy thing, a measurement
+nobody ran. Remove that cause in the same change or the next: a blaze lint with a fix that finds
+every other instance (`fix-through-blaze-lints`), a check that joins the gate, a rule or skill
+instruction that says what to do instead, or a change to the interface so the mistake cannot be
+expressed. The fix is not done until the guard exists and has been run over the whole tree. Do it
+proactively: you do not wait to be asked, and you say in your report what the cause was and what now
+guards it. A guard that only describes the one instance you found is not one; state the general rule
+it enforces.
+
+See [docs/contributing.md#what-a-change-needs](../../../docs/contributing.md#what-a-change-needs).
+
+## build-the-missing-piece (rule 58)
+
+A design that says "this would use X, but X is not in the tree" is not finished. The missing piece
+(a language or reflection feature, an intrinsic, a bstd module, a SIMD primitive, a harness check, a
+debugging command) is part of the work: specify it, build it in its right home, and use it, in the
+same lane or one started at once, with a ledger row so it is tracked. An interim form is allowed
+only while the piece is being built: it is marked at the spot (`// when <piece> lands: <what
+changes>`), listed in the lane's report and its ledger row, and removed when the piece lands. What
+is never acceptable is the weaker design left standing with a note that the tree lacked something: a
+scalar loop where the design is vectorized, a hand-written impl where reflection should derive it, a
+guessed number where a measurement tool should exist. If the piece is large, say so and start it; do
+not quietly scope it out. This is `own-the-language` for the whole tree, and `guard-the-cause` for
+capabilities: the cause of a weak design is a missing piece, so add the piece.
+
 <!-- End of the generated rules. Hand-written notes follow. -->

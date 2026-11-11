@@ -35,6 +35,12 @@ rust-src https://static.rust-lang.org/dist/2026-10-27/rust-src-nightly.tar.xz a9
 #   the attribute path `blaze::contract_test` names in every crate. Unstable under
 #   `blaze_verify`; nothing else in library/ refers to it
 #   (docs/v2/plan/design/contracts.md, part 2).
+# - core/src/blaze_simd.rs (new) with its `mod blaze_simd;` and the re-export
+#   `pub use crate::blaze_simd::native_lanes;` in `pub mod simd` of core/src/lib.rs:
+#   `core::simd::native_lanes!(T)`, the lanes of the widest vector the calling crate is compiled
+#   for, a macro over `cfg!(target_feature)`. Unstable under `blaze_simd`, which
+#   `#![blaze::simd]` turns on with `portable_simd`; portable-simd/ itself is unchanged and
+#   nothing else in library/ refers to it (docs/v2/plan/design/simd.md).
 # - wasm64-blaze-wasip1 (64-bit WASI preview 1): vendor/wasip1-1.0.0/src/lib_generated.rs takes
 #   every pointer and witx `size` argument of the raw imports as `usize` and imports them from
 #   `wasi_snapshot_preview1` on 32-bit and `wasi_snapshot_preview1_64` on 64-bit (wasm32 is
@@ -48,3 +54,11 @@ rust-src https://static.rust-lang.org/dist/2026-10-27/rust-src-nightly.tar.xz a9
 #   (std/Cargo.toml) and names it with `extern crate wasi_rt;` under the same cfg
 #   (std/src/lib.rs); Cargo.lock has its package and std's dependency on it. Every other
 #   target's std is unchanged.
+# - core/src/record.rs (new) with its `pub mod record;` and `#![feature(unsized_const_params)]`
+#   in core/src/lib.rs: the type of blaze's records `{ a: A, b: B }` (`#![blaze::records]`),
+#   `Record<const FIELDS: &'static str, T>` (`#[lang = "record"]`, `#[repr(transparent)]` over
+#   the tuple `T` of the field types in the order of the sorted names `FIELDS` joins), which
+#   hir-ty lowers a record type to; its derived `Clone`, `Copy`, `PartialEq`, `Eq`,
+#   `PartialOrd`, `Ord`, `Hash` and `Default`, each when the tuple has it; and `Debug` over the
+#   trait `Fields` of tuples of up to twelve types. Unstable under `blaze_records`; nothing
+#   else in library/ refers to it (docs/v2/plan/design/records.md).

@@ -478,6 +478,16 @@ impl Pairs {
     }
 }
 
+/// A name Rust code defines ([`State::names`]): the symbol it is, and whether it is defined
+/// weakly ([`crate::Change::weak_names`]). A weak one is the name's definition only while no
+/// native input (or the image linked beside) defines it strongly; resolution decides which
+/// ([`crate::native`]), and the symbol stays Rust's own either way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct RustName {
+    pub target: Sym,
+    pub weak: bool,
+}
+
 /// Every field is `Copy`, an `Arc`, or a copy-on-write container whose clone is a reference
 /// count.
 #[derive(Clone)] // clone: once per stage, no allocation: `a_clone_allocates_nothing`
@@ -488,9 +498,10 @@ pub(crate) struct State {
     /// Written with `Arc::make_mut`, only where a region changes, so a stage that writes none
     /// shares the list it started from.
     pub spaces: Arc<Vec<Space>>,
-    /// The names Rust code defines (`#[no_mangle]`, `main`), each the symbol it is.
+    /// The names Rust code defines (`#[no_mangle]`, `main`), each the symbol it is and how
+    /// strongly ([`RustName`]).
     // BTreeMap: changed by every stage and walked in order by each native resolve.
-    pub names: Arc<BTreeMap<NameId, Sym>>,
+    pub names: Arc<BTreeMap<NameId, RustName>>,
     /// wasm: what codegen's live functions and statics say each name is imported as, the one
     /// import every live piece declaring it agrees on ([`State::declare_wasm`]); a name no
     /// live piece declares has none.
@@ -530,6 +541,13 @@ pub(crate) struct State {
     pub lists: Arc<crate::write::Lists>,
     /// What the image is across its generations: its first full link's.
     pub lineage: [u8; 16],
+    /// What the image holds, as its caller names it ([`crate::Change::given`]): zeros for a
+    /// caller that names nothing.
+    pub given: blaze_ids::ContentId,
+    /// What the stage that made this state changed that a debug side file records
+    /// ([`crate::beside::Delta`]); of a state no stage recorded one for, that every function
+    /// may have changed.
+    pub debug_delta: Arc<crate::beside::Delta>,
     pub laid_out: bool,
     /// One past the last thunk island index given ([`crate::thunk`]): a full link's segments,
     /// then one per incremental stage whose new code needed a thunk.
@@ -597,6 +615,8 @@ impl State {
             synthesis: 0,
             encoded: Arc::default(),
             lineage: [0; 16],
+            given: blaze_ids::ContentId::default(),
+            debug_delta: Arc::default(),
             laid_out: false,
             islands: 0,
             makes: Arc::default(),
@@ -1127,11 +1147,16 @@ impl State {
         self.functions.push(FunctionInfo { key, id, fde, windows, lines, made }) as FuncId
     }
 
-    /// The image's id, its build id in the file: of its lineage and generation.
+    /// The image's id, its build id in the file: of its lineage, its generation and what its
+    /// caller says it holds ([`crate::Change::given`]). Two images of one lineage (the same
+    /// program first linked in two checkouts) take their own edits, each to generations the
+    /// other also counts: what each holds tells their files apart, so one build id is never
+    /// two programs'.
     pub fn image_id(&self) -> [u8; 16] {
-        let full = blaze_ids::Hasher::new("blaze v2 link image 1")
+        let full = blaze_ids::Hasher::new("blaze v2 link image 2")
             .update(&self.lineage[..])
             .update(&self.generation.to_le_bytes())
+            .update(&self.given.0[..])
             .finish();
         let mut id = [0; 16];
         id.copy_from_slice(&full.0[..16]);
