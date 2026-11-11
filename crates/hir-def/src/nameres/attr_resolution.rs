@@ -148,7 +148,7 @@ impl DefMap {
                         | "sealed"
                         // `#[blaze::acyclic]` and `#[blaze::program_lifetime]`, from
                         // `AttrFlags::BLAZE_ACYCLIC` and `AttrFlags::BLAZE_PROGRAM_LIFETIME`
-                        // (`hir-ty-facts`, docs/v2/plan/design/facts.md).
+                        // (`hir-ty-pure`'s facts, docs/v2/plan/design/facts.md).
                         | "acyclic"
                         | "program_lifetime"
                 )

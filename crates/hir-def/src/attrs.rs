@@ -1247,18 +1247,19 @@ bitflags::bitflags! {
         /// `struct_domain`, docs/v2/plan/design/comptime.md "Which fields").
         const BLAZE_REFLECT = 1 << 124;
         /// `#[blaze::acyclic]`, a word, on a struct or enum: a blaze extension (inert under
-        /// rustc with `#![register_tool(blaze)]`), a declared type fact
-        /// (docs/v2/plan/design/facts.md): no chain of owning pointers leads from a value of
-        /// the type back to itself. `hir-ty-facts` proves it from the fields or refuses the
-        /// type naming the field path that can close a cycle (`blaze::acyclic`). It changes
+        /// rustc with `#![register_tool(blaze)]`). The spelling that asserts the `Acyclic`
+        /// trait of the type: the trait is derived from the type's shape by compile-time
+        /// reflection with a blanket impl (rule `reflection-first`; built on `lang-int-1110`,
+        /// docs/v2/plan/design/facts.md "Acyclic"), so nothing in the compiler analyses it
+        /// and nothing reads the bit until that lane's assertion does. It changes
         /// diagnostics, never code: no codegen key reads the bit.
         const BLAZE_ACYCLIC = 1 << 125;
         /// `#[blaze::program_lifetime]`, a word, on a struct or enum: a blaze extension (inert
         /// under rustc with `#![register_tool(blaze)]`), a declared type fact
-        /// (docs/v2/plan/design/facts.md): instances live until the program exits. `hir-ty-facts`
-        /// checks what the type itself must be for that (no `Drop`, nothing in it to drop, no
-        /// type parameter, not public unless its crate opts in) or refuses it naming the field
-        /// path (`blaze::program_lifetime`). It changes diagnostics, never code: no codegen
+        /// (docs/v2/plan/design/facts.md): instances live until the program exits. `hir-ty-pure`'s
+        /// `program_lifetime` checks what the type itself must be for that (no `Drop`, nothing
+        /// in it to drop, no type parameter, not public unless its crate opts in) or refuses it
+        /// naming the field path (`blaze::program_lifetime`). It changes diagnostics, never code: no codegen
         /// key reads the bit.
         const BLAZE_PROGRAM_LIFETIME = 1 << 126;
         /// `#[clippy::has_significant_drop]`, a word, on a struct or enum: dropping a value of
