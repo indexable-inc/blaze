@@ -1941,7 +1941,7 @@ impl Store {
         // alloc: setup, once per schema the store is given.
         let old = Arc::make_mut(&mut self.columns).insert(schema, Arc::new(columns));
         assert!(old.is_none(), "two encodings of schema {:x}", schema.0);
-        self.publish();
+        self.publish_view();
     }
 
     /// Whether it has a value of `key`, unverified: for planning, never for use.
@@ -4741,7 +4741,7 @@ impl Store {
             return;
         }
         if self.pending.front().is_some_and(|it| it.maps == 0) {
-            self.publish();
+            self.publish_view();
             // alloc: one list a commit of the chunks drained, held in the limbo past their grace
             let mut chunks = Vec::new();
             // A move not made whole stops the store below (`Lost`).
@@ -4891,7 +4891,7 @@ impl Store {
         }
         self.periods = 0;
         self.index_mapping = false;
-        self.publish();
+        self.publish_view();
         if writers {
             self.migrating = Some(Grace::start());
         }
@@ -4954,11 +4954,11 @@ impl Store {
             let dir = own.dir.clone();
             return self.fail(dir, why);
         }
-        self.publish();
+        self.publish_view();
     }
 
     /// Publishes what readers see, and frees the view it replaces at task boundaries.
-    fn publish(&mut self) {
+    fn publish_view(&mut self) {
         // clone: the view readers share, made once a publish (see `Tier::view`), with an `Arc` of the encodings
         let view = View {
             tiers: self.tiers.iter().map(Tier::view).collect(),
@@ -5075,7 +5075,7 @@ impl Store {
                     // alloc: once per dictionary trained
                     bytes: Ok(Arc::new(prepared)),
                 });
-                self.publish();
+                self.publish_view();
             }
             // Full samples get no more to train on twice as many: it cannot be tried again.
             Err(why) if training.full() => self.give_up_training(kind, &why),
@@ -5902,7 +5902,7 @@ impl Store {
                 let tier = &mut self.tiers[at];
                 tier.opened = true;
                 tier.before = None;
-                self.publish();
+                self.publish_view();
                 if self.is_peer(at) {
                     self.peer_settled(at);
                 }
