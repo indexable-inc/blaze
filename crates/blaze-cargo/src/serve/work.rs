@@ -111,7 +111,7 @@ impl SourceFile {
 
 /// What a job's work is, as far as its units' work differs by it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Goal {
+pub enum JobKind {
     /// Stops after the front end.
     Check,
     Build,
@@ -130,7 +130,7 @@ pub struct Selection<'a> {
     /// Every test, not only those the change reached.
     pub all: bool,
     /// Each test run in blaze's MIR evaluator, checked for undefined behavior. The job's
-    /// units were checked only ([`Goal::Check`]): `built` is empty, nothing is linked.
+    /// units were checked only ([`JobKind::Check`]): `built` is empty, nothing is linked.
     pub ub: Option<Ub>,
 }
 
@@ -174,7 +174,7 @@ pub struct JobInput {
     /// How many of the functions blaze could not compile an error names, every one with `None`
     /// ([`blaze_api::Cargo::refused`]; [`crate::REFUSED_SHOWN`] for an agent's request).
     pub refused: Option<u32>,
-    pub goal: Goal,
+    pub kind: JobKind,
     /// Set once the job is cancelled: long work looks at it between pieces and stops with
     /// [`Failed::Again`], which the loop drops for a cancelled job.
     pub cancelled: Arc<AtomicBool>,
@@ -958,7 +958,7 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
     /// whether nothing of it will be made again (cargo's `Fresh`).
     fn fresh(&self, unit: usize) -> bool;
     /// On a worker: phase `phase` of unit `unit` (any mode but `RunCustomBuild`), which is
-    /// checked and, unless the goal is [`Goal::Check`] or the unit is a check, compiled and
+    /// checked and, unless the job is a [`JobKind::Check`] or the unit is a check, compiled and
     /// linked. Every unit it depends on is done, the runs of build scripts it depends on
     /// applied, and the phases before `phase` ([`Phase`]) are done; what each made waits for
     /// the next with the front. [`Phase::Store`] gives the compile; every other phase none.
@@ -1046,7 +1046,7 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
         writer: S::Writer,
         images: &[(&'static str, u64, u64)],
     ) -> Result<Vec<Table>, Failed>;
-    /// On a worker, once every unit of a [`Goal::Check`] build is checked and every build
+    /// On a worker, once every unit of a [`JobKind::Check`] build is checked and every build
     /// script's run and proc macro's load applied, for `blaze doc`: the documentation of the crates
     /// `cargo doc` documents for the check's root units (`blaze-doc`), and unless `no_deps` of
     /// every library they depend on, made through the job's `writer`, the front end's last use,

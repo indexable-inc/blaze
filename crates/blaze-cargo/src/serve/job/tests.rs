@@ -173,7 +173,7 @@ fn tests_under_the_evaluator_check_the_units_and_build_none() {
     let work =
         Work::Test { targets: targets(), filter: Vec::new(), all: true, args: Vec::new(), ub };
     assert_eq!(command_of(&work), Command::Test);
-    assert_eq!(goal_of(&work), Goal::Check);
+    assert_eq!(kind_of(&work), JobKind::Check);
     let compiled = Work::Test {
         targets: targets(),
         filter: Vec::new(),
@@ -181,16 +181,16 @@ fn tests_under_the_evaluator_check_the_units_and_build_none() {
         args: Vec::new(),
         ub: None,
     };
-    assert_eq!(goal_of(&compiled), Goal::Test);
+    assert_eq!(kind_of(&compiled), JobKind::Test);
 }
 
 #[test]
 fn a_build_ahead_compiles_tests_and_an_edit_only_checks() {
     let ahead = Work::Ahead { targets: targets(), filter: vec!["parse".into()] };
-    assert_eq!((command_of(&ahead), goal_of(&ahead)), (Command::Test, Goal::Test));
+    assert_eq!((command_of(&ahead), kind_of(&ahead)), (Command::Test, JobKind::Test));
     assert!(targets_of(&ahead).is_some());
     let edit = Work::Edit(Vec::new());
-    assert_eq!((command_of(&edit), goal_of(&edit)), (Command::Check, Goal::Check));
+    assert_eq!((command_of(&edit), kind_of(&edit)), (Command::Check, JobKind::Check));
     assert!(targets_of(&edit).is_none());
     assert!(reuses_plans(&edit) && reuses_plans(&ahead));
 }

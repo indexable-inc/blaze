@@ -58,7 +58,7 @@ use super::{
     files::Mounted,
     graph, reads, say, script,
 };
-use crate::serve::work::{Compiled, Failed, Goal, Linking, Output, Phase, Put};
+use crate::serve::work::{Compiled, Failed, JobKind, Linking, Output, Phase, Put};
 
 type Image = crate::serve::work::Image<Real>;
 
@@ -354,7 +354,7 @@ fn narrow_identity(job: &Job, unit: usize) -> Result<Option<ContentId>, ApiError
     if reads_comments {
         return Ok(None);
     }
-    Ok(Some(match checks_only(job.input.goal, u) {
+    Ok(Some(match checks_only(job.input.kind, u) {
         true => narrowed.checked,
         false => narrowed.code,
     }))
@@ -750,7 +750,7 @@ impl Checked {
 /// one that only checks, whose record is under this very identity.
 fn check_key(job: &Job, unit: usize) -> Result<Option<Key>, ApiError> {
     let u = job.unit(unit)?;
-    if checks_only(job.input.goal, u) || narrow_identity(job, unit)?.is_none() {
+    if checks_only(job.input.kind, u) || narrow_identity(job, unit)?.is_none() {
         return Ok(None);
     }
     let Some(narrowed) = job.narrowed.get(unit).and_then(|it| it.get()).copied().flatten() else {
@@ -880,7 +880,7 @@ fn with_record_inputs<T>(
         codegen::makes(u, codegen::asked(job, unit)),
         Ok(Makes::Executable | Makes::Shared { proc_macro: false })
     );
-    let layout = match links && !checks_only(job.input.goal, u) {
+    let layout = match links && !checks_only(job.input.kind, u) {
         true => super::layout::key(job, job.plan(unit)?)
             .map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?,
         false => None,
@@ -894,7 +894,7 @@ fn with_record_inputs<T>(
         script_link_args: script_link_args(job, unit)?,
         linked_rustflag_libs: linked_rustflag_libs(job, unit)?,
         makers,
-        goal: keyed_goal(job.input.goal, u),
+        kind: keyed_kind(job.input.kind, u),
         color: job.input.color,
         short: job.input.short,
         verified,
@@ -1087,8 +1087,8 @@ pub(crate) struct RecordInputs<'a> {
     /// writes and the record's encoding). Each moves on any edit of a package it is of, so a
     /// record made by other code is never found.
     pub(crate) makers: crate::serve::RecordMakers,
-    /// [`keyed_goal`].
-    pub(crate) goal: u8,
+    /// [`keyed_kind`].
+    pub(crate) kind: u8,
     pub(crate) color: bool,
     pub(crate) short: bool,
     pub(crate) verified: bool,
@@ -1139,7 +1139,7 @@ impl RecordInputs<'_> {
         })?;
         hasher.id(&self.makers.front_end).id(&self.makers.codegen).id(&self.makers.record).update(
             &[
-                self.goal,
+                self.kind,
                 u8::from(self.color),
                 u8::from(self.short),
                 u8::from(self.verified),
@@ -1209,7 +1209,7 @@ impl RecordInputs<'_> {
                 "the code identity of what makes a record (blaze-cargo's closure)",
                 Some(&self.makers.record),
             ),
-            bytes("goal", &[self.goal]),
+            bytes("the job's kind", &[self.kind]),
             flag("color", self.color),
             flag("short diagnostics", self.short),
             flag("BLAZE_ELIDE=verify (built to verify an inert build script)", self.verified),
@@ -1250,19 +1250,19 @@ mod erased {
     }
 }
 
-/// The goal as `unit`'s record key holds it. A build script's compile is the same program
-/// whatever the job's goal ([`super::checks_only`] is false for it under every goal), as a
-/// device unit's MSL is, so a `blaze check` and a `blaze build` share its record; any other
-/// unit keys the goal.
-pub(crate) fn keyed_goal(goal: Goal, unit: &Unit) -> u8 {
+/// The job's kind as `unit`'s record key holds it. A build script's compile is the same
+/// program whatever the job's kind ([`super::checks_only`] is false for it under every kind),
+/// as a device unit's MSL is, so a `blaze check` and a `blaze build` share its record; any
+/// other unit keys the kind.
+pub(crate) fn keyed_kind(kind: JobKind, unit: &Unit) -> u8 {
     if unit.mode == Mode::Build && (unit.target.is_custom_build() || unit.for_device()) {
         return 1;
     }
-    match goal {
-        Goal::Check => 0,
-        Goal::Build => 1,
-        Goal::Test => 2,
-        Goal::Run => 3,
+    match kind {
+        JobKind::Check => 0,
+        JobKind::Build => 1,
+        JobKind::Test => 2,
+        JobKind::Run => 3,
     }
 }
 
@@ -2112,7 +2112,7 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
     // A device unit has no native code: its library is a crate record, and its MSL is written
     // from the front end at its link ([`assemble`]).
     let builds_code = !inert
-        && !checks_only(job.input.goal, u)
+        && !checks_only(job.input.kind, u)
         && !library_reached
         && !proc_macro
         && !u.for_device();
@@ -3373,8 +3373,8 @@ fn assemble(
         // them may be under keep-going ([`Compiled::open`]). A unit whose code is built or
         // run (a build script, a proc macro, a library a program links) fails shut: what
         // depends on it needs that code. Both inputs are in the record's key (its check's
-        // outcome through its sources, the goal through [`keyed_goal`]).
-        let only_checked = checks_only(job.input.goal, u);
+        // outcome through its sources, the job's kind through [`keyed_kind`]).
+        let only_checked = checks_only(job.input.kind, u);
         let open = !phases.items_broken && only_checked;
         let why = match (open, only_checked) {
             (true, _) => "errors only in its bodies or lints",

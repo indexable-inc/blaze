@@ -143,7 +143,7 @@ use super::{
     observe::Ended,
     plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds, loops},
     work::{
-        Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, Library,
+        Broke, Compiled, Failed, Front, FrontEnd, Image, JobInput, JobKind, Kept, KeptDb, Library,
         Linking, LocalRead, Phase, Readers, RunPuts, Runs, Selection, Source, Steps, Writer,
     },
 };
@@ -988,12 +988,12 @@ fn command_of(work: &Work) -> Command {
     }
 }
 
-fn goal_of(work: &Work) -> Goal {
+fn kind_of(work: &Work) -> JobKind {
     match work {
-        Work::Build(_) | Work::CodegenInputs(_) => Goal::Build,
-        Work::Test { ub: Some(_), .. } => Goal::Check,
-        Work::Test { .. } | Work::Ahead { .. } => Goal::Test,
-        Work::Run { .. } => Goal::Run,
+        Work::Build(_) | Work::CodegenInputs(_) => JobKind::Build,
+        Work::Test { ub: Some(_), .. } => JobKind::Check,
+        Work::Test { .. } | Work::Ahead { .. } => JobKind::Test,
+        Work::Run { .. } => JobKind::Run,
         // A reach builds only the units its views' front ends apply, each as a check builds
         // it, and so shares a check's records ([`reads_front_unbuilt`]).
         Work::Reach { .. }
@@ -1004,7 +1004,7 @@ fn goal_of(work: &Work) -> Goal {
         | Work::Snapshot
         | Work::Edit(_)
         | Work::Doc { .. }
-        | Work::Lock(_) => Goal::Check,
+        | Work::Lock(_) => JobKind::Check,
     }
 }
 
@@ -5322,7 +5322,7 @@ impl<S: Steps> Jobs<S> {
             width: cargo.and_then(|it| it.width),
             verbose: cargo.map_or(0, |it| it.verbose),
             refused: cargo.map_or(Some(crate::REFUSED_SHOWN), |it| it.refused),
-            goal: goal_of(&job.work),
+            kind: kind_of(&job.work),
             cancelled: job.cancelled.clone(), // clone: a refcount, once per view
         };
         // Asked as the view is lowered, so it is in by the time the units are built.
@@ -5837,11 +5837,11 @@ impl<S: Steps> Jobs<S> {
             u32::try_from(picked.as_ref().map_or(all.len(), Vec::len)).expect("under 2^32 units");
         let unit_at =
             |offset: u32| picked.as_ref().map_or(offset, |it| it[offset as usize]) as usize;
-        let goal = input.goal;
+        let kind = input.kind;
         // A unit's phases, a node each; none for a build script's run, which is one node.
         let phases_of = |unit: &blaze_units::schema::Unit| match unit.mode {
             UnitMode::RunCustomBuild => &[][..],
-            _ => super::unit::phases(goal, unit),
+            _ => super::unit::phases(kind, unit),
         };
         // Each built unit's last node, by its place after the batch's first; `u32::MAX` for one
         // not built. A unit's first node waits for the last of each unit it depends on.
@@ -6149,9 +6149,9 @@ impl<S: Steps> Jobs<S> {
         if !build.reported.insert(build.package_of[at]) {
             return;
         }
-        let verb = match (fresh, build.input.goal, unit.mode) {
+        let verb = match (fresh, build.input.kind, unit.mode) {
             (true, ..) => Verb::Fresh,
-            (false, Goal::Check, _) | (false, _, UnitMode::Check) => Verb::Checking,
+            (false, JobKind::Check, _) | (false, _, UnitMode::Check) => Verb::Checking,
             (false, ..) => Verb::Compiling,
         };
         let started = UnitStarted {
