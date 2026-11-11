@@ -693,7 +693,7 @@ impl<'db> HirFrontend<'db> {
     /// them, as its walk does ([`Self::walking`]): a program's world then rekeys the bodies
     /// built against it and no other. One whose walk can't say is keyed by the world, and
     /// its describe gives the error.
-    fn memoed<'db>(
+    fn memoed(
         &self,
         db: &'db Db,
         instance: &HirInstance,
