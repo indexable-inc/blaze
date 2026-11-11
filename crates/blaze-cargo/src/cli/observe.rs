@@ -40,6 +40,7 @@ const EXPLORE_USAGE: &str = "blaze explore [--dev] [--print]: the explorer's lin
                              `--dev`: the page's development server, http://localhost:5173, may connect too)";
 const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live | blaze debug sql [--json] QUERY \
                            | blaze debug schema [TABLE] [--json] \
+                           | blaze debug syscalls [--loop | --thread NAME] [--unit TEXT] [--over MS] [--build N] [--json] \
                            | blaze debug hot [--top N] [--last-build] | blaze debug time [--build N] [--by unit|item|wait] [--top N] \
                            [--match TEXT] [--cores [LINES]] [--html FILE] [--trace FILE] \
                            | blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE] \
@@ -131,6 +132,7 @@ pub fn debug(words: Vec<OsString>, color: bool) -> i32 {
         },
         Some("sql") => query(words.collect()),
         Some("schema") => schema_of(words.collect()),
+        Some("syscalls") => syscalls(words.collect()),
         Some("hot") => hot(words.collect()),
         Some("time") => time(words.collect()),
         Some("gate") => gate(words.collect()),
@@ -703,6 +705,63 @@ fn query(words: Vec<OsString>) -> Result<(), Refusal> {
     print(&run(&sql)?, shape)
 }
 
+const SYSCALLS_USAGE: &str =
+    "blaze debug syscalls [--loop | --thread NAME] [--unit TEXT] [--over MS] [--build N] [--json]";
+
+/// `blaze debug syscalls`: what a build's threads blocked in, as the daemon itself recorded
+/// it (the `syscalls` view: the drivers' file calls off the loop, the loop's steps that ran in
+/// line past their bound, and the samples of blocked threads), with no strace: of the daemon's
+/// loop thread with `--loop`, of the threads named like `--thread`, inside the spans of a unit
+/// with `--unit`, of `--over` milliseconds or more (1), of the last build that ended unless
+/// `--build` says.
+fn syscalls(words: Vec<OsString>) -> Result<(), Refusal> {
+    let (args, shape) = syscalls_args(texts(words)?)?;
+    let view = views::find("syscalls").map_err(|error| error.to_string())?;
+    let sql = views::render(view, &args).map_err(|error| error.to_string())?;
+    print(&run(&sql)?, shape)
+}
+
+/// The `syscalls` view's arguments as `blaze debug syscalls`' words give them.
+fn syscalls_args(words: Vec<String>) -> Result<(Map<String, Value>, Shape), Refusal> {
+    let usage = |what: &str| Refusal::Usage(format!("{SYSCALLS_USAGE}: {what}"));
+    let (mut args, mut shape) = (Map::new(), Shape::Table);
+    let mut words = words.into_iter();
+    while let Some(word) = words.next() {
+        let mut value =
+            |what: &str| words.next().ok_or_else(|| usage(&format!("`{word}` takes {what}")));
+        match word.as_str() {
+            "--json" => shape = Shape::Json,
+            "--loop" | "--thread" if args.contains_key("thread") => {
+                return Err(usage("one of `--loop` and `--thread`, once"));
+            }
+            "--loop" => _ = args.insert("thread".to_owned(), Value::from("loop")),
+            "--thread" => {
+                _ = args.insert("thread".to_owned(), Value::from(value("a thread's name")?));
+            }
+            "--unit" => {
+                let unit = value("text the unit's spans hold")?;
+                _ = args.insert("within".to_owned(), Value::from(format!("%{unit}%")));
+            }
+            "--over" => {
+                let ms = value("milliseconds")?
+                    .parse::<f64>()
+                    .ok()
+                    .and_then(serde_json::Number::from_f64)
+                    .ok_or_else(|| usage("`--over` takes milliseconds"))?;
+                _ = args.insert("min_ms".to_owned(), Value::Number(ms));
+            }
+            "--build" => {
+                let build = value("a build id")?
+                    .parse::<u64>()
+                    .map_err(|_| usage("`--build` takes a build id"))?;
+                _ = args.insert("build".to_owned(), Value::from(build));
+            }
+            _ => return Err(usage(&format!("not `{word}`"))),
+        }
+    }
+    Ok((args, shape))
+}
+
 /// `blaze debug schema [TABLE] [--json]`: the tables and views of the profile, each with what
 /// it holds; with a table (or a span view), its columns with their types and meaning. From the
 /// schema this blaze reads and writes (`blaze_profile::schema`), so no column is a guess; no
@@ -1185,6 +1244,30 @@ mod tests {
         assert_eq!(lines[0], r#"{"name":"parse","count":3,"share":0.5,"note":"a \"quoted\" one"}"#);
         assert_eq!(lines[1], r#"{"name":null,"count":10,"share":1.0,"note":""}"#);
         assert_eq!(lines.len(), 3);
+    }
+
+    /// `blaze debug syscalls`' words are the `syscalls` view's arguments, and the view binds
+    /// them: the loop thread, a unit's spans, a bound and a build.
+    #[test]
+    fn debug_syscalls_words_bind_the_syscalls_view() {
+        let words = |it: &[&str]| it.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>();
+        let (args, shape) = syscalls_args(words(&[
+            "--loop", "--unit", "serde", "--over", "20", "--build", "7", "--json",
+        ]))
+        .ok()
+        .unwrap();
+        assert!(shape == Shape::Json);
+        assert_eq!(args.get("thread"), Some(&Value::from("loop")));
+        assert_eq!(args.get("within"), Some(&Value::from("%serde%")));
+        assert_eq!(args.get("build"), Some(&Value::from(7u64)));
+        let sql = views::render(views::find("syscalls").unwrap(), &args).unwrap();
+        assert!(sql.contains("LIKE 'loop'") && sql.contains("'loop' = 'loop'"), "{sql}");
+        assert!(sql.contains("LIKE '%serde%'") && sql.contains(">= 2e1 * 1e6"), "{sql}");
+        let (none, _) = syscalls_args(Vec::new()).ok().unwrap();
+        assert!(none.is_empty(), "every thread of the last build, 1 ms or more");
+        for bad in [&["--loop", "--thread", "x"][..], &["--over", "soon"], &["--thread"], &["--nope"]] {
+            assert!(matches!(syscalls_args(words(bad)), Err(Refusal::Usage(_))), "{bad:?}");
+        }
     }
 
     #[test]

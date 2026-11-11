@@ -83,6 +83,11 @@ const ANY_BUILD: Arg = Arg { name: "build", ty: ArgType::U64, default: Some("NUL
 /// The limit of a view whose rows are read whole (a build's timeline, its counts): past it the
 /// view is cut, and `limit=N` asks for more.
 const MANY: Arg = Arg { name: "limit", ty: ArgType::U64, default: Some("200") };
+/// A thread's name as `LIKE` matches it, or `loop` for the daemon's loop thread: every
+/// thread unless given.
+const THREAD: Arg = Arg { name: "thread", ty: ArgType::Text, default: Some("'%'") };
+/// Text a row's call or span holds, as `LIKE` matches it: anything unless given.
+const WITHIN: Arg = Arg { name: "within", ty: ArgType::Text, default: Some("'%'") };
 /// The least duration of a span a timeline lists, in milliseconds.
 const MIN_MS: Arg = Arg { name: "min_ms", ty: ArgType::F64, default: Some("1.0") };
 /// The least duration of a span that counts as long, in milliseconds: the loop's budget for a
@@ -160,6 +165,7 @@ pub const VIEWS: &[View] = &[
     const { view("scripts", &[BUILD, MANY]) },
     const { view("pool", &[ENDED_BUILD]) },
     const { view("kept", &[ENDED_BUILD, MANY]) },
+    const { view("syscalls", &[ENDED_BUILD, THREAD, WITHIN, MIN_MS, MANY]) },
 ];
 
 /// The view named `name`.

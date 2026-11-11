@@ -1027,3 +1027,60 @@ FROM misses AS m
 WHERE m.step = 'results kept after the answer' AND m.build_id IN ($build, $build + 1)
 ORDER BY at_ms NULLS LAST, name
 LIMIT $limit
+
+-- name: syscalls
+-- says: what a build's threads blocked in, as the daemon itself saw it, with no strace: each file call a driver made off its loop (`io call`: a `wait` span whose `awaits` is `io <op> <file>`: a clone, a write-back, a listing, with how long it took and the span it was made in), each step of the daemon's loop that ran in line past its bound (`loop step in line`: the step and its time), and the samples of threads blocked inside a span (`blocked samples`: the stack, outermost first, the span, how many, and the time they stand for at 49 a second), in the order they began. `thread`: a thread's name (`LIKE`), or `loop` for the daemon's loop thread; `within`: text the call or its span holds (`LIKE`); `min_ms`: the least time. A system call no driver times and no sample caught is not here: harness/v2/loop_syscalls.py (strace) sees those
+WITH bounds AS (
+    SELECT started_ns AS t0, started_ns + dur_ns AS t1
+    FROM builds
+    WHERE build_id = $build
+), looped AS (
+    SELECT DISTINCT process AS loop_process, thread AS loop_thread
+    FROM spans
+    WHERE build_id = $build
+        AND (name = 'request: read to reply' OR name = 'loop stalled' OR starts_with(CAST(name AS VARCHAR), 'loop: '))
+), named AS (
+    SELECT process AS named_process, thread AS named_thread, CAST(any_value(thread_name) AS VARCHAR) AS said_name
+    FROM spans
+    WHERE build_id = $build
+    GROUP BY process, thread
+), calls AS (
+    SELECT s.process AS call_process, s.thread AS call_thread, CAST(s.thread_name AS VARCHAR) AS on_thread,
+        s.start_ns AS began_ns, s.dur_ns AS took_ns, 'io call' AS seen_as, s.awaits AS call,
+        CAST(p.name AS VARCHAR) || coalesce(' ' || p.function, '') AS inside, CAST(1 AS BIGINT) AS times
+    FROM spans AS s
+    LEFT JOIN spans AS p ON p.process = s.process AND p.span_id = s.parent
+    CROSS JOIN bounds
+    WHERE s.name = 'wait' AND starts_with(s.awaits, 'io ') AND s.start_ns >= bounds.t0 AND s.start_ns < bounds.t1
+    UNION ALL
+    SELECT s.process, s.thread, CAST(s.thread_name AS VARCHAR), s.start_ns, NULL, 'loop step in line', s.function, NULL, CAST(1 AS BIGINT)
+    FROM spans AS s
+    CROSS JOIN bounds
+    WHERE s.name = 'loop stalled' AND s.start_ns >= bounds.t0 AND s.start_ns < bounds.t1 + 1000000000
+    UNION ALL
+    SELECT m.process, m.thread, any_value(named.said_name), min(m.t_ns), CAST(count(*) * 20408163 AS BIGINT), 'blocked samples',
+        array_to_string(m.stack, ' > '), CAST(p.name AS VARCHAR) || coalesce(' ' || p.function, ''), CAST(count(*) AS BIGINT)
+    FROM samples AS m
+    LEFT JOIN spans AS p ON p.process = m.process AND p.span_id = m.span_id
+    LEFT JOIN named ON named.named_process = m.process AND named.named_thread = m.thread
+    CROSS JOIN bounds
+    WHERE m.cpu = 'off' AND m.t_ns >= bounds.t0 AND m.t_ns < bounds.t1
+    GROUP BY m.process, m.thread, m.span_id, array_to_string(m.stack, ' > '), p.name, p.function
+)
+SELECT
+    round((calls.began_ns - bounds.t0) / 1e6, 3) AS at_ms,
+    round(calls.took_ns / 1e6, 3) AS ms,
+    calls.on_thread AS thread,
+    calls.seen_as,
+    calls.call,
+    calls.inside,
+    calls.times
+FROM calls
+CROSS JOIN bounds
+WHERE (calls.on_thread LIKE $thread
+        OR ($thread = 'loop' AND EXISTS (
+            SELECT 1 FROM looped WHERE looped.loop_process = calls.call_process AND looped.loop_thread = calls.call_thread)))
+    AND (coalesce(calls.inside, '') LIKE $within OR coalesce(calls.call, '') LIKE $within)
+    AND (calls.took_ns IS NULL OR calls.took_ns >= $min_ms * 1e6)
+ORDER BY calls.began_ns, calls.seen_as
+LIMIT $limit

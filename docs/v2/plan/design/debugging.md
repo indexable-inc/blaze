@@ -134,65 +134,117 @@ critical-path time under no span, by stretch (20.0 ms or more each):
    fix: put a span over what ran there (rule slow-is-p0-traced), then read it again
 ```
 
-## h. One command for the edit loop (see the fork's commit)
+## h. One command for the edit loop (built: bd24ee432d, 436278ae06)
 
-`blaze bench edits`: applies an edit of a kind (no-op, comment, body, signature, add item,
-dependency body), builds, repeats, and prints per run the wall time, the daemon's time, the
-timeline, the bounded counters and the problems, with the binary's and the tree's identity;
-refuses to compare runs of different binaries without saying so; leaves the workspace as it
-found it. Every answer names the binary that gave it; a client served by a daemon of another
-binary says so in one line.
+`blaze debug edits KIND [--file F] [--fn NAME[:LINE]] [--runs N] [--json] [-- BUILD ARGS]`
+(named `debug edits`: `blaze bench` is cargo's) applies the Nth edit of one kind (no-op,
+comment, body, signature, add-item, dep-body) to the file as found, runs `blaze build` with
+this very executable, and repeats. Each run reports wall time, `builds.dur_ns`, the `timeline`
+rows, the bounded `query_counts` and the `problems` rows. The first line is the medians from
+run 2 on, or `FAILED:` naming the run and the build's own exit code, after which nothing is
+timed. A run fails if its `builds.blaze` is not this binary's BLAKE3, or if no build or more
+than one started in the daemon during it. The file is written back on every way out; a journal
+in the state directory restores it after a kill. Each good measurement is appended to
+`<state>/edits.jsonl`; the last record of the same workspace, kind, file and function is shown
+beside this one, labelled `ANOTHER BINARY` or `ANOTHER TREE` when it is.
 
-## i. A failed build is not a slow one (see the fork's commit)
+`blaze --version` prints `binary: <BLAKE3> <path>` after its first line, and `status`, `debug`,
+`explain`, `why` and `slow` print one warning when the daemon that answers is another build
+than the client. `builds.blaze` is filled for every command (verified).
 
-A build that resumes or redoes work because the checkout's last build failed says so in its
-first line and in `blaze why`.
+## i. A failed build is not a slow one (built: b52d9192b8, 8c9a1eb79d)
 
-## e. Which process did it (see the fork's commit)
+The daemon keeps, per checkout, its last build that did not end well. The next build says so
+as its view opens ("the last build of /w (build 41, `build`) failed with 212 of its 340 units
+not built ...: this build first does the work that one left, so its time is not a no-op's"),
+its misses take one row of step `work the last build left unfinished`, which `blaze why` says
+before every other group and `blaze slow` ranks first (finding `unfinished`). Spec:
+[why.md](why.md).
 
-A sandbox refusal carries the program, argv[0], pid, syscall name and number, whether it was
-before `main` (a heuristic, said as one) and the module of the instruction pointer.
-`blaze explain script <unit>` prints the last run's trace summary.
+## e. Which process did it (built on Linux: f87fe256af, 3f58c4890b)
 
-## k. A corrupt persisted database stops at restore (see the fork's commit)
+On the first untraceable call of each kind per process, the sandbox supervisor reads
+`/proc/<pid>/{exe,cmdline,status,maps}` and records the program, `argv[0]`, the pid as the
+supervisor and as the sandbox number it, the system call's name and number, the instruction
+pointer and the module it is in, and whether it was before `main` (a stated heuristic: yes
+when the call came from the loader or before the interposer said it loaded, else "not
+known"). The refusal appends who read it. `blaze explain script UNIT [--json]` prints the last
+run's trace summary from the events the daemon writes as the run ends (`script run traced`,
+`script call`), joined with the run's `processes` row. On macOS the interposer cannot say
+which process, and the refusal says so.
 
-A restore verifies checksums, the manifest and that every id a restored row references
-exists; one that fails names the file and its format version and never serves or starts
-empty. `blaze doctor` runs the same verification on demand and prints the command that
-quarantines the file.
+## k. A corrupt persisted database stops at restore (built: 0dfebb7bbf)
 
-## j. `blaze why` never guesses (see the fork's commit)
+The daemon image's references are checked as it opens: a checksum-valid record that names
+what the image lacks is `DbError::Dangling`, the start is refused naming the file, and nothing
+of it is used. The engine's "an ID this database never gave" panic names the file, layout and
+hash the process restored from. `blaze doctor [--json]` runs the same checks on the files with
+no daemon, prints the command that sets the state aside whole, and deletes nothing. Spec:
+[restore.md](restore.md). The cause of 2026-11-10's forged key was not found.
 
-When an explanation is unavailable the answer says exactly why and how to have it next time.
+## j. `blaze why` never guesses (built: 45ffd373db; the cap's accounting fixed by 2449b43295)
 
-## l. A hung user-code run says what each process is blocked in (see the fork's commit)
+Each reason says what was recorded; where the record cannot tell two things apart it says
+both and that which is not recorded; where the record is gone it says why and the command
+that reads what is left (`blaze explain key_part_diff after=N before=M`). Spec:
+[why.md](why.md).
 
-After a bound, the stall report lists each process of the run with its state and the system
-call or wait channel it is blocked in, from `/proc`.
+## l. A hung user-code run says what each process is blocked in (built on Linux: 3d43868436)
 
-## d. System calls without strace (specified; the contained part built)
+When a build script's run is killed for making no progress, the error appends a line a
+process of the run: its state, the system call it is in, the file its descriptor is open on
+and the kernel's wait channel, from `/proc`, bounded to 8192 entries, 32 processes and 200 ms.
+On macOS it names `ps -o state,wchan` and `sample PID`. Proc-macro and test hangs do not go
+through this bound yet.
 
-`blaze debug syscalls --loop | --thread NAME | --unit UNIT [--over MS] [--json]`.
+## d. System calls without strace (the view and command built; two sources specified)
 
-What is recorded, always on, per call over a threshold (1 ms; 20 ms is the loop's budget): the
-call, its duration, the thread, the file's path where the caller has one, and the span it was
-in. Sources, cheapest first:
+`blaze debug syscalls [--loop | --thread NAME] [--unit TEXT] [--over MS] [--build N] [--json]`
+prints the `syscalls` view: what a build's threads blocked in, as the daemon itself recorded
+it, in the order it began. `--loop` is the daemon's loop thread (the thread of its
+`request: read to reply`, `loop: ...` and `loop stalled` spans).
 
-1. **The driver's own timing.** Every effect the io driver runs (a ring operation's submit to
-   completion, an off-ring call such as `FICLONE`) is already bracketed where it is issued; one
-   over the threshold becomes a `syscall` span (`function` the call, `unit` the path). This
-   covers the daemon's own IO, on Linux and macOS, with no privilege. *Built for the off-ring
-   calls and the loop's inline steps; ring operations specified.*
-2. **Blocked samples.** The sampler already records `cpu = 'off'` samples of threads blocked
-   inside a span. On Linux it reads `/proc/self/task/<tid>/syscall` for a thread it finds
-   blocked (number and arguments, no ptrace, no seccomp), and names the fd's path from
-   `/proc/self/fd`. On macOS, without root, `proc_pidinfo(PROC_PIDTHREADINFO)` gives the
-   thread's run state and `thread_get_state` its pc, named through the image; kperf's kdebug
-   syscall tracing needs root and is not used (rule macos-private-apis: said in
-   docs/macos.md). *Specified.*
-3. **The view.** `syscalls`: the `syscall` spans and the blocked samples by thread and span,
-   which `blaze debug syscalls` prints. `harness/v2/loop_syscalls.py` (strace) stays as the
-   cross-check from outside.
+```
+$ blaze debug syscalls --loop --over 20
+at_ms    ms       thread      seen_as            call                                   inside                times
+-------  -------  ----------  -----------------  -------------------------------------  --------------------  -----
+212.4             blaze       loop step in line  place outputs: 889 ms                                        1
+214.0    889.012  blaze-io-2  io call            io clone /w/target/debug/hello         loop: place outputs   1
+2 rows
+```
+
+What it reads today, each already in the profile, on Linux and macOS with no privilege:
+
+1. **The drivers' file calls off the loop** (`io call`): `blaze_core::lock::io_wait` brackets
+   each clone, write-back and listing a driver makes off its ring in a `wait` span whose
+   `awaits` is `io <op> <file>` (commit 97d29fb72c), so the call, its file, its time, its
+   thread and the span it was made in are rows.
+2. **The loop's steps that ran in line past 20 ms** (`loop step in line`): the `loop stalled`
+   spans (c).
+3. **Blocked samples** (`blocked samples`): the sampler's `cpu = 'off'` samples of threads
+   blocked inside a span, by stack and span, with the time they stand for at 49 a second.
+
+What is specified and not built, in the order to build it:
+
+- **Ring operations.** The io_uring driver stamps each submission; a completion that arrives
+  more than 1 ms after it becomes a `wait` span of kind io, `awaits` `io <opcode> <file>`, as
+  the off-ring calls are. That makes every slow operation of the daemon's own IO a row, always
+  on, at the cost of a clock read per submission.
+- **The blocked thread's system call (Linux).** The release sampler (perf_event) takes no
+  off-CPU sample, and a blocked sample has no stack. The stall watchdog's reader thread, once
+  a second, reads `/proc/self/task/<tid>/stat` for each thread with an open span and, for one
+  in state `S` or `D` longer than 20 ms, `/proc/self/task/<tid>/syscall` (the call's number
+  and arguments; no ptrace, no seccomp) and `/proc/self/fd/<n>` for a descriptor argument,
+  and writes a `blocked` sample with the call and the path as its stack's one frame. The
+  parsing is `blaze_usercode::blocked` (item l), which already reads the same files of a
+  sandboxed run.
+- **macOS.** Without root: `proc_pidinfo(PROC_PIDTHREADINFO)` gives each thread's run state
+  and `thread_get_state` its pc, named through the images; `ulock` waits are already `wait`
+  spans (`blaze_core::wait`). kperf's kdebug system call tracing needs root and is not used;
+  docs/macos.md's audit says which private interfaces the tree calls.
+
+`harness/v2/loop_syscalls.py` (strace) stays as the cross-check from outside: a system call no
+driver times and no sample caught is only there.
 
 ## m. Agent-readable everything
 
