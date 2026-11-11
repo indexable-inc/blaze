@@ -1036,7 +1036,8 @@ pub(super) const BLAZE: &[Lint] = &[
     l("blaze::stale_hot_marker", Warn, "detects a function marked hot (`#[deny(blaze::hot)]`) that the configured profile counts as cold or never run")
         .externally_loaded(),
     l("blaze::hot_marked_cold", Warn, "detects a `#[cold]` function that the configured profile shows hot")
-        .externally_loaded(),    l("blaze::push_without_reserve", Warn, "detects an empty `Vec` or `String` pushed to once per iteration of a loop whose count is known before it starts, which `with_capacity` would allocate once")
+        .externally_loaded(),
+    l("blaze::push_without_reserve", Warn, "detects an empty `Vec` or `String` pushed to once per iteration of a loop whose count is known before it starts, which `with_capacity` would allocate once")
         .externally_loaded(),
     l("blaze::scratch_in_loop", Warn, "detects a `Vec`, `String` or hash map made, grown and dropped in every iteration of a loop, which made once and cleared would keep its capacity")
         .externally_loaded(),
@@ -1129,6 +1130,7 @@ pub(super) const BLAZE: &[Lint] = &[
     l("blaze::could_be_program_lifetime", Allow, "detects a private type with no `Drop` whose every instance is built into a `static` or leaked, and so already lives until the program exits: `#[blaze::program_lifetime]` and the program arena would hold it by 4-byte references with no count")
         .externally_loaded(),
     l("blaze::could_be_ref32", Allow, "detects a field or collection element of a struct stored many times that holds a `#[blaze::program_lifetime]` type as `&'static T`, `Arc<T>`, `Rc<T>` or `Box<T>`, where a `Ref32<T>` is half the size")
+        .externally_loaded(),
     l("blaze::span_field_unrecorded", Allow, "detects a field of a `tracing` span or event of the target `blaze` that the profile keeps nothing of")
         .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.

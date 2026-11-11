@@ -1849,7 +1849,7 @@ pub struct Uring {
 /// Where the host's effects are told: the channel of the work off the ring, and its wake.
 struct HostSink {
     done: crossbeam_channel::Sender<Completion>,
-    wake: Arc<OwnedFd>,
+    wake: Arc<Wake>,
 }
 
 impl crate::host::Sink for HostSink {

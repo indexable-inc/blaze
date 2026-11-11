@@ -853,7 +853,7 @@ impl World {
         for completion in out.drain(..) {
             match self.loads.owns(completion.tag) {
                 true => self.loads.complete(&self.pool, completion, &mut self.ended),
-                false => self.written(completion)?,
+                false => self.written(&completion)?,
             }
         }
         self.out = out;
@@ -959,7 +959,7 @@ impl World {
     /// completed, the sync is asked; once the sync has, the append is the file's, in the pool
     /// and in the model (the head's flip). A write or a sync that failed gives the append up:
     /// nothing of it was committed.
-    fn written(&mut self, completion: Completion) -> Result<(), Broke> {
+    fn written(&mut self, completion: &Completion) -> Result<(), Broke> {
         let actor = std::mem::replace(&mut self.actors[COMMITTER], Actor::Idle);
         let Actor::Appending { file, append, bytes, records, checks, mut writes, mut failed, syncing } = actor else {
             return Err(Broke::Harness(format!("a completion neither a load nor the commit asked for: {completion:?}")));

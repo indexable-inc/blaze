@@ -305,7 +305,7 @@ pub trait Interner:
     /// expression of the same constants (`#![feature(blaze_const_exprs)]`: `{ N + M }` and
     /// `{ M + N }`), by a normal form the interner computes. `false` wherever no generic const
     /// expression is involved.
-    fn same_const_expression(self, a: Self::Const, b: Self::Const) -> bool;
+    fn same_const_expression(self, a: Const<Self>, b: Const<Self>) -> bool;
 
     type GenericsOf: GenericsOf<Self>;
     fn generics_of(self, def_id: Self::DefId) -> Self::GenericsOf;

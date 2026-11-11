@@ -144,11 +144,15 @@ fn sides(rule: &Rewrite) -> (Graph, [Id; 2], usize) {
     (graph, [lhs, rhs], used)
 }
 
+/// The coordinates of a point: both sides' variables. Named because the released blaze
+/// (stage 0) cannot infer `[f64; 2 * MAX_VARS]` written inline in an `impl FnMut` parameter.
+const POINT: usize = 2 * MAX_VARS;
+
 /// Every point whose first `used` coordinates are each one of `values`, the rest 1.
-fn grid(values: &[f64], used: usize, mut each: impl FnMut(&[f64; 2 * MAX_VARS])) {
+fn grid(values: &[f64], used: usize, mut each: impl FnMut(&[f64; POINT])) {
     let mut at = [0usize; MAX_VARS];
     loop {
-        let mut point = [1.0; 2 * MAX_VARS];
+        let mut point = [1.0; POINT];
         for slot in 0..used {
             point[slot] = values[at[slot]];
         }

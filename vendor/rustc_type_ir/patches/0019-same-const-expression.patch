@@ -6,7 +6,7 @@ src/interner.rs --- Rust
 ... 305     /// expression of the same constants (`#![feature(blaze_const_exprs)]`: `{ N + M }` and
 ... 306     /// `{ M + N }`), by a normal form the interner computes. `false` wherever no generic const
 ... 307     /// expression is involved.
-... 308     fn same_const_expression(self, a: Self::Const, b: Self::Const) -> bool;
+... 308     fn same_const_expression(self, a: Const<Self>, b: Const<Self>) -> bool;
 303 309 
 304 310     type GenericsOf: GenericsOf<Self>;
 305 311     fn generics_of(self, def_id: Self::DefId) -> Self::GenericsOf;

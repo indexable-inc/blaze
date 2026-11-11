@@ -778,11 +778,11 @@ fn assert_dead_is_exact(store: &Store) {
         let mut unfound = 0;
         let mut offset = PACK_HEADER;
         while offset < pack.end {
-            if pack.bytes(offset, 4).unwrap() == [0; 4] {
+            if pack.bytes(look, offset, 4).unwrap() == [0; 4] {
                 offset = (offset + 1).next_multiple_of(disk::BLOCK);
                 continue;
             }
-            let header = RecordHeader::decode(pack.bytes(offset, RECORD_HEADER).unwrap()).unwrap();
+            let header = RecordHeader::decode(pack.bytes(look, offset, RECORD_HEADER).unwrap()).unwrap();
             let found = matches!(
                 look.find(&header.key),
                 Some(Ok(found)) if matches!(found.place, Place::Pack(loc) if loc.pack as usize == at && loc.offset == offset)
@@ -994,12 +994,13 @@ fn end_the_migration(store: &mut Store) {
 fn assert_spots_hold_their_value(store: &Store, key: &Key) {
     let own = &store.tiers[0];
     let held = Held::writer(&*store.shared);
+    let look = store.look();
     for (name, table) in
         std::iter::once(("the delta", &own.delta)).chain(own.prev.iter().map(|it| ("prev", it)))
     {
         let Some((_, spot)) = table.get(held, key) else { continue };
         let header = match spot.place {
-            Place::Pack(loc) => own.packs[loc.pack as usize].bytes(loc.offset, RECORD_HEADER),
+            Place::Pack(loc) => own.packs[loc.pack as usize].bytes(look, loc.offset, RECORD_HEADER),
             // SAFETY: a chunk a table's spot names is freed only after a move takes the spot and
             // a grace passes, and this thread, the store's, makes the moves.
             Place::Segment(seg) => unsafe { seg.chunk.get().bytes(seg.offset, RECORD_HEADER) },
@@ -3296,7 +3297,7 @@ fn a_long_cold_value_is_compressed_without_a_dictionary_over_a_long_window() {
     flush(&mut sim, &mut store);
     let loc = store.loc_of(&key(1));
     let header = RecordHeader::decode(
-        store.tiers[0].packs[loc.pack as usize].bytes(loc.offset, RECORD_HEADER).unwrap(),
+        store.tiers[0].packs[loc.pack as usize].bytes(store.look(), loc.offset, RECORD_HEADER).unwrap(),
     );
     assert_eq!(header.unwrap().dictionary, NO_DICTIONARY);
     drop(store);
