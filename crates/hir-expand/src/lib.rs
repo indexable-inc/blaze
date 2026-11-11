@@ -695,7 +695,7 @@ impl MacroCallId {
             parsed.err.as_ref().is_some_and(|err| err.kind().proc_macro_gave_no_expansion());
         let e: ExpandResult<Arc<[SyntaxError]>> = parsed.as_ref().map(|it| match gave_none {
             // alloc: error path, an empty slice
-            true => Arc::from(&[][..]),
+            true => Arc::from(Vec::<SyntaxError>::new()),
             false => Arc::from(it.0.errors()),
         });
         if e.value.is_empty() && e.err.is_none() { None } else { Some(e) }
