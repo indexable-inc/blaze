@@ -58,13 +58,18 @@ See [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#wor
 
 ## fan-out-write-only (rule 35)
 
-Fan out code, not builds. Subagents only read and write code, including the tests for it. They never
-run a build, check, test, clippy, benchmark or any other expensive step, and never start a daemon or
-a VM. The main agent waits until every subagent has finished writing, applies all their changes to
-one tree, and then runs it once: `blaze check` and `blaze test` (the central loop), with keep-going.
-It hands each failure back to a fresh subagent for the code that broke, with the exact tree, the
-command and the error, and runs again. Checks that need a variant tree, such as reverting a fix to
-show its test fails (test-the-cause), are also run by the main agent, as patches.
+The time that matters is from a change to knowing whether it works. A lane given its own ix VM (one
+per lane, `ix new --name <lane>`, named in its brief; never the Mac, never a shared VM, never AWS)
+closes that loop itself: it ships its worktree there, runs `blaze check` with tests and `blaze test`
+for what it touched, reads the errors and fixes them, and reports results, not "nothing was
+compiled". It builds only with blaze (`blaze-builds-blaze`), on the compiler its brief names,
+touches nothing it did not make, and removes its VM when done (`clean-up-lane`). A lane with no VM
+only reads and writes code and says plainly that nothing was built. What stays with the main agent:
+merging to main, and before a merge one check of the exact tip being merged, tests included (a
+library build alone is not "compiles"); every measurement a speed or memory claim rests on, with its
+exact tree (`measure-the-exact-tree`); changes to persisted state, the bootstrap and the pinned
+compiler; and deciding what to do next. Use few lanes (`agents-are-a-cost`): a VM per lane is 64
+cores, so each must be worth it.
 
 ## worktree-per-lane (rule 36)
 

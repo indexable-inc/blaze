@@ -1,0 +1,133 @@
+{
+ "about": "Decisions the main agent made on its own authority, with what it recommended and where each stands. Andrew, 2026-11-11: \"just be proactive and do what you need to do; make a decisions.json file with all your decisions and what you recommended and just do things and get blaze to work\". A decision here is reversed by Andrew saying so; one that changes a rule also changes tools/agents/rules.ts.",
+ "decisions": [
+  {
+   "id": "D1",
+   "date": "2026-11-11",
+   "decision": "Lanes with their own ix VM build, check and test their own work. Merges to main, measurements that claims rest on, persisted-state and bootstrap changes, and the check before a merge stay with the main agent.",
+   "why": "The round trip through the main agent cost 10 to 40 minutes per fix all day; a lane with a VM closes the loop in minutes.",
+   "recommended": "Yes, for the speed lanes first.",
+   "state": "done: rule fan-out-write-only rewritten"
+  },
+  {
+   "id": "D2",
+   "date": "2026-11-11",
+   "decision": "One new blaze built from today's tree becomes the compiler for all work (a blaze built earlier is a legal stage 0). It is used on the VMs as soon as stage 2 passes; a release follows when main's gate is green.",
+   "why": "The old release has its own faults and does not know the lint ratchet or the language extensions; most of the day's detours came from building with it.",
+   "recommended": "Yes.",
+   "state": "in progress: stage 2 running on two VMs"
+  },
+  {
+   "id": "D3",
+   "date": "2026-11-11",
+   "decision": "\"Compiles\" means `blaze check` with tests on the exact tip, by a blaze that knows the tree's rules, before a merge.",
+   "why": "Main was merged on a library build by the old release; its daemon tests and its own lint check did not pass.",
+   "recommended": "Yes.",
+   "state": "in force"
+  },
+  {
+   "id": "D4",
+   "date": "2026-11-11",
+   "decision": "A crate with no line in a lint baseline is unmeasured (held at warn until a bless records it), not zero. Vendored third-party crates and the std-only script crates are exempt from blaze's own style lints by rule.",
+   "why": "A new crate could not pass the check, so could not be blessed, so could never get a line; 3,931 lint errors in script and vendored crates stopped the tree's own check.",
+   "recommended": "Yes to both.",
+   "state": "partly done: 89 crates listed unmeasured by hand on edit-all-1111; the rule change in blaze-lints and blaze-units is to do"
+  },
+  {
+   "id": "D5",
+   "date": "2026-11-11",
+   "decision": "Memory is a first priority beside edit latency: front-end results become store records read through the pool, and the allocator returns freed memory.",
+   "why": "Memory stopped work three times on 2026-11-11 (58 GB for one crate's tests, 81 GiB for blaze building blaze, 61 to 71 GB on reth and tempo); the same change fixes edits after a restart.",
+   "recommended": "Yes.",
+   "state": "to start once the new compiler exists"
+  },
+  {
+   "id": "D6",
+   "date": "2026-11-11",
+   "decision": "The optimizer's tier bars may be measured against rustc -O0, -O1 and -O3 in the optimizer's benchmark harness only. rustc stays out of every correctness path and every build.",
+   "why": "A Pareto claim needs a reference point; rule verify-on-real-projects forbids rustc as an oracle, not as a stopwatch for a published benchmark.",
+   "recommended": "Yes, as a narrow exception written into the rule when the harness is built.",
+   "state": "decided; the rule text changes with the harness (ledger B20)"
+  },
+  {
+   "id": "D7",
+   "date": "2026-11-11",
+   "decision": "Release builds keep the linker's patch room (as file holes).",
+   "why": "The file-level splice that makes release edit-links fast uses it at every optimization level.",
+   "recommended": "Keep.",
+   "state": "in force"
+  },
+  {
+   "id": "D8",
+   "date": "2026-11-11",
+   "decision": "blaze's checkout of a git dependency carries a deterministic, synthesized .git that real git can read.",
+   "why": "cargo's checkout has one and build scripts (vergen) run git there; a stub that answers one command and breaks another is worse than none.",
+   "recommended": "Build it as its own spec-then-build piece.",
+   "state": "to start"
+  },
+  {
+   "id": "D9",
+   "date": "2026-11-11",
+   "decision": "bstd's unsynced renames issue a truly unsynced rename on real drivers too.",
+   "why": "That is their documented contract; callers relying on the stronger behaviour are the bugs the simulation exists to find; nothing runs on bstd yet.",
+   "recommended": "Keep.",
+   "state": "in force on bstd-test-1111"
+  },
+  {
+   "id": "D10",
+   "date": "2026-11-11",
+   "decision": "`strip` in a profile is accepted with a named note on every build until the linker honours it (ledger D44); it is not refused.",
+   "why": "Real projects set it; refusing would stop builds the reference compiler accepts.",
+   "recommended": "Note, not refusal.",
+   "state": "written on inv-fix-1111 and verified; to merge"
+  },
+  {
+   "id": "D11",
+   "date": "2026-11-11",
+   "decision": "A missed loader probe is not part of a pure build script's key: a library appearing later at a probed path does not invalidate the kept run.",
+   "why": "Same class as system libraries, which are not keyed either; tightening it needs a design for runtime inputs as a whole.",
+   "recommended": "Leave and track.",
+   "state": "tracked"
+  },
+  {
+   "id": "D12",
+   "date": "2026-11-11",
+   "decision": "The Python fixture generator is ported once into blaze-script as its one home, together with the harness scripts that use it; loop_syscalls.py stays on the allowed list until then.",
+   "why": "A second copy of the fixture in Rust would be two homes for one concept.",
+   "recommended": "Port it with its users.",
+   "state": "to do with the harness batch"
+  },
+  {
+   "id": "D13",
+   "date": "2026-11-11",
+   "decision": "bv_decide (Lean.ofReduceBool) is allowed for bit-vector rule proofs only, in files the MIR proofs cannot import, listed by the gate.",
+   "why": "Andrew, 2026-11-11: yes to \"yes, but kept separate\".",
+   "recommended": "Yes, kept separate.",
+   "state": "done on rule-lang-1111: the gate enforces it; 3 of 248 theorems use it"
+  },
+  {
+   "id": "D14",
+   "date": "2026-11-11",
+   "decision": "Builds by the released blaze that fault (the forged-id panic, a loop stall) are retried by the VM scripts, each retry printed with its cause, until the use-after-release behind the panic is found.",
+   "why": "The panic happens from a clean database, so clearing state is not a fix; a loud retry keeps work moving without hiding it.",
+   "recommended": "Retry loudly; find the cause on the new compiler.",
+   "state": "in force"
+  },
+  {
+   "id": "D15",
+   "date": "2026-11-11",
+   "decision": "One large ix VM per concurrent heavy job (bootstrap, target projects, verification, a building lane); a VM is removed when its job ends.",
+   "why": "Verification capacity, not writing, was the day's bottleneck; a 62 GB VM was OOM-killed and one VM lost its disk.",
+   "recommended": "Yes.",
+   "state": "in force: rework-b (bootstrap), rework-t (reth, tempo), rework-d, rework-e, rework-s"
+  },
+  {
+   "id": "D16",
+   "date": "2026-11-11",
+   "decision": "A branch is admin-merged to main when its own content is verified on a VM, in small pieces as each goes green, rather than held for one large merge.",
+   "why": "Andrew, 2026-11-11: \"can we admin merge anything in as well\". Long-lived unmerged branches were the source of the semantic conflicts that broke main.",
+   "recommended": "Merge what is verified now: the invariant controls with the strip note and the nostd port; the lint baselines; the three compiler fixes (memory budget, loader reads, effect-check binder) once stage 2 passes with them.",
+   "state": "in progress"
+  }
+ ]
+}
