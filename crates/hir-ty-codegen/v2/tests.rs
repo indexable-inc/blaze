@@ -3931,7 +3931,9 @@ fn an_inlined_callee_that_takes_a_dyn_fn_keeps_a_matching_key() {
             frontend.describe(it, by).unwrap_or_else(|e| panic!("{it:?}: {}", e.what))
         };
         // The driver's first walk of the program: everything it reaches, then its dyn facts.
-        frontend.devirt.makes(super::RootKind::Executable, main);
+        frontend
+            .with(|hir| frontend.devirt.makes(hir, super::RootKind::Executable, main))
+            .expect("the front end walks one program");
         let (mut reached, mut queue): (Vec<(HirInstance, Origin)>, _) =
             (Vec::new(), vec![(root.clone(), origin)]);
         while let Some((at, by)) = queue.pop() {
@@ -3946,9 +3948,8 @@ fn an_inlined_callee_that_takes_a_dyn_fn_keeps_a_matching_key() {
             }
             reached.push((at, by));
         }
-        frontend.reached(&reached, &[]);
         assert!(
-            frontend.closed().expect("the program's dyn facts"),
+            frontend.closed(&reached, &[]).expect("the program's dyn facts"),
             "the premise: the program has a world"
         );
         let [callee] = &frontend.with(|hir| called(hir, &root, resize))[..] else {

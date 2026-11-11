@@ -514,7 +514,7 @@ impl Frontend for Program {
 
     /// A program with a call through a `dyn` closes its dyn facts when its first walk ends,
     /// and the walk runs again against them; the second walk's facts are the first's.
-    fn closed(&self) -> Result<bool, CodegenError> {
+    fn closed(&self, _: &[(u32, Origin)], _: &[u32]) -> Result<bool, CodegenError> {
         if self.dyn_sites.is_empty() {
             return Ok(false);
         }

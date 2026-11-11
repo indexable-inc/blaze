@@ -2016,6 +2016,10 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut graph = recursion::Graph::new();
         let mut level = graph.start(roots, static_roots, check);
         let ordered = order.as_deref().map_or(0, Vec::len);
+        // Everything the walk reached, in its order: what the front end closes the program's
+        // facts over (`Frontend::closed`).
+        // alloc: per build, one per function and static the walk reaches
+        let (mut told, mut told_statics) = (Vec::new(), Vec::new());
         let mut round = 1;
         loop {
             if level.is_empty() {
@@ -2032,7 +2036,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 if !errors.is_empty() {
                     break;
                 }
-                match self.frontend.closed() {
+                match self.frontend.closed(&told, &told_statics) {
                     Ok(false) => break,
                     Ok(true) if round == 1 => {}
                     Ok(true) => {
@@ -2060,6 +2064,8 @@ impl<'a, B: Prepare> Build<'a, B> {
                 static_asked.clear();
                 described_statics.clear();
                 described_functions.clear();
+                told.clear();
+                told_statics.clear();
                 if let Some(order) = order.as_deref_mut() {
                     order.truncate(ordered);
                 }
@@ -2074,6 +2080,9 @@ impl<'a, B: Prepare> Build<'a, B> {
             // deferred, never described by them, and what it reaches never walked from it.
             graph.level(self.frontend, &mut level, errors);
             self.frontend.reached(&level.functions, &level.statics);
+            // clone: per build, the walk's handle of each function and static it reached
+            told.extend_from_slice(&level.functions);
+            told_statics.extend_from_slice(&level.statics); // clone: as above
             // The span of a describe is the front end's, opened where it describes
             // (`hir-ty-codegen`'s `codegen describe`, named for its function): a kept describe
             // the front end says still holds opens none, so the spans of a level are the

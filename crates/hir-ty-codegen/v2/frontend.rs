@@ -1113,7 +1113,6 @@ impl Frontend for HirFrontend<'_> {
     }
 
     fn reached(&self, functions: &[(HirInstance, Origin)], statics: &[HirStatic]) {
-        self.devirt.reached(functions, statics);
         let Some(checks) = self.checks else { return };
         let bodies: Vec<DefWithBodyId> = self.with(|db| {
             (functions.iter().filter_map(|(instance, _)| body_of(db, instance)))
@@ -1267,8 +1266,12 @@ impl Frontend for HirFrontend<'_> {
     ) -> CodegenError {
         self.with(|db| past_recursion_limit(db, instance, depth, limit, head, limit_of))
     }
-    fn closed(&self) -> Result<bool, CodegenError> {
-        self.devirt.closed(self)
+    fn closed(
+        &self,
+        functions: &[(HirInstance, Origin)],
+        statics: &[HirStatic],
+    ) -> Result<bool, CodegenError> {
+        self.devirt.closed(self, functions, statics)
     }
 }
 
