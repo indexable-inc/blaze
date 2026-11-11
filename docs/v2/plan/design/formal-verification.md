@@ -612,6 +612,26 @@ programs; it is the specification of the Rust pass of the same name.
   kernel decides. `RemoveStorageMarkers` does exactly its specification. The Rust
   `SimplifyConstCondition` also takes a condition that reads a place the statement before
   assigned a constant; there `after ≠ spec before` and the build says so.
+**The gate holds the proofs** (`harness/v2/lean_gate.py`; written 2026-11-10, its first run
+in CI pending). What is claimed proved is one list, `lean/theorems.json` (each theorem's name,
+module, what it says and its ledger row), and [proofs.md](../proofs.md) is generated from it
+with each statement as its module states it. The `lean` job of `blaze.yaml` runs the gate's
+`check` on every change, with the Lean `lean/lean-toolchain` pins:
+- `lake build` of `lean/` and of `lean/analysis` (after `lake exe cache get`), and neither log
+  may say `declaration uses 'sorry'`;
+- one generated Lean file per package runs `#print axioms` on each listed theorem: it must
+  exist and rest on nothing but `propext`, `Classical.choice` and `Quot.sound` (so a `sorry`,
+  `native_decide` or a new `axiom` under a listed theorem fails by name);
+- without Lean (`sources`, in the `scripts` job): no Lean source says `sorry`, `admit`,
+  `native_decide`, `decide +native`, `axiom`, `partial def` or `debug.skipKernelTC` outside a
+  comment, except where the list's `allow` names the file and the word (one entry: the
+  `partial def` that reads standard input in `lean/Blaze/Tests/Fnv1aMain.lean`); every listed
+  theorem is stated in its module; `lean/analysis/lake-manifest.json` is checked in and pins
+  Mathlib at `lakefile.toml`'s commit; proofs.md is current.
+
+The gate does not check that a theorem's statement says what its one line in words says: the
+statement is printed in proofs.md so a reader can.
+
 **The trusted base** (what a `(proved: ..)` of rule 57 rests on, beyond what is proved):
 - Lean's kernel, and the axioms `propext`, `Classical.choice`, `Quot.sound`.
 - That `lean/Blaze/Mir` is what Rust means, on the subset. Reduced by V6's three-way run.
@@ -664,7 +684,7 @@ the reals, in a second Lake package, `lean/analysis`. Objective V10 is the row.
 
 **What Lean has checked and what nothing has compiled.** `lake build` of `lean/analysis`
 passes with Lean 4.20.0 at commit a36c7907ae: every theorem below is checked by Lean (their
-axioms have not been printed). The Rust side of the same work has never been compiled: the
+axioms are printed and held by the gate, above). The Rust side of the same work has never been compiled: the
 generated table's wiring into `diff::RULES` and `simplify::REWRITES`, the fix of `powi` at
 `i32::MIN`, `eval::dual` and every new test are written and not built.
 
@@ -676,8 +696,9 @@ generated table's wiring into `diff::RULES` and `simplify::REWRITES`, the fix of
   `c211948581bde9846a99e32d97a03f0d5307c31e`, which is what Mathlib's tag `v4.20.0` names (the
   Mathlib built for Lean 4.20.0), and it requires `lean/` by path, so it reuses `Blaze.*` and
   does not copy it: a `powi` exponent is `Blaze.I32`, Rust's `i32` as `Blaze.Scalar` models it.
-  Build: in `lean/analysis`, `lake update`, then `lake exe cache get` (Mathlib's prebuilt
-  files; Mathlib is never compiled here), then `lake build`.
+  Build: in `lean/analysis`, `lake exe cache get` (Mathlib's prebuilt files; Mathlib is never
+  compiled here), then `lake build`. `lake-manifest.json` is checked in, so what Mathlib itself
+  needs is pinned too; `lake update` rewrites it, and is run only to move the pin.
 
 **One source for the rules.** `crates/blaze-diff/rules.json` lists the operations, each
 derivative rule (its tangent as a template, its kink, its domain, its IEEE condition) and each
