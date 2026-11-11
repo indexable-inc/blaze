@@ -1,7 +1,8 @@
 //! The park of one thread on a word and its wake from any other, a sans-IO core: the word's
 //! states and the order of its atomics, with the kernel's wait and wake handed in ([`Futex`]).
 //! On Linux the kernel is the thread's wait ring (`IORING_OP_FUTEX_WAIT` with the deadline in
-//! its registered wait region, `IORING_OP_FUTEX_WAKE`); elsewhere std's thread park. Its proof
+//! its registered wait region, `IORING_OP_FUTEX_WAKE`); on macOS the wait on an address
+//! (`os_sync_wait_on_address_with_deadline`, `wait/macos.rs`); elsewhere std's thread park. Its proof
 //! is the DST in `wait/tests.rs`, which runs these functions against a simulated futex whose
 //! wakes come between any two of their atomics ([`Futex::switch`]), and plants a lost wakeup
 //! ([`ParkPlant::CheckThenStore`]) it must catch.
