@@ -18,7 +18,7 @@
 
 use base_db::Db;
 use blaze_items::{ItemId, item_key};
-use hir_def::{AdtId, FunctionId, ItemContainerId, attrs::AttrFlags, signatures::FunctionSignature};
+use hir_def::{AdtId, FunctionId, ItemContainerId, signatures::FunctionSignature};
 use hir_ty::facts::{Fact, FactItem, FactSet, Facts, Provider};
 use hir_ty_mir::mir::dispatch::Body;
 
@@ -156,8 +156,7 @@ fn fn_facts(db: &Db, func: FunctionId) -> Facts {
 #[blaze_query::tracked(returns(ref))]
 fn adt_facts(db: &Db, adt: AdtId) -> Facts {
     let mut facts = Facts::none(item_key(db, ItemId::Adt(adt)).0.0);
-    if AttrFlags::query(db, adt.into()).contains(AttrFlags::BLAZE_PROGRAM_LIFETIME)
-        && program_lifetime::shape(db, adt).is_none()
+    if program_lifetime::declared(db, adt) && program_lifetime::shape(db, adt).is_none()
     {
         facts.declared = FactSet::one(Fact::ProgramLifetime);
     }

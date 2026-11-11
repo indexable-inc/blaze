@@ -21,7 +21,7 @@
 //! In a binary that links no analyses (a crate below `hir-ty-pure` testing itself) nothing
 //! is proved and the pass changes nothing ([`linked`]).
 
-use hir_def::{DefWithBodyId, FunctionId, ItemContainerId, Lookup, signatures::FunctionSignature};
+use hir_def::{DefWithBodyId, FunctionId, ItemContainerId, signatures::FunctionSignature};
 use rustc_abi::ExternAbi;
 use rustc_type_ir::inherent::IntoKind as _;
 
@@ -141,7 +141,7 @@ pub(super) fn unwind_edges<'db>(ctx: &Ctx<'_, 'db>, body: &mut MirBody<'db>) -> 
         }
     }
     if gone != 0 {
-        tracing::debug!(target: "blaze", owner = ?body.owner, gone, "unwind edges removed on facts");
+        tracing::debug!(target: "blaze", gone, "unwind edges removed on facts");
     }
     gone
 }
@@ -275,8 +275,7 @@ fn repeated(
 
 /// How many blocks go to each block when nothing unwinds, and one of them.
 fn predecessors(body: &MirBody<'_>) -> Vec<(u32, BasicBlockId)> {
-    // alloc: one pair a block, for the pass
-    let mut found = vec![(0u32, block_id(0)); body.basic_blocks.len()];
+    let mut found = vec![(0u32, block_id(0)); body.basic_blocks.len()]; // alloc: one pair a block, for the pass
     for (from, block) in body.basic_blocks.iter() {
         let Some(terminator) = &block.terminator else { continue };
         for to in terminator.kind.successors().chain(terminator.kind.unwind()) {
@@ -329,7 +328,7 @@ pub(super) fn merge_repeats<'db>(ctx: &Ctx<'_, 'db>, body: &mut MirBody<'db>) ->
         gone += 1;
     }
     if gone != 0 {
-        tracing::debug!(target: "blaze", owner = ?body.owner, gone, "repeated pure calls merged on facts");
+        tracing::debug!(target: "blaze", gone, "repeated pure calls merged on facts");
     }
     gone
 }
