@@ -33,12 +33,13 @@
 //! `Inline` and is refused at run time with [`TaskWhy::CannotOverlap`] (the spec makes it a
 //! compile error; that check does not exist yet).
 
-use std::{
+use alloc::{borrow::ToOwned, string::{String, ToString}};
+use core::{
     any::Any,
     cell::{Cell, RefCell},
     fmt,
     marker::PhantomData,
-    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    panic::AssertUnwindSafe,
 };
 
 use blaze_core::wait::Deadline;
@@ -46,6 +47,7 @@ use blaze_mem::Frame;
 
 use crate::{
     Plant, Stopped,
+    rt::{catch_unwind, resume_unwind},
     cx::Cx,
     host::Exit,
     io::ABANDON_WAIT,
@@ -110,7 +112,7 @@ impl fmt::Display for TaskError {
     }
 }
 
-impl std::error::Error for TaskError {}
+impl core::error::Error for TaskError {}
 
 /// How a scope's wait for its tasks ended: at its join, or when a panic dropped it.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: a stop

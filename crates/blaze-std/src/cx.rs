@@ -23,10 +23,8 @@
 //!   [`Scope::join`] ([`crate::task`]); [`Cx::scope_with`] runs a closure as one. There is no
 //!   `io.tasks()`.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use blaze_core::{Done, Tag, wait::Deadline};
 use blaze_mem::Frame;
@@ -268,7 +266,7 @@ impl Cx {
     }
 
     /// Whether this context stopped already at `now`: then a call asks nothing of the driver.
-    pub(crate) fn stopped_by(&self, now: std::time::Duration) -> Result<(), Stopped> {
+    pub(crate) fn stopped_by(&self, now: core::time::Duration) -> Result<(), Stopped> {
         if self.plant != Plant::WaitIgnoresCancel {
             self.check()?;
         }
@@ -308,8 +306,8 @@ impl Cx {
     }
 }
 
-impl std::fmt::Debug for Cx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Cx {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Cx")
             .field("span", &self.span)
             .field("deadline", &self.deadline)

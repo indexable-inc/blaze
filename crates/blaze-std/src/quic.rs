@@ -19,7 +19,7 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::time::Duration;
+use core::time::Duration;
 
 pub use blaze_http::h3::{
     ALPN, ClientConfig, Closed, ConnId, Direction, Endpoint, Error, Event, Identity, LINGER,
@@ -36,7 +36,7 @@ pub fn drain(
     transmits: &mut impl Extend<Transmit>,
     events: &mut impl Extend<Event>,
 ) -> Option<Duration> {
-    transmits.extend(std::iter::from_fn(|| endpoint.next_transmit()));
-    events.extend(std::iter::from_fn(|| endpoint.next_event()));
+    transmits.extend(core::iter::from_fn(|| endpoint.next_transmit()));
+    events.extend(core::iter::from_fn(|| endpoint.next_event()));
     endpoint.next_deadline()
 }

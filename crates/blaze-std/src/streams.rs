@@ -12,7 +12,8 @@
 //! **Finishing.** A [`Stream`] is linear, finished with [`Stream::finish`], which tells the
 //! peer no more will be sent.
 
-use std::{collections::VecDeque, fmt, sync::Arc};
+use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use core::fmt;
 
 use crate::{
     Stopped,
@@ -62,7 +63,7 @@ impl fmt::Display for StreamsError {
     }
 }
 
-impl std::error::Error for StreamsError {}
+impl core::error::Error for StreamsError {}
 
 /// Who is at the other end.
 #[derive(Clone)]

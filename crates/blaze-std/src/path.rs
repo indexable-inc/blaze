@@ -2,7 +2,8 @@
 //! a root or `..`, so every open is beneath the [`crate::fs::Dir`] it is joined to. There is no
 //! current directory. A path is refused as it is made, with a [`PathError`] naming it and why.
 
-use std::fmt;
+use alloc::{format, borrow::ToOwned, string::String};
+use core::fmt;
 
 use blaze_core::FileName;
 
@@ -37,7 +38,7 @@ impl fmt::Display for PathError {
     }
 }
 
-impl std::error::Error for PathError {}
+impl core::error::Error for PathError {}
 
 impl PathWhy {
     const fn says(self) -> &'static str {

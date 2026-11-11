@@ -2,7 +2,7 @@
 //! (docs/v2/plan/design/std.md, "Narrowing never widens"). Narrowing keeps, of the things
 //! named, those the capability reached already: never one more.
 
-use std::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 
 use crate::Plant;
 
@@ -42,6 +42,6 @@ impl<T: Clone + PartialEq> Allowed<T> {
 
     /// Only `thing`, if this allows it already.
     pub(crate) fn one(&self, thing: &T, plant: Plant) -> Allowed<T> {
-        self.only(std::slice::from_ref(thing), plant)
+        self.only(core::slice::from_ref(thing), plant)
     }
 }

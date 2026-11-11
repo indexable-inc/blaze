@@ -26,7 +26,8 @@
 //! connection nor an answer's error can be dropped unseen. [`Http::request`] is the two
 //! together.
 
-use std::{fmt, sync::Arc};
+use alloc::{borrow::ToOwned, string::{String, ToString}, sync::Arc, vec::Vec};
+use core::fmt;
 
 use blaze_http::h1;
 
@@ -106,7 +107,7 @@ impl fmt::Display for HeaderError {
     }
 }
 
-impl std::error::Error for HeaderError {}
+impl core::error::Error for HeaderError {}
 
 impl Header {
     pub fn new(name: &str, value: &str) -> Result<Header, HeaderError> {
@@ -218,7 +219,7 @@ impl fmt::Display for HttpError {
     }
 }
 
-impl std::error::Error for HttpError {}
+impl core::error::Error for HttpError {}
 
 impl From<Stopped> for HttpKind {
     fn from(stopped: Stopped) -> HttpKind {

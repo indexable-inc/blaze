@@ -22,7 +22,8 @@
 //! cannot ask the driver to stop the op: it waits for it to end, which is why it never
 //! returns before the op is done.
 
-use std::{fmt, marker::PhantomData};
+use alloc::boxed::Box;
+use core::{fmt, marker::PhantomData};
 
 use blaze_core::{Done, Effect, Tag, wait::Deadline};
 

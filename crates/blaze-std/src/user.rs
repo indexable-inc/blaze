@@ -6,7 +6,7 @@
 //! **Provider.** The simulation only ([`crate::hosted::SimHost::user`]): blaze-core has no
 //! effect that asks who the process runs as.
 
-use std::fmt;
+use core::fmt;
 
 use blaze_core::FileName;
 

@@ -2,7 +2,8 @@
 //! simulation's is virtual), deadlines on it, and sleeps that end by the task's deadline. Wall
 //! time needs an effect blaze-core does not have, so there is none yet.
 
-use std::time::Duration;
+use alloc::{format, string::String};
+use core::time::Duration;
 
 use blaze_core::{Done, Effect, wait::Deadline};
 
@@ -49,8 +50,8 @@ pub enum SleepError {
     Driver { span: &'static str, said: String },
 }
 
-impl std::fmt::Display for SleepError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for SleepError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             SleepError::Stopped(stopped) => write!(f, "bstd::clock sleep: {stopped}"),
             SleepError::Driver { span, said } => {
@@ -60,7 +61,7 @@ impl std::fmt::Display for SleepError {
     }
 }
 
-impl std::error::Error for SleepError {}
+impl core::error::Error for SleepError {}
 
 impl From<Stopped> for SleepError {
     fn from(stopped: Stopped) -> SleepError {

@@ -80,7 +80,8 @@
 //!   [`File::read_all`] and `copy_to` pass through one global allocation each read; the page
 //!   pool (std.md, S1f) replaces it with a view.
 
-use std::{fmt, marker::PhantomData, num::NonZero, sync::Arc};
+use alloc::{format, string::String, sync::Arc, vec::Vec};
+use core::{fmt, marker::PhantomData, num::NonZero};
 
 use blaze_core::{Done, Effect, FileName};
 use blaze_mem::Frame;
@@ -411,7 +412,7 @@ impl fmt::Display for FsError {
     }
 }
 
-impl std::error::Error for FsError {}
+impl core::error::Error for FsError {}
 
 impl FsError {
     fn new(op: FsOp, path: &FileName, kind: FsKind) -> FsError {

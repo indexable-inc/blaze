@@ -6,7 +6,8 @@
 //! asks for it). Signals are left out: blaze-core's only signal effect is `Kill` of a child
 //! it spawned, and watching the process's own signals needs an effect it does not have.
 
-use std::{num::NonZero, sync::Arc};
+use alloc::sync::Arc;
+use core::num::NonZero;
 
 use crate::{
     io::{Io, Missing, Offers},
@@ -89,8 +90,8 @@ impl Host {
     }
 }
 
-impl std::fmt::Debug for Host {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Host {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         self.io.host_facts(|facts| write!(f, "Host({facts:?})"))
     }
 }

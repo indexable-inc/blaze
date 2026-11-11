@@ -26,6 +26,7 @@
 //! name change made before the last of those, in any directory (a journal commits in order);
 //! a crash keeps a prefix of the changes after and undoes the rest, newest first.
 
+use alloc::vec::Vec;
 use blaze_core::{Completion, Done, Effect, FileName, Tag, sim::Sim};
 use blaze_rng::SplitMix64;
 

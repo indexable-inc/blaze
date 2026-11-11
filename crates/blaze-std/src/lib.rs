@@ -80,11 +80,18 @@
 //! | [`quic`], [`http`] | sans-IO QUIC (WebTransport over HTTP/3) and HTTP/1.1 | blaze-http |
 //! | [`test`] | the simulation, the model checker, allocation counting | blaze-core, blaze-check, blaze-alloc-count |
 //!
-//! Until S4, `alloc`'s global allocator is still underneath: the few global allocations here
+//! bstd is `#![no_std]`; `alloc`'s global allocator is still underneath until S4's runtime: the few global allocations here
 //! are the effects' own buffers (blaze-core's `Effect` owns its bytes) and errors' messages,
 //! each with its `// alloc:` line. What bstd hands back to a caller is made in the caller's
 //! allocator ([`mem::Bytes`]).
 
+// `#![no_std]` (S4, docs/v2/plan/design/sys.md): bstd names `core`, `alloc` and blaze's
+// crates only. What Rust's `std` alone provides is in `rt`, the one module that names it.
+// `alloc` is linked for its types (`Arc`, `Vec<T, A>`, `String`, `Box`): what bstd hands a
+// caller is in the caller's allocator, and each use of the global heap that remains has its
+// `// alloc:` line until the effects stop owning their bytes. Tests are built on `std` (the
+// harness, `eprintln!`).
+#![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
 #![feature(
     allocator_api,
@@ -95,6 +102,8 @@
     register_tool
 )]
 #![register_tool(blaze)]
+
+extern crate alloc;
 
 pub mod args;
 /// Sound: `AudioOut` and `AudioIn`, PCM streams pulled by the device.
@@ -156,6 +165,12 @@ pub mod requests;
 /// Name lookup alone: `Resolver`, from a `Net`, with no connect.
 pub mod resolver;
 pub mod rng;
+/// What bstd still takes from Rust's `std`: the one module that names it (S4's ban list).
+#[expect(
+    clippy::disallowed_types,
+    reason = "`LazyLock` and `OnceLock`, named here once for `bstd::sync`'s re-export, which carries the ban's reason"
+)]
+pub(crate) mod rt;
 /// Whom TLS trusts: `Roots`, a set of trust anchors.
 pub mod roots;
 /// Streams to an origin: `Streams`, from the host or a handler.
@@ -294,7 +309,7 @@ pub mod test {
 #[cfg(test)]
 mod tests;
 
-use std::{fmt, time::Duration};
+use core::{fmt, time::Duration};
 
 pub use crate::{
     clock::Clock,
@@ -345,7 +360,7 @@ impl fmt::Display for Stopped {
     }
 }
 
-impl std::error::Error for Stopped {}
+impl core::error::Error for Stopped {}
 
 /// Consumes a linear value that has no fields left to move out (a fieldless marker such as
 /// [`fs::ReadWrite`]): the one way such a value ends, besides its type's own consuming calls.

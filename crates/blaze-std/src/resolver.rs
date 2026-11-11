@@ -11,7 +11,7 @@
 //! [`Net`]: crate::net::Net
 //! [`Net::resolver`]: crate::net::Net::resolver
 
-use std::{fmt, net::SocketAddr};
+use core::{fmt, net::SocketAddr};
 
 use crate::{
     cx::Cx,

@@ -8,7 +8,8 @@
 //!
 //! [`Refused`] is how a call on any of them fails, the one shape their per-area errors share.
 
-use std::{fmt, net::IpAddr};
+use alloc::{string::String, vec::Vec};
+use core::{fmt, net::IpAddr};
 
 use crate::{
     Stopped,

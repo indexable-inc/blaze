@@ -26,7 +26,8 @@
 //! crash is never listed), and a delete is a remove. A host that offers a store directly (a
 //! wasm worker's) would be a second provider; none exists yet.
 
-use std::fmt;
+use alloc::{borrow::ToOwned, string::String, vec::Vec};
+use core::fmt;
 
 use blaze_mem::Frame;
 
@@ -81,7 +82,7 @@ impl fmt::Display for KeyError {
     }
 }
 
-impl std::error::Error for KeyError {}
+impl core::error::Error for KeyError {}
 
 /// Why `raw` is no key, if it is not.
 pub const fn refused(raw: &str) -> Option<KeyWhy> {
@@ -172,7 +173,7 @@ impl fmt::Display for KvError {
     }
 }
 
-impl std::error::Error for KvError {}
+impl core::error::Error for KvError {}
 
 impl KvError {
     /// The stop, if the wait under it stopped.

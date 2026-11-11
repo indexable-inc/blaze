@@ -33,7 +33,8 @@
 //! them ([`Offers::NATIVE`]) and a simulated one answers them from its
 //! [`SimHost`] ([`Io::script`]). Nothing stands in for a missing provider.
 
-use std::{fmt, sync::Arc, time::Duration};
+use alloc::{boxed::Box, string::{String, ToString}, sync::Arc, vec::Vec};
+use core::{fmt, time::Duration};
 
 use blaze_core::{
     Completion, Done, Driver, Effect, FileName, Tag,
@@ -331,7 +332,7 @@ impl fmt::Display for Missing {
     }
 }
 
-impl std::error::Error for Missing {}
+impl core::error::Error for Missing {}
 
 /// A simulated world: the seed every choice of it comes from, how unkind it is, its
 /// environment variables, its command line and its host.
@@ -369,7 +370,7 @@ impl SimWorld {
 /// no effect that asks the system for randomness or the host's name yet).
 #[derive(Debug)]
 pub struct NativeWorld<'a> {
-    pub root: &'a std::path::Path,
+    pub root: &'a crate::rt::RootPath,
     pub threads: usize,
     pub env: Vec<(String, String)>,
     pub args: Vec<String>,
@@ -403,7 +404,7 @@ impl fmt::Display for OpenError {
     }
 }
 
-impl std::error::Error for OpenError {}
+impl core::error::Error for OpenError {}
 
 impl Io {
     /// A whole simulated world from `seed`: an in-memory file tree, a virtual clock, a seeded
@@ -459,7 +460,7 @@ impl Io {
             seed: world.seed,
             env: world.env,
             args: world.args,
-            host: HostFacts { pid: std::process::id(), cores, name: world.host_name },
+            host: HostFacts { pid: crate::rt::process_id(), cores, name: world.host_name },
             offers: crate::host::OFFERS,
             hosted: None,
             disk: None,
@@ -870,10 +871,10 @@ impl Io {
             simulated
         };
         if !simulated {
-            std::process::exit(status);
+            crate::rt::exit(status);
         }
         // alloc: once, the unwind's payload.
-        std::panic::resume_unwind(Box::new(Exit { status }))
+        crate::rt::resume_unwind(Box::new(Exit { status }))
     }
 
     /// The driver's clock.

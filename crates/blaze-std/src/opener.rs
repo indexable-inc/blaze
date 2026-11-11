@@ -7,7 +7,7 @@
 //! something, and starting `open` or `xdg-open` as a process is not one (a program runs only
 //! in a sandbox).
 
-use std::fmt;
+use core::fmt;
 
 use crate::{
     cx::Cx,
@@ -30,7 +30,7 @@ impl fmt::Display for OpenerError {
     }
 }
 
-impl std::error::Error for OpenerError {}
+impl core::error::Error for OpenerError {}
 
 /// The user's default applications: from [`Io::opener`].
 #[derive(Clone)]

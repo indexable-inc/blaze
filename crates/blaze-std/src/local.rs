@@ -19,7 +19,8 @@
 //! the bytes or the room are there already; under a fiber layout the other end's task wakes
 //! it.
 
-use std::{collections::VecDeque, fmt, num::NonZero, sync::Arc};
+use alloc::{collections::VecDeque, sync::Arc};
+use core::{fmt, num::NonZero};
 
 use blaze_core::lock::Lock;
 
@@ -70,7 +71,7 @@ impl fmt::Display for LocalError {
     }
 }
 
-impl std::error::Error for LocalError {}
+impl core::error::Error for LocalError {}
 
 /// One direction of a pair: the bytes written and not yet read.
 struct Pipe {

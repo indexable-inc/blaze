@@ -93,7 +93,8 @@
 //! - A point that calls itself, directly or through others: its body would hold its own
 //!   [`Point`] as a constant, which code identity refuses (`hir_ty_identity::SELF_READ`).
 
-use std::{alloc::AllocError, any::Any, cell::Cell, fmt};
+use alloc::{boxed::Box, vec::Vec};
+use core::{alloc::AllocError, any::Any, cell::Cell, fmt};
 
 use blaze_mem::Frame;
 
@@ -134,7 +135,7 @@ impl Point {
         // A constant of each instance of `F`: its value is in the code identity of whatever
         // names it, so a point's own identity covers the points it calls.
         let code = const { core::reflect::code_id_of::<F>() };
-        Point { code: ContentId(code), path: std::any::type_name::<F>() }
+        Point { code: ContentId(code), path: core::any::type_name::<F>() }
     }
 
     /// Its code identity.
@@ -161,8 +162,8 @@ impl PartialEq for Point {
 
 impl Eq for Point {}
 
-impl std::hash::Hash for Point {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl core::hash::Hash for Point {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.code.hash(state);
     }
 }
@@ -425,7 +426,7 @@ impl fmt::Display for Mistyped {
     }
 }
 
-impl std::error::Error for Mistyped {}
+impl core::error::Error for Mistyped {}
 
 /// A user's evaluator: it is handed every call of the [`Eval`] made from it, nested ones too,
 /// and decides where each value comes from. It must leave `next` with a value: by running the
@@ -787,7 +788,7 @@ where
                 self.out = Some(value.clone());
                 Ok(())
             }
-            None => Err(Mistyped { point: self.point, wanted: std::any::type_name::<R>() }),
+            None => Err(Mistyped { point: self.point, wanted: core::any::type_name::<R>() }),
         }
     }
 
@@ -959,7 +960,7 @@ impl Memo {
     fn rotate(&self, kept: &mut Generations) {
         let dropped = kept.old.empty();
         self.evicted.set(self.evicted.get() + dropped as u64);
-        std::mem::swap(&mut kept.young, &mut kept.old);
+        core::mem::swap(&mut kept.young, &mut kept.old);
     }
 }
 

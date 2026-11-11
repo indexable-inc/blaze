@@ -5,7 +5,8 @@
 //! The recorder is bounded: past [`TRACE_MOST`] records it counts what it drops rather than
 //! grow (rule bounded-progress).
 
-use std::time::Duration;
+use alloc::vec::Vec;
+use core::time::Duration;
 
 /// The most records one world keeps; past it each further one is counted in
 /// [`Trace::dropped`].

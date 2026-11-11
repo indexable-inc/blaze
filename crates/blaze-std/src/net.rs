@@ -17,7 +17,8 @@
 //! There is no UDP socket ([`Net`]'s `Datagrams`) yet: blaze-core's `Effect` has no datagram
 //! effects (a bind of a UDP socket, a send to an address, a receive with its sender).
 
-use std::{fmt, net::SocketAddr, sync::Arc};
+use alloc::{borrow::ToOwned, format, string::String, sync::Arc, vec::Vec};
+use core::{fmt, net::SocketAddr};
 
 use blaze_core::{Address, Done, Effect, Tag};
 
@@ -130,7 +131,7 @@ impl fmt::Display for HostPortError {
     }
 }
 
-impl std::error::Error for HostPortError {}
+impl core::error::Error for HostPortError {}
 
 /// Why `host` is no host, if it is not: a DNS name, an IPv4 address (which is one by these
 /// rules too), or an IPv6 address in brackets. A `const fn`, shared by run time and
@@ -222,7 +223,7 @@ pub const fn refused(raw: &str) -> Option<HostPortWhy> {
         Err(why) => return Some(why),
     };
     let (host, port) = raw.as_bytes().split_at(colon);
-    let host = match std::str::from_utf8(host) {
+    let host = match core::str::from_utf8(host) {
         Ok(host) => host,
         Err(_) => return Some(HostPortWhy::BadByte),
     };
@@ -286,7 +287,7 @@ impl HostPort {
     pub fn socket_addr(&self) -> Option<SocketAddr> {
         let host = self.host();
         let host = host.strip_prefix('[').and_then(|it| it.strip_suffix(']')).unwrap_or(host);
-        let ip: std::net::IpAddr = host.parse().ok()?;
+        let ip: core::net::IpAddr = host.parse().ok()?;
         Some(SocketAddr::new(ip, self.port))
     }
 }
@@ -423,7 +424,7 @@ impl fmt::Display for NetError {
     }
 }
 
-impl std::error::Error for NetError {}
+impl core::error::Error for NetError {}
 
 pub(crate) fn error(op: NetOp, addr: &Addr, kind: NetKind) -> NetError {
     // clone: an error's address.

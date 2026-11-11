@@ -10,7 +10,8 @@
 //! **Provider.** The simulation only ([`crate::hosted::SimHost::term`]): blaze-core has no
 //! effect for a terminal's size, its modes or its input, so a native `Io` does not offer one.
 
-use std::{collections::VecDeque, fmt};
+use alloc::{borrow::ToOwned, collections::VecDeque, string::String, vec::Vec};
+use core::fmt;
 
 use crate::{
     cx::Cx,
@@ -136,7 +137,7 @@ impl fmt::Display for TermError {
     }
 }
 
-impl std::error::Error for TermError {}
+impl core::error::Error for TermError {}
 
 /// The terminal: from [`Io::term`].
 #[derive(Clone)]

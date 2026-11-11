@@ -7,7 +7,8 @@
 //! machine's store needs an effect blaze-core does not have (blaze-http's `roots` reads it
 //! ambiently, which is why bstd leaves that out).
 
-use std::{fmt, sync::Arc};
+use alloc::{sync::Arc, vec::Vec};
+use core::fmt;
 
 use crate::{Plant, name::Authority, narrow::Allowed};
 

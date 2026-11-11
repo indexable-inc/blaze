@@ -37,9 +37,9 @@
 //! });
 //! ```
 
-use std::{fmt, marker::PhantomData};
+use core::{fmt, marker::PhantomData};
 
-pub use std::cell::{Cell, UnsafeCell as RawCell};
+pub use core::cell::{Cell, UnsafeCell as RawCell};
 
 /// The kind of a scope's token and cells: invariant in `'id` (it is both read and returned
 /// by the `fn` it names), and `Send + Sync` (a `fn` pointer is), so a token moves between

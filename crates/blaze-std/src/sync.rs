@@ -28,14 +28,15 @@
               one home, and the ban stays on every use of them"
 )]
 
-pub use std::{
+pub use alloc::{rc::Rc as LocalShared, sync::Arc as Shared};
+pub use core::{
     cell::{LazyCell as LocalLazy, OnceCell as LocalOnce, RefCell as LocalLock},
-    rc::Rc as LocalShared,
-    sync::{
-        Arc as Shared, LazyLock as Lazy, OnceLock as Once,
-        atomic::{Atomic, Ordering},
-    },
+    sync::atomic::{Atomic, Ordering},
 };
+
+// The two that wait on first use are Rust std's until bstd's own wait is under them (S4's
+// ban list, `crates/blaze-std/src/rt.rs`).
+pub use crate::rt::{LazyLock as Lazy, OnceLock as Once};
 
 pub use blaze_core::lock::{Lock, LockGuard, ReadGuard, ReadLock as RwLock, Signal, WriteGuard};
 pub use blaze_spin::SpinWait;
