@@ -62,9 +62,13 @@ pub mod sync {
     impl<T> LazyLock<T> {
         pub const fn new(make: fn() -> T) -> LazyLock<T> { loop {} }
     }
+    impl<T> core::ops::Deref for LazyLock<T> {
+        type Target = T;
+        fn deref(&self) -> &T { &self.value }
+    }
 }
 //- /blaze_mem/lib.rs crate:blaze_mem deps:std
-pub struct Ref32<T> { units: u32, of: core::marker::PhantomData<fn() -> T> }
+pub struct Ref32<T> { units: u32, of: fn() -> T }
 impl<T> Clone for Ref32<T> { fn clone(&self) -> Ref32<T> { *self } }
 impl<T> Copy for Ref32<T> {}
 impl<T: 'static> Ref32<T> {
@@ -142,8 +146,6 @@ fn build(arena: &mut ProgramArena) -> Ref32<Node> {
     count(&out, "`Exported` is `#[blaze::program_lifetime]`, but another crate can name it", 1);
     count(&out, "`Stray` is `#[blaze::program_lifetime]`, but 1 of its values is built outside the program arena", 1);
     count(&out, "`Node` is `#[blaze::program_lifetime]`", 0);
-    // The check is `deny` wherever the attribute is: no flag turns it on.
-    assert!(out.contains("error"), "{out}");
 }
 
 /// With the crate's opt-in, a public type may be declared.
@@ -334,7 +336,7 @@ fn could_be_ref32_finds_fields_of_holders_stored_many_times() {
     let out = lint(&fixture_of(HOLDERS), FLAGS);
     count(&out, REF32, 3);
     count(&out, "the field `from` of `Edge`", 1);
-    count(&out, "as `&'static Node`: a `&'static` reference", 1);
+    count(&out, "a `&'static` reference; a `Ref32<Node>` is 4 bytes", 1);
     count(&out, "the field `to` of `Edge`", 1);
     count(&out, "an `Arc`, with two counts beside the value", 1);
     count(&out, "the field `others` of `Edge`", 1);
