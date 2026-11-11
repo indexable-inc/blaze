@@ -1298,6 +1298,92 @@ fn an_item_under_an_attribute_macro_given_after_its_map_was_read_is_expanded_aga
     assert!(failures.is_empty(), "{failures}");
 }
 
+/// The expanders of the macros `names` of the proc-macro crate `pm`, in its own map: whether
+/// each is one the crate's list gave.
+fn own_expanders(db: &Db, pm: Crate, names: &[&str]) -> Vec<bool> {
+    use crate::MacroId;
+    let map = crate_local_def_map(db, pm).def_map(db);
+    names
+        .iter()
+        .map(|it| match map.module(db, map.root).scope(db).get(&name(it)).take_macros() {
+            Some(MacroId::ProcMacroId(id)) => !id.loc(db).expander.is_missing(),
+            other => panic!("`{it}` is not a proc macro of the crate: {other:?}"),
+        })
+        .collect()
+}
+
+/// A proc-macro crate with a macro its root file declares (`plain`) and one an attribute
+/// macro's expansion declares (`sol`), with no macros given yet; and the two given.
+fn under_an_attribute() -> (Loaded, Crate, Vec<hir_expand::proc_macro::ProcMacro>) {
+    use hir_expand::proc_macro::{ProcMacroKind, ProcMacros};
+    let loaded = Loaded::new(
+        "//- proc_macros: identity\n//- /pm.rs crate:proc-macro:pm\n#[proc_macro]\npub fn plain(input: TokenStream) -> TokenStream { input }\n#[proc_macro]\n#[proc_macros::identity]\npub fn sol(input: TokenStream) -> TokenStream { input }\n",
+    );
+    let file = loaded.file("/pm.rs");
+    let db = &loaded.db;
+    let pm = *all_crates(db).iter().find(|it| it.data(db).root_file_id == file).expect("`pm`");
+    let fixtures = *all_crates(db)
+        .iter()
+        .find(|it| **it != pm && it.data(db).target_kind.is_proc_macro())
+        .expect("`proc_macros`");
+    let identity = ProcMacros::get_for_crate(db, fixtures)
+        .and_then(|it| it.macros().map(<[_]>::to_vec))
+        .expect("listed")
+        .into_iter()
+        .next()
+        .expect("`identity`");
+    let given = ["plain", "sol"]
+        .into_iter()
+        .map(|it| hir_expand::proc_macro::ProcMacro {
+            name: Symbol::intern(it),
+            kind: ProcMacroKind::Bang,
+            // clone: an `Arc`, the fixture's expander under another name
+            expander: identity.expander.clone(),
+            disabled: false,
+        })
+        .collect();
+    (loaded, pm, given)
+}
+
+/// The invariant: a proc-macro crate given its macros names the expander of each in its map,
+/// the one its root file declares and the one an attribute macro's expansion declares
+/// (alloy-sol-macro's `#[proc_macro] #[proc_macro_error] pub fn sol`): the crate's map is
+/// read before its module is built, when no macro of it has an expander, and resolves again
+/// when the list is given.
+#[test]
+fn a_proc_macro_under_an_attribute_macro_names_its_expander_once_its_crate_is_given_its_macros() {
+    use hir_expand::proc_macro::ProcMacros;
+    let (mut loaded, pm, given) = under_an_attribute();
+    assert_eq!(
+        own_expanders(&loaded.db, pm, &["plain", "sol"]),
+        [false, false],
+        "before its macros are built"
+    );
+    ProcMacros::give(&mut loaded.db, [(pm, Ok(given))]);
+    assert_eq!(
+        own_expanders(&loaded.db, pm, &["plain", "sol"]),
+        [true, true],
+        "given its built macros after its map was read"
+    );
+    let mut failures = String::new();
+    check_db(&loaded.db, "given built macros", &Exempt::NONE, true, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}
+
+/// The control of the invariant above: with the root's group run again only when its round-0
+/// log changed, the macro under the attribute keeps no expander, as `sol` did.
+#[test]
+fn the_oracle_catches_a_given_crate_whose_root_runs_again_only_for_its_log() {
+    use hir_expand::proc_macro::ProcMacros;
+    let (mut loaded, pm, given) = under_an_attribute();
+    let _ = own_expanders(&loaded.db, pm, &["plain", "sol"]);
+    super::input::GIVEN_READS_THE_LOG_ALONE.set(true);
+    ProcMacros::give(&mut loaded.db, [(pm, Ok(given))]);
+    let after = own_expanders(&loaded.db, pm, &["plain", "sol"]);
+    super::input::GIVEN_READS_THE_LOG_ALONE.set(false);
+    assert_eq!(after, [true, false], "the planted bug leaves `sol` with no expander");
+}
+
 /// Three crates: `main` globs `lib`, and `other` depends on neither and neither on it.
 const REACH: &str = "//- /main.rs crate:main deps:lib\npub use lib::*;\n//- /lib.rs crate:lib\npub struct A;\n//- /other.rs crate:other\npub struct O;\n";
 
