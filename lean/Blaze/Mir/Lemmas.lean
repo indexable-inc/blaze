@@ -27,6 +27,14 @@ theorem execStmt_assign (adts : List AdtDecl) (st : State) (p : Place) (rv : Rva
   rw [hp]
   exact hw
 
+/-- A statement that runs to `st1` is one step of its block. -/
+theorem execBlockFrom_step (adts : List AdtDecl) (sig : FnId → Option FnSig) (st : State)
+    (s : Statement) (rest : List Statement) (t : Terminator) (st1 : State)
+    (h : execStmt adts st s = Outcome.ok st1) :
+    execBlockFrom adts sig st (s :: rest) t = execBlockFrom adts sig st1 rest t := by
+  rw [execBlockFrom_cons, h]
+  rfl
+
 /-- A copy reads the place and leaves the state. -/
 theorem evalOperand_copy (st : State) (p : Place) (ptr : Pointer) (v : Value)
     (hp : evalPlace st p = Outcome.ok ptr) (hv : st.read ptr = Outcome.ok v) :

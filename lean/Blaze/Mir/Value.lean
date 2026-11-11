@@ -111,14 +111,18 @@ def Value.update : Value → List PathElem → Value → Outcome Value
     (Value.child old e).bind (fun inner =>
       (Value.update inner rest new).bind (fun inner' => Value.setChild old e inner'))
 
-/-- A slot after a write at a path: a write of the whole initializes it; a write of a part
-needs a value there. -/
-def Slot.store : Slot → List PathElem → Value → Outcome Slot
-  | _, [], v => Outcome.ok (Slot.init v)
-  | Slot.init old, e :: rest, v =>
-    (Value.update old (e :: rest) v).bind (fun new => Outcome.ok (Slot.init new))
-  | Slot.uninit, _ :: _, _ => Outcome.undefined Undefined.uninit
-  | Slot.moved, _ :: _, _ => Outcome.undefined Undefined.moved
+/-- A slot after a write at a path: a write of the whole initializes it, whatever it held; a
+write of a part needs a value there. The path is matched first, so a write of a whole slot
+reduces for a slot that is a variable. -/
+def Slot.store (slot : Slot) (path : List PathElem) (v : Value) : Outcome Slot :=
+  match path with
+  | [] => Outcome.ok (Slot.init v)
+  | e :: rest =>
+    match slot with
+    | Slot.init old =>
+      (Value.update old (e :: rest) v).bind (fun new => Outcome.ok (Slot.init new))
+    | Slot.uninit => Outcome.undefined Undefined.uninit
+    | Slot.moved => Outcome.undefined Undefined.moved
 
 /-- What a read of a slot gives. -/
 def Slot.load : Slot → Outcome Value

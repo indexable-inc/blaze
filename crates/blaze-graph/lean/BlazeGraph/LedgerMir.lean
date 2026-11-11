@@ -96,17 +96,52 @@ theorem step1 (hash : U64) (bytes : Slice U8) (i : Usize) (s4 s5 s6 s7 : Slot) :
   rw [← len_value bytes]
   rfl
 
+def cmpStmt : Statement :=
+  Statement.assign (Place.mk 5 [])
+    (Rvalue.binary BinOp.lt (Operand.copy (Place.mk 3 [])) (Operand.move (Place.mk 4 [])))
+
 def switchTerm : Terminator :=
   Terminator.switchInt (Operand.move (Place.mk 5 [])) [(0, 3)] 4
 
-/-- Block 2, up to its switch: the comparison is in local 5. -/
-theorem step2_compared (hash : U64) (bytes : Slice U8) (i : Usize) (s5 s6 s7 : Slot) :
-    step P (loopAt 2 hash bytes i (Slot.init (Value.int ScalarTy.Usize (Slice.len bytes)))
-        s5 s6 s7) =
-      execBlockFrom P.adts P.sig
+/-- Block 2's statement: `at < len` is in local 5, and the length is moved out of. -/
+theorem compare_len (hash : U64) (bytes : Slice U8) (i : Usize) (s5 s6 s7 : Slot) :
+    execStmt P.adts
+        (loopAt 2 hash bytes i (Slot.init (Value.int ScalarTy.Usize (Slice.len bytes))) s5 s6 s7)
+        cmpStmt =
+      Outcome.ok
         (loopAt 2 hash bytes i Slot.moved
-          (Slot.init (Value.bool (Scalar.lt i (Slice.len bytes)))) s6 s7)
-        [] switchTerm :=
+          (Slot.init (Value.bool (Scalar.lt i (Slice.len bytes)))) s6 s7) :=
+  execStmt_assign P.adts
+    (loopAt 2 hash bytes i (Slot.init (Value.int ScalarTy.Usize (Slice.len bytes))) s5 s6 s7)
+    (Place.mk 5 [])
+    (Rvalue.binary BinOp.lt (Operand.copy (Place.mk 3 [])) (Operand.move (Place.mk 4 [])))
+    (Value.bool (Scalar.lt i (Slice.len bytes)))
+    (loopAt 2 hash bytes i Slot.moved s5 s6 s7) { frame := 1, slot := 5, path := [] }
+    (loopAt 2 hash bytes i Slot.moved
+      (Slot.init (Value.bool (Scalar.lt i (Slice.len bytes)))) s6 s7)
+    (evalTwo_ok
+      (loopAt 2 hash bytes i (Slot.init (Value.int ScalarTy.Usize (Slice.len bytes))) s5 s6 s7)
+      (Operand.copy (Place.mk 3 [])) (Operand.move (Place.mk 4 [])) (binaryOp false BinOp.lt)
+      (Value.int ScalarTy.Usize i)
+      (loopAt 2 hash bytes i (Slot.init (Value.int ScalarTy.Usize (Slice.len bytes))) s5 s6 s7)
+      (Value.int ScalarTy.Usize (Slice.len bytes)) (loopAt 2 hash bytes i Slot.moved s5 s6 s7)
+      (Value.bool (Scalar.lt i (Slice.len bytes)))
+      rfl rfl
+      ((binaryOp_same BinOp.lt i (Slice.len bytes) (by decide) (by decide)).trans rfl))
+    rfl rfl
+
+/-- Block 2's switch on `true`: on to the body. -/
+theorem switch_true (hash : U64) (bytes : Slice U8) (i : Usize) (s6 s7 : Slot) :
+    execBlockFrom P.adts P.sig
+        (loopAt 2 hash bytes i Slot.moved (Slot.init (Value.bool true)) s6 s7) [] switchTerm =
+      Outcome.ok (Next.state (loopAt 4 hash bytes i Slot.moved Slot.moved s6 s7)) :=
+  rfl
+
+/-- Block 2's switch on `false`: out of the loop. -/
+theorem switch_false (hash : U64) (bytes : Slice U8) (i : Usize) (s6 s7 : Slot) :
+    execBlockFrom P.adts P.sig
+        (loopAt 2 hash bytes i Slot.moved (Slot.init (Value.bool false)) s6 s7) [] switchTerm =
+      Outcome.ok (Next.state (loopAt 3 hash bytes i Slot.moved Slot.moved s6 s7)) :=
   rfl
 
 /-- Block 2 when `at < len`: on to the body. -/
@@ -115,8 +150,19 @@ theorem step2_true (hash : U64) (bytes : Slice U8) (i : Usize) (s5 s6 s7 : Slot)
     step P (loopAt 2 hash bytes i (Slot.init (Value.int ScalarTy.Usize (Slice.len bytes)))
         s5 s6 s7) =
       Outcome.ok (Next.state (loopAt 4 hash bytes i Slot.moved Slot.moved s6 s7)) := by
-  rw [step2_compared, hlt]
-  rfl
+  have hs :
+      execBlockFrom P.adts P.sig
+          (loopAt 2 hash bytes i (Slot.init (Value.int ScalarTy.Usize (Slice.len bytes)))
+            s5 s6 s7) [cmpStmt] switchTerm =
+        execBlockFrom P.adts P.sig
+          (loopAt 2 hash bytes i Slot.moved
+            (Slot.init (Value.bool (Scalar.lt i (Slice.len bytes)))) s6 s7) [] switchTerm :=
+    execBlockFrom_step P.adts P.sig _ cmpStmt [] switchTerm _ (compare_len hash bytes i s5 s6 s7)
+  rw [hlt] at hs
+  show execBlockFrom P.adts P.sig
+      (loopAt 2 hash bytes i (Slot.init (Value.int ScalarTy.Usize (Slice.len bytes))) s5 s6 s7)
+      [cmpStmt] switchTerm = _
+  exact hs.trans (switch_true hash bytes i s6 s7)
 
 /-- Block 2 when `at >= len`: out of the loop. -/
 theorem step2_false (hash : U64) (bytes : Slice U8) (i : Usize) (s5 s6 s7 : Slot)
@@ -124,8 +170,19 @@ theorem step2_false (hash : U64) (bytes : Slice U8) (i : Usize) (s5 s6 s7 : Slot
     step P (loopAt 2 hash bytes i (Slot.init (Value.int ScalarTy.Usize (Slice.len bytes)))
         s5 s6 s7) =
       Outcome.ok (Next.state (loopAt 3 hash bytes i Slot.moved Slot.moved s6 s7)) := by
-  rw [step2_compared, hlt]
-  rfl
+  have hs :
+      execBlockFrom P.adts P.sig
+          (loopAt 2 hash bytes i (Slot.init (Value.int ScalarTy.Usize (Slice.len bytes)))
+            s5 s6 s7) [cmpStmt] switchTerm =
+        execBlockFrom P.adts P.sig
+          (loopAt 2 hash bytes i Slot.moved
+            (Slot.init (Value.bool (Scalar.lt i (Slice.len bytes)))) s6 s7) [] switchTerm :=
+    execBlockFrom_step P.adts P.sig _ cmpStmt [] switchTerm _ (compare_len hash bytes i s5 s6 s7)
+  rw [hlt] at hs
+  show execBlockFrom P.adts P.sig
+      (loopAt 2 hash bytes i (Slot.init (Value.int ScalarTy.Usize (Slice.len bytes))) s5 s6 s7)
+      [cmpStmt] switchTerm = _
+  exact hs.trans (switch_false hash bytes i s6 s7)
 
 /-- Block 3: the function returns `hash`. -/
 theorem step3 (hash : U64) (bytes : Slice U8) (i : Usize) (s4 s5 s6 s7 : Slot) :
@@ -138,10 +195,12 @@ def readPlace : Place := Place.mk 2 [ProjElem.deref, ProjElem.index 3]
 def readStmt : Statement :=
   Statement.assign (Place.mk 6 []) (Rvalue.use (Operand.copy readPlace))
 
-def bodyRest : List Statement :=
-  [Statement.assign (Place.mk 7 []) (Rvalue.cast (Operand.move (Place.mk 6 [])) ScalarTy.U64),
-   Statement.assign (Place.mk 1 [])
-     (Rvalue.binary BinOp.bitXor (Operand.copy (Place.mk 1 [])) (Operand.move (Place.mk 7 [])))]
+def castStmt : Statement :=
+  Statement.assign (Place.mk 7 []) (Rvalue.cast (Operand.move (Place.mk 6 [])) ScalarTy.U64)
+
+def xorStmt : Statement :=
+  Statement.assign (Place.mk 1 [])
+    (Rvalue.binary BinOp.bitXor (Operand.copy (Place.mk 1 [])) (Operand.move (Place.mk 7 [])))
 
 def mulTerm : Terminator :=
   Terminator.call (Callee.intrinsic Intrinsic.wrappingMul)
@@ -182,6 +241,59 @@ theorem read_byte (hash : U64) (bytes : Slice U8) (i : Usize) (s4 s5 s6 s7 : Slo
       (Value.int ScalarTy.U8 (bytes.val.get ⟨i.val.toNat, h⟩)) hp hv)
     rfl rfl
 
+/-- Block 4's second statement: the byte as a `u64` is in local 7. -/
+theorem cast_byte (hash : U64) (bytes : Slice U8) (i : Usize) (s4 s5 s7 : Slot) (b : U8) :
+    execStmt P.adts
+        (loopAt 4 hash bytes i s4 s5 (Slot.init (Value.int ScalarTy.U8 b)) s7) castStmt =
+      Outcome.ok
+        (loopAt 4 hash bytes i s4 s5 Slot.moved
+          (Slot.init (Value.int ScalarTy.U64 (Scalar.cast ScalarTy.U64 b)))) :=
+  execStmt_assign P.adts
+    (loopAt 4 hash bytes i s4 s5 (Slot.init (Value.int ScalarTy.U8 b)) s7)
+    (Place.mk 7 []) (Rvalue.cast (Operand.move (Place.mk 6 [])) ScalarTy.U64)
+    (Value.int ScalarTy.U64 (Scalar.cast ScalarTy.U64 b))
+    (loopAt 4 hash bytes i s4 s5 Slot.moved s7) { frame := 1, slot := 7, path := [] }
+    (loopAt 4 hash bytes i s4 s5 Slot.moved
+      (Slot.init (Value.int ScalarTy.U64 (Scalar.cast ScalarTy.U64 b))))
+    (evalOne_ok
+      (loopAt 4 hash bytes i s4 s5 (Slot.init (Value.int ScalarTy.U8 b)) s7)
+      (Operand.move (Place.mk 6 [])) (castTo ScalarTy.U64)
+      (Value.int ScalarTy.U8 b) (loopAt 4 hash bytes i s4 s5 Slot.moved s7)
+      (Value.int ScalarTy.U64 (Scalar.cast ScalarTy.U64 b))
+      rfl rfl)
+    rfl rfl
+
+/-- Block 4's third statement: `hash ^= c`. -/
+theorem xor_byte (hash : U64) (bytes : Slice U8) (i : Usize) (s4 s5 : Slot) (c : U64) :
+    execStmt P.adts
+        (loopAt 4 hash bytes i s4 s5 Slot.moved (Slot.init (Value.int ScalarTy.U64 c)))
+        xorStmt =
+      Outcome.ok (loopAt 4 (Scalar.xor hash c) bytes i s4 s5 Slot.moved Slot.moved) :=
+  execStmt_assign P.adts
+    (loopAt 4 hash bytes i s4 s5 Slot.moved (Slot.init (Value.int ScalarTy.U64 c)))
+    (Place.mk 1 [])
+    (Rvalue.binary BinOp.bitXor (Operand.copy (Place.mk 1 [])) (Operand.move (Place.mk 7 [])))
+    (Value.int ScalarTy.U64 (Scalar.xor hash c))
+    (loopAt 4 hash bytes i s4 s5 Slot.moved Slot.moved) { frame := 1, slot := 1, path := [] }
+    (loopAt 4 (Scalar.xor hash c) bytes i s4 s5 Slot.moved Slot.moved)
+    (evalTwo_ok
+      (loopAt 4 hash bytes i s4 s5 Slot.moved (Slot.init (Value.int ScalarTy.U64 c)))
+      (Operand.copy (Place.mk 1 [])) (Operand.move (Place.mk 7 [])) (binaryOp false BinOp.bitXor)
+      (Value.int ScalarTy.U64 hash)
+      (loopAt 4 hash bytes i s4 s5 Slot.moved (Slot.init (Value.int ScalarTy.U64 c)))
+      (Value.int ScalarTy.U64 c) (loopAt 4 hash bytes i s4 s5 Slot.moved Slot.moved)
+      (Value.int ScalarTy.U64 (Scalar.xor hash c))
+      rfl rfl
+      ((binaryOp_same BinOp.bitXor hash c (by decide) (by decide)).trans rfl))
+    rfl rfl
+
+/-- Block 4's terminator: `hash = hash.wrapping_mul(prime)`, then block 5. -/
+theorem mul_hash (hash : U64) (bytes : Slice U8) (i : Usize) (s4 s5 s6 s7 : Slot) :
+    execBlockFrom P.adts P.sig (loopAt 4 hash bytes i s4 s5 s6 s7) [] mulTerm =
+      Outcome.ok (Next.state
+        (loopAt 5 (Scalar.wrapping_mul hash (1099511628211 : U64)) bytes i s4 s5 s6 s7)) :=
+  rfl
+
 /-- Block 4, `bytes[at]` in bounds: one byte of FNV-1a is in `hash`. -/
 theorem step4 (hash : U64) (bytes : Slice U8) (i : Usize) (s4 s5 s6 s7 : Slot)
     (h : i.val.toNat < bytes.val.length) :
@@ -189,10 +301,18 @@ theorem step4 (hash : U64) (bytes : Slice U8) (i : Usize) (s4 s5 s6 s7 : Slot)
       Outcome.ok (Next.state
         (loopAt 5 (BlazeGraph.Ledger.step hash (bytes.val.get ⟨i.val.toNat, h⟩)) bytes i
           s4 s5 Slot.moved Slot.moved)) := by
-  show (execStmt P.adts (loopAt 4 hash bytes i s4 s5 s6 s7) readStmt).bind
-    (fun st1 => execBlockFrom P.adts P.sig st1 bodyRest mulTerm) = _
-  rw [read_byte hash bytes i s4 s5 s6 s7 h]
-  rfl
+  have h0 := read_byte hash bytes i s4 s5 s6 s7 h
+  have h1 := cast_byte hash bytes i s4 s5 s7 (bytes.val.get ⟨i.val.toNat, h⟩)
+  have h2 := xor_byte hash bytes i s4 s5
+    (Scalar.cast ScalarTy.U64 (bytes.val.get ⟨i.val.toNat, h⟩))
+  have h3 := mul_hash
+    (Scalar.xor hash (Scalar.cast ScalarTy.U64 (bytes.val.get ⟨i.val.toNat, h⟩)))
+    bytes i s4 s5 Slot.moved Slot.moved
+  show execBlockFrom P.adts P.sig (loopAt 4 hash bytes i s4 s5 s6 s7)
+    [readStmt, castStmt, xorStmt] mulTerm = _
+  exact (execBlockFrom_step P.adts P.sig _ readStmt [castStmt, xorStmt] mulTerm _ h0).trans
+    ((execBlockFrom_step P.adts P.sig _ castStmt [xorStmt] mulTerm _ h1).trans
+      ((execBlockFrom_step P.adts P.sig _ xorStmt [] mulTerm _ h2).trans h3))
 
 def addStmt : Statement :=
   Statement.assign (Place.mk 3 [])
