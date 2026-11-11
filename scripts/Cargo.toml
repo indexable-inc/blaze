@@ -1,0 +1,22 @@
+[package]
+name = "scripts"
+description = "The repository's scripts, one binary each (src/bin/<name>.rs), built and run by the pinned released blaze: `blaze run -p scripts --bin <name> -- '<json>'` (docs/v2/plan/design/scripts.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# Every file of src/bin is a script, a binary cargo finds by its name; `selftest` is its test.
+
+[dependencies]
+blaze-script.workspace = true
+regex.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+toml = { workspace = true, features = ["preserve_order"] }
+
+[lints]
+workspace = true

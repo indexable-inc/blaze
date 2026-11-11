@@ -2,6 +2,8 @@
 members = [
     "crates/*",
     "fuzz",
+    # The repository's scripts, built by the pinned released blaze (docs/v2/plan/design/scripts.md).
+    "scripts",
     # ix's linter and rewriter (tools/astlog/UPSTREAM).
     "tools/astlog/cli",
     "tools/astlog/core",
@@ -341,6 +343,7 @@ blaze-explore = { path = "crates/blaze-explore" }
 blaze-explore-core = { path = "crates/blaze-explore-core" }
 blaze-protocol = { path = "crates/blaze-protocol" }
 blaze-report = { path = "crates/blaze-report" }
+blaze-script = { path = "crates/blaze-script" }
 blaze-serde = { path = "crates/blaze-serde" }
 blaze-serde-derive = { path = "crates/blaze-serde-derive" }
 blaze-ui = { path = "crates/blaze-ui" }
