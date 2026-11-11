@@ -583,6 +583,26 @@ fn derived_once(sim: &mut Sim, len: usize, ranges: u64, range: usize) -> (Store,
     (store, base, gives)
 }
 
+/// A derived value read back as a file is its base's bytes with every recipe's ranges
+/// written, down a chain; [`Reader::get`] of it is the recipe. (A dev executable adopted from
+/// a record after a restart was handed the recipe as its image: "Unknown file magic".)
+#[test]
+fn a_derived_values_file_is_its_chain_applied_and_never_its_recipe() {
+    let mut sim = Sim::new(37, quiet());
+    let (mut store, base, first) = derived_once(&mut sim, 64 << 10, 2, 300);
+    let second = edit(&mut sim, &mut store, (2, &first), 3, 8192);
+    let reader = store.reader();
+    let guard = enter();
+    assert_eq!(reader.file_of(&guard, &key(1)), Ok(Some(base)));
+    assert_eq!(reader.file_of(&guard, &key(2)).unwrap().as_ref(), Some(&first));
+    assert_eq!(reader.file_of(&guard, &key(3)).unwrap().as_ref(), Some(&second));
+    assert_eq!(reader.file_of(&guard, &key(9)), Ok(None));
+    // The control: what `get` gives of it is the recipe, a few hundred bytes, no file.
+    let recipe = reader.get(&guard, &key(3)).unwrap().unwrap();
+    assert_eq!(recipe.kind, Kind::Derived);
+    assert_ne!(recipe.bytes, &second[..]);
+}
+
 /// The one place asked, driven to its end.
 fn placed_one(sim: &mut Sim, store: &mut Store, effects: &mut Vec<Effect>) -> Placed {
     drive(sim, store, effects);

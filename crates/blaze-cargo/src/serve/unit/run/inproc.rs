@@ -261,7 +261,7 @@ impl DevRuns {
         path: &str,
         runs_from: Option<&str>,
         key: Key,
-        bytes: impl FnOnce() -> Result<&'b [u8], String>,
+        bytes: impl FnOnce() -> Result<std::borrow::Cow<'b, [u8]>, String>,
     ) -> Result<Told, String> {
         // clone: a count, once per replayed dev executable
         let held = self.programs.pin().get(path).cloned().filter(|it| it.program.file() == key.0.0);
@@ -273,7 +273,7 @@ impl DevRuns {
                 let _span = tracing::info_span!(target: "blaze", "dev run adopt", path, len).entered();
                 let host = self.host()?;
                 let name = path.rsplit('/').next().unwrap_or(path);
-                Arc::new(adopted(&host, name, bytes, key)?)
+                Arc::new(adopted(&host, name, &bytes, key)?)
             }
         };
         let replaced = hold(self, path, runs_from, &loaded);

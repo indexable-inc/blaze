@@ -2463,18 +2463,21 @@ fn held(job: &Job, unit: usize, kept: &mut Compiled) -> Result<(), Failed> {
     for output in programs() {
         let path = output.path.as_str();
         // Read only when the daemon does not hold the program by this key already.
+        // The file itself: an image the store keeps as what its link changed of the one
+        // before it (`Kind::Derived`) is a recipe under its key, and its file is its base's
+        // with the recipes' ranges written (`blaze_cas::Reader::file_of`), never the recipe.
         let bytes = || match kept.puts.iter().find(|it| it.key == output.key) {
-            Some(put) => Ok(&put.bytes[..]),
-            None => match job.input.store.get(&guard, &output.key) {
-                Ok(Some(it)) => Ok(it.bytes),
+            Some(put) if put.kind != Kind::Derived => Ok(std::borrow::Cow::Borrowed(&put.bytes[..])),
+            _ => match job.input.store.file_of(&guard, &output.key) {
+                Ok(Some(it)) => Ok(std::borrow::Cow::Owned(it)),
                 // alloc: error path
                 Ok(None) => Err(format!(
                     "its record names the output {:x}, which the store does not hold",
                     output.key.0
                 )),
                 // alloc: error path
-                Err(corrupt) => Err(format!(
-                    "reading the output {:x} from the store: {corrupt}",
+                Err(why) => Err(format!(
+                    "reading the output {:x} from the store: {why}",
                     output.key.0
                 )),
             },

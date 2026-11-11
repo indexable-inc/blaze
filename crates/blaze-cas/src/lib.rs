@@ -1104,6 +1104,65 @@ impl Reader {
         Derivable::No(NoBase::Chain(most))
     }
 
+    /// The file the value of `key` is, as bytes: its own bytes, or for a derived value
+    /// ([`Kind::Derived`], whose bytes are a recipe) its base's file with each recipe's
+    /// ranges written and its length set, down the chain to a value that is no recipe.
+    /// `None` when the store has no value of `key`. For a caller that reads an output back by
+    /// its bytes (a dev executable adopted from a record): [`Reader::get`] of a derived value
+    /// gives the recipe, never the file. Bounded by [`derived::CHAIN_MOST`]; a longer chain,
+    /// a base the store lacks and a recipe that cannot be read are errors naming the key.
+    pub fn file_of(&self, guard: &Guard, key: &Key) -> Result<Option<Vec<u8>>, String> {
+        let look = self.look(guard);
+        // alloc: the recipes' keys, newest first; once per file read back
+        let mut chain: Vec<Key> = Vec::new();
+        let mut at = *key;
+        let mut out = loop {
+            // alloc: the error of a corrupt value
+            let entry = look.get(&at).map_err(|corrupt| corrupt.to_string())?;
+            let entry = match entry {
+                Some(entry) => entry,
+                None if chain.is_empty() => return Ok(None),
+                // alloc: an error, once
+                None => {
+                    return Err(format!(
+                        "the derived value {key:?} is made from {at:?}, which the store does not hold"
+                    ));
+                }
+            };
+            if entry.kind != Kind::Derived {
+                // alloc: the file, which the caller owns
+                break entry.bytes.to_vec();
+            }
+            if chain.len() as u32 > derived::CHAIN_MOST {
+                // alloc: an error, once
+                return Err(format!(
+                    "the derived value {key:?} is the last of more than {} derived values in a row",
+                    derived::CHAIN_MOST
+                ));
+            }
+            let recipe = derived::decode(entry.bytes)
+                // alloc: an error, once
+                .map_err(|why| format!("the derived value {at:?} holds {why}"))?;
+            chain.push(at);
+            at = recipe.base;
+        };
+        // Oldest first: each recipe over the file before it.
+        for at in chain.iter().rev() {
+            // alloc: the error of a corrupt value
+            let entry = look.get(at).map_err(|corrupt| corrupt.to_string())?;
+            let recipe = entry
+                .and_then(|entry| derived::decode(entry.bytes).ok())
+                // alloc: an error, once
+                .ok_or_else(|| format!("the derived value {at:?} went while its file was made"))?;
+            out.resize(recipe.len as usize, 0);
+            for (offset, bytes) in recipe.ranges() {
+                let offset = offset as usize;
+                out[offset..offset + bytes.len()].copy_from_slice(bytes);
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// Whether the put that got `ticket` is durable.
     pub fn durable(&self, ticket: Ticket) -> bool {
         self.shared.durable(ticket)
