@@ -3067,8 +3067,10 @@ fn gpu_msl(job: &Job, unit: usize, ok: bool, module: Module<'_>) -> Result<Optio
             // alloc: once per device unit linked, the MSL for its dependents
             Some((_, Written::Bytes(bytes) | Written::Linked(bytes, _), _)) => bytes.clone(),
             // A device unit's MSL is written whole as its link makes it (`Written::Bytes`); a
-            // kept image or a patch of one holds no bytes here to hand its dependents.
-            Some((_, Written::Kept(_) | Written::Derived { .. }, _)) | None => {
+            // kept image, a patch of one or an image handed over as its runs holds no bytes
+            // here to hand its dependents.
+            Some((_, Written::Kept(_) | Written::Derived { .. } | Written::Runs { .. }, _))
+            | None => {
                 return Err(error("its link wrote no MSL there".to_owned()));
             }
         },
