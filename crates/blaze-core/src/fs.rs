@@ -212,6 +212,7 @@ pub(crate) fn write_back(path: &Path) -> io::Result<()> {
 /// the file's data out and, on Apple's, leaves it in the drive's cache (`F_FULLFSYNC` is the
 /// durable one, and is not asked for).
 #[cfg(all(unix, not(target_os = "linux")))]
+#[expect(unsafe_code, reason = "fsync, the one call that writes a file's data back")]
 pub(crate) fn write_back(path: &Path) -> io::Result<()> {
     use std::os::fd::AsRawFd as _;
     let file = File::open(path)?;
