@@ -13,7 +13,7 @@ remembered. How rows are picked, worked and landed is
 `harness/v2/ledger.py`. A check in *italics* is not written yet, and writing it is the first
 part of the work. `?` is not measured; "last known" is a lead, not a status.
 
-87 objectives: 0 met, 0 open, 0 blocked, 87 not measured.
+88 objectives: 0 met, 0 open, 0 blocked, 88 not measured.
 
 ## Targets
 
@@ -37,6 +37,7 @@ What a user feels, on one warm machine.
 | T14 | Every bound in bounds.md is within 10% | `budgets.py {"budgets": ["bounds"]}` |  | ? |
 | T15 | A warm no-op build, a comment edit and a body edit of the smoke's two fixtures hold every bound of harness/v2/guards.py (none worse than its known failure), and a build script that runs $RUSTC ends inside the sandbox | `budgets.py {"command": "smoke"}` | not run: guards-known.toml's numbers are hand-traced, to be recorded on a built blaze (11-10) | ? |
 | T16 | A body edit's answer is not held by the store's placement: over the edit's build the daemon's loop thread never stalls (no `loop stalled` span, no system call of it over 20 ms but its own waits) and the answer is held under 200 ms for what the job still does | `budgets.py {"command": "smoke"}`; `loop_syscalls.py` | answer held 3.2 s; the loop thread 0.9 and 1.4 s in ioctl(FICLONE) (Linux ARM VM, XFS, hello world, 11-10) | ? |
+| T19 | The patch room blaze-link keeps in an image costs no disk bytes and no time to write, hash or copy: a dev executable's allocated size is its content, and its store record, its place and its code memory hold none of the room | *write: a harness script that builds `-p scripts --bin docs` on a Linux VM and fails unless `du` (allocated) of the binary and of the store's `placed/` file of it are each under 12 MB, the binary runs, `blaze debug edits body` still patches, and the `link copy` span's bytes are under the file's length less its room; until then `blaze test -p blaze-link -p blaze-cas -p blaze-inproc` and those commands by hand* | 141-149 MB allocated for 9 MB of loaded content (blaze 0.20261105.4, aarch64 Linux, 11-11); the file's length stays its addresses' (the room is a hole), design/patch-in-place.md | ? |
 
 ## Correctness
 

@@ -86,8 +86,10 @@ made only of a clone waits for the file to be made, sealed and written back firs
   edit ago with no sync, so it is the same wait. So: a new file, whole content, renamed over.
   Writing only changed blocks needs a source known written back; that is a later step
   (write-back of the output after the answer, then clone-and-patch when it has completed).
-- **The store's copy.** The value is put as before (a recipe of the link's ranges, a few KB,
-  or the whole file on a first link) and is durable with the store's next commit, after the
+- **The store's copy.** The value is put as a recipe: of the link's ranges over the file
+  before it, a few KB, or on a first link of the file's runs over the base of holes
+  ([patch-in-place.md](patch-in-place.md), "The patch room"), never the file at its length.
+  It is durable with the store's next commit, after the
   answer (`Settling`). No `placed/` file is made on the edit path; `Store::unplace_made` lets
   go of the one the path's last value was cloned from.
 - **Crash safety.** After a crash the path holds its old file, the new one, or what the power
