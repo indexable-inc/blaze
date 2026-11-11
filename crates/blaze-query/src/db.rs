@@ -66,7 +66,7 @@ pub mod plumbing {
         ingredient::{Ingredient, Kind, Vtable},
         input::{
             Input, InputSetter, input_fields, input_new, input_new_singleton, input_read,
-            input_set, input_singleton,
+            input_set, input_singleton, input_written_since,
         },
         interned::{Interned, intern, intern_by, interned_arguments, interned_fields},
         owner_is,

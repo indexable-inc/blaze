@@ -28,7 +28,8 @@ use super::{
     plumbing::{
         CycleKind, Function, Ingredient, Input, Interned, Tag, Tracked, Vtable, durable, evict_values,
         evict_values_of, fetch, input_fields, input_new, input_new_singleton, input_read,
-        input_set, input_singleton, intern, intern_by, interned_arguments, interned_fields,
+        input_set, input_singleton, input_written_since, intern, intern_by, interned_arguments,
+        interned_fields,
         tracked_fields, tracked_new, value_hash,
     },
     replay_reads, report_untracked_read,
@@ -435,6 +436,59 @@ fn a_durable_row_holds_its_value_while_the_durable_view_is_the_same() {
     assert_eq!(db.storage().durable_view(), db.storage().view());
     assert_eq!(*get::<Double>(&db, library), 10);
     assert!(durable::<Double>(&db, library));
+}
+
+/// `plumbing::input_written_since` says whether one input was written since a view its
+/// caller kept, from the input's own stamps: a write of another input, of either kind, leaves
+/// it `false`, a write of any of its fields makes it `true`, and an input made since is
+/// written since.
+#[test]
+fn an_input_tells_whether_it_was_written_since_a_view() {
+    let mut db = TestDb::new();
+    let member = Cell::new(&db, 1, 2);
+    let other = Cell::new(&db, 3, 4);
+    let library = Cell::of(&db, 5, 6, Durability::HIGH);
+    let written = |db: &TestDb, cell: Cell, since| {
+        input_written_since::<Cells>(db.storage(), cell.0, since)
+    };
+    let seen = db.storage().view();
+    assert!(!written(&db, member, seen) && !written(&db, other, seen));
+
+    other.set_a(&mut db, 7);
+    library.set_b(&mut db, 8);
+    assert!(!written(&db, member, seen), "writes of other inputs are none of its");
+    assert!(written(&db, other, seen) && written(&db, library, seen));
+    let later = db.storage().view();
+    assert!(!written(&db, other, later), "not since the view after its write");
+
+    member.set_b(&mut db, 9);
+    assert!(written(&db, member, seen) && written(&db, member, later), "its second field");
+    let made = Cell::new(&db, 0, 0);
+    assert!(!written(&db, made, db.storage().view()));
+    member.set_a(&mut db, 10);
+    assert!(written(&db, made, later), "an input made since a view is written since it");
+}
+
+/// The control of [`an_input_tells_whether_it_was_written_since_a_view`]'s bound: once the
+/// views are renumbered a stamp of before says nothing, and the answer is `true`, never a
+/// `false` read off a rank. A view the storage never opened is answered the same way.
+#[test]
+fn an_input_is_written_since_a_view_no_stamp_tells() {
+    let mut db = TestDb::new();
+    db.storage_mut().start_at_view(VIEW_MASK - 1);
+    let cell = Cell::new(&db, 1, 2);
+    let seen = db.storage().view();
+    assert!(!input_written_since::<Cells>(db.storage(), cell.0, seen));
+    let other = Cell::new(&db, 3, 4);
+    // Two writes: the second opens a view past the limit, which renumbers first.
+    other.set_a(&mut db, 5);
+    other.set_a(&mut db, 6);
+    assert!(
+        input_written_since::<Cells>(db.storage(), cell.0, seen),
+        "renumbered since: no stamp of `seen` is left to compare"
+    );
+    let now = db.storage().view();
+    assert!(!input_written_since::<Cells>(db.storage(), cell.0, now));
 }
 
 /// A row whose value was let go is not current: `durable` says no until a fetch makes the
