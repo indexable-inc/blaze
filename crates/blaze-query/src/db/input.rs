@@ -17,7 +17,7 @@ use super::{
     ingredient::{Ingredient, Kind, Vtable},
     local,
     row::{Pages, layout},
-    storage::{Durability, FIELD, Ids, Storage, Table, color, input_bits, node_key, or},
+    storage::{Durability, FIELD, Ids, Storage, Table, View, color, input_bits, node_key, or},
 };
 
 /// One input struct. Its fields are numbered 0..FIELDS; each has its own stamp and node.
@@ -193,6 +193,19 @@ pub fn input_read<I: Input>(storage: &Storage, id: Id, field: u32) {
     let durability = ((seen >> 32) as u32 & !FIELD) as u8;
     let note = local::with(|local| local.read(storage, node, durability, seen as u32));
     super::noted(storage, note);
+}
+
+/// Whether a field of input `id` was written, or the input made, in a view after `since`, a
+/// view the caller read from [`Storage::view`]: each field's node holds the view it last
+/// changed in. For a host that keeps something made from one input's fields alone (a crate's
+/// sources, say) and asks, a view later, whether to make it again, with no row verified and
+/// no edge walked: a load a field. Exact, or `true` where the storage can no longer say (its
+/// views were renumbered since `since`). Records no read: for a caller outside any query.
+pub fn input_written_since<I: Input>(storage: &Storage, id: Id, since: View) -> bool {
+    let Some(stamp) = storage.stamp_of(since) else { return true };
+    let first = row::<I>(storage, id).first.load(Ordering::Relaxed);
+    // The low word of a field node's color is the view it last changed in (`color`).
+    (0..I::FIELDS.max(1)).any(|field| storage.color_of(first + field) as u32 > stamp)
 }
 
 #[cfg(test)]

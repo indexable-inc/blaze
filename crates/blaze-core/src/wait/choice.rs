@@ -137,7 +137,8 @@ mod tests {
     use super::*;
 
     /// The mark's refusal names the variable, the value and the rule. (The choice itself is
-    /// the process's: its tests are the ones that run a process, blaze-graph's
+    /// the process's: its tests are the ones that run a process, `wait/filtered.rs`'s
+    /// `every_public_wait_ends_in_a_sandboxed_process` and blaze-graph's
     /// `a_sandboxed_process_parks_its_workers_with_no_io_uring`.)
     #[test]
     fn a_mark_of_another_value_is_refused_naming_it() {

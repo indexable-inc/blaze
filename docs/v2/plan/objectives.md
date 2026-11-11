@@ -13,7 +13,7 @@ remembered. How rows are picked, worked and landed is
 `harness/v2/ledger.py`. A check in *italics* is not written yet, and writing it is the first
 part of the work. `?` is not measured; "last known" is a lead, not a status.
 
-98 objectives: 0 met, 0 open, 0 blocked, 98 not measured.
+80 objectives: 0 met, 0 open, 0 blocked, 80 not measured.
 
 ## Targets
 
@@ -21,23 +21,21 @@ What a user feels, on one warm machine.
 
 | id | objective | check | last known | status |
 |---|---|---|---|---|
-| T1 | A body edit in nushell is running code in 10-30 ms | `budgets.py {"budgets": ["body"]}` | hello world 4.0-7.0 s, ripgrep 9.4 s on a stage 1 of all-1110 (2026-11-10); the answer waits 4 s on the executable's placement | ? |
+| T1 | A body edit in nushell is running code in 10-30 ms | `budgets.py {"budgets": ["body"]}` | 0.29 s (10-29) | ? |
 | T2 | A signature edit costs in proportion to the items whose facts changed | `budgets.py {"budgets": ["signature"]}` | 0.31 s, 6,269 roots asked (10-29) | ? |
-| T3 | A format or comment edit compiles nothing | `budgets.py {"budgets": ["format", "comment"]}` | end-of-line comment 0.34 s hello world, 0.6-1.2 s ripgrep, nothing recomputed; an own-line comment reruns the unit (2026-11-10) | ? |
+| T3 | A format or comment edit compiles nothing | `budgets.py {"budgets": ["format", "comment"]}` |  | ? |
 | T4 | A rename or a move of an item compiles nothing | `budgets.py {"budgets": ["rename", "move"]}` |  | ? |
-| T5 | A no-op build of ripgrep takes under 5 ms | `budgets.py {"budgets": ["noop"]}` | 38-49 ms hello world, 121-136 ms ripgrep; the daemon's part is 0.09 ms (2026-11-10) | ? |
+| T5 | A no-op build of ripgrep takes under 5 ms | `budgets.py {"budgets": ["noop"]}` | 11 ms (10-29) | ? |
 | T6 | A warm daemon start takes under 1 s | `budgets.py {"budgets": ["warm-start", "restart"]}` | 35 s nushell, 238 s in CI (10-29) | ? |
 | T7 | blaze's own CI on a small pull request takes under 2 min | `budgets.py {"budgets": ["ci"]}` | 30 min+ (10-29) | ? |
-| T8 | A cold build of blaze keeps every core busy; wall time is within 25% of its critical path | `budgets.py {"budgets": ["cold-blaze"]}` | ripgrep cold dev build 70.9 s on a stage 1 of all-1110, 50.3 s on 0.20261105.4, cargo 5.2 s (2026-11-10) | ? |
-| T9 | No build is killed for memory; peak is at most cargo's | `budgets.py {"budgets": ["memory"]}`; `tightmemory.py` | ripgrep: daemon holds 15.6-16.8 GB after the run, cargo peaks at 2.76 GB (2026-11-10) | ? |
+| T8 | A cold build of blaze keeps every core busy; wall time is within 25% of its critical path | `budgets.py {"budgets": ["cold-blaze"]}` | 12 min, mostly serial codegen (10-29) | ? |
+| T9 | No build is killed for memory; peak is at most cargo's | `budgets.py {"budgets": ["memory"]}`; `tightmemory.py` | ripgrep 2.0 GB against 0.56 GB (10-29) | ? |
 | T10 | A body edit in a big top crate (ruff) takes under 50 ms | `budgets.py {"budgets": ["big-crate"]}` | 75 s (10-29) | ? |
 | T11 | Dev-build code runs at least as fast as cargo's debug build on ripgrep | `budgets.py {"budgets": ["dev-speed"]}` | 5.8x slower (10-29) | ? |
 | T12 | Release code runs at least as fast as cargo's release build | `budgets.py {"budgets": ["release-speed"]}` |  | ? |
 | T13 | A second build of an unchanged tree in a fresh checkout misses nothing | `budgets.py {"budgets": ["cache-misses"]}`; `worktree_keys.py` |  | ? |
 | T14 | Every bound in bounds.md is within 10% | `budgets.py {"budgets": ["bounds"]}` |  | ? |
-| T15 | A build's answer is sent within 5 ms of its last task's end, and no turn of the daemon's loop runs over 5 ms | *write: a budget smoke row reading the spans: last task's end to `request: read to reply`'s end, and each `loop turn`* | 4.0 s held and one turn of 734 ms on hello world (2026-11-10) | ? |
-| T16 | A dev build's executable holds no debug info by default; hello world's is under 20 MB with a side file a debugger and a backtrace find | *write: the harness row of design/debug-side-file.md: sizes, a panic's backtrace, gdb and lldb where present* | 162,021,720 bytes (2026-11-10) | ? |
-| T17 | A cold build of ripgrep on a machine with a warm toolchain store takes at most cargo's time | *write: a budget row for a cold build against a store holding the pinned toolchain's results* | 70.9 s against cargo's 5.2 s; the standard library is built from source, 146 units for hello world (2026-11-10) | ? |
+| T15 | A warm no-op build, a comment edit and a body edit of the smoke's two fixtures hold every bound of harness/v2/guards.py (none worse than its known failure), and a build script that runs $RUSTC ends inside the sandbox | `budgets.py {"command": "smoke"}` | not run: guards-known.toml's numbers are hand-traced, to be recorded on a built blaze (11-10) | ? |
 
 ## Correctness
 
@@ -56,10 +54,7 @@ What must hold for any of the speed to count.
 | V2 | Each subsystem with a simulation test has a reference model as an ordinary type in its crate, one generic harness (bstd::test's Refines) checks the real code refines it, and the model is what is translated to Lean | *write: a refinement stated for the store, the pool, the vfs and bstd's Fs, each with a planted difference* |  | ? |
 | V3 | bstd's public functions carry contracts (requires and ensures), each run as a generated property test | *write: contracts on bstd's API and the generator of reflect.md item 7* |  | ? |
 | V4 | The simulated driver refines each native driver on the effects both run | *write: one test per native driver that replays seeded effect sequences on both and compares completions* |  | ? |
-| V5 | A reference model translated to Lean has a property proved about it, and the compiled Lean model agrees with blaze-built code on drawn inputs | *write: the first proof in the tree, named by a `(proved: ..)` statement, checked in the train* | fnv1a_from has a model and a hand-written proof on mir-lean-1110; Lean has not checked it (2026-11-10) | ? |
-| V6 | An executable Lean semantics of MIR (a first subset: integers, structs, enums, references, calls, loops, panics) agrees with blaze's MIR evaluator and blaze-built code on generated programs | *write: the differential harness in the gate (Lean interpreter, MIR evaluator, compiled code on drawn programs)* | not started; rule verified-compiler (2026-11-10) | ? |
-| V7 | The functional model hir-ty-lean emits for a function is proved or checked equal to the Lean semantics of its MIR body, so a proof is of what blaze compiles | *write: an equivalence proved per emitted model (generated proof or a proved-sound checker), checked by lake build in the gate* | the first proof (fnv1a_from) is of a hand-checked model: lake build passes with Lean 4.20.0, the Rust golden test has not run (2026-11-10) | ? |
-| V8 | One MIR optimization is proved to refine its input against the Lean semantics, and one large pass is translation-validated by a checker proved sound, run on real crates in the gate | *write: the theorem checked by lake build; the validator's run over the corpus* | not started (2026-11-10) | ? |
+| V5 | A reference model translated to Lean has a property proved about it, and the compiled Lean model agrees with blaze-built code on drawn inputs | *write: the first proof in the tree, named by a `(proved: ..)` statement, checked in the train* |  | ? |
 
 ## The design, part by part
 
@@ -107,7 +102,7 @@ The parts of [the design](../plan.md#the-design) no check has shown yet.
 | E2 | Handles copy themselves under `#![blaze::handles]`; the last use moves | *write: fixtures: copies counted per path; a crate without the attribute builds to the same bytes* |  | ? |
 | E3 | Error unions: `A | B` in type position, `?` widens, match is exhaustive | *write: fixtures for widening, exhaustiveness, a refused type parameter and one identity across crates* |  | ? |
 | E4 | View types: methods with disjoint field views do not conflict | *write: fixtures accepted and refused; ABI unchanged* |  | ? |
-| E5 | Records and named arguments with defaults | *write: fixtures for equality in any field order, defaults, and one layout across crates* | designed (edition.md change 4), no code (2026-11-10) | ? |
+| E5 | Records and named arguments with defaults | *write: fixtures for equality in any field order, defaults, and one layout across crates* |  | ? |
 | E6 | Contexts: the `with` clause passes bstd's capabilities and Cx by name | *write: bstd's tests rewritten with `with` and passing* |  | ? |
 | E7 | Effects are inferred inside a crate and required on pub functions; closures pass theirs through; no async in crates on fibers | *write: the blaze::unmarked_* lints at zero in blaze's crates* |  | ? |
 | E8 | edition = "blaze-2026.11" turns every change on and every removed thing into an error; blaze fix --edition migrates | *write: one real crate migrated by the tool and passing its tests* |  | ? |
@@ -115,19 +110,6 @@ The parts of [the design](../plan.md#the-design) no check has shown yet.
 | E10 | Pattern types cover enum variants under `#![blaze::pattern_types]`: `T is Variant(..)`, narrowing in match and if-let, free widening, same layout | *write: fixtures: a function taking one variant; narrowing after match; a refused whole-value write through a unique reference; layout equal to the enum's* |  | ? |
 | L1 | Code generation takes LIR, blaze's own low-level IR, not Cranelift IR: one builder from MIR, read by the stencils, LLVM and the wasm emitter | *write: blaze-lir's round-trip and verifier tests; then C1 with every producer reading LIR and no CLIF outside Wasmtime (branch lir-ir-1109)* |  | ? |
 | P1 | The store reads through its own buffer pool (reserved address range, explicit reads, eviction by advice); no store file is mapped | *write: the pool's simulation test with its planted bugs; then budgets warm-start and memory with mmap of store files banned (branch pool-core-1109)* |  | ? |
-| D32 | The codegen walk, its later passes and the link's inputs do work in proportion to an edit, counted, at 10,000 functions | *write: the counter tests of design/incremental-walk.md and patch-in-place.md run in the gate; owners, templates, dedupe and the delta are still whole* | body edits patched, written and unbuilt; walk 0.34-0.56 s on hello world (2026-11-10) | ? |
-| D33 | An output reaches its path with writes in proportion to the edit: derived from the last file, never a clone of unflushed data, placed once for every path | *write: the placement simulation's counters (bytes written, forced writeback) in the gate* | a clone of a just-written 162 MB file takes 1.29 s, a flushed one 1 ms (2026-11-10) | ? |
-| D34 | Build on save: a watched change starts the last answered request's build at idle priority, and the next request is answered by the no-op lane | *write: the no-op lane's property test with changes before, during and after requests; nothing is written* |  | ? |
-| D35 | A client reaches the daemon with no process launch: blaze-client, its C ABI and the Node-API addon; the CLI is built on it | *write: the smoke test under Bun against a live daemon; the CLI still has its own start and placement code* | written, lints fixed, unbuilt (2026-11-10) | ? |
-| D36 | Checked native extensions: a lint, a fact or a transform is a Rust crate blaze compiles and loads, on blaze-ext; blaze's own lints are extensions | *write: slice 1's tests of design/extensions.md; then each in-tree lint ported* |  | ? |
-| D37 | The agent API's code graph carries each item's facts: declared and inferred effects with their witnesses, and any extension's | *write: a request and its schema; nothing is written* |  | ? |
-| D38 | Symbolic derivatives of pure functions: lifted from MIR, differentiated, simplified with exact rewrites, lowered back; blaze::grad! and blaze explain d/dx | *write: the crates' tests in the gate; nothing calls derivative_body, so grad! and explain do not exist* | layers 2 and 3-minimum written, unbuilt (2026-11-10) | ? |
-| D39 | Every cause found on 2026-11-10 has a guard in the gate: the budget smoke, durable writes that say why, waits with deadlines, zero-work counts, previous-layout tests | *write: the guards' own tests and their first run over the tree* |  | ? |
-| D40 | The Verus tier is gone: Lean is the prover, and a clause with no proof says not proved | *write: lake build of lean/ and the crate's tests on a stage 1; the first proof is unchecked* | written on mir-lean-1110, 128,212 lines removed, nothing run (2026-11-10) | ? |
-| E11 | Effects are declared by what a function may do: #[blaze::may(panic, alloc, block, diverge)], with undeclared_effect, unneeded_effect and negative_effect | *write: the lints' tests on a stage 1; no rule accepts a `for` loop as bounded* | written on terminates-effect, unbuilt (2026-11-10) | ? |
-| E12 | A workspace's proc macros and its build scripts' ambient std uses are linted, warn once their replacements are in the tree | *write: the lints' tests on a stage 1; three of four are allow until reflection phase 2 and bstd land* | written on lints-macros-scripts-1110, unbuilt (2026-11-10) | ? |
-| S6 | No bstd API hides a cost or a guarantee: durability, waits, allocation, buffering and policy are arguments or types | *write: the explicitness tables of design/std.md and the file-durability simulation test* |  | ? |
-| E16 | Const generic arguments may be expressions over generic parameters (generic const expressions), checked and unified by blaze's own front end under an opt-in attribute | *write: a spec, then fixtures: arithmetic on const arguments in types and bounds unifies and is refused where it overflows or is not well formed; a crate without the attribute is unchanged* | not started; asked for 2026-11-10 (fractional shares counted in the type need it) | ? |
 
 ## The agent app
 

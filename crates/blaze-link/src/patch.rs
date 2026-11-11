@@ -209,6 +209,36 @@ impl Image {
         Ok(Patch { full, len, old_len, writes, base, digest, generation: self.state.generation })
     }
 
+    /// [`Image::commit_into`], giving also what the commit changes of the file, as
+    /// [`Image::patch`] gives it of a commit with no memory: the ranges written into
+    /// `memory`'s image part are the ranges a writer of the file writes, and the file's
+    /// identity before and after is kept by the blocks written. For a caller that keeps the
+    /// dev executable's file as its last file with those ranges written (a store's derived
+    /// value), so that the file's bytes are never read back out of the memory. With the
+    /// patch, the message for the programs running the memory, as [`Image::commit_into`]
+    /// gives it.
+    pub fn commit_into_patch(
+        &mut self,
+        mut staged: Staged,
+        memory: &mut blaze_inproc::CodeMemory,
+    ) -> Result<(Patch, Option<Vec<u8>>), LinkError> {
+        self.can_commit(&staged)?;
+        self.carry_placed_pairs(&mut staged.state)?;
+        let cells = self.cells_in(memory)?;
+        self.write_into(&staged.writes, memory)?;
+        let base = match self.state.laid_out {
+            true => Some(self.filed.of(&self.state).root()),
+            false => None,
+        };
+        let crate::commit::Writes { full, len, old_len, writes, message } = staged.writes;
+        self.take(staged.state, full, staged.undo);
+        self.placed_pairs.clear();
+        self.cells = Some(cells);
+        let digest = self.filed.of(&self.state).root();
+        let generation = self.state.generation;
+        Ok((Patch { full, len, old_len, writes, base, digest, generation }, message))
+    }
+
     /// Whether a file of `len` bytes is the one the last commit left: every block read
     /// through `read` (which fills a zeroed block with the file's bytes of that block) and
     /// hashed, and the root compared with [`Image::digest`]. Costs the file. For a caller

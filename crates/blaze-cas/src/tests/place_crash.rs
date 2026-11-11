@@ -1,10 +1,18 @@
 //! Placement under crashes: outputs put whole and as derived values ([`Kind::Derived`]), placed
 //! at a few paths, replaced, with a full `placed/`, clean reopens and crashes at any completion,
 //! on the simulation ([`Sim`]), which tears what was not synced. Nothing a place asks for is
-//! synced, so every crash leaves the whole files of `placed/` old, new, torn or gone and may
-//! undo a rename onto an output's path; the oracle is what a build may rely on all the same.
+//! synced ([`blaze_core::Durable::No`]: an output is derived data, placed again by the build
+//! after a power failure), so every crash leaves the whole files of `placed/` old, new, torn
+//! or gone, may undo a rename onto an output's path, and may tear an output written where it
+//! goes; the oracle is what a build may rely on all the same.
 //! The same harness as the race of two stores (`place_race`): the store's own state machine on
 //! the simulated disk, Hegel drawing the run.
+//!
+//! The simulation also charges a clone of a file with data not written back the write-back
+//! it forces ([`Sim::bytes_forced`]): on a real disk that is what the clone waits for, the
+//! whole file's worth after a whole write. The store clones only a file whose write-back it
+//! saw complete, so the count stays 0 in every run, and the counter tests below say what an
+//! edit's placement writes.
 //!
 //! The planted bugs ([`PlacePlant`]) each take one safeguard out; the oracle must catch each.
 
@@ -55,12 +63,13 @@ struct Case {
 
 const PATHS: [&str; 3] = ["one/build/a", "two/build/a", "one/build/b"];
 
-/// A value put: its key, the bytes a place of it must give, and whether the store keeps a
-/// whole file of it (so it can be a base).
+/// A value put: its key, the bytes a place of it must give, whether the store keeps a whole
+/// file of it (so it can be a base), and for a derived value the value it is derived from.
 struct Value {
     key: Key,
     bytes: Vec<u8>,
     whole: bool,
+    base: Option<usize>,
 }
 
 /// A place asked and not yet answered.
@@ -205,23 +214,32 @@ impl World {
     }
 
     /// The oracle after a crash: each path holds nothing, or the whole of a value once placed
-    /// there, or, of a value short enough to be written where it goes and not cloned, any of
-    /// its sectors (its write is not synced, as no part of a place is). What it holds is what
-    /// it is then known to hold.
+    /// there, or what a place of one that the power cut short may leave, since no part of a
+    /// place is synced: of a value written where it goes, any of its sectors; of a derived
+    /// value made of a clone of its base with its ranges written, the base's bytes with any
+    /// of the value's written over them (each byte the value's, the base's, or a zero where
+    /// the file grew), no longer than the longer of the two. Never bytes of anything else.
+    /// What it holds is what it is then known to hold.
     fn look_after_crash(&mut self) -> Result<(), String> {
         for n in 0..PATHS.len() {
             let there = self.sim.exists(&path(n)).then(|| self.sim.contents(&path(n)));
             let allowed = match &there {
                 None => true,
                 Some(found) => self.ever[n].iter().any(|value| {
-                    let Value { bytes, whole, .. } = &self.values[*value];
-                    found == bytes
-                        || (!whole
-                            && found.len() <= bytes.len()
-                            && found.chunks(SECTOR).enumerate().all(|(at, sector)| {
-                                sector == &bytes[at * SECTOR..at * SECTOR + sector.len()]
-                                    || sector.iter().all(|it| *it == 0)
-                            }))
+                    let Value { bytes, base, .. } = &self.values[*value];
+                    let sectors = found.len() <= bytes.len()
+                        && found.chunks(SECTOR).enumerate().all(|(at, sector)| {
+                            sector == &bytes[at * SECTOR..at * SECTOR + sector.len()]
+                                || sector.iter().all(|it| *it == 0)
+                        });
+                    let over_base = base.is_some_and(|base| {
+                        let base = &self.values[base].bytes;
+                        found.len() <= bytes.len().max(base.len())
+                            && found.iter().enumerate().all(|(at, it)| {
+                                bytes.get(at) == Some(it) || base.get(at) == Some(it) || *it == 0
+                            })
+                    });
+                    found == bytes || sectors || over_base
                 }),
             };
             if !allowed {
@@ -240,7 +258,13 @@ impl World {
         Ok(())
     }
 
-    fn put(&mut self, kind: Kind, bytes: &[u8], gives: Vec<u8>) -> Result<(), String> {
+    fn put(
+        &mut self,
+        kind: Kind,
+        bytes: &[u8],
+        gives: Vec<u8>,
+        base: Option<usize>,
+    ) -> Result<(), String> {
         let key = key(1000 + self.values.len() as u64);
         let store = self.store.as_mut().expect("the store is open");
         store.put(key, kind, bytes).map_err(|it| format!("a put was refused: {it:?}"))?;
@@ -248,7 +272,7 @@ impl World {
         store.flush(&mut self.effects);
         self.pump(None)?;
         let whole = kind == Kind::Derived || gives.len() as u64 >= CLONE_FROM;
-        self.values.push(Value { key, bytes: gives, whole });
+        self.values.push(Value { key, bytes: gives, whole, base });
         Ok(())
     }
 
@@ -265,7 +289,7 @@ impl World {
             Op::Whole { seed, len } => {
                 let bytes = noise(len as usize, seed);
                 // clone: the model's copy of the value.
-                self.put(Kind::Output, &bytes, bytes.clone())?;
+                self.put(Kind::Output, &bytes, bytes.clone(), None)?;
             }
             Op::Derived { base, seed, ranges, len } => {
                 let bases: Vec<usize> =
@@ -273,12 +297,13 @@ impl World {
                 if bases.is_empty() {
                     return Ok(());
                 }
-                let base = &self.values[bases[usize::from(base) % bases.len()]];
+                let based = bases[usize::from(base) % bases.len()];
+                let base = &self.values[based];
                 let (len, writes) = recipe_of(base.bytes.len() as u64, seed, ranges, len);
                 let recipe = derived::encode(&base.key, len, &writes)
                     .map_err(|why| format!("the test drew a bad recipe: {why}"))?;
                 let gives = derived::applied(&base.bytes, len, writes.iter().map(|(at, it)| (*at, it)));
-                self.put(Kind::Derived, &recipe, gives)?;
+                self.put(Kind::Derived, &recipe, gives, Some(based))?;
             }
             Op::Place { value, path: n, replace, steps } => {
                 if self.values.is_empty() {
@@ -350,11 +375,19 @@ fn recipe_of(base: u64, seed: u64, ranges: u8, len: Len) -> (u64, Vec<(u64, Vec<
 
 /// Runs `case` with `plant` planted; `Err` says where the oracle failed.
 fn run(case: &Case, plant: PlacePlant) -> Result<(), String> {
+    forced(case, plant).map(|_| ())
+}
+
+/// Runs `case` with `plant` planted, as [`run`] does, and says how many bytes its clones
+/// forced out of their sources ([`Sim::bytes_forced`]): what a real disk would have made
+/// those clones wait for.
+fn forced(case: &Case, plant: PlacePlant) -> Result<u64, String> {
     let mut world = World::new(case, plant);
     for (n, op) in case.ops.iter().enumerate() {
         world.step(op).map_err(|why| format!("at op {n} ({op:?}): {why}"))?;
     }
-    world.pump(None).map_err(|why| format!("at the end: {why}"))
+    world.pump(None).map_err(|why| format!("at the end: {why}"))?;
+    Ok(world.sim.bytes_forced())
 }
 
 #[hegel::composite]
@@ -407,15 +440,23 @@ fn case(tc: &TestCase) -> Case {
 /// value's: one written or derived by this run, or one an earlier run left that hashes to its
 /// name (a derived value's is never kept: it is made again from its base and its ranges); (2)
 /// until a place ends well its path holds what it held or the new value whole, never a part;
-/// (3) after a crash a path holds nothing, or the whole of a value once placed there, or, of
-/// a value under [`CLONE_FROM`] bytes (written where it goes, not cloned, and not synced), any
-/// of its sectors; and the store opens. `HEGEL_TEST_CASES=<n>` runs it longer.
+/// (3) after a crash a path holds nothing, or the whole of a value once placed there, or what
+/// the power left of a place of one (nothing of a place is synced: any of the sectors of a
+/// value written where it goes, or a derived value's base with any of its ranges written),
+/// never bytes of anything else; (4) no clone the store asks for is of a file with data not written back,
+/// so no place waits for a write-back a clone forced; and the store opens.
+/// `HEGEL_TEST_CASES=<n>` runs it longer.
 #[test]
 fn a_place_gives_its_values_bytes_whole_through_any_crash() {
     super::model_check::run_cases(96, |tc| {
         let case = tc.draw(case());
-        if let Err(why) = run(&case, PlacePlant::None) {
-            panic!("{case:?}: {why}");
+        match forced(&case, PlacePlant::None) {
+            Err(why) => panic!("{case:?}: {why}"),
+            Ok(0) => {}
+            Ok(forced) => panic!(
+                "{case:?}: its clones forced {forced} bytes out of their sources: a file was \
+                 cloned from before its write-back completed"
+            ),
         }
     });
 }
@@ -457,8 +498,10 @@ fn the_oracle_catches_a_placed_file_used_after_a_crash_unchecked() {
 #[test]
 fn the_oracle_catches_a_rename_before_the_clones_bytes_are_complete() {
     let derived = Op::Derived { base: 0, seed: 7, ranges: 3, len: Len::Same };
-    let ops = [whole(2), place(0, 0), derived, place(1, 0)];
-    let (seed, why) = caught(&ops, 0..64, PlacePlant::RenameBeforeRanges)
+    // Placed after a reopen, so the output is a clone of the derived value's own file (its
+    // base's is not yet known to be there): the file the planted store renames too early.
+    let ops = [whole(2), place(0, 0), derived, Op::Reopen, place(1, 0)];
+    let (seed, why) = caught(&ops, 0..512, PlacePlant::RenameBeforeRanges)
         .expect("the oracle missed a derived file cloned before its ranges were written");
     assert!(why.contains("was placed with value 1 and holds"), "seed {seed}: {why}");
 }
@@ -486,6 +529,36 @@ fn the_oracle_catches_a_derived_file_accepted_as_a_crash_left_it() {
     let (seed, why) = caught(&ops, 0..96, PlacePlant::KeepsDerived)
         .expect("the oracle missed a torn derived file cloned from as a crash left it");
     assert!(why.contains("was placed with value 1 and holds"), "seed {seed}: {why}");
+}
+
+/// The planted-bug control: a whole file cloned from as soon as it is sealed, its write-back
+/// begun and not waited for. The derived value's file is its base's clone with ranges just
+/// written, so the clone of it to the output's path forces those ranges out and waits for
+/// them: on a real disk, and after a whole write, the 1.3 s an edit's answer waited. The
+/// bytes placed are right all the same, so only the count of forced bytes catches it.
+#[test]
+fn the_oracle_catches_a_clone_of_a_dirty_file_on_the_edit_path() {
+    let derived = Op::Derived { base: 0, seed: 13, ranges: 3, len: Len::Same };
+    let ops = [whole(5), place(0, 0), derived, Op::Reopen, place(1, 0)];
+    // The planted store's clone races its own write-back, so on some seed it comes first.
+    let caught = (0..96).find_map(|seed| {
+        let case = Case { seed, latency_us: 300, ops: ops.to_vec() }; // clone: a test's ops.
+        assert_eq!(
+            forced(&case, PlacePlant::None),
+            Ok(0),
+            "seed {seed}: the store as it is forces nothing"
+        );
+        let planted = forced(&case, PlacePlant::ClonesUnflushed)
+            .expect("the bytes placed are right: only the forced write-back says it");
+        (planted > 0).then_some((seed, planted))
+    });
+    let (seed, planted) =
+        caught.expect("the oracle missed a clone of a file not yet written back");
+    assert!(planted <= 9 * SECTOR as u64, "seed {seed}: {planted} bytes, more than its ranges");
+    // The first place too: a whole file written and cloned from at once forces all of it.
+    let ops = [whole(6), place(0, 0), place(0, 1)];
+    let case = Case { seed: 2, latency_us: 300, ops: ops.to_vec() }; // clone: a test's ops.
+    assert_eq!(forced(&case, PlacePlant::None), Ok(0));
 }
 
 /// One whole output of `len` bytes under key 1, placed at `one/build/a`, and under key 2 a
@@ -518,15 +591,30 @@ fn placed_one(sim: &mut Sim, store: &mut Store, effects: &mut Vec<Effect>) -> Pl
     placed.into_iter().next().unwrap()
 }
 
-/// A derive writes its ranges and nothing else: an image of 10 MiB that differs from the last
-/// by one block of 4 KiB is placed by writing 4 KiB, with none of the base read (or hashed:
-/// the store never has its bytes in hand). The simulation counts every byte an effect wrote
-/// to a file and read from one.
+/// What a derived value of key `base`'s gives, put under `key`: one range of 4 KiB at `at`.
+fn edit(sim: &mut Sim, store: &mut Store, base: (u64, &[u8]), new: u64, at: u64) -> Vec<u8> {
+    let writes = vec![(at, noise(4096, 900 + new))];
+    let recipe = derived::encode(&key(base.0), base.1.len() as u64, &writes).unwrap();
+    store.put(key(new), Kind::Derived, &recipe).unwrap();
+    flush(sim, store);
+    derived::applied(base.1, base.1.len() as u64, writes.iter().map(|(at, it)| (*at, it)))
+}
+
+/// A warm edit's placement writes its ranges and nothing else, and waits for no write-back:
+/// an image of 10 MiB that differs from the last by one block of 4 KiB is placed by cloning
+/// the last image's whole file, which is written back, and writing 4 KiB into the clone,
+/// once for the output and once for the store's own file of the new image; none of the base
+/// is read (or hashed: the store never has its bytes in hand), and no clone is of a file with
+/// data to write back. The edit after it derives from the file the first one made, written
+/// back by then, at the same cost; and the same image at a second path (`debug/` beside
+/// `deps/`) is a clone that writes nothing. The simulation counts every byte an effect wrote
+/// to a file, read from one, and forced out of a clone's source.
 #[test]
-fn a_derive_writes_its_ranges_and_reads_none_of_its_base() {
+fn a_warm_edits_placement_writes_its_ranges_and_forces_no_write_back() {
     const LEN: usize = 10 << 20;
     let mut sim = Sim::new(31, quiet());
     let (mut store, base, gives) = derived_once(&mut sim, LEN, 1, 4096);
+    assert_eq!(store.reader().derivable(&enter(), &key(1)), Derivable::Yes, "written back: a base");
     let (wrote, read) = (sim.bytes_written(), sim.bytes_read());
     // As a build's job replaces the image at its path: the old one's whole file is let go
     // of, and the new one placed.
@@ -537,19 +625,138 @@ fn a_derive_writes_its_ranges_and_reads_none_of_its_base() {
     assert_eq!(placed.result, Ok(()));
     assert_eq!(
         placed.bytes,
-        PlacedBytes { cloned: LEN as u64, written: 4096, copied: 0 },
-        "what the place reports is what was written"
+        PlacedBytes { cloned: LEN as u64 - 4096, written: 0, copied: 4096 },
+        "what the place reports is what was written where it goes"
     );
     assert_eq!(sim.contents(&name("one/build/a")), gives);
     let (wrote, read) = (sim.bytes_written() - wrote, sim.bytes_read() - read);
     assert!(
-        (4096..=2 * 4096).contains(&wrote),
-        "a derive of one 4 KiB range wrote {wrote} bytes: its range, and at most a constant"
+        (2 * 4096..=3 * 4096).contains(&wrote),
+        "an edit of one 4 KiB range wrote {wrote} bytes: its range into the output and into \
+         the store's file, and at most a constant"
     );
     assert!(read < 64 << 10, "a derive read {read} bytes: none of its 10 MiB base is read");
-    // The base's whole file went once the derive had cloned it: one whole file is kept.
+    assert_eq!(sim.bytes_forced(), 0, "no clone was of a file with data to write back");
+    // The base's whole file went once the derives had cloned it: one whole file is kept.
     assert!(!sim.exists(&name(&format!("store/placed/{:x}", content_of(&base)))));
     assert!(sim.exists(&name(&format!("store/placed/{:x}{DERIVED_SUFFIX}", key(2).0))));
+    assert!(store.problems().is_empty(), "{:?}", store.problems());
+
+    // The next edit: its base is the file the last one derived, written back by now.
+    assert_eq!(store.reader().derivable(&enter(), &key(2)), Derivable::Yes);
+    let next = edit(&mut sim, &mut store, (2, gives.as_slice()), 3, 8 << 20);
+    let wrote = sim.bytes_written();
+    store.unplace(&key(2), &key(3), &mut effects);
+    store.place(&key(3), name("one/build/a"), &mut effects).unwrap();
+    let placed = placed_one(&mut sim, &mut store, &mut effects);
+    assert_eq!(placed.result, Ok(()));
+    assert_eq!(placed.bytes, PlacedBytes { cloned: LEN as u64 - 4096, written: 0, copied: 4096 });
+    assert_eq!(sim.contents(&name("one/build/a")), next);
+    let wrote = sim.bytes_written() - wrote;
+    assert!((2 * 4096..=3 * 4096).contains(&wrote), "the second edit wrote {wrote} bytes");
+    assert_eq!(sim.bytes_forced(), 0);
+    assert!(!sim.exists(&name(&format!("store/placed/{:x}{DERIVED_SUFFIX}", key(2).0))));
+
+    // One output, two paths: the second is a clone of the store's file of it, written back.
+    let wrote = sim.bytes_written();
+    store.place(&key(3), name("one/debug/a"), &mut effects).unwrap();
+    let placed = placed_one(&mut sim, &mut store, &mut effects);
+    assert_eq!(placed.result, Ok(()));
+    assert_eq!(
+        placed.bytes,
+        PlacedBytes { cloned: LEN as u64, written: 2 * 4096, copied: 0 },
+        "cloned whole; it is the first to report what making the store's files wrote (its \
+         own ranges and those of the file before it, which no place cloned)"
+    );
+    assert_eq!(sim.contents(&name("one/debug/a")), next);
+    assert_eq!((sim.bytes_written() - wrote, sim.bytes_forced()), (0, 0));
+    assert!(store.problems().is_empty(), "{:?}", store.problems());
+}
+
+/// One output, two paths, asked in the same turn as the edit (a unit whose image is at
+/// `deps/` and at the profile's directory): each is a clone of the base with the ranges
+/// written, so the edit writes its ranges three times (the two paths and the store's own
+/// file) and the whole file nowhere, and neither path waits for the store's file.
+#[test]
+fn one_edit_at_two_paths_derives_each_and_writes_the_whole_file_nowhere() {
+    const LEN: usize = 4 << 20;
+    let mut sim = Sim::new(32, quiet());
+    let (mut store, _, gives) = derived_once(&mut sim, LEN, 2, 4096);
+    let wrote = sim.bytes_written();
+    let mut effects = Vec::new();
+    store.unplace(&key(1), &key(2), &mut effects);
+    let a = store.place(&key(2), name("one/build/a"), &mut effects).unwrap();
+    let b = store.place(&key(2), name("one/debug/a"), &mut effects).unwrap();
+    drive(&mut sim, &mut store, &mut effects);
+    let placed = store.placed();
+    assert_eq!(placed.len(), 2, "{placed:?}");
+    for it in &placed {
+        assert!(it.tag == a || it.tag == b);
+        assert_eq!(it.result, Ok(()));
+        assert_eq!(it.bytes, PlacedBytes { cloned: LEN as u64 - 2 * 4096, written: 0, copied: 2 * 4096 });
+    }
+    assert_eq!(sim.contents(&name("one/build/a")), gives);
+    assert_eq!(sim.contents(&name("one/debug/a")), gives);
+    let wrote = sim.bytes_written() - wrote;
+    assert!(
+        (6 * 4096..=7 * 4096).contains(&wrote),
+        "two ranges at two paths and in the store's file wrote {wrote} bytes"
+    );
+    assert_eq!(sim.bytes_forced(), 0);
+}
+
+/// The dirty-base rule ([`Reader::derivable`]): while the whole file of the last image is
+/// written and not yet written back (here its write-back never completes: the device stopped
+/// answering), it is no base, so the edit's image is put whole; its place writes the whole
+/// file once where it goes (and once as the store's own file of it), clones nothing and
+/// forces nothing, and is answered while both write-backs are still held. When the
+/// write-backs complete, the new image is a base again and the old one's file, let go of,
+/// goes.
+#[test]
+fn an_edit_over_a_base_not_written_back_is_put_whole_written_once_and_forces_nothing() {
+    const LEN: usize = 1 << 20;
+    let mut sim = Sim::new(33, quiet());
+    let mut store = open(&mut sim, "store");
+    let base = noise(LEN, 5);
+    store.put(key(1), Kind::Output, &base).unwrap();
+    flush(&mut sim, &mut store);
+    sim.hold_syncs(name("store/placed"));
+    let mut effects = Vec::new();
+    store.place(&key(1), name("one/build/a"), &mut effects).unwrap();
+    let placed = placed_one(&mut sim, &mut store, &mut effects);
+    assert_eq!(placed.result, Ok(()), "answered while its file's write-back is held");
+    assert_eq!(placed.bytes, PlacedBytes { cloned: 0, written: LEN as u64, copied: LEN as u64 });
+    assert_eq!(sim.contents(&name("one/build/a")), base);
+    assert_eq!(
+        store.reader().derivable(&enter(), &key(1)),
+        Derivable::No(NoBase::Unflushed),
+        "written by this run and not written back: no base"
+    );
+    // So the edit is handed over whole, as the caller of `derivable` does.
+    let mut edited = base.clone(); // clone: a test's bytes.
+    edited[LEN / 2] ^= 1;
+    store.put(key(2), Kind::Output, &edited).unwrap();
+    flush(&mut sim, &mut store);
+    let wrote = sim.bytes_written();
+    store.unplace(&key(1), &key(2), &mut effects);
+    store.place(&key(2), name("one/build/a"), &mut effects).unwrap();
+    let placed = placed_one(&mut sim, &mut store, &mut effects);
+    assert_eq!(placed.result, Ok(()));
+    assert_eq!(placed.bytes, PlacedBytes { cloned: 0, written: LEN as u64, copied: LEN as u64 });
+    assert_eq!(sim.contents(&name("one/build/a")), edited);
+    assert_eq!(
+        sim.bytes_written() - wrote,
+        2 * LEN as u64,
+        "the whole file once where it goes, and once as the store's file of it"
+    );
+    assert_eq!(sim.bytes_forced(), 0, "nothing was cloned, so nothing was forced out");
+    // The device answers again: both files are written back.
+    sim.release_held(Duration::from_micros(50));
+    drive(&mut sim, &mut store, &mut effects);
+    assert_eq!(store.reader().derivable(&enter(), &key(2)), Derivable::Yes);
+    assert!(!sim.exists(&name(&format!("store/placed/{:x}", content_of(&base)))), "let go of");
+    assert!(sim.exists(&name(&format!("store/placed/{:x}", content_of(&edited)))));
+    assert_eq!(sim.bytes_forced(), 0);
     assert!(store.problems().is_empty(), "{:?}", store.problems());
 }
 

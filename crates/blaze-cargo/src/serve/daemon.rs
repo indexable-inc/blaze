@@ -572,6 +572,9 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// `settled` and `job_effects`, and the turns it finished. The stop's guard reads it while
     /// the loop may be stuck inside the stop, or inside any turn.
     pulse: Arc<Pulse>,
+    /// The top stall's line as the guard last said it ([`Pulse::take_stall`]), the loop's own
+    /// copy: taken from the guard's queue once a look at the builds, with no lock.
+    stall: Option<String>,
     /// The effects that end on their own that ended ([`ends_alone`]: writes, reads and runs,
     /// never a client's connect or request, which a stuck daemon still takes).
     completions: u64,
@@ -1470,7 +1473,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         if let Some(machine) = &mut machine {
             plane.poll(driver.now());
             if let Some(bytes) =
-                machine.turn(driver.now(), &mut plane).map_err(|why| format!("{why:#}"))?
+                machine.first_turn(driver.now(), &mut plane).map_err(|why| format!("{why:#}"))?
             {
                 blaze_graph::admission::set_budgets(bytes);
             }
@@ -1577,6 +1580,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             job_effects: 0,
             working: 0,
             pulse: Arc::default(), // alloc: once a daemon
+            stall: None,
             completions: 0,
             plotted: Duration::ZERO,
             broken_down: Duration::ZERO,
@@ -1924,6 +1928,21 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             let driver = &mut self.driver;
             blaze_graph::wait::wait(woken.on(), None, || driver.poll(&mut done, until));
         }
+        self.turn_after_wait(done)
+    }
+
+    /// What a turn does once its wait ended, with the completions the wait gave: everything of
+    /// a turn but the loop's one wait (`turn_untagged`'s `Driver::poll`).
+    ///
+    /// The rule: the daemon's loop thread waits in one place, the driver's poll, and nothing
+    /// else it runs may block; work that blocks (a file read or written, a lock another thread
+    /// holds for long, a channel with a bound, a child awaited) is an effect the driver carries
+    /// out or a plane task on a worker. `#[blaze::nonblocking]` holds this function and
+    /// everything it calls to that (docs/v2/plan/design/effects.md): `blaze check` refuses a
+    /// blocking call under it, naming the chain. A call proven not to wait is marked
+    /// `#[blaze::nonblocking(trusted = "why")]` where it is defined, never allowed here.
+    #[blaze::nonblocking]
+    fn turn_after_wait(&mut self, mut done: Vec<Completion>) -> bool {
         for completion in &done {
             self.ended(completion);
         }
@@ -2160,6 +2179,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         );
         tracing::error!("{said}");
         let file = under(&self.state, &format!("stalls/{now}.json"));
+        // durable: a stall's trace is read after the daemon is killed for the stall, and nothing can make it again
         self.effects.push(Effect::Write { file, bytes: stall.trace, tag: STALL });
         // clone: the error, once a stall
         let error = ApiError::new(said.clone(), Some("stall".to_owned()));
@@ -2338,7 +2358,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let memory = doing::memory();
         let pool = blaze_graph::exec::shared();
         let working = pool.working();
-        let stall = self.pulse.stall();
+        self.pulse.take_stall(&mut self.stall);
+        let stall = self.stall.as_deref();
         let look = doing::Look {
             now,
             running: &running,
@@ -2349,7 +2370,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             workers: u32::try_from(pool.workers()).unwrap_or(u32::MAX),
             fetching: &fetching,
             memory: &memory,
-            stall: stall.as_deref(),
+            stall,
         };
         let mut said = self.spare.said.pop().unwrap_or_default();
         let mut builds = std::mem::take(&mut self.builds);

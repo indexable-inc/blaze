@@ -34,7 +34,7 @@ use std::alloc::Global;
 
 use super::{
     Build, Built, By, FnNode, FrontInstance, FrontStatic, Lookup, Node, Out, Put, Sorted, StaticId,
-    StaticNode, Whence, callee, dev_template_key, error, placed, prepare_node, stopped, stored,
+    StaticOf, Whence, callee, dev_template_key, error, placed, prepare_node, stopped, stored,
     stored_function, unfit, unkept_inline, unkept_message,
 };
 use crate::{
@@ -609,7 +609,7 @@ impl<B: Prepare> Build<'_, B> {
     pub(super) fn later(
         &self,
         nodes: &Sorted<InstanceKey, Node<B>>,
-        statics: &Sorted<StaticId, StaticNode<B>>,
+        statics: &Sorted<StaticId, StaticOf<B>>,
         root_keys: &[InstanceKey],
         entry: &[usize],
         order: &[InstanceKey],

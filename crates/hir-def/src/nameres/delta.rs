@@ -104,38 +104,118 @@ pub struct CrateDelta {
 }
 
 /// The maintainer's reads, two steps per layer of the crate graph (each crate one past its
-/// deepest dependency), a job per crate on the database's workers: first each crate of the
-/// layer reads its round-0 logs and runs its region to the cutoff on `&Db`, and the apply
-/// publishes its scopes; then each makes its name records over the scopes published, and the
-/// apply publishes its resolution. Its dependencies, all in earlier layers, are published by
-/// then; a crate in its own layer it never reads.
-fn read_step(db: &Db, _: &Written<'_>, reads: &mut Reads) {
-    let step = reads.step() as usize;
-    let at = step / 2;
+/// deepest dependency) that holds a crate the write reaches, a job per such crate on the
+/// database's workers: first each reads its round-0 logs and runs its region to the cutoff on
+/// `&Db`, and the apply publishes its scopes; then each makes its name records over the scopes
+/// published, and the apply publishes its resolution. Its dependencies, all in earlier layers,
+/// are published by then; a crate in its own layer it never reads.
+///
+/// A crate the write does not reach ([`unreached`]) has no job, and a layer of none has no
+/// step: a write of one file of one crate costs that crate and those above it, not a job a
+/// crate and two steps a layer of the whole graph (measured 2026-11-10 on a one-file program:
+/// 13 `maintainer reads` of about 15 ms each and a job for each of the standard library's
+/// crates, for an edit of the one file that is the program's).
+fn read_step(db: &Db, written: &Written<'_>, reads: &mut Reads) {
+    let first = reads.step() == 0;
     let more = db.lend_state::<LastWrite, _>(|last| {
         db.lend_state::<State, _>(|state| {
-            if step == 0 {
+            if first {
                 last.crates.clear();
                 state.pass.modules_changed.clear();
                 state.pass.scoped.clear();
+                state.pass.reached.clear();
+                state.pass.at = 0;
+                state.pass.records = false;
                 layer(db, &mut state.pass.layers);
             }
-            if step % 2 == 1 {
+            if state.pass.records {
                 // The layer's records, over the scopes its first step published.
+                state.pass.records = false;
                 reads.each(Tag::Nameres, std::mem::take(&mut state.pass.scoped), read_records);
-                return at + 1 < state.pass.layers.len();
+                return state.pass.at < state.pass.layers.len();
             }
-            let Some(layer) = state.pass.layers.get_mut(at) else { return false };
-            let layer = std::mem::take(layer);
-            let runs: Vec<CrateRun> =
-                layer.iter().map(|&krate| CrateRun::new(db, krate, state, &last.crates)).collect(); // alloc: a layer's jobs, once a step
-            state.pass.layers[at] = layer;
-            reads.each(Tag::Nameres, runs, read_crate);
-            true
+            // The next layer with a crate the write reaches: bounded by the layers.
+            while state.pass.at < state.pass.layers.len() {
+                let at = state.pass.at;
+                state.pass.at += 1;
+                let layer = std::mem::take(&mut state.pass.layers[at]);
+                let mut runs: Vec<CrateRun> = Vec::new(); // alloc: a layer's jobs, none for a layer the write does not reach
+                for &krate in &layer {
+                    if unreached(db, krate, state, written) {
+                        continue;
+                    }
+                    state.pass.reached.insert(krate);
+                    runs.push(CrateRun::new(db, krate, state, &last.crates));
+                }
+                state.pass.layers[at] = layer;
+                if runs.is_empty() {
+                    continue;
+                }
+                reads.each(Tag::Nameres, runs, read_crate);
+                state.pass.records = true;
+                return true;
+            }
+            false
         })
     });
     if more {
         reads.again();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: a crate above one the write reached is left without a job
+    /// when no file of its own was written.
+    pub(in crate::nameres) static SKIPS_ABOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the test on this thread planted [`SKIPS_ABOVE`]; never outside a test.
+fn skips_above() -> bool {
+    #[cfg(test)]
+    let planted = SKIPS_ABOVE.get();
+    #[cfg(not(test))]
+    let planted = false;
+    planted
+}
+
+/// Whether `written` leaves `krate`'s resolution, and everything the state holds of it, as
+/// it is: then the crate has no job in this pass, and its state stays where it is.
+///
+/// The invariant: a crate with no job is one whose job would read no log again, wake no
+/// group, run no region and publish nothing ([`read_crate`] and [`finish_crate`] with an
+/// empty delta put its state back and hand [`LastWrite`] nothing). That holds when
+/// - the write changed no crate graph, cfg or env, no file set and no source root (any of
+///   those walks every crate's round-0 tree), and gave this crate no proc macros;
+/// - no crate it depends on, directly or through others, is reached by the write: a crate
+///   reads names only of crates it depends on, so nothing an earlier crate's job changed is
+///   a key it read, and its root's log, which alone reads other crates' roots, is as it was;
+/// - it has a state and the write holds no file a log of it reads
+///   ([`CrateState::reads_written`]); or the frozen image serves it and it has no state to
+///   drop.
+/// A crate reached is noted ([`state::Pass::reached`]) whether or not its job then changes
+/// anything, so every crate above a written one has its job, as before.
+fn unreached(db: &Db, krate: Crate, state: &State, written: &Written<'_>) -> bool {
+    if written.crates
+        || !written.added.is_empty()
+        || !written.removed.is_empty()
+        || !written.roots.is_empty()
+        || written.proc_macros.binary_search(&krate).is_ok()
+    {
+        return false;
+    }
+    let above_reached = krate
+        .data(db)
+        .dependencies
+        .iter()
+        .any(|it| state.pass.reached.contains(&it.crate_id));
+    if above_reached && !skips_above() {
+        return false;
+    }
+    match (frozen::is_served(db, krate), state.crates.get(&krate)) {
+        (true, None) => true,
+        (false, Some(cs)) => !cs.reads_written(written),
+        _ => false,
     }
 }
 

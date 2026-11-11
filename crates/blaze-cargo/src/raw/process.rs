@@ -233,6 +233,7 @@ pub fn wait_exited(pid: u32) -> std::io::Result<()> {
     let clock = blaze_core::wait::Monotonic::new();
     let pid =
         libc::pid_t::try_from(pid).map_err(|_| std::io::Error::from_raw_os_error(libc::ECHILD))?;
+    // wakes: the kernel, at the test executable's exit (`waitid`): the pid is this process's child
     match blaze_core::wait::exited("a test executable's exit", pid, None, &clock) {
         Ok(_) => Ok(()),
         Err(error) => Err(std::io::Error::from(error)),

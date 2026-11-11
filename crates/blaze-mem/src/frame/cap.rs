@@ -387,6 +387,7 @@ fn reserve(shared: &'static Shared, bytes: u64) -> Result<(), Refused> {
             shared.changed.notify_all();
             continue;
         }
+        // wakes: every give-back of bytes notifies `changed`, and this waiter is registered before it looks again
         state = shared.changed.wait(state).unwrap_or_else(PoisonError::into_inner);
     }
 }

@@ -108,6 +108,12 @@ struct Engine {
     durable: std::collections::HashSet<u32>,
     /// The durable view ([`Frontend::durable_view`]).
     high: u64,
+    /// The group of inputs each function's describe and count hang on
+    /// ([`Frontend::group`]): one with none is asked each build.
+    groups: HashMap<u32, u64>,
+    /// The revision an input of each group was last written at
+    /// ([`Frontend::written_since`]).
+    written: HashMap<u64, u64>,
 }
 
 impl Default for Engine {
@@ -123,6 +129,8 @@ impl Default for Engine {
             misses_facts: false,
             durable: std::collections::HashSet::new(),
             high: 0,
+            groups: HashMap::default(),
+            written: HashMap::default(),
         }
     }
 }
@@ -192,6 +200,9 @@ impl Program {
         self.engine.changed.insert(id, self.engine.revision);
         if self.engine.durable.contains(&id) {
             self.engine.high += 1;
+        }
+        if let Some(group) = self.engine.groups.get(&id) {
+            self.engine.written.insert(*group, self.engine.revision);
         }
     }
 
@@ -415,6 +426,18 @@ impl Frontend for Program {
 
     fn durable_view(&self) -> Option<u64> {
         Some(self.engine.high)
+    }
+
+    fn view(&self) -> Option<u64> {
+        Some(self.engine.revision)
+    }
+
+    fn group(&self, id: &u32, _: &Origin) -> Option<u64> {
+        self.engine.groups.get(id).copied()
+    }
+
+    fn written_since(&self, group: u64, view: u64) -> bool {
+        self.engine.written.get(&group).is_some_and(|at| *at > view)
     }
 
     fn closes(&self) -> bool {
@@ -1402,7 +1425,7 @@ fn a_statics_refused_put_names_it_by_its_path() {
     for (id, at) in [(1, a), (2, b)] {
         map.insert(
             at,
-            StaticNode::<Machine> {
+            StaticOf::<Machine> {
                 value: id,
                 described: test_static(id),
                 spec: spec.clone(),

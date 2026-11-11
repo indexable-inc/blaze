@@ -186,6 +186,7 @@ impl Store {
                 // holds nothing yet.
                 let file = self.tiers[0].file(HEAD_FILE);
                 let tag = self.tags.ask(Op::Announce);
+                // durable: the store's first head: a reopen, and the other writers of the shared directory, read it as what is committed
                 effects.push(Effect::Write { file, bytes: Head::default().encode(), tag });
             } else {
                 self.start_look(effects);
@@ -312,6 +313,7 @@ impl Store {
         let file = self.tiers[0].file(HEAD_FILE);
         if self.retry(&file, done) {
             let tag = self.tags.ask(Op::Announce);
+            // durable: the store's first head, asked again after a failure: what a reopen reads as committed
             effects.push(Effect::Write { file, bytes: Head::default().encode(), tag });
         }
     }

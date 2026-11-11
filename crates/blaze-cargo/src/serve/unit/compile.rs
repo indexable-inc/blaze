@@ -1453,6 +1453,22 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
     })
 }
 
+/// Whether `unit`'s record is in the store under its narrow key ([`narrow_key`]), the first
+/// of the keys a lookup asks ([`record_keys`]): then the unit is replayed from what its
+/// crate's code texts say alone, and an edit that leaves every code text finds it again. Not
+/// for a unit with no narrow key (its lints read comments, its crate keeps its whole text),
+/// nor one whose record is under what its diagnostics quote or its whole key, which hold its
+/// files' bytes. What the job's front end asks of each unit before it vouches for a source
+/// (`UnitWriter::still`); read in place, as [`fresh`] reads.
+pub(crate) fn found_narrow(job: &Job, unit: usize) -> bool {
+    let Ok(Some(narrow)) = narrow_key(job, unit) else { return false };
+    let guard = blaze_cas::enter();
+    let found_in = |store: &blaze_cas::Reader, std: bool| {
+        matches!(filed_in(job, store, std, &guard, narrow), Ok(Some(_)))
+    };
+    found_in(&job.input.store, false) || (shared(job, unit) && found_in(&job.input.std, true))
+}
+
 /// The narrowed identities of library crates the writer worked out and no unit gave the loop
 /// yet ([`Job::library_narrows`]): each put once, by the first unit replayed or stored after
 /// it was made.
@@ -1871,17 +1887,23 @@ impl Written {
     /// the end of no long chain of patches), the patch ([`Written::Derived`]), and `whole` is
     /// not called; else the whole file `whole` gives ([`Written::Linked`]): an image's first
     /// link or one from scratch (a full patch), a base the store never had or let go of.
-    /// Having no base is not an error, and why is logged.
+    /// Having no base is not an error, and why is logged; `whole`'s error is the answer's.
+    ///
+    /// A base whose whole file the store wrote and has not seen written back is no base
+    /// either (`blaze_cas::NoBase::Unflushed`, the dirty-base rule): a derive is a clone of
+    /// that file, which would wait for all of it to be written out, so the image is handed
+    /// over whole and written where it goes. That is at most one whole file per write-back
+    /// in flight; the edit after it derives again.
     ///
     /// Give no patch for a file the daemon reads back by its bytes (a proc macro's wasm
     /// module, [`Module::bytes`]): what the store keeps of a patch is the recipe, and only a
     /// place gives the file.
-    pub(crate) fn linked(
+    pub(crate) fn linked<E>(
         store: &blaze_cas::Reader,
         root: [u8; 32],
         patch: Option<blaze_link::Patch>,
-        whole: impl FnOnce() -> Vec<u8>,
-    ) -> Written {
+        whole: impl FnOnce() -> Result<Vec<u8>, E>,
+    ) -> Result<Written, E> {
         let derived = patch.filter(|it| !it.full && it.digest == root).and_then(|patch| {
             let base = patch.base?;
             let key = linked_key(&base);
@@ -1901,8 +1923,8 @@ impl Written {
             }
         });
         match derived {
-            Some(derived) => derived,
-            None => Written::Linked(whole(), root),
+            Some(derived) => Ok(derived),
+            None => Ok(Written::Linked(whole()?, root)),
         }
     }
 }
@@ -3398,14 +3420,10 @@ fn assemble(
                         }
                         // alloc: once per image linked, a unit links one or two
                         links.push((path.to_owned(), linked.how));
-                        // The link hands over the whole file and no patch yet
-                        // (`codegen::LinkMade`): with the patch it took the link as, and the
-                        // bytes made only when asked, an edit's image is derived in the store.
-                        files.push((
-                            path.to_owned(),
-                            Written::linked(&job.input.store, linked.root, None, || linked.bytes),
-                            true,
-                        ));
+                        // What the link settled the store is given: the patch the image took
+                        // the link as, where the store derives the file from the one before
+                        // it, else the whole file (`codegen::LinkMade::written`).
+                        files.push((path.to_owned(), linked.written, true));
                     }
                     Err(failed) => {
                         // alloc: error path

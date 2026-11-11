@@ -2127,8 +2127,12 @@ fn where_blocks_cannot_be_shared_a_place_fails_and_copies_nothing() {
     assert!(!sim.exists(&name("out/q")));
 }
 
+/// The first places of an output are its bytes written where they go, while the store's own
+/// whole file of it is written, sealed and written back beside them: none waits for that
+/// file, and none is a clone of a file just written. Once it is written back, a place is a
+/// clone of it.
 #[test]
-fn an_output_is_written_once_and_cloned_to_every_place() {
+fn an_output_is_written_where_it_goes_first_and_cloned_once_its_file_is_written_back() {
     let mut sim = Sim::new(11, quiet());
     let mut store = open(&mut sim, "store");
     let out = noise(CHUNK_FROM as usize + 10, 110);
@@ -2147,13 +2151,24 @@ fn an_output_is_written_once_and_cloned_to_every_place() {
     bytes += placed[&b].bytes;
     assert_eq!(
         bytes,
-        PlacedBytes { cloned: 2 * len, written: len, copied: 0 },
-        "written once, cloned twice"
+        PlacedBytes { cloned: 0, written: len, copied: 2 * len },
+        "written into the store once, and where each goes"
     );
     assert_eq!(sim.contents(&name("one/build/a")), out);
     assert_eq!(sim.contents(&name("two/build/a")), out);
+    assert_eq!(sim.contents(&file), out);
     assert_eq!(sim.mode(&file), Some(PLACED_MODE), "the store's copy is read-only");
-    assert_eq!(sim.mode(&name("one/build/a")), Some(0o644), "a clone is a written file's mode");
+    assert_eq!(sim.mode(&name("one/build/a")), Some(0o644), "an output is a written file's mode");
+    // Written back by now: a third place is a clone of it, and writes nothing.
+    let wrote = sim.bytes_written();
+    let c = store.place(&key(1), name("three/build/a"), &mut effects).unwrap();
+    drive(&mut sim, &mut store, &mut effects);
+    let placed = store.placed();
+    assert_eq!((placed[0].tag, &placed[0].result), (c, &Ok(())));
+    assert_eq!(placed[0].bytes, PlacedBytes { cloned: len, written: 0, copied: 0 });
+    assert_eq!(sim.contents(&name("three/build/a")), out);
+    assert_eq!(sim.mode(&name("three/build/a")), Some(0o644), "a clone is a written file's mode");
+    assert_eq!((sim.bytes_written() - wrote, sim.bytes_forced()), (0, 0));
     // Let go of, the whole file goes; the value and every clone stay, and placing again
     // writes it again.
     store.unplace(&key(1), &key(9), &mut effects);
@@ -2164,7 +2179,7 @@ fn an_output_is_written_once_and_cloned_to_every_place() {
     drive(&mut sim, &mut store, &mut effects);
     let placed = store.placed();
     assert_eq!(placed[0].tag, again);
-    assert_eq!(placed[0].bytes, PlacedBytes { cloned: len, written: len, copied: 0 });
+    assert_eq!(placed[0].bytes, PlacedBytes { cloned: 0, written: len, copied: len });
     assert_eq!(store.problems(), &[] as &[String]);
 }
 
@@ -2236,6 +2251,7 @@ fn the_first_place_after_an_open_looks_at_and_seals_the_placed_file_without_foll
                 Effect::Stat { file: it, .. } if *it == file => Some("Stat"),
                 Effect::Map { file: it, .. } if *it == file => Some("Map"),
                 Effect::Seal { file: it, .. } if *it == file => Some("Seal"),
+                Effect::WriteBack { file: it, .. } if *it == file => Some("WriteBack"),
                 Effect::Mode { file: it, .. } if *it == file => Some("Mode"),
                 Effect::Write { file: it, .. } | Effect::WriteUnsynced { file: it, .. }
                     if *it == file =>
@@ -2258,7 +2274,11 @@ fn the_first_place_after_an_open_looks_at_and_seals_the_placed_file_without_foll
         }
     }).expect("the effects end");
     assert_eq!(store.placed()[0].result, Ok(()));
-    assert_eq!(seen, ["Lstat", "Map", "Seal", "Clone"], "the kept file's effects, in order");
+    assert_eq!(
+        seen,
+        ["Lstat", "Map", "Seal", "WriteBack", "Clone"],
+        "the kept file's effects, in order: written back before it is cloned from"
+    );
 }
 
 #[test]
@@ -2522,12 +2542,17 @@ fn where_an_output_cannot_be_cloned_its_place_fails_and_copies_nothing() {
     store.put(key(1), Kind::Output, &noise(CHUNK_FROM as usize, 120)).unwrap();
     flush(&mut sim, &mut store);
     let mut effects = Vec::new();
+    // Its first place is its bytes written where they go, which shares no block.
     store.place(&key(1), name("out/a"), &mut effects).unwrap();
+    drive(&mut sim, &mut store, &mut effects);
+    assert_eq!(store.placed()[0].result, Ok(()));
+    // The next is a clone of the store's whole file of it: refused, and nothing copies.
+    store.place(&key(1), name("out/b"), &mut effects).unwrap();
     drive(&mut sim, &mut store, &mut effects);
     let placed = store.placed();
     assert!(matches!(&placed[0].result, Err(why) if why.contains("does not copy")), "{placed:?}");
     assert_eq!(placed[0].bytes, PlacedBytes::default());
-    assert!(!sim.exists(&name("out/a")));
+    assert!(!sim.exists(&name("out/b")));
 }
 
 #[test]

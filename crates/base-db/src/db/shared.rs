@@ -81,6 +81,7 @@ impl Shared {
             self.db.storage().stop_readers();
             let mut held = self.gone.lock.lock();
             let db = &self.db;
+            // wakes: each `Reader`'s drop notifies `gone.left`, and every reader was just told to stop
             self.gone.left.wait_while(&mut held, |_| Arc::strong_count(db) > 1);
             drop(held);
         }

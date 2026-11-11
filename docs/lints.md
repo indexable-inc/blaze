@@ -1,6 +1,6 @@
 ---
 status: current
-summary: The general `blaze::` lints `blaze check` runs in every workspace (`blaze::general`): what each catches, why it costs, how to fix or allow it, and the `clippy.toml` keys that tune them.
+summary: The general `blaze::` lints `blaze check` runs in every workspace (`blaze::general`): what each catches, why it costs, how to fix or allow it, and the `clippy.toml` keys that tune them; then the three guard lints of `blaze::internal` that ask for a stated reason on the line (`durable_write`, `unbounded_wait`, `combined_identity`).
 ---
 # The general lints
 
@@ -1237,3 +1237,93 @@ smaller nodes. Goose's links are narrow and relative for the same reason.
 widen it with `as usize` where it indexes; check the length where the container grows.
 
 **Allowing it.** `#[expect(blaze::wide_index, reason = "..")]` on the struct.
+
+# The guard lints
+
+Three lints of `blaze::internal` (allowed unless a workspace turns the group on, as blaze's own
+does) each hold a rule whose absence let bad code be written (rule `guard-the-cause`). Each asks
+for a comment that states a reason on the line, as `// alloc: <why>` does, read on the finding's
+line or the line above; an empty reason keeps nothing. None is linted in tests.
+
+## `durable_write`
+
+**The rule.** A write waits for the disk only where a crash would lose something no build can
+make again, and its line says what.
+
+**What it catches.** A `blaze_core::Effect::Write`, `Effect::Rename` or `Effect::Sync` built; a
+call of `File::sync_all` or `File::sync_data` (std's, tokio's), of blaze-core's
+`write_atomically`, or of `fsync`, `fdatasync` or `fcntl_fullfsync` (libc's, rustix's); each
+with no `// durable: <why>`. The variant and the functions are resolved, so a renamed import is
+found; a pattern that names a synced effect builds nothing and is not.
+
+**Why it matters.** A sync holds its asker until the disk has the bytes, seconds on a busy disk.
+A build's answer was held 4 s behind the sync of files the next build would have written again,
+because nothing asked why they were synced.
+
+**How to fix it.** Data a build can make again, and whose reader checks it before use (an
+output placed from the store, a file named by its content), takes `Effect::WriteUnsynced` and
+`Effect::RenameUnsynced`. What must survive (a commit point, a journal, a lease, a user's file)
+keeps its sync and says so: `// durable: the manifest is the one record of which files a flush
+wrote`.
+
+**Not found.** A sync asked of the kernel by a raw opcode (blaze-core's io_uring driver, which
+carries out `Effect::Sync`), and `fcntl(fd, F_FULLFSYNC)` through libc's `fcntl`.
+
+**Allowing it.** The comment, or `#[expect(blaze::durable_write, reason = "..")]`.
+
+## `unbounded_wait`
+
+**The rule.** A wait has a deadline, or its line names what always wakes it and why that
+cannot end first (rules `deadline-waits` and `bounded-progress`).
+
+**What it catches.** A call of `std::thread::park`; of `Condvar::wait` or `wait_while` (std's,
+`parking_lot`'s) or `blaze_core::lock::Signal`'s `wait` or `wait_while`; or of a function of
+`blaze_core::wait` (`Parker::park`, `until`, `exited`, `readable`, `pollable`) given `None` for
+its deadline, written out; each with no `// wakes: <who>`. `blaze_core::wait` itself, where the
+deadline is applied, is not linted.
+
+**Why it matters.** A wait with no deadline hangs forever the day its waker ends another way.
+Inside the build-script sandbox the workers' wait ring was refused, each worker returned from
+its error path, and the main thread stayed in `thread::park()`: blaze hung with no error.
+`.clippy.toml` already banned `std::thread::park`, and the site carried an `#[expect]` whose
+reason said why it parks, not who wakes it.
+
+**How to fix it.** Wait to a `Deadline` through `blaze_core::wait` and end in a typed error
+naming what was awaited when it passes (`Waited::Deadline`). Where no deadline is right (an
+idle worker, a thread that serves until told to stop), name the waker and why it cannot end
+without waking: `// wakes: the pool's Drop, which unparks every thread it listed`.
+
+**Not found.** A channel's `recv` and a thread's `join`: the other side's end wakes them (the
+last sender dropped, the thread returned), so a waker that ends silently still ends the wait. A
+deadline that is `None` only at run time. A raw kernel wait, which `.clippy.toml` bans outside
+`crates/blaze-core/src/wait.rs` and its modules.
+
+**Allowing it.** The comment, or `#[expect(blaze::unbounded_wait, reason = "..")]`.
+
+## `combined_identity`
+
+**The rule.** An identity of many things is a hash of all of them; one kept through edits is
+`blaze_ids::keyed::Keyed`'s root (`crates/blaze-ids/src/keyed.rs`), and nothing else adds or
+XORs hashes into an identity.
+
+**What it catches.** `a ^ b`, `a ^= b`, `a.wrapping_add(b)` or `a.wrapping_sub(b)` on integers,
+in a function whose parameters or return type hold a `blaze_ids::ContentId` (itself or two
+types deep: `BuiltId(ContentId)`, `&[(Key, ContentId)]`), or with an operand that reads one;
+each with no `// identity: <why>`. `blaze_ids::keyed`, the one audited module, is not linted.
+
+**Why it matters.** A sum or an XOR of hashes updates as cheaply as a Merkle root and is not
+collision resistant: entries that XOR to a chosen value are found by linear algebra, entries
+that sum to one by a generalized birthday search. Two different sets then share an ID, and
+state kept under it is used for the wrong set (rule `keys-cover-every-input`). A build's ID
+was the wrapping sum of its functions' entries, and keyed kept state.
+
+**How to fix it.** Keep the set in a `Keyed` (set and remove entries as they change, about
+`log2(n)` hashes each) and take its root; or hash every entry with `blaze_ids::Hasher` where
+nothing is kept between builds.
+
+**Not found.** `+` and `+=`, which panic on overflow where it is checked; an identity that is
+a bare integer or array with no `ContentId` in the function's signature or the operands.
+
+**Allowing it.** An XOR or a sum that makes no identity (a shard index, a checksum of one
+buffer, a hash function's own rounds) says so with `// identity: <why>`, or
+`#[expect(blaze::combined_identity, reason = "..")]`.

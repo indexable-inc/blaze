@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(all(unix, feature = "native"))]
 use std::time::Duration;
 
-use blaze_core::lock::Lock;
+use crossbeam_queue::SegQueue;
 #[cfg(all(unix, feature = "native"))]
 use blaze_core::lock::stall::Stall;
 
@@ -28,33 +28,43 @@ pub struct Pulse {
     moved: AtomicU64,
     /// The turns it finished, idle ones too: an idle loop turns at least every 50 ms.
     turns: AtomicU64,
-    /// The top stall's line ([`Stall::line`]) at the guard's last look, `None` for none. Set
-    /// by the guard only while a stall lasts and once as it ends; read by the loop once a look
-    /// at its builds (`doing::EVERY`), so neither holds it for more than a swap or a clone.
-    stall: Lock<Option<String>>,
+    /// The top stall's line ([`Stall::line`]) at each of the guard's looks, `None` for none,
+    /// in order: messages from the guard to the loop, which keeps the last it took
+    /// ([`Pulse::take_stall`]). Until 2026-11-10 this was a lock both took, the loop to clone
+    /// the line: uncontended but for the guard's swap, yet a lock the loop thread could park
+    /// on, which nothing it runs after its wait may do (`Daemon::turn_after_wait`). A queue
+    /// has no holder to wait for. At most [`STALLS_KEPT`] are kept: the guard drops the oldest.
+    stalls: SegQueue<Option<String>>,
 }
+
+/// The most stall lines the queue holds for the loop: a loop that builds nothing takes none,
+/// and the guard says one each look while a stall lasts.
+const STALLS_KEPT: usize = 4;
 
 impl Default for Pulse {
     fn default() -> Pulse {
-        Pulse {
-            moved: AtomicU64::new(0),
-            turns: AtomicU64::new(0),
-            stall: Lock::new("serve.pulse.stall", None),
-        }
+        Pulse { moved: AtomicU64::new(0), turns: AtomicU64::new(0), stalls: SegQueue::new() }
     }
 }
 
 impl Pulse {
-    /// The guard's latest stall line, `None` once none lasts.
+    /// The guard's latest stall line, `None` once none lasts. Never waits: the oldest line
+    /// the loop has not taken goes when [`STALLS_KEPT`] are queued, and the last said stays.
     pub fn set_stall(&self, line: Option<String>) {
-        let was = std::mem::replace(&mut *self.stall.lock(), line);
-        // The old line drops here, after the lock is let go.
-        drop(was);
+        if self.stalls.len() >= STALLS_KEPT {
+            drop(self.stalls.pop());
+        }
+        self.stalls.push(line);
     }
 
-    /// The top stall's line at the guard's last look, while one lasts.
-    pub fn stall(&self) -> Option<String> {
-        self.stall.lock().clone() // clone: a stall's line, rare, once a look at the builds
+    /// On the loop: the guard's lines since the last take, the last of them left in `latest`
+    /// (the top stall's line at the guard's last look, `None` once none lasts); `latest` as it
+    /// was when the guard said nothing since. Never waits. Bounded by the lines queued, at
+    /// most [`STALLS_KEPT`] and what the guard says meanwhile, one a look of its own.
+    pub fn take_stall(&self, latest: &mut Option<String>) {
+        while let Some(line) = self.stalls.pop() {
+            *latest = line;
+        }
     }
 
     /// A turn ended, with the loop's progress at `moved`.
@@ -259,6 +269,33 @@ mod tests {
     use super::*;
 
     const S: u64 = 1_000_000_000;
+
+    /// The loop's copy of the stall line is the guard's last word, whatever
+    /// the guard said between two takes and however many it said to a loop that took none;
+    /// and with nothing said since, it is as it was. Make `take_stall` keep the first line it
+    /// pops and the loop shows a stall that ended.
+    #[test]
+    fn the_loop_takes_the_guards_last_stall_line_without_a_lock() {
+        let pulse = Pulse::default();
+        let mut latest = None;
+        pulse.take_stall(&mut latest);
+        assert_eq!(latest, None, "nothing said");
+        pulse.set_stall(Some("a".to_owned()));
+        pulse.set_stall(Some("b".to_owned()));
+        pulse.take_stall(&mut latest);
+        assert_eq!(latest.as_deref(), Some("b"));
+        pulse.take_stall(&mut latest);
+        assert_eq!(latest.as_deref(), Some("b"), "nothing said since: as it was");
+        // A stall that lasts while the loop takes nothing: the queue stays bounded, and the
+        // end of the stall, said last, is what the loop takes.
+        for at in 0..100 {
+            pulse.set_stall(Some(format!("stall {at}")));
+        }
+        assert!(pulse.stalls.len() <= STALLS_KEPT, "{} lines queued", pulse.stalls.len());
+        pulse.set_stall(None);
+        pulse.take_stall(&mut latest);
+        assert_eq!(latest, None, "the stall ended");
+    }
 
     /// The daemon's stuck loop, as the guard sees it: turns stop at 7, the report comes once
     /// at its bound, never again while the turn lasts, and anew once the loop turned and

@@ -675,6 +675,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-client"
+version = "0.0.0"
+dependencies = [
+ "blaze-api",
+ "blaze-core",
+ "blaze-protocol",
+ "blaze-report",
+ "blaze-rng",
+ "hegeltest",
+ "libc",
+ "serde",
+ "sonic-rs",
+ "tracing",
+]
+
+[[package]]
+name = "blaze-client-c"
+version = "0.0.0"
+dependencies = [
+ "blaze-api",
+ "blaze-client",
+ "blaze-protocol",
+]
+
+[[package]]
 name = "blaze-codegen"
 version = "0.0.0"
 dependencies = [
@@ -740,6 +765,33 @@ dependencies = [
  "blaze-ids",
  "hegeltest",
  "smallvec",
+]
+
+[[package]]
+name = "blaze-diff"
+version = "0.0.0"
+dependencies = [
+ "blaze-hash",
+ "hegeltest",
+]
+
+[[package]]
+name = "blaze-diff-mir"
+version = "0.0.0"
+dependencies = [
+ "base-db",
+ "blaze-diff",
+ "blaze-hash",
+ "blaze-query",
+ "hegeltest",
+ "hir-def",
+ "hir-expand",
+ "hir-ty",
+ "hir-ty-mir",
+ "hir-ty-pure",
+ "intern",
+ "la-arena",
+ "rustc_type_ir",
 ]
 
 [[package]]
@@ -1524,6 +1576,15 @@ dependencies = [
  "blaze-units",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "blaze-napi"
+version = "0.0.0"
+dependencies = [
+ "blaze-api",
+ "blaze-client",
+ "crossbeam-channel",
 ]
 
 [[package]]

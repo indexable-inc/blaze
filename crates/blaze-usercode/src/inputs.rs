@@ -219,6 +219,7 @@ impl Files {
         };
         let (a, b) = (pass(0x243f_6a88_85a3_08d3), pass(0x1319_8a2e_0370_7344));
         let mut id = [0; 32];
+        // identity: two seeded passes over one path's bytes mixed into one key of a table that never leaves the process and compares the path on each find; not the identity of a set
         for (at, word) in [a, b, mix(a ^ b), mix(a.wrapping_add(b))].into_iter().enumerate() {
             id[at * 8..at * 8 + 8].copy_from_slice(&word.to_le_bytes());
         }

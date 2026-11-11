@@ -515,6 +515,7 @@ pub(crate) fn wait_exited(pid: libc::pid_t) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         let clock = crate::wait::Monotonic::new();
+        // wakes: the kernel, at the child's exit (`waitid`): the pid is this process's child, which exits or is killed
         match crate::wait::exited("a child's exit", pid, None, &clock) {
             Ok(_) => Ok(()),
             Err(error) => Err(io::Error::from(error)),

@@ -736,6 +736,52 @@ pub fn code_text_of(root: &SyntaxNode, text: &str) -> CodeText {
     }
 }
 
+const STILL_TEXT: &str = "blaze v2 file still text 1";
+
+/// The still text of a file of text `text`, parsed as `root`: its bytes but what no code text
+/// holds whole, and nothing else. Left out is exactly what [`Masked::mask`] leaves of a plain
+/// `//` comment (it and the spaces and tabs before it; never its line's end, never a doc
+/// comment, a block comment or a comment the compiler reads, [`READ_IN_COMMENTS`]), what
+/// [`Masked::blank`] leaves of whitespace (the spaces and tabs before a line's end) and what is
+/// after the file's last token ([`code_end`]).
+///
+/// The invariant: two texts of one still text have every [`CodeText`] equal, each hash and
+/// each flag. Their tokens are the same at the same lines and columns: what is left out is
+/// before a line's end or after the last token and inside no token, so every other byte is in
+/// both, in order; a doc or block comment is whole in both, so its shape is one; a left-out
+/// body's shape counts its lines' ends and what is after the last of them, which holds no
+/// `//` comment (one would end the line) and no space before a line's end. So a unit keyed by
+/// code texts ([`crate::Lowered::narrowed`]) has one key for both. It is the narrowest such
+/// text: an edit of a doc comment's words, which a code text may hold as a shape, changes it.
+///
+/// What the no-op lane compares of a changed file (blaze-cargo's `serve::job::noop`): one
+/// parse of it, no database.
+pub fn still_text_of(root: &SyntaxNode, text: &str) -> ContentId {
+    let mut still = Masked::of(STILL_TEXT, code_end(root));
+    let mut next = root.first_token();
+    while let Some(token) = next {
+        match token.kind() {
+            SyntaxKind::WHITESPACE => still.blank(text, &token),
+            // Doc comments are of other kinds; a `/* */` one keeps its text here.
+            SyntaxKind::COMMENT if token.text().starts_with("//") => still.mask(text, &token),
+            // The planted bug: a number's digits are in no still text.
+            SyntaxKind::INT_NUMBER if planted(Plant::Stale) => {
+                let range = token.text_range();
+                still.skip(text, usize::from(range.start()), usize::from(range.end()));
+            }
+            _ => {}
+        }
+        next = token.next_token();
+    }
+    still.finish(text)
+}
+
+/// [`still_text_of`] of `text` parsed as a file of `edition`: one parse, made here and dropped.
+pub fn still_text(text: &str, edition: span::Edition) -> ContentId {
+    let parse = syntax::SourceFile::parse(text, edition);
+    still_text_of(parse.tree().syntax(), text)
+}
+
 /// Where the code of a file parsed as `root` ends: the end of its last token that is not
 /// whitespace or a plain `//` comment, 0 for a file with none. Nothing is after what follows it,
 /// so no token and no position moves with it, and no text holds it ([`Masked::end`]): a

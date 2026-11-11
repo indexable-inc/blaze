@@ -59,6 +59,25 @@ fn profile(name: &str, opt_level: &str, backend: Option<&str>) -> Profile {
     }
 }
 
+/// Debug info goes beside an ELF or Mach-O image by default and under either split setting;
+/// `off` puts it inside as before; no debug info is none wherever; a format with no side file
+/// keeps what it had; a setting rustc does not take is refused by name.
+#[test]
+fn debug_info_goes_beside_the_image_unless_the_profile_says_off() {
+    use blaze_link::{Debug, Format};
+    for format in [Format::Elf, Format::MachO] {
+        for split in [None, Some("packed"), Some("unpacked")] {
+            assert_eq!(super::debug_place(Debug::Lines, format, split), Ok(Debug::Beside));
+        }
+        assert_eq!(super::debug_place(Debug::Lines, format, Some("off")), Ok(Debug::Lines));
+        assert_eq!(super::debug_place(Debug::None, format, None), Ok(Debug::None));
+        assert_eq!(super::debug_place(Debug::None, format, Some("off")), Ok(Debug::None));
+    }
+    assert_eq!(super::debug_place(Debug::Lines, Format::Pe, None), Ok(Debug::Lines));
+    let refused = super::debug_place(Debug::Lines, Format::Elf, Some("split")).unwrap_err();
+    assert!(refused.contains("`split`") && refused.contains("unpacked"), "{refused}");
+}
+
 #[test]
 fn llvm_and_no_backend_leave_the_choice_to_blaze() {
     for level in [OptLevel::O0, OptLevel::O3] {

@@ -1,5 +1,6 @@
-//! The comments that keep a cost on a line: `// clone: <why>`, `// alloc: <why>` and
-//! `// dyn: <why>`, on a line of the finding or on the line above it, with a reason that isn't
+//! The comments that keep a cost on a line: `// clone: <why>`, `// alloc: <why>`,
+//! `// dyn: <why>`, `// seqcst: <why>`, `// durable: <why>`, `// wakes: <who>` and
+//! `// identity: <why>`, on a line of the finding or on the line above it, with a reason that isn't
 //! empty. Read from the text of the tree walked, nothing allocated.
 
 use syntax::TextRange;
@@ -14,6 +15,9 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         Lint::HotAlloc | Lint::HotAllocCall | Lint::ImplicitAllocator => Some("alloc"),
         Lint::HotDyn => Some("dyn"),
         Lint::SeqcstUnexplained => Some("seqcst"),
+        Lint::DurableWrite => Some("durable"),
+        Lint::UnboundedWait => Some("wakes"),
+        Lint::CombinedIdentity => Some("identity"),
         // `relaxed_publish` reads it on either side and on the atomic's declaration itself.
         Lint::RelaxedPublish => Some("relaxed"),
         Lint::Parallelizable
