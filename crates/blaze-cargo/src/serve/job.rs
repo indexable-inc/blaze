@@ -3353,6 +3353,9 @@ pub struct Jobs<S: Steps> {
     roots: Roots<S>,
     /// Views of plans replaced in `roots`, closed once no job reads them.
     retired: Vec<ViewId>,
+    /// A plan was made since the plan's database was last collected (`Jobs::expire`'s end):
+    /// the values the plan before it held alone are let go of at the next turn.
+    planned: bool,
     /// What a run of user code says, a buffer reused by each of its calls.
     out: Vec<Response>,
     /// The tasks a write held, a buffer reused by each [`Jobs::apply_writes`].
@@ -3492,6 +3495,7 @@ impl<S: Steps> Jobs<S> {
             erring: HashMap::new_in(Global),
             roots: Roots::new(),
             retired: Vec::new(), // alloc: none until a plan is replaced
+            planned: false,
             out: Vec::new(),     // alloc: none until user code says something, then reused
             posts: Vec::new(),   // alloc: none until a write holds a task, then reused
             over: Vec::new(),    // alloc: none until a job ends, then reused
@@ -5224,6 +5228,7 @@ impl<S: Steps> Jobs<S> {
                 // alloc: once per plan that differs from the last, shared by the job's tasks
                 let units = same.unwrap_or_else(|| Arc::new(units));
                 let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+                self.planned = true;
                 if let Some(root) = prep.root
                     && reuses_plans(&job.work)
                 {
@@ -8230,6 +8235,23 @@ impl<S: Steps> Jobs<S> {
                 }
                 read
             });
+        }
+        // A plan was made: what the plan before it held alone of the plan's database (each
+        // plan's values, 24 MiB of them a plan of blaze) is let go of now. Until this the
+        // database was collected only between requests (`Daemon::between`), so a build that
+        // planned again as each build script ended kept every plan it had made: 914 segments
+        // of 4 MiB, 3.76 GiB of the query tag's heap, sixteen minutes into a cold build of
+        // blaze (lane mem-1111, 2026-11-11; `held_samples`, allocated in `plan`). The
+        // collection is the one `between` runs, with the same root: it keeps what an open view
+        // or the root reaches, and frees a memo only once a grace after its unlinking passed.
+        if std::mem::take(&mut self.planned) {
+            let _span = tracing::info_span!(
+                target: "blaze",
+                "plan made: collect the plan's database",
+                retired = self.retired.len()
+            )
+            .entered();
+            w.db.collect(&[w.steps.plan_key()], w.effects);
         }
     }
 
