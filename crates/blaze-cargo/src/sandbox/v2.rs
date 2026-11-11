@@ -388,7 +388,16 @@ fn program_env(spec: &confine::Spec) -> std::borrow::Cow<'_, [(OsString, OsStrin
     let Some(given) = spec.given.as_deref().filter(|_| lends(spec)) else {
         return std::borrow::Cow::Borrowed(&spec.env);
     };
-    let ours = || READ_BY_THE_SANDBOX.iter().chain(READ_BY_THE_C_LIBRARY).copied();
+    // The run's provider is in the program's environment as it is, never lent: std reads it
+    // from `environ` itself before `main`, and it is no variable the program's key lacks
+    // (`blaze_usercode::provider`).
+    let ours = || {
+        READ_BY_THE_SANDBOX
+            .iter()
+            .chain(READ_BY_THE_C_LIBRARY)
+            .copied()
+            .chain([blaze_usercode::provider::VAR])
+    };
     // Once per run, as the sandbox is set up.
     let mut env = Vec::with_capacity(spec.env.len() + 1);
     for (name, value) in &spec.env {

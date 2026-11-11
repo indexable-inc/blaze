@@ -220,6 +220,11 @@ pub type Read = Vec<(PathBuf, Option<[u8; 32]>)>;
 /// or an error naming the script and the first effect its proof said it never has. Called
 /// before anything is taken out of the trace (the run's own key's `keyed`), so it sees every
 /// read.
+///
+/// What the sandbox answered from the run's provider (`getrandom`, an open of
+/// `/dev/urandom`: docs/v2/plan/design/determinism.md, section C) is not in `traced` at all
+/// ([`crate::trace::answered`]): it was made of the run's key, so it is no effect the proof
+/// has to deny. What the sandbox could not answer still is one, and is refused here.
 pub fn check(
     script: &str,
     proof: &Proof,
@@ -235,7 +240,7 @@ pub fn check(
     if let Some(it) = traced.untraceable.first() {
         // alloc: error path
         return Err(bug(format!(
-            "read what can't be traced ({it:?}), which its proof says it never does"
+            "got what the sandbox could neither trace nor answer from its provider ({it:?}), which its proof says it never does"
         )));
     }
     if let Some((dir, _)) = traced.dirs.iter().find(|(dir, _)| !runtime(dir, places)) {

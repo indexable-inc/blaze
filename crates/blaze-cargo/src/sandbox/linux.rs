@@ -79,6 +79,10 @@ use std::{
 
 use blaze_core::{Untraceable, exit::Exit, utf8::push_lossy};
 use blaze_hash::HashMap;
+use blaze_usercode::{
+    provider::{Answers, Provider, SOURCE_DATE_EPOCH, Wall},
+    trace::{ANSWERED_DEVICE, ANSWERED_RANDOM},
+};
 use std::alloc::Global;
 
 use super::{Also, Bind, MARK, Recorder, Scope, Spec, View, tidy, tidy_into};
@@ -268,6 +272,10 @@ const CALLS: &[Call] = &[
 #[cfg(target_arch = "x86_64")]
 const ARCH: u32 = 0xc000_003e; // AUDIT_ARCH_X86_64
 #[cfg(target_arch = "x86_64")]
+const NR_MMAP: u32 = 9;
+#[cfg(target_arch = "x86_64")]
+const NR_GETTIMEOFDAY: i32 = 96;
+#[cfg(target_arch = "x86_64")]
 const NR_IOCTL: u32 = 16;
 
 #[cfg(target_arch = "aarch64")]
@@ -309,6 +317,10 @@ const CALLS: &[Call] = &[
 #[cfg(target_arch = "aarch64")]
 const ARCH: u32 = 0xc000_00b7; // AUDIT_ARCH_AARCH64
 #[cfg(target_arch = "aarch64")]
+const NR_MMAP: u32 = 222;
+#[cfg(target_arch = "aarch64")]
+const NR_GETTIMEOFDAY: i32 = 169;
+#[cfg(target_arch = "aarch64")]
 const NR_IOCTL: u32 = 29;
 
 /// `io_uring_setup`, of the table every architecture shares from 403 on.
@@ -341,6 +353,17 @@ const SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP: libc::c_ulong = 1;
 const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = 0xc050_2100;
 const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = 0xc018_2101;
 const SECCOMP_IOCTL_NOTIF_SET_FLAGS: libc::c_ulong = 0x4008_2104;
+/// `_IOW('!', 2, __u64)`.
+const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::c_ulong = 0x4008_2102;
+/// `_IOW('!', 3, struct seccomp_notif_addfd)`.
+const SECCOMP_IOCTL_NOTIF_ADDFD: libc::c_ulong = 0x4018_2103;
+/// The descriptor added is the call's result, and the call is answered with it (Linux 5.14).
+const SECCOMP_ADDFD_FLAG_SEND: u32 = 1 << 1;
+/// `mmap`'s mapping type (`MAP_TYPE`) and the type of a mapping the kernel may drop under
+/// memory pressure (`MAP_DROPPABLE`, Linux 6.11): the one the vDSO's `getrandom` keeps its
+/// state in.
+const MAP_TYPE: u32 = 0x0f;
+const MAP_DROPPABLE: u32 = 0x08;
 
 /// Each call of [`CALLS`] by its number, one past its index (0 for none): the supervisor
 /// finds a notification's call in one load.
@@ -381,6 +404,16 @@ struct NotifResp {
     val: i64,
     error: i32,
     flags: u32,
+}
+
+/// `struct seccomp_notif_addfd`.
+#[repr(C)]
+struct NotifAddFd {
+    id: u64,
+    flags: u32,
+    srcfd: u32,
+    newfd: u32,
+    newfd_flags: u32,
 }
 
 #[repr(C)]
@@ -424,6 +457,16 @@ pub(super) fn run_as(
     unshared: Option<&str>,
     also: Also<'_>,
 ) -> Result<i32, String> {
+    // The run's provider, which its environment names: the supervisor answers from it what
+    // the program asks the kernel for.
+    let provider = Provider::among(spec.env.iter().map(|(name, value)| (&**name, &**value)))?;
+    if provider.is_some() && !(spec.record_reads && also.live.is_some()) {
+        // alloc: the error, once, and no sandbox is made.
+        return Err(format!(
+            "the program is given a provider (`{}`), and its run is not traced: the sandbox answers `getrandom` and an open of `/dev/urandom` only for a run whose reads it records",
+            blaze_usercode::provider::VAR
+        ));
+    }
     // The interposer is seen where it is, read-only, and is no input of what runs.
     let interposer = match also.live.is_some() && spec.record_reads {
         true => Some(interposer()?),
@@ -663,11 +706,22 @@ fn run_in(
         (None, true) => Around::Confined(first),
         (None, false) => Around::Namespaces,
     };
-    let mut watch = Watch { around, network: also.network, processes: HashMap::new_in(Global) };
+    let mut watch = Watch {
+        around,
+        network: also.network,
+        processes: HashMap::new_in(Global),
+        provided: provider.map(|provider| Provided {
+            answers: Answers::new(&provider),
+            wall: provider.wall,
+            numbers: HashMap::new_in(Global),
+            devices: Vec::with_capacity(0),
+        }),
+    };
     let supervised = listener.is_some();
     if let Some(listener) = listener {
         supervise(listener.as_raw_fd(), first, &mut recorder, &mut watch);
         drop(listener);
+        watch.devices_read_out(&mut recorder);
     }
     let mut status = 0;
     while raw::wait(first, &mut status, 0) < 0 {
@@ -1935,6 +1989,9 @@ fn exec(made: &Made<'_>) -> String {
     if made.viewed {
         close_machine_files();
     }
+    // The window's test plants what an allocator seeding a heap there would do.
+    #[cfg(test)]
+    let planted = made.env.iter().any(|it| it.as_bytes().starts_with(tests::PLANT_WINDOW));
     if let Some(program) = made.filter {
         let listener = match install(program) {
             Ok(it) => it,
@@ -1945,6 +2002,11 @@ fn exec(made: &Made<'_>) -> String {
         }
         // The supervisor has its own copy now, and the program is not to have it.
         drop(listener);
+        #[cfg(test)]
+        if planted {
+            let mut seed = [0u8; 32];
+            raw::random_now(&mut seed);
+        }
     }
     // SAFETY: `made.socket` is this process's copy of the child's end of the supervisor's
     // pair, owned by no `OwnedFd`; the program is not to have it, and nothing uses it after.
@@ -2008,7 +2070,7 @@ fn filter_program(
         (insn(RET_K, 0, 0, SECCOMP_RET_USER_NOTIF), insn(RET_K, 0, 0, SECCOMP_RET_ALLOW));
     let errno = |it: i32| insn(RET_K, 0, 0, SECCOMP_RET_ERRNO | it as u32);
     // The head, then at most 9 instructions for each call, then the last.
-    let mut program = Vec::with_capacity(16 + 9 * CALLS.len());
+    let mut program = Vec::with_capacity(24 + 9 * CALLS.len());
     program.extend([
         insn(LD_W_ABS, 0, 0, 4), // the architecture
         insn(JEQ_K, 1, 0, ARCH),
@@ -2026,6 +2088,22 @@ fn filter_program(
         insn(JEQ_K, 0, 1, NR_IO_URING_SETUP),
         errno(libc::ENOSYS),
     ]);
+    if recorded && reads {
+        // The vDSO's `getrandom` (Linux 6.11, glibc 2.41) makes no call the filter sees. It
+        // keeps its state in a mapping the C library makes with `MAP_DROPPABLE`, the only
+        // user of that type: refused as a kernel without it refuses it, the C library asks
+        // by system call from then on, which is noted or answered.
+        const ALU_AND_K: u16 = 0x54;
+        program.extend([
+            insn(JEQ_K, 0, 4, NR_MMAP),
+            insn(LD_W_ABS, 0, 0, low(3)),
+            insn(ALU_AND_K, 0, 0, MAP_TYPE),
+            insn(JEQ_K, 0, 1, MAP_DROPPABLE),
+            errno(libc::EINVAL),
+            // The call again, which the comparisons below read.
+            insn(LD_W_ABS, 0, 0, 0),
+        ]);
+    }
     // A null address is a connected socket's message.
     let sendto_with_address = [
         insn(LD_W_ABS, 0, 0, low(4)),
@@ -2163,6 +2241,35 @@ struct Watch {
     network: bool,
     /// The process of each thread seen, by the thread's id.
     processes: HashMap<u64, u64, Global>,
+    /// What the run's provider answers, when the run was given one.
+    provided: Option<Provided>,
+}
+
+/// The most bytes one `getrandom` is answered with. The call's contract lets a call for more
+/// than 256 bytes return fewer, and a caller asks again for the rest.
+const RANDOM_MOST: usize = 1 << 20;
+
+/// How many bytes the file an open of a random device is answered with holds: what seeds a
+/// generator many times over. A program that reads them all is noted as having read what
+/// can't be traced ([`Watch::devices_read_out`]).
+const DEVICE_BYTES: usize = 1 << 16;
+
+/// The most opens of a random device answered in one run: the supervisor keeps a descriptor
+/// of each to its end. An open past them is the machine's device, noted as what can't be
+/// traced.
+const DEVICES_MOST: usize = 256;
+
+/// What the supervisor answers from the run's provider (docs/v2/plan/design/determinism.md,
+/// section C).
+struct Provided {
+    answers: Answers,
+    wall: Wall,
+    /// The number of each process in the provider's streams, by its id as the supervisor
+    /// sees it.
+    numbers: HashMap<u64, u64, Global>,
+    /// The file each answered open of a random device was handed, through the same open
+    /// file: how far the program read it is read here as the run ends.
+    devices: Vec<OwnedFd>,
 }
 
 /// The supervisor's buffers, kept from one notification to the next: a path a call names is
@@ -2184,6 +2291,10 @@ struct Scratch {
     room: Vec<u8>,
     /// What a refused line names: an address as text.
     text: String,
+    /// The call being answered is a read-only open of a random device in a run with a
+    /// provider, with whether it asks for a descriptor closed on exec: set as the call is
+    /// noted, taken as it is answered.
+    device: Option<bool>,
     procs: Procs,
     resolving: Resolving,
 }
@@ -2219,6 +2330,35 @@ struct Resolving {
 }
 
 impl Watch {
+    /// The number of `process` in the provider's streams: its id in the sandbox's own PID
+    /// namespace, which the kernel gives out in order from 1, so a process has the same
+    /// number on every run that forks in the same order. A confined sandbox has no namespace
+    /// of its own: there a process's number is its place among those that asked.
+    fn number(&mut self, process: u64, procs: &mut Procs) -> u64 {
+        let confined = matches!(self.around, Around::Confined(_));
+        let Some(provided) = &mut self.provided else { return process };
+        if let Some(&number) = provided.numbers.get(&process) {
+            return number;
+        }
+        let asked = provided.numbers.len() as u64 + 1;
+        let number = match confined {
+            true => asked,
+            false => inner_id(process, &mut procs.file).unwrap_or(asked),
+        };
+        // alloc: one entry per process that asks, for the run
+        provided.numbers.insert(process, number);
+        number
+    }
+
+    /// As the run ends: a random device's file the program read to its end was not enough for
+    /// it, and what it did then is not known, so the run read what can't be traced.
+    fn devices_read_out(&mut self, recorder: &mut Recorder) {
+        let Some(provided) = &self.provided else { return };
+        if provided.devices.iter().any(|file| raw::offset(file.as_fd()) >= DEVICE_BYTES as i64) {
+            recorder.random();
+        }
+    }
+
     /// The process `thread` is of. A thread not seen before starts in no scope, but the first
     /// thread of a new process: in the scope the thread that forked it had when it did, which
     /// is the one it has now, its next mark being taken only once the processes it forked
@@ -2374,6 +2514,18 @@ fn ids(thread: u64, file: &mut Vec<u8>) -> Option<(u64, u64)> {
     Some((field("Tgid:")?, field("PPid:")?))
 }
 
+/// The id of `process` in the innermost PID namespace it is in, by `/proc` (`NSpid:`, whose
+/// last field it is), read into `file`.
+fn inner_id(process: u64, file: &mut Vec<u8>) -> Option<u64> {
+    let mut name = [0u8; 64];
+    if !read_file(proc_path(&mut name, format_args!("/proc/{process}/status"))?, file) {
+        return None;
+    }
+    let status = std::str::from_utf8(file).ok()?;
+    let ids = status.lines().find_map(|it| it.strip_prefix("NSpid:"))?;
+    ids.split_whitespace().next_back()?.parse().ok()
+}
+
 /// The thread of `parent` that forked `child`, by the children `/proc` lists for each.
 fn forker(parent: u64, child: u64, procs: &mut Procs) -> Option<u64> {
     let mut name = [0u8; 64];
@@ -2397,10 +2549,27 @@ fn answer(
     if raw::notif_recv(listener, &mut notif) < 0 {
         return;
     }
-    let refused = match call_of(notif.nr) {
+    let call = call_of(notif.nr);
+    if let Some(call) = call
+        && let Some(resp) = provided(listener, &notif, call, recorder, watch, scratch)
+    {
+        // A process that ended meanwhile makes it fail, which is nothing to answer.
+        raw::notif_send(listener, &resp);
+        return;
+    }
+    scratch.device = None;
+    let refused = match call {
         Some(call) => noted(&notif, call, recorder, watch, scratch),
         None => None,
     };
+    if let (None, Some(close_on_exec)) = (refused, scratch.device.take()) {
+        if handed_device(listener, &notif, close_on_exec, recorder, watch, scratch) {
+            // Handing the file over answered the call.
+            return;
+        }
+        // Not answered: the open goes on to the machine's device, which can't be traced.
+        recorder.random();
+    }
     let resp = match refused {
         Some(error) => NotifResp { id: notif.id, val: 0, error: -error, flags: 0 },
         None => {
@@ -2409,6 +2578,153 @@ fn answer(
     };
     // A process that ended meanwhile makes it fail, which is nothing to answer.
     raw::notif_send(listener, &resp);
+}
+
+/// Answers the call `notif` of `call` from the run's provider, when the run has one and the
+/// call is one it answers: the kernel does not run the call, and the program gets what this
+/// returns. `None` for every other call, which is noted and goes on.
+///
+/// - `getrandom`: the next bytes of the process's stream ([`Answers::random`]), written into
+///   its memory; the bytes written are the call's value. Noted as answered, no input: the
+///   seed is made of the run's key.
+/// - `clock_gettime` of the realtime clock and `gettimeofday`, when the provider has a wall
+///   clock: that time. Noted as a read of `SOURCE_DATE_EPOCH`, the variable the time is.
+///
+/// The memory is written only while the notification is still the thread's
+/// (`SECCOMP_IOCTL_NOTIF_ID_VALID`): a thread killed meanwhile may have left its id to
+/// another process, whose memory is not to be written.
+fn provided(
+    listener: libc::c_int,
+    notif: &Notif,
+    call: &Call,
+    recorder: &mut Recorder,
+    watch: &mut Watch,
+    scratch: &mut Scratch,
+) -> Option<NotifResp> {
+    let value = |val: i64| NotifResp { id: notif.id, val, error: 0, flags: 0 };
+    let failed = |error: i32| NotifResp { id: notif.id, val: 0, error: -error, flags: 0 };
+    let wall = match watch.provided.as_ref()?.wall {
+        Wall::Fixed(seconds) => Some(seconds),
+        Wall::System => None,
+    };
+    let (pid, thread) = (notif.pid as libc::pid_t, u64::from(notif.pid));
+    match call.does {
+        Does::Random => {
+            let (at, len, flags) = (notif.args[0], notif.args[1], notif.args[2] as u32);
+            // `GRND_NONBLOCK`, `GRND_RANDOM` and `GRND_INSECURE` are the flags there are, and
+            // the last two are not asked for together: the kernel's own refusals.
+            if flags & !7 != 0 || flags & 6 == 6 {
+                return Some(failed(libc::EINVAL));
+            }
+            let process = watch.process(recorder, thread, &mut scratch.procs);
+            let number = watch.number(process, &mut scratch.procs);
+            let len = usize::try_from(len).unwrap_or(RANDOM_MOST).min(RANDOM_MOST);
+            scratch.memory.clear();
+            scratch.memory.resize(len, 0);
+            watch.provided.as_mut()?.answers.random(number, &mut scratch.memory);
+            recorder.answered(thread, ANSWERED_RANDOM);
+            if len == 0 {
+                return Some(value(0));
+            }
+            if !raw::notif_id_valid(listener, notif.id) {
+                return Some(failed(libc::EINTR));
+            }
+            match raw::write_memory(pid, at, &scratch.memory) {
+                wrote if wrote > 0 => Some(value(wrote as i64)),
+                _ => Some(failed(libc::EFAULT)),
+            }
+        }
+        Does::Clock(id) => {
+            let seconds = wall?;
+            // `clock_gettime` of `CLOCK_REALTIME` or `CLOCK_REALTIME_COARSE` (a `struct
+            // timespec`), or `gettimeofday` (a `struct timeval`, then a time zone that is
+            // always none): sixteen bytes, the seconds and then nothing more of one. The
+            // other realtime clocks (`CLOCK_TAI`, which leads by the leap seconds, the alarm
+            // clock) and `time` are not answered.
+            let at = match id {
+                Some(id) if matches!(notif.args[id] as u32, 0 | 5) => notif.args[1],
+                None if notif.nr == NR_GETTIMEOFDAY => notif.args[0],
+                _ => return None,
+            };
+            recorder.read_var(thread, SOURCE_DATE_EPOCH);
+            if at == 0 {
+                return Some(match id {
+                    Some(_) => failed(libc::EFAULT),
+                    None => value(0),
+                });
+            }
+            let mut time = [0u8; 16];
+            time[..8].copy_from_slice(&seconds.to_ne_bytes());
+            if !raw::notif_id_valid(listener, notif.id) {
+                return Some(failed(libc::EINTR));
+            }
+            match raw::write_memory(pid, at, &time) {
+                16 => Some(value(0)),
+                _ => Some(failed(libc::EFAULT)),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Answers the open of a random device `notif` is, read-only, with a file of the run's
+/// provider ([`Answers::device`]): [`DEVICE_BYTES`] of a stream of the open's own, in a file
+/// in memory the program is handed read-only at its start. Whether it was answered; when it
+/// was not, nothing was handed over and the open is still to be answered.
+///
+/// The program's descriptor is of the same open file as the one kept here, so how far it
+/// read is known as the run ends ([`Watch::devices_read_out`]). What the program sees that
+/// the device is not: a regular file (`fstat`), which ends.
+fn handed_device(
+    listener: libc::c_int,
+    notif: &Notif,
+    close_on_exec: bool,
+    recorder: &mut Recorder,
+    watch: &mut Watch,
+    scratch: &mut Scratch,
+) -> bool {
+    let thread = u64::from(notif.pid);
+    let process = watch.process(recorder, thread, &mut scratch.procs);
+    let number = watch.number(process, &mut scratch.procs);
+    let Some(provided) = &mut watch.provided else { return false };
+    if provided.devices.len() >= DEVICES_MOST {
+        return false;
+    }
+    scratch.memory.clear();
+    scratch.memory.resize(DEVICE_BYTES, 0);
+    if provided.answers.device(number, &mut scratch.memory).is_none() {
+        return false;
+    }
+    let Some(file) = raw::memfd(c"blaze-random-device") else { return false };
+    let mut written = 0;
+    while written < scratch.memory.len() {
+        match raw::write(file.as_fd(), &scratch.memory[written..]) {
+            wrote if wrote > 0 => written += wrote as usize,
+            _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+            _ => return false,
+        }
+    }
+    // Another open file of it: read-only, and at its start.
+    let mut name = [0u8; 64];
+    let Some(path) = proc_path(&mut name, format_args!("/proc/self/fd/{}", file.as_raw_fd()))
+    else {
+        return false;
+    };
+    let Some(read_only) = raw::open(path, libc::O_RDONLY | libc::O_CLOEXEC) else { return false };
+    recorder.answered(thread, ANSWERED_DEVICE);
+    let add = NotifAddFd {
+        id: notif.id,
+        flags: SECCOMP_ADDFD_FLAG_SEND,
+        srcfd: read_only.as_raw_fd() as u32,
+        newfd: 0,
+        newfd_flags: if close_on_exec { libc::O_CLOEXEC as u32 } else { 0 },
+    };
+    if raw::notif_addfd(listener, &add) < 0 {
+        return false;
+    }
+    // alloc: one descriptor per answered open, at most `DEVICES_MOST` a run
+    provided.devices.push(read_only);
+    true
 }
 
 /// Notes in `recorder` what the call `notif` of `call` reaches, and the error the sandbox
@@ -2568,6 +2884,15 @@ fn noted(
             Does::Run => {
                 recorder.read(thread, path);
                 ran(recorder, pid, thread, process, path, &mut scratch.inside);
+            }
+            // Read-only, in a run with a provider: answered once the call is noted
+            // (`handed_device`), and noted as what can't be traced only if it can't be.
+            Does::Open(flags)
+                if (path == "/dev/random" || path == "/dev/urandom")
+                    && watch.provided.is_some()
+                    && notif.args[flags] as i32 & libc::O_ACCMODE == libc::O_RDONLY =>
+            {
+                scratch.device = Some(notif.args[flags] as i32 & libc::O_CLOEXEC != 0);
             }
             Does::Open(_) | Does::Change if path == "/dev/random" || path == "/dev/urandom" => {
                 recorder.random()
@@ -3198,6 +3523,174 @@ for it in "$OUT"/*; do :; done
         assert!(lines.iter().any(|it| it.seen == Seen::Listed && it.what == listed), "{text}");
         assert_eq!(lines[0], trace::Line::new(Seen::Env, "", trace::ALL_ENV));
         _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The variable that has the launcher's child ask the kernel for randomness between its
+    /// filter's install and its exec, as an allocator seeding a heap there would.
+    pub(super) const PLANT_WINDOW: &[u8] = b"__BLAZE_TEST_WINDOW_SEED=";
+
+    /// A traced run of `/bin/sh -c script` with `env` beside `OUT` and `PATH`: what it left
+    /// in `$OUT/said`, and its trace. `None` where no sandbox can be made (unless
+    /// `BLAZE_VIEW_TESTS=require`).
+    fn provided_run(
+        name: &str,
+        script: &str,
+        env: &[(std::ffi::OsString, std::ffi::OsString)],
+    ) -> Option<(String, Vec<blaze_usercode::trace::Line>)> {
+        use blaze_usercode::{confine, trace};
+        if let Err(why) = alone::probe(crate::sandbox::Probe::V2) {
+            let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
+            assert!(!required, "{why}");
+            eprintln!("skipped: {why}");
+            return None;
+        }
+        let dir = scratch(name);
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+            vec![("OUT".into(), out.clone().into()), ("PATH".into(), "/usr/bin:/bin".into())];
+        vars.extend(env.iter().cloned());
+        let spec = confine::Spec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            env: vars,
+            dir: out.clone(),
+            read: vec![dir.clone()],
+            write: vec![out.clone()],
+            network: false,
+            trace: true,
+            services: Vec::new(),
+            live: dir.join("live"),
+            report: dir.join("report"),
+            // The program's own run is a line of the trace: what the window's test looks for.
+            not_inputs: Vec::new(),
+            given: None,
+        };
+        assert_eq!(alone::launch(&spec), 0);
+        let said = std::fs::read_to_string(out.join("said")).unwrap();
+        let text = std::fs::read_to_string(&spec.live).unwrap();
+        let (lines, _) = trace::parse(&text).unwrap();
+        _ = std::fs::remove_dir_all(&dir);
+        Some((said, lines))
+    }
+
+    fn test_provider(code: u8) -> blaze_usercode::provider::Provider {
+        use blaze_ids::ContentId;
+        use blaze_usercode::{RunKey, RunKind, provider::Provider};
+        let key = RunKey { code: ContentId([code; 32]), given: ContentId([7; 32]) };
+        Provider::of(RunKind::BuildScript, &key, None).unwrap()
+    }
+
+    /// Two processes that each ask `getrandom` for a name (`mktemp -u`), and two opens of
+    /// `/dev/urandom`.
+    const ASKS_FOR_RANDOMNESS: &str = r#"{
+mktemp -u XXXXXXXXXXXX
+mktemp -u XXXXXXXXXXXX
+head -c 24 /dev/urandom | od -An -tx1
+head -c 24 /dev/urandom | od -An -tx1
+} > "$OUT/said""#;
+
+    /// The lines of `lines` that say the run got what can't be traced, the answered ones not
+    /// among them.
+    fn untraced(lines: &[blaze_usercode::trace::Line]) -> Vec<&str> {
+        use blaze_usercode::trace::{Seen, answered};
+        lines
+            .iter()
+            .filter(|it| it.seen == Seen::Untraceable && !answered(&it.what))
+            .map(|it| it.what.as_str())
+            .collect()
+    }
+
+    /// The invariant: in a run given a provider, what a process gets from `getrandom` and from
+    /// `/dev/urandom` is the provider's: the same bytes on every run of the same seed, other
+    /// bytes for each process and each open, other bytes under another seed, and nothing in
+    /// the trace that can't be traced.
+    #[test]
+    fn a_provided_run_is_answered_the_same_randomness_every_time() {
+        use blaze_usercode::trace::{ANSWERED_DEVICE, ANSWERED_RANDOM, Seen};
+        let run = |name: &str, code: u8| {
+            provided_run(name, ASKS_FOR_RANDOMNESS, &[test_provider(code).entry()])
+        };
+        let Some((first, lines)) = run("provided-1", 1) else { return };
+        let (again, _) = run("provided-2", 1).unwrap();
+        let (other, _) = run("provided-3", 2).unwrap();
+        assert_eq!(first, again, "one seed gives one run's randomness");
+        assert_ne!(first, other, "another seed gives another's");
+        let said: Vec<&str> = first.lines().collect();
+        assert_eq!(said.len(), 4, "{first}");
+        assert_ne!(said[0], said[1], "each process has a stream of its own");
+        assert_ne!(said[2], said[3], "each open of the device has a stream of its own");
+        assert_eq!(untraced(&lines), Vec::<&str>::new(), "{lines:?}");
+        for answered in [ANSWERED_RANDOM, ANSWERED_DEVICE] {
+            assert!(
+                lines.iter().any(|it| it.seen == Seen::Untraceable && it.what == answered),
+                "no `{answered}` line: {lines:?}"
+            );
+        }
+    }
+
+    /// The control: without a provider the same program's randomness is the machine's, and
+    /// the trace says it can't be traced.
+    #[test]
+    fn the_oracle_catches_randomness_read_without_a_provider() {
+        let Some((_, lines)) = provided_run("unprovided", ASKS_FOR_RANDOMNESS, &[]) else {
+            return;
+        };
+        assert!(untraced(&lines).contains(&"random"), "{lines:?}");
+    }
+
+    /// Whether the launcher's child got randomness, answered or not, before the program it
+    /// runs: a `T` line of randomness or the clock before the line of the program's exec.
+    /// Each kind of line is kept once, where it was first seen, so one the program's own
+    /// start-up makes later is after it.
+    fn window_made_a_call(lines: &[blaze_usercode::trace::Line]) -> bool {
+        use blaze_usercode::trace::Seen;
+        let exec = lines
+            .iter()
+            .position(|it| it.seen == Seen::Read && it.what == "/bin/sh")
+            .expect("the program's exec is a line of the trace");
+        lines[..exec].iter().any(|it| {
+            it.seen == Seen::Untraceable && (it.what.contains("random") || it.what == "clock")
+        })
+    }
+
+    /// The invariant: between its filter's install and its exec the launcher's child makes
+    /// no call the supervisor notes or answers (no allocation that seeds a heap, no clock):
+    /// the supervisor takes every call of that process for the program's, and an answered one
+    /// would move the program's stream.
+    #[test]
+    fn the_launchers_window_makes_no_call_the_supervisor_sees() {
+        let provider = test_provider(3).entry();
+        let script = r#": > "$OUT/said""#;
+        let Some((_, lines)) = provided_run("window", script, &[provider]) else { return };
+        assert!(!window_made_a_call(&lines), "{lines:?}");
+    }
+
+    #[test]
+    fn the_oracle_catches_an_allocation_that_seeds_in_the_window() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let provider = test_provider(3).entry();
+        let name = std::ffi::OsStr::from_bytes(&PLANT_WINDOW[..PLANT_WINDOW.len() - 1]);
+        let plant = (name.to_owned(), "1".into());
+        let script = r#": > "$OUT/said""#;
+        let Some((_, lines)) = provided_run("window-planted", script, &[provider, plant]) else {
+            return;
+        };
+        assert!(window_made_a_call(&lines), "{lines:?}");
+    }
+
+    /// The filter of a run whose reads are recorded refuses the mapping the vDSO's
+    /// `getrandom` keeps its state in, so randomness is asked by a call it sees; another
+    /// run's filter leaves `mmap` alone.
+    #[test]
+    fn a_traced_runs_filter_refuses_the_vdsos_random_state() {
+        let refuses = |program: &[libc::sock_filter]| {
+            program.windows(2).any(|it| {
+                it[0].k == super::MAP_TYPE && it[1].k == super::MAP_DROPPABLE
+            }) && program.iter().any(|it| it.k == super::NR_MMAP)
+        };
+        assert!(refuses(&super::filter_program(true, true, false, false, 3)));
+        assert!(!refuses(&super::filter_program(true, false, false, false, 3)));
     }
 
     #[test]

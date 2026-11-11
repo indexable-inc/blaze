@@ -773,6 +773,21 @@ impl Recorder {
         self.note(Seen::Untraceable, self.scope_id(thread), trace::untraceable_name(it));
     }
 
+    /// The sandbox answered `thread` from the run's provider: `what` is one of
+    /// [`trace::ANSWERED_RANDOM`] and [`trace::ANSWERED_DEVICE`]. No input of the run: what it
+    /// was given is made of its key.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn answered(&mut self, thread: u64, what: &str) {
+        self.note(Seen::Untraceable, self.scope_id(thread), what);
+    }
+
+    /// `thread` read the variable `name` in a way the sandbox saw itself: the wall clock a
+    /// provider gives is the build's `SOURCE_DATE_EPOCH`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn read_var(&mut self, thread: u64, name: &str) {
+        self.note(Seen::Env, self.scope_id(thread), name);
+    }
+
     /// Randomness was read. What a process read of it stays in it (`std` keeps the keys of its
     /// hash maps), whatever scope it is in later: it is every scope's.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

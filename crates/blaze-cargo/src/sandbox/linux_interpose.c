@@ -413,28 +413,45 @@ int putenv(char *string) {
 // ---------------------------------------------------------------------------------------
 // The clock.
 
+// Whether the run's provider gives a wall clock (`__BLAZE_PROVIDER=1:<64 hex digits>:<seconds>`,
+// not `...:os`; docs/v2/plan/design/determinism.md): then the realtime clock is asked of the
+// kernel by a system call, never through the vDSO, and the supervisor answers it with that
+// time and notes the read of `SOURCE_DATE_EPOCH` itself.
+static int wall_given;
+
 static int realtime(clockid_t clock) {
     return clock == CLOCK_REALTIME || clock == CLOCK_REALTIME_COARSE ||
            clock == CLOCK_REALTIME_ALARM || clock == CLOCK_TAI;
 }
 
 int clock_gettime(clockid_t clock, struct timespec *ts) {
+    if (wall_given && (clock == CLOCK_REALTIME || clock == CLOCK_REALTIME_COARSE))
+        return syscall(SYS_clock_gettime, clock, ts);
     if (realtime(clock)) read_clock();
     if (!REAL(clock_gettime)) return syscall(SYS_clock_gettime, clock, ts);
     return real_clock_gettime(clock, ts);
 }
 
 int gettimeofday(struct timeval *tv, void *tz) {
+    if (wall_given) return syscall(SYS_gettimeofday, tv, tz);
     read_clock();
     return REAL(gettimeofday)(tv, tz);
 }
 
 time_t time(time_t *t) {
+    if (wall_given) {
+        struct timespec ts;
+        if (syscall(SYS_clock_gettime, CLOCK_REALTIME, &ts)) return (time_t)-1;
+        if (t) *t = ts.tv_sec;
+        return ts.tv_sec;
+    }
     read_clock();
     return REAL(time)(t);
 }
 
 int timespec_get(struct timespec *ts, int base) {
+    if (base == TIME_UTC && wall_given)
+        return syscall(SYS_clock_gettime, CLOCK_REALTIME, ts) ? 0 : base;
     if (base == TIME_UTC) read_clock();
     return REAL(timespec_get)(ts, base);
 }
@@ -663,6 +680,9 @@ __attribute__((constructor(101))) static void start(void) {
         REAL(unsetenv)(CHILD_VISIBLE);
     }
     started = 1;
+    // After `1:`, the seed's 64 digits and a `:`.
+    const char *provider = lookup("__BLAZE_PROVIDER");
+    wall_given = provider && strlen(provider) > 67 && strcmp(provider + 67, "os") != 0;
     const char *preload = lookup(PRELOAD);
     if (preload && !strncmp(preload, self, self_len)) {
         if (preload[self_len] == ':') setenv(PRELOAD, preload + self_len + 1, 1);
