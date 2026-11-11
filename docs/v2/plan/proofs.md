@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-49 theorems: 36 in `lean`, 13 in `lean/analysis`.
+51 theorems: 38 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -346,6 +346,21 @@ theorem threadGotosN_source (prog : Program) :
   | 0, _, _, _ => rfl
   | k + 1, n, st, hne => by
     have ih : run (threadGotosN k prog) n st = run prog n st
+```
+
+**`Blaze.Mir.run_refines`** (`Blaze.Mir.Opt.SwitchSame`, `lean`): When every step of the target refines the step of the source, every run of the target refines the run of the source, with the same fuel.
+
+```lean
+theorem run_refines (src tgt : Program)
+    (h : ∀ (st : State), (step tgt st).Refines (step src st)) :
+    ∀ (fuel : Nat) (st : State), (run tgt fuel st).Refines (run src fuel st)
+```
+
+**`Blaze.Mir.Opt.switchToGoto_refines`** (`Blaze.Mir.Opt.SwitchSame`, `lean`): A switchInt whose arms all go to one block made a goto refines the program: the same run, unless the program's is undefined.
+
+```lean
+theorem switchToGoto_refines (prog : Program) (fuel : Nat) (st : State) :
+    (run (switchToGoto prog) fuel st).Refines (run prog fuel st)
 ```
 
 ## V10

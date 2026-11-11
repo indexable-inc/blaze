@@ -432,4 +432,33 @@ example :
 example : isInt ScalarTy.U32 4 ((Opt.renumber shuffled constantSimplified).call 8 0 [] []) = true := by
   decide
 
+/-! A `switchInt` whose arms all go to one block is a `goto` to it; one whose arms differ is
+left. -/
+
+def sameArms (other : BlockId) : Program :=
+  { adts := [],
+    fns :=
+      [{ name := "sameArms", args := 1, locals := [Ty.int ScalarTy.U32, Ty.bool],
+         blocks :=
+           [{ stmts := [],
+              terminator := Terminator.switchInt (Operand.copy (Place.mk 1 [])) [(0, 1)] other },
+            { stmts :=
+                [Statement.assign (Place.mk 0 [])
+                   (Rvalue.use (Operand.const (Const.int ScalarTy.U32 7)))],
+              terminator := Terminator.ret },
+            { stmts := [], terminator := Terminator.unreachable }] }] }
+
+example :
+    (Opt.switchToGoto (sameArms 1)).fns.map
+        (fun body => body.blocks.map (fun blk => blk.terminator)) =
+      [[Terminator.goto 1, Terminator.ret, Terminator.unreachable]] := by
+  decide
+
+example : Opt.switchToGoto (sameArms 2) = sameArms 2 := by decide
+
+example :
+    isInt ScalarTy.U32 7 ((Opt.switchToGoto (sameArms 1)).call 4 0 [] [Value.bool true]) =
+      true := by
+  decide
+
 end Blaze.Mir.Tests

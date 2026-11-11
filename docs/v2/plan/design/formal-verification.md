@@ -622,7 +622,15 @@ programs; it is the specification of the Rust pass of the same name.
     run of `n` (`Stutter.run_source`). For threading `K` is 2. Whole chains are the pass
     again: `threadGotosN k` threads chains of up to `k` empty blocks, with the bounds
     composed, `2 ^ k * n` one way and `n` the other (`threadGotosN_target`,
-    `threadGotosN_source`; not yet elaborated).
+    `threadGotosN_source`; checked at e15b208b49).
+  - **A `switchInt` whose arms all agree is a `goto`** (`Opt/SwitchSame.lean`,
+    `switchToGoto`; not yet elaborated). A refinement, not an equality: the `goto` drops the
+    evaluation of the discriminant, which here can be undefined, so `switchToGoto_refines`
+    says the rewritten run is the program's unless the program's is undefined. The
+    discriminant must be a `copy` of a place with no index (a `move` changes the state, an
+    index can panic); the Rust `simplify_branch` rewrites those too. The file has what
+    every such pass uses: `run_refines` (steps that refine give runs that refine) and
+    `Outcome.Calm` (a value or undefined, never a panic), proved of reads and plain places.
   - **Where these cover less than the Rust `SimplifyCfg`** (`optimize/cfg.rs`): it threads a
     call's return target too (the specification leaves call targets, so that no state is
     renamed); it merges a block into
