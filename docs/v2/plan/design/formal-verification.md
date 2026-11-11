@@ -447,9 +447,9 @@ library, every golden model and the proofs. After a deliberate change to the tra
 
 Rule `verified-compiler` needs one thing every proof and every pass is held to: what a MIR
 body means. It is `lean/Blaze/Mir`, a deep embedding of blaze's MIR with an executable
-semantics, for a first subset. It was written without Lean or blaze having run on it: until
-`lake build` of `lean/` and `blaze test -p hir-ty-lean` pass on a named commit, read this
-section as what the code is meant to do. Objectives V6, V7 and V8 decide it.
+semantics, for a first subset. `lake build` of `lean/` passes with Lean 4.20.0 up to commit 19916d9159 (2026-11-10); what was
+written after it is marked "not yet checked". The Rust tests of `crates/hir-ty-lean` have
+not run, so every embedded body is a prediction of the encoder's output. Objectives V6, V7 and V8 decide it.
 
 **Prior art, and the one lesson taken from each.**
 - [MiniRust](https://github.com/minirust/minirust): a specification of Rust's operational
@@ -490,13 +490,19 @@ holds what the entry function's reference arguments point to.
 - **Why.** It is what safe code that borrows locals and their parts needs, it is the model the
   functional translation reads a `&mut` in, and every definition reduces in Lean's kernel, so
   tests and translation validation are `rfl`.
+- **Frames are named by an id from a counter**, never by depth, so a reference into a frame
+  that returned is `dangling` for the rest of the run. A move out of a part of a local leaves
+  a hole (`Value.dead`) there, and a read of the hole is undefined; a value with a hole
+  inside is still read whole, and the hole is undefined when it is used.
 - **What it cannot express:** raw pointers, pointer-integer casts, transmutes, unions,
   anything that depends on layout (padding, niches, alignment), the heap (`Box`, `Vec`),
-  `static`s, interior mutability, and aliasing rules (Tree or Stacked Borrows): two `&mut` to
-  one place are not detected. A reference into a frame that returned is `dangling` only until
-  another call reuses the depth. A move out of a part of a local leaves the part readable.
-  Storage markers do nothing, so a use of a dead local is not detected. The encoder refuses
-  what the model has no form for; the rest is the borrow checker's to rule out.
+  `static`s and interior mutability. Storage markers do nothing, so a use of a dead local is
+  not detected.
+- **Aliasing is not modelled.** Two live `&mut` to one place are two pointers to it: a write
+  through one is read through the other, where Rust says undefined behaviour (Stacked or
+  Tree Borrows). No program the borrow checker accepts does this, and the encoder embeds
+  only accepted programs, so every theorem about a Rust program has "borrow-checked" as its
+  hypothesis; a pass that needs `noalias` to be correct cannot be proved here yet.
 - **How it grows.** Heap cells addressed by an allocation id, for `Box` and `Vec`. Then bytes
   with provenance, as MiniRust has, with a stated relation between the two models: a
   structured value is related to the bytes its type's layout encodes it as. That relation is
@@ -524,7 +530,9 @@ and no axiom.
   two agree. The rvalue is evaluated before the place it is assigned to.
 - **Proved** (`Run.lean`): `step_deterministic` (a state has one next outcome: `step` is a
   function), `run_mono` (a run that ends, ends the same with any more fuel) and `run_agree`
-  (two runs of one state that both end agree). No frame lemma yet.
+  (two runs of one state that both end agree). `State.lean`: the frame lemma
+  `State.read_write_other` (a write at a place leaves the read of every place in another
+  slot as it was); two places in one slot are not covered.
 
 **V6: the differential harness.** `harness/v2/mir_semantics.py differential` draws programs
 (arithmetic with overflow, a struct through a `&mut` parameter, an enum built and matched, a
@@ -555,6 +563,13 @@ steps is `Outcome.ofResult` of the model run with `len + 1` turns; with less fue
 encoder's output until the golden test runs; when it differs, the file is rewritten and the
 block theorems of `LedgerMir.lean` (one per block, each failing alone) are redone.
 
+Three more functions are tied the same way (not yet checked by Lean), each a file beside its
+model: `arith::add_one` (`BlazeModel/arith/add_one_agrees.lean`: the value, and the overflow
+panic), `early::clamp` (both branches) and `loops::count` (through `run_loop`, the one
+lemma for loops: an invariant and a variant give the loop's result). The other four goldens
+(`structs::bump`, `enums::side`, `slices::first`, `calls::quadruple`) have none, and the
+Rust emitter that prints these scripts is not written.
+
 How it scales: **the translator emits the proof with the model**, a script that follows the
 translation's structure and applies one lemma per construct (`Blaze/Mir/Lemmas.lean`, the
 first step, used by the `fnv1a_from` proof): an assignment is `execStmt_assign`; a copy or
@@ -571,11 +586,25 @@ agreement does not terminate by `rfl`. `native_decide` is not allowed either way
 programs; it is the specification of the Rust pass of the same name.
 - **Refinement.** `Outcome.Refines target source`: the source is undefined, or the two are
   equal. Behaviours of the target are behaviours of the source.
-- **`run_mapBlocks`.** A rewrite that leaves each block's meaning as it was from every state
-  preserves every run, with the same fuel. Proved for `removeStorageMarkers`
-  (`RemoveStorageMarkers`: true in this semantics because a marker does nothing in it) and
-  `simplifyConstCondition` (`SimplifyConstCondition`'s direct form: a `switchInt` or an
-  `assert` on a constant).
+- **`run_mapBlocks`** (`Opt/Local.lean`). A rewrite that leaves each block's meaning as it was
+  from every state preserves every run, with the same fuel. Proved with it:
+  `removeStorageMarkers` (true in this semantics because a marker does nothing in it),
+  `simplifyConstCondition` (the direct form: a `switchInt` or an `assert` on a constant),
+  `removeNops`, and `constFold` (a binary, checked, unary operation or a cast on constants is
+  its value; one that panics is left, so it still panics). blaze has no Rust pass that only
+  folds constants or only removes `nop`s, so those two have no pair to check.
+- **`Sim`** (`Opt/Sim.lean`). A lockstep simulation through a map on states, under an
+  invariant, gives equal runs (`Sim.run`). It is what a pass that renumbers blocks or locals,
+  or removes code nothing reaches, is proved with. It has no such client yet: each needs
+  the functions of `Step.lean` proved to commute with the map (about thirty lemmas), which
+  are not written. So no CFG simplification and no dead-store elimination is proved. A pass
+  that changes the number of steps (threading a `goto`) needs a stuttering form on top.
+- **A validator proved sound** (`Opt/Validate.lean`). `validate a b` accepts when the two
+  programs have one normal form under the proved rewrites; `validate_sound`: an accepted
+  pair runs alike for every fuel and state. It takes no witness and accepts only what the
+  normal form identifies. The witness form (a block mapping and per-block symbolic execution
+  to stores of expressions, sound through `Sim`) is not written; the inliner needs a
+  relation between one frame and two beyond that.
 - **The Rust passes are held to them by translation validation.** The test
   `the_passes_are_their_lean_specifications` and `mir_semantics.py validate` run each pass
   alone on runtime MIR, embed the body before and after, and Lean checks
@@ -583,12 +612,6 @@ programs; it is the specification of the Rust pass of the same name.
   kernel decides. `RemoveStorageMarkers` does exactly its specification. The Rust
   `SimplifyConstCondition` also takes a condition that reads a place the statement before
   assigned a constant; there `after ≠ spec before` and the build says so.
-- **What the general validator needs** (V8's large-pass half, for `DeadStoreElimination`,
-  `CopyProp`, `Inline`): a simulation relation weaker than equality (states equal on live
-  locals; a `moved` slot related to any slot, CompCert's `lessdef`), `step` proved monotone
-  in it, and a checker `validate : Body → Body → Bool` proved to imply the simulation, run
-  by `rfl` per function.
-
 **The trusted base** (what a `(proved: ..)` of rule 57 rests on, beyond what is proved):
 - Lean's kernel, and the axioms `propext`, `Classical.choice`, `Quot.sound`.
 - That `lean/Blaze/Mir` is what Rust means, on the subset. Reduced by V6's three-way run.
@@ -596,7 +619,8 @@ programs; it is the specification of the Rust pass of the same name.
   Reduced by V6 and by the golden tests.
 - The memory model's coverage: what it cannot express, above.
 - `Blaze.Scalar` and the intrinsics as the meaning of core's integer operations.
-- The functional translation, for every model without a V7 theorem (all but `fnv1a_from`).
+- The functional translation, for every model without a V7 theorem (all but `fnv1a_from`;
+  `add_one`, `clamp` and `count` leave the list when Lean has checked their proofs).
 - blaze's front end up to MIR: parsing, name resolution, type and borrow checking, MIR
   building. A proof is about the MIR blaze built.
 - Runtime lowering (`crates/hir-ty-mir/src/mir/transform`: `AddAsserts`, `ElaborateDrops`,

@@ -98,4 +98,24 @@ theorem execBlockFrom_terminator (g : Terminator → Terminator)
         (fun st1 => execBlockFrom adts sig st1 rest t) := funext ih
     rw [execBlockFrom_cons, execBlockFrom_cons, same]
 
+/-- A rewrite of each statement preserves a block when it preserves each statement. -/
+theorem execBlockFrom_mapStmts (g : Statement → Statement)
+    (hg : ∀ (adts : List AdtDecl) (st : State) (s : Statement),
+      execStmt adts st (g s) = execStmt adts st s)
+    (adts : List AdtDecl) (sig : FnId → Option FnSig) (t : Terminator) :
+    ∀ (stmts : List Statement) (st : State),
+      execBlockFrom adts sig st (stmts.map g) t = execBlockFrom adts sig st stmts t := by
+  intro stmts
+  induction stmts with
+  | nil =>
+    intro st
+    rfl
+  | cons s rest ih =>
+    intro st
+    have same : (fun st1 => execBlockFrom adts sig st1 (rest.map g) t) =
+        (fun st1 => execBlockFrom adts sig st1 rest t) := funext ih
+    show execBlockFrom adts sig st (g s :: rest.map g) t =
+      execBlockFrom adts sig st (s :: rest) t
+    rw [execBlockFrom_cons, execBlockFrom_cons, hg adts st s, same]
+
 end Blaze.Mir

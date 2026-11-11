@@ -32,6 +32,16 @@ theorem nth?_map {α β : Type} (f : α → β) :
   | _ :: _, 0 => rfl
   | _ :: l, n + 1 => nth?_map f l n
 
+/-- A replacement at `n` leaves every other index as it was. -/
+theorem nth?_setNth_ne {α : Type} :
+    ∀ (l : List α) (n m : Nat) (v : α), ¬ n = m → nth? (setNth l n v) m = nth? l m
+  | [], _, _, _, _ => rfl
+  | _ :: _, 0, 0, _, h => absurd rfl h
+  | _ :: _, 0, _ + 1, _, _ => rfl
+  | _ :: _, _ + 1, 0, _, _ => rfl
+  | _ :: l, n + 1, m + 1, v, h =>
+    nth?_setNth_ne l n m v (fun e => h (congrArg (fun k => k + 1) e))
+
 /-- An index in bounds reads the element there. -/
 theorem nth?_map_get {α β : Type} (f : α → β) :
     ∀ (l : List α) (n : Nat) (h : n < l.length), nth? (l.map f) n = some (f (l.get ⟨n, h⟩))
@@ -47,8 +57,9 @@ inductive PathElem where
   | index (i : Nat)
   deriving DecidableEq, Repr
 
-/-- A place: frame 0 is what the entry function's reference arguments point to, frame `d + 1`
-the `d`-th frame from the bottom of the stack. -/
+/-- A place: frame 0 is what the entry function's reference arguments point to; every call's
+frame has an id of its own, counted up from 1 and never used again, so a pointer into a frame
+that returned names no frame, for ever. -/
 structure Pointer where
   frame : Nat
   slot : Nat
@@ -67,6 +78,8 @@ inductive Value where
   /-- An array, or what a slice reference points to. -/
   | array (elems : List Value)
   | ref (p : Pointer)
+  /-- The hole a move out of a part of a local leaves: a read of it is undefined. -/
+  | dead
 
 /-- What a local holds. -/
 inductive Slot where
@@ -123,6 +136,12 @@ def Slot.store (slot : Slot) (path : List PathElem) (v : Value) : Outcome Slot :
       (Value.update old (e :: rest) v).bind (fun new => Outcome.ok (Slot.init new))
     | Slot.uninit => Outcome.undefined Undefined.uninit
     | Slot.moved => Outcome.undefined Undefined.moved
+
+/-- A value read is not the hole of a move. A value that has a hole inside is read whole,
+hole included; the hole is undefined when it is itself read or used. -/
+def Value.checkLive : Value → Outcome Value
+  | Value.dead => Outcome.undefined Undefined.moved
+  | v => Outcome.ok v
 
 /-- What a read of a slot gives. -/
 def Slot.load : Slot → Outcome Value
