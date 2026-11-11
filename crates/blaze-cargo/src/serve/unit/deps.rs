@@ -571,7 +571,8 @@ impl Flushes {
         let said = |what: &str, (failed, why): (usize, String)| {
             // alloc: a loss, once
             format!(
-                "{what} did not keep {failed} of the records this build offered (every other was kept, and the                  front end with them), the first: {why}"
+                "{what} did not keep {failed} of the records this build offered (every other was kept, and the \
+                 front end with them), the first: {why}"
             )
         };
         match (items, goals) {
