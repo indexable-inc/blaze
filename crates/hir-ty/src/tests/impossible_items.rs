@@ -1,5 +1,5 @@
 //! A provided item whose own where-clauses may hold through an impl is not impossible there, as
-//! rustc's `is_impossible_associated_item` answers rustdoc (queue 01225): its clauses are solved
+//! rustc's `is_impossible_associated_item` answers rustdoc: its clauses are solved
 //! in coherence mode with the impl's parameters as inference variables, and only a clause that
 //! fails for every value of them makes the item impossible.
 //!

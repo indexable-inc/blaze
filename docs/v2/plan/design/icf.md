@@ -93,8 +93,9 @@ piece. Nothing references a folded key any more, so that would only matter for n
   `equal_code_is_one_function_unless_its_address_is_significant` (driver) and
   `equal_instances_are_one_address_and_an_exported_one_keeps_its_own` (linker, end to end)
   check it.
-- **A patchable function of a live build**, and a tiered one: each keeps its slot, which an
-  edit or a tier-up replaces alone.
+- **A function of a live build reached through its slot**: an edited one, a rebound one (an
+  instance an edit fills again under its own key, [codegen.md](codegen.md#slots-and-a-splices-reach))
+  and a tiered one. Each keeps its slot, which an edit or a tier-up replaces alone.
 - **A covered, counting or PGO-instrumented function**: merged, two would share counters.
 - **Statics, never.** A static is `Target::Static`, by its item, and is never a candidate.
   `#[used]` applies only to statics, so it is covered. A static's writable data has an ID of

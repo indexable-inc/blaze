@@ -127,6 +127,35 @@ fn check_page_map(heap: *mut mi_heap_t) {
     }
 }
 
+/// `mi_option_purge_delay` of mimalloc 3's `mi_option_e` (include/mimalloc.h): the sixteenth
+/// option, after `mi_option_deprecated_eager_commit_delay` (14, which libmimalloc-sys names
+/// `mi_option_eager_commit_delay`) and before `mi_option_use_numa_nodes` (16). libmimalloc-sys
+/// 0.1.49 does not name it; `the_purge_delay_is_the_option_this_names` holds the number to
+/// mimalloc's default for it.
+const PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+
+/// mimalloc's default `purge_delay`, in milliseconds (src/options.c).
+#[cfg(test)]
+const PURGE_DELAY_DEFAULT: std::ffi::c_long = 1000;
+
+/// Has mimalloc give a page back to the system as it frees it to its arena, not `purge_delay`
+/// (1 s) later: a delayed purge runs only as some thread next takes or frees a page, at most
+/// once per tenth of the delay and over a quarter of the arenas, so what a burst of frees left
+/// stayed in the footprint until allocation went on, and an idle daemon kept it until asked
+/// ([`give_back_here`]). At 0 an empty page is decommitted where it is freed
+/// (`mi_arena_schedule_purge`: `MADV_DONTNEED` on Linux, `MADV_FREE_REUSABLE` on macOS, both
+/// out of the footprint at once; never `MADV_FREE`, since `purge_decommits` stays 1). mimalloc
+/// still keeps, per thread and size class, the pages it allocates from and
+/// `page_full_retain` (2) empty ones, so a loop that frees and allocates again does not pay a
+/// system call each turn. What this cannot give back is a page with a live block on it, or one
+/// whose blocks another thread freed until its owner collects ([`give_back_here`]). Called
+/// once, before the first query (docs/memory-footprint.md, cause 1).
+pub(crate) fn purge_at_once() {
+    // SAFETY: sets one option word, which mimalloc reads each time it frees a page to an
+    // arena; mimalloc documents options as settable from any thread at any time.
+    unsafe { libmimalloc_sys::mi_option_set(PURGE_DELAY, 0) };
+}
+
 /// mimalloc, a heap per tag ([`Holders`]).
 pub(crate) struct Heaps;
 
@@ -193,6 +222,10 @@ fn give_back_here(asked: u64) {
     });
     // SAFETY: collects the calling thread's theap of the main heap; no argument.
     unsafe { mi_collect(true) };
+    // Its pages are back in the arenas and purged (unless another thread's purge held
+    // mimalloc's purge guard, which the purge that waits on this redoes): a purge waiting for
+    // every worker hears this one ([`blaze_mem::tag::heap_give_back_settled`]).
+    blaze_mem::tag::heap_gave_back(asked);
 }
 
 /// This thread's theap of `tag`'s heap, found now and kept in `slot`; null if mimalloc makes
@@ -623,6 +656,105 @@ mod tests {
                 BLOCK * BLOCKS,
             );
         });
+    }
+
+    /// [`PURGE_DELAY`] is the option `purge_at_once` means: it reads mimalloc's default for
+    /// `purge_delay`, which neither neighbour in `mi_option_e` has (`eager_commit_delay` is 1
+    /// and `use_numa_nodes` 0). No test of this binary sets it, since those above measure what
+    /// a give-back purges under the default; `MIMALLOC_PURGE_DELAY` in the environment would.
+    #[test]
+    fn the_purge_delay_is_the_option_this_names() {
+        // SAFETY: reads option words; callable from any thread.
+        let (before, delay, after) = unsafe {
+            (
+                libmimalloc_sys::mi_option_get(PURGE_DELAY - 1),
+                libmimalloc_sys::mi_option_get(PURGE_DELAY),
+                libmimalloc_sys::mi_option_get(PURGE_DELAY + 1),
+            )
+        };
+        assert_eq!(
+            (before, delay, after),
+            (1, PURGE_DELAY_DEFAULT, 0),
+            "option 15 of libmimalloc-sys's mimalloc is not purge_delay at its default"
+        );
+    }
+
+    /// The purge before a refusal or at the ceiling (`blaze_cargo::raw::memory::purge`) reads
+    /// the footprint only once a counted worker gave back what it kept, and that takes it out
+    /// of the footprint: large and small blocks a worker made and touched, freed on another
+    /// thread (so into the worker's own pages, which only it may collect), leave the footprint
+    /// by most of their bytes between the purge's two readings. The worker looks for a
+    /// give-back every 20 ms, as an idle one woken late would: a purge that read the footprint
+    /// at once, as before 2026-11-09 (the daemon at its 47 GiB ceiling with up to 7.5 GiB freed
+    /// and resident), reads it with the blocks still in it, and this fails (test-the-cause:
+    /// set `SETTLE_WITHIN` to 0).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_purge_reads_the_footprint_after_a_worker_gave_back_what_another_thread_freed() {
+        use std::sync::atomic::AtomicBool;
+
+        use blaze_core::wait::{Clock as _, Deadline, Monotonic};
+
+        const LARGE: usize = 32 << 20;
+        const LARGES: usize = 4; // 128 MiB
+        const SMALL: usize = 4 << 10;
+        const SMALLS: usize = 32 << 10; // 128 MiB
+        let larges: Vec<AtomicPtr<u8>> =
+            (0..LARGES).map(|_| AtomicPtr::new(ptr::null_mut())).collect();
+        let smalls: Vec<AtomicPtr<u8>> =
+            (0..SMALLS).map(|_| AtomicPtr::new(ptr::null_mut())).collect();
+        // The tag's heap made first, so the allocator's give-back is set (`heap_gives_back_by`)
+        // before the worker counts: in the tests mimalloc's heaps are no global allocator.
+        // SAFETY: a valid layout; the block is freed at once, with it.
+        unsafe { Heaps.dealloc(Heaps.alloc_for(Tag::Parse, layout(SMALL), false), layout(SMALL)) };
+        let made = std::sync::Barrier::new(2);
+        let stop = AtomicBool::new(false);
+        let purged = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // A pool worker's count: the purge waits for this thread's give-back.
+                let _settles = blaze_mem::tag::count_heap_settles();
+                for (slots, size) in [(&larges, LARGE), (&smalls, SMALL)] {
+                    for slot in slots {
+                        // SAFETY: a valid layout; the block is freed once, with it, below.
+                        let block = unsafe { Heaps.alloc_for(Tag::Parse, layout(size), false) };
+                        assert!(!block.is_null());
+                        // Touched, so its pages are resident and in the footprint.
+                        // SAFETY: the block is `size` bytes, ours.
+                        unsafe { block.write_bytes(1, size) };
+                        slot.store(block, Ordering::Release);
+                    }
+                }
+                made.wait();
+                // An idle worker that looks late: it gives back once asked, at its next look.
+                let clock = Monotonic::new();
+                while !stop.load(Ordering::Acquire) {
+                    blaze_mem::tag::settle_heap();
+                    let next = Deadline::after(clock.now(), std::time::Duration::from_millis(20));
+                    blaze_core::wait::sleep_until("the test worker's next look", next, &clock)
+                        .expect("the test worker sleeps");
+                }
+            });
+            made.wait();
+            for (slots, size) in [(&larges, LARGE), (&smalls, SMALL)] {
+                for slot in slots {
+                    // SAFETY: a live block the worker made with this layout, freed once.
+                    unsafe { Heaps.dealloc(slot.load(Ordering::Acquire), layout(size)) };
+                }
+            }
+            let purged = blaze_cargo::raw::memory::purge();
+            stop.store(true, Ordering::Release);
+            purged
+        });
+        assert!(
+            matches!(purged.settle, blaze_mem::tag::Settle::Settled { .. }),
+            "the purge read the footprint before the worker gave back: {purged:?}"
+        );
+        let freed = (LARGE * LARGES + SMALL * SMALLS) as u64;
+        assert!(
+            purged.returned() >= freed / 2,
+            "the purge returned {} bytes of the {freed} the worker's freed blocks held: {purged:?}",
+            purged.returned(),
+        );
     }
 
     /// Two blocks handed to another thread to free.

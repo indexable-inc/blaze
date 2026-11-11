@@ -412,7 +412,7 @@ pub enum Asked {
     /// `blaze daemon install` or `blaze daemon uninstall`: the units that socket-activate it.
     Daemon(DaemonVerb),
     /// `blaze codegen-inputs`, `blaze trace` or `blaze tables`: what the daemon's last build of
-    /// the checkout did; or `blaze pack`: a program packed for the in-browser compiler. With the
+    /// the checkout did. With the
     /// words after the command, which [`super::inspect`] reads.
     Inspect(super::inspect::Inspected, Vec<OsString>),
     /// `blaze explore`, with the words after it ([`super::observe::explore`]).
@@ -440,6 +440,13 @@ pub enum Asked {
     /// `blaze fmt`, with the words after it: blaze's formatter, run in this process
     /// ([`blaze_fmt::command::main`]).
     Fmt(Vec<OsString>),
+    /// `blaze new <PATH>`, or with `init` `blaze init [PATH]`, with the words after it: a
+    /// package made in this process ([`super::new::main`]).
+    New { init: bool, words: Vec<OsString> },
+    /// `blaze tree`, with the words after it ([`super::tree::main`]).
+    Tree(Vec<OsString>),
+    /// `blaze metadata`, with the words after it ([`super::metadata::main`]).
+    Metadata(Vec<OsString>),
     Help(Option<Command>),
     Version,
     /// A command that is none of blaze's.
@@ -765,6 +772,10 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
             Some("cache") => return Ok(Asked::Cache(words.collect())),
             Some("fetch-url") => return Ok(Asked::FetchUrl(words.collect())),
             Some("fmt") => return Ok(Asked::Fmt(words.collect())),
+            Some("new") => return Ok(Asked::New { init: false, words: words.collect() }),
+            Some("init") => return Ok(Asked::New { init: true, words: words.collect() }),
+            Some("tree") => return Ok(Asked::Tree(words.collect())),
+            Some("metadata") => return Ok(Asked::Metadata(words.collect())),
             Some("daemon") => {
                 return Ok(match words.next().as_deref().and_then(std::ffi::OsStr::to_str) {
                     Some("install") => Asked::Daemon(DaemonVerb::Install),

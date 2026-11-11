@@ -12,6 +12,3 @@ __pycache__/
 # directories included.
 !/library/**
 /library/target/
-# Built: `crates/blaze-wasm/web/build.sh` and `build-site.sh`.
-/crates/blaze-wasm/web/pkg/
-/site/playground/blaze/

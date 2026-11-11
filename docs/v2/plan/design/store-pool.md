@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: The store's hot tier as a vmcache-style buffer pool - one reserved range with a fixed slot per page of every store file, a state word per page (optimistic and pinned reads), misses as explicit reads through blaze-core that the task yields on, immutable records written once through the pool, eviction by the one evictor with MADV_DONTNEED / MADV_FREE_REUSABLE, prefetch we plan ourselves (change set, query graph, learned page sets, per-view warm sets), codegen outputs then memos then the image on it, a DST, and the lanes.
+summary: The store's hot tier as a vmcache-style buffer pool - one reserved range with a fixed slot per page of every store file, a state word per page (optimistic and pinned reads), misses as explicit reads around the page cache through blaze-core that the task yields on, immutable records written once through the pool, eviction by the one evictor (a second-chance sweep that takes a page read once first) with MADV_DONTNEED / MADV_FREE_REUSABLE, prefetch we plan ourselves (each view's recorded trace replayed in order and paced by its hits, then the change set's cone in the query graph), codegen outputs then memos then the image on it, a DST, and the lanes.
 date: 2026-11-09
 ---
 # The store's buffer pool
@@ -18,8 +18,12 @@ gate, and one step.
 
 Prior art: Leis, Alhomssi, Ziegler, Loeck and Dietrich, "Virtual-Memory Assisted Buffer Management"
 (vmcache, SIGMOD 2023); Crotty, Leis and Pavlo, "Are You Sure You Want to Use MMAP in Your Database
-Management System?" (CIDR 2022); for prefetch and warm restarts, InnoDB's buffer pool dump and load
-and PostgreSQL's `pg_prewarm` autoprewarm.
+Management System?" (CIDR 2022); Leis, Haubenschild, Kemper and Neumann, "LeanStore" (ICDE 2018), for
+optimistic reads; Neumann and Freitag, "Umbra" (CIDR 2020), for pages of several sizes; Zhang, Yang,
+Yue, Vigfusson and Rashmi, "SIEVE is Simpler than LRU" (NSDI 2024), and Yang, Zhang, Qiu, Yue and
+Rashmi, "FIFO Queues are All You Need for Cache Eviction" (S3-FIFO, SOSP 2023), for eviction; for
+prefetch and warm restarts, InnoDB's buffer pool dump and load and PostgreSQL's `pg_prewarm`
+autoprewarm.
 
 ## What it replaces, and why
 
@@ -87,8 +91,11 @@ contiguous slice in memory with no copy and no stitching, because the window is 
 **run** is the range of pages a record covers: `at / PAGE ..= (at + len - 1) / PAGE`. A miss loads
 the run's unloaded pages in as few reads as there are gaps. A 40 MiB object (a file of its own) is
 one window and 640 pages, and loading it whole costs one read of up to 1 MiB per command. There is
-one page size. A second size (2 MiB pages for files of their own) is an open question, decided by
-the measurement in section 7.
+one page size. Umbra has size classes because a value longer than a page must be contiguous in
+memory; here the window already makes it so, which is vmcache's own answer. What a second size
+(2 MiB pages for files of their own) could still buy is fewer state words per pin of a large object
+and huge pages under it. That is an open question, and the open questions say what measurement
+decides it.
 
 Size of the reservation: 4 TiB by default, which is 4096 windows. The store's open checks it
 against the head (live packs plus externals plus the two index slots, with room to double). A store
@@ -107,7 +114,7 @@ The state words are a second sparse region, one `AtomicU64` per page of the rese
 |---|---|---|
 | 0..20 | `pins` | pinned readers of the page (up to about a million; a pin that would overflow is a bug, and panics naming the page) |
 | 20..23 | `state` | `Unloaded`, `Loading`, `Loaded`, `Evicting`, `Corrupt` |
-| 23 | `referenced` | set by a pin, cleared by the evictor's sweep (CLOCK's second chance) |
+| 23 | `referenced` | set by a pin of a page already loaded and by an optimistic read that finds it clear; a load leaves it clear; cleared by the evictor's sweep (the second chance, section 4) |
 | 24 | `prefetched` | loaded by a prefetch and not yet pinned by a demand read (section 5) |
 | 25..64 | `version` | 39 bits, raised by every eviction; an optimistic read checks it |
 
@@ -157,10 +164,24 @@ block checks. `Pool::read_optimistic(at, out: &mut [u8])` does the following:
    defined behavior while the kernel drops the page underneath. A plain `&[u8]` read would not be.
 3. Fence with Acquire, then load the word again.
 4. The copy is good only if the state is still `Loaded` and the version is the same.
+5. A good copy sets the page's `referenced` bit if it is clear, with one compare-and-swap whose
+   failure is ignored (`Pool::touch`). So a page read only optimistically, as every index page is,
+   is not taken by the sweep while it is in use.
 
 This is the seqlock that `MemoHot::inline` already uses (`crates/blaze-query/src/memo.rs`). An
-optimistic read writes no shared line, so a lookup that hits, which the store's rule says must
-write nothing, still writes nothing.
+optimistic read writes a shared line once per page per lap of the sweep, and nothing after: the
+store's own rule for what a read sets (`read.rs`: a bit, set only when it is not set already, so a
+second read writes nothing).
+
+**Short records are copied, not pinned.** vmcache and LeanStore read optimistically wherever they
+can, because a pin is two writes to a word every core shares, and on a hot page that line bounces
+between cores. A `PinSet` saves the second read of a run within a task, but a query that reads a
+few hundred small memos touches more runs than its 32. So `Reader::read` copies a record of at most
+`COPY_MOST = 1 KiB` out optimistically into the task's frame and hands out a reference into the
+frame; the frame's reset frees it. Only a miss, a record longer than that, or a value held past its
+task pins. The copy is aligned as the record is, so `Persist::read` reads it in place. The
+measurement that moves `COPY_MOST`: the failed compare-and-swaps per pin (`pool pin retries`, a
+counter the store port adds) against the bytes copied, on the self-check.
 
 ## 2. Reads
 
@@ -174,6 +195,7 @@ impl Reader {
     /// the calling task yielding until it is, never blocking the worker.
     pub fn pin(&self, key: &Key) -> Result<Option<Pinned>, ReadError>;
     /// As `pin`, into the task's `PinSet`: the bytes are the task's until it ends or resets.
+    /// A short record in memory is copied into the task's frame with no pin (section 1).
     pub fn read<'t>(&self, task: &'t PinSet, key: &Key) -> Result<Option<Entry<'t>>, ReadError>;
 }
 
@@ -240,13 +262,44 @@ effects to a blaze-core driver of its own, polls completions with a deadline (`D
 on Linux.
 
 - **Linux**: one io_uring (`crates/blaze-core/src/uring.rs`), `SINGLE_ISSUER | DEFER_TASKRUN`, the
-  pool's files opened once, `O_DIRECT`, in its fixed file table. A read is `IORING_OP_READ` into
-  the slot's address. With `O_DIRECT` the bytes are not also in the page cache, which would charge
-  them to the cgroup a second time.
+  pool's files opened once, `O_DIRECT`, in its fixed file table (`IOSQE_FIXED_FILE`: no descriptor
+  lookup or count per read). A read is `IORING_OP_READ` into the slot's address.
+  - **One submission.** The loader drains every ask before it submits, and a load's reads (one per
+    gap of its run, each up to 1 MiB) go out together, so every read asked since the last pass is
+    one `io_uring_enter`, which also reaps what completed.
+  - **No registered buffers.** `IORING_REGISTER_BUFFERS` pins the physical pages it is given for
+    the registration's life. The pool gives pages back with `MADV_DONTNEED`: the mapping would get
+    fresh pages on the next touch while a fixed read kept writing the old, pinned ones, which
+    nothing maps any more. Registering the range would also fault in and pin every page of it. So
+    the pool's reads take the address, and the kernel pins the pages of each read for that read
+    alone.
 - **macOS**: the kqueue driver's file threads (`kqueue.rs`, `threads.rs`). The pool's driver has
   its own threads, `2 × cores` of them, so an NVMe drive sees a queue deep enough. Each does a
-  `pread` into the slot on a descriptor opened with `F_NOCACHE`. `EVFILT_AIO` is an option the lane
-  measures against them.
+  `pread` into the slot on a descriptor opened once with `F_NOCACHE` and kept (lane 2 opens per
+  effect for now; the store port keeps them). Not POSIX AIO with `EVFILT_AIO`: XNU carries it out
+  on `kern.aiothreads` (4) kernel threads doing the same `pread`, and refuses more than
+  `kern.aioprocmax` (16) requests a process, which is no queue depth for a drive.
+
+**No second copy in the page cache.** Every read into the pool and every write from it goes around
+the system's cache (`Cache::Bypassed` on the effect: `O_DIRECT`, `F_NOCACHE`), at whole 4 KiB
+blocks, which the pool's pages and the packs' padding already are. A copy in the page cache would be
+the same bytes held twice: on Linux charged to the daemon's cgroup a second time, on macOS outside
+the footprint but taken from the same machine. A file system that cannot bypass its cache fails the
+read, naming the file (rule `no-fallback`). By kind of file:
+
+| file | read | written | why |
+|---|---|---|---|
+| a pack | around the cache, into its window | around the cache, from its window | the pool is its cache |
+| an index slot | around the cache, into its window | around the cache, from its window | as a pack |
+| a file of its own, as a record | around the cache, into its window | around the cache, from its window | as a pack |
+| a file of its own, as a `Kind::Machine` module | mapped by its loader | (the same file) | the loader's mapping is its one copy; the pool never loads it too |
+| `checks-<n>` | whole, once, through the cache (`ReadAll`) | appended through the cache | 1/1024 of its pack, kept on the heap for the pack's life; read once, so the cache's copy is cold and the kernel's to drop |
+| `head` | whole, once (`ReadAll`) | whole (`Write`) | a few KiB |
+| `placed/<content>` | never by the store | cloned from, by the file system | a build directory's file shares its blocks; it is not the hot tier |
+
+The one copy that does exist twice for a while is a record between its put and its commit's
+publish: in its writer's segment and, once drained, in its pack's window. The segment's chunk goes
+at the next task boundary after the publish (section 3).
 
 A thread for the loader, rather than a ring per worker as vmcache has, keeps the pool's IO one
 sans-IO core that `Sim` drives (section 7). It also keeps workers out of the kernel, since only
@@ -298,8 +351,8 @@ The store does the same per **block**:
   (`Effect::Private`). That is enough (decided below): a reload does not hash again.
 
 The sidecar changes the store's format. `FORMAT` goes from 3 to 4, and a store of format 3 refuses
-to open, naming both, as every change of format does (docs/v2-store.md, "Opening"). There is no
-migration. The store is rebuilt from what made it.
+to open, naming both, as every change of format does. There is no
+migration. The store is rebuilt from what made it. (Built: `crates/blaze-cas/src/checks.rs`.)
 
 ### Errors
 
@@ -327,7 +380,8 @@ Records are immutable and content-addressed. The write path stays the group comm
    task writes its output once, into the segment, never into a heap tree kept until something
    serializes it.
 2. **Drain.** `Store::flush` drains each segment's records straight into their pack's window in
-   the pool, at the offsets they will have on disk. This replaces `Pack::memory`. Before writing
+   the pool, at the offsets they will have on disk (`pool::Append`, one a pack a commit). This
+   replaces `Pack::memory`. Before writing
    into a pack's last page, the commit pins it. The page may hold records already committed and
    being read: the commit writes only bytes past the committed length, which no reader can reach,
    so readers and the commit never touch the same bytes. If that last page was evicted, the commit
@@ -383,14 +437,26 @@ is the first cache on it. It implements the evictor's interface (`name`, `charge
   latency per byte from its `pool load` spans. That is far less than recomputing a memo or a
   function, so the evictor takes pool pages before anything it would have to recompute. That is the
   point of the pool: the values in it can always be had again, cheaply.
-- **Within the pool.** It uses CLOCK. The sweep walks the windows' words from where it stopped. A
+- **Within the pool.** A second-chance sweep. It walks the windows' words from where it stopped. A
   page with `referenced` set gets it cleared and is passed over. A page that is `Loaded`, unpinned
   and unreferenced is a candidate.
+- **A page read once goes first.** A load leaves `referenced` clear: the bit is set by the first
+  pin, or the first optimistic read, that finds the page already loaded. So a page one task read
+  once (a scan, a verify, the open's recovery) is a candidate on the sweep's first pass after its
+  pin is let go, and a page read again since it was loaded gets its lap. This is what SIEVE and
+  S3-FIFO show matters most: new entries earn their stay, and a hit writes at most one bit. The
+  rest of those designs does not carry over. Both keep a queue and decide by an entry's place in
+  it; a pool whose page `n` is at a fixed address has no queue to keep, and its sweep is in address
+  order, as vmcache's is. S3-FIFO's ghost queue and two-bit counter would need a table beside the
+  words, which the `prefetch wasted bytes` and `pool reloaded bytes` counters (a page loaded again
+  within a build of its eviction) must first show a need for.
+- **What a commit wrote stays a lap.** Pages a commit filled are published with `referenced` set:
+  what was just made is the likeliest thing to be read next.
 - **Index pages and recent pack tails.** Index pages count four times their bytes, because one index
   miss stalls every lookup it covers. The last page of a pack written in the last two commits is
   passed over.
-- **Prefetched pages** that no demand read has pinned enter with `referenced` clear, so they are
-  the first to go (section 5).
+- **Prefetched pages** that no demand read has pinned enter with `referenced` clear, as every
+  loaded page does, and are counted as wasted when taken (section 5).
 - **Bounded.** The sweep visits at most twice the pool's pages per call and ends in a typed outcome:
   the bytes freed, and whether it stopped short because everything else is pinned
   (rule `bounded-progress`).
@@ -492,20 +558,45 @@ same state word. That gives everything the list lacks:
 
 - Dedupe: a page already `Loading` or `Loaded` is not asked again.
 - Completion: an event, which a task can wait on.
-- Priority: two queues in the loads core.
+- Priority: the loads core issues a prefetch only while no demand load is in flight.
 - A budget in bytes and in reads in flight.
-- Cancellation: an asked prefetch that is not yet submitted is dropped when the budget shrinks.
+- Cancellation: a prefetch that is queued and not yet issued is dropped when a new plan replaces the
+  queue, and is not issued while the budget has no room for it.
 - A `prefetched` bit per page, which the first demand pin clears and counts as a hit.
 
 ### What to prefetch, from small metadata
 
-The planner, `pool::prefetch::Plan` (`crates/blaze-cas/src/pool/prefetch.rs`, `#![blaze::sans_io]`),
-never reads a record to decide. It works from three sources of metadata that are already in memory,
-each producing page runs `(pack, first page, pages)` with a probability:
+The planner, `pool::prefetch` (`crates/blaze-cas/src/pool/prefetch.rs`, `#![blaze::sans_io]`),
+never reads a record to decide. It works from metadata that is already in memory, each source
+producing page runs `(file, first page, pages)`:
 
-1. **The query graph.** The dense engine has no reverse edges. Each node row has instead a 128-bit
-   input summary, a Bloom filter of the input fields it read, transitively (`Summary`,
-   `input_bits`, `NodeRow` in `crates/blaze-query/src/db/storage.rs`).
+1. **The view's trace.** What the last build of this view had to read, in the order it needed it.
+   - *Recorded on the miss path only.* A reader that claims a stretch for a load appends its run to
+     its view's `Recorder` (a capped list, `TRACE_RUNS = 65536` runs). A hit records nothing and
+     writes nothing.
+   - *Saved at the build's end* as `pool::Trace`: this build's misses in order, then the runs of
+     the trace before it that are still `Loaded` and not left `prefetched` (they were hit, or were
+     hot throughout), each page once. A run that was evicted and not read again has gone cold and
+     drops out. So does one that was prefetched and never read: a wrong guess is made once. Misses
+     go first so that a page the replay brought too late, or not at all, is brought first next
+     time.
+   - It names a page by its file (the pack's number in the head, the index slot, a file's content)
+     and its page in that file, never by its window, so it means the same after a restart.
+   - It is a small store record keyed by the view (`Key::of(TRACE_SCHEMA, producer, [view])`), made
+     durable by the next commit, so it survives a daemon crash.
+   - *Replayed at the view's next build* (a daemon restart, a first build of a view, or the next
+     edit), in order and paced (below), with pages already `Loading` or `Loaded` skipped, so on a
+     warm daemon it costs a walk of state words and reads nothing.
+   - This is InnoDB's buffer pool dump and load and `pg_prewarm`'s autoprewarm, with two changes.
+     Theirs is a set, loaded whole at a start; this one keeps the order of need, so the pages a
+     build wants first come first and a budget cuts it at a point in time, not at an address. And
+     theirs is what was resident; this one is what was waited for, so it also covers what the query
+     graph cannot see: the link reading every unit's code, a test program's objects, build-script
+     outputs. It also prefetches the daemon image once the image is on the pool (section 6).
+2. **The query graph**, for what an edit will reread that the last build did not. The dense
+   engine has no reverse edges. Each node row has instead a 128-bit input summary, a Bloom filter
+   of the input fields it read, transitively (`Summary`, `input_bits`, `NodeRow` in
+   `crates/blaze-query/src/db/storage.rs`).
    - A change set's fields set bits. The memos whose summaries share a bit with them are the ones
      the next walk verifies, and maybe reruns. False positives cost a page read and nothing else.
    - The scan is over one column of 32-byte rows. It is split across the pool's workers, and bounded
@@ -513,81 +604,87 @@ each producing page runs `(pack, first page, pages)` with a probability:
    - For each such memo, its value's place (once memos are on the pool, section 6: the value row
      holds its `Loc`) gives a run. Its value is read for early cutoff by `==` when it reruns, and
      by its dependents when they do.
-   - Probability: 1 for a memo whose summary matches a changed field exactly, lower for one matched
-     only through the transitive bits.
-2. **Learned from past builds.** For each input key that changed in a build, a record of the page
-   runs that the build read after the change.
-   - The record is a Space-Saving sketch of the top 256 runs, each with a count, plus the number of
-     builds the input changed in.
-   - Probability is count over builds, decayed by half every 64 changes, so a run the code no longer
-     reads fades out.
-   - It is built at each build's end from the `pool_reads` table (section 5, "Counted") by a
-     sans-IO maintainer pass. It is kept as a blaze-history section of the daemon image
-     (`crates/blaze-history`, beside admission's estimates).
-   - This is what covers what the graph cannot see: the link reading every unit's code after one
-     function changes, a test program's objects, build-script outputs.
-3. **The per-view warm set.** At a build's end, each view saves the pages its build pinned, as a
-   sparse bitmap of runs (`pool::WarmSet`, run-length encoded by pack).
-   - It is saved as a small store record keyed by the view (`Key::of(WARM_SCHEMA, producer, [view])`),
-     made durable by the next commit, so it survives a daemon crash.
-   - At the view's next start (a daemon restart, or the first build of a view after one) it is
-     replayed as a prefetch of probability 1/2.
-   - This is InnoDB's buffer pool dump and load, and `pg_prewarm`'s autoprewarm.
-   - It is what makes a restarted daemon's first check fast. It also prefetches the daemon image
-     once the image is on the pool (section 6).
+   - Its runs go ahead of the trace's: they are known to be about this change.
+3. **Learned per changed input**, only if the first two leave misses. For each input key that
+   changed in a build, a Space-Saving sketch of the top 256 runs the build read after the change,
+   each with a count, decayed by half every 64 changes, kept as a blaze-history section of the
+   daemon image. The trace already carries what a build of this view reads whatever changed, so
+   this is built only when `demand missed bytes` on the edit harness, with sources 1 and 2 on,
+   shows misses that follow from which input changed.
 
-Page runs name a pack by its number in the head, and packs are only appended to. So a run stays
-valid until its pack is retired, and the planner drops runs of retired packs. A settle that moves a
-record makes the old run dead weight. The waste counter shows how much, and the learned sketch
-forgets it.
+Runs name a pack by its number in the head, and packs are only appended to. So a run stays
+valid until its pack is retired, and the planner drops runs of files the pool no longer holds. A
+settle that moves a record makes the old run a wrong guess, which the trace's rule above drops after
+one build.
 
-### One batch for a change set, across views
+### Paced by its hits, across views
 
 When a check or build starts for a change set, which may cover several views (worktrees) at once,
-the daemon calls `Plan::for_change(changes, views)` before it schedules the first task. It takes
-the union of the three sources over every view, drops pages already `Loading` or `Loaded`, and
-ranks what is left by probability. Then it cuts the list at the budget (below), sorts by file and
-offset, and merges adjacent runs into reads of up to 1 MiB.
+the daemon calls `prefetch::plan(traces, ..)` before it schedules the first task. It walks the
+sources in order, drops pages already `Loading` or `Loaded` and pages another view's run named
+first, merges runs that follow each other, and hands the list to the loads core as its queue
+(`Loads::prefetch`), replacing what was queued. Planning is bounded: it has fuel in runs and pages
+and ends saying how much of its sources it covered (rule `bounded-progress`). Its span
+`prefetch plan` carries the pages and bytes asked from each source.
 
 Pages are content-addressed records in one store. Two worktrees with the same dependencies read the
-same std, the same crates' memos and the same compiled functions, so the same pages, and the union
+same std, the same crates' memos and the same compiled functions, so the same pages, and the queue
 holds each page once.
 
-The batch goes to the loads core as one ask. That is one `io_uring_enter` submitting every read on
-Linux, and one hand-off of every read to the file threads with one trigger on macOS. Planning is
-bounded: it has fuel for 2 ms and ends naming how much of the cone it covered (rule
-`bounded-progress`). Its span `prefetch plan` carries the pages and bytes asked from each source.
+The loads core does not read the queue at once. It issues from the front (`Loads::pump`, called by
+the loader after every demand ask is taken), a read of up to 1 MiB at a time, and only while all of
+these hold:
+
+- no demand load is in flight (below);
+- fewer than `PREFETCH_IN_FLIGHT = 16` prefetch loads are;
+- the pages prefetched and not yet read (in flight, or `Loaded` with `prefetched` set) stay within
+  the budget (below).
+
+So the replay runs a budget's worth ahead of the build. A hit clears a page's `prefetched` bit and
+makes room for the next run; a build that reads what the trace says pulls the replay along at its
+own pace, and the pool never holds more unread guesses than the budget. A build that has turned
+elsewhere stops pulling: its guesses stay unread, the window stays full, and nothing more is
+issued. The sweep takes unread guesses first, which would open the window again, so the core also
+drops the queue once the pages wasted since the plan pass the pages hit by `WASTE_SLACK` (4 MiB): a
+replay that is wrong more than it is right ends.
 
 ### Never crowding out demand
 
-- **Two queues.** The loads core keeps demand and prefetch apart. It submits prefetch reads only
-  when no demand read is waiting to be submitted, and a demand read always goes before a queued
-  prefetch.
-  - On Linux a prefetch read is tagged with `IOPRIO_CLASS_IDLE` in its `ioprio`, which the block
-    layer honors under `mq-deadline` and BFQ.
-  - On macOS the prefetch threads run with the throttled IO policy (`setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_THROTTLE)`).
-- **In flight.** At most `PREFETCH_IN_FLIGHT = 64` prefetch reads at once, against the table's
-  4096. A demand read never waits for a table slot that a prefetch holds: the slots are split, and
-  prefetch has its 64 and no more.
-- **A budget in bytes.** At most the smaller of an eighth of the ceiling and the room that eviction
-  of unreferenced pages could give. A prefetch never evicts a page with `referenced` set, or a page
-  pinned in this build, to make its room.
+- **Prefetch reads only an idle pool.** The loads core issues a prefetch read only while no demand
+  load is in flight, and never in a submission ahead of a demand read. The priority is the pool's
+  own. The kernel's is not enough: `IOPRIO_CLASS_IDLE` is honored under `mq-deadline` and BFQ, and
+  an NVMe drive's default scheduler is `none`, which ignores it. A prefetch read still carries
+  `Priority::Idle` (Linux's idle class; on macOS the throttled IO policy,
+  `setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_THROTTLE)`, on the thread that reads
+  it), for the disks where it means something.
+- **In flight.** At most `PREFETCH_IN_FLIGHT = 16` prefetch loads at once, 16 MiB, so a demand read
+  that arrives behind them waits a few milliseconds at worst on a drive that reads 3 GB/s. They
+  have load slots of their own, the last 16 of the table's 4096: a demand read never waits for a
+  slot a prefetch holds.
+- **A budget in bytes.** At most the smaller of an eighth of the ceiling and the room the plane
+  last published (`Loads::set_budget`). With no room there is no prefetch. A prefetch never
+  evicts to make its room: it is not issued.
 - **Caught up.** A demand read for a page a prefetch is `Loading` waits on that load. It is counted
   as a late hit, and the read is not issued twice.
-- **Dropped first.** Prefetched pages that no demand read has pinned are the first the evictor takes.
+- **Dropped first.** Prefetched pages that no demand read has pinned enter with `referenced` clear,
+  so they are among the first the evictor takes, and each one taken is counted as wasted.
 
 ### Counted
 
 Each build writes a `pool_reads` row per load (the profile's tables, docs/profiling.md):
 
 - build, view, pack, first page and pages;
-- the class: demand, or prefetch from graph, learned or warm;
+- the class: demand, or prefetch from the trace, the graph or the learned sketch;
 - latency, and the task that waited, if any;
 - the outcome: a hit (the first demand pin while `prefetched` was set), late, wasted (evicted or
   never pinned before the build ended), or a demand miss no source predicted.
 
-Counters per build: `prefetch asked bytes`, `prefetch hit bytes`, `prefetch wasted bytes` and
-`demand missed bytes`.
+Counters per build: `prefetch asked bytes`, `prefetch hit bytes`, `prefetch late bytes`,
+`prefetch wasted bytes` and `demand missed bytes`. The pool keeps the first four itself, per page,
+each written once in a prefetched page's life (`Pool::prefetch_counts`): loaded, then exactly one of
+hit (its first pin found it loaded), late (its first pin waited on its load) or wasted (taken by
+the sweep or a retirement unread), so `loaded = hit + late + wasted + still unread` at every
+moment, which the DST checks.
 
 `blaze explain prefetch [build]` ranks the sources by hit rate and wasted bytes. Thresholds,
 weights and budgets are then set from those numbers, and every change to them quotes before and
@@ -627,8 +724,8 @@ after (rule `slow-is-p0-traced`).
    - The image file gets a window like any store file. A group (64 KiB by default) is a page, so
      the group CRC that `Image::group` checks on a first read becomes the page's load check, and
      `Image::group` and `Image::range` pin.
-   - A cold start then reads the spine with one explicit read, and the view's warm set prefetches the
-     rest as one batch. That should beat a mapping's fault per page, and the lane measures it against
+   - A cold start then reads the spine with one explicit read, and the view's trace prefetches the
+     rest in the order the last start read it. That should beat a mapping's fault per page, and the lane measures it against
      the mapping.
    - Until it moves, the image may stay mapped. It is read once per daemon life and its values are
      immutable. This is the one mapping, besides `Kind::Machine`'s, that the hot tier keeps for a while.
@@ -668,8 +765,8 @@ Its oracle, checked at every step and after every crash, against a `BTreeMap` mo
 4. `Tag::Pool` equals the `Loaded` and `Loading` pages times `PAGE` at every step. Pinned bytes
    equal the sum of the guards alive.
 5. Every ask ends, loaded or failed, within a bound of steps. Every waiter wakes.
-6. The prefetch budget in bytes and in flight is never passed. A demand read is never queued
-   behind a prefetch. `asked = hit + late + wasted + resident` for prefetched pages.
+6. No prefetch read is issued past the budget in bytes or in flight, nor while a demand load is in
+   flight. `loaded = hit + late + wasted + still unread` for prefetched pages.
 
 Planted bugs, each a test-only switch (`pool::Plant`) that the oracle must catch within its case
 budget:
@@ -680,11 +777,11 @@ budget:
 4. `Loading -> Loaded` published before the read completes.
 5. The block checks are skipped on load, so a torn or rotted block is served.
 6. A failed read leaves the page `Loaded`.
-7. The head is written before the packs' and checks' syncs complete (as the store's crash tests plant
-   today).
+7. The head is written before the packs' and checks' syncs complete (planted in the store's
+   crash tests, `Store::plant_head_before_syncs`, `crates/blaze-cas/src/tests/block_checks.rs`).
 8. The commit writes into a pack's last page without pinning it, so the sweep evicts it in the
    middle of the write.
-9. A prefetch is submitted ahead of a waiting demand read.
+9. A prefetch is issued while a demand load is in flight.
 
 The footprint DST of the admission lane (`crates/blaze-graph/src/footprint/tests.rs`) gains a pool:
 a simulated evictable tier with drawn pinned shares. Its oracle gains "`Wait`, `GiveWay` and `Fail`
@@ -724,7 +821,13 @@ check runs as a step of the self-build in CI.
 ## 8. The lanes
 
 Each lane is one pull request or a few, landed through `.github/scripts/land.py`, with its DST where
-it touches concurrent or durable code. Lanes 1 and 2 can run side by side. The rest are in order.
+it touches concurrent or durable code. Lanes 1 and 2 can run side by side. The rest are in order,
+except the lanes that are the pool's alone (4a and 6a), which need only lane 3.
+
+Where they stand (2026-11-10): lanes 1 and 2 are on main. Lanes 3, 4a and 6a are built on branch
+pool-finish-1109 and not yet on main. Of lane 4b, the checks sidecar and format 4 are built on
+branch fast-storepool-1110; the store's reads and its commit are not on the pool yet, and that
+is next. Lane 5 waits on 4b and on admission by footprint reaching main.
 
 1. **blaze-mem: giving back a sparse range.**
    - `Region::evict(&self, ranges)` for a sparse region, over `os::evict`: Linux
@@ -764,50 +867,159 @@ it touches concurrent or durable code. Lanes 1 and 2 can run side by side. The r
    - `pool/loads.rs`, `pool/evict.rs` and the driver `pool/drive.rs`.
    - The DST of section 7 with planted bugs 1 to 6, over files the test writes. The store does not
      use it yet.
-4. **The store on the pool.**
-   - Packs, index slots and files of their own read through the pool, with `checks-<n>` and
-     `FORMAT` 4. The open's recovery scan as reads. The commit draining into the pool and writing
-     with `WriteFrom`. `Pinned` as pins.
-   - The DST grows planted bugs 7 and 8. The store's existing crash and model-check tests
-     (`crates/blaze-cas/src/tests.rs`, `tests/model_check.rs`) run on the pool.
-   - Deletes: `Pack::mapping`, `Pack::memory`, `PackView::mapping`, `Index::mapping`,
-     `ExternalView::mapping` and `External::mapping` (except for `Kind::Machine`),
-     `PinnedBytes::Mapped`, the remap after every commit, and the store's every `Effect::Map` but
-     `Kind::Machine`'s.
-   - docs/v2-store.md is brought up to what it then does.
-5. **Eviction with admission.**
+   - Built (branches pool-core-1109 and pool-finish-1109), with section 4's policy: a load leaves
+     `referenced` clear, and `Pool::touch` marks a page for an optimistic copy that validated.
+   - Not built, and blaze-core's to add: a way for another thread to wake a native driver's poll
+     (kqueue's `EVFILT_USER`, an eventfd read on the ring). Until then the loader polls with a
+     deadline 50 \u00B5s away while a read is in flight (`drive::TICK`), so an ask that arrives
+     during a read waits up to that long to be submitted.
+4. **The store on the pool**, in two parts.
+   - **4a. The pool's write side.** Built on pool-finish-1109. `pool::Append`
+     (`crates/blaze-cas/src/pool/append.rs`): the pin of a file's last committed page, the pages
+     past it taken with the commit's pin (`Pool::fresh`), the commit's bytes written into the
+     window with atomic stores, their checks, the spans to write from, and `Append::commit`, which
+     makes them the file's loaded pages (`Windows::grow`, `Loads::grow`, `Loader::grow`). An
+     append given up gives its fresh pages back. The DST has the commit as an actor (append,
+     `WriteFrom`, sync, then the flip, with crashes through it) and planted bug 8.
+   - **4b. The store's port.** Built in part on fast-storepool-1110; the reads are not.
+     - Built: `checks-<n>` and `FORMAT` 4 (`crates/blaze-cas/src/checks.rs`). A commit cuts each
+       written pack's checks to those committed, writes the new blocks' checks and syncs them,
+       after the pack's own sync and before the head; the open reads each pack's checks whole, refuses a file that holds fewer
+       than the head names, and checks every block its recovery scan reads; a removed pack's
+       checks go with it. Each pack's checks stay in memory (`Pack::checks`) for the loads core
+       (`Opened::checks`). Its crash test, the oracle's rule for the checks and planted bug 7
+       (the head written before the packs' and checks' syncs complete) with its directed case
+       are `crates/blaze-cas/src/tests/block_checks.rs`. The store still maps what it reads.
+     - Not built: packs, index slots and files of their own read through the pool. The open's
+       recovery scan as reads. The commit draining into `Append`s and
+       writing with `WriteFrom`. `Pinned` as pins, `Reader::read` with a `PinSet` and the
+       optimistic copy of short records (section 1), and `Tail::Hot` set for a pack written in the
+       last two commits.
+     - Decided (2026-11-10), for the reads' move:
+       - *Misses.* The store stays sans-IO. A read that needs pages not in memory asks for them
+         (the loads core emits `ReadInto`), and whoever drives the store's effects completes
+         them. On a task in the daemon, `read` and `pin` wait for the load through the one
+         deadline wait, in a span naming the pages, while the loader thread drives the pool's
+         effects (`pool/drive.rs`). A caller that drives the store's effects itself (every test
+         on `Sim`, a tool) passes a `Pump` (`fn pump(&mut self, loads: &Loads) -> Result<(),
+         LoadError>`), which loads a miss by pumping effects to completion there,
+         deterministically. The store has no hidden thread under `Sim`; the tests' reads go
+         through one helper that owns the `Sim` pump.
+       - *Pins.* As section 2: `Reader::read(&self, task: &PinSet, key)` for a task's reads and
+         `Reader::pin(&self, key)` for a holder that outlives a task. No guard of the store's
+         own behind `Entry`. A caller with no task in hand uses `pin` for now.
+       - *`Config`* gains one field saying how misses are driven: `Loader::Thread` (the
+         target's native driver, the default) or `Loader::Pumped`. The existing constructors
+         default it.
+       - *blaze-storemodel* gets `ReadInto` and `WriteFrom` rules with the semantics of `Read`
+         and `WriteAt` over a registered span, and a crash rule for a span being written as the
+         crash comes.
+       - Built of these: the `Config` field (`blaze_cas::Loader`, on `Config` and
+         `SharedConfig`; the daemon's stores say `Thread`, every other site `Pumped`), the
+         store model's rules, and the chained checks. Not built: `Pump`, `Reader::read` and
+         `Reader::pin` on the pool.
+       - Found on the way and decided: blaze-core's span registry grows by chunks (it held 64
+         regions a process, and a test binary holds a pool a store); and `Config::load_tags`
+         is a second range of 2^32 tags, the loads core's own (the daemon's `LOADS` and
+         `STD_LOADS`), refused as the store is made when it overlaps `Config::tags`.
+       - The read port's six steps, in order, each a commit that leaves the tree whole: (1) the
+         pool, the windows and the loads core inside the store, each pack opened with its
+         checks (`crates/blaze-cas/src/hot.rs`: built); (2) `Pump`, for the simulation and a
+         native inline driver (`crates/blaze-cas/src/pump.rs`, `Inline` over any driver, and
+         `Hot::pin_pack`, a pinned read whose miss the pump loads: built); (3) `Reader::read` and `Reader::pin` beside the old readers;
+         (4) the index probes, the recovery scan and the commit (`Append`, `WriteFrom`) on the
+         pool; (5) the callers, crate by crate, and the tests' reads through one helper;
+         (6) the old readers and every mapping but `Kind::Machine`'s deleted.
+       - Decided (2026-11-10) as the port went on, each with its reason:
+         - *The commit goes onto the pool before any reader pins* (step 4's commit before
+           step 3): a commit that wrote beside the pool would have to give back the page a
+           pack's committed bytes end in, which a reader may hold pinned. Built: a commit's
+           bytes of a pack go into the pack's window through `pool::Append`
+           (`Hot::begin_append`), are written from there with `WriteFrom` around the page
+           cache, and are the pack's loaded pages once the head names them (`Hot::committed`),
+           its last page hot for two commits. When the page the committed bytes end in is not
+           in memory the store asks its load as an effect of its own, tagged from
+           `Config::load_tags`, and takes the completion as a step of the commit, so the
+           commit stays a sans-IO state machine with no pump and no thread. Still to move in
+           step 4: the index probes and the recovery scan, and `Pack::memory`, which the
+           store's own reads of bytes not yet mapped still use.
+         - *The pool is built under the model checker too* (`cfg(blaze_check)`), with no stub:
+           the commit writes from the pool's pages, so a stub would keep the old write path
+           alive beside it for the model build alone. What that leaves unchecked: the pool's
+           state words and pins are `std` atomics over reserved memory, which a model run
+           does not schedule; their proof is the pool's DST.
+         - *A pump hands back what is not its own load's*, a commit's page load among them
+           (`Loads::slot_of`): the caller gives those completions to the store, as it does
+           its driver's others.
+         - *`Loader::Thread` carries the driver's root*, a pumped caller's pump rides in its
+           `PinSet`, a tier opened afresh keeps its windows until the last pin of them goes,
+           `FileId::Index` and `FileId::External` gain their tier, and the loads core is the
+           one owner of a pack's checks: decided, for step 3; not built.
+       - *The checks' effects are chained* behind their pack's own sync (cut, write, sync, one
+         at a time), so the store model's search over a commit's orders still ends. That costs
+         commit latency: a second sync in series a pack. Running them beside the pack's again
+         needs the model's bound measured again first.
+     - A reader's miss blocks on the loader, so the store's reads stop being a pure function of a
+       published view: every caller of `Reader::get`, `get_in_place`, `get_from` and `pinned`
+       across the workspace moves in the same batch (rule `whole-ports`), and the store's `Sim`
+       tests drive the loads core's effects beside the store's own.
+     - Planted bug 7 is built, in the store's crash tests (above). The store's existing crash
+       and model-check tests (`crates/blaze-cas/src/tests.rs`, `tests/model_check.rs`) run on
+       the pool once the reads do.
+     - A trace is kept as a store record keyed by its view, with its round-trip test (lane 6a
+       builds it in memory).
+     - Deletes: `Pack::mapping`, `Pack::memory`, `PackView::mapping`, `Index::mapping`,
+       `ExternalView::mapping` and `External::mapping` (except for `Kind::Machine`),
+       `PinnedBytes::Mapped`, the remap after every commit, and the store's every `Effect::Map` but
+       `Kind::Machine`'s.
+     - The macOS file threads keep each pool file's descriptor open (lane 2 opens per effect).
+     - docs/v2-store.md is brought up to what it then does.
+5. **Eviction with admission.** The pool's side is built on fast-storepool-1110: `evict::census`
+   (the pool's charge, its pinned bytes, what an eviction could give back now, and the unread
+   guesses, from one walk of the state words) beside `Sweep::evict`, and `Sweep::evicted`. The
+   rest is not built: it waits on lane 4b (nothing reads through the pool to measure) and on
+   `crates/blaze-graph/src/footprint.rs` and memory-pool.md's one evictor, which
+   are on branches admit-footprint-1106 and kept-memory-1109 and not on main.
    - The pool as the first cache on the one evictor. `PlaneInput::Footprint::evictable` and
      `footprint::Step::Evict`. The ceiling guard evicts before it exits. Pinned bytes go into the
-     task's account.
-   - Telemetry: the `pool loaded bytes`, `pool pinned bytes` and `pool evicted bytes` counters;
-     the `pool load` and `pool evict` spans; the `pool_reads` table; and the pool row of
+     task's account. The plane's room published for the prefetch budget (`Loader::set_budget`).
+   - Telemetry: the `pool loaded bytes`, `pool pinned bytes`, `pool evicted bytes` and
+     `pool reloaded bytes` counters, taken as a census of the state words by the sweep once a
+     sample, never counted on a pin; the `pool load` and `pool evict` spans; the `pool_reads`
+     table; the prefetch counters from `Pool::prefetch_counts`; and the pool row of
      `blaze explain memory`.
    - The footprint DST gains the pool.
    - The first measurement, of the store's own reads.
-6. **Prefetch, part one: priority, budget, counting, warm sets.**
-   - The loads core's two queues, the budget, the `prefetched` bit and its counting.
-   - `pool::WarmSet` saved at each build's end and replayed at a view's start.
-   - `Plan::for_change` with the warm source alone, deduplicated across views and merged into one
-     batch. `blaze explain prefetch`.
-   - The DST grows planted bug 9.
+6. **Prefetch, part one: priority, budget, counting, the trace.**
+   - **6a. In the pool.** Built on pool-finish-1109. The loads core's queue and pump
+     (`Loads::prefetch`, `Loads::pump`): slots of its own, no prefetch while a demand load is in
+     flight, the budget of pages prefetched and not yet read, the queue dropped for waste. The
+     `prefetched` mark and its counts (`Pool::prefetch_counts`). `pool::prefetch`: `Recorder`,
+     `Trace::after`, `plan`. The loader takes plans and the budget, and a first read of a
+     prefetched page wakes it. The DST has prefetch acts, the oracle's sixth rule and planted
+     bug 9.
+   - **6b. In the store and the daemon.** Not built; it waits on lane 4b. A reader records its
+     misses under its task's view. The trace saved at each build's end as a store record and
+     planned at a view's start, across the views of a change set. The budget from the ceiling
+     until lane 5 publishes the plane's room. `blaze explain prefetch`.
 7. **Codegen outputs on the pool.**
    - `CompiledFunction` as a record, written once.
    - `driver::Built` of keys. The linker pins. Objects are put as they are made.
    - Deletes: the `Vec<CompiledFunction>` kept in `Built`, and `write_object`'s whole-unit buffers kept
      until the link.
    - Measured.
-8. **Prefetch, part two: the graph and the learned sketch.**
-   - The summary scan as a source.
-   - The per-input Space-Saving sketch, built from `pool_reads` at each build's end and kept in a
-     blaze-history section.
-   - Thresholds set from lane 6's numbers.
+8. **Prefetch, part two: the graph.**
+   - The summary scan as a source, its runs ahead of the trace's.
+   - The budget, `PREFETCH_IN_FLIGHT` and `WASTE_SLACK` set from lane 6's numbers.
+   - The per-input sketch (section 5's third source) only if the edit harness then still shows
+     misses that follow from which input changed.
 9. **Query memos on the pool.**
    - `ValueRow` naming a store record. Values written once by their query's task. `PinSet` hits.
    - Deletes: the cold files (`Pending::ColdWrite`, `Pending::ColdMap`), the memo store's value
      segments for committed values, `Database::evict` as a separate path, and `Squeeze::caps`' value sweep.
    - Measured on the self-check.
 10. **The daemon image on the pool.**
-    - The image's window, groups as pages, and its cold start through the pool and the warm set.
+    - The image's window, groups as pages, and its cold start through the pool and the view's trace.
     - The restore budget measured against the mapping.
     - Deletes: the image's `Effect::Map` and its mapping in `crates/blaze-cargo/src/serve/image.rs`.
 11. **The check in CI.** Section 7's measurement as a step of the self-build.
@@ -840,6 +1052,17 @@ Andrew's answers, 2026-11-09:
 ## Open questions
 
 1. **One page size.** Is 64 KiB right, or should files of their own (large objects) get 2 MiB pages?
-   Lane 5's measurement decides.
+   Lane 5's measurement decides, from three numbers of the self-check: the bytes loaded over the
+   bytes of the records pinned, per kind of file, from `pool_reads` (above about 2 for packs, 64 KiB
+   reads too much around small records, and a smaller page is the question instead); the time of a
+   pin of a file of its own (640 words for 40 MiB) as a share of the link's `pool pin` time; and the
+   link's data-TLB misses over those files, from the sampler. A second size is worth its second
+   kind of window only if one of the last two is over a few percent.
 2. **The loader thread, or rings per worker.** Start with the loader thread, and move submission onto
    the workers only if the hand-off shows in the spans?
+3. **One checks file a pack, or one a tier.** `checks-<n>` beside each pack is simple: appended to,
+   its length the pack's, removed with it. It also doubles the files a commit syncs, and on macOS
+   every sync is an `F_FULLFSYNC`. One append-only checks log a tier would be one more sync a commit
+   instead, at the price of a length in the head and a compaction as packs retire. The store port
+   measures syncs and their time per commit (`store commit` spans) with the sidecars, and changes
+   only if they show.

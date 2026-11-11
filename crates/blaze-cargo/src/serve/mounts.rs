@@ -50,6 +50,8 @@ struct Local {
     mount: Mount,
     watched: Option<String>,
     generation: u64,
+    /// Nothing was at its path when it was read ([`LocalRead::source`] has no file).
+    absent: bool,
 }
 
 impl Mounts {
@@ -132,24 +134,35 @@ impl Mounts {
         if self.by_at.contains_key(&at) {
             return Err(format!("`{at}` is read where it is on the disk, but a fetched source is mounted there"));
         }
+        let absent = watched.is_none() && files.is_empty();
         let files = files.into_iter().map(|file| (file.path, file.bytes, file.mode));
         let root = vfs
             .apply_files(vfs.empty(), files)
             .map_err(|error| format!("the files read at {at} don't make a tree: {}", op_error(&error)))?;
         let mount = Mount { at: at.clone(), origin: Origin::Root(root), under }; // clone: once per path read
-        self.locals.insert(at, Local { mount: mount.clone(), watched, generation }); // clone: as above
+        self.locals.insert(at, Local { mount: mount.clone(), watched, generation, absent }); // clone: as above
         Ok(mount)
     }
 
     /// Where each local mount is that must be read again before a job reads it, sorted: one
-    /// file or an absent path always (no watch vouches for it), a directory unless
-    /// `unchanged(watched, generation)` says nothing under it changed since it was read.
-    pub fn stale_locals(&self, unchanged: impl Fn(&str, u64) -> bool) -> Vec<String> {
+    /// file always (no watch vouches for it), a directory unless `unchanged(watched,
+    /// generation)` says nothing under it changed since it was read, and a path read as
+    /// absent unless `absent(at)` says nothing is there now (a look at the disk at each ask,
+    /// which is the whole of what an absent path is).
+    pub fn stale_locals(
+        &self,
+        unchanged: impl Fn(&str, u64) -> bool,
+        absent: impl Fn(&str) -> bool,
+    ) -> Vec<String> {
         // alloc: once per job, the locals to read again
         let mut stale: Vec<String> = self
             .locals
             .iter()
-            .filter(|(_, it)| !it.watched.as_deref().is_some_and(|dir| unchanged(dir, it.generation)))
+            .filter(|(at, it)| match (it.watched.as_deref(), it.absent) {
+                (Some(dir), _) => !unchanged(dir, it.generation),
+                (None, true) => !absent(at.as_str()),
+                (None, false) => true,
+            })
             .map(|(at, _)| at.clone()) // clone: once per local read again
             .collect();
         stale.sort_unstable();

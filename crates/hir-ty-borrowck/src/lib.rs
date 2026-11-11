@@ -903,7 +903,7 @@ pub(crate) struct Ctx<'a, 'db> {
     /// The user variable each local is, if it is one.
     pub(crate) bindings: FMap<'a, LocalId, BindingId>,
     /// In the body of a closure, its captures, by field of the closure.
-    pub(crate) upvars: FVec<'a, Upvar>,
+    pub(crate) upvars: FVec<'a, Upvar<'a>>,
     /// In the body of a closure, how it is called.
     pub(crate) closure_kind: Option<rustc_type_ir::ClosureKind>,
     pub(crate) closure_local: Option<LocalId>,
@@ -925,7 +925,7 @@ pub(crate) struct Ctx<'a, 'db> {
 }
 
 /// A capture of a closure, in its body.
-pub(crate) struct Upvar {
+pub(crate) struct Upvar<'a> {
     pub(crate) binding: BindingId,
     /// The local lowering copies the capture into.
     pub(crate) local: LocalId,
@@ -933,7 +933,9 @@ pub(crate) struct Upvar {
     pub(crate) mutable: bool,
     /// The captured place is behind a reference.
     pub(crate) behind_deref: bool,
-    pub(crate) place: CapturedPlace,
+    /// Inference's capture, read in place: a copy owns a block of its sources on the global
+    /// heap, one per capture of every closure body checked.
+    pub(crate) place: &'a CapturedPlace,
 }
 
 impl<'a, 'db> Ctx<'a, 'db> {
@@ -983,8 +985,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
                                 hir_ty::next_solver::TyKind::Adt(def, _) if def.is_box()
                             )
                         }),
-                        // clone: hir-ty's `CapturedPlace`, once per capture per closure body
-                        place: capture.clone(),
+                        place: capture,
                     });
                 }
             }

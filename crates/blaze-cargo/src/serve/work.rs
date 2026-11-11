@@ -10,7 +10,7 @@
 //!   the network or the disk; they touch no state of the loop.
 //! - **On a worker of the plane**: [`Steps::lower`], [`Front::compile`], [`Front::reach`],
 //!   [`Front::ub_tests`], [`Front::evaluate`], [`Front::codegen_inputs`], [`Front::tables`],
-//!   [`Front::pack`].
+//!   [`Front::doc`].
 //!   They read the front end through the [`Steps::Reader`] the loop made as it posted the task, the
 //!   VFS's reader and the store through [`JobInput`], and give back what the loop writes
 //!   ([`Compiled::puts`]); a [`Failed::Again`] goes back to the loop, which posts it again
@@ -29,8 +29,8 @@
 //! is posted with a [`Steps::Reader`], a shared reference it holds for its run and drops as it ends,
 //! with no lock, no clone of the database and no cancellation. The tables are measured with
 //! the database exclusive, so no reader adds to them: their task, the front end's last use, is
-//! handed the job's [`Writer`] itself. So is a pack's, whose recording of expansions sets the
-//! database's proc macros, once its check's own plane request is over.
+//! handed the job's [`Writer`] itself. So is the documentation's, which sets `cfg(doc)` on the
+//! crates it documents, once its check's own plane request is over.
 //!
 //! A build script's output ([`Writer::ran`]) and a proc macro's load ([`Writer::macros`]) are
 //! writes, and so is letting go of what a unit that compiled leaves in the front end for no task
@@ -390,6 +390,14 @@ impl Linking {
             Linking::Full(Full::Layout) => {
                 blaze_api::LinkHow::Full { why: vec!["layout".to_owned()] }
             }
+            // alloc: one name, for a link that was not spliced
+            Linking::Full(Full::NoThunk) => {
+                blaze_api::LinkHow::Full { why: vec!["no thunk in reach".to_owned()] }
+            }
+            // alloc: one name, for a link that was not spliced
+            Linking::Full(Full::NoRoom) => {
+                blaze_api::LinkHow::Full { why: vec!["no room".to_owned()] }
+            }
         }
     }
 }
@@ -409,6 +417,12 @@ impl std::fmt::Display for Linking {
             Linking::Full(Full::Layout) => {
                 f.write_str("not spliced: the profile its code is laid out by changed")
             }
+            Linking::Full(Full::NoThunk) => f.write_str(
+                "not spliced: full link: the splice could not place a thunk in a branch's reach",
+            ),
+            Linking::Full(Full::NoRoom) => f.write_str(
+                "not spliced: full link: the kept image has no room for the change",
+            ),
         }
     }
 }
@@ -425,6 +439,15 @@ pub enum Full {
     /// The profile its code is laid out by changed (docs/v2/plan/design/code-layout.md): an
     /// image keeps its first link's order, so it is laid out again.
     Layout,
+    /// The kept image refused the change as a splice: a branch in code it holds in place
+    /// reaches neither its target nor the patch region, where a splice's thunks go
+    /// ([`blaze_link::Refusal::NoThunk`]). The image was linked from scratch, and the build
+    /// says which branch.
+    NoThunk,
+    /// The kept image refused the change for want of room: a region, the jump table or the
+    /// patch region is full, or its thread-locals would move ([`blaze_link::LinkError::no_room`]).
+    /// The image was linked from scratch, with room again, and the build says what was full.
+    NoRoom,
 }
 
 /// Fields of [`blaze_link::Output`] as a set, a bit each in [`OutputFields::NAMES`]'s order.
@@ -620,6 +643,25 @@ pub trait Steps: Sized + Send + Sync + 'static {
     /// after it loses none of it (persisted-state-round-trips). Called once per kept front
     /// end, while no task reads it; one already stored hands back no puts.
     fn store_kept(&self, kept: &mut Self::KeptFront) -> Result<Vec<KeptPut>, ApiError>;
+    /// On a worker, by the task that stores a kept front end and before it stores: what the
+    /// front end's query engine logged of why its queries ran since the last take, each memo
+    /// and input named with the database in hand ([`Writer::run_log`], taken here so naming a
+    /// build's runs is never on the loop before the build's answer); none for a front end
+    /// with no database, and while the run log is off.
+    fn kept_run_log(&self, kept: &Self::KeptFront) -> blaze_query::db::Taken {
+        let _ = kept;
+        blaze_query::db::Taken::default()
+    }
+    /// On a worker, by the task that stores a kept front end, after [`Steps::store_kept`] and
+    /// after the build's answer: what the build's end lets go of its front end (every MIR it
+    /// made, and the values no build read since the one before). The front end is the task's
+    /// alone, as it was the job's writer's. A release only lowers memory, so it is never a
+    /// precondition of the checkout's next build: once `wanted` is set (a request of the
+    /// checkout waits for the front end) it is skipped, unless blaze is past its limit's line,
+    /// and that build goes on with what was not let go.
+    fn release_kept(&self, kept: &mut Self::KeptFront, wanted: &AtomicBool) {
+        let _ = (kept, wanted);
+    }
     /// On the loop: `blaze run`'s start of the built program at `program` as process `pid`
     /// ([`blaze_api::Request::Launch`]): the variables it runs on the daemon's code memory
     /// with, or `None` for a program that is no dev executable and runs its file.
@@ -796,7 +838,8 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// On the loop, once every task of the job's build has ended: the front end with every
     /// write applied, for the head's next build to lower into. An error while a reader of it
     /// is alive or a write fails to apply: the build ends with it, never a silent full lower
-    /// next time.
+    /// next time. It lets nothing go: what the build's end releases is released by the task
+    /// that stores the kept front end, after the answer ([`Steps::release_kept`]).
     fn keep(self) -> Result<S::KeptFront, ApiError>;
 }
 
@@ -893,6 +936,13 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
     /// The error that unit `unit` can't be made, saying `what`: a diagnostic of the unit,
     /// named and rendered as its others are, for a compile that panicked.
     fn refused(&self, unit: usize, what: String) -> Diagnostic;
+    /// On a worker, as a phase task of unit `unit` starts: the unit's crate (its target's
+    /// name) and the unit as its phase spans name it (`serde v1.0.219 (lib)`), for its `task`
+    /// span. `None` for a front that names no units.
+    fn subject(&self, unit: usize) -> Option<(String, String)> {
+        let _ = unit;
+        None
+    }
     /// On the loop: the run of build script unit `unit` (mode `RunCustomBuild`). Its run
     /// reports [`Response::BuildScript`] (and cargo's warnings as diagnostics), and before it
     /// ends applies its directives as cargo does to the units they reach (`rustc-cfg`,
@@ -959,11 +1009,7 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
         images: &[(&'static str, u64, u64)],
     ) -> Result<Vec<Table>, Failed>;
     /// On a worker, once every unit of a [`Goal::Check`] build is checked and every build
-    /// script's run and proc macro's load applied: package `program`'s crate and every crate it
-    /// is made of packed for blaze's in-browser compiler, its macros' expansions recorded
-    /// through the job's `writer`, the front end's last use ([`Response::Packed`]'s bytes).
-    fn pack(&self, writer: S::Writer, program: &str) -> Result<Vec<u8>, Failed>;
-    /// On a worker, as [`Front::pack`] is but for `blaze doc`: the documentation of the crates
+    /// script's run and proc macro's load applied, for `blaze doc`: the documentation of the crates
     /// `cargo doc` documents for the check's root units (`blaze-doc`), and unless `no_deps` of
     /// every library they depend on, made through the job's `writer`, the front end's last use,
     /// which sets `cfg(doc)` on them. `private` is `--document-private-items`.

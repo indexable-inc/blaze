@@ -38,6 +38,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+hegeltest.workspace = true
 object = { workspace = true, features = ["write"] }
 zerocopy.workspace = true
 

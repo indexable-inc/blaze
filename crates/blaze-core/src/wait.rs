@@ -21,19 +21,35 @@
 //! a [`Parker`]'s futex wait, a child's exit ([`exited`], and the wait of a reap), a poll of one
 //! descriptor ([`pollable`]) and a sleep ([`sleep_until`]). The park's protocol and the reap's
 //! are sans-IO cores (`wait/parking.rs`, `wait/reaping.rs`), proven by the DST in `wait/tests.rs`.
+//!
+//! A process inside blaze's sandbox, whose seccomp filter refuses io_uring, makes the same
+//! waits with direct system calls instead (`wait/direct.rs`: `futex`, `ppoll`, `pidfd_open`,
+//! `waitid`, `clock_nanosleep`), over the same cores. Which of the two a process uses is chosen
+//! once, in its `main`, from the mark the sandbox launcher leaves in its environment
+//! ([`choose_from_env`], `wait/choice.rs`); the ring is never tried to find out.
 
 use std::time::{Duration, Instant};
 
+mod choice;
 mod parking;
 mod reaping;
 mod retry;
 
 #[cfg(test)]
 pub(crate) use self::retry::Plant;
-pub use self::retry::{Clock, Deadline, Once, WaitError, Waited};
+pub use self::{
+    choice::{MarkRefused, SANDBOXED, Waits, choose, choose_from_env},
+    retry::{Clock, Deadline, Once, WaitError, Waited},
+};
 
 #[cfg(target_os = "linux")]
-#[expect(unsafe_code, reason = "Linux's waits: io_uring_enter and clock_nanosleep, one call each")]
+#[expect(
+    unsafe_code,
+    reason = "the waits of a process where io_uring is refused: futex, ppoll, pidfd_open, waitid and clock_nanosleep, one call each"
+)]
+mod direct;
+#[cfg(target_os = "linux")]
+#[expect(unsafe_code, reason = "Linux's waits: io_uring_enter, one call")]
 mod linux;
 #[cfg(target_os = "macos")]
 #[expect(unsafe_code, reason = "macOS's waits: kevent and mach_wait_until, one call each")]
@@ -148,9 +164,10 @@ pub fn until<T>(
 /// One thread's park, woken from any thread: a token, as std's `thread::park` is (an unpark
 /// before the park makes it return at once), with an absolute deadline on an injected clock.
 /// On Linux the park is `IORING_OP_FUTEX_WAIT` on the thread's wait ring and the unpark
-/// `IORING_OP_FUTEX_WAKE` on the waker's (a plain `FUTEX_WAKE` from a thread with no ring);
-/// elsewhere std's park, until those systems' address waits land. Only one thread parks on a
-/// `Parker`; nothing signals it.
+/// `IORING_OP_FUTEX_WAKE` on the waker's (a plain `FUTEX_WAKE` from a thread with no ring), or,
+/// in a process that chose the direct driver ([`choose`]), `FUTEX_WAIT_BITSET` to an absolute
+/// time and `FUTEX_WAKE`; elsewhere std's park, until those systems' address waits land. Only
+/// one thread parks on a `Parker`; nothing signals it.
 pub struct Parker {
     word: std::sync::atomic::AtomicU32,
     #[cfg(not(target_os = "linux"))]
@@ -174,14 +191,25 @@ impl Parker {
         deadline: Option<Deadline>,
         clock: &impl Clock,
     ) -> Result<Waited<()>, WaitError> {
-        parking::park(&self.word, &self.kernel(), what, deadline, clock, parking::ParkPlant::None)
+        let plant = parking::ParkPlant::None;
+        #[cfg(target_os = "linux")]
+        if choice::chosen() == Waits::Direct {
+            let kernel = direct::Direct(&direct::Kernel);
+            return parking::park(&self.word, &kernel, what, deadline, clock, plant);
+        }
+        parking::park(&self.word, &self.kernel(), what, deadline, clock, plant)
     }
 
     /// Wakes its thread, or makes its next park return at once.
     pub fn unpark(&self) {
+        #[cfg(target_os = "linux")]
+        if choice::chosen() == Waits::Direct {
+            return parking::unpark(&self.word, &direct::Direct(&direct::Kernel));
+        }
         parking::unpark(&self.word, &self.kernel());
     }
 
+    /// The ring's futex: the kernel of a process that did not choose the direct driver.
     #[cfg(target_os = "linux")]
     fn kernel(&self) -> ring::Futexes {
         ring::Futexes
@@ -238,7 +266,8 @@ impl parking::Futex for ThreadPark<'_> {
 }
 
 /// Waits until the child `pid` has exited, by `deadline` on `clock` (forever for `None`),
-/// leaving it unreaped: `IORING_OP_WAITID` with `WEXITED | WNOWAIT` on this thread's wait ring.
+/// leaving it unreaped: `IORING_OP_WAITID` with `WEXITED | WNOWAIT` on this thread's wait ring,
+/// or, on the direct driver, a `ppoll` of its pidfd between two `waitid(WNOHANG | WNOWAIT)`.
 /// A pid that is no child of this process (or one reaped already) fails with `ECHILD`.
 #[cfg(target_os = "linux")]
 pub fn exited(
@@ -248,7 +277,10 @@ pub fn exited(
     clock: &impl Clock,
 ) -> Result<Waited<()>, WaitError> {
     use reaping::Children as _;
-    ring::Kids.exited(what, pid, true, deadline, clock)
+    match choice::chosen() {
+        Waits::Ring => ring::Kids.exited(what, pid, true, deadline, clock),
+        Waits::Direct => direct::Direct(&direct::Kernel).exited(what, pid, true, deadline, clock),
+    }
 }
 
 /// Reaps the child `pid` once it has exited, by `deadline` on `clock`: its status and what it
@@ -260,11 +292,18 @@ pub(crate) fn reap(
     deadline: Option<Deadline>,
     clock: &impl Clock,
 ) -> Result<Waited<(libc::c_int, libc::rusage)>, WaitError> {
-    reaping::reap(what, &ring::Kids, pid, deadline, clock, reaping::ReapPlant::None)
+    let plant = reaping::ReapPlant::None;
+    match choice::chosen() {
+        Waits::Ring => reaping::reap(what, &ring::Kids, pid, deadline, clock, plant),
+        Waits::Direct => {
+            reaping::reap(what, &direct::Direct(&direct::Kernel), pid, deadline, clock, plant)
+        }
+    }
 }
 
 /// Waits until `fd` is ready for `events` (`POLLIN`, `POLLPRI`, ...), by `deadline` on `clock`
-/// (forever for `None`): its `revents`. One `IORING_OP_POLL_ADD` on this thread's wait ring.
+/// (forever for `None`): its `revents`. One `IORING_OP_POLL_ADD` on this thread's wait ring, or
+/// `ppoll` on the direct driver.
 #[cfg(target_os = "linux")]
 pub fn pollable(
     what: &'static str,
@@ -273,5 +312,8 @@ pub fn pollable(
     deadline: Option<Deadline>,
     clock: &impl Clock,
 ) -> Result<Waited<libc::c_short>, WaitError> {
-    ring::poll(what, fd, events, deadline, clock)
+    match choice::chosen() {
+        Waits::Ring => ring::poll(what, fd, events, deadline, clock),
+        Waits::Direct => direct::poll(what, fd, events, deadline, clock),
+    }
 }

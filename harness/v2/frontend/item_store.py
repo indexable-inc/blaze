@@ -8,7 +8,7 @@ random edits").
 
 The input is one JSON object (inline, a file's path, or `-` for stdin):
 
-    engine      the blaze under test (engine.EngineSpec); v2 only, as v1 has no item store
+    engine      the blaze under test (engine.EngineSpec)
     out         the path the result JSON is written to (report.py)
     work        the directory the daemons' homes go in; empty: a new one under /tmp
     apps        which entries of harness/apps/apps.json run, by name; empty: every one with `edits`
@@ -727,8 +727,6 @@ def run_app(eng: engine.Engine, name: str, spec: dict[str, Any], args: Input, wo
 
 
 def main(args: Input) -> None:
-    if args.engine.kind != "v2":
-        fail(SCRIPT, f"engine.kind: v2, not {args.engine.kind!r}: v1 has no item store")
     if args.steps < 0:
         fail(SCRIPT, f"steps: at least 0, not {args.steps}")
     import appruns as apps

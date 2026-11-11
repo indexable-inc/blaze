@@ -252,7 +252,7 @@ ORDER BY step, item, part
 LIMIT $limit
 
 -- name: task_memory
--- says: a build's daemon tasks by kind (`task` spans): how many ran, the memory the plane granted them against the most they held, how many held more than granted, how many memory held back, and their time
+-- says: a build's daemon tasks by kind (`task` spans): how many ran, the memory the plane granted them against the most they held, how many held more than granted and by how much (over), how many held under half their grant and what of it went unused (under), how many memory held back, and their time
 SELECT
     function AS task,
     count(*) AS tasks,
@@ -260,6 +260,9 @@ SELECT
     round(sum(peak_bytes) / 1048576, 1) AS peak_mib,
     round(max(peak_bytes) / 1048576, 1) AS largest_peak_mib,
     count(*) FILTER (WHERE peak_bytes > granted_bytes) AS over_grant,
+    round(sum(peak_bytes - granted_bytes) FILTER (WHERE peak_bytes > granted_bytes) / 1048576, 1) AS over_mib,
+    count(*) FILTER (WHERE peak_bytes * 2 < granted_bytes) AS under_grant,
+    round(sum(granted_bytes - peak_bytes) FILTER (WHERE peak_bytes * 2 < granted_bytes) / 1048576, 1) AS under_mib,
     count(*) FILTER (WHERE passed > 0) AS held_back,
     max(passed) AS most_passed,
     round(sum(dur_ns) / 1e6, 1) AS ms
@@ -267,6 +270,22 @@ FROM spans
 WHERE build_id = $build AND name = 'task'
 GROUP BY function
 ORDER BY peak_mib DESC NULLS LAST, task
+
+-- name: task_grants
+-- says: a build's daemon tasks whose peak passed their grant or stayed under half of it (`task` spans), worst first: the task kind, its crate and unit, its grant and peak, and by how much the grant missed
+SELECT
+    function AS task,
+    "crate",
+    unit,
+    round(granted_bytes / 1048576, 1) AS granted_mib,
+    round(peak_bytes / 1048576, 1) AS peak_mib,
+    CASE WHEN peak_bytes > granted_bytes THEN 'over' ELSE 'under' END AS missed,
+    round(abs(peak_bytes::DOUBLE - granted_bytes::DOUBLE) / 1048576, 1) AS missed_mib
+FROM spans
+WHERE build_id = $build AND name = 'task'
+    AND (peak_bytes > granted_bytes OR peak_bytes * 2 < granted_bytes)
+ORDER BY missed_mib DESC, task, "crate", unit
+LIMIT $limit
 
 -- name: memory_timeline
 -- says: a build's memory minute by minute from its first counter (`blaze explain memory`): the footprint (all the OS counts against the daemon), the global heap's live blocks, what blaze-mem's tags hold, what the allocators keep freed (`allocator kept bytes`, or the footprint less the live heap and blaze-mem's resident pages where no such row is), and the most tasks running, in GiB; each column its minute's most. Counters of a blaze before they carried a build are taken by the build's window

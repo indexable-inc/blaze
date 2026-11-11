@@ -1056,8 +1056,6 @@ def main() -> None:
     if len(sys.argv) != 2:
         fail(SCRIPT, "takes one JSON value (inline, a file's path, or -), or `selftest`")
     args = parse(Input, sys.argv[1], SCRIPT)
-    if args.engine.kind != "v2":
-        fail(SCRIPT, "engine.kind: v2 only; v1 has no `blaze trace` and no history to read")
     check_target(args.target)
     rep = report.Report(SCRIPT, args.engine, args.out)
     try:

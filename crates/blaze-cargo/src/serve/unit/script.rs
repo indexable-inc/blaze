@@ -946,11 +946,63 @@ pub(crate) struct ScriptRun {
     /// The ticket of a record its run put that a value depends on where its roots are
     /// ([`blaze_usercode::roots::verify::retraction`]): durable before its job is done.
     puts: RunPuts,
+    /// Why its sandboxed run was not reused ([`run_missed`]), held from its start until the
+    /// run ends: given with what the run then read ([`with_reads`]), so `blaze why` names the
+    /// read that differs from its last run's; a run that ends with no reads known (it failed,
+    /// or was stopped) gives it as its start made it ([`Runs::take_puts`]).
+    missed: Option<blaze_kernel::Miss>,
     /// `build script run`, open from the run's start to its end, so its whole time (the
     /// program's, which no thread of the daemon spends) is a row naming the package and
     /// version. Held ([`blaze_profile::flight::HELD_FIELD`]): entered only while the loop does a step
     /// of it, so its `self_cpu_ns` is the daemon's work for this run alone.
     span: tracing::Span,
+    /// The run's files are in place as this process left them ([`run_in_place`]): of which
+    /// bytes, and when that run began. Taken as the run ends reused (nothing is written when
+    /// the bytes are those) or starts anew ([`ScriptRun::started`]).
+    left: Option<(blaze_ids::ContentId, SystemTime)>,
+}
+
+/// What a run left in its directory: cargo's files of it, of which bytes ([`run_id`]), when it
+/// began (the time of `invoked.timestamp`), and each file's length and time as it was left.
+struct LeftRun {
+    id: blaze_ids::ContentId,
+    began: SystemTime,
+    files: [(u64, SystemTime); 3],
+}
+
+/// Each run's directory this process left cargo's files in, by its path: a few dozen a
+/// build, scanned. In memory only: a restarted daemon writes each once.
+static LEFT_RUNS: blaze_core::lock::Lock<Vec<(PathBuf, LeftRun)>> =
+    blaze_core::lock::Lock::new("serve.unit.script.left_runs", Vec::new());
+
+/// The identity of cargo's files of a run that printed `stdout` and `stderr`; its
+/// `root-output` is its unit's `OUT_DIR`, which its directory names.
+fn run_id(stdout: &[u8], stderr: &[u8]) -> blaze_ids::ContentId {
+    blaze_ids::Hasher::new("blaze serve script run files").part(stdout).part(stderr).finish()
+}
+
+/// A file's length and time now.
+fn file_now(path: &Path) -> Option<(u64, SystemTime)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+/// Whether `unit`'s run directory holds cargo's files as this process left them, and its
+/// `OUT_DIR` is there: the bytes they are of and when that run began. Four stats and no
+/// read; a write of any of them, by anyone, moved its time or its length. What is found so
+/// is not written again by a run reused ([`ScriptRun::finish`]): a walk that computes
+/// nothing writes nothing, so no watch of the build directory hears of it.
+fn run_in_place(unit: &bs::Unit) -> Option<(blaze_ids::ContentId, SystemTime)> {
+    let dir = blaze_build_script::run::run_dir(unit);
+    let (id, began, files) = {
+        let left = LEFT_RUNS.lock();
+        let (_, it) = left.iter().find(|it| it.0 == dir)?;
+        (it.id, it.began, it.files)
+    };
+    let at = blaze_build_script::run::files(unit, &[], &[]).ok()?;
+    let now = [file_now(&at.printed.0)?, file_now(&at.stderr.0)?, file_now(&at.root_output.0)?];
+    let invoked = file_now(&blaze_build_script::run::invoked(unit).0)?.1;
+    (now == files && invoked == began && unit.out_dir.is_dir()).then_some((id, began))
 }
 
 enum State {
@@ -973,6 +1025,12 @@ enum State {
 /// then given its bytes, then the first dated when the run began. None is synced: cargo syncs
 /// none of them. The run ends ok once every effect of them completed.
 struct Writing {
+    /// The run's directory, the files' paths in it, the bytes they are of ([`run_id`]) and
+    /// when the run began: what is noted of them once they are written ([`Writing::note`]).
+    run_dir: PathBuf,
+    paths: [PathBuf; 3],
+    id: blaze_ids::ContentId,
+    began: SystemTime,
     files: [FileName; 3],
     /// Each file's bytes until it is cut and they are written; none are for an empty file.
     bytes: [Vec<u8>; 3],
@@ -1102,6 +1160,7 @@ fn run_miss(
             // alloc: none
             parts: Vec::new(),
             beyond: None,
+            via: None,
         },
     }
 }
@@ -1118,14 +1177,25 @@ fn label_run(tag: Tag, package: &str) {
 
 /// Why the sandboxed run of unit `unit`'s build script, keyed as `prepared` says, was not
 /// reused, for `blaze why`: its key's parts by name (its code, each variable it is given), and
-/// past them, what it read when it last ran. Made on a miss only.
+/// past them, what it read when it last ran, which [`with_reads`] names once this run ends.
+/// Made on a miss only.
 fn run_missed(job: &Job, unit: usize, prepared: &Prepared) -> blaze_kernel::Miss {
     use blaze_kernel::Part;
+    // The unit that compiles the script, whose result its code is: what a chain follows.
+    let compiled = job.unit(unit).ok().and_then(|run| {
+        run.dependencies
+            .iter()
+            .filter_map(|dep| job.unit(dep.index).ok())
+            .find(|it| {
+                it.target.is_custom_build() && it.mode == blaze_units::schema::Mode::Build
+            })
+            .map(super::compile::span_unit)
+    });
     run_miss(job, unit, |subject, item| {
         let key = prepared.spec.key;
         let mut hasher = blaze_ids::Hasher::new("blaze v2 why run key 1");
         hasher.id(&key.code).id(&key.given);
-        let parts = std::iter::once(Part::new("the build script's code", Some(key.code)))
+        let parts = std::iter::once(Part::result("the build script's code", Some(key.code), compiled))
             .chain(
                 prepared.made.parts().into_iter().map(|(name, hash)| Part::new(name, Some(hash))),
             )
@@ -1135,6 +1205,119 @@ fn run_missed(job: &Job, unit: usize, prepared: &Prepared) -> blaze_kernel::Miss
         miss.beyond = Some("what it read when it last ran (the files and variables it traced)");
         miss
     })
+}
+
+/// The domain of a read's value as a part of a run's miss, and of the miss's key with its
+/// reads ([`with_reads`]).
+const READ: &str = "blaze v2 why run read 1";
+const READS_KEY: &str = "blaze v2 why run key with reads 1";
+
+/// The most reads a run's miss names one by one ([`with_reads`]): the first of them by name;
+/// the rest are one part, so a script that reads ten thousand headers does not fill `blaze
+/// why`'s ledger with their names.
+const READS_NAMED: usize = 1024;
+
+/// `miss`, of a sandboxed run that has now ended having read `traced` (its run's key's
+/// inputs past the key: [`blaze_usercode::index::result_key`]), with each read as a part of
+/// it by name, hashed as the run saw it, and a key that covers them. `blaze why` then tells
+/// this run from the last one of its script by the reads that differ, by name: a file by its
+/// path, a directory's listing, a variable, cargo's watch of a whole package or of a tree a
+/// `rerun-if-changed` named, and what it read that can't be traced. Two runs that read the
+/// same have one key: the second ran because the first's result was not kept, which is what
+/// `blaze why` then says. A miss with no parts to tell apart (it failed to be made) is left
+/// as it is.
+fn with_reads(mut miss: blaze_kernel::Miss, traced: &blaze_core::Traced) -> blaze_kernel::Miss {
+    use blaze_kernel::{Miss, Missed, Part};
+    use blaze_usercode::trace;
+    if !matches!(miss.missed, Missed::New) {
+        return miss;
+    }
+    let seen = |kind: u8, bytes: Option<&[u8]>| {
+        let mut hasher = blaze_ids::Hasher::new(READ);
+        hasher.update(&[kind]).opt_part(bytes);
+        Some(hasher.finish())
+    };
+    // A path cargo's rule watches whole is named for what it is, never by the name no file has.
+    let walked = |path: &Path| {
+        trace::walked(path).map(|(dir, package)| match package {
+            // alloc: once a run that missed, a part's name
+            true => format!(
+                "every file of the package at {} (it printed no `rerun-if-changed` and read a file the sandbox did not see opened)",
+                dir.display()
+            ),
+            // alloc: as above
+            false => format!("every file below {} (its `rerun-if-changed`)", dir.display()),
+        })
+    };
+    // alloc: once a run that missed, a part each read
+    let mut reads: Vec<Part> =
+        Vec::with_capacity(traced.files.len() + traced.dirs.len() + traced.env.len() + 1);
+    for (path, hash) in &traced.files {
+        // alloc: as `walked`
+        let name =
+            walked(path.as_path()).unwrap_or_else(|| format!("the file {}", path.display()));
+        reads.push(Part::new(name, seen(0, hash.as_ref().map(|it| &it[..]))));
+    }
+    for (path, hash) in &traced.dirs {
+        // alloc: as `walked`
+        let name = walked(path.as_path())
+            .unwrap_or_else(|| format!("the names in the directory {}", path.display()));
+        reads.push(Part::new(name, seen(1, Some(&hash[..]))));
+    }
+    for (name, value) in &traced.env {
+        let named = match name == trace::ALL_ENV_NAME {
+            true => "the names of every environment variable (it read them all)".to_owned(), // alloc: as `walked`
+            false => format!("the variable {} it read", name.display()), // alloc: as `walked`
+        };
+        let value = value.as_deref().map(trace::os_bytes);
+        reads.push(Part::new(named, seen(2, value.as_deref())));
+    }
+    if !traced.untraceable.is_empty() {
+        let mut names: Vec<&str> =
+            traced.untraceable.iter().map(|it| trace::untraceable_name(*it)).collect(); // alloc: as `reads`
+        names.sort_unstable();
+        names.dedup();
+        let named = format!("what it read that can't be traced ({})", names.join(", ")); // alloc: as `walked`
+        let joined = names.join("\0"); // alloc: as `walked`
+        reads.push(Part::new(named, seen(3, Some(joined.as_bytes()))));
+    }
+    reads.sort();
+    reads.dedup();
+    if reads.len() > READS_NAMED {
+        let mut hasher = blaze_ids::Hasher::new(READ);
+        hasher.update(&[4]);
+        for part in &reads[READS_NAMED..] {
+            hasher.part(part.name.as_bytes());
+            match &part.hash {
+                Some(hash) => _ = hasher.update(&[1]).id(hash),
+                None => _ = hasher.update(&[0]),
+            }
+        }
+        let rest = reads.len() - READS_NAMED;
+        reads.truncate(READS_NAMED);
+        // alloc: as `walked`
+        reads.push(Part::new(
+            format!("its other {rest} reads (more than {READS_NAMED} are not named one by one)"),
+            Some(hasher.finish()),
+        ));
+    }
+    let mut parts = std::mem::take(&mut miss.parts);
+    parts.extend(reads);
+    let mut made = Miss::of_parts(miss.step, miss.subject, miss.item, miss.key, parts);
+    let mut hasher = blaze_ids::Hasher::new(READS_KEY);
+    hasher.id(&miss.key);
+    for part in &made.parts {
+        hasher.part(part.name.as_bytes());
+        match &part.hash {
+            Some(hash) => _ = hasher.update(&[1]).id(hash),
+            None => _ = hasher.update(&[0]),
+        }
+    }
+    made.key = hasher.finish();
+    made.kept = miss.kept;
+    // Nothing is filed past this key: the same key again is a result that was not kept.
+    made.beyond = None;
+    made
 }
 
 /// `spec`, of a sandboxed run of `unit`, with its live record named ([`blaze_usercode::confine::LIVE`])
@@ -1196,7 +1379,9 @@ pub(crate) fn start(job: &Arc<Job>, unit: usize, tags: u64) -> Result<ScriptRun,
         tag: Tag(tags),
         state: State::Ready(Box::new(start)),
         puts: RunPuts::default(),
+        missed: None,
         span: tracing::Span::none(),
+        left: None,
     })
 }
 
@@ -1363,6 +1548,19 @@ impl ScriptRun {
                 out,
             );
         }
+        // cargo's files of these bytes are in place as this process left them: a run reused
+        // that computes nothing writes nothing. Of other bytes, the run starts anew.
+        let began = match self.left.take() {
+            Some((left, _)) if left == run_id(&stdout, &stderr) => {
+                self.state = State::Done;
+                return Some(true);
+            }
+            Some(_) => match blaze_build_script::run::begin(&start.unit) {
+                Ok(it) => it,
+                Err(error) => return self.error(error.0, out),
+            },
+            None => began,
+        };
         match Writing::begin(&start.unit, stdout, stderr, began, self.tag, effects) {
             Ok(writing) => {
                 self.state = State::Writing(Box::new(writing)); // alloc: once per script run
@@ -1382,6 +1580,7 @@ impl ScriptRun {
     ) -> Option<bool> {
         match writing.step(self.tag, completion, effects) {
             Ok(true) => {
+                writing.note();
                 self.state = State::Done;
                 Some(true)
             }
@@ -1405,9 +1604,15 @@ impl Writing {
         tag: Tag,
         effects: &mut Vec<Effect>,
     ) -> Result<Writing, String> {
+        let id = run_id(&stdout, &stderr);
+        let run_dir = blaze_build_script::run::run_dir(unit);
+        // What was noted of the directory is of files about to be cut.
+        LEFT_RUNS.lock().retain(|it| it.0 != run_dir);
         let at = blaze_build_script::run::files(unit, &[], &[]).map_err(|error| {
             format!("cargo's files of the build script run of `{}`: {error}", unit.package.descr())
         })?;
+        // clone: three paths, once per run written
+        let paths = [at.printed.0.clone(), at.stderr.0.clone(), at.root_output.0.clone()];
         let files =
             [file_name(&at.printed.0)?, file_name(&at.stderr.0)?, file_name(&at.root_output.0)?];
         // alloc: the effect owns what it writes; `OUT_DIR`'s path, once per run.
@@ -1428,7 +1633,19 @@ impl Writing {
                 tag: Tag(tag.0 + CUT + n),
             });
         }
-        Ok(Writing { files, bytes: [stdout, stderr, root_output], modified_ns, left: 3 })
+        let bytes = [stdout, stderr, root_output];
+        Ok(Writing { run_dir, paths, id, began, files, bytes, modified_ns, left: 3 })
+    }
+
+    /// Every file is written: what the directory holds is noted, each file's length and time
+    /// read back, so the next run reused with these bytes finds them in place
+    /// ([`run_in_place`]). A file that can't be looked at leaves nothing noted.
+    fn note(self) {
+        let now = [file_now(&self.paths[0]), file_now(&self.paths[1]), file_now(&self.paths[2])];
+        if let [Some(a), Some(b), Some(c)] = now {
+            let left = LeftRun { id: self.id, began: self.began, files: [a, b, c] };
+            LEFT_RUNS.lock().push((self.run_dir, left)); // alloc: once per run written
+        }
     }
 
     /// `completion` of one of its effects, the run's tag being `tag`: the next effect of its
@@ -1495,6 +1712,12 @@ impl Runs<Real> for ScriptRun {
     }
 
     fn take_puts(&mut self) -> RunPuts {
+        // A run over with its miss still held ended before what it read was known.
+        if matches!(self.state, State::Done)
+            && let Some(miss) = self.missed.take()
+        {
+            self.puts.misses.push(miss);
+        }
         std::mem::take(&mut self.puts)
     }
 
@@ -1519,6 +1742,16 @@ impl Runs<Real> for ScriptRun {
 }
 
 impl ScriptRun {
+    /// The script is to run, whatever its directory holds: cargo's start of a run made now
+    /// when it was put off for files found in place ([`ScriptRun::begin`]), before the
+    /// spawn asked for is submitted. When the run began.
+    fn started(&mut self, unit: &bs::Unit, began: SystemTime) -> Result<SystemTime, String> {
+        match self.left.take() {
+            Some(_) => blaze_build_script::run::begin(unit).map_err(|error| error.0),
+            None => Ok(began),
+        }
+    }
+
     /// [`Runs::start`]'s step.
     fn begin(
         &mut self,
@@ -1531,10 +1764,16 @@ impl ScriptRun {
             return None;
         };
         // cargo's start of a run: `OUT_DIR` made, `invoked.timestamp` written, and the time it
-        // began, which its `output` is given.
-        let began = match blaze_build_script::run::begin(&start.unit) {
-            Ok(it) => it,
-            Err(error) => return self.error(error.0, out),
+        // began, which its `output` is given. Not when the last run's files are in place as
+        // this process left them: a run reused then writes nothing, and one that runs starts
+        // then ([`ScriptRun::started`]).
+        self.left = run_in_place(&start.unit);
+        let began = match self.left {
+            Some((_, began)) => began,
+            None => match blaze_build_script::run::begin(&start.unit) {
+                Ok(it) => it,
+                Err(error) => return self.error(error.0, out),
+            },
         };
         match &start.how {
             How::Inert => {
@@ -1570,11 +1809,16 @@ impl ScriptRun {
                     // alloc: none
                     parts: Vec::new(),
                     beyond: None,
+                    via: None,
                 }
                 });
                 self.puts.misses.push(miss);
                 effects.push(Effect::Spawn { command: Box::new(command.clone()), tag: self.tag });
                 label_run(self.tag, &start.unit.package.descr());
+                let began = match self.started(&start.unit, began) {
+                    Ok(it) => it,
+                    Err(what) => return self.error(what, out),
+                };
                 self.state = State::Running {
                     start,
                     run: None,
@@ -1597,9 +1841,12 @@ impl ScriptRun {
                     }
                     Ok(Begun::Running(run)) => {
                         label_run(self.tag, &start.unit.package.descr());
-                        let miss = run_missed(&self.job, self.unit, prepared);
-                        self.puts.misses.push(miss);
+                        self.missed = Some(run_missed(&self.job, self.unit, prepared));
                         let quiet = Some(Quiet::begin(&live, self.tag, effects));
+                        let began = match self.started(&start.unit, began) {
+                            Ok(it) => it,
+                            Err(what) => return self.error(what, out),
+                        };
                         self.state = State::Running {
                             start,
                             run: Some(run),
@@ -1673,6 +1920,10 @@ impl ScriptRun {
                         // What the run kept under its sandboxed key, and a retraction it put.
                         self.puts.kept(completed.tickets.iter().copied());
                         self.puts.retraction(completed.retracted);
+                        // Its miss, now that what it read is known: each read a part of it.
+                        if let Some(miss) = self.missed.take() {
+                            self.puts.misses.push(with_reads(miss, &completed.traced));
+                        }
                         let value = completed.value;
                         // A pure key's hit verified across checkouts, run again and otherwise:
                         // retracted before the run is kept under the pure key, which then

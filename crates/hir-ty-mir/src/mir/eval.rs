@@ -342,6 +342,39 @@ fn size_class(size: usize) -> usize {
     size.max(8).checked_next_power_of_two().unwrap_or(usize::MAX)
 }
 
+/// What one copy of a constant into an evaluation has relocated
+/// ([`Evaluator::patch_addresses`]), by where things are now: each place walked at a type, and
+/// each pointer word moved. A piece two pointers of the constant share (a `&'static` recipe
+/// two fields name) is reached from each, and after the first walk its words hold this
+/// evaluation's addresses: read again as the constant's, one that equals another piece's
+/// address in the constant's evaluation (both heaps start at the same offset) would be moved
+/// a second time, onto that piece, or onto no memory at all when that piece is empty
+/// (`read invalid memory address 4`). rustc relocates each pointer of an allocation once, by
+/// its provenance.
+struct Relocation<'db> {
+    walked: HashSet<(usize, Ty<'db>), std::alloc::Global>,
+    words: HashMap<usize, Moved, std::alloc::Global>,
+}
+
+/// Where a pointer word [`Relocation`] moved points now.
+#[derive(Clone, Copy)]
+enum Moved {
+    /// Into a copy of a piece of the constant (or nowhere it kept, left as it was).
+    Piece,
+    /// Into this evaluator's copy of a static, which is not the constant's to walk.
+    Static,
+}
+
+impl Relocation<'_> {
+    fn new() -> Self {
+        // alloc: one relocation of a constant's copy, dropped when it is done
+        Relocation {
+            walked: HashSet::new_in(std::alloc::Global),
+            words: HashMap::new_in(std::alloc::Global),
+        }
+    }
+}
+
 /// The layout of one variant of an ADT ([`Evaluator::layout_of_variant`]): the type's own,
 /// or one made for a variant of an enum with several.
 enum VariantLayout {
@@ -513,8 +546,13 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     /// constant's or static's initializer ([`Self::limits_frames`]), which the lint is of; it
     /// fires at [`LINT_TERMINATOR_LIMIT`]. A step is a run of a block rustc counts
     /// ([`ctfe_limit`](super::ctfe_limit)): a call or a loop's back edge, not every block
-    /// [`Self::steps_left`] counts.
+    /// [`Self::steps_left`] counts. The count is of one constant: a `const { .. }` block run
+    /// by this evaluation ([`Self::inline_const_in_heap`]) has its own, from zero, as rustc
+    /// evaluates the block by an evaluation of its own.
     lint_steps: u64,
+    /// The steps the `const { .. }` blocks this evaluation ran spent of their own counts, which
+    /// [`Self::lint_steps`] leaves out: what a profile adds to say what the evaluation cost.
+    lint_steps_inner: u64,
     /// [`ctfe_limit::counted_blocks`](super::ctfe_limit::counted_blocks) of each body run in
     /// an evaluation the lint is of, by the body's address.
     counted_blocks: HashMap<usize, Arc<[u64]>, std::alloc::Global>,
@@ -796,8 +834,9 @@ pub fn interpret_mir<'db>(
 ) -> Result<'db, (Result<'db, Allocation<'db>>, MirOutput)> {
     // What an evaluation spent, over its runs: `blocks` of the budget (every block run) and
     // `steps` of `long_running_const_eval` (the calls and loop turns rustc counts, 2,000,000 at
-    // most without an `#[allow]`), so a profile says which constant took the time and in which
-    // unit it would hit a limit.
+    // most without an `#[allow]` in the constant and in each `const { .. }` block it runs, whose
+    // steps are added here), so a profile says which constant took the time and in which unit
+    // it would hit a limit.
     let span = tracing::info_span!(
         target: "blaze",
         "const eval",
@@ -818,7 +857,7 @@ pub fn interpret_mir<'db>(
         evaluator.read_statics = Some(mem::take(&mut read_statics));
         let it = evaluator.evaluate(body, ty);
         blocks += evaluator.budget.steps - evaluator.steps_left;
-        steps += evaluator.lint_steps;
+        steps += evaluator.lint_steps + evaluator.lint_steps_inner;
         runs += 1;
         read_statics = evaluator.read_statics.take().unwrap_or_default();
         if let Some(read) = evaluator.missing_static.take()
@@ -1056,6 +1095,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             steps_left: budget.steps,
             memory_peak: 0,
             lint_steps: 0,
+            lint_steps_inner: 0,
             counted_blocks: HashMap::new_in(std::alloc::Global),
             inherited_overflow_checks: None,
             layout_cache: RefCell::new(Default::default()),
@@ -3852,7 +3892,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             MirEvalError::ConstEvalError(name, Box::new(ConstEvalError::MirLowerError(e)))
         })?;
         let mark = self.stack.len();
-        let result = self.interpret_mir(body, iter::empty(), None)?;
+        // The block is a constant of its own to `long_running_const_eval`: rustc evaluates an
+        // inline const by an evaluation of its own, whose count of steps starts at zero, and
+        // what it spends is not spent of the constant that uses it. The budget
+        // ([`Self::steps_left`]) is this whole evaluation's and goes on.
+        let outer = mem::replace(&mut self.lint_steps, 0);
+        let result = self.interpret_mir(body, iter::empty(), None);
+        self.lint_steps_inner += mem::replace(&mut self.lint_steps, outer);
+        let result = result?;
         let ty = body.locals[return_slot()].ty.as_ref();
         let align = self.size_align_of_sized(ty, locals, "the value of a constant")?.1;
         let addr = self.heap_allocate(result.size, align)?;
@@ -3932,6 +3979,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let ids = self.ids_by_provenance(memory_map, &patch_map, addr, v, size)?;
         let ptr_size = self.cached_ptr_size;
         self.patch_addresses(
+            &mut Relocation::new(),
             &patch_map,
             memory_map,
             |bytes| match memory_map {
@@ -5371,6 +5419,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     fn patch_addresses(
         &mut self,
+        moved: &mut Relocation<'db>,
         patch_map: &HashMap<usize, usize, std::alloc::Global>,
         source: &MemoryMap<'db>,
         ty_of_bytes: impl Fn(&[u8]) -> Result<'db, Ty<'db>> + Copy,
@@ -5384,6 +5433,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         if my_size == 0 {
             return Ok(());
         }
+        // A piece two pointers of the constant share is reached from each: walked once at a
+        // type, as what it holds is this evaluation's after the first walk ([`Relocation`]).
+        let word = self.cached_ptr_size;
+        if !moved.walked.insert((addr.to_usize(word), ty)) {
+            return Ok(());
+        }
         use rustc_type_ir::TyKind;
         // The vtable of a `dyn` pointer is the id the value's own evaluation gave the type it
         // points at and the trait, and this one has another for them: of a pointee that
@@ -5392,23 +5447,33 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             && let TyKind::Dynamic(..) = self.struct_tail(t)?.kind()
         {
             let at = addr.offset(self.ptr_size());
-            let id =
-                from_bytes!(usize, self.cached_ptr_size, self.peek_memory(at, self.ptr_size())?);
-            let (new_id, _) = self.own_id(source, id)?;
-            self.write_vtable_pointer(at, new_id)?;
+            if moved.words.insert(at.to_usize(word), Moved::Piece).is_none() {
+                let id = from_bytes!(usize, word, self.peek_memory(at, self.ptr_size())?);
+                let (new_id, _) = self.own_id(source, id)?;
+                self.write_vtable_pointer(at, new_id)?;
+            }
         }
-        // A pointer into a static points into this evaluator's copy of it.
+        // Whether the pointer at `addr` is already this evaluation's: moved when another type
+        // reached the same word (a union's word as `*const ()`), so it is not moved again.
+        let mut already = false;
         if let TyKind::RawPtr(..) | TyKind::Ref(..) = ty.kind() {
-            let current =
-                from_bytes!(usize, self.cached_ptr_size, self.peek_memory(addr, self.ptr_size())?);
-            if let Some((id, offset)) = source.static_at(current) {
-                let location = self.eval_static(id, locals)?;
-                let start = from_bytes!(
-                    usize,
-                    self.cached_ptr_size,
-                    self.peek_memory(location, self.ptr_size())?
-                );
-                return self.write_root_pointer(addr, start + offset);
+            match moved.words.get(&addr.to_usize(word)).copied() {
+                // It points into this evaluator's copy of a static, which is not the constant's.
+                Some(Moved::Static) => return Ok(()),
+                Some(Moved::Piece) => already = true,
+                None => {
+                    // A pointer into a static points into this evaluator's copy of it.
+                    let current =
+                        from_bytes!(usize, word, self.peek_memory(addr, self.ptr_size())?);
+                    if let Some((id, offset)) = source.static_at(current) {
+                        moved.words.insert(addr.to_usize(word), Moved::Static);
+                        let location = self.eval_static(id, locals)?;
+                        let start =
+                            from_bytes!(usize, word, self.peek_memory(location, self.ptr_size())?);
+                        return self.write_root_pointer(addr, start + offset);
+                    }
+                    moved.words.insert(addr.to_usize(word), Moved::Piece);
+                }
             }
         }
         match ty.kind() {
@@ -5422,11 +5487,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             self.cached_ptr_size,
                             self.peek_memory(addr, my_size)?
                         );
-                        let patched = match patch_map.get(&current) {
+                        let patched = match patch_map.get(&current).filter(|_| !already) {
                             Some(it) => {
                                 self.write_root_pointer(addr, *it)?;
                                 *it
                             }
+                            None if already => current,
                             None => {
                                 if M::CHECKS {
                                     self.write_root_pointer(addr, current)?;
@@ -5435,6 +5501,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             }
                         };
                         self.patch_addresses(
+                            moved,
                             patch_map,
                             source,
                             ty_of_bytes,
@@ -5448,11 +5515,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         let (current, metadata) = bytes.split_at(my_size / 2);
                         let metadata = OwnedBytes::from_slice(metadata);
                         let current = from_bytes!(usize, self.cached_ptr_size, current);
-                        let patched = match patch_map.get(&current) {
+                        let patched = match patch_map.get(&current).filter(|_| !already) {
                             Some(it) => {
                                 self.write_root_pointer(addr, *it)?;
                                 *it
                             }
+                            None if already => current,
                             None => {
                                 if M::CHECKS {
                                     self.write_root_pointer(addr, current)?;
@@ -5464,6 +5532,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         if let TyKind::Dynamic(..) = t.kind() {
                             let concrete = self.vtable_map.ty_of_bytes(&metadata)?;
                             self.patch_addresses(
+                                moved,
                                 patch_map,
                                 source,
                                 ty_of_bytes,
@@ -5486,6 +5555,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 }
                                 for i in 0..count {
                                     self.patch_addresses(
+                                        moved,
                                         patch_map,
                                         source,
                                         ty_of_bytes,
@@ -5501,6 +5571,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             let len = if size == 0 { 0 } else { len };
                             for i in 0..len {
                                 self.patch_addresses(
+                                    moved,
                                     patch_map,
                                     source,
                                     ty_of_bytes,
@@ -5514,9 +5585,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 }
             }
             TyKind::Pat(base, _) => {
-                self.patch_addresses(patch_map, source, ty_of_bytes, addr, base, locals)?
+                self.patch_addresses(moved, patch_map, source, ty_of_bytes, addr, base, locals)?
             }
             // A raw pointer can point anywhere into the allocation that was kept for it.
+            TyKind::RawPtr(..) if already => {}
             TyKind::RawPtr(..) => {
                 let current = from_bytes!(
                     usize,
@@ -5536,10 +5608,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     self.write_function_pointer(addr, new_id)?;
                 }
             }
+            // Of the constant's evaluation once: read again, the id is this one's.
             TyKind::FnPtr(_, _) => {
-                let ty = ty_of_bytes(self.peek_memory(addr, my_size)?)?;
-                let new_id = self.vtable_map.id(ty);
-                self.write_function_pointer(addr, new_id)?;
+                if moved.words.insert(addr.to_usize(word), Moved::Piece).is_none() {
+                    let ty = ty_of_bytes(self.peek_memory(addr, my_size)?)?;
+                    let new_id = self.vtable_map.id(ty);
+                    self.write_function_pointer(addr, new_id)?;
+                }
             }
             TyKind::Adt(id, args) => match id.def_id() {
                 // A `#[blaze::bits]` struct is an integer: no field holds an address.
@@ -5549,6 +5624,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         let offset = layout.fields.offset(i).bytes_usize();
                         let ty = field.ty().instantiate(self.interner(), args).skip_norm_wip();
                         self.patch_addresses(
+                            moved,
                             patch_map,
                             source,
                             ty_of_bytes,
@@ -5566,6 +5642,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             Ty::new_imm_ptr(self.interner(), Ty::new_unit(self.interner()));
                         for word in 0..my_size / self.ptr_size() {
                             self.patch_addresses(
+                                moved,
                                 patch_map,
                                 source,
                                 ty_of_bytes,
@@ -5588,6 +5665,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             let offset = layout.fields.offset(i).bytes_usize();
                             let ty = field.ty().instantiate(self.interner(), args).skip_norm_wip();
                             self.patch_addresses(
+                                moved,
                                 patch_map,
                                 source,
                                 ty_of_bytes,
@@ -5603,6 +5681,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 for (id, ty) in tys.iter().enumerate() {
                     let offset = layout.fields.offset(id).bytes_usize();
                     self.patch_addresses(
+                        moved,
                         patch_map,
                         source,
                         ty_of_bytes,
@@ -5620,6 +5699,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let size = self.size_of_sized(inner, locals, "inner of array")?;
                 for i in 0..len {
                     self.patch_addresses(
+                        moved,
                         patch_map,
                         source,
                         ty_of_bytes,
@@ -5654,7 +5734,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let normalized =
                     super::normalize_or_keep(&self.infcx, self.param_env.param_env, ty);
                 if !matches!(normalized.kind(), TyKind::Alias(..)) {
-                    self.patch_addresses(patch_map, source, ty_of_bytes, addr, normalized, locals)?;
+                    self.patch_addresses(moved, patch_map, source, ty_of_bytes, addr, normalized, locals)?;
                 }
             }
         }

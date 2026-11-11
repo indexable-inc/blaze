@@ -365,6 +365,12 @@ impl<M: Memo> Plane<M> {
             // a plane never told an allowance grants up to its budget alone.
             PlaneInput::Allowance { .. } => {}
             PlaneInput::Cap { bytes, .. } => self.cap = bytes,
+            // Admission by footprint is not modelled: the differential tests give no footprint
+            // and no realized bytes, and a plane never given one charges `max(granted, held)`
+            // as this model does. `crate::footprint`'s DST proves it.
+            PlaneInput::Footprint { .. } | PlaneInput::Realized { .. } => {
+                unreachable!("the differential tests give no footprint")
+            }
             PlaneInput::Promote { request, .. } => {
                 if let Some(&r) = self.request_index.get(&request)
                     && self.requests[r].idle

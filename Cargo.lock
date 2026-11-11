@@ -577,6 +577,8 @@ dependencies = [
  "blaze-macro-eval",
  "blaze-manifest",
  "blaze-mem",
+ "blaze-metadata",
+ "blaze-new",
  "blaze-profile",
  "blaze-protocol",
  "blaze-query",
@@ -587,16 +589,17 @@ dependencies = [
  "blaze-source",
  "blaze-store-check",
  "blaze-testsel",
+ "blaze-tree",
  "blaze-ui",
  "blaze-units",
  "blaze-usercode",
  "blaze-vfs",
- "blaze-wasm-pack",
  "cfg",
  "crossbeam-channel",
  "crossbeam-queue",
  "flate2",
  "futures-util",
+ "hegeltest",
  "hir",
  "hir-def",
  "hir-ty",
@@ -710,6 +713,7 @@ dependencies = [
  "blaze-store-check",
  "crossbeam-channel",
  "hashbrown 0.17.1",
+ "hegeltest",
  "serde",
  "serde_json",
  "tracing",
@@ -882,7 +886,6 @@ dependencies = [
  "blaze-protocol",
  "blaze-rng",
  "blaze-serde",
- "blaze-web",
  "crossbeam-channel",
  "ix-prof",
  "serde",
@@ -1174,6 +1177,7 @@ dependencies = [
  "blaze-core",
  "blaze-format",
  "blaze-ids",
+ "hegeltest",
 ]
 
 [[package]]
@@ -1331,6 +1335,7 @@ dependencies = [
  "blaze-mem",
  "blaze-sha256",
  "gimli",
+ "hegeltest",
  "object 0.40.0",
  "smallvec",
  "tracing",
@@ -1366,6 +1371,7 @@ dependencies = [
  "blaze-profile",
  "blaze-query",
  "blaze-serde",
+ "blaze-vfs",
  "cfg",
  "either",
  "expect-test",
@@ -1424,6 +1430,7 @@ dependencies = [
  "blaze-units",
  "blaze-vfs",
  "cfg",
+ "hegeltest",
  "hir-def",
  "hir-expand",
  "hir-ty-mir",
@@ -2022,42 +2029,6 @@ name = "blaze-wasi"
 version = "0.0.0"
 dependencies = [
  "wasmtime",
-]
-
-[[package]]
-name = "blaze-wasm-pack"
-version = "0.0.0"
-dependencies = [
- "base-db",
- "blaze-core",
- "blaze-hash",
- "blaze-query",
- "blaze-serde",
- "cfg",
- "hir",
- "hir-expand",
- "intern",
- "serde",
- "span",
- "syntax-bridge",
- "triomphe",
- "tt",
-]
-
-[[package]]
-name = "blaze-web"
-version = "0.0.0"
-dependencies = [
- "base64",
- "blaze-alloc-count",
- "blaze-core",
- "blaze-hash",
- "blaze-ids",
- "blaze-protocol",
- "crossbeam-channel",
- "flate2",
- "flecs-c",
- "sha1",
 ]
 
 [[package]]
@@ -3216,19 +3187,6 @@ dependencies = [
  "miniz_oxide",
  "zlib-rs",
 ]
-
-[[package]]
-name = "flecs-c"
-version = "0.1.0"
-dependencies = [
- "cc",
- "flecs-distr",
-]
-
-[[package]]
-name = "flecs-distr"
-version = "4.2.0"
-source = "git+https://github.com/indexable-inc/flecs?rev=ab8b8e051c6f8ac014557136c97847941bd3caa0#ab8b8e051c6f8ac014557136c97847941bd3caa0"
 
 [[package]]
 name = "fnv"
@@ -6087,17 +6045,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "sha1"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.3.1",
- "digest 0.11.3",
 ]
 
 [[package]]

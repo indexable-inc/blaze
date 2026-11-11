@@ -3741,6 +3741,55 @@ fn long_running_lint_counts_loop_turns_not_blocks() {
     );
 }
 
+/// Each `const { .. }` block of a constant's value is a constant of its own to
+/// `long_running_const_eval`, as rustc evaluates an inline const by an evaluation of its own:
+/// three blocks of 700,000 steps each (350,000 turns of a loop that makes a call) are 2,100,000
+/// steps together and none of them is long, where the same calls written in the constant's
+/// own body are one evaluation of 2,100,000 steps, which rustc denies too (blaze-profile's
+/// `VIEWS`, a `const { .. }` per view, was refused while the blocks spent `VIEWS`'s count).
+#[test]
+fn long_running_lint_counts_each_inline_const_on_its_own() {
+    let turns = r#"
+    const fn same(x: usize) -> usize { x }
+    const fn turns(n: usize) -> usize {
+        let mut i = 0;
+        while i < n {
+            i = same(i) + 1;
+        }
+        i
+    }
+    "#;
+    check_number(
+        &format!(
+            "{turns}
+    const GOAL: usize =
+        const {{ turns(350_000) }} + const {{ turns(350_001) }} + const {{ turns(350_002) }};
+    "
+        ),
+        1_050_003,
+    );
+    // In an array of another constant, as `VIEWS` has them.
+    check_number(
+        &format!(
+            "{turns}
+    const PARTS: [usize; 3] =
+        [const {{ turns(350_000) }}, const {{ turns(350_001) }}, const {{ turns(350_002) }}];
+    const GOAL: usize = PARTS[0] + PARTS[1] + PARTS[2];
+    "
+        ),
+        1_050_003,
+    );
+    // The control: without the blocks it is one constant, and long.
+    check_fail(
+        &format!(
+            "{turns}
+    const GOAL: usize = turns(350_000) + turns(350_001) + turns(350_002);
+    "
+        ),
+        |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::LongRunning { at: Some(_) })),
+    );
+}
+
 #[test]
 fn memory_limit() {
     check_fail(
@@ -3951,6 +4000,113 @@ fn a_loaded_constants_pointers_in_an_unsized_tail_are_its_own() {
     };
         "#,
         57123,
+    );
+}
+
+/// A loaded constant's piece that two of its pointers share (`Fill::RECIPE`, named by both of
+/// `Inks`'s fields; `f32::RECIPE`, by all of `Rgba`'s) is relocated once: walked again, its
+/// pointers are this evaluation's and were moved a second time, onto whichever piece had that
+/// address in the constant's evaluation, or onto no memory (harness-native-ui-look-api's
+/// `LAYOUT_HASH`: "read invalid memory address 4 with size 56", a `&Recipe` moved onto an
+/// empty piece of alignment 4). The shape is hyperion-layout's recipes under `api_layouts!`.
+#[test]
+fn a_loaded_constants_shared_pointee_is_relocated_once() {
+    check_number(
+        r#"
+    //- minicore: coerce_unsized, index, slice, str
+    pub enum Recipe {
+        Prim { size: usize, align: usize },
+        Struct { fields: &'static [Field], size: usize, align: usize },
+    }
+    pub struct Field { pub offset: usize, pub ty: &'static Recipe }
+    pub trait Layout { const RECIPE: &'static Recipe; }
+    impl Layout for f32 { const RECIPE: &'static Recipe = &Recipe::Prim { size: 4, align: 4 }; }
+    impl Layout for u8 { const RECIPE: &'static Recipe = &Recipe::Prim { size: 1, align: 1 }; }
+    pub struct Rgba;
+    pub struct Fill;
+    pub struct Inks;
+    pub struct HoverInk;
+    impl Layout for Rgba {
+        const RECIPE: &'static Recipe = &Recipe::Struct {
+            fields: &[
+                Field { offset: 0, ty: <f32 as Layout>::RECIPE },
+                Field { offset: 4, ty: <f32 as Layout>::RECIPE },
+                Field { offset: 8, ty: <f32 as Layout>::RECIPE },
+                Field { offset: 12, ty: <f32 as Layout>::RECIPE },
+            ],
+            size: 16,
+            align: 4,
+        };
+    }
+    impl Layout for Fill {
+        const RECIPE: &'static Recipe = &Recipe::Struct {
+            fields: &[
+                Field { offset: 0, ty: <Rgba as Layout>::RECIPE },
+                Field { offset: 16, ty: <Rgba as Layout>::RECIPE },
+            ],
+            size: 32,
+            align: 4,
+        };
+    }
+    impl Layout for Inks {
+        const RECIPE: &'static Recipe = &Recipe::Struct {
+            fields: &[
+                Field { offset: 0, ty: <Fill as Layout>::RECIPE },
+                Field { offset: 32, ty: <Fill as Layout>::RECIPE },
+            ],
+            size: 64,
+            align: 4,
+        };
+    }
+    impl Layout for HoverInk {
+        const RECIPE: &'static Recipe = &Recipe::Struct {
+            fields: &[
+                Field { offset: 0, ty: <Fill as Layout>::RECIPE },
+                Field { offset: 32, ty: <Fill as Layout>::RECIPE },
+                Field { offset: 64, ty: <u8 as Layout>::RECIPE },
+            ],
+            size: 68,
+            align: 4,
+        };
+    }
+    pub struct ApiType { pub rust: &'static str, pub recipe: &'static Recipe }
+    pub const fn api_type<T: Layout>(rust: &'static str) -> ApiType {
+        ApiType { rust, recipe: T::RECIPE }
+    }
+    const fn feed(r: &Recipe) -> usize {
+        match r {
+            Recipe::Prim { size, align } => *size + *align,
+            Recipe::Struct { fields, size, align } => {
+                let mut h = *size + *align;
+                let mut i = 0;
+                while i < fields.len() {
+                    h += fields[i].offset + feed(fields[i].ty);
+                    i += 1;
+                }
+                h
+            }
+        }
+    }
+    const fn fold(types: &[ApiType]) -> usize {
+        let mut sum = 0;
+        let mut i = 0;
+        while i < types.len() {
+            let t = &types[i];
+            sum += t.rust.as_bytes().len() + feed(t.recipe);
+            i += 1;
+        }
+        sum
+    }
+    pub const API_TYPES: &[ApiType] = &[
+        api_type::<Rgba>("Rgba"),
+        api_type::<Fill>("Fill"),
+        api_type::<Inks>("Inks"),
+        api_type::<HoverInk>("HoverInk"),
+    ];
+    const GOAL: usize = fold(API_TYPES);
+        "#,
+        // Rgba 76, Fill 204, Inks 508, HoverInk 578 (f32 8, u8 2), and 20 bytes of names.
+        1386,
     );
 }
 

@@ -10,6 +10,7 @@ mod const_args;
 mod const_bounds;
 mod const_param_ty;
 mod consteval_inference;
+mod default_binding_modes;
 mod elided_lifetime_args;
 mod fn_cache;
 mod fn_item_predicates;

@@ -1,30 +1,42 @@
 #!/usr/bin/env python3
-"""unittests.py: the crates' own tests, with the ones known to fail named.
+"""unittests.py: every test of the workspace, held to the one list of tests that may fail.
 
 usage: unittests.py [CONFIG]
 
 CONFIG is one JSON object, inline, in a file, or `-` for standard input, `{}` when left out:
 
-    {"cargo": false, "build": false, "args": ["<test argument>", ...], "max_mb": 0}
+    {"build": false, "record": false, "reached": false, "args": ["<test argument>", ...], "max_mb": 0}
 
-`max_mb`, when not 0, fails the run when the machine had more than that many megabytes of memory
-and swap in use at once while it ran (docs/memory-budget.md, the check in CI).
+Runs `blaze test --release --locked --no-fail-fast --workspace` from the root: every package of
+the workspace with its default features (blaze tests blaze, AGENTS.md rule blaze-builds-blaze),
+never a hand-kept subset, with `args` after its own. Each line of the run is passed on as it
+comes, so a CI log shows a slow build while it is slow. The run's output is kept in
+`target/known-failures/unittests.log` and held to harness/known-failures.toml by
+harness/failures.py, the only exemption there is: a failing test that is not listed there fails
+the run, and so does a listed test that passes or no longer exists (take it out: the list only
+shrinks), a test binary that does not finish, and a package none of whose test binaries ran
+(its test build failed); so does the run failing before any of its tests failed.
 
-Runs `blaze test --release --no-fail-fast` of CRATES with their default features, blaze-engine's
-`native` (LLVM among them) included (blaze tests blaze, AGENTS.md rule blaze-builds-blaze;
-`"cargo": true`: plain `cargo test`, on Windows, which has no release of blaze to test with yet), one run in the root workspace, with `args` after its own.
+`"record": true` writes harness/known-failures.toml again from the run instead of holding the
+run to it (failures.py, `recorded`): each failure of this OS with the crate, the test and the
+first line of what it said, sorted, the entries of other OSes kept. Run it once per OS the gate
+tests on, on the tree to land, and commit the list:
+
+    python3 harness/unittests.py '{"record": true}'
+
+`"reached": true` adds `--reached`: the daemon runs only the tests the change can have reached
+and reports a kept pass as cached (docs/cargo.md, "Which tests run"); the tests it leaves out are
+counted as unchecked. Not what the gate runs: it is here for a run that has to be shorter.
+
 `"build": true` is CI's build job: `blaze build` of the same packages with the same profile and
 features, so that each library it compiles has the key the test build asks for (a crate of the
 workspace is keyed by its features, by whether it is of a package named, `CARGO_PRIMARY_PACKAGE`,
-and by the keys of the crates it is built on), and the tests job takes those from the store the build job hands it
-(.github/workflows/blaze-platform.yaml). Only the crates built with `cfg(test)` are then compiled
-again. Each line of
-the run is passed on as it comes, so a CI log shows a slow build while it is slow. The run's
-output is kept in `target/known-failures/unittests.log` and held to harness/known-failures.toml
-by harness/failures.py: a failing test that is not listed there fails the run, and so does a
-listed test that passes or no longer exists (take it out), and a test binary that does not
-finish; so does the cargo run failing before any of its tests failed. Each listed failure has an
-owner and a cause. `blaze-diagnostics` is the daemon's errors (its diagnostics are the verdict).
+and by the keys of the crates it is built on), and the tests job takes those from the store the
+build job hands it (.github/workflows/blaze-platform.yaml). Only the crates built with
+`cfg(test)` are then compiled again.
+
+`max_mb`, when not 0, fails the run when the machine had more than that many megabytes of memory
+and swap in use at once while it ran (docs/memory-budget.md, the check in CI).
 """
 import dataclasses, json, os, re, shutil, signal, subprocess, sys, threading, time, typing
 
@@ -32,20 +44,11 @@ import failures
 import memory
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CRATES = [
-    "hir-ty-codegen", "blaze-cas", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "blaze-cargo", "blaze-engine",
-    "hir-ty", "hir-ty-mir", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "const-ast", "blaze-diagnostics",
-]
-CRATES += ["proc-macro-api"]
-# MIR to Charon's LLBC (vendor/charon): needs no solver or tool outside the tree, unlike hir-ty-verus.
-CRATES += ["hir-ty-charon"]
-
-# The failures known, each with its owner and cause: harness/known-failures.toml (failures.py).
+# The tests that may fail: harness/known-failures.toml (failures.py).
 
 COLOR = re.compile(r"\x1b\[[0-9;]*m")
-# A test binary is `deps/<name>-<hash>` in cargo's first layout of the build directory and
-# `build/<package>/<hash>/out/<name>-<hash>` in its second (nightly cargo's default); blaze names
-# it `deps/<name>-<hash>` too, a bin's name with its dashes.
+# A test binary is `deps/<name>-<hash>` in the build directory's first layout and
+# `build/<package>/<hash>/out/<name>-<hash>` in its second, a bin's name with its dashes.
 RUNNING = re.compile(r"^\s+Running .*[/\\](?:deps|out)[/\\]([\w-]+?)-[0-9a-f]{16}\b")
 DOCTESTS = re.compile(r"^\s+Doc-tests (\w+)")
 RESULT = re.compile(r"^test (\S+)(?: - .*)? \.\.\. (ok|FAILED|ignored)")
@@ -209,7 +212,7 @@ class Watch:
 
 
 def run(command, cwd, env, seen, failed, watch_dirs, log):
-    """Runs one `cargo test`, adding its tests to seen and failed and its output to `log`;
+    """Runs one `blaze test`, adding its tests to seen and failed and its output to `log`;
     returns its exit status, whether any of its tests failed and its `Watch`."""
     print(" ".join(command), flush=True)
     proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
@@ -239,10 +242,12 @@ def read(proc, seen, failed, kept):
 
 @dataclasses.dataclass(frozen=True)
 class Config:
-    # Plain `cargo test`, where there is no release of blaze to test with (Windows).
-    cargo: bool = False
     # `blaze build` of what the tests are built on, and no tests: CI's build job.
     build: bool = False
+    # Write harness/known-failures.toml again from the run, instead of holding the run to it.
+    record: bool = False
+    # `--reached`: only the tests the change can have reached.
+    reached: bool = False
     # Passed after the command's own arguments.
     args: list = dataclasses.field(default_factory=list)
     # The most memory and swap the machine may have in use at once, in MB; 0 is no bound.
@@ -275,28 +280,25 @@ def config(argv: list[str]) -> Config:
 
 def main():
     cfg = config(sys.argv[1:])
-    plain, args = cfg.cargo, cfg.args
-    if cfg.build and plain:
-        sys.exit("unittests.py: `build` is blaze's build, not cargo's")
-    packages = [f"-p{c}" for c in CRATES]
-    if plain:
-        command = ["cargo", "test", "--release", "--no-fail-fast", *packages, *args]
-    else:
-        verb = ["build"] if cfg.build else ["test", "--no-fail-fast"]
-        command = ["blaze", *verb, "--release", "--locked", *packages, *args]
+    args = cfg.args
+    if cfg.build and (cfg.record or cfg.reached):
+        sys.exit("unittests.py: `build` runs no test: it takes no `record` or `reached`")
+    if cfg.record and cfg.reached:
+        sys.exit("unittests.py: `record` writes the list from every test, so it takes no `reached`")
+    verb = ["build"] if cfg.build else ["test", "--no-fail-fast", *(["--reached"] if cfg.reached else [])]
+    command = ["blaze", *verb, "--release", "--locked", "--workspace", *args]
     # Under CI rust-analyzer's slow tests run, and mark that they did in the target directory.
     env = {"CARGO_TARGET_DIR": os.path.join(ROOT, "target"), **os.environ}
     # blaze's frames are larger than rustc's, and blaze-diagnostics' 5204-arm test overflows the
     # 2 MiB a test thread has, which aborts its whole program
     # (https://github.com/indexable-inc/blaze/issues/894). Not a `--skip`: an argument to the
     # tests has blaze run every test, not those an edit reached.
-    if not plain:
-        env.setdefault("RUST_MIN_STACK", str(16 << 20))
+    env.setdefault("RUST_MIN_STACK", str(16 << 20))
     seen, failed = set(), set()
     watch_dirs = [ROOT, *(d for d in [os.environ.get("BLAZE_CACHE"), "/mnt"] if d)]
     log = os.path.join(env["CARGO_TARGET_DIR"], "known-failures", "unittests.log")
     os.makedirs(os.path.dirname(log), exist_ok=True)
-    status, any_failed, watch = run(command, ROOT, env, seen, failed, watch_dirs, log)
+    status, _, watch = run(command, ROOT, env, seen, failed, watch_dirs, log)
     sys.stdout.flush()
     took = (time.monotonic() - watch.began) / 60
     peak = f"{watch.peak / 1024:.1f} GB of memory and swap in use on the machine at most" if watch.at_peak else "no memory reading on this platform"
@@ -310,14 +312,31 @@ def main():
         print(f"::error::the machine had {watch.peak} MB of memory and swap in use at once, over the {cfg.max_mb} MB bound (max_mb; docs/memory-budget.md)")
     if cfg.build:
         sys.exit(status or (1 if over else 0))
+    context = failures.Context("release", failures.this_os())
+    asked = failures.workspace_packages()
+    logged = failures.Path(log)
+    if cfg.record:
+        if not seen:
+            print(f"::error::{' '.join(command)} (exit status {status}) ran no test: nothing to record; the build, most likely")
+            sys.exit(1)
+        print(f"\n{len(seen)} tests, {len(failed)} failed; harness/known-failures.toml written from them:", flush=True)
+        try:
+            for line in failures.record([logged], context, asked, " ".join(command)):
+                print(line)
+        except failures.Refused as e:
+            print(f"::error::harness/failures.py: {e}")
+            sys.exit(1)
+        sys.exit(1 if over else 0)
     print(f"\n{len(seen)} tests, {len(failed)} failed; held to harness/known-failures.toml:", flush=True)
-    context = failures.Context("cargo" if plain else "blaze", "release", failures.this_os())
     try:
-        held = failures.check([failures.Path(log)], context, report=failures.Path(log).with_suffix(".json"))
+        verdict = failures.checked([logged], context, report=logged.with_suffix(".json"), asked=asked)
     except failures.Refused as e:
         print(f"::error::harness/failures.py: {e}")
         sys.exit(1)
-    if status and not any_failed:
+    held = not verdict.failed
+    # A run that failed with nothing the list accounts for (no failing test, no binary that did
+    # not finish, no package that did not build its tests) failed some other way.
+    if status and held and not verdict.known:
         print(f"::error::{' '.join(command)} failed (exit status {status}) before any test failed: the build, most likely")
         sys.exit(1)
     sys.exit(0 if held and not over else 1)

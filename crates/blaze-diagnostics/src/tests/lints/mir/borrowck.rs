@@ -516,7 +516,7 @@ fn main() {{}}
 }
 
 /// E0320 of a local whose type nests `Option` past the recursion limit around a projection
-/// the drop check cannot see through (`/tmp/blaze-lanes/v2-quadratic/param140.rs`, cut to the
+/// the drop check cannot see through (a chain of 140 such `let`s, cut to the
 /// first refusal): rustc's message with its type abbreviated by `short_string`, its note of
 /// what overflowed, and the body, the limit and a raised limit to try.
 #[test]

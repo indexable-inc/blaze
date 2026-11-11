@@ -51,7 +51,7 @@ pub use provenance::{
     take_log_in,
 };
 pub use slot::{Filled, Slot, SlotClaim, SlotError, SlotName, SlotRefused};
-pub use storage::{Database, Durability, Hook, Storage, View};
+pub use storage::{Database, Durability, Hook, Storage, Unread, View};
 pub use value::Value;
 
 /// What generated code calls: the ingredient traits, their statics' vtables, and the typed
@@ -60,7 +60,9 @@ pub mod plumbing {
     pub use blaze_mem::Tag;
 
     pub use super::{
-        function::{CycleKind, Function, MAX_ROUNDS, evict_values, evict_values_of, fetch},
+        function::{
+            CycleKind, Function, MAX_ROUNDS, durable, evict_values, evict_values_of, fetch,
+        },
         ingredient::{Ingredient, Kind, Vtable},
         input::{
             Input, InputSetter, input_fields, input_new, input_new_singleton, input_read,
@@ -415,13 +417,111 @@ impl fmt::Display for Runaway {
 
 impl std::error::Error for Runaway {}
 
-/// The text of an unwind the engine raised ([`Runaway`], [`OutOfFuel`], [`OutOfSteps`],
-/// [`Cancelled`]), for a host reporting a job's panic; `None` for any other payload (a
-/// `panic!`'s text is `stdx::panic_text`'s).
+/// Why a query unwound when asked for a key its database never gave: no ingredient owns the
+/// key's page, so its row would sit in a page no sweep or drop can name. It fails its job
+/// alone, as a panic would (rule 20), and a host reports this text ([`unwind_text`]).
+///
+/// It names what the next occurrence needs to find where the key came from (the first one,
+/// 2026-11-09, `FunctionSignature::kept` asked for `Id(0)` once while compiling a crate, said
+/// only its query): the query that asked on the task's stack, the view, how many pages the
+/// database had given, the thread, and the call stack of the ask. A key of 0 is no ID:
+/// [`Id::new`] refuses it, so safe code cannot hold one, and it was read as an ID out of
+/// memory that was zero (a row, an interned value or a record read before its writer filled
+/// it, or after its memory was let go). Any other is an ID of another database, or a word
+/// decoded without [`Id::decode`] and its page's owner.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NeverGiven {
+    pub query: &'static str,
+    /// The key's bits.
+    pub key: u32,
+    pub page: usize,
+    /// The bound of the pages the database had given: its IDs' pages are from 1 to below it.
+    pub pages: usize,
+    /// The database's view, as its rows' `verified` words hold it.
+    pub view: u32,
+    /// The query running or verifying on top of the task's query stack, with its key: the
+    /// one whose code asked. `None` when the ask came from outside any query.
+    pub asker: Option<String>,
+    /// The queries running or verifying on the task's stack.
+    pub frames: usize,
+    pub thread: String,
+    /// The call stack of the ask ([`std::backtrace::Backtrace::force_capture`]).
+    pub backtrace: String,
+}
+
+impl fmt::Display for NeverGiven {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let NeverGiven { query, key, page, pages, view, asker, frames, thread, backtrace } = self;
+        write!(
+            f,
+            "`{query}` was asked for the key Id({key}), an ID this database never gave (its page \
+             {page} has no owner; every page this database gave is from 1 to below {pages}, and \
+             it is at view {view}): "
+        )?;
+        match *key {
+            0 => f.write_str(
+                "0 is no ID, and `Id::new` never makes it, so it was read as an ID out of memory \
+                 that was zero: a row, an interned value or a record read before its writer \
+                 filled it, or after its memory was let go",
+            )?,
+            _ => f.write_str(
+                "a key of another database, forged, or decoded without checking its page's owner",
+            )?,
+        }
+        match asker {
+            Some(asker) => write!(
+                f,
+                "; asked by {asker}, the top of the {frames} queries on its task's query stack"
+            )?,
+            None => f.write_str("; asked from outside any query")?,
+        }
+        write!(f, ", on thread `{thread}`; the call stack of the ask:\n{backtrace}")
+    }
+}
+
+impl std::error::Error for NeverGiven {}
+
+/// Unwinds with a [`NeverGiven`]: ingredient `index` was asked for the key `id`, whose page no
+/// ingredient owns. The asking query's key is written with a barrier on top of the task's
+/// stack, as [`unwind_runaway`]'s names are.
+#[cold]
+#[inline(never)]
+pub(crate) fn never_given(storage: &Storage, index: u32, id: Id) -> ! {
+    let (asker, frames) = local::with(|local| (local.top_query(), local.task_frames()));
+    let barrier = local::barrier();
+    let asker = asker.map(|(ingredient, bits)| {
+        let name = ingredient::name(ingredient);
+        match Id::new(bits) {
+            Some(key) => format!("`{name}` of {}", key_text(storage, ingredient, key)), // alloc: an error's text, once
+            None => format!("`{name}` of the key {bits}, which is no ID either"), // alloc: as above
+        }
+    });
+    drop(barrier);
+    let thread = std::thread::current();
+    let out = NeverGiven {
+        query: ingredient::name(index),
+        key: id.as_u32(),
+        page: id.page(),
+        pages: storage.pages_made(),
+        view: storage.view_bits(),
+        asker,
+        frames,
+        thread: thread.name().unwrap_or("(unnamed)").to_owned(), // alloc: an error's text, once
+        backtrace: std::backtrace::Backtrace::force_capture().to_string(), // alloc: as above
+    };
+    tracing::error!(target: "blaze", never_given = %out, "a query was asked for a key its database never gave and fails");
+    std::panic::resume_unwind(Box::new(out)) // alloc: an unwind's payload
+}
+
+/// The text of an unwind the engine raised ([`Runaway`], [`NeverGiven`], [`OutOfFuel`],
+/// [`OutOfSteps`], [`Cancelled`]), for a host reporting a job's panic; `None` for any other
+/// payload (a `panic!`'s text is `stdx::panic_text`'s).
 // dyn: a panic's payload, read once per panicked job
 pub fn unwind_text(payload: &(dyn std::any::Any + Send)) -> Option<String> {
     // alloc: an error's text, once per panicked job
     if let Some(it) = payload.downcast_ref::<Runaway>() {
+        Some(it.to_string())
+    } else if let Some(it) = payload.downcast_ref::<NeverGiven>() {
         Some(it.to_string())
     } else if let Some(it) = payload.downcast_ref::<OutOfFuel>() {
         Some(it.to_string())

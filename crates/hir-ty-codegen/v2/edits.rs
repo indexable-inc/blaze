@@ -481,15 +481,17 @@ fn verdict(
         &function,
         &mut out,
     );
-    each_apart(
-        "the symbol",
-        &map(inc.symbols.iter().cloned()),
-        &map(cl.symbols.iter().cloned()),
-        &function,
-        &mut out,
-    );
+    // A symbol and how it is defined: an edit that makes a definition weak is a difference.
+    let symbols = |built: &Built| {
+        // clone: the report's own copy of each name, once per comparison
+        map(built.symbols.iter().map(|(key, name, linkage)| (*key, (name.clone(), *linkage))))
+    };
+    each_apart("the symbol", &symbols(inc), &symbols(cl), &function, &mut out);
     let static_symbols = |built: &Built| {
-        map(built.static_symbols.iter().map(|(item, id, name)| ((*item, *id), name.clone())))
+        map(built.static_symbols.iter().map(|(item, id, name, linkage)| {
+            // clone: the report's own copy of each name, once per comparison
+            ((*item, *id), (name.clone(), *linkage))
+        }))
     };
     each_apart(
         "the static symbol",

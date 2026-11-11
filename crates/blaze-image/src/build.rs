@@ -1,5 +1,5 @@
 //! Writing an image: sections appended in order, each from a group boundary, then the CRC table
-//! and the spine. The bytes go to disk as one `blaze_core::Effect::Write` (a temporary file,
+//! and the spine. The bytes go to disk through [`crate::place::Placer`] (a file beside the image,
 //! synced, renamed over the old image), so no reader sees a part of them.
 
 #![forbid(unsafe_code)]

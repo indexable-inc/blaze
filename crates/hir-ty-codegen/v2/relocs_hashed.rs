@@ -271,7 +271,7 @@ const CORPUS: &[(&str, &str)] = &[
          #[repr(C, packed(2))] pub struct Pk<X: ?Sized>(pub u16, pub core::mem::ManuallyDrop<Wrap2<X>>);\n\
          static PK: &Pk<dyn Tr + Sync> = &Pk(1, core::mem::ManuallyDrop::new(Wrap2(&77, Holder(&A(9)))));",
     ),
-    // The key review's (`/tmp/blaze-lanes/v2-xcheck-review.md`, C1 and C2): values whose bytes
+    // The key review's cases C1 and C2: values whose bytes
     // an edit keeps and whose emitted code it changes.
     (
         "which_static",

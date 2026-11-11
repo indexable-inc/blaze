@@ -1035,12 +1035,21 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             fs::write_atomically(path, &bytes)?;
             Ok(Done::Written)
         }),
+        // No sync of the file or its directory: derived data, checked by its reader.
+        Effect::WriteUnsynced { file, bytes, .. } => at(root, &file, |path| {
+            fs::write_unsynced(path, &bytes)?;
+            Ok(Done::Written)
+        }),
         Effect::WriteAt { file, at: offset, bytes, .. } => at(root, &file, |path| {
             fs::write_at(path, offset, &bytes)?;
             Ok(Done::Written)
         }),
         Effect::Rename { from, to, .. } => at(root, &from, |from| {
             at(root, &to, |to| fs::rename(from, to))?;
+            Ok(Done::Renamed)
+        }),
+        Effect::RenameUnsynced { from, to, .. } => at(root, &from, |from| {
+            at(root, &to, |to| fs::rename_unsynced(from, to))?;
             Ok(Done::Renamed)
         }),
         Effect::Mode { file, mode, .. } => at(root, &file, |path| {

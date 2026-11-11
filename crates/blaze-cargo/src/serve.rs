@@ -1094,6 +1094,11 @@ pub(crate) fn engine(
     // Read once: the explorer and live SQL run this DuckDB; set wrong, the daemon does not start.
     let duckdb =
         observe::duckdb(std::env::var_os(observe::DUCKDB)).map_err(|why| anyhow::anyhow!(why))?;
+    // Unset: the pinned DuckDB, where a reader of the history has laid it out (`cli/duckdb.rs`
+    // fetches it on first use; the daemon's start fetches nothing).
+    let duckdb = duckdb.or_else(|| {
+        observe::Pin::host().map(|pin| pin.laid_out(&paths.state)).filter(|it| it.is_file())
+    });
     // Read once: what the history writes of DEBUG events (`BLAZE_HISTORY_LEVEL`, docs/profiling.md);
     // a value that names no level stops the daemon, naming it.
     let events = blaze_profile::logs::Policy::from_env().map_err(|why| anyhow::anyhow!(why))?;

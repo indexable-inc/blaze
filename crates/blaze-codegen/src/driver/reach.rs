@@ -154,25 +154,29 @@ impl Reach {
     pub(super) fn of(&self, root: &InstanceKey) -> Option<Vec<CodeHash>> {
         let root = self.functions.binary_search(root).ok()? as u32;
         let nodes = self.marks.len();
-        // alloc: per call, a bit per node
-        let mut seen = vec![0u64; nodes.div_ceil(64)];
-        // alloc: per call, sized by what it reaches
-        let mut stack = vec![root];
-        seen[root as usize / 64] |= 1 << (root % 64);
-        // alloc: per call, sized by what it reaches
+        // alloc: per call, the result, sized by what it reaches
         let mut marks = Vec::new();
-        while let Some(at) = stack.pop() {
-            marks.extend(self.marks[at as usize].map(CodeHash));
-            let edges = &self.edges
-                [self.starts[at as usize] as usize..self.starts[at as usize + 1] as usize];
-            for &next in edges {
-                let (word, bit) = (next as usize / 64, 1u64 << (next % 64));
-                if seen[word] & bit == 0 {
-                    seen[word] |= bit;
-                    stack.push(next);
+        // The walk's bit per node and its stack are the call's alone: in a frame of its own,
+        // gone as it returns (a bit per node from the global heap for each root asked was the
+        // build's nodes squared, in bits, allocated and freed).
+        blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
+            let seen = frame.alloc_slice_fill_with(nodes.div_ceil(64), |_| 0u64);
+            let mut stack = Vec::new_in(frame);
+            stack.push(root);
+            seen[root as usize / 64] |= 1 << (root % 64);
+            while let Some(at) = stack.pop() {
+                marks.extend(self.marks[at as usize].map(CodeHash));
+                let edges = &self.edges
+                    [self.starts[at as usize] as usize..self.starts[at as usize + 1] as usize];
+                for &next in edges {
+                    let (word, bit) = (next as usize / 64, 1u64 << (next % 64));
+                    if seen[word] & bit == 0 {
+                        seen[word] |= bit;
+                        stack.push(next);
+                    }
                 }
             }
-        }
+        });
         marks.sort_unstable();
         marks.dedup();
         Some(marks)

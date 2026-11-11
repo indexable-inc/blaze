@@ -727,7 +727,7 @@ mod budget {
         let mut sim = Sim::new(5, Faults::default());
         let mut effects = Vec::new();
         let config =
-            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
+            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped };
         let mut store = Store::open(config, &mut effects);
         run_until_idle(&mut sim, &mut effects, |completion, effects| {
             store.complete(completion, effects);
@@ -781,7 +781,7 @@ mod budget {
         let mut sim = Sim::new(5, Faults::default());
         let mut effects = Vec::new();
         let config =
-            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
+            Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48, load_tags: (1 << 48) + (1 << 32), loader: blaze_cas::Loader::Pumped };
         let mut store = Store::open(config, &mut effects);
         run_until_idle(&mut sim, &mut effects, |completion, effects| {
             store.complete(completion, effects);

@@ -170,8 +170,10 @@ mod why {
                                          `cargo:rustc-link-search`";
     pub(super) const WEAK: &str = "blaze's linker has no weak or re-exported library on its link line \
                                    yet (`LC_LOAD_WEAK_DYLIB`, `LC_REEXPORT_DYLIB`)";
-    pub(super) const EXPORT_DYNAMIC: &str = "blaze's linker exports no symbols of an executable, and \
-                                             a shared library exports what its crate exports";
+    pub(super) const EXPORT_DYNAMIC: &str = "blaze's linker exports from an executable only the \
+                                             symbols a shared library it links also defines or \
+                                             refers to (ELF), and a shared library exports what \
+                                             its crate exports";
     pub(super) const SCRIPT: &str = "blaze's linker reads only the linker scripts system libraries \
                                      ship (`GROUP`, `INPUT`, `AS_NEEDED`), not a layout script";
     pub(super) const STATIC: &str = "blaze links a dynamic, position-independent image with the C \

@@ -18,6 +18,16 @@ pub fn request(envelope: &Envelope<Request>) -> String {
     line(envelope)
 }
 
+/// The request `text` is in this rendering: what a foreign caller (blaze-client's C ABI and
+/// Node-API addon) hands over, a `Request` as [`request`] writes an envelope's body. Bytes are
+/// arrays of numbers, as they are written. Refused naming what the JSON said wrong.
+pub fn request_of(text: &[u8]) -> Result<Request, crate::ApiError> {
+    sonic_rs::from_slice(text).map_err(|error| {
+        // alloc: error path, a request that does not parse.
+        crate::ApiError::new(format!("a request that is not the API's JSON: {error}"), None)
+    })
+}
+
 fn line<T: Serialize>(envelope: &Envelope<T>) -> String {
     // alloc: the line handed out is the buffer written into; `from_utf8` only checks it.
     let mut out = Vec::new();

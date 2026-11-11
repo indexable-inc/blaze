@@ -1,7 +1,7 @@
 //! Every method call and overloaded call records the function it calls, with the receiver's
 //! type as the first argument: `s.area()` of `s: &dyn Shape` is `<dyn Shape as Shape>::area`,
-//! `f(1)` of `f: &dyn Fn(u32) -> u32` is `<dyn Fn(u32) -> u32 as Fn>::call` (queue 01277:
-//! blaze-lints' `hot_dyn` found only `Shape::area(s)`).
+//! `f(1)` of `f: &dyn Fn(u32) -> u32` is `<dyn Fn(u32) -> u32 as Fn>::call`
+//! (blaze-lints' `hot_dyn` found only `Shape::area(s)`).
 
 use hir_def::{
     DefWithBodyId, ModuleDefId, expr_store::Body, hir::Expr, nameres::crate_def_map,

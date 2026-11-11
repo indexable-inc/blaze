@@ -336,7 +336,7 @@ fn two_closures_of_one_signature_keep_their_own_bodies() {
 /// of before it runs the C compiler: `fetch_update(AcqRel, Acquire, |t| t.checked_sub(1))` on
 /// an `AtomicU32` of `NUM_JOBS`, retried after a `YieldOnce` on a no-op waker, and given back
 /// when `retain_mut` drops a finished job's token. ring's and zstd-sys's build scripts, built by
-/// blaze, compiled `NUM_JOBS` objects and then slept in cc's `block_on` forever (queue 01523):
+/// blaze, compiled `NUM_JOBS` objects and then slept in cc's `block_on` forever:
 /// the MIR inliner inlined `drop_in_place`'s `drop_glue`, a placeholder, so `retain_mut`
 /// dropped nothing it removed. Each step is checked on its own, in the build script and in the
 /// program.
@@ -406,6 +406,19 @@ fn a_program_splitting_on_ascii_whitespace_builds() {
 fn a_promoted_temporary_with_its_place_in_it_runs() {
     let case = Case::new("a_promoted_temporary_with_its_place_in_it_runs");
     assert_eq!(case.ok(&["run"]), "main.rs:16\nmain.rs:11\n");
+}
+
+/// An `async` body with an `.await` in a branch a constant condition rules out (`if F::ON { ..
+/// .await }` of an associated constant, or of a `const`) builds and runs: the branch's blocks are
+/// not compiled, so its yield has no arm in the switch that resumes or drops the future. Each
+/// `.await` that runs suspends once, and the last future is dropped suspended.
+#[test]
+fn an_await_a_constant_condition_rules_out_builds() {
+    let case = Case::new("an_await_a_constant_condition_rules_out_builds");
+    assert_eq!(
+        case.ok(&["run"]),
+        "dropped early\ndropped early\n(7, 2) (8, 2)\n(2, 1) (7, 2)\n(8, 2)\ndropped early\n"
+    );
 }
 
 /// sqlx's `#[sqlx::test(migrations = "..")]` passes `&Migrator { migrations: Cow::Borrowed(const
@@ -630,6 +643,23 @@ fn a_proc_macro_package_tests_build() {
     for test in ["the_lib_test_runs", "the_macro_expands"] {
         assert!(said.contains(&format!("test {test} ... ok")), "`{test}` did not pass:\n{said}");
     }
+}
+
+/// `#[blaze::contract_test]` (docs/v2/plan/design/contracts.md, part 2): a function whose
+/// `#![no_std]` proc-macro crates of every edition, an attribute macro among them (as
+/// multiversion_no_op's), and one that declares its own `extern crate std`, each built as a
+/// wasm module and expanded: the glue blaze appends to a macro crate's root names std only
+/// through its own `extern crate std as __blaze_std`, so a crate whose extern prelude has no
+/// `std`, or that already declares one, builds.
+#[test]
+fn a_no_std_proc_macro_expands() {
+    let case = Case::new("a_no_std_proc_macro_expands");
+    let out = case.ok_in("", &["test"]);
+    let said = format!("{}{}", out.stdout, out.stderr);
+    assert!(
+        said.contains("test every_no_std_macro_expands ... ok"),
+        "`every_no_std_macro_expands` did not pass:\n{said}"
+    );
 }
 
 /// `#[blaze::contract_test]` (docs/v2/plan/design/contracts.md, part 2): a function whose

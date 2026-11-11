@@ -21,7 +21,7 @@ use blaze_live::patch::{Answer, Message, MessageView};
 use blaze_units::schema::Mode;
 use blaze_units::stdlib::DEV_RUNTIME;
 
-use crate::serve::unit::{Job, codegen, compile::output_key, graph::flag};
+use crate::serve::unit::{Job, codegen, compile::linked_key, graph::flag};
 use blaze_live::patch::ask::{
     self, ANSWER, ANSWERED, NO_PATCH, NO_TIERS, PATCH, PATCH_ASK, TIERS_ASK,
 };
@@ -415,6 +415,17 @@ fn hold(
     replaced
 }
 
+/// The store's key of the file `image`'s last commit left in its code memory, by the linker's
+/// digest of it (`compile::linked_key`): the blocks the commit wrote are hashed, never the
+/// file. The invariant: the image part of a dev executable's code memory is written only by
+/// [`Image::commit_into`] and [`Image::roll_back_into`], which write there what a file commit
+/// writes its file, so the memory's first `len` bytes are the file the digest names. The
+/// unit's record files the same bytes under the same key (`codegen::link`).
+fn file_key(name: &str, image: &mut Image) -> Result<Key, String> {
+    let root = image.digest().map_err(|it| format!("the digest of `{name}`'s file: {it}"))?;
+    Ok(linked_key(&root))
+}
+
 /// The newest patch of a program's image, for the runs that ask; `generation` is the last
 /// committed into the memory, with or without a message.
 #[derive(Default)]
@@ -470,7 +481,7 @@ pub(crate) fn load(
     memory.lay_out(format).map_err(|it| format!("laying `{name}`'s code memory out: {it}"))?;
     // alloc: once per dev executable linked, the bytes the store keeps.
     let bytes = memory.bytes(CodeRange { offset: 0, len }).map_err(|it| it.to_string())?.to_vec();
-    let file = host::Image { key: output_key(&bytes).0.0, len, store: None };
+    let file = host::Image { key: file_key(name, image)?.0.0, len, store: None };
     let loaded = held(host, name, memory, file, generation, image.lineage())?;
     Ok((loaded, bytes))
 }
@@ -606,7 +617,7 @@ impl Loaded {
         // alloc: once per patch, the bytes the store keeps.
         let bytes =
             memory.bytes(CodeRange { offset: 0, len }).map_err(|it| it.to_string())?.to_vec();
-        let file = host::Image { key: output_key(&bytes).0.0, len, store: None };
+        let file = host::Image { key: file_key(name, image)?.0.0, len, store: None };
         self.program.relaid(&memory, file).map_err(|it| format!("`{name}`: {it}"))?;
         let told = match &message {
             None => Told::Nothing,

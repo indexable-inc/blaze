@@ -1,5 +1,5 @@
 //! Where a source file is: on disk ([`AbsPathBuf`]) or virtual (a `/`-separated path no disk
-//! has: blaze-wasm's packed sources, a test's database), and paths relative to a file
+//! has: a test's database), and paths relative to a file
 //! ([`AnchoredPath`]), as `#[path]`, `mod` and `include!` name them.
 use std::fmt;
 

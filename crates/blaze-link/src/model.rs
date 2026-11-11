@@ -805,6 +805,10 @@ pub(crate) struct Shared {
     /// Objects and archives a linker script adds (`libc_nonshared.a`): the caller reads
     /// these by name as further inputs.
     pub inputs: Vec<String>,
+    /// ELF: the names it refers to and leaves undefined, global or weak, in
+    /// [`Shared::names`]: an executable that defines one exports it, as it does a name the
+    /// library defines ([`Exported`]).
+    pub undefined: Vec<Name>,
 }
 
 impl Shared {
@@ -874,14 +878,35 @@ pub(crate) struct Bind {
     pub addend: i64,
 }
 
-/// A name the image defines for the loader and other modules: `main` of a PIE that a
-/// shared library calls back, every export of a shared library, the live descriptor.
+/// A name the image defines for the loader and other modules: every export of a shared
+/// library, a name an ELF executable defines that a shared library it links also defines or
+/// refers to (`malloc`, which the loader then binds the library's own calls to), the live
+/// descriptor.
 #[derive(PartialEq, Eq, Debug)]
 pub(crate) struct Export {
     pub name: String,
     pub addr: u64,
     pub size: u64,
     pub kind: SymbolKind,
+    /// ELF: bound weakly (`STB_WEAK`), as its definition is.
+    pub weak: bool,
+}
+
+/// A name resolution has the image export, an [`Export`] once it is placed: a COFF
+/// `/EXPORT` directive's, or a name an ELF executable defines that a shared library on its
+/// link line defines or leaves undefined.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: per graph built, not per item: `Arc::make_mut` of a list nothing shares yet
+pub(crate) struct Exported {
+    pub name: String,
+    /// The symbol it is.
+    pub symbol: String,
+    /// Data whatever it is defined in (`/EXPORT:name=symbol,DATA`).
+    pub data: bool,
+    /// Its definition is weak.
+    pub weak: bool,
+    /// The type and size its definition states (an ELF object's symbol); without them, those
+    /// of the piece it is in.
+    pub own: Option<(SymbolKind, u64)>,
 }
 
 /// A placed function, for the unwind tables and the debug info.

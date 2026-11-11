@@ -245,7 +245,8 @@ pub fn toolchain_file(dir: &Path) -> Option<PathBuf> {
 /// Says, under `-v`, that the toolchain file nearest `dir` is not followed: one line, since
 /// nothing about the build depends on it.
 pub fn say_toolchain_file(dir: &Path, verbose: bool) {
-    if let Some(file) = toolchain_file(dir).filter(|_| verbose) {
+    // Looked for only when it is to be said: two stats a directory above `dir` otherwise.
+    if verbose && let Some(file) = toolchain_file(dir) {
         eprintln!(
             "blaze: {} is ignored: blaze builds with its own Rust, {} ({})",
             file.display(),

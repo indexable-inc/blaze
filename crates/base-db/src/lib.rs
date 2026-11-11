@@ -453,6 +453,9 @@ impl IncludedFile {
     /// The file at `path` read from disk now, as the front end reads a file outside the VFS
     /// ([`Files::included_file`] reads the path its view has it at).
     pub fn read_now(path: &std::path::Path) -> Result<std::sync::Arc<[u8]>, ReadError> {
+        // Read from the disk every time, and counted as a look at it: no watch vouches for
+        // the file (`blaze_vfs::outside::looks`).
+        blaze_vfs::outside::looked(path);
         std::fs::read(path).map(Into::into).map_err(|it| ReadError::of(&it))
     }
 

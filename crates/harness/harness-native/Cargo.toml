@@ -41,6 +41,8 @@ harness-native-ui-draw = { path = "../harness-native-ui-draw" }
 harness-native-ui-prims = { path = "../harness-native-ui-prims" }
 harness-native-ui-view = { path = "../harness-native-ui-view" }
 harness-native-render = { path = "../harness-native-render" }
+# Edits to the app's own code while it runs under `blaze run` (src/app/live.rs).
+blaze-live = { path = "../../blaze-live" }
 hyperion-ecs = { path = "../vendor/hyperion-ecs", features = ["pipeline", "meta"] }
 hyperion-flecs-c = { path = "../vendor/hyperion-flecs-c", features = ["prefab", "constraint_traits", "pipeline", "script", "script_input", "rest"] }
 harness-vt = { path = "../harness-vt" }

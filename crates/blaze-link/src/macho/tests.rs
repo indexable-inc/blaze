@@ -855,6 +855,7 @@ fn hello(output: Output) -> Parts {
             addr: TEXT,
             size: 8,
             kind: SymbolKind::Function,
+            weak: false,
         }],
         functions: vec![
             Function { addr: TEXT, size: 4, fde: None, windows: None, name: Some("main".into()) },

@@ -16,7 +16,7 @@
 //!   append made the file. One that fails is cut back to the length before it, and the build is
 //!   marked a gap in memory and in [`GAP`], a file beside the ledger that survives a restart;
 //!   from then on each build writes the whole ledger, until one succeeds and the gap is gone.
-//! - **Compaction**: the whole ledger, its oldest subjects dropped past [`super::CAP_BYTES`],
+//! - **Compaction**: the whole ledger, its oldest subjects shrunk to tombstones past [`super::CAP_BYTES`],
 //!   written to a hidden file, synced, renamed over the ledger and the directory synced, once
 //!   the file is past [`super::COMPACT_MIN`] and twice its last whole write (or holds appends a
 //!   restart found, whose whole size it can't know).
@@ -158,6 +158,17 @@ impl File {
     ) -> (Vec<Rebuild>, Vec<MissRow>, Vec<u8>) {
         let _span = tracing::info_span!(target: "blaze", "explain a build's misses", build, misses = misses.len()).entered();
         let explained = self.ledger.explain(build, ended_well, misses);
+        // A step with no recorded reason is a bug in blaze: counted where the profile sees it.
+        let unexplained = explained
+            .rebuilt
+            .iter()
+            .filter(|it| {
+                it.ends.iter().any(|end| matches!(end, blaze_api::Reason::Unexplained { .. }))
+            })
+            .count();
+        if unexplained > 0 {
+            tracing::warn!(target: "blaze", build, unexplained, "blaze why has no recorded reason for steps this build recomputed, which is a bug in blaze: `blaze why --unexplained` lists them");
+        }
         (explained.rebuilt, explained.rows, explained.record)
     }
 
@@ -404,7 +415,7 @@ impl File {
         let _span = tracing::info_span!(target: "blaze", "compact blaze why's ledger", len = self.len, live = self.live).entered();
         let dropped = self.ledger.prune(super::CAP_BYTES);
         if dropped > 0 {
-            tracing::info!(target: "blaze", dropped, "blaze why's ledger dropped its oldest subjects to stay under its cap");
+            tracing::info!(target: "blaze", dropped, "blaze why's ledger shrank its oldest subjects to tombstones, or removed its oldest tombstones, to stay under its cap");
         }
         let bytes = self.ledger.file();
         let written = write_whole(&self.dir, &self.path, &bytes);
@@ -765,8 +776,11 @@ mod tests {
                 ("codegen dev template".to_owned(), ContentId([1; 32])),
                 super::super::Last {
                     key: ContentId([1; 32]),
+                    ends: Vec::new(),
+                    item: "app::f".to_owned(),
                     kept: None,
                     step: "codegen dev template".to_owned(),
+                    tomb: false,
                     build: 7,
                     parts: Vec::new(),
                     beyond: None,

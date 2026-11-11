@@ -1785,7 +1785,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 Ok(Some(current))
             }
             Expr::Const(id) => {
-                // Inline const blocks (`const { .. }`) are stored with their inner expression in
+                // A block that is not a constant of its own here (`inline_const_at`: this body
+                // is the block's own constant, or another anonymous constant's). Inline const
+                // blocks (`const { .. }`) are stored with their inner expression in
                 // the same body (see inference, which infers the inner expression directly), so we
                 // lower that expression in place. Const-ness is irrelevant here: MIR evaluation
                 // already runs in a const context.
@@ -2677,11 +2679,12 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         Ok(())
     }
 
-    /// A function's `const { .. }` block as the constant it is, evaluated for each instance of
-    /// the function as rustc's inline consts are: what only runs at compile time
-    /// (`#[rustc_comptime]`, `type_info`'s intrinsics) is then never code of the function. The
-    /// block of a constant's own body is lowered in place, as it is already evaluated. The
-    /// constant is the `const { .. }` expression, which owns the block's bindings.
+    /// An item's `const { .. }` block as the constant it is, evaluated for each instance of
+    /// the item as rustc's inline consts are: what only runs at compile time
+    /// (`#[rustc_comptime]`, `type_info`'s intrinsics) is then never code of a function, and a
+    /// block in a constant's or static's value has its own count of `long_running_const_eval`'s
+    /// steps ([`inline_const_at`]). The block of the constant's own body is lowered in place.
+    /// The constant is the `const { .. }` expression, which owns the block's bindings.
     fn inline_const(&self, expr: ExprId) -> Option<AnonConstId<'db>> {
         inline_const_at(self.db, self.owner, self.infer, expr)
     }
@@ -4865,9 +4868,17 @@ fn cast_kind<'db>(db: &'db Db, source_ty: Ty<'db>, target_ty: Ty<'db>) -> Result
     })
 }
 
-/// The constant a `const { .. }` block `expr` of `owner` is lowered to, a body of its own; `None`
-/// where it is lowered in place, as an inline const of a constant's or static's value is. A
-/// `const static { .. }` block (`#![feature(blaze_comptime)]`) is a constant of its own in every
+/// The constant a `const { .. }` block `expr` of `owner` is lowered to, a body of its own, in an
+/// item's body (a function's, and a constant's, static's or discriminant's value); `None` where
+/// it is lowered in place: in its own constant's body, in another anonymous constant's (a block
+/// inside a block, an array length), and where its type is not known.
+///
+/// A block in a constant's value is a constant of its own as it is in a function, because rustc
+/// evaluates it as one, with its own count of `long_running_const_eval`'s steps
+/// (`Evaluator::inline_const_in_heap`): `const A: &[T] = &[const { f(1) }, const { f(2) }]`
+/// may spend 2,000,000 steps in each block, where lowered in place the blocks spent the one
+/// count of `A` between them and a constant rustc takes was refused (blaze-profile's `VIEWS`).
+/// A `const static { .. }` block (`#![feature(blaze_comptime)]`) is a constant of its own in every
 /// body: it is evaluated by an evaluation of its own, in comptime mode, never in place.
 pub fn inline_const_at<'db>(
     db: &'db Db,
@@ -4879,7 +4890,7 @@ pub fn inline_const_at<'db>(
     if matches!(owner, InferBodyId::AnonConstId(it) if it.loc(db).expr == expr) {
         return None;
     }
-    if !matches!(owner, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(_)))
+    if !matches!(owner, InferBodyId::DefWithBodyId(_))
         && !hir_ty::effects::const_block_is_comptime(db, owner.expression_store_owner(db), expr)
     {
         return None;

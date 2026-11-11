@@ -1208,7 +1208,7 @@ mod tests {
     /// [`stored`] in `sim`, kept for the test to commit puts in.
     fn opened(mut sim: Sim, values: &[(&str, Kind, &[u8])]) -> (Sim, Store) {
         let mut effects = Vec::new();
-        let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 0 };
+        let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 0, load_tags: 1 << 32, loader: crate::Loader::Pumped };
         let mut store = Store::open(config, &mut effects);
         drive(&mut sim, &mut store, &mut effects);
         assert!(store.ready());
@@ -2255,7 +2255,7 @@ mod tests {
     fn a_server_of_a_store_that_does_not_watch_its_keys_stops_and_says_why() {
         let mut sim = Sim::new(7, Faults::default());
         let mut effects = Vec::new();
-        let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 0 };
+        let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 0, load_tags: 1 << 32, loader: crate::Loader::Pumped };
         let mut store = Store::open(config, &mut effects);
         drive(&mut sim, &mut store, &mut effects);
         assert!(!store.watching_keys());

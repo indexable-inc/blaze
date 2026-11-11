@@ -15,7 +15,9 @@
 //! is probed: a kernel without one of these fails the wait with an error naming it.
 //!
 //! The sandbox launcher stays off this ring: its seccomp filter refuses io_uring to what it
-//! launches, and it waits between its fork and its exec, where nothing may be made.
+//! launches, and it waits between its fork and its exec, where nothing may be made. What it
+//! launches is told so (`wait/choice.rs`), and a blaze there waits with direct system calls
+//! (`wait/direct.rs`); a process not told so that meets the filter fails here, naming it.
 
 use std::{
     cell::RefCell,
@@ -314,7 +316,17 @@ impl WaitRing {
             libc::syscall(libc::SYS_io_uring_setup, ENTRIES, &raw mut params as *mut libc::c_void)
         };
         if fd < 0 {
-            return Err(refused("io_uring_setup", io::Error::last_os_error()));
+            let error = io::Error::last_os_error();
+            // The sandbox's filter answers so, as a kernel with no io_uring does.
+            let step = match error.raw_os_error() {
+                Some(libc::ENOSYS) => {
+                    "io_uring_setup (a kernel with no io_uring answers so, and so does blaze's sandbox to what it \
+                     runs: a blaze the sandbox launched waits with direct system calls when its environment has \
+                     the launcher's `__BLAZE_SANDBOXED=1`, which this process's has not)"
+                }
+                _ => "io_uring_setup",
+            };
+            return Err(refused(step, error));
         }
         // SAFETY: the call returned a descriptor of its own.
         let fd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };

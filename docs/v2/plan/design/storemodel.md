@@ -23,9 +23,12 @@ protocol, run on the real Rust state machines rather than a separate TLA+ spec. 
   - walk the shape slots;
   - put the entry;
   - put the shape, taking a `Mismatch` as "another writer took the slot".
-- **Warm restart's rule.** The rule is "a build answers once what it leaves is durable, and a
-  build asked mid-store waits". It is modelled as each actor's wait before it answers, in one of
-  two forms (`store::Wait`):
+- **The rule after an answer** (2026-11-10; before, "a build answers once what it leaves is
+  durable"). A build answers at once, durable or not; what it left settles after the answer
+  and is kept for reuse across a crash only once it is durable, or said lost when the store
+  stopped (`store::Op::Answer`, `store::Op::Settle`). A snapshot still waits before it answers
+  (`store::Op::AwaitAndAnswer`). What is waited on before keeping is one of two forms
+  (`store::Wait`):
   - `Own`: the tickets of its own puts;
   - `Everything`: every put made before it asked, which is the hold.
 - The daemon's `Jobs` bookkeeping itself lives in `blaze-cargo`'s private `serve` module, so it
@@ -105,7 +108,7 @@ lands.
 | `a_restore_never_serves_a_value_no_writer_fully_wrote` | two builds and a reader |
 | `a_restore_never_silently_starts_empty` | crash states, plus three kinds of damage after a clean stop: a pack cut short, the head's bytes changed, a pack gone |
 | `two_values_under_one_identity_are_refused_never_overwritten` | two writers on one key, one IO failure; two gets of an impure step |
-| `after_a_build_answers_its_results_survive_any_crash` | two kernel gets racing for one shape slot, one IO failure, effects in any order |
+| `what_is_kept_after_an_answer_survives_any_crash_and_no_lost_value_is_served` | two kernel gets racing for one shape slot, one IO failure, effects in any order |
 | `the_restore_after_any_crash_equals_a_fresh_build` | the restore, built again, equals a fresh build, and so does a clean restart of it |
 | `every_wait_ends` | two flushes and two IO failures: every wait for durability ends, and so does every restore's open |
 
@@ -120,8 +123,9 @@ histories legitimately lay out the same values differently.
 Further tests:
 
 - `larger_scenarios_sampled_keep_every_property`: seeded random search over bigger scenarios.
-- `the_model_catches_an_answer_given_before_its_store_is_durable`: the model's own check (rule
-  20). A planted early answer must be caught at the crash that loses it.
+- `the_oracle_catches_a_kept_answer_relied_on_before_its_tickets_were_durable` and `the_oracle_catches_a_settling_failure_dropped_silently`: the model's own checks (rule
+  23). What is kept before it is durable must be caught at the crash that loses it, and a
+  settling that ends with the store stopped and says nothing must be caught.
 - `a_crash_keeps_what_the_file_system_model_says`: the crash model's rules.
 
 ## Findings (by reading the code; the ignored tests pin them)
@@ -187,7 +191,7 @@ whole daemon. That lane owns those files, so the cut is proposed, not made:
 2. Run it as one more actor kind in `blaze-storemodel`, through a `pub` re-export behind
    `#[cfg(any(test, feature = "model"))]`.
 3. Until then, the daemon's sim test
-   (`what_a_build_left_for_the_store_is_durable_once_it_answers_and_survives_a_crash`) should
+   (`what_a_build_left_for_the_store_is_durable_once_it_settles_and_survives_a_crash`) should
    crash at every IO step and in every crash state, rather than once with a random seed. The
    test would put a `CrashFs` (made `Driver`) in for `Sim`, and `Sim` would gain a
    `crash_with(chooser)`.

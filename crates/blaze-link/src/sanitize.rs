@@ -491,8 +491,9 @@ impl<'a> Stage<'a> {
                 self.make(&piece, Content::Bytes(bytes));
             }
             let id = self.symbols.name(name);
-            if self.new.names.get(&id) != Some(&sym) {
-                Arc::make_mut(&mut self.new.names).insert(id, sym);
+            let name = crate::state::RustName { target: sym, weak: false };
+            if self.new.names.get(&id) != Some(&name) {
+                Arc::make_mut(&mut self.new.names).insert(id, name);
             }
             let named = self.sym(SymKey::Name(id));
             self.new.see(named);

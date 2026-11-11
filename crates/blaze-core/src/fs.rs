@@ -168,6 +168,33 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     })
 }
 
+/// [`crate::Effect::WriteUnsynced`]: `bytes` as the whole of `path`, written to a temporary
+/// file next to it and renamed over it, with no sync of the file or the directory. A reader
+/// sees the old file or the new; a crash may leave either, or the new name over any part of
+/// the bytes.
+#[cfg(any(unix, target_os = "wasi"))]
+pub(crate) fn write_unsynced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    blaze_mem::scratch::with_path(|temporary| {
+        temporary_into(path, temporary);
+        let written = (|| {
+            let open = || OpenOptions::new().write(true).create_new(true).open(&*temporary);
+            making_parent(path, open)?.write_all(bytes)
+        })();
+        let renamed = written.and_then(|()| std::fs::rename(&*temporary, path));
+        if renamed.is_err() {
+            _ = std::fs::remove_file(&*temporary);
+        }
+        renamed
+    })
+}
+
+/// [`crate::Effect::RenameUnsynced`]: `from` renamed over `to`, neither directory synced;
+/// `from` is left as it was when the rename fails.
+#[cfg(any(unix, target_os = "wasi"))]
+pub(crate) fn rename_unsynced(from: &Path, to: &Path) -> io::Result<()> {
+    making_parent(to, || std::fs::rename(from, to))
+}
+
 /// `from` renamed to `to`, and `to`'s directory synced.
 #[cfg(any(unix, target_os = "wasi"))]
 pub(crate) fn commit_rename(from: &Path, to: &Path) -> io::Result<()> {
@@ -419,7 +446,9 @@ pub(crate) fn set_times(path: &Path, modified_ns: u64) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-pub(crate) use crate::iocp::files::{clone, rename, seal, set_mode, set_times, write_atomically};
+pub(crate) use crate::iocp::files::{
+    clone, rename, rename_unsynced, seal, set_mode, set_times, write_atomically, write_unsynced,
+};
 
 #[cfg(any(unix, target_os = "wasi"))]
 fn sync_dir_of(path: &Path) -> io::Result<()> {

@@ -19,7 +19,7 @@ use blaze_units::{
 };
 use blaze_usercode::run::Value;
 
-use super::{artifact, codegen, compile, graph, pack, run, script, test, unit_target};
+use super::{artifact, codegen, compile, graph, run, script, test, unit_target};
 
 const HOST: &str = "x86_64-unknown-linux-gnu";
 
@@ -1018,56 +1018,6 @@ fn a_unit_waits_on_every_run_of_its_closure() {
     assert!((0..6).all(|at| waits.ready(at)));
 }
 
-#[test]
-fn a_pack_is_of_the_packages_binary_or_else_its_library() {
-    let (app, dep) = ("path+file:///w/app#0.1.0", "path+file:///w/dep#0.1.0");
-    let with = |units: Vec<Unit>| Units {
-        graph: UnitGraph { version: 1, units, roots: Vec::new() },
-        plans: Vec::new(),
-        packages: vec![package(app, "app", "/w/app"), package(dep, "dep", "/w/dep")],
-        lock: None,
-        warnings: Vec::new(),
-        target_dir: "/w/target".to_owned(),
-        build_dir: "/w/target".to_owned(),
-        finished: String::new(),
-        link_dirs: Vec::new(),
-        sandboxed_tests: false,
-        native: Vec::new(),
-    };
-    let units = with(vec![
-        unit(dep, target("dep", "lib", "/w/dep/src/lib.rs"), Mode::Check, &[]),
-        unit(
-            app,
-            target("build-script-build", "custom-build", "/w/app/build.rs"),
-            Mode::Build,
-            &[],
-        ),
-        unit(app, target("app", "lib", "/w/app/src/lib.rs"), Mode::Check, &[0]),
-        unit(app, target("app", "bin", "/w/app/src/main.rs"), Mode::Check, &[2]),
-    ]);
-    assert_eq!(pack::program_unit(&units, "app").unwrap(), 3);
-    assert_eq!(pack::program_unit(&units, "dep").unwrap(), 0);
-    let none = pack::program_unit(&units, "other").unwrap_err().what;
-    assert!(none.contains("-p other"), "{none}");
-
-    let mut tested = unit(app, target("app", "bin", "/w/app/src/main.rs"), Mode::Check, &[]);
-    tested.checked_as_test = true;
-    let units =
-        with(vec![tested, unit(app, target("app", "lib", "/w/app/src/lib.rs"), Mode::Check, &[])]);
-    assert_eq!(
-        pack::program_unit(&units, "app").unwrap(),
-        1,
-        "a binary checked as a test is no program"
-    );
-
-    let units = with(vec![
-        unit(app, target("one", "bin", "/w/app/src/bin/one.rs"), Mode::Check, &[]),
-        unit(app, target("two", "bin", "/w/app/src/bin/two.rs"), Mode::Check, &[]),
-    ]);
-    let refused = pack::program_unit(&units, "app").unwrap_err().what;
-    assert!(refused.contains("`one`, `two`"), "{refused}");
-}
-
 /// A unit of a package the build doesn't list, or naming a dependency past its units, stops
 /// the graph: no edge is dropped and no unit is given a package it isn't of.
 #[test]
@@ -1740,7 +1690,7 @@ fn primary_package_keys_only_a_record_whose_code_read_it() {
 fn build_script_compile_is_reused_across_runs() {
     let first = [
         ("FOO", "on"),
-        ("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101"),
+        ("BLAZE_PROFILE", "/tmp/blaze-profile-0101"),
         ("OLDPWD", "/w"),
         ("SHLVL", "1"),
         ("BLAZE_CLIENT_PID", "4242"),
@@ -1748,7 +1698,7 @@ fn build_script_compile_is_reused_across_runs() {
     ];
     let second = [
         ("FOO", "on"),
-        ("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0242"),
+        ("BLAZE_PROFILE", "/tmp/blaze-profile-0242"),
         ("OLDPWD", "/tmp/elsewhere"),
         ("SHLVL", "3"),
         ("BLAZE_CLIENT_PID", "977"),
@@ -1779,13 +1729,13 @@ fn build_script_compile_is_reused_across_runs() {
 /// value of a variable its code read (another value, or unset), its source, a dependency.
 #[test]
 fn a_real_input_of_a_build_script_makes_its_record_miss() {
-    let run = [("FOO", "on"), ("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101")];
+    let run = [("FOO", "on"), ("BLAZE_PROFILE", "/tmp/blaze-profile-0101")];
     let (base, read) = script_run(SCRIPT, true, &run);
     let mut store = super::reads::tests::Store::default();
     let filed = store.keep(base, &read, &super::reads::tests::env(&run));
     let other_value: &[(&str, &str)] =
-        &[("FOO", "off"), ("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101")];
-    let unset: &[(&str, &str)] = &[("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101")];
+        &[("FOO", "off"), ("BLAZE_PROFILE", "/tmp/blaze-profile-0101")];
+    let unset: &[(&str, &str)] = &[("BLAZE_PROFILE", "/tmp/blaze-profile-0101")];
     for env in [other_value, unset] {
         let (again, read_again) = script_run(SCRIPT, true, env);
         assert_eq!(again, base, "{env:?}: the base key holds no variable's value");
@@ -2682,7 +2632,7 @@ fn a_served_dependency_whose_out_dir_file_alone_moves_is_served_again_not_stale(
 /// and finds it again once the file is as it was.
 #[test]
 fn a_file_a_proc_macro_read_outside_the_tree_makes_the_record_miss_once_it_changes() {
-    let run = [("BLAZE_PROFILE", "/tmp/blaze-lanes/profile-0101")];
+    let run = [("BLAZE_PROFILE", "/tmp/blaze-profile-0101")];
     let (lowered, base) = script_lowered(SCRIPT, true, &run);
     let krate = lowered.krate(1).unwrap();
     let outside = tempfile::tempdir().unwrap();
@@ -2812,4 +2762,185 @@ fn a_warn_with_no_target_written_in_blaze_cargo_reaches_the_events_table() {
         3,
         "its value typed, not text"
     );
+}
+
+/// A library that also lists a `staticlib` or `dylib` (tree-sitter-highlight's `crate-type =
+/// ["lib", "staticlib"]`) is built as the rlib its dependents link when the build only depends
+/// on it; asked for itself, or with no rlib to link, it is refused, naming the crate and kind.
+#[test]
+fn a_dependencys_staticlib_or_dylib_is_built_as_its_rlib_and_refused_where_asked_for() {
+    for kind in ["staticlib", "dylib"] {
+        let mut lib = target("tree_sitter_highlight", "lib", "src/lib.rs");
+        lib.kind = vec!["lib".to_owned(), kind.to_owned()];
+        lib.crate_types = lib.kind.clone(); // clone: the test's target
+        let dep = unit("registry+tree-sitter-highlight", lib, Mode::Build, &[]);
+        assert_eq!(codegen::makes(&dep, false), Ok(codegen::Makes::Library), "{kind}");
+        let asked = codegen::makes(&dep, true).unwrap_err();
+        assert!(
+            asked.contains("`tree_sitter_highlight`") && asked.contains(&format!("`{kind}`"))
+                && asked.contains("asked for this library"),
+            "{asked}"
+        );
+        // Control: without its rlib there is nothing a dependent could link instead.
+        let mut only = dep.clone(); // clone: the test's unit
+        only.target.kind = vec![kind.to_owned()];
+        only.target.crate_types = vec![kind.to_owned()];
+        let none = codegen::makes(&only, false).unwrap_err();
+        assert!(none.contains("no `lib` or `rlib`"), "{none}");
+    }
+}
+
+/// A file's text by name, for [`compile::placed_from`] and [`compile::replaced_from`].
+fn one_file(text: &'static str) -> impl Fn(&str) -> Option<String> {
+    move |name| (name == "src/lib.rs").then(|| text.to_owned())
+}
+
+/// A warning over `what` of `text` (its first), with a label over `label` and a suggestion
+/// that replaces `what`.
+fn warning_over(text: &str, what: &str, label: &str) -> blaze_diagnostics::Diag {
+    let span = |of: &str| {
+        let lo = text.find(of).unwrap_or_else(|| panic!("no `{of}` in the text")) as u32;
+        blaze_diagnostics::Span {
+            file: "src/lib.rs".to_owned(),
+            lo,
+            hi: lo + of.len() as u32,
+            expansion: None,
+        }
+    };
+    let mut diag = blaze_diagnostics::Diag::error(None, format!("unused: `{what}`"), span(what));
+    diag.span.labels.push((span(label), "here".to_owned()));
+    diag.suggestions.push(blaze_diagnostics::model::Suggestion {
+        message: "prefix it".to_owned(),
+        substitutions: vec![vec![(span(what), format!("_{what}"))]],
+        applicability: blaze_api::Applicability::MachineApplicable,
+        style: blaze_diagnostics::model::SuggestionStyle::ShowCode,
+    });
+    diag
+}
+
+const PLACED_BARE: &str = "fn f() {\n    let x = 1;\n    g();\n}\n";
+/// [`PLACED_BARE`] with what its narrow key does not see: a comment at each line's end, spaces
+/// before one, a comment after the last line.
+const PLACED_NOTED: &str =
+    "fn f() { // opens\n    let x = 1; // never read\n    g();  \n}\n// the end\n";
+
+/// What each span of `diags` covers of `text`, in the order they are met: the oracle of a
+/// replay, which shows the tokens the check pointed at.
+fn covered(diags: &[blaze_diagnostics::Diag], text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for diag in diags {
+        let spans = diag.span.primary.iter().chain(diag.span.labels.iter().map(|it| &it.0)).chain(
+            diag.suggestions.iter().flat_map(|it| it.substitutions.iter().flatten().map(|it| &it.0)),
+        );
+        for span in spans {
+            out.push(text.get(span.lo as usize..span.hi as usize).unwrap_or("<outside>").to_owned());
+        }
+    }
+    out
+}
+
+/// The invariant: a record's diagnostics kept as places, replayed over any text of the same
+/// code text (a comment at a line's end, spaces before one, a comment after the last line
+/// added or taken away), point at the very tokens the check pointed at, and over the text they
+/// were made of are the diagnostics the check gave, byte for byte, through the record's
+/// encoding.
+#[test]
+fn a_records_diagnostics_kept_as_places_point_at_the_same_tokens_in_every_text_of_its_key() {
+    let diags = vec![
+        warning_over(PLACED_BARE, "x", "let x = 1;"),
+        warning_over(PLACED_BARE, "g()", "g"),
+    ];
+    let pointed = covered(&diags, PLACED_BARE);
+    assert_eq!(pointed, ["x", "let x = 1;", "x", "g()", "g", "g()"]);
+    let placed = compile::placed_from(one_file(PLACED_BARE), span::Edition::CURRENT, &diags)
+        .expect("every span is of tokens of a file that is read");
+    // Through the record's encoding and back: the same value.
+    let bytes = blaze_protocol::cbor::to_vec(&placed).unwrap();
+    let restored: compile::Placed = blaze_protocol::cbor::from_slice(&bytes).unwrap();
+    assert_eq!(restored, placed);
+    assert_eq!(blaze_protocol::cbor::to_vec(&restored).unwrap(), bytes);
+    // Over the text they were made of: what the check gave.
+    assert_eq!(compile::replaced_from(one_file(PLACED_BARE), 0, &restored).unwrap(), diags);
+    // Over another text of the same code text: the same tokens, at other offsets.
+    let moved = compile::replaced_from(one_file(PLACED_NOTED), 0, &restored).unwrap();
+    assert_ne!(moved, diags);
+    assert_eq!(covered(&moved, PLACED_NOTED), pointed);
+    // And made of that text, replayed over the first: the same again.
+    let noted = vec![
+        warning_over(PLACED_NOTED, "x", "let x = 1;"),
+        warning_over(PLACED_NOTED, "g()", "g"),
+    ];
+    assert_eq!(moved, noted, "a replay is what a check of the text as it is gives");
+    let placed_noted =
+        compile::placed_from(one_file(PLACED_NOTED), span::Edition::CURRENT, &noted).unwrap();
+    assert_eq!(compile::replaced_from(one_file(PLACED_BARE), 0, &placed_noted).unwrap(), diags);
+}
+
+/// Shown at the offsets the record was made with, in a text whose comments moved them, a
+/// diagnostic points at other text: the oracle finds it.
+#[test]
+fn the_oracle_catches_a_diagnostic_rendered_at_stale_offsets() {
+    let diags = vec![warning_over(PLACED_BARE, "x", "let x = 1;")];
+    let placed =
+        compile::placed_from(one_file(PLACED_BARE), span::Edition::CURRENT, &diags).unwrap();
+    let pointed = covered(&diags, PLACED_BARE);
+    let replayed = compile::replaced_from(one_file(PLACED_NOTED), 0, &placed).unwrap();
+    assert_eq!(covered(&replayed, PLACED_NOTED), pointed);
+    // The planted bug: the kept diagnostics as they are, their offsets not found again.
+    assert_ne!(covered(&placed.diags, PLACED_NOTED), pointed);
+}
+
+/// What is not kept as places, so that its record is under the files it quotes or its whole
+/// key: a span into a comment, one over a comment (a suggestion may copy what it covers), and
+/// one in a file that is not read. A replay over a file that lacks a place is refused, naming
+/// the file.
+#[test]
+fn a_span_that_is_no_place_keeps_its_record_under_what_it_quotes() {
+    let edition = span::Edition::CURRENT;
+    let into = vec![warning_over(PLACED_NOTED, "opens", "fn")];
+    assert_eq!(compile::placed_from(one_file(PLACED_NOTED), edition, &into), None);
+    let over = vec![warning_over(PLACED_NOTED, "{ // opens\n    let x = 1;", "fn")];
+    assert_eq!(compile::placed_from(one_file(PLACED_NOTED), edition, &over), None);
+    let diags = vec![warning_over(PLACED_BARE, "x", "let x = 1;")];
+    assert_eq!(compile::placed_from(|_| None, edition, &diags), None);
+
+    let placed = compile::placed_from(one_file(PLACED_BARE), edition, &diags).unwrap();
+    let refused = compile::replaced_from(one_file("fn f() {}\n"), 3, &placed).unwrap_err();
+    assert!(
+        refused.what.contains("`src/lib.rs`") && refused.what.contains("unit 3"),
+        "{}",
+        refused.what
+    );
+    let unread = compile::replaced_from(|_| None, 3, &placed).unwrap_err();
+    assert!(unread.what.contains("no text of"), "{}", unread.what);
+}
+
+/// A check entry, the store's own record of a unit's check, restores to the outcome it was
+/// made of, byte for byte: through its encoding and a record's header check, the same value
+/// and the same bytes again, and its diagnostics replayed over the text they were made of are
+/// the check's. Bytes cut short are refused.
+#[test]
+fn a_check_entry_restores_to_the_outcome_it_was_made_of() {
+    let diags = vec![warning_over(PLACED_BARE, "x", "let x = 1;")];
+    let placed =
+        compile::placed_from(one_file(PLACED_BARE), span::Edition::CURRENT, &diags).unwrap();
+    for checked in [
+        compile::Checked { items_broken: true, placed: Some(placed) },
+        compile::Checked { items_broken: false, placed: None },
+    ] {
+        let bytes = checked.encoded().unwrap();
+        let body = compile::header::check(&bytes, |_| true, &mut |_: &std::path::Path| {
+            None::<[u8; 32]>
+        })
+        .expect("a check entry starts as a record with no output does");
+        let restored = compile::Checked::decoded(&bytes, body).unwrap();
+        assert_eq!(restored, checked);
+        assert_eq!(restored.encoded().unwrap(), bytes);
+        if let Some(placed) = &restored.placed {
+            let replayed = compile::replaced_from(one_file(PLACED_BARE), 0, placed).unwrap();
+            assert_eq!(replayed, diags);
+        }
+        assert!(compile::Checked::decoded(&bytes[..bytes.len() - 1], body).is_err());
+        assert!(compile::Checked::decoded(&bytes, bytes.len() + 1).is_err());
+    }
 }
