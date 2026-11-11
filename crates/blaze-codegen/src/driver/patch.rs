@@ -5,8 +5,8 @@
 //! finds the changed set and what a change touches ([`Keep`]): every *item* the walk
 //! described (a function as some origin's code asks for it, a static) with its describe, the
 //! graph of what each refers to and the two sets of it that the roots reach
-//! ([`support`]: everything described, and what is built), and which functions are asked
-//! again.
+//! ([`support`]: everything described, and what is built), and what finds an item from
+//! the front end's name of it.
 //!
 //! A build patches it when all of this holds, each checked, and walks whole otherwise,
 //! saying which did not ([`super::Walk::whole`]):
@@ -26,7 +26,9 @@
 //! describes exactly what its check's roots and its own reach (`recursion::claims_past`) and
 //! builds what its own roots reach, and each node is a function of its describe, the policy
 //! and what it refers to. The patch asks again every function and static whose describe or
-//! count may be other ([`Frontend::durable`], [`Frontend::group`]), sets each changed one's
+//! count may be other: those the front end names as changed since the kept walk's view
+//! ([`Frontend::changed_since`]) and those asked each build ([`Frontend::each_build`]), or
+//! every one it holds where the front end names no set. It sets each changed one's
 //! edges, describes what newly enters, and lets [`support`] say what the roots reach now:
 //! the same items. Then each rule below is evaluated again for every node one of its inputs
 //! changed for, found through the graph's reverse edges:
@@ -59,20 +61,11 @@ use super::{
 };
 use crate::{
     InstanceKey, Linkage, Owner, Target,
-    backend::{Counted, Described, DescribedStatic, FrontRef, Frontend, Instantiates, Prepare},
+    backend::{
+        Changed, Counted, Described, DescribedStatic, FrontRef, Frontend, Instantiates, Prepare,
+    },
     plan::Origin,
 };
-
-/// When a function's describe and count are asked again.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Hangs {
-    /// Never while the durable view is the kept one ([`Frontend::durable`]).
-    Durable,
-    /// When an input of this group was written ([`Frontend::group`]).
-    Group(u64),
-    /// Each build.
-    Loose,
-}
 
 /// A function of a kept walk, as one origin's code asks for it.
 struct FunctionItem<I, S> {
@@ -82,7 +75,8 @@ struct FunctionItem<I, S> {
     described: Arc<Described<I, S>>,
     key: InstanceKey,
     counted: Counted,
-    hangs: Hangs,
+    /// Asked each build ([`Frontend::each_build`]): in [`Keep::each_build`].
+    each_build: bool,
 }
 
 /// A static of a kept walk.
@@ -90,6 +84,8 @@ struct StaticItem<I, S> {
     value: S,
     described: DescribedStatic<I, S>,
     id: StaticId,
+    /// Asked each build ([`Frontend::static_each_build`]): in [`Keep::each_build_statics`].
+    each_build: bool,
 }
 
 enum Item<I, S> {
@@ -102,21 +98,23 @@ enum Item<I, S> {
 pub(super) struct Keep<I, S> {
     /// Every item the walk described, by its place in `graph`; `None` for a place given up.
     items: Vec<Option<Item<I, S>>>,
+    /// Each function, by who asks for it, and each static, by its handle: what finds the
+    /// item a front end's changed set names ([`Frontend::changed_since`]), a lookup a name.
     functions: HashMap<(I, Origin), u32>,
     values: HashMap<S, u32>,
+    /// The functions of each instance, whoever asks for it: what a changed count names.
+    instances: HashMap<I, Vec<u32>>,
     /// Each static described, by which static it is.
     ids: HashMap<StaticId, u32>,
     /// How many describes each key is of.
     askers: blaze_hash::HashMap<InstanceKey, u32, Global>,
     /// What each item refers to, and what the roots reach of it.
     graph: support::Graph,
-    /// The functions asked again each build, sorted.
-    loose: Vec<u32>,
-    /// The functions asked again when their group is written, by group, each list sorted.
-    // BTreeMap: the groups are asked in one order every build.
-    groups: BTreeMap<u64, Vec<u32>>,
-    /// Every static, sorted: asked again each build.
-    statics: Vec<u32>,
+    /// The functions asked again each build ([`Frontend::each_build`]), sorted: those the
+    /// front end's changed set does not cover.
+    each_build: Vec<u32>,
+    /// The statics asked again each build ([`Frontend::static_each_build`]), sorted.
+    each_build_statics: Vec<u32>,
     /// The check's roots, in its order ([`recursion`]).
     check_roots: Vec<u32>,
     /// Every function some node builds in. A function taken out stays: it then gives way
@@ -140,8 +138,20 @@ pub(super) struct Walked<I, S> {
     static_roots_in: Vec<S>,
     check_in: Vec<CheckRoot<I, S>>,
     policy: ContentId,
-    /// The front end's durable view and its view ([`Frontend::view`]) from before the walk.
+    /// The front end's durable view from before the walk.
     view: u64,
+    /// The front end's view ([`Frontend::view`]) from before the walk: what the next build
+    /// asks the changed set since ([`Frontend::changed_since`]).
+    ///
+    /// Why it is the whole key of what the walk holds of the front end (rule
+    /// keys-cover-every-input). Every item's describe and count here are the front end's
+    /// answers in this view or a later one with no write between. The front end's changed
+    /// set since it covers every input of those answers: `hir-ty-codegen`'s is the query
+    /// engine's over `described_memo`, `counted_memo` and `described_static_memo`, which
+    /// records every read of a run and puts a row with a read it cannot see in every walk;
+    /// a describe that reads beside the database is asked each build
+    /// ([`Frontend::each_build`]). The walk's other inputs (roots, check roots, policy, the
+    /// durable view) are compared by value, and with no view (`None`) every item is asked.
     seen: Option<u64>,
     /// Shared with the build's `Later`: a patch copies the chunks it changes.
     nodes: Arc<Sorted<InstanceKey, super::FnNode<I, S>>>,
@@ -275,15 +285,40 @@ impl<I: Clone + Eq + Hash, S: Clone + Eq + Hash> Keep<I, S> {
         }
     }
 
-    /// Files function `item` under when it is asked again, or takes it out.
-    fn hang(&mut self, item: u32, hangs: Hangs, add: bool) {
-        let list = match hangs {
-            Hangs::Durable => return,
-            Hangs::Loose => &mut self.loose,
-            // alloc: once per group of inputs a walk's functions hang on
-            Hangs::Group(group) => self.groups.entry(group).or_default(),
+    /// Files function `item` under who asks for it and under its instance.
+    fn file(&mut self, asked: &(I, Origin), item: u32) {
+        // clone: the walk's handle of the function, its map's key
+        self.functions.insert(asked.clone(), item);
+        // clone: the instance, the key of its functions; alloc: once per instance of a walk
+        self.instances.entry(asked.0.clone()).or_default().push(item);
+    }
+
+    /// Takes function `item` out of what [`Self::file`] put it in.
+    fn unfile(&mut self, asked: &(I, Origin), item: u32) {
+        self.functions.remove(asked);
+        if let Some(items) = self.instances.get_mut(&asked.0) {
+            items.retain(|it| *it != item);
+            if items.is_empty() {
+                self.instances.remove(&asked.0);
+            }
+        }
+    }
+
+    /// Says whether `item` is asked each build from now on, keeping the lists of those that
+    /// are ([`Self::each_build`], [`Self::each_build_statics`]).
+    fn ask_each_build(&mut self, item: u32, each: bool) {
+        let list = match self.items.get_mut(item as usize).and_then(Option::as_mut) {
+            Some(Item::Function(it)) if it.each_build != each => {
+                it.each_build = each;
+                &mut self.each_build
+            }
+            Some(Item::Static(it)) if it.each_build != each => {
+                it.each_build = each;
+                &mut self.each_build_statics
+            }
+            _ => return,
         };
-        match add {
+        match each {
             true => sorted_insert(list, item),
             false => sorted_remove(list, item),
         }
@@ -332,8 +367,7 @@ impl<I: Clone + Eq + Hash, S: Clone + Eq + Hash> Keep<I, S> {
                         Some(item) => *item,
                         None => {
                             let item = self.place();
-                            // clone: the handle of a function new to the walk, its map's key
-                            self.functions.insert(asked.clone(), item);
+                            self.file(&asked, item);
                             fresh.push((item, Fresh::Function(asked)));
                             item
                         }
@@ -414,30 +448,70 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut nodes = Arc::try_unwrap(nodes).unwrap_or_else(|shared| (*shared).clone());
         let mut work = Work::default();
 
-        // Who is asked: the functions asked each build, and those of each group an input
-        // of which was written since the kept walk.
-        // clone: per build, the functions it asks of
-        let mut asks = keep.loose.clone();
-        for (group, members) in &keep.groups {
-            work.groups += 1;
-            if seen.is_none_or(|seen| self.frontend.written_since(*group, seen)) {
-                asks.extend_from_slice(members);
+        // Who is asked: the functions and statics asked each build, and what the walk holds
+        // of those the front end names as changed since the kept walk's view. Each name is
+        // a lookup; one the walk does not hold is of no item of this program. Where the
+        // front end names no set (its typed answer, with why), everything the walk holds.
+        let named = match seen {
+            Some(seen) => self.frontend.changed_since(seen),
+            // alloc: once a build, of a walk kept with no view
+            None => Changed::Unknown("the kept walk holds no view of the front end".to_owned()),
+        };
+        // clone: per build, the functions and the statics it asks of each time
+        let (mut asks, mut static_asks) = (keep.each_build.clone(), keep.each_build_statics.clone());
+        work.each_build = asks.len() + static_asks.len();
+        let unknown = match named {
+            Changed::Named { functions, counted, statics } => {
+                work.named = functions.len() + counted.len() + statics.len();
+                // alloc: per build, the items its changed set names
+                let mut held: Vec<u32> = Vec::with_capacity(functions.len());
+                held.extend(functions.iter().filter_map(|asked| keep.functions.get(asked)));
+                for instance in &counted {
+                    held.extend(keep.instances.get(instance).into_iter().flatten());
+                }
+                held.sort_unstable();
+                held.dedup();
+                // alloc: per build, the statics its changed set names
+                let mut held_statics: Vec<u32> =
+                    statics.iter().filter_map(|value| keep.values.get(value).copied()).collect();
+                held_statics.sort_unstable();
+                held_statics.dedup();
+                work.held = held.len() + held_statics.len();
+                asks.extend(held);
+                static_asks.extend(held_statics);
+                None
             }
-        }
+            Changed::Unknown(why) => {
+                // Linear in the walk, as a whole walk is: the front end named nothing.
+                asks.extend(keep.functions.values());
+                static_asks.extend(keep.values.values());
+                Some(why)
+            }
+        };
         asks.sort_unstable();
-        work.asked = asks.len() + keep.statics.len();
-        // Each one's describe and count, on all cores. A describe that fails is the whole
-        // walk's to report.
-        type Answer<I, S> = Option<(Option<Arc<Described<I, S>>>, Counted)>;
-        // The asking is the part of a patched walk that is still the program's size, not the
-        // edit's (docs/v2/plan/design/incremental-walk.md, "The changed set from the engine"):
-        // its own span, so the profile says how much of `codegen walk` it is.
+        asks.dedup();
+        static_asks.sort_unstable();
+        static_asks.dedup();
+        work.asked = asks.len() + static_asks.len();
+        // Each one's describe and count, and whether it is asked each build from now on, on
+        // all cores. A describe that fails is the whole walk's to report.
+        type Answer<I, S> = (Option<(Option<Arc<Described<I, S>>>, Counted)>, bool);
+        // The asking is the edit's size where the front end names its changed set, and the
+        // program's where it does not (docs/v2/plan/design/incremental-walk.md, "The changed
+        // set from the engine"): its span says which, with what was named and held.
         let asking = tracing::info_span!(
             target: "blaze",
             "codegen walk: ask functions",
             asked = asks.len(),
+            named = work.named,
+            held = work.held,
+            each_build = work.each_build,
+            unknown = tracing::field::Empty,
         )
         .entered();
+        if let Some(why) = &unknown {
+            asking.record("unknown", tracing::field::display(why));
+        }
         let answers: Vec<Result<Answer<_, _>, &'static str>> = par::map(&asks, |item| {
             let Some(it) = keep.function(*item) else {
                 return Err("a kept walk asks of a function it does not hold");
@@ -459,18 +533,21 @@ impl<'a, B: Prepare> Build<'a, B> {
             let &[counted] = counted.as_slice() else {
                 return Err("the front end gave no count of a function");
             };
-            Ok((now.is_some() || counted != it.counted).then_some((now, counted)))
+            let each = self.frontend.each_build(&it.asked.0, &it.asked.1);
+            Ok(((now.is_some() || counted != it.counted).then_some((now, counted)), each))
         });
         drop(asking);
         let asking = tracing::info_span!(
             target: "blaze",
             "codegen walk: ask statics",
-            asked = keep.statics.len(),
+            asked = static_asks.len(),
         )
         .entered();
         // alloc: per build, the statics whose describe is another
         let mut changed_statics = Vec::new();
-        for &item in &keep.statics {
+        // alloc: per build, the statics asked each build from now on, or no longer
+        let mut each_changed: Vec<(u32, bool)> = Vec::new();
+        for &item in &static_asks {
             let Some(Some(Item::Static(it))) = keep.items.get(item as usize) else {
                 return Err("a kept walk asks of a static it does not hold");
             };
@@ -479,8 +556,15 @@ impl<'a, B: Prepare> Build<'a, B> {
                 Ok(now) => changed_statics.push((item, now)),
                 Err(_) => return Err("a static's describe failed"),
             }
+            let each = self.frontend.static_each_build(&it.value);
+            if each != it.each_build {
+                each_changed.push((item, each));
+            }
         }
         drop(asking);
+        for (item, each) in each_changed {
+            keep.ask_each_build(item, each);
+        }
 
         // The changed set. Each changed item takes its new describe and its edges are set
         // again; what it newly refers to goes to `fresh`.
@@ -501,7 +585,9 @@ impl<'a, B: Prepare> Build<'a, B> {
         // Kept describes the front end said changed.
         let mut redescribed = 0;
         for (item, answer) in asks.iter().copied().zip(answers) {
-            let Some((now, counted)) = answer? else { continue };
+            let (answer, each) = answer?;
+            keep.ask_each_build(item, each);
+            let Some((now, counted)) = answer else { continue };
             let Some(Some(Item::Function(it))) = keep.items.get(item as usize) else {
                 return Err("a kept walk asks of a function it does not hold");
             };
@@ -603,17 +689,11 @@ impl<'a, B: Prepare> Build<'a, B> {
                 let described = self.described(asked, 0, &counts)?;
                 let node = self.node(&asked.0, asked.1, described)?;
                 let counted = self.frontend.counted(std::slice::from_ref(asked));
-                let hangs = match self.frontend.durable(&asked.0, &asked.1) {
-                    true => Hangs::Durable,
-                    false => match self.frontend.group(&asked.0, &asked.1) {
-                        Some(group) => Hangs::Group(group),
-                        None => Hangs::Loose,
-                    },
-                };
-                Ok::<_, crate::CodegenError>((node, counted, hangs))
+                let each_build = self.frontend.each_build(&asked.0, &asked.1);
+                Ok::<_, crate::CodegenError>((node, counted, each_build))
             });
             for ((item, asked), made) in functions.into_iter().zip(described) {
-                let Ok((node, counted, hangs)) = made else {
+                let Ok((node, counted, each_build)) = made else {
                     return Err("a describe of a new function failed");
                 };
                 let &[counted] = counted.as_slice() else {
@@ -625,13 +705,20 @@ impl<'a, B: Prepare> Build<'a, B> {
                 }
                 keep.askers.insert(key, 1);
                 keep.count(&counted, true);
-                keep.hang(item, hangs, true);
+                if each_build {
+                    sorted_insert(&mut keep.each_build, item);
+                }
                 let described = node.described.clone(); // clone: a reference count
                 let outs = keep.outs(&described.refs, described.origin, &mut fresh);
                 keep.graph.set_outs(item, outs);
                 told.push(asked.clone()); // clone: the walk's handle of a new function
-                keep.items[item as usize] =
-                    Some(Item::Function(FunctionItem { asked, described, key, counted, hangs }));
+                keep.items[item as usize] = Some(Item::Function(FunctionItem {
+                    asked,
+                    described,
+                    key,
+                    counted,
+                    each_build,
+                }));
                 made_new.insert(item, node);
                 work.described += 1;
             }
@@ -646,8 +733,12 @@ impl<'a, B: Prepare> Build<'a, B> {
                 }
                 let outs = keep.outs(&described.refs, described.origin, &mut fresh);
                 keep.graph.set_outs(item, outs);
-                sorted_insert(&mut keep.statics, item);
-                keep.items[item as usize] = Some(Item::Static(StaticItem { value, described, id }));
+                let each_build = self.frontend.static_each_build(&value);
+                if each_build {
+                    sorted_insert(&mut keep.each_build_statics, item);
+                }
+                keep.items[item as usize] =
+                    Some(Item::Static(StaticItem { value, described, id, each_build }));
                 work.described += 1;
             }
             structural = true;
@@ -718,14 +809,18 @@ impl<'a, B: Prepare> Build<'a, B> {
                     if keep.askers.remove(&it.key) != Some(1) {
                         return Err("a function of a key of two describes left the walk");
                     }
-                    keep.functions.remove(&it.asked);
+                    keep.unfile(&it.asked, item);
                     keep.count(&it.counted, false);
-                    keep.hang(item, it.hangs, false);
+                    if it.each_build {
+                        sorted_remove(&mut keep.each_build, item);
+                    }
                 }
                 Some(Item::Static(it)) => {
                     keep.values.remove(&it.value);
                     keep.ids.remove(&it.id);
-                    sorted_remove(&mut keep.statics, item);
+                    if it.each_build {
+                        sorted_remove(&mut keep.each_build_statics, item);
+                    }
                 }
                 None => {}
             }
@@ -1073,8 +1168,8 @@ impl<'a, B: Prepare> Build<'a, B> {
     }
 
     /// What keeps a whole walk that had no error: every item it described with the graph of
-    /// what each refers to, what the roots reach of it, and when each function is asked
-    /// again. Linear in the walk, once per whole walk. `None` when the walk's own tables do
+    /// what each refers to, what the roots reach of it, what finds an item from the front
+    /// end's name of it, and which are asked each build. Linear in the walk, once per whole walk. `None` when the walk's own tables do
     /// not agree with what its roots reach: such a walk is not kept, and the next runs whole.
     pub(super) fn keep_of(
         &self,
@@ -1090,12 +1185,12 @@ impl<'a, B: Prepare> Build<'a, B> {
             items: Vec::with_capacity(side.described.len() + side.statics.len()),
             functions: HashMap::with_capacity(side.described.len()),
             values: HashMap::with_capacity(side.statics.len()),
+            instances: HashMap::with_capacity(side.described.len()),
             ids: HashMap::with_capacity(side.statics.len()),
             askers: blaze_hash::HashMap::with_capacity_in(side.asked.len(), Global),
             graph: support::Graph::default(),
-            loose: Vec::new(), // alloc: per whole walk, the functions asked each build
-            groups: BTreeMap::new(),
-            statics: Vec::new(), // alloc: per whole walk, its statics
+            each_build: Vec::new(), // alloc: per whole walk, the functions asked each build
+            each_build_statics: Vec::new(), // alloc: per whole walk, the statics asked each build
             check_roots: Vec::new(), // alloc: per whole walk, its check's roots
             built_into: blaze_hash::HashSet::new_in(Global),
             bodies: HashMap::new(),
@@ -1106,31 +1201,27 @@ impl<'a, B: Prepare> Build<'a, B> {
         // alloc: per whole walk, one per count
         let counted: HashMap<&(FrontInstance<B>, Origin), Counted> =
             side.counted.iter().map(|(asked, counted)| (asked, *counted)).collect();
-        // Asked once a function, after its describe: when it is asked again.
-        let hangs = par::map(&side.described, |(asked, _)| {
-            match self.frontend.durable(&asked.0, &asked.1) {
-                true => Hangs::Durable,
-                false => match self.frontend.group(&asked.0, &asked.1) {
-                    Some(group) => Hangs::Group(group),
-                    None => Hangs::Loose,
-                },
-            }
+        // Asked once a function, after its describe: whether it is asked each build.
+        let each_build = par::map(&side.described, |(asked, _)| {
+            self.frontend.each_build(&asked.0, &asked.1)
         });
-        for ((asked, described), hangs) in side.described.iter().zip(hangs) {
+        for ((asked, described), each_build) in side.described.iter().zip(each_build) {
             let item = keep.place();
             let key = *side.asked.get(asked)?;
             let counted = *counted.get(asked)?;
             *keep.askers.entry(key).or_insert(0) += 1;
             keep.count(&counted, true);
-            keep.hang(item, hangs, true);
-            // clone: the walk's handle of the function, its map's key and its item's
-            keep.functions.insert(asked.clone(), item);
+            // Items are placed in order, so the list stays sorted.
+            if each_build {
+                keep.each_build.push(item);
+            }
+            keep.file(asked, item);
             keep.items[item as usize] = Some(Item::Function(FunctionItem {
-                asked: asked.clone(),           // clone: as above
-                described: described.clone(),   // clone: a reference count
+                asked: asked.clone(),         // clone: the walk's handle, its item's
+                described: described.clone(), // clone: a reference count
                 key,
                 counted,
-                hangs,
+                each_build,
             }));
         }
         for (value, described) in side.statics {
@@ -1141,8 +1232,12 @@ impl<'a, B: Prepare> Build<'a, B> {
                 return None;
             }
             keep.values.insert(value.clone(), item); // clone: the walk's handle of the static
-            keep.statics.push(item);
-            keep.items[item as usize] = Some(Item::Static(StaticItem { value, described, id }));
+            let each_build = self.frontend.static_each_build(&value);
+            if each_build {
+                keep.each_build_statics.push(item);
+            }
+            keep.items[item as usize] =
+                Some(Item::Static(StaticItem { value, described, id, each_build }));
         }
         // The edges, then the roots: each root brings in what it reaches.
         let mut fresh = Vec::new();

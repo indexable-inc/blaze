@@ -17,6 +17,7 @@ use super::{
     capture::REF,
     counts,
     dense::{Dense, Heap, Zeroed},
+    frontier::Frontier,
     id::{Id, MAX_PAGES, PAGE_BITS, PAGE_LEN},
     ingredient::{self, Ingredient, MAX_INGREDIENTS},
     provenance::{self, Cause, restamp_run},
@@ -40,6 +41,12 @@ pub struct View(pub(crate) u64);
 impl View {
     pub fn as_u64(self) -> u64 {
         self.0
+    }
+
+    /// The view a host kept as its number ([`View::as_u64`]). A number that is no view of
+    /// the storage it is asked of is told apart there (`ChangedUnknown::NotAView`).
+    pub fn from_u64(view: u64) -> View {
+        View(view)
     }
 }
 
@@ -293,6 +300,8 @@ pub struct Storage {
     /// The views the last two epochs that wrote ended at, the older first
     /// ([`Storage::end_epoch`]).
     epochs: [u32; 2],
+    /// The changed set's feeds, reverse index and walks ([`super::frontier`]).
+    pub(crate) frontier: Frontier,
     /// The database type of its first function table ([`Storage::check_db`]).
     #[expect(clippy::disallowed_types, reason = "held once per function table made, to check its database type")]
     db_type: blaze_core::lock::Lock<Option<TypeId>>,
@@ -359,6 +368,7 @@ impl Storage {
             budgets: [None; Tag::COUNT],
             passed_at: [0; Tag::COUNT],
             epochs: [view; 2],
+            frontier: Frontier::new(),
             db_type: blaze_core::lock::Lock::new("query.storage.db_type", None),
         }
     }
@@ -534,7 +544,7 @@ impl Storage {
                 out.push(usage);
             }
         }
-        // alloc: the caller's report, three entries
+        // alloc: the caller's report, four entries
         out.extend(self.graph_usage());
         // Process-wide, not this storage's, and no bytes held now (so not in `held_bytes`): the
         // most one run's reads and one task's pending rows reached as their stacks grew, what
@@ -569,7 +579,7 @@ impl Storage {
     }
 
     /// The dependency graph's columns as [`Storage::memory_usage`] reports them.
-    fn graph_usage(&self) -> [MemoryUsage; 3] {
+    fn graph_usage(&self) -> [MemoryUsage; 4] {
         let live = self
             .edges_top
             .load(Ordering::Relaxed)
@@ -599,6 +609,14 @@ impl Storage {
                     as u64,
                 value_bytes: 0,
             },
+            // The changed set's reverse index: a reader a row, 4 to 8 bytes each and 4 a node.
+            MemoryUsage {
+                name: "reverse edges",
+                rows: self.frontier.held(),
+                used: self.frontier.held(),
+                row_bytes: self.frontier.bytes(),
+                value_bytes: 0,
+            },
         ]
     }
 
@@ -620,6 +638,8 @@ impl Storage {
         if durability.0 >= Durability::HIGH.0 {
             self.high_opened = self.opened;
         }
+        // Before the edge array settles: the fold reads the spans runs replaced.
+        self.fold_reverse();
         self.settle();
         self.sweep();
         self.view
@@ -1105,6 +1125,13 @@ impl Storage {
     #[inline(always)]
     pub(crate) fn edge(&self, at: u64) -> u32 {
         self.edges.get(at as usize).load(Ordering::Relaxed)
+    }
+
+    /// The edges rows name: the array's top less what reruns left dead.
+    pub(crate) fn live_edges(&self) -> u64 {
+        self.edges_top
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.edges_dead.load(Ordering::Relaxed))
     }
 
     /// The span's edges are no longer named.

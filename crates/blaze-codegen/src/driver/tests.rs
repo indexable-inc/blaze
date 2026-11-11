@@ -13,6 +13,7 @@ use blaze_core::lock::Lock;
 use super::*;
 use crate::{
     Arch, Backend, Init, RelocKind,
+    backend::Changed,
     plan::{Mode, OptLevel, Override, Package, Profile},
     settings::{DebugInfo, Panic, Pgo, Relocation, Sanitize, Toolchain},
     summary::{Attrs, Call, Hint},
@@ -103,17 +104,29 @@ struct Engine {
     /// The planted bug of a control: a dyn fact's change is not seen, so a body built against
     /// the old fact is said to hold.
     misses_facts: bool,
-    /// The functions whose describe and count read durable inputs alone
-    /// ([`Frontend::durable`]): an edit of one moves `high`.
+    /// The functions whose describe and count read durable inputs alone: an edit of one
+    /// moves `high`.
     durable: std::collections::HashSet<u32>,
     /// The durable view ([`Frontend::durable_view`]).
     high: u64,
-    /// The group of inputs each function's describe and count hang on
-    /// ([`Frontend::group`]): one with none is asked each build.
-    groups: HashMap<u32, u64>,
-    /// The revision an input of each group was last written at
-    /// ([`Frontend::written_since`]).
-    written: HashMap<u64, u64>,
+    /// The revision at which each static's describe last changed ([`Program::touch_static`]).
+    statics_changed: HashMap<u32, u64>,
+    /// The revision at which each function's count last changed ([`Program::touch_count`]).
+    counts_changed: HashMap<u32, u64>,
+    /// Whose code asked for a describe of each function: the keys of its describes, which
+    /// the changed set names ([`Frontend::changed_since`]).
+    asked_by: Lock<HashMap<u32, Vec<Origin>>>,
+    /// The functions whose describe reads what the engine does not see
+    /// ([`Frontend::each_build`]): an edit of one's body is no revision, and its describe is
+    /// made again and compared whenever it is asked.
+    each_build: std::collections::HashSet<u32>,
+    /// The planted bug of a control: the changed set leaves out the first function that
+    /// changed.
+    unnamed: bool,
+    /// The planted bug of a control: no function is said to be asked each build.
+    forgets_each_build: bool,
+    /// The engine names no changed set ([`Changed::Unknown`]): everything held is asked.
+    names_no_set: bool,
 }
 
 impl Default for Engine {
@@ -129,8 +142,13 @@ impl Default for Engine {
             misses_facts: false,
             durable: std::collections::HashSet::new(),
             high: 0,
-            groups: HashMap::default(),
-            written: HashMap::default(),
+            statics_changed: HashMap::default(),
+            counts_changed: HashMap::default(),
+            asked_by: Lock::new("test.codegen.driver.engine_asked_by", HashMap::default()),
+            each_build: std::collections::HashSet::new(),
+            unnamed: false,
+            forgets_each_build: false,
+            names_no_set: false,
         }
     }
 }
@@ -201,9 +219,19 @@ impl Program {
         if self.engine.durable.contains(&id) {
             self.engine.high += 1;
         }
-        if let Some(group) = self.engine.groups.get(&id) {
-            self.engine.written.insert(*group, self.engine.revision);
-        }
+    }
+
+    /// An edit of what a describe of the static `id` reads: a new revision, which it changed
+    /// at.
+    fn touch_static(&mut self, id: u32) {
+        self.engine.revision += 1;
+        self.engine.statics_changed.insert(id, self.engine.revision);
+    }
+
+    /// An edit of what the count of `id` reads: a new revision, which its count changed at.
+    fn touch_count(&mut self, id: u32) {
+        self.engine.revision += 1;
+        self.engine.counts_changed.insert(id, self.engine.revision);
     }
 
     /// An edit of the dyn fact the body of `id` reads: a new revision, which the fact changed
@@ -280,6 +308,13 @@ impl Frontend for Program {
         let against = self.engine.against.load(Ordering::Relaxed);
         self.engine.describes.fetch_add(1, Ordering::Relaxed);
         self.engine.seen.lock().insert((*id, *requester, against), self.engine.revision);
+        {
+            let mut asked_by = self.engine.asked_by.lock();
+            let origins = asked_by.entry(*id).or_default();
+            if !origins.contains(requester) {
+                origins.push(*requester);
+            }
+        }
         let refs = function
             .calls
             .iter()
@@ -404,9 +439,15 @@ impl Frontend for Program {
         &self,
         id: &u32,
         requester: &Origin,
-        _: &Described<u32, u32>,
+        was: &Described<u32, u32>,
     ) -> Result<Option<Described<u32, u32>>, CodegenError> {
         let engine = &self.engine;
+        // What the engine does not see is described again and compared. A function an edit
+        // removed is asked of until the walk drops it: its describe is what it was.
+        if engine.each_build.contains(id) && self.functions.contains_key(id) {
+            let now = self.describe(id, requester)?;
+            return Ok((now != *was).then_some(now));
+        }
         let against = engine.against.load(Ordering::Relaxed);
         let mut changed = engine.changed.get(id).copied().unwrap_or(0);
         if against && !engine.misses_facts {
@@ -420,10 +461,6 @@ impl Frontend for Program {
         self.describe(id, requester).map(Some)
     }
 
-    fn durable(&self, id: &u32, _: &Origin) -> bool {
-        self.engine.durable.contains(id)
-    }
-
     fn durable_view(&self) -> Option<u64> {
         Some(self.engine.high)
     }
@@ -432,12 +469,43 @@ impl Frontend for Program {
         Some(self.engine.revision)
     }
 
-    fn group(&self, id: &u32, _: &Origin) -> Option<u64> {
-        self.engine.groups.get(id).copied()
+    /// Exactly what an edit since `view` changed ([`Program::touch`] and its like): each
+    /// function by every origin that asked for a describe of it, each count's function, each
+    /// static, by number.
+    fn changed_since(&self, view: u64) -> Changed<u32, u32> {
+        let engine = &self.engine;
+        if engine.names_no_set {
+            return Changed::Unknown("the test's engine names no changed set".to_owned());
+        }
+        let since = |changed: &HashMap<u32, u64>| {
+            let mut ids: Vec<u32> =
+                changed.iter().filter(|(_, at)| **at > view).map(|(id, _)| *id).collect();
+            ids.sort_unstable();
+            ids
+        };
+        let mut changed = since(&engine.changed);
+        if engine.unnamed && !changed.is_empty() {
+            changed.remove(0);
+        }
+        let asked_by = engine.asked_by.lock();
+        let functions = (changed.iter())
+            .flat_map(|id| {
+                asked_by.get(id).into_iter().flatten().map(move |origin| (*id, *origin))
+            })
+            .collect();
+        Changed::Named {
+            functions,
+            counted: since(&engine.counts_changed),
+            statics: since(&engine.statics_changed),
+        }
     }
 
-    fn written_since(&self, group: u64, view: u64) -> bool {
-        self.engine.written.get(&group).is_some_and(|at| *at > view)
+    fn each_build(&self, id: &u32, _: &Origin) -> bool {
+        !self.engine.forgets_each_build && self.engine.each_build.contains(id)
+    }
+
+    fn static_each_build(&self, _: &u32) -> bool {
+        false
     }
 
     fn closes(&self) -> bool {
