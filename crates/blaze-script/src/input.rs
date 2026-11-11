@@ -28,7 +28,7 @@ use std::io::Read;
 
 use serde_json::{Map, Value};
 
-use crate::pyjson::dumps;
+use crate::{os_error, pyjson::dumps};
 
 /// What is wrong with the input, naming the field.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,16 +58,6 @@ pub fn read(text: &str) -> Result<Value, InputError> {
         text
     };
     serde_json::from_str(text).map_err(|e| InputError(format!("the input is not JSON: {e}")))
-}
-
-/// An error opening `path` as Python's `OSError` prints: `[Errno 2] No such file or directory: 'x'`.
-fn os_error(e: &std::io::Error, path: &str) -> String {
-    let said = e.to_string();
-    let said = said.split(" (os error").next().unwrap_or(&said);
-    match e.raw_os_error() {
-        Some(code) => format!("[Errno {code}] {said}: '{path}'"),
-        None => format!("{said}: '{path}'"),
-    }
 }
 
 /// `T` read from the JSON `text` (inline, a path, or `-`); ends the script naming what is wrong.

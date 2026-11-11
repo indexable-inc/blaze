@@ -9,6 +9,8 @@
 //! - [`run`], [`git`], [`run_shown`]: a program run, its output captured or shown.
 //! - [`pyfmt`]: `{x:g}`, `{x!r}` and `{x}` of a value, as an f-string writes them.
 //! - [`pystr`]: Python's `splitlines` and whitespace, where Rust's `lines` and `trim` differ.
+//! - [`pypath`]: `os.path`'s `normpath`, `relpath` and the rest, `glob.glob` and `fnmatch`.
+//! - [`TempDir`]: `tempfile.TemporaryDirectory`, for a `selftest` that writes files.
 //! - [`fail`], [`expect`]: how a script ends in an error, and how its `selftest` checks.
 //!
 //! When a release carries bstd and reflection, a script's `Input::parse` is derived
@@ -17,11 +19,13 @@
 pub mod input;
 pub mod pyfmt;
 pub mod pyjson;
+pub mod pypath;
 pub mod pystr;
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 pub use regex;
@@ -105,10 +109,65 @@ pub fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// An error opening `path` as Python's `OSError` prints: `[Errno 2] No such file or directory: 'x'`.
+pub fn os_error(e: &std::io::Error, path: &str) -> String {
+    let said = e.to_string();
+    let said = said.split(" (os error").next().unwrap_or(&said);
+    match e.raw_os_error() {
+        Some(code) => format!("[Errno {code}] {said}: '{path}'"),
+        None => format!("{said}: '{path}'"),
+    }
+}
+
 /// A file's text as Python's `open(path, encoding="utf-8").read()` gives it (`\r\n` and `\r`
 /// become `\n`), or `None` when there is no such file, it is a directory or it is not UTF-8.
 pub fn read_text(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     let text = String::from_utf8(bytes).ok()?;
     Some(if text.contains('\r') { text.replace("\r\n", "\n").replace('\r', "\n") } else { text })
+}
+
+/// A new empty directory under the system's temporary directory, removed with all it holds
+/// when this is dropped: Python's `tempfile.TemporaryDirectory(prefix=...)`.
+#[derive(Debug)]
+pub struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    /// A directory named `<prefix><pid>-<n>`; `Err` names the directory that could not be made.
+    pub fn new(prefix: &str) -> Result<TempDir, String> {
+        static MADE: AtomicU32 = AtomicU32::new(0);
+        let n = MADE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("{prefix}{}-{n}", std::process::id()));
+        // A directory left by a process of the same id that was killed is not this one's.
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).map_err(|e| format!("{} could not be made: {e}", path.display()))?;
+        Ok(TempDir { path })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_temp_dir_is_new_and_goes_when_dropped() {
+        let (a, b) = (TempDir::new("blaze-script-t-").unwrap(), TempDir::new("blaze-script-t-").unwrap());
+        assert_ne!(a.path(), b.path());
+        std::fs::write(a.path().join("x"), "1").unwrap();
+        let held = a.path().to_owned();
+        drop(a);
+        assert!(!held.exists() && b.path().is_dir());
+    }
 }

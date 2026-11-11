@@ -11,6 +11,37 @@ pub fn dumps(value: &Value) -> String {
     out
 }
 
+/// `json.dumps(value, indent=indent)`: each item on its own line, `indent` spaces deeper than
+/// its holder, `","` ending all but the last, `[]` and `{}` when empty.
+pub fn dumps_indent(value: &Value, indent: usize) -> String {
+    let mut out = String::new();
+    write_indented(&mut out, value, indent, 0);
+    out
+}
+
+fn write_indented(out: &mut String, value: &Value, indent: usize, depth: usize) {
+    let items: Vec<(Option<&String>, &Value)> = match value {
+        Value::Array(items) if !items.is_empty() => items.iter().map(|it| (None, it)).collect(),
+        Value::Object(fields) if !fields.is_empty() => fields.iter().map(|(k, v)| (Some(k), v)).collect(),
+        other => return write(out, other, true),
+    };
+    let (open, close) = if value.is_array() { ('[', ']') } else { ('{', '}') };
+    let inner = " ".repeat(indent * (depth + 1));
+    out.push(open);
+    for (i, (key, item)) in items.into_iter().enumerate() {
+        out.push_str(if i > 0 { ",\n" } else { "\n" });
+        out.push_str(&inner);
+        if let Some(key) = key {
+            string(out, key, true);
+            out.push_str(": ");
+        }
+        write_indented(out, item, indent, depth + 1);
+    }
+    out.push('\n');
+    out.push_str(&" ".repeat(indent * depth));
+    out.push(close);
+}
+
 /// `json.dumps(value, ensure_ascii=False)`.
 pub fn dumps_unicode(value: &Value) -> String {
     let mut out = String::new();
@@ -116,6 +147,17 @@ mod tests {
         assert_eq!(dumps(&value), r#"{"a": [1, 2.5, "x\ty", null, true], "\u00e9": {"b": 1.0}}"#);
         assert_eq!(dumps_unicode(&value), "{\"a\": [1, 2.5, \"x\\ty\", null, true], \"é\": {\"b\": 1.0}}");
         assert_eq!(dumps(&json!("\u{1F600}\u{1}")), r#""\ud83d\ude00\u0001""#);
+    }
+
+    #[test]
+    fn an_indented_value_is_written_as_python_writes_it() {
+        let value = json!({"changed": ["a", "é"], "dependents": [], "all": false, "elsewhere": 1,
+            "n": {"x": {}, "y": [[1, 2.5]]}});
+        // json.dumps(value, indent=1) in Python 3.13.
+        let said = "{\n \"changed\": [\n  \"a\",\n  \"\\u00e9\"\n ],\n \"dependents\": [],\n \"all\": false,\n \
+            \"elsewhere\": 1,\n \"n\": {\n  \"x\": {},\n  \"y\": [\n   [\n    1,\n    2.5\n   ]\n  ]\n }\n}";
+        assert_eq!(dumps_indent(&value, 1), said);
+        assert_eq!(dumps_indent(&json!([]), 1), "[]");
     }
 
     #[test]

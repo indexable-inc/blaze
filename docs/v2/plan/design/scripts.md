@@ -234,13 +234,24 @@ the row says otherwise. `state`: `written` (the Rust is in the tree, not yet com
 | ledger | switched | `... ledger.py '{"command": "write"}'` | `R ledger -- '{"command": "write"}'` | `git status --short` empty after each on a clean tree; after a row's `known` is edited, objectives.json and objectives.md are the same bytes from both |
 | ledger | switched | `... ledger.py '{"command": "pick", "count": 4}'`, and `"count": 1` | `R ledger -- <the same>` | output, status 0 |
 | ledger | switched, not compared | `... ledger.py '{"command": "run", "engine": {"kind": "v2", "blaze": "<blaze>"}, "ids": ["V10"], "work": "/tmp/l-py"}'` | the same with `"work": "/tmp/l-rs"` | the lines printed and the status; objectives.json and objectives.md the same bytes (V10's check, `diff_rules.py check`, needs no blaze); `"ids": ["nope"]`: `ledger.py: no row nope`, status 1; without `engine`: `ledger.py: run needs \`engine\``, status 1 |
+| invariants | written | `uv run --frozen python harness/v2/invariants.py selftest` | `R invariants -- selftest` | output (`invariants.py selftest: ok`), status 0 |
+| invariants | written | `... invariants.py '{"command": "check"}'` | `R invariants -- '{"command": "check"}'` | clean tree: silent, status 0. Planted one at a time in a test file of `crates/`: `/// The invariant: x.` above a blank line and no item; `/// The invariant (certain): x.`; `/// The invariant (proved: proofs/Nope.lean): x.`; a `/// The refinement:` with no control; then `docs/v2/plan/invariants.md` with a line edited: the same lines, status 1; `{"command": "chek"}`, `{"comand": "check"}`, `{"command": "check", "root": "/tmp"}`, no argument: the same lines and status (the `root` case: status 1 from both, the words differ, see below) |
+| invariants | written | `... invariants.py '{"command": "write"}'` | `R invariants -- '{"command": "write"}'` | `git status --short` empty after each on a clean tree; with a statement added, `docs/v2/plan/invariants.md` the same bytes from both |
+| guards | written | `uv run --frozen python harness/v2/guards.py selftest` | `R guards -- selftest` | output (`guards.py selftest: ok`), status 0 |
+| guards | written | `... guards.py '{"command": "table"}'` | `R guards -- '{"command": "table"}'` | output, status 0 |
+| guards | written | `... guards.py '{"command": "held", "result": "<a smoke's budgets-smoke.json>"}'` | `R guards -- <the same>` | the lines and the status on a gate run's result; then on copies of it with one outcome's verdict set to `fail`, one outcome taken out, a number raised over its bound, and a bound of `harness/v2/guards-known.toml` that now passes; with `"result": "/nope.json"`, with no `result`, `{"command": "hold"}`, a `guards-known.toml` that is not TOML: the same lines, status 1 (the TOML error's words excepted) |
+| changed | written | `uv run --frozen python harness/v2/changed.py selftest` | `R changed -- selftest` | output (`changed.py selftest: ok`), status 0 |
+| changed | written | `... changed.py '{"base": "origin/main"}'`; with `"print": "packages"`; `"print": "args"`; `"dependents": false`; `{"base": "HEAD~3", "direct": true}` | `R changed -- <the same>` | output, status 0, on a branch a few commits past main; again with an untracked file in `crates/blaze-script/src/`, with `Cargo.lock` touched (`all`, `why_all`), and with only `docs/` changed (`print: args` prints nothing) |
+| changed | written | `... changed.py '{"base": "nope"}'`, `{"base": "main", "root": "/tmp"}`, `{"base": "main", "since": "x"}`, `{"base": "main", "print": "list"}`, `{}`, no argument | `R changed -- <the same>` | the same lines, status 1 |
 
 Known differences, on purpose: the words of a JSON syntax error are serde_json's; a heading's
 anchor keeps a character by Rust's `char::is_alphanumeric` and a table of combining-mark blocks
 where Python asked `str.isalnum` and Unicode category M (no heading of docs/ tells them apart:
 the clean-tree `check` proves it). The ledger's default `work` directory is
 `/tmp/ledger-<pid>-<nanoseconds>` where Python's `mkdtemp` chose a random name, and its date is
-`date +%Y-%m-%d`'s.
+`date +%Y-%m-%d`'s. A TOML syntax error (guards' known list, changed's manifests) is in the toml
+crate's words. `invariants` ends with git's words when `git ls-files` fails, and `changed` with
+`git did not start` when there is no git, where the Python raised (a traceback, status 1).
 
 ## Appendix: every Python file
 
