@@ -13,7 +13,7 @@ remembered. How rows are picked, worked and landed is
 `scripts/src/bin/ledger.rs`. A check in *italics* is not written yet, and writing it is the first
 part of the work. `?` is not measured; "last known" is a lead, not a status.
 
-106 objectives: 0 met, 0 open, 0 blocked, 106 not measured.
+107 objectives: 0 met, 0 open, 0 blocked, 107 not measured.
 
 ## Targets
 
@@ -136,6 +136,7 @@ The parts of [the design](../plan.md#the-design) no check has shown yet.
 | E14 | A value whose drop only frees memory is dropped at its last use under `#![blaze::early_drop]`; the borrow checker accepts what that frees; guards keep scope-end drop | *write: on a stage 1: hir-ty-mir's `mir::early_drop::frontier` tests (the Hegel invariant and its four `the_oracle_catches_*` controls) and `tests::mir::early_drop`, hir-ty-borrowck's `early_drop_tests`, hir-ty-pure's `tests::drop_effects`; then `check_drop_attr` reported by `blaze check`, the `blaze::unused_guard` lint, and a crate without the attribute building to the same bytes* | spec and first slice written on early-drop-1110, unbuilt (2026-11-10) | ? |
 | E15 | `#[blaze::program_lifetime]` is a checked type fact with Ref32; blaze's own syntax trees and interned data use it | *write: the lints' and blaze-mem's tests on a stage 1; the attribute deriving the ProgramLifetime impl (a hand-written unsafe impl refused); a count of blaze's syntax-tree and interner types held by Ref32, which must not be zero* | written on facts-1110, unbuilt (2026-11-10) | ? |
 | D43 | Python is gone from the repository: every script is a Rust script built and run by the pinned released blaze (docs/v2/plan/design/scripts.md) | `docs.rs python {"left": 0}` | 166 files, 63,906 lines of Python left; `tools/docs.py check` holds that none is added (2026-11-11) | ? |
+| D44 | blaze honours a profile's `strip`: `"debuginfo"` leaves out every crate's `.debug_*` sections and line tables (the shipped standard library's included), `true` or `"symbols"` also `.symtab` and `.strtab`, and on Mach-O the equivalent (no `__DWARF`, no local symbols); blaze-link never writes them (no remove after writing), and the link's key covers the setting | *write: the check: `.github/actions/script/build.sh` with its interim strip step removed and `strip = true` in `[profile.script]`, then `readelf -S` (Linux) or `otool -l` (macOS) on each script binary shows no `.debug_*`, `.symtab` or `__DWARF`, each binary is under 12 MB, and `docs check` still passes; plus a blaze-link test that a link with each setting writes none of those sections and a changed setting relinks. Until then the setting is accepted and ignored (blaze-units lowers it to debuginfo only; blaze-cargo's answers list `-C strip` as ignored). Refusing it is not a small change: [profile.release] strip = true is common in real projects, which would then not build (superset-of-rust), and blaze-manifest's profile fixtures (overrides, inherits) record cargo building such profiles, so the fix is the implementation* | a script binary is 143-149 MB, ~138 MB of it std's shipped DWARF; `size docs` 8.9 MB loaded; .symtab 0.44 MB and .strtab 1.9 MB; the script action strips with binutils in the meantime (2026-11-11) | ? |
 
 ## The agent app
 
