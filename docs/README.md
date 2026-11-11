@@ -20,6 +20,7 @@ How blaze is now. Kept true: CI checks their links, paths and settings against t
 - [install.md](install.md): Installing blaze: the install script, the release channels and what gets installed.
 - [ix-prof.md](ix-prof.md): Profiling any Rust program, not only blaze, like Go's pprof. Covers the ix-prof crate (CPU samples of every thread, tracing spans with their own CPU time and allocations, named waits, allocations by stack), `IX_PROF=<dir>`, the loopback `/debug/pprof` endpoint and live stream, and `blaze pprof` with top, peek, tree, list, flame, diff, export and --http.
 - [lints.md](lints.md): The general `blaze::` lints `blaze check` runs in every workspace (`blaze::general`): what each catches, why it costs, how to fix or allow it, and the `clippy.toml` keys that tune them; then the three guard lints of `blaze::internal` that ask for a stated reason on the line (`durable_write`, `unbounded_wait`, `combined_identity`).
+- [macos.md](macos.md): Which macOS interfaces blaze uses where a private, undocumented or Apple-only call beats the portable one (rule macos-private-apis), what each buys, its risk, and what is still to measure.
 - [mir-passes.md](mir-passes.md): The MIR passes from built MIR to runtime MIR, ported from rustc, that codegen and the interpreter run on.
 - [no-rustc.md](no-rustc.md): The no-rustc rule, what counts as running rustc, the end state, and the live list of the places that still name rustc or cargo.
 - [release.md](release.md): Releases: the canary and stable channels, how a release is cut and what gates promotion to stable.
