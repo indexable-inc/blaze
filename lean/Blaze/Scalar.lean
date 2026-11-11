@@ -157,6 +157,11 @@ theorem checked_ok (ty : ScalarTy) (x : Int) (h : ty.min ≤ x ∧ x ≤ ty.max)
   unfold checked
   rw [dif_pos h]
 
+theorem checked_fail (ty : ScalarTy) (x : Int) (h : ¬ (ty.min ≤ x ∧ x ≤ ty.max)) :
+    checked ty x = Result.fail Error.arithmetic := by
+  unfold checked
+  rw [dif_neg h]
+
 /-- `x` brought to the nearest end of `ty`'s range. -/
 def clamp (ty : ScalarTy) (x : Int) : Scalar ty :=
   if h1 : x < ty.min then ⟨ty.min, Int.le_refl _, ty.min_le_max⟩
