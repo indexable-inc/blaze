@@ -1996,7 +1996,13 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// everything it calls to that (docs/v2/plan/design/effects.md): `blaze check` refuses a
     /// blocking call under it, naming the chain. A call proven not to wait is marked
     /// `#[blaze::nonblocking(trusted = "why")]` where it is defined, never allowed here.
-    #[blaze::nonblocking]
+    ///
+    /// Off for one release (2026-11-10): the released blaze (stage 0, 0.20261105.4) takes
+    /// `blaze_ids::Idx<T>`'s `PhantomData<fn() -> T>` for a function pointer it cannot see
+    /// through and refuses this function; the checker is fixed in 02b092913b. Put the attribute
+    /// back when `.github/blaze-version` names a blaze with that fix. Until then the loop is
+    /// held at run time by the `loop stalled` span (`Stalled`) and harness/v2/loop_syscalls.py.
+    // #[blaze::nonblocking]
     fn turn_after_wait(&mut self, mut done: Vec<Completion>) -> bool {
         let mut step = Stalled::begin("completions");
         for completion in &done {
