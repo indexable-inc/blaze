@@ -275,7 +275,7 @@ ORDER BY peak_mib DESC NULLS LAST, task
 -- says: a build's daemon tasks whose peak passed their grant or stayed under half of it (`task` spans), worst first: the task kind, its crate and unit, its grant and peak, and by how much the grant missed
 SELECT
     function AS task,
-    "crate",
+    crate,
     unit,
     round(granted_bytes / 1048576, 1) AS granted_mib,
     round(peak_bytes / 1048576, 1) AS peak_mib,
@@ -284,7 +284,7 @@ SELECT
 FROM spans
 WHERE build_id = $build AND name = 'task'
     AND (peak_bytes > granted_bytes OR peak_bytes * 2 < granted_bytes)
-ORDER BY missed_mib DESC, task, "crate", unit
+ORDER BY missed_mib DESC, task, crate, unit
 LIMIT $limit
 
 -- name: memory_timeline
@@ -300,9 +300,9 @@ WITH c AS (
 measured AS (SELECT t_ns, value AS kept FROM c WHERE name = 'allocator kept bytes'),
 derived AS (
     SELECT r.t_ns, f.value - h.value - r.value AS kept
-    FROM (SELECT t_ns, value FROM c WHERE name = 'blaze-mem resident bytes') r
-    ASOF JOIN (SELECT t_ns, value FROM c WHERE name = 'heap live bytes') h ON r.t_ns >= h.t_ns
-    ASOF JOIN (SELECT t_ns, value FROM c WHERE name = 'footprint bytes') f ON r.t_ns >= f.t_ns
+    FROM (SELECT t_ns, value FROM c WHERE name = 'blaze-mem resident bytes') AS r
+    ASOF JOIN (SELECT t_ns, value FROM c WHERE name = 'heap live bytes') AS h ON r.t_ns >= h.t_ns
+    ASOF JOIN (SELECT t_ns, value FROM c WHERE name = 'footprint bytes') AS f ON r.t_ns >= f.t_ns
 ),
 kept AS (
     SELECT * FROM measured
@@ -332,7 +332,7 @@ WITH tasks AS (
     SELECT * FROM spans WHERE build_id = $build AND name = 'task' AND peak_bytes IS NOT NULL
 ),
 phases AS (
-    SELECT process, parent, any_value("crate") AS krate, any_value(unit) AS unit
+    SELECT process, parent, any_value(crate) AS krate, any_value(unit) AS unit
     FROM spans
     WHERE build_id = $build
         AND name IN ('unit names', 'unit bodies', 'unit codegen', 'unit link', 'unit store')
@@ -340,7 +340,7 @@ phases AS (
 )
 SELECT
     t.function AS task,
-    coalesce(t."crate", p.krate) AS "crate",
+    coalesce(t.crate, p.krate) AS crate,
     coalesce(t.unit, p.unit) AS unit,
     round(t.peak_bytes / 1073741824, 2) AS peak_gib,
     round(t.granted_bytes / 1073741824, 2) AS granted_gib,
@@ -348,8 +348,8 @@ SELECT
     round(t.heap_freed_bytes / 1073741824, 2) AS heap_freed_gib,
     round(t.heap_allocated_bytes / nullif(t.peak_bytes, 0), 1) AS churn_x_peak,
     round(t.dur_ns / 1e9, 1) AS s
-FROM tasks t
-LEFT JOIN phases p ON p.process = t.process AND p.parent = t.span_id
+FROM tasks AS t
+LEFT JOIN phases AS p ON p.process = t.process AND p.parent = t.span_id
 ORDER BY t.peak_bytes DESC, task
 LIMIT $limit
 

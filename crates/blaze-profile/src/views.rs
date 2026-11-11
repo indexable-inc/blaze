@@ -851,6 +851,11 @@ mod tests {
         "row_number",
         "regexp_extract",
         "ends_with",
+        "abs",
+        "avg",
+        "floor",
+        "nullif",
+        "split_part",
     ];
 
     /// The identifiers of `sql` outside comments, strings, numbers and `$`/`@` names, each with
