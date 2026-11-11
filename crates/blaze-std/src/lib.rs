@@ -95,13 +95,13 @@
     allocator_api,
     allocator_ext,
     blaze_comptime,
+    blaze_const_exprs,
     coerce_unsized,
     const_cmp,
     const_trait_impl,
     core_intrinsics,
     custom_inner_attributes,
     generic_atomic,
-    generic_const_exprs,
     marker_trait_attr,
     register_tool,
     type_info,
@@ -109,10 +109,8 @@
 )]
 #![allow(
     internal_features,
-    incomplete_features,
     reason = "`core_intrinsics` for the one reflection intrinsic `own::raw` asks directly \
-              (`type_id_vtable`, of an unsized type); `generic_const_exprs` is blaze's own \
-              (docs/v2/plan/design/ownership.md), which rustc calls incomplete"
+              (`type_id_vtable`, of an unsized type)"
 )]
 #![register_tool(blaze)]
 
