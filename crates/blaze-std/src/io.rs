@@ -33,7 +33,13 @@
 //! them ([`Offers::NATIVE`]) and a simulated one answers them from its
 //! [`SimHost`] ([`Io::script`]). Nothing stands in for a missing provider.
 
-use alloc::{boxed::Box, string::{String, ToString}, sync::Arc, vec::Vec};
+use alloc::{
+    boxed::Box,
+    collections::BTreeMap,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use core::{fmt, time::Duration};
 
 use blaze_core::{
@@ -206,6 +212,12 @@ struct World {
     /// test's view of where its capabilities reached.
     touched: Vec<(FileName, bool)>,
     record: bool,
+    /// For each file whose bytes or name an effect of this world changed, the number of the
+    /// last effect that did (its tag, plus one): the file's generation, which a
+    /// [`crate::fs::Flushed`] carries and its clone compares. A file removed or renamed away
+    /// has no entry, so the table holds one entry a file that is there and was changed here.
+    // alloc: one entry a live file changed through this world.
+    changed: BTreeMap<FileName, u64>,
     /// What the world's tasks recorded through their contexts.
     trace: Trace,
     host: HostFacts,
@@ -520,6 +532,8 @@ impl Io {
             // alloc: none until a test records.
             touched: Vec::new(),
             record: false,
+            // alloc: none until a file is changed.
+            changed: BTreeMap::new(),
             trace: Trace::new(limits.trace_most),
             host,
             exited: None,
@@ -960,6 +974,7 @@ impl Io {
         if world.record {
             touch(&mut world.touched, &effect);
         }
+        change(&mut world.changed, &effect, tag.0 + 1);
         let World { driver, effects, disk, .. } = &mut *world;
         if let (Some(disk), Some(sim)) = (disk.as_deref_mut(), driver.sim()) {
             disk.submitted(sim, &effect);
@@ -967,6 +982,14 @@ impl Io {
         effects.push(effect);
         driver.submit(effects);
         tag
+    }
+
+    /// The generation of `name`: the number of the last effect of this world that changed
+    /// its bytes or made it, 0 for a file no effect of this world changed (or one since
+    /// removed). Changes by another process are not seen: blaze-core's `Meta` carries no
+    /// inode or change time to compare (std.md, "still implicit").
+    pub(crate) fn generation(&self, name: &FileName) -> u64 {
+        self.world.lock().changed.get(name).copied().unwrap_or(0)
     }
 
     /// A number no other call of this world was given: a tag's, taken for a name made beside
@@ -1135,6 +1158,36 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
         | Effect::Send { .. }
         | Effect::Hangup { .. }
         | Effect::Pressure { .. } => {}
+    }
+}
+
+/// Records in `changed` what `effect`, numbered `stamp`, does to the files it names: a file
+/// whose bytes it changes or that it makes is stamped; one it removes or renames away loses
+/// its entry.
+fn change(changed: &mut BTreeMap<FileName, u64>, effect: &Effect, stamp: u64) {
+    match effect {
+        Effect::Append { file, .. }
+        | Effect::Truncate { file, .. }
+        | Effect::Write { file, .. }
+        | Effect::WriteAt { file, .. }
+        | Effect::WriteFrom { file, .. } => {
+            // clone: the table's key, a refcount.
+            changed.insert(file.clone(), stamp);
+        }
+        Effect::Remove { file, .. } => {
+            changed.remove(file);
+        }
+        Effect::Rename { from, to, .. } => {
+            changed.remove(from);
+            // clone: the table's key, a refcount.
+            changed.insert(to.clone(), stamp);
+        }
+        Effect::Clone { to, .. } | Effect::Link { to, .. } => {
+            // clone: the table's key, a refcount.
+            changed.insert(to.clone(), stamp);
+        }
+        // Everything else leaves every file's bytes and names as they were.
+        _ => {}
     }
 }
 

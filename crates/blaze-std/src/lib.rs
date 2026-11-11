@@ -427,4 +427,6 @@ pub(crate) enum Plant {
     DurableSkipsNameSync,
     /// `Written::flush` asks for the flush and hands out its `Flushed` without waiting for it.
     FlushedBeforeFlush,
+    /// `Flushed::clone_to` does not look at whether its file was changed behind it.
+    StaleFlushedCloned,
 }

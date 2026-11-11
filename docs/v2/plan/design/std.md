@@ -470,7 +470,11 @@ hid the two things that decide its cost. Built in `bstd::fs` (S1).
 - **A file whose data may not be on disk is another type.** An `_unsynced` call gives
   `Written`; `written.flush(cx)` gives `Flushed`, and is the wait; a `_synced` call gives
   `Flushed`. `clone_to` exists on `Flushed` alone; `copy_to` (a plain read and write of the
-  bytes, a chunk at a time) is on both. A clone that forces writeback cannot be written.
+  bytes, a chunk at a time) is on both. A clone that forces writeback cannot be written. A
+  `Flushed` does not go stale silently: it carries the file's generation (the number of the
+  last effect of its world that changed the file, kept by the `Io`), and a clone of a file
+  changed since is refused, naming it (`FsKind::Stale`); flushing again gives one that clones.
+  A change by another process is not seen until an effect reports the inode and change time.
   Neither replaces a file that is there: that is `publish`.
 - **Say what a path should hold, not how.** `dir.publish(path, content, durable)` makes `path`
   hold `content`, replaced all at once (a temporary file beside it, renamed over it), where
@@ -906,6 +910,7 @@ parameter when records land; its cost and guarantee fields stay required.
 | `fs` | `File::close{,_unsynced,_synced}` giving `Written` or `Flushed` | that closing syncs only when told, and what the file then is | `close` always synced |
 | `fs` | `Dir::{remove,rename_replacing}{,_unsynced,_synced}`, `Dir::sync_names` | that a name is durable only once its directory is synced; that a rename replaces | `remove`, `rename`: durability unsaid |
 | `fs` | `Written`, `Flushed`, `clone_to`, `copy_to(.., chunk)` | whether bytes reached the disk; clone against copy; neither replaces (`FsKind::Exists`) | no clone or copy in bstd; the store's own |
+| `fs` | `Flushed` carries its file's generation; `clone_to` and a cloning publish refuse `FsKind::Stale`; `Flushed::is_stale` | that the file was not changed, through this world, since its flush | a write behind a `Flushed` was unseen, and its clone forced writeback |
 | `fs` | `Dir::create` | in place, not atomic, nothing durable until its close says | "made empty, replacing what was there" through a synced whole-file write |
 | `fs` | `Buffered`, `Pushed` | the one buffer, sized by its maker; held against written; linear | no buffered writer |
 | `fs` | `File::read_into(buf)`, `read_at`, `read_all(into)`, `Dir::list(cx, frame)` | the caller's buffer or allocator | already explicit |
@@ -952,6 +957,7 @@ chosen otherwise today, and each is a row to close):
 | `streams` (handler provider) | replies are held in the global heap (bounded by `inbox_most`) | an allocator on `Streams::open` |
 | `Path::join`, `Dir::subdir`, narrowing (`only`) | a name or an allow-list is allocated in the global heap, once | S4's `String<A>`, or names interned in the task's frame |
 | `keys::Secret` | its bytes are in the global heap | a locked, zeroed arena from `Mem` |
+| `fs::Flushed` | a change to its file by another process is not seen (the generation counts this world's effects) | a stat effect that reports the inode and change time (`statx` in blaze-sys has both) |
 | `sync::RwLock`, `Signal` | `read()`, `write()` and `wait()` take no `Cx` (blaze-core's, re-exported); `Lock::lock(cx)` waits on the wall clock, not the driver's | S1b: bstd's own locks over the one wait |
 | `Io`'s own state | one process lock around the driver (uncontended under `Inline`) | the scheduler (S3b) |
 | `kv::KEY_MOST` | a bound of the format (a key's longest file name), a `pub const` named in the outcome it ends in | nothing: not a policy |

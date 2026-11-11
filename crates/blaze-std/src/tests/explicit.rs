@@ -160,20 +160,73 @@ fn a_clone_of_a_flushed_file_forces_nothing_and_one_of_unflushed_bytes_is_charge
     let counts = io.disk().expect("a simulated disk");
     assert_eq!((counts.clones, counts.forced_writeback), (1, 0));
     assert_eq!(held(&cx, &dir, "clone").as_deref(), Some(&[7u8; 100][..]));
-    // What no type sees: the path is written again behind the `Flushed`, unsynced. The
-    // simulation charges the clone for every byte it makes the kernel write out.
+    // The path is written again behind the `Flushed`, unsynced: the `Flushed` is stale, and
+    // its clone is refused before anything is made, naming the file.
     dir.publish_unsynced(&cx, &path("base"), Content::bytes(&[8; 60]), Unsynced::No).expect("a publish");
-    flushed.clone_to(&cx, &dir, &path("stale")).expect("a clone");
+    assert!(flushed.is_stale());
+    let refused = flushed.clone_to(&cx, &dir, &path("stale")).expect_err("a clone of a file changed behind its Flushed");
+    assert!(matches!(refused.kind, FsKind::Stale { .. }), "{refused}");
+    assert_eq!(refused.op, FsOp::CloneTo);
+    assert!(refused.to_string().contains("data/base") && refused.to_string().contains("flush it again"), "{refused}");
+    assert_eq!(held(&cx, &dir, "stale"), None, "a refused clone made nothing");
     let counts = io.disk().expect("a simulated disk");
-    assert_eq!((counts.clones, counts.forced_writeback), (2, 60));
+    assert_eq!((counts.clones, counts.forced_writeback), (1, 0));
+    // Flushed again, it clones, and forces nothing.
+    let again = crate::fs::Written::from(flushed).flush(&cx).expect("a flush");
+    assert!(!again.is_stale());
+    again.clone_to(&cx, &dir, &path("fresh")).expect("a clone of the file flushed again");
+    let counts = io.disk().expect("a simulated disk");
+    assert_eq!((counts.clones, counts.forced_writeback), (2, 0));
+    assert_eq!(held(&cx, &dir, "fresh").as_deref(), Some(&[8u8; 60][..]));
     // A copy of the same unflushed file forces nothing: it reads and writes.
     dir.publish_unsynced(&cx, &path("base"), Content::bytes(&[9; 40]), Unsynced::No).expect("a publish");
     let chunk = NonZero::new(16).expect("a chunk");
     let unflushed = dir.open_read(&cx, &path("base")).expect("the file");
     let copied = dir.publish_unsynced(&cx, &path("copy"), Content::copy_of(&unflushed, chunk), Unsynced::No).expect("a copy");
     assert_eq!(copied.how, How::Copied);
-    assert_eq!(io.disk().expect("a simulated disk").forced_writeback, 60);
+    assert_eq!(io.disk().expect("a simulated disk").forced_writeback, 0);
     assert_eq!(held(&cx, &dir, "copy").as_deref(), Some(&[9u8; 40][..]));
+}
+
+/// The invariant: no clone made through a `Flushed` forces writeback, whatever was written
+/// behind it. The oracle is the simulated disk's ledger. `plant` is the bug planted.
+fn stale_clone_forces_nothing(plant: Plant) -> Result<(), String> {
+    let io = world(24, plant);
+    let (cx, dir) = data(&io);
+    let flushed = dir.publish_synced(&cx, &path("base"), Content::bytes(&[7; 100])).map_err(|error| error.to_string())?.file;
+    // Written behind the `Flushed`, three ways: a publish over the path, an append through
+    // another handle, a rename onto it.
+    let file = match dir.open(&cx, &path("base")) {
+        Ok(file) => file,
+        Err(error) => return Err(error.to_string()),
+    };
+    let appended = file.append_unsynced(&cx, &[8; 60], Unsynced::No);
+    let closed = file.close_unsynced(Unsynced::No);
+    appended.map_err(|error| error.to_string())?;
+    closed.map_err(|error| error.to_string())?;
+    // A clone either is refused or forced nothing out.
+    let cloned = flushed.clone_to(&cx, &dir, &path("clone"));
+    let published = dir.publish_unsynced(&cx, &path("published"), Content::file(&flushed), Unsynced::No);
+    let forced = io.disk().ok_or("no simulated disk")?.forced_writeback;
+    match forced {
+        0 => Ok(()),
+        forced => Err(format!(
+            "clones of a file written behind its Flushed forced {forced} bytes out (clone_to: {}, publish: {})",
+            cloned.is_ok(),
+            published.is_ok()
+        )),
+    }
+}
+
+#[test]
+fn a_flushed_file_written_behind_is_not_cloned() {
+    stale_clone_forces_nothing(Plant::None).unwrap();
+}
+
+#[test]
+fn the_oracle_catches_a_stale_flushed_cloned() {
+    let why = stale_clone_forces_nothing(Plant::StaleFlushedCloned).expect_err("a stale Flushed was cloned and nothing noticed");
+    assert!(why.contains("forced 60 bytes") || why.contains("forced 120 bytes"), "{why}");
 }
 
 #[test]

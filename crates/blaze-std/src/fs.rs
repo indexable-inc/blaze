@@ -366,6 +366,10 @@ pub enum FsKind {
     /// a directory (blaze-core's rename syncs its own; nothing else of its does): refused,
     /// never said durable. The change itself was made.
     NoNameSync,
+    /// A [`Flushed`] was to be cloned and its file was changed after the flush it stands
+    /// for (by effect `changed_at` of this world; the flush saw `flushed_at`): the clone
+    /// would make the kernel write the new bytes out first. Nothing was cloned.
+    Stale { flushed_at: u64, changed_at: u64 },
     /// The driver failed it, saying this.
     Driver(String),
     /// The driver answered with a completion of another kind: a driver's bug.
@@ -403,6 +407,13 @@ impl fmt::Display for FsError {
                 f,
                 "bstd::fs {op} of {path}: its directory's names were to be synced, and this driver has no \
                  effect that syncs a directory: the change was made and is not said durable (rule no-fallback)"
+            ),
+            FsKind::Stale { flushed_at, changed_at } => write!(
+                f,
+                "bstd::fs {op} of {path}: the file was changed after it was flushed (the flush saw \
+                 change {flushed_at}, and change {changed_at} came after), so a clone would wait for \
+                 its writeback: nothing was cloned (flush it again, `Written::from(flushed).flush(cx)`, \
+                 or copy it)"
             ),
             FsKind::Driver(said) => write!(f, "bstd::fs {op} of {path}: {said}"),
             FsKind::Answered(done) => {
@@ -891,6 +902,7 @@ impl Dir<ReadWrite> {
                 How::Written
             }
             Kind::CloneOf(base) => {
+                base.not_stale(FsOp::Publish)?;
                 // A name left by an earlier process: a clone never replaces.
                 remove(&self.io, cx, FsOp::Publish, &temp)?;
                 clone_file(&self.io, cx, FsOp::Publish, base.name(), &temp)?;
@@ -901,6 +913,7 @@ impl Dir<ReadWrite> {
                 How::Copied
             }
             Kind::PatchOf { base, patches } => {
+                base.not_stale(FsOp::Publish)?;
                 remove(&self.io, cx, FsOp::Publish, &temp)?;
                 clone_file(&self.io, cx, FsOp::Publish, base.name(), &temp)?;
                 for patch in patches {
@@ -989,7 +1002,10 @@ impl Dir<ReadWrite> {
         self.swap_in(cx, flushed.name(), &name)?;
         sync_names(&self.io, cx, FsOp::Publish, &name, true)?;
         cx.event(how.says());
-        Ok(Published { file: Flushed::of(&self.io, name), how })
+        // The name's generation is its rename's: the bytes were flushed as the temporary file,
+        // and nothing changed them since.
+        let seen = self.io.generation(&name);
+        Ok(Published { file: Flushed::of(&self.io, name, seen), how })
     }
 
     /// The file at `path` gone, as durably as `durable` says; gone already is done.
@@ -1082,12 +1098,17 @@ pub struct Written {
 }
 
 /// A file whose bytes had all reached the disk when this was made: what a `_synced` call and
-/// [`Written::flush`] give. The one type with [`Flushed::clone_to`]. A write to the file
-/// through another handle after this was made is not seen by the type: the simulation
-/// counts what a clone then forces out ([`crate::disk::DiskCounts::forced_writeback`]).
+/// [`Written::flush`] give. The one type with [`Flushed::clone_to`]. It carries the file's
+/// generation as its flush saw it (the number of the last effect of this world that changed
+/// the file), and a clone of a file changed since is refused ([`FsKind::Stale`]): a
+/// `Flushed` does not go stale silently. A change by another process is not seen (blaze-core
+/// reports no inode or change time yet); the simulation still counts what any clone forces
+/// out ([`crate::disk::DiskCounts::forced_writeback`]).
 #[derive(Clone, Debug)] // clone: authority held, copied: refcounts
 pub struct Flushed {
     file: File<ReadOnly>,
+    /// The file's generation ([`Io::generation`]) read before the flush this stands for.
+    seen: u64,
 }
 
 impl From<File<ReadOnly>> for Written {
@@ -1099,6 +1120,8 @@ impl From<File<ReadOnly>> for Written {
 }
 
 impl From<Flushed> for Written {
+    /// A flushed file taken as one that may not be: it claims less. The way back from a
+    /// stale `Flushed` is this and [`Written::flush`].
     fn from(flushed: Flushed) -> Written {
         Written { file: flushed.file }
     }
@@ -1124,12 +1147,15 @@ impl Written {
     /// `_synced` call that named it).
     pub fn flush(self, cx: &Cx) -> Result<Flushed, FsError> {
         let Written { file } = self;
+        // Read before the flush is asked for: a change that lands while it runs is one the
+        // flush may not cover, and makes the `Flushed` stale.
+        let seen = file.io.generation(&file.name);
         if file.io.plant() == Plant::FlushedBeforeFlush {
             flush_start(&file.io, &file.name);
-            return Ok(Flushed { file });
+            return Ok(Flushed { file, seen });
         }
         flush_wait(&file.io, cx, FsOp::Flush, &file.name)?;
-        Ok(Flushed { file })
+        Ok(Flushed { file, seen })
     }
 
     /// A new file at `path` beneath `dir` holding what this holds, read and written `chunk`
@@ -1150,8 +1176,26 @@ impl Written {
 }
 
 impl Flushed {
-    fn of(io: &Io, name: FileName) -> Flushed {
-        Flushed { file: File { io: io.clone(), name, quota: None, made: false, rights: ReadOnly } }
+    fn of(io: &Io, name: FileName, seen: u64) -> Flushed {
+        Flushed { file: File { io: io.clone(), name, quota: None, made: false, rights: ReadOnly }, seen }
+    }
+
+    /// Whether the file was changed, through this world, after the flush this stands for:
+    /// then [`Flushed::clone_to`] and a publish that clones it refuse it.
+    pub fn is_stale(&self) -> bool {
+        self.file.io.generation(&self.file.name) != self.seen
+    }
+
+    /// What every clone of this file checks first, for the call `op`: [`FsKind::Stale`],
+    /// naming the file, when it was changed after its flush. Under
+    /// [`Plant::StaleFlushedCloned`] nothing is checked: the planted bug of the stale-clone
+    /// test.
+    fn not_stale(&self, op: FsOp) -> Result<(), FsError> {
+        let changed_at = self.file.io.generation(&self.file.name);
+        if changed_at == self.seen || self.file.io.plant() == Plant::StaleFlushedCloned {
+            return Ok(());
+        }
+        Err(FsError::new(op, &self.file.name, FsKind::Stale { flushed_at: self.seen, changed_at }))
     }
 
     /// The file, to read.
@@ -1167,8 +1211,11 @@ impl Flushed {
     /// are forced out, this file being flushed. It never replaces: something at `path` is
     /// [`FsKind::Exists`]. A file system that cannot share blocks fails it, naming both
     /// volumes; nothing copies in its place ([`Flushed::copy_to`] is the copy). The new
-    /// file's name is not synced.
+    /// file's name is not synced. A file changed since its flush is refused before anything
+    /// is made ([`FsKind::Stale`], naming the file): flushing it again gives a `Flushed` that
+    /// clones.
     pub fn clone_to(&self, cx: &Cx, dir: &Dir<ReadWrite>, path: &Path) -> Result<Written, FsError> {
+        self.not_stale(FsOp::CloneTo)?;
         let to = dir.beneath(path);
         dir.absent(cx, FsOp::CloneTo, &to)?;
         clone_file(&dir.io, cx, FsOp::CloneTo, &self.file.name, &to)?;
@@ -1461,14 +1508,15 @@ impl File<ReadWrite> {
     pub fn close_synced(self, cx: &Cx) -> Result<Flushed, FsError> {
         let File { io, name, quota: _, made, rights } = self;
         crate::consume(rights);
+        let seen = io.generation(&name);
         if io.plant() == Plant::CloseSkipsSync {
-            return Ok(Flushed::of(&io, name));
+            return Ok(Flushed::of(&io, name, seen));
         }
         flush_wait(&io, cx, FsOp::Close, &name)?;
         if made {
             sync_names(&io, cx, FsOp::Close, &name, false)?;
         }
-        Ok(Flushed::of(&io, name))
+        Ok(Flushed::of(&io, name, seen))
     }
 }
 
