@@ -76,15 +76,27 @@ jobs:
   changes:
     name: changes
     runs-on: [ix, arm64]
-    # The release's install and a build of scripts/ from the runner's store (an ix runner starts
-    # from main's last green disk); not yet measured.
-    timeout-minutes: 20
+    # The built scripts from the Actions cache take seconds (./.github/actions/script); a miss,
+    # once per change of their inputs, installs the release and builds scripts/ from the
+    # runner's store (an ix runner starts from main's last green disk). Neither is measured yet.
+    timeout-minutes: 12
     outputs:
       tier: ${{ steps.files.outputs.tier }}
     steps:
-      # A whole checkout: `blaze run` loads the workspace scripts/ is a member of.
+      # Only what the script action's key reads (.github/actions/script/key.sh); a miss checks
+      # the rest out.
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/blaze
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.github/
+            /.cargo/
+            /scripts/
+            /crates/blaze-script/
+            /harness/toolchain
+            /Cargo.toml
+            /Cargo.lock
+      - uses: ./.github/actions/script
         with:
           job: changes
       - id: files
@@ -95,14 +107,14 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           HEAD: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
         run: |
-          blaze run -q -p scripts --bin gate_changes -- \
+          "$BLAZE_SCRIPTS/gate_changes" \
             "{\"tier\": \"$TIER\", \"repository\": \"$GITHUB_REPOSITORY\", \"base\": \"$BASE\", \"head\": \"$HEAD\"}"
 
   scripts:
     name: harness imports, rustc sites
     runs-on: [ix, arm64]
-    # 10 before the Rust scripts; the release's install and a cold build of scripts/ come on top
-    # (not yet measured).
+    # 10 before the Rust scripts; the built scripts come from the Actions cache in seconds, and a
+    # miss (the release's install and a build of scripts/) comes on top (not yet measured).
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -127,26 +139,26 @@ jobs:
       # Under bun: tsc's script asks for node, which ix's runner image does not have.
       - run: bun site/node_modules/.bin/tsc -p tools/agents
       - run: bun tools/agents/rules.ts --check
-      # The repository's Rust scripts (scripts/, docs/v2/plan/design/scripts.md) run on the
-      # release .github/blaze-version names, never on the blaze this tree builds: a tree whose
-      # compiler does not build must still be checked (the stage-0 rule). No LLVM: the scripts
-      # link none.
-      - uses: ./.github/actions/blaze
+      # The repository's Rust scripts (scripts/, docs/v2/plan/design/scripts.md), built by the
+      # release .github/blaze-version names, never by the blaze this tree builds: a tree whose
+      # compiler does not build must still be checked (the stage-0 rule). From the Actions cache
+      # when their inputs are unchanged (./.github/actions/script). No LLVM: the scripts link none.
+      - uses: ./.github/actions/script
         with:
           job: scripts
       # Each doc says what it is, the current ones hold against the tree, and docs/README.md is
       # their index (scripts/src/bin/docs.rs). And no Python file is added: tools/python-allowed.txt
       # lists the ones left and only shrinks (docs/v2/plan/design/scripts.md).
       - run: |
-          blaze run -q -p scripts --bin docs -- selftest
-          blaze run -q -p scripts --bin docs -- check
+          "$BLAZE_SCRIPTS/docs" selftest
+          "$BLAZE_SCRIPTS/docs" check
       # No new place in blaze's code starts rustc, rustdoc or cargo (docs/no-rustc.md,
       # scripts/src/bin/rustcsites.rs).
-      - run: blaze run -q -p scripts --bin rustcsites
+      - run: '"$BLAZE_SCRIPTS/rustcsites"'
       # The objectives ledger's rows are well formed and its table is current (scripts/src/bin/ledger.rs).
       - run: |
-          blaze run -q -p scripts --bin ledger -- selftest
-          blaze run -q -p scripts --bin ledger -- '{"command": "check"}'
+          "$BLAZE_SCRIPTS/ledger" selftest
+          "$BLAZE_SCRIPTS/ledger" '{"command": "check"}'
       # The budget harness's own parts hold: which rows an input selects, the daemon home's layout
       # against the daemon's rule, the smoke's edit on the fixture (harness/v2/budgets.py). Its
       # smoke, against the blaze a change builds, is blaze-platform.yaml's profile-gate job.
@@ -156,17 +168,17 @@ jobs:
       # guard missing is refused. And which packages a change touches (scripts/src/bin/changed.rs).
       - run: |
           uv run --frozen python harness/v2/guards.py selftest
-          blaze run -q -p scripts --bin changed -- selftest
+          "$BLAZE_SCRIPTS/changed" selftest
       # Every stated invariant has a control beside it, and docs/v2/plan/invariants.md lists them
       # (scripts/src/bin/invariants.rs).
       - run: |
-          blaze run -q -p scripts --bin invariants -- selftest
-          blaze run -q -p scripts --bin invariants -- '{"command": "check"}'
+          "$BLAZE_SCRIPTS/invariants" selftest
+          "$BLAZE_SCRIPTS/invariants" '{"command": "check"}'
       # blaze-diff's Rust tables and the Lean ones the proofs are about are what
       # crates/blaze-diff/rules.json generates (scripts/src/bin/diff_rules.rs).
       - run: |
-          blaze run -q -p scripts --bin diff_rules -- selftest
-          blaze run -q -p scripts --bin diff_rules -- '{"command": "check"}'
+          "$BLAZE_SCRIPTS/diff_rules" selftest
+          "$BLAZE_SCRIPTS/diff_rules" '{"command": "check"}'
       # The Lean proofs, as far as no Lean is needed (harness/v2/lean_gate.py): the list of
       # theorems (lean/theorems.json) names statements that are there, no source says `sorry`,
       # `native_decide`, `axiom` or `partial def`, lean/analysis's manifest is checked in at the
@@ -176,7 +188,7 @@ jobs:
           uv run --frozen python harness/v2/lean_gate.py '{"command": "sources"}'
       # Each hash domain in crates/ is written once outside tests (scripts/src/bin/domains.rs).
       - run: |
-          blaze run -q -p scripts --bin domains -- '{"root": "."}'
+          "$BLAZE_SCRIPTS/domains" '{"root": "."}'
       # A change of blaze-profile's schema version lands only once ix.dev/explore reads it
       # (.github/scripts/explore_page.py; release.yaml checks every release too).
       - name: ix.dev/explore reads a new profile schema
@@ -403,6 +415,9 @@ jobs:
         with:
           job: check
           llvm: true
+      - uses: ./.github/actions/script
+        with:
+          job: check
       # The fast tier: the packages the change touches and those that depend on them, each
       # after what it needs (scripts/src/bin/changed.rs), checked before the workspace, so a change's
       # first compile error comes in minutes and names the earliest cause. What it checks the
@@ -414,7 +429,7 @@ jobs:
           if [ -z "$BASE" ] || ! git fetch -q --depth=1 origin "$BASE"; then
             echo "no base to compare with: the workspace check below is the check"; exit 0
           fi
-          args=$(blaze run -q -p scripts --bin changed -- "{\"base\": \"$BASE\", \"direct\": true, \"print\": \"args\"}")
+          args=$("$BLAZE_SCRIPTS/changed" "{\"base\": \"$BASE\", \"direct\": true, \"print\": \"args\"}")
           if [ -z "$args" ] || [ "$args" = --workspace ]; then
             echo "nothing narrower than the workspace to check first: ${args:-no package changed}"; exit 0
           fi

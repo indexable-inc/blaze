@@ -70,7 +70,9 @@ tree that does not compile must still be checked, landed on and released from. S
 
 - A script uses only the language and libraries that release has. One that needs a newer
   feature waits one release: the feature lands, a release is cut and pinned, then the script
-  uses it. CI runs every script with the stage-0 binary, as it builds blaze with it.
+  uses it. CI runs every script with the stage-0 binary, as it builds blaze with it: built by
+  it once per change of their inputs and kept in the Actions cache under a key of all of them
+  (`.github/actions/script`).
 - A script builds from its own file and its helper crate alone, never from blaze's crates: the
   helper (`crates/blaze-script`) depends on nothing in `crates/` and only on registry crates
   the lock already holds, so a broken compiler crate cannot stop `land` or the gate's checkers

@@ -80,6 +80,8 @@ const CODE: &[&str] = &[
     ".github/workflows/blaze-platform.yaml",
     ".github/actions/toolchain/",
     ".github/actions/blaze/",
+    // The check job's built scripts (`changed`): their cache key and their build.
+    ".github/actions/script/",
     // The package of the repository's scripts (scripts/src/bin/<name>.rs), a workspace member the
     // build checks, among them the workspace check's fast tier (`changed`, which packages a change
     // touches); their library is crates/blaze-script, under crates/ above.

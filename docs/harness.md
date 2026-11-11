@@ -597,11 +597,18 @@ pinned nightly (`harness/toolchain`), `harness/unittests.py`, `.github/scripts/l
 (`harness/profile_gate.py`, `harness/profile-gate-known.toml`) and the flake that pins its
 DuckDB (`flake.nix`, `flake.lock`), the release of blaze that builds blaze (`.github/blaze-version`,
 `site/install.sh`), `blaze.yaml`, `blaze-platform.yaml` and the actions they use (`toolchain`,
-`blaze`, `blaze-remote`); on a push to main, the smoke corpus too (`harness/smoke.py`,
+`blaze`, `script`, `blaze-remote`); on a push to main, the smoke corpus too (`harness/smoke.py`,
 `harness/smoke/`), which the `warm` tier runs. It names what is code rather than what is not,
 so a new directory of documents, benches or harnesses runs no build; a list of files that
 cannot be had (a run by hand, a comparison of 300 files or more, GitHub refusing) counts as
 code. When the build or the unit tests start reading a new file, add it there.
+
+Every job that runs a script (`changes`, `scripts`, and `check` for `changed`) takes the built
+scripts from `.github/actions/script`: binaries the release builds, kept in the Actions cache
+under a key of every input of their build (`key.sh` says why it covers them all). A hit runs no
+blaze and takes seconds, so `changes` checks out only what the key reads; a miss checks out the
+rest, installs the release, builds `-p scripts --bins` and saves them. `local.sh CACHE` runs the
+same steps outside Actions, with a directory for the cache.
 
 The build and the unit tests of the `gate` and `warm` tiers install no rustup and no Nix: a
 checkout, then `.github/actions/blaze`, which installs the release of blaze as a user does, with
