@@ -339,6 +339,9 @@ pub enum Unknown {
     Before { floor: View },
     /// The view asked from is not one of this storage's: it is after its current view.
     NotAView { view: View },
+    /// Asked from inside a query while a walk is due: a walk is started only from outside
+    /// one.
+    InsideQuery,
 }
 
 impl std::fmt::Display for Unknown {
@@ -352,6 +355,9 @@ impl std::fmt::Display for Unknown {
             Unknown::NotAView { view } => {
                 write!(f, "the view asked from is after the storage's view {}", view.as_u64())
             }
+            Unknown::InsideQuery => f.write_str(
+                "the changed set was asked for from inside a query while a walk of it is due",
+            ),
         }
     }
 }
@@ -380,7 +386,15 @@ pub fn changed_since<F: Function>(db: &F::Db, since: View) -> Changed<F::Key> {
 /// for its caller to read the arguments of (`arguments`), in ID order.
 pub fn changed_ids_since<F: Function>(db: &F::Db, since: View) -> Changed<Id> {
     let storage = db.storage();
-    bring_to_date(std::ptr::from_ref(db).cast(), storage);
+    if local::with(|local| local.task_frames()) != 0 {
+        // Asked from inside a query: a walk waits for rows the caller's own stack may hold,
+        // so none is started; without one the log may lack this view's changes.
+        if due(storage) {
+            return Changed::Unknown(Unknown::InsideQuery);
+        }
+    } else {
+        bring_to_date(std::ptr::from_ref(db).cast(), storage);
+    }
     let index = F::ingredient().index();
     let (log, floor) = {
         let walked = storage.frontier.walked.lock();

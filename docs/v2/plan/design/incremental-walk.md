@@ -238,9 +238,6 @@ them to the edit.
 
 ## Not built
 
-- **Hosts that start from the changed set** (above, "Next"): the engine names it and makes
-  each ask of an unchanged memo a few loads; the walk still asks every item (the body check
-  starts from the set).
 - **The `Vec` copy.** Removing it means `Built`'s lists are `Rows`, or `CompiledFunction`'s
   buffers shared, and every reader ported.
 - **The dyn world.** A build that may close facts walks whole; narrowing needs the world's
