@@ -576,7 +576,7 @@ fn calls_relocate_as_cranelift() {
     assert_eq!((code.bytes[near.at as usize - 1], near.addend), (0xe8, -4));
 }
 
-/// The invariant (docs/v2/plan/design/launcher.md, "Step 3"): under `Target::slots` a call
+/// The code's shape (docs/v2/plan/design/launcher.md, "Step 3"): under `Target::slots` a call
 /// of a named function is `call qword ptr [rip + word]` against the callee's GOT entry (its
 /// slot word), colocated or not, so no register holds a body's address; a return call is
 /// `jmp qword ptr [rip + word]`; and a colocated function's address is `lea reg, [rip + thunk]`,

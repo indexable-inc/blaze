@@ -226,7 +226,7 @@ fn the_oracle_catches_a_record_of_another_layout_and_an_index_past_its_list() {
     assert!(matches!(Record::decode(&out), Err(WireError::Range { .. })));
 }
 
-/// The invariant (launcher.md, "Step 3"; the table in `record`'s documentation): placed on
+/// What a placed record is (launcher.md, "Step 3"; the table in `record`'s documentation): on
 /// AArch64, a GOT fixup against a function names its slot word, any other its entry thunk;
 /// a GOT fixup against an outside symbol names a pool cell that holds the symbol's address;
 /// a datum and the code itself are named directly; and the pool follows the code, 8-aligned.

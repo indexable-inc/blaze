@@ -458,7 +458,7 @@ extern "C-unwind" fn boom(x: i64) -> i64 {
     std::panic::panic_any(x)
 }
 
-/// The invariant (launcher.md, "Step 3"): tier 0 code compiled under `Target::slots` runs
+/// What this shows (launcher.md, "Step 3"): tier 0 code compiled under `Target::slots` runs
 /// in the launcher with nothing linked. A function is compiled and placed when it is first
 /// called, never before (the daemon's needs come in the order of the first calls); a call
 /// reaches its callee through the slot word, a function's address is its thunk, a static and
