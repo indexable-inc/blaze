@@ -41,6 +41,7 @@ use base_db::{Crate, Db};
 use blaze_cas::Key;
 use blaze_format::cursor::{Put as _, Reader};
 use blaze_ids::{ContentId, Hasher};
+use blaze_usercode::roots::{Role, Roots};
 
 /// The domain of a record's slots and of a record filed by its reads.
 /// 3: the crates that read `CARGO_PRIMARY_PACKAGE` ([`Reads::primary`]). 4: the files outside
@@ -74,12 +75,12 @@ fn note_named(names: &[String]) {
 
 /// Every path a record's reads named in a lookup or a filing in this process
 /// ([`Reads::hash`]): the files outside every source root its crates `include!`d and the
-/// files its proc-macro expansions read, then the directories those listed; each sorted, each
-/// once. The last is set once an expansion's reads did not decode: what it read is then not
-/// known. The process's, as [`NAMED`] is, and for the same reader: a path here is one the
+/// files its proc-macro expansions read, then the directories those listed, each as the path
+/// it is in this checkout; each sorted, each once. The last is why, once an expansion's reads
+/// did not decode or named a root it has not: what it read is then not known. The process's, as [`NAMED`] is, and for the same reader: a path here is one the
 /// no-op lane never takes for another request's output ([`read_paths`]).
-static PATHS: blaze_core::lock::Lock<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>, bool)> =
-    blaze_core::lock::Lock::new("serve.unit.reads.paths", (Vec::new(), Vec::new(), false));
+static PATHS: blaze_core::lock::Lock<Noted> =
+    blaze_core::lock::Lock::new("serve.unit.reads.paths", (Vec::new(), Vec::new(), None));
 
 /// `path` kept in `sorted`, once.
 fn note_path(sorted: &mut Vec<std::path::PathBuf>, path: &std::path::Path) {
@@ -92,41 +93,66 @@ fn note_path(sorted: &mut Vec<std::path::PathBuf>, path: &std::path::Path) {
 /// ([`shape_said`]).
 const VERIFIED_SHAPE: &[u8] = b"blaze v2 verified expansion reads 1\0";
 
+/// The paths noted ([`PATHS`]): files, directories, and why they are not known.
+type Noted = (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>, Option<String>);
+
 /// The reads of `reads` by path noted in [`PATHS`].
 fn note_paths(reads: &Reads) {
     if reads.files.is_empty() && reads.expansions.is_empty() {
         return;
     }
-    let mut paths = PATHS.lock();
+    note_paths_in(&mut PATHS.lock(), reads);
+}
+
+/// The reads of `reads` by path noted in `paths`.
+fn note_paths_in(paths: &mut Noted, reads: &Reads) {
     for (path, _) in &reads.files {
         note_path(&mut paths.0, std::path::Path::new(path));
     }
-    for (shape, _) in reads.expansions.iter().flat_map(|it| &it.shapes) {
-        let rest = match shape.strip_prefix(VERIFIED_SHAPE) {
-            Some(rest) if rest.len() >= 32 => &rest[32..],
-            _ => shape.as_slice(),
-        };
-        match blaze_usercode::index::Shape::decode(rest) {
-            Ok(it) => {
-                for file in &it.files {
-                    note_path(&mut paths.0, file);
+    for expansions in &reads.expansions {
+        // A shape is written against the calling crate's roots (`proc_macro_api::kept::roots`:
+        // its package and `OUT_DIR`, from the variables the slot keeps): each path is noted
+        // as the file it is in this checkout, and a root's mark, whose value is the root's
+        // path and which names no file, is not a read of the disk.
+        let get = |name: &str| expansions.env.iter().find(|it| it.0 == name).map(|it| it.1.as_str());
+        let named = [(Role::Package, get("CARGO_MANIFEST_DIR")), (Role::OutDir, get("OUT_DIR"))];
+        let roots = Roots::new(named.into_iter().filter_map(|(role, path)| Some((role, path?))));
+        for (shape, _) in &expansions.shapes {
+            let rest = match shape.strip_prefix(VERIFIED_SHAPE) {
+                Some(rest) if rest.len() >= 32 => &rest[32..],
+                _ => shape.as_slice(),
+            };
+            let shape = match blaze_usercode::index::Shape::decode(rest) {
+                Ok(it) => it,
+                Err(why) => {
+                    // alloc: a reason, once for the process's life
+                    paths.2.get_or_insert_with(|| format!("a unit record's proc-macro expansion reads do not decode ({why}): what it read is not known"));
+                    continue;
                 }
-                for dir in &it.dirs {
-                    note_path(&mut paths.1, dir);
+            };
+            for (list, at) in [(&shape.files, 0), (&shape.dirs, 1)] {
+                for path in list.iter().filter(|it| !blaze_usercode::roots::is_mark(it)) {
+                    match roots.real_path(path) {
+                        Ok(real) if at == 0 => note_path(&mut paths.0, &real),
+                        Ok(real) => note_path(&mut paths.1, &real),
+                        Err(why) => {
+                            // alloc: a reason, once for the process's life
+                            paths.2.get_or_insert_with(|| format!("a unit record's proc-macro expansion read is not a path of this checkout: {why}"));
+                        }
+                    }
                 }
             }
-            Err(_) => paths.2 = true,
         }
     }
 }
 
 /// The files and the directories any record's reads named in this process so far
-/// ([`PATHS`]); an error once an expansion's reads did not decode.
+/// ([`PATHS`]), each as the path it is in this checkout; an error naming why once an
+/// expansion's reads did not decode or named a root the expansion has not.
 pub(crate) fn read_paths() -> Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>), String> {
     let paths = PATHS.lock();
-    if paths.2 {
-        // alloc: a reason, once a build
-        return Err("a unit record's proc-macro expansion reads do not decode: what it read is not known".to_owned());
+    if let Some(why) = &paths.2 {
+        return Err(why.clone()); // clone: a reason, once a build
     }
     Ok((paths.0.clone(), paths.1.clone())) // clone: once a build that walked and made nothing
 }

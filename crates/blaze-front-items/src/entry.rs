@@ -4,21 +4,26 @@
 //!
 //! - under the item's id (16 bytes), its [`Entry`]: what it is, the hash of its header, what
 //!   gates it, and the items taken out of it;
-//! - under [`body_key`] (the id and the byte [`BODY`], 17 bytes), its [`Body`]: the hash of
-//!   its body. An item with no body has no such key (a read of it sees the absence).
+//! - under [`body_key`] (the id and the byte [`BODY`], 17 bytes), its [`Body`]: the body's
+//!   syntax record, its tokens (comments and whitespace left out) with the id of each item
+//!   taken out of it where it stood. What reads a body (`infer`) reads this one part and not
+//!   `parse(file)`; the part's digest, which the kernel keeps, is the body's identity. An
+//!   item with no body has no such key (a read of it sees the absence).
 //!
 //! Nothing in either is a position, in bytes or in tokens, so a comment or whitespace edit
 //! anywhere leaves both equal, and an edit of the header leaves the body's part equal though
 //! the body's tokens moved: positions are in the line part ([`crate::lines`]).
 //!
-//! What the second part costs: 16 bytes of hash that only moved out of the entry, and for
-//! each item with a body one more entry of the table (the kernel's directory record of 40
-//! bytes, the 17-byte key and its place in the index).
+//! What the second part costs: for each item with a body one more entry of the table (the
+//! kernel's directory record of 40 bytes, the 17-byte key and its place in the index), and
+//! the body's tokens: 7 bytes a token beside its text, so about the body's text without its
+//! trivia, plus half again for short tokens. That is what makes `infer` of one body a read of
+//! one part, where it was a read of the file's tree.
 //!
 //! Layout of an entry, little-endian: kind (`u8`), flags (`u8`), the name's length (`u16`),
 //! how many children (`u32`), the gates' length in bytes (`u32`); then the container's id and
 //! the header's hash (16 bytes each); then the name, the gates, and the children's ids in the
-//! order written. A body's part is its hash (16 bytes).
+//! order written. A body's part is its record ([`Body`]).
 
 #![blaze::sans_io]
 
@@ -73,28 +78,98 @@ pub fn key_item(key: &[u8]) -> Option<(ItemId, bool)> {
     }
 }
 
-/// An item's body, as its part of `items(file)` holds it.
+/// In a body's record, where an item was taken out: its id follows. No token's kind is this.
+pub const CHILD: u16 = 0xfffe;
+
+/// An item's body, as its part of `items(file)` holds it, read in place: the kind of the
+/// body's node (`u16`), then each piece in the order written. A token is its kind (`u16`),
+/// whether it is joined to the next (`u8`: an operator followed by one, inside a token tree),
+/// its length (`u32`) and its text; an item taken out is [`CHILD`] and its id.
+///
+/// Positions are not here (review point 7): the `n`th token is the item's own token
+/// `body_span.0 + n` of its line row (`crate::lines::ItemLines`), which places it. So an edit
+/// of anything but the body's tokens (a comment in it, its header, another item) leaves the
+/// record byte-equal.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Body {
-    /// The body's tokens, with the id of each item taken out of it where it was: the key of
-    /// the body's syntax record.
-    pub hash: Key,
+pub struct Body<'a> {
+    /// The body's node's kind (`syntax::SyntaxKind` as `u16`): a block, a const's or
+    /// static's expression, a discriminant's.
+    pub kind: u16,
+    pieces: &'a [u8],
+    tokens: u32,
 }
 
-impl Body {
-    /// The part's bytes.
-    pub fn write(&self) -> Vec<u8> {
-        // alloc: one body's part, kept in the step's value
-        self.hash.to_vec()
+/// One piece of a body.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Piece<'a> {
+    Token { kind: u16, joint: bool, text: &'a str },
+    /// An item taken out of the body, where it stood.
+    Child(ItemId),
+}
+
+/// One piece from the front of `bytes`, and the rest.
+fn piece_at(bytes: &[u8]) -> Result<(Piece<'_>, &[u8]), String> {
+    let kind = match bytes {
+        [a, b, ..] => u16::from_le_bytes([*a, *b]),
+        // alloc: error path
+        _ => return Err(String::from("whose piece is cut short")),
+    };
+    let rest = &bytes[2..];
+    if kind == CHILD {
+        let Some(id) = rest.get(..16) else {
+            // alloc: error path
+            return Err(String::from("whose item taken out is cut short"));
+        };
+        return Ok((Piece::Child(ItemId(id.try_into().expect("16 bytes"))), &rest[16..]));
+    }
+    if rest.len() < 5 || rest[0] > 1 {
+        // alloc: error path
+        return Err(format!("whose token of kind {kind} is cut short or has spacing {:?}", rest.first()));
+    }
+    let len = u32_at(rest, 1) as usize;
+    let Some(text) = rest.get(5..5 + len) else {
+        // alloc: error path
+        return Err(format!("whose token of kind {kind} runs past the record"));
+    };
+    let Ok(text) = core::str::from_utf8(text) else {
+        // alloc: error path
+        return Err(format!("whose token of kind {kind} is not UTF-8"));
+    };
+    Ok((Piece::Token { kind, joint: rest[0] == 1, text }, &rest[5 + len..]))
+}
+
+impl<'a> Body<'a> {
+    /// The body `bytes` are, walked once; other bytes are refused saying what is wrong.
+    pub fn read(bytes: &'a [u8]) -> Result<Body<'a>, String> {
+        let [a, b, pieces @ ..] = bytes else {
+            // alloc: error path
+            return Err(format!("an item's body of {} bytes, under the 2 of its kind", bytes.len()));
+        };
+        let (mut rest, mut tokens) = (pieces, 0u32);
+        while !rest.is_empty() {
+            let (piece, after) = piece_at(rest).map_err(|what| format!("an item's body {what}"))?;
+            tokens += u32::from(matches!(piece, Piece::Token { .. }));
+            rest = after;
+        }
+        Ok(Body { kind: u16::from_le_bytes([*a, *b]), pieces, tokens })
     }
 
-    /// The body `bytes` are; other bytes are refused saying what is wrong with them.
-    pub fn read(bytes: &[u8]) -> Result<Body, String> {
-        match bytes.try_into() {
-            Ok(hash) => Ok(Body { hash }),
-            // alloc: error path
-            Err(_) => Err(format!("an item's body part of {} bytes, where it is 16", bytes.len())),
-        }
+    /// How many tokens: the body's count of own tokens (`body_span.1`).
+    pub fn tokens(&self) -> u32 {
+        self.tokens
+    }
+
+    /// The pieces, in the order written.
+    pub fn pieces(&self) -> impl Iterator<Item = Piece<'a>> + Clone + 'a {
+        let mut rest = self.pieces;
+        core::iter::from_fn(move || {
+            if rest.is_empty() {
+                return None;
+            }
+            let (piece, after) = piece_at(rest).expect("`Body::read` walked the pieces");
+            rest = after;
+            Some(piece)
+        })
     }
 }
 

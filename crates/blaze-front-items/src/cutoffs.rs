@@ -118,10 +118,22 @@ struct ItemKey {
     item: ItemId,
 }
 
-fn item_subject(what: &'static str, input: &ItemKey) -> Subject {
-    let mut hasher = Hasher::new(what);
-    hasher.part(input.file.name.as_bytes()).part(&input.item.0);
-    Subject { of: hasher.finish(), flags: ContentId::default() }
+trait Subjected {
+    fn subject_of(&self, what: &'static str) -> Subject;
+}
+
+impl Subjected for ItemKey {
+    fn subject_of(&self, what: &'static str) -> Subject {
+        let mut hasher = Hasher::new(what);
+        hasher.part(self.file.name.as_bytes()).part(&self.item.0);
+        Subject { of: hasher.finish(), flags: ContentId::default() }
+    }
+}
+
+impl Subjected for FileKey {
+    fn subject_of(&self, what: &'static str) -> Subject {
+        Subject { of: ContentId::of(what, self.name.as_bytes()), flags: ContentId::default() }
+    }
 }
 
 macro_rules! reader {
@@ -136,17 +148,13 @@ macro_rules! reader {
             type Input = $input;
 
             fn subject(input: &$input) -> Subject {
-                reader!(@subject $text, input, $input)
+                input.subject_of($text)
             }
 
             fn label(input: &$input) -> String {
                 format!("{} {input:?}", $text)
             }
         }
-    };
-    (@subject $text:literal, $input:ident, ItemKey) => { item_subject($text, $input) };
-    (@subject $text:literal, $input:ident, FileKey) => {
-        Subject { of: ContentId::of($text, $input.name.as_bytes()), flags: ContentId::default() }
     };
 }
 
@@ -357,11 +365,15 @@ fn a_body_edit_reaches_exactly_that_bodys_reader() {
 /// (c) A header edit of one function, its length kept. The floor: exactly that header's
 /// reader. Its body's reader is not reached: the body is a part of its own, and holds no
 /// position (the body's token span is in the line row).
+///
+/// `parse` is cut here too: its record is the tree's shape (kinds and lengths) and holds no
+/// text, and `u32` to `u64` is one identifier for another of the same length. `items` is not
+/// cut by it: it reads the file's text itself, so it reruns and its header part changes.
 #[test]
 fn a_header_edit_reaches_exactly_that_headers_reader() {
     let mut it = driven();
     let edited = two_hundred().replace("pub fn f3(x: u32) -> u32 {", "pub fn f3(x: u64) -> u32 {");
-    assert_eq!(it.edit(edited), carried(2, 1, 1), "parse and items changed, lines cut");
+    assert_eq!(it.edit(edited), carried(1, 2, 1), "items changed; parse (same shape) and lines cut");
     assert_eq!(it.ask(), Reran { header: vec![3], ..Reran::default() });
 }
 

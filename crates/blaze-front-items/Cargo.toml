@@ -21,6 +21,7 @@ blaze-kernel.workspace = true
 syntax.workspace = true
 
 [dev-dependencies]
+blaze-store-check.workspace = true
 hegeltest.workspace = true
 hir-expand.workspace = true
 span.workspace = true

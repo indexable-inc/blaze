@@ -327,3 +327,48 @@ fn a_record_that_read_a_file_outside_every_root_is_found_while_the_file_is_as_it
         "the file as it was again"
     );
 }
+
+/// The invariant: what [`super::read_paths`] hands a request certificate are paths of this
+/// checkout. An expansion's shape is written against the calling crate's roots, so each of
+/// its paths is noted as the file it names here, and a root's mark (whose value is the root's
+/// path, no file's bytes) is not noted at all. The control: noted as the shape spells them,
+/// the certificate looked for `\0p/\0root` on disk and wrote nothing (round 20, smoke).
+#[test]
+fn an_expansions_reads_are_noted_as_this_checkouts_paths() {
+    use blaze_usercode::roots::{Role, Roots};
+    use std::path::{Path, PathBuf};
+    let package = "/w/pkg";
+    let roots = Roots::new([(Role::Package, package)]);
+    let ported = |path: &str| roots.path(Path::new(path)).into_owned();
+    let mark = PathBuf::from(format!("\0{}/\0root", char::from(Role::Package.tag())));
+    let shape = blaze_usercode::index::Shape {
+        files: vec![ported("/w/pkg/data/schema.json"), mark.clone(), PathBuf::from("/far/abs.txt")],
+        dirs: vec![ported("/w/pkg/data")],
+        ..Default::default()
+    };
+    assert_ne!(shape.files[0], PathBuf::from("/w/pkg/data/schema.json"), "the shape is ported");
+    let reads = Reads {
+        names: Vec::new(),
+        expansions: vec![super::Expansions {
+            env: env(&[("CARGO_MANIFEST_DIR", package)]),
+            shapes: vec![(shape.encode(), None)],
+        }],
+        primary: Vec::new(),
+        files: Vec::new(),
+    };
+    let mut noted = (Vec::new(), Vec::new(), None);
+    super::note_paths_in(&mut noted, &reads);
+    assert_eq!(noted.2, None, "every read is of this checkout");
+    assert_eq!(noted.0, [PathBuf::from("/far/abs.txt"), PathBuf::from("/w/pkg/data/schema.json")]);
+    assert_eq!(noted.1, [PathBuf::from("/w/pkg/data")]);
+
+    // A read under a root the expansion has not is not known: named, never a guessed path.
+    let reads = Reads {
+        expansions: vec![super::Expansions { env: Vec::new(), shapes: reads.expansions[0].shapes.clone() }],
+        ..reads
+    };
+    let mut noted = (Vec::new(), Vec::new(), None);
+    super::note_paths_in(&mut noted, &reads);
+    let why = noted.2.expect("a root the expansion has not");
+    assert!(why.contains("not a path of this checkout"), "{why}");
+}

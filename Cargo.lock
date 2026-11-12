@@ -1074,6 +1074,7 @@ dependencies = [
  "blaze-cas",
  "blaze-ids",
  "blaze-kernel",
+ "blaze-store-check",
  "hegeltest",
  "hir-expand",
  "span",

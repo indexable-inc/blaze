@@ -3,9 +3,10 @@
 //!
 //! - [`items::file_items`] is `items(file)`: a pure function of a file's tree giving a table,
 //!   one [`entry::Entry`] an item under a stable, content-hashed [`entry::ItemId`], with the
-//!   hash of the item's header and of its body over tokens (comments, whitespace and
-//!   positions left out), the attributes that gate or transform it, and the items taken out
-//!   of it. Positions are a separate part ([`lines`]), so a comment edit changes the line part
+//!   hash of the item's header over tokens (comments, whitespace and positions left out), the
+//!   attributes that gate or transform it, and the items taken out of it; and, as a part of
+//!   its own ([`entry::body_key`]), the body's syntax record ([`entry::Body`]): its tokens,
+//!   which is what reads a body instead of the file's tree. Positions are a separate part ([`lines`]), so a comment edit changes the line part
 //!   and no entry.
 //! - [`parse::parse`] is `parse(file, edition)`: the tree as the record the tree crate stores.
 //! - [`modules::modules`] is `modules(crate)`: the crate's file set, reading the existence of
@@ -34,6 +35,8 @@ pub mod entry;
 pub mod items;
 pub mod lines;
 pub mod modules;
+#[cfg(test)]
+mod cutoffs;
 #[cfg(test)]
 mod oracle;
 pub mod parse;

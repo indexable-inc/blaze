@@ -62,11 +62,12 @@ pub(crate) fn changed(a: &Rows, b: &Rows) -> Vec<Key> {
     out
 }
 
-/// The hash of the body of the item `id`, none where it has no body's part.
-pub(crate) fn body_of(items: &FileItems, id: ItemId) -> Option<Key> {
+/// The body's part of the item `id` (its syntax record), none where it has no body.
+pub(crate) fn body_of(items: &FileItems, id: ItemId) -> Option<Vec<u8>> {
     let table = Table::read(ITEMS, &items.items).expect("an items table");
     let part = table.get(&body_key(id)).expect("a whole table")?;
-    Some(Body::read(part).expect("a body").hash)
+    Body::read(part).expect("a body");
+    Some(part.to_vec())
 }
 
 /// The line row of the item `id`.
@@ -355,4 +356,103 @@ fn a_tree_record_reads_back_to_the_same_items() {
     assert_eq!(file_items(back.root()).expect("items"), items_of(&text));
     let other = Reading { edition: Edition::Edition2015, extensions: Extensions::NONE };
     assert!(tree(&record, &text, other).is_ok(), "a full parse's record names no edition");
+}
+
+/// The rule (end-state.md review point 4, "each entry holds the key of the body's syntax
+/// record"): a body's part is its own tokens, so what reads a body reads that part and not the
+/// file's tree; it holds no position, so it is byte-equal after an edit of another body, a
+/// comment inside it, or an edit of its own header that moves it; and its tokens are placed
+/// by the line row: the `n`th is the item's own token `body_span.0 + n`.
+#[test]
+fn a_bodys_record_is_its_tokens_and_moves_only_with_them() {
+    let text = "fn g() {}\nfn f(x: u8) -> u8 {\n    let y = x;\n    fn inner() {}\n    y + 1\n}\n";
+    let items = items_of(text);
+    let f = id_of(&items, Kind::Fn, "f");
+    let record = body_of(&items, f).expect("f has a body");
+    let body = Body::read(&record).expect("a body");
+    assert_eq!(body.kind, syntax::SyntaxKind::BLOCK_EXPR as u16);
+    let inner = id_of(&items, Kind::Fn, "inner");
+    let mut texts: Vec<String> = Vec::new();
+    for piece in body.pieces() {
+        match piece {
+            entry::Piece::Token { text, .. } => texts.push(String::from(text)),
+            entry::Piece::Child(id) => {
+                assert_eq!(id, inner, "the item taken out stands where it was");
+                texts.push(String::from("<inner>"));
+            }
+        }
+    }
+    assert_eq!(texts, ["{", "let", "y", "=", "x", ";", "<inner>", "y", "+", "1", "}"]);
+    // Placed by the line row: each token's start is its own token's in the row.
+    let row = lines_of(&items, f);
+    assert_eq!(row.body_span.1, body.tokens());
+    let starts: Vec<u32> = row.tokens().skip(row.body_span.0 as usize).take(body.tokens() as usize).collect();
+    let tokens: Vec<&str> = body
+        .pieces()
+        .filter_map(|piece| match piece {
+            entry::Piece::Token { text, .. } => Some(text),
+            entry::Piece::Child(_) => None,
+        })
+        .collect();
+    for (start, token) in starts.iter().zip(&tokens) {
+        assert!(text[*start as usize..].starts_with(token), "`{token}` at byte {start}");
+    }
+    // Byte-equal under edits that are not of its tokens.
+    for edited in [
+        text.replace("fn g() {}", "fn g() { let other = 1; }"),
+        text.replace("let y = x;", "let y = /* a comment */ x; // and one more"),
+        text.replace("fn f(x: u8) -> u8", "fn f(x: u8, more: &mut [u64]) -> u8"),
+        text.replace("fn inner() {}", "fn inner() { 3 }"),
+    ] {
+        let after = items_of(&edited);
+        assert_eq!(body_of(&after, f).as_deref(), Some(record.as_slice()), "after `{edited}`");
+    }
+    // And moved by an edit of them.
+    let after = items_of(&text.replace("y + 1", "y + 2"));
+    assert_ne!(body_of(&after, f).as_deref(), Some(record.as_slice()));
+}
+
+/// The rule (the known limit of index tie-breaks, closed for what is in an impl): an `impl`
+/// written before others of the same self type, trait and gates moves those impls' ids (their
+/// index among equals) and no id of an item in them, since an impl's items are scoped by what
+/// names the impl, not by its id; their bodies' parts stay byte-equal. An impl of the same
+/// type under another `cfg` is named apart, so it moves nothing.
+#[test]
+fn an_impl_inserted_before_its_equals_moves_no_item_in_them() {
+    let text = "struct S;\nimpl S {\n    fn a(&self) -> u8 { 1 }\n}\nimpl S {\n    fn b(&self) -> u8 { 2 }\n}\n";
+    let before = items_of(text);
+    let (a, b) = (id_of(&before, Kind::Fn, "a"), id_of(&before, Kind::Fn, "b"));
+    let impls = list_of(&before, ItemId::IMPLS);
+    let edited = text.replace("struct S;\n", "struct S;\nimpl S {\n    fn c(&self) -> u8 { 3 }\n}\n");
+    let after = items_of(&edited);
+    assert_eq!(id_of(&after, Kind::Fn, "a"), a, "a method's id is not its impl's index");
+    assert_eq!(id_of(&after, Kind::Fn, "b"), b);
+    assert_eq!(body_of(&after, a), body_of(&before, a));
+    assert_eq!(body_of(&after, b), body_of(&before, b));
+    let moved = list_of(&after, ItemId::IMPLS);
+    assert_eq!(moved.len(), 3);
+    // The index is the tie-break left: the new impl took the first id, each impl after it
+    // the next one's, and the last a new one.
+    assert_eq!(moved[..2], impls[..]);
+    assert!(!impls.contains(&moved[2]));
+    with_entry(&after, a, |entry| assert_eq!(entry.container, moved[1], "a is in the second impl now written"));
+
+    // Under another `cfg`, the new impl is named apart: no impl id moves either.
+    let gated = text.replace("struct S;\n", "struct S;\n#[cfg(unix)]\nimpl S {\n    fn c(&self) -> u8 { 3 }\n}\n");
+    let after = items_of(&gated);
+    let moved = list_of(&after, ItemId::IMPLS);
+    assert_eq!(moved[1..], impls[..], "the impls written after it keep their ids");
+    assert_eq!((id_of(&after, Kind::Fn, "a"), id_of(&after, Kind::Fn, "b")), (a, b));
+
+    // Two methods of one name in two impls of one name are told apart by index, as rustc
+    // refuses them as duplicates unless a `cfg` names them apart, which it does here.
+    let twice = "struct S;\n#[cfg(unix)]\nimpl S { fn new() {} }\n#[cfg(windows)]\nimpl S { fn new() {} }\n";
+    let items = items_of(twice);
+    let news: Vec<ItemId> = rows(ITEMS, &items.items)
+        .iter()
+        .filter(|(key, _)| !ItemId(**key).is_list())
+        .filter(|(_, bytes)| Entry::read(bytes).expect("an entry").name == "new")
+        .map(|(key, _)| ItemId(*key))
+        .collect();
+    assert_eq!(news.len(), 2, "two entries, two ids");
 }

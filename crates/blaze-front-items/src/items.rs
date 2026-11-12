@@ -30,11 +30,14 @@
 //!
 //! [`ItemId`] is the hash of (scope, kind, what names it), then of its index among the items
 //! of exactly that first hash. What names an item: its name; of an `impl`, its self type's
-//! tokens and its trait's; of a `use`, its tree's tokens; of a macro call, its path; of an
-//! `extern` block, its ABI's string. The scope is the container's id, but an `extern` block's items
-//! are scoped as the block is (a block has no name, and makes no scope). There is no ordinal
-//! of the file anywhere: inserting or removing an item moves no other item's id, except the
-//! index of an item that names itself exactly as the inserted one does.
+//! tokens, its trait's and its gates (`cfg`, `cfg_attr`); of a `use`, its tree's tokens; of a
+//! macro call, its path; of an `extern` block, its ABI's string. The scope is the container's
+//! id, but an `extern` block's items are scoped as the block is (a block has no name, and
+//! makes no scope), and an `impl`'s by what names the impl without its index (so its items'
+//! ids do not move with it). There is no ordinal of the file anywhere: inserting or removing
+//! an item moves no other item's id, except the index of an item that names itself exactly as
+//! the inserted one does; for an `impl` of the same self type, trait and gates as later ones,
+//! those impls' ids, and no id of an item in them.
 //!
 //! # Cost against the floor
 //!
@@ -57,7 +60,7 @@ use syntax::{
 
 use crate::{
     entry::{
-        Body, CFG, CFG_ATTR, DECLARED, EXPORTED, EntryBuf, Gate, HAS_BODY, ItemId, Kind, UNSPLIT,
+        CFG, CFG_ATTR, CHILD, DECLARED, EXPORTED, EntryBuf, Gate, HAS_BODY, ItemId, Kind, UNSPLIT,
         body_key,
     },
     lines,
@@ -70,13 +73,13 @@ pub const ITEMS: Family = Family { name: "items" };
 const BASE_DOMAIN: &str = "blaze v2 front item base 1";
 const ID_DOMAIN: &str = "blaze v2 front item id 1";
 const HEADER_DOMAIN: &str = "blaze v2 front item header 1";
-const BODY_DOMAIN: &str = "blaze v2 front item body 1";
 const NAMES_DOMAIN: &str = "blaze v2 front item names 1";
+const RECORD_DOMAIN: &str = "blaze v2 front item body record 1";
+const GATED_DOMAIN: &str = "blaze v2 front item impl gates 1";
+const GROUP_DOMAIN: &str = "blaze v2 front item impl scope 1";
 
 /// In a feed, where the body was cut: no token's kind is this.
 const CUT: u16 = 0xffff;
-/// Where an item was taken out: its id follows.
-const CHILD: u16 = 0xfffe;
 /// Ends the inner attributes after a cut.
 const END: u16 = 0xfffd;
 
@@ -118,37 +121,75 @@ pub fn file_items(root: view::Node<'_>) -> Result<FileItems, String> {
     Ok(FileItems { items, lines })
 }
 
-/// One hash being fed tokens.
+/// Tokens being fed: to a hash (a header, a name), or to a body's record ([`Body`]), whose
+/// bytes are the ones a hash would be fed. A token is its kind (`u16`), whether it is joint
+/// (`u8`), its length (`u32`) and its text; a mark is a `u16` no kind is; a child is
+/// [`CHILD`] and its id.
 struct Feed {
-    hasher: Hasher,
+    out: Out,
+}
+
+enum Out {
+    Hash(Hasher),
+    Record(Vec<u8>),
 }
 
 impl Feed {
     fn new(domain: &'static str, kind: SyntaxKind) -> Feed {
-        let mut feed = Feed { hasher: Hasher::new(domain) };
+        let mut feed = Feed { out: Out::Hash(Hasher::new(domain)) };
         feed.mark(kind as u16);
         feed
     }
 
+    /// A body's record, which starts with the kind of the body's node.
+    fn record(kind: SyntaxKind) -> Feed {
+        // alloc: one body's record, kept as its part of the step's value
+        let mut feed = Feed { out: Out::Record(Vec::new()) };
+        feed.mark(kind as u16);
+        feed
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        match &mut self.out {
+            Out::Hash(hasher) => {
+                hasher.update(bytes);
+            }
+            // alloc: one body's record, kept as its part of the step's value
+            Out::Record(record) => record.extend_from_slice(bytes),
+        }
+    }
+
     fn token(&mut self, kind: SyntaxKind, joint: bool, text: &str) {
-        self.hasher
-            .update(&(kind as u16).to_le_bytes())
-            .update(&[u8::from(joint)])
-            .update(&(text.len() as u32).to_le_bytes())
-            .update(text.as_bytes());
+        self.update(&(kind as u16).to_le_bytes());
+        self.update(&[u8::from(joint)]);
+        self.update(&(text.len() as u32).to_le_bytes());
+        self.update(text.as_bytes());
     }
 
     fn mark(&mut self, mark: u16) {
-        self.hasher.update(&mark.to_le_bytes());
+        self.update(&mark.to_le_bytes());
     }
 
     fn child(&mut self, id: ItemId) {
         self.mark(CHILD);
-        self.hasher.update(&id.0);
+        self.update(&id.0);
     }
 
+    /// The first 16 bytes of the hash; of a record, of the hash of its bytes. (A body's
+    /// identity is its part's digest, which the kernel makes: the walk never asks this of one.)
     fn finish(&self) -> Key {
-        first_16(&self.hasher)
+        match &self.out {
+            Out::Hash(hasher) => first_16(hasher),
+            Out::Record(record) => first_16(Hasher::new(RECORD_DOMAIN).update(record)),
+        }
+    }
+
+    /// The record's bytes; of a hash, none.
+    fn into_record(self) -> Option<Vec<u8>> {
+        match self.out {
+            Out::Hash(_) => None,
+            Out::Record(record) => Some(record),
+        }
     }
 }
 
@@ -198,7 +239,7 @@ fn feed_all(node: view::Node<'_>, feed: &mut Feed) {
 
 /// The hash of `node`'s tokens alone: what names an item that has no name.
 fn names(node: Option<view::Node<'_>>) -> Key {
-    let mut feed = Feed { hasher: Hasher::new(NAMES_DOMAIN) };
+    let mut feed = Feed { out: Out::Hash(Hasher::new(NAMES_DOMAIN)) };
     match node {
         Some(node) => feed_all(node, &mut feed),
         None => feed.mark(END),
@@ -565,13 +606,23 @@ fn shape<'t>(item: view::Item<'t>) -> Shape<'t> {
 
 impl Walk {
     /// The id of the next item of `kind` under `scope` that `name` and `names` name.
-    fn id(&mut self, scope: ItemId, kind: Kind, name: &str, names: Option<[Key; 2]>) -> ItemId {
+    /// What names an item under `scope`: the first hash of its id.
+    fn base(scope: ItemId, kind: Kind, name: &str, names: Option<[Key; 2]>) -> Key {
         let mut base = Hasher::new(BASE_DOMAIN);
         base.update(&scope.0).update(&[kind as u8]).part(name.as_bytes());
         if let Some([first, second]) = names {
             base.update(&first).update(&second);
         }
-        let base = first_16(&base);
+        first_16(&base)
+    }
+
+    fn id(&mut self, scope: ItemId, kind: Kind, name: &str, names: Option<[Key; 2]>) -> ItemId {
+        self.indexed(Walk::base(scope, kind, name, names))
+    }
+
+    /// The id of the next item named by `base`: its index among the items of exactly that
+    /// base, in the order written.
+    fn indexed(&mut self, base: Key) -> ItemId {
         // alloc: one node of the map a distinct base
         let index = self.counts.entry(base).or_insert(0);
         let mut id = Hasher::new(ID_DOMAIN);
@@ -614,7 +665,28 @@ impl Walk {
         if declared {
             attrs.flags |= DECLARED;
         }
-        let id = self.id(scope, kind, &name, names);
+        // An impl is named by its self type, its trait and its gates; its items are scoped by
+        // that name, not by its id, which also holds its index among impls named the same.
+        // So an impl written before others of the same name moves their ids and no id of an
+        // item in them: a method's id is (self type, trait, gates, its own name), what
+        // resolving it reads. (A hash of the impl's item names as the tie-break instead would
+        // move the impl's id, the file's entry and the list of impls at every method added.)
+        let (id, child_scope) = match (kind, names) {
+            (Kind::Impl, Some([self_ty, trait_])) if !whole => {
+                let mut gated = Hasher::new(GATED_DOMAIN);
+                gated.update(&trait_).part(&attrs.gates);
+                let base = Walk::base(scope, kind, &name, Some([self_ty, first_16(&gated)]));
+                let mut group = Hasher::new(GROUP_DOMAIN);
+                group.update(&base);
+                (self.indexed(base), ItemId(first_16(&group)))
+            }
+            // An `extern` block has no name and makes no scope: its items are scoped as it is.
+            (Kind::ExternBlock, _) => (self.id(scope, kind, &name, names), scope),
+            _ => {
+                let id = self.id(scope, kind, &name, names);
+                (id, id)
+            }
+        };
         let list_of = match kind {
             Kind::Impl if !whole => Some(0),
             Kind::MacroRules if attrs.flags & EXPORTED != 0 => Some(1),
@@ -625,8 +697,6 @@ impl Walk {
             // alloc: the file's list of ids, kept in the step's value
             self.lists[list].extend_from_slice(&id.0);
         }
-        // An `extern` block has no name and makes no scope: its items are scoped as it is.
-        let child_scope = if kind == Kind::ExternBlock { scope } else { id };
         let mut own = Own::new(Feed::new(HEADER_DOMAIN, node.kind()), node.text_range().start());
         self.walk(node, body.filter(|_| !whole), whole, id, child_scope, &mut own)?;
         self.finish(Head { id, kind, container, name }, attrs, own, node)?;
@@ -664,7 +734,7 @@ impl Walk {
             }
         }
         let mut own = Own::new(header, value.text_range().start());
-        own.body = Some(Feed::new(BODY_DOMAIN, value.kind()));
+        own.body = Some(Feed::record(value.kind()));
         own.in_body = true;
         self.walk(value, None, false, id, id, &mut own)?;
         own.in_body = false;
@@ -713,7 +783,7 @@ impl Walk {
                         let header = &mut own.header;
                         inner_attrs(at, &mut |attr| feed_all(attr.syntax(), header));
                         own.header.mark(END);
-                        own.body = Some(Feed::new(BODY_DOMAIN, kind));
+                        own.body = Some(Feed::record(kind));
                         own.in_body = true;
                         own.body_span.0 = own.tokens;
                     } else if is_item(at) {
@@ -751,15 +821,16 @@ impl Walk {
         node: view::Node<'_>,
     ) -> Result<(), String> {
         let Head { id, kind, container, name } = head;
-        let body = own.body.as_ref().map(|feed| Body { hash: feed.finish() });
+        let Own { header, body, body_span, deltas, children, .. } = own;
+        let body = body.and_then(Feed::into_record);
         let entry = EntryBuf {
             kind,
             flags: attrs.flags | if body.is_some() { HAS_BODY } else { 0 },
             container,
-            header: own.header.finish(),
+            header: header.finish(),
             name,
             gates: attrs.gates,
-            children: own.children,
+            children,
         };
         let range = node.text_range();
         let bytes = entry.write().map_err(|what| {
@@ -767,10 +838,10 @@ impl Walk {
             format!("items of a file: {what}, at byte {}", u32::from(range.start()))
         })?;
         self.items.part(&id.0, &bytes);
-        if let Some(body) = body {
-            self.items.part(&body_key(id), &body.write());
+        if let Some(body) = &body {
+            self.items.part(&body_key(id), body);
         }
-        let row = lines::row(range.start().into(), range.len().into(), own.body_span, &own.deltas);
+        let row = lines::row(range.start().into(), range.len().into(), body_span, &deltas);
         self.lines.part(&id.0, &row);
         Ok(())
     }

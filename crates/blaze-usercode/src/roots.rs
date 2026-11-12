@@ -1122,6 +1122,12 @@ fn root_hash(root: &str) -> [u8; 32] {
     ContentId::of(ROOT_DOMAIN, root.as_bytes()).0
 }
 
+/// Whether `path`, written against roots, is a root's mark ([`Roots::mark`]): an entry whose
+/// value is the root's path, which names no file on disk.
+pub fn is_mark(path: &Path) -> bool {
+    marked(path).is_some()
+}
+
 /// The tag of the root `path` is the mark of, when it is one.
 fn marked(path: &Path) -> Option<u8> {
     let bytes = path.as_os_str().as_encoded_bytes();
