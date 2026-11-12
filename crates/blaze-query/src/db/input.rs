@@ -214,7 +214,16 @@ pub(crate) fn field_node<I: Input>(storage: &Storage, id: Id, field: u32) -> u32
 }
 
 /// Singleton `I`'s table and ID, reserving the ID and its field nodes on first use: unmade,
-/// each field node stamped 0 (never changed) with durability `LOW`.
+/// each field node stamped 0 (never changed) with durability `HIGH`.
+///
+/// Why `HIGH`. A query that asks for a singleton nobody made reads its absence, and a row is
+/// as durable as the least durable thing it read. At `LOW` every row that asked for an
+/// unmade singleton was `LOW` itself, the standard library's rows among them (measured
+/// 2026-11-11 on a hello-world: `ServedBodies` and `FrozenImpls` were never made, and each
+/// body edit walked the edges of 1,091,174 rows, `interface_of` alone 428,529, that a write
+/// of a workspace file cannot change). An absence changes only by the singleton being made,
+/// which opens a view of kind `HIGH` ([`input_new_singleton`]), so every row that read the
+/// absence is looked at again then, whatever its durability.
 fn reserved<I: Input>(storage: &Storage) -> (&InputTable<I>, Id) {
     let (table, index) = storage.table_or_make::<InputTable<I>>(I::ingredient());
     // Acquire: the row and field nodes `reserve` made before it stored the ID.
@@ -239,7 +248,7 @@ fn reserve<I: Input>(storage: &Storage, table: &InputTable<I>, index: u32) -> Id
         let node = first + field;
         storage.set_key(node, node_key(index, id, field));
         storage.set_summary(node, input_bits(node));
-        storage.repaint(node, color(FIELD | u32::from(Durability::LOW.0), 0));
+        storage.repaint(node, color(FIELD | u32::from(Durability::HIGH.0), 0));
     }
     row.first.store(first, Ordering::Relaxed);
     // Release: a reader that loads the ID sees its row and field nodes.
@@ -289,7 +298,9 @@ pub fn input_new_singleton<I: Input, const N: usize>(
     let first = row.first.load(Ordering::Relaxed);
     let end = first + I::FIELDS.max(1);
     let written = (first..end).fold([0; 2], |acc, node| or(acc, input_bits(node)));
-    let view = storage.new_view(Durability::LOW, written);
+    // Of kind `HIGH`: its absence was read at `HIGH` ([`reserved`]), so making it is a change
+    // no row's durability excuses it from looking at.
+    let view = storage.new_view(Durability::HIGH, written);
     for (at, node) in (first..end).enumerate() {
         let kind = durability.get(at).copied().unwrap_or(Durability::LOW);
         storage.repaint(node, color(FIELD | u32::from(kind.0), view));
