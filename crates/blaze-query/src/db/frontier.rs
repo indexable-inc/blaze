@@ -37,7 +37,7 @@
 //! edit removed): a pull would never run it. So a verification that unwinds for any reason
 //! but the caller's own (a write pending, its fuel) is contained: the engine's guard puts the
 //! row's word back, the walk counts it, names it as changed and goes on, and does not ask it
-//! again until something else brought it up to date ([`Walked::unwound`]).
+//! again until something else brought it up to date ([`Walked::apart`]).
 //!
 //! Persistence: none. The storage is memory (a restart makes another storage), and the index
 //! is made from the rows' own edges: empty with an empty storage, it holds the invariant from
@@ -125,16 +125,28 @@ fn merge_oldest(log: &mut Vec<Arc<Found>>) {
     log.insert(0, Arc::new(Found { at, nodes: all })); // alloc: as above
 }
 
-/// The rows one level of a walk verifies before it hands them to the pool: a level of fewer
-/// is verified on the walker's thread, one row after the other.
+/// The rows of one level past which a walk stops verifying and marks: a level of fewer is
+/// verified on the walker's thread, one row after the other, with early cutoff; from the
+/// first level of this many on, every row the walk reaches is set apart unverified
+/// ([`Walked::apart`]), named as changed, and its readers reached in turn.
 ///
-/// A count, not the small-loop predictor (`blaze_graph::par::Small`, whose bound is 32
-/// items). Measured 2026-11-11 on a hello-world's one-expression edit (a walk of 67 rows, 23
-/// changed): the edit's build took 103 to 130 ms with the predictor and 106 to 165 ms with
-/// this bound, no difference past the noise, so the walk keeps the dispatch it had. A level's
-/// rows read each other and the rows below them, which on one thread are run on the walker's
-/// own stack with nothing to wait for.
-const PAR_AT: usize = 64;
+/// Why a wide level is marked and not verified. Verifying a row pulls what it reads, and
+/// the rows of one level read each other and the rows the walk has yet to reach. Until
+/// 2026-11-11 a wide level was handed to the pool a job a row: each job waited on runs
+/// other jobs of the level held, gave way and asked again, and the walk also ran again
+/// every evicted row it reached, asked for or not. After a change the whole program reads
+/// (measured: a first `blaze test` after `run`, `changed set` 465 s, 108,508 waits of
+/// 23,548 thread-seconds, 84,075 bodies run again) sixteen cores spent eight minutes
+/// waiting on each other. A change that reaches a wide level is broad, and a broad change
+/// gains little from the walk's cutoff: so the walk follows the reverse edges only (loads,
+/// no query run, no wait, nothing given way to) and leaves each marked row to whoever asks
+/// for it, verified then as any pull verifies, by the hosts' own tasks on all cores. A row
+/// nothing asks for is never run.
+///
+/// What stays true: a row the walk did not reach is unchanged ([`clean`]); a marked row is
+/// never taken as clean; every row whose value changed is named, with marked rows named
+/// too, which may be unchanged (a name too many costs its host one ask).
+const WIDE: usize = 64;
 
 /// What the walks keep between them. Its vectors are taken out by the walker (the holder of
 /// the walk's flight) and put back, so the lock is held for moves only.
@@ -147,10 +159,12 @@ struct Walked {
     written: Vec<u32>,
     /// The rows whose last run made an untracked read, sorted.
     untracked: Vec<u32>,
-    /// Rows whose verification by a walk unwound, each with its `verified` word then: not
+    /// Rows a walk set apart: those of a wide level and past it, marked unverified
+    /// ([`WIDE`]), and those whose verification unwound; each with its `verified` word then,
+    /// sorted by node, each node once. Not
     /// asked again by a walk while the word stands, named as changed whenever reached, and
     /// never taken as clean ([`clean`]). Replaced whole by a walk that ended.
-    unwound: Arc<Vec<(u32, u32)>>,
+    apart: Arc<Vec<(u32, u32)>>,
     work: ChangedSetWork,
 }
 
@@ -173,6 +187,9 @@ pub struct ChangedSetWork {
     pub changed: u64,
     /// Verifications that unwound and were contained.
     pub unwound: u64,
+    /// Rows marked unverified: those of the first wide level ([`WIDE`] rows) and every row
+    /// reached past it. 0 for an edit whose every level is narrow.
+    pub marked: u64,
 }
 
 /// A bug planted in the walk or its feeds, for the simulation's controls: each is one
@@ -209,7 +226,7 @@ pub(crate) struct Frontier {
     /// The view the last walk ended in ([`Storage::view`]'s number), 0 before any: while it
     /// is the storage's view, a row not verified in it is unchanged ([`clean`]).
     clean_at: AtomicU64,
-    /// How many rows [`Walked::unwound`] holds.
+    /// How many rows [`Walked::apart`] holds.
     unwound: AtomicU32,
     plant: Plant,
 }
@@ -622,7 +639,7 @@ fn walk(db: *const (), storage: &Storage) {
             written: std::mem::take(&mut walked.written),
             untracked: std::mem::take(&mut walked.untracked),
         };
-        (taken, Arc::clone(&walked.unwound)) // clone: a count
+        (taken, Arc::clone(&walked.apart)) // clone: a count
     };
     // Named, with what it did: the size of the changed set, the rows visited and the edges
     // walked for this edit (rule 16).
@@ -636,6 +653,7 @@ fn walk(db: *const (), storage: &Storage) {
         edges = tracing::field::Empty,
         changed = tracing::field::Empty,
         unwound = tracing::field::Empty,
+        marked = tracing::field::Empty,
     );
     let _entered = walking.enter();
     let mut plan = Plan::new();
@@ -652,7 +670,8 @@ fn walk(db: *const (), storage: &Storage) {
         row_of(storage, node)
             .is_some_and(|(header, _, _)| header.meta.load(Ordering::Relaxed) & UNTRACKED != 0)
     });
-    // A row whose verification unwound stands apart while its word does.
+    // A row set apart (marked past a wide level, or its verification unwound) stands apart
+    // while its word does: a pull that brought it up to date since took it out.
     // alloc: the rows set apart, none in a build whose every row verifies
     let mut unwound: Vec<(u32, u32)> = apart
         .iter()
@@ -677,6 +696,11 @@ fn walk(db: *const (), storage: &Storage) {
             work.untracked += 1;
         }
     }
+    // The rows set apart, by node: those kept from the walks before and this walk's.
+    let mut apart_now = Seen::with_hasher(blaze_hash::FixedState);
+    apart_now.extend(unwound.iter().map(|it| it.0)); // alloc: as above
+    // Whether a wide level was met: from it on the walk marks and verifies nothing.
+    let mut broad = false;
     let mut first = true;
     loop {
         // What said it changed, by this walk's verifications or by any pull since the last.
@@ -696,7 +720,7 @@ fn walk(db: *const (), storage: &Storage) {
         }
         // A row set apart is not verified again: it is named, and its readers are asked.
         suspects.retain(|&node| {
-            let apart = unwound.iter().any(|&(it, _)| it == node);
+            let apart = apart_now.contains(&node);
             if apart {
                 changed.push(node);
                 found.push(node);
@@ -704,15 +728,36 @@ fn walk(db: *const (), storage: &Storage) {
             !apart
         });
         let db = Db(db);
+        // A wide level, and every level after it: marked, not verified ([`WIDE`]). A row
+        // never made or emptied has nothing to mark; one up to date in this view said so
+        // if it changed.
+        broad |= suspects.len() >= WIDE;
+        if broad {
+            let view_bits = storage.view_bits();
+            for &node in &suspects {
+                let Some((header, _, _)) = row_of(storage, node) else { continue };
+                let word = header.verified.load(Ordering::Acquire);
+                if word & (VIEW_MASK | RUNNING | PROVISIONAL) == 0 {
+                    continue;
+                }
+                if word & (RUNNING | PROVISIONAL) == 0 && word & VIEW_MASK == view_bits {
+                    continue;
+                }
+                changed.push(node);
+                found.push(node);
+                if apart_now.insert(node) {
+                    unwound.push((node, word)); // alloc: as above
+                }
+                work.marked += 1;
+            }
+            suspects.clear();
+            continue;
+        }
         let seen: Vec<AtomicU8> = suspects.iter().map(|_| AtomicU8::new(0)).collect(); // alloc: as above
         let one = |at: usize| {
             seen[at].store(verify(db, storage, suspects[at], plant) as u8, Ordering::Relaxed);
         };
-        if suspects.len() < PAR_AT {
-            (0..suspects.len()).for_each(one);
-        } else {
-            super::par_for_each(suspects.len(), one);
-        }
+        (0..suspects.len()).for_each(one);
         for (at, &node) in suspects.iter().enumerate() {
             let seen = seen[at].load(Ordering::Relaxed);
             if seen == Seen1::Unsure as u8 || seen == Seen1::Unwound as u8 {
@@ -721,7 +766,9 @@ fn walk(db: *const (), storage: &Storage) {
             }
             if seen == Seen1::Unwound as u8 {
                 work.unwound += 1;
-                if let Some((header, _, _)) = row_of(storage, node) {
+                if let Some((header, _, _)) = row_of(storage, node)
+                    && apart_now.insert(node)
+                {
                     unwound.push((node, header.verified.load(Ordering::Acquire))); // alloc: as above
                 }
             }
@@ -746,6 +793,7 @@ fn walk(db: *const (), storage: &Storage) {
     walking.record("edges", work.edges);
     walking.record("changed", work.changed);
     walking.record("unwound", work.unwound);
+    walking.record("marked", work.marked);
     // The walk's work, kept with the build it ran in (`blaze explain edit_work`): a walk
     // that verified or reached more than the edit did shows here first.
     tracing::info!(
@@ -757,6 +805,7 @@ fn walk(db: *const (), storage: &Storage) {
         edges = work.edges,
         changed = work.changed,
         unwound = work.unwound,
+        marked = work.marked,
         "edit work"
     );
 
@@ -771,12 +820,14 @@ fn walk(db: *const (), storage: &Storage) {
         merge_oldest(&mut log);
         Arc::new(log) // alloc: as above
     };
-    let apart = unwound.len() as u32;
+    // Sorted by node, each once ([`set_apart`] searches it).
+    unwound.sort_unstable_by_key(|it| it.0);
+    let apart = u32::try_from(unwound.len()).unwrap_or(u32::MAX);
     let unwound = Arc::new(unwound); // alloc: as above
     taken.written.clear();
     let mut walked = frontier.walked.lock();
     walked.log = log;
-    walked.unwound = unwound;
+    walked.apart = unwound;
     walked.done = view;
     walked.work = work;
     drop(walked);
@@ -810,8 +861,8 @@ pub(crate) fn clean(storage: &Storage, header: &Header, node: u32) -> bool {
 
 #[cold]
 fn set_apart(frontier: &Frontier, node: u32) -> bool {
-    let apart = Arc::clone(&frontier.walked.lock().unwound); // clone: a count
-    apart.iter().any(|&(it, _)| it == node)
+    let apart = Arc::clone(&frontier.walked.lock().apart); // clone: a count
+    apart.binary_search_by_key(&node, |it| it.0).is_ok()
 }
 
 /// Walks the changed set of this view if a walk is due: what a host calls once after its

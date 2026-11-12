@@ -1237,6 +1237,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-hub"
+version = "0.0.0"
+dependencies = [
+ "blaze-protocol",
+ "blaze-std",
+ "blaze-vfs",
+ "hegeltest",
+ "serde",
+]
+
+[[package]]
 name = "blaze-ids"
 version = "0.0.0"
 dependencies = [
@@ -1383,6 +1394,15 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-store-check",
+ "hegeltest",
+]
+
+[[package]]
+name = "blaze-launch"
+version = "0.0.0"
+dependencies = [
+ "blaze-protocol",
+ "blaze-std",
  "hegeltest",
 ]
 

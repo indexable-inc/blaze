@@ -421,8 +421,8 @@ fn an_untracked_read_puts_its_row_in_every_walk() {
 }
 
 /// The cost of an edit is what it reaches: one input of a thousand written, the walk visits
-/// that input's readers (on the pool: past [`super::frontier`]'s serial bound) and no other
-/// row, and the answer is theirs.
+/// that input's readers (a wide level: marked, not run) and no other row, and the answer is
+/// theirs.
 #[test]
 fn the_work_of_an_edit_is_its_readers_among_a_thousand_rows() {
     const WIDE: usize = 100;
@@ -483,27 +483,67 @@ fn a_level_under_the_walks_serial_bound_is_verified_on_the_walkers_thread() {
     assert!(on.iter().all(|thread| *thread == me), "a row of the level left the walker's thread");
 }
 
-/// The control of [`a_level_under_the_walks_serial_bound_is_verified_on_the_walkers_thread`]:
-/// a level at the bound or past it is the pool's, and its rows run on workers, so the oracle
-/// tells where a level ran.
+/// The invariant: a walk that meets a wide level runs no row and waits for none. From that
+/// level on it marks: each row it reaches is named as changed and left to whoever asks for
+/// it, so a change the whole program reads costs the walk its reverse edges, where a level
+/// handed to the pool a job a row had its jobs wait on each other for minutes (2026-11-11).
+/// 100 readers of one input, each read by a row of its own: the walk runs none of the 200,
+/// names all, and a row asked for afterwards is run then and answers as the model.
 #[test]
-fn the_oracle_catches_a_level_handed_to_the_pool() {
+fn a_wide_level_is_marked_and_no_row_of_it_runs_in_the_walk() {
     const WIDE: usize = 100;
-    let flow: Vec<FlowNode> = (0..WIDE).map(|_| sum(&[Dep::Input(0)])).collect();
+    let mut flow: Vec<FlowNode> = (0..WIDE).map(|_| sum(&[Dep::Input(0)])).collect();
+    flow.extend((0..WIDE).map(|at| sum(&[Dep::Query(at)])));
     let mut db = TestDb::new();
     *db.flow.lock() = flow;
     let cells: Vec<Cell> = (0..2).map(|_| Cell::new(&db, 1, 0)).collect();
     db.cells.lock().extend(cells.iter().map(|it| it.0));
-    for at in 0..WIDE {
+    for at in 0..2 * WIDE {
+        assert_eq!(*fetch::<Flow>(&db, node(&db, at)), 1);
+    }
+    take_ran_on(&db);
+    let since = db.storage().view();
+    cells[0].set_a(&mut db, 7);
+    let changed = changed_since::<Flow>(&db, since);
+    assert!(matches!(changed, Changed::Keys(ref keys) if keys.len() == 2 * WIDE), "{changed:?}");
+    assert_eq!(take_ran_on(&db).len(), 0, "the walk ran a row of a wide level");
+    let work = db.storage().changed_set_work();
+    assert_eq!((work.visited, work.marked, work.changed), (200, 200, 200), "{work:?}");
+    // A marked row is never taken as clean: asked for, it is run and gives the new value,
+    // and what it reads with it.
+    assert_eq!(*fetch::<Flow>(&db, node(&db, WIDE + 3)), 7);
+    assert_eq!(take_ran_on(&db).len(), 2, "the row asked for and the one it reads");
+    for at in 0..2 * WIDE {
+        assert_eq!(*fetch::<Flow>(&db, node(&db, at)), 7, "row {at}");
+    }
+    // The next walk, after another write: the rows brought up to date are verified again
+    // or marked again, and every answer is the model's.
+    cells[0].set_a(&mut db, 9);
+    let again = changed_since::<Flow>(&db, since);
+    assert!(matches!(again, Changed::Keys(ref keys) if keys.len() == 2 * WIDE), "{again:?}");
+    for at in 0..2 * WIDE {
+        assert_eq!(*fetch::<Flow>(&db, node(&db, at)), 9, "row {at}");
+    }
+}
+
+/// The control of [`a_wide_level_is_marked_and_no_row_of_it_runs_in_the_walk`]: a level
+/// under the bound is verified by the walk itself, so its rows do run in it, and the oracle
+/// tells a walk that marks from one that verifies.
+#[test]
+fn the_oracle_catches_a_walk_that_runs_a_levels_rows() {
+    const NARROW: usize = 20;
+    let flow: Vec<FlowNode> = (0..NARROW).map(|_| sum(&[Dep::Input(0)])).collect();
+    let mut db = TestDb::new();
+    *db.flow.lock() = flow;
+    let cells: Vec<Cell> = (0..2).map(|_| Cell::new(&db, 1, 0)).collect();
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
+    for at in 0..NARROW {
         fetch::<Flow>(&db, node(&db, at));
     }
     take_ran_on(&db);
     let since = db.storage().view();
     cells[0].set_a(&mut db, 7);
-    let me = std::thread::current().id();
-    let changed = changed_since::<Flow>(&db, since);
-    assert!(matches!(changed, Changed::Keys(ref keys) if keys.len() == WIDE), "{changed:?}");
-    let on = take_ran_on(&db);
-    assert_eq!(on.len(), WIDE);
-    assert!(on.iter().any(|thread| *thread != me), "every row of a wide level ran on the walker's thread");
+    _ = changed_since::<Flow>(&db, since);
+    assert_eq!(take_ran_on(&db).len(), NARROW, "a narrow level's rows run in the walk");
+    assert_eq!(db.storage().changed_set_work().marked, 0);
 }
