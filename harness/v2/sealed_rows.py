@@ -104,8 +104,8 @@ def memory(label: str) -> None:
                f"huge pages {int(rollup['AnonHugePages'].split()[0]) // 1024} MB")
 
 
-def explain(label: str, d: Path) -> None:
-    _, r = timed([IN.blaze, "explain", "edit_work"], d)
+def explain(label: str, d: Path, build: int) -> None:
+    _, r = timed([IN.blaze, "explain", "edit_work", f"build={build}"], d)
     if r.returncode != 0:
         row(label, f"`blaze explain edit_work` failed: {r.stderr.strip()[-300:]}")
         return
@@ -141,7 +141,7 @@ def main() -> None:
     body(a, 100)
     ms, r = timed([IN.blaze, "run", "-q"], a)
     row("first edit after the cold build", f"{ms:.0f} ms, exit {r.returncode}, right {'hello: 101' in r.stdout}")
-    explain("first edit: engine work", a)
+    explain("first edit: engine work", a, 3)
     if IN.census:
         time.sleep(3)
         census()
@@ -176,7 +176,6 @@ def main() -> None:
     body(a, 777)
     ms, r = timed([IN.blaze, "run", "-q"], a)
     row("first edit after a restart", f"{ms / 1000:.2f} s, exit {r.returncode}, right {'hello: 778' in r.stdout}")
-    explain("first edit after a restart: engine work", a)
     time.sleep(5)
     memory("idle after the restart's builds")
     row("load average at end", os.getloadavg()[0])
