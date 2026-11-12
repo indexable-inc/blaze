@@ -192,6 +192,14 @@
    "why": "A no-code review of the plan by a second Fable at high effort, asked for by Andrew, 2026-11-11; its main finding was that the lanes then running did not follow the plan's own order (nobody was on the edit path).",
    "recommended": "Adopt all of it; the code-speed target is stated as faster than default rustc --release until measured.",
    "state": "edit-path, launcher and hub lanes started; promotion deferred"
+  },
+  {
+   "id": "D25",
+   "date": "2026-11-11",
+   "decision": "While cargo builds blaze in the dev loop, a new crate that has to be verified now sits on core and alloc, not bstd, and says in its header that it moves to bstd when the rule returns to blaze-only.",
+   "why": "bstd uses blaze-only syntax and features (core::reflect, blaze_comptime, for const), so rustc rejects it and a crate on it cannot be checked or tested with cargo; blaze-hub and blaze-launch were written on bstd and could not be verified. Andrew, 2026-11-11: \"your decision is fine\".",
+   "recommended": "Yes, as an interim; the alternative was to block new crates on making bstd build under rustc.",
+   "state": "in force; blaze-launch is being ported, blaze-hub is next"
   }
  ]
 }
