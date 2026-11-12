@@ -341,6 +341,7 @@ impl Storage {
             runs = tracing::field::Empty,
             readers = tracing::field::Empty,
             remade = tracing::field::Empty,
+            packed = tracing::field::Empty,
         );
         let _entered = fold.enter();
         let mut seen = Seen::with_hasher(blaze_hash::FixedState);
@@ -368,10 +369,37 @@ impl Storage {
                 reverse.stored(node, &[], &new, &mut seen);
             }
         }
+        // The lists hold as many readers as the packed tier: packed, a copy a reader, a
+        // bounded number of times a reader however long the storage lives.
+        let packed = reverse.due();
+        if packed {
+            reverse.pack();
+        }
         fold.record("runs", runs);
         fold.record("readers", reverse.held());
         fold.record("remade", remade);
+        fold.record("packed", packed);
         self.frontier.reverse = reverse;
+    }
+
+    /// Packs the reverse index where its lists hold enough readers to pay
+    /// ([`Reverse::worth_packing`]): what a host does with time to spare (a build's end), so
+    /// what a build's runs added is held at 4 bytes a reader from then on. With `&mut`: no
+    /// walk reads the index meanwhile.
+    pub fn pack_reverse(&mut self) {
+        if !self.frontier.reverse.worth_packing() {
+            return;
+        }
+        let pack = tracing::info_span!(
+            target: "blaze",
+            "reverse edges pack",
+            readers = self.frontier.reverse.held(),
+            before = self.frontier.reverse.bytes(),
+            after = tracing::field::Empty,
+        );
+        let _entered = pack.enter();
+        self.frontier.reverse.pack();
+        pack.record("after", self.frontier.reverse.bytes());
     }
 
     /// The nodes of the edge span `span`, into `out` (emptied first).

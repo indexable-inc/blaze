@@ -362,6 +362,12 @@ impl Release<Crate> {
             true => db.storage_mut().end_epoch(),
             false => blaze_query::db::Unread::default(),
         };
+        // And what its runs added to the reverse edges is packed, 4 bytes a reader: here,
+        // with the answer given and the front end exclusive, never at a view's boundary on a
+        // build's path unless the lists doubled the index.
+        if ended {
+            db.storage_mut().pack_reverse();
+        }
         // What was let go goes back to the system now, not when mimalloc's purge delay and the
         // next page taken get to it: this thread's heaps and every freed page at once, each
         // other thread's heaps as it next allocates or idles (memcap5). Not while the daemon
