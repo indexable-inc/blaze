@@ -1104,13 +1104,16 @@ fn a_thread_locals_cells_of_every_kind_go_with_it() {
         [GotKind::TpOff, GotKind::TlsGd],
     );
     // `adrp x0, :gottprel:tls; ldr x0, [x0, :gottprel_lo12:tls]; adrp x0, :tlsdesc:tls;
-    // ldr x1, [x0, :tlsdesc_lo12:tls]; add x0, x0, :tlsdesc_lo12:tls; blr x1; ret`
+    // ldr x1, [x0, :tlsdesc_lo12:tls]; add x0, x0, :tlsdesc_lo12:tls; blr x1; ret`, in a
+    // shared library: an executable's descriptors are relaxed and have no cell
+    // (`reloc::in_output`).
     let words: [u32; 7] =
         [0x9000_0000, 0xf940_0000, 0x9000_0000, 0xf940_0001, 0x9100_0000, 0xd63f_0020, 0xd65f_03c0];
     let a64 = (
         Output {
             arch: Arch::Aarch64,
-            interpreter: Some("/lib/ld-linux-aarch64.so.1".into()),
+            kind: OutputKind::Shared { name: "libt.so".into(), exports: vec!["_start".into()] },
+            interpreter: None,
             triple: "aarch64-unknown-linux-gnu".into(),
             ..output(true)
         },
@@ -2296,6 +2299,8 @@ mod patch;
 mod beside;
 
 mod eh_frame_reach;
+
+mod tls_desc;
 
 /// The state's columns, read and written as a stage does.
 mod columns {

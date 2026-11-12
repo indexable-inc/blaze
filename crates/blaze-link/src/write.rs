@@ -590,7 +590,9 @@ impl Reloc<'_> {
                 Value::Tls(offset) => tls_base + offset,
                 Value::Import(_) | Value::TpOff(_) => 0,
             };
-            let tls_kind = reloc::is_tls(fixup.apply);
+            // A relaxed TLS descriptor is local exec to all but an import ([`reloc::known`]).
+            let apply = reloc::known(fixup.apply, matches!(value, Value::Import(_)));
+            let tls_kind = reloc::is_tls(apply);
             let tp = match (value, self.tls_at) {
                 (Value::TpOff(tp), _) if tls_kind => Some(tp),
                 (Value::TpOff(_), _) => {
@@ -727,7 +729,7 @@ impl Reloc<'_> {
                     .map_err(|it| fail(fixup, it))?;
                 continue;
             }
-            let kind = reloc::got_kind(fixup.apply);
+            let kind = reloc::got_kind(apply);
             let g = match kind {
                 Some(kind) => {
                     let target = got_target(symbols, fixup);
@@ -827,7 +829,7 @@ impl Reloc<'_> {
                 tls: self.tls,
                 tp,
             };
-            reloc::apply(fixup.apply, &ctx, place).map_err(|it| match it.reach() {
+            reloc::apply(apply, &ctx, place).map_err(|it| match it.reach() {
                 // alloc: error path
                 true => past(fixup, it.to_string()),
                 // alloc: error path
