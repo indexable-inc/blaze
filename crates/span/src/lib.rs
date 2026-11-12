@@ -25,7 +25,7 @@ pub use self::{
     map::{RealSpanMap, SpanMap, kept_maps},
 };
 
-pub use syntax::{Edition, Extensions};
+pub use syntax::{BlazeEdition, Edition, Extensions, UnknownBlazeEdition};
 pub use text_size::{TextRange, TextSize};
 
 /// A source file: a dense number base-db hands out, at most [`EditionedFileId::MAX_FILE_ID`].

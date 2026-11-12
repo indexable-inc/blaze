@@ -12,6 +12,7 @@ pub mod crate_attrs;
 mod db;
 mod editioned_file_id;
 mod extensions;
+pub use extensions::SaidBlazeEdition;
 mod file_set;
 mod files;
 mod input;

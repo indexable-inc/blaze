@@ -18,7 +18,7 @@ use blaze_units::{
 };
 use cfg::{CfgAtom, CfgOptions};
 use intern::Symbol;
-use span::Edition;
+use span::{BlazeEdition, Edition};
 use triomphe::Arc;
 
 use super::{LowerError, files};
@@ -412,13 +412,46 @@ pub(crate) fn dependency(
     Ok(BuiltDependency::with_prelude(name, krate, prelude, on.is_std && !unit.is_std))
 }
 
+/// The Rust edition `unit`'s crate is parsed and resolved in: its target's, or for a target
+/// of a blaze edition (`edition = "blaze-2026.11"`) the Rust edition that fixes
+/// ([`BlazeEdition::rust`]). The blaze edition itself reaches the front end as a crate
+/// attribute ([`blaze_edition_attrs`]).
 pub(crate) fn edition(unit: &Unit, what: &str) -> Result<Edition, LowerError> {
+    if let Some(blaze) = blaze_edition(unit, what)? {
+        return Ok(blaze.rust());
+    }
     unit.target.edition.parse::<Edition>().map_err(|_| {
         LowerError::at(
             format!("{what} has edition `{}`, which blaze does not know", unit.target.edition),
             what,
         )
     })
+}
+
+/// The blaze edition `unit`'s target says (docs/v2/plan/design/std.md, "The blaze edition:
+/// opting in"), or none for a Rust edition; one that starts `blaze-` and is no blaze
+/// edition's is refused, naming it.
+pub(crate) fn blaze_edition(unit: &Unit, what: &str) -> Result<Option<BlazeEdition>, LowerError> {
+    BlazeEdition::from_manifest(&unit.target.edition)
+        .map_err(|unknown| LowerError::at(format!("{what}: {unknown}"), what))
+}
+
+/// The crate attributes `unit`'s crate is given beside its root's own
+/// (`base_db::BuiltCrateData::crate_attrs`): for a target of a blaze edition, the edition's
+/// attribute ([`BlazeEdition::crate_attr`]), which is how the opt-in is a tracked input of
+/// the front end: the crate's key hashes every crate attribute (`blaze_items::key::crate_key`),
+/// so nothing made for the crate under one edition is ever served under another (rule
+/// keys-cover-every-input). A build script and a proc-macro target stay Rust's: neither is
+/// handed capabilities yet (std.md, row S5f), and a unit of the standard library is never of
+/// a blaze edition. A crate of a Rust edition is given none, as before.
+pub(crate) fn blaze_edition_attrs(unit: &Unit, what: &str) -> Result<Box<[Box<str>]>, LowerError> {
+    let rust_only =
+        unit.is_std || unit.target.is_proc_macro() || unit.target.kind.iter().any(|it| it == "custom-build");
+    match blaze_edition(unit, what)? {
+        // alloc: once per crate of a blaze edition, its one attribute
+        Some(blaze) if !rust_only => Ok(Box::new([Box::from(blaze.crate_attr())])),
+        _ => Ok(Box::new([])),
+    }
 }
 
 /// The front end's form of what a unit is built for ([`Unit::built_for`], the source of truth),

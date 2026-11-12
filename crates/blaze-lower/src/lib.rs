@@ -824,7 +824,7 @@ fn lower_writes<T: blaze_query::Tree>(
             edition: crates::edition(unit, what)?,
             dependencies,
             origin: crates::origin(package, unit),
-            crate_attrs: Box::new([]),
+            crate_attrs: crates::blaze_edition_attrs(unit, what)?,
             target_kind: crates::target_kind(unit, plan, what)?,
             manifest_kind: crates::manifest_kind(unit, what)?,
             crate_types: crates::crate_types(unit, plan, what)?,

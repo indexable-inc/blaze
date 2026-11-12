@@ -26,6 +26,8 @@ cargo-platform.workspace = true
 # cargo 1.99's own schema of Cargo.toml, so that what deserializes and the messages of what does
 # not are cargo's: docs/resolve.md, "Decisions".
 cargo-util-schemas.workspace = true
+# The blaze editions and their spellings, shared with the front end (`edition = "blaze-2026.11"`).
+edition.workspace = true
 glob.workspace = true
 pathdiff.workspace = true
 semver.workspace = true

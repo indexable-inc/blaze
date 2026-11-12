@@ -65,7 +65,7 @@ pub use crate::{
         SyntaxNodeChildren, SyntaxToken, SyntaxTreeBuilder, Tree,
     },
 };
-pub use parser::{Edition, Extensions, LexedStr, SyntaxKind, T};
+pub use parser::{BlazeEdition, Edition, Extensions, LexedStr, SyntaxKind, T, UnknownBlazeEdition};
 pub use rustc_literal_escaper as unescape;
 pub use smol_str::{SmolStr, SmolStrBuilder, ToSmolStr, format_smolstr};
 pub use syntax_tree::{
