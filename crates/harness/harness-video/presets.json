@@ -1,0 +1,97 @@
+{
+  "about": "Export presets for harness-video, by name: `harness-video SCENE.flecs OUT.mp4 PRESET`. The one home of every encoder setting; src/preset.rs reads it (compiled in) and refuses a field it does not know. A preset's width and height are pixels: the scene's Video says the frame in points, and the scale is the preset's width over the scene's (the two must have one aspect). `fps` replaces the scene's (a timeline is in seconds, so every frame is still drawn at its own time).",
+  "x": {
+    "source": "https://docs.x.com/x-api/media/quickstart/best-practices",
+    "fetched": "2026-11-11",
+    "says": [
+      "Recommended Video Codec: H264 High Profile",
+      "Frame Rates: 30 FPS, 60 FPS",
+      "Video Resolution: 1280x720 (landscape), 720x1280 (portrait), 720x720 (square). Subscribed users can upload a 1080p video and get 1080p playback. Unsubscribed users can upload a 720p video and get a 720p playback.",
+      "Minimum Video Bitrate: 5,000 kbps",
+      "Minimum Audio Bitrate: 128 kbps",
+      "Audio Codec: AAC LC",
+      "Aspect Ratio: 16:9 (landscape or portrait), 1:1 (square)",
+      "Frame rate: must be 60 FPS or less",
+      "Dimensions: must be between 32x32 and 1280x1024",
+      "File size: see size and duration limits (8 GB default for Post video; 16 GB for Premium / verified)",
+      "Video on a Post (tweet_video, amplify_video): 0.5 seconds-20 minutes, 8 GB",
+      "Aspect ratio: must be between 1:3 and 3:1",
+      "Pixel aspect ratio: must have 1:1",
+      "Pixel format: Only YUV 4:2:0 is supported",
+      "Audio must be AAC with Low Complexity profile. (High-Efficiency AAC is not supported)",
+      "Audio must be mono or stereo, not 5.1 or greater",
+      "Must not have open GOP",
+      "Must use progressive scan"
+    ],
+    "unverified": [
+      "The page is the API's (media upload); the consumer help page help.x.com/en/using-x/x-videos answered 403 on 2026-11-11, so what the app and the web composer accept is not established.",
+      "HEVC / H.265 is not mentioned on the page: nothing says X accepts it.",
+      "10-bit and HDR are not mentioned: nothing says X keeps them. The X presets are 8-bit BT.709.",
+      "No container is named; MP4 with the moov first is what the presets write.",
+      "The page says both 'Dimensions: must be between 32x32 and 1280x1024' and 'Subscribed users can upload a 1080p video': 1920x1080 is taken to be for subscribed accounts only, and nothing above 1080p is accepted, so there is no 4K preset.",
+      "The Premium / verified duration limit (the page's second table) was not read out in full."
+    ]
+  },
+  "presets": {
+    "x-landscape-1080p60": {
+      "for": "X, a subscribed account (1080p in, 1080p playback): the page's recommended codec at its highest resolution and frame rate. X re-encodes whatever it is given, so the bitrate is far above its 5,000 kbps minimum: a clean source.",
+      "width": 1920, "height": 1080, "fps": 60,
+      "codec": "h264", "profile": "high", "pixel": "yuv420p8",
+      "bitrate_kbps": 40000,
+      "keyframe_seconds": 1.0, "closed_gop": true,
+      "colour": "bt709-video-range",
+      "audio": "aac-lc", "audio_kbps": 256,
+      "container": "mp4-moov-first"
+    },
+    "x-landscape-720p60": {
+      "for": "X, an unsubscribed account (720p in, 720p playback).",
+      "width": 1280, "height": 720, "fps": 60,
+      "codec": "h264", "profile": "high", "pixel": "yuv420p8",
+      "bitrate_kbps": 20000,
+      "keyframe_seconds": 1.0, "closed_gop": true,
+      "colour": "bt709-video-range",
+      "audio": "aac-lc", "audio_kbps": 256,
+      "container": "mp4-moov-first"
+    },
+    "x-square-1080": {
+      "for": "X, 1:1, a subscribed account. A scene must be laid out square to use it.",
+      "width": 1080, "height": 1080, "fps": 60,
+      "codec": "h264", "profile": "high", "pixel": "yuv420p8",
+      "bitrate_kbps": 30000,
+      "keyframe_seconds": 1.0, "closed_gop": true,
+      "colour": "bt709-video-range",
+      "audio": "aac-lc", "audio_kbps": 256,
+      "container": "mp4-moov-first"
+    },
+    "x-portrait-1080x1920": {
+      "for": "X, 9:16, a subscribed account. A scene must be laid out upright to use it.",
+      "width": 1080, "height": 1920, "fps": 60,
+      "codec": "h264", "profile": "high", "pixel": "yuv420p8",
+      "bitrate_kbps": 40000,
+      "keyframe_seconds": 1.0, "closed_gop": true,
+      "colour": "bt709-video-range",
+      "audio": "aac-lc", "audio_kbps": 256,
+      "container": "mp4-moov-first"
+    },
+    "x-landscape-1080p60-hevc": {
+      "for": "UNVERIFIED ON X: its page names H.264 only. HEVC Main, 8-bit, for places that take it; never the default for X.",
+      "width": 1920, "height": 1080, "fps": 60,
+      "codec": "hevc", "profile": "main", "pixel": "yuv420p8",
+      "quality": 0.85,
+      "keyframe_seconds": 1.0, "closed_gop": true,
+      "colour": "bt709-video-range",
+      "audio": "aac-lc", "audio_kbps": 256,
+      "container": "mp4-moov-first"
+    },
+    "youtube-hdr10-master": {
+      "for": "YouTube's HDR master, and what a render with no preset named makes: H.265 Main 10, HDR10 (PQ over BT.2020, P3-D65 mastering display at 1000 nits), lossless audio. Its size and frame rate are the scene's own (0 here).",
+      "width": 0, "height": 0, "fps": 0,
+      "codec": "hevc", "profile": "main10", "pixel": "yuv420p10",
+      "quality": 0.85,
+      "keyframe_seconds": 0.5, "closed_gop": false,
+      "colour": "hdr10",
+      "audio": "alac",
+      "container": "mp4-moov-first"
+    }
+  }
+}

@@ -1,6 +1,6 @@
 [package]
 name = "harness-video"
-description = "Renders a video from a flecs scene: the native stack's UI (prims, layout, motion, draw) on a fixed frame clock, a timeline of Cues as data, Metal offscreen, encoded by VideoToolbox (HEVC Main 10, HDR10) into an mp4 by AVAssetWriter"
+description = "Renders a video from a flecs scene: the native stack's UI (prims, layout, motion, draw) on a fixed frame clock, a timeline of Cues as data, Metal offscreen, encoded by VideoToolbox (H.264 or HEVC, as an export preset says) into an mp4 by AVAssetWriter"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
@@ -32,6 +32,8 @@ harness-native-ui-timeline = { path = "../harness-native-ui-timeline" }
 hyperion-ecs = { path = "../vendor/hyperion-ecs", features = ["pipeline", "meta"] }
 hyperion-flecs-c = { path = "../vendor/hyperion-flecs-c", features = ["prefab", "constraint_traits", "pipeline", "script", "script_input"] }
 png = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 harness-native-ui-motion-api = { path = "../harness-native-ui-motion-api" }

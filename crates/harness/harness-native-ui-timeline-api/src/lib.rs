@@ -95,6 +95,43 @@ impl GlyphsIn {
     }
 }
 
+/// A number shown as a node's words: the node's `Text` is `value` set with `decimals` places and a comma between each
+/// three digits of its whole part, then `unit` (its own leading space included: `" ms"`). A `Cue` on `Tally.value` counts
+/// it up or down, so a figure on screen moves because the number did. harness-native-ui-timeline's `apply` writes the
+/// words after the cues, each frame.
+#[derive(Component, Clone, Debug, Default, PartialEq)]
+pub struct Tally {
+    pub value: f32,
+    pub decimals: i32,
+    pub unit: ScriptString,
+}
+
+impl Tally {
+    /// The words: `1,091,174`, `15.1 ms`. A negative value keeps its sign before the digits.
+    #[must_use]
+    pub fn words(&self) -> String {
+        let places = self.decimals.clamp(0, 6) as usize;
+        let set = format!("{:.places$}", self.value.abs());
+        let (whole, frac) = set.split_once('.').map_or((set.as_str(), ""), |(w, f)| (w, f));
+        let mut out = String::new();
+        if self.value < 0.0 && set.bytes().any(|b| (b'1'..=b'9').contains(&b)) {
+            out.push('-');
+        }
+        for (i, c) in whole.chars().enumerate() {
+            if i > 0 && (whole.len() - i) % 3 == 0 {
+                out.push(',');
+            }
+            out.push(c);
+        }
+        if !frac.is_empty() {
+            out.push('.');
+            out.push_str(frac);
+        }
+        out.push_str(self.unit.as_str());
+        out
+    }
+}
+
 /// An instrument a [`Sound`] plays (harness-native-blaze's soundtrack voices); the members it reads are on each.
 #[derive(Layout, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -114,6 +151,10 @@ pub enum Voice {
     Whoosh,
     /// The physically modelled fire, burning for its Lasts.
     Fire,
+    /// A low warm bed, an open chord on its Pitch for its Lasts: Gain, Pan.
+    Pad,
+    /// A tone rising two octaves to its Pitch over its Lasts, cut at the top (where a hit lands): Gain, Pan.
+    Rise,
 }
 
 /// A sound of the scene's soundtrack, as data, one component per concern so a prefab carries a voice's defaults and an
@@ -182,6 +223,7 @@ impl GlyphsArrive {
 
 hyperion_api_layouts::api_layouts! {
     "Cue" => alias Cue,
+    "Tally" => alias Tally,
     "GlyphsIn" => alias GlyphsIn,
     "GlyphsArrive" => alias GlyphsArrive,
     "Sound" => alias Sound,
@@ -197,6 +239,7 @@ hyperion_api_layouts::api_layouts! {
 /// Register the timeline's components before any scene resolves them.
 pub fn register(world: &World) {
     world.component::<Cue>().writable();
+    world.component::<Tally>().writable();
     world.component::<GlyphsIn>().writable();
     world.component::<GlyphsArrive>().writable();
     world.component::<Sound>().writable();

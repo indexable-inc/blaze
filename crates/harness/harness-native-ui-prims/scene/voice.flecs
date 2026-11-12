@@ -57,4 +57,18 @@ voice {
     Sound: {voice: Fire}
     Lasts: {dur: 3}
   }
+  // A low warm bed under a stretch: an open chord on its Pitch.
+  prefab Pad : Base {
+    Sound: {voice: Pad}
+    Lasts: {dur: 8}
+    Pitch: {hz: 110}
+    Gain: {amp: 0.03}
+  }
+  // A clean rise to its Pitch, cut at the top: put a hit at its end.
+  prefab Rise : Base {
+    Sound: {voice: Rise}
+    Lasts: {dur: 1.5}
+    Pitch: {hz: 880}
+    Gain: {amp: 0.04}
+  }
 }

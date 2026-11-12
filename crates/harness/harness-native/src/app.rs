@@ -2900,6 +2900,8 @@ fn scene_sound(w: WorldRef<'_>) -> Result<SceneSound, String> {
         Voice::Thud => V::Thud,
         Voice::Whoosh => V::Whoosh,
         Voice::Fire => V::Fire,
+        Voice::Pad => V::Pad,
+        Voice::Rise => V::Rise,
     };
     let gain = |e: EntityView<'_>| e.try_cloned::<&Gain>().map_or(0.0, |g| g.amp);
     let lasts = |e: EntityView<'_>| e.try_cloned::<&Lasts>().map_or(0.0, |l| l.dur);

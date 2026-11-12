@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 harness-native-flecs = { path = "../harness-native-flecs" }
 harness-native-ui-node-api = { path = "../harness-native-ui-node-api" }
+harness-native-ui-text-api = { path = "../harness-native-ui-text-api" }
 harness-native-ui-timeline-api = { path = "../harness-native-ui-timeline-api" }
 hyperion-ecs = { path = "../vendor/hyperion-ecs", features = ["meta"] }
 

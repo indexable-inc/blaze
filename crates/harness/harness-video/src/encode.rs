@@ -1,12 +1,14 @@
 //! The mp4, natively and with no copy of a frame: each frame is a pixel buffer from the VideoToolbox session's own pool
-//! (`x420`: 10-bit 4:2:0 biplanar, limited range, IOSurface-backed), whose two planes CoreVideo maps into Metal so the
-//! HDR10 pass (`hdr.rs`) writes them directly; VideoToolbox encodes it as HEVC Main 10 on the media engine (hardware
-//! required: no software encoder is ever taken), and AVAssetWriter writes the compressed samples into the mp4 as they are
-//! (passthrough), with the soundtrack beside them as Apple Lossless (ALAC), 24-bit stereo at 48 kHz.
+//! (4:2:0 biplanar, video range, IOSurface-backed: `420v` 8-bit or `x420` 10-bit, as the preset's pixel format says), whose
+//! two planes CoreVideo maps into Metal so the colour pass (`yuv.rs`) writes them directly; VideoToolbox encodes it on the
+//! media engine (hardware required: no software encoder is ever taken) as the preset's codec (H.264 High, HEVC Main, HEVC
+//! Main 10), and AVAssetWriter writes the compressed samples into the mp4 as they are (passthrough), moov first, with the
+//! soundtrack beside them as the preset's audio: AAC-LC (AudioToolbox's encoder, inside the writer) or Apple Lossless.
 //!
-//! The stream is tagged HDR10 (BT.2020 primaries and matrix, the PQ transfer, chroma sited left) on every buffer and on
-//! the session, with the mastering display (P3-D65, 1000 nits peak) as SEI. The encoder calls back on its own threads; each
-//! compressed sample is sent to the caller's thread, which appends it to the writer, interleaved with the audio by time.
+//! The stream is tagged with the preset's colour on every buffer and on the session: BT.709 (SDR), or HDR10 (BT.2020
+//! primaries and matrix, the PQ transfer, the mastering display P3-D65 at 1000 nits as SEI); chroma sited left. The
+//! encoder calls back on its own threads; each compressed sample is sent to the caller's thread, which appends it to the
+//! writer, interleaved with the audio by time.
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::path::Path;
@@ -21,21 +23,23 @@ use objc2::runtime::AnyObject;
 use objc2_av_foundation::{
     AVAssetWriter, AVAssetWriterInput, AVAssetWriterStatus, AVFileTypeMPEG4, AVMediaTypeAudio, AVMediaTypeVideo,
 };
-use objc2_avf_audio::{AVEncoderBitDepthHintKey, AVFormatIDKey, AVNumberOfChannelsKey, AVSampleRateKey};
+use objc2_avf_audio::{AVEncoderBitDepthHintKey, AVEncoderBitRateKey, AVFormatIDKey, AVNumberOfChannelsKey, AVSampleRateKey};
 use objc2_core_audio_types::{
     AudioStreamBasicDescription, kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked, kAudioFormatLinearPCM,
-    kAudioFormatAppleLossless,
+    kAudioFormatAppleLossless, kAudioFormatMPEG4AAC,
 };
 use objc2_core_foundation::{CFBoolean, CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType};
 use objc2_core_media::{
     CMAudioFormatDescriptionCreate, CMAudioSampleBufferCreateReadyWithPacketDescriptions, CMBlockBuffer,
     CMFormatDescription, CMSampleBuffer, CMTime, kCMBlockBufferAssureMemoryNowFlag, kCMTimeInvalid,
-    kCMVideoCodecType_HEVC,
+    kCMVideoCodecType_H264, kCMVideoCodecType_HEVC,
 };
 use objc2_core_video::{
     CVAttachmentMode, CVMetalTexture, CVMetalTextureCache, CVMetalTextureGetTexture, CVPixelBuffer, CVPixelBufferPool,
     kCVImageBufferChromaLocationBottomFieldKey, kCVImageBufferChromaLocationTopFieldKey, kCVImageBufferChromaLocation_Left,
-    kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, kCVImageBufferTransferFunctionKey,
+    kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, kCVImageBufferColorPrimaries_ITU_R_709_2,
+    kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
     kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020,
     kCVMetalTextureUsage, kCVPixelBufferHeightKey, kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferMetalCompatibilityKey,
     kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
@@ -45,6 +49,8 @@ use objc2_foundation::{NSDictionary, NSNumber, NSString, NSURL};
 use objc2_metal::{MTLPixelFormat, MTLTextureUsage};
 use objc2_video_toolbox::{
     VTCompressionSession, VTEncodeInfoFlags, VTSessionSetProperty, kVTCompressionPropertyKey_AllowFrameReordering,
+    kVTCompressionPropertyKey_AllowOpenGOP, kVTCompressionPropertyKey_AverageBitRate, kVTProfileLevel_H264_High_AutoLevel,
+    kVTProfileLevel_HEVC_Main_AutoLevel,
     kVTCompressionPropertyKey_ColorPrimaries, kVTCompressionPropertyKey_ExpectedFrameRate,
     kVTCompressionPropertyKey_HDRMetadataInsertionMode, kVTCompressionPropertyKey_MasteringDisplayColorVolume,
     kVTCompressionPropertyKey_MaxKeyFrameInterval, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
@@ -55,12 +61,11 @@ use objc2_video_toolbox::{
     kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
 };
 
-use crate::hdr::PEAK_NITS;
+use crate::preset::{Audio as AudioCodec, Codec, Colour, Export, Pixel, Profile};
+use crate::yuv::PEAK_NITS;
 
-/// Constant quality, 0 to 1 (VideoToolbox's scale; ffmpeg's `-q:v 85`).
-const QUALITY: f64 = 0.85;
-/// The soundtrack's bits a sample, lossless: YouTube re-encodes whatever it is given, so the master's audio is ALAC, not
-/// a lossy AAC (whose Apple encoder also stops at 320 kb/s for 48 kHz stereo, short of YouTube's recommended 384).
+/// An ALAC soundtrack's bits a sample (the YouTube master's: YouTube re-encodes whatever it is given, so that master's
+/// audio is lossless, not a lossy AAC, whose Apple encoder also stops at 320 kb/s for 48 kHz stereo).
 const AUDIO_BITS: i32 = 24;
 /// Audio frames a sample buffer of the soundtrack holds.
 const AUDIO_CHUNK: usize = 4096;
@@ -114,9 +119,9 @@ unsafe extern "C-unwind" fn encoded(
 /// A frame's target: a pixel buffer from the encoder's pool and its two planes mapped into Metal.
 pub struct Target {
     buf: CFRetained<CVPixelBuffer>,
-    /// The `R16Unorm` luma plane, `w x h`.
+    /// The luma plane, `w x h`: `R16Unorm` (10-bit) or `R8Unorm` (8-bit).
     pub luma: Tex,
-    /// The `RG16Unorm` CbCr plane, `w/2 x h/2`.
+    /// The CbCr plane, `w/2 x h/2`: `RG16Unorm` or `RG8Unorm`.
     pub chroma: Tex,
     /// While these live, CoreVideo keeps the planes' textures bound to `buf`'s IOSurface.
     _cv: [CFRetained<CVMetalTexture>; 2],
@@ -140,6 +145,7 @@ pub struct Encoder {
     tx: *mut Sender<Encoded>,
     rx: Receiver<Encoded>,
     writer: Retained<AVAssetWriter>,
+    export: Export,
     path: String,
     /// Made on the first compressed sample: its format description is the passthrough input's format hint.
     video: Option<Retained<AVAssetWriterInput>>,
@@ -189,9 +195,27 @@ fn mastering_display() -> [u8; 24] {
 }
 
 impl Encoder {
-    /// A hardware HEVC Main 10 session for `w x h` frames at `fps`, writing `path` (replaced if it exists), with `sound`
-    /// (interleaved stereo at its rate) as the ALAC track, or no audio track.
-    pub fn new(dev: &Dev, path: &Path, (w, h): (u32, u32), fps: f32, sound: Option<(u32, Vec<[f32; 2]>)>) -> Result<Self, String> {
+    /// A hardware session of `export`'s codec for `w x h` frames at `fps`, writing `path` (replaced if it exists), with
+    /// `sound` (interleaved stereo at its rate) as the audio track in `export`'s audio codec, or no audio track.
+    pub fn new(
+        dev: &Dev,
+        path: &Path,
+        (w, h): (u32, u32),
+        fps: f32,
+        export: &Export,
+        sound: Option<(u32, Vec<[f32; 2]>)>,
+    ) -> Result<Self, String> {
+        if sound.is_some() && export.audio == AudioCodec::None {
+            return Err("encode: a soundtrack was given to a preset whose audio is none".into());
+        }
+        let codec = match export.codec {
+            Codec::H264 => kCMVideoCodecType_H264,
+            Codec::Hevc => kCMVideoCodecType_HEVC,
+        };
+        let pixel = match export.pixel {
+            Pixel::Yuv420p8 => kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            Pixel::Yuv420p10 => kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+        };
         let shown = path.display().to_string();
         // SAFETY: CoreVideo and VideoToolbox string constants, alive for the process.
         let session = unsafe {
@@ -200,7 +224,7 @@ impl Encoder {
                 &[CFBoolean::new(true)],
             );
             let (fmt, cw, ch) = (
-                CFNumber::new_i32(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange as i32),
+                CFNumber::new_i32(pixel as i32),
                 CFNumber::new_i32(w as i32),
                 CFNumber::new_i32(h as i32),
             );
@@ -228,7 +252,7 @@ impl Encoder {
                 None,
                 w as i32,
                 h as i32,
-                kCMVideoCodecType_HEVC,
+                codec,
                 Some(session.0.as_opaque()),
                 Some(session.1.as_opaque()),
                 None,
@@ -241,8 +265,9 @@ impl Encoder {
             // SAFETY: no session was made, so nothing holds `tx`.
             drop(unsafe { Box::from_raw(tx) });
             return Err(format!(
-                "encode: no hardware HEVC encoder for {w}x{h} (VTCompressionSessionCreate with \
-                 RequireHardwareAcceleratedVideoEncoder, OSStatus {r}); a software encoder is never used"
+                "encode: no hardware {:?} encoder for {w}x{h} {:?} (VTCompressionSessionCreate with \
+                 RequireHardwareAcceleratedVideoEncoder, OSStatus {r}); a software encoder is never used",
+                export.codec, export.pixel
             ));
         };
         // SAFETY: the +1 reference VTCompressionSessionCreate made.
@@ -264,7 +289,7 @@ impl Encoder {
             }
         };
         let setup = || -> Result<(CFRetained<CVPixelBufferPool>, Retained<AVAssetWriter>, Option<Audio>), String> {
-            Self::configure(&session, fps)?;
+            Self::configure(&session, fps, export)?;
             // SAFETY: the session is live and configured.
             status("VTCompressionSessionPrepareToEncodeFrames", unsafe { session.prepare_to_encode_frames() })?;
             // SAFETY: the session is live; the pool it gives is retained (Get rule, the binding retains).
@@ -301,6 +326,7 @@ impl Encoder {
                     tx,
                     rx,
                     writer,
+                    export: export.clone(),
                     path: shown,
                     video: None,
                     audio,
@@ -327,18 +353,27 @@ impl Encoder {
     }
 
     /// Every property, each checked: one VideoToolbox refuses is an error naming it.
-    fn configure(s: &VTCompressionSession, fps: f32) -> Result<(), String> {
+    fn configure(s: &VTCompressionSession, fps: f32, export: &Export) -> Result<(), String> {
         let set = |name: &str, key: &CFString, value: &CFType| {
             // SAFETY: a live session, and each value is the CF type its key documents.
             let r = unsafe { VTSessionSetProperty(s, key, Some(value)) };
             status(&format!("VideoToolbox refused {name}"), r)
         };
-        let gop = (fps / 2.0).round().max(1.0) as i32;
-        let mastering = CFData::from_bytes(&mastering_display());
+        let gop = (f64::from(fps) * export.keyframe_seconds).round().max(1.0) as i32;
         // SAFETY: VideoToolbox and CoreVideo string constants, alive for the process.
         unsafe {
-            set("ProfileLevel = HEVC_Main10_AutoLevel", kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main10_AutoLevel)?;
-            set(&format!("Quality = {QUALITY}"), kVTCompressionPropertyKey_Quality, &CFNumber::new_f64(QUALITY))?;
+            match export.profile {
+                Profile::High => set("ProfileLevel = H264_High_AutoLevel", kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel)?,
+                Profile::Main => set("ProfileLevel = HEVC_Main_AutoLevel", kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel)?,
+                Profile::Main10 => set("ProfileLevel = HEVC_Main10_AutoLevel", kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main10_AutoLevel)?,
+            }
+            if let Some(kbps) = export.bitrate_kbps {
+                let bits = i64::from(kbps) * 1000;
+                set(&format!("AverageBitRate = {bits}"), kVTCompressionPropertyKey_AverageBitRate, &CFNumber::new_i64(bits))?;
+            }
+            if let Some(q) = export.quality {
+                set(&format!("Quality = {q}"), kVTCompressionPropertyKey_Quality, &CFNumber::new_f64(q))?;
+            }
             set("RealTime = false", kVTCompressionPropertyKey_RealTime, CFBoolean::new(false))?;
             set(
                 "PrioritizeEncodingSpeedOverQuality = false",
@@ -346,32 +381,52 @@ impl Encoder {
                 CFBoolean::new(false),
             )?;
             set("AllowFrameReordering = true", kVTCompressionPropertyKey_AllowFrameReordering, CFBoolean::new(true))?;
+            // H.264's key frames from VideoToolbox are IDR frames, so its groups are always closed; HEVC's may be open
+            // (frames after a key frame in decode order that lean on ones before it) unless told not to.
+            if export.codec == Codec::Hevc {
+                set(
+                    &format!("AllowOpenGOP = {}", !export.closed_gop),
+                    kVTCompressionPropertyKey_AllowOpenGOP,
+                    CFBoolean::new(!export.closed_gop),
+                )?;
+            }
             set(&format!("MaxKeyFrameInterval = {gop}"), kVTCompressionPropertyKey_MaxKeyFrameInterval, &CFNumber::new_i32(gop))?;
             set(
-                "MaxKeyFrameIntervalDuration = 0.5",
+                &format!("MaxKeyFrameIntervalDuration = {}", export.keyframe_seconds),
                 kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
-                &CFNumber::new_f64(0.5),
+                &CFNumber::new_f64(export.keyframe_seconds),
             )?;
             set(&format!("ExpectedFrameRate = {fps}"), kVTCompressionPropertyKey_ExpectedFrameRate, &CFNumber::new_f64(f64::from(fps)))?;
-            set(
-                "SpatialAdaptiveQPLevel = Default",
-                kVTCompressionPropertyKey_SpatialAdaptiveQPLevel,
-                &CFNumber::new_i32(kVTQPModulationLevel_Default),
-            )?;
-            set("ColorPrimaries = ITU_R_2020", kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_2020)?;
-            set(
-                "TransferFunction = SMPTE_ST_2084_PQ",
-                kVTCompressionPropertyKey_TransferFunction,
-                kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,
-            )?;
-            set("YCbCrMatrix = ITU_R_2020", kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_2020)?;
-            set("MasteringDisplayColorVolume", kVTCompressionPropertyKey_MasteringDisplayColorVolume, &mastering)?;
-            set("HDRMetadataInsertionMode = Auto", kVTCompressionPropertyKey_HDRMetadataInsertionMode, kVTHDRMetadataInsertionMode_Auto)?;
+            match export.colour {
+                Colour::Bt709 => {
+                    set("ColorPrimaries = ITU_R_709_2", kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2)?;
+                    set("TransferFunction = ITU_R_709_2", kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2)?;
+                    set("YCbCrMatrix = ITU_R_709_2", kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2)?;
+                }
+                Colour::Hdr10 => {
+                    let mastering = CFData::from_bytes(&mastering_display());
+                    set(
+                        "SpatialAdaptiveQPLevel = Default",
+                        kVTCompressionPropertyKey_SpatialAdaptiveQPLevel,
+                        &CFNumber::new_i32(kVTQPModulationLevel_Default),
+                    )?;
+                    set("ColorPrimaries = ITU_R_2020", kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_2020)?;
+                    set(
+                        "TransferFunction = SMPTE_ST_2084_PQ",
+                        kVTCompressionPropertyKey_TransferFunction,
+                        kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,
+                    )?;
+                    set("YCbCrMatrix = ITU_R_2020", kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_2020)?;
+                    set("MasteringDisplayColorVolume", kVTCompressionPropertyKey_MasteringDisplayColorVolume, &mastering)?;
+                    set("HDRMetadataInsertionMode = Auto", kVTCompressionPropertyKey_HDRMetadataInsertionMode, kVTHDRMetadataInsertionMode_Auto)?;
+                }
+            }
         }
         Ok(())
     }
 
-    /// The next frame's pixel buffer, tagged HDR10, with its planes mapped into Metal for the HDR pass to write.
+    /// The next frame's pixel buffer, tagged with the preset's colour, with its planes mapped into Metal for the colour
+    /// pass to write.
     pub fn target(&mut self) -> Result<Target, String> {
         // CoreVideo asks for this periodically: it recycles textures no one holds.
         self.cache.flush(0);
@@ -385,10 +440,22 @@ impl Encoder {
         let buf = unsafe { CFRetained::from_raw(buf) };
         // SAFETY: CoreVideo's documented attachment keys with their documented CFString values, on a live buffer.
         unsafe {
+            let (primaries, transfer, matrix) = match self.export.colour {
+                Colour::Bt709 => (
+                    kCVImageBufferColorPrimaries_ITU_R_709_2,
+                    kCVImageBufferTransferFunction_ITU_R_709_2,
+                    kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                ),
+                Colour::Hdr10 => (
+                    kCVImageBufferColorPrimaries_ITU_R_2020,
+                    kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,
+                    kCVImageBufferYCbCrMatrix_ITU_R_2020,
+                ),
+            };
             for (key, value) in [
-                (kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020),
-                (kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ),
-                (kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020),
+                (kCVImageBufferColorPrimariesKey, primaries),
+                (kCVImageBufferTransferFunctionKey, transfer),
+                (kCVImageBufferYCbCrMatrixKey, matrix),
                 (kCVImageBufferChromaLocationTopFieldKey, kCVImageBufferChromaLocation_Left),
                 (kCVImageBufferChromaLocationBottomFieldKey, kCVImageBufferChromaLocation_Left),
             ] {
@@ -401,7 +468,7 @@ impl Encoder {
         let (w, h) = (self.w, self.h);
         let map = |plane: usize, format: MTLPixelFormat, pw: usize, ph: usize| -> Result<(CFRetained<CVMetalTexture>, Tex), String> {
             let mut out: *mut CVMetalTexture = std::ptr::null_mut();
-            // SAFETY: a live cache and a live IOSurface-backed, Metal-compatible x420 buffer (the pool's attributes ask
+            // SAFETY: a live cache and a live IOSurface-backed, Metal-compatible biplanar 4:2:0 buffer (the pool's attributes ask
             // for one) whose plane `plane` is `pw x ph` of the format given (16-bit luma, 2x16-bit CbCr at half size); the
             // attributes hold kCVMetalTextureUsage as a CFNumber; `out` is a valid place for the +1 result.
             let r = unsafe {
@@ -425,8 +492,12 @@ impl Encoder {
             let tex = CVMetalTextureGetTexture(&cv).ok_or_else(|| format!("encode: plane {plane} mapped to no Metal texture"))?;
             Ok((cv, tex))
         };
-        let (cv_luma, luma) = map(0, MTLPixelFormat::R16Unorm, w, h)?;
-        let (cv_chroma, chroma) = map(1, MTLPixelFormat::RG16Unorm, w / 2, h / 2)?;
+        let (one, two) = match self.export.pixel {
+            Pixel::Yuv420p8 => (MTLPixelFormat::R8Unorm, MTLPixelFormat::RG8Unorm),
+            Pixel::Yuv420p10 => (MTLPixelFormat::R16Unorm, MTLPixelFormat::RG16Unorm),
+        };
+        let (cv_luma, luma) = map(0, one, w, h)?;
+        let (cv_chroma, chroma) = map(1, two, w / 2, h / 2)?;
         Ok(Target { buf, luma, chroma, _cv: [cv_luma, cv_chroma] })
     }
 
@@ -478,38 +549,51 @@ impl Encoder {
             let video = AVAssetWriterInput::assetWriterInputWithMediaType_outputSettings_sourceFormatHint(video_type, None, Some(&hint));
             video.setExpectsMediaDataInRealTime(false);
             if !self.writer.canAddInput(&video) {
-                return Err(format!("encode: {}: AVAssetWriter cannot take the HEVC track", self.path));
+                return Err(format!("encode: {}: AVAssetWriter cannot take the {:?} track", self.path, self.export.codec));
             }
             self.writer.addInput(&video);
             self.video = Some(video);
             if let Some(a) = &mut self.audio {
                 let audio_type = AVMediaTypeAudio.ok_or("encode: AVFoundation has no AVMediaTypeAudio")?;
                 let key = |k: Option<&'static NSString>, name: &str| k.ok_or_else(|| format!("encode: AVFAudio has no {name}"));
+                // The format, then what is only that format's: ALAC's bit depth, AAC-LC's bitrate.
+                let (format, name, extra_key, extra) = match (self.export.audio, self.export.audio_kbps) {
+                    (AudioCodec::Alac, _) => (
+                        kAudioFormatAppleLossless,
+                        format!("ALAC, {AUDIO_BITS} bits"),
+                        key(AVEncoderBitDepthHintKey, "AVEncoderBitDepthHintKey")?,
+                        AUDIO_BITS,
+                    ),
+                    // kAudioFormatMPEG4AAC is AAC Low Complexity (HE-AAC has its own format ids).
+                    (AudioCodec::AacLc, Some(kbps)) => (
+                        kAudioFormatMPEG4AAC,
+                        format!("AAC-LC, {kbps} kb/s"),
+                        key(AVEncoderBitRateKey, "AVEncoderBitRateKey")?,
+                        kbps as i32 * 1000,
+                    ),
+                    other => return Err(format!("encode: a soundtrack for audio {other:?}")),
+                };
                 let keys = [
                     key(AVFormatIDKey, "AVFormatIDKey")?,
                     key(AVSampleRateKey, "AVSampleRateKey")?,
                     key(AVNumberOfChannelsKey, "AVNumberOfChannelsKey")?,
-                    key(AVEncoderBitDepthHintKey, "AVEncoderBitDepthHintKey")?,
+                    extra_key,
                 ];
                 let values = [
-                    NSNumber::numberWithUnsignedInt(kAudioFormatAppleLossless),
+                    NSNumber::numberWithUnsignedInt(format),
                     NSNumber::numberWithDouble(f64::from(a.rate)),
                     NSNumber::numberWithInt(2),
-                    NSNumber::numberWithInt(AUDIO_BITS),
+                    NSNumber::numberWithInt(extra),
                 ];
                 let values: Vec<&AnyObject> = values.iter().map(|v| -> &AnyObject { v }).collect();
                 let settings = NSDictionary::<NSString, AnyObject>::from_slices(&keys, &values);
                 if !self.writer.canApplyOutputSettings_forMediaType(Some(&settings), audio_type) {
-                    return Err(format!(
-                        "encode: AVAssetWriter refuses ALAC at {} Hz, 2 channels, {} bits",
-                        a.rate,
-                        AUDIO_BITS
-                    ));
+                    return Err(format!("encode: AVAssetWriter refuses {name} at {} Hz, 2 channels", a.rate));
                 }
                 let input = AVAssetWriterInput::assetWriterInputWithMediaType_outputSettings(audio_type, Some(&settings));
                 input.setExpectsMediaDataInRealTime(false);
                 if !self.writer.canAddInput(&input) {
-                    return Err(format!("encode: {}: AVAssetWriter cannot take the ALAC track", self.path));
+                    return Err(format!("encode: {}: AVAssetWriter cannot take the {name} track", self.path));
                 }
                 self.writer.addInput(&input);
                 a.input = Some(input);

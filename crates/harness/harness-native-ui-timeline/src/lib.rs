@@ -6,7 +6,8 @@ use std::ffi::CString;
 
 use harness_native_flecs::prelude::*;
 use harness_native_ui_node_api::Node;
-use harness_native_ui_timeline_api::Cue;
+use harness_native_ui_text_api::Text;
+use harness_native_ui_timeline_api::{Cue, Tally};
 use hyperion_ecs::sys;
 
 /// One cue as found: the node it moves and its member split into the component and the path inside it.
@@ -59,7 +60,26 @@ pub fn apply(world: WorldRef<'_>, time: f32) -> Result<(), String> {
             errors.push(format!("cue {cue}: {component}.{path}: {err}"));
         }
     }
-    if errors.is_empty() { Ok(()) } else { Err(errors.join("\n")) }
+    if !errors.is_empty() {
+        return Err(errors.join("\n"));
+    }
+    tally(world);
+    Ok(())
+}
+
+/// Write every [`Tally`]'s words into its node's `Text` (after the cues, so a cued `Tally.value` shows this frame). Only
+/// a tally whose words changed is written, so a still one costs no relayout.
+fn tally(world: WorldRef<'_>) {
+    let mut changed = Vec::new();
+    world.new_query::<&Tally>().each_entity(|e, t| {
+        let words = t.words();
+        if e.try_get::<&Text>(|now| now.s.as_str() == words) != Some(true) {
+            changed.push((*e.id(), words));
+        }
+    });
+    for (id, words) in changed {
+        world.entity_from_id(id).set(Text { s: words.as_str().into() });
+    }
 }
 
 /// Write `value` into member `path` of `component` on `node`, through flecs reflection, and tell flecs it changed.

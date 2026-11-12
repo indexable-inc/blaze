@@ -69,6 +69,12 @@ pub enum Voice {
     Whoosh,
     /// The physically modelled fire, catching over its first third (at most 0.8 s) and burning `dur`; `freq` is unused.
     Fire,
+    /// A low warm bed: an open chord on `freq` (root, fifth, octave, tenth), each note two slowly beating sines,
+    /// breathing in over two seconds and out over the last three of `dur`. Spread across the frame around `pan`.
+    Pad,
+    /// A clean rise: a tone gliding up two octaves to `freq` over `dur` with air brightening over it, growing as it
+    /// goes and cut at its top, where a hit lands.
+    Rise,
 }
 
 /// One sound of a scene's score: `voice` from `at` seconds for `dur`, at `freq` Hz and `amp` (the mark's mallets are
@@ -132,7 +138,42 @@ impl Track {
                 self.whoosh(n.at, dur, n.amp, (n.pan, n.pan + n.sweep), move |p| 0.15 * top + 0.85 * top * p);
             }
             Voice::Fire => self.fire(n.at, (dur / 3.0).min(0.8), dur),
+            Voice::Pad => self.pad(n.at, n.freq, n.amp, dur, n.pan),
+            Voice::Rise => self.rise(n.at, n.freq, n.amp, dur, (n.pan, n.pan + n.sweep)),
         }
+    }
+
+    /// A bed under a whole stretch: root, fifth, octave and tenth over `freq`, each two sines a fraction of a hertz
+    /// apart (so it beats slowly and never sits still), the upper notes quieter and wider.
+    fn pad(&mut self, t0: f32, freq: f32, amp: f32, dur: f32, pan: f32) {
+        let (rise, fall) = (2.0f32.min(dur * 0.4), 3.0f32.min(dur * 0.4));
+        for (ratio, level, side) in [(1.0, 1.0, 0.0), (1.5, 0.6, -0.5), (2.0, 0.5, 0.5), (2.5198, 0.32, -0.3), (3.0, 0.16, 0.3)] {
+            let f = freq * ratio;
+            let beat = self.rng.range(0.15, 0.45);
+            let drift = self.rng.range(0.05, 0.11);
+            let p = (pan + side).clamp(-1.0, 1.0);
+            self.add(t0, dur, (p, p), 0.5, move |t, _| {
+                let env = (t / rise).min(1.0).powi(2) * ((dur - t) / fall).clamp(0.0, 1.0).powi(2);
+                let breathe = 0.85 + 0.15 * (TAU * drift * t).sin();
+                amp * level * env * breathe * 0.5 * ((TAU * f * t).sin() + (TAU * (f + beat) * t).sin())
+            });
+        }
+    }
+
+    /// A rise into a hit: the tone glides up two octaves to `freq`, with low-passed noise opening over it.
+    fn rise(&mut self, t0: f32, freq: f32, amp: f32, dur: f32, pan: (f32, f32)) {
+        let sr = self.sr;
+        let (mut phase, mut low) = (0.0f32, 0.0f32);
+        self.add(t0, dur, pan, 0.4, move |t, rng| {
+            let p = t / dur;
+            let f = freq * 2f32.powf(2.0 * (p - 1.0));
+            phase += TAU * f / sr;
+            let k = 1.0 - (-TAU * (300.0 + 5000.0 * p * p) / sr).exp();
+            low += k * (rng.range(-1.0, 1.0) - low);
+            // Cut over the last 12 ms, so the hit lands in the clear.
+            let cut = ((dur - t) / 0.012).min(1.0);
+            amp * p * p * cut * (phase.sin() + 0.25 * (2.0 * phase).sin() + 0.8 * low)
+        });
     }
 
     /// A short noise tick with a ringing tone, for small clicks.
