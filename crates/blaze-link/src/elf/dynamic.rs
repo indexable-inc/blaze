@@ -681,8 +681,9 @@ pub(crate) struct KeptRela {
     slots: usize,
     /// The binds' and GOT cells' entries a patch builds, reused.
     scratch: Vec<u8>,
-    /// The slots a patch took and gave back, reused.
+    /// The slots a patch's new addresses took and the slots it gave back, reused.
     taken: Vec<u32>,
+    gone: Vec<u32>,
     /// How many builds were patches, and how many entries the last patch wrote.
     #[cfg(test)]
     pub(crate) patched: u32,
@@ -738,7 +739,10 @@ fn rela_dyn(
     // their sizes, which an edit that fills the patch regions changes.
     let patches = placed
         .delta
-        .filter(|delta| last != 0 && slotted(&writer.output) && delta.from == last && delta.same_places);
+        .filter(|delta| last != 0 && delta.from == last && delta.same_places)
+        // A table no dynamic loader applies stays in address order with no empty slot: it
+        // is patched only where every splice keeps its length, and so its slots.
+        .filter(|delta| slotted(&writer.output) || delta.rebase.iter().all(|it| it.same_len()));
     #[cfg(test)]
     let patches = patches.filter(|delta| !kept.whole || delta.rebase.iter().all(|it| it.same_len()));
     if let Some(delta) = patches {
@@ -822,25 +826,28 @@ fn patch_relative(
     if len != rebase.len() {
         return false;
     }
-    // The slots given back, then the slots taken, the lowest empty one first: an edit that
-    // takes as many as it gives back leaves the run as long as it was.
-    let taken = &mut kept.taken;
+    // Each splice's new addresses take the slots of the ones it took out, in order, as far
+    // as those go: a splice that keeps its length keeps its slots, and asks nothing of the
+    // empty ones. The slots left over are given back; the addresses left over take the
+    // lowest empty slot, or one more at the run's end, once every splice has given back.
+    const UNSET: u32 = u32::MAX;
+    let (taken, gone) = (&mut kept.taken, &mut kept.gone);
     taken.clear();
+    gone.clear();
     for splice in delta.rebase {
-        let gone = &kept.slot_of[splice.old.start as usize..splice.old.end as usize];
-        taken.extend_from_slice(gone); // alloc: none once it has held an edit's slots
-        kept.free.extend(gone.iter().copied()); // alloc: a node an empty slot, until it is taken
+        let old = &kept.slot_of[splice.old.start as usize..splice.old.end as usize];
+        let stay = old.len().min(splice.new.len());
+        taken.extend_from_slice(&old[..stay]); // alloc: none once it has held an edit's slots
+        taken.extend(std::iter::repeat_n(UNSET, splice.new.len() - stay)); // alloc: as above
+        gone.extend_from_slice(&old[stay..]); // alloc: as above
+        kept.free.extend(old[stay..].iter().copied()); // alloc: a node an empty slot, until it is taken
     }
-    let given_back = taken.len();
     let mut slots = kept.slots;
-    for splice in delta.rebase {
-        for _ in splice.new.clone() {
-            let slot = kept.free.pop_first().unwrap_or_else(|| {
-                slots += 1;
-                slots as u32 - 1
-            });
-            taken.push(slot);
-        }
+    for slot in taken.iter_mut().filter(|it| **it == UNSET) {
+        *slot = kept.free.pop_first().unwrap_or_else(|| {
+            slots += 1;
+            slots as u32 - 1
+        });
     }
     // Back to front, so each splice's place in the kept list is still the last link's.
     let mut end = taken.len();
@@ -859,7 +866,7 @@ fn patch_relative(
     let relative = types(writer.output.arch).relative;
     let bytes = &mut kept.bytes;
     bytes.resize(RELA as usize * slots + others);
-    for &slot in &taken[..given_back] {
+    for &slot in gone.iter() {
         if (slot as usize) < slots && kept.free.contains(&slot) {
             bytes.update(RELA as usize * slot as usize, &[0; RELA as usize]);
         }
