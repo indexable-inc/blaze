@@ -163,7 +163,7 @@ impl<'a> Table<'a> {
         if bytes.len() < INDEX_HEADER || bytes[..8] != INDEX_MAGIC {
             return Err("it does not start as an index of this store's format does");
         }
-        if u32_at(bytes, 8) != crate::FORMAT {
+        if !(crate::FORMAT_READ..=crate::FORMAT).contains(&u32_at(bytes, 8)) {
             return Err("it is of another format of the store");
         }
         if bytes[12..16].iter().chain(&bytes[32..INDEX_HEADER]).any(|&byte| byte != 0) {

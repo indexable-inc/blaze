@@ -321,11 +321,17 @@ pub(crate) struct DictionaryRef {
     pub offset: u64,
 }
 
+/// A whole file of the store ([`external_file`]) as a head lists it: its content and length,
+/// or, with [`EXTERNAL_REMOVED`] for its length, a file no key names any more, which whoever
+/// opens the store removes if it is still there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct ExternalRef {
     pub content: ContentId,
     pub len: u64,
 }
+
+/// [`ExternalRef::len`] of a whole file to remove (format 5): no file is this long.
+pub(crate) const EXTERNAL_REMOVED: u64 = u64::MAX;
 
 /// What a store is: written whole and at once (`Effect::Write`) after everything it names is
 /// durable, so a crash leaves the old head or the new, each naming only whole bytes.
@@ -398,7 +404,7 @@ impl Head {
             return Err("it is not the head of a store of this format".into());
         }
         let format = u32_at(bytes, 8);
-        if format != crate::FORMAT {
+        if !(crate::FORMAT_READ..=crate::FORMAT).contains(&format) {
             // alloc: the error's message
             return Err(format!(
                 "it is of store format {format}, not {}: remove the directory to start a new \
