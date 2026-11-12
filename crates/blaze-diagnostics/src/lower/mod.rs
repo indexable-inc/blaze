@@ -121,6 +121,7 @@ pub(crate) mod borrowck_error;
 pub(crate) mod borrowck_skipped;
 pub(crate) mod break_outside_of_loop;
 pub(crate) mod comptime;
+pub(crate) mod comptime_call;
 pub(crate) mod const_check_error;
 pub(crate) mod const_eval_failed;
 pub(crate) mod const_impure;
@@ -348,6 +349,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::BreakOutsideOfLoop(d) => break_outside_of_loop::lower(cx, &d),
         AnyDiagnostic::ConstCheckError(d) => const_check_error::lower(cx, &d),
         AnyDiagnostic::ConstEvalFailed(d) => const_eval_failed::lower(cx, &d),
+        AnyDiagnostic::ComptimeCall(d) => comptime_call::lower(cx, &d),
         AnyDiagnostic::ConstImpure(d) => const_impure::lower(cx, &d),
         AnyDiagnostic::ConstPatternRefused(d) => const_pattern_refused::lower(cx, &d),
         AnyDiagnostic::EmptyRangePattern(d) => empty_range_pattern::lower(cx, &d),
