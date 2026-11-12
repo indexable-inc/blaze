@@ -4,7 +4,12 @@
 //!
 //! An answer is kept ([`LastAnswer`]) only of a build that walked every unit and made
 //! nothing ([`Recording::end`]), so what is said again is what a walk said of this very
-//! state. It is said again only while every input of that walk is as it was
+//! state. A checkout keeps one a request shape ([`Answers`]: `build`, `test`, `run`, `check`,
+//! each in a profile), so `build`, `test`, `build` finds the first `build`'s again: an answer
+//! goes when a job of its own shape walks, never because a request of another shape did; what
+//! that other walk changed that this answer rests on (an output placed in a directory of its
+//! outputs, a lock file) is heard by the same watches and roots that cover a stranger's change.
+//! It is said again only while every input of that walk is as it was
 //! ([`LastAnswer::replayable`]), each input covered by one of:
 //!
 //! - **The checkout's files** (sources, manifests, the lock file, `.cargo/config.toml` in it,
@@ -12,11 +17,24 @@
 //!   ([`Inputs::view`]), which the checkout's watcher commits before the request is seen; or,
 //!   where the root is another, each file that differs is a source the walk held by its code
 //!   text alone, with the still text it had ([`LastAnswer::code_unmoved`], below).
-//! - **The request**: its command, arguments, directory, whole environment and the config
-//!   files outside the view by their bytes, the mounts (each source and path dependency
-//!   outside the view by its root), the toolchain, where the daemon builds, and the blaze
-//!   that serves it ([`Inputs::config`]); and what the request says past those (`-v`, the
-//!   build goal: [`Inputs::request`]).
+//! - **The request**: its command, arguments, directory and the config files outside the
+//!   view by their bytes, the mounts (each source and path dependency outside the view by its
+//!   root), the toolchain, where the daemon builds, and the blaze that serves it
+//!   ([`Inputs::config`]); and what the request says past those (`-v`, the build goal:
+//!   [`Inputs::request`]).
+//! - **The request's environment**, of which exactly the variables a step of the walk read
+//!   ([`env_moved`]): those a step reads without asking for them by name ([`Asked::unasked`]:
+//!   the plan's, the set a build script's walk of its environment sees, blaze's own), and
+//!   those the walk's steps asked for by name ([`LastAnswer::named`]: a build script's traced
+//!   `env::var`, a crate's `env!`). A variable nothing read (a shell's `SHLVL`, nushell's
+//!   `CMD_DURATION_MS`, which is another at every command) is no input: the answer is said
+//!   again whatever it holds. Until 2026-11-12 the whole environment was compared, "for every
+//!   step of the build, a build script's reads among them, which no plan names": the reads
+//!   are named now, by the steps that made them. A walk that cannot name them
+//!   ([`Recording::vouch_env`] not told, or told why not) keeps an answer every variable is
+//!   compared for. A `run` or `test` asked through the client is a build whose program the
+//!   client starts in its own environment: no variable is an input of the answer for the
+//!   program's sake.
 //! - **How the request's client is shown diagnostics** (in colour or not, their width, a line
 //!   each, how many refused functions are named: [`Inputs::drawn`]): no input of anything
 //!   built, and of an answer only its diagnostics are drawn with it. An answer that holds no
@@ -101,9 +119,10 @@ pub(super) trait Vouches {
 pub(super) struct Inputs {
     /// The view's root: every file of the checkout.
     pub(super) view: ContentId,
-    /// The view's whole build configuration.
+    /// The view's whole build configuration, the request's every variable in it.
     pub(super) config: Arc<BuildConfig>,
-    /// The hash of `config`'s encoding.
+    /// The hash of `config`'s encoding less its environment, which is compared by what read
+    /// it ([`env_moved`]).
     pub(super) config_id: ContentId,
     /// The hash of the request's work and its `Targets`, less how its client is shown
     /// diagnostics: what `config` does not hold of it (verbosity, the build goal).
@@ -125,12 +144,15 @@ impl Inputs {
             .finish()
     }
 
-    /// The first input of `now` that is not as it is here, or none.
-    pub(super) fn moved(&self, now: &Inputs) -> Option<Moved> {
+    /// The first input of `now` that is not as it is here, or none; of the environment, the
+    /// variables `reads` says a step read ([`env_moved`]).
+    pub(super) fn moved(&self, now: &Inputs, reads: &dyn Fn(&str) -> bool) -> Option<Moved> {
         if self.files_moved(now) {
             return Some(Moved::Files);
         }
-        self.moved_past_files(now).or(self.drawn_moved(now).then_some(Moved::Drawing))
+        self.moved_past_files(now)
+            .or_else(|| env_moved(&self.config, &now.config, reads).map(Moved::Env))
+            .or(self.drawn_moved(now).then_some(Moved::Drawing))
     }
 
     /// Whether `now`'s client is shown diagnostics another way than this one's.
@@ -143,7 +165,8 @@ impl Inputs {
         self.view != now.view && !planted(Plant::IgnoresFiles)
     }
 
-    /// [`Inputs::moved`] of everything but the view and how diagnostics are drawn.
+    /// [`Inputs::moved`] of everything but the view, the environment and how diagnostics are
+    /// drawn.
     fn moved_past_files(&self, now: &Inputs) -> Option<Moved> {
         if self.config_id != now.config_id && !planted(Plant::IgnoresConfig) {
             return Some(config_moved(&self.config, &now.config));
@@ -169,7 +192,31 @@ fn first_moved<V: PartialEq>(was: &[(String, V)], now: &[(String, V)]) -> Option
     now.iter().find(|(name, _)| other(was, name).is_none()).map(|(name, _)| name.clone())
 }
 
-/// What of two configs that encode differently differs, the first found in this order.
+/// The first variable (by name, of `was` first) that `reads` says a step read and whose
+/// value in `now`'s environment is not the one in `was`'s: set to another, unset, or set
+/// where it was not. None whatever else of the two environments differs: a variable no step
+/// read is no input of an answer (rule keys-cover-every-input, both ways).
+pub(super) fn env_moved(
+    was: &BuildConfig,
+    now: &BuildConfig,
+    reads: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    use blaze_units::query::env_var;
+    if planted(Plant::IgnoresConfig) {
+        return None;
+    }
+    let (was, now) = (&was.invocation.env, &now.invocation.env);
+    let whole = planted(Plant::WholeEnvironment);
+    let read = |name: &str| whole || reads(name);
+    let moved = |it: &&(String, String)| {
+        read(it.0.as_str()) && env_var(now, it.0.as_str()) != Some(it.1.as_str())
+    };
+    let added = |it: &&(String, String)| read(it.0.as_str()) && env_var(was, it.0.as_str()).is_none();
+    was.iter().find(moved).or_else(|| now.iter().find(added)).map(|it| it.0.clone()) // clone: a reason, once a refusal
+}
+
+/// What of two configs that encode differently less their environments differs, the first
+/// found in this order.
 fn config_moved(was: &BuildConfig, now: &BuildConfig) -> Moved {
     let (a, b) = (&was.invocation, &now.invocation);
     if a.command != b.command {
@@ -180,9 +227,6 @@ fn config_moved(was: &BuildConfig, now: &BuildConfig) -> Moved {
     }
     if a.cwd != b.cwd || a.root != b.root {
         return Moved::Directory;
-    }
-    if let Some(name) = first_moved(&a.env, &b.env) {
-        return Moved::Env(name);
     }
     if let Some(path) = first_moved(&a.files, &b.files) {
         return Moved::ConfigFile(path);
@@ -217,7 +261,8 @@ pub(super) enum Moved {
     Args,
     /// The directory the command runs in, or the checkout's root.
     Directory,
-    /// A variable of the request's environment, by name; never its values.
+    /// A variable of the request's environment that a step of the kept answer's walk read,
+    /// by name; never its values.
     Env(String),
     /// A config file outside the view (`$CARGO_HOME/config.toml`, one above the checkout).
     ConfigFile(String),
@@ -467,6 +512,15 @@ pub(super) enum Plant {
     /// Says an answer again though a diagnostic of it quotes a file that changed: a quoted
     /// line with a comment the file no longer has.
     ReplaysQuotes,
+    /// Compares the request's whole environment, as the lane did until 2026-11-12: a
+    /// variable nothing read turns a build with nothing changed into a walk.
+    WholeEnvironment,
+    /// Compares no variable the walk's steps asked for by name: says an answer again over a
+    /// variable a build script read.
+    IgnoresNamed,
+    /// Drops every shape's answer when a job of one shape walks, as the lane did until
+    /// 2026-11-12 (one answer a checkout): `build`, `test`, `build` walks three times.
+    DropsOthers,
 }
 
 #[cfg(test)]
@@ -535,6 +589,11 @@ pub(super) struct Asked<'a> {
     /// Every path outside the view that is mounted where it is on the disk is vouched for by
     /// its watch since it was read (`Mounts::stale_locals` names none).
     pub(super) locals_vouched: bool,
+    /// Whether a step reads the variable of this name without asking for it by name: the
+    /// plan's (`blaze_units::query::read_by_plan`), what a build script's walk of its
+    /// environment sees (`blaze_usercode::confine::walk_sees`), blaze's own (`BLAZE_*`).
+    /// The lists are the steps' own, handed in by the daemon: a core reads none.
+    pub(super) unasked: &'a dyn Fn(&str) -> bool,
 }
 
 /// The answer of a checkout's last build that walked every unit and made nothing: what the
@@ -543,8 +602,8 @@ pub(super) struct Asked<'a> {
 /// placed or missed anything, so what is said again is what a walk said of this very state:
 /// its warnings, its units and its artifacts as a build with nothing to do says them.
 ///
-/// Kept in memory, per checkout, and dropped by the next job of the checkout that walks; a
-/// restarted daemon keeps none, and walks.
+/// Kept in memory, one a request shape of a checkout ([`Answers`]), and dropped by the next
+/// job of that shape that walks; a restarted daemon keeps none, and walks.
 pub(super) struct LastAnswer {
     pub(super) inputs: Inputs,
     /// [`blaze_vfs::outside::generation`] as read before the build looked at anything.
@@ -564,6 +623,10 @@ pub(super) struct LastAnswer {
     /// The last view asked that differs from `inputs.view` only in what no code text holds
     /// ([`LastAnswer::code_unmoved`] said so): asked again, it is not read again.
     pub(super) same: Option<ContentId>,
+    /// The variables of the request's environment its walk's steps asked for by name, sorted;
+    /// or why they are not known ([`Recording::vouch_env`]), and then every variable is one a
+    /// step may have read.
+    pub(super) named: Result<Arc<[String]>, String>,
 }
 
 /// Whether `diagnostic`, or one under it, names a file whose last name is `name`: in a span,
@@ -575,6 +638,51 @@ fn names_file(diagnostic: &blaze_api::Diagnostic, name: &str) -> bool {
 }
 
 impl LastAnswer {
+    /// Whether a step of the answer's walk read the variable `name`: one a step reads unasked
+    /// (`unasked`), or one its steps asked for by name; any, where those are not known.
+    fn read_env(&self, name: &str, unasked: &dyn Fn(&str) -> bool) -> bool {
+        if unasked(name) {
+            return true;
+        }
+        match &self.named {
+            Ok(names) => {
+                names.binary_search_by(|it| it.as_str().cmp(name)).is_ok()
+                    && !planted(Plant::IgnoresNamed)
+            }
+            Err(_) => true,
+        }
+    }
+
+    /// About what keeping the answer holds of the heap, in bytes: what it said (each
+    /// response's text), the directories and paths it rests on, the sources it vouched for
+    /// by path and the names its steps asked for. Its config is shared with nothing after
+    /// its walk, and is counted by its environment and arguments. Not counted: the view of
+    /// its files the daemon holds open beside it (the nodes of the tree no later root
+    /// shares). A count for a budget, not an exact size.
+    pub(super) fn held_bytes(&self) -> usize {
+        let text = |response: &Response| match response {
+            Response::Diagnostic(diagnostic) => diagnostic.rendered.len() + diagnostic.message.len(),
+            _ => 0,
+        };
+        let said: usize =
+            self.responses.iter().map(|it| size_of::<Response>() + text(it)).sum();
+        let paths = |all: &[PathBuf]| -> usize {
+            all.iter().map(|it| size_of::<PathBuf>() + it.as_os_str().len()).sum()
+        };
+        let still: usize = match &self.still {
+            Ok(files) => files.iter().map(|it| size_of::<StillFile>() + it.path.len()).sum(),
+            Err(why) => why.len(),
+        };
+        let named: usize = match &self.named {
+            Ok(names) => names.iter().map(|it| size_of::<String>() + it.len()).sum(),
+            Err(why) => why.len(),
+        };
+        let invocation = &self.inputs.config.invocation;
+        let env: usize = invocation.env.iter().map(|(name, value)| name.len() + value.len()).sum();
+        let args: usize = invocation.args.iter().map(String::len).sum();
+        size_of::<LastAnswer>() + said + paths(&self.dirs) + paths(&self.absent) + still + named + env + args
+    }
+
     /// Whether `view` is known to hold the answer's files as every key of its walk read
     /// them: its own view, or the last one found so.
     pub(super) fn files_known(&self, view: &ContentId) -> bool {
@@ -640,6 +748,11 @@ impl LastAnswer {
         }
         if let Some(moved) = self.inputs.moved_past_files(asked.inputs) {
             return Err(NotReplayed::Moved(moved));
+        }
+        // Of the environment, what a step of this answer's walk read, and no other variable.
+        let reads = |name: &str| self.read_env(name, asked.unasked);
+        if let Some(name) = env_moved(&self.inputs.config, &asked.inputs.config, &reads) {
+            return Err(NotReplayed::Moved(Moved::Env(name)));
         }
         // Only a diagnostic is drawn for its client: an answer with none is every client's.
         if self.inputs.drawn_moved(asked.inputs)
@@ -730,6 +843,8 @@ pub(super) struct Recording {
     refused: Option<Unkept>,
     /// [`LastAnswer::still`], as its front end vouched ([`Recording::vouch`]).
     still: Result<Arc<[StillFile]>, String>,
+    /// [`LastAnswer::named`], as its steps said ([`Recording::vouch_env`]).
+    named: Result<Arc<[String]>, String>,
 }
 
 impl Recording {
@@ -753,7 +868,21 @@ impl Recording {
             refused: None,
             // alloc: a reason, once a build that walks its checkout's last plan
             still: Err("its front end was not asked which sources it held by code text".to_owned()),
+            // alloc: as above
+            named: Err("its steps were not asked which variables they read by name".to_owned()),
         }
+    }
+
+    /// The variables of the request's environment the build's steps asked for by name, as
+    /// they say once every task of the build ended (each build script's kept run's traced
+    /// reads, each unit record's `env!` and `option_env!`); or why they are not all known.
+    /// A recording not told keeps an answer every variable is compared for.
+    pub(super) fn vouch_env(&mut self, named: Result<Vec<String>, String>) {
+        self.named = named.map(|mut names| {
+            names.sort_unstable();
+            names.dedup();
+            names.into()
+        });
     }
 
     /// The sources the build's front end held by code text alone, as it says once every
@@ -815,7 +944,124 @@ impl Recording {
             worked: walk.worked,
             still: self.still,
             same: None,
+            named: self.named,
         })
+    }
+}
+
+/// The most request shapes a checkout keeps an answer of ([`Answers`]): the plans it keeps
+/// (`PLANS_KEPT` in the daemon, which asserts the two are one), a shape being what a plan is
+/// kept by less its view. A count now; what one costs to keep is [`LastAnswer::held_bytes`]
+/// and the view held beside it: a footprint budget lets go of the least recently used first
+/// (the first of [`Answers`]' shapes).
+pub(super) const MOST_SHAPES: usize = 8;
+
+/// One request shape's place among a checkout's answers.
+struct Shaped<H> {
+    shape: ContentId,
+    last: Last,
+    /// What the daemon holds beside the answer for as long as it is kept (the view of the
+    /// files its walk read): handed back when the answer goes.
+    held: Option<H>,
+}
+
+/// A checkout's kept answers, one a request shape (the request's config as its plan reads
+/// it: the command, the arguments, the plan's variables), the most recently used last, at
+/// most [`MOST_SHAPES`]. The store is the lane's, so its rule is simulated with it:
+///
+/// - a job of a shape that walks drops that shape's answer ([`Answers::begin`]) and may
+///   leave the next ([`Answers::keep`]);
+/// - nothing else drops an answer but the bound, which lets go of the least recently used;
+/// - a request is asked of its own shape's answer alone ([`Answers::ask`]), which is said
+///   again only while every input of its walk is as it was ([`LastAnswer::replayable`]).
+///
+/// So a walk of another shape costs an answer nothing unless it changed something the
+/// answer rests on, which the answer's own check then finds.
+pub(super) struct Answers<H> {
+    shapes: Vec<Shaped<H>>,
+}
+
+impl<H> Answers<H> {
+    pub(super) const fn new() -> Answers<H> {
+        Answers { shapes: Vec::new() } // alloc: none until a build of the checkout walks
+    }
+
+    fn at(&self, shape: &ContentId) -> Option<usize> {
+        self.shapes.iter().position(|it| it.shape == *shape)
+    }
+
+    /// The answer kept of `shape`.
+    pub(super) fn answer(&self, shape: &ContentId) -> Option<&LastAnswer> {
+        self.at(shape).and_then(|at| self.shapes[at].last.as_ref().ok())
+    }
+
+    /// The answer kept of `shape` with what the daemon holds beside it.
+    pub(super) fn held_mut(&mut self, shape: &ContentId) -> Option<(&LastAnswer, &mut H)> {
+        let at = self.at(shape)?;
+        let slot = &mut self.shapes[at];
+        match (&slot.last, &mut slot.held) {
+            (Ok(answer), Some(held)) => Some((answer, held)),
+            _ => None,
+        }
+    }
+
+    /// Every answer kept, whatever its shape.
+    pub(super) fn kept(&self) -> impl Iterator<Item = &LastAnswer> + '_ {
+        self.shapes.iter().filter_map(|it| it.last.as_ref().ok())
+    }
+
+    /// [`LastAnswer::held_bytes`] of every answer kept.
+    pub(super) fn held_bytes(&self) -> usize {
+        self.kept().map(LastAnswer::held_bytes).sum()
+    }
+
+    /// A job of `shape` walks: that shape's answer goes (the walk may leave the next), and
+    /// no other shape's. Returns what was held beside each answer that went, for the daemon
+    /// to let go.
+    pub(super) fn begin(&mut self, shape: &ContentId) -> Vec<H> {
+        let mut gone = Vec::new(); // alloc: none unless a view was held
+        for slot in &mut self.shapes {
+            if slot.shape == *shape || planted(Plant::DropsOthers) {
+                slot.last = Err(Unkept::None);
+                gone.extend(slot.held.take());
+            }
+        }
+        gone
+    }
+
+    /// `last` is `shape`'s answer from now, or why it has none, with `held` beside it: the
+    /// most recently used. Past [`MOST_SHAPES`] the least recently used shapes go. Returns
+    /// what was held beside whatever went.
+    pub(super) fn keep(&mut self, shape: ContentId, last: Last, held: Option<H>) -> Vec<H> {
+        let mut gone = Vec::new(); // alloc: none unless a view was held
+        if let Some(at) = self.at(&shape) {
+            gone.extend(self.shapes.remove(at).held);
+        }
+        self.shapes.push(Shaped { shape, last, held });
+        while self.shapes.len() > MOST_SHAPES {
+            gone.extend(self.shapes.remove(0).held);
+        }
+        gone
+    }
+
+    /// What `asked`, a request of `shape`, is answered with: that shape's kept answer's
+    /// responses and its `Work`, the shape made the most recently used and the view asked
+    /// noted as one the answer was said again of ([`answered`]); or why the build walks.
+    /// No other shape's answer is asked, and none is changed.
+    pub(super) fn ask(
+        &mut self,
+        shape: &ContentId,
+        asked: &Asked<'_>,
+        watches: &impl Vouches,
+    ) -> Result<(Arc<[Response]>, Option<Worked>), NotReplayed> {
+        let Some(at) = self.at(shape) else {
+            return Err(NotReplayed::NoAnswer(Unkept::None));
+        };
+        let found = ask(&self.shapes[at].last, asked, watches)?;
+        let mut slot = self.shapes.remove(at);
+        answered(&mut slot.last, asked.inputs.view);
+        self.shapes.push(slot);
+        Ok(found)
     }
 }
 
