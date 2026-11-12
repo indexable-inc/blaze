@@ -3595,6 +3595,16 @@ impl<S: Steps> Jobs<S> {
         self.settling.len()
     }
 
+    /// The content key of the output placed at `path` whose file was as placed at the jobs'
+    /// last look ([`Placement`]); `None` for a path nothing is placed at, one whose placement
+    /// is in flight, or one whose file a look found changed. What a launch of the file there
+    /// may take the file for (`serve::unit::run::inproc::DevRuns::launch`).
+    pub fn placed_key(&self, path: &str) -> Option<[u8; 32]> {
+        let id = *self.paths.ids.get(path)?;
+        let placed = self.paths.placed[id as usize].as_ref()?;
+        placed.meta.map(|_| placed.key.0.0)
+    }
+
     /// How many outputs answered jobs left being placed ([`Settling::placing`]): the loop is
     /// not between requests while any is, as while a job is under way.
     pub fn placing_after(&self) -> usize {
