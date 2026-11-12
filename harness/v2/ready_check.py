@@ -34,15 +34,43 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ran
 
-MOD = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;", re.MULTILINE)
+# A module's declaration (`mod x;`, or `mod x {` which opens an inline module), or a brace:
+# what tells which inline modules a `mod y;` is inside.
+MOD = re.compile(r"(?<![A-Za-z0-9_])(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*([;{])|([{}])")
 ROOTS = ("lib.rs", "main.rs", "mod.rs")
 # String literals, raw first: a `mod x;` inside one is a test fixture's source, not a module.
 STRINGS = re.compile(r'r(#+)".*?"\1|r".*?"|"(?:\\.|[^"\\])*"', re.DOTALL)
+# Comments and character literals: a brace or a `mod x;` inside one is not code.
+COMMENTS = re.compile(r"//[^\n]*|/\*.*?\*/|'(?:\\.|[^'\\\n])'", re.DOTALL)
 
 
 def code(text: str) -> str:
     """`text` with every string literal's inside blanked, its newlines kept so lines count."""
-    return STRINGS.sub(lambda hit: "".join(it if it == "\n" else " " for it in hit.group(0)), text)
+    def blank(hit: re.Match[str]) -> str:
+        return "".join(it if it == "\n" else " " for it in hit.group(0))
+
+    return COMMENTS.sub(blank, STRINGS.sub(blank, text))
+
+
+def declared(text: str) -> list[tuple[int, tuple[str, ...], str]]:
+    """Each `mod y;` of `text` (already through `code`): where it starts, the inline modules
+    it is inside, outermost first, and `y`. A `mod y;` in `mod tests { .. }` of `a.rs` is the
+    file `a/tests/y.rs`, not `a/y.rs` (2026-11-12: `mod budgets;` in item_scope.rs's inline
+    `mod tests` was looked for one directory too high and a whole list refused)."""
+    inside: list[str | None] = []
+    found: list[tuple[int, tuple[str, ...], str]] = []
+    for hit in MOD.finditer(text):
+        name, opens, brace = hit.group(1), hit.group(2), hit.group(3)
+        if brace == "{":
+            inside.append(None)
+        elif brace == "}":
+            if inside:
+                inside.pop()
+        elif opens == "{":
+            inside.append(name)
+        else:
+            found.append((hit.start(), tuple(it for it in inside if it is not None), name))
+    return found
 
 
 @dataclass(frozen=True)
@@ -69,10 +97,12 @@ def listed_files(repo: Path, paths: list[str]) -> tuple[list[Path], list[str]]:
     return files, missing
 
 
-def module_files(file: Path, name: str) -> tuple[Path, Path]:
-    """Where `mod name;` in `file` looks: beside a crate root or a mod.rs, else under the
-    directory named after the file."""
+def module_files(file: Path, inside: tuple[str, ...], name: str) -> tuple[Path, Path]:
+    """Where `mod name;` in `file`, inside the inline modules `inside`, looks: beside a crate
+    root or a mod.rs, else under the directory named after the file; then one directory down
+    for each inline module."""
     home = file.parent if file.name in ROOTS else file.parent / file.stem
+    home = home.joinpath(*inside)
     return home / f"{name}.rs", home / name / "mod.rs"
 
 
@@ -87,15 +117,15 @@ def findings(repo: Path, tracked: set[str], paths: list[str], quiet: int, now: f
         if file.suffix != ".rs":
             continue
         text = code(file.read_text(errors="replace"))
-        for hit in MOD.finditer(text):
-            before = text[: hit.start()].rstrip().rsplit("\n", 1)[-1]
+        for start, inside, name in declared(text):
+            before = text[:start].rstrip().rsplit("\n", 1)[-1]
             if "#[path" in before:
                 continue
-            candidates = [str(it.relative_to(repo)) for it in module_files(file, hit.group(1))]
+            candidates = [str(it.relative_to(repo)) for it in module_files(file, inside, name)]
             if not any(it in tracked or it in covered for it in candidates):
-                line = text.count("\n", 0, hit.start()) + 1
+                line = text.count("\n", 0, start) + 1
                 found.append(
-                    f"{file.relative_to(repo)}:{line}: `mod {hit.group(1)};` names {candidates[0]}, which is neither tracked nor in the list"
+                    f"{file.relative_to(repo)}:{line}: `mod {name};` names {candidates[0]}, which is neither tracked nor in the list"
                 )
     return found
 
