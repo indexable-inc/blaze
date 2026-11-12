@@ -196,10 +196,26 @@ def measure() -> None:
         t = [timed([T, "run", "-q"], B) for _ in range(3)]
         row(f"new project {k}: first/second/third run", "  ".join(f"{ms:7.0f} ms" for ms, _ in t) + f"  bad={sum(1 for _, r in t if r.returncode != 0 or 'hello' not in r.stdout)}")
     # another terminal width must rebuild nothing
-    for cols in ("80", "200"):
+    for cols in (80, 200):
+        import fcntl, pty, struct, termios
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, cols, 0, 0))
         s = time.perf_counter()
-        r = subprocess.run(["script", "-q", "/dev/null", "/bin/sh", "-c", f"stty cols {cols}; exec {T} run"], cwd=A, env=ENV, capture_output=True, text=True, timeout=900)
-        row(f"run in a terminal {cols} wide", f"{(time.perf_counter() - s) * 1000:7.0f} ms  recomputed-note={'recomputed' in r.stdout}  compiling-lines={r.stdout.count('Compiling')}")
+        p = subprocess.Popen([T, "run"], cwd=A, env=ENV, stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+        os.close(slave)
+        out = b""
+        while True:
+            try:
+                chunk = os.read(master, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out += chunk
+        code = p.wait()
+        os.close(master)
+        text = out.decode(errors="replace")
+        row(f"run in a terminal {cols} wide", f"{(time.perf_counter() - s) * 1000:7.0f} ms  exit {code}  ran={'hello' in text}  recomputed-note={'recomputed' in text}  compiling-lines={text.count('Compiling')}")
     # memory and disk
     pids = sh(["pgrep", "-f", str(INST / "blaze-engine")]).stdout.split()
     rss = 0
