@@ -87,6 +87,9 @@ pub mod kinds {
     /// ([`crate::giveback::Rung::Values`]): swept on a worker, never the loop. Pushed with no
     /// memory of its own, since it runs because memory is short.
     pub const GIVE_BACK: TaskKind = TaskKind(0x1_0010);
+    /// A checkout's front-end carry (`blaze_cargo::serve::front_carry`): its kernel session
+    /// carried to a build's pin and saved, on a worker after the build, never the loop.
+    pub const FRONT_CARRY: TaskKind = TaskKind(0x1_0011);
 }
 
 /// The name of one of the daemon's own task kinds ([`kinds`]), as a profile's `task` span
@@ -110,6 +113,7 @@ pub const fn name_of(kind: TaskKind) -> Option<&'static str> {
         kinds::PROGRAM_LINK => "program link",
         kinds::STORE_KEPT => "store kept",
         kinds::GIVE_BACK => "give back",
+        kinds::FRONT_CARRY => "front carry",
         _ => return None,
     })
 }
@@ -126,6 +130,7 @@ pub const fn tag_of(kind: TaskKind) -> Tag {
         kinds::FETCH | kinds::UNIT_STORE | kinds::STORE_KEPT => Tag::Store,
         kinds::LIBRARY | kinds::COMPILE | kinds::REACH | kinds::PROGRAM => Tag::Codegen,
         kinds::UNIT_NAMES => Tag::Nameres,
+        kinds::FRONT_CARRY => Tag::Parse,
         kinds::UNIT_BODIES => Tag::Infer,
         kinds::UNIT_LINK | kinds::PROGRAM_LINK => Tag::Link,
         kinds::LOWER | kinds::UB_TESTS | kinds::EVALUATE => Tag::Mir,

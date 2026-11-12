@@ -1,5 +1,5 @@
-//! Built MIR through the item store: a body's MIR and its closure's, built and flushed in one
-//! database, are read in a fresh one whose ids differ with no MIR built, equal to the same MIR
+//! Built MIR through the item store: a body's MIR and its closure's, built in one database and
+//! kept by the kernel's entries (`body_store::tests::kept_by_the_kernel`), are read in a fresh one whose ids differ with no MIR built, equal to the same MIR
 //! built there; both databases encode it to the same bytes; a lowering error is never stored; a
 //! corrupt answer is an error naming the body; a hit allocates only what decoding makes; a
 //! record holds a slot for each location literal and reads it where the body is now.
@@ -16,7 +16,6 @@ use blaze_hash::HashMap;
 use blaze_query::db::{Durability, Setter};
 use hir_def::{
     AdtId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, ModuleDefId, StructId, VariantId,
-    deps::ImageStore,
     expr_store::{Body, ExpressionStore},
     hir::{BindingId, ClosureKind, Expr, ExprId},
     nameres::{crate_def_map, demand::crate_body_owners},
@@ -32,9 +31,9 @@ use crate::{
     CallableDefId, InferBodyId, MemoryMap,
     body_store::{
         BodyFacts, Flushed, Lookup, Mode, Step, StepCounts,
-        record::{self, ShapeRef},
         tests::{
-            BUILD, Defs, FIXTURE, Memory, Session, db_of, function, second, session, without_steps,
+            Defs, FIXTURE, Memory, Session, db_of, function, kept_by_the_kernel, second, session,
+            without_steps,
         },
     },
     db::{InternedClosure, InternedClosureId},
@@ -43,7 +42,7 @@ use crate::{
         MirPhase, MirSpan, Operand, OperandKind, Place, Projection, ProjectionElem, Rvalue,
         Statement, StatementKind, Terminator, TerminatorKind,
     },
-    next_solver::{DbInterner, Ty, default_types, goal_store::solver_version},
+    next_solver::{DbInterner, Ty, default_types},
 };
 
 /// What a test asks the store for: the MIR of `closures` or of its closure, or a lowering that
@@ -308,33 +307,17 @@ fn stored() -> (Arc<Memory>, Defs, [Vec<u8>; 2]) {
         assert_eq!(*built, mir_of(&first.db, owner_of(&first.db, ask)));
         forms[usize::from(closure)] = stable(&first, owner_of(&first.db, ask));
     }
+    kept_by_the_kernel(&first, &memory);
     let flushed = first.installed.flush().unwrap();
-    assert_eq!(flushed.written, 2, "the body's MIR and its closure's, each a record: {flushed:?}");
-    assert_eq!(memory.len(), 4, "a shape and an answer each");
+    assert_eq!(flushed.written, 0, "a served step's record is the kernel's entry: {flushed:?}");
+    assert_eq!(memory.len(), 0, "nothing is filed in the item store's records");
+    assert_eq!(memory.entries(), 2, "the body's MIR and its closure's, each an entry");
     (memory, defs, forms)
 }
 
-/// Where `owner`'s MIR answer is in `memory`, from its shape in slot 0: its store key and its
-/// answer key.
-fn answer_of<'db>(
-    memory: &Memory,
-    s: &'db Session,
-    owner: MirOwner<'db>,
-) -> (blaze_ids::ContentId, blaze_ids::ContentId) {
-    let (def, schema) = place(&s.db, owner).unwrap();
-    let identity = s.facts.identity(&s.db, def).expect("a module's function has an identity");
-    let base = record::base_key(&identity, Step::Mir, &schema, &solver_version(&BUILD));
-    let shape_key = record::shape_key(&base, 0);
-    let held =
-        memory.get(&record::shape_at(Step::Mir, &shape_key)).unwrap().expect("a shape in slot 0");
-    let shape = ShapeRef::open(held.bytes(), &base).unwrap();
-    // An answer is under its shape's bytes, wherever in the chain the shape is.
-    let mut key = blaze_record::AnswerKey::new(held.bytes());
-    for fact in shape.facts() {
-        key.value(blaze_record::Digest::Is(s.facts.value(&s.db, def, fact).unwrap()));
-    }
-    let answer_key = key.finish();
-    (record::answer_at(Step::Mir, &answer_key), answer_key)
+/// The schema `owner`'s MIR is filed under.
+fn schema_of_mir<'db>(s: &'db Session, owner: MirOwner<'db>) -> blaze_format::SchemaHash {
+    place(&s.db, owner).expect("the test's owners are a body's").1
 }
 
 #[test]
@@ -399,19 +382,19 @@ fn a_lowering_error_is_never_stored() {
     reset_ran();
     assert!(built_mir(&first.db, failing).is_ok());
     assert_eq!(ran(), 1, "the body is built once it lowers");
-    assert_eq!(first.installed.flush().unwrap().written, 1);
+    assert_eq!(first.installed.flush().unwrap().written, 0, "a served step's record is the kernel's entry");
 }
 
 #[test]
 fn a_corrupt_answer_is_an_error_naming_the_body() {
     let (memory, defs, _) = stored();
     let probe = session(db_of(FIXTURE), &Arc::new(Memory::default()), &defs, None, Mode::Serve);
-    let (at, answer_key) = answer_of(&memory, &probe, owner_of(&probe.db, ask(&probe, false)));
+    let schema = schema_of_mir(&probe, owner_of(&probe.db, ask(&probe, false)));
     drop(probe);
 
     let mut garbage = vec![0u8; 256];
     garbage[..16].copy_from_slice(b"not a MIR answer");
-    memory.set(at, &record::write_answer(&answer_key, &garbage));
+    memory.set_answer_under("closures", Step::Mir, schema, &garbage);
     let fresh = session(second(FIXTURE), &memory, &defs, None, Mode::Serve);
     let ask = ask(&fresh, false);
     let def = ask.def(&fresh.db);
@@ -461,10 +444,10 @@ fn verify_builds_every_hit_and_a_difference_is_an_error_naming_the_body() {
 
     // The body's answer swapped for its closure's: it decodes, and differs.
     let probe = session(db_of(FIXTURE), &Arc::new(Memory::default()), &defs, None, Mode::Serve);
-    let (at, body_key) = answer_of(&memory, &probe, owner_of(&probe.db, ask(&probe, false)));
+    let schema = schema_of_mir(&probe, owner_of(&probe.db, ask(&probe, false)));
     let closure_bytes = stable(&probe, owner_of(&probe.db, ask(&probe, true)));
     drop(probe);
-    memory.set(at, &record::write_answer(&body_key, &closure_bytes));
+    memory.set_answer_under("closures", Step::Mir, schema, &closure_bytes);
     let wrong = session(second(FIXTURE), &memory, &defs, None, Mode::Verify);
     let ask = ask(&wrong, false);
     let def = ask.def(&wrong.db);
@@ -482,9 +465,7 @@ fn a_hit_allocates_only_the_decoded_mir() {
         let (def, schema) = place(&fresh.db, owner).unwrap();
         // Warm: the identity, the facts' values and every type the MIR interns.
         assert!(matches!(lookup_mir(&fresh.db, def, owner, schema), Lookup::Hit { .. }));
-        let (at, answer_key) = answer_of(&memory, &fresh, owner);
-        let answer = memory.get(&at).unwrap().unwrap();
-        let body = Aligned::copy_from(record::open_answer(answer.bytes(), &answer_key).unwrap());
+        let body = Aligned::copy_from(&memory.answer_under("closures", Step::Mir, schema));
         let (decoded, decoding) = measure(|| decode(&fresh.db, &*fresh.facts, def, &body));
         drop(decoded.unwrap());
         let (found, hit) = measure(|| lookup_mir(&fresh.db, def, owner, schema));

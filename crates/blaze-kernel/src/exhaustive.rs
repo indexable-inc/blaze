@@ -265,6 +265,9 @@ enum Failure {
     Stale { after: Vec<Did>, hit: bool, gave: Vec<u8>, fresh: Vec<u8> },
     /// What a get kept, the lookup straight after did not find.
     Lost { after: Vec<Did> },
+    /// A value asked for at the top, of a step that may be asked for, that the session held
+    /// before a carry and does not after it: the carry dropped it in place of repairing it.
+    Unrepaired { after: Vec<Did>, root: String },
     Kernel { after: Vec<Did>, why: String },
 }
 

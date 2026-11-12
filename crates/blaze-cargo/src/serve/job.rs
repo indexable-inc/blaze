@@ -212,6 +212,9 @@ pub enum Value<S: Steps> {
     /// ([`Does::GiveValues`]), with the bytes that went: none when the sweep panicked, as it
     /// may be half swept.
     GaveValues(Option<S::KeptFront>, u64),
+    /// A front-end carry's pass ran ([`Does::FrontCarry`]): what it gave is in its
+    /// [`CarryHand`], which the loop finds by the node ([`Jobs::front_carried`]).
+    FrontCarried,
 }
 
 /// What jobs tell the session, in order.
@@ -475,6 +478,15 @@ pub(super) enum Does<S: Steps> {
         bytes: u64,
         wanted: Arc<AtomicBool>,
     },
+    /// One pass of checkout `checkout`'s front-end carry ([`super::front_carry::Carry::run`]):
+    /// the pass and the session taken from `hand`, the tree read through `files`, the store
+    /// through `store` under the task's guard, every write kept for the loop to put.
+    FrontCarry {
+        hand: Arc<Lock<CarryHand>>,
+        checkout: String,
+        files: blaze_vfs::Reader,
+        store: blaze_cas::Reader,
+    },
 }
 
 impl<S: Steps> Step<S> {
@@ -541,6 +553,7 @@ impl<S: Steps> plane::Work for Step<S> {
             Does::Doc { .. } => tracing::info_span!("doc"),
             Does::StoreKept { checkout, .. } => tracing::info_span!(target: "blaze", "store kept front end", checkout = %checkout),
             Does::GiveValues { checkout, bytes, .. } => tracing::info_span!(target: "blaze", "give back a kept front end's values", checkout = %checkout, bytes = *bytes),
+            Does::FrontCarry { checkout, .. } => tracing::info_span!(target: "blaze", "front end carry pass", checkout = %checkout),
         }
         .entered();
         match &self.does {
@@ -836,6 +849,41 @@ impl<S: Steps> plane::Work for Step<S> {
                     }
                 };
                 self.settle(Ok::<(), Failed>(()), |_| Value::GaveValues(front, gave))
+            }
+            Does::FrontCarry { hand, files, store, .. } => {
+                let (state, pass, crates) = {
+                    let mut held = hand.lock();
+                    (held.state.take(), held.pass.take(), std::mem::take(&mut held.crates))
+                };
+                let Some(pass) = pass else {
+                    let error = ApiError::new("the front-end carry's pass was taken before its task ran", None);
+                    return self.settle(Err::<(), _>(Failed::Error(error)), |_| Value::FrontCarried);
+                };
+                let start = blaze_profile::clock::mono_ns();
+                let guard = blaze_cas::enter();
+                let reading = blaze_kernel::Reading { reader: store, guard: &guard };
+                let run = || {
+                    let mut overlay = super::front_carry::Overlay::new(&reading);
+                    let ran = super::front_carry::Carry::run(state, pass, files, &mut overlay, &crates);
+                    ran.map(|(carry, built, saved)| CarryOut { carry, built, saved, puts: overlay.into_puts(), ns: 0 })
+                };
+                #[cfg(test)]
+                let run = || super::front_carry::sim::in_task(run);
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+                drop(guard);
+                // A monotonic clock: the difference is never negative.
+                let ns = blaze_profile::clock::mono_ns().saturating_sub(start).max(0).cast_unsigned();
+                let out = match caught {
+                    Ok(Ok(out)) => Ok(CarryOut { ns, ..out }),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    // alloc: a panic, once
+                    Err(payload) => Err(format!(
+                        "blaze {}, carrying the front end; its session is dropped, as it may be half carried",
+                        plane::panicked(&*payload)
+                    )),
+                };
+                hand.lock().out = Some(out);
+                self.settle(Ok::<(), Failed>(()), |_| Value::FrontCarried)
             }
         }
     }
@@ -1931,17 +1979,29 @@ struct Roots<S: Steps> {
     /// as a row `blaze why` says ([`Job::ended`]).
     unfinished: Vec<Option<Unfinished>>,
     /// Its front-end carry ([`super::front_carry`]): one kernel session kept across its
-    /// builds, carried to each build's pin ([`carry_front`]).
+    /// builds, carried to each build's pin by a task posted at the build's end
+    /// ([`Jobs::post_carry`]).
     carries: Vec<CarryOf>,
 }
 
-/// A checkout's front-end carry and the plan whose crates it was last given.
+/// A checkout's front-end carry ([`super::front_carry`]): its session, the crates its last
+/// build ended with, and what of it the daemon's image may name.
 #[derive(Default)]
 struct CarryOf {
+    /// The checkout's directory, as [`Roots::intern`] was given it: the task's name, and the
+    /// image's name of the session.
+    checkout: String,
     state: CarryState,
-    /// The plan `crates` are of, held so its address names it while it is compared.
-    units: Option<Arc<blaze_units::query::Units>>,
+    /// The crates the last build ended with ([`super::work::Writer::view_crates`]).
     crates: Vec<super::front_carry::CrateRoot>,
+    /// A build's root that ended while a pass ran, held open: the next pass carries from the
+    /// session's pin to it alone, so builds that land during a pass coalesce into one.
+    wanted: Option<(ContentId, ViewId)>,
+    /// The last pass's save and the tickets of its puts, until they are durable.
+    pending: Option<(super::front_carry::Saved, blaze_cas::Tickets)>,
+    /// The last save whose puts are durable, its root held open: the one the daemon's image
+    /// names ([`Jobs::carry_sessions`]), so an image never names a session the store may lose.
+    kept: Option<(super::front_carry::Saved, ViewId)>,
 }
 
 #[derive(Default)]
@@ -1949,28 +2009,55 @@ enum CarryState {
     /// No session yet: the next build with crates seeds one.
     #[default]
     None,
-    Held(super::front_carry::Carry),
+    /// The session the daemon's image named, its root held open: the next build opens it.
+    Saved(super::front_carry::Saved, ViewId),
+    /// The session between passes, the view of its pin's root held open so the next pass's
+    /// diff has both roots.
+    Held(Box<super::front_carry::Carry>, ViewId),
+    /// A pass on its task ([`Does::FrontCarry`]): `from` is the view of the root it carries
+    /// from (none for a seed), `to` of the root it carries to.
+    Running {
+        node: NodeId,
+        hand: Arc<Lock<CarryHand>>,
+        from: Option<ViewId>,
+        to: ViewId,
+        span: tracing::Span,
+    },
     /// A carry failed: said on every build after it, never tried again (rule 3) until the
     /// daemon restarts.
     Failed(String),
 }
 
-/// The front end's carry of one build of a checkout ([`super::front_carry`]): its session
-/// carried from the last build's pin to `input.root`'s, in the span "front end carry" with
-/// what the carry did (seeded, repaired, changed, cut, gone; the paths the pins differ in,
-/// the crates, the files held as roots) and its time in `ns`. The crates are asked of the
-/// front once a plan. A failure is an error event naming it, and every later build's span
-/// says it.
-fn carry_front<S: Steps>(
-    of: &mut CarryOf,
-    vfs: &mut Vfs,
-    store: &mut Store,
-    input: &JobInput,
-    front: &S::Front,
-) {
-    let span = tracing::info_span!(
+/// What the loop and a carry's task share ([`Does::FrontCarry`]): the pass and the session
+/// handed over, and what the task gives back. Shared so a task the plane refuses, or one that
+/// settles without running, leaves nothing lost unsaid.
+pub(super) struct CarryHand {
+    state: Option<Box<super::front_carry::Carry>>,
+    pass: Option<super::front_carry::Pass>,
+    crates: Vec<super::front_carry::CrateRoot>,
+    out: Option<Result<CarryOut, String>>,
+}
+
+/// A pass done: the session, what it did, where it saved it and the store writes to put.
+struct CarryOut {
+    carry: Box<super::front_carry::Carry>,
+    built: super::front_carry::Built,
+    saved: super::front_carry::Saved,
+    puts: Vec<super::work::Put>,
+    /// The pass's time on its task.
+    ns: u64,
+}
+
+/// The span of one pass of a checkout's front-end carry, "front end carry": what the carry
+/// did (seeded, repaired, changed, cut, gone; the paths the pins differ in, the crates, the
+/// files held as roots), its time on its task in `ns`, and `on = "task"`. Opened as the pass
+/// is posted, recorded as its value is back.
+fn carry_span(checkout: &str) -> tracing::Span {
+    tracing::info_span!(
         target: "blaze",
         "front end carry",
+        checkout = %checkout,
+        on = "task",
         seeded = tracing::field::Empty,
         repaired = tracing::field::Empty,
         changed = tracing::field::Empty,
@@ -1983,60 +2070,306 @@ fn carry_front<S: Steps>(
         crates = tracing::field::Empty,
         files = tracing::field::Empty,
         ran = tracing::field::Empty,
+        puts = tracing::field::Empty,
         error = tracing::field::Empty,
+    )
+}
+
+fn record_built(span: &tracing::Span, built: &super::front_carry::Built) {
+    let carried = built.carried;
+    span.record("seeded", carried.seeded as u64);
+    span.record("repaired", carried.repaired as u64);
+    span.record("changed", carried.changed as u64);
+    span.record("cut", carried.cut as u64);
+    span.record("gone", carried.gone as u64);
+    span.record("first", built.first);
+    span.record("dropped", tracing::field::debug(carried.dropped));
+    span.record("paths", built.paths as u64);
+    span.record("crates", built.crates as u64);
+    span.record("files", built.files as u64);
+    span.record("ran", built.ran as u64);
+}
+
+/// A view holding `root` open for the front end's carry.
+fn carry_view(vfs: &mut Vfs, root: ContentId) -> Result<ViewId, String> {
+    vfs.open(blaze_vfs::View { root })
+        // alloc: an error
+        .map_err(|error| format!("the root {root:x} cannot be held open for the front end's carry: {error:?}"))
+}
+
+/// Checkout `of`'s carry fails with `why`: said as an error event and in the span of the pass
+/// it failed in, every view it held closed, never tried again (rule 3) until the daemon
+/// restarts. The last durable session stays the image's.
+fn fail_carry(vfs: &mut Vfs, of: &mut CarryOf, why: String) {
+    tracing::error!(
+        target: "blaze",
+        checkout = %of.checkout,
+        error = %why,
+        "the front end's carry failed: no build of this checkout carries again until the daemon restarts"
     );
-    let _entered = span.enter();
-    let start = blaze_profile::clock::mono_ns();
-    if !of.units.as_ref().is_some_and(|it| Arc::ptr_eq(it, &input.units)) {
-        match <S::Front as Front<S>>::view_crates(front) {
-            Ok(crates) => of.crates = crates,
-            Err(why) => of.state = CarryState::Failed(why),
-        }
-        of.units = Some(Arc::clone(&input.units));
-    }
-    let done = match std::mem::take(&mut of.state) {
-        CarryState::Failed(why) => Err(why),
-        CarryState::None if of.crates.is_empty() => Ok(super::front_carry::Built::default()),
-        CarryState::None => match super::front_carry::Carry::seed(vfs, store, input.root, &of.crates) {
-            Ok((carry, built)) => {
-                of.state = CarryState::Held(carry);
-                Ok(built)
-            }
-            Err(error) => Err(error.to_string()),
-        },
-        CarryState::Held(mut carry) => match carry.build(vfs, store, input.root, &of.crates) {
-            Ok(built) => {
-                of.state = CarryState::Held(carry);
-                Ok(built)
-            }
-            Err(error) => {
-                carry.close(vfs);
-                Err(error.to_string())
-            }
-        },
-    };
-    span.record("ns", blaze_profile::clock::mono_ns().saturating_sub(start));
-    match done {
-        Ok(built) => {
-            let carried = built.carried;
-            span.record("seeded", carried.seeded as u64);
-            span.record("repaired", carried.repaired as u64);
-            span.record("changed", carried.changed as u64);
-            span.record("cut", carried.cut as u64);
-            span.record("gone", carried.gone as u64);
-            span.record("first", built.first);
-            span.record("dropped", tracing::field::debug(carried.dropped));
-            span.record("paths", built.paths as u64);
-            span.record("crates", built.crates as u64);
-            span.record("files", built.files as u64);
-            span.record("ran", built.ran as u64);
-        }
-        Err(why) => {
-            tracing::error!(target: "blaze", error = %why, "the front end's carry failed: no build of this checkout carries again until the daemon restarts");
+    match std::mem::take(&mut of.state) {
+        CarryState::Saved(_, view) | CarryState::Held(_, view) => vfs.close(view),
+        CarryState::Running { from, to, span, .. } => {
             span.record("error", why.as_str());
-            of.state = CarryState::Failed(why);
+            if let Some(from) = from {
+                vfs.close(from);
+            }
+            vfs.close(to);
+        }
+        CarryState::None | CarryState::Failed(_) => {}
+    }
+    if let Some((_, view)) = of.wanted.take() {
+        vfs.close(view);
+    }
+    of.pending = None;
+    of.state = CarryState::Failed(why);
+}
+
+impl<S: Steps> Jobs<S> {
+    /// A build of checkout `at` ended at `root`, its crates as it ended them
+    /// ([`super::work::Writer::view_crates`]): the checkout's session is carried to `root` on a
+    /// task of its own ([`Jobs::start_carry`]), off the loop and off the build's answer. A
+    /// pass under way when it ends is not waited on: `root` is kept as the one the next pass
+    /// carries to, replacing any kept before (the session goes from its pin to the latest root
+    /// alone). A build of the root the session is pinned at carries nothing.
+    fn post_carry(
+        &mut self,
+        w: &mut World<'_, S>,
+        at: u32,
+        root: ContentId,
+        crates: Result<Vec<super::front_carry::CrateRoot>, String>,
+    ) {
+        let of = &mut self.roots.carries[at as usize];
+        match crates {
+            Ok(crates) => of.crates = crates,
+            Err(why) => return fail_carry(w.vfs, of, why),
+        }
+        if of.crates.is_empty() {
+            return;
+        }
+        match &of.state {
+            CarryState::Failed(why) => {
+                let span = carry_span(&of.checkout);
+                span.record("error", why.as_str());
+                return;
+            }
+            CarryState::Held(carry, _) if carry.root() == root => return,
+            CarryState::Running { .. } => {
+                match carry_view(w.vfs, root) {
+                    Ok(view) => {
+                        if let Some((_, old)) = of.wanted.replace((root, view)) {
+                            w.vfs.close(old);
+                        }
+                    }
+                    Err(why) => fail_carry(w.vfs, of, why),
+                }
+                return;
+            }
+            CarryState::None | CarryState::Saved(..) | CarryState::Held(..) => {}
+        }
+        match carry_view(w.vfs, root) {
+            Ok(view) => self.start_carry(w, at, root, view),
+            Err(why) => fail_carry(w.vfs, of, why),
         }
     }
+
+    /// Posts checkout `at`'s next pass to `root`, which `to` holds open: a seed, an open of
+    /// the image's session, or a move of the held one, its change set the VFS's diff from the
+    /// session's root, computed here where both roots are held. The task is no job's and asks
+    /// the memory its checkout's passes are learned to hold ([`carry_cost_key`]).
+    fn start_carry(&mut self, w: &mut World<'_, S>, at: u32, root: ContentId, to: ViewId) {
+        use super::front_carry::Pass;
+        let of = &mut self.roots.carries[at as usize];
+        let (pass, state, from) = match std::mem::take(&mut of.state) {
+            CarryState::None => (Pass::Seed { root }, None, None),
+            CarryState::Saved(saved, view) => {
+                let changes = match saved.root == root {
+                    true => Vec::new(), // alloc: none
+                    false => w.vfs.diff(saved.root, root),
+                };
+                (Pass::Open { saved, root, changes }, None, Some(view))
+            }
+            CarryState::Held(carry, view) => {
+                let changes = w.vfs.diff(carry.root(), root);
+                (Pass::Move { root, changes }, Some(carry), Some(view))
+            }
+            other @ (CarryState::Running { .. } | CarryState::Failed(_)) => {
+                of.state = other;
+                w.vfs.close(to);
+                return;
+            }
+        };
+        let span = carry_span(&of.checkout);
+        // clone: once a pass, the crates the task asks
+        let crates = of.crates.clone();
+        // alloc: once a pass, shared with the task so a refused one leaves nothing unsaid
+        let hand = Arc::new(Lock::new(
+            "serve.job.front_carry.hand",
+            CarryHand { state, pass: Some(pass), crates, out: None },
+        ));
+        let request = w.plane.open(w.now, false, false);
+        let name = named("carrying the front end of ", &of.checkout);
+        let mut fresh = w.plane.fresh(1, name.len(), 0);
+        let task = w.plane.push_learned(
+            &mut fresh,
+            node(NodeKind::Store, &name, &[], Pool::Work, None),
+            one(kinds::FRONT_CARRY),
+            carry_cost_key(&of.checkout),
+        );
+        let does = Does::FrontCarry {
+            hand: Arc::clone(&hand), // clone: a refcount, once a pass
+            checkout: of.checkout.clone(), // alloc: the task's span's name, once a pass
+            files: w.vfs.reader(),
+            store: w.store.reader(),
+        };
+        // The task is no job's: nothing cancels it but its own end.
+        let never = Arc::new(AtomicBool::new(false)); // alloc: once a pass
+        let work = Step::of(&never, does);
+        // No job looks at this request: marked so its finish is forgotten as a store's is.
+        self.store_requests.insert(request);
+        of.state = CarryState::Running { node: task, hand, from, to, span };
+        if let Err(error) = w.plane.add(w.now, request, fresh, Some(work), false) {
+            // alloc: an error
+            fail_carry(w.vfs, of, format!("the plane refused the front end's carry task: {error}"));
+        }
+        w.plane.close(w.now, request);
+    }
+
+    /// Node `node` gave its value (`valued`) or settled: if it is a checkout's carry pass, what
+    /// the pass gave is taken from its hand. Done: its store writes put (their tickets kept, so
+    /// the image names the session once they are durable, [`Jobs::carry_sessions`]), the view
+    /// of the root it carried from closed, the span recorded, and the root a build ended at
+    /// meanwhile carried to next. Failed, or settled with nothing given: the carry fails,
+    /// saying why.
+    fn front_carried(&mut self, w: &mut World<'_, S>, node: NodeId, valued: bool) {
+        let Some(at) = self
+            .roots
+            .carries
+            .iter()
+            .position(|it| matches!(&it.state, CarryState::Running { node: running, .. } if *running == node))
+        else {
+            return;
+        };
+        let of = &mut self.roots.carries[at];
+        let out = match &of.state {
+            CarryState::Running { hand, .. } => hand.lock().out.take(),
+            _ => return,
+        };
+        let out = match out {
+            Some(out) => out,
+            None if valued => Err("the front end's carry task gave its value with no pass done".to_owned()), // alloc: an error
+            None => Err("the front end's carry task settled without running".to_owned()), // alloc: an error
+        };
+        let CarryOut { carry, built, saved, puts, ns } = match out {
+            Ok(out) => out,
+            Err(why) => return fail_carry(w.vfs, of, why),
+        };
+        let mut tickets = blaze_cas::Tickets::default();
+        let count = puts.len();
+        for put in puts {
+            match w.store.put(put.key, put.kind, &put.bytes) {
+                Ok(ticket) => tickets.add(ticket),
+                Err(mismatch) => {
+                    // alloc: an error
+                    let why = format!("the store holds other bytes under a key the front end's carry put: {mismatch:?}");
+                    return fail_carry(w.vfs, of, why);
+                }
+            }
+        }
+        let CarryState::Running { from, to, span, .. } = std::mem::take(&mut of.state) else {
+            unreachable!("the state was a running pass above");
+        };
+        record_built(&span, &built);
+        span.record("ns", ns);
+        span.record("puts", count as u64);
+        #[cfg(test)]
+        super::front_carry::sim::built(built);
+        if let Some(from) = from {
+            w.vfs.close(from);
+        }
+        of.pending = Some((saved, tickets));
+        of.state = CarryState::Held(carry, to);
+        if let Some((root, view)) = of.wanted.take() {
+            match matches!(&of.state, CarryState::Held(carry, _) if carry.root() == root) {
+                true => w.vfs.close(view),
+                false => self.start_carry(w, u32::try_from(at).expect("under 2^32 checkouts"), root, view),
+            }
+        }
+    }
+
+    /// The image's section of carry sessions (`SectionId::FRONT_CARRY`,
+    /// [`super::front_carry::encode_sessions`]): each checkout's last save whose puts are
+    /// durable in `store`. A newer save becomes the kept one here once its puts are durable,
+    /// its root held open by a view of the kept one's own, so the VFS image has it.
+    pub fn carry_sessions(&mut self, vfs: &mut Vfs, store: &blaze_cas::Store) -> Vec<u8> {
+        // alloc: once an image, a session a checkout
+        let mut sessions = Vec::new();
+        for of in &mut self.roots.carries {
+            if let Some((saved, tickets)) = &of.pending
+                && tickets.pending(|ticket| store.durable(ticket)).is_none()
+            {
+                let saved = *saved;
+                match carry_view(vfs, saved.root) {
+                    Ok(view) => {
+                        if let Some((_, old)) = of.kept.replace((saved, view)) {
+                            vfs.close(old);
+                        }
+                        of.pending = None;
+                    }
+                    Err(why) => tracing::warn!(
+                        target: "blaze",
+                        checkout = %of.checkout,
+                        "the image names the checkout's older durable carry session: {why}"
+                    ),
+                }
+            }
+            if let Some((saved, _)) = &of.kept {
+                sessions.push((of.checkout.clone(), *saved)); // clone: a checkout's path, once an image
+            }
+        }
+        super::front_carry::encode_sessions(&sessions)
+    }
+
+    /// The carry sessions a restored image named: each checkout's session is the one its
+    /// next build opens ([`CarryState::Saved`]), its root held open, and stays the image's
+    /// until a newer one is durable. A session whose root the restored VFS does not have is
+    /// left, and said in what this returns: that checkout seeds on its next build.
+    pub fn restore_carries(
+        &mut self,
+        vfs: &mut Vfs,
+        sessions: Vec<(String, super::front_carry::Saved)>,
+    ) -> Option<String> {
+        // alloc: a start's report, only for a session left
+        let mut left = Vec::new();
+        for (checkout, saved) in sessions {
+            let (held, kept) = match (carry_view(vfs, saved.root), carry_view(vfs, saved.root)) {
+                (Ok(held), Ok(kept)) => (held, kept),
+                (held, kept) => {
+                    for view in [held, kept].into_iter().flatten() {
+                        vfs.close(view);
+                    }
+                    left.push(checkout); // alloc: a start's report
+                    continue;
+                }
+            };
+            let at = self.roots.intern(&checkout);
+            let of = &mut self.roots.carries[at as usize];
+            of.state = CarryState::Saved(saved, held);
+            of.kept = Some((saved, kept));
+        }
+        (!left.is_empty()).then(|| {
+            // alloc: a start's report
+            format!("the VFS has not the roots of the sessions of {}: each seeds on its next build", left.join(", "))
+        })
+    }
+}
+
+/// The predictor's key of a checkout's front-end carry: what a pass held is learned per
+/// checkout, as its lowering is ([`lower_cost_key`]).
+fn carry_cost_key(checkout: &str) -> Key {
+    let mut hasher = blaze_ids::Hasher::new("blaze v2 front carry cost 1");
+    hasher.update(checkout.as_bytes());
+    Key(hasher.finish().0)
 }
 
 impl<S: Steps> Roots<S> {
@@ -2065,7 +2398,8 @@ impl<S: Steps> Roots<S> {
         self.answers.push(Answers::new());
         self.lost.push(None);
         self.unfinished.push(None);
-        self.carries.push(CarryOf::default());
+        // alloc: the checkout's directory, once a checkout
+        self.carries.push(CarryOf { checkout: root_dir.to_owned(), ..CarryOf::default() });
         id
     }
 }
@@ -2507,6 +2841,10 @@ struct Job<S: Steps> {
     /// the write. A plan of the view opened again that asks for other bytes is an error,
     /// never a second round.
     locked: Option<(ContentId, LockWrite)>,
+    /// The checkout of each view it opened again with its lock files written in
+    /// ([`Jobs::open_locked`]), by that view's root: a root no head is at, whose checkout is the
+    /// one the view was asked on, never an agent's view.
+    relocated: Vec<(ContentId, String)>,
     placing: usize,
     /// How the bytes of what it placed got there: cloned, written into the store, copied
     /// ([`blaze_cas::PlacedBytes`]), for its `Work` report and its span.
@@ -3221,6 +3559,7 @@ impl<S: Steps> Job<S> {
             built_root: None,
             borrowed: Vec::new(), // alloc: once per job
             locked: None,
+            relocated: Vec::new(), // alloc: none until a plan writes lock files
             placing: 0,
             placed: blaze_cas::PlacedBytes::default(),
             worked: None,
@@ -4314,16 +4653,22 @@ impl<S: Steps> Jobs<S> {
         w: &World<'_, S>,
         work: &Work,
         opened: &Opened,
+        relocated: &[(ContentId, String)],
         library: String,
     ) -> Viewed {
         let targets = targets_of(work);
         let root_dir = match targets.and_then(|it| it.cargo.as_ref()) {
             Some(cargo) => cargo.root.clone(), // clone: the view's root directory, once per view
-            None => w
-                .heads
-                .path_of(&*w.vfs, opened.view.root)
-                // alloc: an agent's view's directory, once per view
-                .unwrap_or_else(|| format!("{}/{:x}", setup.views, opened.view.root)),
+            // A view the job opened again with its lock files is its checkout's still: no head
+            // is at its root ([`Job::relocated`]).
+            None => match relocated.iter().find(|it| it.0 == opened.view.root) {
+                Some((_, dir)) => dir.clone(), // clone: the view's root directory, once per view
+                None => w
+                    .heads
+                    .path_of(&*w.vfs, opened.view.root)
+                    // alloc: an agent's view's directory, once per view
+                    .unwrap_or_else(|| format!("{}/{:x}", setup.views, opened.view.root)),
+            },
         };
         let root = lasting(&setup.views, &root_dir).then(|| roots.intern(&root_dir));
         // clone: the config owns its mounts, once per view
@@ -4375,7 +4720,7 @@ impl<S: Steps> Jobs<S> {
             return;
         };
         let Viewed { root_dir, root, config, bare, planned, key, shape } =
-            Self::viewed(&self.setup, &mut self.roots, w, &job.work, &opened, library);
+            Self::viewed(&self.setup, &mut self.roots, w, &job.work, &opened, &job.relocated, library);
         // A view whose plan is known to write lock files into it (a build of this very view
         // did, and its plan is kept): the files are written into the view again and the
         // view opened with them, asked of no load ([`LastPlan::asked`]).
@@ -4531,7 +4876,7 @@ impl<S: Steps> Jobs<S> {
         let keying =
             tracing::info_span!(target: "blaze", "no-op answer: the request's inputs").entered();
         let Viewed { root, config, bare, shape, .. } =
-            Self::viewed(&self.setup, &mut self.roots, w, work, opened, library);
+            Self::viewed(&self.setup, &mut self.roots, w, work, opened, &[], library);
         let Some(root) = root else {
             // alloc: a reason, once a request on an agent's view
             self.refused = Some("its view is no checkout's: an agent's view keeps no answer".to_owned());
@@ -5415,6 +5760,7 @@ impl<S: Steps> Jobs<S> {
                 }
             }
             Value::GaveValues(front, gave) => self.gave_values(w, node, front, gave),
+            Value::FrontCarried => self.front_carried(w, node, true),
             value => {
                 if let Some(job) =
                     self.batches.job_of(node).and_then(|id| self.jobs.get_mut(key_of(id)))
@@ -5436,6 +5782,9 @@ impl<S: Steps> Jobs<S> {
         // A give-back of a kept front end's values, which is no job's: its value came before
         // this ([`Jobs::gave_values`]), or never will ([`Jobs::give_settled`]).
         self.give_settled(w, node);
+        // A front-end carry's pass, which is no job's: its value came before this
+        // ([`Jobs::front_carried`]), or never will, and the carry fails saying so.
+        self.front_carried(w, node, false);
         // A unit's node: what its walk reached teaches the forecast, and a unit whose names
         // settled is forecast by its dependencies' walks ([`Jobs::forecast_walk`]).
         self.forecast_walk(w, node);
@@ -6109,6 +6458,7 @@ impl<S: Steps> Jobs<S> {
         .entered();
         let opened = Opened { view: blaze_vfs::View { root }, ..was };
         job.locked = Some((key, written.clone())); // clone: the lock files' text, once
+        job.relocated.push((root, root_dir.to_owned())); // alloc: the checkout's path, once a lock write
         if let Some(view) = job.views.iter_mut().find(|it| **it == was) {
             *view = opened;
         }
@@ -6713,10 +7063,6 @@ impl<S: Steps> Jobs<S> {
             return;
         };
         let cancelled = job.cancelled.clone(); // clone: a refcount, once per build
-        // The front end's session carried to this build's pin, once a build of a checkout.
-        if let Some(at) = root {
-            carry_front::<S>(&mut self.roots.carries[at as usize], w.vfs, w.store, &input, &front);
-        }
         // A build of the units a view's front end applies ([`Jobs::next`]): the job's plane
         // request stays open after it.
         let applying = job.applying.is_some();
@@ -8291,6 +8637,12 @@ impl<S: Steps> Jobs<S> {
             true => Some(writer),
             false => {
                 if let Some(root) = root {
+                    // The front end's session carried to this build's pin, on a task of its
+                    // own: the crates as the build ended them, every build script's cfg and
+                    // each root's syntax extensions applied ([`Jobs::post_carry`]).
+                    let crates = tracing::info_span!(target: "blaze", "loop: the build's crates for the front end's carry")
+                        .in_scope(|| writer.view_crates());
+                    self.post_carry(w, root, input.root, crates);
                     let kept =
                         tracing::info_span!(target: "blaze", "loop: the build's front end kept")
                             .in_scope(|| writer.keep());
@@ -9326,6 +9678,7 @@ impl<S: Steps> Jobs<S> {
     /// A snapshot: the image written, the journal and the store flushed, and every head as it
     /// stands, reported once all of it is durable.
     fn snapshot(&mut self, w: &mut World<'_, S>) -> Stage<S> {
+        let carries = self.carry_sessions(&mut *w.vfs, &*w.store);
         let front = self.front_db();
         w.images.ask(Parts {
             db: w.db,
@@ -9333,6 +9686,7 @@ impl<S: Steps> Jobs<S> {
             vfs: &mut *w.vfs,
             predict: w.plane.predict(),
             effects: &mut *w.effects,
+            carries: &carries,
         });
         // What it waits for, read before the flush: a put another thread makes between the
         // flush's drain and the read would be waited on and drained by no commit.

@@ -33,7 +33,7 @@
 #![register_tool(blaze)]
 
 use std::alloc::Global;
-use std::any::TypeId;
+use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::fmt;
 
@@ -93,6 +93,8 @@ pub mod steps {
     pub const BODY_MIR: StepId = StepId(0x0302);
     /// That a body's borrow check passed (`hir_ty::body_store::entries::BorrowckEntry`).
     pub const BODY_BORROWCK: StepId = StepId(0x0303);
+    /// A constant's evaluated value (`hir_ty::body_store::entries::ConstEntry`).
+    pub const BODY_CONST: StepId = StepId(0x0304);
 }
 
 /// A compute step, by number: one number is one step for every blaze ([`steps`]).
@@ -685,7 +687,15 @@ struct Registered<W: ?Sized> {
     /// Its `maintain` behind its input's bytes, where it is a maintained step
     /// ([`Kernel::register_maintain`]).
     maintain: Option<nest::Maintainer<W>>,
+    /// Its [`Ask::key`], a [`Keyer`] of it, where other steps may ask for it: how a value
+    /// asked for at the top ([`Kernel::get_in`], whose bound is [`Compute`]) is named by the
+    /// key a carry asks it again by.
+    keyer: Option<Box<dyn Any + Send + Sync>>,
 }
+
+/// [`Ask::key`] of `S`, as the registry keeps it behind `Any`: a get of `S` finds it by `S`'s
+/// own type, where its bound says nothing of [`Ask`] ([`Kernel::root`]).
+struct Keyer<S: Step>(fn(&S::Input, &mut Vec<u8>));
 
 /// The registry of steps, each with its code, over the one world `W` its steps read. It is
 /// built at setup and shared (`&Kernel<W>`) after that.
@@ -700,6 +710,12 @@ pub struct Kernel<W: ?Sized> {
 }
 
 const REGISTRY: &str = "blaze v2 kernel registry 1";
+
+/// The [`Keyer`] of `S`, as [`Registered::keyer`] holds it.
+fn keyer<S: Ask>() -> Box<dyn Any + Send + Sync> {
+    // alloc: the registry, once a step that may be asked for
+    Box::new(Keyer::<S>(S::key))
+}
 
 /// The digest of a registry: every step's number, name and code, whether it may be asked
 /// for, whether its value is a table and whether it is maintained, in the order of the
@@ -744,13 +760,13 @@ impl<W: World + ?Sized> Kernel<W> {
 
     /// Registers `S` with its code. A second step of one number or one name is refused.
     pub fn register<S: Step>(&mut self, code: CodeId) -> Result<(), KernelError> {
-        self.enter::<S>(code, None, false, false, None)
+        self.enter::<S>(code, None, false, false, None, None)
     }
 
     /// Registers `C` with its code as a cover ([`Kernel::cover`], [`Kernel::seed`]): a step
     /// no step asks for and no carry looks up, whose value is the manifest of its members.
     pub fn register_cover<C: Step>(&mut self, code: CodeId) -> Result<(), KernelError> {
-        self.enter::<C>(code, None, true, false, None)
+        self.enter::<C>(code, None, true, false, None, None)
     }
 
     /// Whether the step a read of a step's value names (its number, then its input: what
@@ -765,13 +781,14 @@ impl<W: World + ?Sized> Kernel<W> {
     /// registry keeps how to look it up, run it and keep it from the bytes of its input, which
     /// is how a read of its value is answered at a later lookup.
     pub fn register_ask<S: Ask<World = W>>(&mut self, code: CodeId) -> Result<(), KernelError> {
-        self.enter::<S>(code, Some(Runner::of::<S>()), false, S::TABLE, None)
+        self.enter::<S>(code, Some(Runner::of::<S>()), false, S::TABLE, None, Some(keyer::<S>()))
     }
 
     /// Registers `S` as [`Kernel::register_ask`] does, and as a maintained step: a carry
     /// that repairs it runs [`Maintain::maintain`] from the entry the session had of it.
     pub fn register_maintain<S: Maintain<World = W>>(&mut self, code: CodeId) -> Result<(), KernelError> {
-        self.enter::<S>(code, Some(Runner::of::<S>()), false, S::TABLE, Some(nest::Maintainer::of::<S>()))
+        let maintain = Some(nest::Maintainer::of::<S>());
+        self.enter::<S>(code, Some(Runner::of::<S>()), false, S::TABLE, maintain, Some(keyer::<S>()))
     }
 
     /// The `maintain` of the step numbered `step`, where it is registered as maintained.
@@ -799,6 +816,7 @@ impl<W: World + ?Sized> Kernel<W> {
         cover: bool,
         table: bool,
         maintain: Option<nest::Maintainer<W>>,
+        keyer: Option<Box<dyn Any + Send + Sync>>,
     ) -> Result<(), KernelError> {
         if let Some(had) = self.steps.get(&S::ID) {
             return Err(KernelError::Twice { first: (S::ID, had.name), second: (S::ID, S::NAME) });
@@ -808,7 +826,7 @@ impl<W: World + ?Sized> Kernel<W> {
         }
         // alloc: the registry, once a step
         let registered =
-            Registered { name: S::NAME, code, type_id: TypeId::of::<S>(), asked, cover, table, maintain };
+            Registered { name: S::NAME, code, type_id: TypeId::of::<S>(), asked, cover, table, maintain, keyer };
         // alloc: the registry, once a step
         self.steps.insert(S::ID, registered);
         self.registry = registry_of(&self.steps);
@@ -904,7 +922,7 @@ impl<W: World + ?Sized> Kernel<W> {
         input: &S::Input,
         verify: &Setting,
     ) -> Result<Got<'s>, KernelError> {
-        self.get_at::<S, P>(&mut Session::new(world), store, world, input, verify)
+        Ok(self.get_at::<S, P>(&mut Session::new(world), store, world, input, verify)?.0)
     }
 
     /// [`Kernel::get`] in `session`: what the session verified under its pin is not looked up
@@ -912,6 +930,10 @@ impl<W: World + ?Sized> Kernel<W> {
     /// at the top before is one get, with no probe and no list read), and what this request
     /// verifies is the session's after it. `store` is the one store the session is of. A world
     /// that is not at the session's pin, before or after, is [`KernelError::Moved`].
+    ///
+    /// The value is the session's as any other it verified: where `S` may be asked for
+    /// ([`Kernel::register_ask`]), a carry that reaches it repairs it in place and cuts there
+    /// when its value is the same bytes, whether or not a step reads it (`Kernel::root`).
     pub fn get_in<'s, S: Compute<World = W>, P: Put + ?Sized>(
         &self,
         session: &mut Session,
@@ -921,10 +943,39 @@ impl<W: World + ?Sized> Kernel<W> {
         verify: &Setting,
     ) -> Result<Got<'s>, KernelError> {
         session.enter(world, self.registry)?;
-        self.get_at::<S, P>(session, store, world, input, verify)
+        let (got, row, hash) = self.get_at::<S, P>(session, store, world, input, verify)?;
+        self.root::<S>(session, row, input, hash);
+        Ok(got)
     }
 
-    /// A get in a session whose pin is the world's at the start.
+    /// Names the row `row` of `S` of `input`, a value a request asked for at the top, by the
+    /// key a read of its value names it by, and gives it its value's hash where the row has
+    /// none (`hash`, from the entry the request read): what a carry that reaches it looks it
+    /// up again by, and compares its value against, as it does a value a step read
+    /// ([`Kernel::carry`]). A row a step read is named already.
+    ///
+    /// Only a step that may be asked for has such a key (its input's bytes, [`Ask::key`]): a
+    /// value of any other step that no step reads is dropped when a carry reaches it
+    /// ([`Carried::gone`]), and looked up when it is next asked for.
+    fn root<S: Step>(&self, session: &mut Session, row: u32, input: &S::Input, hash: Option<ContentId>) {
+        if session.asked(row).is_none() {
+            let keyer = self.steps.get(&S::ID).and_then(|it| it.keyer.as_deref());
+            let Some(Keyer(key_of)) = keyer.and_then(|it| it.downcast_ref::<Keyer<S>>()) else {
+                return;
+            };
+            // alloc: one root's key, once its row
+            let mut key = Vec::new();
+            key_of(input, &mut key);
+            session.link(row, S::ID, &key);
+        }
+        if let Some(hash) = hash {
+            session.fill_hash(row, hash);
+        }
+    }
+
+    /// A get in a session whose pin is the world's at the start: the value, its row in the
+    /// session, and the hash of its value where the request has it with no work (an entry
+    /// with reads keeps it; a bare value's is made only for a parent that asked).
     fn get_at<'s, S: Compute<World = W>, P: Put + ?Sized>(
         &self,
         session: &mut Session,
@@ -932,7 +983,7 @@ impl<W: World + ?Sized> Kernel<W> {
         world: &W,
         input: &S::Input,
         verify: &Setting,
-    ) -> Result<Got<'s>, KernelError> {
+    ) -> Result<(Got<'s>, u32, Option<ContentId>), KernelError> {
         let identity = self.identity::<S>(input)?;
         let valued = {
             let mut lent = LentMut(&mut *store);
@@ -942,12 +993,14 @@ impl<W: World + ?Sized> Kernel<W> {
         // Before the answer, or the request's own error: a world that moved gives neither.
         session.leave(world)?;
         match valued? {
-            Some(Valued { key, how: How::Computed { value, reads }, .. }) => {
-                Ok(Got::Computed { key, value, reads })
+            Some(Valued { key, hash, how: How::Computed { value, reads }, row, .. }) => {
+                Ok((Got::Computed { key, value, reads }, row, hash))
             }
-            Some(Valued { key, how: How::Hit { .. }, .. }) => {
+            Some(Valued { key, hash, how: How::Hit { .. }, row, .. }) => {
                 let store: &'s P = store;
-                Ok(Got::Hit(read_entry::<S, P>(store, key, input, &identity)?))
+                let entry = read_entry::<S, P>(store, key, input, &identity)?;
+                let hash = hash.or_else(|| entry.kept_hash());
+                Ok((Got::Hit(entry), row, hash))
             }
             None => unreachable!("a get keeps, and what keeps finds a value or makes it"),
         }
@@ -961,8 +1014,13 @@ impl<W: World + ?Sized> Kernel<W> {
     ///
     /// - **Seed.** The entries with a read `changed` names ([`Changed`], total by kind of
     ///   read) are dropped from the session and queued, found through the postings their
-    ///   admission wrote. An entry no step has read is only dropped: it is looked up when it
-    ///   is next asked for.
+    ///   admission wrote.
+    /// - **Every reached entry with a key is repaired.** A value a step read, and one a request
+    ///   asked for at the top of a step that may be asked for ([`Kernel::get_in`]), is named
+    ///   by the key a read of it uses, so it is repaired in place and cut where its value is
+    ///   the same bytes, whether or not anything reads it. Only a value of a step that may not
+    ///   be asked for that no step read has no key: reached, it is dropped (`gone`) and looked
+    ///   up when it is next asked for.
     /// - **Repair, lowest first.** The lowest queued entry is looked up again by the kernel's
     ///   ordinary lookup at the new pin: an entry the store has for the reads as they are now
     ///   is a hit, else it is run and kept. Its value's hash is compared with the one its

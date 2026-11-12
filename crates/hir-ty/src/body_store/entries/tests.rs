@@ -45,13 +45,15 @@ use std::alloc::Global;
 use syntax::{Edition, Extensions};
 
 use super::{
-    BodyDelta, BodyKey, BodyWorld, BorrowckEntry, DROPPED, IDENTITY_NAME, Identities, InferEntry,
-    MirEntry, RUNS, always_dirty, bodies, borrowck_schema, def_of, reads, register, run_infer,
+    ANY_REVISION, BodyDelta, BodyKey, BodyWorld, BorrowckEntry, DROPPED, IDENTITY_NAME, Identities,
+    InferEntry, MirEntry, RUNS, always_dirty, bodies, borrowck_schema, def_of, reads, register,
+    run_infer, serve,
 };
 use crate::{
     InferenceResult,
     body_store::{
-        BodyFacts, Classified, Installed, Mode, Step, capture, infer, install, offer, offer_passed,
+        BodyFacts, Classified, Installed, Mode, Step, StepCounts, capture, infer, install,
+        lookup_passed, offer, offer_passed,
         tests::{BUILD, Memory as Images, OWN, is_impl_table, own, portable},
     },
     next_solver::{
@@ -122,8 +124,13 @@ fn impls(db: &Db) -> ContentId {
 /// portable form, whose header holds the text of the item's file: any edit of `leaf.rs`, a
 /// comment's too, gave every caller's answer other bytes than the entry had read, with no read
 /// of that file in its trace.)
+/// What [`EntryFacts::def_key`] gave each id it named, by its key: shared by two trees, so a
+/// second database decodes what the first encoded (the keys are a tag and the interned id's
+/// bits, equal in two fixture databases built alike).
+type Defs = Arc<Lock<HashMap<ContentId, (u8, PortableIds), Global>>>;
+
 struct EntryFacts {
-    defs: Lock<HashMap<ContentId, (u8, PortableIds), Global>>,
+    defs: Defs,
 }
 
 /// `def`'s id in its database, as its interned id's bits.
@@ -268,6 +275,7 @@ fn fake_borrowck(db: &Db, def: DefWithBodyId) -> bool {
 struct Tree {
     // Declared first: the store is uninstalled before the database drops.
     installed: Installed,
+    defs: Defs,
     fixture: Fixture,
     files: BTreeMap<String, String>,
     bodies: HashMap<(String, ItemId), DefWithBodyId, Global>,
@@ -276,14 +284,20 @@ struct Tree {
 
 impl Tree {
     fn new() -> Tree {
+        Tree::with_defs(Arc::new(Lock::new("test.ty.body_entries.defs", HashMap::default())))
+    }
+
+    /// A tree whose facts name ids through `defs`, as another tree's do.
+    fn with_defs(defs: Defs) -> Tree {
         let fixture = fixture::db(FIXTURE);
-        let facts = Arc::new(EntryFacts { defs: Lock::new("test.ty.body_entries.defs", HashMap::default()) });
+        // clone: a counted reference
+        let facts = Arc::new(EntryFacts { defs: defs.clone() });
         let installed = install(fixture.db(), Arc::new(Images::default()), facts, BUILD, Mode::Serve)
             .expect("an item store for the test database");
         // The fixture's files as the database has them; `edit` sets both.
         let files = BTreeMap::from([("leaf.rs".to_owned(), LEAF.to_owned()), ("main.rs".to_owned(), MAIN.to_owned())]);
         let mut tree =
-            Tree { installed, fixture, files, bodies: HashMap::new_in(Global), keys: Vec::new() };
+            Tree { installed, defs, fixture, files, bodies: HashMap::new_in(Global), keys: Vec::new() };
         tree.map();
         tree
     }
@@ -390,6 +404,15 @@ impl BodyWorld for Tree {
         }
     }
 
+    fn schema(&self, def: DefWithBodyId, step: Step) -> Result<SchemaHash, String> {
+        match step {
+            Step::Infer => Ok(infer::SCHEMA),
+            Step::Mir => Ok(MIR_SCHEMA),
+            Step::Borrowck => Ok(borrowck_schema(self.db(), def, CHECKER)),
+            Step::Const => Err(String::from("a constant's value has no body entry")),
+        }
+    }
+
     fn fact(&self, _: &str, fact: FactRef) -> Result<Seen, WorldError> {
         match fact {
             IMPLS => Ok(Seen::Is(impls(self.db()))),
@@ -428,10 +451,15 @@ impl Put for Memory {
 }
 
 fn kernel() -> Kernel<Tree> {
+    kernel_of(BUILD)
+}
+
+/// A kernel whose body entries are of the front end `build`.
+fn kernel_of(build: ContentId) -> Kernel<Tree> {
     let mut kernel = Kernel::new();
     kernel.register_ask::<Parse<Tree>>(CodeId(ContentId([61; 32]))).unwrap();
     kernel.register_ask::<Items<Tree>>(CodeId(ContentId([62; 32]))).unwrap();
-    register(&mut kernel, CodeId(BUILD)).unwrap();
+    register(&mut kernel, CodeId(build)).unwrap();
     kernel
 }
 
@@ -644,4 +672,135 @@ fn a_second_session_with_a_new_database_hits_every_entry() {
     let second = ask_all(&kernel, &mut session, &mut store, &tree);
     assert_eq!(runs(), [0; Step::COUNT], "no entry runs: each is the store's");
     differs(&second, &first).expect("every entry is the first session's");
+}
+
+/// Every body's three entries got in `session`, each served to the tree's database
+/// (`entries::serve`), as the driver serves every entry it gets.
+fn ask_and_serve(kernel: &Kernel<Tree>, session: &mut Session, store: &mut Memory, tree: &Tree) {
+    // clone: the test's keys, so the tree is lent whole
+    let keys = tree.keys.clone();
+    let off = &Setting::OFF;
+    for key in &keys {
+        let got = kernel.get_in::<InferEntry<Tree>, _>(session, store, tree, key, off).unwrap();
+        serve(tree, key, Step::Infer, &got).unwrap();
+        let got = kernel.get_in::<MirEntry<Tree>, _>(session, store, tree, key, off).unwrap();
+        serve(tree, key, Step::Mir, &got).unwrap();
+        let got = kernel.get_in::<BorrowckEntry<Tree>, _>(session, store, tree, key, off).unwrap();
+        serve(tree, key, Step::Borrowck, &got).unwrap();
+    }
+}
+
+/// A first session keeps every entry in a store; a second tree, with a new database and item
+/// store, gets them in a new session (each a hit, nothing run) and serves them; with
+/// `moved`, its database then moves to another revision (a comment edit, which changes no
+/// identity and no fact). Then each body's inference and borrow check is asked of the second
+/// database: what its item store counted of those, by step.
+fn answered_in_a_second_database(moved: bool) -> [StepCounts; Step::COUNT] {
+    let kernel = kernel();
+    let mut store = Memory::default();
+    let first = Tree::new();
+    {
+        let mut session = Session::new(&first);
+        ask_all(&kernel, &mut session, &mut store, &first);
+    }
+    // clone: a counted reference
+    let mut second = Tree::with_defs(first.defs.clone());
+    {
+        let mut session = Session::new(&second);
+        reset_runs();
+        ask_and_serve(&kernel, &mut session, &mut store, &second);
+        assert_eq!(runs(), [0; Step::COUNT], "no entry runs in the second session: each is the store's");
+    }
+    if moved {
+        second.edit("leaf.rs", &format!("{LEAF}// a comment\n"));
+    }
+    let db = second.db();
+    for &def in second.bodies.values() {
+        let _ = InferenceResult::of(db, def);
+        let _ = lookup_passed(db, def, CHECKER, || panic!("no store here verifies"));
+    }
+    second.installed.errors().expect("no served answer disagrees with the database");
+    let steps = second.installed.steps();
+    let flushed = second.installed.flush().unwrap();
+    assert_eq!(flushed.written, 0, "a served step offers nothing to the item store's flush: {flushed:?}");
+    steps
+}
+
+#[test]
+fn a_query_in_a_second_database_answers_from_the_kernels_entries_without_running() {
+    let steps = answered_in_a_second_database(false);
+    let bodies = 4;
+    assert_eq!(
+        steps[Step::Infer as usize],
+        StepCounts { hits: bodies, ran: 0, refused: 0 },
+        "each body's inference is the kernel's entry, with no inference run"
+    );
+    assert_eq!(steps[Step::Borrowck as usize].hits, bodies, "each borrow check is the kernel's entry");
+}
+
+/// The invariant: a served answer is the query's answer only at the revision it was posted
+/// at; at any other, the step runs. `Err` names the steps that answered from another
+/// revision's posts.
+fn served_only_at_its_revision() -> Result<(), String> {
+    let steps = answered_in_a_second_database(true);
+    let (infer, check) = (steps[Step::Infer as usize].hits, steps[Step::Borrowck as usize].hits);
+    match (infer, check) {
+        (0, 0) => Ok(()),
+        _ => Err(format!("{infer} inferences and {check} borrow checks answered at another revision")),
+    }
+}
+
+#[test]
+fn a_served_answer_is_used_only_at_the_revision_it_was_posted_at() {
+    served_only_at_its_revision().unwrap();
+}
+
+/// The control: a store that gives a served answer at any revision (`ANY_REVISION`) must be
+/// caught.
+#[test]
+fn the_oracle_catches_a_served_answer_used_at_another_revision() {
+    ANY_REVISION.with(|it| it.set(true));
+    let caught = served_only_at_its_revision();
+    ANY_REVISION.with(|it| it.set(false));
+    assert!(caught.is_err(), "the planted bug went unseen");
+}
+
+/// The served steps' lookup of the item store's own records is gone: the one record lookup
+/// left is a constant's value's (`Store::find_constant`).
+#[test]
+fn the_served_steps_have_no_lookup_of_the_item_stores_records() {
+    let source = include_str!("../../body_store.rs");
+    assert_eq!(source.matches("blaze_record::lookup(").count(), 1, "one record lookup");
+    let at = source.find("blaze_record::lookup(").unwrap();
+    let constant = source.find("fn find_constant(").expect("the constant's lookup");
+    let next = source[constant + 1..].find("\n    fn ").map_or(source.len(), |it| it + constant + 1);
+    assert!((constant..next).contains(&at), "the record lookup is the constant's");
+    for gone in ["fn find(", "self.find("] {
+        assert!(!source.contains(gone), "`{gone}` is deleted");
+    }
+}
+
+/// Rule 21, the solver's code: a body's entries kept by the front end before an edit of the
+/// solver's source (each front-end identity as blaze-engine's build script works it out,
+/// `blaze_codegen_code::FRONT_END`, the code the driver registers the entries with) miss in a
+/// kernel of the front end after it, and are found again by one of the front end that kept
+/// them.
+#[test]
+fn an_entry_kept_by_one_solver_misses_after_a_solver_source_edit() {
+    let (before, after) = blaze_codegen_code::fixture::front_end_around_a_solver_edit();
+    let (before, after) = (ContentId(before), ContentId(after));
+    assert_ne!(before, after, "an edit of the solver's source is another front-end identity");
+    let mut store = Memory::default();
+    {
+        let tree = Tree::new();
+        let mut session = Session::new(&tree);
+        ask_all(&kernel_of(before), &mut session, &mut store, &tree);
+    }
+    for (build, ran, what) in [(after, true, "the edited solver finds none"), (before, false, "the solver that kept them finds each")] {
+        let tree = Tree::new();
+        let mut session = Session::new(&tree);
+        reset_runs();
+        ask_all(&kernel_of(build), &mut session, &mut store, &tree);
+        assert_eq!(runs()[Step::Infer as usize] > 0, ran, "{what}: {:?}", runs());
+    }
 }

@@ -1,0 +1,14 @@
+{
+ "id": "relocated-checkout",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), main agent, int-1112",
+ "where": "crates/blaze-cargo/src/serve/job.rs Jobs::viewed, Jobs::open_locked",
+ "what": "An agent's request (no `cargo` targets) on a checkout whose first build wrote its lock files lost its checkout: the view opened again with the lock files has a root no head is at, so `viewed` named it an agent's view (`root: None`). That build kept no front end, no answer and posted no carry. 16 of serve::tests' 20 standing failures were this, since the sim's checkouts have no lock file; the suite had been blind to front-end reuse.",
+ "cost": "16 serve::tests red for days, read as noise; the carry driver's daemon tests failed on it",
+ "cause": "a checkout's identity was derived from a content id (which head is at this root) instead of carried from the request that named it",
+ "class": "identity derived by a reverse lookup on content, which breaks when the content moves under the same owner",
+ "prevention": "the job carries what its request named; a reverse lookup on a root id is only for a request that names nothing",
+ "workaround": "none",
+ "fix": "Job::relocated records each lock-written view's checkout; viewed reads it before the heads. Control: with the lookup off, a_build_lowers_into_the_front_end_its_last_build_stored and three others fail again.",
+ "state": "fixed"
+}

@@ -479,7 +479,7 @@ impl<S: Steps> Jobs<S> {
         let keying = span.in_scope(|| {
             tracing::info_span!(target: "blaze", "request certificate: the request's shape").entered()
         });
-        let viewed = Self::viewed(&self.setup, &mut self.roots, w, &work, opened, library);
+        let viewed = Self::viewed(&self.setup, &mut self.roots, w, &work, opened, &[], library);
         let (now, drawn) = (opened.view.root, drawn_id(&work));
         let shaped = shaped(&mut self.certify.tool, id, viewed, request, now, drawn, idle, span);
         drop(keying);
@@ -523,7 +523,7 @@ impl<S: Steps> Jobs<S> {
         let shaped = {
             let Some(job) = self.jobs.get(key_of(id)) else { return false };
             let (Some(request), [opened]) = (request_id(&job.work), job.views.as_slice()) else { return false };
-            let viewed = Self::viewed(&self.setup, &mut self.roots, w, &job.work, opened, library);
+            let viewed = Self::viewed(&self.setup, &mut self.roots, w, &job.work, opened, &job.relocated, library);
             let (now, drawn) = (opened.view.root, drawn_id(&job.work));
             shaped(&mut self.certify.tool, id, viewed, request, now, drawn, job.idle, span)
         };

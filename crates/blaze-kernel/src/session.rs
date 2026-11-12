@@ -994,6 +994,30 @@ impl Session {
         }
     }
 
+    /// Gives the live row `row` the hash of its value where it has none: for a value asked
+    /// for at the top, whose entry the request read anyway ([`crate::Kernel::get_in`]), so a
+    /// carry that reaches it compares its value now with this one.
+    pub(crate) fn fill_hash(&mut self, row: u32, hash: ContentId) {
+        let Some(live) = self.live_mut(row) else {
+            return;
+        };
+        if live.known.hash.is_none() {
+            live.known.hash = Some(hash);
+            self.touch(row);
+        }
+    }
+
+    /// A planted bug's row kept live as it was before the carry reached it, unrepaired.
+    #[cfg(test)]
+    pub(crate) fn keep_unrepaired(&mut self, row: u32, key: Key, hash: ContentId) {
+        let it = self.rows.get_index_mut(row as usize).expect("a queued row is a row").1;
+        let was = it.live.replace(Live { known: Known { key, hash: Some(hash), reads: Vec::new() }, height: 0 });
+        if was.is_none() {
+            self.live += 1;
+        }
+        self.touch(row);
+    }
+
     fn live_mut(&mut self, row: u32) -> Option<&mut Live> {
         self.rows.get_index_mut(row as usize)?.1.live.as_mut()
     }
@@ -1006,7 +1030,8 @@ impl Session {
     /// input `input` holds names: from then on the postings of that name are the row's
     /// readers, and a carry can look the row up again by the read's key. Called wherever a
     /// step is looked up or run for another (`nest::looked`, `nest::asked`), before its
-    /// reader is posted. Once a row: later calls find it said.
+    /// reader is posted, and for a value asked for at the top of a step that may be asked for
+    /// (`Kernel::root`), which then has no reader. Once a row: later calls find it said.
     pub(crate) fn link(&mut self, row: u32, step: StepId, input: &[u8]) {
         if self.rows[row as usize].name.is_some() {
             return;
@@ -1032,7 +1057,9 @@ impl Session {
         self.touch(row);
     }
 
-    /// The key a read of the value of `row` names it by, once a step read it.
+    /// The key a read of the value of `row` names it by, once a step read it or a request
+    /// asked for it at the top of a step that may be asked for ([`crate::Kernel::get_in`]):
+    /// what a carry that reaches the row looks it up again by. None for any other row.
     pub(crate) fn asked(&self, row: u32) -> Option<&[u8]> {
         let name = self.rows.get_index(row as usize)?.1.name?;
         let (name, _) = self.posts.get_index(name as usize)?;
@@ -1258,6 +1285,15 @@ impl Session {
             self.dirty(store, row, queue)?;
         }
         Ok(())
+    }
+
+    /// Whether the identity `id` is live in the session, its row read from `store` where it
+    /// is not in memory: for a check between requests, which leaves no node held.
+    #[cfg(test)]
+    pub(crate) fn holds<G: Get + ?Sized>(&mut self, store: &G, id: &ContentId) -> Result<bool, KernelError> {
+        let held = self.known(store, id)?.is_some();
+        self.nodes.clear();
+        Ok(held)
     }
 
     /// The root of the postings of `kind` in the store, as the last save left it.
@@ -1523,7 +1559,9 @@ pub struct Carried {
     pub changed: usize,
     /// Of those, the entries whose value is the same bytes: their readers stayed verified.
     pub cut: usize,
-    /// Entries dropped from the session: no step had read them (they are looked up when next
-    /// asked for), or they cannot be valued at the new pin.
+    /// Entries dropped from the session: they cannot be valued at the new pin, or they have no
+    /// key to be looked up again by (a value of a step that may not be asked for, which no
+    /// step read: [`crate::Kernel::get_in`]), or they were admitted through a cover. Each is
+    /// looked up when next asked for.
     pub gone: usize,
 }

@@ -22,6 +22,12 @@
 //! before its child shows; and its value says nothing of its fact, so a repair that comes to
 //! the same bytes (the cutoff) is common in scope.
 //!
+//! A value a get asks for at the top is often one no step reads: `Over(1)` always, `Mid(1)`
+//! and `Leaf(2)` until `Top` or `Mid(1)` asks for them. Each carry also checks that every such
+//! root of a step that may be asked for which the session held before the carry it holds
+//! after it (repaired in place, never dropped: [`Failure::Unrepaired`]); the oracle checks
+//! that what it holds is fresh. `Top` may not be asked for, so it is the root a carry drops.
+//!
 //! The bound: `16^4 = 65,536` sequences from each of two starts, each prefix checked: an empty
 //! store, and a store in which a session that is gone kept every value at the first world (so
 //! a sequence admits entries it finds, not only ones it makes: [`Did::Warm`]). Four steps hold
@@ -310,6 +316,23 @@ impl Exploring {
             }
             changed.differs(Read { kind: FACT, key: &[at as u8] });
         }
+        // The values a get asks for at the top whose steps may be asked for (`Top` may not):
+        // none reads `Over(1)`, and `Mid(1)` and `Leaf(2)` are read only once `Top` or `Mid(1)`
+        // asked for them, so each is often a root no step reads. Each the session holds
+        // before the carry it holds after it: a reached one is repaired in place, never
+        // dropped (every value here can be valued at any world).
+        let roots = [
+            ("Mid(1)", self.kernel.identity::<Mid>(&1).unwrap().id()),
+            ("Leaf(2)", self.kernel.identity::<Leaf>(&2).unwrap().id()),
+            ("Over(1)", self.kernel.identity::<Over>(&1).unwrap().id()),
+        ];
+        let mut held = [false; 3];
+        for (n, (_, id)) in roots.iter().enumerate() {
+            held[n] = self.session.holds(&self.store, id).map_err(|why| Failure::Kernel {
+                after: self.path.clone(),
+                why: why.to_string(),
+            })?;
+        }
         let carried = self.kernel.carry(
             &mut self.session,
             &mut self.store,
@@ -317,6 +340,17 @@ impl Exploring {
             &changed,
             &Setting::OFF,
         );
+        if let Ok(Carried { dropped: None, .. }) = carried {
+            for (n, (root, id)) in roots.iter().enumerate() {
+                let now = self.session.holds(&self.store, id).map_err(|why| Failure::Kernel {
+                    after: self.path.clone(),
+                    why: why.to_string(),
+                })?;
+                if held[n] && !now {
+                    return Err(Failure::Unrepaired { after: self.path.clone(), root: (*root).to_owned() });
+                }
+            }
+        }
         match carried {
             Ok(carried) => {
                 self.pinned = self.world.facts;
@@ -473,7 +507,8 @@ fn stale_after_a_carry(bug: Bug, start: Start) -> Vec<Did> {
 /// kernel, hit or computed, and a lookup straight after a get finds what it kept. The session
 /// is carried from pin to pin and never made again, so this is the carry's invariant too
 /// ([`Kernel::carry`]): every value a carried session gives is the fresh one, and so is every value of a session
-/// saved, dropped and opened again from the store at any step (rule 26). 65,536
+/// saved, dropped and opened again from the store at any step (rule 26), and a reached root
+/// that no step reads is repaired, not dropped. 65,536
 /// sequences a start, each prefix checked; some gets hit although a step under them ran
 /// again (early cutoff), and some carries stopped at an entry whose value came out the same.
 #[test]
@@ -527,8 +562,18 @@ fn an_absence_left_out_of_the_change_set_is_caught() {
     assert!(after.iter().any(|it| matches!(it, Did::Set(_, Some(_)))), "{after:?}");
 }
 
-/// The control of I3: a carry that repairs the highest entry first, and none twice, looks a
-/// parent up against a child that is still as it was.
+/// The control of the repair of a value no step reads: a carry that keeps such a row as it
+/// was, in place of looking it up again, gives it stale once its value changed (`Mid(1)`
+/// asked, fact 2 changed, `Mid(1)` asked again: three steps). The invariant's own check that
+/// a reached root is repaired, not dropped, holds under the bug (the row is live), so it is
+/// the oracle that catches it.
+#[test]
+fn a_root_kept_without_its_repair_is_caught() {
+    let after = stale_after_a_carry(Bug::RootKept, Start::Cold);
+    assert!(after.iter().any(|it| matches!(it, Did::Set(..))), "{after:?}");
+    assert!(after.iter().any(|it| matches!(it, Did::Get(1..))), "{after:?}");
+}
+
 /// The control of rule 26 for the session's records: a session opened from the store that
 /// reads no posting back (it "starts empty" of readers) is carried past an entry it holds.
 #[test]
@@ -538,6 +583,8 @@ fn a_session_opened_without_its_postings_is_caught() {
     assert!(after.iter().any(|it| matches!(it, Did::Set(..))), "{after:?}");
 }
 
+/// The control of I3: a carry that repairs the highest entry first, and none twice, looks a
+/// parent up against a child that is still as it was.
 #[test]
 fn a_parent_repaired_before_its_child_is_caught() {
     let after = stale_after_a_carry(Bug::ParentFirst, Start::Cold);

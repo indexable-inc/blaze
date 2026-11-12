@@ -579,48 +579,46 @@ fn a_change_that_leaves_a_value_the_same_stops_at_its_entry() {
     assert_eq!(cost, Cost { probes: 0, gets: 1, valued: 0 });
 }
 
-/// One fact of 240 changes and its leaf's value with it: the carry repairs the leaf and its
-/// group (the path), drops the whole (no step read it: it is looked up when asked for), and
-/// the next get of the whole runs it from 15 groups the session holds. The 239 other leaves
-/// and 14 other groups cost no read valued and no get of their own, in the carry or after:
-/// the bounds are of the path (16 leaves read by the group's run, 15 groups by the whole's),
-/// far under the 240 reads and hundreds of gets of looking every entry up again.
+/// One fact of 240 changes and its leaf's value with it: the carry repairs the path, the leaf,
+/// its group and the whole (which no step reads: it is repaired in place as a value read
+/// is, by the key `Kernel::get_in` named it by), and the whole is a session hit after it.
+/// The 239 other leaves and 14 other groups cost no read valued and no get of their own, in
+/// the carry or after: the bounds are of the path (16 leaves read by the group's run, 15
+/// groups by the whole's), far under the 240 reads and hundreds of gets of looking every
+/// entry up again.
 ///
-/// The carry's 26 gets: the leaf's 5 (as in the cutoff's test) and the group's 21: its
-/// lookup's 3 (its 16 leaves are session rows: no get), the 16 leaves' entries read for the
-/// run (the floor: a run reads its children's values), its keep's 2. The get of the whole
-/// after it is 19 gets and 1 probe the same way: its list, the probe of the entry its reads
-/// name now, slot 1; 15 groups' entries for the run; the keep's 2. So of 45 gets, 31 are the
-/// floor's and 14 are not (2 a lookup that could find a kept entry, 1 the end of a chain, 2
-/// the keep's, for each of three entries, less the top's probe in place of a get).
+/// The carry's 46 gets: the leaf's 5 (as in the cutoff's test), the group's 21 (its lookup's
+/// 3: its 16 leaves are session rows, no get; the 16 leaves' entries read for the run, the
+/// floor: a run reads its children's values; its keep's 2), and the whole's 20 the same way
+/// (its lookup's 3, 15 groups' entries for the run, the keep's 2). The get of the whole after
+/// it is its entry's one. So of 47 gets, 32 are the floor's and 15 are not (2 a lookup that
+/// could find a kept entry, 1 the end of a chain, 2 the keep's, for each of three entries).
+/// Before the carry repaired a root no step reads, it dropped the whole (`gone`), and the get
+/// after it ran it: the same 20 gets less a probe for a get, one carry later.
 #[test]
 fn a_change_costs_the_path_from_its_entry_to_the_top() {
     let mut built = built();
     let changed = built.set(37, 12);
     let (carried, cost) = built.carry(&changed);
     println!("path carry: {carried:?} {cost:?}");
-    assert_eq!(carried, Carried { seeded: 1, repaired: 2, changed: 2, gone: 1, ..NOTHING });
-    assert_eq!(cost, Cost { probes: 0, gets: 5 + (3 + 16 + 2), valued: 2 });
-    assert_eq!(built.session.len(), 255);
+    assert_eq!(carried, Carried { seeded: 1, repaired: 3, changed: 3, ..NOTHING });
+    assert_eq!(cost, Cost { probes: 0, gets: 5 + (3 + 16 + 2) + (3 + 15 + 2), valued: 2 });
+    assert_eq!(built.session.len(), 256);
     let (hit, value, cost) = built.whole();
     println!("path get of the top: {cost:?}");
-    assert!(!hit, "the whole reads a group whose value changed");
+    assert!(hit, "the carry repaired the whole");
     assert_eq!(value, built.fresh());
-    assert_eq!(cost, Cost { probes: 1, gets: 2 + 15 + 2, valued: 0 });
-    assert_eq!(built.session.len(), 256);
-    let (hit, _, cost) = built.whole();
-    assert!(hit);
     assert_eq!(cost, Cost { probes: 0, gets: 1, valued: 0 });
 }
 
 /// A kind with no exact difference: every entry with a read of it is looked up again, and
 /// the cutoff still holds for each one whose value is the same.
 ///
-/// 504 gets: each of the 239 leaves that come out the same is 2 (its read-list, and its
+/// 524 gets: each of the 239 leaves that come out the same is 2 (its read-list, and its
 /// entry for the hash its group saw: the same entry the row had, so that get is owed: a row
-/// that kept its key while queued would know the hash without it), the changed leaf 5 and
-/// its group 21 as on the path. 241 reads valued: one a leaf's lookup, and the changed
-/// leaf's run.
+/// that kept its key while queued would know the hash without it), the changed leaf 5, its
+/// group 21 and the whole 20 as on the path. 241 reads valued: one a leaf's lookup, and the
+/// changed leaf's run.
 #[test]
 fn a_kind_with_no_exact_difference_looks_up_every_entry_that_read_it() {
     let mut built = built();
@@ -630,10 +628,10 @@ fn a_kind_with_no_exact_difference_looks_up_every_entry_that_read_it() {
     changed.everything(TILE);
     let (carried, cost) = built.carry(&changed);
     let expected =
-        Carried { seeded: 240, repaired: 241, changed: 2, cut: 239, gone: 1, ..NOTHING };
+        Carried { seeded: 240, repaired: 242, changed: 3, cut: 239, ..NOTHING };
     println!("everything carry: {carried:?} {cost:?}");
     assert_eq!(carried, expected);
-    assert_eq!(cost, Cost { probes: 0, gets: 239 * 2 + 5 + 21, valued: 241 });
+    assert_eq!(cost, Cost { probes: 0, gets: 239 * 2 + 5 + 21 + 20, valued: 241 });
     let (_, value, _) = built.whole();
     assert_eq!(value, built.fresh());
 }
@@ -704,17 +702,18 @@ impl Compute for Bare2 {
 /// Rule 26, the restore: a session saved, dropped and opened again answers and carries as the
 /// one that was never saved: the same `Carried`, the same bytes, and the bytes of a fresh run.
 /// Opened, it holds nothing but its root; the carry reads the changed fact's posting and the
-/// rows on the path (and the rows of the 15 leaves its group's run asks for), never the
-/// session.
+/// rows on the path (and the rows of the 15 leaves its group's run asks for, and of the 14
+/// other groups the whole's run asks for), never the session.
 ///
-/// Its gets against the 26 of the session in memory (the floor of an opened one is those and
-/// one get for each record that holds something it needs): 21 rows and postings are looked for
-/// (the fact's posting, the leaf's row and posting, the group's row and posting, the whole's
-/// row, 15 leaves' rows), in three maps of a root and 16 leaves each. A node is read once a
-/// carry (`trie::Nodes`), so they cost the nodes they are in: 2 of the facts' postings, 2 or 3
-/// of the steps' postings, the rows' root and one leaf for each first nibble among 18
-/// identities. With leaves of 8 and every path read from its root (layout 1) it was 89: the
-/// 26 and 3 nodes for each of the 21.
+/// Its gets against the 46 of the session in memory (the floor of an opened one is those and
+/// one get for each record that holds something it needs): 36 rows and postings are looked for
+/// (the fact's posting, the leaf's, the group's and the whole's row and posting, 15 leaves'
+/// rows, 14 groups' rows), in three maps of a root and 16 leaves each. A node is read once a
+/// carry (`trie::Nodes`), so they cost the nodes they are in: 2 of the facts' postings, 2 to 4
+/// of the steps' postings, the rows' root and one leaf for each first nibble among 32
+/// identities. Before the carry repaired the whole (no step reads it), it was 26 and 17 nodes
+/// (18 rows, 2 or 3 of the steps' postings); with leaves of 8 and every path read from its
+/// root (layout 1) it was 89: the 26 and 3 nodes for each of the 21.
 #[test]
 fn a_session_opened_from_the_store_carries_as_the_one_that_was_saved() {
     let mut kept = built();
@@ -734,10 +733,11 @@ fn a_session_opened_from_the_store_carries_as_the_one_that_was_saved() {
     println!("path carry after open: {carried:?} {cost:?} held {:?}", built.session.held());
     assert_eq!(carried, carried_kept);
     assert_eq!((cost.probes, cost.valued), (0, 2), "{cost:?}");
-    // 17 nodes: 2 of the facts' postings, 2 or 3 of the steps', the rows' root, and the 11
-    // or 12 leaves the 18 rows are in (which of the two the nibbles of their hashes decide).
-    assert_eq!(cost.gets, 26 + 17, "{cost:?}");
-    assert_eq!(built.session.held().0, 18, "the leaves of one group, the group and the whole");
+    // 19 nodes past the 46 of the carry (measured on the Mac, 2026-11-12): 2 of the facts'
+    // postings, the steps' (the three names' leaves), the rows' root, and the leaves the 32
+    // rows are in, which the nibbles of their hashes decide.
+    assert_eq!(cost.gets, 46 + 19, "{cost:?}");
+    assert_eq!(built.session.held().0, 32, "the leaves of one group, the 15 groups and the whole");
     let (hit, value, _) = built.whole();
     assert_eq!((hit, &value), (hit_kept, &value_kept));
     assert_eq!(value, built.fresh());
@@ -750,20 +750,21 @@ fn a_session_opened_from_the_store_carries_as_the_one_that_was_saved() {
     assert!(hit);
     assert_eq!(value, built.fresh());
     assert_eq!(cost, Cost { probes: 0, gets: 2 + 1, valued: 0 }, "its row's root and leaf, its entry");
-    assert_eq!(built.session.held(), (1, 0));
+    assert_eq!(built.session.held(), (1, 1), "the whole's row, and the name it is asked by");
 }
 
-/// A save writes the paths of what changed, not the session: after a carry that repaired two
-/// entries and dropped the top, three rows differ (no posting does: their lists were posted),
+/// A save writes the paths of what changed, not the session: after a carry that repaired three
+/// entries, the top among them, three rows differ (no posting does: their lists were posted),
 /// so the rows' root, the three leaves they are in, and the root record: 5 records, which is
 /// the floor of a map kept as write-once records (a changed row is a new leaf, a new leaf a
 /// new root). Layout 1 wrote 8 (a branch more a row) and 537 for the whole.
 ///
 /// The disk floor (rule 67). Records: 52 for 256 entries, 0.2 an entry, beside the records
 /// of the entries themselves (printed below), so the session adds that share to the store's
-/// overhead a record. Bytes: the session's 73,642 against the entries' own 68,615 (287 and 268
+/// overhead a record. Bytes: the session's 73,721 against the entries' own 68,615 (287 and 268
 /// an entry): 107% of them, where the bar is a tenth; what is owed to bring them down is in
-/// kernel.md.
+/// kernel.md. The whole's name, by which a carry repairs it though no step reads it, is 79 of
+/// them: its posting (32 bytes of key, 41 of record) and 6 in its row.
 #[test]
 fn a_save_writes_the_paths_of_what_changed() {
     let mut built = built();
@@ -777,12 +778,12 @@ fn a_save_writes_the_paths_of_what_changed() {
         session / 256
     );
     // 268 bytes an entry of its own, 287 of the session: 107%, where the bar is 10%.
-    assert_eq!((own, session), (68_615, 73_642));
+    assert_eq!((own, session), (68_615, 73_721));
     assert_eq!(built.store.values.len(), 512 + 52, "an entry is two records: its list and itself");
     let changed = built.set(37, 12);
     built.carry(&changed);
     let (next, written) = built.save();
-    println!("save: {whole} records for 256 entries, {written} after a carry that repaired 2");
+    println!("save: {whole} records for 256 entries, {written} after a carry that repaired 3");
     assert_ne!(next, root);
     assert_eq!((whole, written), (3 * 17 + 1, 1 + 3 + 1));
 }

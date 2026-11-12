@@ -12,6 +12,7 @@ use blaze_alloc_count::{assert_at_most, measure};
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher};
+use blaze_kernel::Seen;
 use blaze_query::QueryKind;
 use blaze_query::db::{Database as _, Durability, SealNotWhole, Setter};
 use hir_def::{
@@ -38,7 +39,7 @@ use crate::{
     InferenceResult,
     next_solver::{
         SolverDefId,
-        goal_store::{FactObject, FactRef, solver_version},
+        goal_store::{FactObject, FactRef},
     },
 };
 
@@ -117,11 +118,92 @@ const BODIES: [&str; 4] = ["uses_show", "plain", "seven", "closures"];
 /// A store in memory, which refuses a second put of a key with other bytes as the store does.
 pub(super) struct Memory {
     images: Lock<HashMap<ContentId, Arc<Aligned>, Global>>,
+    /// The served steps' entries the kernel keeps beside the store ([`kept_by_the_kernel`]).
+    entries: Lock<Vec<Kept>>,
 }
 
 impl Default for Memory {
     fn default() -> Memory {
-        Memory { images: Lock::new("test.ty.body_store.memory", HashMap::default()) }
+        Memory {
+            images: Lock::new("test.ty.body_store.memory", HashMap::default()),
+            entries: Lock::new("test.ty.body_store.entries", Vec::new()),
+        }
+    }
+}
+
+/// A served step of a body of `main`, by its function's name, as its kernel entry keeps it:
+/// the identity and the facts its run read, with what each was, and its answer.
+pub(super) struct Kept {
+    name: Name,
+    step: Step,
+    schema: blaze_format::SchemaHash,
+    identity: ContentId,
+    facts: Box<[(FactRef, Seen)]>,
+    answer: Arc<[u8]>,
+}
+
+/// What the kernel's body entries keep of `first`'s runs of the served steps, put beside
+/// `memory`: each run's trace the item store kept (what an entry's run reads,
+/// `entries::compute`), with the identity and facts as `first` has them. [`session`] posts to
+/// each new database what the kernel's lookup gives there: each entry whose identity and
+/// facts are the same in it ([`served_by_the_kernel`]). The kernel itself, over a world of
+/// syntax, is driven in `entries::tests`; this is its verdict for these tests' databases,
+/// which have no syntax world.
+pub(super) fn kept_by_the_kernel(first: &Session, memory: &Memory) {
+    let db = &first.db;
+    let traces: Vec<_> = super::with_store(db, |store| {
+        store.traces.lock().iter().map(|(&key, ran)| (key, ran.clone())).collect()
+    })
+    .expect("the first database's item store");
+    for ((def, step, schema), ran) in traces {
+        let (DefWithBodyId::FunctionId(f), super::entries::Ran::Kept { facts, answer }) = (def, &*ran) else {
+            continue;
+        };
+        if !step.served() {
+            continue;
+        }
+        let Some(identity) = first.facts.identity(db, def) else { continue };
+        let facts = facts
+            .iter()
+            .map(|&fact| (fact, first.facts.value(db, def, fact).map_or(Seen::Gone, Seen::Is)))
+            .collect();
+        memory.entries.lock().push(Kept {
+            name: FunctionSignature::of(db, f).name.clone(),
+            step,
+            schema,
+            identity,
+            facts,
+            answer: answer[..].into(),
+        });
+    }
+}
+
+/// Posts to `s`'s database, at its revision now, each entry beside `memory` the kernel's
+/// lookup verifies there: its body's identity and each fact it read are what they were.
+fn served_by_the_kernel(s: &Session, memory: &Memory) {
+    let db = &s.db;
+    let (_, revision) = db.nonce_and_revision();
+    let main = crate_named(db, "main");
+    for kept in memory.entries.lock().iter() {
+        let Some(def) = crate_body_owners(db, main).into_iter().find(|def| {
+            matches!(def, DefWithBodyId::FunctionId(it) if FunctionSignature::of(db, *it).name == kept.name)
+        }) else {
+            continue;
+        };
+        let same = s.facts.identity(db, def) == Some(kept.identity)
+            && kept.facts.iter().all(|&(fact, seen)| s.facts.value(db, def, fact).map_or(Seen::Gone, Seen::Is) == seen);
+        if !same {
+            continue;
+        }
+        let served = super::entries::Served {
+            revision,
+            identity: kept.identity,
+            facts: kept.facts.clone(),
+            children: Box::new([]),
+            answer: kept.answer.clone(),
+        };
+        super::with_store(db, |store| store.served.lock().post(def, kept.step, kept.schema, served))
+            .expect("the database's item store");
     }
 }
 
@@ -344,7 +426,9 @@ pub(super) fn session(
 ) -> Session {
     let facts = Arc::new(TestFacts::new(&db, defs, refuse));
     let installed = install(&db, memory.clone(), facts.clone(), BUILD, mode).unwrap();
-    Session { installed, facts, db }
+    let s = Session { installed, facts, db };
+    served_by_the_kernel(&s, memory);
+    s
 }
 
 /// [`Flushed::steps`] with `counts` for `step` and none for the others.
@@ -392,16 +476,18 @@ fn stored(mode: Mode) -> (Arc<Memory>, Defs, HashMap<&'static str, Vec<u8>, Glob
         let def = function(&first.db, name);
         forms.insert(name, stable(&first.db, &first.facts, def));
     }
+    kept_by_the_kernel(&first, &memory);
     let flushed = first.installed.flush().unwrap();
-    assert_eq!(flushed.written, BODIES.len(), "each body's inference is written: {flushed:?}");
+    assert_eq!(flushed.written, 0, "a served step's record is the kernel's entry: {flushed:?}");
     let ran = StepCounts { ran: BODIES.len() as u64, ..StepCounts::default() };
     assert_eq!(flushed.steps, only(Step::Infer, ran), "each body missed and ran");
-    // What `blaze_record` counted of those misses: a lookup a body, of an empty store, so no
-    // shape was read and no fact valued; and no other step was looked up.
-    let mut looked = [blaze_record::Counts::default(); Step::COUNT];
-    looked[Step::Infer as usize].lookups = BODIES.len() as u64;
-    assert_eq!(flushed.lookups, looked, "each body's lookup is counted, under its step");
-    assert_eq!(memory.len(), 2 * BODIES.len(), "a shape and an answer each");
+    assert_eq!(
+        flushed.lookups,
+        [blaze_record::Counts::default(); Step::COUNT],
+        "a served step searches none of the item store's records"
+    );
+    assert_eq!(memory.len(), 0, "nothing is filed in the item store's records");
+    assert_eq!(memory.entries.lock().len(), BODIES.len(), "an entry each");
     assert_eq!(
         first.installed.flush().unwrap(),
         Flushed::default(),
@@ -410,38 +496,55 @@ fn stored(mode: Mode) -> (Arc<Memory>, Defs, HashMap<&'static str, Vec<u8>, Glob
     (memory, defs, forms)
 }
 
-/// Where `def`'s inference answer is in `memory`, from its shape in slot 0: its store key, its
-/// answer key and the step's bytes.
-fn answer_of(memory: &Memory, s: &Session, def: DefWithBodyId) -> (ContentId, ContentId, Vec<u8>) {
-    let identity = s.facts.identity(&s.db, def).expect("a module's function has an identity");
-    let base = record::base_key(&identity, Step::Infer, &infer::SCHEMA, &solver_version(&BUILD));
-    let shape_key = record::shape_key(&base, 0);
-    let held =
-        memory.get(&record::shape_at(Step::Infer, &shape_key)).unwrap().expect("a shape in slot 0");
-    let shape = ShapeRef::open(held.bytes(), &base).unwrap();
-    // An answer is under its shape's bytes, wherever in the chain the shape is.
-    let mut key = AnswerKey::new(held.bytes());
-    for fact in shape.facts() {
-        key.value(Digest::Is(s.facts.value(&s.db, def, fact).unwrap()));
+impl Memory {
+    /// `f` of the kernel's entry of `step` of the function `name`, under `schema` where it is
+    /// given (a body's MIR and its closure's are two).
+    fn kept<R>(
+        &self,
+        name: &str,
+        step: Step,
+        schema: Option<blaze_format::SchemaHash>,
+        f: impl FnOnce(&mut Kept) -> R,
+    ) -> R {
+        let mut entries = self.entries.lock();
+        let kept = entries
+            .iter_mut()
+            .find(|it| {
+                it.name == Name::new_root(name) && it.step == step && schema.is_none_or(|schema| it.schema == schema)
+            })
+            .unwrap_or_else(|| panic!("no entry of the {step:?} of `{name}`"));
+        f(kept)
     }
-    let answer_key = key.finish();
-    let at = record::answer_at(Step::Infer, &answer_key);
-    let answer = memory.get(&at).unwrap().expect("an answer under its shape's facts");
-    let body = record::open_answer(answer.bytes(), &answer_key).unwrap().to_vec();
-    (at, answer_key, body)
-}
 
-/// The facts the shape of `def`'s inference in slot 0 lists.
-fn shape_facts(memory: &Memory, s: &Session, def: DefWithBodyId) -> Vec<FactRef> {
-    let identity = s.facts.identity(&s.db, def).unwrap();
-    let base = record::base_key(&identity, Step::Infer, &infer::SCHEMA, &solver_version(&BUILD));
-    let shape_key = record::shape_key(&base, 0);
-    let shape =
-        memory.get(&record::shape_at(Step::Infer, &shape_key)).unwrap().expect("a shape in slot 0");
-    let shape = ShapeRef::open(shape.bytes(), &base).unwrap();
-    let facts: Vec<FactRef> = shape.facts().collect();
-    assert_eq!(facts.len(), shape.len());
-    facts
+    /// The answer of the kernel's entry of `step` of the function `name`.
+    pub(super) fn answer(&self, name: &str, step: Step) -> Vec<u8> {
+        self.kept(name, step, None, |it| it.answer.to_vec())
+    }
+
+    /// The answer of its entry under `schema`.
+    pub(super) fn answer_under(&self, name: &str, step: Step, schema: blaze_format::SchemaHash) -> Vec<u8> {
+        self.kept(name, step, Some(schema), |it| it.answer.to_vec())
+    }
+
+    /// The facts the run that made it read.
+    pub(super) fn facts(&self, name: &str, step: Step) -> Vec<FactRef> {
+        self.kept(name, step, None, |it| it.facts.iter().map(|&(fact, _)| fact).collect())
+    }
+
+    /// Makes its answer `bytes`: an entry whose answer does not decode, or another body's.
+    pub(super) fn set_answer(&self, name: &str, step: Step, bytes: &[u8]) {
+        self.kept(name, step, None, |it| it.answer = bytes.into());
+    }
+
+    /// Makes its answer under `schema` `bytes`.
+    pub(super) fn set_answer_under(&self, name: &str, step: Step, schema: blaze_format::SchemaHash, bytes: &[u8]) {
+        self.kept(name, step, Some(schema), |it| it.answer = bytes.into());
+    }
+
+    /// How many entries the kernel keeps beside the store.
+    pub(super) fn entries(&self) -> usize {
+        self.entries.lock().len()
+    }
 }
 
 #[test]
@@ -523,17 +626,7 @@ fn a_stored_inference_is_read_in_a_fresh_database_without_inferring() {
     let hits = only(Step::Infer, StepCounts { hits: BODIES.len() as u64, ..StepCounts::default() });
     assert_eq!(fresh.installed.steps(), hits, "this build's counts, before the flush");
     let flushed = fresh.installed.flush().unwrap();
-    // What `blaze_record` counted of the hits: a lookup and a hit a body, each of at least its
-    // own shape, under inference alone.
-    let looked = flushed.lookups[Step::Infer as usize];
-    let bodies = BODIES.len() as u64;
-    assert_eq!((looked.lookups, looked.hits), (bodies, bodies), "{looked:?}");
-    assert!(looked.lists >= bodies, "a hit read the shape it was found by: {looked:?}");
-    let mut alone = [blaze_record::Counts::default(); Step::COUNT];
-    alone[Step::Infer as usize] = looked;
-    assert_eq!(flushed.lookups, alone, "no other step was looked up");
-    let flushed = without_lookups(flushed);
-    assert_eq!(flushed, Flushed { steps: hits, ..Flushed::default() }, "a hit offers nothing");
+    assert_eq!(flushed, Flushed { steps: hits, ..Flushed::default() }, "a hit searches no record and offers nothing");
     assert_eq!(
         fresh.installed.steps(),
         [StepCounts::default(); Step::COUNT],
@@ -552,7 +645,7 @@ fn a_changed_body_misses_and_the_others_hit() {
     let _ = InferenceResult::of(&fresh.db, function(&fresh.db, "seven"));
     assert_eq!(ran(), 1, "the changed body is inferred");
     let flushed = fresh.installed.flush().unwrap();
-    assert_eq!(flushed.written, 1, "the changed body is offered and written: {flushed:?}");
+    assert_eq!(flushed.written, 0, "a served step's record is the kernel's entry: {flushed:?}");
     assert_eq!(flushed.steps, only(Step::Infer, StepCounts { hits: 1, ran: 1, refused: 0 }));
 }
 
@@ -573,8 +666,8 @@ fn an_added_impl_misses_only_where_the_shape_lists_the_impls() {
         );
         let plain = names(function(&first.db, "plain"));
         assert!(!plain.iter().any(|it| is_impl_table(it)), "an empty body reads none: {plain:?}");
-        assert_eq!(shape_facts(&memory, &first, function(&first.db, "uses_show")), [IMPLS]);
-        assert!(shape_facts(&memory, &first, function(&first.db, "plain")).is_empty());
+        assert_eq!(memory.facts("uses_show", Step::Infer), [IMPLS]);
+        assert!(memory.facts("plain", Step::Infer).is_empty());
     }
     let fixture = format!("{FIXTURE}{ADDED_IMPL}");
     let fresh = session(second(&fixture), &memory, &defs, None, Mode::Serve);
@@ -584,9 +677,8 @@ fn an_added_impl_misses_only_where_the_shape_lists_the_impls() {
     let _ = InferenceResult::of(&fresh.db, function(&fresh.db, "uses_show"));
     assert_eq!(ran(), 1, "a body whose shape lists the impls misses");
     let flushed = fresh.installed.flush().unwrap();
-    assert_eq!(flushed.written, 1, "the same shape, a second answer: {flushed:?}");
+    assert_eq!(flushed.written, 0, "a served step's record is the kernel's entry: {flushed:?}");
     assert_eq!(flushed.steps, only(Step::Infer, StepCounts { hits: 1, ran: 1, refused: 0 }));
-    assert_eq!(memory.len(), 2 * BODIES.len() + 1);
 }
 
 #[test]
@@ -607,20 +699,13 @@ fn a_refused_read_is_tallied_by_name_and_nothing_is_stored() {
 }
 
 #[test]
-fn a_corrupt_record_is_an_error_naming_the_body() {
+fn a_served_answer_that_does_not_decode_is_an_error_naming_the_body() {
     let (memory, defs, forms) = stored(Mode::Serve);
-    let probe = session(db_of(FIXTURE), &Arc::new(Memory::default()), &defs, None, Mode::Serve);
-    let (at, answer_key, _) = answer_of(&memory, &probe, function(&probe.db, "seven"));
-    drop(probe);
-
     for (bad, why) in [
-        (
-            record::write_answer(&answer_key, b"not an inference answer"),
-            "a body that does not decode",
-        ),
-        (record::write_answer(&ContentId([9; 32]), b""), "an answer under another key"),
+        (&b"not an inference answer"[..], "a body that does not decode"),
+        (&b""[..], "an empty answer"),
     ] {
-        memory.set(at, &bad);
+        memory.set_answer("seven", Step::Infer, bad);
         let fresh = session(second(FIXTURE), &memory, &defs, None, Mode::Serve);
         let seven = function(&fresh.db, "seven");
         reset_ran();
@@ -652,11 +737,8 @@ fn verify_runs_every_hit_and_a_difference_is_an_error_naming_the_body() {
     );
     drop(same);
 
-    let probe = session(db_of(FIXTURE), &Arc::new(Memory::default()), &defs, None, Mode::Serve);
-    let (at, plain_key, _) = answer_of(&memory, &probe, function(&probe.db, "plain"));
-    let (_, _, seven) = answer_of(&memory, &probe, function(&probe.db, "seven"));
-    drop(probe);
-    memory.set(at, &record::write_answer(&plain_key, &seven));
+    let seven = memory.answer("seven", Step::Infer);
+    memory.set_answer("plain", Step::Infer, &seven);
     let wrong = session(second(FIXTURE), &memory, &defs, None, Mode::Verify);
     let plain = function(&wrong.db, "plain");
     let _ = InferenceResult::of(&wrong.db, plain);
@@ -709,7 +791,8 @@ fn only_a_passing_borrow_check_is_stored() {
 
     verdict.set_passes(&mut first.db).to(true);
     assert!(borrow_checked(&first.db, verdict));
-    assert_eq!(first.installed.flush().unwrap().written, 1);
+    kept_by_the_kernel(&first, &memory);
+    assert_eq!(first.installed.flush().unwrap().written, 0, "the pass is the kernel's entry");
     drop(first);
 
     let fresh = session(second(FIXTURE), &memory, &defs, None, Mode::Serve);
@@ -801,7 +884,7 @@ fn a_hit_allocates_only_the_decoded_result_and_no_store_allocates_nothing() {
         // Warm: the thread's `blaze_reclaim` slot, the identity, the facts' values and the types
         // the result interns.
         assert!(matches!(lookup_inference(&fresh.db, def), Lookup::Hit { .. }));
-        let (_, _, body) = answer_of(&memory, &fresh, def);
+        let body = memory.answer(name, Step::Infer);
         let (decoded, decoding) =
             measure(|| infer::decode(&fresh.db, &*fresh.facts, def, &Aligned::copy_from(&body)));
         drop(decoded.unwrap());
@@ -829,44 +912,6 @@ fn a_hit_allocates_only_the_decoded_result_and_no_store_allocates_nothing() {
     assert!(!assert_at_most(0, "a borrow check lookup with no store for the database", || {
         lookup_passed(&without, def, CHECKER, || true)
     }));
-}
-
-/// Rule 21, the solver's code: an item kept by the solver before an edit of its source (each
-/// front-end identity as blaze-engine's build script works it out and its main hands it over,
-/// `blaze_codegen_code::FRONT_END`) misses in the item store of the solver after it, and is found
-/// again by the one that kept it.
-#[test]
-fn an_item_kept_by_one_solver_misses_after_a_solver_source_edit() {
-    let (before, after) = blaze_codegen_code::fixture::front_end_around_a_solver_edit();
-    let (before, after) = (ContentId(before), ContentId(after));
-    assert_ne!(before, after, "an edit of the solver's source is another front-end identity");
-    let memory = Arc::new(Memory::default());
-    let defs = Defs::default();
-    let with = |db: Db, build: ContentId| {
-        let facts = Arc::new(TestFacts::new(&db, &defs, None));
-        let installed = install(&db, memory.clone(), facts.clone(), build, Mode::Serve).unwrap();
-        Session { installed, facts, db }
-    };
-    let first = with(db_of(FIXTURE), before);
-    for name in BODIES {
-        let _ = InferenceResult::of(&first.db, function(&first.db, name));
-    }
-    assert_eq!(
-        first.installed.flush().unwrap().written,
-        BODIES.len(),
-        "each body's inference is kept"
-    );
-    drop(first);
-    for (build, hits, what) in [
-        (after, 0, "the edited solver finds none"),
-        (before, BODIES.len(), "the solver that kept them finds each"),
-    ] {
-        let s = with(second(FIXTURE), build);
-        for name in BODIES {
-            let _ = InferenceResult::of(&s.db, function(&s.db, name));
-        }
-        assert_eq!(s.installed.steps()[Step::Infer as usize].hits, hits as u64, "{what}");
-    }
 }
 
 /// A store that shows a put only once its driver made it, as the daemon's does (blaze-cargo

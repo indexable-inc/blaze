@@ -222,7 +222,7 @@ pub(crate) struct Valued {
     pub hash: Option<ContentId>,
     pub how: How,
     /// Its row in the session.
-    row: u32,
+    pub row: u32,
     /// Its reads' names and what each saw: read only by a planted bug's control.
     #[cfg(test)]
     reads: Vec<(Vec<u8>, Seen)>,
@@ -1360,9 +1360,11 @@ pub(crate) fn carry<W: World + ?Sized>(
                 return Ok(carried);
             }
         };
-        // Only a value a step read is looked up here: it has the hash its readers saw, and
-        // the key they name it by. Any other has no reader to tell: dropped, it is looked up
-        // when it is next asked for.
+        // A value a step read, or one asked for at the top of a step that may be asked for
+        // (`Kernel::root`), has the key a read of it names it by and the hash its value had:
+        // it is looked up again here, and cut where its value is the same, whether or not
+        // anything reads it. Any other (a step that may not be asked for, which no step read)
+        // has no key: dropped, it is looked up when it is next asked for.
         // alloc: one repair's key, apart from the session its lookup writes in
         let key = session.asked(row).map(<[u8]>::to_vec);
         // A cover is never looked up by a carry (to run one is to ask for every member): it
@@ -1384,6 +1386,21 @@ pub(crate) fn carry<W: World + ?Sized>(
             }
             continue;
         };
+        #[cfg(test)]
+        {
+            if planted::is(planted::Bug::RootKept) && !session.is_live(row) {
+                // A row no step reads is kept as it was, unrepaired: stale where it changed.
+                if let Err(error) = session.load_readers(&*store, row) {
+                    session.clear();
+                    return Err(error);
+                }
+                if session.reader(row, 0).is_none() {
+                    session.keep_unrepaired(row, was_key, was);
+                    carried.cut += 1;
+                    continue;
+                }
+            }
+        }
         // A lookup since it was queued may have asked for it, and so repaired it.
         if !session.is_live(row) {
             carried.repaired += 1;
@@ -1619,6 +1636,9 @@ pub(crate) mod planted {
         /// A session opened from the store reads no posting back: a name's readers are only
         /// those posted since it was opened (rule 26: a restore never silently starts empty).
         OpenUnposted,
+        /// A carry keeps a reached row that no step reads (a value asked for at the top) as
+        /// it was, unrepaired, in place of looking it up again.
+        RootKept,
     }
 
     thread_local! {

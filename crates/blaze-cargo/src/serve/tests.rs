@@ -65,6 +65,10 @@ fn name(it: &str) -> FileName {
 }
 
 thread_local! {
+    /// The crates the fakes' writer gives the front end's carry ([`Writer::view_crates`]):
+    /// none but for a test of the carry.
+    static CARRY_CRATES: std::cell::RefCell<Vec<crate::serve::front_carry::CrateRoot>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// How many times the load ran on this thread (tasks run inline, on the test's).
     static PLANS: Cell<usize> = const { Cell::new(0) };
     /// The configuration of each run of the load.
@@ -838,6 +842,12 @@ impl Writer<Fake> for FakeWriter {
         }
     }
 
+    /// The fake lowers no crates: the front-end carry has none of its builds, but for a
+    /// test that names some ([`CARRY_CRATES`]).
+    fn view_crates(&self) -> Result<Vec<crate::serve::front_carry::CrateRoot>, String> {
+        Ok(CARRY_CRATES.with_borrow(Clone::clone))
+    }
+
     fn keep(mut self) -> Result<FakeInputs, ApiError> {
         if !self.apply()? {
             return Err(ApiError::new(
@@ -1238,11 +1248,6 @@ impl Front<Fake> for FakeFront {
             links: Vec::new(),
             misses: Vec::new(),
         }))
-    }
-
-    /// The fake lowers no crates: the front-end carry has none of its builds.
-    fn view_crates(&self) -> Result<Vec<crate::serve::front_carry::CrateRoot>, String> {
-        Ok(Vec::new())
     }
 
     fn refused(&self, _: usize, what: String) -> Diagnostic {
@@ -4966,3 +4971,77 @@ fn command_env() -> Vec<(String, String)> {
 
 mod ahead;
 mod giving;
+
+/// The checkout's one crate as the front end's carry is given it: rooted at `src/main.rs` of
+/// the view's tree.
+fn carry_crates() -> Vec<crate::serve::front_carry::CrateRoot> {
+    vec![crate::serve::front_carry::CrateRoot::new(
+        "w w bin",
+        "src/main.rs".to_owned(),
+        syntax::Edition::CURRENT,
+        cfg::CfgOptions::default(),
+        syntax::Extensions::NONE,
+    )]
+}
+
+/// A check of the head of `/w`, ok, and the daemon turned until it settles: the carry's pass,
+/// posted at the build's end, has run.
+fn check_settled(client: &mut Client, daemon: &mut SimDaemon) {
+    let id = client.send(daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
+    assert_eq!(client.wait(daemon, id).last(), Some(&Response::Done { ok: true }));
+    turn_until(daemon, |it| it.settled());
+}
+
+/// The front end's carry runs on a task of its own, never the loop (rule 14): over a seed
+/// and a carried edit, every read of the carry's world is the task's, none the loop's.
+#[test]
+fn the_loop_runs_no_front_end_step_of_the_carry() {
+    CARRY_CRATES.set(carry_crates());
+    let mut sim = Sim::new(33, Faults::default());
+    checkout(&mut sim, "[package]\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 33);
+    let mut client = dial(&mut daemon);
+    check_settled(&mut client, &mut daemon);
+    daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 1; }\n");
+    check_settled(&mut client, &mut daemon);
+    let built = crate::serve::front_carry::sim::take_built();
+    assert_eq!(built.iter().map(|it| it.first).collect::<Vec<_>>(), [true, false], "a seed, then a carry");
+    assert!(built[0].files > 0, "the crate's root is in the view's tree: {built:?}");
+    let (on_loop, on_task) = crate::serve::front_carry::sim::reads();
+    assert_eq!(on_loop, 0, "no read of the carry's world on the loop");
+    assert!(on_task > 0, "the carry's task read its world");
+}
+
+/// The session survives a restart (rule 26): seeded, carried over an edit, the daemon stopped
+/// (its image names the session), started again, the edit undone and built. The restarted
+/// daemon opens the image's session and carries it from that root, with the counts an edit of
+/// that shape carries, rather than seeding; and none of it runs on the loop.
+#[test]
+fn a_restarted_daemon_carries_from_its_image() {
+    CARRY_CRATES.set(carry_crates());
+    let mut sim = Sim::new(34, Faults::default());
+    checkout(&mut sim, "[package]\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 34);
+    let mut client = dial(&mut daemon);
+    check_settled(&mut client, &mut daemon);
+    daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 1; }\n");
+    check_settled(&mut client, &mut daemon);
+    let before = crate::serve::front_carry::sim::take_built();
+    assert_eq!(before.len(), 2, "a seed, then a carry: {before:?}");
+    assert!(before[0].files > 0, "the crate's root is in the view's tree: {before:?}");
+
+    let mut daemon = restart(daemon, &steps, 35);
+    assert_eq!(daemon.started().carries, None, "the image's sessions were used");
+    let mut client = dial(&mut daemon);
+    daemon.driver().change(&name("w/src/main.rs"), b"fn main() {}\n");
+    check_settled(&mut client, &mut daemon);
+    let after = crate::serve::front_carry::sim::take_built();
+    assert_eq!(after.len(), 1, "one pass: {after:?}");
+    assert!(!after[0].first, "the restarted daemon opened the image's session, not a seed");
+    assert_eq!(after[0].paths, 1, "carried from the root the image's session is pinned at");
+    assert_eq!(after[0].carried, before[1].carried, "an edit of the same shape carries the same");
+    assert_eq!(after[0].files, before[1].files, "and holds the same roots");
+    assert_eq!(crate::serve::front_carry::sim::reads().0, 0, "no read of the carry's world on the loop");
+}

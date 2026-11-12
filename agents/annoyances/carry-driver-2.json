@@ -9,6 +9,6 @@
  "class": "a semantic of a core API stated only where it is implemented, not on the entry point callers read (`Kernel::carry`, `Carried::gone`)",
  "prevention": "`Kernel::carry`'s and `Carried::gone`'s docs say a reached root with no reader is dropped and must be asked again",
  "workaround": "the driver asks each edited file's `items` and `lines` again after the carry (`Built::ran` counts the reruns)",
- "fix": "none yet: a doc line on `Kernel::carry`, or the kernel repairing readerless roots under their own key",
- "state": "open"
+ "fix": "built by lane kernel-roots (claude-fable-5-2, 2026-11-12): `Kernel::get_in` names a root of a step that may be asked for (`register_ask`, `register_maintain`) by the key a read of it would use (`Session::link` through a type-erased keyer in the registry) and fills its hash, so the carry repairs it in place and cuts there; only a root of a step that may not be asked for is still dropped. Checked by the exhaustive nested model (a held root must still be held after a carry, `Failure::Unrepaired`) and its planted control `Bug::RootKept`",
+ "state": "fixed in the int-1112 tree, pending the main agent's test run; the driver's re-ask workaround in front_carry.rs is now always a hit and can go"
 }

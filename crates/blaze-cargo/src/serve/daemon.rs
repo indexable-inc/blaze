@@ -544,7 +544,7 @@ pub struct Options {
 }
 
 /// The variable that names parts of the daemon's image a start leaves unused though they
-/// are whole: `database`, `history`, `trees`, separated by commas. For finding which part of
+/// are whole: `database`, `history`, `trees`, `carries`, separated by commas. For finding which part of
 /// a restored state a fault follows (docs/v2/plan/design/restore.md, "Which part a fault
 /// follows"): the image stays on disk as it is, and each part left is said in the start's log.
 pub const RESTORE_WITHOUT: &str = "BLAZE_RESTORE_WITHOUT";
@@ -558,6 +558,8 @@ pub struct Without {
     pub history: bool,
     /// The library syntax trees: every library file is parsed.
     pub trees: bool,
+    /// The front end's carry sessions: each checkout seeds its session on its next build.
+    pub carries: bool,
 }
 
 impl Without {
@@ -570,11 +572,12 @@ impl Without {
                 "database" => without.database = true,
                 "history" => without.history = true,
                 "trees" => without.trees = true,
+                "carries" => without.carries = true,
                 // alloc: an error's text, once a start
                 _ => {
                     return Err(format!(
                         "{RESTORE_WITHOUT} names `{word}`, which is no part of the daemon image \
-                         a start can leave unused: the parts are `database`, `history` and `trees`"
+                         a start can leave unused: the parts are `database`, `history`, `trees` and `carries`"
                     ));
                 }
             }
@@ -837,6 +840,9 @@ pub struct Started {
     pub unlearned: Option<Unlearned>,
     /// Why the image's library syntax trees were not read: every library file is parsed.
     pub trees: Option<String>,
+    /// Why the image's front-end carry sessions, or some of them, were not used: each such
+    /// checkout seeds its session on its next build.
+    pub carries: Option<String>,
 }
 
 impl Started {
@@ -850,6 +856,7 @@ impl Started {
             && self.heads_dropped == 0
             && self.unlearned.is_none()
             && self.trees.is_none()
+            && self.carries.is_none()
     }
 }
 
@@ -897,6 +904,13 @@ impl fmt::Display for Started {
             write!(
                 f,
                 "{sep}the stored library trees were not read ({why}): library files are parsed"
+            )?;
+            sep = "; ";
+        }
+        if let Some(why) = &self.carries {
+            write!(
+                f,
+                "{sep}the front end's carry sessions were not used ({why}): each checkout seeds its session on its next build"
             )?;
         }
         Ok(())
@@ -1751,7 +1765,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // and writes the ready byte the CLI that started it waits for, and that CLI connects at
         // once. Every driver binds as the listen is submitted.
         driver.submit(&mut effects);
-        let jobs = Jobs::new(Setup {
+        let mut jobs = Jobs::new(Setup {
             views: format!("/{state}/views"),
             std: format!("/{}", options.std),
             builds: format!("/{}", options.builds),
@@ -1765,6 +1779,32 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             runs_end: RUNS_END,
         })
         .map_err(|error| format!("the jobs' tables: {error}"))?;
+        // The front end's carry sessions the image kept: each checkout's next build opens its
+        // own, carried to the build's root, rather than seeding one (`front_carry::Pass::Open`).
+        if opened.is_some() && options.without.carries {
+            // alloc: a start's report, once
+            started.carries = Some(format!(
+                "the start was asked to leave them unused: {RESTORE_WITHOUT} names `carries`"
+            ));
+        } else if let Some(opened) = &opened {
+            let _span = tracing::info_span!(
+                target: "blaze",
+                "daemon start: restore the front end's carry sessions",
+                sessions = tracing::field::Empty,
+                why = tracing::field::Empty,
+            )
+            .entered();
+            match super::image::carries(opened) {
+                Ok(sessions) => {
+                    _span.record("sessions", sessions.len() as u64);
+                    started.carries = jobs.restore_carries(&mut vfs, sessions);
+                }
+                Err(why) => {
+                    _span.record("why", why.as_str());
+                    started.carries = Some(why);
+                }
+            }
+        }
         // The system's memory pressure, watched for the daemon's life: it fails at once where
         // there is no source ([`Daemon::pressure`]).
         effects.push(Effect::Pressure { tag: PRESSURE });
@@ -2121,6 +2161,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// stop), so no request lets go of it; the settle's, asked between requests, is let go
     /// when one comes ([`Daemon::let_go_of_image`]).
     fn ask_image(&mut self, waited: bool) {
+        let carries = self.jobs.carry_sessions(&mut self.vfs, &self.store);
         let front = self.jobs.front_db();
         let parts = Parts {
             db: &self.db,
@@ -2128,6 +2169,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             vfs: &mut self.vfs,
             predict: self.plane.predict(),
             effects: &mut self.effects,
+            carries: &carries,
         };
         match waited {
             true => self.images.ask(parts),
@@ -2324,6 +2366,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // An image someone waits for (a stop's, a snapshot's) is made whatever comes; the
         // settle's is not made while a request is read and held, nor soon after one.
         let makes = self.stopping.is_some() || !self.jobs.idle() || self.quiet_between_requests();
+        // The carry sessions only for an image made this turn: a durable save becomes the
+        // image's as it is made ([`Jobs::carry_sessions`]).
+        let carries = match makes {
+            true => self.jobs.carry_sessions(&mut self.vfs, &self.store),
+            false => Vec::new(), // alloc: none
+        };
         let front = self.jobs.front_db();
         let parts = Parts {
             db: &self.db,
@@ -2331,6 +2379,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             vfs: &mut self.vfs,
             predict: self.plane.predict(),
             effects: &mut self.effects,
+            carries: &carries,
         };
         if makes {
             self.images.step(parts, idle);

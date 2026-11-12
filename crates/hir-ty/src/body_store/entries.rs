@@ -29,7 +29,7 @@
 //! trust; the world's map from a [`BodyKey`] to the database's body ([`BodyWorld::body`]) is
 //! the one the syntax gives ([`bodies`], [`def_of`]).
 
-use std::{fmt, marker::PhantomData};
+use std::{alloc::Global, fmt, marker::PhantomData, sync::Arc};
 
 use base_db::Db;
 use blaze_cas::Kind as StoreKind;
@@ -41,10 +41,10 @@ use blaze_front_items::{
 };
 use blaze_ids::ContentId;
 use blaze_kernel::{
-    Ask, Changed, CodeId, Compute, Fact, Get, Kernel, KernelError, Read, ReadKind, Reads, Seen,
-    Session, Step as KernelStep, StepError, StepId, Subject, WorldError, steps as ids,
+    Ask, Changed, CodeId, Compute, Fact, Get, Got, Kernel, KernelError, Read, ReadKind, Reads,
+    Seen, Session, Step as KernelStep, StepError, StepId, Subject, WorldError, steps as ids,
 };
-use blaze_query::QueryKind;
+use blaze_query::{QueryKind, db::View};
 use hir_def::{DefWithBodyId, ModuleDefId, ModuleId, nameres::DefMap, signatures::FunctionSignature};
 use hir_expand::name::Name;
 
@@ -120,6 +120,10 @@ pub trait BodyWorld: Source {
     /// The value of `fact` as the crate named `krate` sees it now: gone where it names
     /// nothing; [`WorldError::not_now`] where it cannot be hashed now.
     fn fact(&self, krate: &str, fact: FactRef) -> Result<Seen, WorldError>;
+
+    /// The schema `step` of `def` is offered under in [`BodyWorld::db`], as [`BodyWorld::run`]
+    /// gives it, with nothing run: what [`serve`] files an earlier step a served one read under.
+    fn schema(&self, def: DefWithBodyId, step: Step) -> Result<SchemaHash, String>;
 }
 
 const SUBJECT: &str = "blaze v2 body entry 1";
@@ -457,6 +461,136 @@ pub fn register<W: BodyWorld + ?Sized + 'static>(
     kernel.register_ask::<InferEntry<W>>(code)?;
     kernel.register_ask::<MirEntry<W>>(code)?;
     kernel.register_ask::<BorrowckEntry<W>>(code)
+}
+
+/// A served step's answer as the kernel verified it ([`serve`]): what the step's query in the
+/// database answers from (`super::Store::served_answer`), valid only at `revision`. With it,
+/// what the entry read, so the query reads each again and its row depends on them: the body's
+/// identity, each fact with what it saw, and each earlier step of the body it read, with the
+/// schema that step is filed under.
+pub struct Served {
+    pub(super) revision: View,
+    pub(super) identity: ContentId,
+    pub(super) facts: Box<[(FactRef, Seen)]>,
+    pub(super) children: Box<[(Step, SchemaHash)]>,
+    pub(super) answer: Arc<[u8]>,
+}
+
+/// The served answers of one database (`super::Store::served`), all posted at one revision:
+/// a post at another revision drops every answer of the one before, so none outlives it.
+#[derive(Default)]
+pub(super) struct Posted {
+    revision: Option<View>,
+    rows: blaze_hash::HashMap<(DefWithBodyId, Step, SchemaHash), Arc<Served>, Global>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The planted bug of the revision oracle's control: a served answer is given at any
+    /// revision, not only the one it was posted at.
+    pub(super) static ANY_REVISION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn any_revision() -> bool {
+    ANY_REVISION.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn any_revision() -> bool {
+    false
+}
+
+impl Posted {
+    /// The answer of `step` of `def` under `schema` posted at `now`; none posted at another
+    /// revision.
+    pub(super) fn get(
+        &self,
+        now: View,
+        def: DefWithBodyId,
+        step: Step,
+        schema: SchemaHash,
+    ) -> Option<Arc<Served>> {
+        let served = self.rows.get(&(def, step, schema))?;
+        if served.revision != now && !any_revision() {
+            return None;
+        }
+        // clone: a counted reference
+        Some(served.clone())
+    }
+
+    pub(super) fn post(&mut self, def: DefWithBodyId, step: Step, schema: SchemaHash, served: Served) {
+        if self.revision != Some(served.revision) && !any_revision() {
+            self.rows.clear();
+            self.revision = Some(served.revision);
+        }
+        // alloc: one answer a served step of a body, dropped at the next revision's first post
+        self.rows.insert((def, step, schema), Arc::new(served));
+    }
+}
+
+/// Posts what the kernel gave for `step` of the body `key` (`got`, from a get or after a
+/// carry) to the item store of `world`'s database, at its revision now: the step's query
+/// there answers from it until the database's next revision, checking again in the query what
+/// the entry read (`super::Store::served_answer`). The driver serves every entry it gets.
+///
+/// Refused, naming the body: an entry with no read of its identity (no entry of a body step
+/// is made without one, so it is another step's or a corrupt one), a read of an earlier step
+/// whose key names another step, and a database with no item store installed.
+pub fn serve<W: BodyWorld + ?Sized + 'static>(
+    world: &W,
+    key: &BodyKey,
+    step: Step,
+    got: &Got<'_>,
+) -> Result<(), String> {
+    let def = world.body(key)?;
+    let schema = world.schema(def, step)?;
+    let mut identity = None;
+    // alloc: the entry's facts and earlier steps, kept with its answer
+    let mut facts = Vec::new();
+    let mut children = Vec::new();
+    let mut note = |read: Read<'_>, seen: Seen| -> Result<(), String> {
+        if read.kind == reads::IDENTITY {
+            match seen {
+                Seen::Is(it) => identity = Some(it),
+                // alloc: error path
+                Seen::Gone => return Err(format!("{key:?}: its {} saw no identity", super::what(step))),
+            }
+        } else if let Some((fact, _)) = fact_of(read) {
+            facts.push((fact, seen));
+        } else if read.kind == ReadKind::STEP {
+            let child = match read.key.split_first_chunk::<2>().map(|(id, _)| StepId(u16::from_be_bytes(*id))) {
+                Some(ids::BODY_INFER) => Step::Infer,
+                Some(ids::BODY_MIR) => Step::Mir,
+                // alloc: error path
+                _ => return Err(format!("{key:?}: its {} read a step that is no earlier body step", super::what(step))),
+            };
+            children.push((child, world.schema(def, child)?));
+        }
+        Ok(())
+    };
+    match got {
+        Got::Hit(entry) => entry.reads().try_for_each(|(it, seen)| note(it, seen))?,
+        Got::Computed { reads, .. } => reads.iter().try_for_each(|(it, seen)| note(it, seen))?,
+    }
+    let Some(identity) = identity else {
+        // alloc: error path
+        return Err(format!("{key:?}: its {} entry has no read of its identity", super::what(step)));
+    };
+    let db = world.db();
+    let (_, revision) = db.nonce_and_revision();
+    let served = Served {
+        revision,
+        identity,
+        facts: facts.into(),
+        children: children.into(),
+        answer: got.value().into(),
+    };
+    match with_store(db, |store| store.served.lock().post(def, step, schema, served)) {
+        Some(()) => Ok(()),
+        // alloc: error path
+        None => Err(format!("{key:?}: the database has no item store installed")),
+    }
 }
 
 /// What differs, between two pins, of the reads body entries make, as the maintainers'

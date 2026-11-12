@@ -108,6 +108,22 @@ pub fn trees(image: &Arc<Image<Mapping>>) -> Result<Option<base_db::trees::Trees
     base_db::trees::Trees::open(bytes).map(Some).map_err(|error| error.to_string())
 }
 
+/// The front end's carry sessions `image` names, a checkout each
+/// ([`super::front_carry::decode_sessions`]); `Err` saying why none is used: an image written
+/// without the section (by a blaze before it), or one of another schema or layout. Each
+/// checkout then seeds its session on its next build, which the start says.
+pub fn carries<S: Stable>(
+    image: &Image<S>,
+) -> Result<Vec<(String, super::front_carry::Saved)>, String> {
+    let section = image
+        .section(SectionId::FRONT_CARRY, super::front_carry::SESSIONS_SCHEMA)
+        .map_err(|refused| refused.to_string())?;
+    let bytes = image
+        .whole(&section)
+        .map_err(|corrupt| format!("the image's {}: {corrupt}", SectionId::FRONT_CARRY))?;
+    super::front_carry::decode_sessions(bytes)
+}
+
 /// An image as the logs name it: its hash, its bytes and its sections by what they hold,
 /// largest first.
 pub struct Shape<'a, S: Stable>(pub &'a Image<S>);
@@ -213,6 +229,9 @@ pub struct Parts<'a> {
     pub vfs: &'a mut Vfs,
     pub predict: &'a History,
     pub effects: &'a mut Vec<Effect>,
+    /// The front end's carry sessions (`Jobs::carry_sessions`): always written, so an image
+    /// without the section is one of a blaze before it, which [`carries`] says.
+    pub carries: &'a [u8],
 }
 
 enum State {
@@ -385,6 +404,7 @@ impl Images {
             base_db::trees::write_section(front, &mut trees);
             txn.sections().add(SectionId::SYNTAX_TREES, base_db::trees::SCHEMA, &trees);
         }
+        txn.sections().add(SectionId::FRONT_CARRY, super::front_carry::SESSIONS_SCHEMA, parts.carries);
         intern::write_symbols(&live, txn.sections());
         match txn.commit(&mut self.placer, &on_pool, parts.effects) {
             Ok(asked) => {
@@ -636,6 +656,31 @@ mod tests {
         };
         assert!(matches!(error, HistoryError::Decode(_)), "{error:?}");
         assert!(error.to_string().contains("the plane's history"), "{error}");
+    }
+
+    /// The front end's carry sessions round trip through an image byte for byte (rule 26),
+    /// and an image of the layout before the section (none) opens: the sessions are refused
+    /// naming the section, which the start says (`Started::carries`), and each checkout seeds.
+    #[test]
+    fn carry_sessions_survive_an_image_and_one_without_them_opens_saying_so() {
+        use super::super::front_carry::{SESSIONS_SCHEMA, Saved, decode_sessions, encode_sessions};
+        let saved = |n: u8| Saved {
+            session: blaze_cas::Key(blaze_ids::ContentId([n; 32])),
+            root: blaze_ids::ContentId([n + 1; 32]),
+        };
+        let sessions = vec![("/b".to_owned(), saved(3)), ("/a".to_owned(), saved(1))];
+        let bytes = encode_sessions(&sessions);
+        let mut builder = Builder::new();
+        builder.add(SectionId::FRONT_CARRY, SESSIONS_SCHEMA, &bytes);
+        let image = Image::open(builder.finish().unwrap()).unwrap();
+        let restored = carries(&image).unwrap();
+        assert_eq!(restored, vec![("/a".to_owned(), saved(1)), ("/b".to_owned(), saved(3))], "in path order");
+        assert_eq!(encode_sessions(&restored), bytes, "the same bytes again");
+        assert!(decode_sessions(&bytes[..bytes.len() - 1]).is_err(), "a cut section is refused");
+
+        let before = with_history(HISTORY, &empty());
+        let Err(why) = carries(&before) else { panic!("an image without the section gave sessions") };
+        assert!(why.contains(SectionId::FRONT_CARRY.name()), "{why}");
     }
 }
 

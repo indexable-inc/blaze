@@ -28,6 +28,14 @@ impl Step {
     pub const ALL: [Step; 4] = [Step::Infer, Step::Mir, Step::Borrowck, Step::Const];
     /// How many steps there are: the length of an array indexed by a step.
     pub const COUNT: usize = Step::ALL.len();
+
+    /// Whether the step's answers come from the kernel's verified body entries
+    /// ([`super::entries`], posted by [`super::entries::serve`]), not from the item store's
+    /// own records: every step but a constant's value, which has no entry yet
+    /// (`blaze_kernel::steps::BODY_CONST` is its number, owed).
+    pub const fn served(self) -> bool {
+        !matches!(self, Step::Const)
+    }
 }
 
 /// What one read a step made stands for.

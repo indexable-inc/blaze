@@ -20,6 +20,11 @@
 //! - Each offer also keeps the run's trace (its facts and answer) per body, step and schema,
 //!   which the kernel entries of the three steps read ([`entries`]): a carry then reaches
 //!   exactly the bodies whose syntax record, identity or a fact changed.
+//! - Inference, MIR and the borrow check ([`Step::served`]) are answered from the kernel's
+//!   verified entries alone: the driver posts each entry it gets or carries
+//!   ([`entries::serve`]), valid only at the database's revision then, and the step's query
+//!   reads the entry's identity, facts and earlier steps again on a hit. They offer nothing to
+//!   the flush; the records above are a constant's value's until it has an entry.
 //!
 //! With no store installed for a database, every entry point is one load and a branch. A
 //! record that does not open under its key or a store that cannot be read is an error naming
@@ -170,6 +175,16 @@ struct Store {
     /// ([`entries`]). A run of the step replaces it, so it is always of the run that made the
     /// value the database holds for the step now.
     traces: Lock<blaze_hash::HashMap<(DefWithBodyId, Step, SchemaHash), Arc<entries::Ran>, std::alloc::Global>>,
+    /// The kernel's verified answers of the served steps ([`Step::served`]) for this database,
+    /// each valid only at the revision it was posted at ([`entries::serve`]): what
+    /// [`Store::lookup`] answers those steps from.
+    served: Lock<entries::Posted>,
+}
+
+/// Where a hit's answer bytes are: the kernel's verified entry, or the item store's record.
+enum Answer {
+    Served(Arc<[u8]>),
+    Record(hir_def::deps::ImageBuf),
 }
 
 /// The buffers an offer fills, kept for the thread's next one. Taken out for the offer and put
@@ -217,13 +232,27 @@ impl Store {
             self.pending.looked_up(step, false);
             return Lookup::Off;
         };
-        let base = record::base_key(&identity, step, &schema, &self.version);
-        let found = match self.find(db, def, step, &base) {
+        // A served step's answer is the kernel's verified entry, posted at this revision
+        // (`entries::serve`); a constant's is the item store's own record until it has one.
+        let answer = match step.served() {
+            true => self.served_answer(db, def, step, schema, identity).map(|served| {
+                // clone: a counted reference to the posted answer
+                let at = served.answer.clone();
+                (Answer::Served(at), ContentId::default())
+            }),
+            false => {
+                let base = record::base_key(&identity, step, &schema, &self.version);
+                self.find_constant(db, def, &base).map(|(found, key)| (Answer::Record(found), key))
+            }
+        };
+        let found = match answer {
             None => Lookup::Miss,
             Some((found, answer_key)) => {
-                match record::open_answer(found.bytes(), &answer_key)
-                    .and_then(|body| decode(&*self.facts, body))
-                {
+                let opened = match &found {
+                    Answer::Served(bytes) => Ok(&bytes[..]),
+                    Answer::Record(found) => record::open_answer(found.bytes(), &answer_key),
+                };
+                match opened.and_then(|body| decode(&*self.facts, body)) {
                     Ok(value) => {
                         let verify = self.mode == Mode::Verify;
                         // The one hit site of the three steps. The running query's value is
@@ -253,15 +282,92 @@ impl Store {
         found
     }
 
-    /// The answer record of the first shape of `base` whose facts hash the same now, and its
-    /// answer key.
-    fn find(
+    /// The kernel's verified answer of `step` of `def` under `schema` for this database at its
+    /// revision now, if one was posted ([`entries::serve`]) and it still holds: the body's
+    /// `identity` (read by the caller), each fact it read and each earlier step it read (with
+    /// that step's own identity, facts and earlier steps) are read again here, in the running
+    /// query, so the row depends on what the answer depends on, with nothing run. An answer
+    /// posted at another revision is no answer (the kernel verified it at that pin, not this
+    /// one). One whose identity or a fact differs now, at the revision it was verified at, is
+    /// the build's error (the kernel's world and this database disagree) and a miss.
+    fn served_answer(
         &self,
         db: &Db,
         def: DefWithBodyId,
         step: Step,
+        schema: SchemaHash,
+        identity: ContentId,
+    ) -> Option<Arc<entries::Served>> {
+        let (_, now) = db.nonce_and_revision();
+        let served = self.served.lock().get(now, def, step, schema)?;
+        // Which steps of the body are to be checked, under which schema: `step`, then each
+        // earlier step a checked one read. Steps are walked latest first, and a step reads
+        // only earlier ones, so each is checked once, after every step that read it: bounded
+        // by the number of steps, with nothing allocated.
+        let mut needed: [Option<SchemaHash>; Step::COUNT] = [None; Step::COUNT];
+        needed[step as usize] = Some(schema);
+        for of in Step::ALL.into_iter().rev() {
+            let Some(of_schema) = needed[of as usize] else { continue };
+            let row = match of == step {
+                // clone: a counted reference
+                true => served.clone(),
+                false => self.served.lock().get(now, def, of, of_schema)?,
+            };
+            if row.identity != identity {
+                self.fail(format_args!(
+                    "the served {} of {def:?} was verified with identity {:x}, and the database has {identity:x} at the same revision",
+                    what(of),
+                    row.identity
+                ));
+                return None;
+            }
+            for &(fact, seen) in &row.facts[..] {
+                let value = self.facts.value(db, def, fact).map_or(blaze_kernel::Seen::Gone, blaze_kernel::Seen::Is);
+                if value != seen {
+                    self.fail(format_args!(
+                        "the served {} of {def:?} read {fact:?} as {:x}, and the database has {:x} at the same revision",
+                        what(of),
+                        seen.hash(),
+                        value.hash()
+                    ));
+                    return None;
+                }
+            }
+            for &(child, child_schema) in &row.children[..] {
+                if child >= of {
+                    self.fail(format_args!(
+                        "the served {} of {def:?} read its own {}, which is no earlier step",
+                        what(of),
+                        what(child)
+                    ));
+                    return None;
+                }
+                match needed[child as usize] {
+                    None => needed[child as usize] = Some(child_schema),
+                    Some(other) if other == child_schema => {}
+                    Some(_) => {
+                        self.fail(format_args!(
+                            "the served steps of {def:?} read its {} under two schemas",
+                            what(child)
+                        ));
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(served)
+    }
+
+    /// The answer record of the first shape of `base` whose facts hash the same now, and its
+    /// answer key: of a constant's value, the one step with no kernel entry yet (not
+    /// [`Step::served`]). The served steps have no lookup of the item store's records.
+    fn find_constant(
+        &self,
+        db: &Db,
+        def: DefWithBodyId,
         base: &ContentId,
     ) -> Option<(hir_def::deps::ImageBuf, ContentId)> {
+        let step = Step::Const;
         // What `blaze_record::lookup` cannot say through a read's digest: a name in a shape
         // that is no fact. The shape is passed over, and the lookup is an error.
         let mut no_fact = None;
@@ -390,6 +496,11 @@ impl Store {
         if let Err(why) = write(&*self.facts, &mut scratch.answer) {
             tracing::debug!(?def, step = what(step), %why, "a step's result with no stored form");
             return Err(Refusal::Unencodable);
+        }
+        // A served step's record is the kernel's entry, made from this trace
+        // ([`Store::trace`], read by `entries`' run of the step): nothing to flush.
+        if step.served() {
+            return Ok(());
         }
         let base = record::base_key(&identity, step, &schema, &self.version);
         record::write_shape(&mut scratch.shape, &base, &scratch.facts);
@@ -751,6 +862,7 @@ pub fn install(
         lookups: [const { blaze_record::Tally::new() }; Step::COUNT],
         error: Lock::new("ty.body_store.error", None),
         traces: Lock::new("ty.body_store.traces", blaze_hash::HashMap::new_in(std::alloc::Global)),
+        served: Lock::new("ty.body_store.served", entries::Posted::default()),
     }));
     for (at, slot) in REGISTRY.iter().enumerate() {
         if slot

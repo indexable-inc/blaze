@@ -107,6 +107,9 @@ impl SectionId {
     pub const QUERY_GRAPH: SectionId = SectionId(0x0501);
     /// The library files' parsed syntax trees (lane tree-store, `base_db::trees::SCHEMA`).
     pub const SYNTAX_TREES: SectionId = SectionId(0x0600);
+    /// The daemon's front-end carry sessions, a checkout each: the store key of each saved
+    /// session and the VFS root it is pinned at (`blaze_cargo::serve::front_carry`).
+    pub const FRONT_CARRY: SectionId = SectionId(0x0700);
     /// The VFS's tree of nodes and names (`blaze-vfs`).
     pub const VFS_TREE: SectionId = SectionId::vfs(0);
     /// The VFS's file bytes.
@@ -140,6 +143,7 @@ impl SectionId {
             SectionId::QUERY_INTERNED => "the query database's interned rows",
             SectionId::QUERY_GRAPH => "the query graph",
             SectionId::SYNTAX_TREES => "the library syntax trees",
+            SectionId::FRONT_CARRY => "the front end's carry sessions",
             SectionId(id) if id & !0xff == SectionId::VFS => "the VFS tree",
             SectionId(id) if id & !0xffff == SectionId::INTERNED => "an interned table",
             _ => "a section this blaze does not know",

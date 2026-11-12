@@ -1405,6 +1405,44 @@ impl Writer<Real> for UnitWriter {
         Ok(noted.seen.clone()) // clone: once a build, a read a file its build scripts read
     }
 
+    fn view_crates(&self) -> Result<Vec<crate::serve::front_carry::CrateRoot>, String> {
+        let job = &self.job;
+        let units = &job.input.units;
+        let db = self.front.db();
+        // alloc: once a build, a crate of the view each
+        let mut out = Vec::new();
+        for (at, unit) in units.graph.units.iter().enumerate() {
+            if unit.is_std || unit.mode == Mode::RunCustomBuild {
+                continue;
+            }
+            let Some(krate) = self.front.krate(at) else { continue };
+            let Some(src) = unit.target.src_path.to_str() else {
+                // alloc: an error
+                return Err(format!("unit {at}'s root `{}` is not UTF-8", unit.target.src_path.display()));
+            };
+            // A crate whose root is outside the view is another root's (a dependency's).
+            let Some(root) = job.mounted.in_view(src) else { continue };
+            let package = units
+                .packages
+                .binary_search_by(|it| it.id.as_str().cmp(&unit.pkg_id))
+                .map(|place| units.packages[place].name.as_str())
+                .map_err(|_| format!("unit {at}'s package `{}` is not in the plan", unit.pkg_id))?; // alloc: an error
+            let edition = blaze_lower::unit_edition(unit).map_err(|error| error.to_string())?;
+            // alloc: once a crate a build
+            let what = format!("{package} {} {}{}", unit.target.name, unit.target.kind.join(","), match unit.checked_as_test || unit.mode == Mode::Test {
+                true => " test",
+                false => "",
+            });
+            // The cfg as the build ended it: the lowering's, with every build script's run
+            // applied (`blaze_lower`'s apply of a run's `cargo:rustc-cfg`s sets it).
+            // clone: once a crate a build
+            let cfg = krate.cfg_options(db).clone();
+            let extensions = krate.extensions(db);
+            out.push(crate::serve::front_carry::CrateRoot::new(&what, root.into_owned(), edition, cfg, extensions));
+        }
+        Ok(out)
+    }
+
     fn keep(mut self) -> Result<KeptLowered, ApiError> {
         // The writes still asked for are applied. With none, only that no reader is alive is
         // asked: a release that is due stays for the task that stores the front end.
@@ -2131,39 +2169,6 @@ impl Front<Real> for JobFront {
             return Err(Failed::Again);
         }
         cancellable(|| compile::compile(&self.0, &reader, unit, phase, images))?
-    }
-
-    fn view_crates(&self) -> Result<Vec<crate::serve::front_carry::CrateRoot>, String> {
-        let job = &self.0;
-        let units = &job.input.units;
-        // alloc: once a plan, a crate of the view each
-        let mut out = Vec::new();
-        for (at, unit) in units.graph.units.iter().enumerate() {
-            if unit.is_std || unit.mode == Mode::RunCustomBuild {
-                continue;
-            }
-            let Some(cfg) = job.crates.cfg(at) else { continue };
-            let Some(src) = unit.target.src_path.to_str() else {
-                // alloc: an error
-                return Err(format!("unit {at}'s root `{}` is not UTF-8", unit.target.src_path.display()));
-            };
-            // A crate whose root is outside the view is another root's (a dependency's).
-            let Some(root) = job.mounted.in_view(src) else { continue };
-            let package = units
-                .packages
-                .binary_search_by(|it| it.id.as_str().cmp(&unit.pkg_id))
-                .map(|place| units.packages[place].name.as_str())
-                .map_err(|_| format!("unit {at}'s package `{}` is not in the plan", unit.pkg_id))?; // alloc: an error
-            let edition = blaze_lower::unit_edition(unit).map_err(|error| error.to_string())?;
-            // alloc: once a crate a plan
-            let what = format!("{package} {} {}{}", unit.target.name, unit.target.kind.join(","), match unit.checked_as_test || unit.mode == Mode::Test {
-                true => " test",
-                false => "",
-            });
-            // clone: once a crate a plan, the cfg it was lowered with
-            out.push(crate::serve::front_carry::CrateRoot::new(&what, root.into_owned(), edition, cfg.clone()));
-        }
-        Ok(out)
     }
 
     fn refused(&self, unit: usize, what: String) -> blaze_api::Diagnostic {
