@@ -573,37 +573,6 @@ impl Steps for Real {
     }
 }
 
-/// `written` and every ready unit whose crate is blocked (`hir_def::deps::awaited::blocked`:
-/// it or a crate below it is awaited), sorted: what a serve after a batch's writes asks about.
-///
-/// The invariant: after a serve, no ready unit's crate is blocked. A unit is built once it
-/// is ready, and its build reads its crate and everything below; a batch's write can make a
-/// crate below a unit that was ready, and released, before it (a build script's run applied
-/// makes its crate again with the run's cfgs; a second request's plan adds crates), and that
-/// crate is awaited from the write that made it. Asking only about the units the batch made
-/// ready left it awaited under a unit being built (the smoke's edition step, 2026-11-12: `no
-/// maintained resolution for crate libc .. it waits for the records of crate libc`). Costs a
-/// load when nothing is awaited.
-fn with_blocked_ready(
-    lowered: &Lowered,
-    job: &Job,
-    waits: &graph::Waits,
-    written: &[u32],
-) -> Vec<u32> {
-    let mut asked = written.to_vec(); // alloc: once per batch of runs applied
-    if !lowered.any_awaited() {
-        return asked;
-    }
-    let blocked = hir_def::deps::awaited::blocked(lowered.db());
-    asked.extend((0..job.graph.len() as u32).filter(|&unit| {
-        waits.ready(unit)
-            && job.crates.krate(unit as usize).is_some_and(|krate| blocked.contains(&krate))
-    }));
-    asked.sort_unstable();
-    asked.dedup();
-    asked
-}
-
 /// Serves the crates of `written`, the units a batch of runs and loads made ready or a loaded
 /// proc macro reaches ([`deps::serve`]), adding to what `kept` holds of the job's serves:
 /// before their harnesses read them (the units made ready were awaited until then), and again
@@ -1209,8 +1178,7 @@ impl Writer<Real> for UnitWriter {
         let mut written = harness::reached(job, waits, &loaded, ready);
         // Asked of the store before the harness reads them: the units the runs made ready
         // were awaited until now (`blaze_lower::lower_awaiting`), with everything above them.
-        let asked = with_blocked_ready(lowered, job, waits, &written);
-        if let Err(error) = serve_written(lowered, job, &asked, &mut self.session, &mut self.deps) {
+        if let Err(error) = serve_written(lowered, job, &written, &mut self.session, &mut self.deps) {
             self.broken = true;
             return Err(error);
         }
@@ -1250,8 +1218,7 @@ impl Writer<Real> for UnitWriter {
         // before (rule 21). A serve that fails or panics has left the front end partly served,
         // which no unit's write owns: it is the writer's own error, and ends the job with or
         // without keep-going, naming the units it served; no unit is built over it.
-        let asked = with_blocked_ready(lowered, &self.job, &self.waits, &written);
-        if let Err(error) = serve_written(lowered, &self.job, &asked, &mut self.session, &mut self.deps) {
+        if let Err(error) = serve_written(lowered, &self.job, &written, &mut self.session, &mut self.deps) {
             self.broken = true;
             return Err(error);
         }
