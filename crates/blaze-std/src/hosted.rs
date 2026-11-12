@@ -83,6 +83,8 @@ impl From<Stopped> for Refused {
 pub struct SimHost {
     /// Everything written to standard output ([`crate::out::Out`]), in order.
     pub out: Vec<u8>,
+    /// Everything written to standard error, in order.
+    pub err: Vec<u8>,
     pub term: SimTerm,
     /// The keychain.
     pub keys: Vec<SimKey>,
@@ -136,6 +138,7 @@ impl SimHost {
         SimHost {
             // alloc: none, nothing written yet.
             out: Vec::new(),
+            err: Vec::new(),
             term: SimTerm::new(),
             // alloc: none, the simulated host's empty tables (this and each below).
             keys: Vec::new(),

@@ -153,6 +153,15 @@ pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData> {
         Some(AttrsOrCfgRef::CfgDisabled(_, attrs)) => attrs,
     };
     let mut crate_data = DefMapCrateData::new(krate_data.edition);
+    // blaze: a crate of a blaze edition makes every collection in an allocator it was handed
+    // (`Vec::new_in(cx.frame())`; docs/v2/plan/design/std.md, "Memory is explicit"), so the
+    // allocator API needs no `#![feature]` in it: entered as if written, as
+    // `#![blaze::simd]` enters its two, and nothing else of the crate changes.
+    if krate.blaze_edition(db).is_some() {
+        for feature in ["allocator_api", "allocator_ext"] {
+            crate_data.unstable_features.enable(Symbol::intern(feature));
+        }
+    }
     let mut is_proc_macro = krate_data.target_kind.is_proc_macro();
     // Process other crate-level attributes.
     for attr in &*attrs {

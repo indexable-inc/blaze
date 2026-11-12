@@ -14,7 +14,7 @@
 //! | [`catch_unwind`], [`resume_unwind`] | a task's panic failing only its task; the simulated exit's unwind | bstd's own unwinder entry (on `library/unwind`) |
 //! | [`LazyLock`], [`OnceLock`] | `bstd::sync`'s `Lazy` and `Once` | the same two on bstd's one wait |
 //! | [`run`], [`Exit`] | the entry of a program of the blaze edition (`bstd::entry`): the native world made from the process's arguments, environment and start directory, and the status handed to Rust std's `lang_start` | bstd's own entry on `blaze-sys`: the start block read directly, no `lang_start` |
-//! | [`write_out`] | `Out` on a native `Io` | an effect of blaze-core's drivers that writes to a handle the process was started with |
+//! | [`write_out`] | `Out` on a native `Io`, both streams | an effect of blaze-core's drivers that writes to a handle the process was started with |
 //! | `Owns` for `HashMap`, `HashSet`, `Mutex`, `RwLock`, `OnceLock`, `LazyLock` | `bstd::own`'s reachability walk, for code that still holds one of Rust std's | nothing: gone with the last use of those types |
 
 extern crate std;
@@ -134,17 +134,24 @@ fn error_line(said: &str) {
     let _ = err.write_all(b"error: ").and_then(|()| err.write_all(said.as_bytes())).and_then(|()| err.write_all(b"\n"));
 }
 
-/// `parts`, in order, on the process's standard output, flushed: all of them or the host's
-/// refusal as it says it.
-pub(crate) fn write_out(parts: &[&[u8]]) -> Result<(), String> {
+/// `parts`, in order, on the process's `stream`, with the operating system when this
+/// returns: all of them or the host's refusal as it says it. Standard output goes through
+/// Rust std's handle, whose buffer is flushed here, so `parts` reach the system as one write
+/// when they fit it and never wait in it; standard error has no buffer.
+pub(crate) fn write_out(stream: crate::out::Stream, parts: &[&[u8]]) -> Result<(), String> {
     use std::io::Write as _;
-    let mut out = std::io::stdout().lock();
-    for part in parts {
-        // alloc: an error's message.
-        out.write_all(part).map_err(|error| error.to_string())?;
+    fn all(mut to: impl std::io::Write, parts: &[&[u8]]) -> std::io::Result<()> {
+        for part in parts {
+            to.write_all(part)?;
+        }
+        to.flush()
     }
+    let written = match stream {
+        crate::out::Stream::Out => all(std::io::stdout().lock(), parts),
+        crate::out::Stream::Err => all(std::io::stderr().lock(), parts),
+    };
     // alloc: an error's message.
-    out.flush().map_err(|error| error.to_string())
+    written.map_err(|error| error.to_string())
 }
 
 /// The process's id.

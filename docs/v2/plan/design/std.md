@@ -1148,7 +1148,7 @@ single-file program); two that disagree, or a version that is no edition's, are 
 | | under the edition | built |
 |---|---|---|
 | `std` | names the dependency called `bstd`; Rust's `std` has no name in the crate (`core` is unchanged, `alloc` is by `extern crate alloc`). So `std::fs`, `std::env`, `println!` and the rest of Rust std's ambient authority are not reachable by any path | yes |
-| the prelude | `std::prelude::blaze_2026_11`: `core`'s Rust 2024 prelude, `Cx`, `Io`, the entry's `Error`, and `core`'s macros (`assert_eq!`, `panic!`, `write!`, ..). No collection: one is made in an allocator | yes |
+| the prelude | `std::prelude::blaze_2026_11`: `core`'s Rust 2024 prelude, `Cx`, `Io`, the entry's `Error`, `core`'s macros (`assert_eq!`, `panic!`, `write!`, ..), and for memory `Vec`, `Box`, bstd's `String` and `format_in!` ("Memory under the edition") | yes |
 | the entry | rule `entry-takes-roots`: `main`'s parameters are roots the runtime makes, each at most once, in the runtime's order, `&Cx` then `Io`. So `fn main()`, `fn main(cx: &Cx)`, `fn main(io: Io)` and `fn main(cx: &Cx, io: Io)`, by the rule and not by a list (`hir_ty::entry::takes`). It returns anything that is a `bstd::entry::Outcome` (a trait: `()`, a `Status`, a `Result` of one and an error that can be shown; a program's own type may implement it) | yes |
 | the root context | `main(cx, ..)` gets one with the named bounds `entry::MAIN_BUDGET` (no deadline) and `MAIN_SCRATCH`; a program that wants others takes `io` alone and calls `io.cx(budget, scratch)` | yes |
 | a test | takes the same roots, handed the simulation's (`Io::sim(seed)`, the seed printed on failure); `#[test(native)]` asks for the real one | S5b |
@@ -1160,6 +1160,34 @@ roots `main` takes; `run` makes the native `Io` (the start directory as its root
 line, the environment), calls `main`, prints a failure as `error: <what>` on standard error
 and exits 0 or 1. `entry::run_in(io, ..)` is the same on an `Io` a test made. Standard output
 is the capability `Out` (`io.out()`), in the simulation and natively.
+
+**Saying something** is one call, whatever is said: `out.line(cx, "text")?` and
+`out.line(cx, format_args!("x = {x}"))?` (`write` for no line feed), on anything `Display`,
+formatted on the stack with no allocation, returning the `OutError` itself. `out.with(cx)` is
+a `core::fmt::Write` for `write!`/`writeln!` and keeps the first error, which `fmt::Error`
+cannot carry. bstd holds nothing between calls: a call of up to `out::HELD` (1024) bytes is
+one write, with the operating system when it returns, so a crash leaves on screen every line
+whose call returned. The price is one system call a line, which is what Rust's line-buffered
+`println!` pays too (measured: see the lane's report); a program that wants fewer builds its
+text in an allocator and writes once.
+
+**Memory under the edition.** The prelude has `Vec` and `Box` (alloc's types, for
+`Vec::new_in(cx.frame())` and `Box::new_in(v, a)`; the allocator API needs no `#![feature]`
+in the crate), bstd's `String` (made in an allocator) and `format_in!`. It has no `vec!` and
+no `format!`, and `alloc` is not nameable without `extern crate alloc`. That is not
+enforcement: `Vec::new()` is a method of the same type, and it allocates from the global
+heap. Two things refuse it. `blaze check` denies `blaze::std_use` in a crate of the edition
+(its table has the global-heap rows: `Vec::new`, `Box::new`, `String::from`, `to_string`,
+`format!`, `vec!`, the collections), naming the explicit form; built. The build's own
+refusal is the `global_alloc` effect of S2 over every function the program reaches; S5g,
+not built, so `blaze build` and `blaze run` of a program that writes `Vec::new()` succeed
+today. A dependency of a Rust edition allocates from the global heap as before and still
+works; its bytes belong to no task and no arena, so the program's accounting ("every byte
+belongs to a task or a named cache") covers the edition's own code and bstd's handed-back
+memory only, and says so, until S5g's walk either proves the reached code allocates nothing
+or the crate is on the trusted list with its heap counted as one named arena. bstd itself
+still has about 128 global allocations, each with its `// alloc:` line (effects' buffers,
+errors' messages, once-per-world tables), until S4.
 
 **Errors name the rule.** A `main` of the edition with a parameter that is no root, a root
 twice or out of order is refused at `main`, naming the parameter and `entry-takes-roots`. A
@@ -1200,7 +1228,8 @@ warns by default from the same day `blaze new` defaults to the edition
 people to move would be a nag. blaze's own workspace allows it while cargo builds blaze (D25).
 
 Deferred, a row each below: tests (S5b), the sandbox derived from `main` (S5c), bstd shipped
-with blaze (S5d), `Out` on the driver (S5e), build scripts and proc macros (S5f).
+with blaze (S5d), `Out` on the driver (S5e), build scripts and proc macros (S5f), the global
+heap refused by the build (S5g).
 
 ## Moving blaze onto it
 
@@ -1224,6 +1253,7 @@ Interface first, bottom last, so nothing waits on the runtime and every step lan
 | S5c | The OS sandbox of a program derived from what `main` hands out | a program of the edition that never opens the network cannot, checked by the sandbox |
 | S5d | bstd ships with blaze and is given to every crate of the edition as `std` is given (`attach_std`), so the manifest's `bstd` line goes; `blaze_new::BSTD_SHIPS` and `ready::EDITION_SHIPS` turn on | `blaze new` then `blaze run` prints its line on a machine with no checkout of blaze; the release's install check uses it |
 | S5e | `Out` (and standard input) as effects of the drivers, with the context's deadline | `rt::write_out` is gone from S4's ban list |
+| S5g | No global heap in the edition, at build time: the `global_alloc` effect (S2) is an error in a crate of the edition over what it reaches, old-edition dependencies proved or trusted with their heap as one named arena | a program of the edition with `Vec::new()`, `Box::new`, `format!` or `extern crate alloc` + `vec!` fails `blaze build` naming the call path and `Vec::new_in(cx.frame())`; today only `blaze check` refuses it (`blaze::std_use`) |
 | S5f | A build script and a proc-macro target of an edition package take capabilities (`ready::CAPABILITIES_FOR_BUILD_SCRIPTS`) | they are of the edition, not Rust 2024 |
 | S6 | C dependencies as wasm, the registry, the migration (`blaze fix --edition`, which rewrites `main`, `std::` paths the table of `blaze::std_use` covers, and the manifest) | each has its own row when S5c is met |
 
@@ -1264,7 +1294,9 @@ with its path, or put on the trusted list with a reason.
   opting in").
 - **The opt-in is the manifest's `edition`**, carried to the front end as a crate attribute.
 - **Structured tasks with deadlines**, as Trio's scopes.
-- **Standard error is not a capability; standard output is.**
+- **Standard output and standard error are each a capability** (`io.out()`, `io.err()`, one
+  type `Out`). Reversed 2026-11-12 from "standard error is not a capability": a program that
+  reports on standard error is saying something to whoever started it, as on standard output.
 - **No revocation** until something needs it.
 - **No default for a cost or a guarantee** (the second rule); a policy that changes an effect
   is a function of its own.

@@ -357,8 +357,11 @@ pub mod test {
 pub mod prelude {
     /// The prelude of `edition = "blaze-2026.11"`: `core`'s prelude of Rust 2024, the types
     /// a `main` names (`Cx`, `Io` and the entry's `Error`), and `core`'s macros that Rust's `std` hands on from its
-    /// root. No collection is here: one is made in an allocator its code was handed
-    /// (std.md, "Memory is explicit").
+    /// root. The collections are here by their types, to be made in an allocator the code
+    /// was handed (`Vec::new_in(cx.frame())`, `Box::new_in(value, alloc)`); `String` is
+    /// bstd's, which is made in one, with `format_in!` in place of `format!`. `vec!` and
+    /// `format!`, which reach the global heap by themselves, are not (std.md, "Memory is
+    /// explicit").
     pub mod blaze_2026_11 {
         pub use core::prelude::rust_2024::*;
         pub use core::{
@@ -366,7 +369,14 @@ pub mod prelude {
             unimplemented, unreachable, write, writeln,
         };
 
-        pub use crate::{cx::Cx, entry::Error, io::Io};
+        pub use alloc::{boxed::Box, vec::Vec};
+
+        pub use crate::{
+            cx::Cx,
+            entry::Error,
+            io::Io,
+            mem::{String, format_in},
+        };
     }
 }
 

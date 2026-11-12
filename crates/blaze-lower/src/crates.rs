@@ -934,7 +934,18 @@ pub fn lint_flags(unit: &Unit, plan: &UnitPlan, local: bool, extra_verbose: bool
     const SHORT: [&str; 4] = ["-A", "-W", "-D", "-F"];
     const LONG: [&str; 6] =
         ["--allow", "--warn", "--deny", "--forbid", "--force-warn", "--cap-lints"];
-    let mut out = plan.lints.clone(); // clone: the unit's own list, once per unit per build
+    let mut out = Vec::with_capacity(plan.lints.len() + 2); // alloc: the unit's list, once per unit per build
+    // A crate of a blaze edition denies `blaze::std_use` (docs/v2/plan/design/std.md, "The
+    // blaze edition: opting in", memory): a use of Rust std's global heap (`Vec::new()`,
+    // `Box::new`, `format!`, ..) or of anything else bstd replaces is an error of `blaze
+    // check` that names the explicit form. First, so the workspace's table and the command
+    // line still have the last word; the build's own refusal is the `global_alloc` effect
+    // (row S5g).
+    if blaze_edition_attrs(unit, "").is_ok_and(|attrs| !attrs.is_empty()) {
+        out.push("-D".to_owned()); // alloc: as above
+        out.push("blaze::std_use".to_owned()); // alloc: as above
+    }
+    out.extend(plan.lints.iter().cloned()); // clone: the unit's own list, once per unit per build
     let mut flags = plan.rustflags.iter();
     while let Some(flag) = flags.next() {
         let flag = flag.as_str();
