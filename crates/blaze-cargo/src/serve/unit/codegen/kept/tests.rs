@@ -459,11 +459,11 @@ fn a_body_edit_among_many_hashes_the_edit() {
         let (mut first, _) = built(&program, None);
         let filler = first.functions[0].clone(); // clone: the test's template of a function
         for key in &rest {
-            let mut function = filler.clone(); // clone: one more function of the program
+            let mut function = (*filler).clone(); // clone: one more function of the program
             function.key = InstanceKey(ContentId(*key));
             function.relocs = Vec::<blaze_codegen::Relocation>::new().into();
             function.code = vec![0xc3];
-            first.functions.push(function);
+            first.functions.push(std::sync::Arc::new(function));
         }
         first.functions.sort_unstable_by_key(|it| it.key);
         first.inputs = first.functions.iter().map(|it| (it.key, CodeHash(it.key.0))).collect();
