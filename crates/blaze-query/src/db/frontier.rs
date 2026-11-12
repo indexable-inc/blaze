@@ -78,10 +78,52 @@ struct Found {
     nodes: Vec<u32>,
 }
 
-/// The most nodes the walks' findings keep, and the most walks: past either the oldest go,
-/// and a host that asks from before them is told so ([`Unknown::Before`]).
+/// The most walks' findings kept apart, and the most nodes they hold before the oldest are
+/// merged ([`merge_oldest`]): past either, the oldest findings become one, of the newest view
+/// among them. Nothing is dropped, so a host that asks from any earlier view is answered
+/// (there is no "before the log": a host with nothing to start from would have to take
+/// everything it holds as changed, which is the sweep the changed set replaces).
 const LOG_NODES: usize = 1 << 20;
 const LOG_WALKS: usize = 256;
+
+/// Merges the oldest findings of `log` where it is over its bounds: more than [`LOG_WALKS`]
+/// walks (the older half becomes one), or more nodes than [`LOG_NODES`] and twice what its
+/// oldest finding holds (all become one). The merged finding holds each node once and is of
+/// the newest view merged.
+///
+/// Why an answer stays right: [`changed_ids_since`] names the nodes of every finding whose
+/// view is after the one asked from. A finding merged into one of a later view is named
+/// whenever it was before (its own view is no later than the merged one), and to a host that
+/// asks from between the two it is named where it was not: a name too many, which
+/// [`Changed::Keys`] allows and costs the host one ask of a row that is up to date.
+///
+/// Cost: the node bound is at least twice the oldest finding, so the findings merged into it
+/// hold as many nodes as it does: each node is copied a number of times logarithmic in the
+/// log's size, never once a walk. Memory: each node once in the oldest finding, so at most 4
+/// bytes a node of the storage beside [`LOG_NODES`] of newer ones.
+fn merge_oldest(log: &mut Vec<Arc<Found>>) {
+    let nodes: usize = log.iter().map(|it| it.nodes.len()).sum();
+    let most = LOG_NODES.max(log.first().map_or(0, |it| 2 * it.nodes.len()));
+    let merged = if nodes > most {
+        log.len()
+    } else if log.len() > LOG_WALKS {
+        log.len() - LOG_WALKS / 2
+    } else {
+        return;
+    };
+    if merged < 2 {
+        return;
+    }
+    let at = log[merged - 1].at;
+    let mut all: Vec<u32> = Vec::new(); // alloc: the merged finding, each changed node once
+    for found in log.drain(..merged) {
+        all.extend_from_slice(&found.nodes);
+    }
+    all.sort_unstable();
+    all.dedup();
+    all.shrink_to_fit();
+    log.insert(0, Arc::new(Found { at, nodes: all })); // alloc: as above
+}
 
 /// The rows one level of a walk verifies before it hands them to the pool.
 const PAR_AT: usize = 64;
@@ -92,8 +134,6 @@ const PAR_AT: usize = 64;
 struct Walked {
     /// The view the last walk ended in.
     done: u64,
-    /// [`changed_since`] answers a view at or after this.
-    floor: u64,
     log: Arc<Vec<Arc<Found>>>,
     /// The field nodes written since the last walk.
     written: Vec<u32>,
@@ -334,9 +374,6 @@ pub enum Changed<K> {
 /// changed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Unknown {
-    /// The view asked from is before what the walks' findings keep (they keep the last
-    /// [`LOG_WALKS`] walks and [`LOG_NODES`] nodes): `floor` is the earliest view they answer.
-    Before { floor: View },
     /// The view asked from is not one of this storage's: it is after its current view.
     NotAView { view: View },
     /// Asked from inside a query while a walk is due: a walk is started only from outside
@@ -347,11 +384,6 @@ pub enum Unknown {
 impl std::fmt::Display for Unknown {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Unknown::Before { floor } => write!(
-                f,
-                "the view asked from is before view {}, the earliest the changed sets kept answer",
-                floor.as_u64()
-            ),
             Unknown::NotAView { view } => {
                 write!(f, "the view asked from is after the storage's view {}", view.as_u64())
             }
@@ -396,15 +428,9 @@ pub fn changed_ids_since<F: Function>(db: &F::Db, since: View) -> Changed<Id> {
         bring_to_date(std::ptr::from_ref(db).cast(), storage);
     }
     let index = F::ingredient().index();
-    let (log, floor) = {
-        let walked = storage.frontier.walked.lock();
-        (Arc::clone(&walked.log), walked.floor) // clone: a count, no allocation under the lock
-    };
+    let log = Arc::clone(&storage.frontier.walked.lock().log); // clone: a count, no allocation under the lock
     if since > storage.view() {
         return Changed::Unknown(Unknown::NotAView { view: storage.view() });
-    }
-    if since.as_u64() < floor {
-        return Changed::Unknown(Unknown::Before { floor: View(floor) });
     }
     let from = log.partition_point(|found| found.at <= since.as_u64());
     let mut ids: Vec<u32> = Vec::new(); // alloc: the caller's answer, the changed keys
@@ -695,31 +721,23 @@ fn walk(db: *const (), storage: &Storage) {
     walking.record("changed", work.changed);
     walking.record("unwound", work.unwound);
 
-    // The findings: this walk's after the kept ones, the oldest dropped past the bounds.
+    // The findings: this walk's after the kept ones, the oldest merged past the bounds. A
+    // walk that found nothing leaves the kept log as it is.
     let kept = Arc::clone(&frontier.walked.lock().log); // clone: a count
-    let mut floor = None;
-    let mut log: Vec<Arc<Found>> = kept.iter().cloned().collect(); // alloc: the log's list, at most `LOG_WALKS` pointers
-    if !found.is_empty() {
+    let log = if found.is_empty() {
+        kept
+    } else {
+        let mut log: Vec<Arc<Found>> = kept.iter().cloned().collect(); // alloc: the log's list, at most `LOG_WALKS` pointers
         log.push(Arc::new(Found { at: view, nodes: found })); // alloc: a walk's findings
-    }
-    let mut nodes: usize = log.iter().map(|it| it.nodes.len()).sum();
-    let mut drop_to = 0;
-    while log.len() - drop_to > LOG_WALKS || (nodes > LOG_NODES && drop_to < log.len()) {
-        nodes -= log[drop_to].nodes.len();
-        floor = Some(log[drop_to].at);
-        drop_to += 1;
-    }
-    log.drain(..drop_to);
-    let log = Arc::new(log); // alloc: as above
+        merge_oldest(&mut log);
+        Arc::new(log) // alloc: as above
+    };
     let apart = unwound.len() as u32;
     let unwound = Arc::new(unwound); // alloc: as above
     taken.written.clear();
     let mut walked = frontier.walked.lock();
     walked.log = log;
     walked.unwound = unwound;
-    if let Some(floor) = floor {
-        walked.floor = walked.floor.max(floor);
-    }
     walked.done = view;
     walked.work = work;
     drop(walked);
@@ -770,3 +788,76 @@ pub fn walk_changed_set<D: Database>(db: &D) -> ChangedSetWork {
     storage.changed_set_work()
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn found(at: u64, nodes: &[u32]) -> Arc<Found> {
+        Arc::new(Found { at, nodes: nodes.to_vec() })
+    }
+
+    /// The nodes the log names to a host that asks from view `since`, each once, in order:
+    /// what [`changed_ids_since`] reads of it.
+    fn named(log: &[Arc<Found>], since: u64) -> Vec<u32> {
+        let from = log.partition_point(|it| it.at <= since);
+        let mut nodes: Vec<u32> = log[from..].iter().flat_map(|it| it.nodes.iter().copied()).collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes
+    }
+
+    /// The invariant: merging the log's oldest findings loses no name. A host that asks from
+    /// any view, the views before the merged findings too, is named every node it was named
+    /// before the merge (it may be named more), so no host is ever told the log cannot
+    /// answer and left to sweep everything it holds.
+    #[test]
+    fn a_merged_log_names_every_node_it_named_before_from_every_view() {
+        // More walks than the log keeps apart, each of two nodes, one shared with the next.
+        let walks = LOG_WALKS as u64 + 40;
+        let whole: Vec<Arc<Found>> =
+            (1..=walks).map(|at| found(at * 3, &[at as u32, at as u32 + 1])).collect();
+        let mut merged = whole.clone();
+        merge_oldest(&mut merged);
+        assert!(merged.len() <= LOG_WALKS, "{} findings kept apart", merged.len());
+        assert!(merged.windows(2).all(|it| it[0].at < it[1].at), "the log stays in view order");
+        assert!(merged[0].nodes.windows(2).all(|it| it[0] < it[1]), "a merged finding holds each node once");
+        for since in 0..=walks * 3 + 1 {
+            let (before, after) = (named(&whole, since), named(&merged, since));
+            assert!(
+                before.iter().all(|node| after.binary_search(node).is_ok()),
+                "asked from view {since}: the merged log names {after:?}, the whole one {before:?}"
+            );
+        }
+        // At and after the merged finding's view the answer is the same: nothing more is named.
+        let at = merged[0].at;
+        assert_eq!(named(&whole, at), named(&merged, at));
+    }
+
+    /// The control of [`a_merged_log_names_every_node_it_named_before_from_every_view`]: a
+    /// log that drops its oldest findings (what the merge replaced) names less to a host that
+    /// asks from before them, and the oracle says so.
+    #[test]
+    fn the_oracle_catches_a_log_that_drops_its_oldest_findings() {
+        let walks = LOG_WALKS as u64 + 40;
+        let whole: Vec<Arc<Found>> =
+            (1..=walks).map(|at| found(at * 3, &[at as u32, at as u32 + 1])).collect();
+        let dropped = &whole[40..];
+        let (before, after) = (named(&whole, 0), named(dropped, 0));
+        assert!(before.iter().any(|node| after.binary_search(node).is_err()));
+    }
+
+    /// The node bound merges every finding into one, and then only once the newer findings
+    /// hold as many nodes as it does: a walk never copies the whole log.
+    #[test]
+    fn the_node_bound_merges_only_when_the_newer_findings_match_the_oldest() {
+        let big: Vec<u32> = (0..LOG_NODES as u32 + 10).collect();
+        let mut log = vec![found(1, &big[..LOG_NODES / 2 + 5]), found(2, &big[LOG_NODES / 2 + 5..])];
+        merge_oldest(&mut log);
+        assert_eq!(log.len(), 1, "past the node bound the findings are one");
+        assert_eq!((log[0].at, log[0].nodes.len()), (2, big.len()));
+        log.push(found(3, &[7, 8, 9]));
+        merge_oldest(&mut log);
+        assert_eq!(log.len(), 2, "a small finding after a large one is kept apart");
+    }
+}
