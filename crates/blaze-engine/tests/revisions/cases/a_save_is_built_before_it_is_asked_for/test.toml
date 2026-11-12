@@ -1,0 +1,18 @@
+about = "A save the daemon is left alone with is built before it is asked for (`BLAZE_AHEAD=1`, docs/v2/plan/design/on-save.md): the run after it makes nothing again and prints the new program's output; with no wait, a run read while the save is being built ahead prints the new program's output too."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+env = { BLAZE_AHEAD = "1" }
+prints = "2 4\n"
+
+[[revision]]
+steps = ["edit", "wait 3000 ms"]
+action = "run"
+prints = "11 4\n"
+redone = []
+max_units = 0
+
+[[revision]]
+action = "run"
+prints = "2 4\n"

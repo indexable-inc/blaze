@@ -3701,6 +3701,16 @@ impl<S: Steps> Jobs<S> {
         self.settling.iter().map(|it| it.placing).sum()
     }
 
+    /// Whether the checkout at `dir` has a kept answer known to be of the view `root`
+    /// ([`noop::LastAnswer::files_known`]): its next build or check of the request that
+    /// answer is of is answered by the no-op lane, while nothing else it rests on moves.
+    /// What the daemon builds ahead of a save until ([`super::ahead`]).
+    pub fn answer_known(&self, dir: &str, root: &ContentId) -> bool {
+        self.roots.ids.get(dir).is_some_and(|&at| {
+            matches!(&self.roots.answers[at as usize], Ok(answer) if answer.files_known(root))
+        })
+    }
+
     /// The last of what settling lost, oldest first ([`Jobs::lose`]).
     pub fn lost(&self) -> &[Lost] {
         &self.lost

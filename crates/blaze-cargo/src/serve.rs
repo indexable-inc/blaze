@@ -16,6 +16,8 @@
 //!   its CPUs, and answers `blaze explore`, `blaze debug live` and a reader's ask to flush the
 //!   history (`blaze_api::Request::Flush`) itself ([`observe`]).
 
+#[blaze::sans_io]
+mod ahead;
 mod breakdown;
 pub mod ceiling;
 mod daemon;
@@ -1346,6 +1348,17 @@ pub(crate) fn start(
     }
 }
 
+/// The variable that has the daemon build a save before it is asked for (`1` or `on`), in the
+/// daemon's own environment (docs/v2/plan/design/on-save.md). Opt-in while a build's account
+/// (`blaze why`, the revision tests' `redone`) is of the request's own job alone: a save
+/// built ahead leaves the request after it nothing to make.
+pub(crate) const BUILD_AHEAD: &str = "BLAZE_AHEAD";
+
+/// Whether [`BUILD_AHEAD`] is on for this daemon.
+fn build_ahead() -> bool {
+    matches!(std::env::var(BUILD_AHEAD).as_deref(), Ok("1" | "on"))
+}
+
 fn begin(
     driver: blaze_core::Native,
     options: Options,
@@ -1360,6 +1373,7 @@ fn begin(
     #[cfg(all(unix, feature = "native"))]
     let shared = options.machine.as_ref().map(|it| it.said().to_owned()); // alloc: the start's line
     let mut daemon = Daemon::start(driver, options, steps, runner)?;
+    daemon.build_ahead(build_ahead());
     say(ready, Phase::Setup);
     // Each start says the limit it runs under, so a run's log shows it was told one (B5).
     if let Some(limit) = limit {

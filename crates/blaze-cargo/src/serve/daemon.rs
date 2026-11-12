@@ -685,6 +685,12 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// Each request read and not yet told it is done, with its `request: read to reply` span
     /// ([`Daemon::arrive`], [`Daemon::reply`]); a connection's go as it ends.
     answering: Vec<(RequestRef, tracing::Span)>,
+    /// What is built before it is asked for ([`super::ahead`]): the core, off until
+    /// [`Daemon::build_ahead`] turns it on.
+    ahead: super::ahead::Ahead,
+    /// The build ahead under way, from its request sent to its `Done`: what its line in the
+    /// log says, and its span.
+    ahead_run: Option<ahead::Run>,
     /// How many turns in a row, since a request was last read and since a job was last under
     /// way, took no completion with no plane task running ([`quiet_turns_after`]): the work
     /// between requests waits for [`QUIET_BEFORE_BETWEEN`] of them ([`Daemon::between`]).
@@ -1762,6 +1768,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             settling: false,
             stop_settles: None,
             answering: Vec::new(), // alloc: none until a request
+            ahead: super::ahead::Ahead::new(false),
+            ahead_run: None,
             quiet_turns: 0,
             failed: None,
             machine,
@@ -2015,6 +2023,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // The memory by tag as the work ends, its high-water marks the run's.
         log_memory(&blaze_mem::tag::snapshot());
         self.stopping = Some(Stopping::Image);
+        // Nothing is built ahead from here on, and what is, is cancelled (the turn's
+        // `ahead_turn` sends the cancel).
+        self.ahead.stop();
         // The socket's name first: the next daemon may bind it while this one writes its
         // image, and a client that comes meanwhile finds no one rather than waits.
         self.server.unlisten(&mut self.effects);
@@ -2128,6 +2139,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // A job's wait for the store to make its puts durable has a deadline of its own.
         sooner(self.jobs.next_deadline().map(Deadline::at), Woken::Durable);
         sooner(self.observe.wait(now).map(|it| Deadline::after(now, it)), Woken::Observe);
+        // A save's quiet running out: its build ahead is due ([`super::ahead::QUIET`]).
+        sooner(self.ahead.deadline(now).map(Deadline::at), Woken::Idle);
         if let Some(settles) = &self.settles {
             // A batch out comes back over a channel no driver wakes for, and a plan under way
             // takes a step a turn while the daemon is between requests.
@@ -2202,6 +2215,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             self.submit();
         }
         self.expire_jobs();
+        self.ahead_turn();
         drop(part);
         step.next("the plane's step");
         let part = spanned
@@ -2278,6 +2292,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             let stopped = self.held.iter().map(|(id, _)| (*id, None)).collect();
             self.release_held_as(stopped);
         }
+        // What the turn's later parts said of a build ahead (its end, in the plane's step):
+        // a request held behind it is handed on in this turn.
+        self.ahead_turn();
         self.stepping_stop();
         self.submit();
         step.end();
@@ -2854,6 +2871,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// `reply` handed to the server to send. A request's `Done` ends its `request: read to
     /// reply` span ([`Daemon::arrive`]).
     fn reply(&mut self, reply: &Reply) {
+        // A reply to the daemon's own request is the core's and no client's: what a build
+        // ahead says is shown to nobody ([`super::ahead`]).
+        if reply.to.conn == super::ahead::CONN {
+            self.ahead_heard(reply);
+            return;
+        }
         self.server.reply(reply, &mut self.effects);
         if matches!(reply.response, blaze_api::Response::Done { .. })
             && let Some(at) = self.answering.iter().position(|(to, _)| *to == reply.to)
@@ -2885,9 +2908,16 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             }
             Arrived::Gone { conn } => self.answering.retain(|(to, _)| to.conn != *conn),
         }
+        // A build ahead gives way as the request is read, beside the request's wait for its
+        // watcher; a cancel of a request held behind one is the core's to answer.
+        if self.ahead.read(&arrived) {
+            self.ahead_do();
+            return;
+        }
         let mut out = self.spare.out.pop().unwrap_or_default();
         self.heads.arrive(&self.vfs, arrived, &mut self.effects, &mut out);
         self.outs(out);
+        self.ahead_do();
     }
 
     fn outs(&mut self, mut out: Vec<Out>) {
@@ -2999,6 +3029,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                         self.stop_asked = true;
                         self.stop_from.get_or_insert(*from);
                     }
+                    // A request for what is being built ahead waits for that build, its
+                    // own, and is handed on as it ends ([`Daemon::ahead_do`]).
+                    if self.ahead_holds(&arrived) {
+                        continue;
+                    }
                     let mut replies = std::mem::take(&mut self.replies);
                     self.session.arrive(&mut cx!(self), arrived, &mut replies);
                     self.replies = replies;
@@ -3006,6 +3041,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 }
                 Out::Answer(reply) => self.reply(&reply),
                 Out::Moved { head, root } => {
+                    self.ahead_moved(&head, root);
                     self.session.head_moved(&mut cx!(self), &head, root);
                     self.after_session();
                 }
@@ -3471,6 +3507,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
     }
 }
+
+mod ahead;
 
 #[cfg(test)]
 mod tests {

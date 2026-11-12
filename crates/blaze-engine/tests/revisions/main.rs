@@ -62,6 +62,7 @@ real! {
     a_feature_flip_follows_the_cfg
     a_renamed_function_keeps_its_code
     a_save_by_rename_is_read_whole
+    a_save_is_built_before_it_is_asked_for
     a_second_project_reuses_the_standard_library
     a_signature_change_remakes_the_callers
     a_terminal_of_another_width_remakes_nothing
