@@ -271,7 +271,21 @@ Three things recur, and each is one piece of work for all five, not five:
   member must be under one of the cover's reads, else the keep is refused naming the read.
   It sits in nesting: a child run "under cover" has its reads checked against the parent's
   covering reads instead of recorded as the parent's. Nothing else may stand in front of a
-  lookup.
+  lookup. **Built** as an operation of the kernel, not a run: `Kernel::register_cover`,
+  `Kernel::member` (a member verified in the session: its entry is read for its key, value
+  hash and reads), `Kernel::cover` (values the covering reads, checks every member's read:
+  a world read under a covering read by `World::cover`, at most 8 steps up; a step's value
+  only of a member; else `KernelError::Uncovered` naming member and read; keeps the manifest,
+  `blaze kernel c 1`), `Kernel::seed` (the cover's ordinary lookup, then each member admitted
+  from the manifest). A covering read is a world read: an interface's digest is the hash of
+  the interface step's value as the world gives it (the test's digest ignores each fact's
+  low bit, which no value shows). Covers are read only by `seed` (a cold start, another
+  checkout); a carry never looks one up. Cost (`tests/cost.rs`): a seed through a cover of
+  17 members values 1 read (the floor) and no member's; its gets are the cover's own (its
+  list and entry; printed, to pin); each member is then one get. Not built: a covering read
+  that is a read of a step's value through the kernel; a cover over members of another
+  cover; the way "seed through a cover" in the exhaustive check (`exhaustive/nested.rs`:
+  the control is a direct one in `tests/cost.rs`).
 
 ### Carrying a session
 
@@ -300,7 +314,7 @@ of every reader's lists; eager needs only the postings and each read row's own k
 | I2 the seed is complete | `Changed` is total by kind (`CarryError::Unsaid` names a kind left out); a registry that differs drops the session; that the names are all of them is the driver's to prove | `an_absence_left_out_of_the_change_set_is_caught` (the bug is in the driver's model) |
 | I3 children before parents | the queue pops the lowest; a queued row is dropped at once, so a lookup that asks for it repairs it first; a changed row queues its readers even if they were repaired | `a_parent_repaired_before_its_child_is_caught` |
 | I4 valued at the pin | `carry` takes `&mut Session`; `Moved` before and after; a change set from another pin is `CarryError::From` | `a_session_that_outlives_its_pin_is_caught` |
-| I5 covers post | not built: the cover is not built | none yet |
+| I5 covers post | `Session::cover` admits a member as a reader of the cover's row (`By::Cover`), and a carry drops a cover with every reader, never looking it up | `a_member_admitted_through_a_cover_is_dropped_with_it` (`tests/cost.rs`, `Bug::CoverUnposted`) |
 
 The theorem is stated once, on `Kernel::carry` (`/// The invariant:`), and checked by
 `every_nested_sequence_in_scope_gives_what_a_fresh_run_gives`: 16^4 sequences from an empty
@@ -323,11 +337,11 @@ its entry with no reads (`Session::listed`).
 **In the store** (`trie.rs`, `Session::save`, `Session::open`). The store is write-once and a
 session is not a function of its checkout and pin (it depends on what was asked), so nothing of
 it is keyed by either: rows and postings are entries of maps kept as 16-way tries on a key's
-nibbles, each node a record under the hash of its own bytes (`blaze kernel t 1`; a subtree of at
-most 8 entries is one leaf, so a node's bytes are a function of the entries under it). One map
+nibbles, each node a record under the hash of its own bytes (`blaze kernel t 2`; a subtree of at
+most 64 entries is one leaf, so a node's bytes are a function of the entries under it). One map
 holds the rows by identity (entry key, value hash, height, posted slots, the name its value is
 read by); one map for each kind of read holds the postings by the hash of the name (the name,
-its step's own row, the readers' identities in order). A root record (`blaze kernel s 1`: pin,
+its step's own row, the readers' identities in order). A root record (`blaze kernel s 2`: pin,
 registry, live count, the maps' roots) names them, and its key is the one thing whoever holds
 the session keeps: `save` gives it, `open` takes it.
 
@@ -342,12 +356,45 @@ the session keeps: `save` gives it, `open` takes it.
   session can be dropped whenever nothing is running in it.
 - A node a parent names that the store lacks is `KernelError::Store` naming the node, and the
   carry that met it drops the session whole (some rows were dropped, their readers not
-  reached); a root of another layout is refused naming the layout. Neither is read as empty.
+  reached); a root or a node of another layout (`s 1`, `t 1`: leaves of 8, lengths of four
+  bytes) is refused naming the layout. Neither is read as empty.
+
+Disk and gets against their floors (rule 67; `tests/cost.rs`, the session of 256 entries):
+
+- **Records.** A full save is 52 records, 0.2 an entry: three maps (rows, the facts' postings,
+  the steps' postings) of a root and 16 leaves each, and the root record. In general a map of
+  `n` keys is `n/64` to `n/4` leaves and a sixteenth as many branches. Layout 1 (leaves of 8)
+  wrote 537: by the shape's arithmetic each map of about 250 keys was a root, 16 branches and
+  a leaf for each of about 162 of 256 second nibbles (not counted map by map). A save after a
+  carry that repaired 2 entries and dropped the top is 5 records (the rows' root, three
+  leaves, the root record; 8 in layout 1): `1 + log16(n/64)` nodes a changed row, the floor of
+  a map on a write-once store. What it trades: a changed row writes its leaf's other rows
+  again, at most 63 of about 100 bytes.
+- **Bytes.** Counts and lengths are one byte where they are under 128 (layout 1: four and
+  eight). The saved session is 73,642 bytes, 287 an entry, beside the entries' own 68,615, 268
+  an entry (their read-lists and entry records, 512 records: two an entry, where one record an
+  entry with its list inline, for an identity of one list, would halve the store's overhead a
+  record; that is `blaze-record`'s to build). So the session is 107% of the entries' bytes,
+  not within a tenth, and not at its own floor (a row: its identity, entry key and value hash; a posting: its name and
+  32 bytes a reader). Owed, each a change of layout: the 32-byte key of a posting in its leaf
+  is the hash of the name beside it (about a fifth of the bytes: derive it when a leaf is
+  written, find by name when it is read); a step's name is kept in its row and in its posting,
+  and the posting names its own row by identity (33 bytes) where the row could be found from
+  the name; readers are 32-byte identities where a row number kept with the session would be
+  one to four bytes, which is what decides the bytes once entries have many reads.
+- **Gets of an opened session.** A node is read from the store once in one carry or one
+  request (`trie::Nodes`, emptied at its end), so rows and postings cost the nodes they are
+  in, not a path each: a get of the top is 3 gets (its row's root and leaf, its entry), a
+  carry of one fact that cuts off is 9 (its 5, and a root and a leaf for the posting and for
+  the row), a carry of the path is its 26 and 17 nodes that hold the 21 rows and postings it
+  reaches (43 gets; 89 in layout 1: 3 nodes for each of the 21). The floor is one get for each record
+  that holds something needed; over it, each map's root is one get more a carry.
 
 Tests (`tests/cost.rs`): a session saved and opened carries with the same `Carried` and the
-same bytes as one never saved; a save after a carry that repaired 2 of 256 entries writes at
-most 8 records; an opened session's get of the top reads its row's path and its entry; a carry
-of one fact reads that fact's posting and the rows it reaches. `exhaustive/nested.rs` has the
+same bytes as one never saved; a save after a carry that repaired 2 of 256 entries writes 5
+records; an opened session's get of the top reads its row's path and its entry; a carry of
+one fact reads that fact's posting and the rows it reaches; a count in a record has one form.
+`exhaustive/nested.rs` has the
 way "save, drop, open" at every step (16^4 sequences a start) and the control
 `a_session_opened_without_its_postings_is_caught`.
 
@@ -355,7 +402,7 @@ Owed: a deterministic simulation of the driver's root swap (a crash at each put 
 then `open` of the old root) once a driver holds a root, in `blaze-storemodel`; the save is
 not in that model yet. Not built: compaction of postings left by rows that were dropped,
 heights raised when a child grows taller without its value changing (such a parent may be
-repaired twice in a later carry; never wrongly), and the cover.
+repaired twice in a later carry; never wrongly).
 
 ### (c) What a lookup costs
 

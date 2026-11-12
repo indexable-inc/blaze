@@ -325,6 +325,7 @@ fn a_world_that_moved_under_a_session_is_refused() {
 // so that anything that touches every entry is seen at once: 240 reads valued, hundreds of gets.
 
 const TILE: ReadKind = ReadKind(2);
+const DIGEST: ReadKind = ReadKind(3);
 const LEAVES: u8 = 240;
 const GROUPS: u8 = 15;
 
@@ -342,7 +343,25 @@ impl World for Wide {
                 "blaze v2 kernel cost test tile 1",
                 &[self.facts[usize::from(at)]],
             ))),
+            // A group's interface digest: of its 16 facts halved, which is all a leaf's
+            // value shows of a fact. It ignores each fact's low bit, as no value can see it.
+            (DIGEST, &[group]) => {
+                let from = usize::from(group) * 16;
+                let halves: Vec<u8> = self.facts[from..from + 16].iter().map(|it| it / 2).collect();
+                Ok(Seen::Is(ContentId::of("blaze v2 kernel cost test digest 1", &halves)))
+            }
             _ => Err(WorldError::new(read, "no such fact")),
+        }
+    }
+
+    fn cover<'r>(&'r self, read: Read<'r>) -> Option<Read<'r>> {
+        static GROUPS_BY_NUMBER: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        match (read.kind, read.key) {
+            (TILE, &[at]) => {
+                let group = usize::from(at) / 16;
+                Some(Read { kind: DIGEST, key: &GROUPS_BY_NUMBER[group..group + 1] })
+            }
+            _ => None,
         }
     }
 
@@ -495,6 +514,11 @@ impl Built {
         let had = self.store.values.len();
         let root = self.session.save(&mut self.store).unwrap();
         (root, self.store.values.len() - had)
+    }
+
+    /// The bytes of every record in the store: what the store keeps beside its own overhead.
+    fn bytes(&self) -> usize {
+        self.store.values.values().map(Vec::len).sum()
     }
 
     /// Drops the session and opens it from `root`, as another process would: what that costs.
@@ -681,8 +705,16 @@ impl Compute for Bare2 {
 /// one that was never saved: the same `Carried`, the same bytes, and the bytes of a fresh run.
 /// Opened, it holds nothing but its root; the carry reads the changed fact's posting and the
 /// rows on the path (and the rows of the 15 leaves its group's run asks for), never the
-/// session: its gets are the path's 26 and at most 3 nodes for each of those rows and
-/// postings.
+/// session.
+///
+/// Its gets against the 26 of the session in memory (the floor of an opened one is those and
+/// one get for each record that holds something it needs): 21 rows and postings are looked for
+/// (the fact's posting, the leaf's row and posting, the group's row and posting, the whole's
+/// row, 15 leaves' rows), in three maps of a root and 16 leaves each. A node is read once a
+/// carry (`trie::Nodes`), so they cost the nodes they are in: 2 of the facts' postings, 2 or 3
+/// of the steps' postings, the rows' root and one leaf for each first nibble among 18
+/// identities. With leaves of 8 and every path read from its root (layout 1) it was 89: the
+/// 26 and 3 nodes for each of the 21.
 #[test]
 fn a_session_opened_from_the_store_carries_as_the_one_that_was_saved() {
     let mut kept = built();
@@ -693,6 +725,7 @@ fn a_session_opened_from_the_store_carries_as_the_one_that_was_saved() {
     let mut built = built();
     let (root, written) = built.save();
     println!("first save of 256 entries: {written} records");
+    assert_eq!(written, 3 * 17 + 1, "three maps of a root and 16 leaves, and the root record");
     assert_eq!(built.save(), (root, 0), "a save of nothing changed writes nothing");
     assert_eq!(built.reopen(root), Cost { probes: 0, gets: 1, valued: 0 });
     assert_eq!((built.session.len(), built.session.held()), (256, (0, 0)));
@@ -701,9 +734,9 @@ fn a_session_opened_from_the_store_carries_as_the_one_that_was_saved() {
     println!("path carry after open: {carried:?} {cost:?} held {:?}", built.session.held());
     assert_eq!(carried, carried_kept);
     assert_eq!((cost.probes, cost.valued), (0, 2), "{cost:?}");
-    // The fact's posting, the leaf's row and posting, the group's row and posting, the
-    // whole's row, 15 leaves' rows: 21 paths.
-    assert!(cost.gets > 26 && cost.gets <= 26 + 21 * 3, "{cost:?}");
+    // 17 nodes: 2 of the facts' postings, 2 or 3 of the steps', the rows' root, and the 11
+    // or 12 leaves the 18 rows are in (which of the two the nibbles of their hashes decide).
+    assert_eq!(cost.gets, 26 + 17, "{cost:?}");
     assert_eq!(built.session.held().0, 18, "the leaves of one group, the group and the whole");
     let (hit, value, _) = built.whole();
     assert_eq!((hit, &value), (hit_kept, &value_kept));
@@ -716,30 +749,48 @@ fn a_session_opened_from_the_store_carries_as_the_one_that_was_saved() {
     println!("get of the top after open: {cost:?}");
     assert!(hit);
     assert_eq!(value, built.fresh());
-    assert_eq!((cost.probes, cost.valued), (0, 0), "{cost:?}");
-    assert!(cost.gets >= 2 && cost.gets <= 1 + 3, "its row's path and its entry: {cost:?}");
+    assert_eq!(cost, Cost { probes: 0, gets: 2 + 1, valued: 0 }, "its row's root and leaf, its entry");
     assert_eq!(built.session.held(), (1, 0));
 }
 
 /// A save writes the paths of what changed, not the session: after a carry that repaired two
 /// entries and dropped the top, three rows differ (no posting does: their lists were posted),
-/// so at most a root node, three nodes under it, three leaves, and the root record.
+/// so the rows' root, the three leaves they are in, and the root record: 5 records, which is
+/// the floor of a map kept as write-once records (a changed row is a new leaf, a new leaf a
+/// new root). Layout 1 wrote 8 (a branch more a row) and 537 for the whole.
+///
+/// The disk floor (rule 67). Records: 52 for 256 entries, 0.2 an entry, beside the records
+/// of the entries themselves (printed below), so the session adds that share to the store's
+/// overhead a record. Bytes: the session's 73,642 against the entries' own 68,615 (287 and 268
+/// an entry): 107% of them, where the bar is a tenth; what is owed to bring them down is in
+/// kernel.md.
 #[test]
 fn a_save_writes_the_paths_of_what_changed() {
     let mut built = built();
+    let own = built.bytes();
+    println!("records of the 256 entries themselves: {}", built.store.values.len());
     let (root, whole) = built.save();
+    let session = built.bytes() - own;
+    println!(
+        "bytes: the 256 entries' own {own} ({} an entry), the saved session {session} ({} an entry)",
+        own / 256,
+        session / 256
+    );
+    // 268 bytes an entry of its own, 287 of the session: 107%, where the bar is 10%.
+    assert_eq!((own, session), (68_615, 73_642));
+    assert_eq!(built.store.values.len(), 512 + 52, "an entry is two records: its list and itself");
     let changed = built.set(37, 12);
     built.carry(&changed);
     let (next, written) = built.save();
     println!("save: {whole} records for 256 entries, {written} after a carry that repaired 2");
     assert_ne!(next, root);
-    assert!(whole >= 3 * 256 / 8 && whole <= 900, "{whole}");
-    assert!(written >= 3 && written <= 8, "{written}");
+    assert_eq!((whole, written), (3 * 17 + 1, 1 + 3 + 1));
 }
 
 /// A session opened and carried over one changed fact whose leaf comes out the same reads
-/// that fact's posting and that leaf's row (a path each), and the leaf's lookup, run and keep
-/// (5 gets, as with the session in memory): one row and two names are in memory after it.
+/// that fact's posting and that leaf's row (a root and a leaf each: 4 gets, which is the
+/// floor less one, were a posting and a row in one record), and the leaf's lookup, run and
+/// keep (5 gets, as with the session in memory): one row and two names are in memory after it.
 #[test]
 fn an_opened_session_reads_only_what_a_carry_reaches() {
     let mut built = built();
@@ -749,30 +800,64 @@ fn an_opened_session_reads_only_what_a_carry_reaches() {
     let (carried, cost) = built.carry(&changed);
     println!("cutoff carry after open: {carried:?} {cost:?}");
     assert_eq!(carried, Carried { seeded: 1, repaired: 1, cut: 1, ..NOTHING });
-    assert_eq!((cost.probes, cost.valued), (0, 2), "{cost:?}");
-    assert!(cost.gets >= 5 + 2 * 2 && cost.gets <= 5 + 2 * 3, "{cost:?}");
+    assert_eq!(cost, Cost { probes: 0, gets: 5 + 2 * 2, valued: 2 });
     assert_eq!(built.session.held(), (1, 2), "the leaf; the fact's name and the leaf's own");
     assert_eq!(built.session.len(), 256);
 }
 
-/// Rule 26, the previous layout: a root record of layout 0 is refused naming the layout, and
-/// so is a root the store does not have; neither opens as an empty session.
+/// Rule 26, the previous layout: a root record of layout 1 (leaves of 8, lengths of four
+/// bytes) is refused naming the layout, and so is a root the store does not have; neither
+/// opens as an empty session. A node of layout 1 under a root of this layout is refused the
+/// same way by the carry that reads it.
 #[test]
 fn a_saved_session_of_another_layout_is_refused_by_name() {
     let mut built = built();
     let (root, _) = built.save();
     let mut bytes = built.store.values.get(&root).unwrap().clone();
-    assert_eq!(&bytes[..16], b"blaze kernel s 1");
-    bytes[15] = b'0';
+    assert_eq!(&bytes[..16], b"blaze kernel s 2");
+    bytes[15] = b'1';
     let old = Key(ContentId::of("blaze v2 kernel cost test old root 1", &bytes));
     built.store.values.insert(old, bytes);
     let refused = Session::open(&built.store, old).map(|_| ()).unwrap_err();
     assert!(matches!(&refused, KernelError::Store { key, .. } if *key == old), "{refused}");
-    assert!(refused.to_string().contains("blaze kernel s 0"), "{refused}");
+    assert!(refused.to_string().contains("blaze kernel s 1"), "{refused}");
     let nowhere = Key(ContentId([9; 32]));
     let refused = Session::open(&built.store, nowhere).map(|_| ()).unwrap_err();
     assert!(matches!(&refused, KernelError::Store { key, .. } if *key == nowhere), "{refused}");
     assert!(refused.to_string().contains("missing"), "{refused}");
+
+    let node = built.session.posts_root(TILE).unwrap();
+    let bytes = built.store.values.get_mut(&node).unwrap();
+    assert_eq!(&bytes[..16], b"blaze kernel t 2");
+    bytes[15] = b'1';
+    built.reopen(root);
+    let changed = built.set(37, 12);
+    let refused = built
+        .kernel
+        .carry(&mut built.session, &mut built.store, &built.world, &changed, &Setting::OFF)
+        .unwrap_err();
+    assert!(matches!(&refused, KernelError::Store { key, .. } if *key == node), "{refused}");
+    assert!(refused.to_string().contains("session node of layout 1"), "{refused}");
+    assert_eq!(built.session.len(), 0);
+}
+
+/// A count in a session's records has one form (rule 25): what `put_var` writes is read back,
+/// and the same number written longer, or one past 64 bits, is no record.
+#[test]
+fn a_count_in_a_session_record_has_one_form() {
+    use crate::trie::{Cursor, put_var};
+    for value in [0, 1, 127, 128, 16_383, 16_384, u64::from(u32::MAX), u64::MAX] {
+        let mut bytes = Vec::new();
+        put_var(&mut bytes, value);
+        let mut input = Cursor::new(&bytes);
+        assert_eq!((input.var(), input.ended()), (Some(value), true), "{value}");
+    }
+    assert_eq!(Cursor::new(&[0x7f]).var(), Some(127));
+    assert_eq!(Cursor::new(&[0x80, 0x00]).var(), None, "0 written in two bytes");
+    assert_eq!(Cursor::new(&[0xff; 9]).var(), None, "ends before its last byte");
+    let mut past = [0xff; 10];
+    past[9] = 0x02;
+    assert_eq!(Cursor::new(&past).var(), None, "a bit past the 64th");
 }
 
 /// Rule 26, the lost record: a posting node the store no longer has is an error naming the
@@ -797,4 +882,130 @@ fn a_posting_node_the_store_lost_is_an_error_naming_it() {
     built.session = Session::new(&built.world);
     let (_, value, _) = built.whole();
     assert_eq!(value, built.fresh());
+}
+
+// The cover (docs/v2/plan/design/kernel.md, "A covering digest"): a step whose one read is a
+// group's interface digest and whose value is the manifest of the group and its 16 leaves.
+
+/// The cover's step: a [`Step`] only. A cover is kept by the kernel, never run or asked for
+/// by a step, so it has no `Compute` and no `Ask` (which [`step!`] would give it).
+struct Crate;
+
+impl Step for Crate {
+    const ID: StepId = StepId(0x7f45);
+    const NAME: &'static str = "cost cover of a group";
+    const KIND: Kind = Kind::Query;
+    type Input = u8;
+
+    fn subject(input: &u8) -> Subject {
+        Subject { of: ContentId::of("cost cover of a group", &[*input]), flags: ContentId::default() }
+    }
+
+    fn label(input: &u8) -> String {
+        format!("cost cover of a group {input}")
+    }
+}
+
+/// A kernel with the cover, a store that holds group 2, its leaves and the cover over the
+/// 17, and the world they were made in.
+fn covered() -> (Kernel<Wide>, Memory, Wide) {
+    let mut kernel = wide_kernel();
+    kernel.register_cover::<Crate>(CodeId(ContentId([45; 32]))).unwrap();
+    let mut store = Memory::default();
+    let world = Wide { facts: vec![8; 256], valued: Cell::new(0) };
+    let mut session = Session::new(&world);
+    kernel.get_in::<Group, _>(&mut session, &mut store, &world, &2, &Setting::OFF).unwrap();
+    let mut members = crate::Members::default();
+    for leaf in 32..48u8 {
+        kernel.member::<Leaf, _>(&mut members, &mut session, &store, &leaf).unwrap();
+    }
+    // The group without its leaves' digest, and a leaf of another group, are refused by name.
+    let other = [Read { kind: DIGEST, key: &[3] }];
+    let refused =
+        kernel.cover::<Crate, _>(&mut session, &mut store, &world, &2, &other, &members).unwrap_err();
+    assert!(matches!(&refused, KernelError::Uncovered { .. }), "{refused}");
+    assert!(refused.to_string().contains("under none of the cover's reads"), "{refused}");
+    let mut alone = crate::Members::default();
+    kernel.member::<Group, _>(&mut alone, &mut session, &store, &2).unwrap();
+    let digest = [Read { kind: DIGEST, key: &[2] }];
+    let refused =
+        kernel.cover::<Crate, _>(&mut session, &mut store, &world, &2, &digest, &alone).unwrap_err();
+    assert!(refused.to_string().contains("not a member of the cover"), "{refused}");
+    kernel.member::<Group, _>(&mut members, &mut session, &store, &2).unwrap();
+    kernel.cover::<Crate, _>(&mut session, &mut store, &world, &2, &digest, &members).unwrap();
+    (kernel, store, world)
+}
+
+fn group_now(kernel: &Kernel<Wide>, world: &Wide) -> Vec<u8> {
+    let world = Wide { facts: world.facts.clone(), valued: Cell::new(0) };
+    let mut fresh = Memory::default();
+    kernel.get::<Group, _>(&mut fresh, &world, &2, &Setting::OFF).unwrap().value().to_vec()
+}
+
+/// A new session seeded through a cover of 17 members values the cover's one read and none
+/// of the members' 16, and reads the cover's records and none of the members' 34: the floor
+/// is one read valued and one get (the manifest). Each member is then a session hit: one get.
+#[test]
+fn a_cover_seeds_its_members_with_none_of_their_reads_valued() {
+    let (kernel, mut store, world) = covered();
+    let mut session = Session::new(&world);
+    (store.gets.set(0), store.probes.set(0), world.valued.set(0));
+    let seeded = kernel.seed::<Crate, _>(&mut session, &store, &world, &2).unwrap();
+    let cost = (store.probes.get(), store.gets.get(), world.valued.get());
+    println!("seed through a cover of 17: {seeded:?} (probes, gets, valued) {cost:?}");
+    assert_eq!(seeded, Some(crate::Seeded { members: 17, admitted: 17 }));
+    assert_eq!(cost.2, 1, "the cover's digest, and no member's read");
+    // To pin once it is printed: the cover's list, its entry, the entry again for its value.
+    assert!(cost.1 >= 1 && cost.1 <= 4, "{cost:?}");
+    assert_eq!(session.len(), 18);
+    (store.gets.set(0), store.probes.set(0), world.valued.set(0));
+    let got = kernel.get_in::<Group, _>(&mut session, &mut store, &world, &2, &Setting::OFF).unwrap();
+    assert!(got.is_hit());
+    assert_eq!(got.value(), group_now(&kernel, &world));
+    drop(got);
+    assert_eq!((store.probes.get(), store.gets.get(), world.valued.get()), (0, 1, 0));
+    assert_eq!(kernel.seed::<Crate, _>(&mut session, &store, &world, &2).unwrap().map(|it| it.admitted), Some(0));
+    let mut empty = Session::new(&world);
+    assert_eq!(kernel.seed::<Crate, _>(&mut empty, &store, &world, &3).unwrap(), None);
+}
+
+/// Seeds through the cover, changes fact 37 to `to` and carries: what the carry did, the
+/// group's bytes in the session after it, and the bytes of a fresh run.
+fn seeded_then_carried(to: u8) -> (Carried, Vec<u8>, Vec<u8>) {
+    let (kernel, mut store, mut world) = covered();
+    let mut session = Session::new(&world);
+    kernel.seed::<Crate, _>(&mut session, &store, &world, &2).unwrap().unwrap();
+    let from = world.pin();
+    world.facts[37] = to;
+    let mut changed = Changed::between(from, world.pin());
+    changed.differs(Read { kind: TILE, key: &[37] });
+    changed.exact(DIGEST);
+    if to / 2 != 4 {
+        changed.differs(Read { kind: DIGEST, key: &[2] });
+    }
+    let carried = kernel.carry(&mut session, &mut store, &world, &changed, &Setting::OFF).unwrap();
+    let got = kernel.get_in::<Group, _>(&mut session, &mut store, &world, &2, &Setting::OFF).unwrap();
+    let value = got.value().to_vec();
+    drop(got);
+    (carried, value, group_now(&kernel, &world))
+}
+
+/// Invariant I5: a member admitted through a cover is reached by a change of the cover's
+/// read. A fact that changes inside what the interface digest ignores reaches nothing (no
+/// value can show it); one the digest shows drops the cover and its 17 members, which are
+/// then looked up through their own lists. Control: with the posting from the cover to its
+/// members left out, the carry reaches the cover alone and the group's stale bytes are served.
+#[test]
+fn a_member_admitted_through_a_cover_is_dropped_with_it() {
+    use crate::nest::planted::{self, Bug};
+    let (carried, value, fresh) = seeded_then_carried(9);
+    assert_eq!((carried, &value), (NOTHING, &fresh));
+    let (carried, value, fresh) = seeded_then_carried(12);
+    assert_eq!(carried, Carried { seeded: 1, gone: 18, ..NOTHING });
+    assert_eq!(value, fresh);
+    planted::plant(Bug::CoverUnposted);
+    let (carried, value, fresh) = seeded_then_carried(12);
+    planted::plant(Bug::None);
+    assert_eq!(carried, Carried { seeded: 1, gone: 1, ..NOTHING });
+    assert_ne!(value, fresh, "the planted bug was not caught: a member outlived its cover");
 }

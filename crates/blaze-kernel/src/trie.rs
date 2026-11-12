@@ -3,16 +3,28 @@
 //! session's rows and postings are saved as (docs/v2/plan/design/kernel.md, "Carrying a
 //! session").
 //!
-//! - **Nothing of it is held in memory.** [`get`] reads the nodes from a root to one key;
-//!   [`update`] reads the paths to the keys it changes, writes those paths anew and gives the
-//!   new root. Every node no change is under is shared by the old root and the new.
+//! - **Nothing of it is held in memory past a carry or a request.** [`get`] reads the nodes
+//!   from a root to one key; [`update`] reads the paths to the keys it changes, writes those
+//!   paths anew and gives the new root. Every node no change is under is shared by the old
+//!   root and the new. A node is under the hash of its bytes, so one read is good for ever:
+//!   [`Nodes`] keeps the nodes one carry or one request read, so that each costs one get of
+//!   the store however many keys are looked for under it, and is emptied when that ends.
 //! - **A node's bytes are a function of the entries under it** (rule 25): a subtree of at most
 //!   [`LEAF`] entries is one leaf, its entries in key order; any other is a branch of its
 //!   children in nibble order. Nothing is ever taken out, so an update keeps that form.
+//! - **What it costs on disk.** The store pays a fixed overhead a record
+//!   (docs/v2/plan/design/end-state/disk.md), so the records are what is counted: a map of `n`
+//!   keys is between `n / 64` and `n / 4` leaves (a leaf of 65 becomes up to 16) and a
+//!   sixteenth as many branches, at most about 0.27 records a key. A changed key writes its
+//!   leaf and the branches above it anew: `1 + log16(n / LEAF)` records, the leaf's other
+//!   entries (at most 63) written again with it. Layout 1 had leaves of at most 8, which at 256
+//!   keys is a leaf for every 1.5 keys under 17 branches.
 //! - **Children are written before their parent** and a root's key is given only after its
 //!   put: a save that stops part way leaves nodes no root names, never a root with a node
 //!   missing. A node a parent names that the store does not have is an error naming its key
 //!   ([`Broken`]), never read as an empty subtree.
+
+use std::alloc::Global;
 
 use blaze_cas::{Key, Kind};
 use blaze_ids::ContentId;
@@ -20,13 +32,15 @@ use blaze_ids::ContentId;
 use crate::store::{Get, Put};
 
 /// `blaze kernel t`, then the layout's number.
-const MAGIC: [u8; 16] = *b"blaze kernel t 1";
+const MAGIC: [u8; 16] = *b"blaze kernel t 2";
 const TAG_LEAF: u8 = 0;
 const TAG_BRANCH: u8 = 1;
 
-/// The most entries of a leaf above the last nibble: a row or a posting is a few hundred
-/// bytes, so a leaf is a few kilobytes at most and a path is `log16(n / LEAF)` branches.
-pub(crate) const LEAF: usize = 8;
+/// The most entries of a leaf above the last nibble: a row or a posting is about a hundred
+/// bytes, so a leaf is a few kilobytes and a path is `log16(n / LEAF)` branches. Wider, a
+/// changed key writes more bytes again; narrower, the store's overhead a record is paid more
+/// often than the entries are worth (the module's doc has the counts).
+pub(crate) const LEAF: usize = 64;
 
 /// A key's nibbles: a branch at this depth has nothing to branch on.
 const DEEPEST: usize = 64;
@@ -68,12 +82,31 @@ impl<'s> Cursor<'s> {
         Some(u16::from_be_bytes(self.take(2)?.try_into().ok()?))
     }
 
-    pub(crate) fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_be_bytes(self.take(4)?.try_into().ok()?))
-    }
-
     pub(crate) fn u64(&mut self) -> Option<u64> {
         Some(u64::from_be_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    /// A count or a length as [`put_var`] writes it, and in no other form (rule 25): none
+    /// with a zero byte at its end, none past 64 bits.
+    pub(crate) fn var(&mut self) -> Option<u64> {
+        let mut value = 0u64;
+        // Bounded (rule 18): ten bytes hold 64 bits.
+        for at in 0..10u32 {
+            let byte = self.u8()?;
+            value |= u64::from(byte & 0x7f) << (7 * at);
+            if byte & 0x80 == 0 {
+                let shortest = at == 0 || byte != 0;
+                let fits = at < 9 || byte <= 1;
+                return (shortest && fits).then_some(value);
+            }
+        }
+        None
+    }
+
+    /// A length as [`Cursor::var`] reads it, then that many bytes.
+    pub(crate) fn counted(&mut self) -> Option<&'s [u8]> {
+        let len = usize::try_from(self.var()?).ok()?;
+        self.take(len)
     }
 
     pub(crate) fn id(&mut self) -> Option<ContentId> {
@@ -105,6 +138,22 @@ pub(crate) fn put_maybe_id(out: &mut Vec<u8>, id: Option<ContentId>) {
     }
 }
 
+/// Appends a count or a length: 7 bits a byte, the lowest first, each byte but the last with
+/// its high bit set. One byte under 128, which a name's length and a row's height are.
+pub(crate) fn put_var(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value & 0x7f) as u8 | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+/// Appends a length ([`put_var`]), then the bytes it counts ([`Cursor::counted`]).
+pub(crate) fn put_counted(out: &mut Vec<u8>, bytes: &[u8]) {
+    put_var(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
 /// A node as its record says it, read in place.
 enum Node<'s> {
     /// Its entries, in key order.
@@ -113,18 +162,21 @@ enum Node<'s> {
     Branch { bitmap: u16, children: &'s [u8] },
 }
 
-fn read<'s, G: Get + ?Sized>(store: &'s G, key: Key) -> Result<Node<'s>, Broken> {
-    let bytes = match store.get(&key) {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => {
-            return Err(broken(
-                key,
-                "a node of a session's rows or postings is missing: the node above it names it, so its entries are not known (never read as none)",
-            ));
-        }
-        Err(why) => return Err(Broken { key, why }),
-    };
-    parse(bytes).ok_or_else(|| match bytes.get(..MAGIC.len()) {
+/// The bytes the store keeps under a node's key: one get.
+fn fetch<G: Get + ?Sized>(store: &G, key: Key) -> Result<&[u8], Broken> {
+    match store.get(&key) {
+        Ok(Some(bytes)) => Ok(bytes),
+        Ok(None) => Err(broken(
+            key,
+            "a node of a session's rows or postings is missing: the node above it names it, so its entries are not known (never read as none)",
+        )),
+        Err(why) => Err(Broken { key, why }),
+    }
+}
+
+/// Why `bytes`, kept under `key`, are no node this blaze reads: another layout by its number.
+fn unparsed(key: Key, bytes: &[u8]) -> Broken {
+    match bytes.get(..MAGIC.len()) {
         Some(magic) if magic[..MAGIC.len() - 1] == MAGIC[..MAGIC.len() - 1] => Broken {
             key,
             // alloc: an error
@@ -135,7 +187,53 @@ fn read<'s, G: Get + ?Sized>(store: &'s G, key: Key) -> Result<Node<'s>, Broken>
             ),
         },
         _ => broken(key, "its value is no session node"),
-    })
+    }
+}
+
+fn read<G: Get + ?Sized>(store: &G, key: Key) -> Result<Node<'_>, Broken> {
+    let bytes = fetch(store, key)?;
+    parse(bytes).ok_or_else(|| unparsed(key, bytes))
+}
+
+/// The nodes read since it was last emptied, by key: what makes a node cost one get of the
+/// store in one carry or one request, however many rows and postings are looked for under it
+/// (the root of a map is on every path). A node is under the hash of its own bytes, so what
+/// is held is never out of date; it is emptied for its memory alone, by the session at the
+/// end of each request and each carry.
+#[cfg_attr(test, derive(Clone))]
+pub(crate) struct Nodes {
+    held: blaze_hash::HashMap<Key, Box<[u8]>, Global>,
+}
+
+impl Nodes {
+    pub(crate) fn new() -> Nodes {
+        // alloc: none until a node is read
+        Nodes { held: blaze_hash::HashMap::new_in(Global) }
+    }
+
+    /// Lets go of every node it holds.
+    pub(crate) fn clear(&mut self) {
+        // Asked at the start and the end of every request: nothing to do for most.
+        if !self.held.is_empty() {
+            self.held.clear();
+        }
+    }
+
+    /// How many nodes it holds.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    /// The node under `key`: from the store the first time, from here after.
+    fn read<G: Get + ?Sized>(&mut self, store: &G, key: Key) -> Result<Node<'_>, Broken> {
+        if !self.held.contains_key(&key) {
+            // alloc: one node's bytes, until the carry or request that read it ends
+            self.held.insert(key, Box::from(fetch(store, key)?));
+        }
+        let bytes = &**self.held.get(&key).expect("the node put in just above");
+        parse(bytes).ok_or_else(|| unparsed(key, bytes))
+    }
 }
 
 fn parse(bytes: &[u8]) -> Option<Node<'_>> {
@@ -150,8 +248,7 @@ fn parse(bytes: &[u8]) -> Option<Node<'_>> {
             let mut entries = Vec::with_capacity(count.min(LEAF));
             for _ in 0..count {
                 let key = input.id()?;
-                let len = input.u32()? as usize;
-                entries.push((key, input.take(len)?));
+                entries.push((key, input.counted()?));
             }
             input.ended().then_some(Node::Leaf(entries))
         }
@@ -182,10 +279,11 @@ fn child(bitmap: u16, children: &[u8], nibble: usize) -> Option<Key> {
     Some(Key(ContentId(key)))
 }
 
-/// What the map under `root` holds for `key`: one get a node on the way, none where the map
-/// has no such key. No root is the empty map.
+/// What the map under `root` holds for `key`: one get a node on the way that `nodes` does not
+/// hold, none where the map has no such key. No root is the empty map.
 pub(crate) fn get<G: Get + ?Sized>(
     store: &G,
+    nodes: &mut Nodes,
     root: Option<Key>,
     key: &ContentId,
 ) -> Result<Option<Vec<u8>>, Broken> {
@@ -194,7 +292,7 @@ pub(crate) fn get<G: Get + ?Sized>(
     };
     // Bounded (rule 18): a node a nibble of the key, and a branch past the last is refused.
     for depth in 0..=DEEPEST {
-        match read(store, at)? {
+        match nodes.read(store, at)? {
             Node::Leaf(entries) => {
                 // alloc: the value found, handed to the session that asked
                 return Ok(entries.iter().find(|(it, _)| it == key).map(|(_, value)| value.to_vec()));
@@ -337,7 +435,7 @@ fn pack<P: Put + ?Sized>(
     if entries.len() <= LEAF || depth == DEEPEST {
         // alloc: one node's record
         let mut bytes = Vec::with_capacity(
-            MAGIC.len() + 3 + entries.iter().map(|(_, value)| 36 + value.len()).sum::<usize>(),
+            MAGIC.len() + 3 + entries.iter().map(|(_, value)| 34 + value.len()).sum::<usize>(),
         );
         bytes.extend_from_slice(&MAGIC);
         bytes.push(TAG_LEAF);
@@ -345,9 +443,7 @@ fn pack<P: Put + ?Sized>(
         bytes.extend_from_slice(&count.to_be_bytes());
         for (key, value) in &entries {
             bytes.extend_from_slice(&key.0);
-            let len = u32::try_from(value.len()).expect("a row or a posting is counted in u32");
-            bytes.extend_from_slice(&len.to_be_bytes());
-            bytes.extend_from_slice(value);
+            put_counted(&mut bytes, value);
         }
         return write(store, bytes);
     }

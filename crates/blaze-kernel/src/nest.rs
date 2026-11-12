@@ -962,6 +962,19 @@ pub(crate) fn carry<W: World + ?Sized>(
         // when it is next asked for.
         // alloc: one repair's key, apart from the session its lookup writes in
         let key = session.asked(row).map(<[u8]>::to_vec);
+        // A cover is never looked up by a carry (to run one is to ask for every member): it
+        // is dropped, and so is every member admitted through it, each then looked up
+        // through its own lists as any dropped row is (invariant I5).
+        if key.as_deref().is_some_and(|key| kernel.is_cover(key)) {
+            if !session.is_live(row) {
+                carried.gone += 1;
+            }
+            if let Err(error) = dirty_readers(session, &*store, row, &mut queue) {
+                session.clear();
+                return Err(error);
+            }
+            continue;
+        }
         let (Some(key), Some(was)) = (key, was) else {
             if !session.is_live(row) {
                 carried.gone += 1;
@@ -998,23 +1011,33 @@ pub(crate) fn carry<W: World + ?Sized>(
         }
         // Its readers, read from the store where they are not in memory. A store that fails
         // here leaves rows dropped whose readers were not reached: the session is dropped.
-        if let Err(error) = session.load_readers(&*store, row) {
+        if let Err(error) = dirty_readers(session, &*store, row, &mut queue) {
             session.clear();
             return Err(error);
-        }
-        let mut n = 0;
-        while let Some(reader) = session.reader(row, n) {
-            n += 1;
-            if queue.takes(reader)
-                && let Err(error) = session.dirty(&*store, reader, &mut queue)
-            {
-                session.clear();
-                return Err(error);
-            }
         }
     }
     session.leave(world)?;
     Ok(carried)
+}
+
+/// Drops and queues every reader of `row` the queue still takes, its readers read from the
+/// store where they are not in memory.
+fn dirty_readers(
+    session: &mut Session,
+    store: &dyn Put,
+    row: u32,
+    queue: &mut crate::session::Queue,
+) -> Result<(), KernelError> {
+    session.load_readers(store, row)?;
+    let mut n = 0;
+    // Bounded (rule 18): one turn a reader of one posting.
+    while let Some(reader) = session.reader(row, n) {
+        n += 1;
+        if queue.takes(reader) {
+            session.dirty(store, reader, queue)?;
+        }
+    }
+    Ok(())
 }
 
 /// A hit's value computed again, for lane verify's check.
@@ -1100,6 +1123,9 @@ pub(crate) mod planted {
         /// A carry repairs the highest queued entry first, and one repaired is not queued
         /// again: a parent is looked up before the child it reads (invariant I3).
         ParentFirst,
+        /// A member admitted through a cover is not posted as the cover's reader (invariant
+        /// I5): a covering read that changes drops the cover and leaves the member verified.
+        CoverUnposted,
         /// A session opened from the store reads no posting back: a name's readers are only
         /// those posted since it was opened (rule 26: a restore never silently starts empty).
         OpenUnposted,

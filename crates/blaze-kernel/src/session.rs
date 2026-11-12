@@ -43,11 +43,11 @@ use crate::Seen;
 #[cfg(test)]
 use crate::nest::planted::{self, Bug};
 use crate::store::{Get, Put};
-use crate::trie::{self, Broken, Cursor};
+use crate::trie::{self, Broken, Cursor, Nodes};
 use crate::{KernelError, Of, Pin, Read, ReadKind, StepId, World, entry, hex};
 
 /// `blaze kernel s`, then the layout's number: the root record of a saved session.
-const ROOT_MAGIC: [u8; 16] = *b"blaze kernel s 1";
+const ROOT_MAGIC: [u8; 16] = *b"blaze kernel s 2";
 
 /// The key of a read's postings in the map of its kind: the hash of its name.
 fn name_key(name: &[u8]) -> ContentId {
@@ -149,6 +149,9 @@ pub(crate) enum By {
     Hit,
     /// It was computed now and kept.
     Keep,
+    /// A cover's manifest names it ([`Session::cover`]): its own lists are not read, and the
+    /// one posting written is from the cover to it (invariant I5).
+    Cover,
 }
 
 /// The postings of one list of one identity are written: what [`Session::admit`] takes. Only
@@ -190,6 +193,9 @@ pub struct Session {
     /// The rows and names that differ from what the store keeps, each once.
     dirty_rows: Vec<u32>,
     dirty_posts: Vec<u32>,
+    /// The nodes of the store's maps that the request or carry now running read: each is one
+    /// get however many rows and postings are read under it. Empty between them.
+    nodes: Nodes,
     /// The name being looked for by [`Session::link`]: one buffer, reused.
     scratch: Vec<u8>,
     /// A planted bug's postings, written a carry late.
@@ -215,6 +221,7 @@ impl Session {
             dirty_rows: Vec::new(),
             // alloc: none until a posting changes
             dirty_posts: Vec::new(),
+            nodes: Nodes::new(),
             // alloc: none until a step's value is read
             scratch: Vec::new(),
             #[cfg(test)]
@@ -283,6 +290,7 @@ impl Session {
             dirty_rows: Vec::new(),
             // alloc: none until a posting changes
             dirty_posts: Vec::new(),
+            nodes: Nodes::new(),
             // alloc: none until a step's value is read
             scratch: Vec::new(),
             #[cfg(test)]
@@ -308,22 +316,22 @@ impl Session {
             let (name, post) = self.posts.get_index(at).expect("a changed name is in the session");
             let kind = entry::named(name).expect("a read's name starts with its kind").kind.0;
             // alloc: one posting's record
-            let mut bytes = Vec::with_capacity(4 + name.len() + 1 + 32 + 4 + 32 * post.readers.len());
-            let len = u32::try_from(name.len()).expect("a read's name is counted in u32");
-            bytes.extend_from_slice(&len.to_be_bytes());
-            bytes.extend_from_slice(name);
+            let mut bytes = Vec::with_capacity(2 + name.len() + 1 + 32 + 2 + 32 * post.readers.len());
+            trie::put_counted(&mut bytes, name);
             trie::put_maybe_id(&mut bytes, post.row.map(|row| self.id_of(row)));
             // alloc: one posting's readers by identity, in order (rule 25)
             let mut readers: Vec<[u8; 32]> = post.readers.iter().map(|row| self.id_of(*row).0).collect();
             readers.sort_unstable();
             readers.dedup();
-            let count = u32::try_from(readers.len()).expect("a session's rows are counted in u32");
-            bytes.extend_from_slice(&count.to_be_bytes());
+            trie::put_var(&mut bytes, readers.len() as u64);
             for reader in &readers {
                 bytes.extend_from_slice(reader);
             }
             posts.entry(kind).or_default().push((name_key(name), bytes));
         }
+        // The nodes read for the postings above are let go: the save's own reads are of the
+        // paths it writes, each once.
+        self.nodes.clear();
         // alloc: one save's new roots
         let mut roots: BTreeMap<u16, Key> = BTreeMap::new();
         for (kind, names) in self.kinds.iter() {
@@ -343,21 +351,19 @@ impl Session {
             let (id, it) = self.rows.get_index(*row as usize).expect("a changed row is in the session");
             let name = it.name.map(|at| &**self.posts.get_index(at as usize).expect("a row's name is in the session").0);
             // alloc: one row's record
-            let mut bytes = Vec::with_capacity(9 + 68 + name.map_or(0, |name| 4 + name.len()));
+            let mut bytes = Vec::with_capacity(2 + 66 + name.map_or(0, |name| 2 + name.len()));
             let hash = it.live.as_ref().and_then(|live| live.known.hash);
             bytes.push(u8::from(it.live.is_some()) | u8::from(hash.is_some()) << 1 | u8::from(name.is_some()) << 2);
-            bytes.extend_from_slice(&it.posted.to_be_bytes());
+            trie::put_var(&mut bytes, it.posted);
             if let Some(live) = &it.live {
                 bytes.extend_from_slice(&live.known.key.0.0);
-                bytes.extend_from_slice(&live.height.to_be_bytes());
+                trie::put_var(&mut bytes, u64::from(live.height));
                 if let Some(hash) = hash {
                     bytes.extend_from_slice(&hash.0);
                 }
             }
             if let Some(name) = name {
-                let len = u32::try_from(name.len()).expect("a read's name is counted in u32");
-                bytes.extend_from_slice(&len.to_be_bytes());
-                bytes.extend_from_slice(name);
+                trie::put_counted(&mut bytes, name);
             }
             rows.push((*id, bytes));
         }
@@ -423,13 +429,19 @@ impl Session {
     }
 
     /// The record the store keeps for the postings of `name`, none where it keeps none.
-    fn stored_post<G: Get + ?Sized>(&self, store: &G, name: &[u8]) -> Result<Option<Vec<u8>>, KernelError> {
+    /// Takes the session's kinds and nodes apart from it: `name` is borrowed from its names.
+    fn stored_post<G: Get + ?Sized>(
+        kinds: &blaze_hash::HashMap<u16, Names, Global>,
+        nodes: &mut Nodes,
+        store: &G,
+        name: &[u8],
+    ) -> Result<Option<Vec<u8>>, KernelError> {
         let kind = entry::named(name).expect("a read's name starts with its kind").kind.0;
-        let root = self.kinds.get(&kind).and_then(|names| names.root);
+        let root = kinds.get(&kind).and_then(|names| names.root);
         if root.is_none() || Session::planted_open() {
             return Ok(None);
         }
-        trie::get(store, root, &name_key(name)).map_err(broken)
+        trie::get(store, nodes, root, &name_key(name)).map_err(broken)
     }
 
     /// Reads in the readers the store keeps for the name at `at`, where they are not yet
@@ -439,7 +451,7 @@ impl Session {
         if post.loaded {
             return Ok(());
         }
-        if let Some(bytes) = self.stored_post(store, name)? {
+        if let Some(bytes) = Session::stored_post(&self.kinds, &mut self.nodes, store, name)? {
             self.merge_post(at, &bytes)?;
         }
         self.posts.get_index_mut(at).expect("a name by its place").1.loaded = true;
@@ -451,10 +463,9 @@ impl Session {
     fn merge_post(&mut self, at: usize, bytes: &[u8]) -> Result<(), KernelError> {
         let parsed = (|| {
             let mut input = Cursor::new(bytes);
-            let len = input.u32()? as usize;
-            input.take(len)?;
+            input.counted()?;
             let own = input.maybe_id()?;
-            let count = input.u32()? as usize;
+            let count = usize::try_from(input.var()?).ok()?;
             let readers = input.take(count.checked_mul(32)?)?;
             input.ended().then_some((own, readers))
         })();
@@ -498,7 +509,7 @@ impl Session {
         if self.rows[at as usize].loaded {
             return Ok(at);
         }
-        let stored = trie::get(store, self.rows_root, id).map_err(broken)?;
+        let stored = trie::get(store, &mut self.nodes, self.rows_root, id).map_err(broken)?;
         let (live, posted, name) = match &stored {
             None => (None, 0, None),
             Some(bytes) => Session::read_row(bytes).ok_or_else(|| {
@@ -521,12 +532,12 @@ impl Session {
     fn read_row(bytes: &[u8]) -> Option<(Option<Live>, u64, Option<&[u8]>)> {
         let mut input = Cursor::new(bytes);
         let flags = input.u8()?;
-        let posted = input.u64()?;
+        let posted = input.var()?;
         let live = match flags & 1 != 0 {
             false => None,
             true => {
                 let key = Key(input.id()?);
-                let height = input.u32()?;
+                let height = u32::try_from(input.var()?).ok()?;
                 let hash = match flags & 2 != 0 {
                     true => Some(input.id()?),
                     false => None,
@@ -544,10 +555,7 @@ impl Session {
             }
         };
         let name = match flags & 4 != 0 {
-            true => {
-                let len = input.u32()? as usize;
-                Some(input.take(len)?)
-            }
+            true => Some(input.counted()?),
             false => None,
         };
         (flags < 8 && input.ended()).then_some((live, posted, name))
@@ -568,12 +576,7 @@ impl Session {
         // alloc: one posting's record, until it is added to the session
         trie::each(store, root, &mut |_, bytes| records.push(bytes.to_vec())).map_err(broken)?;
         for bytes in &records {
-            let name = (|| {
-                let mut input = Cursor::new(bytes);
-                let len = input.u32()? as usize;
-                input.take(len)
-            })();
-            let Some(name) = name else {
+            let Some(name) = Cursor::new(bytes).counted() else {
                 return Err(unreadable(
                     root.expect("a record was read under a root"),
                     "a posting record under this root ends before its name does",
@@ -630,6 +633,7 @@ impl Session {
         self.rows_root = None;
         self.dirty_rows.clear();
         self.dirty_posts.clear();
+        self.nodes.clear();
         #[cfg(test)]
         self.late.clear();
     }
@@ -641,6 +645,8 @@ impl Session {
         world: &W,
         registry: ContentId,
     ) -> Result<(), KernelError> {
+        // What a request that stopped at an error left: its memory, never a wrong node.
+        self.nodes.clear();
         match self.registry {
             None => self.registry = Some(registry),
             Some(had) if had != registry => {
@@ -658,6 +664,8 @@ impl Session {
     /// Refuses a world that moved while a request ran, and drops the rows: some were verified
     /// against a world that is no longer the pinned one.
     pub(crate) fn leave<W: World + ?Sized>(&mut self, world: &W) -> Result<(), KernelError> {
+        // The request or the carry is over: the nodes it read are let go.
+        self.nodes.clear();
         let now = world.pin();
         if now == self.pin || Session::planted_stale() {
             return Ok(());
@@ -774,6 +782,9 @@ impl Session {
             if by == By::Hit && planted::is(Bug::HitUnposted) {
                 return true;
             }
+            if by == By::Cover && planted::is(Bug::CoverUnposted) {
+                return true;
+            }
         }
         let _ = by;
         false
@@ -799,6 +810,81 @@ impl Session {
         row.live = Some(Live { known, height: posted.height });
         self.touch(posted.row);
         posted.row
+    }
+
+    /// Admits the members a cover's manifest names, each with the entry key and the value hash
+    /// the manifest gives, through the cover whose identity is `cover` (live in the session:
+    /// its lookup found it and posted it under its covering reads). How many were admitted;
+    /// a member the session holds verified already is left as it is.
+    ///
+    /// Invariant I5: a member admitted here has no posting of its own reads (its lists were
+    /// not read: that is what the cover saves), so it is posted as a reader of the cover: the
+    /// cover's row is given a name (`step`, then its identity; nothing asks for it by that
+    /// name) and each member is a reader of that name. A covering read that changes reaches
+    /// the cover's row, and a carry drops a cover with every reader ([`crate::nest::carry`]).
+    /// Its height is one above the cover's; it takes its own when its own lookup admits it.
+    pub(crate) fn cover<G: Get + ?Sized>(
+        &mut self,
+        store: &G,
+        cover: &ContentId,
+        step: StepId,
+        members: &mut dyn Iterator<Item = (ContentId, Key, ContentId)>,
+    ) -> Result<usize, KernelError> {
+        let Some((row, _)) = self.known(store, cover)? else {
+            return Ok(0);
+        };
+        self.link(row, step, &cover.0);
+        let height = self.live_of(row).expect("a row `known` gave is live").height + 1;
+        let name = self.rows.get_index(row as usize).expect("a row `known` gave").1.name;
+        let at = name.expect("a row linked just above has a name") as usize;
+        self.load_post(store, at)?;
+        // The cover's readers before this, in order: a member is looked for in them by
+        // halving, never one by one (a cover has thousands).
+        // alloc: one seeding's copy of one posting's readers
+        let mut had = self.posts.get_index(at).expect("the cover's name").1.readers.clone();
+        had.sort_unstable();
+        let unposted = Session::planted_unposted(By::Cover);
+        let mut admitted = 0;
+        for (id, key, hash) in members {
+            if self.known(store, &id)?.is_some() {
+                continue;
+            }
+            // alloc: the session's rows, one a member it admits
+            let (member, _) = self.rows.get_or_insert_with(id, || Row::new(true));
+            let member = u32::try_from(member).expect("a session's rows are counted in u32");
+            if !unposted && had.binary_search(&member).is_err() {
+                let post = self.posts.get_index_mut(at).expect("the cover's name").1;
+                // alloc: the session's postings, one a member of a cover
+                post.readers.push(member);
+                if !post.dirty {
+                    post.dirty = true;
+                    // alloc: the names the next save writes
+                    self.dirty_posts.push(at as u32);
+                }
+            }
+            let known = Known {
+                key,
+                hash: Some(hash),
+                // alloc: none: a planted bug's reads are of the process that read them
+                #[cfg(test)]
+                reads: Vec::new(),
+            };
+            self.admit(Posted { row: member, height }, known);
+            admitted += 1;
+        }
+        Ok(admitted)
+    }
+
+    /// The identity of the step whose value the read `kind`, `key` is of, where a step of
+    /// the session read it: how a cover's keep finds that a member's child is a member.
+    pub(crate) fn named_row(&self, kind: ReadKind, key: &[u8]) -> Option<ContentId> {
+        // alloc: one name, for one check at a cover's keep
+        let mut name = Vec::with_capacity(2 + key.len());
+        entry::name_kind(kind, &mut name);
+        name.extend_from_slice(key);
+        let at = self.posts.get_index_of(&*name)?;
+        let row = self.posts.get_index(at)?.1.row?;
+        Some(self.id_of(row))
     }
 
     /// Says row `row` differs from what the store keeps of it.
@@ -1025,7 +1111,7 @@ impl Session {
                                 at
                             }
                             // A name this process has not met: its readers are the store's.
-                            None => match self.stored_post(store, name)? {
+                            None => match Session::stored_post(&self.kinds, &mut self.nodes, store, name)? {
                                 Some(bytes) => {
                                     let at = self.name_at(name);
                                     self.merge_post(at, &bytes)?;
@@ -1075,6 +1161,7 @@ impl Session {
     /// How many rows and how many names are in memory.
     #[cfg(test)]
     pub(crate) fn held(&self) -> (usize, usize) {
+        assert_eq!(self.nodes.len(), 0, "a node of the store's maps held past a request or a carry");
         (self.rows.len(), self.posts.len())
     }
 

@@ -227,6 +227,17 @@ pub trait World {
     /// the world holds, not one it works out. What a [`Session`] verified holds for one pin.
     fn pin(&self) -> Pin;
 
+    /// The covering read `read` is under, none where nothing covers it (a fact of a crate
+    /// under the crate's digest, a file under its directory's Merkle id; a covering read may
+    /// be under a wider one). The claim, which is the world's to keep: while the covering
+    /// read hashes the same, every value computed from `read` is the same bytes. A digest of
+    /// an interface may ignore part of what `read` holds; it may not ignore anything a value
+    /// can show. [`Kernel::cover`] refuses a member with a read under none of the cover's
+    /// reads, so a world that says nothing here has no covers and no wrong ones.
+    fn cover<'r>(&'r self, _read: Read<'r>) -> Option<Read<'r>> {
+        None
+    }
+
     /// The read as an error or a check names it, e.g. "layout of `core::option::Option<u8>`".
     /// Rendered only for an error or a sampled check, never on a hit's path.
     fn describe(&self, read: Read<'_>) -> String {
@@ -400,6 +411,8 @@ pub enum KernelError {
     /// every row. Nothing is answered; a carry drops what the session verified
     /// ([`Kernel::carry`]), or its holder makes a new one.
     Reregistered { session: ContentId, now: ContentId },
+    /// A cover was not kept: `member` cannot be under it, for `read` and `why`.
+    Uncovered { member: Of, read: String, why: String },
     /// A carry was refused before it changed anything ([`Kernel::carry`]).
     Carry(CarryError),
     /// A step asked for a value that was being computed for it: `cycle` is the values on the
@@ -439,6 +452,7 @@ impl KernelError {
             | KernelError::Verify(_)
             | KernelError::Moved { .. }
             | KernelError::Reregistered { .. }
+            | KernelError::Uncovered { .. }
             | KernelError::Carry(_) => false,
         }
     }
@@ -493,6 +507,10 @@ impl fmt::Display for KernelError {
                 f,
                 "the kernel's steps are not the ones a session was verified under: the session is of the registry {session:x}, and the kernel's is {now:x} now, so nothing was answered; carry the session (which drops what it verified) or make a new one"
             ),
+            KernelError::Uncovered { member, read, why } => write!(
+                f,
+                "no cover was kept: its member {member} reads {read}, {why}; a cover's hit admits every member with none of its reads valued, so each must be under a read the cover makes"
+            ),
             KernelError::Carry(error) => error.fmt(f),
             KernelError::Cycle { of, cycle } => {
                 write!(f, "{of} is asked for while it is computed: a cycle of steps, ")?;
@@ -530,12 +548,42 @@ impl fmt::Display for KernelError {
 
 impl std::error::Error for KernelError {}
 
+/// `blaze kernel c`, then the layout's number: the value of a cover, before its count and rows.
+const MANIFEST: [u8; 16] = *b"blaze kernel c 1";
+
+/// How many times [`Kernel::cover`] follows [`World::cover`] from one read.
+pub const MOST_COVERS: usize = 8;
+
+/// The members a cover is to be kept over ([`Kernel::member`], [`Kernel::cover`]).
+#[derive(Default)]
+pub struct Members {
+    rows: Vec<Member>,
+}
+
+struct Member {
+    id: ContentId,
+    key: Key,
+    hash: ContentId,
+    of: Of,
+    reads: Vec<(ReadKind, Vec<u8>)>,
+}
+
+/// What [`Kernel::seed`] did: how many members the cover's manifest names, and how many of
+/// them the session did not hold and now does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Seeded {
+    pub members: usize,
+    pub admitted: usize,
+}
+
 struct Registered<W: ?Sized> {
     name: &'static str,
     code: CodeId,
     type_id: TypeId,
     /// Its lookup, run and keep behind its input's bytes, when other steps may ask for it.
     asked: Option<Runner<W>>,
+    /// Whether it is a cover ([`Kernel::register_cover`]): a carry never looks it up.
+    cover: bool,
 }
 
 /// The registry of steps, each with its code, over the one world `W` its steps read. It is
@@ -594,20 +642,35 @@ impl<W: World + ?Sized> Kernel<W> {
 
     /// Registers `S` with its code. A second step of one number or one name is refused.
     pub fn register<S: Step>(&mut self, code: CodeId) -> Result<(), KernelError> {
-        self.enter::<S>(code, None)
+        self.enter::<S>(code, None, false)
+    }
+
+    /// Registers `C` with its code as a cover ([`Kernel::cover`], [`Kernel::seed`]): a step
+    /// no step asks for and no carry looks up, whose value is the manifest of its members.
+    pub fn register_cover<C: Step>(&mut self, code: CodeId) -> Result<(), KernelError> {
+        self.enter::<C>(code, None, true)
+    }
+
+    /// Whether the step a read of a step's value names (its number, then its input: what
+    /// [`Session::asked`] gives) is a cover.
+    pub(crate) fn is_cover(&self, key: &[u8]) -> bool {
+        key.split_first_chunk::<2>()
+            .and_then(|(step, _)| self.steps.get(&StepId(u16::from_be_bytes(*step))))
+            .is_some_and(|it| it.cover)
     }
 
     /// Registers `S` with its code as a step other steps may ask for ([`Reads::step`]): the
     /// registry keeps how to look it up, run it and keep it from the bytes of its input, which
     /// is how a read of its value is answered at a later lookup.
     pub fn register_ask<S: Ask<World = W>>(&mut self, code: CodeId) -> Result<(), KernelError> {
-        self.enter::<S>(code, Some(Runner::of::<S>()))
+        self.enter::<S>(code, Some(Runner::of::<S>()), false)
     }
 
     fn enter<S: Step>(
         &mut self,
         code: CodeId,
         asked: Option<Runner<W>>,
+        cover: bool,
     ) -> Result<(), KernelError> {
         if let Some(had) = self.steps.get(&S::ID) {
             return Err(KernelError::Twice { first: (S::ID, had.name), second: (S::ID, S::NAME) });
@@ -616,7 +679,8 @@ impl<W: World + ?Sized> Kernel<W> {
             return Err(KernelError::Twice { first: (*step, had.name), second: (S::ID, S::NAME) });
         }
         // alloc: the registry, once a step
-        let registered = Registered { name: S::NAME, code, type_id: TypeId::of::<S>(), asked };
+        let registered =
+            Registered { name: S::NAME, code, type_id: TypeId::of::<S>(), asked, cover };
         // alloc: the registry, once a step
         self.steps.insert(S::ID, registered);
         self.registry = registry_of(&self.steps);
@@ -823,6 +887,173 @@ impl<W: World + ?Sized> Kernel<W> {
         input: &S::Input,
     ) -> Result<Option<Entry<'s>>, KernelError> {
         self.find_at::<S, G>(&mut Session::new(world), store, world, input)
+    }
+
+    /// Notes `S` of `input` as a member of the cover `members` is for: it must be verified
+    /// in `session` (asked for at this pin), and its entry is read for its key, its value's
+    /// hash and its reads, which [`Kernel::cover`] checks.
+    pub fn member<S: Step, G: Get + ?Sized>(
+        &self,
+        members: &mut Members,
+        session: &mut Session,
+        store: &G,
+        input: &S::Input,
+    ) -> Result<(), KernelError> {
+        let identity = self.identity::<S>(input)?;
+        let of = of::<S>(input, &identity);
+        let Some((_, known)) = session.known(store, &identity.id())? else {
+            return Err(KernelError::Uncovered {
+                member: of,
+                // alloc: an error
+                read: "nothing yet".to_owned(),
+                // alloc: an error
+                why: "it is not verified in this session: ask for it at this pin first".to_owned(),
+            });
+        };
+        let entry = read_entry::<S, G>(store, known.key, input, &identity)?;
+        // alloc: one member's reads, until its cover is kept
+        let reads = entry.reads().map(|(read, _)| (read.kind, read.key.to_vec())).collect();
+        // alloc: the members of one cover, until it is kept
+        members.rows.push(Member {
+            id: identity.id(),
+            key: known.key,
+            hash: entry.value_hash(),
+            of,
+            reads,
+        });
+        Ok(())
+    }
+
+    /// Keeps the cover `C` of `input` over `members`: an entry whose reads are `reads` (the
+    /// covering reads, valued now) and whose value is the manifest of the members: each one's
+    /// identity, entry key and value hash, in order of identity. Its key.
+    ///
+    /// The proof that it covers is checked here, and a cover that fails it is not kept
+    /// ([`KernelError::Uncovered`], naming the member and the read): every read of every
+    /// member is under one of `reads` by the world's word ([`World::cover`], followed at most
+    /// [`MOST_COVERS`] times), and a read of a step's value is of a member. So while the
+    /// covering reads hash the same, every member's value is the bytes its entry holds.
+    ///
+    /// A covering read is a world read: the hash of an interface's value is given by the
+    /// world as a read of its own kind. Whoever keeps a cover asked for each member in
+    /// `session` at this pin; a world that moved since is [`KernelError::Moved`].
+    pub fn cover<C: Step, P: Put + ?Sized>(
+        &self,
+        session: &mut Session,
+        store: &mut P,
+        world: &W,
+        input: &C::Input,
+        reads: &[Read<'_>],
+        members: &Members,
+    ) -> Result<Key, KernelError> {
+        session.enter(world, self.registry)?;
+        let identity = self.identity::<C>(input)?;
+        let mut trace = Trace::new();
+        for read in reads {
+            let seen = world.hash(*read).map_err(|error| KernelError::World {
+                of: of::<C>(input, &identity),
+                read: self.describe(world, *read),
+                // alloc: an error
+                why: format!("{error:?}"),
+            })?;
+            // The same read named twice sees the same: valued once is enough.
+            let _ = trace.read(*read, seen);
+        }
+        // alloc: the members' identities in order, for one keep
+        let mut ids: Vec<ContentId> = members.rows.iter().map(|it| it.id).collect();
+        ids.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for member in &members.rows {
+            for (kind, key) in &member.reads {
+                let read = Read { kind: *kind, key };
+                let why = if *kind == ReadKind::STEP {
+                    match session.named_row(*kind, key) {
+                        Some(child) if ids.binary_search_by(|it| it.0.cmp(&child.0)).is_ok() => continue,
+                        _ => "the value of a step that is not a member of the cover",
+                    }
+                } else {
+                    let mut at = read;
+                    let mut under = reads.contains(&at);
+                    // Bounded (rule 18): a covering read is under a wider one a few times.
+                    for _ in 0..MOST_COVERS {
+                        if under {
+                            break;
+                        }
+                        match world.cover(at) {
+                            Some(wider) => at = wider,
+                            None => break,
+                        }
+                        under = reads.contains(&at);
+                    }
+                    if under {
+                        continue;
+                    }
+                    "which is under none of the cover's reads (`World::cover`)"
+                };
+                return Err(KernelError::Uncovered {
+                    // clone: an error
+                    member: member.of.clone(),
+                    read: self.describe(world, read),
+                    // alloc: an error
+                    why: why.to_owned(),
+                });
+            }
+        }
+        // alloc: the manifest, until it is kept
+        let mut value = Vec::with_capacity(MANIFEST.len() + 4 + 96 * members.rows.len());
+        value.extend_from_slice(&MANIFEST);
+        trie::put_var(&mut value, members.rows.len() as u64);
+        // alloc: the members in order of identity (rule 25), for one keep
+        let mut rows: Vec<&Member> = members.rows.iter().collect();
+        rows.sort_unstable_by(|a, b| a.id.0.cmp(&b.id.0));
+        for member in rows {
+            value.extend_from_slice(&member.id.0);
+            value.extend_from_slice(&member.key.0.0);
+            value.extend_from_slice(&member.hash.0);
+        }
+        session.leave(world)?;
+        self.keep::<C, P>(store, input, &trace, &value)
+    }
+
+    /// Seeds `session` through the cover `C` of `input`, where the store has one that holds
+    /// at the world's pin: the ordinary lookup of the cover (its covering reads valued, its
+    /// list and its entry read), then every member its manifest names is admitted with no
+    /// read of its own valued and no record of its own read. None: no cover holds, and the
+    /// session is as it was; each value is then looked up when asked for.
+    ///
+    /// For a cold start or another checkout: a carry never comes here, and drops a cover
+    /// whose reads changed with every member admitted through it (invariant I5).
+    pub fn seed<C: Step, G: Get + ?Sized>(
+        &self,
+        session: &mut Session,
+        store: &G,
+        world: &W,
+        input: &C::Input,
+    ) -> Result<Option<Seeded>, KernelError> {
+        let Some(entry) = self.find_in::<C, G>(session, store, world, input)? else {
+            return Ok(None);
+        };
+        let identity = self.identity::<C>(input)?;
+        let unreadable = |why: &str| KernelError::Store {
+            of: of::<C>(input, &identity),
+            key: entry.key,
+            // alloc: an error
+            why: why.to_owned(),
+        };
+        let rows = entry
+            .value
+            .strip_prefix(&MANIFEST[..])
+            .ok_or_else(|| unreadable("its value is no cover's manifest of layout 1 (`blaze kernel c 1`)"))?;
+        let mut input_ = trie::Cursor::new(rows);
+        let count = input_.var().and_then(|count| usize::try_from(count).ok());
+        let rows = count
+            .and_then(|count| input_.take(count.checked_mul(96)?))
+            .filter(|_| input_.ended())
+            .ok_or_else(|| unreadable("a cover's manifest ends early or has bytes left over"))?;
+        let id = |bytes: &[u8]| ContentId(bytes.try_into().expect("32 bytes of a manifest's row"));
+        let mut members =
+            rows.chunks_exact(96).map(|row| (id(&row[..32]), Key(id(&row[32..64])), id(&row[64..])));
+        let admitted = session.cover(store, &identity.id(), C::ID, &mut members)?;
+        Ok(Some(Seeded { members: rows.len() / 96, admitted }))
     }
 
     /// [`Kernel::find`] in `session`, as [`Kernel::get_in`] is of [`Kernel::get`].
