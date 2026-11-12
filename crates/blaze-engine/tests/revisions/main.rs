@@ -71,6 +71,7 @@ real! {
     an_unrelated_environment_variable
     build_then_run_then_build_are_no_ops
     the_first_test_after_a_run
+    the_same_sources_in_another_directory_under_another_home
 }
 
 /// Every directory of `cases/` runs under each driver it names: a case no list holds would

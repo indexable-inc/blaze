@@ -227,6 +227,10 @@ fn one(test: &Test, seed: u64) -> (Vec<Row>, Vec<String>) {
                     "{}: the step `project {name}` is the real driver's: the simulation has one project and one database",
                     test.name
                 ),
+                Step::Home(name) => panic!(
+                    "{}: the step `home {name}` is the real driver's: the simulation has one home and one database",
+                    test.name
+                ),
                 Step::Do(_) => {
                     state.log.push("a build".to_owned());
                     if let Ok(built) = state.build() {

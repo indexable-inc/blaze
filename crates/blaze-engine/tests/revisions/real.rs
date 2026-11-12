@@ -355,6 +355,7 @@ impl Real {
                 file.set_modified(SystemTime::now()).unwrap();
             }
             Step::Project(name) => self.enter(Some(name)),
+            Step::Home(name) => self.rehome(name),
             Step::Do(action) => {
                 // The revision's own arguments: a request that differs in them is another
                 // request to the no-op lane.
@@ -381,6 +382,24 @@ impl Real {
         self.dir = dir;
     }
 
+    /// Commands run under the home `h-<name>` and the machine directory `c-<name>` from here
+    /// on (`home NAME`): the daemon stopped, and the new home given a copy of the store it
+    /// left, nothing else of the old home (no database image, no build directory, no ledger).
+    fn rehome(&mut self, name: &str) {
+        self.stop();
+        let (home, cache) = (self.root.join(format!("h-{name}")), self.root.join(format!("c-{name}")));
+        let store = self.home.join("v2/store");
+        assert!(store.is_dir(), "`home {name}`: the first home has no store at {}", store.display());
+        copy_dir(&store, &home.join("v2/store"));
+        for dir in [&self.home, &self.cache] {
+            if !self.others.contains(dir) {
+                self.others.push(dir.clone()); // clone: a path, once a home
+            }
+        }
+        (self.home, self.cache) = (home, cache);
+        self.log_read = 0;
+    }
+
     /// The homes and every checkout set aside under `as_`, so the next build starts from
     /// nothing at the same paths.
     fn set_aside(&mut self, as_: &str) {
@@ -393,6 +412,21 @@ impl Real {
             }
         }
         self.log_read = 0;
+    }
+}
+
+/// `from`, a directory, copied to `to` with everything under it.
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap_or_else(|error| panic!("reading {}: {error}", from.display())) {
+        let entry = entry.unwrap();
+        let (source, target) = (entry.path(), to.join(entry.file_name()));
+        match entry.file_type().unwrap().is_dir() {
+            true => copy_dir(&source, &target),
+            false => {
+                fs::copy(&source, &target).unwrap_or_else(|error| panic!("copying {}: {error}", source.display()));
+            }
+        }
     }
 }
 
