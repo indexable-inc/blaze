@@ -205,6 +205,15 @@ impl<W: Work> Runner<W> {
         }
     }
 
+    /// Whether a task's end ends the wait of the loop's driver ([`Back`]): the loop then sets
+    /// no deadline of its own to read the ends by. The simulation's tasks run on the loop.
+    pub fn wakes(&self) -> bool {
+        match self {
+            Runner::Threads(it) => it.wakes(),
+            Runner::Inline(_) => false,
+        }
+    }
+
     /// How many of [`Runner::running`] were posted to the process's worker pool ([`Pool::Work`]
     /// on [`Threads`]): each ends only as its pool job's `done` runs, so with the pool idle and
     /// none of its jobs parked, such a task can never end. The simulation's run on the loop.
@@ -273,12 +282,31 @@ const REALIZED_STEP: u64 = 64 << 20;
 /// The daemon's: work tasks on the process's worker pool, IO tasks on threads of their own.
 pub struct Threads<W: Work> {
     /// Every task's way back, shared by reference: a task posted counts no sender.
-    done_tx: &'static Sender<Ran<W::Value>>,
+    done_tx: &'static Back<W::Value>,
     done: Receiver<Ran<W::Value>>,
     io: Sender<IoJob<W>>,
     running: usize,
     /// Of `running`, those posted to the worker pool.
     on_pool: usize,
+}
+
+/// A task's way back to the loop: its end queued, then the loop's wait ended where its driver
+/// has a waker ([`blaze_core::Driver::waker`]), in that order, so the turn the wake starts
+/// reads the end. With none (`wake` is `None`), the loop reads the queue at its own deadline
+/// (`daemon::Woken::PlaneTasks`).
+struct Back<V> {
+    tx: Sender<Ran<V>>,
+    wake: Option<blaze_core::Waker>,
+}
+
+impl<V> Back<V> {
+    fn send(&self, ran: Ran<V>) {
+        // The loop holds the receiver for as long as the process lives.
+        _ = self.tx.send(ran);
+        if let Some(wake) = &self.wake {
+            wake.wake();
+        }
+    }
 }
 
 struct IoJob<W: Work> {
@@ -295,10 +323,13 @@ impl<W: Work> Threads<W> {
     /// # Panics
     ///
     /// When a thread cannot be started, as [`std::thread::spawn`].
-    pub fn new(io: usize, work: usize) -> Threads<W> {
+    ///
+    /// `wake` is the waker of the driver the plane's loop waits in, which each task's end
+    /// calls ([`Back`]); `None` for a loop that reads the ends at a deadline of its own.
+    pub fn new(io: usize, work: usize, wake: Option<blaze_core::Waker>) -> Threads<W> {
         let (done_tx, done) = bounded(io.max(1) + work.max(1) + 1);
         // alloc: one sender per runner, kept for the process's life so no task clones it.
-        let done_tx: &'static Sender<Ran<W::Value>> = Box::leak(Box::new(done_tx));
+        let done_tx: &'static Back<W::Value> = Box::leak(Box::new(Back { tx: done_tx, wake }));
         let (io_tx, io_rx) = unbounded::<IoJob<W>>();
         for at in 0..io.max(1) {
             let io_rx = io_rx.clone();
@@ -325,7 +356,7 @@ impl<W: Work> Threads<W> {
                                 (None, ..) => {}
                             }
                         };
-                        _ = done_tx.send(Ran { task: job.task, ended, peak, ran_ns, puts });
+                        done_tx.send(Ran { task: job.task, ended, peak, ran_ns, puts });
                     }
                 })
                 .unwrap_or_else(|why| panic!("an IO thread of the daemon's plane: {why}"));
@@ -533,7 +564,7 @@ fn post_work<W: Work>(
     task: Posting,
     work: Arc<W>,
     readers: W::Readers,
-    done: &'static Sender<Ran<W::Value>>,
+    done: &'static Back<W::Value>,
 ) {
     let pool = blaze_graph::exec::shared();
     // The batch's work comes back with the result, for a task that gave way to be posted again
@@ -541,11 +572,11 @@ fn post_work<W: Work>(
     let run = move || (run_measured(&*work, task, readers), work);
     let then = move |result: std::thread::Result<_>| match result {
         Ok(((Some(ended), peak, ran_ns, puts), _)) => {
-            _ = done.send(Ran { task, ended, peak, ran_ns, puts })
+            done.send(Ran { task, ended, peak, ran_ns, puts })
         }
         Ok(((None, peak, ran_ns, puts), _)) if task.reads => {
             let ended = Ended::GaveWay { group: blaze_graph::pool::group() };
-            _ = done.send(Ran { task, ended, peak, ran_ns, puts });
+            done.send(Ran { task, ended, peak, ran_ns, puts });
         }
         // Gave way: posted again behind what is ready on the group it ran on.
         Ok(((None, ..), work)) => {
@@ -558,7 +589,7 @@ fn post_work<W: Work>(
         }
         // A panic outside the measure: its puts stay in the thread's buffer.
         Err(panic) => {
-            _ = done.send(Ran {
+            done.send(Ran {
                 task,
                 ended: Ended::Panicked(panicked(&*panic)),
                 peak: 0,
@@ -605,6 +636,11 @@ impl<W: Work> Threads<W> {
 
     fn running(&self) -> usize {
         self.running
+    }
+
+    /// Whether a task's end ends the loop's wait ([`Back`]).
+    fn wakes(&self) -> bool {
+        self.done_tx.wake.is_some()
     }
 }
 
@@ -1639,6 +1675,11 @@ impl<W: Work, P: Predict> Plane<W, P> {
         self.runner.running()
     }
 
+    /// Whether a thread task's end ends the loop's wait ([`Runner::wakes`]).
+    pub fn wakes(&self) -> bool {
+        self.runner.wakes()
+    }
+
     /// How many thread tasks run on the worker pool ([`Runner::running_on_pool`]).
     pub fn running_on_pool(&self) -> usize {
         self.runner.running_on_pool()
@@ -1877,8 +1918,8 @@ mod tests {
             began: None,
         };
         let runners: [(Runner<Next>, Pool); 3] = [
-            (Runner::Threads(Threads::new(1, 1)), Pool::Io),
-            (Runner::Threads(Threads::new(1, 1)), Pool::Work),
+            (Runner::Threads(Threads::new(1, 1, None)), Pool::Io),
+            (Runner::Threads(Threads::new(1, 1, None)), Pool::Work),
             (Runner::Inline(Inline::new(1)), Pool::Work),
         ];
         for (mut runner, pool) in runners {
@@ -1914,8 +1955,8 @@ mod tests {
             kinds::UNIT_STORE,
         ] {
             let runners: [(Runner<Next>, Pool); 3] = [
-                (Runner::Threads(Threads::new(1, 1)), Pool::Io),
-                (Runner::Threads(Threads::new(1, 1)), Pool::Work),
+                (Runner::Threads(Threads::new(1, 1, None)), Pool::Io),
+                (Runner::Threads(Threads::new(1, 1, None)), Pool::Work),
                 (Runner::Inline(Inline::new(1)), Pool::Work),
             ];
             for (mut runner, pool) in runners {
@@ -2196,7 +2237,7 @@ mod tests {
         let config = PlaneConfig { io: 1, work: pool, budget: None, starve_after: 8 };
         let history = blaze_history::History::new(blaze_history::Config::default());
         let mut plane =
-            Plane::new(config, history, Runner::Threads(Threads::new(1, pool))).unwrap();
+            Plane::new(config, history, Runner::Threads(Threads::new(1, pool, None))).unwrap();
         let ran_on = Arc::new(blaze_core::lock::Lock::new("serve.plane.tests.ran_on", Vec::<String>::new()));
         let work = Each({
             let ran_on = Arc::clone(&ran_on);

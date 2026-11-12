@@ -567,14 +567,26 @@ enum Stopping {
     Over,
 }
 
+/// How often the loop turns while thread tasks run whose ends wake it ([`Woken::PlaneWakes`]):
+/// each turn's plane step reads what the running tasks hold (`Plane::measure`), which memory
+/// admission decides on, so one long task is still read this often. No task's end waits for it.
+const MEASURES_EVERY: Duration = Duration::from_millis(10);
+
 /// What ends the loop's wait for its driver between turns, besides the driver's own completions
 /// (a client's connection or request, a file, a child, a watch): the timer the loop set, and
 /// why. Named by the wait's span, so the loop's time between turns says what it waited on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Woken {
-    /// Thread tasks run: their ends come back on the plane's channel, which the loop reads
-    /// each turn, so it waits at most a millisecond.
+    /// Thread tasks run on a driver with no waker ([`blaze_core::Driver::waker`]): their ends
+    /// come back on the plane's channel, which the loop reads each turn, so it waits at most a
+    /// millisecond.
     PlaneTasks,
+    /// Thread tasks run, and each one's end ends the driver's wait (`plane::Back`): the loop
+    /// waits for that or the driver's io, and turns at least every [`MEASURES_EVERY`] to read
+    /// what the running tasks hold. Until 2026-11-11
+    /// every driver's loop read the ends every millisecond: each step of an edit that the loop
+    /// hands on waited up to one, 257 kept units' wind-ups of hello world about 10 ms in all.
+    PlaneWakes,
     /// Nothing runs: the idle tick.
     Idle,
     /// An intent's deadline in the session.
@@ -592,6 +604,9 @@ impl Woken {
         match self {
             Woken::PlaneTasks => WaitOn::Channel(
                 "daemon loop: a plane task's end (read every 1 ms) or the driver's io",
+            ),
+            Woken::PlaneWakes => WaitOn::Channel(
+                "daemon loop: a plane task's end, which wakes it, or the driver's io, or its 10 ms look at the running tasks' memory",
             ),
             Woken::Idle => WaitOn::Io(
                 "daemon loop: a client's connection or request, a file, a child or a watch, or the 50 ms idle tick",
@@ -2069,6 +2084,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let now = self.driver.now();
         let mut wait = if !self.effects.is_empty() || self.plane.ready() {
             (Deadline::PASSED, Woken::Idle)
+        } else if self.plane.running() > 0 && self.plane.wakes() {
+            (Deadline::after(now, MEASURES_EVERY), Woken::PlaneWakes)
         } else if self.plane.running() > 0 {
             (Deadline::after(now, Duration::from_millis(1)), Woken::PlaneTasks)
         } else {

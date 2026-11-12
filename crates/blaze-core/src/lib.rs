@@ -1257,6 +1257,44 @@ pub trait Driver {
     fn in_flight(&self) -> usize;
     /// Monotonic time since the driver began.
     fn now(&self) -> Duration;
+    /// A handle another thread ends this driver's wait with ([`Waker`]), where the driver has
+    /// one: what a thread that finished work the loop reads from a queue of its own (a plane
+    /// task's end) calls after it queued it, so the loop turns then and not at its next
+    /// deadline. `None` says the driver has none (the simulation, which runs no thread; a
+    /// driver not yet given one): its caller then bounds its wait by a deadline of its own and
+    /// says so in the wait's name.
+    fn waker(&self) -> Option<Waker> {
+        None
+    }
+}
+
+/// Ends a [`Driver`]'s wait from any thread ([`Driver::waker`]): the poll under way, or the
+/// next one if none is, returns though no effect completed. Calls between two polls make one
+/// return. The order that loses no wake is the caller's half: queue what the loop is to read,
+/// then call [`Waker::wake`].
+#[derive(Clone)] // clone: a handle, once per thread pool that wakes the loop
+pub struct Waker(std::sync::Arc<dyn Wake>); // dyn: one call a task's end, to whichever driver the daemon runs on
+
+/// What a driver gives a [`Waker`]: its own way to end its wait.
+pub trait Wake: Send + Sync {
+    fn wake(&self);
+}
+
+impl Waker {
+    pub fn new(wake: std::sync::Arc<dyn Wake>) -> Waker {
+        Waker(wake)
+    }
+
+    /// Ends the driver's wait under way, or its next.
+    pub fn wake(&self) {
+        self.0.wake();
+    }
+}
+
+impl fmt::Debug for Waker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Waker")
+    }
 }
 
 /// How long [`run_until_idle`] waits, on the driver's clock, for its next completion before it

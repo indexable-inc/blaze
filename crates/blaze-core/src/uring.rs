@@ -1277,7 +1277,7 @@ impl Offload {
         let (sender, receiver) = crossbeam_channel::unbounded();
         // SAFETY: the call returned a descriptor of its own.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let wake = Arc::new(Wake { fd, parked: AtomicBool::new(false) }); // alloc: setup, once per driver.
+        let wake = Arc::new(Wake { fd, parked: AtomicBool::new(false), asked: AtomicBool::new(false) }); // alloc: setup, once per driver.
         // alloc: setup, once per driver.
         let count = ManuallyDrop::new(Box::new(UnsafeCell::new([0; 8])));
         Ok(Offload { sender, receiver, wake, out: 0, reading: None, count })
@@ -1662,6 +1662,18 @@ struct Wake {
     /// Set by the ring's thread before it waits in the kernel, cleared by it after, and by
     /// the first sender that wakes it.
     parked: AtomicBool,
+    /// A [`crate::Waker`] asked the wait to end ([`Driver::waker`]) with no completion of the
+    /// ring's own: set before `parked` is swapped, read by the ring's thread after it set
+    /// `parked`, so, both sequentially consistent, either the thread reads it before it sleeps
+    /// or the waker finds `parked` and writes the eventfd.
+    asked: AtomicBool,
+}
+
+impl crate::Wake for Wake {
+    fn wake(&self) {
+        self.asked.store(true, Ordering::SeqCst);
+        wake_ring(self);
+    }
 }
 
 /// Tells the ring's wait that work off the ring has sent its completion: a write of the
@@ -2639,7 +2651,10 @@ impl Driver for Uring {
                 // below, and the kernel is not entered to wait.
                 self.offload.wake.parked.store(true, Ordering::SeqCst);
                 self.take_offloaded();
-                if !self.ready.is_empty() {
+                // A waker's ask ends the poll with what there is, which may be nothing: what
+                // it woke the loop for is in a queue of the caller's own.
+                let asked = self.offload.wake.asked.swap(false, Ordering::SeqCst);
+                if !self.ready.is_empty() || asked {
                     self.offload.wake.parked.store(false, Ordering::SeqCst);
                     out.append(&mut self.ready);
                     break;
@@ -2683,6 +2698,11 @@ impl Driver for Uring {
 
     fn now(&self) -> Duration {
         self.start.elapsed()
+    }
+
+    fn waker(&self) -> Option<crate::Waker> {
+        // clone: a handle to the ring's wake, once per waker asked for
+        Some(crate::Waker::new(Arc::clone(&self.offload.wake) as Arc<dyn crate::Wake>))
     }
 }
 

@@ -1268,9 +1268,11 @@ pub(crate) fn engine(
     }
     let steps = Arc::new(unit::Real::new(&paths, sources).map_err(|why| anyhow::anyhow!(why))?);
     let scratch = paths.state.join("spawn");
-    let runner = plane::Runner::Threads(plane::Threads::new(options.io, options.threads));
     let driver = blaze_core::native(std::path::Path::new("/"), threads)
         .context("starting this machine's native driver (io_uring, kqueue or IOCP)")?;
+    // A plane task's end ends the loop's wait in this driver, where it has a waker.
+    let wake = blaze_core::Driver::waker(&driver);
+    let runner = plane::Runner::Threads(plane::Threads::new(options.io, options.threads, wake));
     let driver = driver
         .confined(confine)
         .scratch(&scratch)
