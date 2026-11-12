@@ -36,6 +36,63 @@ fn a_response_handed_in_place_is_the_one_sent() {
     assert_eq!(got, [(sent[0].clone(), true), (sent[1].clone(), false)]);
 }
 
+/// What `stop` and `status` may say when nothing listens at their socket. The invariant: "no
+/// daemon is running" (`Ok`) only when no daemon holds the state; one that does is the error,
+/// named by its pid, its lock and the socket that was asked (agents.json A37).
+#[test]
+fn no_daemon_is_said_only_when_none_holds_the_state() {
+    use crate::serve::Holder;
+    let socket = Path::new("/home/me/.cache/blaze/v2.sock");
+    assert_eq!(absent(&Holder::None, socket), Ok(()));
+    let lock = std::path::PathBuf::from("/home/me/.cache/blaze/v2/serve.lock");
+    let said = absent(&Holder::Daemon { pid: Some(4242), lock: lock.clone() }, socket).unwrap_err();
+    assert!(
+        said.starts_with(
+            "a daemon is running (pid 4242: it holds blaze's state, /home/me/.cache/blaze/v2/serve.lock) and \
+             nothing listens at /home/me/.cache/blaze/v2.sock, the socket this command uses"
+        ),
+        "{said}"
+    );
+    assert!(said.contains("XDG_RUNTIME_DIR") && said.contains("told it nothing"), "{said}");
+    let unwritten = absent(&Holder::Daemon { pid: None, lock }, socket).unwrap_err();
+    assert!(unwritten.starts_with("a daemon is running (its pid not yet written: "), "{unwritten}");
+}
+
+/// The planted bug: the answer `stop` gave before, from the socket alone. With a daemon
+/// holding the state and nothing at the socket it says "no daemon is running"; the rule above
+/// refuses exactly that case, so the two differ on it and agree where no daemon holds the state.
+#[test]
+fn the_oracle_catches_no_daemon_said_from_the_socket_alone() {
+    use crate::serve::Holder;
+    let socket = Path::new("/run/user/501/blaze/v2.sock");
+    let from_the_socket_alone = |_: &Holder| -> Result<(), String> { Ok(()) };
+    let held = Holder::Daemon { pid: Some(7), lock: "/home/me/.cache/blaze/v2/serve.lock".into() };
+    assert!(from_the_socket_alone(&held).is_ok() && absent(&held, socket).is_err());
+    assert_eq!(from_the_socket_alone(&Holder::None), absent(&Holder::None, socket));
+}
+
+/// A daemon of another API schema is running, and is said to be: named by its schema, the
+/// socket and the pid its state's lock holds, with what stops it (agents.json A6).
+#[test]
+fn a_daemon_of_another_schema_is_named_as_running() {
+    use crate::serve::Holder;
+    let socket = Path::new("/home/me/.cache/blaze/v2.sock");
+    let held = Holder::Daemon { pid: Some(4242), lock: "/home/me/.cache/blaze/v2/serve.lock".into() };
+    let theirs = blaze_api::SCHEMA + 1;
+    let said = other_schema(theirs, Some(&held), socket);
+    assert!(
+        said.starts_with(&format!(
+            "a daemon is running at /home/me/.cache/blaze/v2.sock (pid 4242) and speaks API schema {theirs}, \
+             this blaze {}",
+            blaze_api::SCHEMA
+        )),
+        "{said}"
+    );
+    assert!(said.contains("`blaze stop`") && !said.contains("no daemon"), "{said}");
+    let unknown = other_schema(theirs, None, socket);
+    assert!(unknown.contains("(its pid is the first word of `serve.lock` in blaze's state)"), "{unknown}");
+}
+
 #[test]
 fn a_start_that_never_listens_names_the_socket() {
     let said = not_listening(

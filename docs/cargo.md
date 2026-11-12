@@ -1060,7 +1060,14 @@ bound; the command connects only after that newline, and gives each phase 60 s. 
 stops short is an error naming the phase it reached and, when the daemon ended, its exit code
 or signal; or systemd or launchd start it on the first connection
 after `blaze daemon install` (socket activation; `blaze daemon uninstall` removes the units). It does not exit
-when idle: it stops on `blaze stop` or SIGTERM, letting go of its socket first and then writing its state.
+when idle: it stops on `blaze stop` or SIGTERM, letting go of its socket first and then writing its state. `blaze stop` and `blaze status` say `no daemon is running` only when nothing listens at the
+socket and no daemon holds the state either: the state's lock (`serve.lock`, held by the kernel
+for the daemon's life, naming its pid) is asked, never the socket alone, since the socket's
+path follows `XDG_RUNTIME_DIR` and the state's does not. A daemon that holds the state and
+does not listen at the command's socket is an error naming its pid, its lock and the socket;
+one that answers in another API schema (another build of blaze) is said to be running, with
+its schema and pid and what stops it (`absent` and `other_schema` in
+`crates/blaze-cargo/src/cli/daemon.rs`).
 
 A daemon holds `serve.lock` in its state directory, which names its pid, for as long as it runs.
 One started while the one before it still ends (writing its image) says so on the pipe and

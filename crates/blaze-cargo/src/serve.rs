@@ -830,6 +830,50 @@ fn hold(
     Ok((file, before))
 }
 
+/// Who holds blaze's state now ([`holder`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Holder {
+    /// No process holds the state's lock: no daemon runs on this state.
+    None,
+    /// A daemon holds it: the pid it wrote in `lock`, when it has written one.
+    Daemon { pid: Option<u32>, lock: PathBuf },
+}
+
+/// Who holds `state` now, asked of its lock (`serve.lock`, [`hold`]) and never of a socket: the
+/// one answer to "is a daemon running on this state", whatever socket that daemon listens at
+/// and whatever build of blaze it is. The socket's path follows `XDG_RUNTIME_DIR`
+/// ([`blaze_api::client::home`]) and the state's does not ([`state`]), so a command whose
+/// environment differs from the daemon's finds no socket while the daemon runs (agents.json
+/// A37: `stop` said no daemon ran while one held the state); the lock is held for the daemon's
+/// life by the kernel, and says so to anyone. It takes the lock shared for an instant when no
+/// one holds it, creates nothing and never waits.
+#[cfg(unix)]
+pub fn holder(state: &Path) -> anyhow::Result<Holder> {
+    use std::io::Read as _;
+    let lock = state.join("serve.lock");
+    let file = match std::fs::File::open(&lock) {
+        Ok(file) => file,
+        // No daemon ever ran on this state.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Holder::None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("opening the daemon's lock {}", lock.display()));
+        }
+    };
+    let tried = stdx::file_lock::Locked::try_lock_shared(file)
+        .with_context(|| format!("asking who holds the daemon's lock {}", lock.display()))?;
+    match tried {
+        // Taken, so no daemon holds it; let go as it drops, here.
+        Ok(_free) => Ok(Holder::None),
+        Err(mut file) => {
+            let mut written = String::new(); // alloc: once a command that found no socket
+            file.read_to_string(&mut written)
+                .with_context(|| format!("reading the pid in the daemon's lock {}", lock.display()))?;
+            let pid = written.split_whitespace().next().and_then(|it| it.parse().ok());
+            Ok(Holder::Daemon { pid, lock })
+        }
+    }
+}
+
 /// The pipe of `blaze serve --ready-fd N` ([`Phase`]), and the thread that says on it, every
 /// [`REPORT_EVERY`] until the daemon listens, what the thread of its start is inside
 /// ([`INSIDE`]). One lock holds the pipe for both, so no record cuts into another, and none

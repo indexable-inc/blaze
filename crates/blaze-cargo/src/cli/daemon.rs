@@ -1277,11 +1277,77 @@ fn started() -> anyhow::Result<(std::path::PathBuf, std::process::Child)> {
     Ok((log, child?))
 }
 
+/// What a command that found nothing listening at `socket` may say: nothing more (`Ok`: no
+/// daemon is running) only when no daemon holds blaze's state either. One that does is named,
+/// and is the error: "no daemon is running" is never said while one runs (agents.json A37;
+/// the class: two answers to "which daemon", the socket's and the state's).
+pub fn absent(holder: &crate::serve::Holder, socket: &Path) -> Result<(), String> {
+    let crate::serve::Holder::Daemon { pid, lock } = holder else { return Ok(()) };
+    let who = match pid {
+        Some(pid) => format!("pid {pid}"), // alloc: an error's text, once
+        None => "its pid not yet written".to_owned(),
+    };
+    Err(format!(
+        "a daemon is running ({who}: it holds blaze's state, {}) and nothing listens at {}, the socket this \
+         command uses: it was started with another XDG_RUNTIME_DIR, where its socket is, or its socket's file \
+         was removed. This command told it nothing; run it with the daemon's XDG_RUNTIME_DIR, or end that \
+         process",
+        lock.display(),
+        socket.display()
+    ))
+}
+
+/// [`absent`], of this blaze's state and socket. Where the state has no lock (not Unix) there
+/// is no second answer to ask for.
+#[cfg(feature = "native")]
+fn none_runs() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let holder = crate::serve::holder(&crate::serve::state()?)?;
+        absent(&holder, &crate::serve::socket()?).map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
+/// A failed call to the daemon at this blaze's socket, as an error that names the daemon: one
+/// of another API schema ([`ClientError::Schema`]) is another build of blaze, running, named
+/// by its schema and by the pid its state's lock holds, with what stops it.
+#[cfg(feature = "native")]
+fn of_daemon(error: ClientError) -> anyhow::Error {
+    let ClientError::Schema { theirs } = error else { return error.into() };
+    let socket = match crate::serve::socket() {
+        Ok(socket) => socket,
+        Err(error) => return error,
+    };
+    #[cfg(unix)]
+    let holder = crate::serve::state().and_then(|state| crate::serve::holder(&state));
+    #[cfg(not(unix))]
+    let holder: anyhow::Result<crate::serve::Holder> = Ok(crate::serve::Holder::None);
+    anyhow::Error::msg(other_schema(theirs, holder.ok().as_ref(), &socket))
+}
+
+/// What is said of a running daemon that speaks API schema `theirs`, not this blaze's.
+pub fn other_schema(theirs: u32, holder: Option<&crate::serve::Holder>, socket: &Path) -> String {
+    let who = match holder {
+        Some(crate::serve::Holder::Daemon { pid: Some(pid), .. }) => format!("pid {pid}"), // alloc: an error's text, once
+        _ => "its pid is the first word of `serve.lock` in blaze's state".to_owned(),
+    };
+    format!(
+        "a daemon is running at {} ({who}) and speaks API schema {theirs}, this blaze {}: it is another build \
+         of blaze, which this one can ask nothing and can't tell to stop. That build's own `blaze stop` stops \
+         it; so does ending that process",
+        socket.display(),
+        blaze_api::SCHEMA
+    )
+}
+
 /// `blaze stop`: the daemon made durable and ended, waited for until its socket is gone.
 // dyn: the CLI's output writer, written a few times per command.
 #[cfg(feature = "native")]
 pub fn stop(err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
     let Some(mut client) = connect(Start::Never)? else {
+        // Nothing listens at the socket: said as "no daemon" only once the state says so too.
+        none_runs()?;
         writeln!(err, "no daemon is running")?;
         return Ok(0);
     };
@@ -1291,7 +1357,8 @@ pub fn stop(err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
             // alloc: error path, the daemon's errors, said once it is done.
             said.push(error.what.to_owned());
         }
-    })?;
+    })
+    .map_err(of_daemon)?;
     for what in said {
         err.write_all(super::say::error(&what, color).as_bytes())?;
     }
@@ -1351,6 +1418,8 @@ pub fn status(
         false => None,
     };
     let Some(mut client) = connect(Start::Never)? else {
+        // Nothing listens at the socket: said as "no daemon" only once the state says so too.
+        none_runs()?;
         match &place {
             Some(place) => out.write_all(status_json(place, None)?.as_bytes())?,
             None => writeln!(out, "no daemon is running")?,
@@ -1364,7 +1433,8 @@ pub fn status(
         // alloc: error path, the daemon's errors, said once it is done.
         ResponseRef::Error(error) => said.push(error.what.to_owned()),
         _ => {}
-    })?;
+    })
+    .map_err(of_daemon)?;
     for what in said {
         err.write_all(super::say::error(&what, color).as_bytes())?;
     }
