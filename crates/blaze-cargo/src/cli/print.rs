@@ -303,6 +303,7 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
     fn refuse(&mut self, what: &str, index: u32) -> io::Result<()> {
         self.to(false)?;
         self.refused = true;
+        self.err.take(Event::Diagnosed { error: true, unit: None });
         say::leveled_with(&mut self.line, say::ERROR, "error", self.shown.color, |line| {
             // Writing to a String cannot fail.
             let _ = write!(
@@ -473,8 +474,9 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
                     self.to(true)?;
                     self.line.push_str(&blaze_ui::api::unchecked_json(&unchecked));
                 }
-                // The tree of what was not checked: under `-v`; the build's last line counts it.
-                if self.shown.verbose > 0 {
+                // The tree of what was not checked: a pipe's and `-v`'s, by name; a terminal's
+                // one line of the failure counts it, and `blaze explain` names it.
+                if !self.shown.live || self.shown.verbose > 0 {
                     self.to(false)?;
                     blaze_ui::api::unchecked_lines(&mut self.line, &unchecked, self.shown.color);
                 }
@@ -512,7 +514,13 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
                 }
                 self.held.push((unit.map(|it| it.id), report)); // alloc: a failure's, once
             }
-            ResponseRef::Error(error) => self.report(error.into_report())?,
+            // An error that ends the request: counted, so the build's last line says it failed
+            // of an error.
+            ResponseRef::Error(error) => {
+                self.report(error.into_report())?;
+                self.flush()?;
+                self.err.take(Event::Diagnosed { error: true, unit: None });
+            }
             _ => {}
         }
         Ok(())
@@ -655,17 +663,11 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
                 })
                 .collect(),
             unbuilt: u32::try_from(self.left).unwrap_or(u32::MAX),
-            program: self.built.as_ref().and_then(|built| {
-                // The one program the build placed, where it placed one.
-                let mut programs = built.artifacts.iter().filter(|it| {
-                    !it.profile.test && matches!(it.target.kind, TargetKind::Bin | TargetKind::Example)
-                });
-                let one = programs.next()?;
-                match programs.next() {
-                    Some(_) => None,
-                    None => one.executable.clone(), // clone: a path, once a build
-                }
-            }),
+            program: self
+                .built
+                .as_ref()
+                .and_then(|built| blaze_thin::answer::placed(&built.artifacts))
+                .map(str::to_owned), // alloc: a path, once a build
             next,
             why_follows: why.is_some(),
             tests_follow: tests,

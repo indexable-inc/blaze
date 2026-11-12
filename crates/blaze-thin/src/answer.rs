@@ -109,6 +109,7 @@ impl Plain {
                     path: it.path.clone(), // clone: as above
                 })
                 .collect(),
+            program: placed(&self.artifacts).map(str::to_owned), // alloc: a path, once a command
             ..Built::default()
         }));
         let mut out = String::with_capacity(160); // alloc: once a command, what it prints
@@ -131,6 +132,20 @@ impl Plain {
             return None;
         }
         one.executable.as_ref().map(|_| one)
+    }
+}
+
+/// The one program among what a build placed (`artifacts`), where it placed exactly one: its
+/// path, which the build's line names. The thin `blaze` and the engine's printer ask this one
+/// function, so they name the same.
+pub fn placed(artifacts: &[Artifact]) -> Option<&str> {
+    let mut programs = artifacts.iter().filter(|it| {
+        !it.profile.test && matches!(it.target.kind, TargetKind::Bin | TargetKind::Example)
+    });
+    let one = programs.next()?;
+    match programs.next() {
+        Some(_) => None,
+        None => one.executable.as_deref(),
     }
 }
 

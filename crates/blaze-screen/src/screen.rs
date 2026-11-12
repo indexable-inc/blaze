@@ -1181,9 +1181,15 @@ fn cut(row: &mut Line, cols: usize) {
 /// longest="codegen core 0.0.0 lib (host)" for_ms=4200`. Also what `blaze status` says of each
 /// build.
 pub fn progress_line(now: &Now, elapsed_ms: u64) -> String {
+    format!("blaze: progress {}", progress_fields(now, elapsed_ms)) // alloc: a line every ten seconds
+}
+
+/// The fields of [`progress_line`], without its first words: what `blaze status` says of each
+/// build under way.
+pub fn progress_fields(now: &Now, elapsed_ms: u64) -> String {
     let tally = now.tally;
     let mut line = format!(
-        "blaze: progress phase={} done={}/{} running={} elapsed_ms={elapsed_ms}",
+        "phase={} done={}/{} running={} elapsed_ms={elapsed_ms}",
         now.phase.word(),
         tally.done,
         tally.total,

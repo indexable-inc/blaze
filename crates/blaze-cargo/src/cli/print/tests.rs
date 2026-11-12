@@ -181,30 +181,16 @@ fn a_build_with_warnings_as_cargo_prints_it() {
     ];
     let (out, err) = printed(Shown::default(), &responses, true);
     assert_eq!(out, "");
-    assert_eq!(
-        err,
-        format!(
-            "   Compiling foo v0.1.0 (/w/foo)\n{UNUSED}warning: `foo` (lib) generated 2 warnings (1 duplicate) \
-             (run `blaze check --fix --lib -p foo` to apply 1 suggestion)\n    Finished `dev` profile \
-             [unoptimized + debuginfo] target(s) in 1.23s\n"
-        )
-    );
+    // The warning once (its duplicate is not said again, nor counted), then the screen's one
+    // line of the build; no line a unit.
+    assert_eq!(err, format!("{UNUSED}blaze: ok built=0 cached=0 warnings=1 elapsed_ms=0\n"));
 
+    // `-v` names each unit made again as it starts.
     let (_, verbose) = printed(Shown { verbose: 1, ..Shown::default() }, &responses, true);
-    assert!(
-        verbose.starts_with("       Fresh bar v0.1.0 (/w/bar)\n   Compiling foo v0.1.0 (/w/foo)\n"),
-        "{verbose}"
-    );
+    assert!(verbose.starts_with("blaze: compiling unit=\"foo v0.1.0\"\n"), "{verbose}");
 
     let (_, quiet) = printed(Shown { quiet: true, ..Shown::default() }, &responses, true);
     assert_eq!(quiet, UNUSED);
-
-    // `check --fix` makes the suggestions it would hint at.
-    let (_, fixing) = printed(Shown { fixing: true, ..Shown::default() }, &responses, true);
-    assert!(
-        fixing.contains("warning: `foo` (lib) generated 2 warnings (1 duplicate)\n"),
-        "{fixing}"
-    );
 }
 
 #[test]
@@ -245,18 +231,18 @@ fn what_a_request_did_is_one_json_line_of_blazes() {
             + &finished_line(None, Some(work))
             + "\n"
     );
-    assert!(err.starts_with("link: target/debug/foo (spliced)\n"), "{err}");
+    assert_eq!(err, "blaze: ok built=1 cached=3 warnings=0 elapsed_ms=0\n");
     let (out, err) = printed(
         Shown::default(),
         &[Response::Work(worked.clone()), Response::Done { ok: true }],
         true,
     );
     assert_eq!(out, "", "under the human format the work line is not printed");
-    assert!(err.starts_with("link: target/debug/foo (spliced)\n"), "but how it linked is: {err}");
+    assert_eq!(err, "blaze: ok built=1 cached=3 warnings=0 elapsed_ms=0\n", "a spliced link is not news");
     assert!(!err.contains("timeline-us:"), "{err}");
     let stats = Shown { stats: true, ..Shown::default() };
     let (_, err) = printed(stats, &[Response::Work(worked), Response::Done { ok: true }], true);
-    assert!(err.starts_with("link: target/debug/foo (spliced)\ntimeline-us: link=40\n"), "{err}");
+    assert!(err.starts_with("timeline-us: link=40\n"), "{err}");
 }
 
 #[test]
@@ -348,17 +334,20 @@ fn a_unit_that_failed() {
         Response::Done { ok: false },
     ];
     let (_, err) = printed(Shown { color: false, ..Shown::default() }, &responses, false);
+    // The diagnostics, then one line: what failed, and what says more of it.
+    const FAILED: &str =
+        "blaze: failed errors=1 warnings=1 unbuilt=0 elapsed_ms=0 unit=foo next=\"blaze explain foo\"\n";
     assert_eq!(
         err,
         format!(
-            "   Compiling foo v0.1.0 (/w/foo)\n{UNUSED}error[E0308]: mismatched types\n\nFor more information \
-             about this error, try `rustc --explain E0308`.\nwarning: `foo` (lib) generated 1 warning\nerror: \
-             could not compile `foo` (lib) due to 1 previous error; 1 warning emitted\n"
+            "{UNUSED}error[E0308]: mismatched types\n\nFor more information about this error, try `rustc \
+             --explain E0308`.\n{FAILED}"
         )
     );
+    // `-q` silences no failure.
     let (_, quiet) =
         printed(Shown { color: false, quiet: true, ..Shown::default() }, &responses, false);
-    assert!(quiet.ends_with("`rustc --explain E0308`.\nerror: could not compile `foo` (lib) due to 1 previous error; 1 warning emitted\n"), "{quiet}");
+    assert!(quiet.ends_with(&format!("`rustc --explain E0308`.\n{FAILED}")), "{quiet}");
 }
 
 #[test]
@@ -400,7 +389,7 @@ fn one_rendered_text_is_printed_once_with_or_without_its_newline() {
     let responses =
         [Response::Diagnostic(first), Response::Diagnostic(second), Response::Done { ok: true }];
     let (_, err) = printed(Shown::default(), &responses, true);
-    assert_eq!(err, "warning: a\nwarning: `foo` (lib) generated 2 warnings (1 duplicate)\n");
+    assert_eq!(err, "warning: a\nblaze: ok built=0 cached=0 warnings=1 elapsed_ms=0\n");
 }
 
 /// Two units failing with one error of no span each print it (selfbuild2: psm's and
@@ -489,18 +478,11 @@ fn lines_of_one_stream_in_one_write_and_both_in_the_order_made() {
     drop(screen);
     let log = log.into_inner();
     let streams: Vec<bool> = log.iter().map(|it| it.0).collect();
-    assert_eq!(streams, [false, true, false, true], "{log:#?}");
-    assert_eq!(log[0].1, "   Compiling foo v0.1.0 (/w/foo)\n   Compiling bar v0.1.0 (/w/bar)\n");
-    assert!(log[1].1.starts_with("{\"reason\":\"compiler-artifact\""), "{}", log[1].1);
-    assert!(
-        log[2].1.starts_with("warning: unused variable")
-            && log[2]
-                .1
-                .ends_with("Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.23s\n"),
-        "{}",
-        log[2].1
-    );
-    assert_eq!(log[3].1, finished_line(Some("dev"), None) + "\n");
+    assert_eq!(streams, [true, false, true, false], "{log:#?}");
+    assert!(log[0].1.starts_with("{\"reason\":\"compiler-artifact\""), "{}", log[0].1);
+    assert!(log[1].1.starts_with("warning: unused variable"), "{}", log[1].1);
+    assert_eq!(log[2].1, finished_line(Some("dev"), None) + "\n");
+    assert_eq!(log[3].1, "blaze: ok built=0 cached=0 warnings=1 elapsed_ms=0\n");
 }
 
 #[test]
@@ -516,7 +498,7 @@ fn a_unit_or_package_numbered_past_any_request_fails_the_build_naming_it() {
     drop(printer);
     drop(screen);
     let err = String::from_utf8(err).unwrap();
-    assert!(err.ends_with("error: the daemon numbered a unit 4294967295, past the 16777216 a request's indexes stay under\n"), "{err}");
+    assert!(err.contains("error: the daemon numbered a unit 4294967295, past the 16777216 a request's indexes stay under\nblaze: failed errors=1 "), "{err}");
 
     let Response::Unit(unit) = started("foo", Verb::Compiling) else { unreachable!() };
     let (_, err) = printed(
@@ -526,7 +508,8 @@ fn a_unit_or_package_numbered_past_any_request_fails_the_build_naming_it() {
     );
     assert_eq!(
         err,
-        "error: the daemon numbered a package 16777216, past the 16777216 a request's indexes stay under\n"
+        "error: the daemon numbered a package 16777216, past the 16777216 a request's indexes stay under\n\
+         blaze: failed errors=1 warnings=0 unbuilt=0 elapsed_ms=0\n"
     );
 }
 
@@ -559,10 +542,7 @@ fn json_on_stdout_and_status_on_stderr() {
     assert!(lines[1].starts_with(r#"{"reason":"compiler-artifact","#));
     assert_eq!(lines[2], finished_line(Some("dev"), None));
     // No "generated" line: cargo counts a unit's warnings where it renders them.
-    assert_eq!(
-        err,
-        "   Compiling foo v0.1.0 (/w/foo)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.23s\n"
-    );
+    assert_eq!(err, "blaze: ok built=0 cached=0 warnings=1 elapsed_ms=0\n");
 
     let rendering = Shown {
         format: Format::Json { short: false, ansi: false, render_diagnostics: true },
@@ -571,7 +551,7 @@ fn json_on_stdout_and_status_on_stderr() {
     let (out, err) = printed(rendering, &responses, true);
     assert!(!out.contains("compiler-message"));
     assert!(err.contains(UNUSED));
-    assert!(err.contains("warning: `foo` (lib) generated 1 warning\n"));
+    assert!(err.ends_with("blaze: ok built=0 cached=0 warnings=1 elapsed_ms=0\n"), "{err}");
 }
 
 #[test]
@@ -601,7 +581,10 @@ fn an_error_of_the_daemon() {
     ];
     let (out, err) = printed(Shown::default(), &responses, false);
     assert_eq!(out, "");
-    assert_eq!(err, "error: no package `nope` in the workspace\n");
+    assert_eq!(
+        err,
+        "error: no package `nope` in the workspace\nblaze: failed errors=1 warnings=0 unbuilt=0 elapsed_ms=0\n"
+    );
 }
 
 /// A unit's failure said as a report waits for what it blocks, names it by count and the one

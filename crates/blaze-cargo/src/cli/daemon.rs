@@ -1593,7 +1593,7 @@ pub fn status_lines(status: &Status) -> String {
     }
     for build in &status.builds {
         // alloc: a line a build
-        let compact = blaze_screen::progress_line(&build.now, build.now.at_ms);
+        let compact = blaze_screen::progress_fields(&build.now, build.now.at_ms);
         lines.push_str(&format!("  #{} {}: {compact}\n", build.id, build.what));
         for span in &build.spans {
             lines.push_str(&format!("    {span}\n"));

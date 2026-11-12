@@ -35,5 +35,5 @@ pub use event::{BinaryEnd, Built, Command, Event, Link, Stamped, Test, Verdict, 
 pub use frame::{Frame, Line, Mark, Progress, Role, Span};
 pub use screen::{
     Caps, HANDFUL, OUTPUT_LINES, Options, PLAIN_EVERY_MS, Plant, QUIET_MS, SLOW_ITEM_MS,
-    SLOW_TEST_MS, Screen, file_url, live, progress_line, unicode,
+    SLOW_TEST_MS, Screen, file_url, live, progress_fields, progress_line, unicode,
 };

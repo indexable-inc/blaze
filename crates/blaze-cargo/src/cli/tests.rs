@@ -349,13 +349,9 @@ fn under_fail_fast_a_failing_test_executable_stops_the_tests() {
     assert_eq!(then, Then::Exit(101));
     assert_eq!(out, "");
     let lines: Vec<&str> = err.lines().collect();
-    assert_eq!(lines[0], "   Compiling foo v0.1.0 (/w/foo)");
-    assert!(
-        lines[1].starts_with("    Finished `test` profile [unoptimized + debuginfo] target(s) in "),
-        "{err}"
-    );
+    assert!(lines[0].starts_with("blaze: ok built=0 cached=0 warnings=0 elapsed_ms=0"), "{err}");
     assert_eq!(
-        &lines[2..],
+        &lines[1..],
         [
             "     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)",
             "error: test failed, to rerun pass `--lib`",
@@ -378,7 +374,7 @@ fn a_failed_build_runs_nothing() {
     let (then, _, err) = driven(&mut api, &["blaze", "test", "--fail-fast"], &mut programs);
     assert_eq!(then, Then::Exit(101));
     assert!(programs.ran.is_empty());
-    assert_eq!(err, "   Compiling foo v0.1.0 (/w/foo)\n");
+    assert_eq!(err, "blaze: failed errors=0 warnings=0 unbuilt=0 elapsed_ms=0\n");
 
     let mut api = FakeApi { hangs_up: true, ..FakeApi::answering(vec![foo_compiling()]) };
     let (then, _, err) = driven(&mut api, &["blaze", "build"], &mut programs);
@@ -486,7 +482,9 @@ fn run_becomes_its_program() {
     assert_eq!(exec.program, PathBuf::from("target/debug/foo"));
     assert_eq!(exec.args, [OsString::from("a"), OsString::from("b")]);
     assert_eq!(exec.cwd, PathBuf::from("/w"));
-    assert!(err.ends_with("     Running `target/debug/foo a b`\n"), "{err}");
+    // The program's command line is said only under `-v`: what a `run` shows is the build's
+    // one line, which names the program it placed.
+    assert_eq!(err, "blaze: ok built=0 cached=0 warnings=0 elapsed_ms=0 program=/w/target/debug/foo\n");
 
     let two = [
         crate::cli::run::tests::artifact("foo", "bin", "foo", false, Some("foo")),
@@ -555,10 +553,7 @@ fn doc_writes_its_pages_and_says_what_cargo_doc_says() {
         [" Documenting foo v0.1.0 (/w/foo)", " Documenting dep v1.0.0"],
         "{err}"
     );
-    assert!(
-        lines[2].starts_with("    Finished `dev` profile [unoptimized + debuginfo] target(s) in "),
-        "{err}"
-    );
+    assert!(lines[2].starts_with("blaze: ok built=0 cached=0 "), "{err}");
     assert_eq!(lines[3], format!("   Generated {}", dir.join("foo/index.html").display()), "{err}");
     assert_eq!(std::fs::read_to_string(dir.join("foo/index.html")).unwrap(), "<html>foo</html>");
     assert_eq!(std::fs::read_to_string(dir.join("dep/index.html")).unwrap(), "dep");
