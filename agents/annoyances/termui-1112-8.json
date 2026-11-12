@@ -3,7 +3,7 @@
  "date": "2026-11-12",
  "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
  "where": "the one build queue (lanebase-1112, /root/loop.sh)",
- "what": "A change to a small crate (blaze-screen, 15 tests that run in five seconds) waits behind every other lane`s release build and ten-minute command: three were ahead, so one compile-and-test took the better part of the session`s end, and several commits were pushed without having been compiled.",
+ "what": "A change to a small crate (blaze-screen, 15 tests that run in five seconds) waits behind every other lane's release build and ten-minute command: three were ahead, so one compile-and-test took the better part of the session's end, and several commits were pushed without having been compiled.",
  "cost": "unverified commits on the branch until the queue reached it",
  "cause": "one lock for every lane and every kind of command",
  "workaround": "one job that runs every check, queued once",
