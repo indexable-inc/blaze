@@ -1,5 +1,5 @@
 about = "A source file whose modification time moves while its bytes stay makes nothing again."
-drivers = ["real"]
+drivers = ["sim", "real"]
 
 [[revision]]
 action = "run"
@@ -13,7 +13,7 @@ redone = []
 max_units = 0
 
 [[revision]]
-steps = ["touch src/main.rs"]
+steps = ["touch src/lib.rs"]
 action = "run"
 prints = "2 4\n"
 redone = []

@@ -1,5 +1,5 @@
 about = "A constant's value changed makes the two functions that read it again, and no other."
-drivers = ["real"]
+drivers = ["sim", "real"]
 
 [[revision]]
 action = "run"

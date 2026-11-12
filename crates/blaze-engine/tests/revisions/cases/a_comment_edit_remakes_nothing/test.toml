@@ -1,5 +1,5 @@
 about = "A comment's text changed, and then a comment line added so that every line after it moves, makes no function's code again."
-drivers = ["real"]
+drivers = ["sim", "real"]
 
 [[revision]]
 action = "run"

@@ -1,7 +1,8 @@
 //! What a revision test is, whichever driver runs it: a project, a sequence of revisions of
 //! its files, and after each revision an action, what must come of it, and what must have
-//! been made again and what reused. A driver ([`crate::real`], [`crate::sim`]) applies the
-//! revisions and says what it [`Observed`]; [`crate::check`] holds that to the [`Expect`].
+//! been made again and what reused. A driver (the real daemon's, `real.rs` beside this file; the simulation's,
+//! hir-ty-codegen's `v2/edits/revisions.rs`) applies the revisions and says what it
+//! [`Observed`]; `check.rs` holds that to the [`Expect`].
 
 use std::{
     collections::BTreeMap,
@@ -10,7 +11,7 @@ use std::{
 };
 
 /// One test: `cases/<name>/` (a `test.toml`, `base/` and `rev2/`, `rev3/`.. overlays) or one
-/// rustc-style file whose revisions are `--cfg <revision>` ([`crate::rustc`]).
+/// rustc-style file whose revisions are `--cfg <revision>` (`rustc.rs`).
 #[derive(Clone, Debug)]
 pub struct Test {
     pub name: String,
@@ -333,5 +334,6 @@ impl Test {
 
 /// `cases/`, beside this file.
 pub fn cases() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/revisions/cases")
+    // From either crate a driver lives in (blaze-engine's real one, hir-ty-codegen's simulated).
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../blaze-engine/tests/revisions/cases")
 }

@@ -1,7 +1,7 @@
 //! The real driver: a test's revisions as real processes. One daemon in a home of its own
 //! serves every revision, its incremental state kept between them; then each revision is
 //! built from nothing at the same paths (a fresh home, cache and checkout, so the bytes can
-//! be compared) and the two are held together ([`crate::check`]).
+//! be compared) and the two are held together (`check.rs`).
 //!
 //! It is for what only a kernel shows (the file watcher's event order, `kill -9`, a program
 //! really run) and as the cross-check of the simulated driver. What it reads of a build is
@@ -28,7 +28,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use crate::{
+use super::{
     check::{self, Row},
     spec::{Change, Observed, Revision, Step, Test},
 };
@@ -45,9 +45,14 @@ static RUNNING: (Mutex<u32>, Condvar) = (Mutex::new(0), Condvar::new());
 
 struct Slot;
 
+/// The bound on tests at once.
+pub fn jobs() -> u32 {
+    std::env::var("BLAZE_REVISIONS_JOBS").ok().and_then(|it| it.parse().ok()).unwrap_or(JOBS)
+}
+
 impl Slot {
     fn take() -> Slot {
-        let most = std::env::var("BLAZE_REVISIONS_JOBS").ok().and_then(|it| it.parse().ok()).unwrap_or(JOBS);
+        let most = jobs();
         let mut running = RUNNING.0.lock().unwrap();
         while *running >= most {
             running = RUNNING.1.wait(running).unwrap();
@@ -81,6 +86,8 @@ struct Real {
     cache: PathBuf,
     /// How much of the daemon's log was read for panics.
     log_read: u64,
+    /// Whether a failure leaves the root in place, for its logs.
+    keep: bool,
 }
 
 fn drain(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<String> {
@@ -106,7 +113,7 @@ impl Real {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("test"), &test.name).unwrap();
         let blaze = std::env::var_os("BLAZE_REVISIONS_BLAZE").map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_blaze")), PathBuf::from);
-        Real { blaze, dir: root.join("w"), home: root.join("h"), cache: root.join("c"), root, log_read: 0 }
+        Real { blaze, dir: root.join("w"), home: root.join("h"), cache: root.join("c"), root, log_read: 0, keep: true }
     }
 
     fn blaze(&self, args: &[&str], env: &BTreeMap<String, String>) -> Out {
@@ -369,16 +376,27 @@ impl Drop for Real {
         if self.home.exists() {
             self.kill_daemon();
         }
-        if !thread::panicking() {
+        if !thread::panicking() || !self.keep {
             let _ = fs::remove_dir_all(&self.root);
         }
     }
 }
 
-/// `test` under the real driver.
-pub fn run(test: &Test) {
+/// When a revision is also built from nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Clean {
+    /// Every revision: the suite's cases.
+    Always,
+    /// Only a revision whose incremental build failed a check, to tell a build that is wrong
+    /// only incrementally from one blaze gets wrong from nothing too: a corpus of hundreds.
+    WhenWrong,
+}
+
+/// `test`'s rows under the real driver, and where its logs are.
+pub fn rows(test: &Test, clean_when: Clean) -> (Vec<Row>, String) {
     let _slot = Slot::take();
     let mut real = Real::new(test);
+    real.keep = clean_when == Clean::Always;
     fs::create_dir_all(real.root.join("t")).unwrap();
     let mut rows: Vec<Row> = Vec::new();
     for (index, revision) in test.revisions.iter().enumerate() {
@@ -387,7 +405,8 @@ pub fn run(test: &Test) {
             real.step(step, revision, &env);
         }
         let seen = real.act(revision, &env, true);
-        rows.push(Row { label: revision.label.clone(), seen, failed: Vec::new() });
+        let failed = check::held(revision, &seen, None, &[]);
+        rows.push(Row { label: revision.label.clone(), seen, failed, clean_ok: None });
     }
     real.stop();
     real.set_aside("incremental");
@@ -395,6 +414,9 @@ pub fn run(test: &Test) {
     // environment share one clean build.
     let mut built: Vec<(usize, Observed)> = Vec::new();
     for (index, revision) in test.revisions.iter().enumerate() {
+        if clean_when == Clean::WhenWrong && rows[index].failed.is_empty() {
+            continue;
+        }
         let env = test.env_at(index);
         let same = built.iter().find(|(earlier, _)| {
             let before = &test.revisions[*earlier];
@@ -418,7 +440,8 @@ pub fn run(test: &Test) {
                 clean
             }
         };
-        rows[index].failed = check::held(revision, &rows[index].seen, Some(&clean));
+        rows[index].failed = check::held(revision, &rows[index].seen, Some(&clean), &[]);
+        rows[index].clean_ok = Some(clean.ok);
         built.push((index, clean));
     }
     let note = format!(
@@ -426,5 +449,11 @@ pub fn run(test: &Test) {
         real.home.with_extension("incremental").join("v2/serve.log").display(),
         real.home.with_extension("clean").join("v2/serve.log").display()
     );
+    (rows, note)
+}
+
+/// `test` under the real driver.
+pub fn run(test: &Test) {
+    let (rows, note) = rows(test, Clean::Always);
     check::verdict(test, "real", &rows, &note);
 }

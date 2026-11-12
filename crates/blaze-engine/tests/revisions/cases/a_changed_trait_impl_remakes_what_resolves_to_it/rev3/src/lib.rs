@@ -1,12 +1,13 @@
-trait Shape {
+#![no_std]
+pub trait Shape {
     fn area(&self) -> u32;
     fn name(&self) -> &'static str {
         "shape"
     }
 }
 
-struct Square(u32);
-struct Strip(u32);
+pub struct Square(pub u32);
+pub struct Strip(pub u32);
 
 impl Shape for Square {
     fn area(&self) -> u32 {
@@ -23,24 +24,23 @@ impl Shape for Strip {
     }
 }
 
-fn by_generic<T: Shape>(shape: &T) -> u32 {
+pub fn by_generic<T: Shape>(shape: &T) -> u32 {
     shape.area()
 }
 
-fn by_dyn(shape: &dyn Shape) -> u32 {
+pub fn by_dyn(shape: &dyn Shape) -> u32 {
     shape.area()
 }
 
-fn named<T: Shape>(shape: &T) -> &'static str {
+pub fn named<T: Shape>(shape: &T) -> &'static str {
     shape.name()
 }
 
-fn unrelated(x: u32) -> u32 {
+pub fn unrelated(x: u32) -> u32 {
     x * 2
 }
 
-fn main() {
+pub fn all() -> (u32, u32, u32, u32, &'static str, &'static str) {
     let (square, strip) = (Square(3), Strip(5));
-    println!("{} {} {} {}", by_generic(&square), by_dyn(&square), by_generic(&strip), by_dyn(&strip));
-    println!("{} {} {}", named(&square), named(&strip), unrelated(2));
+    (by_generic(&square), by_dyn(&square), by_generic(&strip), by_dyn(&strip), named(&square), named(&strip))
 }

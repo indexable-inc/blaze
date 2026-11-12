@@ -14,6 +14,10 @@ max_executed = 200
 max_verified = 2000
 link = "none"
 
+[revision.known]
+max_executed = "the first `run` after a `build` of the same source runs about 840 engine memos (843, 841 seen), though it makes no unit again: `build` then `run` is not a no-op (2026-11-11)"
+max_verified = "and verifies about 58,500 cached results"
+
 [[revision]]
 steps = []
 action = "build"

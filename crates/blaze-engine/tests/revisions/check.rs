@@ -5,7 +5,7 @@
 
 use std::{fmt::Write as _, fs, io::Write as _};
 
-use crate::spec::{Observed, Revision, Test};
+use super::spec::{Observed, Revision, Test};
 
 pub struct Failure {
     pub check: &'static str,
@@ -14,6 +14,9 @@ pub struct Failure {
 }
 
 fn short(text: &str) -> String {
+    // A build's progress lines are not what a reader of a failure is after.
+    let kept: Vec<&str> = text.lines().filter(|line| !line.trim_start().starts_with("Compiling ")).collect();
+    let text = &kept.join("\n");
     match text.len() > 1500 {
         true => format!("{}\n.. ({} bytes)", &text[..text.floor_char_boundary(1500)], text.len()),
         false => text.to_owned(),
@@ -29,9 +32,21 @@ fn most(check: &'static str, bound: Option<u64>, got: Option<u64>, what: &str, i
     }
 }
 
-/// Each check of `revision` that `seen` fails. `clean`: the same revision built from
-/// nothing by the same driver.
-pub fn held(revision: &Revision, seen: &Observed, clean: Option<&Observed>) -> Vec<Failure> {
+/// The checks the simulated driver does not see, because its pipeline ends at code records:
+/// nothing is linked or run, no unit is counted, and no engine memo counts are read. It
+/// skips them and says so in each row; every other check it holds.
+pub const SIM_BLIND: &[&str] = &["prints", "says", "max_units", "max_executed", "max_verified", "max_ms", "noop", "link"];
+
+/// Each check of `revision` that `seen` fails, but those in `blind` (what the driver cannot
+/// see: said, not taken as met). `clean`: the same revision built from nothing by the same
+/// driver.
+pub fn held(revision: &Revision, seen: &Observed, clean: Option<&Observed>, blind: &[&str]) -> Vec<Failure> {
+    let mut failed = all(revision, seen, clean);
+    failed.retain(|it| !blind.contains(&it.check));
+    failed
+}
+
+fn all(revision: &Revision, seen: &Observed, clean: Option<&Observed>) -> Vec<Failure> {
     let expect = &revision.expect;
     let mut failed = Vec::new();
     match &expect.fails {
@@ -53,6 +68,18 @@ pub fn held(revision: &Revision, seen: &Observed, clean: Option<&Observed>) -> V
             })
         }
         _ => {}
+    }
+    if !failed.is_empty() {
+        // The action did not end as stated: what it made and printed is not held to
+        // anything, and the one failure is the finding.
+        if seen.panics > 0 {
+            failed.push(Failure {
+                check: "panics",
+                wanted: "no panic caught".to_owned(),
+                got: format!("{} caught, the first: {}", seen.panics, seen.first_panic),
+            });
+        }
+        return failed;
     }
     if let Some(prints) = &expect.prints
         && seen.stdout != *prints
@@ -149,11 +176,21 @@ pub fn held(revision: &Revision, seen: &Observed, clean: Option<&Observed>) -> V
     failed
 }
 
+/// The cause the revision lists for `check` failing under `driver`: a row named for the check
+/// (`redone`) is every driver's, one named `real: redone` only that driver's.
+fn known<'a>(revision: &'a Revision, driver: &str, check: &str) -> Option<&'a String> {
+    // `sim seed 3` is the driver `sim`.
+    let driver = driver.split(' ').next().unwrap_or(driver);
+    revision.known.get(&format!("{driver}: {check}")).or_else(|| revision.known.get(check))
+}
+
 /// One revision's row of the suite's table.
 pub struct Row {
     pub label: String,
     pub seen: Observed,
     pub failed: Vec<Failure>,
+    /// Whether the revision built from nothing succeeded, where it was built so.
+    pub clean_ok: Option<bool>,
 }
 
 /// The test's verdict under `driver`: its rows printed (and appended to the file
@@ -168,7 +205,7 @@ pub fn verdict(test: &Test, driver: &str, rows: &[Row], note: &str) {
         let mut result = "ok".to_owned();
         let mut known_said = Vec::new();
         for failure in &row.failed {
-            match revision.known.get(failure.check) {
+            match known(revision, driver, failure.check) {
                 Some(cause) => known_said.push(format!("{}: {cause} (got: {})", failure.check, short(&failure.got).replace('\n', " "))),
                 None => {
                     result = "FAILED".to_owned();
@@ -181,6 +218,12 @@ pub fn verdict(test: &Test, driver: &str, rows: &[Row], note: &str) {
             }
         }
         for (check, cause) in &revision.known {
+            // A row of another driver (`real: clean bytes`) is not this one's.
+            let check = match check.split_once(": ") {
+                Some((of, check)) if Some(of) == driver.split(' ').next() => check,
+                Some(_) => continue,
+                None => check.as_str(),
+            };
             if !row.failed.iter().any(|it| it.check == check) {
                 result = "FAILED".to_owned();
                 _ = writeln!(

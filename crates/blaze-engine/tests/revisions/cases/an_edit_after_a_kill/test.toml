@@ -1,5 +1,5 @@
 about = "The first build after the daemon is killed with SIGKILL that sees a changed file answers within its bound as a clean build does, with no panic caught."
-drivers = ["real"]
+drivers = ["sim", "real"]
 
 [[revision]]
 action = "run"

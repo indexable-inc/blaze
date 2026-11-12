@@ -5,6 +5,7 @@ drivers = ["real"]
 action = "run"
 args = ["-p", "app"]
 prints = "41 4\n"
+known = { outcome = "every proc macro traps in its wasm module on all-1111 (6b5b794d0d, built by cargo on macOS), from nothing too: a_proc_macro_package_tests_build, a_no_std_proc_macro_expands and a_struct_deriving_deserialize_reads_its_fields of tests/repro fail the same way" }
 
 [[revision]]
 action = "run"
@@ -12,3 +13,4 @@ args = ["-p", "app"]
 prints = "42 4\n"
 redone_has = ["app::uses"]
 reused = ["app::other", "app::main"]
+known = { outcome = "every proc macro traps in its wasm module on all-1111 (6b5b794d0d, built by cargo on macOS), from nothing too: a_proc_macro_package_tests_build, a_no_std_proc_macro_expands and a_struct_deriving_deserialize_reads_its_fields of tests/repro fail the same way" }

@@ -1,5 +1,5 @@
 about = "A file saved by writing beside it and renaming over it (an editor's save, `sed -i`), and one truncated and then written, is read with its new bytes (2026-11-11: read as empty, E0601 `main` not found, until written again)."
-drivers = ["real"]
+drivers = ["sim", "real"]
 
 [[revision]]
 action = "run"

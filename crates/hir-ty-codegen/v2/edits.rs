@@ -36,6 +36,7 @@
 #[path = "tests/db.rs"]
 mod db;
 mod identity;
+mod revisions;
 
 use std::collections::BTreeMap;
 

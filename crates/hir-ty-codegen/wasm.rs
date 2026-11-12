@@ -3055,7 +3055,10 @@ impl Op {
 mod tests {
     use super::*;
 
-    use cranelift_codegen::{ir::UserFuncName, isa::CallConv};
+    use cranelift_codegen::{
+        ir::{InstBuilder as _, UserFuncName},
+        isa::CallConv,
+    };
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
     /// `fn(i32, i64) -> i64` of one block of `rounds` rounds, six values each, with a value
@@ -3094,7 +3097,7 @@ mod tests {
         let mixed = b.ins().bxor(halves, l);
         let out = b.ins().iadd(mixed, kept);
         b.ins().return_(&[out]);
-        b.finalize();
+        b.finalize(crate::isa_for(crate::Target::for_host()).unwrap().frontend_config());
         func
     }
 
@@ -3147,7 +3150,7 @@ mod tests {
         let out = b.ins().iadd(scaled, more);
         b.ins().return_(&[out]);
         b.seal_all_blocks();
-        b.finalize();
+        b.finalize(crate::isa_for(crate::Target::for_host()).unwrap().frontend_config());
         func
     }
 

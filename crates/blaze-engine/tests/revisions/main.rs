@@ -21,6 +21,7 @@
 
 mod check;
 mod real;
+mod rustc;
 mod spec;
 
 use spec::Test;
@@ -49,6 +50,7 @@ macro_rules! real {
 real! {
     a_body_edit_remakes_one_function
     a_broken_revision_fails_and_recovers
+    a_cfg_twin_chosen_by_a_build_script
     a_changed_const_remakes_its_two_readers
     a_changed_proc_macro_remakes_the_users_of_its_expansion
     a_changed_struct_layout_remakes_what_uses_it
@@ -63,6 +65,7 @@ real! {
     an_added_and_a_removed_function
     an_edit_after_a_kill
     an_edit_after_a_restart
+    an_impl_overriding_a_provided_method_changes_its_vtable
     an_unrelated_environment_variable
     build_then_run_then_build_are_no_ops
     the_first_test_after_a_run
@@ -91,4 +94,17 @@ fn every_case_is_listed() {
         }
     }
     assert!(unlisted.is_empty(), "cases no `#[test]` runs: {unlisted:?}; add each to its driver's list in main.rs");
+}
+
+/// rustc's `tests/incremental` through the real driver (`rustc.rs`): the directory
+/// `BLAZE_REVISIONS_RUSTC` names, its report written where `BLAZE_REVISIONS_RUSTC_REPORT`
+/// says, only the tests whose path holds `BLAZE_REVISIONS_RUSTC_ONLY` when that is set.
+/// Not part of the gate: the corpus is not in the tree, and it takes tens of minutes.
+#[test]
+#[ignore = "needs rustc's tests/incremental, fetched outside the tree: docs/harness.md, \"Revision tests\""]
+fn rustc_incremental_corpus() {
+    let dir = std::env::var("BLAZE_REVISIONS_RUSTC").expect("BLAZE_REVISIONS_RUSTC names rustc's tests/incremental");
+    let report = std::env::var("BLAZE_REVISIONS_RUSTC_REPORT").expect("BLAZE_REVISIONS_RUSTC_REPORT names the report to write");
+    let only = std::env::var("BLAZE_REVISIONS_RUSTC_ONLY").ok();
+    rustc::corpus(std::path::Path::new(&dir), std::path::Path::new(&report), only.as_deref());
 }

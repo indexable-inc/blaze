@@ -10,6 +10,7 @@ steps = []
 action = "test"
 says = ["test tests::f_adds_one ... ok"]
 max_executed = 5000
+known = { max_executed = "the first `test` after a `run` runs 2.63 million engine memos (2,631,510 and 2,631,509 seen) and makes 8,097 functions again: the 777,858 queries of 2026-11-11, the results of std not reused for the test profile" }
 
 [[revision]]
 steps = []
