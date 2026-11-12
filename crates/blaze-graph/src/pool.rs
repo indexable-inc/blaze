@@ -2484,6 +2484,8 @@ impl Local {
             // Outside any job: the free pages this thread's heaps keep go back if a release
             // asked since it last gave them (memcap5); nothing otherwise.
             blaze_mem::tag::settle_heap();
+            // And the frame memory it keeps warm, if an idle daemon asked for it.
+            blaze_mem::frame::settle_spare();
             crate::sched::idle(&shared.sched, true);
             let parked = DriverSpan::open(Driving::Idle);
             let waited = if shared.parked.load(Ordering::Acquire) != 0

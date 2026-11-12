@@ -110,9 +110,7 @@ pub fn main() -> ExitCode {
         }
         _ => {
             #[cfg(feature = "native")]
-            if let Err(error) = crate::huge::huge_pages_for_mimalloc() {
-                return failed(&format!("{error:#}"));
-            }
+            crate::huge::base_pages_for_mimalloc();
             // Freed pages leave the footprint as they are freed, in the client and the
             // daemon alike.
             #[cfg(feature = "native")]

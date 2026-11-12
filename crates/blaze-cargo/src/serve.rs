@@ -25,6 +25,7 @@ mod fetch_url;
 pub(crate) mod flightrec;
 mod gc;
 mod heads;
+mod idle;
 mod image;
 #[cfg(all(unix, feature = "native"))]
 pub(crate) mod inspect;
