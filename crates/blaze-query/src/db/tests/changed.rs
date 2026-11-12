@@ -14,7 +14,7 @@ use super::{
     super::{
         Changed, Untracked,
         frontier::Plant,
-        plumbing::{changed_since, evict_values},
+        plumbing::{changed_since, evict_values, walk_changed_set},
         report_untracked_read,
     },
     *,
@@ -626,4 +626,106 @@ fn a_walk_contains_at_most_eight_unwinds_and_marks_the_rest() {
 fn the_oracle_catches_a_walk_that_contains_every_unwind() {
     let (work, named) = a_walk_over_rows_whose_runs_panic(Plant::ContainsEveryUnwind);
     assert_eq!((work.unwound, work.marked, named), (40, 0, 40), "{work:?}");
+}
+
+/// What [`a_first_edit_after_a_build`] saw: the walk at the build's end, the first edit's
+/// walk, and the rows the edit's changed set named.
+#[derive(Debug, PartialEq, Eq)]
+struct FirstEdit {
+    /// Rows the two walks asked or marked: the walks' work after the build's last write.
+    asked: u64,
+    /// Rows left set apart, so that a pull of one walks its edges again.
+    marked: u64,
+    /// The edit's walk: the nodes that had said they changed before it, the reverse edges it
+    /// followed and the rows it asked.
+    edit: (u64, u64, u64),
+    /// The rows named to a host that asks from the build's end.
+    named: usize,
+}
+
+/// A build of `library` pairs of rows, an application row and a second package's row, then a
+/// first edit, as a host does them: row `2i` reads the library's configuration (input 0) and
+/// row `2i + 1` reads row `2i`; the application's row reads its source (input 1) and row 0;
+/// the last row reads the second package's configuration (input 2). The build makes every
+/// row, then the library's configuration is written (a build script's result applied after
+/// the rows that read it were made) and the build pulls every row again: each library row
+/// runs again and says it changed, with no walk. Then the second package's configuration is
+/// written and its row pulled, so the library's rows are of an earlier view than the
+/// build's last. At its end the host walks the changed set (off the answer's path). The edit writes the application's source and asks for the changed
+/// set since the build's end. Every answer is checked against a run from scratch.
+fn a_first_edit_after_a_build(library: usize, plant: Plant) -> FirstEdit {
+    let mut flow: Vec<FlowNode> = Vec::with_capacity(2 * library + 1);
+    for at in 0..library {
+        flow.push(sum(&[Dep::Input(0)]));
+        flow.push(sum(&[Dep::Query(2 * at)]));
+    }
+    flow.push(sum(&[Dep::Input(1), Dep::Query(0)]));
+    flow.push(sum(&[Dep::Input(2)]));
+    let (rows, application) = (flow.len(), 2 * library);
+    let mut db = TestDb::new();
+    db.storage_mut().plant_in_changed_set(plant);
+    *db.flow.lock() = flow.clone();
+    let mut inputs = vec![1u64, 10, 100];
+    let cells: Vec<Cell> = inputs.iter().map(|&value| Cell::new(&db, value, 0)).collect();
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
+    let pull = |db: &TestDb, inputs: &[u64]| {
+        let model = evaluate(&flow, inputs, 0);
+        for at in 0..rows {
+            assert_eq!(*fetch::<Flow>(db, node(db, at)), model[at], "row {at}");
+        }
+    };
+    // The build: every row made, the configuration applied, every row pulled again.
+    pull(&db, &inputs);
+    inputs[0] = 5;
+    cells[0].set_a(&mut db, 5);
+    pull(&db, &inputs);
+    inputs[2] = 500;
+    cells[2].set_a(&mut db, 500);
+    assert_eq!(*fetch::<Flow>(&db, node(&db, rows - 1)), 500);
+    // Its end: the host's walk, after the answer.
+    let ended = walk_changed_set(&db);
+    let since = db.storage().view();
+    // The first edit.
+    inputs[1] = 11;
+    cells[1].set_a(&mut db, 11);
+    let changed = changed_since::<Flow>(&db, since);
+    let Changed::Keys(keys) = changed else { panic!("unknown: {changed:?}") };
+    let edit = db.storage().changed_set_work();
+    pull(&db, &inputs);
+    if plant == Plant::None {
+        assert_eq!(keys, [node(&db, application)], "the edit reaches the application's row");
+    }
+    FirstEdit {
+        asked: ended.visited + edit.visited,
+        marked: ended.marked + edit.marked,
+        edit: (edit.said, edit.edges, edit.visited),
+        named: keys.len(),
+    }
+}
+
+/// The invariant: the work of the first edit after a build is bounded by what the edit
+/// reaches, not by the database's size. A build leaves every row it made again saying it
+/// changed; each reader of one was verified after it changed, so the walk at the build's end
+/// passes it over with one load, asks no row and sets none apart, and the edit's walk starts
+/// from the edit's write alone: one reverse edge, one row asked, one row named, the same in
+/// a database of 202 rows and one of 4,002.
+#[test]
+fn the_first_edit_after_a_build_costs_what_it_reaches_at_two_sizes() {
+    let small = a_first_edit_after_a_build(100, Plant::None);
+    let large = a_first_edit_after_a_build(2000, Plant::None);
+    assert_eq!(small, FirstEdit { asked: 1, marked: 0, edit: (0, 1, 1), named: 1 });
+    assert_eq!(large, small, "the first edit's work grew with the database");
+}
+
+/// The control of [`the_first_edit_after_a_build_costs_what_it_reaches_at_two_sizes`]: a
+/// walk that asks every reader of a changed node, those verified since it changed too, meets
+/// the build's rows as a wide level and sets them all apart, so the work after the build is
+/// the database's size, and the oracle says so at both sizes.
+#[test]
+fn the_oracle_catches_a_walk_that_asks_the_readers_that_saw_the_change() {
+    let small = a_first_edit_after_a_build(100, Plant::AsksReadersThatSawTheChange);
+    let large = a_first_edit_after_a_build(2000, Plant::AsksReadersThatSawTheChange);
+    assert!(small.marked >= 200 && small.asked >= 200, "{small:?}");
+    assert!(large.marked >= 4000 && large.asked >= 4000, "{large:?}");
+    assert_ne!(small, large);
 }

@@ -21,6 +21,9 @@
 //! as any reader's edge is (`refresh` without the value: run again where a read changed,
 //! backdated where the value is equal); whatever changes says so and the walk goes on to its
 //! readers; a row that verifies unchanged stops it. It ends when nothing more changed.
+//! A reader verified in the view its dependency changed in, or later, is passed over with one
+//! load ([`Plan::suspects`]): the change is in its value already. So a walk after a build asks
+//! the rows that are behind what the build made again, not every reader of it.
 //!
 //! Why no changed row is missed. Write `L` for the view of the last walk. Held at every walk's
 //! end, for every row made before it: the row is verified in that view, or a pull of it would
@@ -32,6 +35,8 @@
 //! row is among `d`'s readers ([`super::reverse`]'s invariant; a run re-reads its edges up to
 //! and including the first changed one, so the edge to `d` survives the run, and an edge is
 //! never taken out of the index). So the walk verifies the row, and it says it changed.
+//! The readers passed over lose nothing: `d` changed after the row was verified, so the row
+//! is behind `d`'s stamp and is asked.
 //!
 //! A row the walk verifies may be one nothing asks for any more (its key names something an
 //! edit removed): a pull would never run it. So a verification that unwinds for any reason
@@ -59,9 +64,9 @@ use super::{
     function::{self, Function, Verified},
     ingredient::{self, Kind},
     local,
-    reverse::{Plan, Reverse, Seen},
+    reverse::{ASSUMED, ChangedIn, Plan, Reverse, Seen},
     row::{Header, PROVISIONAL, RUNNING, UNTRACKED, VALUE, VIEW_MASK, span},
-    storage::{Database, Storage, View, key_parts},
+    storage::{Database, FIELD, Storage, View, key_parts},
 };
 
 /// The edges one run stored: its row's node, the span it held before (0 for none) and the
@@ -207,6 +212,9 @@ pub struct ChangedSetWork {
     pub visited: u64,
     /// Reverse edges it followed.
     pub edges: u64,
+    /// Readers it passed over with one load each: verified in the view their dependency
+    /// changed in or later, so the change is in their value already.
+    pub seen_since: u64,
     /// Nodes that changed: the changed set's size, fields included.
     pub changed: u64,
     /// Verifications that unwound and were contained.
@@ -241,6 +249,10 @@ pub(crate) enum Plant {
     /// The walk goes on verifying however many verifications unwound ([`UNWOUND_MOST`]
     /// taken out): a panic a row for everything keyed by what an edit removed.
     ContainsEveryUnwind,
+    /// The walk asks every reader of a changed node, those verified since it changed too
+    /// ([`Plan::suspects`]'s test taken out): the first walk after a build asks the readers
+    /// of every row the build made again.
+    AsksReadersThatSawTheChange,
 }
 
 /// The storage's part of the changed set.
@@ -450,6 +462,37 @@ impl Storage {
         let (start, len) = (span::start(span), span::len(span));
         out.extend((start..start + len).map(|at| self.edge(at))); // alloc: the fold's scratch, one row's edges
     }
+}
+
+/// The view node `node` changed in, for a node that said it changed or was written: a
+/// field's stamp, a settled row's `changed`. [`ASSUMED`] where nothing says (a row emptied,
+/// running or provisional, a node with no row): every reader of it is asked.
+fn changed_in(storage: &Storage, node: u32, plant: Plant) -> ChangedIn {
+    if plant == Plant::AsksReadersThatSawTheChange {
+        return (node, ASSUMED);
+    }
+    let painted = storage.color_of(node);
+    if (painted >> 32) as u32 >= FIELD {
+        return (node, painted as u32);
+    }
+    let since = row_of(storage, node).map_or(ASSUMED, |(header, _, _)| {
+        let word = header.verified.load(Ordering::Acquire);
+        if word & (RUNNING | PROVISIONAL) != 0 || word & VIEW_MASK == 0 {
+            ASSUMED
+        } else {
+            header.changed.load(Ordering::Relaxed)
+        }
+    });
+    (node, since)
+}
+
+/// The view the row of `node` was last verified in; 0 where that cannot be told (running,
+/// provisional, never made, no row): a reader that has seen no change.
+fn verified_in(storage: &Storage, node: u32) -> u32 {
+    row_of(storage, node).map_or(0, |(header, _, _)| {
+        let word = header.verified.load(Ordering::Acquire);
+        if word & (RUNNING | PROVISIONAL) != 0 { 0 } else { word & VIEW_MASK }
+    })
 }
 
 /// The header of the function row `node` names, with its ingredient and key; `None` for a
@@ -721,6 +764,7 @@ fn walk(db: *const (), storage: &Storage) {
         written = taken.written.len(),
         untracked = tracing::field::Empty,
         said = tracing::field::Empty,
+        seen_since = tracing::field::Empty,
         visited = tracing::field::Empty,
         edges = tracing::field::Empty,
         changed = tracing::field::Empty,
@@ -755,10 +799,11 @@ fn walk(db: *const (), storage: &Storage) {
         .collect();
 
     // alloc: a walk's lists, what the edit reaches
-    let mut changed: Vec<u32> = match plant {
+    let mut changed: Vec<ChangedIn> = match plant {
         Plant::ForgetsReadersOfWritten => Vec::new(),
-        // clone: the written fields, a word each; `taken` keeps them should the walk unwind
-        _ => taken.written.clone(),
+        // The written fields, each with the view of its write; `taken` keeps them should
+        // the walk unwind.
+        _ => taken.written.iter().map(|&node| changed_in(storage, node, plant)).collect(),
     };
     let mut found: Vec<u32> = Vec::new(); // alloc: as above
     let mut suspects: Vec<u32> = Vec::new(); // alloc: as above
@@ -783,7 +828,7 @@ fn walk(db: *const (), storage: &Storage) {
         // What said it changed, by this walk's verifications or by any pull since the last.
         if first || plant != Plant::StopsAtChangedReader {
             while let Some(node) = frontier.changed.pop() {
-                changed.push(node);
+                changed.push(changed_in(storage, node, plant));
                 found.push(node);
                 work.said += u64::from(first);
             }
@@ -792,7 +837,7 @@ fn walk(db: *const (), storage: &Storage) {
         if plant == Plant::ForgetsReadersOfWritten {
             changed.clear();
         }
-        plan.suspects(&frontier.reverse, &mut changed, &mut suspects);
+        plan.suspects(&frontier.reverse, &mut changed, &mut suspects, |reader| verified_in(storage, reader));
         if suspects.is_empty() {
             if frontier.changed.is_empty() || plant == Plant::StopsAtChangedReader {
                 break;
@@ -803,7 +848,7 @@ fn walk(db: *const (), storage: &Storage) {
         suspects.retain(|&node| {
             let apart = apart_now.contains(&node);
             if apart {
-                changed.push(node);
+                changed.push((node, ASSUMED));
                 found.push(node);
             }
             !apart
@@ -824,7 +869,7 @@ fn walk(db: *const (), storage: &Storage) {
                 if word & (RUNNING | PROVISIONAL) == 0 && word & VIEW_MASK == view_bits {
                     continue;
                 }
-                changed.push(node);
+                changed.push((node, ASSUMED));
                 found.push(node);
                 if apart_now.insert(node) {
                     unwound.push((node, word)); // alloc: as above
@@ -847,7 +892,7 @@ fn walk(db: *const (), storage: &Storage) {
                 if word & (RUNNING | PROVISIONAL) == 0 && word & VIEW_MASK == view_bits {
                     continue;
                 }
-                changed.push(node);
+                changed.push((node, ASSUMED));
                 found.push(node);
                 if apart_now.insert(node) {
                     unwound.push((node, word)); // alloc: as above
@@ -857,7 +902,7 @@ fn walk(db: *const (), storage: &Storage) {
             }
             let seen = verify(db, storage, node, plant);
             if seen == Seen1::Unsure || seen == Seen1::Unwound {
-                changed.push(node);
+                changed.push((node, ASSUMED));
                 found.push(node);
             }
             if seen == Seen1::Unwound {
@@ -892,9 +937,11 @@ fn walk(db: *const (), storage: &Storage) {
     found.dedup();
     work.visited = plan.visited;
     work.edges = plan.edges;
+    work.seen_since = plan.seen_since;
     work.changed = found.len() as u64;
     walking.record("untracked", work.untracked);
     walking.record("said", work.said);
+    walking.record("seen_since", work.seen_since);
     walking.record("visited", work.visited);
     walking.record("edges", work.edges);
     walking.record("changed", work.changed);
@@ -908,6 +955,7 @@ fn walk(db: *const (), storage: &Storage) {
         written = work.written,
         untracked = work.untracked,
         said = work.said,
+        seen_since = work.seen_since,
         visited = work.visited,
         edges = work.edges,
         changed = work.changed,
