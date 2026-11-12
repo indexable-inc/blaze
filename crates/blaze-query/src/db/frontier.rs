@@ -964,17 +964,7 @@ fn walk(db: *const (), storage: &Storage) {
         "edit work"
     );
 
-    // The findings: this walk's after the kept ones, the oldest merged past the bounds. A
-    // walk that found nothing leaves the kept log as it is.
-    let kept = Arc::clone(&frontier.walked.lock().log); // clone: a count
-    let log = if found.is_empty() {
-        kept
-    } else {
-        let mut log: Vec<Arc<Found>> = kept.iter().cloned().collect(); // alloc: the log's list, at most `LOG_WALKS` pointers
-        log.push(Arc::new(Found { at: view, nodes: found })); // alloc: a walk's findings
-        merge_oldest(&mut log);
-        Arc::new(log) // alloc: as above
-    };
+    let log = logged(frontier, view, found);
     // Sorted by node, each once ([`set_apart`] searches it).
     unwound.sort_unstable_by_key(|it| it.0);
     let apart = u32::try_from(unwound.len()).unwrap_or(u32::MAX);
@@ -990,6 +980,125 @@ fn walk(db: *const (), storage: &Storage) {
     // Published last: from here a row not verified in this view is unchanged ([`clean`]).
     frontier.unwound.store(apart, Ordering::Release);
     frontier.clean_at.store(view, Ordering::Release);
+}
+
+/// The log with `found` (sorted, each node once) after the kept findings, as view `view`'s,
+/// the oldest merged past the bounds. Nothing found leaves the kept log as it is.
+fn logged(frontier: &Frontier, view: u64, found: Vec<u32>) -> Arc<Vec<Arc<Found>>> {
+    let kept = Arc::clone(&frontier.walked.lock().log); // clone: a count
+    if found.is_empty() {
+        return kept;
+    }
+    let mut log: Vec<Arc<Found>> = kept.iter().cloned().collect(); // alloc: the log's list, at most `LOG_WALKS` pointers
+    log.push(Arc::new(Found { at: view, nodes: found })); // alloc: a walk's findings
+    merge_oldest(&mut log);
+    Arc::new(log) // alloc: as above
+}
+
+/// What [`Storage::settle_changed_set`] did.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct Settled {
+    /// Nodes that had said they changed, and written fields, it looked at.
+    pub said: u64,
+    /// Reverse edges it followed: a load of each reader's word.
+    pub edges: u64,
+    /// Those of `said` it took out of the next walk's start: every reader has seen the change.
+    pub settled: u64,
+    /// Those left to the next walk: a reader is behind, or nothing says when the node changed.
+    pub left: u64,
+}
+
+impl Storage {
+    /// Settles what a build's pulls left for the next walk, with `&mut` (no run in flight):
+    /// what a host does at a build's end, after its answer. Every row the build made again
+    /// said it changed, and every field it wrote is listed; the next walk would start from
+    /// all of them and follow each one's reverse edges, on the path of the next edit, whose
+    /// own write is one field. Here each is looked at once: where every reader was verified in
+    /// the view the node changed in or later, the change is in every reader's value already
+    /// ([`Plan::suspects`]'s invariant), so the node is named in the log as changed by this
+    /// view and taken out of the next walk's start. A node with a reader that is behind, or
+    /// with nothing to say when it changed, stays for the next walk, which verifies.
+    ///
+    /// It runs no query and verifies no row: it claims nothing about the rows ([`clean`] is
+    /// a walk's to say), only that the next walk need not ask these nodes' readers.
+    ///
+    /// Why no changed row is missed: a row changes by running again for a read that changed
+    /// after it was verified. A node taken out has no reader verified before its stamp, so
+    /// no reader runs again for it; if the node changes again it says so again.
+    ///
+    /// Folds first ([`Storage::fold_reverse`]): the readers of this build's runs are in the
+    /// index before it is asked.
+    pub fn settle_changed_set(&mut self) -> Settled {
+        self.fold_reverse();
+        let view = self.view().as_u64();
+        let plant = self.frontier.plant;
+        let span = tracing::info_span!(
+            target: "blaze",
+            "changed set settle",
+            view,
+            said = tracing::field::Empty,
+            edges = tracing::field::Empty,
+            settled = tracing::field::Empty,
+            left = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let mut done = Settled::default();
+        let storage = &*self;
+        let frontier = &storage.frontier;
+        // Whether every reader of `node` has seen its change; counts the edges looked at.
+        let mut seen_by_all = |node: u32| {
+            let (_, since) = changed_in(storage, node, plant);
+            if since == ASSUMED {
+                return false;
+            }
+            let mut behind = false;
+            done.edges += frontier.reverse.readers(node, |reader| {
+                // A reader never made, or emptied, has nothing to bring up to date.
+                let verified = verified_word(storage, reader);
+                behind |= verified & VIEW_MASK != 0 && verified & VIEW_MASK < since
+                    || verified & (RUNNING | PROVISIONAL) != 0;
+            });
+            !behind
+        };
+        let mut said: Vec<u32> = Vec::new(); // alloc: the build's backlog, a word a node
+        while let Some(node) = frontier.changed.pop() {
+            said.push(node);
+        }
+        said.sort_unstable();
+        said.dedup();
+        let mut found: Vec<u32> = Vec::with_capacity(said.len()); // alloc: as above
+        let mut left = 0u64;
+        for &node in &said {
+            if seen_by_all(node) {
+                found.push(node);
+            } else {
+                frontier.changed.push(node);
+                left += 1;
+            }
+        }
+        let mut written = std::mem::take(&mut frontier.walked.lock().written);
+        let fields = written.len();
+        written.retain(|&node| !seen_by_all(node));
+        left += written.len() as u64;
+        done.said = said.len() as u64 + fields as u64;
+        done.left = left;
+        done.settled = done.said - left;
+        let log = logged(frontier, view, found);
+        let mut walked = frontier.walked.lock();
+        walked.written = written;
+        walked.log = log;
+        drop(walked);
+        span.record("said", done.said);
+        span.record("edges", done.edges);
+        span.record("settled", done.settled);
+        span.record("left", done.left);
+        done
+    }
+}
+
+/// The `verified` word of the row of `node`; 0 for a node with no row.
+fn verified_word(storage: &Storage, node: u32) -> u32 {
+    row_of(storage, node).map_or(0, |(header, _, _)| header.verified.load(Ordering::Acquire))
 }
 
 /// Whether the row of `node`, verified in an earlier view, holds in this one with no look at

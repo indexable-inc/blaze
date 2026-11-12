@@ -14,7 +14,7 @@ use super::{
     super::{
         Changed, Untracked,
         frontier::Plant,
-        plumbing::{changed_since, evict_values, walk_changed_set},
+        plumbing::{changed_since, evict_values},
         report_untracked_read,
     },
     *,
@@ -154,6 +154,8 @@ enum Step {
     Pull(Vec<usize>),
     /// Folds what ran into the reverse index now, as a host does after a build's answer
     /// ([`crate::db::Storage::pack_reverse`]), where a view's boundary would fold it later.
+    /// Then settles the changed set ([`crate::db::Storage::settle_changed_set`]): the nodes
+    /// that said they changed whose readers have all seen it leave the next walk's start.
     Pack,
     /// Asks for the changed set since the ask `back` asks ago (0: the last; past the first:
     /// since the storage's first view), then for every node made.
@@ -249,6 +251,8 @@ fn simulate(program: &Program, plant: Plant) -> Result<(), String> {
             }
             Step::Pack => {
                 db.storage_mut().pack_reverse();
+                // And settles what the pulls since the last walk left, as a host does there.
+                db.storage_mut().settle_changed_set();
                 if db.storage().runs_unfolded() != 0 {
                     return Err(format!(
                         "step {at}: {} runs' edges are left to the next view's boundary after a fold",
@@ -628,13 +632,15 @@ fn the_oracle_catches_a_walk_that_contains_every_unwind() {
     assert_eq!((work.unwound, work.marked, named), (40, 0, 40), "{work:?}");
 }
 
-/// What [`a_first_edit_after_a_build`] saw: the walk at the build's end, the first edit's
+/// What [`a_first_edit_after_a_build`] saw: the settle at the build's end, the first edit's
 /// walk, and the rows the edit's changed set named.
 #[derive(Debug, PartialEq, Eq)]
 struct FirstEdit {
-    /// Rows the two walks asked or marked: the walks' work after the build's last write.
+    /// Nodes the settle at the build's end left to the edit's walk.
+    left: u64,
+    /// Rows the edit's walk asked.
     asked: u64,
-    /// Rows left set apart, so that a pull of one walks its edges again.
+    /// Rows it set apart, so that a pull of one walks its edges again.
     marked: u64,
     /// The edit's walk: the nodes that had said they changed before it, the reverse edges it
     /// followed and the rows it asked.
@@ -651,7 +657,7 @@ struct FirstEdit {
 /// the rows that read it were made) and the build pulls every row again: each library row
 /// runs again and says it changed, with no walk. Then the second package's configuration is
 /// written and its row pulled, so the library's rows are of an earlier view than the
-/// build's last. At its end the host walks the changed set (off the answer's path). The edit writes the application's source and asks for the changed
+/// build's last. At its end the host settles the changed set (off the answer's path). The edit writes the application's source and asks for the changed
 /// set since the build's end. Every answer is checked against a run from scratch.
 fn a_first_edit_after_a_build(library: usize, plant: Plant) -> FirstEdit {
     let mut flow: Vec<FlowNode> = Vec::with_capacity(2 * library + 1);
@@ -682,8 +688,8 @@ fn a_first_edit_after_a_build(library: usize, plant: Plant) -> FirstEdit {
     inputs[2] = 500;
     cells[2].set_a(&mut db, 500);
     assert_eq!(*fetch::<Flow>(&db, node(&db, rows - 1)), 500);
-    // Its end: the host's walk, after the answer.
-    let ended = walk_changed_set(&db);
+    // Its end, after the answer: the host settles what the build's pulls left.
+    let ended = db.storage_mut().settle_changed_set();
     let since = db.storage().view();
     // The first edit.
     inputs[1] = 11;
@@ -696,8 +702,9 @@ fn a_first_edit_after_a_build(library: usize, plant: Plant) -> FirstEdit {
         assert_eq!(keys, [node(&db, application)], "the edit reaches the application's row");
     }
     FirstEdit {
-        asked: ended.visited + edit.visited,
-        marked: ended.marked + edit.marked,
+        left: ended.left,
+        asked: edit.visited,
+        marked: edit.marked,
         edit: (edit.said, edit.edges, edit.visited),
         named: keys.len(),
     }
@@ -705,27 +712,27 @@ fn a_first_edit_after_a_build(library: usize, plant: Plant) -> FirstEdit {
 
 /// The invariant: the work of the first edit after a build is bounded by what the edit
 /// reaches, not by the database's size. A build leaves every row it made again saying it
-/// changed; each reader of one was verified after it changed, so the walk at the build's end
-/// passes it over with one load, asks no row and sets none apart, and the edit's walk starts
-/// from the edit's write alone: one reverse edge, one row asked, one row named, the same in
-/// a database of 202 rows and one of 4,002.
+/// changed; each reader of one was verified after it changed, so the settle at the build's
+/// end takes every one out of the next walk's start with a load a reader, running nothing,
+/// and the edit's walk starts from the edit's write alone: one reverse edge, one row asked,
+/// none set apart, one row named, the same in a database of 202 rows and one of 4,002.
 #[test]
 fn the_first_edit_after_a_build_costs_what_it_reaches_at_two_sizes() {
     let small = a_first_edit_after_a_build(100, Plant::None);
     let large = a_first_edit_after_a_build(2000, Plant::None);
-    assert_eq!(small, FirstEdit { asked: 1, marked: 0, edit: (0, 1, 1), named: 1 });
+    assert_eq!(small, FirstEdit { left: 0, asked: 1, marked: 0, edit: (0, 1, 1), named: 1 });
     assert_eq!(large, small, "the first edit's work grew with the database");
 }
 
 /// The control of [`the_first_edit_after_a_build_costs_what_it_reaches_at_two_sizes`]: a
 /// walk that asks every reader of a changed node, those verified since it changed too, meets
-/// the build's rows as a wide level and sets them all apart, so the work after the build is
-/// the database's size, and the oracle says so at both sizes.
+/// the build's rows as a wide level and sets them all apart: nothing the build left can be
+/// settled, the edit's walk is the database's size, and the oracle says so at both sizes.
 #[test]
 fn the_oracle_catches_a_walk_that_asks_the_readers_that_saw_the_change() {
     let small = a_first_edit_after_a_build(100, Plant::AsksReadersThatSawTheChange);
     let large = a_first_edit_after_a_build(2000, Plant::AsksReadersThatSawTheChange);
-    assert!(small.marked >= 200 && small.asked >= 200, "{small:?}");
-    assert!(large.marked >= 4000 && large.asked >= 4000, "{large:?}");
+    assert!(small.left >= 200 && small.marked >= 200 && small.asked >= 200, "{small:?}");
+    assert!(large.left >= 4000 && large.marked >= 4000 && large.asked >= 4000, "{large:?}");
     assert_ne!(small, large);
 }

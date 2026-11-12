@@ -367,6 +367,12 @@ impl Release<Crate> {
         // build's path unless the lists doubled the index.
         if ended {
             db.storage_mut().pack_reverse();
+            // And what its pulls left for the next changed-set walk is settled: each row the
+            // build made again said it changed, and the next edit's walk would start from all
+            // of them (a hello-world's first edit: 381,137 rows asked and 381,101 set apart
+            // for a write of one file, 1.9 million memos verified, 2026-11-12). Here, after
+            // the answer, each costs a load a reader and runs nothing.
+            db.storage_mut().settle_changed_set();
         }
         // What was let go goes back to the system now, not when mimalloc's purge delay and the
         // next page taken get to it: this thread's heaps and every freed page at once, each
