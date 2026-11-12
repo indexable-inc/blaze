@@ -23,4 +23,57 @@ cue {
     prop by: f32 = 0.05
     Cue: {member: "Pose.shrink", from: 0, to: 0 - $by, at: $at, dur: $dur, ease: InOut}
   }
+  // There from `at`, at once (a cut in): gone before it. With a `CutOut` or a `FadeOut` after it, a shot's window.
+  template CutIn {
+    prop at: f32 = 0
+    Cue: {member: "Pose.fade", from: 1, to: 0, at: $at, dur: 0, ease: Linear}
+  }
+  // Gone from `at`, at once (a cut out).
+  template CutOut {
+    prop at: f32 = 0
+    Cue: {member: "Pose.fade", from: 0, to: 1, at: $at, dur: 0, ease: Linear}
+  }
+  // Arrive: fade in over `dur` from `at`, quick then settling (things coming in).
+  template Arrive {
+    prop at: f32 = 0
+    prop dur: f32 = 0.35
+    Cue: {member: "Pose.fade", from: 1, to: 0, at: $at, dur: $dur, ease: Out}
+  }
+  // Rise `by` points into place over `dur` from `at`, settling; pair it with an Arrive.
+  template Lift {
+    prop at: f32 = 0
+    prop dur: f32 = 0.45
+    prop by: f32 = 10
+    Cue: {member: "Pose.dy", from: $by, to: 0, at: $at, dur: $dur, ease: Out}
+  }
+  // Type words on: every glyph hidden at `at`, all shown `dur` later, at an even pace (pair it with a Caret).
+  template Type {
+    prop at: f32 = 0
+    prop dur: f32 = 1
+    Cue: {member: "Pose.cut", from: 1, to: 0, at: $at, dur: $dur, ease: Linear}
+  }
+  // A bar growing: its width from `from` to `to` points over `dur` from `at`, at an even speed (so its length is time).
+  template Widen {
+    prop at: f32 = 0
+    prop dur: f32 = 1
+    prop from: f32 = 0
+    prop to: f32 = 100
+    Cue: {member: "Size.w.value", from: $from, to: $to, at: $at, dur: $dur, ease: Linear}
+  }
+  // A Tally counting from `from` to `to` over `dur` from `at`, at an even speed (beside a Widen, the bar's own clock).
+  template Count {
+    prop at: f32 = 0
+    prop dur: f32 = 1
+    prop from: f32 = 0
+    prop to: f32 = 100
+    Cue: {member: "Tally.value", from: $from, to: $to, at: $at, dur: $dur, ease: Linear}
+  }
+  // A Tally falling (or climbing) from `from` to `to`, slowly at first and landing softly: a number that was improved.
+  template Fall {
+    prop at: f32 = 0
+    prop dur: f32 = 1
+    prop from: f32 = 100
+    prop to: f32 = 0
+    Cue: {member: "Tally.value", from: $from, to: $to, at: $at, dur: $dur, ease: InOut}
+  }
 }

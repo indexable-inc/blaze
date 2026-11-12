@@ -1,0 +1,164 @@
+// Shot 3, what blaze is: seven things, one a card, fast (film.flecs's storyboard). Each is something the repository's
+// docs say is built (AGENTS.md's rules sandbox-everything, deterministic-output, cache-by-code-id; docs/v2/plan/design/
+// code-identity.md; the linker and live runtime; `blaze debug inspect` in blaze-cargo's cli), or says "in progress" on
+// the card (the Lean proofs: docs/v2/plan/objectives.md rows V6 to V11).
+const t = $t_what
+
+@tree ChildOf
+film {
+  daemon : film_part.Shot {
+    cue.CutIn enter(at: $t + 0.0)
+    cue.CutOut leave(at: $t + 1.5)
+    count : film_part.Mono {
+      Text: {s: "1 / 7"}
+      Fill: $tone_film_accent
+    }
+    room : film_part.Gap {}
+    head : film_part.Hero {
+      Text: {s: "A resident daemon."}
+      cue.Lift up(at: $t + 0.0, dur: 0.35, by: 14)
+    }
+    room2 : film_part.Gap {}
+    sub : film_part.Mono {
+      Text: {s: "the compiler stays loaded between edits"}
+      Fill: $tone_ink_muted
+      cue.Arrive show(at: $t + 0.0 + 0.25)
+    }
+    // Sound: each card lands on the next note up A major, left to right.
+    note : voice.Mallet { Onset: {at: $t + 0.0}; Pitch: {hz: 220.0}; Gain: {amp: 0.06}; Lasts: {dur: 1.4}; Pan: {pos: -0.6, sweep: 0} }
+    tick : voice.Click { Onset: {at: $t + 0.0}; Pitch: {hz: 2600}; Gain: {amp: 0.03} }
+  }
+  identity : film_part.Shot {
+    cue.CutIn enter(at: $t + 1.5)
+    cue.CutOut leave(at: $t + 3.0)
+    count : film_part.Mono {
+      Text: {s: "2 / 7"}
+      Fill: $tone_film_accent
+    }
+    room : film_part.Gap {}
+    head : film_part.Hero {
+      Text: {s: "Results keyed by code identity."}
+      cue.Lift up(at: $t + 1.5, dur: 0.35, by: 14)
+    }
+    room2 : film_part.Gap {}
+    sub : film_part.Mono {
+      Text: {s: "nothing is compiled twice"}
+      Fill: $tone_ink_muted
+      cue.Arrive show(at: $t + 1.5 + 0.25)
+    }
+    // Sound: each card lands on the next note up A major, left to right.
+    note : voice.Mallet { Onset: {at: $t + 1.5}; Pitch: {hz: 246.94}; Gain: {amp: 0.06}; Lasts: {dur: 1.4}; Pan: {pos: -0.4, sweep: 0} }
+    tick : voice.Click { Onset: {at: $t + 1.5}; Pitch: {hz: 2600}; Gain: {amp: 0.03} }
+  }
+  sandbox : film_part.Shot {
+    cue.CutIn enter(at: $t + 3.0)
+    cue.CutOut leave(at: $t + 4.6)
+    count : film_part.Mono {
+      Text: {s: "3 / 7"}
+      Fill: $tone_film_accent
+    }
+    room : film_part.Gap {}
+    head : film_part.Hero {
+      Text: {s: "Build scripts and proc macros run sandboxed."}
+      cue.Lift up(at: $t + 3.0, dur: 0.35, by: 14)
+    }
+    room2 : film_part.Gap {}
+    sub : film_part.Mono {
+      Text: {s: "always; where no sandbox can be made, blaze stops"}
+      Fill: $tone_ink_muted
+      cue.Arrive show(at: $t + 3.0 + 0.25)
+    }
+    // Sound: each card lands on the next note up A major, left to right.
+    note : voice.Mallet { Onset: {at: $t + 3.0}; Pitch: {hz: 277.18}; Gain: {amp: 0.06}; Lasts: {dur: 1.4}; Pan: {pos: -0.2, sweep: 0} }
+    tick : voice.Click { Onset: {at: $t + 3.0}; Pitch: {hz: 2600}; Gain: {amp: 0.03} }
+  }
+  bytes : film_part.Shot {
+    cue.CutIn enter(at: $t + 4.6)
+    cue.CutOut leave(at: $t + 6.3)
+    count : film_part.Mono {
+      Text: {s: "4 / 7"}
+      Fill: $tone_film_accent
+    }
+    room : film_part.Gap {}
+    head : film_part.Hero {
+      Text: {s: "Byte-identical outputs."}
+      cue.Lift up(at: $t + 4.6, dur: 0.35, by: 14)
+    }
+    room2 : film_part.Gap {}
+    sub : film_part.Mono {
+      Text: {s: "build twice, compare the bytes"}
+      Fill: $tone_ink_muted
+      cue.Arrive show(at: $t + 4.6 + 0.25)
+    }
+    // Sound: each card lands on the next note up A major, left to right.
+    note : voice.Mallet { Onset: {at: $t + 4.6}; Pitch: {hz: 329.63}; Gain: {amp: 0.06}; Lasts: {dur: 1.4}; Pan: {pos: 0.0, sweep: 0} }
+    tick : voice.Click { Onset: {at: $t + 4.6}; Pitch: {hz: 2600}; Gain: {amp: 0.03} }
+  }
+  linker : film_part.Shot {
+    cue.CutIn enter(at: $t + 6.3)
+    cue.CutOut leave(at: $t + 8.1)
+    count : film_part.Mono {
+      Text: {s: "5 / 7"}
+      Fill: $tone_film_accent
+    }
+    room : film_part.Gap {}
+    head : film_part.Hero {
+      Text: {s: "Its own linker patches the running binary."}
+      cue.Lift up(at: $t + 6.3, dur: 0.35, by: 14)
+    }
+    room2 : film_part.Gap {}
+    sub : film_part.Mono {
+      Text: {s: "an edit lands in the live process"}
+      Fill: $tone_ink_muted
+      cue.Arrive show(at: $t + 6.3 + 0.25)
+    }
+    // Sound: each card lands on the next note up A major, left to right.
+    note : voice.Mallet { Onset: {at: $t + 6.3}; Pitch: {hz: 369.99}; Gain: {amp: 0.06}; Lasts: {dur: 1.4}; Pan: {pos: 0.2, sweep: 0} }
+    tick : voice.Click { Onset: {at: $t + 6.3}; Pitch: {hz: 2600}; Gain: {amp: 0.03} }
+  }
+  lean : film_part.Shot {
+    cue.CutIn enter(at: $t + 8.1)
+    cue.CutOut leave(at: $t + 9.9)
+    count : film_part.Mono {
+      Text: {s: "6 / 7"}
+      Fill: $tone_film_accent
+    }
+    room : film_part.Gap {}
+    head : film_part.Hero {
+      Text: {s: "Optimizer rewrites checked in Lean."}
+      cue.Lift up(at: $t + 8.1, dur: 0.35, by: 14)
+    }
+    room2 : film_part.Gap {}
+    sub : film_part.Mono {
+      Text: {s: "in progress: the first MIR passes are proved against a Lean semantics"}
+      Fill: $tone_ink_muted
+      cue.Arrive show(at: $t + 8.1 + 0.25)
+    }
+    // Sound: each card lands on the next note up A major, left to right.
+    note : voice.Mallet { Onset: {at: $t + 8.1}; Pitch: {hz: 440.0}; Gain: {amp: 0.06}; Lasts: {dur: 1.4}; Pan: {pos: 0.4, sweep: 0} }
+    tick : voice.Click { Onset: {at: $t + 8.1}; Pitch: {hz: 2600}; Gain: {amp: 0.03} }
+  }
+  inspect : film_part.Shot {
+    cue.CutIn enter(at: $t + 9.9)
+    cue.CutOut leave(at: $t + 11.8)
+    count : film_part.Mono {
+      Text: {s: "7 / 7"}
+      Fill: $tone_film_accent
+    }
+    room : film_part.Gap {}
+    head : film_part.Hero {
+      Text: {s: "blaze debug inspect"}
+      TextStyle: {size: $size_film_hero, line: $line_film_hero, code_line: 0, role: 9, bold: 1, weight: 0}
+      cue.Lift up(at: $t + 9.9, dur: 0.35, by: 14)
+    }
+    room2 : film_part.Gap {}
+    sub : film_part.Mono {
+      Text: {s: "what every worker is doing, as data an agent can read"}
+      Fill: $tone_ink_muted
+      cue.Arrive show(at: $t + 9.9 + 0.25)
+    }
+    // Sound: each card lands on the next note up A major, left to right.
+    note : voice.Mallet { Onset: {at: $t + 9.9}; Pitch: {hz: 493.88}; Gain: {amp: 0.06}; Lasts: {dur: 1.4}; Pan: {pos: 0.6, sweep: 0} }
+    tick : voice.Click { Onset: {at: $t + 9.9}; Pitch: {hz: 2600}; Gain: {amp: 0.03} }
+  }
+}

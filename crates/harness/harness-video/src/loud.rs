@@ -51,8 +51,9 @@ fn k_weighted(channel: impl Iterator<Item = f32>) -> Vec<f64> {
 /// Taps each side of the true-peak interpolator.
 const HALF: isize = 12;
 
-/// The largest magnitude of `channel` oversampled four times (a Hann-windowed sinc), linear.
-fn true_peak(channel: &[f32]) -> f64 {
+/// For each sample of `channel`, the largest magnitude of it and of the three points after it when the channel is
+/// oversampled four times (a Hann-windowed sinc), linear: the true peak, by sample.
+fn envelope(channel: &[f32]) -> Vec<f64> {
     let mut taps = [[0.0f64; (2 * HALF) as usize]; 3];
     for (k, phase) in taps.iter_mut().enumerate() {
         let frac = (k + 1) as f64 / 4.0;
@@ -65,15 +66,23 @@ fn true_peak(channel: &[f32]) -> f64 {
         }
     }
     let at = |i: isize| if i < 0 || i as usize >= channel.len() { 0.0 } else { f64::from(channel[i as usize]) };
-    let mut peak = 0.0f64;
-    for i in 0..channel.len() as isize {
-        peak = peak.max(at(i).abs());
-        for phase in &taps {
-            let v: f64 = phase.iter().enumerate().map(|(j, t)| t * at(i + j as isize - HALF + 1)).sum();
-            peak = peak.max(v.abs());
-        }
-    }
-    peak
+    (0..channel.len() as isize)
+        .map(|i| {
+            let mut peak = at(i).abs();
+            for phase in &taps {
+                let v: f64 = phase.iter().enumerate().map(|(j, t)| t * at(i + j as isize - HALF + 1)).sum();
+                peak = peak.max(v.abs());
+            }
+            peak
+        })
+        .collect()
+}
+
+/// The true peak of a mix by sample: the larger channel's [`envelope`].
+fn peaks(mix: &[[f32; 2]]) -> Vec<f64> {
+    let left: Vec<f32> = mix.iter().map(|s| s[0]).collect();
+    let right: Vec<f32> = mix.iter().map(|s| s[1]).collect();
+    envelope(&left).into_iter().zip(envelope(&right)).map(|(l, r)| l.max(r)).collect()
 }
 
 fn db(linear: f64) -> f64 {
@@ -102,20 +111,26 @@ pub fn measure(mix: &[[f32; 2]]) -> Loudness {
         let kept: Vec<f64> = over.iter().copied().filter(|e| loud(*e) > gate).collect();
         if kept.is_empty() { f64::NEG_INFINITY } else { loud(mean(&kept)) }
     };
-    let left: Vec<f32> = mix.iter().map(|s| s[0]).collect();
-    let right: Vec<f32> = mix.iter().map(|s| s[1]).collect();
     let sample = mix.iter().flat_map(|s| [s[0].abs(), s[1].abs()]).fold(0.0f32, f32::max);
-    Loudness { lufs, true_peak: db(true_peak(&left).max(true_peak(&right))), sample_peak: db(f64::from(sample)) }
+    Loudness { lufs, true_peak: db(peaks(mix).into_iter().fold(0.0, f64::max)), sample_peak: db(f64::from(sample)) }
 }
 
 /// How far ahead the limiter sees: 5 ms.
 const LOOK: usize = RATE as usize / 200;
 
-/// Hold every sample of `mix` at or under `ceiling` (linear): each sample's gain is the least any sample within
-/// [`LOOK`] ahead of it needs, averaged over the [`LOOK`] before it, so the gain is already down when a peak arrives and
-/// moves smoothly. The average of gains each at most what this sample needs is at most what it needs.
+/// Hold `mix`'s true peak at or under `ceiling` (linear): what a sample needs is the ceiling over the true peak around
+/// it (its own [`peaks`] and the sample before's, whose three points after it lie between the two); each sample's gain
+/// is the least any sample within [`LOOK`] ahead of it needs, averaged over the [`LOOK`] before it, so the gain is already
+/// down when a peak arrives and moves smoothly. The average of gains each at most what this sample needs is at most what
+/// it needs.
 fn limit(mix: &mut [[f32; 2]], ceiling: f32) {
-    let need: Vec<f32> = mix.iter().map(|s| (ceiling / s[0].abs().max(s[1].abs()).max(1e-9)).min(1.0)).collect();
+    let around = peaks(mix);
+    let need: Vec<f32> = (0..mix.len())
+        .map(|i| {
+            let peak = around[i].max(around[i.saturating_sub(1)]).max(1e-9);
+            (f64::from(ceiling) / peak).min(1.0) as f32
+        })
+        .collect();
     let n = need.len();
     // least[i] = min need[i..=i+LOOK], by a monotonic queue of indices.
     let mut least = vec![1.0f32; n];
@@ -146,16 +161,17 @@ fn limit(mix: &mut [[f32; 2]], ceiling: f32) {
 }
 
 /// Bring `mix` to `lufs` integrated with no true peak over `ceiling` dBTP, and say what it then measures. The limiter
-/// works on samples, 0.4 dB under the ceiling, so what lies between samples stays under it; if a true peak still passes
-/// the ceiling the whole mix comes down by the difference. Err for a silent mix (nothing to bring to a loudness).
+/// holds the true peak 0.2 dB under the ceiling (a moving gain can lift a point between samples a little); if a true
+/// peak still passes the ceiling the whole mix comes down by the difference. Err for a silent mix (nothing to bring to
+/// a loudness).
 pub fn master(mix: &mut [[f32; 2]], lufs: f64, ceiling: f64) -> Result<Loudness, String> {
     let before = measure(mix);
     if !before.lufs.is_finite() {
         return Err("the mix is silent: it has no loudness to bring to a target".into());
     }
-    let hold = 10f64.powf((ceiling - 0.4) / 20.0) as f32;
-    // Twice: the limiter takes a little loudness off, which the second pass gives back.
-    for _ in 0..2 {
+    let hold = 10f64.powf((ceiling - 0.2) / 20.0) as f32;
+    // Four times: the limiter takes a little loudness off, which the next pass gives back.
+    for _ in 0..4 {
         let now = measure(mix);
         let gain = 10f64.powf((lufs - now.lufs) / 20.0) as f32;
         for s in mix.iter_mut() {

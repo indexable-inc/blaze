@@ -1,0 +1,173 @@
+// Shot 4, the edit loop (film.flecs's storyboard): a line is typed; every dot is a share of the cached results blaze
+// re-verified for one body edit; this morning that was all of them, and after one day's fixes it is the few left lit.
+// The figure and the dots fall together, from the data file's `engine.reverified` row; then the day's other three rows.
+const t = $t_loop
+// When the line is typed, when the edit lands (the grid lights), and the fall from before to after.
+const typed = $t + 0.7
+const lands = $t + 2.0
+const fall = $t + 4.2
+const fell = $t + 6.7
+// The grid: `dots` dots; the share of them left lit is the row's after over its before.
+const dots = 1100
+const kept = $dots * $d_engine_reverified_after_share
+const keys = 18
+const ticks = 30
+
+@tree ChildOf
+film {
+  loop : film_part.Shot {
+    Flex: {axis: Column, gap: 14, align: Start, justify: Center, wrap: false}
+    cue.CutIn enter(at: $t)
+    cue.CutOut leave(at: $t_race)
+    cols : ui.Row {
+      Flex: {axis: Row, gap: 40, align: Start, justify: Start, wrap: false}
+      Size: {w: {kind: Percent, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+      left : ui.Column {
+        Flex: {axis: Column, gap: 14, align: Start, justify: Start, wrap: false}
+        Size: {w: {kind: Fixed, value: 416, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        code : ui.Column {
+          Fill: $tone_film_panel
+          Shape: {radius: 8, n: 4, border: 0, feather: 0}
+          Padding: {l: 16, r: 16, t: 12, b: 12}
+          Size: {w: {kind: Percent, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+          top : film_part.Mono {
+            Text: {s: "fn total(order: &Order) -> u64 \{\n    let mut total = order.subtotal();"}
+            Highlight: {file: "order.rs"}
+          }
+          edit : film_part.Mono {
+            Text: {s: "    total += order.shipping();"}
+            Highlight: {file: "order.rs"}
+            Caret: {at: $t + 0.2, until: $lands + 0.4, blink: 0.5, ink: $film_caret}
+            cue.Type on(at: $typed, dur: 1.0)
+          }
+          rest : film_part.Mono {
+            Text: {s: "    total\n}"}
+            Highlight: {file: "order.rs"}
+          }
+        }
+        day : film_part.Small {
+          Text: {s: $d_engine_title}
+          Fill: $tone_film_accent
+          cue.Arrive show(at: $fell + 0.5)
+        }
+        launch : ui.Column {
+          cue.Arrive show(at: $fell + 0.7)
+          label : film_part.Small { Text: {s: $d_engine_launch_label} }
+          nums : ui.Row {
+            Flex: {axis: Row, gap: 10, align: Center, justify: Start, wrap: false}
+            was : film_part.Mono { Text: {s: $d_engine_launch_before_t}; Fill: $tone_ink_muted }
+            to : film_part.Mono { Text: {s: "→"}; Fill: $tone_ink_faint }
+            now : film_part.Figure {
+              Fill: $tone_film_accent
+              Tally: {value: 0, decimals: 2, unit: " {d_engine_launch_unit}"}
+              cue.Fall drop(at: $fell + 0.8, dur: 0.9, from: $d_engine_launch_before, to: $d_engine_launch_after)
+            }
+          }
+        }
+        walk : ui.Column {
+          cue.Arrive show(at: $fell + 1.9)
+          label : film_part.Small { Text: {s: $d_engine_walk_label} }
+          nums : ui.Row {
+            Flex: {axis: Row, gap: 10, align: Center, justify: Start, wrap: false}
+            was : film_part.Mono { Text: {s: $d_engine_walk_before_t}; Fill: $tone_ink_muted }
+            to : film_part.Mono { Text: {s: "→"}; Fill: $tone_ink_faint }
+            now : film_part.Figure {
+              Fill: $tone_film_accent
+              Tally: {value: 0, decimals: 0, unit: " {d_engine_walk_unit}"}
+              cue.Fall drop(at: $fell + 2.0, dur: 0.9, from: $d_engine_walk_before, to: $d_engine_walk_after)
+            }
+          }
+        }
+        body : ui.Column {
+          cue.Arrive show(at: $fell + 3.1)
+          label : film_part.Small { Text: {s: $d_engine_body_label} }
+          nums : ui.Row {
+            Flex: {axis: Row, gap: 10, align: Center, justify: Start, wrap: false}
+            was : film_part.Mono { Text: {s: $d_engine_body_before_t}; Fill: $tone_ink_muted }
+            to : film_part.Mono { Text: {s: "→"}; Fill: $tone_ink_faint }
+            now : film_part.Figure {
+              Fill: $tone_film_accent
+              Tally: {value: 0, decimals: 0, unit: " {d_engine_body_unit}"}
+              cue.Fall drop(at: $fell + 3.2, dur: 0.9, from: $d_engine_body_before, to: $d_engine_body_after)
+            }
+          }
+        }
+      }
+      right : ui.Column {
+        Flex: {axis: Column, gap: 4, align: Start, justify: Start, wrap: false}
+        Size: {w: {kind: Fixed, value: 392, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        figure : film_part.Figure {
+          Fill: $tone_film_accent
+          TextStyle: {size: $size_film_figure, line: $line_film_figure, code_line: 0, role: 9, bold: 1, weight: 0}
+          cue.Arrive show(at: $lands, dur: 0.2)
+          cue.Count up(at: $lands, dur: 0.8, from: 0, to: $d_engine_reverified_before)
+          cue.Fall drop(at: $fall, dur: $fell - $fall, from: $d_engine_reverified_before, to: $d_engine_reverified_after)
+        }
+        label : film_part.Body {
+          Text: {s: $d_engine_reverified_label}
+          cue.Arrive show(at: $lands)
+        }
+        when : ui.ZStack {
+          Size: {w: {kind: Percent, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 18, min: 0, max: 0}}
+          before : film_part.Small {
+            Text: {s: "before"}
+            cue.Arrive show(at: $lands)
+            cue.FadeOut hide(at: $fall, dur: 0.3)
+          }
+          after : film_part.Small {
+            Text: {s: "after one day's fixes"}
+            Fill: $tone_film_accent
+            cue.Arrive show(at: $fell)
+          }
+        }
+        grid : ui.Row {
+          Flex: {axis: Row, gap: 4, align: Start, justify: Start, wrap: true}
+          Size: {w: {kind: Percent, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+          for i in 0..$dots {
+            "dot_{i}" : film_part.Dot {
+              lit : film_part.Lit {
+                // The edit lands: the light sweeps the grid. Then all but the kept share go out, scattered.
+                on { Cue: {member: "Pose.fade", from: 1, to: 0, at: $lands + i * 0.0007, dur: 0.12, ease: Out} }
+                if (i * 37) % $dots >= $kept {
+                  off { Cue: {member: "Pose.fade", from: 0, to: 1, at: $fall + ((i * 37) % $dots) * ($fell - $fall - 0.3) / $dots, dur: 0.3, ease: Out} }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    foot : film_part.Small {
+      Text: {s: $d_engine_conditions}
+      cue.Arrive show(at: $lands)
+    }
+
+    // Sound: the keys; the edit landing; a rise under the fall with ticks that come faster as the number drops; one hit
+    // where it lands; a soft note for each of the day's other rows.
+    for i in 0..$keys {
+      "key_{i}" : voice.Click {
+        Onset: {at: $typed + i * 1.0 / $keys}
+        Pitch: {hz: 2400 + (i % 4) * 220}
+        Gain: {amp: 0.035}
+        Pan: {pos: -0.45, sweep: 0}
+      }
+    }
+    sweep : voice.Whoosh { Onset: {at: $lands - 0.05}; Lasts: {dur: 0.8}; Gain: {amp: 0.035}; Pan: {pos: 0.0, sweep: 0.7} }
+    climb : voice.Rise { Onset: {at: $fall}; Lasts: {dur: $fell - $fall}; Pitch: {hz: 880}; Gain: {amp: 0.035}; Pan: {pos: 0.2, sweep: 0.2} }
+    for i in 0..$ticks {
+      "tick_{i}" : voice.Click {
+        // Evenly spaced in the square of time: the gaps shrink to the hit.
+        Onset: {at: $fall + ($fell - $fall) * (1 - (1 - i * 1.0 / $ticks) * (1 - i * 1.0 / $ticks))}
+        Pitch: {hz: 1800 + i * 60}
+        Gain: {amp: 0.02 + i * 0.001}
+        Pan: {pos: 0.15 + (i % 3) * 0.15, sweep: 0}
+      }
+    }
+    hit : voice.Thud { Onset: {at: $fell}; Gain: {amp: 0.3} }
+    hit_tone : voice.Mallet { Onset: {at: $fell}; Pitch: {hz: 220}; Gain: {amp: 0.1}; Lasts: {dur: 3.0} }
+    hit_air : voice.Bell { Onset: {at: $fell + 0.02}; Pitch: {hz: 880}; Gain: {amp: 0.035}; Lasts: {dur: 2.4}; Pan: {pos: 0.3, sweep: 0} }
+    row_1 : voice.Mallet { Onset: {at: $fell + 1.7}; Pitch: {hz: 329.63}; Gain: {amp: 0.05}; Lasts: {dur: 1.2}; Pan: {pos: -0.4, sweep: 0} }
+    row_2 : voice.Mallet { Onset: {at: $fell + 2.9}; Pitch: {hz: 369.99}; Gain: {amp: 0.05}; Lasts: {dur: 1.2}; Pan: {pos: -0.4, sweep: 0} }
+    row_3 : voice.Mallet { Onset: {at: $fell + 4.1}; Pitch: {hz: 440}; Gain: {amp: 0.05}; Lasts: {dur: 1.6}; Pan: {pos: -0.4, sweep: 0} }
+  }
+}

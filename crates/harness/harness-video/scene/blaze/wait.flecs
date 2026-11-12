@@ -1,0 +1,40 @@
+// Shot 1, the problem (film.flecs's storyboard): an agent's edit is quick, and then it waits. No number: the picture is
+// the loop itself, typed out, stalling on "wait".
+const t = $t_wait
+const typed = $t + 1.7
+const keys = 26
+
+@tree ChildOf
+film {
+  wait : film_part.Shot {
+    cue.CutIn enter(at: $t)
+    cue.CutOut leave(at: $t_name)
+    one : film_part.Hero {
+      Text: {s: "An agent writes the edit."}
+      cue.Arrive show(at: $t + 0.1)
+      cue.Lift up(at: $t + 0.1)
+    }
+    two : film_part.Hero {
+      Text: {s: "Then it waits for the compiler."}
+      Fill: $tone_film_accent
+      cue.Arrive show(at: $t + 0.9)
+      cue.Lift up(at: $t + 0.9)
+    }
+    room : film_part.Gap {}
+    again : film_part.Mono {
+      Text: {s: "edit → build → wait → run → edit → build → wait → wait → wait"}
+      Fill: $tone_ink_muted
+      Caret: {at: $typed - 0.2, until: $t_name, blink: 0.5, ink: $film_caret}
+      cue.Type on(at: $typed, dur: 1.6)
+    }
+    // Sound: the keys of the loop being typed, then the cut.
+    for i in 0..$keys {
+      "key_{i}" : voice.Click {
+        Onset: {at: $typed + i * 1.6 / $keys}
+        Pitch: {hz: 2400 + (i % 5) * 180}
+        Gain: {amp: 0.035}
+        Pan: {pos: -0.5 + i * 1.0 / $keys, sweep: 0}
+      }
+    }
+  }
+}

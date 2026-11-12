@@ -371,10 +371,9 @@ fn write_png(path: &Path, px: &[u8], (w, h): (u32, u32)) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-fn run() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+fn run(args: &[String]) -> Result<(), String> {
     const SR: u32 = 48_000;
-    if let [check, file, scene, name] = args.as_slice()
+    if let [check, file, scene, name] = args
         && check == "check"
     {
         let export = preset::named(name)?;
@@ -386,7 +385,7 @@ fn run() -> Result<(), String> {
         println!("ok: {file} is preset {name}: {}", export.words());
         return Ok(());
     }
-    let (scene, out, preset_name) = parse(&args)?;
+    let (scene, out, preset_name) = parse(args)?;
     let mut stage = Stage::load(&scene)?;
     let name = preset_name.as_deref().unwrap_or(preset::DEFAULT);
     let export = preset::named(name)?;
@@ -411,7 +410,7 @@ fn run() -> Result<(), String> {
             .ok_or_else(|| format!("{}: no BlazeMark and no Sound, so no soundtrack", scene.display()))?;
         std::fs::write(path, harness_native_blaze::sound::wav(SR, &sound))
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        eprintln!("harness-video: wrote {} ({} s at {SR} Hz, 32-bit float stereo{})", path.display(), v.seconds, loudness(measured));
+        eprintln!("harness-video: wrote {} ({} s at {SR} Hz, 16-bit stereo{})", path.display(), v.seconds, loudness(measured));
         return Ok(());
     }
     let (pw, ph) = stage.pixels();
@@ -521,7 +520,8 @@ fn loudness(measured: Option<loud::Loudness>) -> String {
 }
 
 fn main() {
-    if let Err(e) = run() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Err(e) = run(&args) {
         eprintln!("harness-video: {e}");
         std::process::exit(1);
     }
@@ -548,6 +548,56 @@ mod tests {
         assert_eq!((v.width * v.scale, v.height * v.scale, v.fps), (1920.0, 1080.0, 60.0));
         let square = preset::named("x-square-1080").unwrap_or_else(|e| panic!("{e}"));
         assert!(fit(&mut v, "x-square-1080", &square).is_err_and(|e| e.contains("not one shape")));
+    }
+
+    /// The film loads on the app's scene with its numbers from data.json, is a minute at 60 fps, fits the X preset at
+    /// 1920 by 1080, has a soundtrack with a master, and shows the data file's own figure: the control changes the
+    /// number in a copy of the file and the scene's constant follows.
+    #[test]
+    fn film_loads_from_its_data() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("scene/blaze");
+        let stage = Stage::load(&dir.join("film.flecs")).unwrap_or_else(|e| panic!("{e}"));
+        let mut v = stage.video;
+        assert_eq!((v.seconds, v.fps), (60.0, 60.0));
+        let x = preset::named("x-landscape-1080p60").unwrap_or_else(|e| panic!("{e}"));
+        fit(&mut v, "x-landscape-1080p60", &x).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((v.width * v.scale, v.height * v.scale), (1920.0, 1080.0));
+        assert_eq!(stage.mix, Some(Mix { lufs: -16.0, peak: -1.0 }));
+        let (mark, _, heard) = stage.score().unwrap_or_else(|e| panic!("{e}"));
+        assert!(mark.is_some() && heard.len() > 50, "{} sounds", heard.len());
+        let json = std::fs::read_to_string(dir.join("data.json")).unwrap_or_else(|e| panic!("{e}"));
+        let was = data::script(&json).unwrap_or_else(|e| panic!("{e}"));
+        assert!(was.contains("export const d_engine_reverified_before_t = \"1,091,174\""), "{was}");
+        let now = data::script(&json.replace("1091174", "1091175")).unwrap_or_else(|e| panic!("{e}"));
+        assert!(now.contains("export const d_engine_reverified_before_t = \"1,091,175\""), "{now}");
+    }
+
+    /// A render through the X preset is what the preset says, by the file's own boxes: half a second of a small scene
+    /// at 1920 by 1080 is 30 H.264 High frames of one length, BT.709, with an AAC-LC stereo track as long (silence: the
+    /// scene has no sound). The controls: the same file is refused against one frame more, and against the HEVC preset.
+    /// Needs the Mac's media engine, as every render does.
+    #[test]
+    fn x_preset_reads_back() {
+        let dir = std::env::temp_dir().join(format!("harness-video-x-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        let (scene, out) = (dir.join("clip.flecs"), dir.join("clip.mp4"));
+        std::fs::write(
+            &scene,
+            "@tree ChildOf\nclip : ui.ZStack {\n  Video: {width: 64, height: 36, fps: 10, seconds: 0.5, scale: 2}\n  Fill: $tone_ground\n  \
+             badge : hn.Badge {\n    cue.FadeIn show(at: 0.1, dur: 0.3)\n  }\n}\n",
+        )
+        .unwrap_or_else(|e| panic!("{}: {e}", scene.display()));
+        let arg = |p: &Path| p.to_str().unwrap_or_else(|| panic!("{}: not UTF-8", p.display())).to_owned();
+        run(&[arg(&scene), arg(&out), "x-landscape-1080p60".to_owned()]).unwrap_or_else(|e| panic!("{e}"));
+        let report = check::read(&std::fs::read(&out).unwrap_or_else(|e| panic!("{e}"))).unwrap_or_else(|e| panic!("{e}"));
+        let x = preset::named("x-landscape-1080p60").unwrap_or_else(|e| panic!("{e}"));
+        check::verify(&report, &x, (1920, 1080), 60, 30).unwrap_or_else(|e| panic!("{e}"));
+        let audio = report.audio().unwrap_or_else(|| panic!("no audio track"));
+        assert_eq!((audio.entry.as_str(), audio.channels, audio.rate), ("mp4a", 2, 48_000));
+        assert!(check::verify(&report, &x, (1920, 1080), 60, 31).is_err_and(|e| e.contains("30 frames, not 31")));
+        let hevc = preset::named("x-landscape-1080p60-hevc").unwrap_or_else(|e| panic!("{e}"));
+        assert!(check::verify(&report, &hevc, (1920, 1080), 60, 30).is_err_and(|e| e.contains("hvc1")));
+        std::fs::remove_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
     }
 
     /// A tally's words group the whole part by three and keep the places asked for (tested here, where flecs is linked:

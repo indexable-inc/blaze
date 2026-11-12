@@ -1,0 +1,29 @@
+// The film's own tokens (film.flecs includes this). Everything else it names is the app's
+// (harness-native/scene/00-tokens.flecs): its near-black ground and its four inks.
+
+// The one accent: blaze's fire (docs/brand/fire's hot orange), for blaze's own bars, figures and name. Relax's bars are
+// a quiet grey: the comparison is in the lengths, not in a colour that says who is good. A video draws only the dark half.
+export const tone_film_accent: Fill = {dark: {1.0, 0.584, 0.196, 1}, light: {1.0, 0.584, 0.196, 1}}
+export const tone_film_other: Fill = {dark: {0.47, 0.5, 0.56, 1}, light: {0.47, 0.5, 0.56, 1}}
+export const tone_film_dot: Fill = {dark: {0.17, 0.185, 0.215, 1}, light: {0.17, 0.185, 0.215, 1}}
+export const tone_film_panel: Fill = {dark: {0.075, 0.082, 0.098, 1}, light: {0.075, 0.082, 0.098, 1}}
+export const film_caret: Rgba = {1.0, 0.584, 0.196, 1}
+
+// Type, in points of a 960 by 540 frame (drawn at 2 pixels a point for 1080p): most people watch on a phone, so nothing
+// that must be read is under 10.5 points.
+export const size_film_hero = 40
+export const line_film_hero = 48
+export const size_film_head = 26
+export const line_film_head = 32
+export const size_film_body = 15
+export const line_film_body = 22
+export const size_film_small = 10.5
+export const line_film_small = 15
+export const size_film_figure = 54
+export const line_film_figure = 60
+
+// The frame's margin, and the race's measures: the longest bar of a row, and how long it takes to grow (seconds): each
+// bar grows at one speed, so the one that took less time stops first.
+export const film_margin = 56
+export const film_bar = 370
+export const film_pace = 1.3

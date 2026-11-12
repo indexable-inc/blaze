@@ -1,0 +1,11 @@
+// The cut list: when each shot of the film starts, seconds on the frame clock (film.flecs has the storyboard). A shot's
+// cues and sounds are all placed from its own start, so moving a start here retimes the shot, its motion and its sound
+// together. Included first, so every shot file sees these.
+export const t_wait = 0.0
+export const t_name = 3.6
+export const t_what = 7.2
+export const t_loop = 19.0
+export const t_race = 31.5
+export const t_behind = 39.4
+export const t_end = 50.5
+export const t_out = 60.0

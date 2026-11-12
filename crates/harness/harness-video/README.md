@@ -4,20 +4,42 @@ Renders a video from a flecs scene, on the harness app's own stack: the `ui.*` p
 and the shared Metal renderer and paint pass (`harness-native-render`). Frame `i` is drawn at `i / fps` seconds of a
 fixed clock (never the wall clock), so the same scene gives the same pixels every run, and any frame can be drawn alone.
 
-    blaze run --release -p harness-video -- harness-video/scene/launch.flecs blaze-launch.mp4   # the video
-    blaze run --release -p harness-video -- harness-video/scene/launch.flecs still.png 6.0      # one frame
-    blaze run --release -p harness-video -- harness-video/scene/launch.flecs frames/ 0.5        # a frame each 0.5 s
-    blaze run --release -p harness-video -- harness-video/scene/launch.flecs sound.wav          # the soundtrack alone
+    harness-video SCENE.flecs OUT.mp4 [PRESET]        # the video, as an export preset, then read back and checked
+    harness-video SCENE.flecs still.png 6.0           # one frame
+    harness-video SCENE.flecs frames/ 0.5             # a frame each 0.5 s
+    harness-video SCENE.flecs sound.wav               # the soundtrack alone, as it is in the video (16-bit, 48 kHz)
+    harness-video SCENE.flecs sounds                  # every sound of the soundtrack, in time order
+    harness-video check OUT.mp4 SCENE.flecs PRESET    # read a finished mp4 back and hold it to the scene and preset
 
-The mp4 is a YouTube HDR master, made natively with no ffmpeg (`src/encode.rs`): H.265 Main 10 encoded by VideoToolbox
-on the media engine (hardware required; there is no software path), constant quality 0.85, 4:2:0 10-bit, HDR10 (PQ over
-BT.2020, the mastering display P3-D65 at 1000 nits as SEI), a half-second GOP, tagged `hvc1`, written by AVAssetWriter
-with the moov first, and the soundtrack lossless: Apple Lossless (ALAC), 24-bit stereo at 48 kHz (YouTube re-encodes
-the audio anyway, so the master keeps all of it; Apple's AAC encoder also tops out at 320 kb/s for 48 kHz stereo). No frame is copied: `src/hdr.rs` writes each frame's Y and
-CbCr straight into the encoder's own IOSurface-backed pixel buffer, mapped into Metal by CoreVideo. The renderer draws
-extended range (sRGB-encoded half floats; 1.0 is SDR white), and `src/hdr.rs` puts SDR white at 203 nits (BT.2408), so the UI looks as
-it does in SDR and only what is drawn brighter than white (the fire, white-hot letters) goes past it. Stills and frame
-sheets stay 8-bit sRGB PNG, clipped to SDR. `scene/launch.flecs` is 960 x 540 points at scale 8: 7680 x 4320, 60 fps.
+(`blaze run --release -p harness-video -- ...` from `crates/harness`.) The mp4 is made natively with no ffmpeg
+(`src/encode.rs`): VideoToolbox on the media engine (hardware required; there is no software path) into pixel buffers
+the GPU wrote, and AVAssetWriter with the moov first. No frame is copied: `src/yuv.rs` writes each frame's Y and CbCr
+straight into the encoder's own IOSurface-backed pixel buffer, mapped into Metal by CoreVideo. Stills and frame sheets
+are 8-bit sRGB PNG, clipped to SDR.
+
+## Export presets
+
+`presets.json` is the one home of every encoder setting, by name (`src/preset.rs` is its typed form and refuses a field
+it does not know). It also records what X's upload page says, quoted, with the date it was fetched and what is not
+established.
+
+| preset | what |
+| --- | --- |
+| `x-landscape-1080p60` | X, subscribed accounts: H.264 High, 1920 x 1080, 60 fps, 4:2:0 8-bit, BT.709 video range, 40 Mb/s target, a key frame a second, closed GOP, AAC-LC 256 kb/s stereo 48 kHz |
+| `x-landscape-720p60` | X, unsubscribed accounts: the same at 1280 x 720 |
+| `x-square-1080`, `x-portrait-1080x1920` | X's other shapes; a scene must be laid out for the shape (a preset whose aspect is not the scene's is refused) |
+| `x-landscape-1080p60-hevc` | HEVC Main 8-bit; unverified on X (its page names H.264 only) |
+| `youtube-hdr10-master` | with no preset named: H.265 Main 10, constant quality 0.85, HDR10 (PQ over BT.2020, the mastering display P3-D65 at 1000 nits as SEI), a half-second GOP, ALAC 24-bit, at the scene's own size and rate (`scene/launch.flecs`: 7680 x 4320) |
+
+A preset's width over the scene's width in points is the scale it is drawn at, and its `fps` replaces the scene's (a
+timeline is in seconds: frame `i` is drawn at `i / fps`, so no frame is dropped or doubled at any rate). For HDR10 the
+renderer's extended range (1.0 is SDR white) puts SDR white at 203 nits (BT.2408) and what is drawn brighter goes past
+it; an SDR preset clips at white and keeps the app's sRGB values, tagged BT.709 as web video is.
+
+Every render is read back (`src/check.rs`, the file's own boxes, no decoder): the moov is before the mdat; the codec,
+profile and size are the preset's; there are exactly seconds x fps frames, each the same length, each shown in its own
+slot once; a key frame at least as often as the preset says; the colour tag; and the audio's codec, rate, channels and
+length against the video's. A file that differs fails the render, listing how.
 
 ## A scene
 
@@ -41,7 +63,7 @@ sheets stay 8-bit sRGB PNG, clipped to SDR. `scene/launch.flecs` is 960 x 540 po
   flames, white-hot letters and embers rise by their heat to `glow` SDR whites (4.93 in `launch.flecs`: the 1000-nit
   HDR10 peak over 203-nit white), drawn as a light layer over the mark; the UI stays at white.
 - Sound is data, one component per concern: `Sound: {voice}` (`Bell`, `Mallet`, `Bass`, `Click`, `Thud`, `Whoosh`,
-  `Fire`), `Onset: {at}`, `Lasts: {dur}`, `Pitch: {hz}`, `Gain: {amp}`, `Pan: {pos, sweep}` (-1 the frame's left edge,
+  `Fire`, `Pad`, `Rise`), `Onset: {at}`, `Lasts: {dur}`, `Pitch: {hz}`, `Gain: {amp}`, `Pan: {pos, sweep}` (-1 the frame's left edge,
   1 its right; `sweep` moves it). `harness-native-ui-prims/scene/voice.flecs` has a `voice.*` prefab per voice with its
   defaults, so an instance sets only its onset and what differs:
   `ding : voice.Bell {` then `Onset: {at: 2.0}` and `Pitch: {hz: 1760}` on their own lines, `}`. Only sounds under the frame (the node with the `Video`) are the video's. They mix in the same room as
@@ -56,4 +78,19 @@ sheets stay 8-bit sRGB PNG, clipped to SDR. `scene/launch.flecs` is 960 x 540 po
   plays a sheet of frames stacked downwards. Pictures and the mark are textures whose texels are fetched, never
   filtered: crisp, with no seam between cells, at any size or mid-animation scale.
 
-`scene/launch.flecs` is blaze's launch video.
+- Numbers are data: a `data.json` beside the scene becomes constants before the scene loads (`src/data.rs`): each leaf
+  is `d_<keys joined by _>`; a number also has `_t`, its words (digits grouped by three, then its object's `unit`); a
+  range `{"low", "high"}` has `_low` and its words; an object with `"compare": [names]` gives each name a `_share`, its
+  value over the largest (a bar's length). A scene names a figure (`Text: {s: $d_rows_noop_blaze_t}`) and never types one.
+- `Tally: {value, decimals, unit}` shows a number as a node's words; cue `Tally.value` and it counts (`cue.Count`,
+  `cue.Fall`). `cue.Widen` grows a bar, `cue.CutIn`/`CutOut` are a shot's window, `cue.Arrive`, `cue.Lift` and
+  `cue.Type` bring words in.
+- `Mix: {lufs, peak}` on the root masters the soundtrack (`src/loud.rs`): brought to `lufs` integrated (ITU-R BS.1770,
+  K-weighted and gated) with no true peak over `peak` dBTP, by a look-ahead limiter; the render prints what it then
+  measures. `voice.Pad` is a bed under a stretch and `voice.Rise` a rise into a hit.
+
+`scene/launch.flecs` is blaze's launch video (the mark alone, 10 seconds). `scene/blaze/film.flecs` is the one-minute
+film for X: its storyboard is at its top, each shot is a file beside it, `cuts.flecs` is when each starts, and every
+number it shows is a row of `scene/blaze/data.json`.
+
+    harness-video harness-video/scene/blaze/film.flecs blaze-film.mp4 x-landscape-1080p60

@@ -363,6 +363,94 @@
    "cause": "the brief said no VMs but the tests it had to write only run on Linux",
    "workaround": "say in the brief where Linux-only tests may run",
    "state": "open"
+  },
+  {
+   "id": "A34",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "harness: building",
+   "what": "The brief said build the harness crates with cargo, but cargo cannot read the harness workspace at all since 2026-11-10: harness-native-render depends on harness-native-shaders with `artifact = \"gpu\"`, a blaze extension cargo refuses (`artifact = ... requires -Z bindeps`), and the pinned blaze (0.20261105.4, dated five days before that dependency landed) was not tried: a blaze build of the harness on the Mac beside three other lanes was not a risk to take for a film. The warm target's harness-video was a cargo build from before that merge.",
+   "cost": "about 20 minutes finding a way to build at all",
+   "cause": "the rule change of 2026-11-11 (cargo is the dev-loop builder) and the gpu artifact dependency of 2026-11-10 contradict each other for crates/harness, and neither the README nor the brief says which wins",
+   "workaround": "an uncommitted shim in the lane's worktree: the dependency rewritten as a plain path dependency, BLAZE_GPU_MSL_HARNESS_NATIVE_SHADERS pointed at the mascot.metal an older slangc build left in the target, and cargo +nightly-2026-10-27 (the gpu crate pulls blaze crates that need rustc 1.101, so the default stable 1.99.1 also fails). The film draws no Kip, so the stale MSL only has to compile",
+   "state": "open"
+  },
+  {
+   "id": "A35",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "harness: building",
+   "what": "Building from a worktree into main's warm target (so no second multi-GB target) overwrites main's own target/release/harness-video with the lane's build, and cargo wrote crates/harness/Cargo.lock in the worktree (13 packages added for the gpu crate, which the checked-in lock has never listed because only blaze reads it).",
+   "cost": "none yet; main's harness-video binary is now this lane's",
+   "cause": "one target directory shared between checkouts, and a lock file cargo and blaze disagree about",
+   "workaround": "the lock change and the shim are left uncommitted; rebuild harness-video from main to get main's binary back",
+   "state": "open"
+  },
+  {
+   "id": "A36",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "the brief",
+   "what": "The brief described bstd's `Encoder`/`Muxer` (crates/blaze-std/src/video) as the video path, but harness-video does not depend on bstd: it has its own VideoToolbox session with the zero-copy Metal planes and writes the file with AVAssetWriter. bstd's module says so itself (\"moved from harness-video's encode.rs and reshaped\"), yet both copies live on.",
+   "cost": "the H.264 and AAC work had two possible homes; it went where the film's frames actually go (harness-video), and bstd's encoder still has no H.264 provider, no audio provider and no `avc1`/`mp4a` in its muxer",
+   "cause": "two encoders for one concept (rule one-concept-one-home): bstd's cannot take GPU-written frames yet, so harness-video cannot move onto it",
+   "workaround": "none; said in the lane's report",
+   "state": "open"
+  },
+  {
+   "id": "A37",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "harness-video",
+   "what": "An api crate's unit test cannot link: harness-native-ui-timeline-api's test binary fails with undefined `_ecs_os_api`, because `ScriptString`'s drop calls flecs's allocator and api crates link no flecs.",
+   "cost": "one failed test run",
+   "cause": "api crates are declared flecs-free but hold a type whose Drop needs flecs",
+   "workaround": "the Tally test lives in harness-video, which links flecs",
+   "state": "open"
+  },
+  {
+   "id": "A38",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "harness-video",
+   "what": "One command (render the film, its mix, six stills, the read-back) was reported by the tool as taking 24 minutes, where the film alone renders in 21 to 54 seconds; the files' own times do not show where the time went, and the identical command run again took about two minutes.",
+   "cost": "up to 24 minutes, unexplained",
+   "cause": "unknown: the machine was under load from other lanes (load average 27); harness-video opens no span for its waits (the soundtrack's master, the encoder, the writer), so nothing says which one it was (rule slow-is-p0-traced)",
+   "workaround": "none; the next run was fast again",
+   "state": "open"
+  },
+  {
+   "id": "A39",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "harness-video",
+   "what": "The Mac's own tools left a `<name>.mp4.sb-<hash>` sibling beside each mp4 AVAssetWriter wrote into the scratch directory.",
+   "cost": "one confused directory listing",
+   "cause": "not established; probably AVAssetWriter's moov-first pass writing a temporary beside the output",
+   "workaround": "removed by hand after each render",
+   "state": "open"
+  },
+  {
+   "id": "A40",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "X's documentation",
+   "what": "X's consumer help page (help.x.com/en/using-x/x-videos) answers 403 to a fetch, and the developer page gives two different size limits (\"between 32x32 and 1280x1024\" and \"Subscribed users can upload a 1080p video\") and never mentions HEVC, 10-bit, HDR or a container.",
+   "cost": "the presets' limits beyond H.264 High 1080p60 AAC-LC are marked unverified",
+   "cause": "the only fetchable source is the API's best-practices page",
+   "workaround": "presets.json quotes the page with its date and lists what is not established",
+   "state": "open"
+  },
+  {
+   "id": "A41",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "flecs script",
+   "what": "A `voice.*` sound, a `GlyphsIn` and the `BlazeMark` interact silently: with a mark in the scene every glyph of every `GlyphsIn` rings a bell in the soundtrack, so the film uses `GlyphsIn` only on the end card's address.",
+   "cost": "a redesign of how the film's words arrive",
+   "cause": "the mark's score takes every GlyphsIn in the world as its glints, wherever it is",
+   "workaround": "fades and lifts (cue.Arrive, cue.Lift) for words elsewhere",
+   "state": "open"
   }
  ]
 }

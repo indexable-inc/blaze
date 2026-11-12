@@ -1,0 +1,97 @@
+{
+  "about": "Every number the film shows (film.flecs and its shots). harness-video turns each leaf into a d_* constant the scenes name (src/data.rs); no number is typed into a scene. Re-measure, edit this file, render again. Rows where blaze is behind are shown as they are.",
+  "when": "2026-11-11",
+  "program": "hello-world",
+  "machine": "Apple-silicon Mac, 18 cores, under load",
+  "conditions": "hello-world · Apple-silicon Mac, 18 cores, machine under load · 2026-11-11 · medians · fixed environment, every run's output checked",
+  "relax": "Relax is makepad's Rust JIT (github.com/makepad/relax)",
+  "status": "measured on a loaded machine; to be re-measured on a quiet one",
+  "rows": {
+    "start": {
+      "label": "client start",
+      "unit": "ms", "compare": ["blaze", "relax"],
+      "blaze": 5.3, "relax": 9.3,
+      "source": "the owner's measurement of 2026-11-11, medians",
+      "conditions": "hello-world; Apple-silicon Mac, 18 cores, under load; fixed environment; every run's output checked"
+    },
+    "noop": {
+      "label": "no-op run",
+      "unit": "ms", "compare": ["blaze", "relax"],
+      "blaze": 15.1, "blaze_range": {"low": 10.6, "high": 52.4}, "relax": 37.8,
+      "source": "the owner's measurement of 2026-11-11, medians; blaze's range over its runs",
+      "conditions": "hello-world; Apple-silicon Mac, 18 cores, under load; fixed environment; every run's output checked"
+    },
+    "comment": {
+      "label": "comment edit, then run",
+      "unit": "ms", "compare": ["blaze", "relax"],
+      "blaze": 51.7, "relax": 91.2,
+      "source": "the owner's measurement of 2026-11-11, medians",
+      "conditions": "hello-world; Apple-silicon Mac, 18 cores, under load; fixed environment; every run's output checked"
+    },
+    "body": {
+      "label": "body edit, then run",
+      "unit": "ms", "compare": ["blaze", "relax"],
+      "blaze": 166.3, "relax": 76.6,
+      "verdict": "blaze behind",
+      "source": "the owner's measurement of 2026-11-11, medians",
+      "conditions": "hello-world; Apple-silicon Mac, 18 cores, under load; fixed environment; every run's output checked"
+    },
+    "cold": {
+      "label": "cold first run",
+      "unit": "s", "compare": ["blaze", "relax"],
+      "blaze": 8.0, "relax": 0.30,
+      "verdict": "blaze behind",
+      "source": "the owner's measurement of 2026-11-11, medians (8.0 s and 0.30 s)",
+      "conditions": "hello-world; Apple-silicon Mac, 18 cores, under load; fixed environment; every run's output checked"
+    },
+    "memory": {
+      "label": "memory after a cold build and five edits",
+      "unit": "MB", "compare": ["blaze", "relax"],
+      "blaze": 5770, "relax": 88,
+      "blaze_what": "daemon", "relax_what": "peak, no daemon",
+      "verdict": "blaze behind",
+      "source": "the owner's measurement of 2026-11-11",
+      "conditions": "hello-world; Apple-silicon Mac, 18 cores, under load; blaze: its daemon after a cold build and five edits; Relax: peak, it has no daemon"
+    },
+    "disk": {
+      "label": "state on disk",
+      "unit": "MB", "compare": ["blaze", "relax"],
+      "blaze": 958, "relax": {"low": 58, "high": 89},
+      "verdict": "blaze behind",
+      "source": "the owner's measurement of 2026-11-11",
+      "conditions": "hello-world; Apple-silicon Mac, 18 cores; Relax's bar is drawn to the high end of its range"
+    }
+  },
+  "engine": {
+    "title": "one day of fixes",
+    "conditions": "blaze's own per-edit engine work, before and after the fixes of 2026-11-11 · hello-world · Apple-silicon Mac, 18 cores",
+    "reverified": {
+      "label": "cached results re-verified per body edit",
+      "compare": ["before", "after"],
+      "before": 1091174, "after": 21067,
+      "source": "the owner's measurement of 2026-11-11, before and after the day's fixes",
+      "conditions": "hello-world; Apple-silicon Mac, 18 cores"
+    },
+    "launch": {
+      "label": "`run` launch step",
+      "unit": "ms",
+      "before": {"low": 219, "high": 390}, "after": 0.08,
+      "source": "the owner's measurement of 2026-11-11, before and after the day's fixes",
+      "conditions": "hello-world; Apple-silicon Mac, 18 cores"
+    },
+    "walk": {
+      "label": "changed-set walk on a broad change",
+      "unit": "ms",
+      "before": 465479, "after": 60,
+      "source": "the owner's measurement of 2026-11-11, before and after the day's fixes",
+      "conditions": "Apple-silicon Mac, 18 cores"
+    },
+    "body": {
+      "label": "body edit, then run",
+      "unit": "ms",
+      "before": 953, "after": 166,
+      "source": "the owner's measurement of 2026-11-11, over the day",
+      "conditions": "hello-world; Apple-silicon Mac, 18 cores, under load"
+    }
+  }
+}

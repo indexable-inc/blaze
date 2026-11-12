@@ -1,0 +1,65 @@
+// blaze, the film: one minute at 60 fps for X (3,600 frames), in six shots. Written as data: each shot is a file of
+// flecs script (the app's own ui.* prims on the app's tokens), every motion a `Cue`, every sound a `voice.*` event, and
+// every number on screen a row of data.json beside it (harness-video turns it into the d_* constants; no number is
+// typed into a scene, so re-measuring rerenders the film).
+//
+//   cd crates/harness
+//   harness-video harness-video/scene/blaze/film.flecs blaze-film.mp4 x-landscape-1080p60    # the film, read back
+//   harness-video harness-video/scene/blaze/film.flecs frames/ 2.0                           # a still every 2 s
+//   harness-video harness-video/scene/blaze/film.flecs blaze-film.wav                        # the mix alone
+//   harness-video harness-video/scene/blaze/film.flecs sounds                                # every sound event
+//
+// Storyboard (cuts.flecs has the times; a shot's file has its motion and its sound):
+//
+//   shot  seconds      file            what the viewer should feel and learn
+//   1     0.0 - 3.6    wait.flecs      The problem, before 4 s: an agent's edit is quick, then it waits for the compiler.
+//                                      The loop is typed out and stalls on "wait". Feel: recognition.
+//   2     3.6 - 7.2    name.flecs      "The edit loop is the product." Then the name, struck: blaze, a Rust compiler
+//                                      and build system built for coding agents. Feel: a claim, plainly made.
+//   3     7.2 - 19.0   what.flecs      What it is, seven cards, fast then slower (1.5 s each to 1.9 s): a resident
+//                                      daemon; results keyed by code identity; sandboxed build scripts and proc macros;
+//                                      byte-identical outputs; its own linker patching the running binary; optimizer
+//                                      rewrites checked in Lean (labelled in progress); `blaze debug inspect`. Learn:
+//                                      what is different about it. Each card lands a note higher.
+//   4     19.0 - 31.5  loop.flecs      The edit loop, visceral: a line is typed; the grid of cached results lights; the
+//                                      figure "cached results re-verified per body edit" counts to its before, then
+//                                      falls to its after as the dots go dark, leaving the few an edit still touches
+//                                      (the data's own share). A rise, ticks quickening, one hit where it lands. Then
+//                                      the day's other three before-and-after rows. Feel: the work disappearing.
+//   5     31.5 - 50.5  race.flecs,     Head to head with Relax (makepad's Rust JIT), a race a row: three rows where
+//                      behind.flecs    blaze is ahead, then, under "Where blaze is behind today", the four where it is
+//                                      not, at the same scale and in the same colours. Conditions in the small print
+//                                      the whole shot. Learn: exactly where it stands; trust the numbers because the
+//                                      bad ones are there.
+//   6     50.5 - 60.0  end.flecs       The mark catches fire; the line again; github.com/indexable-inc/blaze; what is
+//                                      still in progress, said so. Fades to the ground it started on.
+//
+// Honesty (the repository's rule: claims from evidence): a comparison is a measured row of data.json with its conditions
+// on screen; rows where blaze is behind are shown as they are; nothing is compared with cargo or rustc (no such row
+// exists); nothing says "fastest". What is designed but not built is on the end card as "in progress".
+//
+// Sound: synthesised by harness-native-blaze's `sound` from the events in the shot files (`harness-video ... sounds`
+// lists them), one bed under the whole film, brought to the root's `Mix`. X autoplays muted: the picture carries
+// everything, the sound only adds.
+include cuts
+include tokens
+include parts
+include wait
+include name
+include what
+include loop
+include race
+include behind
+include end
+
+@tree ChildOf
+film : ui.ZStack {
+  Video: {width: 960, height: 540, fps: 60, seconds: $t_out, scale: 2}
+  // -16 LUFS integrated, no true peak over -1 dBTP: loud enough on a phone, with headroom for X's re-encode.
+  Mix: {lufs: -16, peak: -1}
+  Fill: $tone_ground
+  Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
+  Size: {w: {kind: Fixed, value: 960, min: 0, max: 0}, h: {kind: Fixed, value: 540, min: 0, max: 0}}
+  // The bed: a low warm chord on A under the whole film (its root at 110 Hz, so a phone's speaker still carries it).
+  bed : voice.Pad { Onset: {at: 0}; Lasts: {dur: $t_out}; Pitch: {hz: 110}; Gain: {amp: 0.02} }
+}

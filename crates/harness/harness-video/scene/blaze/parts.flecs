@@ -1,0 +1,80 @@
+// The film's parts: what its shots are made of. Prefabs only (no props), each a ui.* prim with the film's type on it.
+@tree ChildOf
+film_part {
+  // A shot: the whole frame, its parts down a column from the margin. Hidden until its first cue shows it.
+  prefab Shot : ui.Column {
+    Flex: {axis: Column, gap: 0, align: Start, justify: Center, wrap: false}
+    Size: {w: {kind: Percent, value: 1, min: 0, max: 0}, h: {kind: Percent, value: 1, min: 0, max: 0}}
+    Padding: {l: $film_margin, r: $film_margin, t: 40, b: 40}
+  }
+  // A shot whose parts sit in the middle.
+  prefab Centred : film_part.Shot {
+    Flex: {axis: Column, gap: 0, align: Center, justify: Center, wrap: false}
+  }
+  // The biggest words: one line a shot.
+  prefab Hero : ui.Words, Strong {
+    TextStyle: {size: $size_film_hero, line: $line_film_hero, code_line: 0, role: 2, bold: 1, weight: 0}
+  }
+  prefab Head : ui.Words, Strong {
+    TextStyle: {size: $size_film_head, line: $line_film_head, code_line: 0, role: 2, bold: 1, weight: 0}
+  }
+  prefab Body : ui.Words, Ink {
+    TextStyle: {size: $size_film_body, line: $line_film_body, code_line: 0, role: 0, bold: 0, weight: 0}
+  }
+  // The small print: conditions, sources, labels.
+  prefab Small : ui.Words, Muted {
+    TextStyle: {size: $size_film_small, line: $line_film_small, code_line: 0, role: 0, bold: 0, weight: 0}
+  }
+  // Code and numbers, in the monospace face.
+  prefab Mono : ui.Words, Ink {
+    TextStyle: {size: $size_film_body, line: $line_film_body, code_line: 0, role: 9, bold: 0, weight: 0}
+  }
+  // A number that counts: its words are its Tally's.
+  prefab Figure : film_part.Mono {
+    Tally: {value: 0, decimals: 0, unit: ""}
+  }
+  // A bar of the race, 0 wide until a cue.Widen grows it.
+  prefab Bar : ui.Node {
+    Fill: $tone_film_other
+    Shape: {radius: 2, n: 4, border: 0, feather: 0}
+    Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 9, min: 0, max: 0}}
+  }
+  // A bar and its figure, side by side.
+  prefab Lane : ui.Row {
+    Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: 15, min: 0, max: 0}}
+  }
+  // One row of a comparison: its label, then its lanes.
+  prefab Row : ui.Row {
+    Flex: {axis: Row, gap: 16, align: Center, justify: Start, wrap: false}
+    Size: {w: {kind: Percent, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 40, min: 0, max: 0}}
+  }
+  prefab RowLabel : ui.Column {
+    Flex: {axis: Column, gap: 0, align: End, justify: Center, wrap: false}
+    Size: {w: {kind: Fixed, value: 300, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab Lanes : ui.Column {
+    Flex: {axis: Column, gap: 3, align: Start, justify: Center, wrap: false}
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  // A dot of the result grid, and the light on it.
+  prefab Dot : ui.Node {
+    Size: {w: {kind: Fixed, value: 5, min: 0, max: 0}, h: {kind: Fixed, value: 5, min: 0, max: 0}}
+    Fill: $tone_film_dot
+    Shape: {radius: 2.5, n: 2, border: 0, feather: 0}
+  }
+  prefab Lit : ui.Node {
+    Background
+    Fill: $tone_film_accent
+    Shape: {radius: 2.5, n: 2, border: 0, feather: 0}
+  }
+  // A swatch of a legend.
+  prefab Swatch : ui.Node {
+    Size: {w: {kind: Fixed, value: 9, min: 0, max: 0}, h: {kind: Fixed, value: 9, min: 0, max: 0}}
+    Shape: {radius: 2, n: 4, border: 0, feather: 0}
+  }
+  // Room between parts.
+  prefab Gap : ui.Node {
+    Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: 14, min: 0, max: 0}}
+  }
+}
