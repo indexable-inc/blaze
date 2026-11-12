@@ -108,6 +108,11 @@ impl Sums {
         sums
     }
 
+    /// The bytes the sums hold.
+    pub(super) fn held(&self) -> usize {
+        self.nodes.capacity() * size_of::<u32>()
+    }
+
     /// The length of the file these are the sums of.
     pub(super) fn len(&self) -> usize {
         self.len

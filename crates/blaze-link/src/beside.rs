@@ -541,6 +541,7 @@ impl Kept {
     /// The bytes it holds kept.
     pub(crate) fn held(&self) -> u64 {
         (self.file.capacity()
+            + self.sums.as_ref().map_or(0, crc::Sums::held)
             + self.records.capacity() * size_of::<(InstanceKey, Record)>()
             + self.files.iter().map(|it| 2 * it.capacity()).sum::<usize>()) as u64
     }

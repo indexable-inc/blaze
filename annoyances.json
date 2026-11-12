@@ -252,7 +252,7 @@
    "cost": "it is why mimalloc on base pages is 17% slower an edit (each build takes the freed pages again a 4 KiB fault at a time), so it is what keeps 1.0 GiB of huge-page slack on every Linux daemon; and it is edit time on any pages",
    "cause": "the edit's link and the walk copy whole-program tables",
    "workaround": "none",
-   "state": "open (codegen and link lanes)"
+   "state": "mostly fixed on edit2-1111 (2026-11-11): the `Built`'s functions are shared and the `Built` is given back and written into (no clone, no `patch_lists` lists), a patch's place writes the patch (no `file::fill` of the file's runs), the side file is patched by the loop and held once; what is left, about 15 MiB an edit by the samples, is the ELF writer's tables made whole each stage, the store's encoding of the patch, and `Reach::patched`"
   },
   {
    "id": "mem2-12",
@@ -275,6 +275,138 @@
    "cause": "the delay is one process-wide option read at each free and at each purge",
    "workaround": "purge at once, as before",
    "state": "open: why a rested edit is slower on pages kept warm is not known"
+  },
+  {
+   "id": "edit2-1",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+   "where": "the brief's VM line: `ix new --memory 96`",
+   "what": "`ix new` takes memory only as 4, 8, 16, 32, 64, 128 or 256 GiB: `--memory 96` is refused (`\"96\" is not a memory size in GiB`), and the next command (`ix shell`) then fails on a VM that does not exist.",
+   "cost": "a minute; the lane took 128",
+   "cause": "the brief was written from memory of the flag",
+   "workaround": "`--memory 128`",
+   "state": "open: briefs should name a size `ix new` takes"
+  },
+  {
+   "id": "edit2-2",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+   "where": "cargo's target directory: which file is the thin client",
+   "what": "`target/release/blaze` is blaze-engine's second binary, not the thin client: the thin client is `target/release/blaze-thin`, which is installed as `blaze`. The measuring script takes a directory with `blaze` and `blaze-engine`; given the target directory it ran the engine under both names, the second one found a daemon of another binary, stopped it and started its own, and the script died reading `/proc/<pid>/status` of the daemon that was gone.",
+   "cost": "one baseline run (five minutes) and ten minutes finding why the daemon restarted",
+   "cause": "two binaries of one name, and a script that takes a directory",
+   "workaround": "copy `blaze-thin` as `blaze` beside `blaze-engine` into a directory of its own (`/root/install.sh`, gone with the VM)",
+   "state": "open: the measuring script should take the two paths, or check `blaze --version` says thin"
+  },
+  {
+   "id": "edit2-3",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+   "where": "copying blaze's pinned LLVM between two ix VMs",
+   "what": "`ix shell a -- tar -cf - dir | ix shell b -- tar -xf -` through the Mac moved 355 MB in about 20 minutes (0.3 MB/s), and a foreground wait on it is moved to the background after three minutes.",
+   "cost": "20 minutes before the first build could start",
+   "cause": "the bytes go VM to Mac to VM through two interactive shells; there is no VM-to-VM copy and no fetch of the pinned LLVM by its hash on a fresh VM",
+   "workaround": "started the clone and rustup meanwhile",
+   "state": "open: a lane's VM should fetch the pinned LLVM itself (`blaze` does, cargo's build of blaze does not)"
+  },
+  {
+   "id": "edit2-4",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+   "where": "blaze-link's tests under cargo",
+   "what": "`cargo test -p blaze-link --lib` does not compile on all-1111 (e453ac295a): `tests::Linked` has no `Debug` and `tests.rs:1794` calls `unwrap_err` on a `Result<Linked, _>`.",
+   "cost": "one failed test run; no test of the linker could be run until it was fixed",
+   "cause": "a test added by a lane that builds with blaze, where nothing compiled the test target under cargo",
+   "workaround": "`#[derive(Debug)]` on the test's `Linked` (on edit2-1111)",
+   "state": "fixed on edit2-1111 (the derive)"
+  },
+  {
+   "id": "edit2-5",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+   "where": "the tests of all-1111 under cargo, before this lane's changes",
+   "what": "Eight tests fail on the untouched tip of all-1111 (e453ac295a), run in a worktree and a target directory of their own. blaze-codegen: `driver::tests::kept::a_walk_over_kept_describes_builds_what_a_fresh_walk_builds`, the refinement that an edit's `Built` is a fresh build's (`build 1: debug_names differs`: after a function is removed the patched walk still holds it; reproduce with `AXicbYqxDQBACAL/8lZ27r+sJNqQSMEBoZ6UyGKwDWs3wL6Bki+Dv/8GLHwAwg==`). blaze-link: `digest::tests::a_digest_kept_by_updates_is_the_files` (`2 nodes kept, 1 in the file's digest: not canonical`) and `tests::patch::a_same_size_body_edit_writes_the_function_and_a_constant` (`what an edit writes grows with the program`). blaze-cas: `a_changed_byte_in_the_zeros_ending_a_commit_stops_the_store_naming_its_pack`, `a_pack_whose_header_names_another_unit_stops_the_store`, `block_checks::the_oracle_catches_a_head_written_before_its_syncs`, `the_oracle_catches_a_put_reported_durable_that_no_sync_made_so`, `place_crash::the_oracle_catches_a_derived_file_accepted_as_a_crash_left_it`.",
+   "cost": "an hour: a baseline worktree, a second target directory and three test runs to tell them from this lane's changes; and the tree's own promise that an edit builds what a clean build builds is not held by its test",
+   "cause": "not looked for; the codegen one came with or after the edit-work-1111 merge (the test file's last change), the store's with the pool",
+   "workaround": "ran the same suites on the base and compared the lists: the same eight fail there, and this lane's new tests pass",
+   "state": "open: each is its lane's; the codegen refinement is the one that says an edit can build something a clean build does not"
+  },
+  {
+   "id": "edit2-6",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+   "where": "blaze: `blaze explain edit_work` after a `blaze run`",
+   "what": "With no `build=`, `blaze explain edit_work` reads the last build, which after every edit is the `store kept front end` build that follows it and counted nothing: `build 326 counted no work in any stage`. The edit's own build is the one before.",
+   "cost": "a few minutes each time, and a query written by hand to find the build",
+   "cause": "the view's default is the newest build of any kind",
+   "workaround": "`build=N` with N from `select max(build_id) from builds where command like 'run%' and misses > 0`",
+   "state": "open: the default should be the last build that counted work"
+  },
+  {
+   "id": "edit2-7",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+   "where": "blaze: the profile's rows of a link",
+   "what": "The spans of one `unit link` did not line up (`3 spans with no parent row, 26 past their parent`), and 13.7 ms at its end, the `Built` and its 12,000 functions being freed, was under no span: `blaze slow` printed no finding for it. It was found only by grouping the CPU samples by frame (`drop_glue::<CompiledFunction>`).",
+   "cost": "half an hour before the drop was seen at all",
+   "cause": "a value dropped at the end of a task is inside the task's span and under no span of its own",
+   "workaround": "a query over `samples` joined to `spans`, by innermost frame",
+   "state": "fixed for this drop (the `Built` goes back to the driver, edit2-1111); open for the next large drop"
+  },
+  {
+   "id": "edit2-8",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+   "where": "blaze: the daemon's loop on the edit path",
+   "what": "The loop reads a plane task's end every 1 ms (`channel daemon loop: a plane task's end (read every 1 ms)`), so every step of an edit that the loop hands on waits up to a millisecond: `the build's first made unit waits behind the units found kept` is 5.1 ms for hello world's 32 kept units, and a placement's seven effects are seven turns. After this lane the front of a one-function edit (plan 3.7 ms, `plan made: collect the plan's database` 1.8, lower 2 to 6, the kept units 5, changed set and inference 5) is 20 of the daemon's 44 ms.",
+   "cost": "about 10 ms an edit, none of it work",
+   "cause": "a poll where a wake would do",
+   "workaround": "none; not this lane's code",
+   "state": "open: the loop's and the plane's"
+  },
+  {
+   "id": "edit2-9",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+   "where": "blaze: the profile's flush at a build's end",
+   "what": "The profile's flush and its `fsync`s start as the build's request finishes, while the build's outputs are still being renamed onto their paths; on xfs one rename then took 6.6 ms (0.15 ms otherwise), and the answer waits for it.",
+   "cost": "up to 6 ms of an edit's answer, some edits",
+   "cause": "two writers of one file system's log at the moment the answer is due",
+   "workaround": "none",
+   "state": "open: the flush could wait for the answer"
+  },
+  {
+   "id": "edit2-10",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+   "where": "blaze-link: what a one-function edit writes",
+   "what": "`.rela.dyn` is rewritten almost whole by a one-function edit of hello world: 303 KB of a 442 KB table in two ranges (`link write` events), because a relocation added or removed moves every one after it. It is 95% of the patch (318 KB), of the store's record of it and of what each path's place writes.",
+   "cost": "about 0.3 MB written three times an edit, and the store's puts are 1.16 MB an edit",
+   "cause": "a table sorted and packed, with no slots that stay",
+   "workaround": "none",
+   "state": "open (the linker's relocations lane): relocations at fixed slots, a gone one left as `R_*_NONE`"
+  },
+  {
+   "id": "edit2-11",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+   "where": "blaze-link: compaction",
+   "what": "A stage compacted every list of the image (O(image), 14 ms) every seventh edit of hello world: the jump table's cells are one piece whose rebase list names every filled slot, a body edit fills one slot and empties another, and the whole of the last list (12,000 entries) is garbage each time. Nothing said a compaction ran: it was inside `link patch`.",
+   "cost": "2 ms an edit on average and 14 ms every seventh, seen as `link patch` between 8 and 26 ms",
+   "cause": "one threshold for seven lists, and a list re-pushed whole for one entry",
+   "workaround": "none needed",
+   "state": "fixed on edit2-1111: `link compact` is a span naming the list, and the loader's lists compact alone (a pass over the pieces); open: the cells' rebase list is still made whole by an edit that fills a slot"
+  },
+  {
+   "id": "edit2-12",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+   "where": "this lane's own measurement",
+   "what": "A test build was started on the VM while the measuring script ran: the rows of that run (no-op run 20.6 ms against 12.6) were the compile's, not the binary's.",
+   "cost": "one measurement thrown away and run again",
+   "cause": "one VM for building and measuring, and nothing that refuses to measure while a build runs",
+   "workaround": "waited for `pgrep cargo` to be empty before each measurement",
+   "state": "open: the measuring script could refuse when the machine is busy"
   }
  ]
 }
