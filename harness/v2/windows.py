@@ -68,9 +68,19 @@ def executable(eng: engine.Engine, ws: Path, env: dict[str, str], name: str, pro
 
 
 def build(
-    eng: engine.Engine, label: str, ws: Path, env: dict[str, str], *, release: bool = False
+    eng: engine.Engine,
+    label: str,
+    ws: Path,
+    env: dict[str, str],
+    *,
+    release: bool = False,
+    manifest_path: str = "",
 ) -> engine.Ran:
-    args = ["--message-format=json", *(["--release"] if release else [])]
+    args = [
+        "--message-format=json",
+        *(["--release"] if release else []),
+        *(["--manifest-path", manifest_path] if manifest_path else []),
+    ]
     ran = eng.build(label, ws, env, args, timeout=BUILD_SECS)
     if ran.returncode != 0:
         raise Regression(f"{label}: blaze exited {ran.returncode}:\n{ran.said()}")
@@ -96,8 +106,14 @@ def path_spellings(path: Path) -> tuple[str, ...]:
     native = str(path.resolve())
     drive, tail = os.path.splitdrive(native)
     case = drive.swapcase() + tail.swapcase()
-    # Keep these as strings until subprocess's cwd boundary: pathlib normalizes the slash form.
+    # Strings, never Path: pathlib normalizes the slash form back to backslashes.
     return (native, native.replace("\\", "/"), case, "\\\\?\\" + native)
+
+
+def manifest_in(spelling: str) -> str:
+    """`spelling`'s Cargo.toml, joined with the spelling's own separator: a verbatim `\\\\?\\`
+    path takes no `/`, and the slash spelling keeps only `/`."""
+    return spelling + ("/" if "/" in spelling else "\\") + "Cargo.toml"
 
 
 def paths(eng: engine.Engine, top: Path, rep: report.Report) -> None:
@@ -111,11 +127,13 @@ def paths(eng: engine.Engine, top: Path, rep: report.Report) -> None:
     write(ws / "src/main.rs", 'fn main() { println!("{}", win_dep::value()); }\n')
     home, target = top / "path-home", top / "path-target"
     env = eng.env(home, target)
+    # The spelling goes to blaze as an argument, from a working directory outside the workspace:
+    # as a cwd, Windows would canonicalize it before blaze ever saw it.
     for index, spelling in enumerate(path_spellings(ws)):
-        build(eng, f"windows paths: spelling {index + 1}", spelling, env)  # type: ignore[arg-type]
+        build(eng, f"windows paths: spelling {index + 1}", top, env, manifest_path=manifest_in(spelling))
         expect(
             f"path spelling {spelling}",
-            run_program(executable(eng, Path(spelling), env, "windows_paths"), top),
+            run_program(executable(eng, ws, env, "windows_paths"), top),
             "registry Ω\n",
         )
     rep.extra["path_spellings"] = [str(p) for p in path_spellings(ws)]
@@ -375,8 +393,16 @@ def selftest() -> int:
             selected(("paths", "daemon")) == ("paths", "daemon") or (_ for _ in ()).throw(AssertionError())
         ),
         lambda: 'kind = "raw-dylib"' in RAW_DLL or (_ for _ in ()).throw(AssertionError()),
-        lambda: path_spellings(Path("C:/Mixed Path"))[1].count("/") >= 2
-        or (_ for _ in ()).throw(AssertionError()),
+        lambda: (
+            "/" in (slash := path_spellings(Path("C:/Mixed Path/Inner"))[1])
+            and "\\" not in slash
+            or (_ for _ in ()).throw(AssertionError())
+        ),
+        lambda: (
+            manifest_in("C:/a b") == "C:/a b/Cargo.toml"
+            and manifest_in("\\\\?\\C:\\a b") == "\\\\?\\C:\\a b\\Cargo.toml"
+            or (_ for _ in ()).throw(AssertionError())
+        ),
     )
     try:
         selected(("not-a-scenario",))
