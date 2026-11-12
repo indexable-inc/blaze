@@ -407,13 +407,22 @@ fn run(spec: &confine::Spec, live: &Live) -> Result<i32, String> {
 /// of the walk set. What [`program_env`] puts in the program's environment or lends until a
 /// walk, and what the run's trace has for a walk.
 fn walk_shows(given: &[String], name: &std::ffi::OsStr) -> bool {
-    // What the sandbox and the C library read themselves is of the walk set (the test
-    // `what_stays_visible_is_of_the_walk_set`).
+    // Every visible name is in the program's environment as it is, so a walk sees it,
+    // whether or not it is of the walk set (the loader's `LD_DEBUG`, the resolver's
+    // `RES_OPTIONS`: [`READ_BY_THE_C_LIBRARY`] is longer than the walk set). The daemon's
+    // check has those by name, as the run's trace notes each read from its start.
     confine::walk_sees(name)
         || name.to_str().is_some_and(|it| {
-            given.iter().any(|given| given == it) || it == blaze_usercode::provider::VAR
+            given.iter().any(|given| given == it)
+                || it == blaze_usercode::provider::VAR
+                || READ_BY_THE_C_LIBRARY.contains(&it)
+                || VISIBLE_TO_THE_SANDBOX.contains(&it)
         })
 }
+
+/// [`READ_BY_THE_SANDBOX`] on every platform (it is a unix list, and this is asked where the
+/// launcher's code is compiled at all): the names the sandboxes read as text.
+const VISIBLE_TO_THE_SANDBOX: &[&str] = &["TMPDIR", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"];
 
 /// The environment the program of `spec` is started in: [`confine::Spec::env`] as it is, or,
 /// when it [`lends`], the visible variables as they are (the given ones,
@@ -714,21 +723,21 @@ mod tests {
         _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Every variable a lending run keeps visible is of the walk set, so what a walk sees is
-    /// the walk set and the given names ([`super::walk_shows`]) on both sides: the program's
-    /// environment and the trace's.
+    /// The invariant: what a walk of a lending run's environment shows ([`super::walk_shows`])
+    /// is exactly what [`super::program_env`] leaves in the environment or lends until a walk:
+    /// every visible name (given, the sandbox's, the C library's, the provider's) and the walk
+    /// set, and no variable lent by name alone. The control: a name outside all of them.
     #[cfg(unix)]
     #[test]
-    fn what_stays_visible_is_of_the_walk_set() {
+    fn a_walk_shows_every_visible_name_and_the_walk_set() {
+        let given = ["OUT_DIR".to_owned()];
+        let shows = |name: &str| super::walk_shows(&given, std::ffi::OsStr::new(name));
         for name in super::READ_BY_THE_SANDBOX.iter().chain(super::READ_BY_THE_C_LIBRARY) {
-            assert!(
-                blaze_usercode::confine::walk_sees(std::ffi::OsStr::new(name)),
-                "`{name}` stays in a lending run's environment and is not of the walk set"
-            );
+            assert!(shows(name), "`{name}` stays in a lending run's environment, and a walk is not shown it");
         }
-        let shows = |name: &str| super::walk_shows(&["OUT_DIR".to_owned()], std::ffi::OsStr::new(name));
-        assert!(shows("OUT_DIR") && shows("PATH") && shows(blaze_usercode::provider::VAR));
-        assert!(!shows("OLDPWD") && !shows("INVOCATION_ID"));
+        assert_eq!(super::READ_BY_THE_SANDBOX, super::VISIBLE_TO_THE_SANDBOX);
+        assert!(shows("OUT_DIR") && shows("CC") && shows(blaze_usercode::provider::VAR));
+        assert!(!shows("OLDPWD") && !shows("INVOCATION_ID") && !shows("LIBCLANG_PATH"));
     }
 
     /// A run whose spec names the variables its key has is lent the rest: they are no
