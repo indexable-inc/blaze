@@ -281,7 +281,11 @@ struct Kept {
 /// How many kept checks a process holds: the least recently used goes when one more is made.
 /// A daemon's unit checks one crate, so a workspace of this many crates in one configuration
 /// keeps them all; a database dropped leaves its kept checks here until others push them out.
-const KEPT_CHECKS: usize = 64;
+/// A check pushed out is a whole plan the next time (`Whole::NothingKept`), every body of its
+/// crate visited: at 64 a workspace of more crates than that (reth has over a hundred) lost
+/// some crate's kept check on every build, so the bound is well past any workspace's crates
+/// times its configurations. A kept check is a word a module and two a body.
+const KEPT_CHECKS: usize = 4096;
 
 /// The kept checks, each with what it is of, the last used last. A plan takes its key's out
 /// and its run puts the next in, so two plans of one key at once find one kept check between
