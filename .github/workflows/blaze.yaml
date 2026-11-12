@@ -191,7 +191,9 @@ jobs:
       - run: |
           uv run --frozen python harness/v2/lean_gate.py selftest
           uv run --frozen python harness/v2/lean_gate.py '{"command": "sources"}'
-      # Each hash domain in crates/ is written once outside tests (scripts/src/bin/domains.rs).
+      # Each hash domain in crates/ is written once outside tests, and is under a cache of
+      # docs/v2/plan/design/caches.md with the grain of its key; each hasher that is not BLAKE3
+      # has its class there (scripts/src/bin/domains.rs).
       - run: |
           "$BLAZE_SCRIPTS/domains" '{"root": "."}'
       # A change of blaze-profile's schema version lands only once ix.dev/explore reads it

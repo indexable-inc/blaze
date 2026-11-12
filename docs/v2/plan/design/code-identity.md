@@ -223,8 +223,7 @@ naming its replacement (rule 11). The call sites are in the identity lane's hand
       deletes `CodegenCode`, `set_code` and `crates/blaze-codegen-code`; a CodeId that can't be had
       stops the build with its error. Every reader of the id then keeps working as is: they
       take `Toolchain` or `Settings` whole (blaze-global `public.rs`, blaze-cargo
-      `serve/unit/compile.rs`, blaze-codegen `driver.rs`, `later.rs`, `kernel.rs`, blaze-premap
-      `key.rs`), which the step checks call site by call site.
+      `serve/unit/compile.rs`, blaze-codegen `driver.rs`, `later.rs`, `kernel.rs`), which the step checks call site by call site.
 5. **`hir-ty-pure`'s script identity** (`identity::of`, `content`) is behaviour identity of the
    script's root.
 

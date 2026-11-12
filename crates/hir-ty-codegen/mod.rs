@@ -998,12 +998,18 @@ const CHAINED: usize = 256;
 
 /// What tells compiled code from any other: equal for the same code however often an edit
 /// went away from it and came back, so that a patch holds what differs from its base alone.
+///
+/// It is an identity (equal prints are taken as equal code, with no compare after), so it is
+/// BLAKE3 under a domain, 128 bits kept (docs/v2/plan/design/caches.md, "Hash functions"):
+/// until 2026-11-12 it was SipHash-128 under a fixed public key, which is no identity.
 fn print_of(code: &impl std::hash::Hash) -> u128 {
-    let mut hasher = rustc_stable_hash::StableSipHasher128::new();
-    code.hash(&mut hasher);
-    let type_id::Fingerprint(low, high) = hasher.finish();
-    u128::from(low) | u128::from(high) << 64
+    let mut hasher = blaze_ids::Hasher::new(PRINT_DOMAIN);
+    code.hash(&mut blaze_hash::Blake3Hasher(&mut hasher));
+    hasher.finish().fingerprint().0
 }
+
+/// The domain of [`print_of`].
+const PRINT_DOMAIN: &str = "blaze v2 compiled code print 1";
 
 /// The print of the function's code. The database runs this again only when compiling gave
 /// something else, not each time it compiled.
@@ -16851,6 +16857,24 @@ mod number_ranges {
 #[cfg(test)]
 mod tests {
     use cranelift_codegen::ir::{self, AbiParam, InstBuilder, types};
+
+    /// The invariant: a print is the first 128 bits of the BLAKE3 of the code's `Hash` under
+    /// `PRINT_DOMAIN`, the same in every process, and other code has another print. The
+    /// control is the hash it replaced: SipHash-128 of the same value is not the print.
+    #[test]
+    fn a_print_is_blake3_under_its_domain() {
+        use std::hash::Hash as _;
+        let code = (7u32, "body", [1u8, 2, 3]);
+        let mut hasher = blaze_ids::Hasher::new(super::PRINT_DOMAIN);
+        code.hash(&mut blaze_hash::Blake3Hasher(&mut hasher));
+        assert_eq!(super::print_of(&code), hasher.finish().fingerprint().0);
+        assert_eq!(super::print_of(&code), super::print_of(&(7u32, "body", [1u8, 2, 3])));
+        assert_ne!(super::print_of(&code), super::print_of(&(7u32, "body", [1u8, 2, 4])));
+        let mut sip = rustc_stable_hash::StableSipHasher128::new();
+        code.hash(&mut sip);
+        let super::type_id::Fingerprint(low, high) = sip.finish();
+        assert_ne!(super::print_of(&code), u128::from(low) | u128::from(high) << 64);
+    }
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
     /// core's two UB checks are known by their pre-interned symbols, however the name was

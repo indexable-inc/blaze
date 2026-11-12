@@ -1510,25 +1510,6 @@
    },
    {
     "dependencies": [
-     "blaze-alloc-count",
-     "blaze-bytes",
-     "blaze-cas",
-     "blaze-codegen",
-     "blaze-core",
-     "blaze-format",
-     "blaze-graph",
-     "blaze-hash",
-     "blaze-ids",
-     "blaze-inproc",
-     "blaze-items",
-     "blaze-link",
-     "blaze-mem"
-    ],
-    "name": "blaze-premap",
-    "version": "0.0.0"
-   },
-   {
-    "dependencies": [
      "arrow-array",
      "arrow-ipc",
      "arrow-schema",
@@ -10812,23 +10793,6 @@
    "rust_version": "1.101",
    "source": {
     "dir": "crates/blaze-phf",
-    "kind": "path"
-   },
-   "version": "0.0.0"
-  },
-  "blaze-premap@0.0.0": {
-   "authors": "blaze contributors",
-   "description": "blaze v2's dependency image: everything below the workspace members prelinked once at a fixed base, keyed by the dependency graph, kept in the store and mapped by every dev run, so a dev link covers only the workspace's own code",
-   "homepage": "",
-   "license": "MIT OR Apache-2.0",
-   "license_file": "",
-   "links": null,
-   "name": "blaze-premap",
-   "readme": "",
-   "repository": "https://github.com/indexable-inc/blaze",
-   "rust_version": "1.101",
-   "source": {
-    "dir": "crates/blaze-premap",
     "kind": "path"
    },
    "version": "0.0.0"

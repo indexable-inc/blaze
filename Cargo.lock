@@ -1725,25 +1725,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blaze-premap"
-version = "0.0.0"
-dependencies = [
- "blaze-alloc-count",
- "blaze-bytes",
- "blaze-cas",
- "blaze-codegen",
- "blaze-core",
- "blaze-format",
- "blaze-graph",
- "blaze-hash",
- "blaze-ids",
- "blaze-inproc",
- "blaze-items",
- "blaze-link",
- "blaze-mem",
-]
-
-[[package]]
 name = "blaze-profile"
 version = "0.0.0"
 dependencies = [

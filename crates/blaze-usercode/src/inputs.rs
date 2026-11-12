@@ -90,6 +90,18 @@ impl Stamp {
         }
     }
 
+    /// Whether a write could still land under this stamp, `now_ns` being the wall clock: the
+    /// file last changed less than [`RACY_NS`] ago, or after now (another machine's clock, a
+    /// clock set back). A kernel stamps a write with a clock that ticks every few
+    /// milliseconds (a second on some file systems), so a file hashed in the tick it was
+    /// written in and written again in that tick, to the same length, has the stamp it was
+    /// hashed under and other bytes. Git's index has the same hole and the same answer
+    /// ("racy git"): such a stamp stands for nothing yet, and the file is hashed again at its
+    /// next check, until its last change is old enough that no write can share its tick.
+    fn racy(&self, now_ns: i128) -> bool {
+        self.modified.max(self.changed).saturating_add(RACY_NS) > now_ns
+    }
+
     fn bytes(&self) -> [u8; 56] {
         let mut out = [0; 56];
         out[..8].copy_from_slice(&self.len.to_le_bytes());
@@ -99,6 +111,19 @@ impl Stamp {
         out[48..].copy_from_slice(&self.device.to_le_bytes());
         out
     }
+}
+
+/// How long after a file's last change its stamp is not taken for its content
+/// ([`Stamp::racy`]): above the coarsest tick a file system blaze reads stamps a write with
+/// (FAT's two seconds).
+const RACY_NS: i128 = 2_000_000_000;
+
+/// The wall clock in nanoseconds since the epoch, the clock a kernel stamps a file with; the
+/// least value when it cannot be read, under which every stamp is racy and none is kept.
+fn wall_ns() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(i128::MIN, |it| i128::try_from(it.as_nanos()).unwrap_or(i128::MAX))
 }
 
 /// The hashes of the machine's files, each under its path and what `stat` said of it when it
@@ -409,7 +434,8 @@ impl Files {
         // A file changed while it was read is hashed again at its next check.
         let after = std::fs::metadata(path).map(|it| Stamp::of(&it)).ok();
         let settled = after == Some(stamp);
-        if settled {
+        // Kept only under a stamp no later write can share ([`Stamp::racy`]).
+        if settled && !stamp.racy(wall_ns()) {
             self.stamped.intern(key, || hash);
         }
         Ok((Some(hash), settled))
@@ -514,7 +540,10 @@ impl Files {
         read_all(file, |bytes| _ = hasher.update(bytes)).map_err(unreadable)?;
         let id = hasher.finish();
         // A file changed while it was read is hashed again at its next check.
-        if std::fs::symlink_metadata(path).is_ok_and(|it| Stamp::of(&it) == stamp) {
+        // And kept only under a stamp no later write can share ([`Stamp::racy`]).
+        if std::fs::symlink_metadata(path).is_ok_and(|it| Stamp::of(&it) == stamp)
+            && !stamp.racy(wall_ns())
+        {
             self.stamped.intern(key, || id.0);
         }
         Ok(Entry::File(id, mode))
@@ -861,6 +890,44 @@ impl Inputs for ViewInputs<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The invariant: a stamp stands for a file's content only once no write can share it. A
+    /// file changed within [`RACY_NS`] of now, or stamped after now, is racy; an older one is
+    /// not; with no clock every stamp is. The control is the rule this replaced (any settled
+    /// stamp is kept): the rewrite below has the stamp of the bytes before it.
+    #[test]
+    fn a_stamp_a_later_write_can_share_is_not_kept() {
+        let at = |modified: i128, changed: i128| Stamp { len: 4, modified, changed, inode: 7, device: 1 };
+        let now = 1_700_000_000_000_000_000i128;
+        assert!(at(now, now).racy(now), "written this tick");
+        assert!(at(now - RACY_NS + 1, now - 10 * RACY_NS).racy(now), "modified a moment ago");
+        assert!(at(now - 10 * RACY_NS, now - 1).racy(now), "its inode changed a moment ago");
+        assert!(at(now + 5, now + 5).racy(now), "stamped after now");
+        assert!(!at(now - RACY_NS, now - RACY_NS).racy(now), "old enough");
+        assert!(at(0, 0).racy(i128::MIN), "no clock: nothing is kept");
+        // Two writes of one length in one tick: equal stamps, other bytes. Kept by the stamp
+        // alone, the first hash would answer for the second.
+        let (first, second) = (at(now, now), at(now, now));
+        assert_eq!(first, second);
+        assert!(first.racy(now) && second.racy(now));
+    }
+
+    /// A file just written is hashed from the disk each time it is looked at, so a rewrite of
+    /// the same length under the same stamp is seen; nothing was kept for it to hide behind.
+    #[test]
+    fn a_file_rewritten_at_once_to_the_same_length_is_seen() {
+        let dir = std::env::temp_dir().join(format!("blaze-usercode-racy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("input");
+        let files = Files::new();
+        std::fs::write(&path, b"aaaa").unwrap();
+        let (first, _) = files.look(&path).unwrap();
+        std::fs::write(&path, b"bbbb").unwrap();
+        let (second, _) = files.look(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(first.is_some() && second.is_some());
+        assert_ne!(first, second, "the second write's bytes are what is hashed");
+    }
 
     #[test]
     fn the_disk_hashes_files_lists_directories_and_refuses_nothing_quietly() {
