@@ -2441,11 +2441,7 @@ fn launched(
         how,
         tiers,
         restart,
-        // Said as a link from scratch is: a note of the build, naming the program.
-        whole: linked.from_records.map(|why| {
-            // alloc: a note's text, once per build of a program that had no image
-            format!("since its last build its runs were started from records, not an image of placed code: {why}")
-        }),
+        whole: None,
     })
 }
 

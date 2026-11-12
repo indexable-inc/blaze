@@ -599,14 +599,13 @@ what the daemon sends. So the daemon does it once and keeps the outcome, an **im
   fixup relative to something outside the mapping is refused, and then there is no image.
 - **Who makes it, and where it lives.** The daemon (`blaze-launch-host`, `start_image`),
   with the launcher's own placement code (`blaze_launch::place`, pure), from its own
-  records, when the second launcher of a kept `Hello` answer asks: the first run after a
-  build is sent the records as before and waits for no image. It lives beside the kept
-  answer, in the daemon's memory, keyed as the answer is (the build and the set of
-  functions run so far) and by the launcher's system and page size. It is not a file: a
-  launched program does not outlive its daemon's code (`Tell::Unheld`), so nothing would
-  read one. When programs replay after a daemon restart, the image becomes a store record
-  under the build's record key, the launcher binary's key and the set: the same content it
-  is now, with a key.
+  records, when a launcher says `Hello` and no kept answer is of this build and this set
+  of functions: the first run after a build too. It is kept beside that answer, in the
+  daemon's memory, keyed by the build, the set and the launcher's system and page size,
+  and every later launcher is sent the same bytes. It is not a file: a launched program
+  does not outlive its daemon's code (`Tell::Unheld`), so nothing would read one. When
+  programs replay after a daemon restart, the image becomes a store record under the
+  build's record key, the launcher binary's key and the set.
 - **How it reaches the launcher.** One message, `Tell::Image { bytes }` (schema 3), in
   place of `Welcome`, the records, `Statics`, the first `Edit` and `Start`.
 - **What the launcher verifies before using it** (`Driver::image`, `Loaded::image`): the
@@ -621,25 +620,37 @@ what the daemon sends. So the daemon does it once and keeps the outcome, an **im
   outside symbol once, adds each mapping's address to the listed words, copies the code
   with one write and one barrier, registers the unwind entries, and commits as an edit of
   every body does.
-- **When there is none.** Four named cases (`image::Why`): a static or datum aligned past
-  a page, a thread-local where the launcher has none (x86-64), code relative to data, and
-  more than 12 MiB of code and data. The launchers of that answer are then sent the
-  records: a second, named way to the one state, which the refinement test holds to be
-  one state (an image rebased is the records placed). It is never quiet: the daemon says
-  it at every such start as a warn event that names the program and the case and carries
-  the program's counts of starts from an image and from records (`Program::starts`), and
-  the program's next build says it as a note (`launch::Linked::from_records`). Each case
-  has a test that it is refused by its name; the host's test and the timing script fail
-  when a small program or hello world is started from records. Not yet: a row of
-  `blaze why` and a counter of the profile, which are in files of other lanes.
+- **It is the one way a launcher starts** (rule `no-fallback`, as rewritten 2026-11-12:
+  a failed launch is better than one that took another route). The daemon no longer sends
+  a start as `Welcome`, records, `Statics`, an `Edit` and `Start`: that route is deleted
+  from `blaze-launch-host`. Where a program has something an image cannot hold, the
+  launcher's `Hello` is refused and the program does not start: the error names the case
+  (`image::Why`), the function or static, and what to do (run the program without the
+  launcher: `blaze stop`, then build with `BLAZE_LAUNCH` unset). Records still come one at
+  a time for what an image is not of: a first call (`Need`), an edit, a static added by an
+  edit.
+
+Each case is work to remove, with what it needs:
+
+| Case | Refused when | To remove it |
+|---|---|---|
+| aligned past a page | a static or datum is aligned to more than the page size | the launcher reserves its data at an address aligned to the largest alignment the image names (one more header field; over-reserve and trim) |
+| a thread-local here | a thread-local static on x86-64 | the launcher's thread-locals on x86-64 (`tls`: the descriptor call sequence; launcher.md step 3 lists it) |
+| code relative to data | a function reaches a static, a datum or an outside symbol relative to itself | nothing in tier 0 emits this (every data address is taken from the GOT); if a backend does, either a pool cell for it or the data inside the code mapping's reach, as one reservation with a fixed distance |
+| longer than a message | more than 12 MiB of code and data in the start | the image by descriptor (a sealed memfd passed with the message, mapped and copied once), which also removes the socket's copies |
+
+Still in the launcher and the wire, though no daemon sends them at a start: `Welcome` and
+`Start` (`blaze-launch-rt`'s control thread). The stand-in daemons of `blaze-launch-rt`'s
+and `blaze-stencil`'s tests start their launchers with them; they go when those tests
+start from images.
 
 Held to: `blaze-launch` `tests/image.rs` (the refinement: an image rebased to a process's
 addresses is byte for byte what placing the same records there gives; a control that
 leaves the outside symbols' words out; refusals of other layouts), `blaze-launch-rt`
 `tests.rs` (a launcher started from an image runs its function and holds its static; an
-image of another geometry is refused), `blaze-launch-host` `tests.rs` (the second launcher
-of an answer is bound as the first, with a planted short image). None of it has been
-compiled: this lane writes and does not run (rule 35 as of 2026-11-12).
+image of another geometry is refused), `blaze-launch-host` `tests.rs` (a start is one
+message that binds what the runs before called; a program an image cannot hold is refused
+by name with what to do; the simulation's launchers all start from images).
 
 Not known, to be measured with the phase timings of branch `launch3-1111-probe`: what the
 1.7 ms was made of, and what a start from an image costs. Expected to remain, from the

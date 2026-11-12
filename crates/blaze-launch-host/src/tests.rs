@@ -652,91 +652,6 @@ fn a_record_names_callees_by_place_and_carries_its_positions_as_data() {
     assert!(refused.contains("`hello::main`") && refused.contains("TlsGd32"), "{refused}");
 }
 
-/// Three launchers of one build: a first run that calls the entry and what it calls, then
-/// the first launcher of the answer for that set, which is sent the frames, then the second,
-/// which is sent one message. Gives the last two, and whether the program had an image.
-fn framed_and_imaged(plant: Plant) -> (Launcher, Launcher, Option<String>) {
-    let mut program = Program::new();
-    program.plant = plant;
-    let source = Source { bodies: vec![1, 1, 1], statics: vec![7, 7], sigs: Vec::new() };
-    program.built(&build(&source, &[]), "main", Tables::Whole(&[])).expect("built");
-    let connect = |program: &mut Program, conn: u64| {
-        program.connected(Conn(conn));
-        let mut launcher = Launcher { conn, ..Launcher::default() };
-        launcher.say(&Ask::Hello {
-            program: ProgramId([0; 32]),
-            pid: 1,
-            arch: wire::Arch::Aarch64,
-            os: wire::Os::Linux,
-            page: 4096,
-        });
-        launcher
-    };
-    // The daemon hears everything the launcher said; the launcher reads everything it was sent.
-    let settle = |program: &mut Program, launcher: &mut Launcher| {
-        loop {
-            let mut moved = launcher.step();
-            if let Some(message) = launcher.outbound.pop_front() {
-                let mut out = Vec::new();
-                program.said(Conn(launcher.conn), &message, &mut out).expect("heard");
-                launcher.inbound.extend(out);
-                moved = true;
-            }
-            if !moved {
-                break;
-            }
-        }
-    };
-    let mut first = connect(&mut program, 1);
-    settle(&mut program, &mut first);
-    for slot in [0, 1] {
-        first.waiting.push(slot);
-        first.say(&Ask::Need { slot: Slot(slot), thread: Thread(1) });
-        settle(&mut program, &mut first);
-    }
-    assert!(first.waiting.is_empty());
-    let mut framed = connect(&mut program, 2);
-    settle(&mut program, &mut framed);
-    assert!(framed.started && framed.bound[0].is_some() && framed.bound[1].is_some());
-    let mut imaged = connect(&mut program, 3);
-    let hello = imaged.outbound.pop_front().expect("its hello");
-    let mut out = Vec::new();
-    program.said(Conn(3), &hello, &mut out).expect("heard");
-    let unimaged = program.unimaged();
-    if unimaged.is_none() {
-        let (item, took) = wire::split(&out).expect("a frame").expect("a whole frame");
-        assert_eq!(took, out.len(), "one message");
-        assert!(matches!(Tell::decode(item), Ok((_, Tell::Image { .. }))));
-    }
-    imaged.inbound.extend(out);
-    settle(&mut program, &mut imaged);
-    (framed, imaged, unimaged)
-}
-
-/// The refinement: a launcher started from the image is the launcher started from the frames.
-/// The second launcher of an answer is sent one message, an image of placed code, and holds
-/// what the first, sent the frames, holds: the same slots declared, the same record in each
-/// bound slot, the program started.
-#[test]
-fn a_second_launcher_of_an_answer_starts_from_an_image_and_is_bound_as_the_first() {
-    let (framed, imaged, unimaged) = framed_and_imaged(Plant::None);
-    // A small real program gets an image: were it started from records, that is this
-    // check's failure, never a slow start nobody sees.
-    assert_eq!(unimaged, None, "the program's start has an image");
-    assert!(imaged.started);
-    assert_eq!(imaged.declared, framed.declared);
-    assert_eq!(imaged.bound, framed.bound);
-}
-
-/// A control of [`a_second_launcher_of_an_answer_starts_from_an_image_and_is_bound_as_the_first`]:
-/// an image that leaves out a body its frames bind is caught by the bound slots.
-#[test]
-fn the_oracle_catches_an_image_that_binds_less_than_the_frames() {
-    let (framed, imaged, unimaged) = framed_and_imaged(Plant::ShortImage);
-    assert_eq!(unimaged, None);
-    assert_ne!(imaged.bound, framed.bound);
-}
-
 /// A launcher that says hello to `program` as connection `conn`.
 fn hello(program: &mut Program, conn: u64) -> Launcher {
     program.connected(Conn(conn));
@@ -859,4 +774,71 @@ fn the_oracle_catches_a_slot_kept_across_a_changed_signature() {
     assert!(edited.before.is_some());
     assert_ne!(edited.after, edited.before);
     assert_eq!(edited.declared.1, edited.declared.0);
+}
+
+/// A launcher's start is one message, an image of placed code, that binds every function
+/// the runs before it called, each to the newest build's record; and the next launcher of
+/// the same build and set is sent the same bytes.
+#[test]
+fn a_launcher_starts_from_one_message_that_binds_what_the_runs_before_called() {
+    let mut program = Program::new();
+    let source = Source { bodies: vec![1, 1, 1], statics: vec![7, 7], sigs: Vec::new() };
+    program.built(&build(&source, &[]), "main", Tables::Whole(&[])).expect("built");
+    // A first run, which calls the entry and what it calls.
+    let mut first = hello(&mut program, 1);
+    settled(&mut program, &mut first);
+    assert!(first.started && first.bound.iter().all(Option::is_none), "nothing ran before it");
+    for slot in [0, 1] {
+        first.waiting.push(slot);
+        first.say(&Ask::Need { slot: Slot(slot), thread: Thread(1) });
+        settled(&mut program, &mut first);
+    }
+    let answer = |program: &mut Program, conn: u64| {
+        let mut launcher = hello(program, conn);
+        let said = launcher.outbound.pop_front().expect("its hello");
+        let mut out = Vec::new();
+        program.said(Conn(conn), &said, &mut out).expect("heard");
+        let (item, took) = wire::split(&out).expect("a frame").expect("a whole frame");
+        assert_eq!(took, out.len(), "one message");
+        assert!(matches!(Tell::decode(item), Ok((_, Tell::Image { .. }))));
+        launcher.inbound.extend(out.iter().copied());
+        settled(program, &mut launcher);
+        (launcher, out)
+    };
+    let (second, sent) = answer(&mut program, 2);
+    assert!(second.started);
+    for slot in [0u32, 1] {
+        assert!(second.bound[slot as usize].is_some(), "slot {slot} is bound before the program starts");
+        assert_eq!(second.bound[slot as usize], program.newest(slot));
+    }
+    let (third, again) = answer(&mut program, 3);
+    assert_eq!(third.bound, second.bound);
+    // The same image; the frame differs in nothing but would in its id were it made again.
+    assert_eq!(again, sent);
+}
+
+/// A program an image cannot hold is not started another way: the launcher's hello is
+/// refused, naming the case, what of the program it is and what to do. Here a launcher in
+/// pages of 4 bytes, past which every static of the program is aligned.
+#[test]
+fn a_program_an_image_cannot_hold_is_refused_by_name_with_what_to_do() {
+    let mut program = Program::new();
+    let source = Source { bodies: vec![1, 1, 1], statics: vec![7, 7], sigs: Vec::new() };
+    program.built(&build(&source, &[]), "main", Tables::Whole(&[])).expect("built");
+    program.connected(Conn(1));
+    let mut launcher = Launcher { conn: 1, ..Launcher::default() };
+    launcher.say(&Ask::Hello {
+        program: ProgramId([0; 32]),
+        pid: 1,
+        arch: wire::Arch::Aarch64,
+        os: wire::Os::Linux,
+        page: 4,
+    });
+    let said = launcher.outbound.pop_front().expect("its hello");
+    let mut out = Vec::new();
+    let why = program.said(Conn(1), &said, &mut out).expect_err("refused");
+    assert!(out.is_empty(), "nothing is sent of a start that is refused");
+    assert!(why.contains("aligned past a page"), "{why}");
+    assert!(why.contains("aligned to 8 bytes"), "{why}");
+    assert!(why.contains("Run it without the launcher"), "{why}");
 }
