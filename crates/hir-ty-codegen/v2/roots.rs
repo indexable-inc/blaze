@@ -148,8 +148,8 @@ impl HirFrontend<'_> {
     /// The roots of the unit that compiles `krate` as `kind` makes it. An input rustc takes and
     /// blaze can't is an error naming it.
     pub fn roots(&self, krate: Crate, kind: RootKind) -> Result<Roots, CodegenError> {
-        self.devirt.makes(kind, krate);
         self.with(|db| {
+            self.devirt.makes(db, kind, krate)?;
             let mut listed = Listed::default();
             // alloc: once a unit, the tests cargo is given (empty but for a harness)
             let mut tests = Vec::new();

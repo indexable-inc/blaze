@@ -241,8 +241,11 @@ pub trait Frontend: Sync {
         value: &Self::Static,
     ) -> Result<DescribedStatic<Self::Instance, Self::Static>, CodegenError>;
 
-    /// The instances and statics the walk reached next, before any of them is described:
-    /// what a front end checking bodies beside the build checks first. Once a level.
+    /// Instances and statics the walk newly reached and describes: what a front end checking
+    /// bodies beside the build checks first. A hint of order, never of the program: the roots
+    /// first, then in batches as the walk's describes reach more (each instance in one batch,
+    /// a batch in no order), while those describes run. What the walk reached, whole and in
+    /// its order, is what [`Self::closed`] is given.
     fn reached(&self, functions: &[(Self::Instance, Origin)], statics: &[Self::Static]);
 
     /// Whether the build's outcome is decided without its code (a body it compiles failed
@@ -252,7 +255,7 @@ pub trait Frontend: Sync {
 
     /// What the recursion limit reads of each of `functions`, in order ([`Counted`]): one
     /// entry a function. Another count is the build's error, naming the functions left
-    /// without one.
+    /// without one. Asked on every core at once, of the functions one describe newly reaches.
     fn counted(&self, functions: &[(Self::Instance, Origin)]) -> Vec<Counted>;
 
     /// `instance` as an error names it: its path and its arguments, cut short.
@@ -333,20 +336,28 @@ pub trait Frontend: Sync {
     }
 
     /// Whether a walk of this front end may close facts of the whole program
-    /// ([`Self::closed`] may say `true`). The facts are made from everything the walk reached
-    /// ([`Self::reached`]), so a walk patched from a kept one, which tells only what changed,
-    /// is for a front end that says `false`. The default is `true`.
+    /// ([`Self::closed`] may say `true`). The facts are made from everything the walk reached,
+    /// so a walk patched from a kept one, which holds only what changed, is for a front end
+    /// that says `false`. The default is `true`.
     fn closes(&self) -> bool {
         true
     }
 
-    /// Told that the walk has reached everything it was told of ([`Self::reached`]), with
-    /// no error: `true` when what it reached closes facts of the whole program its bodies are
-    /// to be described and built against from now on (a final binary's trait objects, which
-    /// `hir-ty-codegen` devirtualizes calls by), so the walk runs once more and describes
-    /// every instance again; `false` when there are none, or they are those the walk was made
-    /// against. Facts the second walk finds other than the first are the front end's error.
-    fn closed(&self) -> Result<bool, CodegenError> {
+    /// Told that the walk has reached everything, with no error: `functions` (each with whose
+    /// code asked for it) and `statics` are all it reached, each once, in the walk's order,
+    /// which is one for a program whatever the schedule of its describes (breadth first from
+    /// the roots, each instance's references in their order). `true` when they close facts of
+    /// the whole program its bodies are to be described and built against from now on (a
+    /// final binary's trait objects, which `hir-ty-codegen` devirtualizes calls by), so the
+    /// walk runs once more and describes every instance again; `false` when there are none,
+    /// or they are those the walk was made against. Facts the second walk finds other than
+    /// the first are the front end's error.
+    fn closed(
+        &self,
+        functions: &[(Self::Instance, Origin)],
+        statics: &[Self::Static],
+    ) -> Result<bool, CodegenError> {
+        _ = (functions, statics);
         Ok(false)
     }
 }

@@ -1281,7 +1281,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             keep.check_roots.push(item);
             keep.graph.root(BUILT, item);
         }
-        // Each root once, at its first place: the check's order (`recursion::Graph::start`).
+        // Each root once, at its first place: the check's order (`frontier::Order::of`).
         let mut seen = blaze_hash::HashSet::new_in(Global);
         keep.check_roots.retain(|item| seen.insert(*item));
         for at in 0..keep.check_roots.len() {

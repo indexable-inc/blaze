@@ -1,7 +1,8 @@
 //! A build's codegen, one function instance at a time (docs/v2/plan/design/codegen.md).
 //!
 //! 1. **Walk**: from the roots, the front end describes each instance and what it refers to,
-//!    a level at a time on all cores; the policy gives each its settings and so its key.
+//!    a worklist on all cores (each describe sends on what it newly reaches, with no round
+//!    between; `worklist`, `frontier`); the policy gives each its settings and so its key.
 //! 2. **Places**: each instance's references resolved to this build's targets (a callee
 //!    reached through its slot or directly).
 //! 3. **Dev** (Cranelift, stencils): a template from the store by instance key, else from the memo by
@@ -30,6 +31,7 @@ use blaze_graph::par::{self, IntoSource};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
 use blaze_mem::{Tag, frame};
+use crossbeam_queue::SegQueue;
 
 use crate::{
     CodegenError, CompiledFunction, Instance, InstanceKey, Linkage, Static, Target, Unit,
@@ -1631,6 +1633,118 @@ pub struct Build<'a, B: Prepare> {
     planted: Option<Planted>,
 }
 
+/// What the walk's worklist visits: a function or static the walk reached and has not
+/// described, with its place on the path it was reached by.
+enum Ask<I, S> {
+    Function(Arc<frontier::Function<I, S>>, Arc<Step>),
+    Static(Arc<frontier::Static<I, S>>, Arc<Step>),
+}
+
+/// One round of a walk, shared by its describes on all cores ([`Build::found`]).
+struct Walking<'w, I, S> {
+    /// What the walk reached: an entry a function and a static, made once.
+    frontier: Frontier<I, S>,
+    /// What is still to describe.
+    work: Worklist<Ask<I, S>>,
+    /// The front end said the build stopped ([`Frontend::stopped`]): nothing more is begun.
+    stopped: AtomicBool,
+    /// What the describes newly reached, for the front end's hint.
+    hints: Hints<I, S>,
+    /// Writes the walk's entries refused, as errors: none, but for a bug of the walk.
+    refused: SegQueue<CodegenError>,
+    counts: &'w kept::Counts,
+    /// Which round of the walk, from 0 ([`Build::described`]).
+    round: usize,
+}
+
+impl<I, S> Walking<'_, I, S> {
+    /// An entry was given a second describe, of `what`: only one visit describes an entry, so
+    /// this is the walk's bug, refused by name and never written over (rule 21).
+    fn twice(&self, what: String) {
+        self.refused.push(error(
+            InstanceKey(ContentId::default()),
+            ItemKey(ContentId::default()),
+            // alloc: an error
+            format!(
+                "{what} was described twice in one walk: its entry keeps the first describe \
+                 and refuses the second"
+            ),
+        ));
+    }
+}
+
+/// How many functions and statics the walk's describes reach before the front end is told
+/// of them ([`Frontend::reached`]): a batch, so a front end that takes a lock to hear it (the
+/// body checks' plan) takes it once per this many, never once per describe.
+const HINTED: usize = 256;
+
+/// What the walk's describes newly reached and the front end was not yet told of.
+struct Hints<I, S> {
+    functions: SegQueue<(I, Origin)>,
+    statics: SegQueue<S>,
+    /// How many wait, more or less: a batch is told once it passes [`HINTED`].
+    waiting: std::sync::atomic::AtomicUsize,
+    /// One thread tells at a time; what is added meanwhile is in the next batch.
+    telling: AtomicBool,
+}
+
+impl<I, S> Hints<I, S> {
+    fn new() -> Self {
+        Hints {
+            functions: SegQueue::new(),
+            statics: SegQueue::new(),
+            waiting: std::sync::atomic::AtomicUsize::new(0),
+            telling: AtomicBool::new(false),
+        }
+    }
+
+    /// Adds `functions` and `statics`, which a describe just sent on, and tells the front end
+    /// of everything waiting once that is a batch.
+    fn tell<F>(&self, frontend: &F, functions: Vec<(I, Origin)>, statics: Vec<S>)
+    where
+        F: Frontend<Instance = I, Static = S>,
+    {
+        let more = functions.len() + statics.len();
+        if more == 0 {
+            return;
+        }
+        for it in functions {
+            self.functions.push(it);
+        }
+        for it in statics {
+            self.statics.push(it);
+        }
+        if self.waiting.fetch_add(more, Ordering::Relaxed) + more >= HINTED {
+            self.flush(frontend);
+        }
+    }
+
+    /// Tells the front end of everything waiting, unless another thread is telling it now.
+    fn flush<F>(&self, frontend: &F)
+    where
+        F: Frontend<Instance = I, Static = S>,
+    {
+        /// Lets the next thread tell, however this one's telling ended.
+        struct Telling<'h>(&'h AtomicBool);
+        impl Drop for Telling<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        if self.telling.swap(true, Ordering::Acquire) {
+            return;
+        }
+        let _telling = Telling(&self.telling);
+        self.waiting.store(0, Ordering::Relaxed);
+        // alloc: per batch of hints, sized by it
+        let functions: Vec<(I, Origin)> = std::iter::from_fn(|| self.functions.pop()).collect();
+        let statics: Vec<S> = std::iter::from_fn(|| self.statics.pop()).collect(); // alloc: as above
+        if !(functions.is_empty() && statics.is_empty()) {
+            frontend.reached(&functions, &statics);
+        }
+    }
+}
+
 /// A bug a control plants in a patched build ([`Build::planted`]): each takes away one rule
 /// of [`patch`] or [`lists`], and the refinement's oracle must find the difference.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1969,15 +2083,261 @@ impl<'a, B: Prepare> Build<'a, B> {
         Ok(StaticNode { value: value.clone(), described, spec: choice.first, refs: Vec::new() })
     }
 
+    /// Everything `roots`, `static_roots` and the check's roots reach, described: the walk's
+    /// worklist (docs/v2/plan/design/scheduler.md, "Codegen: a worklist"). Each root is an
+    /// item; a visit describes its function or static and sends on what that newly reaches
+    /// ([`Self::visit`]), on every core, with no round between a describe and what it
+    /// reached. An instance is described once: whoever makes its entry in the walk's table
+    /// ([`Frontier`]) sends it. Each carries its place on the path it was reached by, and is
+    /// not sent past the recursion limit there ([`Step`]); the limit's check then runs over
+    /// what was described, in the walk's one order, and sends back what rustc's path reaches
+    /// within the limit, until it sends nothing ([`recursion::check`]: at most its bound of
+    /// passes, then an error).
+    ///
+    /// Gives what was reached in that order ([`Order`]: the same for every schedule), whether
+    /// the front end stopped the build partway (the order then holds what was described by
+    /// then), and the errors that are not a describe's own: the check's refusals, then any
+    /// write the table refused.
+    fn found(
+        &self,
+        roots: &[(FrontInstance<B>, Origin)],
+        static_roots: &[FrontStatic<B>],
+        check: &[CheckRoot<FrontInstance<B>, FrontStatic<B>>],
+        round: usize,
+        counts: &kept::Counts,
+    ) -> (Order<FrontInstance<B>, FrontStatic<B>>, bool, Vec<CodegenError>) {
+        let walking = Walking {
+            frontier: Frontier::new(),
+            work: Worklist::new(),
+            stopped: AtomicBool::new(false),
+            hints: Hints::new(),
+            refused: SegQueue::new(),
+            counts,
+            round,
+        };
+        // alloc: none unless the check refuses
+        let mut errors = Vec::new();
+        // alloc: per build, its roots' handles
+        let mut functions = roots.to_vec();
+        let mut statics = static_roots.to_vec(); // alloc: as above
+        for root in check {
+            match root {
+                CheckRoot::Function(instance, origin) => {
+                    // clone: per build, the walk's handle of a check root
+                    functions.push((instance.clone(), *origin))
+                }
+                CheckRoot::Static(value) => statics.push(value.clone()), // clone: as above
+            }
+        }
+        // The roots are told at once and first; what the describes reach, in batches.
+        let (functions, statics) = self.send(&walking, functions, statics, None);
+        if !(functions.is_empty() && statics.is_empty()) {
+            self.frontend.reached(&functions, &statics);
+        }
+        let mut passes = 0;
+        let order = loop {
+            {
+                let _span = tracing::info_span!(
+                    target: "blaze",
+                    "codegen walk describe",
+                    round,
+                    pass = passes + 1,
+                )
+                .entered();
+                walking.work.run(&|ask: &Ask<_, _>| self.visit(&walking, ask));
+                walking.hints.flush(self.frontend);
+            }
+            let order = Order::of(&walking.frontier, roots, static_roots, check);
+            if walking.stopped.load(Ordering::Relaxed) {
+                break order;
+            }
+            match recursion::check(&order, self.frontend, &mut passes, &mut errors) {
+                recursion::Checked::Done => break order,
+                recursion::Checked::Again(deferred) => {
+                    for entry in deferred {
+                        // Deferred with its count: the check sends back no other.
+                        let Some(counted) = entry.counted.get() else { continue };
+                        let step = Step::place_past(entry.from.as_ref(), counted);
+                        walking.work.push(Ask::Function(entry, step));
+                    }
+                }
+            }
+        };
+        // alloc: none unless a write was refused, which is the walk's bug
+        let mut refused: Vec<CodegenError> = std::iter::from_fn(|| walking.refused.pop()).collect();
+        // Refused on whichever thread: by what they say, so the errors are in one order.
+        refused.sort_by(|a, b| a.what.cmp(&b.what));
+        errors.extend(refused);
+        (order, walking.stopped.into_inner(), errors)
+    }
+
+    /// One visit of the walk's worklist: `ask`'s function or static is described, its node
+    /// written to its entry (published: any reader of the entry has it from then, while the
+    /// rest of the walk goes on), and what it refers to that the walk had not reached is sent
+    /// on ([`Self::follow`]). Nothing is begun once the front end says the build stopped.
+    ///
+    /// Safe to run again from its start, as a visit whose wait gave way is
+    /// ([`Worklist::run`]): an entry that holds its node is not described again, and what a
+    /// first run sent on has its entries, so a second sends only the rest.
+    fn visit(
+        &self,
+        walking: &Walking<'_, FrontInstance<B>, FrontStatic<B>>,
+        ask: &Ask<FrontInstance<B>, FrontStatic<B>>,
+    ) {
+        if self.frontend.stopped() {
+            walking.stopped.store(true, Ordering::Relaxed);
+            walking.work.halt();
+            return;
+        }
+        match ask {
+            Ask::Function(entry, step) => {
+                let made = match entry.made.get() {
+                    Some(made) => made,
+                    None => {
+                        let made = self
+                            .described(&entry.asked, walking.round, walking.counts)
+                            .and_then(|it| self.node(&entry.asked.0, entry.asked.1, it));
+                        match entry.made.set(made) {
+                            Ok(made) => made,
+                            Err(refused) => {
+                                walking.twice(self.frontend.spell(&entry.asked.0));
+                                refused.kept
+                            }
+                        }
+                    }
+                };
+                if let Ok(node) = made {
+                    self.follow(walking, &node.described.refs, node.described.origin, step);
+                }
+            }
+            Ask::Static(entry, step) => {
+                let made = match entry.made.get() {
+                    Some(made) => made,
+                    None => {
+                        let made = self
+                            .frontend
+                            .describe_static(&entry.value)
+                            .and_then(|it| self.static_node(&entry.value, it));
+                        match entry.made.set(made) {
+                            Ok(made) => made,
+                            Err(refused) => {
+                                // alloc: the error's name of the static
+                                walking.twice(format!("static {:?}", entry.value));
+                                refused.kept
+                            }
+                        }
+                    }
+                };
+                if let Ok(node) = made {
+                    self.follow(walking, &node.described.refs, node.described.origin, step);
+                }
+            }
+        }
+    }
+
+    /// Sends on what `refs`, the references of a function or static at `step` asked for by
+    /// `requester`'s code, reach that the walk has no entry of, and hints them to the front
+    /// end.
+    fn follow(
+        &self,
+        walking: &Walking<'_, FrontInstance<B>, FrontStatic<B>>,
+        refs: &[FrontRef<FrontInstance<B>, FrontStatic<B>>],
+        requester: Origin,
+        step: &Arc<Step>,
+    ) {
+        // alloc: per describe, what it may newly reach: often nothing
+        let (mut functions, mut statics) = (Vec::new(), Vec::new());
+        for it in refs {
+            match it {
+                FrontRef::Function(callee) => {
+                    // clone: the walk's handle of a callee; who asks for it is a copy
+                    let asked = (callee.clone(), requester);
+                    if !walking.frontier.has_function(&asked) {
+                        functions.push(asked);
+                    }
+                }
+                FrontRef::Static(value) if !walking.frontier.has_static(value) => {
+                    statics.push(value.clone()); // clone: the walk's handle of a static
+                }
+                FrontRef::Static(_) | FrontRef::Extern(_) | FrontRef::Weak(_) => {}
+            }
+        }
+        if functions.is_empty() && statics.is_empty() {
+            return;
+        }
+        let (functions, statics) = self.send(walking, functions, statics, Some(step));
+        walking.hints.tell(self.frontend, functions, statics);
+    }
+
+    /// Makes the walk's entry of each of `functions` and `statics`, reached from `from`
+    /// (`None`: roots), that has none, and sends each entry this call made to the worklist,
+    /// its place on its path with it; a function past the recursion limit there is left
+    /// with its entry and no describe (deferred: [`recursion::check`] may send it back).
+    /// Gives those sent. One of two calls that reach an instance at once makes its entry, so
+    /// each is sent once.
+    ///
+    /// The front end counts the functions before any entry is made, as that may wait; from
+    /// the first entry on nothing waits, so an entry made is an entry sent even when the
+    /// visit this is part of is run again.
+    fn send(
+        &self,
+        walking: &Walking<'_, FrontInstance<B>, FrontStatic<B>>,
+        functions: Vec<(FrontInstance<B>, Origin)>,
+        statics: Vec<FrontStatic<B>>,
+        from: Option<&Arc<Step>>,
+    ) -> (Vec<(FrontInstance<B>, Origin)>, Vec<FrontStatic<B>>) {
+        let counted = match functions.is_empty() {
+            true => Vec::new(), // alloc: none, empty
+            false => {
+                let _span = tracing::info_span!(
+                    target: "blaze",
+                    "recursion limit: count",
+                    functions = functions.len(),
+                )
+                .entered();
+                self.frontend.counted(&functions)
+            }
+        };
+        let miscounted = (counted.len() != functions.len())
+            .then(|| recursion::miscounted(self.frontend, &functions, counted.len()));
+        // alloc: per describe that reaches something new, those it sends
+        let mut sent = Vec::with_capacity(functions.len());
+        for (at, asked) in functions.into_iter().enumerate() {
+            let Some(entry) = walking.frontier.claim_function(asked, from) else { continue };
+            // A fresh entry, which only this call writes: neither write is refused.
+            if let Some(why) = &miscounted {
+                // clone: an error, once per function the front end left uncounted
+                _ = entry.made.set(Err(why.clone()));
+                continue;
+            }
+            let counted = counted[at];
+            _ = entry.counted.put(counted);
+            if let Some(step) = Step::place(from, &counted) {
+                // clone: the walk's handle of the function, for the front end's hint
+                sent.push(entry.asked.clone());
+                walking.work.push(Ask::Function(entry, step));
+            }
+        }
+        // alloc: as above
+        let mut sent_statics = Vec::with_capacity(statics.len());
+        for value in statics {
+            let Some(entry) = walking.frontier.claim_static(value, from) else { continue };
+            // clone: the walk's handle of the static, for the front end's hint
+            sent_statics.push(entry.value.clone());
+            walking.work.push(Ask::Static(entry, Step::place_static(from)));
+        }
+        (sent, sent_statics)
+    }
+
     /// Every instance and static the roots reach, each with its places resolved, and what
     /// the walk did ([`Walk`]). With `order`, each function's key is pushed to it once, in the
     /// order the walk reached it.
     ///
     /// The walk reaches everything from the roots again every build: one hash lookup and a
     /// few vector pushes a function, with no describe of one whose kept describe still holds
-    /// ([`Self::described`]). Every pass after the levels (what the build's own roots reach,
-    /// the order, the slots, the places, what each builds in) is over the walk's own tables,
-    /// linear in its functions and references, each under its span.
+    /// ([`Self::described`]). Every pass after the describes (the walk's order, what the
+    /// build's own roots reach, the slots, the places, what each builds in) is over the
+    /// walk's own tables, linear in its functions and references, each under its span.
     fn walk(
         &self,
         roots: &[(FrontInstance<B>, Origin)],
@@ -2011,182 +2371,192 @@ impl<'a, B: Prepare> Build<'a, B> {
             blaze_hash::HashMap::new_in(Global);
         let mut asked: HashMap<(FrontInstance<B>, Origin), InstanceKey> = HashMap::new();
         let mut static_asked: HashMap<FrontStatic<B>, StaticId> = HashMap::new();
-        // Every function and static reached, what each refers to and the paths rustc's
-        // recursion limit counts on (`recursion`).
-        let mut graph = recursion::Graph::new();
-        let mut level = graph.start(roots, static_roots, check);
         let ordered = order.as_deref().map_or(0, Vec::len);
+        // Of the walk's last round: whether a check root is none of the build's, and what
+        // the recursion limit read of each function (for a walk that is kept).
+        let mut checks_more;
+        // alloc: per build that keeps its walk, a count a function
+        let mut counted = Vec::new();
         let mut round = 1;
         loop {
-            if level.is_empty() {
-                // rustc's recursion limit, over everything described: it may send instances
-                // the levels deferred back to be described first.
-                if graph.check(self.frontend, &mut level, errors) {
-                    continue;
-                }
-                // The walk runs a second time where the first closed facts of the whole
-                // program that bodies are built against (`Frontend::closed`): it describes
-                // each instance again, as its code and references may now be others. A third
-                // is never needed: the second's facts are the first's, or the front end's
-                // error.
-                if !errors.is_empty() {
-                    break;
-                }
-                match self.frontend.closed() {
-                    Ok(false) => break,
-                    Ok(true) if round == 1 => {}
-                    Ok(true) => {
-                        errors.push(error(
-                            InstanceKey(ContentId::default()),
-                            ItemKey(ContentId::default()),
-                            // alloc: the error's message
-                            format!(
-                                "the front end made new facts of the whole program after walk \
-                                 {round}, which the bodies it described were built against"
-                            ),
-                        ));
-                        break;
-                    }
-                    Err(why) => {
-                        errors.push(why);
-                        break;
-                    }
-                }
-                round += 1;
-                tracing::info!(target: "blaze", round, "the walk runs again over the program's facts");
-                nodes.clear();
-                statics.clear();
-                asked.clear();
-                static_asked.clear();
-                described_statics.clear();
-                described_functions.clear();
-                if let Some(order) = order.as_deref_mut() {
-                    order.truncate(ordered);
-                }
-                level = graph.start(roots, static_roots, check);
-                continue;
+            // Everything the roots reach, described on all cores as it is reached
+            // ([`Self::found`]), then put in the walk's one order ([`frontier::Order`]).
+            let (found, stopped_early, refused) =
+                self.found(roots, static_roots, check, round - 1, &counts);
+            let ordering = tracing::info_span!(
+                target: "blaze",
+                "codegen walk order",
+                round,
+                items = found.items.len(),
+            )
+            .entered();
+            checks_more = found.checks_more;
+            if keeps {
+                counted = found.counts();
             }
-            if self.frontend.stopped() {
+            // What the front end closes the program's facts over, if the walk has no error.
+            let (told, told_statics) = found.reached();
+            // The walk is over, and the order holds each entry alone: its node moves out.
+            // alloc: per build, one per function and static the walk reached
+            let mut items: Vec<_> = found.items.into_iter().map(Some).collect();
+            // In the order the walk followed references by, the same for every schedule of
+            // its describes: so the describe a key keeps, the errors' order and a lazy
+            // build's order are the program's, never the schedule's.
+            for item in found.followed {
+                let Some(frontier::Item { of, .. }) = items[item as usize].take() else {
+                    continue;
+                };
+                match of {
+                    frontier::Of::Function(entry) => {
+                        let (asked_for, made) = match Arc::try_unwrap(entry) {
+                            Ok(entry) => (entry.asked, entry.made.into_inner()),
+                            // clone: an entry something else still holds, which the walk
+                            // gives none: its key, and its node's handles
+                            Err(shared) => (shared.asked.clone(), shared.made.get().cloned()),
+                        };
+                        let node = match made {
+                            Some(Ok(node)) => node,
+                            Some(Err(why)) => {
+                                errors.push(why);
+                                continue;
+                            }
+                            // Past the limit on every path the check claims it by, which the
+                            // check's error says; or never begun, by a build that stopped.
+                            None => continue,
+                        };
+                        let key = node.unit.instance.key();
+                        if keeps {
+                            // clone: per build that keeps its walk, the function's handle and a count
+                            described_functions.push((asked_for.clone(), node.described.clone()));
+                        }
+                        asked.insert(asked_for, key);
+                        match nodes.entry(key) {
+                            blaze_hash::hash_map::Entry::Vacant(slot) => {
+                                if let Some(order) = order.as_deref_mut() {
+                                    order.push(key);
+                                }
+                                slot.insert(node);
+                            }
+                            // One key described twice (an `asm!` function asked for by a dependency
+                            // and the workspace, a generic made for arguments its code reads alike)
+                            // is the image's if either says so, and then is the image's describer's
+                            // whole: its code is the key's either way, and the image's copy refers
+                            // to what that describer's references are, never the workspace's.
+                            // Two describes under one key that disagree on what the code is mean the
+                            // key misses an input (rule 21): refused, never one kept silently.
+                            blaze_hash::hash_map::Entry::Occupied(mut it) => {
+                                let (kept, new) = (&it.get().described, &node.described);
+                                if kept.code != new.code
+                                    || kept.template_code != new.template_code
+                                    || kept.anchors != new.anchors
+                                    || kept.built_in_code != new.built_in_code
+                                    || kept.built_in.len() != new.built_in.len()
+                                    || kept.refs.len() != new.refs.len()
+                                {
+                                    errors.push(error(
+                                        key,
+                                        new.item,
+                                        // alloc: the error's message
+                                        format!(
+                                            "`{}` and `{}` have one instance key {key:?} but other code: \
+                                             code {:?} against {:?}, template code {:?} against {:?}, \
+                                             built in as {:?} against {:?}, {} \
+                                             built-in callees against {}, {} references against {}; the \
+                                             key misses an input their code reads",
+                                            kept.name,
+                                            new.name,
+                                            kept.code,
+                                            new.code,
+                                            kept.template_code,
+                                            new.template_code,
+                                            kept.built_in_code,
+                                            new.built_in_code,
+                                            kept.built_in.len(),
+                                            new.built_in.len(),
+                                            kept.refs.len(),
+                                            new.refs.len(),
+                                        ),
+                                    ));
+                                } else {
+                                    let least = it.get().least_origin.min(node.least_origin);
+                                    if new.owner < kept.owner {
+                                        it.insert(node);
+                                    }
+                                    it.get_mut().least_origin = least;
+                                }
+                            }
+                        }
+                    }
+                    frontier::Of::Static(entry) => {
+                        let (value, made) = match Arc::try_unwrap(entry) {
+                            Ok(entry) => (entry.value, entry.made.into_inner()),
+                            // clone: as a function's above
+                            Err(shared) => (shared.value.clone(), shared.made.get().cloned()),
+                        };
+                        let node = match made {
+                            Some(Ok(node)) => node,
+                            Some(Err(why)) => {
+                                errors.push(why);
+                                continue;
+                            }
+                            None => continue,
+                        };
+                        let id = (node.described.item, node.described.instance);
+                        if keeps {
+                            // clone: per build that keeps its walk, the static's handle and describe
+                            described_statics.push((value.clone(), node.described.clone()));
+                        }
+                        static_asked.insert(value, id);
+                        statics.entry(id).or_insert(node);
+                    }
+                }
+            }
+            drop(ordering);
+            // The recursion limit's refusals, and a write the walk's tables refused, after
+            // the describes' own errors.
+            errors.extend(refused);
+            if stopped_early {
                 errors.push(stopped());
                 break;
             }
-            // Before the level is described: an instance past the limit on the levels' path is
-            // deferred, never described by them, and what it reaches never walked from it.
-            graph.level(self.frontend, &mut level, errors);
-            self.frontend.reached(&level.functions, &level.statics);
-            // The span of a describe is the front end's, opened where it describes
-            // (`hir-ty-codegen`'s `codegen describe`, named for its function): a kept describe
-            // the front end says still holds opens none, so the spans of a level are the
-            // functions it described.
-            // alloc: per build, sized by its units
-            let described: Vec<_> = par::map(&level.functions, |asked| {
-                self.described(asked, round - 1, &counts)
-                    .and_then(|it| self.node(&asked.0, asked.1, it))
-            });
-            // alloc: per build, sized by its units
-            let level_statics: Vec<_> = par::map(&level.statics, |value| {
-                self.frontend.describe_static(value).and_then(|it| self.static_node(value, it))
-            });
-            let current = std::mem::replace(&mut level, recursion::Level::new());
-            let functions = current
-                .functions
-                .into_iter()
-                .zip(current.function_items)
-                .zip(current.function_from);
-            for (((asked_for, item), at), node) in functions.zip(described) {
-                let node = match node {
-                    Ok(node) => node,
-                    Err(why) => {
-                        graph.failed(item);
-                        errors.push(why);
-                        continue;
-                    }
-                };
-                let key = node.unit.instance.key();
-                if keeps {
-                    // clone: per build that keeps its walk, the function's handle and a count
-                    described_functions.push((asked_for.clone(), node.described.clone()));
+            // The walk runs a second time where the first closed facts of the whole
+            // program that bodies are built against (`Frontend::closed`): it describes
+            // each instance again, as its code and references may now be others. A third
+            // is never needed: the second's facts are the first's, or the front end's
+            // error.
+            if !errors.is_empty() {
+                break;
+            }
+            match self.frontend.closed(&told, &told_statics) {
+                Ok(false) => break,
+                Ok(true) if round == 1 => {}
+                Ok(true) => {
+                    errors.push(error(
+                        InstanceKey(ContentId::default()),
+                        ItemKey(ContentId::default()),
+                        // alloc: the error's message
+                        format!(
+                            "the front end made new facts of the whole program after walk \
+                             {round}, which the bodies it described were built against"
+                        ),
+                    ));
+                    break;
                 }
-                asked.insert(asked_for, key);
-                let origin = node.described.origin;
-                graph.described(item, &node.described.refs, &origin, at, &mut level);
-                match nodes.entry(key) {
-                    blaze_hash::hash_map::Entry::Vacant(slot) => {
-                        if let Some(order) = order.as_deref_mut() {
-                            order.push(key);
-                        }
-                        slot.insert(node);
-                    }
-                    // One key described twice (an `asm!` function asked for by a dependency
-                    // and the workspace, a generic made for arguments its code reads alike)
-                    // is the image's if either says so, and then is the image's describer's
-                    // whole: its code is the key's either way, and the image's copy refers
-                    // to what that describer's references are, never the workspace's.
-                    // Two describes under one key that disagree on what the code is mean the
-                    // key misses an input (rule 21): refused, never one kept silently.
-                    blaze_hash::hash_map::Entry::Occupied(mut it) => {
-                        let (kept, new) = (&it.get().described, &node.described);
-                        if kept.code != new.code
-                            || kept.template_code != new.template_code
-                            || kept.anchors != new.anchors
-                            || kept.built_in_code != new.built_in_code
-                            || kept.built_in.len() != new.built_in.len()
-                            || kept.refs.len() != new.refs.len()
-                        {
-                            errors.push(error(
-                                key,
-                                new.item,
-                                // alloc: the error's message
-                                format!(
-                                    "`{}` and `{}` have one instance key {key:?} but other code: \
-                                     code {:?} against {:?}, template code {:?} against {:?}, \
-                                     built in as {:?} against {:?}, {} \
-                                     built-in callees against {}, {} references against {}; the \
-                                     key misses an input their code reads",
-                                    kept.name,
-                                    new.name,
-                                    kept.code,
-                                    new.code,
-                                    kept.template_code,
-                                    new.template_code,
-                                    kept.built_in_code,
-                                    new.built_in_code,
-                                    kept.built_in.len(),
-                                    new.built_in.len(),
-                                    kept.refs.len(),
-                                    new.refs.len(),
-                                ),
-                            ));
-                        } else {
-                            let least = it.get().least_origin.min(node.least_origin);
-                            if new.owner < kept.owner {
-                                it.insert(node);
-                            }
-                            it.get_mut().least_origin = least;
-                        }
-                    }
+                Err(why) => {
+                    errors.push(why);
+                    break;
                 }
             }
-            let statics_of =
-                current.statics.into_iter().zip(current.static_items).zip(current.static_from);
-            for (((value, item), at), node) in statics_of.zip(level_statics) {
-                let node = match node {
-                    Ok(node) => node,
-                    Err(why) => {
-                        graph.failed(item);
-                        errors.push(why);
-                        continue;
-                    }
-                };
-                let id = (node.described.item, node.described.instance);
-                if keeps {
-                    // clone: per build that keeps its walk, the static's handle and describe
-                    described_statics.push((value.clone(), node.described.clone()));
-                }
-                static_asked.insert(value, id);
-                let origin = node.described.origin;
-                graph.described(item, &node.described.refs, &origin, at, &mut level);
-                statics.entry(id).or_insert(node);
+            round += 1;
+            tracing::info!(target: "blaze", round, "the walk runs again over the program's facts");
+            nodes.clear();
+            statics.clear();
+            asked.clear();
+            static_asked.clear();
+            described_statics.clear();
+            described_functions.clear();
+            if let Some(order) = order.as_deref_mut() {
+                order.truncate(ordered);
             }
         }
         // What a check root alone reaches ([`CheckRoot`]) was described for the recursion
@@ -2199,7 +2569,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             statics = statics.len(),
         )
         .entered();
-        if graph.checks_more() {
+        if checks_more {
             // alloc: per build, what its own roots reach
             let mut functions: blaze_hash::HashSet<InstanceKey, Global> =
                 blaze_hash::HashSet::new_in(Global);
@@ -2447,7 +2817,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         let roots = roots.iter().filter_map(|it| asked.get(it).copied()).collect();
         let side = (keeps && errors.is_empty()).then(|| patch::Side {
             asked,
-            counted: graph.counts(),
+            counted,
             described: described_functions,
             statics: described_statics,
         });
@@ -4748,15 +5118,20 @@ mod owners;
 pub use owners::Owner;
 mod delta;
 pub use delta::{BuiltId, Changes, Delta, Fresh};
+mod frontier;
+use frontier::{Frontier, Order};
 mod kept;
 pub use kept::{Kept, Walk, Work};
 mod later;
 mod lists;
 mod patch;
 mod recursion;
+use recursion::Step;
 mod rows;
 mod support;
+mod worklist;
 pub use later::{Later, Walked, runs_at_start};
+use worklist::Worklist;
 pub mod digests;
 pub use digests::{Digests, static_definition};
 

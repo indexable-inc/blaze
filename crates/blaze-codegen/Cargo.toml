@@ -27,6 +27,7 @@ blaze-mem.workspace = true
 blaze-query.workspace = true
 blaze-serde.workspace = true
 blaze-store-check.workspace = true
+crossbeam-queue.workspace = true
 hashbrown.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
