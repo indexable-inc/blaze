@@ -414,6 +414,42 @@ fn gen_ran(out_dir: &str, cfg: &str) -> Ran {
     }
 }
 
+/// The invariant: a build script's crate is made from its package's files, never from what
+/// its own run left. Applying the run puts `gen.rs` into the package's source root, whose
+/// content moves, and the library given that `OUT_DIR` is made from it; the script's own
+/// crate, of the same source root and given no `OUT_DIR`, has the content and the identity
+/// it had before the run ([`base_db::crate_root_content`]).
+///
+/// Its control is the tree before `crate_root_content`: every key took the root's content
+/// whole, so the first assertion on the script failed, and with it the first build after a
+/// cold one compiled the script again (the revision test
+/// `the_first_edit_after_a_cold_build_with_a_build_script_dependency`).
+#[test]
+fn a_run_applied_leaves_its_build_scripts_crate_as_it_was() {
+    let units = units();
+    let mut built = lowered(&units).unwrap();
+    let (script, lib) = (krate(&built, BUILD_SCRIPT), krate(&built, LIB));
+    let seen = |built: &mut Built| {
+        let db = built.lowered.db();
+        let root = db.file_source_root(script.data(db).root_file_id).source_root_id(db);
+        assert_eq!(root, db.file_source_root(lib.data(db).root_file_id).source_root_id(db));
+        let whole = db.source_root(root).content(db);
+        let own = (base_db::crate_root_content(db, script), base_db::crate_root_content(db, lib));
+        assert_eq!(base_db::other_out_dirs(db, script), [OUT_DIR.to_owned()]);
+        assert!(base_db::other_out_dirs(db, lib).is_empty());
+        (whole, own.0, own.1, built.lowered.identity(BUILD_SCRIPT), built.lowered.identity(LIB))
+    };
+    let before = seen(&mut built);
+    built.lowered.ran(RUN, &gen_ran(OUT_DIR, "made")).unwrap();
+    let after = seen(&mut built);
+    assert_ne!(before.0, after.0, "the run's file is in the package's source root");
+    assert_eq!(before.1, after.1, "the build script's crate is not made from its run's file");
+    assert_ne!(before.2, after.2, "the library given the `OUT_DIR` is");
+    assert_eq!(before.3, after.3, "the build script's identity stands");
+    assert_ne!(before.4, after.4, "the library's moves");
+    assert_eq!(after.2, after.0, "a crate whose root holds no other crate's `OUT_DIR` has the root's own content");
+}
+
 /// Whether `krate`'s cfg holds a [`crates::RUN_PROFILE`] atom.
 fn has_run_profile(db: &Db, krate: Crate) -> bool {
     krate.cfg_options(db).into_iter().any(
