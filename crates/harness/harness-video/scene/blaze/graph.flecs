@@ -1,0 +1,42 @@
+// Beat 2, the graph: a calm field of nodes, everything cached. One is edited: a ring leaves it and lights only it and
+// its few readers; the rest stay dark.
+const t = $t_graph
+const edit = 1.5
+
+@tree ChildOf
+film {
+  graph_shot { Cue: {member: "Backdrop.shot", from: 2, to: 2, at: $t, dur: 0, ease: Linear} }
+  graph_at { Cue: {member: "Backdrop.at", from: $t, to: $t, at: $t, dur: 0, ease: Linear} }
+  graph_a { Cue: {member: "Backdrop.a", from: $edit, to: $edit, at: $t, dur: 0, ease: Linear} }
+  graph_caps : film_part.Under {
+    slot : film_part.Slot {
+      calm : film_part.Caption {
+        Text: {s: "all cached"}
+        cue.Arrive show(at: $t + 0.2, dur: 0.1)
+        cue.Pop pop(at: $t + 0.2)
+        cue.Leave hide(at: $t + 1.3)
+      }
+      one : film_part.Caption {
+        Text: {s: "one edit"}
+        Fill: $tone_film_accent
+        cue.Arrive show(at: $t + $edit, dur: 0.1)
+        cue.Pop pop(at: $t + $edit)
+        cue.Leave hide(at: $t + $edit + 1.2)
+      }
+      only : film_part.Caption {
+        Text: {s: "only this reruns"}
+        cue.Arrive show(at: $t + $edit + 1.4, dur: 0.1)
+        cue.Pop pop(at: $t + $edit + 1.4)
+        cue.Leave hide(at: $t + 4.2)
+      }
+    }
+    low : film_part.Low {}
+  }
+  // Sound: the edit is a key and a clear note; the ring a soft sweep; each reader a small bell as it lights.
+  graph_key : voice.Click { Onset: {at: $t + $edit}; Pitch: {hz: 2800}; Gain: {amp: 0.09} }
+  graph_note : voice.Mallet { Onset: {at: $t + $edit}; Pitch: {hz: 440}; Gain: {amp: 0.1}; Lasts: {dur: 2.2} }
+  graph_ring : voice.Whoosh { Onset: {at: $t + $edit}; Lasts: {dur: 1.0}; Pitch: {hz: 2200}; Gain: {amp: 0.035}; Pan: {pos: -0.2, sweep: 0.6} }
+  for i in 0..5 {
+    "graph_reader_{i}" : voice.Bell { Onset: {at: $t + $edit + 0.42 + i * 0.07}; Pitch: {hz: 880 + i * 110}; Gain: {amp: 0.035}; Lasts: {dur: 1.2}; Pan: {pos: -0.4 + i * 0.2, sweep: 0} }
+  }
+}

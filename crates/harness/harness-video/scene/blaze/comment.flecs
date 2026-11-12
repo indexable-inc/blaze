@@ -1,0 +1,63 @@
+// A race: a comment is edited, then the program run. Every lane's time is its row in the data file.
+const t = $t_comment
+const go = $t + $film_lead
+
+@tree ChildOf
+film {
+  comment_shot { Cue: {member: "Backdrop.shot", from: 1, to: 1, at: $t, dur: 0, ease: Linear} }
+  comment_at { Cue: {member: "Backdrop.at", from: $go, to: $go, at: $t, dur: 0, ease: Linear} }
+  comment_a { Cue: {member: "Backdrop.a", from: $film_pace * $d_rows_comment_blaze_share, to: $film_pace * $d_rows_comment_blaze_share, at: $t, dur: 0, ease: Linear} }
+  comment_b { Cue: {member: "Backdrop.b", from: $film_pace * $d_rows_comment_relax_share, to: $film_pace * $d_rows_comment_relax_share, at: $t, dur: 0, ease: Linear} }
+  comment_c { Cue: {member: "Backdrop.c", from: $film_pace * $d_rows_comment_cargo_share, to: $film_pace * $d_rows_comment_cargo_share, at: $t, dur: 0, ease: Linear} }
+  comment_lanes : film_part.Layer {
+    cue.CutIn enter(at: $t)
+    cue.CutOut leave(at: $t_start)
+    blaze : film_part.Lane {
+      who : film_part.Who { Text: {s: $d_who_blaze}; Fill: $tone_film_accent }
+      took : film_part.Took {
+        Fill: $tone_film_accent
+        Tally: {value: 0, decimals: 1, unit: " {d_rows_comment_unit}"}
+        cue.Count count(at: $go, dur: $film_pace * $d_rows_comment_blaze_share, from: 0, to: $d_rows_comment_blaze)
+      }
+      // Sound: it leaves with a whoosh and lands with a hit, where its light does.
+      off : voice.Whoosh { Onset: {at: $go - 0.05}; Lasts: {dur: $film_pace * $d_rows_comment_blaze_share + 0.1}; Pitch: {hz: 2600}; Gain: {amp: 0.05}; Pan: {pos: -0.7, sweep: 1.4} }
+      land : voice.Mallet { Onset: {at: $go + $film_pace * $d_rows_comment_blaze_share}; Pitch: {hz: 493.88}; Gain: {amp: 0.11}; Lasts: {dur: 1.2}; Pan: {pos: 0.6, sweep: 0} }
+      snap : voice.Click { Onset: {at: $go + $film_pace * $d_rows_comment_blaze_share}; Pitch: {hz: 3200}; Gain: {amp: 0.07}; Pan: {pos: 0.6, sweep: 0} }
+    }
+    relax : film_part.Lane {
+      who : film_part.Who { Text: {s: $d_who_relax}; Fill: $tone_film_other }
+      took : film_part.Took {
+        Fill: $tone_film_other
+        Tally: {value: 0, decimals: 1, unit: " {d_rows_comment_unit}"}
+        cue.Count count(at: $go, dur: $film_pace * $d_rows_comment_relax_share, from: 0, to: $d_rows_comment_relax)
+      }
+      // Sound: it leaves with a whoosh and lands with a hit, where its light does.
+      off : voice.Whoosh { Onset: {at: $go - 0.05}; Lasts: {dur: $film_pace * $d_rows_comment_relax_share + 0.1}; Pitch: {hz: 2100}; Gain: {amp: 0.03}; Pan: {pos: -0.7, sweep: 1.4} }
+      land : voice.Mallet { Onset: {at: $go + $film_pace * $d_rows_comment_relax_share}; Pitch: {hz: 370.41}; Gain: {amp: 0.07}; Lasts: {dur: 1.2}; Pan: {pos: 0.6, sweep: 0} }
+      snap : voice.Click { Onset: {at: $go + $film_pace * $d_rows_comment_relax_share}; Pitch: {hz: 2600}; Gain: {amp: 0.07}; Pan: {pos: 0.6, sweep: 0} }
+    }
+    cargo : film_part.Lane {
+      who : film_part.Who { Text: {s: $d_who_cargo}; Fill: $tone_film_other }
+      took : film_part.Took {
+        Fill: $tone_film_other
+        Tally: {value: 0, decimals: 1, unit: " {d_rows_comment_unit}"}
+        cue.Count count(at: $go, dur: $film_pace * $d_rows_comment_cargo_share, from: 0, to: $d_rows_comment_cargo)
+      }
+      // Sound: it leaves with a whoosh and lands with a hit, where its light does.
+      off : voice.Whoosh { Onset: {at: $go - 0.05}; Lasts: {dur: $film_pace * $d_rows_comment_cargo_share + 0.1}; Pitch: {hz: 1600}; Gain: {amp: 0.03}; Pan: {pos: -0.7, sweep: 1.4} }
+      land : voice.Mallet { Onset: {at: $go + $film_pace * $d_rows_comment_cargo_share}; Pitch: {hz: 246.94}; Gain: {amp: 0.07}; Lasts: {dur: 1.2}; Pan: {pos: 0.6, sweep: 0} }
+      snap : voice.Click { Onset: {at: $go + $film_pace * $d_rows_comment_cargo_share}; Pitch: {hz: 2000}; Gain: {amp: 0.07}; Pan: {pos: 0.6, sweep: 0} }
+    }
+  }
+  comment_caps : film_part.Under {
+    slot : film_part.Slot {
+      what : film_part.Caption {
+        Text: {s: $d_rows_comment_label}
+        cue.Arrive show(at: $t + 0.1, dur: 0.1)
+        cue.Pop pop(at: $t + 0.1)
+        cue.Leave hide(at: $t + 3.4)
+      }
+    }
+    low : film_part.Low {}
+  }
+}

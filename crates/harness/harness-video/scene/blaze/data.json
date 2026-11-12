@@ -1,97 +1,80 @@
 {
-  "about": "Every number the film shows (film.flecs and its shots). harness-video turns each leaf into a d_* constant the scenes name (src/data.rs); no number is typed into a scene. Re-measure, edit this file, render again. Rows where blaze is behind are shown as they are.",
+  "about": "Every number the film shows (film.flecs and its beats). harness-video turns each leaf into a d_* constant the scenes name (src/data.rs); no number is typed into a scene. Re-measure, edit this file, render again. A row is shown as measured or left out.",
   "when": "2026-11-11",
-  "program": "hello-world",
-  "machine": "Apple-silicon Mac, 18 cores, under load",
-  "conditions": "hello-world · Apple-silicon Mac, 18 cores, machine under load · 2026-11-11 · medians · fixed environment, every run's output checked",
-  "relax": "Relax is makepad's Rust JIT (github.com/makepad/relax)",
-  "status": "measured on a loaded machine; to be re-measured on a quiet one",
+  "conditions": "hello-world · Apple-silicon Mac, 18 cores · 2026-11-11",
+  "method": "medians; fixed environment; every run's output checked; measured the evening of 2026-11-11",
+  "who": {
+    "blaze": "blaze",
+    "relax": "Relax",
+    "relax_is": "makepad's Rust JIT (github.com/makepad/relax)",
+    "cargo": "cargo",
+    "cargo_is": "`cargo +nightly-2026-10-27 run -q`, used as a stopwatch on the same program"
+  },
   "rows": {
     "start": {
-      "label": "client start",
-      "unit": "ms", "compare": ["blaze", "relax"],
-      "blaze": 5.3, "relax": 9.3,
-      "source": "the owner's measurement of 2026-11-11, medians",
-      "conditions": "hello-world; Apple-silicon Mac, 18 cores, under load; fixed environment; every run's output checked"
+      "label": "client start", "unit": "ms", "compare": ["blaze", "relax"],
+      "blaze": 4.2, "relax": 7.6,
+      "source": "the owner's measurement, 2026-11-11 evening, medians",
+      "conditions": "hello-world; Apple-silicon Mac, 18 cores; fixed environment; every run's output checked"
     },
     "noop": {
-      "label": "no-op run",
-      "unit": "ms", "compare": ["blaze", "relax"],
-      "blaze": 15.1, "blaze_range": {"low": 10.6, "high": 52.4}, "relax": 37.8,
-      "source": "the owner's measurement of 2026-11-11, medians; blaze's range over its runs",
-      "conditions": "hello-world; Apple-silicon Mac, 18 cores, under load; fixed environment; every run's output checked"
+      "label": "no-op run", "unit": "ms", "compare": ["blaze", "relax", "cargo"],
+      "blaze": 11.9, "relax": 26.2, "cargo": 43.2,
+      "source": "the owner's measurement, 2026-11-11 evening, medians",
+      "conditions": "hello-world; Apple-silicon Mac, 18 cores; fixed environment; every run's output checked"
     },
     "comment": {
-      "label": "comment edit, then run",
-      "unit": "ms", "compare": ["blaze", "relax"],
-      "blaze": 51.7, "relax": 91.2,
-      "source": "the owner's measurement of 2026-11-11, medians",
-      "conditions": "hello-world; Apple-silicon Mac, 18 cores, under load; fixed environment; every run's output checked"
+      "label": "comment edit", "unit": "ms", "compare": ["blaze", "relax", "cargo"],
+      "blaze": 47.6, "relax": 58.2, "cargo": 184.5,
+      "what": "a comment is edited, then the program is run",
+      "source": "the owner's measurement, 2026-11-11 evening, medians",
+      "conditions": "hello-world; Apple-silicon Mac, 18 cores; fixed environment; every run's output checked"
     },
     "body": {
-      "label": "body edit, then run",
-      "unit": "ms", "compare": ["blaze", "relax"],
-      "blaze": 166.3, "relax": 76.6,
-      "verdict": "blaze behind",
-      "source": "the owner's measurement of 2026-11-11, medians",
-      "conditions": "hello-world; Apple-silicon Mac, 18 cores, under load; fixed environment; every run's output checked"
+      "label": "body edit", "unit": "ms", "compare": ["blaze", "relax", "cargo"],
+      "blaze": 143.5, "relax": 53.7, "cargo": 155.2,
+      "what": "a function's body is edited, then the program is run",
+      "verdict": "Relax leads",
+      "source": "the owner's measurement, 2026-11-11 evening, medians",
+      "conditions": "hello-world; Apple-silicon Mac, 18 cores; fixed environment; every run's output checked"
     },
     "cold": {
-      "label": "cold first run",
-      "unit": "s", "compare": ["blaze", "relax"],
-      "blaze": 8.0, "relax": 0.30,
-      "verdict": "blaze behind",
-      "source": "the owner's measurement of 2026-11-11, medians (8.0 s and 0.30 s)",
-      "conditions": "hello-world; Apple-silicon Mac, 18 cores, under load; fixed environment; every run's output checked"
-    },
-    "memory": {
-      "label": "memory after a cold build and five edits",
-      "unit": "MB", "compare": ["blaze", "relax"],
-      "blaze": 5770, "relax": 88,
-      "blaze_what": "daemon", "relax_what": "peak, no daemon",
-      "verdict": "blaze behind",
-      "source": "the owner's measurement of 2026-11-11",
-      "conditions": "hello-world; Apple-silicon Mac, 18 cores, under load; blaze: its daemon after a cold build and five edits; Relax: peak, it has no daemon"
-    },
-    "disk": {
-      "label": "state on disk",
-      "unit": "MB", "compare": ["blaze", "relax"],
-      "blaze": 958, "relax": {"low": 58, "high": 89},
-      "verdict": "blaze behind",
-      "source": "the owner's measurement of 2026-11-11",
-      "conditions": "hello-world; Apple-silicon Mac, 18 cores; Relax's bar is drawn to the high end of its range"
+      "label": "cold start", "unit": "s", "compare": ["blaze", "relax", "cargo"],
+      "blaze": 9.5, "relax": 0.30, "cargo": 0.26,
+      "what": "the first run, nothing built or cached",
+      "verdict": "still behind",
+      "source": "the owner's measurement, 2026-11-11 evening, medians",
+      "conditions": "hello-world; Apple-silicon Mac, 18 cores; fixed environment; every run's output checked"
     }
   },
-  "engine": {
-    "title": "one day of fixes",
-    "conditions": "blaze's own per-edit engine work, before and after the fixes of 2026-11-11 · hello-world · Apple-silicon Mac, 18 cores",
+  "day": {
+    "title": "one day",
+    "conditions": "blaze, before and after the fixes of 2026-11-11; hello-world; Apple-silicon Mac, 18 cores",
     "reverified": {
-      "label": "cached results re-verified per body edit",
-      "compare": ["before", "after"],
+      "label": "re-verified per edit", "compare": ["before", "after"],
+      "what": "cached results re-verified for one edit",
       "before": 1091174, "after": 21067,
-      "source": "the owner's measurement of 2026-11-11, before and after the day's fixes",
-      "conditions": "hello-world; Apple-silicon Mac, 18 cores"
+      "source": "the owner's measurement, 2026-11-11"
     },
-    "launch": {
-      "label": "`run` launch step",
-      "unit": "ms",
-      "before": {"low": 219, "high": 390}, "after": 0.08,
-      "source": "the owner's measurement of 2026-11-11, before and after the day's fixes",
-      "conditions": "hello-world; Apple-silicon Mac, 18 cores"
-    },
-    "walk": {
-      "label": "changed-set walk on a broad change",
-      "unit": "ms",
-      "before": 465479, "after": 60,
-      "source": "the owner's measurement of 2026-11-11, before and after the day's fixes",
-      "conditions": "Apple-silicon Mac, 18 cores"
+    "noop": {
+      "label": "no-op run", "unit": "ms", "compare": ["before", "after"],
+      "before": 288, "after": 11.9,
+      "source": "the owner's measurement, 2026-11-11"
     },
     "body": {
-      "label": "body edit, then run",
-      "unit": "ms",
-      "before": 953, "after": 166,
-      "source": "the owner's measurement of 2026-11-11, over the day",
-      "conditions": "hello-world; Apple-silicon Mac, 18 cores, under load"
+      "label": "body edit", "unit": "ms", "compare": ["before", "after"],
+      "before": 953, "after": 143.5,
+      "source": "the owner's measurement, 2026-11-11"
+    },
+    "launch": {
+      "label": "launch step", "unit": "ms", "compare": ["before", "after"],
+      "before": {"low": 219, "high": 390}, "after": 0.08,
+      "source": "the owner's measurement, 2026-11-11; the beam starts at the high end of the before range"
+    },
+    "disk": {
+      "label": "on disk", "unit": "MB", "compare": ["before", "after"],
+      "before": 971, "after": 500,
+      "source": "the owner's measurement, 2026-11-11"
     }
   }
 }

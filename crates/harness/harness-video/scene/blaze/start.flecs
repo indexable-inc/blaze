@@ -1,0 +1,51 @@
+// A race: the client starting. Two lanes: the data has no cargo row for it.
+const t = $t_start
+const go = $t + $film_lead
+
+@tree ChildOf
+film {
+  start_shot { Cue: {member: "Backdrop.shot", from: 1, to: 1, at: $t, dur: 0, ease: Linear} }
+  start_at { Cue: {member: "Backdrop.at", from: $go, to: $go, at: $t, dur: 0, ease: Linear} }
+  start_a { Cue: {member: "Backdrop.a", from: $film_pace * $d_rows_start_blaze_share, to: $film_pace * $d_rows_start_blaze_share, at: $t, dur: 0, ease: Linear} }
+  start_b { Cue: {member: "Backdrop.b", from: $film_pace * $d_rows_start_relax_share, to: $film_pace * $d_rows_start_relax_share, at: $t, dur: 0, ease: Linear} }
+  start_c { Cue: {member: "Backdrop.c", from: 0, to: 0, at: $t, dur: 0, ease: Linear} }
+  start_lanes : film_part.Layer {
+    cue.CutIn enter(at: $t)
+    cue.CutOut leave(at: $t_bodyrace)
+    blaze : film_part.Lane {
+      who : film_part.Who { Text: {s: $d_who_blaze}; Fill: $tone_film_accent }
+      took : film_part.Took {
+        Fill: $tone_film_accent
+        Tally: {value: 0, decimals: 1, unit: " {d_rows_start_unit}"}
+        cue.Count count(at: $go, dur: $film_pace * $d_rows_start_blaze_share, from: 0, to: $d_rows_start_blaze)
+      }
+      // Sound: it leaves with a whoosh and lands with a hit, where its light does.
+      off : voice.Whoosh { Onset: {at: $go - 0.05}; Lasts: {dur: $film_pace * $d_rows_start_blaze_share + 0.1}; Pitch: {hz: 2600}; Gain: {amp: 0.05}; Pan: {pos: -0.7, sweep: 1.4} }
+      land : voice.Mallet { Onset: {at: $go + $film_pace * $d_rows_start_blaze_share}; Pitch: {hz: 554.36}; Gain: {amp: 0.11}; Lasts: {dur: 1.2}; Pan: {pos: 0.6, sweep: 0} }
+      snap : voice.Click { Onset: {at: $go + $film_pace * $d_rows_start_blaze_share}; Pitch: {hz: 3200}; Gain: {amp: 0.07}; Pan: {pos: 0.6, sweep: 0} }
+    }
+    relax : film_part.Lane {
+      who : film_part.Who { Text: {s: $d_who_relax}; Fill: $tone_film_other }
+      took : film_part.Took {
+        Fill: $tone_film_other
+        Tally: {value: 0, decimals: 1, unit: " {d_rows_start_unit}"}
+        cue.Count count(at: $go, dur: $film_pace * $d_rows_start_relax_share, from: 0, to: $d_rows_start_relax)
+      }
+      // Sound: it leaves with a whoosh and lands with a hit, where its light does.
+      off : voice.Whoosh { Onset: {at: $go - 0.05}; Lasts: {dur: $film_pace * $d_rows_start_relax_share + 0.1}; Pitch: {hz: 2100}; Gain: {amp: 0.03}; Pan: {pos: -0.7, sweep: 1.4} }
+      land : voice.Mallet { Onset: {at: $go + $film_pace * $d_rows_start_relax_share}; Pitch: {hz: 415.77}; Gain: {amp: 0.07}; Lasts: {dur: 1.2}; Pan: {pos: 0.6, sweep: 0} }
+      snap : voice.Click { Onset: {at: $go + $film_pace * $d_rows_start_relax_share}; Pitch: {hz: 2600}; Gain: {amp: 0.07}; Pan: {pos: 0.6, sweep: 0} }
+    }
+  }
+  start_caps : film_part.Under {
+    slot : film_part.Slot {
+      what : film_part.Caption {
+        Text: {s: $d_rows_start_label}
+        cue.Arrive show(at: $t + 0.1, dur: 0.1)
+        cue.Pop pop(at: $t + 0.1)
+        cue.Leave hide(at: $t + 3.2)
+      }
+    }
+    low : film_part.Low {}
+  }
+}

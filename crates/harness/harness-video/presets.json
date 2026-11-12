@@ -54,7 +54,7 @@
       "container": "mp4-moov-first"
     },
     "x-square-1080": {
-      "for": "X, 1:1, a subscribed account. A scene must be laid out square to use it.",
+      "for": "X, 1:1, a subscribed account. For a scene whose Video says `reframes`.",
       "width": 1080, "height": 1080, "fps": 60,
       "codec": "h264", "profile": "high", "pixel": "yuv420p8",
       "bitrate_kbps": 30000,
@@ -64,7 +64,7 @@
       "container": "mp4-moov-first"
     },
     "x-portrait-1080x1920": {
-      "for": "X, 9:16, a subscribed account. A scene must be laid out upright to use it.",
+      "for": "X, 9:16, a subscribed account (most short video is watched upright). For a scene whose Video says `reframes`.",
       "width": 1080, "height": 1920, "fps": 60,
       "codec": "h264", "profile": "high", "pixel": "yuv420p8",
       "bitrate_kbps": 40000,

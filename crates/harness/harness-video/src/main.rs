@@ -6,7 +6,9 @@
 //!
 //!     harness-video SCENE.flecs OUT.mp4 [PRESET]   the whole video, as PRESET (presets.json; with none, the YouTube HDR
 //!                                                  master), then read back and held to the preset (check.rs)
-//!     harness-video SCENE.flecs OUT.png AT         one frame, at AT seconds
+//!     harness-video SCENE.flecs OUT.png AT [PRESET] one frame, at AT seconds (PRESET: its shape, for a scene that reframes)
+//!     harness-video SCENE.flecs OUT.png contact [PRESET]   a contact sheet: one small frame a second, in one image
+//!     harness-video SCENE.flecs OUT.png burst AT [PRESET]  ten consecutive frames from AT, in one image
 //!     harness-video SCENE.flecs DIR/ EVERY         a frame every EVERY seconds, DIR/<ms>.png (to look the video over)
 //!     harness-video SCENE.flecs OUT.wav            the soundtrack alone, as it is in the video
 //!     harness-video SCENE.flecs sounds             every sound of the soundtrack, in time order
@@ -21,6 +23,7 @@
 //! the `cue.*` moves and `voice.*` voices, and the `hn.*` widgets), so a video names the same tokens and is made of the
 //! same parts as the app, and declares only what is its own. Its directory holds the media its `Picture`s name, and a
 //! `data.json` there becomes the scene's `d_*` constants before it loads (`data.rs`).
+mod backdrop;
 mod check;
 mod data;
 mod encode;
@@ -50,6 +53,10 @@ pub struct Video {
     pub fps: f32,
     pub seconds: f32,
     pub scale: f32,
+    /// The scene is laid out to be reframed (everything centre-weighted, sizes as shares of the frame): a preset of
+    /// another shape (upright, square) redraws it at that shape, in the same points a pixel. Without it such a preset
+    /// is refused.
+    pub reframes: bool,
 }
 
 /// The soundtrack's master, on the node that carries the [`Video`]: the mix is brought to `lufs` integrated (ITU-R
@@ -75,6 +82,8 @@ struct Stage {
     root: u64,
     /// The root's Mix, if it has one.
     mix: Option<Mix>,
+    /// The root has a Backdrop: the UI is drawn over a clear ground and laid over the picture.
+    pictured: bool,
 }
 
 impl Stage {
@@ -83,6 +92,7 @@ impl Stage {
         let world = harness_native::scene::world()?;
         world.component::<Video>().writable();
         world.component::<Mix>().writable();
+        world.component::<backdrop::Backdrop>().writable();
         let dir = scene.parent().ok_or_else(|| format!("{}: no directory", scene.display()))?;
         let path = scene.to_str().ok_or_else(|| format!("{}: not UTF-8", scene.display()))?;
         // The scene's numbers, as constants, before the scene names them.
@@ -138,7 +148,25 @@ impl Stage {
             Painter::new(TypeLook { code_scale: 1.0, plain: true, ..TypeLook::default() });
         painter.media = Some(dir.to_path_buf());
         let mix = world.world_ref().entity_from_id(root).try_cloned::<&Mix>();
-        Ok(Self { world, painter, video, root, mix })
+        let pictured = world.world_ref().entity_from_id(root).has(backdrop::Backdrop::id());
+        Ok(Self { world, painter, video, root, mix, pictured })
+    }
+
+    /// The root's Backdrop as the cues left it this frame.
+    fn backdrop(&self) -> Option<backdrop::Backdrop> {
+        self.world.world_ref().entity_from_id(self.root).try_cloned::<&backdrop::Backdrop>()
+    }
+
+    /// Take `export`'s shape and rate (see [`fit`]), and make the root that many points.
+    fn fit(&mut self, name: &str, export: &preset::Export) -> Result<(), String> {
+        fit(&mut self.video, name, export)?;
+        let v = self.video;
+        let size = harness_native_ui_layout_api::Size {
+            w: harness_native_ui_layout_api::Sizing::fixed(v.width),
+            h: harness_native_ui_layout_api::Sizing::fixed(v.height),
+        };
+        self.world.world_ref().entity_from_id(self.root).set(size);
+        Ok(())
     }
 
     /// The soundtrack at `sr` Hz: the one `BlazeMark`'s score (if any) and every `Sound` the scene declares, or None for
@@ -273,7 +301,7 @@ impl Stage {
                 slug: [0.0, 1.0, 1.0, 0.0],
                 place: [0.0; 4],
             },
-            clear: [0.0, 0.0, 0.0, 1.0],
+            clear: [0.0, 0.0, 0.0, if self.pictured { 0.0 } else { 1.0 }],
             ..Draw::default()
         };
         let mut errors = Vec::new();
@@ -305,13 +333,18 @@ impl Stage {
 enum Out {
     Video(PathBuf),
     Still(PathBuf, f32),
+    /// One small frame a second, in one image.
+    Contact(PathBuf),
+    /// Ten consecutive frames from a time, in one image.
+    Burst(PathBuf, f32),
     Sheet(PathBuf, f32),
     Audio(PathBuf),
     Sounds,
 }
 
 fn parse(args: &[String]) -> Result<(PathBuf, Out, Option<String>), String> {
-    let usage = "usage: harness-video SCENE.flecs OUT.mp4 [PRESET] | OUT.png AT | DIR/ EVERY | OUT.wav | sounds\n       \
+    let usage = "usage: harness-video SCENE.flecs OUT.mp4 [PRESET] | OUT.png AT [PRESET] | OUT.png contact [PRESET] | \
+                 OUT.png burst AT [PRESET] | DIR/ EVERY | OUT.wav | sounds\n       \
                  harness-video check OUT.mp4 SCENE.flecs PRESET";
     let num = |s: &String| s.parse::<f32>().map_err(|e| format!("{s:?}: {e}; {usage}"));
     match args {
@@ -319,7 +352,18 @@ fn parse(args: &[String]) -> Result<(PathBuf, Out, Option<String>), String> {
         [scene, out, preset] if out.ends_with(".mp4") => Ok((scene.into(), Out::Video(out.into()), Some(preset.clone()))),
         [scene, out] if out.ends_with(".wav") => Ok((scene.into(), Out::Audio(out.into()), None)),
         [scene, out] if out == "sounds" => Ok((scene.into(), Out::Sounds, None)),
-        [scene, out, at] if out.ends_with(".png") => Ok((scene.into(), Out::Still(out.into(), num(at)?), None)),
+        [scene, out, how, rest @ ..] if out.ends_with(".png") => {
+            let (what, rest) = match (how.as_str(), rest) {
+                ("contact", rest) => (Out::Contact(out.into()), rest),
+                ("burst", [at, rest @ ..]) => (Out::Burst(out.into(), num(at)?), rest),
+                (_, rest) => (Out::Still(out.into(), num(how)?), rest),
+            };
+            match rest {
+                [] => Ok((scene.into(), what, None)),
+                [preset] => Ok((scene.into(), what, Some(preset.clone()))),
+                _ => Err(usage.into()),
+            }
+        }
         [scene, out, every] if out.ends_with('/') => Ok((scene.into(), Out::Sheet(out.into(), num(every)?), None)),
         _ => Err(usage.into()),
     }
@@ -333,10 +377,19 @@ fn fit(v: &mut Video, name: &str, export: &preset::Export) -> Result<(), String>
     }
     if export.width > 0 {
         let scale = export.width as f32 / v.width;
+        if (v.height * scale - export.height as f32).abs() > 0.01 && v.reframes {
+            // Another shape, for a scene that reframes: the same pixels a point, the preset's frame.
+            let (w, h) = (export.width as f32 / v.scale, export.height as f32 / v.scale);
+            if w.fract() != 0.0 || h.fract() != 0.0 {
+                return Err(format!("preset {name} is {}x{} pixels, not whole points at the scene's scale {}", export.width, export.height, v.scale));
+            }
+            (v.width, v.height) = (w, h);
+            return Ok(());
+        }
         if (v.height * scale - export.height as f32).abs() > 0.01 {
             return Err(format!(
                 "preset {name} is {}x{} pixels and the scene's frame is {}x{} points: not one shape (a scene is laid out \
-                 for one aspect; this one needs a preset of its own)",
+                 for one aspect unless its Video says `reframes`)",
                 export.width, export.height, v.width, v.height
             ));
         }
@@ -361,6 +414,55 @@ fn opaque(px: &mut [u8]) {
     }
 }
 
+/// A thumbnail's size: `(w, h)` scaled so its longer side is `long` pixels, both sides at least 1.
+fn thumbnail_size((w, h): (u32, u32), long: u32) -> (u32, u32) {
+    let k = long as f32 / w.max(h) as f32;
+    (((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1))
+}
+
+/// RGBA8 `px` of `(w, h)` shrunk to `(sw, sh)`: each small pixel the mean of the pixels it covers.
+fn shrink(px: &[u8], (w, h): (u32, u32), (sw, sh): (u32, u32)) -> Vec<u8> {
+    let mut out = vec![0u8; (sw * sh * 4) as usize];
+    for y in 0..sh {
+        let (y0, y1) = (y * h / sh, ((y + 1) * h / sh).max(y * h / sh + 1));
+        for x in 0..sw {
+            let (x0, x1) = (x * w / sw, ((x + 1) * w / sw).max(x * w / sw + 1));
+            let mut sum = [0u32; 4];
+            for yy in y0..y1 {
+                for xx in x0..x1 {
+                    let at = ((yy * w + xx) * 4) as usize;
+                    for (s, v) in sum.iter_mut().zip(&px[at..at + 4]) {
+                        *s += u32::from(*v);
+                    }
+                }
+            }
+            let n = (y1 - y0) * (x1 - x0);
+            let at = ((y * sw + x) * 4) as usize;
+            for (o, s) in out[at..at + 4].iter_mut().zip(sum) {
+                *o = (s / n) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// `thumbs` (each `(sw, sh)`) in a grid `across` wide with a 4-pixel gutter, on mid-grey so a dark frame's edge shows.
+fn tile(thumbs: &[Vec<u8>], (sw, sh): (u32, u32), across: u32) -> (Vec<u8>, (u32, u32)) {
+    const GAP: u32 = 4;
+    let rows = (thumbs.len() as u32).div_ceil(across).max(1);
+    let (w, h) = (across * (sw + GAP) + GAP, rows * (sh + GAP) + GAP);
+    let mut out = vec![96u8; (w * h * 4) as usize];
+    for (i, t) in thumbs.iter().enumerate() {
+        let (cx, cy) = (GAP + (i as u32 % across) * (sw + GAP), GAP + (i as u32 / across) * (sh + GAP));
+        for y in 0..sh {
+            let from = (y * sw * 4) as usize;
+            let to = (((cy + y) * w + cx) * 4) as usize;
+            out[to..to + (sw * 4) as usize].copy_from_slice(&t[from..from + (sw * 4) as usize]);
+        }
+    }
+    (out, (w, h))
+}
+
 fn write_png(path: &Path, px: &[u8], (w, h): (u32, u32)) -> Result<(), String> {
     let file = std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
@@ -377,8 +479,9 @@ fn run(args: &[String]) -> Result<(), String> {
         && check == "check"
     {
         let export = preset::named(name)?;
-        let mut v = Stage::load(Path::new(scene))?.video;
-        fit(&mut v, name, &export)?;
+        let mut stage = Stage::load(Path::new(scene))?;
+        stage.fit(name, &export)?;
+        let v = stage.video;
         let (pw, ph) = ((v.width * v.scale) as u32, (v.height * v.scale) as u32);
         let frames = (v.seconds * v.fps).round() as u32;
         print!("{}", read_back(Path::new(file), &export, (pw, ph), v.fps, frames)?);
@@ -389,8 +492,9 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut stage = Stage::load(&scene)?;
     let name = preset_name.as_deref().unwrap_or(preset::DEFAULT);
     let export = preset::named(name)?;
-    if let Out::Video(_) = &out {
-        fit(&mut stage.video, name, &export)?;
+    // A video takes its preset (the default with none named); a still or a sheet takes one only when named.
+    if matches!(out, Out::Video(_)) || preset_name.is_some() {
+        stage.fit(name, &export)?;
     }
     let v = stage.video;
     if let Out::Sounds = &out {
@@ -425,6 +529,11 @@ fn run(args: &[String]) -> Result<(), String> {
         Out::Video(_) => (0..total).collect(),
         Out::Audio(_) | Out::Sounds => unreachable!("written above"),
         Out::Still(_, at) => vec![((at * v.fps).round() as u32).min(total.saturating_sub(1))],
+        Out::Contact(_) => (0..total).step_by(v.fps.round() as usize).collect(),
+        Out::Burst(_, at) => {
+            let from = ((at * v.fps).round() as u32).min(total.saturating_sub(1));
+            (from..(from + 10).min(total)).collect()
+        }
         Out::Sheet(_, every) => {
             let step = ((every * v.fps).round() as u32).max(1);
             (0..total).step_by(step as usize).collect()
@@ -455,6 +564,14 @@ fn run(args: &[String]) -> Result<(), String> {
         Out::Video(_) => Some(yuv::Yuv::new(renderer.device(), pw, ph, export.colour)?),
         _ => None,
     };
+    let picture = if stage.pictured { Some(backdrop::Pass::new(renderer.device(), pw, ph)?) } else { None };
+    // A contact sheet's or a burst's small frames, in order.
+    let mut thumbs: Vec<Vec<u8>> = Vec::new();
+    let small = match &out {
+        Out::Contact(_) => thumbnail_size((pw, ph), 192),
+        Out::Burst(_, _) => thumbnail_size((pw, ph), 480),
+        _ => (0, 0),
+    };
     let mut next = wanted.iter().peekable();
     for i in 0..=last {
         let r = &renderer;
@@ -466,20 +583,26 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         next.next();
         renderer.render(&draw, Dest::Texture(tex.clone()));
+        // With a Backdrop, the frame is the picture with the UI over it; without, the UI alone.
+        let shown = match (&picture, stage.backdrop()) {
+            (Some(pass), Some(b)) => pass.draw(&b, i as f32 / v.fps, i, &tex)?.clone(),
+            _ => tex.clone(),
+        };
         if let Some(enc) = encoder.as_mut() {
             let target = enc.target()?;
-            hdr.as_ref().ok_or("yuv: no colour pass")?.convert(&tex, &target.luma, &target.chroma)?;
+            hdr.as_ref().ok_or("yuv: no colour pass")?.convert(&shown, &target.luma, &target.chroma)?;
             enc.encode(target, i)?;
             if i % 60 == 0 {
                 eprintln!("harness-video: frame {i}/{total}");
             }
             continue;
         }
-        let mut px = renderer.read(&tex);
+        let mut px = renderer.read(&shown);
         opaque(&mut px);
         match &out {
             Out::Video(_) => unreachable!("encoded above"),
             Out::Still(path, _) => write_png(path, &px, (pw, ph))?,
+            Out::Contact(_) | Out::Burst(_, _) => thumbs.push(shrink(&px, (pw, ph), small)),
             Out::Sheet(dir, _) => write_png(
                 &dir.join(format!("{:05}.png", (i as f32 / v.fps * 1000.0).round() as u32)),
                 &px,
@@ -490,6 +613,11 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     if let Some(enc) = encoder {
         enc.finish()?;
+    }
+    if let Out::Contact(path) | Out::Burst(path, _) = &out {
+        let across = if matches!(out, Out::Burst(_, _)) { 5 } else if small.0 > small.1 { 10 } else { 15 };
+        let (sheet, size) = tile(&thumbs, small, across);
+        write_png(path, &sheet, size)?;
     }
     let peak = hdr.as_ref().map_or(0.0, yuv::Yuv::peak_nits);
     let what = match &out {
@@ -505,6 +633,8 @@ fn run(args: &[String]) -> Result<(), String> {
             )
         }
         Out::Still(p, at) => format!("{} (at {at} s)", p.display()),
+        Out::Contact(p) => format!("{} ({} frames, one a second, left to right then down)", p.display(), wanted.len()),
+        Out::Burst(p, at) => format!("{} ({} consecutive frames from {at} s)", p.display(), wanted.len()),
         Out::Sheet(d, _) => format!("{} ({} frames)", d.display(), wanted.len()),
         Out::Audio(_) | Out::Sounds => unreachable!("written above"),
     };
@@ -558,18 +688,33 @@ mod tests {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("scene/blaze");
         let stage = Stage::load(&dir.join("film.flecs")).unwrap_or_else(|e| panic!("{e}"));
         let mut v = stage.video;
-        assert_eq!((v.seconds, v.fps), (60.0, 60.0));
+        assert!(v.seconds > 45.0 && v.seconds <= 60.0 && v.fps == 60.0 && v.reframes, "{v:?}");
+        assert!(stage.pictured, "the film's root has a Backdrop");
         let x = preset::named("x-landscape-1080p60").unwrap_or_else(|e| panic!("{e}"));
         fit(&mut v, "x-landscape-1080p60", &x).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!((v.width * v.scale, v.height * v.scale), (1920.0, 1080.0));
         assert_eq!(stage.mix, Some(Mix { lufs: -16.0, peak: -1.0 }));
+        // It reframes: the upright preset is the same points a pixel, 540 by 960.
+        let mut tall = stage.video;
+        let upright = preset::named("x-portrait-1080x1920").unwrap_or_else(|e| panic!("{e}"));
+        fit(&mut tall, "x-portrait-1080x1920", &upright).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((tall.width, tall.height, tall.scale), (540.0, 960.0, 2.0));
         let (mark, _, heard) = stage.score().unwrap_or_else(|e| panic!("{e}"));
         assert!(mark.is_some() && heard.len() > 50, "{} sounds", heard.len());
         let json = std::fs::read_to_string(dir.join("data.json")).unwrap_or_else(|e| panic!("{e}"));
         let was = data::script(&json).unwrap_or_else(|e| panic!("{e}"));
-        assert!(was.contains("export const d_engine_reverified_before_t = \"1,091,174\""), "{was}");
+        assert!(was.contains("export const d_day_reverified_before_t = \"1,091,174\""), "{was}");
         let now = data::script(&json.replace("1091174", "1091175")).unwrap_or_else(|e| panic!("{e}"));
-        assert!(now.contains("export const d_engine_reverified_before_t = \"1,091,175\""), "{now}");
+        assert!(now.contains("export const d_day_reverified_before_t = \"1,091,175\""), "{now}");
+        // Few words: every string a scene shows, counted (a number is not a word). Under 60.
+        let mut words = 0;
+        stage.world.new_query::<&harness_native_ui_text_api::Text>().each_entity(|e, t| {
+            if std::iter::successors(e.parent(), |p| p.parent()).any(|p| *p.id() == stage.root) && !e.has(harness_native_ui_timeline_api::Tally::id()) {
+                words += t.s.as_str().split(|c: char| !c.is_alphanumeric() && c != '-' && c != '.' && c != '/').filter(|w| w.chars().any(char::is_alphabetic)).count();
+            }
+        });
+        assert!(words > 0 && words < 60, "{words} words on screen");
+        eprintln!("the film shows {words} words");
     }
 
     /// A render through the X preset is what the preset says, by the file's own boxes: half a second of a small scene

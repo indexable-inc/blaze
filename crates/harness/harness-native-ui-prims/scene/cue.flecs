@@ -46,6 +46,20 @@ cue {
     prop by: f32 = 10
     Cue: {member: "Pose.dy", from: $by, to: 0, at: $at, dur: $dur, ease: Out}
   }
+  // Pop: grow into place from `by` smaller over `dur` from `at`, a little past and back (a caption landing); pair it
+  // with an Arrive.
+  template Pop {
+    prop at: f32 = 0
+    prop dur: f32 = 0.24
+    prop by: f32 = 0.3
+    Cue: {member: "Pose.shrink", from: $by, to: 0, at: $at, dur: $dur, ease: Back}
+  }
+  // Leave: fade out over `dur` from `at`, quickening (things going).
+  template Leave {
+    prop at: f32 = 0
+    prop dur: f32 = 0.12
+    Cue: {member: "Pose.fade", from: 0, to: 1, at: $at, dur: $dur, ease: In}
+  }
   // Type words on: every glyph hidden at `at`, all shown `dur` later, at an even pace (pair it with a Caret).
   template Type {
     prop at: f32 = 0

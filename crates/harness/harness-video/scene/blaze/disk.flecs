@@ -1,0 +1,37 @@
+// One of blaze's own day: disk. Time as a bar of light: the before, whole; then it falls to the after, the
+// figure counting down with it. Both ends are the data file's `day.disk` row.
+const t = $t_disk
+const fall = $t + 0.7
+
+@tree ChildOf
+film {
+  disk_shot { Cue: {member: "Backdrop.shot", from: 5, to: 5, at: $t, dur: 0, ease: Linear} }
+  disk_at { Cue: {member: "Backdrop.at", from: $t, to: $t, at: $t, dur: 0, ease: Linear} }
+  disk_whole { Cue: {member: "Backdrop.a", from: $d_day_disk_before_share, to: $d_day_disk_before_share, at: $t, dur: 0, ease: Linear} }
+  disk_lit { Cue: {member: "Backdrop.a", from: $d_day_disk_before_share, to: $d_day_disk_after_share, at: $fall, dur: 1.2, ease: InOut} }
+  disk_fig : film_part.Layer {
+    cue.CutIn enter(at: $t)
+    cue.CutOut leave(at: $t + 3.0)
+    fig : film_part.Figure {
+      Tally: {value: 0, decimals: 0, unit: " {d_day_disk_unit}"}
+      was { Cue: {member: "Tally.value", from: $d_day_disk_before, to: $d_day_disk_before, at: $t, dur: 0, ease: Linear} }
+      cue.Fall drop(at: $fall, dur: 1.2, from: $d_day_disk_before, to: $d_day_disk_after)
+    }
+    lift : film_part.Raise {}
+  }
+  disk_caps : film_part.Under {
+    slot : film_part.Slot {
+      what : film_part.Caption {
+        Text: {s: $d_day_disk_label}
+        cue.Arrive show(at: $t + 0.1, dur: 0.1)
+        cue.Pop pop(at: $t + 0.1)
+        cue.Leave hide(at: $t + 2.8)
+      }
+    }
+    low : film_part.Low {}
+  }
+  // Sound: the fall is a short glide down to a hit.
+  disk_glide : voice.Whoosh { Onset: {at: $fall}; Lasts: {dur: 1.2}; Pitch: {hz: 1800}; Gain: {amp: 0.05}; Pan: {pos: 0.6, sweep: -1.0} }
+  disk_hit : voice.Mallet { Onset: {at: $fall + 1.2}; Pitch: {hz: 440.0}; Gain: {amp: 0.11}; Lasts: {dur: 1.4} }
+  disk_tap : voice.Thud { Onset: {at: $fall + 1.2}; Gain: {amp: 0.14} }
+}

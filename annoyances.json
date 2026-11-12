@@ -451,6 +451,61 @@
    "cause": "the mark's score takes every GlyphsIn in the world as its glints, wherever it is",
    "workaround": "fades and lifts (cue.Arrive, cue.Lift) for words elsewhere",
    "state": "open"
+  },
+  {
+   "id": "A42",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "making videos",
+   "what": "The first film was built and delivered without its author looking at it as a viewer: six stills were read for correctness, not judged, and the owner rejected it as a deck (headlines, a labelled bar chart, a footnote).",
+   "cost": "a whole film redone",
+   "cause": "nothing said what a film is judged by, and nothing made a contact sheet cheap",
+   "workaround": "the making-videos skill (.agents/skills/making-videos) and harness-video's `contact` and `burst` outputs",
+   "state": "fixed in this lane: the skill and the two outputs"
+  },
+  {
+   "id": "A43",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "harness-video",
+   "what": "A generated beat cut every race's lane labels 0.3 s after they appeared (a start time passed where an end was meant); the read-back check, the tests and the loudness line all passed, and only the contact sheet showed it.",
+   "cost": "one render cycle",
+   "cause": "the read-back checks the container, not the picture",
+   "workaround": "look at the contact sheet before anything else",
+   "state": "open: no check that a node meant to be on screen is"
+  },
+  {
+   "id": "A44",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "harness-video",
+   "what": "`Cue`s on one member take turns across the whole film, so a beat that did not set `Backdrop.a` at its own start drew its first 0.7 s with the previous beat's value (a beam one dot long).",
+   "cost": "one render cycle",
+   "cause": "a cue has no scope: the latest begun wins, whichever beat it belongs to",
+   "workaround": "every beat sets each Backdrop member it reads with a zero-length cue at its start",
+   "state": "open"
+  },
+  {
+   "id": "A45",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "Metal shading language",
+   "what": "Two compile failures at start-up: `half` is a type name (used as a variable), and file-scope `static const float3` must be `constant float3`.",
+   "cost": "two rebuilds",
+   "cause": "MSL written in a Rust string is checked only when the binary runs",
+   "workaround": "none; the errors name the line",
+   "state": "open: film shaders are MSL strings in harness-video, not Rust in harness-native-shaders, because that path needs a blaze newer than the pin"
+  },
+  {
+   "id": "A46",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "harness: building",
+   "what": "The proper fix for the harness build could not be made: the pinned blaze (0.20261105.4; neither its launcher nor its engine contains the device target or BLAZE_GPU_MSL) cannot build `artifact = \"gpu\"`, cargo cannot parse it, and no manifest satisfies both. The lane built with the same uncommitted edit as before.",
+   "cost": "the build fix asked for is not delivered",
+   "cause": "the pin was not moved when the gpu dependency landed on 2026-11-10",
+   "workaround": "cargo with the pinned nightly, the dependency line edited locally, an older MSL file for Kip",
+   "state": "open: needs a blaze from after 2026-11-10 pinned, and a harness build with it somewhere its memory is safe"
   }
  ]
 }

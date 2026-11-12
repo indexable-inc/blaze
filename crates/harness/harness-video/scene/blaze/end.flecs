@@ -1,38 +1,29 @@
-// Shot 6, the end card: blaze's mark (live: its letters drop in, the fire catches, and it keeps burning), the film's one
-// line, where the repository is, and what is not built yet, said so.
+// The end: every point streams to the middle and blaze's mark forms there (live: its letters drop in and the fire
+// catches); then the repository, for under three seconds, and out.
 const t = $t_end
 // The mark is 43 by 23 cells (harness-native-blaze), each this many points.
-const cell = 7
+const cell = 8
 
 @tree ChildOf
 film {
-  end : film_part.Centred {
-    Flex: {axis: Column, gap: 10, align: Center, justify: Center, wrap: false}
+  end_shot { Cue: {member: "Backdrop.shot", from: 6, to: 6, at: $t, dur: 0, ease: Linear} }
+  end_at { Cue: {member: "Backdrop.at", from: $t, to: $t, at: $t, dur: 0, ease: Linear} }
+  end_gather { Cue: {member: "Backdrop.a", from: 0, to: 1, at: $t, dur: 2.0, ease: InOut} }
+  end_card : film_part.Layer {
+    Flex: {axis: Column, gap: 14, align: Center, justify: Center, wrap: false}
     cue.CutIn enter(at: $t)
-    cue.FadeOut leave(at: $t_out - 1.0, dur: 0.9)
+    cue.FadeOut leave(at: $t_out - 0.6, dur: 0.5)
     mark : ui.Node {
       // `glow` 1: an SDR export has no room over white. `exit` 0: it never burns away.
-      BlazeMark: {start: $t + 0.3, exit: 0, glow: 1}
+      BlazeMark: {start: $t + 0.1, exit: 0, glow: 1}
       Size: {w: {kind: Fixed, value: 43 * $cell, min: 0, max: 0}, h: {kind: Fixed, value: 23 * $cell, min: 0, max: 0}}
     }
-    line : film_part.Head {
-      Text: {s: "The edit loop is the product."}
-      cue.Arrive show(at: $t + 2.4)
-      cue.Lift up(at: $t + 2.4)
-    }
-    url : film_part.Mono {
+    url : film_part.Who {
       Text: {s: "github.com/indexable-inc/blaze"}
       Fill: $tone_ink_strong
-      TextStyle: {size: 20, line: 28, code_line: 0, role: 9, bold: 0, weight: 0}
-      GlyphsIn: {at: $t + 3.4, per: 0.035, dur: 0.4, by: 0, ease: Out, cool: 0.9, hot: $film_caret}
+      TextStyle: {size: 22, line: 30, code_line: 0, role: 9, bold: 0, weight: 0}
+      cue.Arrive show(at: $t + 1.9, dur: 0.2)
+      cue.Pop pop(at: $t + 1.9, by: 0.12)
     }
-    room : film_part.Gap {}
-    next : film_part.Small {
-      Text: {s: "in progress: the hub · lazy compilation in the launcher · one store shared across machines"}
-      cue.Arrive show(at: $t + 5.2)
-    }
-    // Sound: the mark's own score (its letters landing up A major, the fire catching on the chord) is the resolve; a
-    // higher bed opens under it.
-    open : voice.Pad { Onset: {at: $t}; Lasts: {dur: $t_out - $t}; Pitch: {hz: 220}; Gain: {amp: 0.012} }
   }
 }
