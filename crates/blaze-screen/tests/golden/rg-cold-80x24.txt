@@ -95,6 +95,7 @@ warning: unused import: `self::SummaryKind::*`
 127 |         use self::SummaryKind::*;
     |             ^^^^^^^^^^^^^^^^^^^^
 
-✓ built 81 units, 4 cached in 45.8s · tier 0 · 3 warnings · blaze slow says why
+✓ built 81 units, 4 cached in 45.8s ·  · tier 0 · 3 warnings · blaze slow says w
+hy
 ⚠ 1 step recomputed for no recorded reason: a blaze bug (blaze why --unexplained
 ) (3 times) · blaze explain why:unexplained

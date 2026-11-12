@@ -108,5 +108,5 @@ warning: unused import: `self::SummaryKind::*`
 127 |         use self::SummaryKind::*;
     |             ^^^^^^^^^^^^^^^^^^^^
 
-✓ built 81 units, 4 cached in 45.8s · tier 0 · 3 warnings · blaze slow says why → /root/home9/build/ripgrep-2869fcc03106fcd9eadd9b7a1fd4d4e4/debug/rg
+✓ built 81 units, 4 cached in 45.8s ·  · tier 0 · 3 warnings · blaze slow says why → /root/home9/build/ripgrep-2869fcc03106fcd9eadd9b7a1fd4d4e4/debug/rg
 ⚠ 1 step recomputed for no recorded reason: a blaze bug (blaze why --unexplained) (3 times) · blaze explain why:unexplained

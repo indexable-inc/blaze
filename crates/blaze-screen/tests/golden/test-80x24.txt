@@ -19,7 +19,7 @@
  ◦ paused: daemon at 89.4 of 81.5 GiB, waiting on 1 task: calc 0.1.0 test it (…
  testing  ━━━━━━━━━━━━━━━━━━━  1/1 · 1 passed · 23.0s
 == 28000 ms
-✗ tests::adds_wrong  calc lib · 0ms
+✗ tests::adds_wrong  calc lib · <1ms
   adding 2 and 2
 
   thread 'tests::adds_wrong' (130627) panicked at src/lib.rs:8:59:
@@ -27,12 +27,12 @@
     left: 4
    right: 5
   note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
-✓ built 33 units, 7 cached in 26.8s · tier 0 · 29% optimized
+✓ built 33 units, 7 cached in 26.8s ·  · tier 0 · 29% optimized
  ▶ calc lib        4/6 · 1 failed  tests::slow_one 2.2s  tests…slow_two 2.2s
  ▶ calc it         1/2  slow_outside 1.1s
  testing  ━━━━━━━━━━━━───────  6/9 · 4 passed · 1 failed · 1 ignored · 28.0s
 == end
-✗ tests::adds_wrong  calc lib · 0ms
+✗ tests::adds_wrong  calc lib · <1ms
   adding 2 and 2
 
   thread 'tests::adds_wrong' (130627) panicked at src/lib.rs:8:59:
@@ -40,6 +40,7 @@
     left: 4
    right: 5
   note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
-✓ built 33 units, 7 cached in 26.8s · tier 0 · 29% optimized
+✓ built 33 units, 7 cached in 26.8s ·  · tier 0 · 29% optimized
 ✗ 8 of 9 ran: 1 failed · 7 passed · 1 ignored · 0 filtered · 3 binaries · 31.8s
+(26.8s of it the build)
   rerun: blaze test -p calc --lib
