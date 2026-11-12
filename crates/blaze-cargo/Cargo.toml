@@ -102,6 +102,8 @@ tar = { workspace = true, features = ["default"] }
 zip = { workspace = true, features = ["deflate-flate2"] }
 # The `.tar.gz` files build scripts download (FFmpeg's source, `cargo/fetches.rs`).
 flate2 = { workspace = true, features = ["default"] }
+# A flight recording's body is one zstd frame (`serve/flightrec.rs`).
+zstd.workspace = true
 # The `.tar.xz` files of blaze's own toolchain (`cargo/toolchain/own.rs`): in Rust, within 1.3x
 # of liblzma's time on rustc's 84 MB.
 lzma-rust2 = { workspace = true, features = ["std", "xz", "optimization"] }
