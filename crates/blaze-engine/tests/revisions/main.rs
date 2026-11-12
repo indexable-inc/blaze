@@ -86,6 +86,8 @@ fn every_case_is_listed() {
         for driver in &test.drivers {
             let listed = match driver.as_str() {
                 "real" => REAL.contains(&name.as_str()),
+                // The simulated driver's own list is held by its `every_sim_case_is_listed`.
+                "sim" => true,
                 other => panic!("{name}: no driver `{other}`"),
             };
             if !listed {
