@@ -457,11 +457,15 @@ impl Release<Crate> {
             // for a write of one file, 1.9 million memos verified, 2026-11-12). Here, after
             // the answer, each costs a load a reader and runs nothing.
             db.storage_mut().settle_changed_set();
-            // Then the seal pass, one a build: each crate's group that has been quiet long
-            // enough is sealed (a library's at once, a workspace crate's after two builds
-            // that wrote nothing of it), so the next edit costs its own crate
-            // (`Storage::seal_quiet_groups`). Its span, `seal groups`, says what it did.
-            db.storage_mut().seal_quiet_groups();
+            // No seal pass here yet. `Storage::seal_quiet_groups` exists and is tested, but on
+            // 2026-11-12 its refinement test (`db::tests::sealed::
+            // a_sealed_database_answers_as_an_unsealed_one_under_random_writes`) found three
+            // stale answers in three runs, each from a different hole (a reader missed in a
+            // broken seal; a floor made over an untracked row; a row made after the seal and
+            // missed by the next write's walk). A real build must not answer from a mechanism
+            // its own oracle still breaks, so no build seals until that test has passed with
+            // its case budget raised a hundredfold on a named commit; the pass is then called
+            // here again, once a build, after the settle.
         }
         // Asked for by name (a diagnostic, a walk of every row): which rows are of which kind
         // and the fields that hold a library's rows below `HIGH`, into the daemon's log.
