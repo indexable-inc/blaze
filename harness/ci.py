@@ -94,8 +94,9 @@ KEYS = 3
 # The order is the order of each part's run. A harness in the fast tier needs a line in FAST.
 HARNESSES = [
     # One Windows-native suite, with observable runs in dev (Cranelift) and release (LLVM):
-    # path spellings, MSVC imports and CRTs, revision changes, restart/cache reuse and interrupted
-    # build recovery. It fails by name when the Windows daemon/bootstrap prerequisite is absent;
+    # path spellings, MSVC imports and CRTs, restart/cache reuse and interrupted build recovery.
+    # Incremental histories stay in deterministic simulation. It fails by name when the Windows
+    # daemon/bootstrap prerequisite is absent;
     # cargo is never a substitute.
     (
         "windows",

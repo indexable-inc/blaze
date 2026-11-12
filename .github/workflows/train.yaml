@@ -3,7 +3,7 @@
 # docs/harness.md ("CI").
 #
 #   every harness of harness/ci.py's full tier, on Linux AArch64 (ix), macOS arm64 and
-#       Windows x86-64 (including v2/windows.py's path, MSVC linker, incremental and daemon
+#       Windows x86-64 (including v2/windows.py's path, MSVC linker and daemon
 #       regressions), each profile picking its producer (dev Cranelift, release LLVM); `blaze` on small projects (AArch64, macOS) and the larger ones (AArch64); and the ripgrep
 #       bench (not blocking). No Linux x86-64 until ix has x86-64 capacity. nix-live.yaml (the flake's builds, the demo and live edits on macOS)
 #       runs on the same pushes in a workflow of its own: a cold nix build takes up to two hours,

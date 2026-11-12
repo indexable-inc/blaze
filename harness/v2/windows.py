@@ -5,12 +5,11 @@
 
 The input is one typed JSON object. ``engine`` and ``out`` are the usual v2 harness
 fields; ``work`` names the directory to use, ``keep`` retains it, and ``scenarios``
-selects from paths, linking, incremental and daemon (empty means all).
+selects from paths, linking and daemon (empty means all).
 
 This is intentionally an end-to-end platform harness.  Path spellings, PE imports,
-executed programs and daemon process lifetime are facts only Windows can expose.  The
-incremental cases additionally build every revision from an empty home and compare the
-program's observable result with the warm build.
+executed programs and daemon process lifetime are facts only Windows can expose. Incremental
+state histories belong in the query engine's deterministic simulation, not this native driver.
 """
 
 import ctypes
@@ -32,7 +31,7 @@ import storelib
 from typed_input import fail, parse
 
 SCRIPT = "windows.py"
-SCENARIOS = ("paths", "linking", "incremental", "daemon")
+SCENARIOS = ("paths", "linking", "daemon")
 BUILD_SECS = 1800
 RUN_SECS = 120
 
@@ -51,7 +50,7 @@ class Regression(Exception):
 
 
 def manifest(name: str, *, dependency: str = "", crate_type: str = "") -> str:
-    dep = f'\n[dependencies]\nwin_dep = {{ path = "{dependency}" }}\n' if dependency else ""
+    dep = f'\n[dependencies]\nwin-dep = {{ path = "{dependency}" }}\n' if dependency else ""
     lib = f'\n[lib]\ncrate-type = ["{crate_type}"]\n' if crate_type else ""
     return (
         f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2024"\npublish = false\n'
@@ -61,7 +60,7 @@ def manifest(name: str, *, dependency: str = "", crate_type: str = "") -> str:
 
 def write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, newline="\n")
+    path.write_text(text, encoding="utf-8", newline="\n")
 
 
 def executable(eng: engine.Engine, ws: Path, env: dict[str, str], name: str, profile: str = "debug") -> Path:
@@ -92,12 +91,13 @@ def expect(label: str, got: str, wanted: str) -> None:
         raise Regression(f"{label}: expected {wanted!r}, got {got!r}")
 
 
-def path_spellings(path: Path) -> tuple[Path, ...]:
+def path_spellings(path: Path) -> tuple[str, ...]:
     """The native, slash, case-varied and Win32 verbatim spellings of one path."""
     native = str(path.resolve())
     drive, tail = os.path.splitdrive(native)
     case = drive.swapcase() + tail.swapcase()
-    return (Path(native), Path(native.replace("\\", "/")), Path(case), Path("\\\\?\\" + native))
+    # Keep these as strings until subprocess's cwd boundary: pathlib normalizes the slash form.
+    return (native, native.replace("\\", "/"), case, "\\\\?\\" + native)
 
 
 def paths(eng: engine.Engine, top: Path, rep: report.Report) -> None:
@@ -112,10 +112,10 @@ def paths(eng: engine.Engine, top: Path, rep: report.Report) -> None:
     home, target = top / "path-home", top / "path-target"
     env = eng.env(home, target)
     for index, spelling in enumerate(path_spellings(ws)):
-        build(eng, f"windows paths: spelling {index + 1}", spelling, env)
+        build(eng, f"windows paths: spelling {index + 1}", spelling, env)  # type: ignore[arg-type]
         expect(
             f"path spelling {spelling}",
-            run_program(executable(eng, spelling, env, "windows_paths"), top),
+            run_program(executable(eng, Path(spelling), env, "windows_paths"), top),
             "registry Ω\n",
         )
     rep.extra["path_spellings"] = [str(p) for p in path_spellings(ws)]
@@ -210,116 +210,10 @@ def linking(eng: engine.Engine, top: Path, rep: report.Report) -> None:
     )
 
 
-@dataclass(frozen=True)
-class Revision:
-    name: str
-    app: str
-    dep: str
-    version: str
-    lock_note: str
-    output: str
-
-
-REVISIONS = (
-    Revision(
-        "base",
-        'fn main() { println!("{}", win_dep::value()); }\n',
-        'pub fn value() -> &\'static str { "one" }\n',
-        "0.1.0",
-        "base",
-        "one\n",
-    ),
-    Revision(
-        "body",
-        'fn main() { println!("{}", win_dep::value()); }\n',
-        'pub fn value() -> &\'static str { "two" }\n',
-        "0.1.0",
-        "base",
-        "two\n",
-    ),
-    Revision(
-        "interface",
-        'fn main() { println!("{}", win_dep::value(3)); }\n',
-        'pub fn value(n: u32) -> String { format!("interface-{n}") }\n',
-        "0.1.0",
-        "base",
-        "interface-3\n",
-    ),
-    Revision(
-        "dependency-version",
-        'fn main() { println!("{}", win_dep::value(3)); }\n',
-        'pub fn value(n: u32) -> String { format!("version-{n}") }\n',
-        "0.2.0",
-        "version",
-        "version-3\n",
-    ),
-    Revision(
-        "lock",
-        'fn main() { println!("{}", win_dep::value(3)); }\n',
-        'pub fn value(n: u32) -> String { format!("version-{n}") }\n',
-        "0.2.0",
-        "lock changed",
-        "version-3\n",
-    ),
-)
-
-
-def lockfile(revision: Revision) -> str:
-    return (
-        f'# {revision.lock_note}\nversion = 4\n\n[[package]]\nname = "windows_incremental"\n'
-        f'version = "0.1.0"\ndependencies = [\n "win-dep",\n]\n\n[[package]]\n'
-        f'name = "win-dep"\nversion = "{revision.version}"\n'
-    )
-
-
-def write_revision(ws: Path, revision: Revision) -> None:
-    write(ws / "Cargo.toml", manifest("windows_incremental", dependency="dep"))
-    write(ws / "src/main.rs", revision.app)
-    write(
-        ws / "dep/Cargo.toml",
-        manifest("win-dep").replace('version = "0.1.0"', f'version = "{revision.version}"'),
-    )
-    write(ws / "dep/src/lib.rs", revision.dep)
-    write(ws / "Cargo.lock", lockfile(revision))
-
-
 def clean_copy(source: Path, destination: Path) -> None:
     if destination.exists():
         shutil.rmtree(destination)
     shutil.copytree(source, destination, ignore=shutil.ignore_patterns("target"))
-
-
-def incremental(eng: engine.Engine, top: Path, rep: report.Report) -> None:
-    ws, home, target = top / "incremental", top / "incremental-home", top / "incremental-target"
-    env = eng.env(home, target)
-    observed: list[str] = []
-    sequence = [*REVISIONS, REVISIONS[0]]
-    for index, revision in enumerate(sequence):
-        write_revision(ws, revision)
-        mark = eng.mark(home)
-        build(eng, f"incremental revision {index}: {revision.name}", ws, env)
-        warm = run_program(executable(eng, ws, env, "windows_incremental"), top)
-        scratch = top / "scratch" / str(index) / "workspace"
-        clean_copy(ws, scratch)
-        scratch_env = eng.env(top / "scratch" / str(index) / "home", top / "scratch" / str(index) / "target")
-        build(eng, f"clean revision {index}: {revision.name}", scratch, scratch_env)
-        cold = run_program(executable(eng, scratch, scratch_env, "windows_incremental"), top)
-        expect(f"incremental {revision.name}", warm, revision.output)
-        expect(f"clean {revision.name}", cold, revision.output)
-        expect(f"incremental equals clean for {revision.name}", warm, cold)
-        work = eng.work_since(home, mark)
-        if revision.name == "lock" and work.compiled != 0:
-            raise Regression(
-                f"a comment-only Cargo.lock edit compiled {work.compiled} functions instead of reusing the same graph: "
-                f"{work.said}"
-            )
-        observed.append(f"{revision.name}: compiled={work.compiled}, found={work.found}")
-    # The final state is byte-for-byte the base sources. Its successful output and a nonzero
-    # store-hit count distinguish restoration from merely accepting the rewrite.
-    final_work = observed[-1]
-    if "found=0" in final_work:
-        raise Regression(f"restoring the base revision found no compiled result in the store ({final_work})")
-    rep.add("windows/incremental", "pass", revisions=len(sequence), work="; ".join(observed))
 
 
 def kill_process(pid: int) -> None:
@@ -363,11 +257,15 @@ def daemon(eng: engine.Engine, top: Path, rep: report.Report) -> None:
     if not reused.found:
         raise Regression(f"the unchanged build after restart found no stored result: {reused.said}")
 
-    # Start a real request and terminate its daemon, then require the same home to recover and
-    # produce the clean build's result. The wait is bounded and names what failed to progress.
+    # The negative control completes this exact large build without interruption. Then one source
+    # edit starts a new request; only an observed active request authorizes killing its daemon.
     bulky = "\n".join(f"#[inline(never)] fn f{i}() -> usize {{ {i} }}" for i in range(4000))
     calls = " + ".join(f"f{i}()" for i in range(4000))
     write(ws / "src/main.rs", f'{bulky}\nfn main() {{ println!("sum={{}}", {calls}); }}\n')
+    build(eng, "uninterrupted-build control", ws, env)
+    write(ws / "src/main.rs", f'{bulky}\nfn main() {{ println!("sum={{}}", {calls} + 1); }}\n')
+    before = storelib.blaze_status(str(eng.blaze), env, str(ws)).daemon
+    before_requests = set(before.requests if before is not None else ())
     client = subprocess.Popen(
         [str(eng.blaze), "build", "--message-format=json"],
         cwd=ws,
@@ -380,19 +278,24 @@ def daemon(eng: engine.Engine, top: Path, rep: report.Report) -> None:
     deadline, killed = time.monotonic() + 30, None
     while time.monotonic() < deadline and client.poll() is None:
         status = storelib.blaze_status(str(eng.blaze), env, str(ws), 10).daemon
-        if status is not None:
+        if status is not None and set(status.requests) - before_requests:
             killed = status.pid
             kill_process(status.pid)
             break
         time.sleep(0.05)
     try:
-        client.communicate(timeout=60)
+        stdout, stderr = client.communicate(timeout=60)
     except subprocess.TimeoutExpired:
         client.kill()
         client.communicate()
         raise engine.Failed("the build client did not end within 60 s after its daemon was killed") from None
     if killed is None:
-        raise engine.Failed("the interrupted-build control could not observe a daemon within 30 s")
+        raise engine.Failed("the interrupted-build control observed no new active request within 30 s")
+    if client.returncode == 0:
+        raise Regression(
+            "the interrupted-build client succeeded after its active daemon was killed; "
+            f"stdout={stdout[-1000:]!r}, stderr={stderr[-1000:]!r}"
+        )
     build(eng, "recovery after interrupted build", ws, env)
     recovered = run_program(executable(eng, ws, env, "windows_daemon"), top)
     scratch = top / "daemon-clean"
@@ -438,7 +341,7 @@ def main(args: Input) -> None:
     top.mkdir(parents=True, exist_ok=True)
     rep = report.Report(SCRIPT, args.engine, args.out)
     rep.extra.update(work=str(top), scenarios=list(scenarios), toolchain=engine.TOOLCHAIN)
-    functions = {"paths": paths, "linking": linking, "incremental": incremental, "daemon": daemon}
+    functions = {"paths": paths, "linking": linking, "daemon": daemon}
     try:
         for name in scenarios:
             try:
@@ -472,7 +375,8 @@ def selftest() -> int:
             selected(("paths", "daemon")) == ("paths", "daemon") or (_ for _ in ()).throw(AssertionError())
         ),
         lambda: 'kind = "raw-dylib"' in RAW_DLL or (_ for _ in ()).throw(AssertionError()),
-        lambda: "lock changed" in lockfile(REVISIONS[-1]) or (_ for _ in ()).throw(AssertionError()),
+        lambda: path_spellings(Path("C:/Mixed Path"))[1].count("/") >= 2
+        or (_ for _ in ()).throw(AssertionError()),
     )
     try:
         selected(("not-a-scenario",))
