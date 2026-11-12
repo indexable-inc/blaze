@@ -268,6 +268,12 @@ codegen rows below are Linux's: **macOS was not run.**
 | unit records missed by the new project's first build | 27 | 2 | its own unit and its run |
 | the daemon's CPU over that build, user + system | 48.6 + 34.1 s | 39.4 + 4.3 s | one matched pair |
 
+The edit loop of one hello-world, the two binaries interleaved (5 rounds of 10 edits,
+medians): a no-op run 18.0 to 17.0 ms, a body edit and run 78.8 to 68.3 ms (66.0 to 59.7 ms
+from the fifth edit on), a comment edit and run 22.6 to 20.8 ms. The first body edit after
+the builds is 761 and 752 ms at the median; over two runs of the script it took more than a
+second once in ten before and three times in ten after, which this lane did not explain.
+
 **Where the first run's 14 s go** (build 7 of a matched pair's profiles; `spans`,
 `query_counts`, `misses`, `key_parts`):
 
