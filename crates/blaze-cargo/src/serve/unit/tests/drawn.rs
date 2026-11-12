@@ -328,7 +328,10 @@ fn a_record_of_the_layout_before_is_refused_and_never_read_as_empty() {
     blaze_protocol::cbor::append(&mut bytes, &old).unwrap();
     let refused = compile::record_said(&bytes).unwrap_err();
     assert!(refused.contains("said"), "it names what the bytes lack: {refused}");
-    assert_eq!(compile::RECORD_DOMAIN, "blaze v2 cargo unit record 12");
+    // The domain moves with every layout since (12: what a unit said; 13: written against the
+    // build's directories, `portable`), so no key of this blaze names a record of layout 11
+    // or 12.
+    assert_eq!(compile::RECORD_DOMAIN, "blaze v2 cargo unit record 13");
 }
 
 /// A record under its narrow key keeps the places of its diagnostics' spans, and is drawn

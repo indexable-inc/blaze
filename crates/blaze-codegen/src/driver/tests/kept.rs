@@ -351,16 +351,15 @@ pub(super) fn difference(
     same!(stats.instances);
     same!(stats.statics);
     same!(walk.reached);
-    // Every function a round of a whole walk reached was described or taken from the kept
-    // walk, once; a patched walk asks only of what the front end names and what is asked
-    // each build.
-    if kept.walk.whole.is_some()
-        && kept.walk.described + kept.walk.verified != fresh.walk.described
-    {
+    // Every function a round of a whole walk reached was described, taken from the kept
+    // walk or read from a record of the store (`tests/recorded.rs`), once; a patched walk
+    // asks only of what the front end names and what is asked each build.
+    let accounted = |walk: &Walk| walk.described + walk.verified + walk.found;
+    if kept.walk.whole.is_some() && accounted(&kept.walk) != accounted(&fresh.walk) {
         return Some(format!(
-            "the walk over kept describes asked for {} describes and took {} kept, where the \
-             fresh walk described {}",
-            kept.walk.described, kept.walk.verified, fresh.walk.described
+            "the walk over kept describes asked for {} describes, took {} kept and read {} \
+             records, where the fresh walk described {}",
+            kept.walk.described, kept.walk.verified, kept.walk.found, fresh.walk.described
         ));
     }
     None

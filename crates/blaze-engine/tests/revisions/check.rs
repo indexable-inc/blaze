@@ -35,7 +35,7 @@ fn most(check: &'static str, bound: Option<u64>, got: Option<u64>, what: &str, i
 /// The checks the simulated driver does not see, because its pipeline ends at code records:
 /// nothing is linked or run, no unit is counted, and no engine memo counts are read. It
 /// skips them and says so in each row; every other check it holds.
-pub const SIM_BLIND: &[&str] = &["prints", "says", "max_units", "max_records", "max_runs", "max_executed", "max_verified", "max_written", "max_unkept", "max_ms", "noop", "link"];
+pub const SIM_BLIND: &[&str] = &["prints", "says", "max_units", "max_records", "max_runs", "max_executed", "max_verified", "max_written", "max_unkept", "max_described", "max_ms", "noop", "link"];
 
 /// Each check of `revision` that `seen` fails, but those in `blind` (what the driver cannot
 /// see: said, not taken as met). `clean`: the same revision built from nothing by the same
@@ -134,6 +134,7 @@ fn all(revision: &Revision, seen: &Observed, clean: Option<&Observed>) -> Vec<Fa
     most("max_verified", expect.max_verified, seen.verified, "engine memos verified", &mut failed);
     most("max_written", expect.max_written, seen.written, "engine inputs written", &mut failed);
     most("max_unkept", expect.max_unkept, seen.unkept, "units made whose record was not kept", &mut failed);
+    most("max_described", expect.max_described, seen.described, "describes the codegen walk asked for", &mut failed);
     most("max_ms", expect.max_ms, Some(seen.ms as u64), "ms", &mut failed);
     if expect.noop && seen.noop != Some(true) {
         failed.push(Failure {

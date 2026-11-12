@@ -400,7 +400,7 @@ impl Real {
             seen.runs = Some(0);
             // No build ran, so no unit was made, whether or not a `blaze-work` line said so.
             seen.units = Some(seen.units.unwrap_or(0));
-            (seen.written, seen.unkept) = (Some(0), Some(0));
+            (seen.written, seen.unkept, seen.described) = (Some(0), Some(0), Some(0));
             seen.why = "answered as the last build was (the no-op lane)".to_owned();
             return seen;
         }
@@ -444,7 +444,8 @@ impl Real {
         if let Some(build) = build
             && (revision.expect.max_executed.is_some()
                 || revision.expect.max_verified.is_some()
-                || revision.expect.max_written.is_some())
+                || revision.expect.max_written.is_some()
+                || revision.expect.max_described.is_some())
         {
             let work = self.blaze(&["explain", "edit_work", &format!("build={build}"), "limit=500", "--json"], &none);
             for line in work.stdout.lines() {
@@ -457,9 +458,16 @@ impl Real {
                         _ => {}
                     }
                 }
+                if row["stage"] == "codegen walk" && row["counter"] == "described" {
+                    seen.described = row["total"].as_u64();
+                }
             }
             if work.stderr.contains("counted no work in any stage") {
                 (seen.executed, seen.verified, seen.written) = (Some(0), Some(0), Some(0));
+            }
+            // A build whose units were all records or the no-op lane's answer walked nothing.
+            if revision.expect.max_described.is_some() && seen.described.is_none() && seen.executed.is_some() {
+                seen.described = Some(0);
             }
             if seen.executed.is_none() {
                 seen.why.push_str(&format!("`blaze explain edit_work build={build}` said: {}{}\n", work.stdout, work.stderr));

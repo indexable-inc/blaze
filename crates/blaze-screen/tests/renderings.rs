@@ -106,7 +106,8 @@ fn drawn(command: Command, events: &[Event], caps: Caps, terminal: &Terminal) ->
         ..Options::of(command)
     };
     let mut screen = Screen::new(options, caps);
-    screen.advance_clock(700);
+    // Under the 100 ms past which a build that made nothing is no longer the calm one.
+    screen.advance_clock(40);
     let mut out = String::new();
     for event in events {
         screen.take(event.clone());
@@ -114,11 +115,24 @@ fn drawn(command: Command, events: &[Event], caps: Caps, terminal: &Terminal) ->
             encode(&frame, terminal, &mut out);
         }
     }
-    // The update's brackets, the cursor and the progress report are the same for every
-    // message: the lines are what is compared.
-    out.lines()
-        .map(|it| it.replace("\x1b[?2026h", "").replace("\x1b[?2026l", "").replace("\x1b[?25h", "").replace('\x1b', "\\e"))
-        .filter(|it| !it.is_empty())
+    // The update's brackets, the cursor's moves and the rows erased are the same for every
+    // message, with colour or without: only what styles and links the text is kept (SGR,
+    // which ends in `m`, and OSC), so the lines are what is compared.
+    let mut kept = String::new();
+    let mut rest = out.as_str();
+    while let Some(at) = rest.find("\x1b[") {
+        kept.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        let end = after.find(|c: char| c.is_ascii_alphabetic()).map_or(after.len(), |end| end + 1);
+        if after[..end].ends_with('m') {
+            kept.push_str(&rest[at..at + 2 + end]);
+        }
+        rest = &after[end..];
+    }
+    kept.push_str(rest);
+    kept.lines()
+        .map(|it| it.trim_start_matches('\r').replace('\x1b', "\\e"))
+        .filter(|it| !it.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n")
 }

@@ -908,7 +908,8 @@ fn the_thin_blaze_prints_an_edits_answer_as_this_cli_does() {
         }
         assert_eq!(untimed(&said), untimed(&err), "{typed:?}");
         if !thin.quiet {
-            assert!(said.starts_with("   Compiling foo v0.1.0 (/w/foo)\nlink: /w/target/debug/foo (spliced)\n"), "{said}");
+            // One line, the screen's (docs/terminal.md): no line a unit, no `link:` for a splice.
+            assert!(said.starts_with("blaze: ok built=1 "), "{said}");
         }
     }
     let build = thin_asked(&["build"]);

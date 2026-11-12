@@ -95,7 +95,7 @@ backticks, a path from the checkout as a link to its file; without colour (`NO_C
 pipe) code and commands get their backticks back; JSON carries the spans with their roles
 (`{"Code":"hello::add"}`), so an agent parses no prose. The screen's own lines, a build's why
 and blaze's reports are this type. What is not yet: the messages that still format an
-interpolation between backticks by hand, 5,036 in 95 crates when the type was made
+interpolation between backticks by hand, 5,124 in 99 crates as merged on 2026-11-12
 (`crates/blaze-report/tests/backticks.txt`, a crate a row; its test holds each crate to its
 number, which only goes down), a diagnostic of code among them (`blaze_diagnostics::Diag`'s
 message is a string).

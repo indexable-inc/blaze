@@ -463,9 +463,9 @@ fn only_a_long_build_ends_with_a_notification() {
 /// What the terminal shows after a program `blaze run` started wrote `before` and ended as
 /// `ran`.
 fn footer(before: &str, ran: blaze_screen::Ran) -> String {
-    let caps = Caps { live: true, cols: 40, rows: 10, unicode: true };
+    let caps = Caps { live: true, cols: 80, rows: 10, unicode: true };
     let mut screen = Screen::new(Options::of(Command::Run), caps);
-    let mut vt = vt::Vt::new(40, 10);
+    let mut vt = vt::Vt::new(80, 10);
     vt.write(before);
     screen.take(Event::Ran(ran));
     if let Some(frame) = screen.frame() {
