@@ -11,6 +11,7 @@ use crate::read::Found;
 mod block_checks;
 mod collect;
 mod model_check;
+mod part;
 mod place_copy;
 mod place_whole;
 mod place_crash;
