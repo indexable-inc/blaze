@@ -81,6 +81,8 @@ impl From<Stopped> for Refused {
 /// through [`Io::script`].
 #[derive(Debug)]
 pub struct SimHost {
+    /// Everything written to standard output ([`crate::out::Out`]), in order.
+    pub out: Vec<u8>,
     pub term: SimTerm,
     /// The keychain.
     pub keys: Vec<SimKey>,
@@ -132,6 +134,8 @@ impl SimHost {
     /// windows, devices or names).
     pub fn new() -> SimHost {
         SimHost {
+            // alloc: none, nothing written yet.
+            out: Vec::new(),
             term: SimTerm::new(),
             // alloc: none, the simulated host's empty tables (this and each below).
             keys: Vec::new(),

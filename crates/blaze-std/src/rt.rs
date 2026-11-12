@@ -13,6 +13,8 @@
 //! | [`exit`] | `Host::exit` on a native `Io` | `blaze_sys`'s `exit_group` |
 //! | [`catch_unwind`], [`resume_unwind`] | a task's panic failing only its task; the simulated exit's unwind | bstd's own unwinder entry (on `library/unwind`) |
 //! | [`LazyLock`], [`OnceLock`] | `bstd::sync`'s `Lazy` and `Once` | the same two on bstd's one wait |
+//! | [`run`], [`Exit`] | the entry of a program of the blaze edition (`bstd::entry`): the native world made from the process's arguments, environment and start directory, and the status handed to Rust std's `lang_start` | bstd's own entry on `blaze-sys`: the start block read directly, no `lang_start` |
+//! | [`write_out`] | `Out` on a native `Io` | an effect of blaze-core's drivers that writes to a handle the process was started with |
 //! | `Owns` for `HashMap`, `HashSet`, `Mutex`, `RwLock`, `OnceLock`, `LazyLock` | `bstd::own`'s reachability walk, for code that still holds one of Rust std's | nothing: gone with the last use of those types |
 
 extern crate std;
@@ -22,6 +24,128 @@ pub use std::{
     path::Path as RootPath,
     sync::{LazyLock, OnceLock},
 };
+
+use alloc::{string::{String, ToString as _}, sync::Arc, vec::Vec};
+use core::fmt::Write as _;
+
+use crate::{
+    cx::Cx,
+    entry::{Outcome, Status, run_in},
+    io::{Io, Limits, NativeWorld},
+};
+
+/// The threads the native driver runs file calls on where it has a pool (kqueue, IOCP): a
+/// bound bstd picks for a program's entry, named (std.md, "The second rule").
+pub const FILE_THREADS: usize = 4;
+
+/// What a program of the blaze edition hands Rust std's `lang_start`: its [`Status`], as the
+/// one type of bstd that implements Rust std's `Termination`. Gone with `lang_start`, when
+/// bstd's own entry reads the start block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Exit(pub Status);
+
+impl std::process::Termination for Exit {
+    fn report(self) -> std::process::ExitCode {
+        std::process::ExitCode::from(self.0.0)
+    }
+}
+
+/// The process's entry for a `main` that takes its world: the native [`Io`] over the
+/// directory the process was started in, with its command line, its environment and
+/// [`Limits::USUAL`]; then [`run_in`]. What a failure says goes to standard error as one line,
+/// `error: <what>`, and the process exits with the status (0, or 1 for a failure).
+///
+/// What the world is made from, each read here once and nowhere else:
+/// - the command line: an argument that is not UTF-8 stops the program before `main`, naming
+///   its place (`Args` holds text);
+/// - the environment: a variable whose name or value is not UTF-8 is not in `Env`, which
+///   holds text (a stated gap until `Env` holds bytes);
+/// - the start directory, the root every `Path` is beneath;
+/// - the seed of `Rng`, from the system's randomness as Rust std's hasher keys draw it;
+/// - the host's name, empty: neither blaze-core nor Rust std asks the system for it yet.
+pub fn run<R: Outcome>(main: impl FnOnce(&Cx, Io) -> R) -> Exit {
+    // alloc: once per process, what a failure says.
+    let mut said = String::new();
+    let status = match native() {
+        Ok(io) => run_in(io, &mut said, main),
+        Err(why) => {
+            said.push_str(&why);
+            Status::FAILED
+        }
+    };
+    if !said.is_empty() {
+        error_line(&said);
+    }
+    Exit(status)
+}
+
+/// The process's world, or why it cannot be made.
+fn native() -> Result<Io, String> {
+    // alloc: once per process, its command line.
+    let mut args = Vec::new();
+    for (at, arg) in std::env::args_os().enumerate() {
+        match arg.into_string() {
+            Ok(arg) => args.push(arg),
+            Err(arg) => {
+                // alloc: an error's message.
+                let mut why = String::new();
+                let _ = write!(
+                    why,
+                    "bstd::entry: argument {at} of the command line is not UTF-8 ({}): `Args` holds text",
+                    arg.to_string_lossy()
+                );
+                return Err(why);
+            }
+        }
+    }
+    // alloc: once per process, its environment.
+    let env: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
+    let root = std::env::current_dir().map_err(|error| {
+        // alloc: an error's message.
+        let mut why = String::new();
+        let _ = write!(why, "bstd::entry: the directory the program was started in: {error}");
+        why
+    })?;
+    let seed = {
+        use std::hash::BuildHasher as _;
+        std::hash::RandomState::new().hash_one(0u8)
+    };
+    let world = NativeWorld {
+        root: &root,
+        threads: FILE_THREADS,
+        env,
+        args,
+        // alloc: once per process, the host's name (empty: see `run`).
+        host_name: Arc::from(""),
+        seed,
+        limits: Limits::USUAL,
+    };
+    // alloc: an error's message.
+    Io::native(world).map_err(|error| error.to_string())
+}
+
+/// `said` on standard error, as `error: <said>` and a line feed. A standard error that
+/// cannot be written to changes nothing: the status still says the program failed.
+fn error_line(said: &str) {
+    use std::io::Write as _;
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(b"error: ").and_then(|()| err.write_all(said.as_bytes())).and_then(|()| err.write_all(b"\n"));
+}
+
+/// `parts`, in order, on the process's standard output, flushed: all of them or the host's
+/// refusal as it says it.
+pub(crate) fn write_out(parts: &[&[u8]]) -> Result<(), String> {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    for part in parts {
+        // alloc: an error's message.
+        out.write_all(part).map_err(|error| error.to_string())?;
+    }
+    // alloc: an error's message.
+    out.flush().map_err(|error| error.to_string())
+}
 
 /// The process's id.
 pub(crate) fn process_id() -> u32 {

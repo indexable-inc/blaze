@@ -158,6 +158,7 @@ pub mod cx;
 pub mod device;
 /// The simulated disk's ledger: what file calls paid, and which names a crash may undo.
 pub mod disk;
+pub mod entry;
 pub mod env;
 /// Who decides how a pure function is computed: `Eval` and its providers, memo points, keys.
 pub mod eval;
@@ -185,6 +186,7 @@ mod narrow;
 pub mod net;
 /// Handing a URL to the user's default application: `Opener`, narrowed to a scheme.
 pub mod opener;
+pub mod out;
 /// Ownership properties derived by reflection (`Acyclic`, `NoCapability`), the walk they are
 /// instances of, and the handles built on them: `Shared`, `LocalShared`, `Shares`.
 #[expect(
@@ -344,6 +346,25 @@ pub mod test {
     /// `cfg(blaze_check)`.
     pub mod checked {
         pub use blaze_check::{cell, hint, linear, sync, thread};
+    }
+}
+
+/// What a crate of the blaze edition has in scope unasked (docs/v2/plan/design/std.md, "The
+/// blaze edition: opting in"): one module an edition, named for it, as Rust's `std::prelude`
+/// has one a Rust edition.
+pub mod prelude {
+    /// The prelude of `edition = "blaze-2026.11"`: `core`'s prelude of Rust 2024, the two
+    /// types every `main` names, and `core`'s macros that Rust's `std` hands on from its
+    /// root. No collection is here: one is made in an allocator its code was handed
+    /// (std.md, "Memory is explicit").
+    pub mod blaze_2026_11 {
+        pub use core::prelude::rust_2024::*;
+        pub use core::{
+            assert_eq, assert_ne, debug_assert, debug_assert_eq, debug_assert_ne, matches, panic, todo,
+            unimplemented, unreachable, write, writeln,
+        };
+
+        pub use crate::{cx::Cx, io::Io};
     }
 }
 
