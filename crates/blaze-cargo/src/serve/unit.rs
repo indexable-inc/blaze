@@ -602,6 +602,7 @@ fn units_differ(kept: &Units, now: &Units) -> &'static str {
         packages,
         lock,
         warnings,
+        notes,
         target_dir,
         build_dir,
         finished,
@@ -619,6 +620,8 @@ fn units_differ(kept: &Units, now: &Units) -> &'static str {
         "the lock file to write"
     } else if warnings != &now.warnings {
         "the load's warnings"
+    } else if notes != &now.notes {
+        "the load's notes"
     } else if target_dir != &now.target_dir {
         "the target directory"
     } else if build_dir != &now.build_dir {

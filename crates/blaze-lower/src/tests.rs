@@ -250,6 +250,7 @@ fn units() -> Units {
         packages,
         lock: None,
         warnings: Vec::new(),
+        notes: Vec::new(),
         target_dir: "/w/target".to_owned(),
         build_dir: "/w/target".to_owned(),
         finished: "`dev` profile [unoptimized + debuginfo]".to_owned(),

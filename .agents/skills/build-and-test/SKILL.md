@@ -9,18 +9,25 @@ description: "How blaze is built, checked, tested and measured, and how a lane r
 
 ## blaze-builds-blaze (rule 2)
 
-Build, check and test blaze with blaze (`blaze build`, `blaze check`, `blaze test`), never `cargo`,
-`rustc` or sccache, in any place: an agent's loop, a harness, a CI workflow, a benchmark, the
-release build or a doc's instructions. Stage 0 is a blaze binary (the release
-`.github/blaze-version` names, or a blaze built earlier), never cargo, until the wasm seed replaces
-it (docs/future/bootstrap.md). Stage 0 is never overwritten: a build of the tree (stage 1) becomes
-stage 0 only after it rebuilds the tree (stage 2) byte for byte and the tests pass, and moving
-`.github/blaze-version` forward is that promotion. When stage 0 can't build the tree, that is a
-named error: write the source around it for one release or pin an older release, never cargo. Every
-build, check, test and verdict comes from blaze. When blaze fails on blaze (a compile error, a link
-error, a panic, a hang, a wrong result, too slow, too much memory), that failure is the work: fix
-blaze, never route around it through cargo. A crate blaze can't check or test yet is a ranked, owned
-blocker, not a reason to keep using cargo for it.
+Interim, by the owner's decision of 2026-11-11: blaze's own tree is built, checked and unit-tested
+in the dev loop with cargo and the pinned nightly (`harness/toolchain`): `cargo +nightly-<date>
+check -p blaze-engine`, `cargo +nightly-<date> build --release -p blaze-engine`, with
+`LLVM_SYS_231_PREFIX` naming the LLVM `crates/hir-ty-codegen/llvm.json` pins (blaze's own copy under
+`~/.blaze/native/` serves). On 2026-11-11 that check took under two minutes and a release build 292
+s on an 18-core Mac, where blaze building blaze took about 80 minutes and 175 GB on 64 cores. A
+blaze cargo built is a legal stage 0 and the daily driver. What does not change: blaze must keep
+building blaze (a self-build runs at least daily and before a release, and a release binary is one
+blaze built, stage 2 equal to stage 3); a claim about what blaze does (it builds a project, an edit
+takes so long, a test passes under it) is measured with a blaze, never with cargo standing in for
+it; and a failure of blaze on blaze (a compile error, a panic, too slow, too much memory) is ranked
+work, never dropped because cargo got past it. The tree stays accepted by both compilers while this
+holds: attribute-form extensions (`#[blaze::pure]`, `#![blaze::sans_io]`, tool attributes rustc
+ignores) are used as before, and code only blaze accepts (a borrow rustc refuses, extension syntax)
+waits or sits behind the extension's own crate; where the two disagree on plain Rust, rustc's
+refusal of a program blaze accepted is a blaze bug to file (2026-11-11: a method redeclaring its
+impl's lifetime). The rule returns to blaze-only when the owner says the loop is fast enough; the
+measure to watch is a warm rebuild of blaze by blaze after a one-function change in under a minute,
+and a cold one inside 64 GiB. Never sccache.
 
 See [docs/contributing.md](../../../docs/contributing.md).
 
@@ -58,13 +65,18 @@ See [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#wor
 
 ## fan-out-write-only (rule 35)
 
-Fan out code, not builds. Subagents only read and write code, including the tests for it. They never
-run a build, check, test, clippy, benchmark or any other expensive step, and never start a daemon or
-a VM. The main agent waits until every subagent has finished writing, applies all their changes to
-one tree, and then runs it once: `blaze check` and `blaze test` (the central loop), with keep-going.
-It hands each failure back to a fresh subagent for the code that broke, with the exact tree, the
-command and the error, and runs again. Checks that need a variant tree, such as reverting a fix to
-show its test fails (test-the-cause), are also run by the main agent, as patches.
+The time that matters is from a change to knowing whether it works. A lane given its own ix VM (one
+per lane, `ix new --name <lane>`, named in its brief; never the Mac, never a shared VM, never AWS)
+closes that loop itself: it ships its worktree there, runs `blaze check` with tests and `blaze test`
+for what it touched, reads the errors and fixes them, and reports results, not "nothing was
+compiled". It builds only with blaze (`blaze-builds-blaze`), on the compiler its brief names,
+touches nothing it did not make, and removes its VM when done (`clean-up-lane`). A lane with no VM
+only reads and writes code and says plainly that nothing was built. What stays with the main agent:
+merging to main, and before a merge one check of the exact tip being merged, tests included (a
+library build alone is not "compiles"); every measurement a speed or memory claim rests on, with its
+exact tree (`measure-the-exact-tree`); changes to persisted state, the bootstrap and the pinned
+compiler; and deciding what to do next. Use few lanes (`agents-are-a-cost`): a VM per lane is 64
+cores, so each must be worth it.
 
 ## worktree-per-lane (rule 36)
 
@@ -99,10 +111,13 @@ See [docs/v2/plan/design/tasks.md](../../../docs/v2/plan/design/tasks.md).
 
 ## agents-are-a-cost (rule 48)
 
-An agent costs its whole context, and its report loses detail both ways. The coordinator does small
-pieces, reads and deletions itself. Start a worker only for a piece that is independent of the
-others and large enough to pay for its brief; four workers at once is a lot. Never start a fleet to
-read or summarise.
+An agent costs its whole context, and its report loses detail both ways, so the coordinator does
+small pieces, reads and deletions itself and never starts a fleet to read or summarise. But work
+that splits into independent, large pieces is done in parallel, all of it at once (`sota-first`):
+one lane per piece, each with its own worktree and a brief that states its outcome and check, as
+many as the work has independent pieces and the machines can build. What bounds the number is
+independence (two lanes in one file cost more than they save) and the coordinator's ability to merge
+and verify what comes back, not a fixed count.
 
 See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
 
