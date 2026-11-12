@@ -38,6 +38,10 @@ pub const STARTED_WITH: &[&str] = &[
     blaze_core::cores::VAR,
     // The DuckDB the explorer and live SQL run (`serve::engine`, read once).
     super::observe::DUCKDB,
+    // The profile history's cap in MiB (`serve::observe::keep_history`, read once).
+    blaze_profile::history::CAP_VAR,
+    // What the profile records between builds (`serve::observe::keep_history`, read once).
+    blaze_profile::sampler::DETAIL_VAR,
     // The kept expansions' check (proc-macro-api's `kept.rs`, at the daemon's setup).
     proc_macro_api::kept::CACHE,
     // Huge pages (blaze-mem's `huge.rs`, chosen once).

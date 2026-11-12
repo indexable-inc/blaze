@@ -207,6 +207,12 @@ fn drain(
         if on_cpu && depth == 0 {
             return;
         }
+        // A block in a span of no build while no build runs is not sampled unless asked, as
+        // on macOS (`super::samples_blocked`); judged as the drain reads it, so a block that
+        // ended as its build did may be judged a moment late.
+        if !on_cpu && !super::samples_blocked(crate::flight::build_of(span)) {
+            return;
+        }
         let mut it = Sample {
             at: clock.instant(at_ns),
             tid,

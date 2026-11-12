@@ -586,6 +586,22 @@ pub fn keep_history(
     events: blaze_profile::logs::Policy,
 ) -> Result<(Profiling, Keeper), String> {
     let dir = history::dir_in(state);
+    // How much is recorded between builds, and the cap, as the daemon was started
+    // (`settings::STARTED_WITH`); one that does not read fails the start, naming it.
+    let detail = std::env::var(blaze_profile::sampler::DETAIL_VAR);
+    let detail = match &detail {
+        Ok(value) => Some(value.as_str()),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => Some("(not UTF-8)"),
+    };
+    blaze_profile::sampler::sample_between_builds(blaze_profile::sampler::detail_of(detail)?);
+    let cap = match std::env::var(history::CAP_VAR) {
+        Ok(value) => history::cap_of(Some(&value))?,
+        Err(std::env::VarError::NotPresent) => history::cap_of(None)?,
+        Err(std::env::VarError::NotUnicode(value)) => {
+            history::cap_of(Some(&value.to_string_lossy()))?
+        }
+    };
     let owner = claim(&dir).map_err(|it| it.to_string())?;
     let (ended, rows) = crossbeam_channel::unbounded();
     let (failed_to, failed) = crossbeam_channel::unbounded();
@@ -600,7 +616,7 @@ pub fn keep_history(
             // Held until the last flush is written: a daemon after this one numbers its builds
             // from what this one wrote.
             let _owner = owner;
-            match History::open(&at, history::CAP_BYTES, blaze_profile::sampler::process()) {
+            match History::open(&at, cap, blaze_profile::sampler::process()) {
                 Ok(mut history) => {
                     history.events_policy(events);
                     // The daemon's own panics go to its history, and a fatal signal of it to
@@ -785,6 +801,9 @@ fn keep(
     doing: &Doing,
 ) {
     let mut flushed_at = Instant::now();
+    // When the history last wrote, or was last asked to by anything but the timer: a quiet
+    // history's timer writes only every `history::IDLE_EVERY`.
+    let mut written_at = Instant::now();
     // The builds that ended and whose answer has not been said, oldest first ([`Noted`]).
     let mut noted: Vec<Noted> = Vec::new(); // alloc: none until a build ends
     loop {
@@ -800,10 +819,23 @@ fn keep(
                 }
                 tell_failed(&mut history, failed);
                 flushed_at = Instant::now();
+                written_at = flushed_at;
                 continue;
             }
             default(due) => Err(RecvTimeoutError::Timeout),
         };
+        // The timer, with no build running, none whose row or answer waits, and a write
+        // within the last minute: nothing a flush now would write but the daemon's own
+        // heartbeat, a file a table for a few hundred rows. Held for the next flush anything
+        // asks for, at most `history::IDLE_EVERY`.
+        if matches!(next, Err(RecvTimeoutError::Timeout))
+            && noted.is_empty()
+            && history.quiet()
+            && written_at.elapsed() < history::IDLE_EVERY
+        {
+            flushed_at = Instant::now();
+            continue;
+        }
         // In a task of the profile's tag, so what a flush reads and keeps (the rings' rows,
         // the history's buffers) is named on the daemon's memory line.
         //
@@ -845,6 +877,7 @@ fn keep(
             (flushed.map(drop), batch.last)
         });
         flushed_at = Instant::now();
+        written_at = flushed_at;
         if let Err(error) = flushed {
             tracing::error!("{error}");
             _ = failed.send(error.to_string()); // alloc: error path, a flush that failed

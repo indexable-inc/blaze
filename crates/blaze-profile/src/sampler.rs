@@ -42,6 +42,58 @@ use macos as platform;
 
 /// Samples a second of a thread's CPU time: prime, so it beats with no periodic work.
 pub const HZ: u32 = 49;
+
+/// Builds the history was told started and not yet ended ([`build_running`]).
+static BUILDS_RUNNING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Whether a blocked thread is sampled between builds too ([`sample_between_builds`]).
+static BETWEEN_BUILDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The daemon's setting for how much the profile records between builds: unset or `lean`,
+/// a thread blocked in a span of no build while no build runs is not sampled; `full`, it is,
+/// as it was until 2026-11-11.
+pub const DETAIL_VAR: &str = "BLAZE_PROFILE_DETAIL";
+
+/// What [`DETAIL_VAR`] set to `value` asks: whether blocked threads are sampled between
+/// builds. A value that is neither `lean` nor `full` is refused, naming it.
+pub fn detail_of(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None | Some("lean") => Ok(false),
+        Some("full") => Ok(true),
+        // alloc: an error, once a daemon
+        Some(other) => Err(format!(
+            "{DETAIL_VAR}={other:?} is neither `lean` (blocked threads are not sampled between builds; \
+             what it is unset) nor `full` (they are)"
+        )),
+    }
+}
+
+/// Has a thread blocked inside a span be sampled while no build runs too (`full`), or not
+/// (`lean`, the default): an idle daemon's 21 threads, each parked in its loop's wait, were
+/// 51,821 off-CPU samples a minute and 0.6 MB of files (2026-11-11), the largest part of the
+/// 1.2 MB a minute an idle daemon wrote. Once, as the daemon starts.
+pub fn sample_between_builds(full: bool) {
+    BETWEEN_BUILDS.store(full, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Notes a build started (`true`) or ended: the history says each as it is told it. An end
+/// with no start counted (a build told only as it ended) leaves the count at 0.
+pub(crate) fn build_running(running: bool) {
+    use std::sync::atomic::Ordering;
+    if running {
+        BUILDS_RUNNING.fetch_add(1, Ordering::Relaxed);
+    } else {
+        _ = BUILDS_RUNNING.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |it| it.checked_sub(1));
+    }
+}
+
+/// Whether a thread blocked inside a span of build `build` (0: of none) is sampled now: one
+/// of a build's always, and any while a build runs (the loop's waits during a build are part
+/// of what the build waited on) or when the daemon was started with `full` detail. A thread
+/// on the CPU is always sampled, between builds too.
+pub(crate) fn samples_blocked(build: u32) -> bool {
+    use std::sync::atomic::Ordering;
+    build != 0 || BUILDS_RUNNING.load(Ordering::Relaxed) != 0 || BETWEEN_BUILDS.load(Ordering::Relaxed)
+}
 /// Addresses a sample keeps, the innermost first: where the thread was, then each return
 /// address up its stack.
 pub(crate) const DEPTH: usize = 48;
