@@ -2796,14 +2796,14 @@ fn program_units_of_a_real_library() -> Units {
     units
 }
 
-/// [`program_units_of_a_real_library`] lowered in a workspace whose root is `/w` (a root
-/// manifest with a `[workspace]` there) or, without one, the first member's own directory:
+/// [`program_units_of_a_real_library`] lowered in a workspace whose root is `/w` (the view's
+/// root manifest, with its `[workspace]`) or, with that manifest gone, the first member's own
+/// directory:
 /// two workspaces to every crate made with the workspace's root.
 fn lowered_in_workspace(rooted: bool) -> Built {
     let tree = MemTree::default();
-    let manifest: &[(&'static str, Option<&'static [u8]>)] =
-        &[("Cargo.toml", Some(b"[workspace]\nmembers = [\"a\", \"b\", \"m\"]\n"))];
-    let root = changed(&tree, if rooted { manifest } else { &[] });
+    let unrooted: &[(&'static str, Option<&'static [u8]>)] = &[("Cargo.toml", None)];
+    let root = changed(&tree, if rooted { &[] } else { unrooted });
     let config = config(root, library(&tree));
     let units = program_units_of_a_real_library();
     let lowered =
@@ -2855,7 +2855,7 @@ fn the_workspaces_root_is_never_the_standard_librarys() {
     let core = units.packages.iter().position(|it| it.name == "core").unwrap();
     units.packages.swap(0, core);
     let tree = MemTree::default();
-    let root = changed(&tree, &[("Cargo.toml", Some(b"[workspace]\nmembers = [\"a\", \"b\", \"m\"]\n"))]);
+    let root = view(&tree);
     let config = config(root, library(&tree));
     let mounts = crate::files::Mounts {
         mounts: &config.mounts,
