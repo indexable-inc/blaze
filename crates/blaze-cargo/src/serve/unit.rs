@@ -447,11 +447,11 @@ impl Steps for Real {
                                     );
                                     drop((session, lowered, seeds));
                                 }
-                                (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new())
+                                (blaze_lower::lower_awaiting(lower()).map_err(failed)?, None, Vec::new())
                             }
                         }
                     }
-                    None => (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new()),
+                    None => (blaze_lower::lower_awaiting(lower()).map_err(failed)?, None, Vec::new()),
                 };
                 // How the front end's identities write paths, told before any is asked: against
                 // the build's directories ([`portable::Places`]), so a unit's record key does
@@ -503,6 +503,19 @@ impl Steps for Real {
                 job._seeded = seeded;
                 let job = Arc::new(job);
                 let waits = graph::Waits::new(&job.graph);
+                // The ready units' crates are asked of the store before anything reads one:
+                // the front end awaits the crates lowered into it (`blaze_lower::lower_awaiting`),
+                // and the harness below reads each ready unit's resolution. This serve reads
+                // the ones with records from them and resolves the rest; the serve after the
+                // identities then finds only what the harness's roots moved.
+                let mut deps = None;
+                deps::serve(
+                    &mut lowered,
+                    &job,
+                    &deps::ready(&job, &waits),
+                    &mut session,
+                    &mut deps,
+                )?;
                 // After the seeds (the root's parse is seeded as on disk), before any identity:
                 // a test crate is identified by its root with the harness.
                 // A unit refused here has no write to charge it to yet: the lowering fails, naming each.
@@ -523,7 +536,6 @@ impl Steps for Real {
                 // Kept or fresh alike: the session's keys say which crates' keys moved, and a kept
                 // front end's serve of the units ready now finds none moved unless a write before
                 // this job's moved one.
-                let mut deps = None;
                 deps::serve(
                     &mut lowered,
                     &job,
@@ -559,6 +571,40 @@ impl Steps for Real {
         let front = Arc::new(JobFront(writer.job.clone()));
         Ok(FrontEnd { front, writer, puts, misses })
     }
+}
+
+/// Serves the crates of `written`, the units a batch of runs and loads made ready or a loaded
+/// proc macro reaches ([`deps::serve`]), adding to what `kept` holds of the job's serves:
+/// before their harnesses read them (the units made ready were awaited until then), and again
+/// after the harness's roots and the identities, for a key those writes moved. A serve that
+/// fails or panics has left the front end partly served, which no unit's write owns: the
+/// error is the writer's own, naming the units served; no unit is built over it.
+fn serve_written(
+    lowered: &mut Lowered,
+    job: &Job,
+    written: &[u32],
+    session: &mut deps::Session,
+    kept: &mut Option<deps::Kept>,
+) -> Result<(), ApiError> {
+    let Some(&first) = written.first() else { return Ok(()) };
+    let served = applying(first as usize, "serving dependencies", || {
+        deps::serve(lowered, job, written, session, kept)
+    });
+    let error = match served {
+        Ok(Ok(())) => return Ok(()),
+        Ok(Err(error)) => error,
+        Err(broke) => ApiError::new(broke.how.to_string(), None), // alloc: an error, once
+    };
+    let units =
+        written.iter().map(|&it| lowered.what(it as usize)).collect::<Vec<_>>().join(", "); // alloc: an error, once
+    let at = error.at.as_deref().map(|at| format!(" at {at}")).unwrap_or_default(); // alloc: an error, once
+    let what = format!(
+        "serving from the store the dependencies of {units}, which a batch of build scripts' runs and \
+         proc macros' loads made ready, failed{at}: {}; the front end is left partly served, and no unit \
+         is built over it",
+        error.what
+    ); // alloc: an error, once
+    Err(ApiError::new(what, error.at))
 }
 
 /// Why job `input`'s lowering does not lower into the kept front end `kept`, by the part of
@@ -1130,6 +1176,12 @@ impl Writer<Real> for UnitWriter {
         // code moves the key of every crate it reaches.
         let (job, waits, ready) = (&self.job, &self.waits, &self.ready);
         let mut written = harness::reached(job, waits, &loaded, ready);
+        // Asked of the store before the harness reads them: the units the runs made ready
+        // were awaited until now (`blaze_lower::lower_awaiting`), with everything above them.
+        if let Err(error) = serve_written(lowered, job, &written, &mut self.session, &mut self.deps) {
+            self.broken = true;
+            return Err(error);
+        }
         if let Some(&first) = written.first() {
             match applying(first as usize, "the harness", || {
                 harness::write(lowered, job, written.iter().copied())
@@ -1166,32 +1218,9 @@ impl Writer<Real> for UnitWriter {
         // before (rule 21). A serve that fails or panics has left the front end partly served,
         // which no unit's write owns: it is the writer's own error, and ends the job with or
         // without keep-going, naming the units it served; no unit is built over it.
-        if let Some(&first) = written.first() {
-            let (job, session, kept) = (&self.job, &mut self.session, &mut self.deps);
-            let served = applying(first as usize, "serving dependencies", || {
-                deps::serve(lowered, job, &written, session, kept)
-            });
-            let failed = match served {
-                Ok(Ok(())) => None,
-                Ok(Err(error)) => Some(error),
-                Err(broke) => Some(ApiError::new(broke.how.to_string(), None)), // alloc: an error, once
-            };
-            if let Some(error) = failed {
-                self.broken = true;
-                let units = written
-                    .iter()
-                    .map(|&it| lowered.what(it as usize))
-                    .collect::<Vec<_>>()
-                    .join(", "); // alloc: an error, once
-                let at = error.at.as_deref().map(|at| format!(" at {at}")).unwrap_or_default(); // alloc: an error, once
-                let what = format!(
-                    "serving from the store the dependencies of {units}, which a batch of build scripts' runs and \
-                     proc macros' loads made ready, failed{at}: {}; the front end is left partly served, and no unit \
-                     is built over it",
-                    error.what
-                ); // alloc: an error, once
-                return Err(ApiError::new(what, error.at));
-            }
+        if let Err(error) = serve_written(lowered, &self.job, &written, &mut self.session, &mut self.deps) {
+            self.broken = true;
+            return Err(error);
         }
         Ok(true)
     }

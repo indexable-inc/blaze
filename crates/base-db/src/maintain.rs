@@ -100,6 +100,8 @@ pub struct Written<'a> {
     /// [`crate::add_crates`]): no crate that was there depends on one, and none of them was
     /// read before, so a maintainer owes each a first run and the others nothing for it. A
     /// plan lowered into a front end that holds another plan's crates adds its own this way.
+    /// Also the crates no maintainer was shown before this write and is shown now
+    /// ([`Db::note_crates_added`]: `hir_def::deps`' awaited crates, released).
     pub crates_added: &'a [Crate],
     /// Crates given proc macros in place of those they had ([`Db::note_proc_macros`]).
     pub proc_macros: &'a [Crate],
@@ -602,6 +604,19 @@ impl Db {
     /// crate's proc macros), as a write: outside a [`Db::batch`] the maintainers run now.
     pub fn note_crates_changed(&mut self) {
         self.write("Db::note_crates_changed", |db| db.note(Note::Crates));
+    }
+
+    /// Notes each of `crates` as a crate added ([`Written::crates_added`]), as a write: crates
+    /// already in the graph that no maintainer was shown yet (`hir_def::deps`' awaited crates,
+    /// released), so to the maintainers this write is their first appearance. The caller holds
+    /// what makes that true: no maintainer ran, prepared or published any of them, nor a crate
+    /// depending on one.
+    pub fn note_crates_added(&mut self, crates: &[Crate]) {
+        self.write("Db::note_crates_added", |db| {
+            for &krate in crates {
+                db.note(Note::CrateAdded(krate));
+            }
+        });
     }
 
     /// Notes that `krate` was given proc macros in place of those it had, as a write: outside a

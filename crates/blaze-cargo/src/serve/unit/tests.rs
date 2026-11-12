@@ -21,6 +21,8 @@ use blaze_usercode::run::Value;
 
 use super::{artifact, codegen, compile, graph, run, script, test, unit_target};
 
+/// A dependency with records is never resolved by the daemon that finds them.
+mod awaited;
 /// What a unit said, kept in its record and drawn for each client.
 mod drawn;
 /// `artifact = "gpu"` dependencies, their device build and its MSL applied to the host.
@@ -2013,7 +2015,7 @@ fn script_lib_front(lib: &[u8]) -> blaze_lower::Lowered {
         sources: "/s/sources".to_owned(),
         blaze: String::new(),
     };
-    blaze_lower::lower(blaze_lower::Lower {
+    blaze_lower::lower_awaiting(blaze_lower::Lower {
         units: &units,
         config: &config,
         files: &tree,

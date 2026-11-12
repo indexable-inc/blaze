@@ -296,15 +296,23 @@ impl State {
 /// Step 0's apply, before any crate's node: drops the crates gone, and gives each crate
 /// maintained for the first time its state and its directory's empty slot, all the slots
 /// registered with one write ([`publish::register_slots`]). Reads only inputs.
+///
+/// A blocked crate (`hir_def::deps::awaited`: its records, or those of a crate below it, were
+/// not asked for yet) is passed over: it gets its state and slot in the write that releases
+/// it, where it is maintained for the first time.
 pub(crate) fn prepare(db: &mut Db, state: &mut State, written: &Written<'_>) {
     let crates = base_db::all_crates(&*db);
     if written.crates {
         drop_gone(state, &crates);
     }
+    let blocked = hir_def::deps::awaited::blocked(&*db);
     let mut slots = std::mem::take(&mut state.scratch.slots);
     slots.clear();
     for &krate in crates.iter() {
         if frozen::served(&*db, krate) || state.crates.contains_key(&krate) {
+            continue;
+        }
+        if blocked.contains(&krate) {
             continue;
         }
         let durability = base_db::crate_durability(&*db, krate);
@@ -374,6 +382,14 @@ pub(crate) fn run_nodes(db: &Db, state: &mut State, last: &LastWrite, written: &
         reset_impls.clear();
         for &krate in crates.iter() {
             if frozen::served(db, krate) {
+                continue;
+            }
+            // Blocked (`hir_def::deps::awaited`): no state ([`prepare`]), no delta, no node.
+            if last.blocked.contains(&krate) {
+                debug_assert!(
+                    !state.crates.contains_key(&krate),
+                    "impls: the blocked crate {krate:?} has a state"
+                );
                 continue;
             }
             let delta = state.scratch.deltas.get(&krate).copied();
