@@ -1,0 +1,32 @@
+[package]
+name = "blaze-launch-host"
+description = "The daemon's side of blaze's launcher (docs/v2/plan/design/launcher.md, steps 3 to 5): a build's functions and statics made records the launcher takes, and the sans-IO state of one program its launchers run - slots by identity, what each launcher has bound, a rebuild classified as an edit to apply live or a restart"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-codegen.workspace = true
+blaze-format.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-items.workspace = true
+blaze-launch.workspace = true
+# A `Location`'s layout and a span table's encoding are the linker's (`blaze_link::position`).
+blaze-link.workspace = true
+# A record's id: the BLAKE3 hash of its bytes, as the launcher checks it.
+blake3.workspace = true
+
+[dev-dependencies]
+hegeltest.workspace = true
+
+[lints]
+workspace = true

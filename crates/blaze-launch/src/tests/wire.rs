@@ -22,13 +22,15 @@ enum Owned {
     Frames { txn: u64, held: Vec<Slot> },
     Ended { domain: u64, marks: Vec<u8>, needs: Option<String> },
     Restarting { txn: u64 },
-    Welcome { slots: u32, entry: u32 },
+    Welcome { slots: u32 },
+    Start { entry: u32, inits: Vec<u32> },
     Record { id: [u8; 32], bytes: Vec<u8> },
     Statics { defs: Vec<(u32, [u8; 32])>, refs: Vec<u32> },
     Edit { txn: u64, binds: Vec<OwnedBind>, refs: Vec<u32>, declare: u32, together: bool },
     Refused { slot: u32, diagnostic: String },
     Probe { txn: u64, slots: Vec<Slot> },
     Restart { txn: u64, why: String },
+    Unheld { why: String },
 }
 
 /// A bind without its refs: every bind of a drawn edit shares the edit's one list.
@@ -111,8 +113,9 @@ impl Owned {
                 Message::Ask(Ask::Ended { domain: *domain, marks, needs: needs.as_deref() })
             }
             Owned::Restarting { txn } => Message::Ask(Ask::Restarting { txn: Txn(*txn) }),
-            Owned::Welcome { slots, entry } => {
-                Message::Tell(Tell::Welcome { slots: *slots, entry: Slot(*entry) })
+            Owned::Welcome { slots } => Message::Tell(Tell::Welcome { slots: *slots }),
+            Owned::Start { entry, inits } => {
+                Message::Tell(Tell::Start { entry: Slot(*entry), inits: List::of(inits) })
             }
             Owned::Record { id, bytes } => {
                 Message::Tell(Tell::Record { id: RecordId(*id), bytes })
@@ -133,6 +136,7 @@ impl Owned {
                 Message::Tell(Tell::Probe { txn: Txn(*txn), slots: List::of(slots) })
             }
             Owned::Restart { txn, why } => Message::Tell(Tell::Restart { txn: Txn(*txn), why }),
+            Owned::Unheld { why } => Message::Tell(Tell::Unheld { why }),
         }
     }
 }
@@ -174,7 +178,7 @@ fn slots(tc: &TestCase) -> Vec<Slot> {
 }
 
 fn owned(tc: &TestCase) -> Owned {
-    match pick(tc, 13) {
+    match pick(tc, 15) {
         0 => Owned::Hello {
             program: id(tc),
             pid: number(tc),
@@ -192,7 +196,12 @@ fn owned(tc: &TestCase) -> Owned {
             needs: tc.draw(gs::booleans()).then(|| text(tc)),
         },
         6 => Owned::Restarting { txn: number(tc) },
-        7 => Owned::Welcome { slots: small(tc), entry: small(tc) },
+        7 => Owned::Welcome { slots: small(tc) },
+        14 => Owned::Unheld { why: text(tc) },
+        13 => Owned::Start {
+            entry: small(tc),
+            inits: (0..pick(tc, 30)).map(|_| small(tc)).collect(),
+        },
         11 => Owned::Record {
             id: id(tc),
             bytes: (0..pick(tc, 300)).map(|at| at as u8).collect(),

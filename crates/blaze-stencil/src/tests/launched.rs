@@ -402,7 +402,7 @@ fn daemon(mut socket: UnixStream, leaf_k: Arc<AtomicI64>) -> Served {
             let (_, ask) = Ask::decode(item).expect("a message of the launcher's");
             match ask {
                 Ask::Hello { .. } => {
-                    tell(&mut socket, 1, &Tell::Welcome { slots: SLOTS, entry: Slot(TWICE) });
+                    tell(&mut socket, 1, &Tell::Welcome { slots: SLOTS });
                     // The program's statics: 0 holds 1000; 1 is a thread-local of 42.
                     let (plain, plain_id) = static_record(1000, false, "STATIC0");
                     let (local, local_id) = static_record(42, true, "TLS1");
@@ -413,6 +413,8 @@ fn daemon(mut socket: UnixStream, leaf_k: Arc<AtomicI64>) -> Served {
                         wire::StaticDef { number: 1, record: local_id, refs: List::of(&[]) },
                     ];
                     tell(&mut socket, 4, &Tell::Statics { defs: List::of(&defs) });
+                    let start = Tell::Start { entry: Slot(TWICE), inits: List::of(&[0]) };
+                    tell(&mut socket, 5, &start);
                 }
                 Ask::Need { slot, .. } => {
                     served.needs.push(slot.0);
@@ -479,11 +481,17 @@ fn tier_zero_code_runs_in_the_launcher_compiled_on_first_call_and_edited_while_i
     let (ready, entry) = crossbeam_channel::bounded(1);
     let control = std::thread::spawn(move || {
         let mut records = Loaded::new().expect("the program's data");
-        let served = blaze_launch_rt::run(driver, ours, ProgramId([3; 32]), &mut records, ready);
+        let stay = |why: &str| format!("a test's launcher does not restart: {why}");
+        let served =
+            blaze_launch_rt::run(driver, ours, ProgramId([3; 32]), &mut records, ready, stay);
         (served, records)
     });
-    let entry = entry.recv_timeout(PATIENCE).expect("the daemon's welcome").expect("an entry");
-    assert_eq!(Some(entry), shared.thunk(Slot(TWICE)), "the entry is the entry slot's thunk");
+    let start = entry.recv_timeout(PATIENCE).expect("the daemon's word to start").expect("an entry");
+    assert_eq!(Some(start.entry), shared.thunk(Slot(TWICE)), "the entry is the entry slot's thunk");
+    // The one initializer the daemon named: static 0, at an address that holds its value.
+    assert_eq!(start.inits.len(), 1);
+    // SAFETY: the address of static 0, 8 bytes the launcher placed and never unmaps.
+    assert_eq!(unsafe { (start.inits[0] as *const u64).read() }, 1000);
 
     let me = shared.birth().begin();
     let address = |slot: u32| shared.thunk(Slot(slot)).expect("a slot of the table");

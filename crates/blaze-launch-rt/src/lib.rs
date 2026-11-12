@@ -10,6 +10,7 @@
 //! | [`control`] | the control thread: the patch protocol over a Unix socket, the stubs' needs, the threads' reports |
 //! | [`records`] | [`Loaded`]: the records the daemon sends, checked against their ids; the program's data and statics in a mapping of their own; outside symbols by `dlsym` |
 //! | [`tls`] | the program's thread-locals: a table a thread, a copy made on first touch, reached through a record's pool |
+//! | [`threads`] | the program's own threads told to the core: its `pthread_create` announces each birth, a key's destructor each end |
 //! | [`unwind`] | a placed function's unwind entry, told to the system's unwinder and taken back when the body is freed |
 //!
 //! Who touches what, which is the whole of the design's safety:
@@ -41,13 +42,14 @@ pub mod drive;
 pub mod records;
 pub mod sys;
 pub mod table;
+pub mod threads;
 pub mod tls;
 pub mod unwind;
 
 #[cfg(test)]
 mod tests;
 
-pub use control::{ControlError, run};
+pub use control::{ControlError, Start, run};
 pub use drive::{Config, Driver, EditError, Error, Place, REACH, Records};
 pub use records::Loaded;
 pub use table::{Birth, Bound, Event, Mutator, Shared, Told};

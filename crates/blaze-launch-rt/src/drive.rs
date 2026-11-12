@@ -81,6 +81,9 @@ pub trait Records {
     /// The message that named the records given so far was carried out, or failed: they are
     /// let go. The daemon gives a record again before each message that names it.
     fn release(&mut self);
+
+    /// The address of static `number`, when it is defined and is no thread-local.
+    fn static_at(&self, number: u32) -> Option<usize>;
 }
 
 /// Where a bind's code goes, and the addresses its fixups name.
@@ -582,4 +585,8 @@ impl Records for Nothing {
     fn forget(&mut self, _: u64) {}
 
     fn release(&mut self) {}
+
+    fn static_at(&self, _: u32) -> Option<usize> {
+        None
+    }
 }

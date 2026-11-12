@@ -101,6 +101,10 @@ impl Records for Table {
 
     fn release(&mut self) {}
 
+    fn static_at(&self, _number: u32) -> Option<usize> {
+        None
+    }
+
     fn code(
         &mut self,
         bind: &wire::Bind<'_>,
@@ -446,7 +450,8 @@ fn a_stub_asks_the_daemon_and_its_caller_resumes_in_the_code_it_sent() {
     let (ready, entry) = crossbeam_channel::bounded(1);
     let control = std::thread::spawn(move || {
         let mut records = records;
-        let served = crate::run(driver, ours, ProgramId([7; 32]), &mut records, ready);
+        let stay = |why: &str| format!("a test's launcher does not restart: {why}");
+        let served = crate::run(driver, ours, ProgramId([7; 32]), &mut records, ready, stay);
         (served, records)
     });
 
@@ -459,11 +464,13 @@ fn a_stub_asks_the_daemon_and_its_caller_resumes_in_the_code_it_sent() {
         "{hello:?}"
     );
     assert_eq!(id, 1);
-    tell(&mut daemon, 1, &Tell::Welcome { slots: 2, entry: Slot(1) });
+    tell(&mut daemon, 1, &Tell::Welcome { slots: 2 });
+    tell(&mut daemon, 2, &Tell::Start { entry: Slot(1), inits: List::of(&[]) });
     // Nothing calls a slot before it is declared: the program's first call comes after the
-    // launcher took the daemon's welcome, which is when its main thread is given the
-    // address of the entry, the entry slot's thunk.
-    assert_eq!(entry.recv_timeout(PATIENCE), Ok(Ok(shared.thunk(Slot(1)).expect("a slot"))));
+    // launcher took the daemon's welcome and its word to start, which is when its main
+    // thread is given the address of the entry, the entry slot's thunk.
+    let start = crate::Start { entry: shared.thunk(Slot(1)).expect("a slot"), inits: Vec::new() };
+    assert_eq!(entry.recv_timeout(PATIENCE), Ok(Ok(start)));
     assert_ne!(shared.target(Slot(0)), Some(0));
 
     // A thread calls slot 0, which has no code: its stub fires and the thread waits.

@@ -269,6 +269,9 @@ fn own(name: &str) -> Option<u64> {
     static DSO_HANDLE: u8 = 0;
     match name {
         "__dso_handle" => Some(&raw const DSO_HANDLE as u64),
+        // The program's threads are started through the launcher, which tells the core of
+        // each before it runs (`threads`).
+        "pthread_create" => Some(crate::threads::create as *const () as u64),
         _ => None,
     }
 }
@@ -427,6 +430,13 @@ impl Records for Loaded {
 
     fn release(&mut self) {
         self.held.clear();
+    }
+
+    fn static_at(&self, number: u32) -> Option<usize> {
+        match self.statics.get(number as usize).copied().flatten() {
+            Some(Static::At(address)) => Some(address as usize),
+            Some(Static::Tls(_)) | None => None,
+        }
     }
 
     fn forget(&mut self, at: u64) {

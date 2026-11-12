@@ -352,9 +352,14 @@ pub enum Ask<'a> {
 /// What the daemon says to the launcher.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Tell<'a> {
-    /// The answer to [`Ask::Hello`]: how many slots the program has, and the slot of its
-    /// entry (the C `main`), which the launcher calls once the slots are declared.
-    Welcome { slots: u32, entry: Slot },
+    /// The answer to [`Ask::Hello`]: how many slots the program has. The launcher declares
+    /// them; nothing runs yet.
+    Welcome { slots: u32 },
+    /// Run the program: its statics are defined. `inits` are the statics of its initializer
+    /// sections (`.init_array`, `__mod_init_func`), by number, each holding the address of a
+    /// function the launcher calls first, in this order, as the system's loader would; then
+    /// it calls `entry`, the slot of the C `main`.
+    Start { entry: Slot, inits: List<'a, u32> },
     /// The bytes of a record ([`crate::record`]) that a later [`Bind`] or [`StaticDef`] names
     /// by `id`, their content id: the launcher keeps them until a message uses them. Records
     /// come over the socket, not from a directory of the store: a record is a few hundred
@@ -376,6 +381,9 @@ pub enum Tell<'a> {
     /// The edit `txn` cannot be applied to the running program, for `why`: start again in
     /// place. Its code is ready.
     Restart { txn: Txn, why: &'a str },
+    /// The answer to an [`Ask::Hello`] for a program this daemon holds no code of, and why:
+    /// the launcher stops, naming it.
+    Unheld { why: &'a str },
 }
 
 impl<'a> Ask<'a> {
@@ -542,12 +550,17 @@ impl<'a> Tell<'a> {
     /// leaves `out` as it was.
     pub fn encode<A: Allocator>(&self, id: u64, out: &mut Vec<u8, A>) -> Result<(), WireError> {
         frame(id, out, |to| match *self {
-            Tell::Welcome { slots, entry } => {
-                variant(to, "Welcome", 2);
-                to.text("entry");
-                entry.write(to);
+            Tell::Welcome { slots } => {
+                variant(to, "Welcome", 1);
                 to.text("slots");
                 to.uint(u64::from(slots));
+            }
+            Tell::Start { entry, inits } => {
+                variant(to, "Start", 2);
+                to.text("entry");
+                entry.write(to);
+                to.text("inits");
+                inits.write(to);
             }
             Tell::Record { id, bytes } => {
                 variant(to, "Record", 2);
@@ -593,6 +606,11 @@ impl<'a> Tell<'a> {
                 to.text("why");
                 to.text(why);
             }
+            Tell::Unheld { why } => {
+                variant(to, "Unheld", 1);
+                to.text("why");
+                to.text(why);
+            }
         })
     }
 
@@ -603,12 +621,18 @@ impl<'a> Tell<'a> {
         let named = from.at();
         let tell = match from.text()? {
             "Welcome" => {
-                from.map(2, "Welcome, a map of 2")?;
-                from.key("entry")?;
-                let entry = Slot::read(&mut from)?;
+                from.map(1, "Welcome, a map of 1")?;
                 from.key("slots")?;
                 let slots = from.uint32("a slot count past 32 bits")?;
-                Tell::Welcome { slots, entry }
+                Tell::Welcome { slots }
+            }
+            "Start" => {
+                from.map(2, "Start, a map of 2")?;
+                from.key("entry")?;
+                let entry = Slot::read(&mut from)?;
+                from.key("inits")?;
+                let inits = List::read(&mut from)?;
+                Tell::Start { entry, inits }
             }
             "Record" => {
                 from.map(2, "Record, a map of 2")?;
@@ -658,6 +682,11 @@ impl<'a> Tell<'a> {
                 from.key("why")?;
                 let why = from.text()?;
                 Tell::Restart { txn, why }
+            }
+            "Unheld" => {
+                from.map(1, "Unheld, a map of 1")?;
+                from.key("why")?;
+                Tell::Unheld { why: from.text()? }
             }
             _ => return Err(WireError::Variant { at: named }),
         };

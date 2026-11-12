@@ -315,7 +315,18 @@ pub(crate) extern "C" fn resolve(stub: usize, context: *const c_void) -> *const 
     // it ends when the daemon answers the need (code, or a refusal) or its socket closes,
     // each of which the control thread turns into an answer here.
     match bound.recv() {
-        Ok(Bound::Code) => word as *const usize,
+        Ok(Bound::Code) => {
+            // The resolver's exit is a safepoint (launcher.md, section 1): a thread that
+            // began as a mutator reports its stack here while a batch waits.
+            if thread.0 != 0 && shared.waiting.load(Ordering::Relaxed) != 0 {
+                let epoch = shared.epoch();
+                // alloc: the frames found in the area; few, and only while a batch waits.
+                let mut frames = Vec::new();
+                let complete = walk(&shared.area, &mut frames);
+                shared.send(Event::Thread(Told::Report { thread, epoch, frames, complete }));
+            }
+            word as *const usize
+        }
         Ok(Bound::Refused(diagnostic)) => stop(slot, &diagnostic),
         Ok(Bound::Lost(why)) => stop(slot, &why),
         Err(_) => stop(slot, "the launcher's control thread is gone"),
