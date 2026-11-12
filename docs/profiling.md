@@ -452,7 +452,16 @@ the run until it is taken out, so the lists only shrink.
 
 **Who wrote an input.** The engine counts a write per input kind and no write says who made
 it, so the account attributes by kind (`account::Writer::of_input`), and a test over the
-tree's `#[blaze_query::input]`s fails for a kind with no writer named. A file's writes are
+tree's `#[blaze_query::input]`s fails for a kind with no writer named. One input is written
+by a plan and by blaze alike: base-db's `CrateSlot`, one a thing given to one crate
+(`Crate::give::<K>`). Its writes are counted by the slot's kind `K` (`base_db::take_given`,
+taken with the engine's counts) and attributed by it (`account::Writer::of_slot`: a plan's
+proc macros and its primary flag to the plan, a published resolution or a served
+dependency's slot to blaze); the
+same test fails for a kind given anywhere in the tree with no writer named, and a write of
+`CrateSlot` no kind counted is unattributed. A kind's first gift to a crate makes the slot,
+which is no write of `CrateSlot` to the engine; it writes the crate's list of slots, a
+write of `Crate`, counted with the plan's whatever the kind. A file's writes are
 told apart further where they matter, in the steps: a step that ends in a changed file is
 counted by where the file is (the workspace, a build directory, a lock file, outside the
 workspace). Not recorded yet: which code wrote an input (the watcher's wake, the request's

@@ -394,6 +394,9 @@ pub const FLUSH_WAIT: Duration = Duration::from_secs(30);
 struct Finished {
     ended: Ended,
     query_counts: Vec<QueryCountRow>,
+    /// Its writes of crate slots by who writes that kind (`base_db::take_given`, taken with
+    /// the counts): what the account attributes its `CrateSlot` writes by.
+    slots: blaze_profile::account::Slots,
 }
 
 /// A build that ended, explained, whose rows wait on the history's thread for its answer
@@ -459,6 +462,7 @@ fn account_of(
     counts: &[QueryCountRow],
     rebuilt: &[blaze_api::Rebuild],
     links: usize,
+    slots: blaze_profile::account::Slots,
     dropped: u64,
 ) -> blaze_profile::account::Account {
     use blaze_api::Reason;
@@ -489,7 +493,7 @@ fn account_of(
                 .collect(),
         })
         .collect();
-    let seen = Seen { links: links as u64, history_dropped: dropped };
+    let seen = Seen { links: links as u64, slots, history_dropped: dropped };
     Account::of(row.build_id, counts, &steps, seen)
 }
 
@@ -1265,6 +1269,7 @@ fn take(
         Ok(ToHistory::Ended(Finished {
             ended: Ended { mut row, links, crate_deps, misses, test_runs, provenance },
             query_counts,
+            slots,
         })) => {
             let build = row.build_id;
             let ended_well = matches!(row.outcome, history::Outcome::Ok);
@@ -1304,6 +1309,7 @@ fn take(
                 &query_counts,
                 &rebuilt,
                 links.len(),
+                slots,
                 history.dropped().total(),
             );
             say_account(&account);
@@ -1644,7 +1650,11 @@ impl Observe {
             return;
         };
         let query_counts = query_counts(build);
-        let sent = profiling.ended.send(ToHistory::Ended(Finished { ended, query_counts }));
+        // alloc: once a build, a kind of crate slot it wrote
+        let mut given: Vec<(&'static str, u64)> = Vec::new();
+        base_db::take_given(|kind, writes| given.push((kind, writes)));
+        let slots = blaze_profile::account::Slots::of(given);
+        let sent = profiling.ended.send(ToHistory::Ended(Finished { ended, query_counts, slots }));
         // Counted whether or not it reached the history's thread: one that never did is never
         // explained, and `blaze why` says so rather than answer with an older build's reasons
         // (rule 3).
@@ -2167,7 +2177,7 @@ mod tests {
         };
         let (to, rows) = crossbeam_channel::unbounded();
         let (failed_to, failed) = crossbeam_channel::unbounded();
-        to.send(ToHistory::Ended(Finished { ended, query_counts: vec![row] })).unwrap();
+        to.send(ToHistory::Ended(Finished { ended, query_counts: vec![row], slots: Default::default() })).unwrap();
         drop(to);
         let (mut why, _) = File::restore(dir.path());
         let (told_to, told) = crossbeam_channel::unbounded();
@@ -2237,7 +2247,7 @@ mod tests {
             })
             .unwrap();
         let bound = Duration::from_secs(60);
-        let ended = Finished { ended: ended_row(71), query_counts: Vec::new() };
+        let ended = Finished { ended: ended_row(71), query_counts: Vec::new(), slots: Default::default() };
         sent.send(ToHistory::Ended(ended)).unwrap();
         sent.send(ToHistory::Flush(to(1, 1))).unwrap();
         assert!(matches!(
@@ -2279,7 +2289,7 @@ mod tests {
             .unwrap();
         let bound = Duration::from_secs(60);
         sent.send(ToHistory::Planted("byte array offset overflow".to_owned())).unwrap();
-        sent.send(ToHistory::Ended(Finished { ended: ended_row(72), query_counts: Vec::new() }))
+        sent.send(ToHistory::Ended(Finished { ended: ended_row(72), query_counts: Vec::new(), slots: Default::default() }))
             .unwrap();
         sent.send(ToHistory::Answered(72)).unwrap();
         sent.send(ToHistory::Flush(to(1, 1))).unwrap();
@@ -2339,7 +2349,7 @@ mod tests {
             })
             .unwrap();
         sent.send(ToHistory::Planted("byte array offset overflow".to_owned())).unwrap();
-        sent.send(ToHistory::Ended(Finished { ended: ended_row(72), query_counts: Vec::new() }))
+        sent.send(ToHistory::Ended(Finished { ended: ended_row(72), query_counts: Vec::new(), slots: Default::default() }))
             .unwrap();
         assert!(keeper.join().is_err(), "the unsupervised thread ends by its panic");
         let caught = written_after_a_panic(&told, 72, Duration::from_secs(60));

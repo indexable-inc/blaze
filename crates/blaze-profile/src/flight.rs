@@ -4180,10 +4180,17 @@ pub struct Read {
 /// `decode`'s blocks on an idle hello-world daemon's heap).
 const READ_KEPT: usize = 1 << 14;
 
-/// Empties `rows`, keeping room for [`READ_KEPT`] of them at most.
+/// Empties `rows`, keeping room for [`READ_KEPT`] of them at most once a read used under a
+/// quarter of the room it had: a read that filled its room is one of a busy stretch, whose
+/// next read fills it again. Until 2026-11-12 every read's room was cut back, so each flush
+/// of a cold build grew it again from [`READ_KEPT`] by doubling: on tempo's, `decode` and
+/// this function were 6.2 GiB of the `profile` tag's 135.31 GiB of heap churn, in blocks of
+/// 60 MB and 3.3 MB (`alloc_samples`; int-1112 d45e70ddc). An idle daemon's first small read
+/// after a burst still lets the room go, which is what the cut is for.
 fn let_go<T>(rows: &mut Vec<T>) {
+    let used = rows.len();
     rows.clear();
-    if rows.capacity() > READ_KEPT {
+    if rows.capacity() > READ_KEPT && used < rows.capacity() / 4 {
         rows.shrink_to(READ_KEPT);
     }
 }

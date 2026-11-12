@@ -83,15 +83,62 @@ impl Writer {
             "ProcessEnv" => Writer::Environment,
             "AllCrates" | "Crate" | "PrimaryCrates" | "LibraryRoots" | "LocalRoots"
             | "SourceRootInput" | "FileSourceRootInput" | "FrontSettings" | "NamedPaths"
-            | "PathBucket" | "ProcMacros" | "FrontEnd" | "Awaited" => Writer::Plan,
+            | "PathBucket" | "FrontEnd" | "Awaited" => Writer::Plan,
             "BuiltinDerives" | "CandidateSlice" | "CrateResolution" | "DepImages"
             | "DirectorySlot" | "FieldOrder" | "FrozenDefMaps" | "FrozenImpls"
-            | "FrozenLangItems" | "ImplIdentities" | "ImplSlices" | "InherentSlice"
-            | "KeptConsts" | "LibraryImplSlices" | "LibraryResolutions" | "Resolutions"
+            | "FrozenLangItems" | "ImplIdentities" | "InherentSlice" | "KeptConsts"
             | "PagedDefMaps" | "ScopeInput" | "ServedBodies" | "SliceDirectory"
             | "SourceNames" | "TraitImplsSlice" => Writer::Derived,
+            // `CrateSlot` (base-db: one input a thing given to one crate) is written by a
+            // plan and by blaze's own publications alike: its writes are attributed by the
+            // slot's kind ([`Writer::of_slot`], [`Seen::slots`]), never by this name.
             _ => Writer::Unattributed,
         }
+    }
+
+    /// Who writes a crate slot of `kind`: the type name of `base_db::Crate::give`'s `K`, as
+    /// `base_db::take_given` says it (its path and its generic arguments are left out).
+    pub fn of_slot(kind: &str) -> Writer {
+        let kind = kind.split('<').next().unwrap_or(kind);
+        let kind = kind.rsplit("::").next().unwrap_or(kind);
+        match kind {
+            // The proc macros a plan loaded for the crate, and whether the plan asks for it.
+            "ProcMacros" | "PrimaryFlag" => Writer::Plan,
+            // What blaze publishes of the crate from its own results, and the slot a served or
+            // withdrawn dependency's entry has beside each of its maps.
+            "CrateResolution" | "DirectorySlot" | "ImageSlot" | "DefMapSlot" | "LangItemsSlot"
+            | "PagesSlot" | "ImplTablesSlot" | "ItemPagesSlot" => Writer::Derived,
+            _ => Writer::Unattributed,
+        }
+    }
+}
+
+/// The engine's name of the input every crate slot is ([`Writer::of_slot`]).
+pub const CRATE_SLOT: &str = "CrateSlot";
+
+/// A build's writes of crate slots, by who writes that kind of slot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Slots {
+    pub plan: u64,
+    pub derived: u64,
+    /// Writes of a kind [`Writer::of_slot`] does not name.
+    pub unattributed: u64,
+}
+
+impl Slots {
+    /// The writes `given` lists, each a kind with its writes (`base_db::take_given`).
+    pub fn of<'a>(given: impl IntoIterator<Item = (&'a str, u64)>) -> Slots {
+        let mut slots = Slots::default();
+        for (kind, writes) in given {
+            match Writer::of_slot(kind) {
+                Writer::Plan => slots.plan += writes,
+                Writer::Derived => slots.derived += writes,
+                Writer::Source | Writer::Environment | Writer::Unattributed => {
+                    slots.unattributed += writes;
+                }
+            }
+        }
+        slots
     }
 }
 
@@ -357,6 +404,9 @@ pub struct Account {
 pub struct Seen {
     /// Images linked (`links` rows).
     pub links: u64,
+    /// The build's writes of crate slots by kind: what its `CrateSlot` writes are attributed
+    /// by. Writes the engine counted of `CrateSlot` past these are unattributed.
+    pub slots: Slots,
     /// Rows the history dropped so far ([`crate::supervise::Dropped::total`]).
     pub history_dropped: u64,
 }
@@ -375,12 +425,23 @@ impl Account {
         let mut unbalanced = Vec::new();
         for it in counts {
             row.written += it.written;
-            match Writer::of_input(it.query) {
-                Writer::Source => row.written_source += it.written,
-                Writer::Environment => row.written_environment += it.written,
-                Writer::Plan => row.written_plan += it.written,
-                Writer::Derived => row.written_derived += it.written,
-                Writer::Unattributed => row.written_unattributed += it.written,
+            if it.query.rsplit("::").next() == Some(CRATE_SLOT) {
+                // By the slot's kind: the plan's first, then blaze's own, and what the kinds
+                // counted do not cover (a kind with no writer named, or a write the kinds'
+                // count missed) is unattributed.
+                let plan = seen.slots.plan.min(it.written);
+                let derived = seen.slots.derived.min(it.written - plan);
+                row.written_plan += plan;
+                row.written_derived += derived;
+                row.written_unattributed += it.written - plan - derived;
+            } else {
+                match Writer::of_input(it.query) {
+                    Writer::Source => row.written_source += it.written,
+                    Writer::Environment => row.written_environment += it.written,
+                    Writer::Plan => row.written_plan += it.written,
+                    Writer::Derived => row.written_derived += it.written,
+                    Writer::Unattributed => row.written_unattributed += it.written,
+                }
             }
             row.executed += it.executed;
             row.verified += it.verified;
@@ -970,6 +1031,27 @@ mod tests {
         assert_eq!(names, ["unattributed", "unkept"]);
     }
 
+    /// A crate slot's writes are attributed by the slot's kind, not by the input's name: the
+    /// plan's proc macros to the plan, blaze's publications to blaze, and a write no kind
+    /// counted (the control) to nobody, which alarms.
+    #[test]
+    fn a_crate_slots_writes_are_attributed_by_its_kind() {
+        let wrote = [QueryCountRow { written: 5, executed: 5, ran_new: 5, ..counts("base_db::CrateSlot") }];
+        let slots = Slots::of([
+            ("hir_expand::proc_macro::ProcMacros", 2),
+            ("hir_def::nameres::frozen::DefMapSlot<'static>", 1),
+            ("hir_def::nameres::delta::publish::CrateResolution", 1),
+        ]);
+        assert_eq!(slots, Slots { plan: 2, derived: 2, unattributed: 0 });
+        let account = Account::of(9, &wrote, &[], Seen { slots, ..Seen::default() });
+        let row = &account.row;
+        assert_eq!((row.written_plan, row.written_derived, row.written_unattributed), (2, 2, 1));
+        assert_eq!(account.unbalanced, Vec::<Unbalanced>::new());
+        assert_eq!(account.alarms(), [Alarm::Unattributed { writes: 1 }]);
+        let whole = Slots::of([("ProcMacros", 2), ("DirectorySlot", 3), ("SomeNewKind", 4)]);
+        assert_eq!(whole, Slots { plan: 2, derived: 3, unattributed: 4 });
+    }
+
     #[test]
     fn a_file_is_placed_by_its_path() {
         assert_eq!(Origin::of_file("/w/src/lib.rs", "/w"), Origin::Workspace);
@@ -1017,8 +1099,20 @@ mod tests {
                     continue;
                 };
                 inputs += 1;
-                if Writer::of_input(&name) == Writer::Unattributed {
+                // A crate slot's writer is its kind's (`Writer::of_slot`), held below.
+                if name != CRATE_SLOT && Writer::of_input(&name) == Writer::Unattributed {
                     unnamed.push(format!("{name} ({})", file.display()));
+                }
+            }
+            // Every kind a crate is given (`Crate::give::<K>`) has a writer too.
+            for (at, _) in text.match_indices(".give::<") {
+                let kind: String = text[at + ".give::<".len()..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+                    .collect();
+                // A generic giver's `K`, and this test's own text, name no kind.
+                if !kind.is_empty() && kind != "K" && Writer::of_slot(&kind) == Writer::Unattributed {
+                    unnamed.push(format!("the crate slot kind {kind} ({})", file.display()));
                 }
             }
         }
