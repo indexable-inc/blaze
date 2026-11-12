@@ -320,6 +320,13 @@ impl Db {
         if self.files.find_included(path).is_none() {
             return false;
         }
+        // Held from here on: what is read of it is these bytes, not the disk's
+        // ([`IncludedFile::hold`]), under the name the front end has it by and the place it
+        // is on the disk.
+        let content = IncludedFile::content_of(Ok(&bytes[..]));
+        let at: &std::path::Path = path.as_ref();
+        IncludedFile::hold(at, content);
+        IncludedFile::hold(&self.files.on_disk(at), content);
         self.set_included_file(path, bytes)
     }
 

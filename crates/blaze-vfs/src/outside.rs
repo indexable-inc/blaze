@@ -573,6 +573,12 @@ pub fn take_named_looks() -> Vec<(PathBuf, u32)> {
 /// a build no one asks about pays one load a look.
 pub fn name_looks(on: bool) {
     NAMING.store(on, Ordering::Relaxed);
+    if on {
+        // A stretch of naming begins: the last look of an earlier stretch is not this one's
+        // (a build that looked at nothing named a path an earlier build had looked at).
+        LAST_LOOK.lock().clear();
+        NAMED_LOOKS.lock().clear();
+    }
 }
 
 /// The last path looked at while looks were named, for a person: which path no watch
