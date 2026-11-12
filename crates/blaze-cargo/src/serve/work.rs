@@ -905,6 +905,12 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// "Pressure"): let go of what the front end keeps for no task to come, by a write
     /// [`Writer::waiting`] asks for, now, whatever this daemon's own budget says.
     fn pressed(&mut self) {}
+    /// On the loop, as the last thing the daemon gives back before a task fails for memory
+    /// (`blaze_graph::giveback::Rung::Running`): a release is due now, as for
+    /// [`Writer::pressed`], and every reader of the front end is stopped for it: each task
+    /// under way gives way at its next query call and is posted again whole once the release
+    /// is applied. What those tasks had done is done again.
+    fn stop_for_memory(&mut self) {}
     /// Every write asked for, applied as one, in the order asked, if no reader is alive:
     /// `Ok(true)` once applied (or none waited), `Ok(false)` while a reader is, asking again
     /// costing one load. A write that fails (its error, or a panic, a maintainer's included,
@@ -1088,6 +1094,14 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
     /// name) and the unit as its phase spans name it (`serde v1.0.219 (lib)`), for its `task`
     /// span. `None` for a front that names no units.
     fn subject(&self, unit: usize) -> Option<(String, String)> {
+        let _ = unit;
+        None
+    }
+    /// On the loop: how many instances unit `unit`'s codegen walk reached in this build, once
+    /// it ended well; `None` before that, and for a front that walks nothing. What a unit
+    /// that depends on it is forecast by before its own walk starts
+    /// (`super::plane::Plane::forecast_instances`).
+    fn reached(&self, unit: usize) -> Option<u64> {
         let _ = unit;
         None
     }

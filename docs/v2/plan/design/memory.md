@@ -233,6 +233,50 @@ its memory: a small wait costs a purge and the next build lowers into the kept f
 values go on a worker and a build asked meanwhile waits and lowers into the front end; the
 control is a driver that gives with no plan, which drops the front end for the same wait.
 
+**The last rung, and the ceiling.** The planner is told the limit's line, a sixteenth
+under the limit, since nothing gates an allocation: the daemon holds a limit (`--memory-gb`,
+or what the machine's ledger allows) by making tasks wait and by giving back, never by
+growing to it. After a kept front end comes one more rung, `running tasks`: the readers of
+the builds under way are stopped (`Writer::stop_for_memory`,
+`blaze_query::db::Storage::stop_readers`), each task gives way at its next query call, the
+build's release is applied (every MIR, the values swept to their fair shares), and the tasks
+are posted again whole. Its cost is the work the tasks had done, and it is held like any
+other give: a build stopped once is not stopped again until it has run sixteen times what it
+lost. With a build under way the floor is that build's own front end, so every kept front
+end may go before its tasks are stopped. When nothing is left to give, the footprint is
+within a thirty-second of the limit and one task runs alone, that task's unit fails
+(`blaze_graph::footprint::past_ceiling`, wired at last): `<target> of <package> does not fit
+in the daemon's memory: task N needs X GiB, running alone, beside Y GiB the process holds
+after a purge: past the memory ceiling of Z GiB`. Only that unit fails; the daemon keeps
+serving; with another task still running nothing fails, since that task ends and gives
+memory back. What this does not reach is a task that makes no query call (inside the back
+end's own code): there the ceiling's guard (`serve::ceiling`) is still the bound.
+
+**Forecasts.** A grant is the task's forecast, and on a cold build the forecast knows
+nothing of what a task pulls of the front end: the first task to ask for a dependency's
+bodies, inference and MIR is charged for them (tempo, cold, 2026-11-12: a lowering granted
+0.06 GiB held 7.27, a compile 0.16 held 6.71, a link 0.06 held 4.73). Three rules close it:
+a task of a kind never measured is forecast at least an equal share of half the budget for
+each work thread, at most 2 GiB (`Plane::unknown_share`), never 64 MiB; every guess of a
+forecast (from a kind or a size) is multiplied by how far tasks of its kind peaked past
+their base forecasts lately, raised at once by a peak it would not have covered and
+lowered by half its excess only after 64 small peaks in a row
+(`blaze_graph::forecast::Correction`), and a kind none of whose tasks has ended takes every
+kind's ratio; and a task that grows past its grant is charged what it holds from the 10 ms
+look that sees it (`PlaneInput::Realized`), so what no longer fits waits. A task's own
+record, where one was measured, stands uncorrected.
+
+**MIR is the defect under all of this.** In that build the `mir` tag held 18.9 GiB, all of
+it global heap, and the `query` tag 28.3: values the one running codegen task had asked the
+front end for, kept as heap trees in memo rows until a release, and a release needs the
+front end exclusive, so nothing of it could go while the task ran. Stopping the task is the
+only give there is today, and it loses the task's work. The fix is rules 11 and 51: a MIR
+body is a record, written once into the store and read through its buffer pool under a pin,
+so a body no task pins is a pool page the second rung gives back with no reader stopped.
+No lane owns that yet: restore.md gives bodies, inference and MIR to the item store by body
+key, and the front-end records lane's pieces stop below inference. The planner needs nothing
+new for it; until it exists the `running tasks` rung is the only give there is.
+
 **Not built.** A front end is given whole or by its values, not yet by crate. The size of
 codegen's caches is the codegen tag's heap with no codegen task running, an upper bound.
 

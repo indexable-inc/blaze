@@ -486,6 +486,8 @@ impl<'a> World<'a> {
                 Rung::Caches => self.caches,
                 Rung::Values => self.fronts[at].values,
                 Rung::FrontEnd => self.fronts[at].core + self.fronts[at].values,
+                // The simulation lists no running build.
+                Rung::Running => 0,
             };
             if give.bytes > has || give.bytes == 0 {
                 return Err(Broke::Harness(format!("{give:?} asks more than the {has} bytes there, or nothing")));
@@ -512,6 +514,7 @@ impl<'a> World<'a> {
                     self.kept += has;
                     self.fronts[at] = Front { core: 0, values: 0 };
                 }
+                Rung::Running => {}
             }
         }
         Ok(())
@@ -655,7 +658,7 @@ fn a_small_wait_is_met_by_a_purge_and_the_front_end_is_kept() {
     let after = Now { at_ns: now.at_ns + 6 * TICK_NS, footprint: 35 * GIB, ask: 0, reading: 9, purged: 3, ..now };
     assert_eq!(planner.step(&after, &sources[..2], &mut out), Outcome::Enough);
     assert!(out.is_empty());
-    assert_eq!(planner.counts().gives, [1, 0, 0, 0, 0]);
+    assert_eq!(planner.counts().gives, [1, 0, 0, 0, 0, 0]);
 }
 
 /// The control of the test above (test-the-cause): the rule before this module, on the same

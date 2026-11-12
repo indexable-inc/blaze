@@ -679,6 +679,29 @@ fn a_grant_counts_until_a_reading_holds_its_bytes() {
     assert_eq!(charge.charged(80), 180);
 }
 
+/// The invariant: a task that grew far past its grant is charged what it holds from the look
+/// that saw it (its grant is raised to it at once, before any reading holds its bytes), so
+/// what no longer fits beside it waits; the reading that holds its bytes then counts them
+/// once, not twice. The cold build of tempo, 2026-11-12: a lowering granted 0.06 GiB held
+/// 7.27 (here in tenths of a GiB: 1 granted, 70 held, 100 held besides).
+#[test]
+fn a_task_far_past_its_grant_is_charged_from_the_look_that_saw_it() {
+    let mut charge = Charge::<u32>::new();
+    charge.read(100, 0, false);
+    charge.started(1, 1);
+    assert_eq!(charge.charged(1), 101);
+    // The look, every 10 ms: its account reached 70.
+    let raise = charge.realized(1, 70);
+    assert_eq!(raise, 69, "its grant is raised to what it holds");
+    assert_eq!(charge.charged(1 + raise), 170, "charged at once: nothing that needs that room starts");
+    // The reading that holds its bytes counts them once.
+    charge.read(170, 0, false);
+    assert_eq!(charge.charged(70), 170);
+    // It ends having held 70 on a grant of 1: graded over, by 69.
+    charge.ended(1, Some(70));
+    assert_eq!(charge.grades(), Grades { over: 1, over_bytes: 69, ..Grades::default() });
+}
+
 /// A task that ended stays charged for what it grew since the reading, until the next.
 #[test]
 fn an_ended_task_stays_charged_until_the_next_reading() {

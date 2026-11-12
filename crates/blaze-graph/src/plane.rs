@@ -250,6 +250,12 @@ pub enum PlaneInput {
     /// grant, its grant grows to that at once; what it realized counts as in the footprint
     /// from the next [`PlaneInput::Footprint`]. Of a task not running it does nothing.
     Realized { at_ns: u64, id: NodeId, bytes: u64 },
+    /// Node `id`, not started yet, is forecast to hold `bytes`: its task's memory is raised to
+    /// that, at most the budget, and never lowered. What a driver learns of a task between
+    /// its push and its start (a unit's codegen walk reaches at least what its largest
+    /// dependency's did, known only once that one ended). Of a node gone, never added or
+    /// already running it does nothing: a running task's growth is [`PlaneInput::Realized`]'s.
+    Forecast { at_ns: u64, id: NodeId, bytes: u64 },
     /// What the machine's ledger lets this daemon grant now (docs/memory-budget.md, section 7,
     /// [`crate::ledger::Allowance`]): the least of its ceiling and the machine budget less
     /// every other live daemon's charge. Given only while the daemon holds the ledger's lock:
@@ -280,6 +286,7 @@ impl PlaneInput {
             | PlaneInput::Held { at_ns, .. }
             | PlaneInput::Footprint { at_ns, .. }
             | PlaneInput::Realized { at_ns, .. }
+            | PlaneInput::Forecast { at_ns, .. }
             | PlaneInput::Allowance { at_ns, .. }
             | PlaneInput::Cap { at_ns, .. }
             | PlaneInput::Promote { at_ns, .. }
@@ -1642,6 +1649,19 @@ impl<M: Memo> Plane<M> {
                     }
                     self.granted += raise;
                     self.counts.granted_most = self.counts.granted_most.max(self.granted);
+                }
+            }
+            PlaneInput::Forecast { id, bytes, .. } => {
+                if let Some(&node) = self.index.get(&id) {
+                    let task = self.rows[node.index() as usize].task;
+                    if task != NO_TASK
+                        && self.task_slots.live(task)
+                        && !self.tasks[row_of(task)].running
+                    {
+                        let most = self.config.budget.as_ref().map_or(u64::MAX, |it| it.bytes);
+                        let row = &mut self.tasks[row_of(task)];
+                        row.memory = row.memory.max(bytes.min(most));
+                    }
                 }
             }
             PlaneInput::Allowance { bytes, .. } => {

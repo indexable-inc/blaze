@@ -33,6 +33,8 @@
 //! 5. A front end marked the floor (the checkout built last: what keeps the edit loop alive)
 //!    is never given whole. When the footprint is past the limit and only floors are left, the
 //!    planner says so by name ([`Outcome::FloorOver`]) and gives nothing.
+//!    The tasks of a build under way are the last rung ([`Rung::Running`]): stopped, they
+//!    give way and run again once their front end let go of what it kept for no task to come.
 //! 6. Hysteresis: an owner that was given and made again is not given again until
 //!    [`hold_ns`] after its remake, a time that grows with what the remake cost. A give of an
 //!    owner that was given and remade before, after that hold, is a thrash: counted
@@ -41,6 +43,10 @@
 #![blaze::sans_io]
 
 use crate::footprint::PURGE_EVERY_NS;
+
+// The process's word that memory is short enough for running tasks to give way: kept with
+// the limit (`crate::admission`), named here beside the rung that sets it.
+pub use crate::admission::{set_short, short};
 
 /// What can be given back, cheapest to make again first. The order is the order of giving.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -59,11 +65,23 @@ pub enum Rung {
     Values = 3,
     /// A checkout's whole kept front end: its next build lowers anew, which takes minutes.
     FrontEnd = 4,
+    /// The tasks of a build under way: its readers are stopped, each task gives way and runs
+    /// again whole once the build's front end let go of what nothing still to compile reads.
+    /// What is made again is the work those tasks had done. The last rung: after it only a
+    /// task that alone does not fit is left, which fails by name
+    /// (`crate::footprint::past_ceiling`).
+    Running = 5,
 }
 
 impl Rung {
-    pub const ALL: [Rung; 5] =
-        [Rung::Allocator, Rung::Pool, Rung::Caches, Rung::Values, Rung::FrontEnd];
+    pub const ALL: [Rung; 6] = [
+        Rung::Allocator,
+        Rung::Pool,
+        Rung::Caches,
+        Rung::Values,
+        Rung::FrontEnd,
+        Rung::Running,
+    ];
 
     pub const fn index(self) -> usize {
         self as usize
@@ -77,13 +95,14 @@ impl Rung {
             Rung::Caches => "caches",
             Rung::Values => "front end values",
             Rung::FrontEnd => "front end",
+            Rung::Running => "running tasks",
         }
     }
 
     /// Whether what it gives is of value: time to make again that a user waits for. The
     /// proportion rule (the module's rule 4) holds these alone.
     pub const fn valued(self) -> bool {
-        matches!(self, Rung::Values | Rung::FrontEnd)
+        matches!(self, Rung::Values | Rung::FrontEnd | Rung::Running)
     }
 
     /// The least time between two asks of one source of this rung that an ask leaves as it
@@ -95,7 +114,7 @@ impl Rung {
     const fn retry_ns(self) -> u64 {
         match self {
             Rung::Allocator | Rung::Pool | Rung::Caches => PURGE_EVERY_NS,
-            Rung::Values | Rung::FrontEnd => 0,
+            Rung::Values | Rung::FrontEnd | Rung::Running => 0,
         }
     }
 }
@@ -236,8 +255,8 @@ pub enum Outcome {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
     /// Gives asked and their bytes, by [`Rung::index`].
-    pub gives: [u64; 5],
-    pub bytes: [u64; 5],
+    pub gives: [u64; 6],
+    pub bytes: [u64; 6],
     /// Waits for a reading that ended at [`MEASURE_WITHIN_NS`] with none.
     pub unmeasured: u64,
     /// Steps at which an owner made again was kept out of a plan by its hold.

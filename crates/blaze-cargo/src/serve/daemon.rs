@@ -74,6 +74,10 @@ const STD_STORE_END: u64 = 9 << 32;
 const LOADS: u64 = 9 << 32;
 const STD_LOADS: u64 = 10 << 32;
 const STD_LOADS_END: u64 = 11 << 32;
+/// Lane packs-1112: the tags of the read-only endpoint peers read the store through
+/// ([`super::packs::endpoint`]).
+const PEERS: u64 = 11 << 32;
+const PEERS_END: u64 = 12 << 32;
 const WATCHERS: u64 = 1 << 40;
 const RUNS: u64 = 1 << 50;
 const RUNS_END: u64 = 1 << 62;
@@ -778,6 +782,10 @@ pub struct Daemon<D: Driver, S: Steps> {
     settles: Option<super::settle::Settles>,
     /// The store's collector ([`super::collect`]): `None` for a daemon that collects nothing.
     collects: Option<super::collect::Collects>,
+    /// Lane packs-1112: the endpoint peers read the store through, when the settings ask
+    /// for one, and the pack commands a client asked of this daemon.
+    peers: Option<super::packs::endpoint::Endpoint>,
+    packings: super::packs::daemon::Packings,
     /// `blaze gc`'s answers from the build dirs' collector, held until the store's lap they
     /// asked for has ended too ([`super::collect::Collects::asked_waits`]).
     gc_answers: Vec<Reply>,
@@ -1810,6 +1818,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             gc: None,
             settles: None,
             collects: None,
+            peers: None,
+            packings: super::packs::daemon::Packings::new(),
             gc_answers: Vec::new(), // alloc: none until `blaze gc` asks
             fetch_urls: super::fetch_url::FetchUrls::new(),
             held: Vec::new(), // alloc: none until a build runs out of space
@@ -2021,10 +2031,15 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// serve` alone, as a process has one store, and a test's daemons are many to a process. Its
     /// root is the driver's, `/`.
     pub fn install_store(&mut self) -> Result<&'static blaze_cas::Handle, String> {
-        blaze_cas::Handle::install(blaze_cas::Handle::new(
+        let handle = blaze_cas::Handle::install(blaze_cas::Handle::new(
             &mut self.store,
             std::path::PathBuf::from("/"),
-        ))
+        ))?;
+        // Lane packs-1112: the read-only endpoint peers read this store through, only when
+        // `<root>/packs.json` asks for one (`serve`); one asked for that the settings do not
+        // allow stops the daemon's start, naming why. It listens on this daemon's driver.
+        self.peers = super::packs::endpoint::Endpoint::asked(PEERS, &mut self.effects)?;
+        Ok(handle)
     }
 
     pub fn mounts(&self) -> &Mounts {
@@ -2295,6 +2310,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let fetched = self.fetch_urls.take_answers();
         if !fetched.is_empty() {
             self.send(fetched);
+        }
+        // Lane packs-1112: the answers of `blaze store export|import|install` run here.
+        let packed = self.packings.take_answers();
+        if !packed.is_empty() {
+            self.send(packed);
         }
         if self.stopping.is_none()
             && let Some(gc) = &mut self.gc
@@ -2867,6 +2887,15 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 }
             }
             DB..STORE => self.db.complete(completion, &mut self.effects),
+            // Lane packs-1112: a peer's request, answered from the store.
+            PEERS..PEERS_END => {
+                if let Some(peers) = &mut self.peers {
+                    peers.complete(completion, &self.store, &mut self.effects);
+                    if let Some(why) = peers.take_failed() {
+                        tracing::error!(target: "blaze", "{why}");
+                    }
+                }
+            }
             // The store's own effects, and its pool's reads (a commit loading the page a pack's
             // committed bytes end in).
             STORE..FLUSHES | LOADS..STD_LOADS => {
@@ -3041,6 +3070,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                     };
                     self.reply(&Reply { to: from, response });
                     self.reply(&Reply { to: from, response: blaze_api::Response::Done { ok } });
+                }
+                // Lane packs-1112: `blaze store export|import|install` while this daemon holds
+                // the store: run on a thread of its own over the store's handle and this
+                // loop ([`super::packs::daemon::Packings`]), answered as it ends.
+                Out::Pass(Arrived::Request { from, request: Request::Store { words } }) => {
+                    self.packings.ask(from, words);
                 }
                 // `blaze fetch-url`: fetched on a thread of its own, answered as it ends
                 // ([`super::fetch_url::FetchUrls::take_answers`]).
@@ -3536,6 +3571,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         if self.stopping.is_some() || !self.store.ready() || self.store.broken().is_some() {
             return;
         }
+        // Lane packs-1112: what a pack command asks of the store's owner (a pin written, the
+        // keys of a pin, a flush) is done here, on the loop, before the collector's step of
+        // this turn: an import's pin is in the store before any of its records is put.
+        let now = self.driver.now();
+        self.packings.turn(&mut self.store, self.collects.as_mut(), now, &mut self.effects);
         let Some(collects) = &mut self.collects else { return };
         let idle =
             self.jobs.idle() && self.jobs.storing() == 0 && self.jobs.placing_after() == 0;

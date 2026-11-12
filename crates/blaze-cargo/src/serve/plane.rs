@@ -101,6 +101,10 @@ pub struct Fresh {
     keys: Vec<Option<Key>>,
     /// Each node's unit's source bytes ([`Plane::push_sized`]); 0 for a node not sized.
     sizes: Vec<u64>,
+    /// Each node's base forecast: what admission's rules gave it before any correction
+    /// ([`Plane::admit`]), which its peak is compared with as it ends
+    /// (`blaze_graph::forecast::Correction`).
+    bases: Vec<u64>,
     /// Each node whose own measured runs predict more than the whole budget, and that peak:
     /// what the plane's refusal of it says it came from ([`Plane::admit`]). Few, usually none.
     over: Vec<(NodeId, u64)>,
@@ -756,6 +760,8 @@ struct Batch<W> {
     /// Each node's unit's source bytes, 0 for none ([`Plane::push_sized`]): what its peak
     /// teaches its kind's bytes held per KiB of source.
     sizes: Vec<u64>,
+    /// Each node's base forecast ([`Fresh::bases`]).
+    bases: Vec<u64>,
     /// [`Fresh::over`]'s nodes that have not run.
     over: Vec<(NodeId, u64)>,
     live: u32,
@@ -790,6 +796,16 @@ pub struct Plane<W: Work, P: Predict> {
     /// kind's recent ratios. Not kept in the image: a daemon starts from [`PER_SOURCE_KIB`]
     /// and learns again in its first build.
     per_kib: HashMap<TaskKind, admission::Estimate, Global>, // alloc: the plane's, an entry a kind
+    /// How far tasks of each kind peaked past their base forecasts lately: what a guess of a
+    /// forecast is corrected by ([`Plane::admit`]). Not kept in the image: a daemon starts
+    /// with none, and its first tasks teach it.
+    correct: blaze_graph::forecast::Correction,
+    /// What each codegen task that ended held at most, by node, until the loop says how many
+    /// instances its walk reached ([`Plane::walked`]); and the bytes a walk held per instance
+    /// reached lately, by [`admission::Estimate`]'s rule: what a unit's codegen is forecast
+    /// by once its dependencies' walks ended ([`Plane::forecast_instances`]).
+    walk_peaks: HashMap<NodeId, u64, Global>, // alloc: the plane's, an entry a codegen task ended and not yet told
+    per_instance: admission::Estimate,
     /// Each node ready and not started: its `admission` span, open from the step it became
     /// ready, and that step's time ([`Plane::admitting`]).
     admitting: HashMap<NodeId, Admitting, Global>, // alloc: the plane's, an entry a ready node
@@ -907,6 +923,11 @@ pub const PER_SOURCE_KIB: u64 = 1 << 20;
 /// history's prediction for a kind never seen (`blaze_history::Config::unseen_bytes`).
 pub const SIZED_FLOOR: u64 = 64 << 20;
 
+/// The most a task of a kind never measured is forecast for being unknown
+/// ([`Plane::unknown_share`]): 2 GiB, so a large budget on few threads does not make every
+/// first task of a kind run nearly alone.
+pub const UNKNOWN_MOST: u64 = 2 << 30;
+
 /// Where a node's predicted peak came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Basis {
@@ -971,6 +992,9 @@ impl<W: Work, P: Predict> Plane<W, P> {
             loops: BTreeMap::new(),
             replays: HashSet::new_in(Global), // alloc: the plane's, once
             per_kib: HashMap::new_in(Global), // alloc: the plane's, once
+            correct: blaze_graph::forecast::Correction::new(),
+            walk_peaks: HashMap::new_in(Global), // alloc: the plane's, once
+            per_instance: admission::Estimate::default(),
             admitting: HashMap::new_in(Global), // alloc: the plane's, once
             pressure: blaze_graph::pressure::Pressured::default(),
             capped: None,
@@ -1064,12 +1088,13 @@ impl<W: Work, P: Predict> Plane<W, P> {
     pub fn fresh(&mut self, count: u32, name_bytes: usize, deps: usize) -> Fresh {
         let first = self.reserve(count);
         let nodes = Nodes::with_capacity(first, count as usize, name_bytes, deps);
-        let (tasks, keys, sizes) = (
+        let (tasks, keys, sizes, bases) = (
+            Vec::with_capacity(count as usize),
             Vec::with_capacity(count as usize),
             Vec::with_capacity(count as usize),
             Vec::with_capacity(count as usize),
         );
-        Fresh { nodes, tasks, keys, sizes, over: Vec::new(), count }
+        Fresh { nodes, tasks, keys, sizes, bases, over: Vec::new(), count }
     }
 
     /// The next node of `fresh`, its id; its memory raised to what its kind and key are
@@ -1101,6 +1126,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
         fresh.tasks.push(task);
         fresh.keys.push(node.key);
         fresh.sizes.push(0);
+        fresh.bases.push(node.memory);
         fresh.nodes.push(node)
     }
 
@@ -1159,13 +1185,14 @@ impl<W: Work, P: Predict> Plane<W, P> {
             true => Basis::Own,
             false => Basis::Kind,
         };
-        self.admit(fresh, &mut node, peak, basis);
+        let base = self.admit(fresh, &mut node, kind, peak, basis);
         if let Some(cost) = cost {
             node.cost = cost;
         }
         fresh.tasks.push(task);
         fresh.keys.push(learn);
         fresh.sizes.push(0);
+        fresh.bases.push(base);
         fresh.nodes.push(node)
     }
 
@@ -1217,13 +1244,14 @@ impl<W: Work, P: Predict> Plane<W, P> {
             true if peak >= sized => (peak, Basis::Own),
             _ => (sized, Basis::Sized),
         };
-        self.admit(fresh, &mut node, predicted, basis);
+        let base = self.admit(fresh, &mut node, kind, predicted, basis);
         if let Some(cost) = cost {
             node.cost = cost;
         }
         fresh.tasks.push(task);
         fresh.keys.push(Some(learn));
         fresh.sizes.push(source);
+        fresh.bases.push(base);
         fresh.nodes.push(node)
     }
 
@@ -1231,13 +1259,117 @@ impl<W: Work, P: Predict> Plane<W, P> {
     /// from `basis`, as [`admitted`] bounds it by the budget. One whose own measured runs say
     /// more than the whole budget keeps that, for the plane to refuse it as it becomes ready,
     /// and is noted so the refusal says where the number came from.
-    fn admit(&self, fresh: &mut Fresh, node: &mut NodeRef<'_>, peak: u64, basis: Basis) {
+    ///
+    /// A guess (from its kind or its size) is first at least an equal share of half the
+    /// budget for each work thread while no task of its kind was ever measured
+    /// ([`Plane::unknown_share`]), then corrected by what tasks of its kind held past their
+    /// forecasts lately (`blaze_graph::forecast::Correction`: a cold build of tempo granted a
+    /// lowering 0.06 GiB that held 7.27). Its own record is what it held, and stands.
+    /// Returns the base forecast, before the correction: what its peak teaches against.
+    fn admit(
+        &self,
+        fresh: &mut Fresh,
+        node: &mut NodeRef<'_>,
+        kind: TaskKind,
+        peak: u64,
+        basis: Basis,
+    ) -> u64 {
         let budget = self.budget().map(|it| it.bytes);
-        node.memory = admitted(node.memory.max(peak), basis, budget);
+        let base = node.memory.max(peak);
+        let (base, forecast) = match basis {
+            Basis::Own => (base, base),
+            Basis::Sized | Basis::Kind => {
+                let base = match self.predict.measured(kind, None) {
+                    true => base,
+                    false => base.max(self.unknown_share()),
+                };
+                (base, self.correct.corrected(kind, base))
+            }
+        };
+        node.memory = admitted(forecast, basis, budget);
         if budget.is_some_and(|budget| node.memory > budget) {
             let id = NodeId(fresh.nodes.first().0 + fresh.nodes.len() as u32);
             fresh.over.push((id, node.memory));
         }
+        base
+    }
+
+    /// What a task of a kind never measured is forecast at least, under a budget: an equal
+    /// share of half the budget for each work thread, no less than [`SIZED_FLOOR`] and no more
+    /// than [`UNKNOWN_MOST`]. With nothing known of a kind, every thread running one then
+    /// fits in half the budget together; the first to end teaches the kind
+    /// (`blaze_graph::forecast::Correction`). 0 with no budget, where no forecast holds
+    /// anything back.
+    fn unknown_share(&self) -> u64 {
+        let config = self.graph.config();
+        match &config.budget {
+            Some(budget) => {
+                (budget.bytes / 2 / config.work.max(1) as u64).clamp(SIZED_FLOOR, UNKNOWN_MOST)
+            }
+            None => 0,
+        }
+    }
+
+    /// How far tasks of `kind` peaked past their base forecasts lately, as the correction
+    /// their next forecast is made with: a ratio in 1024ths
+    /// (`blaze_graph::forecast::Scale::ratio`).
+    pub fn correction(&self, kind: TaskKind) -> u64 {
+        self.correct.scale(kind).ratio
+    }
+
+    /// The running thread task whose memory account reached the most, its bytes, and how
+    /// many thread tasks with an account run: what the ceiling's last step decides on
+    /// (`blaze_graph::footprint::past_ceiling`). Ties go to the older node, so the answer
+    /// hangs on no map's order.
+    pub fn biggest_running(&self) -> Option<(NodeId, u64, usize)> {
+        let mut most: Option<(NodeId, u64)> = None;
+        let mut count = 0;
+        for (&id, seen) in self.realizing.iter() {
+            let Some(bytes) = arena::peak_now(seen.account) else { continue };
+            count += 1;
+            if most.is_none_or(|(at, held)| bytes > held || (bytes == held && id < at)) {
+                most = Some((id, bytes));
+            }
+        }
+        most.map(|(id, bytes)| (id, bytes, count))
+    }
+
+    /// Node `id` settled, and its unit's codegen walk reached `reached` instances (`None`
+    /// for a node that is no codegen's, or whose walk did not end): what its task held per
+    /// instance teaches the forecast of the walks to come. Called for every unit node that
+    /// settles, so the peak kept for it is let go either way.
+    pub fn walked(&mut self, id: NodeId, reached: Option<u64>) {
+        let Some(peak) = self.walk_peaks.remove(&id) else { return };
+        if let Some(reached) = reached.filter(|it| *it > 0) {
+            self.per_instance.observe(peak / reached);
+        }
+    }
+
+    /// Node `id`, a unit's codegen not started yet, is forecast by `instances`, the most a
+    /// walk of a unit it depends on reached: that many times what a walk held per instance
+    /// lately ([`PlaneInput::Forecast`], which only raises). Nothing until a walk of this
+    /// daemon was measured.
+    pub fn forecast_instances(&mut self, at: Duration, id: NodeId, instances: u64) {
+        if self.per_instance.seen == 0 {
+            return;
+        }
+        let bytes = instances.saturating_mul(self.per_instance.predicted);
+        self.step(PlaneInput::Forecast { at_ns: ns(at), id, bytes })
+            .unwrap_or_else(|error| panic!("the plane refused the forecast of node {id}: {error}"));
+    }
+
+    /// The kind of node `id`'s task, while the plane holds it and it has not settled.
+    pub fn kind_of(&self, id: NodeId) -> Option<TaskKind> {
+        match self.task(id)?.1 {
+            Task::Thread { kind, .. } | Task::Loop { kind } => Some(kind),
+            Task::Gone => None,
+        }
+    }
+
+    /// Node `id`'s base forecast ([`Fresh::bases`]); 0 for a node the plane no longer holds.
+    fn base(&self, id: NodeId) -> u64 {
+        let Some((first, batch)) = self.batches.range(..=id.0).next_back() else { return 0 };
+        batch.bases.get((id.0 - first) as usize).copied().unwrap_or(0)
     }
 
     /// The peak node `id` was refused by, its own measured runs' over the whole budget
@@ -1359,6 +1491,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
         fresh.tasks.push(Task::Thread { kind, arg });
         fresh.keys.push(Some(program));
         fresh.sizes.push(0);
+        fresh.bases.push(node.memory);
         fresh.nodes.push(node)
     }
 
@@ -1461,7 +1594,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
         work: Option<W>,
         reads: bool,
     ) -> Result<(), Error> {
-        let Fresh { nodes, tasks, keys, sizes, over, count } = fresh;
+        let Fresh { nodes, tasks, keys, sizes, bases, over, count } = fresh;
         let work = work.map(Arc::new); // alloc: one per batch, shared by its tasks
         assert_eq!(tasks.len() as u32, count, "a batch is added with every node it was made for");
         assert!(
@@ -1472,7 +1605,17 @@ impl<W: Work, P: Predict> Plane<W, P> {
         if count > 0 {
             self.batches.insert(
                 first.0,
-                Batch { tasks, keys, sizes, over, live: count, work, reads, request: request.0 },
+                Batch {
+                    tasks,
+                    keys,
+                    sizes,
+                    bases,
+                    over,
+                    live: count,
+                    work,
+                    reads,
+                    request: request.0,
+                },
             );
         }
         match self.step(PlaneInput::AddNodes { at_ns: ns(at), request, nodes }) {
@@ -1610,6 +1753,13 @@ impl<W: Work, P: Predict> Plane<W, P> {
             let key = self.key(id);
             if !self.replays.remove(&id) {
                 self.predict.observe(task.kind, key, ran_ns, peak);
+                // What it held against what admission's rules forecast it: the correction of
+                // its kind's next forecasts.
+                let base = self.base(id);
+                self.correct.observe(task.kind, base, peak);
+                if task.kind == kinds::COMPILE && peak > 0 {
+                    self.walk_peaks.insert(id, peak);
+                }
                 let source = self.size(id);
                 if source > 0 {
                     self.per_kib

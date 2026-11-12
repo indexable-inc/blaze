@@ -2112,6 +2112,21 @@ impl<S: Steps> Build<S> {
         self.units.get(node.0.wrapping_sub(self.first.0) as usize).map(|it| *it as usize)
     }
 
+    /// Unit `unit` is refused from now on for `why`: its task, posted again after it gave way,
+    /// fails with it ([`Jobs::post`]). What the ceiling's last step says of a task that alone
+    /// does not fit ([`Jobs::fail_too_big`]). A unit refused already keeps its first reason.
+    fn refuse_unit(&mut self, unit: usize, why: String) {
+        let units = self.input.units.graph.units.len();
+        let refused = self.refused.get_or_insert_with(|| Refused {
+            by: vec![u32::MAX; units], // alloc: once a unit is refused
+            whys: Vec::new(),          // alloc: once a unit is refused
+        });
+        if refused.by.get(unit).is_some_and(|it| *it == u32::MAX) {
+            refused.by[unit] = refused.whys.len() as u32;
+            refused.whys.push(why);
+        }
+    }
+
     /// The job's error for `broke`, a write that failed or panicked, naming the write and its
     /// unit, with every unit that depends on its unit refused from now on, each naming it. The
     /// unit itself was built, its write is what failed, unless the write was part of making
@@ -5219,6 +5234,9 @@ impl<S: Steps> Jobs<S> {
         // A give-back of a kept front end's values, which is no job's: its value came before
         // this ([`Jobs::gave_values`]), or never will ([`Jobs::give_settled`]).
         self.give_settled(w, node);
+        // A unit's node: what its walk reached teaches the forecast, and a unit whose names
+        // settled is forecast by its dependencies' walks ([`Jobs::forecast_walk`]).
+        self.forecast_walk(w, node);
         // The store of a kept front end whose job answered already ([`Settling`]): no batch
         // names it any more.
         let settling = self
@@ -8950,6 +8968,13 @@ impl<S: Steps> Jobs<S> {
             // Its profile is flushed from here on, never before ([`Jobs::answered`]).
             if let Some(request) = job.request {
                 self.answered.push(u64::from(request.0));
+            }
+            // Lane packs-1112: a pack source or a peer that failed while builds ran is said
+            // in the output of the build that ends next, once (`super::packs::take_notices`).
+            if matches!(job.work, Work::Build(_) | Work::Check(_)) {
+                for notice in super::packs::take_notices() {
+                    w.said.push(Said::Report(id, Response::Diagnostic(warned(&notice))));
+                }
             }
             w.said.push(Said::Finish(id, ok, error, job.built.zip(job.built_root)));
         }

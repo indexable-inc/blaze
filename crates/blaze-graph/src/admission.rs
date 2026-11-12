@@ -206,6 +206,25 @@ pub fn set_budgets(machine: u64) {
     }
 }
 
+/// Whether the daemon has nothing left to give back but the work of the tasks under way
+/// ([`set_short`]).
+static SHORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether memory is so short that the daemon is giving back the work of running tasks
+/// (`crate::giveback::Rung::Running`): what a long task reads at a point where it holds
+/// nothing of the front end and little is lost, to give way there (the codegen walk, between
+/// two runs of its worklist). One relaxed load.
+pub fn short() -> bool {
+    SHORT.load(Ordering::Relaxed)
+}
+
+/// Says whether memory is that short ([`short`]): set by the give-back's driver as it gives
+/// the `running tasks` rung, cleared once the footprint is within the limit and no task
+/// waits.
+pub fn set_short(short: bool) {
+    SHORT.store(short, Ordering::Relaxed);
+}
+
 /// [`set_budgets`]' `machine`: the memory the daemon may hold in all; `u64::MAX` before.
 pub fn limit() -> u64 {
     LIMIT.load(Ordering::Relaxed)

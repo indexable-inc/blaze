@@ -11,7 +11,15 @@
 //! | pool | the pages the stores' pools hold (the `store` tag's committed bytes) | `Store::evict_pool` of that many bytes |
 //! | caches | what codegen keeps between builds (`Steps::kept_caches`), listed only while no task that may walk a program runs (`Plane::walks_in_flight`) | `Steps::give_caches` |
 //! | values | each kept front end's values kept by bytes (`KeptDb::values`); the front ends of the builds under way, all or nothing | a task on a worker ([`Jobs::give_values`]); `Writer::short` |
-//! | front end | each kept front end (`KeptDb::held`), the checkout built last the floor | dropped: its checkout's next build lowers anew, and its `blaze why` says so |
+//! | front end | each kept front end (`KeptDb::held`), the checkout built last the floor unless a build is under way (then that build's own front end is what the edit loop needs) | dropped: its checkout's next build lowers anew, and its `blaze why` says so |
+//! | running tasks | the builds under way, while a thread task runs: what their front ends hold in MIR and inference | `Writer::stop_for_memory`: the readers stopped, each task gives way, the release applied, the tasks posted again whole |
+//!
+//! The limit the planner is told is the limit's line, a sixteenth under it ([`LINE`]): the
+//! daemon gives back before it is at its limit, since nothing gates an allocation. Past the
+//! last rung, with the footprint within a thirty-second of the limit ([`FAIL_LINE`]) and one
+//! task running alone, that task's unit fails with a typed error naming it
+//! ([`Jobs::fail_too_big`], `blaze_graph::footprint::past_ceiling`): the daemon keeps serving
+//! and the kernel's limit is never what ends the build.
 //!
 //! A kept front end's values are swept on a worker, never the loop: the front end is taken
 //! from its checkout as it is for its store, a task of kind `GIVE_BACK` sweeps it in at most
@@ -37,6 +45,7 @@ use std::{
 use blaze_core::lock::Lock;
 use blaze_graph::{
     NodeId, Pool,
+    footprint::{Past, Step as Gate, past_ceiling},
     giveback::{self, Give, Now, Outcome, Planner, Rung, Source, Why},
 };
 use blaze_protocol::events::NodeKind;
@@ -44,7 +53,7 @@ use blaze_protocol::events::NodeKind;
 use super::{Does, Jobs, KeptDb, Stage, Step, Steps, World, key_of};
 use crate::serve::{
     plane::{kinds, ns},
-    work::Writer as _,
+    work::{Front as _, Writer as _},
 };
 
 /// The owner of the one source that is every build under way's front end: no checkout's
@@ -59,6 +68,16 @@ const PLAN_EVERY: Duration = Duration::from_millis(250);
 /// (`Writer::short`): whether one comes of it is the release's own rule
 /// (`blaze_graph::admission::Squeeze::short`), so the ask's source does not fall at once.
 const RUNNING_EVERY: Duration = Duration::from_secs(1);
+
+/// The limit's line: the planner is told the limit less this part of it (a sixteenth, as the
+/// kernel's `memory.high` is set at 15/16 of `memory.max`), so the give-backs begin before
+/// the limit is reached.
+const LINE: u64 = 16;
+
+/// Where a task that alone does not fit fails: the limit less this part of it (a
+/// thirty-second), halfway from the line to the limit, so the task has until the limit to
+/// reach a query call and unwind before the ceiling's guard would end the daemon.
+const FAIL_LINE: u64 = 32;
 
 /// The most slices a give of values is swept in ([`give_in_slices`]): a build that asks for
 /// the front end meanwhile waits for one slice's end at most, an eighth of the give.
@@ -80,10 +99,14 @@ struct Memory {
 }
 
 impl Memory {
+    /// What the planner is told: the limit as its line ([`LINE`]).
     fn now(&self, at: Duration) -> Now {
         Now {
             at_ns: ns(at),
-            limit: self.limit,
+            limit: match self.limit {
+                u64::MAX => u64::MAX,
+                limit => limit - limit / LINE,
+            },
             footprint: self.footprint,
             ask: self.ask,
             reading: self.readings,
@@ -138,6 +161,9 @@ pub(super) struct Giving<S: Steps> {
     pressed: bool,
     /// The gives of values under way, a checkout each.
     out: Vec<Out<S>>,
+    /// Since when a build has been under way, as the loop's turns saw it; restarted when its
+    /// tasks are stopped for memory: the work a stop loses.
+    building_since: Option<Duration>,
 }
 
 impl<S: Steps> Giving<S> {
@@ -153,6 +179,7 @@ impl<S: Steps> Giving<S> {
             floor_said: false,
             pressed: false,
             out: Vec::new(), // alloc: none until values are given
+            building_since: None,
         }
     }
 
@@ -284,6 +311,12 @@ impl<S: Steps> Jobs<S> {
         if std::mem::take(&mut self.giving.pressed) {
             self.press_kept(w);
         }
+        let building = self.building();
+        match (building, self.giving.building_since) {
+            (true, None) => self.giving.building_since = Some(w.now),
+            (false, Some(_)) => self.giving.building_since = None,
+            _ => {}
+        }
         let memory = self.memory(w, ask);
         #[cfg(test)]
         if sim::PLANT_NO_PLAN.get() {
@@ -312,6 +345,8 @@ impl<S: Steps> Jobs<S> {
             if outcome == Outcome::Enough {
                 self.giving.floor_said = false;
                 self.giving.idle_until = None;
+                // No task under way is asked to give way any more.
+                giveback::set_short(false);
             }
             self.giving.gives = gives;
             return;
@@ -332,7 +367,7 @@ impl<S: Steps> Jobs<S> {
         .entered();
         let mut sources = std::mem::take(&mut self.giving.sources);
         sources.clear();
-        self.give_sources(w, memory.kept, &mut sources);
+        self.give_sources(w, memory.kept, building, &mut sources);
         let outcome = self.giving.planner.step(&now, &sources, &mut gives);
         match outcome {
             Outcome::Gave { rung } => {
@@ -377,13 +412,24 @@ impl<S: Steps> Jobs<S> {
             }
             Outcome::Enough | Outcome::Measuring { .. } => {}
         }
+        // Nothing is left to give and the footprint is at the limit: a task that runs alone
+        // and alone does not fit fails, by name.
+        if building && matches!(outcome, Outcome::Waits { .. } | Outcome::FloorOver { .. }) {
+            self.fail_too_big(w, &memory);
+        }
         drop(span);
         self.giving.sources = sources;
         self.giving.gives = gives;
     }
 
     /// What every owner can give now (the module's table), added to `sources`.
-    fn give_sources(&mut self, w: &World<'_, S>, allocator_kept: u64, sources: &mut Vec<Source>) {
+    fn give_sources(
+        &mut self,
+        w: &World<'_, S>,
+        allocator_kept: u64,
+        building: bool,
+        sources: &mut Vec<Source>,
+    ) {
         let one = |rung, gives, grain| Source { rung, owner: 0, gives, grain, remake_ns: 0, floor: false };
         if allocator_kept != 0 {
             // alloc: none past the most sources, the scratch kept (every push below)
@@ -401,7 +447,9 @@ impl<S: Steps> Jobs<S> {
                 sources.push(one(Rung::Caches, caches, caches));
             }
         }
-        let floor = self.giving.last_built;
+        // The floor is what the edit loop needs next: the front end of the checkout built
+        // last, unless a build is under way, whose own front end (out with it) is that.
+        let floor = self.giving.last_built.filter(|_| !building);
         for (at, front) in self.roots.fronts.iter_mut().enumerate() {
             let Some(front) = front else { continue };
             let owner = at as u32;
@@ -434,21 +482,121 @@ impl<S: Steps> Jobs<S> {
         }
         // The builds under way: what their front ends hold in MIR and inference, which a
         // release lets go of where nothing still to compile reads it.
-        let building = self.order.iter().any(|&id| {
-            self.jobs.get(key_of(id)).is_some_and(|job| matches!(job.stage, Stage::Units(_)))
-        });
-        let lately = self.giving.running_asked.is_some_and(|at| w.now < at + RUNNING_EVERY);
-        if building && !lately {
-            let snapshot = blaze_mem::tag::snapshot();
-            let of = |tag: blaze_mem::Tag| {
-                let it = snapshot.get(tag);
-                it.live.saturating_add(it.heap)
-            };
-            let gives = of(blaze_mem::Tag::Mir).saturating_add(of(blaze_mem::Tag::Infer));
-            if gives != 0 {
-                sources.push(Source { rung: Rung::Values, owner: RUNNING, gives, grain: gives, remake_ns: 0, floor: false });
-            }
+        if !building {
+            return;
         }
+        let snapshot = blaze_mem::tag::snapshot();
+        let of = |tag: blaze_mem::Tag| {
+            let it = snapshot.get(tag);
+            it.live.saturating_add(it.heap)
+        };
+        let gives = of(blaze_mem::Tag::Mir).saturating_add(of(blaze_mem::Tag::Infer));
+        if gives == 0 {
+            return;
+        }
+        // Asked politely first: a release once the tasks under way end by themselves.
+        let lately = self.giving.running_asked.is_some_and(|at| w.now < at + RUNNING_EVERY);
+        if !lately {
+            sources.push(Source { rung: Rung::Values, owner: RUNNING, gives, grain: gives, remake_ns: 0, floor: false });
+        }
+        // Then, the last rung: the tasks stopped for that release now. What it costs is the
+        // work they did since the build began, or since they were last stopped.
+        if w.plane.running() > 0 {
+            let lost = self.giving.building_since.map_or(0, |since| ns(w.now.saturating_sub(since)));
+            sources.push(Source { rung: Rung::Running, owner: RUNNING, gives, grain: gives, remake_ns: lost, floor: false });
+        }
+    }
+
+    /// Unit node `node` settled (docs/v2/plan/design/memory.md, "Forecasts"). The plane is
+    /// told what its unit's codegen walk reached, where it is a codegen that ended well: what
+    /// that task held per instance teaches the walks to come. And where it is the unit's
+    /// first node (its names), the unit's own codegen, not started yet, is forecast by the
+    /// most any unit it depends on reached: a top crate's walk reaches at least what its
+    /// largest dependency's did, which no forecast made as the build's nodes were pushed
+    /// could know. Only raises a forecast; a dependency whose walk has not ended says nothing.
+    pub(super) fn forecast_walk(&mut self, w: &mut World<'_, S>, node: NodeId) {
+        let Some(id) = self.batches.job_of(node) else { return };
+        let Some(job) = self.jobs.get(key_of(id)) else { return };
+        let Stage::Units(build) = &job.stage else { return };
+        let Some(unit) = build.unit(node) else { return };
+        w.plane.walked(node, build.front.reached(unit));
+        let at = node.0.wrapping_sub(build.first.0) as usize;
+        let of_unit = |at: usize| build.units.get(at) == Some(&(unit as u32));
+        if at > 0 && of_unit(at - 1) {
+            return;
+        }
+        let depends = &build.input.units.graph.units[unit].dependencies;
+        let most = depends.iter().filter_map(|dep| build.front.reached(dep.index as usize)).max();
+        let Some(instances) = most else { return };
+        let mut next = at + 1;
+        while of_unit(next) {
+            let compile = NodeId(build.first.0 + next as u32);
+            if w.plane.kind_of(compile) == Some(kinds::COMPILE) {
+                w.plane.forecast_instances(w.now, compile, instances);
+                return;
+            }
+            next += 1;
+        }
+    }
+
+    /// Whether a build's units are under way: a job at its units' stage.
+    fn building(&self) -> bool {
+        self.order.iter().any(|&id| {
+            self.jobs.get(key_of(id)).is_some_and(|job| matches!(job.stage, Stage::Units(_)))
+        })
+    }
+
+    /// The ceiling's last step (`blaze_graph::footprint::past_ceiling`), once nothing is left
+    /// to give: with the footprint within a thirty-second of the limit ([`FAIL_LINE`]) and
+    /// one thread task running alone, that task's unit is refused with a typed error naming
+    /// it, its peak, what the process holds besides and the ceiling, and its build's readers
+    /// are stopped so the task gives way and ends with that error where it is posted again
+    /// (`Jobs::post`). While another task runs nothing fails: it ends and gives memory back.
+    /// A task that makes no query call (inside the back end's own code) is not reached by the
+    /// stop; the ceiling's guard is still the bound there (`serve::ceiling`).
+    fn fail_too_big(&mut self, w: &mut World<'_, S>, memory: &Memory) {
+        if memory.limit == u64::MAX {
+            return;
+        }
+        let Some((node, held, running)) = w.plane.biggest_running() else { return };
+        let past = Past {
+            ceiling: memory.limit - memory.limit / FAIL_LINE,
+            footprint: memory.footprint,
+            // The planner purged, and nothing it could give is left.
+            kept: 0,
+            bytes: 0,
+            asker: node,
+            asker_holds: held,
+            others_unrealized: 0,
+            others_running: running.saturating_sub(1),
+            others_waiting: 0,
+            newest: node,
+            tried: true,
+        };
+        let Gate::Fail(too_big) = past_ceiling(&past) else { return };
+        let Some(id) = self.batches.job_of(node) else { return };
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        let Stage::Units(build) = &mut job.stage else { return };
+        let Some(unit) = build.unit(node) else { return };
+        let named = {
+            let it = &build.input.units.graph.units[unit];
+            format!("{} of {}", it.target.name, it.pkg_id) // alloc: an error, once
+        };
+        // alloc: an error, once
+        let why = format!(
+            "{named} does not fit in the daemon's memory: {too_big}; everything else the daemon could give back was given first"
+        );
+        tracing::error!(
+            target: "blaze",
+            unit = named.as_str(),
+            held,
+            footprint = memory.footprint,
+            limit = memory.limit,
+            "memory ceiling: a task that alone does not fit fails"
+        );
+        crate::serve::said::logged!(ERROR, "blaze serve: {why}");
+        build.refuse_unit(unit, why);
+        build.writer.stop_for_memory();
     }
 
     /// Does one give (the module's table), under a span that says what, whose, how much, why
@@ -460,7 +608,7 @@ impl<S: Steps> Jobs<S> {
         };
         let checkout = match give.rung {
             Rung::Values | Rung::FrontEnd if give.owner != RUNNING => self.checkout_of(give.owner).to_owned(), // alloc: a give's name, once a give
-            Rung::Values => "the builds under way".to_owned(), // alloc: a give's name, once a give
+            Rung::Values | Rung::Running => "the builds under way".to_owned(), // alloc: a give's name, once a give
             _ => String::new(),                                // alloc: none, empty
         };
         #[cfg(test)]
@@ -529,6 +677,29 @@ impl<S: Steps> Jobs<S> {
                 None
             }
             Rung::FrontEnd => self.give_front_end(give, &checkout),
+            Rung::Running => {
+                for &id in &self.order {
+                    let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
+                    if let Stage::Units(build) = &mut job.stage {
+                        build.writer.stop_for_memory();
+                    }
+                }
+                // The work begins again from here, and a build stopped is not stopped again
+                // until it has had many times what it lost (`giveback::hold_ns`).
+                self.giving.planner.remade(Rung::Running, RUNNING, ns(w.now), give.remake_ns);
+                self.giving.building_since = Some(w.now);
+                // And a long task that makes few query calls gives way at its own safe
+                // point (the codegen walk's, between two runs of its worklist), until the
+                // footprint is within the limit again.
+                giveback::set_short(true);
+                crate::serve::said::logged!(WARN,
+                    "blaze serve: memory: the tasks of the builds under way are stopped and run again, {:.0} s of their work with them:                      the footprint is {:.2} GiB of a limit's line of {:.2} GiB and nothing cheaper is left to give",
+                    give.remake_ns as f64 / 1e9,
+                    give.footprint as f64 / f64::from(1u32 << 30),
+                    give.limit as f64 / f64::from(1u32 << 30)
+                );
+                None
+            }
         };
         drop(entered);
         if let Some(gave) = gave {

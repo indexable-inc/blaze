@@ -371,6 +371,10 @@ impl<M: Memo> Plane<M> {
             PlaneInput::Footprint { .. } | PlaneInput::Realized { .. } => {
                 unreachable!("the differential tests give no footprint")
             }
+            // Nor is a forecast between a push and a start: the differential tests give none.
+            PlaneInput::Forecast { .. } => {
+                unreachable!("the differential tests give no forecast")
+            }
             PlaneInput::Promote { request, .. } => {
                 if let Some(&r) = self.request_index.get(&request)
                     && self.requests[r].idle
