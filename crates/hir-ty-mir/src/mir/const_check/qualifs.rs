@@ -543,14 +543,27 @@ fn fixpoint<'f>(
     }
 }
 
-/// rustc's `FlowSensitiveAnalysis` of one qualif, with a cursor into it. A state has the
-/// locals the qualif is in, then from `borrowed` on the locals borrowed in a way that may
-/// change them, which a move then does not clear.
+/// rustc's `FlowSensitiveAnalysis` of one qualif, with a cursor into it. A state is the locals
+/// the qualif is in.
+///
+/// One difference from rustc, which accepts no less than rustc does: a local moved out of
+/// whole loses the qualif whether or not it was borrowed before ([`clear_moved`]). rustc keeps
+/// a second set, the locals borrowed in a way that may change them, and means to keep the
+/// qualif of one of those across a move ("for backward compatibility ... might not be strictly
+/// necessary since the local is no longer initialized", `resolver.rs`). But its states join
+/// with `self.qualif.join(..) || self.borrow.join(..)`, which leaves the borrowed set out of
+/// every join that changes the qualifs, so whether a borrow reaches a move depends on which
+/// blocks lie between them: at the pinned nightly `self.set(x); self` in a `const fn(mut
+/// self) -> Self` is accepted (the call ends the block the borrow is in) and `let r = &mut
+/// self; r.x = x; self` is refused (E0493), and code depends on the first (reth's
+/// `SparseStateTrie::with_updates`, `DatabaseArguments::with_max_read_transaction_duration`).
+/// A local moved out of holds nothing, its drop runs no destructor in any evaluation, and
+/// drop elaboration takes that drop away, so there is nothing to refuse: both are accepted
+/// here, on every layout of the blocks.
 struct Flow<'f> {
     q: Qualif,
     entry: Matrix<'f>,
     state: Bits<'f>,
-    borrowed: usize,
     /// Where `state` is: before statement `index` of `block`.
     block: Option<BasicBlockId>,
     index: usize,
@@ -559,8 +572,8 @@ struct Flow<'f> {
 impl<'f> Flow<'f> {
     fn compute<'db>(cx: &mut Cx<'_, 'f, 'db>, graph: &Graph<'f>, q: Qualif) -> Flow<'f> {
         let (body, frame) = (cx.body, cx.frame);
-        let borrowed = words_for(body.locals.len()) * 64;
-        let mut entry = matrix_in(body.basic_blocks.len(), 2 * borrowed, frame);
+        let locals = words_for(body.locals.len()) * 64;
+        let mut entry = matrix_in(body.basic_blocks.len(), locals, frame);
         let start = block_index(body.start_block);
         for &param in &body.param_locals {
             let ty = cx.local_ty(param);
@@ -568,17 +581,17 @@ impl<'f> Flow<'f> {
                 entry.insert(start, local_index(param));
             }
         }
-        let mut state: Bits<'f> = bits_in(2 * borrowed, frame);
+        let mut state: Bits<'f> = bits_in(locals, frame);
         fixpoint(body, graph, &mut entry, &mut state, frame, |state, block| {
             let data = &body.basic_blocks[block];
             for statement in &data.statements {
-                statement_effect(cx, q, state, borrowed, statement);
+                statement_effect(cx, q, state, statement);
             }
             if let Some(terminator) = &data.terminator {
-                terminator_effect(cx, q, state, borrowed, terminator);
+                terminator_effect(cx, q, state, terminator);
             }
         });
-        Flow { q, entry, state, borrowed, block: None, index: 0 }
+        Flow { q, entry, state, block: None, index: 0 }
     }
 
     /// Moves the cursor to before statement `index` of `block` (its terminator at the
@@ -592,7 +605,7 @@ impl<'f> Flow<'f> {
         let body = cx.body;
         let statements = &body.basic_blocks[block].statements;
         while self.index < index {
-            statement_effect(cx, self.q, &mut self.state, self.borrowed, &statements[self.index]);
+            statement_effect(cx, self.q, &mut self.state, &statements[self.index]);
             self.index += 1;
         }
     }
@@ -619,10 +632,11 @@ fn assign_direct(
     }
 }
 
-fn clear_moved(state: &mut Bits<'_>, borrowed: usize, operand: &Operand) {
+/// A local moved out of whole no longer has the qualif, borrowed before or not: [`Flow`] says
+/// why that is not rustc's rule and refuses nothing rustc accepts.
+fn clear_moved(state: &mut Bits<'_>, operand: &Operand) {
     if let OperandKind::Move(place) = &operand.kind
         && place.projection.is_empty()
-        && !state.contains(borrowed + local_index(place.local))
     {
         state.remove(local_index(place.local));
     }
@@ -632,7 +646,6 @@ fn statement_effect(
     cx: &mut Cx<'_, '_, '_>,
     q: Qualif,
     state: &mut Bits<'_>,
-    borrowed: usize,
     statement: &Statement,
 ) {
     match &statement.kind {
@@ -643,7 +656,7 @@ fn statement_effect(
                 assign_direct(cx, q, state, place, value);
             }
             if q.is_cleared_on_move() {
-                rvalue.for_each_operand(&mut |operand| clear_moved(state, borrowed, operand));
+                rvalue.for_each_operand(&mut |operand| clear_moved(state, operand));
             }
             let Rvalue::Ref(kind, target) = rvalue else { return };
             let elems = target.projection.as_slice();
@@ -660,12 +673,10 @@ fn statement_effect(
             };
             if allows_mutation && cx.in_any_value_of_ty(q, ty) {
                 state.insert(local_index(target.local));
-                state.insert(borrowed + local_index(target.local));
             }
         }
         &StatementKind::StorageDead(local) => {
             state.remove(local_index(local));
-            state.remove(borrowed + local_index(local));
         }
         // rustc's `InlineAsm` terminator: what it reads is moved, and its outputs are as a
         // call's result.
@@ -674,7 +685,7 @@ fn statement_effect(
                 if let AsmOperand::Reg { input: Some(input), .. } = operand
                     && q.is_cleared_on_move()
                 {
-                    clear_moved(state, borrowed, input);
+                    clear_moved(state, input);
                 }
             }
             for operand in &asm.operands {
@@ -694,7 +705,6 @@ fn terminator_effect(
     cx: &mut Cx<'_, '_, '_>,
     q: Qualif,
     state: &mut Bits<'_>,
-    borrowed: usize,
     terminator: &Terminator,
 ) {
     if let TerminatorKind::DropAndReplace { place, value, .. } = &terminator.kind {
@@ -704,7 +714,7 @@ fn terminator_effect(
         }
     }
     if q.is_cleared_on_move() {
-        terminator.kind.for_each_operand(&mut |operand| clear_moved(state, borrowed, operand));
+        terminator.kind.for_each_operand(&mut |operand| clear_moved(state, operand));
     }
     match &terminator.kind {
         TerminatorKind::Call { destination: place, .. }
