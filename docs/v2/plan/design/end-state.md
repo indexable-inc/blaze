@@ -675,3 +675,77 @@ same piece (rule 66).
 Order: the kernel's read-by-part; `parse`/`items`/`item`; the daemon's carry driver with the
 certificate; `infer` on step reads for the facts that are syntactic; `scope`/`resolve`; the rest
 of `infer`'s facts; `code`.
+
+### Review of this section, 2026-11-12, and what it changes
+
+An outside review (a fresh agent with the code and this section, not its reasoning): the shape
+holds (steps keyed by syntax, a carry with cutoff, per-function records); the name-resolution
+rows cannot be built as written, three cutoffs claimed above are false for real Rust, and the
+order put off the only end-to-end number. What replaces the table's rows:
+
+1. **Read-by-part is the primitive; `resolve` is not a step.** `Reads::part(step, key)` reads in
+   place, named (step key, part key), with the part's digest as what it saw and "gone" for an
+   absent key; a read of the key set is its own read. Values are laid out with a Merkle index so
+   a carry diffs the old record against the new one; postings are by (step, part). A step per
+   key would rerun every key's row on any change of the table (at 1,000 keys, thousands of store
+   operations where parts cost microseconds: reviewer's estimate). Three planted-bug controls: an
+   absence not posted, a removed key the diff missed, a part whose bytes name another part.
+2. **The floor is fixed at the finest grain the semantics allows** (per name, per (trait, head
+   type)), or a coarse step passes the bar vacuously.
+3. **`parse(file, edition)`; the crate's file set is a step** (`modules(crate)`: `mod`
+   declarations, `#[path]`, absence reads of both `foo.rs` and `foo/mod.rs`).
+4. **`items(file)` holds only if** ids are content-hashed, never ordinal; spans are relative to
+   their item, in macro output too; items nested in bodies (an `impl` in a fn or in serde's
+   `const _`) are taken out; an item under a non-builtin attribute macro is not split (its body
+   is the macro's input). Each entry holds the key of the body's syntax record.
+5. **False cutoffs, and the keys that make them precise.** "A body edit changes no header
+   fact" is false for const fn bodies (read through const evaluation), async fn and
+   return-position `impl Trait` bodies (hidden type, auto-trait leakage, the future's layout),
+   items under attribute macros, and opaque types' defining bodies. "A callee's body edit
+   reaches no caller" is false for the same async and const cases. The keys: `witness(coroutine)`,
+   `coroutine_layout(fn)`, `hidden_type(opaque)`, `const_eval(item, args)`.
+6. **Name resolution is one maintained step a crate**, not a step a module: per-module steps are
+   cyclic through `use super::*`, re-exports and macro scope, so the cycle is the crate. Its
+   value is the table of (module, namespace, name), read by part. It runs from its previous
+   value and the reads that changed (semi-naive insertion, over-deletion for glob cycles) and
+   must equal a fresh run byte for byte. The tree already has this as maintainers
+   (`hir-def/src/nameres/delta.rs`, `hir-ty/src/method_resolution/delta.rs`, `dbsp.md`): they
+   move under the kernel. The kernel needs one more primitive for it: a step that may run from
+   its previous value and its changed reads, checked against a fresh run. Impls are read by
+   (trait, simplified self type) plus the trait's blanket impls; inherent impls by (crate,
+   simplified type); trait candidates by (crate, method name).
+7. **Positions are placed, not baked.** Panic locations and debug lines are slots filled from a
+   per-file line record; in a debug build nearly every function has one, so baking them makes a
+   comment at the top of a file recompile every function below it.
+8. **The hybrid's change set comes from the maintainers' exact deltas** (item-hash columns'
+   `changed`, name resolution's bindings delta, impls' last write), not "always dirty": always
+   dirty brings back microseconds per entry, and it is only as right as the after-the-fact read
+   rules are complete (trusted, not by construction). Both engines are pinned to one world.
+
+The order, re-cut, with the first end-to-end number early:
+
+| # | Piece | Judged by |
+|---|---|---|
+| 1 | Part reads in the kernel (and the maintained-step primitive) | the exhaustive check with the three controls |
+| 2 | `parse(file, edition)`, `items(file)`, `modules(crate)` | the old item tree and body hashes as oracle over a replay of reth's history |
+| 3 | `body_store`'s infer, MIR and borrow-check records kept as kernel entries (a trace: a part read of `items(file)` for the function, plus its facts); the change set from the pin and the maintainers' deltas; the existing `code` step and the patch | reth, leaf body edit, end to end: carry under 1 ms; every always-dirty entry counted |
+| 4 | The maintainers as maintained steps: the def map, impls, candidates | maintained equals fresh, in simulation; a new `pub fn` in a leaf module costs its readers |
+| 5 | `signature`, `const_eval`, `layout`, `witness`, `hidden_type` as steps | each false cutoff of point 5 has a test that the edit reaches exactly its readers |
+| 6 | `code` with placed positions and layout steps | comment edit on reth |
+
+What the review says no design reaches (added to the list above): glob cycles (over-deletion
+costs the cycle); a proc macro that keeps state or reads absolute lines; a goal whose self type
+is not yet known (`?`, `.into()`, `collect`) reads a trait's whole key set, so a new `From` impl
+reruns every such body; trait-solver cycles get no cache across bodies; an async body edit
+reaches every awaiting caller's layout up to the spawn; crate-level changes (features, cfg,
+edition) rerun the crate; postings at item grain for all 827 crates of reth are gigabytes, so
+item grain is for workspace and path crates and registry crates go through covers.
+
+Reviewer's estimates for reth if built well (today's measured numbers in brackets): no-op
+5-20 ms [2.0-2.8 s]; comment edit 10-40 ms [3.5-9.4 s]; private non-generic body edit under 33
+dependents 50-150 ms, dominated by the patch and the function's own check and code [46-54 s];
+generic or inline body edit 0.5-5 s; signature edit under 33 dependents 0.3-5 s.
+
+Measured first: a from-scratch def map with expansions cached, for reth's three largest
+workspace crates, with their item counts. About 3 ms or less and a plain per-crate step meets
+the bar; more and the maintained step is needed (piece 4).
