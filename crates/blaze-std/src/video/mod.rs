@@ -116,16 +116,16 @@ impl<A: Allocator> Frame<A> {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn format(&self) -> PixelFormat {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn format(&self) -> PixelFormat {
         self.format
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn size(&self) -> (u32, u32) {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
 
@@ -146,16 +146,16 @@ pub fn size(&self) -> (u32, u32) {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn duration(&self) -> u32 {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn duration(&self) -> u32 {
         self.duration
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn timescale(&self) -> u32 {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn timescale(&self) -> u32 {
         self.timescale
     }
 }

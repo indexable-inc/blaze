@@ -94,9 +94,9 @@ pub struct Procs {
 
 impl Procs {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn new(io: Io) -> Procs {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn new(io: Io) -> Procs {
         Procs { io, allowed: Allowed::Any }
     }
 

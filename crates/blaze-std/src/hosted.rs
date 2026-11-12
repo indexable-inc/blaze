@@ -72,10 +72,10 @@ impl fmt::Display for Refused {
 
 impl From<Stopped> for Refused {
     #[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-fn from(stopped: Stopped) -> Refused {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn from(stopped: Stopped) -> Refused {
         Refused::Stopped(stopped)
     }
 }
@@ -169,7 +169,7 @@ impl SimHost {
 
 impl Default for SimHost {
     #[blaze::nonblocking]
-fn default() -> SimHost {
+    fn default() -> SimHost {
         SimHost::new()
     }
 }

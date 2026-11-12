@@ -109,7 +109,7 @@ pub(crate) struct Disk {
 
 impl Disk {
     #[blaze::nonblocking]
-pub(crate) fn new(seed: u64) -> Disk {
+    pub(crate) fn new(seed: u64) -> Disk {
         Disk {
             counts: DiskCounts::default(),
             // alloc: none until a file is written.
@@ -127,9 +127,9 @@ pub(crate) fn new(seed: u64) -> Disk {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn counts(&self) -> DiskCounts {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn counts(&self) -> DiskCounts {
         self.counts
     }
 

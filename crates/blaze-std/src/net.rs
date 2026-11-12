@@ -295,9 +295,9 @@ impl HostPort {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn port(&self) -> u16 {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn port(&self) -> u16 {
         self.port
     }
 
@@ -329,8 +329,8 @@ impl TryFrom<&str> for HostPort {
     type Error = HostPortError;
 
     #[blaze::pure]
-#[blaze::nonblocking]
-fn try_from(raw: &str) -> Result<HostPort, HostPortError> {
+    #[blaze::nonblocking]
+    fn try_from(raw: &str) -> Result<HostPort, HostPortError> {
         HostPort::parse(raw)
     }
 }
@@ -365,9 +365,9 @@ impl Allowed {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn allows(&self, at: &Addr) -> bool {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn allows(&self, at: &Addr) -> bool {
         match self {
             Allowed::Any => true,
             Allowed::Only(only) => only == at,
@@ -481,9 +481,9 @@ pub struct Net {
 
 impl Net {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn new(io: Io) -> Net {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn new(io: Io) -> Net {
         Net { io, connect: Allowed::Any, listen: Allowed::Any, budget: None }
     }
 
@@ -686,9 +686,9 @@ impl Conn {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn peer(&self) -> &Addr {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn peer(&self) -> &Addr {
         &self.peer
     }
 

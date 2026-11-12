@@ -30,9 +30,9 @@ pub struct Roots {
 
 impl Roots {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn new(anchors: Arc<[Anchor]>, plant: Plant) -> Roots {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn new(anchors: Arc<[Anchor]>, plant: Plant) -> Roots {
         Roots { anchors, allowed: Allowed::Any, plant }
     }
 

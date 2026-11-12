@@ -116,30 +116,30 @@ impl<A: Allocator> Image<A> {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn width(&self) -> u32 {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn width(&self) -> u32 {
         self.width
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn height(&self) -> u32 {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn height(&self) -> u32 {
         self.height
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn color(&self) -> Color {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn color(&self) -> Color {
         self.color
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn depth(&self) -> Depth {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn depth(&self) -> Depth {
         self.depth
     }
 
@@ -151,26 +151,26 @@ pub fn depth(&self) -> Depth {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn pixels(&self) -> &[u8] {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn pixels(&self) -> &[u8] {
         &self.pixels
     }
 
     #[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn into_pixels(self) -> Vec<u8, A> {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn into_pixels(self) -> Vec<u8, A> {
         self.pixels
     }
 }
 
 impl<A: Allocator, B: Allocator> PartialEq<Image<B>> for Image<A> {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-fn eq(&self, other: &Image<B>) -> bool {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn eq(&self, other: &Image<B>) -> bool {
         self.width == other.width
             && self.height == other.height
             && self.color == other.color

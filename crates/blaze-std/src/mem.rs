@@ -88,30 +88,30 @@ impl<'a> Bytes<'a> {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn as_slice(&self) -> &[u8] {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn as_slice(&self) -> &[u8] {
         &self.bytes
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn len(&self) -> usize {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn len(&self) -> usize {
         self.bytes.len()
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn is_empty(&self) -> bool {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn clear(&mut self) {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn clear(&mut self) {
         self.bytes.clear();
     }
 
@@ -138,9 +138,9 @@ pub struct Mem {
 
 impl Mem {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn new(io: Io) -> Mem {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn new(io: Io) -> Mem {
         Mem { io }
     }
 
@@ -167,16 +167,16 @@ pub struct Arena {
 
 impl Arena {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn name(&self) -> &'static str {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn name(&self) -> &'static str {
         self.name
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn limit(&self) -> usize {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn limit(&self) -> usize {
         self.limit
     }
 

@@ -50,30 +50,30 @@ pub struct User {
 
 impl User {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn new(io: Io, facts: UserFacts) -> User {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn new(io: Io, facts: UserFacts) -> User {
         User { io, facts }
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn name(&self) -> &UserName {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn name(&self) -> &UserName {
         &self.facts.name
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn uid(&self) -> u32 {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn uid(&self) -> u32 {
         self.facts.uid
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn gid(&self) -> u32 {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn gid(&self) -> u32 {
         self.facts.gid
     }
 

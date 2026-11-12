@@ -81,7 +81,7 @@ impl SimAudio {
 
 impl Default for SimAudio {
     #[blaze::nonblocking]
-fn default() -> SimAudio {
+    fn default() -> SimAudio {
         SimAudio::new()
     }
 }
@@ -117,9 +117,9 @@ pub struct Audio {
 
 impl Audio {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn new(io: Io) -> Audio {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn new(io: Io) -> Audio {
         Audio { io }
     }
 

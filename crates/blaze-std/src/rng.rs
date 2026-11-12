@@ -18,10 +18,10 @@ pub struct Rng {
 
 impl Rng {
     #[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn new(seed: u64) -> Rng {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn new(seed: u64) -> Rng {
         Rng { draws: SplitMix64::new(seed) }
     }
 
@@ -34,9 +34,9 @@ pub(crate) fn new(seed: u64) -> Rng {
     }
 
     #[blaze::pure]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn next_u64(&mut self) -> u64 {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn next_u64(&mut self) -> u64 {
         self.draws.next_u64()
     }
 
@@ -50,9 +50,9 @@ pub fn next_u64(&mut self) -> u64 {
     }
 
     #[blaze::pure]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn fill(&mut self, out: &mut [u8]) {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn fill(&mut self, out: &mut [u8]) {
         self.draws.fill(out);
     }
 }

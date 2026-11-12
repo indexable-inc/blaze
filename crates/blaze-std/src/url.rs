@@ -100,9 +100,9 @@ impl Scheme {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn as_str(&self) -> &str {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 
@@ -140,23 +140,23 @@ pub struct Origin {
 
 impl Origin {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn new(scheme: Scheme, at: HostPort) -> Origin {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn new(scheme: Scheme, at: HostPort) -> Origin {
         Origin { scheme, at }
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn scheme(&self) -> &Scheme {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn scheme(&self) -> &Scheme {
         &self.scheme
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn at(&self) -> &HostPort {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn at(&self) -> &HostPort {
         &self.at
     }
 }
@@ -234,16 +234,16 @@ impl Url {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn as_str(&self) -> &str {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn as_str(&self) -> &str {
         &self.raw
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn scheme(&self) -> &Scheme {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn scheme(&self) -> &Scheme {
         &self.scheme
     }
 
@@ -280,7 +280,7 @@ impl TryFrom<&str> for Url {
     type Error = UrlError;
 
     #[blaze::nonblocking]
-fn try_from(raw: &str) -> Result<Url, UrlError> {
+    fn try_from(raw: &str) -> Result<Url, UrlError> {
         Url::parse(raw)
     }
 }

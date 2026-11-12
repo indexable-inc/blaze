@@ -172,10 +172,10 @@ impl Point {
 
 impl PartialEq for Point {
     #[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-fn eq(&self, other: &Point) -> bool {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn eq(&self, other: &Point) -> bool {
         self.code == other.code
     }
 }
@@ -184,10 +184,10 @@ impl Eq for Point {}
 
 impl core::hash::Hash for Point {
     #[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.code.hash(state);
     }
 }
@@ -337,10 +337,10 @@ impl EvalKey for char {
 
 impl EvalKey for () {
     #[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-fn write_key(&self, _: &mut KeyWriter) {}
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn write_key(&self, _: &mut KeyWriter) {}
 }
 
 impl EvalKey for str {
@@ -361,9 +361,9 @@ impl<T: EvalKey> EvalKey for [T] {
 /// An array: its elements; its length is its type's.
 impl<T: EvalKey, const N: usize> EvalKey for [T; N] {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-fn write_key(&self, into: &mut KeyWriter) {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn write_key(&self, into: &mut KeyWriter) {
         T::write_keys(self, into);
     }
 }
@@ -371,10 +371,10 @@ fn write_key(&self, into: &mut KeyWriter) {
 /// A reference is what it refers to: never its address.
 impl<T: EvalKey + ?Sized> EvalKey for &T {
     #[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-fn write_key(&self, into: &mut KeyWriter) {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn write_key(&self, into: &mut KeyWriter) {
         (**self).write_key(into);
     }
 }
@@ -1082,8 +1082,8 @@ impl<'m> Graph<'m> {
     }
 
     #[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn is_empty(&self) -> bool {
+    #[blaze::nonblocking]
+    pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
@@ -1165,9 +1165,9 @@ pub struct Provenance<'a, 'm> {
 
 impl<'a, 'm> Provenance<'a, 'm> {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn new(inner: &'a Eval<'a>, graph: &'a Graph<'m>) -> Provenance<'a, 'm> {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn new(inner: &'a Eval<'a>, graph: &'a Graph<'m>) -> Provenance<'a, 'm> {
         Provenance { inner, graph }
     }
 }
@@ -1179,9 +1179,9 @@ impl Handler for Provenance<'_, '_> {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-fn name(&self) -> &'static str {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn name(&self) -> &'static str {
         "the provenance handler"
     }
 }

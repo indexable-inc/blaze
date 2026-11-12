@@ -75,19 +75,19 @@ impl core::error::Error for SleepError {}
 
 impl From<Stopped> for SleepError {
     #[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-fn from(stopped: Stopped) -> SleepError {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn from(stopped: Stopped) -> SleepError {
         SleepError::Stopped(stopped)
     }
 }
 
 impl Clock {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn new(io: Io) -> Clock {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn new(io: Io) -> Clock {
         Clock { io }
     }
 

@@ -82,9 +82,9 @@ pub struct Window {
 
 impl Window {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn new(io: Io) -> Window {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn new(io: Io) -> Window {
         Window { io, allowed: Allowed::Any }
     }
 

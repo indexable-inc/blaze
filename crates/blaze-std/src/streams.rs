@@ -151,9 +151,9 @@ pub struct Stream {
 
 impl Stream {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn origin(&self) -> &Origin {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn origin(&self) -> &Origin {
         &self.origin
     }
 

@@ -23,9 +23,9 @@ impl<T: Clone + PartialEq> Allowed<T> {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn allows(&self, thing: &T) -> bool {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn allows(&self, thing: &T) -> bool {
         match self {
             Allowed::Any => true,
             Allowed::Only(only) => only.contains(thing),

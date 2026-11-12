@@ -46,27 +46,27 @@ pub(crate) struct Crc(u32);
 
 impl Crc {
     #[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn new() -> Crc {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn new() -> Crc {
         Crc(0xFFFF_FFFF)
     }
 
     #[blaze::pure]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn update(&mut self, bytes: &[u8]) {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
         for &b in bytes {
             self.0 = CRC_TABLE[((self.0 ^ u32::from(b)) & 0xFF) as usize] ^ (self.0 >> 8);
         }
     }
 
     #[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn finish(&self) -> u32 {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn finish(&self) -> u32 {
         self.0 ^ 0xFFFF_FFFF
     }
 }
@@ -101,10 +101,10 @@ pub(crate) struct Inflate {
 
 impl Inflate {
     #[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn new() -> Inflate {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn new() -> Inflate {
         Inflate { state: DecompressorOxide::new(), at: 0, done: false }
     }
 

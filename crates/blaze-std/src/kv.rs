@@ -129,9 +129,9 @@ impl Key {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn as_str(&self) -> &str {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
 
@@ -157,8 +157,8 @@ impl TryFrom<&str> for Key {
     type Error = KeyError;
 
     #[blaze::pure]
-#[blaze::nonblocking]
-fn try_from(raw: &str) -> Result<Key, KeyError> {
+    #[blaze::nonblocking]
+    fn try_from(raw: &str) -> Result<Key, KeyError> {
         Key::new(raw)
     }
 }

@@ -58,9 +58,9 @@ pub struct Host {
 
 impl Host {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn new(io: Io) -> Host {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn new(io: Io) -> Host {
         Host { io }
     }
 

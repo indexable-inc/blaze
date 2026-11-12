@@ -113,7 +113,7 @@ impl core::error::Error for HeaderError {}
 
 impl Header {
     #[blaze::nonblocking]
-pub fn new(name: &str, value: &str) -> Result<Header, HeaderError> {
+    pub fn new(name: &str, value: &str) -> Result<Header, HeaderError> {
         if let Some(why) = h1::refuse_header(name, value) {
             // alloc: an error's message.
             return Err(HeaderError { name: name.to_owned(), why });
@@ -123,16 +123,16 @@ pub fn new(name: &str, value: &str) -> Result<Header, HeaderError> {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn name(&self) -> &str {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn name(&self) -> &str {
         &self.name
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn value(&self) -> &str {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn value(&self) -> &str {
         &self.value
     }
 }
@@ -235,10 +235,10 @@ impl core::error::Error for HttpError {}
 
 impl From<Stopped> for HttpKind {
     #[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-fn from(stopped: Stopped) -> HttpKind {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn from(stopped: Stopped) -> HttpKind {
         HttpKind::Stopped(stopped)
     }
 }

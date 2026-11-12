@@ -77,18 +77,18 @@ pub struct TokenCell<T: ?Sized, K> {
 
 impl<T, K> TokenCell<T, K> {
     #[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub const fn new(value: T) -> TokenCell<T, K> {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub const fn new(value: T) -> TokenCell<T, K> {
         TokenCell { kind: PhantomData, value: RawCell::new(value) }
     }
 
     #[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn into_inner(self) -> T {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn into_inner(self) -> T {
         self.value.into_inner()
     }
 }

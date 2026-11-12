@@ -35,10 +35,10 @@ impl BlobId {
     }
 
     #[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn as_bytes(&self) -> &[u8; 32] {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 

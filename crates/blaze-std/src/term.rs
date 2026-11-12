@@ -117,9 +117,9 @@ impl SimTerm {
 
 impl Default for SimTerm {
     #[blaze::pure]
-#[blaze::nopanic]
-#[blaze::nonblocking]
-fn default() -> SimTerm {
+    #[blaze::nopanic]
+    #[blaze::nonblocking]
+    fn default() -> SimTerm {
         SimTerm::new()
     }
 }
@@ -157,9 +157,9 @@ pub struct Term {
 
 impl Term {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn new(io: Io) -> Term {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn new(io: Io) -> Term {
         Term { io }
     }
 

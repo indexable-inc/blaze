@@ -176,10 +176,10 @@ impl Durable {
 
 impl From<Unsynced> for Durable {
     #[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-fn from(unsynced: Unsynced) -> Durable {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn from(unsynced: Unsynced) -> Durable {
         match unsynced {
             Unsynced::No => Durable::No,
             Unsynced::Started => Durable::Started,
@@ -701,9 +701,9 @@ pub struct Fs {
 
 impl Fs {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn new(io: Io) -> Fs {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn new(io: Io) -> Fs {
         Fs { io }
     }
 
@@ -1219,9 +1219,9 @@ impl Written {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn name(&self) -> &FileName {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn name(&self) -> &FileName {
         &self.file.name
     }
 
@@ -1291,9 +1291,9 @@ impl Flushed {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn name(&self) -> &FileName {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn name(&self) -> &FileName {
         &self.file.name
     }
 
@@ -1370,9 +1370,9 @@ impl<#[blaze::linear] P: Rights> fmt::Debug for File<P> {
 
 impl<#[blaze::linear] P: Rights> File<P> {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn name(&self) -> &FileName {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn name(&self) -> &FileName {
         &self.name
     }
 

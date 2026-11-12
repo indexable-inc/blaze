@@ -12,9 +12,9 @@ pub struct Args {
 
 impl Args {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn new(args: Arc<[String]>) -> Args {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn new(args: Arc<[String]>) -> Args {
         Args { args }
     }
 
@@ -27,16 +27,16 @@ pub(crate) fn new(args: Arc<[String]>) -> Args {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn len(&self) -> usize {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn len(&self) -> usize {
         self.args.len()
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn is_empty(&self) -> bool {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn is_empty(&self) -> bool {
         self.args.is_empty()
     }
 

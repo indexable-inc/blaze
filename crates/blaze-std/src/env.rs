@@ -83,8 +83,8 @@ pub const fn check_literal(raw: &str) {
 
 impl VarName {
     #[blaze::pure]
-#[blaze::nonblocking]
-pub fn new(raw: &str) -> Result<VarName, VarNameError> {
+    #[blaze::nonblocking]
+    pub fn new(raw: &str) -> Result<VarName, VarNameError> {
         if let Some(why) = refused(raw) {
             // alloc: an error's message.
             return Err(VarNameError { name: raw.to_owned(), why });
@@ -94,9 +94,9 @@ pub fn new(raw: &str) -> Result<VarName, VarNameError> {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub fn as_str(&self) -> &str {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -117,8 +117,8 @@ impl TryFrom<&str> for VarName {
     type Error = VarNameError;
 
     #[blaze::pure]
-#[blaze::nonblocking]
-fn try_from(raw: &str) -> Result<VarName, VarNameError> {
+    #[blaze::nonblocking]
+    fn try_from(raw: &str) -> Result<VarName, VarNameError> {
         VarName::new(raw)
     }
 }
@@ -159,9 +159,9 @@ pub struct Env {
 
 impl Env {
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn new(vars: Arc<[(String, String)]>, plant: Plant) -> Env {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn new(vars: Arc<[(String, String)]>, plant: Plant) -> Env {
         Env { vars, allowed: None, plant }
     }
 

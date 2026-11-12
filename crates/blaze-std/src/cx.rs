@@ -162,9 +162,9 @@ impl Cx {
     }
 
     #[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn plant(&self) -> Plant {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn plant(&self) -> Plant {
         self.plant
     }
 

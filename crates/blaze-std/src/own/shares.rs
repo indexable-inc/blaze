@@ -123,10 +123,10 @@ impl<#[blaze::linear] T, K, const N: usize, const D: usize> Deref for Shares<T, 
     type Target = T;
 
     #[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-fn deref(&self) -> &T {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn deref(&self) -> &T {
         // SAFETY: the value is freed only by `whole`, which takes every part by value; this
         // part exists, so that has not happened, and it cannot while the borrow of `self`
         // lives. Writes go through `get_mut`, which needs every part too.
