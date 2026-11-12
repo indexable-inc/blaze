@@ -81,6 +81,15 @@
    "do": "Lanes only write: one worktree and branch each, small commits, pushed often; no VM, no cargo, no daemon. The main agent runs `python3 -I harness/v2/integrate.py '{\"branches\":[...],\"tests\":true}'`: it merges every branch into the integration worktree, builds once, and prints one table (edit loop beside Relax, stale answers, new project, restart, memory, disk, tests). Failures go back to the lane whose files they name. The script's paths are the Mac's today (integration worktree /Volumes/Projects/blaze-int-1112, Relax at /tmp/relax-src); moving it to the one build VM is open.",
    "why": "Rule fan-out-write-only as rewritten 2026-11-12: ten lanes each building in their own VM cost a cold build and hours each, and their numbers had to be redone on the combined tree anyway.",
    "state": "current"
+  },
+  {
+   "id": "H10",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-builds-1112",
+   "task": "Run a blaze command longer than a few minutes on the shared build VM",
+   "do": "Always through `/root/loop.sh <branch> <command>` (it alone checks your branch out). For a run longer than the call: inside the loop call, copy `/root/inst/blaze` and `/root/inst/blaze-engine` to a directory of your lane, put a worktree of the tip at `/root/wt/<branch>` (`git -C /root/blaze worktree add --detach`, or `git -C /root/wt/<branch> checkout --detach <tip>`), and start the command as a systemd unit that uses those and `BLAZE_HOME=/root/homes/<branch>`; poll with `systemctl is-active <unit>` and read its log. The lane's wrapper was three scripts on the Mac (prep.sh sent base64 through `ix shell`, go.sh, poll.sh).",
+   "why": "Another lane's loop call replaces `/root/inst`, kills its daemon and moves `/root/blaze` to its branch (annoyances bstd-1, bstd-3).",
+   "state": "current"
   }
  ],
  "annoyances": [
@@ -1209,6 +1218,78 @@
    "workaround": "stopped it with its own binary",
    "fix": "`--version` prints both the launcher and the version it runs; `stop` names the daemon on the socket whatever built it",
    "state": "open"
+  },
+  {
+   "id": "bstd-1",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-builds-1112",
+   "where": "/root/loop.sh on lanebase-1112",
+   "what": "Every call of `/root/loop.sh` by any lane kills the daemon of `/root/inst/blaze-engine` and replaces `/root/inst/blaze`, and checks another branch out in `/root/blaze`, so a run longer than one call (a `blaze test -p blaze-std` of three minutes started as a systemd unit) cannot use `/root/inst` or `/root/blaze`.",
+   "cost": "twenty minutes writing a wrapper (prep.sh) before the first run",
+   "cause": "one install directory and one checkout for every lane",
+   "workaround": "inside my loop call: copy `/root/inst/blaze{,-engine}` to `/root/inst-bstd/`, `git worktree add --detach /root/wt/<branch>`, and start the unit on those",
+   "fix": "loop.sh installs to `/root/inst/<branch>/` and keeps `/root/wt/<branch>` at the tip itself, and takes `--unit <name>` to start the command as a systemd unit and print how to poll it",
+   "state": "open"
+  },
+  {
+   "id": "bstd-2",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-builds-1112",
+   "where": "/root/loop.sh on lanebase-1112",
+   "what": "The queue is one flock with no bound on how long a holder keeps it: `loop.sh content-keys-1112 /root/wt/content-keys-1112/exp1.sh` held it for over 15 minutes (ps etimes 925 s) with three lanes queued behind it; my `check --fix` call waited behind it, and each waiting call was moved to the background by the tool after 180 s with no output.",
+   "cost": "about twenty minutes of waiting, twice",
+   "cause": "experiments run inside the lock; the brief says to keep each call short but nothing holds a call to it",
+   "workaround": "wrote docs and agents.json rows while waiting",
+   "fix": "loop.sh prints who holds the lock and for how long while it waits, and runs the command under `timeout` (ten minutes) so a long run has to be a unit outside the lock",
+   "state": "open"
+  },
+  {
+   "id": "bstd-3",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-builds-1112",
+   "where": "my own command on lanebase-1112",
+   "what": "To see a failing assertion I ran `flock /root/loop.lock bash -c 'cargo test ...'` in `/root/blaze` myself, not through loop.sh: the checkout was another lane's (3d1f288eb), my test did not exist there, and the command printed nothing.",
+   "cost": "one wasted call and a cargo test build of another lane's tree in the shared target",
+   "cause": "the lock does not say whose tree is checked out; only loop.sh checks the branch out",
+   "workaround": "always `/root/loop.sh <branch> ...`",
+   "fix": "none needed beyond bstd-1's fix; the how-to row says it",
+   "state": "open"
+  },
+  {
+   "id": "bstd-4",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-builds-1112",
+   "where": "git worktree add, in an agent's shell",
+   "what": "`git worktree add -b bstd-builds-1112 ../blaze-bstd-builds-1112 origin/main 2>&1 | tail -2` printed one line of 14,000 characters: git's `Updating files: N%` progress uses carriage returns, so `tail` sees one line.",
+   "cost": "context",
+   "cause": "progress written to a pipe because of `2>&1`",
+   "workaround": "`git worktree add -q`",
+   "fix": "the lane how-to says `-q`",
+   "state": "open"
+  },
+  {
+   "id": "bstd-5",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-builds-1112",
+   "where": "crates/hir-ty-mir/tests/mir (fixtures)",
+   "what": "A test that slices the source by a diagnostic's range has to slice the text after the fixture's `//- minicore:` line: I put that line inside the string I sliced and got `\"pub fn \"` where the call was. And an intrinsic of a made-up name (`raw`) makes `mir_body` fail (`UnknownIntrinsic`), so a check that reads MIR answers nothing for the whole body.",
+   "cost": "two rounds of the shared build (about 25 minutes with the queue)",
+   "cause": "the fixture's header is not part of the file; lowering looks an intrinsic up by name",
+   "workaround": "copy `tests/mir/const_check.rs`'s `check` helper's shape; use a real intrinsic's name (`variant_count`)",
+   "fix": "a shared `refused_text(src, name)` helper in tests/mir/main.rs that every span-slicing test uses",
+   "state": "open"
+  },
+  {
+   "id": "bstd-6",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-builds-1112",
+   "where": "blaze check --fix",
+   "what": "`blaze check --fix --lib -p blaze-std` made the suggestions of every crate in the checkout the check reached (blaze-sys, vendor/quinn-proto), not of blaze-std alone, and two of those are wrong as written: `clippy::disallowed_methods` of `std::mem::forget` in blaze-sys (a `no_std` crate) gave E0433 `cannot find module or crate std` at crates/blaze-sys/src/linux/fs.rs, and suggestions in vendor/quinn-proto gave E0432 unresolved imports `crate::connection::Chunks` and five more, E0308 in frame.rs and `bindings_with_variant_name`. Then every effect lint said `into_raw` \"has a body that does not lower to MIR: MissingFunctionDefinition\", which was the unresolved `std` path, not a fault of the effect checks.",
+   "cost": "the 137k-line output read as a compiler bug in MIR lowering until the last twelve lines were read",
+   "cause": "the fixer took every diagnostic whose file is in the checkout; the two lints' fixes were never run on a no_std crate or on quinn-proto",
+   "workaround": "none before the fix",
+   "fix": "fixed for the scope (UnitOf::primary, commit a0a553886 on bstd-builds-1112); the two wrong fixes are still wrong and would show with `--fix -p blaze-sys` and `--fix -p quinn-proto`: a what-if error should name the suggestion that caused it (lint and span), which the fixer can find by bisecting the ops",
+   "state": "fixed for the scope with a0a553886; the wrong fixes open"
   }
  ]
 }
