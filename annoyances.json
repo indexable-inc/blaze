@@ -1,0 +1,115 @@
+{
+ "about": "Everything that slowed, surprised or annoyed an agent or a person while working on blaze, however slightly, written down when it happens (rule record-annoyances). A row is a lead for guard-the-cause: the fix is to remove the cause, then set the row's state. Rows are never deleted; a fixed one keeps its state and the commit.",
+ "annoyances": [
+  {
+   "id": "disk-1",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+   "where": "the task's premise: the profile's size",
+   "what": "The brief said the profile directory's 551 MB was spans, waits, samples and per-flush files. 516 MiB of it was one file, `flight-<pid>.map`, the flight recorder's mapping with all 256 rings' stores reserved up front; the Parquet history was 17 MB and `why.ledger` 17 MB. `du` of `profile/` says one number for three different things.",
+   "cost": "the first plan (aggregate waits) aimed at 3% of the bytes",
+   "cause": "nothing reports the history's directory by what is in it (the mapping, the ledger, each table)",
+   "workaround": "listed the directory by table with a one-line awk",
+   "state": "fixed for the mapping in 31664bef18 (reserved as handed out); a `blaze debug disk` that says each part is open"
+  },
+  {
+   "id": "disk-2",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+   "where": "blaze-profile: the mapping's reservation on macOS",
+   "what": "`F_PREALLOCATE` asked with `F_ALLOCATECONTIG` alone succeeds with whatever contiguous run it found: a 3.4 MiB ask came back with 20 KiB reserved and no error, so the mapping's promise (no SIGBUS on a full disk) held only because the 516 MiB ask happened to fail and fall through to `F_ALLOCATEALL`.",
+   "cost": "found only because the new test's oracle checks the blocks the file holds",
+   "cause": "the code never read `fst_bytesalloc`",
+   "workaround": "none needed",
+   "state": "fixed in 31664bef18: all or nothing, and the bytes given are checked"
+  },
+  {
+   "id": "disk-3",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+   "where": "blaze-profile's tests under cargo on macOS",
+   "what": "Three tests fail on the untouched tip of all-1111 (65fafef399): `batches::tests::names_given_on_many_threads_read_back_from_parquet_as_recorded` every time, alone too (two of five threads' spans missing); `history::tests::past_the_cap_the_oldest_files_go_first` and `history::tests::a_pinned_reader_keeps_retired_files_until_it_lets_go` (and once `past_the_cap_a_build_goes_whole`) only when the suite runs in parallel, passing alone.",
+   "cost": "a baseline worktree and three extra runs to tell them from my changes",
+   "cause": "not looked for: the cap tests share something across tests in one process (the pins directory or the reaper's timing)",
+   "workaround": "ran each alone and on a detached worktree of the base",
+   "state": "open"
+  },
+  {
+   "id": "disk-4",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+   "where": "blaze-cargo's tests under cargo on macOS",
+   "what": "`cli::tests::every_command_suggested_is_one` fails (`serve` is in COMMANDS and is no command) and `serve::why::tests::a_changed_key_part_is_named_by_subject_and_survives_a_restore` expects a torn third record to be called `record 1` where the code says `record 2`. Neither is in code this lane touched; whether both fail on the base is said in the lane's report.",
+   "cost": "minutes",
+   "cause": "not looked for",
+   "workaround": "none",
+   "state": "open"
+  },
+  {
+   "id": "disk-5",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+   "where": "measuring disk on APFS",
+   "what": "`du` counts a clone's blocks once a file: the store's `placed/*.derived` files read as 450 MB and hold 9.6 MB of their own, so a home's `du` total can be several times what it holds, and the script every lane was given (`/tmp/blaze-fresh.sh`) reports `du`.",
+   "cost": "one wrong conclusion nearly drawn (that the store had tripled)",
+   "cause": "`du` has no notion of shared extents",
+   "workaround": "wrote a script that asks `ATTR_CMNEXT_PRIVATESIZE` per file (`/private/tmp/blaze-disk-scripts/private.py`, gone with the lane)",
+   "state": "open: the measuring script should say private bytes beside `du`'s"
+  },
+  {
+   "id": "disk-6",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+   "where": "the shell",
+   "what": "`stat -f %z` failed inside a script because GNU `stat` from nix is first on PATH; `/usr/bin/stat` had to be spelled out. The same cause as A1.",
+   "cost": "minutes",
+   "cause": "two toolchains on one PATH",
+   "workaround": "spell `/usr/bin/stat`",
+   "state": "open"
+  },
+  {
+   "id": "disk-7",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+   "where": "blaze: `blaze debug sql` in a fresh home",
+   "what": "The first `blaze debug sql` in a home downloads DuckDB into `<home>/v2/duckdb` (55 MB), a copy a home, though it is a pinned binary named by its version and hash.",
+   "cost": "55 MB a home, and the first query waits for the download",
+   "cause": "the tool directory is under the home's state, not the machine's shared directory",
+   "workaround": "none",
+   "state": "open"
+  },
+  {
+   "id": "disk-8",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+   "where": "blaze: the idle daemon",
+   "what": "An idle daemon still wakes its loop every 50 ms, its profile drain every 50 ms and its stop guard every 100 ms, each a span, and plots ten counters every 50 ms: 45 span rows and 235 counter rows a second with nothing happening, 0.15 MB a minute of history after this lane's changes (1.2 MB before).",
+   "cost": "about 220 MB a day of history for a daemon left running, which the cap now takes back first",
+   "cause": "polling loops where a wait on an event would do, and gauges written whether or not they changed",
+   "workaround": "the cap retires rows of no build before any build's (e8aec1d91a)",
+   "state": "open: the ticks themselves are the runtime's"
+  },
+  {
+   "id": "disk-9",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+   "where": "blaze: the build directory",
+   "what": "The linked executable is in the build directory twice, each with its own blocks (`debug/hello` and `debug/build/hello/<id>/out/hello`, 23.2 MB each on disk, 158.5 MB long), and so is its `.dSYM` (8.1 MB each): 31 MB of hello-world's 63 MB build directory is a second copy.",
+   "cost": "31 MB a program",
+   "cause": "each path is placed from the store as its own file and patched on its own",
+   "workaround": "none",
+   "state": "open: one file and a hard link, or the patch room gone (launcher.md step 5)"
+  },
+  {
+   "id": "disk-10",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+   "where": "the lane's own rule: annoyances.json",
+   "what": "`annoyances.json` is not on `all-1111` (it is on `film-1111`), so every lane cut from all-1111 adds the file and they will conflict add/add when merged.",
+   "cost": "a merge conflict a lane",
+   "cause": "the file was started on a branch the lanes were not cut from",
+   "workaround": "rows here have ids `disk-1` up so they can be appended",
+   "state": "open"
+  }
+ ]
+}
