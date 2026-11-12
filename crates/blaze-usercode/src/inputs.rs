@@ -123,6 +123,14 @@ pub struct Files {
 }
 
 thread_local! {
+    /// A planted bug, for a test's control: a path missing a part before its last has no
+    /// names ([`names`]), so it is looked at every time, as until 2026-11-12. Never set
+    /// outside a test.
+    #[doc(hidden)]
+    pub static MISSING_PARENT_IS_UNVOUCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
     /// A planted bug, for a test's control: [`Files::entry`] looks at the disk on every ask,
     /// as until 2026-11-12. Never set outside a test.
     #[doc(hidden)]
@@ -201,9 +209,9 @@ const MOST_LINKS: usize = 40;
 /// `usr/lib/libm.tbd` one to `libSystem.tbd`), each link where it is and the file they end at.
 /// A link pointed elsewhere is a change in the link's own directory, and the file changed is
 /// one in its own: with a watch over each, nothing the answer depends on moves unheard. A
-/// missing path's last part is the name that would be made. `None` for a path that is not
-/// absolute, has `..` in it, has more than [`MOST_LINKS`] links, or of which a part
-/// before the last is missing or unreadable. Cold: on a miss only.
+/// missing path's name is the first part of it that is not there: the name that would be made.
+/// `None` for a path that is not absolute, has `..` in it, has more than [`MOST_LINKS`]
+/// links, or of which a part before the last is unreadable. Cold: on a miss only.
 fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
     use std::path::Component;
     let mut parts = path.components();
@@ -248,7 +256,16 @@ fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
                 }
             }
             Ok(_) => at = name,
-            // The name that would be made, for a path that is not there.
+            // The name that would be made, for a path that is not there: its last part, or
+            // the first part of it that is missing (nothing below a name that is not there
+            // is, until that name is made, which its directory hears). Until 2026-11-12 a
+            // path missing a part before its last was never vouched for: a tool that asks of
+            // `src/lib.rs`, `src/main.rs` and `src/bin` in each package of a workspace, some
+            // with no `src`, was looked at on the disk for each, in every build.
+            Err(error) if missing(&error) && answer.is_none() && !MISSING_PARENT_IS_UNVOUCHED.get() => {
+                at = name;
+                break;
+            }
             Err(error) if missing(&error) && left.is_empty() && answer.is_none() => at = name,
             Err(_) => return None,
         }
@@ -957,7 +974,12 @@ mod tests {
         );
         assert_eq!(names(&dir.join("sdks/real/lib/system"), hash), Some(vec![dir.join("sdks/real/lib/system")]));
         assert_eq!(names(&dir.join("sdks/named/lib/gone"), None), Some(vec![dir.join("sdks/named"), dir.join("sdks/real/lib/gone")]));
-        assert_eq!(names(&dir.join("sdks/gone/lib/m"), None), None, "a part before the last is missing");
+        // The invariant: a path missing a part before its last rests on that part's name.
+        assert_eq!(names(&dir.join("sdks/gone/lib/m"), None), Some(vec![dir.join("sdks/gone")]));
+        // The control: as until 2026-11-12, such a path is vouched for by nothing.
+        MISSING_PARENT_IS_UNVOUCHED.set(true);
+        assert_eq!(names(&dir.join("sdks/gone/lib/m"), None), None, "planted");
+        MISSING_PARENT_IS_UNVOUCHED.set(false);
         // A `.` names nothing (`Path::components` drops it); a `..` may cross a link, and is
         // not resolved here.
         assert_eq!(names(&dir.join("sdks/./real/lib/system"), hash), Some(vec![dir.join("sdks/real/lib/system")]));
