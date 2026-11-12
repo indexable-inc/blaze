@@ -60,7 +60,7 @@ fn edition(cx: &Cx<'_, '_>) -> Vec<Diag> {
         SaidBlazeEdition::Is(edition) => {
             let std = span::BlazeEdition::STD;
             let has_std =
-                krate.data(cx.db).dependencies.iter().any(|dep| dep.as_name().as_str() == std);
+                krate.data(cx.db).dependencies.iter().any(|dep| dep.name.as_str() == std);
             if has_std {
                 return Vec::new();
             }

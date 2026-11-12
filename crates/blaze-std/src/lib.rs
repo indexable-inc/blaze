@@ -355,8 +355,8 @@ pub mod test {
 /// blaze edition: opting in"): one module an edition, named for it, as Rust's `std::prelude`
 /// has one a Rust edition.
 pub mod prelude {
-    /// The prelude of `edition = "blaze-2026.11"`: `core`'s prelude of Rust 2024, the two
-    /// types every `main` names, and `core`'s macros that Rust's `std` hands on from its
+    /// The prelude of `edition = "blaze-2026.11"`: `core`'s prelude of Rust 2024, the types
+    /// a `main` names (`Cx`, `Io` and the entry's `Error`), and `core`'s macros that Rust's `std` hands on from its
     /// root. No collection is here: one is made in an allocator its code was handed
     /// (std.md, "Memory is explicit").
     pub mod blaze_2026_11 {
@@ -366,7 +366,7 @@ pub mod prelude {
             unimplemented, unreachable, write, writeln,
         };
 
-        pub use crate::{cx::Cx, io::Io};
+        pub use crate::{cx::Cx, entry::Error, io::Io};
     }
 }
 

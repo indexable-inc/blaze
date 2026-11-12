@@ -189,14 +189,14 @@ pub const MARK: &str = "\n// blaze's entry of the blaze edition, which is not in
 /// code a program could have written; nothing in it is the compiler's.
 pub fn module(takes: Takes) -> String {
     let binds: Vec<String> = Root::ALL
-        .iter()
-        .map(|&root| match takes.has(root) {
+        .into_iter()
+        .map(|root| match takes.has(root) {
             true => root.arg().to_owned(),
             false => format!("_{}", root.arg()),
         })
         .collect();
     let hands: Vec<&str> =
-        Root::ALL.iter().filter(|&&root| takes.has(root)).map(|root| root.arg()).collect();
+        Root::ALL.into_iter().filter(|&root| takes.has(root)).map(Root::arg).collect();
     format!(
         "{MARK}#[doc(hidden)]\n#[allow(warnings, clippy::all)]\npub mod {module} {{\n    pub fn \
          main() -> ::std::entry::Exit {{\n        ::std::entry::run(|{binds}| \
@@ -215,7 +215,7 @@ fn roots_of(db: &Db, krate: Crate) -> Option<[AdtId; 2]> {
         .dependencies
         .iter()
         .rev()
-        .find(|dep| dep.as_name().as_str() == BlazeEdition::STD)?
+        .find(|dep| dep.name.as_str() == BlazeEdition::STD)?
         .crate_id;
     let def_map = crate_def_map(db, std);
     let scope = def_map.module(db, def_map.crate_root(db)).scope(db);

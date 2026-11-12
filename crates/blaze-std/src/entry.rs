@@ -12,13 +12,18 @@
 //! - [`run_in`] is the same on an `Io` its caller made: a test hands it [`Io::sim`], so a
 //!   program's `main` runs in the simulation with no process (std.md, "Io").
 //! - [`Outcome`] is the rule for what `main` may return, as a trait: `()`, a [`Status`], or a
-//!   `Result` of one of those and an error that can be shown.
+//!   `Result` of one of those and an error that can be shown. [`Error`] is the error a `main`
+//!   that uses `?` on more than one area's errors returns.
 //!
 //! The root context's bounds are bstd's to pick, since `main` has no caller: they are the
 //! named constants [`MAIN_BUDGET`] and [`MAIN_SCRATCH`] (std.md, "The second rule": a bound
 //! bstd must pick is a named `pub const`). A program that wants others takes `io` alone and
 //! makes its own context with [`Io::cx`].
 
+use alloc::{
+    borrow::ToOwned as _,
+    string::{String, ToString as _},
+};
 use core::{fmt, time::Duration};
 
 use crate::{cx::Cx, io::Io, mem::TASK_FRAME};
@@ -76,6 +81,44 @@ impl<T: Outcome, E: fmt::Display> Outcome for Result<T, E> {
                 Status::FAILED
             }
         }
+    }
+}
+
+/// What a `main` returns when it failed: what the failure says, from whichever error it was.
+/// `?` in `main` turns any error into it (`From` for every `core::error::Error`), so one
+/// `main` can use capabilities whose errors differ; the entry prints it and exits
+/// [`Status::FAILED`]. It is for `main` alone: below it a function returns its area's own
+/// error (std.md, "Errors"), and it is not itself a `core::error::Error`, which is what lets
+/// every error convert into it. Error unions (edition.md, change 2) replace it where a
+/// `main` wants to say which errors it has.
+pub struct Error {
+    said: String,
+}
+
+impl Error {
+    /// A failure that says `said`.
+    pub fn new(said: &str) -> Error {
+        // alloc: an error's message.
+        Error { said: said.to_owned() }
+    }
+}
+
+impl<E: core::error::Error> From<E> for Error {
+    fn from(error: E) -> Error {
+        // alloc: an error's message.
+        Error { said: error.to_string() }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.said)
+    }
+}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.said)
     }
 }
 
