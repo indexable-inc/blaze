@@ -144,6 +144,7 @@ pub const VIEWS: &[View] = &[
     const { view("memory_held", &[BUILD, LIMIT]) },
     const { view("memory_held_now", &[LIMIT]) },
     const { view("memory_sites", &[BUILD, LIMIT]) },
+    const { view("memory_give_backs", &[BUILD, LIMIT]) },
     const { view("admission_waits", &[BUILD, LIMIT]) },
     const { view("busiest_threads", &[BUILD, LIMIT]) },
     const { view("longest_gaps", &[BUILD, LIMIT]) },

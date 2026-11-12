@@ -122,6 +122,7 @@ use parquet::{
 };
 
 use crate::{
+    account::{self, AccountRow},
     batches::{self, Process},
     clock, crash,
     errors::{self, ErrorRow},
@@ -133,6 +134,7 @@ use crate::{
     identity, logs, panics,
     sampler::{self, Sample},
     schema::{self, Column, Table, Type},
+    supervise::{self, Dropped},
     symbols,
 };
 
@@ -464,6 +466,12 @@ pub struct Flushed {
     pub client: usize,
     pub key_parts: usize,
     pub provenance: usize,
+    /// Builds' accounts ([`History::accounted`]): `accounts` rows.
+    pub accounts: usize,
+    /// Rows this flush read and could not write, of every table: each could not be made into
+    /// a batch even alone ([`supervise::split`]). Never silent: said as a WARN event and
+    /// through [`History::take_failed`], and counted by table in [`History::dropped`].
+    pub unwritten: usize,
     /// Spans the threads were inside as the flush read them.
     pub open: usize,
     pub folded: usize,
@@ -491,6 +499,17 @@ pub enum HistoryError {
     Panicked {
         what: String,
         rows: usize,
+        /// The rows by table, `spans 120, events 3`.
+        tables: String,
+    },
+    /// A flush wrote, and `rows` rows of `table` it had read are in no file: each could not be
+    /// made into a batch even alone (`why`: what making it panicked with), or was past the
+    /// bound of [`supervise::split`]'s halvings. `splits`: how often a batch was halved.
+    Dropped {
+        table: &'static str,
+        rows: usize,
+        splits: u32,
+        why: String,
     },
     Io {
         path: PathBuf,
@@ -583,9 +602,13 @@ impl fmt::Display for CompactError {
 impl fmt::Display for HistoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            HistoryError::Panicked { what, rows } => write!(
+            HistoryError::Panicked { what, rows, tables } => write!(
                 f,
-                "the profile history: a flush panicked ({what}): the {rows} rows it had read are not written,                  and the history goes on from the next flush"
+                "the profile history: a flush panicked ({what}): the {rows} rows it had read are not written ({tables}), and the history goes on from the next flush"
+            ),
+            HistoryError::Dropped { table, rows, splits, why } => write!(
+                f,
+                "the profile history: {rows} rows of the {table} table are not written: making their batch panicked ({why}) even after {splits} halvings; the other rows of the flush are written"
             ),
             HistoryError::Io { path, doing, error } => {
                 write!(f, "the profile history: {doing} {}: {error}", path.display())
@@ -658,7 +681,9 @@ impl std::error::Error for HistoryError {
             | HistoryError::Unclassified { .. }
             | HistoryError::Unplaced { .. } => None,
             HistoryError::Postmortem(error) => Some(error),
-            HistoryError::Client { .. } | HistoryError::Panicked { .. } => None,
+            HistoryError::Client { .. }
+            | HistoryError::Panicked { .. }
+            | HistoryError::Dropped { .. } => None,
         }
     }
 }
@@ -875,6 +900,10 @@ pub struct History {
     key_parts: Vec<KeyedMiss>,
     /// The query engine's run log at each build's end, since the last flush.
     provenance: Vec<ProvenanceRow>,
+    /// Builds' accounts ([`crate::account`]), since the last flush.
+    accounts: Vec<AccountRow>,
+    /// The rows this history could not write, by table, since it opened.
+    dropped: Dropped,
     /// The ring a flush reads CPU samples from ([`History::open`]), the samples of it read so
     /// far, and a flush's new ones.
     sampler: &'static sampler::Ring,
@@ -1021,6 +1050,8 @@ impl History {
             key_parts: Vec::new(),
             // alloc: once a history
             provenance: Vec::new(),
+            accounts: Vec::new(),
+            dropped: Dropped::default(),
             sampler,
             sampled: 0,
             // alloc: once a history
@@ -1267,6 +1298,18 @@ impl History {
         self.provenance.extend(rows);
     }
 
+    /// Notes a build's account ([`crate::account::Account`]), for the next flush to write.
+    pub fn accounted(&mut self, rows: impl IntoIterator<Item = AccountRow>) {
+        self.accounts.extend(rows);
+    }
+
+    /// The rows this history read and could not write, by table, since it opened: a flush that
+    /// panicked ([`History::flush_contained`]) and rows no batch could hold
+    /// ([`supervise::split`]). What `blaze daemon status` and each build's account show.
+    pub fn dropped(&self) -> &Dropped {
+        &self.dropped
+    }
+
     /// Writes what the rings hold that is new since the last flush, and the builds that ended
     /// since, one file a table with rows, named for the highest build any of its rows is of and
     /// never below `build` (`None`: the timer's flush, named 0 when it holds no build's rows).
@@ -1289,17 +1332,25 @@ impl History {
         match flushed {
             Ok(flushed) => flushed,
             Err(panic) => {
-                let what = match panic.downcast_ref::<&str>() {
-                    Some(it) => (*it).to_owned(), // alloc: error path
-                    None => match panic.downcast_ref::<String>() {
-                        Some(it) => it.clone(), // clone: error path
-                        None => "a payload that is no text".to_owned(), // alloc: error path
-                    },
-                };
+                let what = supervise::panic_text(&*panic);
                 let rows = self.read.rows();
+                // By table, so what is missing is said where a reader looks for it.
+                let mut lost = Dropped::default();
+                for (table, rows) in [
+                    (schema::SPANS.name, self.read.spans.len()),
+                    (schema::COUNTERS.name, self.read.counters.len()),
+                    (schema::SWITCHES.name, self.read.switches.len()),
+                    (schema::EVENTS.name, self.read.events.len()),
+                    (schema::EVENT_FIELDS.name, self.read.fields.len()),
+                    (schema::FOLDED.name, self.read.folds.len()),
+                ] {
+                    lost.add(table, rows as u64);
+                    self.dropped.add(table, rows as u64);
+                }
+                let tables = lost.line().unwrap_or_else(|| "none of the rings'".to_owned()); // alloc: error path
                 self.read.clear();
                 self.clean = false;
-                Err(HistoryError::Panicked { what, rows })
+                Err(HistoryError::Panicked { what, rows, tables })
             }
         }
     }
@@ -1503,12 +1554,19 @@ impl History {
         // In batches of at most `BATCH_ROWS` rows: a text column of one batch holds at most
         // 2 GiB (`i32` offsets), and a flush that fell behind holds up to `BACKLOG_ROWS`
         // rows, each span with its query's key as text.
-        let mut spans =
-            in_row_batches(&self.read.spans, |rows| batches::spans(rows, of_build))
-                .map_err(arrow_error(&schema::SPANS))?;
+        // A batch whose making panics all the same is halved until it fits, and a row that
+        // fits no batch alone is dropped, counted and said (`supervise::split`).
+        // alloc: once a flush, none unless a row was dropped
+        let mut unwritten: Vec<HistoryError> = Vec::new();
+        let mut spans = in_row_batches(&schema::SPANS, &self.read.spans, &mut unwritten, |rows| {
+            batches::spans(rows, of_build)
+        })
+        .map_err(arrow_error(&schema::SPANS))?;
         spans.extend(
-            in_row_batches(&self.others, |rows| batches::spans(rows, self.process))
-                .map_err(arrow_error(&schema::SPANS))?,
+            in_row_batches(&schema::SPANS, &self.others, &mut unwritten, |rows| {
+                batches::spans(rows, self.process)
+            })
+            .map_err(arrow_error(&schema::SPANS))?,
         );
         spans.append(&mut self.client_spans);
         let counters = [batches::counters(&self.read.counters, self.process)
@@ -1541,13 +1599,29 @@ impl History {
         .map_err(arrow_error(&schema::PROVENANCE))?;
         let switches = [batches::switches(&self.read.switches, self.process)
             .map_err(arrow_error(&schema::SWITCHES))?];
-        let mut events =
-            in_row_batches(&self.read.events, |rows| batches::events(rows, self.process))
-                .map_err(arrow_error(&schema::EVENTS))?;
+        let mut events = in_row_batches(&schema::EVENTS, &self.read.events, &mut unwritten, |rows| {
+            batches::events(rows, self.process)
+        })
+        .map_err(arrow_error(&schema::EVENTS))?;
         events.append(&mut self.client_events);
         let event_fields =
-            in_row_batches(&self.read.fields, |rows| batches::event_fields(rows, self.process))
-                .map_err(arrow_error(&schema::EVENT_FIELDS))?;
+            in_row_batches(&schema::EVENT_FIELDS, &self.read.fields, &mut unwritten, |rows| {
+                batches::event_fields(rows, self.process)
+            })
+            .map_err(arrow_error(&schema::EVENT_FIELDS))?;
+        let accounts =
+            [account::accounts(&self.accounts).map_err(arrow_error(&schema::ACCOUNTS))?];
+        let mut unwritten_rows = 0usize;
+        for error in &unwritten {
+            if let HistoryError::Dropped { table, rows, .. } = error {
+                self.dropped.add(*table, *rows as u64);
+                unwritten_rows += *rows;
+            }
+            // Never silent (rule 3): in the build's problems, and told to the daemon
+            // (`History::take_failed`).
+            tracing::warn!(target: "blaze", "{error}");
+        }
+        self.deferred.append(&mut unwritten);
         let mut folded = vec![
             batches::folded(&self.read.folds, self.process)
                 .map_err(arrow_error(&schema::FOLDED))?,
@@ -1630,6 +1704,8 @@ impl History {
             misses: rows(&misses),
             key_parts: rows(&key_parts),
             provenance: rows(&provenance),
+            accounts: rows(&accounts),
+            unwritten: unwritten_rows,
             open: rows(&open),
             folded: rows(&folded),
             panics: rows(&panics),
@@ -1649,7 +1725,7 @@ impl History {
         let build = named;
         flushed.build = build;
         self.core.files_mut().named(build);
-        let tables: [(&'static Table, &[RecordBatch]); 22] = [
+        let tables: [(&'static Table, &[RecordBatch]); 23] = [
             (&schema::SPANS, &spans),
             (&schema::COUNTERS, &counters),
             (&schema::BUILDS, &builds),
@@ -1672,6 +1748,7 @@ impl History {
             (&schema::PROCESSES, &processes),
             (&schema::TEST_RUNS, &test_runs),
             (&schema::IMAGES, &images),
+            (&schema::ACCOUNTS, &accounts),
         ];
         // Each table's file is encoded here and placed by the core, then all are listed in one
         // commit: a reader sees all of the flush or none of it. A table whose file can't be
@@ -1796,6 +1873,9 @@ impl History {
         }
         if done(&schema::PROVENANCE) {
             self.provenance.clear();
+        }
+        if done(&schema::ACCOUNTS) {
+            self.accounts.clear();
         }
         // The clients' batches went into this flush's parts.
         self.client_build = 0;
@@ -2021,16 +2101,44 @@ fn drain(drained: &Drained, stop: &Receiver<()>, full: &Sender<()>) {
 /// history's thread ended, on reth's and on tempo's cold build.
 pub const BATCH_ROWS: usize = 1 << 16;
 
-/// `rows` as batches of at most [`BATCH_ROWS`] rows each, in order, made by `make`; no rows
-/// is one empty batch, so every table still has its part.
+/// `rows` of `table` as batches of at most [`BATCH_ROWS`] rows each, in order, made by `make`;
+/// no rows is one empty batch, so every table still has its part. A batch whose making panics
+/// (a text column past 2 GiB all the same: [`BATCH_ROWS`] bounds rows, not bytes) is halved
+/// until its rows fit ([`supervise::split`]), and rows that fit no batch are left out and
+/// pushed to `unwritten` as a [`HistoryError::Dropped`] naming the table: the bound is by what
+/// arrow holds, found by trying, so no size has to be guessed.
 fn in_row_batches<T>(
+    table: &'static Table,
     rows: &[T],
+    unwritten: &mut Vec<HistoryError>,
     make: impl Fn(&[T]) -> Result<RecordBatch, ArrowError>,
 ) -> Result<Vec<RecordBatch>, ArrowError> {
-    if rows.is_empty() {
-        return Ok(vec![make(rows)?]); // alloc: a flush's parts, once a flush
+    let split = supervise::split(rows, BATCH_ROWS, make)?;
+    if split.splits > 0 || split.dropped > 0 {
+        let why = split.why.unwrap_or_default();
+        tracing::warn!(
+            target: "blaze",
+            table = table.name,
+            rows = rows.len(),
+            splits = split.splits,
+            dropped = split.dropped,
+            "the profile history halved a batch whose making panicked ({why}): the table whose text passed what one batch holds"
+        );
+        if split.dropped > 0 {
+            // alloc: error path
+            unwritten.push(HistoryError::Dropped {
+                table: table.name,
+                rows: split.dropped,
+                splits: split.splits,
+                why,
+            });
+        }
     }
-    rows.chunks(BATCH_ROWS).map(make).collect()
+    if split.batches.is_empty() {
+        // Every row was dropped: the table still has its part.
+        return Ok(vec![RecordBatch::new_empty(batches::schema_of(table))]); // alloc: a flush's parts
+    }
+    Ok(split.batches)
 }
 
 /// The batches of `table` in `bytes`, an Arrow IPC stream build `build`'s client sent (none for
@@ -2576,6 +2684,47 @@ mod tests {
 
         let again = history.flush(Some(62)).unwrap();
         assert_eq!((again.links, again.crate_deps), (0, 0), "a flush writes each row once");
+        _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The invariant: a build's account is written by the next flush, once, each count in its
+    /// own column, and a history with no account yet (one from before the table) reads as no
+    /// rows through the table's schema file.
+    #[test]
+    fn a_builds_account_is_written_at_the_next_flush_once() {
+        use arrow_array::types::UInt64Type;
+
+        use crate::account::{Account, End, Origin, STEP_UNIT, Seen, Step};
+        let dir = scratch("accounts");
+        let mut history = History::open(&dir, CAP_BYTES, sampler::unsampled()).unwrap();
+        let steps = [Step {
+            step: STEP_UNIT.to_owned(),
+            ends: vec![End::Changed { origin: Origin::Workspace, input: "/w/src/lib.rs".to_owned() }],
+        }];
+        let account = Account::of(71, &[], &steps, Seen { links: 2, ..Seen::default() });
+        history.accounted([account.row]);
+        let flushed = history.flush(Some(71)).unwrap();
+        assert_eq!((flushed.accounts, flushed.unwritten), (1, 0));
+        assert_eq!(history.dropped().total(), 0);
+        let read = read_back(
+            &dir.join(format!("{}-{:08}.accounts.parquet", flushed.build, flushed.seq)),
+        );
+        let batch = &read[0];
+        let count = |name: &str| {
+            batch
+                .column(schema::ACCOUNTS.column(name).unwrap())
+                .as_primitive::<UInt64Type>()
+                .value(0)
+        };
+        assert_eq!(
+            ["build_id", "steps", "units", "by_workspace_file", "changes", "links", "by_unexplained"].map(count),
+            [71, 1, 1, 1, 1, 2, 0]
+        );
+        let first = batch.column(schema::ACCOUNTS.column("first_change").unwrap()).as_string::<i32>();
+        assert_eq!(first.value(0), "/w/src/lib.rs");
+        assert!(batch.column(schema::ACCOUNTS.column("alarms").unwrap()).is_null(0));
+        let again = history.flush(Some(72)).unwrap();
+        assert_eq!(again.accounts, 0, "a flush writes each account once");
         _ = fs::remove_dir_all(&dir);
     }
 

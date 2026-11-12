@@ -138,6 +138,9 @@ pub struct ProvenanceRow {
     pub cause_kind: Option<&'static str>,
     /// For an untracked read: its name.
     pub what: Option<&'static str>,
+    /// How many logged runs it stands for (`provenance.weight`): 1, or the log's sampling rate
+    /// for a sample of the runs past its bound.
+    pub weight: u32,
 }
 
 /// What the schema's `key_parts` table holds of one thing a build computed again: a row each
@@ -422,6 +425,7 @@ pub fn provenance(rows: &[ProvenanceRow]) -> Result<RecordBatch, ArrowError> {
         column(StringArray::from_iter(rows.iter().map(|it| it.cause_key.as_deref()))),
         dict(rows.iter().map(|it| it.cause_kind)),
         column(StringArray::from_iter(rows.iter().map(|it| it.what))),
+        column(UInt32Array::from_iter(rows.iter().map(|it| Some(it.weight)))),
     ];
     RecordBatch::try_new(batches::schema_of(&schema::PROVENANCE), columns)
 }
@@ -666,6 +670,7 @@ mod tests {
             cause_key: Some("`FileText.text`(Id(2))".into()),
             cause_kind: Some("input"),
             what: None,
+            weight: 1,
         };
         let read = ProvenanceRow {
             outcome: RunOutcome::UntrackedRead,
@@ -673,9 +678,16 @@ mod tests {
             cause_key: None,
             cause_kind: None,
             what: Some("the proc macro's output"),
+            weight: 64,
             ..changed.clone()
         };
         let batch = provenance(&[changed, read]).unwrap();
+        let weight = batch.column(schema::PROVENANCE.column("weight").unwrap());
+        assert_eq!(
+            weight.as_primitive::<arrow_array::types::UInt32Type>().values(),
+            &[1, 64],
+            "a sample of the runs past the log's bound says how many it stands for"
+        );
         let at = |name: &str| schema::PROVENANCE.column(name).unwrap();
         assert_eq!(
             batch.column(at("cause_key")).as_string::<i32>().value(0),

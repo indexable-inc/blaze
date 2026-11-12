@@ -26,6 +26,7 @@
 
 use std::{path::Path, sync::OnceLock, time::Instant};
 
+pub mod account;
 pub mod arrow;
 pub mod batches;
 pub mod clock;
@@ -54,6 +55,7 @@ pub mod span;
 pub mod sql;
 mod stack;
 pub mod starting;
+pub mod supervise;
 mod symbols;
 pub mod time;
 pub mod views;

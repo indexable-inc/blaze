@@ -54,8 +54,8 @@ pub use interned::NamesIds;
 /// what the query stack's runaway bounds are set against (the daemon's memory line says them).
 pub use local::{HighWater as StackHighWater, high_water as stack_high_water};
 pub use provenance::{
-    Cause, LOG_MOST, Logged, LoggedRun, Outcome, Provenance, RowNamer, Taken, log_runs, name_rows,
-    take_log_in,
+    Cause, LOG_MOST, Logged, LoggedRun, Outcome, Provenance, RowNamer, SAMPLE_EVERY, SAMPLED_MOST,
+    Taken, log_runs, name_rows, take_log_in,
 };
 pub use slot::{Filled, Slot, SlotClaim, SlotError, SlotName, SlotRefused};
 pub use storage::{Database, Durability, Hook, Storage, Unread, View};

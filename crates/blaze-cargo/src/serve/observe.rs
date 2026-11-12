@@ -447,15 +447,18 @@ impl Noted {
 /// loop as the build ends when its front end is not kept ([`super::work::Writer::run_log`]);
 /// sorted by the engine, so the rows are the same each time.
 pub(super) fn provenance_rows(build: u64, taken: blaze_query::db::Taken) -> Vec<ProvenanceRow> {
-    let blaze_query::db::Taken { rows, dropped } = taken;
+    let blaze_query::db::Taken { rows, dropped, sampled } = taken;
     if dropped > 0 {
         // Never silent (rule 3): the counts in `query_counts` still hold every run.
         tracing::warn!(
             target: "blaze",
             build,
             dropped,
-            "the query engine's run log kept its first {} runs; the rest of build {build}'s are in `query_counts` alone",
+            sampled,
+            "the query engine's run log kept build {build}'s first {} runs whole and one in {} of the next {sampled} as a sample (`provenance.weight`); {} more are in `query_counts` alone",
             blaze_query::db::LOG_MOST,
+            blaze_query::db::SAMPLE_EVERY,
+            dropped - sampled,
         );
     }
     // alloc: once a build, a row a memo that ran again
@@ -464,7 +467,7 @@ pub(super) fn provenance_rows(build: u64, taken: blaze_query::db::Taken) -> Vec<
 
 fn provenance_row(build_id: u64, run: blaze_query::db::LoggedRun) -> ProvenanceRow {
     use blaze_query::db::{Cause, Logged};
-    let blaze_query::db::LoggedRun { query, key, view, why, read, read_kind } = run;
+    let blaze_query::db::LoggedRun { query, key, view, why, read, read_kind, weight } = run;
     let (outcome, cause, what) = match why {
         Logged::Ran(cause) => {
             let name = match cause {
@@ -488,6 +491,7 @@ fn provenance_row(build_id: u64, run: blaze_query::db::LoggedRun) -> ProvenanceR
         cause_key: read,
         cause_kind: read_kind,
         what,
+        weight,
     }
 }
 

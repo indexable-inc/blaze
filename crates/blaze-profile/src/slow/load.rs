@@ -226,6 +226,7 @@ pub fn facts(
         span_stacks_sql(build, window, &of, &spans),
         thread_cpu_sql(&spans),
         problems_sql(Some(build), PROBLEMS)?,
+        account_sql(build),
     ];
     if let Some((memory, recorder)) = &windowed {
         // clone: a query, once a report
@@ -240,7 +241,7 @@ pub fn facts(
         source,
         crate::sql::Scope::All,
         &asked,
-        "reading the build's row, threads, spans by name, misses, query counts, sampled stacks by span, threads' CPU, problems, memory and recorder",
+        "reading the build's row, threads, spans by name, misses, query counts, sampled stacks by span, threads' CPU, problems, account, memory and recorder",
     )?;
     let answer = |i: usize| answers.get(i).map(Vec::as_slice).unwrap_or_default();
     Ok(Facts {
@@ -252,8 +253,9 @@ pub fn facts(
         span_stacks: span_stacks(answer(5))?,
         thread_cpu: thread_cpu(answer(6))?,
         problems: problems(answer(7))?,
-        memory: if windowed.is_some() { memory(answer(8))? } else { Memory::default() },
-        recorder: if windowed.is_some() { recorder(answer(9))? } else { Recorder::default() },
+        account: account(answer(8))?,
+        memory: if windowed.is_some() { memory(answer(9))? } else { Memory::default() },
+        recorder: if windowed.is_some() { recorder(answer(10))? } else { Recorder::default() },
         spans: crate::time::SpanCut::default(),
     })
 }
@@ -597,6 +599,143 @@ fn thread_cpu(batches: &[RecordBatch]) -> Result<Vec<ThreadCpu>, TimeError> {
         });
     }
     Ok(out)
+}
+
+/// The counts of an `accounts` row, in the order [`account`] reads them.
+const ACCOUNT_COUNTS: [&str; 35] = [
+    "written",
+    "written_source",
+    "written_environment",
+    "written_plan",
+    "written_derived",
+    "written_unattributed",
+    "executed",
+    "verified",
+    "ran_new",
+    "ran_changed",
+    "ran_untracked",
+    "ran_cycle",
+    "ran_evicted",
+    "ran_uncaused",
+    "unbalanced",
+    "steps",
+    "units",
+    "unkept",
+    "scripts",
+    "functions",
+    "other_steps",
+    "links",
+    "by_workspace_file",
+    "by_built_file",
+    "by_lock_file",
+    "by_outside_file",
+    "by_input",
+    "by_first",
+    "by_evicted",
+    "by_left",
+    "by_forced",
+    "by_unstable",
+    "by_unexplained",
+    "changes",
+    "history_dropped",
+];
+
+fn account_sql(build: u64) -> String {
+    // alloc: a query, once a report
+    let counts = ACCOUNT_COUNTS.map(|it| format!("CAST({it} AS UBIGINT) AS {it}")).join(", ");
+    // alloc: a query, once a report
+    format!(
+        "SELECT {counts}, CAST(first_change AS VARCHAR) AS first_change, CAST(alarms AS VARCHAR) AS alarms \
+         FROM accounts WHERE build_id = {build} LIMIT 1"
+    )
+}
+
+/// The build's account, when the history holds one.
+fn account(batches: &[RecordBatch]) -> Result<Option<crate::account::AccountRow>, TimeError> {
+    let Some((batch, row)) = rows(batches).next() else { return Ok(None) };
+    const T: &str = "accounts";
+    let mut counts = [0u64; ACCOUNT_COUNTS.len()];
+    for (at, column) in ACCOUNT_COUNTS.into_iter().enumerate() {
+        counts[at] = uint(batch, T, column, row)?.unwrap_or(0);
+    }
+    let [
+        written,
+        written_source,
+        written_environment,
+        written_plan,
+        written_derived,
+        written_unattributed,
+        executed,
+        verified,
+        ran_new,
+        ran_changed,
+        ran_untracked,
+        ran_cycle,
+        ran_evicted,
+        ran_uncaused,
+        unbalanced,
+        steps,
+        units,
+        unkept,
+        scripts,
+        functions,
+        other_steps,
+        links,
+        by_workspace_file,
+        by_built_file,
+        by_lock_file,
+        by_outside_file,
+        by_input,
+        by_first,
+        by_evicted,
+        by_left,
+        by_forced,
+        by_unstable,
+        by_unexplained,
+        changes,
+        history_dropped,
+    ] = counts;
+    Ok(Some(crate::account::AccountRow {
+        // The row was asked for by its build.
+        build_id: 0,
+        written,
+        written_source,
+        written_environment,
+        written_plan,
+        written_derived,
+        written_unattributed,
+        executed,
+        verified,
+        ran_new,
+        ran_changed,
+        ran_untracked,
+        ran_cycle,
+        ran_evicted,
+        ran_uncaused,
+        unbalanced,
+        steps,
+        units,
+        unkept,
+        scripts,
+        functions,
+        other_steps,
+        links,
+        by_workspace_file,
+        by_built_file,
+        by_lock_file,
+        by_outside_file,
+        by_input,
+        by_first,
+        by_evicted,
+        by_left,
+        by_forced,
+        by_unstable,
+        by_unexplained,
+        changes,
+        first_change: text(batch, T, "first_change", row)?,
+        history_dropped,
+        alarms: text(batch, T, "alarms", row)?,
+    }))
 }
 
 fn misses_sql(build: u64) -> String {

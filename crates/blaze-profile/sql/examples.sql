@@ -464,6 +464,24 @@ GROUP BY site
 ORDER BY allocated_gib DESC, site
 LIMIT $limit
 
+-- name: memory_give_backs
+-- says: what a build's daemon gave back because memory was short (`blaze explain memory`), in the order it did: each `memory give-back` span (what was given, whose, how many bytes were asked, why, what was short, the limit and the footprint it was decided on, what it costs to make again, whether it was given before and made again since, and what it gave), each plan that decided them (`memory give-back plan`: what a task waited for, the limit, the footprint, what the allocators kept freed, and the outcome) and each purge (`memory purge`: the footprint before and after, and what it returned), with when it began from the build's start and how long it took; spans of no build in the build's window are its too. A row `what=front end` is a kept front end let go: that checkout's next build lowers anew. No row: nothing was given back
+WITH bounds AS (
+    SELECT started_ns AS t0, started_ns + coalesce(dur_ns, 0) AS t1
+    FROM builds
+    WHERE build_id = $build
+)
+SELECT
+    round((s.start_ns - bounds.t0) / 1e6, 1) AS at_ms,
+    round(s.dur_ns / 1e6, 1) AS ms,
+    CAST(s.name AS VARCHAR) AS span,
+    s.fields AS said
+FROM spans AS s, bounds
+WHERE (s.build_id = $build OR (s.build_id IS NULL AND s.start_ns >= bounds.t0 AND s.start_ns < bounds.t1))
+    AND s.name IN ('memory give-back', 'memory give-back plan', 'memory purge', 'kept front ends let go for memory')
+ORDER BY s.start_ns
+LIMIT $limit
+
 -- name: admission_waits
 -- says: what a build's daemon tasks waited for before they started (`admission` spans, from ready to start): per task kind and what held it back (memory, a work or io thread, nothing), how many, their whole and longest wait, and the times memory passed them over; a null waited_for never started
 SELECT
