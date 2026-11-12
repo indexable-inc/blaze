@@ -33,7 +33,8 @@ pub fn socket() -> Result<PathBuf, String> {
 }
 
 /// Where the daemon's socket lives: `BLAZE_HOME`, else `blaze` in `XDG_RUNTIME_DIR`, else
-/// `~/.cache/blaze`.
+/// `~/.cache/blaze` (`~` is [`blaze_core::home::user`]: `HOME`, else the system's record of
+/// the user).
 pub fn home() -> Result<PathBuf, String> {
     let set = |name| std::env::var_os(name).filter(|it| !it.is_empty());
     if let Some(home) = set("BLAZE_HOME") {
@@ -42,11 +43,11 @@ pub fn home() -> Result<PathBuf, String> {
     if let Some(runtime) = set("XDG_RUNTIME_DIR") {
         return Ok(PathBuf::from(runtime).join("blaze"));
     }
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    // alloc: error path
-    let home =
-        home.ok_or("no BLAZE_HOME, XDG_RUNTIME_DIR or HOME says where the daemon's socket is")?;
-    Ok(PathBuf::from(home).join(".cache/blaze"))
+    let home = blaze_core::home::user().map_err(|why| {
+        // alloc: error path
+        format!("no BLAZE_HOME or XDG_RUNTIME_DIR says where the daemon's socket is, and {why}")
+    })?;
+    Ok(home.join(".cache/blaze"))
 }
 
 /// The checkout a manifest in `dir` is part of, whose absolute path names its head

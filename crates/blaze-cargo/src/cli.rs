@@ -856,7 +856,12 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
     programs: &mut P,
 ) -> io::Result<Then> {
     let mut printer = Printer::new(shown, &place.root, out, err);
-    printer.place(std::env::var("HOME").ok(), observe::last_failure());
+    printer.place(
+        // The user's home, which the printer shortens paths under to `~`; with none, or one
+        // that is not UTF-8, paths are printed whole.
+        blaze_core::home::user().ok().and_then(|it| it.into_os_string().into_string().ok()),
+        observe::last_failure(),
+    );
     // alloc: once a request, for `--reached` and `--ub`; it grows by doubling, not by a result.
     let mut results: Vec<TestResult> = Vec::new();
     let mut unwritten = None;

@@ -140,8 +140,8 @@ pub fn sources() -> anyhow::Result<PathBuf> {
 /// [`builds`] and [`sources`] are under; `blaze status --json` names it as `home`.
 pub fn root() -> anyhow::Result<PathBuf> {
     blaze_manifest::home::process_root()
-        .map_err(anyhow::Error::msg)?
-        .context("no BLAZE_HOME, XDG_CACHE_HOME or HOME says where blaze keeps its state and build directories")
+        .map_err(anyhow::Error::msg)
+        .context("finding where blaze keeps its state and build directories")
 }
 
 /// Where every daemon of this machine, whatever its `BLAZE_HOME`, keeps what they share:
@@ -195,11 +195,9 @@ fn same_file_system(a: &Path, b: &Path) -> anyhow::Result<bool> {
 fn user_shared() -> anyhow::Result<PathBuf> {
     let dir = match std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()) {
         Some(caches) => PathBuf::from(caches).join("blaze"),
-        None => {
-            let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-            PathBuf::from(home.context("no XDG_CACHE_HOME or HOME says where this machine's daemons share the standard library")?)
-                .join(".cache/blaze")
-        }
+        None => blaze_core::home::user()
+            .context("no XDG_CACHE_HOME says where this machine's daemons share the standard library")?
+            .join(".cache/blaze"),
     };
     // A relative one is taken against the current directory, as cargo takes its homes (review
     // round 6, C4).
@@ -1127,7 +1125,7 @@ pub(crate) fn engine(
     // Fixed for the daemon's life before any job: a build's tasks only read it.
     let sysroot = crate::toolchain::sysroot().with_context(|| {
         // alloc: once, on the error that stops the daemon from starting
-        let at = crate::toolchain::own::Release::ours().and_then(|it| it.dir());
+        let at = crate::toolchain::own::Release::ours().and_then(|it| it.dir().ok());
         let at =
             at.map_or_else(|| "on this machine".to_owned(), |it| format!("at {}", it.display()));
         format!(

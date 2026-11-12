@@ -183,11 +183,14 @@ impl<'c, F: Files> Workspace<'c, F> {
             return Ok(dir.clone());
         }
         let config = &self.ctx.config;
-        let root = crate::home::root(|name| config.env(name).map(std::ffi::OsString::from));
-        let root = root.ok_or_else(|| {
+        let root = crate::home::root(
+            |name| config.env(name).map(std::ffi::OsString::from),
+            blaze_core::home::record,
+        );
+        let root = root.map_err(|why| {
             anyhow::anyhow!(
-                "no BLAZE_HOME, XDG_CACHE_HOME or HOME says where blaze keeps the build \
-                 directory of the workspace at {}",
+                "no BLAZE_HOME or XDG_CACHE_HOME says where blaze keeps the build directory of \
+                 the workspace at {}, and {why}",
                 self.root().display()
             )
         })?;

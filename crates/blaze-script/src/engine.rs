@@ -573,18 +573,19 @@ pub fn cannot_clone(directory: &Path) -> Result<Option<String>, std::io::Error> 
 }
 
 /// Where a work directory nobody named may go, best first: `/tmp`, then `blaze-harness` in the
-/// user's cache directory.
+/// user's cache directory (`XDG_CACHE_HOME`, else `.cache` in the user's home,
+/// [`blaze_core::home::user`]). A user with neither has `/tmp` alone: no directory is guessed
+/// (it was a literal `~` under the current directory).
 pub fn work_bases() -> Vec<PathBuf> {
     #[allow(clippy::disallowed_methods, reason = "storelib's rule, read where it is used as the Python read it")]
-    let caches = std::env::var("XDG_CACHE_HOME").ok().filter(|it| !it.is_empty()).map_or_else(
-        || {
-            #[allow(clippy::disallowed_methods, reason = "as above")]
-            let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_owned());
-            PathBuf::from(home).join(".cache")
-        },
-        PathBuf::from,
-    );
-    vec![PathBuf::from("/tmp"), caches.join("blaze-harness")]
+    let caches = std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .filter(|it| !it.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| blaze_core::home::user().ok().map(|home| home.join(".cache")));
+    let mut bases = vec![PathBuf::from("/tmp")];
+    bases.extend(caches.map(|caches| caches.join("blaze-harness")));
+    bases
 }
 
 /// The directory a script keeps its checkouts and daemon homes in, its real path: `given`,

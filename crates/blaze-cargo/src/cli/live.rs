@@ -306,7 +306,12 @@ pub fn drive<A: Api>(
 
     let (mut out, mut err) = (Above::new(to_screen.clone()), Above::new(to_screen.clone()));
     let mut printer = Printer::new(shown, &place.root, &mut out, &mut err);
-    printer.place(std::env::var("HOME").ok(), super::observe::last_failure());
+    printer.place(
+        // The user's home, which the printer shortens paths under to `~`; with none, or one
+        // that is not UTF-8, paths are printed whole.
+        blaze_core::home::user().ok().and_then(|it| it.into_os_string().into_string().ok()),
+        super::observe::last_failure(),
+    );
     let mut failed_units: HashSet<u32, Global> = HashSet::default(); // alloc: one a command
     let mut unwritten = None;
     // The test view's events; a build or check has none.

@@ -625,13 +625,11 @@ fn heard(ready: &std::io::PipeReader, long: Duration) -> io::Result<Heard> {
     }
 }
 
-/// Whether a launchd or systemd unit serves `socket`. Units live under `HOME`: without one,
-/// none is installed.
+/// Whether a launchd or systemd unit serves `socket`. Units live under the user's home
+/// ([`blaze_core::home::user`]): without one, none is installed.
 #[cfg(all(unix, feature = "native"))]
 fn activation(socket: &Path) -> anyhow::Result<Installed> {
-    if blaze_api::activation::Manager::here().is_none()
-        || std::env::var_os("HOME").is_none_or(|it| it.is_empty())
-    {
+    if blaze_api::activation::Manager::here().is_none() || blaze_core::home::user().is_err() {
         return Ok(Installed::No);
     }
     Ok(blaze_api::units::installed(&blaze_api::units::place_here()?, socket)?)

@@ -96,7 +96,8 @@ impl Client {
         let clock = Monotonic::new();
         let deadline = Deadline::after(clock.now(), connect.within);
         // The environment is read here, where a client begins, and nowhere after.
-        let homes = Homes::of(connect.home, |name| std::env::var_os(name)).map_err(Error::Asked)?;
+        let homes = Homes::of(connect.home, |name| std::env::var_os(name), blaze_core::home::record)
+            .map_err(Error::Asked)?;
         let _span = tracing::info_span!(target: "blaze", "client: connect to the daemon").entered();
         // clone: error paths below name the socket.
         let socket = homes.socket.clone();

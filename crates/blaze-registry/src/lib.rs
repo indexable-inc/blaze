@@ -110,7 +110,7 @@ pub fn cargo_home() -> Option<PathBuf> {
             std::env::current_dir().ok()?.join(home)
         });
     }
-    std::env::home_dir().map(|it| it.join(".cargo"))
+    blaze_core::home::user().ok().map(|it| it.join(".cargo"))
 }
 
 /// cargo's lock on its package cache (`$CARGO_HOME/.package-cache`, the lock of

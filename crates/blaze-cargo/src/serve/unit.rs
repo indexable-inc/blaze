@@ -148,7 +148,7 @@ impl Real {
             selectors: test::image::Selectors::default(),
             dev_runs: run::inproc::DevRuns::new(paths.state.join("inproc")),
         };
-        let native = blaze_manifest::user_config::home().map(|it| it.join(crate::serve::native::NATIVE));
+        let native = blaze_manifest::user_config::home().ok().map(|it| it.join(crate::serve::native::NATIVE));
         Ok(Real {
             fetcher,
             shared: Arc::new(shared),

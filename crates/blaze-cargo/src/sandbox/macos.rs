@@ -260,9 +260,12 @@ fn user_temp() -> Option<PathBuf> {
 /// installed one needs nothing besides itself.
 fn library() -> Result<PathBuf, String> {
     let caches = std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()).map(PathBuf::from);
-    let caches = caches
-        .or_else(|| std::env::home_dir().map(|it| it.join(".cache")))
-        .ok_or("no XDG_CACHE_HOME or home directory to keep the sandbox's library in")?;
+    let caches = match caches {
+        Some(caches) => caches,
+        None => blaze_core::home::user()
+            .map_err(|why| format!("no XDG_CACHE_HOME says where to keep the sandbox's library, and {why}"))?
+            .join(".cache"),
+    };
     let dir =
         caches.join("blaze/sandbox").join(crate::content::hex(&blaze_ids::b3::hash(LIBRARY)[..12]));
     let file = dir.join("libblaze_sandbox.dylib");
