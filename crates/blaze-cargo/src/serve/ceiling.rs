@@ -5,12 +5,10 @@
 //! - On macOS the kernel holds it with a fatal memorystatus limit on the daemon's own pid
 //!   ([`crate::raw::memory::hold_own_footprint`], private), where XNU lets this process set one
 //!   (root, or entitled `com.apple.private.memorystatus`).
-//! - On Linux the kernel holds it with `memory.max` of the daemon's own cgroup v2, where one
-//!   is delegated ([`blaze_core::cgroup::hold_own`]), and with no `memory.high`: the kernel
-//!   throttles the daemon nowhere, since a throttle under the line where a task fails typed
-//!   is a band with no exit (`blaze_graph::lines`, which derives what the kernel is told). The
-//!   footprint is then that cgroup's charge ([`crate::raw::memory::own_footprint`]), not the
-//!   process's resident set.
+//! - On Linux the kernel holds it with `memory.max` (and `memory.high` at 15/16) of the daemon's
+//!   own cgroup v2, where one is delegated ([`blaze_core::cgroup::hold_own`]). The footprint is
+//!   then that cgroup's charge ([`crate::raw::memory::own_footprint`]), not the process's
+//!   resident set.
 //! - Everywhere the stop's guard (`serve::stop`) reads the footprint every [`EVERY`] and ends
 //!   the daemon with [`blaze_core::exit::Exit::MemoryCeiling`] once it passes the ceiling, after
 //!   writing what it held by tag and what each thread was inside. Where the kernel holds it to
@@ -99,7 +97,7 @@ impl fmt::Display for Bound {
             #[cfg(target_os = "linux")]
             Bound::Cgroup { dir } => write!(
                 f,
-                "{BY_CGROUP}{}, memory.high max so the kernel throttles nowhere under it, no swap), and by its own watch every {every} ms",
+                "{BY_CGROUP}{}, memory.high at 15/16 of it, no swap), and by its own watch every {every} ms",
                 dir.display()
             ),
             Bound::Watch { why } => write!(
@@ -152,8 +150,7 @@ fn kernel(bytes: u64) -> anyhow::Result<Bound> {
 #[cfg(target_os = "linux")]
 fn kernel(bytes: u64) -> anyhow::Result<Bound> {
     use anyhow::Context as _;
-    let told = blaze_graph::lines::Lines::of(bytes).kernel();
-    let held = blaze_core::cgroup::hold_own(told.kill, told.throttle).with_context(|| {
+    let held = blaze_core::cgroup::hold_own(bytes).with_context(|| {
         // alloc: an error's message, once
         format!("holding the daemon's own cgroup to its memory ceiling of {bytes} bytes")
     })?;

@@ -8,21 +8,18 @@
 //! | rung | the source | the give |
 //! |---|---|---|
 //! | allocator | what the last reading says the allocators keep freed | a purge on the purger's thread (`Plane::ask_purge`), then a reading marked purged |
-//! | pool | the pages the stores' pools hold (the `store` tag's committed bytes), unless their last sweeps freed nothing | asked of the pools' slicer (`blaze_graph::poolgive::Slices`): `Store::evict_pool` of one slice a turn ([`Jobs::sweep_pools`]), never the whole give in a turn |
+//! | pool | the pages the stores' pools hold (the `store` tag's committed bytes) | `Store::evict_pool` of that many bytes |
 //! | caches | what codegen keeps between builds (`Steps::kept_caches`), listed only while no task that may walk a program runs (`Plane::walks_in_flight`) | `Steps::give_caches` |
 //! | values | each kept front end's values kept by bytes (`KeptDb::values`); the front ends of the builds under way, all or nothing | a task on a worker ([`Jobs::give_values`]); `Writer::short` |
 //! | front end | each kept front end (`KeptDb::held`), the checkout built last the floor unless a build is under way (then that build's own front end is what the edit loop needs) | dropped: its checkout's next build lowers anew, and its `blaze why` says so |
 //! | running tasks | the builds under way, while a thread task runs: what their front ends hold in MIR and inference | `Writer::stop_for_memory`: the readers stopped, each task gives way, the release applied, the tasks posted again whole |
 //!
-//! The limit the planner is told is the limit's give-back line, a sixteenth under it
-//! ([`Lines::give`]): the daemon gives back before it is at its limit, since nothing gates an
-//! allocation. Past the last rung, with the footprint past the fail line, a thirty-second
-//! under the limit ([`Lines::fail`]), and one task running alone, that task's unit fails with
-//! a typed error naming it ([`Jobs::fail_too_big`], `blaze_graph::footprint::past_ceiling`):
-//! the daemon keeps serving and the kernel's limit is never what ends the build. Both lines,
-//! and what the kernel is told, are `blaze_graph::lines`, which holds their order: the kernel
-//! slows the daemon nowhere under the fail line (no `memory.high`), so the band between the
-//! give-back line and the limit always has that exit.
+//! The limit the planner is told is the limit's line, a sixteenth under it ([`LINE`]): the
+//! daemon gives back before it is at its limit, since nothing gates an allocation. Past the
+//! last rung, with the footprint within a thirty-second of the limit ([`FAIL_LINE`]) and one
+//! task running alone, that task's unit fails with a typed error naming it
+//! ([`Jobs::fail_too_big`], `blaze_graph::footprint::past_ceiling`): the daemon keeps serving
+//! and the kernel's limit is never what ends the build.
 //!
 //! A kept front end's values are swept on a worker, never the loop: the front end is taken
 //! from its checkout as it is for its store, a task of kind `GIVE_BACK` sweeps it in at most
@@ -59,8 +56,6 @@ use blaze_graph::{
     NodeId, Pool,
     footprint::{Past, Step as Gate, past_ceiling},
     giveback::{self, Give, Now, Outcome, Planner, Rung, Source, Why},
-    lines::Lines,
-    poolgive::{self, Asked, Slices},
 };
 use blaze_protocol::events::NodeKind;
 
@@ -92,6 +87,16 @@ const GIVES_EVERY: Duration = Duration::from_secs(5);
 /// want (the edit loop's next build is seconds); past it the daemon is not in an edit loop.
 const COLD_AFTER: Duration = Duration::from_secs(30 * 60);
 
+/// The limit's line: the planner is told the limit less this part of it (a sixteenth, as the
+/// kernel's `memory.high` is set at 15/16 of `memory.max`), so the give-backs begin before
+/// the limit is reached.
+const LINE: u64 = 16;
+
+/// Where a task that alone does not fit fails: the limit less this part of it (a
+/// thirty-second), halfway from the line to the limit, so the task has until the limit to
+/// reach a query call and unwind before the ceiling's guard would end the daemon.
+const FAIL_LINE: u64 = 32;
+
 /// The most slices a give of values is swept in ([`give_in_slices`]): a build that asks for
 /// the front end meanwhile waits for one slice's end at most, an eighth of the give.
 pub(super) const SLICES: u64 = 8;
@@ -112,11 +117,14 @@ struct Memory {
 }
 
 impl Memory {
-    /// What the planner is told: the limit as its give-back line ([`Lines::give`]).
+    /// What the planner is told: the limit as its line ([`LINE`]).
     fn now(&self, at: Duration) -> Now {
         Now {
             at_ns: ns(at),
-            limit: Lines::of(self.limit).give(),
+            limit: match self.limit {
+                u64::MAX => u64::MAX,
+                limit => limit - limit / LINE,
+            },
             footprint: self.footprint,
             ask: self.ask,
             reading: self.readings,
@@ -169,8 +177,6 @@ pub(super) struct Giving<S: Steps> {
     floor_said: bool,
     /// The system said memory is short since the last turn ([`Jobs::pressed`]).
     pressed: bool,
-    /// What is wanted of the stores' pools, given a slice a turn ([`Jobs::sweep_pools`]).
-    pool: Slices,
     /// The gives of values under way, a checkout each.
     out: Vec<Out<S>>,
     /// Since when a build has been under way, as the loop's turns saw it; restarted when its
@@ -193,7 +199,6 @@ impl<S: Steps> Giving<S> {
             running_asked: None,
             floor_said: false,
             pressed: false,
-            pool: Slices::new(),
             out: Vec::new(), // alloc: none until values are given
             building_since: None,
             idle_since: None,
@@ -328,72 +333,10 @@ impl<S: Steps> Jobs<S> {
         }
     }
 
-    /// One turn of giving back: one step of the give-back rule ([`Jobs::plan_gives`]), then at
-    /// most one slice of the stores' pool pages ([`Jobs::sweep_pools`]), after the plan so
-    /// that a pool give planned this turn has its first slice in it. Called once a loop turn.
-    pub(super) fn give_back(&mut self, w: &mut World<'_, S>, ask: u64) {
-        self.plan_gives(w, ask);
-        self.sweep_pools(w);
-    }
-
-    /// The system wants the stores' pools to give back every page no task pins, for `stands`
-    /// from `now`: memory pressure (`Daemon::pressure`), or a footprint past its release line
-    /// (`Daemon::plot`). Nothing is swept here: the pools give a slice a turn while it stands
-    /// ([`Jobs::sweep_pools`]), and the asker says it again while its reason lasts.
-    pub fn ask_pools(&mut self, now: Duration, stands: Duration) {
-        self.giving.pool.stand(ns(now.saturating_add(stands)));
-    }
-
-    /// At most one slice of the stores' pool pages given back to the kernel
-    /// (`blaze_graph::poolgive::Slices::turn`): the one place the loop evicts pool pages while
-    /// a build may run, bounded by the slice so the loop turns between two of them
-    /// (bounded-progress). Each slice is a span saying the bytes asked and freed and whose
-    /// want it answers; pools whose sweeps free nothing twice in a row are said dry, and
-    /// neither swept nor listed as a source until that passes, so the ladder goes on to its
-    /// next rung.
-    fn sweep_pools(&mut self, w: &mut World<'_, S>) {
-        let now = ns(w.now);
-        let poolgive::Turn::Sweep { bytes, why } = self.giving.pool.turn(now) else { return };
-        let span = tracing::info_span!(
-            target: "blaze",
-            "memory give-back: pool slice",
-            asked = bytes,
-            why = why.name(),
-            freed = tracing::field::Empty,
-            left = tracing::field::Empty,
-            outcome = tracing::field::Empty,
-        )
-        .entered();
-        let store = w.store.evict_pool(bytes);
-        let std = w.std.evict_pool(bytes.saturating_sub(store));
-        let freed = store.saturating_add(std);
-        span.record("freed", freed);
-        match self.giving.pool.swept(freed, now) {
-            poolgive::Swept::Freed { left } => {
-                span.record("left", left);
-                span.record("outcome", "freed");
-            }
-            poolgive::Swept::Empty => {
-                span.record("outcome", "freed nothing: asked once more");
-            }
-            poolgive::Swept::Dry { left, until_ns } => {
-                span.record("left", left);
-                span.record("outcome", "dry");
-                tracing::info!(
-                    target: "blaze",
-                    left,
-                    until_ns,
-                    sweeps_in_a_row = poolgive::DRY_AFTER,
-                    "memory give-back: the stores' pools are dry (every page left is pinned by a running task or was just read): not swept again for 10 s, and the ladder goes on to its next rung"
-                );
-            }
-        }
-    }
-
     /// One step of the give-back rule (the module's doc), `ask` the bytes a task waits for of
     /// what the process holds besides its tasks (`blaze_graph::Plane::short`). Called once a
     /// loop turn: with nothing short it reads two numbers and returns.
-    fn plan_gives(&mut self, w: &mut World<'_, S>, ask: u64) {
+    pub(super) fn give_back(&mut self, w: &mut World<'_, S>, ask: u64) {
         if std::mem::take(&mut self.giving.pressed) {
             self.press_kept(w);
         }
@@ -456,8 +399,6 @@ impl<S: Steps> Jobs<S> {
             if outcome == Outcome::Enough {
                 self.giving.floor_said = false;
                 self.giving.idle_until = None;
-                // And the pools owe the ladder nothing more.
-                self.giving.pool.enough();
                 // No task under way is asked to give way any more.
                 giveback::set_short(false);
             }
@@ -553,8 +494,7 @@ impl<S: Steps> Jobs<S> {
             sources.push(one(Rung::Allocator, allocator_kept, allocator_kept));
         }
         let pool = blaze_mem::tag::snapshot().get(blaze_mem::Tag::Store).live;
-        // Dry pools (their last sweeps freed nothing) are no source until that passes.
-        if pool != 0 && !self.giving.pool.dry(ns(w.now)) {
+        if pool != 0 {
             sources.push(one(Rung::Pool, pool, 1));
         }
         // Codegen's kept walks, only while no task that may walk runs: one in flight keeps
@@ -666,7 +606,7 @@ impl<S: Steps> Jobs<S> {
     }
 
     /// The ceiling's last step (`blaze_graph::footprint::past_ceiling`), once nothing is left
-    /// to give: with the footprint past the limit's fail line ([`Lines::fail`]) and
+    /// to give: with the footprint within a thirty-second of the limit ([`FAIL_LINE`]) and
     /// one thread task running alone, that task's unit is refused with a typed error naming
     /// it, its peak, what the process holds besides and the ceiling, and its build's readers
     /// are stopped so the task gives way and ends with that error where it is posted again
@@ -679,7 +619,7 @@ impl<S: Steps> Jobs<S> {
         }
         let Some((node, held, running)) = w.plane.biggest_running() else { return };
         let past = Past {
-            ceiling: Lines::of(memory.limit).fail(),
+            ceiling: memory.limit - memory.limit / FAIL_LINE,
             footprint: memory.footprint,
             // The planner purged, and nothing it could give is left.
             kept: 0,
@@ -779,13 +719,11 @@ impl<S: Steps> Jobs<S> {
                 self.purge(w);
                 None
             }
-            // Wanted of the pools, not swept here: a slice a turn from this one on
-            // ([`Jobs::sweep_pools`], whose spans say what each freed), since a give may be
-            // gigabytes and the loop must turn meanwhile.
-            Rung::Pool => match self.giving.pool.ask(give.bytes, ns(w.now)) {
-                Asked::Wanted => None,
-                Asked::Dry { .. } => Some(0),
-            },
+            Rung::Pool => {
+                let store = w.store.evict_pool(give.bytes);
+                let std = w.std.evict_pool(give.bytes.saturating_sub(store));
+                Some(store + std)
+            }
             Rung::Caches => Some(w.steps.give_caches()),
             Rung::Values => {
                 self.giving.running_asked = Some(w.now);
@@ -996,8 +934,7 @@ impl<S: Steps> Jobs<S> {
     /// The system said memory is short (docs/memory-budget.md section 7, "Pressure"): every
     /// kept front end gives the values it keeps by bytes, all of them, on a worker
     /// ([`Jobs::give_values`]), under a `memory give-back` span each; none is dropped whole.
-    /// The daemon purges at the same event and its pools are asked for a slice a turn while the
-    /// pressure stands (`Daemon::pressure`, [`Jobs::ask_pools`]), and a
+    /// The daemon purges and its pools give back at the same event (`Daemon::pressure`), and a
     /// limit that falls under what the daemon holds is [`Jobs::give_back`]'s to answer, in its
     /// order.
     fn press_kept(&mut self, w: &mut World<'_, S>) {

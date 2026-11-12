@@ -313,10 +313,9 @@ impl Pressure {
         Pressure { held: crate::arena::own_of(&snapshot), limit, over }
     }
 
-    /// Whether blaze holds more than the limit less its [`LINE`]th: the release line
-    /// ([`crate::lines::Lines::release`], where the limit's lines are ordered).
+    /// Whether blaze holds more than the limit less its [`LINE`]th.
     pub const fn squeezed(&self) -> bool {
-        self.limit != u64::MAX && self.held >= crate::lines::Lines::of(self.limit).release()
+        self.limit != u64::MAX && self.held >= self.limit - self.limit / LINE
     }
 }
 
