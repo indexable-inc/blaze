@@ -119,7 +119,9 @@ impl<T: Send> Worklist<T> {
                 self.drain(Some(scope), visit);
                 self.draining.fetch_sub(1, Ordering::Relaxed);
             });
-            if let Some(panic) = self.panic.lock().take() {
+            // Taken out before it is raised: no lock is held while the caller unwinds.
+            let panic = self.panic.lock().take();
+            if let Some(panic) = panic {
                 resume_unwind(panic);
             }
             if self.halted() {
