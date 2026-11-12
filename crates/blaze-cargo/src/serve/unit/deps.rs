@@ -200,6 +200,21 @@ pub(crate) fn images(
         moved = moved.len() as u64,
         "edit work"
     );
+    // Why each crate is asked of the store again, for the first few: the key it was last
+    // served or resolved under and the key it has now (rule 19: a serve that changes how a
+    // crate is read says what moved).
+    {
+        let db = lowered.db();
+        for krate in moved.iter().take(8) {
+            tracing::info!(
+                target: "blaze",
+                krate = %krate.named(db),
+                was = ?session.keyed.get(krate),
+                now = ?keys.get(krate),
+                "a dependency crate's image key moved since it was last served or resolved"
+            );
+        }
+    }
     if moved.is_empty() {
         // `keyed` holds every key walked already.
         session.walked.note(at, build, crates.iter().chain(keys.keys()));

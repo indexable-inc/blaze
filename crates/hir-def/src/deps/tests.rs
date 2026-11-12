@@ -488,6 +488,44 @@ fn a_served_dependency_resolves_as_a_fresh_one() {
     }
 }
 
+/// The invariant: a crate has the same module ids whether it is resolved or read from its
+/// image. One database resolves `lib` and `core`, stores their images, and is then served
+/// them (what a daemon's second build does to the crates its first build resolved): each
+/// crate's root and every module of it keep their ids, so each item's location (interned by
+/// its module) keeps its id too, and a row the database made before the serve is still keyed
+/// by something its crate's `DefMap` holds.
+///
+/// Its control is the tree before `DefMap::empty` took `crate_root`: the decoded map's root
+/// was a tracked struct of the decoding query, and this failed on the root's id.
+#[test]
+fn a_crate_served_after_it_was_resolved_keeps_its_module_ids() {
+    let _turn = TURN.lock();
+    let mut db = fixture::db(FIXTURE).into_db();
+    let memory = Memory::default();
+    let crates = all(&db);
+    let modules = |db: &TestDB, name: &str| -> Vec<crate::ModuleId> {
+        let def_map = crate::nameres::crate_def_map(db, crate_named(db, name));
+        let mut ids = vec![def_map.crate_root(db)];
+        ids.extend(def_map.modules(db).map(|(module, _)| module));
+        ids
+    };
+    let resolved = ["core", "lib"].map(|name| modules(&db, name));
+    assert!(resolved[1].len() >= 5, "lib has its root, deep, deeper and made: {:?}", resolved[1]);
+    for name in ["core", "lib"] {
+        assert_eq!(mode(&db, crate_named(&db, name)), None, "{name} is resolved first");
+    }
+    let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    assert_eq!(served.hits, Vec::new());
+    store(&db, &served, &memory).unwrap();
+    let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    assert_eq!(names(&db, &served.hits), ["core", "lib"]);
+    for name in ["core", "lib"] {
+        assert_eq!(mode(&db, crate_named(&db, name)), Some(Mode::Serve), "{name} is served now");
+    }
+    assert_eq!(["core", "lib"].map(|name| modules(&db, name)), resolved);
+    assert_eq!(frozen::differences(), Vec::<String>::new());
+}
+
 #[test]
 fn an_unresolved_import_of_a_dependency_is_still_reported() {
     let _turn = TURN.lock();

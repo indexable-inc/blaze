@@ -73,11 +73,11 @@ pub(super) fn read(
         || !written.removed.is_empty()
         || !written.roots.is_empty()
         || state.groups.get(&state.root).is_none_or(|it| it.key != root_key);
-    if full || !incremental(db, state, written, deps_changed, woken, &mut delta) {
+    if full || !incremental(db, krate, state, written, deps_changed, woken, &mut delta) {
         delta = Delta::default();
         walk(db, state, root_key, written, cold, &mut delta);
     }
-    include_readers(state, written, &mut delta);
+    include_readers(db, krate, state, written, &mut delta);
     expansion_readers(state, written, &mut delta);
     if written.proc_macros.binary_search(&krate).is_ok() {
         given_proc_macros(state, &mut delta);
@@ -151,6 +151,7 @@ fn key_is_current(db: &Db, state: &CrateState, group: ModuleId) -> bool {
 /// which only a walk follows.
 fn incremental(
     db: &Db,
+    krate: Crate,
     state: &mut CrateState,
     written: &Written<'_>,
     deps_changed: bool,
@@ -171,7 +172,7 @@ fn incremental(
     // A written file no module is defined in may be one a macro like `include!` read, and a
     // written file may be one an `include!` parsed (`include_readers`).
     let unknown = |file: &FileId| !state.files.contains_key(file);
-    let (bytes, unnamed) = (!written.included.is_empty(), written.set.iter().any(unknown));
+    let (bytes, unnamed) = (read_included(db, krate, written), written.set.iter().any(unknown));
     if bytes || unnamed {
         checked.extend(
             state
@@ -376,6 +377,16 @@ fn expansion_readers(state: &CrateState, written: &Written<'_>, delta: &mut Delt
     }
 }
 
+/// Whether the write changed a file outside the VFS that `krate` read by its bytes
+/// (`Written::included`, [`base_db::Files::included_read_by`]): every such read is noted with
+/// the crate that made it, so a file another crate read wakes no group of this one. Until
+/// 2026-11-11 any such write woke every group of every crate that expands an `include!`,
+/// `include_str!` or `include_bytes!`: `core`'s root and `gimli` ran again for a write of
+/// thiserror's `OUT_DIR/private.rs`.
+fn read_included(db: &Db, krate: Crate, written: &Written<'_>) -> bool {
+    written.included.iter().any(|&file| db.files().included_read_by(krate, file))
+}
+
 /// A file read by its bytes that changed (`Written::included`) is one an `include!`, an
 /// `include_str!` or an `include_bytes!` read: every group that expanded one is a seed, with
 /// a possible removal. A written file that defines no module of the crate may be one an
@@ -384,9 +395,15 @@ fn expansion_readers(state: &CrateState, written: &Written<'_>, delta: &mut Delt
 /// group's expansion files, so a group that expanded only `include!`s is a seed when that
 /// file is written ([`expansion_readers`]) and for no other file: an edit of another crate's
 /// source is not a write of a file this crate's `include!` read.
-fn include_readers(state: &CrateState, written: &Written<'_>, delta: &mut Delta) {
+fn include_readers(
+    db: &Db,
+    krate: Crate,
+    state: &CrateState,
+    written: &Written<'_>,
+    delta: &mut Delta,
+) {
     let unknown = |file: &FileId| !state.files.contains_key(file);
-    let (bytes, unnamed) = (!written.included.is_empty(), written.set.iter().any(unknown));
+    let (bytes, unnamed) = (read_included(db, krate, written), written.set.iter().any(unknown));
     if !bytes && !unnamed {
         return;
     }

@@ -410,9 +410,20 @@ fn files(db: &Db, krate: Crate, base: &Base, hasher: &mut Hasher) {
     // alloc: setup: the directory frozen images name this crate's files from
     let root_path = root.path_for_file(&file).map(|it| it.to_string());
     let dir = root_path.as_deref().and_then(|it| it.rsplit_once('/')).map(|it| it.0);
+    // The files below another crate's `OUT_DIR` (a build script's crate's own run's) are not
+    // what this crate is made from: left out, as its identity leaves them out
+    // ([`base_db::crate_root_content`], which says why that covers every input).
+    let others = base_db::other_out_dirs(db, krate);
     // alloc: setup: the root's files, once per crate per session
     let mut files: Vec<(Vec<u8>, ContentId)> = root
         .iter()
+        .filter(|file| {
+            others.is_empty()
+                || !root
+                    .path_for_file(file)
+                    .and_then(|it| it.as_path())
+                    .is_some_and(|it| base_db::below_any(it.as_str(), others))
+        })
         .map(|file| {
             // alloc: setup: one path a file, once per crate per session
             let path = root.path_for_file(&file)

@@ -1057,6 +1057,13 @@ impl Files {
         read
     }
 
+    /// Whether `krate` read the file outside the VFS that `file` is the read of: every such
+    /// read is noted with its crate ([`Files::included_at`]), so a write of `file` reaches
+    /// exactly the crates this is true of.
+    pub fn included_read_by(&self, krate: Crate, file: IncludedFile) -> bool {
+        self.included_by.iter().any(|&(by, at)| by == krate && self.included.get(at).file == file)
+    }
+
     fn read_included(&self, path: &AbsPath) -> Result<std::sync::Arc<[u8]>, ReadError> {
         IncludedFile::read_now(&self.on_disk(path.as_ref()))
     }
