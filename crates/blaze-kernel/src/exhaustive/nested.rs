@@ -22,7 +22,7 @@
 //! before its child shows; and its value says nothing of its fact, so a repair that comes to
 //! the same bytes (the cutoff) is common in scope.
 //!
-//! The bound: `15^4 = 50,625` sequences from each of two starts, each prefix checked: an empty
+//! The bound: `16^4 = 65,536` sequences from each of two starts, each prefix checked: an empty
 //! store, and a store in which a session that is gone kept every value at the first world (so
 //! a sequence admits entries it finds, not only ones it makes: [`Did::Warm`]). Four steps hold
 //! every planted bug's shortest failure (a get, a change, a get; for a parent repaired first,
@@ -41,8 +41,9 @@ use crate::nest::planted::{self, Bug};
 use crate::*;
 
 const STEPS: u32 = 4;
-/// A fact changed (9 ways), a get (4), the session dropped, the session carried.
-const WAYS: u64 = 15;
+/// A fact changed (9 ways), a get (4), the session dropped, the session carried, the session
+/// saved and opened again.
+const WAYS: u64 = 16;
 
 thread_local! {
     /// How many times a step of this file ran, on this thread.
@@ -390,6 +391,25 @@ impl Exploring {
         self.store.undo(mark);
         self.session = Session::restored(&session);
         self.pinned = pinned;
+        // The session as another process would have it: saved, dropped, opened from its root,
+        // with nothing in memory but what the steps after this read back.
+        let mark = self.store.put.len();
+        self.path.push(Did::Reopen);
+        self.reopen()?;
+        self.go(left - 1)?;
+        self.path.pop();
+        self.store.undo(mark);
+        self.session = Session::restored(&session);
+        Ok(())
+    }
+
+    fn reopen(&mut self) -> Result<(), Failure> {
+        let failed = |after: &[Did], why: KernelError| Failure::Kernel {
+            after: after.to_vec(),
+            why: why.to_string(),
+        };
+        let root = self.session.save(&mut self.store).map_err(|why| failed(&self.path, why))?;
+        self.session = Session::open(&self.store, root).map_err(|why| failed(&self.path, why))?;
         Ok(())
     }
 
@@ -452,7 +472,8 @@ fn stale_after_a_carry(bug: Bug, start: Start) -> Vec<Did> {
 /// another session filled, a get gives what the steps make of the world as it is now with no
 /// kernel, hit or computed, and a lookup straight after a get finds what it kept. The session
 /// is carried from pin to pin and never made again, so this is the carry's invariant too
-/// ([`Kernel::carry`]): every value a carried session gives is the fresh one. 50,625
+/// ([`Kernel::carry`]): every value a carried session gives is the fresh one, and so is every value of a session
+/// saved, dropped and opened again from the store at any step (rule 26). 65,536
 /// sequences a start, each prefix checked; some gets hit although a step under them ran
 /// again (early cutoff), and some carries stopped at an entry whose value came out the same.
 #[test]
@@ -508,6 +529,15 @@ fn an_absence_left_out_of_the_change_set_is_caught() {
 
 /// The control of I3: a carry that repairs the highest entry first, and none twice, looks a
 /// parent up against a child that is still as it was.
+/// The control of rule 26 for the session's records: a session opened from the store that
+/// reads no posting back (it "starts empty" of readers) is carried past an entry it holds.
+#[test]
+fn a_session_opened_without_its_postings_is_caught() {
+    let after = stale_after_a_carry(Bug::OpenUnposted, Start::Cold);
+    assert!(after.iter().any(|it| matches!(it, Did::Reopen)), "{after:?}");
+    assert!(after.iter().any(|it| matches!(it, Did::Set(..))), "{after:?}");
+}
+
 #[test]
 fn a_parent_repaired_before_its_child_is_caught() {
     let after = stale_after_a_carry(Bug::ParentFirst, Start::Cold);

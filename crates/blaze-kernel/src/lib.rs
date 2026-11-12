@@ -49,6 +49,7 @@ mod nest;
 mod reads;
 mod session;
 mod store;
+mod trie;
 #[cfg(test)]
 mod tests;
 pub mod why;
@@ -978,6 +979,13 @@ pub(crate) trait Lists<T> {
         names: &mut dyn Iterator<Item = &'n [u8]>,
         found: &mut T,
     );
+
+    /// Whether the identity is known to have an entry with reads: then its entry with no reads
+    /// is not looked for. A step is pure, so the first read it makes is made by every run of
+    /// one input: an identity with an entry that has reads has none without.
+    fn listed(&self) -> bool {
+        false
+    }
 }
 
 /// The entry of `identity` whose reads all hash the same now: the entry with no reads, else
@@ -992,7 +1000,9 @@ fn find_key<S: Step, G: Get + ?Sized, T>(
     let id = identity.id();
     let failed =
         |key: Key, why: String| KernelError::Store { of: of::<S>(input, identity), key, why };
-    if let Some(mut found) = lists.answer(whole::key(identity))? {
+    if !lists.listed()
+        && let Some(mut found) = lists.answer(whole::key(identity))?
+    {
         lists.held(None, &mut std::iter::empty(), &mut found);
         return Ok(Some(found));
     }

@@ -303,21 +303,59 @@ of every reader's lists; eager needs only the postings and each read row's own k
 | I5 covers post | not built: the cover is not built | none yet |
 
 The theorem is stated once, on `Kernel::carry` (`/// The invariant:`), and checked by
-`every_nested_sequence_in_scope_gives_what_a_fresh_run_gives`: 15^4 sequences from an empty
+`every_nested_sequence_in_scope_gives_what_a_fresh_run_gives`: 16^4 sequences from an empty
 store and from a store another session filled, the session carried at every moved get and at
 any step, each get against a computation with no kernel.
 
-Cost (`tests/cost.rs`, a session of 256 entries): a carry that reaches nothing reads nothing
-and values nothing; one changed fact whose entry comes out the same costs that entry's lookup
-and run; one that changes its entry costs the path to the top (each entry on it: one lookup that
-misses, one run); every other entry is one get when asked for. Against the floor (the changed
-entries and their direct readers rerun): the carry adds one missed lookup per rerun entry, a
-few gets each.
+Cost (`tests/cost.rs`, a session of 256 entries, each number pinned exactly): a carry that
+reaches nothing reads nothing and values nothing; one changed fact whose entry comes out the same
+is 5 gets and 2 reads valued; one that changes its entry costs the path to the top (a leaf, its
+group of 16 and the whole of 15 groups: 45 gets, of which 31 are the runs reading their
+children's values); every other entry is one get when asked for. The floor is the changed
+entries and their direct readers rerun: each its run and one put. Over it, a rerun entry pays 5
+gets: 2 for a lookup that can find an entry another session kept (its read-list, the entry its
+reads name now), 1 for the end of its chain of lists, 2 in the keep (`blaze_record` reads the
+entry's key before the put, and the list's slot again). The last three are owed; so is the
+entry get of a queued row whose reads come to the key it had (2 gets where 1 would do, for
+each entry a kind with no exact difference reaches). A row that had reads is never asked for
+its entry with no reads (`Session::listed`).
 
-Not built: the rows and postings as records of the store (they are memory of whoever holds
-the session), compaction of postings left by rows that were dropped, heights raised when a
-child grows taller without its value changing (such a parent may be repaired twice in a later
-carry; never wrongly), and the cover.
+**In the store** (`trie.rs`, `Session::save`, `Session::open`). The store is write-once and a
+session is not a function of its checkout and pin (it depends on what was asked), so nothing of
+it is keyed by either: rows and postings are entries of maps kept as 16-way tries on a key's
+nibbles, each node a record under the hash of its own bytes (`blaze kernel t 1`; a subtree of at
+most 8 entries is one leaf, so a node's bytes are a function of the entries under it). One map
+holds the rows by identity (entry key, value hash, height, posted slots, the name its value is
+read by); one map for each kind of read holds the postings by the hash of the name (the name,
+its step's own row, the readers' identities in order). A root record (`blaze kernel s 1`: pin,
+registry, live count, the maps' roots) names them, and its key is the one thing whoever holds
+the session keeps: `save` gives it, `open` takes it.
+
+- `save` writes the paths of the rows and postings that changed since the last save (a row
+  admitted, filled, named or dropped; a posting that took a reader), children before parents,
+  the root record last. A save that stops part way leaves nodes no root names; the old root is
+  whole. Every node no change is under is shared with the root before.
+- `open` reads the root record alone. A row is read when its identity is first looked for; a
+  posting when a carry seeds from its name or asks for a changed row's readers; a reader is a
+  row not yet read until the carry drops it. `Changed::everything` reads the kind's map whole.
+  So the memory of an opened session is what its requests and carries reached, and a saved
+  session can be dropped whenever nothing is running in it.
+- A node a parent names that the store lacks is `KernelError::Store` naming the node, and the
+  carry that met it drops the session whole (some rows were dropped, their readers not
+  reached); a root of another layout is refused naming the layout. Neither is read as empty.
+
+Tests (`tests/cost.rs`): a session saved and opened carries with the same `Carried` and the
+same bytes as one never saved; a save after a carry that repaired 2 of 256 entries writes at
+most 8 records; an opened session's get of the top reads its row's path and its entry; a carry
+of one fact reads that fact's posting and the rows it reaches. `exhaustive/nested.rs` has the
+way "save, drop, open" at every step (16^4 sequences a start) and the control
+`a_session_opened_without_its_postings_is_caught`.
+
+Owed: a deterministic simulation of the driver's root swap (a crash at each put of a save,
+then `open` of the old root) once a driver holds a root, in `blaze-storemodel`; the save is
+not in that model yet. Not built: compaction of postings left by rows that were dropped,
+heights raised when a child grows taller without its value changing (such a parent may be
+repaired twice in a later carry; never wrongly), and the cover.
 
 ### (c) What a lookup costs
 

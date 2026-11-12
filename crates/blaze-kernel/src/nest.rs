@@ -423,7 +423,7 @@ impl<W: World + ?Sized> Looker<'_, W> {
         need: Need,
     ) -> Result<Looked, KernelError> {
         let id = identity.id();
-        if let Some((row, known)) = self.state.session.known(&id) {
+        if let Some((row, known)) = self.state.session.known(self.store, &id)? {
             let fill = known.hash.is_none();
             let found = known_now::<S>(self.store, input, identity, known, need)?;
             if fill && found.hash.is_some() {
@@ -556,6 +556,10 @@ impl<S: Step, W: World + ?Sized> Lists<Found> for Walk<'_, '_, S, W> {
         let id = self.identity.id();
         found.posted = Some(self.looker.state.session.post(id, slot, names, By::Hit));
     }
+
+    fn listed(&self) -> bool {
+        self.looker.state.session.listed(&self.identity.id())
+    }
 }
 
 /// The row of what a lookup found.
@@ -646,7 +650,7 @@ impl<'e, W: World + ?Sized> Engine<'e, W> {
         need: Need,
     ) -> Result<Option<Valued>, KernelError> {
         let id = identity.id();
-        if let Some((row, known)) = self.session.known(&id) {
+        if let Some((row, known)) = self.session.known(self.door.get(), &id)? {
             let fill = known.hash.is_none();
             let found = known_now::<S>(self.door.get(), input, identity, known, need)?;
             if fill && found.hash.is_some() {
@@ -685,7 +689,7 @@ impl<'e, W: World + ?Sized> Engine<'e, W> {
         identity: &Identity,
     ) -> Result<Option<Key>, KernelError> {
         let id = identity.id();
-        if let Some((_, known)) = self.session.known(&id) {
+        if let Some((_, known)) = self.session.known(self.door.get(), &id)? {
             return Ok(Some(known.key));
         }
         self.state().enter::<S>(input, identity)?;
@@ -936,7 +940,7 @@ pub(crate) fn carry<W: World + ?Sized>(
     verify: &Setting,
 ) -> Result<Carried, KernelError> {
     let mut carried = Carried::default();
-    let Some(mut queue) = session.seed(kernel.registry(), world.pin(), changed)? else {
+    let Some(mut queue) = session.seed(&*store, kernel.registry(), world.pin(), changed)? else {
         carried.dropped = Some(Dropped::Registry);
         return Ok(carried);
     };
@@ -992,11 +996,20 @@ pub(crate) fn carry<W: World + ?Sized>(
             Some(_) => carried.changed += 1,
             None => carried.gone += 1,
         }
+        // Its readers, read from the store where they are not in memory. A store that fails
+        // here leaves rows dropped whose readers were not reached: the session is dropped.
+        if let Err(error) = session.load_readers(&*store, row) {
+            session.clear();
+            return Err(error);
+        }
         let mut n = 0;
         while let Some(reader) = session.reader(row, n) {
             n += 1;
-            if queue.takes(reader) {
-                session.dirty(reader, &mut queue);
+            if queue.takes(reader)
+                && let Err(error) = session.dirty(&*store, reader, &mut queue)
+            {
+                session.clear();
+                return Err(error);
             }
         }
     }
@@ -1087,6 +1100,9 @@ pub(crate) mod planted {
         /// A carry repairs the highest queued entry first, and one repaired is not queued
         /// again: a parent is looked up before the child it reads (invariant I3).
         ParentFirst,
+        /// A session opened from the store reads no posting back: a name's readers are only
+        /// those posted since it was opened (rule 26: a restore never silently starts empty).
+        OpenUnposted,
     }
 
     thread_local! {

@@ -254,6 +254,8 @@ enum Did {
     /// Before the sequence: every value was kept in the store at the first world, by a
     /// session that is gone (`nested`).
     Warm,
+    /// The session saved in the store, dropped, and opened again from its root.
+    Reopen,
 }
 
 /// What the oracle refused, with the sequence that led to it.
