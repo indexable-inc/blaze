@@ -1033,8 +1033,7 @@ unsafe fn verify_edge<F: Function>(db: *const (), storage: &Storage, id: Id) -> 
     match refresh::<F>(db, storage, index, row, key, false) {
         State::Current => Verified::Current,
         State::Assumed => Verified::Assumed,
-        // A row this task joined a cycle through counts as changed to a verify ([`State::Joined`]).
-        State::Provisional(_) | State::OnStack(_) | State::Joined { .. } => Verified::Changed,
+        State::Provisional(_) | State::OnStack(_) => Verified::Changed,
     }
 }
 
