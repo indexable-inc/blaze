@@ -51,10 +51,11 @@ use blaze_store_check::{Hit, Recompute, RecordedRead, Setting};
 
 use crate::reads::Unfinished;
 use crate::session::{By, Known, Popped, Posted, Session};
+use crate::table::{self, Table, Which};
 use crate::{
-    Ask, Carried, Changed, Compute, Dropped, Entry, Get, Identity, Kernel, KernelError, Link,
-    Lists, Put, Read, ReadKind, Reads, Seen, Step, StepError, StepId, Trace, World, entry,
-    find_key, hex, keep, of, said,
+    Ask, Carried, Change, Changed, Compute, Dropped, Entry, Get, Identity, Kernel, KernelError,
+    Link, Lists, Maintain, Of, Put, Read, ReadKind, Reads, Seen, Step, StepError, StepId, Trace,
+    World, entry, find_key, hex, keep, of, said,
 };
 
 /// How deep steps may nest: each level is a few frames of this thread's stack, so the bound is
@@ -236,6 +237,8 @@ pub(crate) enum How {
 
 /// What a step that asked for another's value is given.
 pub(crate) struct Asked {
+    /// The key of its entry.
+    pub key: Key,
     pub hash: ContentId,
     /// The value's bytes, when they were wanted.
     pub value: Option<Vec<u8>>,
@@ -248,6 +251,126 @@ pub(crate) struct Asked {
 pub(crate) trait Asks {
     /// The value now of the step a [`ReadKind::STEP`] read names by `key`.
     fn asked(&mut self, key: &[u8]) -> Result<Asked, KernelError>;
+
+    /// One part, or the keys, of the value now of the step `key` names: a table.
+    fn parted(&mut self, key: &[u8], which: Which<'_>) -> Result<Parted, KernelError>;
+}
+
+/// What a step that asked for a part, or for the keys, of a table is given.
+pub(crate) struct Parted {
+    /// What the read saw: the part's digest, [`Seen::Gone`] for a key the table has not, the
+    /// key set's digest.
+    pub seen: Seen,
+    /// The part's bytes, copied: none for an absent key, and where the keys were asked for.
+    pub part: Option<Vec<u8>>,
+    /// The keys, copied, where they were asked for.
+    pub keys: Vec<Vec<u8>>,
+}
+
+/// One part, or the keys, of `table`: what a read of it sees, and with `copy` its bytes.
+fn parted(table: &Table<'_>, which: Which<'_>, copy: bool) -> Result<Parted, String> {
+    // alloc: none where nothing is copied
+    let mut parted = Parted { seen: Seen::Gone, part: None, keys: Vec::new() };
+    match which {
+        Which::Part(key) => {
+            if let Some(part) = table.part(key)? {
+                parted.seen = Seen::Is(part.digest);
+                // alloc: one part, handed to the step that asked for it
+                parted.part = copy.then(|| part.bytes.to_vec());
+            }
+        }
+        Which::Keys | Which::Whole => {
+            parted.seen = Seen::Is(table.keys_digest()?);
+            let keys = if copy { table.len() } else { 0 };
+            for at in 0..keys {
+                // alloc: the keys, handed to the step that asked for them
+                parted.keys.push(table.entry(at)?.0.to_vec());
+            }
+        }
+    }
+    Ok(parted)
+}
+
+/// The value of the step `key` names, under `entry`, as the table it is: read in place in
+/// the store, one get.
+fn table_in<'s, W: World + ?Sized>(
+    kernel: &Kernel<W>,
+    store: &'s (dyn Get + 's),
+    key: &[u8],
+    entry: Key,
+) -> Result<Table<'s>, KernelError> {
+    let (step, input) = step_of(key)?;
+    (kernel.runner(step)?.table)(kernel, store, input, entry)
+}
+
+/// The value of the step `key` names, under `entry`, as the table it is, for a read of a
+/// part: from the store the first time the request or the carry reads it (one get, its bytes
+/// then held by the session until the request ends), from the session after. A reader of n
+/// parts of one table, and n readers of it repaired by one carry, pay one get.
+fn table_at<'t, W: World + ?Sized>(
+    kernel: &Kernel<W>,
+    session: &'t mut Session,
+    store: &dyn Get,
+    key: &[u8],
+    entry: Key,
+) -> Result<Table<'t>, KernelError> {
+    if session.table(&entry).is_none() {
+        let table = table_in(kernel, store, key, entry)?;
+        session.hold_table(entry, table.bytes());
+    }
+    let session: &'t Session = session;
+    let bytes = session.table(&entry).expect("the table held just above");
+    Table::read(bytes).map_err(|why| torn(kernel, key, entry, why))
+}
+
+/// A table whose directory or index cannot be read, as an error names it.
+fn torn<W: World + ?Sized>(kernel: &Kernel<W>, key: &[u8], entry: Key, why: String) -> KernelError {
+    let label = match step_of(key).and_then(|(step, input)| Ok((kernel.runner(step)?.label)(input))) {
+        Ok(label) => label,
+        Err(_) => hex(key),
+    };
+    KernelError::Store { of: Of { step: "table", label, identity: entry.0 }, key: entry, why }
+}
+
+/// What a read of one part, or of the keys, of the step `key` names sees in its entry
+/// `entry`: one get the first time a request reads the table, none after ([`table_at`]).
+fn part_seen<W: World + ?Sized>(
+    kernel: &Kernel<W>,
+    session: &mut Session,
+    store: &dyn Get,
+    key: &[u8],
+    entry: Key,
+    which: Which<'_>,
+) -> Result<Seen, KernelError> {
+    let table = table_at(kernel, session, store, key, entry)?;
+    match parted(&table, which, false) {
+        Ok(parted) => Ok(parted.seen),
+        Err(why) => Err(torn(kernel, key, entry, why)),
+    }
+}
+
+/// `S` of the input `key`, under `entry`, as a table: the erased form a part read and a
+/// carry's comparison go through.
+fn table_of<'s, S: Ask<World = W>, W: World + ?Sized>(
+    kernel: &Kernel<W>,
+    store: &'s (dyn Get + 's),
+    key: &[u8],
+    entry: Key,
+) -> Result<Table<'s>, KernelError> {
+    let input = input_of::<S>(key)?;
+    let identity = kernel.identity::<S>(&input)?;
+    let failed = |why: String| KernelError::Store { of: of::<S>(&input, &identity), key: entry, why };
+    if !S::TABLE {
+        // alloc: an error
+        return Err(failed("its step does not say its value is a table (`Ask::TABLE`)".to_owned()));
+    }
+    let bytes = store
+        .get(&entry)
+        .map_err(failed)?
+        // alloc: an error
+        .ok_or_else(|| failed("its entry is not in the store: a session is of one store".to_owned()))?;
+    let entry = Entry::read(bytes, entry, &identity).map_err(failed)?;
+    Table::read(entry.value).map_err(failed)
 }
 
 /// A step that may be asked for, as the registry holds it: its typed lookup, run and keep
@@ -258,6 +381,8 @@ pub(crate) struct Runner<W: ?Sized> {
     /// Looked up, else run and kept.
     value: for<'a, 'e> fn(&'a mut Engine<'e, W>, &[u8], Need) -> Result<Option<Asked>, KernelError>,
     pub label: fn(&[u8]) -> String,
+    /// Its value under an entry's key, as a table read in place.
+    table: for<'s> fn(&Kernel<W>, &'s (dyn Get + 's), &[u8], Key) -> Result<Table<'s>, KernelError>,
 }
 
 impl<W: ?Sized> Clone for Runner<W> {
@@ -270,8 +395,113 @@ impl<W: ?Sized> Copy for Runner<W> {}
 
 impl<W: World + ?Sized> Runner<W> {
     pub(crate) fn of<S: Ask<World = W>>() -> Runner<W> {
-        Runner { look: looked::<S, W>, value: asked::<S, W>, label: label::<S> }
+        Runner { look: looked::<S, W>, value: asked::<S, W>, label: label::<S>, table: table_of::<S, W> }
     }
+}
+
+/// A maintained step's `maintain` behind the bytes of its input, as the registry holds it.
+pub(crate) struct Maintainer<W: ?Sized> {
+    run: for<'a, 'w> fn(
+        &'a mut Reads<'w, W>,
+        &[u8],
+        &[u8],
+        &[Change<'_>],
+    ) -> Result<Vec<u8>, StepError>,
+}
+
+impl<W: ?Sized> Clone for Maintainer<W> {
+    fn clone(&self) -> Maintainer<W> {
+        *self
+    }
+}
+
+impl<W: ?Sized> Copy for Maintainer<W> {}
+
+impl<W: World + ?Sized> Maintainer<W> {
+    pub(crate) fn of<S: Maintain<World = W>>() -> Maintainer<W> {
+        Maintainer { run: maintain_of::<S> }
+    }
+}
+
+/// `S::maintain` of the input `key`: its erased form.
+fn maintain_of<S: Maintain>(
+    ctx: &mut Reads<'_, S::World>,
+    key: &[u8],
+    previous: &[u8],
+    changed: &[Change<'_>],
+) -> Result<Vec<u8>, StepError> {
+    let input = S::input(key).map_err(StepError::Refused)?;
+    S::maintain(ctx, &input, previous, changed)
+}
+
+/// The row a carry is repairing, as the session had it: what a maintained step runs from.
+#[derive(Clone, Copy)]
+pub(crate) struct Repair<'e> {
+    /// The identity the row is of.
+    identity: ContentId,
+    /// The bytes of its input, as a read of its value names it.
+    input: &'e [u8],
+    /// The key of the entry it had before the carry: still in the store.
+    was: Key,
+    /// What the carry was told differs.
+    changed: &'e Changed,
+}
+
+/// Where a maintained run differs from a fresh one of the same step: the first read, else
+/// the first part of a table, else the first byte. None where they are the same.
+fn differs<W: World + ?Sized>(
+    kernel: &Kernel<W>,
+    world: &W,
+    maintained: &(Vec<u8>, Trace),
+    fresh: &(Vec<u8>, Trace),
+) -> Option<String> {
+    let named = |read: Read<'_>, seen: Seen| said(kernel.describe(world, read), seen);
+    let (mut ours, mut theirs) = (maintained.1.iter(), fresh.1.iter());
+    // Bounded (rule 18): one turn a read of either run.
+    for n in 0..maintained.1.len().max(fresh.1.len()) {
+        // alloc: an error
+        match (ours.next(), theirs.next()) {
+            (Some(a), Some(b)) if a == b => {}
+            (Some((read, seen)), Some((other, other_seen))) => {
+                return Some(format!(
+                    "its read {n} is {}, where `compute` reads {}",
+                    named(read, seen),
+                    named(other, other_seen)
+                ));
+            }
+            (Some((read, seen)), None) => {
+                return Some(format!("it reads {}, which `compute` does not", named(read, seen)));
+            }
+            (None, Some((read, seen))) => {
+                return Some(format!("it does not read {}, which `compute` reads", named(read, seen)));
+            }
+            (None, None) => {}
+        }
+    }
+    if maintained.0 == fresh.0 {
+        return None;
+    }
+    if let (Ok(ours), Ok(theirs)) = (Table::read(&maintained.0), Table::read(&fresh.0)) {
+        let mut first: Option<&[u8]> = None;
+        let mut each = |key| -> Result<(), KernelError> {
+            first = first.or(Some(key));
+            Ok(())
+        };
+        if let Ok(Ok(_)) = table::diff(&ours, &theirs, &mut each)
+            && let Some(key) = first
+        {
+            // alloc: an error
+            return Some(format!("the part of the key {} is not the part `compute` makes", hex(key)));
+        }
+    }
+    let at = maintained.0.iter().zip(&fresh.0).position(|(a, b)| a != b);
+    // alloc: an error
+    Some(format!(
+        "its value is {} bytes and `compute`'s {}, and they differ from byte {}",
+        maintained.0.len(),
+        fresh.0.len(),
+        at.unwrap_or(maintained.0.len().min(fresh.0.len()))
+    ))
 }
 
 fn input_of<S: Ask>(key: &[u8]) -> Result<S::Input, KernelError> {
@@ -312,6 +542,7 @@ fn asked<S: Ask<World = W>, W: World + ?Sized>(
         How::Computed { value, .. } => Some(value),
     };
     Ok(Some(Asked {
+        key: valued.key,
         hash: valued.hash.expect("a value asked for by a step is valued with its hash"),
         value,
         #[cfg(test)]
@@ -494,7 +725,7 @@ struct Walk<'a, 'l, S: Step, W: ?Sized> {
 impl<S: Step, W: World + ?Sized> Lists<Found> for Walk<'_, '_, S, W> {
     fn now(&mut self, read: Read<'_>) -> Result<Now, KernelError> {
         let Cx { kernel, world, .. } = self.looker.cx;
-        if read.kind != ReadKind::STEP {
+        if !read.kind.is_kernels() {
             return match world.hash(read) {
                 Ok(seen) => Ok(Now::Seen(seen)),
                 // The world cannot value it now: no entry whose run made this read is the
@@ -507,37 +738,52 @@ impl<S: Step, W: World + ?Sized> Lists<Found> for Walk<'_, '_, S, W> {
                 }),
             };
         }
-        if self.nots.iter().any(|it| it.as_slice() == read.key) {
+        // The step whose value it is, whole or one part: looked up the same either way.
+        let Some((step, which)) = table::split(read) else {
+            return Err(KernelError::Input {
+                step: "a step",
+                key: hex(read.key),
+                // alloc: an error
+                why: "a read of a part names no step: its key is shorter than it says".to_owned(),
+            });
+        };
+        if self.nots.iter().any(|it| it.as_slice() == step) {
             return Ok(Now::Not);
         }
-        let looked = match self.looker.child(read.key) {
+        let looked = match self.looker.child(step) {
             Ok(looked) => looked,
             // What cannot be valued in a lookup cannot be by a run after it either.
             Err(error) if error.unvaluable() => {
                 // alloc: a child that cannot be valued, once a lookup
-                self.nots.push(read.key.to_vec());
+                self.nots.push(step.to_vec());
                 return Ok(Now::Not);
             }
             Err(error) => return Err(error),
         };
         match looked {
-            Looked::Found(found, _) => {
+            Looked::Found(found, _) if which == Which::Whole => {
                 let hash = found.hash.expect("a child is looked up for its value's hash");
                 Ok(Now::Seen(step_seen(read.key, hash)))
             }
+            // The child's value changed or not: only the part's digest is compared.
+            Looked::Found(found, _) => {
+                let store = self.looker.store;
+                let session = &mut *self.looker.state.session;
+                Ok(Now::Seen(part_seen(kernel, session, store, step, found.key, which)?))
+            }
             Looked::Later if !self.last => {
                 // alloc: a child to run, once a lookup
-                self.pending.push(read.key.to_vec());
+                self.pending.push(step.to_vec());
                 Ok(Now::Pending)
             }
             Looked::Missing if self.looker.keeps && !self.last => {
                 // alloc: a child to run, once a lookup
-                self.pending.push(read.key.to_vec());
+                self.pending.push(step.to_vec());
                 Ok(Now::Pending)
             }
             Looked::Missing | Looked::Later => {
                 // alloc: a child that cannot be valued, once a lookup
-                self.nots.push(read.key.to_vec());
+                self.nots.push(step.to_vec());
                 Ok(Now::Not)
             }
         }
@@ -613,6 +859,9 @@ pub(crate) struct Engine<'e, W: ?Sized> {
     stack: Vec<Frame>,
     /// The request's session: the values found valid or made, and who read what.
     session: &'e mut Session,
+    /// The row a carry is repairing through this request: a maintained step runs from it,
+    /// once.
+    repair: Option<Repair<'e>>,
 }
 
 impl<'e, W: World + ?Sized> Engine<'e, W> {
@@ -624,7 +873,7 @@ impl<'e, W: World + ?Sized> Engine<'e, W> {
         session: &'e mut Session,
     ) -> Engine<'e, W> {
         // alloc: one request's stack, as deep as its steps nest; empty until one is entered
-        Engine { cx: Cx { kernel, world, verify }, door, stack: Vec::new(), session }
+        Engine { cx: Cx { kernel, world, verify }, door, stack: Vec::new(), session, repair: None }
     }
 
     fn state(&mut self) -> State<'_> {
@@ -705,15 +954,122 @@ impl<'e, W: World + ?Sized> Engine<'e, W> {
     /// What `read` is now, for whoever explains a miss: a step's value that cannot be had now
     /// is nothing.
     pub(crate) fn now(&mut self, read: Read<'_>) -> Result<Seen, String> {
-        if read.kind != ReadKind::STEP {
+        if !read.kind.is_kernels() {
             return self.cx.world.hash(read).map_err(|error| error.why);
         }
-        match self.seen_of(read.key) {
-            Ok(Some(hash)) => Ok(step_seen(read.key, hash)),
-            Ok(None) => Ok(Seen::Gone),
+        match self.kernels_now(read) {
+            Ok(seen) => Ok(seen.unwrap_or(Seen::Gone)),
             // alloc: an error
             Err(error) => Err(error.to_string()),
         }
+    }
+
+    /// What a read of a step's value, of one part of it or of its keys is now: the step is
+    /// looked up, or run and kept. None where it cannot be valued now.
+    fn kernels_now(&mut self, read: Read<'_>) -> Result<Option<Seen>, KernelError> {
+        let Some((step, which)) = table::split(read) else {
+            return Err(KernelError::Input {
+                step: "a step",
+                key: hex(read.key),
+                // alloc: an error
+                why: "a read of a part names no step: its key is shorter than it says".to_owned(),
+            });
+        };
+        let asked = match self.ask(step, Need::Hash) {
+            Ok(Some(asked)) => asked,
+            Ok(None) => return Ok(None),
+            Err(error) if error.unvaluable() => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if which == Which::Whole {
+            return Ok(Some(step_seen(read.key, asked.hash)));
+        }
+        part_seen(self.cx.kernel, &mut *self.session, self.door.get(), step, asked.key, which).map(Some)
+    }
+
+    /// A maintained step run from the entry its session had of it ([`Maintain`]): its value
+    /// and its reads, as [`Engine::run`] gives them. None where this is not such a repair:
+    /// the request is no carry's repair of this identity, the step is not registered as
+    /// maintained, no read of the entry before is other now (the lookup finds that entry), or
+    /// a read that changed cannot be valued now (`compute` then says what it reads).
+    ///
+    /// It comes before the lookup: a lookup values every read of the entry's list to make
+    /// the answer's key, and here only the reads the carry was told may differ are valued by
+    /// the world; a read of a step's value is valued by that step's row in the session.
+    fn maintained<S: Compute<World = W>>(
+        &mut self,
+        input: &S::Input,
+        identity: &Identity,
+    ) -> Result<Option<(Vec<u8>, Trace)>, KernelError> {
+        let id = identity.id();
+        let Cx { kernel, world, verify } = self.cx;
+        let Some(repair) = self.repair.filter(|it| it.identity == id) else {
+            return Ok(None);
+        };
+        let Some(maintainer) = kernel.maintainer(S::ID) else {
+            return Ok(None);
+        };
+        if !self.door.keeps() {
+            return Ok(None);
+        }
+        // Once: asked for again in this request, it is in the session or looked up as any.
+        self.repair = None;
+        let failed =
+            |why: String| KernelError::Store { of: of::<S>(input, identity), key: repair.was, why };
+        // alloc: the entry before, held apart from the store the run keeps in
+        let bytes = self
+            .door
+            .get()
+            .get(&repair.was)
+            .map_err(failed)?
+            // alloc: an error
+            .ok_or_else(|| failed("the entry its session had of it is not in the store: a session is of one store".to_owned()))?
+            .to_vec();
+        let entry = Entry::read(&bytes, repair.was, identity).map_err(failed)?;
+        // alloc: one maintained run's reads as they are now, and those that are other
+        let mut now: Vec<Seen> = Vec::with_capacity(entry.reads().len());
+        let mut changed: Vec<Change<'_>> = Vec::new();
+        for (read, was) in entry.reads() {
+            let seen = if read.kind.is_kernels() {
+                match self.kernels_now(read)? {
+                    Some(seen) => seen,
+                    None => return Ok(None),
+                }
+            } else if repair.changed.may_differ(read) {
+                match world.hash(read) {
+                    Ok(seen) => seen,
+                    Err(error) if error.not_now => return Ok(None),
+                    Err(error) => {
+                        return Err(KernelError::World {
+                            of: of::<S>(input, identity),
+                            read: kernel.describe(world, read),
+                            why: error.why,
+                        });
+                    }
+                }
+            } else {
+                was
+            };
+            if seen != was {
+                changed.push(Change { read, was, now: seen });
+            }
+            now.push(seen);
+        }
+        if changed.is_empty() {
+            return Ok(None);
+        }
+        let before = entry.reads().zip(now.iter()).map(|((read, _), seen)| (read, *seen));
+        let mut ctx = Reads::maintaining(world, self, before);
+        let made = (maintainer.run)(&mut ctx, repair.input, entry.value, &changed);
+        let finished = ctx.finish();
+        let made = Self::ran::<S>(kernel, world, input, identity, made, finished)?;
+        if verify.sampled(&id) {
+            let fresh = self.run::<S>(input, identity)?;
+            if let Some(why) = differs(kernel, world, &made, &fresh) {
+                return Err(KernelError::Maintained { of: of::<S>(input, identity), why });
+            }
+        }
+        Ok(Some(made))
     }
 
     /// The value of `S` of `input`, found in the store or computed and kept, with the proof
@@ -725,24 +1081,46 @@ impl<'e, W: World + ?Sized> Engine<'e, W> {
         identity: &Identity,
         need: Need,
     ) -> Result<Option<(Valued, Posted)>, KernelError> {
-        if let Some(mut found) = self.lookup::<S>(input, identity, need)? {
-            self.check::<S>(input, identity, found.key)?;
-            let posted = found.posted.take().expect("a walk posts the list of the entry it found");
-            let valued = Valued {
-                key: found.key,
-                hash: found.hash,
-                how: How::Hit { value: found.value },
-                row: u32::MAX,
-                #[cfg(test)]
-                reads: found.reads,
-            };
-            return Ok(Some((valued, posted)));
+        let (value, trace) = match self.maintained::<S>(input, identity)? {
+            Some(made) => made,
+            None => {
+                if let Some(mut found) = self.lookup::<S>(input, identity, need)? {
+                    self.check::<S>(input, identity, found.key)?;
+                    let posted =
+                        found.posted.take().expect("a walk posts the list of the entry it found");
+                    let valued = Valued {
+                        key: found.key,
+                        hash: found.hash,
+                        how: How::Hit { value: found.value },
+                        row: u32::MAX,
+                        #[cfg(test)]
+                        reads: found.reads,
+                    };
+                    return Ok(Some((valued, posted)));
+                }
+                if !self.door.keeps() {
+                    return Ok(None);
+                }
+                self.run::<S>(input, identity)?
+            }
+        };
+        let Cx { kernel, world, verify } = self.cx;
+        if kernel.table_step(S::ID) {
+            // What a step that says its value is a table made is one: its header whenever it
+            // is kept, every byte (`Table::verify`: built again from its own keys and parts)
+            // where the request's setting samples this identity.
+            let checked = Table::read(&value).and_then(|table| match verify.sampled(&identity.id()) {
+                true => table.verify(),
+                false => Ok(()),
+            });
+            if let Err(why) = checked {
+                return Err(KernelError::Compute {
+                    of: of::<S>(input, identity),
+                    // alloc: an error
+                    why: format!("its step says its value is a table (`Ask::TABLE`): {why}"),
+                });
+            }
         }
-        if !self.door.keeps() {
-            return Ok(None);
-        }
-        let (value, trace) = self.run::<S>(input, identity)?;
-        let Cx { kernel, world, .. } = self.cx;
         let reads = || -> Vec<String> {
             // alloc: an error
             trace.iter().map(|(read, seen)| said(kernel.describe(world, read), seen)).collect()
@@ -827,7 +1205,20 @@ impl<'e, W: World + ?Sized> Engine<'e, W> {
         let Cx { kernel, world, .. } = self.cx;
         let mut ctx = Reads::asking(world, self);
         let computed = S::compute(&mut ctx, input);
-        let trace = match ctx.finish() {
+        let finished = ctx.finish();
+        Self::ran::<S>(kernel, world, input, identity, computed, finished)
+    }
+
+    /// What a run came to: its value and its reads, or why it keeps nothing.
+    fn ran<S: Step>(
+        kernel: &Kernel<W>,
+        world: &W,
+        input: &S::Input,
+        identity: &Identity,
+        computed: Result<Vec<u8>, StepError>,
+        finished: Result<Trace, Unfinished>,
+    ) -> Result<(Vec<u8>, Trace), KernelError> {
+        let trace = match finished {
             Ok(trace) => trace,
             Err(Unfinished::Failed(error)) => {
                 return Err(KernelError::World {
@@ -928,6 +1319,18 @@ impl<W: World + ?Sized> Asks for Engine<'_, W> {
             None => unreachable!("a step runs only where its request keeps, and there a value asked for is found or made"),
         }
     }
+
+    /// The child is looked up, or run and kept, as for a read of its whole value; then the
+    /// one part is copied from its table, which the request reads from the store once
+    /// ([`table_at`]).
+    fn parted(&mut self, key: &[u8], which: Which<'_>) -> Result<Parted, KernelError> {
+        let Some(asked) = self.ask(key, Need::Hash)? else {
+            unreachable!("a step runs only where its request keeps, and there a value asked for is found or made")
+        };
+        let kernel = self.cx.kernel;
+        let table = table_at(kernel, &mut *self.session, self.door.get(), key, asked.key)?;
+        parted(&table, which, true).map_err(|why| torn(kernel, key, asked.key, why))
+    }
 }
 
 /// [`Kernel::carry`]: the seed, then the repair, lowest first.
@@ -948,8 +1351,8 @@ pub(crate) fn carry<W: World + ?Sized>(
     // Bounded (rule 18): each turn takes a row out of the queue, and the queue stops giving
     // rows past its count.
     loop {
-        let (row, was) = match queue.pop() {
-            Popped::Row { row, was } => (row, was),
+        let (row, was, was_key) = match queue.pop() {
+            Popped::Row { row, was, key } => (row, was, key),
             Popped::Empty => break,
             Popped::Spent => {
                 session.clear();
@@ -985,8 +1388,16 @@ pub(crate) fn carry<W: World + ?Sized>(
         if !session.is_live(row) {
             carried.repaired += 1;
             let asked = {
+                let identity = session.id_at(row);
                 let mut engine =
                     Engine::new(kernel, world, Door::Keep(&mut *store), verify, &mut *session);
+                // What the session had of it: a maintained step runs from that entry.
+                engine.repair = identity.map(|identity| Repair {
+                    identity,
+                    input: key.get(2..).unwrap_or(&[]),
+                    was: was_key,
+                    changed,
+                });
                 engine.ask(&key, Need::Hash)
             };
             match asked {
@@ -1009,9 +1420,14 @@ pub(crate) fn carry<W: World + ?Sized>(
             Some(_) => carried.changed += 1,
             None => carried.gone += 1,
         }
-        // Its readers, read from the store where they are not in memory. A store that fails
-        // here leaves rows dropped whose readers were not reached: the session is dropped.
-        if let Err(error) = dirty_readers(session, &*store, row, &mut queue) {
+        // Its readers, read from the store where they are not in memory: of the whole value,
+        // and for a table of the parts that differ. A store that fails here leaves rows
+        // dropped whose readers were not reached: the session is dropped.
+        let parts = match kernel.is_table(&key) {
+            true => dirty_parts(kernel, session, &*store, row, &key, was_key, &mut queue),
+            false => Ok(()),
+        };
+        if let Err(error) = parts.and_then(|()| dirty_readers(session, &*store, row, &mut queue)) {
             session.clear();
             return Err(error);
         }
@@ -1037,6 +1453,72 @@ fn dirty_readers(
             session.dirty(store, reader, queue)?;
         }
     }
+    Ok(())
+}
+
+/// Drops and queues every reader of the read named `name` the queue still takes.
+fn dirty_named(
+    session: &mut Session,
+    store: &dyn Put,
+    name: &[u8],
+    queue: &mut crate::session::Queue,
+) -> Result<(), KernelError> {
+    let Some(at) = session.name_readers(store, name)? else {
+        return Ok(());
+    };
+    let mut n = 0;
+    // Bounded (rule 18): one turn a reader of one posting.
+    while let Some(reader) = session.reader_at(at, n) {
+        n += 1;
+        if queue.takes(reader) {
+            session.dirty(store, reader, queue)?;
+        }
+    }
+    Ok(())
+}
+
+/// The readers by part of the table `row`, whose value changed: the entry its readers saw
+/// (`was`, still in the store) is compared with the one it has now by their indexes
+/// ([`table::diff`]), and only the readers of a part that differs, came or went are dropped
+/// and queued, and those of the key set where a key came or went. A table that cannot be
+/// valued now drops every reader of any part of it.
+///
+/// The invariant: a reader of one part of a table is repaired by a carry exactly when that
+/// part's digest differs, the key appeared or the key went (`exhaustive/nested.rs`, controls
+/// `an_absence_not_posted_is_caught`, `a_removed_key_the_comparison_missed_is_caught`,
+/// `a_part_digested_as_another_is_caught`; cost in `tests/cost.rs`).
+fn dirty_parts<W: World + ?Sized>(
+    kernel: &Kernel<W>,
+    session: &mut Session,
+    store: &dyn Put,
+    row: u32,
+    key: &[u8],
+    was: Key,
+    queue: &mut crate::session::Queue,
+) -> Result<(), KernelError> {
+    // alloc: one repair's name of a part, reused for each part that differs
+    let mut name = Vec::new();
+    let Some(now) = session.key_of(row) else {
+        table::name(ReadKind::TABLE, key, &[], &mut name);
+        return dirty_named(session, store, &name, queue);
+    };
+    let get: &dyn Get = store;
+    let old = table_in(kernel, get, key, was)?;
+    let new = table_in(kernel, get, key, now)?;
+    let mut each = |part: &[u8]| {
+        name.clear();
+        table::name(ReadKind::PART, key, part, &mut name);
+        dirty_named(session, store, &name, queue)
+    };
+    let keys = table::diff(&old, &new, &mut each).map_err(|why| torn(kernel, key, now, why))??;
+    if keys {
+        name.clear();
+        table::name(ReadKind::KEYS, key, &[], &mut name);
+        dirty_named(session, store, &name, queue)?;
+    }
+    // The readers this carry repairs read their parts of the table as it is now: held, so
+    // the comparison's get of it is the carry's one.
+    session.hold_table(now, new.bytes());
     Ok(())
 }
 
@@ -1126,6 +1608,14 @@ pub(crate) mod planted {
         /// A member admitted through a cover is not posted as the cover's reader (invariant
         /// I5): a covering read that changes drops the cover and leaves the member verified.
         CoverUnposted,
+        /// A step that reads a key its table has not records no read: the absence is not
+        /// posted, so the key appearing reaches no one.
+        AbsenceUnposted,
+        /// The comparison of a table with the one before passes over a key that went.
+        DiffRemoved,
+        /// A table keeps, as a part's digest, the digest of the next key's bytes: a reader is
+        /// reached through another part than the one it read.
+        PartDigest,
         /// A session opened from the store reads no posting back: a name's readers are only
         /// those posted since it was opened (rule 26: a restore never silently starts empty).
         OpenUnposted,

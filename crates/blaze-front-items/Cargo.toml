@@ -1,0 +1,29 @@
+[package]
+name = "blaze-front-items"
+description = "The bottom of blaze v2's front end as kernel steps: parse(file, edition), items(file) with content-hashed item ids and header/body hashes over tokens, the per-file line part, and modules(crate); sans-IO, core + alloc"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-bytes.workspace = true
+blaze-cas.workspace = true
+blaze-ids.workspace = true
+blaze-kernel.workspace = true
+syntax.workspace = true
+
+[dev-dependencies]
+hegeltest.workspace = true
+hir-expand.workspace = true
+span.workspace = true
+
+[lints]
+workspace = true

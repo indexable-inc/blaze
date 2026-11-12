@@ -778,10 +778,6 @@ pub struct Unmaintained {
     /// The crate the maintainer was resolving when it asked, with its display name: the
     /// crate asked for is not maintained before it. `None` when no maintainer ran.
     pub asking: Option<(Crate, Option<String>)>,
-    /// The crate awaited (`deps::awaited`) that blocks it, with its display name: `krate`
-    /// itself or one it depends on, whose records the driver has not asked the store for
-    /// yet. `None` when nothing blocks it.
-    pub awaited: Option<(Crate, Option<String>)>,
 }
 
 impl Unmaintained {
@@ -790,13 +786,7 @@ impl Unmaintained {
             // alloc: an error's crate name, once
             krate.extra_data(db).display_name.as_ref().map(|it| it.crate_name().to_string())
         };
-        let awaited = crate::deps::awaited::blocker(db, krate);
-        Unmaintained {
-            krate,
-            name: name(krate),
-            asking: asking.map(|it| (it, name(it))),
-            awaited: awaited.map(|it| (it, name(it))),
-        }
+        Unmaintained { krate, name: name(krate), asking: asking.map(|it| (it, name(it))) }
     }
 
     /// Unwinds with `self` as the payload. It is logged first: a catcher that reads only a
@@ -836,23 +826,6 @@ impl std::fmt::Display for Unmaintained {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("name resolution: no maintained resolution for crate ")?;
         write_crate(f, self.krate, self.name.as_deref())?;
-        if let Some((awaited, name)) = &self.awaited {
-            f.write_str(": it waits for the records of crate ")?;
-            write_crate(f, *awaited, name.as_deref())?;
-            f.write_str(
-                ", which the driver has not asked the store for yet (`hir_def::deps::serve_asked` \
-                 releases a crate it is asked about; nothing may read a crate before that)",
-            )?;
-            // Who read it, where that is known: a maintainer's pass over another crate. With
-            // none named, a reader outside a pass did (a unit's build, a harness).
-            return match &self.asking {
-                Some((asking, name)) => {
-                    f.write_str("; read while maintaining crate ")?;
-                    write_crate(f, *asking, name.as_deref())
-                }
-                None => f.write_str("; read outside a maintainer's pass"),
-            };
-        }
         match &self.asking {
             Some((asking, name)) => {
                 f.write_str(", read while maintaining crate ")?;

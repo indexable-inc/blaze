@@ -91,10 +91,8 @@ pub struct Charge<K> {
     /// No task ended or gave way since the last reading: its `kept` is still what the
     /// allocator keeps.
     fresh: bool,
-    /// The last reading came after a purge.
+    /// The last reading came after a purge: what it says is kept no purge gives back.
     purged: bool,
-    /// A purge was asked for and no reading after a purge came since.
-    asked_since: bool,
     /// When the plane last asked for a purge.
     asked_ns: Option<u64>,
     grades: Grades,
@@ -116,7 +114,6 @@ impl<K: Copy + Eq> Charge<K> {
             gone: 0,
             fresh: true,
             purged: false,
-            asked_since: false,
             asked_ns: None,
             grades: Grades::default(),
         }
@@ -205,9 +202,14 @@ impl<K: Copy + Eq> Charge<K> {
         // Only the driver knows it purged: a reading taken after the plane asked but before
         // the purge says nothing of what a purge gives back.
         self.purged = purged;
-        if purged {
-            self.asked_since = false;
-        }
+    }
+
+    /// The rule of the alone start before 2026-11-12, kept for the liveness oracle's control
+    /// (`Plane::alone_needs_purge`): under the footprint mode, only on a fresh reading that
+    /// keeps nothing or came after a purge.
+    #[cfg(test)]
+    pub(crate) fn alone_ok_before(&self) -> bool {
+        !self.by_footprint || (self.fresh && (self.kept == 0 || self.purged))
     }
 
     /// The live bytes held, under the grants mode ([`crate::plane::PlaneInput::Held`]).
@@ -226,25 +228,25 @@ impl<K: Copy + Eq> Charge<K> {
         }
     }
 
-    /// Whether a task may start alone past what fits (`Plane::pick`). Under the footprint mode
-    /// only once what the allocator keeps is known to be gone: the last reading is fresh and
-    /// either keeps nothing or came after a purge. Otherwise a task let in alone would grow
-    /// into memory a purge would have given back for it, and pass the ceiling.
-    pub fn alone_ok(&self) -> bool {
-        !self.by_footprint || (self.fresh && (self.kept == 0 || self.purged))
-    }
-
     /// Whether to ask the driver for a purge now, the plane being held back for memory at
-    /// `at_ns`. Asked when the allocator may keep something (the last reading says so, or a
-    /// task ended since it), not again until a reading after a purge, and at most every
-    /// [`PURGE_EVERY_NS`]. Counts what it asks.
+    /// `at_ns`. Asked when the allocator may keep something a purge gives back (the last
+    /// reading keeps some and came after no purge, or a task ended since it), at most every
+    /// [`PURGE_EVERY_NS`], whether or not the driver answered the last one with a reading
+    /// after a purge. Counts what it asks.
+    ///
+    /// A purge is a hint for throughput and gates nothing: no start waits for it or for its
+    /// reading (`Plane::pick`'s invariant). Until 2026-11-12 a task that fit only alone
+    /// started only after a reading marked purged, and this asked no second purge until one
+    /// came; blaze-cargo's plane lets a purge go unanswered when nothing waits as it lands,
+    /// so one let go ended every alone start for the daemon's life (the smoke's second build
+    /// stalled on it). A task let in alone that meets what the allocator keeps is purged for
+    /// at the ceiling's gate ([`past_ceiling`]'s `Purge`), where the bytes are measured.
     pub fn ask_purge(&mut self, at_ns: u64) -> bool {
-        let may_keep = self.kept > 0 || !self.fresh;
+        let may_keep = (self.kept > 0 && !self.purged) || !self.fresh;
         let due = self.asked_ns.is_none_or(|it| at_ns >= it.saturating_add(PURGE_EVERY_NS));
-        if !self.by_footprint || !may_keep || self.asked_since || !due {
+        if !self.by_footprint || !may_keep || !due {
             return false;
         }
-        self.asked_since = true;
         self.asked_ns = Some(at_ns);
         self.grades.purges += 1;
         true

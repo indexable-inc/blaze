@@ -352,8 +352,8 @@ whole for the session (`Reader::pinned`), so the saving is the decoded heap valu
 image's bytes: the image without that part is next, then lang items and signatures the same
 way. (2) A module's names are written twice (scope segment and entries). (3) Impl tables
 (`hir-ty`'s frozen impls) are as they were. (4) A workspace crate is never paged: only a
-crate with an image is. (5) b3 and d are not built. F2 is written (below): a crate with records is no longer
-resolved from source before the store is asked.
+crate with an image is. (5) b3 and d are not built. F2 is not built (below): a crate with records is resolved
+from source once, in the write that adds it, before the store is asked.
 (6) No new `blaze_cas::Kind`: pages are `Kind::Query` like the image; their keys are what a
 pin of "toolchain" or "bstd" names (`pages_key` of each crate's `Image::key`).
 
@@ -367,63 +367,34 @@ So the next record is the impls and traits of a crate by module (what `served_de
 written beside the pages and handed over without a scope; until then expect `scope_memo` rows
 about equal to the served crates' modules.
 
-**F2: a crate added is awaited, not resolved (written 2026-11-12 by lane records-1112c, not
-compiled or run by it; the round's results decide).** Read from the code: both maintainers
-worked at the write (`nameres::delta::unreached` gave a job to every crate with no state that
-no image serves; `method_resolution::delta::state::prepare` gave every unserved crate a state
-and a node), the daemon's `harness::write` read each ready unit's def map before the first
-serve, and every serve that changed anything was a change of the whole crate graph, which ran
-every unserved crate cold again. As built:
+**F2 as a set of awaited crates: built 2026-11-11 (5595254297), removed 2026-11-12 (lane
+awaited-out; written, not compiled or run by it).** What it was: an input holding the crates
+whose records were not asked for yet (`hir_def::deps::awaited`), which both maintainers
+passed over, released by the serve that asked about a crate (`serve_asked`), in a front end
+lowered with `blaze_lower::lower_awaiting`. Why it went: it was a second scheduling protocol
+beside the plane, a held set with its own release events and a promise no type enforced
+("nothing reads a crate before a serve asked about it"). The smoke project failed on it three
+times with the same error (`no maintained resolution for crate libc .. it waits for the
+records of crate libc`, unit `smoke-sys (build script)`), once after a fix of the rule for
+what a serve asks about; the cause was never found. The tree is back to what it did before:
 
-- `hir_def::deps::awaited` (`Awaited`, one input): the crates whose records were not asked for
-  yet. A crate is *blocked* while it or a crate below it is awaited (`blocked`, inputs alone):
-  `unreached` gives it no job (`LastWrite::blocked`, fixed at the pass's start), `prepare` and
-  `run_nodes` no state, slot or node, and a reader is stopped with `Unmaintained` naming the
-  crate it waits for.
-- Only a database whose driver promised to serve has the set: `blaze_lower::lower_awaiting`
-  (every front end of the daemon; `serve/unit.rs`), where `lower_writes` awaits the crates a
-  plan makes in the write that makes them. `blaze_lower::lower` (tests, tools with no store)
-  awaits nothing, and `Lowered::serve_deps` refuses such a front end by name, so there is one
-  production path.
-- `deps::serve_asked(db, asked, crates, ..)` releases `asked` and all below them
-  (`awaited::release`) and sets the images found, in one write; a released crate is noted as a
-  crate added (`Db::note_crates_added`), so one with an image is read from it and was never
-  resolved, one without gets its first run there, and the crates released before are left
-  alone (the write is a change of the whole graph only when a crate the maintainers knew
-  gains, loses or swaps an image). `unit/deps.rs` `images` releases what it was asked about
-  whether or not a key moved (`release`), writing nothing when none was awaited.
-- The daemon serves the ready units *before* their harnesses are written (`unit.rs` `lower`,
-  and `serve_written` in `UnitWriter::apply`), and again after the identities for a key the
-  harness's roots moved. A unit that waits on a build script stays awaited, with everything
-  above it, until the serve after that run.
-- *A unit is never built while a crate at or below its crate is awaited* (2026-11-12, lane
-  records-1112e; written, not compiled or run by it). The serve owns it: `unit/deps.rs`
-  `serve` takes the job's `Waits` and asks about the batch's units and every ready unit
-  whose crate is blocked (`deps::asked`), then checks that no ready unit is left blocked
-  (`deps::blocked_ready`: an error at the write naming the unit and the crate). No caller
-  lists the crates (`with_blocked_ready` in `unit.rs` is deleted). `UnitWriter::began` logs
-  a unit that begins blocked with whether `Waits` had it ready, and `Unmaintained` says
-  whether a maintainer's pass or a reader outside one read the crate. **The cause of the
-  smoke failure on 3a3fde543b is not known**: no trace was taken. Read from the code: only
-  `lower_writes` makes and awaits crates (`Lowered::ran` makes none, so the earlier lane's
-  reason was wrong), and a release takes everything below what it is asked about, so a ready
-  unit that was asked about cannot have an awaited crate below it; the failing units were
-  all workspace units (smoke-sys's build script; blaze-rng, blaze-reclaim, blaze-serde-derive
-  and six more). If it fails again the three messages above say which of these holds: the
-  scheduler began a unit `Waits` did not have ready, a unit read a crate not below its own,
-  or a maintainer's pass did. Checks: blaze-cargo
-  `serve::unit::tests::awaited::a_crate_awaited_under_a_ready_unit_is_released_by_the_next_serve_whatever_it_lists`
-  with `the_control_a_serve_of_only_the_units_listed_leaves_a_ready_unit_unmaintained`.
-- Checks: hir-def `deps::awaited::tests::a_crate_is_blocked_while_it_or_one_below_it_is_awaited`;
-  blaze-lower `tests::awaited::a_crate_added_to_an_awaiting_front_end_is_not_resolved_until_it_is_asked_about`
-  (4 and 40 library crates: no nameres or impls record and no item-tree row after lowering,
-  each crate resolved once at its release) with its control
-  `the_control_a_front_end_that_awaits_nothing_resolves_every_crate_as_it_is_added`;
-  blaze-cargo `serve::unit::tests::awaited::a_dependency_with_records_is_never_resolved_by_the_daemon_that_finds_them`.
-- Not covered: a count with many crates that have records (the store is blaze-cargo's, whose
-  fixture has one registry crate); the impls maintainer still keys every served crate's impls
-  from `served_delta` (next piece); a workspace test or program crate is resolved once before
-  its harness root is appended and its root's group again after.
+- Every crate is resolved in the write that adds it. Read from the code: `lower_writes` adds
+  the plan's crates and notes a change of the whole graph, and that write's pass gives a job
+  to every crate with no state that no image serves (`nameres::delta::unreached`) and a state,
+  a slot and a node to every crate whose impls no record serves
+  (`method_resolution::delta::state::prepare`, `run_nodes`), all from source.
+- The serve comes after: `Real::lower` (`serve/unit.rs`) writes the ready units' harness roots
+  and identities, then `deps::serve` of the ready units. A serve that changes how any crate
+  is read notes a change of the whole graph (`hir_def::deps::serve`,
+  `Db::note_crates_changed`): a crate that gained an image has its state dropped, and every
+  crate still resolved from source has a job again over the decoded maps below it.
+- So a restart pays name resolution and the impl tables of every crate once from source
+  before the store is asked, and the unserved crates again after the first serve that hits.
+  The number on record for this path, from before F2 was built: reth, 827 crates, 191.6 s.
+
+What replaces it is not a held set: a cover per registry crate that seeds a kernel session on
+demand (end-state.md), so a crate with records has no job to skip. F2's objective stands; this
+path is not how it is met.
 
 **A registry crate's image under any home (2026-11-12, lane records-1112f; written, not
 compiled or run by it).** Measured by lane reth-1112 on a hello-world: 80 of 80 dependency
@@ -444,16 +415,6 @@ Checks (hir-def `nameres::frozen::tests`):
 `the_control_a_path_kept_absolute_is_other_bytes_under_another_home`,
 `a_literal_that_still_holds_a_directory_is_refused_by_its_name`. To measure: the refused
 count on hello-world, 80 to 0.
-
-**The smoke failure, as far as read (2026-11-12, records-1112f; no trace yet).** `Waits::ready`
-is over the *unit* graph (no build-script run left in the unit's closure) and a release
-walks the *crate* graph (`Crate::data().dependencies`). The units that failed have no
-dependency but the standard library (blaze-rng, blaze-serde-derive; smoke-sys's build script
-has `cc`), the error names one `libc` as both read and awaited, and the unit's own crate was
-not awaited (or the error would name it). So either the two graphs differ at `libc` (a crate
-edge with no unit edge, or the reverse: two `libc` crates, the sysroot's and the registry's
-0.2.x, or host and wasm) or the read is not along a dependency edge. Not decided: it needs
-the three log lines (`a unit begins while ..`, the `Unmaintained` tail, `.. still waits`).
 
 **What is left, in order** (split 2026-11-12: 1's second half is lane records-impls', 4 is
 records-items', 5 and the end-to-end revision cases are records-restart's, bodies and MIR are
@@ -500,8 +461,7 @@ blaze-cargo's `serve::collect::front_keys`: a new record kind adds its key there
    `DefMapSlot`, `LangItemsSlot`, `PagesSlot`, `ImplTablesSlot`), and every read inside a
    query is of the slot: `deps::image_of`, `frozen::frozen_def_map`, `frozen_lang_items`,
    `pages::paged`, hir-ty `frozen::frozen`. The four maps a serve sets are still set in one
-   write. `Awaited` stays one set: a query reads it only on `Unmaintained`'s path, and
-   `any_awaited` stays one load. Checks: hir-def
+   write. Checks: hir-def
    `nameres::frozen::pages::tests::pages_given_to_one_crate_run_no_row_of_another` with
    `the_oracle_catches_a_gift_to_every_crate`; to measure: none of the five names among the
    durability census's blockers. Known cost, not measured: the first gift of a kind to a
@@ -562,10 +522,10 @@ code and said so.
 |---|---|---|
 | 1. `daemon start` | `serve/daemon.rs`: read the state, restore the symbols, restore the VFS, open the database, restore the plane's history, install the library's trees | not in the build's numbers. The VFS's Merkle tree comes back whole (every file's and directory's content ID) and the watcher goes on from its saved cursor and stamps, so no file is read or hashed here. The front end's database is not persisted (constraint 2, below) |
 | 2. the request's plan | watches, `std library`, `plan` | not split out in what was sent |
-| 3. a new database | `Real::lower` (`serve/unit.rs`) with nothing kept: `blaze_lower::lower_awaiting`, `lower_writes` | read: `files::Mounts::walk` takes every file of every package directory of the plan from the tree with its bytes, and `base_db::Files::set_view_root` hashes every file's bytes again to check the ID the tree gave (`content::hash_many`) and writes each as an input. **The 36,408 inputs written are here, by reading**: a text input a file, each file's source root, each root's file set, each crate's inputs. Bounded by the files of the plan's packages, not by the plan. The split by input kind is asked of reth-1112 (`blaze explain writes build=43`) |
+| 3. a new database | `Real::lower` (`serve/unit.rs`) with nothing kept: `blaze_lower::lower`, `lower_writes` | read: `files::Mounts::walk` takes every file of every package directory of the plan from the tree with its bytes, and `base_db::Files::set_view_root` hashes every file's bytes again to check the ID the tree gave (`content::hash_many`) and writes each as an input. **The 36,408 inputs written are here, by reading**: a text input a file, each file's source root, each root's file set, each crate's inputs. Bounded by the files of the plan's packages, not by the plan. The split by input kind is asked of reth-1112 (`blaze explain writes build=43`) |
 | 4. the keys | `deps::serve` of the ready units: `Walked::keys`, `hir_def::deps::image_key` | a hash a crate over its inputs and (path, content ID) of each file of its source root. It needs content IDs, never text; it gets them from the inputs step 3 wrote |
-| 5. the serve | `serve_asked` | a crate with an image is decoded; one without is resolved. `key::eligible` refuses a local crate and every crate that depends on one, so **every workspace crate is resolved, expanded and item-treed from source at every restart** (read). Measured self CPU of build 43: `impls warm impl` 40.5 s, `nameres collect_expansion` 19.0, `parse_macro_expansion` 17.3, `nameres resolve_round` 16.2, `nameres crate` 14.5 (19,941 spans), `nameres update` 13.8, `impls apply_impls` 13.5, `macro_expand` 8.8, `nameres records` 8.5, `file_item_tree_query` 8.2. Which of the 19,941 are workspace crates is asked |
-| 6. harness roots, identities, then a batch of writes for each build script's run and proc macro's load | `harness::write`, `identify`, `UnitWriter::apply` (`ran`, `macros`, `serve_written` twice) | each is a write that opens a view, and each row read after it is proved again. 144,686,333 verified over 6,813,023 executed is 21 a row: by reading, the views the build opens times the rows later readers re-prove, with no seal held (seals are memory only, and no host seals in a real build yet). The count of views and `verified` by query are asked |
+| 5. the serve | `hir_def::deps::serve` | a crate with an image is decoded; one without is resolved. `key::eligible` refuses a local crate and every crate that depends on one, so **every workspace crate is resolved, expanded and item-treed from source at every restart** (read). Measured self CPU of build 43: `impls warm impl` 40.5 s, `nameres collect_expansion` 19.0, `parse_macro_expansion` 17.3, `nameres resolve_round` 16.2, `nameres crate` 14.5 (19,941 spans), `nameres update` 13.8, `impls apply_impls` 13.5, `macro_expand` 8.8, `nameres records` 8.5, `file_item_tree_query` 8.2. Which of the 19,941 are workspace crates is asked |
+| 6. harness roots, identities, then a batch of writes for each build script's run and proc macro's load | `harness::write`, `identify`, `UnitWriter::apply` (`ran`, `macros`, `serve_written`) | each is a write that opens a view, and each row read after it is proved again. 144,686,333 verified over 6,813,023 executed is 21 a row: by reading, the views the build opens times the rows later readers re-prove, with no seal held (seals are memory only, and no host seals in a real build yet). The count of views and `verified` by query are asked |
 | 7. each unit's record | found by a key that needs the unit's identity, which needs its crate resolved | 0 units made; every workspace crate was resolved to learn that |
 | 8. the walk | describes | `body_query` 55.3 s self CPU (215,072 spans): R7, not this lane's |
 | 9. what is lost | `noop::LastAnswer`, the seals | the next no-op is a build again |
@@ -604,7 +564,7 @@ numbers. The cost of step 3 is real work (every file read and hashed twice, 51 s
 by `PathBucket`/`SourceRootInput` sets (17,385 of the 36,408), not by `FileText`. The 827
 crates resolved are far more than reth's workspace: crates with no image at all (not eligible
 because a proc macro's library was not known when they were keyed, or above a local crate, or
-refused), which is asked of the profile before E is sized. The expected "about eight a crate"
+refused), which is asked of the profile before E is sized. The expected "about seven a crate"
 is a guess at sets, and creations are not counted: the bound to hold is that no `PathBucket`,
 `ScopeInput`, `InherentSlice`, `TraitImplsSlice`, `CandidateSlice` or `CrateResolution` is set
 for a crate found by its records.
@@ -645,7 +605,8 @@ same sources write the same bytes: nothing in it is an ID of a database.
 **D. The decision** (`lower_writes`). For a package each of whose crates in the plan has a
 found record, the source root is *declared* from the manifest
 (`base_db::Files::declare_view_root`: a file ID a path, the content ID as the file's content,
-no text), the crates are made awaited as today, and the serve fetches each image by the filed
+no text), the crates are made with no job (this step was written over the awaited set, removed
+2026-11-12: it waits for end-state.md's covers), and the serve fetches each image by the filed
 key the record gave. A declared file's text is read from the tree by its content ID the first
 time something asks for it (a body: `nameres::demand`); a tree that no longer holds that ID is
 an error naming the file, never an empty text. For any other package: today's path.
@@ -682,8 +643,8 @@ F3's condition (each watch it rested on vouched again at the start), which is du
 deciding a build: it lands with its simulation, in noopkeep's lane, not here.
 
 **Expected, to be replaced by the runner's numbers.** A restart with nothing changed writes
-inputs by crates and roots, not files: about eight a crate (data, extra data, cfg, env,
-workspace data, its root's file set, its awaited entry, its image slot), two a root, and the
+inputs by crates and roots, not files: about seven a crate (data, extra data, cfg, env,
+workspace data, its root's file set, its image slot), two a root, and the
 singletons. hello-world (27 crates): about 250, against about 5,000 today (5,087 was measured
 for a change of plan). reth: about nine a crate of its plan, independent of its 36,408; the
 crate count of its plan is not known to this lane. Name-resolution, expansion and item-tree
@@ -814,8 +775,7 @@ What the next writer needs, agreed with the lanes named:
   positions in its slot, so a moved line in it moves the image keys above it (a body edit
   that keeps its lines does not); closing it needs the kept narrowed identities read before
   the first serve; (3) `Crate::give` writes the slot and notes nothing to the maintainers, so
-  an awaited crate given a surface is not resolved (the guard is blaze-lower's
-  `a_crate_added_to_an_awaiting_front_end_is_not_resolved_until_it_is_asked_about`). Tests:
+  a crate given a surface gets no job for it. Tests:
   hir-def `a_dependency_enters_the_key_above_it_by_its_surface_where_it_was_given_one` (its
   first half is the control), blaze-lower
   `every_crate_is_given_its_surface_and_what_no_front_end_reads_moves_none`. Known hole, older
@@ -844,7 +804,7 @@ records-1112d; behind the def-map pages' switch): until then the old path is the
 
 **What forces a served crate's syntax** (read from the code). No reader of a served crate asks
 for an item tree: `file_item_tree_query` is called by name resolution's collection alone, which
-F2 no longer runs. What is left makes a whole `parse`, a `file_outline` (a copy of the parse)
+runs once for every crate in the write that adds it (F2, not built). What is left makes a whole `parse`, a `file_outline` (a copy of the parse)
 or a `parse_macro_expansion` (with `macro_expand` and `decl_macro_expander`, which parses the
 defining file):
 

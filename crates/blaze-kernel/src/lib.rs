@@ -49,6 +49,7 @@ mod nest;
 mod reads;
 mod session;
 mod store;
+pub mod table;
 mod trie;
 #[cfg(test)]
 mod tests;
@@ -134,6 +135,27 @@ impl ReadKind {
     /// the step's number (`u16`, big-endian) and the input's stable bytes ([`Ask::key`]); what
     /// it saw is the hash of the value's bytes. [`Reads::step`] records it.
     pub const STEP: ReadKind = ReadKind(0xffff);
+
+    /// One part of a step's value that is a table ([`table`]): the kernel answers it. Its
+    /// key is the length of the step's key (two bytes, big-endian), the step's key as a
+    /// [`ReadKind::STEP`] read has it, then the part's key; what it saw is the digest of the
+    /// part's own bytes, or [`Seen::Gone`] where the table has no such key.
+    /// [`Reads::part`] records it.
+    pub const PART: ReadKind = ReadKind(0xfffe);
+
+    /// The key set of a step's value that is a table: its key is the step's key, and what it
+    /// saw is the digest of the keys alone. [`Reads::keys`] records it.
+    pub const KEYS: ReadKind = ReadKind(0xfffd);
+
+    /// Never a read: the name a session posts every reader of any part, or of the keys, of
+    /// a step under, so that a table that cannot be valued at a carry reaches them all.
+    pub const TABLE: ReadKind = ReadKind(0xfffc);
+
+    /// Whether the kernel answers reads of this kind itself: no [`World`] is asked for one,
+    /// and no change set names one.
+    pub fn is_kernels(self) -> bool {
+        self.0 >= ReadKind::TABLE.0
+    }
 }
 
 /// One read: its kind and the canonical bytes of its key (content IDs and item keys; no dense
@@ -307,12 +329,61 @@ pub trait Compute: Step {
 /// to, and from no other.
 #[blaze::pure]
 pub trait Ask: Compute<Input: Sized> {
+    /// Whether its value is a table ([`table::Builder`]): a step may then read one part of it
+    /// ([`Reads::part`]) or its key set ([`Reads::keys`]), and a carry compares the old value
+    /// with the new one part by part. A step that says so and makes other bytes is refused
+    /// where a part of it is read.
+    const TABLE: bool = false;
+
     /// Appends the input's stable bytes: content IDs and item keys, never a dense id or a
     /// path in the checkout.
     fn key(input: &Self::Input, out: &mut Vec<u8>);
 
     /// The input `key` wrote; bytes that are none are refused, naming why.
     fn input(key: &[u8]) -> Result<Self::Input, String>;
+}
+
+/// One read of the run before whose value is other now: what a maintained step is given.
+#[derive(Clone, Copy)]
+pub struct Change<'a> {
+    pub read: Read<'a>,
+    /// What the run before saw.
+    pub was: Seen,
+    /// What it is now.
+    pub now: Seen,
+}
+
+/// A step that may run from the value it made before and the reads that changed
+/// ([`Kernel::register_maintain`]): what makes an edit of one fact cost that fact, where
+/// `compute` reads them all (name resolution of a crate, the impls of a trait). `compute`
+/// stays the definition; `maintain` is a faster way to the same bytes.
+///
+/// The kernel calls `maintain` in a carry's repair, where the session holds the entry the
+/// step had before and every read of that entry that changed can be valued now; it calls
+/// `compute` otherwise (a first run, another checkout, a session that was dropped). The entry
+/// kept has the same identity, reads and value form either way.
+///
+/// `ctx` starts with the reads of the run before, each with what it is now, none valued
+/// again for the run: a read the maintainer does not touch is in the trace as `compute` would
+/// record it. The maintainer reads again what it needs the value of ([`Reads::get`]), makes
+/// new reads as any run does, and forgets a read `compute` would no longer make
+/// ([`Reads::forget`]).
+#[blaze::pure]
+pub trait Maintain: Ask {
+    /// The value of `input` now, from `previous` (the bytes the run before made) and
+    /// `changed` (the reads of that run that are other now, in the order of their names).
+    ///
+    /// The invariant: `maintain(previous, changed)` is `compute()` byte for byte, reads
+    /// included. The kernel runs both where the request's setting samples the identity and
+    /// refuses a difference ([`KernelError::Maintained`]), keeping neither (controls
+    /// `a_maintainer_that_forgets_a_deletion_is_refused_under_verify` and
+    /// `a_maintainer_that_forgets_a_deletion_is_stale_with_verify_off`, `tests/cost.rs`).
+    fn maintain(
+        ctx: &mut Reads<'_, Self::World>,
+        input: &Self::Input,
+        previous: &[u8],
+        changed: &[Change<'_>],
+    ) -> Result<Vec<u8>, StepError>;
 }
 
 /// Why a step's run made no value.
@@ -400,6 +471,10 @@ pub enum KernelError {
     TooManyShapes { of: Of },
     /// The step refused its input.
     Compute { of: Of, why: String },
+    /// A maintained step's `maintain` made other reads or other bytes than its `compute`
+    /// ([`Maintain`]'s invariant): `why` names the first read or the first part that differs.
+    /// Neither value was kept.
+    Maintained { of: Of, why: String },
     /// A sampled hit computed again to other reads or other bytes.
     Verify(VerifyError),
     /// The world is not at the pin the request's session is of: it moved between two requests
@@ -446,6 +521,7 @@ impl KernelError {
             KernelError::Unregistered { .. }
             | KernelError::Twice { .. }
             | KernelError::Store { .. }
+            | KernelError::Maintained { .. }
             | KernelError::Unsteady { .. }
             | KernelError::Conflict { .. }
             | KernelError::TooManyShapes { .. }
@@ -497,6 +573,10 @@ impl fmt::Display for KernelError {
                 "{of}: {MOST_SHAPES} shapes of reads are kept under this identity, the most one holds: the step reads too much of what varies"
             ),
             KernelError::Compute { of, why } => write!(f, "{of}: {why}"),
+            KernelError::Maintained { of, why } => write!(
+                f,
+                "{of}: run from its value before and the reads that changed (`Maintain::maintain`) it is not what `compute` makes, so neither was kept: {why}"
+            ),
             KernelError::Verify(error) => error.fmt(f),
             KernelError::Moved { pinned, now } => write!(
                 f,
@@ -584,6 +664,11 @@ struct Registered<W: ?Sized> {
     asked: Option<Runner<W>>,
     /// Whether it is a cover ([`Kernel::register_cover`]): a carry never looks it up.
     cover: bool,
+    /// Whether its value is a table ([`Ask::TABLE`]): a carry compares it part by part.
+    table: bool,
+    /// Its `maintain` behind its input's bytes, where it is a maintained step
+    /// ([`Kernel::register_maintain`]).
+    maintain: Option<nest::Maintainer<W>>,
 }
 
 /// The registry of steps, each with its code, over the one world `W` its steps read. It is
@@ -600,8 +685,9 @@ pub struct Kernel<W: ?Sized> {
 
 const REGISTRY: &str = "blaze v2 kernel registry 1";
 
-/// The digest of a registry: every step's number, name and code, and whether it may be asked
-/// for, in the order of the numbers.
+/// The digest of a registry: every step's number, name and code, whether it may be asked
+/// for, whether its value is a table and whether it is maintained, in the order of the
+/// numbers.
 fn registry_of<W: ?Sized>(steps: &blaze_hash::HashMap<StepId, Registered<W>, Global>) -> ContentId {
     // alloc: once a registration, the steps in the order of their numbers
     let mut sorted: Vec<(StepId, &Registered<W>)> = steps.iter().map(|(step, it)| (*step, it)).collect();
@@ -614,7 +700,7 @@ fn registry_of<W: ?Sized>(steps: &blaze_hash::HashMap<StepId, Registered<W>, Glo
             .update(&name.to_le_bytes())
             .update(it.name.as_bytes())
             .id(&it.code.0)
-            .update(&[u8::from(it.asked.is_some())]);
+            .update(&[u8::from(it.asked.is_some()), u8::from(it.table), u8::from(it.maintain.is_some())]);
     }
     hasher.finish()
 }
@@ -642,13 +728,13 @@ impl<W: World + ?Sized> Kernel<W> {
 
     /// Registers `S` with its code. A second step of one number or one name is refused.
     pub fn register<S: Step>(&mut self, code: CodeId) -> Result<(), KernelError> {
-        self.enter::<S>(code, None, false)
+        self.enter::<S>(code, None, false, false, None)
     }
 
     /// Registers `C` with its code as a cover ([`Kernel::cover`], [`Kernel::seed`]): a step
     /// no step asks for and no carry looks up, whose value is the manifest of its members.
     pub fn register_cover<C: Step>(&mut self, code: CodeId) -> Result<(), KernelError> {
-        self.enter::<C>(code, None, true)
+        self.enter::<C>(code, None, true, false, None)
     }
 
     /// Whether the step a read of a step's value names (its number, then its input: what
@@ -663,7 +749,31 @@ impl<W: World + ?Sized> Kernel<W> {
     /// registry keeps how to look it up, run it and keep it from the bytes of its input, which
     /// is how a read of its value is answered at a later lookup.
     pub fn register_ask<S: Ask<World = W>>(&mut self, code: CodeId) -> Result<(), KernelError> {
-        self.enter::<S>(code, Some(Runner::of::<S>()), false)
+        self.enter::<S>(code, Some(Runner::of::<S>()), false, S::TABLE, None)
+    }
+
+    /// Registers `S` as [`Kernel::register_ask`] does, and as a maintained step: a carry
+    /// that repairs it runs [`Maintain::maintain`] from the entry the session had of it.
+    pub fn register_maintain<S: Maintain<World = W>>(&mut self, code: CodeId) -> Result<(), KernelError> {
+        self.enter::<S>(code, Some(Runner::of::<S>()), false, S::TABLE, Some(nest::Maintainer::of::<S>()))
+    }
+
+    /// The `maintain` of the step numbered `step`, where it is registered as maintained.
+    pub(crate) fn maintainer(&self, step: StepId) -> Option<nest::Maintainer<W>> {
+        self.steps.get(&step).and_then(|it| it.maintain)
+    }
+
+    /// Whether the step a read of a step's value names (as [`Kernel::is_cover`] takes it)
+    /// says its value is a table.
+    pub(crate) fn is_table(&self, key: &[u8]) -> bool {
+        key.split_first_chunk::<2>()
+            .and_then(|(step, _)| self.steps.get(&StepId(u16::from_be_bytes(*step))))
+            .is_some_and(|it| it.table)
+    }
+
+    /// Whether the step numbered `step` says its value is a table.
+    pub(crate) fn table_step(&self, step: StepId) -> bool {
+        self.steps.get(&step).is_some_and(|it| it.table)
     }
 
     fn enter<S: Step>(
@@ -671,6 +781,8 @@ impl<W: World + ?Sized> Kernel<W> {
         code: CodeId,
         asked: Option<Runner<W>>,
         cover: bool,
+        table: bool,
+        maintain: Option<nest::Maintainer<W>>,
     ) -> Result<(), KernelError> {
         if let Some(had) = self.steps.get(&S::ID) {
             return Err(KernelError::Twice { first: (S::ID, had.name), second: (S::ID, S::NAME) });
@@ -680,7 +792,7 @@ impl<W: World + ?Sized> Kernel<W> {
         }
         // alloc: the registry, once a step
         let registered =
-            Registered { name: S::NAME, code, type_id: TypeId::of::<S>(), asked, cover };
+            Registered { name: S::NAME, code, type_id: TypeId::of::<S>(), asked, cover, table, maintain };
         // alloc: the registry, once a step
         self.steps.insert(S::ID, registered);
         self.registry = registry_of(&self.steps);
@@ -705,9 +817,27 @@ impl<W: World + ?Sized> Kernel<W> {
     /// A read as an error or a check names it: a step's value by the step and its input, any
     /// other read as the world names it. Never on a hit's path.
     pub fn describe(&self, world: &W, read: Read<'_>) -> String {
-        if read.kind != ReadKind::STEP {
+        if !read.kind.is_kernels() {
             return world.describe(read);
         }
+        let Some((key, which)) = table::split(read) else {
+            // alloc: an error's or a check's text
+            return format!("a read of kind {} whose key names no step: {}", read.kind.0, hex(read.key));
+        };
+        let value = self.describe_step(key);
+        match which {
+            table::Which::Whole => value,
+            // alloc: an error's or a check's text
+            table::Which::Part(part) => format!("the part {} of {value}", hex(part)),
+            // alloc: an error's or a check's text
+            table::Which::Keys => format!("the keys of {value}"),
+        }
+    }
+
+    /// The value of the step a read names by `key` (its number, then its input), as an error
+    /// or a check names it.
+    fn describe_step(&self, key: &[u8]) -> String {
+        let read = Read { kind: ReadKind::STEP, key };
         match self.asked_of(read) {
             // alloc: an error's or a check's text
             Some((Registered { name, asked: Some(runner), .. }, input)) => {
@@ -723,10 +853,11 @@ impl<W: World + ?Sized> Kernel<W> {
     /// The item a read is of, for a reason's chain to follow: the input of the step whose
     /// value it is, as that step labels it; any other read as the world says.
     pub fn names(&self, world: &W, read: Read<'_>) -> Option<String> {
-        if read.kind != ReadKind::STEP {
+        if !read.kind.is_kernels() {
             return world.names(read);
         }
-        let (registered, input) = self.asked_of(read)?;
+        let (key, _) = table::split(read)?;
+        let (registered, input) = self.asked_of(Read { kind: ReadKind::STEP, key })?;
         Some((registered.asked?.label)(input))
     }
 
@@ -965,8 +1096,10 @@ impl<W: World + ?Sized> Kernel<W> {
         for member in &members.rows {
             for (kind, key) in &member.reads {
                 let read = Read { kind: *kind, key };
-                let why = if *kind == ReadKind::STEP {
-                    match session.named_row(*kind, key) {
+                let why = if kind.is_kernels() {
+                    // A part, or the keys, of a step's value: the step must be a member.
+                    let step = table::split(read).map_or(&key[..], |(step, _)| step);
+                    match session.named_row(ReadKind::STEP, step) {
                         Some(child) if ids.binary_search_by(|it| it.0.cmp(&child.0)).is_ok() => continue,
                         _ => "the value of a step that is not a member of the cover",
                     }

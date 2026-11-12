@@ -1,0 +1,19 @@
+{
+ "id": "admit-live-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane admit-live",
+ "where": "crates/hir-ty-pure/src/walk.rs (`ask_ahead`, deleted)",
+ "what": "On the smoke's second build the walk's summary query made 5.6 to 6.8 million `wait` spans on `summary_in` (one key changed owner 486,616 times) and the build did not finish in 600 s; with the call switched off the same daemon's builds had 954 and 27 such waits, longest 2.5 s.",
+ "cost": "a build that never ends on any crate with mutually recursive functions (syn's `to_tokens`)",
+ "cause": "a hint-only parallel pre-ask of callees' summaries, added 2026-11-11 in an uncompiled cut: an ask that would wait on its own asker gave way and ran again, with no bound. Its two test plants (`asking_in_turn`, `gathering_dry`) were called by no test.",
+ "whys": [
+  "why a livelock: giving way and asking again is a retry loop, and a cycle of instances keeps every asker an owner's waiter",
+  "why unbounded: the hint was said to decide nothing, so nothing counted its rounds",
+  "why not caught: never compiled or run; no test called its plants",
+  "why written: single describes took 57 to 106 s on one worker; a fast path was bolted onto the walk in place of making the walk parallel by design",
+  "property: an optimisation whose failure mode is silent extra work"
+ ],
+ "class": "a fast path bolted onto the default (rule 66) with an unbounded give-way loop (rule 18)",
+ "prevention": "removed whole: `ask_ahead`, `AHEAD`, `bounded`, `Walk::ahead` and its two gather sites, the plants; `summary_in` says why no pre-ask stands there",
+ "state": "written on int-1112, not compiled or run by the lane"
+}

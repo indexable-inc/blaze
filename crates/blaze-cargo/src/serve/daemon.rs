@@ -264,6 +264,10 @@ pub struct Still {
     /// Lowerings the loop holds until their root's kept front end is stored, which have no
     /// node of their own ([`Jobs::held_lowerings`]).
     pub lowerings: Vec<super::job::HeldLowering>,
+    /// What memory admission holds and allows ([`Plane::admission_says`]): a node ready and
+    /// never started is held back by admission, and the stall says by which of its rules.
+    /// `None` with no budget.
+    pub admission: Option<String>,
 }
 
 pub struct StillWait {
@@ -277,13 +281,15 @@ pub struct StillWait {
     pub held: Option<&'static str>,
     /// What a loop task that runs and is held for nothing waits on ([`Jobs::run_wait`]).
     pub run: Option<String>,
+    /// A ready node admission holds back for memory alone ([`Plane::waits_for_memory`]).
+    pub memory: bool,
 }
 
 impl fmt::Display for Still {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "blaze stalled: for {:.1} s nothing could move the build (no task ran or was ready, no effect was pending or in flight, the worker pool was idle with {} jobs parked; {} loop tasks open), with {} nodes not settled:",
+            "blaze stalled: for {:.1} s nothing could move the build (no thread task ran or had ended untaken, no effect was pending or in flight, the worker pool was idle with {} jobs parked; {} loop tasks open), with {} nodes not settled:",
             self.quiet_ns as f64 / 1e9,
             self.parked,
             self.loops,
@@ -305,6 +311,22 @@ impl fmt::Display for Still {
         if !self.graph.0.is_empty() {
             write!(f, "\n  {}", self.graph)?;
         }
+        // The ready nodes: no dependency holds one, so each waits for admission to start it.
+        let ready = self
+            .waits
+            .iter()
+            .filter(|it| matches!(it.state, blaze_protocol::events::NodeState::Ready))
+            .count();
+        if ready > 0 {
+            let memory = self.waits.iter().filter(|it| it.memory).count();
+            write!(
+                f,
+                "\n  {ready} nodes are ready and admission started none of them, {memory} of them held back for memory alone"
+            )?;
+            if let Some(admission) = &self.admission {
+                write!(f, "; {admission}")?;
+            }
+        }
         for it in self.waits.iter().take(STILL_NAMED) {
             write!(f, "\n  request {} node {} `{}`: {:?}", it.request, it.node, it.name, it.state)?;
             if let Some(on) = it.on {
@@ -315,6 +337,9 @@ impl fmt::Display for Still {
             }
             if let Some(run) = &it.run {
                 write!(f, ", {run}")?;
+            }
+            if it.memory {
+                write!(f, ", held back for memory")?;
             }
         }
         if self.waits.len() > STILL_NAMED {
@@ -2593,6 +2618,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 on: it.on.map(|on| on.0),
                 held,
                 run: (held.is_none() && plane.loop_runs(it.id)).then(|| jobs.run_wait(it.id)),
+                memory: plane.waits_for_memory(it.id),
             });
         });
         if waits.is_empty() {
@@ -2614,6 +2640,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             graph: graph.unwrap_or_else(blaze_graph::sched::waits_now),
             waits,
             lowerings: self.jobs.held_lowerings(),
+            admission: self.plane.admission_says(),
         };
         let said = still.to_string();
         tracing::error!("{said}");

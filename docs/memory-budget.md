@@ -119,7 +119,16 @@ The daemon keeps the ledger: `granted`, the sum of the predictions of the units 
 budget`. Units that wait start largest first among those that fit, and no more CPU-bound
 units than cores run at once. A unit whose prediction fits the budget at all starts, alone,
 once no unit granted memory runs, whatever the process holds besides: waiting could never make
-room for it, so it is never refused for that. While a unit waits for memory the process holds
+room for it, so it is never refused for that. That is admission's liveness rule, stated on
+`blaze_graph::Plane::pick` and checked after every step of the footprint simulation: when no
+running task holds a grant, the first ready task starts in that step, whatever it is forecast,
+whatever the footprint readings say, under a pressure cap and past the allowance too (its
+grant is then what the budget is now). No start waits for a purge or for a reading taken after
+one (until 2026-11-12 an alone start did, and a purge the driver let go stalled a build with one
+task ready and nothing running); a purge is asked when work is held back and gates nothing. The
+one wait left with nothing granted is for a turn of the machine's ledger, which the plane asks
+at once. What bounds memory is the ceiling on the footprint: a task that alone outgrows it is
+purged for, then failed by name. While a unit waits for memory the process holds
 besides its grants (`Plane::short`), the daemon lets go of the kept front ends of other
 checkouts and asks each build's front end for a release, before the unit starts. A unit's phase
 with no record of its own is predicted from its size, its source's bytes times what its kind
@@ -222,9 +231,11 @@ As built (2026-11-05), where it differs from the above and why:
   taking the least keeps the bound one number for all of them. At join, the other daemons'
   held bytes are counted as blaze's, not as "not blaze's" (Linux only: macOS has no in-use
   reading yet, so its budget is 3/4 of `hw.memsize` less the margin).
-- A task predicted at the whole ceiling (one with no record, which runs alone) starts alone
-  with its grant clamped to the allowance once the allowance is above zero. Without the clamp
-  it would wait forever for a machine the other daemons share.
+- A task that asks more than the allowance (one predicted at the whole ceiling, with no
+  record, or any other) starts alone, once no task granted memory runs, at a turn of the
+  ledger, with its grant clamped to the allowance (to one byte under an allowance of zero, so
+  it still holds a grant and no second task starts alone beside it). Without that it would
+  wait for a machine the other daemons share, with nothing of its own running to end the wait.
 - Besides every 250 ms and moves past 1/64 of the budget, a daemon turns at once when its
   plane says a turn would change what it may grant (`Plane::turn_wanted`: a task the room
   alone holds back, the lease in its last quarter, or a lease held with no work), and 25 ms
@@ -285,7 +296,9 @@ back. It keeps its allowance at what it holds until 10 s pass with no event
 (`blaze_graph::pressure::Pressured`, a sans-IO core). The plane takes it as
 `PlaneInput::Cap`; its budget is `min(allowance, cap)` (`blaze_graph::pressure::budget_under`,
 `Plane::budget_now`, the one join), every admission decision reads that, and under a cap no
-task starts alone (waiting does make room there). A task is refused as too big only against the
+task starts past it beside one granted memory; with nothing granted the first ready task still
+starts, granted the cap at most (a run of pressure events has no end the daemon can name, so
+it runs one task at a time through it, never none). A task is refused as too big only against the
 allowance, never the cap. The front ends are asked for a release at the first event of a run
 and once each 10 s of it after. The stores' pools give back the pages no task pins a slice a
 loop turn (64 MiB, no sooner than 10 ms after the last) for the 10 s an event stands, as they

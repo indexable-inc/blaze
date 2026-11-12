@@ -169,7 +169,15 @@ pub fn paused_line(
         _ = write!(line, " ({machine})");
     }
     match waiting {
-        0 => line.push_str(", waiting for the system's memory pressure to pass"),
+        // No running task holds a grant. Admission then starts the first ready task whatever
+        // it asks (`Plane::pick`'s invariant), so what is left to wait for is a turn of the
+        // machine's ledger, which the plane asks at once. Until 2026-11-12 this said "waiting
+        // for the system's memory pressure to pass" of every such wait, pressure or none: a
+        // build stalled at 12.9 of 190.9 GiB under no pressure was told that.
+        0 => line.push_str(
+            ", waiting on no running task: a task held back with nothing granted starts at the \
+             next turn of the machine's memory ledger",
+        ),
         1 => line.push_str(", waiting on 1 task: "),
         n => _ = write!(line, ", waiting on {n} tasks: "),
     }
@@ -319,8 +327,9 @@ mod tests {
         assert_eq!(
             paused_line(GIB / 2, 48 * GIB, Some(GIB / 2), Some(machine), 0, &[]),
             "build paused: daemon at 0.5 of 48 GiB (held at 0.5 GiB: the system is short of \
-             memory) (machine 96 GiB, 40.1 held by pid 4242 of /Users/a/.blaze), waiting for the \
-             system's memory pressure to pass"
+             memory) (machine 96 GiB, 40.1 held by pid 4242 of /Users/a/.blaze), waiting on no \
+             running task: a task held back with nothing granted starts at the next turn of the \
+             machine's memory ledger"
         );
     }
 }

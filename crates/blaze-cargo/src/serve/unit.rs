@@ -458,11 +458,11 @@ impl Steps for Real {
                                     );
                                     drop((session, lowered, seeds));
                                 }
-                                (blaze_lower::lower_awaiting(lower()).map_err(failed)?, None, Vec::new())
+                                (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new())
                             }
                         }
                     }
-                    None => (blaze_lower::lower_awaiting(lower()).map_err(failed)?, None, Vec::new()),
+                    None => (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new()),
                 };
                 // How the front end's identities write paths, told before any is asked: against
                 // the build's directories ([`portable::Places`]), so a unit's record key does
@@ -526,20 +526,6 @@ impl Steps for Real {
                 job._seeded = seeded;
                 let job = Arc::new(job);
                 let waits = graph::Waits::new(&job.graph);
-                // The ready units' crates are asked of the store before anything reads one:
-                // the front end awaits the crates lowered into it (`blaze_lower::lower_awaiting`),
-                // and the harness below reads each ready unit's resolution. This serve reads
-                // the ones with records from them and resolves the rest; the serve after the
-                // identities then finds only what the harness's roots moved.
-                let mut deps = None;
-                deps::serve(
-                    &mut lowered,
-                    &job,
-                    &waits,
-                    &deps::ready(&job, &waits),
-                    &mut session,
-                    &mut deps,
-                )?;
                 // After the seeds (the root's parse is seeded as on disk), before any identity:
                 // a test crate is identified by its root with the harness.
                 // A unit refused here has no write to charge it to yet: the lowering fails, naming each.
@@ -560,10 +546,10 @@ impl Steps for Real {
                 // Kept or fresh alike: the session's keys say which crates' keys moved, and a kept
                 // front end's serve of the units ready now finds none moved unless a write before
                 // this job's moved one.
+                let mut deps = None;
                 deps::serve(
                     &mut lowered,
                     &job,
-                    &waits,
                     &deps::ready(&job, &waits),
                     &mut session,
                     &mut deps,
@@ -600,29 +586,19 @@ impl Steps for Real {
 
 /// Serves the crates of `written`, the units a batch of runs and loads made ready or a loaded
 /// proc macro reaches ([`deps::serve`]), adding to what `kept` holds of the job's serves:
-/// before their harnesses read them (the units made ready were awaited until then), and again
 /// after the harness's roots and the identities, for a key those writes moved. A serve that
 /// fails or panics has left the front end partly served, which no unit's write owns: the
 /// error is the writer's own, naming the units served; no unit is built over it.
-///
-/// Every ready unit whose crate is still blocked is asked about with them, by the serve
-/// itself ([`deps::serve`], which states the invariant and checks it).
 fn serve_written(
     lowered: &mut Lowered,
     job: &Job,
-    waits: &graph::Waits,
     written: &[u32],
     session: &mut deps::Session,
     kept: &mut Option<deps::Kept>,
 ) -> Result<(), ApiError> {
-    // With no unit written there is still a serve while a crate is awaited: a ready unit
-    // may be blocked. The failure is then charged to the first unit of the job.
-    if written.is_empty() && !lowered.any_awaited() {
-        return Ok(());
-    }
-    let first = written.first().copied().unwrap_or(0);
+    let Some(&first) = written.first() else { return Ok(()) };
     let served = applying(first as usize, "serving dependencies", || {
-        deps::serve(lowered, job, waits, written, session, kept)
+        deps::serve(lowered, job, written, session, kept)
     });
     let error = match served {
         Ok(Ok(())) => return Ok(()),
@@ -1098,27 +1074,6 @@ impl Writer<Real> for UnitWriter {
 
     fn began(&mut self, unit: usize) {
         self.release.began(unit);
-        // The invariant of [`deps::serve`], seen from the build's side: a unit that begins
-        // is ready and its crate is not blocked. One load when nothing is awaited. A unit
-        // that begins blocked is said here with what the reader's `Unmaintained` cannot
-        // know (the unit, and whether `waits` had it ready): the scheduler started a unit
-        // the writer never served.
-        let lowered: &Lowered = &self.front;
-        let krate = self.job.crates.krate(unit);
-        if let Some((_, krate, awaited)) =
-            deps::blocked_ready(lowered, krate.into_iter().map(|krate| (unit as u32, krate)))
-        {
-            let db = lowered.db();
-            tracing::error!(
-                target: "blaze",
-                unit = lowered.what(unit),
-                ready = self.waits.ready(unit as u32),
-                krate = %krate.named(db),
-                awaited = %awaited.named(db),
-                awaited_id = ?awaited,
-                "a unit begins while its crate waits for the records of a crate below it"
-            );
-        }
     }
 
     fn found_kept(&mut self, unit: usize) {
@@ -1241,14 +1196,6 @@ impl Writer<Real> for UnitWriter {
         // code moves the key of every crate it reaches.
         let (job, waits, ready) = (&self.job, &self.waits, &self.ready);
         let mut written = harness::reached(job, waits, &loaded, ready);
-        // Asked of the store before the harness reads them: the units the runs made ready
-        // were awaited until now (`blaze_lower::lower_awaiting`), with everything above them.
-        if let Err(error) =
-            serve_written(lowered, job, waits, &written, &mut self.session, &mut self.deps)
-        {
-            self.broken = true;
-            return Err(error);
-        }
         if let Some(&first) = written.first() {
             match applying(first as usize, "the harness", || {
                 harness::write(lowered, job, written.iter().copied())
@@ -1285,14 +1232,9 @@ impl Writer<Real> for UnitWriter {
         // before (rule 21). A serve that fails or panics has left the front end partly served,
         // which no unit's write owns: it is the writer's own error, and ends the job with or
         // without keep-going, naming the units it served; no unit is built over it.
-        if let Err(error) = serve_written(
-            lowered,
-            &self.job,
-            &self.waits,
-            &written,
-            &mut self.session,
-            &mut self.deps,
-        ) {
+        if let Err(error) =
+            serve_written(lowered, &self.job, &written, &mut self.session, &mut self.deps)
+        {
             self.broken = true;
             return Err(error);
         }

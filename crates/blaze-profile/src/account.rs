@@ -83,7 +83,7 @@ impl Writer {
             "ProcessEnv" => Writer::Environment,
             "AllCrates" | "Crate" | "PrimaryCrates" | "LibraryRoots" | "LocalRoots"
             | "SourceRootInput" | "FileSourceRootInput" | "FrontSettings" | "NamedPaths"
-            | "PathBucket" | "FrontEnd" | "Awaited" => Writer::Plan,
+            | "PathBucket" | "FrontEnd" => Writer::Plan,
             "BuiltinDerives" | "CandidateSlice" | "CrateResolution" | "DepImages"
             | "DirectorySlot" | "FieldOrder" | "FrozenDefMaps" | "FrozenImpls"
             | "FrozenLangItems" | "ImplIdentities" | "InherentSlice" | "KeptConsts"

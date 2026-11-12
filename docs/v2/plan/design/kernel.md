@@ -404,6 +404,134 @@ not in that model yet. Not built: compaction of postings left by rows that were 
 heights raised when a child grows taller without its value changing (such a parent may be
 repaired twice in a later carry; never wrongly).
 
+### Parts
+
+Built (`table.rs`, `Reads::part`, `Reads::keys`, `nest::dirty_parts`); the rule is
+docs/v2/plan/design/end-state.md, review point 1. A step whose value is a table says so
+(`Ask::TABLE`), and another step reads one key of it, not the value.
+
+- **The value.** One record (`blaze kernel p 1`): a directory in the order of the keys (where
+  each key and part ends, the part's digest), the keys, the parts, and a Merkle index: a 16-way
+  trie on the nibbles of each key's hash, a subtree of at most 16 entries one leaf, each node
+  with the digest of its keys and the digest of its keys and parts. The bytes are a function
+  of the entries (`table::Builder` sorts; `Table::verify` builds again and compares). A part's
+  digest is of its own bytes; the key set's digest is the root's first; the root's second
+  covers both.
+- **The reads.** `Reads::part::<S>(input, key)` records one read of kind `PART` (65534), named
+  by the step, its input and the key, which saw the part's digest, or gone for a key the table
+  has not. `Reads::keys::<S>(input)` records one read of kind `KEYS` (65533), which saw the
+  key set's digest. The table is read in place in the store (a binary search of the
+  directory); a part read copies the part's bytes, a keys read the keys.
+- **At a lookup** the child is looked up or run as for a read of its whole value, then its
+  entry is read (one get) and only the part's digest compared: a parent whose part is the same
+  is a hit though the table changed elsewhere.
+- **In the session** a part read is posted under its own name, so postings are by (step,
+  input, part key) and by (step, input) for the key set, and are saved as any name's (a map
+  for each kind). Each such reader is also posted once under the step's `TABLE` name (65532):
+  what a carry drops when the table cannot be valued at all.
+- **At a carry**, a repaired table whose value hash changed is compared with the entry its
+  readers saw (the queue keeps that entry's key; it is still in the store): `table::diff`
+  walks both indexes from the roots and goes down only where the digests differ, and the
+  carry drops and queues the readers of each part that differs, came or went, and those of
+  the key set if a key came or went. A reader of the whole value is dropped as before.
+
+| Invariant | Where it holds | Control (`tests/cost.rs`) |
+|---|---|---|
+| P1 an absence is a read | `Reads::parted` records the read whatever it saw | `an_absence_not_posted_is_caught` |
+| P2 the comparison is total | `table::diff` gives every key of either side whose digest is not the other's | `a_removed_key_the_comparison_missed_is_caught` |
+| P3 a part's digest is of its own bytes | `table::Builder::finish` | `a_part_digested_as_another_is_caught` |
+
+Checked by `every_sequence_of_table_edits_gives_what_the_rows_give` (`tests/cost.rs`): every
+sequence of three of 12 edits (set to two values, or remove, each of 4 keys of a table of 22
+whose index has branches), the session carried after each, every reader against the rows.
+**Owed:** the same as a way of the model in `exhaustive/nested.rs` (a table-valued,
+maintained step among its 16^4 sequences, with drops, reopens and a store another session
+filled); the three controls, and the maintained step's, are not yet run there.
+
+Cost (`tests/cost.rs`, a table of 1,000 keys, a reader a key, each said against its floor;
+the floor is the table rerun and the direct readers of what changed):
+
+- one part changes: the carry reruns the table and drops 1 reader, in 7 gets and 2 reads
+  valued (pinned): 5 gets are the table's rerun as any rerun entry pays them (its list, the
+  chain's next slot, the answer under its new key, the keep's get before the entry's put and
+  of its list) and 2 the comparison (the entry before, the entry now); the rows are valued by
+  the lookup and again by the run, where the floor is once (a maintained step, below). After
+  it the other 999 readers and the reader of the keys are session hits of one get (their
+  bytes), no read valued; the one rerun reader is 5 gets (pinned: 1006 for the 1001 hits
+  and it). From a saved session the carry is 16 gets (pinned): 9 nodes of the saved maps on
+  the paths it reaches.
+- a reader of n parts of one table pays one get of the table (pinned: 8 parts cost the gets
+  of 1). The session holds the bytes of a table a request or a carry read a part of, by the
+  entry's key, until the request ends (`Session::hold_table`, as `trie::Nodes` holds map
+  nodes); a carry holds the table it compared, so the readers it repairs get it once.
+- a key appears that one reader saw absent: that reader and the reader of the keys;
+- a key appears that nobody read: the reader of the keys alone;
+- a key goes: its reader and the reader of the keys;
+- after `save` and `open` the same, the postings by part read from the store.
+
+A table step's value is checked when it is kept: that it is a table always (its header),
+and every byte (`Table::verify`) where the request's setting samples the identity
+(`a_table_step_that_makes_no_table_is_refused_by_name`).
+
+Over the floor, and owed: the first part read of a request copies the table's bytes into
+the session (linear in the table, once a request or carry), and a table is one record, so a
+run writes all of it: both go with the table of records below.
+
+### Maintained steps
+
+Built (`Maintain`, `Kernel::register_maintain`, `Engine::maintained` in `nest.rs`,
+`Reads::maintaining` and `Reads::forget`, `Table::edit`); the rule is end-state.md, review
+point 6. A maintained step has, beside `compute`, `maintain(ctx, input, previous, changed)`:
+the bytes its run before made, and the reads of that run that are other now (name, what it
+saw, what it is now).
+
+- **When.** In a carry's repair of a row whose step is registered as maintained: the queue
+  kept the key of the entry the row had, which is still in the store. Anywhere else (a first
+  run, another checkout, a dropped session, a read that changed and cannot be valued now, no
+  read that differs) the step is looked up and computed as any. The entry kept has the same
+  identity, reads and form either way.
+- **Before the lookup.** A lookup values every read of the entry's list to make the answer's
+  key; the maintained repair reads the entry before (one get) and values only the reads the
+  carry's `Changed` says may differ (the world's) and the reads of steps' values (their rows
+  in the session). Those that are other are `changed`.
+- **The reads.** `ctx` starts as the reads of the run before, each with what it is now; none
+  is valued for that. The maintainer reads again what it needs the value of, reads what is
+  new, and forgets (`Reads::forget`) a read `compute` would no longer make. What is left is
+  the trace kept.
+- **A table.** `Table::edit(edits)` gives the bytes `table::Builder` gives of the edited
+  entries, hashing only the edited parts and the index nodes on their paths; other digests
+  are copied (`an_edit_is_the_table_built_again`, `an_edit_hashes_the_path_of_what_it_edits`).
+
+| Invariant | Where it holds | Control (`tests/cost.rs`) |
+|---|---|---|
+| M1 `maintain(previous, changed)` is `compute()` byte for byte, reads included | on `Maintain::maintain`; the kernel runs both where `Setting::sampled` takes the identity (the sampling a hit's check has) and refuses a difference with `KernelError::Maintained` naming the step and the first read, else the first part, that differs; neither is kept | `a_maintainer_that_forgets_a_deletion_is_refused_under_verify`, `a_maintainer_that_forgets_a_deletion_is_stale_with_verify_off` |
+
+Checked by `a_maintained_table_is_the_table_computed` (a part set, a key out, in, the same
+again, a key nobody read, every key out: each carried with the check on and with it off,
+the table and its readers against a run with no kernel). **Owed:** the maintained table as a
+way of the exhaustive model (`exhaustive/nested.rs`) with its control there.
+
+Cost (`a_maintained_table_pays_for_the_row_that_changed`, 1,000 rows each its own read, one
+changes; the floor is the row valued once, one path of the index hashed, the entry put):
+
+| | reads valued | digests made | gets |
+|---|---|---|---|
+| maintained | 2 (the kernel asks what the row is now; `maintain` reads its value) | the part, its key, its leaf and the branches over it (bound 28) | the entry before, the keep's, the comparison's 2 (bound 6) |
+| computed | 2,002 (the lookup's 1,001, the run's 1,001) | every key, part and node (over 2,000) | 7 |
+
+Still linear in the table, and owed: the entry before is copied out of the store, the new
+table is written whole, and the kernel compares the names of the entry's 1,001 reads with
+the change set. All three are because a table is one record. **The table of records** (not
+built; it needs a step that can put, which `Reads` does not give): a leaf record holds the
+keys and parts of one subtree of at most 16 entries (`blaze kernel p 2` leaf: count, key
+ends, part ends, keys, parts), under the hash of its bytes; a branch record holds a bitmap
+and, a child, its key and its two digests; the table's value is the root's key and digests.
+Leaves and branches are shared between versions as `trie.rs` shares the session's map
+nodes: an edit writes one leaf and the branches over it, a part read gets the nodes on one
+path (held by the request, as map nodes are), and the comparison walks two roots as it does
+now. The entry's read-list would be a table of the same form, so the reads that may differ
+are found by the change set's names, not by walking the list.
+
 ### (c) What a lookup costs
 
 For an identity with `S` read-lists, the hit in list `j` (lists are searched in order), `r_i`

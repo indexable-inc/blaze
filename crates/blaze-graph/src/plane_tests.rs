@@ -1037,36 +1037,85 @@ fn an_idle_planes_room_has_no_lease() {
     assert!(!plane.turn_wanted());
 }
 
-/// Under a pressure cap the budget is held at the cap: tasks start only within it, none starts
-/// alone past it, a task too big is still judged against the configured budget, and lifting
-/// the cap starts what waited for it.
+/// Under a pressure cap the budget is held at the cap: beside a task granted memory nothing
+/// starts past it, and a task too big is still judged against the configured budget. With
+/// nothing granted the first ready task starts whatever it asks, granted the cap at most (the
+/// liveness invariant of `Plane::pick`: until 2026-11-12 it waited for the pressure to pass,
+/// with nothing running whose end could make room).
 #[test]
-fn under_a_pressure_cap_nothing_starts_past_it() {
+fn under_a_pressure_cap_nothing_starts_past_it_beside_a_granted_task() {
     let config = PlaneConfig { budget: budget(10), starve_after: 100, ..config(1, 4) };
     let mut plane = Plane::new(config).unwrap();
     open(&mut plane, 1, 1, true);
     plane.step(PlaneInput::Held { at_ns: 0, bytes: 4 }).unwrap();
     plane.step(PlaneInput::Cap { at_ns: 0, bytes: Some(6) }).unwrap();
-    // 6 capped, 4 held: 2 free. Nothing granted, yet 3 does not start alone; 2 fits.
+    // 6 capped, 4 held: 2 free. Nothing granted, so 3 starts though 2 are free; its grant is
+    // within the 4 held, so 2 are still free, and 2 fits.
     let out = add(
         &mut plane,
         1,
         vec![node(1, &[], Pool::Work, 100, None, 3), node(2, &[], Pool::Work, 10, None, 2)],
     );
-    assert_eq!(runs(&out), [2]);
-    assert_eq!(plane.short(), 1, "of the 4 held besides, 1 let go makes room for 3");
-    // Released down to 1: 6 capped less 2 granted is 4 free, and 3 starts within the cap.
-    let out = plane.step(PlaneInput::Held { at_ns: 0, bytes: 1 }).unwrap();
-    assert_eq!(runs(&out), [1]);
-    // 8 fits the configured 10, never the cap, and is not refused for it.
+    assert_eq!(runs(&out), [1, 2]);
+    assert_eq!(plane.granted(), 5);
+    // 8 fits the configured 10, never the cap: it is not refused for it, and waits beside
+    // the 5 granted.
     let out = add(&mut plane, 1, vec![node(3, &[], Pool::Work, 1, None, 8)]);
     assert!(runs(&out).is_empty(), "{out:?}");
     assert_eq!(plane.state(NodeId(3)), Some(&NodeState::Ready));
-    built(&mut plane, 1);
-    built(&mut plane, 2);
-    // Nothing granted, 8 over the cap: it waits until the pressure passes.
-    let out = plane.step(PlaneInput::Cap { at_ns: 0, bytes: None }).unwrap();
-    assert_eq!(runs(&out), [3]);
+    assert!(plane.waits_for_memory(NodeId(3)) && !plane.may_start_alone());
+    assert!(runs(&built(&mut plane, 1)).is_empty(), "2 are granted still");
+    // Nothing granted, 8 over the cap: it starts, granted the 6 the cap allows.
+    assert_eq!(runs(&built(&mut plane, 2)), [3]);
+    assert_eq!(plane.granted(), 6);
+    assert!(!plane.waits_for_memory(NodeId(3)));
+}
+
+/// The invariant (`Plane::pick`): with nothing granted a ready task starts in the step that
+/// finds it so, whatever it asks, whatever is held, read or capped. Each case here was a wait
+/// with nothing running before 2026-11-12: a footprint reading that keeps freed memory and
+/// came after no purge, a pressure cap under what is held, and an allowance of nothing.
+#[test]
+fn with_nothing_granted_a_ready_task_starts_whatever_is_read_capped_or_allowed() {
+    // A footprint that keeps 6 of its 9, no purge: 7 of 10 does not fit and starts.
+    let mut plane = Plane::new(PlaneConfig { budget: budget(10), ..config(1, 2) }).unwrap();
+    open(&mut plane, 1, 1, true);
+    plane.step(PlaneInput::Footprint { at_ns: 0, bytes: 9, kept: 6, purged: false }).unwrap();
+    assert_eq!(runs(&add(&mut plane, 1, vec![node(1, &[], Pool::Work, 1, None, 7)])), [1]);
+    assert!(!plane.purge_due(), "nothing is held back, so no purge is asked");
+    // A second one waits beside its grant, a purge is asked for it, and the driver lets that
+    // purge go: the end of the first starts it all the same.
+    assert!(runs(&add(&mut plane, 1, vec![node(2, &[], Pool::Work, 1, None, 7)])).is_empty());
+    assert!(plane.purge_due() && plane.waits_for_memory(NodeId(2)));
+    plane.step(PlaneInput::Footprint { at_ns: 0, bytes: 9, kept: 6, purged: false }).unwrap();
+    assert_eq!(runs(&built(&mut plane, 1)), [2]);
+
+    // A cap of nothing, with 5 held: nothing is free. The first task starts, granted a byte
+    // (a task that asks memory holds a grant while it runs), and the second waits beside it.
+    let two = || vec![node(1, &[], Pool::Work, 2, None, 7), node(2, &[], Pool::Work, 1, None, 7)];
+    let mut plane = Plane::new(PlaneConfig { budget: budget(10), ..config(1, 2) }).unwrap();
+    open(&mut plane, 1, 1, true);
+    plane.step(PlaneInput::Held { at_ns: 0, bytes: 5 }).unwrap();
+    plane.step(PlaneInput::Cap { at_ns: 0, bytes: Some(0) }).unwrap();
+    assert_eq!(runs(&add(&mut plane, 1, two())), [1]);
+    assert_eq!(plane.granted(), 1);
+    assert!(!plane.may_start_alone() && plane.waits_for_memory(NodeId(2)));
+    assert_eq!(runs(&built(&mut plane, 1)), [2]);
+
+    // An allowance of 4 under the 7 asked. Between two turns the room binds (nothing is
+    // charged and a plane with no work leases nothing): the one wait left with nothing
+    // granted, for the turn the plane asks at once, where the task is granted the allowance.
+    let mut plane = Plane::new(PlaneConfig { budget: budget(10), ..config(1, 2) }).unwrap();
+    plane.step(PlaneInput::Allowance { at_ns: 0, bytes: 4 }).unwrap();
+    assert_eq!(plane.room(), 0);
+    open(&mut plane, 1, 1, true);
+    assert!(runs(&add(&mut plane, 1, two())).is_empty(), "the room binds");
+    assert!(plane.turn_wanted(), "a turn is wanted for it at once");
+    assert!(plane.waits_for_memory(NodeId(1)));
+    let out = plane.step(PlaneInput::Allowance { at_ns: 0, bytes: 4 }).unwrap();
+    assert_eq!(runs(&out), [1]);
+    assert_eq!(plane.granted(), 4);
+    assert!(!plane.may_start_alone());
 }
 
 /// A task passed over for memory `starve_after` times holds back every task with memory, of

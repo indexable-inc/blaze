@@ -257,16 +257,18 @@ end's own code): there the ceiling's guard (`serve::ceiling`) is still the bound
 **Forecasts.** A grant is the task's forecast, and on a cold build the forecast knows
 nothing of what a task pulls of the front end: the first task to ask for a dependency's
 bodies, inference and MIR is charged for them (tempo, cold, 2026-11-12: a lowering granted
-0.06 GiB held 7.27, a compile 0.16 held 6.71, a link 0.06 held 4.73). Three rules close it:
+0.06 GiB held 7.27, a compile 0.16 held 6.71, a link 0.06 held 4.73). Two rules answer it:
 a task of a kind never measured is forecast at least an equal share of half the budget for
-each work thread, at most 2 GiB (`Plane::unknown_share`), never 64 MiB; every guess of a
-forecast (from a kind or a size) is multiplied by how far tasks of its kind peaked past
-their base forecasts lately, raised at once by a peak it would not have covered and
-lowered by half its excess only after 64 small peaks in a row
-(`blaze_graph::forecast::Correction`), and a kind none of whose tasks has ended takes every
-kind's ratio; and a task that grows past its grant is charged what it holds from the 10 ms
-look that sees it (`PlaneInput::Realized`), so what no longer fits waits. A task's own
-record, where one was measured, stands uncorrected.
+each work thread, at most 2 GiB (`Plane::unknown_share`), never 64 MiB; and a task that
+grows past its grant is charged what it holds from the 10 ms look that sees it
+(`PlaneInput::Realized`), so what no longer fits waits. A task's own record, where one was
+measured, stands. A third rule, a factor multiplying every guess by how far tasks peaked
+past their forecasts (`forecast::Correction`, 2026-11-11), was deleted the next day: on the
+smoke's cold build it forecast every work task at 66.1 GB where the largest peak of a kind
+was 739 MB, three grants filled the budget of 191 GiB and the build stalled; with the
+factor off the same build granted all 745 admissions. A forecast only decides how many
+tasks run at once (end-state/memory.md 4.3: one predictor, no correction factor); the
+bound on memory is the ceiling.
 
 **MIR is the defect under all of this.** In that build the `mir` tag held 18.9 GiB, all of
 it global heap, and the `query` tag 28.3: values the one running codegen task had asked the

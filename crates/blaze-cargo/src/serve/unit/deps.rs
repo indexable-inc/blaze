@@ -96,48 +96,19 @@ pub(crate) fn ready(job: &Job, waits: &graph::Waits) -> Vec<u32> {
 /// Called with the front end exclusive (no task reads it), in every job, freshly lowered or
 /// kept: once for the units ready when it is lowered, and once per batch of runs and proc
 /// macros applied, with the units they made ready and those a loaded macro reaches.
-///
-/// The invariant: when this returns, no crate at or below a ready unit's crate is awaited
-/// (`hir_def::deps::awaited`), whatever `units` holds. A unit is built once `waits` has it
-/// ready, and its build reads its crate and everything below, so the serve is where a ready
-/// unit's crates are released, and it asks about them itself ([`asked`]) rather than leave
-/// each caller to list them: `waits` is a parameter, so no serve can be written without it.
-/// It then checks what it promised ([`blocked_ready`]): a ready unit still blocked is an
-/// error naming the unit and the crate it waits for, at the write, never a reader's
-/// `Unmaintained` later.
 pub(crate) fn serve(
     lowered: &mut Lowered,
     job: &Job,
-    waits: &graph::Waits,
     units: &[u32],
     session: &mut Session,
     kept: &mut Option<Kept>,
 ) -> Result<(), ApiError> {
     let mode = mode_in(&mut session.env, &job.input.config.invocation.env)?;
     let build = front_end()?;
-    let ready = || {
-        (0..job.graph.len() as u32)
-            .filter(|&unit| waits.ready(unit))
-            .filter_map(|unit| Some((unit, job.crates.krate(unit as usize)?)))
-    };
     // alloc: once per serve, one entry per unit's crate
-    let written: Vec<Crate> =
+    let crates: Vec<Crate> =
         units.iter().filter_map(|&unit| job.crates.krate(unit as usize)).collect();
-    let crates = asked(lowered, &written, ready().map(|(_, krate)| krate));
     let served = images(lowered, &crates, build, session, mode)?;
-    if let Some((unit, krate, awaited)) = blocked_ready(lowered, ready()) {
-        let db = lowered.db();
-        // alloc: an error, once
-        return Err(ApiError::new(
-            format!(
-                "{} is ready to build and its crate `{}` still waits for the records of crate `{}`                  ({awaited:?}) after the serve that asked about every ready unit:                  `hir_def::deps::awaited::release` left a crate awaited below one it was asked about",
-                lowered.what(unit as usize),
-                krate.named(db),
-                awaited.named(db),
-            ),
-            None,
-        ));
-    }
     let Some(served) = served else { return Ok(()) };
     match kept {
         Some(kept) => kept.add(served),
@@ -170,50 +141,6 @@ pub(crate) fn serve(
     Ok(())
 }
 
-/// What a serve asks the store about: `written`, the crates of the units its batch made
-/// ready or reached, and every crate of `ready` (each ready unit's crate) that is blocked
-/// (`hir_def::deps::awaited::blocked`: it or a crate below it is awaited), sorted, each once.
-/// `written` alone when nothing is awaited: one load.
-///
-/// The invariant it gives [`serve`]: a release of what it returns leaves no crate of `ready`
-/// blocked. Asking about `written` alone (the rule until 2026-11-12) leaves blocked every
-/// ready unit the batch did not list; the smoke's edition step on tree 3a3fde543b stopped
-/// nine units with `no maintained resolution for crate libc .. it waits for the records of
-/// crate libc`. Which write left `libc` awaited there is not known (no trace was taken):
-/// this rule does not depend on knowing it.
-pub(crate) fn asked(
-    lowered: &Lowered,
-    written: &[Crate],
-    ready: impl Iterator<Item = Crate>,
-) -> Vec<Crate> {
-    let mut asked = written.to_vec(); // alloc: once per serve
-    if !lowered.any_awaited() {
-        return asked;
-    }
-    let blocked = hir_def::deps::awaited::blocked(lowered.db());
-    asked.extend(ready.filter(|krate| blocked.contains(krate)));
-    asked.sort_unstable();
-    asked.dedup();
-    asked
-}
-
-/// The first of `ready` (each ready unit with its crate) whose crate is blocked, with the
-/// awaited crate that blocks it: what [`serve`] checks it left none of. One load when nothing
-/// is awaited.
-pub(crate) fn blocked_ready(
-    lowered: &Lowered,
-    ready: impl Iterator<Item = (u32, Crate)>,
-) -> Option<(u32, Crate, Crate)> {
-    if !lowered.any_awaited() {
-        return None;
-    }
-    let db = lowered.db();
-    let blocked = hir_def::deps::awaited::blocked(db);
-    ready
-        .filter(|(_, krate)| blocked.contains(krate))
-        .find_map(|(unit, krate)| Some((unit, krate, hir_def::deps::awaited::blocker(db, krate)?)))
-}
-
 /// What a [`serve`] that served images leaves: what this serve wrote (images, lang items, check
 /// outcomes, constants) is no input of a key, so the keys it walked stand at the view it
 /// leaves, and a later serve of those crates there walks nothing ([`images`]). Under debug
@@ -242,14 +169,7 @@ pub(crate) fn images(
     mode: Mode,
 ) -> Result<Option<Served>, ApiError> {
     let at = lowered.db().nonce_and_revision();
-    // While a crate of the front end is awaited (`hir_def::deps::awaited`: added, its records
-    // not asked for yet), every serve releases what it is asked about, whether or not a key
-    // moved: a crate with no key (a workspace member) is only ever released this way.
-    let awaiting = lowered.any_awaited();
     if session.walked.covers(at, build, crates) {
-        if awaiting {
-            release(lowered, crates, build, session, mode)?;
-        }
         return Ok(None);
     }
     // The crates this walk is the first to key at this view, and their dependencies: those
@@ -303,9 +223,6 @@ pub(crate) fn images(
     if moved.is_empty() {
         // `keyed` holds every key walked already.
         session.walked.note(at, build, crates.iter().chain(keys.keys()));
-        if awaiting {
-            release(lowered, crates, build, session, mode)?;
-        }
         return Ok(None);
     }
     moved.sort_unstable();
@@ -315,17 +232,14 @@ pub(crate) fn images(
     let images = &*session.images;
     let trigger = base_db::Trigger::named("the dependencies' images and impl tables served");
     let served = lowered.batch(trigger, |lowered| {
-        // The crates no maintainer was shown before this write.
-        let unseen = hir_def::deps::awaited::blocked(lowered.db());
-        let served = lowered
-            .serve_deps(crates, &moved, build, images, mode)
-            .map_err(super::lower_error)?;
+        let served =
+            lowered.serve_deps(&moved, build, images, mode).map_err(super::lower_error)?;
         let tabled =
             hir_ty::method_resolution::frozen::serve(lowered.served_db(), &served, images, mode)
                 .map_err(|why| ApiError::new(why, None))?;
-        if tabled.iter().any(|it| !unseen.contains(it)) {
-            // A crate the impls maintainer held came to be read from tables, or stopped: it
-            // drops or makes that crate's state in a pass over the whole graph.
+        if !tabled.is_empty() {
+            // A crate came to be read from tables, or stopped: the impls maintainer drops
+            // or makes that crate's state in a pass over the whole graph.
             lowered.served_db().note_crates_changed();
         }
         Ok::<_, ApiError>(served)
@@ -358,28 +272,6 @@ pub(crate) fn images(
         build,
         lookups,
     }))
-}
-
-/// Releases `asked` and what they depend on from the front end's awaited crates with nothing
-/// fetched ([`Lowered::serve_deps`] with no crate to fetch): what a serve that found no key
-/// moved still owes the crates it was asked about. Each released crate gets its first run in
-/// that write; nothing is written, and the view stands, when none of them was awaited.
-fn release(
-    lowered: &mut Lowered,
-    asked: &[Crate],
-    build: ContentId,
-    session: &mut Session,
-    mode: Mode,
-) -> Result<(), ApiError> {
-    let before = lowered.db().nonce_and_revision();
-    lowered.serve_deps(asked, &[], build, &*session.images, mode).map_err(super::lower_error)?;
-    let now = lowered.db().nonce_and_revision();
-    if now != before && session.walked.at == Some((before.0, before.1, build)) {
-        // The release wrote the awaited set alone, which is no input of a key: the keys
-        // walked at the view before it stand at the view it leaves.
-        session.walked.at = Some((now.0, now.1, build));
-    }
-    Ok(())
 }
 
 /// Each crate of `units` that `keyed` has a key of (an eligible dependency), once, with the lint

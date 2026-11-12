@@ -1,0 +1,19 @@
+{
+ "id": "admit-live-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane admit-live",
+ "where": "crates/blaze-graph/src/forecast.rs (`Correction`, deleted), crates/blaze-cargo/src/serve/plane.rs (`Plane::admit`)",
+ "what": "On head 0070301423 every work task of the smoke's cold build from +3.4 s was granted 66,125,919,662 bytes (peaks: Codegen 739 MB, Nameres 231 MB): three tasks filled the 191 GiB budget, the build ran 2-3 tasks at a time on 128 threads and then stalled with 22 Ready tasks never granted. With `corrected` returning its base (variant 18e8331c4e) the same build granted all 745 admissions and did not stall.",
+ "cost": "stalled cold builds on the build VM and two lanes",
+ "cause": "a factor multiplying every guessed forecast by the largest peak/forecast ratio any task showed (raised at once, lowered only after 64 small peaks), shared across kinds until a kind's own task ended; written 2026-11-11 in a cut that was never compiled or run on a real build. 66,125,919,662 / 813,473,044 (the unknown share) is 81.3: read from the numbers, which task taught that ratio was not measured.",
+ "whys": [
+  "why wrong: a ratio learned on one task's small base was applied to every task's base, of every kind",
+  "why possible: the forecast had three predictors layered, each covering the gap of the one below",
+  "why not caught: its tests checked the factor's own arithmetic, never what a build admits under it",
+  "why written: a cold build granted a lowering 0.06 GiB that held 7.27; the answer to a low forecast was made a bigger forecast, where the bound on memory is the ceiling",
+  "property: a safety margin built into a throughput estimate"
+ ],
+ "class": "an estimate asked to enforce a bound (rule 66: a mechanism covering the previous one's gap)",
+ "prevention": "deleted whole (type, state in the plane and its batches, callers, tests, docs); `Plane::admit`'s doc says why nothing multiplies a forecast; the end state (docs/v2/plan/design/end-state/memory.md 4.3) is one predictor with no correction factor",
+ "state": "written on int-1112, not compiled or run by the lane"
+}

@@ -1067,6 +1067,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-front-items"
+version = "0.0.0"
+dependencies = [
+ "blaze-bytes",
+ "blaze-cas",
+ "blaze-ids",
+ "blaze-kernel",
+ "hegeltest",
+ "hir-expand",
+ "span",
+ "syntax",
+]
+
+[[package]]
 name = "blaze-fuzz"
 version = "0.0.0"
 dependencies = [

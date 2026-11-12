@@ -145,7 +145,7 @@ pub fn key(filed: ContentId) -> ContentId {
 /// Gives `db` the impl tables `images` keeps of each crate `served` keyed that is read from
 /// its image in [`Mode::Serve`], and takes away those of a crate `served` keyed that is not
 /// (its image went, or its tables were never written): called in the write of the serve
-/// (`hir_def::deps::serve_asked`), so the pass of that write finds each crate with tables
+/// (`hir_def::deps::serve`), so the pass of that write finds each crate with tables
 /// served and the impls maintainer never keys an impl of it. A crate `served` did not key is
 /// left as it is. Gives the crates whose tables came or went, sorted; nothing is written for
 /// none. The caller notes a change of the crate graph when one of them was maintained before

@@ -1,8 +1,9 @@
 //! The recording context: a step's only door to the world.
 
 use crate::entry::{name_kind, named};
-use crate::nest::{Asks, step_seen};
-use crate::{Ask, Fact, KernelError, Read, ReadKind, Seen, StepError, World, WorldError};
+use crate::nest::{Asks, Parted, step_seen};
+use crate::table::Which;
+use crate::{Ask, Fact, KernelError, Read, ReadKind, Seen, StepError, World, WorldError, hex};
 
 /// What a step reads the world through. It records each read: the read's kind, its key's
 /// bytes, and the hash the read saw. It never hands out the world itself.
@@ -18,6 +19,11 @@ pub struct Reads<'w, W: ?Sized> {
     /// Whom it asks for another step's value: the kernel's engine. None for a context made
     /// with no kernel behind it, where [`Reads::step`] is refused.
     asks: Option<&'w mut (dyn Asks + 'w)>,
+    /// How many of `reads`, from the first, are the reads of the run before, in the order of
+    /// their names: none but in a maintained run ([`Reads::maintaining`]).
+    before: usize,
+    /// The places in `reads` of the reads the run forgot ([`Reads::forget`]).
+    forgot: Vec<usize>,
 }
 
 /// Why a run keeps nothing.
@@ -75,7 +81,7 @@ pub(crate) enum Unfinished {
 fn the_kernels(read: Read<'_>) -> WorldError {
     WorldError::new(
         read,
-        "kind 65535 is the kernel's (a step's value): ask for a step with `Reads::step`",
+        "kinds 65532 to 65535 are the kernel's (a step's value, a part of it, its keys): ask with `Reads::step`, `Reads::part` or `Reads::keys`",
     )
 }
 
@@ -88,13 +94,89 @@ impl<'w, W: World + ?Sized> Reads<'w, W> {
     /// A context with no kernel behind it: its step can read the world and ask for no step.
     pub(crate) fn new(world: &'w W) -> Reads<'w, W> {
         // alloc: one step's run, freed once it is kept; empty until it reads
-        Reads { world, names: Vec::new(), reads: Vec::new(), failed: None, asks: None }
+        Reads {
+            world,
+            names: Vec::new(),
+            reads: Vec::new(),
+            failed: None,
+            asks: None,
+            before: 0,
+            forgot: Vec::new(),
+        }
     }
 
     /// The context of a run the kernel makes: `asks` answers [`Reads::step`].
     pub(crate) fn asking(world: &'w W, asks: &'w mut (dyn Asks + 'w)) -> Reads<'w, W> {
         // alloc: one step's run, freed once it is kept; empty until it reads
-        Reads { world, names: Vec::new(), reads: Vec::new(), failed: None, asks: Some(asks) }
+        Reads {
+            world,
+            names: Vec::new(),
+            reads: Vec::new(),
+            failed: None,
+            asks: Some(asks),
+            before: 0,
+            forgot: Vec::new(),
+        }
+    }
+
+    /// The context of a maintained run ([`crate::Maintain`]): it starts with `reads`, the
+    /// reads of the run before in the order of their names, each with what it is now. None
+    /// is valued here: a read the run does not touch is in its trace as it is given.
+    pub(crate) fn maintaining<'r>(
+        world: &'w W,
+        asks: &'w mut (dyn Asks + 'w),
+        reads: impl Iterator<Item = (Read<'r>, Seen)>,
+    ) -> Reads<'w, W> {
+        let mut it = Reads::asking(world, asks);
+        for (read, seen) in reads {
+            let start = it.names.len();
+            // alloc: one step's run, the names of the reads of the run before
+            name_kind(read.kind, &mut it.names);
+            it.names.extend_from_slice(read.key);
+            it.reads.push(Recorded { start, end: it.names.len(), seen });
+        }
+        it.before = it.reads.len();
+        it
+    }
+
+    /// Forgets `F` of `key`: a read the run before made that `compute` would not make now (a
+    /// fact of a key that went). Only a maintained run has reads to forget; a read made
+    /// after this is recorded as any.
+    #[blaze::pure(trusted = "the kernel takes the read out of this run's record, and nothing else changes")]
+    pub fn forget<F: Fact<W>>(&mut self, key: &F::Key) {
+        let start = self.names.len();
+        name_kind(F::KIND, &mut self.names);
+        F::key(key, &mut self.names);
+        self.forget_from(start);
+    }
+
+    /// Forgets `read`, of any kind, as [`Reads::forget`] does: a read of a step's value, of
+    /// a part or of a key set is named as its entry's read-list names it.
+    #[blaze::pure(trusted = "the kernel takes the read out of this run's record, and nothing else changes")]
+    pub fn forget_read(&mut self, read: Read<'_>) {
+        let start = self.names.len();
+        name_kind(read.kind, &mut self.names);
+        self.names.extend_from_slice(read.key);
+        self.forget_from(start);
+    }
+
+    /// Forgets the reads named as the name written from `start` of `names`, and takes that
+    /// name out again: a binary search of the reads of the run before, and the few this run
+    /// made.
+    fn forget_from(&mut self, start: usize) {
+        let (names, name) = self.names.split_at(start);
+        let named = |it: &Recorded| &names[it.start..it.end];
+        if let Ok(at) = self.reads[..self.before].binary_search_by(|it| named(it).cmp(name)) {
+            // alloc: one maintained run's forgotten reads
+            self.forgot.push(at);
+        }
+        for at in self.before..self.reads.len() {
+            if named(&self.reads[at]) == name {
+                // alloc: one maintained run's forgotten reads
+                self.forgot.push(at);
+            }
+        }
+        self.names.truncate(start);
     }
 
     /// The value of `S` of `input` now, recorded as one read: its kind is
@@ -151,13 +233,108 @@ impl<'w, W: World + ?Sized> Reads<'w, W> {
         Ok(asked.value.expect("a step that asks is given the value's bytes"))
     }
 
+    /// The part of `key` in the value of `S` of `input`, which is a table ([`Ask::TABLE`]):
+    /// none where the table has no such key. Recorded as one read of kind
+    /// [`ReadKind::PART`], named by the step, its input and `key`, which saw the digest of
+    /// the part's own bytes, or [`Seen::Gone`] for a key that is absent. So this run's entry
+    /// stays a hit while that one part is the same bytes (or stays absent), whatever else of
+    /// the table changes, and a key that appears where this run saw none reaches it.
+    ///
+    /// The table is read in place, in the store: what is copied is the part's bytes, once,
+    /// for the step that asked.
+    #[blaze::pure(trusted = "the kernel records the step, the key asked for and the digest of the part it gave")]
+    pub fn part<S: Ask<World = W>>(
+        &mut self,
+        input: &S::Input,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, StepError> {
+        Ok(self.parted::<S>(input, Which::Part(key))?.part)
+    }
+
+    /// The keys of the value of `S` of `input`, which is a table, in the order of their
+    /// bytes. Recorded as one read of kind [`ReadKind::KEYS`], which saw the digest of the
+    /// key set: for a step that depends on which keys there are (a glob), and reruns when one
+    /// comes or goes and not when a part changes.
+    #[blaze::pure(trusted = "the kernel records the step asked for and the digest of the key set it gave")]
+    pub fn keys<S: Ask<World = W>>(&mut self, input: &S::Input) -> Result<Vec<Vec<u8>>, StepError> {
+        Ok(self.parted::<S>(input, Which::Keys)?.keys)
+    }
+
+    fn parted<S: Ask<World = W>>(
+        &mut self,
+        input: &S::Input,
+        which: Which<'_>,
+    ) -> Result<Parted, StepError> {
+        if let Some(failed) = &self.failed {
+            return Err(failed.as_step());
+        }
+        let start = self.names.len();
+        let part = match which {
+            Which::Part(part) => Some(part),
+            Which::Keys | Which::Whole => None,
+        };
+        name_kind(if part.is_some() { ReadKind::PART } else { ReadKind::KEYS }, &mut self.names);
+        let len_at = self.names.len();
+        if part.is_some() {
+            // alloc: the run's buffer of names; the length of the step's key, written below
+            self.names.extend_from_slice(&[0, 0]);
+        }
+        let key = self.names.len();
+        // alloc: the run's buffer of names
+        self.names.extend_from_slice(&S::ID.0.to_be_bytes());
+        S::key(input, &mut self.names);
+        let asked = match (self.asks.as_deref_mut(), u16::try_from(self.names.len() - key)) {
+            (None, _) => Err(KernelError::Unasked { step: S::ID, name: Some(S::NAME) }),
+            (Some(_), Err(_)) => Err(KernelError::Input {
+                step: S::NAME,
+                key: hex(&self.names[key..]),
+                // alloc: an error
+                why: "its key is longer than 65535 bytes, the most a read of a part names its step by"
+                    .to_owned(),
+            }),
+            (Some(asks), Ok(len)) => {
+                if part.is_some() {
+                    self.names[len_at..key].copy_from_slice(&len.to_be_bytes());
+                }
+                asks.parted(&self.names[key..], which)
+            }
+        };
+        let asked = match asked {
+            Ok(asked) => asked,
+            Err(error) => {
+                let error = Box::new(error); // alloc: an error
+                // alloc: an error
+                let key = self.names[key..].to_vec();
+                self.names.truncate(start);
+                // clone: an error, kept so that the run keeps nothing
+                self.failed = Some(Failed::Asked { key, error: error.clone() });
+                return Err(StepError::Asked(error));
+            }
+        };
+        #[cfg(test)]
+        {
+            if asked.seen == Seen::Gone
+                && crate::nest::planted::is(crate::nest::planted::Bug::AbsenceUnposted)
+            {
+                self.names.truncate(start);
+                return Ok(asked);
+            }
+        }
+        if let Some(part) = part {
+            // alloc: the run's buffer of names
+            self.names.extend_from_slice(part);
+        }
+        self.reads.push(Recorded { start, end: self.names.len(), seen: asked.seen });
+        Ok(asked)
+    }
+
     /// `F` of `key`, recorded.
     #[blaze::pure(trusted = "the kernel records every read: its kind, its key and the hash it saw")]
     pub fn get<F: Fact<W>>(&mut self, key: &F::Key) -> Result<F::Value<'w>, WorldError> {
         if let Some(failed) = &self.failed {
             return Err(failed.as_world());
         }
-        if F::KIND == ReadKind::STEP {
+        if F::KIND.is_kernels() {
             return self.fail(the_kernels(Read { kind: F::KIND, key: &[] }));
         }
         let start = self.names.len();
@@ -181,7 +358,7 @@ impl<'w, W: World + ?Sized> Reads<'w, W> {
         if let Some(failed) = &self.failed {
             return Err(failed.as_world());
         }
-        if read.kind == ReadKind::STEP {
+        if read.kind.is_kernels() {
             return self.fail(the_kernels(read));
         }
         match self.world.hash(read) {
@@ -214,11 +391,18 @@ impl<'w, W: World + ?Sized> Reads<'w, W> {
     /// Its reads sorted by kind and key, each once. A read that failed, or one that saw two
     /// hashes, makes no trace.
     pub(crate) fn finish(self) -> Result<Trace, Unfinished> {
-        let Reads { names, mut reads, failed, .. } = self;
+        let Reads { names, mut reads, failed, mut forgot, .. } = self;
         match failed {
             Some(Failed::World(error)) => return Err(Unfinished::Failed(error)),
             Some(Failed::Asked { error, .. }) => return Err(Unfinished::Asked(error)),
             None => {}
+        }
+        // From the last place down, so the read moved into a place taken out is one that
+        // stays.
+        forgot.sort_unstable();
+        forgot.dedup();
+        for at in forgot.into_iter().rev() {
+            reads.swap_remove(at);
         }
         // A name's bytes order as its kind, then its key: the kind is written big-endian.
         reads.sort_by(|a, b| names[a.start..a.end].cmp(&names[b.start..b.end]));
