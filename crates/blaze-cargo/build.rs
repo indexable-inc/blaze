@@ -41,10 +41,28 @@ fn linux_interpose() {
     // `dladdr` itself (glibc 2.34 and later, musl), which `-z defs` proves at link time, and
     // with `libdl` only where that link fails (an older glibc, whose loader finds `libdl.so.2`
     // in its default directories).
+    // Measured on the NixOS VM, 2026-11-12 (gcc 16.2 under nixpkgs' wrapper): the wrapper's
+    // linker writes the directory of every `.so` path among its arguments that exists, and the
+    // output of `-o` is one of them once a build before this one has made it: so the first
+    // build of a target directory wrote no build directory and every rebuild of the C file
+    // wrote `OUT_DIR`. The output is removed before each link. The wrapper reads its switch
+    // under the name salted with the target (`NIX_DONT_SET_RPATH_aarch64_unknown_linux_gnu`;
+    // the unsalted name and `_FOR_TARGET` changed nothing there), so all three are set.
+    let salted = format!(
+        "NIX_DONT_SET_RPATH_{}",
+        std::env::var("TARGET").unwrap_or_else(|_| panic!("cargo sets TARGET for a build script")).replace(['-', '.'], "_")
+    );
     let link = |libdl: bool| {
+        match std::fs::remove_file(&out) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("removing {} before linking it again: {error}", out.display()),
+        }
         let mut command = std::process::Command::new(&cc);
         command
             .env("NIX_DONT_SET_RPATH", "1")
+            .env("NIX_DONT_SET_RPATH_FOR_TARGET", "1")
+            .env(&salted, "1")
             .args(["-shared", "-fPIC", "-O2", "-Wall", "-Wl,-z,defs"])
             .arg("-o")
             .arg(&out)
