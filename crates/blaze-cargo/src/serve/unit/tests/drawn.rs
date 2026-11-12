@@ -15,7 +15,7 @@
 use blaze_api::{Diagnostic, Level};
 use blaze_diagnostics::Diag;
 
-use super::{SCRIPT, compile, script_front};
+use super::{SCRIPT, ScriptFront, compile, script_front};
 use crate::serve::unit::{
     drawn::{self, Drawing, Item, Said},
     reads,
@@ -58,8 +58,8 @@ fn span(of: &str) -> blaze_diagnostics::Span {
     }
 }
 
-/// What the unit's compile says: a warning far along the long line, with a label near the
-/// line's start, a note and a suggestion; an error with a code; a line of blaze's own; and
+/// What the unit's compile says: a warning far along the long line, with a label just before
+/// it, a note and a suggestion; an error with a code; a line of blaze's own; and
 /// the refusal of twenty functions.
 fn compiled() -> Said {
     let mut warning = Diag::error(
@@ -68,7 +68,7 @@ fn compiled() -> Said {
         span("unused_at_the_far_end"),
     );
     warning.level = blaze_diagnostics::model::Level::Warning;
-    warning.span.labels.push((span("let first = 1;"), "the line starts here".to_owned()));
+    warning.span.labels.push((span("let eleventh = 11;"), "the one before it".to_owned()));
     warning.note("`#[warn(unused_variables)]` on by default");
     warning.suggestions.push(blaze_diagnostics::model::Suggestion {
         message: "if this is intentional, prefix it with an underscore".to_owned(),
@@ -108,15 +108,42 @@ struct Store {
     executed: usize,
 }
 
+/// The project as each build lowers it, kept by what its record's key was made with (the
+/// width planted in it, when one is): a build of the same sources lowers the same front, so
+/// these tests lower it once for each.
+#[derive(Default)]
+struct Fronts(Vec<(Option<Option<u32>>, ScriptFront)>);
+
+impl Fronts {
+    /// The front of a build whose client is shown `drawing`, its record's key made with the
+    /// client's width when `planted` (the bug: the width is an input of the key, as it was).
+    fn of(&mut self, drawing: Drawing, planted: bool) -> &ScriptFront {
+        let with = planted.then_some(drawing.width);
+        let at = match self.0.iter().position(|it| it.0 == with) {
+            Some(at) => at,
+            None => {
+                compile::PLANTED_WIDTH.set(with);
+                let front = script_front(SCRIPT, true, &[("FOO", "on")]);
+                compile::PLANTED_WIDTH.set(None);
+                self.0.push((with, front));
+                self.0.len() - 1
+            }
+        };
+        &self.0[at].1
+    }
+}
+
 /// One build of the project for a client shown diagnostics as `drawing` says: the unit's
 /// record looked for under its key and, when the store has none, its compile run and its
 /// record kept; then what it said drawn for the client from the record. Whether its compile
 /// ran, and what the client is shown.
-fn build(store: &mut Store, drawing: Drawing, planted: bool) -> (bool, Vec<Diagnostic>) {
-    // The planted bug: the client's width is an input of the key, as it was.
-    compile::PLANTED_WIDTH.set(planted.then_some(drawing.width));
-    let front = script_front(SCRIPT, true, &[("FOO", "on")]);
-    compile::PLANTED_WIDTH.set(None);
+fn build(
+    fronts: &mut Fronts,
+    store: &mut Store,
+    drawing: Drawing,
+    planted: bool,
+) -> (bool, Vec<Diagnostic>) {
+    let front = fronts.of(drawing, planted);
     let env = reads::tests::env(&[("FOO", "on")]);
     let found = store.filed.find(front.base, &env).map(|it| it.key);
     let (ran, key) = match found {
@@ -166,20 +193,21 @@ fn drawings() -> Vec<Drawing> {
 /// bytes whoever it was built for. The first failure, by the pair.
 fn held(planted: bool) -> Result<(), String> {
     let all = drawings();
+    let mut fronts = Fronts::default();
     let mut records: Vec<Vec<u8>> = Vec::new();
     for first in &all {
         for second in &all {
             let mut store = Store::default();
-            let (ran, _) = build(&mut store, *first, planted);
+            let (ran, _) = build(&mut fronts, &mut store, *first, planted);
             assert!(ran, "a store with no record of it: the unit is compiled");
             records.extend(store.filed.0.values().filter(|it| it.starts_with(compile::header::MAGIC)).cloned());
-            let (ran, shown) = build(&mut store, *second, planted);
+            let (ran, shown) = build(&mut fronts, &mut store, *second, planted);
             if ran || store.executed != 1 {
                 return Err(format!(
                     "a build for {second:?} after one for {first:?} compiled the unit again"
                 ));
             }
-            let (_, fresh) = build(&mut Store::default(), *second, planted);
+            let (_, fresh) = build(&mut fronts, &mut Store::default(), *second, planted);
             if shown != fresh {
                 return Err(format!(
                     "a build for {second:?} after one for {first:?} shows\n{}\nwhere a build from nothing shows\n{}",
@@ -222,7 +250,9 @@ fn the_oracle_catches_the_width_put_back_in_the_key() {
 /// twenty refused functions are named unless every one is asked for.
 #[test]
 fn each_client_is_shown_the_record_drawn_its_own_way() {
-    let shown = |drawing: Drawing| text(&build(&mut Store::default(), drawing, false).1);
+    let mut fronts = Fronts::default();
+    let mut shown =
+        |drawing: Drawing| text(&build(&mut fronts, &mut Store::default(), drawing, false).1);
     let plain = Drawing { color: false, short: false, width: Some(80), refused: Some(16) };
     let narrow = shown(plain);
     let wide = shown(Drawing { width: Some(200), ..plain });
@@ -280,7 +310,8 @@ fn a_record_of_the_layout_before_is_refused_and_never_read_as_empty() {
         made: &'a compile::Made,
         placed: Option<&'a compile::Placed>,
     }
-    let drawn_once = build(&mut Store::default(), Drawing::default(), false).1;
+    let drawn_once =
+        build(&mut Fronts::default(), &mut Store::default(), Drawing::default(), false).1;
     let old = Layout11 {
         ok: false,
         open: false,
