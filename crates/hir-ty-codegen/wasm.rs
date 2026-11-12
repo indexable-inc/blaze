@@ -592,7 +592,12 @@ impl Held {
 /// lowered whole before the next ([`Lower::inst`]), a block's code runs from its first
 /// instruction to its last with no other block's between, and a value is written before it
 /// is read. A block's parameter, and a value another block reads, keep a local of their own:
-/// `own`.
+/// `own`. Such a local is new, never one given back ([`Lower::fresh`]): blocks are lowered in
+/// layout order, which is not the order they run in, so a local a block's value gave back
+/// while that block was lowered is written again each time the block runs, which may be
+/// after a value of another block was written and before it is read (a block laid out before
+/// one that dominates it, which MIR's block order has; rustversion's macros read a capacity
+/// that a later value of the block had overwritten).
 struct Lives {
     own: SecondaryMap<Value, bool>,
     /// The last instruction that reads the value, or the one that defines it when none does.
@@ -631,6 +636,21 @@ impl Lives {
 thread_local! {
     /// The bug a test planted: no local is given back, as before values shared them.
     static KEEPS_EVERY_LOCAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: a value another block reads takes a local given back.
+    static OWN_TAKES_FREED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the test on this thread planted [`OWN_TAKES_FREED`]; never outside a test.
+fn own_takes_freed() -> bool {
+    #[cfg(test)]
+    let planted = OWN_TAKES_FREED.get();
+    #[cfg(not(test))]
+    let planted = false;
+    planted
 }
 
 /// Whether the test on this thread planted [`KEEPS_EVERY_LOCAL`]; never outside a test.
@@ -891,11 +911,19 @@ impl<'a> Lower<'a> {
     }
 
     /// A local of `held` nothing holds: one given back, or a new one. The first of the two
-    /// of a [`Held::Pair`].
+    /// of a [`Held::Pair`]. Only for what one run of one block holds from its first write to
+    /// its last read (a value no other block reads, an instruction's temporary): see
+    /// [`Lives`].
     fn take(&mut self, held: Held) -> u32 {
         if let Some(local) = self.free[held as usize].pop() {
             return local;
         }
+        self.fresh(held)
+    }
+
+    /// A new local of `held`, which nothing held before: what is read across blocks (a
+    /// block's parameter, a value another block reads, the frame, the next block).
+    fn fresh(&mut self, held: Held) -> u32 {
         self.locals.push(held.wasm());
         let local = self.param_count + self.locals.len() as u32 - 1;
         if held == Held::Pair {
@@ -912,10 +940,11 @@ impl<'a> Lower<'a> {
     /// A local of `held` for the instruction being lowered, given back when it ends
     /// ([`Self::release`]); the function's own when none is.
     fn temp(&mut self, held: Held) -> u32 {
-        let local = self.take(held);
-        if self.in_inst {
-            self.taken.push((local, held));
+        if !self.in_inst {
+            return self.fresh(held);
         }
+        let local = self.take(held);
+        self.taken.push((local, held));
         local
     }
 
@@ -971,8 +1000,12 @@ impl<'a> Lower<'a> {
             }
             at => return Ok(at - 1),
         }
-        let class = self.class(value)?;
-        let local = self.take(Held::of(class));
+        let held = Held::of(self.class(value)?);
+        let local = if self.lives.own[value] && !own_takes_freed() {
+            self.fresh(held)
+        } else {
+            self.take(held)
+        };
         self.values[value] = local + 1;
         Ok(local)
     }
@@ -3149,6 +3182,78 @@ mod tests {
         b.seal_all_blocks();
         b.finalize();
         func
+    }
+
+    /// `fn(i32) -> i32`, `n * n + n + n * 3`, whose block that runs last is laid out before
+    /// the block that runs before it: `entry` jumps to `first`, which computes `x = n * 3`
+    /// and jumps back to `last`, which computes `n * n + n` through values only it reads and
+    /// then reads `x`.
+    fn laid_out_against_the_order_it_runs_in() -> Function {
+        let mut signature = Signature::new(CallConv::SystemV);
+        signature.params.push(ir::AbiParam::new(types::I32));
+        signature.returns.push(ir::AbiParam::new(types::I32));
+        let mut func = Function::with_name_signature(UserFuncName::default(), signature);
+        let mut context = FunctionBuilderContext::new();
+        let mut b = FunctionBuilder::new(&mut func, &mut context);
+        let (entry, last, first) = (b.create_block(), b.create_block(), b.create_block());
+        let x = b.declare_var(types::I32);
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        let n = b.block_params(entry)[0];
+        b.ins().jump(first, &[]);
+        // The layout is the order blocks are switched to: `last` before `first`.
+        b.switch_to_block(last);
+        let square = b.ins().imul(n, n);
+        let sum = b.ins().iadd(square, n);
+        let read = b.use_var(x);
+        let out = b.ins().iadd(sum, read);
+        b.ins().return_(&[out]);
+        b.switch_to_block(first);
+        let three = b.ins().iconst(types::I32, 3);
+        let tripled = b.ins().imul(n, three);
+        b.def_var(x, tripled);
+        b.ins().jump(last, &[]);
+        b.seal_all_blocks();
+        b.finalize();
+        assert_eq!(func.layout.blocks().collect::<Vec<_>>(), [entry, last, first]);
+        // `last` reads the value `first` made, not a parameter of its own.
+        assert!(func.dfg.block_params(last).is_empty());
+        func
+    }
+
+    fn runs_laid_out_against_the_order(n: i32) -> i32 {
+        let (lowered, _) =
+            lower(&laid_out_against_the_order_it_runs_in(), Address::Bits32).expect("lowers");
+        let engine = wasmtime::Engine::default();
+        let module = wasmtime::Module::new(&engine, module_of(&lowered)).expect("the engine takes it");
+        let mut store = wasmtime::Store::new(&engine, ());
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("instantiates");
+        let f = instance.get_typed_func::<i32, i32>(&mut store, "f").expect("`f`");
+        f.call(&mut store, n).expect("runs")
+    }
+
+    /// The invariant: a value another block reads holds what its block wrote until it is
+    /// read, whatever order the blocks are laid out in: its local is its own, never one a
+    /// value of the reading block gave back while that block, laid out earlier, was lowered.
+    /// rustversion's attribute macros (`#[rustversion::since(1.81)]`, in rapidhash and
+    /// thread-priority, which tempo builds) trapped in their module on a capacity read back
+    /// as another value.
+    #[test]
+    fn a_value_read_by_a_block_laid_out_before_its_own_is_what_its_block_wrote() {
+        for n in [0i32, 1, 2, 7, -5, 46_341, i32::MAX] {
+            let model = n.wrapping_mul(n).wrapping_add(n).wrapping_add(n.wrapping_mul(3));
+            assert_eq!(runs_laid_out_against_the_order(n), model, "f({n})");
+        }
+    }
+
+    /// The control of the invariant above: when a value another block reads takes a local
+    /// given back, the function reads what the reading block wrote over it.
+    #[test]
+    fn the_oracle_catches_a_value_read_across_blocks_in_a_local_given_back() {
+        OWN_TAKES_FREED.set(true);
+        let got = runs_laid_out_against_the_order(7);
+        OWN_TAKES_FREED.set(false);
+        assert_ne!(got, 7 * 7 + 7 + 7 * 3);
     }
 
     /// How many locals the body declares after its parameters.
