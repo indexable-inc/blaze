@@ -156,8 +156,8 @@ the tests catch them, and each one made the tests fail:
 ## Limits: why not 500×
 
 - **blaze could not run end to end here.** Its runtime needs Linux 7.3+ (the io_uring-based
-  wait ring in `blaze-core`, by design with no fallback). Building `blaze-engine` itself also
-  needs the pinned static LLVM and more memory than this box had free. So the README's
+  wait ring in `blaze-core`, by design with no fallback). Building `blaze-engine` itself was not
+  attempted: it links the pinned static LLVM, and the box had about 3.7 GB of memory free. So the README's
   edit-then-build numbers (ripgrep 56 ms, helix 116 ms, bun 451 ms) were not reproduced, and
   this branch makes **no claim** about them.
 - **Dedupe is one stage of a build.** How much of an edit's time it takes depends on the
