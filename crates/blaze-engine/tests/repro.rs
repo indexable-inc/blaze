@@ -1024,7 +1024,8 @@ fn a_package_not_on_the_latest_blaze_edition_is_told_once() {
     case.write("Cargo.toml", &with("deny"));
     let out = case.blaze_in("", &["check"]);
     assert!(!out.ok, "the denied lint did not fail the check:\n{}", out.stderr);
-    assert!(out.stderr.contains("blaze::not_latest_edition") && out.stderr.contains(TOLD), "{}", out.stderr);
+    // The level's note names the lint as the command line spells it, with dashes.
+    assert!(out.stderr.contains("-D blaze::not-latest-edition") && out.stderr.contains(TOLD), "{}", out.stderr);
     // The same workspace on the blaze edition, the lint still denied: nothing to tell.
     let denied = "\n[workspace.metadata.blaze.lints]\nnot_latest_edition = \"deny\"\n";
     case.write("Cargo.toml", &format!("{}{denied}", edition_program("blaze-2026.11", "")));
