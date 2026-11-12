@@ -145,8 +145,8 @@ mod unix {
         if let Some(why) = route::env(std::env::vars_os().map(|(name, _)| name)) {
             return Err(why.to_string());
         }
-        let home = pin::home(|name| std::env::var_os(name), blaze_core::home::record)
-            .map_err(|why| format!("no BLAZE_HOME says where blaze's home is, and {why}"))?;
+        let home = pin::home(|name| std::env::var_os(name))
+            .ok_or("no BLAZE_HOME or HOME says where blaze's home is")?;
         // As the launcher reads it, unresolved: the kept lookup is named by it.
         let cwd = std::env::current_dir().map_err(|error| format!("the current directory: {error}"))?;
         let found = pin::here(&home, &cwd, VERSION).map_err(|unsure| match unsure {
@@ -200,7 +200,33 @@ mod unix {
         };
         let request = request::request(&asked, sent);
 
-        let homes = Homes::of(None, |name| std::env::var_os(name), blaze_core::home::record)?;
+        // What an answer shows is the screen's (docs/terminal.md), as the engine shows it: what
+        // stderr is, said once before the daemon is talked to.
+        let mut detected =
+            blaze_report::terminal::detect(&config, var, terminal, width.map(|it| it as u16));
+        detected.caps.color = color;
+        let caps = match (blaze_screen::live(var, terminal), place::stderr_size()) {
+            (true, Some((cols, rows))) => {
+                blaze_screen::Caps { live: true, cols, rows, unicode: blaze_screen::unicode(var) }
+            }
+            _ => blaze_screen::Caps::PIPE,
+        };
+        blaze_thin::answer::show_with(blaze_thin::answer::Shown {
+            options: blaze_screen::Options {
+                cwd: place.cwd.to_str().map(str::to_owned),
+                home: var("HOME"),
+                quiet: asked.quiet,
+                ..blaze_screen::Options::of(match asked.command {
+                    blaze_thin::route::Command::Build => blaze_screen::Command::Build,
+                    blaze_thin::route::Command::Run => blaze_screen::Command::Run,
+                })
+            },
+            caps,
+            terminal: detected,
+            size: blaze_thin::answer::on_disk,
+        });
+
+        let homes = Homes::of(None, |name| std::env::var_os(name))?;
         let engine = Engine::beside()?;
         // No daemon: the engine starts one, saying so, as it always has.
         let stream = UnixStream::connect(&homes.socket)

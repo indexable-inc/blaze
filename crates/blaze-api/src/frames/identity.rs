@@ -853,7 +853,7 @@ impl Gen {
     }
 
     fn report_text(&mut self) -> crate::Text {
-        crate::Text(self.many(1, |g| match g.below(9) {
+        crate::Text(self.many(1, |g| match g.below(11) {
             0 => crate::ReportSpan::Plain(g.text()),
             1 => crate::ReportSpan::Code(g.text()),
             2 => crate::ReportSpan::Path(g.text()),
@@ -862,7 +862,9 @@ impl Gen {
             5 => crate::ReportSpan::Hash(g.text()),
             6 => crate::ReportSpan::Var(g.text()),
             7 => crate::ReportSpan::Count(g.wide()),
-            _ => crate::ReportSpan::Took(g.wide()),
+            8 => crate::ReportSpan::Took(g.wide()),
+            9 => crate::ReportSpan::Command(g.text()),
+            _ => crate::ReportSpan::Strong(g.text()),
         }))
     }
 

@@ -22,8 +22,19 @@ const DIM: &str = "\x1b[2m";
 const ERROR: &str = "\x1b[1m\x1b[91m";
 const WARN: &str = "\x1b[1m\x1b[93m";
 const NOTE: &str = "\x1b[1m\x1b[92m";
-/// A code span: red-ish text on a dim background, as a notebook shows inline code.
-const CODE: &str = "\x1b[38;5;203m\x1b[48;5;236m";
+/// A code span and a command, as the palette gives them to a terminal of 16 colours: a
+/// report's renderer is told only whether there is colour ([`Caps`]), so it takes the values
+/// every terminal has.
+const CODE: &str = "\x1b[1m";
+const COMMAND: &str = "\x1b[1;4m";
+
+/// `text` as one line for `caps`, its paths shown from `roots`: a message outside a report's
+/// box.
+pub fn text_into(out: &mut String, text: &crate::Text, caps: Caps, roots: &Roots<'_>) {
+    for span in &text.0 {
+        piece(out, span, caps, roots);
+    }
+}
 
 /// What the terminal a report is rendered for can do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -305,6 +316,15 @@ fn piece(out: &mut String, span: &Span, caps: Caps, roots: &Roots<'_>) {
             let cut = hash.char_indices().nth(8).map_or(hash.len(), |(at, _)| at);
             painted(out, caps, DIM, &hash[..cut]);
         }
+        Span::Command(command) => match caps.color {
+            true => painted(out, caps, COMMAND, command),
+            false => {
+                out.push('`');
+                out.push_str(command);
+                out.push('`');
+            }
+        },
+        Span::Strong(words) => painted(out, caps, BOLD, words),
         Span::Count(count) => styled(out, caps, DIM, |out| crate::push_number(out, *count)),
         Span::Took(ns) => styled(out, caps, DIM, |out| took_into(out, *ns)),
     }

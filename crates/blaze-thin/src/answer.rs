@@ -4,9 +4,10 @@
 //! answer to the engine before it has written a byte ([`Step::HandOver`]).
 //!
 //! A plain answer is units fresh or compiled with no diagnostic, the build's outputs, its
-//! work, and a `Done` that is ok. What it prints is then exactly what blaze's CLI prints of it
-//! (`blaze_cargo::cli::print`): `Compiling` a package compiled, a `link:` line an image,
-//! `Finished`, and for a `run` its `Running` line. So an edit's build that went well (a unit
+//! work, and a `Done` that is ok. What it shows is then exactly what blaze's CLI shows of it,
+//! made by the same core (blaze-screen, docs/terminal.md): on a terminal nothing for a `run`
+//! that built nothing, one line for an edit or a `build`; off one the `blaze: ok` line. So an
+//! edit's build that went well (a unit
 //! compiled, its image patched) is answered here, and its program started, with no second
 //! process: until 2026-11-11 a unit compiled handed the answer to the engine, which cost an
 //! edit that program's start, a second connection for the launch and a third for its rows.
@@ -23,9 +24,11 @@ use std::{
     time::Duration,
 };
 
-use blaze_api::{Artifact, Linked, Response, TargetKind, Tiers, UnitStarted, Verb};
-
-use crate::say;
+use blaze_api::{
+    Artifact, LinkHow, Linked, Report, Response, Severity, TargetKind, Tiers, UnitStarted, Verb,
+};
+use blaze_report::terminal::Terminal;
+use blaze_screen::{Built, Caps, Event, Link, Options, Screen, Why};
 
 /// What taking a response came to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -53,9 +56,37 @@ pub struct Plain {
     artifacts: Vec<Artifact>,
     links: Vec<Linked>,
     tiers: Option<Tiers>,
-    /// The first unit compiled or checked of each package, in the order they came: cargo's
-    /// `Compiling` lines.
+    /// The first unit compiled or checked of each package, in the order they came.
     compiled: Vec<UnitStarted>,
+    /// Units made again and units replayed, as the build's work says
+    /// ([`blaze_api::Worked::compiled`], [`blaze_api::Worked::found`]).
+    made: u64,
+    found: u64,
+    /// Why the build made again what it did, when its answer carried it
+    /// ([`blaze_api::Worked::why`]): what an edit's line names the functions and the cause from.
+    why: Option<Vec<Report>>,
+}
+
+/// How this process shows an answer: the screen's options for its command, what stderr is,
+/// and how a program's size on disk is asked. Set once by the program ([`show_with`]) before
+/// it talks to the daemon; unset (a test, a library user), an answer is shown as a pipe is.
+///
+/// Interim: `talk::talk` makes the [`Plain`] and calls [`Plain::said`] with a `quiet` and a
+/// `color` alone, so what stderr is reaches it this way until `talk::Spoken` carries a
+/// [`Shown`] and passes it to [`Plain::shown`]; this static goes then.
+#[derive(Clone, Debug)]
+pub struct Shown {
+    pub options: Options,
+    pub caps: Caps,
+    pub terminal: Terminal,
+    pub size: fn(&str) -> Option<u64>,
+}
+
+static SHOWN: std::sync::OnceLock<Shown> = std::sync::OnceLock::new();
+
+/// This process shows its answers as `shown` says; the first call's stands.
+pub fn show_with(shown: Shown) {
+    let _ = SHOWN.set(shown);
 }
 
 impl Plain {
@@ -116,6 +147,9 @@ impl Plain {
                 }
                 self.links = worked.links;
                 self.tiers = worked.tiers;
+                self.made = worked.compiled;
+                self.found = worked.found;
+                self.why = worked.why;
                 Step::More
             }
             Response::Done { ok: true } => Step::Done,
@@ -124,45 +158,74 @@ impl Plain {
         }
     }
 
-    /// What blaze's CLI writes to stderr of this answer, the build over `took` after the
-    /// command began: `Compiling` a package compiled unless `quiet`, one `link:` line an image
-    /// the build linked (in every format, under `-q` too), then `Finished` unless `quiet` or
-    /// the build placed nothing.
+    /// What is written to stderr of this answer, the build over `took` after the command
+    /// began, as this process shows answers ([`show_with`]); a pipe's lines when it was not
+    /// said. `quiet` is the command's `-q`.
     pub fn said(&self, quiet: bool, color: bool, took: Duration) -> String {
-        use std::fmt::Write as _;
-        let mut out = String::with_capacity(160); // alloc: once a command, what it prints
-        if !quiet {
-            for unit in &self.compiled {
-                let word = match unit.verb {
-                    Verb::Checking => "Checking",
-                    Verb::Compiling | Verb::Fresh => "Compiling",
+        match SHOWN.get() {
+            Some(shown) => {
+                let options = Options { quiet, ..shown.options.clone() }; // clone: once a command
+                let size = placed(&self.artifacts).and_then(shown.size);
+                self.shown(options, shown.caps, &shown.terminal, took, size)
+            }
+            None => {
+                let options = Options { quiet, ..Options::of(blaze_screen::Command::Build) };
+                let terminal = Terminal {
+                    caps: blaze_report::Caps { color, links: false, width: None },
+                    ..Terminal::PIPE
                 };
-                say::status_word(&mut out, word, color);
-                out.push_str(&unit.name);
-                out.push_str(" v");
-                out.push_str(&unit.version);
-                if let Some(source) = &unit.source {
-                    out.push(' ');
-                    out.push_str(source);
-                }
-                out.push('\n');
+                self.shown(options, Caps::PIPE, &terminal, took, None)
             }
         }
-        for link in &self.links {
-            // Writing to a String cannot fail. `blaze_ui::api::link_lines`'s line.
-            let _ = writeln!(out, "link: {} ({})", link.path, link.how);
+    }
+
+    /// The frame blaze-screen's core makes of the build's end and its why, as the bytes
+    /// `terminal` takes: what the engine's printer shows of the same answer
+    /// (`blaze_cargo::cli::print`). Nothing where the screen says nothing (a `run` that built
+    /// nothing on a terminal, `-q`). `size` is the placed program's size on disk.
+    pub fn shown(
+        &self,
+        options: Options,
+        caps: Caps,
+        terminal: &Terminal,
+        took: Duration,
+        size: Option<u64>,
+    ) -> String {
+        let mut screen = Screen::new(options, caps);
+        screen.advance_clock(u64::try_from(took.as_millis()).unwrap_or(u64::MAX));
+        screen.take(Event::Built(Built {
+            ok: true,
+            compiled: self.made,
+            cached: self.found,
+            tier: self.tiers.as_ref().map(Tiers::status),
+            // alloc: a link an image, once a command
+            links: self
+                .links
+                .iter()
+                .map(|it| Link {
+                    whole: matches!(it.how, LinkHow::Full { .. }),
+                    how: it.how.to_string(),
+                    path: it.path.clone(), // clone: as above
+                })
+                .collect(),
+            program: placed(&self.artifacts).map(str::to_owned), // alloc: a path, once a command
+            size_bytes: size,
+            why_follows: self.why.is_some(),
+            ..Built::default()
+        }));
+        if let Some(why) = &self.why {
+            screen.take(Event::Why(why.iter().map(why_of).collect())); // alloc: a cause each, once
         }
-        if let (Some(profile), false) = (&self.profile, quiet) {
-            say::status_word(&mut out, "Finished", color);
-            say::finished_into(&mut out, profile, took);
-            if let Some(tiers) = &self.tiers {
-                out.push_str(" (");
-                out.push_str(&tiers.line());
-                out.push(')');
-            }
-            out.push('\n');
+        let mut out = String::with_capacity(160); // alloc: once a command, what it prints
+        if let Some(frame) = screen.frame() {
+            blaze_screen::encode(&frame, terminal, &mut out);
         }
         out
+    }
+
+    /// What the build placed.
+    pub fn artifacts(&self) -> &[Artifact] {
+        &self.artifacts
     }
 
     /// The one program a plain `run` (no `--bin`, no `--example`) runs of what was built:
@@ -178,6 +241,84 @@ impl Plain {
             return None;
         }
         one.executable.as_ref().map(|_| one)
+    }
+}
+
+/// The one program among what a build placed (`artifacts`), where it placed exactly one: its
+/// path, which the build's line names. The thin `blaze` and the engine's printer ask this one
+/// function, so they name the same.
+pub fn placed(artifacts: &[Artifact]) -> Option<&str> {
+    let mut programs = artifacts.iter().filter(|it| {
+        !it.profile.test && matches!(it.target.kind, TargetKind::Bin | TargetKind::Example)
+    });
+    let one = programs.next()?;
+    match programs.next() {
+        Some(_) => None,
+        None => one.executable.as_deref(),
+    }
+}
+
+/// What the file at `path` takes on disk, in bytes: the blocks it holds, which is what a
+/// person means by a program's size (a dev executable's length is mostly room for patches
+/// that holds nothing). None where it can't be asked.
+#[cfg(unix)]
+pub fn on_disk(path: &str) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(path).ok().map(|it| it.blocks().saturating_mul(512))
+}
+
+/// Off Unix a file's length is what there is to ask.
+#[cfg(not(unix))]
+pub fn on_disk(path: &str) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|it| it.len())
+}
+
+/// One cause of a build's why (`Rebuilt::summary`'s report of it), as the screen takes it:
+/// its headline as the report has it, each part with its role; the cause's own words (what
+/// follows `because` in the headline); the functions compiled again for it (its `codegen`
+/// facts); and whether it is work that should not have been done (said as a warning). The
+/// thin `blaze` and the engine's printer ask this one function.
+pub fn why_of(report: &Report) -> Why {
+    use blaze_report::Span;
+    let mut cause = blaze_api::Text::new();
+    let mut found = false;
+    for span in &report.headline.0 {
+        match span {
+            Span::Plain(words) if !found => {
+                if let Some((_, after)) = words.split_once(" because ") {
+                    found = true;
+                    if !after.is_empty() {
+                        cause.push(Span::Plain(after.to_owned())); // alloc: once a cause
+                    }
+                }
+            }
+            span if found => cause.push(span.clone()), // clone: as above
+            _ => {}
+        }
+    }
+    let mut functions: Vec<String> = Vec::new(); // alloc: as above
+    for fact in &report.facts {
+        let text = fact.text.flat();
+        let Some((step, names)) = text.split_once(": ") else { continue };
+        if !step.starts_with("codegen") {
+            continue;
+        }
+        for name in names.split(", ") {
+            let name = name.trim_matches('`');
+            // `main` beside `hello::main` is the program's entry, the same function.
+            let last = |it: &str| it.rsplit("::").next().unwrap_or(it).to_owned();
+            if !functions.iter().any(|it| it == name || last(it) == name) {
+                functions.retain(|it| *it != last(name) || name == it);
+                functions.push(name.to_owned()); // alloc: as above
+            }
+        }
+    }
+    Why {
+        wasted: report.severity == Severity::Warning,
+        cause,
+        headline: report.headline.clone(), // clone: as above
+        functions,
+        more: report.rule.as_ref().map(|rule| format!("blaze explain {rule}")), // alloc: as above
     }
 }
 
@@ -214,26 +355,16 @@ impl Exec {
         }
     }
 
-    /// cargo's `Running` line of it, with its newline: the command line in backquotes, every
-    /// argument as it is. Only for arguments that are shown unquoted ([`say::plain`]), which
-    /// the route holds a `run` that prints this to.
-    pub fn running(&self, color: bool) -> String {
-        let mut out = String::with_capacity(64); // alloc: once a run, its line
-        say::status_word(&mut out, "Running", color);
-        out.push('`');
-        out.push_str(&self.program.to_string_lossy());
-        for arg in &self.args {
-            out.push(' ');
-            out.push_str(&arg.to_string_lossy());
-        }
-        out.push_str("`\n");
-        out
+    /// What is said of the program before it starts: nothing. Its command line is said
+    /// only under `-v`, which is the engine's; kept for `talk::talk`, which still asks.
+    pub fn running(&self, _color: bool) -> String {
+        String::new()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use blaze_api::{ApiError, LinkHow};
+    use blaze_api::ApiError;
 
     use super::*;
 
@@ -264,8 +395,11 @@ mod tests {
         assert_eq!(plain.take(Response::Done { ok: true }), Step::Done);
     }
 
+    /// What a plain answer shows is the screen's: off a terminal the one `blaze: ok` line,
+    /// with no escape byte; on one a line for a `build` and nothing for a `run`.
     #[test]
-    fn a_plain_answer_prints_its_links_and_finished() {
+    fn a_plain_answer_says_what_the_screen_says() {
+        use blaze_screen::Command;
         let mut plain = Plain::new();
         let built = Response::Built {
             members: 1,
@@ -274,12 +408,17 @@ mod tests {
         };
         assert_eq!(plain.take(built), Step::More);
         plain.links = vec![Linked { how: LinkHow::Unchanged, path: "/w/target/debug/a".to_owned() }];
+        plain.found = 32;
         let took = Duration::from_millis(10);
-        assert_eq!(
-            plain.said(false, false, took),
-            "link: /w/target/debug/a (unchanged)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.01s\n"
-        );
-        assert_eq!(plain.said(true, false, took), "link: /w/target/debug/a (unchanged)\n");
+        let piped = plain.shown(Options::of(Command::Build), Caps::PIPE, &Terminal::PIPE, took, None);
+        assert_eq!(piped, "blaze: ok built=0 cached=32 warnings=0 elapsed_ms=10\n");
+        // With nothing said of how this process shows answers, `said` is a pipe's.
+        assert_eq!(plain.said(false, false, took), piped);
+        assert_eq!(plain.said(true, false, took), "");
+        let caps = Caps { live: true, cols: 80, rows: 24, unicode: true };
+        let build = plain.shown(Options::of(Command::Build), caps, &Terminal::PIPE, took, None);
+        assert!(build.contains("up to date · 10ms"), "{build:?}");
+        assert_eq!(plain.shown(Options::of(Command::Run), caps, &Terminal::PIPE, took, None), "");
         assert_eq!(plain.program(), None);
         let again = Response::Built { members: 1, profile: String::new(), artifacts: Vec::new() };
         assert!(matches!(plain.take(again), Step::HandOver(_)));
@@ -304,7 +443,8 @@ mod tests {
         assert_eq!(plain.take(compiling(0)), Step::More);
         assert_eq!(plain.take(compiling(0)), Step::More);
         assert_eq!(plain.take(Response::Done { ok: true }), Step::Done);
-        assert_eq!(plain.said(false, false, Duration::ZERO), "   Compiling foo v0.1.0 (/w/foo)\n");
+        assert_eq!(plain.compiled.len(), 1);
+        assert!(plain.said(false, false, Duration::ZERO).starts_with("blaze: ok built=0 "));
         assert_eq!(plain.said(true, false, Duration::ZERO), "");
         assert!(matches!(Plain::of(true).take(compiling(0)), Step::HandOver(_)));
         assert!(matches!(Plain::new().take(compiling(IDS)), Step::HandOver(_)));
@@ -315,7 +455,6 @@ mod tests {
         let cwd = Path::new("/w");
         let exec = Exec::of("/w/target/debug/app", &[], &[OsString::from("--n=1")], cwd);
         assert_eq!(exec.program, Path::new("target/debug/app"));
-        assert_eq!(exec.running(false), "     Running `target/debug/app --n=1`\n");
         assert_eq!(shown_exe(Path::new("/w/app"), cwd), Path::new("./app"));
         assert_eq!(shown_exe(Path::new("/x/app"), cwd), Path::new("/x/app"));
     }

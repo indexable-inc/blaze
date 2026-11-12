@@ -1,0 +1,14 @@
+== 3000 ms
+ ▶ lowering /root/w/hello  names    1.9s
+ building  ━━━━━━━━━━━━━━━━────────  2/3 · 1 running · 3.0s
+== 6000 ms
+ ▶ core  check + codegen    0.4s  ← 117 wait on it
+ building  ━━━━────────────────────  28/147 · 2 running · 6.0s
+== 9000 ms
+ ▶ hello (bin)  codegen    2.4s  ← 2 wait on it
+ building  ━━━━━━━━━━━━━━━━━━━━━━━─  144/147 · 1 running · 9.0s
+== 12000 ms
+ ▶ hello (bin)  codegen    5.4s  ← 2 wait on it
+ building  ━━━━━━━━━━━━━━━━━━━━━━━─  144/147 · 1 running · 12.0s
+== end
+✓ built 28 units, 4 cached in 14.4s · tier 0

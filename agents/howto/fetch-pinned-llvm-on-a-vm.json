@@ -1,0 +1,9 @@
+{
+ "id": "fetch-pinned-llvm-on-a-vm",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
+ "task": "Get blaze's pinned LLVM onto a Linux ix VM",
+ "do": "Fetch it by its hash from the release bucket crates/hir-ty-codegen/llvm.json names (release + '/' + targets.<triple>.name), check sha256sum against targets.<triple>.sha256, and unpack with --strip-components 1 into ~/.blaze/native/sha256-<hash>.",
+ "why": "60 MB in seconds; copying the unpacked 346 MB between VMs through the Mac took 20 minutes (records-6, edit2-3).",
+ "state": "current"
+}

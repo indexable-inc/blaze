@@ -234,20 +234,12 @@
    "state": "steps a and c built on memstrat-1111; b and d not built"
   },
   {
-   "id": "D-S5-1",
+   "id": "D30",
    "date": "2026-11-12",
-   "decision": "The blaze edition's opt-in is the manifest's `edition = \"blaze-2026.11\"`, one spelling, carried to the front end as the crate attribute `#![blaze::edition = \"2026.11\"]`; `main` takes the roots the runtime makes in its order (`&Cx`, then `Io`), by rule `entry-takes-roots`; the entry is library code (`bstd::entry::run`) called from a module appended to the root. docs/v2/plan/design/std.md, \"The blaze edition: opting in\".",
-   "why": "Andrew, 2026-11-12: bstd should be what programs use, entry `fn main(io: Io)` \"or whatever it is\", opt-in so old things compile. A cargo-readable key lost: a package of the edition is not a cargo package. Lane bstd-entry-1112.",
-   "recommended": "Yes.",
-   "state": "in force; slice 1 on bstd-entry-1112"
-  },
-  {
-   "id": "D-S5-2",
-   "date": "2026-11-12",
-   "decision": "`blaze new` defaults to the blaze edition, and `blaze::not_latest_edition` warns by default, from the day bstd ships with blaze (std.md row S5d): one switch each, `blaze_new::BSTD_SHIPS` and `ready::EDITION_SHIPS`, both false today. Until then `blaze new --bstd <PATH>` writes the edition package, `--rust` the plain one, and the lint is `allow` unless asked for. blaze's own workspace allows the lint while cargo builds blaze (D25).",
-   "why": "Andrew asked for the edition as `blaze new`'s default and a warning for packages not on it. Today a package of the edition names bstd by path into a checkout of blaze, so the default would break `blaze new` + `blaze run` on every installed blaze (the release's install check), and the warning would tell people to move to something they cannot build. Lane bstd-entry-1112; for Andrew to overrule.",
-   "recommended": "Yes, until S5d; then flip both.",
-   "state": "in force; for Andrew to confirm"
+   "decision": "What build, run, check and test show is blaze's own, not cargo's lines: on a terminal a region redrawn while the build runs and at most one line when it ends (nothing for a run that built nothing); off a terminal `blaze: progress` every 10 s and one `blaze: ok` or `blaze: failed` line of key=value fields. `Compiling`, `Finished`, `Running`, `link:` and the per-unit `generated N warnings` and `could not compile` lines are gone; the JSON messages on stdout are unchanged. A frontier (a row a unit under way with how many wait on it) over a dependency tree or a lane a worker, from frames of recorded builds. docs/terminal.md.",
+   "why": "Andrew, 2026-11-12: \"can you improve the terminal output too? like `blaze run` could be more like nom + buck2 ... proper TUI thing ... reinvent, super modern\"; rule useful-not-parity.",
+   "recommended": "Yes. The cost: a tool that reads cargo's human lines from blaze's stderr reads nothing it knows (the harnesses filter `blaze:` lines already and read build-finished), and the `blaze check --fix` hint that the per-unit warning line carried is not said anywhere now.",
+   "state": "built on termui-1112, not merged"
   }
  ]
 }

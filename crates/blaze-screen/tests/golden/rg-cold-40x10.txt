@@ -1,0 +1,51 @@
+== 7000 ms
+ ▶ core  names    1.9s  ← 344 wait on …
+ building  78/423 · 1 running · 7.0s
+== 14000 ms
+ ▶ anyhow (buil…  names    0.7s
+ ▶ crossbeam-de…  names    0.7s
+   … 10 more running
+ building  269/423 · 13 running · 14.0s
+== 20000 ms
+ ▶ globset        codegen    6.4s
+ ▶ serde_json (…  codegen    5.7s
+   … 10 more running
+ building  297/423 · 12 running · 20.0s
+== 27000 ms
+ ▶ crossbeam-de…  run build script    …
+ ▶ crossbeam-ep…  run build script    …
+   … 8 more running
+ building  333/423 · 10 running · 27.0s
+== 33000 ms
+warning: unused import: `self::SummaryKi
+nd::*`
+   --> crates/printer/src/summary.rs:127
+:13
+    |
+127 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+
+ ▶ anyhow (buil…  run build script    …
+ building  412/423 · 1 running · 33.0s
+== 40000 ms
+warning: unused import: `self::SummaryKi
+nd::*`
+   --> crates/printer/src/summary.rs:127
+:13
+    |
+127 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+
+ ▶ ripgrep (bin…  codegen    5.6s
+ building  420/423 · 1 running · 40.0s
+== end
+    |
+127 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+
+✓ built 81 units, 4 cached in 45.8s · ti
+er 0 · 3 warnings · blaze slow says why
+⚠ 1 step recomputed for no recorded reas
+on: a blaze bug (blaze why --unexplained
+) (3 times) · blaze explain why:unexplai
+ned

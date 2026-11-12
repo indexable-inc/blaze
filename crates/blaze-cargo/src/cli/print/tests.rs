@@ -7,10 +7,10 @@ use blaze_api::{
 use blaze_ids::ContentId;
 
 use super::*;
-use crate::cli::say::tests::target;
+use crate::cli::{say::tests::target, show::Show};
 
 /// `response` printed as the client reads it: from the bytes the daemon sends, in place.
-fn on<O: Write, E: Write>(printer: &mut Printer<'_, O, E>, response: &Response) -> io::Result<()> {
+fn on<O: Write, S: Sink>(printer: &mut Printer<'_, O, S>, response: &Response) -> io::Result<()> {
     let bytes = blaze_protocol::cbor::to_vec(response).unwrap();
     printer.on(blaze_protocol::cbor::from_slice::<ResponseRef<'_>>(&bytes).unwrap())
 }
@@ -69,7 +69,6 @@ fn lib_of(name: &str) -> UnitOf {
         target: target("lib", name),
         test: false,
         doctest: false,
-        primary: true,
     }
 }
 
@@ -85,26 +84,6 @@ fn diagnostic(level: Level, message: &str, rendered: &str, unit: Option<UnitOf>)
         unit,
         explanation: None,
     }
-}
-
-fn fixable(mut warning: Diagnostic) -> Diagnostic {
-    let span = Span {
-        file: "src/lib.rs".to_owned(),
-        line: 1,
-        column: 5,
-        end_line: 1,
-        end_column: 6,
-        label: None,
-        byte_start: 4,
-        byte_end: 5,
-        primary: true,
-        replacement: Some("_x".to_owned()),
-        applicability: Some(Applicability::MachineApplicable),
-    };
-    let mut help = diagnostic(Level::Help, "prefix it with an underscore", "", None);
-    help.spans.push(span);
-    warning.children.push(help);
-    warning
 }
 
 fn built() -> Response {
@@ -147,20 +126,36 @@ fn finished_line(profile: Option<&str>, work: Option<json::Work>) -> String {
         served: json::Served::HERE,
         took_ms: 1234,
         work,
+        program: None,
+        size_bytes: None,
     };
     json::build_finished(&mut out, &finished);
     out
 }
 
-/// What the printer wrote to stdout and stderr of `responses`, ended with `ok`.
+/// A pipe's screen on `err`, its clock standing still: what the screen says off a terminal is
+/// what these tests read.
+fn piped<E: Write>(shown: Shown, err: E) -> Show<E> {
+    let options = blaze_screen::Options {
+        quiet: shown.quiet,
+        verbose: shown.verbose > 0,
+        ..blaze_screen::Options::of(blaze_screen::Command::Build)
+    };
+    Show::piped(options, err)
+}
+
+/// What the printer wrote to stdout and what the screen wrote to stderr of `responses`, ended
+/// with `ok`.
 fn printed(shown: Shown, responses: &[Response], ok: bool) -> (String, String) {
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let mut printer = Printer::new(shown, Path::new("/w"), &mut out, &mut err);
+    let mut screen = piped(shown, &mut err);
+    let mut printer = Printer::new(shown, Path::new("/w"), &mut out, &mut screen);
     for response in responses {
         on(&mut printer, response).unwrap();
     }
-    printer.finish(ok, Duration::from_millis(1234)).unwrap();
+    printer.finish(ok, Duration::from_millis(1234), None, false).unwrap();
     drop(printer);
+    drop(screen);
     (String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
 }
 
@@ -169,7 +164,7 @@ const UNUSED: &str = "warning: unused variable: `x`\n --> src/lib.rs:1:5\n\n";
 #[test]
 fn a_build_with_warnings_as_cargo_prints_it() {
     let warning =
-        fixable(diagnostic(Level::Warning, "unused variable: `x`", UNUSED, Some(lib_of("foo"))));
+        diagnostic(Level::Warning, "unused variable: `x`", UNUSED, Some(lib_of("foo")));
     let emitted = diagnostic(
         Level::Warning,
         "2 warnings emitted",
@@ -188,94 +183,16 @@ fn a_build_with_warnings_as_cargo_prints_it() {
     ];
     let (out, err) = printed(Shown::default(), &responses, true);
     assert_eq!(out, "");
-    assert_eq!(
-        err,
-        format!(
-            "   Compiling foo v0.1.0 (/w/foo)\n{UNUSED}warning: `foo` (lib) generated 2 warnings (1 duplicate) \
-             (run `blaze check --fix --lib -p foo` to apply 1 suggestion)\n    Finished `dev` profile \
-             [unoptimized + debuginfo] target(s) in 1.23s\n"
-        )
-    );
+    // The warning once (its duplicate is not said again, nor counted), then the screen's one
+    // line of the build; no line a unit.
+    assert_eq!(err, format!("{UNUSED}blaze: ok built=0 cached=0 warnings=1 elapsed_ms=0\n"));
 
+    // `-v` names each unit made again as it starts.
     let (_, verbose) = printed(Shown { verbose: 1, ..Shown::default() }, &responses, true);
-    assert!(
-        verbose.starts_with("       Fresh bar v0.1.0 (/w/bar)\n   Compiling foo v0.1.0 (/w/foo)\n"),
-        "{verbose}"
-    );
+    assert!(verbose.starts_with("blaze: compiling unit=\"foo v0.1.0\"\n"), "{verbose}");
 
     let (_, quiet) = printed(Shown { quiet: true, ..Shown::default() }, &responses, true);
     assert_eq!(quiet, UNUSED);
-
-    // `check --fix` makes the suggestions it would hint at.
-    let (_, fixing) = printed(Shown { fixing: true, ..Shown::default() }, &responses, true);
-    assert!(
-        fixing.contains("warning: `foo` (lib) generated 2 warnings (1 duplicate)\n"),
-        "{fixing}"
-    );
-}
-
-#[test]
-fn a_units_summary_comes_as_it_ends_and_once() {
-    let warning = diagnostic(Level::Warning, "unused variable: `x`", UNUSED, Some(lib_of("foo")));
-    let responses = [
-        started("foo", Verb::Compiling),
-        Response::Diagnostic(warning),
-        Response::UnitEnded(lib_of("foo")),
-        started("bar", Verb::Compiling),
-        Response::UnitEnded(lib_of("bar")),
-        built(),
-        Response::Done { ok: true },
-    ];
-    let (_, err) = printed(Shown::default(), &responses, true);
-    assert_eq!(
-        err,
-        format!(
-            "   Compiling foo v0.1.0 (/w/foo)\n{UNUSED}warning: `foo` (lib) generated 1 warning\n   Compiling bar \
-             v0.1.0 (/w/bar)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.23s\n"
-        )
-    );
-}
-
-/// The `Finished` line ends with the build's goal and how much of the code it linked is
-/// optimized, as its work report gave them; a build that reports no goal (a check, a daemon's
-/// answer with none) ends as cargo's does.
-#[test]
-fn the_finished_line_says_the_goal_and_how_much_is_optimized() {
-    use blaze_api::{Goal, Tiers};
-    const FINISHED: &str = "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.23s";
-    let worked = |tiers| {
-        Response::Work(blaze_api::Worked {
-            why: None,
-            storage: None,
-            tiers,
-            link: blaze_api::LinkKind::Patched,
-            found: 0,
-            green: 0,
-            links: Vec::new(),
-            reran: 0,
-            misses: 0,
-            served: Vec::new(),
-            build_id: None,
-            compiled: 1,
-            critical_path_us: 0,
-            steps_us: Vec::new(),
-            placed: blaze_api::PlacedBytes::default(),
-        })
-    };
-    let said = |tiers| {
-        let responses = [built(), worked(tiers), Response::Done { ok: true }];
-        printed(Shown::default(), &responses, true).1
-    };
-    assert_eq!(
-        said(Some(Tiers::of(Goal::Edit).with(38, 100))),
-        format!("{FINISHED} (goal edit: tier 0 · 38% optimized)\n")
-    );
-    assert_eq!(said(Some(Tiers::of(Goal::Edit))), format!("{FINISHED} (goal edit: tier 0)\n"));
-    assert_eq!(
-        said(Some(Tiers::of(Goal::Max).with(9, 9))),
-        format!("{FINISHED} (goal max: optimized)\n")
-    );
-    assert_eq!(said(None), format!("{FINISHED}\n"));
 }
 
 #[test]
@@ -317,18 +234,18 @@ fn what_a_request_did_is_one_json_line_of_blazes() {
             + &finished_line(None, Some(work))
             + "\n"
     );
-    assert!(err.starts_with("link: target/debug/foo (spliced)\n"), "{err}");
+    assert_eq!(err, "blaze: ok built=1 cached=3 warnings=0 elapsed_ms=0\n");
     let (out, err) = printed(
         Shown::default(),
         &[Response::Work(worked.clone()), Response::Done { ok: true }],
         true,
     );
     assert_eq!(out, "", "under the human format the work line is not printed");
-    assert!(err.starts_with("link: target/debug/foo (spliced)\n"), "but how it linked is: {err}");
+    assert_eq!(err, "blaze: ok built=1 cached=3 warnings=0 elapsed_ms=0\n", "a spliced link is not news");
     assert!(!err.contains("timeline-us:"), "{err}");
     let stats = Shown { stats: true, ..Shown::default() };
     let (_, err) = printed(stats, &[Response::Work(worked), Response::Done { ok: true }], true);
-    assert!(err.starts_with("link: target/debug/foo (spliced)\ntimeline-us: link=40\n"), "{err}");
+    assert!(err.starts_with("timeline-us: link=40\n"), "{err}");
 }
 
 #[test]
@@ -399,7 +316,7 @@ fn a_unit_that_failed() {
         Some(lib_of("foo")),
     );
     let warning =
-        fixable(diagnostic(Level::Warning, "unused variable: `x`", UNUSED, Some(lib_of("foo"))));
+        diagnostic(Level::Warning, "unused variable: `x`", UNUSED, Some(lib_of("foo")));
     let aborting = diagnostic(
         Level::Error,
         "aborting due to 1 previous error",
@@ -421,60 +338,20 @@ fn a_unit_that_failed() {
         Response::Done { ok: false },
     ];
     let (_, err) = printed(Shown { color: false, ..Shown::default() }, &responses, false);
+    // The diagnostics, then one line: what failed, and what says more of it.
+    const FAILED: &str =
+        "blaze: failed errors=1 warnings=1 unbuilt=0 elapsed_ms=0 unit=foo next=\"blaze explain foo\"\n";
     assert_eq!(
         err,
         format!(
-            "   Compiling foo v0.1.0 (/w/foo)\n{UNUSED}error[E0308]: mismatched types\n\nFor more information \
-             about this error, try `rustc --explain E0308`.\nwarning: `foo` (lib) generated 1 warning\nerror: \
-             could not compile `foo` (lib) due to 1 previous error; 1 warning emitted\n"
+            "{UNUSED}error[E0308]: mismatched types\n\nFor more information about this error, try `rustc \
+             --explain E0308`.\n{FAILED}"
         )
     );
+    // `-q` silences no failure.
     let (_, quiet) =
         printed(Shown { color: false, quiet: true, ..Shown::default() }, &responses, false);
-    assert!(quiet.ends_with("`rustc --explain E0308`.\nerror: could not compile `foo` (lib) due to 1 previous error; 1 warning emitted\n"), "{quiet}");
-}
-
-/// A library's doc tests that fail to build are named as its doc tests, not as the library.
-#[test]
-fn failed_doctests_say_they_are_the_doctests() {
-    let doctests = UnitOf { id: 7, doctest: true, ..lib_of("foo") };
-    let error = diagnostic(
-        Level::Error,
-        "mismatched types",
-        "error[E0308]: mismatched types\n\n",
-        Some(doctests),
-    );
-    let responses = [Response::Diagnostic(error), Response::Done { ok: false }];
-    let (_, err) = printed(Shown { color: false, ..Shown::default() }, &responses, false);
-    assert!(
-        err.ends_with("error: could not compile `foo` (lib doctest) due to 1 previous error\n"),
-        "{err}"
-    );
-}
-
-#[test]
-fn levels_in_color_as_cargos_shell_writes_them() {
-    let error = diagnostic(
-        Level::Error,
-        "mismatched types",
-        "error[E0308]: mismatched types\n",
-        Some(lib_of("foo")),
-    );
-    let warning = diagnostic(Level::Warning, "unused variable: `x`", UNUSED, Some(lib_of("foo")));
-    let responses =
-        [Response::Diagnostic(warning), Response::Diagnostic(error), Response::Done { ok: false }];
-    let (_, err) = printed(Shown { color: true, ..Shown::default() }, &responses, false);
-    assert!(
-        err.ends_with(&format!(
-            "{}warning{}: `foo` (lib) generated 1 warning\n{}error{}: could not compile `foo` (lib) due to 1 \
-             previous error; 1 warning emitted\n",
-            say::WARN,
-            say::RESET,
-            say::ERROR,
-            say::RESET
-        )),
-        "{err:?}"
-    );
+    assert!(quiet.ends_with(&format!("`rustc --explain E0308`.\n{FAILED}")), "{quiet}");
 }
 
 #[test]
@@ -516,7 +393,7 @@ fn one_rendered_text_is_printed_once_with_or_without_its_newline() {
     let responses =
         [Response::Diagnostic(first), Response::Diagnostic(second), Response::Done { ok: true }];
     let (_, err) = printed(Shown::default(), &responses, true);
-    assert_eq!(err, "warning: a\nwarning: `foo` (lib) generated 2 warnings (1 duplicate)\n");
+    assert_eq!(err, "warning: a\nblaze: ok built=0 cached=0 warnings=1 elapsed_ms=0\n");
 }
 
 /// Two units failing with one error of no span each print it (selfbuild2: psm's and
@@ -564,24 +441,6 @@ fn every_unit_failing_with_the_same_words_prints_them() {
     assert_eq!(err.matches("error[E0308]: mismatched types\n").count(), 1, "{err}");
 }
 
-#[test]
-fn units_of_one_package_are_told_apart() {
-    let lib = diagnostic(Level::Warning, "a", "warning: a\n", Some(lib_of("foo")));
-    let test = diagnostic(
-        Level::Warning,
-        "a",
-        "warning: b\n",
-        Some(UnitOf { id: 100, test: true, ..lib_of("foo") }),
-    );
-    let responses =
-        [Response::Diagnostic(lib), Response::Diagnostic(test), Response::Done { ok: true }];
-    let (_, err) = printed(Shown::default(), &responses, true);
-    assert_eq!(
-        err,
-        "warning: a\nwarning: b\nwarning: `foo` (lib) generated 1 warning\nwarning: `foo` (lib test) generated 1 warning\n"
-    );
-}
-
 /// Each `write` call, with whether it went to stdout.
 struct Logged<'a> {
     out: bool,
@@ -602,12 +461,13 @@ impl Write for Logged<'_> {
 #[test]
 fn lines_of_one_stream_in_one_write_and_both_in_the_order_made() {
     let log = std::cell::RefCell::new(Vec::new());
-    let (mut out, mut err) = (Logged { out: true, log: &log }, Logged { out: false, log: &log });
+    let mut out = Logged { out: true, log: &log };
     let shown = Shown {
         format: Format::Json { short: false, ansi: false, render_diagnostics: true },
         ..Shown::default()
     };
-    let mut printer = Printer::new(shown, Path::new("/w"), &mut out, &mut err);
+    let mut screen = piped(shown, Logged { out: false, log: &log });
+    let mut printer = Printer::new(shown, Path::new("/w"), &mut out, &mut screen);
     let warning = diagnostic(Level::Warning, "unused variable: `x`", UNUSED, Some(lib_of("foo")));
     for response in [
         started("foo", Verb::Compiling),
@@ -617,85 +477,16 @@ fn lines_of_one_stream_in_one_write_and_both_in_the_order_made() {
     ] {
         on(&mut printer, &response).unwrap();
     }
-    printer.finish(true, Duration::from_millis(1234)).unwrap();
+    printer.finish(true, Duration::from_millis(1234), None, false).unwrap();
     drop(printer);
+    drop(screen);
     let log = log.into_inner();
     let streams: Vec<bool> = log.iter().map(|it| it.0).collect();
-    assert_eq!(streams, [false, true, false, true], "{log:#?}");
-    assert_eq!(log[0].1, "   Compiling foo v0.1.0 (/w/foo)\n   Compiling bar v0.1.0 (/w/bar)\n");
-    assert!(log[1].1.starts_with("{\"reason\":\"compiler-artifact\""), "{}", log[1].1);
-    assert!(
-        log[2].1.starts_with("warning: unused variable")
-            && log[2]
-                .1
-                .ends_with("Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.23s\n"),
-        "{}",
-        log[2].1
-    );
-    assert_eq!(log[3].1, finished_line(Some("dev"), None) + "\n");
-}
-
-/// A build's responses: each unit starting, warnings, artifacts, a unit ending.
-fn a_build(n: usize) -> Vec<Response> {
-    let mut responses = Vec::new();
-    for at in 0..n {
-        let name = format!("p{at}");
-        responses.push(started(&name, Verb::Compiling));
-        let warning = fixable(diagnostic(
-            Level::Warning,
-            "unused variable: `x`",
-            UNUSED,
-            Some(lib_of(&name)),
-        ));
-        responses.push(Response::Diagnostic(warning.clone()));
-        responses.push(Response::Diagnostic(warning));
-        responses.push(Response::UnitEnded(lib_of(&name)));
-    }
-    responses
-        .push(Response::Fetched { verb: FetchVerb::Downloaded, what: "serde v1.0.219".to_owned() });
-    // No error: one ends a request, and is read and said owned, once (a report).
-    responses
-}
-
-/// The printer allocates per request, not per response: once its buffers have grown and the
-/// units are known, reading a build's responses where they lie in the daemon's bytes and
-/// printing them allocates nothing, in every format.
-#[test]
-fn printing_responses_warm_allocates_nothing() {
-    let formats = [
-        Format::Human,
-        Format::Short,
-        Format::Json { short: false, ansi: false, render_diagnostics: false },
-        Format::Json { short: false, ansi: true, render_diagnostics: true },
-    ];
-    let sent: Vec<Vec<u8>> =
-        a_build(64).iter().map(|it| blaze_protocol::cbor::to_vec(it).unwrap()).collect();
-    for format in formats {
-        for verbose in [0, 1] {
-            let shown = Shown { format, verbose, color: true, ..Shown::default() };
-            let (mut out, mut err) = (Vec::with_capacity(1 << 20), Vec::with_capacity(1 << 20));
-            let mut printer = Printer::new(shown, Path::new("/w"), &mut out, &mut err);
-            for bytes in &sent {
-                printer
-                    .on(blaze_protocol::cbor::from_slice::<ResponseRef<'_>>(bytes).unwrap())
-                    .unwrap();
-            }
-            printer.flush().unwrap();
-            printer.printed.clear();
-            printer.packages.clear();
-            for counted in &mut printer.counted {
-                *counted = Counted::default();
-            }
-            blaze_alloc_count::assert_at_most(0, "printing a warm build's responses", || {
-                for bytes in &sent {
-                    printer
-                        .on(blaze_protocol::cbor::from_slice::<ResponseRef<'_>>(bytes).unwrap())
-                        .unwrap();
-                }
-            });
-            assert!(!printer.refused());
-        }
-    }
+    assert_eq!(streams, [true, false, true, false], "{log:#?}");
+    assert!(log[0].1.starts_with("{\"reason\":\"compiler-artifact\""), "{}", log[0].1);
+    assert!(log[1].1.starts_with("warning: unused variable"), "{}", log[1].1);
+    assert_eq!(log[2].1, finished_line(Some("dev"), None) + "\n");
+    assert_eq!(log[3].1, "blaze: ok built=0 cached=0 warnings=1 elapsed_ms=0\n");
 }
 
 #[test]
@@ -703,13 +494,15 @@ fn a_unit_or_package_numbered_past_any_request_fails_the_build_naming_it() {
     let far = UnitOf { id: u32::MAX, ..lib_of("foo") };
     let warning = diagnostic(Level::Warning, "unused variable: `x`", UNUSED, Some(far));
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let mut printer = Printer::new(Shown::default(), Path::new("/w"), &mut out, &mut err);
+    let mut screen = piped(Shown::default(), &mut err);
+    let mut printer = Printer::new(Shown::default(), Path::new("/w"), &mut out, &mut screen);
     on(&mut printer, &Response::Diagnostic(warning)).unwrap();
     assert!(printer.refused());
-    printer.finish(false, Duration::from_millis(1)).unwrap();
+    printer.finish(false, Duration::from_millis(1), None, false).unwrap();
     drop(printer);
+    drop(screen);
     let err = String::from_utf8(err).unwrap();
-    assert!(err.ends_with("error: the daemon numbered a unit 4294967295, past the 16777216 a request's indexes stay under\n"), "{err}");
+    assert!(err.contains("error: the daemon numbered a unit 4294967295, past the 16777216 a request's indexes stay under\nblaze: failed errors=1 "), "{err}");
 
     let Response::Unit(unit) = started("foo", Verb::Compiling) else { unreachable!() };
     let (_, err) = printed(
@@ -719,7 +512,8 @@ fn a_unit_or_package_numbered_past_any_request_fails_the_build_naming_it() {
     );
     assert_eq!(
         err,
-        "error: the daemon numbered a package 16777216, past the 16777216 a request's indexes stay under\n"
+        "error: the daemon numbered a package 16777216, past the 16777216 a request's indexes stay under\n\
+         blaze: failed errors=1 warnings=0 unbuilt=0 elapsed_ms=0\n"
     );
 }
 
@@ -752,10 +546,7 @@ fn json_on_stdout_and_status_on_stderr() {
     assert!(lines[1].starts_with(r#"{"reason":"compiler-artifact","#));
     assert_eq!(lines[2], finished_line(Some("dev"), None));
     // No "generated" line: cargo counts a unit's warnings where it renders them.
-    assert_eq!(
-        err,
-        "   Compiling foo v0.1.0 (/w/foo)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.23s\n"
-    );
+    assert_eq!(err, "blaze: ok built=0 cached=0 warnings=1 elapsed_ms=0\n");
 
     let rendering = Shown {
         format: Format::Json { short: false, ansi: false, render_diagnostics: true },
@@ -764,7 +555,7 @@ fn json_on_stdout_and_status_on_stderr() {
     let (out, err) = printed(rendering, &responses, true);
     assert!(!out.contains("compiler-message"));
     assert!(err.contains(UNUSED));
-    assert!(err.contains("warning: `foo` (lib) generated 1 warning\n"));
+    assert!(err.ends_with("blaze: ok built=0 cached=0 warnings=1 elapsed_ms=0\n"), "{err}");
 }
 
 #[test]
@@ -794,21 +585,10 @@ fn an_error_of_the_daemon() {
     ];
     let (out, err) = printed(Shown::default(), &responses, false);
     assert_eq!(out, "");
-    assert_eq!(err, "error: no package `nope` in the workspace\n");
-}
-
-#[test]
-fn what_the_daemon_fetched() {
-    let responses = [
-        Response::Fetched { verb: FetchVerb::Updating, what: "crates.io index".to_owned() },
-        Response::Fetched { verb: FetchVerb::Downloaded, what: "serde v1.0.219".to_owned() },
-        Response::Done { ok: false },
-    ];
-    let (out, err) = printed(Shown::default(), &responses, false);
-    assert_eq!(out, "");
-    assert_eq!(err, "    Updating crates.io index\n  Downloaded serde v1.0.219\n");
-    let (_, quiet) = printed(Shown { quiet: true, ..Shown::default() }, &responses, false);
-    assert_eq!(quiet, "");
+    assert_eq!(
+        err,
+        "error: no package `nope` in the workspace\nblaze: failed errors=1 warnings=0 unbuilt=0 elapsed_ms=0\n"
+    );
 }
 
 /// A unit's failure said as a report waits for what it blocks, names it by count and the one

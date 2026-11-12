@@ -15,12 +15,12 @@ blaze build
 ```
 
 The first build starts a background process, the daemon (`blaze serve`), which loads your
-project and compiles every crate of it from source. No `cargo build` and no rustc run, and what
-it prints is what cargo prints:
+project and compiles every crate of it from source. No `cargo build` and no rustc run. While
+it builds, the terminal shows what is under way; when it ends, one line stays
+([terminal.md](terminal.md)):
 
 ```
-   Compiling my-project v0.1.0 (/home/me/my-project)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 41.20s
+✓ built 81 units, 4 cached in 45.8s · tier 0
 ```
 
 From then on, an edit builds only what it changed, on what the daemon holds. The program is

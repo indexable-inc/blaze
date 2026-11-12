@@ -1,0 +1,25 @@
+blaze: progress phase=compiling done=79/423 running=2 elapsed_ms=12561 longest="bodies core 0.0.0 lib (host)" for_ms=0 in="unit bodies (Infer)"
+blaze: progress phase=compiling done=297/423 running=12 elapsed_ms=22572 longest="codegen globset 0.4.21 lib (host)" for_ms=9005
+warning: unused import: `self::SummaryKind::*`
+   --> crates/printer/src/summary.rs:104:13
+    |
+104 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `self::SummaryKind::*`
+   --> crates/printer/src/summary.rs:115:13
+    |
+115 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::SummaryKind::*`
+   --> crates/printer/src/summary.rs:127:13
+    |
+127 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+
+blaze: progress phase=compiling done=419/423 running=1 elapsed_ms=33331 longest="bodies ripgrep 15.2.0 bin rg (host)" for_ms=274
+blaze: ok built=81 cached=4 warnings=3 elapsed_ms=45828 tier="tier 0 · 0% optimized" program=/root/home9/build/ripgrep-2869fcc03106fcd9eadd9b7a1fd4d4e4/debug/rg next="blaze slow"
+blaze: wasted why="1 step recomputed for no recorded reason: a blaze bug (blaze why --unexplained) (3 times)" next="blaze explain why:unexplained"
