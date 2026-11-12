@@ -269,6 +269,10 @@ fn one(test: &Test, seed: u64) -> (Vec<Row>, Vec<String>) {
                     "{}: the step `home {name}` is the real driver's: the simulation has one home and one database",
                     test.name
                 ),
+                Step::Packed(name) => panic!(
+                    "{}: the step `packed {name}` is the real driver's: the simulation has one home and one database",
+                    test.name
+                ),
                 Step::Start | Step::Await { .. } | Step::Count { .. } | Step::End => {
                     panic!(
                         "{}: a step of a running program, which the simulated driver has none of: the case's \
