@@ -205,7 +205,12 @@ struct Library {
     /// seen since it loaded ([`Evaluated::same_from_either_state`]): another first call that
     /// leaves another state shows the state depends on which call ran first.
     settled: Lock<Option<Settled>>,
+    /// How many runs that moved state on were said since it loaded ([`MOVED_SAID`] at most).
+    moved_said: std::sync::atomic::AtomicU32,
 }
+
+/// The most runs that moved state on a library says by name since it loaded.
+const MOVED_SAID: u32 = 8;
 
 thread_local! {
     /// A planted bug, for a test's control: an output that is kept by no store is never shown
@@ -760,6 +765,7 @@ fn load_on(
         turns: Turns::default(),
         kept_roots: SharedMap::default(),
         settled: Lock::new("macro.library.settled", None),
+        moved_said: std::sync::atomic::AtomicU32::new(0),
     });
     // Said once a load: what the crate's macros run and what the store says of their state,
     // so two loads of one crate that give other expanders say what moved between them.
@@ -962,11 +968,45 @@ impl Evaluated {
             self.run_on(db, calling, call, &preset, replayed, &this)?
         };
         let left_holding = ran.statics.iter().any(|it| it.2);
-        library.saw(match () {
+        let left = match () {
             () if ran.statics.is_empty() && !from.replayed => Left::Nothing,
             () if stateless && !left_holding => Left::First,
             () => Left::Moved,
-        })?;
+        };
+        // A run that moved state on is why its crate is stateful, and every unit that calls
+        // a stateful crate's macros is kept by no record: said, the first few times a load,
+        // with the statics it changed by name (rule 19). reth's `jsonrpsee_proc_macros` was
+        // stateful with nothing saying which static moved (2026-11-12).
+        if left == Left::Moved
+            && library.moved_said.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MOVED_SAID
+        {
+            // alloc: a few times a load of a stateful crate, the names of what it changed
+            let statics: Vec<String> = ran
+                .statics
+                .iter()
+                .map(|(id, bytes, holds)| {
+                    use hir_def::HasModule as _;
+                    format!(
+                        "{}::{} ({} bytes{})",
+                        id.module(db).krate(db).named(db),
+                        hir_def::signatures::StaticSignature::of(db, *id).name.as_str(),
+                        bytes.len(),
+                        if *holds { ", holds an address" } else { "" },
+                    )
+                })
+                .collect();
+            tracing::info!(
+                target: "blaze",
+                krate = %library.name,
+                r#macro = %self.name,
+                calling = %calling.named(db),
+                replayed = from.replayed,
+                from_fresh = stateless,
+                statics = %statics.join(", "),
+                "a proc macro's run moved its session's state on"
+            );
+        }
+        library.saw(left)?;
         let Some(mut session) = turn.update() else { return Ok((ran, from)) };
         if !ran.statics.is_empty() {
             session.holds |= left_holding;

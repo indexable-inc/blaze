@@ -892,12 +892,24 @@ WITH picked AS (
     SELECT build_id AS picked_build, started_ns AS t0
     FROM builds
     WHERE CASE WHEN $build IS NULL THEN build_id > (SELECT max(build_id) FROM builds) - $builds ELSE build_id = $build END
-), said AS (
-    SELECT build_id AS tagged, t_ns AS said_ns, CAST(level AS VARCHAR) AS severity,
-        CAST(target AS VARCHAR) || ' ' || CAST(name AS VARCHAR) AS source,
-        coalesce(message, '') || coalesce(' [' || fields || ']', '') AS said_what
-    FROM events_wide
+), loud AS (
+    SELECT build_id, process, event_id, t_ns, level, target, name, message
+    FROM events
     WHERE level IN ('ERROR', 'WARN')
+), loud_fields AS (
+    -- The fields of those events alone: `events_wide` pivots every event's fields before any
+    -- filter, which on a history of reth's size is past DuckDB's memory limit.
+    SELECT v.process AS field_process, v.event_id AS field_event,
+        string_agg(v.key || '=' || coalesce(v.value_text, '?'), ' ' ORDER BY v.ordinal) AS fields
+    FROM event_values AS v
+    JOIN loud ON loud.process = v.process AND loud.event_id = v.event_id
+    GROUP BY v.process, v.event_id
+), said AS (
+    SELECT loud.build_id AS tagged, loud.t_ns AS said_ns, CAST(loud.level AS VARCHAR) AS severity,
+        CAST(loud.target AS VARCHAR) || ' ' || CAST(loud.name AS VARCHAR) AS source,
+        coalesce(loud.message, '') || coalesce(' [' || loud_fields.fields || ']', '') AS said_what
+    FROM loud
+    LEFT JOIN loud_fields ON loud_fields.field_process = loud.process AND loud_fields.field_event = loud.event_id
     UNION ALL
     SELECT build_id, t_ns, CASE WHEN kind = 'signal' THEN 'FATAL' ELSE 'PANIC' END,
         CASE WHEN kind = 'signal' THEN 'signal ' || coalesce(CAST(signal AS VARCHAR), '?') ELSE 'panic at ' || coalesce(location, '?') END,
