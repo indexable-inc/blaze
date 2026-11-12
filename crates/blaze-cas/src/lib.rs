@@ -922,6 +922,9 @@ pub struct Store {
     commit: Option<Commit>,
     /// A flush asked for while a commit was in flight.
     flush_wanted: bool,
+    /// Values a [`Store::settle_take`] moved itself (their columns packed), counted for the
+    /// [`Store::settle_put`] that follows.
+    moved_in_columns: u64,
     /// A commit that waits for the removal of a whole file it would write again
     /// ([`Tier::removing`]): begun when that removal answers.
     commit_deferred: bool,
@@ -1324,6 +1327,81 @@ struct Moves {
     /// To move hot, by place; `promoted` of them are done.
     promote: Vec<(Key, Loc, Row)>,
     promoted: usize,
+}
+
+/// How much one call may move ([`Store::work_moves`], [`Store::settle_take`]) and how much it
+/// has.
+struct Budget {
+    most: u64,
+    /// Of `most`, what short cold records may take.
+    short_most: u64,
+    spent: u64,
+    spent_short: u64,
+    /// Short records were passed by for their share: more to do at the next period's end.
+    more_short: bool,
+}
+
+/// Values of one kind a settle moves cold, out of their packs and waiting to be compressed:
+/// [`ColdBatch::compress`] is the work, which needs nothing of the store and runs on any
+/// thread; the store takes the batch back with [`Store::settle_put`].
+pub struct ColdBatch {
+    kind: Kind,
+    /// The kind's dictionary and its number in the store, for the values under
+    /// [`cold::LONG_FROM`].
+    dictionary: Option<(u32, Arc<cold::Prepared>)>,
+    items: Vec<ColdItem>,
+}
+
+struct ColdItem {
+    key: Key,
+    /// Where the record was when its value was read: the move is made only if it still is.
+    loc: Loc,
+    row: Row,
+    content: ContentId,
+    raw: Vec<u8>,
+    /// The value compressed, or why zstd refused it; `None` until [`ColdBatch::compress`].
+    stored: Option<Result<Vec<u8>, String>>,
+}
+
+impl ColdBatch {
+    /// The bytes of its values, uncompressed.
+    pub fn bytes(&self) -> u64 {
+        self.items.iter().map(|it| it.raw.len() as u64).sum()
+    }
+
+    /// How many values it holds.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether it holds no value (never, of a batch the store gave).
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// The name of the kind its values are of.
+    pub fn kind(&self) -> &'static str {
+        self.kind.name()
+    }
+
+    /// Compresses every value: zstd with the kind's dictionary, or, for a long value, with
+    /// long-distance matching on zstd's own threads ([`cold::compress_long`]). Deterministic:
+    /// the bytes depend on the values and the dictionary alone.
+    pub fn compress(&mut self) {
+        let dictionary = self.dictionary.as_ref().map(|(_, it)| &**it);
+        let mut short = cold::Batch::new(dictionary);
+        for item in &mut self.items {
+            item.stored = Some(if item.raw.len() >= cold::LONG_FROM {
+                cold::compress_long(&item.raw)
+            } else {
+                match &mut short {
+                    Ok(short) => short.compress(&item.raw),
+                    // clone: the error, once per value of a batch zstd would not start for
+                    Err(why) => Err(why.clone()),
+                }
+            });
+        }
+    }
 }
 
 /// Why a record's bytes are wanted, which decides whether its check is remembered and
@@ -2006,6 +2084,7 @@ impl Store {
             periods: 0,
             moves: None,
             commit_deferred: false,
+            moved_in_columns: 0,
             columns,
             peers,
             staging,
@@ -2430,144 +2509,35 @@ impl Store {
         stepped: bool,
     ) -> Settled {
         let mut settled = Settled::default();
-        let mut spent: u64 = 0;
-        // What short cold records took of `spent`, and whether some were left for the next.
-        let (mut spent_short, mut more_short) = (0u64, false);
-        let encodings = Arc::clone(&self.columns);
-        'kinds: while moves.demoted < moves.demote.len() {
-            let from = moves.demoted;
-            let kind = moves.demote[from].1.kind;
-            let to = from
-                + moves.demote[from..].iter().take_while(|(_, loc, _)| loc.kind == kind).count();
-            if self.dictionary_of(kind).is_none() {
-                // Long records are not sampled, as `put` does not sample them: a few would fill the
-                // samples with too few values and give the kind up.
-                let long = cold::LONG_FROM as u64;
-                for at in from..to {
-                    let (_, loc, _) = moves.demote[at];
-                    if loc.form != Form::Raw || loc.raw >= long {
-                        continue;
-                    }
-                    // The samples are full (and trained, or gave up) or the kind gave up: a
-                    // copy would be kept as no sample.
-                    if !self.training[kind.code() as usize].wants_samples() {
-                        break;
-                    }
-                    let pack = &self.tiers[0].packs[loc.pack as usize];
-                    let payload = loc.offset.checked_add(RECORD_HEADER);
-                    let look = Look::new(&self.shared, Held::writer(&*self.shared));
-                    let Some(raw) = payload.and_then(|at| pack.bytes(look, at, loc.raw)) else {
-                        continue;
-                    };
-                    // A record met by an earlier settle, or put while the store is open, is
-                    // sampled already: a settle that meets it again adds nothing.
-                    let content = content_of(raw);
-                    if self.training[kind.code() as usize].sampled.contains(&content) {
-                        continue;
-                    }
-                    // alloc: a settle (idle), a value not sampled yet, until a dictionary is trained; `sample` keeps a copy and may append to the pack this borrows
-                    let bytes = raw.to_vec();
-                    self.sample(kind, content, &bytes);
-                    if self.dictionary_of(kind).is_some() {
-                        break;
-                    }
-                }
+        let mut budget = Budget { most, short_most, spent: 0, spent_short: 0, more_short: false };
+        loop {
+            let (batch, more) = self.take_cold(moves, &mut budget, stepped, &mut settled);
+            if let Some(mut batch) = batch {
+                batch.compress();
+                settled.demoted += self.put_cold(batch, stepped);
             }
-            let number = self.dictionary_of(kind);
-            let dictionary = number.map(|number| {
-                self.tiers[0].dictionaries[number as usize]
-                    .bytes
-                    // clone: an `Arc`, once per kind a settle (idle), held while it appends
-                    .clone()
-                    .expect("a dictionary of its own is held")
-            });
-            let mut batch = match cold::Batch::new(dictionary.as_deref()) {
-                Ok(batch) => batch,
-                Err(why) => {
-                    self.cannot_compress(kind, &why);
-                    return settled;
-                }
-            };
-            for at in from..to {
-                let (key, loc, row) = moves.demote[at];
-                let short = loc.raw < DEMOTE_FROM;
-                // A short cold record is listed while its kind has no dictionary only to be
-                // sampled (`tier_moves`). It is not moved yet: without the dictionary it saves
-                // too little, and would be marked tried and never moved once one is trained.
-                if short && number.is_none() {
-                    moves.demoted = at + 1;
-                    continue;
-                }
-                // A short record costs a record's work: counted as `DEMOTE_FROM` bytes, so a
-                // settle of many short records stays a short step too. They have at most
-                // `short_most` of a settle, so a backlog of them leaves the rest of the step to
-                // longer records, promotion and retiring.
-                let cost = loc.raw.max(DEMOTE_FROM);
-                if short && spent_short.saturating_add(cost) > short_most {
-                    more_short = true;
-                    moves.demoted = at + 1;
-                    continue;
-                }
-                if spent > 0 && spent.saturating_add(cost) > most {
-                    settled.more = true;
-                    moves.demoted = at;
-                    break 'kinds;
-                }
-                moves.demoted = at + 1;
-                if stepped && self.read_since(&key, loc) {
-                    continue;
-                }
-                let Some((content, bytes)) = self.movable(key, loc) else { continue };
-                spent += cost;
-                if short {
-                    spent_short += cost;
-                }
-                if let Some(columns) = encodings_of(&encodings, &bytes) {
-                    match colder_columns(columns, loc, &bytes) {
-                        Ok(Some((form, payload))) => {
-                            self.replace(key, loc, form, 0, content, &payload);
-                            settled.demoted += 1;
-                        }
-                        Ok(None) => self.set_tried(key, loc, row, stepped),
-                        Err(why) => {
-                            // alloc: a problem reported, an encoding that failed
-                            self.problems.push(format!("{:x} is not moved colder: {why}", key.0));
-                            self.set_tried(key, loc, row, stepped);
-                        }
-                    }
-                    continue;
-                }
-                let long = bytes.len() >= cold::LONG_FROM;
-                let stored =
-                    if long { cold::compress_long(&bytes) } else { batch.compress(&bytes) };
-                let stored = match stored {
-                    Ok(stored) => stored,
-                    Err(why) => {
-                        self.cannot_compress(kind, &why);
-                        return settled;
-                    }
-                };
-                if stored.len() as u64 + loc.raw / 8 > loc.raw {
-                    self.set_tried(key, loc, row, stepped);
-                    continue;
-                }
-                let dictionary = if long { NO_DICTIONARY } else { number.unwrap_or(NO_DICTIONARY) };
-                self.replace(key, loc, Form::Zstd, dictionary, content, &stored);
-                if loc.form == Form::External {
-                    self.external_replaced(&content);
-                }
-                settled.demoted += 1;
+            if self.broken.is_some() {
+                return settled;
+            }
+            if more {
+                settled.more = true;
+                break;
+            }
+            if moves.demoted >= moves.demote.len() {
+                break;
             }
         }
+        let spent = &mut budget.spent;
+        let more_short = budget.more_short;
         while moves.promoted < moves.promote.len() {
             let (key, loc, _) = moves.promote[moves.promoted];
-            if settled.more || (spent > 0 && spent.saturating_add(loc.raw) > most) {
+            if settled.more || (*spent > 0 && spent.saturating_add(loc.raw) > most) {
                 settled.more = true;
                 break;
             }
             moves.promoted += 1;
             let Some((content, bytes)) = self.movable(key, loc) else { continue };
-            spent += loc.raw;
+            *spent += loc.raw;
             match (loc.kind == Kind::Output).then(|| cold::lz4(&bytes)).flatten() {
                 Some(stored) => self.replace(key, loc, Form::Lz4, 0, content, &stored),
                 None => self.replace(key, loc, Form::Raw, 0, content, &bytes),
@@ -2580,11 +2550,11 @@ impl Store {
             }
             let Some(live) = self.live_records(at) else { continue };
             let bytes: u64 = live.iter().map(|(header, _)| header.span()).sum();
-            if spent > 0 && spent + bytes > most {
+            if *spent > 0 && *spent + bytes > most {
                 settled.more = true;
                 break;
             }
-            spent += bytes;
+            *spent += bytes;
             let unit = Unit(self.tiers[0].packs[at].unit);
             // Before anything of it is written again: what is copied on, and the dictionaries
             // it holds, go to a pack that stays (`writable_pack` passes a retiring one by).
@@ -2599,6 +2569,221 @@ impl Store {
         // earlier would stop promotion and retiring in this settle.
         settled.more |= more_short;
         settled
+    }
+
+    /// The next values of one kind the plan moves cold, read out of their packs to be
+    /// compressed ([`ColdBatch::compress`], on any thread), as far as `budget` allows; and
+    /// whether the budget stopped it with moves of the plan left. A value of a schema with
+    /// column encodings is moved here, in place of joining the batch: its columns are packed,
+    /// not compressed.
+    fn take_cold(
+        &mut self,
+        moves: &mut Moves,
+        budget: &mut Budget,
+        stepped: bool,
+        settled: &mut Settled,
+    ) -> (Option<ColdBatch>, bool) {
+        if moves.demoted >= moves.demote.len() {
+            return (None, false);
+        }
+        let encodings = Arc::clone(&self.columns);
+        let from = moves.demoted;
+        let kind = moves.demote[from].1.kind;
+        let to =
+            from + moves.demote[from..].iter().take_while(|(_, loc, _)| loc.kind == kind).count();
+        if self.dictionary_of(kind).is_none() {
+            // Long records are not sampled, as `put` does not sample them: a few would fill the
+            // samples with too few values and give the kind up.
+            let long = cold::LONG_FROM as u64;
+            for at in from..to {
+                let (_, loc, _) = moves.demote[at];
+                if loc.form != Form::Raw || loc.raw >= long {
+                    continue;
+                }
+                // The samples are full (and trained, or gave up) or the kind gave up: a
+                // copy would be kept as no sample.
+                if !self.training[kind.code() as usize].wants_samples() {
+                    break;
+                }
+                let pack = &self.tiers[0].packs[loc.pack as usize];
+                let payload = loc.offset.checked_add(RECORD_HEADER);
+                let look = Look::new(&self.shared, Held::writer(&*self.shared));
+                let Some(raw) = payload.and_then(|at| pack.bytes(look, at, loc.raw)) else {
+                    continue;
+                };
+                // A record met by an earlier settle, or put while the store is open, is
+                // sampled already: a settle that meets it again adds nothing.
+                let content = content_of(raw);
+                if self.training[kind.code() as usize].sampled.contains(&content) {
+                    continue;
+                }
+                // alloc: a settle (idle), a value not sampled yet, until a dictionary is trained; `sample` keeps a copy and may append to the pack this borrows
+                let bytes = raw.to_vec();
+                self.sample(kind, content, &bytes);
+                if self.dictionary_of(kind).is_some() {
+                    break;
+                }
+            }
+        }
+        let number = self.dictionary_of(kind);
+        let dictionary = number.map(|number| {
+            let bytes = self.tiers[0].dictionaries[number as usize]
+                .bytes
+                // clone: an `Arc`, once per batch of a settle (idle), held while it compresses
+                .clone()
+                .expect("a dictionary of its own is held");
+            (number, bytes)
+        });
+        // alloc: once per batch of a settle (idle), the values it compresses
+        let mut batch = ColdBatch { kind, dictionary, items: Vec::new() };
+        let mut more = false;
+        for at in from..to {
+            let (key, loc, row) = moves.demote[at];
+            let short = loc.raw < DEMOTE_FROM;
+            // A short cold record is listed while its kind has no dictionary only to be
+            // sampled (`tier_moves`). It is not moved yet: without the dictionary it saves
+            // too little, and would be marked tried and never moved once one is trained.
+            if short && number.is_none() {
+                moves.demoted = at + 1;
+                continue;
+            }
+            // A short record costs a record's work: counted as `DEMOTE_FROM` bytes, so a
+            // settle of many short records stays a short step too. They have at most
+            // `short_most` of a settle, so a backlog of them leaves the rest of the step to
+            // longer records, promotion and retiring.
+            let cost = loc.raw.max(DEMOTE_FROM);
+            if short && budget.spent_short.saturating_add(cost) > budget.short_most {
+                budget.more_short = true;
+                moves.demoted = at + 1;
+                continue;
+            }
+            if budget.spent > 0 && budget.spent.saturating_add(cost) > budget.most {
+                more = true;
+                moves.demoted = at;
+                break;
+            }
+            moves.demoted = at + 1;
+            if stepped && self.read_since(&key, loc) {
+                continue;
+            }
+            let Some((content, bytes)) = self.movable(key, loc) else { continue };
+            budget.spent += cost;
+            if short {
+                budget.spent_short += cost;
+            }
+            if let Some(columns) = encodings_of(&encodings, &bytes) {
+                match colder_columns(columns, loc, &bytes) {
+                    Ok(Some((form, payload))) => {
+                        self.replace(key, loc, form, 0, content, &payload);
+                        settled.demoted += 1;
+                    }
+                    Ok(None) => self.set_tried(key, loc, row, stepped),
+                    Err(why) => {
+                        // alloc: a problem reported, an encoding that failed
+                        self.problems.push(format!("{:x} is not moved colder: {why}", key.0));
+                        self.set_tried(key, loc, row, stepped);
+                    }
+                }
+                continue;
+            }
+            batch.items.push(ColdItem { key, loc, row, content, raw: bytes, stored: None });
+        }
+        ((!batch.items.is_empty()).then_some(batch), more)
+    }
+
+    /// The values of `batch`, compressed ([`ColdBatch::compress`]), written in place of their
+    /// records: how many moved. A value whose record is no longer where the batch read it (a
+    /// settle or a retire moved it meanwhile), or, `stepped`, that was read since its period
+    /// ended, stays as it is; one that saved too little is not tried again. zstd refusing a
+    /// value stops the store.
+    fn put_cold(&mut self, batch: ColdBatch, stepped: bool) -> u64 {
+        let mut demoted = 0;
+        let ColdBatch { kind, dictionary, items } = batch;
+        for item in items {
+            let ColdItem { key, loc, row, content, raw, stored } = item;
+            let stored = match stored {
+                Some(Ok(stored)) => stored,
+                Some(Err(why)) => {
+                    self.cannot_compress(kind, &why);
+                    return demoted;
+                }
+                None => {
+                    self.cannot_compress(kind, "a batch was given back before it was compressed");
+                    return demoted;
+                }
+            };
+            let here = matches!(
+                self.look().find(&key),
+                Some(Ok(found)) if found.place == Place::Pack(loc)
+            );
+            if !here || (stepped && self.read_since(&key, loc)) {
+                continue;
+            }
+            if stored.len() as u64 + loc.raw / 8 > loc.raw {
+                self.set_tried(key, loc, row, stepped);
+                continue;
+            }
+            let long = raw.len() >= cold::LONG_FROM;
+            let number = match (&dictionary, long) {
+                (Some((number, _)), false) => *number,
+                _ => NO_DICTIONARY,
+            };
+            self.replace(key, loc, Form::Zstd, number, content, &stored);
+            if loc.form == Form::External {
+                self.external_replaced(&content);
+            }
+            demoted += 1;
+        }
+        demoted
+    }
+
+    /// The next values the last [`Store::end_period`] planned to move cold, read out of their
+    /// packs: at most `most` bytes of them (one value, however long). The caller compresses
+    /// them wherever it likes ([`ColdBatch::compress`]: a worker, so the thread that owns the
+    /// store does not wait for zstd) and hands them back to [`Store::settle_put`]. `None` once
+    /// the plan has no more to move cold, or while the store cannot move (a commit in flight):
+    /// [`Store::settle_step`] then makes what is left of the plan.
+    pub fn settle_take(&mut self, most: u64) -> Option<ColdBatch> {
+        assert!(self.tiers[0].opened, "a settle of a store that is not open");
+        self.tidy();
+        if self.broken.is_some() {
+            self.moves = None;
+            return None;
+        }
+        if self.commit.is_some() || self.index_mapping || self.migrating.is_some() {
+            return None;
+        }
+        let mut moves = self.moves.take()?;
+        let mut budget =
+            Budget { most, short_most: u64::MAX, spent: 0, spent_short: 0, more_short: false };
+        let mut settled = Settled::default();
+        let mut batch = None;
+        // A kind whose values were all moved here (columns) or passed by gives no batch: the
+        // next kind's is taken, while the budget lasts.
+        while batch.is_none() && moves.demoted < moves.demote.len() {
+            let (taken, more) = self.take_cold(&mut moves, &mut budget, true, &mut settled);
+            batch = taken;
+            if more || self.broken.is_some() {
+                break;
+            }
+        }
+        self.moved_in_columns += settled.demoted;
+        if self.broken.is_none() {
+            self.moves = Some(moves);
+        }
+        batch
+    }
+
+    /// A batch [`Store::settle_take`] gave, compressed, written in place of its values'
+    /// records ([`Store::put_cold`]): how many moved. Nothing is committed: the caller
+    /// flushes ([`Store::flush`]) once enough has moved, or the plan is done.
+    pub fn settle_put(&mut self, batch: ColdBatch) -> u64 {
+        assert!(self.tiers[0].opened, "a settle of a store that is not open");
+        self.tidy();
+        if self.broken.is_some() {
+            return 0;
+        }
+        self.put_cold(batch, true) + std::mem::take(&mut self.moved_in_columns)
     }
 
     /// A key that named the whole file of `content` now finds its value in a pack: one key

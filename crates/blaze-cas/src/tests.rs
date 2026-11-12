@@ -3568,6 +3568,77 @@ fn a_period_s_moves_made_in_steps_are_a_settle_s_and_one_pack_gives_its_dead_byt
     assert_eq!(store.verify(None), Vec::new());
 }
 
+/// The daemon's settle with the compression on another thread: the store's thread reads a
+/// batch of values out ([`Store::settle_take`]), any thread compresses it
+/// ([`ColdBatch::compress`]), and the store writes it back ([`Store::settle_put`]). A value
+/// read, and one put again, while its batch was out stay as they are; the rest are what a
+/// whole settle makes them, byte for byte.
+#[test]
+fn values_compressed_on_another_thread_move_cold_as_a_settle_moves_them() {
+    let value = |n: u64| if n == 9 { text(n, cold::LONG_FROM + 100) } else { text(n, 9 << 10) };
+    // What a whole settle stores for each key.
+    let mut sim = Sim::new(35, quiet());
+    let mut whole = open(&mut sim, "whole");
+    let mut store = open(&mut sim, "store");
+    for n in 0..12 {
+        whole.put(key(n), Kind::Code, &value(n)).unwrap();
+        store.put(key(n), Kind::Code, &value(n)).unwrap();
+    }
+    flush(&mut sim, &mut whole);
+    flush(&mut sim, &mut store);
+    settle(&mut sim, &mut whole);
+    settle(&mut sim, &mut whole);
+    assert_eq!(settle(&mut sim, &mut whole).demoted, 12);
+    assert_eq!(settle_in_steps(&mut sim, &mut store, 1), Settled::default());
+    assert_eq!(settle_in_steps(&mut sim, &mut store, 1), Settled::default());
+    assert!(store.end_period());
+    let mut moved = 0;
+    let mut batches = 0;
+    while let Some(mut batch) = store.settle_take(40 << 10) {
+        batches += 1;
+        assert!(batch.bytes() <= (40 << 10).max(value(9).len() as u64), "{}", batch.bytes());
+        // Compressed where the store is not: the batch is all the work needs.
+        let batch = std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    batch.compress();
+                    batch
+                })
+                .join()
+                .unwrap()
+        });
+        if batches == 1 {
+            // Key 0 is in the first batch (the plan is in the packs' order): read while the
+            // batch was out, it stays hot.
+            assert_eq!(bytes_of(&store, &key(0)).unwrap(), value(0));
+        }
+        moved += store.settle_put(batch);
+        assert!(batches < 100, "the plan's batches did not end");
+    }
+    assert!(batches >= 3, "{batches} batches of at most 40 KiB for 12 values");
+    assert_eq!(moved, 11, "every value but the one read");
+    let mut effects = Vec::new();
+    let rest = store.settle_step(1 << 20, &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    assert!(!rest.more && !store.settling(), "{rest:?}");
+    flush(&mut sim, &mut store);
+    assert_eq!(form_of(&store, &key(0)), Form::Raw);
+    for n in 1..12 {
+        assert_eq!(form_of(&store, &key(n)), Form::Zstd, "{n}");
+        let (ours, theirs) = (store.found_of(&key(n)), whole.found_of(&key(n)));
+        let ours = store.look().record(ours, &key(n)).unwrap();
+        let theirs = whole.look().record(theirs, &key(n)).unwrap();
+        assert_eq!(ours.1, theirs.1, "{n}: the stored bytes are a whole settle's");
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), value(n), "{n}");
+    }
+    assert_eq!(store.verify(None), Vec::new());
+    drop(store);
+    let store = open(&mut sim, "store");
+    for n in 0..12 {
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), value(n), "{n} after a reopen");
+    }
+}
+
 #[test]
 fn a_cold_value_read_in_two_periods_running_comes_back_hot() {
     let mut sim = Sim::new(31, quiet());
