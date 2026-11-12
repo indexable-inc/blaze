@@ -1,0 +1,4 @@
+[workspace]
+members = ["app", "other", "up"]
+exclude = ["vendor"]
+resolver = "3"

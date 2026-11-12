@@ -205,6 +205,21 @@ impl BuildConfig {
         cbor::to_vec(self).unwrap_or_else(|error| panic!("a build config has no CBOR: {error}"))
     }
 
+    /// The configuration as the plan reads it, encoded: this one with, of the request's
+    /// environment, only the variables the workspace's load reads ([`read_by_plan`]). What a
+    /// build's database view is opened with and what its plan is kept by, so a request that
+    /// differs in any other variable (another pane's `TERM` or `COLUMNS`, systemd's
+    /// `INVOCATION_ID`, a `LIBCLANG_PATH` only build scripts read) is the same view and the
+    /// same plan (rule keys-cover-every-input: an input nothing read is not an input). The
+    /// whole environment stays in the job's own config, for what is keyed by its own reads of
+    /// it: a build script's run, a crate's `env!`, the program a `run` starts.
+    pub fn planned(&self) -> Vec<u8> {
+        // clone: once per request, the configuration without the variables no plan reads
+        let mut planned = self.clone();
+        planned.invocation.env.retain(|(name, _)| read_by_plan(name));
+        planned.encode()
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<BuildConfig, String> {
         cbor::from_slice(bytes).map_err(|error| format!("the view's build configuration: {error}"))
     }
@@ -274,6 +289,34 @@ pub struct Invocation {
     pub env: Vec<(String, String)>,
     /// Files outside every mount that cargo reads, by absolute path (`$CARGO_HOME/config.toml`).
     pub files: Vec<(String, Vec<u8>)>,
+}
+
+/// The variables cargo reads by name (cargo-notes section 1), and clippy's driver's
+/// `CLIPPY_CONF_DIR`: the load keeps no other one of the request's environment for the
+/// queries after its first.
+pub fn read_by_cargo(name: &str) -> bool {
+    name.starts_with("CARGO_")
+        || matches!(
+            name,
+            "RUSTFLAGS"
+                | "CLIPPY_CONF_DIR"
+                | "RUSTDOCFLAGS"
+                | "RUSTC_WORKSPACE_WRAPPER"
+                | "HOME"
+                | "USERPROFILE"
+                | "__CARGO_DEFAULT_LIB_METADATA"
+                | "__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT"
+                | "__CARGO_TEMPORARY_STOP_RLIB_UPLIFT_OPT_OUT"
+        )
+}
+
+/// The variables of a request's environment the workspace's load reads at all: cargo's
+/// ([`read_by_cargo`]) and the four its first query reads by name beside them (whether this is
+/// CI, whether `blaze.lock` is written, the packages whose pin is ignored). The one list:
+/// that query asserts each name it reads is here, and [`BuildConfig::planned`] keeps these
+/// alone, so a plan's key holds every variable its plan read and no other.
+pub fn read_by_plan(name: &str) -> bool {
+    read_by_cargo(name) || matches!(name, "CI" | "TF_BUILD" | crate::lock::LOCK_ENV | "BLAZE_IGNORE_PIN_FOR")
 }
 
 /// The variable `name` of a request's environment ([`Invocation::env`]).
@@ -902,6 +945,61 @@ pub fn key_input<K: Serialize>(domain: &'static str, key: &K) -> ContentId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The invariant: a plan's key (what its view is opened with) holds, of the request's
+    /// environment, the variables the load reads and no other, so two requests that differ in
+    /// a variable no plan reads are one plan, and two that differ in one it reads are not.
+    /// The control: the whole configuration, which the key was before, differs in both.
+    #[test]
+    fn a_plan_is_keyed_by_the_variables_the_load_reads_alone() {
+        let with = |env: &[(&str, &str)]| {
+            let mut env: Vec<(String, String)> =
+                env.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect();
+            env.sort();
+            BuildConfig {
+                invocation: Invocation {
+                    command: Command::Build,
+                    args: Vec::new(),
+                    root: "/w".to_owned(),
+                    cwd: "/w".to_owned(),
+                    env,
+                    files: Vec::new(),
+                },
+                mounts: Vec::new(),
+                host: "aarch64-unknown-linux-gnu".to_owned(),
+                library: "/rustc/abc/library".to_owned(),
+                std: "/s/std".to_owned(),
+                builds: "/s/build".to_owned(),
+                sources: "/s/sources".to_owned(),
+                blaze: String::new(),
+            }
+        };
+        let base = with(&[("HOME", "/home/u"), ("TERM", "xterm")]);
+        for unread in [("TERM", "dumb"), ("COLUMNS", "80"), ("INVOCATION_ID", "1"), ("LIBCLANG_PATH", "/lib")] {
+            let other = with(&[("HOME", "/home/u"), ("TERM", "xterm"), unread]);
+            assert_eq!(base.planned(), other.planned(), "{unread:?} is in a plan's key, and no plan reads it");
+            // The control.
+            assert_ne!(base.encode(), other.encode(), "{unread:?}");
+        }
+        for read in [
+            ("RUSTFLAGS", "-Cdebuginfo=0"),
+            ("CARGO_TARGET_DIR", "/t"),
+            ("CARGO_BUILD_JOBS", "2"),
+            ("HOME", "/home/v"),
+            ("CI", "true"),
+            ("TF_BUILD", "True"),
+            (crate::lock::LOCK_ENV, "write"),
+            ("BLAZE_IGNORE_PIN_FOR", "p"),
+            ("CLIPPY_CONF_DIR", "/c"),
+        ] {
+            assert!(read_by_plan(read.0), "{read:?}");
+            let other = with(&[("TERM", "xterm"), read]);
+            let base = with(&[("TERM", "xterm")]);
+            assert_ne!(base.planned(), other.planned(), "{read:?} is read by the plan, and not in its key");
+        }
+        // What is kept decodes as a configuration: the load's first query reads it as one.
+        assert!(BuildConfig::decode(&base.planned()).is_ok());
+    }
 
     fn env(vars: &[(&str, &str)]) -> Vec<(String, String)> {
         vars.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect()

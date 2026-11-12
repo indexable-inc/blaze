@@ -20,10 +20,13 @@
 //! key, set or not, so the program behaves as it would with its whole environment and its key
 //! has what they change. Each other variable is an entry [`LENT`] (`__BLAZE_LENT=NAME=VALUE`),
 //! which the interposer takes out of the environment as it loads and answers `getenv` from,
-//! tracing the read. When the program walks its environment (std says so before it does,
+//! tracing the read; one outside the walk set ([`confine::walk_sees`]) is an entry [`NAMED`]
+//! instead, answered by name the same way and never put back. When the program walks its environment (std says so before it does,
 //! through `__blaze_environ_walked`; `system` and `popen` on Linux run a shell the interposer
 //! can't hand anything) the interposer puts every lent variable back and notes
-//! `E\t<scope>\t* <why>`: from then on it read all of them. A walk the interposer is not told
+//! `E\t<scope>\t* <why>`: from then on it read all of them, which is the walk set and the
+//! visible variables, never the whole of the shell the build was started in (a `TERM`, a
+//! `COLUMNS`, a service manager's `INVOCATION_ID` reach it only by name). A walk the interposer is not told
 //! of (C code reading `environ` itself) sees the visible variables alone, which the key has.
 //!
 //! A program the process runs with its own environment gets every lent variable back in its
@@ -68,6 +71,16 @@ pub const NOT_TRACED_ON_WINDOWS: &str = "what a program reads is not traced on W
 /// which the interposers (`linux_interpose.c`, `macos_interpose.c`) take out of the program's
 /// environment as they load.
 pub const LENT: &str = "__BLAZE_LENT";
+
+/// The name of each entry a variable lent to the program by name alone is in,
+/// `__BLAZE_NAMED=NAME=VALUE`: a variable of the run's environment outside the walk set
+/// ([`confine::walk_sees`]). The interposers take these out of the environment as they load and
+/// answer `getenv` from them, tracing the read, as for [`LENT`]; unlike those they never go
+/// back into the environment, whoever walks it, so a walk (the program's, or that of a
+/// program it runs) sees the visible variables and the walk set and nothing else of the shell
+/// the build was started in. They are passed on, as entries, to a program the process runs
+/// with its own environment before it walked it, whose interposer answers them the same way.
+pub const NAMED: &str = "__BLAZE_NAMED";
 
 /// The variable that names, `NAME=NAME=...`, the variables a lending run keeps visible: the
 /// given ones, `READ_BY_THE_SANDBOX` and [`READ_BY_THE_C_LIBRARY`]. The interposers pass it on
@@ -389,6 +402,19 @@ fn run(spec: &confine::Spec, live: &Live) -> Result<i32, String> {
     super::backend(&made, Some(&program), also)
 }
 
+/// Whether a walk of the environment of a lending run whose given names are `given` shows
+/// the variable `name`: a visible one (given, read by the sandbox or by the C library) or one
+/// of the walk set. What [`program_env`] puts in the program's environment or lends until a
+/// walk, and what the run's trace has for a walk.
+fn walk_shows(given: &[String], name: &std::ffi::OsStr) -> bool {
+    // What the sandbox and the C library read themselves is of the walk set (the test
+    // `what_stays_visible_is_of_the_walk_set`).
+    confine::walk_sees(name)
+        || name.to_str().is_some_and(|it| {
+            given.iter().any(|given| given == it) || it == blaze_usercode::provider::VAR
+        })
+}
+
 /// The environment the program of `spec` is started in: [`confine::Spec::env`] as it is, or,
 /// when it [`lends`], the visible variables as they are (the given ones,
 /// `READ_BY_THE_SANDBOX`, [`READ_BY_THE_C_LIBRARY`]), each other one as an entry [`LENT`] for
@@ -423,7 +449,12 @@ fn program_env(spec: &confine::Spec) -> std::borrow::Cow<'_, [(OsString, OsStrin
                 entry.push(name);
                 entry.push("=");
                 entry.push(value);
-                env.push((OsString::from(LENT), entry));
+                // What a walk may see is lent until one; the rest is answered by name alone.
+                let how = match confine::walk_sees(name) {
+                    true => LENT,
+                    false => NAMED,
+                };
+                env.push((OsString::from(how), entry));
             }
         }
     }
@@ -504,8 +535,14 @@ fn finish(spec: &confine::Spec, live: &Live) -> Result<Report, String> {
     let ours = bytes.get(live.start as usize..).unwrap_or_default();
     // alloc: once, as the run ends: the record read as text, where it is not UTF-8.
     let lines = lines_of(&String::from_utf8_lossy(ours));
-    // clone: once, as the run ends, the environment the files are hashed by.
-    let traced = trace::assemble(&lines, None, &mut Disk::new(spec.env.clone()))
+    // clone: once, as the run ends, the environment the files are hashed by. A run that is
+    // lent its environment walked, if it did, the visible variables and the walk set
+    // ([`program_env`]); any other was given all of it.
+    let mut disk = match spec.given.as_deref().filter(|_| lends(spec)) {
+        Some(given) => Disk::lent(spec.env.clone(), |name| walk_shows(given, name)),
+        None => Disk::new(spec.env.clone()),
+    };
+    let traced = trace::assemble(&lines, None, &mut disk)
         // alloc: the error, once, and no report.
         .map_err(|error| error.to_string())?;
     Ok(Report::Ran(Some(traced)))
@@ -677,6 +714,23 @@ mod tests {
         _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Every variable a lending run keeps visible is of the walk set, so what a walk sees is
+    /// the walk set and the given names ([`super::walk_shows`]) on both sides: the program's
+    /// environment and the trace's.
+    #[cfg(unix)]
+    #[test]
+    fn what_stays_visible_is_of_the_walk_set() {
+        for name in super::READ_BY_THE_SANDBOX.iter().chain(super::READ_BY_THE_C_LIBRARY) {
+            assert!(
+                blaze_usercode::confine::walk_sees(std::ffi::OsStr::new(name)),
+                "`{name}` stays in a lending run's environment and is not of the walk set"
+            );
+        }
+        let shows = |name: &str| super::walk_shows(&["OUT_DIR".to_owned()], std::ffi::OsStr::new(name));
+        assert!(shows("OUT_DIR") && shows("PATH") && shows(blaze_usercode::provider::VAR));
+        assert!(!shows("OLDPWD") && !shows("INVOCATION_ID"));
+    }
+
     /// A run whose spec names the variables its key has is lent the rest: they are no
     /// entries of its environment but [`super::LENT`] ones, for the interposer, and it reads
     /// none of them until it reads one by name or walks its environment. What the sandbox and
@@ -688,6 +742,7 @@ mod tests {
         let dir = scratch("lent");
         let mut spec = spec(&dir, "/bin/true", &[], true);
         spec.env.push(("OLDPWD".into(), "/home/u".into()));
+        spec.env.push(("CC".into(), "clang".into()));
         spec.env.push(("LD_PRELOAD".into(), "/l.so".into()));
         spec.env.push(("LANG".into(), "C.UTF-8".into()));
         spec.given = Some(vec!["OUT".into()]);
@@ -699,7 +754,10 @@ mod tests {
             [
                 path,
                 out,
-                (super::LENT.into(), "OLDPWD=/home/u".into()),
+                // Outside the walk set: answered by name, never put back for a walk.
+                (super::NAMED.into(), "OLDPWD=/home/u".into()),
+                // Of the walk set: lent until a walk.
+                (super::LENT.into(), "CC=clang".into()),
                 ("LD_PRELOAD".into(), "/l.so".into()),
                 ("LANG".into(), "C.UTF-8".into()),
             ]

@@ -42,6 +42,143 @@ pub const LIVE: &str = "__BLAZE_SANDBOX_LIVE";
 /// a traced run of it reads all of it.
 pub const GIVEN: &str = "__BLAZE_SANDBOX_GIVEN";
 
+/// The variables a run that is lent its environment ([`GIVEN`]) sees when it, or a program it
+/// runs, walks the environment rather than asking for a variable by name (`env::vars`, a
+/// `Command` whose environment it changes, a shell, a `configure`), beside the given ones:
+/// the walk set (docs/v2/plan/design/store.md, "What a step reads"). A walk is keyed by these
+/// alone, set or not, so a run that read them all has a small key that is the same in every
+/// pane and under every service manager; a variable outside the set (`TERM`, `COLUMNS`,
+/// `SHLVL`, `OLDPWD`, `SSH_*`, `XDG_*`, systemd's `INVOCATION_ID`) reaches a program only by a
+/// read of its name, which is traced. The set is what programs a build script runs take from
+/// their environment without a script naming it: where programs and the user's files are,
+/// the locale and time zone, the C toolchain's and its build tools' own variables, cargo's
+/// and rustc's, and a nix shell's compiler wrapper's. Sorted, for [`walk_sees`].
+pub const WALK_NAMES: &[&str] = &[
+    "AR",
+    "ARFLAGS",
+    "AS",
+    "ASFLAGS",
+    "CC",
+    "CCC_OVERRIDE_OPTIONS",
+    "CFLAGS",
+    "CMAKE",
+    "COMPILER_PATH",
+    "CPATH",
+    "CPLUS_INCLUDE_PATH",
+    "CPP",
+    "CPPFLAGS",
+    "CXX",
+    "CXXFLAGS",
+    "C_INCLUDE_PATH",
+    "DEVELOPER_DIR",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "GCC_EXEC_PREFIX",
+    "HOME",
+    "IPHONEOS_DEPLOYMENT_TARGET",
+    "LANG",
+    "LANGUAGE",
+    "LD",
+    "LDFLAGS",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LD_RUN_PATH",
+    "LIBRARY_PATH",
+    "LOCPATH",
+    "LOGNAME",
+    "MACOSX_DEPLOYMENT_TARGET",
+    "MAKE",
+    "MAKEFLAGS",
+    "MFLAGS",
+    "MallocScribble",
+    "MallocSpaceEfficient",
+    "MallocStackLogging",
+    "MallocStackLoggingDirectory",
+    "MallocStackLoggingNoCompact",
+    "MallocZeroOnFree",
+    "NLSPATH",
+    "NM",
+    "OBJCOPY",
+    "OBJC_INCLUDE_PATH",
+    "OBJDUMP",
+    "PATH",
+    "PKG_CONFIG",
+    "RANLIB",
+    "SDKROOT",
+    "SHELL",
+    "SOURCE_DATE_EPOCH",
+    "STRIP",
+    "TEMP",
+    "TEMPDIR",
+    "TMP",
+    "TMPDIR",
+    "TVOS_DEPLOYMENT_TARGET",
+    "TZ",
+    "TZDIR",
+    "USER",
+    "WATCHOS_DEPLOYMENT_TARGET",
+    "XROS_DEPLOYMENT_TARGET",
+    "ZERO_AR_DATE",
+];
+
+/// The variables of the walk set by how their names start: cargo's and rustc's (`CARGO_*`,
+/// `RUSTFLAGS`, `RUSTC_WRAPPER`, `RUSTUP_*`), what a dependency's script said (`DEP_*`), the
+/// C toolchain's by target (`CC_<triple>`, `CFLAGS_<triple>`, `HOST_CC`, `TARGET_CC`), a
+/// locale's categories (`LC_*`), CMake's and pkg-config's own, and a nix shell's compiler
+/// wrapper's (`NIX_CFLAGS_COMPILE`, `NIX_LDFLAGS`, `NIX_CC_WRAPPER_*`), which a shell reads
+/// by walking.
+pub const WALK_PREFIXES: &[&str] = &[
+    "AR_",
+    "CARGO",
+    "CC_",
+    "CFLAGS_",
+    "CMAKE_",
+    "CXXFLAGS_",
+    "CXX_",
+    "DEP_",
+    "HOST_",
+    "LC_",
+    "NIX_",
+    "PKG_CONFIG_",
+    "RUST",
+    "TARGET_",
+];
+
+/// Whether a walk of a lent environment sees the variable `name`: one of [`WALK_NAMES`] or
+/// of [`WALK_PREFIXES`]. On a platform whose sandbox lends nothing (Windows) a run is given
+/// its whole environment, and a walk sees every variable. A name that is not text is in
+/// neither list.
+pub fn walk_sees(name: &std::ffi::OsStr) -> bool {
+    if !cfg!(unix) || planted_whole_walk() {
+        return true;
+    }
+    let Some(name) = name.to_str() else { return false };
+    WALK_NAMES.binary_search(&name).is_ok()
+        || WALK_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A bug a test plants, which its oracle has to catch: a walk sees the whole environment
+    /// ([`walk_sees`] says yes to every name), as it did before there was a walk set. Off: no
+    /// bug planted.
+    pub(crate) static PLANTED_WHOLE_WALK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a test planted [`PLANTED_WHOLE_WALK`]; never outside a test.
+fn planted_whole_walk() -> bool {
+    #[cfg(test)]
+    {
+        PLANTED_WHOLE_WALK.get()
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// The subcommand and flag of blaze's launcher.
 pub const LAUNCH: [&str; 2] = ["sandbox", "--v2"];
 
@@ -542,6 +679,32 @@ mod tests {
         assert_eq!(spec.env, vec![("CC".into(), "cc".into())]);
         assert_eq!(spec.given, Some(vec!["OUT_DIR".to_owned(), "TARGET".to_owned()]));
         assert!(given_value([std::ffi::OsStr::new("A=B")]).unwrap_err().contains("`A=B`"));
+    }
+
+    /// The invariant: the walk set is a fixed list, sorted (it is searched), that holds what a
+    /// C toolchain is pointed by and none of what differs from one pane or service to the
+    /// next.
+    #[test]
+    fn a_walk_sees_the_fixed_set_and_nothing_of_a_shell_session() {
+        assert!(WALK_NAMES.is_sorted(), "WALK_NAMES is searched: keep it sorted");
+        assert!(WALK_NAMES.windows(2).all(|pair| pair[0] != pair[1]));
+        let sees = |name: &str| walk_sees(std::ffi::OsStr::new(name));
+        if cfg!(unix) {
+            for name in ["PATH", "HOME", "CC", "CFLAGS", "CC_aarch64_unknown_linux_gnu", "SDKROOT"] {
+                assert!(sees(name), "{name}");
+            }
+            for name in ["NIX_CFLAGS_COMPILE", "RUSTFLAGS", "CARGO_HOME", "LC_ALL", "DEP_Z_INCLUDE"] {
+                assert!(sees(name), "{name}");
+            }
+            for name in ["TERM", "COLUMNS", "SHLVL", "OLDPWD", "PWD", "INVOCATION_ID"] {
+                assert!(!sees(name), "{name}");
+            }
+            for name in ["IO_PRESSURE_WATCH", "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR", "LIBCLANG_PATH"] {
+                assert!(!sees(name), "{name}");
+            }
+        } else {
+            assert!(sees("TERM"));
+        }
     }
 
     #[test]

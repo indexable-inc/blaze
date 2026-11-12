@@ -453,24 +453,44 @@ impl Default for Files {
     }
 }
 
-/// An environment, sorted by name, each name once (the first, as `getenv` finds it).
+/// An environment, sorted by name, each name once (the first, as `getenv` finds it), and
+/// what a walk of it sees: all of it ([`Env::new`]), or, for a run that is lent its
+/// environment, the variables its sandbox shows a walk ([`Env::lent`]).
 #[derive(PartialEq, Eq, Default, Debug)]
-pub struct Env(Vec<(OsString, OsString)>);
+pub struct Env {
+    vars: Vec<(OsString, OsString)>,
+    /// What a walk sees of `vars`, in their order, when that is not all of them.
+    walk: Option<Vec<(OsString, OsString)>>,
+}
 
 impl Env {
     pub fn new(mut vars: Vec<(OsString, OsString)>) -> Env {
         vars.sort_by(|a, b| a.0.cmp(&b.0));
         vars.dedup_by(|later, first| later.0 == first.0);
-        Env(vars)
+        Env { vars, walk: None }
+    }
+
+    /// The environment of a run that is lent it ([`crate::confine::GIVEN`]): a read by name
+    /// finds any variable of `vars`, and a walk sees those `sees` says alone (the walk set,
+    /// [`crate::confine::walk_sees`], and for the launcher the given names as well). So what
+    /// a run that read them all is keyed by is the walk's variables, never the whole of the
+    /// environment the build was started in.
+    pub fn lent(vars: Vec<(OsString, OsString)>, sees: impl Fn(&OsStr) -> bool) -> Env {
+        let mut env = Env::new(vars);
+        // clone: once per run prepared or checked, the variables its walk sees
+        let walk = env.vars.iter().filter(|(name, _)| sees(name)).cloned().collect(); // alloc: as above
+        env.walk = Some(walk);
+        env
     }
 
     pub fn get(&self, name: &OsStr) -> Option<&OsStr> {
-        let at = self.0.binary_search_by(|it| it.0.as_os_str().cmp(name)).ok()?;
-        Some(&self.0[at].1)
+        let at = self.vars.binary_search_by(|it| it.0.as_os_str().cmp(name)).ok()?;
+        Some(&self.vars[at].1)
     }
 
+    /// What a walk of the environment sees: sorted by name, each name once.
     pub fn vars(&self) -> &[(OsString, OsString)] {
-        &self.0
+        self.walk.as_deref().unwrap_or(&self.vars)
     }
 }
 
@@ -491,6 +511,12 @@ pub struct Disk {
 impl Disk {
     pub fn new(env: Vec<(OsString, OsString)>) -> Disk {
         Disk { files: Files::shared(), env: Env::new(env) }
+    }
+
+    /// The files with the environment of a run that is lent it ([`Env::lent`], whose `sees`
+    /// this takes): what a build script's run is assembled and checked against.
+    pub fn lent(env: Vec<(OsString, OsString)>, sees: impl Fn(&OsStr) -> bool) -> Disk {
+        Disk { files: Files::shared(), env: Env::lent(env, sees) }
     }
 
     /// The same files with another environment.
@@ -809,6 +835,25 @@ mod tests {
         assert_eq!(env.vars(), expected.as_slice());
         assert_eq!(env.get(OsStr::new("B")), Some(OsStr::new("2")));
         assert_eq!(env.get(OsStr::new("C")), None);
+    }
+
+    /// The invariant: a lent environment answers a read by name from all of it and a walk
+    /// from the walk's variables alone, in order. The control: the same variables not lent
+    /// show a walk every one.
+    #[test]
+    fn a_lent_environment_is_read_whole_by_name_and_walked_in_part() {
+        let vars = || -> Vec<(OsString, OsString)> {
+            vec![("TERM".into(), "x".into()), ("PATH".into(), "/bin".into()), ("CC".into(), "cc".into())]
+        };
+        let lent = Env::lent(vars(), |name| name != "TERM");
+        assert_eq!(lent.get(OsStr::new("TERM")), Some(OsStr::new("x")));
+        let walked: Vec<&OsStr> = lent.vars().iter().map(|it| it.0.as_os_str()).collect();
+        assert_eq!(walked, [OsStr::new("CC"), OsStr::new("PATH")]);
+        let mut disk = Disk::lent(vars(), |name| name != "TERM");
+        assert_eq!(disk.env(OsStr::new("TERM")), Some(OsStr::new("x")));
+        assert_eq!(disk.env_all().len(), 2);
+        // The control.
+        assert_eq!(Env::new(vars()).vars().len(), 3);
     }
 
     #[test]

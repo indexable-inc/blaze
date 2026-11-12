@@ -1,0 +1,49 @@
+about = "A variable one build script reads by name and declares (MADE_VALUE), changed: that script runs again, and what is made from its output is made again (its library and the program), nothing else. A variable one crate reads with option_env! (APP_TAG), changed: that crate's unit, and no build script. Each difference that matters still separates: the program prints the new value both times."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "52 none\n"
+
+[[revision]]
+steps = []
+action = "run"
+args = ["-p", "app"]
+env = { MADE_VALUE = "41" }
+prints = "53 none\n"
+reused = ["up::sum"]
+max_units = 2
+max_records = 2
+max_runs = 1
+
+[[revision]]
+steps = []
+action = "run"
+args = ["-p", "app"]
+prints = "53 none\n"
+redone = []
+max_units = 0
+max_records = 0
+max_runs = 0
+
+[[revision]]
+steps = []
+action = "run"
+args = ["-p", "app"]
+env = { APP_TAG = "tagged" }
+prints = "53 tagged\n"
+reused = ["up::sum"]
+max_units = 1
+max_records = 1
+max_runs = 0
+
+[[revision]]
+steps = []
+action = "run"
+args = ["-p", "app"]
+env = { MADE_VALUE = "40" }
+prints = "52 tagged\n"
+reused = ["up::sum"]
+max_units = 2
+max_runs = 1

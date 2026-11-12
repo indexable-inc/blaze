@@ -933,7 +933,7 @@ fn with_record_inputs<T>(
         places: &places,
         unit: KeyedUnit::of(job, u)?,
         plan: job.plan(unit)?,
-        run_env: &runs.env,
+        run_env: keyed_run_env(u, job.plan(unit)?, &runs),
         script_check_cfgs: script_check_cfgs(job, unit)?,
         script_link_args: script_link_args(job, unit)?,
         linked_rustflag_libs: linked_rustflag_libs(job, unit)?,
@@ -1219,8 +1219,10 @@ pub(crate) struct RecordInputs<'a> {
     /// paths.
     pub(crate) places: &'a Places,
     pub(crate) unit: KeyedUnit<'a>,
+    /// Its plan, of which the key holds what making the unit reads ([`KeyedPlan`]).
     pub(crate) plan: &'a blaze_units::query::UnitPlan,
-    /// How its program is run ([`artifact::run_env`]).
+    /// How its program is run ([`artifact::run_env`]), for a unit that makes one; empty for
+    /// any other ([`keyed_run_env`]).
     pub(crate) run_env: &'a [(String, String)],
     /// The `--check-cfg`s its package's build script runs printed ([`script_check_cfgs`]):
     /// its check's lints read them, and neither its plan nor its crate's identity holds them.
@@ -1268,7 +1270,7 @@ impl RecordInputs<'_> {
         places.layout(&mut hasher);
         SCRATCH.with_borrow_mut(|scratch| -> Result<(), ApiError> {
             hash_cbor(&mut hasher, scratch, places, &self.unit, "unit", unit)?;
-            hash_cbor(&mut hasher, scratch, places, self.plan, "plan", unit)?;
+            hash_cbor(&mut hasher, scratch, places, &KeyedPlan::of(self.plan), "plan", unit)?;
             hash_cbor(&mut hasher, scratch, places, self.run_env, "run environment", unit)?;
             hash_cbor(
                 &mut hasher,
@@ -1359,7 +1361,7 @@ impl RecordInputs<'_> {
             cbor("mode", &u.mode)?,
             cbor("features", &u.features)?,
             flag("whether it is std's", u.is_std),
-            cbor("plan", self.plan)?,
+            cbor("plan", &KeyedPlan::of(self.plan))?,
             cbor("run environment", &self.run_env)?,
             cbor("the check-cfgs its build scripts printed", &self.script_check_cfgs)?,
             cbor("the link arguments its build scripts printed", &self.script_link_args)?,
@@ -1435,19 +1437,140 @@ mod erased {
     }
 }
 
-/// The job's kind as `unit`'s record key holds it. A build script's compile is the same
-/// program whatever the job's kind ([`super::checks_only`] is false for it under every kind),
-/// as a device unit's MSL is, so a `blaze check` and a `blaze build` share its record; any
-/// other unit keys the kind.
+/// The job's kind as `unit`'s record key holds it: what making the unit reads of it, which is
+/// whether the job only checks ([`super::checks_only`], and the front end's
+/// `release::Release::new`: the two readers of the kind while a unit is made). So 0 for a check
+/// and 1 for a build, a test and a run alike: a library `blaze build` made is the library
+/// `blaze test` and `blaze run` link, found by its record, where its unit and plan are the
+/// same (a test's own program is another unit, of mode `Test`). A build script's compile is
+/// the same program whatever the job's kind (`checks_only` is false for it under every kind),
+/// as a device unit's MSL is, so a `blaze check` and a `blaze build` share its record too.
 pub(crate) fn keyed_kind(kind: JobKind, unit: &Unit) -> u8 {
     if unit.mode == Mode::Build && (unit.target.is_custom_build() || unit.for_device()) {
         return 1;
     }
+    if let Some(planted) = planted_kind(kind) {
+        return planted;
+    }
     match kind {
         JobKind::Check => 0,
-        JobKind::Build => 1,
-        JobKind::Test => 2,
-        JobKind::Run => 3,
+        JobKind::Build | JobKind::Test | JobKind::Run => 1,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A bug a test plants, which its oracle has to catch: each kind of job its own byte in a
+    /// record's key ([`keyed_kind`]), as it was before the key held only whether the job
+    /// checks. Off: no bug planted.
+    pub(crate) static PLANTED_KIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The byte a test planted for `kind` ([`PLANTED_KIND`]); never one outside a test.
+fn planted_kind(kind: JobKind) -> Option<u8> {
+    #[cfg(test)]
+    {
+        if PLANTED_KIND.get() {
+            return Some(match kind {
+                JobKind::Check => 0,
+                JobKind::Build => 1,
+                JobKind::Test => 2,
+                JobKind::Run => 3,
+            });
+        }
+    }
+    let _ = kind;
+    None
+}
+
+/// How `unit`'s program is run as its record's key holds it: `runs`' environment for a unit
+/// that makes a program ([`artifact::executable`]), whose record's artifact keeps it for the
+/// client that runs it; nothing for any other, whose artifact keeps none
+/// ([`artifact::artifact`]). So a library's key holds nothing of where the build's native
+/// directories are or of what a build script of its closure set for a run.
+pub(crate) fn keyed_run_env<'a>(
+    unit: &Unit,
+    plan: &blaze_units::query::UnitPlan,
+    runs: &'a artifact::Runs,
+) -> &'a [(String, String)] {
+    match artifact::executable(unit, plan) {
+        Some(_) => &runs.env,
+        None => &[],
+    }
+}
+
+/// A unit's plan as its record's key hashes it: every field that making the unit or its
+/// record reads, and no other. All of them are the unit's own (its flags, cfgs, lints, the
+/// variables cargo derives from its package, its output files, its build script's
+/// directory); none is another unit's or the request's, but for what the request's shape
+/// decides of its outputs (a `cdylib` or `staticlib` is copied to the profile's directory
+/// only as a root of the request) and of `unit_id` (the build's LTO, from its roots), which
+/// the record holds: its outputs are placed from the record. `metadata` is left out: nothing
+/// reads it (`unit_id` and `extra_filename`, which name the files, are kept).
+#[derive(Serialize)]
+struct KeyedPlan<'a> {
+    checked_as_test: bool,
+    extra_filename: &'a str,
+    unit_id: &'a str,
+    cfgs: &'a [String],
+    check_cfg: &'a [String],
+    rustflags: &'a [String],
+    lints: &'a [String],
+    env: &'a [(String, String)],
+    outputs: &'a [String],
+    out_dir: &'a Option<String>,
+    links: &'a Option<String>,
+    unsandboxed: bool,
+    runner: &'a [String],
+    harness: bool,
+    clippy: &'a Option<blaze_units::query::Clippy>,
+    macro_wasm: bool,
+    gpu_msl: &'a Option<String>,
+}
+
+impl<'a> KeyedPlan<'a> {
+    fn of(plan: &'a blaze_units::query::UnitPlan) -> KeyedPlan<'a> {
+        // Every field named: a field added to a plan is kept or left out here by a decision,
+        // never by default.
+        let blaze_units::query::UnitPlan {
+            checked_as_test,
+            metadata: _,
+            extra_filename,
+            unit_id,
+            cfgs,
+            check_cfg,
+            rustflags,
+            lints,
+            env,
+            outputs,
+            out_dir,
+            links,
+            unsandboxed,
+            runner,
+            harness,
+            clippy,
+            macro_wasm,
+            gpu_msl,
+        } = plan;
+        KeyedPlan {
+            checked_as_test: *checked_as_test,
+            extra_filename,
+            unit_id,
+            cfgs,
+            check_cfg,
+            rustflags,
+            lints,
+            env,
+            outputs,
+            out_dir,
+            links,
+            unsandboxed: *unsandboxed,
+            runner,
+            harness: *harness,
+            clippy,
+            macro_wasm: *macro_wasm,
+            gpu_msl,
+        }
     }
 }
 

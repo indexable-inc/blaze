@@ -1184,6 +1184,45 @@ fn a_build_scripts_record_is_keyed_alike_under_every_goal() {
     );
 }
 
+/// The invariant: a record's key holds of the job's kind only what making a unit reads of it,
+/// whether the job checks. So a library built by `blaze build` is keyed as `blaze test` and
+/// `blaze run` key it (build, then test, then build: its record is found each time), and a
+/// check, which makes no code, is still apart. The control: each kind its own byte again
+/// ([`compile::PLANTED_KIND`]), a test keys the library apart from a build.
+#[test]
+fn a_build_a_test_and_a_run_key_a_library_alike() {
+    use crate::serve::work::JobKind;
+    let lib = unit("p", target("p", "lib", "/w/p/src/lib.rs"), Mode::Build, &[]);
+    let alike = || {
+        let built = compile::keyed_kind(JobKind::Build, &lib);
+        [JobKind::Test, JobKind::Run].iter().all(|kind| compile::keyed_kind(*kind, &lib) == built)
+    };
+    assert!(alike(), "a test or a run keys a library apart from a build, which makes the same record");
+    assert_ne!(compile::keyed_kind(JobKind::Check, &lib), compile::keyed_kind(JobKind::Test, &lib));
+    compile::PLANTED_KIND.set(true);
+    let planted = alike();
+    compile::PLANTED_KIND.set(false);
+    assert!(!planted, "with each kind its own byte a test must key apart: the test would pass without the change");
+}
+
+/// The invariant: how a program is run is in the key of a unit that makes one, whose record
+/// keeps it, and in no other unit's: a library's key holds nothing of the build's native
+/// directories or of what a build script set for a run. The control is the binary, whose key
+/// part is the environment itself.
+#[test]
+fn only_a_unit_that_makes_a_program_is_keyed_by_how_it_is_run() {
+    let runs = super::artifact::Runs {
+        runner: Vec::new(),
+        env: vec![("LD_LIBRARY_PATH".to_owned(), "/w/target/debug/build/z-1/out".to_owned())],
+    };
+    let lib = unit("p", target("p", "lib", "/w/p/src/lib.rs"), Mode::Build, &[]);
+    let lib_plan = plan("-1", &["/w/target/debug/deps/libp-1.rlib"]);
+    assert!(compile::keyed_run_env(&lib, &lib_plan, &runs).is_empty());
+    let bin = unit("p", target("p", "bin", "/w/p/src/main.rs"), Mode::Build, &[]);
+    let bin_plan = plan("-2", &["/w/target/debug/deps/p-2"]);
+    assert_eq!(compile::keyed_run_env(&bin, &bin_plan, &runs), runs.env.as_slice());
+}
+
 const MACROS: &[u8] = b"extern crate proc_macro;\nuse proc_macro::TokenStream;\n\n\
 #[proc_macro]\npub fn shout(input: TokenStream) -> TokenStream { input }\n\n\
 #[proc_macro_attribute]\npub fn tag(_: TokenStream, item: TokenStream) -> TokenStream { item }\n";
@@ -2380,6 +2419,74 @@ fn each_maker_of_a_record_moves_its_key() {
     for (what, makers) in moved {
         assert_ne!(key(&mut front, makers), base, "{what} code identity is in the record key");
     }
+}
+
+/// The invariant: a unit's record key holds of its plan what making the unit reads
+/// ([`compile::KeyedPlan`]), so each of those still separates two records (its flags, its cfgs,
+/// its lints, a variable cargo derives for it, its output files, its features and profile
+/// through the unit), and what nothing reads (`metadata`) separates none. The control is the
+/// other half: were the plan not hashed at all, the changes that must move the key would not.
+#[test]
+fn a_units_key_holds_what_of_its_plan_is_read_and_nothing_else() {
+    use blaze_units::query::UnitPlan;
+    let mut front = orphan_front(false);
+    let identity = front.lowered.identity(0).unwrap();
+    let base_plan = front.units.plans[0].clone();
+    let base_unit = front.units.graph.units[0].clone();
+    let key = |u: &Unit, plan: &UnitPlan| {
+        compile::RecordInputs {
+            identity,
+            places: &test_places(),
+            unit: compile::KeyedUnit::among(u, |at| Ok(&front.units.graph.units[at])).unwrap(),
+            plan,
+            run_env: &[],
+            script_check_cfgs: Vec::new(),
+            script_link_args: Vec::new(),
+            linked_rustflag_libs: Vec::new(),
+            makers: one_maker(),
+            kind: compile::keyed_kind(crate::serve::work::JobKind::Build, u),
+            goal: compile::goal_byte(blaze_api::Goal::Edit),
+            verified: false,
+            reached: false,
+            pgo: None,
+            lint_profile: None,
+            layout: None,
+        }
+        .key(0)
+        .unwrap()
+    };
+    let base = key(&base_unit, &base_plan);
+    // What nothing reads moves nothing.
+    let unread = UnitPlan { metadata: "ffffffffffffffff".to_owned(), ..base_plan.clone() };
+    assert_eq!(key(&base_unit, &unread), base, "`metadata`, which nothing reads, is in a unit's key");
+    // What making it reads still separates.
+    let pushed = |mut list: Vec<String>, word: &str| {
+        list.push(word.to_owned());
+        list
+    };
+    let mut derived = base_plan.env.clone();
+    derived.push(("CARGO_PKG_VERSION".to_owned(), "9.9.9".to_owned()));
+    let read: [(&str, UnitPlan); 6] = [
+        ("its rustflags", UnitPlan { rustflags: pushed(base_plan.rustflags.clone(), "-Copt-level=3"), ..base_plan.clone() }),
+        ("its cfgs", UnitPlan { cfgs: pushed(base_plan.cfgs.clone(), "feature=\"x\""), ..base_plan.clone() }),
+        ("its lints", UnitPlan { lints: pushed(base_plan.lints.clone(), "--warn=unused"), ..base_plan.clone() }),
+        ("a variable cargo derives for it", UnitPlan { env: derived, ..base_plan.clone() }),
+        ("its output files", UnitPlan { outputs: pushed(base_plan.outputs.clone(), "/w/target/debug/deps/libother.rlib"), ..base_plan.clone() }),
+        ("whether it is checked as a test", UnitPlan { checked_as_test: !base_plan.checked_as_test, ..base_plan.clone() }),
+    ];
+    for (what, plan) in &read {
+        assert_ne!(key(&base_unit, plan), base, "{what} is read as the unit is made, and is not in its key");
+    }
+    // Its own features, profile and target, through the unit.
+    let mut featured = base_unit.clone();
+    featured.features.push("extra".to_owned());
+    assert_ne!(key(&featured, &base_plan), base, "its features");
+    let mut optimized = base_unit.clone();
+    optimized.profile.opt_level = "3".to_owned();
+    assert_ne!(key(&optimized, &base_plan), base, "its profile");
+    let mut elsewhere = base_unit.clone();
+    elsewhere.platform = Some("aarch64-unknown-linux-gnu".to_owned());
+    assert_ne!(key(&elsewhere, &base_plan), base, "its target");
 }
 
 /// Rule 21 for the build goal (docs/v2/plan/design/tiers.md): a unit's record holds the code

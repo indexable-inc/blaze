@@ -396,6 +396,84 @@ identical bytes" over a real database with a dependency read from an image (the 
 five measurements of the lane's brief (second project, restart, second home, wall time, the
 edit loop).
 
+## What a step reads
+
+2026-11-12, lane envkeys-1112 (decision D21). "Content keys" says how an input is written into
+a key; this says which inputs a key may hold at all: what the step that made the value read,
+and nothing else. An input nothing read is not an input (rule keys-cover-every-input, both
+ways): a key that holds one rebuilds for a change that cannot matter. Written, not yet run:
+the tests are named, their results are the round's.
+
+| Step | Reads | How each read is known |
+|---|---|---|
+| the plan (the workspace's load) | manifests, lock, cargo's config files; of the environment `CARGO_*`, `RUSTFLAGS`, `RUSTDOCFLAGS`, `RUSTC_WORKSPACE_WRAPPER`, `CLIPPY_CONF_DIR`, `HOME`, `USERPROFILE`, three `__CARGO_*`, `CI`, `TF_BUILD`, `BLAZE_LOCK`, `BLAZE_IGNORE_PIN_FOR` | one list, `blaze_units::query::read_by_plan`; the load's first query asserts each name it reads is on it; the view is opened with, and the plan kept by, `BuildConfig::planned` (those variables alone) |
+| a crate's front end | its files, cfgs, edition, target, the variables cargo derives for it (`CARGO_PKG_*`, `CARGO_MANIFEST_DIR`, `OUT_DIR`: from the unit, never the shell), its dependencies | its identity (`identity_of`); `env!`/`option_env!` of any other variable is a tracked read by name, and the record is filed under the names and values read (`serve/unit/reads.rs`) |
+| a crate's codegen | the front end's output, the unit's profile, target, flags, goal, PGO and layout profiles by content | the unit key's own fields (`KeyedUnit`, `KeyedPlan`) |
+| a link | each function's code record, the link arguments its build scripts printed, the `-l`/`-L` of the crates it links | by value, in the unit key |
+| a build script's run | what blaze sets from the unit (given: in the run's key); any variable it or a program it runs asks for *by name* (traced, keyed by name and value, set or not); when it or a child *walks* the environment, the walk set; files and listings (traced); `rerun-if-env-changed` (cargo's rule, where the trace is not whole) | the sandbox (`sandbox/v2.rs`, the interposers) |
+| a proc macro's expansion | its input tokens, the calling crate's own variables, files it opens | the expansion server's trace (`reads.rs`, expansions) |
+
+**The environment.** Nothing of the request's environment is in a unit's key or a plan's key
+except the rows above. The request's whole environment still travels with the job
+(`JobInput::config`), because a build script may ask for any variable by name; it is keyed by
+what was asked.
+
+**The walk set.** A script that enumerates its environment (`env::vars`, a `Command` whose
+environment it changes, `system`), or runs a program that takes its environment whole (a C
+compiler, a shell, `configure`, `cmake`), used to be lent the user's whole shell and keyed by
+all of it: `TERM`, `COLUMNS`, `SHLVL`, systemd's `INVOCATION_ID`, a new `LIBCLANG_PATH`, each
+reran every such script. Now a walk sees a fixed set (`blaze_usercode::confine::WALK_NAMES`,
+`WALK_PREFIXES`) beside the given variables, and "it read them all" is that set:
+
+- where things are: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, the temporary directory names
+  (the sandbox's own);
+- locale and time: `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `TZDIR`;
+- the C toolchain and its tools: `CC`, `CXX`, `CPP`, `AR`, `AS`, `LD`, `NM`, `RANLIB`, `STRIP`,
+  `OBJCOPY`, `OBJDUMP`, their flags, `CC_<triple>`/`CFLAGS_<triple>`/`HOST_*`/`TARGET_*`, the
+  compilers' own (`CPATH`, `C_INCLUDE_PATH`, `LIBRARY_PATH`, `SDKROOT`, `DEVELOPER_DIR`,
+  `*_DEPLOYMENT_TARGET`, `SOURCE_DATE_EPOCH`), `MAKE`, `MAKEFLAGS`, `CMAKE_*`, `PKG_CONFIG*`,
+  the dynamic loader's paths;
+- cargo's and rustc's: `CARGO*`, `RUST*`, `DEP_*`;
+- a nix shell's compiler wrapper: `NIX_*` (a bash script, which only walks).
+
+A variable outside the set reaches a program only by a read of its name (`getenv`,
+`env::var`): the interposer answers it from an entry `__BLAZE_NAMED=NAME=VALUE` and traces
+the read, in the script and in a program it runs with its environment untouched. What this
+refuses on purpose: a variable outside the set that only a walking child reads (`$FOO` in a
+`configure`) when its parent rebuilt the environment; the script must read it by name or the
+set must grow. Windows lends nothing, so a walk there is still all of it. Tests:
+`blaze_usercode::script::tests::a_walk_of_the_environment_is_keyed_by_the_walk_set_and_named_reads_alone`
+(control: the walk made whole again), `confine`'s and `sandbox::v2`'s; revision cases
+`a_variable_no_step_reads`, `a_variable_a_step_reads`, `a_build_script_that_wanted_a_variable`.
+
+**The plan in a unit's key.** A unit's key takes of its `UnitPlan` what making it reads
+(`KeyedPlan`: every field but `metadata`, which nothing reads), how its program is run only
+when it makes one (`keyed_run_env`), and of the job's kind only whether it checks
+(`keyed_kind`: build, test and run key a library alike). It never held another unit's plan
+or which packages were asked for. What of the request's shape is still in it, through the
+plan: a `cdylib`'s or `staticlib`'s copy to the profile directory (roots only) and LTO
+(from the roots); both are in the record's own output list, so they leave the key only when
+a hit places outputs from the finding build's plan (not built). A test build and a plain
+build share a library's record when its unit is the same; today cargo names the profile
+`test` there and the front end's identity may hold the plan (lane sealed-1112), so the
+kind byte is necessary and not sufficient.
+
+**The toolchain.** A key holds the code identity of each stage that made its value. What
+exists: `blaze_codegen_code::{FRONT_END, CODEGEN, RECORD}`, each the hash of a package
+closure (FRONT_END: hir-def, hir-ty, diagnostics, items, lower, macro-eval; CODEGEN: that
+plus hir-ty-codegen and blaze-codegen; RECORD: blaze-cargo's closure, which holds both and
+blaze-link and blaze-lints), and per-function identities (`fn_info(&f).code_id`, `code_id`
+of a compiled function) that key code records, not units. Every unit key holds all three,
+so today any edit under blaze-cargo's closure, the linker's among them, misses every unit
+record (check-only ones too), though function code records keyed by code identity survive.
+The split the rule asks for, not built: a check record keyed by FRONT_END and a
+`CHECK_RECORD` identity (lints, diagnostics, the record's encoding); a library's by those and
+CODEGEN; only a linking unit's by a `LINK` identity (blaze-link's closure). It needs the
+record's making moved out of blaze-cargo's closure or a file-level cut: `Cut` refuses to cut
+blaze-link today because `blaze-launch-host` is built from it and `serve/unit/*.rs` name it.
+Whether a build script run's key holds the sandbox's own code identity (the launcher and the
+interposers, which decide what a run can read) was not checked by this lane.
+
 ## Cold start as a fetch: the standard library (F4)
 
 2026-11-11. A machine that has never built std spends its first build on it (10 to 12 s for

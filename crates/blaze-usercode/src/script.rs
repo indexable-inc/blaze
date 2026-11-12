@@ -12,8 +12,11 @@
 //!   to it, not given ([`crate::confine::GIVEN`]): its environment holds the given ones
 //!   alone, and what it reads of the others by name is traced by name, so a variable it never
 //!   reads (a shell's `OLDPWD` or `SHLVL`) is in no key. A script that walks its environment
-//!   (`env::vars`, a `Command` that passes it on to a program) is lent all of it then, and
-//!   read all of it.
+//!   (`env::vars`, a `Command` that passes it on to a program) is lent the walk set then
+//!   ([`crate::confine::WALK_NAMES`], [`crate::confine::WALK_PREFIXES`]: a fixed list, the
+//!   same in every shell), and read all of that: never the whole of the environment the
+//!   build was started in, so another pane's or another service manager's variables rerun no
+//!   script. A variable outside the set is read by its name alone.
 //! - **Portable** (docs/v2/plan/design/store.md, "Portable keys"): every path and value in
 //!   the key and in what is traced is written against the run's roots ([`crate::roots`]): its
 //!   package, its `OUT_DIR`, the target directory, the workspace, blaze's tools and launcher
@@ -41,7 +44,7 @@ use blaze_ids::ContentId;
 
 use crate::{
     Given, RunKey, RunKind,
-    confine::GIVEN,
+    confine::{GIVEN, walk_sees},
     roots::{Role, RoleSet, RootMap},
     rule::CargoRule,
     run::{self, Mode, OutFile, Value},
@@ -101,6 +104,21 @@ pub struct Prepared {
 }
 
 impl Prepared {
+    /// What a walk of the run's environment sees of [`Prepared::env`]: its variables of the
+    /// walk set ([`walk_sees`]), in its order. What a check's [`crate::inputs::Disk::lent`]
+    /// lends as the whole environment, and what [`ALL_ENV_NAME`]'s hash is of.
+    pub fn walked(&self) -> Vec<(OsString, OsString)> {
+        // clone: once per run kept that walked its environment
+        self.env.iter().filter(|(name, _)| walk_sees(name)).cloned().collect() // alloc: as above
+    }
+
+    /// The disk a check of the run's inputs reads: every file as it is, a variable by name
+    /// from [`Prepared::env`], and a walk of the environment as the run's sandbox shows it.
+    pub fn disk(&self) -> crate::inputs::Disk {
+        // clone: once per run prepared, the environment its checks answer from
+        crate::inputs::Disk::lent(self.env.clone(), walk_sees)
+    }
+
     /// The script's whole environment, as it is started in it (its command's), given names
     /// and make's jobserver too: what a pure key's variables have the values of, on keep as on
     /// find ([`script_env`]). A pure key has no given part, so [`Prepared::env`], which leaves
@@ -348,19 +366,24 @@ pub fn keyed(prepared: &Prepared, traced: &mut Traced) -> Result<(), Error> {
     }
     if whole {
         // About a hundred names on each side, once per run kept: no order of the trace assumed.
-        let missing =
-            prepared.env.iter().find(|(name, _)| !traced.env.iter().any(|it| it.0 == *name));
+        // What a walk of the run's environment saw of what a check answers from: the walk set
+        // ([`walk_sees`]), never the whole of what the build was started in.
+        let missing = prepared
+            .env
+            .iter()
+            .filter(|(name, _)| walk_sees(name))
+            .find(|(name, _)| !traced.env.iter().any(|it| it.0 == *name));
         if let Some((name, _)) = missing {
             // alloc: error path
             return Err(Error(format!(
-                "{} read its whole environment, and its trace has no `{}`, which a check of \
+                "{} walked its environment, and its trace has no `{}`, which a check of \
                  it reads: its result would be kept under a key no check makes (rule 21, a bug in blaze)",
                 prepared.spec.command.program.display(),
                 name.display()
             )));
         }
         if let Some(all) = traced.env.iter_mut().find(|it| it.0 == ALL_ENV_NAME) {
-            all.1 = Some(crate::trace::names_hash(&prepared.env).into());
+            all.1 = Some(crate::trace::names_hash(&prepared.walked()).into());
         }
     }
     Ok(())
@@ -672,8 +695,11 @@ mod tests {
 
         // The run, as the sandbox reports it: what it read of the environment it was started with.
         let lines: Vec<Line> = names.iter().map(|name| Line::new(Seen::Env, "", name)).collect();
-        let mut traced =
-            trace::assemble(&lines, None, &mut Disk::new(prepared.script_env().to_vec())).unwrap();
+        // As the launcher assembles it (`sandbox/v2.rs`): a walk sees the given names and
+        // the walk set.
+        let sees = |name: &OsStr| prepared.given.iter().any(|it| it == name) || walk_sees(name);
+        let mut disk = Disk::lent(prepared.script_env().to_vec(), sees);
+        let mut traced = trace::assemble(&lines, None, &mut disk).unwrap();
         keyed(prepared, &mut traced).unwrap();
         let roots = prepared.spec.roots.view();
         let (marked, stored) =
@@ -742,7 +768,6 @@ mod tests {
     fn finds(store: &[(blaze_cas::Key, Vec<u8>)], prepared: &Prepared) -> bool {
         use crate::{
             index::{self, Found},
-            inputs::Disk,
             roots::Rooted,
         };
 
@@ -751,7 +776,7 @@ mod tests {
                 store.iter().find(|it| it.0 == *key).map(|it| it.1.as_slice()),
             )
         };
-        let mut disk = Disk::new(prepared.env.clone());
+        let mut disk = prepared.disk();
         let found = index::search(
             get,
             &prepared.spec.key,
@@ -847,6 +872,64 @@ mod tests {
         // A variable passed through that changed is still an input of the whole environment.
         let moved = prepare(&unit(), &inherited("/b"), &place()).unwrap();
         assert!(!finds(&store, &moved), "a changed PATH finds the run of another");
+    }
+
+    /// The invariant: a run that walked its environment (it, or a program it ran, read them
+    /// all) is keyed by the walk set's variables and by what it read by name, and by nothing
+    /// else of the environment its build was started in (rule keys-cover-every-input, both
+    /// ways). So another pane's `TERM` or a service manager's `INVOCATION_ID` finds the run
+    /// kept, and so does a variable outside the walk set that nothing read by name
+    /// (`LIBCLANG_PATH` set for the scripts that do read it); a variable of the walk set that
+    /// moved (`CC`) does not, and neither does one the run read by name, set, changed or
+    /// newly set. The control: with the walk the whole environment again
+    /// ([`crate::confine::PLANTED_WHOLE_WALK`]), another `TERM` misses.
+    #[cfg(not(windows))] // Windows has no roots and lends nothing: a walk there is all of it.
+    #[test]
+    fn a_walk_of_the_environment_is_keyed_by_the_walk_set_and_named_reads_alone() {
+        let shell = |term: &str, id: &str, cc: &str, libclang: Option<&str>| {
+            let mut env = inherited("/a");
+            env.push(("TERM".into(), term.into()));
+            env.push(("INVOCATION_ID".into(), id.into()));
+            env.push(("CC".into(), cc.into()));
+            if let Some(path) = libclang {
+                env.push(("LIBCLANG_PATH".into(), path.into()));
+            }
+            prepare(&unit(), &env, &place()).unwrap()
+        };
+        let first = shell("xterm", "1", "cc", None);
+        // It walked its environment and asked for nothing by name.
+        let walked = kept_whole(&first);
+        assert!(finds(&walked, &shell("xterm", "1", "cc", None)), "the same shell misses");
+        assert!(finds(&walked, &shell("dumb", "2", "cc", None)), "another pane's variables miss");
+        assert!(
+            finds(&walked, &shell("xterm", "1", "cc", Some("/lib"))),
+            "a variable outside the walk set that the run never read misses"
+        );
+        assert!(
+            !finds(&walked, &shell("xterm", "1", "clang", None)),
+            "another CC, which a walk sees, finds the run of another"
+        );
+        // It walked its environment and read `LIBCLANG_PATH` by name, not set.
+        let named = kept_reading(&first, &[crate::trace::ALL_ENV, "LIBCLANG_PATH"]);
+        assert!(finds(&named, &shell("dumb", "2", "cc", None)));
+        assert!(
+            !finds(&named, &shell("xterm", "1", "cc", Some("/lib"))),
+            "a variable the run read by name, now set, finds the run that read it unset"
+        );
+        // And read it set: found by that value alone.
+        let set = shell("xterm", "1", "cc", Some("/lib"));
+        let named = kept_reading(&set, &[crate::trace::ALL_ENV, "LIBCLANG_PATH"]);
+        assert!(finds(&named, &shell("dumb", "2", "cc", Some("/lib"))));
+        assert!(!finds(&named, &shell("xterm", "1", "cc", Some("/other"))));
+        assert!(!finds(&named, &shell("xterm", "1", "cc", None)));
+        // The control: the cause put back, the effect is back.
+        crate::confine::PLANTED_WHOLE_WALK.set(true);
+        let whole = kept_whole(&first);
+        let (same, other) =
+            (finds(&whole, &shell("xterm", "1", "cc", None)), finds(&whole, &shell("dumb", "2", "cc", None)));
+        crate::confine::PLANTED_WHOLE_WALK.set(false);
+        assert!(same, "the control's own shell misses");
+        assert!(!other, "with a walk the whole environment, another pane's TERM must miss: the test would pass without the walk set");
     }
 
     #[test]

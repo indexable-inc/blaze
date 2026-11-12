@@ -1067,7 +1067,14 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
             ));
         }
     }
-    let disk = blaze_usercode::inputs::Disk::new(prepared.env.clone());
+    // What a check of the run's inputs answers from: a variable by name from all of the
+    // environment it is started in, and a walk of it as its sandbox shows one, the walk set
+    // ([`blaze_usercode::confine::walk_sees`]). A run outside the sandbox is given all of it.
+    let disk = match outside(job, run) {
+        // clone: once per run prepared, the environment its checks answer from
+        true => blaze_usercode::inputs::Disk::new(prepared.env.clone()),
+        false => prepared.disk(),
+    };
     let how = match outside(job, run) {
         true => {
             // Outside the sandbox nothing is lent: the program is given its whole environment,
@@ -1410,6 +1417,8 @@ fn with_reads(mut miss: blaze_kernel::Miss, traced: &blaze_core::Traced) -> blaz
     }
     for (name, value) in &traced.env {
         let named = match name == trace::ALL_ENV_NAME {
+            // "All" is what a walk of its environment sees: the variables blaze gives it
+            // and the walk set, never the whole of the shell the build was started in.
             true => "the names of every environment variable (it read them all)".to_owned(), // alloc: as `walked`
             false => format!("the variable {} it read", name.display()), // alloc: as `walked`
         };
