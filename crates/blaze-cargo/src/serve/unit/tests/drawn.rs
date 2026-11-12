@@ -41,6 +41,7 @@ fn unit_of(unit: &blaze_units::schema::Unit) -> blaze_api::UnitOf {
         package_id: unit.pkg_id.clone(),
         manifest_path: "/w/Cargo.toml".to_owned(),
         target: super::unit_target(unit).unwrap(),
+        primary: true,
     }
 }
 

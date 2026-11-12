@@ -857,6 +857,7 @@ fn built_answer() -> Vec<Response> {
         doctest: false,
         package_id: "path+file:///w/foo#0.1.0".to_owned(),
         manifest_path: "/w/foo/Cargo.toml".to_owned(),
+        primary: true,
     });
     answer.insert(1, ended);
     answer
