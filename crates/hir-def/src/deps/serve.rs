@@ -205,6 +205,22 @@ pub enum Refused {
     Encode { part: Part, why: String },
 }
 
+impl Refused {
+    /// The refusal's kind, one word a variant: what a count of refusals groups by.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Refused::SessionMacros => "session macros",
+            Refused::ProcMacro { .. } => "proc macro reads unknown",
+            Refused::OutsideSourceRoot { .. } => "outside source root",
+            Refused::ModuleFileMissing { .. } => "module file missing",
+            Refused::KeyMoved { .. } => "key moved",
+            Refused::MachinePath { .. } => "machine path",
+            Refused::Reads { .. } => "reads",
+            Refused::Encode { .. } => "encode",
+        }
+    }
+}
+
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -649,7 +665,19 @@ pub fn store(db: &Db, served: &Served, images: &dyn ImageStore) -> Result<Stored
                 stored.written.push(krate);
                 stored.filed.insert(krate, filed);
             }
-            Err(why) => stored.refused.push((krate, why)),
+            Err(why) => {
+                // Said, a crate each: a crate with no image is resolved again by every daemon
+                // that starts (reth's first build after a restart resolved 827 crates and
+                // read 291 from images, and nothing in its profile said why of the rest).
+                tracing::info!(
+                    target: "blaze",
+                    krate = %krate.named(db),
+                    kind = why.kind(),
+                    why = %why,
+                    "a crate's image is not written: every daemon that starts resolves the crate again"
+                );
+                stored.refused.push((krate, why));
+            }
         }
     }
     if images.paged() {
