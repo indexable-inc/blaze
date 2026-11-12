@@ -22,7 +22,7 @@ use syntax::ast::HasName;
 use crate::{
     Lookup,
     deps::{
-        DepImages, Image, filed,
+        DepImages, Image, awaited, filed,
         image::{ImageBuf, ImageRef, Part, PartBytes, write_image},
         key::{Base, keys},
         reads::Reads,
@@ -278,6 +278,47 @@ pub fn serve(
     images: &dyn ImageStore,
     mode: Mode,
 ) -> Result<Served, String> {
+    serve_released(db, crates, build, images, mode, &[])
+}
+
+/// [`serve`] by a driver whose database awaits the crates added to it ([`awaited`]): `asked`
+/// is every crate the driver asks about now (a unit's crate, eligible or not), `crates` those
+/// of them to fetch (all of `asked`, or the ones whose key moved since they were last
+/// served). `asked` and everything they depend on are released in this write
+/// ([`awaited::release`]), which is the same write that gives the database the images found:
+/// a crate released with an image is read from it and was never resolved, and one released
+/// with none gets its first run from source in this write's pass. A crate of `asked` that is
+/// not in `crates` and has no image is released to that first run too.
+///
+/// The invariant: after this, no crate of `asked` nor any crate below one is awaited, hit or
+/// miss, whatever `crates` holds and whether or not the store was read.
+pub fn serve_asked(
+    db: &mut Db,
+    asked: &[Crate],
+    crates: &[Crate],
+    build: ContentId,
+    // dyn: the driver's store, one call per crate per session
+    images: &dyn ImageStore,
+    mode: Mode,
+) -> Result<Served, String> {
+    let released = awaited::release(db, asked);
+    serve_released(db, crates, build, images, mode, &released)
+}
+
+/// [`serve`], with `released`, sorted: the crates this write took out of the awaited set
+/// ([`awaited::release`], which noted each as a crate added). A change of what such a crate
+/// is read from is no change to any maintainer, which never saw the crate: the write is a
+/// change of the whole crate graph only when it changes how a crate the maintainers knew is
+/// read (an image gained by a crate resolved before, or lost, or swapped for another).
+fn serve_released(
+    db: &mut Db,
+    crates: &[Crate],
+    build: ContentId,
+    // dyn: the driver's store, one call per crate per session
+    images: &dyn ImageStore,
+    mode: Mode,
+    released: &[Crate],
+) -> Result<Served, String> {
     let keys = keys(&*db, crates, build);
     // clone: the handle of the images served before, once per serve
     let before = DepImages::try_get(&*db).map(|it| it.images(&*db).clone()).unwrap_or_default();
@@ -326,14 +367,20 @@ pub fn serve(
     // taken away. A serve that found nothing new (a cold store) writes nothing, so it costs
     // no maintenance pass.
     let mut changed = false;
+    // Whether it changes how a crate the maintainers knew before this write is read: one
+    // that is not of `released`.
+    let mut known = false;
     for (&(krate, base), found) in order.iter().zip(found) {
         let found = found.into_inner().unwrap_or_else(|| {
             panic!("`ImageStore::for_each` did not run the task of crate {}", krate.named(db))
         });
-        changed |= served.remove(&krate).is_some();
-        changed |= maps.remove(&krate).is_some();
-        changed |= lang_items.remove(&krate).is_some();
-        changed |= paged.remove(&krate).is_some();
+        let fresh = released.binary_search(&krate).is_ok();
+        let mut had = served.remove(&krate).is_some();
+        had |= maps.remove(&krate).is_some();
+        had |= lang_items.remove(&krate).is_some();
+        had |= paged.remove(&krate).is_some();
+        changed |= had;
+        known |= had;
         let (bytes, parts, filed) = match found? {
             Found::Hit { bytes, parts, filed } => (bytes, parts, filed),
             Found::Miss { stale: true } => {
@@ -363,6 +410,7 @@ pub fn serve(
         served.insert(krate, Image { base, key: filed, bytes, parts, mode });
         hits.push(krate);
         changed = true;
+        known |= !fresh;
     }
     hits.sort_unstable_by_key(|krate| keys[krate]);
     if !changed {
@@ -402,8 +450,12 @@ pub fn serve(
     }
     set_images(db, served);
     // A served crate's modules are the decoded map's, not the ones its dependents were
-    // maintained against: the maintainers run again over the crates now served.
-    db.note_crates_changed();
+    // maintained against: the maintainers run again over the crates now served. Not for
+    // crates released by this write alone: no dependent of one was maintained, and each is
+    // noted as a crate added.
+    if known {
+        db.note_crates_changed();
+    }
     Ok(Served { keys, hits, stale, build })
 }
 
