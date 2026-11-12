@@ -208,6 +208,22 @@
    "why": "Andrew, 2026-11-11: \"don't do things incrementally, go for SOTA right away and do things in parallel, and then try to get tempo to work\".",
    "recommended": "Yes.",
    "state": "done: rules changed; a lane on tempo and reth started"
+  },
+  {
+   "id": "D27",
+   "date": "2026-11-11",
+   "decision": "Tests of stateful, incremental, concurrent or durable behaviour run in the deterministic simulation by default (rule simulate-first); revision tests (a project and a sequence of source revisions with state kept) are the form for incremental behaviour; a real daemon is the second, thin driver.",
+   "why": "Andrew, 2026-11-11: \"if everything is sans-IO you could just use DST\", \"properly bias towards sans-IO and DST\"; a contributor pointed at rustc's tests/incremental revisions as the pattern.",
+   "recommended": "Yes.",
+   "state": "rule on main; the harness is being built on revisions-1111"
+  },
+  {
+   "id": "D28",
+   "date": "2026-11-11",
+   "decision": "cargo may be timed on the same program as a stopwatch reference in published comparisons (the film, the head-to-head), named plainly as cargo; it is never an oracle for correctness and never builds a project to diff against blaze's output.",
+   "why": "Andrew, 2026-11-11: the comparison in the film should be \"to the existing system\" and \"data driven\"; \"more comparisons\".",
+   "recommended": "Yes, as a second narrow exception beside D6.",
+   "state": "in force; first numbers measured on hello-world"
   }
  ]
 }

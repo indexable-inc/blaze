@@ -180,6 +180,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     tool's quirk, a trap in the tree, a missing command, your own repeated mistake), gets a row in
     `annoyances.json` (at the top of the repository) when it happens, with who you are. Skill:
     `changing-code`.
+64. **simulate-first**: A test of anything stateful, incremental, concurrent or durable runs in the
+    deterministic simulation by default, in process, under many seeds; a real process, daemon or
+    kernel is used only for what the simulation cannot model, and a part that cannot run under
+    simulation is a sans-IO gap to close. Skill: `testing`.
 
 ## Code Review Rules
 
