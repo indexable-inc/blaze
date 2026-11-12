@@ -1211,6 +1211,72 @@ fn the_cap_retires_whole_builds_and_none_that_runs(tc: TestCase) {
     }
 }
 
+/// What the cap's order promises: a build's file goes only once every file of no build has
+/// gone, the newest flush's aside (which never goes).
+fn no_build_first_oracle(kept: &[Kept], gone: &BTreeSet<usize>) -> Result<(), String> {
+    let Some(build) = gone.iter().find(|at| builds_of(&kept[**at]).is_some()) else { return Ok(()) };
+    let newest = kept.len() - 1;
+    match (0..newest).find(|at| builds_of(&kept[*at]).is_none() && !gone.contains(at)) {
+        Some(idle) => Err(format!(
+            "file {build}, a build's, went while file {idle}, of no build, stays: {gone:?} of {kept:?}"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The invariant: past the cap, rows of no build (a daemon's own between builds) go before
+/// any build's rows do, whatever their ages.
+#[hegel::test(test_cases = 300)]
+fn the_cap_retires_rows_of_no_build_before_any_build_s(tc: TestCase) {
+    let mut d = Drawn(&tc);
+    let files = d.int(1, 24);
+    let mut kept = Vec::new();
+    for seq in 1..=files {
+        let builds = match d.one_in(2) {
+            true => None,
+            false => {
+                let lo = d.int(1, 12);
+                Some([lo, lo + d.int(0, 3)])
+            }
+        };
+        kept.push(capped_file(builds.map_or(0, |[_, hi]| hi), seq, builds, d.int(1, 100)));
+    }
+    let running: BTreeSet<u64> = (0..d.int(0, 3)).map(|_| d.int(1, 15)).collect();
+    let total: u64 = kept.iter().map(|it| it.bytes).sum();
+    let cap = d.int(0, total);
+    let gone = past_cap(kept.iter(), total, cap, &running);
+    if let Err(broke) = no_build_first_oracle(&kept, &gone) {
+        panic!("{broke}\ncap {cap} of {total}, running {running:?}");
+    }
+    cap_oracle(&kept, &gone, &running).unwrap();
+}
+
+/// A day of builds, then a daemon left idle: builds 1 and 2, then four flushes of no build.
+/// The cap as it was (age alone) retired the builds and kept the idle rows; the oracle
+/// catches that, and holds for the cap as it is, which retires the idle rows and keeps both
+/// builds.
+#[test]
+fn the_oracle_catches_a_build_retired_while_rows_of_no_build_stay() {
+    let kept = [
+        capped_file(1, 1, Some([1, 1]), 100),
+        capped_file(2, 2, Some([2, 2]), 100),
+        capped_file(0, 3, None, 100),
+        capped_file(0, 4, None, 100),
+        capped_file(0, 5, None, 100),
+        capped_file(0, 6, None, 100),
+    ];
+    let none = BTreeSet::new();
+    let planted = past_cap_in(kept.iter(), 600, 400, &none, Order::OldestFirst);
+    assert_eq!(planted, BTreeSet::from([0, 1]), "age alone retired both builds");
+    let caught = no_build_first_oracle(&kept, &planted).unwrap_err();
+    assert!(caught.contains("a build's, went while file 2, of no build, stays"), "{caught}");
+
+    let gone = past_cap(kept.iter(), 600, 400, &none);
+    assert_eq!(gone, BTreeSet::from([2, 3]), "the oldest rows of no build go, and no build's");
+    no_build_first_oracle(&kept, &gone).unwrap();
+    cap_oracle(&kept, &gone, &none).unwrap();
+}
+
 /// The 80-minute build of 2026-11-11: build 7 runs for the whole history while builds 8 and 9
 /// run beside it and end. The flushes that held build 8's or 9's rows were named for them,
 /// with build 7's rows inside. The cap as it was retired "build 8" and "build 9" whole, and

@@ -154,13 +154,48 @@ pub use manifest::Manifest;
 pub use pin::Pin;
 pub use retire::PINS;
 
-/// What the history keeps by default: 4 GiB, about 400 million rows at the ~10 bytes a row
-/// takes compressed. A self-build's `check` and `build` wrote about 1 GiB together with every
-/// span a row, which a 1 GiB cap trimmed from under the build it was asked about (profrows).
-pub const CAP_BYTES: u64 = 4 << 30;
+/// What the history keeps by default: 256 MiB, about 25 million rows at the ~10 bytes a row
+/// takes compressed. Measured 2026-11-11: hello-world's cold build (std's front end and
+/// code, 400,000 spans) is 18 MiB and each edit after it 0.3 MiB, so the default holds a
+/// small project's cold build and several hundred edits, and of a large workspace its
+/// newest builds: the newest flush's builds and every build still running are never retired
+/// ([`files`]), so the build being asked about is whole whatever the cap. It was 4 GiB until
+/// then (from 1 GiB, which trimmed a self-build from under itself before running builds were
+/// kept): a day's work left 1.3 GiB. What goes is said each time ([`said_capped`]). A daemon
+/// started with [`CAP_VAR`] keeps that many MiB instead.
+pub const CAP_BYTES: u64 = 256 << 20;
+
+/// The daemon's setting for the history's cap, in MiB: `BLAZE_PROFILE_CAP_MB=4096` keeps what
+/// the default was until 2026-11-11.
+pub const CAP_VAR: &str = "BLAZE_PROFILE_CAP_MB";
+
+/// The cap a daemon started with [`CAP_VAR`] set to `value` keeps: [`CAP_BYTES`] unset, that
+/// many MiB set; a value that is no whole number of MiB from 1 up is refused, naming it.
+pub fn cap_of(value: Option<&str>) -> Result<u64, String> {
+    let Some(value) = value else { return Ok(CAP_BYTES) };
+    match value.trim().parse::<u64>() {
+        Ok(mib) if mib >= 1 && mib <= u64::MAX >> 20 => Ok(mib << 20),
+        // alloc: an error, once a daemon
+        _ => Err(format!(
+            "{CAP_VAR}={value:?} is not a number of MiB from 1 up for the profile history to keep \
+             (unset, it keeps {} MiB)",
+            CAP_BYTES >> 20
+        )),
+    }
+}
 
 /// How often the daemon flushes while a session runs.
 pub const EVERY: Duration = Duration::from_secs(5);
+
+/// How often the daemon's timer flushes a quiet history ([`History::quiet`]: no build
+/// running, none whose row waits): a flush is a file a table with rows, each several KiB
+/// of Parquet footer whatever it holds, so an idle daemon's flush every [`EVERY`] wrote 48 KiB
+/// for a few hundred rows of its own heartbeat, 0.6 MB a minute (2026-11-11, samples aside).
+/// Nothing is lost by the wait and no reader sees it: a reader asks for a flush before it
+/// reads, a build's start and end each flush, [`FLUSH_ROWS`] drained flush at once, and the
+/// rows of a daemon that dies meanwhile are in its rings (an idle thread writes far fewer
+/// than a ring holds in this time), which the next history reads back.
+pub const IDLE_EVERY: Duration = Duration::from_secs(60);
 
 /// How often the history's drain thread reads the rings into the next flush, on a thread of its
 /// own so a flush that takes seconds stops no drain. A thread's ring holds [`flight::CAP`]
@@ -1018,8 +1053,9 @@ impl History {
         flight::persist(self.core.dir(), &self.blaze, self.process.name)
             .map_err(HistoryError::Postmortem)?;
         self.persisted = true;
-        // The mapping is reserved whole as it is made: the cap counts it from now on, and the
-        // crash record armed beside it.
+        // The cap counts the mapping from now on, as long as it is at this count (a ring made
+        // later grows it by 2 MiB, counted at the next recount), and the crash record armed
+        // beside it.
         match self.core.job(files::Files::recount)? {
             files::Outcome::Recounted(retired) => retired.map(|capped| said_capped(&capped)),
             other => Err(mismatch(self.core.dir(), "counting the files beside", &other)),
@@ -1033,6 +1069,12 @@ impl History {
         u32::try_from(self.core.files().last_build() + 1).unwrap_or(u32::MAX)
     }
 
+    /// Whether the timer has nothing to write for now ([`IDLE_EVERY`]): no build is running
+    /// and no build's row waits for the next flush.
+    pub fn quiet(&mut self) -> bool {
+        self.ended.is_empty() && !self.core.files_mut().any_running()
+    }
+
     /// Notes a build that started, `row` its row with outcome running and no duration, for the
     /// next flush to write: a build its daemon never ends (a kill, a crash) is then one row in
     /// the history, which a reader tells from one still running by its process ([`writes`]).
@@ -1041,8 +1083,10 @@ impl History {
             // clone: a hash, once a build
             row.blaze = Some(self.blaze.clone());
         }
-        // While it runs, the cap retires no file that holds a row of it.
+        // While it runs, the cap retires no file that holds a row of it, and blocked threads
+        // are sampled whatever span they block in.
         self.core.files_mut().running(row.build_id, true);
+        sampler::build_running(true);
         flight::postmortem::build_started(&flight::postmortem::RunningBuild {
             build_id: row.build_id,
             started_ns: row.started_ns,
@@ -1060,7 +1104,9 @@ impl History {
     /// the build's. A tree that can't be digested leaves `tree` null, and the next flush answers
     /// why.
     pub fn build_ended(&mut self, mut row: BuildRow) {
-        self.core.files_mut().running(row.build_id, false);
+        if self.core.files_mut().running(row.build_id, false) {
+            sampler::build_running(false);
+        }
         flight::postmortem::build_ended(row.build_id);
         if row.blaze.is_none() {
             // clone: a hash, once a build
@@ -2704,6 +2750,17 @@ mod tests {
             "the sample kept into the history's ring"
         );
         _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_cap_is_the_default_or_the_mib_the_daemon_was_started_with() {
+        assert_eq!(cap_of(None), Ok(CAP_BYTES));
+        assert_eq!(cap_of(Some("4096")), Ok(4 << 30));
+        assert_eq!(cap_of(Some(" 1 ")), Ok(1 << 20));
+        for bad in ["0", "", "64MB", "-1", "1.5", "18446744073709551615"] {
+            let said = cap_of(Some(bad)).expect_err(bad);
+            assert!(said.contains(CAP_VAR) && said.contains(&format!("{bad:?}")), "{said}");
+        }
     }
 
     #[test]

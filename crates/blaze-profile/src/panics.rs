@@ -232,7 +232,7 @@ fn times(sites: &[AtomicU64], counts: &[AtomicU64], site: u64) -> Option<u64> {
 }
 
 /// Whether the `n`th panic of a site (`n >= 2`) gets its one line: each of the first
-/// [`EACH`], then each power of two, so a site that panics 150,000 times costs 21 lines, not
+/// [`EACH`], then each power of two, so a site that panics 150,000 times costs 22 lines, not
 /// 150,000 backtraces (a day's `serve.log` was 2.2 GB of them, 2026-11-11).
 const fn again(n: u64) -> bool {
     n <= EACH || n.is_power_of_two()
@@ -706,7 +706,7 @@ mod tests {
     use super::*;
 
     /// A site's panics are counted apart from every other site's, 150,000 of them are said
-    /// in 21 lines (the first whole), and a site the table has no room for is told apart
+    /// in 22 lines (the first whole), and a site the table has no room for is told apart
     /// (printed whole), never counted as another's.
     #[test]
     fn a_repeated_panic_is_a_line_and_a_count() {
@@ -720,7 +720,7 @@ mod tests {
             assert_eq!(times(&sites, &counts, a), Some(n));
             lines += u64::from(n == 1 || again(n));
         }
-        assert_eq!(lines, 21);
+        assert_eq!(lines, 22);
         assert_eq!(times(&sites, &counts, b), Some(1), "another site's first");
         assert_eq!(times(&sites, &counts, b), Some(2));
         for other in 0..2 {

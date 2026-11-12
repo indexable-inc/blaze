@@ -155,10 +155,15 @@ fn running(thread: &Thread) -> bool {
 /// while it is stopped, since it may hold the allocator's or any other.
 fn sample(thread: &Thread, ring: &crate::flight::Ring) -> Option<Sample> {
     let on_cpu = running(thread);
-    if !on_cpu && ring.innermost() == 0 {
+    if !on_cpu {
+        let span = ring.innermost();
         // Blocked outside every span: no span to blame its wait on, and Linux cannot sample
-        // it without waking it, so neither system does.
-        return None;
+        // it without waking it, so neither system does. Blocked in a span of no build while
+        // no build runs: an idle daemon's parked threads, not sampled unless asked
+        // (`super::samples_blocked`), and so not stopped 49 times a second either.
+        if span == 0 || !super::samples_blocked(crate::flight::build_of(span)) {
+            return None;
+        }
     }
     let at = Instant::now();
     let mut sample = Sample {
