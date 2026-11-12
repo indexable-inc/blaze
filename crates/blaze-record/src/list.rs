@@ -76,6 +76,17 @@ pub fn write_list_with<R: AsRef<[u8]>>(
     out[start + COUNT_AT..start + HEAD].copy_from_slice(&len32(count, "a count of reads"));
 }
 
+/// The read-list of `base` with no note and no reads, as [`write_list`] writes it. Its bytes
+/// are known from the base alone, so a filer whose work reads nothing keys its answer by them
+/// ([`crate::AnswerKey`]) without filing a list or allocating one: one probe, and the answer a
+/// lookup of the same list filed would find.
+pub fn empty_list(base: &ContentId) -> [u8; HEAD] {
+    let mut out = [0; HEAD];
+    out[..8].copy_from_slice(&LAYOUT.to_le_bytes());
+    out[8..NOTE_LEN_AT].copy_from_slice(&base.0);
+    out
+}
+
 /// Why bytes are not a read-list of the base asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListError {

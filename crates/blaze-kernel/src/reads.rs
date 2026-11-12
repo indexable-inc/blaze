@@ -1,13 +1,15 @@
 //! The recording context: a step's only door to the world.
 
-use crate::{Fact, Read, ReadKind, Seen, World, WorldError};
+use crate::entry::{name_kind, named};
+use crate::{Fact, Read, Seen, World, WorldError};
 
 /// What a step reads the world through. It records each read: the read's kind, its key's
 /// bytes, and the hash the read saw. It never hands out the world itself.
 pub struct Reads<'w, W: ?Sized> {
     world: &'w W,
-    /// The keys' bytes, one after another.
-    keys: Vec<u8>,
+    /// The reads' names, one after another: each its kind, then its key's bytes
+    /// ([`crate::entry`]), as its entry's read-list keeps it.
+    names: Vec<u8>,
     reads: Vec<Recorded>,
     /// The first read that failed. After it, the run keeps nothing, whatever the step does with
     /// the error.
@@ -16,7 +18,6 @@ pub struct Reads<'w, W: ?Sized> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Recorded {
-    kind: ReadKind,
     start: usize,
     end: usize,
     seen: Seen,
@@ -25,13 +26,19 @@ struct Recorded {
 /// Why a run's reads make no trace.
 pub(crate) enum Unfinished {
     Failed(WorldError),
-    Unsteady { kind: ReadKind, key: Vec<u8>, first: Seen, then: Seen },
+    /// `name`: the read's name, to be read with [`named`].
+    Unsteady { name: Vec<u8>, first: Seen, then: Seen },
+}
+
+/// The read a name written here is of.
+fn read_of(name: &[u8]) -> Read<'_> {
+    named(name).expect("a name written by `Reads` starts with its kind")
 }
 
 impl<'w, W: World + ?Sized> Reads<'w, W> {
     pub(crate) fn new(world: &'w W) -> Reads<'w, W> {
         // alloc: one step's run, freed once it is kept; empty until it reads
-        Reads { world, keys: Vec::new(), reads: Vec::new(), failed: None }
+        Reads { world, names: Vec::new(), reads: Vec::new(), failed: None }
     }
 
     /// `F` of `key`, recorded.
@@ -41,15 +48,16 @@ impl<'w, W: World + ?Sized> Reads<'w, W> {
             // clone: an error, once for each read after a failed one
             return Err(failed.clone());
         }
-        let start = self.keys.len();
-        F::key(key, &mut self.keys);
+        let start = self.names.len();
+        name_kind(F::KIND, &mut self.names);
+        F::key(key, &mut self.names);
         match F::get(self.world, key) {
             Ok((value, seen)) => {
-                self.reads.push(Recorded { kind: F::KIND, start, end: self.keys.len(), seen });
+                self.reads.push(Recorded { start, end: self.names.len(), seen });
                 Ok(value)
             }
             Err(error) => {
-                self.keys.truncate(start);
+                self.names.truncate(start);
                 self.fail(error)
             }
         }
@@ -64,9 +72,10 @@ impl<'w, W: World + ?Sized> Reads<'w, W> {
         }
         match self.world.hash(read) {
             Ok(seen) => {
-                let start = self.keys.len();
-                self.keys.extend_from_slice(read.key);
-                self.reads.push(Recorded { kind: read.kind, start, end: self.keys.len(), seen });
+                let start = self.names.len();
+                name_kind(read.kind, &mut self.names);
+                self.names.extend_from_slice(read.key);
+                self.reads.push(Recorded { start, end: self.names.len(), seen });
                 Ok(seen)
             }
             Err(error) => self.fail(error),
@@ -91,23 +100,22 @@ impl<'w, W: World + ?Sized> Reads<'w, W> {
     /// Its reads sorted by kind and key, each once. A read that failed, or one that saw two
     /// hashes, makes no trace.
     pub(crate) fn finish(self) -> Result<Trace, Unfinished> {
-        let Reads { keys, mut reads, failed, .. } = self;
+        let Reads { names, mut reads, failed, .. } = self;
         if let Some(error) = failed {
             return Err(Unfinished::Failed(error));
         }
-        reads.sort_by(|a, b| (a.kind, &keys[a.start..a.end]).cmp(&(b.kind, &keys[b.start..b.end])));
+        // A name's bytes order as its kind, then its key: the kind is written big-endian.
+        reads.sort_by(|a, b| names[a.start..a.end].cmp(&names[b.start..b.end]));
         let mut kept: usize = 0;
         for at in 0..reads.len() {
             let this = reads[at];
             if let Some(last) = kept.checked_sub(1).map(|it| reads[it])
-                && last.kind == this.kind
-                && keys[last.start..last.end] == keys[this.start..this.end]
+                && names[last.start..last.end] == names[this.start..this.end]
             {
                 if last.seen != this.seen {
                     return Err(Unfinished::Unsteady {
-                        kind: this.kind,
                         // alloc: an error
-                        key: keys[this.start..this.end].to_vec(),
+                        name: names[this.start..this.end].to_vec(),
                         first: last.seen,
                         then: this.seen,
                     });
@@ -118,14 +126,14 @@ impl<'w, W: World + ?Sized> Reads<'w, W> {
             kept += 1;
         }
         reads.truncate(kept);
-        Ok(Trace { keys, reads })
+        Ok(Trace { names, reads })
     }
 }
 
 /// A run's reads, sorted by kind and key, each once: what its entry records.
 #[derive(Debug)]
 pub struct Trace {
-    keys: Vec<u8>,
+    names: Vec<u8>,
     reads: Vec<Recorded>,
 }
 
@@ -139,8 +147,16 @@ impl Trace {
     }
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (Read<'_>, Seen)> + Clone + '_ {
-        self.reads
-            .iter()
-            .map(|it| (Read { kind: it.kind, key: &self.keys[it.start..it.end] }, it.seen))
+        self.reads.iter().map(|it| (read_of(&self.names[it.start..it.end]), it.seen))
+    }
+
+    /// Each read's name, in the trace's order: what its entry's read-list keeps.
+    pub(crate) fn names(&self) -> impl ExactSizeIterator<Item = &[u8]> + Clone + '_ {
+        self.reads.iter().map(|it| &self.names[it.start..it.end])
+    }
+
+    /// What each read saw, in the trace's order.
+    pub(crate) fn seen(&self) -> impl ExactSizeIterator<Item = Seen> + Clone + '_ {
+        self.reads.iter().map(|it| it.seen)
     }
 }

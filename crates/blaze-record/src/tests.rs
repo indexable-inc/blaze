@@ -16,8 +16,8 @@ use blaze_rng::SplitMix64;
 
 use crate::{
     AnswerKey, Bounds, Digest, Error, Filing, Found, Kept, Kind, LAYOUT, ListError, ListRef,
-    Placed, Slot, Store, Walked, chain::first_open_for_tests, keep_answer, list_key, lookup, walk,
-    write_list, write_list_with,
+    Placed, Slot, Store, Walked, chain::first_open_for_tests, empty_list, keep_answer, list_key,
+    lookup, walk, write_list, write_list_with,
 };
 
 /// The things the work can read: each absent, or one of [`READS`] values.
@@ -549,6 +549,10 @@ fn a_read_list_round_trips_and_refuses_what_is_not_one() {
         names,
     );
     assert_eq!(in_place, bytes, "a note written in place gives the same list");
+    let mut none = Vec::new();
+    write_list(&mut none, &base, b"", [] as [&[u8]; 0]);
+    assert_eq!(empty_list(&base)[..], none[..], "the list of no reads, without a buffer");
+    assert!(ListRef::open(&empty_list(&base), &base).unwrap().is_empty());
 
     assert_eq!(ListRef::open(list, &base_key(3)).err(), Some(ListError::OtherBase));
     for cut in 0..list.len() {

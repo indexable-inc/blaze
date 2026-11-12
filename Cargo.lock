@@ -1397,6 +1397,7 @@ dependencies = [
  "blaze-format",
  "blaze-hash",
  "blaze-ids",
+ "blaze-record",
  "blaze-store-check",
  "hegeltest",
 ]

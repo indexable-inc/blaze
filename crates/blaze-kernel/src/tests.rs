@@ -408,9 +408,8 @@ fn the_chain_of_shapes_is_bounded() {
         let mut ctx = Reads::new(&world);
         Wide::compute(&mut ctx, &0).unwrap();
         let Ok(trace) = ctx.finish() else { panic!("the wide step's reads") };
-        store
-            .put(shape_slot(&identity, n), Kind::Query, entry::encode_shape(&identity, &trace))
-            .unwrap();
+        let slot = blaze_record::list_key(&identity, blaze_record::Slot { generation: 0, n });
+        store.put(Key(slot), Kind::Query, entry::list(&identity, &trace)).unwrap();
     }
     world.dial = MOST_SHAPES as u16;
     let refused = kernel.get::<Wide, _>(&mut store, &world, &0, &Setting::OFF).unwrap_err();

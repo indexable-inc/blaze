@@ -15,9 +15,13 @@
 //!   [`World`] that the wiring crate implements over the front end answers them. The kernel
 //!   does not depend on `blaze-query`.
 //! - **Identity first.** An entry with no reads is kept under [`whole::key`] alone, as its bare
-//!   value: one probe, no header. A step that reads keeps the names of its reads (a [`Shape`])
+//!   value: one probe, no header. A step that reads keeps the names of its reads (a read-list)
 //!   in a bounded chain of slots under its identity ([`MOST_SHAPES`]). Lookup hashes each
-//!   shape's reads now and probes the entry those hashes name.
+//!   list's reads now and probes the entry those hashes name.
+//! - **Stored as a record.** The chain, the read-list's bytes and the entry's key are
+//!   `blaze_record`'s (base key → read-lists → answer): the base is the identity's ID, and the
+//!   kernel adds what `entry` says (a read's name, the entry's bytes). The kernel is the API:
+//!   registered steps, [`Identity`], [`Reads`], [`World`], and the refusals below.
 //! - **Refusals, not overwrites.** Two values under one identity and set of reads is a
 //!   [`KernelError::Conflict`] (rule 21). A run whose read failed, or which saw two hashes for
 //!   one read, keeps nothing.
@@ -30,29 +34,33 @@
 
 use std::alloc::Global;
 use std::any::TypeId;
+use std::cell::RefCell;
 use std::fmt;
 
-use blaze_cas::{Key, Kind};
+use blaze_cas::{Key, Kind, content_of};
 use blaze_ids::{ContentId, Hasher};
+use blaze_record::{AnswerKey, Doing, Filing, Placed, Slot, Walked, keep_answer, list_key, walk};
 use blaze_store_check::{Hit, Recompute, RecordedRead, Setting, VerifyError};
 
 mod entry;
+#[cfg(test)]
+mod exhaustive;
 mod reads;
 mod store;
 #[cfg(test)]
 mod tests;
 pub mod why;
 
-pub use crate::entry::{
-    Entry, EntryKey, EntryReads, Shape, ShapeReads, entry_key, shape_slot, whole,
-};
+pub use crate::entry::{Entry, EntryReads, whole};
 pub use crate::reads::{Reads, Trace};
 pub use crate::store::{Get, Put, Reading, Writing};
+use crate::store::{Keeping, Looking, Stopped};
 pub use crate::why::{Miss, Missed, Part, PartKind};
 
-/// The most shapes one identity's chain holds. A step whose reads differ by shape more often
-/// than this reads too much of what varies, so its keys should be split. Reaching the bound is
-/// [`KernelError::TooManyShapes`], never an endless walk (rule 18).
+/// The most shapes (read-lists: the names of one run's reads) one identity's chain holds. A
+/// step whose reads differ by shape more often than this reads too much of what varies, so its
+/// keys should be split. Reaching the bound is [`KernelError::TooManyShapes`], never an endless
+/// walk (rule 18).
 pub const MOST_SHAPES: u32 = 1024;
 
 /// Every step's number, in one table so that no two crates take the same one (registration
@@ -96,7 +104,7 @@ pub struct Identity {
 const IDENTITY: &str = "blaze v2 kernel identity 1";
 
 impl Identity {
-    /// Its content ID: what its entries and shape slots are keyed by.
+    /// Its content ID: the base key its read-lists and entries are filed under.
     pub fn id(&self) -> ContentId {
         let mut hasher = Hasher::new(IDENTITY);
         hasher.update(&self.step.0.to_le_bytes()).id(&self.of).id(&self.code.0).id(&self.flags);
@@ -490,10 +498,7 @@ impl Kernel {
     ) -> Result<Key, KernelError> {
         let identity = self.identity::<S>(input)?;
         let key = whole::key(&identity);
-        // alloc: the value, kept in the store
-        store
-            .put(key, S::KIND, value.to_vec())
-            .map_err(|it| conflict::<S>(input, &identity, key, &[], &it))?;
+        keep_entry::<S, P>(&RefCell::new(store), input, &identity, key, value, Vec::new)?;
         Ok(key)
     }
 }
@@ -502,26 +507,51 @@ fn of<S: Step>(input: &S::Input, identity: &Identity) -> Of {
     Of { step: S::NAME, label: S::label(input), identity: identity.id() }
 }
 
-fn conflict<S: Step>(
-    input: &S::Input,
-    identity: &Identity,
-    key: Key,
-    reads: &[String],
-    mismatch: &blaze_cas::Mismatch,
-) -> KernelError {
-    // alloc: an error
-    let reads = reads.to_vec();
-    KernelError::Conflict {
-        of: of::<S>(input, identity),
-        key,
-        reads,
-        kept: mismatch.kept,
-        given: mismatch.given,
+/// Why a lookup's walk of an identity's read-lists stopped.
+enum Stop {
+    Chain(blaze_record::Error<Stopped>),
+    /// The slot `at` holds a read-list one of whose reads is named by `len` bytes: no kernel
+    /// read's name.
+    Name { at: Slot, len: usize },
+    World { read: String, why: String },
+    Store { key: Key, why: String },
+}
+
+impl From<blaze_record::Error<Stopped>> for Stop {
+    fn from(error: blaze_record::Error<Stopped>) -> Stop {
+        Stop::Chain(error)
+    }
+}
+
+/// The error of a lookup or a filing that `blaze_record` stopped, for the identity whose ID is
+/// `id`. A second value of an entry is not this: [`keep`] makes it a
+/// [`KernelError::Conflict`], which names the reads.
+fn chain_error(of: Of, id: &ContentId, error: blaze_record::Error<Stopped>) -> KernelError {
+    match error {
+        blaze_record::Error::Store { doing, key, error } => KernelError::Store {
+            of,
+            key: Key(key),
+            // alloc: an error
+            why: format!("{doing}: {}", error.why()),
+        },
+        blaze_record::Error::List { at, why } => KernelError::Store {
+            of,
+            key: Key(list_key(id, at)),
+            // alloc: an error
+            why: format!("slot {} of its chain of read-lists holds {why}", at.n),
+        },
+        blaze_record::Error::TwoAnswers { key } => KernelError::Store {
+            of,
+            key: Key(key),
+            // alloc: an error
+            why: "another value is kept under its entry's key".to_owned(),
+        },
     }
 }
 
 /// The key of the entry of `identity` whose reads all hash the same now: the entry with no
-/// reads, else the first shape in the chain whose reads' hashes now name an entry the store has.
+/// reads, else the first read-list in the identity's chain whose reads' hashes now name an
+/// entry the store has.
 fn find_key<S: Compute, G: Get + ?Sized>(
     store: &G,
     world: &S::World,
@@ -535,27 +565,42 @@ fn find_key<S: Compute, G: Get + ?Sized>(
     if store.has(&whole).map_err(|why| failed(whole, why))? {
         return Ok(Some(whole));
     }
-    for n in 0..MOST_SHAPES {
-        let slot = shape_slot(&id, n);
-        let Some(bytes) = store.get(&slot).map_err(|why| failed(slot, why))? else {
-            return Ok(None);
-        };
-        let shape = Shape::read(bytes, &id).map_err(|why| failed(slot, why))?;
-        let mut key = EntryKey::new(&id, shape.len());
-        for read in shape.reads() {
-            let seen = world.hash(read).map_err(|error| KernelError::World {
-                of: of::<S>(input, identity),
-                read: world.describe(read),
-                why: error.why,
-            })?;
-            key.read(read, seen);
+    let walked = walk::<_, Key, Stop, _>(&Looking(store), entry::BOUNDS, &id, |at, bytes, list| {
+        let mut key = AnswerKey::new(bytes);
+        for name in list.reads() {
+            let read = entry::named(name).ok_or(Stop::Name { at, len: name.len() })?;
+            let seen = world
+                .hash(read)
+                .map_err(|error| Stop::World { read: world.describe(read), why: error.why })?;
+            key.value(entry::digest(seen));
         }
-        let key = key.finish();
-        if store.has(&key).map_err(|why| failed(key, why))? {
-            return Ok(Some(key));
+        let key = Key(key.finish());
+        match store.has(&key) {
+            Ok(true) => Ok(Some(key)),
+            Ok(false) => Ok(None),
+            Err(why) => Err(Stop::Store { key, why }),
         }
+    });
+    match walked {
+        Ok(Walked::Found { found, .. }) => Ok(Some(found)),
+        Ok(Walked::Passed { full: false, .. }) => Ok(None),
+        Ok(Walked::Passed { full: true, .. }) => {
+            Err(KernelError::TooManyShapes { of: of::<S>(input, identity) })
+        }
+        Err(Stop::Chain(error)) => Err(chain_error(of::<S>(input, identity), &id, error)),
+        Err(Stop::Name { at, len }) => Err(failed(
+            Key(list_key(&id, at)),
+            // alloc: an error
+            format!(
+                "slot {} of its chain of read-lists names a read by {len} bytes, too few to hold its kind",
+                at.n
+            ),
+        )),
+        Err(Stop::World { read, why }) => {
+            Err(KernelError::World { of: of::<S>(input, identity), read, why })
+        }
+        Err(Stop::Store { key, why }) => Err(failed(key, why)),
     }
-    Err(KernelError::TooManyShapes { of: of::<S>(input, identity) })
 }
 
 fn read_entry<'s, S: Step, G: Get + ?Sized>(
@@ -607,22 +652,24 @@ fn ended<S: Compute>(
             read: world.describe(error.read()),
             why: error.why,
         },
-        reads::Unfinished::Unsteady { kind, key, first, then } => KernelError::Unsteady {
+        reads::Unfinished::Unsteady { name, first, then } => KernelError::Unsteady {
             of: of::<S>(input, identity),
-            read: world.describe(Read { kind, key: &key }),
+            read: world.describe(
+                entry::named(&name).expect("a name written by `Reads` starts with its kind"),
+            ),
             first,
             then,
         },
     }
 }
 
-/// Keeps `value` as the entry of `identity` and `trace`, then makes sure the trace's shape is in
-/// the identity's chain. The entry goes first: a shape found always names reads that some
+/// Keeps `value` as the entry of `identity` and `trace`, then makes sure the trace's read-list
+/// is in the identity's chain. The entry goes first: a list found always names reads that some
 /// entry recorded.
 ///
 /// `store` must read its own puts at once (blaze-cas does, through every writer): a slot taken
-/// by another shape is found by its get, and a slot taken between the get and the put (another
-/// writer) is a [`blaze_cas::Mismatch`] that moves on to the next slot.
+/// by another list is found by its get, and a slot taken between the get and the put (another
+/// writer, a [`blaze_cas::Mismatch`]) is read again and passed over for the next slot.
 fn keep<S: Compute, P: Put + ?Sized>(
     store: &mut P,
     world: &S::World,
@@ -631,35 +678,68 @@ fn keep<S: Compute, P: Put + ?Sized>(
     trace: &Trace,
     value: &[u8],
 ) -> Result<Key, KernelError> {
-    let id = identity.id();
-    let failed =
-        |key: Key, why: String| KernelError::Store { of: of::<S>(input, identity), key, why };
-    let key = entry_key(&id, trace.iter());
-    let bytes = entry::encode(identity, trace, value);
-    if let Err(mismatch) = store.put(key, S::KIND, bytes) {
+    let store = RefCell::new(store);
+    let reads = || -> Vec<String> {
         // alloc: an error
-        let reads: Vec<String> =
-            trace.iter().map(|(read, seen)| described(world, read, seen)).collect();
-        return Err(conflict::<S>(input, identity, key, &reads, &mismatch));
-    }
+        trace.iter().map(|(read, seen)| described(world, read, seen)).collect()
+    };
     if trace.is_empty() {
+        let key = whole::key(identity);
+        keep_entry::<S, P>(&store, input, identity, key, value, reads)?;
         return Ok(key);
     }
-    let mut shape = entry::encode_shape(&id, trace);
-    for n in 0..MOST_SHAPES {
-        let slot = shape_slot(&id, n);
-        match store.get(&slot).map_err(|why| failed(slot, why))? {
-            Some(held) if held == shape.as_slice() => return Ok(key),
-            Some(_) => continue,
-            None => {}
-        }
-        match store.put(slot, Kind::Query, std::mem::take(&mut shape)) {
-            Ok(()) => return Ok(key),
-            // Another writer took the slot between the get and the put.
-            Err(_) => shape = entry::encode_shape(&id, trace),
-        }
+    let entry = entry::encode(identity, trace, value);
+    keep_entry::<S, P>(&store, input, identity, entry.key, &entry.bytes, reads)?;
+    let id = identity.id();
+    let records = Keeping { store: &store, answers: S::KIND };
+    match Filing::new(id, entry::BOUNDS).place(&records, entry.list()) {
+        Ok(Placed::Written(_) | Placed::Kept(_)) => Ok(entry.key),
+        Ok(Placed::Full) => Err(KernelError::TooManyShapes { of: of::<S>(input, identity) }),
+        Err(error) => Err(chain_error(of::<S>(input, identity), &id, error)),
     }
-    Err(KernelError::TooManyShapes { of: of::<S>(input, identity) })
+}
+
+/// Keeps `bytes` as the entry under `key`: `blaze_record`'s rule that a key names one answer.
+/// A second value under it is a [`KernelError::Conflict`] naming `reads` (rule 21), whether
+/// the get before the put saw the first, or the put itself did where another writer kept its
+/// value in between; the first stays.
+fn keep_entry<S: Step, P: Put + ?Sized>(
+    store: &RefCell<&mut P>,
+    input: &S::Input,
+    identity: &Identity,
+    key: Key,
+    bytes: &[u8],
+    reads: impl FnOnce() -> Vec<String>,
+) -> Result<(), KernelError> {
+    let failed = |why: String| KernelError::Store { of: of::<S>(input, identity), key, why };
+    let second = |kept: ContentId, given: ContentId| KernelError::Conflict {
+        of: of::<S>(input, identity),
+        key,
+        reads: reads(),
+        kept,
+        given,
+    };
+    match keep_answer(&Keeping { store, answers: S::KIND }, key.0, bytes) {
+        Ok(_) => Ok(()),
+        Err(blaze_record::Error::TwoAnswers { .. }) => {
+            let held = store.try_borrow().map_err(|_| failed(Stopped::Held.why()))?;
+            let refused = match Get::get(&**held, &key) {
+                Ok(Some(kept)) => second(content_of(kept), content_of(bytes)),
+                // alloc: an error
+                Ok(None) => failed(
+                    "another value was kept under its entry's key, and then none".to_owned(),
+                ),
+                Err(why) => failed(why),
+            };
+            Err(refused)
+        }
+        Err(blaze_record::Error::Store {
+            doing: Doing::KeepingAnswer,
+            error: Stopped::Refused(mismatch),
+            ..
+        }) => Err(second(mismatch.kept, mismatch.given)),
+        Err(error) => Err(chain_error(of::<S>(input, identity), &identity.id(), error)),
+    }
 }
 
 fn described<W: World + ?Sized>(world: &W, read: Read<'_>, seen: Seen) -> String {

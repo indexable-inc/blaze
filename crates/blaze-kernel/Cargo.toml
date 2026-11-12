@@ -18,6 +18,7 @@ blaze-cas.workspace = true
 blaze-format.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
+blaze-record.workspace = true
 blaze-store-check.workspace = true
 
 [dev-dependencies]

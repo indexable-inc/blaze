@@ -20,13 +20,15 @@
 use blaze_cas::Key;
 use blaze_ids::ContentId;
 
-use crate::{Entry, Get, Identity, Seen, World, shape_slot};
+use blaze_record::{Slot, list_key};
+
+use crate::{Entry, Get, Identity, Seen, World};
 
 /// Why a lookup of a step the kernel computes found no entry.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Missed {
     /// Nothing is kept under its identity: no entry kept last was handed in, and no shape of
-    /// reads is kept under it.
+    /// reads (a read-list) is kept under it.
     New,
     /// The entry kept last under its identity saw `read` as `was`, and it is `now` now: the
     /// first of the entry's reads, in its order (kind, then key), whose hash changed. `changed`
@@ -196,7 +198,7 @@ fn explained<W: World + ?Sized, G: Get + ?Sized>(
     // alloc: an error
     let at = |key: Key, why: String| format!("the store at {:x}: {why}", key.0);
     let Some(key) = last else {
-        let first = shape_slot(&identity.id(), 0);
+        let first = Key(list_key(&identity.id(), Slot { generation: 0, n: 0 }));
         return Ok(match store.has(&first).map_err(|why| at(first, why))? {
             true => Missed::Unrecorded,
             false => Missed::New,

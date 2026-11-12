@@ -4,6 +4,7 @@
 //! - The **base key** is the result's own content identity, computable before the work.
 //! - A **read-list** ([`write_list`], [`write_list_with`], [`ListRef`]) names what one run of the work read, without
 //!   the values: filed under the base, in a slot of the base's chain ([`Slot`], [`list_key`]).
+//!   The list of work that reads nothing is [`empty_list`]: known from the base, never filed.
 //! - An **answer** is filed under a read-list's bytes and the digest each of its reads had
 //!   ([`AnswerKey`], [`Digest`]; a read that found nothing is [`Digest::Nothing`]).
 //!
@@ -66,4 +67,4 @@ pub use chain::{
     walk,
 };
 pub use keys::{AnswerKey, Digest, Slot, list_key};
-pub use list::{LAYOUT, ListError, ListRef, Reads, write_list, write_list_with};
+pub use list::{LAYOUT, ListError, ListRef, Reads, empty_list, write_list, write_list_with};
