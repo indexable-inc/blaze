@@ -23,7 +23,7 @@
 
 use std::{
     collections::VecDeque,
-    io::{self, Write as _},
+    io,
     path::{Path, PathBuf},
     sync::Arc,
     thread::JoinHandle,

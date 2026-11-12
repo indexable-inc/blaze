@@ -35,7 +35,7 @@ use crate::{
 
 /// The threads the native driver runs file calls on where it has a pool (kqueue, IOCP): a
 /// bound bstd picks for a program's entry, named (std.md, "The second rule").
-pub const FILE_THREADS: usize = 4;
+pub(crate) const FILE_THREADS: usize = 4;
 
 /// What a program of the blaze edition hands Rust std's `lang_start`: its [`Status`], as the
 /// one type of bstd that implements Rust std's `Termination`. Gone with `lang_start`, when

@@ -22,7 +22,7 @@
 // pack's records, allowed on that module alone.
 #![deny(unsafe_code)]
 // `ContentMap` names its allocator.
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 
 mod content_map;
 mod persist;

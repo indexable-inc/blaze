@@ -174,6 +174,8 @@ impl Backend {
         }
     }
 
+    /// A test's view: the lib asks no driver how much it holds.
+    #[cfg(test)]
     fn in_flight(&self) -> usize {
         match self {
             #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
@@ -1103,6 +1105,7 @@ impl Io {
 
     /// How many effects the driver holds that have not completed: a test's view of whether
     /// anything a wait gave back is still in flight.
+    #[cfg(test)]
     pub(crate) fn in_flight(&self) -> usize {
         self.world.lock().driver.in_flight()
     }

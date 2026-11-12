@@ -102,7 +102,6 @@
 // by a `Default` or a `new()` that takes nothing (std.md, "The second rule").
 #![warn(blaze::default_policy)]
 #![feature(
-    allocator_api,
     allocator_ext,
     atomic_internals,
     blaze_comptime,

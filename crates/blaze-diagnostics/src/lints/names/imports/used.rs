@@ -832,6 +832,8 @@ impl<'f, 'db> Uses<'f, 'db> {
             {
                 self.type_relative(cx, path);
             }
+        } else if kind == SyntaxKind::IDENT_PAT {
+            self.ident_pat(cx, ast::IdentPat::cast(node).unwrap());
         } else if kind == SyntaxKind::METHOD_CALL_EXPR {
             let call = ast::MethodCallExpr::cast(node).unwrap();
             let Some(name) = call.name_ref() else { return };
@@ -1096,6 +1098,31 @@ impl<'f, 'db> Uses<'f, 'db> {
             if !last && !module_prefix {
                 return;
             }
+        }
+    }
+
+    /// Marks what an identifier pattern is found through when it names an item and binds
+    /// nothing: `Success => ..` under `use Token::*;` is the variant, which rustc resolves as a
+    /// path of one segment in the value namespace (`late.rs`, `try_resolve_as_non_binding`) and
+    /// records the use of. Syntax has no path there, so the walk of paths never met it, and the
+    /// glob a `match` alone used was called unused (blaze-report's `palette.rs`, 2026-11-12).
+    fn ident_pat(&mut self, cx: &Cx<'_, 'db>, pat: ast::IdentPat<'db>) {
+        let Some(name) = pat.name() else { return };
+        // A fresh binding resolves to no item: nothing is used.
+        let Some(def) = cx.vsema.resolve_bind_pat_to_const(pat) else { return };
+        let Some(scope) = cx.vsema.scope(pat.syntax()) else { return };
+        let module = ModuleId::from(scope.module());
+        let name = name.as_name();
+        let per = self.lookup(cx, module, PathKind::Plain, std::slice::from_ref(&name));
+        match (ModuleDefId::try_from(def), entry(&per, Ns::Values)) {
+            (Ok(def), Some(found)) if found.def == def => {
+                if let Some(binding) = found.import {
+                    self.mark(cx, binding, Used::Scope, &name, Ns::Values);
+                }
+            }
+            // Found another way than this walk finds it: every import it could be through
+            // counts as used, as for a path.
+            _ => self.taint(cx, module, &name, true, None),
         }
     }
 

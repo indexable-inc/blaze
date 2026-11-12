@@ -25,7 +25,7 @@
 //! the simulation with it, is safe Rust.
 
 #![deny(unsafe_code)]
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 // `#![blaze::sans_io]` marks a sans-IO core for `blaze::sans_io_core`; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]

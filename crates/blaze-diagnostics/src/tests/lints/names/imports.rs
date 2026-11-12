@@ -208,6 +208,37 @@ fn main() {{
     );
 }
 
+/// A glob import a `match` uses only through its patterns is used: `Success => ..` under
+/// `use Token::*;` names the variant, as rustc resolves an identifier pattern. The control is
+/// the second glob, of an enum no pattern names, which is still unused.
+#[test]
+fn a_glob_import_used_by_identifier_patterns_is_used() {
+    let fixture = "//- /main.rs crate:other:main edition:2021
+pub enum Token { Success, Failure }
+pub enum Other { Idle }
+pub const LIMIT: u8 = 3;
+mod limits { pub const MOST: u8 = 9; }
+pub fn name(token: Token, n: u8) -> u8 {
+    use Token::*;
+    use Other::*;
+    use limits::MOST;
+    let first = match token {
+        Success => 1,
+        Failure => 2,
+    };
+    match n {
+        MOST => first,
+        fresh => fresh,
+    }
+}
+fn main() {}
+";
+    assert_eq!(
+        messages(fixture, &[], "unused_imports"),
+        ["unused_imports: unused import: `Other::*`"]
+    );
+}
+
 #[test]
 fn used_import_of_a_dependency_s_item() {
     let fixture = format!(

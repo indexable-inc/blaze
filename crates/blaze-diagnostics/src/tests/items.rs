@@ -13,6 +13,7 @@ mod lifetimes;
 mod macros;
 mod names;
 mod parse;
+mod publicity;
 mod refine;
 mod refused;
 mod resolve;

@@ -328,8 +328,9 @@ struct Waiting<'a> {
     start_ns: u64,
     span: u64,
     token: u64,
-    /// Its row in the wait-for graph, while it waits.
-    registered: Option<graph::Registered>,
+    /// Its row in the wait-for graph, while it waits: held for its drop, which takes the row
+    /// out, and never read.
+    _registered: Option<graph::Registered>,
     ended: bool,
 }
 
@@ -361,13 +362,13 @@ impl<'a> Waiting<'a> {
             Some(site),
             Some(&meta.owner),
         ));
-        Waiting { meta, probe, site, mode, value_type, start_ns, span, token, registered, ended: false }
+        Waiting { meta, probe, site, mode, value_type, start_ns, span, token, _registered: registered, ended: false }
     }
 
     /// The lock taken: ends the span, records the wait, and gives the guard's acquire time.
     fn taken(mut self) -> u64 {
         self.ended = true;
-        self.registered = None;
+        self._registered = None;
         let Some(probe) = self.probe else { return 0 };
         probe.wait_end(self.token);
         self.meta.waiting.fetch_sub(1, Ordering::Relaxed);

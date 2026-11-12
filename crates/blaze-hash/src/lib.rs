@@ -42,7 +42,7 @@
 //!   is `blaze_ids::Hasher`, and a value's `Hash` is fed to it through [`Blake3Hasher`]. This
 //!   crate depends on nothing of blaze's, so every crate can use it.
 
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 #![cfg_attr(test, feature(hashmap_internals))]
 #![cfg_attr(
     test,

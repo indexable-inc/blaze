@@ -85,7 +85,7 @@ impl GiveBacks {
 
     /// One read-modify-write of the word: `f` gives the new word, or `None` to leave it.
     fn update(&self, f: impl FnMut(u64) -> Option<u64>) -> Result<u64, u64> {
-        self.word.fetch_update(Ordering::AcqRel, Ordering::Acquire, f)
+        self.word.try_update(Ordering::AcqRel, Ordering::Acquire, f)
     }
 
     /// Asks every thread to give back: the generation moves on and its acks start at none, in

@@ -3,7 +3,6 @@
 
 use std::hash::Hash;
 
-pub use blaze_hash::fixed_width_writes;
 use blaze_hash::{Blake3, Blake3Hasher};
 
 use crate::Hasher;

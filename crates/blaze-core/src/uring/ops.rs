@@ -283,10 +283,6 @@ impl Ops {
         self.hot.contains(id)
     }
 
-    pub(super) fn len(&self) -> usize {
-        self.hot.len()
-    }
-
     pub(super) fn is_empty(&self) -> bool {
         self.hot.is_empty()
     }
