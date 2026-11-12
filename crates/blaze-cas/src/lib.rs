@@ -786,6 +786,9 @@ pub(crate) enum PlacePlant {
     /// As [`PlacePlant::MadeClonesUnflushed`], with the file's write-back waited for before
     /// the clone: the answer waits for a write-back.
     MadeWaitsForWriteBack,
+    /// An output placed from its maker's bytes is not begun on its way to the device as its
+    /// place ends: the clone its next patch starts from forces all of it out.
+    MadeNoWriteBack,
 }
 
 /// Whether a value can be the base of a derived one ([`Reader::derivable`]).
@@ -1474,6 +1477,9 @@ enum Op {
     PatchRename {
         asked: Tag,
     },
+    /// The write-back of an output just placed from its maker's bytes, which nothing waits
+    /// for ([`Store::runs_step`]).
+    OutputBack,
     /// A step of the output place `asked` written from its maker's runs
     /// ([`publish::Writing`]).
     Runs {
@@ -2899,6 +2905,39 @@ impl Store {
         tag
     }
 
+    /// Asks for the file at `to` to be brought to `file`: `to`'s own file with `file`'s runs
+    /// written over it and cut to its length. The edit path's place of an output whose link
+    /// was a patch of the file before it: the caller knows `to` holds that file (it placed
+    /// it and has looked since), and gives what the link wrote. How it went comes through
+    /// [`Store::placed`], under the tag returned.
+    ///
+    /// The path's file is cloned under a staged name beside it, the runs written into the
+    /// clone, and the clone renamed onto `to`, unsynced ([`publish::Writing`]): the file a
+    /// program may be running is never written, and what is written is the patch, whatever
+    /// the file's length. Nothing of the store is read, cloned or waited for. A `to` that is
+    /// not there, or on a volume that shares no blocks, fails the place, naming it.
+    pub fn place_patched(&mut self, to: FileName, file: Sparse, effects: &mut Vec<Effect>) -> Tag {
+        assert!(
+            !self.tiers.iter().any(|tier| to.is_under(&tier.dir)),
+            "{to} is in the store: values are placed outside it"
+        );
+        self.tidy();
+        let tag = self.tags.fresh();
+        // As [`Store::place`]'s: open until the answer, with no parent.
+        let span = tracing::info_span!(
+            target: "blaze",
+            parent: None,
+            "place",
+            %to,
+            how = tracing::field::Empty,
+            bytes = tracing::field::Empty,
+            waits = tracing::field::Empty,
+        );
+        self.place_spans.insert(tag, span);
+        self.publish(tag, to, Content::Over(file), Durable::No, 0, effects);
+        tag
+    }
+
     /// How a step of an output written from its maker's runs went ([`publish::Writing`]): the
     /// next effects asked, or its place answered. One that fails removes what it made under
     /// its staged name and refuses the place, naming the path and the step.
@@ -2911,10 +2950,27 @@ impl Store {
             publish::Next::Done(wrote) => Ok(wrote),
             publish::Next::Failed(why) => Err(why),
         };
-        let Some(publish::Writing { to, temp, .. }) = self.writing.remove(&asked) else { return };
+        let Some(publish::Writing { to, temp, len, over, .. }) = self.writing.remove(&asked) else {
+            return;
+        };
         match result {
             Ok(wrote) => {
-                let bytes = PlacedBytes { cloned: 0, written: 0, copied: wrote };
+                // What the path's file holds that is only in memory is begun on its way to
+                // the device, and nothing waits for it: the clone the path's next patch
+                // starts from ([`Store::place_patched`]) then finds the file written back,
+                // or waits for what is left of these bytes and no more. The planted bug of
+                // a control asks for none.
+                #[cfg(test)]
+                let back = self.plant != PlacePlant::MadeNoWriteBack;
+                #[cfg(not(test))]
+                let back = true;
+                if back {
+                    // clone: the effect owns the name; once per place
+                    let file = to.clone();
+                    effects.push(Effect::WriteBack { file, tag: self.tags.ask(Op::OutputBack) });
+                }
+                let cloned = if over { len.saturating_sub(wrote) } else { 0 };
+                let bytes = PlacedBytes { cloned, written: 0, copied: wrote };
                 self.answer(Placed { tag: asked, to, result: Ok(()), bytes });
             }
             Err(why) => {
@@ -3001,7 +3057,10 @@ impl Store {
             match &content {
                 Content::File { of: Some(source), .. } => self.cloned(source.content, effects),
                 Content::Patch { base_id, .. } => self.cloned(*base_id, effects),
-                Content::File { of: None, .. } | Content::Bytes(_) | Content::Sparse(_) => {}
+                Content::File { of: None, .. }
+                | Content::Bytes(_)
+                | Content::Sparse(_)
+                | Content::Over(_) => {}
             }
             // alloc: an error, once per place refused
             let why = format!(
@@ -3017,6 +3076,7 @@ impl Store {
                 bytes: PlacedBytes::default(),
             });
         }
+        let over = matches!(content, Content::Over(_));
         match content {
             Content::Bytes(bytes) => {
                 let placed = PlacedBytes { cloned: 0, written, copied: bytes.len() as u64 };
@@ -3028,7 +3088,7 @@ impl Store {
                 let op = Op::Place { asked, to, staged: None, of: None, bytes: placed };
                 self.tags.ops.insert(asked, op);
             }
-            Content::Sparse(file) => {
+            Content::Sparse(file) | Content::Over(file) => {
                 if let Err(why) = file.check() {
                     // alloc: an error, once per place refused
                     let why = format!("{to} was to be written from runs that are no file: {why}");
@@ -3054,7 +3114,7 @@ impl Store {
                     ),
                     _ => (temp, None),
                 };
-                let (writing, clear) = publish::Writing::begin(to, temp, file, asked);
+                let (writing, clear) = publish::Writing::begin(to, temp, file, over, asked);
                 #[cfg(test)]
                 let writing = writing.planted_with(plant);
                 self.writing.insert(asked, writing);
@@ -4704,6 +4764,9 @@ impl Store {
                 self.patch_step(op, done, effects);
             }
             Op::Runs { asked, step } => self.runs_step(asked, step, &done, effects),
+            // Nothing waits for it, and one that fails is of a path placed again or removed
+            // since: the next clone of the path's file writes out what it left.
+            Op::OutputBack => {}
             op @ (Op::DeriveClear { .. }
             | Op::DeriveClone { .. }
             | Op::DeriveWrite { .. }

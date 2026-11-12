@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
 use blaze_items::CodeHash;
@@ -75,11 +77,11 @@ fn built() -> Built {
         std::iter::empty(),
     );
     Built {
-        functions: (0..3).map(|n| compiled(key(n), refs[n as usize], &[], &[])).collect(),
+        functions: (0..3).map(|n| Arc::new(compiled(key(n), refs[n as usize], &[], &[]))).collect(),
         roots: vec![key(0), key(2)],
         inputs: (0..3).map(|n| (key(n), CodeHash(ran(n)))).collect(),
         versions: (0..3).map(|n| (id(n), Ok(ran(n)))).collect(),
-        reach,
+        reach: Arc::new(reach),
         ..Built::default()
     }
 }
@@ -342,13 +344,13 @@ fn placing(span_table_1: u8, static_0: u8) -> (Built, Vec<(ContentId, Vec<u8>)>)
     let mut deduped = crate::dedupe::Deduped::default();
     deduped.merged.insert(key(3), key(0));
     let built = Built {
-        functions,
+        functions: functions.into_iter().map(Arc::new).collect(),
         statics,
         roots: (0..6).map(key).collect(),
         inputs: (0..6).map(|n| (key(n), CodeHash(ran(n)))).collect(),
         versions: (0..6).map(|n| (id(n), Ok(ran(n)))).collect(),
         deduped,
-        reach,
+        reach: Arc::new(reach),
         ..Built::default()
     };
     let spans = vec![(ContentId([1; 32]), vec![span_table_1]), (ContentId([2; 32]), vec![0])];
@@ -387,8 +389,8 @@ fn a_static_s_value_changes_the_functions_reading_it_at_any_depth() {
 #[test]
 fn the_order_a_function_names_its_tables_in_is_not_in_its_bound() {
     let (mut built, spans) = placing(0, 0);
-    built.functions[0] = compiled(key(0), &[position(1, 0), position(2, 0)], &[], &[]);
-    built.functions[1] = compiled(key(1), &[position(2, 4)], &[position(1, 3)], &[]);
+    built.functions[0] = Arc::new(compiled(key(0), &[position(1, 0), position(2, 0)], &[], &[]));
+    built.functions[1] = Arc::new(compiled(key(1), &[position(2, 4)], &[position(1, 3)], &[]));
     built.versions[1].1 = Ok(ran(0));
     let table =
         ExecTable::new(&built, &spans, 0, |_| None, ContentId::default(), no_tests()).unwrap();
@@ -418,14 +420,14 @@ fn a_table_is_in_identity_order_and_says_each_place_in_it() {
     );
     let built = Built {
         functions: (0..1000)
-            .map(|n| compiled(InstanceKey(numbered(n, 0)), refs_of(n), &[], &[]))
+            .map(|n| Arc::new(compiled(InstanceKey(numbered(n, 0)), refs_of(n), &[], &[])))
             .collect(),
         roots: vec![InstanceKey(numbered(0, 0)), InstanceKey(numbered(999, 0))],
         inputs: (0..1000)
             .map(|n| (InstanceKey(numbered(n, 0)), CodeHash(numbered(n, 8))))
             .collect(),
         versions: (0..1000).map(|n| (numbered(999 - n, 4), Ok(numbered(n, 8)))).collect(),
-        reach,
+        reach: Arc::new(reach),
         ..Built::default()
     };
     let slot_of = |key: &InstanceKey| (key.0 == numbered(0, 0)).then_some(1);

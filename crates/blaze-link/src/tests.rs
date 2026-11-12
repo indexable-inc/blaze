@@ -348,6 +348,7 @@ impl Disk {
 }
 
 /// A linked file read back.
+#[derive(Debug)]
 struct Linked {
     words: Vec<u64>,
     len: usize,

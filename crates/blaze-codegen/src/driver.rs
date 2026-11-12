@@ -178,8 +178,10 @@ impl ProfileCounts {
 /// What a build gives the linker.
 #[derive(PartialEq, Eq, Debug, Default)]
 pub struct Built {
-    /// By key, after dedupe.
-    pub functions: Vec<CompiledFunction>,
+    /// By key, after dedupe. Each shared with the rows the driver keeps of the build
+    /// ([`lists`]): a `Built` holds no copy of a function's code, and the next build's
+    /// holds the same function where nothing changed it.
+    pub functions: Vec<Arc<CompiledFunction>>,
     /// By item and instance.
     pub statics: Vec<Static>,
     pub roots: Vec<InstanceKey>,
@@ -205,8 +207,8 @@ pub struct Built {
     /// Every instance the walk reached by key, with the name a debugger calls it
     /// ([`Described::name`]), those dedupe merged away included.
     pub debug_names: Vec<(InstanceKey, String)>,
-    /// What each root reaches ([`Built::reached`]).
-    pub reach: Reach,
+    /// What each root reaches ([`Built::reached`]): shared with the rows the driver keeps.
+    pub reach: Arc<Reach>,
     /// A lazy build's ([`Build::run_later`]) functions, every one the walk reached, in its
     /// order; empty for a whole build.
     pub walked: Vec<Walked>,
@@ -1760,6 +1762,8 @@ enum Planted {
     UnsplitClass,
     /// The delta names no function the build removed.
     DeltaOmitsRemoved,
+    /// A `Built` given back keeps the rows of the functions the build removed.
+    StaleBuilt,
 }
 
 /// How many of a walk's functions are reached each way: what [`rebind`] counted, and the span
@@ -3487,7 +3491,8 @@ impl<'a, B: Prepare> Build<'a, B> {
             return Err(errors);
         }
         let mut built = Built {
-            functions,
+            // alloc: per whole build, a reference count a function, which its rows share
+            functions: functions.into_iter().map(Arc::new).collect(),
             statics: compiled_statics,
             roots: root_keys,
             symbols,
@@ -3500,7 +3505,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             inputs,
             items,
             debug_names,
-            reach,
+            reach: Arc::new(reach), // alloc: per whole build, shared with its rows
             walked: lazily.walked,
             entry: lazily.entry,
             owners: owned.functions,

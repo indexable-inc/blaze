@@ -46,7 +46,7 @@ fn compile_one_gives_what_a_whole_build_compiles() {
     for walked in &built.walked {
         let function = build.compile_one(walked.key, &store).unwrap();
         let want = whole.functions.iter().find(|it| it.key == walked.key).unwrap();
-        assert_eq!(&function, want);
+        assert_eq!(function, **want);
     }
     // The entry is the memo's, by the stored key its compile ahead landed under; 2's IR again
     // and its compile; 3 takes 2's template by the shape its check kept, building nothing; 4
@@ -165,7 +165,7 @@ fn compile_one_reads_a_store_behind_a_trait_object() {
     let lookup: &dyn Lookup = &store;
     let before = counts(&machine);
     let entry = build.compile_one(built.entry[0], lookup).unwrap();
-    assert_eq!(entry, built.functions[0]);
+    assert_eq!(entry, *built.functions[0]);
     assert_eq!(counts(&machine), before);
 }
 
@@ -228,7 +228,7 @@ fn an_owned_walk_compiles_what_a_whole_build_compiles() {
         let (function, _) =
             later.compile_kept(&machine, &program, &memo, walked.key, &store).unwrap();
         let want = whole.functions.iter().find(|it| it.key == walked.key).unwrap();
-        assert_eq!(&function, want);
+        assert_eq!(function, **want);
     }
 }
 
@@ -286,9 +286,9 @@ fn a_first_call_after_an_edit_compiles_only_what_still_has_its_key() {
     assert_eq!(counts(&machine), before, "refused before its IR is built");
 
     let (five, _) = later.compile_kept(&machine, &program, &memo, key(5), &store).unwrap();
-    assert_eq!(five, want(key(5)));
+    assert_eq!(five, *want(key(5)));
     let (three, _) = later.compile_kept(&machine, &program, &memo, key(3), &store).unwrap();
-    assert_eq!(three, want(key(3)), "2's template, by the shape 3's check recorded");
+    assert_eq!(three, *want(key(3)), "2's template, by the shape 3's check recorded");
 }
 
 /// A tier-up compiles the function alone at each tier, under the tier's own key, and refuses

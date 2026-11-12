@@ -1895,7 +1895,7 @@ struct Making {
     records: Vec<ImageRecord>,
     /// Each image this compile linked, by its path, as the runs of its file that hold bytes
     /// (`codegen::LinkMade::made`): what the loop places it from.
-    made_files: Vec<(String, Arc<blaze_cas::Sparse>)>,
+    made_files: Vec<(String, Arc<crate::serve::work::Made>)>,
     /// The debug side files its links made, each by the path it goes at
     /// (`codegen::LinkMade::side`): outputs the loop places from these bytes after the
     /// build's answer, in no record.

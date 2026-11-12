@@ -258,9 +258,54 @@ pub struct Output {
     pub key: blaze_cas::Key,
     pub executable: bool,
     /// The file itself, where this compile linked it: the loop places it from these bytes
-    /// (`blaze_cas::Store::place_made`), never from a file of the store. None for a file the
-    /// store places from its value (a library, a record replayed).
-    pub made: Option<Arc<blaze_cas::Sparse>>,
+    /// ([`Made`]), never from a file of the store. None for a file the store places from its
+    /// value (a library, a record replayed).
+    pub made: Option<Arc<Made>>,
+}
+
+/// A file a compile linked, as the loop places it ([`Output::made`]).
+pub enum Made {
+    /// The whole file, as the runs of it that hold bytes: written into a file of holes
+    /// (`blaze_cas::Store::place_made`). An image's first link, or one from scratch.
+    Whole(blaze_cas::Sparse),
+    /// What a link changed of the file before it: the file of key `base` with `file`'s runs
+    /// written over it, cut to `file`'s length. Where the path holds the file of `base` as
+    /// the loop placed it, the place is a clone of it with those runs written
+    /// (`blaze_cas::Store::place_patched`): a few kilobytes for a one-function edit,
+    /// whatever the file's length. Where it does not (nothing was placed there by this
+    /// daemon, a place failed, the file was changed or removed since), `whole` makes the
+    /// file's runs and it is placed as [`Made::Whole`] is: one route, picked by what the
+    /// path holds, and said on the place's span.
+    Patch { base: blaze_cas::Key, file: blaze_cas::Sparse, whole: Whole },
+}
+
+/// The whole of a file a link patched, as the runs of it that hold bytes: read from what
+/// the link holds of it when asked, on the loop's thread, and only when asked.
+pub type Whole = Arc<dyn Fn() -> blaze_cas::Sparse + Send + Sync>;
+
+impl PartialEq for Made {
+    fn eq(&self, other: &Made) -> bool {
+        match (self, other) {
+            (Made::Whole(a), Made::Whole(b)) => a == b,
+            (Made::Patch { base: a, file: x, .. }, Made::Patch { base: b, file: y, .. }) => {
+                a == b && x == y
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Made {}
+
+impl std::fmt::Debug for Made {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Made::Whole(file) => write!(f, "Whole({} bytes in {} runs of {})", file.bytes(), file.runs.len(), file.len),
+            Made::Patch { base, file, .. } => {
+                write!(f, "Patch({} bytes in {} runs of {} over {base:?})", file.bytes(), file.runs.len(), file.len)
+            }
+        }
+    }
 }
 
 /// What came of one unit's compile.

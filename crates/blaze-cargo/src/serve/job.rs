@@ -144,7 +144,7 @@ use super::{
     plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds, loops},
     work::{
         Broke, Compiled, Failed, Front, FrontEnd, Image, JobInput, JobKind, Kept, KeptDb, Library,
-        Linking, LocalRead, Phase, Readers, RunPuts, Runs, Selection, Source, Steps, Writer,
+        Linking, LocalRead, Made, Phase, Readers, RunPuts, Runs, Selection, Source, Steps, Writer,
     },
 };
 use crate::cli::print::Format;
@@ -3171,6 +3171,10 @@ enum Own {
     Mode { job: JobId, path: u32, key: blaze_cas::Key },
     /// A placed output's file looked at: placed again unless it is as it was placed.
     Look { job: JobId, path: u32, key: blaze_cas::Key, executable: bool },
+    /// The file at a path looked at before a link's patch of it is placed there
+    /// ([`Jobs::patching`]): the patch is written over a clone of it where it is as it was
+    /// placed, and the whole file is written where it is not.
+    LookBase { job: JobId, path: u32, key: blaze_cas::Key, executable: bool },
     /// A file placed, looked at for its [`Placement`] before its job is done: a file changed
     /// after the job's `Done` must not be recorded as the one placed.
     Record { job: JobId, path: u32, key: blaze_cas::Key },
@@ -3198,7 +3202,7 @@ struct Queued {
     path: u32,
     key: blaze_cas::Key,
     executable: bool,
-    made: Option<Arc<blaze_cas::Sparse>>,
+    made: Option<Arc<Made>>,
     /// `an output waits for the path's placement in flight`, open while it waits
     /// (every-wait-says-what).
     _waits: tracing::Span,
@@ -3320,6 +3324,9 @@ pub struct Jobs<S: Steps> {
     flying: HashMap<u32, u32, Global>,
     /// The outputs waiting for their path's effects in flight to end, in the order asked.
     queued: Vec<Queued>,
+    /// The patches whose path's file is being looked at ([`Own::LookBase`]), by path: one a
+    /// path, as one effect is in flight there.
+    patching: HashMap<u32, Arc<Made>, Global>,
     paths: Paths<S>,
     /// The lock writes, modes and looks at files in flight, by the slot their tag carries.
     own: Tagged<Own>,
@@ -3484,6 +3491,7 @@ impl<S: Steps> Jobs<S> {
             placing: HashMap::new_in(Global),
             flying: HashMap::new_in(Global),
             queued: Vec::new(), // alloc: none until an output waits for its path
+            patching: HashMap::new_in(Global),
             paths: Paths::new(machine),
             own,
             runs,
@@ -6600,7 +6608,7 @@ impl<S: Steps> Jobs<S> {
         path: u32,
         key: blaze_cas::Key,
         executable: bool,
-        made: Option<Arc<blaze_cas::Sparse>>,
+        made: Option<Arc<Made>>,
     ) {
         #[cfg(test)]
         let planted = PLANT_NO_QUEUE.get();
@@ -6630,13 +6638,13 @@ impl<S: Steps> Jobs<S> {
         path: u32,
         key: blaze_cas::Key,
         executable: bool,
-        made: Option<Arc<blaze_cas::Sparse>>,
+        made: Option<Arc<Made>>,
     ) {
         // A file this compile linked is placed from the bytes it made, whatever the path
         // holds: no file of the store is read, cloned or waited for, so the answer is
         // held by no clone and no write-back (docs/v2/plan/design/clone-out.md).
         if let Some(made) = made {
-            self.place_made(w, id, path, key, executable, &made);
+            self.place_made(w, id, path, key, executable, made);
             return;
         }
         let placed = self.paths.placed[path as usize]
@@ -6760,9 +6768,11 @@ impl<S: Steps> Jobs<S> {
     }
 
     /// `made`, the file of `key` that job `id`'s compile just linked, placed at path `path`
-    /// from those bytes (`blaze_cas::Store::place_made`): its runs written into a file of
-    /// holes beside the path and renamed onto it. The whole file the store kept to clone the
-    /// path's last value from goes, and none is made of this one.
+    /// from the bytes the link holds. A whole file goes as its runs
+    /// ([`Jobs::place_made_as`]). A patch of the file before it ([`Made::Patch`]) goes as
+    /// the patch where the path's record says it holds that file: the file is looked at
+    /// first ([`Own::LookBase`]), since a file changed or removed since it was placed is no
+    /// base. Where the record names another value or none, the whole file is placed.
     fn place_made(
         &mut self,
         w: &mut World<'_, S>,
@@ -6770,7 +6780,50 @@ impl<S: Steps> Jobs<S> {
         path: u32,
         key: blaze_cas::Key,
         executable: bool,
-        made: &blaze_cas::Sparse,
+        made: Arc<Made>,
+    ) {
+        let based = match &*made {
+            Made::Patch { base, .. } => self.paths.placed[path as usize]
+                .as_ref()
+                .is_some_and(|it| it.key == *base && it.executable == executable && it.meta.is_some()),
+            Made::Whole(_) => false,
+        };
+        if !based {
+            self.place_made_as(w, id, path, key, executable, &made, false);
+            return;
+        }
+        match self.own_tag(Own::LookBase { job: id, path, key, executable }) {
+            Ok(tag) => {
+                // clone: the driver's effect owns the file's name, once per output
+                let Some(file) = self.paths.files[path as usize].clone() else {
+                    self.place_made_as(w, id, path, key, executable, &made, false);
+                    return;
+                };
+                self.patching.insert(path, made);
+                self.begin_placing(id, path);
+                w.effects.push(Effect::Stat { file, tag });
+            }
+            Err(error) => self.placing_failed(id, path, error),
+        }
+    }
+
+    /// [`Jobs::place_made`] once it is known what the path holds: `over` says it holds the
+    /// file a patch is of, as it was placed. Then the patch's runs are written into a clone
+    /// of that file (`blaze_cas::Store::place_patched`); else the whole file's runs into a
+    /// file of holes (`blaze_cas::Store::place_made`), a patch's made now from what its link
+    /// holds, which the span says (`place: a patch's whole file made`). Either is renamed
+    /// onto the path. The whole file the store kept to clone the path's last value from
+    /// goes, and none is made of this one.
+    #[expect(clippy::too_many_arguments, reason = "a placement's parts, each its own")]
+    fn place_made_as(
+        &mut self,
+        w: &mut World<'_, S>,
+        id: JobId,
+        path: u32,
+        key: blaze_cas::Key,
+        executable: bool,
+        made: &Made,
+        over: bool,
     ) {
         if let Some(before) = self.paths.placed[path as usize].take()
             && before.key != key
@@ -6795,8 +6848,28 @@ impl<S: Steps> Jobs<S> {
             self.placing_failed(id, path, error);
             return;
         };
-        // clone: the runs, which the path's writes own (an effect owns its bytes); once per path
-        let tag = w.store.place_made(file, made.clone(), w.effects);
+        let tag = match (made, over) {
+            // clone: the patch's runs, which the path's writes own (an effect owns its
+            // bytes); once per path, the edit's bytes
+            (Made::Patch { file: patch, .. }, true) => {
+                w.store.place_patched(file, patch.clone(), w.effects)
+            }
+            (Made::Patch { whole, .. }, false) => {
+                let span = tracing::info_span!(
+                    target: "blaze",
+                    "place: a patch's whole file made",
+                    function = &*self.paths.names[path as usize],
+                    bytes = tracing::field::Empty,
+                )
+                .entered();
+                let runs = whole();
+                span.record("bytes", runs.bytes());
+                w.store.place_made(file, runs, w.effects)
+            }
+            // clone: the runs, which the path's writes own (an effect owns its bytes); once
+            // per path
+            (Made::Whole(runs), _) => w.store.place_made(file, runs.clone(), w.effects),
+        };
         self.placing.insert(tag, Placing { job: id, path, key, executable });
         self.begin_placing(id, path);
     }
@@ -7075,6 +7148,21 @@ impl<S: Steps> Jobs<S> {
                 self.end_placing(id, path);
                 if !unchanged && self.owned(id) {
                     self.place(w, id, path, key, executable);
+                }
+            }
+            Own::LookBase { job: id, path, key, executable } => {
+                // The path's record is of the patch's base (checked as the look was
+                // asked): the file is that one where it is as it was placed.
+                let over = matches!(
+                    (&done, &self.paths.placed[path as usize]),
+                    (Done::Stat(Some(meta)), Some(placement)) if placement.meta == Some(*meta)
+                );
+                let made = self.patching.remove(&path);
+                self.end_placing(id, path);
+                if let Some(made) = made
+                    && self.owned(id)
+                {
+                    self.place_made_as(w, id, path, key, executable, &made, over);
                 }
             }
             Own::Write { job: id, path } | Own::Mode { job: id, path, .. } => {

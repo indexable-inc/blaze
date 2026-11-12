@@ -111,7 +111,8 @@ impl HirFrontend<'_> {
     /// written, the blocks in the order of their modules, without those whose `cfg(..)` the
     /// crate leaves out. A form blaze can't link is an error naming it.
     pub fn linked(&self, krate: Crate) -> Result<Vec<NativeLib>, CodegenError> {
-        self.with(|db| linked(db, krate)).map_err(error)
+        // clone: per crate linked, its few libraries, out of the database's memo
+        self.with(|db| linked(db, krate).clone()).map_err(error)
     }
 
     /// What the code of a live image built from `krate` assumes of its items, by key, sorted:
@@ -190,6 +191,12 @@ fn error(what: String) -> CodegenError {
     }
 }
 
+/// [`HirFrontend::linked`], kept by the database: a link asks it of every crate it links, the
+/// standard library's among them, and what it reads is each crate's modules and `extern`
+/// blocks, which an edit of a function's body changes for no crate. Asked as a plain
+/// function it walked them all again every link (2.8 ms of a one-function edit of hello
+/// world, `link natives`); as a memo, a crate nothing was written in is one check.
+#[blaze_query::tracked(returns(ref))]
 fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
     // alloc: an error's name of the crate
     let named = || format!("crate `{}`", krate.named(db));

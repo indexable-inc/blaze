@@ -225,6 +225,13 @@ pub(crate) fn whole(state: &State) -> Vec<(u64, Vec<u8>)> {
     fill(&layout, &runs(&layout.extents(GAP)))
 }
 
+/// [`whole`], made on the calling thread and no other: for a caller on no pool's worker.
+pub(crate) fn whole_here(state: &State) -> Vec<(u64, Vec<u8>)> {
+    let layout = Layout::of(state);
+    // alloc: the runs, which the caller owns
+    runs(&layout.extents(GAP)).iter().map(|&(at, len)| (at, layout.bytes(at, len))).collect()
+}
+
 /// The writes that put back `state`'s file where a commit overwrote `ranges` of it (the whole
 /// file when it was a full link): a rollback's.
 pub(crate) fn restore(state: &State, full: bool, ranges: &[(u64, u64)]) -> Vec<(u64, Vec<u8>)> {

@@ -154,6 +154,29 @@ impl<I: Clone + Eq + Hash + Send + Sync, S: Send + Sync> Kept<I, S> {
         self.lists.lock().insert(program, lists);
     }
 
+    /// Gives back `built`, a `Built` a build over this gave, once its reader is done with
+    /// it: the next build of its program writes the rows it changed into these lists in
+    /// place of making every list again from its rows, so what an edit costs here is the
+    /// edit's rows and never the program's ([`Work::copied`]). Kept only where it is the
+    /// last `Built` of a program kept by row (its ID is the rows'), and let go otherwise:
+    /// one given late, after its program was built again, is of no use to anyone. A reader
+    /// that never gives one back costs the next build a copy a row, and nothing else: which
+    /// `Built` the next build gives does not depend on it.
+    pub fn give_back(&self, built: super::Built) {
+        let unused = {
+            let mut lists = self.lists.lock();
+            match lists.values_mut().find(|it| it.gave(&built)) {
+                Some(of) => {
+                    of.take_back(built);
+                    None
+                }
+                None => Some(built),
+            }
+        };
+        // Freed outside the lock.
+        drop(unused);
+    }
+
     /// Takes the walk kept of `program`, if one is: a build that patches it owns it, and
     /// keeps the patched one in its place when it ends well.
     pub(super) fn take_walk(&self, program: u64) -> Option<Walked<I, S>> {
@@ -245,7 +268,9 @@ pub struct Work {
     pub replaced: usize,
     /// Bytes hashed: the code of the functions made again and the paths of the keyed sets.
     pub hashed: u64,
-    /// Rows copied into the `Built`'s contiguous lists: every one, the one linear cost.
+    /// Rows written into the `Built`'s contiguous lists: those the build changed, where the
+    /// last `Built` was given back to be written into ([`Kept::give_back`]); every one,
+    /// where it was not, or where it was a whole build's (once, for its template entries).
     pub copied: usize,
     /// Whether the `Built` was made by patching the lists kept of the last one.
     pub patched: bool,

@@ -450,7 +450,7 @@ fn verdict(
     }
 
     fn functions(built: &Built) -> BTreeMap<InstanceKey, &blaze_codegen::CompiledFunction> {
-        map(built.functions.iter().map(|it| (it.key, it)))
+        map(built.functions.iter().map(|it| (it.key, &**it)))
     }
     for it in apart(&functions(inc), &functions(cl)) {
         out.push(match it {

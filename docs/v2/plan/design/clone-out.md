@@ -86,6 +86,19 @@ made only of a clone waits for the file to be made, sealed and written back firs
   edit ago with no sync, so it is the same wait. So: a new file, whole content, renamed over.
   Writing only changed blocks needs a source known written back; that is a later step
   (write-back of the output after the answer, then clone-and-patch when it has completed).
+- **Only the changed blocks, since 2026-11-11** (lane edit2-1111; measured on xfs, hello world:
+  the answer waited 24.9 ms for its four places and waits 8.9). The step above named as later
+  is built: every made place asks for its file's write-back as it ends (`Effect::WriteBack`,
+  waited for by nothing), so the path's file is a source written back by the time the next
+  edit clones it, or the clone waits for what is left of the last patch and no more. A link
+  taken as a patch hands the loop its ranges (`work::Made::Patch`); the loop looks that the
+  path still holds the file it placed there (`Own::LookBase`: its size and time), and then
+  `Store::place_patched` clones the path's own file under the staged name, writes the
+  ranges and renames it over: 0.3 MB written a path where it was 21 MB. Where the path does
+  not hold that file (nothing placed there by this daemon, a place that failed, a file changed
+  since), the whole file's runs are made from the link's state and written as before. The
+  simulation holds a patch's clone to what its path's last place wrote
+  (`tests::place_made`), and the control takes the write-back out.
 - **The store's copy.** The value is put as a recipe: of the link's ranges over the file
   before it, a few KB, or on a first link of the file's runs over the base of holes
   ([patch-in-place.md](patch-in-place.md), "The patch room"), never the file at its length.

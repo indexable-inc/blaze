@@ -118,10 +118,10 @@ fn the_tables_the_code_names_are_given_with_their_positions() {
     let start = hashes.span(db, owner, MirSpan::ExprId(root)).unwrap();
     let declared = hashes.declaration(db, func).unwrap();
     let built = Built {
-        functions: vec![compiled(
+        functions: vec![std::sync::Arc::new(compiled(
             1,
             vec![Line { at: 0, span: start }, Line { at: 1, span: declared }],
-        )],
+        ))],
         items: vec![item_key(db, ItemId::Function(func))],
         debug_names: vec![(InstanceKey(ContentId([1; 32])), "lib::f".to_owned())],
         ..Built::default()
@@ -175,7 +175,7 @@ fn a_position_of_no_table_the_build_has_is_an_error() {
     let stray = SpanRef { anchor: ContentId([9; 32]), index: 0 };
     let unknown = ItemKey(ContentId([7; 32]));
     let built = Built {
-        functions: vec![compiled(1, vec![Line { at: 0, span: stray }])],
+        functions: vec![std::sync::Arc::new(compiled(1, vec![Line { at: 0, span: stray }]))],
         items: vec![item_key(db, ItemId::Function(func)), unknown],
         debug_names: vec![(InstanceKey(ContentId([1; 32])), "lib::f".to_owned())],
         ..Built::default()
@@ -345,7 +345,7 @@ impl Program {
             }
             let mut compiled = compiled(0, lines);
             compiled.key = self.key(at);
-            functions.push(compiled);
+            functions.push(std::sync::Arc::new(compiled));
             items.push(item_key(db, ItemId::Function(func)));
         }
         functions.sort_unstable_by_key(|it| it.key);
