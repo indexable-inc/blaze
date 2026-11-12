@@ -209,7 +209,7 @@ pub fn format<A: Allocator>(alloc: A, args: fmt::Arguments<'_>) -> String<A> {
 #[macro_export]
 macro_rules! format_in {
     ($alloc:expr, $($arg:tt)*) => {
-        $crate::text::format($alloc, ::std::format_args!($($arg)*))
+        $crate::text::format($alloc, ::core::format_args!($($arg)*))
     };
 }
 
