@@ -1,0 +1,26 @@
+about = "A body edit makes that function's code again and no other's, runs and verifies a number of engine memos that does not grow with std, and taking it back makes nothing."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "2 4\n"
+bytes = true
+
+[[revision]]
+action = "run"
+prints = "11 4\n"
+redone = ["app::f"]
+max_units = 1
+max_executed = 200
+max_verified = 2000
+link = "spliced"
+bytes = true
+
+[[revision]]
+action = "run"
+prints = "2 4\n"
+redone = []
+max_units = 1
+max_executed = 200
+max_verified = 2000
+bytes = true

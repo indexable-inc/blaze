@@ -1,0 +1,14 @@
+about = "A proc macro whose output changes is expanded again and the function holding the expansion made again; a function that uses no macro is not; the program prints what a clean build's does."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "41 4\n"
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "42 4\n"
+redone_has = ["app::uses"]
+reused = ["app::other", "app::main"]

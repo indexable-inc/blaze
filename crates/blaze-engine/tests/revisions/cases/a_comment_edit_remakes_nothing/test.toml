@@ -1,0 +1,19 @@
+about = "A comment's text changed, and then a comment line added so that every line after it moves, makes no function's code again."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "2 4\n"
+
+[[revision]]
+action = "run"
+prints = "2 4\n"
+redone = []
+max_units = 0
+link = "none"
+
+[[revision]]
+action = "run"
+prints = "2 4\n"
+redone = []
+max_executed = 200

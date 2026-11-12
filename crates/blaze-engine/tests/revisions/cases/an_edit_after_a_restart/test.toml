@@ -1,0 +1,26 @@
+about = "The first build after `blaze stop` that sees a changed file answers within its bound, makes one function again, prints what a clean build prints, with no panic caught and no store hit that recomputes to other bytes (2026-11-11: it never returned, 55,000 caught panics; and `alloc::vec::from_elem::<u8>` had one code identity and two machine codes after a restart)."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "3 2\n"
+
+[[revision]]
+steps = []
+action = "run"
+prints = "3 2\n"
+redone = []
+
+[[revision]]
+steps = ["stop", "edit"]
+action = "run"
+prints = "3 11\n"
+redone = ["app::f"]
+max_ms = 60000
+
+[[revision]]
+steps = ["edit", "stop"]
+action = "run"
+prints = "3 101\n"
+redone = ["app::f"]
+max_ms = 60000

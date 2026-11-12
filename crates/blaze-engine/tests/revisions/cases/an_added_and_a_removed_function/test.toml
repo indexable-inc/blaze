@@ -1,0 +1,17 @@
+about = "A function added and called is made, with main; the functions beside it are not made again; removed again with its call, the program is the first one's."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "2 4\n"
+
+[[revision]]
+action = "run"
+prints = "2 4 103\n"
+redone_has = ["app::h", "app::main"]
+reused = ["app::f", "app::g"]
+
+[[revision]]
+action = "run"
+prints = "2 4\n"
+reused = ["app::f", "app::g"]

@@ -1,0 +1,11 @@
+about = "A function renamed, with its call: blaze's code identity holds no name, so the body is the code it was and nothing but the caller, whose call names another symbol, is made again."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "2 4\n"
+
+[[revision]]
+action = "run"
+prints = "2 4\n"
+redone = []

@@ -1,0 +1,17 @@
+about = "An impl's method body changed is that method made again, through a generic and through a dyn call alike; an impl then given its own copy of a provided method has the calls that resolve to it follow, and the other impl's do not."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "9 9 5 5\nshape shape 4\n"
+
+[[revision]]
+action = "run"
+prints = "10 10 5 5\nshape shape 4\n"
+redone = ["<app::Square as app::Shape>::area"]
+
+[[revision]]
+action = "run"
+prints = "10 10 5 5\nsquare shape 4\n"
+redone_has = ["<app::Square as app::Shape>::name"]
+reused = ["<app::Strip as app::Shape>::area", "app::unrelated", "app::by_dyn"]

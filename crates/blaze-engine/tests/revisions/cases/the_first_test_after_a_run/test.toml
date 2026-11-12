@@ -1,0 +1,19 @@
+about = "The first `test` after a `run` builds the test program by running a bounded number of new engine memos, std's results reused (2026-11-11: it redid 777,858 queries), and the test passes; the run after it makes nothing."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "2 4\n"
+
+[[revision]]
+steps = []
+action = "test"
+says = ["test tests::f_adds_one ... ok"]
+max_executed = 5000
+
+[[revision]]
+steps = []
+action = "run"
+prints = "2 4\n"
+redone = []
+max_units = 0
