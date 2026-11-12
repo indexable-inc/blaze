@@ -587,8 +587,9 @@ impl Granted {
     }
 }
 
-/// A start hook's grant of `object` with `rights`, made in this process as the daemon makes it.
-#[cfg(test)]
+/// A start hook's grant of `object` with `rights`, made in this process as the daemon makes it:
+/// for tests, this crate's and `blaze-inproc`'s (another crate, which a `cfg(test)` here would
+/// hide it from; macOS's is plain too).
 pub fn granted(object: &Object, rights: Rights) -> Result<Granted, Error> {
     let fd = match rights {
         Rights::Code => object.read_only()?,
