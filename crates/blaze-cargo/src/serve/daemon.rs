@@ -2240,6 +2240,13 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         Arc::clone(&self.pulse) // clone: a handle, once a daemon
     }
 
+    /// The table of the plane's tasks the loop publishes for the explorer: what `blaze debug
+    /// inspect`'s thread reads the queued and running tasks from, off the loop.
+    #[cfg(feature = "native")]
+    pub fn tasks(&self) -> Arc<blaze_explore::Tasks> {
+        self.observe.tasks()
+    }
+
     /// The loop's effects to the driver, those that end on their own counted in `ending`.
     fn submit(&mut self) {
         for effect in &self.effects {
@@ -2373,6 +2380,14 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             DownloadsNow(&blaze_fetch::downloads::Downloads::process().shown())
         );
         tracing::error!("{said}");
+        // What every thread was inside and the recorder's last minutes, where the client that
+        // this stall hangs up on finds it (`flightrec`): written here, by the loop, which is
+        // about to fail every request and stop.
+        _ = super::flightrec::record(
+            super::flightrec::Why::Stall,
+            &said,
+            super::flightrec::WINDOW,
+        );
         let file = under(&self.state, &format!("stalls/{now}.json"));
         // durable: a stall's trace is read after the daemon is killed for the stall, and nothing can make it again
         self.effects.push(Effect::Write { file, bytes: stall.trace, tag: STALL });
@@ -2792,11 +2807,6 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     }
 
     fn outs(&mut self, mut out: Vec<Out>) {
-        // A request handed on with these, or still held for its checkout's flush, builds
-        // what the watcher committed itself: a move of a head in the same stretch is that
-        // request's change, not a save to build ahead of.
-        let asked = self.heads.holds_a_request()
-            || out.iter().any(|it| matches!(it, Out::Pass(Arrived::Request { .. })));
         for it in out.drain(..) {
             match &it {
                 Out::Pass(Arrived::Request {
@@ -2912,15 +2922,6 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 Out::Answer(reply) => self.reply(&reply),
                 Out::Moved { head, root } => {
                     self.session.head_moved(&mut cx!(self), &head, root);
-                    // A save the watcher committed with no request waiting on it: built
-                    // ahead where the head was built before and nothing else is at work, so
-                    // the edit is pushed through the front end now and not at the next
-                    // request. What was done is said; `None` is a move a request asked for.
-                    let ahead = match asked {
-                        true => None,
-                        false => Some(self.session.save_ahead(&mut cx!(self), &head, root)),
-                    };
-                    tracing::info!(target: "blaze", head = head.as_str(), ahead = ?ahead, "save seen");
                     self.after_session();
                 }
             }

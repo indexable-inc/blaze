@@ -41,6 +41,7 @@ pub mod plan;
 pub mod query;
 pub mod relocs;
 pub mod settings;
+pub mod slot;
 pub mod summary;
 pub mod template;
 pub mod unwind;

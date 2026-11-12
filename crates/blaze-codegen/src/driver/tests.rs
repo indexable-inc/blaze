@@ -61,8 +61,13 @@ struct Program {
     statics: HashMap<u32, (u8, Option<String>)>,
     /// The functions a static's value points to.
     static_calls: HashMap<u32, Vec<u32>>,
-    /// The functions of each level the walk reached, in the order it told them.
+    /// The functions the walk told the front end it reached, a batch at a time
+    /// ([`Frontend::reached`]): the roots first.
     reached: Lock<Vec<Vec<u32>>>,
+    /// Called as a describe of a function begins, with its number: for a test that holds one
+    /// describe until another is done.
+    // dyn: a test's hook, once per describe
+    watch: Option<Box<dyn Fn(u32) + Send + Sync>>,
     stop: AtomicBool,
     /// Each counted function's body and whether it is drop glue: none is counted unless named.
     bodies: HashMap<u32, (u32, bool)>,
@@ -125,12 +130,8 @@ struct Engine {
     unnamed: bool,
     /// The planted bug of a control: no function is said to be asked each build.
     forgets_each_build: bool,
-    /// The front end tells no view ([`Frontend::view`] is `None`), so it names no changed
-    /// set and, by that, every function and static held is asked each build.
+    /// The engine names no changed set ([`Changed::Unknown`]): everything held is asked.
     names_no_set: bool,
-    /// The front end tells a view and cannot name what changed since it
-    /// ([`Changed::Unknown`]): the build is refused.
-    loses_its_set: bool,
 }
 
 impl Default for Engine {
@@ -153,7 +154,6 @@ impl Default for Engine {
             unnamed: false,
             forgets_each_build: false,
             names_no_set: false,
-            loses_its_set: false,
         }
     }
 }
@@ -165,6 +165,7 @@ impl Default for Program {
             statics: HashMap::default(),
             static_calls: HashMap::default(),
             reached: Lock::new("test.codegen.driver.reached", Vec::new()),
+            watch: None,
             stop: AtomicBool::new(false),
             bodies: HashMap::default(),
             recursion_limit: None,
@@ -307,6 +308,9 @@ impl Frontend for Program {
         requester: &Origin,
     ) -> Result<Described<u32, u32>, CodegenError> {
         let function = &self.functions[id];
+        if let Some(watch) = &self.watch {
+            watch(*id);
+        }
         // Against the program's dyn facts, a call through a `dyn` is direct: one more
         // reference, last, and another code, as the facts its body read key it.
         let direct = self.devirtualized(*id);
@@ -471,7 +475,7 @@ impl Frontend for Program {
     }
 
     fn view(&self) -> Option<u64> {
-        (!self.engine.names_no_set).then_some(self.engine.revision)
+        Some(self.engine.revision)
     }
 
     /// Exactly what an edit since `view` changed ([`Program::touch`] and its like): each
@@ -479,8 +483,8 @@ impl Frontend for Program {
     /// static, by number.
     fn changed_since(&self, view: u64) -> Changed<u32, u32> {
         let engine = &self.engine;
-        if engine.loses_its_set {
-            return Changed::Unknown("the test's engine lost its changed set".to_owned());
+        if engine.names_no_set {
+            return Changed::Unknown("the test's engine names no changed set".to_owned());
         }
         let since = |changed: &HashMap<u32, u64>| {
             let mut ids: Vec<u32> =
@@ -519,7 +523,7 @@ impl Frontend for Program {
 
     /// A program with a call through a `dyn` closes its dyn facts when its first walk ends,
     /// and the walk runs again against them; the second walk's facts are the first's.
-    fn closed(&self) -> Result<bool, CodegenError> {
+    fn closed(&self, _: &[(u32, Origin)], _: &[u32]) -> Result<bool, CodegenError> {
         if self.dyn_sites.is_empty() {
             return Ok(false);
         }
@@ -959,11 +963,17 @@ fn two_items_written_alike_share_one_template_each_at_its_own_positions() {
 }
 
 #[test]
-fn the_front_end_hears_each_level_before_it_and_a_stop_ends_the_build() {
+fn the_front_end_hears_the_roots_then_what_they_reach_and_a_stop_ends_the_build() {
     let (program, policy) = (program(), policy(OptLevel::O0, Mode::Output));
     let (machine, memo, store) = (Machine::default(), Memo::new(), Store::default());
     build(&program, &machine, &policy, &memo, &store).unwrap();
-    assert_eq!(*program.reached.lock(), [vec![1], vec![2, 3], vec![4, 5]]);
+    // The roots at once; the rest in batches, in no order, each function in one batch.
+    let reached = program.reached.lock();
+    assert_eq!(reached.first(), Some(&vec![1]), "{reached:?}");
+    let mut rest: Vec<u32> = reached[1..].iter().flatten().copied().collect();
+    rest.sort_unstable();
+    assert_eq!(rest, [2, 3, 4, 5], "{reached:?}");
+    drop(reached);
 
     program.stop.store(true, Ordering::Relaxed);
     let stopped = Machine::default();
@@ -1817,6 +1827,7 @@ mod later;
 mod masks;
 mod pieces;
 mod stop;
+mod walk;
 
 /// Two instances of one key, the first a workspace's and the second a dependency's (cc's
 /// `RawTable<(.., ToolFamily)>::reserve_rehash::{closure#1}` and its `RawTable<(Box<str>,

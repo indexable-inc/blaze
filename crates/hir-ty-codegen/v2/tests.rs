@@ -137,6 +137,27 @@ fn o3() -> Build {
     Build::of(&Spec { backend: Backend::Llvm { opt: 3 }, mir_inline: true, ..spec() })
 }
 
+/// The invariant (docs/v2/plan/design/tiers.md, "Key shape"): tier 0 code of a crate that is
+/// not the library's is built from its own body alone. A unit at tier 0 (stencils, or LLVM at
+/// `-O0` for a CPU the stencils do not cover) asks for MIR level 1, no inliner and no
+/// devirtualization, so `hir-ty-mir`'s `optimize` runs neither `Inline` nor `SpendFacts` on
+/// it and its body reads no callee's body or effect summary: a body edit changes the key of
+/// one tier 0 function. The optimized tier asks for all three. (The library's own bodies are
+/// at level 2 and inlined under every unit, [`Build::options`]: they are std's, which no edit
+/// of the workspace reaches.)
+#[test]
+fn a_tier_zero_unit_builds_no_callee_into_its_bodies() {
+    let tier_zero = [Backend::Stencil, Backend::Llvm { opt: 0 }];
+    for backend in tier_zero {
+        let build = Build::of(&Spec { backend, ..spec() });
+        assert!(!build.optimized, "{backend:?}: MIR level 2 runs `SpendFacts`");
+        assert!(!build.inlines, "{backend:?}: the inliner builds callees in");
+        assert!(build.world.is_none(), "{backend:?}: devirtualized against the program");
+    }
+    let optimized = o3();
+    assert!(optimized.optimized && optimized.inlines);
+}
+
 /// What the compile of `instance` under `build` built in, by code: its `Function::inlined`.
 fn inlined_by_build(
     db: &Db,
@@ -3931,7 +3952,9 @@ fn an_inlined_callee_that_takes_a_dyn_fn_keeps_a_matching_key() {
             frontend.describe(it, by).unwrap_or_else(|e| panic!("{it:?}: {}", e.what))
         };
         // The driver's first walk of the program: everything it reaches, then its dyn facts.
-        frontend.devirt.makes(super::RootKind::Executable, main);
+        frontend
+            .with(|hir| frontend.devirt.makes(hir, super::RootKind::Executable, main))
+            .expect("the front end walks one program");
         let (mut reached, mut queue): (Vec<(HirInstance, Origin)>, _) =
             (Vec::new(), vec![(root.clone(), origin)]);
         while let Some((at, by)) = queue.pop() {
@@ -3946,9 +3969,8 @@ fn an_inlined_callee_that_takes_a_dyn_fn_keeps_a_matching_key() {
             }
             reached.push((at, by));
         }
-        frontend.reached(&reached, &[]);
         assert!(
-            frontend.closed().expect("the program's dyn facts"),
+            frontend.closed(&reached, &[]).expect("the program's dyn facts"),
             "the premise: the program has a world"
         );
         let [callee] = &frontend.with(|hir| called(hir, &root, resize))[..] else {
@@ -3984,6 +4006,71 @@ fn an_inlined_callee_that_takes_a_dyn_fn_keeps_a_matching_key() {
         );
         let unkept: Vec<_> = inlined.iter().filter(|it| !kept.contains(it)).collect();
         assert!(unkept.is_empty(), "built in, not in the key: {unkept:?} (the key holds {kept:?})");
+    });
+}
+
+/// What a front end knows of its program for devirtualizing (`devirt::State`) is two records
+/// written once and read with no lock: what the unit makes, and the world its bodies are built
+/// against. Many threads read the world and say the same program again at once and all see
+/// the one; another program, and other facts than the world held, are each refused by name,
+/// and what was written stays.
+#[test]
+fn a_front_ends_program_and_its_dyn_facts_are_written_once() {
+    use blaze_codegen::{backend::Frontend as _, plan::Origin};
+    let (db, frontend) = held_as(fixture::db(DYN_FN_BUILT_IN).into_db(), &policy(OptLevel::O3));
+    let main = fixture::test_crate(db);
+    let origin = frontend.with(|hir| frontend.origin(hir, main));
+    let root = frontend.root(function(db, "roots"));
+    let executable = super::RootKind::Executable;
+    blaze_query::db::attach(db, || {
+        assert_eq!(frontend.devirt.world(), None, "no world before the first walk ends");
+        frontend
+            .with(|hir| frontend.devirt.makes(hir, executable, main))
+            .expect("the front end walks one program");
+        let (mut reached, mut queue): (Vec<(HirInstance, Origin)>, _) =
+            (Vec::new(), vec![(root.clone(), origin)]);
+        while let Some((at, by)) = queue.pop() {
+            if reached.iter().any(|(it, _)| *it == at) {
+                continue;
+            }
+            let it = frontend.describe(&at, &by).unwrap_or_else(|e| panic!("{at:?}: {}", e.what));
+            for it_ref in &it.refs {
+                if let FrontRef::Function(callee) = it_ref {
+                    queue.push((callee.clone(), it.origin));
+                }
+            }
+            reached.push((at, by));
+        }
+        assert!(frontend.closed(&reached, &[]).expect("the program's dyn facts"));
+        let world = frontend.devirt.world().expect("the world the first walk closed");
+
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    for _ in 0..1000 {
+                        assert_eq!(frontend.devirt.world(), Some(world));
+                    }
+                    frontend
+                        .with(|hir| frontend.devirt.makes(hir, executable, main))
+                        .expect("the same program, said again");
+                    assert_eq!(frontend.devirt.world(), Some(world));
+                });
+            }
+        });
+
+        // The same facts again: the world held, and no new one.
+        assert!(!frontend.closed(&reached, &[]).expect("the facts the bodies were built against"));
+        // Another program of the same front end: refused, naming both.
+        let refused = frontend
+            .with(|hir| frontend.devirt.makes(hir, super::RootKind::Test, main))
+            .expect_err("a second program");
+        assert!(refused.what.contains("the dyn facts of the test of crate"), "{}", refused.what);
+        assert!(refused.what.contains("already walks the executable of crate"), "{}", refused.what);
+        // Other facts than the world held (a walk that reached nothing): refused, and the
+        // world stays.
+        let refused = frontend.closed(&[], &[]).expect_err("other facts");
+        assert!(refused.what.contains("found others (none)"), "{}", refused.what);
+        assert_eq!(frontend.devirt.world(), Some(world));
     });
 }
 

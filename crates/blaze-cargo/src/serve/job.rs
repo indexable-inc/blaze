@@ -143,7 +143,7 @@ use super::{
     observe::Ended,
     plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds, loops},
     work::{
-        Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, Library,
+        Broke, Compiled, Failed, Front, FrontEnd, Image, JobInput, JobKind, Kept, KeptDb, Library,
         Linking, LocalRead, Phase, Readers, RunPuts, Runs, Selection, Source, Steps, Writer,
     },
 };
@@ -988,12 +988,12 @@ fn command_of(work: &Work) -> Command {
     }
 }
 
-fn goal_of(work: &Work) -> Goal {
+fn kind_of(work: &Work) -> JobKind {
     match work {
-        Work::Build(_) | Work::CodegenInputs(_) => Goal::Build,
-        Work::Test { ub: Some(_), .. } => Goal::Check,
-        Work::Test { .. } | Work::Ahead { .. } => Goal::Test,
-        Work::Run { .. } => Goal::Run,
+        Work::Build(_) | Work::CodegenInputs(_) => JobKind::Build,
+        Work::Test { ub: Some(_), .. } => JobKind::Check,
+        Work::Test { .. } | Work::Ahead { .. } => JobKind::Test,
+        Work::Run { .. } => JobKind::Run,
         // A reach builds only the units its views' front ends apply, each as a check builds
         // it, and so shares a check's records ([`reads_front_unbuilt`]).
         Work::Reach { .. }
@@ -1004,7 +1004,7 @@ fn goal_of(work: &Work) -> Goal {
         | Work::Snapshot
         | Work::Edit(_)
         | Work::Doc { .. }
-        | Work::Lock(_) => Goal::Check,
+        | Work::Lock(_) => JobKind::Check,
     }
 }
 
@@ -2203,7 +2203,10 @@ struct Job<S: Steps> {
     /// its `Work` report.
     served: Vec<ServedCrate>,
     /// Each image its units linked and how ([`Compiled::links`]), taken by its `Work` report.
-    links: Vec<(String, Linking)>,
+    links: Vec<(String, Linking, Option<blaze_api::Tiers>)>,
+    /// The goal its build waits for ([`super::unit::request_goal`]), for its `Work`
+    /// report: set as its build answers; none before, and for a request that asked for no unit.
+    goal: Option<blaze_api::Goal>,
     /// Each image its units linked, for the history ([`LinkRow`]): the target it is of as
     /// cargo names it, its package, and whether it was laid out whole.
     linked: Vec<(String, Option<String>, bool)>,
@@ -2865,6 +2868,7 @@ impl<S: Steps> Job<S> {
             compiled: 0,
             served: Vec::new(),    // alloc: none; a build fills it once
             links: Vec::new(),     // alloc: none until a unit links
+            goal: None,
             linked: Vec::new(),    // alloc: none until a unit links
             misses: Vec::new(),    // alloc: none until a unit misses
             test_runs: Vec::new(), // alloc: none until a test runs
@@ -3889,6 +3893,19 @@ impl<S: Steps> Jobs<S> {
         let Viewed { root_dir, root, config, encoded, key } =
             Self::viewed(&self.setup, &mut self.roots, w, &job.work, &opened, library);
         let request = request_id(&job.work);
+        // A blaze that keys as another toolchain (`BLAZE_DEV_TOOLCHAIN_AS`) says so before
+        // anything else of each build or check, and refuses one whose outputs may be shipped.
+        if request.is_some()
+            && let Some(dev) = super::dev_toolchain::dev()
+        {
+            let invocation = &config.invocation;
+            if let Some(refused) = dev.refuses(invocation.command.name(), &invocation.args) {
+                self.end(w, id, false, Some(ApiError::new(refused, None)));
+                return;
+            }
+            let warning = Diagnostic::warning(dev.said());
+            w.said.push(Said::Report(id, Response::Diagnostic(warning)));
+        }
         let config = Arc::new(config); // alloc: once per view, shared with its tasks
         // Any job of a checkout that walks drops the checkout's kept answer (it may place
         // other outputs); a build or a check that walks may become the next
@@ -5322,7 +5339,8 @@ impl<S: Steps> Jobs<S> {
             width: cargo.and_then(|it| it.width),
             verbose: cargo.map_or(0, |it| it.verbose),
             refused: cargo.map_or(Some(crate::REFUSED_SHOWN), |it| it.refused),
-            goal: goal_of(&job.work),
+            kind: kind_of(&job.work),
+            goal: targets_of(&job.work).and_then(|it| it.goal),
             cancelled: job.cancelled.clone(), // clone: a refcount, once per view
         };
         // Asked as the view is lowered, so it is in by the time the units are built.
@@ -5837,11 +5855,11 @@ impl<S: Steps> Jobs<S> {
             u32::try_from(picked.as_ref().map_or(all.len(), Vec::len)).expect("under 2^32 units");
         let unit_at =
             |offset: u32| picked.as_ref().map_or(offset, |it| it[offset as usize]) as usize;
-        let goal = input.goal;
+        let kind = input.kind;
         // A unit's phases, a node each; none for a build script's run, which is one node.
         let phases_of = |unit: &blaze_units::schema::Unit| match unit.mode {
             UnitMode::RunCustomBuild => &[][..],
-            _ => super::unit::phases(goal, unit),
+            _ => super::unit::phases(kind, unit),
         };
         // Each built unit's last node, by its place after the batch's first; `u32::MAX` for one
         // not built. A unit's first node waits for the last of each unit it depends on.
@@ -6149,9 +6167,9 @@ impl<S: Steps> Jobs<S> {
         if !build.reported.insert(build.package_of[at]) {
             return;
         }
-        let verb = match (fresh, build.input.goal, unit.mode) {
+        let verb = match (fresh, build.input.kind, unit.mode) {
             (true, ..) => Verb::Fresh,
-            (false, Goal::Check, _) | (false, _, UnitMode::Check) => Verb::Checking,
+            (false, JobKind::Check, _) | (false, _, UnitMode::Check) => Verb::Checking,
             (false, ..) => Verb::Compiling,
         };
         let started = UnitStarted {
@@ -6374,7 +6392,7 @@ impl<S: Steps> Jobs<S> {
         {
             let kind = u.target.kind.first().map_or("", String::as_str);
             let package = package_named(&build.input.units, &u.pkg_id);
-            for (_, how) in &compiled.links {
+            for (_, how, _) in &compiled.links {
                 // alloc: one a link, for the history
                 job.linked.push((
                     format!("{} ({kind})", u.target.name),
@@ -7261,6 +7279,7 @@ impl<S: Steps> Jobs<S> {
         };
         if let Some(job) = self.jobs.get_mut(key_of(id)) {
             job.served = served;
+            job.goal = super::unit::request_goal(&input);
         }
         let profile = input.units.finished.clone(); // clone: the report owns it, once per build
         let members = input.units.packages.iter().filter(|it| it.is_member).count();
@@ -7495,6 +7514,13 @@ impl<S: Steps> Jobs<S> {
         }
         let (stats, fresh, compiled) = (job.stats, job.fresh, job.compiled);
         let links = std::mem::take(&mut job.links);
+        // The goal, with the functions of every image linked for it: an image of build-time
+        // code says none, and counts in none.
+        let tiers = job.goal.map(|goal| {
+            links.iter().filter_map(|it| it.2).fold(blaze_api::Tiers::of(goal), |all, image| {
+                all.with(image.optimized, image.functions)
+            })
+        });
         let worked = Worked {
             // Given as it is said, by the daemon, when the build is explained by then
             // (`Daemon::said_as`): the jobs have no reasons of their own.
@@ -7513,8 +7539,9 @@ impl<S: Steps> Jobs<S> {
             // alloc: one a link, at the request's end
             links: links
                 .into_iter()
-                .map(|(path, how)| blaze_api::Linked { how: how.how(), path })
+                .map(|(path, how, _)| blaze_api::Linked { how: how.how(), path })
                 .collect(),
+            tiers,
             critical_path_us: stats.critical_path_ns / 1000,
             steps_us: NodeKind::ALL
                 .into_iter()
@@ -8486,8 +8513,8 @@ fn warned(warning: &str) -> Diagnostic {
 
 /// What a request's links did, as [`Worked::link`] says it: placed whole when any image was laid
 /// out whole (a first link, or one that could not patch the image kept), else patched in place.
-pub(crate) fn link_kind(links: &[(String, Linking)]) -> LinkKind {
-    match links.iter().any(|(_, how)| how.placed()) {
+pub(crate) fn link_kind(links: &[(String, Linking, Option<blaze_api::Tiers>)]) -> LinkKind {
+    match links.iter().any(|(_, how, _)| how.placed()) {
         true => LinkKind::Placed,
         false => LinkKind::Patched,
     }

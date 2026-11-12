@@ -6,14 +6,17 @@
 //!
 //! Which path counts. rustc walks depth first from each root in turn, claims every neighbor of
 //! an instance when it lists them, before it visits any, and counts an instance on the path it
-//! was claimed on. The build's walk describes level by level, in parallel; the path it reaches an
-//! instance by first is the one of fewest steps, which can hold more repeats of a body than
-//! rustc's (a long chain claims what a short one reaches later in rustc's order), so it never
-//! decides a refusal. [`Graph::check`] does: rustc's walk, over the graph the levels described,
-//! in root and reference order. The levels stop describing an instance past the limit along
-//! their own path ([`Graph::level`] defers it), which bounds a chain that grows forever; one the
-//! check reaches within the limit is sent back to be described, and the check runs again over the
-//! larger graph, until it reaches no undescribed instance. Only the check's last run errs.
+//! was claimed on. The build's walk is a worklist, its describes on all cores; the path it
+//! reaches an instance by is the one of whichever describe reached it first, which is of this
+//! run's schedule and can hold more or fewer repeats of a body than rustc's, so it never
+//! decides a refusal. [`check`] does: rustc's walk, over the graph the worklist described, in
+//! root and reference order. The worklist stops describing an instance past the limit along
+//! its own path (each instance carries its place on it, a [`Step`], in place of a level), which
+//! bounds a chain that grows forever; one the check reaches within the limit is sent back to
+//! be described, and the check runs again over the larger graph, until it reaches no
+//! undescribed instance. Only the check's last run errs, and that run is over a graph in which
+//! every instance it claims within the limit is described: the same graph, the same claims and
+//! the same errors whatever the schedule was.
 //!
 //! Which roots, in which order. As rustc's walk claims first what its first roots reach, the
 //! order of the roots decides what builds. The check walks from the [`CheckRoot`]s the build is
@@ -42,14 +45,17 @@
 //! Compile identity never reads a path (it is per instance, `hir_ty_identity`'s
 //! `SHARED_DEPTH`), so a path is never in a key.
 
-use std::{alloc::Global, hash::Hash};
+use std::{
+    hash::Hash,
+    sync::{Arc, atomic::Ordering},
+};
 
 use blaze_ids::ContentId;
 
-use super::CheckRoot;
+use super::frontier::{Function, Of, Order, State};
 use crate::{
     CodegenError, InstanceKey,
-    backend::{Counted, FrontRef, Frontend, Limit},
+    backend::{Counted, Frontend, Limit},
     plan::Origin,
 };
 use blaze_items::ItemKey;
@@ -57,9 +63,96 @@ use blaze_items::ItemKey;
 /// No node, or no item: what a root is reached from.
 pub(super) const NONE: u32 = u32::MAX;
 
-/// How many times [`Graph::check`] may send instances back to be described before it stops
-/// with an error: each time describes at least one more, of the finitely many within the limit.
+/// How many times [`check`] may send instances back to be described before it stops with an
+/// error: each time describes at least one more, of the finitely many within the limit.
 const PASSES: u32 = 1 << 16;
+
+/// An instance's place on the path the worklist reached it by: what it carries in place of a
+/// level, and hands to what it reaches. Shared by every instance below it on its path, which
+/// hold it for as long as they are walked.
+pub(super) struct Step {
+    /// What it was reached from; `None` at the head of its path.
+    parent: Option<Arc<Step>>,
+    body: Option<ContentId>,
+    /// How many times its body appears above it on its path: rustc's `recursion_depth`.
+    depth: u32,
+    /// The path's limit; `None` past a head of no crate, whose reaches head their own paths.
+    limit: Option<Limit>,
+}
+
+impl Step {
+    /// A function counted as `counted`, reached from `parent` (`None` for a root): its place
+    /// on that path, or on a path of its own ([`Counted::heads_own_path`]), and whether that
+    /// place is past the path's limit. [`Paths::place`]'s rule, over a path that is shared
+    /// rather than indexed.
+    fn at(parent: Option<&Arc<Step>>, counted: &Counted) -> (Step, bool) {
+        let up = parent.and_then(|node| node.limit.map(|limit| (node, limit)));
+        let (parent, limit) = match (up, counted.limit) {
+            // Collected in its own crate's build: a path of its own, held to the larger limit.
+            (Some((_, path)), Some(own)) if counted.heads_own_path && own.krate != path.krate => {
+                (None, Some(Limit { krate: own.krate, value: own.value.max(path.value) }))
+            }
+            (Some((up, path)), _) => (Some(up), Some(path)),
+            (None, own) => (None, own),
+        };
+        let (mut depth, mut past) = (0, false);
+        if let Some(body) = counted.body {
+            // Each step's parent was placed before it, so the climb ends at the head.
+            let mut above = parent;
+            while let Some(node) = above {
+                if node.body == Some(body.body) {
+                    depth = node.depth + 1;
+                    break;
+                }
+                above = node.parent.as_ref();
+            }
+            let counted = if body.drop_glue { depth / 4 } else { depth };
+            past = limit.is_some_and(|limit| counted > limit.value);
+        }
+        // clone: a reference count, the step's hold of its path
+        let step =
+            Step { parent: parent.cloned(), body: counted.body.map(|it| it.body), depth, limit };
+        (step, past)
+    }
+
+    /// The place of a function counted as `counted`, reached from `parent`: `None` past the
+    /// limit there, where the worklist does not describe it.
+    pub(super) fn place(parent: Option<&Arc<Step>>, counted: &Counted) -> Option<Arc<Step>> {
+        let (step, past) = Step::at(parent, counted);
+        // alloc: per build, one per function the walk describes: its place on its path
+        (!past).then(|| Arc::new(step))
+    }
+
+    /// As [`Step::place`], for a function the check sent back: placed though past the limit.
+    pub(super) fn place_past(parent: Option<&Arc<Step>>, counted: &Counted) -> Arc<Step> {
+        // alloc: per build, one per function the check sent back
+        Arc::new(Step::at(parent, counted).0)
+    }
+
+    /// The place of a static reached from `parent`: no body, on that path, or heading none.
+    pub(super) fn place_static(parent: Option<&Arc<Step>>) -> Arc<Step> {
+        // alloc: per build, one per static the walk describes
+        Arc::new(Step {
+            // clone: a reference count, the step's hold of its path
+            parent: parent.cloned(),
+            body: None,
+            depth: 0,
+            limit: parent.and_then(|it| it.limit),
+        })
+    }
+}
+
+impl Drop for Step {
+    /// Lets go of the path above one step at a time: a path is as long as the program's
+    /// deepest chain of references, and a drop that recursed along it would need that much
+    /// stack.
+    fn drop(&mut self) {
+        let mut above = self.parent.take();
+        while let Some(step) = above {
+            above = Arc::into_inner(step).and_then(|mut last| last.parent.take());
+        }
+    }
+}
 
 /// An instance or static on its path.
 struct Node {
@@ -160,486 +253,192 @@ impl Paths {
     }
 }
 
-enum State {
-    /// In a level, not yet described.
-    Queued,
-    /// Past the limit on the levels' path from node `from`, so not described by them.
-    Deferred { from: u32 },
-    /// Described: the items it refers to, in its references' order.
-    Described(Vec<u32>),
-    /// Its description failed, which is an error of the build already.
-    Failed,
+/// What [`check`] found.
+pub(super) enum Checked<I, S> {
+    /// It reached these within the limit, which the worklist had left undescribed past the
+    /// limit on its own path: describe them ([`Step::place_past`]) and check again.
+    Again(Vec<Arc<Function<I, S>>>),
+    /// It reached everything: its refusals, if any, are in the errors.
+    Done,
 }
 
-struct Item<I> {
-    /// The function and whose code asks for it; `None` for a static.
-    function: Option<(I, Origin)>,
-    counted: Option<Counted>,
-    state: State,
-    /// Sent back by the check: the levels place it past their limit.
-    forced: bool,
-}
-
-/// One level of the walk: the functions (with whose code asks for each) and statics to
-/// describe, each with its item and the node it was reached from on the levels' path ([`NONE`]
-/// for a root); after [`Graph::level`], its own node.
-pub(super) struct Level<I, S> {
-    pub(super) functions: Vec<(I, Origin)>,
-    pub(super) function_items: Vec<u32>,
-    pub(super) function_from: Vec<u32>,
-    pub(super) statics: Vec<S>,
-    pub(super) static_items: Vec<u32>,
-    pub(super) static_from: Vec<u32>,
-}
-
-impl<I, S> Level<I, S> {
-    pub(super) fn new() -> Self {
-        Level {
-            // alloc: none until pushed; per build, one per instance of a level
-            functions: Vec::new(),
-            function_items: Vec::new(), // alloc: as above
-            function_from: Vec::new(),  // alloc: as above
-            statics: Vec::new(),        // alloc: as above
-            static_items: Vec::new(),   // alloc: as above
-            static_from: Vec::new(),    // alloc: as above
-        }
+/// rustc's walk over `order`, the graph the worklist described so far, once the worklist is
+/// empty: from each root in order, depth first, claiming each neighbor of an instance as it
+/// lists them and placing it on the path of that instance. Deferred instances it claims within
+/// the limit are given back to be described ([`Checked::Again`], each marked
+/// [`Function::forced`]); the check runs again once they and what they reach are. Otherwise
+/// each instance claimed past the limit is an error. `passes` counts the times it sent
+/// instances back, over the walk.
+pub(super) fn check<I, S, F>(
+    order: &Order<I, S>,
+    frontend: &F,
+    passes: &mut u32,
+    errors: &mut Vec<CodegenError>,
+) -> Checked<I, S>
+where
+    I: Clone + Eq + Hash + Send + Sync,
+    S: Clone + Eq + Hash + Send + Sync,
+    F: Frontend<Instance = I>,
+{
+    struct Frame {
+        /// Its claimed neighbors are `claimed[start..end]`; `next` is the one to visit.
+        start: u32,
+        end: u32,
+        next: u32,
     }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.functions.is_empty() && self.statics.is_empty()
-    }
-}
-
-/// Every function (by whose code asks for it) and static the walk reached, what each refers
-/// to, and the levels' paths.
-pub(super) struct Graph<I, S> {
-    functions: blaze_hash::HashMap<(I, Origin), u32, Global>,
-    statics: blaze_hash::HashMap<S, u32, Global>,
-    items: Vec<Item<I>>,
-    /// The check's roots, each once: the [`CheckRoot`]s in their order, then each root of
-    /// the build they leave out, in the build's order.
-    roots: Vec<u32>,
-    /// A check root is none of the build's: what only it reaches is described for the check,
-    /// and left out of the build ([`Self::checks_more`]).
-    checks_more: bool,
-    /// The levels' paths: a bound on what they describe, never an error.
-    levels: Paths,
-    /// How many times the check sent instances back to be described.
-    passes: u32,
-}
-
-impl<I: Clone + Eq + Hash + std::fmt::Debug, S: Clone + Eq + Hash> Graph<I, S> {
-    pub(super) fn new() -> Self {
-        Graph {
-            functions: blaze_hash::HashMap::new_in(Global),
-            statics: blaze_hash::HashMap::new_in(Global),
-            // alloc: per build, one per function and static the walk reaches
-            items: Vec::new(),
-            roots: Vec::new(), // alloc: per build, one per root
-            checks_more: false,
-            levels: Paths::default(),
-            passes: 0,
-        }
-    }
-
-    /// The first level: each root of the build once, in order, then each check root that is
-    /// none of them ([`CheckRoot`]). Also for the walk's next round, which reaches everything
-    /// again.
-    pub(super) fn start(
-        &mut self,
-        roots: &[(I, Origin)],
-        static_roots: &[S],
-        check: &[CheckRoot<I, S>],
-    ) -> Level<I, S> {
-        self.functions.clear();
-        self.statics.clear();
-        self.items.clear();
-        self.roots.clear();
-        self.checks_more = false;
-        self.levels.nodes.clear();
-        self.passes = 0;
-        let mut level = Level::new();
-        // alloc: per build, one per root of the build
-        let mut built = Vec::with_capacity(roots.len() + static_roots.len());
-        for root in roots {
-            let (item, new) = self.function(root);
-            if new {
-                built.push(item);
-                // clone: per build, the walk's handle of a root
-                level.functions.push(root.clone());
-                level.function_items.push(item);
-                level.function_from.push(NONE);
+    let _span = tracing::info_span!(
+        target: "blaze",
+        "recursion limit check",
+        pass = *passes + 1,
+        items = order.items.len(),
+        roots = order.roots.len(),
+    )
+    .entered();
+    // Places `item` on the check's path of node `parent`: `None` for a function with no count.
+    let claim = |paths: &mut Paths, item: u32, parent: u32| -> Option<Result<u32, Past>> {
+        match &order.items[item as usize].of {
+            Of::Static(_) => Some(Ok(paths.place_static(parent))),
+            Of::Function(entry) => {
+                entry.counted.get().map(|counted| paths.place(item, counted, parent, false))
             }
         }
-        for root in static_roots {
-            let (item, new) = self.static_item(root);
-            if new {
-                built.push(item);
-                // clone: per build, the walk's handle of a static root
-                level.statics.push(root.clone());
-                level.static_items.push(item);
-                level.static_from.push(NONE);
-            }
+    };
+    let mut paths = Paths::default();
+    // alloc: per check, one flag per item
+    let mut visited = vec![false; order.items.len()];
+    // alloc: per check, the claimed neighbors of the instances on the path
+    let mut claimed: Vec<(u32, u32)> = Vec::new();
+    let mut stack: Vec<Frame> = Vec::new(); // alloc: per check, the path
+    let mut past: Vec<Past> = Vec::new(); // alloc: per check, one per instance past the limit
+    let mut undescribed: Vec<u32> = Vec::new(); // alloc: per check, one per instance to describe
+    for &root in &order.roots {
+        if std::mem::replace(&mut visited[root as usize], true) {
+            continue;
         }
-        for root in check {
-            match root {
-                CheckRoot::Function(instance, origin) => {
-                    // clone: per build, the walk's handle of a check root
-                    let asked = (instance.clone(), *origin);
-                    let (item, new) = self.function(&asked);
-                    if new {
-                        self.checks_more = true;
-                        level.functions.push(asked);
-                        level.function_items.push(item);
-                        level.function_from.push(NONE);
-                    }
-                    self.roots.push(item);
-                }
-                CheckRoot::Static(value) => {
-                    let (item, new) = self.static_item(value);
-                    if new {
-                        self.checks_more = true;
-                        // clone: per build, the walk's handle of a static check root
-                        level.statics.push(value.clone());
-                        level.static_items.push(item);
-                        level.static_from.push(NONE);
-                    }
-                    self.roots.push(item);
-                }
-            }
+        match claim(&mut paths, root, NONE) {
+            Some(Ok(node)) => claimed.push((root, node)),
+            Some(Err(it)) => past.push(it),
+            None => undescribed.push(root),
         }
-        self.roots.extend(built);
-        // alloc: per build, one flag per root
-        let mut seen = vec![false; self.items.len()];
-        self.roots.retain(|&it| !std::mem::replace(&mut seen[it as usize], true));
-        level
-    }
-
-    /// Whether a check root is none of the build's roots: what the walk described then holds
-    /// what only such a root reaches, which the build leaves out.
-    pub(super) fn checks_more(&self) -> bool {
-        self.checks_more
-    }
-
-    fn function(&mut self, asked: &(I, Origin)) -> (u32, bool) {
-        if let Some(item) = self.functions.get(asked) {
-            return (*item, false);
+        // The root is the one claimed: visit it as a frame of one.
+        if claimed.len() == 1 {
+            stack.push(Frame { start: 0, end: 1, next: 0 });
         }
-        let item = self.items.len() as u32;
-        // clone: per build, the walk's handle of a function and who asks for it, twice: its
-        // item's and the map's
-        self.functions.insert(asked.clone(), item);
-        self.items.push(Item {
-            function: Some(asked.clone()),
-            counted: None,
-            state: State::Queued,
-            forced: false,
-        });
-        (item, true)
-    }
-
-    fn static_item(&mut self, value: &S) -> (u32, bool) {
-        if let Some(item) = self.statics.get(value) {
-            return (*item, false);
-        }
-        let item = self.items.len() as u32;
-        // clone: per build, the walk's handle of a static
-        self.statics.insert(value.clone(), item);
-        self.items.push(Item {
-            function: None,
-            counted: None,
-            state: State::Queued,
-            forced: false,
-        });
-        (item, true)
-    }
-
-    /// Puts each of `level` on the levels' path before it is described. A function past the
-    /// limit there is deferred and taken out of the level, never described by the levels; its
-    /// refusal is the check's ([`Self::check`]). Each kept one's `from` then holds its own node.
-    /// A function the front end gave no [`Counted`] is an error in `errors`, never described.
-    pub(super) fn level<F: Frontend<Instance = I>>(
-        &mut self,
-        frontend: &F,
-        level: &mut Level<I, S>,
-        errors: &mut Vec<CodegenError>,
-    ) {
-        debug_assert_eq!(level.functions.len(), level.function_from.len());
-        let counted = {
-            let _span = tracing::info_span!(
-                target: "blaze",
-                "recursion limit: count a level",
-                functions = level.functions.len(),
-            )
-            .entered();
-            frontend.counted(&level.functions)
-        };
-        if counted.len() != level.functions.len() {
-            errors.push(miscounted(frontend, &level.functions, counted.len()));
-        }
-        let mut kept = 0;
-        for at in 0..level.functions.len() {
-            let (item, from) = (level.function_items[at], level.function_from[at]);
-            let Some(&counted) = counted.get(at) else {
-                // Named by the error above: never described, so never built.
-                self.items[item as usize].state = State::Failed;
-                continue;
-            };
-            let entry = &mut self.items[item as usize];
-            entry.counted = Some(counted);
-            match self.levels.place(item, &counted, from, entry.forced) {
-                Ok(node) => {
-                    level.functions.swap(kept, at);
-                    level.function_items[kept] = item;
-                    level.function_from[kept] = node;
-                    kept += 1;
-                }
-                Err(_) => self.items[item as usize].state = State::Deferred { from },
-            }
-        }
-        level.functions.truncate(kept);
-        level.function_items.truncate(kept);
-        level.function_from.truncate(kept);
-        for from in &mut level.static_from {
-            *from = self.levels.place_static(*from);
-        }
-    }
-
-    /// Item `item` was described with `refs`, asked for by `requester`'s code, at node `at` of
-    /// the levels' path: each function and static it refers to that is new goes to `next`.
-    pub(super) fn described(
-        &mut self,
-        item: u32,
-        refs: &[FrontRef<I, S>],
-        requester: &Origin,
-        at: u32,
-        next: &mut Level<I, S>,
-    ) {
-        // alloc: per build, one per reference of an instance or static
-        let mut edges = Vec::with_capacity(refs.len());
-        for it in refs {
-            match it {
-                FrontRef::Function(callee) => {
-                    // clone: per build, the walk's handle of a callee; who asks for it is a copy
-                    let asked = (callee.clone(), *requester);
-                    let (callee, new) = self.function(&asked);
-                    edges.push(callee);
-                    if new {
-                        next.functions.push(asked);
-                        next.function_items.push(callee);
-                        next.function_from.push(at);
-                    }
-                }
-                FrontRef::Static(value) => {
-                    let (value_item, new) = self.static_item(value);
-                    edges.push(value_item);
-                    if new {
-                        // clone: per build, the walk's handle of a static
-                        next.statics.push(value.clone());
-                        next.static_items.push(value_item);
-                        next.static_from.push(at);
-                    }
-                }
-                FrontRef::Extern(_) | FrontRef::Weak(_) => {}
-            }
-        }
-        self.items[item as usize].state = State::Described(edges);
-    }
-
-    /// Every function the walk counted, by whose code asked for it, with its count: what a
-    /// kept walk holds its functions to ([`super::patch`]).
-    pub(super) fn counts(&self) -> Vec<((I, Origin), Counted)> {
-        // clone: per build that keeps its walk, the walk's handle of each function
-        let counted = |it: &Item<I>| Some((it.function.clone()?, it.counted?));
-        // alloc: per build that keeps its walk, one per function
-        self.items.iter().filter_map(counted).collect()
-    }
-
-    /// Item `item`'s description failed.
-    pub(super) fn failed(&mut self, item: u32) {
-        self.items[item as usize].state = State::Failed;
-    }
-
-    /// rustc's walk over the graph described so far, once the levels have run out: from each
-    /// root in order, depth first, claiming each neighbor of an instance as it lists them and
-    /// placing it on the path of that instance. A deferred instance it claims within the limit
-    /// is put in `next`, to be described, and `true` returned: the check runs again once the
-    /// levels have run out again. Otherwise each instance claimed past the limit is an error.
-    pub(super) fn check<F: Frontend<Instance = I>>(
-        &mut self,
-        frontend: &F,
-        next: &mut Level<I, S>,
-        errors: &mut Vec<CodegenError>,
-    ) -> bool {
-        struct Frame {
-            /// Its claimed neighbors are `claimed[start..end]`; `next` is the one to visit.
-            start: u32,
-            end: u32,
-            next: u32,
-        }
-        let _span = tracing::info_span!(
-            target: "blaze",
-            "recursion limit check",
-            pass = self.passes + 1,
-            items = self.items.len(),
-            roots = self.roots.len(),
-        )
-        .entered();
-        let mut paths = Paths::default();
-        // alloc: per check, one flag per item
-        let mut visited = vec![false; self.items.len()];
-        // alloc: per check, the claimed neighbors of the instances on the path
-        let mut claimed: Vec<(u32, u32)> = Vec::new();
-        let mut stack: Vec<Frame> = Vec::new(); // alloc: per check, the path
-        let mut past: Vec<Past> = Vec::new(); // alloc: per check, one per instance past the limit
-        let mut undescribed: Vec<u32> = Vec::new(); // alloc: per check, one per instance to describe
-        for root in 0..self.roots.len() {
-            let root = self.roots[root];
-            if std::mem::replace(&mut visited[root as usize], true) {
+        while let Some(top) = stack.last_mut() {
+            if top.next == top.end {
+                claimed.truncate(top.start as usize);
+                stack.pop();
                 continue;
             }
-            match self.claim(&mut paths, root, NONE) {
-                Some(Ok(node)) => claimed.push((root, node)),
-                Some(Err(it)) => past.push(it),
-                None => undescribed.push(root),
-            }
-            // The root is the one claimed: visit it as a frame of one.
-            if claimed.len() == 1 {
-                stack.push(Frame { start: 0, end: 1, next: 0 });
-            }
-            while let Some(top) = stack.last_mut() {
-                if top.next == top.end {
-                    claimed.truncate(top.start as usize);
-                    stack.pop();
-                    continue;
-                }
-                let (item, node) = claimed[top.next as usize];
-                top.next += 1;
-                match &self.items[item as usize].state {
-                    State::Described(edges) => {
-                        let start = claimed.len() as u32;
-                        for &edge in edges {
-                            if std::mem::replace(&mut visited[edge as usize], true) {
-                                continue;
-                            }
-                            match self.claim(&mut paths, edge, node) {
-                                Some(Ok(node)) => claimed.push((edge, node)),
-                                Some(Err(it)) => past.push(it),
-                                None => undescribed.push(edge),
-                            }
+            let (item, node) = claimed[top.next as usize];
+            top.next += 1;
+            match &order.items[item as usize].state {
+                State::Described(edges) => {
+                    let start = claimed.len() as u32;
+                    for &edge in edges {
+                        if std::mem::replace(&mut visited[edge as usize], true) {
+                            continue;
                         }
-                        stack.push(Frame { start, end: claimed.len() as u32, next: start });
+                        match claim(&mut paths, edge, node) {
+                            Some(Ok(node)) => claimed.push((edge, node)),
+                            Some(Err(it)) => past.push(it),
+                            None => undescribed.push(edge),
+                        }
                     }
-                    State::Failed => {}
-                    State::Queued | State::Deferred { .. } => undescribed.push(item),
+                    stack.push(Frame { start, end: claimed.len() as u32, next: start });
                 }
+                State::Failed => {}
+                State::Unmade => undescribed.push(item),
             }
         }
-        let mut more = false;
-        for item in undescribed {
-            let entry = &mut self.items[item as usize];
-            let (State::Deferred { from }, Some(function)) = (&entry.state, &entry.function) else {
-                continue;
-            };
-            // clone: per build, the walk's handle of a deferred function, once
-            next.functions.push(function.clone());
-            next.function_items.push(item);
-            next.function_from.push(*from);
-            entry.state = State::Queued;
-            entry.forced = true;
-            more = true;
+    }
+    // alloc: per check, the instances it sends back
+    let mut again = Vec::new();
+    for item in undescribed {
+        let entry = &order.items[item as usize];
+        // A function with a count and no node is one the worklist left past its limit.
+        let (State::Unmade, Of::Function(function)) = (&entry.state, &entry.of) else { continue };
+        if function.counted.get().is_some() && !function.forced.swap(true, Ordering::Relaxed) {
+            // clone: a reference count, once per instance sent back
+            again.push(function.clone());
         }
-        if more {
-            self.passes += 1;
-            if self.passes <= PASSES {
-                return true;
-            }
-            let (instance, _) = &next.functions[0];
+    }
+    if let Some(first) = again.first() {
+        *passes += 1;
+        if *passes <= PASSES {
+            return Checked::Again(again);
+        }
+        errors.push(CodegenError {
+            unit: InstanceKey(ContentId::default()),
+            item: ItemKey(ContentId::default()),
+            // alloc: the error's message
+            what: format!(
+                "the recursion limit's check sent instances back to be described {PASSES} \
+                 times without reaching them all, the last one `{}`",
+                frontend.spell(&first.asked.0)
+            ),
+            front: None,
+        });
+        return Checked::Done;
+    }
+    let instance = |item: u32| order.asked(item).map(|it| &it.0);
+    let spelled = |item: u32| match instance(item) {
+        Some(instance) => format!("`{}`", frontend.spell(instance)), // alloc: an error's text
+        None if item == NONE => "none".to_owned(),                   // alloc: an error's text
+        None => "a static".to_owned(),                               // alloc: an error's text
+    };
+    for it in &past {
+        let (Some(at), Some(head), Some(limit_of)) =
+            (instance(it.item), instance(it.head), instance(it.limit_of))
+        else {
+            // A path's head and the item whose limit holds it are functions by construction
+            // ([`Paths::place`]); were one not, the refusal still stands, named as it is.
             errors.push(CodegenError {
                 unit: InstanceKey(ContentId::default()),
                 item: ItemKey(ContentId::default()),
                 // alloc: the error's message
                 what: format!(
-                    "the recursion limit's check sent instances back to be described {PASSES} \
-                     times without reaching them all, the last one `{}`",
-                    frontend.spell(instance)
+                    "{} repeats its body {} times on its path, past {}; the path's head is {} \
+                     and the limit is that of {}'s crate, which `Paths::place` makes functions",
+                    spelled(it.item),
+                    it.depth,
+                    it.limit,
+                    spelled(it.head),
+                    spelled(it.limit_of)
                 ),
                 front: None,
             });
-            next.functions.clear();
-            next.function_items.clear();
-            next.function_from.clear();
-            return false;
-        }
-        let spelled =
-            |item: u32| match self.items.get(item as usize).and_then(|it| it.function.as_ref()) {
-                Some((instance, _)) => format!("`{}`", frontend.spell(instance)), // alloc: an error's text
-                None if item == NONE => "none".to_owned(), // alloc: an error's text
-                None => "a static".to_owned(),             // alloc: an error's text
-            };
-        for it in &past {
-            let instance = |item: u32| {
-                self.items.get(item as usize).and_then(|it| it.function.as_ref()).map(|it| &it.0)
-            };
-            let (Some(at), Some(head), Some(limit_of)) =
-                (instance(it.item), instance(it.head), instance(it.limit_of))
-            else {
-                // A path's head and the item whose limit holds it are functions by construction
-                // ([`Paths::place`]); were one not, the refusal still stands, named as it is.
-                errors.push(CodegenError {
-                    unit: InstanceKey(ContentId::default()),
-                    item: ItemKey(ContentId::default()),
-                    // alloc: the error's message
-                    what: format!(
-                        "{} repeats its body {} times on its path, past {}; the path's head is {} \
-                         and the limit is that of {}'s crate, which `Paths::place` makes functions",
-                        spelled(it.item),
-                        it.depth,
-                        it.limit,
-                        spelled(it.head),
-                        spelled(it.limit_of)
-                    ),
-                    front: None,
-                });
-                continue;
-            };
-            errors.push(frontend.past_recursion_limit(at, it.depth, it.limit, head, limit_of));
-        }
-        if past.is_empty()
-            && let Some(left) =
-                self.items.iter().position(|it| matches!(it.state, State::Deferred { .. }))
-        {
-            errors.push(CodegenError {
-                unit: InstanceKey(ContentId::default()),
-                item: ItemKey(ContentId::default()),
-                // alloc: the error's message
-                what: format!(
-                    "the recursion limit's check never reached {}, which the build's walk \
-                     deferred past the limit, though it refused nothing",
-                    spelled(left as u32)
-                ),
-                front: None,
-            });
-        }
-        false
+            continue;
+        };
+        errors.push(frontend.past_recursion_limit(at, it.depth, it.limit, head, limit_of));
     }
-
-    /// Places `item` on the check's path of node `parent`: `None` for a function not yet
-    /// counted (never leveled).
-    fn claim(&self, paths: &mut Paths, item: u32, parent: u32) -> Option<Result<u32, Past>> {
-        let entry = &self.items[item as usize];
-        match entry.function {
-            None => Some(Ok(paths.place_static(parent))),
-            Some(_) => entry.counted.map(|counted| paths.place(item, &counted, parent, false)),
-        }
+    let deferred = |it: &super::frontier::Item<I, S>| match (&it.state, &it.of) {
+        (State::Unmade, Of::Function(function)) => function.counted.get().is_some(),
+        _ => false,
+    };
+    if past.is_empty()
+        && let Some(left) = order.items.iter().position(deferred)
+    {
+        errors.push(CodegenError {
+            unit: InstanceKey(ContentId::default()),
+            item: ItemKey(ContentId::default()),
+            // alloc: the error's message
+            what: format!(
+                "the recursion limit's check never reached {}, which the build's walk \
+                 deferred past the limit, though it refused nothing",
+                spelled(left as u32)
+            ),
+            front: None,
+        });
     }
+    Checked::Done
 }
 
-/// rustc's walk ([`Graph::check`]) over the graph of a kept walk, every item of which is
+/// rustc's walk ([`check`]) over the graph of a kept walk, every item of which is
 /// described: whether it claims an instance past its path's limit, and how many items it
 /// claimed. `roots` are the check's, in its order; `edges` gives what an item refers to, in
 /// its references' order; `counted` gives a function's count, `None` for a static. The same
-/// claims in the same order as the last pass of [`Graph::check`] over the same graph, so
+/// claims in the same order as the last pass of [`check`] over the same graph, so
 /// `false` here is a walk whose check refuses nothing, and a walk with no refusal described
 /// everything its roots reach (a deferred instance the check claims within the limit is sent
 /// back, and one it claims past it is a refusal).
@@ -702,9 +501,10 @@ pub(super) fn claims_past<'e>(
     (false, claims)
 }
 
-/// The error of a front end whose [`Frontend::counted`] gave `given` entries for a level of
-/// `functions`: naming the front end and the functions left without one.
-fn miscounted<I, F: Frontend<Instance = I>>(
+/// The error of a front end whose [`Frontend::counted`] gave `given` entries for `functions`,
+/// which one describe newly reached (or the roots): naming the front end and the functions
+/// left without one. Each of `functions` is then left undescribed, with this as why.
+pub(super) fn miscounted<I, F: Frontend<Instance = I>>(
     frontend: &F,
     functions: &[(I, Origin)],
     given: usize,
@@ -727,8 +527,8 @@ fn miscounted<I, F: Frontend<Instance = I>>(
         item: ItemKey(ContentId::default()),
         // alloc: the error's message
         what: format!(
-            "the front end `{}` gave {given} recursion limit entries (`Frontend::counted`) for a \
-             level of {} functions, one a function: {which}",
+            "the front end `{}` gave {given} recursion limit entries (`Frontend::counted`) for \
+             {} functions, one a function: {which}",
             std::any::type_name::<F>(),
             functions.len(),
         ),

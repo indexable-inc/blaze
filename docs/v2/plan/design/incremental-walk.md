@@ -41,12 +41,8 @@ It asks again (`redescribe` and `counted`, on all cores) only the items it holds
 each found by a lookup (`Keep::functions`, `instances`, `values`), and the items asked each
 build (`Frontend::each_build`, `static_each_build`): those whose describe reads beside the
 database, a body or a static's value that names a file. A name the walk holds no item of is
-ignored. A front end that tells no view (`Frontend::view` is `None`: one with no engine)
-says by that that every item is asked each build, and the `ask functions` span says `every`.
-A front end that tells a view and answers `Unknown` has lost its changed set: the build is
-refused with the front end's reason, the kept walk and lists put back as they were
-(`no_changed_set_error`; rule no-fallback), where until 2026-11-11 the walk asked of
-everything it held.
+ignored. `Unknown` (a front end with no engine, a view from before the engine's log, a walk
+kept with no view) asks of everything the walk holds, and the `ask functions` span says why.
 `HirFrontend` answers from `described_memo::changed_since`, `counted_memo::changed_since`
 and `described_static_memo::changed_since`, each key read back by the query's `arguments`
 (crates/hir-ty-codegen/v2/frontend.rs). `Frontend::durable`, `group`, `written_since`,
@@ -98,12 +94,8 @@ What is built (crates/blaze-query/src/db/reverse.rs, the core, and frontier.rs, 
    reach. The codegen walk and the body check ask only what item 5 names.
 5. **Naming**: `plumbing::changed_since::<F>(db, view) -> Changed<F::Key>` and each tracked
    query's generated `changed_since` (IDs): the keys of `F` whose value changed since
-   `view`, from a log of the walks' findings, or `Unknown` naming why (a view that is none
-   of this storage's, or asked inside a query while a walk is due), which is a host's error:
-   the body check and the codegen walk refuse to build on it (rule no-fallback). The log
-   answers from any earlier view: past 256 walks or 2^20 nodes its oldest findings are
-   merged into one of the newest view among them (`merge_oldest`), never dropped, so a host
-   that asks from before them is named a few rows too many and is never left to sweep.
+   `view`, from a log of the last 256 walks (2^20 nodes), or `Unknown` naming why (asked
+   from before the log, or a view of another storage), which a host takes as everything.
    It may name more, and only: a value that changed and changed back, a row whose
    verification unwound, a change at or before `view` when no walk ran between. A row
    first made after `view` is not named.
@@ -154,46 +146,6 @@ modules changed. Its refinement test holds it to a whole plan's diagnostics over
 with two planted bugs and a count of the tasks of one edit among 20 bodies and 200. What
 still grows with more than the edit: the slots of a touched module are all its bodies, and
 a body or module that is not clean (a warning counts) is visited every build.
-Where a check is kept and the engine answers `Unknown`, there is no plan: `NoChangedSet`
-names the crates and the engine's reason, and the kept check goes back as it was.
-
-### The work of an edit, counted, and what else follows the edit (2026-11-11; written, unbuilt and untested)
-
-**The measure.** Each stage says once what it visited as a kept event `edit work` with its
-stage's name and its counters (crates/blaze-query/src/db/edit_work.rs names the stages and
-lists the counters): the engine's walk (`changed set`), each unit's plan (`body check`),
-each program's walk (`codegen walk`), each dependency serve (`dependency image keys`) and
-each link (`link`). `blaze explain edit_work` prints them by stage with the engine's memos
-run and verified from `query_counts`; a build that counted nothing is an error. The test of
-the whole front half is hir's `a_body_edit_touches_only_what_reads_the_body`: three crates,
-the same body edit among 200 functions and among 2,000, every count equal and small; its
-control edits a signature, which reaches every caller.
-
-**Dependency image keys.** A key is the database's memo (`hir_def::deps`'
-`crate_image_key`), where it was a host's walk forgotten at every view: an edit of a member
-makes none again (0 at 4 libraries and at 40), and a key that changes is held to a fresh
-database's.
-
-**At the save.** The watcher's commit of a save, with no request waiting on it, starts the
-head's last build-shaped request as a check on the new root, as an intent's job
-(`Session::save_ahead`): the file is read into the database, the engine marks what read it
-and the changed bodies are checked before `blaze run` is typed, and that request takes the
-job over. Nothing is linked, patched or run ahead. At most `SAVES_AHEAD` between two
-requests that build, and never beside a request's job.
-
-**Small loops run here.** A loop of at most 32 items predicted under 2 ms from its own
-site's small runs (`blaze_graph::par::Small`) runs on its calling thread with no job
-submitted: the body check's tasks, the codegen walk's asks. The changed-set walk's levels
-keep their own bound (under 64 rows on the walker's thread): a level's rows read each
-other, and at 32 a level of about 55 rows went to the pool and its jobs waited on each
-other without end (a hello-world body edit hung in `names`, 2026-11-11).
-A unit's phases are still plane tasks, each a dispatch: the edit's chain is one thread
-within a stage, not yet across them.
-
-**Still the program's size, not the edit's.** A link goes over every name and every
-patchable function of the program (`link`'s `symbols` and `patchable`), and a `Built`'s
-lists are copied each build (`codegen walk`'s `copied`); the slots of a touched module are
-all its bodies.
 
 ## The patched walk
 

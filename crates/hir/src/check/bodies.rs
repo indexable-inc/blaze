@@ -32,11 +32,8 @@
 //! (`changed_since` of [`body_check_clean`], [`module_check_clean`], [`module_bodies`]), those
 //! that were not clean, and the bodies new in a module listed again. Every other body's and
 //! module's answer is the kept one, clean, with no task and no fetch, so the check costs the
-//! edit and the modules it touches, not the crate ([`Work`]). Where nothing is kept (the first
-//! check of its key) or a crate's file modules changed, the plan is whole and says why
-//! ([`Whole`]). Where a check is kept and the engine cannot name what changed since it, there
-//! is no plan: that is an error naming the crates and the engine's reason ([`NoChangedSet`]),
-//! never a sweep of every body in its place (rule no-fallback).
+//! edit and the modules it touches, not the crate ([`Work`]). Where the engine cannot name the
+//! set, or nothing is kept, the plan is whole and says why ([`Whole`]).
 
 use std::{
     fmt, mem, ptr,
@@ -65,10 +62,6 @@ use crate::{
 
 #[cfg(test)]
 mod tests;
-
-/// The sweep's loop, as the pool's small-loop predictor knows it: an edit's one or two tasks
-/// run on the thread that runs the plan.
-pub(crate) static SWEEP: blaze_query::db::Small = blaze_query::db::Small::new("body check sweep");
 
 /// No body: an empty place of the reached ring, a task checking none.
 const NONE: u32 = u32::MAX;
@@ -127,6 +120,8 @@ pub enum Whole {
     /// Nothing is kept for this database, these crates and these style lints: the first plan
     /// of them in this process, or another plan of them has not run yet.
     NothingKept,
+    /// The engine cannot name what changed since the kept check's view.
+    Unknown(ChangedUnknown),
     /// The file modules of this crate changed: every position the kept check holds is of the
     /// list before.
     Modules(Crate),
@@ -139,52 +134,10 @@ impl fmt::Display for Whole {
             Whole::NothingKept => {
                 f.write_str("nothing is kept for this database, these crates and style lints")
             }
+            Whole::Unknown(why) => write!(f, "the engine cannot name what changed: {why}"),
             Whole::Modules(krate) => write!(f, "the file modules of {krate:?} changed"),
         }
     }
-}
-
-/// Why no plan of every body could be made from the check kept of its crates: the query
-/// engine could not name what changed since that check. A plan that swept every body in its
-/// place would be right and cost the crate on every edit with nothing saying so, so this is
-/// the plan's error (rule no-fallback); [`Plan::of_every_body`] panics with it, which fails
-/// the unit whose check it is and names it (rule panics-fail-one-job). The kept check is put
-/// back first, as it was.
-///
-/// What can cause it, each a bug of its caller and none an edit's: a plan made inside a
-/// query while the engine's walk of the changed set is due (a walk starts only outside one),
-/// or a kept view that is after the database's (a view counter set back).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NoChangedSet {
-    pub crates: Vec<Crate>,
-    pub style_lints: bool,
-    /// The view the kept check ran in, which the engine was asked from.
-    pub since: View,
-    pub why: ChangedUnknown,
-}
-
-impl fmt::Display for NoChangedSet {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "the check of every body of {:?} (style lints: {}) holds a kept check of view {} \
-             and the query engine cannot name what changed since it: {}. A plan from a kept \
-             check starts from the engine's changed set and has no sweep of every body to \
-             take its place (hir::check::bodies, rule no-fallback)",
-            self.crates,
-            self.style_lints,
-            self.since.as_u64(),
-            self.why
-        )
-    }
-}
-
-/// Why [`changes`] gives no patch of a kept check.
-enum Unpatched {
-    /// The plan is whole, by design, and says this.
-    Whole(Whole),
-    /// The engine cannot name the changed set: the plan's error.
-    Unknown(ChangedUnknown),
 }
 
 /// What a plan holds and what it visits: on the spans `body check plan` and `body check
@@ -281,11 +234,7 @@ struct Kept {
 /// How many kept checks a process holds: the least recently used goes when one more is made.
 /// A daemon's unit checks one crate, so a workspace of this many crates in one configuration
 /// keeps them all; a database dropped leaves its kept checks here until others push them out.
-/// A check pushed out is a whole plan the next time (`Whole::NothingKept`), every body of its
-/// crate visited: at 64 a workspace of more crates than that (reth has over a hundred) lost
-/// some crate's kept check on every build, so the bound is well past any workspace's crates
-/// times its configurations. A kept check is a word a module and two a body.
-const KEPT_CHECKS: usize = 4096;
+const KEPT_CHECKS: usize = 64;
 
 /// The kept checks, each with what it is of, the last used last. A plan takes its key's out
 /// and its run puts the next in, so two plans of one key at once find one kept check between
@@ -347,18 +296,17 @@ struct Patch<'db> {
 
 /// What a plan from `kept` visits: the modules and bodies the engine names as changed since
 /// the kept view, those that were not clean, and the bodies new in a module whose list
-/// changed. `Err` where a crate's file modules changed (a whole plan) or the engine cannot
-/// say (no plan).
-fn changes<'db>(db: &'db Db, of: &Of, kept: &Kept) -> Result<Patch<'db>, Unpatched> {
+/// changed. `Err` where the engine cannot say or a crate's file modules changed.
+fn changes<'db>(db: &'db Db, of: &Of, kept: &Kept) -> Result<Patch<'db>, Whole> {
     let since = kept.view;
     let keys = |changed: Changed<Id>| match changed {
         Changed::Keys(ids) => Ok(ids),
-        Changed::Unknown(why) => Err(Unpatched::Unknown(why)),
+        Changed::Unknown(why) => Err(Whole::Unknown(why)),
     };
     let crates = keys(crate_file_modules::changed_since(db, since))?;
     for &krate in &of.crates {
         if crates.binary_search(&AsId::as_id(&krate.id)).is_ok() {
-            return Err(Unpatched::Whole(Whole::Modules(krate)));
+            return Err(Whole::Modules(krate));
         }
     }
     // alloc: once a plan, a word per module or body the edit touched or that was not clean
@@ -533,12 +481,6 @@ impl Plan<'static, fn(DefWithBody) -> bool> {
     /// The diagnostics are those of a plan that keeps nothing: a memo or a kept answer says
     /// only that a check gave none, and a body or module that gave any is checked by its task
     /// as before. It runs with the `style_lints` it was made with, in the view it was made in.
-    ///
-    /// # Panics
-    ///
-    /// With [`NoChangedSet`]'s text, when a check is kept of these crates and the query
-    /// engine cannot name what changed since it: there is no sweep of every body in the
-    /// changed set's place.
     pub fn of_every_body(
         db: &Db,
         crates: &[Crate],
@@ -621,27 +563,9 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
             None => Err(Whole::KeepsNothing),
             Some(of) => match take_kept(of) {
                 None => Err(Whole::NothingKept),
-                Some(kept) => match changes(db, of, &kept) {
-                    Ok(patch) => Ok((kept, patch)),
-                    // A kept check whose crate's file modules changed is dropped here: the
-                    // whole plan's run keeps the next.
-                    Err(Unpatched::Whole(why)) => Err(why),
-                    // No changed set: no plan. The kept check goes back as it was, so the
-                    // error is the same until its cause is removed, never a whole plan the
-                    // second time.
-                    Err(Unpatched::Unknown(why)) => {
-                        let refused = NoChangedSet {
-                            // clone: the error's, once
-                            crates: of.crates.clone(),
-                            style_lints: of.style_lints,
-                            since: kept.view,
-                            why,
-                        };
-                        // clone: the error path, once
-                        put_kept(of.clone(), kept);
-                        panic!("{refused}");
-                    }
-                },
+                // A kept check the engine cannot patch is dropped here: the whole plan's run
+                // keeps the next.
+                Some(kept) => changes(db, of, &kept).map(|patch| (kept, patch)),
             },
         };
         let (tables, work, last) = match from_kept {
@@ -709,25 +633,6 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
             listing.record("why", tracing::field::display(why));
         }
         drop(listing);
-        // What the plan holds and visits, kept with the build (`blaze explain edit_work`).
-        // Only a plan of every body says it: the others are no unit's check.
-        if keep.is_some() {
-            tracing::info!(
-                target: "blaze",
-                stage = blaze_query::db::edit_work::BODY_CHECK,
-                held_modules = u64::from(work.held_modules),
-                held_bodies = u64::from(work.held_bodies),
-                named_modules = u64::from(work.named_modules),
-                named_bodies = u64::from(work.named_bodies),
-                relisted = u64::from(work.relisted),
-                slots_modules = u64::from(work.slots_modules),
-                slots_bodies = u64::from(work.slots_bodies),
-                visited_modules = u64::from(work.visited_modules),
-                visited_bodies = u64::from(work.visited_bodies),
-                whole = u64::from(work.whole.is_some()),
-                "edit work"
-            );
-        }
         let Tables {
             modules,
             crate_ends,
@@ -928,10 +833,7 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
         if let Some(why) = &work.whole {
             sweep.record("why", tracing::field::display(why));
         }
-        // A plan from a kept check has the edit's few tasks: where they are predicted to
-        // cost less than a dispatch they run on this thread, one after the other, with no
-        // job submitted (`Db::run_all_small`); a whole plan's run on the pool.
-        db.run_all_small(&SWEEP, Tag::Infer, self.tasks.len(), |task_db, task| {
+        db.run_all(Tag::Infer, self.tasks.len(), |task_db, task| {
             assert_eq!(
                 ptr::from_ref(task_db).cast::<()>().addr(),
                 home,
@@ -1198,10 +1100,7 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
 #[blaze_query::tracked(returns(copy))]
 pub fn body_check_clean(db: &Db, def: DefWithBodyId, style_lints: bool) -> bool {
     #[cfg(test)]
-    {
-        tests::CHECKED.lock().push((db.nonce_and_revision().0, def));
-        tests::CHECKED_ON.lock().push((db.nonce_and_revision().0, std::thread::current().id()));
-    }
+    tests::CHECKED.lock().push((db.nonce_and_revision().0, def));
     super::check_body(db, def, style_lints).is_empty()
 }
 

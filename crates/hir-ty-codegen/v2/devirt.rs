@@ -1,9 +1,10 @@
 //! The whole program's trait objects, for `hir-ty-mir`'s `Devirtualize`
 //! (docs/v2/plan/design/devirt.md). Each walked body lists what it does with trait
 //! objects ([`Facts`], found by [`super::refs`] beside its references); once the walk of a
-//! final binary has reached everything, [`State::closed`] makes the program's [`World`] of
-//! them, and the walk runs again (`blaze_codegen::driver`) with the bodies that call through a
-//! `dyn` built against it, whose new references (the direct callees) it then lists.
+//! final binary has reached everything, it hands what it reached to [`State::closed`], which
+//! makes the program's [`World`] of them, and the walk runs again (`blaze_codegen::driver`)
+//! with the bodies that call through a `dyn` built against it, whose new references (the
+//! direct callees) it then lists.
 //!
 //! What makes an object's list of types closed: the program is an executable or a test (a
 //! `cdylib`'s every object is open: a program that loads it may make more), no code of a
@@ -19,7 +20,9 @@
 use std::alloc::Global;
 
 use base_db::{Crate, Db};
-use blaze_codegen::{CodegenError, InstanceKey, Owner, backend::FrontRef, plan::Origin};
+use blaze_codegen::{
+    CodegenError, InstanceKey, Owner, backend::FrontRef, plan::Origin, slot::Slot,
+};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey};
 use hir_def::{CallableDefId, ItemContainerId, TraitId, signatures::TraitSignature};
@@ -33,7 +36,6 @@ use hir_ty_mir::mir::{
     MirBody, TerminatorKind,
     devirt::{self, DevirtWorld, Held, Object, ObjectKey, Target, World},
 };
-use blaze_core::lock::Lock;
 use rustc_type_ir::inherent::IntoKind as _;
 
 use super::{Hashes as _, HirFrontend, HirInstance, HirStatic, Kind, RootKind, build::Build, refs};
@@ -202,87 +204,107 @@ pub(crate) fn code(code: blaze_items::CodeHash, read: &[[u8; 32]]) -> blaze_item
     blaze_items::CodeHash(hasher.finish())
 }
 
-/// What a build's front end knows of the program it walks, for its world.
-pub(crate) struct State(Lock<Program>);
-
-impl Default for State {
-    fn default() -> State {
-        State(Lock::new("codegen.devirt.program", Program::default()))
-    }
-}
-
+/// What a build's front end knows of the program it walks, for its world: two records, each
+/// written once ([`Slot`]) and read with no lock, as every describe of the walk reads the
+/// world on every core at once. What the walk reached is the walk's own, handed to
+/// [`State::closed`] whole and in the walk's order when it ends: nothing here grows.
 #[derive(Default)]
-struct Program {
-    /// What the unit makes, from its roots ([`HirFrontend::roots`]): `None` before.
-    makes: Option<(RootKind, Crate)>,
-    /// What the walk reached, each level's appended ([`blaze_codegen::backend::Frontend::reached`]).
-    functions: Vec<(HirInstance, Origin)>,
-    statics: Vec<HirStatic>,
-    held: Option<Held>,
+pub(crate) struct State {
+    /// What the unit makes, from its roots ([`HirFrontend::roots`]): unset before.
+    makes: Slot<(RootKind, Crate)>,
+    /// The world the program's bodies are built against, held from the end of its first walk
+    /// ([`State::closed`]): unset before, and for a program that has none.
+    held: Slot<Held>,
 }
 
 impl State {
-    pub(crate) fn makes(&self, kind: RootKind, krate: Crate) {
-        self.0.lock().makes = Some((kind, krate));
-    }
-
-    pub(crate) fn reached(&self, functions: &[(HirInstance, Origin)], statics: &[HirStatic]) {
-        let mut program = self.0.lock();
-        if matches!(
-            program.makes,
-            Some((RootKind::Executable | RootKind::Test | RootKind::Shared, _))
-        ) {
-            // clone: once per instance a final binary's walk reaches, its handle
-            program.functions.extend_from_slice(functions);
-            // clone: once per static a final binary's walk reaches, its handle
-            program.statics.extend_from_slice(statics);
+    /// The unit makes `krate` as `kind`: said once, by its roots. A front end is of one
+    /// program, so another program is refused, naming both; the first stays.
+    pub(crate) fn makes(&self, db: &Db, kind: RootKind, krate: Crate) -> Result<(), CodegenError> {
+        match self.makes.put((kind, krate)) {
+            Ok(_) => Ok(()),
+            Err(refused) => {
+                let (kept_kind, kept_crate) = *refused.kept;
+                Err(refused_of(
+                    db,
+                    krate,
+                    kind,
+                    // alloc: the error's message
+                    format!(
+                        "its front end already walks {}; a front end's dyn facts are one \
+                         program's",
+                        program_name(db, kept_kind, kept_crate)
+                    ),
+                ))
+            }
         }
     }
 
     /// The world the walk's bodies are built against: `None` before the first walk ends, and
-    /// for a program that has none.
+    /// for a program that has none. One acquire load.
     pub(crate) fn world(&self) -> Option<DevirtWorld> {
-        self.0.lock().held.as_ref().map(|it| it.world().id)
+        self.held.get().map(|it| it.world().id)
     }
 
-    /// Called when a walk has reached everything: the program's world from what it reached,
-    /// `true` when it is a new one the bodies are to be built against (the walk then runs
-    /// again), `false` when there is none or it is the one the bodies were built against. A
-    /// second walk that finds other facts than the first is an error naming the program: the
-    /// bodies built against the first would be keyed by facts that are not the program's.
-    pub(crate) fn closed(&self, frontend: &HirFrontend<'_>) -> Result<bool, CodegenError> {
-        let (makes, functions, statics, held) = {
-            let mut program = self.0.lock();
-            let lists =
-                (std::mem::take(&mut program.functions), std::mem::take(&mut program.statics));
-            (program.makes, lists.0, lists.1, program.held.as_ref().map(|it| it.world().id))
-        };
-        let Some((kind, krate)) = makes.filter(|it| it.0 != RootKind::Library) else {
+    /// Called when a walk has reached everything, with every function (and whose code asked
+    /// for it) and static it reached, in the walk's order, which is the same whatever the
+    /// schedule of its describes: the program's world from them, `true` when it is a new one
+    /// the bodies are to be built against (the walk then runs again), `false` when there is
+    /// none or it is the one the bodies were built against. A second walk that finds other
+    /// facts than the first is an error naming the program: the bodies built against the
+    /// first would be keyed by facts that are not the program's.
+    pub(crate) fn closed(
+        &self,
+        frontend: &HirFrontend<'_>,
+        functions: &[(HirInstance, Origin)],
+        statics: &[HirStatic],
+    ) -> Result<bool, CodegenError> {
+        let Some(&(kind, krate)) = self.makes.get().filter(|it| it.0 != RootKind::Library) else {
             return Ok(false);
         };
         let made = frontend.with(|db| {
             let program = program_name(db, kind, krate);
             let _span =
                 tracing::info_span!(target: "blaze", "devirt world", program = &*program).entered();
-            world_of(frontend, db, (kind, program), &functions, &statics)
-                .map_err(|what| refused(db, krate, kind, what))
+            world_of(frontend, db, (kind, program), functions, statics)
+                .map_err(|what| refused_of(db, krate, kind, what))
         })?;
+        let held = self.held.get().map(|it| it.world().id);
+        let others = |id: DevirtWorld, found: String| {
+            frontend.with(|db| {
+                refused_of(
+                    db,
+                    krate,
+                    kind,
+                    // alloc: the error's message
+                    format!(
+                        "the walk of the program against its dyn facts {id:?} found others \
+                         ({found}); the facts may not change with what is built against them"
+                    ),
+                )
+            })
+        };
         match (made, held) {
             (None, None) => Ok(false),
             (Some(world), None) => {
-                let held = devirt::give(world).map_err(|what| frontend.with(|db| refused(db, krate, kind, what)))?;
-                self.0.lock().held = Some(held);
-                Ok(true)
+                let id = world.id;
+                let given = devirt::give(world)
+                    .map_err(|what| frontend.with(|db| refused_of(db, krate, kind, what)))?;
+                match self.held.set(given) {
+                    Ok(_) => Ok(true),
+                    // Another walk over this front end closed its facts meanwhile: the same
+                    // ones are the ones the bodies are now built against, and this walk runs
+                    // again over them as it would over its own; others are refused.
+                    Err(refused) if refused.kept.world().id == id => Ok(true),
+                    // alloc: the error's message
+                    Err(refused) => Err(others(refused.kept.world().id, format!("{id:?}"))),
+                }
             }
             (Some(world), Some(id)) if world.id == id => Ok(false),
-            (made, Some(id)) => Err(frontend.with(|db| {
+            (made, Some(id)) => {
                 // alloc: the error's message
-                let found = made.map_or_else(|| "none".to_owned(), |it| format!("{:?}", it.id));
-                refused(db, krate, kind, format!(
-                    "the walk of the program against its dyn facts {id:?} found others ({found}); \
-                     the facts may not change with what is built against them"
-                ))
-            })),
+                Err(others(id, made.map_or_else(|| "none".to_owned(), |it| format!("{:?}", it.id))))
+            }
         }
     }
 }
@@ -298,7 +320,7 @@ fn program_name(db: &Db, kind: RootKind, krate: Crate) -> Box<str> {
     format!("{what} of crate `{}`", krate.named(db)).into_boxed_str()
 }
 
-fn refused(db: &Db, krate: Crate, kind: RootKind, what: impl std::fmt::Display) -> CodegenError {
+fn refused_of(db: &Db, krate: Crate, kind: RootKind, what: impl std::fmt::Display) -> CodegenError {
     CodegenError {
         unit: InstanceKey(ContentId::default()),
         item: ItemKey(ContentId::default()),

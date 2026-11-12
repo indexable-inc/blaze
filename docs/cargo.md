@@ -107,7 +107,15 @@ cargo would refuse. `-C DIRECTORY` (with `-Z unstable-options`) and the global f
 the command work as in cargo. `test` alone takes four flags of blaze's own (extensions,
 [below](#which-tests-run)): `--reached`, `--ub`, `--ub-seed N` and `--ub-schedules K`. `build`,
 `check`, `run`, `test` and `bench` take `--refused N|all`: how many of the functions blaze could
-not compile a build's error names, the first `N` (16 without it) or every one.
+not compile a build's error names, the first `N` (16 without it) or every one. `build`,
+`run`, `test` and `check` take `--goal edit|max`: what the build waits for before it answers.
+`edit` answers once every function has tier 0 code (copy-and-patch stencils); `max` once every
+function has its optimized code (LLVM's), and fails, naming the function, where it cannot.
+Without the flag the profile says: `dev` and `test` edit, `release` and `bench` (and any
+profile at `opt-level` 2, 3, `s` or `z`) are `max`. A package cargo gives its own `opt-level`
+(`[profile.*.package.*]`) keeps it under both. The `Finished` line ends with the goal and how
+much of the linked code is optimized: `(goal edit: tier 0 · 38% optimized)`
+([v2/plan/design/tiers.md](v2/plan/design/tiers.md)).
 `serve` is the daemon itself ([below](#the-daemon)); `codegen-inputs`, `trace` and `tables`
 print what the daemon's last build of the checkout did (each instance it made with its code
 hash, every result with its edges as CBOR, the size of each long-lived table); `check --replace std::sync::Mutex=parking_lot::Mutex` retargets every
@@ -1088,7 +1096,7 @@ answered. It is said again only while every input of that walk is as it was:
 |---|---|
 | The checkout's files (sources, manifests, lock file, config in it) | the view's root, which the checkout's watcher commits before the request is seen |
 | Command, arguments, directory, the request's whole environment, config files outside the checkout, fetched sources and path dependencies, toolchain, blaze's version | the view's config, by its bytes |
-| Colors, width, `--refused`, `-v` | the request's own hash |
+| Colors, width, `--refused`, `-v`, `--goal` | the request's own hash |
 | Paths outside the checkout a build script, proc macro or `include!` read | the watches outside views heard nothing since the kept walk began, and that walk looked at no such path on the disk |
 | Path dependencies outside the checkout | each one's watch vouches for it; one named through a link, or a single file, is read again by every build |
 | A manifest above the checkout that is not there | looked at as the request is asked |

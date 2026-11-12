@@ -19,9 +19,14 @@
 //!    `Database::storage_mut`, which ends every `&'db` borrow of the storage, so no reference
 //!    of an earlier view is alive when a value of that view is dropped or replaced.
 //! 4. **Provisional values are their cycle's thread's.** A [`PROVISIONAL`] value (fixpoint
-//!    iteration) is written and read only by the task whose stack holds its cycle's head, and
-//!    replaced only between rounds, when every frame that read the last round's has returned;
-//!    other tasks never read it, they wait on the head's flight.
+//!    iteration) is read only by the task whose stack holds its cycle's head, and replaced or
+//!    dropped only by that task, between rounds, when every frame that read the last round's
+//!    has returned; other tasks never read it, they wait on the head's flight. A task whose
+//!    wait would close a cycle of tasks joins the cycle instead (`function::lend`): it reads
+//!    the head's fallback or initial value from a box the storage keeps
+//!    (`Storage::lend`), never a row; the rows it then runs it writes once, provisional,
+//!    holding each one's flight with [`RUNNING`] set (rule 1), and hands to the head's task
+//!    (`function::hand_to`), after which they are that task's as if it had made them.
 //!
 //! Every `unsafe` block below names which of these it rests on.
 
@@ -65,6 +70,17 @@ pub(crate) const HEAD: u32 = 1 << 4;
 pub(crate) const STALE: u32 = 1 << 5;
 /// `meta`: `extra` is the 64-bit hash of the value an eviction dropped.
 pub(crate) const HASHED: u32 = 1 << 6;
+/// `meta`, on a provisional row a joined task handed to its cycle's head and that head has
+/// not taken yet (`function::hand_to`, `function::adopt`): its value came from a value lent in
+/// place of one the head's round holds, or an inner head of its own did not converge, so the
+/// head's round it is taken in is not its last.
+pub(crate) const UNSETTLED: u32 = 1 << 7;
+/// `meta`, on such a row: its run replayed captured reads, whose summaries its head takes as
+/// every bit.
+pub(crate) const REPLAYED: u32 = 1 << 8;
+/// `meta`, on such a row: its run, or a run of the cycle it headed on its own task, made an
+/// untracked read. Not [`UNTRACKED`], which says so of a final row.
+pub(crate) const UNTRACKED_HANDED: u32 = 1 << 9;
 
 /// A row's header: the same for every function, so the verify walk reads any row untyped.
 #[repr(C, align(8))]
@@ -76,9 +92,11 @@ pub(crate) struct Header {
     pub(crate) changed: AtomicU32,
     /// Its node in the dependency graph, 0 before its first run.
     pub(crate) node: AtomicU32,
-    /// [`DURABILITY`], [`CYCLE`], [`UNTRACKED`], [`HEAD`], [`STALE`], [`HASHED`].
+    /// [`DURABILITY`], [`CYCLE`], [`UNTRACKED`], [`HEAD`], [`STALE`], [`HASHED`], and until its
+    /// head takes a handed row, [`UNSETTLED`], [`REPLAYED`], [`UNTRACKED_HANDED`].
     pub(crate) meta: AtomicU32,
-    /// Its edges: a span of the storage's edge array ([`span`]).
+    /// Its edges: a span of the storage's edge array ([`span`]). A provisional row has none,
+    /// but one handed to its head and not yet taken: what its run read outside the cycle.
     pub(crate) edges: AtomicU64,
     /// The value's hash ([`HASHED`]), or while [`PROVISIONAL`] the node of its cycle's head.
     pub(crate) extra: AtomicU64,

@@ -69,7 +69,7 @@
 //! `runtime_mir_body_query` under `evicted_asked` in that build's `query_counts`. A check
 //! releases as it did.
 //!
-//! A check (`Goal::Check`) keeps its inference: what it made, and what the next check of the
+//! A check (`JobKind::Check`) keeps its inference: what it made, and what the next check of the
 //! head reads again. Its MIR goes as its front end is kept, as every build's does, and memory
 //! makes a release of a check due mid-build as of any build: then the MIR, constant values and
 //! solver caches of every crate go and the values kept by bytes are swept under the squeeze's

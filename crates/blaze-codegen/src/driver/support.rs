@@ -417,7 +417,8 @@ mod tests {
     }
 
     /// The work of an edit is what it changes: in a chain of 10,000 with a branch at each,
-    /// taking the last branch off visits the one item dropped.
+    /// taking the last branch off visits the one item dropped, once in each set it leaves
+    /// (the root is one of both sets, so the branch was a member of both).
     #[test]
     fn an_edit_visits_what_it_changes() {
         const COUNT: u32 = 10_000;
@@ -438,10 +439,11 @@ mod tests {
         graph.set_outs(COUNT - 1, Vec::new());
         let settled = graph.settle();
         assert_eq!(settled.left[BUILT], vec![2 * COUNT - 1]);
-        assert_eq!(graph.visited - before, 1, "the one item dropped");
+        assert_eq!(settled.left[ALL], vec![2 * COUNT - 1]);
+        assert_eq!(graph.visited - before, 2, "the one item dropped, from each of its two sets");
         // An edge to an item already reached supports it and visits nothing.
         graph.set_outs(COUNT - 1, vec![5]);
         assert_eq!(graph.settle(), Settled::default());
-        assert_eq!(graph.visited - before, 1);
+        assert_eq!(graph.visited - before, 2);
     }
 }

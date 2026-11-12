@@ -19,11 +19,15 @@
 mod breakdown;
 pub mod ceiling;
 mod daemon;
+pub mod dev_toolchain;
 mod fetch;
 mod fetch_url;
+pub(crate) mod flightrec;
 mod gc;
 mod heads;
 mod image;
+#[cfg(all(unix, feature = "native"))]
+pub(crate) mod inspect;
 mod job;
 #[cfg(all(unix, feature = "native"))]
 mod machine;
@@ -1063,6 +1067,9 @@ pub(crate) fn engine(
     // directories.
     let stalls = state.join("stalls");
     std::fs::create_dir_all(&stalls).with_context(|| format!("making {}", stalls.display()))?;
+    // Where its flight recordings go (`flightrec`): written by whichever thread finds the
+    // daemon going down, or by `blaze debug inspect --record`.
+    flightrec::arm(&state);
     if let Some(parent) = serving.socket.as_deref().and_then(Path::parent) {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("making the socket's directory {}", parent.display()))?;
@@ -1230,6 +1237,9 @@ pub(crate) fn engine(
     blaze_profile::crash::install();
     plane::record_panics();
     plane::record_alloc_failures();
+    // After `record_panics`: a panic no job's runner catches is recorded and printed as
+    // before, then writes a flight recording of what the daemon was doing.
+    flightrec::on_panic(plane::in_a_job);
     // Each query run is progress to the stall watchdog: a check inside queries for minutes is
     // no stall. Set once per process, so a second daemon in one (tests) finds it set by the
     // first; a hook something else set first would leave the watchdog counting nothing.
@@ -1403,6 +1413,19 @@ fn listen(
     // its stall bound, however stuck, saying what it was inside, and a loop stuck inside a turn
     // is reported with the children it leaves unreaped.
     let guard = stop::arm(daemon.stall_bound(), daemon.pulse())?;
+    // `blaze debug inspect`'s thread and socket, off the loop and the pool: served before the
+    // CLI is told the daemon listens. A daemon that can't serve it says why and serves the rest.
+    #[cfg(unix)]
+    {
+        let inspector = inspect::Inspector { pulse: daemon.pulse(), tasks: daemon.tasks() };
+        if let Err(why) = socket()
+            .map_err(|why| why.to_string())
+            .and_then(|at| inspect::serve(&inspect::socket_of(&at), inspector))
+        {
+            tracing::warn!("{why}");
+            eprintln!("blaze serve: {why}");
+        }
+    }
     eprintln!("{LISTENING}{} (pid {})", daemon.listening(), std::process::id());
     // Its last word: the pipe closes as it goes, and the reporter of what the start is inside
     // writes nothing after it.

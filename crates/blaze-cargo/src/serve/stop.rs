@@ -40,6 +40,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use super::{
     ceiling::{EASED, Gib, NEAR, STOPPED},
+    flightrec,
     pulse::{CeilingLook, CeilingWatch, Look, LoopWatch, Pulse, StallWatch},
     signals,
 };
@@ -146,6 +147,7 @@ fn guard(pipe: std::fs::File, bound: Duration, pulse: &Pulse, over: &Receiver<()
             tracing::error!(target: "blaze", "{said}");
             // logged: the event above
             eprintln!("{said}");
+            _ = flightrec::record(flightrec::Why::StopStalled, &said, flightrec::WINDOW);
             signals::exit_now(Exit::StopStalled);
         }
         let _wait = tracing::info_span!(target: "blaze", "watch the stop", awaits = "the daemon's stop to end").entered();
@@ -225,6 +227,7 @@ fn watch_turns(
             tracing::error!(target: "blaze", "{said}");
             // logged: the event above
             eprintln!("{said}");
+            _ = flightrec::record(flightrec::Why::LoopStalled, &said, flightrec::WINDOW);
             signals::exit_now(Exit::LoopStalled);
         }
         let _wait = tracing::info_span!(
@@ -445,6 +448,9 @@ fn passed(pid: u32, footprint: u64, ceiling: u64) -> ! {
     tracing::error!(target: "blaze", "{said}");
     // logged: the event above
     eprintln!("{said}");
+    // The recorder's last seconds only: the daemon is over its memory, and its workers go on
+    // taking more while this is written.
+    _ = flightrec::record(flightrec::Why::MemoryCeiling, &said, flightrec::WINDOW_AT_CEILING);
     signals::exit_now(Exit::MemoryCeiling);
 }
 

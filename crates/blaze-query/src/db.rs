@@ -18,7 +18,6 @@ mod budget;
 mod capture;
 mod counts;
 mod dense;
-pub mod edit_work;
 mod frontier;
 mod function;
 mod id;
@@ -41,7 +40,6 @@ mod verify;
 pub use capture::{
     Read, ReadKind, Reads, capture_reads, for_span_text, replay_reads, unshareable_reads,
 };
-pub use blaze_graph::par::{SMALL_ITEMS, SMALL_NS, Small};
 pub use counts::{Counts, take as take_counts};
 pub use frontier::{Changed, ChangedSetWork, Unknown as ChangedUnknown};
 pub use function::completed;
@@ -892,64 +890,6 @@ pub fn par_for_each(count: usize, task: impl Fn(usize) + Sync) {
     for at in again {
         task(at);
     }
-}
-
-/// [`par_for_each`], run on the calling thread alone where `small` predicts that the loop
-/// costs less than its dispatch ([`blaze_graph::par::Small`]: at most
-/// [`blaze_graph::par::SMALL_ITEMS`] tasks, predicted under a few milliseconds from this
-/// site's own small runs): no job is submitted, so nothing is stolen, no worker is woken and
-/// the caller does not park. What an edit's own chain goes through: the body check's tasks
-/// and the codegen walk's asks, each one to a few items that do not wait on each other. (The
-/// changed-set walk's levels keep their own bound, `frontier::PAR_AT`: a level's rows read
-/// each other, and are verified on the walker's thread below it.)
-///
-/// Why a task may run as a call here, where [`par_for_each`] runs each in a job. On the pool
-/// a task that asks for a key this caller runs gives way and is run again here, on this
-/// thread and outside the barrier, where it meets the cycle on its own stack; a task run
-/// here from the start is that second run without the first. As on the pool, a task that
-/// gives way ([`Cancelled::WouldWaitOnItself`]) runs once more after the others, in order,
-/// and a give-way of that run unwinds to the caller. Inside a query, what a task run here
-/// reads is recorded as its caller's read too: an edge more, never one less.
-///
-/// The result is the same wherever the tasks ran (rule deterministic-output): each runs
-/// once to its end, and nothing here orders what they make.
-pub fn par_for_each_small(
-    small: &blaze_graph::par::Small,
-    count: usize,
-    task: impl Fn(usize) + Sync,
-) {
-    if count == 0 {
-        return;
-    }
-    let here = small.here(count);
-    let began = std::time::Instant::now();
-    if here {
-        let task = |at: usize| {
-            task(at);
-            // As in [`par_for_each`]: an item that ran to its end is work ended.
-            function::complete_one();
-        };
-        // alloc: none unless a task gives way; then the few that did
-        let mut again: Vec<usize> = Vec::new();
-        for at in 0..count {
-            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(at)));
-            let Err(payload) = ran else { continue };
-            match payload.downcast_ref::<Cancelled>() {
-                Some(Cancelled::WouldWaitOnItself { .. }) => {
-                    again.push(at);
-                    // As the pool's loop: the next task is not the same ask again.
-                    blaze_graph::pump::rerun_later();
-                }
-                _ => std::panic::resume_unwind(payload),
-            }
-        }
-        for at in again {
-            task(at);
-        }
-    } else {
-        par_for_each(count, task);
-    }
-    small.ran(count, began.elapsed().as_nanos() as u64, here);
 }
 
 /// `f(at)` for each `at` in `0..count`, in order, run as [`par_for_each`] runs its tasks.

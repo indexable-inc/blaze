@@ -45,7 +45,9 @@ const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live 
                            [--match TEXT] [--cores [LINES]] [--html FILE] [--trace FILE] \
                            | blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE] \
                            | blaze debug locks [--build N] [--top N] [--json] \
-                           | blaze debug edits KIND [--file PATH] [--fn NAME[:LINE]] [--runs N] [--json] [-- BUILD ARGS]";
+                           | blaze debug edits KIND [--file PATH] [--fn NAME[:LINE]] [--runs N] [--json] [-- BUILD ARGS] \
+                           | blaze debug toolchain \
+                           | blaze debug inspect [--record] | blaze debug inspect --read FILE [--trace OUT]";
 const EXPLAIN_USAGE: &str =
     "blaze explain RULE | PACKAGE [--json] | memory [BUILD] [limit=N] [--json] | VIEW [NAME=VALUE ...] [--json]";
 const MEMORY_USAGE: &str = "blaze explain memory [BUILD] [limit=N] [--json]";
@@ -137,11 +139,134 @@ pub fn debug(words: Vec<OsString>, color: bool) -> i32 {
         Some("time") => time(words.collect()),
         Some("gate") => gate(words.collect()),
         Some("locks") => locks(words.collect()),
+        Some("inspect") => inspect(words.collect()),
+        Some("toolchain") => match words.next() {
+            None => toolchain(),
+            Some(word) => Err(Refusal::Usage(format!(
+                "blaze debug toolchain takes nothing, not `{}`",
+                word.to_string_lossy()
+            ))),
+        },
         // The edit loop as one command (`edits.rs`), which says its own usage and exit code.
         Some("edits") => return super::edits::main(words.collect(), color),
         _ => Err(Refusal::Usage(DEBUG_USAGE.to_owned())),
     };
     said(result, color)
+}
+
+/// `blaze debug inspect [--record]`: what the live daemon is doing, as one line of JSON
+/// (`crate::serve::inspect::Inspected`: each thread's spans and what it waits on, the plane's
+/// queued and running tasks, the lock and scheduler waits, memory, the longest waits first),
+/// asked of the daemon's inspect thread on its own socket, so it answers while every work
+/// thread is busy and while the loop is stuck. It starts no daemon. `--record` also has the
+/// daemon write a flight recording and names it (`recorded`).
+///
+/// `blaze debug inspect --read FILE [--trace OUT]`: a flight recording as one line of JSON
+/// (why it was written, what the daemon said, every thread's open spans), with its trace's
+/// length in place of the trace; `--trace OUT` writes the trace, a Chrome trace
+/// ui.perfetto.dev opens, to `OUT`. No daemon.
+fn inspect(words: Vec<OsString>) -> Result<(), Refusal> {
+    const USAGE: &str =
+        "blaze debug inspect [--record] | blaze debug inspect --read FILE [--trace OUT]";
+    let (mut record, mut read, mut trace) = (false, None, None);
+    let mut words = texts(words)?.into_iter();
+    while let Some(word) = words.next() {
+        let file = |words: &mut std::vec::IntoIter<String>| {
+            words.next().ok_or_else(|| Refusal::Usage(format!("{USAGE}: `{word}` takes a file")))
+        };
+        match word.as_str() {
+            "--record" => record = true,
+            "--read" => read = Some(file(&mut words)?),
+            "--trace" => trace = Some(file(&mut words)?),
+            _ => return Err(Refusal::Usage(format!("{USAGE}, not `{word}`"))),
+        }
+    }
+    match (read, trace, record) {
+        (Some(file), trace, false) => read_recording(Path::new(&file), trace.as_deref()),
+        (Some(_), _, true) => {
+            Err(Refusal::Usage(format!("{USAGE}: `--record` asks a daemon, `--read` reads a file")))
+        }
+        (None, Some(_), _) => {
+            Err(Refusal::Usage(format!("{USAGE}: `--trace` is of the recording `--read` names")))
+        }
+        (None, None, record) => inspect_daemon(record),
+    }
+}
+
+#[cfg(all(unix, feature = "native"))]
+fn inspect_daemon(record: bool) -> Result<(), Refusal> {
+    use crate::serve::inspect::{self, Answer, Asked};
+    let daemon = blaze_api::client::socket().map_err(|why| Refusal::Failed(why.to_string()))?;
+    let asked = Asked { record, schema: inspect::SCHEMA };
+    match inspect::ask(&inspect::socket_of(&daemon), asked).map_err(Refusal::Failed)? {
+        Answer::Inspected(inspected) => {
+            let text = serde_json::to_string(&inspected).map_err(|error| {
+                Refusal::Failed(format!("`blaze debug inspect`'s answer as JSON: {error}"))
+            })?;
+            println!("{text}");
+            Ok(())
+        }
+        Answer::Refused(why) => Err(Refusal::Failed(why)),
+    }
+}
+
+#[cfg(not(all(unix, feature = "native")))]
+fn inspect_daemon(_record: bool) -> Result<(), Refusal> {
+    Err(Refusal::Failed(
+        "`blaze debug inspect` asks a daemon over a Unix socket, and this blaze has none (it is \
+         not a Unix build with the `native` feature)"
+            .to_owned(),
+    ))
+}
+
+/// The flight recording `file` as one line of JSON, its trace's length in place of its bytes;
+/// the trace written to `trace` when given.
+fn read_recording(file: &Path, trace: Option<&str>) -> Result<(), Refusal> {
+    use crate::serve::flightrec::Recording;
+    let failed = |what: String| Refusal::Failed(format!("{}: {what}", file.display()));
+    let bytes = std::fs::read(file).map_err(|error| failed(format!("reading it: {error}")))?;
+    let mut recording = Recording::decode(&bytes).map_err(|refused| failed(refused.to_string()))?;
+    let bytes = std::mem::take(&mut recording.trace);
+    let Ok(Value::Object(mut said)) = serde_json::to_value(&recording) else {
+        return Err(failed("its recording is no JSON object".to_owned()));
+    };
+    said.remove("trace");
+    said.insert("trace_bytes".to_owned(), Value::from(bytes.len()));
+    if let Some(out) = trace {
+        std::fs::write(out, &bytes)
+            .map_err(|error| failed(format!("writing its trace to {out}: {error}")))?;
+        said.insert("trace_written".to_owned(), Value::String(out.to_owned()));
+    }
+    println!("{}", Value::Object(said));
+    Ok(())
+}
+
+/// `blaze debug toolchain`: the three code identities this blaze keys what it stores by, as
+/// one line of JSON, with no daemon: `built` as its build script worked them out, `keyed` as
+/// it keys (other than `built` only under `BLAZE_DEV_TOOLCHAIN_AS`, `assumed` then true), and
+/// `as`, the value of `BLAZE_DEV_TOOLCHAIN_AS` under which another blaze keys as this one does
+/// (`crate::serve::dev_toolchain`).
+fn toolchain() -> Result<(), Refusal> {
+    use crate::serve::dev_toolchain::{self, Codes};
+    let keyed = crate::serve::record_makers().map_err(Refusal::Failed)?;
+    let keyed =
+        Codes { codegen: keyed.codegen, front_end: keyed.front_end, record: keyed.record };
+    let dev = dev_toolchain::dev();
+    let built = dev.map_or(keyed, |it| it.built);
+    let codes = |it: Codes| {
+        let mut map = Map::new();
+        map.insert("codegen".to_owned(), Value::String(format!("{:x}", it.codegen)));
+        map.insert("front_end".to_owned(), Value::String(format!("{:x}", it.front_end)));
+        map.insert("record".to_owned(), Value::String(format!("{:x}", it.record)));
+        Value::Object(map)
+    };
+    let mut out = Map::new();
+    out.insert("as".to_owned(), Value::String(keyed.spelled()));
+    out.insert("assumed".to_owned(), Value::Bool(dev.is_some()));
+    out.insert("built".to_owned(), codes(built));
+    out.insert("keyed".to_owned(), codes(keyed));
+    println!("{}", Value::Object(out));
+    Ok(())
 }
 
 /// `blaze debug hot [--top N] [--last-build]`: the N keys (20) that took most time and each
@@ -865,33 +990,7 @@ fn explained(words: Vec<OsString>) -> Result<(), Refusal> {
     if name == "problems" && batches.iter().all(|it| it.num_rows() == 0) {
         return no_problems(&args, shape);
     }
-    // `edit_work` with no row is a build that counted nothing, or one that is not there:
-    // said, never an empty table that reads as "the edit cost nothing" (no-fallback).
-    if name == "edit_work" && batches.iter().all(|it| it.num_rows() == 0) {
-        return no_edit_work(&args);
-    }
     print(&batches, shape)
-}
-
-/// What `blaze explain edit_work` says when its view has no row: which build it read and
-/// why a build has none, as an error in either shape.
-fn no_edit_work(args: &Map<String, Value>) -> Result<(), Refusal> {
-    let build = match args.get("build").and_then(Value::as_u64) {
-        Some(build) => Some(build),
-        // The view's own default: the last build with a span.
-        None => number("SELECT max(build_id) AS build FROM spans")?,
-    };
-    Err(Refusal::Failed(match build {
-        Some(build) => format!(
-            "`blaze explain edit_work`: build {build} counted no work in any stage: no query ran, no \
-             unit was checked, compiled or linked and no dependency was keyed in it (a build answered \
-             again with nothing to do counts none), or it is not in this history; `build=N` reads \
-             another build"
-        ),
-        None => "`blaze explain edit_work`: this history has no build, so there is nothing to read: \
-                 run a build under this daemon first (`blaze status` names its state directory)"
-            .to_owned(),
-    }))
 }
 
 /// The last build of the history.
