@@ -158,7 +158,8 @@ impl Reason {
     }
 
     /// `` `name` ``.
-    const fn push_ty(&mut self, ty: TypeId) {
+    #[rustc_comptime]
+    fn push_ty(&mut self, ty: TypeId) {
         self.push("`");
         self.push(raw::name(ty));
         self.push("`");
@@ -243,7 +244,8 @@ impl Walk {
     }
 
     /// Adds every type argument of the holder at `at`.
-    const fn add_args(&mut self, at: usize, cell: usize) {
+    #[rustc_comptime]
+    fn add_args(&mut self, at: usize, cell: usize) {
         let ty = self.nodes[at].ty;
         let mut arg = 0;
         while arg < raw::args(ty) {
@@ -255,7 +257,8 @@ impl Walk {
     }
 
     /// Adds every field of every variant of the struct, enum or tuple at `at`.
-    const fn add_fields(&mut self, at: usize, cell: usize) {
+    #[rustc_comptime]
+    fn add_fields(&mut self, at: usize, cell: usize) {
         let ty = self.nodes[at].ty;
         let mut variant = 0;
         while variant < raw::variants(ty) {
@@ -271,7 +274,8 @@ impl Walk {
     /// The named steps from the start to the entry `at`, as `` `Owner.field` `` (an enum's as
     /// `` `Owner::Variant.field` ``), with the field's type when `typed`, joined by `, then `.
     /// Whether one was written.
-    const fn push_path(&self, out: &mut Reason, at: usize, typed: bool) -> bool {
+    #[rustc_comptime]
+    fn push_path(&self, out: &mut Reason, at: usize, typed: bool) -> bool {
         // The entries from the start to `at`: found backwards, written forwards.
         let mut chain = [NONE; NODES];
         let mut count = 0;
@@ -322,7 +326,8 @@ enum Holds {
     Shaped(Shape),
 }
 
-const fn holds(ty: TypeId) -> Holds {
+#[rustc_comptime]
+fn holds(ty: TypeId) -> Holds {
     if raw::implements(ty, raw::id::<dyn Owns<Nothing>>()) {
         Holds::Nothing
     } else if raw::implements(ty, raw::id::<dyn Owns<Mutably>>()) {
@@ -348,7 +353,8 @@ const fn unseen(shape: Shape) -> &'static str {
 }
 
 /// The answer to `ask` about the type `start`.
-pub const fn walk(start: TypeId, ask: &Ask) -> Verdict {
+#[rustc_comptime]
+pub fn walk(start: TypeId, ask: &Ask) -> Verdict {
     let mut walk = Walk::new(start);
     let mut at = 0;
     while at < walk.len {
@@ -363,7 +369,8 @@ pub const fn walk(start: TypeId, ask: &Ask) -> Verdict {
     Verdict::Clear
 }
 
-const fn too_large(start: TypeId) -> Reason {
+#[rustc_comptime]
+fn too_large(start: TypeId) -> Reason {
     let mut out = Reason::new();
     out.push("the walk from ");
     out.push_ty(start);
@@ -372,7 +379,8 @@ const fn too_large(start: TypeId) -> Reason {
 }
 
 /// Expands the entry `at`: adds what it holds, or gives the refusal it is.
-const fn visit(walk: &mut Walk, at: usize, start: TypeId, ask: &Ask) -> Option<Reason> {
+#[rustc_comptime]
+fn visit(walk: &mut Walk, at: usize, start: TypeId, ask: &Ask) -> Option<Reason> {
     let Node { ty, cell, .. } = walk.nodes[at];
     let found = match ask.find {
         Find::Cycle => false,
@@ -486,7 +494,8 @@ const fn visit(walk: &mut Walk, at: usize, start: TypeId, ask: &Ask) -> Option<R
 /// Whether a pointee of the counted pointer at `at`, which is behind a cell, leads back to
 /// `start` through anything it owns: the refusal naming the path, or `None`. A type on the way
 /// that is not seen into is a refusal too: it could.
-const fn leads_back(outer: &Walk, at: usize, start: TypeId) -> Option<Reason> {
+#[rustc_comptime]
+fn leads_back(outer: &Walk, at: usize, start: TypeId) -> Option<Reason> {
     let pointer = outer.nodes[at];
     let mut arg = 0;
     while arg < raw::args(pointer.ty) {
@@ -532,7 +541,8 @@ const fn leads_back(outer: &Walk, at: usize, start: TypeId) -> Option<Reason> {
 /// The refusal of a cycle: the path to the counted pointer at `at` of `outer`, the cell it
 /// is behind, and the path from its pointee back to `start` (the entry `end` of `back`), or
 /// to the type on it that is not seen into (`hidden`).
-const fn cycle(
+#[rustc_comptime]
+fn cycle(
     outer: &Walk,
     at: usize,
     back: &Walk,
@@ -573,14 +583,16 @@ const fn cycle(
 }
 
 /// The answer to the question `Q` about `T`.
-pub const fn reaches<T: ?Sized, Q: Question>() -> Verdict {
+#[rustc_comptime]
+pub fn reaches<T: ?Sized, Q: Question>() -> Verdict {
     walk(raw::id::<T>(), &Q::ASK)
 }
 
 /// `true` when nothing `Q` asks about is reachable from `T`; otherwise a panic whose message
 /// is the path. Written as a `where const { none::<T, Q>() }` condition: the bound that fails
 /// shows the message.
-pub const fn none<T: ?Sized, Q: Question>() -> bool {
+#[rustc_comptime]
+pub fn none<T: ?Sized, Q: Question>() -> bool {
     match reaches::<T, Q>() {
         Verdict::Clear => true,
         Verdict::Refused(reason) => refuse(reason.as_str()),

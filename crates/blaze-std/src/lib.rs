@@ -116,6 +116,7 @@
     generic_atomic,
     marker_trait_attr,
     register_tool,
+    rustc_attrs,
     type_info,
     unsize
 )]
@@ -124,7 +125,8 @@
     reason = "`core_intrinsics` for the one reflection intrinsic `own::raw` asks directly \
               (`type_id_vtable`, of an unsized type); `atomic_internals` for the bound of \
               `Atomic<T>` (`AtomicPrimitive`), which `own`'s one `Owns` impl for every atomic \
-              has to name"
+              has to name; `rustc_attrs` for `#[rustc_comptime]` on `own`'s walk, which calls \
+              reflection's compile-time-only functions and so is compile-time-only itself"
 )]
 #![register_tool(blaze)]
 
