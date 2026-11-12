@@ -1,6 +1,8 @@
+import type { Docs } from "../docs.ts";
 import { withHiddenPage, type Page } from "../cdp.ts";
 import { table, type Table } from "../table.ts";
-import { effect, oneLine } from "../effects.ts";
+import { effect } from "../effects.ts";
+import { oneLine } from "../disclose.ts";
 
 export type SearchResult = {
   title: string;
@@ -80,3 +82,13 @@ async function resolveInPage(page: Page, hrefs: string[]): Promise<Map<string, s
   }
   return found;
 }
+
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  googleSearch: {
+    area: "web",
+    sig: "googleSearch(query: string, opts?: { limit?: number = 10; hl?: string = 'en' }): Promise<Table<{ title; url; resolved: boolean; site; snippet }>>",
+    about: "Google search in a page of the harness browser (embedded Chromium the daemon runs; its card shows in the chat). url is the real link when resolved, else Google's /goto link (Google throttles resolving after ~2 per page); site is the displayed breadcrumb.",
+    example: "await googleSearch('bun spawn detached', { limit: 5 })",
+  },
+};

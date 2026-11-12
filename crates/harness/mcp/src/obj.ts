@@ -1,12 +1,15 @@
 // The object API: every agent PTY (s7), process run (r12) and run stage (r12.0) is an object with an
 // id, a name, a parent, append-only streams (read here straight from ~/.harness, or via sql) and RPC
 // through the daemon's one `rpc {id, method, args}` op (see crates/harness/harness/src/object.rs).
-import { checkShell, refusal } from "./shell-check.ts";
+import type { Docs } from "./docs.ts";
+import { HOME } from "./self.ts";
+import { checkShell, refusal } from "./shell-rule.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { req } from "./daemon.ts";
 import { sql } from "./sql.ts";
 import { table, type Table } from "./table.ts";
-import { effect, oneLine } from "./effects.ts";
+import { effect } from "./effects.ts";
+import { oneLine } from "./disclose.ts";
 import { messageRows, readLog, type Event, type Msg } from "./wire.ts";
 
 export type Kind = "claude" | "codex" | "cursor" | "shell" | "proc";
@@ -24,14 +27,13 @@ export type SpawnOpts = {
   parent?: string | Obj | null;
   /** proc: initial stdin text; the pipe stays open for .stdin() unless liveStdin: false. */
   stdin?: string; liveStdin?: boolean; cols?: number; rows?: number;
-  /** proc: why a command that only reads files or the tree needs the shell (else it is refused, shell-check.ts). */
+  /** proc: why a command that only reads files or the tree needs the shell (else it is refused, shell-rule.ts). */
   why?: string;
 };
 export type { Msg };
 export type SliceOpts = { from?: number; to?: number; tail?: number; new?: boolean; cursor?: string };
 export type WaitOpts = { status?: string; match?: string | RegExp; timeoutMs?: number };
 
-const HOME = () => process.env.HARNESS_HOME ?? `${process.env.HOME}/.harness`;
 const AGENTS = new Set(["claude", "codex", "cursor"]);
 const selfSession = () => (process.env.HARNESS_SESSION ? `s${process.env.HARNESS_SESSION}` : null);
 const read = (p: string) => (existsSync(p) ? readFileSync(p, "utf8") : "");
@@ -322,3 +324,30 @@ export async function tree(root?: string | Obj, f: ObjFilter = {}): Promise<Tabl
   for (const o of start) walk(o, 0);
   return table(out);
 }
+
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  spawn: {
+    area: "agents",
+    sig: "spawn(kind: 'claude'|'codex'|'cursor'|'shell'|'proc', { name?, model?, effort?, prompt?, cmd? (proc), cwd?, env?, args?, parent? = this agent, stdin? }): Promise<Obj>",
+    about: "start a child object, or get the running one holding that name. A claude/codex/cursor sub agent must give name, model and (when the model lists efforts) effort, never --model/--effort in args; nothing is defaulted; which to pick: skill('agents'). Obj (every agent, proc, stage is one): fields id ('s7' | 'r12' | 'r12.0'), kind, name, parent, status, exitCode; send(method, args) = RPC; prompt(text); reply(timeoutMs? = 600000): Promise<string> = waits for the turn to finish and returns its last assistant message (claude/codex; the round trip: `const a = await spawn('claude', { name: 'x', model: 'claude-opus-5-5', effort: 'high', prompt: '...' }); await a.reply(); await a.prompt('more'); await a.reply()`); input(bytes); stdin(text), closeStdin() (proc stdin stays open until closed); interrupt() (agents Esc, shell ^C, proc SIGINT); signal(sig); kill(); resize(cols, rows); wait(pred | { status?, match?: string|RegExp, timeoutMs? }) (no arg: until it stops); refresh(). Sync reads: .stdout / .stderr (proc: what its caller sees; a stage: its own) / .pty (escapes stripped) / read(stream, { from?, to?, tail?, new? }) / .messages: Table<{ n, role, kind: text|thinking|tool_call|tool_result|turn_end, tool, text, ts_ms }>. Async: screen(), events({ stream?, since?, tail? }): Table of stored lines, children().",
+    example: "const a = await spawn('claude', { name: 'x', model: 'claude-opus-5-5', effort: 'high', prompt: '...' }); await a.reply()",
+    throws: "Error naming what is missing (name, model, effort) for an agent; the daemon's error otherwise.",
+  },
+  obj: {
+    area: "agents",
+    sig: "obj(idOrName): Promise<Obj>",
+    about: "handle on any object, live or past: 's7', 'r12', 'r12.0', or a name.",
+  },
+  objects: {
+    area: "agents",
+    sig: "objects({ kind?, parent?, status?, name?, live?, all? (stages and REPL cells too), limit? = 200 }): Promise<Table<{ id; kind; name; parent; status; exit_code; cmd; cwd; created; ended_ms }>>",
+    about: "every object, live and past, newest first. tree(root?, filter?): the same as an indented tree (me marks this agent).",
+    example: "await objects({ live: true })",
+  },
+  tree: {
+    area: "agents",
+    sig: "tree(root?, filter?)",
+    about: "see objects.",
+  },
+};

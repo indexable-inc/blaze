@@ -4,6 +4,7 @@
 // (JSON [{ name, description, source, path }]), so the index the agent reads and what skill() serves are one list.
 // skill(name) reads the file when asked (an edit shows at the next read) and returns its body, the front matter cut;
 // the person sees it as one quiet step, "Read skill github".
+import type { Docs } from "./docs.ts";
 import { dirname } from "node:path";
 import { bytes, effect } from "./effects.ts";
 import { table, type Table } from "./table.ts";
@@ -58,7 +59,17 @@ export async function skill(name: string): Promise<string> {
     (text) => ({ detail: bytes(Buffer.byteLength(text)) }));
 }
 
-export const skillDocs = {
-  skill: "skill(name): Promise<string> — the full instructions of one skill, from the index at the end of your system note (read it before the work it covers); the person sees a quiet \"Read skill name\" step, not the text.",
-  skills: "skills(): Table<{ name; description; source: harness|user|project; path }> — every skill you can load, by name.",
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  skill: {
+    area: "cells",
+    sig: "skill(name): Promise<string>",
+    about: "the full instructions of one skill, from the index at the end of your system note (read it before the work it covers); the person sees a quiet \"Read skill name\" step, not the text.",
+    throws: "Error listing the skills there are when the name is not one.",
+  },
+  skills: {
+    area: "cells",
+    sig: "skills(): Table<{ name; description; source: harness|user|project; path }>",
+    about: "every skill you can load, by name.",
+  },
 };

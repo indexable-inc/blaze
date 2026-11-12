@@ -3,6 +3,7 @@
 // pasteboard, appearance, orientation, simulated location, files in an app's container, installing a build.
 // devicectl's `--json-output -` is its stable interface, so every call returns its `result`, and `phone.ctl(...)`
 // reaches any command not wrapped here. There is no touch input in Core Device: nothing here taps or types.
+import type { Docs } from "./docs.ts";
 import { join } from "node:path";
 import { effect } from "./effects.ts";
 import { table, type Table } from "./table.ts";
@@ -158,7 +159,12 @@ export const phone = {
     effect("write", "Installing an app on the device", "Installed an app on the device", path, async () => ctl(["device", "install", "app", ...(await dev(o)), path], { timeoutS: 600 })),
 };
 
-export const phoneDocs = {
-  phone:
-    "phone.* — an iPhone, iPad or Watch with Developer Mode on, through Xcode's devicectl: devices(): Table<{ name; model; os; id; state: connected|disconnected; paired; developerMode }>; screenshot(): path of a PNG of its screen now (show it: render(svelte`<Image src={p} />`, { p })); record(seconds): an MP4; apps(), processes(): Tables; launch(bundleId, { args?, env?, terminateExisting? }); terminate(pid); openURL(url) (a page in Safari, or an app link like maps://); pasteboard.copy(text) / paste(); appearance('dark'|'light'); orientation(...); location(lat, lon) / location(null); install(path); info(); lockState(); ctl(...args) for any other devicectl command (its JSON result). Calls take { device } when more than one is connected (or phone.use(name)). It cannot tap, swipe or type: Core Device has no touch input; drive an app through its URLs, launch arguments and pasteboard.",
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  phone: {
+    area: "device",
+    sig: "phone.*",
+    about: "an iPhone, iPad or Watch with Developer Mode on, through Xcode's devicectl: devices(): Table<{ name; model; os; id; state: connected|disconnected; paired; developerMode }>; screenshot(): path of a PNG of its screen now (show it: render(svelte`<Image src={p} />`, { p })); record(seconds): an MP4; apps(), processes(): Tables; launch(bundleId, { args?, env?, terminateExisting? }); terminate(pid); openURL(url) (a page in Safari, or an app link like maps://); pasteboard.copy(text) / paste(); appearance('dark'|'light'); orientation(...); location(lat, lon) / location(null); install(path); info(); lockState(); ctl(...args) for any other devicectl command (its JSON result). Calls take { device } when more than one is connected (or phone.use(name)). It cannot tap, swipe or type: Core Device has no touch input; drive an app through its URLs, launch arguments and pasteboard.",
+    throws: "PhoneError with devicectl's own message.",
+  },
 };

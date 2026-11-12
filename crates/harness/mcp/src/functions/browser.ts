@@ -1,6 +1,7 @@
 // `browser.*`: the harness browser (embedded Chromium the daemon runs, crates/harness/harness-browser) as a cell uses it
 // directly. googleSearch, gmail and withHiddenPage drive it too; these are for a page the person should see, and for
 // what the browser holds.
+import type { Docs } from "../docs.ts";
 import { host, newPage, withHiddenPage, type Extension, type Fix, type Page, type Place, type ViewInfo } from "../cdp.ts";
 import { pmap } from "../pmap.ts";
 import { currentTask, type Task } from "../tasks.ts";
@@ -124,3 +125,25 @@ export function location(): Promise<Fix & { at: string; maps: string }> {
   }, (f) => ({ detail: `${f.latitude.toFixed(4)}, ${f.longitude.toFixed(4)} (within ${Math.round(f.accuracy_m)} m)` }));
 }
 
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  browser: {
+    area: "web",
+    sig: "browser.*",
+    about: "the harness browser (embedded Chromium the daemon runs; the person sees it in the browser pane, cmd+shift+B). read(url | urls[], { maxChars? }): Table<{ url; title; text; error }> = the words of every page (innerText once settled), each in a hidden view, six at a time: to read several pages (search results, reviews, docs) make ONE read call, never a loop of goto and sleeps over one page. open(url): Promise<Page> opens url in a view that stays open, loaded or after 20 s still loading; the chat shows one line for it that the person presses to see it in the browser pane (it does not open by itself, so never say a page 'is open in the browser pane': say they can press it); to put a page in the transcript itself draw <Browser view={page.view} /> or <Browser src=\"https://…\" />. views(): Table<{ view; target; url; title; loading; can_back; can_forward; owner; size; scale }>. extensions(): Table<{ id; name; version; enabled; popup; source: store|unpacked; path }>. manage(url? = 'chrome://extensions'): opens the manage window (a full Chrome-style window: install from the Chrome Web Store there). When the browser cannot start, every call throws CdpUnavailable naming why (no other browser is tried).",
+    example: "await browser.read(['https://bun.com/docs', 'https://example.com'])",
+    throws: "CdpUnavailable naming why the harness browser cannot start (no other browser is tried).",
+  },
+  location: {
+    area: "web",
+    sig: "location(): Promise<{ latitude; longitude; accuracy_m; altitude_m?; at_ms; at; maps }>",
+    about: "where this Mac (so the person) is now, from macOS Location Services through the harness browser's host; the first call makes macOS ask the person. Use it for anything 'near me'; it throws, saying why, when Location Services is off or refused (do not guess from IP or timezone instead: say so).",
+    throws: "Error saying why when Location Services is off or refused.",
+  },
+  places: {
+    area: "web",
+    sig: "places(query, { near?: { latitude, longitude } | [lat, lon] = location(), radius_m? = 5000, limit? = 20, map? = true }): Table<{ id; name; address; phone; url; category; latitude; longitude; distance_m; maps }>",
+    about: "what Apple Maps finds for query ('coffee', 'convenience store', a name) near the person, nearest first, AND it draws them on Apple's map under the cell by itself (each pin shows Apple's own card of the place when pressed: pictures, hours, rating): the person already sees the places, so the answer to 'closest X' / 'X near me' is ONE cell, `(await places('convenience store')).select('name', 'distance_m', 'category').head(6)` (several kinds: Promise.all, they share one map), then one or two sentences naming your pick; never a list of links, never a second cell to draw the map, never a search page or map API scraped for a list of places. Apple's servers can take 10 to 20 s on a slow network: one call, no retries. What Maps does not know (stock, outlets, wifi) say you could not check, or read the places' own pages with browser.read if the person asked for that.",
+    example: "(await places('coffee')).select('name', 'distance_m').head(6)",
+  },
+};

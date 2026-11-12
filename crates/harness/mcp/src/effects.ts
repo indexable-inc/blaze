@@ -20,9 +20,12 @@
 // (Bun.connect, the harness browser's socket behind withHiddenPage; a cell's page.goto and browser.open are steps), node:fs's callback forms and its other functions (stat,
 // readdir, streams), fs calls made by packages a cell imports (they get the real builtin), Bun.file's stream() and
 // slices, and anything a native addon does. The harness's own requests to harnessd are not effects either.
+import type { Docs } from "./docs.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { currentTask, type Task } from "./tasks.ts";
 import { brief, shown, type Shown, type ShownKind } from "./shown.ts";
+import { abortable, killGroup, own, signal } from "./cancel.ts";
+import { oneLine } from "./disclose.ts";
 
 /** `list`: a directory listing or file walk (ls, glob, du); `build`: a build, lint or test followed to a digest (follow,
  *  cargo.*); `wait`: waiting for another cell (wait), its value the value that cell gave; `skill`: a skill's instructions
@@ -101,9 +104,10 @@ export async function effect<T>(
   after: (r: T) => { ok?: boolean; detail?: string; show?: unknown; kind?: ShownKind } = () => ({}),
 ): Promise<T> {
   const s = step(kind, doing, done, target);
-  if (!s) return fn();
+  // Stopping the cell ends the wait at once, whether or not what is waited on can be stopped (cancel.ts).
+  if (!s) return abortable(fn());
   try {
-    const r = await quiet(fn);
+    const r = await abortable(quiet(fn));
     const a = after(r);
     s.end(a.ok ?? true, a.detail ?? "", r, a.show, a.kind);
     return r;
@@ -133,22 +137,12 @@ export function progress(done: number, total: number, what = "Working"): void {
   if (at >= Math.round(total)) s.end(true, `${at}/${Math.round(total)}`);
 }
 
-export const progressDocs = {
-  progress:
-    "progress(done, total, what? = 'Working'): void — say how far along this cell's own long work is (files, rows, pages); the person's work bar fills to that share and says about how long is left. Call it as the work moves: `for (const [i, f] of files.entries()) { progress(i, files.length, 'Converting'); await convert(f) }`.",
-};
 
 /** Bytes for a step's detail: "812 B", "3.2 KB", "1.4 MB". */
 export function bytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1 << 20) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / (1 << 20)).toFixed(1)} MB`;
-}
-
-/** A command or text as one short line, for a step's words. */
-export function oneLine(s: string, n = 80): string {
-  const one = s.replace(/\s+/g, " ").trim();
-  return one.length > n ? one.slice(0, n - 1) + "…" : one;
 }
 
 /** A path as a step names it: relative to the working directory when under it. */
@@ -171,7 +165,10 @@ export function install() {
     const url = input instanceof Request ? input.url : String(input);
     let host = url;
     try { host = new URL(url).host || url; } catch {}
-    return effect("net", `Fetching ${host}`, `Fetched ${host}`, url, () => realFetch(input, init), (r: Response) => {
+    // The cell's signal joins the caller's, so a stopped cell's request is dropped, not just no longer awaited.
+    const signals = [init?.signal ?? (input instanceof Request ? input.signal : undefined), signal()].filter((s): s is AbortSignal => s != null);
+    const withSignal = signals.length ? { ...init, signal: signals.length === 1 ? signals[0] : AbortSignal.any(signals) } : init;
+    return effect("net", `Fetching ${host}`, `Fetched ${host}`, url, () => realFetch(input, withSignal), (r: Response) => {
       const len = r.headers.get("content-length");
       return { ok: r.ok, detail: `${r.status}${len ? ` · ${bytes(Number(len))}` : ""}` };
     });
@@ -202,11 +199,23 @@ export function install() {
     const cmd = Array.isArray(a) ? a : (a as { cmd?: string[] })?.cmd ?? [];
     return oneLine(cmd.join(" "));
   };
-  const realSpawn = Bun.spawn;
+  // A cell's sleep ends when the cell is stopped.
+  const realSleep = Bun.sleep;
+  Bun.sleep = ((ms: number | Date) => abortable(realSleep(ms))) as typeof Bun.sleep;
+
+  const realSpawn = Bun.spawn as (...a: unknown[]) => Bun.Subprocess;
   Bun.spawn = ((...args: unknown[]) => {
     const cmd = argvOf(args[0]);
     const s = step("exec", `Running ${cmd}`, `Ran ${cmd}`, cmd);
-    const sub = (s ? quiet(() => (realSpawn as (...a: unknown[]) => Bun.Subprocess)(...args)) : (realSpawn as (...a: unknown[]) => Bun.Subprocess)(...args));
+    // Inside a cell a child leads its own process group (`detached`) unless the caller said otherwise, and the cell
+    // owns it: stopping the cell kills it with everything it started (cancel.ts).
+    const mine = currentTask() !== undefined;
+    const at = Array.isArray(args[0]) ? 1 : 0;
+    const given = (args[at] ?? {}) as { detached?: boolean };
+    const leads = given.detached ?? mine;
+    if (mine && given.detached === undefined) args[at] = { ...given, detached: true };
+    const sub = s ? quiet(() => realSpawn(...args)) : realSpawn(...args);
+    if (mine) own({ what: `pid ${sub.pid} (${cmd})`, exited: sub.exited, kill: (hard) => (leads ? killGroup(sub.pid, hard ? "SIGKILL" : "SIGTERM") : void sub.kill(hard ? "SIGKILL" : "SIGTERM")) });
     s && sub.exited.then((code) => s.end(code === 0, `exit ${code}`), (e) => s.end(false, String(e)));
     return sub;
   }) as typeof Bun.spawn;
@@ -277,3 +286,12 @@ export async function fsFor(spec: string): Promise<Record<string, unknown> | und
   fsMod ??= (() => { const m = wrap(real, SYNC); m.promises = fspMod; m.default = m; return m; })();
   return name === "fs" ? fsMod : fspMod;
 }
+
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  progress: {
+    area: "cells",
+    sig: "progress(done, total, what? = 'Working'): void",
+    about: "say how far along this cell's own long work is (files, rows, pages); the person's work bar fills to that share and says about how long is left. Call it as the work moves: `for (const [i, f] of files.entries()) { progress(i, files.length, 'Converting'); await convert(f) }`.",
+  },
+};

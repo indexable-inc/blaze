@@ -9,8 +9,10 @@
 //
 // Plain fetch to api.github.com, not octokit: one POST per query is all @octokit/graphql would do, and the kernel's
 // own code takes no package from the cell package cache (packages.ts).
+import type { Docs } from "../docs.ts";
 import { table, type Table } from "../table.ts";
-import { effect, oneLine, quiet } from "../effects.ts";
+import { effect, quiet } from "../effects.ts";
+import { oneLine } from "../disclose.ts";
 
 export class GithubError extends Error { override name = "GithubError"; }
 
@@ -316,3 +318,14 @@ export function makeGithub(deps: GithubDeps) {
 
 /** github.* as cells get it: gh's token, the kernel's fetch. */
 export const github = makeGithub({ fetch: (url, init) => fetch(url, init), token: ghToken() });
+
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  github: {
+    area: "services",
+    sig: "github.*",
+    about: "GitHub with gh's token, never `gh api` in a shell: graphql<T>(query, vars?): Promise<T> (data, typed by you); prs({ repo: 'owner/name', state?: open|closed|merged|all = open, author?, limit? = 30 }): Table<{ number; title; state; draft; author; ci: success|failure|pending|error|null; mergeable; review: approved|changes_requested|review_required|null; head; base; created; updated; url }>; pr({ repo, n }): that row plus body, sha, files, checks, comments, reviews (Tables); issues({ repo, state?, author?, assignee?, labels?, limit? }): Table<{ number; title; state; author; labels; assignees; comments; created; updated; url }>; checks({ repo, ref }): Table<{ name; workflow; status; conclusion; url; started; completed }>; rest(path, { method?, body? }) for what GraphQL lacks (Actions logs). await skill('github') first.",
+    example: "await github.prs({ repo: 'owner/name', state: 'open' })",
+    throws: "GithubError naming the call and GitHub's status and message.",
+  },
+};

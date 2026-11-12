@@ -1,6 +1,7 @@
 // gitLog(): a repository's history as a LazyTable, one row per commit with the files it changed as a list column. Ported
 // from den's repl (den/repl/src/git-log.ts). It reads `git log --numstat` and is recorded as one "search" step
 // ("Reading git log", then "Read git log · 42 commits"), not as the git process it runs.
+import type { Docs } from "./docs.ts";
 import { resolve } from "node:path";
 import { effect, quiet } from "./effects.ts";
 import { scanTable, type LazyTable } from "./table.ts";
@@ -108,3 +109,13 @@ export function gitLog(options: GitLogOptions = {}): LazyTable<CommitRow> {
     },
   });
 }
+
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  gitLog: {
+    area: "search",
+    sig: "gitLog({ cwd?, ref?, path?: string | string[], since?: '1 month ago', until?, author?, merges? = false, limit? }): LazyTable<{ hash; author; email; date: ms; subject; files: string[]; added; deleted }>",
+    about: "commits newest first, chainable before await (a head right after becomes --max-count): gitLog({ since: '1 month ago' }).explode('files').groupBy('author').agg(col('files').nUnique().alias('files')).",
+    example: "await gitLog({ since: '1 week ago' }).select('hash', 'subject').head(10)",
+  },
+};

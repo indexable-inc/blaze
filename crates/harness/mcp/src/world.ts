@@ -2,6 +2,7 @@
 // harness-native/src/world_api.rs) to query and edit the world it is drawn from: entities and their components as
 // flecs serializes them, the scene's tokens (the theme), flecs script. One request a connection in harness's frames:
 // `{schema, call}` in CBOR, answered `{ok}` or `{error}`.
+import type { Docs } from "./docs.ts";
 import { dirname, join } from "node:path";
 import { decode, encode } from "./cbor.ts";
 import { SOCK } from "./daemon.ts";
@@ -84,7 +85,12 @@ export const world = {
   forget: (index?: number): Promise<{ left: number }> => ask({ op: "forget", index }),
 };
 
-export const worldDocs = {
-  world:
-    "world.* — the harness app's own flecs world, live. When he asks to change how this app looks (\"make the theme like my Ghostty\", \"warmer\", \"bigger text\", a colour, a corner), do it HERE, at once, with no build: never by editing .flecs scene or token files in a repository. Its look and layout are entities, components and scene tokens. token(name) reads a scene token and token(name, value) writes it, everything made from it following (`await world.token('tone_accent', { dark: { r: 0.9, g: 0.5, b: 0.2 } })`); query(flecsQuery): Table<{ entity; values }>; get(path) is one entity whole; set(path, component, value) writes the members named; script(code) runs flecs script; schema(component?) is the types; saved() and forget(i?) are the edits kept across launches (token and set are kept unless { save: false }). await skill('world') first.",
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  world: {
+    area: "ui",
+    sig: "world.*",
+    about: "the harness app's own flecs world, live. When he asks to change how this app looks (\"make the theme like my Ghostty\", \"warmer\", \"bigger text\", a colour, a corner), do it HERE, at once, with no build: never by editing .flecs scene or token files in a repository. Its look and layout are entities, components and scene tokens. token(name) reads a scene token and token(name, value) writes it, everything made from it following (`await world.token('tone_accent', { dark: { r: 0.9, g: 0.5, b: 0.2 } })`); query(flecsQuery): Table<{ entity; values }>; get(path) is one entity whole; set(path, component, value) writes the members named; script(code) runs flecs script; schema(component?) is the types; saved() and forget(i?) are the edits kept across launches (token and set are kept unless { save: false }). await skill('world') first.",
+    example: "await world.token('tone_accent', { dark: { r: 0.9, g: 0.5, b: 0.2 } })",
+  },
 };

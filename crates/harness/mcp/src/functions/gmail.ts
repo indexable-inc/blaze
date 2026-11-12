@@ -23,17 +23,19 @@
 //
 // The array positions below were read off live traffic (2026-11-05); when Gmail moves them, the error names the
 // endpoint and what was missing.
+import type { Docs } from "../docs.ts";
+import { HOME } from "../self.ts";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { external, newPage, type Page } from "../cdp.ts";
 import { table, type Table } from "../table.ts";
-import { effect, oneLine } from "../effects.ts";
+import { effect } from "../effects.ts";
+import { oneLine } from "../disclose.ts";
 import { canConfirm, confirm } from "../host.ts";
 
 const ACCOUNT = 0;
 const ORIGIN = "https://mail.google.com";
 const SYNC = `/sync/u/${ACCOUNT}/i`;
-const HOME = () => process.env.HARNESS_HOME ?? `${process.env.HOME}/.harness`;
 
 /** A thread as a search lists it. */
 export type GmailThread = {
@@ -956,3 +958,13 @@ function markRead(targets: Target | Target[], read = true) {
 }
 
 export const gmail = { search, messages, read, labels, attachment, send, draft, deleteDraft, reply, forward, archive, trash, label, markRead, via: via_ };
+
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  gmail: {
+    area: "services",
+    sig: "gmail.*",
+    about: "Andrew's Gmail through the harness browser's profile (he signs in once in the browser pane, cmd+shift+B): search, messages, read, labels, attachment, send, reply, forward, draft, archive, trash, label, markRead, via; await skill('gmail') for every call's arguments and rows before using it.",
+    throws: "GmailError naming the endpoint and its status.",
+  },
+};

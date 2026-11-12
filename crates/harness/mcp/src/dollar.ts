@@ -1,8 +1,9 @@
 // `$` template tag over sh(): `` await $`git status` `` resolves to { stdout, stderr, exitCode, ok, text(), lines(), json() }.
 // Modelled on den's `$` (repl/src/shell.ts). Interpolations are shell-quoted words; `$.raw(text)` splices unquoted.
-// A command that only reads files or the tree is refused before it starts (src/shell-check.ts) unless it says why.
+// A command that only reads files or the tree is refused before it starts (src/shell-rule.ts) unless it says why.
+import type { Docs } from "./docs.ts";
 import { sh } from "./proc.ts";
-import { checkShell, initShellCheck } from "./shell-check.ts";
+import { checkShell } from "./shell-rule.ts";
 
 /** Text spliced into a `$` command as written, not quoted. */
 export class Raw { constructor(readonly text: string) {} }
@@ -21,7 +22,7 @@ function textOf(strings: TemplateStringsArray, values: unknown[]): string {
   return text;
 }
 
-/** Throws the refusal when `cmd` only reads files or the tree and no reason was given. Needs `await initShellCheck()` first. */
+/** Throws the refusal when `cmd` only reads files or the tree and no reason was given. */
 export function checked(cmd: string, why?: string): void {
   const verdict = checkShell(cmd, why);
   if (!verdict.ok) throw new Error(verdict.message);
@@ -69,8 +70,7 @@ export class ShellCommand implements PromiseLike<ShellOutput> {
 
   async #run(): Promise<ShellOutput> {
     this.#started = true;
-    await initShellCheck();
-    // sh() refuses a read-only command (shell-check.ts) unless the reason given with .why() lets it run.
+    // sh() refuses a read-only command (shell-rule.ts) unless the reason given with .why() lets it run.
     const r = await sh(this.cmd, { cwd: this.#cwd, env: this.#env, stdin: this.#stdin, timeoutMs: this.#timeoutMs, why: this.#why });
     const output = new ShellOutput(r.stdout, r.stderr, r.exit_code, r.signal);
     if (!output.ok && !this.#nothrow) throw new ShellError(this.cmd, output);
@@ -111,3 +111,14 @@ export const $: Dollar = Object.assign(
   (strings: TemplateStringsArray, ...values: unknown[]) => new ShellCommand(textOf(strings, values)),
   { raw: (text: string) => new Raw(text) },
 );
+
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  "$": {
+    area: "shell",
+    sig: "$`cmd ${arg}`: thenable of { stdout, stderr, exitCode, ok, text(), lines(), json() }",
+    about: "runs a program through sh(); each ${value} is one quoted word (arrays several), $.raw(s) unquoted. Chain before awaiting: .nothrow(), .cwd(dir), .env(vars), .timeout(ms), .stdin(data), .why(reason). A non-zero exit throws with the stderr tail. `await $`git log --oneline -5`.lines()`.",
+    example: "await $`git log --oneline -5`.lines()",
+    throws: "ShellError (exit code, stderr tail) on a non-zero exit unless .nothrow(); the 'Not run: ...' refusal as sh.",
+  },
+};
