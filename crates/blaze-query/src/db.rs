@@ -799,9 +799,7 @@ impl Cycle<'_> {
         self.id
     }
 
-    /// The round of the cycle's outermost head, from 1: every head the cycle keeps from one
-    /// round to the next is told that round, however deep it is nested, and a row new to the
-    /// cycle is told its head's.
+    /// The round, from 1.
     pub fn iteration(&self) -> u32 {
         self.iteration
     }

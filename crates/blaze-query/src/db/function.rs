@@ -768,14 +768,6 @@ pub(crate) mod probe {
         pub(crate) static BEFORE_FLIGHT: Cell<Option<fn(u32, Id)>> = const { Cell::new(None) };
         /// The planted bug: this thread runs a stale head of a cycle that is another task's.
         pub(crate) static FOREIGN_STALE_RUNS: Cell<bool> = const { Cell::new(false) };
-        /// The planted bug: on this thread a head that ends a member of a lower cycle keeps to
-        /// itself that a row above it moved this round, so the outermost head never hears of
-        /// it ([`super::participate`], `tests/inner_heads.rs`).
-        pub(crate) static INNER_HEADS_FORGET: Cell<bool> = const { Cell::new(false) };
-        /// The planted bug: on this thread a head kept from a cycle's last round starts its
-        /// frame at round 1 again, so its `cycle_recover` is told 1 in every round
-        /// ([`super::run`], `tests/inner_heads.rs`).
-        pub(crate) static KEPT_HEADS_START_AGAIN: Cell<bool> = const { Cell::new(false) };
     }
 }
 
@@ -1035,12 +1027,9 @@ fn run<F: Function>(
     let id = key.as_id();
     let node = node_of(storage, index, id, header);
     let mut word = header.verified.load(Ordering::Acquire);
-    // The node of the head that kept this row from its cycle's last round, 0 when none did.
-    let mut keeper = 0;
     if word & RUNNING == 0 {
         let meta = header.meta.load(Ordering::Relaxed);
         if meta & STALE != 0 {
-            keeper = header.extra.load(Ordering::Relaxed) as u32;
             header.meta.store(meta & !STALE, Ordering::Relaxed);
         }
         if header
@@ -1059,23 +1048,6 @@ fn run<F: Function>(
     let at = frame.unwrap_or_else(|| {
         local::with(|local| local.push(Frame::new(storage, FrameKind::Run, node, index, id)))
     });
-    // The planted bug (`tests/inner_heads.rs`): a kept head counts its rounds from 1 again.
-    #[cfg(test)]
-    if probe::KEPT_HEADS_START_AGAIN.with(Cell::get) {
-        keeper = 0;
-    }
-    if keeper != 0 {
-        // A head kept from the last round of a lower head's cycle runs again as part of that
-        // head's round: its frame is new, but the round is not its first. It starts at its
-        // keeper's, so its `cycle_recover` and its members' are told the cycle's round
-        // ([`participate`]), not 1 in every round. The keeper's run is on this stack
-        // ([`claimed`] runs a stale row nowhere else).
-        local::with(|local| {
-            if let Some(below) = local.find(storage, keeper) {
-                local.frames[at as usize].round = local.frames[below as usize].round;
-            }
-        });
-    }
     let mut running = Running { storage, header, word, at, index, id, armed: true };
     storage.event(|| EventKind::WillExecute { database_key: DatabaseKeyIndex::new(index, id) });
     counts::count(index, counts::EXECUTED);
@@ -1265,22 +1237,10 @@ fn participate<F: Function>(
     let header = row.header;
     let id = key.as_id();
     let head = local::with(|local| local.frames[done.head as usize].node);
-    // The planted bug (`tests/inner_heads.rs`): what the rows above this one told it of the
-    // round stops at its frame, as it did when each told only the frame of its own head.
-    #[cfg(test)]
-    if probe::INNER_HEADS_FORGET.with(Cell::get) {
-        local::with(|local| local.frames[at as usize].unconverged = false);
-    }
     let value = match (F::CYCLE, done.reentered) {
         (CycleKind::Result, _) => blaze_mem::frame::task(F::TAG, |_| F::cycle_result(db, id, key)),
         (CycleKind::Fixpoint, true) => {
-            // The cycle's round as far as this row knows it: its head's, or its own where that
-            // is later (a head kept from an earlier round, read again under a head that is new
-            // this round). A kept head's frame starts at its keeper's round ([`run`]), so the
-            // outermost head's round reaches every row its cycle kept, however deep.
-            let round = local::with(|local| {
-                local.frames[at as usize].round.max(local.frames[done.head as usize].round)
-            });
+            let round = local::with(|local| local.frames[done.head as usize].round);
             let heads = heads_of(storage, done.members, id);
             let cycle = Cycle { heads: &heads, id, iteration: round };
             // SAFETY: the row's provisional value, this task's own (rule 4).
@@ -1288,11 +1248,7 @@ fn participate<F: Function>(
             let value =
                 blaze_mem::frame::task(F::TAG, |_| F::cycle_recover(db, &cycle, last, new, key));
             if !F::equal(last, &value) {
-                // A run above read `last` from this row on the stack, and the row ends the
-                // round with another value: the round is not the cycle's last. Said on this
-                // row's own frame; `hand_over` takes it to the head with the rest it carries,
-                // and each head that ends a member hands it on in turn, down to the outermost.
-                local::with(|local| local.frames[at as usize].unconverged = true);
+                local::with(|local| local.frames[done.head as usize].unconverged = true);
             }
             value
         }
@@ -1535,12 +1491,7 @@ struct Converged {
 /// Hands what the run at `at` read outside its cycle, now that it ended a member of the cycle
 /// headed at `head` (below it), on toward the head:
 ///
-/// - what it carries (durability, an untracked read, replayed summaries) to the head's frame,
-///   and whether the round is unconverged: a row of the cycle, this one or one that handed to
-///   it, was read on the stack and ended the round with another value. This is the one place a
-///   frame's word reaches its head's, so a head that ends a member of a lower cycle hands on
-///   all it was told, and the outermost head, alone the one that decides ([`head_round`]),
-///   hears of every row of its cycle;
+/// - what it carries (durability, an untracked read, replayed summaries) to the head's frame;
 /// - its reads in read order: an inner head's earlier rounds' first, then its own run's (which
 ///   hold what the runs below it handed it, at their places), then what it was handed while it
 ///   ran and could not place;
@@ -1563,8 +1514,6 @@ fn hand_over(storage: &Storage, local: &mut local::Local, at: u32, head: u32) {
     let durability = frame.durability.min(frame.cycle.durability);
     let untracked = frame.untracked | frame.cycle.untracked;
     let summary = or(frame.summary, frame.cycle.summary);
-    let unconverged = frame.unconverged;
-    local.frames[head as usize].unconverged |= unconverged;
     let cycle = &mut local.frames[head as usize].cycle;
     cycle.durability = cycle.durability.min(durability);
     cycle.untracked |= untracked;
