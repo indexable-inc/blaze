@@ -21,6 +21,8 @@ export type Area = keyof typeof AREAS;
 
 export type Doc = {
   area: Area;
+  /** What someone wants when this is the call to use, in their words: what help.search matches first. */
+  for?: string;
   /** The call as it is written, with its options and what it returns. */
   sig: string;
   /** What it does and what to know before using it. */

@@ -963,8 +963,9 @@ export const gmail = { search, messages, read, labels, attachment, send, draft, 
 export const docs: Docs = {
   gmail: {
     area: "services",
+    for: "email: search, read, send, reply",
     sig: "gmail.*",
-    about: "Andrew's Gmail through the harness browser's profile (he signs in once in the browser pane, cmd+shift+B): search, messages, read, labels, attachment, send, reply, forward, draft, archive, trash, label, markRead, via; await skill('gmail') for every call's arguments and rows before using it.",
+    about: "Andrew's Gmail through the harness browser's profile (he signs in once in the browser pane, cmd+shift+B): search, messages, read, labels, attachment, send, reply, forward, draft, deleteDraft, archive, trash, label, markRead, via; await skill('gmail') for every call's arguments and rows before using it.",
     throws: "GmailError naming the endpoint and its status.",
   },
 };

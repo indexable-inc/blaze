@@ -12,6 +12,7 @@ import { packages, parseSpec } from "./packages.ts";
 import { overLimit } from "./patience.ts";
 import { installCapture, inTask, newTask, type Task } from "./tasks.ts";
 import type { Checker } from "./typecheck.ts";
+import { watchdog } from "./watchdog.ts";
 import { isSvelteCell, stripCell } from "./ui/compile.ts";
 import { count, installUi, isElement, show, uiError } from "./ui/index.ts";
 
@@ -51,6 +52,10 @@ export class Repl {
   /** Start a cell as a task and return it at once. Past `limit_ms` it is stopped (cancel.ts). */
   run(code: string, o: RunOptions = {}): Task {
     const t = newTask(code, o.call ?? null, o);
+    // Its limit is enforced here when the cell awaits, and from outside the thread when it never does (watchdog.ts):
+    // armed before the cell's first line runs, which may be the one that never returns.
+    if (o.limit_ms !== undefined) watchdog()?.arm(t.id, Date.now() + o.limit_ms);
+    void t.done.then(() => watchdog()?.disarm(t.id));
     const cell = inTask(t, () => this.#exec(t));
     t.settled = cell.then(() => {}, () => {});
     const timer = o.limit_ms === undefined ? undefined : setTimeout(() => void stopTask(t, overLimit(o.limit_ms!, t.expect_ms).why).catch(() => {}), o.limit_ms);

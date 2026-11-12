@@ -312,6 +312,7 @@ export const call = {
 export const docs: Docs = {
   call: {
     area: "device",
+    for: "place a phone call for the person",
     sig: "call.place(to: '+15551234567', { goal, onBehalfOf, voice?, greeting?, maxMinutes? = 10 }): Promise<{ to; sid; status: completed|no-answer|busy|failed|canceled|timeout; seconds; outcome; transcript: Table<{ who: them|assistant; text }> }>",
     about: "a real phone call: Twilio dials, an OpenAI Realtime voice speaks for him toward goal (it says it is an AI assistant calling for onBehalfOf) and hangs up with the outcome. It shows him a Call / Don't call question first and dials only on Call; it is billed and reaches a real person, so write the goal as you would brief a careful assistant, and never call a number he did not give or approve. The cell waits for the whole call: pass yield_ms 0 to ts, or expect it backgrounded. Needs keys in ~/.harness/keys (the error says which).",
     throws: "CallError naming the missing key or the step that failed; nothing is dialled until the person presses Call.",

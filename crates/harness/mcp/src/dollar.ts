@@ -116,6 +116,7 @@ export const $: Dollar = Object.assign(
 export const docs: Docs = {
   "$": {
     area: "shell",
+    for: "run a program and get its output",
     sig: "$`cmd ${arg}`: thenable of { stdout, stderr, exitCode, ok, text(), lines(), json() }",
     about: "runs a program through sh(); each ${value} is one quoted word (arrays several), $.raw(s) unquoted. Chain before awaiting: .nothrow(), .cwd(dir), .env(vars), .timeout(ms), .stdin(data), .why(reason). A non-zero exit throws with the stderr tail. `await $`git log --oneline -5`.lines()`.",
     example: "await $`git log --oneline -5`.lines()",

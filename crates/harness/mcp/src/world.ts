@@ -89,6 +89,7 @@ export const world = {
 export const docs: Docs = {
   world: {
     area: "ui",
+    for: "change how the app looks: theme, colours, text size",
     sig: "world.*",
     about: "the harness app's own flecs world, live. When he asks to change how this app looks (\"make the theme like my Ghostty\", \"warmer\", \"bigger text\", a colour, a corner), do it HERE, at once, with no build: never by editing .flecs scene or token files in a repository. Its look and layout are entities, components and scene tokens. token(name) reads a scene token and token(name, value) writes it, everything made from it following (`await world.token('tone_accent', { dark: { r: 0.9, g: 0.5, b: 0.2 } })`); query(flecsQuery): Table<{ entity; values }>; get(path) is one entity whole; set(path, component, value) writes the members named; script(code) runs flecs script; schema(component?) is the types; saved() and forget(i?) are the edits kept across launches (token and set are kept unless { save: false }). await skill('world') first.",
     example: "await world.token('tone_accent', { dark: { r: 0.9, g: 0.5, b: 0.2 } })",

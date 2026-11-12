@@ -351,6 +351,7 @@ export async function ptree() {
 export const docs: Docs = {
   sh: {
     area: "shell",
+    for: "run a program; start a server or a watcher that keeps running",
     sig: "sh(cmd: string | string[], { cwd?, env?, stdin?: string, why?, maxBytes? = 8MB per stream kept in memory (oldest lines dropped, line numbers kept), timeoutMs?, local?: true to bypass harnessd, detach?: true }): Proc",
     about: "the awaitable form of spawn('proc'): start now, return a handle at once; `await sh(...)` (or a cell ending in sh(...)) waits and gives { id: 'p1', run: 'r12' | null, pid, exit_code, signal, stdout, stderr }. Runs through harnessd (bash) when it's up: the command is split at top-level ; && || and |, and the FULL stdout and stderr of EVERY pipeline stage is stored as run r12 stage 0, 1, ... readable later by any agent (`cargo clippy 2>&1 | head -n5` shows you 5 lines, clippy still runs to the end and stage(r, 0) has all of it — so pipe through head/tail/grep freely, nothing is lost). stdout here = last stage of each pipeline; stderr = every stage's. With no daemon it is a local process (run: null). Handle: id, run, pid, status running|exited|killed, kill(). The cell that starts a command owns it: when the cell is stopped (cancel, its limit) the command and everything it started is killed; a cell that ends normally leaves it running. { detach: true } keeps it through a stop too (harnessd holds it; objects() shows it). The shell is for running programs: a command line that only reads files or the tree (cat, head, tail, grep, rg, find, ls, stat, wc, sed -n, awk, du, tree, which), a GitHub read through gh, or curl/wget is refused with the typed call to use unless { why } says why the shell is needed; filtering a program's output (cargo test 2>&1 | grep FAIL) runs.",
     example: "const server = sh('bun run dev', { detach: true }); await Bun.sleep(500); out(server, { new: true })",
@@ -363,6 +364,7 @@ export const docs: Docs = {
   },
   out: {
     area: "shell",
+    for: "read what a process printed so far",
     sig: "out(p: 'p1' | 'r12' | pid | Proc, { from?, to?, tail?, new?: true, cursor? = 'default', stage? }): string",
     about: "stdout lines; from/to are 1-based inclusive line numbers, tail last N; new: only output since the previous read with that cursor (every read moves it to the end). With stage: n | 'final' it returns Promise<string> of that stored stage (same as stage()).",
     example: "out('p1', { tail: 20 })",
@@ -379,6 +381,7 @@ export const docs: Docs = {
   },
   kill: {
     area: "shell",
+    for: "stop a process",
     sig: "kill(p, signal? = 'SIGTERM'): proc record",
     about: "signal a command and everything it started (its process group). harnessd runs: SIGTERM to the run's process group, SIGKILL after 3s.",
   },

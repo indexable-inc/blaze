@@ -254,6 +254,7 @@ export const UI_TYPED = ['render', 'ask', 'svelte', 'interval'] as const satisfi
 export const uiDocs: Docs = {
   render: {
     area: 'ui',
+    for: "show, chart, compare, visualize; a small interactive tool",
     sig: "render(svelte`<markup>`, props?): { unmount() }",
     about: "Draw a Svelte 5 component under the cell, live for the person; or write the whole cell as markup (it starts with <script> or a tag). What it renders is for the person and never comes back to you: return the facts you need. await skill('ui') first for the elements, runes and rules.",
     example: "render(svelte`<Table {rows} />`, { rows })",
@@ -261,6 +262,7 @@ export const uiDocs: Docs = {
   },
   ask: {
     area: 'ui',
+    for: "ask the person a question; confirm; choose",
     sig: "ask(text, { options?: (string | { label, detail? })[], default?, detail?, allowText?, block? = true }): Promise<string>",
     about: "Ask the person a question under the cell and get the label picked or the words typed. An answer that comes after the tool call replied reaches you as a message. Stopping the cell withdraws the question.",
     example: "await ask('Deploy to production?', { options: ['Deploy', 'Cancel'], default: 'Cancel' })",

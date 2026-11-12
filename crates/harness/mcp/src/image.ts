@@ -107,6 +107,7 @@ export async function image(input: string | Uint8Array, options?: ImageOptions):
 export const docs: Docs = {
   image: {
     area: "files",
+    for: "convert or resize an image; SVG to PNG",
     sig: "image(path | svgMarkup, { format?: 'png'|'jpeg'|'pdf', width?, height?, out? }): Promise<{ path, bytes, format }>",
     about: "convert or resize (rsvg-convert, sips); an SVG with no format stays an SVG.",
     example: "await image('diagram.svg', { format: 'png', width: 800 })",

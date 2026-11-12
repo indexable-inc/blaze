@@ -26,6 +26,7 @@ import { currentTask, type Task } from "./tasks.ts";
 import { brief, shown, type Shown, type ShownKind } from "./shown.ts";
 import { abortable, killGroup, own, signal } from "./cancel.ts";
 import { oneLine } from "./disclose.ts";
+import { watchdog } from "./watchdog.ts";
 
 /** `list`: a directory listing or file walk (ls, glob, du); `build`: a build, lint or test followed to a digest (follow,
  *  cargo.*); `wait`: waiting for another cell (wait), its value the value that cell gave; `skill`: a skill's instructions
@@ -223,9 +224,13 @@ export function install() {
   Bun.spawnSync = ((...args: unknown[]) => {
     const cmd = argvOf(args[0]);
     const s = step("exec", `Running ${cmd}`, `Ran ${cmd}`, cmd);
-    const r = (realSpawnSync as (...a: unknown[]) => Bun.SyncSubprocess)(...args);
-    s?.end(r.exitCode === 0, `exit ${r.exitCode}`);
-    return r;
+    // The whole kernel waits in here: the watchdog is told whose program holds it (watchdog.ts).
+    watchdog()?.sync(currentTask()?.id ?? null);
+    try {
+      const r = (realSpawnSync as (...a: unknown[]) => Bun.SyncSubprocess)(...args);
+      s?.end(r.exitCode === 0, `exit ${r.exitCode}`);
+      return r;
+    } finally { watchdog()?.sync(null); }
   }) as typeof Bun.spawnSync;
 }
 
@@ -291,6 +296,7 @@ export async function fsFor(spec: string): Promise<Record<string, unknown> | und
 export const docs: Docs = {
   progress: {
     area: "cells",
+    for: "show how far along long work is",
     sig: "progress(done, total, what? = 'Working'): void",
     about: "say how far along this cell's own long work is (files, rows, pages); the person's work bar fills to that share and says about how long is left. Call it as the work moves: `for (const [i, f] of files.entries()) { progress(i, files.length, 'Converting'); await convert(f) }`.",
   },

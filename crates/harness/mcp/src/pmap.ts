@@ -61,6 +61,7 @@ export async function pmap<T, R>(
 export const docs: Docs = {
   pmap: {
     area: "cells",
+    for: "do many things in parallel",
     sig: "pmap(items, (item, i, signal) => ..., { concurrency? = 16 }): Promise<R[]>",
     about: "map in parallel, results in input order; the first error aborts the rest: `await pmap(await glob('src/**/*.ts'), async p => (await Bun.file(p).text()).split('\\n').length)`.",
     example: "await pmap(await glob('src/**/*.ts'), async (p) => (await Bun.file(p).text()).split('\\n').length)",

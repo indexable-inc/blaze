@@ -323,6 +323,7 @@ export const github = makeGithub({ fetch: (url, init) => fetch(url, init), token
 export const docs: Docs = {
   github: {
     area: "services",
+    for: "pull requests, issues, CI checks, reviews",
     sig: "github.*",
     about: "GitHub with gh's token, never `gh api` in a shell: graphql<T>(query, vars?): Promise<T> (data, typed by you); prs({ repo: 'owner/name', state?: open|closed|merged|all = open, author?, limit? = 30 }): Table<{ number; title; state; draft; author; ci: success|failure|pending|error|null; mergeable; review: approved|changes_requested|review_required|null; head; base; created; updated; url }>; pr({ repo, n }): that row plus body, sha, files, checks, comments, reviews (Tables); issues({ repo, state?, author?, assignee?, labels?, limit? }): Table<{ number; title; state; author; labels; assignees; comments; created; updated; url }>; checks({ repo, ref }): Table<{ name; workflow; status; conclusion; url; started; completed }>; rest(path, { method?, body? }) for what GraphQL lacks (Actions logs). await skill('github') first.",
     example: "await github.prs({ repo: 'owner/name', state: 'open' })",

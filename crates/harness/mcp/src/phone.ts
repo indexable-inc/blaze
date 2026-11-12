@@ -163,6 +163,7 @@ export const phone = {
 export const docs: Docs = {
   phone: {
     area: "device",
+    for: "a connected iPhone: screenshot, apps, open a URL",
     sig: "phone.*",
     about: "an iPhone, iPad or Watch with Developer Mode on, through Xcode's devicectl: devices(): Table<{ name; model; os; id; state: connected|disconnected; paired; developerMode }>; screenshot(): path of a PNG of its screen now (show it: render(svelte`<Image src={p} />`, { p })); record(seconds): an MP4; apps(), processes(): Tables; launch(bundleId, { args?, env?, terminateExisting? }); terminate(pid); openURL(url) (a page in Safari, or an app link like maps://); pasteboard.copy(text) / paste(); appearance('dark'|'light'); orientation(...); location(lat, lon) / location(null); install(path); info(); lockState(); ctl(...args) for any other devicectl command (its JSON result). Calls take { device } when more than one is connected (or phone.use(name)). It cannot tap, swipe or type: Core Device has no touch input; drive an app through its URLs, launch arguments and pasteboard.",
     throws: "PhoneError with devicectl's own message.",

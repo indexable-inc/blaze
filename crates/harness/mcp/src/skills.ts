@@ -63,6 +63,7 @@ export async function skill(name: string): Promise<string> {
 export const docs: Docs = {
   skill: {
     area: "cells",
+    for: "load the instructions for a kind of work",
     sig: "skill(name): Promise<string>",
     about: "the full instructions of one skill, from the index at the end of your system note (read it before the work it covers); the person sees a quiet \"Read skill name\" step, not the text.",
     throws: "Error listing the skills there are when the name is not one.",

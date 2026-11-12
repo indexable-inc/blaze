@@ -329,6 +329,7 @@ export async function tree(root?: string | Obj, f: ObjFilter = {}): Promise<Tabl
 export const docs: Docs = {
   spawn: {
     area: "agents",
+    for: "start a sub-agent or a long process as an object",
     sig: "spawn(kind: 'claude'|'codex'|'cursor'|'shell'|'proc', { name?, model?, effort?, prompt?, cmd? (proc), cwd?, env?, args?, parent? = this agent, stdin? }): Promise<Obj>",
     about: "start a child object, or get the running one holding that name. A claude/codex/cursor sub agent must give name, model and (when the model lists efforts) effort, never --model/--effort in args; nothing is defaulted; which to pick: skill('agents'). Obj (every agent, proc, stage is one): fields id ('s7' | 'r12' | 'r12.0'), kind, name, parent, status, exitCode; send(method, args) = RPC; prompt(text); reply(timeoutMs? = 600000): Promise<string> = waits for the turn to finish and returns its last assistant message (claude/codex; the round trip: `const a = await spawn('claude', { name: 'x', model: 'claude-opus-5-5', effort: 'high', prompt: '...' }); await a.reply(); await a.prompt('more'); await a.reply()`); input(bytes); stdin(text), closeStdin() (proc stdin stays open until closed); interrupt() (agents Esc, shell ^C, proc SIGINT); signal(sig); kill(); resize(cols, rows); wait(pred | { status?, match?: string|RegExp, timeoutMs? }) (no arg: until it stops); refresh(). Sync reads: .stdout / .stderr (proc: what its caller sees; a stage: its own) / .pty (escapes stripped) / read(stream, { from?, to?, tail?, new? }) / .messages: Table<{ n, role, kind: text|thinking|tool_call|tool_result|turn_end, tool, text, ts_ms }>. Async: screen(), events({ stream?, since?, tail? }): Table of stored lines, children().",
     example: "const a = await spawn('claude', { name: 'x', model: 'claude-opus-5-5', effort: 'high', prompt: '...' }); await a.reply()",
@@ -341,6 +342,7 @@ export const docs: Docs = {
   },
   objects: {
     area: "agents",
+    for: "what is running; every agent, process and stage",
     sig: "objects({ kind?, parent?, status?, name?, live?, all? (stages and REPL cells too), limit? = 200 }): Promise<Table<{ id; kind; name; parent; status; exit_code; cmd; cwd; created; ended_ms }>>",
     about: "every object, live and past, newest first. tree(root?, filter?): the same as an indented tree (me marks this agent).",
     example: "await objects({ live: true })",

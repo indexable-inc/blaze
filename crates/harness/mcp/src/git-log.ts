@@ -114,6 +114,7 @@ export function gitLog(options: GitLogOptions = {}): LazyTable<CommitRow> {
 export const docs: Docs = {
   gitLog: {
     area: "search",
+    for: "commit history; who changed a file and when",
     sig: "gitLog({ cwd?, ref?, path?: string | string[], since?: '1 month ago', until?, author?, merges? = false, limit? }): LazyTable<{ hash; author; email; date: ms; subject; files: string[]; added; deleted }>",
     about: "commits newest first, chainable before await (a head right after becomes --max-count): gitLog({ since: '1 month ago' }).explode('files').groupBy('author').agg(col('files').nUnique().alias('files')).",
     example: "await gitLog({ since: '1 week ago' }).select('hash', 'subject').head(10)",

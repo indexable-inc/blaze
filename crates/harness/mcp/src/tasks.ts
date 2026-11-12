@@ -167,6 +167,7 @@ export function taskValue(id: string | number) {
 export const docs: Docs = {
   tasks: {
     area: "cells",
+    for: "list cells that ran; what is still running",
     sig: "tasks(): Table<{ id; status: running|done|error|stopped|lost; code; started; elapsed_ms; logs: count; result: preview }>",
     about: "every cell run so far, cells of an earlier kernel included (kept in its journal; one that was running when that kernel ended is lost).",
   },

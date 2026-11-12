@@ -1,5 +1,6 @@
 // Start the kernel in this process: its globals, its type checker, its journal, and what the process does about errors
 // nobody awaited. Every adapter (mcp.ts, serve.ts) begins here, so they serve one kernel made one way.
+import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { docs, functions } from "./functions/index.ts";
@@ -9,10 +10,13 @@ import { serve } from "./serve.ts";
 import { allTasks } from "./tasks.ts";
 import { TypeChecker } from "./typecheck.ts";
 import { UI_TYPED } from "./ui/index.ts";
+import { startWatchdog } from "./watchdog.ts";
 
 export type StartOptions = {
   /** The task journal's file; null for a kernel that keeps none. Default: by session or working directory (journal-file.ts). */
   journal?: string | null;
+  /** How long a cell past its limit may hold the kernel's thread before the kernel is ended (watchdog.ts). Default GRACE_MS; null for no watchdog. */
+  watchdog_ms?: number | null;
   /** Type-check cells (typecheck.ts). Default true; HARNESS_REPL_TYPECHECK=0 turns it off for the whole kernel. */
   typecheck?: boolean;
 };
@@ -40,6 +44,8 @@ export function start(o: StartOptions = {}): Kernel {
       kernel.notes.push(`[kernel] the task journal at ${journal} cannot be used (${e instanceof Error ? e.message : String(e)}): this kernel's cells will not outlive it.`);
     }
   }
+
+  if (o.watchdog_ms !== null) startWatchdog({ journal: journal !== null && existsSync(journal) ? journal : null, grace_ms: o.watchdog_ms });
 
   // An error nobody awaited fails nothing but itself, and is the cell's that caused it (Kernel.unawaited): Bun's default
   // ends the process, and with it every cell's names and the agent's turn.

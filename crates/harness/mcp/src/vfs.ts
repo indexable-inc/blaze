@@ -106,6 +106,7 @@ export type Vfs = typeof vfs;
 export const docs: Docs = {
   vfs: {
     area: "files",
+    for: "save a file the person asked for; export",
     sig: "vfs.write(name, text | bytes | Blob | image()): Promise<path>",
     about: "a file the person asked for (an exported image, a report) goes here, not in the project; show it with render(svelte`<Image src={f} />`, { f }) or <FileRef path={f} />. Also vfs.text/bytes/read(name), list(dir?), move(a, b), delete(name), path(name?).",
     example: "const f = await vfs.write('report.md', text)",

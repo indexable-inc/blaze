@@ -44,6 +44,7 @@ export { cancel, signal };
 export const docs: Docs = {
   wait: {
     area: "cells",
+    for: "wait for a backgrounded cell to finish",
     sig: "wait(id: 't3' | 3, timeoutMs?): Promise<{ id; status; code; started; elapsed_ms; logs; result }>",
     about: "Wait for a backgrounded cell; on timeout it returns the snapshot still running. Stopping the waiting cell ends the wait, not the awaited cell.",
     example: "(await wait('t3')).result",
@@ -51,6 +52,7 @@ export const docs: Docs = {
   },
   cancel: {
     area: "cells",
+    for: "stop, kill or abort a running cell",
     sig: "cancel(id: 't3' | 3, why?): Promise<string>",
     about: "Stop a running cell: its signal aborts (every typed call it waits in rejects), every process it started is killed with its process group (SIGTERM, SIGKILL after 2 s) and so is every harnessd run; what it started with sh(cmd, { detach: true }) is left. Resolves with what was killed, what would not die and what was left running. Code that never checks the signal keeps running and is said to; the tool's `cancel` input does the same without running a cell.",
     example: "await cancel('t3')",
@@ -64,6 +66,7 @@ export const docs: Docs = {
   },
   more: {
     area: "cells",
+    for: "see the rest of a big result",
     sig: "more(id: 't3' | 3, { path?: 'a.b[0]', rows?: [from, to], chars?: [from, to], fields?: string[] }): unknown",
     about: "A part of an earlier cell's value, which its reply summarized: follow path into it, then take a row range of a list (or a character range of a string), then only some fields of each row. Returns the data itself, printed under the same budget.",
     example: "more('t3', { path: 'items', rows: [100, 200], fields: ['name', 'size'] })",
@@ -71,6 +74,7 @@ export const docs: Docs = {
   },
   rerun: {
     area: "cells",
+    for: "run an earlier cell again; restore names after a restart",
     sig: "rerun(id: 't3' | 3): Promise<unknown>",
     about: "Run an earlier cell's code again as a new cell and give its value. After a kernel restart the task list, logs and results are still there (the journal) but the names cells bound are not: rerun the cells that made them.",
     example: "await rerun('t2')",
@@ -78,6 +82,7 @@ export const docs: Docs = {
   },
   help: {
     area: "cells",
+    for: "what can this REPL do; find a function",
     sig: "help(topic?: string): string; help.search(words): string",
     about: "help() lists the areas with one line each; help('files') an area's calls; help('cargo') or help('cargo.test') a call's signature, an example and what it throws; help.search('largest files') finds calls by what they do.",
     example: "help.search('wait for a process')",
@@ -85,6 +90,7 @@ export const docs: Docs = {
   },
   "Bun.file": {
     area: "files",
+    for: "read a file; part of a file; count its lines; cat, head, tail",
     sig: "Bun.file(path): BunFile — .text(), .json(), .bytes(), .exists(), .size",
     about: "Read a file: await Bun.file(p).text(); a part of it: (await Bun.file(p).text()).split('\\n').slice(99, 140). Each read is shown to the person as a step.",
     example: "(await Bun.file('Cargo.toml').text()).split('\\n').length",
@@ -92,12 +98,14 @@ export const docs: Docs = {
   },
   "Bun.write": {
     area: "files",
+    for: "write, create or overwrite a file",
     sig: "Bun.write(path, text | bytes | Blob | Response): Promise<number>",
     about: "Write a file, creating its folders. rename, rm, mkdir, cp come from 'node:fs/promises'. A file the person asked for (an export, a report) goes in vfs, not the project.",
     example: "await Bun.write('notes/todo.md', text)",
   },
   fetch: {
     area: "web",
+    for: "HTTP request; call an API; download",
     sig: "fetch(url, init?): Promise<Response>",
     about: "HTTP, shown to the person as a step with its status. A stopped cell's request is aborted. Not curl or wget in a shell. For the words of a web page use browser.read.",
     example: "await (await fetch('https://api.github.com/zen')).text()",

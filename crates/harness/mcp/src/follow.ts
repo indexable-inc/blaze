@@ -661,6 +661,7 @@ export const cargo = {
 export const docs: Docs = {
   follow: {
     area: "builds",
+    for: "run a long build, lint or test command and get its findings",
     sig: "follow(cmd: string | string[], { step?, find?, json?, total?, summary?, failure?, title?, cwd?, env?, timeout?, limit? = 20 }): Promise<{ ok; summary; counts; findings: { level; at?; text }[]; more?; failure?; log }>",
     about: "run a command live as one build step and get a digest, never its output: each stdout/stderr line (\\r ends one; stdout JSON parsed with json) goes to step(line, { from, tally }) → label | { label, done, total } and find(line, ctx) → finding(s); log is the path of the full raw output.",
     example: "await follow('bunx tsc --noEmit')",
@@ -668,6 +669,7 @@ export const docs: Docs = {
   },
   cargo: {
     area: "builds",
+    for: "build, check, lint or test Rust",
     sig: "cargo.check | clippy | build | test(args?: string | string[], { cwd?, env?, timeout?, limit? }): Promise<digest & { unchecked? }>",
     about: "cargo with --message-format=json and --keep-going (test: --no-fail-fast), live as one build step; findings are rustc's errors and warnings at file:line (relative to cwd) and, for test, each failed test at its panic, with passed/failed/ignored counted; unchecked says what a failure left unbuilt or unrun.",
     example: "await cargo.test('-p blaze-core scheduler')",

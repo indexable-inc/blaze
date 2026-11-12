@@ -53,8 +53,8 @@ export function hint(message: string, names: Iterable<string>): string | null {
     : `No \`${missing}\` here. help.search('what it should do') finds a call by intent; help() lists the areas.`;
 }
 
-const entry = (name: string, d: Doc): string =>
-  [d.sig, d.about, d.example ? `Example: ${d.example}` : "", d.throws ? `Throws: ${d.throws}` : "", `Area: ${d.area} (help('${d.area}'))`].filter(Boolean).join("\n");
+const entry = (_name: string, d: Doc): string =>
+  [d.sig, d.for ? `For: ${d.for}.` : "", d.about, d.example ? `Example: ${d.example}` : "", d.throws ? `Throws: ${d.throws}` : "", `Area: ${d.area} (help('${d.area}'))`].filter(Boolean).join("\n");
 
 const firstSentence = (s: string) => oneLine(/^.*?[.;:](?=\s|$)/.exec(s)?.[0] ?? s, 110);
 
@@ -69,7 +69,7 @@ export function makeHelp(docs: Docs): Help {
     const t = topic.trim().replace(/\(\)$/, "");
     if (t in AREAS) {
       const mine = names.filter((n) => docs[n]!.area === t);
-      return [`${t}: ${AREAS[t as Area]}`, ...mine.map((n) => `${n.padEnd(14)} ${firstSentence(docs[n]!.about)}`), `help('name') gives one in full.`].join("\n");
+      return [`${t}: ${AREAS[t as Area]}`, ...mine.map((n) => `${n.padEnd(14)} ${docs[n]!.for ?? firstSentence(docs[n]!.about)}`), `help('name') gives one in full.`].join("\n");
     }
     const own = docs[t];
     const under = names.filter((n) => n.startsWith(`${t}.`));
@@ -84,14 +84,16 @@ export function makeHelp(docs: Docs): Help {
   const search = (query: string): string => {
     if (typeof query !== "string" || !query.trim()) throw new TypeError("help.search takes the words to look for: help.search('largest files')");
     const q = words(query);
-    const scored = names.map((n) => {
+    const ranked = names.map((n) => {
       const d = docs[n]!;
-      const inName = words(n), inSig = words(d.sig), inAbout = new Set(words(`${d.about} ${d.example ?? ""} ${AREAS[d.area]}`));
-      const score = q.reduce((sum, w) => sum + (inName.some((x) => x.includes(w)) ? 4 : 0) + (inSig.includes(w) ? 2 : 0) + (inAbout.has(w) ? 1 : 0), 0);
+      const inFor = new Set(words(d.for ?? "")), inName = words(n), inSig = new Set(words(d.sig)), inAbout = new Set(words(`${d.about} ${d.example ?? ""}`));
+      const score = q.reduce((sum, w) => sum + (inFor.has(w) ? 6 : 0) + (inName.some((x) => x === w) ? 4 : 0) + (inSig.has(w) ? 2 : 0) + (inAbout.has(w) ? 1 : 0), 0);
       return [score, n] as const;
-    }).filter(([s]) => s > 0).sort((a, b) => b[0] - a[0] || a[1].localeCompare(b[1])).slice(0, 8);
+    }).filter(([s]) => s > 0).sort((a, b) => b[0] - a[0] || a[1].localeCompare(b[1]));
+    // Within reach of the best match: a word shared in passing is not an answer.
+    const scored = ranked.filter(([s]) => s >= ranked[0]![0] * 0.4).slice(0, 8);
     if (!scored.length) return `Nothing matches ${JSON.stringify(query)}. help() lists the areas.`;
-    return [...scored.map(([, n]) => `${n.padEnd(14)} ${firstSentence(docs[n]!.about)}`), `help('name') gives one in full.`].join("\n");
+    return [...scored.map(([, n]) => `${n.padEnd(14)} ${docs[n]!.for ?? firstSentence(docs[n]!.about)}`), `help('name') gives one in full.`].join("\n");
   };
   return Object.assign(help, { search });
 }

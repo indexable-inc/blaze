@@ -906,6 +906,7 @@ export const table = Object.assign(fromRows, { from: fromRows, lazy });
 export const docs: Docs = {
   table: {
     area: "tables",
+    for: "group, sort, filter, join rows",
     sig: "table(rows) / table.from(rows): Table<Row>",
     about: "a real array (r[0], .map, .length; slice(a, b), sort(fn) and join(',') stay Array's) plus polars verbs returning new Tables: filter(col('a').gt(1) | r => bool), select('a', col('b').alias('c')), withColumns(expr, ...), sort(by | [by], true | { descending, nullsLast }), head(n = 10), tail(n), groupBy(...keys).agg(col('x').sum().alias('s'), ...) or .agg(a => ({ n: a.count(), s: a.sum(c), m: a.mean(c), lo: a.min(c), hi: a.max(c), f: a.first(c), l: a.list(c), d: a.distinct(c), sub: a.rows() })) or .len(), join(other, { on, how: inner|left|semi|anti, suffix = '_right' }), unique(subset?, { keep: first|last }), explode(listCols), unnest(recordCol), rename({ from: 'to' }), drop(...cols), count(), toArray(col), lazy(); old names work: where(fn), derive({ c: r => v }), sortBy(col, { desc }), joinOn(other, on, how), column(col), rows(). table.lazy(rows | promise | () => promise): LazyTable<Row> — the same verbs plus polars' slice(offset, length), recorded as a plan (explain()) and run by await (an eager Table; a returned one prints its rows), collect(), toRecords(), toArray(col) or height(). A column the table lacks is a type error and a runtime error naming its columns.",
     example: "table(rows).filter(col('size').gt(1e6)).sort('size', true).head(5)",

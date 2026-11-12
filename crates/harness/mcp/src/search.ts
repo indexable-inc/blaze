@@ -673,6 +673,7 @@ export async function du(target?: string, input?: DuOptions): Promise<DuResults>
 export const docs: Docs = {
   rg: {
     area: "search",
+    for: "find a symbol, a word or a pattern in files; grep",
     sig: "rg(pattern, { path?, glob?, type?, ignoreCase?, smartCase?, fixed?, word?, multiline?, context?: n | { before, after }, maxCount?, hidden?, noIgnore?, filesOnly?, limit? = 10000, signal? }): Promise<{ path; line; column; text; before?; after?; submatches }[] & { files; count; truncated; warnings }>",
     about: "ripgrep as data, sorted by path, recorded as a search step (not exec): `(await rg('fn main', { path: 'crates', type: 'rust', context: 2 })).files`.",
     example: "(await rg('fn main', { path: 'crates', type: 'rust', context: 2 })).files",
@@ -680,12 +681,14 @@ export const docs: Docs = {
   },
   ls: {
     area: "files",
+    for: "list a directory; a tree of a folder",
     sig: "ls(path = '.', { recursive?, depth?, hidden?, glob?, gitignore?, limit? = 10000, signal? }): Promise<{ name; path; kind: file|dir|symlink; size; modified; ext }[] & { path; truncated }>",
     about: "a directory as rows, directories first: `await ls('src', { recursive: true, gitignore: true })`.",
     example: "await ls('src', { recursive: true, gitignore: true })",
   },
   glob: {
     area: "files",
+    for: "largest files; recently changed files; find files by name or extension",
     sig: "glob(pattern, { cwd?, dot?, onlyFiles? = true, onlyDirs?, gitignore? = true, ignore?, followSymlinks?, stat?, sort?: 'path'|'size'|'mtime', limit? = 10000, signal? }): Promise<string[] & { truncated }>",
     about: "sorted absolute paths via ripgrep's walk; stat: true gives table({ path, size, mtime, isDir, ext }); the five largest: `await glob('**/*', { stat: true, sort: 'size', limit: 5 })`.",
     example: "await glob('**/*', { stat: true, sort: 'size', limit: 5 })",
@@ -693,6 +696,7 @@ export const docs: Docs = {
   },
   du: {
     area: "files",
+    for: "directory sizes; what takes the disk space",
     sig: "du(path = '.', { depth? = 1, gitignore? = false, dot? = true, limit?, signal? }): Promise<{ path; size; files; isDir }[] & { path; total; files; truncated }>",
     about: "disk use per entry, largest first, bytes: `(await du('target', { depth: 2 })).total`.",
     example: "(await du('target')).total",
