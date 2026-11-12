@@ -1209,7 +1209,7 @@ ORDER BY looked.unit, looked.read
 LIMIT $limit
 
 -- name: edit_work
--- says: the work a build did, by stage, as each stage counted it: how many things it visited, asked of or made again, which after an edit should be the edit's size and not the program's (rule incremental-first). `engine memos` are the query engine's rows run (`executed`) and proved unchanged without running (`verified`), from `query_counts`; `changed set` is the engine's walk from what was written (`visited` rows verified, `changed` the rows whose value moved); `body check` is each unit's plan (`visited_bodies` and `visited_modules` got a task, `held_*` is the crate, `whole` counts plans that visited everything); `codegen walk` is each program's walk (`asked` functions asked of again, `described` made again, `replaced` rows of the kept lists, `whole` walks from the roots); `dependency image keys` are the keys a serve asked of the database (`asked`), those that moved (`moved`) and those made again (`computed`); `link` is each link's rows made again (`rows`) and the names and patchable functions it went over (`symbols`, `patchable`, the part that still follows the program). `total` sums a counter over the build, `times` is how many units or walks said it; a counter nothing said has no row. Events `edit work` (crates/blaze-query/src/db/edit_work.rs names the stages)
+-- says: the work a build did, by stage, as each stage counted it: how many things it visited, asked of or made again, which after an edit should be the edit's size and not the program's (rule incremental-first). `engine memos` are the query engine's rows run (`executed`) and proved unchanged without running (`verified`) and its inputs written (`written`: 0 for a build of an unchanged tree), from `query_counts`; `changed set` is the engine's walk from what was written (`visited` rows verified, `changed` the rows whose value moved); `body check` is each unit's plan (`visited_bodies` and `visited_modules` got a task, `held_*` is the crate, `whole` counts plans that visited everything); `codegen walk` is each program's walk (`asked` functions asked of again, `described` made again, `replaced` rows of the kept lists, `whole` walks from the roots); `dependency image keys` are the keys a serve asked of the database (`asked`), those that moved (`moved`) and those made again (`computed`); `link` is each link's rows made again (`rows`) and the names and patchable functions it went over (`symbols`, `patchable`, the part that still follows the program). `total` sums a counter over the build, `times` is how many units or walks said it; a counter nothing said has no row. Events `edit work` (crates/blaze-query/src/db/edit_work.rs names the stages)
 WITH said AS (
     SELECT
         e.process AS said_process,
@@ -1230,6 +1230,10 @@ WITH said AS (
     WHERE q.build_id = $build
     UNION ALL
     SELECT 'engine memos' AS stage, 'verified' AS counter, CAST(sum(q.verified) AS BIGINT) AS n
+    FROM query_counts AS q
+    WHERE q.build_id = $build
+    UNION ALL
+    SELECT 'engine memos' AS stage, 'written' AS counter, CAST(sum(q.written) AS BIGINT) AS n
     FROM query_counts AS q
     WHERE q.build_id = $build
     UNION ALL

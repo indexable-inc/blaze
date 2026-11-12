@@ -292,7 +292,7 @@ impl Real {
         if seen.noop == Some(true) {
             // No build ran: nothing was made again, and no memo ran.
             (seen.redone, seen.executed, seen.verified) = (Some(Vec::new()), Some(0), Some(0));
-            seen.records = Some(0);
+            (seen.records, seen.written, seen.unkept) = (Some(0), Some(0), Some(0));
             seen.why = "answered as the last build was (the no-op lane)".to_owned();
             return seen;
         }
@@ -302,9 +302,13 @@ impl Real {
             Ok(value) if why.ok && value["build"].as_u64() == build && build.is_some() => {
                 let mut redone = Vec::new();
                 let mut records = 0;
+                let mut unkept = 0;
                 for group in value["groups"].as_array().into_iter().flatten() {
                     if group["step"].as_str() == Some("unit") {
                         records += group["items"].as_array().map_or(0, |it| it.len() as u64);
+                    }
+                    if group["step"].as_str() == Some("unit record") {
+                        unkept += group["items"].as_array().map_or(0, |it| it.len() as u64);
                     }
                     if group["step"].as_str().is_some_and(|it| it.starts_with("codegen")) {
                         redone.extend(group["items"].as_array().into_iter().flatten().filter_map(|it| it.as_str()).map(str::to_owned));
@@ -314,12 +318,15 @@ impl Real {
                 redone.dedup();
                 seen.redone = Some(redone);
                 seen.records = Some(records);
+                seen.unkept = Some(unkept);
             }
             _ => seen.why = format!("`blaze why --all --json` of build {build:?} said: {}{}\n", why.stdout, why.stderr),
         }
         seen.why.push_str(&self.blaze(&["why", "--all"], &none).stdout);
         if let Some(build) = build
-            && (revision.expect.max_executed.is_some() || revision.expect.max_verified.is_some())
+            && (revision.expect.max_executed.is_some()
+                || revision.expect.max_verified.is_some()
+                || revision.expect.max_written.is_some())
         {
             let work = self.blaze(&["explain", "edit_work", &format!("build={build}"), "limit=500", "--json"], &none);
             for line in work.stdout.lines() {
@@ -328,12 +335,13 @@ impl Real {
                     match row["counter"].as_str() {
                         Some("executed") => seen.executed = row["total"].as_u64(),
                         Some("verified") => seen.verified = row["total"].as_u64(),
+                        Some("written") => seen.written = row["total"].as_u64(),
                         _ => {}
                     }
                 }
             }
             if work.stderr.contains("counted no work in any stage") {
-                (seen.executed, seen.verified) = (Some(0), Some(0));
+                (seen.executed, seen.verified, seen.written) = (Some(0), Some(0), Some(0));
             }
             if seen.executed.is_none() {
                 seen.why.push_str(&format!("`blaze explain edit_work build={build}` said: {}{}\n", work.stdout, work.stderr));

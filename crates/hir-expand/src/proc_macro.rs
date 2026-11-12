@@ -64,6 +64,19 @@ pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + Any {
     /// What any call gives is what it gives in order: a run ahead only saves time.
     fn speculate(&self, _db: &Db, _calling_crate: Crate, _call: ProcMacroCall<'_>) {}
 
+    /// Whether this expander, loaded for a crate that has `held`, takes `held`'s place: when
+    /// they are not equal, unless a crate's expanders built two ways are told apart here.
+    /// One proc-macro crate is one crate of the front end and may be two units of a build
+    /// (two profiles: a module each), each of which gives the crate its expanders as it
+    /// ends: taken in turn, the crate's expanders were those of whichever unit ended last,
+    /// an input written and every user resolved again twice a build, with nothing changed.
+    /// An expander that says no here leaves the crate with `held` whichever was loaded
+    /// first, so the crate's expanders are a function of the build, not of its timing.
+    fn replaces(&self, held: &dyn ProcMacroExpander) -> bool {
+        // dyn: the database's expander trait, compared when a crate's macros are set
+        !self.eq_dyn(held)
+    }
+
     /// The content ID of the code the macro runs: its library's, and the compiled module it
     /// runs in when it runs in one, which the front end's code identity does not cover. What
     /// the key of a crate that uses it covers (`hir_def::deps`, the goal store's facts). `None`
@@ -263,8 +276,9 @@ impl ProcMacros {
     /// set that is not noted leaves it naming none.
     ///
     /// The invariant: a crate given the list it has (each macro's name, kind and expander
-    /// equal: [`ProcMacroExpander::eq_dyn`], which for a built macro is the code it runs) is
-    /// given nothing: no input is written, nothing is noted, no def map resolves again.
+    /// equal: [`ProcMacroExpander::eq_dyn`], which for a built macro is the code it runs),
+    /// or one that does not replace it ([`ProcMacroExpander::replaces`]: the same code built
+    /// another way, by another unit of the crate), is given nothing: no input is written, nothing is noted, no def map resolves again.
     /// Whether any crate's list changed is returned. A build loads every proc macro's
     /// expanders again (its unit's record replayed); until 2026-11-12 each load set the
     /// whole map at `HIGH` and noted its crate, so a build of reth with nothing changed
@@ -282,7 +296,7 @@ impl ProcMacros {
                 let held = all.by_crate(db);
                 for (krate, macros) in given {
                     let macros = CrateProcMacros::new(macros);
-                    if held.get(&krate).is_some_and(|it| **it == macros)
+                    if held.get(&krate).is_some_and(|it| !macros.replaces(it))
                         && !GIVES_EQUAL_LISTS.get()
                     {
                         continue;
@@ -316,6 +330,21 @@ impl ProcMacros {
 impl CrateProcMacros {
     pub fn new(macros: ProcMacroLoadResult) -> Self {
         CrateProcMacros(macros.map(Vec::into_boxed_slice))
+    }
+
+    /// Whether this list, loaded for a crate that has `held`, takes its place: when they are
+    /// not equal, unless both loaded the same macros (each one's name, kind and whether it
+    /// is disabled) and no expander of this one replaces the one `held` has for it
+    /// ([`ProcMacroExpander::replaces`]).
+    fn replaces(&self, held: &CrateProcMacros) -> bool {
+        let (Ok(new), Ok(old)) = (&self.0, &held.0) else { return self != held };
+        new.len() != old.len()
+            || new.iter().zip(old.iter()).any(|(new, old)| {
+                new.name != old.name
+                    || new.kind != old.kind
+                    || new.disabled != old.disabled
+                    || new.expander.replaces(&*old.expander)
+            })
     }
 
     /// The macros of the crate, when they loaded.

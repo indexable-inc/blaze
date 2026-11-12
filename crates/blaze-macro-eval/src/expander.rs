@@ -216,13 +216,27 @@ impl Library {
     /// nothing is written (`ProcMacros::give`). A verdict that moved (a crate first seen in
     /// the build before) is another library: its expansions report their reads otherwise.
     fn same(self: &Arc<Library>, other: &Arc<Library>) -> bool {
-        Arc::ptr_eq(self, other)
-            || (Arc::ptr_eq(&self.macros, &other.macros)
-                && self.krate == other.krate
-                && self.toolchain == other.toolchain
-                && self.loaded == other.loaded
-                && self.runs == other.runs
-                && self.seen.verdict() == other.seen.verdict())
+        Arc::ptr_eq(self, other) || self.differs(other).is_none()
+    }
+
+    /// What of `other`, a library loaded for the same crate, is not as it is of this one:
+    /// why its expanders replace this one's, or none.
+    fn differs(&self, other: &Library) -> Option<&'static str> {
+        if !Arc::ptr_eq(&self.macros, &other.macros) {
+            Some("the daemon's macros they are kept by")
+        } else if self.krate != other.krate {
+            Some("the crate")
+        } else if self.toolchain != other.toolchain {
+            Some("the toolchain")
+        } else if self.loaded != other.loaded {
+            Some("the crate's code")
+        } else if self.runs != other.runs {
+            Some("the module its code was built into")
+        } else if self.seen.verdict() != other.seen.verdict() {
+            Some("what the store says of the state its expansions leave")
+        } else {
+            None
+        }
     }
 }
 
@@ -736,6 +750,16 @@ fn load_on(
         kept_roots: SharedMap::default(),
         settled: Lock::new("macro.library.settled", None),
     });
+    // Said once a load: what the crate's macros run and what the store says of their state,
+    // so two loads of one crate that give other expanders say what moved between them.
+    tracing::info!(
+        target: "blaze",
+        krate = %library.name,
+        code = %format_args!("{:x}", library.loaded),
+        runs = %format_args!("{:x}", library.runs),
+        verdict = ?library.seen.verdict(),
+        "a proc-macro crate's expanders loaded"
+    );
     macros.libraries.lock().push(Arc::downgrade(&library));
     // None for a proc-macro crate with none, which rustc builds: a use fails at the use.
     let functions = run::functions(db, krate);
@@ -1678,11 +1702,55 @@ impl ProcMacroExpander for Evaluated {
         self.expand_keyed(db, calling_crate, call)
     }
 
+    /// A macro of the same crate, code, daemon and toolchain built into another module (the
+    /// crate is two units of the build, one a profile) takes `held`'s place only when its
+    /// module is the lesser of the two by what it runs ([`Library::runs`]): whichever unit
+    /// ends first, and in every build, the crate has the expanders of that one module, so
+    /// the keys that hold what its macros run ([`ProcMacroExpander::code`]) do not move
+    /// with the order two units ended in. Until 2026-11-12 the crate had the expanders of
+    /// the unit that ended last, and each build wrote them twice.
+    fn replaces(&self, held: &dyn ProcMacroExpander) -> bool {
+        // dyn: the database's expander trait, the edge
+        let Some(other) = (held as &dyn std::any::Any).downcast_ref::<Evaluated>() else {
+            return true;
+        };
+        if self.eq_dyn(held) {
+            return false;
+        }
+        let (new, old) = (&self.library, &other.library);
+        let another_module = self.function == other.function
+            && self.index == other.index
+            && self.kind == other.kind
+            && self.name == other.name
+            && Arc::ptr_eq(&new.macros, &old.macros)
+            && new.krate == old.krate
+            && new.toolchain == old.toolchain
+            && new.loaded == old.loaded
+            && new.runs != old.runs;
+        match another_module {
+            true => new.runs < old.runs,
+            false => true,
+        }
+    }
+
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
         // dyn: the database's expander trait, the edge
         (other as &dyn std::any::Any) // dyn: as above, told apart by type
             .downcast_ref::<Evaluated>()
             .is_some_and(|other| {
+                // Said once a macro whose library was loaded again otherwise: its crate's
+                // expanders are replaced, an input written and its users resolved again.
+                if !Arc::ptr_eq(&self.library, &other.library)
+                    && let Some(what) = self.library.differs(&other.library)
+                {
+                    tracing::info!(
+                        target: "blaze",
+                        krate = %self.library.name,
+                        r#macro = %self.name,
+                        differs = what,
+                        "a proc macro's expanders loaded again are not the ones its crate has"
+                    );
+                }
                 self.library.same(&other.library)
                     && self.function == other.function
                     && self.index == other.index
