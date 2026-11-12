@@ -8,13 +8,13 @@
 
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
-use blaze_api::ApiError;
+use blaze_api::{ApiError, Goal, Tiers};
 use blaze_build_script::{
     apply::{Compile, Linked as LinkedTo},
     unit as bs,
 };
 use blaze_codegen::{
-    Backend, InstanceKey, NativeLib, NativeLibKind, Target,
+    Arch, Backend, InstanceKey, NativeLib, NativeLibKind, Target,
     driver::{Build, Built, ProfileCounts},
     plan::{Mode as BuildMode, OptLevel, Origin, Override, Package, Policy, Profile},
     settings::{DebugInfo, Panic, Pgo, Sanitize, Sanitizers, Toolchain},
@@ -230,6 +230,47 @@ pub(crate) fn origin(job: &Job, at: usize, unit: &Unit) -> Result<Origin, String
         _ if package.is_member => Origin::Member(Package::new(&package.name)),
         _ => Origin::Dependency(Package::new(&package.name)),
     })
+}
+
+/// The build goal unit `unit`'s code is compiled for (docs/v2/plan/design/tiers.md): the
+/// request's `--goal` when it gave one, else its profile's own
+/// ([`Goal::of_profile`]: `dev` edits, `release` is `max`). Build-time code (a build script, a
+/// proc macro, what they depend on) runs once during the build and is no part of the program
+/// the request waits for: its goal is its own profile's whatever the request says.
+///
+/// `--goal max` of a profile that asks for `codegen-backend = "stencil"` is refused, naming
+/// both: that profile's every function is tier 0 code, and `max` is never answered with it.
+pub(crate) fn goal(job: &Job, unit: usize) -> Result<Goal, String> {
+    let u = job.unit(unit).map_err(|it| it.what)?;
+    let profile = &u.profile;
+    let backend = profile.codegen_backend.as_deref();
+    let asked = match build_time(job, unit).0 {
+        true => None,
+        false => job.input.goal,
+    };
+    match asked {
+        Some(Goal::Max) if backend == Some("stencil") => Err(format!(
+            "`--goal max` waits for the optimized code of `{}`, and its profile `{}` asks for \
+             codegen-backend `stencil`, which compiles every function as tier 0 code: `max` is \
+             never answered with tier 0 code (docs/v2/plan/design/tiers.md); drop `--goal max`, \
+             or the profile's `codegen-backend`",
+            u.target.name, profile.name
+        )),
+        Some(asked) => Ok(asked),
+        None => Ok(Goal::of_profile(&profile.name, &profile.opt_level, backend)),
+    }
+}
+
+/// What the image of unit `unit`, built as `built` for `arch`, says of its goal: the goal and
+/// how many of its functions are the optimized tier's (LLVM at `-O2` or `-O3`). None for
+/// build-time code and for wasm, whose one producer no goal picks.
+fn tiers(job: &Job, unit: usize, built: &Built, arch: Arch) -> Result<Option<Tiers>, String> {
+    if build_time(job, unit).0 || arch.is_wasm() {
+        return Ok(None);
+    }
+    let optimized =
+        built.made.iter().filter(|it| matches!(it.1.backend, Backend::Llvm { opt: 2.. })).count();
+    Ok(Some(Tiers::of(goal(job, unit)?).with(optimized as u64, built.made.len() as u64)))
 }
 
 /// What blaze makes of cargo's `codegen-backend` for `package`'s code at `level`, `true` when
@@ -744,7 +785,23 @@ pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Pol
     let pgo = pgo_of(job, pgo(rustflags)?)?;
     let base = &root.profile;
     let opt = opt_level(&base.opt_level)?;
-    let stencils = codegen_backend(base, &job.package(root).map_err(|it| it.what)?.name, opt)?;
+    // The goal picks the tier of the profile's own code (docs/v2/plan/design/tiers.md): tier 0
+    // under `edit`, the optimized tier under `max`. A profile already at its goal's tier (dev
+    // under `edit`, release under `max`) is compiled at its own level, so its policy, and
+    // every key and byte made from it, is what it was before the goal. A package cargo gives
+    // another level (`[profile.*.package.*]`, below) keeps that level under both goals.
+    let goal = goal(job, unit)?;
+    let at = match goal {
+        Goal::Edit => opt.tier_zero(),
+        Goal::Max => opt.optimized(),
+    };
+    let stencils = codegen_backend(base, &job.package(root).map_err(|it| it.what)?.name, at)
+        .map_err(|why| match at == opt {
+            true => why,
+            false => {
+                format!("{why} (the goal `{goal}` compiles the profile's own code at {at:?})")
+            }
+        })?;
     let info = debuginfo(&base.debuginfo)?;
     // BTreeMap: it is `Profile::packages`, which is serialized and hashed.
     let mut packages = BTreeMap::new();
@@ -785,7 +842,7 @@ pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Pol
     let mut policy = Policy {
         toolchain,
         profile: Profile {
-            opt_level: opt,
+            opt_level: at,
             overflow_checks: base.overflow_checks,
             debug_assertions: base.debug_assertions,
             debuginfo: info,
@@ -1644,6 +1701,8 @@ pub(crate) struct LinkMade {
     pub(crate) read: Vec<Read>,
     pub(crate) table: Option<blaze_codegen::ExecTable>,
     pub(crate) how: Linking,
+    /// The image's goal and how many of its functions are optimized ([`tiers`]).
+    pub(crate) tiers: Option<Tiers>,
     pub(crate) restart: Option<String>,
     pub(crate) whole: Option<String>,
 }
@@ -2236,6 +2295,8 @@ fn link_at(
         super::run::inproc::Told::Restart { why } => Some(why),
         super::run::inproc::Told::Nothing | super::run::inproc::Told::Patched { .. } => None,
     };
+    let tiers = tiers(job, unit, generated.built, generated.policy.toolchain.arch)
+        .map_err(LinkCause::Given)?;
     Ok(LinkMade {
         written,
         made: runs,
@@ -2243,6 +2304,7 @@ fn link_at(
         read,
         table,
         how,
+        tiers,
         restart,
         whole: whole.map(|it| it.1),
     })

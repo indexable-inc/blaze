@@ -1626,6 +1626,7 @@ fn script_front_for(
         linked_rustflag_libs: Vec::new(),
         makers: one_maker(),
         kind: compile::keyed_kind(crate::serve::work::JobKind::Build, script),
+        goal: compile::goal_byte(blaze_api::Goal::Edit),
         color: false,
         short: false,
         verified: false,
@@ -2342,6 +2343,7 @@ fn each_maker_of_a_record_moves_its_key() {
             linked_rustflag_libs: Vec::new(),
             makers,
             kind: compile::keyed_kind(crate::serve::work::JobKind::Build, u),
+            goal: compile::goal_byte(blaze_api::Goal::Edit),
             color: false,
             short: false,
             verified: false,
@@ -2370,6 +2372,50 @@ fn each_maker_of_a_record_moves_its_key() {
     }
 }
 
+/// Rule 21 for the build goal (docs/v2/plan/design/tiers.md): a unit's record holds the code
+/// of the tier its goal picked, and its unit and plan are the same under both goals, so the
+/// goal is in the record key: an `edit` build's record is never served to a `max` build, nor
+/// the other way, and a unit only checked (which compiles no code) is neither's.
+#[test]
+fn the_goal_moves_a_units_record_key() {
+    use blaze_api::Goal;
+    let key = |front: &mut MemFront, goal: u8| {
+        let identity = front.lowered.identity(0).unwrap();
+        let u = &front.units.graph.units[0];
+        compile::RecordInputs {
+            identity,
+            unit: compile::KeyedUnit::among(u, |at| Ok(&front.units.graph.units[at])).unwrap(),
+            plan: &front.units.plans[0],
+            run_env: &[],
+            script_check_cfgs: Vec::new(),
+            script_link_args: Vec::new(),
+            linked_rustflag_libs: Vec::new(),
+            makers: one_maker(),
+            kind: compile::keyed_kind(crate::serve::work::JobKind::Build, u),
+            goal,
+            color: false,
+            short: false,
+            verified: false,
+            reached: false,
+            pgo: None,
+            lint_profile: None,
+            layout: None,
+            width: None,
+            refused: None,
+        }
+        .key(0)
+        .unwrap()
+    };
+    let mut front = orphan_front(false);
+    let (edit, max) = (compile::goal_byte(Goal::Edit), compile::goal_byte(Goal::Max));
+    assert!(edit != 0 && max != 0 && edit != max, "0 is a unit only checked");
+    let at_edit = key(&mut front, edit);
+    assert_eq!(key(&mut front, edit), at_edit, "the same goal, the same key");
+    assert_ne!(key(&mut front, max), at_edit, "tier 0 code and optimized code under one key");
+    assert_ne!(key(&mut front, 0), at_edit);
+    assert_ne!(key(&mut front, 0), key(&mut front, max));
+}
+
 /// Rule 21 for the sealed checks of a reached-only crate: when `l` gains `#[blaze::sealed]`,
 /// `d`'s record key moves, so a record of `d` built while its graph had no sealed trait (no check
 /// of its own, so no refusal) is never served for the sealed graph, and `d` is checked again and
@@ -2390,6 +2436,7 @@ fn a_dependency_gaining_sealed_moves_a_reached_only_dependents_key_and_checks_it
             linked_rustflag_libs: Vec::new(),
             makers: one_maker(),
             kind: compile::keyed_kind(crate::serve::work::JobKind::Build, u),
+            goal: compile::goal_byte(blaze_api::Goal::Edit),
             color: false,
             short: false,
             verified: false,

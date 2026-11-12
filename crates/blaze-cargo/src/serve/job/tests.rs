@@ -75,7 +75,7 @@ fn a_builds_history_row_names_its_request_its_command_and_its_workspace() {
 #[test]
 fn work_is_placed_whole_when_any_link_was() {
     use crate::serve::work::Full;
-    let link = |how| ("/w/target/debug/app".to_owned(), how);
+    let link = |how| ("/w/target/debug/app".to_owned(), how, None);
     assert_eq!(link_kind(&[]), LinkKind::Patched);
     assert_eq!(link_kind(&[link(Linking::Spliced), link(Linking::Spliced)]), LinkKind::Patched);
     assert_eq!(link_kind(&[link(Linking::Spliced), link(Linking::First)]), LinkKind::Placed);

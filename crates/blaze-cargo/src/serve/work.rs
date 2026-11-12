@@ -175,6 +175,11 @@ pub struct JobInput {
     /// ([`blaze_api::Cargo::refused`]; [`crate::REFUSED_SHOWN`] for an agent's request).
     pub refused: Option<u32>,
     pub kind: JobKind,
+    /// The request's `--goal` ([`blaze_api::Targets::goal`]): what its build waits for, tier 0
+    /// code or optimized code (docs/v2/plan/design/tiers.md). `None` for each profile's own
+    /// ([`blaze_api::Goal::of_profile`]); the goal of one unit is
+    /// `unit::codegen::goal`'s to say.
+    pub goal: Option<blaze_api::Goal>,
     /// Set once the job is cancelled: long work looks at it between pieces and stops with
     /// [`Failed::Again`], which the loop drops for a cancelled job.
     pub cancelled: Arc<AtomicBool>,
@@ -291,9 +296,10 @@ pub struct Compiled {
     /// A device unit's MSL (`blaze_units::UnitPlan::gpu_msl`), as it made or kept it: the loop
     /// asks the job's [`Writer::gpu_msl`] with it. None for any other unit.
     pub gpu_msl: Option<Vec<u8>>,
-    /// Each image the compile linked, by its path, and how the link reached it: what the job's
-    /// [`blaze_api::Worked`] says, and the bench fails an edit by.
-    pub links: Vec<(String, Linking)>,
+    /// Each image the compile linked, by its path, how the link reached it, and its goal with
+    /// how many of its functions are optimized (none for build-time code and wasm, which no
+    /// goal reaches): what the job's [`blaze_api::Worked`] says, and the bench fails an edit by.
+    pub links: Vec<(String, Linking, Option<blaze_api::Tiers>)>,
     /// Why its record and each template its codegen missed were not in the store, each with
     /// its subject within the unit ([`blaze_kernel::Miss`]): what `blaze why` explains once
     /// the build ends. Empty for a unit its record replayed.

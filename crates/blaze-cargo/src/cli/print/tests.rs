@@ -235,6 +235,47 @@ fn a_units_summary_comes_as_it_ends_and_once() {
     );
 }
 
+/// The `Finished` line ends with the build's goal and how much of the code it linked is
+/// optimized, as its work report gave them; a build that reports no goal (a check, a daemon's
+/// answer with none) ends as cargo's does.
+#[test]
+fn the_finished_line_says_the_goal_and_how_much_is_optimized() {
+    use blaze_api::{Goal, Tiers};
+    const FINISHED: &str = "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.23s";
+    let worked = |tiers| {
+        Response::Work(blaze_api::Worked {
+            why: None,
+            tiers,
+            link: blaze_api::LinkKind::Patched,
+            found: 0,
+            green: 0,
+            links: Vec::new(),
+            reran: 0,
+            misses: 0,
+            served: Vec::new(),
+            build_id: None,
+            compiled: 1,
+            critical_path_us: 0,
+            steps_us: Vec::new(),
+            placed: blaze_api::PlacedBytes::default(),
+        })
+    };
+    let said = |tiers| {
+        let responses = [built(), worked(tiers), Response::Done { ok: true }];
+        printed(Shown::default(), &responses, true).1
+    };
+    assert_eq!(
+        said(Some(Tiers::of(Goal::Edit).with(38, 100))),
+        format!("{FINISHED} (goal edit: tier 0 · 38% optimized)\n")
+    );
+    assert_eq!(said(Some(Tiers::of(Goal::Edit))), format!("{FINISHED} (goal edit: tier 0)\n"));
+    assert_eq!(
+        said(Some(Tiers::of(Goal::Max).with(9, 9))),
+        format!("{FINISHED} (goal max: optimized)\n")
+    );
+    assert_eq!(said(None), format!("{FINISHED}\n"));
+}
+
 #[test]
 fn what_a_request_did_is_one_json_line_of_blazes() {
     let worked = blaze_api::Worked {

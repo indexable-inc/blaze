@@ -16,8 +16,8 @@
 //!   files outside the view by their bytes, the mounts (each source and path dependency
 //!   outside the view by its root), the toolchain, where the daemon builds, and the blaze
 //!   that serves it ([`Inputs::config`]); and what the request says past those (whether its
-//!   diagnostics are colored, their width, how many refused functions it names, `-v`:
-//!   [`Inputs::request`]).
+//!   diagnostics are colored, their width, how many refused functions it names, `-v`, the
+//!   build goal: [`Inputs::request`]).
 //! - **Paths outside every view** (a build script's traced reads and the directories it
 //!   listed, an `include!`d file, the toolchain's files, the C compiler's): the watches of
 //!   [`blaze_vfs::outside`] heard nothing since the walk began ([`Vouches::quiet_since`]), and
@@ -213,7 +213,8 @@ pub(super) enum Moved {
     Blaze,
     /// Where the daemon places builds, sources or the standard library's builds.
     Places,
-    /// What the request says past its config: colors, width, refused functions, verbosity.
+    /// What the request says past its config: colors, width, refused functions, verbosity,
+    /// the build goal.
     Rendering,
 }
 
@@ -233,7 +234,7 @@ impl fmt::Display for Moved {
             Moved::Blaze => f.write_str("the version of blaze"),
             Moved::Places => f.write_str("where the daemon places builds and sources"),
             Moved::Rendering => f.write_str(
-                "how the request's diagnostics are said (colors, width, `--refused`, `-v`)",
+                "what the request says past its command line (colors, width, `--refused`, `-v`, `--goal`)",
             ),
         }
     }

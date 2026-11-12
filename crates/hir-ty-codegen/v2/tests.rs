@@ -137,6 +137,27 @@ fn o3() -> Build {
     Build::of(&Spec { backend: Backend::Llvm { opt: 3 }, mir_inline: true, ..spec() })
 }
 
+/// The invariant (docs/v2/plan/design/tiers.md, "Key shape"): tier 0 code of a crate that is
+/// not the library's is built from its own body alone. A unit at tier 0 (stencils, or LLVM at
+/// `-O0` for a CPU the stencils do not cover) asks for MIR level 1, no inliner and no
+/// devirtualization, so `hir-ty-mir`'s `optimize` runs neither `Inline` nor `SpendFacts` on
+/// it and its body reads no callee's body or effect summary: a body edit changes the key of
+/// one tier 0 function. The optimized tier asks for all three. (The library's own bodies are
+/// at level 2 and inlined under every unit, [`Build::options`]: they are std's, which no edit
+/// of the workspace reaches.)
+#[test]
+fn a_tier_zero_unit_builds_no_callee_into_its_bodies() {
+    let tier_zero = [Backend::Stencil, Backend::Llvm { opt: 0 }];
+    for backend in tier_zero {
+        let build = Build::of(&Spec { backend, ..spec() });
+        assert!(!build.optimized, "{backend:?}: MIR level 2 runs `SpendFacts`");
+        assert!(!build.inlines, "{backend:?}: the inliner builds callees in");
+        assert!(build.world.is_none(), "{backend:?}: devirtualized against the program");
+    }
+    let optimized = o3();
+    assert!(optimized.optimized && optimized.inlines);
+}
+
 /// What the compile of `instance` under `build` built in, by code: its `Function::inlined`.
 fn inlined_by_build(
     db: &Db,

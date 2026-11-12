@@ -1700,6 +1700,22 @@ pub(crate) fn checks_only(kind: JobKind, unit: &Unit) -> bool {
     }
 }
 
+/// The goal of the request `input` is of, for what its build says of itself
+/// ([`blaze_api::Worked::tiers`]): its `--goal`, else the goal of the profile of the first
+/// unit it asked for ([`blaze_api::Goal::of_profile`]); none for a request that asked for no
+/// unit. The goal one unit's code is compiled for is [`codegen::goal`]'s to say.
+pub(crate) fn request_goal(input: &JobInput) -> Option<blaze_api::Goal> {
+    input.goal.or_else(|| {
+        let graph = &input.units.graph;
+        let profile = &graph.units.get(*graph.roots.first()?)?.profile;
+        Some(blaze_api::Goal::of_profile(
+            &profile.name,
+            &profile.opt_level,
+            profile.codegen_backend.as_deref(),
+        ))
+    })
+}
+
 /// The phases of `unit`'s compile, each a node of the plane ([`Phase`]): no codegen and no
 /// link for a unit [`checks_only`] stops after the front end.
 pub(crate) fn phases(kind: JobKind, unit: &Unit) -> &'static [Phase] {

@@ -895,6 +895,7 @@ fn with_record_inputs<T>(
         linked_rustflag_libs: linked_rustflag_libs(job, unit)?,
         makers,
         kind: keyed_kind(job.input.kind, u),
+        goal: keyed_goal(job, unit)?,
         color: job.input.color,
         short: job.input.short,
         verified,
@@ -1089,6 +1090,8 @@ pub(crate) struct RecordInputs<'a> {
     pub(crate) makers: crate::serve::RecordMakers,
     /// [`keyed_kind`].
     pub(crate) kind: u8,
+    /// [`keyed_goal`].
+    pub(crate) goal: u8,
     pub(crate) color: bool,
     pub(crate) short: bool,
     pub(crate) verified: bool,
@@ -1140,6 +1143,7 @@ impl RecordInputs<'_> {
         hasher.id(&self.makers.front_end).id(&self.makers.codegen).id(&self.makers.record).update(
             &[
                 self.kind,
+                self.goal,
                 u8::from(self.color),
                 u8::from(self.short),
                 u8::from(self.verified),
@@ -1210,6 +1214,7 @@ impl RecordInputs<'_> {
                 Some(&self.makers.record),
             ),
             bytes("the job's kind", &[self.kind]),
+            bytes("the build goal (tier 0 code or optimized code)", &[self.goal]),
             flag("color", self.color),
             flag("short diagnostics", self.short),
             flag("BLAZE_ELIDE=verify (built to verify an inert build script)", self.verified),
@@ -1263,6 +1268,28 @@ pub(crate) fn keyed_kind(kind: JobKind, unit: &Unit) -> u8 {
         JobKind::Build => 1,
         JobKind::Test => 2,
         JobKind::Run => 3,
+    }
+}
+
+/// The build goal as unit `unit`'s record key holds it (docs/v2/plan/design/tiers.md): the
+/// tier its code is compiled at is the goal's ([`codegen::goal`]), and its unit and plan, which
+/// the key holds, are the same under both. 0 for a unit only checked, which compiles no code
+/// (so `blaze check --goal max` shares `blaze check`'s records); else 1 for `edit`, 2 for `max`.
+pub(crate) fn keyed_goal(job: &Job, unit: usize) -> Result<u8, ApiError> {
+    let u = job.unit(unit)?;
+    if checks_only(job.input.kind, u) {
+        return Ok(0);
+    }
+    let goal = codegen::goal(job, unit)
+        .map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?; // alloc: error path
+    Ok(goal_byte(goal))
+}
+
+/// A goal's byte in a record key: never 0, a unit only checked.
+pub(crate) fn goal_byte(goal: blaze_api::Goal) -> u8 {
+    match goal {
+        blaze_api::Goal::Edit => 1,
+        blaze_api::Goal::Max => 2,
     }
 }
 
@@ -1859,7 +1886,7 @@ struct Making {
     /// What codegen put, the outputs to follow.
     puts: Vec<Put>,
     natives: Vec<(String, ContentId)>,
-    links: Vec<(String, Linking)>,
+    links: Vec<(String, Linking, Option<blaze_api::Tiers>)>,
     macros: Option<ProcMacroLoadResult>,
     /// A device unit's MSL, as its link wrote it ([`Compiled::gpu_msl`]).
     gpu_msl: Option<Vec<u8>>,
@@ -3586,7 +3613,7 @@ fn assemble(
                             made.table = linked.table;
                         }
                         // alloc: once per image linked, a unit links one or two
-                        links.push((path.to_owned(), linked.how));
+                        links.push((path.to_owned(), linked.how, linked.tiers));
                         // What the link settled the store is given: the patch the image took
                         // the link as, where the store derives the file from the one before
                         // it, else the whole file (`codegen::LinkMade::written`).
