@@ -3498,8 +3498,10 @@ impl Dec<'_> {
         }
         data.unstable_features = features;
 
-        // The modules: the root as `DefMap::empty` makes it, and the others as the collector
-        // does, each in its parent.
+        // The modules: the root as `DefMap::empty` makes it (the crate's one root id,
+        // `facts::queries::crate_root`, the maintainer's too), and the others as the collector
+        // does, each in its parent: a crate read from its image has the module ids it has
+        // when resolved.
         let (n, room) = self.len_and_room()?;
         let mut skeleton = Vec::with_capacity(room);
         for _ in 0..n {
