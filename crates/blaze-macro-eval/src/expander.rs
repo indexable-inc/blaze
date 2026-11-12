@@ -1507,7 +1507,16 @@ impl Evaluated {
                             self.found(db, calling, &call)?;
                             // Found under its key, which a crate that settles keeps only shown
                             // calls under (`shown`).
-                            return Ok(Expanded { tree, reads, state: state_use(verdict, true) });
+                            // A value of the fresh state (or shown the same from either)
+                            // is fixed by its call and reads, whatever its crate's verdict.
+                            let state = match reads {
+                                ExpansionReads::Unknown(_) => state_use(verdict, true),
+                                _ if matches!(verdict, Verdict::Unseen | Verdict::Stateful) => {
+                                    StateUse::Fixed
+                                }
+                                _ => state_use(verdict, true),
+                            };
+                            return Ok(Expanded { tree, reads, state });
                         }
                         Mode::Check => found = Some((checked(value), reads, verified)),
                     }
@@ -1707,7 +1716,15 @@ impl Evaluated {
             true => None,
             false => unknown_why,
         };
-        let state = state_use(verdict, proven);
+        // And its output is fixed by its call and reads: the front end keeps its expansion
+        // while those are the same, as any other's. Left as a session's (run again in every
+        // revision), each edit of reth ran all 26 `#[rpc]` expansions of reth-rpc-api again,
+        // one at a time with the calls before each run again, and every query that needs
+        // that crate's impls waited for them: 7 s of a 12 s body edit of another crate.
+        let state = match unsettled && fresh_shown {
+            true => StateUse::Fixed,
+            false => state_use(verdict, proven),
+        };
         if let Some(why) = unknown_why.filter(|_| !keep || session) {
             return done(output, ExpansionReads::Unknown(why), state);
         }
