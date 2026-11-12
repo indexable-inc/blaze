@@ -2254,6 +2254,69 @@ fn a_large_value_is_a_file_of_its_own_placed_by_sharing_blocks() {
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), big);
 }
 
+/// The invariant: a clone placed at a path a program is started from ([`Store::starts`]) is
+/// asked to hold what the system holds of the path's file ([`Effect::Prewarm`], from the path
+/// to the staged clone) after it is cloned, and renamed onto the path only as that completed,
+/// since after the rename the path names the clone; where no file is at the path yet the
+/// place still ends well; and a path nothing is started from is asked for no prewarm. The
+/// control is the last: the same place with the path not said started renames with none.
+#[test]
+fn a_clone_placed_where_a_program_starts_is_prewarmed_before_its_rename() {
+    let mut sim = Sim::new(9, quiet());
+    let mut store = open(&mut sim, "store");
+    let big = noise(EXTERNAL_FROM + 10, 90);
+    store.put(key(1), Kind::Image, &big).unwrap();
+    flush(&mut sim, &mut store);
+    // What the store asks for the path, in order, each with the completion it was asked
+    // under (`None`: as the place was asked).
+    fn placed_logged(sim: &mut Sim, store: &mut Store, to: &str) -> Vec<(String, Option<String>)> {
+        let to = name(to);
+        let mut effects = Vec::new();
+        let tag = store.place(&key(1), to.clone(), &mut effects).unwrap();
+        let said = |effect: &Effect| match effect {
+            Effect::Clone { .. } => Some("clone".to_owned()),
+            Effect::Prewarm { like, file, .. } => {
+                Some(format!("prewarm {like} into {}", if *file == to { "the path" } else { "its clone" }))
+            }
+            Effect::RenameUnsynced { to: onto, .. } if *onto == to => Some("rename".to_owned()),
+            _ => None,
+        };
+        let mut log: Vec<(String, Option<String>)> =
+            effects.iter().filter_map(&said).map(|it| (it, None)).collect();
+        run_until_idle(sim, &mut effects, |completion, effects| {
+            if store.owns(completion.tag) {
+                let under = format!("{:?}", completion.done);
+                let before = effects.len();
+                store.complete(completion, effects);
+                log.extend(effects[before..].iter().filter_map(&said).map(|it| (it, Some(under.clone()))));
+            }
+        })
+        .expect("the effects end");
+        let placed = store.placed();
+        assert!(placed.iter().any(|it| it.tag == tag && it.result == Ok(())), "{placed:?}");
+        log
+    }
+    let asked = |log: &[(String, Option<String>)]| log.iter().map(|it| it.0.clone()).collect::<Vec<_>>();
+
+    // No file at the path yet: prewarmed all the same (of nothing), and placed.
+    store.starts(&name("target/app"), true);
+    let first = placed_logged(&mut sim, &mut store, "target/app");
+    assert_eq!(asked(&first), ["clone", "prewarm target/app into its clone", "rename"]);
+    assert_eq!(sim.contents(&name("target/app")), big);
+    // Over the file there: the prewarm is asked as the clone completed, the rename as the
+    // prewarm did.
+    let again = placed_logged(&mut sim, &mut store, "target/app");
+    assert_eq!(asked(&again), ["clone", "prewarm target/app into its clone", "rename"]);
+    assert_eq!(again[1].1.as_deref(), Some("Cloned"), "{again:?}");
+    assert!(again[2].1.as_deref().is_some_and(|it| it.starts_with("Prewarmed")), "{again:?}");
+    // The control: a path nothing is started from, and the same path once it is said so.
+    let other = placed_logged(&mut sim, &mut store, "target/app.debug");
+    assert_eq!(asked(&other), ["clone", "rename"]);
+    store.starts(&name("target/app"), false);
+    let unstarted = placed_logged(&mut sim, &mut store, "target/app");
+    assert_eq!(asked(&unstarted), ["clone", "rename"]);
+}
+
 #[test]
 fn where_blocks_cannot_be_shared_a_place_fails_and_copies_nothing() {
     let mut sim = Sim::new(10, Faults { no_clone: true, ..Faults::default() });

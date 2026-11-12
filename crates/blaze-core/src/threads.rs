@@ -1086,6 +1086,10 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             at(root, &to, |to| fs::clone(from, to))?;
             Ok(Done::Cloned)
         }),
+        Effect::Prewarm { like, file, .. } => at(root, &like, |like| {
+            let bytes = at(root, &file, |file| fs::prewarm(like, file, crate::PREWARM_MOST))?;
+            Ok(Done::Prewarmed { bytes })
+        }),
         Effect::Link { from, to, .. } => at(root, &from, |from| {
             at(root, &to, |to| fs::link(from, to))?;
             Ok(Done::Linked)

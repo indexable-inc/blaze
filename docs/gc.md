@@ -316,8 +316,10 @@ skip it and `blaze clean` knows it as a build dir: only into one blaze made just
 `<root>/build`, never into a directory of the user's.
 
 The collector's ledger, `<state>/gc-ledger.json`, keeps when its last run ended (so the periodic
-deadline survives a restart) and its last 16 runs' reports. An asked or urgent run's is written
-as it ends, a paced slice's at most once a minute. A ledger that does not read is logged
+deadline survives a restart) and its last 16 runs' reports. An asked run's is written as it
+ends, as is an urgent run's with no build under way; an urgent run's that ended beside a build
+is written once no build has been under way for a second (never beside the build's outputs),
+a paced slice's at most once a minute. A ledger that does not read is logged
 and begun afresh, never silently.
 
 ## Commands

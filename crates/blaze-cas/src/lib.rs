@@ -955,6 +955,10 @@ pub struct Store {
     /// The outputs being written from the runs their maker holds ([`Content::Sparse`],
     /// [`Store::place_made`]), by the tag their place was asked with.
     writing: HashMap<Tag, publish::Writing, Global>, // alloc: the store's own table, for its life
+    /// The paths a program is started from ([`Store::starts`]): a clone renamed onto one is
+    /// first asked to hold in memory what the system holds of the path's file
+    /// ([`Effect::Prewarm`]), whichever way it is placed.
+    started: HashSet<FileName, Global>, // alloc: the store's own table, a name an executable placed
     /// The whole files of outputs placed by cloning ([`CLONE_FROM`]), by content.
     files: ByHash<ContentId, PlacedFile, Global>, // alloc: the store's own table, for its life
     /// The whole files that are derived values' ([`Kind::Derived`]), each by its key's hash
@@ -1512,6 +1516,15 @@ enum Op {
         of: Option<Source>,
         bytes: PlacedBytes,
     },
+    /// `staged`'s clone, of a path a program is started from ([`Store::starts`]), asked to
+    /// hold in memory what the system holds of `to`'s file ([`Effect::Prewarm`]), before it is
+    /// renamed onto `to`: after the rename `to` names the clone.
+    Warm {
+        asked: Tag,
+        to: FileName,
+        staged: Staged,
+        bytes: PlacedBytes,
+    },
     /// `staged`'s clone renamed onto `to`.
     Commit {
         asked: Tag,
@@ -1580,6 +1593,11 @@ enum Op {
     },
     /// One of the ranges of the output place `asked` derives written, or its length set.
     PatchWrite {
+        asked: Tag,
+    },
+    /// The clone the output place `asked` derives, of a path a program is started from, asked
+    /// to hold in memory what the system holds of its path's file, as [`Op::Warm`].
+    PatchWarm {
         asked: Tag,
     },
     /// The output place `asked` derives renamed from its staged name onto its path.
@@ -2070,6 +2088,7 @@ impl Store {
             place_spans: HashMap::new_in(Global), // alloc: the store's own table, for its life
             patching: HashMap::new_in(Global), // alloc: the store's own table, for its life
             writing: HashMap::new_in(Global), // alloc: the store's own table, for its life
+            started: HashSet::new_in(Global), // alloc: the store's own table, for its life
             files: ByHash::new_in(Global), // alloc: the store's own table, for its life
             derived: ByHash::new_in(Global), // alloc: the store's own table, for its life
             derive_depth: 0,
@@ -3348,7 +3367,18 @@ impl Store {
     /// program may be running is never written, and what is written is the patch, whatever
     /// the file's length. Nothing of the store is read, cloned or waited for. A `to` that is
     /// not there, or on a volume that shares no blocks, fails the place, naming it.
-    pub fn place_patched(&mut self, to: FileName, file: Sparse, effects: &mut Vec<Effect>) -> Tag {
+    ///
+    /// `started` says a program is started from `to` (an executable): its clone is then asked
+    /// to hold in memory what the system holds of `to`'s file ([`Effect::Prewarm`],
+    /// `publish::Writing`), so the program's next start reads from memory what its last run
+    /// did. A file nothing starts from (a debug file) is not.
+    pub fn place_patched(
+        &mut self,
+        to: FileName,
+        file: Sparse,
+        started: bool,
+        effects: &mut Vec<Effect>,
+    ) -> Tag {
         assert!(
             !self.tiers.iter().any(|tier| to.is_under(&tier.dir)),
             "{to} is in the store: values are placed outside it"
@@ -3366,7 +3396,8 @@ impl Store {
             waits = tracing::field::Empty,
         );
         self.place_spans.insert(tag, span);
-        self.publish(tag, to, Content::Over(file), Durable::No, 0, effects);
+        self.starts(&to, started);
+        self.publish(tag, to, Content::Over { file, started }, Durable::No, 0, effects);
         tag
     }
 
@@ -3492,7 +3523,7 @@ impl Store {
                 Content::File { of: None, .. }
                 | Content::Bytes(_)
                 | Content::Sparse(_)
-                | Content::Over(_) => {}
+                | Content::Over { .. } => {}
             }
             // alloc: an error, once per place refused
             let why = format!(
@@ -3508,7 +3539,10 @@ impl Store {
                 bytes: PlacedBytes::default(),
             });
         }
-        let over = matches!(content, Content::Over(_));
+        let over = match &content {
+            Content::Over { started, .. } => Some(*started),
+            _ => None,
+        };
         match content {
             Content::Bytes(bytes) => {
                 let placed = PlacedBytes { cloned: 0, written, copied: bytes.len() as u64 };
@@ -3520,7 +3554,7 @@ impl Store {
                 let op = Op::Place { asked, to, staged: None, of: None, bytes: placed };
                 self.tags.ops.insert(asked, op);
             }
-            Content::Sparse(file) | Content::Over(file) => {
+            Content::Sparse(file) | Content::Over { file, .. } => {
                 if let Err(why) = file.check() {
                     // alloc: an error, once per place refused
                     let why = format!("{to} was to be written from runs that are no file: {why}");
@@ -3546,7 +3580,9 @@ impl Store {
                     ),
                     _ => (temp, None),
                 };
-                let (writing, clear) = publish::Writing::begin(to, temp, file, over, asked);
+                let (mut writing, clear) =
+                    publish::Writing::begin(to, temp, file, over.is_some(), asked);
+                writing.warm = over == Some(true);
                 #[cfg(test)]
                 let writing = writing.planted_with(plant);
                 self.writing.insert(asked, writing);
@@ -3633,6 +3669,14 @@ impl Store {
                     return;
                 }
                 match patching.failed.take() {
+                    // A program is started from the path: the clone is first asked to hold
+                    // in memory what the system holds of the path's file ([`Op::Warm`]).
+                    None if self.started.contains(&patching.to) => {
+                        // clone: the effect owns the names; once per place
+                        let (like, file) = (patching.to.clone(), patching.temp.clone());
+                        let tag = self.tags.ask(Op::PatchWarm { asked });
+                        effects.push(Effect::Prewarm { like, file, tag });
+                    }
                     None => {
                         // clone: the effect owns the names; once per place
                         let (from, to) = (patching.temp.clone(), patching.to.clone());
@@ -3643,6 +3687,26 @@ impl Store {
                     Some(why) => {
                         // alloc: an error, once per place that fails
                         let why = format!("writing its ranges into its base's clone: {why}");
+                        self.patch_failed(asked, &why, effects)
+                    }
+                }
+            }
+            Op::PatchWarm { asked } => {
+                let Some(patching) = self.patching.get(&asked) else { return };
+                match done {
+                    Done::Prewarmed { .. } => {
+                        // clone: the effect owns the names; once per place
+                        let (from, to) = (patching.temp.clone(), patching.to.clone());
+                        let tag = self.tags.ask(Op::PatchRename { asked });
+                        // Not synced: the path holds its old file or the new one, whole.
+                        effects.push(publish::rename(from, to, Durable::No, tag));
+                    }
+                    done => {
+                        // alloc: an error, once per place that fails
+                        let why = format!(
+                            "asking the system to read ahead what it holds of its path's file: {}",
+                            describe(&done)
+                        );
                         self.patch_failed(asked, &why, effects)
                     }
                 }
@@ -4139,6 +4203,40 @@ impl Store {
         let staged = Staged { temp, content };
         self.tags.ops.insert(asked, Op::Clear { asked, from, to, staged, of, bytes });
         clear
+    }
+
+    /// `staged`'s clone, whole under its own name, renamed onto `to`: it replaces whatever is
+    /// there in one step, a concurrent place's clone of the same bytes too. Not synced: the
+    /// path holds its old file or the clone, whole, and a crash that undoes the rename leaves
+    /// the old one, placed again by the build that finds it.
+    fn commit_staged(
+        &mut self,
+        asked: Tag,
+        to: FileName,
+        staged: Staged,
+        bytes: PlacedBytes,
+        effects: &mut Vec<Effect>,
+    ) {
+        // clone: the effect and the op each own the names; once per place
+        let (from, into) = (staged.temp.clone(), to.clone());
+        let tag = self.tags.ask(Op::Commit { asked, to, staged, bytes });
+        effects.push(publish::rename(from, into, Durable::No, tag));
+    }
+
+    /// Says whether a program is started from `to` (an executable a `run` or a person
+    /// starts): every clone placed there from now on is then asked, before its rename, to
+    /// hold in memory what the system holds of the file at `to` ([`Effect::Prewarm`]), so the
+    /// program's next start reads from memory what its last run did, where a clone alone
+    /// shares no cached page (30 to 45 ms of the first `exec` of hello world's image on
+    /// APFS). A file nothing starts from (a debug file) is not asked, which would read from
+    /// the disk, each place, whatever of it the system held.
+    pub fn starts(&mut self, to: &FileName, started: bool) {
+        match started {
+            // clone: the store's own copy of the name, once a path
+            true if !self.started.contains(to) => _ = self.started.insert(to.clone()),
+            true => {}
+            false => _ = self.started.remove(to),
+        }
     }
 
     /// The hidden name beside `to` that the place `asked` clones into before it renames it onto
@@ -5053,14 +5151,18 @@ impl Store {
                     // The clone is whole under its own name: renamed onto `to`, it replaces
                     // whatever is there in one step, a concurrent place's clone of the same
                     // bytes too. (Under the planted bug the clone was made at `to` itself.)
-                    (Done::Cloned, _, Some(staged)) if !(cfg!(test) && staged.temp == to) => {
+                    // A program is started from `to`: the clone is first asked to hold in
+                    // memory what the system holds of `to`'s file, which the rename replaces.
+                    (Done::Cloned, _, Some(staged))
+                        if !(cfg!(test) && staged.temp == to) && self.started.contains(&to) =>
+                    {
                         // clone: the effect and the op each own the names; once per place
-                        let (from, into) = (staged.temp.clone(), to.clone());
-                        let tag = self.tags.ask(Op::Commit { asked, to, staged, bytes });
-                        // Not synced: the path holds its old file or the clone, whole, and
-                        // a crash that undoes the rename leaves the old one, placed again by
-                        // the build that finds it.
-                        effects.push(publish::rename(from, into, Durable::No, tag));
+                        let (like, file) = (to.clone(), staged.temp.clone());
+                        let tag = self.tags.ask(Op::Warm { asked, to, staged, bytes });
+                        effects.push(Effect::Prewarm { like, file, tag });
+                    }
+                    (Done::Cloned, _, Some(staged)) if !(cfg!(test) && staged.temp == to) => {
+                        self.commit_staged(asked, to, staged, bytes, effects);
                     }
                     (Done::Cloned | Done::Written, _, _) => {
                         self.answer(Placed { tag: asked, to, result: Ok(()), bytes })
@@ -5098,6 +5200,20 @@ impl Store {
                     }
                 }
             }
+            Op::Warm { asked, to, staged, bytes } => match done {
+                Done::Prewarmed { .. } => self.commit_staged(asked, to, staged, bytes, effects),
+                done => {
+                    // clone: the effect and the op each own the name; once per place that fails
+                    let tag = self.tags.ask(Op::Discard { file: staged.temp.clone() });
+                    effects.push(Effect::Remove { file: staged.temp, tag });
+                    // alloc: an error, once per place that fails
+                    let result = Err(format!(
+                        "asking the system to read ahead what it holds of {to}: {}",
+                        describe(&done)
+                    ));
+                    self.answer(Placed { tag: asked, to, result, bytes: PlacedBytes::default() });
+                }
+            },
             Op::Recheck { content, waiter, why } => {
                 self.rechecked(content, waiter, &why, &done, effects)
             }
@@ -5192,6 +5308,7 @@ impl Store {
             op @ (Op::PatchClear { .. }
             | Op::PatchClone { .. }
             | Op::PatchWrite { .. }
+            | Op::PatchWarm { .. }
             | Op::PatchRename { .. }) => {
                 self.patch_step(op, done, effects);
             }

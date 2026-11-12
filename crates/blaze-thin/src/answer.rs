@@ -1,14 +1,19 @@
 //! What the daemon answers a build with, as the thin `blaze` takes it: the answer of a build
-//! that had nothing to say ([`Plain`]), which it prints itself, or the first response that is
-//! not such an answer's, at which it hands the whole answer to the engine before it has
-//! written a byte ([`Step::HandOver`]).
+//! that went well with nothing to say but cargo's status lines ([`Plain`]), which it prints
+//! itself, or the first response that is not such an answer's, at which it hands the whole
+//! answer to the engine before it has written a byte ([`Step::HandOver`]).
 //!
-//! A plain answer is every unit fresh, the build's outputs, its work with nothing computed
-//! again, and a `Done` that is ok. What it prints is then exactly what blaze's CLI prints of
-//! it (`blaze_cargo::cli::print`): a `link:` line an image, `Finished`, and for a `run` its
-//! `Running` line. A diagnostic, a unit compiled, a report, a fetch, an error, a build that
-//! recomputed anything: each is the engine's printer's, which says more than this could
-//! without being that printer a second time.
+//! A plain answer is units fresh or compiled with no diagnostic, the build's outputs, its
+//! work, and a `Done` that is ok. What it prints is then exactly what blaze's CLI prints of it
+//! (`blaze_cargo::cli::print`): `Compiling` a package compiled, a `link:` line an image,
+//! `Finished`, and for a `run` its `Running` line. So an edit's build that went well (a unit
+//! compiled, its image patched) is answered here, and its program started, with no second
+//! process: until 2026-11-11 a unit compiled handed the answer to the engine, which cost an
+//! edit that program's start, a second connection for the launch and a third for its rows.
+//! A diagnostic, a report, a fetch, an error, a failure: each is the engine's printer's, which
+//! says more than this could without being that printer a second time. So is a build that
+//! says why it recomputed what it did after `Finished` ([`Plain::of`]'s `reports`: a `build`
+//! that is not quiet): that one is handed over at its first unit compiled, as it starts.
 //!
 //! A sans-IO core: responses in, a decision and the text out.
 
@@ -18,7 +23,7 @@ use std::{
     time::Duration,
 };
 
-use blaze_api::{Artifact, Linked, Response, TargetKind, Tiers, Verb};
+use blaze_api::{Artifact, Linked, Response, TargetKind, Tiers, UnitStarted, Verb};
 
 use crate::say;
 
@@ -33,19 +38,39 @@ pub enum Step {
     HandOver(&'static str),
 }
 
+/// The most packages one answer's units may number theirs to, as the engine's printer holds
+/// it (`blaze_cargo::cli::print`'s `IDS`): past it that printer says the daemon's error.
+const IDS: u32 = 1 << 24;
+
 /// A build's answer so far, every response of it plain.
 #[derive(Debug, Default)]
 pub struct Plain {
+    /// The command says, after `Finished`, why the build recomputed what it did
+    /// ([`Plain::of`]).
+    reports: bool,
     /// The profile of [`Response::Built`], which `Finished` names; `None` until it came.
     profile: Option<String>,
     artifacts: Vec<Artifact>,
     links: Vec<Linked>,
     tiers: Option<Tiers>,
+    /// The first unit compiled or checked of each package, in the order they came: cargo's
+    /// `Compiling` lines.
+    compiled: Vec<UnitStarted>,
 }
 
 impl Plain {
+    /// The answer of a command that says nothing of what its build recomputed: a `run`, or a
+    /// quiet `build`.
     pub fn new() -> Plain {
         Plain::default()
+    }
+
+    /// The answer of a command; `reports` when it says, after `Finished`, why its build
+    /// recomputed what it did (a `build` that is not quiet; a `run` starts its program
+    /// instead, `blaze_cargo::cli::said_recomputed`). Those reports are the engine's
+    /// printer's, so such an answer is handed over at its first unit compiled.
+    pub fn of(reports: bool) -> Plain {
+        Plain { reports, ..Plain::default() }
     }
 
     /// Takes the answer's next response.
@@ -53,7 +78,22 @@ impl Plain {
         match response {
             // Shown only under `-v`, which is the engine's.
             Response::Unit(unit) if unit.verb == Verb::Fresh => Step::More,
-            Response::Unit(_) => Step::HandOver("a unit is compiled"),
+            Response::Unit(_) if self.reports => {
+                Step::HandOver("a unit is compiled, and the build says why after it")
+            }
+            Response::Unit(unit) if unit.package >= IDS => {
+                Step::HandOver("a package numbered past any request's")
+            }
+            // cargo's `Compiling foo v0.1.0 (/w/foo)`, once a package.
+            Response::Unit(unit) => {
+                if !self.compiled.iter().any(|it| it.package == unit.package) {
+                    self.compiled.push(unit);
+                }
+                Step::More
+            }
+            // A unit's end says its warnings' count or that it could not compile: of a unit
+            // with no diagnostic, nothing. A diagnostic or a report is handed over as it comes.
+            Response::UnitEnded(_) => Step::More,
             // What a build script's run said (its record's, for a script kept as for one
             // run): the printer writes it only as a JSON message
             // (`blaze_cargo::cli::print`), and a command line with `--message-format` is the
@@ -70,7 +110,8 @@ impl Plain {
             }
             Response::Work(worked) => {
                 // What it computed again is said after `Finished`, as reports.
-                if worked.misses != 0 || worked.why.as_ref().is_some_and(|it| !it.is_empty()) {
+                let again = worked.misses != 0 || worked.why.as_ref().is_some_and(|it| !it.is_empty());
+                if self.reports && again {
                     return Step::HandOver("the build computed something again");
                 }
                 self.links = worked.links;
@@ -84,11 +125,29 @@ impl Plain {
     }
 
     /// What blaze's CLI writes to stderr of this answer, the build over `took` after the
-    /// command began: one `link:` line an image the build linked (in every format, under `-q`
-    /// too), then `Finished` unless `quiet` or the build placed nothing.
+    /// command began: `Compiling` a package compiled unless `quiet`, one `link:` line an image
+    /// the build linked (in every format, under `-q` too), then `Finished` unless `quiet` or
+    /// the build placed nothing.
     pub fn said(&self, quiet: bool, color: bool, took: Duration) -> String {
         use std::fmt::Write as _;
         let mut out = String::with_capacity(160); // alloc: once a command, what it prints
+        if !quiet {
+            for unit in &self.compiled {
+                let word = match unit.verb {
+                    Verb::Checking => "Checking",
+                    Verb::Compiling | Verb::Fresh => "Compiling",
+                };
+                say::status_word(&mut out, word, color);
+                out.push_str(&unit.name);
+                out.push_str(" v");
+                out.push_str(&unit.version);
+                if let Some(source) = &unit.source {
+                    out.push(' ');
+                    out.push_str(source);
+                }
+                out.push('\n');
+            }
+        }
         for link in &self.links {
             // Writing to a String cannot fail. `blaze_ui::api::link_lines`'s line.
             let _ = writeln!(out, "link: {} ({})", link.path, link.how);
@@ -224,6 +283,31 @@ mod tests {
         assert_eq!(plain.program(), None);
         let again = Response::Built { members: 1, profile: String::new(), artifacts: Vec::new() };
         assert!(matches!(plain.take(again), Step::HandOver(_)));
+    }
+
+    fn compiling(package: u32) -> Response {
+        Response::Unit(UnitStarted {
+            name: "foo".to_owned(),
+            verb: Verb::Compiling,
+            source: Some("(/w/foo)".to_owned()),
+            package,
+            version: "0.1.0".to_owned(),
+            package_id: "path+file:///w/foo#0.1.0".to_owned(),
+        })
+    }
+
+    /// An edit's answer: a unit compiled is said once a package, and nothing is handed over.
+    /// The control: the same unit of a command that reports what it recomputed is handed over.
+    #[test]
+    fn a_unit_compiled_is_said_once_a_package_unless_the_command_reports() {
+        let mut plain = Plain::new();
+        assert_eq!(plain.take(compiling(0)), Step::More);
+        assert_eq!(plain.take(compiling(0)), Step::More);
+        assert_eq!(plain.take(Response::Done { ok: true }), Step::Done);
+        assert_eq!(plain.said(false, false, Duration::ZERO), "   Compiling foo v0.1.0 (/w/foo)\n");
+        assert_eq!(plain.said(true, false, Duration::ZERO), "");
+        assert!(matches!(Plain::of(true).take(compiling(0)), Step::HandOver(_)));
+        assert!(matches!(Plain::new().take(compiling(IDS)), Step::HandOver(_)));
     }
 
     #[test]

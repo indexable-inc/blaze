@@ -180,19 +180,39 @@ impl File {
     /// `build`'s `record` to the file: appended, or the whole ledger written while the file is
     /// behind or due a compaction. What failed, for `blaze daemon status`.
     pub fn write(&mut self, build: u64, record: &[u8]) -> Result<(), String> {
-        if !self.writable || (record.is_empty() && self.behind.is_none()) {
+        // alloc: clone: one build's record, where a caller writes one alone (tests)
+        self.write_all(&[(build, record.to_vec())])
+    }
+
+    /// The records of the builds explained since the file was last written, in the order they
+    /// were explained: appended as one write with one sync, which is the bytes each would have
+    /// appended alone; or, while the file is behind or due a compaction, the whole ledger
+    /// written once, which holds every one of them. What failed, for `blaze daemon status`:
+    /// the first of the builds is then the one the file is behind from.
+    ///
+    /// Written together because they are written late: a build's record is appended and
+    /// synced once the builds have been quiet (`serve::observe::Held`), never as the build
+    /// ends, when its outputs are being placed on the disk the sync flushes (measured
+    /// 2026-11-11 on APFS: 7 ms of `F_FULLFSYNC` beside each edit's placement).
+    pub fn write_all(&mut self, records: &[(u64, Vec<u8>)]) -> Result<(), String> {
+        let Some(&(first, _)) = records.first() else { return Ok(()) };
+        let bytes: u64 = records.iter().map(|it| it.1.len() as u64).sum();
+        if !self.writable || (bytes == 0 && self.behind.is_none()) {
             return Ok(());
         }
-        if self.behind.is_some() || self.due(self.len + record.len() as u64) {
-            return self.whole().map_err(|error| self.fell_behind(build, error.why));
+        if self.behind.is_some() || self.due(self.len + bytes) {
+            return self.whole().map_err(|error| self.fell_behind(first, error.why));
         }
-        let _span = tracing::info_span!(target: "blaze", "append to blaze why's ledger", build, bytes = record.len()).entered();
-        match self.append(record) {
+        let build = records.last().map_or(first, |it| it.0);
+        let _span = tracing::info_span!(target: "blaze", "append to blaze why's ledger", build, bytes, builds = records.len()).entered();
+        // alloc: the records as one write, once a flush of the history
+        let joined = records.iter().flat_map(|it| it.1.iter().copied()).collect::<Vec<u8>>();
+        match self.append(&joined) {
             Ok(len) => {
                 self.len = len;
                 Ok(())
             }
-            Err(error) => Err(self.fell_behind(build, error)),
+            Err(error) => Err(self.fell_behind(first, error)),
         }
     }
 
@@ -696,6 +716,36 @@ mod tests {
             .collect();
         out.sort();
         out
+    }
+
+    /// The refinement: builds' records written together ([`File::write_all`]) leave the file
+    /// byte for byte as each written alone as its build ended does, and a restore of either
+    /// explains the next build alike. So a record written late, with the ones after it, is
+    /// the same ledger.
+    #[test]
+    fn records_written_together_are_the_file_of_each_written_alone() {
+        let (alone, together) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (mut one, _) = File::restore(alone.path());
+        for (build, code) in [(3, 7), (4, 8), (5, 9)] {
+            built(&mut one, build, code);
+        }
+        let (mut all, _) = File::restore(together.path());
+        let mut pending = Vec::new();
+        for (build, code) in [(3, 7), (4, 8), (5, 9)] {
+            let (_, _, record) = all.explain(build, true, vec![miss(1, code)]);
+            pending.push((build, record));
+        }
+        assert_eq!(fs::metadata(together.path().join(LEDGER)).map(|it| it.len()).unwrap_or(0), 0);
+        all.write_all(&pending).unwrap();
+        all.write_all(&[]).unwrap();
+        let bytes = |dir: &Path| fs::read(dir.join(LEDGER)).unwrap();
+        assert_eq!(bytes(alone.path()), bytes(together.path()));
+        assert_eq!(one.len, all.len);
+        let (mut again, said) = File::restore(together.path());
+        assert!(said.torn.is_none(), "{:?}", said.torn);
+        let (mut was, _) = File::restore(alone.path());
+        let explain = |file: &mut File| file.explain(6, true, vec![miss(1, 9), miss(2, 1)]).0;
+        assert_eq!(format!("{:?}", explain(&mut again)), format!("{:?}", explain(&mut was)));
     }
 
     /// The faults a ledger file can have at a start, each as it should be met: an empty file
