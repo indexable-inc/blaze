@@ -832,14 +832,24 @@ What stays on GitHub's hosted runners, and why:
 - Windows, which ix does not serve.
 - The bench workflows' measurements run on the machines `BENCH_RUNNERS` registers.
 
-How far blaze cross-compiles today: `--target` takes one foreign triple; std is built from
-`library/` for it, Cranelift and LLVM emit for it, and blaze-link writes ELF and Mach-O itself,
-signing Mach-O ad hoc (no `codesign`). What a cross build still borrows from the host: a C cross
-compiler as `CC_<triple>` (crt objects, libc, build scripts' `cc`), read when the daemon starts;
-the pinned LLVM's build script runs the target archive's own `llvm-config` (qemu-user for
-x86-64, impossible for a Mach-O one on Linux); and `build_release.py` builds only for the host.
-For `aarch64-apple-darwin` on Linux it also needs a macOS SDK at `SDKROOT`, a darwin clang as
-`CC_aarch64_apple_darwin` and `otool`, none of which CI has, so no darwin cross job runs.
+How far blaze cross-compiles today (ledger row X1; the design is
+[toolchain-c.md](v2/plan/design/toolchain-c.md#cross-compilation)): `--target` takes one foreign
+triple; std is built from `library/` for it, Cranelift and LLVM emit for it, and blaze-link
+writes ELF and Mach-O itself, signing Mach-O ad hoc (no `codesign`). A program of Rust alone
+borrows nothing from the host: for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` and
+`aarch64-apple-darwin` blaze-link takes glibc's symbols (release 2.28), libgcc_s's, a start
+object and libSystem's symbol list from its own binary, and runs no program and reads no file of
+the machine. Measured on an AArch64 Linux VM at 079690a95a (2026-11-12) under `env -i` with a
+PATH of one empty directory and no `CC*`, `SDKROOT`, `LIBRARY_PATH` or `NIX_LDFLAGS`: the probe
+(`harness/v2/cross/probe`) built for all three; the AArch64 one ran and passed its five checks,
+the x86-64 one passed them under qemu-user 11.1.2 against glibc 2.44 (270 ms); a second build
+from an empty home on the same machine gave the same bytes for each. Not measured: the darwin
+binary run on a Mac, and a build from a second host. What still borrows from the host: a link
+that names anything blaze does not ship (a `-sys` crate's archive, a system library, a
+framework, a sanitizer) takes the machine's C toolchain as `CC_<triple>` for all of it, and for
+darwin the SDK at `SDKROOT`; build scripts' `cc`; the pinned LLVM's build script, which runs
+the target archive's own `llvm-config` until the archives are rebuilt with their link manifest;
+and `build_release.py` builds only for the host. The musl triples are not linked.
 
 ### Named harnesses, and the projects downstream
 
