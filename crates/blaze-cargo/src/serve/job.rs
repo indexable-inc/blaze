@@ -4469,6 +4469,20 @@ impl<S: Steps> Jobs<S> {
     fn keep_answer(&mut self, recorded: Recorded, ok: bool) {
         let Recorded { root, recording, walked, .. } = recorded;
         let (made_nothing, worked) = walked.unwrap_or((false, None));
+        // Each path the walk looked at on the disk, with how often: one look is enough to
+        // keep the next build from being answered again, and the refusal names the last alone.
+        let looked = blaze_vfs::outside::take_named_looks();
+        if !looked.is_empty() {
+            // alloc: once a build that looked, the paths as text
+            let paths: Vec<String> =
+                looked.iter().map(|(path, times)| format!("{} ({times})", path.display())).collect();
+            tracing::info!(
+                target: "blaze",
+                root = %root,
+                paths = %paths.join(", "),
+                "the build looked at paths outside every view on the disk, which no watch covers"
+            );
+        }
         let last = recording.end(Walk {
             passed: ok,
             made_nothing,
