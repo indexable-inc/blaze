@@ -223,6 +223,73 @@ fn a_crate_rebuilds_after_its_daemon_restarts() {
     assert_eq!(case.ok(&["run"]), "after\n");
 }
 
+/// The pid of the daemon `case`'s log last says is listening.
+fn daemon_pid(case: &Case) -> Option<String> {
+    let log = fs::read_to_string(case.home.join("v2/serve.log")).ok()?;
+    let pid = log.rsplit("listening on ").next()?.split("(pid ").nth(1)?.split(')').next()?;
+    (!pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())).then(|| pid.to_owned())
+}
+
+/// The longest the first request after a restart that sees a changed file may take here: the
+/// 45 s an agent's loop gave it on 2026-11-11 was the bound it missed; a release blaze answers
+/// in about 8 s, an unoptimised one is slower.
+const RESTART_EDIT_BOUND: Duration = Duration::from_secs(120);
+
+/// The first request after a restart that sees a changed source file answers within its
+/// bound, prints what a fresh home's build of the same source prints, and the daemon caught
+/// no panic on the way: after a `blaze stop`, and after a `kill -9`. On 5c2f8b2ec8 it did not
+/// answer in 45 s, three times of three: the restarted daemon's first build of the edit
+/// writes the input fields of every library crate again (4,722 of them, which 551,000 rows
+/// read), the changed-set walk verified each row it reached on the pool, and each row keyed
+/// by a module the def maps no longer had panicked as it ran (40,903 caught panics, each a
+/// stack written to the log). The walk now marks a wide level and contains at most 8 unwinds
+/// (`blaze_query`'s `WIDE` and `UNWOUND_MOST`).
+#[test]
+fn an_edit_after_a_restart_answers_within_its_bound_as_a_fresh_build_does_with_no_panic_caught() {
+    const THIRD: &str = "fn main() {\n    println!(\"a third\");\n}\n";
+    let case = Case::new("a_crate_rebuilds_after_its_daemon_restarts");
+    assert_eq!(case.ok(&["run"]), "before\n");
+    // Once more, warm: the image the next daemon restores is written with nothing to build.
+    assert_eq!(case.ok(&["run"]), "before\n");
+    for (crash, text, prints) in [(false, AFTER, "after\n"), (true, THIRD, "a third\n")] {
+        match crash {
+            false => case.stop(),
+            true => {
+                let pid = daemon_pid(&case).expect("the daemon's log names its pid");
+                case.kill_daemon();
+                // `kill` returns before the process is gone: a run started meanwhile would
+                // reach the dying daemon, which then hangs up on it.
+                let began = Instant::now();
+                while Command::new("kill").args(["-0", &pid]).stderr(Stdio::null()).status().unwrap().success() {
+                    assert!(began.elapsed() < Duration::from_secs(30), "pid {pid} outlived its kill -9 by 30 s");
+                    #[allow(clippy::disallowed_methods, reason = "std has no wait on a process that is not a child")]
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        case.write("src/main.rs", text);
+        let began = Instant::now();
+        let got = case.ok(&["run"]);
+        let took = began.elapsed();
+        assert_eq!(got, prints, "after a restart (kill -9: {crash})");
+        assert!(
+            took < RESTART_EDIT_BOUND,
+            "the first run after a restart (kill -9: {crash}) that saw src/main.rs changed took {took:?}, past its bound of {RESTART_EDIT_BOUND:?}"
+        );
+    }
+    // What a fresh build of the source as it is now prints: a home, and so a daemon, of its own.
+    let fresh = case.second_home();
+    assert_eq!(fresh.ok(&["run"]), "a third\n", "a fresh home's build of the same source");
+    let log = fs::read_to_string(case.home.join("v2/serve.log")).unwrap();
+    let panics: Vec<&str> = log.lines().filter(|line| line.contains("panicked at")).collect();
+    assert!(
+        panics.is_empty(),
+        "the daemon caught {} panics across two restarts and their edits, the first: {}",
+        panics.len(),
+        panics[0]
+    );
+}
+
 /// The standard library is built once per daemon, not per workspace: a second workspace on the
 /// daemon that built the first compiles its own package and nothing else (it has no
 /// dependencies), so no `core`, `alloc`, `std`, `compiler_builtins`, `panic_*` or std's vendored
