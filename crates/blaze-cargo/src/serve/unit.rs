@@ -33,6 +33,7 @@ mod compile;
 mod configs;
 mod deps;
 mod doc;
+mod drawn;
 mod error;
 pub(crate) mod files;
 mod graph;
