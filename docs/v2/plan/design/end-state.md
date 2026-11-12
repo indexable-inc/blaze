@@ -467,3 +467,47 @@ the file tree). Main has 15 failing constant-evaluation tests that its known-fai
 not name. A constants step added today could not hit under the real facts (every evaluation reads
 per-instance MIR no fact covers) and is switched off until runtime MIR is a step of the
 per-function store.
+
+## The kernel is the home of all of this (2026-11-12; the owner's reminder)
+
+The idea of this document already exists in the tree under another name: `kernel.md` (2026-11-02)
+and `crates/blaze-kernel`. A kernel step is a registered pure function that reads the world only
+through a recording context; its result is stored under its identity (step, of what, the step's
+code identity, flags) with the reads it made and the hash each saw; a lookup re-hashes each read
+and takes the entry only when all agree; two values under one identity and reads is a refusal.
+There is no graph, no view and no shortcut proof in it, so its correctness is three things: the
+step is pure, its reads are recorded (true by construction: the context is the only way to read),
+and the hashes are right. It has a model checker (`blaze-storemodel`) and a proof crate
+(`blaze-v2-proof`).
+
+The kernel was scoped "from MIR down, beside blaze-query": its one real step is codegen's dev
+template, and the front end kept its salsa-derived engine. Every wrong answer found on 2026-11-12
+was in that other engine (three from shortcut proofs around seals, one from the cycle fixpoint);
+none was in the kernel. `blaze-record`, written the same day as "the one primitive", is the
+kernel's entry form derived again; `blaze-kernel/src/entry.rs` was listed as "a sixth copy" when
+it is the original.
+
+So, replacing "one primitive" and "one validity mechanism" above:
+
+1. **One home.** `blaze-record` is the kernel's storage layer (its chain of read-lists and its
+   answer keys); `blaze-kernel` is the API: registered steps, `Identity`, `Reads`, `World`,
+   conflict and unsteady refusals. `kernel/src/entry.rs` moves onto `blaze-record`. The per-function
+   store, the goal store, the build-script index and the image read slots become kernel steps or
+   are stated as the kernel's form with a reason they are not yet steps.
+2. **The front end moves under the kernel.** A front-end result that outlives a process is a
+   kernel entry; the in-memory engine is a cache of what this process verified and can be dropped
+   without changing an answer (`end-state/engine.md` argues the same from the other side).
+   "Read completeness" stops being an audit: a step has no database handle except its `Reads`.
+3. **Speed comes only from covering digests.** A hit costs a re-hash per read, which is why the
+   front end was left on views and stamps. The only accelerators allowed in front of the kernel
+   are hashes that COVER a set of reads (a directory's Merkle id, a crate's digest of its content
+   and its dependencies' digests, a request certificate): equal digest, equal everything under
+   it, by arithmetic. A proof from timing or from a view (the floor, `reach`, summary bits,
+   durability levels) is not that kind, and is where all three seal failures came from.
+4. **What is proved.** The kernel's lookup rule and the covering-digest rule, once, in Lean, and
+   by exhaustive small-scope checking in the gate (every program up to a few nodes and steps;
+   each of the four engine bugs needed at most six nodes and five steps). Every step then
+   inherits it by being pure and reading only through `Reads`, both of which the compiler checks.
+5. **The number that decides how far it goes:** the cost of verifying front-end entries by hash at
+   item grain on reth (reads per entry, entries per edit, nanoseconds per re-hash through the
+   pool). It is why the kernel stopped at MIR; it is measured before the front end is moved.
