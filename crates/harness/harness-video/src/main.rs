@@ -7,12 +7,19 @@
 //!     harness-video SCENE.flecs OUT.mp4 [PRESET]   the whole video, as PRESET (presets.json; with none, the YouTube HDR
 //!                                                  master), then read back and held to the preset (check.rs)
 //!     harness-video SCENE.flecs OUT.png AT [PRESET] one frame, at AT seconds (PRESET: its shape, for a scene that reframes)
-//!     harness-video SCENE.flecs OUT.png contact [PRESET]   a contact sheet: one small frame a second, in one image
+//!     harness-video SCENE.flecs OUT.png contact [EVERY] [PRESET]  a contact sheet: a small frame each EVERY seconds (1)
+//!     harness-video SCENE.flecs OUT.png sound      the mix as a picture: its waveform over its spectrogram
 //!     harness-video SCENE.flecs OUT.png burst AT [PRESET]  ten consecutive frames from AT, in one image
 //!     harness-video SCENE.flecs DIR/ EVERY         a frame every EVERY seconds, DIR/<ms>.png (to look the video over)
 //!     harness-video SCENE.flecs OUT.wav            the soundtrack alone, as it is in the video
 //!     harness-video SCENE.flecs sounds             every sound of the soundtrack, in time order
 //!     harness-video check OUT.mp4 SCENE.flecs PRESET   read a finished mp4 back and hold it to the scene and preset
+//!     harness-video SCENE.flecs cuts               every hard cut and where it is in the music; fails on one off the grid
+//!     harness-video analyse TRACK.wav beats.json   a track's beat grid (music.rs), and beats.png: the track with the grid on it
+//!     harness-video score OUT.wav BPM BARS DROP DROP_BARS   the temp score to cut against until a track is supplied
+//!
+//! Music: a `beats.json` beside the scene becomes the `m_*` constants a scene places its cuts by; a root with a `Music`
+//! has `music.wav` beside the scene as its soundtrack, the scene's own sounds mixed under it.
 //!
 //! The soundtrack is synthesised offline (harness-native-blaze's `sound`), deterministic, placed binaurally: the
 //! `BlazeMark`'s score from the mark's own timeline, plus every `Sound` the scene declares under its frame as data. A
@@ -28,6 +35,7 @@ mod check;
 mod data;
 mod encode;
 mod loud;
+mod music;
 mod preset;
 mod yuv;
 
@@ -67,6 +75,16 @@ pub struct Mix {
     pub peak: f32,
 }
 
+/// The film is cut to a track: `music.wav` beside the scene is its soundtrack, at `gain`, with the scene's own sounds
+/// (and a mark's score) mixed in at `under` of their level, so the track stays the hero. On the node that carries the
+/// [`Video`]. The file is the owner's to supply (or the temp score, `harness-video score`); a root with a `Music` and no
+/// file is an error, never a silent film.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Music {
+    pub gain: f32,
+    pub under: f32,
+}
+
 /// One sound of the soundtrack as the scene declares it, for the listing.
 struct Heard {
     path: String,
@@ -84,6 +102,10 @@ struct Stage {
     mix: Option<Mix>,
     /// The root has a Backdrop: the UI is drawn over a clear ground and laid over the picture.
     pictured: bool,
+    /// The scene's beat grid (`beats.json` beside it), if it has one.
+    grid: Option<music::Grid>,
+    /// The root's Music and the track's path, if it is cut to one.
+    track: Option<(Music, PathBuf)>,
 }
 
 impl Stage {
@@ -93,8 +115,20 @@ impl Stage {
         world.component::<Video>().writable();
         world.component::<Mix>().writable();
         world.component::<backdrop::Backdrop>().writable();
+        world.component::<Music>().writable();
         let dir = scene.parent().ok_or_else(|| format!("{}: no directory", scene.display()))?;
         let path = scene.to_str().ok_or_else(|| format!("{}: not UTF-8", scene.display()))?;
+        // The track's grid, as constants, before the scene places its cuts by them.
+        let beats = dir.join("beats.json");
+        let grid = if beats.exists() {
+            let json = std::fs::read_to_string(&beats).map_err(|e| format!("{}: {e}", beats.display()))?;
+            let grid: music::Grid = serde_json::from_str(&json).map_err(|e| format!("{}: {e}", beats.display()))?;
+            harness_native::scene::load(&world, "video-beats", &grid.constants())
+                .map_err(|e| format!("{}: as constants: {e}", beats.display()))?;
+            Some(grid)
+        } else {
+            None
+        };
         // The scene's numbers, as constants, before the scene names them.
         let numbers = dir.join("data.json");
         if numbers.exists() {
@@ -149,7 +183,32 @@ impl Stage {
         painter.media = Some(dir.to_path_buf());
         let mix = world.world_ref().entity_from_id(root).try_cloned::<&Mix>();
         let pictured = world.world_ref().entity_from_id(root).has(backdrop::Backdrop::id());
-        Ok(Self { world, painter, video, root, mix, pictured })
+        let track = world.world_ref().entity_from_id(root).try_cloned::<&Music>().map(|m| (m, dir.join("music.wav")));
+        Ok(Self { world, painter, video, root, mix, pictured, grid, track })
+    }
+
+    /// Every hard cut (a cue on `Backdrop.shot`: the picture changes whole) with where it is in the music, a line each.
+    /// Err, with the list, when one is more than a frame off a beat or a half beat of the grid.
+    fn cuts(&self) -> Result<String, String> {
+        use harness_native_ui_timeline_api::Cue;
+        let grid = self.grid.as_ref().ok_or("the scene has no beats.json beside it: no grid to hold its cuts to")?;
+        let mut cuts = Vec::new();
+        self.world.new_query::<&Cue>().each_entity(|e, c| {
+            if c.member.as_str() == "Backdrop.shot" {
+                cuts.push((c.at, e.name().to_string()));
+            }
+        });
+        cuts.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let frame = 1.0 / f64::from(self.video.fps);
+        let mut out = format!("{} cuts against {} ({:.2} beats a minute):\n", cuts.len(), grid.source, grid.bpm);
+        let mut off_grid = 0;
+        for (at, name) in &cuts {
+            let (said, off) = grid.position(f64::from(*at));
+            let ok = off.abs() <= frame + 1e-6;
+            off_grid += usize::from(!ok);
+            out.push_str(&format!("{at:8.3} s  frame {:>4}  {said:<28} {:+.1} ms  {name}{}\n", (at * self.video.fps).round(), off * 1000.0, if ok { "" } else { "   OFF THE GRID" }));
+        }
+        if off_grid > 0 { Err(format!("{out}{off_grid} cuts are more than one frame off the grid")) } else { Ok(out) }
     }
 
     /// The root's Backdrop as the cues left it this frame.
@@ -173,12 +232,29 @@ impl Stage {
     /// a scene with neither. With a `Mix` on the root it is mastered, and what it then measures comes with it.
     fn sound(&self, sr: u32) -> Result<Option<(Vec<[f32; 2]>, Option<loud::Loudness>)>, String> {
         let (mark, glints, heard) = self.score()?;
-        if mark.is_none() && heard.is_empty() {
+        if mark.is_none() && heard.is_empty() && self.track.is_none() {
             return Ok(None);
         }
         let notes: Vec<_> = heard.iter().map(|h| h.note).collect();
         let glints = if mark.is_some() { glints } else { Vec::new() };
-        let mut mix = harness_native_blaze::sound::soundtrack(sr, self.video.seconds, mark, &glints, &notes, 7);
+        let mut mix = if mark.is_none() && heard.is_empty() {
+            vec![[0.0; 2]; (self.video.seconds * sr as f32) as usize]
+        } else {
+            harness_native_blaze::sound::soundtrack(sr, self.video.seconds, mark, &glints, &notes, 7)
+        };
+        if let Some((m, path)) = &self.track {
+            if sr != loud::RATE {
+                return Err(format!("a Music's track is mixed at {} Hz, not {sr}", loud::RATE));
+            }
+            let bytes = std::fs::read(path).map_err(|e| {
+                format!("{}: {e}: the scene's root has a Music, so its track must be there (the owner's file, or `harness-video score` for the temp score)", path.display())
+            })?;
+            let track = music::read_wav(&bytes, &path.display().to_string())?;
+            for (i, s) in mix.iter_mut().enumerate() {
+                let t = track.get(i).copied().unwrap_or([0.0; 2]);
+                *s = [t[0] * m.gain + s[0] * m.under, t[1] * m.gain + s[1] * m.under];
+            }
+        }
         let measured = match self.mix {
             None => None,
             Some(m) if sr == loud::RATE => Some(loud::master(&mut mix, f64::from(m.lufs), f64::from(m.peak))?),
@@ -333,13 +409,17 @@ impl Stage {
 enum Out {
     Video(PathBuf),
     Still(PathBuf, f32),
-    /// One small frame a second, in one image.
-    Contact(PathBuf),
+    /// A small frame every so many seconds, in one image.
+    Contact(PathBuf, f32),
+    /// The mix as a picture.
+    Heard(PathBuf),
     /// Ten consecutive frames from a time, in one image.
     Burst(PathBuf, f32),
     Sheet(PathBuf, f32),
     Audio(PathBuf),
     Sounds,
+    /// Every hard cut and where it is in the music.
+    Cuts,
 }
 
 fn parse(args: &[String]) -> Result<(PathBuf, Out, Option<String>), String> {
@@ -352,9 +432,12 @@ fn parse(args: &[String]) -> Result<(PathBuf, Out, Option<String>), String> {
         [scene, out, preset] if out.ends_with(".mp4") => Ok((scene.into(), Out::Video(out.into()), Some(preset.clone()))),
         [scene, out] if out.ends_with(".wav") => Ok((scene.into(), Out::Audio(out.into()), None)),
         [scene, out] if out == "sounds" => Ok((scene.into(), Out::Sounds, None)),
+        [scene, out] if out == "cuts" => Ok((scene.into(), Out::Cuts, None)),
         [scene, out, how, rest @ ..] if out.ends_with(".png") => {
             let (what, rest) = match (how.as_str(), rest) {
-                ("contact", rest) => (Out::Contact(out.into()), rest),
+                ("sound", rest) => (Out::Heard(out.into()), rest),
+                ("contact", [every, rest @ ..]) if every.parse::<f32>().is_ok() => (Out::Contact(out.into(), num(every)?), rest),
+                ("contact", rest) => (Out::Contact(out.into(), 1.0), rest),
                 ("burst", [at, rest @ ..]) => (Out::Burst(out.into(), num(at)?), rest),
                 (_, rest) => (Out::Still(out.into(), num(how)?), rest),
             };
@@ -475,6 +558,38 @@ fn write_png(path: &Path, px: &[u8], (w, h): (u32, u32)) -> Result<(), String> {
 
 fn run(args: &[String]) -> Result<(), String> {
     const SR: u32 = 48_000;
+    if let [what, track, out] = args
+        && what == "analyse"
+    {
+        let bytes = std::fs::read(track).map_err(|e| format!("{track}: {e}"))?;
+        let mix = music::read_wav(&bytes, track)?;
+        let name = Path::new(track).file_name().and_then(|n| n.to_str()).unwrap_or(track);
+        // The temp score says what it is in its name; the grid carries that, so a render can be labelled.
+        let grid = music::analyse(&mix, if name.contains("temp") { "temp score" } else { name })?;
+        let json = serde_json::to_string_pretty(&grid).map_err(|e| format!("{out}: {e}"))?;
+        std::fs::write(out, json + "\n").map_err(|e| format!("{out}: {e}"))?;
+        let picture = Path::new(out).with_extension("png");
+        let size = ((mix.len() as f64 / f64::from(SR) * 30.0) as usize, 240);
+        write_png(&picture, &grid.picture(&mix, size), (size.0 as u32, size.1 as u32))?;
+        println!("{track}: {:.2} beats a minute, {} beats, {} bars", grid.bpm, grid.beats.len(), grid.bars.len());
+        for s in &grid.sections {
+            println!("  bar {:>3} at {:7.3} s  {}", s.bar, s.at, s.label);
+        }
+        for (k, i) in grid.impacts.iter().enumerate() {
+            println!("  impact {} at {:7.3} s  {}", k + 1, i.at, grid.position(i.at).0);
+        }
+        println!("wrote {out} and {} (the track with its grid: faint lines beats, bright lines bars, orange lines sections)", picture.display());
+        return Ok(());
+    }
+    if let [what, out, bpm, bars, drop, drop_bars] = args
+        && what == "score"
+    {
+        let num = |s: &String| s.parse::<f64>().map_err(|e| format!("{s:?}: {e}"));
+        let score = music::temp_score(num(bpm)?, num(bars)? as usize, num(drop)? as usize, num(drop_bars)? as usize, 7);
+        std::fs::write(out, harness_native_blaze::sound::wav(SR, &score)).map_err(|e| format!("{out}: {e}"))?;
+        println!("wrote {out}: the temp score, {} s (temp music: a stand-in until a track is supplied)", score.len() as f64 / f64::from(SR));
+        return Ok(());
+    }
     if let [check, file, scene, name] = args
         && check == "check"
     {
@@ -497,6 +612,10 @@ fn run(args: &[String]) -> Result<(), String> {
         stage.fit(name, &export)?;
     }
     let v = stage.video;
+    if let Out::Cuts = &out {
+        print!("{}", stage.cuts()?);
+        return Ok(());
+    }
     if let Out::Sounds = &out {
         let (mark, glints, heard) = stage.score()?;
         if let Some((start, exit)) = mark {
@@ -517,6 +636,16 @@ fn run(args: &[String]) -> Result<(), String> {
         eprintln!("harness-video: wrote {} ({} s at {SR} Hz, 16-bit stereo{})", path.display(), v.seconds, loudness(measured));
         return Ok(());
     }
+    if let Out::Heard(path) = &out {
+        let (sound, measured) = stage
+            .sound(SR)?
+            .ok_or_else(|| format!("{}: no BlazeMark and no Sound, so no soundtrack", scene.display()))?;
+        // Ten columns a second, so a cue a tenth of a second long is a column.
+        let size = ((v.seconds * 20.0) as usize, 420);
+        write_png(path, &loud::picture(&sound, size), (size.0 as u32, size.1 as u32))?;
+        eprintln!("harness-video: wrote {} (waveform over spectrogram, 40 Hz to 20 kHz, {} columns a second{})", path.display(), 20, loudness(measured));
+        return Ok(());
+    }
     let (pw, ph) = stage.pixels();
     let mut renderer =
         Renderer::new(objc2_metal::MTLCreateSystemDefaultDevice().ok_or("no Metal device")?);
@@ -527,9 +656,9 @@ fn run(args: &[String]) -> Result<(), String> {
     // so springs and transitions are where they would be in the video.
     let wanted: Vec<u32> = match &out {
         Out::Video(_) => (0..total).collect(),
-        Out::Audio(_) | Out::Sounds => unreachable!("written above"),
+        Out::Audio(_) | Out::Sounds | Out::Heard(_) | Out::Cuts => unreachable!("written above"),
         Out::Still(_, at) => vec![((at * v.fps).round() as u32).min(total.saturating_sub(1))],
-        Out::Contact(_) => (0..total).step_by(v.fps.round() as usize).collect(),
+        Out::Contact(_, every) => (0..total).step_by(((every * v.fps).round() as usize).max(1)).collect(),
         Out::Burst(_, at) => {
             let from = ((at * v.fps).round() as u32).min(total.saturating_sub(1));
             (from..(from + 10).min(total)).collect()
@@ -568,7 +697,7 @@ fn run(args: &[String]) -> Result<(), String> {
     // A contact sheet's or a burst's small frames, in order.
     let mut thumbs: Vec<Vec<u8>> = Vec::new();
     let small = match &out {
-        Out::Contact(_) => thumbnail_size((pw, ph), 192),
+        Out::Contact(_, _) => thumbnail_size((pw, ph), 192),
         Out::Burst(_, _) => thumbnail_size((pw, ph), 480),
         _ => (0, 0),
     };
@@ -602,19 +731,19 @@ fn run(args: &[String]) -> Result<(), String> {
         match &out {
             Out::Video(_) => unreachable!("encoded above"),
             Out::Still(path, _) => write_png(path, &px, (pw, ph))?,
-            Out::Contact(_) | Out::Burst(_, _) => thumbs.push(shrink(&px, (pw, ph), small)),
+            Out::Contact(_, _) | Out::Burst(_, _) => thumbs.push(shrink(&px, (pw, ph), small)),
             Out::Sheet(dir, _) => write_png(
                 &dir.join(format!("{:05}.png", (i as f32 / v.fps * 1000.0).round() as u32)),
                 &px,
                 (pw, ph),
             )?,
-            Out::Audio(_) | Out::Sounds => unreachable!("written above"),
+            Out::Audio(_) | Out::Sounds | Out::Heard(_) | Out::Cuts => unreachable!("written above"),
         }
     }
     if let Some(enc) = encoder {
         enc.finish()?;
     }
-    if let Out::Contact(path) | Out::Burst(path, _) = &out {
+    if let Out::Contact(path, _) | Out::Burst(path, _) = &out {
         let across = if matches!(out, Out::Burst(_, _)) { 5 } else if small.0 > small.1 { 10 } else { 15 };
         let (sheet, size) = tile(&thumbs, small, across);
         write_png(path, &sheet, size)?;
@@ -625,18 +754,22 @@ fn run(args: &[String]) -> Result<(), String> {
             // Every render is read back: what was written is what the preset says, or the render fails.
             let report = read_back(p, &export, (pw, ph), v.fps, total)?;
             format!(
-                "{} ({total} frames, {pw}x{ph} at {} fps, preset {name}: {}; brightest pixel {peak:.0} nits{})\nread back:\n{report}",
+                "{} ({total} frames, {pw}x{ph} at {} fps, preset {name}: {}; brightest pixel {peak:.0} nits{}{})\nread back:\n{report}",
                 p.display(),
                 v.fps,
                 export.words(),
-                loudness(measured)
+                loudness(measured),
+                match &stage.grid {
+                    Some(g) if stage.track.is_some() => format!("; cut to {}{}", g.source, if g.source == "temp score" { " (TEMP MUSIC: a stand-in, not the film's track)" } else { "" }),
+                    _ => String::new(),
+                }
             )
         }
         Out::Still(p, at) => format!("{} (at {at} s)", p.display()),
-        Out::Contact(p) => format!("{} ({} frames, one a second, left to right then down)", p.display(), wanted.len()),
+        Out::Contact(p, every) => format!("{} ({} frames, one each {every} s, left to right then down)", p.display(), wanted.len()),
         Out::Burst(p, at) => format!("{} ({} consecutive frames from {at} s)", p.display(), wanted.len()),
         Out::Sheet(d, _) => format!("{} ({} frames)", d.display(), wanted.len()),
-        Out::Audio(_) | Out::Sounds => unreachable!("written above"),
+        Out::Audio(_) | Out::Sounds | Out::Heard(_) | Out::Cuts => unreachable!("written above"),
     };
     eprintln!("harness-video: wrote {what}");
     Ok(())
@@ -688,12 +821,15 @@ mod tests {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("scene/blaze");
         let stage = Stage::load(&dir.join("film.flecs")).unwrap_or_else(|e| panic!("{e}"));
         let mut v = stage.video;
-        assert!(v.seconds > 45.0 && v.seconds <= 60.0 && v.fps == 60.0 && v.reframes, "{v:?}");
+        assert!(v.seconds == 60.0 && v.fps == 60.0 && v.reframes, "{v:?}");
         assert!(stage.pictured, "the film's root has a Backdrop");
         let x = preset::named("x-landscape-1080p60").unwrap_or_else(|e| panic!("{e}"));
         fit(&mut v, "x-landscape-1080p60", &x).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!((v.width * v.scale, v.height * v.scale), (1920.0, 1080.0));
         assert_eq!(stage.mix, Some(Mix { lufs: -16.0, peak: -1.0 }));
+        // It is cut to the grid: every hard cut within a frame of a beat or a half beat.
+        let cuts = stage.cuts().unwrap_or_else(|e| panic!("{e}"));
+        assert!(cuts.lines().count() > 15, "{cuts}");
         // It reframes: the upright preset is the same points a pixel, 540 by 960.
         let mut tall = stage.video;
         let upright = preset::named("x-portrait-1080x1920").unwrap_or_else(|e| panic!("{e}"));
@@ -706,14 +842,14 @@ mod tests {
         assert!(was.contains("export const d_day_reverified_before_t = \"1,091,174\""), "{was}");
         let now = data::script(&json.replace("1091174", "1091175")).unwrap_or_else(|e| panic!("{e}"));
         assert!(now.contains("export const d_day_reverified_before_t = \"1,091,175\""), "{now}");
-        // Few words: every string a scene shows, counted (a number is not a word). Under 60.
+        // Few words: every string a scene shows, counted (a number is not a word). Under 80 for the minute.
         let mut words = 0;
         stage.world.new_query::<&harness_native_ui_text_api::Text>().each_entity(|e, t| {
             if std::iter::successors(e.parent(), |p| p.parent()).any(|p| *p.id() == stage.root) && !e.has(harness_native_ui_timeline_api::Tally::id()) {
                 words += t.s.as_str().split(|c: char| !c.is_alphanumeric() && c != '-' && c != '.' && c != '/').filter(|w| w.chars().any(char::is_alphabetic)).count();
             }
         });
-        assert!(words > 0 && words < 60, "{words} words on screen");
+        assert!(words > 0 && words < 80, "{words} words on screen");
         eprintln!("the film shows {words} words");
     }
 
@@ -743,6 +879,72 @@ mod tests {
         let hevc = preset::named("x-landscape-1080p60-hevc").unwrap_or_else(|e| panic!("{e}"));
         assert!(check::verify(&report, &hevc, (1920, 1080), 60, 30).is_err_and(|e| e.contains("hvc1")));
         std::fs::remove_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+    }
+
+    /// The longest straight run of sharp change in an RGBA8 picture: along a column boundary (a vertical line) or a
+    /// row boundary, the most consecutive pixels whose luma differs from their neighbour across it by more than `jump`.
+    /// A change counts only when it is a step: still there between the pixels eight to either side (a thin bright line,
+    /// a shape's own outline, rises and falls again within that, and is not one). A glow cut off where its shape or
+    /// track ends is such a step along a line; a point, a curve, an outline or a soft edge is not.
+    /// (A bright outline's halo is a little brighter eight pixels one side of where its core begins than the other,
+    /// by about 20 of 255; the tests ask for 40, so a cut dimmer than that is not seen.)
+    fn straight_edge(px: &[u8], (w, h): (usize, usize), jump: i32) -> (usize, String) {
+        let luma = |x: usize, y: usize| {
+            let at = (y * w + x) * 4;
+            (i32::from(px[at]) * 3 + i32::from(px[at + 1]) * 6 + i32::from(px[at + 2])) / 10
+        };
+        let mut longest = (0, String::new());
+        for x in 8..w - 9 {
+            let mut run = 0;
+            for y in 0..h {
+                let step = (luma(x, y) - luma(x + 1, y)).abs() > jump && (luma(x - 8, y) - luma(x + 9, y)).abs() > jump;
+                run = if step { run + 1 } else { 0 };
+                if run > longest.0 {
+                    longest = (run, format!("down the column x = {x}, ending at y = {y}"));
+                }
+            }
+        }
+        for y in 8..h - 9 {
+            let mut run = 0;
+            for x in 0..w {
+                let step = (luma(x, y) - luma(x, y + 1)).abs() > jump && (luma(x, y - 8) - luma(x, y + 9)).abs() > jump;
+                run = if step { run + 1 } else { 0 };
+                if run > longest.0 {
+                    longest = (run, format!("along the row y = {y}, ending at x = {x}"));
+                }
+            }
+        }
+        longest
+    }
+
+    /// The invariant: no light in the picture ends at a line. Every shot the kernel has, at five times through a
+    /// three-second beat (its start, its middle, the fly-through at its end), has no straight run of sharp change
+    /// longer than a sixth of the frame's short side (a disk's rim against its lit inside runs straight for a tenth). The control: a glow cut at the edge of its bar (the second
+    /// film's fault: a beam's light stopped on a straight line where its track began) is caught.
+    #[test]
+    fn no_light_ends_at_a_line() {
+        let (w, h) = (480usize, 270usize);
+        let limit = h / 6;
+        // The control, drawn by hand: a soft bar whose glow is cut off at x = 120.
+        let mut cut = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 120..w {
+                let v = (255.0 * (-((y as f32 - 135.0) / 30.0).powi(2)).exp()) as u8;
+                cut[(y * w + x) * 4..(y * w + x) * 4 + 3].copy_from_slice(&[v, v, v]);
+            }
+        }
+        assert!(straight_edge(&cut, (w, h), 40).0 > limit, "the control's cut glow was not seen");
+        let renderer = Renderer::new(objc2_metal::MTLCreateSystemDefaultDevice().unwrap_or_else(|| panic!("no Metal device")));
+        let pass = backdrop::Pass::new(renderer.device(), w as u32, h as u32).unwrap_or_else(|e| panic!("{e}"));
+        for shot in 0..=17 {
+            for t in [0.05f32, 0.6, 1.5, 2.4, 2.95] {
+                let b = backdrop::Backdrop { shot: shot as f32, at: 10.0, a: if shot == 11 { 5.0 } else { 1.0 }, b: 1.2, c: 2.0, d: 0.0, e: 0.0, f: 3.0 };
+                let tex = pass.picture(&b, 10.0 + t).unwrap_or_else(|e| panic!("{e}"));
+                let px = renderer.read(tex);
+                let (run, place) = straight_edge(&px, (w, h), 40);
+                assert!(run <= limit, "shot {shot} at {t} s: light ends at a straight line {run} pixels long (over {limit}), {place}");
+            }
+        }
     }
 
     /// A tally's words group the whole part by three and keep the places asked for (tested here, where flecs is linked:

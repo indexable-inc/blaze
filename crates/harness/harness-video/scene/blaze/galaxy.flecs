@@ -1,0 +1,60 @@
+// The peak, where the film has been flying since the name: the galaxy, every function a star. The camera dives to
+// one; it is edited; it flares and only its four readers light after it; the rest of the galaxy does not stir. Then
+// back out. The sound rises under the dive, ticks quickening, and lands its one big hit on the edit.
+const dive = $m_b15_3
+const edit = $m_b17_1
+const back = $m_b18_3
+const ticks = 26
+
+@tree ChildOf
+film {
+  galaxy_shot { Cue: {member: "Backdrop.shot", from: 11, to: 11, at: $t_galaxy, dur: 0, ease: Linear} }
+  galaxy_at { Cue: {member: "Backdrop.at", from: $t_galaxy, to: $t_galaxy, at: $t_galaxy, dur: 0, ease: Linear} }
+  galaxy_len { Cue: {member: "Backdrop.f", from: $t_soon - $t_galaxy, to: $t_soon - $t_galaxy, at: $t_galaxy, dur: 0, ease: Linear} }
+  galaxy_b { Cue: {member: "Backdrop.b", from: $edit - $t_galaxy, to: $edit - $t_galaxy, at: $t_galaxy, dur: 0, ease: Linear} }
+  galaxy_far { Cue: {member: "Backdrop.a", from: 1, to: 1, at: $t_galaxy, dur: 0, ease: Linear} }
+  galaxy_dive { Cue: {member: "Backdrop.a", from: 1, to: 3.5, at: $dive, dur: $edit - $dive, ease: InOut} }
+  galaxy_back { Cue: {member: "Backdrop.a", from: 3.5, to: 1, at: $back, dur: $t_soon - $back, ease: InOut} }
+  galaxy_caps : film_part.Under {
+    slot : film_part.Slot {
+      one : film_part.Caption {
+        Text: {s: "one edit"}
+        Fill: $tone_film_accent
+        cue.Arrive show(at: $edit, dur: 0.08)
+        cue.Pop pop(at: $edit)
+        cue.Leave hide(at: $edit + 2 * $beat - 0.1)
+      }
+      twice : film_part.Caption {
+        Text: {s: "nothing compiled twice"}
+        cue.Arrive show(at: $edit + 2 * $beat, dur: 0.08)
+        cue.Pop pop(at: $edit + 2 * $beat)
+        cue.Leave hide(at: $edit + 4 * $beat - 0.1)
+      }
+      live : film_part.Caption {
+        Text: {s: "patched live"}
+        cue.Arrive show(at: $back, dur: 0.08)
+        cue.Pop pop(at: $back)
+        cue.Leave hide(at: $t_soon - 0.2)
+      }
+    }
+    low : film_part.Low {}
+  }
+  galaxy_rise : voice.Rise { Onset: {at: $dive}; Lasts: {dur: $edit - $dive}; Pitch: {hz: 880}; Gain: {amp: 0.07}; Pan: {pos: -0.3, sweep: 0.6} }
+  galaxy_swell : voice.Pad { Onset: {at: $t_galaxy}; Lasts: {dur: $t_soon - $t_galaxy}; Pitch: {hz: 220}; Gain: {amp: 0.035} }
+  for i in 0..$ticks {
+    "galaxy_tick_{i}" : voice.Click {
+      Onset: {at: $dive + ($edit - $dive) * (1 - (1 - i * 1.0 / $ticks) * (1 - i * 1.0 / $ticks))}
+      Pitch: {hz: 1700 + i * 60}
+      Gain: {amp: 0.03 + i * 0.0015}
+      Pan: {pos: -0.5 + (i % 5) * 0.25, sweep: 0}
+    }
+  }
+  galaxy_hit : voice.Thud { Onset: {at: $edit}; Gain: {amp: 0.5} }
+  galaxy_tone : voice.Mallet { Onset: {at: $edit}; Lasts: {dur: 3.0}; Pitch: {hz: 220}; Gain: {amp: 0.18} }
+  galaxy_air : voice.Bell { Onset: {at: $edit + 0.02}; Lasts: {dur: 2.4}; Pitch: {hz: 880}; Gain: {amp: 0.06}; Pan: {pos: 0.3, sweep: 0} }
+  galaxy_reader_0 : voice.Bell { Onset: {at: $edit + 0.30}; Lasts: {dur: 1.2}; Pitch: {hz: 1108.73}; Gain: {amp: 0.04}; Pan: {pos: -0.3, sweep: 0} }
+  galaxy_reader_1 : voice.Bell { Onset: {at: $edit + 0.38}; Lasts: {dur: 1.2}; Pitch: {hz: 1218.73}; Gain: {amp: 0.04}; Pan: {pos: -0.1, sweep: 0} }
+  galaxy_reader_2 : voice.Bell { Onset: {at: $edit + 0.46}; Lasts: {dur: 1.2}; Pitch: {hz: 1328.73}; Gain: {amp: 0.04}; Pan: {pos: 0.1, sweep: 0} }
+  galaxy_reader_3 : voice.Bell { Onset: {at: $edit + 0.54}; Lasts: {dur: 1.2}; Pitch: {hz: 1438.73}; Gain: {amp: 0.04}; Pan: {pos: 0.3, sweep: 0} }
+  galaxy_out : voice.Whoosh { Onset: {at: $back}; Lasts: {dur: $t_soon - $back}; Pitch: {hz: 2000}; Gain: {amp: 0.05}; Pan: {pos: 0.5, sweep: -1.0} }
+}

@@ -1,0 +1,80 @@
+// The opening: the three most surprising things blaze does, a hard cut each and under a second each, then the name
+// over the sea, the galaxy far off (the place the film is flying to: it arrives there at the peak).
+
+@tree ChildOf
+film {
+  cage_shot { Cue: {member: "Backdrop.shot", from: 1, to: 1, at: $t_cage, dur: 0, ease: Linear} }
+  cage_at { Cue: {member: "Backdrop.at", from: $t_cage, to: $t_cage, at: $t_cage, dur: 0, ease: Linear} }
+  cage_len { Cue: {member: "Backdrop.f", from: $t_unclosed - $t_cage, to: $t_unclosed - $t_cage, at: $t_cage, dur: 0, ease: Linear} }
+  cage_caps : film_part.Under {
+    slot : film_part.Slot {
+      says : film_part.Caption {
+        Text: {s: "build.rs: no network"}
+        cue.Arrive show(at: $t_cage, dur: 0.08)
+        cue.Pop pop(at: $t_cage)
+        cue.Leave hide(at: $t_unclosed - 0.1)
+      }
+    }
+    low : film_part.Low {}
+  }
+  cage_hit : voice.Thud { Onset: {at: $t_cage}; Gain: {amp: 0.45} }
+  cage_tone : voice.Mallet { Onset: {at: $t_cage}; Lasts: {dur: 0.8}; Pitch: {hz: 220}; Gain: {amp: 0.14} }
+  unclosed_shot { Cue: {member: "Backdrop.shot", from: 17, to: 17, at: $t_unclosed, dur: 0, ease: Linear} }
+  unclosed_at { Cue: {member: "Backdrop.at", from: $t_unclosed, to: $t_unclosed, at: $t_unclosed, dur: 0, ease: Linear} }
+  unclosed_len { Cue: {member: "Backdrop.f", from: $t_check - $t_unclosed, to: $t_check - $t_unclosed, at: $t_unclosed, dur: 0, ease: Linear} }
+  unclosed_caps : film_part.Layer {
+    slot : film_part.Slot {
+      says : film_part.Shout {
+        Text: {s: "unclosed file: compile error"}
+        cue.Arrive show(at: $t_unclosed, dur: 0.08)
+        cue.Pop pop(at: $t_unclosed)
+        cue.Leave hide(at: $t_check - 0.1)
+      }
+    }
+  }
+  unclosed_hit : voice.Thud { Onset: {at: $t_unclosed}; Gain: {amp: 0.45} }
+  unclosed_tone : voice.Mallet { Onset: {at: $t_unclosed}; Lasts: {dur: 0.8}; Pitch: {hz: 277.18}; Gain: {amp: 0.14} }
+  check_shot { Cue: {member: "Backdrop.shot", from: 2, to: 2, at: $t_check, dur: 0, ease: Linear} }
+  check_at { Cue: {member: "Backdrop.at", from: $t_check, to: $t_check, at: $t_check, dur: 0, ease: Linear} }
+  check_len { Cue: {member: "Backdrop.f", from: $t_name - $t_check, to: $t_name - $t_check, at: $t_check, dur: 0, ease: Linear} }
+  check_caps : film_part.Under {
+    slot : film_part.Slot {
+      says : film_part.Caption {
+        Text: {s: "{d_lean_theorems_t} theorems, in Lean"}
+        cue.Arrive show(at: $t_check, dur: 0.08)
+        cue.Pop pop(at: $t_check)
+        cue.Leave hide(at: $t_name - 0.1)
+      }
+    }
+    low : film_part.Low {}
+  }
+  check_hit : voice.Thud { Onset: {at: $t_check}; Gain: {amp: 0.45} }
+  check_tone : voice.Mallet { Onset: {at: $t_check}; Lasts: {dur: 0.8}; Pitch: {hz: 329.63}; Gain: {amp: 0.14} }
+  name_shot { Cue: {member: "Backdrop.shot", from: 0, to: 0, at: $t_name, dur: 0, ease: Linear} }
+  name_at { Cue: {member: "Backdrop.at", from: $t_name, to: $t_name, at: $t_name, dur: 0, ease: Linear} }
+  name_len { Cue: {member: "Backdrop.f", from: $t_agents - $t_name, to: $t_agents - $t_name, at: $t_name, dur: 0, ease: Linear} }
+  name_card : film_part.Layer {
+    cue.CutIn enter(at: $t_name)
+    cue.CutOut leave(at: $t_agents)
+    word : film_part.Name {
+      Text: {s: "blaze"}
+      cue.Pop pop(at: $t_name, dur: 0.3, by: 0.4)
+      cue.PushIn push(at: $t_name + 0.3, dur: 2.0, by: 0.06)
+    }
+    lift : film_part.Raise {}
+  }
+  name_caps : film_part.Under {
+    slot : film_part.Slot {
+      says : film_part.Caption {
+        Text: {s: "a compiler for agents"}
+        cue.Arrive show(at: $t_name + $beat, dur: 0.08)
+        cue.Pop pop(at: $t_name + $beat)
+        cue.Leave hide(at: $t_agents - 0.1)
+      }
+    }
+    low : film_part.Low {}
+  }
+  name_low : voice.Bass { Onset: {at: $t_name}; Lasts: {dur: 2.4}; Pitch: {hz: 110}; Gain: {amp: 0.16} }
+  name_chord : voice.Mallet { Onset: {at: $t_name}; Lasts: {dur: 2.2}; Pitch: {hz: 440}; Gain: {amp: 0.16} }
+  name_air : voice.Bell { Onset: {at: $t_name + 0.03}; Lasts: {dur: 2.0}; Pitch: {hz: 880}; Gain: {amp: 0.05}; Pan: {pos: 0.3, sweep: 0} }
+}

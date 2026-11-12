@@ -1,68 +1,79 @@
-// blaze, the film: under a minute at 60 fps for X, landscape and upright from one scene. A picture, not a deck: every
-// beat is a living image drawn by shaders (harness-video's src/backdrop.rs: points of light on near-black, one accent)
-// with at most a few words over it, and every number a row of data.json beside this file (harness-video turns it into
-// the d_* constants; nothing is typed into a scene, so re-measuring rerenders the film).
+// blaze, the trailer: exactly 60 seconds at 60 fps for X, landscape and upright from one scene. One flight: the
+// camera never stops moving through a dark sea of points, and each idea is a landmark of light it nears, holds on and
+// flies through (harness-video's src/backdrop.rs), with two to five words popping in and out under it. Three times
+// the palette turns over (a field of the accent, dark type): the interrupts. Ideas, not metrics: what blaze is, then
+// what it will be; speed is two beats. Every number is a row of data.json beside this file.
 //
 //   cd crates/harness
-//   harness-video harness-video/scene/blaze/film.flecs film.mp4 x-landscape-1080p60       # the film, read back
-//   harness-video harness-video/scene/blaze/film.flecs film-tall.mp4 x-portrait-1080x1920 # the same, upright
-//   harness-video harness-video/scene/blaze/film.flecs sheet.png contact                  # a frame a second, one image
-//   harness-video harness-video/scene/blaze/film.flecs burst.png burst 14.9               # ten frames in a row
-//   harness-video harness-video/scene/blaze/film.flecs mix.wav                            # the mix alone
-//   harness-video harness-video/scene/blaze/film.flecs sounds                             # every sound event
+//   harness-video harness-video/scene/blaze/film.flecs film.mp4 x-landscape-1080p60        # the film, read back
+//   harness-video harness-video/scene/blaze/film.flecs film-tall.mp4 x-portrait-1080x1920  # the same, upright
+//   harness-video harness-video/scene/blaze/film.flecs sheet.png contact 0.5               # a frame each half second
+//   harness-video harness-video/scene/blaze/film.flecs burst.png burst 0.7                 # ten frames in a row
+//   harness-video harness-video/scene/blaze/film.flecs mix.wav                             # the mix alone
+//   harness-video harness-video/scene/blaze/film.flecs sound.png sound                     # its waveform and spectrogram
+//   harness-video harness-video/scene/blaze/film.flecs sounds                              # every sound event
 //
-// Storyboard (cuts.flecs has the times; a beat's file has its picture's numbers, its captions and its sound):
+// Cut to music: cuts.flecs places every beat on the track's grid (bar and beat), three acts: a cold open of hard
+// cuts on single hits, a build whose cut rate doubles, the galaxy on the drop's downbeat, a montage, a break, the mark
+// on the final downbeat and a button a bar later. The times below are with the temp score (104 beats a minute).
 //
-//   beat  starts  file            picture (shader)                           words on screen
-//   1     0.0     hook.flecs      race: three comets, blaze's lands first    "no-op run", the three names and times
-//   2     3.8     graph.flecs     graph: a ring from one node lights only    "all cached", "one edit",
-//                                 it and its readers                         "only this reruns"
-//   3     8.2     core.flecs      core: the daemon, warm, work in orbit      "warm daemon", "sandboxed, byte-identical"
-//   4     11.8    swarm.flecs     swarm: a million sparks fall to a few      1,091,174 falling to 21,067,
-//                                 (the peak: a rise, ticks, one hit)         "re-verified per edit", "one day"
-//   5-8   19.4    noop, body,     beam: a time as a bar of light, falling    the figure and two words each
-//                 launch, disk    from its before to its after
-//   9-10  31.4    comment, start  race                                       two words, names and times
-//   11    38.6    bodyrace.flecs  race: Relax lands first                    "body edit", "Relax leads"
-//   12    42.6    cold.flecs      race: blaze still crossing at the end      "cold start", "still behind", "in progress"
-//   13    47.3    end.flecs       gather: the points stream in, the mark     the mark, the repository
-//                                 forms and catches fire
+// Storyboard (cuts.flecs has the positions). Each beat: its landmark, its words, and what in the tree backs the claim.
 //
-// Honesty (the repository's rule: claims from evidence): a comparison is a measured row of data.json, drawn to scale
-// (a lane's time is its share of the row's slowest); the rows blaze loses are shown as they are, and said; "cargo" is
-// the stopwatch data.json describes and nothing more is claimed of it; the conditions pass once in the smallest type.
+//   at     beat      landmark (shot)             words                              backed by
+//   0.00   cage      a hexagon nothing leaves    "build.rs: no network"             AGENTS.md rule 9 sandbox-everything; the sandbox
+//                                                                                   refuses a script's network and stray writes
+//   0.58   unclosed  INTERRUPT (accent field)    "unclosed file: compile error"     crates/hir-ty-linear/src/drops.rs:334 (CONSUME);
+//                                                                                   blaze-std's File is `#[blaze::linear]`
+//   1.15   check     a check mark, drawn         "90 theorems, in Lean"             lean/theorems.json (90 entries on main)
+//   1.73   name      the sea; the galaxy, far    "blaze", "a compiler for agents"   AGENTS.md's first lines
+//   4.62   agents    streams into a warm core    "agents, not keyboards"            the resident daemon and its API
+//   6.92   rings     arcs that only narrow       "nothing ambient",                 crates/blaze-std/src/lib.rs:10-12 (capabilities
+//                                                "capabilities only narrow"         made from an Io or by narrowing, never widened)
+//   9.23   linear    INTERRUPT                   the compiler's error, verbatim     crates/hir-ty-linear/src/drops.rs:334
+//   11.54  disk      a disk tears, time runs     "same code", "fake disk",          crates/blaze-core/src/sim.rs (blaze_core::sim::Sim;
+//                    back, it tears again        "replays"                          the `testing` skill: seeded, replayable)
+//   16.15  tree      a proof tree closing        "proved"                           lean/ (BlazeMir, BlazeValidated), theorems.json
+//   18.47  prism     one beam, split             "pure", "nopanic", "noalloc"       104, 141 and 146 uses of the attributes in crates/
+//   20.77  nopanic   INTERRUPT                   "#[blaze::nopanic]  v[i]",         the nopanic check's refusal ("a nopanic function and
+//                                                "refused"                          everything it calls cannot panic or abort")
+//   21.92  mirror    two builds read as one      "same bytes"                       AGENTS.md rule 25 deterministic-output
+//   23.08  ripples   three rings to one shore    "no-op run", three names, times    data.json rows.noop (conditions on screen)
+//   25.38  warp      the sea at speed            953.0 falling to 143.5, "body edit" data.json day.body
+//   27.69  near      the galaxy, nearing         (no words)                         (the approach; the last beat before the drop is bare)
+//   32.31  galaxy    THE PEAK, on the drop: dive  "one edit",                              docs/v2/plan/design/code-identity.md; rule 52
+//                    it flares, four readers     "nothing compiled twice",          cache-by-code-id; the linker and live runtime
+//                    light, nothing else stirs   "patched live"                     (docs/v2/plan/design/patch-in-place.md)
+//   43.85  soon      comb, stair, store, cores   "soon": "the hub", "first-call     SOON: branches hub-1111, launcher-1111; the shared
+//                                                compile", "shared store",          store and the scheduler for hundreds of cores are
+//                                                "hundreds of cores"                designs (docs/v2/plan/design/scheduler.md)
+//   53.08  quiet     the sea alone; silence      "blaze builds blaze"               AGENTS.md rule 2 (blaze builds blaze as the proof)
+//   55.38  end       the sea streams in          the mark, the repository
 //
-// Sound: synthesised by harness-native-blaze's `sound` from the events in the beat files (`harness-video ... sounds`
-// lists them), one bed under the whole film, brought to the root's `Mix`. X autoplays muted: the picture carries
-// everything, the sound only adds.
+// The open loop: the galaxy is in the sky behind the name at 2.25 s, small; the film arrives in it on the drop.
+// Honesty: a claim on screen is something the tree has, or is under the "soon" tag. The one comparison is a measured
+// row, drawn to scale (each ring's time to the shore is its share of the slowest's), its conditions passing once.
+// Sound: the track, with the beats' own synthesised events under it (`harness-video ... sounds` lists them): a hit on
+// each opening cut, a rise into the edit's one big hit, and the track's one silence before the last line.
 include cuts
 include tokens
 include parts
-include hook
-include graph
-include core
-include swarm
-include noop
-include body
-include launch
-include disk
-include comment
-include start
-include bodyrace
-include cold
+include open
+include today
+include speed
+include galaxy
+include soon
 include end
 
 @tree ChildOf
 film : ui.ZStack {
   Video: {width: 960, height: 540, fps: 60, seconds: $t_out, scale: 2, reframes: true}
-  // The picture: which shot and its numbers are cued by each beat's file.
-  Backdrop: {shot: 0, at: 0, a: 0, b: 0, c: 0, d: 0, e: 0, f: 0}
+  // The picture: which landmark and its numbers are cued by each beat.
+  Backdrop: {shot: 0, at: 0, a: 0, b: 0, c: 0, d: 0, e: 0, f: 1}
   // -16 LUFS integrated, no true peak over -1 dBTP: loud enough on a phone, with headroom for X's re-encode.
   Mix: {lufs: -16, peak: -1}
   Flex: {axis: Z, gap: 0, align: Center, justify: Center, wrap: false}
   Size: {w: {kind: Fixed, value: 960, min: 0, max: 0}, h: {kind: Fixed, value: 540, min: 0, max: 0}}
-  // The bed: a low warm chord on A under the whole film (its root at 110 Hz, so a phone's speaker still carries it),
-  // and a thud on the first frame's heels, so the hook is heard.
-  bed : voice.Pad { Onset: {at: 0}; Lasts: {dur: $t_out}; Pitch: {hz: 110}; Gain: {amp: 0.035} }
-  first : voice.Thud { Onset: {at: 0.05}; Gain: {amp: 0.3} }
+  // The film is cut to a track: music.wav beside this file (not in the tree: the owner's file, or the temp score
+  // `harness-video score` writes), its grid in beats.json. The beats' own sounds sit under it.
+  Music: {gain: 1.0, under: 0.55}
 }

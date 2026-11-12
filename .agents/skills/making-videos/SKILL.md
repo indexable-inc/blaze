@@ -7,9 +7,28 @@ description: "Making a video with the repository's own renderer (crates/harness/
 
 A video here is data rendered by `crates/harness/harness-video` (its README is the reference): flecs script scenes on
 the app's own stack, a picture drawn by shaders under them, every number from one JSON file, sound synthesised from
-events in the scenes, encoded by VideoToolbox, no ffmpeg anywhere. The first film made this way was rejected by the
-owner as "a deck, not a film": slides of headlines, a labelled bar chart, a footnote. The rules below are what that
-cost. Read them before the first line of a scene.
+events in the scenes, encoded by VideoToolbox, no ffmpeg anywhere. Two films made this way were rejected by the owner.
+The first was "a deck, not a film": slides of headlines, a labelled bar chart, a footnote. The second had shaders and
+few words and was still wrong: "a lot of small statistics but not the bigger picture", nine beats of numbers and
+two images used over and over, and a glow that ended on a straight line. The rules below are what those cost. Read
+them before the first line of a scene.
+
+## Before building: what is it, and three treatments
+
+- **A trailer is ideas, not metrics.** Say what the thing is and will be (for blaze: a compiler for agents, its own
+  capability-based standard library, linear types, a deterministic simulation, proofs in Lean, enforced effects,
+  sandboxing, byte-identical output, code identity, then what is coming). Speed is one or two beats, the strongest
+  measured rows only. If most beats are a number, it is a dashboard.
+- **Verify every claim in the tree before it is a beat**, and write beside the beat in the storyboard the file and line
+  that backs it. What is designed or on a branch goes under a "soon" tag. Use the tool's own words for an error
+  (grep the message), never a paraphrase.
+- **Write three one-paragraph treatments** (art directions that could not be mistaken for each other: one continuous
+  flight through a world; flat colour fields and hard typographic cuts; the code itself as the material), pick the one
+  most likely to be rewatched, say why, and commit to it. Do not start from the last cut's parts.
+- **High-entropy first.** The first two seconds hold the most surprising concrete claims in the film, a hard cut
+  each, under a second each; the name comes after. Context follows surprise.
+- **Open a loop early and close it late** (the galaxy small in the sky behind the name; the film arrives in it at
+  the peak).
 
 ## The pipeline
 
@@ -19,12 +38,16 @@ From `crates/harness` (build: see Traps), with `F=harness-video/scene/<film>/fil
 | --- | --- |
 | The video, read back and checked | `harness-video $F out.mp4 x-landscape-1080p60` |
 | The same scene upright | `harness-video $F tall.mp4 x-portrait-1080x1920` (the root's `Video` says `reframes: true`) |
-| A contact sheet: a frame a second, one image | `harness-video $F sheet.png contact [PRESET]` |
+| A contact sheet: a frame each EVERY seconds (1), one image | `harness-video $F sheet.png contact [EVERY] [PRESET]` |
+| The mix as a picture (waveform over spectrogram) | `harness-video $F sound.png sound` |
 | Ten consecutive frames from a time, one image | `harness-video $F burst.png burst 14.9 [PRESET]` |
 | One full frame | `harness-video $F still.png 14.9 [PRESET]` |
 | The mix alone (with its loudness printed) | `harness-video $F mix.wav` |
 | Every sound event, in time order | `harness-video $F sounds` |
 | Check a finished file against a preset | `harness-video check out.mp4 $F PRESET` |
+| A track's beat grid, and its picture | `harness-video analyse music.wav beats.json` |
+| Every hard cut, held to the grid | `harness-video $F cuts` |
+| The temp score | `harness-video score OUT.wav BPM BARS DROP_BAR DROP_BARS` |
 
 - **Presets** are data: `harness-video/presets.json`, one home for codec, profile, pixel format, bitrate, key frames,
   colour, audio and container. Add a platform by adding a preset there, never a flag.
@@ -42,6 +65,33 @@ From `crates/harness` (build: see Traps), with `F=harness-video/scene/<film>/fil
 - **Sound** is `voice.*` events in the beat's file (`Onset`, `Lasts`, `Pitch`, `Gain`, `Pan`), synthesised
   deterministically by `harness-native-blaze`'s `sound`, mastered to the root's `Mix: {lufs, peak}` (`src/loud.rs`).
 
+## Cut to music, in musical time
+
+A trailer is edited to a track, frame in, frame out. Author cuts as bar and beat, never as seconds.
+
+1. **The track** is a file the owner supplies with the rights to use it, as `music.wav` beside the scene (WAV: 16, 24
+   or 32-bit PCM or float, any rate; it is not committed). **Never download or rip a recording**, and never imitate a
+   recognisable part of one. Until a track is supplied, `harness-video score music-temp.wav 104 26 15 5` writes a temp
+   score (a pulse, a build, a drop) to cut against; a render made with it says TEMP MUSIC and is named so.
+2. **The grid**: `harness-video analyse music.wav beats.json` (`src/music.rs`: spectral-flux onsets, tempo by
+   autocorrelation, a dynamic-programming beat tracker fitted to one even tempo, downbeats from the low band, sections
+   from each bar's energy, the strongest impacts). It also writes `beats.png`: the track with faint lines on beats,
+   bright lines on bars, orange lines on sections. **Look at it**: the bright lines must sit on the kicks. A grid at half
+   or double tempo, or counted from the wrong beat, moves every cut.
+3. **Placing cuts**: `beats.json` becomes `m_*` constants (`$m_b15_1` bar 15 beat 1, `$m_b15_1h` the half beat after,
+   `$m_drop`, `$m_impact_1`, `$m_beat` a beat's seconds), each snapped to a frame. `cuts.flecs` is nothing but those;
+   inside a beat, offsets are whole or half beats (`$t_rings + 4 * $beat`). Another track re-times the film.
+4. **The check**: `harness-video $F cuts` lists every hard cut with its bar and beat and fails on one more than a frame
+   off the grid (the film's test runs it).
+5. **Where cuts go**: on the beat for an impact (the image and the hit arrive together); a caption or a camera move
+   may start a few frames before a beat so it lands on it; things leave just before the next beat, so the beat belongs
+   to what arrives. Motion carries through a cut (the fly-through that ends one landmark is the approach to the next).
+6. **The shape**: a cold open of hard cuts on single hits; a build whose cut rate doubles each phrase, with a riser;
+   a bare beat before the drop; the hero image on the drop's downbeat, held; a montage; a break (the film's one
+   silence) with one line on one hit; the mark on the final downbeat; a button a bar later.
+7. **The mix**: the track is the hero (`Music: {gain, under}` on the root mixes the scene's own sounds under it);
+   the loudness target does not change.
+
 ## Numbers are bound, never typed
 
 A `data.json` beside the scene becomes `d_*` constants before the scene loads (`src/data.rs`): `d_rows_noop_blaze`
@@ -51,19 +101,25 @@ is: change the file, render, and the film shows the new number. Each row carries
 
 ## Craft: what a film is judged by
 
-1. **Almost nothing to read.** At most 3 to 5 words on screen at once; under 60 words in a minute, counted (the
-   film's test counts them). No paragraphs, bullet cards, "5 / 7", legends, footnote blocks. If it needs a sentence,
+1. **Almost nothing to read.** At most 2 to 5 words on screen at once; under 80 words in a minute, counted (the
+   film's test counts them). One line of real code or the compiler's own error may be an image when it is the point. No paragraphs, bullet cards, "5 / 7", legends, footnote blocks. If it needs a sentence,
    find the picture that says it.
 2. **Captions pop in and out.** One phrase at a time, bold, low-centre or beside the thing it names, 0.6 to 1.5 s
    each (longer only under a race it labels), in with a quick scale (`cue.Arrive` + `cue.Pop`), gone (`cue.Leave`)
    before the next. The word that matters may take the accent. At 2 pixels a point, 34-point bold reads on a phone;
    19-point is the floor for a label; the conditions line is the only smaller thing and it fades.
 3. **Numbers are the heroes.** Big, few, moving: a `Tally` that counts while the picture changes with it.
-4. **Shaders, not rectangles.** Every beat is a living image: points of light, comets with tails, a ring through a
-   graph, a swarm thinning, a beam shortening. Near-black, one accent, depth (layers of points), glow, grain, a
-   vignette. Blur what moves fast (a tail is the path over the shutter). A plate with a headline on it is a slide.
-5. **A hook in 1.5 s:** motion and one number, no title card. **A new picture every 3 to 4 s.** One peak the film
-   builds to (the rise in the sound lands on it). An end card (mark, name, repository) under 3 s.
+4. **Shaders, not rectangles.** Every beat is a living image with depth: signed-distance shapes, layers of points
+   the camera moves through, glow, grain, a vignette; near-black, one accent, which may invert for an interrupt. A
+   plate with a headline on it is a slide; so is a bar with a label.
+   **Every falloff reaches zero inside what is drawn.** A glow is a Gaussian of a distance to a point, a segment or
+   a curve and nothing else: never multiply it by a `step` at a track's start, a shape's box or a quad's edge, or its
+   light ends on a straight line (the second film's beam did, at its left end). `no_light_ends_at_a_line` draws
+   every shot and fails on a long straight run of sharp change; add a shot and it is checked.
+5. **A hook in the first 2 s** (above), no title card. **Beats of 1.5 to 3.5 s, each a different image and a different
+   idea: no image twice.** A pattern interrupt every 5 to 8 s (the palette turned over, a hard cut to one line of
+   code or an error, a freeze, a fly-through). One sustained peak around two thirds through (the rise in the sound
+   lands on it). What is coming as a fast montage. An end card (mark, name, repository) under 3 s. A minute is 60.0 s.
 6. **Sound off first.** Platforms autoplay muted: the picture must carry everything. Sound follows the picture (a
    whoosh on a streak, a hit on a finish, a rise into the peak) and never explains.
 7. **Reframe.** Most short video is watched upright. Compose centre-weighted, size things as shares of the frame
@@ -100,11 +156,23 @@ anything else is labelled "in progress" or is not in the film.
    number?
 3. Phone size: one upright still shrunk to about 400 pixels wide (`sips -Z 800`). Can you read every word?
 4. Count the words. Check the bitrate. Read the loudness line. Run `sounds` and check the first second is not silent.
-5. Open the images with your image reader and look. A film nobody looked at ships its bugs: the first cut of this
+   You cannot hear the mix: render `sound.png sound` (waveform over spectrogram) and look for dead stretches, a
+   waveform touching its top, a silence you did not mean; list the cue times for the owner to spot-check.
+5. Contact sheet at a frame each half second (`contact 0.5`), and a burst over every cut in the first five seconds.
+6. Write the critique down: would I keep watching at 2 s, 5 s, 15 s, 40 s? Which one frame would someone screenshot?
+   What would make an engineer quote-post it? If an answer is "nothing", it is not done.
+7. Open the images with your image reader and look. A film nobody looked at ships its bugs: the first cut of this
    one had every lane label gone after 0.3 s and nobody would have known from the read-back.
 
 ## Traps
 
+- **Building with today's blaze** (tried 2026-11-11 with `/tmp/blaze-inst/blaze-engine`, a cargo-built blaze of the
+  day's tree, own `BLAZE_HOME` under `/private/tmp`): without `--ignore-pin` it fetches and runs the pinned release,
+  which cannot read the manifest; a daemon that run started then refuses the newer client ("speaks API schema 40,
+  this blaze 50") until it is stopped. With `--ignore-pin` and that daemon gone it builds, slowly from a cold home
+  (20 minutes cloning flecs, then 1,776 of 2,567 units in the 25 minutes it was given, no error): give it an hour
+  and nothing else to do. `env BLAZE_HOME=/private/tmp/<own> BLAZE_DAEMON_MEMORY_GB=48 <blaze-engine> --ignore-pin
+  build --release -p harness-video` from `crates/harness`, with the manifest as committed.
 - **The build.** cargo cannot read the harness workspace (`harness-native-render` depends on
   `harness-native-shaders` with `artifact = "gpu"`, a blaze extension), and the pinned blaze (0.20261105.4) predates
   that. The proper build is `blaze build --release -p harness-video` with a blaze from after 2026-11-10. Until the pin

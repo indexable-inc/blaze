@@ -190,8 +190,93 @@ pub fn master(mix: &mut [[f32; 2]], lufs: f64, ceiling: f64) -> Result<Loudness,
     Ok(after)
 }
 
+/// A picture of a mix, for eyes that cannot hear it: `(w, h)` RGBA8, the waveform (each column its loudest sample,
+/// both channels) over the spectrogram (each column a 2048-sample Hann window's magnitudes, low at the bottom on a
+/// log scale from 40 Hz to 20 kHz, -90 dB black to 0 dB white). A dead stretch is a flat line over a black column;
+/// clipping is a waveform that touches its top.
+pub fn picture(mix: &[[f32; 2]], (w, h): (usize, usize)) -> Vec<u8> {
+    const N: usize = 2048;
+    let mut px = vec![0u8; w * h * 4];
+    let mut put = |x: usize, y: usize, c: [u8; 3]| {
+        let at = (y * w + x) * 4;
+        px[at..at + 4].copy_from_slice(&[c[0], c[1], c[2], 255]);
+    };
+    let wave = h / 3;
+    let per = (mix.len() / w).max(1);
+    for x in 0..w {
+        let from = (x * per).min(mix.len());
+        let chunk = &mix[from..(from + per).min(mix.len())];
+        let peak = chunk.iter().flat_map(|s| [s[0].abs(), s[1].abs()]).fold(0.0f32, f32::max).min(1.0);
+        let half = (peak * (wave / 2) as f32) as usize;
+        for y in 0..wave {
+            let d = y.abs_diff(wave / 2);
+            put(x, y, if d <= half { [255, 149, 50] } else if y == 0 || y == wave - 1 { [90, 90, 90] } else { [12, 13, 16] });
+        }
+        // The spectrum of the window that starts here.
+        let mut re = [0.0f64; N];
+        let mut im = [0.0f64; N];
+        for (i, r) in re.iter_mut().enumerate() {
+            let s = mix.get(from + i).map_or(0.0, |s| f64::from(s[0] + s[1]) * 0.5);
+            *r = s * (0.5 - 0.5 * (std::f64::consts::TAU * i as f64 / N as f64).cos());
+        }
+        fft(&mut re, &mut im);
+        let rows = h - wave;
+        for y in 0..rows {
+            let hz = 40.0 * (20_000.0f64 / 40.0).powf(1.0 - y as f64 / rows as f64);
+            let bin = ((hz * N as f64 / f64::from(RATE)) as usize).clamp(1, N / 2 - 1);
+            let mag = (re[bin] * re[bin] + im[bin] * im[bin]).sqrt() / (N as f64 / 4.0);
+            let v = ((20.0 * mag.max(1e-9).log10() + 90.0) / 90.0).clamp(0.0, 1.0);
+            let c = (v * 255.0) as u8;
+            put(x, wave + y, [c, (v * v * 255.0) as u8, (v * v * v * 200.0) as u8]);
+        }
+    }
+    px
+}
+
+/// An in-place radix-2 FFT (the lengths here are powers of two).
+pub(crate) fn fft(re: &mut [f64], im: &mut [f64]) {
+    let n = re.len();
+    let mut j = 0;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    let mut len = 2;
+    while len <= n {
+        let ang = -std::f64::consts::TAU / len as f64;
+        for start in (0..n).step_by(len) {
+            for k in 0..len / 2 {
+                let (c, s) = ((ang * k as f64).cos(), (ang * k as f64).sin());
+                let (a, b) = (start + k, start + k + len / 2);
+                let (tr, ti) = (re[b] * c - im[b] * s, re[b] * s + im[b] * c);
+                (re[b], im[b]) = (re[a] - tr, im[a] - ti);
+                (re[a], im[a]) = (re[a] + tr, im[a] + ti);
+            }
+        }
+        len <<= 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The picture of a mix shows a tone where it is: a 1 kHz sine lights the row for 1 kHz and leaves 100 Hz dark.
+    #[test]
+    fn a_tone_is_a_line_in_the_spectrogram() {
+        let (w, h) = (16, 300);
+        let px = picture(&sine(1000.0, 0.5, 2.0), (w, h));
+        let row = |hz: f64| 100 + ((1.0 - (hz / 40.0).ln() / (20_000.0f64 / 40.0).ln()) * 200.0) as usize;
+        let red = |y: usize| px[(y * w + 4) * 4];
+        assert!(red(row(1000.0)) > 200 && red(row(100.0)) < 60, "{} {}", red(row(1000.0)), red(row(100.0)));
+    }
+
     use super::*;
 
     fn sine(hz: f64, amp: f64, seconds: f64) -> Vec<[f32; 2]> {

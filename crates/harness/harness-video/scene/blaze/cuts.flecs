@@ -1,17 +1,37 @@
-// The cut list: when each beat of the film starts, seconds on the frame clock (film.flecs has the storyboard). A
-// beat's picture, captions and sounds are all placed from its own start, so moving a start here retimes all three.
-// Included first, so every beat's file sees these.
-export const t_hook = 0.0
-export const t_graph = 3.8
-export const t_core = 8.2
-export const t_swarm = 11.8
-export const t_noop = 19.4
-export const t_body = 22.4
-export const t_launch = 25.4
-export const t_disk = 28.4
-export const t_comment = 31.4
-export const t_start = 35.1
-export const t_bodyrace = 38.6
-export const t_cold = 42.6
-export const t_end = 47.3
-export const t_out = 51.6
+// The cut list, in musical time: when each beat of the trailer starts, as a position in the track's grid
+// (`$m_b<bar>_<beat>`, from beats.json beside this file: harness-video's src/music.rs). Every hard cut is on a beat
+// (`harness-video ... cuts` lists them and fails on one off the grid), so another track re-times the film. A beat's
+// landmark, captions and sounds are placed from its own start in beats (`$beat` is a beat's seconds).
+//
+// The shape is a trailer's, in three acts over the track's 26 bars:
+//   cold open  bars 1-2    a hard cut on each of the first three hits, the name on the fourth, held
+//   build      bars 3-14   shots of a bar, then half a bar; two bars toward the galaxy on a riser, the last beat bare
+//   drop       bar 15      the galaxy lands on the downbeat and holds for five bars; the edit on bar 17's downbeat
+//   montage    bars 20-23  what is coming, a bar each
+//   break      bar 24      silence; the last line on its one hit (beat 3)
+//   end        bar 25      the mark on the final downbeat; the button (the repository, one more hit) on bar 26
+export const beat = $m_beat
+export const t_cage = $m_b1_1
+export const t_unclosed = $m_b1_2
+export const t_check = $m_b1_3
+export const t_name = $m_b1_4
+export const t_agents = $m_b3_1
+export const t_rings = $m_b4_1
+export const t_linear = $m_b5_1
+export const t_disk = $m_b6_1
+export const t_tree = $m_b8_1
+export const t_prism = $m_b9_1
+export const t_nopanic = $m_b10_1
+export const t_mirror = $m_b10_3
+export const t_ripples = $m_b11_1
+export const t_warp = $m_b12_1
+export const t_near = $m_b13_1
+export const t_galaxy = $m_drop
+export const t_soon = $m_b20_1
+export const t_first = $m_b21_1
+export const t_store = $m_b22_1
+export const t_cores = $m_b23_1
+export const t_quiet = $m_b24_1
+export const t_end = $m_b25_1
+// The film is a minute, whatever the track's last bar rounds to.
+export const t_out = 60.0

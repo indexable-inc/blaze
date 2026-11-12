@@ -506,6 +506,61 @@
    "cause": "the pin was not moved when the gpu dependency landed on 2026-11-10",
    "workaround": "cargo with the pinned nightly, the dependency line edited locally, an older MSL file for Kip",
    "state": "open: needs a blaze from after 2026-11-10 pinned, and a harness build with it somewhere its memory is safe"
+  },
+  {
+   "id": "A47",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "blaze: building the harness",
+   "what": "`blaze-engine build --release -p harness-video` with today's blaze (/tmp/blaze-inst, own BLAZE_HOME) ran the pinned release instead: \"blaze 0.0.0-dev ... runs blaze 0.20261105.4 here, as crates/harness/Cargo.toml pins\"; it fetched 154 MB, started that release's daemon, and failed on the manifest: \"`artifact = …` requires `-Z bindeps` (harness-native-shaders)\". The harness workspace pins a blaze that cannot read the harness workspace.",
+   "cost": "one attempt, and a daemon of the wrong version left in the home",
+   "cause": "crates/harness is covered by the root pin, which was not moved when the gpu dependency landed",
+   "workaround": "`--ignore-pin`",
+   "state": "open: move the pin, or the harness cannot be built by the blaze it names"
+  },
+  {
+   "id": "A48",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "blaze: building the harness",
+   "what": "After the pinned run, `--ignore-pin` failed at once: \"the daemon at /private/tmp/blaze-home-film/v2.sock speaks API schema 40, this blaze 50: it is another build of blaze, which this one can't tell to stop\". The daemon was the one the same command had started a minute before.",
+   "cost": "one attempt",
+   "cause": "a newer client will not stop an older daemon in its own home",
+   "workaround": "kill the old daemon by the pid its log names",
+   "state": "open"
+  },
+  {
+   "id": "A49",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "blaze: building the harness",
+   "what": "With `--ignore-pin` and the old daemon gone, today's blaze did build the harness without an error, slowly: about 20 of 25 minutes went on `fetch git repository https://github.com/indexable-inc/flecs` (a full clone; cargo has it cached), then it compiled 1,776 of 2,567 units (24 GB, squeezed under the 48 GB cap) before the 25-minute bound ended it (exit 124). Not finished, so Rust shaders are still not in the film.",
+   "cost": "25 minutes during which cargo could not be run on the same manifest",
+   "cause": "a cold blaze home shares nothing with cargo's git cache; the build was not given longer",
+   "workaround": "the film's shaders stay Metal source compiled at start-up",
+   "state": "open: run it to the end in a quiet hour (the command is in the making-videos skill)"
+  },
+  {
+   "id": "A50",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "harness-video",
+   "what": "The first test for 'no light ends at a line' failed on honest shapes four times before it failed on nothing: a hexagon's side, an outline's halo (brighter eight pixels one side of its core than the other), a disk's rim against its lit inside. Each needed the measure narrowed (a step, not a line; 40 of 255, not 12; a sixth of the frame, not a twelfth).",
+   "cost": "five test cycles",
+   "cause": "'a hard edge' has no definition until the legitimate hard edges are listed",
+   "workaround": "the test's doc says what it does not see (a cut dimmer than 40 of 255, shorter than a sixth of the short side)",
+   "state": "open"
+  },
+  {
+   "id": "A51",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "the brief",
+   "what": "Three briefs arrived while the work before each was unfinished (a trailer; real shaders by blaze; cut to music with an analysis pipeline), each a remake, so two cuts were replaced before they were reviewed against the next rule, and the ssh-keys claim, the AudioToolbox import and the bstd encoder were asked for and not built.",
+   "cost": "most of a day",
+   "cause": "the film's shape was being decided by watching finished cuts",
+   "workaround": "the report says what was not built",
+   "state": "open"
   }
  ]
 }

@@ -32,7 +32,7 @@ film_part {
   }
   // The room under a Figure that lifts it over the picture's middle (a beam, the swarm's heart).
   prefab Raise : ui.Node {
-    Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Percent, value: 0.2, min: 0, max: 0}}
+    Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Percent, value: 0.12, min: 0, max: 0}}
   }
   // A race's lane: a tenth of the frame high (the kernel's lanes are a tenth apart), its words above its line. The time
   // stands beside the name at the start, clear of the flash at the finish.
@@ -48,6 +48,37 @@ film_part {
     Fill: $tone_film_other
     TextStyle: {size: $size_film_lane, line: $line_film_lane, code_line: 0, role: 10, bold: 1, weight: 0}
     Tally: {value: 0, decimals: 1, unit: ""}
+  }
+  // The name, once.
+  prefab Name : ui.Line {
+    Fill: $tone_film_accent
+    TextStyle: {size: $size_film_name, line: $line_film_name, code_line: 0, role: 2, bold: 1, weight: 0}
+  }
+  // Words on an interrupt's accent field: big, dark.
+  prefab Shout : ui.Words {
+    Fill: $tone_film_dark
+    TextStyle: {size: $size_film_shout, line: $line_film_shout, code_line: 0, role: 2, bold: 1, weight: 0}
+    Size: {w: {kind: Percent, value: 0.8, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  // A line of code, in the monospace face.
+  prefab Code : ui.Line, Strong {
+    TextStyle: {size: $size_film_code, line: $line_film_code, code_line: 0, role: 9, bold: 0, weight: 0}
+  }
+  // The compiler's words on an interrupt: monospace, bold, dark, wrapping inside the frame.
+  prefab Error : ui.Words {
+    Fill: $tone_film_dark
+    TextStyle: {size: 30, line: 38, code_line: 0, role: 9, bold: 1, weight: 0}
+    Size: {w: {kind: Percent, value: 0.8, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  // One line on an interrupt, in the middle: dark, bold.
+  prefab Stamp : ui.Line {
+    Fill: $tone_film_dark
+    TextStyle: {size: 54, line: 62, code_line: 0, role: 2, bold: 1, weight: 0}
+  }
+  // The tag over what is not built yet.
+  prefab Tag : ui.Line {
+    Fill: $tone_film_accent
+    TextStyle: {size: 28, line: 34, code_line: 0, role: 9, bold: 1, weight: 0}
   }
   // The one tiny line: what was measured on, fading.
   prefab Note : ui.Line, Muted {

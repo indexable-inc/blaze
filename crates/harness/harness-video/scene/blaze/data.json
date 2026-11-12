@@ -1,5 +1,5 @@
 {
-  "about": "Every number the film shows (film.flecs and its beats). harness-video turns each leaf into a d_* constant the scenes name (src/data.rs); no number is typed into a scene. Re-measure, edit this file, render again. A row is shown as measured or left out.",
+  "about": "Every number the trailer shows (film.flecs and its beats). harness-video turns each leaf into a d_* constant the scenes name (src/data.rs); no number is typed into a scene. Re-measure, edit this file, render again. A row is shown as measured or left out; the film shows the no-op row and one row of blaze's own day, and the rest stay here for the next cut.",
   "when": "2026-11-11",
   "conditions": "hello-world · Apple-silicon Mac, 18 cores · 2026-11-11",
   "method": "medians; fixed environment; every run's output checked; measured the evening of 2026-11-11",
@@ -12,35 +12,73 @@
   },
   "rows": {
     "start": {
-      "label": "client start", "unit": "ms", "compare": ["blaze", "relax"],
-      "blaze": 4.2, "relax": 7.6,
+      "label": "client start",
+      "unit": "ms",
+      "compare": [
+        "blaze",
+        "relax"
+      ],
+      "blaze": 4.2,
+      "relax": 7.6,
       "source": "the owner's measurement, 2026-11-11 evening, medians",
       "conditions": "hello-world; Apple-silicon Mac, 18 cores; fixed environment; every run's output checked"
     },
     "noop": {
-      "label": "no-op run", "unit": "ms", "compare": ["blaze", "relax", "cargo"],
-      "blaze": 11.9, "relax": 26.2, "cargo": 43.2,
+      "label": "no-op run",
+      "unit": "ms",
+      "compare": [
+        "blaze",
+        "relax",
+        "cargo"
+      ],
+      "blaze": 11.9,
+      "relax": 26.2,
+      "cargo": 43.2,
       "source": "the owner's measurement, 2026-11-11 evening, medians",
       "conditions": "hello-world; Apple-silicon Mac, 18 cores; fixed environment; every run's output checked"
     },
     "comment": {
-      "label": "comment edit", "unit": "ms", "compare": ["blaze", "relax", "cargo"],
-      "blaze": 47.6, "relax": 58.2, "cargo": 184.5,
+      "label": "comment edit",
+      "unit": "ms",
+      "compare": [
+        "blaze",
+        "relax",
+        "cargo"
+      ],
+      "blaze": 47.6,
+      "relax": 58.2,
+      "cargo": 184.5,
       "what": "a comment is edited, then the program is run",
       "source": "the owner's measurement, 2026-11-11 evening, medians",
       "conditions": "hello-world; Apple-silicon Mac, 18 cores; fixed environment; every run's output checked"
     },
     "body": {
-      "label": "body edit", "unit": "ms", "compare": ["blaze", "relax", "cargo"],
-      "blaze": 143.5, "relax": 53.7, "cargo": 155.2,
+      "label": "body edit",
+      "unit": "ms",
+      "compare": [
+        "blaze",
+        "relax",
+        "cargo"
+      ],
+      "blaze": 143.5,
+      "relax": 53.7,
+      "cargo": 155.2,
       "what": "a function's body is edited, then the program is run",
       "verdict": "Relax leads",
       "source": "the owner's measurement, 2026-11-11 evening, medians",
       "conditions": "hello-world; Apple-silicon Mac, 18 cores; fixed environment; every run's output checked"
     },
     "cold": {
-      "label": "cold start", "unit": "s", "compare": ["blaze", "relax", "cargo"],
-      "blaze": 9.5, "relax": 0.30, "cargo": 0.26,
+      "label": "cold start",
+      "unit": "s",
+      "compare": [
+        "blaze",
+        "relax",
+        "cargo"
+      ],
+      "blaze": 9.5,
+      "relax": 0.3,
+      "cargo": 0.26,
       "what": "the first run, nothing built or cached",
       "verdict": "still behind",
       "source": "the owner's measurement, 2026-11-11 evening, medians",
@@ -51,30 +89,67 @@
     "title": "one day",
     "conditions": "blaze, before and after the fixes of 2026-11-11; hello-world; Apple-silicon Mac, 18 cores",
     "reverified": {
-      "label": "re-verified per edit", "compare": ["before", "after"],
+      "label": "re-verified per edit",
+      "compare": [
+        "before",
+        "after"
+      ],
       "what": "cached results re-verified for one edit",
-      "before": 1091174, "after": 21067,
+      "before": 1091174,
+      "after": 21067,
       "source": "the owner's measurement, 2026-11-11"
     },
     "noop": {
-      "label": "no-op run", "unit": "ms", "compare": ["before", "after"],
-      "before": 288, "after": 11.9,
+      "label": "no-op run",
+      "unit": "ms",
+      "compare": [
+        "before",
+        "after"
+      ],
+      "before": 288,
+      "after": 11.9,
       "source": "the owner's measurement, 2026-11-11"
     },
     "body": {
-      "label": "body edit", "unit": "ms", "compare": ["before", "after"],
-      "before": 953, "after": 143.5,
+      "label": "body edit",
+      "unit": "ms",
+      "compare": [
+        "before",
+        "after"
+      ],
+      "before": 953,
+      "after": 143.5,
       "source": "the owner's measurement, 2026-11-11"
     },
     "launch": {
-      "label": "launch step", "unit": "ms", "compare": ["before", "after"],
-      "before": {"low": 219, "high": 390}, "after": 0.08,
+      "label": "launch step",
+      "unit": "ms",
+      "compare": [
+        "before",
+        "after"
+      ],
+      "before": {
+        "low": 219,
+        "high": 390
+      },
+      "after": 0.08,
       "source": "the owner's measurement, 2026-11-11; the beam starts at the high end of the before range"
     },
     "disk": {
-      "label": "on disk", "unit": "MB", "compare": ["before", "after"],
-      "before": 971, "after": 500,
+      "label": "on disk",
+      "unit": "MB",
+      "compare": [
+        "before",
+        "after"
+      ],
+      "before": 971,
+      "after": 500,
       "source": "the owner's measurement, 2026-11-11"
     }
+  },
+  "lean": {
+    "theorems": 90,
+    "what": "theorems listed in lean/theorems.json, which the Lean gate holds",
+    "source": "lean/theorems.json on origin/main at 1024794c24 (`theorems`: 90 entries), counted 2026-11-11"
   }
 }

@@ -17,6 +17,15 @@ export const size_film_note = 9.5
 export const line_film_note = 13
 
 // A race: the slowest lane takes this long; each of the others its own share of it (the data's).
-export const film_pace = 2.3
+export const film_pace = 1.9
 // How long after a beat starts its race or its fall begins.
 export const film_lead = 0.35
+
+// The interrupts: the palette turned over. Words on the accent field are the ground's own dark.
+export const tone_film_dark: Fill = {dark: {0.035, 0.04, 0.05, 1}, light: {0.035, 0.04, 0.05, 1}}
+export const size_film_name = 118
+export const line_film_name = 130
+export const size_film_shout = 44
+export const line_film_shout = 52
+export const size_film_code = 22
+export const line_film_code = 30

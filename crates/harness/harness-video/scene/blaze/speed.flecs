@@ -1,0 +1,102 @@
+// Speed, in two beats and no more, then the approach: the no-op run as three ripples leaving at once for one shore, each at its own
+// speed (its row of the data file), the conditions passing once in the smallest type; then one figure of blaze's own
+// day, falling, as the camera goes to speed. Then two bars toward the galaxy that has been in the sky since the name: it
+// grows as the track rises, and the last beat before the drop is bare.
+
+@tree ChildOf
+film {
+  ripples_shot { Cue: {member: "Backdrop.shot", from: 9, to: 9, at: $t_ripples, dur: 0, ease: Linear} }
+  ripples_at { Cue: {member: "Backdrop.at", from: $t_ripples, to: $t_ripples, at: $t_ripples, dur: 0, ease: Linear} }
+  ripples_len { Cue: {member: "Backdrop.f", from: $t_warp - $t_ripples, to: $t_warp - $t_ripples, at: $t_ripples, dur: 0, ease: Linear} }
+  ripples_a { Cue: {member: "Backdrop.a", from: $film_pace * $d_rows_noop_blaze_share, to: $film_pace * $d_rows_noop_blaze_share, at: $t_ripples, dur: 0, ease: Linear} }
+  ripples_b { Cue: {member: "Backdrop.b", from: $film_pace * $d_rows_noop_relax_share, to: $film_pace * $d_rows_noop_relax_share, at: $t_ripples, dur: 0, ease: Linear} }
+  ripples_c { Cue: {member: "Backdrop.c", from: $film_pace * $d_rows_noop_cargo_share, to: $film_pace * $d_rows_noop_cargo_share, at: $t_ripples, dur: 0, ease: Linear} }
+  ripples_times : film_part.Layer {
+    cue.CutIn enter(at: $t_ripples)
+    cue.CutOut leave(at: $t_warp)
+    row : ui.Row {
+      Flex: {axis: Row, gap: 22, align: Center, justify: Center, wrap: false}
+      blaze : ui.Column {
+        Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
+        took : film_part.Took {
+          Fill: $tone_film_accent
+          Tally: {value: 0, decimals: 1, unit: " {d_rows_noop_unit}"}
+          cue.Count count(at: $t_ripples, dur: $film_pace * $d_rows_noop_blaze_share, from: 0, to: $d_rows_noop_blaze)
+        }
+        who : film_part.Who { Text: {s: $d_who_blaze}; Fill: $tone_film_accent }
+      }
+      relax : ui.Column {
+        Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
+        took : film_part.Took {
+          Fill: $tone_film_other
+          Tally: {value: 0, decimals: 1, unit: " {d_rows_noop_unit}"}
+          cue.Count count(at: $t_ripples, dur: $film_pace * $d_rows_noop_relax_share, from: 0, to: $d_rows_noop_relax)
+        }
+        who : film_part.Who { Text: {s: $d_who_relax}; Fill: $tone_film_other }
+      }
+      cargo : ui.Column {
+        Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
+        took : film_part.Took {
+          Fill: $tone_film_other
+          Tally: {value: 0, decimals: 1, unit: " {d_rows_noop_unit}"}
+          cue.Count count(at: $t_ripples, dur: $film_pace * $d_rows_noop_cargo_share, from: 0, to: $d_rows_noop_cargo)
+        }
+        who : film_part.Who { Text: {s: $d_who_cargo}; Fill: $tone_film_other }
+      }
+    }
+    lift : ui.Node { Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Percent, value: 0.66, min: 0, max: 0}} }
+  }
+  ripples_blaze : voice.Mallet { Onset: {at: $t_ripples + $film_pace * $d_rows_noop_blaze_share}; Lasts: {dur: 1.0}; Pitch: {hz: 440}; Gain: {amp: 0.12} }
+  ripples_relax : voice.Mallet { Onset: {at: $t_ripples + $film_pace * $d_rows_noop_relax_share}; Lasts: {dur: 1.0}; Pitch: {hz: 329.63}; Gain: {amp: 0.07} }
+  ripples_cargo : voice.Mallet { Onset: {at: $t_ripples + $film_pace * $d_rows_noop_cargo_share}; Lasts: {dur: 1.0}; Pitch: {hz: 220}; Gain: {amp: 0.07} }
+  ripples_caps : film_part.Under {
+    slot : film_part.Slot {
+      says : film_part.Caption {
+        Text: {s: $d_rows_noop_label}
+        cue.Arrive show(at: $t_ripples, dur: 0.08)
+        cue.Pop pop(at: $t_ripples)
+        cue.Leave hide(at: $t_warp - 0.2)
+      }
+    }
+    low : film_part.Low {}
+  }
+  ripples_note : film_part.Under {
+    note : film_part.Note {
+      Text: {s: $d_conditions}
+      cue.Arrive show(at: $t_ripples + 0.2, dur: 0.3)
+      cue.Leave hide(at: $t_warp - 0.4, dur: 0.3)
+    }
+    low : ui.Node { Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Percent, value: 0.06, min: 0, max: 0}} }
+  }
+  warp_shot { Cue: {member: "Backdrop.shot", from: 10, to: 10, at: $t_warp, dur: 0, ease: Linear} }
+  warp_at { Cue: {member: "Backdrop.at", from: $t_warp, to: $t_warp, at: $t_warp, dur: 0, ease: Linear} }
+  warp_len { Cue: {member: "Backdrop.f", from: $t_near - $t_warp, to: $t_near - $t_warp, at: $t_warp, dur: 0, ease: Linear} }
+  warp_fig : film_part.Layer {
+    cue.CutIn enter(at: $t_warp)
+    cue.CutOut leave(at: $t_near)
+    fig : film_part.Figure {
+      Tally: {value: 0, decimals: 1, unit: " {d_day_body_unit}"}
+      was { Cue: {member: "Tally.value", from: $d_day_body_before, to: $d_day_body_before, at: $t_warp, dur: 0, ease: Linear} }
+      cue.Fall drop(at: $t_warp + $beat, dur: 2 * $beat, from: $d_day_body_before, to: $d_day_body_after)
+    }
+  }
+  warp_caps : film_part.Under {
+    slot : film_part.Slot {
+      what : film_part.Caption {
+        Text: {s: $d_day_body_label}
+        cue.Arrive show(at: $t_warp, dur: 0.08)
+        cue.Pop pop(at: $t_warp)
+        cue.Leave hide(at: $t_near - 0.1)
+      }
+    }
+    low : film_part.Low {}
+  }
+  warp_rush : voice.Whoosh { Onset: {at: $t_warp}; Lasts: {dur: 2.6}; Pitch: {hz: 3000}; Gain: {amp: 0.05}; Pan: {pos: -0.5, sweep: 1.0} }
+  warp_land : voice.Mallet { Onset: {at: $t_warp + 3 * $beat}; Lasts: {dur: 1.2}; Pitch: {hz: 329.63}; Gain: {amp: 0.12} }
+  near_shot { Cue: {member: "Backdrop.shot", from: 0, to: 0, at: $t_near, dur: 0, ease: Linear} }
+  near_at { Cue: {member: "Backdrop.at", from: $t_near, to: $t_near, at: $t_near, dur: 0, ease: Linear} }
+  near_len { Cue: {member: "Backdrop.f", from: $t_galaxy - $t_near, to: $t_galaxy - $t_near, at: $t_near, dur: 0, ease: Linear} }
+  near_far { Cue: {member: "Backdrop.a", from: 1, to: 1, at: $t_name, dur: 0, ease: Linear} }
+  near_come { Cue: {member: "Backdrop.a", from: 1, to: 9, at: $t_near, dur: $t_galaxy - $t_near, ease: In} }
+  near_rise : voice.Rise { Onset: {at: $t_near}; Lasts: {dur: $t_galaxy - $t_near - $beat}; Pitch: {hz: 660}; Gain: {amp: 0.07}; Pan: {pos: -0.3, sweep: 0.6} }
+}

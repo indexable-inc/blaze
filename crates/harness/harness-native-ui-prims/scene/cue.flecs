@@ -54,10 +54,10 @@ cue {
     prop by: f32 = 0.3
     Cue: {member: "Pose.shrink", from: $by, to: 0, at: $at, dur: $dur, ease: Back}
   }
-  // Leave: fade out over `dur` from `at`, quickening (things going).
+  // Leave: fade out over `dur` from `at`, quickening (things going). Short, so what leaves before a cut is gone by it.
   template Leave {
     prop at: f32 = 0
-    prop dur: f32 = 0.12
+    prop dur: f32 = 0.07
     Cue: {member: "Pose.fade", from: 0, to: 1, at: $at, dur: $dur, ease: In}
   }
   // Type words on: every glyph hidden at `at`, all shown `dur` later, at an even pace (pair it with a Caret).

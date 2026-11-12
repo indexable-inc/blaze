@@ -12,3 +12,5 @@ __pycache__/
 # directories included.
 !/library/**
 /library/target/
+# A film's track is the owner's file (or the temp score harness-video writes), never in the tree.
+crates/harness/harness-video/scene/*/music.wav
