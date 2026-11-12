@@ -110,7 +110,7 @@ pub fn main() -> ExitCode {
         }
         _ => {
             #[cfg(feature = "native")]
-            crate::huge::base_pages_for_mimalloc();
+            crate::huge::no_hugetlb_for_mimalloc();
             // Freed pages leave the footprint as they are freed, in the client and the
             // daemon alike.
             #[cfg(feature = "native")]
