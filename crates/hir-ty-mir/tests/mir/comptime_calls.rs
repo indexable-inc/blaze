@@ -12,7 +12,7 @@ const FACTS: &str = r#"#[rustc_comptime]
 pub fn fact(x: usize) -> usize { x }
 #[rustc_intrinsic]
 #[rustc_comptime]
-pub fn raw<T>() -> usize;
+pub fn variant_count<T>() -> usize;
 "#;
 
 /// The text of each call `comptime_calls` reports in the function `name` of `FACTS` and `src`.
@@ -44,7 +44,7 @@ fn refused(src: &str, name: &str) -> Vec<String> {
 fn a_call_that_would_run_is_refused() {
     assert_eq!(refused("pub fn runs() -> usize { fact(1) }", "runs"), ["fact(1)"]);
     assert_eq!(refused("pub const fn may_run() -> usize { fact(2) }", "may_run"), ["fact(2)"]);
-    assert_eq!(refused("pub fn asks<T>() -> usize { raw::<T>() }", "asks"), ["raw::<T>()"]);
+    assert_eq!(refused("pub fn asks<T>() -> usize { variant_count::<T>() }", "asks"), ["variant_count::<T>()"]);
 }
 
 /// The same calls with the cause removed: in a `const { .. }` block, which is a constant of
@@ -53,8 +53,8 @@ fn a_call_that_would_run_is_refused() {
 fn a_call_at_compile_time_is_not() {
     let none: [&str; 0] = [];
     assert_eq!(refused("pub fn runs() -> usize { const { fact(1) } }", "runs"), none);
-    assert_eq!(refused("pub const fn may_run<T>() -> usize { const { raw::<T>() } }", "may_run"), none);
-    assert_eq!(refused("#[rustc_comptime] pub fn only() -> usize { fact(3) + raw::<u8>() }", "only"), none);
+    assert_eq!(refused("pub const fn may_run<T>() -> usize { const { variant_count::<T>() } }", "may_run"), none);
+    assert_eq!(refused("#[rustc_comptime] pub fn only() -> usize { fact(3) + variant_count::<u8>() }", "only"), none);
     assert_eq!(refused("pub const N: usize = fact(4);\npub fn reads() -> usize { N }", "reads"), none);
 }
 
