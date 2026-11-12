@@ -44,7 +44,7 @@
    "task": "Run a lane",
    "do": "One worktree and one branch per lane, named with the date; a lane that needs to run code gets its own ix VM (`ix new --name <lane> --no-shell --arch arm64 --cpus 32 --memory 128 --ttl 3d`) and removes it when done; small commits pushed to its branch; the main agent merges, measures on the exact tip and lands. The brief gives the outcome, the check, the measured facts with their source, the paths, what other lanes own, and what done prints.",
    "why": "Rules fan-out-write-only, worktree-per-lane, every-agent-has-a-task.",
-   "state": "current"
+   "state": "superseded by H9"
   },
   {
    "id": "H6",
@@ -71,6 +71,15 @@
    "task": "Test incremental, concurrent or durable behaviour",
    "do": "Write it against the sans-IO core under the simulation, as a revision case where it is an edit sequence (crates/blaze-engine/tests/revisions/), with a planted-bug control; use a real daemon only for what a kernel alone shows.",
    "why": "Rule simulate-first.",
+   "state": "current"
+  },
+  {
+   "id": "H9",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+   "task": "Run lanes and test their work",
+   "do": "Lanes only write: one worktree and branch each, small commits, pushed often; no VM, no cargo, no daemon. The main agent runs `python3 -I harness/v2/integrate.py '{\"branches\":[...],\"tests\":true}'`: it merges every branch into the integration worktree, builds once, and prints one table (edit loop beside Relax, stale answers, new project, restart, memory, disk, tests). Failures go back to the lane whose files they name. The script's paths are the Mac's today (integration worktree /Volumes/Projects/blaze-int-1112, Relax at /tmp/relax-src); moving it to the one build VM is open.",
+   "why": "Rule fan-out-write-only as rewritten 2026-11-12: ten lanes each building in their own VM cost a cold build and hours each, and their numbers had to be redone on the combined tree anyway.",
    "state": "current"
   }
  ],

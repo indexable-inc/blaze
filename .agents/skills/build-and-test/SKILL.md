@@ -65,18 +65,24 @@ See [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#wor
 
 ## fan-out-write-only (rule 35)
 
-The time that matters is from a change to knowing whether it works. A lane given its own ix VM (one
-per lane, `ix new --name <lane>`, named in its brief; never the Mac, never a shared VM, never AWS)
-closes that loop itself: it ships its worktree there, runs `blaze check` with tests and `blaze test`
-for what it touched, reads the errors and fixes them, and reports results, not "nothing was
-compiled". It builds only with blaze (`blaze-builds-blaze`), on the compiler its brief names,
-touches nothing it did not make, and removes its VM when done (`clean-up-lane`). A lane with no VM
-only reads and writes code and says plainly that nothing was built. What stays with the main agent:
-merging to main, and before a merge one check of the exact tip being merged, tests included (a
-library build alone is not "compiles"); every measurement a speed or memory claim rests on, with its
-exact tree (`measure-the-exact-tree`); changes to persisted state, the bootstrap and the pinned
-compiler; and deciding what to do next. Use few lanes (`agents-are-a-cost`): a VM per lane is 64
-cores, so each must be worth it.
+There is one integration tree (branch `int-<date>`, main plus every lane's pushed branch) and one
+build VM that holds it with a warm build, so a merge costs an incremental build, not a cold one. A
+lane has a worktree and a branch and nothing else: it reads and writes code and tests, commits
+small, pushes often, and never makes a VM, runs cargo or blaze, or starts a daemon; it says plainly
+that it has not run its code. The main agent runs the integration loop (`harness/v2/integrate.py`,
+one JSON value naming the branches): fetch, merge each branch (a branch that conflicts is left out
+and named), one build, then every check at once on that one binary: the edit-loop table beside the
+reference, the stale-answer run, new project, restart, memory, disk, the revision tests and the unit
+tests of the crates touched. One table comes out, tied to the tree's commit. A build error or failed
+check goes back to the lane whose files it names, with the tree, the command and the output; the
+lane fixes and pushes, and the loop runs again. A lane that needs to see something at run time asks
+for it as a check added to the loop (a script, a test, a span query), or is given the loop's built
+binary and its own `BLAZE_HOME` on the build VM to run read-only experiments; it does not build its
+own copy. What only one lane's change can show (a causal claim, `test-the-cause`) is run by the main
+agent as a patch on the tree. Landing: main takes the integration tree, or a branch of it, when the
+table and the tests are clean on that exact commit. Exceptions are named in the lane's brief with
+the reason: work that cannot share the VM (a benchmark that needs quiet cores gets a VM of its own;
+a macOS-only fact is measured on the Mac, one build at a time).
 
 ## worktree-per-lane (rule 36)
 
