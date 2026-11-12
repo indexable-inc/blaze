@@ -1,0 +1,21 @@
+== 3000 ms
+ ▶ lowering /root/w/hello  names    2.9s
+ building  ━━━━━━━━━──────────  1/2 · 1 running · 3.0s
+== 5000 ms
+ ▶ hello (bin)  codegen    1.4s  ← 2 wait on it
+ building  ━━━━━━━━━━━━━━━━━━─  143/146 · 1 running · 5.0s
+== end
+error[E0425]: cannot find value `c` in this scope
+ --> src/main.rs:1:37
+  |
+1 | fn add(a: u32, b: u32) -> u32 { a + c }
+  |                                     ^
+  |
+help: a local variable with a similar name exists
+  |
+1 - fn add(a: u32, b: u32) -> u32 { a + c }
+1 + fn add(a: u32, b: u32) -> u32 { a + a }
+  |
+
+For more information about this error, try `rustc --explain E0425`.
+✗ run failed in 6.30s · 1 error in hello (bin) · blaze explain hello

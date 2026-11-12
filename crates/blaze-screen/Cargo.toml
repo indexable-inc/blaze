@@ -1,0 +1,30 @@
+[package]
+name = "blaze-screen"
+description = "What `blaze build`, `run`, `check` and `test` show: one sans-IO core that takes a build's events and returns frames as data, and the pure encoder a thin driver writes them with (docs/terminal.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `Now`: the build as it runs, the one model the daemon sends.
+blaze-protocol.workspace = true
+# What the terminal does (`terminal::Terminal`), for the encoder.
+blaze-report.workspace = true
+serde = { workspace = true, features = ["derive"] }
+unicode-width.workspace = true
+
+[dev-dependencies]
+expect-test.workspace = true
+hegeltest.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -4,11 +4,12 @@
 //! written a byte ([`Step::HandOver`]).
 //!
 //! A plain answer is every unit fresh, the build's outputs, its work with nothing computed
-//! again, and a `Done` that is ok. What it prints is then exactly what blaze's CLI prints of
-//! it (`blaze_cargo::cli::print`): a `link:` line an image, `Finished`, and for a `run` its
-//! `Running` line. A diagnostic, a unit compiled, a report, a fetch, an error, a build that
-//! recomputed anything: each is the engine's printer's, which says more than this could
-//! without being that printer a second time.
+//! again, and a `Done` that is ok. What it shows is then exactly what blaze's CLI shows of
+//! it, made by the same core (blaze-screen, docs/terminal.md): on a terminal nothing for a
+//! `run` and one dim line for a `build`; off one the `blaze: ok` line. A diagnostic, a unit
+//! compiled, a report, a fetch, an error, a build that recomputed anything: each is the
+//! engine's printer's, which says more than this could without being that printer a second
+//! time.
 //!
 //! A sans-IO core: responses in, a decision and the text out.
 
@@ -18,9 +19,9 @@ use std::{
     time::Duration,
 };
 
-use blaze_api::{Artifact, Linked, Response, TargetKind, Tiers, Verb};
-
-use crate::say;
+use blaze_api::{Artifact, LinkHow, Linked, Response, TargetKind, Tiers, Verb};
+use blaze_report::terminal::Terminal;
+use blaze_screen::{Built, Caps, Event, Link, Options, Screen};
 
 /// What taking a response came to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -41,6 +42,8 @@ pub struct Plain {
     artifacts: Vec<Artifact>,
     links: Vec<Linked>,
     tiers: Option<Tiers>,
+    /// Units replayed from the store ([`blaze_api::Worked::found`]).
+    found: u64,
 }
 
 impl Plain {
@@ -75,6 +78,7 @@ impl Plain {
                 }
                 self.links = worked.links;
                 self.tiers = worked.tiers;
+                self.found = worked.found;
                 Step::More
             }
             Response::Done { ok: true } => Step::Done,
@@ -84,24 +88,33 @@ impl Plain {
     }
 
     /// What blaze's CLI writes to stderr of this answer, the build over `took` after the
-    /// command began: one `link:` line an image the build linked (in every format, under `-q`
-    /// too), then `Finished` unless `quiet` or the build placed nothing.
-    pub fn said(&self, quiet: bool, color: bool, took: Duration) -> String {
-        use std::fmt::Write as _;
+    /// command began: the frame blaze-screen's core makes of the build's end, as the bytes
+    /// `terminal` takes. Nothing where the screen says nothing (a `run`
+    /// on a terminal, `-q`).
+    pub fn said(&self, options: Options, caps: Caps, terminal: &Terminal, took: Duration) -> String {
+        let mut screen = Screen::new(options, caps);
+        screen.advance_clock(u64::try_from(took.as_millis()).unwrap_or(u64::MAX));
+        screen.take(Event::Built(Built {
+            ok: true,
+            compiled: 0,
+            cached: self.found,
+            tier: self.tiers.as_ref().map(Tiers::status),
+            // alloc: a link an image, once a command
+            links: self
+                .links
+                .iter()
+                .map(|it| Link {
+                    whole: matches!(it.how, LinkHow::Full { .. }),
+                    how: it.how.to_string(),
+                    path: it.path.clone(), // clone: as above
+                })
+                .collect(),
+            program: placed(&self.artifacts).map(str::to_owned), // alloc: a path, once a command
+            ..Built::default()
+        }));
         let mut out = String::with_capacity(160); // alloc: once a command, what it prints
-        for link in &self.links {
-            // Writing to a String cannot fail. `blaze_ui::api::link_lines`'s line.
-            let _ = writeln!(out, "link: {} ({})", link.path, link.how);
-        }
-        if let (Some(profile), false) = (&self.profile, quiet) {
-            say::status_word(&mut out, "Finished", color);
-            say::finished_into(&mut out, profile, took);
-            if let Some(tiers) = &self.tiers {
-                out.push_str(" (");
-                out.push_str(&tiers.line());
-                out.push(')');
-            }
-            out.push('\n');
+        if let Some(frame) = screen.frame() {
+            blaze_screen::encode(&frame, terminal, &mut out);
         }
         out
     }
@@ -119,6 +132,20 @@ impl Plain {
             return None;
         }
         one.executable.as_ref().map(|_| one)
+    }
+}
+
+/// The one program among what a build placed (`artifacts`), where it placed exactly one: its
+/// path, which the build's line names. The thin `blaze` and the engine's printer ask this one
+/// function, so they name the same.
+pub fn placed(artifacts: &[Artifact]) -> Option<&str> {
+    let mut programs = artifacts.iter().filter(|it| {
+        !it.profile.test && matches!(it.target.kind, TargetKind::Bin | TargetKind::Example)
+    });
+    let one = programs.next()?;
+    match programs.next() {
+        Some(_) => None,
+        None => one.executable.as_deref(),
     }
 }
 
@@ -154,27 +181,11 @@ impl Exec {
             cwd: cwd.to_owned(),
         }
     }
-
-    /// cargo's `Running` line of it, with its newline: the command line in backquotes, every
-    /// argument as it is. Only for arguments that are shown unquoted ([`say::plain`]), which
-    /// the route holds a `run` that prints this to.
-    pub fn running(&self, color: bool) -> String {
-        let mut out = String::with_capacity(64); // alloc: once a run, its line
-        say::status_word(&mut out, "Running", color);
-        out.push('`');
-        out.push_str(&self.program.to_string_lossy());
-        for arg in &self.args {
-            out.push(' ');
-            out.push_str(&arg.to_string_lossy());
-        }
-        out.push_str("`\n");
-        out
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use blaze_api::{ApiError, LinkHow};
+    use blaze_api::ApiError;
 
     use super::*;
 
@@ -205,8 +216,11 @@ mod tests {
         assert_eq!(plain.take(Response::Done { ok: true }), Step::Done);
     }
 
+    /// What a plain answer shows is the screen's: off a terminal the one `blaze: ok` line,
+    /// with no escape byte; on one a dim line for a `build` and nothing for a `run`.
     #[test]
-    fn a_plain_answer_prints_its_links_and_finished() {
+    fn a_plain_answer_says_what_the_screen_says() {
+        use blaze_screen::Command;
         let mut plain = Plain::new();
         let built = Response::Built {
             members: 1,
@@ -215,12 +229,16 @@ mod tests {
         };
         assert_eq!(plain.take(built), Step::More);
         plain.links = vec![Linked { how: LinkHow::Unchanged, path: "/w/target/debug/a".to_owned() }];
+        plain.found = 32;
         let took = Duration::from_millis(10);
-        assert_eq!(
-            plain.said(false, false, took),
-            "link: /w/target/debug/a (unchanged)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.01s\n"
-        );
-        assert_eq!(plain.said(true, false, took), "link: /w/target/debug/a (unchanged)\n");
+        let piped = plain.said(Options::of(Command::Build), Caps::PIPE, &Terminal::PIPE, took);
+        assert_eq!(piped, "blaze: ok built=0 cached=32 warnings=0 elapsed_ms=10\n");
+        let caps = Caps { live: true, cols: 80, rows: 24, unicode: true };
+        let build = plain.said(Options::of(Command::Build), caps, &Terminal::PIPE, took);
+        assert!(build.contains("up to date · 10ms"), "{build:?}");
+        assert_eq!(plain.said(Options::of(Command::Run), caps, &Terminal::PIPE, took), "");
+        let quiet = Options { quiet: true, ..Options::of(Command::Build) };
+        assert_eq!(plain.said(quiet, Caps::PIPE, &Terminal::PIPE, took), "");
         assert_eq!(plain.program(), None);
         let again = Response::Built { members: 1, profile: String::new(), artifacts: Vec::new() };
         assert!(matches!(plain.take(again), Step::HandOver(_)));
@@ -231,7 +249,6 @@ mod tests {
         let cwd = Path::new("/w");
         let exec = Exec::of("/w/target/debug/app", &[], &[OsString::from("--n=1")], cwd);
         assert_eq!(exec.program, Path::new("target/debug/app"));
-        assert_eq!(exec.running(false), "     Running `target/debug/app --n=1`\n");
         assert_eq!(shown_exe(Path::new("/w/app"), cwd), Path::new("./app"));
         assert_eq!(shown_exe(Path::new("/x/app"), cwd), Path::new("/x/app"));
     }

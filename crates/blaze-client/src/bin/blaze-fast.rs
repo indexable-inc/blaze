@@ -7,11 +7,11 @@
 //! not know is refused by name, saying to use `blaze`. It never runs `blaze` in its place (rule
 //! no-fallback); the one time it starts `blaze` is to start the daemon when none listens.
 //!
-//! It prints each diagnostic as the daemon rendered it (rustc's text, which is what `blaze`
-//! prints), each of blaze's own reports through blaze-report's renderer (the CLI's), and
-//! cargo's status lines for the units, the fetches and the end. The CLI's printer
-//! (`crates/blaze-cargo/src/cli/print.rs`) says more that this does not: the per-unit
-//! "generated N warnings" lines, the live view, `--message-format`. With `--json` every
+//! It prints each diagnostic as the daemon rendered it (which is what `blaze` prints), each of
+//! blaze's own reports through blaze-report's renderer (the CLI's), and of the build what
+//! blaze-screen's core says off a terminal (docs/terminal.md): a `blaze: progress` line every
+//! ten seconds of a build under way and one `blaze: ok` or `blaze: failed` line at its end.
+//! It draws no region, on a terminal either: that is `blaze`'s, with `--message-format`. With `--json` every
 //! response is one line of the API's JSON on stdout and nothing else is printed.
 
 use std::{
@@ -22,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use blaze_api::{Envelope, FetchVerb, Response, TestOutcome, Verb, json};
+use blaze_api::{Envelope, Response, Severity, TestOutcome, Verb, json};
 use blaze_client::{Client, Connect, Error, Options, Start, WhyOptions, place};
 use blaze_report::{Caps, Report, Roots};
 
@@ -238,23 +238,6 @@ fn colored(flag: Option<&str>, var: impl Fn(&str) -> Option<String>, terminal: b
     }
 }
 
-/// A status line as cargo writes one: `word` right-aligned in twelve columns, bold green.
-fn status(word: &str, rest: &str, color: bool) -> String {
-    match color {
-        true => format!("\x1b[1m\x1b[92m{word:>12}\x1b[0m {rest}\n"),
-        false => format!("{word:>12} {rest}\n"),
-    }
-}
-
-/// A time as cargo's `util::elapsed` writes it.
-fn elapsed(took: Duration) -> String {
-    let secs = took.as_secs();
-    match secs >= 60 {
-        true => format!("{}m {:02}s", secs / 60, secs % 60),
-        false => format!("{secs}.{:02}s", took.subsec_nanos() / 10_000_000),
-    }
-}
-
 fn said(report: &Report, color: bool) -> String {
     blaze_report::render(report, Caps { color, links: false, width: None }, &Roots::NONE)
 }
@@ -263,42 +246,81 @@ fn error(what: &str, color: bool) -> String {
     said(&Report::text(what, None), color)
 }
 
-/// What a build's responses print as, on stderr.
+/// What a build's responses print as, on stderr: the screen's lines off a terminal.
 struct Printer {
     color: bool,
-    quiet: bool,
-    verbose: bool,
-    profile: Option<String>,
+    screen: blaze_screen::Screen,
+    started: Instant,
+    /// Units made again and units replayed, and where the linked code stands, once the
+    /// build's work report came.
+    worked: (u64, u64, Option<String>),
     passed: u32,
     failed: u32,
     ignored: u32,
 }
 
 impl Printer {
+    /// What the screen writes of `event`.
+    fn take(&mut self, event: blaze_screen::Event) -> String {
+        let now = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.screen.advance_clock(now);
+        self.screen.take(event);
+        let mut out = String::new(); // alloc: the lines a response prints
+        if let Some(frame) = self.screen.frame() {
+            let terminal = blaze_report::terminal::Terminal {
+                caps: Caps { color: self.color, links: false, width: None },
+                ..blaze_report::terminal::Terminal::PIPE
+            };
+            blaze_screen::encode(&frame, &terminal, &mut out);
+        }
+        out
+    }
+
+    /// `text` as lines that stay; nothing for none.
+    fn say(&mut self, text: String) -> String {
+        match text.is_empty() {
+            true => text,
+            false => self.take(blaze_screen::Event::Said(text)),
+        }
+    }
+
     fn on(&mut self, response: &Response) -> String {
+        use blaze_screen::Event;
         match response {
-            Response::Diagnostic(diagnostic) => diagnostic.rendered.clone(), // clone: the line printed
-            Response::Report { report, .. } => said(report, self.color),
-            Response::Error(error) => said(error.report(), self.color),
-            Response::Unit(unit) if !self.quiet => {
-                let verb = match unit.verb {
-                    Verb::Compiling => "Compiling",
-                    Verb::Checking => "Checking",
-                    Verb::Fresh if self.verbose => "Fresh",
-                    Verb::Fresh => return String::new(),
+            Response::Diagnostic(diagnostic) => {
+                // clone: the line printed
+                let mut out = self.say(diagnostic.rendered.clone());
+                let error = match diagnostic.level {
+                    blaze_api::Level::Error => Some(true),
+                    blaze_api::Level::Warning => Some(false),
+                    _ => None,
                 };
-                let source = unit.source.as_ref().map(|it| format!(" {it}")).unwrap_or_default();
-                status(verb, &format!("{} v{}{source}", unit.name, unit.version), self.color)
+                if let Some(error) = error {
+                    out.push_str(&self.take(Event::Diagnosed { error, unit: None }));
+                }
+                out
             }
-            Response::Fetched { verb, what } if !self.quiet => {
-                let verb = match verb {
-                    FetchVerb::Updating => "Updating",
-                    FetchVerb::Downloaded => "Downloaded",
-                };
-                status(verb, what, self.color)
+            Response::Report { report, .. } => {
+                let mut out = self.say(said(report, self.color));
+                if report.severity == Severity::Error {
+                    out.push_str(&self.take(Event::Diagnosed { error: true, unit: None }));
+                }
+                out
             }
-            Response::Built { profile, .. } => {
-                self.profile = Some(profile.clone()); // clone: kept for the last line
+            Response::Error(error) => {
+                let mut out = self.say(said(error.report(), self.color));
+                out.push_str(&self.take(Event::Diagnosed { error: true, unit: None }));
+                out
+            }
+            Response::Unit(unit) => self.take(Event::Unit {
+                name: format!("{} v{}", unit.name, unit.version),
+                fresh: unit.verb == Verb::Fresh,
+            }),
+            // clone: the model, said about twice a second
+            Response::Doing(doing) => self.take(Event::Now(Box::new(doing.now.clone()))),
+            Response::Work(worked) => {
+                self.worked =
+                    (worked.compiled, worked.found, worked.tiers.as_ref().map(blaze_api::Tiers::status));
                 String::new()
             }
             Response::TestResult(result) => {
@@ -317,10 +339,22 @@ impl Printer {
                 if shown {
                     line.push_str(&String::from_utf8_lossy(&result.output));
                 }
-                line
+                self.say(line)
             }
             _ => String::new(),
         }
+    }
+
+    /// The build's end: the screen's one line of it.
+    fn end(&mut self, ok: bool) -> String {
+        let (compiled, cached, tier) = std::mem::take(&mut self.worked);
+        self.take(blaze_screen::Event::Built(blaze_screen::Built {
+            ok,
+            compiled,
+            cached,
+            tier,
+            ..blaze_screen::Built::default()
+        }))
     }
 }
 
@@ -366,11 +400,23 @@ fn run(asked: Asked) -> Result<u8, String> {
                 None => terminal.then(place::stderr_columns).flatten().map(u32::from),
             };
             options.within_ms = within(3600).as_millis() as u64;
+            let command = match method {
+                Method::Build => blaze_screen::Command::Build,
+                Method::Check => blaze_screen::Command::Check,
+                Method::Test => blaze_screen::Command::Test,
+            };
             let mut printer = Printer {
                 color: options.color,
-                quiet,
-                verbose: options.verbose > 0,
-                profile: None,
+                screen: blaze_screen::Screen::new(
+                    blaze_screen::Options {
+                        quiet,
+                        verbose: options.verbose > 0,
+                        ..blaze_screen::Options::of(command)
+                    },
+                    blaze_screen::Caps::PIPE,
+                ),
+                started,
+                worked: (0, 0, None),
                 passed: 0,
                 failed: 0,
                 ignored: 0,
@@ -417,17 +463,10 @@ fn run(asked: Asked) -> Result<u8, String> {
                     printer.ignored
                 ));
             }
-            match (outcome.ok, &printer.profile) {
-                (true, Some(profile)) if !quiet => {
-                    let rest = format!("{profile} target(s) in {}", elapsed(started.elapsed()));
-                    last.push_str(&status("Finished", &rest, options.color));
-                }
-                (true, _) => {}
-                (false, _) if outcome.errors.is_empty() && outcome.diagnostics.is_empty() => {
-                    last.push_str(&error("the daemon said the request failed and said no more", options.color));
-                }
-                (false, _) => {}
+            if !outcome.ok && outcome.errors.is_empty() && outcome.diagnostics.is_empty() {
+                last.push_str(&error("the daemon said the request failed and said no more", options.color));
             }
+            last.push_str(&printer.end(outcome.ok));
             err.write_all(last.as_bytes()).map_err(|it| it.to_string())?;
             Ok(if outcome.ok { 0 } else { FAILED })
         }

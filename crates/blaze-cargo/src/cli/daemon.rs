@@ -1592,11 +1592,8 @@ pub fn status_lines(status: &Status) -> String {
         lines.push_str(&format!("builds: {}\n", status.builds.len()));
     }
     for build in &status.builds {
-        let mut board = blaze_ui::board::Board::new(&build.what, blaze_ui::test_view::Paint::Plain);
-        board.take(build.now.clone()); // clone: the status is borrowed, and read once
-        let mut compact = String::new(); // alloc: a line a build
-        // A fresh board's first line is always due.
-        board.line(&mut compact);
+        // alloc: a line a build
+        let compact = blaze_screen::progress_fields(&build.now, build.now.at_ms);
         lines.push_str(&format!("  #{} {}: {compact}\n", build.id, build.what));
         for span in &build.spans {
             lines.push_str(&format!("    {span}\n"));

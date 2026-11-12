@@ -1,0 +1,27 @@
+{"at_ms":11,"event":{"Unit":{"name":"core v0.0.0","fresh":true}}}
+{"at_ms":11,"event":{"Unit":{"name":"compiler_builtins v0.1.160","fresh":true}}}
+{"at_ms":11,"event":{"Unit":{"name":"object v0.39.1","fresh":true}}}
+{"at_ms":11,"event":{"Unit":{"name":"libc v0.2.191","fresh":true}}}
+{"at_ms":11,"event":{"Unit":{"name":"std v0.0.0","fresh":true}}}
+{"at_ms":14,"event":{"Unit":{"name":"alloc v0.0.0","fresh":true}}}
+{"at_ms":14,"event":{"Unit":{"name":"rustc-std-workspace-core v1.99.0","fresh":true}}}
+{"at_ms":15,"event":{"Unit":{"name":"rustc-std-workspace-alloc v1.99.0","fresh":true}}}
+{"at_ms":15,"event":{"Unit":{"name":"memchr v2.8.3","fresh":true}}}
+{"at_ms":15,"event":{"Unit":{"name":"adler2 v2.0.1","fresh":true}}}
+{"at_ms":15,"event":{"Unit":{"name":"rustc-demangle v0.1.28","fresh":true}}}
+{"at_ms":15,"event":{"Unit":{"name":"panic_abort v0.0.0","fresh":true}}}
+{"at_ms":15,"event":{"Unit":{"name":"cfg-if v1.0.4","fresh":true}}}
+{"at_ms":15,"event":{"Unit":{"name":"rustc-literal-escaper v0.0.8","fresh":true}}}
+{"at_ms":15,"event":{"Unit":{"name":"unwind v0.0.0","fresh":true}}}
+{"at_ms":15,"event":{"Unit":{"name":"gimli v0.34.0","fresh":true}}}
+{"at_ms":15,"event":{"Unit":{"name":"hashbrown v0.17.1","fresh":true}}}
+{"at_ms":15,"event":{"Unit":{"name":"std_detect v0.1.5","fresh":true}}}
+{"at_ms":15,"event":{"Unit":{"name":"miniz_oxide v0.9.1","fresh":true}}}
+{"at_ms":15,"event":{"Unit":{"name":"panic_unwind v0.0.0","fresh":true}}}
+{"at_ms":15,"event":{"Unit":{"name":"addr2line v0.27.1","fresh":true}}}
+{"at_ms":15,"event":{"Unit":{"name":"proc_macro v0.0.0","fresh":true}}}
+{"at_ms":15,"event":{"Unit":{"name":"blaze_inproc_rt v0.0.0","fresh":true}}}
+{"at_ms":15,"event":{"Unit":{"name":"hello v0.1.0","fresh":false}}}
+{"at_ms":703,"event":{"Built":{"ok":true,"compiled":1,"cached":31,"tier":"tier 0 · 0% optimized","links":[{"path":"/root/home7/build/hello-616f0827fcf2e2487fd4387b6ec0dcfc/debug/build/hello/343a16bba50454d7/out/hello","how":"spliced","whole":false}],"unbuilt":0,"program":"/root/home7/build/hello-616f0827fcf2e2487fd4387b6ec0dcfc/debug/hello","next":null,"why_follows":true,"tests_follow":false}}}
+{"at_ms":703,"event":{"Why":[{"wasted":false,"cause":"src/main.rs changed","headline":"recomputed 2 steps because src/main.rs changed","functions":["hello::add"],"more":"blaze explain why:input"}]}}
+{"at_ms":703,"event":"Clear"}

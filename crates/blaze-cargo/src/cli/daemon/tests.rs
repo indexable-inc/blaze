@@ -212,7 +212,8 @@ fn the_status_for_people() {
     };
     assert!(
         status_lines(&building).ends_with(
-            "builds: 1\n  #12 test -p blaze-api: [2m05s] compiling · mem 0 B · builds 412 units, 1 running\n    \
+            "builds: 1\n  #12 test -p blaze-api: phase=compiling done=0/0 running=0 elapsed_ms=125400 \
+             waits=\"builds 412 units, 1 running\"\n    \
              blaze-worker-3: task (2 min 05 s) > unit bodies `app::main` in app (4 s)\n\
              downloads: 1\n  llvm.tar.xz: 34.0 of 410.0 MB (8%)\n    from https://example.com/llvm.tar.xz\n"
         ),

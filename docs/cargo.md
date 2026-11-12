@@ -113,9 +113,9 @@ not compile a build's error names, the first `N` (16 without it) or every one. `
 function has its optimized code (LLVM's), and fails, naming the function, where it cannot.
 Without the flag the profile says: `dev` and `test` edit, `release` and `bench` (and any
 profile at `opt-level` 2, 3, `s` or `z`) are `max`. A package cargo gives its own `opt-level`
-(`[profile.*.package.*]`) keeps it under both. The `Finished` line ends with the goal and how
-much of the linked code is optimized: `(goal edit: tier 0 · 38% optimized)`
-([v2/plan/design/tiers.md](v2/plan/design/tiers.md)).
+(`[profile.*.package.*]`) keeps it under both. The build's last line says where the linked
+code stands: `tier 0 · 38% optimized` ([v2/plan/design/tiers.md](v2/plan/design/tiers.md),
+[terminal.md](terminal.md)).
 `serve` is the daemon itself ([below](#the-daemon)); `codegen-inputs`, `trace` and `tables`
 print what the daemon's last build of the checkout did (each instance it made with its code
 hash, every result with its edges as CBOR, the size of each long-lived table); `check --replace std::sync::Mutex=parking_lot::Mutex` retargets every
@@ -154,11 +154,12 @@ dev-dependencies; a member the selected packages only depend on is checked as it
 in the same layout, under the workspace's build directory, which is never in the checkout
 ([Where a build writes](#where-a-build-writes)). The client reads no manifest: it finds the checkout, sends the
 daemon one request with the whole command line, its environment and the configuration files
-outside the checkout, and prints the responses as cargo prints its build (`Compiling`,
-`Fresh` under `-v`, warnings, `Finished`), with cargo's exit codes. `check` is the daemon's
-check of every body of each crate the command picks, as rustc checks them
-(`crates/blaze-cargo/src/serve/unit/checks.rs`): the errors a build would fail with, or
-`Finished`, and no rustc. `--message-format` takes each of cargo's values; in JSON the
+outside the checkout, and shows the responses as [terminal.md](terminal.md) says (on a
+terminal a region redrawn while the build runs and one line when it ends; off one the
+diagnostics and one `blaze: ok` or `blaze: failed` line), with cargo's exit codes. `check` is
+the daemon's check of every body of each crate the command picks, as rustc checks them
+(`crates/blaze-cargo/src/serve/unit/checks.rs`): the errors a build would fail with, or that
+one line, and no rustc. `--message-format` takes each of cargo's values; in JSON the
 messages are cargo's (`compiler-artifact`, `build-script-executed`, `compiler-message` with
 rustc's diagnostic, `build-finished`), written as cargo and rustc write them
 (`crates/blaze-cargo/src/cli/json.rs`), which is what rust-analyzer's check-on-save and other
@@ -170,7 +171,7 @@ watches and the memory it holds of its budget (`--json`: one object, [The daemon
 Under a JSON `--message-format` every `build`, `check`, `run`, `test` and `bench` ends its build
 with one `build-finished` line on stdout, the last of its JSON messages and before anything the
 program or the tests print. cargo's has only `success`; blaze's carries what a tool would
-otherwise read from the human `Finished` line and the daemon's log, each field always present,
+otherwise read from the build's last line on stderr and the daemon's log, each field always present,
 `null` where there is nothing to say:
 
     {"reason":"build-finished","success":true,"profile":"dev","served":"daemon","took_ms":812,"build_id":7,"units":{"built":2,"replayed":40},"links":{"first":0,"spliced":1,"unchanged":0,"full":0}}
@@ -288,7 +289,8 @@ them.
 `run` then becomes the program and `test` runs the test executables the client was told of, as
 cargo's `ops::run_tests` does (`crates/blaze-cargo/src/cli/test.rs`): in cargo's order, on the
 terminal, with the variables and working directory cargo gives, cargo's `Running` lines, then
-the doc tests; `--no-run` lists them. By default blaze builds every unit it can, runs every
+the doc tests (on a terminal that redraws, `test` runs them under the screen instead:
+[terminal.md](terminal.md)); `--no-run` lists them. By default blaze builds every unit it can, runs every
 test executable and doc test that built whichever failed, and ends listing the targets that
 failed (with what reruns each), then each test executable or doc test that never built and the
 failure that held it back: its own compile's, or the unit it was skipped behind
@@ -1098,7 +1100,8 @@ answered. It is said again only while every input of that walk is as it was:
 |---|---|
 | The checkout's files (sources, manifests, lock file, config in it) | the view's root, which the checkout's watcher commits before the request is seen |
 | Command, arguments, directory, the request's whole environment, config files outside the checkout, fetched sources and path dependencies, toolchain, blaze's version | the view's config, by its bytes |
-| Colors, width, `--refused`, `-v`, `--goal` | the request's own hash |
+| `-v`, `--goal` | the request's own hash |
+| How the client is shown diagnostics (colors, width, `--message-format`, `--refused`) | no input of what is built: an answer with no diagnostic is said again to any client; one with diagnostics walks, and the walk draws them for that client from the units' records and compiles nothing (`serve/unit/drawn.rs`) |
 | Paths outside the checkout a build script, proc macro or `include!` read | the watches outside views heard nothing since the kept walk began, and that walk looked at no such path on the disk; a path named through symlinks (the macOS SDK's `libm.tbd`) is watched at each link and at the file they end at |
 | Path dependencies outside the checkout | each one's watch vouches for it; one named through a link, or a single file, is read again by every build |
 | A manifest above the checkout that is not there | looked at as the request is asked |
@@ -1176,7 +1179,7 @@ Anything else is an error naming the variable, the value and what it takes. The 
 the daemon's plane, its worker pool, test runs (a test binary's `--test-threads` is taken from
 the same budget as the processes running beside it) and the `NUM_JOBS` a build script's `cc`
 is told (a quarter of the budget: blaze has no jobserver to share, and scripts often run a
-few at once). `blaze test`'s live view runs a quarter of the budget's test binaries at once,
+few at once). `blaze test` on a terminal runs a quarter of the budget's test binaries at once,
 each with `RUST_TEST_THREADS` at a quarter, unless the command sets `RUST_TEST_THREADS`
 itself. Background priority is nice 10 (`setpriority`), which every thread and child process
 inherits; on macOS the worker pool's threads also drop from `user-initiated` to the `default`
@@ -1218,6 +1221,7 @@ never bytes of one layout read as another's. A new persisted file adds its row h
 |---|---|---|---|---|---|
 | The machine's memory ledger | `/tmp/blaze-<uid>/machine.<layout>` (outside every home) | every daemon of the user, under its `flock` | the layout in the file's name and in its header (`blzledgr`, a `u32`) | left alone: each layout has a file of its own, so daemons of two layouts share no budget and neither refuses to start; bytes of another layout under this name are refused naming the file, both layouts and "stop every blaze daemon of this user, then remove" it | `a_file_of_the_previous_layout_is_left_alone`, `a_file_of_the_previous_layout_is_refused_by_name_under_this_layouts_name` (`crates/blaze-cargo/src/serve/machine.rs`); `a_file_of_the_layout_before_the_lease_is_refused_naming_both_layouts` (`crates/blaze-graph/src/ledger/tests.rs`) |
 | The daemon's socket | `<home>/v2.sock` | the daemon | the API's schema number, in every frame | refused by name: the client says both schemas and builds; a daemon of another build is stopped and this one started | `another_schema_is_refused_by_name` (`crates/blaze-api/src/client/tests.rs`), `a_daemon_of_another_schema_is_refused_naming_both` (`crates/blaze-cargo/src/cli/daemon/tests.rs`) |
+| A unit's record | the store, under the unit's key | the daemon | the record format's number in the domain of its key (`RECORD` in `serve/unit/compile.rs`; 12: it holds what the unit said, drawn for each client as it is answered) | left alone: a record of another format is under a key no lookup of this blaze makes; its bytes read as this format's are refused naming the unit and the key, never read as a unit that said nothing | `a_record_of_the_layout_before_is_refused_and_never_read_as_empty`, `a_record_of_what_a_unit_said_restores_to_it` (`crates/blaze-cargo/src/serve/unit/tests/drawn.rs`) |
 | The state directory | `<home>/v2` | the daemon | the `v2` in its name | left alone: another generation of the daemon's state has another directory | none: the name is the marker |
 | The store's head, indexes and packs | `<home>/v2/store` | the store | a format number in the head and in each index | refused by name: the store is broken naming the file and both formats, never migrated | `a_head_of_another_format_is_refused_by_name`, `a_store_of_the_format_before_block_checks_is_refused_naming_both` (`crates/blaze-cas/src/tests.rs`) |
 | The daemon image (database, symbols, the plane's history, the estimates) | `<home>/v2/db` | the daemon's stop | the schema hash of each section; the estimates' magic | starts cold saying why (a section of another schema), and a damaged one is a fault | `an_image_of_another_layout_starts_cold_and_a_damaged_one_is_a_fault` (`crates/blaze-cargo/src/serve/daemon.rs`), `a_history_of_another_blaze_or_none_starts_empty_saying_why` (`crates/blaze-cargo/src/serve/image.rs`) |

@@ -81,6 +81,33 @@
    "do": "Lanes only write: one worktree and branch each, small commits, pushed often; no VM, no cargo, no daemon. The main agent runs `python3 -I harness/v2/integrate.py '{\"branches\":[...],\"tests\":true}'`: it merges every branch into the integration worktree, builds once, and prints one table (edit loop beside Relax, stale answers, new project, restart, memory, disk, tests). Failures go back to the lane whose files they name. The script's paths are the Mac's today (integration worktree /Volumes/Projects/blaze-int-1112, Relax at /tmp/relax-src); moving it to the one build VM is open.",
    "why": "Rule fan-out-write-only as rewritten 2026-11-12: ten lanes each building in their own VM cost a cold build and hours each, and their numbers had to be redone on the combined tree anyway.",
    "state": "current"
+  },
+  {
+   "id": "H10",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
+   "task": "Change what build, run, check or test show",
+   "do": "Change blaze-screen's core (crates/blaze-screen/src/screen.rs) and read the frames: UPDATE_EXPECT=1 cargo test -p blaze-screen rewrites tests/golden/*.txt from the recorded transcripts at 80x24, 200x60 and 40x10; read the diff. Record a new transcript from a real build with BLAZE_UI_TRANSCRIPT=<file> blaze build.",
+   "why": "The screen is a sans-IO core fed events; a transcript replays into the frames a terminal showed, so a layout is judged from real builds without a terminal or a daemon (docs/terminal.md).",
+   "state": "current"
+  },
+  {
+   "id": "H11",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
+   "task": "Look at what blaze draws on a real terminal from an ix VM",
+   "do": "Run it in a detached tmux pane of the size wanted (tmux new-session -d -x 80 -y 24), capture the pane as text every 0.4 s (tmux capture-pane -p), and at the end capture with history (-S -300): the history shows what the screen left behind, which the visible pane does not.",
+   "why": "Every visible frame looked right while tmux's history held a copy of the region per frame (annoyance termui-1): only the history capture showed it.",
+   "state": "current"
+  },
+  {
+   "id": "H12",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
+   "task": "Get blaze's pinned LLVM onto a Linux ix VM",
+   "do": "Fetch it by its hash from the release bucket crates/hir-ty-codegen/llvm.json names (release + '/' + targets.<triple>.name), check sha256sum against targets.<triple>.sha256, and unpack with --strip-components 1 into ~/.blaze/native/sha256-<hash>.",
+   "why": "60 MB in seconds; copying the unpacked 346 MB between VMs through the Mac took 20 minutes (records-6, edit2-3).",
+   "state": "current"
   }
  ],
  "annoyances": [
@@ -1241,6 +1268,90 @@
    "prevention": "every check states what it expected to run and fails when it ran less: integrate.py counts tests run per named test and refuses zero; a measurement row carries the exit status and a proof the program ran (its output); `blaze test` with a filter that matches nothing is an error naming the filter; the gate refuses a step that reports zero checks. State: integrate.py's width row fixed (pty, exit status, output checked); the rest open",
    "workaround": "count `1 passed`, not `ok`",
    "fix": "see prevention",
+   "state": "open"
+  },
+  {
+   "id": "termui-1",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
+   "where": "tmux 3.8, any redrawn region",
+   "what": "Erasing from the cursor to the end of the screen (ED, ESC[J) with the cursor at the top-left corner is a clear of the whole screen to tmux, which pushes the screen into its history first: a region redrawn that way left a copy of itself in the scrollback every frame whenever it started on the pane's first row.",
+   "cost": "an hour; found only in the history capture",
+   "cause": "tmux's scroll-on-clear",
+   "workaround": "none needed",
+   "fix": "the encoder erases the last region a row at a time (EL) and the reference terminal of blaze-screen's tests refuses ED",
+   "state": "fixed on termui-1112"
+  },
+  {
+   "id": "termui-2",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
+   "where": "blaze run after a failed build (main at 248d8f0326 and termui-1112)",
+   "what": "After a build that failed on a compile error, fixing the source and building again fails in the link: `error: linking <image>: staging the change: linking: span 4 of 49f511a4b0b8, whose table has 4`, and every later build of the checkout fails the same way until the home is removed. Seen with the untouched binary of main too.",
+   "cost": "the piped scenarios after a failure had to be run in a fresh BLAZE_HOME",
+   "cause": "not looked for: the linker's kept image after a failed build",
+   "workaround": "a fresh BLAZE_HOME",
+   "fix": "the link lane's",
+   "state": "open"
+  },
+  {
+   "id": "termui-3",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
+   "where": "crates/blaze-cargo/src/cli/daemon.rs (the connect path, lane edit3-1111's)",
+   "what": "A command that starts the daemon prints two long lines before anything else (`blaze: starting the daemon (no socket activation is installed ...)`, `blaze: the daemon it started (pid ..) started: the database starts empty ...`) with eprintln, before the screen exists, so they stay in the scrollback above a region and wrap at 80 columns.",
+   "cost": "none; they are the one thing of a cold start the screen does not own",
+   "cause": "the connect path writes stderr itself",
+   "workaround": "none",
+   "fix": "hand them to the screen as events (a note under -v, the status row's words otherwise) once the connect path is settled",
+   "state": "open"
+  },
+  {
+   "id": "termui-4",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
+   "where": "blaze_protocol::now::Blocker::behind",
+   "what": "In real builds `behind` names the blocker's own unit (`[\"libc 0.2.189 lib (host)\", \"libc 0.2.189 lib (host)\"]`: its later stages), not other units, so the stream says how many tasks wait on a unit and never which. A tree of the graph cannot be drawn from the build's events.",
+   "cost": "the tree layout could only be tried from Cargo.lock in a throwaway script",
+   "cause": "names are taken by unit, and a unit's own later tasks come first",
+   "workaround": "the screen shows the count (`← 22 wait on it`)",
+   "fix": "the fold names units other than the blocker's own",
+   "state": "open"
+  },
+  {
+   "id": "termui-5",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
+   "where": "blaze_protocol::now::Span::item",
+   "what": "A span's `item` is sometimes a value printed whole instead of a path: `{macro MacroCallId { loc: MacroCallLoc { def: MacroDefId { krate: Crate(Id(19460)), ...` for thousands of characters, twice a second, in every `Now`.",
+   "cost": "transcripts of a cold build are mostly these; the screen cuts it to its first word",
+   "cause": "a Debug of a macro file id where a name was meant (`file_item_tree_query`)",
+   "workaround": "`blaze_screen::text::item` shows `{macro …}`",
+   "fix": "the span names the macro by its path",
+   "state": "open"
+  },
+  {
+   "id": "termui-6",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
+   "where": "crates/blaze-cargo tests on main",
+   "what": "Six `cli::` tests fail on the tree before this lane's changes too (`cli::daemon::refusals::a_daemon_that_died_says_how_and_quotes_its_log`, `cli::daemon::tests::the_status_as_json_has_every_field_with_or_without_a_daemon`, `cli::daemon::tests::the_status_for_people` (a download line reads `34.0 MB of 410.0 MB`, the test wants `34.0 of 410.0 MB`), `cli::edits::tests::a_function_is_found_past_a_comment_and_a_declaration_of_its_name`, `cli::place::tests::config_files_outside_the_checkout`, `cli::tests::every_command_suggested_is_one`), and `cargo check -p blaze-client --tests` does not compile (`start.rs:486`: `split` does not live long enough). Run on the base commit too (f0ae2e5138, `cargo test -p blaze-cargo --lib cli::`: 219 passed, the same 6 failed).",
+   "cost": "sorting mine from the rest by reading each",
+   "cause": "other lanes'",
+   "workaround": "none",
+   "fix": "the gate compiles and runs every test target a merge touches (rev-1)",
+   "state": "open"
+  },
+  {
+   "id": "termui-7",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
+   "where": "`blaze check` of blaze-screen",
+   "what": "The crate's `// alloc:` comments, its `#![blaze::sans_io]` and `std_use` were never held to their lints: blaze building blaze needs more memory than the lane's 128 GB VM (A25), so `blaze check` was not run on the tree; cargo checks none of them.",
+   "cost": "unknown until it is run",
+   "cause": "no VM of 256 GB in this lane",
+   "workaround": "cargo with the pinned nightly, as blaze-builds-blaze says",
+   "fix": "the main agent's one `blaze check` of the tip",
    "state": "open"
   }
  ]

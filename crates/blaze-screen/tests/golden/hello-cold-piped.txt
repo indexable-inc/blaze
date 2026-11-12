@@ -1,0 +1,2 @@
+blaze: progress phase=compiling done=144/147 running=1 elapsed_ms=10556 longest="codegen hello 0.1.0 bin hello (host)" for_ms=4001
+blaze: ok built=28 cached=4 warnings=0 elapsed_ms=14434 tier="tier 0 · 0% optimized" program=/root/home7/build/hello-616f0827fcf2e2487fd4387b6ec0dcfc/debug/hello
