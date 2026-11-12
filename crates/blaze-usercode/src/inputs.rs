@@ -342,6 +342,7 @@ impl Files {
         // (`blaze_vfs::outside::looks`).
         blaze_vfs::outside::looked(path);
         let (answer, settled) = self.look(path)?;
+        blaze_vfs::outside::looked_file(path, answer);
         if settled {
             match (known, found) {
                 (Some(known), _) => known.write(generation, answer),

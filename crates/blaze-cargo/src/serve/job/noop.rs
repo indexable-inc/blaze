@@ -94,6 +94,9 @@ pub(super) trait Vouches {
     fn unchanged_since(&self, dir: &Path, generation: u64) -> bool;
     /// Whether nothing is at `path` now: a look at the disk, made as the lane is asked.
     fn absent(&self, path: &Path) -> bool;
+    /// Whether the file at `path` is what `was` says (its content's hash; none: not there):
+    /// a look at the disk, made as the lane is asked.
+    fn same_file(&self, path: &Path, was: Option<[u8; 32]>) -> bool;
 }
 
 /// What a build's answer is a function of that the daemon holds by value.
@@ -369,6 +372,8 @@ pub(super) enum NotReplayed {
     OutputsMoved(PathBuf),
     /// This path, which the answer's walk found absent, is there now.
     Appeared(PathBuf),
+    /// This file, which no watch covers and the answer's walk looked at, is another now.
+    Looked(PathBuf),
     /// This file of the checkout changed in what no code text holds, and a diagnostic of the
     /// answer names it: its quoted lines may say otherwise now, and only a walk renders
     /// them again.
@@ -395,7 +400,7 @@ impl NotReplayed {
             NotReplayed::OutputsMoved(dir) => {
                 Some(format!("the outputs under {}", dir.display()))
             }
-            NotReplayed::Appeared(path) => Some(path.display().to_string()),
+            NotReplayed::Appeared(path) | NotReplayed::Looked(path) => Some(path.display().to_string()),
             NotReplayed::Quoted(path) => {
                 Some(format!("the lines of {path} that the last build's diagnostics quote"))
             }
@@ -424,6 +429,11 @@ impl fmt::Display for NotReplayed {
             NotReplayed::Appeared(path) => {
                 write!(f, "{} is there now, and was not when the kept build ran", path.display())
             }
+            NotReplayed::Looked(path) => write!(
+                f,
+                "{}, which no watch covers, is not what it was when the kept build looked at it",
+                path.display()
+            ),
             NotReplayed::Quoted(path) => write!(
                 f,
                 "{path} changed in what no code reads, and a diagnostic of the kept answer quotes it"
@@ -453,6 +463,8 @@ pub(super) enum Plant {
     IgnoresLocals,
     /// Says an answer again though a path its walk found absent is there now.
     IgnoresAppeared,
+    /// Says an answer again though a file its walk looked at on the disk is another now.
+    IgnoresLooked,
     /// Keeps the answer of a walk that looked at a path on the disk no watch covers.
     KeepsALook,
     /// Keeps the answer of a build that made something.
@@ -554,6 +566,9 @@ pub(super) struct LastAnswer {
     pub(super) dirs: Arc<[PathBuf]>,
     /// The paths its walk found absent, which no watch can be confirmed of.
     pub(super) absent: Arc<[PathBuf]>,
+    /// The files its walk looked at on the disk, which no watch vouched for, each with what
+    /// was there ([`Walk::files`]): looked at again as the lane is asked.
+    pub(super) looked: Arc<[(PathBuf, Option<[u8; 32]>)]>,
     /// What it said, in order, but its `Work` and its progress.
     pub(super) responses: Arc<[Response]>,
     /// Its `Work`, for a build; a check says none.
@@ -667,6 +682,11 @@ impl LastAnswer {
         {
             return Err(NotReplayed::Appeared(path.clone())); // clone: a reason, once
         }
+        if let Some((path, _)) = self.looked.iter().find(|(path, was)| !watches.same_file(path, *was))
+            && !planted(Plant::IgnoresLooked)
+        {
+            return Err(NotReplayed::Looked(path.clone())); // clone: a reason, once
+        }
         Ok(())
     }
 }
@@ -710,6 +730,10 @@ pub(super) struct Walk {
     pub(super) looks: u64,
     /// The last path looked at ([`blaze_vfs::outside::last_look`]), for the reason.
     pub(super) looked_at: Option<PathBuf>,
+    /// Every look of the walk, when each was of a file and said one thing
+    /// ([`blaze_vfs::outside::take_file_looks`]): the answer is kept with them and each is
+    /// looked at again as the lane is asked. None: some look can't be made again so.
+    pub(super) files: Option<Vec<(PathBuf, Option<[u8; 32]>)>>,
     /// Its `Work`.
     pub(super) worked: Option<Worked>,
 }
@@ -803,14 +827,24 @@ impl Recording {
         if !walk.made_nothing && !planted(Plant::KeepsWork) {
             return Err(Unkept::Made);
         }
-        if walk.looks != self.looks && !planted(Plant::KeepsALook) {
-            return Err(Unkept::Looked(walk.looked_at));
-        }
+        // The invariant: an answer is said again only while everything its walk rested on
+        // is as it was. What a watch vouched for, the watches say; a file the walk looked at
+        // on the disk (a name directly under `/`, a path through a link: what no watch can
+        // vouch for) is kept with what was there and looked at again as the lane is asked.
+        // A look of another kind keeps no answer. Until 2026-11-12 any look kept none: a
+        // build script that asked of `/root` was a walk in every build.
+        let looked = match (walk.looks != self.looks, walk.files) {
+            (false, _) => Vec::new(), // alloc: none
+            (true, Some(files)) => files,
+            (true, None) if planted(Plant::KeepsALook) => Vec::new(), // alloc: none
+            (true, None) => return Err(Unkept::Looked(walk.looked_at)),
+        };
         Ok(LastAnswer {
             inputs: self.inputs,
             generation: self.generation,
             dirs: self.dirs.into(),
             absent: self.absent.into(),
+            looked: looked.into(),
             responses: self.responses.into(),
             worked: walk.worked,
             still: self.still,

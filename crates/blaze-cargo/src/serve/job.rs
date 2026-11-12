@@ -1328,6 +1328,12 @@ impl Vouches for Watched {
     fn absent(&self, path: &std::path::Path) -> bool {
         matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
     }
+
+    fn same_file(&self, path: &std::path::Path, was: Option<[u8; 32]>) -> bool {
+        use blaze_usercode::trace::Inputs as _;
+        let mut disk = blaze_usercode::inputs::Disk::new(Vec::new()); // alloc: none, no variables
+        disk.file(path).is_ok_and(|now| now == was)
+    }
 }
 
 /// The still text (`blaze_lower::still_text`) of the file at `path` of the open view `view`,
@@ -4415,6 +4421,7 @@ impl<S: Steps> Jobs<S> {
         let (made_nothing, worked) = walked.unwrap_or((false, None));
         // Each path the walk looked at on the disk, with how often: one look is enough to
         // keep the next build from being answered again, and the refusal names the last alone.
+        let files = blaze_vfs::outside::take_file_looks();
         let looked = blaze_vfs::outside::take_named_looks();
         if !looked.is_empty() {
             // alloc: once a build that looked, the paths as text
@@ -4437,6 +4444,7 @@ impl<S: Steps> Jobs<S> {
             made_nothing,
             looks: blaze_vfs::outside::looks(),
             looked_at: blaze_vfs::outside::last_look(),
+            files,
             worked,
         });
         match &last {

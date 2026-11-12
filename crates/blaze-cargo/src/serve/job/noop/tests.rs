@@ -195,6 +195,8 @@ struct Watches {
     dirs: BTreeMap<&'static str, (u64, u64)>,
     pending: Vec<&'static str>,
     layout: bool,
+    /// What is at every file a walk looked at on the disk ([`Vouches::same_file`]).
+    file: Option<[u8; 32]>,
 }
 
 impl Watches {
@@ -253,6 +255,10 @@ impl Vouches for Watches {
 
     fn absent(&self, _: &Path) -> bool {
         !self.layout
+    }
+
+    fn same_file(&self, _: &Path, was: Option<[u8; 32]>) -> bool {
+        was == self.file
     }
 }
 
@@ -597,6 +603,7 @@ impl Daemon {
                 made_nothing,
                 looks: self.looks,
                 looked_at: None,
+                files: None,
                 worked: None,
             });
         }
@@ -948,6 +955,7 @@ fn a_traced_request_is_never_answered_by_the_lane() {
         made_nothing: true,
         looks: 0,
         looked_at: None,
+        files: None,
         worked: None,
     });
     let asked = |traced| Asked {
@@ -1036,4 +1044,61 @@ fn a_refusal_names_the_file() {
     assert_eq!(moved.input().as_deref(), Some("the checkout's file Cargo.lock"));
     let quoted = NotReplayed::Quoted(SOURCE.to_owned()).input();
     assert!(quoted.is_some_and(|it| it.contains("src/lib.rs")));
+}
+
+/// A walk that looked at `/root` (a name directly under the file system's root, which no
+/// watch can vouch for), finding a directory, kept, then asked again with the file as it was
+/// and with it another. Whether each ask is answered by the lane.
+fn asked_after_a_look() -> (bool, Option<NotReplayed>) {
+    let (mut daemon, world) = (Daemon::new(), plain());
+    let inputs = daemon.inputs(&world);
+    let was = Some([7; 32]);
+    daemon.watches.file = was;
+    let recording = Recording::new(inputs.clone(), 0, 0, Vec::new(), Vec::new());
+    let last = recording.end(Walk {
+        passed: true,
+        made_nothing: true,
+        looks: 2,
+        looked_at: Some(PathBuf::from("/root")),
+        files: Some(vec![(PathBuf::from("/root"), was)]),
+        worked: None,
+    });
+    let asked = Asked {
+        inputs: &inputs,
+        edited: Edited::Unread("the roots are one"),
+        traced: false,
+        alone: true,
+        locals_vouched: true,
+    };
+    let same = ask(&last, &asked, &daemon.watches).is_ok();
+    daemon.watches.file = None;
+    (same, ask(&last, &asked, &daemon.watches).err())
+}
+
+/// The invariant: an answer whose walk looked at files no watch vouches for is said again
+/// exactly while each of them is what the walk saw; a walk with a look that is no file's
+/// (or that differed) keeps no answer.
+#[test]
+fn a_walk_that_looked_at_files_is_answered_while_they_are_the_same() {
+    assert_eq!(asked_after_a_look(), (true, Some(NotReplayed::Looked(PathBuf::from("/root")))));
+    let (daemon, world) = (Daemon::new(), plain());
+    let recording = Recording::new(daemon.inputs(&world), 0, 0, Vec::new(), Vec::new());
+    let last = recording.end(Walk {
+        passed: true,
+        made_nothing: true,
+        looks: 1,
+        looked_at: Some(PathBuf::from("/net/dir")),
+        files: None,
+        worked: None,
+    });
+    assert!(matches!(last, Err(Unkept::Looked(Some(_)))));
+}
+
+/// The control: with a changed file ignored, the answer is said again over it.
+#[test]
+fn the_oracle_catches_an_answer_said_again_over_a_changed_file() {
+    PLANTED.set(Some(Plant::IgnoresLooked));
+    let (_, changed) = asked_after_a_look();
+    PLANTED.set(None);
+    assert_eq!(changed, None, "planted: the changed file is not looked at");
 }

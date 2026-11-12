@@ -733,13 +733,56 @@ pub fn looked(path: &Path) {
             Some(at) => named[at].1 += 1,
             // alloc: at most `LOOKS_NAMED` paths a stretch of naming
             None if named.len() < LOOKS_NAMED => named.push((path.to_path_buf(), 1, by)),
-            None => {}
+            None => NAMED_MORE.store(true, Ordering::Relaxed),
         }
+        drop(named);
+        // Not yet said to be a file's look with an answer ([`looked_file`]).
+        FILE_LOOKS.lock().retain(|it| it.0 != path || it.1.is_some());
     }
 }
 
 /// The most distinct paths [`looked`] keeps while looks are named ([`take_named_looks`]).
-pub const LOOKS_NAMED: usize = 16;
+pub const LOOKS_NAMED: usize = 64;
+
+/// More distinct paths were looked at than [`LOOKS_NAMED`] since looks were last taken.
+static NAMED_MORE: AtomicBool = AtomicBool::new(false);
+
+/// What each look of a file said while looks were named ([`looked_file`]): the path and the
+/// one answer every look of it gave (its content's hash, none for a file that is not
+/// there), or `None` once two looks of it differed.
+static FILE_LOOKS: Lock<Vec<(PathBuf, Option<Option<[u8; 32]>>)>> =
+    Lock::new("vfs.outside.file_looks", Vec::new());
+
+/// A look at the file `path` ([`looked`], told just before) said `answer`: kept while looks
+/// are named, for whoever keeps a build's answer to look again as it is asked
+/// ([`take_file_looks`]).
+pub fn looked_file(path: &Path, answer: Option<[u8; 32]>) {
+    if !NAMING.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut looks = FILE_LOOKS.lock();
+    match looks.iter().position(|it| it.0 == path) {
+        Some(at) if looks[at].1 == Some(answer) => {}
+        Some(at) => looks[at].1 = None,
+        // alloc: at most `LOOKS_NAMED` paths a stretch of naming
+        None if looks.len() < LOOKS_NAMED => looks.push((path.to_path_buf(), Some(answer))),
+        None => NAMED_MORE.store(true, Ordering::Relaxed),
+    }
+}
+
+/// Every look since the last call while looks were named, when each was a file's look that
+/// said one thing ([`looked_file`]) and none was dropped: each path with what was there.
+/// `None` when some look was of another kind (a listing, an entry), differed from another of
+/// its path, or was one too many to keep: such a stretch can't be checked again by looking.
+/// Call before [`take_named_looks`], which forgets what this compares with.
+pub fn take_file_looks() -> Option<Vec<(PathBuf, Option<[u8; 32]>)>> {
+    let files = std::mem::take(&mut *FILE_LOOKS.lock());
+    let named = NAMED_LOOKS.lock();
+    if NAMED_MORE.swap(false, Ordering::Relaxed) || files.len() != named.len() {
+        return None;
+    }
+    files.into_iter().map(|(path, answer)| Some((path, answer?))).collect()
+}
 
 /// The first [`LOOKS_NAMED`] distinct paths looked at while looks were named, each with how
 /// many times.
@@ -763,6 +806,8 @@ pub fn name_looks(on: bool) {
         // (a build that looked at nothing named a path an earlier build had looked at).
         LAST_LOOK.lock().clear();
         NAMED_LOOKS.lock().clear();
+        FILE_LOOKS.lock().clear();
+        NAMED_MORE.store(false, Ordering::Relaxed);
     }
 }
 
