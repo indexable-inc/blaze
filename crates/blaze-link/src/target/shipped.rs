@@ -191,12 +191,12 @@ pub(super) fn libgcc_s() -> Arc<[u8]> {
 /// A field of [`Code`]: a relocation of `r_type` at `at` against `symbol` plus `addend`.
 struct Field {
     at: u64,
-    r_type: u32,
+    r_type: elf::RelocationType,
     symbol: &'static str,
     addend: i64,
 }
 
-const fn field(at: u64, r_type: u32, symbol: &'static str, addend: i64) -> Field {
+const fn field(at: u64, r_type: elf::RelocationType, symbol: &'static str, addend: i64) -> Field {
     Field { at, r_type, symbol, addend }
 }
 
@@ -476,7 +476,8 @@ pub(super) fn start(arch: Arch, executable: bool, release: Glibc) -> Result<Arc<
         defined.push((code.name, symbol));
     }
     if release < STATS_IN_LIBC {
-        let (plain, at_form, jump, plain_at, at_form_at): (&[u8], &[u8], u32, u64, u64) = match arch
+        let (plain, at_form, jump, plain_at, at_form_at): (&[u8], &[u8], elf::RelocationType, u64, u64) =
+            match arch
         {
             Arch::X86_64 => (&X86_STAT, &X86_STATAT, elf::R_X86_64_PLT32, 12, 18),
             _ => (&A64_STAT, &A64_STATAT, elf::R_AARCH64_JUMP26, 12, 20),
@@ -556,13 +557,10 @@ pub(super) fn start(arch: Arch, executable: bool, release: Glibc) -> Result<Arc<
                 .map_err(|error| format!("the start object: {error}"))?;
         }
     }
-    let array = object.add_section(
-        Vec::new(),
-        b".fini_array".to_vec(),
-        object::SectionKind::Elf(elf::SHT_FINI_ARRAY),
-    );
+    let array = object.add_section(Vec::new(), b".fini_array".to_vec(), object::SectionKind::Data);
     object.section_mut(array).flags = object::SectionFlags::Elf {
-        sh_flags: u64::from(elf::SHF_ALLOC | elf::SHF_WRITE),
+        sh_type: elf::SHT_FINI_ARRAY,
+        sh_flags: elf::SHF_ALLOC | elf::SHF_WRITE,
     };
     let entry = object.append_section_data(array, &[0; 8], 8);
     let finalize = defined[0].1;
