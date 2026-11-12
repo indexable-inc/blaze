@@ -51,6 +51,8 @@ pub struct TestDb {
     probe: AtomicU64,
     /// What the two tasks of [`stale_head`] tell each other.
     relay: stale_head::Relay,
+    /// What the tasks of [`joined`] tell each other.
+    joined: joined::Relay,
     cells: Lock<Vec<Id>>,
     graph: Vec<GNode>,
     /// The dependency values of each graph node's last run.
@@ -76,6 +78,7 @@ impl TestDb {
             drops: Arc::new(AtomicUsize::new(0)),
             probe: AtomicU64::new(u64::MAX),
             relay: stale_head::Relay::new(),
+            joined: joined::Relay::new(),
             cells: Lock::new("query.test.db.cells", Vec::new()),
             graph,
             snapshots: Lock::new("query.test.db.snapshots", HashMap::new()),
@@ -3316,4 +3319,5 @@ fn after_editing_one_input_every_rerun_memos_cause_chain_leads_back_to_it(tc: Te
 
 /// The changed set ([`super::frontier`]): its deterministic simulation and planted bugs.
 mod changed;
+mod joined;
 mod stale_head;

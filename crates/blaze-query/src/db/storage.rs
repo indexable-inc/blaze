@@ -2,14 +2,15 @@
 //! ID pages, the dependency graph's nodes and edges, and the view.
 
 use std::{
-    any::TypeId,
+    any::{Any, TypeId},
     fmt,
     ptr::{self, NonNull},
-    sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
 use blaze_graph::{Key, pump::Flights};
 use blaze_mem::{Tag, tag};
+use crossbeam_queue::SegQueue;
 
 use super::{
     Event, EventKind, MemoryUsage,
@@ -20,9 +21,11 @@ use super::{
     frontier::Frontier,
     id::{Id, MAX_PAGES, PAGE_BITS, PAGE_LEN},
     ingredient::{self, Ingredient, MAX_INGREDIENTS},
+    local::Member,
     provenance::{self, Cause, restamp_run},
     row::{Owners, Pages, VALUE, VIEW_MASK, span},
 };
+use crate::table::ShortLock;
 
 /// What a database is to the engine: its storage. `base_db::Db` implements it; the generated
 /// code is generic over it, so with one concrete database every query is a static call.
@@ -283,7 +286,22 @@ pub struct Storage {
     /// Each capture's span in `captured`, by its number; number 0 is the capture of no read.
     captures: Dense<AtomicU64>,
     captures_made: AtomicU32,
+    /// The runs under way that are no row's: a slot's fill, the changed set's walk.
     pub(crate) flights: Flights<()>,
+    /// The rows' runs under way, by [`Storage::flight`]: flights of their own, whose askers
+    /// join a cycle of waits for rows instead of giving way (`function::in_flight`). Every ask
+    /// of them is `function::refresh`'s, which looks at the row again once its wait ends: what
+    /// [`Flights::joining`] asks of its callers.
+    pub(crate) rows: Flights<()>,
+    /// The values lent to tasks that joined a cycle headed in another task (`function::lend`):
+    /// each a head's fallback or initial value, read through a `&` of this storage's lifetime,
+    /// so kept, each in its own box, until the next view opens ([`Storage::settle`]).
+    lent: SegQueue<Box<dyn Any + Send + Sync>>,
+    /// The provisional rows joined tasks made for cycles headed in other tasks, each with its
+    /// head's node, until the head's task takes them ([`Storage::take_handed`]).
+    handed: ShortLock<Vec<(u32, Member)>>,
+    /// How many rows `handed` holds: a head's run reads this, not the lock, when none is.
+    handed_len: AtomicUsize,
     hook: Option<Hook>,
     /// The functions whose values are kept by their bytes (`lru`), weighed at each new view.
     #[expect(clippy::disallowed_types, reason = "held to add a function or take the list at a new view, never across a call")]
@@ -314,6 +332,8 @@ const _: fn() = || {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<Heap>();
     send_sync::<Flights<()>>();
+    send_sync::<SegQueue<Box<dyn Any + Send + Sync>>>();
+    send_sync::<ShortLock<Vec<(u32, Member)>>>();
 };
 
 // SAFETY: every field is `Send` but the table pointers, which own `Send + Sync` tables
@@ -360,6 +380,11 @@ impl Storage {
             captures: Dense::growing(CAPTURES, Tag::Query, "captures"),
             captures_made: AtomicU32::new(1),
             flights: Flights::new(),
+            rows: Flights::joining(),
+            lent: SegQueue::new(),
+            // alloc: none, empty: it grows to the most rows handed and not yet taken at once
+            handed: ShortLock::new("query.storage.handed", Vec::new()),
+            handed_len: AtomicUsize::new(0),
             hook,
             // alloc: none, empty: one entry per `lru` function, pushed once
             weighed: blaze_core::lock::Lock::new("query.storage.weighed", Vec::new()),
@@ -647,6 +672,8 @@ impl Storage {
 
     /// Frees, at a view boundary (`&mut`: no reader, no running row), what the dependency
     /// records of the views before no longer need:
+    /// - every value lent to a task that joined a cycle ([`Storage::lend`]): read only through
+    ///   a `&` of the storage, which this `&mut` ended;
     /// - every capture: a [`super::Reads`] is read only in the view it was made in
     ///   ([`super::Reads::for_each_read`] and [`super::replay_reads`] refuse any other), so
     ///   the capture arrays are emptied and their pages given back;
@@ -654,6 +681,8 @@ impl Storage {
     ///   nodes: the live spans move into a fresh array, a walk of every row and a copy of the
     ///   live edges, so its cost is at most the dead edges it frees.
     fn settle(&mut self) {
+        // No `&` of the storage lives (`&mut`): nothing reads a lent value any more.
+        while self.lent.pop().is_some() {}
         if *self.captures_made.get_mut() > 1 {
             self.captured.clear();
             self.captures.clear();
@@ -1319,6 +1348,50 @@ impl Storage {
         *self.dirs[index as usize].get_mut() = ptr::null_mut();
         // SAFETY: as in `table`: a leaked `Box<T>` of this ingredient's type, now ours alone.
         NonNull::new(at.cast::<T>()).map(|at| unsafe { Box::from_raw(at.as_ptr()) })
+    }
+
+    /// Keeps `value` until the next view opens and lends it for as long as this storage is
+    /// borrowed: a cycle head's fallback or initial value, for a task that joined the cycle
+    /// from outside the head's task and so may not read the head's row (`function::lend`).
+    pub(crate) fn lend<V: Send + Sync + 'static>(&self, value: V) -> &V {
+        let kept = Box::new(value); // alloc: a joined cycle's seed value, kept to the view's end
+        let at: *const V = &raw const *kept;
+        self.lent.push(kept);
+        // SAFETY: the value is in its own box, whose place does not move as the box does, and
+        // the box stays in `lent` until `settle` or the storage's drop, both of which need
+        // `&mut` or ownership of the storage: neither runs while the `&self` this reference
+        // borrows from lives. Nothing else reads or writes the box's value.
+        unsafe { &*at }
+    }
+
+    /// Hands the provisional row `member`, which this task made as a member of the cycle
+    /// headed by node `head` in another task, to that head's task ([`Storage::take_handed`]).
+    pub(crate) fn hand(&self, head: u32, member: Member) {
+        let mut handed = self.handed.lock();
+        // alloc: none once warm: the list grows to the most rows handed and not taken at once
+        handed.push((head, member));
+        // Release: the row is listed before the flight its head's task waits on ends.
+        self.handed_len.store(handed.len(), Ordering::Release);
+    }
+
+    /// Whether any row is handed and not yet taken: one load, for a run that heads no joined
+    /// cycle (nearly every run).
+    #[inline]
+    pub(crate) fn any_handed(&self) -> bool {
+        self.handed_len.load(Ordering::Acquire) != 0
+    }
+
+    /// Takes the rows handed to the head of node `head` onto `into`, in the order handed.
+    pub(crate) fn take_handed(&self, head: u32, into: &mut Vec<Member>) {
+        let mut handed = self.handed.lock();
+        handed.retain(|&(to, member)| {
+            if to == head {
+                // alloc: the taker's list, once a round of a joined cycle
+                into.push(member);
+            }
+            to != head
+        });
+        self.handed_len.store(handed.len(), Ordering::Release);
     }
 
     /// The flight key of row `id` of ingredient `index`.

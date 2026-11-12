@@ -173,6 +173,18 @@ pub(crate) struct Frame {
     pub(crate) head: u32,
     /// A query on this stack asked for this one: it heads a cycle.
     pub(crate) reentered: bool,
+    /// A run on this stack read a provisional row whose head this one is: it heads a cycle.
+    /// Where no query on this stack asked for it ([`Frame::reentered`]), the row was made by a
+    /// task that joined the cycle from outside (`function::hand_to`), and this run's own row is
+    /// seeded when it is first asked for here or as its round ends.
+    pub(crate) joined: bool,
+    /// The node of the head, in another task, of a cycle this run joined: it read that head's
+    /// lent value (`function::lend`), or a run of the cycle it heads on this stack did. 0 for
+    /// none.
+    pub(crate) remote: u32,
+    /// Its value is no round's of the cycle it joined: it read a value lent in place of one
+    /// the head's round holds, or a second head's.
+    pub(crate) unsettled: bool,
     /// An inner head of its cycle did not converge this round (on the outermost head).
     pub(crate) unconverged: bool,
     pub(crate) untracked: bool,
@@ -210,6 +222,9 @@ impl Frame {
             summary: [0; 2],
             head: NONE,
             reentered: false,
+            joined: false,
+            remote: 0,
+            unsettled: false,
             unconverged: false,
             untracked: false,
             unshareable: false,
@@ -1104,6 +1119,8 @@ impl Local {
         frame.summary = [0; 2];
         frame.untracked = false;
         frame.head = NONE;
+        frame.remote = 0;
+        frame.unsettled = false;
         // What its verify was handed (a cycle that met it) comes before its run's reads.
         frame.cycle.round = self.cycle_edges.len() as u32;
         let pending = frame.pending_start as usize;
@@ -1252,6 +1269,9 @@ impl Frame {
             summary: [0; 2],
             head: NONE,
             reentered: false,
+            joined: false,
+            remote: 0,
+            unsettled: false,
             unconverged: false,
             untracked: false,
             unshareable: false,
