@@ -1156,6 +1156,29 @@ impl Local {
         None
     }
 
+    /// Whether the run or verify of `node` of `storage` is on this thread's stack below a
+    /// barrier that is not lifted: it is not this task's part of the stack ([`Local::find`]
+    /// says none), yet a wait for its flight from here would be a wait on the frames this very
+    /// stack holds.
+    pub(crate) fn below_barrier(&self, storage: *const Storage, node: u32) -> bool {
+        if node == 0 || self.bloom[bucket(node)] == 0 {
+            return false;
+        }
+        let mut walled = false;
+        for frame in self.frames.iter().rev() {
+            match frame.kind {
+                Kind::Barrier { lifted: false } => walled = true,
+                Kind::Barrier { lifted: true } => {}
+                Kind::Run | Kind::Verify => {
+                    if walled && frame.node == node && frame.storage == storage {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// The occurrence number of the next tracked struct of `identity_hash` the top run makes.
     pub(crate) fn occurrence(&mut self, ingredient: u32, identity_hash: u64) -> Option<u32> {
         let serial = self.frames.last().filter(|it| it.kind == Kind::Run)?.serial;

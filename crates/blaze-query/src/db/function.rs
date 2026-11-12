@@ -501,6 +501,15 @@ fn refresh<F: Function>(
                 // its word and of its head: no head to wait for; the next round reads both anew.
                 None if head == 0 => continue,
                 None => {
+                    // The head runs on this very stack, below the barrier of a wait this
+                    // verify is inside (the changed set's walk, which verifies from an empty
+                    // stack): a joined task made the row for it while it was parked here. A
+                    // wait for the head would be a wait on this stack's own frames; to the
+                    // verify the edge counts as changed, and the head's run meets the row once
+                    // the barrier is gone.
+                    if !value && local::with(|local| local.below_barrier(storage, head)) {
+                        return State::Joined { head, exact: false };
+                    }
                     let asked = Member { ingredient: index, id: id.as_u32() };
                     let join = may_join::<F>(storage, value);
                     if wait_for(storage, head, asked, join) == Flown::Joins {

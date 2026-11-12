@@ -232,7 +232,7 @@ fn two_tasks_that_enter_a_cycle_at_different_members_run_each_member_once_a_roun
     assert_eq!(ring.map(|cell| *get::<Ring>(&db, cell)), alone(caps).0);
 }
 
-/// The invariant, with three tasks, one inside each place: the last to ask joins the cycle
+/// As the invariant above, with three tasks, one inside each place: the last to ask joins the cycle
 /// headed at place 0, and the task between them, woken to a row that is that head's, joins in
 /// turn rather than wait for a head that waits on it.
 #[test]
@@ -244,8 +244,8 @@ fn three_tasks_that_enter_a_cycle_at_each_member_run_each_member_once_a_round() 
     assert_eq!(ring.map(|cell| *get::<Ring>(&db, cell)), alone([CAP; RING]).0);
 }
 
-/// The invariant, for a task from outside that asks for a member in the middle of the
-/// fixpoint. While the member is provisional the outside task waits for the head and runs
+/// As the invariant above, for a task from outside that asks for a member in the middle of
+/// the fixpoint. While the member is provisional the outside task waits for the head and runs
 /// nothing: the ring runs exactly as one task alone runs it.
 #[test]
 fn a_provisional_member_asked_from_outside_is_waited_for_and_runs_nowhere_else() {
@@ -258,7 +258,7 @@ fn a_provisional_member_asked_from_outside_is_waited_for_and_runs_nowhere_else()
     assert_eq!(ring.map(|cell| *get::<Ring>(&db, cell)), fixpoint);
 }
 
-/// The invariant, for a task from outside that asks for a member the head's round has emptied
+/// As the invariant above, for a task from outside that asks for a member the head's round has emptied
 /// and not reached: it runs that member itself and waits for the head, and the head's task,
 /// reaching the member, joins the cycle now headed there instead of giving way. The fixpoint
 /// moves to the outside task; each place still runs once a round.
