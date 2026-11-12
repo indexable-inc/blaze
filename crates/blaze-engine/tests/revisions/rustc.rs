@@ -381,7 +381,7 @@ fn cause(check: &str, said: &str) -> String {
         .unwrap_or("no error line");
     let mut out = String::new();
     let mut quoted = false;
-    for c in line.chars().take(160) {
+    for c in line.chars() {
         match c {
             '`' => {
                 quoted = !quoted;
@@ -394,6 +394,7 @@ fn cause(check: &str, said: &str) -> String {
             c => out.push(c),
         }
     }
+    let out: String = out.chars().take(150).collect();
     format!("{check}: {out}")
 }
 
