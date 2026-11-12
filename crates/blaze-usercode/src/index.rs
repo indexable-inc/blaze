@@ -688,10 +688,19 @@ mod tests {
     #[test]
     fn a_run_that_read_the_whole_environment_has_one_name_for_it() {
         let traced = Traced {
-            env: vec![(ALL_ENV_NAME.into(), Some("h".into())), ("A".into(), Some("1".into()))],
+            env: vec![(ALL_ENV_NAME.into(), Some("h".into())), ("PATH".into(), Some("1".into()))],
             ..Traced::default()
         };
+        // A variable a walk sees is the walk's to give again: not named.
         assert_eq!(Shape::of(&traced).env, vec![OsString::from(ALL_ENV_NAME)]);
+        // One a walk of a lent environment does not see was read by its name, and stays named:
+        // the walk would not give its value again (on Windows a walk sees every variable).
+        let named = Traced {
+            env: vec![(ALL_ENV_NAME.into(), Some("h".into())), ("LIBCLANG_PATH".into(), Some("/l".into()))],
+            ..Traced::default()
+        };
+        let kept: &[&str] = if cfg!(unix) { &[ALL_ENV_NAME, "LIBCLANG_PATH"] } else { &[ALL_ENV_NAME] };
+        assert_eq!(Shape::of(&named).env, kept.iter().map(OsString::from).collect::<Vec<_>>());
     }
 
     #[test]
