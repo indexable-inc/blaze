@@ -5,7 +5,7 @@ base-db 6
 blaze-api 9
 blaze-bench 9
 blaze-build-script 16
-blaze-cargo 425
+blaze-cargo 427
 blaze-check 2
 blaze-ci 5
 blaze-client 21
@@ -39,7 +39,7 @@ blaze-lint-defs 9
 blaze-lints 522
 blaze-lir 7
 blaze-live 3
-blaze-lower 45
+blaze-lower 46
 blaze-macro-eval 59
 blaze-manifest 248
 blaze-metadata 8
@@ -63,8 +63,8 @@ blaze-sys 2
 blaze-thin 7
 blaze-tree 6
 blaze-ui 8
-blaze-units 270
-blaze-usercode 22
+blaze-units 271
+blaze-usercode 23
 blaze-v2-proof 4
 blaze-wasi 1
 edition 2

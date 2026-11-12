@@ -6,3 +6,10 @@ action = "run"
 env = { BLAZE_LAUNCH = "1", RUST_BACKTRACE = "1" }
 fails = "too deep at 3"
 says = ["src/main.rs:4:9", "the_deepest_one", "the_one_between"]
+
+# A body edit: the function's new body is placed in the same process layout by another
+# launcher, and its frames are named as the first one's were.
+[[revision]]
+action = "run"
+fails = "still too deep at 3"
+says = ["src/main.rs:4:9", "the_deepest_one", "the_one_between"]

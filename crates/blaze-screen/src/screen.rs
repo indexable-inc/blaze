@@ -758,7 +758,7 @@ impl Screen {
         if !built.ok {
             let line = match self.caps.live {
                 true => self.failed_line(&built, took),
-                false => Line::new().with(Role::Plain, self.failed_plain(&built, took)),
+                false => verdict(&self.failed_plain(&built, took), "failed", Role::Failed),
             };
             self.above.push(line); // alloc: a line that stays
         } else if !quiet {
@@ -777,7 +777,7 @@ impl Screen {
                 }
                 false => {
                     let line = self.built_plain(&built, whys, took);
-                    self.above.push(Line::new().with(Role::Plain, line)); // alloc: as above
+                    self.above.push(verdict(&line, "ok", Role::Done)); // alloc: as above
                 }
             }
         }
@@ -1370,6 +1370,17 @@ impl Screen {
             lines.push(Line::new().with(Role::Dim, "  rerun: ").with(Role::Command, rerun.clone())); // alloc: once a failing executable
         }
         lines
+    }
+}
+
+/// A pipe's line `blaze: <word> ..` with its verdict word in `role`: the same bytes where
+/// there is no colour, and the verdict in its colour where one was asked for by name
+/// (`--color always` into a pipe).
+fn verdict(line: &str, word: &str, role: Role) -> Line {
+    let head = "blaze: ";
+    match line.strip_prefix(head).and_then(|rest| rest.strip_prefix(word)) {
+        Some(rest) => Line::new().with(Role::Plain, head).with(role, word).with(Role::Plain, rest),
+        None => Line::new().with(Role::Plain, line),
     }
 }
 

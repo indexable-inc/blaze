@@ -25,13 +25,19 @@ The input is one JSON object (`Input`), unknown fields refused:
             the workspace's copy and the home are made new under it
     tmpfs   a directory on a tmpfs for the second run (outputs are placed otherwise there:
             a tmpfs has no clone); "" leaves that run out and says so
-    steps   which of `cold`, `noop`, `edit`, in that order (all by default); `edit` needs `cold`
+    steps   which of `cold`, `noop`, `edit`, `edition`, in that order (all by default); `edit`
+            needs `cold`
     path    the PATH of the fixed environment: where `cc` is
 
 Each step is `blaze run` under `env -i`-like conditions (ran.Command: the whole environment is
 HOME, PATH, TERM and LANG, nothing inherited), held to exit 0 and to the program's line
 (ran.py: no number without both). `cold` builds from nothing in a home of its own; `noop` runs
 again with nothing changed; `edit` changes the body of `answer` and must print the new value.
+`edition` is `blaze run -p smoke-edition`: the member on the blaze edition, whose one dependency
+is bstd (crates/blaze-std of this repository, named by its absolute path in the copy), which
+cargo never builds: a blaze-core enum that bstd matches with no catch-all then fails here the
+round it changes (2026-11-12: `Effect::Prewarm`, `Effect::Barrier`, `Done::Ordered` and
+`Done::Prewarmed` broke bstd unseen). It builds bstd's whole closure, minutes of work.
 Beside each time it prints what blaze said it built. Exits 1 when any row is INVALID.
 
 The workspace's Cargo.lock and blaze.lock are committed (the versions a run on 2026-11-12
@@ -56,7 +62,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ran
 from ran import Command, Proof
 
-STEPS = ("cold", "noop", "edit")
+STEPS = ("cold", "noop", "edit", "edition")
+# What the blaze-edition member prints (harness/v2/smoke/edition/src/main.rs).
+EDITION = "smoke-edition: bstd built under blaze"
+# The member's path to bstd from where the workspace lives in the repository.
+BSTD = "../../../../crates/blaze-std"
 SOURCE = Path(os.path.dirname(os.path.abspath(__file__))) / "smoke"
 
 
@@ -110,6 +120,11 @@ def place(name: str, root: Path, asked: Input) -> bool:
     home.mkdir(parents=True)
     project = root / "p"
     shutil.copytree(SOURCE, project)
+    member = project / "edition/Cargo.toml"
+    manifest = member.read_text()
+    if manifest.count(BSTD) != 1:
+        sys.exit(f"{member} does not name bstd as {BSTD}: real_smoke.py rewrites that path in the copy")
+    member.write_text(manifest.replace(BSTD, str(SOURCE.parents[2] / "crates/blaze-std")))
     env = {"HOME": str(home), "PATH": asked.path, "TERM": "dumb", "LANG": "C.UTF-8"}
     main = project / "src/main.rs"
     good = True
@@ -123,7 +138,10 @@ def place(name: str, root: Path, asked: Input) -> bool:
                 continue
             main.write_text(text.replace("\n    1\n", "\n    7\n"))
             x = 7
-        r = ran.run(Command((blaze, "run"), str(project), env, timeout=1800), Proof(stdout=line(x)))
+        if step == "edition":
+            r = ran.run(Command((blaze, "run", "-p", "smoke-edition"), str(project), env, timeout=3600), Proof(stdout=EDITION))
+        else:
+            r = ran.run(Command((blaze, "run", "-p", "smoke"), str(project), env, timeout=1800), Proof(stdout=line(x)))
         good = good and not r.invalid
         text = f"INVALID: {r.invalid}" if r.invalid else f"{r.ms:8.0f} ms  exit and the program's line checked"
         print(f"{name + ' ' + step:16s} {text}  [{said(r)}]", flush=True)
