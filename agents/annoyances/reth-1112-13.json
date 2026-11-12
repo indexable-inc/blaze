@@ -1,0 +1,20 @@
+{
+ "id": "reth-1112-13",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "blaze: the no-op lane and files read off the disk (base-db IncludedFile)",
+ "what": "A build that looked at any path no watch covers is never answered again without a walk, and `IncludedFile::content_now` looked at the disk on every ask: reth walks 5,305 units (2 s) every build for `rustix-1.1.5/src/backend/mod.rs` (a `#[path]` candidate that is not there); a serde fixture for serde_core's `out/private.rs`; on NixOS a hello-world for glibc's `crtn.o`.",
+ "cost": "the no-op lane (milliseconds) answers no real project",
+ "cause": "the included-file reads had no vouching, only the build scripts' traced reads had",
+ "whys": [
+  "why a walk: the lane refuses",
+  "why: the last build looked at a path on the disk",
+  "why: an included file is read on every ask",
+  "why: its reads were never given the watches the usercode inputs have",
+  "property: two homes for `a file outside every view`, one watched and one not"
+ ],
+ "class": "one concept in two homes, only one of them finished (rule one-concept-one-home)",
+ "prevention": "built (9b5c8217a5): content_now wants the file's directory watched and keeps the answer with the watches' generation; a serde fixture's fourth build is answered in 34 ms on the Mac. Not built: crtn.o (the native layouts' look, serve/native.rs) and a test under the simulated watches",
+ "fix": "9b5c8217a5; reth being measured",
+ "state": "open: fix written, reth pending"
+}

@@ -1,0 +1,20 @@
+{
+ "id": "reth-1112-11",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "blaze: stateful and unseen proc-macro crates (blaze-macro-eval sessions)",
+ "what": "A unit that calls a macro of a crate whose session state moves (jsonrpsee_proc_macros: `proc_macro_crate::CACHE`, a memo that holds an address) never had a record: 7 units of reth made again in every build. And every macro crate is Unseen in the first build that ever runs it, so every unit that calls a proc macro was unkept in a cold build: the first build after it made 217 units of reth again (96 to 110 s quiet).",
+ "cost": "the whole of reth's remaining no-op (25 s) and of its first build after a cold one",
+ "cause": "reads were known only for crates proven to settle; anything else was unknown whatever the call gave",
+ "whys": [
+  "why unkept: reads unknown",
+  "why: the crate is Stateful or Unseen",
+  "why that matters: a session's state could change what a call gives",
+  "why not tested per call: the only per-call check was for crates already known to settle",
+  "property: knowledge about a call was derived from a verdict about its crate, learned a build late"
+ ],
+ "class": "a per-item property decided by a per-container verdict that arrives after the items are due",
+ "prevention": "built (77c4d94579, decision reth-1112-D1): a call is run once more from the fresh state, outside its session, and when it gives the same its reads are known; a counter is not shown and stays unknown, loudly. Events `a proc macro's run moved its session's state on` name the statics. Fixture cases on the Mac; reth: no-op 0 units, first build after cold 14 units",
+ "fix": "77c4d94579",
+ "state": "fixed 77c4d94579; blaze-macro-eval's corpus tests not run by this lane"
+}

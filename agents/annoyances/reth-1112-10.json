@@ -1,0 +1,20 @@
+{
+ "id": "reth-1112-10",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "blaze: a settling proc macro's call whose output no store keeps (blaze-macro-eval, same_from_either_state)",
+ "what": "39 of the 46 units reth made again in every build had no record because one serde_derive call per crate `was not shown to give the same from the fresh state as from the settled one`: the check compared the two runs' outputs as the store keeps them, and refused, before running anything, an output the store cannot keep (an anchor or a context its input has not: a span the database joined across two items, as for a struct a `macro_rules!` made). The expansion is memoized with that answer, so the unit stayed unkept for the daemon's life.",
+ "cost": "39 units, about 13 s of each build with nothing changed",
+ "cause": "a proof that could only be made over a serialized form",
+ "whys": [
+  "why unkept: reads unknown",
+  "why: the same-from-either-state check returned `not shown`",
+  "why: the output has no kept form, and the check compared kept forms",
+  "why unseen: one message for five ways of not being shown",
+  "property: a check of equality tied to a store encoding that some values do not have"
+ ],
+ "class": "a proof that fails closed for values outside an encoding, silently and permanently",
+ "prevention": "built (f4ff6ea4e2): the two trees are compared when there is no kept form (control UNWRITABLE_IS_UNSHOWN); each of the five ways a call is not shown says which; `misses` step `unit record` names the call",
+ "fix": "f4ff6ea4e2: reth's no-op made 8 units (was 46)",
+ "state": "fixed f4ff6ea4e2"
+}
