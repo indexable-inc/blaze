@@ -135,6 +135,16 @@ not changed here, and not measured (no macOS run in this lane).
   with tombstones (48 bytes a function: address, size, identity), the last id's file cloned
   and the edit's records written, compacted when half are tombstones; readers sort on load.
   The perf map's nodes hold names and edges and need a log, not slots.
+- **A stage that costs the edit.** Measured 2026-11-12 on hello world (12,071 functions, 30
+  one-line body edits, a Linux VM, tree a9325666d): `link patch` is 9.5 ms, of which
+  `link stage: lists` 2.9 (each of the core's four lists is copied whole by
+  `Owned::splice`, and every function is scanned for a changed symbol), `apply the change`
+  2.0, `the writer's tables` 1.25 (`.eh_frame_hdr` is made whole: its patch asks for
+  `Delta::same_regions`, which no edit that places new code keeps), `the writer's file` 0.8
+  (the symbol table, made whole for the same reason) and `dev run commit` 1.2 beside it.
+  Each is a pass over the image. The lists need a structure a splice does not copy (blocks
+  shared between links, as `CowBytes` is for bytes); the two tables need the slot treatment
+  `.rela.dyn` got.
 - **The writer's tables by block.** `file.rs` rebuilds each synthetic region (symbols,
   names, unwind header) every stage and compares it with the last in 4 KiB blocks. Building
   only the blocks that can have changed is a change of each format's writer. What each
