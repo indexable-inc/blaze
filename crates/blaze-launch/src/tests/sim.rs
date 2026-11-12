@@ -23,14 +23,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use bstd::mem::{Kept, Tag};
 use hegel::TestCase;
 use hegel::generators as gs;
 
 use crate::launch::Plant;
 use crate::{
-    Bind, CodeId, Config, Edit, Frame, FrameKind, Launch, Range, Slot, Target, Thread, Tier, Txn,
-    Write,
+    Bind, CodeId, Config, Edit, Frame, FrameKind, KEPT, Kept, Launch, Range, Slot, Target, Thread,
+    Tier, Txn, Write,
 };
 
 const SLOTS: u32 = 6;
@@ -169,7 +168,7 @@ struct Sim {
 
 impl Sim {
     fn new(plant: Plant) -> Result<Sim, String> {
-        let alloc = Kept(Tag::Other);
+        let alloc = KEPT;
         let mut launch = Launch::new(CONFIG, alloc).map_err(|it| format!("new: {it}"))?;
         launch.plant = plant;
         let mut sim = Sim {

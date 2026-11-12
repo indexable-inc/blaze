@@ -5,19 +5,17 @@
 mod sim;
 mod wire;
 
-use bstd::mem::{Kept, Tag};
-
 use crate::area::Area;
 use crate::{
-    Bind, CodeId, Config, Edit, Error, Frame, FrameKind, Launch, Range, Slot, Target, Thread, Tier,
-    Txn, Write,
+    Bind, CodeId, Config, Edit, Error, Frame, FrameKind, KEPT, Kept, Launch, Range, Slot, Target,
+    Thread, Tier, Txn, Write,
 };
 
 const CONFIG: Config =
     Config { slots: 4, area: 4096, page: 256, gate_head: 16, gate_entry: 16, gate_align: 16 };
 
 fn alloc() -> Kept {
-    Kept(Tag::Other)
+    KEPT
 }
 
 fn bind(slot: u32, len: u64) -> Bind {
