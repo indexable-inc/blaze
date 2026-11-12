@@ -1499,10 +1499,16 @@ impl History {
         let client = client_rows(&self.client_spans)
             + client_rows(&self.client_events)
             + client_rows(&self.client_folded);
-        let mut spans = vec![
-            batches::spans(&self.read.spans, of_build).map_err(arrow_error(&schema::SPANS))?,
-            batches::spans(&self.others, self.process).map_err(arrow_error(&schema::SPANS))?,
-        ]; // alloc: a flush's parts, once a flush
+        // In batches of at most `BATCH_ROWS` rows: a text column of one batch holds at most
+        // 2 GiB (`i32` offsets), and a flush that fell behind holds up to `BACKLOG_ROWS`
+        // rows, each span with its query's key as text.
+        let mut spans =
+            in_row_batches(&self.read.spans, |rows| batches::spans(rows, of_build))
+                .map_err(arrow_error(&schema::SPANS))?;
+        spans.extend(
+            in_row_batches(&self.others, |rows| batches::spans(rows, self.process))
+                .map_err(arrow_error(&schema::SPANS))?,
+        );
         spans.append(&mut self.client_spans);
         let counters = [batches::counters(&self.read.counters, self.process)
             .map_err(arrow_error(&schema::COUNTERS))?];
@@ -1534,13 +1540,13 @@ impl History {
         .map_err(arrow_error(&schema::PROVENANCE))?;
         let switches = [batches::switches(&self.read.switches, self.process)
             .map_err(arrow_error(&schema::SWITCHES))?];
-        let mut events = vec![
-            batches::events(&self.read.events, self.process)
-                .map_err(arrow_error(&schema::EVENTS))?,
-        ]; // alloc: as `spans`
+        let mut events =
+            in_row_batches(&self.read.events, |rows| batches::events(rows, self.process))
+                .map_err(arrow_error(&schema::EVENTS))?;
         events.append(&mut self.client_events);
-        let event_fields = [batches::event_fields(&self.read.fields, self.process)
-            .map_err(arrow_error(&schema::EVENT_FIELDS))?];
+        let event_fields =
+            in_row_batches(&self.read.fields, |rows| batches::event_fields(rows, self.process))
+                .map_err(arrow_error(&schema::EVENT_FIELDS))?;
         let mut folded = vec![
             batches::folded(&self.read.folds, self.process)
                 .map_err(arrow_error(&schema::FOLDED))?,
@@ -2004,6 +2010,26 @@ fn drain(drained: &Drained, stop: &Receiver<()>, full: &Sender<()>) {
             _ = full.try_send(());
         }
     }
+}
+
+/// The most rows of one batch of a table whose rows hold text of any length (`spans`, `events`,
+/// `event_fields`): a batch's text column addresses its bytes with `i32` offsets, so at this
+/// many rows one overflows only past 32 KiB of text a row in one column. Until 2026-11-12 a
+/// flush made one batch of everything it had read, up to [`BACKLOG_ROWS`] rows when it fell
+/// behind (a machine short of memory): arrow panicked (`byte array offset overflow`) and the
+/// history's thread ended, on reth's and on tempo's cold build.
+pub const BATCH_ROWS: usize = 1 << 16;
+
+/// `rows` as batches of at most [`BATCH_ROWS`] rows each, in order, made by `make`; no rows
+/// is one empty batch, so every table still has its part.
+fn in_row_batches<T>(
+    rows: &[T],
+    make: impl Fn(&[T]) -> Result<RecordBatch, ArrowError>,
+) -> Result<Vec<RecordBatch>, ArrowError> {
+    if rows.is_empty() {
+        return Ok(vec![make(rows)?]); // alloc: a flush's parts, once a flush
+    }
+    rows.chunks(BATCH_ROWS).map(make).collect()
 }
 
 /// The batches of `table` in `bytes`, an Arrow IPC stream build `build`'s client sent (none for
