@@ -128,15 +128,12 @@ fn merge_oldest(log: &mut Vec<Arc<Found>>) {
 /// The rows one level of a walk verifies before it hands them to the pool: a level of fewer
 /// is verified on the walker's thread, one row after the other.
 ///
-/// Why a count and not the small-loop predictor (`blaze_graph::par::Small`). The rows of one
-/// level are not independent: they read each other and the same rows below them, so on the
-/// pool each row's job waits on runs other jobs of the level claimed. On 2026-11-11 the
-/// predictor's bound of 32 sent a level of about 55 rows (a one-expression edit of a
-/// hello-world's `main`) to the pool, where this bound had kept it on the walker's thread:
-/// 55 jobs waited on each other's run flights, gave way and asked again, and the unit's
-/// `names` task never ended. On one thread a row met below another is run on the walker's
-/// own stack, with nothing to wait for. So an edit's levels stay here; only a level wide
-/// enough to be many independent readers of one change goes to the pool.
+/// A count, not the small-loop predictor (`blaze_graph::par::Small`, whose bound is 32
+/// items). Measured 2026-11-11 on a hello-world's one-expression edit (a walk of 67 rows, 23
+/// changed): the edit's build took 103 to 130 ms with the predictor and 106 to 165 ms with
+/// this bound, no difference past the noise, so the walk keeps the dispatch it had. A level's
+/// rows read each other and the rows below them, which on one thread are run on the walker's
+/// own stack with nothing to wait for.
 const PAR_AT: usize = 64;
 
 /// What the walks keep between them. Its vectors are taken out by the walker (the holder of

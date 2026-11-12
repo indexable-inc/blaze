@@ -454,9 +454,8 @@ fn the_work_of_an_edit_is_its_readers_among_a_thousand_rows() {
 }
 
 /// The invariant: a walk's level of fewer rows than its serial bound is verified on the
-/// walker's thread, every row, with no job handed to the pool. The rows of an edit's level
-/// read each other; as jobs they wait on each other's runs (a hello-world body edit hung so,
-/// 2026-11-11, when a level of about 55 rows was sent to the pool). 50 readers of one input,
+/// walker's thread, every row, with no job handed to the pool: an edit's levels cost no
+/// dispatch. 50 readers of one input,
 /// more than the small-loop predictor's 32 and fewer than the walk's 64: each runs again on
 /// the thread that asked for the changed set. Asked from a thread of no pool, so a row
 /// handed to the pool would run on a worker, never here.

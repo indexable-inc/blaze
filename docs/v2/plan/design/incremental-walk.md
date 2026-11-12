@@ -174,19 +174,19 @@ control edits a signature, which reaches every caller.
 makes none again (0 at 4 libraries and at 40), and a key that changes is held to a fresh
 database's.
 
-**At the save.** The watcher's commit of a save, with no request waiting on it, starts the
-head's last build-shaped request as a check on the new root, as an intent's job
-(`Session::save_ahead`): the file is read into the database, the engine marks what read it
-and the changed bodies are checked before `blaze run` is typed, and that request takes the
-job over. Nothing is linked, patched or run ahead. At most `SAVES_AHEAD` between two
-requests that build, and never beside a request's job.
+**At the save: not built.** A build ahead of a save (the watcher's commit starting the
+head's last request as an intent's job) was written and taken out on 2026-11-11: measured
+on a hello-world, a check ahead resolved the dependencies again as crates of its own (3,733
+item trees run new) and wrote `AllCrates`, `SourceRootInput`, `PathBucket` and
+`ProcMacros`; the run after it walked from fields the whole program reads and never ended.
+A build ahead in place of the check let the first edit through in 2.4 s and hung the
+second. A second job on a view must first write no input the first job's rows read.
 
 **Small loops run here.** A loop of at most 32 items predicted under 2 ms from its own
 site's small runs (`blaze_graph::par::Small`) runs on its calling thread with no job
 submitted: the body check's tasks, the codegen walk's asks. The changed-set walk's levels
-keep their own bound (under 64 rows on the walker's thread): a level's rows read each
-other, and at 32 a level of about 55 rows went to the pool and its jobs waited on each
-other without end (a hello-world body edit hung in `names`, 2026-11-11).
+keep their own bound (under 64 rows on the walker's thread); the predictor there measured
+the same.
 A unit's phases are still plane tasks, each a dispatch: the edit's chain is one thread
 within a stage, not yet across them.
 
