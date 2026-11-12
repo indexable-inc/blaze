@@ -425,13 +425,46 @@ every unserved crate cold again. As built:
   from `served_delta` (next piece); a workspace test or program crate is resolved once before
   its harness root is appended and its root's group again after.
 
+**A registry crate's image under any home (2026-11-12, lane records-1112f; written, not
+compiled or run by it).** Measured by lane reth-1112 on a hello-world: 80 of 80 dependency
+crates refused, kind `encode`. Read from the code: the encoder took an `OUT_DIR` up to its
+*first* `/build/` as a checkout's build directory, and the default target directory is
+`<home>/build/<name>-<id>` (`blaze_manifest::home::build_dir`), so the home was the place and
+every fetched source a file below it. As written: the place is what is before the *last*
+`/build/`; the home's fetched sources are a named root (`blaze_usercode::roots::Role::Sources`,
+in every build's `portable::Places`), so a registry crate's key names no home
+(`crate_root_ported`); `base_db::Port` has the inverse (`placed`) and the one searcher
+(`held`, `Roots::embedded`); a literal's paths are written with the port (`Enc::unplaced`)
+and read back against the reader's roots (`Dec::placed`; a mark with no port told is an
+error); bytes that still hold a root are refused naming it. A file was already named by its
+owning crate and its path from that crate's root. A registry crate's *unit* record whose
+object code holds a `file!()` path is tied and kept under `Places::here`, as any tied record.
+Checks (hir-def `nameres::frozen::tests`):
+`a_crate_fetched_under_one_home_is_the_same_bytes_under_another`,
+`the_control_a_path_kept_absolute_is_other_bytes_under_another_home`,
+`a_literal_that_still_holds_a_directory_is_refused_by_its_name`. To measure: the refused
+count on hello-world, 80 to 0.
+
+**The smoke failure, as far as read (2026-11-12, records-1112f; no trace yet).** `Waits::ready`
+is over the *unit* graph (no build-script run left in the unit's closure) and a release
+walks the *crate* graph (`Crate::data().dependencies`). The units that failed have no
+dependency but the standard library (blaze-rng, blaze-serde-derive; smoke-sys's build script
+has `cc`), the error names one `libc` as both read and awaited, and the unit's own crate was
+not awaited (or the error would name it). So either the two graphs differ at `libc` (a crate
+edge with no unit edge, or the reverse: two `libc` crates, the sysroot's and the registry's
+0.2.x, or host and wasm) or the read is not along a dependency edge. Not decided: it needs
+the three log lines (`a unit begins while ..`, the `Unmaintained` tail, `.. still waits`).
+
 **What is left, in order** (split 2026-11-12: 1's second half is lane records-impls', 4 is
 records-items', 5 and the end-to-end revision cases are records-restart's, bodies and MIR are
 records-bodies'; 2, 3, the many-crates count test, the refinement test under random edits and
 the double resolve of harnessed crates are records-1112d's, then records-1112e's, which
 built none of them: 3 (the image not pinned whole, the duplicate write of a module's names),
 the many-crates count test, the refinement test of def-map pages under random edits and the
-double resolve are all still to do, in that order. The record keys a pin and a pack export
+double resolve are all still to do, in that order. Lane records-1112f (2026-11-12) wrote the
+registry-image piece above and built none of these either; before them it owes the smoke
+fix, the component-size measurement for rule 65 (`/tmp/records-1112e/next.md` D) and the
+wiring lines other lanes send. The record keys a pin and a pack export
 cover are one list now, storegc's `hir_def::deps::front_keys` / `filing_keys` and
 blaze-cargo's `serve::collect::front_keys`: a new record kind adds its key there).
 
@@ -754,6 +787,19 @@ What the next writer needs, agreed with the lanes named:
   pin, or a record written and not pinned is collected. A found record without its image, or
   the reverse, is a miss either way. The serve's check of item pages asks the store, never
   the record.
+- *Named roots (records-1112f; written, not compiled), owed by this lane, not written.*
+  `base_db::Files::ported` now has its reverse `Files::placed(bytes)` and `Files::held(bytes)
+  -> Option<&'static str>` (the named root a path is still under; identity and `None` while
+  no port is told), and the home's fetched sources are a named root (`Role::Sources`, tag
+  `f`). Two uses here. (1) The found record's manifest holds only paths under the package
+  (layout 1 refuses any other), so a file of the source root outside the package (a target
+  root elsewhere) is left out today: give the record a second path form, written with
+  `files().ported` and read with `files().placed`, with a layout bump. (2) `key.rs`'s
+  `Base::value` writes any other absolute path as the one marker `\0ABSOLUTE`, so two
+  different outside paths collapse and nothing says which root one was under: write
+  `files().ported(path)` in its place and ask `files().held` in `PlanBase::holds_machine_path`
+  and `Base::held_by`; that moves every image key (a new `KEY_DOMAIN`), so it goes in one
+  hunk with E's switch, agreed with cutoff-1112 who also edits `key.rs`.
 - *E, the surface slot (cutoff-1112, 2026-11-12; written, not compiled).* `image_key` takes a
   dependency by `given::surface` where one is given, else by its key (key domain 7); the
   lowering gives every crate of the plan its surface (`Lowered::give_surfaces`) at the end of
@@ -810,7 +856,8 @@ defining file):
 | B | crate-wide walks (`crate_diagnostic_items`, `crate_notable_traits`, `UnstableFeatures::query`, `ImportMap::of`) | not built: one table a crate each |
 | C | `enum_has_unsafe_fields`, `written_self_view`, `extern_block_abi`, `get_constrained_lifetimes`, `written_visibility` under `assoc_visibility`, `ExternCrateId::alias_or_name`, macro names | not built |
 | C | `with_source_map`/`relative` of each signature | lowers again from syntax by design; whether only a diagnostic of that item reaches it is not checked (the callers are the dispatchers in `expr_store.rs`, `hir/generics.rs`, `lib.rs`) |
-| D | `decl_macro_expander` (the tokens of a `macro_rules!`/`macro` a dependent calls), the hygiene keys of `nameres/def_site.rs` (`macro_def_module`, `expanded_item_key`, `use_tree_key`, `module_item_key`, `expanded_*_context`) | not built: needs token trees and spans in the record |
+| D | `decl_macro_expander` (the tokens of a `macro_rules!`/`macro` a dependent calls) | per-item entries (`hir_expand::declarative::stored`), written, not compiled or run; a definition a macro wrote, one with a `cfg_attr` and one whose spans have a wider anchor are made from source as before |
+| D | the hygiene keys of `nameres/def_site.rs` (`macro_def_module`, `expanded_item_key`, `use_tree_key`, `module_item_key`, `expanded_*_context`) | not built |
 | D | `include_macro_invoc` (decoded every scope) | from the record: one list a crate |
 | E | an item's range or line (`method_resolution::may_hold`, `opaques.rs`, hir-ty-mir `location.rs`, hir-ty-codegen `places.rs`, `const_check/stability.rs`), blaze-items' `item_key` and macro token forms (`key.rs`, `form.rs`), lint levels (hir-lint-levels) | not built: positions as a segment of their own, read only by units that need them (form to agree with cutoff-1112); the item key and the resolved level set as entries |
 | F | bodies: `Body::of`, `body_syntax`, `block_item_tree_query`, `block_def_map`, `nameres::demand`, MIR's `parse_macro_expansion(..).err` | lane records-bodies |
@@ -865,6 +912,40 @@ elsewhere, and a blaze-cargo test that a dependent's build of a crate with item 
 none of those queries for it. The old path of the three ported queries is not deleted: it is
 still the path of workspace crates and of items in blocks.
 
+**State and what is left** (2026-11-12, lane records-items2; nothing below was compiled or run
+by this lane). The record above is keyed by the crate (`items_key`), against rule 65: it is to
+be replaced by per-item entries, not extended. The per-item form has three levels, none keyed by
+a crate: a file index (ast id to `ItemSource { attrs, header, body }`) under the file's content
+and how it is read; entries under their own keys, all through
+`nameres::frozen::entries` (`entry`, `keep`; the driver's `Entries`); a per-crate table of item
+key to entry key that is an index only.
+
+Built in that form: macro definitions (`crates/hir-expand/src/declarative/stored.rs`, reached
+from `decl_macro_expander`; hir-def's `entries::set` installs the bridge to the entry store).
+Two entries a definition: the source row, H(file content, edition and extensions, ast id) to
+the definition's position-free tree hash (the file index's row for this item, one record a row
+until the whole-file index exists); the tokens, H(tree hash, ast id, edition and extensions,
+defining crate's edition) to the transparency and token trees. The tokens name no file, crate
+or context: every span of a kept definition is of its file's root context and relative to the
+definition's own ast id, and a definition that is not so is not kept. An unchanged file: two
+gets, no parse. An edited file: its parse, one row put a macro asked, and the tokens of every
+unchanged macro found. `stored::def_hash` is the definition's content hash for other keys (a
+body's macro-definition fact). Inert until the driver calls `entries::set`; nothing does yet.
+Checks: hir-expand `declarative::stored::tests` (round trip, a changed token, a span not its
+own is not kept, a layout refused by name, the key's parts); hir-def
+`nameres::frozen::entries::tests`: `a_kept_macro_definition_is_expanded_with_no_parse_of_its_file`
+with `without_kept_definitions_the_same_asks_parse_the_file`, and
+`one_macro_of_n_edited_finds_the_tokens_of_the_others` (N-1 found; the edited one a miss).
+
+Left, in order: the whole-file index with `ItemSource` (`body` is the subtree hash of the body
+node alone; `BodySyntax::item_hash`, the whole item node, is another value and is deleted then), the source row folded into it; attr flags, assoc items and includes
+as entries (keys in `/tmp/records-items/next.md`); the per-crate index; the driver's
+`entries::set` over the store; `items.rs` deleted; macro definitions a macro wrote (keyed on
+the outermost call's inputs) and the expansion key; then rows B, C, E of the table. Not
+written for macro definitions: identical bytes from two databases as a database test (the
+codec test compares two writes), and every macro of std and bstd keeping (needs a harness with
+a real std).
+
 ## Impl tables read in place (2026-11-12, lane records-impls; D21, D29)
 
 The second half of item 1 of "What is left" above. **Written, not compiled or run by this
@@ -900,13 +981,19 @@ no key answers from the head. Every reader calls `report_stored_read`.
 (`TraitImpls::served_row`, `served_blanket`). Of one trait: `for_crate_and_trait` (the trait's
 entry and its rows' run). Of everything, the whole table decoded: `TraitImpls::for_crate`,
 `InherentImpls::for_crate`, `trait_value_items` (which `encode` and `Mode::Verify` read).
-Not ported, each still a whole-table read of a served crate when it asks one:
-`where_const::bound_refusal` (`for_crate(..).blanket_impls`), `for_crate_and_deps` and what
-goes over it (`for_each_crate_and_block*`: the solver's arm for an unresolved type variable,
-diagnostics only; hir-ty-coherence's overlap walk), `InherentImpls::for_each_crate_and_block`
-(hir), hir-ty-pure and hir-ty-suspend's `InherentImpls::for_crate(..).for_self_ty`, hir's and
-blaze-diagnostics' `TraitImpls::for_crate`. `in_crate_for_trait` and `traits.rs`'s sealed
-check read one trait whole, which is what they ask.
+Ported after the cut of 18:24 UTC (written, not compiled): `where_const::bound_refusal`
+(`TraitImpls::each_blanket_in_crate`, new), the solver's arm for an unresolved type variable
+(`next_solver/interner.rs`: the blocks, then `for_crate_and_trait` of each loaded crate),
+hir-ty-coherence's overlap walk and hir's `Impl::all_for_trait` (`for_crate_and_trait` a
+crate), hir-ty-suspend `root.rs` and hir's two walks of inherent impls for a type
+(`InherentImpls::for_self_ty_in_crate_and_block`, new, over `in_crate_for_self_ty`),
+`hir/diagnostics.rs` and blaze-diagnostics' `has_impls` (the trait's table of the checked
+crate). hir-ty-pure's four sites in `models.rs` and `effect_attrs.rs`
+(`in_crate_for_self_ty`, `for_crate_and_trait`). Still a whole-table read of a served crate: hir's `Impl::all_for_type`
+(`TraitImpls::for_crate(seen).for_self_ty`: every trait's impls for one type, which needs a
+table from a self type to the traits with a row for it; in the per-item layout below),
+`for_crate_and_deps` and `for_each_crate_and_block*` for any caller left, and
+`traits.rs`'s sealed check and `in_crate_for_trait`, which read what they ask.
 
 **The input** is the crate's slot (`ImplTablesSlot`, `Tables { pages, mode }`), given in
 `frozen::set`'s write; queries read only the slot.
@@ -922,10 +1009,71 @@ check read one trait whole, which is what they ask.
 `the_oracle_catches_an_absent_row_found_by_a_scan`. Still passing: hir-ty-mir `tests::frozen`
 (Check and Verify over the pages), hir-ty `delta::tests::tables`.
 
+**Rule 65: the record is still keyed a crate (`frozen::key`), which is not allowed; the
+per-item form, approved 2026-11-12, not built.** An entry (a row, a trait's blanket set, an
+inherent bucket, a name's items) is a set of impls under one index (`delta::key::ImplKey`:
+trait and head, or head), so its content is its members' identities and nothing of their
+headers. Its key: the entry kind, the index's identity (`def_identity`, `head_identity`) and
+the sorted `impl_identity` of each member (and `derive_identity` of each derive): what
+`delta::read::impl_row_hash`, `blanket_hash` and the slice hashes hash today. An edit of a
+body, a where clause or generics that leaves (trait, head) alone re-makes no entry; an impl
+moved to another head re-makes two rows. Pieces, in order: (1) `segments` gains a stable
+naming mode (a module by the names on its path, a file by owner crate and path with no
+content id and no files-table index), so an entry's bytes do not move when another module or
+file does; (2) entries kept and found through records-items' `hir_def::nameres::frozen::entries`
+(`entry`, `keep`, `Memory` for tests; drafted at /tmp/records-items/entries.rs), under one
+function pair here taking the crate's key and the entry's key, so storegc's form (a sealed
+set for a crate that does not change under its key, a live set for an edited one) changes
+underneath; (3) the per-crate index is today's four slot tables with a slot holding the
+entry's key, plus a fifth from a self type to the traits with a row; found by the crate's key
+as a first check only, re-made from hashes when it moves; (4) a reader records the index it
+read with the entry's key or "absent" (cutoff's read parts; `report_stored_read` is a flag
+only); (5) the test by counts: N rows, one impl moved, N-2 entries found and 2 made, a
+where-clause edit makes none, and the control keyed by the crate misses all N. Notes:
+/tmp/records-impls/next.md.
+
 **Not done.** An in-place edit of a crate read from pages under random edits (one in-place
 edit is `delta::tests::tables`'s); the `seal_group_whole` test that each reader's row is
 marked stored; the readers listed above; the head reads the record's whole files table, which
 checks the content of every file the crate's impls are in (one read a crate, not a lookup).
+
+**State and what is left (records-items, 2026-11-12, at the end of its context; rule 65).**
+The record above is read per item but KEYED per crate (`items_key(image key)`): any change of
+the crate misses every entry. It is to be rebuilt, not extended, on this form (approved):
+
+1. *A file index*, keyed by H(file content id, edition): ast id to `ItemSource` for each
+   item, variant and assoc item, found without parsing an unchanged file and made by the one
+   parse of an edited one, from the item tree's per-item rows (`item_tree/items.rs`).
+   `ItemSource` is the one per-item source hash, agreed with records-bodies: `attrs` (the
+   item's attribute tokens), `header` (the item's own tree with every body cut), `body` (the
+   tree hash of its OWN body node, not `BodySyntax`'s anchor), all position-free. An item a
+   macro wrote is keyed on inputs, never the expansion: the outermost call's tokens, the
+   `header` of each macro definition expanded on the way, a proc macro by its dylib identity.
+2. *Entries under their own keys*, through `nameres/frozen/entries.rs` (written, not
+   compiled: `Entries { get, put }` with a packing hint `set`, `entry`, `keep`, the singleton
+   input `EntryStore`, a counting `Memory` for tests; records-impls and the def-map pages use
+   it too; storegc decides the storage form behind it). Attribute flags: H(`attrs`, the cfg
+   atoms they name). Assoc items of an impl or trait: H(`header`, cfg atoms, per macro call at
+   assoc position its input key and the fact it resolved by, absent included). An include:
+   one entry a call.
+3. *The per-crate table* (item `Key` to entry key): an index, found by the crate's key as a
+   quick check and made again without running any entry's work.
+
+An edit of one item of N re-makes its file's index, its flags entry only when its attributes
+changed, its impl's assoc entry only when a header inside the impl changed, nothing for a body
+edit. The count test to write: edit one of N impls, N-1 assoc entries hit and the collector
+does not run for them; control keyed by `items_key` misses all N.
+
+Order for the lane that continues (its notes: `/tmp/records-items/next.md`): the tokens of a
+`macro_rules!`/`macro` definition and the input keys of expansions (`decl_macro_expander`;
+entry keys depend on them); the file index; the three entry kinds moved onto `entries`; the
+index; then attribute values, stability, field and generic-parameter flags; blaze-items' item
+key and macro token forms; positions as their own part (with cutoff-1112); lint levels; the
+crate-wide tables; the signature leftovers; a test that every item of std's and bstd's crates
+encodes (blaze-cargo or blaze-lower: hir-def has no std fixture); `items_key` in
+`deps::front_keys` when it exists. Open with records-bodies: a body's spans are relative to
+`BodySyntax`'s anchor, which is the whole `impl` for some methods, so a sibling's edit moves
+them though `body` is equal; positions as a part of their own is the way out.
 
 ## A second kind of target, and where a restart's time goes (2026-11-11, lane share-front-1111)
 
@@ -1316,8 +1464,11 @@ cannot say "only it", so a crate is a *seal group*:
   loosely. A suspect group is checked once, the first time a row of it is asked or by the walk:
   imports behind another seal that holds are passed over a run at a time, the rest are brought
   up to date and their stamps compared with the seal's view. Held: each row of it is proved by
-  one load. Not: the seal is broken, its rows are verified by their own edges, the walk names
-  them all as changed, and the next write opens the group. So a dependent stays sealed while
+  one load. Not: the seal is broken, and (rule
+  granular-caching: a seal is the quick first check, never the grain of what is redone) the
+  walk indexes the group's rows from their own edges and verifies only the rows that read an
+  import that moved; every other row of the group is proved by one load once the walk ends.
+  The next write opens the group. So a dependent stays sealed while
   nothing it reads of the dependency changed; the engine compares the stamps of the rows read,
   it defines no digest, and a host that has a dependent read a dependency through its
   interface record gets cutoff-1112's digest as that one import.
@@ -1326,7 +1477,9 @@ cannot say "only it", so a crate is a *seal group*:
   (`shed_sealed_readers`); when a group opens they are made from its own rows.
 - *What an unseal costs.* The opened group's rows and their edges (to index them), on the
   write's path, under the span `seal group open`; nothing of another group. A broken seal
-  costs the same at the next write, and its rows named to the hosts. A sealing costs the
+  costs its group's edges once (an index, no row verified), its imports' stamps, and the
+  verification of the k rows that read what moved, of its N (test
+  `a_broken_seal_re_verifies_only_the_rows_that_read_what_moved`: 3 of 100 and 3 of 2,000). A sealing costs the
   group's rows not yet behind the seal and their edges, after the answer.
 - *The census* (`Storage::seal_census`, and in `durability_census`'s text): groups sealed,
   rows behind seals, rows by group and state, checks, seals broken, groups opened.
@@ -1335,8 +1488,7 @@ What is not built: the hosts' calls (no crate makes a group yet, so nothing is s
 real build); letting go of a sealed row's forward edges (a row without edges must run again
 when its group opens: right for a library, wrong for a local crate); the provider a sealed
 row's value is fetched through (records-1112b's functions, by value, where a let-go value is
-asked: `function::claimed`'s `Cause::Evicted` run); a precise walk into a broken seal (an
-index of that group made by the reader that broke it, where now every row of it is named).
+asked: `function::claimed`'s `Cause::Evicted` run).
 
 Memory a row behind a seal, as built: its header 32 bytes and its value's place, its node 32,
 its last run 8, its group word 4, its place in its group's list 4, its forward edges 4 each
@@ -1596,3 +1748,257 @@ body) with `the_control_a_crate_with_no_value_builds_every_body`;
 random edits elsewhere (it needs the driver's serve and withdraw), and the count on a real
 build (`query_counts` of `Body::of`, `infer_body_query`, `mir_body_query` for a dependent of a
 served crate: 0 for the owners the value holds).
+
+### One form, a function: the end state (2026-11-12, after the owner's review; design, not built)
+
+The piece above reads a function at a time but is keyed a crate at a time, so any change in a
+crate misses every entry, and it leaves two forms of one idea (the crate value for quiet
+crates, the item store for edited ones). The end state is one form, a function, for
+dependencies and edited crates alike; `body_store` and `check_cache`'s part are deleted into
+it. What stays of the piece above: the container (`pages`), the entry codec, `read_in`, the
+served arm of `compute`. What changes: an entry's key and its lookup.
+
+**What exists already, read from the code.** The item store is most of it: an answer a
+function and step, found by a base key and then by the values of the facts the step read
+(`record::shape_key`, `AnswerKey`), the facts classified from the step's captured reads
+(`blaze_item_hash::reads`, `RULES`): `Signature`, `Fields`, `Attrs` of the items it names, the
+impl indexes by trait and self type, `Crate` and `CrateRoot` facts, lane items' negative facts
+(`ImplIndexKey`, `ScopeIndexKey`). Three things keep it from being the one form:
+
+1. its base key is made from the lowered, resolved body (`identity_parts`: "hir", "entries",
+   "names"), so the lookup costs the lowering;
+2. name resolution's reads are `Rule::Names`: covered by that identity, never recorded;
+3. an answer names a path's target as "target `i` of the body's resolutions"
+   (`keys::Rel::Target`), so decoding calls `names_of`, which lowers and resolves the body.
+
+**The entry's key, made before lowering.** The base key is the function's own content and
+nothing of its crate's: the tree hash of its anchor (`hir_def::expr_store::body::BodySyntax`'s
+`tree`: the item's text, position-free; an item a macro writes: the call's and the macro
+definition's, below), its owner part and module chain as today (`identity::owner`, by key and
+signature), the step, the MIR owner's place, the schema, the front end's code identity, and of
+the crate only its settings (cfg, features, edition, target, toolchain: `crate_inputs` less
+the dependencies' contents). Under it, as today, shapes list what was read and the answer is
+filed under those reads' values.
+
+**The reads an entry records, and how each is checked at a lookup.** Each is a fact whose
+value is a memoized query, so a check is that row's verify, and a body nobody edited checks
+by fingerprints alone:
+
+| Read | Recorded as | Value compared | Negative form |
+|---|---|---|---|
+| a name looked up in a scope (`ScopeInput::name`, `legacy_macro`, a block's scope) | the scope (module key) and the name's text | the item keys it resolves to, a namespace each | the name absent from the scope: the same fact with the value "nothing", so a new item that shadows or supplies it changes the value |
+| the traits in scope of a module (`ScopeInput::traits`) | the module key | the traits' keys, sorted | (a set: an added trait changes it) |
+| a glob or prelude that supplied a name | the name fact of the scope it came through | as a name | as a name |
+| a macro expanded in the body | the macro's item key | the hash of its definition's tokens (a proc macro: its dylib's identity, in the crate's settings) | none: found by a name fact |
+| the signature, fields, attributes, generics of an item named | `Signature`, `Fields`, `Attrs` (as today) | the fact's hash | none |
+| an impl looked for by trait and self type, a method candidate by name | the impl index facts (as today) | the index entry's hash | "no impl": the entry absent, as today (`ImplIndexKey`) |
+| another function's inference, MIR, constant value (a closure's signature, a `const fn` evaluated, an inlined callee at the optimized stage) | that function's step (`body_store::step_value`, as today) | the hash of its answer | none |
+| a layout or drop glue the runtime passes read | the type's layout fact (`blaze_items::layout_hash`) | its hash | none |
+| the dependencies as a whole | nothing: each read of one is one of the rows above, keyed in the dependency | | |
+
+What makes rows 1 to 4 possible is that the body's own lowering is part of the step: the
+capture (`body_store::capture`) must hold the reads `Body::of` made (its row's edges, which
+the engine keeps), not the one read of `Body::of`; `Rule::OwnBody` and `Rule::Names` then
+classify each as a row above. That is the engine piece to ask of cutoff-1112: a step's reads
+flattened through named rows (`Reads::for_each_read` descending into `Body::of`,
+`ExprScopes`, `body_upvars_mentioned` of the own body).
+
+**The answer names items by item key**, never by a place among the body's resolutions:
+`keys::def_key` gives the plain key for a path's target (`Rel::Target` goes; `Own`, `Closure`,
+`Coroutine`, `Opaque` stay, they are places in the body's own text), and `def_of` resolves
+with `blaze_items::key::resolve`. A renamed callee is then a changed name fact and a miss,
+where today it is a hit: the price of a lookup that needs no body. Decoding reads the counts
+the entry keeps (`read_in`, `BodyRef::nodes`) and no `Body::of`.
+
+**The container is storage only.** A crate's entries are packed into one value (`pages`) when
+the crate goes quiet (the seal), found there by the entry's key (base key and shape slot)
+through the bucket table; pins and exports stay one unit a crate. An entry made since is its
+own store value until the next pack. The crate's key (`runtime::key` of its filed image key)
+is only the quick check: when it is what the pack was made under, every entry of the pack
+holds and no fact is compared. When it is not, each entry asked for is checked by its facts,
+so one function edited misses that function, and its callers only if what they read of it
+(its signature; its body when a step read it) changed.
+
+**Steps and stages.** One entry family, a step each: inference (with the verdict), runtime
+MIR (the stage codegen reads; built MIR is no longer stored: nothing reads it that a hit does
+not replace, and the borrow check's verdict is its own answer), promoteds and the coroutine
+facts as parts of the runtime entry.
+
+**Tests.** (1) a crate of N functions, one edited, every function asked: N-1 hits and 0
+`Body::of`, `infer_body_query`, `mir_body_query` runs for them, 1 miss (control: the
+crate's key as the entry's key: N misses); (2) a signature that one function calls changed:
+exactly its callers miss; (3) a new item that shadows a name a body resolved (through a glob):
+the bodies that looked the name up in that scope miss (control: negative name facts left out
+of the shape: the stale answer is served, and the refinement against a database built from
+source catches it); (4) the piece above's tests, kept.
+
+**What cannot be had as asked, or is not known yet.** A body in a block has no anchor of its
+own outside a walk of the body it is in (`placed_body_syntax`): it is keyed under the
+enclosing body's entry, never alone. A body a macro writes: its content is the call's tokens
+and the definition's; whether the expansion's hash can stand in (an expansion is made before
+the body is lowered, and is cheaper than the lowering) is to settle with records-items. A
+location macro's value is a read of the body's position and the file's name: recorded as
+facts, it makes such a body miss on every move, which is right for `line!()` and the reason
+the hole (slot 5) is better: both are needed. Not read yet by this lane, so the table's
+"as today" rows rest on `reads.rs`'s rule names and module text, not on its arms:
+`values.rs`, `names.rs`, `keys.rs` past its head.
+
+**Agreed with the lanes beside this one (2026-11-12, by message; none of it written yet).**
+
+- *The vocabulary of a read is `blaze_items::Fact`* (cutoff-1112: a unit's parts use the same),
+  its value from `blaze_items::facts::value(db, seen_by, &fact)`. The table's rows in it: a
+  name looked up, found or not, is `Fact::Resolves { scope, name }` ("nothing" is a value);
+  an impl search `Fact::Implements { trait_, self_ty }`; a method lookup
+  `Fact::Method { self_ty, name }`. Two kinds are missing and are added there, never as a
+  second form here: a textual-scope (legacy) macro lookup, and the traits in scope of a
+  module; cutoff lists them in store.md, "Early cutoff between crates".
+- *The per-item source hash is `ItemSource`* (records-items): three position-free hashes an
+  item, `attrs`, `header` (the item with every body cut) and `body`, in an index a file keyed
+  by the file's content and edition (no parse for an unchanged file); a macro-written item's
+  in an index keyed by the expansion's inputs (the outermost call's tokens, each definition's
+  content hash, hygiene, cfg, edition), never by the expansion. An entry's base key takes
+  `body` and `header`; a macro definition's content is its item's `header`. `body` is the hash
+  of the item's own body node: `BodySyntax`'s `tree` is of the anchor, which its doc says is
+  wider than the item for an item of an `impl` or module with attributes, so the container's
+  `attrs` go into the owner part. Not checked in `anchored_body_syntax`'s code by either
+  lane.
+- *The descent is the engine's* (sealgroups): `Reads::for_each_read_through(storage, through,
+  each)` beside `Reads::for_each_read`, yielding `RowRead::Read` or `RowRead::Stored`: a row
+  under `through` gives its kept edges in its place; one answered from a record is yielded
+  as `Stored` and never descended (its edges are its key's reads: the caller reads that
+  record's shape); edges outlive an evicted value; a row not current in the view is refused
+  by a panic naming it, so the step fetches `Body::of`, `body_expr_scopes` and
+  `body_upvars_mentioned` before descending.
+
+**What reading the code showed (2026-11-12, lane records-bodies2), and what it changes above.**
+
+- *Positions.* An answer holds no position in a file: inference is by `ExprId`/`PatId`, a MIR
+  span is an id of the body's store (`mir/persist.rs` `span`), a location literal is a slot.
+  So a sibling method that changes length moves nothing in an entry, and where the item is
+  in its anchor is in no key. What does move is `Body::unmoved_source_map`, which whoever
+  wants a position reads (a diagnostic, codegen's panic `Location` and debug lines), and
+  that is a lowering. The runtime entry therefore gets a positions part of its own: span to
+  range relative to the body's own node, rebased when read. It comes right after the runtime
+  step; until then a body with a panic location or debug lines is lowered by codegen.
+- *The content hash* is the tree hash of the item's own node (`BodySyntax::item_hash`, to
+  be kept as a field made in `anchored_body_syntax`; the same value as records-items'
+  `ItemSource.body`), not `BodySyntax`'s `tree`, which `anchored_body_syntax` makes of the
+  anchor (`kept(anchor)`): a whole `impl` for a method.
+- *A macro-written body's key also names every macro of its call chain* (item key and the
+  hash of its definition's tokens), for soundness and not only for hits: two expansions of
+  equal tokens under different def-site hygiene look names up in different scopes, and the
+  base key must fix which facts are read first (each later read follows from the values of
+  the earlier ones).
+- *Signatures leave the key.* The identity hashed every path's target by key and signature
+  (`names.rs` `item_part`); now a signature is a fact only where a step read it, so a
+  changed callee misses the bodies whose inference read its signature and no other.
+- *The lowering is a step of its own, `Step::Lower`.* Four decoders read the body's store
+  only for counts (`body_store/infer.rs` `Nodes`, `mir.rs` and `check_cache/runtime.rs`
+  `Bounds`, `value.rs`), and a closure is interned by its place among its body's closures
+  (`hir_ty::db::ClosureKey::new` and `loc` read `closure_exprs`, which opens the store):
+  every body with a closure is lowered to intern or to place one. So the small facts of a
+  lowered body are an answer: the counts, `closure_exprs`, `Body::has_lowering_errors`,
+  whether it has location literals. Its shape holds the reads `Body::of` made (the descent);
+  every other step lists one fact, "the lowering of the body itself" (as `STEP_INFER` is
+  listed today), and its own direct reads. `closure_exprs` and the counts answer from it.
+  Built so far of this: the inference answer keeps its `Nodes` (`InferRoot.nodes`), and a
+  relative key of a closure carries its kind, so `keys::relative_def` opens no store.
+- *The kinds of fact added* are the item store's own (`blaze_item_hash::values::kinds`, the
+  form is `FactRef`; cutoff moves a unit's `Part::Fact` to `FactRef` and lists them in
+  store.md), not `blaze_items::Fact` variants as the paragraph above says, and two, not
+  four: `0x1806` `TRAITS_IN_SCOPE` (module: the keys of `module_trait_set`, sorted) and
+  `0x1807` `WHOLE_SCOPE` (module: every name with its `Resolves` value; only for a real
+  iteration, each counted by the reading query's name in the flush's report), then
+  `STEP_LOWER`. A name looked up, found or not, stays `Fact::Resolves`, and so does a
+  textual-scope macro lookup: `index::ScopeEntry::Module` holds the name's `legacy_macros`
+  beside its three namespaces, each binding with its visibility and whether it came through
+  a glob. A macro's definition is its `Signature` fact (`form.rs` `macro_`). Both written
+  (`values.rs`: `traits_in_scope`, `whole_scope`, `resolves`; `value` answers them).
+- *A read's key to (module, name)* needs `hir_def::nameres::name_read(db, read, kind) ->
+  Option<NameRead>` with `NameRead::{Name, LegacyMacro, Traits, WholeScope, Children,
+  Handle}` (`ScopeInput`, `ModuleScope` and `Modules` are private); the request, with the 21
+  rows to answer for, is in `/tmp/records-1112e/next.md` section E. Not written: lane
+  records-1112e ended; whoever gets there first writes it in `nameres.rs` and
+  `nameres/frozen/pages.rs`.
+- *Reads the steps make themselves through the resolver* are in their captures today and
+  dropped by `Rule::Names`: they become facts with `name_read` alone. Only the reads inside
+  `Body::of` wait for the descent.
+- *Hard cases, decided.* A body with block-local items has no identity today and stays
+  unstored (counted) until a block's scope has a key. A closure of another body named by
+  plain key (`keys::closure_owner`) lowers that body: only revealed opaque types in runtime
+  MIR reach it. A renamed callee misses its callers; two functions of the same text and
+  different names no longer share an entry. Promoteds and the coroutine held-locals fact
+  are parts of the runtime entry, keyed per instance where monowalk says the generic body
+  does not give the held set.
+
+**The switch and what deletes the old identity.** `identity_parts`' "hir", "entries" and
+"names" parts (with `names.rs`, `entries.rs`, `slots.rs` and `portable_body`'s use here) are
+deleted, with no switch left, when on one commit: `name_read` and the descent are in; a run
+of reth and tempo lists no read in `Flushed::refused` that the old path stored; and the
+count test (N-1 hits with 0 `body_query`, `infer_body_query`, `mir_body_query`) and the
+refinement under random edits pass with their controls.
+
+**State (2026-11-12, lane records-bodies2).** Written, not yet built (ready list
+`/tmp/round2/ready/records-bodies2.txt`): answers name a path's target by plain item key and
+`Rel::Target`, `target_indices` and `Names::targets` are gone (`keys.rs`, `names.rs`;
+`IDENTITY_DOMAIN` 5 so no record of the old form is found); a closure's relative key holds
+its kind (`check_cache/ids.rs` `closure_kind_code`, `closure_kind_of`, now public through
+`body_store`); the inference answer keeps its node counts (schema "inference 2"). The two
+fact kinds and `resolves` are written with their values; nothing classifies a read into
+them yet. Left, in
+order: `name_read`, the reads the steps
+make themselves as facts (`reads.rs` `Rule::Names`), `BodySyntax::item_hash` and the early
+base key (`identity.rs`), `Step::Lower` with the descent, the runtime stage as a step and
+`check_cache`'s per-crate lookup deleted, the positions part, the driver's lines, the tests
+of this subsection.
+
+**State (2026-11-12, lane records-bodies3; letters are the lane's list a to f).** Written, not
+yet built (ready list `/tmp/round2/ready/records-bodies3.txt`):
+
+- *a, done.* `hir_def::nameres::name_read(db, read, kind) -> Option<NameRead>` (end of
+  `nameres.rs`; helpers `delta::publish::name_read`, `frozen::pages::{read_of, paged_index,
+  PagedRead}`). It takes the `ReadKind`: a struct's fields share one ingredient and are told
+  apart by field. One variant more than planned, `NameRead::Crate(Crate)`: a `DefMap` is not
+  a handle, it holds the prelude, the extern and `#[macro_use]` preludes and the root's flags
+  (`no_std`, edition, registered tools), so `def_map`, `DefMapPair` and
+  `crate_shadows_primitive_type` are reads of those, hashed by the new fact kind `0x1808`
+  `CRATE_NAMES` (`values::crate_names`, over `hir_def::nameres::crate_names`; subject: the
+  root module's key). Handles: `Modules`, `ModuleScope`, `Modules::module`, `table`,
+  `crate_local_def_map`, `ModuleIdLt`, `BlockIdLt`, `row`, `CrateResolution::module`,
+  `ScopeInput.module`. `Children` and `block_def_map` map to `WHOLE_SCOPE`.
+- *b, done.* `reads::classify_with(.., Names::Facts)` turns `Rule::Names` rows into facts
+  through `name_read` (`reads::name_fact`); `module_trait_set` is `Rule::TraitsInScope`; a
+  whole-scope read is `Classified::Scan`, counted in `Flushed::scans` by (step, row). The
+  switch is the type installed: `Bodies` (old, `Names::Identity`, still the only one the
+  driver installs) or `blaze_item_hash::RecordedNames`. Rows added to `RULES` and to
+  `identity::covered_queries` (refused before): `ScopeInput`'s `scope`, `children`,
+  `module`; `Modules`' `table`; the paged memos `name_memo`, `legacy_macro_memo`,
+  `scope_memo`, `traits_memo`. Tests in `blaze-item-hash/src/tests/classify.rs`:
+  `a_name_fact_changes_when_the_name_is_supplied_or_shadowed_and_only_then`,
+  `scope_and_crate_name_facts_change_with_what_they_hold_and_only_then`,
+  `recorded_names_are_facts_with_values_or_handles`.
+- *Not checked, to check on the first build:* that a paged scope's `module` index is the
+  module's place in `DefMap::table` (`nameres::paged_module` panics naming it when not);
+  that `crate_names` leaves nothing out a body step reads of a `DefMap`
+  (`exported_derives`, `fn_proc_macro_mapping`, `derive_helpers_in_scope` are left out);
+  that a module's `visibility` and `origin` in `ModuleData` reach no step except through
+  the `Resolves` value of its name in its parent (the `Handle` claim).
+- *c, first half done.* `BodySyntax::item_hash` (hir-def `expr_store/body.rs`): `tree_hash`
+  of the item's own node, set in `anchored_body_syntax` (of `relative`) and
+  `in_owner_body_syntax` (the item found in the owner's tree); not part of equality.
+  It is NOT `ItemSource.body` (records-items2: `body` is the body node alone, `header` the
+  item with every body cut): it is the whole item node, which is what the base key needs
+  of both in one value. When `ItemSource` exists (its file index is unwritten), the base
+  key may take `header` and `body` from it and this field goes; until then this is the
+  one value. A macro definition's hash for the call chain:
+  `hir_expand::declarative::stored::def_hash(db, AstId<ast::Macro>, def_crate) -> u128`
+  (records-items2, written, uncompiled).
+- *Next, exactly:* c, second half: `identity::early_identity(db, def)` beside `identity` in
+  blaze-item-hash `identity.rs`, made with no `Body::of`: `body_syntax(db, def)`'s
+  `item_hash`, the owner part and module chain as `identity::owner` gives them by key (no
+  signature hash: signatures are facts now), the crate's settings (`crate_inputs` less the
+  dependencies' contents), and for a body a macro writes (`body_syntax` is `None`) each
+  macro of its call chain by item key and `Signature` value, with the outermost call's
+  tokens; a body with neither has no early identity (counted `no_identity`). Then make
+  `RecordedNames::identity` (`lib.rs`) return it. Then d, e, f as listed in the lane's
+  brief; none of them is started.

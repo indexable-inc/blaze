@@ -240,6 +240,19 @@ impl Reverse {
     }
 }
 
+/// What names the rows that read a node: the reverse index, or it with more beside it (the
+/// rows of a seal a walk found broken, [`super::seal`]).
+pub(crate) trait Readers {
+    /// Gives `each` every reader of `dep`; returns how many.
+    fn readers(&self, dep: u32, each: impl FnMut(u32)) -> u64;
+}
+
+impl Readers for Reverse {
+    fn readers(&self, dep: u32, each: impl FnMut(u32)) -> u64 {
+        Reverse::readers(self, dep, each)
+    }
+}
+
 /// A set of nodes: the walk's own, and the fold's scratch.
 pub(crate) type Seen = hashbrown::HashSet<u32, blaze_hash::FixedState>;
 
@@ -315,7 +328,7 @@ impl Plan {
     #[blaze::pure]
     pub(crate) fn suspects(
         &mut self,
-        reverse: &Reverse,
+        reverse: &impl Readers,
         changed: &mut Vec<ChangedIn>,
         suspects: &mut Vec<u32>,
         mut verified: impl FnMut(u32) -> u32,

@@ -46,9 +46,12 @@
 //!   reader's edge is, and their stamps compared with `sealed_at`. All unchanged: the group
 //!   is held again, and each of its rows is proved by one load when asked
 //!   ([`Seals::proves`]). One changed: the seal is broken.
-//! - *A broken seal* proves nothing: its rows are verified as any rows, by their own edges.
-//!   The walk names every row of it as changed and sets it apart
-//!   ([`Seals::broken_rows`]), and the next `&mut` opens the group ([`Storage::seal_finalize`]).
+//! - *A broken seal* proves nothing, and is never the grain of what is redone: its rows are
+//!   verified as any rows, by their own edges. The walk indexes the group's rows from their
+//!   own edges ([`Seals::index_broken`]) and hands out only the rows that read an import that
+//!   moved ([`moved_readers`]); a row of the group that no changed read reaches is proved by
+//!   one load once the walk ends. The next `&mut` opens the group
+//!   ([`Storage::seal_finalize`]).
 //!
 //! Why a write that can change a sealed row always makes its group suspect or opens it. Take
 //! the written field `w` and a path of reads from a row `m` behind the seal of `G` down to
@@ -83,7 +86,7 @@
 
 use std::{
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
-    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering},
 };
 
 use blaze_mem::Tag;
@@ -95,7 +98,7 @@ use super::{
     frontier::{self, Plant},
     function::Verified,
     ingredient,
-    reverse::Seen,
+    reverse::{Reverse, Seen},
     row::{DURABILITY, PROVISIONAL, RUNNING, STORED, UNTRACKED, VIEW_MASK, span},
     storage::{
         FIELD, LOOSE, NODES, NodeRow, Restamp, Storage, Summary, input_bits, key_parts, loose, or,
@@ -234,8 +237,11 @@ struct Group {
     /// Whether the reverse index names every row behind its seal as a reader. False once the
     /// index was made without them.
     indexed: bool,
-    /// Set by the walk that named the rows of its broken seal.
-    named: AtomicBool,
+    /// While its seal is broken: the rows behind it as readers of what they read, made from
+    /// their own edges by the walk that first met the seal broken ([`Seals::index_broken`]);
+    /// null otherwise. Freed when the group opens (the storage's index names the rows then)
+    /// or the storage goes.
+    overlay: AtomicPtr<Reverse>,
     /// A group it depends on is suspect, being checked or broken: a row of it is not proved
     /// by a walk's reach ([`Seals::reach_proves`]).
     shadow: AtomicBool,
@@ -260,7 +266,7 @@ impl Group {
             wild: [0; 2],
             edges: 0,
             indexed: true,
-            named: AtomicBool::new(false),
+            overlay: AtomicPtr::new(std::ptr::null_mut()),
             shadow: AtomicBool::new(false),
         }
     }
@@ -303,6 +309,19 @@ pub(crate) struct Seals {
     checks: AtomicU64,
     breaks: AtomicU64,
     opens: u64,
+}
+
+impl Drop for Seals {
+    fn drop(&mut self) {
+        for group in &mut self.groups {
+            let overlay = *group.overlay.get_mut();
+            if !overlay.is_null() {
+                // SAFETY: from `Box::into_raw` in `Seals::index_broken`; the storage is
+                // going, one owner.
+                drop(unsafe { Box::from_raw(overlay) });
+            }
+        }
+    }
 }
 
 impl Seals {
@@ -547,31 +566,107 @@ impl Seals {
         }
     }
 
-    /// The rows of every broken seal a walk has not named yet, with their `verified` words,
-    /// pushed onto `out`: those made and not up to date in this view. Each group once.
-    pub(crate) fn broken_rows(&self, storage: &Storage, out: &mut Vec<(u32, u32)>) {
-        let view = storage.view_bits();
+    /// Makes, for each broken seal that has none, the group's own reverse index from the
+    /// edges of the rows behind it, and returns those groups: called by the walk (one walker
+    /// at a time, its flight), so a group is indexed once. Costs the group's rows and their
+    /// edges, loads only: no row is verified or run.
+    pub(crate) fn index_broken(&self, storage: &Storage) -> Vec<u16> {
+        let mut indexed: Vec<u16> = Vec::new(); // alloc: the groups whose seal broke in this view, few
         for (number, group) in self.groups.iter().enumerate().skip(1) {
             if group.state.load(Ordering::Acquire) != BROKEN
-                || group.named.swap(true, Ordering::AcqRel)
+                || !group.overlay.load(Ordering::Acquire).is_null()
             {
                 continue;
             }
+            // Named: what a broken seal costs before any row of it is looked at (rule 16).
+            let span = tracing::info_span!(
+                target: "blaze",
+                "seal group index broken",
+                group = %group.name,
+                rows = group.members.len(),
+                edges = tracing::field::Empty,
+            );
+            let _entered = span.enter();
+            let mut reverse = Box::new(Reverse::default()); // alloc: a broken group's index, until it opens
+            let mut seen = Seen::with_hasher(blaze_hash::FixedState);
+            let mut edges: Vec<u32> = Vec::new(); // alloc: scratch of one row's edges
+            let mut read = 0u64;
             for &node in &group.members {
                 let word = self.word(node);
                 if word & SEALED == 0 || (word & GROUP) as usize != number {
                     continue;
                 }
                 let Some((header, _, _)) = frontier::row_of(storage, node) else { continue };
-                let verified = header.verified.load(Ordering::Acquire);
-                if verified & (VIEW_MASK | RUNNING | PROVISIONAL) == 0 {
-                    continue;
-                }
-                if verified & (RUNNING | PROVISIONAL) == 0 && verified & VIEW_MASK == view {
-                    continue;
-                }
-                out.push((node, verified)); // alloc: the walk's list, the rows of the groups that broke
+                storage.copy_edges(header.edges.load(Ordering::Acquire), &mut edges);
+                read += edges.len() as u64;
+                reverse.stored(node, &[], &edges, &mut seen);
             }
+            reverse.pack();
+            span.record("edges", read);
+            // Release: a walk that loads the pointer sees the index whole.
+            group.overlay.store(Box::into_raw(reverse), Ordering::Release);
+            indexed.push(number as u16); // alloc: as above
+        }
+        indexed
+    }
+
+    /// Gives `each` the rows behind a broken seal that read `dep`, from the groups' own
+    /// indexes ([`Seals::index_broken`]); returns how many. One load for a node that is
+    /// neither behind a seal nor imported by one.
+    pub(crate) fn readers_in_broken(&self, dep: u32, mut each: impl FnMut(u32)) -> u64 {
+        if self.unsettled.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
+        let word = self.word(dep);
+        let of = |group: &Group, each: &mut dyn FnMut(u32)| -> u64 { // dyn: one of two callers' closures, on a walk's cold path
+            if group.state.load(Ordering::Acquire) != BROKEN {
+                return 0;
+            }
+            let overlay = group.overlay.load(Ordering::Acquire);
+            if overlay.is_null() {
+                return 0;
+            }
+            // SAFETY: a non-null overlay is a live `Box<Reverse>` made by `index_broken` and
+            // freed only by `seal_open` or the storage's drop, both under `&mut`, which this
+            // borrow of the storage excludes; it is never written after it is published.
+            unsafe { &*overlay }.readers(dep, each)
+        };
+        let mut found = 0;
+        // A row behind a seal is read, inside its group, only by rows of that group.
+        if word & SEALED != 0 {
+            found += of(&self.groups[(word & GROUP) as usize], &mut each);
+        }
+        // And from outside, by the groups that import it.
+        if word & IMPORTED != 0 {
+            for (number, group) in self.groups.iter().enumerate().skip(1) {
+                if word & SEALED != 0 && number == (word & GROUP) as usize {
+                    continue;
+                }
+                found += of(group, &mut each);
+            }
+        }
+        found
+    }
+
+    /// Every row behind the seal of `group` that is made and not up to date in this view,
+    /// with its `verified` word, pushed onto `out`: what a walk named before 2026-11-12, kept
+    /// for the control that shows the difference ([`Plant::BrokenSealNamesEveryRow`]).
+    pub(crate) fn every_row_behind(&self, storage: &Storage, group: u16, out: &mut Vec<(u32, u32)>) {
+        let view = storage.view_bits();
+        for &node in &self.groups[group as usize].members {
+            let word = self.word(node);
+            if word & SEALED == 0 || word & GROUP != u32::from(group) {
+                continue;
+            }
+            let Some((header, _, _)) = frontier::row_of(storage, node) else { continue };
+            let verified = header.verified.load(Ordering::Acquire);
+            if verified & (VIEW_MASK | RUNNING | PROVISIONAL) == 0 {
+                continue;
+            }
+            if verified & (RUNNING | PROVISIONAL) == 0 && verified & VIEW_MASK == view {
+                continue;
+            }
+            out.push((node, verified)); // alloc: the control's list
         }
     }
 
@@ -682,6 +777,22 @@ impl SealCensus {
         self.groups.iter().map(|it| it.behind_seal).sum()
     }
 
+    /// The forward edges of the rows behind seals: 4 bytes each in the edge array, kept so
+    /// an opened group's rows verify with no run.
+    pub fn edges_behind_seals(&self) -> u64 {
+        self.groups.iter().filter(|it| it.state != SealState::Open).map(|it| it.edges).sum()
+    }
+
+    /// Of [`SealCensus::edges_behind_seals`], those of groups whose rows the reverse index
+    /// still names as readers (not yet made again without them): as many readers there.
+    pub fn edges_behind_seals_indexed(&self) -> u64 {
+        self.groups
+            .iter()
+            .filter(|it| it.state != SealState::Open && it.indexed)
+            .map(|it| it.edges)
+            .sum()
+    }
+
     /// Rows that are of some group.
     pub fn grouped_rows(&self) -> u64 {
         self.groups.iter().map(|it| it.rows).sum()
@@ -695,12 +806,15 @@ impl std::fmt::Display for SealCensus {
         writeln!(
             f,
             "seal groups: {} of {} sealed ({} waiting for a check, {} broken), {} rows behind \
-             seals of {} in groups, {} rows in no group; {} checks, {} seals broken, {} opened",
+             seals ({} forward edges kept, {} of them still in the reverse index) of {} in \
+             groups, {} rows in no group; {} checks, {} seals broken, {} opened",
             self.sealed_groups(),
             self.groups.len(),
             count(SealState::Suspect),
             count(SealState::Broken),
             self.rows_behind_seals(),
+            self.edges_behind_seals(),
+            self.edges_behind_seals_indexed(),
             self.grouped_rows(),
             self.ungrouped,
             self.checks,
@@ -983,7 +1097,12 @@ impl Storage {
         of.runs = Vec::new();
         of.wild = [0; 2];
         of.edges = 0;
-        *of.named.get_mut() = false;
+        let overlay = std::mem::replace(of.overlay.get_mut(), std::ptr::null_mut());
+        if !overlay.is_null() {
+            // SAFETY: from `Box::into_raw` in `Seals::index_broken`, taken out here under
+            // `&mut` of the storage: no walk reads it, and this is its one owner.
+            drop(unsafe { Box::from_raw(overlay) });
+        }
         if of.pending.is_empty() {
             of.pending = members;
         } else {
@@ -1541,6 +1660,59 @@ pub(crate) fn resolve_all(db: *const (), storage: &Storage, apart: &Seen) -> (u6
         seals.checks.load(Ordering::Relaxed) - before.0,
         seals.breaks.load(Ordering::Relaxed) - before.1,
     )
+}
+
+/// Gives `each` the rows behind the broken seal of `group` that read an import that moved:
+/// each import is brought up to date as the check does (the check stopped at the first that
+/// had moved), and the readers of each whose stamp passed the seal's view, or that the walk
+/// set apart, are given from the group's own index ([`Seals::index_broken`], which the
+/// caller ran). These, and no other row of the group, are what a walk verifies for the break;
+/// a row of them that changes passes the walk on to its own readers as any row does.
+///
+/// The invariant: a row behind the seal that this gives no reader path to holds its value.
+/// It changes only by running again for a read that changed; its reads are rows behind the
+/// same seal, the group's inputs (a write of one opens the group, it does not break it), and
+/// imports; so the first changed read on any path from it is an import that moved, whose
+/// readers are given here.
+///
+/// Cost: the group's imports (a stamp each, a verification where one is behind) and the rows
+/// given.
+pub(crate) fn moved_readers(
+    db: *const (),
+    storage: &Storage,
+    group: u16,
+    apart: &Seen,
+    mut each: impl FnMut(u32),
+) {
+    let seals = &storage.seals;
+    let of = &seals.groups[group as usize];
+    let view = storage.view_bits();
+    let overlay = of.overlay.load(Ordering::Acquire);
+    if overlay.is_null() {
+        return;
+    }
+    // SAFETY: as in `Seals::readers_in_broken`: live until a `&mut` of the storage.
+    let overlay = unsafe { &*overlay };
+    for &node in &of.imports {
+        let row = storage.node(node);
+        let mut seen = row.color();
+        let moved = if (seen >> 32) as u32 >= FIELD {
+            seen as u32 > of.sealed_at
+        } else if seals.proves(node) {
+            verify::function_header(storage, row)
+                .is_none_or(|header| header.changed.load(Ordering::Relaxed) > of.sealed_at)
+        } else if apart.contains(&node) {
+            true
+        } else {
+            if (seen >> 32) as u32 != view && up_to_date(db, storage, row) {
+                seen = row.color();
+            }
+            (seen >> 32) as u32 != view || seen as u32 > of.sealed_at
+        };
+        if moved {
+            overlay.readers(node, &mut each);
+        }
+    }
 }
 
 /// Whether no import of group `group` changed since it was sealed. A run of imports behind

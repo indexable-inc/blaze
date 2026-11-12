@@ -86,6 +86,12 @@
 
 use std::{alloc::Global, hash::Hash, sync::atomic::{AtomicU32, Ordering}};
 
+/// What blaze must hold again before the daemon's next release for memory is due
+/// (`blaze_graph::admission::Squeeze::mark`), as its last one left it: each build's squeeze
+/// starts from it ([`Release::new`]), so a release that freed little is not repeated by the
+/// next build at the same footprint. 0 until one ran.
+static SQUEEZED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The front end releases run since the daemon started, every build's: the build view's
 /// `releases` ([`crate::serve::job::doing::memory`]), a counter that only a release moves.
 pub(crate) static RELEASES: AtomicU32 = AtomicU32::new(0);
@@ -365,7 +371,10 @@ impl Release<Crate> {
     /// check.
     pub(crate) fn new(crates: &Crates, units: usize, compiles: bool) -> Release {
         let of = (0..units).map(|unit| crates.krate(unit)).collect(); // alloc: a crate a unit, once per build
-        Release::of(Finished::new(of), compiles)
+        let mut release = Release::of(Finished::new(of), compiles);
+        // From where this daemon's last release for memory left off ([`SQUEEZED_AT`]).
+        release.squeeze = Squeeze::starting_after(SQUEEZED_AT.load(Ordering::Relaxed));
+        release
     }
 
     /// Unit `unit` compiled: whether memory makes a release due is asked now, once a unit,
@@ -424,19 +433,11 @@ impl Release<Crate> {
         }
         if pressed {
             db.storage_mut().sweep_values(&Squeeze::caps(before));
-            // The walks codegen keeps for the next build's (each function's describe, each
-            // program's walk and lists) are a cache on the global heap under no budget: memory
-            // short takes them as it takes the values above. No walk is in flight (a walk reads
-            // the front end, which is exclusive here); the next begins with nothing kept and
-            // says so (`blaze_codegen::driver::Fresh::LetGo`).
-            let describes = hir_ty_codegen::v2::let_go_kept_walks();
-            span.record("kept_describes", describes);
-            if describes != 0 {
-                crate::serve::said::logged!(INFO,
-                    "blaze serve: front end release (memory): let go of the {describes} describes \
-                     codegen's walks kept for the next build's"
-                );
-            }
+            // The walks codegen keeps for the next build's are no longer let go here: they are
+            // the give-back's caches rung ([`give_kept_caches`], `blaze_graph::giveback`), asked
+            // in its order, measured, and only while no walk is in flight. Let go here, a
+            // release of a daemon at its line threw away 87,287 describes of a hello-world
+            // for 0.36 GiB, at every build (2026-11-12).
         }
         // The build is over: what neither it nor the build before it read of the front end's
         // evictable values goes, the results of revisions no edit since has asked for. Only
@@ -477,6 +478,7 @@ impl Release<Crate> {
         let after = Pressure::now();
         if pressed {
             self.squeeze.released(after);
+            SQUEEZED_AT.store(self.squeeze.mark(), Ordering::Relaxed);
         }
         span.record("bodies", dropped.bodies);
         span.record("inference", dropped.inference);

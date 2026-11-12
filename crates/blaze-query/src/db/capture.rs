@@ -16,8 +16,10 @@ use blaze_hash::FixedState;
 
 use super::{
     Database, DatabaseKeyIndex, Id, Storage,
+    function,
     ingredient::{self, Kind},
     local::{self, Capture, walk_capture},
+    row::{Header, PROVISIONAL, RUNNING, STORED, VIEW_MASK, span},
     storage::{Summary, key_parts, or},
 };
 
@@ -106,6 +108,142 @@ impl Reads {
         walk_capture(storage, self.capture, &mut spans, &mut walked, |node| {
             f(read_of_key(storage.key_of(node)))
         })
+    }
+}
+
+/// One read of [`Reads::for_each_read_through`].
+#[derive(Clone, Copy, Debug)]
+pub enum RowRead {
+    /// A read: one the capture made, or one of a row it was told to descend through.
+    Read(Read),
+    /// A row it was told to descend through whose last run was answered from a store by a
+    /// key ([`super::report_stored_read`]): its kept edges are that lookup's reads, not the
+    /// reads its value was first made from, so it is handed over whole and not descended.
+    /// The caller reads that record's own shape.
+    Stored(Read),
+}
+
+/// The header of the function row `read` names, when it is current in this view: verified
+/// in it, neither running nor provisional.
+///
+/// # Panics
+///
+/// When it is not, naming the row: its kept edges may be an older run's, or about to be
+/// replaced, and a list of them would be taken for what its value rests on now.
+fn current_row<'s>(storage: &'s Storage, read: &Read, why: &str) -> &'s Header {
+    let (index, id) = (read.key.ingredient_index(), read.key.key_index());
+    let current = function::header_of(storage, index, id).filter(|header| {
+        let word = header.verified.load(std::sync::atomic::Ordering::Acquire);
+        word & (RUNNING | PROVISIONAL) == 0 && word & VIEW_MASK == storage.view_bits()
+    });
+    match current {
+        Some(header) => header,
+        None => panic!(
+            "the kept reads of `{}`({id:?}) were asked for ({why}) and the row is not up to \
+             date in this view: fetch it first",
+            ingredient::name(index)
+        ),
+    }
+}
+
+impl Reads {
+    /// [`Reads::for_each_read`], but where `through` says so of a read of a function's row,
+    /// that row's own kept reads are given in its place (and so on through them), the row
+    /// itself not given: for a caller that wants what a value rests on below some rows it
+    /// names (a body's lowering below `Body::of`). Each node is given once, whichever way it
+    /// is reached.
+    ///
+    /// What holds of a row descended through:
+    /// - its reads are those of its last run, kept until it runs again: letting its value go
+    ///   (`evict`, an epoch's end, a budget's pass) keeps them;
+    /// - it must be current in this view (the caller fetched it in this view: such a row does
+    ///   not run again in the view, so its reads are not replaced under the walk, and the
+    ///   edge array moves only under `&mut`);
+    /// - one answered from a store is handed over as [`RowRead::Stored`], never descended.
+    ///
+    /// An interned read records no edge, so none is given, here or in a row descended.
+    ///
+    /// # Panics
+    ///
+    /// If `self` was captured in another view than `storage`'s, or a row `through` names is
+    /// not current in this view (naming it).
+    pub fn for_each_read_through<B>(
+        &self,
+        storage: &Storage,
+        through: impl Fn(&Read) -> bool,
+        mut each: impl FnMut(RowRead) -> ControlFlow<B>,
+    ) -> Option<B> {
+        self.check_view(storage);
+        // `each` may ask the database, so the walk's lists are its own, not the thread's.
+        let mut spans = Vec::new(); // alloc: a walk's open captures, once per read-out of a capture
+        let mut walked = hashbrown::HashSet::with_hasher(FixedState); // alloc: as above
+        let mut seen: hashbrown::HashSet<u32, FixedState> = hashbrown::HashSet::with_hasher(FixedState); // alloc: as above
+        let mut rows: Vec<(u64, u64)> = Vec::new(); // alloc: the rows being descended, a few
+        walk_capture(storage, self.capture, &mut spans, &mut walked, |node| {
+            // Depth first, in read order: the node itself, then (for a row descended through)
+            // its edges, each of which may be descended in turn. Bounded: a node is taken
+            // once (`seen`).
+            let mut next = Some(node);
+            loop {
+                let node = match next.take() {
+                    Some(node) => node,
+                    None => {
+                        let Some(top) = rows.last_mut() else { return ControlFlow::Continue(()) };
+                        if top.0 == top.1 {
+                            rows.pop();
+                            continue;
+                        }
+                        top.0 += 1;
+                        storage.edge(top.0 - 1)
+                    }
+                };
+                if !seen.insert(node) {
+                    continue;
+                }
+                let read = read_of_key(storage.key_of(node));
+                if read.kind != ReadKind::Function || !through(&read) {
+                    if let ControlFlow::Break(out) = each(RowRead::Read(read)) {
+                        rows.clear();
+                        return ControlFlow::Break(out);
+                    }
+                    continue;
+                }
+                let header = current_row(storage, &read, "to descend through it");
+                if header.meta.load(std::sync::atomic::Ordering::Relaxed) & STORED != 0 {
+                    if let ControlFlow::Break(out) = each(RowRead::Stored(read)) {
+                        rows.clear();
+                        return ControlFlow::Break(out);
+                    }
+                    continue;
+                }
+                let kept = header.edges.load(std::sync::atomic::Ordering::Acquire);
+                rows.push((span::start(kept), span::start(kept) + span::len(kept))); // alloc: as above
+            }
+        })
+    }
+}
+
+impl Storage {
+    /// The kept reads of the function row `row`, in read order: those of its last run.
+    /// [`Reads::for_each_read_through`] says what holds of them.
+    ///
+    /// # Panics
+    ///
+    /// When the row is not current in this view, naming it.
+    pub fn row_reads<B>(
+        &self,
+        row: DatabaseKeyIndex,
+        mut each: impl FnMut(Read) -> ControlFlow<B>,
+    ) -> Option<B> {
+        let read = Read { key: row, kind: ReadKind::Function };
+        let header = current_row(self, &read, "its own");
+        let kept = header.edges.load(std::sync::atomic::Ordering::Acquire);
+        for edge in span::start(kept)..span::start(kept) + span::len(kept) {
+            if let ControlFlow::Break(out) = each(read_of_key(self.key_of(self.edge(edge)))) {
+                return Some(out);
+            }
+        }
+        None
     }
 }
 

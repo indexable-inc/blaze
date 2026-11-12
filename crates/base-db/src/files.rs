@@ -121,6 +121,11 @@ pub struct Files {
     /// What each proc-macro expansion read besides its call, by the crate the call is in and
     /// where the reads come from: a later note from the same place replaces them.
     expansions_read: ReadLock<HashMap<(Crate, ReadBy), Box<[ExpansionRead]>, Global>>,
+    /// The files outside the VFS that a crate served from its records read when it was
+    /// resolved, with the content ID each has now, which the records were found by
+    /// ([`Files::included_are_served`]): no read of this database made them, so `included_by`
+    /// has no row of them. Sorted by path.
+    included_served: ReadLock<HashMap<Crate, Box<[(AbsPathBuf, ContentId)]>, Global>>,
     /// Every list of directories whose files are read from another directory that
     /// [`Files::set_view`] made, kept for readers that may hold one; `view` names the one in use.
     views: Log<Box<[View]>>,
@@ -142,8 +147,23 @@ pub struct Files {
 /// The invariant: for one set of directories, two byte strings are ported to the same bytes
 /// only when they are equal (`Roots::unport` gives a ported string back), so a ported key
 /// tells apart everything the unported one did but where the directories are.
+///
+/// A record's bytes are written the same way and read back against the reading database's
+/// directories ([`Port::placed`]); what a record still holds of a directory after that is
+/// found by [`Port::held`], the one searcher (`Roots::embedded`), so a record that names a
+/// place is refused by the name of the place and never given to another checkout or home.
 pub trait Port: Send + Sync + 'static {
     fn ported<'b>(&self, bytes: &'b [u8]) -> std::borrow::Cow<'b, [u8]>;
+
+    /// What `bytes`, written by [`Port::ported`] under some directories, are under this
+    /// database's: each directory's mark as its path here. An error naming the mark for
+    /// one of a directory this database has none of, or bytes that are no ported string.
+    fn placed<'b>(&self, bytes: &'b [u8]) -> Result<std::borrow::Cow<'b, [u8]>, String>;
+
+    /// The directory whose path `bytes` hold anywhere, in any spelling, by what it is
+    /// (`"workspace"`, `"fetched sources directory"`), the first found; `None` when they
+    /// hold none. Wider than what [`Port::ported`] replaces, never narrower.
+    fn held(&self, bytes: &[u8]) -> Option<&'static str>;
 }
 
 struct Included {
@@ -372,6 +392,7 @@ impl Default for Files {
             env_read: Table::new(1 << 22),
             env_unset: Table::new(1 << 22),
             expansions_read: ReadLock::new("db.files.expansions_read", Default::default()),
+            included_served: ReadLock::new("db.files.included_served", Default::default()),
             views: Log::new(1 << 16),
             view: AtomicU32::new(0),
             port: OnceLock::new(),
@@ -1078,8 +1099,41 @@ impl Files {
     /// The files outside the VFS that `krate` has read (with `include!`, `include_bytes!` or
     /// `include_str!`), with the content ID of what it read of each
     /// ([`IncludedFile::content`]: of its bytes, or of why it could not be read). Sorted by
-    /// path.
+    /// path. A crate served from its records in place of being resolved has read, for every
+    /// key made from this, the files its records were found by
+    /// ([`Files::included_are_served`]): they are here too, each path once (a crate served
+    /// and then resolved in one database reads the same input of a path).
     pub fn included_by(&self, db: &Db, krate: Crate) -> Vec<(AbsPathBuf, ContentId)> {
+        let mut read = self.included_read_by_reads(db, krate);
+        if let Some(served) = self.included_served.read().get(&krate) {
+            for (path, content) in served.iter() {
+                if !read.iter().any(|it| it.0 == *path) {
+                    read.push((path.clone(), *content)); // clone: the edge, a path each
+                }
+            }
+            read.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        read
+    }
+
+    /// Notes the files outside the VFS that `krate`, served from its records in place of
+    /// being resolved, was found by (`hir_def::deps::filed::search`), in place of those it
+    /// was served by before: none when it is not served by any, so a crate no longer served
+    /// leaves no file behind.
+    pub fn included_are_served(&self, krate: Crate, mut files: Vec<(AbsPathBuf, ContentId)>) {
+        if files.is_empty() {
+            // Most crates include nothing outside the VFS: no write lock for them.
+            if self.included_served.read().contains_key(&krate) {
+                self.included_served.write().remove(&krate);
+            }
+            return;
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        self.included_served.write().insert(krate, files.into_boxed_slice());
+    }
+
+    /// [`Files::included_by`] for the reads this database made itself.
+    fn included_read_by_reads(&self, db: &Db, krate: Crate) -> Vec<(AbsPathBuf, ContentId)> {
         let mut read: Vec<_> = self
             .included_by
             .iter()
@@ -1162,6 +1216,21 @@ impl Files {
             Some(port) => port.ported(bytes),
             None => std::borrow::Cow::Borrowed(bytes),
         }
+    }
+
+    /// What `bytes`, written by [`Files::ported`] in some database, are in this one
+    /// ([`Port::placed`]): as they are while no port is told, as `ported` left them so.
+    pub fn placed<'b>(&self, bytes: &'b [u8]) -> Result<std::borrow::Cow<'b, [u8]>, String> {
+        match self.port.get() {
+            Some(port) => port.placed(bytes),
+            None => Ok(std::borrow::Cow::Borrowed(bytes)),
+        }
+    }
+
+    /// The directory of this database's port whose path `bytes` still hold ([`Port::held`]):
+    /// none while no port is told, since such a database names no directory.
+    pub fn held(&self, bytes: &[u8]) -> Option<&'static str> {
+        self.port.get().and_then(|port| port.held(bytes))
     }
 
     /// Sorted.

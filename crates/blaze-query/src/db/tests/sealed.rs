@@ -435,6 +435,57 @@ fn a_groups_imports_are_what_its_rows_read_from_outside_it_open_or_sealed() {
     assert_eq!(shop.db.storage_mut().seal_group_whole(lib), Ok(()));
 }
 
+/// A crate with two interface rows, each of an input of its own, and a dependent of `rows`
+/// rows, `readers` of which read the first interface and the rest the second. All sealed; the
+/// first interface's input is written, which breaks the dependent's seal. Returns the rows the
+/// walk verified, the rows it set apart unverified, and the dependent's rows it named.
+fn one_part_read_by_some(rows: usize, readers: usize, plant: Plant) -> (u64, u64, usize) {
+    let mut shop = Shop::new(plant);
+    let app = shop.group("app", &[]);
+    let dep = shop.group("dep", &[app]);
+    let (one, two, of_dep) =
+        (shop.input(1, Some(app)), shop.input(2, Some(app)), shop.input(3, Some(dep)));
+    let interface_one = shop.row(sum(&[Dep::Input(one)]));
+    let interface_two = shop.row(sum(&[Dep::Input(two)]));
+    let first = shop.flow.len();
+    for at in 0..rows {
+        let read = if at < readers { interface_one } else { interface_two };
+        shop.row(sum(&[Dep::Query(read), Dep::Input(of_dep)]));
+    }
+    shop.pull_all().unwrap();
+    assert_eq!(shop.seal().sealed, 2);
+    let since = shop.db.storage().view();
+    shop.write(one, 7);
+    let (named, work) = shop.ask(since);
+    assert_eq!(shop.state(dep), SealState::Broken);
+    assert_eq!(work.groups_broken, 1, "{work:?}");
+    shop.pull_all().unwrap();
+    (work.visited, work.marked, named.iter().filter(|&&row| row >= first).count())
+}
+
+/// The invariant (rule granular-caching): a seal is the quick first check, never the grain of
+/// what is redone. When a part of a dependency moves, the walk verifies the dependent's rows
+/// that read that part and no other row of the dependent: 3 of 100 and 3 of 2,000 (and the
+/// one row of the edited crate), none set apart unverified, and exactly those 3 named.
+#[test]
+fn a_broken_seal_re_verifies_only_the_rows_that_read_what_moved() {
+    let small = one_part_read_by_some(100, 3, Plant::None);
+    let large = one_part_read_by_some(2000, 3, Plant::None);
+    assert_eq!(small, (4, 0, 3));
+    assert_eq!(large, small, "what a broken seal redoes grew with its group");
+}
+
+/// The control of [`a_broken_seal_re_verifies_only_the_rows_that_read_what_moved`]: a walk
+/// that names every row of a group whose seal broke sets the whole group apart, 100 rows and
+/// 2,000, and names them all.
+#[test]
+fn the_oracle_catches_a_broken_seal_that_redoes_its_whole_group() {
+    let small = one_part_read_by_some(100, 3, Plant::BrokenSealNamesEveryRow);
+    let large = one_part_read_by_some(2000, 3, Plant::BrokenSealNamesEveryRow);
+    assert_eq!((small.1, small.2), (100, 100), "{small:?}");
+    assert_eq!((large.1, large.2), (2000, 2000), "{large:?}");
+}
+
 /// The quiet rule ([`SealKind::Local`]): a local crate is sealed by the pass that ends the
 /// second build in a row with no write to its inputs, and a write starts the count again.
 #[test]

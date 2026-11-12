@@ -109,6 +109,39 @@ fn resolution(id: blaze_query::db::Id) -> CrateResolution {
     <CrateResolution as blaze_query::db::FromId>::from_id(id)
 }
 
+/// What a read of one of this file's rows was of (`crate::nameres::name_read`): `name` is the
+/// row's name as the engine has it, `key` its key.
+pub(in crate::nameres) fn name_read(
+    db: &Db,
+    name: &str,
+    kind: blaze_query::db::ReadKind,
+    key: blaze_query::db::Id,
+) -> Option<crate::nameres::NameRead> {
+    use crate::nameres::NameRead;
+    use blaze_query::db::ReadKind;
+    Some(match (name, kind) {
+        ("ScopeInput::name", ReadKind::Function) => {
+            let (input, name) = ScopeInput_name::arguments(db, key)?;
+            NameRead::Name(input.module(db), name)
+        }
+        ("ScopeInput::legacy_macro", ReadKind::Function) => {
+            let (input, name) = ScopeInput_legacy_macro::arguments(db, key)?;
+            NameRead::Name(input.module(db), name)
+        }
+        ("ScopeInput::traits", ReadKind::Function) => {
+            NameRead::Traits(scope_input(key).module(db))
+        }
+        ("scope", ReadKind::InputField(_)) => NameRead::WholeScope(scope_input(key).module(db)),
+        ("children", ReadKind::InputField(_)) => NameRead::Children(scope_input(key).module(db)),
+        // Which module a scope is of, and a module's row (its origin, visibility, parent and
+        // the id of its scope): what a name means is read through the scope's own rows.
+        ("module", ReadKind::InputField(_)) | ("CrateResolution::module", ReadKind::Function) => {
+            NameRead::Handle
+        }
+        _ => return None,
+    })
+}
+
 // What `nameres.rs` reads.
 
 pub(in crate::nameres) fn input_scope(db: &Db, id: blaze_query::db::Id) -> &ItemScope {

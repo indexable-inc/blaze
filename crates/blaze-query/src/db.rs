@@ -41,7 +41,8 @@ mod value;
 mod verify;
 
 pub use capture::{
-    Read, ReadKind, Reads, capture_reads, for_span_text, replay_reads, unshareable_reads,
+    Read, ReadKind, Reads, RowRead, capture_reads, for_span_text, replay_reads,
+    unshareable_reads,
 };
 pub use blaze_graph::par::{SMALL_ITEMS, SMALL_NS, Small};
 pub use census::{Blocker as DurabilityBlocker, Census as DurabilityCensus};

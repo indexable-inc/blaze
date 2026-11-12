@@ -64,7 +64,7 @@ use super::{
     function::{self, Function, Verified},
     ingredient::{self, Kind},
     local,
-    reverse::{ASSUMED, ChangedIn, Plan, Reverse, Seen},
+    reverse::{ASSUMED, ChangedIn, Plan, Readers, Reverse, Seen},
     row::{Header, PROVISIONAL, RUNNING, UNTRACKED, VALUE, VIEW_MASK, span},
     storage::{Database, FIELD, Storage, View, key_parts},
 };
@@ -314,6 +314,11 @@ pub(crate) enum Plant {
     /// taken out): the claim is not made again after the write, and the group's rows are
     /// taken as unchanged with no import looked at.
     ClaimKeptAcrossUnwind,
+    /// A walk that finds a seal broken names every row of the group as changed and sets it
+    /// apart, as it did until 2026-11-12, where it hands out only the rows that read what
+    /// moved ([`super::seal::Seals::moved_readers`]): the grain of what is redone is the
+    /// crate.
+    BrokenSealNamesEveryRow,
     /// A task that finds a group being checked claims it too ([`super::seal::resolve`]'s
     /// compare-and-swap from suspect taken out): two checks of one group run at once.
     SecondClaimAdmitted,
@@ -879,6 +884,20 @@ fn bring_to_date(db: *const (), storage: &Storage) {
     }
 }
 
+/// What a walk asks for the readers of a node: the reverse index, and beside it the rows of
+/// the seals found broken in this view, which the index does not name until the next write
+/// opens their groups ([`super::seal::Seals::readers_in_broken`]).
+struct Indexes<'a> {
+    storage: &'a Storage,
+}
+
+impl Readers for Indexes<'_> {
+    fn readers(&self, dep: u32, mut each: impl FnMut(u32)) -> u64 {
+        self.storage.frontier.reverse.readers(dep, &mut each)
+            + self.storage.seals.readers_in_broken(dep, &mut each)
+    }
+}
+
 /// The walker's vectors, taken out of [`Walked`] and put back when it ends or unwinds: a walk
 /// that unwinds (a write pending) leaves what was written in place, and the next walk starts
 /// from it again.
@@ -1082,7 +1101,7 @@ fn walk(db: *const (), storage: &Storage) {
             changed.clear();
         }
         plan.suspects(
-            &frontier.reverse,
+            &Indexes { storage },
             &mut changed,
             &mut suspects,
             |reader| verified_in(storage, reader),
@@ -1102,17 +1121,33 @@ fn walk(db: *const (), storage: &Storage) {
                 };
                 work.groups_checked += checked;
                 work.groups_broken += broken;
-                let mut rows: Vec<(u32, u32)> = Vec::new(); // alloc: the rows of the groups that broke
-                storage.seals.broken_rows(storage, &mut rows);
-                for (node, word) in rows {
-                    changed.push((node, ASSUMED));
-                    found.push(node);
-                    if apart_now.insert(node) {
-                        unwound.push((node, word)); // alloc: as above
+                // A seal that broke is the quick check that failed, never the grain of what
+                // is redone: the group's rows are indexed (its own edges, no row verified),
+                // and only the rows that read an import that moved are handed out, to be
+                // verified as any suspect; their readers follow as any row's.
+                for group in storage.seals.index_broken(storage) {
+                    if plant == Plant::BrokenSealNamesEveryRow {
+                        let mut rows: Vec<(u32, u32)> = Vec::new(); // alloc: the control's list, every row of the group
+                        storage.seals.every_row_behind(storage, group, &mut rows);
+                        for (node, word) in rows {
+                            changed.push((node, ASSUMED));
+                            found.push(node);
+                            if apart_now.insert(node) {
+                                unwound.push((node, word)); // alloc: as above
+                            }
+                            work.marked += 1;
+                        }
+                        continue;
                     }
-                    work.marked += 1;
+                    super::seal::moved_readers(db, storage, group, &apart_now, |reader| {
+                        if plan.ask(reader) {
+                            suspects.push(reader); // alloc: a walk's list, the rows it reaches
+                        }
+                    });
                 }
-                if !changed.is_empty()
+                suspects.sort_unstable();
+                if !suspects.is_empty()
+                    || !changed.is_empty()
                     || (!frontier.changed.is_empty() && plant != Plant::StopsAtChangedReader)
                 {
                     continue;
@@ -1468,7 +1503,7 @@ fn reach(storage: &Storage, changed: &[ChangedIn], untracked: &[u32], work: &mut
     let mut next: Vec<u32> = Vec::new(); // alloc: as above
     let mut edges = 0u64;
     for &(node, since) in changed {
-        edges += frontier.reverse.readers(node, |reader| {
+        edges += Indexes { storage }.readers(node, |reader| {
             if !sealed(reader)
                 && (since == ASSUMED || verified_in(storage, reader) < since)
                 && reached.insert(reader)
@@ -1491,7 +1526,7 @@ fn reach(storage: &Storage, changed: &[ChangedIn], untracked: &[u32], work: &mut
             over = true;
             break;
         }
-        edges += frontier.reverse.readers(node, |reader| {
+        edges += Indexes { storage }.readers(node, |reader| {
             if !sealed(reader) && reached.insert(reader) {
                 next.push(reader); // alloc: as above
             }
