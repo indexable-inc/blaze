@@ -438,6 +438,11 @@ impl Release<Crate> {
             // for a write of one file, 1.9 million memos verified, 2026-11-12). Here, after
             // the answer, each costs a load a reader and runs nothing.
             db.storage_mut().settle_changed_set();
+            // Then the seal pass, one a build: each crate's group that has been quiet long
+            // enough is sealed (a library's at once, a workspace crate's after two builds
+            // that wrote nothing of it), so the next edit costs its own crate
+            // (`Storage::seal_quiet_groups`). Its span, `seal groups`, says what it did.
+            db.storage_mut().seal_quiet_groups();
         }
         // Asked for by name (a diagnostic, a walk of every row): which rows are of which kind
         // and the fields that hold a library's rows below `HIGH`, into the daemon's log.

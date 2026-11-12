@@ -215,12 +215,8 @@ pub fn input_written_since<I: Input>(storage: &Storage, id: Id, since: View) -> 
 /// Says every field of input `id` is an input of seal group `group` ([`super::seal`]): a write
 /// of one opens that group and no other, found from the field with no walk of rows. For the
 /// host that makes the input, before a query reads it (a row that read it before stays as it
-/// was: of no group, verified row by row).
-///
-/// # Panics
-///
-/// When a field is already an input of another group, naming both: an input has one group
-/// for the storage's life.
+/// was: of no group, verified row by row). An input of another group moves: it is removed
+/// from that group and added to this one (`Storage::seal_input`).
 pub fn input_seal_group<I: Input>(storage: &mut Storage, id: Id, group: SealGroup) {
     let first = row::<I>(storage, id).first.load(Ordering::Relaxed);
     for field in 0..I::FIELDS.max(1) {

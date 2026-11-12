@@ -26,7 +26,7 @@ use blaze_format::cursor::Put;
 use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_mem::{Frame, Tag, frame, scratch};
-use blaze_query::db::{Durability, Setter};
+use blaze_query::db::{Database as _, Durability, SealGroup, SealKind, Setter};
 use smallvec::SmallVec;
 use std::alloc::Global;
 use triomphe::Arc;
@@ -222,6 +222,9 @@ struct View {
 /// What the setters keep beside the inputs, read and written only with [`Files::writer`] held.
 #[derive(Default)]
 pub(crate) struct Writer {
+    /// The seal group of each source root that has one ([`Files::seal_root`]): the group its
+    /// file set, its files' texts and their roots are inputs of.
+    pub(crate) seal_roots: HashMap<SourceRootId, SealGroup, Global>,
     /// The inputs of files that had text and lost it (bytes that are not UTF-8), kept so that
     /// what read them reruns if they get text again.
     pub(crate) parked: HashMap<FileId, FileText, Global>,
@@ -764,6 +767,8 @@ impl Files {
                 let input =
                     FileText::new(&*db, durability, text, file_id, InputId(content), reparse);
                 self.text.set(raw, Some(input));
+                // A new text is of its file's root's seal group, when the root is known.
+                self.seal_file(writer, db, file_id);
             }
         }
         content
@@ -1324,6 +1329,47 @@ impl Files {
         }
     }
 
+    /// The seal group of source root `root` (`blaze_query::db::seal`), made the first time
+    /// it is asked for once the root's kind is known: a library root's is sealed at once, a
+    /// local root's after two builds that wrote nothing of it. `None` for a root not yet set
+    /// ([`Files::set_source_root_with_durability`] asks again).
+    ///
+    /// What is an input of it: the root's file set and content, and the text and the root of
+    /// each file whose root it is. A crate made of the root opens with it
+    /// (`Storage::seal_group_opens_with`, where the crate is made), so an edit of a file opens
+    /// the root's group and those crates, and no other.
+    pub(crate) fn seal_root(
+        &self,
+        writer: &mut Writer,
+        db: &mut Db,
+        root: SourceRootId,
+    ) -> Option<SealGroup> {
+        if let Some(&group) = writer.seal_roots.get(&root) {
+            return Some(group);
+        }
+        let kind = match writer.root_contents.get(&root)?.is_library {
+            true => SealKind::Library,
+            false => SealKind::Local,
+        };
+        let name = format!("source root {}", root.0); // alloc: a group's name, once a root
+        let group = db.storage_mut().seal_group(&name, kind, &[]);
+        writer.seal_roots.insert(root, group);
+        Some(group)
+    }
+
+    /// Gives `file`'s text and its root input to the seal group of the root the file is in,
+    /// when that root has one. A file whose root changed moves: removed from the old root's
+    /// group and added to the new one's (`Storage::seal_input`).
+    pub(crate) fn seal_file(&self, writer: &mut Writer, db: &mut Db, file: FileId) {
+        let Some(file_root) = self.file_source_roots.get(file.index()) else { return };
+        let root = file_root.source_root_id(&*db);
+        let Some(group) = self.seal_root(writer, db, root) else { return };
+        file_root.seal_group(db, group);
+        if let Some(text) = self.text.get(file.index()) {
+            text.seal_group(db, group);
+        }
+    }
+
     pub(crate) fn has_source_root(&self, id: SourceRootId) -> bool {
         self.source_roots.get(id.0).is_some() || self.source_of(id.0).is_some()
     }
@@ -1341,6 +1387,8 @@ impl Files {
                 self.refuse_crate_attr(&writer, file);
             }
             keep_aliases(&writer, &mut source_root);
+            // The root's files, for its seal group below.
+            let sealed: SmallVec<[FileId; 16]> = source_root.iter().collect();
             let index = self.index_root(&mut writer, &*db, source_root_id, &source_root, frame);
             let is_library = index.is_library;
             writer.root_contents.insert(source_root_id, index);
@@ -1359,6 +1407,15 @@ impl Files {
                         .content_durability(content_durability)
                         .new(&*db);
                     self.source_roots.set(source_root_id.0, Some(input));
+                }
+            }
+            // The root's seal group: its file set, and each file of it whose root it is.
+            if let Some(group) = self.seal_root(&mut writer, db, source_root_id) {
+                if let Some(input) = self.source_roots.get(source_root_id.0) {
+                    input.seal_group(db, group);
+                }
+                for &file in &sealed {
+                    self.seal_file(&mut writer, db, file);
                 }
             }
             let mut orphans: SmallVec<[FileId; 4]> = SmallVec::new();
@@ -1411,7 +1468,7 @@ impl Files {
     /// [`Files::set_file_source_root_with_durability`] with the writer's lock held.
     pub(crate) fn set_file_source_root_in(
         &self,
-        _: &mut Writer,
+        writer: &mut Writer,
         db: &mut Db,
         id: FileId,
         source_root_id: SourceRootId,
@@ -1426,6 +1483,9 @@ impl Files {
                 self.file_source_roots.set(id.index(), Some(input));
             }
         }
+        // The file's inputs are of its root's seal group: on a move, out of the old root's
+        // and into the new one's.
+        self.seal_file(writer, db, id);
     }
 
     /// Whether anything has `id`: a file ID [`Files::set_view_root`] may not give a new path.

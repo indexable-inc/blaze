@@ -17,7 +17,7 @@ use blaze_hash::{FixedState, HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher, radix};
 use blaze_lint_defs::LintOptions;
 use blaze_mem::Frame;
-use blaze_query::db::{Durability, Setter};
+use blaze_query::db::{Database as _, Durability, SealGroup, SealKind, Setter};
 use cfg::{CfgOptions, HashableCfgOptions};
 use intern::Symbol;
 use la_arena::{Arena, Idx, RawIdx};
@@ -959,6 +959,8 @@ impl Crate {
             db.crates_map().lock().note(krate, root, true);
             // Not in the graph yet, so this moves no graph content and notes nothing of it.
             db.set_crate_attr_files(krate, false, Some(durability));
+            let map = db.crates_map();
+            seal_crate(db, &mut map.lock(), krate);
             db.note(match added {
                 true => Note::CrateAdded(krate),
                 false => Note::Crates,
@@ -971,6 +973,7 @@ impl Crate {
         db.write_crates("Crate::set_data", |db| {
             self.set_data_field(db).to(data);
             db.set_crate_attr_files(self, false, None);
+            seal_crate_depends(db, self);
             refresh_contents(db, self);
         })
     }
@@ -1455,6 +1458,8 @@ impl CratesMap {
 
 #[derive(Debug, Default)]
 struct Crates {
+    /// Each crate's seal group ([`seal_crate`]).
+    seal: HashMap<Crate, SealGroup, Global>,
     by_data: HashMap<UniqueCrateData, Crate, Global>,
     /// For each crate whose content ID base-db made, when and from which root path: what lets
     /// [`CrateGraphBuilder::set_in_db`] keep the ID of a crate whose fields are what they were
@@ -1654,9 +1659,62 @@ impl Walk<'_, '_> {
             krate.env.clone(),
             InputId(content),
         );
+        seal_crate(db, &mut *self.crates, input);
         let changed = self.crates.note(input, root, true);
         (input, changed)
     }
+}
+
+/// Makes `krate`'s seal group (`blaze_query::db::seal`) as the crate is made: the crate's own
+/// fields are its inputs; it depends on its dependencies' groups and on its source root's,
+/// and it opens with its source root's, so an edit of one of its files opens it at the write.
+/// A workspace member's group is sealed after two builds that wrote nothing of it, any other
+/// crate's at once (`SealKind`).
+///
+/// A crate whose dependencies are set again later keeps the group, with the new ones added
+/// ([`seal_crate_depends`]).
+fn seal_crate(db: &mut Db, crates: &mut Crates, krate: Crate) {
+    let data = krate.data(&*db);
+    let kind = match data.origin.is_local() {
+        true => SealKind::Local,
+        false => SealKind::Library,
+    };
+    let root_file = data.root_file_id;
+    let deps: Vec<SealGroup> = // alloc: a crate's dependencies' groups, once a crate
+        data.dependencies.iter().filter_map(|dep| crates.seal.get(&dep.crate_id).copied()).collect();
+    let name = match krate.rust_name(&*db) {
+        Ok(name) => name.as_str().to_owned(), // alloc: a group's name, once a crate
+        Err(_) => String::from("a crate with no name"), // alloc: as above
+    };
+    let files = db.shared_files();
+    let root = {
+        let mut writer = files.lock();
+        let root = files.file_source_root(&*db, root_file).source_root_id(&*db);
+        files.seal_root(&mut writer, db, root)
+    };
+    let storage = db.storage_mut();
+    let group = storage.seal_group(&name, kind, &deps);
+    if let Some(root) = root {
+        storage.seal_group_opens_with(root, group);
+    }
+    krate.seal_group(db, group);
+    crates.seal.insert(krate, group);
+}
+
+/// Adds the groups of `krate`'s dependencies, as its data names them now, to what its seal
+/// group depends on: after its data was set again.
+fn seal_crate_depends(db: &mut Db, krate: Crate) {
+    let map = db.crates_map();
+    let crates = map.lock();
+    let Some(&group) = crates.seal.get(&krate) else { return };
+    let deps: Vec<SealGroup> = krate // alloc: a crate's dependencies' groups, at a change of them
+        .data(&*db)
+        .dependencies
+        .iter()
+        .filter_map(|dep| crates.seal.get(&dep.crate_id).copied())
+        .collect();
+    drop(crates);
+    db.storage_mut().seal_group_depends(group, &deps);
 }
 
 /// The kind of a crate's inputs when a [`CrateGraphBuilder`] makes it: `HIGH` for a library's

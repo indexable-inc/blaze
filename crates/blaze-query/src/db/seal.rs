@@ -804,20 +804,43 @@ impl Storage {
     }
 
     /// Field node `node` (of input `name`) is an input of `group`.
+    ///
+    /// A field that is an input of another group moves: a removal from that group and an
+    /// addition to this one. The rows that read it were placed, and proved, as rows that read
+    /// an input of the old group, so the move makes the field loose first: the old group is
+    /// opened, the bit is a gain that reaches every row that reads the field at any depth
+    /// and opens every sealed group in the way ([`Storage::complete_summaries`], run here),
+    /// and from then on those rows are covered by their summaries, as readers of an input of
+    /// no group are. Only then is the field given its new group, for the rows that read it
+    /// from here on. The cost is the old group's rows and the field's readers; a move is a
+    /// file changing its source root, not an edit.
     pub(crate) fn seal_input(&mut self, node: u32, group: SealGroup, name: &str) {
         let at = self.seal_number(group) as u32;
         let old = self.seals.word(node);
         if old & INPUT != 0 {
-            if old & GROUP == at {
+            let from = old & GROUP;
+            if from == at {
                 return;
             }
-            panic!(
-                "a field of `{name}` is an input of seal group `{}` and was given to `{}`: an \
-                 input has one group for its storage's life",
-                self.seals.groups[(old & GROUP) as usize].name,
-                self.seals.groups[at as usize].name
+            if self.frontier.plant == Plant::InputMovesWithoutRemoval {
+                self.seals.set_word(node, at | INPUT | (old & IMPORTED));
+                return;
+            }
+            tracing::info!(
+                target: "blaze",
+                input = name,
+                from = %self.seals.groups[from as usize].name,
+                to = %self.seals.groups[at as usize].name,
+                "an input moved to another seal group: removed from the one, added to the other"
             );
+            self.seals.groups[from as usize].written = true;
+            self.seals.groups[at as usize].written = true;
+            self.seal_open(from as u16, "an input of it moved to another group");
+            self.fold_reverse();
+            self.grow_summary(node, LOOSE);
+            self.complete_summaries();
         }
+        let old = self.seals.word(node);
         self.seals.set_word(node, at | INPUT | (old & IMPORTED));
         // Its group covers it now: a row that reads it from here on is not loose by it. A
         // row that read it before keeps the bit, and is verified as before.

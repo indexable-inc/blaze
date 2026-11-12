@@ -305,6 +305,10 @@ pub(crate) enum Plant {
     /// ([`Plan::suspects`]'s `sealed` taken out): a walk enters the sealed groups above an
     /// edit.
     WalkEntersSealedGroups,
+    /// An input given to another seal group is only given its new group
+    /// ([`Storage::seal_input`]'s removal taken out): the rows that read it stay behind the
+    /// old group's seal, which no write of the input reaches any more.
+    InputMovesWithoutRemoval,
 }
 
 /// The storage's part of the changed set.
@@ -1082,8 +1086,7 @@ fn walk(db: *const (), storage: &Storage) {
             // apart and named, as past a wide level, and their readers are asked in turn.
             if storage.seals.unsettled() {
                 let (checked, broken) = {
-                    let apart = |node: u32| apart_now.contains(&node);
-                    super::seal::resolve_all(db, storage, &apart)
+                    super::seal::resolve_all(db, storage, &apart_now)
                 };
                 work.groups_checked += checked;
                 work.groups_broken += broken;

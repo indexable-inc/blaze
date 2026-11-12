@@ -427,6 +427,51 @@ fn a_local_group_is_sealed_after_two_quiet_builds() {
     shop.pull_all().unwrap();
 }
 
+/// Two crates that do not depend on each other and a third over the first; the first has an
+/// input and a row of it, the third a row over that row. All sealed. The input is given to the
+/// second crate's group (a file that moves to another source root), everything is sealed
+/// again, and the input is written. Returns what the oracle says of every row then, and the
+/// groups opened by the move.
+fn an_input_moved_then_written(plant: Plant) -> (Result<(), String>, u64) {
+    let mut shop = Shop::new(plant);
+    let (from, to) = (shop.group("from", &[]), shop.group("to", &[]));
+    let over = shop.group("over", &[from]);
+    let (moved, of_to, of_over) =
+        (shop.input(1, Some(from)), shop.input(2, Some(to)), shop.input(3, Some(over)));
+    let row = shop.row(sum(&[Dep::Input(moved)]));
+    shop.row(sum(&[Dep::Input(of_to)]));
+    shop.row(sum(&[Dep::Query(row), Dep::Input(of_over)]));
+    shop.pull_all().unwrap();
+    assert_eq!(shop.seal().sealed, 3);
+    input_seal_group::<Cells>(shop.db.storage_mut(), shop.cells[moved].0, to);
+    let opened = shop.db.storage().seal_opens();
+    shop.pull_all().unwrap();
+    shop.seal();
+    shop.write(moved, 9);
+    (shop.pull_all(), opened)
+}
+
+/// The invariant: an input that moves to another group is removed from the one and added to
+/// the other. The move opens the group it leaves and the group above that read it through a
+/// row (two groups, and not the group it joins); after everything is sealed again, a write of
+/// the input, which now opens the group it joined, still reaches the rows that read it before
+/// the move, and every row answers as from scratch.
+#[test]
+fn an_input_that_moves_groups_is_removed_from_one_and_added_to_the_other() {
+    assert_eq!(an_input_moved_then_written(Plant::None), (Ok(()), 2));
+}
+
+/// The control of [`an_input_that_moves_groups_is_removed_from_one_and_added_to_the_other`]:
+/// an input only given its new group leaves its old readers behind a seal no write of it
+/// reaches, and the oracle sees their old values.
+#[test]
+fn the_oracle_catches_an_input_regrouped_with_no_removal() {
+    let (said, opened) = an_input_moved_then_written(Plant::InputMovesWithoutRemoval);
+    assert_eq!(opened, 0);
+    let why = said.expect_err("the oracle missed rows left behind the old group's seal");
+    assert!(why.contains("from scratch"), "{why}");
+}
+
 #[derive(Clone, Debug)]
 enum Step {
     Write(usize, u64),
