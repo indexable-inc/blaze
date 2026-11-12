@@ -6446,7 +6446,11 @@ impl Store {
                 if commit.failed.is_none() && last {
                     let tag = self.tags.ask(sync_op(Op::Sync { pack: *pack }, waited));
                     // clone: the effect owns its file name; once per pack a commit
-                    effects.push(Effect::Sync { file: own.packs[*pack].file.clone(), tag }); // durable: the store's commit: a pack's appended bytes are on disk before the head names them
+                    // Ordered before the head, which is all the head needs of them: the head's
+                    // own write is the commit's one wait for the drive, and its flush takes
+                    // these bytes with it (`Effect::Barrier`). A sync here was a second and a
+                    // third flush of the drive's cache a commit, for the same guarantee.
+                    effects.push(Effect::Barrier { file: own.packs[*pack].file.clone(), tag });
                     commit.steps += usize::from(waited);
                     if !waited {
                         // The planted commit waits for no sync: its checks follow the write.
@@ -6465,7 +6469,7 @@ impl Store {
             // short, goes first), written, synced. In a chain behind the pack rather than beside
             // it, so the store model's search over a commit's orders stays within its bound
             // (docs/v2/plan/design/store-pool.md, lane 4b).
-            (Op::Sync { pack }, Done::Synced) => {
+            (Op::Sync { pack }, Done::Ordered) => {
                 if commit.failed.is_none() {
                     let tag = self.tags.ask(Op::TruncateChecks { pack: *pack });
                     effects.push(Effect::Truncate {
@@ -6495,12 +6499,12 @@ impl Store {
                 if commit.failed.is_none() {
                     let tag = self.tags.ask(sync_op(Op::SyncChecks { pack: *pack }, waited));
                     let file = own.file(&disk::checks_file(*pack));
-                    // durable: the store's commit: a pack's checks are on disk before the head names its new length
-                    effects.push(Effect::Sync { file, tag });
+                    // Ordered before the head, as the pack's bytes are.
+                    effects.push(Effect::Barrier { file, tag });
                     commit.steps += usize::from(waited);
                 }
             }
-            (Op::SyncChecks { .. }, Done::Synced)
+            (Op::SyncChecks { .. }, Done::Ordered)
             | (Op::WriteExternal { .. } | Op::WriteIndex, Done::Written) => {}
             (Op::WriteHead, Done::Written) => return self.finish_commit(effects),
             (op, done) => {

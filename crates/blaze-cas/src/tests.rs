@@ -1898,7 +1898,7 @@ fn a_crash_at_any_point_loses_nothing_durable_and_serves_nothing_torn() {
 fn the_oracle_catches_a_put_reported_durable_that_no_sync_made_so() {
     let (seed, why) = block_checks::head_before_syncs_caught();
     assert!(
-        why.contains("did not open") && why.contains("its head names"),
+        why.contains("did not open") && block_checks::names_what_is_not_there(&why),
         "seed {seed}: caught, but not as a head naming what is not durable: {why}"
     );
 }
