@@ -1403,10 +1403,19 @@ fn own_expanders(db: &Db, pm: Crate, names: &[&str]) -> Vec<bool> {
 /// A proc-macro crate with a macro its root file declares (`plain`) and one an attribute
 /// macro's expansion declares (`sol`), with no macros given yet; and the two given.
 fn under_an_attribute() -> (Loaded, Crate, Vec<hir_expand::proc_macro::ProcMacro>) {
+    under_an_attribute_with("#[proc_macro]\npub fn plain(input: TokenStream) -> TokenStream { input }\n")
+}
+
+/// [`under_an_attribute`] with `before` written ahead of `sol` in the root file: `plain`, or
+/// nothing, where the root's round-0 log holds no macro's expander and so does not change
+/// when the crate is given its macros.
+fn under_an_attribute_with(
+    before: &str,
+) -> (Loaded, Crate, Vec<hir_expand::proc_macro::ProcMacro>) {
     use hir_expand::proc_macro::{ProcMacroKind, ProcMacros};
-    let loaded = Loaded::new(
-        "//- proc_macros: identity\n//- /pm.rs crate:proc-macro:pm\n#[proc_macro]\npub fn plain(input: TokenStream) -> TokenStream { input }\n#[proc_macro]\n#[proc_macros::identity]\npub fn sol(input: TokenStream) -> TokenStream { input }\n",
-    );
+    let loaded = Loaded::new(&format!(
+        "//- proc_macros: identity\n//- /pm.rs crate:proc-macro:pm\n{before}#[proc_macro]\n#[proc_macros::identity]\npub fn sol(input: TokenStream) -> TokenStream {{ input }}\n",
+    ));
     let file = loaded.file("/pm.rs");
     let db = &loaded.db;
     let pm = *all_crates(db).iter().find(|it| it.data(db).root_file_id == file).expect("`pm`");
@@ -1459,17 +1468,24 @@ fn a_proc_macro_under_an_attribute_macro_names_its_expander_once_its_crate_is_gi
 }
 
 /// The control of the invariant above: with the root's group run again only when its round-0
-/// log changed, the macro under the attribute keeps no expander, as `sol` did.
+/// log changed, the macro under the attribute keeps no expander, as `sol` did. The crate has
+/// that macro alone: one the root file declares beside it (`plain`) changes the log, the group
+/// runs for it, and the planted bug is hidden (this control asserted `[true, false]` of both
+/// and failed, `[true, true]`, since it was written).
 #[test]
 fn the_oracle_catches_a_given_crate_whose_root_runs_again_only_for_its_log() {
     use hir_expand::proc_macro::ProcMacros;
-    let (mut loaded, pm, given) = under_an_attribute();
-    let _ = own_expanders(&loaded.db, pm, &["plain", "sol"]);
-    super::input::GIVEN_READS_THE_LOG_ALONE.set(true);
-    ProcMacros::give(&mut loaded.db, [(pm, Ok(given))]);
-    let after = own_expanders(&loaded.db, pm, &["plain", "sol"]);
-    super::input::GIVEN_READS_THE_LOG_ALONE.set(false);
-    assert_eq!(after, [true, false], "the planted bug leaves `sol` with no expander");
+    let alone = |planted: bool| {
+        let (mut loaded, pm, mut given) = under_an_attribute_with("");
+        given.retain(|it| it.name.as_str() == "sol");
+        assert_eq!(own_expanders(&loaded.db, pm, &["sol"]), [false]);
+        super::input::GIVEN_READS_THE_LOG_ALONE.set(planted);
+        ProcMacros::give(&mut loaded.db, [(pm, Ok(given))]);
+        super::input::GIVEN_READS_THE_LOG_ALONE.set(false);
+        own_expanders(&loaded.db, pm, &["sol"])
+    };
+    assert_eq!(alone(false), [true], "given its macros, `sol` names its expander");
+    assert_eq!(alone(true), [false], "the planted bug leaves `sol` with no expander");
 }
 
 /// Three crates: `main` globs `lib`, and `other` depends on neither and neither on it.
