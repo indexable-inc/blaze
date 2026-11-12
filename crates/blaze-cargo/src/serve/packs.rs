@@ -156,6 +156,26 @@ pub(crate) fn scope() -> Result<String, String> {
     Ok(scope)
 }
 
+/// The directories of this home a record must not hold to travel, as the one searcher of a
+/// root left in bytes knows them (`Places::tied`, which is `Roots::embedded`): where builds
+/// are (`<root>/build`), the shared standard library directory and the fetched sources.
+/// An export has no job, so no workspace, tools or launcher: those are no root here (an
+/// empty path is none).
+pub(crate) fn home_places() -> Result<super::unit::portable::Places, String> {
+    let said = |error: anyhow::Error| format!("{error:#}"); // alloc: error path
+    let builds = super::builds().map_err(said)?;
+    let sources = super::sources().map_err(said)?;
+    let std = super::machine().map_err(said)?.join("std");
+    Ok(super::unit::portable::Places::new(
+        "",
+        &builds.to_string_lossy(),
+        &std.to_string_lossy(),
+        Path::new(""),
+        Path::new(""),
+        &sources,
+    ))
+}
+
 /// The kinds of record a pack may bring into the store. Never a pin (a pack's pin is made
 /// by the import, of the keys it checked) and never the daemon's image (one checkout's, by
 /// path). Machine code a loader maps is taken only when a trusted key signed for it:

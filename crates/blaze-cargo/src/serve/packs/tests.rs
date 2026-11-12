@@ -59,7 +59,7 @@ fn an_export_imported_into_an_empty_store_holds_the_origins_records_pinned() {
     let dir = tempfile::tempdir().unwrap();
     let mut first = origin(&dir.path().join("a"), 60);
     let (out, again_out) = (dir.path().join("out"), dir.path().join("again"));
-    let done = stored::export(&mut on(&mut first), "toolchain", "t1", &out, None, false, false).unwrap();
+    let done = stored::export(&mut on(&mut first), "toolchain", "t1", &out, None, false, false, &|_| false).unwrap();
     assert_eq!((done.records, done.signed, done.absent), (60, false, 0));
     // A pin that also names keys the store has no record of (slots never filled): they are
     // counted, not in the pack, and no reason to refuse it.
@@ -67,9 +67,17 @@ fn an_export_imported_into_an_empty_store_holds_the_origins_records_pinned() {
     wider.sort_unstable();
     first.store().pin("wider", "the test's records and two keys of nothing", 2, &wider).unwrap();
     first.flush().unwrap();
-    let got = stored::export(&mut on(&mut first), "wider", "t1", &dir.path().join("wider"), None, false, false).unwrap();
+    let got = stored::export(&mut on(&mut first), "wider", "t1", &dir.path().join("wider"), None, false, false, &|_| false).unwrap();
     assert_eq!((got.records, got.absent), (60, 2));
-    let again = stored::export(&mut on(&mut first), "toolchain", "t1", &again_out, None, false, false).unwrap();
+    // No record that holds a directory of the exporting machine travels: of everything it
+    // is left out and counted; a pin that keeps one is refused naming the key. The control
+    // is every export above, whose guard finds none.
+    let holds = |bytes: &[u8]| bytes == &value(7)[..];
+    let all = stored::export(&mut on(&mut first), "build", "t1", &dir.path().join("held"), None, true, false, &holds).unwrap();
+    assert_eq!((all.records, all.held), (59, 1));
+    let refused = stored::export(&mut on(&mut first), "toolchain", "t1", &dir.path().join("held-pin"), None, false, false, &holds).unwrap_err();
+    assert!(refused.contains(&id_of(&key(7)).to_string()) && refused.contains("a directory of this machine"), "{refused}");
+    let again = stored::export(&mut on(&mut first), "toolchain", "t1", &again_out, None, false, false, &|_| false).unwrap();
     assert_eq!(done, again);
     let files = [
         layout::manifest_path(&done.pack),
@@ -80,9 +88,9 @@ fn an_export_imported_into_an_empty_store_holds_the_origins_records_pinned() {
     for path in &files {
         assert_eq!(fs::read(out.join(path)).unwrap(), fs::read(again_out.join(path)).unwrap(), "{path}");
     }
-    assert!(stored::export(&mut on(&mut first), "nothing", "t1", &out, None, false, false).unwrap_err().contains("no pin `nothing`"));
+    assert!(stored::export(&mut on(&mut first), "nothing", "t1", &out, None, false, false, &|_| false).unwrap_err().contains("no pin `nothing`"));
     // Everything that may travel: the 60 records, and not the pin's own record.
-    let all = stored::export(&mut on(&mut first), "build", "t1", &dir.path().join("all"), None, true, false).unwrap();
+    let all = stored::export(&mut on(&mut first), "build", "t1", &dir.path().join("all"), None, true, false, &|_| false).unwrap();
     assert_eq!(all.records, 60);
 
     let base = Base::Dir(out);
@@ -156,7 +164,7 @@ fn a_flipped_byte_in_a_packs_body_is_refused_naming_the_record() {
     // of its frames flipped it is refused naming a record of the pack.
     let mut first = origin(&dir.path().join("a"), 30);
     let out = dir.path().join("out");
-    let done = stored::export(&mut on(&mut first), "toolchain", "t1", &out, None, false, false).unwrap();
+    let done = stored::export(&mut on(&mut first), "toolchain", "t1", &out, None, false, false, &|_| false).unwrap();
     assert!(!out.join(layout::body_path(&done.pack)).exists(), "a compressed pack kept its raw body");
     let base = Base::Dir(out.clone());
     let mut control = empty(&dir.path().join("control-z"));
@@ -182,7 +190,7 @@ fn a_signed_pack_is_taken_under_its_trusted_key_only() {
     let out = dir.path().join("out");
     let seed = [7u8; 32];
     let (public, _) = super::sign(&seed, b"").unwrap();
-    let done = stored::export(&mut on(&mut first), "toolchain", "t1", &out, Some(&seed), false, false).unwrap();
+    let done = stored::export(&mut on(&mut first), "toolchain", "t1", &out, Some(&seed), false, false, &|_| false).unwrap();
     assert!(done.signed);
     let base = Base::Dir(out.clone());
     let mut store = empty(&dir.path().join("b"));

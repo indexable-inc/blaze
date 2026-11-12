@@ -2247,8 +2247,21 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             tracing::info_span!(target: "blaze", "loop turn: completions", count = done.len())
                 .entered()
         });
+        // Each piece of this part is a span of its own while the turn is spanned (rule
+        // slow-is-p0-traced): a no-op build's turn here took 240 ms of the loop's own CPU for
+        // one completion, and 72 ms for none, with nothing naming which piece (Mac, bstd
+        // hello-world, 2026-11-12).
+        let piece = |name: &'static str| {
+            spanned.then(|| {
+                tracing::info_span!(target: "blaze", "loop turn: completions: a piece", piece = name)
+                    .entered()
+            })
+        };
+        let tick = piece("tick");
         self.tick();
+        drop(tick);
         for completion in done.drain(..) {
+            let _dispatch = piece("dispatch of one completion");
             self.dispatch(completion);
         }
         self.done = done;
@@ -2256,10 +2269,15 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // made as its request was read (the no-op lane's, a status) is written in this turn
         // before the plane is stepped or anything between requests runs.
         if !self.effects.is_empty() {
+            let _submit = piece("submit");
             self.submit();
         }
+        let expire = piece("expire jobs");
         self.expire_jobs();
+        drop(expire);
+        let ahead = piece("build ahead");
         self.ahead_turn();
+        drop(ahead);
         drop(part);
         step.next("the plane's step");
         let part = spanned

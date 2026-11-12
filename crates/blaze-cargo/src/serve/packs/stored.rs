@@ -240,6 +240,8 @@ pub(crate) struct Exported {
     pub signed: bool,
     /// Keys the selection named that the store has no record of: not in the pack.
     pub absent: usize,
+    /// Records of everything left out because their bytes hold a directory of this machine.
+    pub held: usize,
 }
 
 fn written(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -264,7 +266,9 @@ fn written(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// the store that may travel ([`admitted`]: never a pin, never the daemon's image, machine
 /// code only under a signature), and `pin` is the name the importing store pins them under:
 /// everything the builds of this home used. `raw`: the body is written as it is, not as
-/// compressed spans (a directory read in place gains nothing from compression).
+/// compressed spans (a directory read in place gains nothing from compression). `tied`:
+/// whether bytes hold a directory of the exporting machine (`Places::tied` of
+/// `serve::packs::home_places`): no such record is ever written into a pack.
 pub(crate) fn export(
     records: &mut impl Records,
     pin: &str,
@@ -273,6 +277,7 @@ pub(crate) fn export(
     seed: Option<&[u8; 32]>,
     all: bool,
     raw: bool,
+    tied: &dyn Fn(&[u8]) -> bool,
 ) -> Result<Exported, String> {
     let admit = admitted(seed.is_some());
     let keys = match all {
@@ -285,10 +290,27 @@ pub(crate) fn export(
     };
     let mut listed = Vec::with_capacity(keys.len()); // alloc: once an export
     let mut absent = 0usize;
+    let mut held = 0usize;
     for key in &keys {
         let mut found = None;
-        records.read(key, &mut |kind, content, bytes| found = Some((kind, content, bytes.len() as u64)))?;
+        let mut holds = false;
+        records.read(key, &mut |kind, content, bytes| {
+            found = Some((kind, content, bytes.len() as u64));
+            holds = tied(bytes);
+        })?;
         match found {
+            // A record that holds a directory of this machine is of this machine alone (a
+            // unit whose code holds a `file!()` path is kept so on purpose, under a key no
+            // other machine asks). Of everything it is left out, counted and said; a pin
+            // that keeps one cannot be exported whole, and says which.
+            Some(_) if holds && all => held += 1,
+            Some(_) if holds => {
+                // alloc: error path
+                return Err(format!(
+                    "the pin `{pin}` keeps the record of key {}, whose bytes hold a directory of this machine: it is of use here alone and does not travel; nothing was written",
+                    id_of(key)
+                ));
+            }
             Some((kind, content, len)) if admit.contains(&kind.code()) => {
                 listed.push(Record { key: id_of(key), kind: kind.code(), len, content: Id(content.0) });
             }
@@ -364,6 +386,7 @@ pub(crate) fn export(
         bytes: manifest.body_len(),
         signed: head.signed.is_some(),
         absent,
+        held,
     })
 }
 

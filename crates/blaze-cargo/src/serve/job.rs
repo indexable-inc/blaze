@@ -3604,6 +3604,10 @@ pub struct Jobs<S: Steps> {
     /// ([`WalkedView`], [`Recorded::view`]): closed at the loop's next step ([`Jobs::step`]),
     /// since what lets them go ([`Jobs::heard`]) has no VFS in hand.
     unheld: Vec<ViewId>,
+    /// Why the request [`Jobs::answer_again`] was last asked of was not answered as its
+    /// shape's last build was, in words: taken by [`Jobs::begin`] and said in a span once
+    /// the request has its build, so the build's own profile names why it walked.
+    refused: Option<String>,
     /// A plan was made since the plan's database was last collected (`Jobs::expire`'s end):
     /// the values the plan before it held alone are let go of at the next turn.
     planned: bool,
@@ -3749,6 +3753,7 @@ impl<S: Steps> Jobs<S> {
             roots: Roots::new(),
             retired: Vec::new(), // alloc: none until a plan is replaced
             unheld: Vec::new(),  // alloc: none until a no-op answer goes
+            refused: None,
             planned: false,
             out: Vec::new(),     // alloc: none until user code says something, then reused
             posts: Vec::new(),   // alloc: none until a write holds a task, then reused
@@ -4023,6 +4028,7 @@ impl<S: Steps> Jobs<S> {
             Ok(()) => return,
             Err(walks) => walks,
         };
+        let refused = self.refused.take();
         let views = match (&work, view) {
             (Work::Reach { from, .. }, Some(to)) => vec![*from, to], // alloc: once per job
             (_, Some(view)) => vec![view],                           // alloc: once per job
@@ -4073,6 +4079,21 @@ impl<S: Steps> Jobs<S> {
             request = request.0,
         )
         .entered();
+        // Why this build walks though it is one the no-op lane answers: said here, inside
+        // the build, where its profile has it. A refusal made before the request had its
+        // build (in `answer_again`) was in no build's rows, and a walk with no word of the
+        // lane could not be told from one the lane was never asked of (2026-11-12, a
+        // repeated `blaze run`: 1,162 jobs and no no-op span). The reason of an answer not
+        // kept is the same span of the next build: `no answer is kept: <why>`.
+        if let Some(why) = refused {
+            tracing::info_span!(
+                target: "blaze",
+                "no-op answer: not given because",
+                request = request.0,
+                why = %why,
+            )
+            .in_scope(|| {});
+        }
         self.prepare(w, id);
     }
 
@@ -4339,16 +4360,25 @@ impl<S: Steps> Jobs<S> {
         view: Option<&Opened>,
         work: &Work,
     ) -> Result<(), Option<(String, ContentId)>> {
+        self.refused = None;
         let (Some(opened), Some(request)) = (view, request_id(work)) else { return Err(None) };
         // The standard library is mounted by a daemon's first build, which keeps no answer.
         // clone: the config owns the library's place, once a request
-        let Some(library) = self.library.clone() else { return Err(None) };
+        let Some(library) = self.library.clone() else {
+            // alloc: a reason, once a daemon's first build
+            self.refused = Some("the standard library is not mounted yet: this is the daemon's first build".to_owned());
+            return Err(None);
+        };
         let _answering = tracing::info_span!(target: "blaze", "no-op answer").entered();
         let keying =
             tracing::info_span!(target: "blaze", "no-op answer: the request's inputs").entered();
         let Viewed { root, config, bare, shape, .. } =
             Self::viewed(&self.setup, &mut self.roots, w, work, opened, library);
-        let Some(root) = root else { return Err(None) };
+        let Some(root) = root else {
+            // alloc: a reason, once a request on an agent's view
+            self.refused = Some("its view is no checkout's: an agent's view keeps no answer".to_owned());
+            return Err(None);
+        };
         let inputs = Inputs {
             view: opened.view.root,
             config_id: bare,
@@ -4374,7 +4404,8 @@ impl<S: Steps> Jobs<S> {
         // What answered jobs left to settle is no job: the kept answer is of a build that
         // made nothing, and stands while that settles.
         let alone = self.order.is_empty();
-        let locals_vouched = w.mounts.stale_locals(vouched_local, super::fetch::local::absent).is_empty();
+        let stale = w.mounts.stale_locals(vouched_local, super::fetch::local::absent);
+        let locals_vouched = stale.is_empty();
         let edited = match &read {
             Ok(edits) => Edited::Files(edits),
             Err(why) => Edited::Unread(*why),
@@ -4412,6 +4443,17 @@ impl<S: Steps> Jobs<S> {
                     why = %why,
                 )
                 .in_scope(|| {});
+                // alloc: a reason, once a build that walks. A path dependency no watch
+                // vouches for is named, with its watch's state as the watches say it
+                // ([`blaze_vfs::outside::why_looked`]): which path, and why not.
+                self.refused = Some(match (&why, stale.first()) {
+                    (noop::NotReplayed::Locals, Some(at)) => format!(
+                        "{why}: {at} ({}); {} such in all",
+                        blaze_vfs::outside::why_looked(std::path::Path::new(at)),
+                        stale.len()
+                    ),
+                    _ => why.to_string(),
+                });
                 return Err(why.input().map(|input| (input, inputs.id())));
             }
         };

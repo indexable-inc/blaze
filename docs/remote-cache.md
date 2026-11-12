@@ -1334,6 +1334,13 @@ its pins read on demand for it, `Collects::read_pins`): no commit ever holds a r
 pin, so no collection at any time from the import on can take one. A pin whose import then
 fails names keys the store lacks, which keeps nothing.
 
+**No record that holds a directory of the exporting machine travels.** The export searches
+each record's bytes with the one searcher of a root left in bytes (`Places::tied`, which is
+`Roots::embedded`, over this home's build, shared std and sources directories:
+`packs::home_places`). Under `--all` such a record is left out, counted and said in the
+command's line (a unit whose code holds a `file!()` path is kept tied on purpose, under a key
+no other machine asks); a pin that keeps one is refused naming the key.
+
 **The body is compressed for transfer**, span by span (`blaze_pack::spans`: 4 MiB spans,
 each a zstd frame, an index of the frames' lengths beside them; `--raw` keeps it as it is).
 Checked first: the store compresses its cold records, but a record is read out of it

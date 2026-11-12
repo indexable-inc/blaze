@@ -182,7 +182,8 @@ fn export(words: &[&str], records: &mut impl Records) -> Result<String, String> 
     let (Some(pin), Some(out)) = (pin, out) else { return usage() };
     let seed = key.as_deref().map(seed_at).transpose()?;
     let scope = packs::scope()?;
-    let done = stored::export(records, pin, &scope, &out, seed.as_ref(), all, raw)?;
+    let places = packs::home_places()?;
+    let done = stored::export(records, pin, &scope, &out, seed.as_ref(), all, raw, &|bytes| places.tied(bytes))?;
     Ok(format!(
         "exported {} as pin `{pin}` for {scope}: pack {}, {} records, {} bytes, {} head, under {}{}\n",
         if all { "every record that may travel" } else { "the store's pin" },
@@ -191,9 +192,11 @@ fn export(words: &[&str], records: &mut impl Records) -> Result<String, String> 
         done.bytes,
         if done.signed { "a signed" } else { "an unsigned" },
         out.display(),
-        match done.absent {
-            0 => String::new(),
-            n => format!("; {n} keys the pin names have no record in the store and are not in the pack"),
+        match (done.absent, done.held) {
+            (0, 0) => String::new(),
+            (absent, held) => format!(
+                "; not in the pack: {absent} keys the pin names with no record in the store, {held} records that hold a directory of this machine"
+            ),
         }
     ))
 }
