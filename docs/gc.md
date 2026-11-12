@@ -364,9 +364,19 @@ and begun afresh, never silently.
 ## Not done yet
 
 - Eviction inside a store (`crates/blaze-cas` units and packs, least recently used): it needs the
-  store to drop units from its index before their packs go; settling already retires half-dead
-  packs. What it costs today (measured 2026-11-11, lane disk-1111): the daemon's store
-  (`<root>/v2/store`) only grows. Hello-world's after a cold build and five edits is 174 MB:
+  store to drop keys from its tables before their packs go. Not built, so nothing in a store is
+  ever forgotten; what is built (2026-11-12, lane disk2-1111) is that it no longer keeps what it
+  holds raw: between requests the daemon ends the store's reading periods and moves what went
+  unread for two of them cold (`crates/blaze-cargo/src/serve/settle.rs`: zstd with a dictionary
+  per kind, on a worker; a value in a file of its own goes into a pack and its file is removed;
+  a pack left half dead is rewritten, the one its unit appends to as well). Hello-world's store
+  after a cold build and ten edits went from 184.3 MB to 33.9 MB (ix arm64, xfs), with the body
+  edit's median unchanged (79.3 ms before, 76.9 ms after, n=4 each). The design for forgetting:
+  packs as the unit of eviction, as a log-structured cache evicts regions: the oldest pack is
+  retired with only its records read in the last two periods (and every pinned key's) copied on,
+  the rest forgotten by a head that no longer lists them; a store of another format or of makers
+  no installed blaze has is a directory the collector trashes whole. What it cost before
+  (measured 2026-11-11, lane disk-1111): the daemon's store (`<root>/v2/store`) only grew. Hello-world's after a cold build and five edits is 174 MB:
   six whole files of front-end records (`Query`, kept as files of their own: 85.7 MB, the
   largest 51.6 MB), one whole `Derived` file (21.1 MB) and a pack of 93 MB (`Query` 43.5 MB in
   13,304 records, `Code` 26.3 MB in 12,207 of which 6.5 MB repeat another record's content,

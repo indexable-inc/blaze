@@ -1214,3 +1214,100 @@ first rule would expire what a head names.
   Needs per-function determinism, which the golden check gives.
 - **Windows and macOS**: CI on main runs Linux x64 and arm64 and macOS arm64 (`train.yaml`,
   **read**). Each target is its own set of heads; is macOS arm64 filled from the start?
+
+## Packs: record sets fetched by content, from any source (2026-11-12)
+
+Design, with one part built: the fetch core (`crates/blaze-fetch/src/verified.rs`, its simulation
+test beside it). The rest of this section is not built; what a pack needs of keys is listed last.
+
+**What a pack is.** A set of store records for one crate key: the records a build of that crate
+made (its unit record, its image, its `Code` and `Debug` records, the outputs they name), each as
+the store keeps it. The crate key is the content key the plan already computes for the unit
+(source hash, features, target, tier, toolchain identity, and its dependencies' keys). Nothing in
+the mechanism knows the standard library or bstd: they are the first keys a release publishes.
+A pack is two objects: a manifest (CBOR, bounded: at most 1 MiB, at most 65,536 records, every
+length checked before anything is allocated) listing each record's store key, kind, length and
+root; and the records' bytes as one object (the records in the manifest's order, zstd-compressed
+as the store's cold tier holds them, so a pack is close to what a settled store holds on disk).
+
+**What is hashed and what is signed.** Every object is named by a root: BLAKE3 over its length
+and the BLAKE3 hashes of its 64 KiB chunks (`verified::root_of`). The list of chunk hashes is
+fetched first and checked against the root alone; every chunk is then checked against its own
+hash as it arrives, alone, in any order, from any source. A two-level tree, not BLAKE3's internal
+1 KiB tree (Bao): a fetch of a whole object reads every chunk, so the list costs nothing extra
+(32 bytes per 64 KiB), and the check needs no access to BLAKE3's internals, which the vendored
+backend (`blake3-servil`) does not expose. A reader of one small range would do better with
+Bao's sibling paths; nothing here reads ranges. If the hub's file tree (`hub.md`) gains verified
+ranges, the two should become one definition (rule one-concept-one-home); today they differ.
+Hashes make the bytes the ones named. They do not make a record correct: a record is an output.
+So what maps a crate key to a manifest root is signed: by the release key for what a release
+publishes (the same Ed25519 trust as `blaze_global::bundle`'s manifests, which this replaces for
+packs: one manifest type), or by a builder the user's settings name. A second route, not built:
+two independent builders that publish the same root for a key agree byte for byte (rule
+deterministic-output), and a client may accept a root that N configured builders signed.
+
+**Sources.** A source answers three questions: `has(keys)` (which of these crate keys have a
+signed manifest root), `hashes(root)` and `chunk(root, at, len)`. The release bucket
+(`https://blaze-releases.ix.dev`, static objects named by root), the gateway (`/has`, `/get`,
+`/blob` with the root as the blob's name, key lists for `has`), a company mirror, and another
+daemon on the network are the same to the core: it is given sources, asks each in turn, drops one
+that lies (right length, wrong hash) at once and one that fails, answers short or runs out its
+deadline three times running, and asks another for what the dropped one owed. There is no
+global index: `has` is asked of each source, a source may lack an object, and sources are added
+and removed while a fetch runs (`Fetch::add_source`, `remove_source`), which is all a peer that
+appears and disappears needs.
+
+**Machines on one network, no server.** Each daemon may serve its store's packs to peers over
+the same three questions. Off by default. Peers are found by mDNS (`_blaze-pack._tcp`, Bonjour
+on macOS, Avahi or systemd-resolved on Linux) or a configured list. A peer is trusted to *offer
+bytes* by anyone (the bytes are checked), and trusted to *vouch for outputs* only if it signs
+its manifests with a key the user's settings list (a team key, or the key of the same signed-in
+account). The listener binds no port another user of the machine or the network can use
+unauthenticated: connections are TLS with the team key's certificate on both ends, and it serves
+only objects, never a key list of what the user has built, to a peer that has not shown the key.
+Cost: one port, discovery traffic, and serving load held to a byte-per-second budget and a
+fixed number of asks in flight.
+
+**When it is fetched.** At install, for the release's keys of the host target. On a build, for
+every dependency the plan is about to compile: one batched `has` for the plan's keys, then the
+fetch, then the build compiles what no source had. The wait is a span (`pack fetch`, with the
+keys and bytes) with a deadline, and progress is data (`verified::Effect::Progress`). Offline, or
+with every source refused, is an error that says so and offers `--build-from-source` (or the
+setting `packs = "never"`): the choice is the user's, said once, never a silent slow path (rule
+no-fallback). Settings: `packs.sources` (a list, a mirror first), `packs = "never"`.
+
+**Publishing.** A release step builds each published key on the release builder, exports its
+pack (the store's records for the key, read through `Store::reader`), signs the manifest root,
+and uploads objects by root (idempotent: an object that is there is not sent). It takes one JSON
+value (the keys, the bucket, the signing key's name) and is not written yet; running it is the
+main agent's, with the owner's go-ahead, and needs: write access to the releases bucket (or a
+`/put` token for a `packs` namespace of the gateway), and the release signing key.
+
+**Kept set.** "Kept" is a pin on a crate key: the collector never removes a pinned key's
+records. The toolchain's keys and bstd's are pinned by default; a user pins others
+(`blaze cache keep <crate>`), and a list of common crates may ship pinned. Not built: the store
+has no eviction of single keys yet (`gc.md`, "Not done yet"), so there is nothing a pin protects
+against today except `blaze clean`, which does not touch the store.
+
+**What stops a pack from being used on another machine today** (measured 2026-11-12, hello-world,
+ix arm64: a first run in an empty home 13.1 s; with another home's whole store copied in, built
+by the same binary, 13.0 s: nothing was reused). The key parts that carry a machine or project
+path, from a read of the code on `origin/main` and `origin/newproj-1111`:
+
+| Part | Where | State |
+|---|---|---|
+| A std unit's outputs, `OUT_DIR` and plan environment under `<machine>/std/<makers>/<placement>` | `crates/blaze-units/src/load/units.rs` (`rebase`), `crates/blaze-cargo/src/serve.rs` (`machine`) | open: key on the virtual `/@blaze-std-out`, rebase when outputs are written |
+| The same `OUT_DIR` in `Crate::content`, so in every crate identity above a std crate with a build script | `crates/base-db/src/input.rs` | open, same fix |
+| `run_env`: `CARGO=<blaze's path>` and the library path under the machine directory, for every unit | `crates/blaze-cargo/src/serve/unit/compile.rs`, `unit/artifact.rs` | open: out of the key for units that run nothing, or written against roots |
+| `proc_macro_cwd` of std members: the asking workspace's root | `crates/blaze-lower/src/crates.rs`, `crates/hir-def/src/deps/key.rs` | fixed on `origin/newproj-1111` (4e433c727b) |
+| The diagnostics' width, colour and short form in unit keys | `compile.rs` (`RecordInputs::key`) | open (lane diagkey-1111, agents.json A34) |
+| `RUSTFLAGS` text in `StdKey` and `UnitPlan` (may hold `-L` paths) | `crates/blaze-units/src/query.rs` | open; correct to key on, paths in it need roots |
+| A workspace member's package id, source path, `CARGO_MANIFEST_DIR`, outputs under `<root>/build/<id>`, registry sources under `<home>/sources` (bstd is such a member) | `crates/blaze-units/src/load/plan/*` | open: workspace members have no root rewriting; dependency images refuse local crates |
+| A linked output's record names its output and native-input paths (values, not key parts) | `compile.rs` (`linked_key`) | open: an importer rebases them |
+
+`Code`, `Debug`, dependency images, check outcomes and the library copy are keyed with no path
+(`hir-ty-identity`'s code id, `hir-def/src/deps/key.rs`'s markers, the virtual
+`/rustc/<commit>/library`). The store already reads read-only layers behind its own directory
+(`blaze_cas::Config::layers`); the daemon configures none. An imported pack is best kept as a
+layer: read in place, verified on every read, removed as one directory.
+
