@@ -80,7 +80,7 @@
    "task": "Run lanes and test their work",
    "do": "Lanes only write: one worktree and branch each, small commits, pushed often; no VM, no cargo, no daemon. The main agent runs `python3 -I harness/v2/integrate.py '{\"branches\":[...],\"tests\":true}'`: it merges every branch into the integration worktree, builds once, and prints one table (edit loop beside Relax, stale answers, new project, restart, memory, disk, tests). Failures go back to the lane whose files they name. The script's paths are the Mac's today (integration worktree /Volumes/Projects/blaze-int-1112, Relax at /tmp/relax-src); moving it to the one build VM is open.",
    "why": "Rule fan-out-write-only as rewritten 2026-11-12: ten lanes each building in their own VM cost a cold build and hours each, and their numbers had to be redone on the combined tree anyway.",
-   "state": "current"
+   "state": "superseded by H12"
   },
   {
    "id": "H10",
@@ -89,6 +89,15 @@
    "task": "Change or drive the harness ts kernel (crates/harness/mcp)",
    "do": "In crates/harness/mcp: `bun install` (a new worktree has no node_modules), `bun test` (about 10 s; bunfig.toml preloads src/test-setup.ts, so no test reaches the live daemon or ~/.harness), `bunx tsc --noEmit`. Drive the real kernel from a shell with `bun scripts/cell.ts '{\"cells\": [\"help()\", \"1 + 1\"]}'` (a kernel of its own) or `{\"sock\": path, \"cells\": [...]}` for one started with HARNESS_REPL_SOCK=path. Decisions live in pure modules with their tests (patience.ts, stop.ts, notices.ts, disclose.ts, help.ts, journal.ts, shell-rule.ts); kernel.ts is the one API and mcp.ts/serve.ts only adapt it. A new function needs a `docs` entry beside it or functions/docs.test.ts fails. HARNESS_REPL_TYPECHECK=0 starts a kernel that does not type-check cells.",
    "why": "Nothing here needs cargo or a VM, so this is the one place a lane runs its own tests; the end-to-end test (src/e2e.test.ts) starts the real MCP server, which is how a wrong reply is seen before an agent sees it.",
+   "state": "current"
+  },
+  {
+   "id": "H12",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+   "task": "Where work runs and where code is written",
+   "do": "One VM: `blaze-vm` (ix, arm64, 128 cores, 256 GiB committed, TTL 7 days from 2026-11-12; remake it with /tmp/blazevm.sh's steps: `ix new --name blaze-vm --no-shell --arch arm64 --cpus 128 --memory 256 --memory-commit --ttl 7d`, rustup + the pinned nightly, the pinned LLVM under /root/.blaze/native, `git clone` to /root/blaze, one release build, then /root/loop.sh and /root/lockwatch.sh). Build and run only through `ix shell blaze-vm --noninteractive -- /root/loop.sh <branch> <command...>`: one caller at a time, the branch checked out in /root/blaze, one incremental build, installed to /root/inst, the command run with BLAZE=/root/inst/blaze and BLAZE_HOME=/root/homes/<branch>, ten minutes at most; copy the binaries to /root/wt/<lane>/inst inside the call before measuring, keep projects and homes under /root/wt/<lane>/, start long runs as systemd units (export HOME=/root and PATH=/root/.cargo/bin:/run/current-system/sw/bin:$PATH in the unit's script) and poll them. One directory: lanes write in the integration checkout on the Mac (/Volumes/Projects/blaze-int-1112, branch int-1112), each in its own paths, without running git; the main agent commits, pushes and runs `harness/v2/integrate.py`. Timings name the load average and alternate base and new.",
+   "why": "Rules work-in-ix-vms, fan-out-write-only and worktree-per-lane as rewritten 2026-11-12: ten lane VMs and seventeen worktrees cost a cold build each and an hour of merging; a first shared queue on a 32-core VM (lanebase-1112) jammed for 22 minutes on a lock a daemon inherited, fixed in loop.sh (children start with the lock closed).",
    "state": "current"
   }
  ],
@@ -1324,6 +1333,27 @@
    "class": "text edits that match inside comments or strings",
    "prevention": "none built: rule fix-through-blaze-lints covers Rust only. For TypeScript here, anchor on `^import ` and read the diff.",
    "fix": "a by-syntax edit tool for the TypeScript in crates/harness if such moves recur",
+   "state": "open"
+  },
+  {
+   "id": "A40",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+   "where": "/root/loop.sh on the build VM (my script)",
+   "what": "The one build queue stood still for 22 minutes with five lanes waiting and the VM idle: `lslocks` showed `/root/loop.lock` held by `blaze-engine serve`, a daemon started by an earlier loop command. Two lanes reported it and both named the wrong holder (the first waiter); I ended that waiter's `flock`, which made it build without the lock until I stopped it.",
+   "cost": "22 minutes for five lanes; one build started outside the lock",
+   "cause": "the lock was `exec 9>lock; flock 9`, and every child inherited descriptor 9; a daemon outlives the command that started it",
+   "whys": [
+    "why stuck: a daemon held the lock",
+    "why possible: the lock is a property of an open descriptor and children inherit descriptors",
+    "why not caught: nothing said who held the lock; waiters looked the same as the holder in `ps`",
+    "why easy: the shell idiom for a lock is inheritable by default",
+    "property: a resource meant for one scope is held by whatever outlives that scope"
+   ],
+   "class": "scope leak: a lock, pipe, descriptor or lease taken for one command is inherited by a process that outlives it (the same class as a daemon holding a caller's stdout pipe open, which also happened in that script)",
+   "prevention": "loop.sh starts every child with the lock closed (9>&-), sends a command's output to a file and prints it after, stops a command at 600 s, and says who holds the lock; a watchdog ends a stray holder. Open: blaze's own daemon closes every descriptor it did not ask for when it starts (CLOEXEC by default, close_range at spawn), with a test that a daemon started from a process holding a lock does not hold it",
+   "workaround": "killed the daemon",
+   "fix": "loop.sh fixed 2026-11-12; the daemon-side close is open",
    "state": "open"
   }
  ]
