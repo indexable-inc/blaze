@@ -2139,8 +2139,14 @@ fn link_at(
     output.sanitize = generated.policy.sanitize;
     let (assembled, located) = {
         let _span = tracing::info_span!(target: "blaze", "link natives", unit = %path).entered();
-        let Natives { crates, mut search, assembled, args, options } =
-            natives(job, unit, krate, &generated.frontend, triple(job, u))?;
+        // Each crate's libraries and assembly, asked of the front end; then where each
+        // library is on the machine. Two spans, so a link that is slow here says which.
+        let Natives { crates, mut search, assembled, args, options } = {
+            let _span =
+                tracing::info_span!(target: "blaze", "link natives: the crates' libraries")
+                    .entered();
+            natives(job, unit, krate, &generated.frontend, triple(job, u))?
+        };
         // What the rustflags' link options and the link arguments ask: set on the output, and
         // the arguments' libraries and directories after the rest, as rustc appends them to
         // the link line. One it does not implement stops the link, named.
@@ -2152,8 +2158,11 @@ fn link_at(
             crates.iter().map(|it| CrateLibs { libs: &it.libs, search: &it.search }).collect();
         libs.push(CrateLibs { libs: &applied.libs, search: &[] });
         let sysroot = crate::toolchain::sysroot().ok_or(LinkCause::NoToolchain)?;
-        let located = blaze_link::target::locate(&mut output, &libs, &search, &sysroot)
-            .map_err(linker(LinkStep::Locate))?;
+        let located = {
+            let _span = tracing::info_span!(target: "blaze", "link natives: locate").entered();
+            blaze_link::target::locate(&mut output, &libs, &search, &sysroot)
+                .map_err(linker(LinkStep::Locate))?
+        };
         (assembled, located)
     };
     // The span tables the code names, as a change of those the last link was given: what
