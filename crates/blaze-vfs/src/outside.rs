@@ -542,7 +542,30 @@ pub fn looked(path: &Path) {
         let mut last = LAST_LOOK.lock();
         last.clear();
         last.push(path); // alloc: grows to the longest path looked at, then is used again
+        drop(last);
+        let mut named = NAMED_LOOKS.lock();
+        match named.iter().position(|it| it.0 == path) {
+            Some(at) => named[at].1 += 1,
+            // alloc: at most `LOOKS_NAMED` paths a stretch of naming
+            None if named.len() < LOOKS_NAMED => named.push((path.to_path_buf(), 1)),
+            None => {}
+        }
     }
+}
+
+/// The most distinct paths [`looked`] keeps while looks are named ([`take_named_looks`]).
+pub const LOOKS_NAMED: usize = 16;
+
+/// The first [`LOOKS_NAMED`] distinct paths looked at while looks were named, each with how
+/// many times.
+static NAMED_LOOKS: Lock<Vec<(PathBuf, u32)>> = Lock::new("vfs.outside.named_looks", Vec::new());
+
+/// The distinct paths looked at since the last call while looks were named (the first
+/// [`LOOKS_NAMED`] of them), each with how many times, and forgets them: for whoever says
+/// why a build was not answered again, which the last look alone does not (one path named
+/// where a build looked at many kinds).
+pub fn take_named_looks() -> Vec<(PathBuf, u32)> {
+    std::mem::take(&mut *NAMED_LOOKS.lock())
 }
 
 /// Has [`looked`] keep the path of each look from now on, or stop: on while someone will
