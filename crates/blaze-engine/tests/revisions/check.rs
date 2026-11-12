@@ -95,7 +95,7 @@ fn all(revision: &Revision, seen: &Observed, clean: Option<&Observed>) -> Vec<Fa
             });
         }
     }
-    let asks_redone = expect.redone.is_some() || !expect.redone_has.is_empty() || !expect.reused.is_empty();
+    let asks_redone = expect.redone.is_some() || expect.redone_within.is_some() || !expect.redone_has.is_empty() || !expect.reused.is_empty();
     match (&seen.redone, asks_redone) {
         (_, false) => {}
         (None, true) => failed.push(Failure {
@@ -109,6 +109,12 @@ fn all(revision: &Revision, seen: &Observed, clean: Option<&Observed>) -> Vec<Fa
                 wanted.sort();
                 if *redone != wanted {
                     failed.push(Failure { check: "redone", wanted: format!("exactly {wanted:?} made again"), got: format!("{redone:?}") });
+                }
+            }
+            if let Some(within) = &expect.redone_within {
+                let beyond: Vec<&String> = redone.iter().filter(|it| !within.contains(it)).collect();
+                if !beyond.is_empty() {
+                    failed.push(Failure { check: "redone_within", wanted: format!("none made again but {within:?}"), got: format!("{redone:?}") });
                 }
             }
             let missing: Vec<&String> = expect.redone_has.iter().filter(|it| !redone.contains(it)).collect();
@@ -148,7 +154,20 @@ fn all(revision: &Revision, seen: &Observed, clean: Option<&Observed>) -> Vec<Fa
             got: format!("{} caught, the first: {}", seen.panics, seen.first_panic),
         });
     }
+    if !seen.alarms.is_empty() {
+        failed.push(Failure {
+            check: "alarms",
+            wanted: "nothing contained and nothing unexplained".to_owned(),
+            got: seen.alarms.join("\n"),
+        });
+    }
     if let Some(clean) = clean {
+        if clean.ok == seen.ok
+            && let (Some(ours), Some(theirs)) = (&seen.diagnostics, &clean.diagnostics)
+            && ours != theirs
+        {
+            failed.push(Failure { check: "clean diagnostics", wanted: format!("as a clean build: {theirs:?}"), got: format!("{ours:?}") });
+        }
         if clean.ok != seen.ok {
             failed.push(Failure {
                 check: "clean outcome",

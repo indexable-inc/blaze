@@ -88,6 +88,15 @@ pub enum Step {
     Stop,
     /// `kill -9` of the daemon.
     Kill,
+    /// The changes saved twice before one build: each `.rs` file written first with a line
+    /// comment after its last line, then as the revision has it.
+    EditTwice,
+    /// A `build` started and interrupted (SIGINT to the command) this many milliseconds in:
+    /// a build cancelled midway, whose outcome is not read.
+    Cancel(u64),
+    /// The project as the revision before left it, copied to a checkout of this name beside
+    /// the first and built there by the same daemon: a second project of the same sources.
+    Beside(String),
     /// A file's modification time moved, its bytes as they were.
     Touch(String),
     /// A command whose outcome only has to be success: `build`, `run`, `check`, `test`.
@@ -111,6 +120,9 @@ pub struct Expect {
     pub says: Vec<String>,
     /// The functions whose code was made again: exactly these.
     pub redone: Option<Vec<String>>,
+    /// The functions whose code may be made again: none but these (the bound of an edit
+    /// whose take-back makes nothing).
+    pub redone_within: Option<Vec<String>>,
     /// Functions whose code was made again, among others.
     pub redone_has: Vec<String>,
     /// Functions whose code was not made again.
@@ -159,9 +171,40 @@ pub struct Observed {
     /// The bytes compared with a clean build's: the linked program (real), the code
     /// records in key order (simulated).
     pub image: Option<Vec<u8>>,
+    /// The build's diagnostics as data (level, code, message, first span), sorted; `None`
+    /// where the driver does not read them.
+    pub diagnostics: Option<Vec<String>>,
+    /// What blaze said that it must never say: a contained unwind of the changed-set walk, a
+    /// step recomputed for no recorded reason.
+    pub alarms: Vec<String>,
     /// `blaze why` of the build, for a failure's message.
     pub why: String,
     pub ms: u128,
+}
+
+impl Step {
+    /// The step as `test.toml` words it: [`step`] reads it back.
+    pub fn word(&self) -> String {
+        match self {
+            Step::Edit => "edit".to_owned(),
+            Step::EditByRename => "edit by rename".to_owned(),
+            Step::EditTruncateWrite => "edit by truncate then write".to_owned(),
+            Step::EditTwice => "edit twice".to_owned(),
+            Step::Cancel(after) => format!("cancel build after {after} ms"),
+            Step::Beside(name) => format!("beside {name}"),
+            Step::Stop => "stop".to_owned(),
+            Step::Kill => "kill".to_owned(),
+            Step::Touch(path) => format!("touch {path}"),
+            Step::Do(action) => action.word().to_owned(),
+            Step::Project(name) => format!("project {name}"),
+        }
+    }
+}
+
+/// The first of the two saves of [`Step::EditTwice`]: a `.rs` file with a comment after its
+/// last line; any other file has one save.
+pub fn first_save(path: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+    path.ends_with(".rs").then(|| [bytes, &b"// the first of two saves\n"[..]].concat())
 }
 
 fn text(table: &toml::Table, key: &str, at: &str) -> Option<String> {
@@ -197,10 +240,25 @@ fn step(word: &str, at: &str) -> Step {
         "edit" => Step::Edit,
         "edit by rename" => Step::EditByRename,
         "edit by truncate then write" => Step::EditTruncateWrite,
+        "edit twice" => Step::EditTwice,
         "stop" => Step::Stop,
         "kill" => Step::Kill,
         _ => match word.split_once(' ') {
             Some(("touch", path)) => Step::Touch(path.to_owned()),
+            Some(("cancel", after)) => Step::Cancel(
+                after
+                    .strip_prefix("build after ")
+                    .and_then(|it| it.strip_suffix(" ms"))
+                    .and_then(|it| it.parse().ok())
+                    .unwrap_or_else(|| panic!("{at}: `cancel build after N ms`, not `{word}`")),
+            ),
+            Some(("beside", name)) => {
+                assert!(
+                    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                    "{at}: `beside NAME` names a directory beside the first checkout, by letters, digits and `_`, not `{name}`"
+                );
+                Step::Beside(name.to_owned())
+            }
             Some(("project", name)) => {
                 assert!(
                     !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
@@ -210,8 +268,9 @@ fn step(word: &str, at: &str) -> Step {
             }
             _ => Step::Do(Action::of(word).unwrap_or_else(|| {
                 panic!(
-                    "{at}: no step `{word}`: `edit`, `edit by rename`, `edit by truncate then write`, `stop`, \
-                     `kill`, `touch PATH`, `project NAME`, `check`, `build`, `run`, `test`"
+                    "{at}: no step `{word}`: `edit`, `edit by rename`, `edit by truncate then write`, `edit twice`, \
+                     `stop`, `kill`, `touch PATH`, `project NAME`, `beside NAME`, `cancel build after N ms`, `check`, \
+                     `build`, `run`, `test`"
                 )
             })),
         },
@@ -219,8 +278,8 @@ fn step(word: &str, at: &str) -> Step {
 }
 
 /// Every key a revision's table may hold: another is a typo, and is refused.
-const KEYS: [&str; 21] = [
-    "action", "args", "env", "steps", "remove", "fails", "prints", "says", "redone", "redone_has", "reused",
+const KEYS: [&str; 22] = [
+    "action", "args", "env", "steps", "remove", "fails", "prints", "says", "redone", "redone_within", "redone_has", "reused",
     "max_units", "max_records", "max_executed", "max_verified", "max_ms", "noop", "link", "bytes", "known", "about",
 ];
 
@@ -311,6 +370,7 @@ impl Test {
                     prints: text(row, "prints", &at),
                     says: texts(row, "says", &at).unwrap_or_default(),
                     redone: texts(row, "redone", &at),
+                    redone_within: texts(row, "redone_within", &at),
                     redone_has: texts(row, "redone_has", &at).unwrap_or_default(),
                     reused: texts(row, "reused", &at).unwrap_or_default(),
                     max_units: count(row, "max_units", &at),

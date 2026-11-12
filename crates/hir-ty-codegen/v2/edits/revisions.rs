@@ -32,6 +32,9 @@
 
 #[path = "../../../blaze-engine/tests/revisions/check.rs"]
 mod check;
+#[allow(dead_code, reason = "the real driver's parts of the generator (the workspace beside the library, the widths) are not this driver's")]
+#[path = "../../../blaze-engine/tests/revisions/generate.rs"]
+mod generate;
 #[path = "../../../blaze-engine/tests/revisions/spec.rs"]
 mod spec;
 
@@ -215,6 +218,33 @@ fn one(test: &Test, seed: u64) -> (Vec<Row>, Vec<String>) {
                         text = new;
                     }
                 }
+                Step::EditTwice => {
+                    let new = text_at(test, index);
+                    if new != text {
+                        // Two saves and no build between: the database is set twice.
+                        let first = spec::first_save("src/lib.rs", new.as_bytes()).expect("a `.rs` file has two saves");
+                        state.db.set_file_text(state.file, std::str::from_utf8(&first).expect("UTF-8"));
+                        state.db.set_file_text(state.file, &new);
+                        state.log.push("the edit, saved twice".to_owned());
+                        text = new;
+                    }
+                }
+                Step::Cancel(_) => {
+                    // Where a build is cut is the daemon's to say; here it runs whole and
+                    // what it made is dropped: the database's rows stay, the store's do not.
+                    state.log.push("a build whose records are dropped".to_owned());
+                    let _ = state.build();
+                }
+                Step::Beside(_) => {
+                    // A second checkout: a database and a memo of its own over the one store.
+                    state.log.push("a second database of the same text, built over the same store".to_owned());
+                    let (mut other, other_file) = database(&fixture(&text));
+                    other.set_file_text(other_file, &text);
+                    let built = build(&other, &Memo::new(), &state.store, blaze_store_check::Setting::ALL, state.heap_to_stack);
+                    if let Ok(built) = built {
+                        state.store.0.extend(built.puts.into_iter().map(|it| (it.key, it.bytes)));
+                    }
+                }
                 Step::Stop | Step::Kill => {
                     state.log.push("a restart".to_owned());
                     state.restart(&text);
@@ -300,6 +330,73 @@ fn run(name: &str) {
         );
         check::verdict(&test, &format!("sim seed {seed}"), &rows, &note);
     }
+}
+
+/// The oracle's case of `turns` under this driver (seed 0: every draw is the sequence's
+/// own, which Hegel shrinks). A failure is written as a case under `BLAZE_ORACLE_OUT` (the
+/// system's temporary directory otherwise) before it is reported.
+fn oracle(turns: &[generate::Turn]) {
+    let parts = generate::Parts::LIBRARY;
+    let test = generate::test(&generate::name(parts, turns), parts, turns, &["sim"]);
+    let (rows, log) = one(&test, 0);
+    let mut note = format!("the sequence: {turns:#?}\nwhat the driver did:\n  {}\n", log.join("\n  "));
+    if rows.iter().any(|row| !row.failed.is_empty()) {
+        let out = std::env::var_os("BLAZE_ORACLE_OUT")
+            .map_or_else(|| std::env::temp_dir().join("blaze-oracle"), std::path::PathBuf::from);
+        generate::write_case(&test, &out);
+        note.push_str(&format!("written as the case {}\n", out.join(&test.name).display()));
+    }
+    check::verdict(&test, "sim seed 0", &rows, &note);
+}
+
+/// The oracle (docs/harness.md): after any drawn sequence of edits of the library, saves,
+/// restarts, second databases and dropped builds, the incremental build's records are a
+/// clean build's, nothing panics, and a turn makes no function its edit does not reach.
+/// `HEGEL_TEST_CASES=<n>` runs it longer.
+#[test]
+fn any_turn_sequence_builds_as_clean() {
+    super::run_cases(40, |tc| {
+        let mut draw = |n: u64| tc.draw(hegel::generators::integers::<u64>().max_value(n - 1));
+        let turns = generate::turns(&mut draw, generate::Parts::LIBRARY, true, 6);
+        oracle(&turns);
+    });
+}
+
+/// The control: a store that answers a key with the bytes of another build is caught. The
+/// planted bug is a store entry kept from before an edit under the key the edit's function
+/// has after it, so the hit is stale.
+#[test]
+fn the_oracle_catches_a_stale_store_entry() {
+    use generate::{Edit, Event, Save, Turn};
+    let turn = |edit| Turn { edits: vec![edit], save: Save::Write, event: Event::Nothing, event_last: false, width: None };
+    let parts = generate::Parts::LIBRARY;
+    let test = generate::test("control", parts, &[turn(Edit::Body(1))], &["sim"]);
+    let texts = [text_at(&test, 0), text_at(&test, 1)];
+    let builds: Vec<Built> = texts
+        .iter()
+        .map(|text| {
+            let (mut db, file) = database(&fixture(text));
+            db.set_file_text(file, text);
+            build(&db, &Memo::new(), &Kept::default(), blaze_store_check::Setting::OFF, false).expect("the control's text builds")
+        })
+        .collect();
+    // `shown`'s record of before the edit, under the key it has after it.
+    let key_of = |built: &Built| {
+        let (instance, _) = built.debug_names.iter().find(|(_, name)| name == "app::shown").expect("app::shown is built");
+        built.kernel.iter().find(|entry| entry.instance == *instance).expect("its kernel entry").key
+    };
+    let (old, new) = (key_of(&builds[0]), key_of(&builds[1]));
+    assert_ne!(old, new, "the edit changes `shown`'s key");
+    let stale = builds[0].puts.iter().find(|it| it.key == old).expect("the first build put it").bytes.clone(); // clone: planted
+    let mut store = Kept::default();
+    store.0.insert(new, stale);
+    let (mut db, file) = database(&fixture(&texts[1]));
+    db.set_file_text(file, &texts[1]);
+    let planted = build(&db, &Memo::new(), &store, blaze_store_check::Setting::OFF, false).expect("a build over the planted store");
+    let (planted_trace, planted_rows) = traced(&planted, &store);
+    let (clean_trace, clean_rows) = traced(&builds[1], &Kept::default());
+    let found = verdict(&Trace::default(), (&planted, &planted_trace, &planted_rows), (&builds[1], &clean_trace, &clean_rows));
+    assert!(!found.is_empty(), "the oracle found nothing in a build that took `shown` of before the edit from the store");
 }
 
 macro_rules! sim {

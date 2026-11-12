@@ -20,6 +20,8 @@
 )]
 
 mod check;
+mod generate;
+mod oracle;
 mod real;
 mod rustc;
 mod spec;

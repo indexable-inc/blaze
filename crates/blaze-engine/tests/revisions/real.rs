@@ -118,7 +118,25 @@ impl Real {
         Real { blaze, dir: root.join("w"), home: root.join("h"), cache: root.join("c"), others: Vec::new(), root, log_read: 0, keep: true }
     }
 
-    fn blaze(&self, args: &[&str], env: &BTreeMap<String, String>) -> Out {
+    /// A `build` started and interrupted `after` milliseconds in, and waited for: its
+    /// outcome is not read (it may have finished first).
+    fn cancel(&self, args: &[&str], env: &BTreeMap<String, String>, after: u64) {
+        let mut child = self.command(args, env).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        thread::sleep(Duration::from_millis(after));
+        let _ = Command::new("kill").args(["-INT", &child.id().to_string()]).stderr(Stdio::null()).status();
+        let began = Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if began.elapsed() > DEADLINE {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                self.kill_daemon();
+                panic!("a `blaze {}` interrupted {after} ms in did not end in {} s: a hang", args.join(" "), DEADLINE.as_secs());
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn command(&self, args: &[&str], env: &BTreeMap<String, String>) -> Command {
         let mut command = Command::new(&self.blaze);
         command.env_clear();
         for name in ["HOME", "BLAZE_DUCKDB"] {
@@ -140,6 +158,11 @@ impl Real {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        command
+    }
+
+    fn blaze(&self, args: &[&str], env: &BTreeMap<String, String>) -> Out {
+        let mut command = self.command(args, env);
         let began = Instant::now();
         let mut child = command.spawn().unwrap_or_else(|error| panic!("starting {}: {error}", self.blaze.display()));
         let stdout = drain(child.stdout.take().unwrap());
@@ -207,6 +230,13 @@ impl Real {
             };
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             match how {
+                Step::EditTwice => {
+                    if let Some(first) = super::spec::first_save(&change.path, bytes) {
+                        fs::write(&path, first).unwrap();
+                        thread::sleep(Duration::from_millis(30));
+                    }
+                    fs::write(&path, bytes).unwrap();
+                }
                 Step::EditByRename => {
                     let beside = path.with_extension("saved-by-rename");
                     fs::write(&beside, bytes).unwrap();
@@ -222,17 +252,20 @@ impl Real {
         }
     }
 
-    /// Panics the daemon's log holds past what was read before.
-    fn panics(&mut self) -> (u64, String) {
-        let Ok(log) = fs::read(self.home.join("v2/serve.log")) else { return (0, String::new()) };
+    /// Panics the daemon's log holds past what was read before, and each line of it that
+    /// says an unwind of the changed-set walk was contained.
+    fn panics(&mut self) -> (u64, String, Vec<String>) {
+        let Ok(log) = fs::read(self.home.join("v2/serve.log")) else { return (0, String::new(), Vec::new()) };
         // A new daemon may start its log again.
         let from = if (log.len() as u64) < self.log_read { 0 } else { self.log_read as usize };
         self.log_read = log.len() as u64;
         let new = String::from_utf8_lossy(&log[from..]).into_owned();
+        let alarms: Vec<String> =
+            new.lines().filter(|line| line.contains("verification of a row unwound")).map(str::to_owned).collect();
         let mut lines = new.lines().filter(|line| line.contains("panicked at"));
         match lines.next() {
-            Some(first) => (1 + lines.count() as u64, first.to_owned()),
-            None => (0, String::new()),
+            Some(first) => (1 + lines.count() as u64, first.to_owned(), alarms),
+            None => (0, String::new(), alarms),
         }
     }
 
@@ -248,6 +281,7 @@ impl Real {
         // every other line is the program's.
         let mut build = None;
         let mut executable = None;
+        let mut diagnostics = Vec::new();
         for line in out.stdout.split_inclusive('\n') {
             let value = match line.starts_with("{\"reason\"") {
                 true => serde_json::from_str::<serde_json::Value>(line).ok(),
@@ -275,14 +309,28 @@ impl Real {
                     }
                 }
                 Some("compiler-message") => {
-                    if let Some(rendered) = value["message"]["rendered"].as_str() {
+                    let message = &value["message"];
+                    if let Some(rendered) = message["rendered"].as_str() {
                         seen.said.push_str(rendered);
                     }
+                    let spans = message["spans"].as_array();
+                    let span = spans.and_then(|all| all.iter().find(|it| it["is_primary"] == true).or(all.first()));
+                    diagnostics.push(format!(
+                        "{} {} {:?} {}:{}:{}",
+                        message["level"].as_str().unwrap_or("?"),
+                        message["code"]["code"].as_str().unwrap_or("-"),
+                        message["message"].as_str().unwrap_or("?"),
+                        span.and_then(|it| it["file_name"].as_str()).unwrap_or("-"),
+                        span.and_then(|it| it["line_start"].as_u64()).unwrap_or(0),
+                        span.and_then(|it| it["column_start"].as_u64()).unwrap_or(0),
+                    ));
                 }
                 _ => {}
             }
         }
-        (seen.panics, seen.first_panic) = self.panics();
+        diagnostics.sort();
+        seen.diagnostics = Some(diagnostics);
+        (seen.panics, seen.first_panic, seen.alarms) = self.panics();
         if revision.expect.bytes && seen.ok {
             seen.image = executable.and_then(|path| fs::read(path).ok());
         }
@@ -317,7 +365,11 @@ impl Real {
             }
             _ => seen.why = format!("`blaze why --all --json` of build {build:?} said: {}{}\n", why.stdout, why.stderr),
         }
-        seen.why.push_str(&self.blaze(&["why", "--all"], &none).stdout);
+        let said = self.blaze(&["why", "--all"], &none);
+        for line in said.stdout.lines().chain(said.stderr.lines()).filter(|line| line.contains("no recorded reason")) {
+            seen.alarms.push(line.to_owned());
+        }
+        seen.why.push_str(&said.stdout);
         if let Some(build) = build
             && (revision.expect.max_executed.is_some() || revision.expect.max_verified.is_some())
         {
@@ -342,9 +394,27 @@ impl Real {
         seen
     }
 
-    fn step(&mut self, step: &Step, revision: &Revision, env: &BTreeMap<String, String>) {
+    /// `before`: the project's files as the revision before left them.
+    fn step(&mut self, step: &Step, revision: &Revision, env: &BTreeMap<String, String>, before: &BTreeMap<String, Vec<u8>>) {
         match step {
-            Step::Edit | Step::EditByRename | Step::EditTruncateWrite => self.write(&revision.changes, step),
+            Step::Edit | Step::EditByRename | Step::EditTruncateWrite | Step::EditTwice => self.write(&revision.changes, step),
+            Step::Cancel(after) => {
+                let mut args = vec!["build"];
+                args.extend(revision.args.iter().map(String::as_str));
+                self.cancel(&args, env, *after);
+            }
+            Step::Beside(name) => {
+                let first = self.dir.clone(); // clone: the checkout to come back to
+                self.enter(Some(name));
+                // clone: the files as changes, once a step
+                let files: Vec<Change> = before.iter().map(|(path, bytes)| Change { path: path.clone(), bytes: Some(bytes.clone()) }).collect();
+                self.write(&files, &Step::Edit);
+                let mut args = vec!["build"];
+                args.extend(revision.args.iter().map(String::as_str));
+                let out = self.blaze(&args, env);
+                self.dir = first;
+                assert!(out.ok, "{}: the build of the second checkout `{name}` failed:\n{}", revision.label, out.stderr);
+            }
             Step::Stop => self.stop(),
             Step::Kill => {
                 assert!(self.daemon_pid().is_some(), "`kill`: the daemon's log names no pid");
@@ -426,8 +496,9 @@ pub fn rows(test: &Test, clean_when: Clean) -> (Vec<Row>, String) {
     let mut rows: Vec<Row> = Vec::new();
     for (index, revision) in test.revisions.iter().enumerate() {
         let env = test.env_at(index);
+        let before = test.files_at(index.saturating_sub(1));
         for step in &revision.steps {
-            real.step(step, revision, &env);
+            real.step(step, revision, &env, &before);
         }
         let seen = real.act(revision, &env, true);
         let failed = check::held(revision, &seen, None, &[]);

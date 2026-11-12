@@ -100,6 +100,8 @@ intern.workspace = true
 blaze-codegen-code.workspace = true
 
 [dev-dependencies]
+# tests/revisions/oracle.rs: the drawn sequences of the real driver's oracle.
+hegeltest.workspace = true
 blaze-alloc-count.workspace = true
 # tests/malloc.rs: an LLVM context made and disposed of in a task, through LLVM's C API.
 llvm-sys.workspace = true
