@@ -99,6 +99,49 @@ use blaze_query::db::{Database as _, MemoryUsage};
 #[cfg(test)]
 mod tests;
 
+/// What a kept front end's query storage holds, from counters
+/// (`blaze_query::db::Storage::held_bytes`): what letting go of the whole front end gives
+/// back, at least (`blaze_graph::giveback::Rung::FrontEnd`).
+pub(crate) fn kept_held(lowered: &Lowered) -> u64 {
+    lowered.db().storage().held_bytes()
+}
+
+/// What the values a kept front end keeps by bytes weigh now
+/// (`blaze_query::db::Storage::weighed_bytes`, summed): what it can give and the engine makes
+/// again from the memos (`blaze_graph::giveback::Rung::Values`). The front end is the
+/// caller's alone, as a kept one is the loop's.
+pub(crate) fn kept_values(lowered: &mut Lowered) -> u64 {
+    lowered.served_db().storage_mut().weighed_bytes().iter().sum()
+}
+
+/// Lets go of about `bytes` of the values a kept front end keeps by bytes, the least recently
+/// verified first, each tag by its part of what they weigh
+/// (`blaze_query::db::Storage::sweep_values` under caps lowered by that much); what went, as
+/// the weights say. Every value let go keeps its memo: a read makes it again and backdates
+/// it. The pages go back to the system at once on this thread, and on each other as it next
+/// allocates or idles (`blaze_mem::tag::give_back_heap`); the purge the give-back rule asks
+/// after reaches the rest.
+pub(crate) fn give_kept_values(lowered: &mut Lowered, bytes: u64) -> u64 {
+    let db = lowered.served_db();
+    let weights = db.storage_mut().weighed_bytes();
+    let before: u64 = weights.iter().sum();
+    if before == 0 || bytes == 0 {
+        return 0;
+    }
+    let keep = before.saturating_sub(bytes);
+    let mut caps = [u64::MAX; blaze_mem::Tag::COUNT];
+    for (cap, &weight) in caps.iter_mut().zip(&weights) {
+        if weight != 0 {
+            let part = u128::from(weight) * u128::from(keep) / u128::from(before);
+            *cap = u64::try_from(part).unwrap_or(u64::MAX);
+        }
+    }
+    db.storage_mut().sweep_values(&caps);
+    blaze_mem::tag::give_back_heap();
+    let after: u64 = db.storage_mut().weighed_bytes().iter().sum();
+    before.saturating_sub(after)
+}
+
 /// The most crates a build may make and still be an edit's ([`Finished::edit`]): the crate
 /// edited and the few a changed interface reaches at once. Past it the build is a rebuild,
 /// whose crates' values go as each finishes, as a cold build's do.

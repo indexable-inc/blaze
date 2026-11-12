@@ -814,6 +814,22 @@ pub trait KeptDb: Send + 'static {
     /// Its database, whose library parses the daemon's image stores
     /// ([`base_db::trees::write_section`]); `None` for a front end with none.
     fn db(&self) -> Option<&base_db::Db>;
+    /// The bytes its query storage holds, from counters: what letting go of it whole gives
+    /// back, at least ([`blaze_graph::giveback::Rung::FrontEnd`]). 0 for one that cannot say.
+    fn held(&self) -> u64 {
+        0
+    }
+    /// The bytes of values it keeps that it can let go and the engine makes again from their
+    /// memos ([`blaze_graph::giveback::Rung::Values`]). On the loop, which holds it alone.
+    fn values(&mut self) -> u64 {
+        0
+    }
+    /// Lets go of about `bytes` of those values, the least recently verified first; what
+    /// went. On the loop, which holds it alone.
+    fn give_values(&mut self, bytes: u64) -> u64 {
+        let _ = bytes;
+        0
+    }
 }
 
 pub trait Kept: Send + 'static {

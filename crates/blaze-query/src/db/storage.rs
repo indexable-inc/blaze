@@ -873,6 +873,24 @@ impl Storage {
         }
     }
 
+    /// What the values of each tag's `lru` functions weigh now, by [`Tag::index`]: what
+    /// [`Storage::sweep_values`] weighs against its budgets, for a caller that caps them by
+    /// bytes (`blaze-cargo`'s give-back of a kept front end's values, which lowers each
+    /// tag's cap by its part of what is asked). A weighing of every weighed ingredient, as a
+    /// sweep's first half is.
+    pub fn weighed_bytes(&mut self) -> [u64; Tag::COUNT] {
+        let mut weight = [0u64; Tag::COUNT];
+        let count = self.weighed.get_mut().len();
+        for at in 0..count {
+            let index = self.weighed.get_mut()[at];
+            let Some(weighed) = ingredient::vtable(index).and_then(|it| it.weighed) else {
+                continue;
+            };
+            weight[weighed.tag.index()] += (weighed.weight)(self, index);
+        }
+        weight
+    }
+
     /// Ends an epoch of the host's (a build), with `&mut`: lets go of every value of an
     /// evictable function (`lru` or `lru = 0`) that was read in no view of this epoch or the
     /// one before it, keeping each row's stamp, edges and hash, so a dependent still verifies

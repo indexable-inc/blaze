@@ -1232,6 +1232,13 @@ impl<M: Memo> Plane<M> {
         self.charge.charged(self.granted)
     }
 
+    /// What of the last footprint reading the allocator keeps freed and would give back to a
+    /// purge ([`PlaneInput::Footprint`]'s `kept`): the first rung of what the daemon gives
+    /// back ([`crate::giveback::Rung::Allocator`]). 0 under the grants mode.
+    pub fn allocator_kept(&self) -> u64 {
+        self.charge.kept()
+    }
+
     /// Whether the driver should purge what the allocator keeps freed, then read the footprint
     /// again and give it as a [`PlaneInput::Footprint`] with `purged`: a task with memory was
     /// held back in the last step's dispatch, the allocator may keep memory, and no purge was

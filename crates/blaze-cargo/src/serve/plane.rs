@@ -274,6 +274,18 @@ impl Purging {
     }
 }
 
+/// The last footprint reading the plane was given ([`Plane::reading`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reading {
+    /// The process's footprint, as the system counts it where it says.
+    pub footprint: u64,
+    /// What of it the allocators keep freed (`blaze_graph::arena::kept_of`): an estimate.
+    pub kept: u64,
+    /// The readings so far, and those of them taken right after a purge.
+    pub readings: u64,
+    pub purged: u64,
+}
+
 /// How much a running task's realized bytes grow before the plane is told again: 1/16 of its
 /// grant, and at least 64 MiB. Each telling is a step of the plane; past its grant it is told
 /// at once ([`Plane::realized`]).
@@ -790,8 +802,13 @@ pub struct Plane<W: Work, P: Predict> {
     began_tx: &'static Began,
     began: Receiver<(NodeId, arena::Account)>,
     realizing: HashMap<NodeId, Realizing, Global>, // alloc: the plane's, an entry a running task
-    /// The plane asked a purge since the loop last did one ([`Graph::purge_due`]).
+    /// The plane asked a purge since the loop last did one ([`Graph::purge_due`]), or the
+    /// give-back rule did ([`Plane::ask_purge`]).
     purge_due: bool,
+    /// How many footprint readings the plane was given ([`Plane::measure`]), and how many of
+    /// them right after a purge: what a give-back is measured by ([`Plane::reading`]).
+    readings: u64,
+    purged_readings: u64,
     /// The purge asked of the purger's thread and not yet done ([`Purging`]).
     purging: Option<Purging>,
     /// Each request's live model, fed every record the plane says of it ([`Folds`]).
@@ -957,6 +974,8 @@ impl<W: Work, P: Predict> Plane<W, P> {
             began,
             realizing: HashMap::new_in(Global), // alloc: the plane's, once
             purge_due: false,
+            readings: 0,
+            purged_readings: 0,
             purging: None,
             folds: Folds::new(),
         })
@@ -1225,7 +1244,8 @@ impl<W: Work, P: Predict> Plane<W, P> {
 
     /// The bytes of what the process holds besides the tasks granted memory that held back a
     /// task for memory as the plane last dispatched ([`blaze_graph::Plane::short`]): 0 when
-    /// none was, or only granted tasks did. The loop lets go of what it can for it.
+    /// none was, or only granted tasks did. The loop gives back for it, cheapest first
+    /// (`blaze_graph::giveback`).
     pub fn short(&self) -> u64 {
         self.graph.short()
     }
@@ -1656,6 +1676,27 @@ impl<W: Work, P: Predict> Plane<W, P> {
         let kept = arena::kept_of(&snapshot, footprint);
         let input = PlaneInput::Footprint { at_ns, bytes: footprint, kept, purged };
         self.step(input).unwrap_or_else(|error| panic!("the plane refused the footprint: {error}"));
+        self.readings += 1;
+        self.purged_readings += u64::from(purged);
+    }
+
+    /// The last footprint reading, as the give-back rule reads it
+    /// (`blaze_graph::giveback::Now`): the footprint, what of it the allocators keep freed,
+    /// and how many readings and purged readings came so far.
+    pub fn reading(&self) -> Reading {
+        Reading {
+            footprint: self.graph.held(),
+            kept: self.graph.allocator_kept(),
+            readings: self.readings,
+            purged: self.purged_readings,
+        }
+    }
+
+    /// The give-back rule asks a purge (`blaze_graph::giveback::Rung::Allocator`): done by
+    /// the purger's thread from the next [`Plane::poll`], as one the plane asks is, and
+    /// followed by a reading marked purged.
+    pub fn ask_purge(&mut self) {
+        self.purge_due = true;
     }
 
     /// What happened since the last call, in order, swapped into `into`, which is empty: the

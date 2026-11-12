@@ -131,6 +131,98 @@ macOS was not measured.
   OOMs.
 - The agent API exposes the counters, so a regression shows up as a number, not a mystery.
 
+## Giving memory back
+
+What the daemon gives back when memory is short, and in which order. The rule is
+`blaze_graph::giveback::Planner`, a sans-IO core; its driver is
+`crates/blaze-cargo/src/serve/job/giving.rs`.
+
+**The rule before (to 2026-11-12), and why it fired for 0.09 GiB.** The plane holds a task
+back when its predicted memory does not fit beside what admission charges (the footprint and
+the running tasks' grants not yet in it), and says how much of what the process holds besides
+its grants kept it out (`Plane::short`). The driver read that number once a loop turn
+(`Jobs::apply_writes`) and, when it was not 0, dropped every kept front end of every checkout,
+whole (`Jobs::let_go`), in that same turn. Three things were wrong in it. The amount was
+ignored: 0.09 GiB short and 55 GiB short got the same answer. Cost was ignored: a front end
+is the dearest thing the daemon holds (reth's next build, a one-line revert, took 195.4 s
+against 4 to 16 s with it kept). And nothing cheaper was tried first: the plane asks a purge
+of the allocators' freed pages in the very step that sets `short` (`Plane::purge_due`), but
+that purge runs on its own thread and lands turns later, so the wait was counted against a
+footprint that still held whatever the allocators kept freed, and the front end was gone
+before the purge could show the wait was nothing. System memory pressure (`Jobs::pressed`)
+took the same path. How much of that footprint a purge would have returned on 2026-11-12 was
+not measured: the log's `43.66 freed: kept, or purged and still counted` is mimalloc's
+committed count less the live heap, and that count never falls on a purge, so it is an upper
+bound and no reading.
+
+**(a) What the limit is charged with.** The footprint the kernel counts, and nothing else
+(rule one-memory-measure): `blaze_mem::tag::resident`, which the daemon reads from the
+system. Pages the allocators purged are not in it: mimalloc decommits with `MADV_DONTNEED`
+(Linux) or `MADV_FREE_REUSABLE` (macOS), never lazy `MADV_FREE`, and its `purge_delay` is 0.
+Pages the allocators freed and still hold are in it until a purge, so they are the first
+thing given back, before anything of value. mimalloc's own committed count is never a
+charge and never a reason: it is in the memory line as an upper bound, named as one.
+
+**(b) The order.** One rung a step, the lowest that has something to give, and a footprint
+reading taken after a rung's gives before the next is asked (at most 2 s is waited for it):
+
+| rung | what | made again by |
+|---|---|---|
+| 1 allocator | pages the allocators freed and hold (`raw::memory::purge`) | nothing |
+| 2 pool | the stores' pool pages no task pins (`Store::evict_pool`) | a read |
+| 3 caches | caches made again in milliseconds | milliseconds |
+| 4 values | a front end's values kept by bytes, least recently verified first; a running build's MIR and inference nothing still to compile reads | the engine, from their memos |
+| 5 front end | one checkout's kept front end, whole | lowering anew: minutes |
+
+What is given is in proportion to what is short: a rung gives until it covers the need and a
+margin (an eighth, at least 64 MiB) and stops; the allocator's freed pages go whole, since
+they cost nothing. For a predicted wait (a task's ask), no give of values or a front end is
+more than four times that target: a task waiting for 0.09 GiB gets 0.16 GiB of values at
+most, never 55 GiB, and when nothing in proportion is left it waits for a task to end or
+starts alone, as admission already lets it. No value goes while the allocator's freed pages
+have grown by what is short since their last purge: a kept front end outlives any wait
+smaller than what the allocator holds freed.
+
+**(c) The cost side.** Each source says what making it again costs. A front end's cost is
+the time its last lowering from nothing took, lowering to kept; its values' cost is their
+part of that by bytes (an upper bound until it is summed from the queries' own spans).
+Within a rung the least remake time a byte goes first. The rungs themselves are cost
+classes, orders of magnitude apart, so they are not mixed.
+
+**(d) When the limit falls under what the daemon holds** (a neighbour took the machine's
+memory): the daemon gives back in the same order until the footprint is under the limit, and
+here a front end may go whatever its size, one at a time, the cheapest a byte first, each
+measured before the next. Never the floor: the front end of the checkout built last, which
+is what keeps the edit loop alive. When only the floor is left and the footprint is still
+past the limit the daemon gives nothing more and says so, once a stretch, in its log and in
+that checkout's next `blaze why`: `memory: blaze holds K GB, N GB past its limit of M GB,
+and what is left to give is the analysis of <project> (F GB), which the next edit needs: it
+is kept; free memory or raise the limit`. Admission holds new work back meanwhile, and the
+ceiling's guard (docs/memory-budget.md, section 7) is still the last line. System pressure
+events take the values of every kept front end and no front end whole.
+
+**(e) Hysteresis.** A front end made again is held: not given again for sixteen times what
+its remake took, at least 10 s (a front end that took 195 s is held 52 minutes). A front
+end that was given, made again and is given again after that hold is a thrash: counted
+(`giveback::Counts::thrash`), marked on the give (`again`) and said in the log by name.
+
+**What says it.** Every give is a `memory give-back` span and event (what, whose, bytes,
+why, what was short, the limit, the footprint, what it costs to make again, what it gave),
+under the `memory give-back plan` span that decided it; `blaze explain memory` lists them
+with each purge (`memory_give_backs`). A front end let go keeps its span
+(`kept front ends let go for memory`) and log line, and its checkout's next build says
+`analysis of <project> was dropped to free N GB (limit M GB, held K GB); the next build
+redoes it`.
+
+**Proof.** `blaze_graph::giveback::tests`: a simulation under a drawn schedule of limit
+changes, asks and builds, whose oracle checks the order, the proportion, the floor, the hold
+and the measure between rungs, with five planted bugs each caught, the first of them the
+rule before (every front end, whole, for any ask).
+
+**Not built.** The caches rung has no source (codegen's kept walks go only while no walk is
+in flight, which the loop cannot say). A front end is given whole or by its values, not yet
+by crate. A give of values runs on the loop.
+
 ## Proof
 
 - Allocation-budget tests: the warm loop (edit, re-check, codegen, patch) makes zero calls into

@@ -35,6 +35,7 @@
 #![forbid(unsafe_code)]
 
 pub(super) mod doing;
+mod giving;
 mod kept;
 mod noop;
 mod slab;
@@ -1944,16 +1945,6 @@ struct Build<S: Steps> {
     made_wait: Option<tracing::Span>,
 }
 
-/// Why the daemon lets go of the front ends it keeps ([`Jobs::let_go`]).
-#[derive(Clone, Copy)]
-enum LetGo {
-    /// The plane holds a task back for this many bytes of what the process holds besides its
-    /// tasks ([`blaze_graph::Plane::short`]).
-    Short(u64),
-    /// The system says memory is short.
-    Pressure,
-}
-
 /// A build of the units a view's front end applies, made in the job's one plane request
 /// ([`Jobs::next`]): the request stays open for the job's next view or its answer, so the
 /// build's end is its last node's settling ([`Jobs::settled`]), not the request's finish. One
@@ -3465,6 +3456,9 @@ pub struct Jobs<S: Steps> {
     /// the daemon to hand to its history, before the build's answer is told to it, so the
     /// answer's flush writes them.
     pub errors: Vec<blaze_profile::errors::ErrorRow>,
+    /// What the daemon gives back when memory is short, and in which order
+    /// ([`Jobs::give_back`], `blaze_graph::giveback`).
+    giving: giving::Giving,
     /// Each job with a plane request, from its opening until its `Finish` is heard: the
     /// build it is in the history and how many `errors` rows it has, so a build that ends
     /// not ok with none is given one ([`Jobs::note_errors`]).
@@ -3612,6 +3606,7 @@ impl<S: Steps> Jobs<S> {
             lost: Vec::new(),     // alloc: none until settling loses something
             ran: Vec::new(),      // alloc: none until a kept front end's run log is named
             errors: Vec::new(),   // alloc: none until a build says an error
+            giving: giving::Giving::new(),
             erring: HashMap::new_in(Global),
             roots: Roots::new(),
             retired: Vec::new(), // alloc: none until a plan is replaced
@@ -4622,17 +4617,6 @@ impl<S: Steps> Jobs<S> {
         }
     }
 
-    /// The plane holds a task back for `short` bytes of what the process holds besides its
-    /// tasks ([`Plane::short`]), which no task's end gives back: every kept front end of a
-    /// checkout is let go (none is in use: a build takes its own out while it runs, and the
-    /// next build of that checkout lowers anew), and each build's front end is asked to let go
-    /// of what nothing still to compile reads ([`Writer::short`]). Then the plane's next
-    /// admission sees what is left; one that still fits nowhere starts alone once nothing
-    /// granted memory runs (`blaze_graph::Plane`'s `pick`).
-    fn short(&mut self, short: u64) {
-        self.let_go(LetGo::Short(short));
-    }
-
     /// What each kept front end's query storage holds, by ingredient, a line a front end in
     /// the daemon's log: the idle daemon's answer to "what holds the memory" (rule
     /// ask-the-profile-first). A walk of every function's rows made, sound beside readers
@@ -4672,45 +4656,20 @@ impl<S: Steps> Jobs<S> {
         }
     }
 
-    /// The system says memory is short (docs/memory-budget.md section 7, "Pressure"): as at
-    /// the soft ceiling, every kept front end is let go and each build's front end is asked for
-    /// a release now ([`Writer::pressed`]), whatever this daemon's own budget says.
+    /// The system says memory is short (docs/memory-budget.md section 7, "Pressure"): the
+    /// kept front ends let go of the values they keep by bytes ([`Jobs::press_kept`]), none of
+    /// them whole, and each build's front end is asked for a release now
+    /// ([`Writer::pressed`]), whatever this daemon's own budget says. Until 2026-11-12 every
+    /// kept front end was let go here, as for any task held back for memory: the next edit
+    /// of each checkout then lowered anew, which takes minutes (reth: 195 s for a one-line
+    /// revert). A limit that falls under what the daemon holds is [`Jobs::give_back`]'s to
+    /// answer, cheapest first.
     pub fn pressed(&mut self) {
-        self.let_go(LetGo::Pressure);
-    }
-
-    fn let_go(&mut self, why: LetGo) {
-        let kept = self.roots.fronts.iter().filter(|it| it.is_some()).count();
-        if kept > 0 {
-            let short = match why {
-                LetGo::Short(short) => short,
-                LetGo::Pressure => 0,
-            };
-            let _span = tracing::info_span!(target: "blaze", "kept front ends let go for memory", short, kept).entered();
-            for (root, &id) in self.roots.ids.iter() {
-                if let Some(front) = self.roots.fronts[id as usize].take() {
-                    match why {
-                        LetGo::Short(short) => crate::serve::said::logged!(WARN,
-                            "blaze serve: the kept front end of {root} is let go, and its next build lowers anew: \
-                             a task waits for {:.2} GiB the process holds besides its tasks",
-                            short as f64 / f64::from(1u32 << 30)
-                        ),
-                        LetGo::Pressure => crate::serve::said::logged!(WARN,
-                            "blaze serve: the kept front end of {root} is let go, and its next build lowers anew: \
-                             the system says memory is short"
-                        ),
-                    }
-                    drop(front);
-                }
-            }
-        }
+        self.press_kept();
         for &id in &self.order {
             let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
             if let Stage::Units(build) = &mut job.stage {
-                match why {
-                    LetGo::Short(_) => build.writer.short(),
-                    LetGo::Pressure => build.writer.pressed(),
-                }
+                build.writer.pressed();
             }
         }
     }
@@ -4722,10 +4681,11 @@ impl<S: Steps> Jobs<S> {
     /// ended, so the step that hears the last one applies the write. The daemon calls it
     /// once a turn as well, for a reader that outlives its task.
     pub fn apply_writes(&mut self, w: &mut World<'_, S>) {
+        // What a task held back for memory waits for, and a limit under what the daemon
+        // holds, are answered by the give-back rule: the allocator's freed pages first, a
+        // kept front end last and never for a wait a cheaper give covers ([`Jobs::give_back`]).
         let short = w.plane.short();
-        if short > 0 {
-            self.short(short);
-        }
+        self.give_back(w, short);
         let order = std::mem::take(&mut self.order);
         let mut posts = std::mem::take(&mut self.posts);
         for &id in &order {
@@ -5716,10 +5676,12 @@ impl<S: Steps> Jobs<S> {
             return;
         }
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
-        let kept = Lock::new(
-            "serve.job.lower.kept",
-            root.and_then(|root| self.roots.fronts[root as usize].take()),
-        );
+        let kept = root.and_then(|root| self.roots.fronts[root as usize].take());
+        if let Some(root) = root {
+            // What a front end made from nothing takes is what giving it back costs.
+            self.giving.lowers(root, kept.is_some(), w.now);
+        }
+        let kept = Lock::new("serve.job.lower.kept", kept);
         let (steps, lowering) = (w.steps.clone(), input.clone()); // clone: refcounts, once per view
         let (leases, builds) = (Arc::clone(&job.leases), self.setup.builds.clone()); // clone: a refcount and a path, once per view
         let learn = lower_cost_key(&checkout);
@@ -5865,6 +5827,9 @@ impl<S: Steps> Jobs<S> {
                         // alloc: a loss, once
                         format!("storing what the build of {checkout} left for the store: {why}")
                     });
+                    if front.is_some() {
+                        self.giving.kept(root, w.now);
+                    }
                     self.roots.fronts[root as usize] = front;
                 }
                 failed

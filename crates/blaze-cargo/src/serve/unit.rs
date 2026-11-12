@@ -800,6 +800,18 @@ impl KeptDb for KeptLowered {
     fn db(&self) -> Option<&Db> {
         Some(self.lowered.db())
     }
+
+    fn held(&self) -> u64 {
+        release::kept_held(&self.lowered)
+    }
+
+    fn values(&mut self) -> u64 {
+        release::kept_values(&mut self.lowered)
+    }
+
+    fn give_values(&mut self, bytes: u64) -> u64 {
+        release::give_kept_values(&mut self.lowered, bytes)
+    }
 }
 
 /// A job's front end as the loop keeps it ([`Writer::keep`]), with what it was lowered from:

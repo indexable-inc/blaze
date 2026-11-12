@@ -981,7 +981,7 @@ impl fmt::Display for MemoryLine<'_> {
             if let Some(committed) = memory.heap_committed {
                 write!(
                     f,
-                    ", in {:.2} its allocator committed ({:.2} freed: kept, or purged and still counted)",
+                    ", in {:.2} its allocator ever committed ({:.2} not live: kept freed, or purged; this count never falls on a purge and nothing is charged by it)",
                     gib(committed),
                     gib(committed.saturating_sub(self.heap)),
                 )?;
@@ -3876,8 +3876,9 @@ mod tests {
         assert!(
             said.starts_with(
                 "memory: resident 12.00 GiB, 1.00 outside blaze-mem and the global heap; \
-                 global heap 6.00 GiB live, 1.00 of it outside any task, in 7.00 its allocator committed \
-                 (1.00 freed: kept, or purged and still counted), at most 2.00 of it freed and resident; \
+                 global heap 6.00 GiB live, 1.00 of it outside any task, in 7.00 its allocator ever committed \
+                 (1.00 not live: kept freed, or purged; this count never falls on a purge and nothing is charged by it), \
+                 at most 2.00 of it freed and resident; \
                  committed 5.00 GiB (most 6.00), 1.00 of it purged (not resident), \
                  4.00 GiB in tags, reserved 1700 GiB in 7400 regions (most 1800)"
             ),
