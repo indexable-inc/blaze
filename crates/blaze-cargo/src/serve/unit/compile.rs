@@ -2582,7 +2582,7 @@ fn held(job: &Job, unit: usize, kept: &mut Compiled) -> Result<(), Failed> {
         let what = format!(
             "`{path}` is running and can't take this build as a patch: {why}; start it again to run it"
         );
-        let said = say::cargo(Level::Warning, what, Some(unit_of.clone()), job.input.color);
+        let said = say::cargo(Level::Warning, what, Some(unit_of.clone()), drawing(job).color);
         kept.diagnostics.push(said);
     }
     Ok(())

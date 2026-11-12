@@ -72,6 +72,15 @@
    "do": "Write it against the sans-IO core under the simulation, as a revision case where it is an edit sequence (crates/blaze-engine/tests/revisions/), with a planted-bug control; use a real daemon only for what a kernel alone shows.",
    "why": "Rule simulate-first.",
    "state": "current"
+  },
+  {
+   "id": "H9",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane diagkey-1111",
+   "task": "Add something a unit says (a warning, a note, a refusal)",
+   "do": "Push a `drawn::Item` onto the unit's `Said` (crates/blaze-cargo/src/serve/unit/drawn.rs): what it says, never text. `drawn::draw` is the one place a unit's diagnostics become text, for the job's client (`Drawing`: colour, width, short, `--refused`), from the record. Never read `job.input.color`, `.width`, `.short` or `.refused` while making a unit, and never put one in a key.",
+   "why": "Rule keys-cover-every-input, the other way: a key holds only what its value is made from. Width in the record's key recompiled all 28 units of hello world from a pane of another width (2026-11-11).",
+   "state": "current"
   }
  ],
  "annoyances": [
@@ -1530,6 +1539,72 @@
    "cause": "`Plane::pick` set `short` for a task that asks the whole ceiling",
    "workaround": "none",
    "state": "fixed on newproj-1111 (37495ec94d); open: a program never measured still waits for every granted task to end (1.2 s of a new hello-world's first build under `admission`) and is granted 101.8 GB where it peaks at 1.2 GB"
+  },
+  {
+   "id": "diagkey-1",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane diagkey-1111",
+   "where": "serve/unit/compile.rs: `names`, `store`",
+   "what": "A unit's compile cannot be driven in a test without a whole daemon: `compile::names`, `link` and `store` take a `Job`, which holds a `JobInput` (the database, the view's files reader, the store's reader, the macros, the plan) that only `serve::unit::Real` makes from a daemon's world. So the property \"a build for another client finds the unit's record and draws it\" could be tested in process only by its parts (the real key, the record's encoding, `reads`' filing, `drawn::draw`) with the glue between them written again in the test, and end to end only with a real daemon (the revision case).",
+   "cost": "the lane's main test is two tests, neither of the code path as it ships",
+   "cause": "the unit phases read the store, the view and the database directly through `Job` (rule sans-io-cores: no injected interface between what a phase decides and what it reads)",
+   "workaround": "`serve/unit/tests/drawn.rs` for the parts; `a_terminal_of_another_width_remakes_nothing` under the real driver for the whole",
+   "state": "open: what blocks it is `Job`/`JobInput` in crates/blaze-cargo/src/serve/unit.rs; a phase core that takes its record lookups and file texts as an interface would run under `Sim`"
+  },
+  {
+   "id": "diagkey-2",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane diagkey-1111",
+   "where": "crates/blaze-engine/tests/revisions (real driver)",
+   "what": "A revision's diagnostics cannot be held to a clean build's: the driver's `said` is the command's whole standard error (status lines with their times) with each message's `rendered` after it, and the clean build runs only when a check failed. \"What a build at width W shows from a record made at V is what a clean build at W shows\" is therefore checked with `says` texts typed by hand.",
+   "cost": "one property stated weaker than it is",
+   "cause": "`Observed` keeps no field of the diagnostics alone",
+   "workaround": "`says`, and the in-process test compares every byte",
+   "state": "open: an `Observed::diagnostics` (the `rendered` of each compiler-message) compared with the clean build's would state it"
+  },
+  {
+   "id": "diagkey-3",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane diagkey-1111",
+   "where": "serve/job/noop/tests.rs",
+   "what": "The no-op lane's model had the colour of the request among what a build's outputs are made from (`made_from`), so the model itself said a build in another colour makes its outputs again: the test agreed with the bug this lane removes.",
+   "cost": "found only by reading the model while changing the lane",
+   "cause": "the model was written from what the code did",
+   "workaround": "none needed",
+   "state": "fixed on diagkey-1111: colour is in the model's warning alone, and an answer with no diagnostic is said again to any client"
+  },
+  {
+   "id": "diagkey-4",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane diagkey-1111",
+   "where": "this lane's own measuring",
+   "what": "The first reproduction ran under `timeout 900` with Python's output buffered, while two cargo builds ran on the same VM: the pinned toolchain's download (9 minutes) and a cold build under load used the 900 s, the script was killed, and nothing it had measured was written.",
+   "cost": "fifteen minutes and one run",
+   "cause": "a buffered script under a timeout, and one VM for building and measuring (the same as edit2-12)",
+   "workaround": "`python3 -u`, no timeout, started detached; timings taken again once no build ran",
+   "state": "open"
+  },
+  {
+   "id": "diagkey-5",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane diagkey-1111",
+   "where": "the no-op lane on an ix VM",
+   "what": "On the lane's VM no build is answered by the no-op lane: every walk looks at `/nix/store/...-glibc-.../lib/crtn.o` on the disk (`no-op answer: ... crtn.o, which no watch covers, so each build looks at it on the disk`), so its answer is never kept. A build with nothing changed is a walk there (0.14 s for hello world).",
+   "cost": "the lane's own behaviour for a client shown diagnostics another way could be seen only in its simulation, not on the VM",
+   "cause": "the linker's startup objects are under /nix/store, outside every watch",
+   "workaround": "none",
+   "state": "open"
+  },
+  {
+   "id": "diagkey-6",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane diagkey-1111",
+   "where": "docs/v2/plan/invariants.md",
+   "what": "The invariants list is generated by a script that only a blaze can run (`blaze run -p scripts --bin invariants`), so the row for this lane's invariant and the counts in the page's head were typed by hand, as A12 says of four other lanes.",
+   "cost": "minutes, and a page the gate may call stale",
+   "cause": "the scripts are built by blaze, and a lane's VM has a cargo-built blaze that was not asked to build the scripts",
+   "workaround": "edited by hand in the script's format",
+   "state": "open"
   }
  ]
 }

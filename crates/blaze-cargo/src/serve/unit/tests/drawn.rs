@@ -15,7 +15,7 @@
 use blaze_api::{Diagnostic, Level};
 use blaze_diagnostics::Diag;
 
-use super::{SCRIPT, compile, script_front};
+use super::{SCRIPT, ScriptFront, compile, script_front};
 use crate::serve::unit::{
     drawn::{self, Drawing, Item, Said},
     reads,
@@ -58,8 +58,8 @@ fn span(of: &str) -> blaze_diagnostics::Span {
     }
 }
 
-/// What the unit's compile says: a warning far along the long line, with a label near the
-/// line's start, a note and a suggestion; an error with a code; a line of blaze's own; and
+/// What the unit's compile says: a warning far along the long line, with a label just before
+/// it, a note and a suggestion; an error with a code; a line of blaze's own; and
 /// the refusal of twenty functions.
 fn compiled() -> Said {
     let mut warning = Diag::error(
@@ -68,7 +68,7 @@ fn compiled() -> Said {
         span("unused_at_the_far_end"),
     );
     warning.level = blaze_diagnostics::model::Level::Warning;
-    warning.span.labels.push((span("let first = 1;"), "the line starts here".to_owned()));
+    warning.span.labels.push((span("let eleventh = 11;"), "the one before it".to_owned()));
     warning.note("`#[warn(unused_variables)]` on by default");
     warning.suggestions.push(blaze_diagnostics::model::Suggestion {
         message: "if this is intentional, prefix it with an underscore".to_owned(),
@@ -108,15 +108,42 @@ struct Store {
     executed: usize,
 }
 
+/// The project as each build lowers it, kept by what its record's key was made with (the
+/// width planted in it, when one is): a build of the same sources lowers the same front, so
+/// these tests lower it once for each.
+#[derive(Default)]
+struct Fronts(Vec<(Option<Option<u32>>, ScriptFront)>);
+
+impl Fronts {
+    /// The front of a build whose client is shown `drawing`, its record's key made with the
+    /// client's width when `planted` (the bug: the width is an input of the key, as it was).
+    fn of(&mut self, drawing: Drawing, planted: bool) -> &ScriptFront {
+        let with = planted.then_some(drawing.width);
+        let at = match self.0.iter().position(|it| it.0 == with) {
+            Some(at) => at,
+            None => {
+                compile::PLANTED_WIDTH.set(with);
+                let front = script_front(SCRIPT, true, &[("FOO", "on")]);
+                compile::PLANTED_WIDTH.set(None);
+                self.0.push((with, front));
+                self.0.len() - 1
+            }
+        };
+        &self.0[at].1
+    }
+}
+
 /// One build of the project for a client shown diagnostics as `drawing` says: the unit's
 /// record looked for under its key and, when the store has none, its compile run and its
 /// record kept; then what it said drawn for the client from the record. Whether its compile
 /// ran, and what the client is shown.
-fn build(store: &mut Store, drawing: Drawing, planted: bool) -> (bool, Vec<Diagnostic>) {
-    // The planted bug: the client's width is an input of the key, as it was.
-    compile::PLANTED_WIDTH.set(planted.then_some(drawing.width));
-    let front = script_front(SCRIPT, true, &[("FOO", "on")]);
-    compile::PLANTED_WIDTH.set(None);
+fn build(
+    fronts: &mut Fronts,
+    store: &mut Store,
+    drawing: Drawing,
+    planted: bool,
+) -> (bool, Vec<Diagnostic>) {
+    let front = fronts.of(drawing, planted);
     let env = reads::tests::env(&[("FOO", "on")]);
     let found = store.filed.find(front.base, &env).map(|it| it.key);
     let (ran, key) = match found {
@@ -166,20 +193,21 @@ fn drawings() -> Vec<Drawing> {
 /// bytes whoever it was built for. The first failure, by the pair.
 fn held(planted: bool) -> Result<(), String> {
     let all = drawings();
+    let mut fronts = Fronts::default();
     let mut records: Vec<Vec<u8>> = Vec::new();
     for first in &all {
         for second in &all {
             let mut store = Store::default();
-            let (ran, _) = build(&mut store, *first, planted);
+            let (ran, _) = build(&mut fronts, &mut store, *first, planted);
             assert!(ran, "a store with no record of it: the unit is compiled");
             records.extend(store.filed.0.values().filter(|it| it.starts_with(compile::header::MAGIC)).cloned());
-            let (ran, shown) = build(&mut store, *second, planted);
+            let (ran, shown) = build(&mut fronts, &mut store, *second, planted);
             if ran || store.executed != 1 {
                 return Err(format!(
                     "a build for {second:?} after one for {first:?} compiled the unit again"
                 ));
             }
-            let (_, fresh) = build(&mut Store::default(), *second, planted);
+            let (_, fresh) = build(&mut fronts, &mut Store::default(), *second, planted);
             if shown != fresh {
                 return Err(format!(
                     "a build for {second:?} after one for {first:?} shows\n{}\nwhere a build from nothing shows\n{}",
@@ -222,7 +250,9 @@ fn the_oracle_catches_the_width_put_back_in_the_key() {
 /// twenty refused functions are named unless every one is asked for.
 #[test]
 fn each_client_is_shown_the_record_drawn_its_own_way() {
-    let shown = |drawing: Drawing| text(&build(&mut Store::default(), drawing, false).1);
+    let mut fronts = Fronts::default();
+    let mut shown =
+        |drawing: Drawing| text(&build(&mut fronts, &mut Store::default(), drawing, false).1);
     let plain = Drawing { color: false, short: false, width: Some(80), refused: Some(16) };
     let narrow = shown(plain);
     let wide = shown(Drawing { width: Some(200), ..plain });
@@ -280,7 +310,8 @@ fn a_record_of_the_layout_before_is_refused_and_never_read_as_empty() {
         made: &'a compile::Made,
         placed: Option<&'a compile::Placed>,
     }
-    let drawn_once = build(&mut Store::default(), Drawing::default(), false).1;
+    let drawn_once =
+        build(&mut Fronts::default(), &mut Store::default(), Drawing::default(), false).1;
     let old = Layout11 {
         ok: false,
         open: false,
@@ -378,4 +409,81 @@ fn a_file_no_view_holds_is_drawn_from_the_text_its_record_keeps() {
     let lost = Said { texts: Vec::new(), ..said };
     let refused = drawn::draw(&lost, &|_| None, &of, Drawing::default()).unwrap_err();
     assert!(refused.what.contains("target/out/gen.rs"), "{}", refused.what);
+}
+
+/// Each line of `code` (a source of the daemon's units) that reads how the job's client is
+/// shown diagnostics off the job's input, comments aside.
+fn reads_of_the_clients_drawing(code: &str) -> Vec<usize> {
+    let read = ["input.color", "input.short", "input.width", "input.refused"];
+    code.lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            let code = line.split("//").next().unwrap_or(line);
+            read.iter().any(|it| code.contains(it))
+        })
+        .map(|(at, _)| at + 1)
+        .collect()
+}
+
+fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        match path.is_dir() {
+            true => sources(&path, out),
+            false if path.extension().is_some_and(|it| it == "rs") => out.push(path),
+            false => {}
+        }
+    }
+}
+
+/// The guard of what this module holds: no code that makes a unit reads how the job's client
+/// is shown diagnostics. The one read of it is `compile::drawing`, whose `Drawing` is for
+/// `drawn::draw` and for a line said to the client as it is answered; a read anywhere else is
+/// how the width came to be in every record's key. Held by reading the units' sources, tests
+/// aside.
+#[test]
+fn no_unit_reads_how_its_client_is_shown_diagnostics_but_to_draw_them() {
+    let unit = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/serve");
+    let mut files = vec![unit.join("unit.rs")];
+    sources(&unit.join("unit"), &mut files);
+    assert!(files.len() > 20, "the units' sources are under {}", unit.display());
+    let mut found = Vec::new();
+    let mut the_one = 0;
+    for file in files {
+        let name = file.strip_prefix(&unit).unwrap().to_string_lossy().into_owned();
+        if name.ends_with("tests.rs") || name.contains("/tests/") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file).unwrap();
+        // `compile::drawing` is the one place: its four lines are not counted.
+        let (code, drawing) = match text.split_once("pub(super) fn drawing(job: &Job) -> Drawing {") {
+            Some((before, rest)) if name == "unit/compile.rs" => {
+                let (body, after) = rest.split_once("\n}\n").unwrap();
+                the_one += reads_of_the_clients_drawing(body).len();
+                // The lines of the body stay, emptied, so the lines after it keep their numbers.
+                (format!("{before}{}{after}", "\n".repeat(body.lines().count() + 1)), true)
+            }
+            _ => (text.clone(), false),
+        };
+        assert_eq!(drawing, name == "unit/compile.rs", "`compile::drawing` is in {name}");
+        for line in reads_of_the_clients_drawing(&code) {
+            found.push(format!("crates/blaze-cargo/src/serve/{name}:{line}"));
+        }
+    }
+    assert_eq!(the_one, 4, "`compile::drawing` reads the colour, the format, the width and `--refused`");
+    assert!(
+        found.is_empty(),
+        "these lines read how the job's client is shown diagnostics while a unit is made: what a \
+         unit says goes into its `drawn::Said` as what it says, and is drawn by `drawn::draw`; a \
+         line said as the client is answered takes `compile::drawing(job)`:\n{}",
+        found.join("\n")
+    );
+}
+
+#[test]
+fn the_oracle_catches_a_unit_that_reads_its_clients_width() {
+    let bad = "fn key(job: &Job) {\n    hasher.update(&job.input.width);\n}\n";
+    assert_eq!(reads_of_the_clients_drawing(bad), [2]);
+    let said = "// `job.input.width` is the client's\nlet it = drawing(job).width;\n";
+    assert_eq!(reads_of_the_clients_drawing(said), Vec::<usize>::new());
 }
