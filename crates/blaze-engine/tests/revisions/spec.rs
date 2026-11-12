@@ -354,7 +354,7 @@ fn step(word: &str, at: &str) -> Step {
 }
 
 /// Every key a revision's table may hold: another is a typo, and is refused.
-const KEYS: [&str; 25] = [
+const KEYS: [&str; 26] = [
     "action", "args", "env", "steps", "remove", "fails", "prints", "says", "redone", "redone_within", "redone_has", "reused",
     "max_units", "max_records", "max_runs", "max_executed", "max_verified", "max_written", "max_unkept", "max_described", "max_ms", "noop", "link", "bytes", "known", "about",
 ];
