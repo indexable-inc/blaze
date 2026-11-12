@@ -363,7 +363,14 @@ fn oracle(turns: &[generate::Turn]) {
 /// `HEGEL_TEST_CASES=<n>` runs it longer.
 #[test]
 fn any_turn_sequence_builds_as_clean() {
+    // `BLAZE_ORACLE_MINUTES=<n>` with a large `HEGEL_TEST_CASES`: a run of that long; the
+    // sequences after it are not run.
+    let minutes: Option<u64> = std::env::var("BLAZE_ORACLE_MINUTES").ok().map(|it| it.parse().expect("BLAZE_ORACLE_MINUTES is a number"));
+    let began = Instant::now();
     super::run_cases(40, |tc| {
+        if minutes.is_some_and(|it| began.elapsed().as_secs() >= it * 60) {
+            return;
+        }
         let mut draw = |n: u64| tc.draw(hegel::generators::integers::<u64>().max_value(n - 1));
         let turns = generate::turns(&mut draw, generate::Parts::LIBRARY, true, 6);
         oracle(&turns);

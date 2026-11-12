@@ -80,7 +80,14 @@ fn any_turn_sequence_builds_as_clean() {
     if std::env::var_os("BLAZE_ORACLE_SEED").is_some() {
         settings = settings.seed(Some(number("BLAZE_ORACLE_SEED", 0)));
     }
+    // `BLAZE_ORACLE_MINUTES=<n>` with a large `BLAZE_ORACLE_CASES`: a run of that long; the
+    // sequences after it are not run.
+    let minutes = std::env::var_os("BLAZE_ORACLE_MINUTES").map(|_| number("BLAZE_ORACLE_MINUTES", 0));
+    let began = std::time::Instant::now();
     Hegel::new(move |tc: hegel::TestCase| {
+        if minutes.is_some_and(|it| began.elapsed().as_secs() >= it * 60) {
+            return;
+        }
         let mut draw = |n: u64| tc.draw(gs::integers::<u64>().max_value(n - 1));
         let parts = generate::parts(&mut draw);
         let turns = generate::turns(&mut draw, parts, false, most);

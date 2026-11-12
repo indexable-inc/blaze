@@ -670,7 +670,10 @@ turn that changes nothing or only comments and layout; the one function for a bo
   plants a stale store entry (`the_oracle_catches_a_stale_store_entry`).
   `BLAZE_REVISIONS_STORE_CHECK=off` lets a stale hit through so the oracle lists what came of it.
 - **Real** (`oracle.rs`, ignored tests: minutes of builds a sequence): the whole workspace under
-  a real daemon. `BLAZE_ORACLE_CASES`, `BLAZE_ORACLE_TURNS`, `BLAZE_ORACLE_SEED`;
+  a real daemon. `BLAZE_ORACLE_CASES`, `BLAZE_ORACLE_TURNS`, `BLAZE_ORACLE_SEED`,
+  `BLAZE_ORACLE_MINUTES` (both drivers: no sequence starts after that long; give it with a large
+  case count), `BLAZE_ORACLE_REPLAY="parts made; scriptcfg; body=1 kill"` with the test `oracle::replay`
+  (a sequence written by hand, `generate::parse`);
   `BLAZE_ORACLE_SKIP=<names>` leaves out edit kinds (`body`, `scriptcfg`..), events (`kill`,
   `cancel`..) and parts (`mac-part`..) with a known failure while the rest run;
   `BLAZE_ORACLE_CLEAN=when-wrong` builds a revision from nothing only when its incremental build
