@@ -11,9 +11,8 @@
 //! that no live range overlaps any more and that the end has passed, once.
 
 use alloc::vec::Vec;
-use bstd::mem::Kept;
 
-use crate::{Error, Range};
+use crate::{Error, Kept, Range};
 
 /// The code area of one process, as offsets from where its driver mapped it.
 pub struct Area {

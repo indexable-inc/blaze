@@ -34,10 +34,9 @@
 //!   again after a bind, and a function pointer names an entry thunk.
 
 use alloc::vec::Vec;
-use bstd::mem::Kept;
 
 use crate::area::Area;
-use crate::{CodeId, Error, Frame, Range, Slot, Thread, Tier, Txn};
+use crate::{CodeId, Error, Frame, Kept, Range, Slot, Thread, Tier, Txn};
 
 /// What a core is made for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

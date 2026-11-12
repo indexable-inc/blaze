@@ -1402,8 +1402,16 @@ name = "blaze-launch"
 version = "0.0.0"
 dependencies = [
  "blaze-protocol",
- "blaze-std",
  "hegeltest",
+]
+
+[[package]]
+name = "blaze-launch-rt"
+version = "0.0.0"
+dependencies = [
+ "blaze-launch",
+ "crossbeam-channel",
+ "libc",
 ]
 
 [[package]]
