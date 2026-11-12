@@ -257,6 +257,10 @@ fn one(test: &Test, seed: u64) -> (Vec<Row>, Vec<String>) {
                     state.log.push("the same text set again".to_owned());
                     state.db.set_file_text(state.file, &text);
                 }
+                Step::Wait(_) => panic!(
+                    "{}: the step `wait` is the real driver's: the simulation's database does nothing of its own accord",
+                    test.name
+                ),
                 Step::Project(name) => panic!(
                     "{}: the step `project {name}` is the real driver's: the simulation has one project and one database",
                     test.name
@@ -372,7 +376,7 @@ fn any_turn_sequence_builds_as_clean() {
 #[test]
 fn the_oracle_catches_a_stale_store_entry() {
     use generate::{Edit, Event, Save, Turn};
-    let turn = |edit| Turn { edits: vec![edit], save: Save::Write, event: Event::Nothing, event_last: false, width: None };
+    let turn = |edit| Turn { request: generate::Request::RUN, edits: vec![edit], save: Save::Write, event: Event::Nothing, event_last: false, width: None };
     let parts = generate::Parts::LIBRARY;
     let test = generate::test("control", parts, &[turn(Edit::Body(1))], &["sim"]);
     let texts = [text_at(&test, 0), text_at(&test, 1)];

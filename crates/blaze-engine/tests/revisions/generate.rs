@@ -119,8 +119,46 @@ pub enum Event {
     Build,
 }
 
+/// What a turn asks blaze for. The simplest is `run`, a dev build, the manifest's features.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct Request {
+    pub action: Ask,
+    pub release: bool,
+    /// `--features loud`, whatever the manifest's default is.
+    pub loud: bool,
+    /// `--message-format json-diagnostic-short` after the driver's own.
+    pub short: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Ask {
+    Run,
+    Build,
+    Check,
+    Test,
+}
+
+impl Request {
+    pub const RUN: Request = Request { action: Ask::Run, release: false, loud: false, short: false };
+
+    fn args(self) -> Vec<String> {
+        let mut args = Vec::new();
+        if self.release {
+            args.push("--release".to_owned());
+        }
+        if self.loud {
+            args.extend(["--features".to_owned(), "loud".to_owned()]);
+        }
+        if self.short {
+            args.extend(["--message-format".to_owned(), "json-diagnostic-short".to_owned()]);
+        }
+        args
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Turn {
+    pub request: Request,
     pub edits: Vec<Edit>,
     pub save: Save,
     pub event: Event,
@@ -224,6 +262,13 @@ impl Model {
         let loud = if self.loud { 1024 } else { 0 };
         let extra = if self.extra { 2048 } else { 0 };
         read ^ shapes ^ first ^ 7 ^ mode ^ loud ^ (9 ^ 8) ^ (1 ^ 16) ^ extra ^ self.shown()
+    }
+
+    /// What the program prints when built with `--features loud` or without.
+    pub fn prints_with(&self, loud: bool) -> String {
+        let mut built = self.clone(); // clone: the model as the command line's feature makes it
+        built.loud |= loud;
+        built.prints()
     }
 
     /// What the program prints.
@@ -446,7 +491,23 @@ pub fn turn(draw: &mut dyn Draw, parts: Parts, library_only: bool) -> Turn {
         7 if !library_only && !skipped("width") => Some(200),
         _ => None,
     };
-    Turn { edits, save, event, event_last, width }
+    // The alternations: another command, profile, feature set or message format than the
+    // turn before, over the same daemon.
+    let request = match library_only {
+        true => Request::RUN,
+        false => Request {
+            action: match draw.below(8) {
+                4 | 5 if !skipped("build-ask") => Ask::Build,
+                6 if !skipped("check-ask") => Ask::Check,
+                7 if !skipped("test-ask") => Ask::Test,
+                _ => Ask::Run,
+            },
+            release: draw.below(8) == 7 && !skipped("release"),
+            loud: draw.below(6) == 5 && !skipped("loud-flag"),
+            short: draw.below(8) == 7 && !skipped("short"),
+        },
+    };
+    Turn { request, edits, save, event, event_last, width }
 }
 
 /// A sequence of one to `most` turns, drawn.
@@ -479,22 +540,35 @@ fn bound(before: &Model, after: &Model) -> Option<Vec<String>> {
 pub fn test(name: &str, parts: Parts, turns: &[Turn], drivers: &[&str]) -> Test {
     let mut model = Model::new(parts);
     let mut files = model.files();
-    let revision = |label: String, changes, steps, env, expect| Revision {
+    let revision = |label: String, request: Request, changes, steps, env, expect| Revision {
         label,
         changes,
         steps,
-        action: Action::Run,
-        args: Vec::new(),
+        action: match request.action {
+            Ask::Run => Action::Run,
+            Ask::Build => Action::Build,
+            Ask::Check => Action::Check,
+            Ask::Test => Action::Test,
+        },
+        args: request.args(),
         env,
         expect,
         known: BTreeMap::new(),
     };
+    // The requests made since the sources last changed, each with the terminal's width, and
+    // those made at all: a request made again of the same sources is a no-op in units and
+    // runs a number of queries that is not the dependencies'; an edit's bound holds for a
+    // request the daemon has built before (the first `test` builds the tests).
+    let mut width = None;
+    let mut since_change = vec![(Request::RUN, width)];
+    let mut ever = vec![Request::RUN];
     let all = |files: &BTreeMap<String, Vec<u8>>| {
         // clone: the files as the revision's changes
         files.iter().map(|(path, bytes)| Change { path: path.clone(), bytes: Some(bytes.clone()) }).collect()
     };
     let mut revisions = vec![revision(
         "rev1".to_owned(),
+        Request::RUN,
         all(&files),
         vec![Step::Edit],
         Vec::new(),
@@ -538,15 +612,30 @@ pub fn test(name: &str, parts: Parts, turns: &[Turn], drivers: &[&str]) -> Test 
         if last {
             steps.extend(event);
         }
-        let within = bound(&before, &model);
+        let request = turn.request;
+        width = turn.width.or(width);
+        if before != model {
+            since_change.clear();
+        }
+        // Made before of these very sources: whatever the width, no unit and no function,
+        // and few queries (200,000 and more is what lowering a workspace over std runs).
+        let again = since_change.iter().any(|(it, _)| *it == request);
+        let within = match (again, ever.contains(&request)) {
+            (true, _) => Some(Vec::new()),
+            (false, true) => bound(&before, &model),
+            (false, false) => None,
+        };
         let expect = Expect {
-            prints: Some(model.prints()),
+            prints: (request.action == Ask::Run).then(|| model.prints_with(request.loud)),
             max_units: within.as_ref().map(|it| it.len() as u64),
+            max_executed: again.then_some(2000),
             redone_within: within,
             ..Expect::default()
         };
+        since_change.push((request, width));
+        ever.push(request);
         let env = turn.width.map(|it| ("__CARGO_TEST_TTY_WIDTH_DO_NOT_USE_THIS".to_owned(), it.to_string()));
-        revisions.push(revision(format!("rev{}", index + 2), changes, steps, env.into_iter().collect(), expect));
+        revisions.push(revision(format!("rev{}", index + 2), request, changes, steps, env.into_iter().collect(), expect));
     }
     Test {
         name: name.to_owned(),
@@ -591,6 +680,12 @@ pub fn write_case(test: &Test, into: &Path) {
         }
         if let Some(most) = revision.expect.max_units {
             _ = writeln!(toml, "max_units = {most}");
+        }
+        if let Some(most) = revision.expect.max_executed {
+            _ = writeln!(toml, "max_executed = {most}");
+        }
+        if !revision.args.is_empty() {
+            _ = writeln!(toml, "args = [{}]", list(&revision.args));
         }
     }
     fs::create_dir_all(&dir).unwrap();

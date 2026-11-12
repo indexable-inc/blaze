@@ -24,7 +24,7 @@ use hegel::{Hegel, Settings, generators as gs};
 
 use super::{
     check,
-    generate::{self, Edit, Event, Parts, Save, Turn},
+    generate::{self, Ask, Edit, Event, Parts, Request, Save, Turn},
     real::{self, Clean},
 };
 
@@ -96,7 +96,7 @@ fn any_turn_sequence_builds_as_clean() {
 #[ignore = "minutes of real builds: docs/harness.md, \"The oracle\""]
 fn each_kind_once_builds_as_clean() {
     let parts = Parts { up: true, made: true, mac: std::env::var_os("BLAZE_ORACLE_NO_MAC").is_none() };
-    let turn = |edits: &[Edit], save, event, event_last, width| Turn { edits: edits.to_vec(), save, event, event_last, width };
+    let turn = |edits: &[Edit], save, event, event_last, width| Turn { request: Request::RUN, edits: edits.to_vec(), save, event, event_last, width };
     let mut turns = vec![
         turn(&[Edit::Body(1)], Save::Write, Event::Nothing, false, None),
         turn(&[], Save::Write, Event::Nothing, false, None),
@@ -121,6 +121,44 @@ fn each_kind_once_builds_as_clean() {
     case(parts, &turns);
 }
 
+/// The alternations alone, no edit between: build, test, build, test, check, run, release,
+/// run, the feature on the command line and off, another width, another message format, each
+/// a second time. After its first occurrence a request is a no-op in units and runs few
+/// queries, whatever was asked between (the kept front end, the no-op lane's kept answer).
+#[test]
+#[ignore = "minutes of real builds: docs/harness.md, \"The oracle\""]
+fn alternating_requests_of_unchanged_sources_are_no_ops() {
+    let parts = Parts { up: true, made: true, mac: false };
+    let ask = |action, release, loud, short, width| Turn {
+        request: Request { action, release, loud, short },
+        edits: Vec::new(),
+        save: Save::Write,
+        event: Event::Nothing,
+        event_last: false,
+        width,
+    };
+    let turns = [
+        ask(Ask::Build, false, false, false, None),
+        ask(Ask::Test, false, false, false, None),
+        ask(Ask::Build, false, false, false, None),
+        ask(Ask::Test, false, false, false, None),
+        ask(Ask::Check, false, false, false, None),
+        ask(Ask::Run, false, false, false, None),
+        ask(Ask::Check, false, false, false, None),
+        ask(Ask::Run, true, false, false, None),
+        ask(Ask::Run, false, false, false, None),
+        ask(Ask::Run, true, false, false, None),
+        ask(Ask::Run, false, true, false, None),
+        ask(Ask::Run, false, false, false, None),
+        ask(Ask::Run, false, true, false, None),
+        ask(Ask::Run, false, false, false, Some(80)),
+        ask(Ask::Run, false, false, true, None),
+        ask(Ask::Run, false, false, false, None),
+        ask(Ask::Run, false, false, true, None),
+    ];
+    case(parts, &turns);
+}
+
 /// The control: a build that answers with the program of before an edit is caught. The
 /// planted bug is in the case (the edit's save is taken out of it), so what ran disagrees
 /// with the model's `prints` and with a clean build of the sources the edit makes.
@@ -128,7 +166,7 @@ fn each_kind_once_builds_as_clean() {
 #[ignore = "minutes of real builds: docs/harness.md, \"The oracle\""]
 fn the_oracle_catches_a_build_of_the_sources_before() {
     let parts = Parts { up: false, made: false, mac: false };
-    let turns = [Turn { edits: vec![Edit::Body(1)], save: Save::Write, event: Event::Nothing, event_last: false, width: None }];
+    let turns = [Turn { request: Request::RUN, edits: vec![Edit::Body(1)], save: Save::Write, event: Event::Nothing, event_last: false, width: None }];
     let mut test = generate::test("control", parts, &turns, &["real"]);
     // The planted bug: the edit is never saved, so the build is of the sources before.
     let lost = std::mem::take(&mut test.revisions[1].changes);
