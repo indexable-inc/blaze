@@ -2921,11 +2921,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 }
                 Out::Answer(reply) => self.reply(&reply),
                 Out::Moved { head, root } => {
-                    // A save the watcher committed: built ahead where the head was built
-                    // before and nothing else is at work, so the edit is pushed through
-                    // the front end now and not at the next request. What was done is said.
-                    let ahead = self.session.head_moved(&mut cx!(self), &head, root);
-                    tracing::info!(target: "blaze", head = head.as_str(), ahead = ?ahead, "save seen");
+                    self.session.head_moved(&mut cx!(self), &head, root);
                     self.after_session();
                 }
             }
