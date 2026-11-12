@@ -883,7 +883,8 @@ mod tests {
     #[test]
     fn the_node_bound_merges_only_when_the_newer_findings_match_the_oldest() {
         let big: Vec<u32> = (0..LOG_NODES as u32 + 10).collect();
-        let mut log = vec![found(1, &big[..LOG_NODES / 2 + 5]), found(2, &big[LOG_NODES / 2 + 5..])];
+        // The oldest holds a quarter: the bound is `LOG_NODES`, which the two pass together.
+        let mut log = vec![found(1, &big[..LOG_NODES / 4]), found(2, &big[LOG_NODES / 4..])];
         merge_oldest(&mut log);
         assert_eq!(log.len(), 1, "past the node bound the findings are one");
         assert_eq!((log[0].at, log[0].nodes.len()), (2, big.len()));
