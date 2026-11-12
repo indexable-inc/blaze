@@ -174,6 +174,42 @@ pub(crate) struct Mark {
     weak: ByHash<Key, Vec<Key>, Global>, // alloc: the mark's table, held while the mark is the store's
     /// Every referent could be read: a mark that could not follow one keeps everything.
     sound: bool,
+    /// How many keys readers had ever kept ([`Keep`]) when its scan was taken: a key kept
+    /// since is in no set of it, so a seal under it is refused.
+    kept_changes: u64,
+}
+
+/// A reader's hold on a key for longer than a build: while it lives, the collector keeps the
+/// key's record (and what it names) whatever its flags of use and its pack's age. For what
+/// reads a record a part at a time over a database's whole life (`hir_def`'s def map pages)
+/// and must never find it gone between two parts. Taken while the build that makes the reader
+/// is under way: a pack is sealed only between builds and only as scanned since the last one
+/// began, so a key kept during a build is in the next mark before any seal. It is memory's
+/// only: a daemon that restarts keeps nothing, and its readers are gone with it.
+pub struct Keep {
+    shared: Arc<crate::read::Shared>,
+    key: Key,
+}
+
+impl Keep {
+    pub fn key(&self) -> Key {
+        self.key
+    }
+}
+
+impl Drop for Keep {
+    fn drop(&mut self) {
+        self.shared.let_go_of(&self.key);
+    }
+}
+
+impl Reader {
+    /// Keeps `key` from the collector for as long as the [`Keep`] lives.
+    pub fn keep(&self, key: Key) -> Keep {
+        self.shared.keep(key);
+        // clone: a count, once per key kept
+        Keep { shared: Arc::clone(&self.shared), key }
+    }
 }
 
 /// What the store keeps for its collector.
@@ -408,6 +444,9 @@ pub struct PeriodScan {
     /// Each own pack that was removed or retiring when the scan was taken.
     passed: Vec<bool>,
     placed: Vec<Key>,
+    /// The keys readers keep ([`Keep`]), and how many were ever kept, as it was taken.
+    kept: Vec<Key>,
+    kept_changes: u64,
     done: bool,
     pub(crate) demote: Vec<(Key, Loc, Row)>,
     pub(crate) promote: Vec<(Key, Loc, Row)>,
@@ -470,7 +509,7 @@ impl PeriodScan {
                 }
             }
         }
-        for key in &self.placed {
+        for key in self.placed.iter().chain(&self.kept) {
             if self.rooted.insert(*key) {
                 work.push(*key);
             }
@@ -1074,7 +1113,10 @@ impl Store {
 
     pub(crate) fn scan_new(&self, rotate: bool) -> PeriodScan {
         let own = &self.tiers[0];
+        let (kept, kept_changes) = self.shared.kept();
         PeriodScan {
+            kept,
+            kept_changes,
             reader: self.reader(),
             // clone: an `Arc`, once a scan
             index: own.index.clone(),
@@ -1194,7 +1236,7 @@ impl Store {
     /// and the scans the store runs itself end with.
     pub(crate) fn keep_scan(&mut self, scan: PeriodScan) -> Moves {
         let PeriodScan {
-            demote, promote, named, pins, rooted, weak, sound, scanned, mut problems, ..
+            demote, promote, named, pins, rooted, weak, sound, scanned, kept_changes, mut problems, ..
         } = scan;
         self.problems.append(&mut problems);
         for (content, external) in &mut self.tiers[0].externals {
@@ -1205,8 +1247,13 @@ impl Store {
         collecting.scanned = scanned;
         collecting.generations += 1;
         // alloc: once a scan, the mark the collector's batches share
-        collecting.mark =
-            Some(Arc::new(Mark { generation: collecting.generations, rooted, weak, sound }));
+        collecting.mark = Some(Arc::new(Mark {
+            generation: collecting.generations,
+            rooted,
+            weak,
+            sound,
+            kept_changes,
+        }));
         Moves { demote, demoted: 0, promote, promoted: 0 }
     }
 
@@ -1413,6 +1460,8 @@ impl Store {
             .flat_map(|it| &it.moves)
             .any(|it| it.to.pack as usize == at);
         let holds = self.collecting.mark.as_ref().is_some_and(|it| it.generation == batch.mark.generation)
+            // A key a reader kept since the mark is in no set of it.
+            && self.shared.kept_changes() == batch.mark.kept_changes
             && !pack.removed
             && !pack.retiring
             && pack.closing

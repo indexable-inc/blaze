@@ -78,6 +78,13 @@ pub(crate) struct Shared {
     /// passed its grace, a table of pins among it ([`Shared::pins_let_go`]).
     bound: Lock<()>,
     unpinned: Signal,
+    /// The keys readers keep for longer than a build ([`crate::collect::Keep`]: a kept front
+    /// end that reads a record a part at a time for its whole life), each with how many keep
+    /// it: roots of the collector, whatever their flags of use. Held for one insert, remove
+    /// or copy.
+    kept: blaze_core::lock::Lock<ByHash<Key, u32, Global>>,
+    /// Counts every key kept, ever: a mark of the collector made before one is stale.
+    kept_changes: std::sync::atomic::AtomicU64,
     /// The store's clock as it was last told ([`crate::Store::clock`]), in seconds: what a
     /// read stamps its pack with. `std`'s atomic under the model checker too: a hint, read
     /// and written with no ordering.
@@ -114,6 +121,9 @@ impl Shared {
             side,
             bound: Lock::new("store.pool.pinned", ()),
             unpinned: Signal::new("store.pool.unpinned"),
+            // alloc: empty, allocates nothing until a key is kept
+            kept: blaze_core::lock::Lock::new("store.kept", ByHash::new_in(Global)),
+            kept_changes: std::sync::atomic::AtomicU64::new(0),
             tick: std::sync::atomic::AtomicU64::new(0),
             // alloc: once per store opened, the view readers load
             view: AtomicPtr::new(Box::into_raw(Box::new(view))),
@@ -125,6 +135,35 @@ impl Shared {
             // alloc: empty, allocates nothing until a whole file is written
             unflushed: blaze_core::lock::Lock::new("store.unflushed", crate::ByHashSet::new_in(Global)),
         }
+    }
+
+    /// `key` is kept by one more reader.
+    pub(crate) fn keep(&self, key: Key) {
+        // alloc: one entry a key kept, removed when its last keeper lets go
+        *self.kept.lock().entry(key).or_insert(0) += 1;
+        self.kept_changes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// One reader fewer keeps `key`.
+    pub(crate) fn let_go_of(&self, key: &Key) {
+        let mut kept = self.kept.lock();
+        if let Some(count) = kept.get_mut(key) {
+            *count -= 1;
+            if *count == 0 {
+                kept.remove(key);
+            }
+        }
+    }
+
+    /// The keys kept now, and how many were ever kept.
+    pub(crate) fn kept(&self) -> (Vec<Key>, u64) {
+        let changes = self.kept_changes.load(std::sync::atomic::Ordering::SeqCst);
+        // alloc: once a scan of a period's end, the keys kept: a few
+        (self.kept.lock().keys().copied().collect(), changes)
+    }
+
+    pub(crate) fn kept_changes(&self) -> u64 {
+        self.kept_changes.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The store's clock, in seconds; 0 until it is told.

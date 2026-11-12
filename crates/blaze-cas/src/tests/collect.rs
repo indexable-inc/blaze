@@ -943,3 +943,34 @@ fn a_flush_that_meets_the_collectors_commit_is_counted_and_the_commit_is_small()
     assert!(!world.store.collect_committing());
     world.check().unwrap();
 }
+
+/// A key a reader keeps ([`crate::collect::Keep`]: a kept front end that reads a record a
+/// part at a time for its whole life) is not forgotten while the keep lives, whatever its
+/// flags of use and its pack's age. The control is the same run with no keep, which forgets
+/// the key.
+#[test]
+fn a_key_a_reader_keeps_is_not_forgotten_while_it_is_kept() {
+    let run = |kept: Option<u64>| {
+        let mut world = World::new(6, quiet(), Plants::default());
+        let ops = directed();
+        // The build that makes the reader is under way when it takes its keep.
+        for op in &ops[..3] {
+            world.step(op).and_then(|()| world.check()).unwrap();
+        }
+        let keep = kept.map(|n| world.store.reader().keep(key(n)));
+        for (at, op) in ops[3..].iter().enumerate() {
+            world.step(op).and_then(|()| world.check()).unwrap_or_else(|why| panic!("op {at} ({op:?}): {why}"));
+        }
+        world.settle_down().unwrap();
+        (world, keep)
+    };
+    let (world, _) = run(None);
+    // A short record of the first build that the run forgets.
+    let forgotten = (0..100)
+        .find(|n| n % 8 != 7 && world.peek(*n).unwrap().is_none())
+        .expect("the run forgets a short record of the first build");
+    let (world, keep) = run(Some(forgotten));
+    assert_eq!(world.peek(forgotten).unwrap(), Some(value(forgotten).1), "kept key {forgotten}");
+    assert!(world.store.usage().counts.records_forgotten > 0, "the run still collects");
+    drop(keep);
+}

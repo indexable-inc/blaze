@@ -626,6 +626,129 @@ mod tests {
         assert!(line.contains("the volume has 10.0GiB free, under its comfortable 30.0GiB"), "{line}");
     }
 
+    /// A store on the simulation with `count` short records put and committed, enough of
+    /// them that its index table holds them (only a record the index holds can be forgotten).
+    fn filled(sim: &mut blaze_core::sim::Sim, count: u64) -> Store {
+        let name = |it: &str| blaze_core::FileName::new(it).unwrap();
+        let config = blaze_cas::Config {
+            dir: name("home/v2/store"),
+            layers: Vec::new(),
+            tags: 1 << 40,
+            load_tags: (1 << 40) + (1 << 32),
+            loader: blaze_cas::Loader::Pumped,
+        };
+        let mut effects = Vec::new();
+        let mut store = Store::open(config, &mut effects);
+        driven(sim, &mut store, &mut effects);
+        for n in 0..count {
+            store.put(key(n), blaze_cas::Kind::Code, &n.to_le_bytes().repeat(8)).unwrap();
+        }
+        store.flush(&mut effects);
+        driven(sim, &mut store, &mut effects);
+        store
+    }
+
+    fn key(n: u64) -> blaze_cas::Key {
+        blaze_cas::Key(blaze_ids::ContentId::of("blaze store collect test key", &n.to_le_bytes()))
+    }
+
+    fn driven(sim: &mut blaze_core::sim::Sim, store: &mut Store, effects: &mut Vec<blaze_core::Effect>) {
+        blaze_core::run_until_idle(sim, effects, |completion, effects| {
+            if store.owns(completion.tag) {
+                store.complete(completion, effects);
+            }
+        })
+        .expect("the effects end");
+    }
+
+    /// Periods ended until `periods` have, each a scan run here.
+    fn periods(sim: &mut blaze_core::sim::Sim, store: &mut Store, periods: u32) {
+        let mut ended = 0;
+        for _ in 0..200 {
+            if ended == periods {
+                return;
+            }
+            let mut effects = Vec::new();
+            store.flush(&mut effects);
+            driven(sim, store, &mut effects);
+            ended += u32::from(store.end_period());
+        }
+        panic!("the store ended {ended} of {periods} periods in 200 asks");
+    }
+
+    /// A store filled earlier (by a blaze from before pins, or imported), then one build
+    /// that only finds the standard library's records (`found`: it queues them as a build
+    /// does, [`keep`]), then every unrooted record collected: whether each of the standard
+    /// library's keys is still there, and how many records were forgotten.
+    fn found_then_collected(found: bool) -> (Vec<bool>, u64) {
+        use blaze_core::Driver as _;
+        let mut sim = blaze_core::sim::Sim::new(31, blaze_core::sim::Faults::default());
+        // Past the 65,536 records after which the store writes its index table.
+        let mut store = filled(&mut sim, 70_000);
+        let std: Vec<blaze_cas::Key> = (100..140).map(key).collect();
+        let gone = std::env::temp_dir().join(format!("blaze-collect-none-{}", std::process::id()));
+        let pace = Pace { grace: Duration::ZERO, ..Pace::default() };
+        let mut collects = Collects::new(&gone, Compress::Inline, pace);
+        // The first scan reads the store's pins (it has none); then the build.
+        periods(&mut sim, &mut store, 1);
+        if found {
+            keep(TOOLCHAIN, std.iter().copied());
+        }
+        collects.build_ended(&mut store);
+        // (Other tests of the process may have queued keys of their own for the pin: the
+        // queue is the process's. They are never this store's.)
+        let pinned = |store: &Store| {
+            store
+                .pins()
+                .find(|pin| pin.name == TOOLCHAIN && std.iter().all(|key| pin.keys.contains(key)))
+                .map(|pin| (pin.when, pin.keys.len()))
+        };
+        let when = pinned(&store);
+        assert_eq!(when.is_some(), found, "the pin is written by the build that found them, and only then");
+        // Again, the same keys found: the pin is not written again (unless another test's
+        // keys came with them, which makes it a longer pin).
+        if found {
+            keep(TOOLCHAIN, std.iter().copied());
+            collects.build_ended(&mut store);
+            let again = pinned(&store);
+            assert!(
+                again == when || again.map(|it| it.1) > when.map(|it| it.1),
+                "a build that finds what is pinned wrote the pin again: {when:?} then {again:?}"
+            );
+        }
+        // The records go unused for two periods and more, and everything unrooted is asked
+        // to go.
+        periods(&mut sim, &mut store, 3);
+        collects.ask(sim.now(), false, true);
+        for _ in 0..20_000 {
+            let mut effects = Vec::new();
+            collects.turn(&mut store, None, true, sim.now(), &mut effects);
+            driven(&mut sim, &mut store, &mut effects);
+            if !collects.asked_waits(sim.now()) && store.usage().counts.packs_retired > 0 && !store.committing() {
+                break;
+            }
+            sim.advance(Duration::from_millis(60));
+        }
+        let guard = blaze_cas::enter();
+        let reader = store.reader();
+        let there = std.iter().map(|key| reader.get(&guard, key).unwrap().is_some()).collect();
+        (there, store.usage().counts.records_forgotten)
+    }
+
+    /// The invariant: the standard library's records a build found are pinned by that build,
+    /// though it wrote none of them, and a collection of everything unrooted keeps them. The
+    /// control is the pin made on write only: the same store and the same collection with
+    /// nothing queued by the build that found them, which forgets them.
+    #[test]
+    fn records_a_build_only_found_are_pinned_and_survive_a_collection() {
+        let (there, forgotten) = found_then_collected(true);
+        assert!(forgotten > 1000, "the collection forgot {forgotten} records: it did not run");
+        assert!(there.iter().all(|it| *it), "a pinned record of the standard library was forgotten: {there:?}");
+        let (there, forgotten) = found_then_collected(false);
+        assert!(forgotten > 1000, "the control's collection forgot {forgotten} records: it did not run");
+        assert!(there.iter().any(|it| !*it), "the control kept every record with no pin: it tests nothing");
+    }
+
     #[test]
     fn the_bytes_of_the_state_leave_the_store_out() {
         let dir = std::env::temp_dir().join(format!("blaze-collect-other-{}", std::process::id()));
