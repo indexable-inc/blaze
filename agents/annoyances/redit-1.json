@@ -1,0 +1,11 @@
+{
+ "id": "redit-1",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+ "where": "blaze: the profile history's cap",
+ "what": "After a cold build of reth and one edit, `blaze debug sql` listed builds 1 and 3 once; the next command (`blaze explain writes`, `explain problems`) said `0 rows` and `this history has no build`. Every file of both builds was gone from `profile/`: only seven idle flushes (`0-00000218` to `0-00000224`) were left. The cap is 256 MiB since today and a reth build's history is larger, so the first idle flush after the build retired the build that had just ended, the one being asked about.",
+ "cost": "the first reproduction's evidence (11 minutes of builds) could not be queried; rerun with the cap raised",
+ "cause": "the cap keeps `the newest flush's builds`, and the newest flush after a build is an idle one of no build; nothing was said in `serve.log`",
+ "workaround": "`BLAZE_PROFILE_CAP_MB=65536` in the daemon's environment",
+ "state": "open: the newest build (not the newest flush's) should never be retired, and `explain problems` should say the history was capped, not that there is no build"
+}

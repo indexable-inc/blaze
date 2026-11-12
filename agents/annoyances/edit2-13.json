@@ -1,0 +1,11 @@
+{
+ "id": "edit2-13",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+ "where": "hir-ty-codegen's tests under cargo",
+ "what": "`v2::linked::tests::a_body_edit_among_many_makes_its_own_tables` fails every time the module's tests run side by side (`2000 functions: the link before was kept`: `no link inputs are kept for this build or its base`), on the untouched tip of all-1111 (e453ac295a) and on this lane alike, three runs of three each, and passes with `--test-threads=1`.",
+ "cost": "a base build of hir-ty-codegen's tests (ten minutes) to tell it from this lane's change to `linked`",
+ "cause": "my guess, unverified: the link inputs kept beside the database are four programs a process, and the tests of one process share them",
+ "workaround": "`--test-threads=1`",
+ "state": "open"
+}

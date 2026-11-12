@@ -1,0 +1,21 @@
+{
+ "id": "launch3-17",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+ "where": "serve/unit/run/launch.rs, serve/unit/compile.rs",
+ "what": "My first fix for a replayed record leaving a launched program on another build's code was to never replay a launched unit's record. That kept every no-op `run` out of the no-op lane (unit codegen and the launch link each run), and after other projects were built in the daemon a no-op run of hello walked the whole program again: 12 s.",
+ "cost": "the warm no-op was 32 ms where 15 was available; one 12 s no-op seen",
+ "cause": "the record's outputs name the launcher's file, the same bytes for every build, so the record could not say whose code the daemon held; I removed the replay instead of keying it",
+ "whys": [
+  "why wrong: a correctness fix by turning a cache off",
+  "why possible: the value under the key (a file) no longer identified the thing that mattered (the code the daemon holds)",
+  "why not caught: output checks passed; only timing showed it",
+  "why easy: `never` is one line, a key is a design",
+  "property: a cached answer whose validity depends on state the key does not name"
+ ],
+ "class": "cache turned off instead of keyed: a stale-answer bug fixed by never reusing, where the missing input belongs in the comparison",
+ "prevention": "rule keys-cover-every-input already says the fix is the key; a review rule for `never replay`/`always rebuild` branches: each names the input the key lacks and why it cannot be added",
+ "workaround": "",
+ "state": "fixed (5226c3d363): replay when the program's held build has the unit's whole record key",
+ "fix": "5226c3d363"
+}

@@ -1,0 +1,11 @@
+{
+ "id": "records-6",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-1111",
+ "where": "ix: copying between two VMs",
+ "what": "`ix shell a -- tar -c | ix shell b -- tar -x` moved 346 MB of LLVM in about 20 minutes.",
+ "cost": "20 minutes before the first build",
+ "cause": "two interactive shells through the Mac",
+ "workaround": "started the clone and rustup beside it",
+ "state": "open: the pinned LLVM should be fetched by its hash on the VM itself"
+}

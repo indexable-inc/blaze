@@ -1,0 +1,11 @@
+{
+ "id": "redit-9",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+ "where": "blaze: tests under cargo on Linux",
+ "what": "base-db's `extensions::tests::the_extensions_are_read_off_the_leading_inner_attributes` and `budget_tests::a_changed_file_costs_a_constant`, and blaze-lower's `code::tests::what_could_read_another_file_is_not_alone` and `tests::readers_of_two_run_classes_keep_their_keys_apart_by_the_runs_identities` fail on this lane's tree, and the same four fail on the untouched tip (1474ed0ab0), run there in a worktree and target directory of its own.",
+ "cost": "a baseline worktree and build to tell them from the lane's changes",
+ "cause": "tests that landed unrun, as rev-1 and real-5 say",
+ "workaround": "a detached worktree of 1474ed0ab0 with its own target directory",
+ "state": "open"
+}

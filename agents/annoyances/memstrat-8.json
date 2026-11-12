@@ -1,0 +1,11 @@
+{
+ "id": "memstrat-8",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+ "where": "blaze-query's tests under cargo",
+ "what": "`db::provenance::name_tests::an_id_in_a_key_reads_with_its_name_and_keeps_its_id` fails on main (3a58d0cbae) and on this lane alike, alone or with the suite: left `NamedForTheLogTest(Id(3) = serde v1.0.3`, right `NamedForTheLogTest(Id(3)`.",
+ "cost": "ten minutes telling it from this lane's change",
+ "cause": "not looked into",
+ "workaround": "ran it on main's checkout to compare (H6)",
+ "state": "open"
+}

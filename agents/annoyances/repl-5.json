@@ -1,0 +1,13 @@
+{
+ "id": "repl-5",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane repl-clean-1112",
+ "where": "my own one-off migration script in this lane (doc strings moved next to their functions)",
+ "what": "The script put `import type { Docs }` before the first `import ` it found in each file by text; in packages.ts and three others the first match was inside the header comment, so the import landed in the middle of a comment.",
+ "cost": "ten minutes, caught by reading the output",
+ "cause": "an edit by text where the tree has no by-name tool for TypeScript",
+ "class": "text edits that match inside comments or strings",
+ "prevention": "none built: rule fix-through-blaze-lints covers Rust only. For TypeScript here, anchor on `^import ` and read the diff.",
+ "fix": "a by-syntax edit tool for the TypeScript in crates/harness if such moves recur",
+ "state": "open"
+}

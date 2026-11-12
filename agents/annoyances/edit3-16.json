@@ -1,0 +1,11 @@
+{
+ "id": "edit3-16",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+ "where": "blaze: the first edits after a daemon restart, and after a pause",
+ "what": "After a daemon restart the first fifteen body edits took 97 ms median against 60 for the next thirty (this lane's build), and a comment edit made a second after the last command is a walk of 30 ms where one made at once is answered from the kept answer in 21: a row's value depends on what came just before it and how long ago.",
+ "cost": "two head-to-head runs read wrong (a restart sat between the build and the rows)",
+ "cause": "not looked into: the restart's first link and what the daemon lets go of between requests",
+ "workaround": "warm each daemon with thirty edits before the rows, and say whether a row's edits are back to back",
+ "state": "open"
+}

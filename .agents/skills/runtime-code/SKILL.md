@@ -73,8 +73,8 @@ launcher, the client, the hub. Logic that does its own IO (reads a file, the clo
 environment, starts a thread or a process, opens a socket, sleeps) is not finished work, whoever
 wrote it and however long it has been there. When you meet such code in what you are changing, cut
 the seam in the same change without being asked: the decisions go into a core, the IO into a driver
-that only performs effects and returns completions; when it is too large for the change, add an
-`agents.json` row naming the file and what blocks it, and a ledger row if it needs one. One
+that only performs effects and returns completions; when it is too large for the change, add an an
+`agents/annoyances/` row naming the file and what blocks it, and a ledger row if it needs one. One
 implementation, the real one: the code that ships is the code the simulation runs. A fake, mock,
 stub, test double or second model written because the real code could not run in a test (a simulated
 daemon beside the real daemon, a toy scheduler in a test, a hand-written in-memory store with its

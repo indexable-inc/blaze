@@ -34,7 +34,7 @@ refuses to read.
 | `vendor/` | the hyperion-* crates over flecs (flecs itself is the indexable-inc/flecs fork, pinned by rev in `vendor/hyperion-flecs-c/Cargo.toml`; `vendor/SOURCE.md`) |
 | `scripts/zig` | fetches the pinned zig through Nix |
 | `scripts/harness` | builds (with blaze) and runs the `harness` binary from this checkout |
-| `mcp/` | the Bun/TypeScript kernel the daemon runs (`mcp/src/mcp.ts`; `bun install` in `mcp/`), with its smoke scripts in `mcp/scripts/` |
+| `mcp/` | the Bun/TypeScript kernel the daemon runs: one API (`mcp/src/kernel.ts`) behind an MCP adapter (`mcp/src/mcp.ts`) and its own socket (`mcp/src/serve.ts`); `bun install` and `bun test` in `mcp/`; `mcp/scripts/cell.ts` runs cells from a shell |
 | `mcp/skills/` | harness's skills: one topic's instructions each (`<name>.md` with `name` and `description` front matter); the agent's note carries only their index, `await skill('name')` in ts loads one (`harness/src/skills.rs`, `mcp/src/skills.ts`) |
 | `harness/src/system_note/` | the always-on part of every agent's note, one file per topic (`harness/src/profiles.rs`) |
 

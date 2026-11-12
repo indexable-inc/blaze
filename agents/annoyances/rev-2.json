@@ -1,0 +1,11 @@
+{
+ "id": "rev-2",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane revisions-1111",
+ "where": "my own method",
+ "what": "A `cargo test --no-run` of another package, run while a 6-minute suite was queued behind cargo's lock, relinked `target/release/blaze` (a `#[cfg(test)]` edit in hir-ty-codegen changes the lib's source file). A client of the new binary then told the daemon of the old one `is another build of blaze ... stopping it and starting this one`.",
+ "cost": "one suite run I had to reason about before trusting, and a rule for the rest of the session: no cargo while a real-driver suite runs",
+ "cause": "the test target's `CARGO_BIN_EXE_blaze` is the one file every build rewrites; a daemon is tied to the exact binary",
+ "workaround": "never build while the suite runs; `BLAZE_REVISIONS_BLAZE=<a copy>` runs the suite on a binary nothing rewrites",
+ "state": "open: the suite could copy the binary into its root first"
+}

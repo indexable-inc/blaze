@@ -1,0 +1,11 @@
+{
+ "id": "edit2-12",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+ "where": "this lane's own measurement",
+ "what": "A test build was started on the VM while the measuring script ran: the rows of that run (no-op run 20.6 ms against 12.6) were the compile's, not the binary's.",
+ "cost": "one measurement thrown away and run again",
+ "cause": "one VM for building and measuring, and nothing that refuses to measure while a build runs",
+ "workaround": "waited for `pgrep cargo` to be empty before each measurement",
+ "state": "open: the measuring script could refuse when the machine is busy"
+}

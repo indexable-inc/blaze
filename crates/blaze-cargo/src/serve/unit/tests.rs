@@ -21,6 +21,8 @@ use blaze_usercode::run::Value;
 
 use super::{artifact, codegen, compile, graph, run, script, test, unit_target};
 
+/// What a unit said, kept in its record and drawn for each client.
+mod drawn;
 /// `artifact = "gpu"` dependencies, their device build and its MSL applied to the host.
 mod gpu;
 
@@ -1630,15 +1632,11 @@ fn script_front_for(
         makers: one_maker(),
         kind: compile::keyed_kind(crate::serve::work::JobKind::Build, script),
         goal: compile::goal_byte(blaze_api::Goal::Edit),
-        color: false,
-        short: false,
         verified: false,
         reached: false,
         pgo: None,
         lint_profile: None,
         layout: None,
-        width: None,
-        refused: None,
     }
     .key(1)
     .unwrap();
@@ -2349,15 +2347,11 @@ fn each_maker_of_a_record_moves_its_key() {
             makers,
             kind: compile::keyed_kind(crate::serve::work::JobKind::Build, u),
             goal: compile::goal_byte(blaze_api::Goal::Edit),
-            color: false,
-            short: false,
             verified: false,
             reached: false,
             pgo: None,
             lint_profile: None,
             layout: None,
-            width: None,
-            refused: None,
         }
         .key(0)
         .unwrap()
@@ -2398,15 +2392,11 @@ fn the_goal_moves_a_units_record_key() {
             makers: one_maker(),
             kind: compile::keyed_kind(crate::serve::work::JobKind::Build, u),
             goal,
-            color: false,
-            short: false,
             verified: false,
             reached: false,
             pgo: None,
             lint_profile: None,
             layout: None,
-            width: None,
-            refused: None,
         }
         .key(0)
         .unwrap()
@@ -2442,15 +2432,11 @@ fn a_dependency_gaining_sealed_moves_a_reached_only_dependents_key_and_checks_it
             makers: one_maker(),
             kind: compile::keyed_kind(crate::serve::work::JobKind::Build, u),
             goal: compile::goal_byte(blaze_api::Goal::Edit),
-            color: false,
-            short: false,
             verified: false,
             reached: true,
             pgo: None,
             lint_profile: None,
             layout: None,
-            width: None,
-            refused: None,
         }
         .key(unit)
         .unwrap()

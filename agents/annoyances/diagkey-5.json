@@ -1,0 +1,11 @@
+{
+ "id": "diagkey-5",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane diagkey-1111",
+ "where": "the no-op lane on an ix VM",
+ "what": "On the lane's VM no build is answered by the no-op lane: every walk looks at `/nix/store/...-glibc-.../lib/crtn.o` on the disk (`no-op answer: ... crtn.o, which no watch covers, so each build looks at it on the disk`), so its answer is never kept. A build with nothing changed is a walk there (0.14 s for hello world).",
+ "cost": "the lane's own behaviour for a client shown diagnostics another way could be seen only in its simulation, not on the VM",
+ "cause": "the linker's startup objects are under /nix/store, outside every watch",
+ "workaround": "none",
+ "state": "open"
+}

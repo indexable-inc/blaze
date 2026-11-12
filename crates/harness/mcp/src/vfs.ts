@@ -5,6 +5,8 @@
 //
 // Ported from den's repl/src/vfs.ts, whose space is a CRDT document den's hubs replicate; harness has one machine and a
 // state directory, so the space is a directory in it and every call is a plain file operation, recorded as a step.
+import type { Docs } from "./docs.ts";
+import { HOME } from "./self.ts";
 import { mkdir, readdir, rename, rm, stat, writeFile, readFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { bytes as size, effect } from "./effects.ts";
@@ -12,7 +14,6 @@ import { bytes as size, effect } from "./effects.ts";
 /** The most one file may be: it is something to look at, not a build artifact. */
 export const VFS_MAX_BYTES = 64 << 20;
 
-const HOME = () => process.env.HARNESS_HOME ?? `${process.env.HOME}/.harness`;
 /** This chat's artifact directory: one per harness session, else one per REPL process. */
 export const artifactDir = (): string =>
   join(HOME(), "artifacts", process.env.HARNESS_SESSION ? `s${process.env.HARNESS_SESSION}` : `pid-${process.pid}`);
@@ -100,3 +101,15 @@ export const vfs = {
   path: (name = ".") => vfsPath(name),
 };
 export type Vfs = typeof vfs;
+
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  vfs: {
+    area: "files",
+    for: "save a file the person asked for; export",
+    sig: "vfs.write(name, text | bytes | Blob | image()): Promise<path>",
+    about: "a file the person asked for (an exported image, a report) goes here, not in the project; show it with render(svelte`<Image src={f} />`, { f }) or <FileRef path={f} />. Also vfs.text/bytes/read(name), list(dir?), move(a, b), delete(name), path(name?).",
+    example: "const f = await vfs.write('report.md', text)",
+    throws: "Error for a name that leaves the file space, or a file over 64 MB.",
+  },
+};

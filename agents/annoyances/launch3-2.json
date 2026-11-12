@@ -1,0 +1,12 @@
+{
+ "id": "launch3-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+ "where": "blaze-launch-host::program",
+ "what": "A caller's `CompiledFunction` is another object after its callee's body edit (its relocations name the callee's new key) while the caller's own key stays. A cache of records by slot, let go by \"its key moved\", kept the caller's record with the callee's old key: the next launcher's hello failed with `InstanceKey(..) is named by the program's code and is no instance of its build`.",
+ "cost": "one debugging round; and a launcher that could not start",
+ "cause": "an instance key names the function's own code and arguments, never what its places resolve to; I took the key for the function's whole identity",
+ "workaround": "the cache is keyed by the `Arc<CompiledFunction>` itself (`Arc::ptr_eq`)",
+ "state": "fixed in 87522b0eca",
+ "fix": ""
+}
