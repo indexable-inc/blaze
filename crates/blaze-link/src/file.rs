@@ -342,8 +342,10 @@ fn changed_slots(old: &[(u64, u64)], new: &[(u64, u64)], len: u64, ranges: &mut 
 
 impl<'a> Stage<'a> {
     pub fn finish(mut self) -> Result<Finished, LinkError> {
+        let step = tracing::info_span!(target: "blaze", "link stage: lists").entered();
         let changes = self.update_lists()?;
         let mut parts = self.parts()?;
+        drop(step);
         let arena = self.arena;
         self.new.synthesis = next_synthesis();
         let written = self.written();
@@ -358,6 +360,7 @@ impl<'a> Stage<'a> {
         let pieces = merge(written.iter().map(|it| (it.0, it.1)).collect(), 0);
         let contents = collect_in(self.new.spaces.iter().map(contents), arena);
         let synthetic = {
+            let _step = tracing::info_span!(target: "blaze", "link stage: the writer's tables").entered();
             let refs = collect_in(contents.iter().map(|it| it.0), arena);
             let paged = collect_in(contents.iter().map(|it| it.1), arena);
             let resolver = self.resolver(&parts.regions);
@@ -415,6 +418,7 @@ impl<'a> Stage<'a> {
         }
         let written_all = merge(all, 0);
         let (offsets, file, encoded) = {
+            let _step = tracing::info_span!(target: "blaze", "link stage: the writer's file").entered();
             let mut refs = collect_in(contents.iter().map(|it| it.0), arena);
             let mut paged = collect_in(contents.iter().map(|it| it.1), arena);
             for (at, (_, bytes)) in homes.iter().zip(&synthetic) {
@@ -472,7 +476,9 @@ impl<'a> Stage<'a> {
         // alloc: once per stage; the next stage compares its exports with these
         self.new.exports = Arc::new(parts.exports);
         let message = self.output.live.is_some().then(|| self.message());
+        let step = tracing::info_span!(target: "blaze", "link stage: the ranges written").entered();
         let writes = if self.full { whole(&self.new) } else { self.dirty(&written, &mut scratch) };
+        drop(step);
         let (undo, old_len) = match (self.old.laid_out, self.full) {
             // alloc: none, an empty Vec holds no buffer
             (false, _) => (Vec::new(), 0),
