@@ -2511,5 +2511,5 @@ fn a_build_of_a_file_reaches_nothing_through_a_slot() {
     let through_slot = |it: &CompiledFunction| {
         it.relocs.targets().iter().any(|target| matches!(target, Target::Function(_)))
     };
-    assert!(!built.functions.iter().any(through_slot));
+    assert!(!built.functions.iter().any(|it| through_slot(it)));
 }
