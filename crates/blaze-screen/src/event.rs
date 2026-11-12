@@ -65,6 +65,8 @@ pub struct Built {
     pub links: Vec<Link>,
     /// Units the build left unbuilt behind its failures.
     pub unbuilt: u32,
+    /// The one program the build placed, where it placed exactly one: its path.
+    pub program: Option<String>,
     /// The command that says more of a failure: `blaze explain hello`.
     pub next: Option<String>,
     /// The build's why is still to come ([`Event::Why`]): its line waits for it.

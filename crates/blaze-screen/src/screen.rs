@@ -124,6 +124,8 @@ pub enum Plant {
     KeepRegion,
     /// After a resize the rows to erase are counted at the old width.
     StaleResize,
+    /// A pipe is sent a terminal's frames.
+    LiveWhenPiped,
 }
 
 /// One test executable.
@@ -321,7 +323,7 @@ impl Screen {
         let region = self.region_now();
         let above = core::mem::take(&mut self.above);
         let progress = self.progress_now();
-        let mut frame = Frame::default();
+        let mut frame = Frame { live: self.caps.live || self.plant == Plant::LiveWhenPiped, ..Frame::default() };
         if progress != self.progress && self.caps.live {
             self.progress = progress;
             frame.progress = Some(progress);
@@ -332,8 +334,10 @@ impl Screen {
             self.hidden = hide;
             frame.hide_cursor = Some(hide);
         }
-        if above.is_empty() && region == self.region {
-            return (!frame.is_empty()).then_some(frame);
+        // Nothing changed: no frame. A frame always carries the whole region, so what a
+        // driver last wrote is what the terminal holds.
+        if above.is_empty() && region == self.region && frame.is_empty() {
+            return None;
         }
         // The rows the last region takes at the width the terminal has now: a terminal that
         // got narrower wrapped each row longer than its new width.
@@ -403,7 +407,8 @@ impl Screen {
     }
 
     fn region_now(&self) -> Vec<Line> {
-        if !self.caps.live || self.cleared || self.opts.quiet || self.caps.cols < 2 {
+        let live = self.caps.live || self.plant == Plant::LiveWhenPiped;
+        if !live || self.cleared || self.opts.quiet || self.caps.cols < 2 {
             return Vec::new(); // alloc: none
         }
         let mut rows = match (&self.tests.began_ms, &self.model) {
@@ -658,12 +663,24 @@ impl Screen {
             }
         }
         if !quiet {
+            // The same waste said once, with how many times.
+            let mut said: Vec<(&Why, usize)> = Vec::new(); // alloc: once a build
             for why in &wasted {
+                match said.iter_mut().find(|it| it.0.headline == why.headline) {
+                    Some(it) => it.1 += 1,
+                    None => said.push((why, 1)), // alloc: as above
+                }
+            }
+            for (why, times) in said {
+                let times = match times {
+                    1 => String::new(), // alloc: none
+                    n => format!(" ({n} times)"), // alloc: as above
+                };
                 let line = match self.caps.live {
                     true => {
                         let mut line = Line::new()
                             .with(Role::Warned, format!("{} ", self.glyph("⚠", "!"))) // alloc: as above
-                            .with(Role::Plain, why.headline.clone()); // clone: as above
+                            .with(Role::Plain, format!("{}{times}", why.headline)); // alloc: as above
                         if let Some(more) = &why.more {
                             line.push(Role::Dim, format!(" {} {more}", self.dot())); // alloc: as above
                         }
@@ -673,7 +690,7 @@ impl Screen {
                         let more = why.more.as_ref().map_or(String::new(), |it| format!(" next={}", text::value(it))); // alloc: as above
                         Line::new().with(
                             Role::Plain,
-                            format!("blaze: wasted why={}{more}", text::value(&why.headline)),
+                            format!("blaze: wasted why={}{more}", text::value(&format!("{}{times}", why.headline))),
                         ) // alloc: as above
                     }
                 };
@@ -707,7 +724,7 @@ impl Screen {
         }
     }
 
-    /// `✓ hello::add recompiled (src/main.rs changed) · tier 0 · 0.70s`.
+    /// `✓ hello::add recompiled in 0.70s · src/main.rs changed · tier 0`.
     fn built_line(&self, built: &Built, whys: &[Why], took: u64, noop: bool) -> Line {
         let mut line = Line::new();
         let dot = self.dot();
@@ -717,16 +734,18 @@ impl Screen {
             line.push(Role::Done, format!("{} ", self.glyph("✓", "ok"))); // alloc: as above
             let (what, cause) = self.made(built, whys);
             line.push(Role::Plain, what);
+            line.push(Role::Strong, format!(" in {}", text::time(took))); // alloc: as above
             if let Some(cause) = cause {
-                line.push(Role::Dim, format!(" ({cause})")); // alloc: as above
+                line.push(Role::Dim, format!(" {dot} {cause}")); // alloc: as above
             }
             if let Some(tier) = &built.tier {
+                // `tier 0 · 0% optimized` says `tier 0` twice.
+                let tier = tier.strip_suffix(" · 0% optimized").unwrap_or(tier);
                 line.push(Role::Dim, format!(" {dot} {tier}")); // alloc: as above
             }
             for link in built.links.iter().filter(|it| it.whole) {
                 line.push(Role::Warned, format!(" {dot} {}", link.how)); // alloc: as above
             }
-            line.push(Role::Dim, format!(" {dot} {}", text::time(took))); // alloc: as above
         }
         if self.warnings > 0 {
             line.push(
@@ -739,12 +758,12 @@ impl Screen {
         }
         // Where the program is, for a command that does not run it.
         if matches!(self.opts.command, Command::Build | Command::Other)
-            && let [link] = built.links.as_slice()
+            && let Some(program) = &built.program
         {
             let left = self.most_cols().saturating_sub(line.width() + 3);
             if left >= 12 {
                 line.push(Role::Dim, format!(" {} ", self.glyph("→", "->"))); // alloc: as above
-                line.push_link(Role::Dim, text::middle(&link.path, left), file_url(&link.path));
+                line.push_link(Role::Plain, text::middle(program, left), file_url(program));
             }
         }
         line
@@ -780,12 +799,12 @@ impl Screen {
         (what, cause)
     }
 
-    /// `✗ build failed · 1 error in hello (bin) · 2 units not built · 0.31s · blaze explain hello`.
+    /// `✗ build failed in 0.31s · 1 error in hello (bin) · 2 units not built · blaze explain hello`.
     fn failed_line(&self, built: &Built, took: u64) -> Line {
         let dot = self.dot();
         let mut line = Line::new()
             .with(Role::Failed, format!("{} ", self.glyph("✗", "x"))) // alloc: the build's line, once
-            .with(Role::Strong, format!("{} failed", self.opts.command.word())); // alloc: as above
+            .with(Role::Strong, format!("{} failed in {}", self.opts.command.word(), text::time(took))); // alloc: as above
         if self.errors > 0 {
             let mut said = format!(" {dot} {}", text::count(u64::from(self.errors), "error", "errors")); // alloc: as above
             match self.failed.as_slice() {
@@ -810,7 +829,6 @@ impl Screen {
                 format!(" {dot} {}", text::count(u64::from(self.warnings), "warning", "warnings")),
             ); // alloc: as above
         }
-        line.push(Role::Dim, format!(" {dot} {}", text::time(took))); // alloc: as above
         if let Some(next) = &built.next {
             line.push(Role::Dim, format!(" {dot} ")); // alloc: as above
             line.push(Role::Plain, next.clone()); // clone: as above
@@ -853,11 +871,14 @@ impl Screen {
         if !functions.is_empty() {
             line.push_str(&format!(" recompiled={}", text::value(&functions.join(",")))); // alloc: as above
         }
-        for link in &built.links {
-            if link.how != "unchanged" {
-                line.push_str(&format!(" linked={}", text::value(&link.path))); // alloc: as above
-                line.push_str(&format!(" link={}", text::value(&link.how))); // alloc: as above
-            }
+        for link in built.links.iter().filter(|it| it.whole) {
+            line.push_str(&format!(" link={}", text::value(&link.how))); // alloc: as above
+        }
+        if let Some(program) = &built.program {
+            line.push_str(&format!(" program={}", text::value(program))); // alloc: as above
+        }
+        if let Some(next) = &built.next {
+            line.push_str(&format!(" next={}", text::value(next))); // alloc: as above
         }
         line
     }

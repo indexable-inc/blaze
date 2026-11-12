@@ -1,0 +1,102 @@
+== 7000 ms
+ ▶ core  names    2.9s  ← 344 wait on it
+ building  ━━━────────────────  78/423 · 1 running · 7.0s
+== 13000 ms
+ ▶ anyhow (build script)       names    0.5s  ← 15 wait on it
+ ▶ crossbeam-deque (build sc…  names    0.5s  ← 20 wait on it
+ ▶ crossbeam-epoch (build sc…  names    0.5s  ← 25 wait on it
+ ▶ crossbeam-utils (build sc…  names    0.5s  ← 30 wait on it
+ ▶ libc (build script)         names    0.5s  ← 40 wait on it
+ ▶ ripgrep (build script)      names    0.5s  ← 10 wait on it
+   … 6 more running
+ building  ━━━━━━━━━━━────────  259/423 · 13 running · 13.0s
+== 19000 ms
+ ▶ globset                     codegen    6.2s  ← 22 wait on it
+ ▶ serde_json (build script)   codegen    5.5s  ← 23 wait on it
+ ▶ crossbeam-deque (build sc…  codegen    5.3s  ← 18 wait on it
+ ▶ crossbeam-epoch (build sc…  codegen    5.3s  ← 23 wait on it
+ ▶ crossbeam-utils (build sc…  codegen    5.2s  ← 28 wait on it
+ ▶ zmij (build script)         codegen    4.6s  ← 28 wait on it
+   … 6 more running
+ building  ━━━━━━━━━━━━━──────  297/423 · 12 running · 19.0s
+== 25000 ms
+ ▶ anyhow (build script)   run build script    2.7s  ← 10 wait on it
+ ▶ crossbeam-utils         names               1.6s  ← 24 wait on it
+ ▶ zmij                    names               1.6s  ← 24 wait on it
+ ▶ libc                    names               1.6s  ← 34 wait on it
+ ▶ serde_core              names               1.6s  ← 29 wait on it
+ ▶ ripgrep (build script)  store               0.2s  ← 6 wait on it
+ building  ━━━━━━━━━━━━━━━────  340/423 · 6 running · 25.0s
+== 31000 ms
+warning: unused import: `self::SummaryKind::*`
+   --> crates/printer/src/summary.rs:104:13
+    |
+104 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `self::SummaryKind::*`
+   --> crates/printer/src/summary.rs:115:13
+    |
+115 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::SummaryKind::*`
+   --> crates/printer/src/summary.rs:127:13
+    |
+127 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+
+ ▶ ripgrep (bin rg)  names    2.1s  ← 4 wait on it
+ building  ━━━━━━━━━━━━━━━━━━─  418/423 · 1 running · 31.0s
+== 37000 ms
+    |
+104 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `self::SummaryKind::*`
+   --> crates/printer/src/summary.rs:115:13
+    |
+115 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::SummaryKind::*`
+   --> crates/printer/src/summary.rs:127:13
+    |
+127 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+
+note: build paused: daemon at 10.1 of 78.3 GiB (machine 93.0 GiB, 14.7 held by 3
+ other daemons: pid 83984 of /root/home3 5.5, pid 83715 of /root/home2 5.3, and
+1 more), waiting for the system's memory pressure to pass
+note: build resumed: memory is free again
+ ▶ ripgrep (bin rg)  codegen    5.1s  ← 2 wait on it
+ building  ━━━━━━━━━━━━━━━━━━─  420/423 · 1 running · 37.0s
+== end
+104 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `self::SummaryKind::*`
+   --> crates/printer/src/summary.rs:115:13
+    |
+115 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::SummaryKind::*`
+   --> crates/printer/src/summary.rs:127:13
+    |
+127 |         use self::SummaryKind::*;
+    |             ^^^^^^^^^^^^^^^^^^^^
+
+note: build paused: daemon at 10.1 of 78.3 GiB (machine 93.0 GiB, 14.7 held by 3
+ other daemons: pid 83984 of /root/home3 5.5, pid 83715 of /root/home2 5.3, and
+1 more), waiting for the system's memory pressure to pass
+note: build resumed: memory is free again
+✓ built 81 units, 4 cached in 42.7s · tier 0 · 3 warnings · blaze slow says why
+⚠ 1 step recomputed for no recorded reason: a blaze bug (blaze why --unexplained
+) (3 times) · blaze explain why:unexplained

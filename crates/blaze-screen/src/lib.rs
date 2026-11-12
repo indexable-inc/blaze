@@ -4,7 +4,7 @@
 //! clock and the terminal's size, and returns [`Frame`]s as data: the lines appended to the
 //! scrollback, the live region under them, the terminal's progress report, each span with
 //! what it means ([`Role`]) and where it leads. [`encode`] is the one place a frame becomes
-//! bytes, for one terminal's capabilities ([`Paint`]); a driver writes them and does nothing
+//! bytes, for one terminal's capabilities (`blaze_report::terminal::Terminal`); a driver writes them and does nothing
 //! else. The daemon sends events, never drawn progress, so nothing about a terminal is an
 //! input of any build key, and a transcript of the events ([`Stamped`], one a line as JSON)
 //! replays into the frames the build showed.
@@ -30,7 +30,7 @@ mod frame;
 mod screen;
 pub mod text;
 
-pub use encode::{Paint, encode};
+pub use encode::encode;
 pub use event::{BinaryEnd, Built, Command, Event, Link, Stamped, Test, Verdict, Why};
 pub use frame::{Frame, Line, Mark, Progress, Role, Span};
 pub use screen::{

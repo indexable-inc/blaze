@@ -110,6 +110,10 @@ pub enum Progress {
 /// One frame: what the driver writes, in this order.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Frame {
+    /// For a terminal whose region is redrawn ([`crate::Caps::live`]). A frame that is not
+    /// is lines that stay and nothing else: the encoder writes no sequence for it but a
+    /// colour asked for by name.
+    pub live: bool,
     /// The rows of the live region drawn last, as the terminal holds them at its width now:
     /// erased first.
     pub erase: u16,
@@ -131,6 +135,7 @@ impl Frame {
     /// terminal's progress report cleared.
     pub fn restore(rows: u16) -> Frame {
         Frame {
+            live: true,
             erase: rows,
             hide_cursor: Some(false),
             progress: Some(Progress::Clear),
@@ -138,7 +143,8 @@ impl Frame {
         }
     }
 
+    /// Nothing to write.
     pub fn is_empty(&self) -> bool {
-        *self == Frame::default()
+        *self == Frame { live: self.live, ..Frame::default() }
     }
 }

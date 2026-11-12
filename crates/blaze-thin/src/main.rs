@@ -275,16 +275,6 @@ mod unix {
             }
             _ => blaze_screen::Caps::PIPE,
         };
-        let paint = match caps.live {
-            true => blaze_screen::Paint { live: true, terminal: detected },
-            false => blaze_screen::Paint {
-                live: false,
-                terminal: blaze_report::terminal::Terminal {
-                    caps: blaze_report::Caps { links: false, ..detected.caps },
-                    ..blaze_report::terminal::Terminal::PIPE
-                },
-            },
-        };
         let options = blaze_screen::Options {
             quiet: asked.quiet,
             ..blaze_screen::Options::of(match asked.command {
@@ -292,7 +282,7 @@ mod unix {
                 Command::Run => blaze_screen::Command::Run,
             })
         };
-        let said = plain.said(options, caps, &paint, started.elapsed());
+        let said = plain.said(options, caps, &detected, started.elapsed());
         if asked.command == Command::Build {
             return Ok(wrote(&said));
         }

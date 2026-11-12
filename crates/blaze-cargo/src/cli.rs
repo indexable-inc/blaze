@@ -715,6 +715,14 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
     let stats = std::env::var_os("BLAZE_STATS").is_some();
     let fixing = pinned.is_some();
     let terminal = terminal::stderr(&config, color);
+    // What the command shows goes through one screen (docs/terminal.md): on a terminal a
+    // region redrawn while the build runs, elsewhere lines that stay.
+    let var = |name: &str| std::env::var(name).ok();
+    let caps = match format.json() {
+        // The JSON messages are stdout's, a line each: nothing is redrawn around them.
+        true => blaze_screen::Caps::PIPE,
+        false => show::caps(io::stderr().is_terminal(), var),
+    };
     let shown = Shown {
         format,
         quiet: asked.flags.quiet,
@@ -723,14 +731,7 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
         stats,
         fixing,
         terminal,
-    };
-    // What the command shows goes through one screen (docs/terminal.md): on a terminal a
-    // region redrawn while the build runs, elsewhere lines that stay.
-    let var = |name: &str| std::env::var(name).ok();
-    let caps = match format.json() {
-        // The JSON messages are stdout's, a line each: nothing is redrawn around them.
-        true => blaze_screen::Caps::PIPE,
-        false => show::caps(io::stderr().is_terminal(), var),
+        live: caps.live,
     };
     let options = blaze_screen::Options {
         command: match asked.command() {
@@ -748,44 +749,61 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
             .is_some()
             .then(|| terminal.notify_after_secs.saturating_mul(1000)),
     };
-    let mut screen = show::Show::new(options, caps, terminal, started, io::stderr());
-    if caps.live
-        && let Err(error) = show::watch_interrupts(screen.paint())
-    {
-        return refused(&format!("the screen's interrupt watcher could not start: {error}"), color);
-    }
-    // On a terminal `test` runs its executables while the build goes on, each speaking from
-    // the runner's thread: the screen is owned by a thread of its own there.
-    if live::wanted(asked, shown, caps) {
-        let then = live::drive(&mut client, asked, &place, request, shown, started, screen);
-        // The seed's one-shot engine stops here, writing its image; a daemon's connection just closes.
-        let closed = client.close();
-        sent_client_rows(&mut io::stderr().lock(), color, true);
-        if let Err(error) = closed {
-            return refused(&format!("closing the connection to the build engine: {error}"), color);
-        }
-        return match then {
-            Ok(Then::Exit(code)) => code,
-            Ok(Then::Exec(_) | Then::Fix(_)) => {
-                refused("the live view ended in neither an exit code nor an error", color)
-            }
-            Err(error) => refused(&error.to_string(), color),
-        };
-    }
+    let screen = show::Show::new(options, caps, terminal, started, io::stderr());
     let mut out = io::stdout().lock();
-    let then = drive(
-        &mut client,
-        asked,
-        &place,
-        request,
-        shown,
-        started,
-        &mut out,
-        &mut screen,
-        &mut test::Spawned,
-    );
-    // Nothing live is on the terminal from here: what follows writes stderr itself.
-    drop(screen);
+    let then = match caps.live {
+        // A region is redrawn: the screen has a thread of its own, which draws when a timer
+        // of the region is due whether or not the daemon says anything.
+        true => {
+            if let Err(error) = show::watch_interrupts(screen.terminal()) {
+                return refused(&format!("the screen's interrupt watcher could not start: {error}"), color);
+            }
+            let screen = match show::Threaded::start(screen) {
+                Ok(screen) => screen,
+                Err(error) => return refused(&format!("the screen's thread could not start: {error}"), color),
+            };
+            let mut to_screen = screen.to.clone(); // clone: a sender, once a command
+            let then = match live::wanted(asked, shown, caps) {
+                // `test` runs its executables while the build goes on.
+                true => live::drive(&mut client, asked, &place, request, shown, started, to_screen),
+                false => {
+                    let then = drive(
+                        &mut client,
+                        asked,
+                        &place,
+                        request,
+                        shown,
+                        started,
+                        &mut out,
+                        &mut to_screen,
+                        &mut test::Spawned,
+                    );
+                    drop(to_screen);
+                    then
+                }
+            };
+            // The last frame is written and the terminal as it was found before anything
+            // else writes it: the program a `run` becomes starts on a clean terminal.
+            match screen.finish() {
+                Ok(()) => then,
+                Err(error) => Err(error),
+            }
+        }
+        false => {
+            let mut screen = screen;
+            drive(
+                &mut client,
+                asked,
+                &place,
+                request,
+                shown,
+                started,
+                &mut out,
+                &mut screen,
+                &mut test::Spawned,
+            )
+        }
+    };
     let mut err = io::stderr().lock();
     // The seed's one-shot engine stops here, writing its image; a daemon's connection just closes.
     let closed = client.close();

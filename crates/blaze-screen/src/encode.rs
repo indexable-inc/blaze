@@ -14,20 +14,6 @@ use blaze_report::terminal::{self, Terminal};
 
 use crate::frame::{Frame, Line, Progress, Role, Span};
 
-/// How a frame is written.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Paint {
-    /// A terminal whose region is redrawn ([`crate::Caps::live`]).
-    pub live: bool,
-    /// Its colour, links, progress report and notifications.
-    pub terminal: Terminal,
-}
-
-impl Paint {
-    /// A pipe: text and newlines.
-    pub const PIPE: Paint = Paint { live: false, terminal: Terminal::PIPE };
-}
-
 /// The SGR parameters of a role: a palette of the eight colours every terminal has, each
 /// readable on a light and on a dark background (no white, no black, no bright variant), with
 /// bold and faint for weight.
@@ -52,14 +38,13 @@ fn link_open(out: &mut String, url: &str) {
     out.push_str("\x1b\\");
 }
 
-fn span(out: &mut String, span: &Span, paint: &Paint) {
-    let caps = paint.terminal.caps;
+fn span(out: &mut String, span: &Span, color: bool, links: bool) {
     let code = sgr(span.role);
-    let linked = caps.links.then_some(span.link.as_deref()).flatten();
+    let linked = links.then_some(span.link.as_deref()).flatten();
     if let Some(url) = linked {
         link_open(out, url);
     }
-    match caps.color && !code.is_empty() {
+    match color && !code.is_empty() {
         true => {
             // Writing to a String cannot fail.
             let _ = write!(out, "\x1b[{code}m{}\x1b[0m", span.text);
@@ -71,10 +56,10 @@ fn span(out: &mut String, span: &Span, paint: &Paint) {
     }
 }
 
-fn line(out: &mut String, line: &Line, paint: &Paint) {
+fn line(out: &mut String, line: &Line, color: bool, linked: bool) {
     match line {
-        Line::Spans(spans) => spans.iter().for_each(|it| span(out, it, paint)),
-        Line::Raw { text, links } if paint.terminal.caps.links => {
+        Line::Spans(spans) => spans.iter().for_each(|it| span(out, it, color, linked)),
+        Line::Raw { text, links } if linked => {
             let mut at = 0;
             for mark in links {
                 let (Some(before), Some(inside)) = (text.get(at..mark.from), text.get(mark.from..mark.to))
@@ -94,12 +79,15 @@ fn line(out: &mut String, line: &Line, paint: &Paint) {
     out.push('\n');
 }
 
-/// `frame` at the end of `out`.
-pub fn encode(frame: &Frame, paint: &Paint, out: &mut String) {
-    if !paint.live {
-        frame.above.iter().for_each(|it| line(out, it, paint));
+/// `frame` at the end of `out`, for `terminal`: its colour, its links, its progress report
+/// and its notifications, each only where it has one.
+pub fn encode(frame: &Frame, terminal: &Terminal, out: &mut String) {
+    let color = terminal.caps.color;
+    if !frame.live {
+        frame.above.iter().for_each(|it| line(out, it, color, false));
         return;
     }
+    let links = terminal.caps.links;
     if frame.is_empty() {
         return;
     }
@@ -113,8 +101,8 @@ pub fn encode(frame: &Frame, paint: &Paint, out: &mut String) {
         Some(false) => out.push_str("\x1b[?25h"),
         None => {}
     }
-    frame.above.iter().for_each(|it| line(out, it, paint));
-    frame.region.iter().for_each(|it| line(out, it, paint));
+    frame.above.iter().for_each(|it| line(out, it, color, links));
+    frame.region.iter().for_each(|it| line(out, it, color, links));
     if let Some(progress) = frame.progress {
         let progress = match progress {
             Progress::Clear => terminal::Progress::Clear,
@@ -122,10 +110,10 @@ pub fn encode(frame: &Frame, paint: &Paint, out: &mut String) {
             Progress::Percent(percent) => terminal::Progress::Normal(percent),
             Progress::Failed(percent) => terminal::Progress::Error(percent),
         };
-        paint.terminal.progress_into(out, progress);
+        terminal.progress_into(out, progress);
     }
     if let Some((title, body)) = &frame.notify {
-        paint.terminal.notify_into(out, title, body);
+        terminal.notify_into(out, title, body);
     }
     out.push_str("\x1b[?2026l");
 }

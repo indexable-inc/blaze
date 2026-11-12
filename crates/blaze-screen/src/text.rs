@@ -102,6 +102,16 @@ pub fn middle(text: &str, most: usize) -> String {
 /// segments around a `…`: `libc::…::<impl#0 in macro>::default`.
 pub fn item(path: &str, most: usize) -> String {
     const CALL: &str = " in macro call ";
+    // A value printed whole where a path was meant (`{macro MacroCallId { loc: .. } }`): its
+    // first word says what it is, and the rest is no name.
+    if let Some(at) = path.find(" { ") {
+        let mut head = fit(&path[..at], most.saturating_sub(2).max(1));
+        head.push_str(match path.starts_with('{') {
+            true => " …}",
+            false => " …",
+        });
+        return fit(&head, most);
+    }
     let mut flat = String::with_capacity(path.len()); // alloc: once an item shown
     let mut rest = path;
     let mut in_macro = false;

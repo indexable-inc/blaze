@@ -11,17 +11,26 @@
 //! which knows the region's rows from one atomic, then ends the command as a shell's
 //! interrupted one ends.
 //!
+//! On a terminal the screen is owned by a thread of its own ([`Threaded`]): the command's
+//! thread waits on the daemon, and a test run's executables speak from the runner's, so the
+//! events of each go to that thread in the order they happened, and it draws when one came
+//! or when a timer of the region is due, whether or not the daemon said anything. Off a
+//! terminal nothing has a timer, and the command's thread drives the [`Show`] itself.
+//!
 //! `BLAZE_UI_TRANSCRIPT=<file>` records the event stream as it came, one event a line as
 //! JSON with its time ([`blaze_screen::Stamped`]): what the tests of blaze-screen replay.
 
 use std::{
     io::{self, Write},
     sync::atomic::{AtomicU16, Ordering},
-    time::Instant,
+    thread,
+    time::{Duration, Instant},
 };
 
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
+
 use blaze_report::terminal::Terminal;
-use blaze_screen::{Caps, Event, Frame, Options, Paint, Screen, Stamped};
+use blaze_screen::{Caps, Event, Frame, Options, Screen, Stamped};
 
 /// What takes the screen's events: the driver itself, or the channel to the thread that owns
 /// it (`blaze test`'s live run, whose test executables speak from another thread).
@@ -29,6 +38,11 @@ pub trait Sink {
     fn take(&mut self, event: Event);
     /// The frame that is due, written.
     fn draw(&mut self) -> io::Result<()>;
+    /// The frame that is due is on the terminal when this returns: what is called before
+    /// something else writes the terminal.
+    fn settle(&mut self) -> io::Result<()> {
+        self.draw()
+    }
 }
 
 /// The rows of the live region on the terminal now: what an interrupt erases.
@@ -37,7 +51,8 @@ static REGION_ROWS: AtomicU16 = AtomicU16::new(0);
 /// The screen of one command and the stream it is written to.
 pub struct Show<E: Write> {
     screen: Screen,
-    paint: Paint,
+    /// What the terminal does: its colour, links, progress report and notifications.
+    terminal: Terminal,
     err: E,
     /// One frame's bytes, reused.
     bytes: String,
@@ -95,14 +110,9 @@ impl<E: Write> Show<E> {
         clock: Box<dyn FnMut() -> u64 + Send>,
         err: E,
     ) -> Show<E> {
-        let mut terminal = terminal;
-        if !caps.live {
-            // Off a terminal no sequence but a colour asked for by name is written.
-            terminal = Terminal { caps: blaze_report::Caps { links: false, ..terminal.caps }, ..Terminal::PIPE };
-        }
         Show {
             screen: Screen::new(options, caps),
-            paint: Paint { live: caps.live, terminal },
+            terminal,
             err,
             bytes: String::with_capacity(4096), // alloc: once a command, a frame's bytes
             clock,
@@ -117,8 +127,8 @@ impl<E: Write> Show<E> {
         Show::with_clock(options, Caps::PIPE, Terminal::PIPE, Box::new(|| 0), err) // alloc: a test's
     }
 
-    pub fn paint(&self) -> Paint {
-        self.paint
+    pub fn terminal(&self) -> Terminal {
+        self.terminal
     }
 
     /// Whether an error was said or a test failed.
@@ -148,7 +158,7 @@ impl<E: Write> Show<E> {
 
     fn write(&mut self, frame: &Frame) -> io::Result<()> {
         self.bytes.clear();
-        blaze_screen::encode(frame, &self.paint, &mut self.bytes);
+        blaze_screen::encode(frame, &self.terminal, &mut self.bytes);
         self.rows = frame.region.len() as u16;
         REGION_ROWS.store(self.rows, Ordering::Release);
         if self.bytes.is_empty() {
@@ -200,7 +210,7 @@ impl<E: Write> Drop for Show<E> {
 /// that redraws; a pipe's has nothing to put back, and its command dies of the signal as
 /// before.
 #[cfg(unix)]
-pub fn watch_interrupts(paint: Paint) -> io::Result<()> {
+pub fn watch_interrupts(terminal: Terminal) -> io::Result<()> {
     use std::io::Read as _;
     crate::serve::signals::catch();
     let mut pipe = crate::serve::signals::stop_pipe()?;
@@ -217,21 +227,21 @@ pub fn watch_interrupts(paint: Paint) -> io::Result<()> {
         if got.is_err() {
             return;
         }
-        interrupted(paint);
+        interrupted(&terminal);
     })?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-pub fn watch_interrupts(_paint: Paint) -> io::Result<()> {
+pub fn watch_interrupts(_terminal: Terminal) -> io::Result<()> {
     Ok(())
 }
 
 /// The terminal put back, then the command's end as an interrupted one.
-pub fn interrupted(paint: Paint) -> ! {
+pub fn interrupted(terminal: &Terminal) -> ! {
     let mut bytes = String::new(); // alloc: once, as the command ends
     let rows = REGION_ROWS.swap(0, Ordering::AcqRel);
-    blaze_screen::encode(&Frame::restore(rows), &paint, &mut bytes);
+    blaze_screen::encode(&Frame::restore(rows), terminal, &mut bytes);
     let mut err = io::stderr();
     let _ = err.write_all(bytes.as_bytes());
     let _ = err.write_all(b"interrupted\n");
@@ -282,5 +292,95 @@ impl<S: Sink> Write for Stay<'_, S> {
 impl<S: Sink> Drop for Stay<'_, S> {
     fn drop(&mut self) {
         let _ = self.say(true);
+    }
+}
+
+/// What the screen's thread is sent, in the order it happened, then its end.
+pub enum Msg {
+    Event(Event),
+    /// A burst of events ended: the frame that is due is drawn.
+    Draw,
+    /// Everything sent before this is on the terminal once the sender hears back.
+    Sync(Sender<()>),
+}
+
+/// The screen as the other threads see it: its events go to the thread that owns it.
+impl Sink for Sender<Msg> {
+    fn take(&mut self, event: Event) {
+        let _ = self.send(Msg::Event(event));
+    }
+
+    fn draw(&mut self) -> io::Result<()> {
+        let _ = self.send(Msg::Draw);
+        Ok(())
+    }
+
+    fn settle(&mut self) -> io::Result<()> {
+        let (done, heard) = crossbeam_channel::bounded(1);
+        if self.send(Msg::Sync(done)).is_ok() {
+            let _waiting = tracing::info_span!(
+                target: "blaze",
+                "screen: wait for the screen's thread to have drawn"
+            )
+            .entered();
+            let _ = heard.recv();
+        }
+        Ok(())
+    }
+}
+
+/// The screen on a thread of its own.
+pub struct Threaded {
+    pub to: Sender<Msg>,
+    thread: thread::JoinHandle<io::Result<()>>,
+}
+
+impl Threaded {
+    /// `show` given to its thread.
+    pub fn start(show: Show<io::Stderr>) -> io::Result<Threaded> {
+        let (to, gets) = unbounded::<Msg>();
+        let thread =
+            thread::Builder::new().name("blaze screen".into()).spawn(move || run(show, &gets))?;
+        Ok(Threaded { to, thread })
+    }
+
+    /// The thread ended, its last frame written and the terminal as it was found.
+    pub fn finish(self) -> io::Result<()> {
+        drop(self.to);
+        self.thread.join().map_err(|_| io::Error::other("the screen's thread panicked"))?
+    }
+}
+
+/// The screen's thread: each message an event for the screen or the end of a burst, a frame
+/// drawn after each burst and when a timer of the region is due; it ends when every sender is
+/// gone.
+fn run(mut show: Show<io::Stderr>, gets: &Receiver<Msg>) -> io::Result<()> {
+    loop {
+        let now = (show.clock)();
+        // The region's timers turn over once a second; with none, the thread only waits.
+        let wait = show.next_deadline().map_or(1000, |at| at.saturating_sub(now).clamp(50, 1000));
+        let mut synced = Vec::new(); // alloc: none until a sender waits
+        let mut over = false;
+        let mut apply = |msg: Msg, show: &mut Show<io::Stderr>| match msg {
+            Msg::Event(event) => show.take(event),
+            Msg::Draw => {}
+            Msg::Sync(done) => synced.push(done), // alloc: a sender that waits
+        };
+        match gets.recv_timeout(Duration::from_millis(wait)) {
+            Ok(msg) => apply(msg, &mut show),
+            Err(RecvTimeoutError::Disconnected) => over = true,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        // A burst is one frame.
+        while let Ok(msg) = gets.try_recv() {
+            apply(msg, &mut show);
+        }
+        show.draw()?;
+        for done in synced {
+            let _ = done.send(());
+        }
+        if over {
+            return Ok(());
+        }
     }
 }

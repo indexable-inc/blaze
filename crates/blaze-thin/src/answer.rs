@@ -20,7 +20,8 @@ use std::{
 };
 
 use blaze_api::{Artifact, LinkHow, Linked, Response, TargetKind, Tiers, Verb};
-use blaze_screen::{Built, Caps, Event, Link, Options, Paint, Screen};
+use blaze_report::terminal::Terminal;
+use blaze_screen::{Built, Caps, Event, Link, Options, Screen};
 
 /// What taking a response came to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -88,9 +89,9 @@ impl Plain {
 
     /// What blaze's CLI writes to stderr of this answer, the build over `took` after the
     /// command began: the frame blaze-screen's core makes of the build's end, as the bytes
-    /// the terminal `paint` describes takes. Nothing where the screen says nothing (a `run`
+    /// `terminal` takes. Nothing where the screen says nothing (a `run`
     /// on a terminal, `-q`).
-    pub fn said(&self, options: Options, caps: Caps, paint: &Paint, took: Duration) -> String {
+    pub fn said(&self, options: Options, caps: Caps, terminal: &Terminal, took: Duration) -> String {
         let mut screen = Screen::new(options, caps);
         screen.advance_clock(u64::try_from(took.as_millis()).unwrap_or(u64::MAX));
         screen.take(Event::Built(Built {
@@ -112,7 +113,7 @@ impl Plain {
         }));
         let mut out = String::with_capacity(160); // alloc: once a command, what it prints
         if let Some(frame) = screen.frame() {
-            blaze_screen::encode(&frame, paint, &mut out);
+            blaze_screen::encode(&frame, terminal, &mut out);
         }
         out
     }
@@ -215,15 +216,14 @@ mod tests {
         plain.links = vec![Linked { how: LinkHow::Unchanged, path: "/w/target/debug/a".to_owned() }];
         plain.found = 32;
         let took = Duration::from_millis(10);
-        let piped = plain.said(Options::of(Command::Build), Caps::PIPE, &Paint::PIPE, took);
+        let piped = plain.said(Options::of(Command::Build), Caps::PIPE, &Terminal::PIPE, took);
         assert_eq!(piped, "blaze: ok built=0 cached=32 warnings=0 elapsed_ms=10\n");
         let caps = Caps { live: true, cols: 80, rows: 24, unicode: true };
-        let paint = Paint { live: true, terminal: blaze_report::terminal::Terminal::PIPE };
-        let build = plain.said(Options::of(Command::Build), caps, &paint, took);
+        let build = plain.said(Options::of(Command::Build), caps, &Terminal::PIPE, took);
         assert!(build.contains("up to date · 10ms"), "{build:?}");
-        assert_eq!(plain.said(Options::of(Command::Run), caps, &paint, took), "");
+        assert_eq!(plain.said(Options::of(Command::Run), caps, &Terminal::PIPE, took), "");
         let quiet = Options { quiet: true, ..Options::of(Command::Build) };
-        assert_eq!(plain.said(quiet, Caps::PIPE, &Paint::PIPE, took), "");
+        assert_eq!(plain.said(quiet, Caps::PIPE, &Terminal::PIPE, took), "");
         assert_eq!(plain.program(), None);
         let again = Response::Built { members: 1, profile: String::new(), artifacts: Vec::new() };
         assert!(matches!(plain.take(again), Step::HandOver(_)));

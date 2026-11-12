@@ -116,6 +116,10 @@ pub struct Shown {
     /// What stderr's terminal does beyond `color` (which wins): hyperlinks, its width, a
     /// progress bar, notifications ([`super::terminal`]). A pipe's by default.
     pub terminal: blaze_report::terminal::Terminal,
+    /// stderr is a terminal whose region is redrawn (docs/terminal.md): a note that only
+    /// says how the build is going is the region's to show, and stays out of the scrollback
+    /// unless `-v` asks for it.
+    pub live: bool,
 }
 
 pub(super) type ByHash<V, A> = blaze_hash::ByHash<u64, V, A>;
@@ -237,6 +241,9 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
             self.to(true)?;
             self.line.push_str(&blaze_report::json_message(&report));
             self.line.push('\n');
+        }
+        if report.severity == Severity::Note && self.shown.live && self.shown.verbose == 0 {
+            return Ok(());
         }
         self.to(false)?;
         let caps = self.caps();
@@ -361,7 +368,7 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
     pub fn clear(&mut self) -> io::Result<()> {
         self.flush()?;
         self.err.take(Event::Clear);
-        self.err.draw()
+        self.err.settle()
     }
 
     /// What the build placed, once it said, taken out of the printer.
@@ -648,6 +655,17 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
                 })
                 .collect(),
             unbuilt: u32::try_from(self.left).unwrap_or(u32::MAX),
+            program: self.built.as_ref().and_then(|built| {
+                // The one program the build placed, where it placed one.
+                let mut programs = built.artifacts.iter().filter(|it| {
+                    !it.profile.test && matches!(it.target.kind, TargetKind::Bin | TargetKind::Example)
+                });
+                let one = programs.next()?;
+                match programs.next() {
+                    Some(_) => None,
+                    None => one.executable.clone(), // clone: a path, once a build
+                }
+            }),
             next,
             why_follows: why.is_some(),
             tests_follow: tests,

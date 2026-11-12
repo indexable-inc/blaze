@@ -323,9 +323,21 @@ fn driven(api: &mut FakeApi, words: &[&str], programs: &mut Fake) -> (Then, Stri
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let shown =
         Shown { quiet: asked.flags.quiet, verbose: asked.flags.verbose, ..Shown::default() };
+    let options = blaze_screen::Options {
+        quiet: shown.quiet,
+        verbose: shown.verbose > 0,
+        ..blaze_screen::Options::of(match asked.command() {
+            Command::Run => blaze_screen::Command::Run,
+            Command::Test => blaze_screen::Command::Test,
+            Command::Check => blaze_screen::Command::Check,
+            _ => blaze_screen::Command::Build,
+        })
+    };
+    let mut screen = show::Show::piped(options, &mut err);
     let then =
-        drive(api, &asked, &place(), request, shown, Instant::now(), &mut out, &mut err, programs)
+        drive(api, &asked, &place(), request, shown, Instant::now(), &mut out, &mut screen, programs)
             .unwrap();
+    drop(screen);
     (then, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
 }
 
@@ -724,7 +736,19 @@ fn the_thin_blaze_prints_a_plain_answer_as_this_cli_does() {
         let mut plain = Plain::new();
         let steps: Vec<Step> = plain_answer().into_iter().map(|it| plain.take(it)).collect();
         assert_eq!(steps, [Step::More, Step::More, Step::More, Step::Done], "{typed:?}");
-        let mut said = plain.said(thin.quiet, false, std::time::Duration::ZERO);
+        let options = blaze_screen::Options {
+            quiet: thin.quiet,
+            ..blaze_screen::Options::of(match thin.command {
+                blaze_thin::route::Command::Build => blaze_screen::Command::Build,
+                blaze_thin::route::Command::Run => blaze_screen::Command::Run,
+            })
+        };
+        let said = plain.said(
+            options,
+            blaze_screen::Caps::PIPE,
+            &blaze_report::terminal::Terminal::PIPE,
+            std::time::Duration::ZERO,
+        );
 
         let mut api = FakeApi::answering(plain_answer());
         let mut words = vec!["blaze"];
@@ -741,9 +765,6 @@ fn the_thin_blaze_prints_a_plain_answer_as_this_cli_does() {
                     &thin.program,
                     std::path::Path::new("/w"),
                 );
-                if !thin.quiet {
-                    said.push_str(&exec.running(false));
-                }
                 let Then::Exec(cli) = then else { panic!("{typed:?}: {then:?}: {err}") };
                 assert_eq!(
                     (exec.program, exec.args, exec.env, exec.cwd),

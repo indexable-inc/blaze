@@ -1,15 +1,14 @@
 //! `blaze test` on a terminal: its test executables run while the build goes on, each as soon
 //! as it is linked, and the screen (docs/terminal.md) shows both. The screen is blaze-screen's
-//! one core behind its driver ([`Show`]); this file is only the threads around it, which do
-//! IO and decide nothing of what is shown:
+//! one core behind its driver (`cli::show`); this file is only the threads around it, which
+//! do IO and decide nothing of what is shown:
 //!
 //! - the caller's thread talks to the daemon: each response is the printer's, which makes the
 //!   screen's events of it, and each test executable linked ([`Response::TestReady`]) is the
 //!   runner's;
 //! - the runner starts each test executable, a few at a time, reads libtest's JSON and says
 //!   each test as the screen's events ([`blaze_screen::Test`]);
-//! - the screen's thread owns the [`Show`]: it takes the events of both in the order they
-//!   came, and draws when one came or a timer of the region is due.
+//! - the screen's thread (`show::Threaded`) takes the events of both in the order they came.
 //!
 //! An interrupt puts the terminal back from `show::watch_interrupts`'s thread; the test
 //! executables share the terminal's process group, so they get the signal too.
@@ -47,7 +46,7 @@ use super::{
     print::{Printer, Shown},
     run::Exec,
     say,
-    show::{Show, Sink},
+    show::{Msg, Sink},
     test::{self, Kind},
 };
 
@@ -84,26 +83,6 @@ pub fn wanted(asked: &Invocation, shown: Shown, caps: Caps) -> bool {
     !asked.flags.no_run && !asked.flags.reached && !asked.flags.ub && reads_args
 }
 
-/// What the screen's thread is sent, in the order it happened, then its end.
-enum Msg {
-    Event(Event),
-    /// A burst of events ended: the frame that is due is drawn.
-    Draw,
-    Finish,
-}
-
-/// The screen as the other threads see it: its events go to the thread that owns it.
-impl Sink for Sender<Msg> {
-    fn take(&mut self, event: Event) {
-        let _ = self.send(Msg::Event(event));
-    }
-
-    fn draw(&mut self) -> io::Result<()> {
-        let _ = self.send(Msg::Draw);
-        Ok(())
-    }
-}
-
 /// What the runner is sent.
 enum Run {
     /// A test executable is linked and placed.
@@ -119,38 +98,6 @@ enum Run {
     BuildOver { ok: bool, artifacts: Vec<Artifact> },
 }
 
-/// The screen's thread: each message an event for the screen or the end of a burst, a frame
-/// drawn after each burst and when a timer of the region is due.
-fn screen(mut show: Show<io::Stderr>, gets: &Receiver<Msg>, started: Instant) -> io::Result<()> {
-    loop {
-        let now = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        // The region's timers turn over once a second; with none, the thread only waits.
-        let wait = show.next_deadline().map_or(1000, |at| at.saturating_sub(now).clamp(50, 1000));
-        // One message: whether it is the end.
-        let apply = |msg: Msg, show: &mut Show<io::Stderr>| match msg {
-            Msg::Event(event) => {
-                show.take(event);
-                false
-            }
-            Msg::Draw => false,
-            Msg::Finish => true,
-        };
-        let mut finish = match gets.recv_timeout(Duration::from_millis(wait)) {
-            Ok(msg) => apply(msg, &mut show),
-            Err(RecvTimeoutError::Disconnected) => true,
-            Err(RecvTimeoutError::Timeout) => false,
-        };
-        // A burst is one frame.
-        while let Ok(msg) = gets.try_recv() {
-            finish |= apply(msg, &mut show);
-        }
-        show.draw()?;
-        if finish {
-            return Ok(());
-        }
-    }
-}
-
 /// The build and its tests under the screen: what `cli::cargo` does for a `test` on a
 /// terminal.
 pub fn drive<A: Api>(
@@ -160,12 +107,8 @@ pub fn drive<A: Api>(
     request: Request,
     shown: Shown,
     started: Instant,
-    show: Show<io::Stderr>,
+    mut to_screen: Sender<Msg>,
 ) -> io::Result<Then> {
-    let (mut to_screen, screen_gets) = unbounded::<Msg>();
-    let screen = thread::Builder::new()
-        .name("blaze screen".into())
-        .spawn(move || screen(show, &screen_gets, started))?;
     let (to_runner, runner_gets) = unbounded::<Run>();
     // The workspace's member count comes with `Built`, after the first executables run, so a
     // rerun always names the package: `-p calc --lib` reruns it in any workspace.
@@ -241,10 +184,7 @@ pub fn drive<A: Api>(
     drop(to_runner);
     let code = runner.join().unwrap_or(Exit::Failed.code());
     to_screen.take(Event::Test(Test::Over));
-    let _ = to_screen.send(Msg::Finish);
-    drop(to_screen);
-    let shown = screen.join().map_err(|_| io::Error::other("the screen's thread panicked"))?;
-    shown?;
+    to_screen.draw()?;
     if let Some(error) = unwritten {
         return Err(error);
     }
@@ -883,7 +823,7 @@ mod tests {
             .try_iter()
             .filter_map(|msg| match msg {
                 Msg::Event(event) => Some(event),
-                Msg::Draw | Msg::Finish => None,
+                Msg::Draw | Msg::Sync(_) => None,
             })
             .collect();
         let output = events.iter().find_map(|event| match event {
