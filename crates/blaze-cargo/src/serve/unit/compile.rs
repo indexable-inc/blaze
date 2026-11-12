@@ -1041,6 +1041,7 @@ fn identity_named(
                 "its crate's settings in the front end (its root's path, cfgs, env, edition and target)",
                 Some(id),
             ),
+            IdentityPart::Setting { what, id } => Part::new(what, Some(id)),
             IdentityPart::File { path, content, code } => Part::file(path, Some(content), code),
             IdentityPart::Files { what, content } => Part::new(what, Some(content)),
             IdentityPart::Appended(id) => {

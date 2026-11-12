@@ -92,6 +92,11 @@ pub enum Step {
     Touch(String),
     /// A command whose outcome only has to be success: `build`, `run`, `check`, `test`.
     Do(Action),
+    /// From here on the commands run in another checkout, of this name, beside the first:
+    /// a second project, served by the same daemon. The revision's files are that project's
+    /// whole, and the revisions after it change that project. Only the real driver has two
+    /// checkouts.
+    Project(String),
 }
 
 /// What must come of a revision's action. Every list is of function paths as `blaze why`
@@ -112,6 +117,10 @@ pub struct Expect {
     pub reused: Vec<String>,
     /// The most units made again.
     pub max_units: Option<u64>,
+    /// The most units whose record was not in the store, so that the unit was worked out
+    /// again (`blaze why`'s `unit` steps): a unit can miss its record and still compile
+    /// nothing, when every function of it is a store hit, which `max_units` does not see.
+    pub max_records: Option<u64>,
     /// The most engine memos run, and proved unchanged without running.
     pub max_executed: Option<u64>,
     pub max_verified: Option<u64>,
@@ -138,6 +147,8 @@ pub struct Observed {
     pub said: String,
     pub redone: Option<Vec<String>>,
     pub units: Option<u64>,
+    /// The units whose record missed ([`Expect::max_records`]).
+    pub records: Option<u64>,
     pub executed: Option<u64>,
     pub verified: Option<u64>,
     pub noop: Option<bool>,
@@ -190,10 +201,17 @@ fn step(word: &str, at: &str) -> Step {
         "kill" => Step::Kill,
         _ => match word.split_once(' ') {
             Some(("touch", path)) => Step::Touch(path.to_owned()),
+            Some(("project", name)) => {
+                assert!(
+                    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                    "{at}: `project NAME` names a directory beside the first checkout, by letters, digits and `_`, not `{name}`"
+                );
+                Step::Project(name.to_owned())
+            }
             _ => Step::Do(Action::of(word).unwrap_or_else(|| {
                 panic!(
                     "{at}: no step `{word}`: `edit`, `edit by rename`, `edit by truncate then write`, `stop`, \
-                     `kill`, `touch PATH`, `check`, `build`, `run`, `test`"
+                     `kill`, `touch PATH`, `project NAME`, `check`, `build`, `run`, `test`"
                 )
             })),
         },
@@ -201,9 +219,9 @@ fn step(word: &str, at: &str) -> Step {
 }
 
 /// Every key a revision's table may hold: another is a typo, and is refused.
-const KEYS: [&str; 20] = [
+const KEYS: [&str; 21] = [
     "action", "args", "env", "steps", "remove", "fails", "prints", "says", "redone", "redone_has", "reused",
-    "max_units", "max_executed", "max_verified", "max_ms", "noop", "link", "bytes", "known", "about",
+    "max_units", "max_records", "max_executed", "max_verified", "max_ms", "noop", "link", "bytes", "known", "about",
 ];
 
 fn files(dir: &Path, under: &Path, into: &mut Vec<Change>) {
@@ -296,6 +314,7 @@ impl Test {
                     redone_has: texts(row, "redone_has", &at).unwrap_or_default(),
                     reused: texts(row, "reused", &at).unwrap_or_default(),
                     max_units: count(row, "max_units", &at),
+                    max_records: count(row, "max_records", &at),
                     max_executed: count(row, "max_executed", &at),
                     max_verified: count(row, "max_verified", &at),
                     max_ms: count(row, "max_ms", &at),
@@ -310,10 +329,27 @@ impl Test {
         Test { name: name.to_owned(), about, drivers, seeds: count(&table, "seeds", &at).unwrap_or(8), revisions }
     }
 
-    /// The project's files as they are after revision `upto` (an index), by path.
+    /// The revision that began the project revision `upto` (an index) is of, and the
+    /// project's name: the last at or before it with a [`Step::Project`], or the first
+    /// revision and no name (the first checkout).
+    pub fn project_at(&self, upto: usize) -> (usize, Option<&str>) {
+        for (index, revision) in self.revisions[..=upto].iter().enumerate().rev() {
+            let named = revision.steps.iter().rev().find_map(|it| match it {
+                Step::Project(name) => Some(name.as_str()),
+                _ => None,
+            });
+            if named.is_some() {
+                return (index, named);
+            }
+        }
+        (0, None)
+    }
+
+    /// The files of revision `upto`'s project as they are after it (an index), by path.
     pub fn files_at(&self, upto: usize) -> BTreeMap<String, Vec<u8>> {
         let mut files = BTreeMap::new();
-        for revision in &self.revisions[..=upto] {
+        let (began, _) = self.project_at(upto);
+        for revision in &self.revisions[began..=upto] {
             for change in &revision.changes {
                 match &change.bytes {
                     // clone: the test's bytes, into the state asked for
