@@ -399,15 +399,30 @@ impl Ledger {
                 RebuildCause::Always { why } if miss.step == "build script run" => {
                     mine.push(Reason::Forced { how: why.clone() }); // clone: once a miss
                 }
+                // A unit whose record is not kept is made again by every build: no bug of
+                // `why`'s, a cost with a reason, said by name (`cause`).
+                RebuildCause::Always { why } if miss.step == UNKEPT => {
+                    mine.push(Reason::Forced { how: why.clone() }); // clone: once a miss
+                }
                 RebuildCause::Always { why } => mine.push(bug(why.clone())), // clone: once a miss
                 RebuildCause::Lost { since } => mine.push(bug(format!(
                     "{}: nothing is kept under its key, the one it had when last computed in build {since}, and what dropped it did not record doing so",
                     miss.item
                 ))),
-                RebuildCause::Beyond { what, since } => mine.push(bug(format!(
-                    "{}: its key is the one it had when last computed in build {since}, so {what} differ, whose values blaze does not keep yet",
-                    miss.item
-                ))),
+                // Made again under the key it had: when this build says its record is not kept
+                // (the last one's was not either), that is why.
+                RebuildCause::Beyond { what, since } => {
+                    let unkept = by_item.get(miss.item.as_str()).and_then(|found| {
+                        found.iter().copied().find(|it| *it != at && misses[*it].step == UNKEPT)
+                    });
+                    match unkept {
+                        Some(unkept) => theirs.push(unkept),
+                        None => mine.push(bug(format!(
+                            "{}: its key is the one it had when last computed in build {since}, so {what} differ, whose values blaze does not keep yet",
+                            miss.item
+                        ))),
+                    }
+                }
                 RebuildCause::Unnamed { since } => mine.push(bug(format!(
                     "{}: its key changed since build {since} though every part it names is the same, so its key has a part it does not name",
                     miss.item
@@ -1252,8 +1267,50 @@ pub fn summary(rebuilt: &[Rebuild]) -> Vec<Report> {
     out
 }
 
+/// The step of a unit whose record is not kept (`unit::compile::UNKEPT_STEP`).
+const UNKEPT: &str = "unit record";
+
+/// The units of `steps` whose record is not kept, said as what it costs and why: every build
+/// makes them again until the reason goes. A warning of every build that pays it (rule 3: a
+/// check whose answer is no is said, never left as units that quietly rebuild).
+fn unkept(ends: &[Reason], steps: &[&Rebuild]) -> Report {
+    // alloc: once a cause said
+    let mut units: Vec<&str> =
+        steps.iter().filter(|it| it.step == UNKEPT).map(|it| it.item.as_str()).collect();
+    units.sort_unstable();
+    units.dedup();
+    let count = units.len() as u64;
+    let text = Text::new()
+        .count(count)
+        .words(if count == 1 { " unit is" } else { " units are" })
+        .words(" made again in every build: blaze cannot keep ")
+        .words(if count == 1 { "its record" } else { "their records" });
+    let mut report = Report::warning(text).rule("why:unkept");
+    for end in ends {
+        if let Reason::Forced { how } = end {
+            report = report.fact("because", Text::new().words(how));
+            if how.contains("procedural macro") {
+                report = report.fact(
+                    "to fix",
+                    Text::new().words(
+                        "make the macro give the same tokens for the same input whatever it expanded before (no counter, no state that changes what it emits), or move the call into a small crate of its own so that only that crate is made again",
+                    ),
+                );
+            }
+        }
+    }
+    let mut named = Text::new().words(&units[..units.len().min(NAMED)].join(", "));
+    if units.len() > NAMED {
+        named = named.words(" and ").count((units.len() - NAMED) as u64).words(" more");
+    }
+    report.fact("units", named)
+}
+
 /// One root cause of a build's summary: the `steps` whose chains end in `ends`.
 fn cause(ends: &[Reason], steps: &[&Rebuild]) -> Report {
+    if steps.iter().any(|it| it.step == UNKEPT) {
+        return unkept(ends, steps);
+    }
     let count = steps.len() as u64;
     let steps_word = if count == 1 { " step" } else { " steps" };
     let is_bug = |it: &Reason| matches!(it, Reason::Unexplained { .. });

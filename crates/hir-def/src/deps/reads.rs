@@ -170,7 +170,12 @@ impl Reads {
                 }
                 &ExpansionReads::Unknown(why) => {
                     // alloc: why a crate is refused, once per refused crate
-                    let call = format!("{:?} of crate {}", call, loc.def.krate.named(db));
+                    // Named for a person: the call's own text (its first line), and the
+                    // macro's crate. The id alone named nothing a person can find.
+                    let text = call.call_node_view(db).value.to_string();
+                    let line = text.lines().find(|it| !it.trim().is_empty()).unwrap_or("").trim();
+                    let line: String = line.chars().take(96).collect();
+                    let call = format!("`{line}` ({call:?}) of crate {}", loc.def.krate.named(db));
                     return Err(Refused::ProcMacro { call, why });
                 }
             }
