@@ -72,8 +72,9 @@ written to a pipe: its own progress report (OSC 9;4: Ghostty 1.2, WezTerm, Windo
 ConEmu), cleared on every way out; hyperlinks (OSC 8) on a diagnostic's `--> path:line:col`
 (a `file://` URL of the file), on an error's code (its page in the error index) and on the
 built program's path, the visible text unchanged; a notification (OSC 777, OSC 9, kitty's OSC
-99) of a build's end as `[terminal] notify` asks (a failure by default; `always` adds a build
-of `notify_after_secs` or longer); synchronized output (mode 2026) around every frame. A
+99) of the end of a build of `[terminal] notify_after_secs` or longer, as `[terminal] notify`
+asks (a failed one by default, `always` any), whether or not the terminal has the focus, which
+blaze does not ask; synchronized output (mode 2026) around every frame. A
 region's rows are erased one at a time (EL), never to the end of the screen (ED): tmux takes
 an ED from its top-left corner for a clear and copies the screen into its history. Not used: the window title (no terminal restores it reliably) and prompt
 marks (OSC 133 is the shell's).

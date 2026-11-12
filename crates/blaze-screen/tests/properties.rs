@@ -433,3 +433,22 @@ fn an_interrupt_puts_the_terminal_back() {
     assert!(!vt.cursor_hidden);
     assert_eq!(vt.progress(), Some("0;0"));
 }
+
+/// A build's end is a notification only when the build was long: a failure that took a
+/// moment is on screen already.
+#[test]
+fn only_a_long_build_ends_with_a_notification() {
+    let notified = |took_ms: u64| {
+        let caps = Caps { live: true, cols: 80, rows: 24, unicode: true };
+        let mut screen = Screen::new(Options::of(Command::Build), caps);
+        screen.advance_clock(took_ms);
+        screen.take(Event::Built(Built { ok: false, ..Built::default() }));
+        let mut bytes = String::new();
+        encode(&screen.frame().expect("the build's line is due"), &terminal(), &mut bytes);
+        let mut vt = vt::Vt::new(80, 24);
+        vt.write(&bytes);
+        vt.osc.iter().any(|it| it.starts_with("777;notify;"))
+    };
+    assert!(!notified(5));
+    assert!(notified(11_000));
+}

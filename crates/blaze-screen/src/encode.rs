@@ -122,7 +122,10 @@ pub fn encode(frame: &Frame, terminal: &Terminal, out: &mut String) {
             };
             terminal.progress_into(out, progress);
         }
+        // A notification is for a build long enough that its person looked away: never for
+        // one that ended in the time of a glance, a failure either.
         if let Some(ended) = &frame.ended
+            && ended.took_ms / 1000 >= terminal.notify_after_secs
             && terminal.notifies(ended.failed, ended.took_ms / 1000)
         {
             terminal.notify_into(out, &ended.title, &ended.body);
