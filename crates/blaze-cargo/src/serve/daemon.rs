@@ -2632,6 +2632,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             tracing::info!(target: "blaze", "idle: the daemon gives its warm memory back");
             blaze_mem::frame::ask_spare_trim();
             crate::raw::memory::purger().ask();
+            self.jobs.say_what_the_kept_front_ends_hold();
         }
         blaze_profile::plot(Plot::AllocatorPurgedBytes, crate::raw::memory::purged_bytes());
         blaze_profile::plot(Plot::CommittedBytes, memory.committed);

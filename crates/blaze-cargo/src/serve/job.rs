@@ -4481,6 +4481,45 @@ impl<S: Steps> Jobs<S> {
         self.let_go(LetGo::Short(short));
     }
 
+    /// What each kept front end's query storage holds, by ingredient, a line a front end in
+    /// the daemon's log: the idle daemon's answer to "what holds the memory" (rule
+    /// ask-the-profile-first). A walk of every function's rows made, sound beside readers
+    /// (`blaze_query::db::Storage::memory_usage`), so only where nothing waits on it: as the
+    /// daemon gives its warm memory back ([`super::idle`]).
+    pub fn say_what_the_kept_front_ends_hold(&self) {
+        use std::fmt::Write as _;
+        const SHOWN: usize = 48;
+        let mib = |bytes: u64| bytes as f64 / f64::from(1u32 << 20);
+        for (root, &id) in self.roots.ids.iter() {
+            let Some(db) = self.roots.fronts[id as usize].as_ref().and_then(KeptDb::db) else {
+                continue;
+            };
+            let _span = tracing::info_span!(target: "blaze", "idle: what the kept front end holds").entered();
+            let mut usage = Vec::new(); // alloc: an idle daemon's report, an entry an ingredient
+            blaze_query::db::Database::storage(db).memory_usage(&mut usage);
+            usage.sort_by(|a, b| b.held().cmp(&a.held()).then(a.name.cmp(b.name)));
+            let total: u64 = usage.iter().map(blaze_query::db::MemoryUsage::held).sum();
+            let mut said = String::new(); // alloc: as above, one line
+            for it in usage.iter().take(SHOWN) {
+                let _ = write!(
+                    said,
+                    "; {} {:.1} (rows {:.1}, values {:.1}; {} rows made, {} used)",
+                    it.name,
+                    mib(it.held()),
+                    mib(it.row_bytes),
+                    mib(it.value_bytes),
+                    it.rows,
+                    it.used,
+                );
+            }
+            crate::serve::said::logged!(INFO,
+                "blaze serve: idle: the kept front end of {root} holds {:.1} MiB of query storage in {} ingredients, in MiB{said}",
+                mib(total),
+                usage.len(),
+            );
+        }
+    }
+
     /// The system says memory is short (docs/memory-budget.md section 7, "Pressure"): as at
     /// the soft ceiling, every kept front end is let go and each build's front end is asked for
     /// a release now ([`Writer::pressed`]), whatever this daemon's own budget says.
