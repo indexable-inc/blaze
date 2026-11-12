@@ -403,6 +403,11 @@ fn compute<W: BodyWorld + ?Sized + 'static>(
                 let fact = world.absolute(def, fact);
                 key.clear();
                 let kind = fact_read(fact, &input.krate, &mut key);
+                // A test's planted bug: a fact kind left out of every trace.
+                #[cfg(test)]
+                if dropped(kind) {
+                    continue;
+                }
                 ctx.hash(Read { kind, key: &key })?;
             }
         }

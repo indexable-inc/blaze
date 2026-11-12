@@ -33,8 +33,8 @@ use blaze_query::QueryKind;
 use blaze_query::db::AsId;
 use blaze_store_check::Setting;
 use hir_def::{
-    AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, ImplId, StaticId, StructId,
-    TraitId, TypeAliasId, UnionId,
+    AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, ImplId, ModuleDefId, StaticId,
+    StructId, TraitId, TypeAliasId, UnionId, VariantId,
     deps::{PortableIds, body_key as hir_body_key},
     expr_store::Body,
     nameres::{crate_def_map, demand::crate_body_owners},
@@ -56,10 +56,12 @@ use crate::{
         lookup_passed, offer, offer_passed,
         tests::{BUILD, Memory as Images, OWN, is_impl_table, own, portable},
     },
+    db::HirDatabase,
     next_solver::{
-        SolverDefId,
+        GenericArgs, ParamEnv, SolverDefId,
         goal_store::{FactObject, FactRef},
     },
+    traits::ParamEnvAndCrate,
 };
 
 const FIXTURE: &str = r#"
@@ -89,6 +91,35 @@ const OWN_MIR: FactRef =
     FactRef { kind: QueryKind(0x18f1), subject: ContentId([1; 32]), object: FactObject::None };
 const IMPLS: FactRef =
     FactRef { kind: QueryKind(0x1800), subject: ContentId([4; 32]), object: FactObject::None };
+
+/// What decides the layout of the leaf crate's struct, where a test gives it one ([`SIZED`]):
+/// the fact a read of its field types, met below a layout row the stand-in MIR read, stands for.
+const LAYOUT: FactRef =
+    FactRef { kind: QueryKind(0x18f2), subject: ContentId([5; 32]), object: FactObject::None };
+
+/// The leaf crate's struct, where its file has one.
+fn sized(db: &Db) -> Option<StructId> {
+    let def_map = crate_def_map(db, crate_named(db, "leaf"));
+    def_map.modules(db).find_map(|(_, module)| {
+        module.scope(db).declarations().find_map(|it| match it {
+            ModuleDefId::AdtId(AdtId::StructId(it)) => Some(it),
+            _ => None,
+        })
+    })
+}
+
+/// The size of the leaf crate's struct in bytes, by its layout: what the stand-in MIR reads.
+fn size_of(db: &Db, s: StructId) -> u64 {
+    let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: crate_named(db, "leaf") };
+    db.layout_of_adt(AdtId::StructId(s), GenericArgs::empty().store(), env.store())
+        .map_or(u64::MAX, |it| it.size.bytes())
+}
+
+/// [`LAYOUT`]'s value: how many fields the leaf crate's struct has; none where it has no struct.
+fn layout(db: &Db) -> Option<ContentId> {
+    let fields = VariantId::from(sized(db)?).fields(db).fields().len() as u64;
+    Some(Hasher::new("blaze v2 body entries test layout").update(&fields.to_le_bytes()).finish())
+}
 
 fn reading() -> Reading {
     Reading { edition: Edition::CURRENT, extensions: Extensions::NONE }
@@ -180,12 +211,17 @@ impl BodyFacts for EntryFacts {
         &self,
         _: &Db,
         _: DefWithBodyId,
-        _: Step,
+        step: Step,
         _: blaze_query::db::DatabaseKeyIndex,
         _: blaze_query::db::ReadKind,
         name: &'static str,
     ) -> Classified {
-        if name.contains("infer_body_query") {
+        if name.contains("layout_of_") {
+            // As item-hash's `Rule::Through`: the layout row's own reads in its place.
+            Classified::Through
+        } else if step == Step::Mir && name.contains("field_types") {
+            Classified::Fact(LAYOUT)
+        } else if name.contains("infer_body_query") {
             Classified::Fact(OWN_INFER)
         } else if name.contains("fake_mir") {
             Classified::Fact(OWN_MIR)
@@ -199,6 +235,7 @@ impl BodyFacts for EntryFacts {
     fn value(&self, db: &Db, _: DefWithBodyId, fact: FactRef) -> Option<ContentId> {
         match fact {
             IMPLS => Some(impls(db)),
+            LAYOUT => layout(db),
             OWN_INFER | OWN_MIR => Some(ContentId([9; 32])),
             _ => None,
         }
@@ -247,15 +284,24 @@ impl BodyFacts for EntryFacts {
     }
 }
 
-/// The MIR stand-in: the body's inference read, and its answer offered as the MIR's.
+/// The MIR stand-in: the body's inference read, and its answer offered as the MIR's. Where
+/// the leaf crate has a struct ([`SIZED`]) it reads the struct's size, by its layout, as a
+/// real body's MIR reads a literal's type's, and its answer holds that size.
 #[blaze_query::tracked(returns(copy))]
 fn fake_mir(db: &Db, def: DefWithBodyId) -> bool {
-    let (_, reads) = capture(db, || {
+    let (size, reads) = capture(db, || {
         let _ = InferenceResult::of(db, def);
+        sized(db).map(|s| size_of(db, s))
     });
     offer(db, def, Step::Mir, MIR_SCHEMA, reads, |facts, out| {
-        out.extend_from_slice(b"mir ");
-        infer::encode(db, facts, def, InferenceResult::of(db, def), out)
+        // The record first, then the size after it: `infer::encode` writes its record over
+        // whatever the buffer held, so a size put before it would be lost.
+        infer::encode(db, facts, def, InferenceResult::of(db, def), out)?;
+        if let Some(size) = size {
+            out.extend_from_slice(b"size ");
+            out.extend_from_slice(&size.to_le_bytes());
+        }
+        Ok(())
     });
     true
 }
@@ -421,6 +467,7 @@ impl BodyWorld for Tree {
     fn fact(&self, _: &str, fact: FactRef) -> Result<Seen, WorldError> {
         match fact {
             IMPLS => Ok(Seen::Is(impls(self.db()))),
+            LAYOUT => Ok(layout(self.db()).map_or(Seen::Gone, Seen::Is)),
             _ => Ok(Seen::Gone),
         }
     }
@@ -497,10 +544,18 @@ fn ask_all(
 }
 
 /// The oracle: every entry as a run with no session and an empty store gives it now.
+/// The oracle: every body's entries as a fresh run of `tree`'s files gives them, in a new
+/// database, store and session, so nothing `tree`'s database was served stands in for a run.
 fn fresh(kernel: &Kernel<Tree>, tree: &Tree) -> Vec<(String, [Vec<u8>; 3])> {
+    // clone: a counted reference, so the new tree names ids as `tree`'s facts do
+    let mut clean = Tree::with_defs(tree.defs.clone());
+    // clone: the test's file texts, so `clean` is edited while `tree` is lent
+    for (name, text) in tree.files.clone() {
+        clean.edit(&name, &text);
+    }
     let mut store = Memory::default();
-    let mut session = Session::new(tree);
-    ask_all(kernel, &mut session, &mut store, tree)
+    let mut session = Session::new(&clean);
+    ask_all(kernel, &mut session, &mut store, &clean)
 }
 
 /// What one carry across an edit of `leaf.rs` to `edited` did.
@@ -658,6 +713,75 @@ fn the_oracle_catches_an_identity_delta_that_leaves_a_change_out() {
     let planted = carried(&LEAF.replace("leaf() -> u32", "leaf() -> u64"), None, Ids::MainLeftOut);
     assert!(planted.dirty.is_empty(), "{:?}", planted.dirty);
     assert!(planted.fresh.is_err(), "the caller's inference, which names the leaf's type, stayed as it was");
+}
+
+/// The leaf crate's struct as the first pin has it, and with the field it gains.
+const SIZED: &str = "pub struct S { pub a: u32 }\n";
+const GROWN: &str = "pub struct S { pub a: u32, pub b: u64 }\n";
+
+/// A carry across the leaf crate's struct gaining a field, every body's stand-in MIR having
+/// read the struct's size ([`fake_mir`]) through its layout row; `dropped` is a read kind left
+/// out of every trace of the first pin. No body's text, identity or impl changes: only what
+/// decides the layout does, which no delta gives yet (always dirty, counted by name).
+fn layout_carried(dropped: Option<ReadKind>) -> Carried {
+    let kernel = kernel();
+    let mut tree = Tree::new();
+    tree.edit("leaf.rs", &format!("{LEAF}{SIZED}"));
+    let mut identities = Identities::default();
+    identities.delta(&tree, &tree.keys).expect("the first pin's identities");
+    let mut store = Memory::default();
+    let mut session = Session::new(&tree);
+    DROPPED.with(|it| it.set(dropped));
+    let before = ask_all(&kernel, &mut session, &mut store, &tree);
+    DROPPED.with(|it| it.set(None));
+    assert_eq!(before.len(), 4, "four bodies");
+    let from = tree.pin();
+    tree.edit("leaf.rs", &format!("{LEAF}{GROWN}"));
+    let mut changed = Changed::between(from, tree.pin());
+    changed.differs(Read { kind: source::FILE, key: b"leaf.rs" });
+    changed.exact(source::EXISTS);
+    changed.exact(source::CFG);
+    let differ = identities.delta(&tree, &tree.keys).expect("the identity delta");
+    assert!(differ.is_empty(), "a struct's field is in no body's identity here: {differ:?}");
+    let delta = BodyDelta {
+        exact: vec![(ReadKind(IMPLS.kind.0), Vec::new())],
+        unknown: vec![(ReadKind(LAYOUT.kind.0), "layout")],
+        identities: Some(differ),
+    };
+    delta.say::<Tree>(&mut changed);
+    let dirty = always_dirty(&mut session, &store, &delta).unwrap();
+    reset_runs();
+    let carry = kernel.carry(&mut session, &mut store, &tree, &changed, &Setting::OFF).unwrap();
+    assert_eq!(carry.dropped, None, "{carry:?}");
+    let after = ask_all(&kernel, &mut session, &mut store, &tree);
+    let runs = runs();
+    let fresh = differs(&after, &fresh(&kernel, &tree));
+    Carried { runs, dirty, fresh }
+}
+
+/// The invariant: a body's MIR entry that read a type's layout holds only while what decides
+/// that layout does. The layout row is read through (`Classified::Through`), so the entry's
+/// trace has the fact of the struct's field types the row read; the struct gains a field, and
+/// every body's MIR entry (each read the struct's size) misses and runs again, with no
+/// inference run.
+#[test]
+fn a_struct_that_gains_a_field_misses_the_mir_entries_that_read_its_size() {
+    let grown = layout_carried(None);
+    assert_eq!(grown.dirty, [("layout", 4)], "each body's MIR entry read the layout's fact");
+    assert_eq!(grown.runs[Step::Infer as usize], 0, "no inference names the struct: {:?}", grown.runs);
+    assert_eq!(grown.runs[Step::Mir as usize], 4, "each MIR entry read the struct's size: {:?}", grown.runs);
+    grown.fresh.expect("every entry is what a fresh run gives");
+}
+
+/// The control: with the layout's fact left out of every trace (its value in no entry's
+/// digest), the grown struct reaches no MIR entry, each wrongly hits with the old size in its
+/// answer, and the oracle finds the stale one.
+#[test]
+fn the_oracle_catches_a_trace_that_drops_the_layout_fact() {
+    let planted = layout_carried(Some(ReadKind(LAYOUT.kind.0)));
+    assert_eq!(planted.dirty, [("layout", 0)], "no entry has a layout fact to post");
+    assert_eq!(planted.runs[Step::Mir as usize], 0, "no MIR entry was reached: {:?}", planted.runs);
+    assert!(planted.fresh.is_err(), "a MIR entry that read the struct's size stayed as it was");
 }
 
 /// A hit in a second session: a new database of the same files and a new session over the

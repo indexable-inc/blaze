@@ -542,8 +542,6 @@ const REFUSALS: &[(&str, &str)] = &[
     ("closure_exprs", "read for another body's closures"),
     // Of a type or a goal in an environment: no fact names one.
     ("lookup_impl_method_stored", "a method's impl, selected in an environment"),
-    ("layout_of_ty_query", "a type's layout in an environment"),
-    ("layout_of_adt_query", "an ADT's layout for its arguments in an environment"),
     ("is_copy_query", "a type in an environment"),
     ("drop_glue_query", "a type in an environment"),
     ("prove_query", "a goal in an environment"),
@@ -868,6 +866,8 @@ fn several_argument_reads_are_facts_of_their_first() {
             Classified::Covered => panic!("{}: covered", it.name),
             // Only the name-facts classification makes a scan; these reads are of other rules.
             Classified::Scan(_) => panic!("{}: a scan", it.name),
+            // A read through is never handed to a store's facts as a read of its own.
+            Classified::Through => panic!("{}: read through", it.name),
         }
     }
     assert!(facts > 0, "no read of the steps by several arguments is a fact");
@@ -891,6 +891,8 @@ fn own_earlier_steps_are_step_facts() {
             Classified::Refused => {}
             Classified::Covered => panic!("{}: covered", it.name),
             Classified::Scan(_) => panic!("{}: a scan", it.name),
+            // A read through is never handed to a store's facts as a read of its own.
+            Classified::Through => panic!("{}: read through", it.name),
         }
     }
     assert!(infer && mir, "no MIR read of inference ({infer}) or borrow check read of MIR ({mir})");
@@ -987,7 +989,7 @@ fn alike_bodies_list_one_shape(
                 .filter(|it| it.def == def && it.step == step)
                 .filter_map(|it| match it.class {
                     Classified::Fact(fact) => Some(listed(def, fact)),
-                    Classified::Covered | Classified::Refused | Classified::Scan(_) => None,
+                    Classified::Covered | Classified::Refused | Classified::Scan(_) | Classified::Through => None,
                 })
                 .collect();
             facts.sort_unstable();
@@ -1173,6 +1175,7 @@ fn recorded_names_are_facts_with_values_or_handles() {
                 names += usize::from(fact.kind == blaze_items::kinds::RESOLVES);
             }
             Classified::Refused => panic!("{}: refused ({read:?})", it.name),
+            Classified::Through => panic!("{}: a name read read through ({read:?})", it.name),
         }
     }
     assert!(names > 0 && handles > 0, "{names} name facts, {handles} handles");

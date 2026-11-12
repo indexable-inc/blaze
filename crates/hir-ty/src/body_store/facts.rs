@@ -49,6 +49,15 @@ pub enum Classified {
     /// iteration of a module's scope): its fact changes with any row of the table, so the
     /// flush counts it by who read it ([`Flushed::scans`](super::Flushed::scans)).
     Scan(FactRef),
+    /// Its value is a function of what its own row read and nothing else (a type's layout:
+    /// `layout_of_ty_query`, `layout_of_adt_query`): the store classifies the row's kept reads
+    /// in its place, through any of them that is `Through` again, down to reads that are
+    /// covered, facts or refused. So what decides the value is traced as the facts there
+    /// already are, each keyed by an item or a crate, and nothing is keyed by the read's own
+    /// arguments (a type, whose interned id is one process's). Only a row the store can bring
+    /// up to date in the view may be given this ([`crate::layout::current`]); any other is
+    /// refused by name.
+    Through,
     /// It stands for nothing the store can key: the result is not stored.
     Refused,
 }

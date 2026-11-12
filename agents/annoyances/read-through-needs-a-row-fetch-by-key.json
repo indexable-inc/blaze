@@ -1,0 +1,14 @@
+{
+ "id": "read-through-needs-a-row-fetch-by-key",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane layout-fact, int-1112",
+ "where": "crates/blaze-query/src/db/capture.rs Reads::for_each_read_through; crates/hir-ty/src/layout.rs current; crates/hir-ty/src/body_store.rs Store::offered",
+ "what": "The item store reads through a layout row to the reads the row itself made (Classified::Through), so no type is ever keyed. for_each_read_through panics on a row that is not current in the view, and a row its reader proved by durability keeps an older view's stamp, so each row must be fetched first. The only way to fetch a row from its DatabaseKeyIndex outside blaze-query is to know which query it is and call it by its arguments: layout::current does that for layout_of_ty_query and layout_of_adt_query only. The small tracked helpers a struct's or enum's layout reads (struct_flags, variant_field_ids, enum_variant_ids, struct_tail_may_be_unsized, field_ranks, bits_layout_query, bit_width_of, enum_discriminants, explicit_discriminant, AttrFlags::repr_assume_has) are pure functions of their reads too, have no rule in item-hash's RULES and cannot be read through, so a body whose MIR reads an ADT's layout is still refused, by the helper's name (Refusal::Read).",
+ "cost": "not measured; MIR of bodies that read only primitive layouts (literals) is kept, ADT layouts read by MIR are not",
+ "cause": "the engine's untyped row verify (ingredient::Vtable::verify) is pub(crate), so 'bring this row up to date' cannot be asked by key",
+ "class": "a generic engine operation reachable only through per-query typed calls, so every user keeps a list of queries in step with the queries that exist",
+ "prevention": "blaze_query::db exposes one `refresh(db, key)` over Vtable::verify; for_each_read_through calls it itself for a row it descends; layout::current and its list are deleted, and Rule::Through is given to every derived helper",
+ "workaround": "layout::current fetches the two layout queries by their arguments; any other row to read through is refused by name",
+ "fix": "",
+ "state": "open"
+}

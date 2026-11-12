@@ -472,6 +472,26 @@ pub fn layout_of_ty_query(
     })
 }
 
+/// Whether `row` is a row of a layout query (`layout_of_ty_query`, `layout_of_adt_query`),
+/// which is then fetched by its arguments, so it is up to date in the database's view: what
+/// the item store asks before it reads the row's kept reads in the row's place
+/// (`body_store::Classified::Through`, `blaze_query::db::Reads::for_each_read_through`). A row
+/// its reader proved by durability, without a look at its edges, keeps the stamp of the view
+/// it was last verified in, and its kept reads may only be listed once it is current. The
+/// fetch is a read of the running query, of a row that query's value already rests on.
+pub(crate) fn current(db: &Db, row: blaze_query::db::DatabaseKeyIndex) -> bool {
+    let key = row.key_index();
+    if let Some((ty, env)) = layout_of_ty_query::arguments(db, key) {
+        let _ = layout_of_ty_query(db, ty, env);
+        return true;
+    }
+    if let Some((def, args, env)) = layout_of_adt_query::arguments(db, key) {
+        let _ = layout_of_adt_query(db, def, args, env);
+        return true;
+    }
+    false
+}
+
 /// The crate's empty environment when `ty` has no parameter, inference variable or placeholder
 /// and every clause of `env` names one: no such clause can match a goal about `ty` or its
 /// fields, so the layout under the empty environment is the same, and a type is laid out once

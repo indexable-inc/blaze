@@ -463,12 +463,43 @@ impl Store {
         let mut refused = None;
         let facts = &mut scratch.facts;
         let storage = blaze_query::db::Database::storage(db);
-        let _ = reads.for_each_read(storage, |blaze_query::db::Read { key: read, kind }| {
+        // What the last `through` call found of the read it was asked about: `each` is given
+        // that read next when it is not descended, and takes the class from here rather than
+        // classify it twice.
+        let asked: Cell<Option<(blaze_query::db::DatabaseKeyIndex, Classified)>> = Cell::new(None);
+        let classify = |read: blaze_query::db::DatabaseKeyIndex, kind: blaze_query::db::ReadKind| {
+            let name = storage.read_name(read, kind);
+            (name, self.facts.classify(db, def, step, read, kind, name))
+        };
+        // A read whose value is a function of its row's own reads ([`Classified::Through`]) is
+        // not given: the row is brought up to date in this view (a row its reader proved by
+        // durability keeps an older view's stamp, and its kept reads are asked for next) and
+        // its reads are given in its place. One the store cannot bring up to date stays a
+        // read, refused below by name.
+        let through = |&blaze_query::db::Read { key: read, kind }: &blaze_query::db::Read| {
+            let (_, class) = classify(read, kind);
+            asked.set(Some((read, class)));
+            class == Classified::Through && crate::layout::current(db, read)
+        };
+        let _ = reads.for_each_read_through(storage, through, |row| {
+            let blaze_query::db::Read { key: read, kind } = match row {
+                blaze_query::db::RowRead::Read(read) => read,
+                // A row to read through that a store answered: its kept reads are the
+                // lookup's, not what its value was made from. No layout row is stored; one
+                // that is has no fact here.
+                blaze_query::db::RowRead::Stored(read) => {
+                    refused = Some(storage.read_name(read.key, read.kind));
+                    return ControlFlow::Break(());
+                }
+            };
             if kind == blaze_query::db::ReadKind::Interned {
                 return ControlFlow::Continue(());
             }
-            let name = storage.read_name(read, kind);
-            match self.facts.classify(db, def, step, read, kind, name) {
+            let (name, class) = match asked.take() {
+                Some((of, class)) if of == read => (storage.read_name(read, kind), class),
+                _ => classify(read, kind),
+            };
+            match class {
                 Classified::Covered => ControlFlow::Continue(()),
                 Classified::Fact(fact) => {
                     facts.push(fact);
@@ -479,7 +510,8 @@ impl Store {
                     facts.push(fact);
                     ControlFlow::Continue(())
                 }
-                Classified::Refused => {
+                // `Through` of a row that could not be brought up to date: no fact stands for it.
+                Classified::Through | Classified::Refused => {
                     refused = Some(name);
                     ControlFlow::Break(())
                 }

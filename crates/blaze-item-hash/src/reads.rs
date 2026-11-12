@@ -117,6 +117,17 @@ pub(crate) enum Rule {
     /// `module_trait_set(module)`: as [`Rule::Names`], the module's `TraitsInScope` fact
     /// under [`Names::Facts`].
     TraitsInScope,
+    /// A type's layout (`layout_of_ty_query`, `layout_of_adt_query`): keyed by a type and an
+    /// environment, which no fact names and whose interned ids are one process's. Its value is
+    /// a function of what its own row read (the target's data layout, `repr`, the fields'
+    /// types and each field's layout row, to the leaves), so the store classifies those reads
+    /// in its place (`Classified::Through`), each by its own rule here: what decides a layout
+    /// is traced as facts keyed by items and crates. A read below a layout row is classified
+    /// for the same body and step as one the step made itself; a layout row reads no
+    /// name-resolution row of its own (it asks queries that do: field types, attributes), so
+    /// [`Rule::Names`] under [`Names::Identity`], which is sound only for the body's own
+    /// paths, is not met below one.
+    Through,
 }
 
 /// How a read of name resolution is stood for: the switch between the identity made from the
@@ -272,6 +283,8 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("infer_body_query", "hir-ty/src/infer.rs", Rule::OwnStep(Step::Infer)),
     ("inherent_value_item", "hir-ty/src/method_resolution.rs", Rule::FieldNamed(Of::Impl)),
     ("lang_items", "hir-def/src/lang_item.rs", Rule::OwnCrate(Else::CrateRoot)),
+    ("layout_of_adt_query", "hir-ty/src/layout/adt.rs", Rule::Through),
+    ("layout_of_ty_query", "hir-ty/src/layout.rs", Rule::Through),
     ("legacy_macro_memo", "hir-def/src/nameres/frozen/pages.rs", Rule::Names),
     ("line_literals", "hir-ty-mir/src/mir/location.rs", Rule::OwnBody),
     ("loaded_crates", "hir-ty/src/method_resolution.rs", Rule::OwnCrate(Else::CrateRoot)),
@@ -434,6 +447,7 @@ fn apply(
             return Classified::Covered;
         }
         Rule::Names => return name_fact(db, def, read, kind),
+        Rule::Through => return Classified::Through,
         Rule::TraitsInScope => {
             arg::<ModuleId>(db, key).map(|module| values::traits_in_scope(db, module))
         }

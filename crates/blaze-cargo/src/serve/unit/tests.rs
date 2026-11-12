@@ -3312,13 +3312,13 @@ fn what_a_build_with_bodies_alike_but_for_their_names_left_is_kept_and_read_by_t
     assert_eq!(ask_bodies_steps(&first), 5);
     let ran = session.item_steps().expect("an item store is installed unless it is turned off");
     assert_eq!((ran[infer].hits, ran[infer].ran, ran[infer].refused), (0, 5, 0), "{ran:?}");
-    // The MIR of `FIRST`, `SECOND` and `three` reads `layout_of_ty_query` (a `u32`'s), which no
-    // fact covers yet: those three runs are refused a trace and keep no entry. Layout as a
-    // kernel step is end-state piece 5 (docs/v2/plan/design/end-state.md); until then most
-    // real bodies' MIR is not kept across builds.
-    assert_eq!((ran[mir].hits, ran[mir].ran, ran[mir].refused), (0, 5, 3), "{ran:?}");
+    // The MIR of `FIRST`, `SECOND` and `three` reads `layout_of_ty_query` (a `u32`'s). The item
+    // store reads through a layout row to what the row itself read (here the target's data
+    // layout, which the body's identity covers): no run is refused a trace, and each keeps
+    // its entry.
+    assert_eq!((ran[mir].hits, ran[mir].ran, ran[mir].refused), (0, 5, 0), "{ran:?}");
     let (kept, did) = super::deps::keep_bodies_of(&first, &all_in_view, &reader).unwrap();
-    assert_eq!((did.kept, did.refused), (7, 3), "five bodies' inference, two bodies' MIR: {did:?}");
+    assert_eq!((did.kept, did.refused), (10, 0), "five bodies' inference and MIR: {did:?}");
     assert_eq!((did.outside, did.unmapped), (0, 0), "{did:?}");
     let (puts, mut flushes) = super::deps::store(&first, None, &mut session, &[], "/w")
         .unwrap_or_else(|error| panic!("what the build left was not kept: {}", error.what));
@@ -3343,13 +3343,12 @@ fn what_a_build_with_bodies_alike_but_for_their_names_left_is_kept_and_read_by_t
     let krate = next.krate(0).unwrap();
     let (_, did) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &reader).unwrap();
     assert_eq!((did.skipped, did.no_store), (false, false), "{did:?}");
-    // Served: four unedited bodies' inference and `one`'s and `two`'s MIR. Missed: `three`'s
-    // two steps and the statics' MIR, which kept no entry.
-    assert_eq!((did.bodies, did.served, did.missed), (5, 6, 4), "{did:?}");
+    // Served: four unedited bodies' inference and MIR. Missed: `three`'s two steps.
+    assert_eq!((did.bodies, did.served, did.missed), (5, 8, 2), "{did:?}");
     assert_eq!(ask_bodies_steps(&next), 5);
     let read = session.item_steps().unwrap();
     assert_eq!((read[infer].hits, read[infer].ran), (4, 1), "inference: {read:?}");
-    assert_eq!((read[mir].hits, read[mir].ran), (2, 3), "MIR: {read:?}");
+    assert_eq!((read[mir].hits, read[mir].ran), (4, 1), "MIR: {read:?}");
 }
 
 /// A crate is served once per revision however many of its units reach it, and a step's run
@@ -3369,7 +3368,7 @@ fn a_crate_is_served_and_a_run_kept_once_per_build() {
     let session = super::deps::session(&first, &reader, &macros, &[]).unwrap();
     assert_eq!(ask_bodies_steps(&first), 5);
     let (kept, did) = super::deps::keep_bodies_of(&first, &all_in_view, &reader).unwrap();
-    assert_eq!((did.kept, did.refused), (7, 3), "the MIR that reads a layout keeps none: {did:?}");
+    assert_eq!((did.kept, did.refused), (10, 0), "the MIR that reads a layout keeps its entry too: {did:?}");
     let (again, did) = super::deps::keep_bodies_of(&first, &all_in_view, &reader).unwrap();
     assert_eq!((did.kept, again.len()), (0, 0), "a run is kept once: {did:?}");
     for it in kept {
@@ -3381,7 +3380,7 @@ fn a_crate_is_served_and_a_run_kept_once_per_build() {
     let _session = super::deps::session(&next, &reader, &macros, &[]).unwrap();
     let krate = next.krate(0).unwrap();
     let (_, did) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &reader).unwrap();
-    assert_eq!((did.skipped, did.served), (false, 7), "the control, the first serve: {did:?}");
+    assert_eq!((did.skipped, did.served), (false, 10), "the control, the first serve: {did:?}");
     let (_, did) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &reader).unwrap();
     assert_eq!((did.skipped, did.served), (true, 0), "a crate is served once a revision: {did:?}");
 }
