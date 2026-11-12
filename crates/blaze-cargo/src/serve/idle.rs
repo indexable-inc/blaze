@@ -26,17 +26,27 @@ pub(crate) const AFTER: Duration = Duration::from_secs(5);
 /// this many of its limit ([`warm`]).
 pub(crate) const WARM_UNDER: u64 = 8;
 
+/// How long the allocator itself keeps a freed page while the daemon keeps them warm
+/// ([`warm`]): longer than any stretch of work without a pause of [`AFTER`], so the allocator
+/// never gives a page back on a build's path of its own accord, and every return is one the
+/// daemon asked for (the idle give-back, or memory running short). Not [`AFTER`]: mimalloc
+/// purges a page past its delay as some thread next takes or frees one, which is on the next
+/// edit's path (measured: with five seconds here an edit 3.5 s after the last took 155 ms,
+/// against 117 with every freed page given back at once).
+pub(crate) const KEPT_FREED: Duration = Duration::from_secs(3600);
+
 /// How long the allocator keeps a freed page, in milliseconds, for a daemon whose footprint is
-/// `footprint` under the limit `limit`: [`AFTER`] while it holds under one part in
+/// `footprint` under the limit `limit`: [`KEPT_FREED`] while it holds under one part in
 /// [`WARM_UNDER`] of the limit, so the pages one edit's build freed are the next one's with no
 /// page fault and the idle give-back returns them; 0, at once, past that, where freed pages
 /// kept are memory admission cannot grant (docs/memory-footprint.md, step 3).
 #[blaze::pure]
 pub(crate) fn warm(footprint: u64, limit: u64) -> u64 {
     match footprint < limit / WARM_UNDER {
-        true => AFTER.as_millis() as u64,
+        true => KEPT_FREED.as_millis() as u64,
         false => 0,
     }
+}
 }
 
 /// Whether this stretch of idleness gave back yet.
@@ -72,7 +82,7 @@ mod tests {
     #[test]
     fn freed_pages_are_kept_warm_only_while_the_daemon_holds_little() {
         let limit = 96 << 30;
-        assert_eq!(warm(4 << 30, limit), 5000);
+        assert_eq!(warm(4 << 30, limit), 3_600_000);
         assert_eq!(warm(limit / WARM_UNDER, limit), 0, "at the line: at once");
         assert_eq!(warm(80 << 30, limit), 0);
         assert_eq!(warm(0, 0), 0, "no limit known: at once");
