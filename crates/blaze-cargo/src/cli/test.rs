@@ -66,7 +66,8 @@ pub trait Programs {
     fn started(&mut self, artifact: &Artifact, exec: &Exec) -> Result<Exec, String>;
 }
 
-/// Runs each program on the terminal, its output inherited.
+/// Runs each program as a process of its own: its stdin and stderr this process's, its stdout
+/// through this process, which counts what it says it ran.
 pub struct Spawned;
 
 impl Programs for Spawned {
