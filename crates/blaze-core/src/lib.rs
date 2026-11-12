@@ -56,6 +56,7 @@ pub mod fs;
 #[allow(unsafe_code, reason = "the FSEvents driver: CoreFoundation, FSEvents and dispatch calls")]
 mod fsevents;
 mod handoff;
+pub mod home;
 mod host;
 #[cfg(windows)]
 #[allow(unsafe_code, reason = "the IOCP driver: Win32 calls and the OVERLAPPEDs the kernel writes")]
