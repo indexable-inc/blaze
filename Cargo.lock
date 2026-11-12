@@ -581,6 +581,7 @@ dependencies = [
  "blaze-source",
  "blaze-store-check",
  "blaze-testsel",
+ "blaze-thin",
  "blaze-tree",
  "blaze-ui",
  "blaze-units",
@@ -904,6 +905,7 @@ dependencies = [
  "blaze-query",
  "blaze-registry",
  "blaze-sha256",
+ "blaze-thin",
  "blaze-units",
  "blaze-vfs",
  "cfg",
@@ -2082,6 +2084,20 @@ dependencies = [
  "blaze-ids",
  "blaze-protocol",
  "blaze-usercode",
+]
+
+[[package]]
+name = "blaze-thin"
+version = "0.0.0"
+dependencies = [
+ "blaze-api",
+ "blaze-client",
+ "blaze-core",
+ "blaze-format",
+ "blaze-ids",
+ "blaze-report",
+ "libc",
+ "tracing",
 ]
 
 [[package]]
