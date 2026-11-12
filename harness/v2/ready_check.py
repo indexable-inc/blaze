@@ -30,10 +30,14 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-MOD = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;", re.M)
+# Run with `python3 -I`, which leaves the script's directory off the path: ran.py is beside it.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ran
+
+MOD = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;", re.MULTILINE)
 ROOTS = ("lib.rs", "main.rs", "mod.rs")
 # String literals, raw first: a `mod x;` inside one is a test fixture's source, not a module.
-STRINGS = re.compile(r'r(#+)".*?"\1|r".*?"|"(?:\\.|[^"\\])*"', re.S)
+STRINGS = re.compile(r'r(#+)".*?"\1|r".*?"|"(?:\\.|[^"\\])*"', re.DOTALL)
 
 
 def code(text: str) -> str:
@@ -52,7 +56,8 @@ class Input:
 def listed_files(repo: Path, paths: list[str]) -> tuple[list[Path], list[str]]:
     """The files the list covers (a directory stands for every file under it), and the listed
     paths that do not exist."""
-    files, missing = [], []
+    files: list[Path] = []
+    missing: list[str] = []
     for path in paths:
         at = repo / path
         if at.is_dir():
@@ -98,11 +103,10 @@ def findings(repo: Path, tracked: set[str], paths: list[str], quiet: int, now: f
 def main(argv: list[str]) -> None:
     if len(argv) != 2:
         sys.exit("ready_check.py takes one JSON value (see its module docs)")
-    raw = json.loads(argv[1])
-    unknown = set(raw) - set(Input.__dataclass_fields__)
-    if unknown:
-        sys.exit(f"ready_check.py: unknown fields {sorted(unknown)}")
-    ask = Input(**{**raw, "lanes": tuple(raw.get("lanes", ()))})
+    try:
+        ask = ran.parsed(Input, json.loads(argv[1]))
+    except ValueError as refused:
+        sys.exit(f"ready_check.py: {refused}")
     repo, ready = Path(ask.repo), Path(ask.ready)
     done = subprocess.run(["git", "-C", str(repo), "ls-files"], capture_output=True, text=True, check=False)
     if done.returncode != 0:
@@ -110,6 +114,15 @@ def main(argv: list[str]) -> None:
     tracked = set(done.stdout.splitlines())
     lanes = ask.lanes or tuple(sorted(it.stem for it in ready.glob("*.txt")))
     now, refused = time.time(), False
+    # A module file another lane of this run lists counts as there: lanes that share a file
+    # are snapshotted together (2026-11-12: `mod found;` in a lib.rs four lanes list, found.rs
+    # on one lane's list), and a refusal of any lane of the run stops the whole snapshot.
+    together: set[str] = set()
+    for lane in lanes:
+        file = ready / f"{lane}.txt"
+        if file.is_file():
+            listed = [it.strip().rstrip("/") for it in file.read_text().splitlines() if it.strip()]
+            together |= {str(it.relative_to(repo)) for it in listed_files(repo, listed)[0]}
     for lane in lanes:
         file = ready / f"{lane}.txt"
         if not file.is_file():
@@ -117,7 +130,7 @@ def main(argv: list[str]) -> None:
             refused = True
             continue
         paths = [it.strip().rstrip("/") for it in file.read_text().splitlines() if it.strip()]
-        found = findings(repo, tracked, paths, ask.quiet_seconds, now)
+        found = findings(repo, tracked | together, paths, ask.quiet_seconds, now)
         list_age = now - os.stat(file).st_mtime
         if list_age < ask.quiet_seconds:
             found.append(f"{file}: the list itself changed {list_age:.0f} s ago")
