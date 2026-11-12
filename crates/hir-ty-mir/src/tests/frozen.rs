@@ -129,7 +129,11 @@ fn with(mode: Mode, bytes: &Bytes, def_maps: bool) -> TestDB {
     }
     let lang_items = by_crate(&db, mode, &bytes.lang_items);
     frozen_def::set_lang_items(&mut db, lang_items);
-    let impls = by_crate(&db, mode, &bytes.impls);
+    // The impls are pages (`frozen_impls::pages`), given held whole in memory.
+    let impls = by_crate(&db, mode, &bytes.impls)
+        .into_iter()
+        .map(|(krate, it)| (krate, frozen_impls::Tables::whole(&it.bytes, mode)))
+        .collect();
     frozen_impls::set(&mut db, impls);
     db
 }

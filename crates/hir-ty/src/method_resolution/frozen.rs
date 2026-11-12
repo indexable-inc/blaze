@@ -1,41 +1,95 @@
-//! The impls of a crate written as bytes and read back instead of found (frozen dependency
-//! artifacts, blaze's `docs/v2/plan.md`, item 1), with `hir_def`'s frozen encoding.
+//! The impls of a crate kept as a record and read back instead of found (frozen dependency
+//! artifacts, blaze's `docs/v2/plan.md`, item 1; docs/v2/plan/design/restore.md, "Impl tables
+//! read in place"), with `hir_def`'s frozen encoding.
 //!
-//! The bytes are two parts, each read on its own: the crate's [`TraitImpls`] and its
-//! [`InherentImpls`]. As with a frozen `DefMap`, what is read must equal what finding the impls
-//! gives: [`Mode::Check`] finds them and [`check`] records a difference, which is a bug.
+//! The record is [`pages`]: a crate's trait impls, inherent impls and its traits' value items
+//! as tables a lookup reads one entry of. This file is what has a crate read from one: the
+//! per-crate input ([`Tables`], [`ImplTablesSlot`]), the key the record is kept under
+//! ([`key`]), the serve and the store ([`serve`], [`store`]), and how a simplified self type is
+//! written. As with a frozen `DefMap`, what is read must equal what finding the impls gives:
+//! [`Mode::Check`] finds them and [`check`] records a difference, which is a bug.
 
 use std::sync::Arc as StdArc;
 
 use base_db::{Crate, Db};
-use blaze_format::cursor::{Put, Reader};
 use blaze_hash::HashMap;
-use blaze_mem::Frame;
+use blaze_ids::{ContentId, Hasher};
 use hir_def::{
     ModuleDefId,
-    nameres::frozen::{Dec, Enc, Frozen, Mode, check_frozen},
+    deps::{DepImages, ImageStore, PageSource, Paged, Served},
+    nameres::frozen::{Dec, Enc, Mode, record_difference},
 };
 use rustc_type_ir::{FloatTy, IntTy, Mutability, UintTy, fast_reject::SimplifiedType as S};
 use std::alloc::Global;
 
-use super::{InherentImpls, InherentImplsBuilder, TraitImpls, TraitImplsBuilder};
-use crate::{
-    db::HirDatabase,
-    next_solver::{SimplifiedType, SolverDefId},
+use crate::next_solver::{SimplifiedType, SolverDefId};
+
+pub mod pages;
+
+pub use pages::encode;
+pub(super) use pages::{
+    all_inherent_into, all_traits_into, all_value_items, blanket, inherent, row, trait_into,
+    value_items,
 };
 
 type R<T = ()> = Result<T, String>;
 
-/// The crates whose impls are frozen, set by whoever has the bytes.
+/// What a crate's impls are read from: the pages of its record ([`pages`]), read a part at a
+/// time through their source, and what is done with them. Equal when the keys are: the store
+/// gives the bytes of a key only after checking them, so equal keys are equal bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tables {
+    pub pages: Paged,
+    pub mode: Mode,
+}
+
+/// A record held whole in memory: a test's, and what [`Tables::whole`] makes.
+struct Whole(StdArc<[u8]>);
+
+impl PageSource for Whole {
+    fn size(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    // dyn: as `PageSource::read`
+    fn read(&self, at: u64, len: u64, with: &mut dyn FnMut(&[u8])) -> Result<(), String> {
+        let range = usize::try_from(at).ok().zip(usize::try_from(len).ok());
+        let part = range.and_then(|(at, len)| self.0.get(at..at.checked_add(len)?));
+        // alloc: error path
+        let part = part.ok_or_else(|| format!("bytes {at}+{len} of {}", self.0.len()))?;
+        with(part);
+        Ok(())
+    }
+}
+
+impl Tables {
+    /// Tables read from `bytes` ([`encode`]) held whole in memory, keyed by their content:
+    /// for a caller with the bytes and no store (a test, a check of the encoding).
+    pub fn whole(bytes: &[u8], mode: Mode) -> Tables {
+        let mut hasher = Hasher::new(KEY_DOMAIN);
+        hasher.part(bytes);
+        // alloc: the record held whole, once per crate so given
+        let source: StdArc<dyn PageSource> = StdArc::new(Whole(StdArc::from(bytes)));
+        Tables { pages: Paged { key: hasher.finish(), source }, mode }
+    }
+}
+
+/// The crates whose impls are read from tables, set by whoever has the records: read where
+/// every crate is gone over ([`serve`], [`withdraw_unimaged`]). A crate's own tables are read
+/// from its slot ([`ImplTablesSlot`], `hir_def::deps::given`), so tables given to one crate
+/// are no write a reader of another crate's read.
 #[blaze_query::input(singleton, debug)]
 pub struct FrozenImpls {
     #[returns(ref)]
-    pub maps: StdArc<HashMap<Crate, Frozen, Global>>,
+    pub maps: StdArc<HashMap<Crate, Tables, Global>>,
 }
 
 /// Has finding the impls of a crate use `maps`.
-pub fn set(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
+pub fn set(db: &mut Db, maps: HashMap<Crate, Tables, Global>) {
     use blaze_query::db::{Durability, Setter};
+    // clone: the handle of the map set before, to tell which crates' tables move
+    let was = FrozenImpls::try_get(&*db).map(|it| it.maps(&*db).clone());
+    hir_def::deps::given::give_changed::<ImplTablesSlot, Tables>(db, was.as_deref(), &maps);
     let maps = StdArc::new(maps);
     match FrozenImpls::try_get(db) {
         Some(it) => {
@@ -47,144 +101,244 @@ pub fn set(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
     }
 }
 
-fn frozen(db: &Db, krate: Crate) -> Option<&Frozen> {
-    FrozenImpls::try_get(db)?.maps(db).get(&krate)
+/// The kind of a crate's slot holding its entry of [`FrozenImpls`].
+pub struct ImplTablesSlot;
+
+/// The tables `krate` was given, from its own slot: the one read of them inside a query.
+fn tables(db: &Db, krate: Crate) -> Option<&Tables> {
+    krate.given::<ImplTablesSlot, Tables>(db)
 }
 
-/// Whether the impls of `krate` are read from frozen bytes rather than found.
+/// Whether the impls of `krate` are read from its tables rather than found.
 pub fn served(db: &Db, krate: Crate) -> bool {
-    frozen(db, krate).is_some_and(|it| it.mode != Mode::Check)
+    tables(db, krate).is_some_and(|it| it.mode != Mode::Check)
 }
 
-/// Part `which` of frozen bytes: the first is after its length.
-fn part(bytes: &[u8], which: usize) -> R<&[u8]> {
-    let mut at = Reader::new(bytes);
-    let first = at.bytes_u32()?;
-    Ok(if which == 0 { first } else { at.take_rest() })
+// Name resolution hands the impls maintainer no delta of a crate whose impls are read here.
+inventory::submit! { hir_def::nameres::delta::ImplsServed(served) }
+
+/// The version of how a simplified self type is written ([`write_simplified`]), for the key
+/// the record is stored under ([`key`]) and the record's header: it changes with every change
+/// to it, so bytes of another version are never asked for.
+pub const ENCODING: &str = "blaze frozen impls 2";
+
+/// The domain of the key a crate's impl tables are kept under ([`key`]).
+pub const KEY_DOMAIN: &str = "blaze v2 impl tables";
+
+/// Where the impl tables of the crate whose image is filed under `filed` are kept: the
+/// image's key (`hir_def::deps::Image::key`, which covers every input of the crate and of the
+/// crates it depends on, and what it read), the layout of the pages ([`pages::LAYOUT`]), this
+/// encoding and the one its ids are written in (`hir_def::nameres::frozen::ENCODING`), so
+/// pages of another layout are another key and are never asked for. A crate's impls, their
+/// traits and their self types' heads are made from its own items and the items of crates it
+/// depends on, all under that key.
+pub fn key(filed: ContentId) -> ContentId {
+    let mut hasher = Hasher::new(KEY_DOMAIN);
+    hasher
+        .id(&filed)
+        .update(&pages::LAYOUT.to_le_bytes())
+        .part(ENCODING.as_bytes())
+        .part(hir_def::nameres::frozen::ENCODING.as_bytes());
+    hasher.finish()
 }
 
-fn read<'db, T>(
-    db: &'db Db,
-    krate: Crate,
-    which: usize,
-    f: impl FnOnce(&mut Dec<'_>) -> R<T>,
-) -> Option<T> {
-    let frozen = frozen(db, krate).filter(|it| it.mode != Mode::Check)?;
-    let read = || {
-        let mut dec = Dec::new_checked(db, krate, part(&frozen.bytes, which)?)?;
-        let it = f(&mut dec)?;
-        dec.finish()?;
-        Ok::<_, String>(it)
-    };
-    Some(read().unwrap_or_else(|why| panic!("frozen impls do not read: {why}")))
-}
-
-pub(super) fn trait_impls<'db>(
-    db: &'db Db,
-    frame: &Frame,
-    krate: Crate,
-) -> Option<TraitImpls<'db>> {
-    read(db, krate, 0, |dec| {
-        let n = dec.len()?;
-        let mut builder = TraitImplsBuilder::new(frame);
-        for _ in 0..n {
-            let ModuleDefId::TraitId(trait_) = dec.def()? else {
-                // alloc: the error on corrupt bytes.
-                return Err("impls of no trait".to_owned());
-            };
-            let t = builder.trait_(trait_);
-            // `many` of `()` allocates nothing: each id goes straight into the builder.
-            dec.many(|dec| {
-                let row = builder.row(t, read_simplified(dec)?);
-                dec.many(|dec| Ok(builder.push_impl(row, dec.impl_id()?)))?;
-                dec.many(|dec| Ok(builder.push_derive(row, dec.builtin_derive_impl()?)))?;
-                Ok(())
-            })?;
-            dec.many(|dec| Ok(builder.push_blanket(t, dec.impl_id()?)))?;
-        }
-        Ok(builder.finish())
-    })
-}
-
-pub(super) fn inherent_impls<'db>(
-    db: &'db Db,
-    frame: &Frame,
-    krate: Crate,
-) -> Option<InherentImpls<'db>> {
-    read(db, krate, 1, |dec| {
-        let mut builder = InherentImplsBuilder::new(frame);
-        dec.many(|dec| {
-            let group = builder.group(read_simplified(dec)?);
-            dec.many(|dec| Ok(builder.push(group, dec.impl_id()?)))?;
-            Ok(())
-        })?;
-        Ok(builder.finish())
-    })
-}
-
-/// The bytes of the impls of `krate` as they are now: found, or read in [`Mode::Serve`] and
-/// [`Mode::Verify`].
-pub fn encode(db: &Db, krate: Crate) -> R<Vec<u8>> {
-    let mut enc = Enc::new(db, krate);
-    let trait_impls = &**TraitImpls::for_crate(db, krate);
-    let traits =
-        enc.sorted(trait_impls.trait_indices(), |enc, it| enc.def(ModuleDefId::TraitId(*it)))?;
-    enc.usize(traits.len())?;
-    for (trait_, t) in traits {
-        enc.def(ModuleDefId::TraitId(trait_))?;
-        let entries = enc.sorted(trait_impls.rows_at(t), |enc, it| write_simplified(enc, it))?;
-        enc.usize(entries.len())?;
-        for (self_ty, (impls, derived)) in entries {
-            write_simplified(&mut enc, self_ty)?;
-            enc.usize(impls.len())?;
-            for &it in impls.iter() {
-                enc.impl_id(it)?;
+/// Gives `db` the impl tables `images` keeps of each crate `served` keyed that is read from
+/// its image in [`Mode::Serve`], and takes away those of a crate `served` keyed that is not
+/// (its image went, or its tables were never written): called in the write of the serve
+/// (`hir_def::deps::serve_asked`), so the pass of that write finds each crate with tables
+/// served and the impls maintainer never keys an impl of it. A crate `served` did not key is
+/// left as it is. Gives the crates whose tables came or went, sorted; nothing is written for
+/// none. The caller notes a change of the crate graph when one of them was maintained before
+/// (the impls maintainer then drops what it held of it).
+///
+/// A crate with an image and no tables in the store is maintained from its decoded def map,
+/// as before tables were kept, and [`store`] then writes them. Tables that are found and do
+/// not read stop the query that reads them, naming the crate; nothing is found in their place.
+pub fn serve(
+    db: &mut Db,
+    served: &Served,
+    // dyn: the driver's store, one call per crate per serve
+    images: &dyn ImageStore,
+    mode: Mode,
+) -> R<Vec<Crate>> {
+    // clone: what was served before, once per serve, to add to
+    let mut maps =
+        FrozenImpls::try_get(&*db).map(|it| (**it.maps(&*db)).clone()).unwrap_or_default();
+    // In the crates' order: the store is asked in the same order by every database.
+    let mut asked: Vec<Crate> = served.keys.keys().copied().collect(); // alloc: once per serve
+    asked.sort_unstable();
+    let mut changed = Vec::new(); // alloc: none until a crate's tables change
+    for krate in asked {
+        // clone: two buffer handles and a few words, once per crate asked
+        let image = DepImages::try_get(&*db).and_then(|it| it.images(&*db).get(&krate).cloned());
+        let found = match image {
+            Some(image) if mode == Mode::Serve && image.mode() == Mode::Serve => {
+                let at = key(image.key());
+                // The record's pages, read a part at a time: nothing of it is held here.
+                let source = images.pages(&at).map_err(|why| {
+                    // alloc: error text
+                    format!("reading the impl tables of crate {} (key {at:?}): {why}", krate.named(&*db))
+                })?;
+                source.map(|source| Tables { pages: Paged { key: at, source }, mode: Mode::Serve })
             }
-            enc.usize(derived.len())?;
-            for &it in derived.iter() {
-                enc.builtin_derive_impl(it)?;
+            _ => None,
+        };
+        if maps.get(&krate) == found.as_ref() {
+            continue;
+        }
+        changed.push(krate);
+        match found {
+            Some(it) => {
+                maps.insert(krate, it);
+            }
+            None => {
+                maps.remove(&krate);
             }
         }
-        let blanket_impls = trait_impls.blanket_impls(trait_);
-        enc.usize(blanket_impls.len())?;
-        for &it in blanket_impls {
-            enc.impl_id(it)?;
-        }
     }
-    let traits = enc.finish()?;
-
-    let mut enc = Enc::new(db, krate);
-    let inherent_impls = InherentImpls::for_crate(db, krate);
-    let map = enc.sorted(inherent_impls.iter(), |enc, it| write_simplified(enc, it))?;
-    enc.usize(map.len())?;
-    for (self_ty, impls) in map {
-        write_simplified(&mut enc, self_ty)?;
-        enc.usize(impls.len())?;
-        for &it in impls.iter() {
-            enc.impl_id(it)?;
-        }
+    if !changed.is_empty() {
+        set(db, maps);
     }
-    let inherent = enc.finish()?;
-
-    let len = u32::try_from(traits.len()).map_err(|_| "impls over 4 GiB")?;
-    let mut out = Vec::with_capacity(4 + traits.len() + inherent.len());
-    out.put_u32(len);
-    out.put_bytes(&traits);
-    out.put_bytes(&inherent);
-    Ok(out)
+    Ok(changed)
 }
 
-/// Records a difference between the frozen impls of `krate` and the live ones in
-/// [`Mode::Check`], or what was read of them in [`Mode::Verify`].
+/// Writes to `images` the impl tables of each of `crates`, a crate with the key its image is
+/// filed under, that is not read from tables already: what the next database's [`serve`]
+/// finds. Called once the crates are resolved and checked, where their images are written.
+/// Gives the crates whose tables do not encode, with why: such a crate has no tables in the
+/// store and is maintained by every database, which the caller says.
+pub fn store(
+    db: &Db,
+    crates: &[(Crate, ContentId)],
+    // dyn: the driver's store, one call per crate per front end stored
+    images: &dyn ImageStore,
+) -> R<Vec<(Crate, String)>> {
+    let mut refused = Vec::new(); // alloc: none until a crate is refused
+    for &(krate, filed) in crates {
+        if served(db, krate) {
+            continue;
+        }
+        match encode(db, krate) {
+            Ok(bytes) => images.put(key(filed), bytes).map_err(|why| {
+                // alloc: error text
+                format!("keeping the impl tables of crate {}: {why}", krate.named(db))
+            })?,
+            Err(why) => refused.push((krate, why)),
+        }
+    }
+    Ok(refused)
+}
+
+inventory::submit! {
+    base_db::Implied { name: "dependency impl tables withdrawn", write: withdraw_unimaged }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: a crate that loses its image keeps its impl tables.
+    pub(crate) static KEEPS_TABLES_PAST_IMAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The write implied by a change to the files of crates read from images, after
+/// `hir_def::deps`' own (implied writes run in the order of their names: "dependency images
+/// withdrawn" is before this one): a crate that lost its image in this write loses its impl
+/// tables in it too, so the pass that resolves it again maintains its impls again. The tables'
+/// key is the image's, so tables kept past their image would be read against files they were
+/// not made from.
+fn withdraw_unimaged(db: &mut Db, written: &base_db::Written<'_>) {
+    #[cfg(test)]
+    if KEEPS_TABLES_PAST_IMAGE.get() {
+        return;
+    }
+    if written.set.is_empty()
+        && written.added.is_empty()
+        && written.removed.is_empty()
+        && written.roots.is_empty()
+    {
+        return;
+    }
+    let Some(input) = FrozenImpls::try_get(&*db) else { return };
+    let maps = input.maps(&*db);
+    if maps.is_empty() {
+        return;
+    }
+    let images = DepImages::try_get(&*db).map(|it| it.images(&*db));
+    let imaged = |krate: &Crate| images.is_some_and(|it| it.contains_key(krate));
+    if maps.keys().all(imaged) {
+        return;
+    }
+    // clone: the tables' handles, once per write that withdraws an image
+    let mut kept = (**maps).clone();
+    kept.retain(|krate, _| imaged(krate));
+    set(db, kept);
+}
+
+/// Records a difference between the pages of `krate` and the live impls in [`Mode::Check`],
+/// or what was read of them in [`Mode::Verify`]: what [`encode`] writes now against the
+/// record, read whole for this.
 pub fn check(db: &Db, krate: Crate) {
-    let Some(frozen) = frozen(db, krate) else { return };
-    check_frozen(db, krate, "impls", frozen, || encode(db, krate));
+    let Some(tables) = tables(db, krate) else { return };
+    let what = match tables.mode {
+        Mode::Serve => return,
+        Mode::Check => "the live ones",
+        Mode::Verify => "what was read of them",
+    };
+    let source = &*tables.pages.source;
+    // alloc: Check/Verify only, which record differences; never when serving
+    let mut kept: Vec<u8> = Vec::new();
+    let read = source.read(0, source.size(), &mut |bytes| kept.extend_from_slice(bytes));
+    match (read, encode(db, krate)) {
+        (Ok(()), Ok(written)) if written == kept => {}
+        (Ok(()), Ok(written)) => record_difference(db, krate, "impls", what, &written, &kept),
+        (Err(why), _) | (_, Err(why)) => {
+            // alloc: Check/Verify only, as above
+            let what = format!("{what}, which cannot be compared ({why})");
+            record_difference(db, krate, "impls", &what, &[], &[])
+        }
+    }
 }
 
 const INTS: [IntTy; 6] = [IntTy::Isize, IntTy::I8, IntTy::I16, IntTy::I32, IntTy::I64, IntTy::I128];
 const UINTS: [UintTy; 6] =
     [UintTy::Usize, UintTy::U8, UintTy::U16, UintTy::U32, UintTy::U64, UintTy::U128];
 const FLOATS: [FloatTy; 4] = [FloatTy::F16, FloatTy::F32, FloatTy::F64, FloatTy::F128];
+
+/// The kind [`write_simplified`] writes `it` as, and the number it writes after it where the
+/// kind has one (0 where it has none, or names an item instead): what a table's slot hashes
+/// ([`pages`]), the same in every database. `None` for a type [`write_simplified`] refuses.
+pub(super) fn simplified_number(it: &SimplifiedType<'_>) -> Option<(u8, u64)> {
+    Some(match *it {
+        S::Bool => (0, 0),
+        S::Char => (1, 0),
+        // As `write_simplified` numbers them: a standard type by its index, an arbitrary
+        // width by its `code()`.
+        S::Int(it) => match it.arbitrary_width() {
+            Some(_) => (2, u64::from(it.code())),
+            None => (2, INTS.iter().position(|x| *x == it).unwrap() as u64),
+        },
+        S::Uint(it) => match it.arbitrary_width() {
+            Some(_) => (3, u64::from(it.code())),
+            None => (3, UINTS.iter().position(|x| *x == it).unwrap() as u64),
+        },
+        S::Float(it) => (4, FLOATS.iter().position(|x| *x == it).unwrap() as u64),
+        S::Adt(_) => (5, 0),
+        S::Foreign(_) => (6, 0),
+        S::Str => (7, 0),
+        S::Array => (8, 0),
+        S::Slice => (9, 0),
+        S::Ref(it) => (10, u64::from(mutability(it))),
+        S::Ptr(it) => (11, u64::from(mutability(it))),
+        S::Never => (12, 0),
+        S::Tuple(n) => (13, n as u64),
+        S::MarkerTraitObject => (14, 0),
+        S::Trait(_) => (15, 0),
+        S::Function(n) => (16, n as u64),
+        S::UnsafeBinder => (17, 0),
+        S::Placeholder => (18, 0),
+        S::Error => (19, 0),
+        S::Closure(_) | S::Coroutine(_) | S::CoroutineWitness(_) => return None,
+    })
+}
 
 fn write_def(enc: &mut Enc<'_>, it: &SolverDefId<'_>) -> R {
     match *it {
@@ -228,7 +382,7 @@ fn read_mutability(dec: &mut Dec<'_>) -> R<Mutability> {
     Ok(if dec.u8()? == 0 { Mutability::Not } else { Mutability::Mut })
 }
 
-fn write_simplified(enc: &mut Enc<'_>, it: &SimplifiedType<'_>) -> R {
+pub(super) fn write_simplified(enc: &mut Enc<'_>, it: &SimplifiedType<'_>) -> R {
     fn index<T: PartialEq + Copy>(all: &[T], it: T) -> u32 {
         all.iter().position(|x| *x == it).unwrap() as u32
     }
@@ -320,7 +474,7 @@ fn read_int<T: Copy, W>(
         .ok_or_else(|| format!("integer type {at}"))
 }
 
-fn read_simplified<'db>(dec: &mut Dec<'_>) -> R<SimplifiedType<'db>> {
+pub(super) fn read_simplified<'db>(dec: &mut Dec<'_>) -> R<SimplifiedType<'db>> {
     Ok(match dec.u8()? {
         0 => S::Bool,
         1 => S::Char,

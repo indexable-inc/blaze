@@ -1467,6 +1467,9 @@ pub mod kinds {
         INHERENT_SLICE_HASH = 0x24df, "inherent_slice_hash";
         CANDIDATE_SLICE_HASH = 0x24e0, "candidate_slice_hash";
 
+        // Impl tables read from pages (`method_resolution/frozen/pages`).
+        IMPL_PAGES_HEAD = 0x24e1, "impl_pages_head";
+
         // Imports.
         USED_IMPORTS_WITH_TRAITS = 0x24c0, "used_imports_with_traits";
         USES_FN_CACHE = 0x24c1, "uses_fn_cache";
