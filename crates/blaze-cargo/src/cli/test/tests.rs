@@ -1,6 +1,7 @@
 use std::{ffi::OsString, io, path::Path};
 
 use blaze_api::{Artifact, ArtifactKind, TestOutcome, TestResult, Unbuilt};
+use blaze_core::exit::Exit;
 use blaze_screen::Tally;
 
 use super::*;
