@@ -69,7 +69,7 @@
 //!
 //! # Memory
 //!
-//! [`Eval::memo`] keeps its entries in two generations, each a map ([`Map`]) and its values in
+//! [`Eval::memo`] keeps its entries in two generations, each a map ([`HashMap`]) and its values in
 //! an arena of [`Mem`] of half the byte limit. A new entry goes to the young one; when that
 //! holds half the entry limit, or its arena is full, the old generation's entries are dropped
 //! whole, its arena is reset, and the two swap. So no entry is freed piecemeal (an arena is a
@@ -102,7 +102,7 @@ use crate::{
     Plant, Stopped,
     cx::Cx,
     id::{ContentHasher, ContentId},
-    map::Map,
+    map::HashMap,
     mem::{Arena, Mem},
     sync::{LocalLock, LocalShared},
 };
@@ -892,7 +892,7 @@ struct Generations {
 
 struct Generation {
     /// `None` only inside [`Generation::empty`], between dropping the map and making the next.
-    entries: Option<Map<Called, Kept, Alloc>>,
+    entries: Option<HashMap<Called, Kept, Alloc>>,
     alloc: Alloc,
 }
 
@@ -900,7 +900,7 @@ impl Generation {
     fn new(arena: Arena) -> Generation {
         // alloc: once per generation of an evaluator, the owner of its arena's frame.
         let alloc = LocalShared::new(arena.into_frame());
-        Generation { entries: Some(Map::new_in(LocalShared::clone(&alloc))), alloc }
+        Generation { entries: Some(HashMap::new_in(LocalShared::clone(&alloc))), alloc }
     }
 
     fn get(&self, slot: &Called) -> Option<&Kept> {
@@ -925,7 +925,7 @@ impl Generation {
                  which were dropped",
             )
             .reset();
-        self.entries = Some(Map::new_in(LocalShared::clone(&self.alloc)));
+        self.entries = Some(HashMap::new_in(LocalShared::clone(&self.alloc)));
         dropped
     }
 
@@ -1028,7 +1028,7 @@ impl Memo {
 /// reads it once the work is done; [`Provenance`] writes it.
 pub struct Graph<'m> {
     arena: &'m Arena,
-    edges: LocalLock<Map<Called, Vec<Called, &'m Frame>, &'m Frame>>,
+    edges: LocalLock<HashMap<Called, Vec<Called, &'m Frame>, &'m Frame>>,
     /// The calls the program made itself, in the order it first made them.
     roots: LocalLock<Vec<Called, &'m Frame>>,
     /// The first call that could not be recorded: the arena had no room.
@@ -1042,7 +1042,7 @@ impl<'m> Graph<'m> {
     pub fn new_in(arena: &'m Arena) -> Graph<'m> {
         Graph {
             arena,
-            edges: LocalLock::new(Map::new_in(arena.alloc())),
+            edges: LocalLock::new(HashMap::new_in(arena.alloc())),
             roots: LocalLock::new(Vec::new_in(arena.alloc())),
             failed: LocalLock::new(None),
         }

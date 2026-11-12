@@ -951,7 +951,7 @@ parameter when records land; its cost and guarantee fields stay required.
 | `keys`, `procs`, `code`, `window`, `term`, `power`, `opener`, `automation` | every call takes `&Cx`; narrowing by typed name; `RawMode`, `Awake` linear | wait, authority, finishing | already explicit |
 | `path`, `url`, `name`, `env::VarName`, `net::HostPort` | checked constructors with a typed `Why`; `path!`/`var!`/`host!` at compile time | no lossy parse | already explicit |
 | `sort` | `sort::on(workers)`, `Serial` | which threads sort; no ambient pool | already explicit |
-| `map`, `hash` | fixed seed, `SipKey` handed in | no per-process hasher seed | already explicit |
+| `map`, `set`, `hash` | one type per need ([Collections](#collections)); fixed seed; `KeyedMap::with_hasher_in(key, a)` for keys from outside | no per-process hasher seed; the allocator; which removal | `bstd::map::Map` named `HashMap` two ways |
 
 Left implicit, with what each waits for (none is hidden by a default a caller could have
 chosen otherwise today, and each is a row to close):
@@ -982,7 +982,7 @@ path, the host) and the kind. No catch-all `io::Error`, no error without its sub
 ## Memory is explicit
 
 There is no global heap in bstd. Every collection is made in an allocator its code was handed
-(`Vec::new_in(a)`, `Map::new_in(a)`, `String::new_in(a)`); `Vec::new()` does not exist. This is
+(`Vec::new_in(a)`, `HashMap::new_in(a)`, `String::new_in(a)`); `Vec::new()` does not exist. This is
 Zig's rule, and it buys what the plan needs: every byte belongs to a task or a named cache
 (section 6), `noalloc` is visible in a signature, and tests can count and fail allocations.
 
@@ -1003,6 +1003,69 @@ uses the `try_` forms (`try_push`, `try_reserve`), which return the error.
 
 Until S4's runtime ([sys](sys.md), "Runtime"), `alloc`'s global allocator still exists underneath; the `ambient` check treats a use of
 it in a capabilities crate as an effect (`global_alloc`), which replaces the `// alloc:` comment.
+
+### Collections
+
+One type per need. Each is made with `new_in(alloc)` or `with_capacity_in(n, alloc)`; none has a
+`new()`, and none picks a hasher seed at run time. The names are the same in `bstd`, in
+`blaze-hash` and in the blaze edition's prelude (`HashMap`, not `Map`: `blaze_hash::Map` is the
+type generic over its hasher, which only the aliases below name).
+
+| need | type | what it is | what it costs |
+|---|---|---|---|
+| ordinary keys (ids, names, tuples, paths) | `map::HashMap<K, V, A>`, `set::HashSet<K, A>` | hashbrown on foldhash with one fixed seed | one hash, one probe; one allocation with room |
+| keys that are hashes already (a content id, a store key, a fingerprint) | `map::ByHash<K, V, A>`, `set::ByHashSet<K, A>` | the same table on the identity hasher: the key's first word places it | no hash at all |
+| values stored once, found by their content | `map::ContentMap<V, A>` (one owner); `blaze_hashcons::HashCons<T>` (shared between threads, a dense `Idx` and a handle that compares by address) | `insert(value) -> ContentId`, `get(&id) -> Option<&V>`; a `ByHash` on the BLAKE3 of the value under its type's domain | BLAKE3 once per insert, over the value; a lookup hashes nothing |
+| iteration that reaches an output, or entries named by position | `map::IndexMap<K, V, A>`, `set::IndexSet<K, A>` | entries dense in a vector in insertion order, and a table of `u32` indices; `swap_remove` (O(1), one entry moves) and `shift_remove` (O(n), order kept), no `remove` | a lookup is a hash map's plus one load; iteration is a vector's; two allocations with room |
+| sorted keys, range queries | `map::SortedMap<K, V, A>`, `set::SortedSet<K, A>` | `alloc`'s B-tree (`BTreeMap::new_in`: it takes an allocator on the pinned nightly, `allocator_ext`) | O(log n), a node per 11 entries |
+| dense ids whose slots are reused | `mem::Slab<T>` and `mem::Handle<T>` (blaze-mem) | `(index, generation)`: a stale handle is detected, not dereferenced; a `Slab` grows in place | a bounds check, one compare, one load; no hash |
+| keys an attacker may pick (names, paths and headers from outside) | `map::KeyedMap<K, V, A>`, `set::KeyedSet<K, A>` | the hash table on SipHash-1-3 under a `hash::SipKey` | SipHash per key, about 3 times foldhash on a short key |
+| shared between threads | `map::SharedMap<K, V>`, `map::SharedByHash<K, V>`, `set::SharedSet<K>` | papaya's lock-free tables; values are lent, never moved out | a read takes no lock and writes nothing shared |
+
+Decided, with the reason for each:
+
+- **A content map is two types, not one.** `ContentMap` has one owner, its allocator in the
+  type, removes, and no index. `HashCons` is shared (shards, lock-free reads), hands out a dense
+  `Idx`, never frees, and lives on the global heap. One type could not be both without paying
+  for the sharing in the single-owner case, which is the same split as `HashMap` and
+  `SharedMap`. They agree on what a value's id is (`content_of`: the type's `Domain`, then what
+  its `Content::hash_content` feeds), so a value keeps its id between them.
+- **The trust rule.** An id is trusted only where the map computed it. A value that arrives
+  with an id (from a file, a peer, a cache) goes in through `insert_claimed(id, value)`, which
+  hashes the value and returns `Mismatch { claimed, actual }` without storing when they differ.
+  Two unequal values with one id stop the process naming the type: the type's `hash_content`
+  leaves out something its `Eq` compares.
+- **Is a map from `Hash(v)` to `v` efficient?** The lookup is: no hashing, one probe. The
+  insert pays BLAKE3 over the value, about a nanosecond a byte for small values, so it is the
+  right table when the id is wanted anyway (it is persisted, sent or compared across runs), and
+  the wrong one for deduplicating in memory only, where a `HashSet` of the values costs a
+  foldhash. `ByHash` against `HashMap<[u8; 32]>` is the measured row below.
+- **An insertion-ordered map of bstd's own**, not the `indexmap` crate: that one has no
+  allocator parameter, holds `usize` indices (twice the table), and offers `remove`, which
+  hides which of the two removals a call meant. Equality here is of the order too, since the
+  order is what a reader of the map sees.
+- **No sorted map of bstd's own.** `alloc`'s B-tree already takes its allocator; a second tree
+  would be a second home for one concept.
+- **A fixed seed gives up resistance to chosen keys**, on purpose, for reproducible runs and a
+  hash the compiler folds. Where the keys come from outside and the table grows with them, the
+  maker hands a key in: `KeyedMap::with_hasher_in(SipKey::random(), alloc)` for a table nothing
+  persists, or a key derived from the content (`id::index_key`) for one an image lays out, or a
+  key from `io.rng()` in code that takes capabilities. `SipKey` has no `Default`, so a keyed
+  table has no `new_in`: it cannot be made without its key. Iteration order of a keyed
+  `HashMap` differs by key; a keyed table whose order is read is `OrderMap<K, V, SipKey, A>`.
+
+Proven by (`crates/blaze-hash/src/order_tests.rs`, `crates/blaze-hashcons/src/content_map.rs`):
+an ordered map equals a `Vec` of pairs under random inserts, both removals by key and by index,
+`pop` and `retain` (Hegel, 300 cases); its order is the same under the fixed seed, under random
+keys, at three capacities and in two other processes, with the control that a hash map's order
+under two keys differs; a table with room allocates when made (hash map 1, ordered map 2, content
+map 1) and never within the room; a content map equals the distinct values by id under random
+inserts and removes; a claimed id that is not the value's is refused and stores nothing; keys
+picked to collide under a known hasher spread under a key.
+
+Measured (`collections_cost`, COST_ROWS):
+
+Moving blaze's own code off the `indexmap` crate: MOVE_ROWS
 
 ### Contracts
 

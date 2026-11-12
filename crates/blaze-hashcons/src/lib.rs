@@ -21,7 +21,10 @@
 // No unsafe code of its own; `blaze_format::record!` writes the `unsafe impl Record` of the
 // pack's records, allowed on that module alone.
 #![deny(unsafe_code)]
+// `ContentMap` names its allocator.
+#![feature(allocator_api)]
 
+mod content_map;
 mod persist;
 mod std_hash;
 mod table;
@@ -37,6 +40,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 use blaze_ids::{ContentId, Domain, Hasher};
 
 pub use crate::{
+    content_map::{ContentMap, Mismatch},
     persist::{Load, PACK_SCHEMA},
     std_hash::hash_std,
     table::{HashCons, Interned},
