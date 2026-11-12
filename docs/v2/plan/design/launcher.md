@@ -425,15 +425,34 @@ The daemon's side is `crates/blaze-launch-host` (sans-IO): slots by identity, wh
 launcher has bound, the prefetch. blaze-cargo owns the socket, an accept thread and a reader
 and a writer thread a launcher.
 
-**Not what the plan says, each stated:** the build still compiles every function before the
-program starts (`Build::run_with_statics`); a `Need` is answered from the build's functions,
-so "compiled on first call" is true of the launcher (a function has no code in the process
-until called) and not yet of the daemon (`Later::compile_kept` is still uncalled). The cold
-run is therefore no faster, and is slower than today's (below). A program this daemon did
-not build since it started is refused by name (`Unheld`): its unit's record replays and no
-code is held. Test binaries stay dev executables. `RUST_BACKTRACE` prints no frames: std's
-symbolizer does not know placed code (the launcher has each body's name, `Loaded::named`,
-and nothing asks it yet); a panic's message has its file, line and column.
+A program thread talks to the control thread through a queue and pthread condition
+variables (`sys::Handoff`), never a channel: a stub can fire while its thread is ending,
+after the launcher's own thread-locals for it are gone, and a channel's send and receive
+need one. A stub that fires in a forked child stops the child, saying so (the child has no
+control thread; `Command`'s children run, since nothing they call before `exec` is new).
+
+**Not what the plan says, each stated:**
+
+- The build still compiles every function before the program starts
+  (`Build::run_with_statics`, `serve/unit/codegen.rs`); a `Need` is answered from the
+  build's functions. So "compiled on first call" is true of the launcher (a function has no
+  code in the process until it is called) and not of the daemon: `Later::compile_kept`
+  (`blaze-codegen/src/driver/later.rs`) is still uncalled, because answering a `Need` with
+  it needs the front end's database after the job that built the program ended. The cold
+  run is therefore no faster than today's (below).
+- A launched program's unit is built by every build that reaches it and never replayed
+  from its record (`launch::never_replayed`): the record names the launcher's file, the
+  same for every build, and says nothing of which build's code the daemon holds. The cost
+  is the codegen walk over what is kept; a no-op `run` answered before its units are
+  reached pays nothing.
+- Test binaries stay dev executables.
+- `RUST_BACKTRACE` prints no frames: std's symbolizer does not know placed code (the
+  launcher has each body's name, `Loaded::named`, and nothing asks it yet). A panic's
+  message has its file, line and column.
+- The launcher's file is not an input of the unit's record: a new blaze with another
+  launcher places it only for a program it builds first.
+- x86-64: the call sequences and the placement are tested as bytes; nothing of the launcher
+  has run there, and thread-locals are refused by name.
 
 ## Step 5 as built, first version: a body edit while the program runs
 
@@ -457,9 +476,54 @@ calls no new function reports nothing and a replaced body's memory stays (sound,
 hundred bytes an edit); retirement is exercised by the tests, and in a real program only
 at a stub.
 
-### Measured (2026-11-12, M-series Mac, hello world and a loop printing a function's value)
+### Measured (2026-11-12; hello world, and a loop that prints a function's value every millisecond)
 
-@@TABLE@@
+Two machines. The Linux arm64 VM (32 cores) ran nothing else: its numbers are the
+comparison. The Mac was shared with other lanes (load average 17 to 100 through every run),
+so its ranges are the machine's, and the three ways were interleaved there (one of each a
+round) to see the same load. Every run checks the program's output and exit status; each
+series has one fixed `env -i` environment; medians, with the range. Binaries of e34a3b446f
+(today's path is the same code with `BLAZE_LAUNCH` unset).
+
+Linux arm64 VM, quiet:
+
+| | under the launcher | today (dev executable) |
+|---|---|---|
+| cold `run` to exit, fresh home and daemon (n=15) | 13.0 s (12.4 to 14.1) | 13.3 s (12.8 to 13.8) |
+| warm no-op `run` (n=20) | 32.3 ms (30.6 to 56.6) | 13.3 ms (11.8 to 16.8) |
+| body edit, then `run`, save to exit (n=20) | 55.8 ms (49.6 to 214.6) | 70.5 ms (63.4 to 153.2) |
+| body edit while the program runs, save to its new output (n=20) | 47.9 ms (40.3 to 323.9), of which the build's answer is 47.8; one process through 22 edits | never: 22 of 22 edits not shown within 20 s; a new `run` is the 70.5 ms above, and a new process |
+
+Mac, shared (interleaved rounds, n=20 each; two runs, at load 34 to 56 and at 17 to 38):
+
+| | under the launcher | today | Relax (`relax run --quiet hello`) |
+|---|---|---|---|
+| warm no-op `run` | 160.4 ms (73.9 to 244.1); 141.8 (79.2 to 967.2) | 120.8 (64.6 to 244.5); 80.4 (35.9 to 633.9) | 86.8 (50.0 to 127.4); 70.9 (32.8 to 122.9) |
+| body edit, then `run` | 98.5 ms (64.8 to 318.5); 147.9 (55.0 to 12067.5) | 205.7 (147.7 to 357.2); 162.7 (114.8 to 9542.7) | 160.8 (103.2 to 317.3); 136.6 (51.7 to 218.9) |
+
+Mac, each way alone: under the launcher, cold 10.7 s (8.4 to 30.4, n=15), body edit while
+running 76.5 ms (54.6 to 7254.9, n=20; none of 22 missed); today, cold 17.5 s (11.5 to 25.1),
+body edit then run 115.8 ms (101.4 to 604.7), and none of 22 edits reached the running
+program; Relax, after `relax clean` 396 ms (363 to 536, n=15), warm 49.3 ms (43.3 to 60.8),
+body edit then run 92.1 ms (53.0 to 216.4).
+
+What these say, and do not:
+
+- **A body edit reaches a running program**, in the time the build takes to answer (48 ms on
+  the quiet machine): no link, no restart, the same process. Today's path and Relax both
+  need a new process. The 20 ms aimed for is not met, and what is left is the daemon's edit
+  build, not the launcher: the new output is seen within the tick (1 ms) of the answer.
+- **Edit then run** is faster than today's on both machines (56 against 71 ms quiet; the
+  launcher's best on the Mac is 55 ms where today's is 115 and Relax's 52). On the shared
+  Mac the medians of the three overlap: nothing here shows blaze ahead of Relax there.
+- **The warm no-op `run` is slower than today's** (32 against 13 ms quiet): the launcher
+  connects, is told its statics and the last run's functions, and places them, where a
+  linked file just starts. Under 100 ms on the quiet machine, not on the loaded Mac.
+- **The cold run is what it was**: the whole program is still compiled first.
+- Found by the output checks while measuring, and fixed: a replayed record left the
+  program on another build's code (`never_replayed`); every build of a launched program
+  put the launcher's 858 KB in the store (a body edit then run was 910 ms at the median
+  until then).
 
 ### What goes, and why each thing that stays does
 
