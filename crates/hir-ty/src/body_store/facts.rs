@@ -32,6 +32,10 @@ pub enum Classified {
     Covered,
     /// It stands for this fact, whose value goes into the record's key.
     Fact(FactRef),
+    /// As [`Classified::Fact`], of a read that took a whole table where a lookup would do (an
+    /// iteration of a module's scope): its fact changes with any row of the table, so the
+    /// flush counts it by who read it ([`Flushed::scans`](super::Flushed::scans)).
+    Scan(FactRef),
     /// It stands for nothing the store can key: the result is not stored.
     Refused,
 }
@@ -61,10 +65,10 @@ pub trait BodyFacts: Send + Sync + 'static {
     /// crates it loads); `None` when it cannot be hashed now.
     fn value(&self, db: &Db, def: DefWithBodyId, fact: FactRef) -> Option<ContentId>;
 
-    /// The key of a definition `body`'s record names, relative to `body`: `body` itself and what
-    /// it owns (closures, coroutines, opaque types, anonymous constants) as "self", an item one of
-    /// its paths names as "the target of that path", anything else by its item key. Two bodies of
-    /// one identity give the same item the same key in every database, under any renaming.
+    /// The key of a definition `body`'s record names: `body` itself and what it owns (closures
+    /// with their kind, coroutines, opaque types) as "self", relative to `body`; anything else,
+    /// an item one of its paths names among them, by its plain item key, the same in every
+    /// database. Reading a key back ([`BodyFacts::def_of`]) lowers no body.
     fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId;
 
     /// The definition [`BodyFacts::def_key`] gave `key` for `body` in `db`; `None` when there is

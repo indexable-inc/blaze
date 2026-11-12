@@ -23,6 +23,7 @@ use hir_def::{
     ExpressionStoreOwnerId, FunctionId, GenericDefId, HasModule, ImplId, ItemContainerId, Lookup,
     ModuleId, StaticId, TraitId, TypeAliasId, VariantId,
     hir::{ClosureKind, CoroutineKind},
+    nameres::{NameRead, name_read},
 };
 use hir_ty::{
     InferBodyId,
@@ -44,9 +45,13 @@ use crate::values;
 /// type (a supertype's other variant) is refused.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Rule {
-    /// The identity covers it for any key: what name resolution reads (the def maps, module
-    /// scopes and their names, the traits in scope), which the identity hashes as what each of
-    /// the body's paths resolves to, its traits in scope and its module chain.
+    /// What name resolution reads (the def maps, module scopes and their names, the traits in
+    /// scope). Under [`Names::Identity`] the identity covers it for any key: it hashes what
+    /// each of the body's paths resolves to, its traits in scope and its module chain. Under
+    /// [`Names::Facts`] each is the fact `hir_def::nameres::name_read` says it was a read of
+    /// ([`name_fact`]): a name looked up, found or not, is its `Resolves` fact, whose value
+    /// for a name the scope lacks is "nothing", so an item that later supplies or shadows the
+    /// name changes it.
     Names,
     /// Keyed by a body, as a `DefWithBodyId` or its `InferBodyId`: covered when it is the
     /// body's own (its HIR, scopes and upvars are of its codec bytes and resolutions, and
@@ -109,6 +114,21 @@ pub(crate) enum Rule {
     /// `match_check(def)` of the body itself, which the borrow check reads to skip a body
     /// whose patterns failed: its `MatchCheck` fact. Refused for another body's.
     OwnMatchCheck,
+    /// `module_trait_set(module)`: as [`Rule::Names`], the module's `TraitsInScope` fact
+    /// under [`Names::Facts`].
+    TraitsInScope,
+}
+
+/// How a read of name resolution is stood for: the switch between the identity made from the
+/// lowered, resolved body and the key made before lowering (docs/v2/plan/design/restore.md,
+/// "The switch and what deletes the old identity"). [`Names::Identity`] goes with the old
+/// identity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Names {
+    /// Covered by the body's identity, which hashes what each of its paths resolves to.
+    Identity,
+    /// Recorded: each read is a fact of the step's shape.
+    Facts,
 }
 
 /// The arguments of a [`Rule::DepCrate`] read, as the query's key interns them.
@@ -207,6 +227,7 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("body_upvars_mentioned", "hir-def/src/upvars.rs", Rule::OwnBody),
     ("cfg_options", "base-db/src/input.rs", Rule::CrateInput),
     ("children", "hir-def/src/nameres.rs", Rule::Names),
+    ("children", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
     ("closure_exprs", "hir-ty/src/db.rs", Rule::OwnStore),
     ("const_conditions_query", "hir-ty/src/lower.rs", Rule::Items),
     ("const_eval_discriminant_variant", "hir-ty/src/consteval.rs", Rule::ConstValue),
@@ -251,6 +272,7 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("infer_body_query", "hir-ty/src/infer.rs", Rule::OwnStep(Step::Infer)),
     ("inherent_value_item", "hir-ty/src/method_resolution.rs", Rule::FieldNamed(Of::Impl)),
     ("lang_items", "hir-def/src/lang_item.rs", Rule::OwnCrate(Else::CrateRoot)),
+    ("legacy_macro_memo", "hir-def/src/nameres/frozen/pages.rs", Rule::Names),
     ("line_literals", "hir-ty-mir/src/mir/location.rs", Rule::OwnBody),
     ("loaded_crates", "hir-ty/src/method_resolution.rs", Rule::OwnCrate(Else::CrateRoot)),
     ("macros_writing_impls", "hir-ty/src/method_resolution.rs", Rule::WholeCrate),
@@ -259,9 +281,11 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("mir_body_for_closure_query", "hir-ty/src/providers.rs", Rule::OwnStep(Step::Mir)),
     ("mir_body_for_coroutine_query", "hir-ty/src/providers.rs", Rule::OwnStep(Step::Mir)),
     ("mir_body_query", "hir-ty/src/providers.rs", Rule::OwnStep(Step::Mir)),
+    ("module", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
     ("module_impls", "hir-def/src/nameres/facts/impls.rs", Rule::ModuleCrate),
     ("module_items_named", "hir-ty/src/method_resolution/scope_sets.rs", Rule::DepCrate(Args::ModuleName)),
-    ("module_trait_set", "hir-ty/src/method_resolution/scope_sets.rs", Rule::Names),
+    ("module_trait_set", "hir-ty/src/method_resolution/scope_sets.rs", Rule::TraitsInScope),
+    ("name_memo", "hir-def/src/nameres/frozen/pages.rs", Rule::Names),
     ("orphan_rules_hold", "hir-ty/src/traits.rs", Rule::Coherence),
     ("predicates", "hir-ty/src/builtin_derive.rs", Rule::Derive),
     ("relevant_impls", "hir-ty/src/method_resolution.rs", Rule::Items),
@@ -270,14 +294,18 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("rpit_hidden_types", "hir-ty/src/opaques.rs", Rule::Items),
     ("rpitit_item_bounds", "hir-ty/src/rpitit.rs", Rule::Items),
     ("scope", "hir-def/src/nameres.rs", Rule::Names),
+    ("scope", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
+    ("scope_memo", "hir-def/src/nameres/frozen/pages.rs", Rule::Names),
     ("specializes_query", "hir-ty/src/specialization.rs", Rule::Items),
     ("supertraits_info", "hir-ty/src/lower.rs", Rule::Items),
+    ("table", "hir-def/src/nameres.rs", Rule::Names),
     ("tait_hidden_types", "hir-ty/src/opaques.rs", Rule::Items),
     ("target_data_layout_query", "hir-ty/src/layout/target.rs", Rule::OwnCrate(Else::Items)),
     ("target_features", "hir-def/src/attrs.rs", Rule::Attrs(Of::Function)),
     ("trait_environment_query", "hir-ty/src/lower.rs", Rule::Signature(Of::GenericDef)),
     ("trait_type_aliases", "hir-ty/src/opaques.rs", Rule::Fields(Of::Trait)),
     ("trait_value_item", "hir-ty/src/method_resolution.rs", Rule::FieldNamed(Of::Trait)),
+    ("traits_memo", "hir-def/src/nameres/frozen/pages.rs", Rule::Names),
     ("transitive_deps", "base-db/src/input.rs", Rule::CrateRoot),
     ("type_alias_bounds_with_diagnostics", "hir-ty/src/lower.rs", Rule::Signature(Of::AliasBounds)),
     ("type_for_const_with_diagnostics", "hir-ty/src/lower.rs", Rule::Signature(Of::Const)),
@@ -288,7 +316,8 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("workspace_data", "base-db/src/input.rs", Rule::CrateInput),
 ];
 
-/// What `read`, made by `step` of `def`, stands for. `name` is its ingredient's debug name.
+/// What `read`, made by `step` of `def`, stands for under [`Names::Identity`]. `name` is its
+/// ingredient's debug name.
 pub fn classify(
     db: &Db,
     def: DefWithBodyId,
@@ -296,6 +325,20 @@ pub fn classify(
     read: blaze_query::db::DatabaseKeyIndex,
     kind: ReadKind,
     name: &'static str,
+) -> Classified {
+    classify_with(db, def, step, read, kind, name, Names::Identity)
+}
+
+/// What `read`, made by `step` of `def`, stands for, name resolution's reads as `names` says.
+/// `name` is its ingredient's debug name.
+pub fn classify_with(
+    db: &Db,
+    def: DefWithBodyId,
+    step: Step,
+    read: blaze_query::db::DatabaseKeyIndex,
+    kind: ReadKind,
+    name: &'static str,
+    names: Names,
 ) -> Classified {
     match kind {
         // An interned value is a function of its fields, which whoever interned it read.
@@ -308,7 +351,7 @@ pub fn classify(
         _ => name,
     };
     match rule_of(db, read, name) {
-        Some(rule) => apply(db, def, step, read, name, rule),
+        Some(rule) => apply(db, def, step, read, kind, name, rule, names),
         None => Classified::Refused,
     }
 }
@@ -380,12 +423,20 @@ fn apply(
     def: DefWithBodyId,
     step: Step,
     read: blaze_query::db::DatabaseKeyIndex,
+    kind: ReadKind,
     name: &'static str,
     rule: Rule,
+    names: Names,
 ) -> Classified {
     let key = read.key_index();
     let found = match rule {
-        Rule::Names => return Classified::Covered,
+        Rule::Names | Rule::TraitsInScope if names == Names::Identity => {
+            return Classified::Covered;
+        }
+        Rule::Names => return name_fact(db, def, read, kind),
+        Rule::TraitsInScope => {
+            arg::<ModuleId>(db, key).map(|module| values::traits_in_scope(db, module))
+        }
         Rule::OwnBody => {
             let own = match arg::<DefWithBodyId>(db, key) {
                 Some(body) => body == def,
@@ -489,16 +540,51 @@ fn apply(
     };
     match found {
         None => Classified::Refused,
-        Some(fact) if fact.kind == items::SIGNATURE && is_owner(db, def, fact.subject) => {
+        // Under `Names::Facts` the base key is `identity::early_identity`, which names the
+        // owner and its container by key and hashes neither's signature or attributes: a
+        // read of one is a fact like any other item's.
+        Some(fact)
+            if names == Names::Identity
+                && fact.kind == items::SIGNATURE
+                && is_owner(db, def, fact.subject) =>
+        {
             Classified::Covered
         }
-        Some(fact) if fact.kind == values::kinds::ATTRS && is_own_attrs(db, def, fact.subject) => {
+        Some(fact)
+            if names == Names::Identity
+                && fact.kind == values::kinds::ATTRS
+                && is_own_attrs(db, def, fact.subject) =>
+        {
             Classified::Covered
         }
         // The body's own item as "self", as its identity writes it: two bodies of one
         // identity that read the same of themselves list the same shape (`values::OWN`).
         Some(fact) => Classified::Fact(values::relative(db, def, fact)),
     }
+}
+
+/// The fact a read of one of name resolution's rows stands for ([`Names::Facts`]): refused
+/// when `hir_def::nameres::name_read` does not know the row, so a row added there is listed
+/// by the flush until it is answered for.
+fn name_fact(
+    db: &Db,
+    def: DefWithBodyId,
+    read: blaze_query::db::DatabaseKeyIndex,
+    kind: ReadKind,
+) -> Classified {
+    let fact = match name_read(db, read, kind) {
+        None => return Classified::Refused,
+        Some(NameRead::Handle) => return Classified::Covered,
+        Some(NameRead::Name(module, name)) => values::resolves(db, module, &name),
+        Some(NameRead::Traits(module)) => values::traits_in_scope(db, module),
+        // The modules declared in a module are names of its scope, each a type: no fact of
+        // them alone is had, so a read of them is a read of the scope.
+        Some(NameRead::WholeScope(module) | NameRead::Children(module)) => {
+            return Classified::Scan(values::relative(db, def, values::whole_scope(db, module)));
+        }
+        Some(NameRead::Crate(krate)) => values::crate_names(db, krate),
+    };
+    Classified::Fact(values::relative(db, def, fact))
 }
 
 /// The item a key of `of` names, for its `Signature` or `Fields` fact.
@@ -617,7 +703,7 @@ fn is_own_attrs(db: &Db, def: DefWithBodyId, subject: ContentId) -> bool {
 }
 
 #[blaze_query::tracked(returns(copy))]
-fn owner_keys(db: &Db, def: DefWithBodyId) -> (ContentId, Option<ContentId>) {
+pub(crate) fn owner_keys(db: &Db, def: DefWithBodyId) -> (ContentId, Option<ContentId>) {
     let owner = key::item_key(db, ItemId::of_body(db, def)).0;
     let container = match def {
         DefWithBodyId::FunctionId(it) => it.lookup(db).container,

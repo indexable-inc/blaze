@@ -15,6 +15,17 @@
 //!   item key, the crates it loads and depends on by crate key, its `#![feature]`s and its
 //!   recursion limit. Unlike `blaze_items::Fact::Crate` it holds no file of the crate, so an edit
 //!   of a body leaves it as it was.
+//! - `TraitsInScope(module)`: the traits in scope in a module (its blocks', its own and the
+//!   prelude's, as `module_trait_set` gives them), by key, sorted: what a read of a scope's
+//!   traits by a body's step stands for (docs/v2/plan/design/restore.md, "One form, a
+//!   function: the end state").
+//! - `WholeScope(module)`: every name of a module's scope with what it is there (each name's
+//!   `Resolves` value): what a read of a whole scope stands for, an iteration and never a
+//!   lookup. Any name added to the module changes it; it is per module, never per crate.
+//!
+//! A name looked up in a module, found or not, in any namespace or in textual macro scope, is
+//! lane items' `Resolves { scope, name }` ("nothing" is a value), and a macro's definition is
+//! its `Signature`: neither has a kind here.
 //!
 //! A fact whose subject no longer resolves has the value [`absent`]; one that names what is not
 //! its kind's (a record is data, which this build may not have written) has none.
@@ -29,16 +40,16 @@ use base_db::{Crate, Db};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey, Resolved, goals::Goals, key};
 use hir_def::{
-    AdtId, AssocItemId, AttrDefId, DefWithBodyId, HasModule as _, VariantId,
+    AdtId, AssocItemId, AttrDefId, DefWithBodyId, HasModule as _, ModuleId, VariantId,
     attrs::AttrFlags,
     lang_item::{LangItemEnum, lang_items},
-    nameres::crate_recursion_limit,
+    nameres::{CrateName, crate_def_map, crate_recursion_limit},
     unstable_features::UnstableFeatures,
 };
 use hir_expand::name::Name;
 use hir_ty::{
     body_store::{Step, step_value},
-    method_resolution::loaded_crates,
+    method_resolution::{loaded_crates, scope_sets::module_trait_set},
     next_solver::goal_store::{FactObject, FactRef, GoalFacts},
 };
 use smallvec::SmallVec;
@@ -60,6 +71,13 @@ pub mod kinds {
     pub const STEP_MIR: QueryKind = QueryKind(0x1804);
     /// Whether a body's match checking failed, which keeps its borrow check from running.
     pub const MATCH_CHECK: QueryKind = QueryKind(0x1805);
+    /// The traits in scope in a module.
+    pub const TRAITS_IN_SCOPE: QueryKind = QueryKind(0x1806);
+    /// Every name of a module's scope: what an iteration of the scope read.
+    pub const WHOLE_SCOPE: QueryKind = QueryKind(0x1807);
+    /// What a crate's def map holds outside its modules' scopes: its preludes, what its
+    /// root's attributes decide for name resolution, whether it shadows a primitive type.
+    pub const CRATE_NAMES: QueryKind = QueryKind(0x1808);
 }
 
 const FIELDS_DOMAIN: &str = "blaze v2 item-hash fields 1";
@@ -67,6 +85,9 @@ const ATTRS_DOMAIN: &str = "blaze v2 item-hash attrs 1";
 const CRATE_ROOT_DOMAIN: &str = "blaze v2 item-hash crate root 1";
 const MATCH_CHECK_DOMAIN: &str = "blaze v2 item-hash match check 1";
 const ABSENT_DOMAIN: &str = "blaze v2 item-hash absent 1";
+const TRAITS_DOMAIN: &str = "blaze v2 item-hash traits in scope 1";
+const WHOLE_SCOPE_DOMAIN: &str = "blaze v2 item-hash whole scope 1";
+const CRATE_NAMES_DOMAIN: &str = "blaze v2 item-hash crate names 1";
 
 /// The subject of a fact about the body's own item (a function, const or static, or a
 /// discriminant's variant), in place of its key: a tag, which no hash is. What it stands for
@@ -135,9 +156,143 @@ pub fn value(db: &Db, krate: Crate, fact: FactRef) -> Option<ContentId> {
                 Some(Hasher::new(MATCH_CHECK_DOMAIN).update(&[u8::from(failed)]).finish())
             }
         }
+    } else if kind == kinds::CRATE_NAMES {
+        match key::resolve(db, ItemKey(fact.subject)) {
+            None => Some(absent(kind)),
+            Some(Resolved::Module(root)) => Some(crate_names_of(db, root.krate(db))),
+            Some(_) => None,
+        }
+    } else if kind == kinds::TRAITS_IN_SCOPE || kind == kinds::WHOLE_SCOPE {
+        match key::resolve(db, ItemKey(fact.subject)) {
+            None => Some(absent(kind)),
+            Some(Resolved::Module(module)) if kind == kinds::TRAITS_IN_SCOPE => {
+                Some(traits_in_scope_of(db, module))
+            }
+            Some(Resolved::Module(module)) => whole_scope_of(db, module),
+            Some(_) => None,
+        }
     } else {
         None
     }
+}
+
+/// The `TraitsInScope` fact of `module`.
+pub fn traits_in_scope(db: &Db, module: ModuleId) -> FactRef {
+    FactRef {
+        kind: kinds::TRAITS_IN_SCOPE,
+        subject: key::module_key(db, module).0,
+        object: FactObject::None,
+    }
+}
+
+/// The `WholeScope` fact of `module`.
+pub fn whole_scope(db: &Db, module: ModuleId) -> FactRef {
+    FactRef {
+        kind: kinds::WHOLE_SCOPE,
+        subject: key::module_key(db, module).0,
+        object: FactObject::None,
+    }
+}
+
+/// The `CrateNames` fact of `krate`, named by its root module's key.
+pub fn crate_names(db: &Db, krate: Crate) -> FactRef {
+    FactRef {
+        kind: kinds::CRATE_NAMES,
+        subject: key::module_key(db, crate_def_map(db, krate).root).0,
+        object: FactObject::None,
+    }
+}
+
+/// What `krate`'s def map holds outside its modules' scopes (`hir_def::nameres::crate_names`),
+/// each module and macro by key.
+#[blaze_query::tracked(returns(copy))]
+fn crate_names_of(db: &Db, krate: Crate) -> ContentId {
+    let mut h = Hasher::new(CRATE_NAMES_DOMAIN);
+    hir_def::nameres::crate_names(db, krate, &mut |row| {
+        match row {
+            CrateName::Prelude(module) => {
+                h.part(b"prelude").id(&key::module_key(db, module).0);
+            }
+            CrateName::Extern(name, root) => {
+                h.part(b"extern")
+                    .id(&key::name_hash(name.as_str()).0)
+                    .id(&key::module_key(db, root).0);
+            }
+            CrateName::MacroUse(name, it) => {
+                h.part(b"macro use")
+                    .id(&key::name_hash(name.as_str()).0)
+                    .id(&key::item_key(db, ItemId::Macro(it)).0);
+            }
+            CrateName::Tool(tool) => {
+                h.part(b"tool").part(tool.as_bytes());
+            }
+            CrateName::Flags(flags, edition) => {
+                h.part(b"flags").update(&(flags.len() as u64).to_le_bytes());
+                for &flag in flags {
+                    h.update(&[u8::from(flag)]);
+                }
+                h.update(&[edition as u8]);
+            }
+        }
+    });
+    h.finish()
+}
+
+/// Lane items' `Resolves` fact of `name` in `module`: what the name is there in each
+/// namespace and in textual macro scope, "nothing" a value like any.
+pub fn resolves(db: &Db, module: ModuleId, name: &Name) -> FactRef {
+    FactRef {
+        kind: blaze_items::kinds::RESOLVES,
+        subject: key::module_key(db, module).0,
+        object: FactObject::Id(key::name_hash(name.as_str()).0),
+    }
+}
+
+/// The traits in scope in `module`, by key, sorted.
+#[blaze_query::tracked(returns(copy))]
+fn traits_in_scope_of(db: &Db, module: ModuleId) -> ContentId {
+    let traits = module_trait_set(db, module).traits();
+    // alloc: none for up to 32 traits in scope; a module past that spills once per change of
+    // its set.
+    let mut keys: SmallVec<[ContentId; 32]> =
+        traits.iter().map(|&it| key::item_key(db, ItemId::Trait(it)).0).collect();
+    keys.sort_unstable();
+    let mut h = Hasher::new(TRAITS_DOMAIN);
+    h.update(&(keys.len() as u64).to_le_bytes());
+    for key in &keys {
+        h.id(key);
+    }
+    h.finish()
+}
+
+/// Every name of `module`'s scope (its items and imports in each namespace, its textual
+/// macros) with its `Resolves` value, sorted by the name's hash; `None` when one of them
+/// cannot be hashed.
+#[blaze_query::tracked(returns(copy))]
+fn whole_scope_of(db: &Db, module: ModuleId) -> Option<ContentId> {
+    let scope = module.def_map(db).module(db, module).scope(db);
+    let subject = key::module_key(db, module).0;
+    let krate = module.krate(db);
+    // alloc: one row per name of the scope, once per change of a scope something iterated
+    let mut rows: Vec<(ContentId, ContentId)> = Vec::new();
+    let named = scope.entries().filter(|(_, per_ns)| !per_ns.is_none()).map(|(name, _)| name);
+    for name in named.chain(scope.legacy_macros().map(|(name, _)| name)) {
+        let name = key::name_hash(name.as_str()).0;
+        let fact = FactRef {
+            kind: blaze_items::kinds::RESOLVES,
+            subject,
+            object: FactObject::Id(name),
+        };
+        rows.push((name, Goals.value(db, Some(krate), fact)?));
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    let mut h = Hasher::new(WHOLE_SCOPE_DOMAIN);
+    h.update(&(rows.len() as u64).to_le_bytes());
+    for (name, value) in &rows {
+        h.id(name).id(value);
+    }
+    Some(h.finish())
 }
 
 /// The body a step fact's subject names: `Some(None)` when it no longer resolves, `None` when

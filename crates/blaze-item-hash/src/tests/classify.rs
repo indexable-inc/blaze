@@ -417,7 +417,7 @@ fn the_covered_reads_are_the_identitys() {
     let mut ours: Vec<(&str, Key)> = RULES
         .iter()
         .filter_map(|&(name, _, rule)| match rule {
-            Rule::Names => Some((name, Key::Any)),
+            Rule::Names | Rule::TraitsInScope => Some((name, Key::Any)),
             Rule::OwnBody | Rule::OwnStore => Some((name, Key::OwnBody)),
             Rule::CrateInput | Rule::OwnCrate(_) => Some((name, Key::OwnCrate)),
             _ => None,
@@ -997,4 +997,136 @@ fn the_oracle_catches_a_shape_that_names_its_own_body_by_key() {
             .expect_err("each body's key is its own");
         assert!(why.contains("one identity and two shapes of their"), "{why}");
     }
+}
+
+fn root_of(db: &Db) -> hir_def::ModuleId {
+    hir_def::nameres::crate_def_map(db, local_crate(db)).root
+}
+
+fn name_in_root(name: &'static str) -> impl Fn(&Db) -> FactRef {
+    move |db| values::resolves(db, root_of(db), &hir_expand::name::Name::new_root(name))
+}
+
+/// A name a body looked up and did not find is the `Resolves` fact with the value "nothing":
+/// an item that later supplies the name changes it, another item does not. The control is
+/// the third pair: were an absent name no fact (or one without a value), `check` would fail
+/// on "the fact has no value before".
+#[test]
+fn a_name_fact_changes_when_the_name_is_supplied_or_shadowed_and_only_then() {
+    check(&[
+        Pair {
+            what: "an absent name supplied",
+            before: "pub fn f() -> u8 { 1 }",
+            after: "pub fn f() -> u8 { 1 }\npub fn g() {}",
+            changes: true,
+            of: |db| name_in_root("g")(db),
+        },
+        Pair {
+            what: "an absent name, another item added",
+            before: "pub fn f() -> u8 { 1 }",
+            after: "pub fn f() -> u8 { 1 }\npub fn h() {}",
+            changes: false,
+            of: |db| name_in_root("g")(db),
+        },
+        Pair {
+            what: "a glob's name shadowed by an item",
+            before: "mod m { pub fn g() {} }\npub use m::*;\npub fn f() { g() }",
+            after: "mod m { pub fn g() {} }\npub use m::*;\npub fn g() {}\npub fn f() { g() }",
+            changes: true,
+            of: |db| name_in_root("g")(db),
+        },
+        Pair {
+            what: "a found name, its body edited",
+            before: "pub fn g() -> u8 { 1 }",
+            after: "pub fn g() -> u8 { 2 }",
+            changes: false,
+            of: |db| name_in_root("g")(db),
+        },
+    ]);
+}
+
+#[test]
+fn scope_and_crate_name_facts_change_with_what_they_hold_and_only_then() {
+    check(&[
+        Pair {
+            what: "a trait brought into scope",
+            before: "mod m { pub trait T {} }\npub fn f() {}",
+            after: "mod m { pub trait T {} }\nuse m::T;\npub fn f() {}",
+            changes: true,
+            of: |db| values::traits_in_scope(db, root_of(db)),
+        },
+        Pair {
+            what: "a function added, the traits in scope",
+            before: "pub trait T {}\npub fn f() {}",
+            after: "pub trait T {}\npub fn f() {}\npub fn g() {}",
+            changes: false,
+            of: |db| values::traits_in_scope(db, root_of(db)),
+        },
+        Pair {
+            what: "a function added, the whole scope",
+            before: "pub fn f() {}",
+            after: "pub fn f() {}\npub fn g() {}",
+            changes: true,
+            of: |db| values::whole_scope(db, root_of(db)),
+        },
+        Pair {
+            what: "a body edited, the whole scope",
+            before: "pub fn f() -> u8 { 1 }",
+            after: "pub fn f() -> u8 { 2 }",
+            changes: false,
+            of: |db| values::whole_scope(db, root_of(db)),
+        },
+        Pair {
+            what: "an item added, the crate's names",
+            before: "pub fn f() {}",
+            after: "pub fn f() {}\npub struct New;",
+            changes: false,
+            of: |db| values::crate_names(db, local_crate(db)),
+        },
+        Pair {
+            what: "a primitive type shadowed, the crate's names",
+            before: "pub fn f() {}",
+            after: "pub fn f() {}\n#[allow(non_camel_case_types)]\npub struct u8;",
+            changes: true,
+            of: |db| values::crate_names(db, local_crate(db)),
+        },
+    ]);
+}
+
+/// Under `Names::Facts` every read of a row of name resolution the steps make is a fact with
+/// a value now, or a handle; none is refused and none is covered that `name_read` does not
+/// call a handle. The control: under `Names::Identity` the same reads are all covered
+/// (`names_rules_are_covered_for_any_key`), so a `classify_with` that ignored its switch
+/// fails here on the first name looked up.
+#[test]
+fn recorded_names_are_facts_with_values_or_handles() {
+    use hir_def::nameres::{NameRead, name_read};
+    let (db, seen) = steps_seen();
+    let (mut names, mut handles) = (0usize, 0usize);
+    for it in &seen {
+        let rule = reads::rule_of(&db, it.read, it.name);
+        if !matches!(rule, Some(Rule::Names | Rule::TraitsInScope)) {
+            continue;
+        }
+        let names_as = reads::Names::Facts;
+        let class =
+            reads::classify_with(&db, it.def, it.step, it.read, it.kind, it.name, names_as);
+        let read = name_read(&db, it.read, it.kind);
+        match class {
+            Classified::Covered => {
+                assert_eq!(read, Some(NameRead::Handle), "{}: covered, not a handle", it.name);
+                handles += 1;
+            }
+            Classified::Fact(fact) | Classified::Scan(fact) => {
+                assert!(
+                    values::value_in(&db, it.def, fact).is_some(),
+                    "{}: {fact:?} has no value",
+                    it.name
+                );
+                names += usize::from(fact.kind == blaze_items::kinds::RESOLVES);
+            }
+            Classified::Refused => panic!("{}: refused ({read:?})", it.name),
+        }
+    }
+    assert!(names > 0 && handles > 0, "{names} name facts, {handles} handles");
 }

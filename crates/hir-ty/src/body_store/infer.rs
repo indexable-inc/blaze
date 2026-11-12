@@ -36,7 +36,11 @@ type R<T = ()> = Result<T, String>;
 
 blaze_format::record! {
     /// An inference answer: where its constants' type table is, its inference record's buffer,
-    /// its ids, and the items they name, each by its key and its kind at the same index.
+    /// its ids, the items they name, each by its key and its kind at the same index, and how
+    /// many expressions (the low half) and patterns (the high half) the store of the body its
+    /// writer inferred has ([`Nodes`]): what a reader bounds the record's nodes by, so reading
+    /// an answer lowers no body. The answer was found under a key that fixes the body's source
+    /// and what its lowering read, so the reader's store, were it made, has the same counts.
     #[derive(Clone, Copy)]
     struct InferRoot: 1 {
         locs: u64,
@@ -44,7 +48,7 @@ blaze_format::record! {
         ids: Slice<u8>,
         items: Slice<ContentId>,
         kinds: Slice<u8>,
-        reserved: u64,
+        nodes: u64,
     }
 }
 
@@ -52,7 +56,7 @@ const _: () = assert!(size_of::<InferRoot>() == 48);
 
 /// The schema of an inference answer, and of everything its bytes are made with.
 pub(super) const SCHEMA: SchemaHash = schema_of(&[
-    Part::Str("blaze v2 item store inference 1"),
+    Part::Str("blaze v2 item store inference 2"),
     Part::Schema(<InferRoot as Record>::SCHEMA),
     Part::Schema(<InferenceRecord as Persist>::SCHEMA),
     Part::Schema(TABLE_SCHEMA),
@@ -172,6 +176,8 @@ pub(super) fn encode<'db>(
     let locs = locs.write(&mut writer);
     let at = writer.next::<InferRoot>();
     let field = |offset: usize| at + offset as u64;
+    // The writer has the body: it was just inferred.
+    let nodes = Nodes::of(Body::of(db, def));
     let root = InferRoot {
         locs,
         record: Slice::between(
@@ -182,7 +188,7 @@ pub(super) fn encode<'db>(
         ids: words.slice(field(offset_of!(InferRoot, ids))),
         items: keys.slice(field(offset_of!(InferRoot, items))),
         kinds: kinds.slice(field(offset_of!(InferRoot, kinds))),
-        reserved: 0,
+        nodes: u64::from(nodes.exprs) | u64::from(nodes.pats) << 32,
     };
     let written = writer.push(&root);
     debug_assert_eq!(written, at, "`Writer::next` is not where `push` writes");
@@ -200,10 +206,6 @@ pub(super) fn decode<'db>(
     bytes: &[u8],
 ) -> R<InferenceResult<'db>> {
     let root = open_as::<InferRoot>(bytes, SCHEMA).map_err(format_error)?;
-    if root.reserved != 0 {
-        // alloc: the reason an answer does not read
-        return Err("an inference answer with reserved bytes set".to_owned());
-    }
     let words = root.ids.follow(bytes).map_err(format_error)?;
     let record = root.record.follow(bytes).map_err(format_error)?;
     let keys = root.items.follow(bytes).map_err(format_error)?;
@@ -211,7 +213,7 @@ pub(super) fn decode<'db>(
     let items = items_of(db, facts, def, keys, kinds)?;
     let interner = DbInterner::new_with(db, def.krate(db));
     let mut table = ids::read(db, interner, &items, words, bytes, root.locs)?;
-    let nodes = Nodes::of(Body::of(db, def));
+    let nodes = Nodes { exprs: root.nodes as u32, pats: (root.nodes >> 32) as u32 };
     ids::relocating(&mut table, || InferenceRecord::read(record)?.to_result(interner, nodes))
         .map_err(format_error)
 }

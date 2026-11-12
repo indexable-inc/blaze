@@ -322,8 +322,11 @@ struct Seen {
 /// How many databases are recording: zero is the one load [`made`] makes.
 static RECORDING: AtomicUsize = AtomicUsize::new(0);
 
-/// The owners noted, by the database that made them, until its [`Recording`] is dropped.
-static SEEN: Lock<Vec<(Nonce, Vec<Seen>)>> = Lock::new("ty.check_cache.runtime.seen", Vec::new());
+/// The owners noted, each with its crate, by the database that made them, until its
+/// [`Recording`] is dropped. The crate is noted with the owner so that [`encode`] takes only
+/// its own crate's under the lock: two crates encoded at once each find theirs.
+static SEEN: Lock<Vec<(Nonce, Vec<(Crate, Seen)>)>> =
+    Lock::new("ty.check_cache.runtime.seen", Vec::new());
 
 /// A database whose runtime bodies of library crates are noted for [`encode`]; dropping it
 /// forgets what was noted.
@@ -410,15 +413,16 @@ pub(crate) fn made<'db>(db: &'db Db, owner: MirOwner<'db>) {
 #[inline(never)]
 fn note<'db>(db: &'db Db, owner: MirOwner<'db>) {
     let Some((def, _)) = entry_key(db, owner) else { return };
-    if def.krate(db).data(db).origin.is_local() {
+    let krate = def.krate(db);
+    if krate.data(db).origin.is_local() {
         return;
     }
     let (nonce, _) = db.nonce_and_revision();
     let seen = seen_of(owner);
     let mut all = SEEN.lock();
     if let Some((_, noted)) = all.iter_mut().find(|it| it.0 == nonce) {
-        // alloc: one word and a byte an owner lowered, until its crate's value is written
-        noted.push(seen);
+        // alloc: three words an owner lowered, until its crate's value is written
+        noted.push((krate, seen));
     }
 }
 
@@ -437,32 +441,33 @@ pub struct Encoded {
 
 /// The runtime MIR value of `krate`: an entry for each owner of it this database noted
 /// ([`record`], [`made`]), in an order and with bytes that are of the entries alone. The
-/// owners noted are taken: a second call writes only what was made since. Refused when an
+/// crate's owners noted are taken: a second call writes only what was made since. Refused when an
 /// entry does not build into the container (two owners with one key).
 pub fn encode(db: &Db, krate: Crate) -> R<(Vec<u8>, Encoded)> {
     let (nonce, _) = db.nonce_and_revision();
-    let mut noted = {
+    // Only this crate's, taken under the lock: another crate's stay for its own call, which
+    // may run beside this one.
+    // alloc: the crate's noted owners, once per crate at store time
+    let mut noted: Vec<Seen> = Vec::new();
+    {
         let mut all = SEEN.lock();
-        match all.iter_mut().find(|it| it.0 == nonce) {
-            Some((_, noted)) => std::mem::take(noted),
-            // alloc: none; an empty `Vec` holds no allocation
-            None => Vec::new(),
+        if let Some((_, every)) = all.iter_mut().find(|it| it.0 == nonce) {
+            every.retain(|&(of, seen)| {
+                if of == krate {
+                    noted.push(seen);
+                }
+                of != krate
+            });
         }
-    };
+    }
     noted.sort_unstable();
     noted.dedup();
     let mut encoded = Encoded::default();
     // alloc: the crate's entries, once per crate at store time
     let mut entries = Vec::new();
-    // alloc: the owners of other crates, given back below
-    let mut others = Vec::new();
     for seen in noted {
         let owner = owner_of(seen);
-        let Some((def, key)) = entry_key(db, owner) else { continue };
-        if def.krate(db) != krate {
-            others.push(seen);
-            continue;
-        }
+        let Some((_, key)) = entry_key(db, owner) else { continue };
         match entry_of(db, owner) {
             // alloc: the entry's bytes into the value being built, once per owner
             Ok(bytes) => entries.push((key, bytes.to_vec())),
@@ -472,12 +477,6 @@ pub fn encode(db: &Db, krate: Crate) -> R<(Vec<u8>, Encoded)> {
                 encoded.unwritable += 1;
             }
             Err(Left::Failed) => encoded.failed += 1,
-        }
-    }
-    if !others.is_empty() {
-        let mut all = SEEN.lock();
-        if let Some((_, noted)) = all.iter_mut().find(|it| it.0 == nonce) {
-            noted.append(&mut others);
         }
     }
     encoded.entries = entries.len();

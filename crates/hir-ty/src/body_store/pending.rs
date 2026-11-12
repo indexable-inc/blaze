@@ -50,6 +50,7 @@ struct Shard {
     defs: Vec<DefWithBodyId>,
     tallies: Counts,
     refused: HashMap<&'static str, u64, Global>,
+    scans: HashMap<(&'static str, &'static str), u64, Global>,
 }
 
 /// Why offered steps were not kept, by every reason but a read, and what each step's lookups
@@ -85,6 +86,8 @@ impl Counts {
 pub(super) struct Tallies {
     /// By the name of the read that kept them out, most first, then by name.
     pub(super) refused: Vec<(&'static str, u64)>,
+    /// Whole-table reads by reader then row, most first, then by names.
+    pub(super) scans: Vec<(&'static str, &'static str, u64)>,
     pub(super) counts: Counts,
 }
 
@@ -188,6 +191,16 @@ impl Pending {
         }
     }
 
+    /// A read of `row` by `reader` that took a whole table (`Classified::Scan`).
+    pub(super) fn scanned(&self, reader: &'static str, row: &'static str) {
+        let mut shard = self.shard();
+        match shard.scans.entry((reader, row)) {
+            Slot::Occupied(mut count) => *count.get_mut() += 1,
+            // alloc: one entry per reader and row name, a few dozen
+            Slot::Vacant(slot) => _ = slot.insert(1),
+        }
+    }
+
     /// What each step's lookups found and its offers met since the last [`Pending::take`], left
     /// in place.
     pub(super) fn steps(&self) -> [StepCounts; 3] {
@@ -205,6 +218,8 @@ impl Pending {
         // alloc: flush, once per build
         let mut refused = HashMap::<&'static str, u64, Global>::default();
         // alloc: flush, once per build
+        let mut scans = HashMap::<(&'static str, &'static str), u64, Global>::default();
+        // alloc: flush, once per build
         let mut taken = Vec::with_capacity(SHARDS);
         for shard in &self.shards {
             let mut shard = shard.0.lock();
@@ -215,11 +230,18 @@ impl Pending {
             for (name, count) in shard.refused.drain() {
                 *refused.entry(name).or_default() += count;
             }
+            for (names, count) in shard.scans.drain() {
+                *scans.entry(names).or_default() += count;
+            }
             tallies.counts.add(&mem::take(&mut shard.tallies));
         }
         // alloc: flush, once per build
         tallies.refused = refused.into_iter().collect();
         tallies.refused.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        // alloc: flush, once per build
+        tallies.scans =
+            scans.into_iter().map(|((reader, row), count)| (reader, row, count)).collect();
+        tallies.scans.sort_unstable_by(|a, b| b.2.cmp(&a.2).then((a.0, a.1).cmp(&(b.0, b.1))));
         (taken, tallies)
     }
 }

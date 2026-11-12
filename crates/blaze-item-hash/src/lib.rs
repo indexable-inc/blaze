@@ -45,6 +45,47 @@ use hir_ty::{
 /// Lane item-hash's side of `hir_ty::body_store`.
 pub struct Bodies;
 
+/// [`Bodies`] with name resolution's reads recorded as facts ([`reads::Names::Facts`]): the
+/// form that replaces it (docs/v2/plan/design/restore.md, "The switch and what deletes the
+/// old identity"). Installed by tests only until that paragraph's conditions hold; then
+/// `Bodies` becomes this and the type goes.
+pub struct RecordedNames;
+
+impl BodyFacts for RecordedNames {
+    fn identity(&self, db: &Db, def: DefWithBodyId) -> Option<ContentId> {
+        identity::early_identity(db, def).ok()
+    }
+
+    fn classify(
+        &self,
+        db: &Db,
+        def: DefWithBodyId,
+        step: Step,
+        read: blaze_query::db::DatabaseKeyIndex,
+        kind: blaze_query::db::ReadKind,
+        name: &'static str,
+    ) -> Classified {
+        reads::classify_with(db, def, step, read, kind, name, reads::Names::Facts)
+    }
+
+    fn value(&self, db: &Db, def: DefWithBodyId, fact: FactRef) -> Option<ContentId> {
+        Bodies.value(db, def, fact)
+    }
+
+    fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
+        Bodies.def_key(db, body, def)
+    }
+
+    fn def_of<'db>(
+        &self,
+        db: &'db Db,
+        body: DefWithBodyId,
+        key: ContentId,
+    ) -> Option<SolverDefId<'db>> {
+        Bodies.def_of(db, body, key)
+    }
+}
+
 impl BodyFacts for Bodies {
     fn identity(&self, db: &Db, def: DefWithBodyId) -> Option<ContentId> {
         identity::identity(db, def).ok()
