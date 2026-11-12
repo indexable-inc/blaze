@@ -72,6 +72,15 @@
    "do": "Write it against the sans-IO core under the simulation, as a revision case where it is an edit sequence (crates/blaze-engine/tests/revisions/), with a planted-bug control; use a real daemon only for what a kernel alone shows.",
    "why": "Rule simulate-first.",
    "state": "current"
+  },
+  {
+   "id": "H9",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+   "task": "Say what blaze leaves on disk, and what a change did to it",
+   "do": "python3 harness/diskbytes.py run '{\"bin\": <dir with blaze and blaze-engine>, \"commit\": <what was built>, \"work\": <an empty directory with no symlink in its path>, \"out\": <a .json>, \"zstd\": <the zstd binary>}': a fresh home, a build, five body and five comment edits with a pause between, a stop, then every byte by directory and by kind (the store's records by kind and form), with duplicates and what zstd makes of each kind; `home` and `tree` tabulate a directory that is there. Run the base binary and the changed one with the same input and compare.",
+   "why": "`du` counts a clone's blocks once a file and says nothing of what a byte is; edits made back to back measure the work the daemon does after an answer, not an edit (mem2-9).",
+   "state": "current"
   }
  ],
  "annoyances": [
@@ -1199,6 +1208,114 @@
    "cause": "two binaries with one name and different versions; `stop` looked at a different daemon than the one on the socket",
    "workaround": "stopped it with its own binary",
    "fix": "`--version` prints both the launcher and the version it runs; `stop` names the daemon on the socket whatever built it",
+   "state": "open"
+  },
+  {
+   "id": "disk2-1",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+   "where": "crates/blaze-sys/src/macos.rs:87, crates/blaze-core/src/fs.rs",
+   "what": "The brief said the tree used `F_BARRIERFSYNC` for `Durable::Started` and the journal's barrier. No code called it: the only mention was the description string of `fcntl` in blaze-sys's symbol table. Every `Effect::Sync` on macOS was `F_FULLFSYNC` and `Effect::WriteBack` plain `fsync`.",
+   "cost": "a survey before the design; the brief's fact had to be dropped",
+   "cause": "a description of intent read as a description of code",
+   "workaround": "read every call site",
+   "fix": "`Effect::Barrier` is the call now (blaze-core); the store's commit uses it",
+   "state": "fixed on disk2-1111 for the store's commit; open for the profile history, the image, the linker and blaze-gc's direct syncs"
+  },
+  {
+   "id": "disk2-2",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+   "where": "crates/blaze-cas/src/lib.rs `Store::settle`",
+   "what": "The store's cold tier (zstd with a dictionary per kind, promotion, retiring half-dead packs) was built and tested and had no caller outside tests: no daemon ever settled, so every home's store was all raw.",
+   "cost": "an hour to find that the machinery existed and was off",
+   "cause": "the daemon's half was never written",
+   "workaround": "wired it (serve/settle.rs)",
+   "fix": "a gate check that a `pub fn` of a core has a caller outside its tests",
+   "state": "fixed on disk2-1111"
+  },
+  {
+   "id": "disk2-3",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+   "where": "crates/blaze-cas tests on origin/main (248d8f0326)",
+   "what": "Five to six tests of blaze-cas fail on the untouched base, run with cargo in an ix VM: `a_changed_byte_in_the_zeros_ending_a_commit_stops_the_store_naming_its_pack`, `a_pack_whose_header_names_another_unit_stops_the_store`, `place_crash::the_oracle_catches_a_derived_file_accepted_as_a_crash_left_it`, `place_made::a_made_output_is_placed_with_no_clone_and_no_wait_for_a_write_back` (some runs), and the two controls of a head written before its syncs, which caught the planted bug and failed on its wording (the pool says the pack was cut, the test wanted `its head names`).",
+   "cost": "every run of the suite had to be compared with the base's list",
+   "cause": "the pool's reads changed what an open says and the tests' expected text was not updated",
+   "workaround": "compared failures by name",
+   "fix": "the two controls accept the pool's wording now; the other four are open",
+   "state": "two fixed on disk2-1111, four open"
+  },
+  {
+   "id": "disk2-4",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+   "where": "crates/blaze-core/src/kqueue.rs:1783",
+   "what": "blaze-core's unit tests did not compile on macOS on main: `driver.poll(&mut out, Duration::from_millis(20))` where `poll` takes a `Deadline`. No macOS test of blaze-core could run.",
+   "cost": "found only when a macOS check of the new effect was needed",
+   "cause": "the deadline-waits port missed one test, and nothing compiles macOS test targets",
+   "workaround": "fixed the line",
+   "fix": "the gate compiles every test target on macOS (rev-1's fix, for macOS too)",
+   "state": "fixed on disk2-1111"
+  },
+  {
+   "id": "disk2-5",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+   "where": "git diff in the Mac's checkout",
+   "what": "`git diff HEAD > patch` wrote difftastic's display, not a patch (an external diff tool is configured), so `git apply` in the VM said `No valid patches in input` three times.",
+   "cost": "fifteen minutes",
+   "cause": "`diff.external` applies to plain `git diff`",
+   "workaround": "`git diff --no-ext-diff`",
+   "fix": "lane briefs that ship a working tree to a VM say `--no-ext-diff`",
+   "state": "open"
+  },
+  {
+   "id": "disk2-6",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+   "where": "ix shell",
+   "what": "`ix shell VM -- cmd < file` delivered nothing on stdin inside a script; `cat file | ix shell VM -- cmd` did. A long `ix shell` whose output went through a pipe also ended once with no output at all while the work in the VM had finished.",
+   "cost": "twenty minutes, and one experiment run twice",
+   "cause": "not found",
+   "workaround": "pipe into it; write results to a file in the VM and read that",
+   "fix": "not known",
+   "state": "open"
+  },
+  {
+   "id": "disk2-7",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+   "where": "the lane's scratch clone in its VM",
+   "what": "I typed `git stash` at the end of a command in the VM's clone by reflex. It stashed the applied working patch there; I dropped the stash at once, and the next sync applies the patch afresh, so nothing was lost and the user's worktrees were not touched. The rule is never `git stash`, anywhere.",
+   "cost": "none",
+   "cause": "habit",
+   "workaround": "dropped it",
+   "fix": "none needed beyond the rule",
+   "state": "accepted"
+  },
+  {
+   "id": "disk2-8",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+   "where": "crates/blaze-cargo/src/serve/settle.rs, `Store::end_period`",
+   "what": "A period's end walks every row of the store on the daemon's loop: 5 ms at the median and 16.5 ms at most for hello-world's 30,000 records (`store period ends`). It grows with the rows: a store of millions would hold the loop for a second at each build's end.",
+   "cost": "not paid yet: only measured small",
+   "cause": "the plan of a period is one walk, where its moves are steps",
+   "workaround": "none",
+   "fix": "plan in steps too (scan a bounded number of rows a turn, rotate the flags when the scan ends), or on a worker through a `Reader`",
+   "state": "open"
+  },
+  {
+   "id": "disk2-9",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+   "where": "a home's store copied into another home",
+   "what": "A first run in an empty home with another home's whole store copied in, same binary, took as long as with none (13.0 s against 13.1 s on main, ix arm64): no record was reused, because unit keys hold the machine directory, the launcher's path and the terminal's width (docs/remote-cache.md, Packs, lists each).",
+   "cost": "the pack work stops here until the keys are fixed",
+   "cause": "keys that carry paths",
+   "workaround": "none",
+   "fix": "the rows of that table",
    "state": "open"
   }
  ]
