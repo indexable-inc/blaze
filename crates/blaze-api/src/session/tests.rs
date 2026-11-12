@@ -1525,7 +1525,9 @@ fn a_save_of_the_same_root_takes_it_over_and_one_of_another_cancels_it() {
     assert_eq!(world.builder.promoted, [first], "nothing on another head");
 
     let now = world.vfs.head("main").unwrap();
-    world.call(|session, cx, _| session.head_moved(cx, "elsewhere", now));
+    world.call(|session, cx, _| {
+        session.head_moved(cx, "elsewhere", now);
+    });
     assert_eq!(world.builder.cancelled, [second, elsewhere], "the watcher's move of a head");
 
     if let Request::WillSave { ops, .. } = &mut check {
@@ -1707,4 +1709,101 @@ fn random_intents_are_taken_over_or_cancelled_once_and_free_their_views() {
         assert_eq!(world.session.views(), 0, "seed {seed}");
         assert_eq!(world.session.deadline(), None, "seed {seed}");
     }
+}
+
+/// What the session did with a move of `main` to `root` by the daemon's watcher.
+fn saved(world: &mut World, root: ContentId) -> super::SaveAhead {
+    let mut did = None;
+    world.call(|session, cx, _| did = Some(session.head_moved(cx, "main", root)));
+    did.expect("the call ran")
+}
+
+/// `main`'s tree with `src/lib.rs` holding function `n`: a root of its own, no head moved.
+fn root_with(world: &mut World, base: ContentId, n: u32) -> ContentId {
+    world.vfs.apply(base, &[write("src/lib.rs", &format!("fn f{n}() {{}}"))]).unwrap()
+}
+
+/// A save the daemon's watcher commits is built ahead: once a request has built the head,
+/// a move of the head starts that request's check on the new root as an intent's job, so
+/// the edit is pushed through the front end at the save, and the next request on the root
+/// takes the job over. It links and runs nothing (a run is checked ahead), never starts
+/// beside a request's job, and a second save cancels the first's and starts its own.
+#[test]
+fn a_save_of_a_head_a_request_built_is_checked_ahead_and_taken_over() {
+    use super::SaveAhead;
+    let mut world = World::new();
+    let base = world.commit(&[("src/lib.rs", "")]);
+    let first = root_with(&mut world, base, 1);
+    assert_eq!(saved(&mut world, first), SaveAhead::NothingBuilt, "no request built the head");
+    assert!(world.builder.speculated.is_empty());
+
+    let run = Request::Run { view: head("main"), targets: targets(), bin: None, args: Vec::new() };
+    assert_eq!(world.request(1, 1, run), []);
+    let running = world.last_job();
+    assert_eq!(saved(&mut world, first), SaveAhead::Busy, "a request's job is under way");
+    world.report(running, worked());
+    world.finish(running, true, None);
+
+    // The root is made again just before it is opened: equal content, the same root.
+    assert_eq!(root_with(&mut world, base, 1), first);
+    assert_eq!(saved(&mut world, first), SaveAhead::Started);
+    let (ahead, opened, work) = world.builder.speculated[0].clone();
+    assert_eq!(opened.view, View { root: first });
+    assert_eq!(work, Work::Check(targets()), "a run is checked ahead: nothing is linked or run");
+
+    // A second save, of another root: the first's job is cancelled and the second's starts.
+    let second = root_with(&mut world, base, 2);
+    assert_eq!(saved(&mut world, second), SaveAhead::Started);
+    assert_eq!(world.builder.cancelled, [ahead]);
+    let later = world.last_speculated();
+    assert_eq!(world.builder.speculated[1].1.view, View { root: second });
+
+    // The request that builds the saved root takes the job over.
+    let check = Request::Check { view: root_of(second), targets: targets() };
+    assert_eq!(world.request(1, 2, check), []);
+    assert_eq!(world.builder.promoted, [later]);
+    let asked = world.last_job();
+    for job in [ahead, later] {
+        assert_eq!(world.finish(job, false, None), []);
+    }
+    world.finish(asked, true, None);
+    assert_eq!(world.session.views(), 0, "every view a build ahead opened is closed");
+}
+
+/// The invariant: the builds ahead of saves between two requests that build a head are at
+/// most [`super::SAVES_AHEAD`], so a build whose own writes move its head cannot start
+/// builds without end; a request that builds the head gives the saves after it theirs again.
+#[test]
+fn saves_with_no_request_between_start_a_bounded_number_of_builds_ahead() {
+    use super::{SAVES_AHEAD, SaveAhead};
+    let mut world = World::new();
+    let base = world.commit(&[("src/lib.rs", "")]);
+    let check = || Request::Check { view: head("main"), targets: targets() };
+    assert_eq!(world.request(1, 1, check()), []);
+    let asked = world.last_job();
+    world.finish(asked, true, None);
+
+    let mut outcomes = Vec::new();
+    for n in 0..3 * SAVES_AHEAD {
+        let root = root_with(&mut world, base, n);
+        outcomes.push(saved(&mut world, root));
+    }
+    let started = outcomes.iter().filter(|it| **it == SaveAhead::Started).count();
+    assert_eq!(started, SAVES_AHEAD as usize, "{outcomes:?}");
+    assert!(outcomes[SAVES_AHEAD as usize..].iter().all(|it| *it == SaveAhead::Spent), "{outcomes:?}");
+    assert_eq!(world.builder.speculated.len(), SAVES_AHEAD as usize);
+    let jobs: Vec<JobId> = world.builder.speculated.iter().map(|it| it.0).collect();
+    for job in jobs {
+        assert_eq!(world.finish(job, false, None), []);
+    }
+
+    // A request that builds the head: the next save is built ahead again.
+    assert_eq!(world.request(1, 2, check()), []);
+    let asked = world.last_job();
+    world.finish(asked, true, None);
+    let root = root_with(&mut world, base, 99);
+    assert_eq!(saved(&mut world, root), SaveAhead::Started);
+    let last = world.last_speculated();
+    assert_eq!(world.finish(last, false, None), []);
+    assert_eq!(world.session.views(), 0);
 }
