@@ -205,13 +205,26 @@ struct Library {
     /// seen since it loaded ([`Evaluated::same_from_either_state`]): another first call that
     /// leaves another state shows the state depends on which call ran first.
     settled: Lock<Option<Settled>>,
+    /// How many runs that moved state on were said since it loaded ([`MOVED_SAID`] at most).
+    moved_said: std::sync::atomic::AtomicU32,
 }
+
+/// The most runs that moved state on a library says by name since it loaded.
+const MOVED_SAID: u32 = 8;
 
 thread_local! {
     /// A planted bug, for a test's control: an output that is kept by no store is never shown
     /// to be the same from either state, as until 2026-11-12. Never set outside a test.
     #[doc(hidden)]
     pub static UNWRITABLE_IS_UNSHOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// A planted bug, for a test's control: a call of a session that moved on, or of a crate
+    /// whose state is not known, is never run again from the fresh state, so its reads stay
+    /// unknown, as until 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static FRESH_IS_NOT_TRIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn planted_unwritable_is_unshown() -> bool {
@@ -760,6 +773,7 @@ fn load_on(
         turns: Turns::default(),
         kept_roots: SharedMap::default(),
         settled: Lock::new("macro.library.settled", None),
+        moved_said: std::sync::atomic::AtomicU32::new(0),
     });
     // Said once a load: what the crate's macros run and what the store says of their state,
     // so two loads of one crate that give other expanders say what moved between them.
@@ -962,11 +976,45 @@ impl Evaluated {
             self.run_on(db, calling, call, &preset, replayed, &this)?
         };
         let left_holding = ran.statics.iter().any(|it| it.2);
-        library.saw(match () {
+        let left = match () {
             () if ran.statics.is_empty() && !from.replayed => Left::Nothing,
             () if stateless && !left_holding => Left::First,
             () => Left::Moved,
-        })?;
+        };
+        // A run that moved state on is why its crate is stateful, and every unit that calls
+        // a stateful crate's macros is kept by no record: said, the first few times a load,
+        // with the statics it changed by name (rule 19). reth's `jsonrpsee_proc_macros` was
+        // stateful with nothing saying which static moved (2026-11-12).
+        if left == Left::Moved
+            && library.moved_said.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MOVED_SAID
+        {
+            // alloc: a few times a load of a stateful crate, the names of what it changed
+            let statics: Vec<String> = ran
+                .statics
+                .iter()
+                .map(|(id, bytes, holds)| {
+                    use hir_def::HasModule as _;
+                    format!(
+                        "{}::{} ({} bytes{})",
+                        id.module(db).krate(db).named(db),
+                        hir_def::signatures::StaticSignature::of(db, *id).name.as_str(),
+                        bytes.len(),
+                        if *holds { ", holds an address" } else { "" },
+                    )
+                })
+                .collect();
+            tracing::info!(
+                target: "blaze",
+                krate = %library.name,
+                r#macro = %self.name,
+                calling = %calling.named(db),
+                replayed = from.replayed,
+                from_fresh = stateless,
+                statics = %statics.join(", "),
+                "a proc macro's run moved its session's state on"
+            );
+        }
+        library.saw(left)?;
         let Some(mut session) = turn.update() else { return Ok((ran, from)) };
         if !ran.statics.is_empty() {
             session.holds |= left_holding;
@@ -1308,6 +1356,36 @@ impl Evaluated {
         }
     }
 
+    /// Whether `call`, which gave `output` in its session, gives the same run once more from
+    /// the fresh state, outside the session: then `output` is what the call's own inputs
+    /// give. Not shown when the run asks what no key covers or reads what can't be keyed.
+    fn same_from_fresh(
+        &self,
+        db: &Db,
+        calling: Crate,
+        call: &ProcMacroCall<'_>,
+        output: &tt::TopSubtree,
+    ) -> Result<bool, ProcMacroExpansionError> {
+        if FRESH_IS_NOT_TRIED.get() {
+            return Ok(false);
+        }
+        let this = self.kept(db, calling, call);
+        let again = {
+            // Its own span, beside the run's `macro expand`: the extra run this check costs.
+            let _span = tracing::info_span!(
+                target: "blaze",
+                "proc macro expansion again from the fresh state",
+                r#macro = %MacroPath(self),
+            )
+            .entered();
+            self.run_on(db, calling, call, &[], &[], &this)?
+        };
+        if again.asked.is_some_and(|it| !it.by_position()) || again.unkeyable.is_some() {
+            return Ok(false);
+        }
+        Ok(self.output(&again, call.call_site).ok().as_ref() == Some(output))
+    }
+
     /// Expands `call` from `calling`'s session, found or run, and states what it read and
     /// whether its session's state took part ([`Expanded`]) on every way out.
     fn expand_keyed(
@@ -1410,8 +1488,16 @@ impl Evaluated {
                     };
                     // A crate whose session's state is not known not to matter: what a call read
                     // does not fix what it gives (what calls ran before it does too).
+                    // Unless the value found is of the fresh state (its key says no start
+                    // state): then it is what a run from the fresh state gave, which is what
+                    // the call's own inputs give ([`Self::same_from_fresh`]); or, for an
+                    // unseen crate, of a state a first call left and shown to be the same
+                    // from either (`shown`: its key says so).
+                    let of_fresh = matches!(start, Some(None));
                     let reads = match verdict {
                         Verdict::Stateless | Verdict::Settles => reads,
+                        Verdict::Unseen | Verdict::Stateful if of_fresh => reads,
+                        Verdict::Unseen if shown => reads,
                         Verdict::Unseen | Verdict::Stateful => ExpansionReads::Unknown(UNSETTLED),
                     };
                     match keeping.mode {
@@ -1522,10 +1608,23 @@ impl Evaluated {
             changed: !ran.statics.is_empty(),
             left_address: ran.statics.iter().any(|it| it.2),
         };
-        if session && !session_reads_known(verdict, left) {
+        // Unless it is shown to give what a run from the fresh state gives: then what it gave
+        // is what its own inputs give, whatever ran before it (a cache of what a macro
+        // looked up, as `proc_macro_crate::CACHE`, moves on and changes no output; a counter
+        // does, and is not shown). A call that started from the fresh state is that run; any
+        // other is run once more, from the fresh state, outside its session. So a unit whose
+        // macros keep such state, or whose macro crate the store has not seen yet (every
+        // crate, in the first build that runs it), has a record: until 2026-11-12 neither
+        // had, and 7 units of reth (jsonrpsee's `#[rpc]`) were made again in every build and
+        // 217 in the first build after a cold one.
+        let unsettled = matches!(verdict, Verdict::Unseen | Verdict::Stateful);
+        let moved = session && !session_reads_known(verdict, left);
+        let fresh_shown = (moved || unsettled)
+            && (left.fresh || self.same_from_fresh(db, calling, &call, &output)?);
+        if moved && !fresh_shown {
             return unknown(
                 output,
-                "its macro keeps a session that does not settle, or it moved its session's state on: its output depends on the calls before it, which ran in no order a key fixes",
+                "its macro keeps a session that does not settle, or it moved its session's state on, and it gives otherwise from the fresh state: its output depends on the calls before it, which ran in no order a key fixes",
             );
         }
         if !ran.emitted.is_empty() {
@@ -1601,6 +1700,12 @@ impl Evaluated {
                 (same.is_ok(), Some(UNSETTLED), false)
             }
             Verdict::Unseen | Verdict::Stateful => (true, Some(UNSETTLED), false),
+        };
+        // A call of a crate whose state is not known to settle, shown to give what the fresh
+        // state gives: its reads are what it read.
+        let unknown_why = match unsettled && fresh_shown {
+            true => None,
+            false => unknown_why,
         };
         let state = state_use(verdict, proven);
         if let Some(why) = unknown_why.filter(|_| !keep || session) {
