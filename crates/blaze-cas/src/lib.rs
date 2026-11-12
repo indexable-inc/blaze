@@ -2145,6 +2145,28 @@ impl Store {
         self.hot.evict(bytes).map_or(0, |swept| swept.freed)
     }
 
+    /// Its pool's pages that nothing read again since the sweep last came by, given back to
+    /// the kernel: one lap, so what the last builds read more than once stays for the next
+    /// edit and a pool nothing reads is gone after two. What an idle daemon asks, once a
+    /// stretch of idleness, where [`Store::evict_pool`] is what a daemon short of memory asks.
+    /// The bytes given back. The pins of tasks that have ended are let go first.
+    ///
+    /// On a store whose misses are pumped nothing loads a page again but its opening, so it
+    /// gives none back: 0.
+    pub fn trim_pool(&mut self) -> u64 {
+        self.tidy();
+        if self.hot.pumped() {
+            return 0;
+        }
+        // As `evict_pool` does: the pins of every task that has ended go back as its grace
+        // passes, and those of running tasks stay.
+        let old = self.shared.fresh_owned();
+        self.limbo.retire(old);
+        self.limbo.collect();
+        self.shared.pins_let_go();
+        self.hot.trim().map_or(0, |swept| swept.freed)
+    }
+
     /// Its pool's pages now, from one walk of their state words: bytes loaded, bytes of them
     /// pinned, and bytes a sweep could give back. `None` when it has no pool.
     pub fn pool_census(&self) -> Option<PoolCensus> {
