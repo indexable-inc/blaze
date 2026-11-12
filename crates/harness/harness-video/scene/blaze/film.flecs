@@ -1,67 +1,57 @@
 // blaze, the trailer: exactly 60 seconds at 60 fps for X, landscape and upright from one scene. One flight: the
-// camera never stops moving through a dark sea of points, and each idea is a landmark of light it nears, holds on and
-// flies through (harness-video's src/backdrop.rs), with two to five words popping in and out under it. Three times
-// the palette turns over (a field of the accent, dark type): the interrupts. Ideas, not metrics: what blaze is, then
-// what it will be; speed is two beats. Every number is a row of data.json beside this file.
+// camera moves through a dark sea of points, and each idea is a landmark of light it nears, holds on and flies through
+// (harness-video's src/backdrop.rs), with one caption at a time under it, each still for at least a second and a half.
+// Eleven shots, cut to a score in A minor at 88 (src/music.rs: one motif, introduced, built, dropped and answered);
+// every cut is on a bar line. Every number is a row of data.json beside this file.
 //
 //   cd crates/harness
+//   harness-video score DIR                                                                # the score, stems, page, pictures
+//   cp DIR/music-temp-score.wav harness-video/scene/blaze/music.wav                        # (or the owner's track)
+//   harness-video analyse harness-video/scene/blaze/music.wav harness-video/scene/blaze/beats.json
 //   harness-video harness-video/scene/blaze/film.flecs film.mp4 x-landscape-1080p60        # the film, read back
 //   harness-video harness-video/scene/blaze/film.flecs film-tall.mp4 x-portrait-1080x1920  # the same, upright
+//   harness-video harness-video/scene/blaze/film.flecs cuts                                # every cut, on the grid
 //   harness-video harness-video/scene/blaze/film.flecs sheet.png contact 0.5               # a frame each half second
-//   harness-video harness-video/scene/blaze/film.flecs burst.png burst 0.7                 # ten frames in a row
-//   harness-video harness-video/scene/blaze/film.flecs mix.wav                             # the mix alone
-//   harness-video harness-video/scene/blaze/film.flecs sound.png sound                     # its waveform and spectrogram
-//   harness-video harness-video/scene/blaze/film.flecs sounds                              # every sound event
 //
-// Cut to music: cuts.flecs places every beat on the track's grid (bar and beat), three acts: a cold open of hard
-// cuts on single hits, a build whose cut rate doubles, the galaxy on the drop's downbeat, a montage, a break, the mark
-// on the final downbeat and a button a bar later. The times below are with the temp score (104 beats a minute).
+// Storyboard (cuts.flecs has the positions; times are with our score). Each shot: bars, its landmark, its caption,
+// what in the tree backs it, and the sentence a first-time viewer should be able to say back.
 //
-// Storyboard (cuts.flecs has the positions). Each beat: its landmark, its words, and what in the tree backs the claim.
+//   bars   at     shot      landmark                    caption                           backed by / says back
+//   1-2    0.00   cage      a hexagon nothing leaves    "build.rs: no network"            AGENTS.md rule 9; the sandbox refuses a script's
+//                                                                                         network / "build scripts are locked in"
+//   3      5.45   unclosed  INTERRUPT (accent field)    "unclosed file: compile error"    crates/blaze-std/src/fs.rs:1287 (linear File);
+//                                                                                         hir-ty-linear / "forgetting to close is an error"
+//   4      8.18   name      the sea; the galaxy, far    "blaze", "a compiler for agents"  AGENTS.md / "it is called blaze, for agents"
+//   5-6    10.91  rings     arcs that only narrow       "nothing ambient", then           crates/blaze-std/src/lib.rs:10-12 / "you get
+//                                                       "capabilities only narrow"        handed access, and it only shrinks"
+//   7-8    16.36  disk      a disk tears, time runs     "same code, fake disk", then      crates/blaze-core/src/sim.rs / "it runs on a
+//                           back, it tears again        "the bug replays"                 simulated disk and the failure repeats exactly"
+//   9-10   21.82  tree      a proof tree closing        "90 theorems, in Lean"            lean/theorems.json / "parts are proved"
+//   11-12  27.27  ripples   three rings to one shore    "no-op run", three names, times   data.json rows.noop / "blaze's run is fastest
+//                                                                                         of the three, 11.9 ms"
+//   13-14  32.73  near      the galaxy nears, is still  (none)                            / "something big is coming"
+//   15-18  38.18  galaxy    THE PEAK, on the drop:      "one edit", then                  docs/v2/plan/design/code-identity.md; rule 52 /
+//                           dive, edit, four readers    "nothing compiled twice"          "one change touches one function"
+//   19-20  49.09  hub       a comb lit from the middle  "soon", "a hub, no checkout"      SOON: branch hub-1111 / "a hub is coming"
+//   21-22  54.55  end       the sea streams in          the mark, the repository          / "blaze, on GitHub"
 //
-//   at     beat      landmark (shot)             words                              backed by
-//   0.00   cage      a hexagon nothing leaves    "build.rs: no network"             AGENTS.md rule 9 sandbox-everything; the sandbox
-//                                                                                   refuses a script's network and stray writes
-//   0.58   unclosed  INTERRUPT (accent field)    "unclosed file: compile error"     crates/hir-ty-linear/src/drops.rs:334 (CONSUME);
-//                                                                                   blaze-std's File is `#[blaze::linear]`
-//   1.15   check     a check mark, drawn         "90 theorems, in Lean"             lean/theorems.json (90 entries on main)
-//   1.73   name      the sea; the galaxy, far    "blaze", "a compiler for agents"   AGENTS.md's first lines
-//   4.62   agents    streams into a warm core    "agents, not keyboards"            the resident daemon and its API
-//   6.92   rings     arcs that only narrow       "nothing ambient",                 crates/blaze-std/src/lib.rs:10-12 (capabilities
-//                                                "capabilities only narrow"         made from an Io or by narrowing, never widened)
-//   9.23   linear    INTERRUPT                   the compiler's error, verbatim     crates/hir-ty-linear/src/drops.rs:334
-//   11.54  disk      a disk tears, time runs     "same code", "fake disk",          crates/blaze-core/src/sim.rs (blaze_core::sim::Sim;
-//                    back, it tears again        "replays"                          the `testing` skill: seeded, replayable)
-//   16.15  tree      a proof tree closing        "proved"                           lean/ (BlazeMir, BlazeValidated), theorems.json
-//   18.47  prism     one beam, split             "pure", "nopanic", "noalloc"       104, 141 and 146 uses of the attributes in crates/
-//   20.77  nopanic   INTERRUPT                   "#[blaze::nopanic]  v[i]",         the nopanic check's refusal ("a nopanic function and
-//                                                "refused"                          everything it calls cannot panic or abort")
-//   21.92  mirror    two builds read as one      "same bytes"                       AGENTS.md rule 25 deterministic-output
-//   23.08  ripples   three rings to one shore    "no-op run", three names, times    data.json rows.noop (conditions on screen)
-//   25.38  warp      the sea at speed            953.0 falling to 143.5, "body edit" data.json day.body
-//   27.69  near      the galaxy, nearing         (no words)                         (the approach; the last beat before the drop is bare)
-//   32.31  galaxy    THE PEAK, on the drop: dive  "one edit",                              docs/v2/plan/design/code-identity.md; rule 52
-//                    it flares, four readers     "nothing compiled twice",          cache-by-code-id; the linker and live runtime
-//                    light, nothing else stirs   "patched live"                     (docs/v2/plan/design/patch-in-place.md)
-//   43.85  soon      comb, stair, store, cores   "soon": "the hub", "first-call     SOON: branches hub-1111, launcher-1111; the shared
-//                                                compile", "shared store",          store and the scheduler for hundreds of cores are
-//                                                "hundreds of cores"                designs (docs/v2/plan/design/scheduler.md)
-//   53.08  quiet     the sea alone; silence      "blaze builds blaze"               AGENTS.md rule 2 (blaze builds blaze as the proof)
-//   55.38  end       the sea streams in          the mark, the repository
-//
-// The open loop: the galaxy is in the sky behind the name at 2.25 s, small; the film arrives in it on the drop.
+// The open loop: the galaxy is in the sky behind the name; the film arrives in it on the drop.
 // Honesty: a claim on screen is something the tree has, or is under the "soon" tag. The one comparison is a measured
 // row, drawn to scale (each ring's time to the shore is its share of the slowest's), its conditions passing once.
-// Sound: the track, with the beats' own synthesised events under it (`harness-video ... sounds` lists them): a hit on
-// each opening cut, a rise into the edit's one big hit, and the track's one silence before the last line.
+// Sound: the score, with a few of the shots' own sounds under it (`harness-video ... sounds` lists them).
 include cuts
 include tokens
 include parts
-include open
-include today
-include speed
+include cage
+include unclosed
+include name
+include rings
+include disk
+include tree
+include ripples
+include near
 include galaxy
-include soon
+include hub
 include end
 
 @tree ChildOf
@@ -75,5 +65,5 @@ film : ui.ZStack {
   Size: {w: {kind: Fixed, value: 960, min: 0, max: 0}, h: {kind: Fixed, value: 540, min: 0, max: 0}}
   // The film is cut to a track: music.wav beside this file (not in the tree: the owner's file, or the temp score
   // `harness-video score` writes), its grid in beats.json. The beats' own sounds sit under it.
-  Music: {gain: 1.0, under: 0.55}
+  Music: {gain: 1.0, under: 0.4}
 }

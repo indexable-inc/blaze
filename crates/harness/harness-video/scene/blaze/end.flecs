@@ -1,46 +1,26 @@
-// The end: a breath (the one silence in the film: the track breaks, the sea alone, then one line on its one hit),
-// then on the last downbeat the sea streams in and the mark forms and catches fire; a bar later, the button: the
-// repository, on one more hit. Under three seconds.
+// Shot 11 (bars 21-22), the end card, held over five seconds: on the final statement's downbeat the sea streams in
+// and the mark forms and catches fire; the repository comes on the third beat and stays.
 
 @tree ChildOf
 film {
-  quiet_shot { Cue: {member: "Backdrop.shot", from: 0, to: 0, at: $t_quiet, dur: 0, ease: Linear} }
-  quiet_at { Cue: {member: "Backdrop.at", from: $t_quiet, to: $t_quiet, at: $t_quiet, dur: 0, ease: Linear} }
-  quiet_len { Cue: {member: "Backdrop.f", from: $t_end - $t_quiet, to: $t_end - $t_quiet, at: $t_quiet, dur: 0, ease: Linear} }
-  quiet_caps : film_part.Layer {
-    slot : film_part.Slot {
-      says : film_part.Caption {
-        Text: {s: "blaze builds blaze"}
-        cue.Arrive show(at: $m_b24_3, dur: 0.08)
-        cue.Pop pop(at: $m_b24_3)
-        cue.Leave hide(at: $t_end - 0.15)
-      }
-    }
-  }
-  quiet_hit : voice.Thud { Onset: {at: $m_b24_3}; Gain: {amp: 0.45} }
-  quiet_tone : voice.Mallet { Onset: {at: $m_b24_3}; Lasts: {dur: 2.0}; Pitch: {hz: 220}; Gain: {amp: 0.16} }
   end_shot { Cue: {member: "Backdrop.shot", from: 16, to: 16, at: $t_end, dur: 0, ease: Linear} }
   end_at { Cue: {member: "Backdrop.at", from: $t_end, to: $t_end, at: $t_end, dur: 0, ease: Linear} }
   end_len { Cue: {member: "Backdrop.f", from: $t_out - $t_end, to: $t_out - $t_end, at: $t_end, dur: 0, ease: Linear} }
   end_gather { Cue: {member: "Backdrop.a", from: 0, to: 1, at: $t_end, dur: 3 * $beat, ease: InOut} }
-  end_hit : voice.Thud { Onset: {at: $t_end}; Gain: {amp: 0.5} }
-  button : voice.Thud { Onset: {at: $m_b26_1}; Gain: {amp: 0.5} }
-  button_tone : voice.Mallet { Onset: {at: $m_b26_1}; Lasts: {dur: 1.6}; Pitch: {hz: 440}; Gain: {amp: 0.16} }
-
   end_card : film_part.Layer {
     Flex: {axis: Column, gap: 14, align: Center, justify: Center, wrap: false}
     cue.CutIn enter(at: $t_end)
-    cue.FadeOut leave(at: $t_out - 0.35, dur: 0.3)
+    cue.FadeOut leave(at: $t_out - 0.4, dur: 0.35)
     mark : ui.Node {
       // `glow` 1: an SDR export has no room over white. `exit` 0: it never burns away.
-      BlazeMark: {start: $t_end + 0.05, exit: 0, glow: 1}
+      BlazeMark: {start: $t_end, exit: 0, glow: 1}
       Size: {w: {kind: Fixed, value: 43 * 8, min: 0, max: 0}, h: {kind: Fixed, value: 23 * 8, min: 0, max: 0}}
     }
     url : film_part.Code {
       Text: {s: "github.com/indexable-inc/blaze"}
       Fill: $tone_ink_strong
-      cue.Arrive show(at: $m_b26_1, dur: 0.05)
-      cue.Pop pop(at: $m_b26_1, by: 0.3)
+      cue.Arrive show(at: $m_b21_3, dur: 0.1)
+      cue.Pop pop(at: $m_b21_3, by: 0.2)
     }
   }
 }

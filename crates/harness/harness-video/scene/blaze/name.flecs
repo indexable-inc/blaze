@@ -1,0 +1,30 @@
+// Shot 3 (bar 4): the name, over the sea, the galaxy small in the sky behind it (the film arrives there on the drop).
+
+@tree ChildOf
+film {
+  name_shot { Cue: {member: "Backdrop.shot", from: 0, to: 0, at: $t_name, dur: 0, ease: Linear} }
+  name_at { Cue: {member: "Backdrop.at", from: $t_name, to: $t_name, at: $t_name, dur: 0, ease: Linear} }
+  name_len { Cue: {member: "Backdrop.f", from: $t_rings - $t_name, to: $t_rings - $t_name, at: $t_name, dur: 0, ease: Linear} }
+  name_far { Cue: {member: "Backdrop.a", from: 1, to: 1, at: $t_name, dur: 0, ease: Linear} }
+  name_card : film_part.Layer {
+    cue.CutIn enter(at: $t_name)
+    cue.CutOut leave(at: $t_rings)
+    word : film_part.Name {
+      Text: {s: "blaze"}
+      cue.Pop pop(at: $t_name, dur: 0.3, by: 0.4)
+      cue.PushIn push(at: $t_name + 0.3, dur: 2.2, by: 0.05)
+    }
+    lift : film_part.Raise {}
+  }
+  name_caps : film_part.Under {
+    slot : film_part.Slot {
+      says : film_part.Caption {
+        Text: {s: "a compiler for agents"}
+        cue.Arrive show(at: $m_b4_2, dur: 0.08)
+        cue.Pop pop(at: $m_b4_2)
+        cue.Leave hide(at: $t_rings - 0.1)
+      }
+    }
+    low : film_part.Low {}
+  }
+}

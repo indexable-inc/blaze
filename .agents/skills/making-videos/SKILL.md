@@ -47,7 +47,7 @@ From `crates/harness` (build: see Traps), with `F=harness-video/scene/<film>/fil
 | Check a finished file against a preset | `harness-video check out.mp4 $F PRESET` |
 | A track's beat grid, and its picture | `harness-video analyse music.wav beats.json` |
 | Every hard cut, held to the grid | `harness-video $F cuts` |
-| The temp score | `harness-video score OUT.wav BPM BARS DROP_BAR DROP_BARS` |
+| Our own score: mix, stems, page, piano roll, loudness curve | `harness-video score DIR` |
 
 - **Presets** are data: `harness-video/presets.json`, one home for codec, profile, pixel format, bitrate, key frames,
   colour, audio and container. Add a platform by adding a preset there, never a flag.
@@ -65,14 +65,50 @@ From `crates/harness` (build: see Traps), with `F=harness-video/scene/<film>/fil
 - **Sound** is `voice.*` events in the beat's file (`Onset`, `Lasts`, `Pitch`, `Gain`, `Pan`), synthesised
   deterministically by `harness-native-blaze`'s `sound`, mastered to the root's `Mix: {lufs, peak}` (`src/loud.rs`).
 
+## Pace: hold, one caption, the reading test
+
+The third cut had 22 cuts in a minute and was rejected: "goes through things way too fast". An idea the viewer cannot
+say back was not shown.
+
+- **Nine to eleven shots a minute**, 7 or 8 ideas. An idea gets 5 to 8 s (two bars at 88): an entrance of about a
+  second, a HOLD where the image is readable and the caption sits still, the image doing its one thing, and an exit
+  that hands motion to the next shot. Fast cutting only for a bar or two before a drop. One near-still moment before
+  the peak. The end card holds 4 s.
+- **One caption at a time, still for at least 1.5 s**; none on screen under 1.2 s. A viewer must be able to read it
+  twice. A caption arrives on a beat, a beat or two after its image, and leaves a tenth of a second before the cut.
+- **The reading test**: for each shot write, in the storyboard, the sentence a first-time viewer would say back
+  ("build scripts are locked in"). If you cannot write it, or two shots have the same one, cut or lengthen.
+
+## The score: one motif
+
+If the film has no licensed track, the score is composed, not assembled from effects (`src/music.rs` `compose`; the
+fourth cut's is the worked example). The owner's words: it "builds up to something, has a motif, and the final thing
+is slightly different".
+
+1. **One motif**: 3 to 5 notes, singable, a clear rhythm and contour, stated in note names (E4 A4 G4 E4: up a fourth,
+   a step back, home: a question).
+2. **Form**: introduce it bare and quiet; restate it over a progression that wants to resolve (i VI III VII), adding a
+   layer at a time (pad, bass, pulse, a counter-line that answers); build (rhythm thickens, register rises, a riser);
+   a bar of near-silence; the drop (the motif in octaves, everything); a final statement that is the motif CHANGED
+   (E4 A4 B4 C#5: it rises to the major third instead of falling back, twice as slow, over the major chord).
+3. **Palette, small**: a plucked or bell lead, a soft pad, a warm bass, kick and hat, one riser, one low hit, a
+   Schroeder reverb, an echo on the lead. Voice-lead the chords. Sound effects few and under the music.
+4. **Check it on paper, since you cannot hear it** (`harness-video score DIR` writes all of these): the page (key,
+   tempo, the motif, each bar's chord and voices), the piano roll against the bar lines, the loudness curve (it must
+   climb, dip before the drop, and stand tallest on it), the spectrogram, the stems (lead, harmony, bass, drums,
+   effects) for someone who can hear, and the test that the pitches heard in the lead stem are the written notes and
+   that the final statement differs from the first exactly as designed.
+5. **Say what it is**: a score synthesised by an agent that cannot hear is the weakest part of a film. A licensed track
+   or a composer does better; the pipeline re-cuts to any WAV.
+
 ## Cut to music, in musical time
 
 A trailer is edited to a track, frame in, frame out. Author cuts as bar and beat, never as seconds.
 
 1. **The track** is a file the owner supplies with the rights to use it, as `music.wav` beside the scene (WAV: 16, 24
    or 32-bit PCM or float, any rate; it is not committed). **Never download or rip a recording**, and never imitate a
-   recognisable part of one. Until a track is supplied, `harness-video score music-temp.wav 104 26 15 5` writes a temp
-   score (a pulse, a build, a drop) to cut against; a render made with it says TEMP MUSIC and is named so.
+   recognisable part of one. Until a track is supplied, `harness-video score DIR` writes our own score (above) to cut
+   against; a render made with it says TEMP MUSIC and is named so. With a slow pace prefer a track with a clear build.
 2. **The grid**: `harness-video analyse music.wav beats.json` (`src/music.rs`: spectral-flux onsets, tempo by
    autocorrelation, a dynamic-programming beat tracker fitted to one even tempo, downbeats from the low band, sections
    from each bar's energy, the strongest impacts). It also writes `beats.png`: the track with faint lines on beats,
@@ -116,8 +152,8 @@ is: change the file, render, and the film shows the new number. Each row carries
    a curve and nothing else: never multiply it by a `step` at a track's start, a shape's box or a quad's edge, or its
    light ends on a straight line (the second film's beam did, at its left end). `no_light_ends_at_a_line` draws
    every shot and fails on a long straight run of sharp change; add a shot and it is checked.
-5. **A hook in the first 2 s** (above), no title card. **Beats of 1.5 to 3.5 s, each a different image and a different
-   idea: no image twice.** A pattern interrupt every 5 to 8 s (the palette turned over, a hard cut to one line of
+5. **A hook in the first 2 s** (one striking image and one claim, not a barrage), no title card. **Each shot a
+   different image and a different idea, held (see Pace): no image twice.** A pattern interrupt every 5 to 8 s (the palette turned over, a hard cut to one line of
    code or an error, a freeze, a fly-through). One sustained peak around two thirds through (the rise in the sound
    lands on it). What is coming as a fast montage. An end card (mark, name, repository) under 3 s. A minute is 60.0 s.
 6. **Sound off first.** Platforms autoplay muted: the picture must carry everything. Sound follows the picture (a

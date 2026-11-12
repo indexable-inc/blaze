@@ -1,0 +1,30 @@
+// Shot 5 (bars 7-8): the simulation: a disk under the same code tears on the third beat; time runs back; it tears
+// again, exactly, in the second bar.
+
+@tree ChildOf
+film {
+  disk_shot { Cue: {member: "Backdrop.shot", from: 5, to: 5, at: $t_disk, dur: 0, ease: Linear} }
+  disk_at { Cue: {member: "Backdrop.at", from: $t_disk, to: $t_disk, at: $t_disk, dur: 0, ease: Linear} }
+  disk_len { Cue: {member: "Backdrop.f", from: $t_tree - $t_disk, to: $t_tree - $t_disk, at: $t_disk, dur: 0, ease: Linear} }
+  disk_a { Cue: {member: "Backdrop.a", from: 2 * $beat, to: 2 * $beat, at: $t_disk, dur: 0, ease: Linear} }
+  disk_caps : film_part.Under {
+    slot : film_part.Slot {
+      same : film_part.Caption {
+        Text: {s: "same code, fake disk"}
+        cue.Arrive show(at: $m_b7_1, dur: 0.08)
+        cue.Pop pop(at: $m_b7_1)
+        cue.Leave hide(at: $m_b8_1 - 0.1)
+      }
+      again : film_part.Caption {
+        Text: {s: "the bug replays"}
+        Fill: $tone_film_accent
+        cue.Arrive show(at: $m_b8_1, dur: 0.08)
+        cue.Pop pop(at: $m_b8_1)
+        cue.Leave hide(at: $t_tree - 0.1)
+      }
+    }
+    low : film_part.Low {}
+  }
+  disk_tear : voice.Whoosh { Onset: {at: $t_disk + 2 * $beat - 0.15}; Lasts: {dur: 0.5}; Pitch: {hz: 3000}; Gain: {amp: 0.05}; Pan: {pos: 0.4, sweep: -0.8} }
+  disk_again : voice.Whoosh { Onset: {at: $t_disk + 4 * $beat + 1.15}; Lasts: {dur: 0.5}; Pitch: {hz: 3000}; Gain: {amp: 0.05}; Pan: {pos: 0.4, sweep: -0.8} }
+}

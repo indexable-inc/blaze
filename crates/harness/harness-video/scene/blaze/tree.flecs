@@ -1,0 +1,19 @@
+// Shot 6 (bars 9-10): the proofs: a tree that closes level by level, a level a half bar. The count is data.json's.
+
+@tree ChildOf
+film {
+  tree_shot { Cue: {member: "Backdrop.shot", from: 6, to: 6, at: $t_tree, dur: 0, ease: Linear} }
+  tree_at { Cue: {member: "Backdrop.at", from: $t_tree, to: $t_tree, at: $t_tree, dur: 0, ease: Linear} }
+  tree_len { Cue: {member: "Backdrop.f", from: $t_ripples - $t_tree, to: $t_ripples - $t_tree, at: $t_tree, dur: 0, ease: Linear} }
+  tree_caps : film_part.Under {
+    slot : film_part.Slot {
+      says : film_part.Caption {
+        Text: {s: "{d_lean_theorems_t} theorems, in Lean"}
+        cue.Arrive show(at: $m_b9_2, dur: 0.08)
+        cue.Pop pop(at: $m_b9_2)
+        cue.Leave hide(at: $t_ripples - 0.1)
+      }
+    }
+    low : film_part.Low {}
+  }
+}

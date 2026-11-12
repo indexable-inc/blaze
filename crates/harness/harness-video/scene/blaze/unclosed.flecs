@@ -1,0 +1,18 @@
+// Shot 2 (bar 3): the interrupt, the palette turned over: a read-write file left open does not compile.
+
+@tree ChildOf
+film {
+  unclosed_shot { Cue: {member: "Backdrop.shot", from: 17, to: 17, at: $t_unclosed, dur: 0, ease: Linear} }
+  unclosed_at { Cue: {member: "Backdrop.at", from: $t_unclosed, to: $t_unclosed, at: $t_unclosed, dur: 0, ease: Linear} }
+  unclosed_len { Cue: {member: "Backdrop.f", from: $t_name - $t_unclosed, to: $t_name - $t_unclosed, at: $t_unclosed, dur: 0, ease: Linear} }
+  unclosed_caps : film_part.Layer {
+    slot : film_part.Slot {
+      says : film_part.Shout {
+        Text: {s: "unclosed file: compile error"}
+        cue.Arrive show(at: $t_unclosed, dur: 0.08)
+        cue.Pop pop(at: $t_unclosed)
+        cue.Leave hide(at: $t_name - 0.1)
+      }
+    }
+  }
+}

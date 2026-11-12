@@ -1,0 +1,10 @@
+// Shot 8 (bars 13-14), no words: the galaxy nears through the build's last bar, then hangs still through the bar of
+// near-silence before the drop.
+
+@tree ChildOf
+film {
+  near_shot { Cue: {member: "Backdrop.shot", from: 0, to: 0, at: $t_near, dur: 0, ease: Linear} }
+  near_at { Cue: {member: "Backdrop.at", from: $t_near, to: $t_near, at: $t_near, dur: 0, ease: Linear} }
+  near_len { Cue: {member: "Backdrop.f", from: $t_galaxy - $t_near, to: $t_galaxy - $t_near, at: $t_near, dur: 0, ease: Linear} }
+  near_come { Cue: {member: "Backdrop.a", from: 1, to: 5, at: $t_near, dur: 4 * $beat, ease: InOut} }
+}

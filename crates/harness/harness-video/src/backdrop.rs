@@ -230,13 +230,13 @@ kernel void backdrop(texture2d<half, access::write> out [[texture(0)]],
         for (int l = 0; l < 6; l++) {
             float n = pow(2.0f, float(l));
             float y = -0.30f + 0.12f * float(l);
-            float grown = smoothstep(float(l) * 0.32f, float(l) * 0.32f + 0.3f, t);
+            float grown = smoothstep(float(l) * 0.62f, float(l) * 0.62f + 0.3f, t);
             float i = clamp(floor((q.x / 0.9f + 0.5f) * n), 0.0f, n - 1.0f);
             for (float j = max(i - 1.0f, 0.0f); j <= min(i + 1.0f, n - 1.0f); j += 1.0f) {
                 float2 at = float2(((j + 0.5f) / n - 0.5f) * 0.9f, y);
                 float2 up = float2(((floor(j / 2.0f) + 0.5f) / (n / 2.0f) - 0.5f) * 0.9f, y - 0.12f);
                 if (l > 0) m += COOL * 0.45f * grown * glow(seg(q, up, mix(up, at, grown)), 0.0022f);
-                float closed = smoothstep(float(l) * 0.32f + 0.25f, float(l) * 0.32f + 0.5f, t);
+                float closed = smoothstep(float(l) * 0.62f + 0.25f, float(l) * 0.62f + 0.5f, t);
                 m += mix(COOL, ACCENT + 0.4f, closed) * grown * (1.2f * glow(length(q - at), 0.009f) + 0.2f * glow(length(q - at), 0.03f));
             }
         }
@@ -286,7 +286,7 @@ kernel void backdrop(texture2d<half, access::write> out [[texture(0)]],
         float2 f = a - id;
         float2 centre = float2(id.x + id.y * 0.5f, id.y * 0.8660254f);
         float d = hexagon(float2(f.x + f.y * 0.5f, f.y * 0.8660254f), 0.40f);
-        float reach = smoothstep(0.0f, 0.6f, t * 3.0f - length(centre) * 0.9f);
+        float reach = smoothstep(0.0f, 0.6f, t * 1.1f - length(centre) * 0.9f);
         m += mix(COOL * 0.5f, ACCENT + 0.2f, reach) * glow(length(q), 0.36f) * (0.9f * glow(d, 0.035f) + 0.5f * reach * glow(d + 0.4f, 0.25f));
     } else if (shot == 13) {
         // Soon, first call: a stair that is only built where the walker steps.

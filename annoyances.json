@@ -561,6 +561,39 @@
    "cause": "the film's shape was being decided by watching finished cuts",
    "workaround": "the report says what was not built",
    "state": "open"
+  },
+  {
+   "id": "A52",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "harness-video: music",
+   "what": "The cut check failed its first real run on a cut that was on the grid: `Grid::position` counted from the track's first beat, which the analysis holds at 0 when the fitted grid starts a few milliseconds before the file, so every position drifted by that much and one passed a frame.",
+   "cost": "one test cycle",
+   "cause": "two places computed the grid's origin",
+   "workaround": "position counts from the second bar",
+   "state": "fixed in this lane (music.rs)"
+  },
+  {
+   "id": "A53",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "the tool",
+   "what": "A second command (tests, a build, two 60-second renders, two contact sheets) was reported as taking 26 minutes; the same steps took about three the pass before.",
+   "cost": "up to 26 minutes, unexplained",
+   "cause": "unknown; no span names harness-video's waits, and the machine was loaded",
+   "workaround": "none",
+   "state": "open (same as A38)"
+  },
+  {
+   "id": "A54",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane film-1111",
+   "where": "making videos",
+   "what": "The third cut was rejected for pace (22 cuts in a minute) the same day the brief had asked for beats of 1.5 to 3.5 s and three opening cuts under a second each: the rule that an idea must be held long enough to say back was learned from the rejection, not known before.",
+   "cost": "a fourth cut",
+   "cause": "no reading test existed",
+   "workaround": "the making-videos skill's Pace section",
+   "state": "fixed in this lane: the skill"
   }
  ]
 }

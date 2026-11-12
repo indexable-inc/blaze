@@ -1,0 +1,20 @@
+// Shot 1 (bars 1-2): a build script in its cage; what it sends out stops at the wall. The film's first image and its
+// first claim, held: the caption comes on the third beat and stays to the cut.
+
+@tree ChildOf
+film {
+  cage_shot { Cue: {member: "Backdrop.shot", from: 1, to: 1, at: $t_cage, dur: 0, ease: Linear} }
+  cage_at { Cue: {member: "Backdrop.at", from: $t_cage, to: $t_cage, at: $t_cage, dur: 0, ease: Linear} }
+  cage_len { Cue: {member: "Backdrop.f", from: $t_unclosed - $t_cage, to: $t_unclosed - $t_cage, at: $t_cage, dur: 0, ease: Linear} }
+  cage_caps : film_part.Under {
+    slot : film_part.Slot {
+      says : film_part.Caption {
+        Text: {s: "build.rs: no network"}
+        cue.Arrive show(at: $m_b1_3, dur: 0.08)
+        cue.Pop pop(at: $m_b1_3)
+        cue.Leave hide(at: $t_unclosed - 0.1)
+      }
+    }
+    low : film_part.Low {}
+  }
+}

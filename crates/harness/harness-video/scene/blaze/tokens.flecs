@@ -17,7 +17,7 @@ export const size_film_note = 9.5
 export const line_film_note = 13
 
 // A race: the slowest lane takes this long; each of the others its own share of it (the data's).
-export const film_pace = 1.9
+export const film_pace = 3.2
 // How long after a beat starts its race or its fall begins.
 export const film_lead = 0.35
 

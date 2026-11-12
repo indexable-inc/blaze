@@ -1,0 +1,27 @@
+// Shot 4 (bars 5-6): the standard library's capabilities: each arc is handed down from the one outside it and spans
+// less. One caption a bar.
+
+@tree ChildOf
+film {
+  rings_shot { Cue: {member: "Backdrop.shot", from: 4, to: 4, at: $t_rings, dur: 0, ease: Linear} }
+  rings_at { Cue: {member: "Backdrop.at", from: $t_rings, to: $t_rings, at: $t_rings, dur: 0, ease: Linear} }
+  rings_len { Cue: {member: "Backdrop.f", from: $t_disk - $t_rings, to: $t_disk - $t_rings, at: $t_rings, dur: 0, ease: Linear} }
+  rings_caps : film_part.Under {
+    slot : film_part.Slot {
+      none : film_part.Caption {
+        Text: {s: "nothing ambient"}
+        cue.Arrive show(at: $m_b5_2, dur: 0.08)
+        cue.Pop pop(at: $m_b5_2)
+        cue.Leave hide(at: $m_b6_1 - 0.1)
+      }
+      narrow : film_part.Caption {
+        Text: {s: "capabilities only narrow"}
+        Fill: $tone_film_accent
+        cue.Arrive show(at: $m_b6_1, dur: 0.08)
+        cue.Pop pop(at: $m_b6_1)
+        cue.Leave hide(at: $t_disk - 0.1)
+      }
+    }
+    low : film_part.Low {}
+  }
+}

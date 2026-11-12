@@ -1,0 +1,70 @@
+// Shot 7 (bars 11-12), the one speed beat: the no-op run as three rings leaving at once for one shore, each at its own
+// speed (its row of the data file; the slowest takes `film_pace` seconds), the times counting with them and then
+// standing; the conditions pass once in the smallest type.
+
+@tree ChildOf
+film {
+  ripples_shot { Cue: {member: "Backdrop.shot", from: 9, to: 9, at: $t_ripples, dur: 0, ease: Linear} }
+  ripples_at { Cue: {member: "Backdrop.at", from: $t_ripples, to: $t_ripples, at: $t_ripples, dur: 0, ease: Linear} }
+  ripples_len { Cue: {member: "Backdrop.f", from: $t_near - $t_ripples, to: $t_near - $t_ripples, at: $t_ripples, dur: 0, ease: Linear} }
+  ripples_a { Cue: {member: "Backdrop.a", from: $film_pace * $d_rows_noop_blaze_share, to: $film_pace * $d_rows_noop_blaze_share, at: $t_ripples, dur: 0, ease: Linear} }
+  ripples_b { Cue: {member: "Backdrop.b", from: $film_pace * $d_rows_noop_relax_share, to: $film_pace * $d_rows_noop_relax_share, at: $t_ripples, dur: 0, ease: Linear} }
+  ripples_c { Cue: {member: "Backdrop.c", from: $film_pace * $d_rows_noop_cargo_share, to: $film_pace * $d_rows_noop_cargo_share, at: $t_ripples, dur: 0, ease: Linear} }
+  ripples_times : film_part.Layer {
+    cue.CutIn enter(at: $t_ripples)
+    cue.CutOut leave(at: $t_near)
+    row : ui.Row {
+      Flex: {axis: Row, gap: 26, align: Center, justify: Center, wrap: false}
+      blaze : ui.Column {
+        Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
+        took : film_part.Took {
+          Fill: $tone_film_accent
+          Tally: {value: 0, decimals: 1, unit: " {d_rows_noop_unit}"}
+          cue.Count count(at: $t_ripples, dur: $film_pace * $d_rows_noop_blaze_share, from: 0, to: $d_rows_noop_blaze)
+        }
+        who : film_part.Who { Text: {s: $d_who_blaze}; Fill: $tone_film_accent }
+      }
+      relax : ui.Column {
+        Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
+        took : film_part.Took {
+          Fill: $tone_film_other
+          Tally: {value: 0, decimals: 1, unit: " {d_rows_noop_unit}"}
+          cue.Count count(at: $t_ripples, dur: $film_pace * $d_rows_noop_relax_share, from: 0, to: $d_rows_noop_relax)
+        }
+        who : film_part.Who { Text: {s: $d_who_relax}; Fill: $tone_film_other }
+      }
+      cargo : ui.Column {
+        Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
+        took : film_part.Took {
+          Fill: $tone_film_other
+          Tally: {value: 0, decimals: 1, unit: " {d_rows_noop_unit}"}
+          cue.Count count(at: $t_ripples, dur: $film_pace * $d_rows_noop_cargo_share, from: 0, to: $d_rows_noop_cargo)
+        }
+        who : film_part.Who { Text: {s: $d_who_cargo}; Fill: $tone_film_other }
+      }
+    }
+    lift : ui.Node { Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Percent, value: 0.66, min: 0, max: 0}} }
+  }
+  ripples_blaze : voice.Mallet { Onset: {at: $t_ripples + $film_pace * $d_rows_noop_blaze_share}; Lasts: {dur: 1.0}; Pitch: {hz: 880}; Gain: {amp: 0.08} }
+  ripples_relax : voice.Mallet { Onset: {at: $t_ripples + $film_pace * $d_rows_noop_relax_share}; Lasts: {dur: 1.0}; Pitch: {hz: 659.25}; Gain: {amp: 0.08} }
+  ripples_cargo : voice.Mallet { Onset: {at: $t_ripples + $film_pace * $d_rows_noop_cargo_share}; Lasts: {dur: 1.0}; Pitch: {hz: 440}; Gain: {amp: 0.08} }
+  ripples_caps : film_part.Under {
+    slot : film_part.Slot {
+      says : film_part.Caption {
+        Text: {s: $d_rows_noop_label}
+        cue.Arrive show(at: $m_b11_2, dur: 0.08)
+        cue.Pop pop(at: $m_b11_2)
+        cue.Leave hide(at: $t_near - 0.1)
+      }
+    }
+    low : film_part.Low {}
+  }
+  ripples_note : film_part.Under {
+    note : film_part.Note {
+      Text: {s: $d_conditions}
+      cue.Arrive show(at: $t_ripples + 0.3, dur: 0.3)
+      cue.Leave hide(at: $t_near - 0.5, dur: 0.3)
+    }
+    low : ui.Node { Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Percent, value: 0.06, min: 0, max: 0}} }
+  }
+}

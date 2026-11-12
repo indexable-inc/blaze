@@ -4,8 +4,8 @@
 //! the track, re-times the film.
 //!
 //! The track is a file the owner supplies with the rights to use it (`music.wav` beside the scene; never a ripped
-//! recording). Until there is one, [`temp_score`] synthesises a stand-in with an unmistakable pulse, a build and a
-//! drop, so the edit has something real to cut against; a render made with it is labelled temp music.
+//! recording). Until there is one, [`compose`] writes and renders a score of our own (one motif, introduced, built,
+//! dropped and answered), so the edit has something real to cut against; a render made with it is labelled temp music.
 //!
 //! Everything here is plain arithmetic on the samples in order: the same track in gives the same grid out.
 use serde::{Deserialize, Serialize};
@@ -247,7 +247,9 @@ impl Grid {
     /// far `t` is from it, seconds.
     pub fn position(&self, t: f64) -> (String, f64) {
         let step = 60.0 / self.bpm;
-        let first = self.bars.first().and_then(|b| self.beats.get(*b)).copied().unwrap_or(0.0);
+        // Counted from the second bar's first beat, a bar back: the track's very first beat is held at 0 when the grid
+        // would put it a few milliseconds before the file begins.
+        let first = self.bars.get(1).and_then(|b| self.beats.get(*b)).map_or(0.0, |t| t - 4.0 * step);
         let halves = ((t - first) / (step / 2.0)).round();
         let off = t - (first + halves * step / 2.0);
         let (bar, half) = (halves.div_euclid(8.0) as i64 + 1, halves.rem_euclid(8.0));
@@ -361,198 +363,421 @@ pub fn read_wav(bytes: &[u8], name: &str) -> Result<Vec<[f32; 2]>, String> {
         .collect())
 }
 
-/// The temp score: a stand-in track to cut against until the owner supplies one. `bars` bars of four at `bpm`, in
-/// trailer shape: a cold open of single low hits (bars 1 and 2), a groove that thickens (to the bar before
-/// `drop_bar`, whose last beat is silent), the drop (everything, a crash on its downbeat) for `drop_bars` bars, a
-/// lighter groove, a break (the bar before the last two: silence, then one hit on its third beat), and the last
-/// downbeat held, with one more hit a bar later (the button). Its notes are its own: a syncopated kick, a backbeat,
-/// a bass on A, and a five-note figure. `seed` fixes its noise.
-pub fn temp_score(bpm: f64, bars: usize, drop_bar: usize, drop_bars: usize, seed: u64) -> Vec<[f32; 2]> {
+/// A note of the score as written: which bar (from 1) and beat (from 1, fractions allowed), how many beats long,
+/// and its pitch as a MIDI number (69 is A4, 440 Hz, equal temperament).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Written {
+    pub bar: usize,
+    pub beat: f64,
+    pub beats: f64,
+    pub midi: i32,
+}
+
+/// The score as written and as rendered: its stems (stereo at [`RATE`], each already through its own reverb, so they
+/// sum to the mix), and the lead's and the bass's notes, for the piano roll and for checking the audio against the page.
+pub struct Score {
+    pub bpm: f64,
+    pub bars: usize,
+    pub lead: Vec<[f32; 2]>,
+    pub harmony: Vec<[f32; 2]>,
+    pub bass: Vec<[f32; 2]>,
+    pub drums: Vec<[f32; 2]>,
+    pub effects: Vec<[f32; 2]>,
+    pub lead_notes: Vec<Written>,
+    pub bass_notes: Vec<Written>,
+}
+
+/// The score's tempo and length: 22 bars of four at 88 are exactly a minute.
+pub const BPM: f64 = 88.0;
+pub const BARS: usize = 22;
+/// The bar the drop lands on, and the bar of the final statement.
+pub const DROP: usize = 15;
+pub const FINAL: usize = 21;
+
+/// The motif, in A minor: E4, up a fourth to A4, a step back to G4, and down to E4 where it began (a question). As
+/// (beat, beats, MIDI).
+pub const MOTIF: [(f64, f64, i32); 4] = [(1.0, 1.0, 64), (2.0, 1.5, 69), (3.5, 0.5, 67), (4.0, 1.0, 64)];
+/// The final statement, over A major: the same rise, E4 to A4, but it does not step back: on to B4 and up to C#5, the
+/// major third (the answer), each note twice as long (the last held).
+pub const ANSWER: [(f64, f64, i32); 4] = [(1.0, 2.0, 64), (3.0, 2.0, 69), (5.0, 2.0, 71), (7.0, 2.0, 73)];
+/// The counter-line that answers the motif on the bars between: a fall of three notes into the next chord.
+const COUNTER_F: [(f64, f64, i32); 3] = [(1.0, 1.0, 72), (2.0, 1.0, 71), (3.0, 2.0, 69)];
+const COUNTER_G: [(f64, f64, i32); 3] = [(1.0, 1.0, 74), (2.0, 1.0, 71), (3.0, 2.0, 67)];
+
+/// The chord of each bar, by name, with its pad voicing (voice-led: common tones held) and its bass note, as MIDI.
+/// i, VI, III, VII in A minor (Am, F, C, G), four times round with the fourth G left bare before the drop, then Am
+/// and F, and A major under the final statement.
+pub fn chord(bar: usize) -> (&'static str, [i32; 3], i32) {
+    const AM: (&str, [i32; 3], i32) = ("Am", [57, 60, 64], 45);
+    const F: (&str, [i32; 3], i32) = ("F", [57, 60, 65], 41);
+    const C: (&str, [i32; 3], i32) = ("C", [55, 60, 64], 48);
+    const G: (&str, [i32; 3], i32) = ("G", [55, 59, 62], 43);
+    match bar {
+        1 | 2 => AM,
+        3..=18 => [AM, F, C, G][(bar - 3) % 4],
+        19 => AM,
+        20 => F,
+        _ => ("A", [57, 61, 64], 45),
+    }
+}
+
+/// What plays in each bar, in words: the form.
+pub fn section(bar: usize) -> &'static str {
+    match bar {
+        1 | 2 => "intro: the motif alone, one soft voice; the pad comes in under its last note",
+        3..=6 => "statement: motif on Am and C, pad and a whole-note bass",
+        7..=10 => "second statement: a kick and a hat join; the counter-line answers on F and G",
+        11..=13 => "build: kick on every beat, hats in sixteenths, the motif an octave up, a riser through bar 13",
+        14 => "near-silence: the pad's tail and a swell; the last beat bare",
+        15..=18 => "drop: the motif in octaves, counter-line, full drums, bass in eighths",
+        19 | 20 => "after: the motif once more, the drums light",
+        21 => "final statement: the motif changed (E4 A4 B4 C#5, twice as slow) over A major, one hit",
+        _ => "tail: the chord and the reverb",
+    }
+}
+
+fn hz(midi: i32) -> f32 {
+    440.0 * 2f32.powf((midi - 69) as f32 / 12.0)
+}
+
+/// A Schroeder reverb (four combs, two all-passes a side, the right side's delays a little longer), mixed in at `wet`.
+fn reverb(stem: &mut [[f32; 2]], wet: f32) {
+    for (ch, spread) in [(0usize, 0usize), (1, 23)] {
+        let dry: Vec<f32> = stem.iter().map(|s| s[ch]).collect();
+        let mut sum = vec![0.0f32; dry.len()];
+        for (len, fb) in [(1557, 0.82), (1617, 0.81), (1491, 0.83), (1422, 0.80)] {
+            let mut buf = vec![0.0f32; len + spread];
+            let mut at = 0;
+            for (i, d) in dry.iter().enumerate() {
+                let out = buf[at];
+                buf[at] = d + out * fb;
+                at = (at + 1) % buf.len();
+                sum[i] += out * 0.25;
+            }
+        }
+        for len in [225, 556] {
+            let mut buf = vec![0.0f32; len + spread];
+            let mut at = 0;
+            for v in &mut sum {
+                let delayed = buf[at];
+                let x = *v + delayed * 0.5;
+                buf[at] = x;
+                at = (at + 1) % buf.len();
+                *v = delayed - x * 0.5;
+            }
+        }
+        for (s, w) in stem.iter_mut().zip(&sum) {
+            s[ch] += w * wet;
+        }
+    }
+}
+
+/// The score, composed and rendered: one motif, introduced bare, restated over a progression that wants to resolve,
+/// built, dropped at full strength, and answered at the end by its changed form (module consts say the notes;
+/// [`chord`] and [`section`] the harmony and the form). Deterministic: the only noise is a fixed xorshift.
+pub fn compose() -> Score {
     let sr = f64::from(RATE);
-    let beat = 60.0 / bpm;
-    let n = (bars as f64 * 4.0 * beat * sr).round() as usize;
-    let mut out = vec![[0.0f32; 2]; n];
-    let mut state = seed | 1;
+    let beat = 60.0 / BPM;
+    let n = (BARS as f64 * 4.0 * beat * sr).round() as usize;
+    let empty = || vec![[0.0f32; 2]; n];
+    let (mut lead, mut harmony, mut bass, mut drums, mut effects) = (empty(), empty(), empty(), empty(), empty());
+    let (mut lead_notes, mut bass_notes) = (Vec::new(), Vec::new());
+    let tau = std::f32::consts::TAU;
+    let at = |bar: usize, b: f64| ((bar - 1) as f64 * 4.0 + b - 1.0) * beat;
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
     let mut noise = move || {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
         (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
     };
-    // One sound: `f(seconds since its start)` for `dur` seconds from `at`, at `pan` (-1 to 1).
-    let mut add = |out: &mut Vec<[f32; 2]>, at: f64, dur: f64, pan: f32, f: &mut dyn FnMut(f32) -> f32| {
-        let from = (at * sr).round() as usize;
+    // A touch of the hand: each note a little louder or softer, by its place.
+    let touch = |bar: usize, b: f64| 0.92 + 0.16 * (((bar * 37 + (b * 8.0) as usize * 11) % 17) as f32 / 16.0);
+    let add = |stem: &mut Vec<[f32; 2]>, t: f64, dur: f64, pan: f32, f: &mut dyn FnMut(f32) -> f32| {
+        let from = (t * sr).round() as usize;
         let (l, r) = ((0.5 * (1.0 - pan)).sqrt(), (0.5 * (1.0 + pan)).sqrt());
         for i in 0..(dur * sr) as usize {
-            let Some(o) = out.get_mut(from + i) else { break };
+            let Some(o) = stem.get_mut(from + i) else { break };
             let v = f(i as f32 / RATE as f32);
             o[0] += v * l;
             o[1] += v * r;
         }
     };
-    let tau = std::f32::consts::TAU;
-    let kick = |amp: f32| move |t: f32| amp * (-t * 9.0).exp() * (tau * (48.0 * t + 14.0 * (1.0 - (-t * 30.0).exp()))).sin();
-    // A low hit for a big cut: a kick under a slow, rough fifth.
-    let braam = |amp: f32| move |t: f32| {
-        let saw = |f: f32| 2.0 * (t * f - (t * f + 0.5).floor());
-        amp * ((-t * 2.2).exp() * 0.5 * (saw(55.0) + saw(55.4) + 0.6 * saw(82.4)) * (1.0 - (-t * 40.0).exp()) + (-t * 7.0).exp() * (tau * (45.0 * t + 12.0 * (1.0 - (-t * 25.0).exp()))).sin())
+    // The lead: a bell-like pluck (FM, the modulator an octave up and dying faster than the note), with one echo a
+    // dotted eighth later.
+    let mut pluck = |lead: &mut Vec<[f32; 2]>, notes: &mut Vec<Written>, bar: usize, b: f64, beats: f64, midi: i32, amp: f32, written: bool| {
+        let f = hz(midi);
+        let amp = amp * touch(bar, b);
+        let ring = (beats * beat) as f32 + 0.9;
+        for (delay, level, pan) in [(0.0, 1.0, -0.1), (0.75 * beat, 0.28, 0.35)] {
+            add(lead, at(bar, b) + delay, f64::from(ring), pan, &mut |t| {
+                amp * level * (1.0 - (-t * 400.0).exp()) * (-t * 2.6).exp() * (tau * f * t + 1.4 * (-t * 7.0).exp() * (tau * 2.0 * f * t).sin()).sin()
+            });
+        }
+        if written {
+            notes.push(Written { bar, beat: b, beats, midi });
+        }
     };
-    let last_groove = bars.saturating_sub(3);
-    for bar in 0..bars {
-        let at = |b: f64| (bar as f64 * 4.0 + b) * beat;
-        let n1 = bar + 1;
-        let (in_drop, lighter) = (n1 >= drop_bar && n1 < drop_bar + drop_bars, n1 >= drop_bar + drop_bars && n1 <= last_groove);
-        if n1 <= 2 {
-            // The cold open: a hit a beat in bar 1, one on the downbeat of bar 2 that rings.
-            for b in 0..if n1 == 1 { 4 } else { 1 } {
-                add(&mut out, at(f64::from(b)), 1.6, 0.0, &mut braam(0.5));
+    for bar in 1..=BARS {
+        let (_, voicing, root) = chord(bar);
+        let level: f32 = match bar {
+            1 | 2 => 0.5,
+            3..=6 => 0.6,
+            7..=10 => 0.72,
+            11..=13 => 0.85,
+            14 => 0.0,
+            15..=18 => 1.0,
+            19 | 20 => 0.7,
+            _ => 0.85,
+        };
+        // Lead.
+        match bar {
+            1 => MOTIF.iter().for_each(|(b, len, m)| pluck(&mut lead, &mut lead_notes, bar, *b, *len, *m, 0.20, true)),
+            3 | 5 | 7 | 9 | 19 => MOTIF.iter().for_each(|(b, len, m)| pluck(&mut lead, &mut lead_notes, bar, *b, *len, *m, 0.26 * level, true)),
+            8 => COUNTER_F.iter().for_each(|(b, len, m)| pluck(&mut lead, &mut lead_notes, bar, *b, *len, *m, 0.2 * level, true)),
+            10 => COUNTER_G.iter().for_each(|(b, len, m)| pluck(&mut lead, &mut lead_notes, bar, *b, *len, *m, 0.2 * level, true)),
+            11 | 13 => MOTIF.iter().for_each(|(b, len, m)| pluck(&mut lead, &mut lead_notes, bar, *b, *len, *m + 12, 0.24 * level, true)),
+            12 => COUNTER_F.iter().for_each(|(b, len, m)| pluck(&mut lead, &mut lead_notes, bar, *b, *len, *m, 0.2 * level, true)),
+            15 | 17 => MOTIF.iter().for_each(|(b, len, m)| {
+                pluck(&mut lead, &mut lead_notes, bar, *b, *len, *m, 0.30, true);
+                pluck(&mut lead, &mut lead_notes, bar, *b, *len, *m + 12, 0.22, false);
+            }),
+            16 => COUNTER_F.iter().for_each(|(b, len, m)| pluck(&mut lead, &mut lead_notes, bar, *b, *len, *m, 0.26, true)),
+            18 => COUNTER_G.iter().for_each(|(b, len, m)| pluck(&mut lead, &mut lead_notes, bar, *b, *len, *m, 0.26, true)),
+            FINAL => ANSWER.iter().for_each(|(b, len, m)| pluck(&mut lead, &mut lead_notes, bar, *b, *len, *m, 0.32, true)),
+            _ => {}
+        }
+        // Harmony: three voices, each two detuned saws through a low-pass, slow in and slow out. From the intro's
+        // second bar; held through the last two bars as one chord.
+        if bar >= 2 && bar != BARS {
+            let bars_long = if bar == FINAL { 2.0 } else { 1.0 };
+            let dur = bars_long * 4.0 * beat + 0.5;
+            let amp = 0.055 * if bar == 14 { 0.35 } else { level.max(0.5) };
+            for (v, m) in voicing.iter().enumerate() {
+                let f = hz(*m);
+                let (mut lp, mut lp2) = (0.0f32, 0.0f32);
+                let cut = 0.035 + 0.05 * level;
+                add(&mut harmony, at(bar, 1.0), dur, [-0.5, 0.0, 0.5][v], &mut |t| {
+                    let saw = |f: f32| 2.0 * (t * f - (t * f + 0.5).floor());
+                    lp += cut * (saw(f) + saw(f * 1.004) - lp);
+                    lp2 += cut * (lp - lp2);
+                    amp * (t / 0.5).min(1.0) * ((dur as f32 - t) / 0.6).clamp(0.0, 1.0) * lp2
+                });
             }
-        } else if n1 < drop_bar || in_drop || lighter {
-            let level = if in_drop { 1.0 } else if lighter { 0.7 } else { 0.45 + 0.4 * (n1 - 3) as f32 / (drop_bar - 3).max(1) as f32 };
-            let silent_tail = n1 + 1 == drop_bar;
-            // Kick: one, the and of two, three (and four in the drop). Backbeat on two and four.
-            for b in [0.0, 1.5, 2.0].into_iter().chain(in_drop.then_some(3.5)) {
-                if !(silent_tail && b >= 3.0) {
-                    add(&mut out, at(b), 0.5, 0.0, &mut kick(0.8 * level));
-                }
+        }
+        // Bass: whole notes at first, eighths in the build and the drop; a sine with a little third harmonic, pressed.
+        if bar >= 3 && bar != 14 && bar != BARS {
+            let eighths = (11..=13).contains(&bar) || (15..=18).contains(&bar);
+            let steps: Vec<(f64, f64)> = if bar == FINAL { vec![(1.0, 8.0)] } else if eighths { (0..8).map(|i| (1.0 + f64::from(i) * 0.5, 0.5)).collect() } else { vec![(1.0, 4.0)] };
+            for (b, len) in steps {
+                let f = hz(root + 12);
+                let amp = 0.30 * level * touch(bar, b);
+                let dur = len * beat * if eighths { 0.9 } else { 1.0 };
+                add(&mut bass, at(bar, b), dur, 0.0, &mut |t| {
+                    let env = (1.0 - (-t * 150.0).exp()) * (-t * if eighths { 4.0 } else { 0.5 }).exp() * ((dur as f32 - t) / 0.03).clamp(0.0, 1.0);
+                    (1.6 * amp * env * ((tau * f * t).sin() + 0.2 * (tau * 3.0 * f * t).sin())).tanh() / 1.6
+                });
+                bass_notes.push(Written { bar, beat: b, beats: len, midi: root + 12 });
             }
-            for b in [1.0, 3.0] {
-                if !(silent_tail && b >= 3.0) {
-                    let mut lp = 0.0f32;
-                    add(&mut out, at(b), 0.22, 0.1, &mut |t| {
-                        lp += 0.5 * (noise() - lp);
-                        0.45 * level * (-t * 22.0).exp() * (lp + 0.5 * (tau * 190.0 * t).sin() * (-t * 30.0).exp())
-                    });
-                }
+        }
+        // Drums: a kick and a hat from the second statement; every beat and sixteenths in the build and the drop; a
+        // soft backbeat in the drop.
+        let drummed = (7..=13).contains(&bar) || (15..=20).contains(&bar);
+        if drummed {
+            let busy = (11..=13).contains(&bar) || (15..=18).contains(&bar);
+            let kicks: &[f64] = if busy { &[1.0, 2.0, 3.0, 4.0] } else { &[1.0, 3.0] };
+            for b in kicks {
+                let amp = 0.55 * level * touch(bar, *b);
+                add(&mut drums, at(bar, *b), 0.4, 0.0, &mut |t| amp * (-t * 10.0).exp() * (tau * (50.0 * t + 12.0 * (1.0 - (-t * 30.0).exp()))).sin());
             }
-            // Hats: eighths; sixteenths from the fourth bar of the groove and in the drop. In the two bars before the
-            // drop a roll that doubles.
-            let hats = if in_drop || n1 >= 7 { 16 } else { 8 };
+            let hats = if busy { 16 } else { 8 };
             for h in 0..hats {
-                let b = 4.0 * f64::from(h) / f64::from(hats);
-                if silent_tail && b >= 3.0 {
-                    continue;
-                }
+                let b = 1.0 + 4.0 * f64::from(h) / f64::from(hats);
+                let amp = 0.07 * level * touch(bar, b) * if h % (hats / 4) == 0 { 1.0 } else { 0.55 };
                 let mut prev = 0.0f32;
-                let amp = 0.10 * level * if h % (hats / 4) == 0 { 1.0 } else { 0.6 };
-                add(&mut out, at(b), 0.05, if h % 2 == 0 { -0.3 } else { 0.3 }, &mut |t| {
+                add(&mut drums, at(bar, b), 0.05, if h % 2 == 0 { -0.3 } else { 0.3 }, &mut |t| {
                     let v = noise();
                     let hp = v - prev;
                     prev = v;
-                    amp * (-t * 90.0).exp() * hp
+                    amp * (-t * 80.0).exp() * hp
                 });
             }
-            if n1 + 2 >= drop_bar && n1 < drop_bar {
-                let hits = if silent_tail { 24 } else { 8 };
-                for h in 0..hits {
-                    let b = (if silent_tail { 3.0 } else { 4.0 }) * f64::from(h) / f64::from(hits);
+            if (15..=18).contains(&bar) {
+                for b in [2.0, 4.0] {
                     let mut lp = 0.0f32;
-                    let amp = 0.12 + 0.25 * h as f32 / hits as f32;
-                    add(&mut out, at(b), 0.12, 0.0, &mut |t| {
-                        lp += 0.6 * (noise() - lp);
-                        amp * (-t * 35.0).exp() * lp
+                    add(&mut drums, at(bar, b), 0.2, 0.1, &mut |t| {
+                        lp += 0.45 * (noise() - lp);
+                        0.3 * (-t * 24.0).exp() * lp
                     });
                 }
             }
-            // Bass on A, an eighth-note line that leans on the off-beats.
-            for (i, semis) in [0, 0, 7, 0, 10, 0, 7, 12].into_iter().enumerate() {
-                let b = i as f64 * 0.5;
-                if silent_tail && b >= 3.0 {
-                    continue;
-                }
-                let f = 55.0 * 2f32.powf(semis as f32 / 12.0);
-                let amp = 0.28 * level * if i % 2 == 1 { 1.0 } else { 0.75 };
-                add(&mut out, at(b), beat * 0.45, 0.0, &mut |t| amp * (1.0 - (-t * 200.0).exp()) * (-t * 5.0).exp() * ((tau * f * t).sin() + 0.3 * (tau * 2.0 * f * t).sin()));
-            }
-            // The figure: five notes of A minor pentatonic over two beats, from the groove's fifth bar; an octave up
-            // and doubled in the drop.
-            if n1 >= 7 || in_drop {
-                for rep in 0..2 {
-                    for (i, semis) in [12, 15, 19, 17, 24].into_iter().enumerate() {
-                        let b = f64::from(rep) * 2.0 + [0.0, 0.75, 1.0, 1.5, 1.75][i];
-                        if silent_tail && b >= 3.0 {
-                            continue;
-                        }
-                        let f = 220.0 * 2f32.powf(semis as f32 / 12.0) * if in_drop { 2.0 } else { 1.0 };
-                        let amp = 0.11 * level;
-                        add(&mut out, at(b), 0.35, if i % 2 == 0 { -0.4 } else { 0.4 }, &mut |t| {
-                            amp * (-t * 9.0).exp() * ((tau * f * t).sin() + 0.4 * (tau * 2.0 * f * t).sin() + 0.15 * (tau * 3.0 * f * t).sin())
-                        });
-                    }
-                }
-            }
-            // A riser through the bar before the drop; a crash and a low hit on the drop's downbeat and on each
-            // bar of the lighter groove.
-            if silent_tail {
-                let mut lp = 0.0f32;
-                let len = (3.0 * beat) as f32;
-                add(&mut out, at(0.0), 3.0 * beat, 0.0, &mut |t| {
-                    let p = t / len;
-                    lp += (0.02 + 0.6 * p * p) * (noise() - lp);
-                    0.5 * p * p * lp + 0.12 * p * p * (tau * (220.0 + 660.0 * p * p) * t).sin()
-                });
-            }
-            if n1 == drop_bar || lighter {
-                let amp = if n1 == drop_bar { 1.0 } else { 0.5 };
-                add(&mut out, at(0.0), 2.0, 0.0, &mut braam(0.6 * amp));
-                let mut prev = 0.0f32;
-                add(&mut out, at(0.0), 1.8, 0.0, &mut |t| {
-                    let v = noise();
-                    let hp = v - 0.7 * prev;
-                    prev = v;
-                    0.22 * amp * (-t * 2.4).exp() * hp
-                });
-            }
-        } else if n1 + 2 == bars {
-            // The break: silence, then one hit on three.
-            add(&mut out, at(2.0), 1.4, 0.0, &mut braam(0.6));
-        } else {
-            // The last two bars: the final downbeat, held as a chord; a bar later, the button.
-            add(&mut out, at(0.0), 2.2, 0.0, &mut braam(if n1 + 1 == bars { 0.8 } else { 0.7 }));
-            if n1 + 1 == bars {
-                let hold = (8.0 * beat) as f32;
-                for (f, pan) in [(110.0, 0.0), (164.81, -0.4), (220.0, 0.4), (277.18, -0.2), (329.63, 0.2)] {
-                    add(&mut out, at(0.0), 8.0 * beat, pan, &mut |t| 0.07 * (t / 0.05).min(1.0) * (1.0 - t / hold).max(0.0).powi(2) * ((tau * f * t).sin() + 0.5 * (tau * (f + 0.4) * t).sin()));
-                }
-            }
+        }
+        // Effects, few: a riser through bar 13, a swell through bar 14's first three beats, a low drop on the drop,
+        // one hit on the final statement.
+        if bar == 13 || bar == 14 {
+            let len = (if bar == 13 { 4.0 } else { 3.0 } * beat) as f32;
+            let top = if bar == 13 { 0.22 } else { 0.3 };
+            let mut lp = 0.0f32;
+            add(&mut effects, at(bar, 1.0), f64::from(len), 0.0, &mut |t| {
+                let p = t / len;
+                lp += (0.02 + 0.5 * p * p) * (noise() - lp);
+                top * p * p * lp * ((len - t) / 0.02).clamp(0.0, 1.0)
+            });
+        }
+        if bar == DROP || bar == FINAL {
+            add(&mut effects, at(bar, 1.0), 2.2, 0.0, &mut |t| 0.5 * (-t * 2.5).exp() * (tau * (41.0 * t + 14.0 * (1.0 - (-t * 12.0).exp()))).sin());
         }
     }
-    // A soft clip, so the hits do not pass full scale.
-    for s in &mut out {
-        *s = s.map(|v| (v * 0.9).tanh());
+    reverb(&mut lead, 0.35);
+    reverb(&mut harmony, 0.3);
+    reverb(&mut drums, 0.08);
+    reverb(&mut effects, 0.25);
+    Score { bpm: BPM, bars: BARS, lead, harmony, bass, drums, effects, lead_notes, bass_notes }
+}
+
+impl Score {
+    /// The stems summed, softly limited: the track.
+    pub fn mix(&self) -> Vec<[f32; 2]> {
+        (0..self.lead.len())
+            .map(|i| {
+                let s = |k: usize| self.lead[i][k] + self.harmony[i][k] + self.bass[i][k] + self.drums[i][k] + self.effects[i][k];
+                [(s(0) * 1.4).tanh() / 1.4, (s(1) * 1.4).tanh() / 1.4]
+            })
+            .collect()
     }
-    out
+
+    /// The pitch heard in the lead stem for each written note, as a MIDI number with its fraction: the strongest
+    /// period (autocorrelation, 180 to 1300 Hz) of the 40 ms that start 25 ms into the note.
+    pub fn heard(&self) -> Vec<(Written, f64)> {
+        let beat = 60.0 / self.bpm;
+        self.lead_notes
+            .iter()
+            .map(|w| {
+                let from = ((((w.bar - 1) as f64 * 4.0 + w.beat - 1.0) * beat + 0.025) * f64::from(RATE)) as usize;
+                let win: Vec<f64> = self.lead[from.min(self.lead.len())..(from + 1920).min(self.lead.len())].iter().map(|s| f64::from(s[0] + s[1])).collect();
+                let (lo, hi) = ((f64::from(RATE) / 1300.0) as usize, (f64::from(RATE) / 180.0) as usize);
+                let score = |lag: usize| win.iter().zip(&win[lag.min(win.len())..]).map(|(a, b)| a * b).sum::<f64>() / (win.len() - lag.min(win.len())).max(1) as f64;
+                let top = (lo..=hi).map(score).fold(f64::NEG_INFINITY, f64::max);
+                // The first lag that is nearly the best: the period itself, not a multiple of it.
+                let lag = (lo..=hi).find(|l| score(*l) > 0.9 * top && score(*l) >= score(*l + 1) && score(*l) >= score(*l - 1)).unwrap_or(lo);
+                let (a, b, c) = (score(lag - 1), score(lag), score(lag + 1));
+                let fine = lag as f64 + 0.5 * (a - c) / (a - 2.0 * b + c).min(-1e-12);
+                (*w, 69.0 + 12.0 * (f64::from(RATE) / fine / 440.0).log2())
+            })
+            .collect()
+    }
+
+    /// The score on paper: key, tempo, the motif and its answer by name, and each bar's chord and what plays.
+    pub fn page(&self) -> String {
+        let name = |m: i32| format!("{}{}", ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"][m.rem_euclid(12) as usize], m / 12 - 1);
+        let line = |notes: &[(f64, f64, i32)]| notes.iter().map(|(b, len, m)| format!("{} (beat {b}, {len} beats)", name(*m))).collect::<Vec<_>>().join(", ");
+        let mut out = format!(
+            "Key: A minor, ending in A major. Tempo: {} beats a minute, 4/4, {} bars = {:.1} s. Equal temperament, A4 = 440 Hz.\n\
+             The motif: {}.\nThe answer (the final statement, bar {FINAL}): {}: the same rise, then on up to the major third instead of falling back, twice as slow.\n\
+             Counter-line: over F {}; over G {}.\nProgression: i VI III VII (Am F C G), a chord a bar.\n\nbar  chord  what plays\n",
+            self.bpm,
+            self.bars,
+            self.bars as f64 * 240.0 / self.bpm,
+            line(&MOTIF),
+            line(&ANSWER),
+            line(&COUNTER_F),
+            line(&COUNTER_G)
+        );
+        for bar in 1..=self.bars {
+            let (chord, voicing, root) = chord(bar);
+            let lead: Vec<String> = self.lead_notes.iter().filter(|w| w.bar == bar).map(|w| name(w.midi)).collect();
+            out.push_str(&format!(
+                "{bar:>3}  {chord:<5}  pad {} | bass {} | lead {} | {}\n",
+                voicing.map(name).join(" "),
+                name(root + 12),
+                if lead.is_empty() { "-".to_owned() } else { lead.join(" ") },
+                section(bar)
+            ));
+        }
+        out
+    }
+
+    /// The piano roll: the lead's notes (accent) and the bass's (grey) by pitch, against the bar lines. `(w, h)` RGBA8.
+    pub fn roll(&self, (w, h): (usize, usize)) -> Vec<u8> {
+        let mut px = vec![0u8; w * h * 4];
+        for p in px.chunks_exact_mut(4) {
+            p.copy_from_slice(&[12, 13, 16, 255]);
+        }
+        let total = self.bars as f64 * 4.0;
+        let (low, high) = (36, 88);
+        let mut rect = |x0: f64, x1: f64, y: usize, c: [u8; 3]| {
+            for x in (x0 * w as f64) as usize..((x1 * w as f64) as usize).min(w) {
+                for yy in y..(y + 4).min(h) {
+                    px[(yy * w + x) * 4..(yy * w + x) * 4 + 3].copy_from_slice(&c);
+                }
+            }
+        };
+        for bar in 0..self.bars {
+            let x = bar as f64 * 4.0 / total;
+            for y in (0..h).step_by(if bar + 1 == DROP || bar + 1 == FINAL { 1 } else { 3 }) {
+                rect(x, x + 1.0 / w as f64, y, [70, 74, 84]);
+            }
+        }
+        for (notes, c) in [(&self.bass_notes, [150u8, 158, 175]), (&self.lead_notes, [255, 149, 50])] {
+            for n in notes.iter() {
+                let x0 = ((n.bar - 1) as f64 * 4.0 + n.beat - 1.0) / total;
+                let y = h - 6 - ((n.midi - low) as usize * (h - 12)) / (high - low) as usize;
+                rect(x0, x0 + n.beats * 0.92 / total, y, c);
+            }
+        }
+        px
+    }
+}
+
+/// A mix's loudness over time, as a curve: each column the level (RMS, dB) of a half second, -60 dB at the bottom to
+/// 0 at the top, with the bar lines of a `bpm` grid. `(w, h)` RGBA8. The build should climb and the drop stand tallest.
+pub fn loudness_curve(mix: &[[f32; 2]], bpm: f64, (w, h): (usize, usize)) -> Vec<u8> {
+    let mut px = vec![0u8; w * h * 4];
+    for p in px.chunks_exact_mut(4) {
+        p.copy_from_slice(&[12, 13, 16, 255]);
+    }
+    let length = mix.len() as f64 / f64::from(RATE);
+    let bar = 240.0 / bpm;
+    for x in 0..w {
+        let t = x as f64 / w as f64 * length;
+        let (from, to) = (((t - 0.25).max(0.0) * f64::from(RATE)) as usize, (((t + 0.25) * f64::from(RATE)) as usize).min(mix.len()));
+        let rms = (mix[from..to].iter().map(|s| f64::from(s[0] * s[0] + s[1] * s[1]) * 0.5).sum::<f64>() / (to - from).max(1) as f64).sqrt();
+        let level = ((20.0 * rms.max(1e-6).log10() + 60.0) / 60.0).clamp(0.0, 1.0);
+        let top = h - 1 - (level * (h - 1) as f64) as usize;
+        let on_bar = (t / bar).fract() < length / w as f64 / bar;
+        for y in 0..h {
+            let c: [u8; 3] = if y >= top { [255, 149, 50] } else if on_bar { [70, 74, 84] } else { [12, 13, 16] };
+            px[(y * w + x) * 4..(y * w + x) * 4 + 3].copy_from_slice(&c);
+        }
+    }
+    px
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The refinement: the analysis finds the grid the temp score was written on. Its tempo to within half a beat a
-    /// minute, every beat to within a frame and a half of where the score put it, the bars counted from the score's
-    /// own first beat, and the drop at the bar the score dropped on. The control: a track with no pulse (noise at one
-    /// level) has no drop where the score's is.
+    /// The refinement: the analysis finds the grid the score was written on. Its tempo to within half a beat a minute,
+    /// every beat to within a frame and a half of where the score put it, the bars counted from the score's own first
+    /// beat, and the drop at the bar the score dropped on. The control: a track with no pulse (noise at one level) has
+    /// no drop where the score's is.
     #[test]
-    fn the_grid_of_the_temp_score_is_found() {
-        let (bpm, bars, drop) = (104.0, 26, 15);
-        let score = temp_score(bpm, bars, drop, 5, 7);
-        assert_eq!(score.len(), 60 * RATE as usize, "26 bars at 104 are a minute");
+    fn the_grid_of_the_score_is_found() {
+        let score = compose().mix();
+        assert_eq!(score.len(), 60 * RATE as usize, "22 bars at 88 are a minute");
         let grid = analyse(&score, "temp score").unwrap_or_else(|e| panic!("{e}"));
-        assert!((grid.bpm - bpm).abs() < 0.5, "tempo {}", grid.bpm);
-        let step = 60.0 / bpm;
+        assert!((grid.bpm - BPM).abs() < 0.5, "tempo {}", grid.bpm);
+        let step = 60.0 / BPM;
         for (i, t) in grid.beats.iter().enumerate() {
             let nearest = (t / step).round() * step;
             assert!((t - nearest).abs() < 0.025, "beat {i} at {t}, {} off the score's", t - nearest);
         }
         assert_eq!(grid.bars.first(), Some(&0), "bars are counted from the first beat");
-        assert_eq!(grid.bars.len(), bars);
+        assert_eq!(grid.bars.len(), BARS);
         let dropped = grid.sections.iter().find(|s| s.label == "drop").unwrap_or_else(|| panic!("no drop in {:?}", grid.sections));
-        assert_eq!(dropped.bar, drop, "{:?}", grid.sections);
+        assert_eq!(dropped.bar, DROP, "{:?}", grid.sections);
         assert!(grid.constants().contains("export const m_b15_1: f32 = "));
-        let (said, off) = grid.position(14.0 * 4.0 * step);
-        assert!(said.starts_with("bar 15 beat 1") && off.abs() < 0.02, "{said} {off}");
-        // The same track twice is the same grid, to the bit.
-        assert_eq!(grid, analyse(&temp_score(bpm, bars, drop, 5, 7), "temp score").unwrap_or_else(|e| panic!("{e}")));
+        assert_eq!(grid, analyse(&compose().mix(), "temp score").unwrap_or_else(|e| panic!("{e}")));
         let mut state = 9u64;
         let flat: Vec<[f32; 2]> = (0..20 * RATE as usize)
             .map(|_| {
@@ -562,7 +787,25 @@ mod tests {
             })
             .collect();
         let none = analyse(&flat, "noise").unwrap_or_else(|e| panic!("{e}"));
-        assert!(none.sections.iter().all(|s| s.label != "drop" || s.bar != drop), "{:?}", none.sections);
+        assert!(none.sections.iter().all(|s| s.label != "drop" || s.bar != DROP), "{:?}", none.sections);
+    }
+
+    /// The refinement: the audio is the page. Every written note of the lead is heard in the lead stem as that note (within
+    /// half a semitone: the echo of the note before can pull the reading tens of cents); the first statement (bar 1) is the motif, E4 A4 G4 E4; the final statement (bar 21) is the
+    /// answer, the same first two notes and then B4 and C#5 where the motif had G4 and E4, each note twice as long.
+    #[test]
+    fn the_motif_is_heard_as_written_and_its_answer_differs_as_designed() {
+        let score = compose();
+        let heard = score.heard();
+        assert!(heard.len() > 40, "{} notes", heard.len());
+        for (w, midi) in &heard {
+            assert!((midi - f64::from(w.midi)).abs() < 0.5, "bar {} beat {}: written {}, heard {midi:.2}", w.bar, w.beat, w.midi);
+        }
+        let of = |bar: usize| -> Vec<(i32, f64)> { heard.iter().filter(|(w, _)| w.bar == bar).map(|(w, m)| (m.round() as i32, w.beats)).collect() };
+        assert_eq!(of(1).iter().map(|n| n.0).collect::<Vec<_>>(), [64, 69, 67, 64], "the motif, heard");
+        assert_eq!(of(FINAL).iter().map(|n| n.0).collect::<Vec<_>>(), [64, 69, 71, 73], "the answer, heard");
+        assert!(of(FINAL).iter().all(|n| n.1 == 2.0) && of(1)[0].1 == 1.0, "the answer is twice as slow");
+        assert!(score.page().contains("E4 (beat 1, 1 beats), A4 (beat 2, 1.5 beats), G4 (beat 3.5, 0.5 beats), E4 (beat 4, 1 beats)"));
     }
 
     /// A WAV written and read back is the samples it was (16-bit, to its step), and a file that is not one is refused

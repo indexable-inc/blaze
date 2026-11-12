@@ -16,7 +16,7 @@
 //!     harness-video check OUT.mp4 SCENE.flecs PRESET   read a finished mp4 back and hold it to the scene and preset
 //!     harness-video SCENE.flecs cuts               every hard cut and where it is in the music; fails on one off the grid
 //!     harness-video analyse TRACK.wav beats.json   a track's beat grid (music.rs), and beats.png: the track with the grid on it
-//!     harness-video score OUT.wav BPM BARS DROP DROP_BARS   the temp score to cut against until a track is supplied
+//!     harness-video score DIR                      our own score (music.rs): its mix, stems, page, piano roll, loudness curve
 //!
 //! Music: a `beats.json` beside the scene becomes the `m_*` constants a scene places its cuts by; a root with a `Music`
 //! has `music.wav` beside the scene as its soundtrack, the scene's own sounds mixed under it.
@@ -581,13 +581,32 @@ fn run(args: &[String]) -> Result<(), String> {
         println!("wrote {out} and {} (the track with its grid: faint lines beats, bright lines bars, orange lines sections)", picture.display());
         return Ok(());
     }
-    if let [what, out, bpm, bars, drop, drop_bars] = args
+    if let [what, dir] = args
         && what == "score"
     {
-        let num = |s: &String| s.parse::<f64>().map_err(|e| format!("{s:?}: {e}"));
-        let score = music::temp_score(num(bpm)?, num(bars)? as usize, num(drop)? as usize, num(drop_bars)? as usize, 7);
-        std::fs::write(out, harness_native_blaze::sound::wav(SR, &score)).map_err(|e| format!("{out}: {e}"))?;
-        println!("wrote {out}: the temp score, {} s (temp music: a stand-in until a track is supplied)", score.len() as f64 / f64::from(SR));
+        // The score of our own: its mix, its stems, the page, the piano roll and the loudness curve, into `dir`.
+        let dir = Path::new(dir);
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let score = music::compose();
+        let mix = score.mix();
+        let put = |name: &str, frames: &[[f32; 2]]| {
+            let path = dir.join(name);
+            std::fs::write(&path, harness_native_blaze::sound::wav(SR, frames)).map_err(|e| format!("{}: {e}", path.display()))
+        };
+        put("music-temp-score.wav", &mix)?;
+        for (name, stem) in [("stem-lead.wav", &score.lead), ("stem-harmony.wav", &score.harmony), ("stem-bass.wav", &score.bass), ("stem-drums.wav", &score.drums), ("stem-effects.wav", &score.effects)] {
+            put(name, stem)?;
+        }
+        let mut page = score.page();
+        page.push_str("\nHeard in the lead stem (written, then the pitch found, MIDI numbers; 69 is A4):\n");
+        for (w, midi) in score.heard() {
+            page.push_str(&format!("  bar {:>2} beat {:<4} written {} heard {midi:.2}\n", w.bar, w.beat, w.midi));
+        }
+        std::fs::write(dir.join("score.txt"), &page).map_err(|e| format!("{}: {e}", dir.display()))?;
+        write_png(&dir.join("piano-roll.png"), &score.roll((1320, 330)), (1320, 330))?;
+        write_png(&dir.join("loudness-over-time.png"), &music::loudness_curve(&mix, score.bpm, (1320, 240)), (1320, 240))?;
+        print!("{page}");
+        println!("wrote {}: music-temp-score.wav (temp music: our own score, a stand-in until a track is supplied), five stems, score.txt, piano-roll.png, loudness-over-time.png", dir.display());
         return Ok(());
     }
     if let [check, file, scene, name] = args
@@ -829,14 +848,14 @@ mod tests {
         assert_eq!(stage.mix, Some(Mix { lufs: -16.0, peak: -1.0 }));
         // It is cut to the grid: every hard cut within a frame of a beat or a half beat.
         let cuts = stage.cuts().unwrap_or_else(|e| panic!("{e}"));
-        assert!(cuts.lines().count() > 15, "{cuts}");
+        assert!(cuts.lines().count() == 12, "eleven shots, a line each under the heading: {cuts}");
         // It reframes: the upright preset is the same points a pixel, 540 by 960.
         let mut tall = stage.video;
         let upright = preset::named("x-portrait-1080x1920").unwrap_or_else(|e| panic!("{e}"));
         fit(&mut tall, "x-portrait-1080x1920", &upright).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!((tall.width, tall.height, tall.scale), (540.0, 960.0, 2.0));
         let (mark, _, heard) = stage.score().unwrap_or_else(|e| panic!("{e}"));
-        assert!(mark.is_some() && heard.len() > 50, "{} sounds", heard.len());
+        assert!(mark.is_some() && !heard.is_empty() && heard.len() < 20, "{} sounds: few, under the score", heard.len());
         let json = std::fs::read_to_string(dir.join("data.json")).unwrap_or_else(|e| panic!("{e}"));
         let was = data::script(&json).unwrap_or_else(|e| panic!("{e}"));
         assert!(was.contains("export const d_day_reverified_before_t = \"1,091,174\""), "{was}");

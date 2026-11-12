@@ -1,0 +1,27 @@
+// Shot 10 (bars 19-20), what is coming, tagged "soon": the hub, a comb of cells lit from the middle out (branch
+// hub-1111; not on main).
+
+@tree ChildOf
+film {
+  soon_tag : film_part.Layer {
+    Flex: {axis: Column, gap: 0, align: Center, justify: Start, wrap: false}
+    cue.CutIn enter(at: $t_hub)
+    cue.CutOut leave(at: $t_end)
+    high : ui.Node { Size: {w: {kind: Fixed, value: 1, min: 0, max: 0}, h: {kind: Percent, value: 0.12, min: 0, max: 0}} }
+    tag : film_part.Tag { Text: {s: "soon"} }
+  }
+  hub_shot { Cue: {member: "Backdrop.shot", from: 12, to: 12, at: $t_hub, dur: 0, ease: Linear} }
+  hub_at { Cue: {member: "Backdrop.at", from: $t_hub, to: $t_hub, at: $t_hub, dur: 0, ease: Linear} }
+  hub_len { Cue: {member: "Backdrop.f", from: $t_end - $t_hub, to: $t_end - $t_hub, at: $t_hub, dur: 0, ease: Linear} }
+  hub_caps : film_part.Under {
+    slot : film_part.Slot {
+      says : film_part.Caption {
+        Text: {s: "a hub, no checkout"}
+        cue.Arrive show(at: $m_b19_2, dur: 0.08)
+        cue.Pop pop(at: $m_b19_2)
+        cue.Leave hide(at: $t_end - 0.1)
+      }
+    }
+    low : film_part.Low {}
+  }
+}
