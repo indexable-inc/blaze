@@ -97,10 +97,11 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 34. **work-in-ix-vms**: Everything that runs on Linux runs on the one build VM, `blaze-vm`, through its
     one build queue; never a VM per lane, never AWS; the Mac is for what only macOS can show, one
     build at a time. Skill: `build-and-test`.
-35. **fan-out-write-only**: Lanes only write code, all in the one integration directory, and run
-    nothing: no build, no test, no VM call, no waiting shell; when the writing is done the main
-    agent builds the one tree once on the one VM, runs every check at once, and hands each failure
-    back to the lane that owns the file. Skill: `build-and-test`.
+35. **fan-out-write-only**: Lanes only write code in the one integration directory and run nothing; the
+    main agent compiles and tests a lane's crate within minutes of its report, admits pieces one
+    lane at a time onto the last green head (the whole workspace check-compiles, test targets
+    included, or the head does not move), and measures on that green head; nothing is written on top
+    of code that has not compiled. Skill: `build-and-test`.
 36. **worktree-per-lane**: Lanes write in the one integration directory, each in its own files, and
     everything is tested at once; a worktree is the exception, for two lanes that must change the
     same file or a variant tree; never `git stash`. Skill: `build-and-test`.
