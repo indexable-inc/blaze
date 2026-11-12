@@ -108,9 +108,6 @@
 "blaze_diagnostics::tests::lints::syntax::early::lexer::codepoints_in_comments_and_literals_are_denied" = { cause = "fails; its panic message was cut by the backtrace (rerun it to read it)" }
 "blaze_diagnostics::tests::lints::syntax::early::validation::a_labeled_break_of_an_unlabeled_loop_is_linted_after_the_parse_errors" = { cause = "panics at crates/blaze-diagnostics/src/tests/lints/syntax/early/validation.rs: expected Expect { error: true, line: Some(33), mentions: [] }, not reported in:" }
 
-[crates.blaze-item-hash]
-"blaze_item_hash::tests::classify::a_rename_keeps_the_signature_and_changes_the_fields" = { cause = "classify.rs:196 assert_eq of the renamed item's hash fails" }
-
 [crates.blaze-link]
 "blaze_link::layout::tests::inputs_in_any_order_give_one_order" = { cause = "u8 multiply overflow in the test, layout.rs:347" }
 "blaze_link::tests::sanitize::msan_options_are_read_only_i32s_only_when_set" = { cause = "error names __msan_keep_going before __msan_track_origins" }

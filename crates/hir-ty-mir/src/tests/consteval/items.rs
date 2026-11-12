@@ -5,10 +5,15 @@
 //! constant's key) moves for all N, is hir-ty's
 //! `body_store::konst::tests::keyed_by_its_crate_every_constant_misses`, which evaluates
 //! nothing. These evaluate, so they are here, where MIR builds.
+//!
+//! `const_eval_query` does not go through the step yet (`hir_ty::consteval::stored_constant`
+//! says the one condition), so these go through [`stored_value`], a query that does what
+//! `const_eval_query` will. Their facts cover every read of an evaluation, which the real
+//! facts do not: they hold what the step does once it can hit, not that it hits today.
 
 use std::sync::Arc;
 
-use base_db::{ContentId, Env, all_crates};
+use base_db::{ContentId, Db, Env, all_crates};
 use blaze_core::lock::Lock;
 use blaze_hash::HashMap;
 use blaze_ids::Hasher;
@@ -23,8 +28,9 @@ use std::alloc::Global;
 
 use crate::{
     body_store::{BodyFacts, Classified, Installed, Mode, Step, StepCounts, install},
-    db::{GeneralConstId, HirDatabase},
-    next_solver::{GenericArgs, SolverDefId, goal_store::FactRef},
+    consteval::{evaluate_by_mir, stored_constant},
+    db::GeneralConstId,
+    next_solver::{GenericArgs, SolverDefId, StoredAllocation, goal_store::FactRef},
     test_db::TestDB,
 };
 
@@ -161,15 +167,25 @@ fn constant(db: &TestDB, name: &str) -> ConstId {
     panic!("no constant `{name}`")
 }
 
+/// What `const_eval_query` does with the store once the constant step is on: `def`'s value
+/// through the item store, evaluated by MIR where the store has none; `None` for one that
+/// does not evaluate.
+#[blaze_query::tracked(returns(copy))]
+fn stored_value(db: &Db, def: ConstId) -> Option<StoredAllocation> {
+    stored_constant(db, def, || {
+        evaluate_by_mir(db, def.into(), GenericArgs::empty(), None).map(|it| it.store())
+    })
+    .ok()
+}
+
 /// Each constant's memory, evaluated or read from the store in `db`.
 fn values(db: &TestDB) -> Vec<Vec<u8>> {
     NAMES
         .iter()
         .map(|name| {
-            let value = db
-                .const_eval(constant(db, name), GenericArgs::empty(), None)
-                .unwrap_or_else(|error| panic!("`{name}` evaluates: {error:?}"));
-            value.memory.to_vec()
+            let value = stored_value(db, constant(db, name))
+                .unwrap_or_else(|| panic!("`{name}` does not evaluate"));
+            value.as_ref().memory.to_vec()
         })
         .collect()
 }

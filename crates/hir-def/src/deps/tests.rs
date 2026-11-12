@@ -461,35 +461,85 @@ fn keys_outside_the_lists(memory: &Memory, served: &Served, stored: &Stored) -> 
     outside
 }
 
+/// [`Memory`] that keeps each crate's def map as pages beside its image
+/// ([`ImageStore::paged`]), as a driver that turned pages on does: the store `store` writes
+/// every record kind of [`front_keys`] into, where [`Memory`] alone is given the image only.
+#[derive(Default)]
+struct Paging(Memory);
+
+impl ImageStore for Paging {
+    fn get(&self, key: &ContentId) -> Result<Option<ImageBuf>, String> {
+        self.0.get(key)
+    }
+
+    fn reads_now(&self, env: &Env, shape: &[u8]) -> Result<ContentId, String> {
+        self.0.reads_now(env, shape)
+    }
+
+    fn put(&self, key: ContentId, image: Vec<u8>) -> Result<(), String> {
+        self.0.put(key, image)
+    }
+
+    fn paged(&self) -> bool {
+        true
+    }
+}
+
+/// Whether `memory` holds, for every crate `stored` filed, each record kind of
+/// [`front_keys`]: its image, its def map pages and its item pages.
+fn holds_every_front_record(memory: &Memory, stored: &Stored) -> bool {
+    let images = memory.images.lock();
+    stored.filed.values().all(|filed| front_keys(*filed).all(|key| images.contains_key(&key)))
+}
+
 /// The invariant: every record `store` writes for a crate is under a key the lists give
-/// ([`front_keys`], [`filing_keys`]), with reads and without: what pins a crate's front end
-/// and what a pack of it carries are taken from those lists, so a record kind written and
-/// left out of them would be collected under a pinned crate and missing from its pack.
+/// ([`front_keys`], [`filing_keys`]), with reads and without, into a store that keeps pages
+/// and into one that does not: what pins a crate's front end and what a pack of it carries
+/// are taken from those lists, so a record kind written and left out of them would be
+/// collected under a pinned crate and missing from its pack. The store that keeps pages is
+/// the one given every kind of [`front_keys`] (checked: each filed crate has all of them),
+/// so no key of the list goes unwritten by the test.
 #[test]
 fn every_key_store_writes_is_a_front_key_or_a_filing_key() {
     let _turn = TURN.lock();
     VALUE.store(0, SeqCst);
-    for mut db in [fixture::db(FIXTURE).into_db(), reading_db()] {
+    let dbs: [fn() -> TestDB; 2] = [|| fixture::db(FIXTURE).into_db(), reading_db];
+    for db in dbs {
         let memory = Memory::default();
-        let crates = all(&db);
-        let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
-        let stored = store(&db, &served, &memory).unwrap();
+        let mut plain = db();
+        let crates = all(&plain);
+        let served = serve(&mut plain, &crates, BUILD, &memory, Mode::Serve).unwrap();
+        let stored = store(&plain, &served, &memory).unwrap();
         assert!(!stored.written.is_empty(), "the fixture stores no crate: the test tests nothing");
         assert_eq!(keys_outside_the_lists(&memory, &served, &stored), Vec::new());
+
+        let paging = Paging::default();
+        let mut paged = db();
+        let crates = all(&paged);
+        let served = serve(&mut paged, &crates, BUILD, &paging, Mode::Serve).unwrap();
+        let stored = store(&paged, &served, &paging).unwrap();
+        assert_eq!(stored.refused, Vec::new(), "a crate whose def map does not write as pages");
+        assert!(!stored.written.is_empty(), "the fixture stores no crate: the test tests nothing");
+        assert!(holds_every_front_record(&paging.0, &stored), "a kind of `front_keys` unwritten");
+        assert_eq!(keys_outside_the_lists(&paging.0, &served, &stored), Vec::new());
     }
 }
 
 /// The control: a record kind `store` writes that the list leaves out is found. Here the
 /// list is the real one less the def map pages' key, as a lane that added pages and forgot
-/// the list would have left it.
+/// the list would have left it. The store keeps pages ([`Paging`]): into [`Memory`] alone
+/// `store` writes none, and the shortened list left nothing out (how this control failed
+/// the first time it ran, 2026-11-12).
 #[test]
 fn the_oracle_catches_a_key_store_writes_that_the_list_leaves_out() {
     let _turn = TURN.lock();
     let mut db = fixture::db(FIXTURE).into_db();
-    let memory = Memory::default();
+    let paging = Paging::default();
+    let memory = &paging.0;
     let crates = all(&db);
-    let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
-    let stored = store(&db, &served, &memory).unwrap();
+    let served = serve(&mut db, &crates, BUILD, &paging, Mode::Serve).unwrap();
+    let stored = store(&db, &served, &paging).unwrap();
+    assert!(holds_every_front_record(memory, &stored), "premise: the pages were written");
     let mut listed: std::collections::BTreeSet<ContentId> = std::collections::BTreeSet::new();
     for filed in stored.filed.values() {
         listed.extend(front_keys(*filed).filter(|key| *key != pages_key(*filed)));
@@ -1099,11 +1149,14 @@ fn reads_read_back_and_damaged_ones_do_not_panic() {
 }
 
 /// What [`Reads::parts_for_tests`] gives: the variables, the expansions' names, each
-/// dependency's by its index, and the crates that read `CARGO_PRIMARY_PACKAGE`.
-pub(super) type ReadsParts = (Vec<Box<str>>, Vec<Box<[u8]>>, Vec<(u32, Vec<Box<[u8]>>)>, Vec<u32>);
+/// dependency's by its index, the crates that read `CARGO_PRIMARY_PACKAGE`, and the paths
+/// of the files outside the VFS.
+pub(super) type ReadsParts =
+    (Vec<Box<str>>, Vec<Box<[u8]>>, Vec<(u32, Vec<Box<[u8]>>)>, Vec<u32>, Vec<Box<[u8]>>);
 
-/// The version of the reads' encoding [`old_reads`] reads.
-const OLD_READS_VERSION: u8 = 3;
+/// The version of the reads' encoding [`old_reads`] reads: 4, which has the files outside
+/// the VFS after the crates that read `CARGO_PRIMARY_PACKAGE`.
+const OLD_READS_VERSION: u8 = 4;
 
 /// The reads' decoder as it was before `blaze_format::cursor`, hand-rolled, written for the
 /// format at [`OLD_READS_VERSION`]: its parts, or none where it refuses.
@@ -1133,8 +1186,8 @@ fn old_reads(bytes: &[u8]) -> Option<ReadsParts> {
     if take(&mut rest, 1)? != [OLD_READS_VERSION] {
         return None;
     }
-    let (mut env, mut macros, mut deps, mut primary) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut env, mut macros, mut deps, mut primary, mut files) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for _ in 0..count(&mut rest)? {
         let len = count(&mut rest)?;
         env.push(Box::<str>::from(std::str::from_utf8(take(&mut rest, len)?).ok()?));
@@ -1156,11 +1209,15 @@ fn old_reads(bytes: &[u8]) -> Option<ReadsParts> {
     for _ in 0..count(&mut rest)? {
         primary.push(u32_of(&mut rest)?);
     }
+    for _ in 0..count(&mut rest)? {
+        files.push(framed(&mut rest)?);
+    }
     let sorted = increasing(&env)
         && increasing(&macros)
         && deps.windows(2).all(|pair| pair[0].0 < pair[1].0)
-        && increasing(&primary);
-    (rest.is_empty() && sorted).then_some((env, macros, deps, primary))
+        && increasing(&primary)
+        && increasing(&files);
+    (rest.is_empty() && sorted).then_some((env, macros, deps, primary, files))
 }
 
 #[test]
@@ -1183,6 +1240,10 @@ fn reads_decode_as_the_old_decoder_did() {
         Reads::default().with_deps_for_tests(&[], &[7]),
         Reads::for_tests(&["B"], &[(b"own", ContentId([3; 32]))])
             .with_deps_for_tests(&[(1, &[b"a", b"bc"]), (4, &[b"d"])], &[1, 2]),
+        Reads::default().with_files_for_tests(&[b""]),
+        Reads::for_tests(&["C"], &[(b"own", ContentId([4; 32]))])
+            .with_deps_for_tests(&[(2, &[b"e"])], &[0])
+            .with_files_for_tests(&[b"\0f/registry/lib/a.rs", b"/usr/include/x.rs"]),
     ];
     let mut rng = blaze_ids::rng::SplitMix64::new(0x5eed_0f_4ead5);
     for reads in &samples {
@@ -1203,6 +1264,49 @@ fn reads_decode_as_the_old_decoder_did() {
             assert_eq!(new, old_reads(&input), "{input:?}");
         }
     }
+}
+
+/// The reads `reads` (which hold no file) as the previous layout, version 3, wrote them:
+/// the same parts up to the crates that read `CARGO_PRIMARY_PACKAGE`, and no list of files
+/// after them.
+fn reads_of_layout_3(reads: &Reads) -> Vec<u8> {
+    let now = reads.encode();
+    let (parts, files) = now.split_at(now.len() - 4);
+    assert_eq!(files, [0; 4], "the sample holds no file, so layout 4 ends in a count of none");
+    let mut was = parts.to_vec();
+    was[0] = 3;
+    was
+}
+
+/// Reads of the previous layout (version 3, before the files outside the VFS) are handled:
+/// refused by name where they are decoded, and a slot that holds them stops the search for
+/// the crate with an error naming the crate, the slot and that refusal; never read as reads
+/// that hold no file. (A key of this build does not find one: the keys' producer covers
+/// [`READS_DOMAIN`](super::READS_DOMAIN), which moved with the version.)
+#[test]
+fn reads_of_the_previous_layout_are_refused_by_name() {
+    let reads = Reads::for_tests(&["A"], &[(b"one", ContentId([1; 32]))])
+        .with_deps_for_tests(&[(1, &[b"a"])], &[1]);
+    let was = reads_of_layout_3(&reads);
+    assert_eq!(Reads::decode(&was), Err("reads of another version"));
+    // The control: the same bytes with this version's number are not reads either (the
+    // files' count is missing), so the version alone is not what tells them apart.
+    let mut renumbered = was.clone();
+    renumbered[0] = reads.encode()[0];
+    assert_eq!(Reads::decode(&renumbered), Err("reads shorter than their lengths"));
+
+    let db = fixture::db("//- /lib.rs crate:lib new_source_root:library\npub fn f() {}\n").into_db();
+    let lib = crate_named(&db, "lib");
+    let memory = Memory::default();
+    let key = ContentId([6; 32]);
+    let mut list = Vec::new();
+    reads::write_list(&mut list, key, &was);
+    memory.put(reads::slot(key, 0), list).unwrap();
+    let why = find_by_reads(&db, lib, key, &memory, |_| Ok(None::<ContentId>)).unwrap_err();
+    assert!(
+        why.contains("lib") && why.contains("slot 0") && why.contains("reads of another version"),
+        "{why}"
+    );
 }
 
 /// Two checkouts of the same crates at different paths, with different `OUT_DIR`s and other

@@ -194,7 +194,10 @@ fn a_crate_read_from_item_pages_answers_as_the_one_lowered() {
     assert!(flags.len() > 4, "{} distinct answers", flags.len());
 }
 
-/// The control: the same oracle over a record whose impls and traits leave `area` out.
+/// The control: the same oracle over a record whose impls and traits leave `area` out. What
+/// it says first is the count: the asks are found through the answers ([`asked`]: an assoc
+/// item's flags are asked once its impl or trait lists it), so a database whose entries lack
+/// `area` asks fewer and [`agree`] stops there, before it compares a key.
 #[test]
 fn the_oracle_catches_an_assoc_item_left_out_of_its_entry() {
     let lowered = fixture::db(FIXTURE).into_db();
@@ -203,7 +206,9 @@ fn the_oracle_catches_an_assoc_item_left_out_of_its_entry() {
     let planted = encode_with(&lowered, lib, Some("area")).unwrap();
     let read = reading(FIXTURE, def_map, Some(Counting::new(planted)));
     let said = agree(&lowered, &read).unwrap_err();
-    assert!(said.contains("the answer of key"), "{said}");
+    let counts = said.strip_suffix(" read").and_then(|it| it.split_once(" answers, "));
+    let counts = counts.and_then(|(was, is)| Some((was.parse::<usize>().ok()?, is.parse::<usize>().ok()?)));
+    assert!(counts.is_some_and(|(was, is)| is < was), "fewer answers read, by `area`'s: {said}");
 }
 
 /// Asks of `lib` what a dependent's build asks of a dependency's items once its names are
@@ -250,10 +255,22 @@ fn ask_all(db: &Db) -> usize {
     asked
 }
 
-/// The queries among `ran` that make syntax, an item tree or an expansion.
+/// The queries among `ran` that make syntax, an item tree or an expansion, by the names the
+/// run log gives them: a file's parse is `EditionedFileId::parse_`, its outline
+/// `file_outline`, its item tree `file_item_tree_query`, its ast ids `HirFileId::ast_id_map`,
+/// an expansion `MacroCallId::parse_macro_expansion` over `MacroCallId::macro_arg` (and
+/// `MacroCallId::proc_macro_expansion`), a `macro_rules!` compiled
+/// `AstId::decl_macro_expander`.
 fn made_syntax(ran: &[String]) -> Vec<&String> {
-    const MAKERS: &[&str] =
-        &["parse", "item_tree", "macro_expand", "outline", "expander", "macro_arg", "ast_id_map"];
+    const MAKERS: &[&str] = &[
+        "parse",
+        "item_tree",
+        "macro_expansion",
+        "outline",
+        "expander",
+        "macro_arg",
+        "ast_id_map",
+    ];
     ran.iter().filter(|name| MAKERS.iter().any(|it| name.contains(it))).collect()
 }
 
@@ -271,8 +288,11 @@ fn a_crate_read_from_item_pages_makes_no_syntax_tree_or_expansion() {
     assert_eq!(made_syntax(&ran), Vec::<&String>::new(), "all that ran: {ran:?}");
 }
 
-/// The control: the cause removed. The same crate read from its def-map pages alone parses
-/// and expands to answer the same asks.
+/// The control: the cause removed. The same crate read from its def-map pages alone cuts
+/// the file's outline, numbers its syntax and expands a macro call to answer the same asks:
+/// each is a query [`made_syntax`] finds, by the name the run log has it under. The file's
+/// own parse (`EditionedFileId::parse_`) is not among them in a fixture's database, which
+/// parsed every file when it was made, so it is not asked for here.
 #[test]
 fn without_item_pages_the_same_asks_parse_and_expand() {
     use crate::test_db::TestDBExt;
@@ -280,8 +300,14 @@ fn without_item_pages_the_same_asks_parse_and_expand() {
     let db = reading(FIXTURE, def_map, None);
     let ran = db.executed_in_read_order(|| _ = ask_all(&db));
     let made = made_syntax(&ran);
-    assert!(made.iter().any(|it| it.contains("parse")), "{ran:?}");
-    assert!(made.iter().any(|it| it.contains("macro_expand")), "{ran:?}");
+    for name in [
+        "file_outline",
+        "HirFileId::ast_id_map",
+        "MacroCallId::macro_arg",
+        "MacroCallId::parse_macro_expansion",
+    ] {
+        assert!(made.iter().any(|it| *it == name), "`{name}` did not run: {ran:?}");
+    }
 }
 
 /// Two databases that asked for things in another order, and so numbered their ids

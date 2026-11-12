@@ -615,8 +615,17 @@ impl Reads {
         self
     }
 
+    /// These reads with `files` as the files outside the VFS the closure read
+    /// ([`Reads::files`]), each by its ported path, given in order, their contents unknown
+    /// as a slot's are.
+    pub(super) fn with_files_for_tests(mut self, files: &[&[u8]]) -> Reads {
+        self.files = files.iter().map(|&path| (path.into(), None)).collect();
+        self
+    }
+
     /// Every part of the reads, their values left out: the variables, the expansions' names,
-    /// each dependency's by its index ([`Reads::deps`]), and [`Reads::primary`].
+    /// each dependency's by its index ([`Reads::deps`]), [`Reads::primary`], and the paths of
+    /// [`Reads::files`].
     pub(super) fn parts_for_tests(&self) -> super::tests::ReadsParts {
         let shapes = |shapes: &[(Arc<[u8]>, Option<ContentId>)]| -> Vec<Box<[u8]>> {
             shapes.iter().map(|(shape, _)| Box::<[u8]>::from(&**shape)).collect()
@@ -626,6 +635,7 @@ impl Reads {
             shapes(&self.macros),
             self.deps.iter().map(|(at, deps)| (*at, shapes(deps))).collect(),
             self.primary.clone(),
+            self.files.iter().map(|(path, _)| path.clone()).collect(), // clone: a test's copy
         )
     }
 }

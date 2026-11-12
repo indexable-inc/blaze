@@ -173,14 +173,20 @@ pub(crate) struct Frame {
     pub(crate) head: u32,
     /// A query on this stack asked for this one: it heads a cycle.
     pub(crate) reentered: bool,
-    /// An inner head of its cycle did not converge this round (on the outermost head).
+    /// This round is not its cycle's last: a row of the cycle (its own, or one that ended a
+    /// member above it) was read on the stack and ended the round with another value. A row
+    /// says it on its own frame as it ends a member (`function::participate`) and hands it to
+    /// its head with the rest it carries (`function::hand_over`), each head in turn, so it
+    /// reaches the outermost head, which decides on it (`function::head_round`).
     pub(crate) unconverged: bool,
     pub(crate) untracked: bool,
     /// The run was answered from a store by a key ([`super::report_stored_read`]).
     pub(crate) stored: bool,
     /// Read a provisional row or was told [`super::unshareable_reads`]: its captures give none.
     pub(crate) unshareable: bool,
-    /// Its fixpoint round, from 1.
+    /// Its fixpoint round, from 1: counted up by the outermost head of a cycle
+    /// (`function::head_round`); the run of a head kept from that cycle's last round starts at
+    /// its keeper's (`function::run`), so the round is the cycle's on every row it kept.
     pub(crate) round: u32,
     /// Where its cycle's members start on the member list.
     pub(crate) members_start: u32,

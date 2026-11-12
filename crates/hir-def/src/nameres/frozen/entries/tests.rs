@@ -72,15 +72,26 @@ fn expanders(db: &Db, ids: &[u32]) -> Vec<String> {
         .collect()
 }
 
-fn parsed(ran: &[String]) -> Vec<&String> {
-    // alloc: a test's list
-    ran.iter().filter(|it| it.contains("parse") || it.contains("outline")).collect()
+/// How many of the queries `ran` are an expander asked for (`AstId::decl_macro_expander`).
+/// A fixture's database compiled every expander when it was made (name resolution asks each
+/// `macro_rules!` for its rule styles), so one runs here only after [`set`] gave the database
+/// a store: that the asks ran at all is part of what a test shows.
+fn expanders_run(ran: &[String]) -> usize {
+    ran.iter().filter(|it| it.contains("decl_macro_expander")).count()
 }
 
-/// The count: a database whose macro definitions are kept makes each expander with no parse of
-/// the defining file, and they are the expanders a database makes from the source.
+/// The count: a database whose macro definitions are kept makes each expander from its kept
+/// entry (the file's index and each definition's tokens are found, none is made), and they
+/// are the expanders a database makes from the source.
+///
+/// Not shown here: the parse this saves. A found index returns before the file is parsed
+/// (`hir_expand::declarative::stored::index::of`), but a fixture's database has parsed every
+/// file by the time a test asks (its own name resolution did), so no query of a parse runs
+/// with or without entries, and a check of the queries' names for one passed whatever the
+/// code did (the first form of this test and of its control, 2026-11-12). Showing it needs a
+/// database whose crate was never resolved from source: the driver's, served from records.
 #[test]
-fn a_kept_macro_definition_is_expanded_with_no_parse_of_its_file() {
+fn a_kept_macro_definition_gives_its_expander_with_nothing_made() {
     let text = text(THIRD);
     let from_source = fixture::db(&text).into_db();
     let ids = macro_ids(&from_source);
@@ -101,20 +112,25 @@ fn a_kept_macro_definition_is_expanded_with_no_parse_of_its_file() {
     let mut got = Vec::new();
     let ran = reading.executed_in_read_order(|| got = expanders(&reading, &ids));
     assert_eq!(got, want);
-    assert_eq!(parsed(&ran), Vec::<&String>::new(), "all that ran: {ran:?}");
+    assert_eq!(expanders_run(&ran), MACROS, "each expander is asked again: {ran:?}");
     let read = store.take();
     assert_eq!(read, Counts { hits: 1 + MACROS as u64, misses: 0, made: 0, again: 0 });
 }
 
-/// The control: the cause removed. The same asks of a database with no entry store parse the
-/// defining file.
+/// The control: the cause removed. The same asks of a database whose store keeps nothing yet
+/// run the same queries, find no entry and make every one: the file's index and each
+/// definition's tokens, from the file's syntax.
 #[test]
-fn without_kept_definitions_the_same_asks_parse_the_file() {
+fn without_kept_definitions_the_same_asks_make_every_entry() {
     let text = text(THIRD);
     let ids = macro_ids(&fixture::db(&text).into_db());
-    let db = fixture::db(&text).into_db();
+    let store = Memory::new();
+    let mut db = fixture::db(&text).into_db();
+    set(&mut db, store.clone());
     let ran = db.executed_in_read_order(|| _ = expanders(&db, &ids));
-    assert!(!parsed(&ran).is_empty(), "{ran:?}");
+    assert_eq!(expanders_run(&ran), MACROS, "each expander is asked again: {ran:?}");
+    let counts = store.take();
+    assert_eq!((counts.made, counts.hits, counts.again), (1 + MACROS as u64, 0, 0), "{counts:?}");
 }
 
 /// Rule 65 by counts: one macro of N edited. The file's index misses (the file's content is

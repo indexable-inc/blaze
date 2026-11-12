@@ -366,16 +366,27 @@ fn main_text() -> &'static str {
     &FIXTURE[from..to]
 }
 
-/// Edits `main.rs` alike in a database that resolves `lib` from source and in one that
-/// reads it from `pages`, `edits` times as `draw` picks (an index into [`EDITS`]), and
-/// holds the two to [`agree`] on `lib` and `main` after each edit: the first disagreement.
+/// [`FIXTURE`] with `lib` in a source root of its own, as a dependency's package is: a write
+/// of a file of `main` then moves no file of `lib`'s source root, which `lib`'s key covers
+/// whole and whose every crate a write of one of its files withdraws
+/// (`deps::serve::withdraw_moved`).
+fn apart() -> String {
+    let lib = "//- /lib.rs crate:lib";
+    assert_eq!(FIXTURE.matches(lib).count(), 1, "`lib.rs` is declared once");
+    FIXTURE.replace(lib, "//- /lib.rs crate:lib new_source_root:local")
+}
+
+/// Edits `main.rs` alike in a database of the fixture `text` that resolves `lib` from source and in
+/// one that reads it from `pages`, `edits` times as `draw` picks (an index into [`EDITS`]),
+/// and holds the two to [`agree`] on `lib` and `main` after each edit: the first disagreement.
 fn agree_under_edits(
+    text: &str,
     pages: Vec<u8>,
     edits: usize,
     mut draw: impl FnMut() -> usize,
 ) -> Result<(), String> {
-    let mut resolved = fixture::db(FIXTURE).into_db();
-    let mut read = paged(FIXTURE, &[("lib", Counting::new(pages))]);
+    let mut resolved = fixture::db(text).into_db();
+    let mut read = paged(text, &[("lib", Counting::new(pages))]);
     agree(&resolved, &read, &["lib", "main"])?;
     let mut text = main_text().to_owned();
     for step in 0..edits {
@@ -395,28 +406,44 @@ fn agree_under_edits(
 
 /// The refinement: a database that reads `lib` from its pages answers every def map query
 /// of `lib` and of `main`, which names it, as one that resolved `lib` from source, after
-/// each of a run of random edits of `main`; and `lib` stays read from its pages throughout.
+/// each of a run of random edits of `main`; and `lib`, a crate of a source root of its own,
+/// stays read from its pages throughout.
 #[hegel::test]
 fn a_crate_read_from_pages_answers_as_the_one_resolved_under_edits_above_it(tc: hegel::TestCase) {
     use hegel::generators as gs;
-    let pages = written(FIXTURE, &["lib"]).remove(0).1;
+    let apart = apart();
+    let pages = written(&apart, &["lib"]).remove(0).1;
     let edits: usize = tc.draw(gs::integers().max_value(6));
-    let said = agree_under_edits(pages, edits, || tc.draw(gs::integers().max_value(EDITS.len() - 1)));
+    let said = agree_under_edits(&apart, pages, edits, || {
+        tc.draw(gs::integers().max_value(EDITS.len() - 1))
+    });
     assert_eq!(said, Ok(()));
+}
+
+/// The control: the cause removed. With `lib` in `main`'s source root, as [`FIXTURE`] has it,
+/// the first edit of `main.rs` is a write of a file of the source root `lib`'s key covers, so
+/// `lib`'s pages are withdrawn with it: the two crates agree before the edit and the run
+/// stops at step 0.
+#[test]
+fn a_crate_of_the_edited_source_root_loses_its_pages() {
+    let pages = written(FIXTURE, &["lib"]).remove(0).1;
+    let said = agree_under_edits(FIXTURE, pages, 1, || 0);
+    assert_eq!(said, Err("step 0: an edit of `main` took `lib`'s pages away".to_owned()));
 }
 
 /// The control: the same run over pages whose name tables leave `Shown` out is caught, at
 /// the first comparison or at an edit that names it.
 #[test]
 fn the_oracle_catches_a_name_left_out_under_edits() {
-    let resolved = fixture::db(FIXTURE).into_db();
+    let apart = apart();
+    let resolved = fixture::db(&apart).into_db();
     let lib = crate_named(&resolved, "lib");
     let pair = crate_local_def_map(&resolved, lib);
     let planted =
         encode_maps(&resolved, lib, pair.def_map(&resolved), pair.local(&resolved), Some("Shown"))
             .unwrap();
     let mut at = 0;
-    let said = agree_under_edits(planted, EDITS.len(), || {
+    let said = agree_under_edits(&apart, planted, EDITS.len(), || {
         at += 1;
         at - 1
     });

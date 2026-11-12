@@ -1,0 +1,14 @@
+{
+ "id": "fix-bodies-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane fix-bodies",
+ "where": "crates/blaze-item-hash/src/tests/classify.rs, crates/blaze-items/src/form.rs (fields, adt, function), harness/known-failures.toml",
+ "what": "two blaze-item-hash tests stated what lane items' `Signature` fact holds and had gone false when blaze-items changed on purpose: a type's signature now holds its field and variant names (`for const` reads them), and an impl method's types for the trait's `impl Trait`s moved to `Fact::RpititTys`. One had sat in known-failures.toml with the cause \"assert_eq of the renamed item's hash fails\", which restates the assert; the other was handed over as a possible missed invalidation.",
+ "cost": "both were first read as regressions of today's store changes; the second was treated as a possible stale answer until the form writer and `Fact::RpititTys` were read",
+ "cause": "the statement of what a signature holds lives in blaze-items' form writer, and a second crate's tests repeated it for particular items; a change in the first does not run or name the second. The known-failures cause was recorded from the first line of the panic, not from a reason",
+ "class": "one statement in two crates (rule 30), and a known failure kept without its cause (rule 61)",
+ "prevention": "a change to what `form.rs` writes for an item runs `cargo test -p blaze-item-hash --lib` in the same batch (it is the fact's other reader); `harness/failures.py` refuses a cause that is only the assert's text or location",
+ "workaround": "none",
+ "fix": "the rename test now states it of a trait's items (by place: kept) and of a struct's field (named: changed), and is out of known-failures; the RPITIT pair asks `RpititTys` (changes) and `Signature` (stays)",
+ "state": "open"
+}

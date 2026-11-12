@@ -87,7 +87,7 @@ const KEYED_NAME: &str = "\0";
 /// The version of what this module writes, for the key frozen bytes are stored under: it
 /// changes with every change to the bytes [`Enc`] writes, the list of lang items included, so
 /// bytes of another version are never read.
-pub const ENCODING: &str = "blaze frozen def map 22";
+pub const ENCODING: &str = "blaze frozen def map 23";
 
 /// What name resolution does with the frozen bytes of a crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -524,6 +524,18 @@ const OUT: &str = "\0OUT_DIR";
 /// module's items. No path holds a NUL.
 const ROOT: &str = "\0ROOT";
 
+/// What starts the name of a file outside the VFS (`base_db::Files::included_source`: the
+/// file an `include!` or a module declaration read from disk, a file of a source root of its
+/// own), after the index of the first crate of the closure that read it: then its path as the
+/// database's port writes it (`base_db::Files::ported`), so one under a directory the port
+/// names is the same bytes in every checkout and home, as a literal's path is
+/// ([`Enc::unplaced`]). Read back ([`Dec::files`]), the file is made as that crate's read
+/// makes it, from the path this database has it at. The crate's image key cannot cover such
+/// a file; its image is filed by the file's content (`deps::reads::Reads`' files). No path
+/// holds a NUL, and no mark of the port is this text (a mark is a NUL and a lower-case
+/// letter).
+const INCLUDED: &str = "\0INCLUDED";
+
 fn out_dir(db: &Db, krate: Crate) -> Option<String> {
     let out = krate.env(db).get("OUT_DIR")?;
     let out = out.trim_end_matches('/');
@@ -709,8 +721,17 @@ impl<'a> Enc<'a> {
                 let content = self.db.file_content(file);
                 self.out.extend_from_slice(&content.0);
             }
-            if !path.starts_with(OUT) && path != ROOT {
-                let full = joined(&self.dirs[&owner], &path);
+            // Where the file is, when its name is not from an `OUT_DIR`: a file outside the
+            // VFS at its own path, any other from its owner's directory.
+            let full = match self.db.files().included_source_path(file) {
+                // alloc: encoding, once per file outside the VFS per image write
+                Some(outside) => Some(outside.to_string()),
+                None if !path.starts_with(OUT) && path != ROOT => {
+                    Some(joined(&self.dirs[&owner], &path))
+                }
+                None => None,
+            };
+            if let Some(full) = full {
                 if let Some(place) = places.iter().find(|it| full.starts_with(it.as_str())) {
                     // alloc: error path
                     return Err(format!(
@@ -863,6 +884,27 @@ impl Enc<'_> {
         let source_root = db.file_source_root(file).source_root_id(db);
         let path = db.source_root(source_root).source_root(db).path_for_file(&file).cloned();
         let path = on_disk(&path.ok_or("a file with no path")?)?;
+        if let Some(outside) = db.files().included_source_path(file) {
+            // A file outside the VFS ([`INCLUDED`]): of the first crate of the closure that
+            // read it, by its ported path.
+            let read_by = |&krate: &Crate| {
+                db.files().included_by(db, krate).iter().any(|it| it.0.as_path() == outside)
+            };
+            let owner = self.closure.iter().position(read_by).ok_or_else(|| {
+                // alloc: error path
+                format!("a file outside the loaded files that no crate of the closure read: {path}")
+            })?;
+            let ported = db.files().ported(path.as_bytes());
+            let ported = std::str::from_utf8(&ported).map_err(|_| {
+                // alloc: error path
+                format!("a path that is not UTF-8 once the port marked its directory: {path}")
+            })?;
+            // alloc: encoding, once per file outside the VFS per image write
+            let name = (owner as u32, format!("{INCLUDED}{ported}"));
+            // clone: encoding, once per crate per image write (not on a build's path)
+            self.file_names.insert(file, name.clone());
+            return Ok(name);
+        }
         if self.owners.is_empty() {
             for (index, &krate) in self.closure.iter().enumerate() {
                 let (dir, _, root) = root_dir(db, krate)?;
@@ -2542,6 +2584,12 @@ impl Dec<'_> {
                 self.files.to_mut().push(root);
                 continue;
             }
+            if let Some(ported) = path.strip_prefix(INCLUDED) {
+                let found = self.included(krate, ported)?;
+                self.files.to_mut().push(found);
+                self.checked(krate, found, ported, content)?;
+                continue;
+            }
             if !self.paths.contains_key(&owner) {
                 let krate = *self.closure.get(owner as usize).ok_or("a file's crate")?;
                 self.paths.insert(owner, root_dir(self.db, krate)?);
@@ -2569,6 +2617,39 @@ impl Dec<'_> {
             self.files.to_mut().push(found);
         }
         not_loaded.map_or(Ok(()), Err)
+    }
+
+    /// The file outside the VFS that `krate` read at the path written `ported`
+    /// ([`INCLUDED`]): made here as `krate`'s own read of it makes it
+    /// (`base_db::Db::included_source`, which notes `krate` as having read it), from the path
+    /// this database's port has it at. A mark left in the path (no port told, or a directory
+    /// this database has none of), a crate whose root has no path on disk and a file ID a
+    /// file of the view has are each an error naming the path.
+    fn included(&self, krate: Crate, ported: &str) -> R<FileId> {
+        let db = self.db;
+        let real = db.files().placed(ported.as_bytes())?;
+        let real = std::str::from_utf8(&real)
+            .map_err(|_| "a file's path that is not UTF-8 once its directory is put back")?;
+        if real.contains('\0') {
+            // alloc: error path
+            return Err(format!(
+                "a file outside the loaded files with the mark of a directory this database was told none of (`base_db::Files::set_port`): {ported:?}"
+            ));
+        }
+        let anchor = krate.data(db).root_file_id;
+        match db.included_source(krate, base_db::AnchoredPath { anchor, path: real }) {
+            Some((_, Ok(file))) => Ok(file),
+            // alloc: error path
+            Some((_, Err(taken))) => Err(format!(
+                "{real}, a file outside the loaded files that {} read, would be {taken:?}, which a loaded file is",
+                krate.named(db)
+            )),
+            // alloc: error path
+            None => Err(format!(
+                "{real}, a file outside the loaded files, is read by {}, whose root has no path on disk",
+                krate.named(db)
+            )),
+        }
     }
 
     /// `file`, of `krate`, as named `name`, has the content ID the image was made from.
@@ -4154,26 +4235,36 @@ pub mod inside { pub fn f() {} }
     /// A registry crate as a daemon has it: fetched below the home's sources, its build
     /// script's file below the home's default build directory (`<home>/build/<name>-<id>`),
     /// and a macro call whose argument is a path below its own sources, as
-    /// `env!("CARGO_MANIFEST_DIR")` leaves one. `LITERAL` is that argument.
+    /// `env!("CARGO_MANIFEST_DIR")` leaves one. Its source text names no home, as a fetched
+    /// crate's does not: the home is in its files' paths and its environment alone, so each
+    /// file has one content under every home. [`ASSETS`] is the path the call's argument
+    /// becomes: a literal of the image (an eager call's argument is kept expanded).
     const FETCHED: &str = r#"
 //- /main.rs crate:main deps:lib
 pub use lib::inside::f;
-//- /homeA/sources/registry/lib/src/lib.rs crate:lib env:OUT_DIR=/homeA/build/ws-1/debug/build/lib-1/out
+//- /homeA/sources/registry/lib/src/lib.rs crate:lib env:OUT_DIR=/homeA/build/ws-1/debug/build/lib-1/out,CARGO_MANIFEST_DIR=/homeA/sources/registry/lib
 #[rustc_builtin_macro]
 macro_rules! include { () => {} }
 #[rustc_builtin_macro]
 macro_rules! concat { () => {} }
 #[rustc_builtin_macro]
 macro_rules! env { () => {} }
-macro_rules! at { ($path:literal) => { pub fn at() {} } }
-at!("LITERAL");
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/assets.rs"));
 include!(concat!(env!("OUT_DIR"), "/made.rs"));
+//- /homeA/sources/registry/lib/src/assets.rs
+pub fn at() {}
 //- /homeA/build/ws-1/debug/build/lib-1/out/made.rs
 pub mod inside { pub fn f() {} }
 "#;
 
-    fn fetched(home: &str, literal: &str, port: Option<&'static str>) -> TestDB {
-        let text = FETCHED.replace("LITERAL", literal).replace("homeA", home);
+    /// The literal [`FETCHED`]'s `lib` holds under home A, and what is after the home's
+    /// sources directory in it.
+    const ASSETS: &str = "/homeA/sources/registry/lib/src/assets.rs";
+    const ASSETS_BELOW: &str = "/registry/lib/src/assets.rs";
+
+    /// [`FETCHED`] under `home`, its database told the port of the one directory `port`.
+    fn fetched(home: &str, port: Option<&'static str>) -> TestDB {
+        let text = FETCHED.replace("homeA", home);
         let db = fixture::db(&text).into_db();
         if let Some(sources) = port {
             assert!(db.files().set_port(std::sync::Arc::new(Sources(sources))));
@@ -4186,15 +4277,17 @@ pub mod inside { pub fn f() {} }
     /// directory, so the crate answers as the one resolved from source there.
     #[test]
     fn a_crate_fetched_under_one_home_is_the_same_bytes_under_another() {
-        const LITERAL: &str = "/homeA/sources/registry/lib/assets";
-        let a = fetched("homeA", LITERAL, Some("/homeA/sources"));
-        let b = fetched("homeB", LITERAL, Some("/homeB/sources"));
+        let a = fetched("homeA", Some("/homeA/sources"));
+        let b = fetched("homeB", Some("/homeB/sources"));
         // It encodes: its sources are below the home, as its build directory is, and only
         // the build directory is a place of one checkout.
         let bytes: Vec<_> = ["lib", "main"]
             .into_iter()
             .map(|name| (name, encode(&a, crate_named(&a, name)).unwrap()))
             .collect();
+        // The literal is in `lib`'s image, its home's directory as the port's mark.
+        let marked = [b"\0f".as_slice(), ASSETS_BELOW.as_bytes()].concat();
+        assert!(holds(&bytes[0].1, &marked), "`lib`'s image holds the call's argument, marked");
         for (name, written) in &bytes {
             assert!(!holds(written, b"homeA"), "{name}: the bytes name the home");
             let krate = crate_named(&b, name);
@@ -4202,7 +4295,7 @@ pub mod inside { pub fn f() {} }
             assert_eq!(unreadable(&b, krate, written), None, "{name}");
         }
         // Read under the other home, it is the crate resolved there, its literal that home's.
-        let mut served = fetched("homeB", LITERAL, Some("/homeB/sources"));
+        let mut served = fetched("homeB", Some("/homeB/sources"));
         let maps = (bytes.iter())
             .map(|(name, bytes)| {
                 let frozen = Frozen { bytes: bytes.as_slice().into(), mode: Mode::Serve };
@@ -4225,17 +4318,17 @@ pub mod inside { pub fn f() {} }
     /// (and a key that named no home would give one home's literal to the other).
     #[test]
     fn the_control_a_path_kept_absolute_is_other_bytes_under_another_home() {
-        const LITERAL: &str = "/homeA/sources/registry/lib/assets";
-        let a = fetched("homeA", LITERAL, None);
-        let b = fetched("homeB", LITERAL, None);
+        let a = fetched("homeA", None);
+        let b = fetched("homeB", None);
         let of = |db: &TestDB| encode(db, crate_named(db, "lib")).unwrap();
-        assert!(holds(&of(&a), b"/homeA/sources/registry/lib/assets"));
+        assert!(holds(&of(&a), ASSETS.as_bytes()));
+        assert!(holds(&of(&b), ASSETS.replace("homeA", "homeB").as_bytes()));
         assert_ne!(of(&a), of(&b));
         // Bytes written with a port are refused by a database told none, by name: the mark
         // is not read as text.
-        let ported = fetched("homeA", LITERAL, Some("/homeA/sources"));
+        let ported = fetched("homeA", Some("/homeA/sources"));
         let bytes = encode(&ported, crate_named(&ported, "lib")).unwrap();
-        let mut served = fetched("homeA", LITERAL, None);
+        let mut served = fetched("homeA", None);
         let lib = crate_named(&served, "lib");
         let frozen = Frozen { bytes: bytes.as_slice().into(), mode: Mode::Serve };
         set(&mut served, [(lib, frozen)].into_iter().collect());
@@ -4245,18 +4338,77 @@ pub mod inside { pub fn f() {} }
         assert!(read.is_err(), "a mark with no port told is no literal");
     }
 
-    /// A directory of the port the port does not mark (here: after a path byte) is still
-    /// found in the bytes, and the crate is refused naming the directory, never written
-    /// with one home's path under a key that names no home.
+    /// A directory of the port the port does not mark (here: one that is not where the
+    /// literal starts, `/sources/registry` after `/homeA`) is still found in the bytes, and
+    /// the crate is refused naming the directory, never written with one home's path under a
+    /// key that names no home. No file's name holds it (each is named from its crate's root
+    /// or its `OUT_DIR`), so the literal is what is refused.
     #[test]
     fn a_literal_that_still_holds_a_directory_is_refused_by_its_name() {
-        let a = fetched("homeA", "-I/homeA/sources/registry/lib/include", Some("/homeA/sources"));
+        let a = fetched("homeA", Some("/sources/registry"));
         let why = encode(&a, crate_named(&a, "lib")).unwrap_err();
         assert!(why.contains("fetched sources directory"), "{why}");
         // A path under no directory of the port is no place of this build: kept as it is.
-        let free = fetched("homeA", "/usr/include/x.h", Some("/homeA/sources"));
+        let free = fetched("homeA", Some("/elsewhere"));
         let bytes = encode(&free, crate_named(&free, "lib")).unwrap();
-        assert!(holds(&bytes, b"/usr/include/x.h"));
+        assert!(holds(&bytes, ASSETS.as_bytes()));
+    }
+
+    /// A fetched crate under `<tmp>/<home>/sources` that includes `../outside.rs`, a file on
+    /// disk beside its `src` that no source root has, written here as `outside`; its database
+    /// told the port of that home's sources when `port`. The database reads the file as it
+    /// resolves the crate, when it is made, and not again.
+    fn including_outside(tmp: &std::path::Path, home: &str, port: bool, outside: &str) -> TestDB {
+        let sources = tmp.join(home).join("sources");
+        let dir = sources.join("registry").join("lib");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("outside.rs"), outside).unwrap();
+        // alloc: a test's directory name, kept for the port
+        let sources: &'static str =
+            String::leak(sources.to_str().expect("a UTF-8 temporary directory").to_owned());
+        let text = format!(
+            "//- {sources}/registry/lib/src/lib.rs crate:lib\n\
+             #[rustc_builtin_macro]\nmacro_rules! include {{ () => {{}} }}\n\
+             include!(\"../outside.rs\");\n"
+        );
+        let db = fixture::db(&text).into_db();
+        if port {
+            assert!(db.files().set_port(std::sync::Arc::new(Sources(sources))));
+        }
+        db
+    }
+
+    /// The invariant: a file outside the VFS that a fetched crate includes is named by its
+    /// path as the port writes it, so the crate's bytes are the same under another home, and
+    /// a database of that home that has not resolved the crate finds the file at its own
+    /// path, with the content the bytes were made from.
+    ///
+    /// The control: told no port, each home writes its own path, so the bytes differ.
+    #[test]
+    fn a_file_outside_the_vfs_is_named_by_its_ported_path() {
+        let tmp = std::env::temp_dir().join(format!("blaze-frozen-outside-{}", std::process::id()));
+        let lib = |db: &TestDB| crate_named(db, "lib");
+        const TEXT: &str = "pub fn out() {}\n";
+        let a = including_outside(&tmp, "homeA", true, TEXT);
+        let b = including_outside(&tmp, "homeB", true, TEXT);
+        let bytes = encode(&a, lib(&a)).unwrap();
+        assert!(holds(&bytes, b"\0INCLUDED\0f/registry/lib/outside.rs"), "named by the port's mark");
+        assert!(!holds(&bytes, b"homeA"), "the bytes name the home");
+        assert_eq!(encode(&b, lib(&b)).as_ref(), Ok(&bytes));
+        let fresh = including_outside(&tmp, "homeB", true, TEXT);
+        assert_eq!(unreadable(&fresh, lib(&fresh), &bytes), None);
+        // A database of home B that read the file with another text refuses the bytes
+        // naming the file: its content is not the one they were made from.
+        let edited = including_outside(&tmp, "homeB", true, "pub fn other() {}\n");
+        let why = unreadable(&edited, lib(&edited), &bytes).expect("another content");
+        assert!(why.contains("outside.rs") && why.contains("has content"), "{why}");
+
+        let a = including_outside(&tmp, "homeA", false, TEXT);
+        let b = including_outside(&tmp, "homeB", false, TEXT);
+        let plain = encode(&a, lib(&a)).unwrap();
+        assert!(holds(&plain, b"homeA/sources/registry/lib/outside.rs"));
+        assert_ne!(encode(&b, lib(&b)).unwrap(), plain);
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]

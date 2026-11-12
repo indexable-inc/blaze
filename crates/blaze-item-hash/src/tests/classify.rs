@@ -12,7 +12,7 @@ use blaze_alloc_count::assert_at_most;
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher};
-use blaze_items::{Fact, ItemId, auto_traits, const_value, implements, key, method};
+use blaze_items::{Fact, ItemId, auto_traits, const_value, implements, key, method, rpitit_tys};
 use hir_def::{
     AdtId, DefWithBodyId, HasModule, ImplId, ModuleDefId,
     deps::{ImageBuf, ImageStore},
@@ -98,9 +98,10 @@ fn items_fact(fact: Fact) -> FactRef {
     let (subject, object) = match fact {
         Fact::Method { self_ty, name } => (self_ty.0, FactObject::Id(name.0)),
         Fact::Implements { trait_, self_ty } => (trait_.0, FactObject::Id(self_ty.0)),
-        Fact::Signature(it) | Fact::ConstValue(it) | Fact::AutoTraits(it) => {
-            (it.0, FactObject::None)
-        }
+        Fact::Signature(it)
+        | Fact::ConstValue(it)
+        | Fact::AutoTraits(it)
+        | Fact::RpititTys(it) => (it.0, FactObject::None),
         other => panic!("no test builds a {other:?}"),
     };
     FactRef { kind: fact.kind(), subject, object }
@@ -203,15 +204,41 @@ fn fields_changes_with_a_member_name_and_only_then() {
     ]);
 }
 
-/// Why `Fields` exists: lane items' interface hash names members by place, so it stays when a
-/// member is renamed.
+/// Why `Fields` exists: lane items' signature hash names a trait's and an impl's items by
+/// place (`blaze_items::form`'s `trait_`), so it stays when one is renamed, and a lookup by
+/// name reads the name. A type's fields and variants that hash names itself (`for const` over
+/// them reads `Field::NAME` and `Variant::NAME`: `form`'s `fields`), so a renamed field changes
+/// the type's signature and its `Fields`, which is over that signature.
 #[test]
-fn a_rename_keeps_the_signature_and_changes_the_fields() {
+fn a_renamed_trait_item_keeps_the_signature_and_changes_the_fields() {
+    let signature =
+        |db: &Db, name: &str| items_fact(Fact::Signature(key::item_key(db, named(db, name))));
+    let value = |db: &Db, fact: FactRef| {
+        let value = values::value(db, local_crate(db), fact);
+        assert!(value.is_some(), "{fact:?} has no value");
+        value
+    };
+
+    // alloc: test fixtures
+    let (before, after) = (
+        db_of(&format!("{PRELUDE}pub trait T {{ fn m(&self); }} impl T for u8 {{ fn m(&self) {{}} }}")),
+        db_of(&format!("{PRELUDE}pub trait T {{ fn n(&self); }} impl T for u8 {{ fn n(&self) {{}} }}")),
+    );
+    assert_eq!(
+        value(&before, signature(&before, "T")),
+        value(&after, signature(&after, "T")),
+        "a trait's signature names its items by place"
+    );
+    let fields = fields_of("T");
+    assert_ne!(value(&before, fields(&before)), value(&after, fields(&after)));
+
     let (before, after) =
         (db_of("pub struct S { pub a: u32 }"), db_of("pub struct S { pub b: u32 }"));
-    let signature = |db: &Db| items_fact(Fact::Signature(key::item_key(db, named(db, "S"))));
-    let value = |db: &Db, fact: FactRef| values::value(db, local_crate(db), fact);
-    assert_eq!(value(&before, signature(&before)), value(&after, signature(&after)));
+    assert_ne!(
+        value(&before, signature(&before, "S")),
+        value(&after, signature(&after, "S")),
+        "a type's signature names its fields"
+    );
     let fields = fields_of("S");
     assert_ne!(value(&before, fields(&before)), value(&after, fields(&after)));
 }
@@ -276,6 +303,16 @@ fn crate_root_changes_with_the_root_and_not_with_a_body() {
 }
 
 /// Lane items' kinds, read through [`values::value`].
+/// An impl method whose type for the trait method's nested `impl Sized` is `<I as It>::Item`,
+/// which the impl of `It` for `I` gives: `u8` here,
+const NESTED_RPITIT_U8: &str = "pub trait It { type Item; } pub struct I; impl It for I { type Item = u8; }\n\
+     pub trait T { fn f(&self) -> impl It<Item = impl Sized>; }\n\
+     pub struct S; impl T for S { fn f(&self) -> I { I } }";
+/// and `u16` here, with nothing else changed.
+const NESTED_RPITIT_U16: &str = "pub trait It { type Item; } pub struct I; impl It for I { type Item = u16; }\n\
+     pub trait T { fn f(&self) -> impl It<Item = impl Sized>; }\n\
+     pub struct S; impl T for S { fn f(&self) -> I { I } }";
+
 #[test]
 fn items_facts_change_through_value() {
     check(&[
@@ -341,16 +378,23 @@ fn items_facts_change_through_value() {
             of: |db| items_fact(auto_traits(db, named(db, "f"), 0)),
         },
         // The impl method's type for the nested `impl Sized` is `<I as It>::Item`, which another
-        // impl gives: nothing its signature names changes, but the type does.
+        // impl gives: nothing its signature names changes, but the type does. The types are
+        // their own fact (`Fact::RpititTys`, what a read of `impl_rpitit_tys` stands for), so
+        // that fact changes,
         Pair {
             what: "the type an impl method gives a nested `impl Trait` changed by another impl",
-            before: "pub trait It { type Item; } pub struct I; impl It for I { type Item = u8; }\n\
-                     pub trait T { fn f(&self) -> impl It<Item = impl Sized>; }\n\
-                     pub struct S; impl T for S { fn f(&self) -> I { I } }",
-            after: "pub trait It { type Item; } pub struct I; impl It for I { type Item = u16; }\n\
-                    pub trait T { fn f(&self) -> impl It<Item = impl Sized>; }\n\
-                    pub struct S; impl T for S { fn f(&self) -> I { I } }",
+            before: NESTED_RPITIT_U8,
+            after: NESTED_RPITIT_U16,
             changes: true,
+            of: |db| items_fact(rpitit_tys(db, impl_method(db, "f"))),
+        },
+        // and the method's signature, which holds none of them (it is read while they are
+        // found), does not.
+        Pair {
+            what: "the same change, asked of the impl method's signature",
+            before: NESTED_RPITIT_U8,
+            after: NESTED_RPITIT_U16,
+            changes: false,
             of: |db| {
                 items_fact(Fact::Signature(key::item_key(
                     db,

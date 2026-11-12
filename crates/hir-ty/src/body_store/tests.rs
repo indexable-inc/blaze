@@ -178,7 +178,10 @@ impl std::ops::Deref for Defs {
 
 /// Lane item-hash's part, for tests, one per database: a body's identity is its key and its HIR
 /// printed (no ids, no spans); every read of an impl table is [`IMPLS`], `refuse` is refused, and
-/// every other read is covered.
+/// every other read is covered. A record's own body is [`OWN`], as [`BodyFacts::def_key`] says
+/// ("self"); any other item is the hash of its portable form, whose header holds the content of
+/// each file it names (`Enc::finish`), so it is found again only by a database whose copy of
+/// the item's file is the same text.
 pub(super) struct TestFacts {
     defs: Defs,
     main: Crate,
@@ -204,6 +207,19 @@ fn is_impl_table(name: &str) -> bool {
         || name.contains("impls")
         || name.contains("value_item")
         || name.contains("lookup_impl_method")
+}
+
+/// The key of a body's own item in its records: no hash, so no item's portable form has it.
+const OWN: ContentId = ContentId(*b"body store test: the body itself");
+
+/// `body`'s own item as a record names it.
+fn own<'db>(body: DefWithBodyId) -> SolverDefId<'db> {
+    match body {
+        DefWithBodyId::FunctionId(it) => SolverDefId::FunctionId(it),
+        DefWithBodyId::ConstId(it) => SolverDefId::ConstId(it),
+        DefWithBodyId::StaticId(it) => SolverDefId::StaticId(it),
+        DefWithBodyId::VariantId(it) => SolverDefId::EnumVariantId(it),
+    }
 }
 
 fn portable(def: SolverDefId<'_>) -> (u8, PortableIds) {
@@ -273,7 +289,10 @@ impl BodyFacts for TestFacts {
         )
     }
 
-    fn def_key<'db>(&self, db: &'db Db, _: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
+    fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
+        if def == own(body) {
+            return OWN;
+        }
         let (tag, ids) = portable(def);
         let bytes = ids.encode(db, self.main).expect("a test item has a portable form");
         let key = Hasher::new("blaze v2 item store test def").update(&[tag]).part(&bytes).finish();
@@ -284,9 +303,12 @@ impl BodyFacts for TestFacts {
     fn def_of<'db>(
         &self,
         db: &'db Db,
-        _: DefWithBodyId,
+        body: DefWithBodyId,
         key: ContentId,
     ) -> Option<SolverDefId<'db>> {
+        if key == OWN {
+            return Some(own(body));
+        }
         let (tag, bytes) = self.defs.lock().get(&key)?.clone();
         let ids = PortableIds::decode(db, self.main, &bytes).ok()?;
         match tag {

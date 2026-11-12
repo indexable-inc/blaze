@@ -15,10 +15,23 @@
 //!   (a type naming a definition, a map holding a static or a vtable) is offered and refused,
 //!   counted in the step's `refused`, and evaluated each time: never kept in part.
 //! - **Which constants.** One with no generic arguments, whose value is the same for every
-//!   asker (`consteval::deps`' module doc says why). An error is never kept. A constant whose
-//!   evaluation read something no fact stands for (the body of a `const fn` it calls, until
-//!   lane item-hash gives that read its `Code` fact) is refused by the read's name
-//!   ([`super::Flushed::refused`]), as any step is.
+//!   asker (`consteval::deps`' module doc says why). An error is never kept.
+//! - **Not switched on.** `const_eval_query` does not call [`constant`]; `consteval::deps` (a
+//!   constant under its crate's check key) is the one store of constants meanwhile. What
+//!   keeps it off: `consteval::evaluate_by_mir` reads the constant's own runtime MIR
+//!   (`monomorphized_runtime_mir_body_query`) before it interprets, and no fact stands for
+//!   that read: the runtime stage is no step of the store, so lane item-hash's facts refuse it
+//!   by name (`blaze-item-hash` `tests/classify.rs`, `REFUSALS`). Under the real facts every
+//!   constant that is not a literal would be offered and refused, and pay a lookup, a capture
+//!   and a classification for an entry it can never have. The same holds of a `const fn` a
+//!   constant calls: its runtime MIR is another body's, with no fact either.
+//! - **The one condition that turns it on:** runtime MIR being a step of the item store
+//!   (docs/v2/plan/design/restore.md, "One form, a function: the end state"). The constant's
+//!   own runtime MIR is then that step's fact, a callee's is the callee's, and
+//!   `const_eval_query` calls `consteval::stored_constant` for a constant with no generic
+//!   arguments; `consteval::deps` is deleted in the same change. Until then the step is
+//!   reached only by hir-ty-mir's `tests::consteval::items`, whose facts cover every read:
+//!   they hold what it does once it can hit.
 //! - **A hit runs nothing.** [`constant`] asks the store before `run` is called: no MIR is
 //!   built and nothing is interpreted. Under [`super::Mode::Verify`] it runs as well, and a
 //!   value that differs from the stored one is the build's error, naming the constant.

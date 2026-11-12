@@ -1,0 +1,14 @@
+{
+ "id": "fix-hirdef-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane fix-hirdef",
+ "where": "hir-def deps tests' store `Memory` and `ImageStore::paged`",
+ "what": "The test that every key `store` writes is in `front_keys`/`filing_keys` never saw two of the three front keys written: pages and item pages are written only when the store says `paged()`, which defaults to false and no test store of the crate set. Its planted-bug control (the list less the pages key) therefore found nothing outside the list.",
+ "cost": "one failed control in the first run; a few thousand tokens to find the switch",
+ "cause": "a record kind behind a default-off switch, and an invariant test that did not check the kinds it claims to cover were written",
+ "class": "vacuous success: an invariant over a set that was empty for the case it names",
+ "prevention": "the invariant test now runs a paged leg and asserts every `front_keys` kind was written before it checks the lists",
+ "workaround": "none",
+ "fix": "deps/tests.rs `Paging`, `holds_every_front_record`",
+ "state": "fixed"
+}
