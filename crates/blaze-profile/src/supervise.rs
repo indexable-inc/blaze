@@ -284,7 +284,7 @@ mod tests {
         assert_eq!(Dropped::default().line(), None);
     }
 
-    /// The invariant of the supervisor: a panic is said once, a repeat is counted and not
+    /// What the supervisor promises: a panic is said once, a repeat is counted and not
     /// said again, another panic is said, and the thread goes on.
     #[test]
     fn a_planted_panic_is_said_once_and_the_thread_goes_on() {

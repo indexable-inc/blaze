@@ -502,6 +502,10 @@ Each number is held to one table, `guards.BOUNDS`, which the script reads and
 | `answer_delay_ms` | ms | 100 | 100 | 100 | from the end of the build's last `task` span to the end of its `request: read to reply` span | a build's answer held 4 s for a disk sync of derived data |
 | `turn_uncovered_ms` | ms | 50 | 50 | 50 | the most time one `loop turn` span has that no child span of it covers | the daemon's loop thread spent 0.8 to 1.1 s in one turn with no span |
 | `uncovered_ms` | ms | 100 | 100 | 100 | the view `uncovered_time` of the build: wall time inside no span | time the profile cannot name (every-wait-says-what, slow-is-p0-traced) |
+| `unexplained` | pieces | 0 | 0 | 0 | `accounts`: steps with no recorded reason or an unstable key, and rows no cause counts | `blaze why` had no recorded reason for steps in 9 of 53 builds of the soundness oracle (2026-11-12) |
+| `unbalanced` | sums | 0 | 0 | 0 | `accounts.unbalanced`: sums of the account that do not hold | a run path that counts a run under no cause |
+| `alarms` | alarms | 0 | 0 | 0 | `accounts.alarms`: how many alarms the account names (work without a change, needless writes, work out of proportion to the change, an unkept unit, an unattributed write) | a no-op that wrote 53 inputs, and 46 units remade by every build of reth, each found by hand (2026-11-12) |
+| `history_dropped` | rows | 0 | 0 | 0 | `accounts.history_dropped`: rows the profile history could not write since its daemon began | a history whose thread ended on a panic and dropped every later build's rows unsaid (2026-11-12) |
 
 The times are for the gate's machine class (16 cores, a blaze the tree built, which runs slower
 than a release) and loose on purpose; they tighten as the numbers fall, by editing the table.

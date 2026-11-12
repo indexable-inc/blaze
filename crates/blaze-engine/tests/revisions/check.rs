@@ -35,7 +35,47 @@ fn most(check: &'static str, bound: Option<u64>, got: Option<u64>, what: &str, i
 /// The checks the simulated driver does not see, because its pipeline ends at code records:
 /// nothing is linked or run, no unit is counted, and no engine memo counts are read. It
 /// skips them and says so in each row; every other check it holds.
-pub const SIM_BLIND: &[&str] = &["prints", "says", "max_units", "max_records", "max_runs", "max_executed", "max_verified", "max_written", "max_unkept", "max_described", "max_ms", "noop", "link"];
+pub const SIM_BLIND: &[&str] = &["prints", "says", "max_units", "max_records", "max_runs", "max_executed", "max_verified", "max_written", "max_unkept", "max_described", "max_ms", "noop", "link", "account"];
+
+/// The standing expectation's check: every revision's build has an account that names no
+/// alarm (blaze-profile's `account`: no unexplained work, every sum held, work in proportion
+/// to the change). Not a key of `test.toml`: it is asked of every revision of every case.
+pub const ACCOUNT: &str = "account";
+
+/// The known failures of [`ACCOUNT`], beside `cases/`: a `[[known]]` row a revision, with
+/// `test`, `revision`, `alarms` (the alarms its account names, as `accounts.alarms` joins them)
+/// and `cause`. A listed revision may fail with exactly those alarms; one that names another
+/// fails, and one that names none fails until its row is taken out: the list only shrinks.
+/// `BLAZE_REVISIONS_ACCOUNT_RECORD=<file>` appends the rows a run would list.
+pub fn account_known_path() -> std::path::PathBuf {
+    super::spec::cases().join("../account-known.toml")
+}
+
+/// [`account_known_path`]'s rows of `test`: by revision, its alarms and its cause.
+fn account_known(test: &str) -> std::collections::BTreeMap<String, (String, String)> {
+    let path = account_known_path();
+    let text = fs::read_to_string(&path).unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+    let table: toml::Table = text.parse().unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    let mut out = std::collections::BTreeMap::new();
+    let rows = match table.get("known") {
+        None => return out,
+        Some(toml::Value::Array(rows)) => rows,
+        Some(other) => panic!("{}: `known` is a list of tables, not {other}", path.display()),
+    };
+    for row in rows {
+        let field = |key: &str| {
+            row.get(key)
+                .and_then(|it| it.as_str())
+                .unwrap_or_else(|| panic!("{}: a `[[known]]` row has `test`, `revision`, `alarms` and `cause`, each a string; this one has no `{key}`: {row}", path.display()))
+                .to_owned()
+        };
+        if field("test") == test {
+            let was = out.insert(field("revision"), (field("alarms"), field("cause")));
+            assert!(was.is_none(), "{}: {test} {} is listed twice", path.display(), field("revision"));
+        }
+    }
+    out
+}
 
 /// Each check of `revision` that `seen` fails, but those in `blind` (what the driver cannot
 /// see: said, not taken as met). `clean`: the same revision built from nothing by the same
@@ -165,6 +205,13 @@ fn all(revision: &Revision, seen: &Observed, clean: Option<&Observed>) -> Vec<Fa
             got: seen.alarms.join("\n"),
         });
     }
+    // The standing expectation: asked of every revision, never opted into.
+    let wanted = || "an account that names no alarm: every piece of work has a recorded cause, each sum holds, and the work fits the change".to_owned();
+    match &seen.account {
+        Some(alarms) if alarms.is_empty() => {}
+        Some(alarms) => failed.push(Failure { check: ACCOUNT, wanted: wanted(), got: format!("{} ({})", alarms.join(", "), seen.account_said) }),
+        None => failed.push(Failure { check: ACCOUNT, wanted: wanted(), got: format!("the driver does not see it: {}", seen.account_said) }),
+    }
     if let Some(clean) = clean {
         if clean.ok == seen.ok
             && let (Some(ours), Some(theirs)) = (&seen.diagnostics, &clean.diagnostics)
@@ -225,11 +272,43 @@ pub fn verdict(test: &Test, driver: &str, rows: &[Row], note: &str) {
     let mut wrong = String::new();
     let mut lines = String::new();
     let mut report = String::new();
+    // The standing expectation's known failures are the real driver's: the simulated one does
+    // not see an account ([`SIM_BLIND`]).
+    let standing = match driver.split(' ').next() == Some("real") {
+        true => account_known(&test.name),
+        false => std::collections::BTreeMap::new(),
+    };
+    let mut record = String::new();
     for (revision, row) in test.revisions.iter().zip(rows) {
         let mut result = "ok".to_owned();
         let mut known_said = Vec::new();
+        // The alarms the revision's account names, as the list writes them.
+        let named = row.seen.account.as_ref().map(|it| it.join(", "));
+        if let Some(named) = named.as_ref().filter(|it| !it.is_empty())
+            && row.failed.iter().any(|it| it.check == ACCOUNT)
+        {
+            let cause = standing.get(&row.label).map_or("not looked into", |it| it.1.as_str());
+            _ = writeln!(
+                record,
+                "[[known]]\ntest = {:?}\nrevision = {:?}\nalarms = {:?}\ncause = {:?}\n",
+                test.name, row.label, named, cause
+            );
+        }
+        match standing.get(&row.label) {
+            Some((_, cause)) if !row.failed.iter().any(|it| it.check == ACCOUNT) => {
+                result = "FAILED".to_owned();
+                _ = writeln!(
+                    wrong,
+                    "{} {} ({driver}): the known failure of the standing check `{ACCOUNT}` ({cause}) passes now: remove its row from {}",
+                    test.name, row.label, account_known_path().display()
+                );
+            }
+            _ => {}
+        }
         for failure in &row.failed {
-            match known(revision, driver, failure.check) {
+            // A listed failure of the standing check passes with exactly the alarms listed.
+            let listed = standing.get(&row.label).filter(|it| failure.check == ACCOUNT && Some(&it.0) == named.as_ref());
+            match known(revision, driver, failure.check).or(listed.map(|it| &it.1)) {
                 Some(cause) => known_said.push(format!("{}: {cause} (got: {})", failure.check, short(&failure.got).replace('\n', " "))),
                 None => {
                     result = "FAILED".to_owned();
@@ -293,6 +372,13 @@ pub fn verdict(test: &Test, driver: &str, rows: &[Row], note: &str) {
         );
     }
     print!("{lines}");
+    if let Ok(path) = std::env::var("BLAZE_REVISIONS_ACCOUNT_RECORD")
+        && !record.is_empty()
+    {
+        // One write of the test's rows: appends of several tests do not interleave.
+        let mut file = fs::OpenOptions::new().create(true).append(true).open(&path).unwrap_or_else(|error| panic!("{path}: {error}"));
+        file.write_all(record.as_bytes()).unwrap();
+    }
     if let Ok(path) = std::env::var("BLAZE_REVISIONS_REPORT") {
         // One write of the test's lines: appends of several tests do not interleave.
         let mut file = fs::OpenOptions::new().create(true).append(true).open(&path).unwrap_or_else(|error| panic!("{path}: {error}"));

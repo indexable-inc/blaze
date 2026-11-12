@@ -387,7 +387,7 @@ pub struct Accounted {
     /// The account in one line ([`crate::account::Account::line`]).
     pub line: String,
     /// Each alarm's name ([`crate::account::Alarm::name`]) and its warning in words.
-    pub warnings: Vec<Named2>,
+    pub warnings: Vec<Warning>,
     /// Work with no recorded cause: steps `blaze why` cannot explain and rows no cause counts.
     /// Must be 0.
     pub unexplained: u64,
@@ -400,9 +400,9 @@ pub struct Accounted {
     pub history_dropped: u64,
 }
 
-/// A name and what it says.
+/// One warning of a build's account: the alarm's name and what it says.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct Named2 {
+pub struct Warning {
     pub name: String,
     pub says: String,
 }
@@ -418,7 +418,7 @@ impl Accounted {
             warnings: account
                 .alarms()
                 .iter()
-                .map(|it| Named2 { name: it.name().to_owned(), says: it.text(row.build_id) })
+                .map(|it| Warning { name: it.name().to_owned(), says: it.text(row.build_id) })
                 .collect(),
             unexplained: row.by_unexplained + row.by_unstable + row.ran_uncaused,
             rows_per_write: (outside > 0)

@@ -377,6 +377,10 @@ enum ToHistory {
     /// no client waits for a write, and one that fails is the history's failure, said in
     /// `blaze status` as any flush's is.
     Client(history::ClientRows),
+    /// A message whose taking panics, saying this: the planted fault of the supervised
+    /// thread's test.
+    #[cfg(test)]
+    Planted(String),
 }
 
 /// How long a reader's flush ([`blaze_api::Request::Flush`]) may take, on the loop's clock,
@@ -412,6 +416,8 @@ struct Noted {
     keyed: Vec<KeyedMiss>,
     misses: Vec<blaze_profile::facts::MissRow>,
     test_runs: Vec<blaze_profile::facts::TestRunRow>,
+    /// The build's account ([`account_of`]): its `accounts` row.
+    account: blaze_profile::account::AccountRow,
     /// `profile rows wait for the build's answer`, open from its end to its answer.
     _waits: tracing::Span,
 }
@@ -428,8 +434,10 @@ impl Noted {
             keyed,
             misses,
             test_runs,
+            account,
             _waits,
         } = self;
+        history.accounted([account]);
         history.linked(links);
         history.crate_graph(crate_deps);
         history.query_counted(query_counts);
@@ -438,6 +446,87 @@ impl Noted {
         history.missed(misses);
         history.tests_ran(test_runs);
         history.build_ended(row);
+    }
+}
+
+/// The account of the build of `row` ([`blaze_profile::account`]): what the engine counted
+/// (`counts`), each step it computed again with where `blaze why`'s chain of reasons ends
+/// (`rebuilt`), and what the history has dropped so far (`dropped`). Made for every build that
+/// ends, on the history's thread, from the rows the build already gave: nothing a build has
+/// to remember to say.
+fn account_of(
+    row: &BuildRow,
+    counts: &[QueryCountRow],
+    rebuilt: &[blaze_api::Rebuild],
+    links: usize,
+    dropped: u64,
+) -> blaze_profile::account::Account {
+    use blaze_api::Reason;
+    use blaze_profile::account::{Account, End, Origin, Seen, Step};
+    // alloc: once a build, a step a thing it computed again
+    let steps: Vec<Step> = rebuilt
+        .iter()
+        .map(|it| Step {
+            step: it.step.clone(), // clone: the account's copy, once a step
+            ends: it
+                .ends
+                .iter()
+                .map(|end| match end {
+                    Reason::InputChanged { file, input, .. } => End::Changed {
+                        origin: match *file {
+                            true => Origin::of_file(input, &row.workspace),
+                            false => Origin::Input,
+                        },
+                        input: input.clone(), // clone: as above
+                    },
+                    Reason::FirstTime => End::First,
+                    Reason::Evicted { .. } => End::Evicted,
+                    Reason::PreviousFailed { .. } => End::Left,
+                    Reason::Forced { .. } => End::Forced,
+                    Reason::KeyUnstable { .. } => End::Unstable,
+                    Reason::Unexplained { .. } => End::Unexplained,
+                })
+                .collect(),
+        })
+        .collect();
+    let seen = Seen { links: links as u64, history_dropped: dropped };
+    Account::of(row.build_id, counts, &steps, seen)
+}
+
+/// Says `account` where the profile and a person see it: one `build account` event with its
+/// numbers (in `events`, as `edit work` is), and a WARN for each alarm and each sum that does
+/// not hold, which `blaze explain problems`, `blaze slow` and `blaze why` list first.
+fn say_account(account: &blaze_profile::account::Account) {
+    let row = &account.row;
+    let build = row.build_id;
+    tracing::info!(
+        target: "blaze",
+        build,
+        written = row.written,
+        executed = row.executed,
+        verified = row.verified,
+        steps = row.steps,
+        changes = row.changes,
+        unexplained = row.by_unexplained + row.by_unstable + row.ran_uncaused,
+        unbalanced = row.unbalanced,
+        history_dropped = row.history_dropped,
+        "build account: {}",
+        account.line()
+    );
+    for sum in &account.unbalanced {
+        tracing::warn!(
+            target: "blaze",
+            build,
+            total = sum.total,
+            by_cause = sum.by_cause,
+            "build {build}'s account does not add up, which is a bug in blaze: {} are {} and their causes count {}",
+            sum.what,
+            sum.total,
+            sum.by_cause
+        );
+    }
+    for alarm in account.alarms() {
+        tracing::warn!(target: "blaze", build, alarm = alarm.name(), "{}", alarm.text(build));
     }
 }
 
@@ -797,6 +886,14 @@ fn claim(dir: &Path) -> Result<Owner, Claim> {
 /// never as it ends: [`Noted`]), which writes its row and gives its spans
 /// its commit. A flush that fails is logged and told to the daemon, for `blaze daemon status`;
 /// the next one goes on.
+///
+/// Supervised (rule panics-fail-one-job, `blaze_profile::supervise::Supervisor`): a panic in a
+/// turn of it (outside a flush and outside a build's explaining, which contain their own) is
+/// caught, said once to the daemon (`blaze daemon status`, the `history:` line) and in the
+/// log, and the thread goes on with the next message; what it held across turns
+/// ([`Keeping`]) is kept. Past the supervisor's bound of panics in a minute it ends, saying so.
+/// Until 2026-11-12 such a panic ended the thread for the daemon's life and every later
+/// build's rows were dropped with nothing said (annoyances envkeys-1112-2, reth-1112-14).
 fn keep(
     mut history: History,
     why: &mut File,
@@ -805,17 +902,87 @@ fn keep(
     told: &Sender<Told>,
     doing: &Doing,
 ) {
-    let mut flushed_at = Instant::now();
-    // When the history last wrote, or was last asked to by anything but the timer: a quiet
-    // history's timer writes only every `history::IDLE_EVERY`.
-    let mut written_at = Instant::now();
-    // The builds that ended and whose answer has not been said, oldest first ([`Noted`]).
-    let mut noted: Vec<Noted> = Vec::new(); // alloc: none until a build ends
-    // The flushes no reader waits for, held while builds come ([`Held`]).
-    let mut held = Held::default();
-    // The records of builds explained and not yet appended to `blaze why`'s ledger, oldest
-    // first: written with the next flush made ([`File::write_all`]), never as a build ends.
-    let mut unwritten: Vec<(u64, Vec<u8>)> = Vec::new(); // alloc: none until a build ends
+    let began = Instant::now();
+    let mut keeping = Keeping {
+        flushed_at: began,
+        written_at: began,
+        noted: Vec::new(), // alloc: none until a build ends
+        held: Held::default(),
+        unwritten: Vec::new(), // alloc: none until a build ends
+    };
+    let mut supervisor = blaze_profile::supervise::Supervisor::default();
+    // What the history has dropped that the daemon was told of ([`tell_dropped`]).
+    let mut dropped_told = 0;
+    // Bounded (rule 18): each turn of this loop is a clean end or a panic, and the supervisor
+    // ends it past its bound of panics.
+    loop {
+        let turns = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            keep_turns(&mut history, why, rows, failed, told, doing, &mut keeping, &mut dropped_told)
+        }));
+        let Err(panic) = turns else { return };
+        let what = blaze_profile::supervise::panic_text(&*panic);
+        let verdict = supervisor.panicked(began.elapsed(), &doing.said(), &what);
+        let (say, ends) = match verdict {
+            blaze_profile::supervise::Verdict::Restart { say } => (say, false),
+            blaze_profile::supervise::Verdict::GiveUp { say } => (Some(say), true),
+        };
+        if let Some(say) = say {
+            tracing::error!("{say}");
+            _ = failed.send(say);
+        }
+        if ends {
+            return;
+        }
+    }
+}
+
+/// What the `blaze-history` thread holds from one turn to the next: kept outside its turns, so
+/// a turn that panics loses its own message and nothing a turn before it took ([`keep`]).
+struct Keeping {
+    flushed_at: Instant,
+    /// When the history last wrote, or was last asked to by anything but the timer: a quiet
+    /// history's timer writes only every `history::IDLE_EVERY`.
+    written_at: Instant,
+    /// The builds that ended and whose answer has not been said, oldest first ([`Noted`]).
+    noted: Vec<Noted>,
+    /// The flushes no reader waits for, held while builds come ([`Held`]).
+    held: Held,
+    /// The records of builds explained and not yet appended to `blaze why`'s ledger, oldest
+    /// first: written with the next flush made ([`File::write_all`]), never as a build ends.
+    unwritten: Vec<(u64, Vec<u8>)>,
+}
+
+/// Tells the daemon what the history has dropped since it opened, by table, each time that
+/// grew ([`History::dropped`]): the `history:` line of `blaze daemon status`.
+fn tell_dropped(history: &History, told: &mut u64, failed: &Sender<String>) {
+    let dropped = history.dropped();
+    if dropped.total() == *told {
+        return;
+    }
+    *told = dropped.total();
+    if let Some(line) = dropped.line() {
+        // alloc: error path, rows the history could not write
+        _ = failed.send(format!(
+            "the profile history has dropped {} rows it read and could not write, since the daemon began ({line}): totals over those tables are short by them",
+            dropped.total()
+        ));
+    }
+}
+
+/// The turns of the `blaze-history` thread, until the daemon hangs up (its last flush made)
+/// or one panics ([`keep`]).
+#[expect(clippy::too_many_arguments, reason = "the history thread's state, each its own")]
+fn keep_turns(
+    history: &mut History,
+    why: &mut File,
+    rows: &Receiver<ToHistory>,
+    failed: &Sender<String>,
+    told: &Sender<Told>,
+    doing: &Doing,
+    keeping: &mut Keeping,
+    dropped_told: &mut u64,
+) {
+    let Keeping { flushed_at, written_at, noted, held, unwritten } = keeping;
     loop {
         doing.set(Step::Waiting, 0);
         let due = history::EVERY.saturating_sub(flushed_at.elapsed());
@@ -828,9 +995,10 @@ fn keep(
                     tracing::error!("{error}");
                     _ = failed.send(error.to_string());  // alloc: error path, a flush that failed
                 }
-                tell_failed(&mut history, failed);
-                flushed_at = Instant::now();
-                written_at = flushed_at;
+                tell_failed(history, failed);
+                tell_dropped(history, dropped_told, failed);
+                *flushed_at = Instant::now();
+                *written_at = *flushed_at;
                 held.flushed();
                 continue;
             }
@@ -848,7 +1016,7 @@ fn keep(
             && history.quiet()
             && written_at.elapsed() < history::IDLE_EVERY
         {
-            flushed_at = Instant::now();
+            *flushed_at = Instant::now();
             continue;
         }
         // In a task of the profile's tag, so what a flush reads and keeps (the rings' rows,
@@ -869,7 +1037,7 @@ fn keep(
             let mut next = Some(next);
             // Bounded: `MOST_BATCH` turns at most.
             while let Some(taken) = next.take() {
-                take(taken, &mut history, why, &mut noted, &mut unwritten, failed, told, doing, &mut batch);
+                take(taken, history, why, noted, unwritten, failed, told, doing, &mut batch);
                 batch.taken += 1;
                 if batch.last || batch.taken == MOST_BATCH {
                     break;
@@ -888,7 +1056,7 @@ fn keep(
                 return (Ok(()), false);
             }
             let Some(build) = held.take(batch.flush) else { return (Ok(()), batch.last) };
-            write_why(why, &mut unwritten, failed);
+            write_why(why, unwritten, failed);
             let flushed = history.flush_contained(build);
             let seq = || match &flushed {
                 Ok(it) => Ok(it.seq),
@@ -903,13 +1071,14 @@ fn keep(
             }
             (flushed.map(drop), batch.last)
         });
-        flushed_at = Instant::now();
-        written_at = flushed_at;
+        *flushed_at = Instant::now();
+        *written_at = *flushed_at;
         if let Err(error) = flushed {
             tracing::error!("{error}");
             _ = failed.send(error.to_string()); // alloc: error path, a flush that failed
         }
-        tell_failed(&mut history, failed);
+        tell_failed(history, failed);
+        tell_dropped(history, dropped_told, failed);
         if last {
             return;
         }
@@ -1080,6 +1249,8 @@ fn take(
             batch.flush(None);
         }
         Ok(ToHistory::Errored(rows)) => history.errored(rows),
+        #[cfg(test)]
+        Ok(ToHistory::Planted(what)) => panic!("{what}"),
         Ok(ToHistory::Client(rows)) => {
             let build = rows.build;
             doing.set(Step::Flushing, build);
@@ -1100,7 +1271,42 @@ fn take(
             // Before the ledger takes the misses: their keys' parts, which it drops.
             let keyed = key_parts(build, &misses);
             doing.set(Step::Explaining, build);
-            let (rebuilt, misses, record) = why.explain(build, ended_well, misses);
+            // A panic while explaining fails this build's explanation alone (rule
+            // panics-fail-one-job): the build is still told explained, with the one reason
+            // that it could not be, so the loop's count of builds explained stays whole and
+            // no later `blaze why` waits for an answer that never comes.
+            let explained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                why.explain(build, ended_well, misses)
+            }));
+            let (rebuilt, misses, record) = match explained {
+                Ok(explained) => explained,
+                Err(panic) => {
+                    let what = blaze_profile::supervise::panic_text(&*panic);
+                    // alloc: error path
+                    let said = format!(
+                        "explaining build {build}'s misses panicked ({what}): its steps are not explained, its `misses` rows are not written, and a later build compared with it may be explained short"
+                    );
+                    tracing::error!("{said}");
+                    _ = failed.send(said.clone()); // clone: error path
+                    // alloc: error path
+                    let unexplained = blaze_api::Rebuild {
+                        ends: vec![blaze_api::Reason::Unexplained { what: said.clone() }], // clone: error path
+                        item: format!("build {build}"),
+                        step: "blaze why".to_owned(),
+                        cause: blaze_api::RebuildCause::Failed { why: said },
+                    };
+                    (vec![unexplained], Vec::new(), Vec::new()) // alloc: error path
+                }
+            };
+            // The build's account, from the same reasons its `blaze why` answer gives.
+            let account = account_of(
+                &row,
+                &query_counts,
+                &rebuilt,
+                links.len(),
+                history.dropped().total(),
+            );
+            say_account(&account);
             // clone: the answer's copy of whose build it is, once a build
             let answer = Answer::new(build, row.workspace.clone(), row.command.clone(), rebuilt);
             // Sent before the record is durable: an answer may name a build whose record a
@@ -1135,6 +1341,7 @@ fn take(
                 keyed,
                 misses,
                 test_runs,
+                account: account.row,
                 _waits: waits,
             });
         }
@@ -2048,6 +2255,95 @@ mod tests {
         drop(sent);
         keeper.join().unwrap();
         assert_eq!(failed.try_recv().ok(), None);
+    }
+
+    /// The invariant: a panic in a turn of the history's thread ends nothing. It is told to
+    /// the daemon, saying what panicked and that the thread goes on, and the build that ends
+    /// after it is explained, accounted and written as any other. Its control is
+    /// `the_oracle_catches_a_history_thread_that_ends_at_its_first_panic`.
+    #[test]
+    fn a_planted_panic_in_the_history_thread_is_told_and_the_next_build_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        static UNSAMPLED: blaze_profile::sampler::Ring = blaze_profile::sampler::Ring::new();
+        let (sent, rows) = crossbeam_channel::unbounded();
+        let (failed_to, failed) = crossbeam_channel::unbounded();
+        let (told_to, told) = crossbeam_channel::unbounded();
+        let at = dir.path().to_path_buf();
+        let keeper = std::thread::Builder::new()
+            .name("blaze-history-test".to_owned())
+            .spawn(move || {
+                let history = History::open(&at, history::CAP_BYTES, &UNSAMPLED).unwrap();
+                let (mut why, _) = File::restore(&at);
+                keep(history, &mut why, &rows, &failed_to, &told_to, &Doing::default())
+            })
+            .unwrap();
+        let bound = Duration::from_secs(60);
+        sent.send(ToHistory::Planted("byte array offset overflow".to_owned())).unwrap();
+        sent.send(ToHistory::Ended(Finished { ended: ended_row(72), query_counts: Vec::new() }))
+            .unwrap();
+        sent.send(ToHistory::Answered(72)).unwrap();
+        sent.send(ToHistory::Flush(to(1, 1))).unwrap();
+        assert_eq!(written_after_a_panic(&told, 72, bound), None);
+        assert!(matches!(told.recv_timeout(bound), Ok(Told::Flushed { seq: Ok(_), .. })));
+        let said = failed.recv_timeout(bound).unwrap();
+        assert!(
+            said.contains("panicked") && said.contains("byte array offset overflow") && said.contains("the thread goes on"),
+            "{said}"
+        );
+        let files: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|it| it.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|it| it.starts_with("72-"))
+            .collect();
+        assert!(files.iter().any(|it| it.ends_with(".builds.parquet")), "{files:?}");
+        assert!(files.iter().any(|it| it.ends_with(".accounts.parquet")), "{files:?}");
+        drop(sent);
+        keeper.join().unwrap();
+    }
+
+    /// The oracle of the supervised thread's test: why the history's thread did not go on
+    /// after a panic (the build that ended after it was never told explained), or `None`.
+    fn written_after_a_panic(told: &Receiver<Told>, build: u64, bound: Duration) -> Option<String> {
+        match told.recv_timeout(bound) {
+            Ok(Told::Explained { answer, .. }) if answer.build == build => None,
+            Ok(_) => Some(format!("build {build} was not the next thing told")),
+            Err(error) => Some(format!("build {build} was never explained: {error}")),
+        }
+    }
+
+    /// The control: the thread as it was until 2026-11-12, its turns run with no supervisor,
+    /// ends at the planted panic, and the build after it is never explained.
+    #[test]
+    fn the_oracle_catches_a_history_thread_that_ends_at_its_first_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        static UNSAMPLED: blaze_profile::sampler::Ring = blaze_profile::sampler::Ring::new();
+        let (sent, rows) = crossbeam_channel::unbounded();
+        let (failed_to, _failed) = crossbeam_channel::unbounded();
+        let (told_to, told) = crossbeam_channel::unbounded();
+        let at = dir.path().to_path_buf();
+        let keeper = std::thread::Builder::new()
+            .name("blaze-history-test".to_owned())
+            .spawn(move || {
+                let mut history = History::open(&at, history::CAP_BYTES, &UNSAMPLED).unwrap();
+                let (mut why, _) = File::restore(&at);
+                let now = Instant::now();
+                let mut keeping = Keeping {
+                    flushed_at: now,
+                    written_at: now,
+                    noted: Vec::new(),
+                    held: Held::default(),
+                    unwritten: Vec::new(),
+                };
+                let doing = Doing::default();
+                keep_turns(&mut history, &mut why, &rows, &failed_to, &told_to, &doing, &mut keeping, &mut 0)
+            })
+            .unwrap();
+        sent.send(ToHistory::Planted("byte array offset overflow".to_owned())).unwrap();
+        sent.send(ToHistory::Ended(Finished { ended: ended_row(72), query_counts: Vec::new() }))
+            .unwrap();
+        assert!(keeper.join().is_err(), "the unsupervised thread ends by its panic");
+        let caught = written_after_a_panic(&told, 72, Duration::from_secs(60));
+        assert!(caught.is_some_and(|it| it.contains("never explained")));
     }
 
     /// The invariant of [`Held`]: a flush no reader waits for is due [`FLUSH_QUIET`] after the

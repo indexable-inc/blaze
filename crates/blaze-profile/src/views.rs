@@ -176,6 +176,8 @@ pub const VIEWS: &[View] = &[
     const { view("syscalls", &[ENDED_BUILD, THREAD, WITHIN, MIN_MS, MANY]) },
     const { view("unit_reads", &[BUILD, MANY]) },
     const { view("edit_work", &[BUILD, MANY]) },
+    const { view("account", &[ENDED_BUILD]) },
+    const { view("unaccounted", &[LIMIT]) },
 ];
 
 /// The view named `name`.

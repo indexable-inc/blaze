@@ -63,6 +63,13 @@ Before any query, on the daemon that showed it:
    reason says what was recorded; where it says "not recorded" it names the command that reads
    what is left.
 
+Each of the three also carries the build's account (`accounts`, docs/profiling.md): `blaze
+slow` prints it in a line under the problems with each warning it names, and an alarm is a
+WARN event, so `problems` and `why` list it. An account line that says `the history holds
+none` means the build's end never reached the history: read `blaze daemon status` (its
+`history:` line says what the history's thread dropped or panicked on) before trusting any
+empty table of that build.
+
 Then the rows. `blaze debug schema [TABLE]` lists the tables and views, or a table's columns
 with their meaning; `blaze debug sql "DESCRIBE spans"` and `"SHOW TABLES"` answer the same. Never
 guess a column: a query DuckDB refuses for one is answered with the table's real columns.
@@ -181,8 +188,9 @@ hand, set `BLAZE_DUCKDB` to that path.
   input's field by id, or another memo's `query_key`), `cause_kind` (`input`, `tracked`,
   `interned`, `function`) and `what` (the `Untracked { what }` name). Names are made only as
   the build ends, with its database, so logging stays cheap. It is written while the
-  daemon keeps a history. Past 2^19 rows between two builds the rest are dropped with a
-  `warn` event, and the counts still hold every run.
+  daemon keeps a history. Its first 2^19 rows between two builds are kept whole; past them
+  one run in 64 is kept as a sample (`weight` 64, so weigh a count by `sum(weight)`), with a
+  `warn` event saying the numbers, and the counts still hold every run exactly.
 - `misses` has one row per unit, build-script run or codegen template that a build computed
   again, with the reason in words (`cause`, `what`, `was`, `now`, `since`). `blaze why` reads
   these rows.
@@ -212,6 +220,13 @@ Each query below is a named view (`blaze explain <name>`) unless it says otherwi
 - `blaze explain pool`: the store's buffer pool's and the worker pool's counters over the build.
 - `blaze explain kept`: what the build kept or lost as it ended and after its answer.
 - `blaze explain syscalls thread=loop`: what the loop thread blocked in.
+- `blaze explain account`: the build's account in one row: what it saw change (`written`,
+  by who writes that kind of input), what it did (`executed` by cause, `steps` by kind, each
+  step once under where its chain of reasons ends), what does not add up (`unbalanced`,
+  `ran_uncaused`, `by_unexplained`: each must be 0), the proportions (`rows_per_write`,
+  `steps_per_change`), the alarms it names, and what the profile lost (`uncovered_ms`,
+  `history_dropped`, the recorder's `spans_lost`). Start here for "did this build do more
+  than its change asked for"; `blaze explain unaccounted` lists the builds that alarm.
 - `blaze explain edit_work`: what each stage of the build visited, asked of or made again
   (`engine memos`, `changed set`, `body check`, `codegen walk`, `dependency image keys`,
   `link`), a row a counter. After a one-function body edit every `total` is a small constant
@@ -365,6 +380,20 @@ A stored value the fixed code would make otherwise is reached today only by leav
 out of `BLAZE_DEV_TOOLCHAIN_AS`.
 
 ## Limits to keep in mind
+
+- **An empty table is not "nothing happened".** The history can lose rows, and says so in
+  three places: `blaze daemon status` (`history:`: a flush or a turn of its thread that
+  panicked, rows dropped by table), the build's account (`accounts.history_dropped`), and
+  WARN events (`the flight recorder lost rows`, `the profile history halved a batch`). Check
+  them before reading no `misses` as "nothing was computed again".
+- **Who wrote an input is told by its kind**, not by the code that wrote it
+  (`account::Writer::of_input`): `written_derived` is blaze's own publications, the others
+  come from outside. Which setter call wrote it is not recorded; `blaze explain writes`
+  names the fields reruns followed.
+- **The account's engine sum is reported, not asserted**: the counters are taken while the
+  engine's threads may still count (from the code; whether a take ever lands between a
+  run's two counts is not measured), so read a small `ran_uncaused` on a build that
+  overlapped another as a lead, and one on a build alone as a bug.
 
 - A key's name is its `Debug` with each id the front end can name followed by its name
   (`Crate(Id(21548) = serde v1.0.219 (lib))`, `FunctionId(Id(77) = serde::de::value::f)`), and

@@ -684,8 +684,8 @@ mod tests {
         let batch = provenance(&[changed, read]).unwrap();
         let weight = batch.column(schema::PROVENANCE.column("weight").unwrap());
         assert_eq!(
-            weight.as_primitive::<arrow_array::types::UInt32Type>().values(),
-            &[1, 64],
+            weight.as_primitive::<UInt32Type>().values().to_vec(),
+            vec![1u32, 64],
             "a sample of the runs past the log's bound says how many it stands for"
         );
         let at = |name: &str| schema::PROVENANCE.column(name).unwrap();

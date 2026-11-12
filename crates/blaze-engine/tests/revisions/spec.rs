@@ -223,6 +223,13 @@ pub struct Observed {
     pub alarms: Vec<String>,
     /// `blaze why` of the build, for a failure's message.
     pub why: String,
+    /// The alarms the build's account names (`blaze explain account`: work with no recorded
+    /// cause, a sum that does not hold, work out of proportion to the change), by name: the
+    /// standing expectation of every revision is none (`check.rs`, the check `account`).
+    /// `None` where the driver does not see the account.
+    pub account: Option<Vec<String>>,
+    /// The account's numbers in words, for a failure's message.
+    pub account_said: String,
     pub ms: u128,
 }
 

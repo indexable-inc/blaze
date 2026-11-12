@@ -911,9 +911,15 @@ WITH picked AS (
     FROM builds
     WHERE CASE WHEN $build IS NULL THEN build_id + $builds > (SELECT max(build_id) FROM builds) ELSE build_id = $build END
 ), loud AS (
+    -- The picked builds' events alone, before any join: an event of a picked build is tagged
+    -- with it or with none, and is no earlier than the first picked build's start (an event of
+    -- no build is the last build's to start before it). On a history of reth's size every
+    -- WARN and ERROR of every build, joined to its fields, was past DuckDB's memory limit.
     SELECT build_id, process, event_id, t_ns, level, target, name, message
     FROM events
     WHERE level IN ('ERROR', 'WARN')
+        AND t_ns >= (SELECT min(t0) FROM picked)
+        AND (build_id IS NULL OR build_id IN (SELECT picked_build FROM picked))
 ), loud_fields AS (
     -- The fields of those events alone: `events_wide` pivots every event's fields before any
     -- filter, which on a history of reth's size is past DuckDB's memory limit.
@@ -1276,4 +1282,80 @@ FROM counted
 WHERE n IS NOT NULL
 GROUP BY stage, counter
 ORDER BY stage, counter
+LIMIT $limit
+
+-- name: account
+-- says: a build's account in one row (`accounts`, crates/blaze-profile/src/account.rs): the change it saw (`written`, the engine's input writes, by who writes that kind of input: `written_source` a file's bytes, `written_environment`, `written_plan` the crate graph and settings, `written_derived` what blaze publishes from its own results, `written_unattributed` a kind nobody named, which must be 0), the work it did (`executed` rows run by cause, `ran_uncaused` those no cause counts, which must be 0; `verified`; `steps` computed again by kind: `units`, `unkept`, `scripts`, `functions`), each step once under where its chain of reasons ends (`by_workspace_file`, `by_built_file`, `by_lock_file`, `by_outside_file`, `by_input` for a change; `by_first`, `by_evicted`, `by_left`, `by_forced` for a standing reason; `by_unstable` and `by_unexplained` for a bug, which must be 0), how many sums do not hold (`unbalanced`, 0), the distinct changed inputs (`changes`, `first_change`), the proportions (`rows_per_write`: rows run for a change or verified, for each input written from outside; `steps_per_change`: steps made again for a change, for each changed input), `alarms` (the warnings the account names, null when the work is explained and fits the change), and what the profile could not see of it: `uncovered_ms` and `uncovered_pct` (wall time inside no span, as `uncovered_time`), `history_dropped` (rows the history could not write since its daemon began) and the flight recorder's `spans_lost` and `rows_skipped` so far (its counters at the build's flush, counted since the daemon began). No row: the build has no account (a blaze before the table, or a build still running)
+WITH bounds AS (
+    SELECT started_ns AS t0, started_ns + dur_ns AS t1
+    FROM builds
+    WHERE build_id = $build
+), outer_spans AS (
+    SELECT greatest(start_ns, t0) AS start_ns, least(start_ns + dur_ns, t1) AS end_ns
+    FROM spans, bounds
+    WHERE depth = 0 AND start_ns < t1 AND start_ns + dur_ns > t0
+    UNION ALL
+    SELECT t1, t1 FROM bounds
+), swept AS (
+    SELECT
+        start_ns,
+        coalesce(
+            max(end_ns) OVER (ORDER BY start_ns, end_ns ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),
+            (SELECT t0 FROM bounds)
+        ) AS covered_to
+    FROM outer_spans
+), uncovered AS (
+    SELECT
+        sum(greatest(start_ns - covered_to, 0)) AS uncovered_ns,
+        any_value(t1 - t0) AS wall_ns
+    FROM swept, bounds
+), recorder AS (
+    SELECT
+        max(value) FILTER (WHERE CAST(name AS VARCHAR) = 'profile spans lost') AS spans_lost,
+        max(value) FILTER (WHERE CAST(name AS VARCHAR) = 'profile rows skipped') AS rows_skipped
+    FROM counters
+    WHERE build_id = $build
+)
+SELECT
+    account.build_id,
+    account.written, account.written_source, account.written_environment, account.written_plan,
+    account.written_derived, account.written_unattributed,
+    account.executed, account.ran_new, account.ran_changed, account.ran_untracked, account.ran_cycle,
+    account.ran_evicted, account.ran_uncaused, account.verified,
+    account.steps, account.units, account.unkept, account.scripts, account.functions, account.other_steps,
+    account.links,
+    account.by_workspace_file, account.by_built_file, account.by_lock_file, account.by_outside_file,
+    account.by_input, account.by_first, account.by_evicted, account.by_left, account.by_forced,
+    account.by_unstable, account.by_unexplained,
+    account.unbalanced, account.changes, account.first_change,
+    round((account.ran_changed + account.verified)
+        / nullif(account.written_source + account.written_environment + account.written_plan, 0), 1) AS rows_per_write,
+    round((account.by_workspace_file + account.by_built_file + account.by_lock_file + account.by_outside_file + account.by_input)
+        / nullif(account.changes, 0), 1) AS steps_per_change,
+    account.alarms,
+    round(uncovered.uncovered_ns / 1e6, 1) AS uncovered_ms,
+    round(100 * uncovered.uncovered_ns / nullif(uncovered.wall_ns, 0), 1) AS uncovered_pct,
+    account.history_dropped,
+    recorder.spans_lost, recorder.rows_skipped
+FROM accounts AS account
+CROSS JOIN uncovered
+CROSS JOIN recorder
+WHERE account.build_id = $build
+
+-- name: unaccounted
+-- says: the builds whose account names an alarm or does not add up, newest first: the alarms by name, the work with no recorded cause (`unexplained`: steps and rows), the sums that do not hold, the writes nobody is named for, and the steps and changed inputs; the standing check that a build did only explained work in proportion to its change. No row: every build the history holds an account of is clean
+SELECT
+    build_id,
+    alarms,
+    by_unexplained + by_unstable + ran_uncaused AS unexplained,
+    unbalanced,
+    written_unattributed,
+    written,
+    executed,
+    steps,
+    changes,
+    first_change
+FROM accounts
+WHERE alarms IS NOT NULL OR unbalanced > 0 OR by_unexplained + by_unstable + ran_uncaused > 0
+ORDER BY build_id DESC
 LIMIT $limit

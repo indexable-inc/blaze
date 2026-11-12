@@ -1,0 +1,13 @@
+{
+ "id": "telemetry-1112-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane telemetry-1112",
+ "where": "harness/v2/guards.py selftest, run as AGENTS.md says scripts are run",
+ "what": "`python3 -I harness/v2/guards.py selftest` fails with `ModuleNotFoundError: No module named 'typed_input'`; it runs with `PYTHONPATH=tools/typed-input/src python3 harness/v2/guards.py selftest` (no `-I`, which ignores PYTHONPATH). harness/v2/budgets.py's selftest needs `blake3` and does not run without the uv environment at all.",
+ "cost": "two failed calls; budgets.py's selftest not run by this lane",
+ "cause": "the script's own header says `uv run --frozen python`, and the lane brief allows only checks that need no build",
+ "class": "a check that needs an environment its caller is not told of",
+ "prevention": "not built: guards.py adds tools/typed-input/src to sys.path itself as it does HERE, so its selftest needs nothing",
+ "workaround": "PYTHONPATH=tools/typed-input/src python3 harness/v2/guards.py selftest",
+ "state": "open"
+}

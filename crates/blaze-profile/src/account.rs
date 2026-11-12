@@ -1,5 +1,5 @@
 //! One accounting per build: the change it saw, the work it did, and for each piece of work the
-//! cause that made it necessary (docs/profiling.md, "The build's account").
+//! cause that made it necessary (docs/profiling.md, "`accounts`").
 //!
 //! The profile records a lot (spans, `query_counts`, `provenance`, `misses`), and until
 //! 2026-11-12 nothing added it up: a no-op that wrote 53 inputs, 46 units made again in every

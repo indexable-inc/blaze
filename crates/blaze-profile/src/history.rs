@@ -904,6 +904,9 @@ pub struct History {
     accounts: Vec<AccountRow>,
     /// The rows this history could not write, by table, since it opened.
     dropped: Dropped,
+    /// Whether the flush before this one panicked ([`History::flush_contained`]): a second
+    /// in a row lets go of the rows kept from flush to flush too.
+    panicked_before: bool,
     /// The ring a flush reads CPU samples from ([`History::open`]), the samples of it read so
     /// far, and a flush's new ones.
     sampler: &'static sampler::Ring,
@@ -1052,6 +1055,7 @@ impl History {
             provenance: Vec::new(),
             accounts: Vec::new(),
             dropped: Dropped::default(),
+            panicked_before: false,
             sampler,
             sampled: 0,
             // alloc: once a history
@@ -1330,10 +1334,13 @@ impl History {
     pub fn flush_contained(&mut self, build: Option<u64>) -> Result<Flushed, HistoryError> {
         let flushed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.flush(build)));
         match flushed {
-            Ok(flushed) => flushed,
+            Ok(flushed) => {
+                self.panicked_before = false;
+                flushed
+            }
             Err(panic) => {
                 let what = supervise::panic_text(&*panic);
-                let rows = self.read.rows();
+                let read = self.read.rows();
                 // By table, so what is missing is said where a reader looks for it.
                 let mut lost = Dropped::default();
                 for (table, rows) in [
@@ -1347,9 +1354,44 @@ impl History {
                     lost.add(table, rows as u64);
                     self.dropped.add(table, rows as u64);
                 }
+                // The rows a flush keeps for the next when it fails (the builds' own: their
+                // misses, counts, accounts) are let go once two flushes in a row panicked:
+                // one of them may be what no batch holds, and kept it would panic every flush
+                // from here on, each dropping what the rings gave it (rule 18). Counted too.
+                if self.panicked_before {
+                    for (table, rows) in [
+                        (schema::BUILDS.name, self.ended.len()),
+                        (schema::ERRORS.name, self.errors.len()),
+                        (schema::LINKS.name, self.links.len()),
+                        (schema::CRATE_DEPS.name, self.crate_deps.len()),
+                        (schema::QUERY_COUNTS.name, self.query_counts.len()),
+                        (schema::MISSES.name, self.misses.len()),
+                        (schema::PROCESSES.name, self.processes.len()),
+                        (schema::TEST_RUNS.name, self.test_runs.len()),
+                        (schema::KEY_PARTS.name, self.key_parts.len()),
+                        (schema::PROVENANCE.name, self.provenance.len()),
+                        (schema::ACCOUNTS.name, self.accounts.len()),
+                    ] {
+                        lost.add(table, rows as u64);
+                        self.dropped.add(table, rows as u64);
+                    }
+                    self.ended.clear();
+                    self.errors.clear();
+                    self.links.clear();
+                    self.crate_deps.clear();
+                    self.query_counts.clear();
+                    self.misses.clear();
+                    self.processes.clear();
+                    self.test_runs.clear();
+                    self.key_parts.clear();
+                    self.provenance.clear();
+                    self.accounts.clear();
+                }
+                self.panicked_before = true;
                 let tables = lost.line().unwrap_or_else(|| "none of the rings'".to_owned()); // alloc: error path
                 self.read.clear();
                 self.clean = false;
+                let rows = (read as u64).max(lost.total()) as usize;
                 Err(HistoryError::Panicked { what, rows, tables })
             }
         }
@@ -2687,7 +2729,7 @@ mod tests {
         _ = fs::remove_dir_all(&dir);
     }
 
-    /// The invariant: a build's account is written by the next flush, once, each count in its
+    /// A build's account is written by the next flush, once, each count in its
     /// own column, and a history with no account yet (one from before the table) reads as no
     /// rows through the table's schema file.
     #[test]

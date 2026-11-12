@@ -402,6 +402,8 @@ impl Real {
             seen.units = Some(seen.units.unwrap_or(0));
             (seen.written, seen.unkept, seen.described) = (Some(0), Some(0), Some(0));
             seen.why = "answered as the last build was (the no-op lane)".to_owned();
+            // No build ran, so there is no work to account for.
+            seen.account = Some(Vec::new());
             return seen;
         }
         let none = BTreeMap::new();
@@ -441,6 +443,32 @@ impl Real {
             seen.alarms.push(line.to_owned());
         }
         seen.why.push_str(&said.stdout);
+        // The build's account: the standing expectation of every revision (`check::ACCOUNT`).
+        match build {
+            Some(build) => {
+                let account = self.blaze(&["explain", "account", &format!("build={build}"), "--json"], &none);
+                let row = account
+                    .stdout
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .find(|row| row["build_id"].as_u64() == Some(build));
+                match row {
+                    Some(row) if account.ok => {
+                        let n = |column: &str| row[column].as_u64().map_or("-".to_owned(), |it| it.to_string());
+                        seen.account = Some(match row["alarms"].as_str() {
+                            Some(alarms) => alarms.split(", ").map(str::to_owned).collect(),
+                            None => Vec::new(),
+                        });
+                        seen.account_said = format!(
+                            "written={} executed={} ran_uncaused={} steps={} changes={} by_unexplained={} by_unstable={} unbalanced={} unkept={}",
+                            n("written"), n("executed"), n("ran_uncaused"), n("steps"), n("changes"), n("by_unexplained"), n("by_unstable"), n("unbalanced"), n("unkept")
+                        );
+                    }
+                    _ => seen.account_said = format!("`blaze explain account build={build} --json` said: {}{}", account.stdout, account.stderr),
+                }
+            }
+            None => seen.account_said = "the build's number was not seen in its messages".to_owned(),
+        }
         if let Some(build) = build
             && (revision.expect.max_executed.is_some()
                 || revision.expect.max_verified.is_some()

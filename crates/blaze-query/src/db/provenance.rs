@@ -500,7 +500,7 @@ mod name_tests {
 mod log_tests {
     use super::*;
 
-    /// The invariant: every event logged is kept whole, kept as a sample, or counted, and
+    /// Every event logged is kept whole, kept as a sample, or counted, and
     /// nothing else: whole + samples + dropped is the events logged, the first [`LOG_MOST`]
     /// are whole, and past them exactly one in [`SAMPLE_EVERY`] is a sample of that weight.
     #[test]

@@ -253,7 +253,7 @@ pub fn facts(
         span_stacks: span_stacks(answer(5))?,
         thread_cpu: thread_cpu(answer(6))?,
         problems: problems(answer(7))?,
-        account: account(answer(8))?,
+        account: account(answer(8), build)?,
         memory: if windowed.is_some() { memory(answer(9))? } else { Memory::default() },
         recorder: if windowed.is_some() { recorder(answer(10))? } else { Recorder::default() },
         spans: crate::time::SpanCut::default(),
@@ -651,7 +651,10 @@ fn account_sql(build: u64) -> String {
 }
 
 /// The build's account, when the history holds one.
-fn account(batches: &[RecordBatch]) -> Result<Option<crate::account::AccountRow>, TimeError> {
+fn account(
+    batches: &[RecordBatch],
+    build: u64,
+) -> Result<Option<crate::account::AccountRow>, TimeError> {
     let Some((batch, row)) = rows(batches).next() else { return Ok(None) };
     const T: &str = "accounts";
     let mut counts = [0u64; ACCOUNT_COUNTS.len()];
@@ -697,7 +700,7 @@ fn account(batches: &[RecordBatch]) -> Result<Option<crate::account::AccountRow>
     ] = counts;
     Ok(Some(crate::account::AccountRow {
         // The row was asked for by its build.
-        build_id: 0,
+        build_id: build,
         written,
         written_source,
         written_environment,
