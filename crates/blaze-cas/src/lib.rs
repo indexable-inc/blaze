@@ -4235,8 +4235,8 @@ impl Store {
     }
 
     /// Decides how the store places ([`PlaceBy`]) by trying one clone of a file of its own in
-    /// its own directory: the leftovers of an earlier try removed (steps 0 and 1), a small
-    /// file written (2), cloned (3), and both removed. A clone that is made: by cloning. One
+    /// its own directory: the leftovers of an earlier try removed (steps 0 and 1), an empty
+    /// file made (2), cloned (3), and both removed. A clone that is made: by cloning. One
     /// the file system refuses because it cannot share blocks: by copying. Anything else
     /// that fails is asked again, and breaks the store naming the file after
     /// [`FAILURES_MOST`] tries: the store does not guess. The look through `placed/` is asked
@@ -4247,8 +4247,12 @@ impl Store {
         effects.push(match step {
             0 => Effect::Remove { file: clone, tag },
             1 => Effect::Remove { file, tag },
-            // alloc: a few bytes, once per open
-            2 => Effect::WriteUnsynced { file, bytes: b"blaze tries a clone".to_vec(), tag },
+            // An empty file: a clone of it has no data to force out of its source and waits
+            // for no write-back, so the try holds no place up on a device that is slow or
+            // not answering (a file with bytes, cloned as soon as it was written, forced
+            // them out: 19 bytes in every placement test, and a hang under held syncs).
+            // alloc: empty, allocates nothing
+            2 => Effect::WriteUnsynced { file, bytes: Vec::new(), tag },
             _ => Effect::Clone { from: file, to: clone, tag },
         });
     }

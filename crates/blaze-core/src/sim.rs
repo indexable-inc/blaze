@@ -2498,7 +2498,9 @@ impl Driver for Sim {
         for pending in ready.drain(..) {
             if !self.recording.is_empty() {
                 let file = match &pending.effect {
-                    Effect::Sync { file, .. } => Some((file, true)),
+                    // A barrier is what a commit waits on the device for where it once
+                    // waited on a sync: recorded as one.
+                    Effect::Sync { file, .. } | Effect::Barrier { file, .. } => Some((file, true)),
                     Effect::Write { file, .. }
                     | Effect::WriteUnsynced { file, .. }
                     | Effect::WriteAt { file, .. }
