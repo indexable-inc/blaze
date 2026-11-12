@@ -2442,6 +2442,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                             // is the image's if either says so, and then is the image's describer's
                             // whole: its code is the key's either way, and the image's copy refers
                             // to what that describer's references are, never the workspace's.
+                            // Of two of one owner, the one of the least origin and name.
                             // Two describes under one key that disagree on what the code is mean the
                             // key misses an input (rule 21): refused, never one kept silently.
                             blaze_hash::hash_map::Entry::Occupied(mut it) => {
@@ -2479,7 +2480,17 @@ impl<'a, B: Prepare> Build<'a, B> {
                                     ));
                                 } else {
                                     let least = it.get().least_origin.min(node.least_origin);
-                                    if new.owner < kept.owner {
+                                    // Which describe the key keeps is of the describes
+                                    // alone, never of which the walk came to first (rule
+                                    // 25): the image's, then the least origin's, then the
+                                    // least name's. A walk patched from a kept one holds
+                                    // the choice of the whole walk it was kept from, and an
+                                    // edit that leaves both describes as they were may
+                                    // still turn the order a whole walk reaches them in
+                                    // (a reference added before them): by order, the
+                                    // patched walk and a whole one then kept two describes.
+                                    let rank = |it: &Described<_, _>| (it.owner, it.origin);
+                                    if (rank(new), &new.name) < (rank(kept), &kept.name) {
                                         it.insert(node);
                                     }
                                     it.get_mut().least_origin = least;
