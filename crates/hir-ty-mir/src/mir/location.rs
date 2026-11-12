@@ -210,11 +210,9 @@ pub fn name_sources(
             names.set_rule(db).with_durability(blaze_query::db::Durability::HIGH).to(rule);
         }
         None => {
+            // What read the singleton's absence (`file_source_path`) read its field's node,
+            // which making it changes (blaze-query's `a_singletons_absence_is_a_tracked_read`).
             _ = SourceNames::new(db, blaze_query::db::Durability::HIGH, rule);
-            // Reading a singleton that does not exist yet is not tracked: what read it before
-            // reported an untracked read (`file_source_path`), which a new revision makes stale.
-            // The read may be under a memo of any durability, so the write is of the highest.
-            db.storage_mut().synthetic_write(blaze_query::db::Durability::HIGH);
         }
     }
 }
@@ -235,13 +233,8 @@ fn file_source_path<'db>(
     krate: base_db::Crate,
     file: base_db::FileText,
 ) -> Option<String> {
+    // The absence is a tracked read: the row runs again when `name_sources` makes it.
     let Some(names) = SourceNames::try_get(db) else {
-        blaze_query::db::report_untracked_read(
-            db,
-            blaze_query::db::Untracked {
-                what: "the absence of the `SourceNames` singleton (`name_sources` not told yet)",
-            },
-        );
         return None;
     };
     (names.rule(db).paths)(db, krate, *file.file_id(db))
