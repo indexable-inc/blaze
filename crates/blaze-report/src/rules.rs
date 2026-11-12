@@ -67,9 +67,10 @@ pub const RULES: &[Rule] = &[
         title: "a sandboxed build script may name only its own, its build's and the system's library directories",
         text: "A build script runs in the sandbox, and a `rustc-link-search` (or a `-L` in `rustc-flags`) it \
                prints reaches every link of its package and of what links it. So the directory must be inside \
-               its OUT_DIR, its package, the build directory (its dependencies' OUT_DIRs), or a system directory \
+               its OUT_DIR, its package, the build directory (its dependencies' OUT_DIRs), a system directory \
                the linker searches anyway (/usr/lib, /nix/store, Homebrew's and Apple's SDKs; the list is \
-               SYSTEM in crates/blaze-cargo/src/directives.rs).\n\n\
+               SYSTEM in crates/blaze-cargo/src/directives.rs), or a layout of blaze's own pinned native \
+               inputs (a `sha256-<digest>` directory under `<BLAZE_HOME>/native`).\n\n\
                Ways out: a directory of the system it links from goes in `build-script-link-dirs = [...]` under \
                [workspace.metadata.blaze.sandbox] in the workspace's root manifest (`${VAR}/lib` names one \
                under a variable the script is given); a script that needs more runs outside the sandbox, by name \

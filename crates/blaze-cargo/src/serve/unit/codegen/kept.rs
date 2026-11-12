@@ -6,7 +6,7 @@
 #[cfg(test)]
 mod tests;
 
-use std::{cell::Cell, collections::BTreeMap, fmt};
+use std::{cell::Cell, collections::BTreeMap, fmt, sync::Arc};
 
 use blaze_codegen::{
     BuiltId, CompiledFunction, InstanceKey, Static, StaticId, driver::Built,
@@ -185,7 +185,7 @@ where
 /// [`Built::functions`] by key ([`Listed`]).
 pub(crate) fn functions_of(
     built: &Built,
-) -> Listed<'_, CompiledFunction, impl Fn(&CompiledFunction) -> InstanceKey> {
+) -> Listed<'_, Arc<CompiledFunction>, impl Fn(&Arc<CompiledFunction>) -> InstanceKey> {
     Listed::new(&built.functions, "functions", |it| it.key)
 }
 

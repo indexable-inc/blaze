@@ -130,13 +130,25 @@ fn hello_comes_first_then_the_source_answers() {
     assert_eq!(core.phase(), Phase::Hello, "nothing before a good hello opens the session");
     assert_eq!(core.request(&token, GOOD), Step::Hello { first: true });
     assert_eq!(core.phase(), Phase::Open);
-    match core.request(&token, br#"{"op":"count","n":3}"#) {
-        Step::Op { name, args } => {
-            assert_eq!(name, "count");
-            assert_eq!(args["n"], 3, "the source is given the request whole");
-            assert_eq!(args["op"], "count");
-        }
-        other => panic!("the source's op, not {other:?}"),
+    assert_eq!(
+        core.request(&token, br#"{"op":"count","n":3,"deep":{"op":"no"}}"#),
+        Step::Op { name: "count".to_owned() },
+        "the source's op, which the driver gives the request whole"
+    );
+    for (bad, says) in [
+        (&br#"{"op":"hello","token":5}"#[..], "`token` is a number, not a string"),
+        (br#"{"op":"hello","token":{"a":[1]}}"#, "`token` is an object, not a string"),
+        (br#"{"op":"hello"}"#, "missing field `token`"),
+        (
+            br#"{"op":"hello","token":"07070707070707070707070707070707","extra":[1]}"#,
+            "unknown field `extra`",
+        ),
+        (br#"[{"op":"hello"}]"#, "no string `op`"),
+        (br#""hello""#, "no string `op`"),
+    ] {
+        let error = refused(core.request(&token, bad));
+        assert_eq!(error.kind, "bad_args", "{}: {error}", String::from_utf8_lossy(bad));
+        assert!(error.message.contains(says), "{}: {error}", String::from_utf8_lossy(bad));
     }
     assert_eq!(core.request(&token, GOOD), Step::Hello { first: false }, "hello again");
 }
@@ -211,8 +223,18 @@ fn an_emptied_replace_set_is_sent_once_as_no_rows() {
 #[test]
 fn hello_says_the_source_the_certificate_the_protocol_and_the_layers() {
     let served = Served { hash: "h".to_owned(), not_after_s: 99 };
-    let header = session::hello_header(&hello(), &served, Duration::from_millis(250), None);
-    let header = Value::Object(header);
+    let source = hello();
+    let header = session::hello_header(&source, &served, Duration::from_millis(250), None);
+    let text = serde_json::to_string(&header).unwrap();
+    assert_eq!(
+        text,
+        format!(
+            r#"{{"op":"hello","daemon":"test 0.1","schema":3,"clock":"{}","now_ns":42,"certhash":"h","cert_not_after_unix_s":99,"live_every_ms":250,"source":{{"kind":"test","extensions":["test"]}},"protocol":{PROTOCOL},"layers":[{{"name":"test","version":3}}]}}"#,
+            crate::clock::CLOCK
+        ),
+        "the header's bytes, its fields in this order whatever the build turns on in serde_json"
+    );
+    let header: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(header["op"], "hello");
     assert_eq!(header["daemon"], "test 0.1");
     assert_eq!(header["schema"], 3);
@@ -244,8 +266,9 @@ fn hello_names_the_core_served_and_the_core_op_answers_its_bytes_after_an_aligne
     let bytes = core_module(1);
     let core = super::CoreWasm::new(bytes.clone(), "core.wasm").unwrap();
     let served = Served { hash: "h".to_owned(), not_after_s: 99 };
-    let header = session::hello_header(&hello(), &served, Duration::from_millis(250), Some(&core));
-    let header = Value::Object(header);
+    let source = hello();
+    let header = session::hello_header(&source, &served, Duration::from_millis(250), Some(&core));
+    let header = serde_json::to_value(header).unwrap();
     let said = serde_json::json!({"abi": 1, "sha256": core.sha256, "bytes": bytes.len()});
     assert_eq!(header["core"], said);
     assert_eq!(header.as_object().unwrap().len(), 12, "{header}");
@@ -303,12 +326,38 @@ fn an_answer_that_fails_becomes_its_error_with_no_ipc() {
 
 #[test]
 fn an_error_header_has_its_kind_message_and_detail() {
-    let header = OpError::new("sql", "no such table").with("query", "select * from x").header();
-    let error = &header["error"];
-    assert_eq!(error["kind"], "sql");
-    assert_eq!(error["message"], "no such table");
-    assert_eq!(error["query"], "select * from x");
-    assert_eq!(header.len(), 1);
+    let failed = OpError::new("sql", "no such table").with("query", "select * from x");
+    let text = serde_json::to_string(&failed.header()).unwrap();
+    assert_eq!(
+        text,
+        r#"{"error":{"kind":"sql","message":"no such table","query":"select * from x"}}"#
+    );
+    let live = serde_json::to_string(&session::live_error_header(&failed)).unwrap();
+    assert_eq!(
+        live,
+        r#"{"error":{"kind":"sql","message":"no such table","query":"select * from x"},"op":"live"}"#
+    );
+    // A detail set twice keeps its place and its last value; one named as the error's own
+    // fields is the one written.
+    let twice = OpError::new("sql", "no").with("a", 1).with("b", 2).with("a", 3).with("kind", "x");
+    assert_eq!(
+        serde_json::to_string(&twice.header()).unwrap(),
+        r#"{"error":{"message":"no","a":3,"b":2,"kind":"x"}}"#
+    );
+}
+
+#[test]
+fn the_live_and_cert_headers_are_their_fields_in_order() {
+    let tick = Tick { at_ns: 7, skipped: 2, lost: 1, ..Tick::default() };
+    assert_eq!(
+        serde_json::to_string(&session::live_header("spans", 3, &tick)).unwrap(),
+        r#"{"op":"live","table":"spans","rows":3,"at_ns":7,"skipped":2,"lost":1}"#
+    );
+    let served = Served { hash: "h".to_owned(), not_after_s: 99 };
+    assert_eq!(
+        serde_json::to_string(&session::cert_header(&served)).unwrap(),
+        r#"{"op":"cert","certhash":"h","not_after_unix_s":99}"#
+    );
 }
 
 fn explorer(dev_origin: bool) -> Explorer {

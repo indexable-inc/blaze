@@ -10,7 +10,8 @@ use base_db::{Crate, CrateOrigin, Db};
 use blaze_codegen::{
     CodegenError, InstanceKey, Owner,
     backend::{
-        Address, Counted, Described, DescribedStatic, FrontRef, Frontend, Instantiates, Limit,
+        Address, Changed, Counted, Described, DescribedStatic, FrontRef, Frontend, Instantiates,
+        Limit,
     },
     driver::Kept,
     plan::{Mode, Origin, Package, PlanError, Policy},
@@ -90,7 +91,7 @@ pub struct HirFrontend<'db> {
     units: Option<Arc<Units>>,
     /// Which of the units given in this process `units` is ([`give_units`]).
     units_id: Option<u32>,
-    // dyn: `reached` once a level of the walk, `stopped` once a function compiled (2 ns
+    // dyn: `reached` once a batch of the walk, `stopped` once a function compiled (2 ns
     // against its 50 to 200 µs), never per instruction
     checks: Option<&'db dyn BodyChecks>, // dyn: never per instruction, as above
     /// Set when the build's job is cancelled or gives way to another task.
@@ -493,6 +494,28 @@ const KEPT_WALKS: usize = 8;
 static KEPT: Lock<Vec<(base_db::Nonce, Facing, Arc<Kept<HirInstance, HirStatic>>)>> =
     Lock::new("codegen.frontend.kept", Vec::new());
 
+/// Lets go of every kept walk ([`HirFrontend::kept`]): each function's describe, each
+/// program's last walk and lists, of every database and configuration. How many describes
+/// went. They are kept only so the next build's walk asks the front end less; on the global
+/// heap, under no budget, they were what a cold build of blaze held most of codegen's heap
+/// for (13.11 GiB with one task running; the held samples' spans were `codegen reach`,
+/// `codegen resolve`, `codegen delta` and `codegen templates`, each as old as the build: lane
+/// mem-1111, 2026-11-11). A walk in flight keeps its own until it ends; the next walk over
+/// each database begins with nothing kept and says why ([`Fresh::LetGo`]), its describes
+/// verified by the query database where they are memos ([`described_memo`]).
+///
+/// [`Fresh::LetGo`]: blaze_codegen::driver::Fresh::LetGo
+pub fn let_go_kept_walks() -> usize {
+    let mut kept = KEPT.lock();
+    let mut describes = 0;
+    for (_, _, walks) in kept.iter_mut() {
+        describes += walks.len();
+        // alloc: an empty table, once a database and configuration a release
+        *walks = Arc::new(Kept::after_let_go());
+    }
+    describes
+}
+
 const NO_POLICY: &str = "the front end was made with no policy (`HirFrontend::with_policy`), so \
                          it can't tell how the instance's units build its MIR";
 
@@ -520,7 +543,7 @@ impl<'db> HirFrontend<'db> {
     }
 
     /// The front end of a build whose unit's bodies `checks` checks beside it.
-    // dyn: called once a level of the walk, never per instance
+    // dyn: called once a batch of what the walk reaches, never per instance
     pub fn with_checks(mut self, checks: &'db dyn BodyChecks) -> Self {
         self.checks = Some(checks);
         self
@@ -753,8 +776,8 @@ impl<'db> HirFrontend<'db> {
     ) -> Result<Described<HirInstance, HirStatic>, CodegenError> {
         // One span a describe, named for its function once described, opened where the work
         // is: a describe the database's memo answers opens none, so the spans of a walk are
-        // the functions whose describe ran. A level's describes run as a few long pool jobs
-        // (`par::split`), and a job of 149 s in a self-build said only `par::map` (spans37).
+        // the functions whose describe ran. A walk's describes run as a few long pool jobs
+        // (its worklist's), and a job of 149 s in a self-build said only `par::map` (spans37).
         let span = tracing::info_span!(
             target: "blaze",
             "codegen describe",
@@ -1112,12 +1135,11 @@ impl Frontend for HirFrontend<'_> {
     }
 
     fn reached(&self, functions: &[(HirInstance, Origin)], statics: &[HirStatic]) {
-        self.devirt.reached(functions, statics);
         let Some(checks) = self.checks else { return };
         let bodies: Vec<DefWithBodyId> = self.with(|db| {
             (functions.iter().filter_map(|(instance, _)| body_of(db, instance)))
                 .chain(statics.iter().map(|it| DefWithBodyId::StaticId(it.0)))
-                // alloc: once a level of the walk, sized by it
+                // alloc: once a batch of what the walk reaches, sized by it
                 .collect()
         });
         checks.reached(&bodies);
@@ -1134,22 +1156,108 @@ impl Frontend for HirFrontend<'_> {
             let counted = |(instance, _): &(HirInstance, Origin)| {
                 counted_memo(db, instance.clone(), ())
             };
-            // alloc: once a level of the walk, sized by it
+            // alloc: once per describe that reaches new functions, sized by them
             functions.iter().map(counted).collect()
         })
     }
 
-    /// Durable when both of its memos are current and of library inputs alone (the query
-    /// engine's `durable`), and its describe is the database's: one of a body that names a
-    /// file is the build's each time. Asked after the walk described and counted it.
-    fn durable(&self, instance: &HirInstance, requester: &Origin) -> bool {
+    /// The query engine's changed set since `view`
+    /// (docs/v2/plan/design/incremental-walk.md, "The changed set from the engine"): the
+    /// keys of [`described_memo`], [`counted_memo`] and [`described_static_memo`] whose
+    /// value changed, each read back to its arguments. The engine walks from what was
+    /// written first, so the rows it names are up to date when the walk asks of them.
+    ///
+    /// A describe's key holds its [`Facing`] too. A walk is kept for one configuration
+    /// ([`Self::kept`]) and patched only where no body takes the program's dyn facts
+    /// ([`Frontend::closes`]), so a function the walk holds is asked under the key it was
+    /// described under; a changed key of another facing names its instance and requester all
+    /// the same, which costs the walk one ask where it holds them.
+    ///
+    /// Unknown, with the engine's reason, when any of the three is: the view is none of this
+    /// database's, or the set is asked for inside a query while the engine's walk is due. The
+    /// engine's log of changed sets answers from any earlier view (it merges its oldest
+    /// findings, never drops them). The driver refuses a build whose front end answers
+    /// Unknown: no walk asks of everything in the set's place.
+    fn changed_since(&self, view: u64) -> Changed<HirInstance, HirStatic> {
+        use blaze_query::db::{Changed as Keys, View};
+        let since = View::from_u64(view);
+        // alloc: an error's message, where the engine names a key that is none of a query's
+        let no_key = |query: &str, id: blaze_query::db::Id| {
+            Changed::Unknown(format!(
+                "the query engine named key {} of `{query}` as changed, which is no key of it",
+                id.as_u32()
+            ))
+        };
         self.with(|db| {
-            let facing = self.facing(self.key_world(db, instance));
-            // clone: the queries' keys by value, a few `Copy` ids in a `Clone`-only type
-            matches!(self.memoed(db, instance, requester), Memoed::Described(_))
-                && described_memo::durable(db, instance.clone(), *requester, facing)
-                && counted_memo::durable(db, instance.clone(), ())
+            let described = match described_memo::changed_since(db, since) {
+                Keys::Keys(ids) => ids,
+                // alloc: once a build, why the engine names no changed set
+                Keys::Unknown(why) => return Changed::Unknown(format!("`described_memo`: {why}")),
+            };
+            let counts = match counted_memo::changed_since(db, since) {
+                Keys::Keys(ids) => ids,
+                // alloc: as above
+                Keys::Unknown(why) => return Changed::Unknown(format!("`counted_memo`: {why}")),
+            };
+            let values = match described_static_memo::changed_since(db, since) {
+                Keys::Keys(ids) => ids,
+                // alloc: as above
+                Keys::Unknown(why) => {
+                    return Changed::Unknown(format!("`described_static_memo`: {why}"));
+                }
+            };
+            // alloc: once a build, sized by the edit's changed set
+            let mut functions = Vec::with_capacity(described.len());
+            for id in described {
+                let Some((instance, requester, _)) = described_memo::arguments(db, id) else {
+                    return no_key("described_memo", id);
+                };
+                functions.push((instance, requester));
+            }
+            // alloc: as above
+            let mut counted = Vec::with_capacity(counts.len());
+            for id in counts {
+                let Some((instance, ())) = counted_memo::arguments(db, id) else {
+                    return no_key("counted_memo", id);
+                };
+                counted.push(instance);
+            }
+            // alloc: as above
+            let mut statics = Vec::with_capacity(values.len());
+            for id in values {
+                let Some((value, _)) = described_static_memo::arguments(db, id) else {
+                    return no_key("described_static_memo", id);
+                };
+                statics.push(value);
+            }
+            Changed::Named { functions, counted, statics }
         })
+    }
+
+    /// A describe of a body that names a file is the build's each time
+    /// ([`Memoed::NamesFiles`]): what the build calls the file is no input of the database,
+    /// so the engine's changed set does not cover it. Every other describe is the
+    /// database's memo. Whether a body names a file is the memo's own value, so a body that
+    /// starts or stops naming one is a changed key, and the walk asks this again then.
+    fn each_build(&self, instance: &HirInstance, requester: &Origin) -> bool {
+        self.with(|db| matches!(self.memoed(db, instance, requester), Memoed::NamesFiles))
+    }
+
+    /// A static whose value holds a file's name ([`MemoedStatic::NamesFiles`]), as
+    /// [`Self::each_build`].
+    fn static_each_build(&self, value: &HirStatic) -> bool {
+        self.with(|db| {
+            matches!(
+                described_static_memo(db, *value, self.facing(None)),
+                MemoedStatic::NamesFiles
+            )
+        })
+    }
+
+    /// The database's view (`Storage::view`): what [`Self::changed_since`] is asked from.
+    fn view(&self) -> Option<u64> {
+        let storage = blaze_query::db::Database::storage(self.databases.db);
+        Some(storage.view().as_u64())
     }
 
     /// The view the last write of a library input opened in the database
@@ -1183,17 +1291,21 @@ impl Frontend for HirFrontend<'_> {
     ) -> CodegenError {
         self.with(|db| past_recursion_limit(db, instance, depth, limit, head, limit_of))
     }
-    fn closed(&self) -> Result<bool, CodegenError> {
-        self.devirt.closed(self)
+    fn closed(
+        &self,
+        functions: &[(HirInstance, Origin)],
+        statics: &[HirStatic],
+    ) -> Result<bool, CodegenError> {
+        self.devirt.closed(self, functions, statics)
     }
 }
 
 /// The domain of the body a shim is an instance of, for the walk's recursion limit.
 const SHIM_BODY_DOMAIN: &str = "blaze v2 recursion shim body 2";
 
-/// [`counted`] of `instance`, kept by the database: with its describe's memo, what tells a
-/// function whose every input is a library's ([`Frontend::durable`]). The unit argument makes
-/// the key an interned one, as an instance is no ID.
+/// [`counted`] of `instance`, kept by the database: with its describe's memo, what the
+/// engine's changed set names a function by ([`Frontend::changed_since`]). The unit argument
+/// makes the key an interned one, as an instance is no ID, and gives the query `arguments`.
 #[blaze_query::tracked(returns(copy))]
 fn counted_memo(db: &Db, instance: HirInstance, _alone: ()) -> Counted {
     counted(db, &instance.0)

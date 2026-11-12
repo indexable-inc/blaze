@@ -37,7 +37,11 @@
 //! leaves the manifest listing bytes the disk lost (every file and the manifest, with the
 //! directory synced around the manifest's rename). Past [`CAP_BYTES`] (or the cap the history
 //! is opened with), the oldest builds are retired first, each whole: every table and flush of a
-//! build at once, so a reader of a build reads all of it or none.
+//! build at once, with every file that holds a row of it and so every build those files hold
+//! rows of too, so a reader of a build reads all of it or none; never a build still running
+//! ([`History::build_started`] to [`History::build_ended`]) nor the newest flush's. What goes is
+//! said as a WARN event ([`said_capped`]), as are rows the rings wrote over before a flush
+//! read them: the history never loses rows with nothing said.
 //!
 //! A flush every [`EVERY`] would leave thousands of files a long build (a 52-minute self-build
 //! left 3,250), and every reader reads each one's footer. So after each flush the
@@ -150,13 +154,48 @@ pub use manifest::Manifest;
 pub use pin::Pin;
 pub use retire::PINS;
 
-/// What the history keeps by default: 4 GiB, about 400 million rows at the ~10 bytes a row
-/// takes compressed. A self-build's `check` and `build` wrote about 1 GiB together with every
-/// span a row, which a 1 GiB cap trimmed from under the build it was asked about (profrows).
-pub const CAP_BYTES: u64 = 4 << 30;
+/// What the history keeps by default: 256 MiB, about 25 million rows at the ~10 bytes a row
+/// takes compressed. Measured 2026-11-11: hello-world's cold build (std's front end and
+/// code, 400,000 spans) is 18 MiB and each edit after it 0.3 MiB, so the default holds a
+/// small project's cold build and several hundred edits, and of a large workspace its
+/// newest builds: the newest flush's builds and every build still running are never retired
+/// ([`files`]), so the build being asked about is whole whatever the cap. It was 4 GiB until
+/// then (from 1 GiB, which trimmed a self-build from under itself before running builds were
+/// kept): a day's work left 1.3 GiB. What goes is said each time ([`said_capped`]). A daemon
+/// started with [`CAP_VAR`] keeps that many MiB instead.
+pub const CAP_BYTES: u64 = 256 << 20;
+
+/// The daemon's setting for the history's cap, in MiB: `BLAZE_PROFILE_CAP_MB=4096` keeps what
+/// the default was until 2026-11-11.
+pub const CAP_VAR: &str = "BLAZE_PROFILE_CAP_MB";
+
+/// The cap a daemon started with [`CAP_VAR`] set to `value` keeps: [`CAP_BYTES`] unset, that
+/// many MiB set; a value that is no whole number of MiB from 1 up is refused, naming it.
+pub fn cap_of(value: Option<&str>) -> Result<u64, String> {
+    let Some(value) = value else { return Ok(CAP_BYTES) };
+    match value.trim().parse::<u64>() {
+        Ok(mib) if mib >= 1 && mib <= u64::MAX >> 20 => Ok(mib << 20),
+        // alloc: an error, once a daemon
+        _ => Err(format!(
+            "{CAP_VAR}={value:?} is not a number of MiB from 1 up for the profile history to keep \
+             (unset, it keeps {} MiB)",
+            CAP_BYTES >> 20
+        )),
+    }
+}
 
 /// How often the daemon flushes while a session runs.
 pub const EVERY: Duration = Duration::from_secs(5);
+
+/// How often the daemon's timer flushes a quiet history ([`History::quiet`]: no build
+/// running, none whose row waits): a flush is a file a table with rows, each several KiB
+/// of Parquet footer whatever it holds, so an idle daemon's flush every [`EVERY`] wrote 48 KiB
+/// for a few hundred rows of its own heartbeat, 0.6 MB a minute (2026-11-11, samples aside).
+/// Nothing is lost by the wait and no reader sees it: a reader asks for a flush before it
+/// reads, a build's start and end each flush, [`FLUSH_ROWS`] drained flush at once, and the
+/// rows of a daemon that dies meanwhile are in its rings (an idle thread writes far fewer
+/// than a ring holds in this time), which the next history reads back.
+pub const IDLE_EVERY: Duration = Duration::from_secs(60);
 
 /// How often the history's drain thread reads the rings into the next flush, on a thread of its
 /// own so a flush that takes seconds stops no drain. A thread's ring holds [`flight::CAP`]
@@ -165,6 +204,11 @@ pub const EVERY: Duration = Duration::from_secs(5);
 /// the writer's thread every 250 ms, a 102 s self-build step lost 42 M rows while flushes of
 /// seconds stopped it (profrows).
 pub const DRAIN: Duration = Duration::from_millis(50);
+
+/// How often a flush reads the sampled blocks still held into `held_samples`
+/// ([`crate::heap::held`]): each reading is a row a held sample, one per 4 MiB held, so a
+/// minute keeps an hour's build of 60 GiB to about a million rows.
+pub const HELD_EVERY: Duration = Duration::from_secs(60);
 
 /// Rows drained that make the history flush before [`EVERY`] is up ([`History::full`]): about
 /// four row groups, so a busy build's rows are written as they come, not held for seconds.
@@ -361,6 +405,26 @@ pub const CLIENT_PROCESS: &str = "blaze client";
 /// its rows later than this many builds ended after its own has its times dropped, named.
 const RECENT_BUILDS: usize = 64;
 
+/// Says what the cap retired, as one WARN event with the counts as its fields, so `blaze
+/// explain problems` names it and the builds whose rows are gone. Until 2026-11-11 the cap
+/// said nothing: a long build's history held its last five minutes and no row said why.
+fn said_capped(capped: &files::Capped) {
+    if capped.files == 0 {
+        return;
+    }
+    let [first_build, last_build] = capped.builds.unwrap_or([0, 0]);
+    tracing::warn!(
+        target: "blaze",
+        files = capped.files,
+        rows = capped.rows,
+        bytes = capped.bytes,
+        first_build,
+        last_build,
+        "the profile history passed its cap and retired its oldest builds' rows, each build \
+         whole: `blaze debug sql` and `blaze slow` no longer read them"
+    );
+}
+
 /// What a flush wrote.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Flushed {
@@ -375,6 +439,8 @@ pub struct Flushed {
     pub samples: usize,
     /// Heap samples ([`crate::heap`]): `alloc_samples` rows.
     pub alloc_samples: usize,
+    /// Samples still held at this flush's reading, if it made one: `held_samples` rows.
+    pub held_samples: usize,
     pub switches: usize,
     pub events: usize,
     /// Rows of `event_fields`: the fields of the events written.
@@ -404,8 +470,12 @@ pub struct Flushed {
     pub bytes: u64,
     /// Rows the rings wrote over before this flush read them, CPU samples included.
     pub skipped: u64,
-    /// Old files retired to stay under the cap (deleted once no reader pins them).
+    /// Old files retired to stay under the cap (deleted once no reader pins them), the rows
+    /// they held and their bytes. Never silent: the flush says them as a WARN event
+    /// ([`said_capped`]).
     pub deleted: u32,
+    pub deleted_rows: u64,
+    pub deleted_bytes: u64,
     /// Files merged into others, and retired, after the flush (deleted once no reader pins
     /// them).
     pub merged: u32,
@@ -802,6 +872,10 @@ pub struct History {
     /// The heap samples read so far ([`crate::heap::since`]), and a flush's new ones.
     heap_sampled: u64,
     heap_samples: Vec<crate::heap::HeapSample>,
+    /// A reading's samples still held ([`crate::heap::held`]), and when the last was written:
+    /// one reading every [`HELD_EVERY`].
+    held_samples: Vec<crate::heap::HeapSample>,
+    held_read: Option<Instant>,
     /// The code images the samples' addresses are in that this history wrote rows of.
     images: symbols::ImagesWritten,
     /// [`identity::binary`], once a history: every build of this process ran it.
@@ -874,6 +948,7 @@ impl History {
         for refused in &opened.crashes.refused {
             tracing::warn!(target: "blaze", "{refused}");
         }
+        said_capped(&opened.capped);
         let blaze = identity::binary().map_err(|error| HistoryError::Identity {
             what: "hashing blaze's own executable",
             path: std::env::current_exe().unwrap_or_default(),
@@ -942,6 +1017,9 @@ impl History {
             heap_sampled: 0,
             // alloc: once a history
             heap_samples: Vec::new(),
+            // alloc: once a history
+            held_samples: Vec::new(),
+            held_read: None,
             images: symbols::ImagesWritten::new(),
             blaze,
             unidentified: None,
@@ -989,10 +1067,11 @@ impl History {
         flight::persist(self.core.dir(), &self.blaze, self.process.name)
             .map_err(HistoryError::Postmortem)?;
         self.persisted = true;
-        // The mapping is reserved whole as it is made: the cap counts it from now on, and the
-        // crash record armed beside it.
+        // The cap counts the mapping from now on, as long as it is at this count (a ring made
+        // later grows it by 2 MiB, counted at the next recount), and the crash record armed
+        // beside it.
         match self.core.job(files::Files::recount)? {
-            files::Outcome::Recounted(retired) => retired.map(|_| ()),
+            files::Outcome::Recounted(retired) => retired.map(|capped| said_capped(&capped)),
             other => Err(mismatch(self.core.dir(), "counting the files beside", &other)),
         }
     }
@@ -1004,6 +1083,12 @@ impl History {
         u32::try_from(self.core.files().last_build() + 1).unwrap_or(u32::MAX)
     }
 
+    /// Whether the timer has nothing to write for now ([`IDLE_EVERY`]): no build is running
+    /// and no build's row waits for the next flush.
+    pub fn quiet(&mut self) -> bool {
+        self.ended.is_empty() && !self.core.files_mut().any_running()
+    }
+
     /// Notes a build that started, `row` its row with outcome running and no duration, for the
     /// next flush to write: a build its daemon never ends (a kill, a crash) is then one row in
     /// the history, which a reader tells from one still running by its process ([`writes`]).
@@ -1012,6 +1097,10 @@ impl History {
             // clone: a hash, once a build
             row.blaze = Some(self.blaze.clone());
         }
+        // While it runs, the cap retires no file that holds a row of it, and blocked threads
+        // are sampled whatever span they block in.
+        self.core.files_mut().running(row.build_id, true);
+        sampler::build_running(true);
         flight::postmortem::build_started(&flight::postmortem::RunningBuild {
             build_id: row.build_id,
             started_ns: row.started_ns,
@@ -1029,6 +1118,9 @@ impl History {
     /// the build's. A tree that can't be digested leaves `tree` null, and the next flush answers
     /// why.
     pub fn build_ended(&mut self, mut row: BuildRow) {
+        if self.core.files_mut().running(row.build_id, false) {
+            sampler::build_running(false);
+        }
         flight::postmortem::build_ended(row.build_id);
         if row.blaze.is_none() {
             // clone: a hash, once a build
@@ -1187,6 +1279,18 @@ impl History {
         // they grew, so an idle daemon's timer writes no file for them.
         // Counted since the process began; the row of a build's flush carries the build.
         let (t_ns, now) = (self.read.at_ns, (self.read.lost, late + behind, behind));
+        // And said, each flush they grew in: a profile never loses rows with nothing said.
+        let (lost, skipped) =
+            (now.0.saturating_sub(self.told.0), now.1.saturating_sub(self.told.1));
+        if lost != 0 || skipped != 0 {
+            tracing::warn!(
+                target: "blaze",
+                spans_lost = lost,
+                rows_skipped = skipped,
+                "the flight recorder lost rows before the profile history read them: a total \
+                 over this stretch is short by what they held"
+            );
+        }
         if build.is_some() || now != self.told {
             self.told = now;
             let build = build.and_then(|it| u32::try_from(it).ok()).unwrap_or(0);
@@ -1417,12 +1521,23 @@ impl History {
         let heap_skipped = crate::heap::since(&mut self.heap_sampled, &mut self.heap_samples);
         let alloc_samples =
             [self.alloc_samples_batch().map_err(arrow_error(&schema::ALLOC_SAMPLES))?];
+        // What the heap holds, by call site: a reading of the sampled blocks nobody freed,
+        // once every `HELD_EVERY` (each reading is every held sample again, so not each flush).
+        self.held_samples.clear();
+        if self.held_read.is_none_or(|read| read.elapsed() >= HELD_EVERY) {
+            self.held_read = Some(Instant::now());
+            crate::heap::held(&mut self.held_samples);
+        }
+        let held_samples =
+            [self.held_samples_batch().map_err(arrow_error(&schema::HELD_SAMPLES))?];
         // The images the samples' and this process's panics' addresses are in, and each
         // recovered crash's executable, of its own process.
         let seen_ns = clock::mono_ns();
         let stacks = self.samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]);
         let stacks =
             stacks.chain(self.heap_samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]));
+        let stacks =
+            stacks.chain(self.held_samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]));
         let stacks = stacks.chain(self.raised.iter().map(panics::Raised::pcs));
         let mut images = vec![
             self.images
@@ -1459,6 +1574,7 @@ impl History {
             builds: rows(&builds),
             samples: rows(&samples),
             alloc_samples: rows(&alloc_samples),
+            held_samples: rows(&held_samples),
             switches: rows(&switches),
             events: rows(&events),
             event_fields: rows(&event_fields),
@@ -1482,18 +1598,21 @@ impl History {
             files: 0,
             bytes: 0,
             deleted: 0,
+            deleted_rows: 0,
+            deleted_bytes: 0,
             merged: 0,
             compacted: 0,
         };
         let build = named;
         flushed.build = build;
         self.core.files_mut().named(build);
-        let tables: [(&'static Table, &[RecordBatch]); 21] = [
+        let tables: [(&'static Table, &[RecordBatch]); 22] = [
             (&schema::SPANS, &spans),
             (&schema::COUNTERS, &counters),
             (&schema::BUILDS, &builds),
             (&schema::SAMPLES, &samples),
             (&schema::ALLOC_SAMPLES, &alloc_samples),
+            (&schema::HELD_SAMPLES, &held_samples),
             (&schema::SWITCHES, &switches),
             (&schema::EVENTS, &events),
             (&schema::ERRORS, &errors),
@@ -1589,7 +1708,7 @@ impl History {
             bytes,
             merged,
             compacted,
-            deleted,
+            capped,
             deferred,
             undeleted,
         } = out;
@@ -1658,7 +1777,10 @@ impl History {
         flushed.bytes = bytes;
         flushed.merged = merged;
         flushed.compacted = compacted;
-        flushed.deleted = deleted;
+        flushed.deleted = capped.files;
+        flushed.deleted_rows = capped.rows;
+        flushed.deleted_bytes = capped.bytes;
+        said_capped(&capped);
         // Committed: what fails from here on is said apart, and the flush's number stands.
         self.deferred.extend(failed);
         self.deferred.extend(deferred);
@@ -1730,6 +1852,20 @@ impl History {
             (Instant::now(), clock::mono_ns()),
             self.process,
         )
+    }
+}
+
+impl History {
+    /// The `held_samples` rows of this flush's reading of the samples still held, none where
+    /// it made no reading.
+    fn held_samples_batch(&self) -> Result<RecordBatch, ArrowError> {
+        if self.held_samples.is_empty() {
+            return Ok(RecordBatch::new_empty(batches::schema_of(&schema::HELD_SAMPLES)));
+        }
+        let frames =
+            symbols::frames(self.held_samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]));
+        let now = clock::mono_ns();
+        batches::held_samples(&self.held_samples, &frames, (Instant::now(), now), now, self.process)
     }
 }
 
@@ -2655,6 +2791,17 @@ mod tests {
             "the sample kept into the history's ring"
         );
         _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_cap_is_the_default_or_the_mib_the_daemon_was_started_with() {
+        assert_eq!(cap_of(None), Ok(CAP_BYTES));
+        assert_eq!(cap_of(Some("4096")), Ok(4 << 30));
+        assert_eq!(cap_of(Some(" 1 ")), Ok(1 << 20));
+        for bad in ["0", "", "64MB", "-1", "1.5", "18446744073709551615"] {
+            let said = cap_of(Some(bad)).expect_err(bad);
+            assert!(said.contains(CAP_VAR) && said.contains(&format!("{bad:?}")), "{said}");
+        }
     }
 
     #[test]

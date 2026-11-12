@@ -403,6 +403,7 @@ fn a_run_that_wrote_files_is_kept_against_its_roots_until_verified() {
             path: "5f3a-foo.o".into(),
             executable: false,
             bytes: Some(b"\x7fELF".to_vec()),
+            link: None,
         }],
     };
     let (kept, _) =
@@ -819,6 +820,7 @@ fn a_written_file_that_embeds_a_root_is_kept_here_alone() {
             path: "flags".into(),
             executable: false,
             bytes: Some(b"-B/opt/tools/bin".to_vec()),
+            link: None,
         }],
     };
     let (kept, _) = a.view().kept(&read("/h", &Disk::of("/h", b"int x;")), &wrote).unwrap();
@@ -847,6 +849,7 @@ fn the_written_file_scan_finds_every_spelling_embedded_does() {
             path: "f".into(),
             executable: false,
             bytes: Some(bytes),
+            link: None,
         }],
     };
     let wide: Vec<u8> = "/opt/tools".encode_utf16().flat_map(u16::to_le_bytes).collect();
@@ -994,4 +997,41 @@ fn a_root_relinked_since_its_map_was_made_is_kept_against_where_it_is() {
     let (kept, _) = map.view().kept(&reading(&[]), &printed(b"")).unwrap();
     assert!(kept.relinked && kept.shared.is_none());
     _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A link a run left in its `OUT_DIR` into its own package is kept as the package's
+/// placeholder and the rest, ties the value to no root, and is the other checkout's package
+/// where it is reused; kept by a run with no package root it is this checkout's path, and
+/// ties the value to every root.
+#[test]
+fn a_kept_link_into_the_package_is_the_other_checkouts_package_where_it_is_reused() {
+    let wrote = |link: &str| Value {
+        code: Some(0),
+        signal: None,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        files: vec![crate::run::OutFile {
+            path: "build/src".into(),
+            executable: false,
+            bytes: None,
+            link: Some(link.into()),
+        }],
+    };
+    let here = sharing("/ta/target", "/opt/tools");
+    let (stored, left) = here.view().stored(&wrote("/h/ws/p/vendor/gmp")).unwrap();
+    assert_eq!(stored.files[0].link.as_deref(), Some("\0p/vendor/gmp"));
+    assert!(left.is_empty(), "{left:?}");
+    let there = RootMap::default()
+        .with(Role::Package, Path::new("/g/other/p"))
+        .with(Role::Workspace, Path::new("/g/other"))
+        .with(Role::Target, Path::new("/tb/target"))
+        .with(Role::Tools, Path::new("/opt/tools"));
+    let restored = there.view().restored(stored.clone()).unwrap();
+    assert_eq!(restored.files[0].link.as_deref(), Some("/g/other/p/vendor/gmp"));
+    assert_eq!(here.view().restored(stored).unwrap(), wrote("/h/ws/p/vendor/gmp"));
+    // No root starts it: this checkout's path, kept here alone.
+    let unrooted = RootMap::default().with(Role::Target, Path::new("/ta/target"));
+    let (stored, left) = unrooted.view().stored(&wrote("/h/ws/p/vendor/gmp")).unwrap();
+    assert_eq!(stored.files[0].link.as_deref(), Some("/h/ws/p/vendor/gmp"));
+    assert!(left.contains(Role::Target), "{left:?}");
 }

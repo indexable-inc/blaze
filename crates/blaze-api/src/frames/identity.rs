@@ -15,11 +15,11 @@ use super::{decode, encode, encode_into};
 use crate::{
     ApiError, Applicability, Artifact, ArtifactKind, Basis, Behind, BuildScriptRan, Cached, Cargo,
     CrateType, Diagnostic, Documented, DocumentedCrate, Edit, Edited, EditedItem, Envelope,
-    FactRead, FetchVerb, How, Level, LinkHow, LinkKind, Linked, LiveFrame, Memory, Mismatch,
+    FactRead, FetchVerb, Goal, How, Level, LinkHow, LinkKind, Linked, LiveFrame, Memory, Mismatch,
     NodeKind, OpenFailure, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, ServedCrate,
     ServedPart, Span, Status, Table, TagMemory, Target, TargetKind, Targets, TestOutcome,
-    TestResult, Traced, Ub, Unbuilt, Unchecked, UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb,
-    ViewRef, Worked,
+    TestResult, Tiers, Traced, Ub, Unbuilt, Unchecked, UnitOf, UnitProfile, UnitStarted,
+    UnitTarget, Verb, ViewRef, Worked,
 };
 
 const REQUESTS: usize = 35;
@@ -231,11 +231,16 @@ impl Gen {
             cargo: self.maybe(Gen::cargo),
             target: self.maybe(Gen::text),
             profile: self.text(),
+            goal: self.maybe(Gen::goal),
             features: self.texts(1),
             packages: self.texts(1),
             all_features: self.yes(),
             no_default_features: self.yes(),
         }
+    }
+
+    fn goal(&mut self) -> Goal {
+        Goal::ALL[(self.next() % Goal::ALL.len() as u64) as usize]
     }
 
     fn request(&mut self) -> Request {
@@ -544,6 +549,7 @@ impl Gen {
                 linked_paths: self.texts(depth),
             }),
             7 => Response::Work(Worked {
+                why: self.maybe(|g| g.many(depth, |g| g.report(depth + 1))),
                 link: match self.yes() {
                     true => LinkKind::Patched,
                     false => LinkKind::Placed,
@@ -578,6 +584,11 @@ impl Gen {
                     written: self.wide(),
                     copied: self.wide(),
                 },
+                tiers: self.maybe(|g| Tiers {
+                    goal: g.goal(),
+                    optimized: g.wide(),
+                    functions: g.wide(),
+                }),
             }),
             8 => Response::TestResult(TestResult {
                 name: self.text(),

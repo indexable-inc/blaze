@@ -1,40 +1,46 @@
-//! The general allocator on the pages `blaze-mem`'s regions are on: memo values (bodies,
-//! inference, MIR) are read at random through pointers, so on transparent huge pages most of
-//! those reads skip a page walk. A reserved hugetlb pool is `blaze-mem`'s alone; mimalloc stays
-//! on base pages then.
+//! The general allocator and huge pages: mimalloc's arenas are on transparent huge pages where
+//! Linux has them, by mimalloc's own doing, and that is kept for its speed at a known price in
+//! memory.
+//!
+//! mimalloc 3 advises every arena it commits `MADV_HUGEPAGE` (its `allow_thp` option, on by
+//! default; `allow_large_os_pages` is hugetlb pages alone, which blaze refuses below), and maps
+//! its first arena before `main`, so nothing here chooses it and `BLAZE_HUGE_PAGES` does not
+//! reach it: the only switch that covers the first arena is libmimalloc-sys's `no_thp`
+//! feature, at build time.
+//!
+//! The price: mimalloc hands out 64 KiB pages and gives them back one at a time; on a huge
+//! page the first touch of one makes 2 MiB resident, and giving 64 KiB back leaves the rest
+//! resident though mimalloc counts none of it. The gain: fewer TLB misses and a page fault a
+//! 2 MiB, not a 4 KiB, as an edit's build takes again what the last one freed (an edit of
+//! hello-world allocates and frees 95 MiB of the global heap). Measured 2026-11-11 (lane
+//! mem2-1111, Linux aarch64 in an ix VM, a hello-world daemon after a cold build and five
+//! edits, two runs each alternated):
+//!
+//! | mimalloc's arenas | resident | of it mimalloc's arenas | a body edit and run, 3.5 s after the last (median of 30) |
+//! |---|---|---|---|
+//! | on transparent huge pages | 5,732 and 5,716 MiB | 3,447 MiB, for 2,437 in its pages | 121.0 and 112.5 ms |
+//! | built with `no_thp` | 3,959 and 4,066 MiB | 2,440 MiB | 137.7 and 136.7 ms |
+//!
+//! Run time comes first (decisions D5 and D21), and 17% of an edit is past what memory may
+//! cost, so the arenas stay on huge pages. Under a hypervisor a TLB miss walks two page tables,
+//! so the gap on bare metal is likely smaller; it was not measured there. macOS has no huge
+//! pages for anonymous memory (`blaze_mem::huge`), so none of this is its.
 
 #![allow(unsafe_code, reason = "sets one mimalloc option word")]
 
-use blaze_mem::huge::{self, Pages};
-
-/// Sets mimalloc's huge page options from `BLAZE_HUGE_PAGES`, every one of them, so neither
-/// mimalloc's defaults nor its `MIMALLOC_*` variables decide: segments on transparent huge pages
-/// (`MADV_HUGEPAGE`, which still counts under the process's opt-out of unadvised huge pages,
-/// [`huge::Thp::AdvisedOnly`]) when they are chosen, base pages otherwise, and never hugetlb
-/// pages reserved at start (`reserve_huge_os_pages`), which belong to blaze-mem's pool alone.
-/// Measured: with segments on transparent huge pages under the host setting `madvise`, the
-/// daemon peaked at 25 GiB where `always` without the opt-out reached 60. Called once, before
-/// the first query. An unreadable setting is an error naming it.
-pub(crate) fn huge_pages_for_mimalloc() -> std::io::Result<()> {
-    let transparent = huge::chosen()? == Pages::Transparent;
-    // SAFETY: each sets an option word mimalloc reads when it next maps a segment; mimalloc
+/// Sets mimalloc's hugetlb options, so neither its defaults nor its `MIMALLOC_*` variables
+/// decide: no arena on hugetlb pages (`allow_large_os_pages`) and none reserved at start
+/// (`reserve_huge_os_pages`), which belong to blaze-mem's pool alone
+/// (`BLAZE_HUGE_PAGES=reserved`). Transparent huge pages are not these options' (the
+/// module's docs). Called once, before the first query.
+pub(crate) fn no_hugetlb_for_mimalloc() {
+    // SAFETY: each sets an option word mimalloc reads when it next maps an arena; mimalloc
     // documents options as settable from any thread at any time.
     unsafe {
-        libmimalloc_sys::mi_option_set_enabled(
-            libmimalloc_sys::mi_option_large_os_pages,
-            transparent,
-        );
+        libmimalloc_sys::mi_option_set_enabled(libmimalloc_sys::mi_option_large_os_pages, false);
         libmimalloc_sys::mi_option_set(libmimalloc_sys::mi_option_reserve_huge_os_pages, 0);
         libmimalloc_sys::mi_option_set(libmimalloc_sys::mi_option_reserve_huge_os_pages_at, -1);
     }
-    Ok(())
-}
-
-/// Whether mimalloc maps its segments on huge pages.
-#[cfg(test)]
-fn enabled() -> bool {
-    // SAFETY: reads an option word; callable from any thread.
-    unsafe { libmimalloc_sys::mi_option_is_enabled(libmimalloc_sys::mi_option_large_os_pages) }
 }
 
 #[cfg(test)]
@@ -42,20 +48,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mimalloc_follows_the_pages_chosen() {
-        huge_pages_for_mimalloc().expect("BLAZE_HUGE_PAGES is readable");
-        let chosen = huge::chosen().expect("chosen once already");
-        if chosen == Pages::Transparent {
-            assert!(enabled(), "transparent huge pages are chosen, so mimalloc maps on them");
-        }
-        assert_eq!(
-            enabled(),
-            chosen == Pages::Transparent,
-            "mimalloc's huge pages follow the choice, set either way"
-        );
-        if std::env::var_os(huge::VAR).is_some_and(|it| it == "off") {
-            assert_eq!(chosen, Pages::Base);
-            assert!(!enabled(), "BLAZE_HUGE_PAGES=off leaves mimalloc on base pages");
-        }
+    fn mimalloc_maps_no_arena_on_hugetlb_pages() {
+        no_hugetlb_for_mimalloc();
+        // SAFETY: reads an option word; callable from any thread.
+        let large = unsafe {
+            libmimalloc_sys::mi_option_is_enabled(libmimalloc_sys::mi_option_large_os_pages)
+        };
+        assert!(!large, "hugetlb pages are blaze-mem's pool's alone");
     }
 }

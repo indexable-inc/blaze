@@ -1,0 +1,23 @@
+about = "A variable no part of the build reads, set in the command's environment, makes nothing again and runs a small number of engine memos."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "2 4\n"
+
+[[revision]]
+steps = []
+action = "run"
+prints = "2 4\n"
+redone = []
+max_units = 0
+
+[[revision]]
+steps = []
+action = "run"
+env = { UNRELATED_TO_THE_BUILD = "1" }
+prints = "2 4\n"
+redone = []
+max_units = 0
+max_executed = 200
+link = "none"

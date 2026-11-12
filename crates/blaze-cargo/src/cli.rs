@@ -10,6 +10,8 @@
 //! - [`daemon`]: finding and starting `blaze serve`, and the [`daemon::Api`] it is spoken to by.
 //! - [`print`]: a build's responses as cargo's lines; [`say`] and [`json`] are their texts.
 //! - [`run`] and [`test`]: what runs after the build; [`doc`]: `doc`'s pages, written.
+//! - [`resume`]: a build or a run the thin `blaze` began (blaze-thin, docs/client.md), gone on
+//!   with from the connection and the answer it hands over.
 //! - [`inspect`]: blaze's own looks at the last build (`codegen-inputs`, `trace`, `tables`).
 //! - [`observe`]: blaze's looks at itself: `explore`, `debug profile|live|sql`, `explain`.
 //! - [`replace`]: `check --replace`, a path moved through the front end's name resolution.
@@ -53,6 +55,7 @@ pub mod pprof;
 pub mod print;
 pub mod reach;
 pub mod replace;
+pub mod resume;
 pub mod run;
 pub mod say;
 pub mod terminal;
@@ -137,14 +140,19 @@ Every command takes cargo's flags; `blaze help <COMMAND>` lists them.
 /// (`observe::recomputed`, docs/v2/plan/design/why.md), on the printer's streams. A build that
 /// recomputed nothing says nothing; a summary the daemon could not give is said as a
 /// warning, and the command's own outcome stands.
+///
+/// `ask`: whether a summary the build's own answer did not carry is asked of the daemon, which
+/// waits for its history thread to have explained the build. A `run` does not ask: its program
+/// starts as soon as its image is built, and `blaze why` has the reasons.
 fn said_recomputed<O: Write, E: Write>(
     printer: &mut Printer<'_, O, E>,
     shown: Shown,
+    ask: bool,
 ) -> io::Result<()> {
     if shown.quiet {
         return Ok(());
     }
-    match observe::recomputed() {
+    match observe::recomputed(ask) {
         Ok(summary) => printer.recomputed(summary),
         Err(why) => printer.err().write_all(say::warning(&why, shown.color).as_bytes()),
     }
@@ -153,8 +161,12 @@ fn said_recomputed<O: Write, E: Write>(
 /// What this client recorded of its build, sent to the daemon's history, and with
 /// `BLAZE_PROFILE` the build's trace written (its path said on `err`): a failure is said on
 /// `err` as a warning naming the step and the build, and the command's own outcome stands.
-fn sent_client_rows(err: &mut impl Write, color: bool) {
-    let said = match client_rows::send() {
+///
+/// `wait`: whether the daemon's answer to them is waited for. A `run` about to become its
+/// program does not wait (unless `BLAZE_PROFILE` is to read them back): the rows are handed to
+/// the daemon and the program starts.
+fn sent_client_rows(err: &mut impl Write, color: bool, wait: bool) {
+    let said = match client_rows::send(wait) {
         Ok(None) => return,
         Ok(Some(path)) => format!(
             "{}: the build's trace (ui.perfetto.dev): {}\n",
@@ -183,6 +195,15 @@ pub fn record() {
 pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
     blaze_profile::began();
     let words = words(args);
+    // A command the thin `blaze` began (blaze-thin's handover): its connection and the answer
+    // read so far come first, then the command line as it was typed.
+    let (began, words) = match blaze_thin::handover::Began::take(words) {
+        Ok(taken) => taken,
+        Err(what) => {
+            eprint!("{}", say::error(&what, auto_color()));
+            return ended(Exit::Usage.code());
+        }
+    };
     // A test executable the daemon launched runs as its test, with the daemon's priority
     // already inherited: `BLAZE_CORES` is the CLI's and the daemon's, not the test's.
     let trampoline = words.first().is_some_and(|it| it == run::TRAMPOLINE);
@@ -215,7 +236,7 @@ pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
     if trampoline {
         return ended(run::trampoline(words.into_iter().skip(1), auto_color()));
     }
-    ended(command(words))
+    ended(command_began(words, began))
 }
 
 /// This process's core budget read (`BLAZE_CORES`, [`blaze_core::cores`]) and, unless it says
@@ -376,6 +397,13 @@ fn no_such_command(name: &str) -> String {
 
 /// One command line, run: its exit code.
 pub fn command(words: Vec<OsString>) -> i32 {
+    command_began(words, None)
+}
+
+/// [`command`], of a command line the thin `blaze` began when `began` says so: the request is
+/// on its connection already, and this goes on from the answer read so far ([`resume`]). Only
+/// a build command is ever begun; any other with `began` is refused, naming it.
+fn command_began(words: Vec<OsString>, began: Option<blaze_thin::handover::Began>) -> i32 {
     let parsing =
         tracing::info_span!(target: "blaze", "client: parse the command line").entered();
     let parsed = args::parse(words);
@@ -401,6 +429,14 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Status(_) | Asked::Debug(_) | Asked::Explain(_) | Asked::Why(_) | Asked::Slow(_)
     ) {
         which::warn_if_other(auto_color());
+    }
+    if began.is_some() && !matches!(asked, Asked::Cargo(_)) {
+        let what = format!(
+            "`blaze {}` hands over a build or a run the thin `blaze` began, and what follows it is neither",
+            blaze_thin::handover::WORD
+        );
+        eprint!("{}", say::error(&what, auto_color()));
+        return Exit::Usage.code();
     }
     match asked {
         Asked::Help(None) => {
@@ -484,7 +520,7 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Tree(_) | Asked::Metadata(_) => said(Err(anyhow::anyhow!(
             "blaze tree and blaze metadata fetch the packages the lock file names: this blaze is built without blaze-cargo's `native` feature (the seed profile, docs/future/bootstrap.md), which has no network"
         ))),
-        Asked::Cargo(asked) => cargo(&asked),
+        Asked::Cargo(asked) => cargo(&asked, began),
     }
 }
 
@@ -582,8 +618,10 @@ fn prepared_cargo(asked: &Invocation, color: bool) -> Result<(Place, Cargo), Str
     Ok((place, cargo))
 }
 
-/// `build`, `check`, `run`, `test` or `bench`.
-fn cargo(asked: &Invocation) -> i32 {
+/// `build`, `check`, `run`, `test` or `bench`. `began`: the thin `blaze` sent the request
+/// already ([`resume`]); this makes the same one, holds it to the one sent, and reads the
+/// answer from where the thin `blaze` stopped.
+fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 {
     let started = Instant::now();
     let refused = |what: &str, color: bool| {
         eprint!("{}", say::error(what, color));
@@ -659,7 +697,10 @@ fn cargo(asked: &Invocation) -> i32 {
     };
     let connecting =
         tracing::info_span!(target: "blaze", "client: connect to the daemon").entered();
-    let connected = daemon::connect(Start::IfMissing);
+    let connected = match began {
+        Some(began) => resume::client(began).map(Some).map_err(anyhow::Error::msg),
+        None => daemon::connect(Start::IfMissing),
+    };
     drop(connecting);
     let mut client = match connected {
         Ok(Some(client)) => client,
@@ -684,7 +725,7 @@ fn cargo(asked: &Invocation) -> i32 {
         let then = live::drive(&mut client, asked, &place, request, shown, started);
         // The seed's one-shot engine stops here, writing its image; a daemon's connection just closes.
         let closed = client.close();
-        sent_client_rows(&mut io::stderr().lock(), color);
+        sent_client_rows(&mut io::stderr().lock(), color, true);
         if let Err(error) = closed {
             return refused(&format!("closing the connection to the build engine: {error}"), color);
         }
@@ -710,7 +751,9 @@ fn cargo(asked: &Invocation) -> i32 {
     );
     // The seed's one-shot engine stops here, writing its image; a daemon's connection just closes.
     let closed = client.close();
-    sent_client_rows(&mut err, color);
+    // A `run` about to become its program hands its rows to the daemon and does not wait for
+    // the answer: the program starts as soon as its image is known to be built.
+    sent_client_rows(&mut err, color, !matches!(then, Ok(Then::Exec(_))));
     if let Err(error) = closed {
         let _ = err.write_all(
             say::error(&format!("closing the connection to the build engine: {error}"), color)
@@ -828,7 +871,11 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
         command = asked.command().name(),
     )
     .entered();
-    let called = api.call(request, |response, more| {
+    // A `wait` row owned by the daemon (`owned_by = 'the daemon'`), so `blaze slow` follows
+    // the critical path across it into the daemon's answer; the ad hoc span above stays for
+    // the timeline.
+    let called = blaze_graph::wait::wait_for_daemon("the daemon's answer to the request", || {
+        api.call(request, |response, more| {
         if let ResponseRef::Diagnostic(diagnostic) = &response {
             if let Some(counted) = &mut counted {
                 counted.add(diagnostic);
@@ -839,6 +886,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
         }
         if let ResponseRef::Work(worked) = &response {
             client_rows::heard(worked.build_id, worked.misses);
+            client_rows::summarized(worked.build_id, worked.why.as_deref());
         }
         let printed = match response {
             ResponseRef::Documented(documented) => {
@@ -870,6 +918,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
         if let Err(error) = written {
             unwritten.get_or_insert(error);
         }
+        })
     });
     drop(waiting);
     if let Some(error) = unwritten {
@@ -927,7 +976,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
         _ => None,
     };
     printer.finish(ok, started.elapsed())?;
-    said_recomputed(&mut printer, shown)?;
+    said_recomputed(&mut printer, shown, asked.command() != Command::Run)?;
     // A check that failed on its findings still has its suggestions made: a deny lint's
     // finding is an error, and its fix takes it away.
     if let Some(found) = found

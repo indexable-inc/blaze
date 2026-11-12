@@ -50,7 +50,12 @@ pub(super) struct Delta {
 /// alone reads other crates at round 0 (the injected std prelude, `#[macro_use] extern crate`),
 /// and `root_decl` holds only their roots. The root's log is read again too when the crate was
 /// given proc macros (`written.proc_macros`): it lists their expanders, as `#[proc_macro]`
-/// functions are only at the root.
+/// functions are only at the root; and the root's group runs again whatever its log says
+/// ([`given_proc_macros`]). `woken`: the groups that read a binding an earlier crate's write
+/// changed. A group's round-0 log holds the expansion of a macro call whose path names
+/// another crate's macro (`pm::sol! { .. }`), with the modules the expansion declares as
+/// its round-0 children, so a woken group's log is read again too: it may have changed, and
+/// its children with it, with no file of the crate written.
 pub(super) fn read(
     db: &Db,
     krate: Crate,
@@ -58,6 +63,7 @@ pub(super) fn read(
     written: &Written<'_>,
     cold: bool,
     deps_changed: bool,
+    woken: &[ModuleId],
 ) -> Delta {
     let mut delta = Delta::default();
     let deps_changed = deps_changed || written.proc_macros.binary_search(&krate).is_ok();
@@ -67,13 +73,57 @@ pub(super) fn read(
         || !written.removed.is_empty()
         || !written.roots.is_empty()
         || state.groups.get(&state.root).is_none_or(|it| it.key != root_key);
-    if full || !incremental(db, state, written, deps_changed, &mut delta) {
+    if full || !incremental(db, state, written, deps_changed, woken, &mut delta) {
         delta = Delta::default();
         walk(db, state, root_key, written, cold, &mut delta);
     }
     include_readers(state, written, &mut delta);
     expansion_readers(state, written, &mut delta);
+    if written.proc_macros.binary_search(&krate).is_ok() {
+        given_proc_macros(state, &mut delta);
+    }
     delta
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: a group woken by another crate's changed binding runs again
+    /// with the round-0 children its state had, its log not read again.
+    pub(in crate::nameres) static WOKEN_LOGS_ARE_NOT_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: a crate given its proc macros runs its root's group again only
+    /// when the root's round-0 log changed.
+    pub(in crate::nameres) static GIVEN_READS_THE_LOG_ALONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A crate given its proc macros: its root's group is a seed, with a possible removal, whatever
+/// its round-0 log says. The log holds the expander of a `#[proc_macro]` function the root
+/// file declares, so it changes for that one; a function under an attribute macro
+/// (`#[proc_macro] #[proc_macro_error] pub fn sol`, alloy-sol-macro's) is declared by the
+/// attribute's expansion, which the log leaves out and the group's run collects, with the
+/// crate's list as it is then. Left to the log, `sol` kept the expander it had before the
+/// crate's module was loaded, none, and every `sol!` failed on a crate that "loaded and
+/// exports no macro of this name".
+fn given_proc_macros(state: &CrateState, delta: &mut Delta) {
+    #[cfg(test)]
+    if GIVEN_READS_THE_LOG_ALONE.get() {
+        return;
+    }
+    let root = state.root;
+    if !state.groups.contains_key(&root) {
+        return;
+    }
+    // A change of the root's log that only inserted name-free ops is no run: this is one.
+    delta.direct.retain(|(group, _)| *group != root);
+    if !delta.seeds.contains(&root) {
+        delta.seeds.push(root);
+    }
+    if !delta.removing.contains(&root) {
+        delta.removing.push(root);
+    }
 }
 
 /// Whether each parent from the root down to `group` still declares the key below it: a key may
@@ -94,20 +144,29 @@ fn key_is_current(db: &Db, state: &CrateState, group: ModuleId) -> bool {
     })
 }
 
-/// The groups of the written files (and the root when `deps_changed`, and those that expanded an
-/// `include!` when a file no module is defined in was written), the parents of those whose logs
-/// changed and the children defined in their expansions, their logs compared; `false` when a
-/// group's round-0 children changed, which only a walk follows.
+/// The groups of the written files (and the root when `deps_changed`, the groups `woken` by
+/// another crate's changed binding, and those that expanded an `include!` when a file no module
+/// is defined in was written), the parents of those whose logs changed and the children defined
+/// in their expansions, their logs compared; `false` when a group's round-0 children changed,
+/// which only a walk follows.
 fn incremental(
     db: &Db,
     state: &mut CrateState,
     written: &Written<'_>,
     deps_changed: bool,
+    woken: &[ModuleId],
     delta: &mut Delta,
 ) -> bool {
     let mut checked: Vec<ModuleId> = Vec::new(); // alloc: the groups of the written files, once per write
     if deps_changed {
         checked.push(state.root);
+    }
+    #[cfg(test)]
+    let woken = if WOKEN_LOGS_ARE_NOT_READ.get() { &[][..] } else { woken };
+    for group in woken {
+        if state.groups.contains_key(group) && !checked.contains(group) {
+            checked.push(*group);
+        }
     }
     // A written file no module is defined in may be one a macro like `include!` read, and a
     // written file may be one an `include!` parsed (`include_readers`).

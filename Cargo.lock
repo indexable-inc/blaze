@@ -581,6 +581,7 @@ dependencies = [
  "blaze-source",
  "blaze-store-check",
  "blaze-testsel",
+ "blaze-thin",
  "blaze-tree",
  "blaze-ui",
  "blaze-units",
@@ -594,6 +595,7 @@ dependencies = [
  "hegeltest",
  "hir",
  "hir-def",
+ "hir-expand",
  "hir-ty",
  "hir-ty-codegen",
  "hir-ty-pure",
@@ -623,6 +625,7 @@ dependencies = [
  "url",
  "windows-sys 0.61.2",
  "zip",
+ "zstd",
 ]
 
 [[package]]
@@ -734,6 +737,7 @@ dependencies = [
  "blaze-serde",
  "blaze-store-check",
  "crossbeam-channel",
+ "crossbeam-queue",
  "hashbrown 0.17.1",
  "hegeltest",
  "serde",
@@ -825,6 +829,7 @@ dependencies = [
  "span",
  "stdx",
  "syntax",
+ "tracing",
  "tt",
  "unicode-ident",
  "unicode-normalization",
@@ -901,6 +906,7 @@ dependencies = [
  "blaze-query",
  "blaze-registry",
  "blaze-sha256",
+ "blaze-thin",
  "blaze-units",
  "blaze-vfs",
  "cfg",
@@ -1234,6 +1240,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-hub"
+version = "0.0.0"
+dependencies = [
+ "blaze-protocol",
+ "blaze-std",
+ "blaze-vfs",
+ "hegeltest",
+ "serde",
+]
+
+[[package]]
 name = "blaze-ids"
 version = "0.0.0"
 dependencies = [
@@ -1381,6 +1398,23 @@ dependencies = [
  "blaze-ids",
  "blaze-store-check",
  "hegeltest",
+]
+
+[[package]]
+name = "blaze-launch"
+version = "0.0.0"
+dependencies = [
+ "blaze-protocol",
+ "hegeltest",
+]
+
+[[package]]
+name = "blaze-launch-rt"
+version = "0.0.0"
+dependencies = [
+ "blaze-launch",
+ "crossbeam-channel",
+ "libc",
 ]
 
 [[package]]
@@ -2051,6 +2085,20 @@ dependencies = [
  "blaze-ids",
  "blaze-protocol",
  "blaze-usercode",
+]
+
+[[package]]
+name = "blaze-thin"
+version = "0.0.0"
+dependencies = [
+ "blaze-api",
+ "blaze-client",
+ "blaze-core",
+ "blaze-format",
+ "blaze-ids",
+ "blaze-report",
+ "libc",
+ "tracing",
 ]
 
 [[package]]
@@ -4001,15 +4049,18 @@ dependencies = [
  "rustc_type_ir",
  "serde",
  "serde_derive",
+ "serde_json",
  "smallvec",
  "span",
  "stdx",
  "syntax",
  "target-features",
  "target-lexicon",
+ "toml",
  "tracing",
  "triomphe",
  "wasm-encoder 0.263.0",
+ "wasmtime",
 ]
 
 [[package]]
@@ -4717,6 +4768,7 @@ dependencies = [
  "rcgen",
  "regex",
  "rustc-demangle",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

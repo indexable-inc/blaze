@@ -136,6 +136,9 @@ pub fn tracked_new<T: Tracked>(storage: &Storage, identity: T::Identity, fields:
                 let was = Durability((((storage.color_of(node) >> 32) as u32) & !FIELD) as u8);
                 if was != durability || !T::equal_field(field, old, &new) {
                     storage.repaint(node, color(FIELD | u32::from(durability.0), view));
+                    // Its readers are the changed set's to verify, whether or not the
+                    // creator's own value changed ([`super::frontier`]).
+                    storage.frontier.changed_field(node);
                 }
             }
             *old = new;

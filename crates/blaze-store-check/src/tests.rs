@@ -178,3 +178,13 @@ fn every_simd_path_finds_each_difference_in_a_block_and_the_overlapping_tail() {
         }
     }
 }
+
+/// A build that must be checked runs at the least rate whatever its request asked: an unset
+/// or lower setting is raised, its seed kept, and a higher one stays.
+#[test]
+fn at_least_raises_a_lower_rate_and_keeps_the_seed() {
+    assert_eq!(Setting::OFF.at_least(0.05), Setting { rate: 0.05, seed: 0 });
+    assert_eq!(Setting { rate: 0.01, seed: 7 }.at_least(0.05), Setting { rate: 0.05, seed: 7 });
+    assert_eq!(Setting::ALL.at_least(0.05), Setting::ALL);
+    assert!(!Setting::OFF.at_least(0.05).is_off());
+}

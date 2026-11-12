@@ -58,7 +58,7 @@ use super::{
     files::Mounted,
     graph, reads, say, script,
 };
-use crate::serve::work::{Compiled, Failed, Goal, Linking, Output, Phase, Put};
+use crate::serve::work::{Compiled, Failed, JobKind, Linking, Output, Phase, Put};
 
 type Image = crate::serve::work::Image<Real>;
 
@@ -354,7 +354,7 @@ fn narrow_identity(job: &Job, unit: usize) -> Result<Option<ContentId>, ApiError
     if reads_comments {
         return Ok(None);
     }
-    Ok(Some(match checks_only(job.input.goal, u) {
+    Ok(Some(match checks_only(job.input.kind, u) {
         true => narrowed.checked,
         false => narrowed.code,
     }))
@@ -750,7 +750,7 @@ impl Checked {
 /// one that only checks, whose record is under this very identity.
 fn check_key(job: &Job, unit: usize) -> Result<Option<Key>, ApiError> {
     let u = job.unit(unit)?;
-    if checks_only(job.input.goal, u) || narrow_identity(job, unit)?.is_none() {
+    if checks_only(job.input.kind, u) || narrow_identity(job, unit)?.is_none() {
         return Ok(None);
     }
     let Some(narrowed) = job.narrowed.get(unit).and_then(|it| it.get()).copied().flatten() else {
@@ -880,7 +880,7 @@ fn with_record_inputs<T>(
         codegen::makes(u, codegen::asked(job, unit)),
         Ok(Makes::Executable | Makes::Shared { proc_macro: false })
     );
-    let layout = match links && !checks_only(job.input.goal, u) {
+    let layout = match links && !checks_only(job.input.kind, u) {
         true => super::layout::key(job, job.plan(unit)?)
             .map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?,
         false => None,
@@ -894,7 +894,8 @@ fn with_record_inputs<T>(
         script_link_args: script_link_args(job, unit)?,
         linked_rustflag_libs: linked_rustflag_libs(job, unit)?,
         makers,
-        goal: keyed_goal(job.input.goal, u),
+        kind: keyed_kind(job.input.kind, u),
+        goal: keyed_goal(job, unit)?,
         color: job.input.color,
         short: job.input.short,
         verified,
@@ -1087,6 +1088,8 @@ pub(crate) struct RecordInputs<'a> {
     /// writes and the record's encoding). Each moves on any edit of a package it is of, so a
     /// record made by other code is never found.
     pub(crate) makers: crate::serve::RecordMakers,
+    /// [`keyed_kind`].
+    pub(crate) kind: u8,
     /// [`keyed_goal`].
     pub(crate) goal: u8,
     pub(crate) color: bool,
@@ -1139,6 +1142,7 @@ impl RecordInputs<'_> {
         })?;
         hasher.id(&self.makers.front_end).id(&self.makers.codegen).id(&self.makers.record).update(
             &[
+                self.kind,
                 self.goal,
                 u8::from(self.color),
                 u8::from(self.short),
@@ -1209,7 +1213,8 @@ impl RecordInputs<'_> {
                 "the code identity of what makes a record (blaze-cargo's closure)",
                 Some(&self.makers.record),
             ),
-            bytes("goal", &[self.goal]),
+            bytes("the job's kind", &[self.kind]),
+            bytes("the build goal (tier 0 code or optimized code)", &[self.goal]),
             flag("color", self.color),
             flag("short diagnostics", self.short),
             flag("BLAZE_ELIDE=verify (built to verify an inert build script)", self.verified),
@@ -1250,19 +1255,41 @@ mod erased {
     }
 }
 
-/// The goal as `unit`'s record key holds it. A build script's compile is the same program
-/// whatever the job's goal ([`super::checks_only`] is false for it under every goal), as a
-/// device unit's MSL is, so a `blaze check` and a `blaze build` share its record; any other
-/// unit keys the goal.
-pub(crate) fn keyed_goal(goal: Goal, unit: &Unit) -> u8 {
+/// The job's kind as `unit`'s record key holds it. A build script's compile is the same
+/// program whatever the job's kind ([`super::checks_only`] is false for it under every kind),
+/// as a device unit's MSL is, so a `blaze check` and a `blaze build` share its record; any
+/// other unit keys the kind.
+pub(crate) fn keyed_kind(kind: JobKind, unit: &Unit) -> u8 {
     if unit.mode == Mode::Build && (unit.target.is_custom_build() || unit.for_device()) {
         return 1;
     }
+    match kind {
+        JobKind::Check => 0,
+        JobKind::Build => 1,
+        JobKind::Test => 2,
+        JobKind::Run => 3,
+    }
+}
+
+/// The build goal as unit `unit`'s record key holds it (docs/v2/plan/design/tiers.md): the
+/// tier its code is compiled at is the goal's ([`codegen::goal`]), and its unit and plan, which
+/// the key holds, are the same under both. 0 for a unit only checked, which compiles no code
+/// (so `blaze check --goal max` shares `blaze check`'s records); else 1 for `edit`, 2 for `max`.
+pub(crate) fn keyed_goal(job: &Job, unit: usize) -> Result<u8, ApiError> {
+    let u = job.unit(unit)?;
+    if checks_only(job.input.kind, u) {
+        return Ok(0);
+    }
+    let goal = codegen::goal(job, unit)
+        .map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?; // alloc: error path
+    Ok(goal_byte(goal))
+}
+
+/// A goal's byte in a record key: never 0, a unit only checked.
+pub(crate) fn goal_byte(goal: blaze_api::Goal) -> u8 {
     match goal {
-        Goal::Check => 0,
-        Goal::Build => 1,
-        Goal::Test => 2,
-        Goal::Run => 3,
+        blaze_api::Goal::Edit => 1,
+        blaze_api::Goal::Max => 2,
     }
 }
 
@@ -1859,7 +1886,7 @@ struct Making {
     /// What codegen put, the outputs to follow.
     puts: Vec<Put>,
     natives: Vec<(String, ContentId)>,
-    links: Vec<(String, Linking)>,
+    links: Vec<(String, Linking, Option<blaze_api::Tiers>)>,
     macros: Option<ProcMacroLoadResult>,
     /// A device unit's MSL, as its link wrote it ([`Compiled::gpu_msl`]).
     gpu_msl: Option<Vec<u8>>,
@@ -1868,7 +1895,11 @@ struct Making {
     records: Vec<ImageRecord>,
     /// Each image this compile linked, by its path, as the runs of its file that hold bytes
     /// (`codegen::LinkMade::made`): what the loop places it from.
-    made_files: Vec<(String, Arc<blaze_cas::Sparse>)>,
+    made_files: Vec<(String, Arc<crate::serve::work::Made>)>,
+    /// The debug side files its links made, each by the path it goes at
+    /// (`codegen::LinkMade::side`): outputs the loop places from these bytes after the
+    /// build's answer, in no record.
+    side_files: Vec<codegen::SideFile>,
     /// How many of `diagnostics` its check's are, in front, and every file they point into, by
     /// the name they give it ([`quoted_key`]); none where that is not known (a doctest's).
     quoted: Option<(usize, Vec<String>)>,
@@ -2108,7 +2139,7 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
     // A device unit has no native code: its library is a crate record, and its MSL is written
     // from the front end at its link ([`assemble`]).
     let builds_code = !inert
-        && !checks_only(job.input.goal, u)
+        && !checks_only(job.input.kind, u)
         && !library_reached
         && !proc_macro
         && !u.for_device();
@@ -2595,6 +2626,7 @@ fn store(
         gpu_msl,
         records,
         made_files,
+        side_files,
         quoted,
     } = *making;
     puts.extend(library_puts(job));
@@ -2904,6 +2936,14 @@ fn store(
     }
     if let Some(slot) = job.made.get(unit) {
         let _ = slot.set(made);
+    }
+    // The debug side files its links made, after its record is encoded: outputs of this
+    // compile alone, placed by the loop from the bytes the link holds. They are in no
+    // record (a build that replays the record links nothing and has none to place, and a
+    // key of theirs is in no store), and no artifact names them, so the build's answer
+    // does not wait for them (`serve::job`'s `Job::names`).
+    for codegen::SideFile { path, key, file } in side_files {
+        compiled.outputs.push(Output { path, key, executable: false, made: Some(file) });
     }
     Ok(compiled)
 }
@@ -3351,6 +3391,7 @@ fn assemble(
         gpu_msl: None,
         records: Vec::new(),
         made_files: Vec::new(),
+        side_files: Vec::new(),
         // clone: the files its diagnostics point into, once per unit that fails or builds nothing
         quoted: Some(quoted.clone()),
     };
@@ -3359,8 +3400,8 @@ fn assemble(
         // them may be under keep-going ([`Compiled::open`]). A unit whose code is built or
         // run (a build script, a proc macro, a library a program links) fails shut: what
         // depends on it needs that code. Both inputs are in the record's key (its check's
-        // outcome through its sources, the goal through [`keyed_goal`]).
-        let only_checked = checks_only(job.input.goal, u);
+        // outcome through its sources, the job's kind through [`keyed_kind`]).
+        let only_checked = checks_only(job.input.kind, u);
         let open = !phases.items_broken && only_checked;
         let why = match (open, only_checked) {
             (true, _) => "errors only in its bodies or lints",
@@ -3377,6 +3418,7 @@ fn assemble(
     // What each file rustc would write holds: (path, bytes, executable).
     let mut files: Vec<(String, Written, bool)> = Vec::new();
     let mut made_files = Vec::new(); // alloc: none until a link
+    let mut side_files = Vec::new(); // alloc: none until a link with a debug side file
     let identity = named_identity(job, unit)?;
     if inert {
         // A build script that does nothing is not run, so not built: what it prints is known.
@@ -3571,7 +3613,7 @@ fn assemble(
                             made.table = linked.table;
                         }
                         // alloc: once per image linked, a unit links one or two
-                        links.push((path.to_owned(), linked.how));
+                        links.push((path.to_owned(), linked.how, linked.tiers));
                         // What the link settled the store is given: the patch the image took
                         // the link as, where the store derives the file from the one before
                         // it, else the whole file (`codegen::LinkMade::written`).
@@ -3580,6 +3622,7 @@ fn assemble(
                             // alloc: once per image linked, shared by the paths it is placed at
                             made_files.push((path.to_owned(), Arc::new(made)));
                         }
+                        side_files.extend(linked.side);
                     }
                     Err(failed) => {
                         // alloc: error path
@@ -3606,6 +3649,7 @@ fn assemble(
         gpu_msl: None,
         records: Vec::new(),
         made_files,
+        side_files,
         quoted: Some(quoted),
     })
 }

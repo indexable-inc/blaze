@@ -60,10 +60,37 @@ several readers.
     file's; `blaze slow` still reads every file, as its recorder counts take the last counter
     before the build.
 
-    **The cap.** Past `history::CAP_BYTES` the history deletes its oldest builds whole, every
-    table of a build at once, never one table of a build; files of no build (an idle daemon's
-    flushes) go one at a time. A build is as old as its newest flush; the newest flush's build is
-    kept.
+    **The cap.** Past `history::CAP_BYTES` (256 MiB; `BLAZE_PROFILE_CAP_MB` in the daemon's
+    environment sets another, and 4096 is what it was until 2026-11-11) the history first
+    deletes its files of no build (what a daemon wrote between builds), oldest first, and only
+    then its oldest builds whole, every table of a build at once, never one table of a build:
+    a daemon left idle never writes a build's rows out of the history while rows of no build
+    are left to go. Hello-world's cold build is 18 MiB and an edit 0.3 MiB, so the default
+    holds a small project's cold build and several hundred edits, and of a large workspace its
+    newest builds.
+
+    **Between builds.** What a default profile records while no build runs is lean
+    (2026-11-11: an idle daemon wrote 1.2 MB a minute, now 0.15 MB). A thread blocked inside
+    a span of no build is not sampled while no build runs (`sampler::samples_blocked`; an idle
+    daemon's 21 parked threads were 51,821 off-CPU samples a minute); a thread on the CPU
+    always is, and during a build every blocked thread is, the loop's too. The timer's flush
+    of a quiet history (no build running, none whose row waits) is held up to a minute
+    (`history::IDLE_EVERY`), since each flush is a file a table of several KiB whatever it
+    holds; a reader's ask, a build's start and end, and `FLUSH_ROWS` drained still flush at
+    once, so no reader sees the difference, and a daemon that dies meanwhile leaves the rows
+    in its rings. What a default profile can therefore not answer: where a thread was blocked
+    between builds, by stack (its wait span still says what it waited on and for how long).
+    `BLAZE_PROFILE_DETAIL=full` in the daemon's environment samples them as before. A flush is named for the highest build of its rows, so while
+    builds run at once a file named for one holds another's rows: the unit that goes is every
+    build whose files chain together through the builds their rows are of (the manifest's
+    `builds` of each file), all at once. A unit is as old as its newest flush. Two are never
+    retired: the newest flush's, and any that holds a row of a build still running, so a long
+    build keeps every row however far past the cap it takes the history. What the cap retires
+    is never silent: each time, a WARN event says the files, rows, bytes and builds
+    (`blaze explain problems` lists it), and so does one for each flush in which the rings
+    wrote over rows before the history read them. Until 2026-11-11 the unit was the build a
+    file was named for and nothing was said: an 80-minute build that shorter builds ran beside
+    kept its last five minutes of `task` spans.
   - The live feed: Arrow batches every 250 ms over the daemon's socket. `blaze debug live`
     renders them as a TUI, and the explorer at ix.dev/explore draws them.
   - The stall watchdog: it writes the buffer out when a request stops moving.
@@ -164,7 +191,7 @@ column.
 | folded_spans | u64? | how many of its children were folded into `folded` instead of written (schema 3); null when none |
 | folded_ns | i64? | those children's durations, added: time under it that no written child covers but that is not its own (`time::Model` takes it from the span's own running time) |
 | awaits | utf8? | what a `wait` waits for: a query's key, a lock, a channel, a scope and the span its caller opened it in; every `wait` has it |
-| owner | u64? | who runs what a `wait` waits for (for a key, the job running it, as `switches.job` names it; null when not known), or the job that holds a `hold`. A `hold` span (a key held across a suspension, such as a codegen round) names its holder here, so its waiters' `owner` matches it |
+| owner | u64? | who runs what a `wait` waits for when that is one job (for a key, the job running it, as `switches.job` names it; for a wait that said who woke it as it ended, `blaze_graph::wait::wait_woken`, that job; null when `owned_by` is not `job`), or the job that holds a `hold`. A `hold` span (a key held across a suspension, such as a codegen round) names its holder here, so its waiters' `owner` matches it |
 | steps | u64? | the basic blocks a `macro expand` ran on the evaluator, or the instances a `build script proof` walked (`hir_ty_pure::ScriptProof::steps`: the same on a cold, warm or busy daemon, and the margin under the proof's bound); null for a compiled run, a run or proof that did not end, and any other span |
 | peak_bytes | u64? | the most stack and heap a `macro expand`'s evaluator held at once (null as `steps` is), or the most a daemon `task` held at once, global allocations and frames together (`blaze_graph::admission::run_as`); null for a task that gave way or panicked |
 | outcome | dict? | how a `macro expand` ended: ok, panic, step limit, memory limit or error; null for one that did not end (an unwind) |
@@ -179,8 +206,9 @@ column.
 | heap_allocated_bytes | u64? | the bytes a daemon `task`'s work allocated from the global heap in all, never netted against its frees, its fan-out's included (`blaze_graph::arena::Spent`): far past `peak_bytes`, the task churns the heap; null for a task that gave way or panicked |
 | heap_freed_bytes | u64? | the bytes a daemon `task`'s work freed to the global heap in all, whoever allocated them; null as `heap_allocated_bytes` is |
 | fields | utf8? | an ad hoc span's fields that fill no other column, as `key=value` text in the order it recorded them, a space between (cut at 1 KiB): a field of any name is kept, so adding one needs no column (`WHERE fields LIKE '%why=memory%'`). Null for a span with none, for a span of a kind, for one too short for a row of its own (`folded`), and in files of a blaze before 2026-11-11 |
+| owned_by | dict? | who ends a `wait`, said by every one (a site that leaves it out does not compile): `job` (its `owner` names it), or what stands in a job's place: `the scope's jobs` (the waiter's `ready` switch names the one that ended it), `whoever sends` (a channel or a signal), `the kernel` (io), `the child`, `the lock's holder` (a thread, in `lock_waits`), `the daemon` (a client's wait for its answer: the critical path crosses it at the daemon's `loop: a job's answer`) or `not said` (a key's wait whose caller named no runner: a bug at that call). Null for any other span, and in files of a blaze before it (2026-11-11; the last typed column, so `VERSION` stays 5) |
 
-The columns from `awaits` on are typed: only a span kind fills them, never an ad hoc span's fields. A span kind is a struct declared once in the registry `span_kinds!` at the end of `crates/blaze-profile/src/span.rs`: `unit names`, `unit bodies`, `unit codegen`, `unit link` and `unit store` (`krate`, `unit`), `macro expand` (`path`, `krate`, and as it ends `steps`, `peak_bytes`, `outcome`), `wait` (`awaits`, `function`, `owner`, `on`), `hold` (`what`, `holder`), `job` (`kind`, `job`, `creator`), `worker` (`doing` in `function`: a pool worker's `search`, `idle` or `switch` between jobs), `macro module` (`module` in `function`, and as it ends `module_from`, `code_bytes`) `build script proof` (`krate`, `unit`, and as it ends `steps`), `admission` (a plane task's wait from ready to start: `kind` in `function`, `node`, and as it ends `waited_for` in `awaits` (memory, a work or io thread, nothing), `passed`, `granted`; detached, on no thread's stack, as no thread waits in it; `blaze explain admission_waits`) and `task` (a daemon plane task run on a thread, `crates/blaze-cargo/src/serve/plane.rs`: `kind` in `function` as `unit bodies (infer)`, `node`, `granted`, `passed`, `krate` in `crate` and `unit` in `unit` (the unit it is a phase of, as the unit phase spans name it; none for a task of no unit), and as it ends `peak` in `peak_bytes`, `heap_allocated` in `heap_allocated_bytes` and `heap_freed` in `heap_freed_bytes`; `blaze explain task_memory`, `task_grants`, `admission_waits` and `memory` read it). Each field names its column by type, so a site that leaves out a field, gives one of the wrong type, or names a column that does not exist does not compile, and a typed column no kind writes fails the build. The kind writes its fields straight into its open span's slot, with no field visitor. `span::read` reads a ring's row back as its kind and `span::read_batch` a `spans` batch; every kind has a view of its rows with its fields as columns, `span_<name>` with spaces as underscores (`span_macro_expand`, whose `path` is `function`). An ad hoc `tracing::info_span!(target: "blaze", ..)` fills `crate`, `function` and `unit` from fields of those names (`krate`, `subject` and `cgu` too); its other fields are kept nowhere.
+The columns from `awaits` on are typed: only a span kind fills them, never an ad hoc span's fields. A span kind is a struct declared once in the registry `span_kinds!` at the end of `crates/blaze-profile/src/span.rs`: `unit names`, `unit bodies`, `unit codegen`, `unit link` and `unit store` (`krate`, `unit`), `macro expand` (`path`, `krate`, and as it ends `steps`, `peak_bytes`, `outcome`), `wait` (`awaits`, `function`, `owner`, `on`, `by` in `owned_by`), `hold` (`what`, `holder`), `job` (`kind`, `job`, `creator`), `worker` (`doing` in `function`: a pool worker's `search`, `idle` or `switch` between jobs), `macro module` (`module` in `function`, and as it ends `module_from`, `code_bytes`) `build script proof` (`krate`, `unit`, and as it ends `steps`), `admission` (a plane task's wait from ready to start: `kind` in `function`, `node`, and as it ends `waited_for` in `awaits` (memory, a work or io thread, nothing), `passed`, `granted`; detached, on no thread's stack, as no thread waits in it; `blaze explain admission_waits`) and `task` (a daemon plane task run on a thread, `crates/blaze-cargo/src/serve/plane.rs`: `kind` in `function` as `unit bodies (infer)`, `node`, `granted`, `passed`, `krate` in `crate` and `unit` in `unit` (the unit it is a phase of, as the unit phase spans name it; none for a task of no unit), and as it ends `peak` in `peak_bytes`, `heap_allocated` in `heap_allocated_bytes` and `heap_freed` in `heap_freed_bytes`; `blaze explain task_memory`, `task_grants`, `admission_waits` and `memory` read it). Each field names its column by type, so a site that leaves out a field, gives one of the wrong type, or names a column that does not exist does not compile, and a typed column no kind writes fails the build. The kind writes its fields straight into its open span's slot, with no field visitor. `span::read` reads a ring's row back as its kind and `span::read_batch` a `spans` batch; every kind has a view of its rows with its fields as columns, `span_<name>` with spaces as underscores (`span_macro_expand`, whose `path` is `function`). An ad hoc `tracing::info_span!(target: "blaze", ..)` fills `crate`, `function` and `unit` from fields of those names (`krate`, `subject` and `cgu` too); its other fields are kept nowhere.
 
 A `macro expand` span is one run of a proc macro: `function` is the macro's path (`serde_derive::Serialize`), `crate` the crate the call is in. A unit's phase spans (`unit names`, `unit bodies`, `unit codegen`, `unit link`, `unit store`) carry the unit in `unit` as `serde v1.0.219 (build script)`; their `crate` is the target's name, `build-script-build` for every build script. A `scope` wait names the span its caller opened the scope in: `scope 13 of unit codegen serde v1.0.219 (build script)`.
 
@@ -563,6 +591,33 @@ over before a flush read it is counted in the flush's skipped rows.
 | tag | dict? | the blaze-mem tag of the task that made the block; null outside any task |
 | block_bytes | u64 | the sampled block's own bytes |
 | site | utf8? | the innermost frame of `stack` outside the allocator and the collections that call it (`alloc::`, `core::`, `std::`, `hashbrown::`, ...) |
+
+### `held_samples`: the sampled allocations nobody has freed, a reading a minute
+
+`alloc_samples` says what was allocated, which is the churn. What the heap holds is the blocks
+nobody freed: each sampled block is kept by the allocator under its address with its sample
+(`blaze_graph::arena::sampled`), taken out as the block is freed and moved with a block that
+moves, and once a minute (`blaze_profile::history::HELD_EVERY`) a flush writes every sample
+still there as one reading. Summed by `site` within one `read_ns`, the samples' `bytes` are
+what the heap held then of what was allocated there, within a sample's: the answer to "what
+keeps the global heap", by function (`blaze explain memory`, `memory_held`). A free costs one
+load, and the eight of the block's bucket; a bucket that is full loses the sample, which only
+lowers a site.
+
+| column | type | |
+|---|---|---|
+| build_id | u64? | the build its block was allocated in, or null |
+| process | u32 | the process id |
+| thread | u32 | the thread that allocated its block |
+| t_ns | i64 | when its block was allocated |
+| bytes | u64 | the bytes of allocation the sample stands for, as `alloc_samples.bytes` |
+| stack | stack | the call stack that allocated it, outermost first |
+| span_id | u64? | the innermost span its thread was inside as it allocated |
+| stack_pcs | pcs? | as in `samples` |
+| tag | dict? | the blaze-mem tag of the task that made the block; null outside any task |
+| block_bytes | u64 | the sampled block's own bytes as it was sampled |
+| site | utf8? | the call site, as `alloc_samples.site` |
+| read_ns | i64 | the reading it is a row of |
 
 ### `heap_by_owner`: the live heap at the end of a build, by what holds it
 
@@ -1004,7 +1059,20 @@ Each row is one stretch of the path: `ran` time on a lane (named by the span tha
 most) or a `waited` gap. `path_s` is the path's length, `path_pct` its share of the build, and
 `parallelism` the threads' busy time divided by the path. The walk is bounded at 100,000 steps;
 `complete` is false when it stopped there, so a cut-short path says so. A wait that names no owner hides its
-waiter's dependency, so the path is only as complete as the owners are.
+waiter's dependency, so the path is only as complete as the owners are. The view matches a wait's
+`owner` to the job of that number in `switches` (generation << 32 | slot); until 2026-11-11 it
+matched schema 1's slot + 1, which no file since schema 2 holds, so it crossed no wait.
+
+Every `wait` says who ends it in `owned_by` (2026-11-11): a job (`owner`), or what stands in a
+job's place. `blaze explain wait_owner [min_ms=20]` lists a build's long waits with that and with
+what the owner's job did while the waiter waited (`owner_did`): for a wait on a query's key, the
+owner's `query verify` span (the holder of the row's flight bringing the row's reads up to date
+before it knows whether the row runs, `crates/blaze-query/src/db/function.rs`) or the spans of the
+query's own run. `blaze slow`'s model (`time::Model`) crosses a client's wait for its daemon
+(`owned_by` = `the daemon`, opened by `blaze_graph::wait::wait_for_daemon`) to the thread that
+made the daemon's answer (`loop: a job's answer`, `time::ANSWER_SPAN`), so the path of a build
+goes from the client into the daemon instead of ending on the client's wait; a wait that learns
+its waker as it ends says so with `blaze_graph::wait::wait_woken`.
 
 Each view whose arguments all have defaults is also a DuckDB view of the same name in every
 `blaze debug sql` query, over the last build to end: `SELECT * FROM uncovered_time`. For another
@@ -1359,15 +1427,19 @@ holds an exclusive lock on (`flight/postmortem.rs`):
 Recording is unchanged: a thread writes its own store with the same atomics, with no system
 call and no allocation, and no row holds an address. Rings made before the history persisted
 move into the file, each by its own thread as it next writes (a ring no thread holds moves at
-once). The file is reserved whole as it is made: its fixed part (about 19.3 MiB) and a store
-for each of the first 256 rings (`MAPPED_RINGS`; each 2 MiB of rows and a 4 KiB head, about
-532 MiB in all), with `posix_fallocate` on Linux and `F_PREALLOCATE` on macOS, so a full disk
-is an error at persist time naming the file and why, never a SIGBUS later. A ring past persist
-takes its store with no system call. There is no heap fallback: a process with more than 256
-rings as it persists refuses to persist (the error names the file), and after it persists a
-thread past the 256th gets no ring (its spans count as ringless) and the next flush reports the
-store as full. The map and the crash records (`crash.<pid>`) count against the history's cap
-(4 GiB), so the files the history keeps plus them stay under it, the newest build excepted. On
+once). The file is mapped with room for 256 stores (`MAPPED_RINGS`; each 2 MiB of rows and a
+4 KiB head) and ends after the last store handed out: its fixed part (about 3.3 MiB) is
+reserved on disk as it is made, a store for each ring there is at persist time, and each later
+ring's store as it is handed out (one system call a ring, `posix_fallocate` on Linux and
+`F_PREALLOCATE` asked for all or nothing on macOS), so no byte of the mapping is written before
+the disk under it is reserved: a full disk is an error naming the file and why, never a SIGBUS
+later. Until 2026-11-11 all 256 stores were reserved up front, 516 MiB a daemon; a daemon on 18
+cores uses 26 rings, 56 MiB. There is no heap fallback: a process with more than 256 rings as
+it persists refuses to persist (the error names the file), and after it persists a thread
+whose store the disk has no room for, or past the 256th, gets no ring (its spans count as
+ringless) and the next flush reports why. The map and the crash records (`crash.<pid>`) count
+against the history's cap (256 MiB, as long as they were at its last recount), so the files the
+history keeps plus them stay under it, the newest build excepted. On
 Windows the history says it can't persist and records as before.
 
 Each flush marks in every store the row it wrote to. A history that opens (and `blaze slow`
@@ -1381,6 +1453,50 @@ describes itself (its layout's version and the fingerprint of every constant dec
 on, the event fields' too), so a blaze rebuilt after a crash, the usual case when the crash is
 being fixed, reads it; a check of the hash would refuse exactly those files, and the
 fingerprint already refuses every one this blaze would misread.
+
+### Flight recordings
+
+The daemon writes what the recorder holds to `<state>/flightrec/<pid>-<unix ms>.cbor`
+(`crates/blaze-cargo/src/serve/flightrec.rs`) when a thread no job's runner catches panics (the
+loop, an IO thread, the guard), when it is stopped at its memory ceiling (the last 5 s only),
+when a build, the loop or a stop stalls past the stall bound, and when `blaze debug inspect
+--record` asks. The file is a 16-byte mark, its format as a `u32`, then one record in
+deterministic CBOR: why it was written, what the daemon said, every thread's open spans
+(name, item, `awaits`, owner, how long) and the recorder's last two minutes as the Chrome
+trace `blaze debug profile` writes, taken again over half the window while it is past 64 MiB.
+A file of another format is refused naming both; the directory keeps the newest 16. A fatal
+signal writes none (its handler can only do what is async-signal-safe): its rows are in
+`flight-<pid>.map`, above. The client a request hung up on names the newest recording of
+the daemon's pid (`its flight recording ...: <path>`), and `blaze debug inspect --read FILE
+[--trace OUT]` prints one as a line of JSON and writes its trace out.
+
+## Asking a live daemon: `blaze debug inspect`
+
+`blaze debug inspect` prints one line of JSON saying what the daemon is doing now. It is
+answered by a thread of its own on a socket of its own (`<home>/v2.inspect.sock`,
+`crates/blaze-cargo/src/serve/inspect.rs`), never by the loop or a pool job, so it answers
+while every work thread is busy and while the loop is stuck. It starts no daemon. The fields:
+
+- `threads`: each thread inside a span, waiting ones first, longest first: `name`, `state`
+  (`waiting` when its innermost span awaits something), `awaits`, `for_ms`, `node` (the plane
+  node of the `task` span it is inside) and `open`, its spans outermost first;
+- `tasks`: the plane's tasks that have not ended, running first: `kind`, `name`, `state`
+  (`running` or `queued`), `for_ms`, `deps` (the unsettled tasks it waits on), and for one a
+  thread is inside, that `thread` and what it `awaits`; `tasks_unread` says when the loop held
+  the table;
+- `lock_waits`: the named-lock, signal and kernel waits in progress with each lock's `holder`;
+- `job_waits`: the scheduler's waits in one line (each parked job and the key, counter or job
+  it waits on, with the key's claimer), or why they were not read within a second;
+- `longest`: the waits of `threads` and `lock_waits`, longest first, at most 32;
+- `memory`: `footprint`, `ceiling`, `limit` (what admission decides by), `admission` (`under`,
+  `near` past 7/8 of the limit, `over`) and each subsystem's bytes;
+- `turn`: the loop's `turns` and how many it `turned` in the 60 ms before the answer (0 is a
+  loop that does not turn), and the pool's `workers`, `working`, `parked`, `jobs_ended`;
+- `recorded`: with `--record`, the flight recording written.
+
+A job parked on a fiber keeps its spans off every thread, so its wait is in `job_waits`, with
+no age, and not in `longest`; a queued task's reason (memory, a thread) is in its `admission`
+span once it starts.
 
 ## The live feed
 
@@ -1423,7 +1539,8 @@ When none of them has moved for the stall bound, 120 s unless `blaze serve --sta
 says otherwise, the daemon:
 
 1. writes `state/stalls/<time>.json`: the flight recorder's last two minutes and the CPU
-   samples as a Chrome trace (ui.perfetto.dev opens it);
+   samples as a Chrome trace (ui.perfetto.dev opens it), and a flight recording
+   (`state/flightrec/<pid>-<time>.cbor`, above) with what every thread was inside;
 2. fails each running request with the error `blaze stalled: no job ended, no query
    completed, no task or step ended, no job's code or run of user code was running and no
    download got a byte for N s while M tasks ran (the stall bound is B s,

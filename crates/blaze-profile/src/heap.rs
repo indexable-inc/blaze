@@ -6,12 +6,17 @@
 //! and the call site, the innermost frame outside the allocator and the collections' plumbing.
 //!
 //! A sample is taken inside the allocator, on the allocating thread: [`taken`] walks the
-//! thread's frame pointers through [`crate::stack::here`] (each record vouched for by the
-//! kernel, so a wild pointer ends the walk, never faults; two system calls a frame) and writes
+//! thread's stack, on Linux by the unwind tables ([`crate::stack::unwound`]) and elsewhere up
+//! its frame pointers through [`crate::stack::here`] (each record vouched for by the
+//! kernel, so a wild pointer ends the walk, never faults; two system calls a frame), and writes
 //! the sample into a fixed ring of atomics, [`RING`], with no lock and no allocation. The
 //! history's flush reads the ring ([`since`]) and names the addresses then, as it does the CPU
 //! samples'. A sample written over before a flush read it, or being written as it read, is lost
 //! and counted in the flush's `skipped`.
+//!
+//! Each sample is also kept by the allocator under its block's address until the block is
+//! freed ([`blaze_graph::arena::sampled`]), so the samples still there are what the heap holds,
+//! by call site: the `held_samples` table, a reading of them once a minute ([`held`]).
 
 use std::{
     sync::{
@@ -34,6 +39,9 @@ const KEPT: usize = 8192;
 /// stands for.
 const HEAD: usize = 6;
 const WORDS: usize = HEAD + DEPTH;
+
+// A sample still held is kept whole by the allocator's table of sampled blocks.
+const _: () = assert!(WORDS <= blaze_graph::arena::sampled::WORDS);
 
 /// The tag word of a sample made outside any task.
 const NO_TAG: u64 = 0xff;
@@ -88,6 +96,7 @@ pub fn start() -> Result<(), Unsampled> {
     }
     _ = EPOCH.get_or_init(Instant::now);
     STARTED.store(true, Ordering::Release);
+    blaze_graph::arena::sampled::keep();
     blaze_graph::arena::sample_heap_with(taken);
     Ok(())
 }
@@ -116,6 +125,11 @@ pub(crate) struct HeapSample {
 fn taken(sampled: HeapSampled) {
     let Some(epoch) = EPOCH.get() else { return };
     let mut pcs = [0u64; DEPTH];
+    // By the unwind tables on Linux, where a function need keep no frame record; by the
+    // frame records where the ABI gives every function that calls one (Apple's).
+    #[cfg(target_os = "linux")]
+    let depth = crate::stack::unwound(&mut pcs);
+    #[cfg(not(target_os = "linux"))]
     let depth = crate::stack::here(&mut pcs);
     let (build, span) = crate::flight::here_now();
     let t_ns = u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -123,6 +137,26 @@ fn taken(sampled: HeapSampled) {
     let packed = u64::from(build) | tag << 32 | (depth as u64) << 40;
     let head = [t_ns, crate::sampler::os_tid(), packed, span, sampled.bytes, sampled.weight];
     put(head, &pcs[..depth]);
+    // And kept under the block's address until the block is freed: what `held_samples` reads.
+    blaze_graph::arena::sampled::put(
+        sampled.block,
+        head.iter().chain(&pcs[..depth]).copied(),
+    );
+}
+
+/// The samples whose blocks are still held, into `into`: every sampled allocation nobody has
+/// freed, with the stack that made it ([`blaze_graph::arena::sampled`]). Nothing where the
+/// sampler was not started in this process.
+pub(crate) fn held(into: &mut Vec<HeapSample>) {
+    if !STARTED.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(epoch) = EPOCH.get() else { return };
+    blaze_graph::arena::sampled::each(|words| {
+        let mut own = [0u64; WORDS];
+        own.copy_from_slice(&words[..WORDS]);
+        into.push(decode(epoch, &own)); // alloc: a reading's rows, into the history's buffer
+    });
 }
 
 /// Writes one sample into its place in [`RING`], unless another writer holds it (a lap behind,
@@ -218,7 +252,23 @@ const PLUMBING: &[&str] = &[
     "blaze_profile::heap",
     "blaze_profile::stack",
     "blaze_graph::arena",
+    "<blaze_graph::arena",
     "blaze_engine::heaps",
+    "<blaze_engine::heaps",
+    "blaze_engine::malloc",
+    // The global allocator's shims, as blaze names them (`__blaze_global_alloc`, `_zeroed`,
+    // `_realloc`): every Rust allocation of a blaze-built daemon passes through one.
+    "blaze_engine::__blaze_global",
+    // The same shims as rustc's own mangling names them in a binary the system linker made
+    // (`__rustc::__rust_alloc`, `_zeroed`, `_realloc`), and C's entry points, which blaze
+    // exports on Linux (`malloc.rs`): their caller is the site.
+    "__rustc::",
+    "malloc",
+    "calloc",
+    "realloc",
+    "posix_memalign",
+    "aligned_alloc",
+    "_Unwind_",
     "__rust_",
     "__rdl_",
     "__rg_",
@@ -277,6 +327,15 @@ mod tests {
         ];
         assert_eq!(site(stack.into_iter()), Some("hir_ty_mir::lower::body"));
         assert_eq!(site(["__rust_alloc", "alloc::alloc::alloc"].into_iter()), None);
+        // A binary cargo built: rustc's own names for the shims, and the counting allocator's
+        // `GlobalAlloc` impl as a trait path.
+        let cargo_built = [
+            "<blaze_graph::arena::Counting<blaze_engine::heaps::Heaps> as core::alloc::global::GlobalAlloc>::realloc",
+            "__rustc::__rust_realloc",
+            "<blaze_query::db::reverse::Reverse>::add",
+        ];
+        assert_eq!(site(cargo_built.into_iter()), Some("<blaze_query::db::reverse::Reverse>::add"));
+        assert_eq!(site(["malloc", "llvm::SmallVectorBase::grow_pod"].into_iter()), Some("llvm::SmallVectorBase::grow_pod"));
     }
 
     /// A sample put is read back whole, once, and a ring written past a reader's place loses

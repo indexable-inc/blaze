@@ -137,6 +137,8 @@ pub const VIEWS: &[View] = &[
     const { view("memory_timeline", &[BUILD]) },
     const { view("memory_peak_tasks", &[BUILD, LIMIT]) },
     const { view("memory_at_peak", &[BUILD]) },
+    const { view("memory_held", &[BUILD, LIMIT]) },
+    const { view("memory_held_now", &[LIMIT]) },
     const { view("memory_sites", &[BUILD, LIMIT]) },
     const { view("admission_waits", &[BUILD, LIMIT]) },
     const { view("busiest_threads", &[BUILD, LIMIT]) },
@@ -159,6 +161,7 @@ pub const VIEWS: &[View] = &[
     const { view("problems", &[ANY_BUILD, BUILDS, LIMIT]) },
     const { view("timeline", &[ENDED_BUILD, MIN_MS, MANY]) },
     const { view("long_spans", &[BUILD, LONG_MS, LIMIT]) },
+    const { view("wait_owner", &[BUILD, LONG_MS, LIMIT]) },
     const { view("waits_by_reason", &[BUILD, LIMIT]) },
     const { view("counts_by_cause", &[BUILD, MANY]) },
     const { view("writes", &[BUILD, MANY]) },
@@ -166,6 +169,7 @@ pub const VIEWS: &[View] = &[
     const { view("pool", &[ENDED_BUILD]) },
     const { view("kept", &[ENDED_BUILD, MANY]) },
     const { view("syscalls", &[ENDED_BUILD, THREAD, WITHIN, MIN_MS, MANY]) },
+    const { view("edit_work", &[BUILD, MANY]) },
 ];
 
 /// The view named `name`.

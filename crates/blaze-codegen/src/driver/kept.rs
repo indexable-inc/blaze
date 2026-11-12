@@ -59,11 +59,15 @@ pub struct Kept<I, S> {
     /// Each program's last `Built` by row ([`Lists`]), by the [`program`] its walk is kept
     /// under: taken by the build that patches it, as its walk is.
     lists: Lock<std::collections::HashMap<u64, Lists>>,
+    /// Made in place of one let go when memory was short ([`Kept::after_let_go`]): what its
+    /// first walks say of why they took nothing kept ([`Fresh::LetGo`]).
+    let_go: bool,
 }
 
 impl<I: Eq + Hash, S> Default for Kept<I, S> {
     fn default() -> Self {
         Kept {
+            let_go: false,
             rounds: std::array::from_fn(|_| SharedMap::default()),
             // alloc: none until a walk is kept
             walks: Lock::new("codegen.driver.kept_walks", std::collections::HashMap::new()),
@@ -78,6 +82,21 @@ impl<I: Clone + Eq + Hash + Send + Sync, S: Send + Sync> Kept<I, S> {
     /// Nothing kept: what the first walk over a database begins with.
     pub fn new() -> Self {
         Kept::default()
+    }
+
+    /// Nothing kept, in place of what was let go when memory was short: a walk that finds it
+    /// empty says so, not that the daemon started.
+    pub fn after_let_go() -> Self {
+        Kept { let_go: true, ..Kept::default() }
+    }
+
+    /// Why a walk that finds nothing kept here took nothing: what was kept was let go, or
+    /// nothing was kept yet.
+    pub(super) fn empty_because(&self) -> Fresh {
+        match self.let_go {
+            true => Fresh::LetGo,
+            false => Fresh::Restart,
+        }
     }
 
     /// How many describes are kept, over every round.
@@ -135,6 +154,29 @@ impl<I: Clone + Eq + Hash + Send + Sync, S: Send + Sync> Kept<I, S> {
         self.lists.lock().insert(program, lists);
     }
 
+    /// Gives back `built`, a `Built` a build over this gave, once its reader is done with
+    /// it: the next build of its program writes the rows it changed into these lists in
+    /// place of making every list again from its rows, so what an edit costs here is the
+    /// edit's rows and never the program's ([`Work::copied`]). Kept only where it is the
+    /// last `Built` of a program kept by row (its ID is the rows'), and let go otherwise:
+    /// one given late, after its program was built again, is of no use to anyone. A reader
+    /// that never gives one back costs the next build a copy a row, and nothing else: which
+    /// `Built` the next build gives does not depend on it.
+    pub fn give_back(&self, built: super::Built) {
+        let unused = {
+            let mut lists = self.lists.lock();
+            match lists.values_mut().find(|it| it.gave(&built)) {
+                Some(of) => {
+                    of.take_back(built);
+                    None
+                }
+                None => Some(built),
+            }
+        };
+        // Freed outside the lock.
+        drop(unused);
+    }
+
     /// Takes the walk kept of `program`, if one is: a build that patches it owns it, and
     /// keeps the patched one in its place when it ends well.
     pub(super) fn take_walk(&self, program: u64) -> Option<Walked<I, S>> {
@@ -183,12 +225,22 @@ pub struct Walk {
 /// whole, which counts nothing: its work is the program's.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Work {
-    /// Functions and statics the front end was asked of again.
+    /// Functions and statics the front end was asked of again: those asked each build and
+    /// those the front end named that the walk holds, each once; every one the walk holds
+    /// when the front end named no changed set.
     pub asked: usize,
-    /// Groups of inputs the front end was asked whether written ([`Frontend::group`]).
+    /// Functions, counted instances and statics the front end named as changed
+    /// ([`Frontend::changed_since`]): 0 when it named no set. A regression of the front
+    /// end's changed set shows here: growing with the program where the edit did not.
     ///
-    /// [`Frontend::group`]: crate::backend::Frontend::group
-    pub groups: usize,
+    /// [`Frontend::changed_since`]: crate::backend::Frontend::changed_since
+    pub named: usize,
+    /// Functions and statics of the walk that those names are of, each once.
+    pub held: usize,
+    /// Functions and statics asked each build ([`Frontend::each_build`]).
+    ///
+    /// [`Frontend::each_build`]: crate::backend::Frontend::each_build
+    pub each_build: usize,
     /// Describes taken anew: of kept functions and statics that changed, and of new ones.
     pub described: usize,
     /// Items the reachability graph looked at: entered, dropped or brought back.
@@ -216,13 +268,15 @@ pub struct Work {
     pub replaced: usize,
     /// Bytes hashed: the code of the functions made again and the paths of the keyed sets.
     pub hashed: u64,
-    /// Rows copied into the `Built`'s contiguous lists: every one, the one linear cost.
+    /// Rows written into the `Built`'s contiguous lists: those the build changed, where the
+    /// last `Built` was given back to be written into ([`Kept::give_back`]); every one,
+    /// where it was not, or where it was a whole build's (once, for its template entries).
     pub copied: usize,
     /// Whether the `Built` was made by patching the lists kept of the last one.
     pub patched: bool,
 }
 
-/// A walk's counts while its levels describe on all cores.
+/// A walk's counts while its describes run on all cores.
 #[derive(Default)]
 pub(super) struct Counts {
     pub(super) described: AtomicUsize,

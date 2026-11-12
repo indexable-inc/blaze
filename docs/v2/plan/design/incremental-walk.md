@@ -28,75 +28,175 @@ as one origin's code asks for it, a static) with its describe, key and count; th
 what each refers to with two sets over it (`support.rs`: `ALL`, what the check's roots and
 the build's reach; `BUILT`, what the build's own roots reach); the nodes and statics in
 `rows::Rows`, a sorted map in 64-entry chunks shared by reference count, so a change copies
-one chunk; and when each function is asked again.
+one chunk; and what finds an item from the front end's name of it (by instance and
+requester, by instance, by static) with the lists of those asked each build.
 
 ## Finding the changed set
 
-A function is asked again (`redescribe` and `counted`, on all cores) by what its inputs are:
-never while the durable view is the same (`Frontend::durable`); when an input of its group
-was written since the kept view (`Frontend::group`, `written_since`, `view`); else each build.
-Statics are asked each build. blaze-query has no reverse index from written fields to rows,
-and a row's Bloom summary is all ones once it reads a crate's name resolution, so the engine
-cannot name the changed memos; it gained `plumbing::input_written_since::<I>(storage, id,
-view)` (a load per field, exact or `true` after renumbering) for a front end to tell a
-group's writes by. **`HirFrontend` does not implement `group` yet**
-(crates/hir-ty-codegen/v2/frontend.rs, beside `durable`): until it does, every function that
-is not durable is asked each build.
+The codegen walk starts from the set the front end names (written 2026-11-11, unbuilt and
+untested). `patched` asks `Frontend::changed_since(view)` with the view the kept walk was
+made in (`Walked::seen`) and gets the functions (instance and requester) whose describe, the
+instances whose count and the statics whose describe may be another, or `Unknown` with why.
+It asks again (`redescribe` and `counted`, on all cores) only the items it holds of those,
+each found by a lookup (`Keep::functions`, `instances`, `values`), and the items asked each
+build (`Frontend::each_build`, `static_each_build`): those whose describe reads beside the
+database, a body or a static's value that names a file. A name the walk holds no item of is
+ignored. A front end that tells no view (`Frontend::view` is `None`: one with no engine)
+says by that that every item is asked each build, and the `ask functions` span says `every`.
+A front end that tells a view and answers `Unknown` has lost its changed set: the build is
+refused with the front end's reason, the kept walk and lists put back as they were
+(`no_changed_set_error`; rule no-fallback), where until 2026-11-11 the walk asked of
+everything it held.
+`HirFrontend` answers from `described_memo::changed_since`, `counted_memo::changed_since`
+and `described_static_memo::changed_since`, each key read back by the query's `arguments`
+(crates/hir-ty-codegen/v2/frontend.rs). `Frontend::durable`, `group`, `written_since`,
+`settle` and the walk's `Hangs` are gone; the durable view is still compared, and another
+one walks whole. `Work` counts `asked`, `named` (what the front end named), `held` (what
+the walk holds of it) and `each_build`.
 
-### The changed set from the engine (design, 2026-11-11; not built)
+### The changed set from the engine (2026-11-11; written, unbuilt and untested)
 
 Measured on ripgrep 15.1.0, a one-line edit inside `fn main` (build 49): `codegen walk` 348
 ms, 38 ms of it the walk's own thread, `patched: asked 86708 functions and statics of 0
-groups, described 2`; `described_memo` verified 86,480. The same shape is in the unit's
+groups, described 2`; `described_memo` verified 86,480. The same shape was in the unit's
 check (`unit bodies` 484 ms, `body_check_clean` executed 6, verified 1,149): every memo of
-the program or the crate is verified by pull to find the handful an edit changed. The span
-`codegen walk: ask functions` (and `: ask statics`) now holds the asking apart.
+the program or the crate verified by pull to find the handful an edit changed.
 
-Why `group` is not the fix. A per-crate group (the bullet under "Not built") is exact only if
-it covers every input a describe can read: the files of the crate that asks and of every
-local crate it reaches, and the thirty-odd other input kinds (crate data, source roots,
-proc-macro libraries, the published name-resolution and method-resolution deltas, the
-settings), each of which must then count as a write of every group. It is also too coarse to
-matter here: an edit of a binary's `main` writes the group of the binary, which holds every
-function the binary's code asks for, its dependencies' generics included.
+Why `group` is not the fix. A per-crate group is exact only if it covers every input a
+describe can read (the files of every crate it reaches and thirty-odd other input kinds),
+and it is too coarse: an edit of a binary's `main` writes the group of the binary, which
+holds every function the binary's code asks for.
 
-What is exact and costs the edit is the engine saying which memos changed, with early
-cutoff, starting from what was written:
+What is built (crates/blaze-query/src/db/reverse.rs, the core, and frontier.rs, the driver):
 
-1. **Reverse edges.** A memo row keeps the rows that read it (appended as an edge is
-   recorded; an entry of a row that has since run again without the edge is skipped when
-   it is met, and the list is compacted then). Input fields keep theirs the same way.
-2. **A frontier per view.** After the writes of a build and before its first query, the
-   engine walks from the written fields: each reader is verified (run again where a read
-   changed, backdated where its value is equal), and only a reader whose value changed
-   passes the walk on to its own readers. A body edit stops at the file's item tree (equal,
-   backdated) and goes on through the one body, its inference, its MIR. The walk is bounded
-   by the rows it visits and ends in a typed outcome (`bounded-progress`).
-3. **What a host asks.** `plumbing::changed_since::<F>(storage, view) -> Changed<F::Key>`:
-   the keys of function `F` whose memo's value changed, or was made, after `view`, or
-   `Changed::Unknown` where the storage can no longer say (views renumbered, a row
-   evicted), which a host takes as "ask everything". Exact, never a guess.
-4. **The walk.** `Frontend::changed_since(view) -> Option<Vec<(Instance, Origin)>>` takes
-   the place of `group` and `written_since`: `HirFrontend` answers it from
-   `changed_since::<described_memo>` and `changed_since::<counted_memo>`. `patched` asks
-   those, the functions whose describe names a file (`Memoed::NamesFiles`, asked each
-   build as now) and the statics by the same call on `described_static_memo`. `Hangs` goes.
-5. **The check.** `Plan::run_marked` posts the bodies and modules of
-   `changed_since::<body_check_clean>` and `::<module_check_clean>` and takes every other
-   one's empty answer without a task.
+1. **Feeds**, one push each where the engine already does the work, never on a hit: a run
+   that stores edges says which span it replaced; an input field written is logged; a row
+   whose stamp moves to the view (not backdated; a cycle's rows; a row emptied) having had
+   a value before, and a tracked field rewritten with another value, say they changed; a
+   run that made an untracked read says so.
+2. **Reverse edges** live in one index a storage, folded at each view boundary (`&mut`, no
+   reader, before the edge array settles) from the edges runs stored since: a rerun adds
+   only the nodes it gained; an edge is never taken out (a stale reader costs one
+   verification, a missed one is a stale result), and when the index holds more than twice
+   the edges the rows name it is made again from the rows. Memory: 4 to 8 bytes a reader
+   and 4 a node, at most twice the forward array's 4 bytes an edge; reported as `reverse
+   edges` in the storage's memory usage. At a million memos and ten edges each: 40 to 80
+   MiB beside the forward array's 40. Interned values have no node, so no reader list.
+   Not persisted: the storage is memory, and the index is made from the rows' edges.
+3. **The walk** (`plumbing::walk_changed_set`, one walker at a time under its own flight,
+   span `changed set` with `written`, `untracked`, `visited`, `edges`, `changed`,
+   `unwound`): from the fields written since the last walk, every node that said it
+   changed and every row whose last run was untracked, the readers are verified as a
+   reader's edge is (run again where a read changed, backdated where equal), a level at a
+   time in node order, on the pool past 64 rows; whatever changes says so and its readers
+   are next; an unchanged row stops it. Each row is verified once and each node's readers
+   gathered once, so it is bounded by the nodes it reaches.
+4. **What a walk leaves**: every row made before it is verified in its view or unchanged.
+   So until the next write, a pull of a row not verified in the view marks it with no look
+   at its edges (`frontier::clean`): a host's pass over everything it holds costs a few
+   loads a row. This is what a task of the body check pays for a memo the edit did not
+   reach. The codegen walk and the body check ask only what item 5 names.
+5. **Naming**: `plumbing::changed_since::<F>(db, view) -> Changed<F::Key>` and each tracked
+   query's generated `changed_since` (IDs): the keys of `F` whose value changed since
+   `view`, from a log of the walks' findings, or `Unknown` naming why (a view that is none
+   of this storage's, or asked inside a query while a walk is due), which is a host's error:
+   the body check and the codegen walk refuse to build on it (rule no-fallback). The log
+   answers from any earlier view: past 256 walks or 2^20 nodes its oldest findings are
+   merged into one of the newest view among them (`merge_oldest`), never dropped, so a host
+   that asks from before them is named a few rows too many and is never left to sweep.
+   It may name more, and only: a value that changed and changed back, a row whose
+   verification unwound, a change at or before `view` when no walk ran between. A row
+   first made after `view` is not named.
 
-The result stays the whole walk's because nothing else changes: the patch still redescribes
-each function it is told of and compares, so a key the engine names that did not change costs
-one ask, and the refinements of `driver/tests/kept.rs` hold the patched walk to the whole
-walk's (their planted bugs are the dependent missed: a caller that names a changed callee's
-old key, a patch that keeps a changed function's old references). What has to be proved new is the
-engine's frontier: a memo it does not name is one a pull would verify unchanged. That is a
-deterministic simulation test in blaze-query (`dst-not-review`): draw writes and reads,
-compare `changed_since` with the pull's answer for every row, and plant the two bugs it must
-catch (a reverse edge not recorded, a changed reader that does not pass the walk on).
+Exactness. A row changes only by running again, and runs again only for a read that
+changed after it was verified, an untracked read, or being emptied. By induction over
+walks, the first changed read `d` of a row that changes after the last walk changed after
+that walk too, so `d` is a written field or said it changed, and the row is among `d`'s
+readers: a run re-reads its edges up to and including the first changed one, so that edge
+survives the run, and no edge leaves the index. Durability needs nothing: a written field
+is followed whatever its kind. An untracked read puts its row in every walk.
 
-Why it was not written with the measurement: it changes the engine's rows and its
-concurrent verify, which is proven by that test run, not by reading.
+Rows nothing asks for. A walk may verify a row whose key names what an edit removed, which
+a pull would never run. A verification that unwinds for any reason but the caller's own (a
+pending write, fuel, a wait that would close a cycle of tasks) is contained: the row's
+word is put back by the engine's guard, the walk logs it (`unwound`), names it as changed,
+goes on to its readers, never takes it as clean, and does not verify it again until
+something else brought it up to date. A walk contains at most 8 of them (`UNWOUND_MOST`):
+from the row after the eighth it marks what it reaches and verifies nothing, as past a wide
+level, so an edit that deletes items costs at most 8 panics a walk (`fn main` replaced by
+another function in a hello-world was 83 before the bound, 2026-11-11). Watch `unwound` and
+the panic hook's output on edits that delete items.
+
+Proof (`dst-not-review`): crates/blaze-query/src/db/tests/changed.rs. Random programs
+(sums, cutoffs, reads chosen by a value, untracked reads) under random writes, pulls in
+views no walk runs in, evictions, epochs and asks from any earlier ask; the oracle is a
+from-scratch evaluation after every step: every row made by `V` whose value differs is
+named, every row named moved in between, every row answers as the model, and the walk
+visits no more rows than were made. Planted bugs it catches: a reverse edge not recorded,
+a rerun's new edges not folded, a changed reader that does not pass the walk on, a cutoff
+not applied, an evicted row passed over. Not in the simulation: cycles, tracked fields,
+two tasks at once, and a verification that unwinds.
+
+Next. The codegen walk starts from the named set ("Finding the changed set"); its
+refinement and controls are in `driver/tests/kept.rs` (a changed function the set does not
+name, a function asked each build that is not asked, the asks of one edit among 100 and
+10,000 functions). The refinements of
+`driver/tests/kept.rs` already hold a patched walk to the whole walk's.
+
+The body check does the same (crates/hir/src/check/bodies.rs; written 2026-11-11, not yet
+built or run). A plan of every body keeps, in memory by (database nonce, crates, style
+lints), the file modules, each module's listed bodies and which checks gave a diagnostic,
+with the view it ran in. The next plan asks `changed_since` of `crate_file_modules`,
+`module_bodies` (both queries now), `module_check_clean` and `body_check_clean`, and holds
+a slot only for the modules touched and a task only for what is named, what was not clean
+(its diagnostics are not kept) and the bodies new in a module listed again; every other
+answer is the kept one, clean, with no task and no fetch. It is whole, and its spans say
+why (`body check plan`, `body check sweep`: `whole`, `why`, held, named, visited,
+`kept_unvisited`), when nothing is kept, the engine answers `Unknown`, or a crate's file
+modules changed. Its refinement test holds it to a whole plan's diagnostics over edits,
+with two planted bugs and a count of the tasks of one edit among 20 bodies and 200. What
+still grows with more than the edit: the slots of a touched module are all its bodies, and
+a body or module that is not clean (a warning counts) is visited every build.
+Where a check is kept and the engine answers `Unknown`, there is no plan: `NoChangedSet`
+names the crates and the engine's reason, and the kept check goes back as it was.
+
+### The work of an edit, counted, and what else follows the edit (2026-11-11; written, unbuilt and untested)
+
+**The measure.** Each stage says once what it visited as a kept event `edit work` with its
+stage's name and its counters (crates/blaze-query/src/db/edit_work.rs names the stages and
+lists the counters): the engine's walk (`changed set`), each unit's plan (`body check`),
+each program's walk (`codegen walk`), each dependency serve (`dependency image keys`) and
+each link (`link`). `blaze explain edit_work` prints them by stage with the engine's memos
+run and verified from `query_counts`; a build that counted nothing is an error. The test of
+the whole front half is hir's `a_body_edit_touches_only_what_reads_the_body`: three crates,
+the same body edit among 200 functions and among 2,000, every count equal and small; its
+control edits a signature, which reaches every caller.
+
+**Dependency image keys.** A key is the database's memo (`hir_def::deps`'
+`crate_image_key`), where it was a host's walk forgotten at every view: an edit of a member
+makes none again (0 at 4 libraries and at 40), and a key that changes is held to a fresh
+database's.
+
+**At the save: not built.** A build ahead of a save (the watcher's commit starting the
+head's last request as an intent's job) was written and taken out on 2026-11-11: measured
+on a hello-world, a check ahead resolved the dependencies again as crates of its own (3,733
+item trees run new) and wrote `AllCrates`, `SourceRootInput`, `PathBucket` and
+`ProcMacros`; the run after it walked from fields the whole program reads and never ended.
+A build ahead in place of the check let the first edit through in 2.4 s and hung the
+second. A second job on a view must first write no input the first job's rows read.
+
+**Small loops run here.** A loop of at most 32 items predicted under 2 ms from its own
+site's small runs (`blaze_graph::par::Small`) runs on its calling thread with no job
+submitted: the body check's tasks, the codegen walk's asks. The changed-set walk's levels
+keep their own bound (under 64 rows on the walker's thread); the predictor there measured
+the same.
+A unit's phases are still plane tasks, each a dispatch: the edit's chain is one thread
+within a stage, not yet across them.
+
+**Still the program's size, not the edit's.** A link goes over every name and every
+patchable function of the program (`link`'s `symbols` and `patchable`), and a `Built`'s
+lists are copied each build (`codegen walk`'s `copied`); the slots of a touched module are
+all its bodies.
 
 ## The patched walk
 
@@ -168,11 +268,12 @@ hir-ty-codegen index and slice: they are copied from the rows each build (`Work:
 
 ## Cost after an edit
 
-N functions, C changed or new, D their referrers, G groups, L functions asked each build.
+N functions, C changed or new, D their referrers, L functions and statics asked each build
+(those that name a file), M what the front end names as changed.
 
 | Pass | Cost | Still linear because |
 |---|---|---|
-| asking | O(L + G + statics), on all cores | `HirFrontend::group` is not implemented, so L is every function not durable |
+| asking | O(L + M) asks on all cores, each name a lookup; the engine's walk itself O(rows the edit reaches); O(N) when the front end names no set (`Unknown`) | |
 | describes | O(C) | |
 | graph, slots, places, built-in, symbols, owners | O(C + D) | |
 | recursion limit | O(C), or O(N + edges) array steps when a body has more instances than the least limit | rustc's claim order is one depth-first walk; its state at the first changed claim is not kept |
@@ -180,16 +281,45 @@ N functions, C changed or new, D their referrers, G groups, L functions asked ea
 | dedupe | O(C + D) hashes; O(N) when a class changes | a class's merge can cascade to its callers |
 | reach | O(C + D) lookups, plus one copy of the arrays | readers index it by place |
 | entries, delta, id | O(C + D) rows, O((C + D) log N) hashes | |
-| the `Built`'s lists | one copy a row (N) | readers outside this crate take `Vec`s |
+| the `Built`'s lists | O(C + D) rows written into the last `Built`, which its reader gave back (`Kept::give_back`; a compiled function is shared, never copied); one entry a row (N) where it was not given back or dedupe ran whole, and once after a whole build for its template entries | readers outside this crate take `Vec`s, so the lists are patched in place: an insert or a removal moves a list's tail (no allocation) |
 
 `Work` (in `Built::work`, and on the spans of `codegen walk` and `codegen finish`) counts
 each; `the_work_of_an_edit_is_the_same_among_a_hundred_functions_and_ten_thousand` holds
 them to the edit.
 
+## The first edit after a cold build (2026-11-11; read, not yet measured)
+
+Measured on ripgrep 15.1.0, 64 cores, one daemon: the first body edit after a cold build
+5.7 s, each later one 0.95 s. Read from the code, what the first edit makes that a later one
+finds:
+
+- **Kept by a cold build, so not the difference:** its walk and lists (a whole build that is
+  not lazy and ends well keeps both under its program; `codegen delta` now says `walk_kept`
+  and `lists_kept`, `yes` or the reason), the describes' memos, the bodies' and modules'
+  check memos (`body_check_clean`, `module_check_clean`: every unit's check is
+  `Plan::of_every_body`), and the image's rows the link's delta is made against.
+- **Let go by the cold build's release, and read again by value:** the edited crate's
+  inference (by name, as the crate finished), and every crate's MIR and constants' values
+  (by tag, at each release with no unit open and at the build's end). The check memos hold,
+  so no check task reads a body; the readers are the lints of bodies
+  (blaze-diagnostics' `lints/bodies.rs`, `before_abort` and `after_abort`), which read every
+  body's inference, built MIR and runtime MIR in one loop on one thread. On ripgrep's
+  binary crate that is about 1,165 bodies of each made again one after another, where the
+  cold build had made them on all cores.
+
+Done: a build that is no edit's holds the inference of the workspace crates it finished
+last, at most `EDIT_CRATES` (blaze-cargo's `serve/unit/release.rs`, `Release::plan_of`),
+so the first edit infers what changed. Not done, and what is left of the difference: the
+MIR goes by its tag, which keeps none by crate, so the first edit still lowers each body's
+built and runtime MIR again on that one thread. Either closes it: the lints of bodies run
+a body a task on all cores, as the check does (then any state of the values costs the
+cores' share, a restart's and a memory squeeze's too), or the release keeps the held
+crates' `mir_body_query` and `runtime_mir_body_query` values, which needs an eviction by
+tag that takes keys to leave. To tell from a profile: the first edit's `query_counts` rows
+with `evicted_asked` (made again because let go) against `ran_changed` (an input changed).
+
 ## Not built
 
-- **The changed set from the engine** (above), which replaces `group`: until it is built
-  every function that is not durable is asked each build (86,708 asks, 348 ms, on ripgrep).
 - **The `Vec` copy.** Removing it means `Built`'s lists are `Rows`, or `CompiledFunction`'s
   buffers shared, and every reader ported.
 - **The dyn world.** A build that may close facts walks whole; narrowing needs the world's

@@ -11,6 +11,7 @@ fn targets() -> Targets {
     Targets {
         packages: vec!["a".into(), "b".into()],
         profile: "release".into(),
+        goal: None,
         target: Some("wasm32-unknown-unknown".into()),
         features: vec!["x".into(), "y".into()],
         all_features: false,
@@ -43,63 +44,10 @@ fn opened(root: u8) -> Opened {
     }
 }
 
-/// A job of nothing but its views, as [`Jobs::begin`] puts one in.
+/// A job of nothing but its views, as [`Jobs::begin`] puts one in ([`Job::fresh`], the one
+/// place a job is made: no test writes its fields out).
 fn job(views: Vec<Opened>) -> Job<Real> {
-    Job {
-        work: Work::Snapshot,
-        views,
-        ready: Vec::new(),
-        request: None,
-        idle: false,
-        closed: false,
-        finished: true,
-        cancelled: Arc::new(AtomicBool::new(false)),
-        stage: Stage::Over,
-        value: None,
-        updating: HashSet::new_in(std::alloc::Global),
-        said: HashSet::new_in(std::alloc::Global),
-        queries: Vec::new(),
-        built: None,
-        borrowed: Vec::new(),
-        placing: 0,
-        placed: blaze_cas::PlacedBytes::default(),
-        worked: None,
-        busy: HashMap::new_in(std::alloc::Global),
-        held: Vec::new(),
-        look: 0,
-        awaiting: None,
-        applied: 0,
-        applying: None,
-        shared: false,
-        runs: 0,
-        durable: blaze_cas::Tickets::default(),
-        storing: None,
-        stored: blaze_cas::Tickets::default(),
-        stored_of: None,
-        durable_since: None,
-        over: None,
-        stats: RequestStats::default(),
-        fresh: 0,
-        compiled: 0,
-        served: Vec::new(),
-        links: Vec::new(),
-        linked: Vec::new(),
-        misses: Vec::new(),
-        test_runs: Vec::new(),
-        opened_cpu: None,
-        opened_ns: 0,
-        opened_unix_ns: None,
-        leases: Arc::new(blaze_core::lock::Lock::new("serve.job.leases", Leases::default())),
-        paused: blaze_graph::pressure::Paused::default(),
-        began: std::time::Duration::ZERO,
-        doing_said: None,
-        missed: 0,
-        held_wait: None,
-        look_wait: None,
-        placed_any: false,
-        walks: None,
-        lost: None,
-    }
+    Job::fresh(Work::Snapshot, views, false, None, std::time::Duration::ZERO)
 }
 
 /// A build's row in the history is its plane request's number, the command line it was asked
@@ -127,7 +75,7 @@ fn a_builds_history_row_names_its_request_its_command_and_its_workspace() {
 #[test]
 fn work_is_placed_whole_when_any_link_was() {
     use crate::serve::work::Full;
-    let link = |how| ("/w/target/debug/app".to_owned(), how);
+    let link = |how| ("/w/target/debug/app".to_owned(), how, None);
     assert_eq!(link_kind(&[]), LinkKind::Patched);
     assert_eq!(link_kind(&[link(Linking::Spliced), link(Linking::Spliced)]), LinkKind::Patched);
     assert_eq!(link_kind(&[link(Linking::Spliced), link(Linking::First)]), LinkKind::Placed);
@@ -226,7 +174,7 @@ fn tests_under_the_evaluator_check_the_units_and_build_none() {
     let work =
         Work::Test { targets: targets(), filter: Vec::new(), all: true, args: Vec::new(), ub };
     assert_eq!(command_of(&work), Command::Test);
-    assert_eq!(goal_of(&work), Goal::Check);
+    assert_eq!(kind_of(&work), JobKind::Check);
     let compiled = Work::Test {
         targets: targets(),
         filter: Vec::new(),
@@ -234,16 +182,16 @@ fn tests_under_the_evaluator_check_the_units_and_build_none() {
         args: Vec::new(),
         ub: None,
     };
-    assert_eq!(goal_of(&compiled), Goal::Test);
+    assert_eq!(kind_of(&compiled), JobKind::Test);
 }
 
 #[test]
 fn a_build_ahead_compiles_tests_and_an_edit_only_checks() {
     let ahead = Work::Ahead { targets: targets(), filter: vec!["parse".into()] };
-    assert_eq!((command_of(&ahead), goal_of(&ahead)), (Command::Test, Goal::Test));
+    assert_eq!((command_of(&ahead), kind_of(&ahead)), (Command::Test, JobKind::Test));
     assert!(targets_of(&ahead).is_some());
     let edit = Work::Edit(Vec::new());
-    assert_eq!((command_of(&edit), goal_of(&edit)), (Command::Check, Goal::Check));
+    assert_eq!((command_of(&edit), kind_of(&edit)), (Command::Check, JobKind::Check));
     assert!(targets_of(&edit).is_none());
     assert!(reuses_plans(&edit) && reuses_plans(&ahead));
 }
@@ -469,6 +417,63 @@ fn a_path_is_placed_once_every_effect_placing_it_has_ended() {
     assert!(jobs.end_placing(gone, 4).is_none(), "a job no longer there counts nothing");
 }
 
+/// A job's answer waits for what it has under way at the paths it names, and for nothing at
+/// any other: an effect counts as needed from its begin when its path is named by then, and
+/// from the naming when it began before; each end takes off what its begin added.
+#[test]
+fn an_answer_waits_for_the_paths_it_names_alone() {
+    let mut jobs = Jobs::<Real>::new(setup(0, 0)).unwrap();
+    let id = JobId { slot: 0, generation: 0 };
+    assert!(jobs.jobs.put(key_of(id), job(Vec::new())).is_ok());
+    let counts = |jobs: &Jobs<Real>| {
+        let job = jobs.jobs.get(key_of(id)).unwrap();
+        (job.placing, job.needed)
+    };
+    jobs.name(id, 4);
+    jobs.begin_placing(id, 4);
+    jobs.begin_placing(id, 5);
+    assert_eq!(counts(&jobs), (2, 1), "path 4 is named, path 5 is not");
+    jobs.begin_placing(id, 6);
+    jobs.name(id, 6);
+    assert_eq!(counts(&jobs), (3, 2), "an effect begun before its path was named counts from the naming");
+    jobs.end_placing(id, 4);
+    jobs.end_placing(id, 6);
+    assert_eq!(counts(&jobs), (1, 0), "only the unnamed path's effect is left: the answer waits for none");
+    jobs.end_placing(id, 5);
+    assert_eq!(counts(&jobs), (0, 0));
+    assert!(jobs.flying.is_empty(), "no path has an effect in flight");
+}
+
+/// What an answered job left being placed is counted by what it left to settle, and its
+/// path stays busy for whoever asks next, until the effect ends.
+#[test]
+fn an_answered_jobs_placement_is_its_settlings_and_keeps_its_path_busy() {
+    let mut jobs = Jobs::<Real>::new(setup(0, 0)).unwrap();
+    let id = JobId { slot: 3, generation: 1 };
+    jobs.settling.push(Settling {
+        job: id,
+        command: "build".into(),
+        checkout: None,
+        view: "none".into(),
+        storing: None,
+        stored: blaze_cas::Tickets::default(),
+        durable: blaze_cas::Tickets::default(),
+        placing: 1,
+        placing_span: None,
+        leases: None,
+        since: None,
+        wait: None,
+    });
+    // Its placement's next step (a mode, a look) begins under it, as under the job.
+    jobs.begin_placing(id, 7);
+    assert_eq!((jobs.settling[0].placing, jobs.flying.get(&7).copied()), (2, Some(1)));
+    assert!(jobs.owned(id) && jobs.idle(), "it is no job, and it is still answered for");
+    assert!(jobs.end_placing(id, 7).is_none());
+    assert_eq!(jobs.settling[0].placing, 1);
+    assert!(jobs.flying.is_empty());
+    assert_eq!(jobs.placing_after(), 1);
+}
+
 #[test]
 fn an_output_path_is_interned_once_and_found_among_its_units_outputs() {
     let mut paths = Paths::<Real>::new(u64::MAX);
@@ -621,12 +626,18 @@ fn a_diagnostic_of_no_unit_is_said_once_a_job_and_a_units_each_time() {
 /// leaves the answer unkept.
 #[test]
 fn a_builds_outputs_are_vouched_for_by_the_directories_under_its_build_dirs() {
-    let dirs = |outputs: &[&'static str]| output_dirs_of(["/b", "/t"], outputs.iter().copied());
+    let dirs = |outputs: &[&'static str]| output_dirs_of(&["/b", "/t", "/std"], outputs.iter().copied());
     assert_eq!(
         dirs(&["/b/debug/deps/liba.rlib", "/b/debug/app", "/t/x86_64/debug/app", "/b/debug/b"]),
-        Some(vec!["/b/debug".into(), "/t/x86_64".into()])
+        Ok(vec!["/b/debug".into(), "/t/x86_64".into()])
     );
-    assert_eq!(dirs(&[]), Some(Vec::new()));
-    assert_eq!(dirs(&["/b/app"]), None, "an output right in the build dir");
-    assert_eq!(dirs(&["/elsewhere/debug/app"]), None, "an output under no build dir");
+    assert_eq!(dirs(&[]), Ok(Vec::new()));
+    // The standard library's units are units of the plan: one build of it is one directory.
+    assert_eq!(
+        dirs(&["/std/9c52/8d9a/build/core/1f/out/libcore-1f.rlib", "/b/debug/app"]),
+        Ok(vec!["/b/debug".into(), "/std/9c52".into()])
+    );
+    // The refusal names the output (errors-name-the-thing).
+    assert_eq!(dirs(&["/b/debug/a", "/b/app"]), Err("/b/app".into()), "an output right in the build dir");
+    assert_eq!(dirs(&["/elsewhere/debug/app"]), Err("/elsewhere/debug/app".into()), "an output under no build dir");
 }

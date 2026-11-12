@@ -62,10 +62,6 @@ const RULE: &str = "a lock is held only for a field update: rule standard-struct
 /// How many bodies (the body and its closures, nested) one body's walk reads at most.
 const MOST_BODIES: usize = 256;
 
-/// The most steps the walk from a call to the IO it reaches takes to name the root (the walk
-/// itself is bounded by its memo; this bounds only the naming, rule bounded-progress).
-const LONGEST_CHAIN: usize = 24;
-
 /// The crates whose functions end the IO walk not reaching: locks, waits, tracing and frames.
 const STOPS: &[&str] =
     &["parking_lot", "parking_lot_core", "lock_api", "tracing", "tracing_core", "log", "blaze_mem"];
@@ -211,8 +207,8 @@ pub(super) fn check(cx: &mut Cx<'_, '_>) {
 
 /// Why a call is slow, as a finding says it.
 enum Slow {
-    /// It reaches IO: the root's path and which IO it is, when the root is at most
-    /// [`LONGEST_CHAIN`] calls down.
+    /// It reaches IO: the root's path and which IO it is, when the search for a chain to it
+    /// names one within its bound ([`alloc::chain_to_root`]).
     Io(Option<(String, Kind)>),
     /// A method of this std stream trait on a receiver the body cannot see into.
     Stream(&'static str),
@@ -226,7 +222,8 @@ impl Slow {
             Slow::Io(Some((root, kind))) => {
                 format!("which reaches {} through `{root}`", kind.say())
             }
-            Slow::Io(None) => format!("which reaches IO more than {LONGEST_CHAIN} calls down"),
+            // alloc: a finding's text
+            Slow::Io(None) => "which reaches IO by a chain of calls too wide to name".to_owned(),
             Slow::Stream(trait_) => {
                 format!("which reads or writes through `{trait_}` on a receiver it cannot see into")
             }
@@ -388,23 +385,21 @@ fn slow_call<'db>(
     allocates.then_some(Slow::Alloc)
 }
 
-/// The IO root the walk from `first` reaches, its path and kind; `None` when the chain is
-/// longer than [`LONGEST_CHAIN`] or ends at no root.
+/// The IO root the walk from `first` reaches, its path and kind, by a shortest chain
+/// ([`alloc::chain_to_root`]); `None` when the search names no root within its bound.
 fn io_root<'db>(
     db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     first: Resolved<'db>,
 ) -> Option<(String, Kind)> {
-    let mut at = first;
-    for _ in 0..LONGEST_CHAIN {
-        if let Resolved::Function(f, _) = at
-            && let Io::Root(kind) = io(db, f)
-        {
-            return Some((root_path(db, f), kind));
-        }
-        at = alloc::next_step(db, env, at, true, Roots::Io)?;
+    let chain = alloc::chain_to_root(db, env, first, true, Roots::Io)?;
+    match *chain.last()? {
+        Resolved::Function(f, _) => match io(db, f) {
+            Io::Root(kind) => Some((root_path(db, f), kind)),
+            Io::Walk | Io::Stop => None,
+        },
+        Resolved::Derived(..) => None,
     }
-    None
 }
 
 /// The std stream trait (`std::io::Read`, `Write` or `BufRead`) `f` is a method of, when the

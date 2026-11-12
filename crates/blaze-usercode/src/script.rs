@@ -911,7 +911,12 @@ mod tests {
         verify_elided(&value, &elided(b"cargo:rustc-cfg=fast\n".to_vec())).unwrap();
         assert!(verify_elided(&value, &elided(b"cargo:rustc-cfg=slow\n".to_vec())).is_err());
         let mut wrote = elided(b"cargo:rustc-cfg=fast\n".to_vec());
-        wrote.files.push(OutFile { path: "x".into(), executable: false, bytes: Some(Vec::new()) });
+        wrote.files.push(OutFile {
+            path: "x".into(),
+            executable: false,
+            bytes: Some(Vec::new()),
+            link: None,
+        });
         assert!(verify_elided(&value, &wrote).is_err());
     }
 }

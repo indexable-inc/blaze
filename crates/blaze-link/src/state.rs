@@ -1047,14 +1047,24 @@ impl State {
 
     /// Whether the list arenas are mostly garbage: then [`State::compact`] pays for itself.
     pub fn wants_compaction(&self) -> bool {
+        self.compaction_of().is_some()
+    }
+
+    /// The first list arena that is mostly garbage, with its garbage and what it holds
+    /// live: what [`State::compact`] is run for, which its span says.
+    pub fn compaction_of(&self) -> Option<(&'static str, usize, usize)> {
         let over = |garbage: usize, live: usize| garbage > live + (1 << 16);
-        over(self.fixups.garbage(), self.fixups.live())
-            || over(self.syms.garbage(), self.syms.live())
-            || over(self.wasm_names.garbage(), self.wasm_names.live())
-            || over(self.ref_items.garbage(), self.ref_items.live())
-            || over(self.rebase.garbage(), self.rebase.live())
-            || over(self.binds.garbage(), self.binds.live())
-            || over(self.lines.garbage(), self.lines.live())
+        [
+            ("fixups", self.fixups.garbage(), self.fixups.live()),
+            ("syms", self.syms.garbage(), self.syms.live()),
+            ("wasm_names", self.wasm_names.garbage(), self.wasm_names.live()),
+            ("ref_items", self.ref_items.garbage(), self.ref_items.live()),
+            ("rebase", self.rebase.garbage(), self.rebase.live()),
+            ("binds", self.binds.garbage(), self.binds.live()),
+            ("lines", self.lines.garbage(), self.lines.live()),
+        ]
+        .into_iter()
+        .find(|it| over(it.1, it.2))
     }
 
     /// Copies every live list into fresh arenas and rebuilds the referrer lists, dropping
@@ -1108,6 +1118,31 @@ impl State {
                     self.functions.get_mut(function as usize).expect("a function").lines = lines;
                 }
             }
+        }
+    }
+
+    /// [`State::compact`] for the loader's lists alone (`rebase`, `binds`): each live
+    /// piece's copied into fresh arenas, a pass over the pieces that reads no other list.
+    /// What a stage runs when those are the lists that are mostly garbage, which is the
+    /// common case: the jump table's cells are one piece whose rebase list names every filled
+    /// slot, and a body edit, which fills one slot and empties another, leaves the whole of
+    /// the last list behind ([`crate::write`]'s `write_cells`). Compacting every list for it
+    /// was O(image) every seventh edit of hello world (14 ms, 2026-11-11).
+    pub fn compact_loader(&mut self) {
+        // clone: O(1), shares every chunk: the old lists are read while fresh ones are built
+        let old = self.clone();
+        self.rebase = CowList::default();
+        self.binds = CowList::default();
+        for id in 0..old.piece_count() {
+            let piece = old.any(id).expect("in range");
+            let loader = match piece.live() {
+                true => Loader {
+                    rebase: self.rebase.push(piece.rebase()),
+                    binds: self.binds.push(piece.binds()),
+                },
+                false => Loader::default(),
+            };
+            *self.loader.get_mut(id as usize).expect("in range") = loader;
         }
     }
 
@@ -1442,6 +1477,45 @@ mod tests {
                 assert!(state.same_bytes(&state, piece.id));
             },
         );
+    }
+
+    /// The loader's lists compacted alone hold what they held, piece for piece, with no
+    /// garbage, and leave every other list as it was: the fixups' arena is the same chunks.
+    /// The control: with the lists not copied (a state left as it is), the garbage stays
+    /// and a stage would compact again.
+    #[test]
+    fn the_loaders_lists_compact_alone() {
+        let mut state = State::new();
+        let class = state.class_id(&Class::Text);
+        let target = Symbols::join(1, 0);
+        let pieces: Vec<PieceId> = (0..4usize)
+            .map(|n| state.add(&piece(Symbols::join(2, n), class, &[fixup(target, None)])))
+            .collect();
+        let cells = pieces[0];
+        // One piece's rebase list set again and again, as the jump table's is by each edit
+        // that fills a slot: every list but the last is garbage.
+        let mut list: Vec<u64> = (0..2_048u64).map(|slot| slot * 8).collect();
+        for edit in 0..40u64 {
+            list[(edit as usize) % 2_048] += 8 * 4_096;
+            list.sort_unstable();
+            state.set_loader(cells, &list, &[]);
+        }
+        state.set_loader(pieces[1], &[16, 24], &[]);
+        let (named, garbage, live) = state.compaction_of().expect("39 dead lists of 2,048");
+        assert_eq!(named, "rebase");
+        assert!(garbage > live + (1 << 16), "{garbage} garbage, {live} live");
+        let fixups_before = state.fixups.live();
+        let control = state.clone();
+        state.compact_loader();
+        assert_eq!(state.compaction_of(), None);
+        assert_eq!(state.piece(cells).unwrap().rebase(), &list[..]);
+        assert_eq!(state.piece(pieces[1]).unwrap().rebase(), [16, 24]);
+        assert!(state.piece(pieces[2]).unwrap().rebase().is_empty());
+        assert_eq!(state.fixups.live(), fixups_before, "no other list is touched");
+        assert_eq!(state.piece(pieces[3]).unwrap().fixups(), [fixup(target, None)]);
+        assert_eq!(state.refs(target).collect::<Vec<_>>(), pieces);
+        // The control: nothing compacted, and the garbage is still there to be asked about.
+        assert!(control.wants_compaction());
     }
 
     /// A piece naming a symbol twice (and as the subtracted one) is its referrer once, and

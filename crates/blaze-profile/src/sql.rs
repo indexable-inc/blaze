@@ -837,9 +837,12 @@ mod tests {
         }
     }
 
-    /// A build of two jobs: job 2 (slot 2) runs `unit b` from 10 to 100 ns and waits from 20 to 60
-    /// for a key job 1 (slot 1, owner 2) runs in `compile a` from 0 to 60. Its critical path is
-    /// job 1's run, then job 2's after its wait: the wait's owner is followed across lanes.
+    /// A build of two jobs: job 2 runs `unit b` from 10 to 100 ns and waits from 20 to 60 for a
+    /// key job 1 runs in `compile a` from 0 to 60, the wait's `owner` naming job 1 as its
+    /// switches do (generation << 32 | slot: here generation 0). Its critical path is job 1's
+    /// run, then job 2's after its wait: the wait's owner is followed across lanes. The fixture
+    /// named the owner as schema 1 did (slot + 1) until 2026-11-11, and so did the view, which
+    /// therefore crossed no wait of a real history.
     #[test]
     #[ignore = "needs the pinned DuckDB: BLAZE_DUCKDB=$(nix build --print-out-paths .#duckdb)/bin/duckdb"]
     fn the_critical_path_crosses_from_a_wait_to_the_job_that_ran_what_it_waited_on() {
@@ -855,7 +858,7 @@ mod tests {
              COPY (SELECT * FROM (VALUES \
                 (1::UBIGINT, 7::UINTEGER, 10::UINTEGER, 1::UBIGINT, 0::USMALLINT, 'compile a', 'a', NULL::VARCHAR, NULL::UBIGINT, 0::BIGINT, 60::BIGINT), \
                 (1, 7, 11, 2, 0, 'unit b', 'b', NULL, NULL, 10, 90), \
-                (1, 7, 11, 3, 1, 'wait', NULL, 'key a', 2, 20, 40)) \
+                (1, 7, 11, 3, 1, 'wait', NULL, 'key a', 1, 20, 40)) \
                 AS t(build_id, process, thread, span_id, depth, name, crate, awaits, owner, start_ns, dur_ns)) TO '{d}/1-00000001.spans.parquet';\n\
              COPY (SELECT * FROM (VALUES \
                 (1::UBIGINT, 7::UINTEGER, 10::UINTEGER, 0::BIGINT, 'started', 1::UBIGINT), \

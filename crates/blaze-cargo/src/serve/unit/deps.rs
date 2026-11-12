@@ -190,6 +190,16 @@ pub(crate) fn images(
         .filter(|&(krate, key)| session.keyed.get(krate) != Some(key))
         .map(|(&krate, _)| krate)
         .collect(); // alloc: once per serve, one per crate whose key moved
+    // What the serve asked and what moved, kept with the build (`blaze explain edit_work`).
+    // A key asked is the database's memo's answer (`hir_def::deps`): how many were made
+    // again is `query_counts`' `executed` of that memo, which the view prints beside these.
+    tracing::info!(
+        target: "blaze",
+        stage = blaze_query::db::edit_work::IMAGE_KEYS,
+        asked = keys.len() as u64,
+        moved = moved.len() as u64,
+        "edit work"
+    );
     if moved.is_empty() {
         // `keyed` holds every key walked already.
         session.walked.note(at, build, crates.iter().chain(keys.keys()));
@@ -273,6 +283,11 @@ pub(crate) struct Session {
 /// [`Session::walked`]: the crates keyed at one view of one database by one `build`, each of
 /// whose keys (and its dependencies') `keyed` holds; no view while a serve that moved a key is
 /// writing.
+///
+/// Each key is the database's memo (`hir_def::deps`' `crate_image_key`): a walk asks the memo
+/// of each crate, which makes a key again only when something the key was made from changed,
+/// so the walk after an edit of a workspace member hashes no dependency's files. What is
+/// kept here is which crates a serve at this view asked, so a batch asks none twice.
 ///
 /// The walk itself is kept with them (`walk`), so the keys of one view are made once: a
 /// build's serves come a batch of units at a time (eight in an edit of ripgrep, each of which
@@ -603,6 +618,37 @@ pub(crate) fn store(
     let items =
         session.items.as_ref().map(body_store::Installed::flush).transpose().map_err(error)?;
     stage("a body's steps of the item store");
+    if let Some(items) = &items {
+        // In the profile, not only under `-v`: after a restart every body's inference and MIR
+        // should be a hit here, and a build where they ran says by these counts whether
+        // nothing was stored (`ran` with no refusal), the step was kept out (`refused`, the
+        // read named most first) or the body has no identity (restore.md, "What an edit
+        // needs").
+        let [infer, mir, borrowck] = &items.steps;
+        let (read, bodies) = items.refused.first().map_or(("", 0), |&(read, bodies)| (read, bodies));
+        tracing::info!(
+            target: "blaze",
+            infer_hits = infer.hits,
+            infer_ran = infer.ran,
+            infer_refused = infer.refused,
+            mir_hits = mir.hits,
+            mir_ran = mir.ran,
+            mir_refused = mir.refused,
+            borrowck_hits = borrowck.hits,
+            borrowck_ran = borrowck.ran,
+            borrowck_refused = borrowck.refused,
+            written = items.written as u64,
+            kept = items.kept as u64,
+            slots_full = items.slots_full as u64,
+            no_identity = items.no_identity,
+            unshareable = items.unshareable,
+            unencodable = items.unencodable,
+            dropped = items.dropped,
+            most_refused_read = read,
+            most_refused_bodies = bodies,
+            "item store flushed"
+        );
+    }
     if let Some(stored) = &stored {
         for krate in &stored.written {
             session.refused.remove(krate);

@@ -26,7 +26,7 @@
 use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 use blaze_api::{
-    ApiError, Arrived, Reply, Request, RequestRef,
+    ApiError, Arrived, Reply, Request, RequestRef, Response,
     server::{Abandoned, Config as ServerConfig, Http, Server, Unix},
     session::{self, Session},
 };
@@ -508,6 +508,49 @@ pub struct Options {
     /// A daemon with none (the simulation's) numbers its builds from 1 and refuses the
     /// explorer and live SQL, saying so.
     pub profiling: Option<Profiling>,
+    /// The parts of a good image this start leaves unused because it was asked to
+    /// ([`RESTORE_WITHOUT`]): each is said in the start's log as every other part not used.
+    pub without: Without,
+}
+
+/// The variable that names parts of the daemon's image a start leaves unused though they
+/// are whole: `database`, `history`, `trees`, separated by commas. For finding which part of
+/// a restored state a fault follows (docs/v2/plan/design/restore.md, "Which part a fault
+/// follows"): the image stays on disk as it is, and each part left is said in the start's log.
+pub const RESTORE_WITHOUT: &str = "BLAZE_RESTORE_WITHOUT";
+
+/// The parts of a good image a start was asked to leave unused ([`RESTORE_WITHOUT`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Without {
+    /// The query database's sections: it starts empty ([`Cold::Asked`]).
+    pub database: bool,
+    /// The plane's history: it starts empty ([`Unlearned::Asked`]).
+    pub history: bool,
+    /// The library syntax trees: every library file is parsed.
+    pub trees: bool,
+}
+
+impl Without {
+    /// The parts `text` names, separated by commas; a word that names none is the error,
+    /// saying the word and the ones there are.
+    pub fn parse(text: &str) -> Result<Without, String> {
+        let mut without = Without::default();
+        for word in text.split(',').map(str::trim).filter(|it| !it.is_empty()) {
+            match word {
+                "database" => without.database = true,
+                "history" => without.history = true,
+                "trees" => without.trees = true,
+                // alloc: an error's text, once a start
+                _ => {
+                    return Err(format!(
+                        "{RESTORE_WITHOUT} names `{word}`, which is no part of the daemon image \
+                         a start can leave unused: the parts are `database`, `history` and `trees`"
+                    ));
+                }
+            }
+        }
+        Ok(without)
+    }
 }
 
 fn under(dir: &FileName, name: &str) -> FileName {
@@ -684,6 +727,8 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// When the daemon past its limit's line last asked for the heaps' free pages back
     /// ([`GIVE_BACK_EVERY`]), on the driver's clock.
     given_back: Duration,
+    /// Whether this stretch with nothing to do gave its warm memory back ([`super::idle`]).
+    idle: super::idle::Idle,
     /// Whether the system's memory pressure is watched ([`PRESSURE`]): from the start until its
     /// watch fails (no source here) or is undone at the stop.
     pressure_watched: bool,
@@ -1043,6 +1088,8 @@ pub enum Cold {
     /// restored: a second daemon in one process, as the simulation's restarts are. `blaze
     /// serve` starts one daemon a process and stops on it.
     Interned,
+    /// The start was asked to leave the database's sections unused ([`RESTORE_WITHOUT`]).
+    Asked,
 }
 
 impl fmt::Display for Cold {
@@ -1056,6 +1103,11 @@ impl fmt::Display for Cold {
             Cold::Interned => write!(
                 f,
                 "values were interned in this process before its symbols could be restored"
+            ),
+            Cold::Asked => write!(
+                f,
+                "the start was asked to leave the image's database unused \
+                 ({RESTORE_WITHOUT} names `database`)"
             ),
         }
     }
@@ -1486,6 +1538,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                     Some(unrestored(error).map_err(|fault| StartError::image(&image, fault))?);
                 Database::new(config)
             }
+            Some((_, Ok(()))) if options.without.database => {
+                started.cold = Some(Cold::Asked);
+                Database::new(config)
+            }
             Some((opened, Ok(()))) => {
                 let restored = Restored {
                     hash: opened.hash(),
@@ -1521,6 +1577,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 .entered();
         let history = match opened.as_deref() {
             None => History::new(HistoryConfig::default()),
+            Some(_) if options.without.history => {
+                started.unlearned = Some(Unlearned::Asked);
+                History::new(HistoryConfig::default())
+            }
             Some(opened) => {
                 let (history, unlearned) = super::image::history(opened, HistoryConfig::default())
                     .map_err(|error| StartError::image(&image, ImageFault::History(error)))?;
@@ -1530,7 +1590,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         };
         drop(learning);
         // Before any front end's database is made: each reads the trees installed when made.
-        if let Some(opened) = &opened {
+        if opened.is_some() && options.without.trees {
+            // alloc: a start's report, once
+            started.trees = Some(format!(
+                "the start was asked to leave them unused: {RESTORE_WITHOUT} names `trees`"
+            ));
+        } else if let Some(opened) = &opened {
             let _span =
                 tracing::info_span!(target: "blaze", "daemon start: install the library's trees")
                     .entered();
@@ -1693,6 +1758,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             builds: Vec::new(), // alloc: none until a build is looked at
             memory_logged: Duration::ZERO,
             given_back: Duration::ZERO,
+            idle: super::idle::Idle::default(),
             pressure_watched: true,
             paused_checked: Duration::ZERO,
             gc: None,
@@ -2063,9 +2129,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // Each part of a turn that has a span is a child of it, so a long turn names what it
         // was inside (slow-is-p0-traced); an idle turn opens none.
         let spanned = _span.is_some();
+        // An output an answered build left being placed is under way as a job is: the work
+        // between requests (the image's pass over the database, the collections) is counted
+        // from the last answer and the last such placement, never run beside one.
         self.quiet_turns = quiet_turns_after(
             self.quiet_turns,
-            !self.jobs.idle(),
+            !self.jobs.idle() || self.jobs.placing_after() != 0,
             !done.is_empty(),
             self.plane.running() != 0,
         );
@@ -2174,6 +2243,13 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         Arc::clone(&self.pulse) // clone: a handle, once a daemon
     }
 
+    /// The table of the plane's tasks the loop publishes for the explorer: what `blaze debug
+    /// inspect`'s thread reads the queued and running tasks from, off the loop.
+    #[cfg(feature = "native")]
+    pub fn tasks(&self) -> Arc<blaze_explore::Tasks> {
+        self.observe.tasks()
+    }
+
     /// The loop's effects to the driver, those that end on their own counted in `ending`.
     fn submit(&mut self) {
         for effect in &self.effects {
@@ -2222,6 +2298,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         for row in self.jobs.rows.drain(..) {
             self.observe.ended(row);
+        }
+        // The errors builds said, before their answers are told below: a build's own flush,
+        // as it is answered, writes them.
+        if !self.jobs.errors.is_empty() {
+            self.observe.errored(std::mem::take(&mut self.jobs.errors));
         }
         // After the rows of the same turn (a stalled build's row and its answer are one turn's),
         // and after this turn's answers went to the driver (`turn_after_wait` submits before
@@ -2302,6 +2383,14 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             DownloadsNow(&blaze_fetch::downloads::Downloads::process().shown())
         );
         tracing::error!("{said}");
+        // What every thread was inside and the recorder's last minutes, where the client that
+        // this stall hangs up on finds it (`flightrec`): written here, by the loop, which is
+        // about to fail every request and stop.
+        _ = super::flightrec::record(
+            super::flightrec::Why::Stall,
+            &said,
+            super::flightrec::WINDOW,
+        );
         let file = under(&self.state, &format!("stalls/{now}.json"));
         // durable: a stall's trace is read after the daemon is killed for the stall, and nothing can make it again
         self.effects.push(Effect::Write { file, bytes: stall.trace, tag: STALL });
@@ -2534,6 +2623,16 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 self.given_back = now;
                 crate::raw::memory::purger().ask();
             }
+        }
+        // Nothing to do for a while: the warm memory each thread keeps for its next task goes
+        // back, once a stretch, on the purger's thread and the workers' own as they park
+        // ([`super::idle`]).
+        let working = self.jobs.build_under_way() != 0 || self.plane.running() != 0;
+        if self.idle.look(now, working) {
+            tracing::info!(target: "blaze", "idle: the daemon gives its warm memory back");
+            blaze_mem::frame::ask_spare_trim();
+            crate::raw::memory::purger().ask();
+            self.jobs.say_what_the_kept_front_ends_hold();
         }
         blaze_profile::plot(Plot::AllocatorPurgedBytes, crate::raw::memory::purged_bytes());
         blaze_profile::plot(Plot::CommittedBytes, memory.committed);
@@ -2769,7 +2868,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 // `blaze run` of a dev executable: the programs are the steps' (review: the
                 // file it may write is the launch's, once per run).
                 Out::Pass(Arrived::Request { from, request: Request::Launch { program, pid } }) => {
-                    let (response, ok) = match self.steps.launch(&program, pid) {
+                    let placed = self.jobs.placed_key(&program);
+                    let (response, ok) = match self.steps.launch(&program, pid, placed) {
                         Ok(Some(env)) => (blaze_api::Response::Launched { live: true, env }, true),
                         // alloc: none, empty
                         Ok(None) => {
@@ -2900,6 +3000,26 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             } else {
                 it
             };
+            // A build that computed something again says why in its `Work` when the history's
+            // thread has explained it by now ([`Observe::summary_of`]): one round trip for
+            // its client, and no wait here when it has not.
+            let it = match it {
+                Said::Report(job, Response::Work(mut worked)) => {
+                    if let (Some(build), true) = (worked.build_id, worked.misses > 0) {
+                        let _span = tracing::info_span!(
+                            target: "blaze",
+                            "loop: why the build recomputed, for its answer",
+                            build,
+                            explained = tracing::field::Empty,
+                        )
+                        .entered();
+                        worked.why = self.observe.summary_of(build);
+                        _span.record("explained", worked.why.is_some());
+                    }
+                    Said::Report(job, Response::Work(worked))
+                }
+                it => it,
+            };
             // Every word of a job passes here once, as it is told: a build that may be answered
             // again later has what it says noted ([`Jobs::heard`]).
             self.jobs.heard(&it);
@@ -3029,7 +3149,11 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// the image), so a request that arrived meanwhile is taken between them, and the image's
     /// write is let go when one comes ([`Daemon::let_go_of_image`]).
     fn between(&mut self) {
-        if self.stopping.is_some() || !self.jobs.idle() || self.jobs.storing() > 0 {
+        if self.stopping.is_some()
+            || !self.jobs.idle()
+            || self.jobs.storing() > 0
+            || self.jobs.placing_after() != 0
+        {
             return;
         }
         if !self.quiet_between_requests() {

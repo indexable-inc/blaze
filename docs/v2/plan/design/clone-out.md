@@ -86,6 +86,19 @@ made only of a clone waits for the file to be made, sealed and written back firs
   edit ago with no sync, so it is the same wait. So: a new file, whole content, renamed over.
   Writing only changed blocks needs a source known written back; that is a later step
   (write-back of the output after the answer, then clone-and-patch when it has completed).
+- **Only the changed blocks, since 2026-11-11** (lane edit2-1111; measured on xfs, hello world:
+  the answer waited 24.9 ms for its four places and waits 8.9). The step above named as later
+  is built: every made place asks for its file's write-back as it ends (`Effect::WriteBack`,
+  waited for by nothing), so the path's file is a source written back by the time the next
+  edit clones it, or the clone waits for what is left of the last patch and no more. A link
+  taken as a patch hands the loop its ranges (`work::Made::Patch`); the loop looks that the
+  path still holds the file it placed there (`Own::LookBase`: its size and time), and then
+  `Store::place_patched` clones the path's own file under the staged name, writes the
+  ranges and renames it over: 0.3 MB written a path where it was 21 MB. Where the path does
+  not hold that file (nothing placed there by this daemon, a place that failed, a file changed
+  since), the whole file's runs are made from the link's state and written as before. The
+  simulation holds a patch's clone to what its path's last place wrote
+  (`tests::place_made`), and the control takes the write-back out.
 - **The store's copy.** The value is put as a recipe: of the link's ranges over the file
   before it, a few KB, or on a first link of the file's runs over the base of holes
   ([patch-in-place.md](patch-in-place.md), "The patch room"), never the file at its length.
@@ -104,6 +117,36 @@ made only of a clone waits for the file to be made, sealed and written back firs
   `a_made_output_is_placed_with_no_clone_and_no_wait_for_a_write_back` and its two controls.
   Guards: `loop stalled` spans (a step of a loop turn over 20 ms) fail an edit's budget, and
   `harness/v2/loop_syscalls.py` holds the loop thread's system calls to 20 ms (ledger T16).
+
+## What the answer waits for (2026-11-11; written, not built or run)
+
+A build's answer waits for the files it names and for no other output. The files it names are
+each unit's artifact files (`Built`'s `path`, `filenames`, `executable`: the uplifted program,
+a library's files) and the lock files it writes: what a person or a script opens the moment
+the command returns, straight from the file system, so the path itself has to hold the file.
+Every other output (a program's copy under `deps` with its hash, dep-info, a file cargo's
+artifact lists none of) is placed after the answer (`Settling::placing` in `serve/job.rs`):
+
+- It goes on exactly as under the job (its mode, the `stat` for its record). A failure is a
+  loss said in the log, `blaze status` and the checkout's next `blaze why`, and the next
+  build that makes the output places it again.
+- A later job's output at a path with an effect in flight waits for it (`Queued`), so two
+  placements of one path never race; a run of the daemon's own (`blaze run`, `blaze test`, a
+  build script) still starts only once its job has nothing in flight, named or not.
+- A stop waits for it as for anything settling; the work between requests (the image, the
+  collections) does not run beside it; the job's build dir leases are held until it ends.
+- A crash before it lands leaves the old file or the new one whole (a rename), and the
+  restarted daemon, knowing of no file it placed, places again: no ordering of anything
+  durable changed.
+- Spans: `the job's answer waits for what it still does` (`function` `its outputs, being
+  placed`, with `named_path=`, `needed=`, `placing=` in `fields`) is now the named files'
+  wait alone; `a build's other outputs are placed after its answer` covers the rest; `an
+  output waits for the path's placement in flight` is a later job's wait for one.
+- Proven by `serve/tests.rs`: `a_builds_answer_waits_for_the_files_it_names_and_places_the_rest_after`,
+  `a_run_asked_right_after_an_answer_waits_for_the_output_still_being_placed`, their controls,
+  `an_output_that_fails_to_be_placed_after_the_answer_is_a_loss_said`, and the crash test
+  `a_crash_after_any_turn_keeps_what_had_settled_and_restores_to_a_fresh_build`, whose crash
+  points now include an output in flight after its answer.
 
 ## Checked by
 

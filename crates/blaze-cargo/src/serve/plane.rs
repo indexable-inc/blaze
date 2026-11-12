@@ -498,7 +498,7 @@ impl Drop for InJob {
 /// Whether a panic raised here is caught by a job's runner: a plane task's, or a pool job's on
 /// its fiber (blaze-graph's hosts catch each job's panic). Elsewhere (the plane's loop, an IO
 /// thread) nothing catches it, and the thread would end without a word.
-fn in_a_job() -> bool {
+pub(super) fn in_a_job() -> bool {
     IN_JOB.try_with(|depth| depth.get() > 0).unwrap_or(false)
         || blaze_graph::sched::fiber::on_fiber()
 }

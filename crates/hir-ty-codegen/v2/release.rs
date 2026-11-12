@@ -296,6 +296,7 @@ pub(crate) fn emit(
     // merged before any is looked for.
     // alloc: once per compile with imports, an entry an import
     let mut merged = Vec::with_capacity(imported.len());
+    let mut requested = Requested::of(places, refs);
     for import in imported {
         let Some(module) = &import.export.module else {
             // alloc: an error
@@ -308,6 +309,7 @@ pub(crate) fn emit(
             unit,
             &mut pending.wants,
             places,
+            &mut requested,
             refs,
             &module.requests,
             &import.export.places,
@@ -675,16 +677,69 @@ fn copied(requests: &Requests) -> Requests {
     Requests { funcs: requests.funcs.clone(), datas: requests.datas.clone() }
 }
 
-/// Puts an import's `requests`, which are `theirs` among `their_refs`, among what the
-/// compile asks for (`wants`, `places`, places into the compile's `refs`): what each of them
-/// is in the compile, functions then data. A static, a vtable or a position asked for twice
-/// is one object, as is equal read-only data; LLVM takes two globals for two objects.
+/// The compile's function requests by what each is in the build: its target among the
+/// compile's references. What [`merge`] finds an import's request among.
+///
+/// A request is made by the front end's name of what it calls ([`FuncTarget`]: the instance and
+/// the environment of the body that asks, the crate it is compiled in too), and two bodies
+/// compiled in two crates name one function of the build two ways. The build's keys know only
+/// the function ([`blaze_codegen::backend::release_refs`], [`blaze_codegen::backend::laid_out`]),
+/// so a compile takes two requests of one target for one function, never by how each body named
+/// it: which crate a body is compiled in is the first asker's of the walk, which no key has.
 #[cfg(feature = "llvm")]
-fn merge(
+struct Requested<'a> {
+    /// The requests of each target, in order: more than one where their signatures differ, or
+    /// the function's own IR asked for it under two names.
+    by: blaze_hash::HashMap<&'a Target, smallvec::SmallVec<[u32; 1]>, std::alloc::Global>,
+}
+
+#[cfg(feature = "llvm")]
+impl<'a> Requested<'a> {
+    /// The requests `places` has among `refs`: those of the function's own IR.
+    fn of(places: &Places, refs: &'a Refs) -> Requested<'a> {
+        // alloc: once per compile with imports, an entry per function it refers to
+        let mut requested = Requested {
+            by: blaze_hash::HashMap::with_capacity_in(places.funcs.len(), std::alloc::Global),
+        };
+        for (id, &place) in places.funcs.iter().enumerate() {
+            if let Some(target) = refs.get(place as usize) {
+                requested.add(target, id as u32);
+            }
+        }
+        requested
+    }
+
+    fn add(&mut self, target: &'a Target, id: u32) {
+        self.by.entry(target).or_default().push(id);
+    }
+
+    /// The first request of `target` with the signature `sig`, among `funcs`.
+    fn first(
+        &self,
+        target: &Target,
+        sig: &cranelift_codegen::ir::Signature,
+        funcs: &[crate::fragment::FuncRequest],
+    ) -> Option<u32> {
+        self.by.get(target)?.iter().copied().find(|&it| funcs[it as usize].sig == *sig)
+    }
+}
+
+/// Puts an import's `requests`, which are `theirs` among `their_refs`, among what the
+/// compile asks for (`wants`, `places`, places into the compile's `refs`, `requested` its
+/// function requests by target): what each of them is in the compile, functions then data. A
+/// function of the build asked for twice is one request, whatever each body calls it
+/// ([`Requested`]): the import's body is linked under the first, and a call through a second
+/// declaration would be of a function LLVM has no body of. A static, a vtable or a position
+/// asked for twice is one object, as is equal read-only data; LLVM takes two globals for two
+/// objects.
+#[cfg(feature = "llvm")]
+#[allow(clippy::too_many_arguments)]
+fn merge<'a>(
     unit: &Unit,
     wants: &mut Wants,
     places: &mut Places,
-    refs: &Refs,
+    requested: &mut Requested<'a>,
+    refs: &'a Refs,
     requests: &Requests,
     theirs: &Places,
     their_refs: &Refs,
@@ -714,32 +769,29 @@ fn merge(
             .get(at)
             .ok_or_else(|| failed(unit, "an import's request without its place"))?;
         let place = place_in(theirs_of(theirs)?)?;
-        let named = |id: usize| places.funcs.get(id).and_then(|&it| refs.get(it as usize));
-        let before = wants.requests.funcs.len();
-        // clone: `Wants::func` takes the target owned; the import's export is shared, borrowed
-        let id = wants.func(request.target.clone(), &request.sig).as_u32();
-        let id = if id as usize == before {
-            places.funcs.push(place);
-            id
-        } else if named(id as usize) == refs.get(place as usize) {
-            id
-        } else {
-            // The build keys a callee by who asks for it: the instance the compile asks for is
-            // another function of the build than the one the import's body calls, and each
-            // request is a declaration of its own (`Symbol::Func` of its ID).
-            let found = (0..wants.requests.funcs.len()).find(|&it| {
-                wants.requests.funcs[it] == *request && named(it) == refs.get(place as usize)
-            });
-            match found {
-                Some(it) => it as u32,
-                None => {
-                    let id = u32::try_from(wants.requests.funcs.len())
+        let target = &refs[place as usize];
+        let id = match requested.first(target, &request.sig, &wants.requests.funcs) {
+            Some(id) => id,
+            None => {
+                let before = wants.requests.funcs.len();
+                // clone: `Wants::func` takes the target owned; the import's export is shared, borrowed
+                let id = wants.func(request.target.clone(), &request.sig).as_u32();
+                let id = if id as usize == before {
+                    id
+                } else {
+                    // The build keys a callee by who asks for it: what the compile calls by
+                    // this name is another function of the build than the one the import's
+                    // body calls, and each request is a declaration of its own (`Symbol::Func`
+                    // of its ID).
+                    let id = u32::try_from(before)
                         .map_err(|_| failed(unit, "more than 2^32 function requests"))?;
                     // clone: as above, a request of the import's that the compile has apart
                     wants.requests.funcs.push(request.clone());
-                    places.funcs.push(place);
                     id
-                }
+                };
+                places.funcs.push(place);
+                requested.add(target, id);
+                id
             }
         };
         funcs.push(id);
@@ -881,10 +933,12 @@ mod tests {
         let their_refs = [Target::Extern("b".to_owned()), Target::Extern("a".to_owned())];
         let refs = [Target::Extern("a".to_owned()), Target::Extern("b".to_owned())];
 
+        let mut requested = Requested::of(&places, &refs);
         let (funcs, datas) = merge(
             &unit(),
             &mut wants,
             &mut places,
+            &mut requested,
             &refs,
             &theirs.requests,
             &their_places,
@@ -903,6 +957,7 @@ mod tests {
             &unit(),
             &mut wants,
             &mut places,
+            &mut requested,
             &refs,
             &theirs.requests,
             &their_places,
@@ -927,11 +982,13 @@ mod tests {
         let their_places = Places { funcs: vec![0], datas: Vec::new(), refs: 1 };
         let their_refs = [Target::Direct(instance(6))];
         let refs = [Target::Direct(instance(5)), Target::Direct(instance(6))];
+        let mut requested = Requested::of(&places, &refs);
         let mut merged = || {
             merge(
                 &unit(),
                 &mut wants,
                 &mut places,
+                &mut requested,
                 &refs,
                 &theirs.requests,
                 &their_places,
@@ -945,6 +1002,100 @@ mod tests {
         assert_eq!(wants.requests.funcs.len(), 2);
     }
 
+    /// The requests of `places` that share a target of `refs` and a signature with a request
+    /// before them, each with that one: none in a compile that asks for each function of the
+    /// build once.
+    fn asked_twice(wants: &Wants, places: &Places, refs: &Refs) -> Vec<(u32, u32)> {
+        let funcs = &wants.requests.funcs;
+        let target = |at: usize| places.funcs.get(at).and_then(|&it| refs.get(it as usize));
+        (0..funcs.len())
+            .filter_map(|at| {
+                let first = (0..at).find(|&it| {
+                    target(it).is_some()
+                        && target(it) == target(at)
+                        && funcs[it].sig == funcs[at].sig
+                })?;
+                Some((at as u32, first as u32))
+            })
+            .collect()
+    }
+
+    /// A compile whose own IR calls the build's function 5 by one name, and three imports
+    /// whose bodies call it by that name, by a second and by a third, as bodies compiled in
+    /// other crates do (the names are symbols here, where the build's are instances with the
+    /// environment of the body that asks): the compile's requests, their places, and what each
+    /// import's request is in the compile.
+    fn named_three_ways(planted: bool) -> (Wants, Places, [Target; 2], Vec<u32>) {
+        let isa = crate::isa_for(crate::Target::for_host()).unwrap();
+        let mut wants = Wants::new(crate::Target::for_host(), &**isa);
+        symbol(&mut wants, "five, as alloc's bodies call it");
+        let mut places = Places { funcs: vec![0], datas: Vec::new(), refs: 1 };
+        let refs = [Target::Direct(instance(5)), Target::Extern("other".to_owned())];
+        let mut ids = Vec::new();
+        // In a block: the index borrows `refs`, which is handed back.
+        {
+            let mut requested = Requested::of(&places, &refs);
+            for name in [
+                "five, as alloc's bodies call it",
+                "five, as std's bodies call it",
+                "five, as the program's bodies call it",
+                "five, as std's bodies call it",
+            ] {
+                let mut theirs = Wants::new(crate::Target::for_host(), &**isa);
+                symbol(&mut theirs, name);
+                symbol(&mut theirs, "other");
+                let their_places = Places { funcs: vec![0, 1], datas: Vec::new(), refs: 2 };
+                let their_refs = [Target::Direct(instance(5)), Target::Extern("other".to_owned())];
+                if planted {
+                    // The bug: the compile forgets what its requests are in the build, so an
+                    // import's request is never one it has by the function it is of.
+                    requested = Requested::of(&Places::default(), &refs);
+                }
+                let (funcs, _) = merge(
+                    &unit(),
+                    &mut wants,
+                    &mut places,
+                    &mut requested,
+                    &refs,
+                    &theirs.requests,
+                    &their_places,
+                    &their_refs,
+                )
+                .unwrap();
+                ids.push(funcs[0]);
+            }
+        }
+        (wants, places, refs, ids)
+    }
+
+    /// The invariant: a release compile asks for each function of the build once, whatever
+    /// the bodies it is made of call it: a request of an import's body whose target among the
+    /// compile's references is one the compile already asks for, with the same signature, is
+    /// that request. The import's body is linked under the first request of its function
+    /// ([`emit`]), so a call through a second would be of a declaration LLVM has no body of,
+    /// and whether there is a second follows from which crate each body was compiled in (the
+    /// first asker's of the walk), which no key of the compile holds: the store then held one
+    /// key's code two ways (`BLAZE_VERIFY_STORE`, 2026-11-11: `alloc::vec::from_elem::<u8>`
+    /// built `RawVecInner::try_allocate_in` in at both of its calls in one program's unit and
+    /// at one of them in another's).
+    #[test]
+    fn a_function_of_the_build_is_one_request_however_a_body_names_it() {
+        let (wants, places, refs, ids) = named_three_ways(false);
+        assert_eq!(ids, [0, 0, 0, 0]);
+        assert_eq!(asked_twice(&wants, &places, &refs), []);
+        // Its own request, and `other` once.
+        assert_eq!(places.funcs, [0, 1]);
+        assert_eq!(by_key(&places, &refs, instance(5)), [0]);
+    }
+
+    #[test]
+    fn the_oracle_catches_a_request_kept_apart_by_its_name() {
+        let (wants, places, refs, ids) = named_three_ways(true);
+        assert_ne!(ids, [0, 0, 0, 0]);
+        assert_ne!(asked_twice(&wants, &places, &refs), []);
+        assert!(by_key(&places, &refs, instance(5)).len() > 1);
+    }
+
     #[test]
     fn an_import_that_refers_to_what_the_compile_lacks_is_refused() {
         let isa = crate::isa_for(crate::Target::for_host()).unwrap();
@@ -953,11 +1104,14 @@ mod tests {
         let mut theirs = Wants::new(crate::Target::for_host(), &**isa);
         symbol(&mut theirs, "c");
         let their_places = Places { funcs: vec![0], datas: Vec::new(), refs: 1 };
+        let refs = [Target::Extern("a".to_owned())];
+        let mut requested = Requested::of(&places, &refs);
         let refused = merge(
             &unit(),
             &mut wants,
             &mut places,
-            &[Target::Extern("a".to_owned())],
+            &mut requested,
+            &refs,
             &theirs.requests,
             &their_places,
             &[Target::Extern("c".to_owned())],

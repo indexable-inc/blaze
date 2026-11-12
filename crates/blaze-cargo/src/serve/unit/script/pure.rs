@@ -342,22 +342,30 @@ pub(crate) fn hit(job: &Job, run: usize) -> Option<&Value> {
 /// What `traced`, the whole trace of run `run` of `unit`'s script, shows against its proof,
 /// when the script is pure: the package files it read, or the error naming the effect its
 /// proof said it never has. `None` for a script that is not pure. Asked before the run's own
-/// key takes anything out of the trace.
+/// key takes anything out of the trace. `script_env` is the script's whole environment as the
+/// run was started in it ([`blaze_usercode::script::Prepared::script_env`]): its library search
+/// path is where the loader's probes are known from.
 pub(crate) fn check(
     job: &Job,
     run: usize,
     unit: &bs::Unit,
+    script_env: &[(OsString, OsString)],
     traced: &Traced,
 ) -> Option<Result<Read, String>> {
     let pure = of(job, compile_of(job.units(), run)?)?;
     // clone: once per run of a pure script: the two paths its loader reads may come from
     let toolchain = [job.shared.tools.clone(), job.shared.launcher.clone()];
+    // The library search path this run was started with, read from its own environment: the
+    // directories its loader probed before `main`.
+    // alloc: once per run of a pure script: the path's directories
+    let search = blaze_build_script::env::dylib_search_path(&unit.host, script_env);
     let places = Places {
         package: &unit.package.manifest_dir,
         out_dir: &unit.out_dir,
         target_dir: Path::new(&job.units().target_dir),
         program: &unit.script,
         toolchain: &toolchain,
+        search: &search,
     };
     Some(pure::check(&unit.package.descr(), &pure.proof, &places, traced).map_err(|it| it.0))
 }

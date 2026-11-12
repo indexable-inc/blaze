@@ -27,6 +27,7 @@ fn targets() -> blaze_api::Targets {
         cargo: None,
         target: None,
         profile: "dev".to_owned(),
+        goal: None,
         features: Vec::new(),
         packages: Vec::new(),
         all_features: false,

@@ -35,6 +35,7 @@ fn span(
         unit: None,
         awaits: None,
         owner: None,
+        owned_by: None,
         job: Some(job),
         creator: None,
         start_ns: start * U,
@@ -510,7 +511,14 @@ fn killed_daemon(dir: &std::path::Path) -> ! {
                 let awaits = crate::span::Name::of("the lock no one lets go");
                 let on = blaze_graph::wait::WaitKind::Key;
                 let _wait =
-                    crate::span::Wait { awaits, function: awaits, owner: Some(7), on }.open();
+                    crate::span::Wait {
+                        awaits,
+                        function: awaits,
+                        owner: Some(7),
+                        on,
+                        by: blaze_graph::wait::OwnedBy::Job,
+                    }
+                    .open();
                 entered.wait();
                 loop {
                     std::thread::park();

@@ -1072,3 +1072,250 @@ fn replay_one_seed() {
         panic!("seed {seed}, Plant::{plant:?}: {broke}");
     }
 }
+
+// --- The cap --------------------------------------------------------------------------------
+
+/// A listed `spans` file of flush `seq`, named for `named`, holding rows of `builds`.
+fn capped_file(named: u64, seq: u64, builds: Option<[u64; 2]>, bytes: u64) -> Kept {
+    let name = Name { build: named, table: table("spans"), first: seq, last: seq, level: 0 };
+    Kept {
+        name,
+        file: name.file_name(),
+        bytes,
+        entry: Entry { builds, ..entry(10, FIRST_PID) },
+        ours: Ours::Ours,
+        listed: Listed::Listed,
+    }
+}
+
+/// What the cap must hold of the files `gone` of `kept`, or what it broke: no build keeps a
+/// part of its rows, nothing of a running build goes, and the newest flush's file stays.
+fn cap_oracle(
+    kept: &[Kept],
+    gone: &BTreeSet<usize>,
+    running: &BTreeSet<u64>,
+) -> Result<(), String> {
+    let builds: BTreeSet<u64> =
+        kept.iter().filter_map(builds_of).flat_map(|[lo, hi]| lo..=hi).collect();
+    for build in builds {
+        let of = |at: &usize| builds_of(&kept[*at]).is_some_and(|[lo, hi]| lo <= build && build <= hi);
+        let holding: Vec<usize> = (0..kept.len()).filter(of).collect();
+        let went = holding.iter().filter(|at| gone.contains(*at)).count();
+        if went != 0 && went != holding.len() {
+            return Err(format!(
+                "build {build} lost {went} of its {} files and kept the rest: {gone:?} of {kept:?}",
+                holding.len()
+            ));
+        }
+        if went != 0 && running.contains(&build) {
+            return Err(format!("build {build} is running and lost its files: {gone:?}"));
+        }
+    }
+    if let Some(newest) = kept.len().checked_sub(1)
+        && gone.contains(&newest)
+    {
+        return Err(format!("the newest flush's file went: {gone:?}"));
+    }
+    Ok(())
+}
+
+/// The cap as it was until 2026-11-11, the planted bug of [`cap_oracle`]'s control: the unit a
+/// file goes with is the build it is named for alone, whatever builds its rows are of.
+fn past_cap_by_name_alone(kept: &[Kept], total: u64, cap: u64) -> BTreeSet<usize> {
+    let mut gone = BTreeSet::new();
+    let newest = kept.last().map_or(0, |it| it.name.last);
+    let mut units: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+    for it in kept {
+        let unit = units.entry(it.name.build).or_insert((0, 0));
+        unit.0 = unit.0.max(it.name.last);
+        unit.1 += it.bytes;
+    }
+    let mut order: Vec<(u64, u64, u64)> =
+        units.into_iter().map(|(build, (last, bytes))| (last, build, bytes)).collect();
+    order.sort_unstable();
+    let mut left = total;
+    for (last, build, bytes) in order {
+        if left <= cap {
+            break;
+        }
+        if last == newest {
+            continue;
+        }
+        left -= bytes;
+        gone.extend((0..kept.len()).filter(|at| kept[*at].name.build == build));
+    }
+    gone
+}
+
+/// The invariant: past the cap no build loses a part of its rows, a running build loses none,
+/// and the newest flush's file stays, whichever builds ran at once and whatever each flush
+/// was named for.
+#[hegel::test(test_cases = 300)]
+fn the_cap_retires_whole_builds_and_none_that_runs(tc: TestCase) {
+    let mut d = Drawn(&tc);
+    let files = d.int(1, 24);
+    let mut kept = Vec::new();
+    for seq in 1..=files {
+        // A flush holds rows of builds `lo..=hi` and is named for the highest, or holds none.
+        let builds = match d.one_in(6) {
+            true => None,
+            false => {
+                let lo = d.int(1, 12);
+                Some([lo, lo + d.int(0, 3)])
+            }
+        };
+        let named = builds.map_or(0, |[_, hi]| hi);
+        kept.push(capped_file(named, seq, builds, d.int(1, 100)));
+    }
+    let running: BTreeSet<u64> = (0..d.int(0, 3)).map(|_| d.int(1, 15)).collect();
+    let total: u64 = kept.iter().map(|it| it.bytes).sum();
+    let cap = d.int(0, total);
+    let gone = past_cap(kept.iter(), total, cap, &running);
+    if let Err(broke) = cap_oracle(&kept, &gone, &running) {
+        panic!("{broke}\ncap {cap} of {total}, running {running:?}");
+    }
+    // What stays is under the cap, or every file left is one the rules keep: a part of the
+    // newest flush's unit or of a running build's.
+    let left: u64 = (0..kept.len()).filter(|at| !gone.contains(at)).map(|at| kept[at].bytes).sum();
+    if left > cap {
+        let rest: Vec<usize> = (0..kept.len()).filter(|at| !gone.contains(at)).collect();
+        // Retiring any one more unit breaks a rule: try each file left with every file that
+        // shares a build with it, transitively, and see the oracle refuse it.
+        for at in rest {
+            let mut more = gone.clone();
+            let mut range = builds_of(&kept[at]);
+            more.insert(at);
+            loop {
+                let before = more.len();
+                for (other, it) in kept.iter().enumerate() {
+                    let overlaps = match (range, builds_of(it)) {
+                        (Some([lo, hi]), Some([a, b])) => a <= hi && lo <= b,
+                        _ => false,
+                    };
+                    if overlaps {
+                        more.insert(other);
+                        let [a, b] = builds_of(it).unwrap();
+                        range = range.map(|[lo, hi]| [lo.min(a), hi.max(b)]);
+                    }
+                }
+                if more.len() == before {
+                    break;
+                }
+            }
+            assert!(
+                cap_oracle(&kept, &more, &running).is_err(),
+                "over the cap ({left} of {cap}) with a unit that could go: file {at} of {kept:?}, \
+                 gone {gone:?}, running {running:?}"
+            );
+        }
+    }
+}
+
+/// What the cap's order promises: a build's file goes only once every file of no build has
+/// gone, the newest flush's aside (which never goes).
+fn no_build_first_oracle(kept: &[Kept], gone: &BTreeSet<usize>) -> Result<(), String> {
+    let Some(build) = gone.iter().find(|at| builds_of(&kept[**at]).is_some()) else { return Ok(()) };
+    let newest = kept.len() - 1;
+    match (0..newest).find(|at| builds_of(&kept[*at]).is_none() && !gone.contains(at)) {
+        Some(idle) => Err(format!(
+            "file {build}, a build's, went while file {idle}, of no build, stays: {gone:?} of {kept:?}"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The invariant: past the cap, rows of no build (a daemon's own between builds) go before
+/// any build's rows do, whatever their ages.
+#[hegel::test(test_cases = 300)]
+fn the_cap_retires_rows_of_no_build_before_any_build_s(tc: TestCase) {
+    let mut d = Drawn(&tc);
+    let files = d.int(1, 24);
+    let mut kept = Vec::new();
+    for seq in 1..=files {
+        let builds = match d.one_in(2) {
+            true => None,
+            false => {
+                let lo = d.int(1, 12);
+                Some([lo, lo + d.int(0, 3)])
+            }
+        };
+        kept.push(capped_file(builds.map_or(0, |[_, hi]| hi), seq, builds, d.int(1, 100)));
+    }
+    let running: BTreeSet<u64> = (0..d.int(0, 3)).map(|_| d.int(1, 15)).collect();
+    let total: u64 = kept.iter().map(|it| it.bytes).sum();
+    let cap = d.int(0, total);
+    let gone = past_cap(kept.iter(), total, cap, &running);
+    if let Err(broke) = no_build_first_oracle(&kept, &gone) {
+        panic!("{broke}\ncap {cap} of {total}, running {running:?}");
+    }
+    cap_oracle(&kept, &gone, &running).unwrap();
+}
+
+/// A day of builds, then a daemon left idle: builds 1 and 2, then four flushes of no build.
+/// The cap as it was (age alone) retired the builds and kept the idle rows; the oracle
+/// catches that, and holds for the cap as it is, which retires the idle rows and keeps both
+/// builds.
+#[test]
+fn the_oracle_catches_a_build_retired_while_rows_of_no_build_stay() {
+    let kept = [
+        capped_file(1, 1, Some([1, 1]), 100),
+        capped_file(2, 2, Some([2, 2]), 100),
+        capped_file(0, 3, None, 100),
+        capped_file(0, 4, None, 100),
+        capped_file(0, 5, None, 100),
+        capped_file(0, 6, None, 100),
+    ];
+    let none = BTreeSet::new();
+    let planted = past_cap_in(kept.iter(), 600, 400, &none, Order::OldestFirst);
+    assert_eq!(planted, BTreeSet::from([0, 1]), "age alone retired both builds");
+    let caught = no_build_first_oracle(&kept, &planted).unwrap_err();
+    assert!(caught.contains("a build's, went while file 2, of no build, stays"), "{caught}");
+
+    let gone = past_cap(kept.iter(), 600, 400, &none);
+    assert_eq!(gone, BTreeSet::from([2, 3]), "the oldest rows of no build go, and no build's");
+    no_build_first_oracle(&kept, &gone).unwrap();
+    cap_oracle(&kept, &gone, &none).unwrap();
+}
+
+/// The 80-minute build of 2026-11-11: build 7 runs for the whole history while builds 8 and 9
+/// run beside it and end. The flushes that held build 8's or 9's rows were named for them,
+/// with build 7's rows inside. The cap as it was retired "build 8" and "build 9" whole, and
+/// with them build 7's rows of those stretches, leaving its last flushes: the oracle catches
+/// that (the control), and holds for the cap as it is, which retires none of them while build
+/// 7 runs and all of them at once after it ended.
+#[test]
+fn a_long_build_keeps_the_rows_it_shares_files_with_shorter_builds_in() {
+    let kept = [
+        capped_file(7, 1, Some([7, 7]), 100),
+        capped_file(8, 2, Some([7, 8]), 100),
+        capped_file(8, 3, Some([7, 8]), 100),
+        capped_file(9, 4, Some([7, 9]), 100),
+        capped_file(7, 5, Some([7, 7]), 100),
+        capped_file(10, 6, Some([10, 10]), 100),
+    ];
+    let total = 600;
+    let cap = 300;
+
+    let planted = past_cap_by_name_alone(&kept, total, cap);
+    assert_eq!(planted, BTreeSet::from([1, 2, 3]), "the old cap retired builds 8 and 9");
+    let running = BTreeSet::from([7]);
+    let caught = cap_oracle(&kept, &planted, &running).unwrap_err();
+    assert!(caught.contains("build 7 lost 3 of its 5 files"), "{caught}");
+
+    // While build 7 runs, nothing of it goes, though the history stays over its cap.
+    let gone = past_cap(kept.iter(), total, cap, &running);
+    assert_eq!(gone, BTreeSet::new());
+    cap_oracle(&kept, &gone, &running).unwrap();
+
+    // Once it ended, builds 7 to 9 are one unit and go together; build 10, the newest, stays.
+    let gone = past_cap(kept.iter(), total, cap, &BTreeSet::new());
+    assert_eq!(gone, BTreeSet::from([0, 1, 2, 3, 4]));
+    cap_oracle(&kept, &gone, &BTreeSet::new()).unwrap();
+
+    // What went is counted for the WARN event that says it.
+    let mut capped = Capped::default();
+    for at in &gone {
+        capped.add(&kept[*at]);
+    }
+    assert_eq!(capped, Capped { files: 5, rows: 50, bytes: 500, builds: Some([7, 9]) });
+}

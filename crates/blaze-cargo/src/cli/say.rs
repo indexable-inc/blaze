@@ -34,8 +34,10 @@ impl<'a> From<&UnitTargetRef<'a>> for Named<'a> {
     }
 }
 
-/// cargo's `HEADER` and `GOOD` (`util/style.rs`): bright green, bold.
-pub const GOOD: &str = "\x1b[1m\x1b[92m";
+// `GOOD`, `RESET`, the status word, the elapsed time and the `Finished` line are blaze-thin's:
+// the thin `blaze` writes them with no blaze-cargo linked, and one function writes each.
+pub use blaze_thin::say::{GOOD, RESET, elapsed_into, finished_into, status_word};
+
 /// cargo's `ERROR`: annotate-snippets' bright red, bold.
 pub const ERROR: &str = "\x1b[1m\x1b[91m";
 /// cargo's `WARN` and `INVALID`: annotate-snippets' bright yellow, bold.
@@ -44,7 +46,6 @@ pub const WARN: &str = "\x1b[1m\x1b[93m";
 pub const VALID: &str = "\x1b[1m\x1b[96m";
 /// cargo's `PLACEHOLDER`: cyan.
 pub const PLACEHOLDER: &str = "\x1b[36m";
-pub const RESET: &str = "\x1b[0m";
 
 /// `text` in `style` when `color`.
 pub fn paint(style: &str, text: &str, color: bool) -> String {
@@ -61,19 +62,6 @@ pub fn status(word: &str, rest: &str, color: bool) -> String {
     line.push_str(rest);
     line.push('\n');
     line
-}
-
-/// The start of a [`status`] line in `out`: `word` right-aligned in twelve columns, then a space.
-pub fn status_word(out: &mut String, word: &str, color: bool) {
-    if color {
-        out.push_str(GOOD);
-    }
-    out.extend(std::iter::repeat_n(' ', 12usize.saturating_sub(word.len())));
-    out.push_str(word);
-    if color {
-        out.push_str(RESET);
-    }
-    out.push(' ');
 }
 
 /// `level: ` and the text `what` writes, and its newline, into `out`, as cargo-util-terminal's
@@ -152,29 +140,11 @@ pub fn warning(what: &str, color: bool) -> String {
     out
 }
 
-/// A time as cargo's `util::elapsed` writes it: `0.12s`, `1m 05s`, into `out`.
-pub fn elapsed_into(out: &mut String, took: Duration) {
-    let secs = took.as_secs();
-    // Writing to a String cannot fail.
-    let _ = match secs >= 60 {
-        true => write!(out, "{}m {:02}s", secs / 60, secs % 60),
-        false => write!(out, "{secs}.{:02}s", took.subsec_nanos() / 10_000_000),
-    };
-}
-
 /// [`elapsed_into`] as its own text.
 pub fn elapsed(took: Duration) -> String {
     let mut out = String::with_capacity(12);
     elapsed_into(&mut out, took);
     out
-}
-
-/// What follows `Finished`: `` `dev` profile [unoptimized + debuginfo] target(s) in 0.12s ``,
-/// of the daemon's `profile` (`Response::Built`), into `out`.
-pub fn finished_into(out: &mut String, profile: &str, took: Duration) {
-    out.push_str(profile);
-    out.push_str(" target(s) in ");
-    elapsed_into(out, took);
 }
 
 /// [`finished_into`] as its own text.
@@ -410,9 +380,8 @@ pub fn escape(arg: &str) -> String {
 
 /// `shell_escape::unix::escape`.
 pub fn escape_unix(arg: &str) -> String {
-    let plain =
-        |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '=' | '/' | ',' | '.' | '+');
-    if !arg.is_empty() && arg.chars().all(plain) {
+    // The one rule of what stays unquoted, which the thin `blaze` asks too.
+    if blaze_thin::say::plain(arg) {
         return arg.to_owned();
     }
     let mut quoted = String::with_capacity(arg.len() + 2);

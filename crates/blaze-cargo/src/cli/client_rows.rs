@@ -36,6 +36,27 @@ static BUILD: AtomicU64 = AtomicU64::new(0);
 /// 0 until a build is heard, and for one that recomputed nothing, whose summary is empty.
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
+/// Why that build computed again what it did, as its own `Work` carried it
+/// ([`blaze_api::Worked::why`]): set once, by the one request a client process makes. Unset
+/// when the daemon had not explained the build as it answered, and then the client asks
+/// ([`observe::recomputed`]).
+static SUMMARY: std::sync::OnceLock<(u64, Vec<blaze_api::Report>)> = std::sync::OnceLock::new();
+
+/// The daemon said why build `build` recomputed what it did, in the build's own answer.
+pub fn summarized(build: Option<u64>, why: Option<&[blaze_api::Report]>) {
+    if let (Some(build), Some(why)) = (build, why) {
+        // clone: the summary, a few reports, once a build; a second `Work` of the process
+        // (there is none) would be dropped
+        let _ = SUMMARY.set((build, why.to_vec()));
+    }
+}
+
+/// The summary of build `build` its answer carried, if it carried one.
+pub fn summary(build: u64) -> Option<Vec<blaze_api::Report>> {
+    // clone: the summary, a few reports, once a build
+    SUMMARY.get().filter(|it| it.0 == build).map(|it| it.1.clone())
+}
+
 /// The build the daemon said this client's request is, 0 for none heard.
 pub fn build() -> u64 {
     BUILD.load(Ordering::Relaxed)
@@ -90,7 +111,11 @@ fn began_ns() -> i64 {
 /// Sends what this process recorded to the daemon as build `BUILD`'s client rows, and then,
 /// with `BLAZE_PROFILE` naming a directory, writes the build's trace there as `trace.json`.
 /// Nothing when no build was heard, or in the seed. An error names the step and the build.
-pub fn send() -> Result<Option<PathBuf>, String> {
+///
+/// `wait` false (a `run` about to become its program): the rows are handed to the daemon and
+/// its answer is not waited for ([`observe::tell`]), unless `BLAZE_PROFILE` is set, whose
+/// trace is read back from the history the rows must be in by then.
+pub fn send(wait: bool) -> Result<Option<PathBuf>, String> {
     let build = BUILD.load(Ordering::Relaxed);
     // The seed runs its engine in this process (`serve::once`): its history already records
     // this process, and a second connection would start a second engine.
@@ -98,9 +123,13 @@ pub fn send() -> Result<Option<PathBuf>, String> {
         return Ok(None);
     }
     let request = rows(build)?;
-    observe::ask(request, Start::Never, |_| Ok(()))
-        .map_err(|why| format!("sending build {build}'s client rows to the daemon: {why}"))?;
-    let Some(dir) = std::env::var_os(PROFILE).filter(|it| !it.is_empty()) else { return Ok(None) };
+    let dir = std::env::var_os(PROFILE).filter(|it| !it.is_empty());
+    let sent = match wait || dir.is_some() {
+        true => observe::ask(request, Start::Never, |_| Ok(())),
+        false => observe::tell(request),
+    };
+    sent.map_err(|why| format!("sending build {build}'s client rows to the daemon: {why}"))?;
+    let Some(dir) = dir else { return Ok(None) };
     export(build, Path::new(&dir)).map(Some)
 }
 

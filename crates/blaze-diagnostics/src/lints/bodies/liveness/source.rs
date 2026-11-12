@@ -167,7 +167,7 @@ impl Var {
 
     /// Each pattern binding it, and whether it is a field's shorthand (`S { x }`).
     pub(super) fn introductions(&self, b: &BodyCx<'_, '_, '_>) -> Vec<(Span, bool)> {
-        let patterns = b.source_map.patterns_for_binding(self.binding);
+        let patterns = b.source_map().patterns_for_binding(self.binding);
         // alloc: a lint's spans, made only once the binding is reported
         patterns
             .iter()
@@ -185,7 +185,7 @@ pub(super) fn var(b: &BodyCx<'_, '_, '_>, binding: BindingId) -> Option<Var> {
         return None;
     }
     let node =
-        b.source_map.patterns_for_binding(binding).iter().find_map(|&pat| b.pat_node(pat))?;
+        b.source_map().patterns_for_binding(binding).iter().find_map(|&pat| b.pat_node(pat))?;
     Some(Var { name: data.name.display(b.db(), b.cx.edition).to_smolstr(), node, binding })
 }
 

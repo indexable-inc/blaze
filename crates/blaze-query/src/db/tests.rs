@@ -49,10 +49,16 @@ pub struct TestDb {
     armed: [AtomicBool; 2],
     drops: Arc<AtomicUsize>,
     probe: AtomicU64,
+    /// What the two tasks of [`stale_head`] tell each other.
+    relay: stale_head::Relay,
     cells: Lock<Vec<Id>>,
     graph: Vec<GNode>,
     /// The dependency values of each graph node's last run.
     snapshots: Lock<HashMap<usize, Vec<u64>>>,
+    /// The changed set's simulation (`changed`): its program's nodes, and the world its
+    /// untracked reads see.
+    flow: Lock<Vec<changed::FlowNode>>,
+    world: AtomicU64,
 }
 
 impl TestDb {
@@ -69,9 +75,12 @@ impl TestDb {
             armed: [AtomicBool::new(false), AtomicBool::new(false)],
             drops: Arc::new(AtomicUsize::new(0)),
             probe: AtomicU64::new(u64::MAX),
+            relay: stale_head::Relay::new(),
             cells: Lock::new("query.test.db.cells", Vec::new()),
             graph,
             snapshots: Lock::new("query.test.db.snapshots", HashMap::new()),
+            flow: Lock::new("query.test.db.flow", Vec::new()),
+            world: AtomicU64::new(0),
         }
     }
 
@@ -1502,6 +1511,27 @@ fn a_word_that_is_no_id_is_refused_by_the_checked_constructors_naming_it() {
     assert_eq!(zero, Err(FormatError::Zero { at: 40, what: "a test's id" }));
     assert!(zero.unwrap_err().to_string().contains("a test's id"), "names the field");
     assert_eq!(Id::decode(7, 40, "a test's id").map(Id::as_u32), Ok(7));
+}
+
+/// The invariant: `Id::decode`'s contract, for any word: an ID it gives is the word it was
+/// given, and a word it refuses is 0 or past `Id::MAX_U32`, so no word decodes to another ID
+/// and none to an ID no storage could give. Words are drawn around the bounds as well as
+/// anywhere in 64 bits.
+#[hegel::test]
+fn a_decoded_id_is_its_word_and_a_refused_word_is_no_id(tc: TestCase) {
+    let max = u64::from(Id::MAX_U32);
+    let near: u64 = tc.draw(gs::integers::<u64>().max_value(8));
+    let word = match tc.draw(gs::integers::<u8>().max_value(4)) {
+        0 => near,
+        1 => max - near,
+        2 => max + near,
+        3 => u64::from(u32::MAX) - 4 + near,
+        _ => tc.draw(gs::integers::<u64>()),
+    };
+    match Id::decode(word, 40, "a test's id") {
+        Ok(id) => assert_eq!(u64::from(id.as_u32()), word),
+        Err(_) => assert!(word == 0 || word > max, "{word} is an ID and was refused"),
+    }
 }
 
 #[test]
@@ -3283,3 +3313,8 @@ fn after_editing_one_input_every_rerun_memos_cause_chain_leads_back_to_it(tc: Te
         }
     }
 }
+
+/// The changed set ([`super::frontier`]): its deterministic simulation and planted bugs.
+mod changed;
+mod small;
+mod stale_head;

@@ -24,7 +24,8 @@ use blaze_http::h3::{
     tokio_driver::{Driver, RecvStream, Request as Incoming, SendStream, Session},
 };
 use blaze_core::lock::Lock;
-use serde_json::{Map, Value};
+use serde::Serialize;
+use serde_json::Value;
 use tokio::{
     sync::{mpsc, oneshot, watch},
     time::MissedTickBehavior,
@@ -349,8 +350,8 @@ async fn session(shared: Arc<Shared>, request: Incoming) {
         let Some((mut send, mut recv, held)) = next_stream(&connection, &core).await else {
             return;
         };
-        let step = step(&shared, &core, &mut recv).await;
-        let first = answer(&shared, &connection, &mut send, step, held).await;
+        let (step, request) = step(&shared, &core, &mut recv).await;
+        let first = answer(&shared, &connection, &mut send, step, request, held).await;
         if first {
             break;
         }
@@ -378,24 +379,28 @@ async fn stream(
     mut recv: RecvStream,
     held: Held,
 ) {
-    let step = step(&shared, &core, &mut recv).await;
-    answer(&shared, &connection, &mut send, step, held).await;
+    let (step, request) = step(&shared, &core, &mut recv).await;
+    answer(&shared, &connection, &mut send, step, request, held).await;
 }
 
-/// The core's step for the request on `recv`.
-async fn step(shared: &Shared, core: &Core, recv: &mut RecvStream) -> Step {
+/// The core's step for the request on `recv`, and the request's bytes, which a
+/// [`Step::Op`]'s source is given parsed.
+async fn step(shared: &Shared, core: &Core, recv: &mut RecvStream) -> (Step, Vec<u8>) {
     match read(recv).await {
-        Ok(bytes) => core.lock().request(&shared.token, &bytes),
-        Err(why) => Step::Refuse(why),
+        Ok(bytes) => (core.lock().request(&shared.token, &bytes), bytes),
+        // alloc: none, an empty request: a refusal reads nothing of it
+        Err(why) => (Step::Refuse(why), Vec::new()),
     }
 }
 
-/// Carries out `step` on `send`: whether it was the session's first good hello.
+/// Carries out `step` on `send`, `request` the bytes it was decided on: whether it was the
+/// session's first good hello.
 async fn answer(
     shared: &Shared,
     connection: &Session,
     send: &mut SendStream,
     step: Step,
+    request: Vec<u8>,
     held: Held,
 ) -> bool {
     match step {
@@ -419,16 +424,26 @@ async fn answer(
             connection.close(code, error.kind);
             false
         }
-        Step::Op { name, args } => {
+        Step::Op { name } => {
             let source = Arc::clone(&shared.source);
             let started_ns = held.started_ns;
             // Dropped as this ends however it ends (answered, stopped by the page, the session
             // gone, the server stopping): the sender gone is the source's stop.
             let (_stop, stopping): (_, Stop) = crossbeam_channel::bounded::<()>(0);
             let work = tokio::task::spawn_blocking(move || {
-                let answer = source
-                    .op(&name, &args, &stopping)
-                    .unwrap_or_else(|| Err(session::unknown_op(&name, &source.hello())));
+                // The request whole, for the source: the core read only its `op`. The core
+                // took these bytes as a JSON object, so a failure here is the two readings
+                // disagreeing, answered as what it is.
+                let answer = match serde_json::from_slice::<Value>(&request) {
+                    Ok(args) => source
+                        .op(&name, &args, &stopping)
+                        .unwrap_or_else(|| Err(session::unknown_op(&name, &source.hello()))),
+                    Err(why) => Err(OpError::new(
+                        Kind::BadArgs,
+                        format!("the request of `{name}` is not JSON: {why}"),
+                    )
+                    .with("op", name.as_str())),
+                };
                 frame::answer_bytes(answer, session::elapsed_ns(started_ns, clock::now_ns()))
             });
             let bytes = tokio::select! {
@@ -557,13 +572,14 @@ async fn live_tables(
     true
 }
 
-async fn live_frame(
+async fn live_frame<H: Serialize>(
     send: &mut SendStream,
     out: &mut Vec<u8>,
-    header: &Map<String, Value>,
+    header: &H,
     ipc: &[u8],
 ) -> bool {
     out.clear();
-    frame::live_head(out, header, ipc.len()).expect("a JSON map always serializes");
+    frame::live_head(out, header, ipc.len())
+        .expect("a live frame's header of strings and integers always serializes");
     send.write_all(out).await.is_ok() && send.write_all(ipc).await.is_ok()
 }

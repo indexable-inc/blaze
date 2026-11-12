@@ -1,0 +1,12 @@
+about = "A field's type changed, which moves the struct's layout, makes again the functions that build and read it, and not a function that does not name it."
+drivers = ["sim", "real"]
+
+[[revision]]
+action = "run"
+prints = "8 8 4\n"
+
+[[revision]]
+action = "run"
+prints = "8 16 4\n"
+redone_has = ["app::make", "app::read"]
+reused = ["app::unrelated"]

@@ -85,7 +85,7 @@ use crate::serve::{
     Paths,
     fetch::Fetcher,
     work::{
-        Broke, Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, KeptPut,
+        Broke, Compiled, Failed, Front, FrontEnd, Image, JobInput, JobKind, Kept, KeptDb, KeptPut,
         Library, Phase, Put, RunPuts, Runs, Selection, Source, SourceFile, Steps, Writer, applying,
         applying_fallible,
     },
@@ -235,10 +235,15 @@ impl Steps for Real {
         Ok(Library { at: named, fingerprint, source: Some(Source { files, under: String::new() }) })
     }
 
-    fn launch(&self, program: &str, pid: u32) -> Result<Option<Vec<(String, String)>>, ApiError> {
+    fn launch(
+        &self,
+        program: &str,
+        pid: u32,
+        placed: Option<[u8; 32]>,
+    ) -> Result<Option<Vec<(String, String)>>, ApiError> {
         self.shared
             .dev_runs
-            .launch(program, pid)
+            .launch(program, pid, placed)
             .map_err(|what| ApiError::new(what, Some(program.to_owned())))
     }
 
@@ -457,7 +462,7 @@ impl Steps for Real {
                 let release = release::Release::new(
                     lowered.crates(),
                     job.graph.len(),
-                    input.goal != Goal::Check,
+                    input.kind != JobKind::Check,
                 );
                 let writer = UnitWriter {
                     session,
@@ -1692,21 +1697,37 @@ pub(crate) fn unit_target(unit: &Unit) -> Result<UnitTarget, ApiError> {
 /// script's compile, for its run, and a proc macro's, its wasm32-wasip1 module, for the
 /// expansions of the crates that use it ([`codegen::wasm_macro`]). A proc macro only checked
 /// has no module, and its `.wasm` output would be a library's crate record (an `ar` archive).
-pub(crate) fn checks_only(goal: Goal, unit: &Unit) -> bool {
+pub(crate) fn checks_only(kind: JobKind, unit: &Unit) -> bool {
     match unit.mode {
         Mode::Check => true,
         Mode::Build if unit.target.is_custom_build() || unit.target.is_proc_macro() => false,
         // A device unit's link is where its MSL is written (`UnitPlan::gpu_msl`), which a
-        // checked dependent's front end reads as a built one's does: under every goal.
+        // checked dependent's front end reads as a built one's does: under every kind of job.
         Mode::Build if unit.for_device() => false,
-        _ => goal == Goal::Check,
+        _ => kind == JobKind::Check,
     }
+}
+
+/// The goal of the request `input` is of, for what its build says of itself
+/// ([`blaze_api::Worked::tiers`]): its `--goal`, else the goal of the profile of the first
+/// unit it asked for ([`blaze_api::Goal::of_profile`]); none for a request that asked for no
+/// unit. The goal one unit's code is compiled for is [`codegen::goal`]'s to say.
+pub(crate) fn request_goal(input: &JobInput) -> Option<blaze_api::Goal> {
+    input.goal.or_else(|| {
+        let graph = &input.units.graph;
+        let profile = &graph.units.get(*graph.roots.first()?)?.profile;
+        Some(blaze_api::Goal::of_profile(
+            &profile.name,
+            &profile.opt_level,
+            profile.codegen_backend.as_deref(),
+        ))
+    })
 }
 
 /// The phases of `unit`'s compile, each a node of the plane ([`Phase`]): no codegen and no
 /// link for a unit [`checks_only`] stops after the front end.
-pub(crate) fn phases(goal: Goal, unit: &Unit) -> &'static [Phase] {
-    match checks_only(goal, unit) {
+pub(crate) fn phases(kind: JobKind, unit: &Unit) -> &'static [Phase] {
+    match checks_only(kind, unit) {
         true => &Phase::CHECK,
         false => &Phase::BUILD,
     }

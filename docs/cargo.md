@@ -107,7 +107,15 @@ cargo would refuse. `-C DIRECTORY` (with `-Z unstable-options`) and the global f
 the command work as in cargo. `test` alone takes four flags of blaze's own (extensions,
 [below](#which-tests-run)): `--reached`, `--ub`, `--ub-seed N` and `--ub-schedules K`. `build`,
 `check`, `run`, `test` and `bench` take `--refused N|all`: how many of the functions blaze could
-not compile a build's error names, the first `N` (16 without it) or every one.
+not compile a build's error names, the first `N` (16 without it) or every one. `build`,
+`run`, `test` and `check` take `--goal edit|max`: what the build waits for before it answers.
+`edit` answers once every function has tier 0 code (copy-and-patch stencils); `max` once every
+function has its optimized code (LLVM's), and fails, naming the function, where it cannot.
+Without the flag the profile says: `dev` and `test` edit, `release` and `bench` (and any
+profile at `opt-level` 2, 3, `s` or `z`) are `max`. A package cargo gives its own `opt-level`
+(`[profile.*.package.*]`) keeps it under both. The `Finished` line ends with the goal and how
+much of the linked code is optimized: `(goal edit: tier 0 · 38% optimized)`
+([v2/plan/design/tiers.md](v2/plan/design/tiers.md)).
 `serve` is the daemon itself ([below](#the-daemon)); `codegen-inputs`, `trace` and `tables`
 print what the daemon's last build of the checkout did (each instance it made with its code
 hash, every result with its edges as CBOR, the size of each long-lived table); `check --replace std::sync::Mutex=parking_lot::Mutex` retargets every
@@ -384,6 +392,7 @@ lld's) on Linux. What blaze's linker implements:
 | a shared library's exports | `-exported_symbol _NAME` (added to the crate's) | |
 | the main thread's stack | `-stack_size SIZE` (hex, whole 4 KiB pages) | |
 | never unloaded | | `-z nodelete` |
+| an executable's dynamic symbols | | `--export-dynamic-symbol PATTERN`, `--export-dynamic-symbol=PATTERN`: each name the image defines that the pattern matches (`*`, `?`, `[a-z]`, as `fnmatch`) is in `.dynsym` and kept for it; nothing for a shared library, which exports what its crate exports |
 
 Taken because blaze's linker always does it: ld64's `-dead_strip`, `-pie`, `-search_paths_first`,
 `-adhoc_codesign`, `-undefined error` for an executable; GNU's `--gc-sections`, `--as-needed`,
@@ -684,10 +693,12 @@ it goes into every rustc and linker run of its package and of what links it. A
 `rustc-link-search` (or `rustc-flags`' `-L`) names a directory in its `OUT_DIR`, its package,
 the target directory's build directory (its dependencies' `OUT_DIR`s), a system directory
 (`/usr/lib`, `/lib64`, `/usr/local/lib`, the Nix store, Homebrew's, Apple's SDKs), one of
-`build-script-link-dirs`, or the layout of a [pinned native input](#pinned-native-inputs) the
-script was given; a `rustc-link-arg` is one of a short list (`-pthread`, `-rdynamic`,
-`-Wl,--as-needed`, `-Wl,-z,now`, `-Wl,-soname,NAME`, `-lNAME`, ...) or an rpath to `$ORIGIN`
-or a directory a search may name; a `rustc-env` sets no variable cargo or rustc gives the crate
+`build-script-link-dirs`, or a layout of a [pinned native input](#pinned-native-inputs) in
+blaze's own store (`<BLAZE_HOME>/native/sha256-<digest>`), whether the script was given it or
+a variable of the shell points it there; a `rustc-link-arg` is one of a short list (`-pthread`,
+`-rdynamic`, `-Wl,--as-needed`, `-Wl,-z,now`, `-lNAME`, ...), a prefix with one value that is
+no further linker word (`-Wl,-soname,NAME`, `-Wl,--export-dynamic-symbol,PATTERN`,
+`-Wl,--version-script=FILE`), or an rpath to `$ORIGIN` or a directory a search may name; a `rustc-env` sets no variable cargo or rustc gives the crate
 itself (`CARGO_PKG_*`, `CARGO_MANIFEST_DIR`, `OUT_DIR`, `RUSTC*`, ...); what cargo gives only
 build scripts (`CARGO_CFG_*`, `CARGO_FEATURE_*`, `CARGO_ENCODED_RUSTFLAGS`) it may forward, as
 rav1e's does. Anything
@@ -866,7 +877,9 @@ two (two `StdKey`s, two directories): the host's units run where they are built,
 is compiled for this machine's own CPU, while the target's, which may be shipped, is compiled
 for the target's baseline (`blaze_units::schema::runs_here`, the one rule both codegen and
 `StdKey` read). In a release build both run elsewhere, so they are one key and share one set
-of std units. Its
+of std units. A std's directory is named by its key without the crates asked of it
+(`StdKey::placement`): a program's build and its tests' build, which asks for `test` too, name
+every std unit they share by the same files, and the second compiles only what it adds. Its
 own units abort too: a profile's `panic = "unwind"`, cargo's default, gets no `-C panic` from
 cargo, so blaze builds each unit with its target's own strategy, as rustc does
 (`crates/blaze-units/src/load/units.rs`). The standard library the macros link is their own
@@ -1085,11 +1098,11 @@ answered. It is said again only while every input of that walk is as it was:
 |---|---|
 | The checkout's files (sources, manifests, lock file, config in it) | the view's root, which the checkout's watcher commits before the request is seen |
 | Command, arguments, directory, the request's whole environment, config files outside the checkout, fetched sources and path dependencies, toolchain, blaze's version | the view's config, by its bytes |
-| Colors, width, `--refused`, `-v` | the request's own hash |
-| Paths outside the checkout a build script, proc macro or `include!` read | the watches outside views heard nothing since the kept walk began, and that walk looked at no such path on the disk |
+| Colors, width, `--refused`, `-v`, `--goal` | the request's own hash |
+| Paths outside the checkout a build script, proc macro or `include!` read | the watches outside views heard nothing since the kept walk began, and that walk looked at no such path on the disk; a path named through symlinks (the macOS SDK's `libm.tbd`) is watched at each link and at the file they end at |
 | Path dependencies outside the checkout | each one's watch vouches for it; one named through a link, or a single file, is read again by every build |
 | A manifest above the checkout that is not there | looked at as the request is asked |
-| The outputs | each directory they are in has been watched since before the kept walk and heard nothing |
+| The outputs, the standard library's among them | each directory they are in (a profile's or a target's under the build directories, one build's under the daemon's `std` place) has been watched since before the kept walk and heard nothing; a `blaze run`'s launch writes none of them |
 | Layout profiles (`<target>/layout`) | watched when there, looked at when not |
 | Other jobs | none is under way |
 
@@ -1211,7 +1224,9 @@ never bytes of one layout read as another's. A new persisted file adds its row h
 | The profile history's manifest | `<home>/v2/profile/manifest.json` | the daemon's flushes and merges | `format` | read: formats from the oldest still read up to this one, rewritten as this one at the next commit; any other refused naming both | `a_manifest_reads_back_what_it_consumed_byte_for_byte` (`crates/blaze-profile/src/history/manifest.rs`) |
 | The flight recorder's mapped rings and the crash record | beside the profile history, `<home>/v2/profile` | every blaze process | a magic and a layout number | refused naming its file; its rows are not recovered | `a_mapping_of_another_layout_is_refused_naming_its_file` (`crates/blaze-profile/src/flight/postmortem.rs`), `a_record_of_another_layout_or_blaze_is_refused` (`crates/blaze-profile/src/crash.rs`) |
 | The collector's ledger | `<home>/v2/gc-ledger.json` | the daemon's collector | `format` | refused by name (the file and both formats) in the log and in status, then a new ledger is started | `a_file_of_the_previous_layout_is_refused_by_name` (`crates/blaze-gc/src/ledger.rs`) |
-| The why ledger | under `<home>/v2` | the daemon | a magic that ends in the blaze version's hash | moved aside as another version's, never written over | the `Fault::Version` case in `crates/blaze-cargo/src/serve/why.rs`'s tests |
+| The why ledger | under `<home>/v2` | the daemon | a magic that ends in the blaze version's hash (records are zstd frames from version 4) | moved aside as another version's, never written over | the `Fault::Version` case in `crates/blaze-cargo/src/serve/why.rs`'s tests |
+| A flight recording | `<home>/v2/flightrec/<pid>-<ms>.cbor` | the daemon | a magic and a format number | format 1 (the CBOR as it is) is read; format 2 is the same CBOR as one zstd frame; any other is refused naming both formats | `a_file_of_format_1_reads_as_the_recording_it_is`, `a_file_of_another_format_is_refused_naming_both` (`crates/blaze-cargo/src/serve/flightrec.rs`) |
+| The daemon's log | `<home>/v2/serve.log`, and `serve.log.1` before it | the daemon's standard error | none: lines of text | read by every version; rotated at 8 MiB, the two kept to 16 MiB | `the_log_and_the_one_before_it_stay_within_the_cap` (`crates/blaze-cargo/src/serve/log.rs`) |
 | The daemon's lock | `<home>/v2/serve.lock` | the daemon | none: a pid and ` stopped` as text | read by every version | none yet |
 | The performance history's run rows | the build directory | `blaze perf record` | `format` in each row | refused naming the file, the run and both formats, with what to do (record it again) | none yet |
 | Build directories and fetched sources | `<home>/build`, `<home>/sources` | the daemon | none, on purpose: they keep their place across the daemon's formats | read | none: their contents are checked by content hash |

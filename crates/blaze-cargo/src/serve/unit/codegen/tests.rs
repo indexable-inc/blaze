@@ -78,6 +78,30 @@ fn debug_info_goes_beside_the_image_unless_the_profile_says_off() {
     assert!(refused.contains("`split`") && refused.contains("unpacked"), "{refused}");
 }
 
+/// A side file's runs are the blocks of it that hold anything, joined where they touch, and
+/// written back over a file of holes of its length they give its bytes: what the loop
+/// places is the file, with none of its sections' room written.
+#[test]
+fn a_side_files_runs_are_its_blocks_that_hold_bytes() {
+    let block = super::SIDE_BLOCK;
+    let mut bytes = vec![0u8; 5 * block + 17];
+    bytes[1] = 7; // block 0
+    bytes[block] = 8; // block 1, touching block 0's
+    bytes[4 * block + 3] = 9; // block 4
+    bytes[5 * block + 16] = 1; // the short last block
+    let file = super::sparse_of(&bytes);
+    assert_eq!(file.len, bytes.len() as u64);
+    assert_eq!(file.check(), Ok(()));
+    let at: Vec<(u64, usize)> = file.runs.iter().map(|it| (it.0, it.1.len())).collect();
+    assert_eq!(at, [(0, 2 * block), (4 * block as u64, block + 17)]);
+    let mut back = vec![0u8; bytes.len()];
+    for (at, run) in &file.runs {
+        back[*at as usize..*at as usize + run.len()].copy_from_slice(run);
+    }
+    assert_eq!(back, bytes);
+    assert!(super::sparse_of(&vec![0u8; 3 * block]).runs.is_empty(), "a file of zeros is all holes");
+}
+
 #[test]
 fn llvm_and_no_backend_leave_the_choice_to_blaze() {
     for level in [OptLevel::O0, OptLevel::O3] {
@@ -304,23 +328,23 @@ fn an_edit_to_a_callee_relinks_its_unchanged_callers() {
     let key = |n: u8| InstanceKey(ContentId([n; 32]));
     let names = [(key(2), "call".to_string())];
     let (first, gone, new) =
-        function_rows(&[], &[calling(3, &[2]), calling(2, &[1]), calling(1, &[])], &names).unwrap();
+        function_rows(&[], &[std::sync::Arc::new(calling(3, &[2])), std::sync::Arc::new(calling(2, &[1])), std::sync::Arc::new(calling(1, &[]))], &names).unwrap();
     assert!(gone.is_empty());
     assert_eq!(new, [key(1), key(2), key(3)]);
 
     let (same, gone, new) =
-        function_rows(&first, &[calling(1, &[]), calling(2, &[1]), calling(3, &[2])], &names)
+        function_rows(&first, &[std::sync::Arc::new(calling(1, &[])), std::sync::Arc::new(calling(2, &[1])), std::sync::Arc::new(calling(3, &[2]))], &names)
             .unwrap();
     assert_eq!(same, first);
     assert!(gone.is_empty() && new.is_empty(), "linked again unchanged: {gone:?} {new:?}");
 
     let (_, gone, new) =
-        function_rows(&first, &[calling(3, &[2]), calling(2, &[4]), calling(4, &[])], &names)
+        function_rows(&first, &[std::sync::Arc::new(calling(3, &[2])), std::sync::Arc::new(calling(2, &[4])), std::sync::Arc::new(calling(4, &[]))], &names)
             .unwrap();
     assert_eq!(gone, [key(1), key(2)], "the old `log`, and `call` as it was filled against it");
     assert_eq!(new, [key(2), key(4)], "`call` filled against the new `log`, and the new `log`");
 
-    let twice = function_rows(&[], &[calling(2, &[1]), calling(2, &[4])], &names).unwrap_err();
+    let twice = function_rows(&[], &[std::sync::Arc::new(calling(2, &[1])), std::sync::Arc::new(calling(2, &[4]))], &names).unwrap_err();
     assert!(
         twice.contains("filled two ways")
             && twice.contains("`call`")

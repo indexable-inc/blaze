@@ -203,6 +203,9 @@ pub struct Printer<'a, O: Write, E: Write> {
     /// What the request's units came to, once its work report came ([`ResponseRef::Work`]):
     /// for `build-finished`.
     work: Option<json::Work>,
+    /// The build's goal and how much of what it linked is optimized, once its work report
+    /// came ([`blaze_api::Worked::tiers`]): for the `Finished` line.
+    tiers: Option<blaze_api::Tiers>,
     /// The test units the build left unbuilt ([`blaze_api::Unchecked::tests`]), for the end of
     /// `test`'s run.
     unbuilt: Vec<blaze_api::Unbuilt>,
@@ -246,6 +249,7 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
             printed: HashedSet::with_capacity_in(DIAGNOSTICS, Global),
             built: None,
             work: None,
+            tiers: None,
             unbuilt: Vec::new(), // alloc: none until a test unit did not build
             refused: false,
             left: 0,
@@ -558,6 +562,7 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
             // spliced is never silent.
             ResponseRef::Work(worked) => {
                 self.work = Some(json::Work::of(&worked));
+                self.tiers = worked.tiers;
                 if self.shown.format.json() {
                     self.to(true)?;
                     // alloc: two texts a request, at its end.
@@ -703,6 +708,13 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         {
             say::status_word(&mut self.line, "Finished", color);
             say::finished_into(&mut self.line, &built.profile, took);
+            // The goal and how far the optimized code has come (`Worked::tiers`): blaze's
+            // own, after cargo's words.
+            if let Some(tiers) = &self.tiers {
+                self.line.push_str(" (");
+                self.line.push_str(&tiers.line());
+                self.line.push(')');
+            }
             self.line.push('\n');
         }
         // A slow build, done or not, points at what says why (`blaze slow`, docs/profiling.md).

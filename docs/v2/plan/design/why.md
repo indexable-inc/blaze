@@ -129,6 +129,16 @@ recomputed nothing, under `-q`, or when no daemon ran the build. A build that re
 nothing says so in its `Work` (`Worked::misses` of 0, the count of the misses the summary
 is made of), and its CLI then asks nothing: a no-op build makes no second round trip.
 
+The summary rides the build's own answer when it can (2026-11-11; written, not built or run):
+as the daemon says a build's `Work` it puts the summary in `Worked::why` if the history's
+thread has explained the build by then (`Observe::summary_of`), and the CLI then asks nothing
+(span `client: why the build recomputed, from its answer`). The answer is never held for the
+explanation, which is the profile's: when it is not there yet `why` is none and the CLI asks
+as above (span `client: ask why the build recomputed`). The daemon's span `loop: why the build
+recomputed, for its answer` says which (`explained=`). A build whose answer waits for nothing
+after its plane request (nothing named to place) is answered in the turn it finishes, before
+its rows reach the history's thread, and so always asks.
+
 One `Report` a root cause (the set of ends a step has), the most steps first, at most 4
 (`CAUSES`); past that one line counts the rest and names `blaze why`. Each has a fact a step
 kind, most first, naming at most 3 items and counting the rest:

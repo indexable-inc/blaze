@@ -1049,7 +1049,7 @@ pub(crate) fn before_claim() -> Result<(), super::NoProgress> {
     let waiting = crate::pump::Waiting::begin(
         crate::wait::WaitKind::Key,
         &mut |it| gave_way.name_wait(it),
-        || Some(gave_way.owner),
+        || crate::wait::Owner::Job(gave_way.owner),
     );
     let waited = wait(Wait::Key(gave_way.flight));
     drop(waiting);

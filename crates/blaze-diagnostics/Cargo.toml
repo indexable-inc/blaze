@@ -28,6 +28,9 @@ rustc_apfloat.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 smallvec.workspace = true
+# The body lints' sweep is a span (`lints::bodies::sweep`): how many bodies were asked and in how
+# many a lint was found.
+tracing.workspace = true
 unicode-ident.workspace = true
 unicode-normalization.workspace = true
 unicode-security.workspace = true

@@ -34,6 +34,7 @@ pub mod borrowed;
 pub mod build;
 pub mod client;
 pub mod frames;
+pub mod goal;
 pub mod http;
 pub mod intent;
 pub mod json;
@@ -52,6 +53,7 @@ pub use borrowed::{
     BasisRef, BuildScriptRanRef, CachedRef, DiagnosticRef, FactReadRef, LiveFrameRef, ResponseRef,
     SpanRef, TestResultRef, UnitOfRef, UnitStartedRef, UnitTargetRef,
 };
+pub use goal::{Goal, Tiers};
 pub use intent::{Edit, Edited, EditedItem, How, Target};
 
 use blaze_core::Conn;
@@ -98,8 +100,11 @@ use serde::{Deserialize, Serialize};
 /// [`Rebuilt::summary`] (what a build says of itself once it ends), and `build` and
 /// `unexplained` of [`Request::Rebuilt`]. 47: [`Worked::misses`], by which a build that
 /// recomputed nothing asks for no summary. 48: `Request::Pack` and `Response::Packed` are gone
-/// with the in-browser compiler they fed.
-pub const SCHEMA: u32 = 48;
+/// with the in-browser compiler they fed. 49: [`Worked::why`], the build's own summary in its
+/// `Work` when the daemon has it by then, so its client makes one round trip. 50:
+/// [`Targets::goal`] and [`Worked::tiers`], the build goal ([`Goal`]) and how much of the code
+/// a build linked is optimized.
+pub const SCHEMA: u32 = 50;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -141,6 +146,10 @@ pub struct Targets {
     /// A target triple; `None` for the machine's.
     pub target: Option<String>,
     pub profile: String,
+    /// What the request waits for (`--goal edit|max`); `None` for the profile's own
+    /// ([`Goal::of_profile`]: `dev` edits, `release` is `max`). A check compiles no program,
+    /// so nothing of it reads this.
+    pub goal: Option<Goal>,
     pub features: Vec<String>,
     /// Packages by name; empty for the workspace's default members.
     pub packages: Vec<String>,
@@ -1026,6 +1035,15 @@ impl Diagnostic {
             explanation: None,
         }
     }
+
+    /// A warning of the whole request, of no unit, span or code: `warning: {message}`.
+    pub fn warning(message: String) -> Diagnostic {
+        Diagnostic {
+            level: Level::Warning,
+            rendered: format!("warning: {message}\n"), // alloc: the report owns it, once per warning
+            ..Diagnostic::note(message)
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -1209,6 +1227,12 @@ pub struct UnitProfile {
 /// What a build did: the counts the oracle's over-invalidation and the budgets read.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Worked {
+    /// Why it computed again what it did, as the daemon sums it up ([`Rebuilt::summary`], a
+    /// report a root cause), when the daemon had explained the build by the time this was
+    /// said: the client then asks for no summary. `None` when it had not (the answer is never
+    /// held for the explanation): the client asks, as before ([`Request::Rebuilt`] with
+    /// `build`), unless [`Worked::misses`] is 0.
+    pub why: Option<Vec<Report>>,
     /// [`LinkKind::Placed`] when any of [`Worked::links`] laid its image out whole: one that is
     /// neither [`LinkHow::Spliced`] nor [`LinkHow::Unchanged`].
     pub link: LinkKind,
@@ -1242,6 +1266,10 @@ pub struct Worked {
     pub steps_us: Vec<(NodeKind, u64)>,
     /// The plane's critical path of the request.
     pub critical_path_us: u64,
+    /// The build's goal and how much of the code of the images it linked is optimized
+    /// ([`Tiers::line`]: `goal edit: tier 0 · 38% optimized`). `None` when no unit the request
+    /// asked for compiles a program.
+    pub tiers: Option<Tiers>,
 }
 
 /// What a build left unchecked ([`Response::Unchecked`]): said once a unit failed and any

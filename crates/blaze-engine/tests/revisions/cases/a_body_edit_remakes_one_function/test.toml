@@ -1,0 +1,29 @@
+about = "A body edit makes that function's code again and no other's, runs and verifies a number of engine memos that does not grow with std, and taking it back makes nothing."
+drivers = ["sim", "real"]
+
+[[revision]]
+action = "run"
+prints = "2 4\n"
+bytes = true
+
+[[revision]]
+action = "run"
+prints = "11 4\n"
+redone = ["app::f"]
+max_executed = 200
+max_verified = 2000
+link = "spliced"
+bytes = true
+
+[revision.known]
+"real: max_executed" = "the first body edit after a cold build runs about 940 engine memos (944 and 919 seen), not a number of the size of the edit"
+"real: max_verified" = "the first body edit after a cold build verifies about a million cached results (1,073,714 and 1,864,496 seen): the body edit re-verifying 1,091,174 of 2026-11-11"
+"real: clean bytes" = "a spliced image is not the bytes of a clean link of the same source: about 2 MB of 158 MB differ, the first at 0xd8 (rule deterministic-output)"
+
+[[revision]]
+action = "run"
+prints = "2 4\n"
+redone = []
+max_executed = 200
+max_verified = 2000
+bytes = true

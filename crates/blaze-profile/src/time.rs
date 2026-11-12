@@ -36,6 +36,7 @@ mod tests;
 
 use std::fmt;
 
+use blaze_graph::wait::OwnedBy;
 use blaze_hash::HashMap;
 use std::alloc::Global;
 
@@ -215,6 +216,9 @@ pub struct SpanIn {
     pub awaits: Option<String>,
     /// For a wait on a key: the job running it, as a switch's `job` names it.
     pub owner: Option<u64>,
+    /// For a wait: who ends it (`spans.owned_by`); `None` for any other span, and for a wait of
+    /// a file from before the column.
+    pub owned_by: Option<OwnedBy>,
     /// For a `job` span: the job it is of, as a switch's `job` (or a `started` row's
     /// `began_as`) names it.
     pub job: Option<u64>,
@@ -233,6 +237,12 @@ pub struct SpanIn {
 
 /// The name of a span that is a wait (`blaze_graph::wait`'s spans).
 pub const WAIT_SPAN: &str = "wait";
+
+/// The span the daemon's loop is inside as it makes a job's answer
+/// (`blaze_cargo::serve::job::Jobs::wind_up`): where a client's wait for its daemon
+/// ([`OwnedBy::Daemon`]) ends, so the lane the critical path crosses to from that wait
+/// ([`Waker::Answer`]).
+pub const ANSWER_SPAN: &str = "loop: a job's answer";
 
 /// The name of a job's root span ([`crate::span::Job`]): the span that names its job and creator.
 pub const JOB_SPAN: &str = <crate::span::Job as crate::span::Span>::NAME;
@@ -429,6 +439,7 @@ impl Input {
                 unit: text(it.unit),
                 awaits: it.get::<col::Awaits>().and_then(|it| it.text()).map(|it| it.to_string()),
                 owner: it.get::<col::Owner>(),
+                owned_by: it.get::<col::OwnedBy>(),
                 job: it.get::<col::OfJob>(),
                 creator: it.get::<col::Creator>(),
                 start_ns: it.start_ns,
@@ -896,6 +907,9 @@ pub enum Waker {
     Awaited { lane: usize },
     /// No `ready` row: the wait's span named the job running the key.
     Owner { lane: usize },
+    /// A client's wait for its daemon ([`OwnedBy::Daemon`]): the lane, in the daemon's process,
+    /// of the last answer the daemon made while the client waited ([`ANSWER_SPAN`]).
+    Answer { lane: usize },
     /// The `ready` row names no job: a thread on no fiber, or a timer, woke it.
     NoJob,
     /// The record names a job with no lane in the model: one on no fiber (a client thread's),
@@ -908,7 +922,10 @@ pub enum Waker {
 impl Waker {
     pub fn lane(self) -> Option<usize> {
         match self {
-            Waker::Ready { lane } | Waker::Awaited { lane } | Waker::Owner { lane } => Some(lane),
+            Waker::Ready { lane }
+            | Waker::Awaited { lane }
+            | Waker::Owner { lane }
+            | Waker::Answer { lane } => Some(lane),
             Waker::NoJob | Waker::NoLane { .. } | Waker::Unknown => None,
         }
     }
@@ -918,6 +935,7 @@ impl Waker {
             Waker::Ready { .. } => "ready",
             Waker::Awaited { .. } => "awaited",
             Waker::Owner { .. } => "owner",
+            Waker::Answer { .. } => "answer",
             Waker::NoJob => "no_job",
             Waker::NoLane { .. } => "no_lane",
             Waker::Unknown => "unknown",
@@ -1807,6 +1825,28 @@ impl Model {
         let named = |process: u32, job: u64, found: fn(usize) -> Waker| {
             jobs.get(&(process, job)).copied().map_or(Waker::NoLane { job }, found)
         };
+        // The daemon's answers ([`ANSWER_SPAN`]), by when each began: (start, process, lane).
+        // alloc: once a model, an entry an answer
+        let mut answers: Vec<(i64, u32, usize)> = Vec::new();
+        for (i, span) in self.spans.iter().enumerate() {
+            if span.name == ANSWER_SPAN
+                && let Some(lane) = self.span_time[i].lane
+            {
+                answers.push((span.start_ns, span.process, lane));
+            }
+        }
+        // By lane on a tie, never by row order (deterministic-output).
+        answers.sort_unstable();
+        // A client's wait for its daemon was ended by the last answer another process began
+        // while it waited: that answer's lane. None in the record: the wait stays a link of its
+        // own, named, and nothing is guessed in its place.
+        let answered = |process: u32, from: i64, to: i64| {
+            answers
+                .iter()
+                .rev()
+                .find(|&&(at, of, _)| of != process && at >= from && at <= to)
+                .map_or(Waker::Unknown, |&(_, _, lane)| Waker::Answer { lane })
+        };
         for w in 0..self.waits.len() {
             let wait = &self.waits[w];
             let process = self.lanes[wait.lane].id.process();
@@ -1822,6 +1862,8 @@ impl Model {
                 }
             };
             let owner = span.and_then(|it| self.spans[it].owner);
+            let by_daemon =
+                span.is_some_and(|it| self.spans[it].owned_by == Some(OwnedBy::Daemon));
             let waker = match (ready.get(&w), wait.on, owner) {
                 (Some(&Some(by)), _, _) => named(process, by, |lane| Waker::Ready { lane }),
                 (Some(&None), _, _) => Waker::NoJob,
@@ -1829,6 +1871,9 @@ impl Model {
                     named(process, wait.value, |lane| Waker::Awaited { lane })
                 }
                 (None, _, Some(owner)) => named(process, owner, |lane| Waker::Owner { lane }),
+                (None, _, None) if by_daemon => {
+                    answered(process, wait.parked_ns, wait.resumed_ns.unwrap_or(i64::MAX))
+                }
                 (None, _, None) => Waker::Unknown,
             };
             let own = wait.lane;

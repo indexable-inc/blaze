@@ -1561,11 +1561,15 @@ fn a_crates_macros_are_loaded_once_every_proc_macro_it_reaches_is() {
     assert!(!super::macros_loaded(db, krate(&built, BIN)), "`m` is not built");
     built.lowered.macros(MACRO, Ok(Vec::new())).unwrap();
     assert!(super::macros_loaded(built.lowered.db(), krate(&built, BIN)));
+    // A macro whose load failed never loads: nothing waits for it, and the crates that reach
+    // it are listed as they are (a use of it fails at the use).
     built.lowered.macros(MACRO, Err(base_db::ProcMacroLoadingError::FailedToBuild)).unwrap();
     assert!(
-        !super::macros_loaded(built.lowered.db(), krate(&built, BIN)),
-        "a macro that failed never loads"
+        super::macros_loaded(built.lowered.db(), krate(&built, BIN)),
+        "a macro whose load failed is waited for, so what reaches it is never listed"
     );
+    built.lowered.macros(MACRO, Err(base_db::ProcMacroLoadingError::NotYetBuilt)).unwrap();
+    assert!(!super::macros_loaded(built.lowered.db(), krate(&built, BIN)), "`m` is not built");
 }
 
 /// The bin's root file (`fn main() { alpha::gen(); }`) as a proc macro's span names it: the
@@ -2679,4 +2683,102 @@ fn a_kept_narrowed_identity_is_under_the_front_ends_code() {
     assert_eq!(made.len(), 1, "another front end's code: another key, so it parses");
     assert_ne!(made[0].0, store[0].0);
     assert_eq!(made[0].1, store[0].1, "the same code text, as this test's two are one code");
+}
+
+/// [`units`] as a build of the program `b` alone plans them (`blaze run`), or, `tested`, of
+/// `b`'s tests in libtest's harness (`blaze test`): the same dependencies either way (`core`,
+/// `a` with its build script and its run, the proc macro `m`), and `b` itself compiled with
+/// `--test` in the second.
+fn program_units(tested: bool) -> Units {
+    let mut units = units();
+    units.graph.units.truncate(LIB_TEST);
+    units.plans.truncate(LIB_TEST);
+    units.graph.roots = vec![BIN];
+    if tested {
+        units.graph.units[BIN].mode = Mode::Test;
+    }
+    units
+}
+
+/// What the stores keep a crate's front-end results under: its content ID, its identity (which
+/// covers its files and its dependencies' identities) and, where it is read from an image,
+/// the image's key.
+fn shared_keys(
+    built: &mut Built,
+    unit: usize,
+) -> (ContentId, Option<ContentId>, Option<ContentId>) {
+    let krate = krate(built, unit);
+    let identity = built.lowered.identity(unit);
+    let db = built.lowered.db();
+    let image = hir_def::deps::keys(db, &[krate], ContentId::default()).get(&krate).copied();
+    (krate.content(db), identity, image)
+}
+
+/// The units of [`program_units`] the program depends on.
+const DEPENDENCIES: [usize; 4] = [CORE, BUILD_SCRIPT, LIB, MACRO];
+
+/// The invariant: what a crate's front-end results are kept under is a function of the crate
+/// (its source, its own cfg, features and env, its dependencies' identities) and never of the
+/// build's other units. A dependency of a program has one content ID, one identity and one
+/// image key whether the program is built to run or with `--test`, so every store (dependency
+/// images, checked bodies, the item store, unit records) answers the second build with what
+/// the first left. The program's own crate is another: it has `cfg(test)`.
+#[test]
+fn a_dependency_is_keyed_the_same_whatever_kind_of_target_uses_it() {
+    let mut run = lowered(&program_units(false)).unwrap();
+    let mut test = lowered(&program_units(true)).unwrap();
+    for unit in DEPENDENCIES {
+        assert_eq!(shared_keys(&mut run, unit), shared_keys(&mut test, unit), "unit {unit}");
+    }
+    assert!(
+        shared_keys(&mut run, CORE).2.is_some(),
+        "`core` is read from an image, so its image key is among what was compared"
+    );
+    let (ran, tested) = (shared_keys(&mut run, BIN), shared_keys(&mut test, BIN));
+    assert_ne!(ran.0, tested.0, "the program under `cfg(test)` is another crate");
+    assert_ne!(ran.1, tested.1);
+}
+
+/// The control of `a_dependency_is_keyed_the_same_whatever_kind_of_target_uses_it`: a tests'
+/// build that plans a dependency apart (its `OUT_DIR` under another directory, as every crate
+/// of the standard library above a build script was until 2026-11-11, placed by the crates
+/// the build asked std for) gives that dependency other keys, and the oracle says so; a crate
+/// below it keeps its own.
+#[test]
+fn the_oracle_catches_a_dependency_planned_apart_for_the_tests() {
+    let mut run = lowered(&program_units(false)).unwrap();
+    let mut planted = program_units(true);
+    let elsewhere = "/w/target/debug/build/a-2/out";
+    planted.plans[RUN].out_dir = Some(elsewhere.to_owned());
+    for (name, value) in &mut planted.plans[LIB].env {
+        if name == "OUT_DIR" {
+            *value = elsewhere.to_owned();
+        }
+    }
+    let mut test = lowered(&planted).unwrap();
+    let (was, now) = (shared_keys(&mut run, LIB), shared_keys(&mut test, LIB));
+    assert_ne!(was.0, now.0, "the oracle sees the dependency's content ID move");
+    assert_ne!(was.1, now.1, "and its identity");
+    assert_eq!(shared_keys(&mut run, CORE), shared_keys(&mut test, CORE), "`core` is below it");
+}
+
+/// What does matter still tells two crates apart under every key (rule 21): a dependency
+/// built with another feature is another crate, by its content ID, its identity and its
+/// image's key, and so is each crate above it, through the identity it depends on.
+#[test]
+fn a_dependency_built_with_other_features_is_keyed_apart() {
+    let mut run = lowered(&program_units(false)).unwrap();
+    let mut featured = program_units(true);
+    featured.plans[CORE].cfgs = vec!["feature=\"extra\"".to_owned()];
+    let mut test = lowered(&featured).unwrap();
+    let (was, now) = (shared_keys(&mut run, CORE), shared_keys(&mut test, CORE));
+    assert_ne!(was.0, now.0);
+    assert_ne!(was.1, now.1);
+    assert!(was.2.is_some() && now.2.is_some(), "`core` is read from an image either way");
+    assert_ne!(was.2, now.2, "an image of `core` without the feature is never read for it");
+    for unit in [LIB, MACRO] {
+        let (was, now) = (shared_keys(&mut run, unit), shared_keys(&mut test, unit));
+        assert_ne!(was.0, now.0, "unit {unit}");
+        assert_ne!(was.1, now.1, "unit {unit}");
+    }
 }

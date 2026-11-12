@@ -220,6 +220,69 @@ const fn f<T>(_: Box<T>) {{}}
     assert_eq!(reported(&found), [("E0493", &*destructor("Box<T>"), "_", Some(("}", true)))]);
 }
 
+/// A struct with a destructor, two functions that borrow their parameter mutably and then
+/// return it, and one that borrows it and lets it go.
+fn borrowed_then_moved() -> String {
+    format!(
+        "{DROP}
+struct S {{ keep: bool }}
+impl Drop for S {{
+    fn drop(&mut self) {{}}
+}}
+const fn set(s: &mut S, keep: bool) {{ s.keep = keep; }}
+const fn through_a_call(mut s: S, keep: bool) -> S {{
+    set(&mut s, keep);
+    s
+}}
+const fn through_a_binding(mut s: S, keep: bool) -> S {{
+    let r = &mut s;
+    r.keep = keep;
+    s
+}}
+const fn dropped(mut s: S, keep: bool) {{
+    set(&mut s, keep);
+}}
+"
+    )
+}
+
+/// The invariant: a value borrowed mutably and then moved out of whole is not dropped where
+/// its scope ends, so nothing is refused. The pinned nightly accepts `set(&mut s, keep); s`
+/// (as reth's `SparseStateTrie::with_updates` and
+/// `DatabaseArguments::with_max_read_transaction_duration`, `self.set(..); self`, which
+/// failed the builds of reth-trie-sparse and reth-db with E0493) and refuses `let r = &mut s;
+/// r.keep = keep; s`, by where the blocks of the borrow and the move end (`Flow` in
+/// `const_check/qualifs.rs` says how); here both are accepted. With a borrowed local keeping
+/// its qualif across the move, as before, both report E0493 at `mut s`.
+#[test]
+fn a_value_borrowed_and_then_moved_out_of_is_not_dropped() {
+    let src = borrowed_then_moved();
+    assert_eq!(reported(&check("sized, copy", &src, func("through_a_call"))), NONE);
+}
+
+/// EXPECTED DIFFERENCE from rustc, an open item: the pinned nightly refuses `let r = &mut s;
+/// r.keep = keep; s` in a `const fn` (E0493 at `mut s`, checked with the ten-line program
+/// under nightly-2026-10-27) and blaze accepts it. The owner's rule is that what blaze accepts
+/// builds with rustc unless an extension is opted into, so this is to become rustc's answer:
+/// the exact mirror of `State::join`'s short circuit (the borrowed set joined into a block's
+/// entry only by a join that leaves the qualifs as they were, in rustc's order of blocks),
+/// which refuses this form and still accepts `through_a_call`. When that lands this test
+/// expects `[("E0493", destructor of `S`, "mut s", ..)]`.
+#[test]
+fn expected_difference_a_borrow_bound_to_a_name_then_a_move_is_accepted_where_rustc_refuses() {
+    let src = borrowed_then_moved();
+    assert_eq!(reported(&check("sized, copy", &src, func("through_a_binding"))), NONE);
+}
+
+/// The control of the invariant above: borrowed and not moved out of, the value is dropped
+/// at the end and refused.
+#[test]
+fn a_value_borrowed_and_not_moved_out_of_is_dropped() {
+    let src = borrowed_then_moved();
+    let found = check("sized, copy", &src, func("dropped"));
+    assert_eq!(reported(&found), [("E0493", &*destructor("S"), "mut s", Some(("}", true)))]);
+}
+
 /// `tests/ui/consts/drop_none.rs`: the constant `FOO` is `None`, which has nothing to drop,
 /// whatever its type.
 #[test]

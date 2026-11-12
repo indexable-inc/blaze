@@ -4,7 +4,10 @@
 //!
 //! The front end here is [`Program`] with its [`Engine`]: every edit is a revision, and a kept
 //! describe holds when it was made at or after the last change of what it reads, as a query
-//! engine verifies a memo. The fresh build is of a copy of the program in a database of its
+//! engine verifies a memo. It names exactly what the edits since a view changed
+//! ([`Frontend::changed_since`]), which is all a patched walk asks of, beside the functions
+//! whose describe reads what the engine does not see ([`Frontend::each_build`]): an edit of
+//! one's body is no revision. The fresh build is of a copy of the program in a database of its
 //! own ([`Program::copy`]), so nothing the kept walk did is seen by it.
 
 use std::sync::atomic::Ordering;
@@ -83,6 +86,11 @@ enum Plant {
     Unrenamed,
     /// A bug planted in the patch of the walk or of the lists ([`Planted`]).
     Patch(Planted),
+    /// The engine's changed set leaves out the first function that changed
+    /// ([`Engine::unnamed`]).
+    Unnamed,
+    /// The front end says no function is asked each build ([`Engine::forgets_each_build`]).
+    NotEachBuild,
 }
 
 /// The program's functions, in order: a draw picks among them the same way every run.
@@ -128,7 +136,10 @@ fn apply(
                 FAILS_ITS_CHECK => FAILS_ITS_CHECK + 1,
                 body => body,
             };
-            program.touch(id);
+            // The engine sees no edit of a body whose describe reads beside it.
+            if !program.engine.each_build.contains(&id) {
+                program.touch(id);
+            }
         }
         Edit::AddRef => {
             let (caller, callee) = (pick(a), pick(b));
@@ -153,6 +164,7 @@ fn apply(
             }
             program.bodies.insert(id, (id % 3, false));
             program.touch(id);
+            program.touch_count(id);
             program.functions.get_mut(&caller).expect("picked among them").calls.push(id);
             program.touch(caller);
         }
@@ -171,8 +183,17 @@ fn apply(
                     program.touch(caller);
                 }
             }
-            for calls in program.static_calls.values_mut() {
+            let mut pointed: Vec<u32> = Vec::new();
+            for (value, calls) in program.static_calls.iter_mut() {
+                let before = calls.len();
                 calls.retain(|it| *it != id);
+                if calls.len() != before {
+                    pointed.push(*value);
+                }
+            }
+            pointed.sort_unstable();
+            for value in pointed {
+                program.touch_static(value);
             }
             let mut sites: Vec<u32> = (program.dyn_sites.iter())
                 .filter(|(site, target)| **site == id || **target == id)
@@ -191,6 +212,7 @@ fn apply(
                 let id = statics[a as usize % statics.len()];
                 let value = &mut program.statics.get_mut(&id).expect("picked among them").0;
                 *value = value.wrapping_add(1 + (b % 5) as u8);
+                program.touch_static(id);
             }
         }
         Edit::DynFact => set_fact(program, pick(a), pick(b)),
@@ -221,6 +243,7 @@ fn apply(
                     }
                     None => calls.push(callee),
                 }
+                program.touch_static(value);
             }
         }
         // The roots are the run's: `first_difference` changes them.
@@ -328,7 +351,8 @@ fn difference(
     same!(stats.statics);
     same!(walk.reached);
     // Every function a round of a whole walk reached was described or taken from the kept
-    // walk, once; a patched walk asks only of what is not durable.
+    // walk, once; a patched walk asks only of what the front end names and what is asked
+    // each build.
     if kept.walk.whole.is_some()
         && kept.walk.described + kept.walk.verified != fresh.walk.described
     {
@@ -351,6 +375,8 @@ fn first_difference(
     plant: Option<Plant>,
 ) -> Option<String> {
     program.engine.misses_facts = plant == Some(Plant::DynFact);
+    program.engine.unnamed = plant == Some(Plant::Unnamed);
+    program.engine.forgets_each_build = plant == Some(Plant::NotEachBuild);
     let kept = Kept::new();
     let mut run = run;
     // The functions that stay: `main`, and every function the check may walk from.
@@ -535,10 +561,10 @@ fn drawn(tc: &hegel::TestCase) -> (Program, Run) {
                 // A dependency's function reads library inputs alone.
                 program.engine.durable.insert(id);
             }
-            // A member's function whose inputs are one crate's sources: asked again only
-            // when one of them is written.
+            // A member's function whose describe reads what the engine does not see (what
+            // the build calls a file its body names): asked each build.
             4 => {
-                program.engine.groups.insert(id, u64::from(id % 2));
+                program.engine.each_build.insert(id);
             }
             _ => {}
         }
@@ -569,7 +595,10 @@ fn drawn(tc: &hegel::TestCase) -> (Program, Run) {
 /// walk and the lists the builds before it kept is, after every edit, the build of a walk
 /// that keeps none: every list of the `Built` and its ID are the same, and the same errors
 /// where it is refused; its delta names exactly what changed since the last build of the
-/// same roots, and that build's lists with the delta applied are its own.
+/// same roots, and that build's lists with the delta applied are its own. The patched walk
+/// asks only of what the front end names as changed since the kept walk's view
+/// (`Frontend::changed_since`) and of the functions asked each build, whose body edits the
+/// front end names nowhere: so the walk patched from the named set is the whole walk's.
 #[hegel::test(test_cases = 64)]
 fn a_walk_over_kept_describes_builds_what_a_fresh_walk_builds(tc: hegel::TestCase) {
     use hegel::generators as gs;
@@ -656,9 +685,10 @@ fn describes(program: &Program) -> (usize, usize) {
     (engine.describes.load(Ordering::Relaxed), engine.verifies.load(Ordering::Relaxed))
 }
 
-/// The walk's cost in describes is the edit's, not the program's: of 300 functions, an edit
-/// of one leaf's body describes that leaf alone, and a build after no edit describes nothing.
-/// The first build describes them all and says why ([`Fresh::Restart`]).
+/// The walk's cost in describes and in asks is the edit's, not the program's: of 300
+/// functions, an edit of one leaf's body asks of that leaf alone and describes it, and a
+/// build after no edit asks of nothing. The first build describes them all and says why
+/// ([`Fresh::Restart`]).
 #[test]
 fn an_edit_of_one_leaf_describes_it_alone() {
     const COUNT: usize = 300;
@@ -682,12 +712,12 @@ fn an_edit_of_one_leaf_describes_it_alone() {
     program.touch(COUNT as u32);
     let (edited, asked) = walk(&program);
     // The leaf has a new key: the one of the walk before is the one function dropped.
-    assert_eq!(counts(&edited), (1, COUNT - 1, COUNT, 1));
-    assert_eq!((edited.fresh, edited.whole, asked), (None, None, (1, COUNT - 1)));
+    assert_eq!(counts(&edited), (1, 0, COUNT, 1));
+    assert_eq!((edited.fresh, edited.whole, asked), (None, None, (1, 0)));
 
     let (again, asked) = walk(&program);
-    assert_eq!(counts(&again), (0, COUNT, COUNT, 0));
-    assert_eq!((again.fresh, again.whole, asked), (None, None, (0, COUNT)));
+    assert_eq!(counts(&again), (0, 0, COUNT, 0));
+    assert_eq!((again.fresh, again.whole, asked), (None, None, (0, 0)));
 
     // A new function the leaf calls: the leaf, whose references changed, and the new one.
     program.function(COUNT as u32 + 1, 0x11, &[]);
@@ -695,11 +725,11 @@ fn an_edit_of_one_leaf_describes_it_alone() {
     program.functions.get_mut(&(COUNT as u32)).expect("the last leaf").calls.push(COUNT as u32 + 1);
     program.touch(COUNT as u32);
     let (grown, asked) = walk(&program);
-    // The patch asked of every function, set the leaf's edges again and described the one
-    // function that entered.
+    // The patch asked of the leaf, set its edges again and described the one function that
+    // entered.
     assert_eq!(grown.whole, None);
-    assert_eq!((grown.described, grown.verified, grown.reached), (2, COUNT - 1, COUNT + 1));
-    assert_eq!(asked, (2, COUNT - 1));
+    assert_eq!((grown.described, grown.verified, grown.reached), (2, 0, COUNT + 1));
+    assert_eq!(asked, (2, 0));
 }
 
 /// A build given nothing to keep describes in describes everything and says so.
@@ -784,9 +814,9 @@ fn the_oracle_catches_a_caller_that_names_a_changed_callees_old_key() {
     assert!(found.starts_with("build 1: "), "{found}");
 }
 
-/// The patched walk's work is the edit's: of 10,000 functions of which all but the last
-/// three are durable, an edit of the last leaf's body asks the front end of those three,
-/// describes one, and touches it and the one function that calls it. An edit that adds a
+/// The patched walk's work is the edit's: of 10,000 functions, an edit of the last leaf's
+/// body asks the front end of that leaf, describes it, and touches it and the one function
+/// that calls it. An edit that adds a
 /// call to a function already reached is patched too.
 #[test]
 fn a_leaf_edit_among_ten_thousand_functions_touches_the_leaf_and_its_caller() {
@@ -797,7 +827,6 @@ fn a_leaf_edit_among_ten_thousand_functions_touches_the_leaf_and_its_caller() {
     for id in 2..=COUNT {
         program.functions.get_mut(&id).expect("of the tree").symbol = Some(format!("f{id}"));
     }
-    program.engine.durable.extend(1..=COUNT - 3);
     let kept = Kept::new();
     let walk = |program: &Program| {
         program.begin_build();
@@ -814,8 +843,8 @@ fn a_leaf_edit_among_ten_thousand_functions_touches_the_leaf_and_its_caller() {
     program.touch(COUNT);
     let (edited, asked) = walk(&program);
     assert_eq!(edited.walk.whole, None, "patched");
-    assert_eq!(counts(&edited.walk), (1, 2, COUNT as usize, 1));
-    assert_eq!(asked, (1, 2), "the front end described one function and verified two");
+    assert_eq!(counts(&edited.walk), (1, 0, COUNT as usize, 1));
+    assert_eq!(asked, (1, 0), "the front end described one function and was asked of no other");
     assert_eq!(edited.walk.visited, 2, "the leaf and the function that calls it");
     let leaf = key_named(&edited, COUNT);
     let changes = &edited.delta.functions;
@@ -830,44 +859,68 @@ fn a_leaf_edit_among_ten_thousand_functions_touches_the_leaf_and_its_caller() {
     assert_eq!(grown.walk.reached, COUNT as usize);
 }
 
-/// What one build did, by pass ([`Work`]), without what is linear by design: the rows copied
-/// into the `Built`'s contiguous lists. The bytes hashed are held to a bound of their own,
-/// as a keyed set's path grows with the logarithm of the set.
+/// What one build did, by pass ([`Work`]), its `Built` to be given back or not. The bytes
+/// hashed are held to a bound of their own, as a keyed set's path grows with the logarithm
+/// of the set.
 fn counted_work(built: &Built) -> Work {
     assert!(built.work.patched, "the lists were patched: {:?}", built.walk.whole);
-    assert_eq!(built.work.copied, built.inputs.len() + built.static_owners.len());
     assert!(built.work.hashed <= 64 * 1024, "{} bytes hashed", built.work.hashed);
-    Work { copied: 0, hashed: 0, ..built.work }
+    Work { hashed: 0, ..built.work }
 }
 
-/// The work of three edits of a tree of `count` functions, each under a name of its own (so
-/// dedupe merges none), all durable but the last three, which are asked each build, and
-/// the last one's caller, which hangs on a group of inputs: a leaf's body; a call added from
-/// the last leaf to a function already reached; the last leaf removed.
-fn work_of_three_edits(count: u32) -> [Work; 3] {
+/// The work of four edits of a tree of `count` functions, each under a name of its own (so
+/// dedupe merges none), the two before the last asked each build: the last leaf's body,
+/// twice; a call added from the last leaf to a function already reached; the last leaf
+/// removed. Each build's `Built` is given back to the walks' keeper once it is read, as a
+/// reader done with it does ([`Kept::give_back`]), unless `given` says the reader keeps it.
+fn work_of_four_edits(count: u32, given: bool) -> [Work; 4] {
     let mut program = tree(count);
     for id in 2..=count {
         program.functions.get_mut(&id).expect("of the tree").symbol = Some(format!("f{id}"));
     }
     let caller = count / 2;
-    program.engine.durable.extend((1..=count - 3).filter(|id| *id != caller));
-    program.engine.groups.insert(caller, 7);
+    program.engine.each_build.extend([count - 2, count - 1]);
     let kept = Kept::new();
     let build = |program: &Program| {
         program.begin_build();
         built(program, WHOLE, Some(&kept), None).unwrap_or_else(|e| panic!("{e:?}"))
     };
-    assert!(build(&program).walk.whole.is_some());
+    let back = |built: Built| {
+        if given {
+            kept.give_back(built);
+        }
+    };
+    let first = build(&program);
+    assert!(first.walk.whole.is_some());
+    back(first);
 
+    // The first edit after a whole build: its `Built`'s template entries are made again
+    // from the rows, once, which is the program's and is not held to the edit.
     program.functions.get_mut(&count).expect("the last leaf").body = 0x12;
+    program.touch(count);
+    let warm = build(&program);
+    assert_eq!(warm.delta.functions.added.len(), 1);
+    back(warm);
+
+    program.functions.get_mut(&count).expect("the last leaf").body = 0x13;
     program.touch(count);
     let body = build(&program);
     assert_eq!(body.delta.functions.added.len(), 1);
+    let body_work = counted_work(&body);
+    back(body);
+
+    program.functions.get_mut(&count).expect("the last leaf").body = 0x14;
+    program.touch(count);
+    let again = build(&program);
+    let again_work = counted_work(&again);
+    back(again);
 
     program.functions.get_mut(&count).expect("the last leaf").calls.push(count - 1);
     program.touch(count);
     let edge = build(&program);
     assert_eq!(edge.walk.reached, count as usize);
+    let edge_work = counted_work(&edge);
+    back(edge);
 
     program.functions.remove(&count);
     program.functions.get_mut(&caller).expect("its caller").calls.retain(|it| *it != count);
@@ -877,20 +930,23 @@ fn work_of_three_edits(count: u32) -> [Work; 3] {
     // The leaf, and its caller's old key: the caller's code names what it calls.
     assert_eq!(removed.delta.functions.removed.len(), 2);
     assert_eq!(removed.delta.functions.added.len(), 1);
-    [counted_work(&body), counted_work(&edge), counted_work(&removed)]
+    [body_work, again_work, edge_work, counted_work(&removed)]
 }
 
 /// The invariant: the work of every pass of a build after an edit is the edit's, not the
-/// program's. A leaf's body edit, a call added to a function already reached and a function
-/// removed each count the same work in a program of 100 functions and in one of 10,000, pass
-/// by pass, and each count is a constant and what the edit changed.
+/// program's, the rows written into the `Built`'s lists among it. A leaf's body edit (twice),
+/// a call added to a function already reached and a function removed each count the same
+/// work in a program of 100 functions and in one of 10,000, pass by pass, and each count is a
+/// constant and what the edit changed.
 #[test]
 fn the_work_of_an_edit_is_the_same_among_a_hundred_functions_and_ten_thousand() {
-    let (small, large) = (work_of_three_edits(100), work_of_three_edits(10_000));
+    let (small, large) = (work_of_four_edits(100, true), work_of_four_edits(10_000, true));
     assert_eq!(small, large, "the counts do not grow with the program");
-    for (edit, work) in ["a body", "an added call", "a removed function"].iter().zip(&large) {
-        // Asked: the three functions asked each build and the one of the group written.
-        assert!(work.asked <= 4 && work.groups == 1, "{edit}: {work:?}");
+    let edits = ["a body", "a body again", "an added call", "a removed function"];
+    for (edit, work) in edits.iter().zip(&large) {
+        // Asked: the two functions asked each build and the one the edit changed, which
+        // the front end named and the walk holds.
+        assert_eq!((work.asked, work.each_build, work.named, work.held), (3, 2, 1, 1), "{edit}: {work:?}");
         assert!(work.described <= 2 && work.graph <= 2 && work.claims == 0, "{edit}: {work:?}");
         // The changed function and the functions that refer to it or to what it refers to.
         for count in [work.classified, work.resolved, work.built_in, work.owners] {
@@ -899,12 +955,116 @@ fn the_work_of_an_edit_is_the_same_among_a_hundred_functions_and_ten_thousand() 
         for count in [work.lookups, work.versions, work.deduped, work.reach, work.replaced] {
             assert!(count <= 4, "{edit}: {work:?}");
         }
+        // The rows written into the `Built` given back: those the build removed and made
+        // again, and those the build before it made again.
+        assert!(work.copied <= 8, "{edit}: {} rows written into the `Built`", work.copied);
     }
     // A body edit: the leaf under its new key and its caller, whose place names it.
     assert_eq!((large[0].lookups, large[0].replaced), (2, 3));
     // A function removed: its row and its caller's old one go, and its caller under its
     // new key and the function that calls that one are made again.
-    assert_eq!((large[2].lookups, large[2].replaced), (2, 4));
+    assert_eq!((large[3].lookups, large[3].replaced), (2, 4));
+}
+
+/// The control of the rows written into a `Built`
+/// ([`the_work_of_an_edit_is_the_same_among_a_hundred_functions_and_ten_thousand`]): a
+/// reader that keeps each `Built` leaves the next build none to write into, so its lists are
+/// made from the rows, one a row, and the count says so: it is the program's.
+#[test]
+fn the_count_catches_a_built_made_whole_from_its_rows() {
+    let (small, large) = (work_of_four_edits(100, false), work_of_four_edits(10_000, false));
+    for (small, large) in small.iter().zip(&large) {
+        assert!(small.copied >= 99 && small.copied <= 101, "{small:?}");
+        assert!(large.copied >= 9_999 && large.copied <= 10_001, "{large:?}");
+        assert_eq!(Work { copied: 0, ..*small }, Work { copied: 0, ..*large });
+    }
+}
+
+/// The `Built`s of a run of edits of a tree of 40 functions, each under a name of its own: a
+/// whole build, then a leaf's body, an inner function's body, a call added, a function
+/// removed, a leaf's body. With `want`, each build's `Built` is held to `want`'s of the same
+/// step (but for the rows counted as written into it) and then given back to the walks'
+/// keeper, so the next build writes into it ([`Kept::give_back`]): `Err` says the first
+/// step whose `Built` is another. Without, each is kept by its reader and returned.
+fn builts_of_edits(plant: Option<Plant>, want: Option<&[Built]>) -> Result<Vec<Built>, String> {
+    let mut program = tree(40);
+    for id in 2..=40 {
+        program.functions.get_mut(&id).expect("of the tree").symbol = Some(format!("f{id}"));
+    }
+    let kept = Kept::new();
+    let mut out: Vec<Built> = Vec::new();
+    for step in 0..6 {
+        match step {
+            0 => {}
+            1 => program.functions.get_mut(&40).expect("a leaf").body = 0x21,
+            2 => program.functions.get_mut(&20).expect("an inner function").body = 0x22,
+            3 => program.functions.get_mut(&40).expect("a leaf").calls.push(39),
+            4 => {
+                program.functions.remove(&40);
+                program.functions.get_mut(&20).expect("its caller").calls.retain(|it| *it != 40);
+            }
+            _ => program.functions.get_mut(&39).expect("a leaf").body = 0x23,
+        }
+        match step {
+            0 => {}
+            1 | 3 => program.touch(40),
+            2 | 4 => program.touch(20),
+            _ => program.touch(39),
+        }
+        program.begin_build();
+        let plant = if step == 0 { None } else { plant };
+        let mut built =
+            built(&program, WHOLE, Some(&kept), plant).unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(built.walk.whole.is_some(), step == 0, "step {step}");
+        let Some(want) = want else {
+            out.push(built);
+            continue;
+        };
+        let copied = std::mem::replace(&mut built.work.copied, want[step].work.copied);
+        if built != want[step] {
+            return Err(format!(
+                "build {step}: the `Built` written into is not the one made from its rows: {} \
+                 inputs, {} functions, {} names, {} symbols against {}, {}, {} and {}",
+                built.inputs.len(),
+                built.functions.len(),
+                built.debug_names.len(),
+                built.symbols.len(),
+                want[step].inputs.len(),
+                want[step].functions.len(),
+                want[step].debug_names.len(),
+                want[step].symbols.len(),
+            ));
+        }
+        if step > 1 {
+            assert!(copied <= 8, "step {step}: {copied} rows written into the `Built` given back");
+        }
+        built.work.copied = copied;
+        kept.give_back(built);
+    }
+    Ok(out)
+}
+
+/// The refinement: the `Built` a build gives by writing its changed rows into the one given
+/// back ([`Kept::give_back`]) is, list for list, the `Built` it gives by making every list
+/// from its rows (a reader that keeps each `Built`), for a body edit of a leaf and of an
+/// inner function, a call added and a function removed, the whole build's `Built` the first
+/// one written into.
+#[test]
+fn a_built_given_back_and_written_into_is_the_built_made_from_its_rows() {
+    let want = builts_of_edits(None, None).expect("each `Built` made from its rows");
+    assert!(want.iter().skip(1).all(|it| it.work.copied >= 39), "made from the rows, each one");
+    builts_of_edits(None, Some(&want)).unwrap_or_else(|why| panic!("{why}"));
+}
+
+/// The control of [`a_built_given_back_and_written_into_is_the_built_made_from_its_rows`]:
+/// the rows a build removed left in the `Built` given back (the planted bug) are a `Built`
+/// with more functions than its rows, which the first edit shows.
+#[test]
+fn the_oracle_catches_a_built_given_back_that_keeps_a_removed_row() {
+    let want = builts_of_edits(None, None).expect("each `Built` made from its rows");
+    let plant = Some(Plant::Patch(Planted::StaleBuilt));
+    let why = builts_of_edits(plant, Some(&want)).expect_err("the oracle missed a row left behind");
+    assert!(why.starts_with("build 1:"), "{why}");
 }
 
 /// The control of [`the_work_of_an_edit_is_the_same_among_a_hundred_functions_and_ten_thousand`]:
@@ -1058,4 +1218,130 @@ fn an_added_and_a_removed_function_are_patched() {
     let gone = [key_named(&grown, 3), key_named(&grown, 5)];
     assert!(gone.iter().all(|key| shrunk.delta.functions.removed.contains(key)));
     assert_eq!(shrunk.walk.dropped, shrunk.delta.functions.removed.len());
+}
+
+/// What the patched walk after an edit of the last leaf's body, among `count` functions,
+/// asked of ([`Work`]): how many functions, how many the front end named and how many of
+/// those the walk held.
+fn asked_after_a_leaf_edit(count: u32, names_no_set: bool) -> (usize, usize, usize, usize) {
+    let mut program = tree(count);
+    program.engine.names_no_set = names_no_set;
+    let kept = Kept::new();
+    let build = |program: &Program| {
+        program.begin_build();
+        built(program, WHOLE, Some(&kept), None).unwrap_or_else(|e| panic!("{e:?}"))
+    };
+    assert!(build(&program).walk.whole.is_some());
+    program.functions.get_mut(&count).expect("the last leaf").body = 0x12;
+    program.touch(count);
+    let edited = build(&program);
+    assert_eq!(edited.walk.whole, None, "patched");
+    let work = edited.work;
+    (work.asked, work.named, work.held, work.each_build)
+}
+
+/// The invariant: a patched walk asks of what the front end names as changed, not of what
+/// it holds. With one function edited it asks of one, among 100 functions and among 10,000.
+/// The cause removed (rule test-the-cause): a front end that tells no view, and so names no
+/// changed set, is asked of every function, and the count says so.
+#[test]
+fn an_edit_of_one_function_asks_of_it_alone_among_a_hundred_and_ten_thousand() {
+    for count in [100, 10_000] {
+        assert_eq!(asked_after_a_leaf_edit(count, false), (1, 1, 1, 0), "of {count}");
+        assert_eq!(asked_after_a_leaf_edit(count, true), (count as usize, 0, 0, 0), "of {count}");
+    }
+}
+
+/// The control of the refinement for the changed set: an edit of 4's body is one the engine
+/// must name. A changed set that leaves 4 out has the walk ask of nothing, so 4 is built as
+/// it was; the oracle says so. Its dependents are held by controls of their own: a caller
+/// that keeps the changed callee's old key
+/// ([`the_oracle_catches_a_caller_that_names_a_changed_callees_old_key`]) and a function
+/// made of a template that names it
+/// ([`the_oracle_catches_a_kept_template_used_after_its_callees_key_changed`]).
+#[test]
+fn the_oracle_catches_a_changed_function_the_set_does_not_name() {
+    let edits = [(Edit::Body, (3, 0))];
+    assert_eq!(first_difference(program(), WHOLE, &edits, None), None);
+    let found = first_difference(program(), WHOLE, &edits, Some(Plant::Unnamed))
+        .expect("the planted bug was not found");
+    assert!(found.starts_with("build 1: "), "{found}");
+}
+
+/// A function asked each build is found changed though the front end names nothing: 4's
+/// describe reads what the engine does not see, and an edit of its body is no revision. The
+/// control: a front end that says no function is asked each build leaves 4 as it was, and
+/// the oracle says so.
+#[test]
+fn the_oracle_catches_a_function_asked_each_build_that_is_not_asked() {
+    let each_build = || {
+        let mut program = program();
+        program.engine.each_build.insert(4);
+        program
+    };
+    let edits = [(Edit::Body, (3, 0))];
+    assert_eq!(first_difference(each_build(), WHOLE, &edits, None), None);
+    let found = first_difference(each_build(), WHOLE, &edits, Some(Plant::NotEachBuild))
+        .expect("the planted bug was not found");
+    assert!(found.starts_with("build 1: "), "{found}");
+}
+
+/// A changed count is asked of every function of its instance: 5 becomes an instance of the
+/// body 2 and 4 are of, under a limit of one repeat, and the patched build is the fresh
+/// one's, asking of 5 alone.
+#[test]
+fn a_changed_count_asks_of_the_functions_of_its_instance() {
+    let mut program = program();
+    for id in [2, 4] {
+        program.bodies.insert(id, (7, false));
+    }
+    program.recursion_limit = Some(1);
+    let kept = Kept::new();
+    program.begin_build();
+    built(&program, WHOLE, Some(&kept), None).unwrap_or_else(|e| panic!("{e:?}"));
+    program.bodies.insert(5, (7, false));
+    program.touch_count(5);
+    program.begin_build();
+    let over_kept = built(&program, WHOLE, Some(&kept), None);
+    assert_eq!(difference(&over_kept, &built(&program.copy(), WHOLE, None, None)), None);
+    let work = over_kept.unwrap_or_else(|e| panic!("{e:?}")).work;
+    assert_eq!((work.asked, work.named, work.held), (1, 1, 1));
+}
+
+/// A front end that tells a view and cannot name what changed since it stops the build with
+/// an error saying so and why: there is no walk that asks of every function in the changed
+/// set's place (rule no-fallback). Nothing kept is lost to the refusal: once the front end
+/// names its set again the next build patches the same walk, and asks of the one function
+/// edited.
+#[test]
+fn a_front_end_that_loses_its_changed_set_is_refused_and_no_function_is_asked() {
+    let mut program = tree(100);
+    let kept = Kept::new();
+    let build = |program: &Program| {
+        program.begin_build();
+        built(program, WHOLE, Some(&kept), None)
+    };
+    assert!(build(&program).unwrap_or_else(|e| panic!("{e:?}")).walk.whole.is_some());
+    program.functions.get_mut(&100).expect("the last leaf").body = 0x12;
+    program.touch(100);
+    program.engine.loses_its_set = true;
+    let before = program.engine.describes.load(Ordering::Relaxed);
+    let errors = match build(&program) {
+        Err(errors) => errors,
+        Ok(built) => panic!("built with no changed set: {:?}", built.walk),
+    };
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    let what = &errors[0].what;
+    assert!(what.contains("could not name what changed"), "{what}");
+    assert!(what.contains("the test's engine lost its changed set"), "the front end's reason: {what}");
+    assert_eq!(
+        program.engine.describes.load(Ordering::Relaxed),
+        before,
+        "the refused build described nothing"
+    );
+    program.engine.loses_its_set = false;
+    let edited = build(&program).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(edited.walk.whole, None, "the kept walk went back as it was");
+    assert_eq!((edited.work.asked, edited.work.named, edited.work.held), (1, 1, 1));
+    assert!(edited.work.patched, "the kept lists went back too");
 }

@@ -509,6 +509,34 @@ fn plain(v: Vec<u8>) -> usize {
 }
 
 #[test]
+fn needless_pass_by_value_leaves_a_consumes_fn_alone() {
+    // A `#[blaze::consumes]` function ends a linear value by taking it: `join` takes its two
+    // handles apart, which moves nothing (their fields are `Copy`), and a reference could not
+    // end the handle (blaze-std's `Shares::join`, blaze checking blaze, 2026-11-11).
+    let fixture = fixture(
+        "sized, copy, clone, fn",
+        "#![feature(register_tool)]
+#![register_tool(blaze)]
+#[blaze::linear]
+struct Part {
+    at: u32,
+}
+#[blaze::consumes]
+fn join(a: Part, b: Part) -> Part {
+    let Part { at } = a;
+    let Part { at: _same } = b;
+    Part { at }
+}
+fn unmarked(v: Vec<u8>) -> usize {
+    v.len()
+}",
+    );
+    let found = lint(&fixture, &only("needless_pass_by_value"));
+    assert_eq!(found.matches("this argument is passed by value").count(), 1, "{found}");
+    assert!(found.contains(" --> src/lib.rs:13:16\n"), "the unmarked fn is still linted: {found}");
+}
+
+#[test]
 fn needless_pass_by_value_local_type() {
     let fixture = fixture(
         "sized, copy, clone, fn",

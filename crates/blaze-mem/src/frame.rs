@@ -54,7 +54,7 @@ use std::{
     panic::Location,
     ptr::{self, NonNull},
     slice, str,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 use crate::{
@@ -1744,6 +1744,35 @@ pub fn spare_bytes() -> usize {
 /// to the kernel: what a worker does when it goes idle after a burst.
 pub fn trim_spare(keep: usize) {
     _ = SHELF_OF.try_with(|shelf| shelf.trim(keep));
+}
+
+/// How many times every thread was asked to let its warm frame memory go ([`ask_spare_trim`]).
+static SPARE_TRIMS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// The last [`ask_spare_trim`] this thread answered ([`settle_spare`]). `const`, with no
+    /// destructor.
+    static SPARE_TRIMMED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Asks every thread to give its warm frame memory ([`WARM`] at most, a thread) back to the
+/// kernel: each does as it next goes idle ([`settle_spare`]). What a daemon with nothing to do
+/// asks, since the shelves are charged to no task and an idle daemon's next task can wait for
+/// the page faults. It wakes nobody and waits for nobody.
+pub fn ask_spare_trim() {
+    SPARE_TRIMS.fetch_add(1, Ordering::Release);
+}
+
+/// Gives the calling thread's warm frame memory back if [`ask_spare_trim`] was called since
+/// it last did; one load and a thread-local compare otherwise. What a pool worker does as it
+/// goes idle, outside any task. Whether it trimmed.
+pub fn settle_spare() -> bool {
+    let asked = SPARE_TRIMS.load(Ordering::Acquire);
+    if SPARE_TRIMMED.try_with(|done| done.replace(asked) == asked).unwrap_or(true) {
+        return false;
+    }
+    trim_spare(0);
+    true
 }
 
 /// Bytes the calling thread's task frames hold of the [`Cap`] now.

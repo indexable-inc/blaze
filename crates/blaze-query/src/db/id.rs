@@ -31,7 +31,12 @@ impl Id {
     /// [`Id::MAX_U32`], past every page a storage has. What a reader of bits it did not make
     /// (a persisted record, a restored image, a question from outside) goes through, so a
     /// corrupt word becomes its own typed error rather than a panic.
+    ///
+    /// It cannot panic or allocate (`#[blaze::nopanic]`, `#[blaze::noalloc]`): a word from a
+    /// file is refused here, as a value, or this does not compile.
     #[inline]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
     pub const fn new(bits: u32) -> Option<Id> {
         match NonZeroU32::new(bits) {
             Some(id) if bits <= Id::MAX_U32 => Some(Id(id)),
@@ -43,7 +48,20 @@ impl Id {
     /// and `what` names the field: [`FormatError::Zero`] for 0, and for any word past
     /// [`Id::MAX_U32`] (a corrupt or foreign word) [`FormatError::Bound`] naming the word and
     /// the bound.
+    ///
+    /// The contract: an ID it gives is the word it was given, and a word it refuses is 0 or
+    /// past [`Id::MAX_U32`]; so no word decodes to another ID, and none to an ID no storage
+    /// could give. It cannot panic or allocate, as [`Id::new`].
+    ///
+    /// The contract is held by a property test over any word
+    /// (`a_decoded_id_is_its_word_and_a_refused_word_is_no_id`), not written as an `ensures`:
+    /// a clause checked at run time ends in an abort where it fails
+    /// (docs/v2/plan/design/contracts.md), which `#[blaze::nopanic]` rightly refuses, and a
+    /// decoder of a file's words is the code that must not have one. It becomes an `ensures`
+    /// once a proved clause builds no check.
     #[inline]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
     pub fn decode(word: u64, at: u64, what: &'static str) -> Result<Id, FormatError> {
         match u32::try_from(word).ok().and_then(Id::new) {
             Some(id) => Ok(id),

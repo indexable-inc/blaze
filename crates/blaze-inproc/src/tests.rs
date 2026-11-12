@@ -1655,5 +1655,144 @@ mod linux {
             assert!(memory.lock().processes.is_empty());
             let _ = std::fs::remove_dir_all(&dir);
         }
+
+        /// The invariant: a launch of a program whose file the build placed at its path
+        /// writes nothing there (the file is the same file, byte for byte, with the same
+        /// inode and time, so the build's placement and its outputs' watch see no change),
+        /// and once its process has attached and exited nothing of the launch is left: no
+        /// grant waiting, no start kept, no process on the memory, no thread of the host's
+        /// or the program's. So any number of `blaze run`s leave the daemon as it was.
+        #[test]
+        fn launches_of_a_placed_executable_write_nothing_and_leave_nothing_behind() {
+            let (held, moved) = launches_leave(Planted::Nothing);
+            assert_eq!(held, Held::default(), "after {LAUNCHES} launches");
+            assert!(!moved, "the placed file was written by a launch");
+        }
+
+        /// The control: a launch whose process is never said to have exited keeps its start
+        /// and its process on the memory, and the oracle counts them.
+        #[test]
+        fn the_oracle_catches_a_launch_never_said_exited() {
+            let (held, moved) = launches_leave(Planted::NeverExited);
+            assert_eq!((held.starts, held.processes), (LAUNCHES, 1), "{held:?}");
+            assert!(!moved);
+        }
+
+        /// The control: a launch that is not told what the build placed writes the file,
+        /// and the oracle sees it moved.
+        #[test]
+        fn the_oracle_catches_a_launch_that_writes_the_placed_file() {
+            let (held, moved) = launches_leave(Planted::NotToldPlaced);
+            assert_eq!(held, Held::default());
+            assert!(moved, "a launch told of no placement writes the executable");
+        }
+
+        const LAUNCHES: usize = 24;
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Planted {
+            Nothing,
+            NeverExited,
+            NotToldPlaced,
+        }
+
+        /// What launches left behind, each a count.
+        #[derive(Default, PartialEq, Eq, Debug)]
+        struct Held {
+            waiting: usize,
+            starts: usize,
+            processes: usize,
+            handshakes: usize,
+            starting: usize,
+        }
+
+        /// [`LAUNCHES`] launches of a program whose executable is at its path already, each
+        /// attached by a start hook played here and then ended: what they left, and whether
+        /// the file at the path is another than before (its bytes, inode, length or time).
+        fn launches_leave(planted: Planted) -> (Held, bool) {
+            use std::os::unix::fs::MetadataExt;
+            let name = match planted {
+                Planted::Nothing => "placed",
+                Planted::NeverExited => "placed-kept",
+                Planted::NotToldPlaced => "placed-written",
+            };
+            let Some(memory) = laid_out(name) else {
+                // No code memory on this platform: what the invariant's test and each
+                // control expect of one.
+                return match planted {
+                    Planted::Nothing => (Held::default(), false),
+                    Planted::NeverExited => {
+                        (Held { starts: LAUNCHES, processes: 1, ..Held::default() }, false)
+                    }
+                    Planted::NotToldPlaced => (Held::default(), true),
+                };
+            };
+            let page = memory.page();
+            let own = memory.layout().unwrap().clone();
+            let dir = temp_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            let host = Arc::new(Host::new(&dir.join("host")).unwrap());
+            let memory = Arc::new(Lock::new("inproc.test.memory", memory));
+            let (sessions, got) = crossbeam_channel::unbounded();
+            let key = [7; 32];
+            let image = Image { key, len: 2 * page, store: None };
+            let program = Program::new(host.clone(), memory.clone(), image, sessions);
+            // The build's placement: the same bytes, a file of the build's own making.
+            let path = dir.join("prog");
+            std::fs::write(&path, an_executable(page)).unwrap();
+            let identity = |path: &std::path::Path| {
+                let meta = std::fs::metadata(path).unwrap();
+                (meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec(), std::fs::read(path).unwrap())
+            };
+            let before = identity(&path);
+            let placed = match planted {
+                Planted::NotToldPlaced => None,
+                _ => Some(key),
+            };
+            for _ in 0..LAUNCHES {
+                let command = Command {
+                    program: path.clone(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    dir: dir.clone(),
+                    stdin: Vec::new(),
+                    sandbox: Sandbox::Off,
+                    memory: None,
+                };
+                let (spawned, started, wrote) =
+                    program.command_placed(command, false, placed).unwrap();
+                match planted {
+                    Planted::NotToldPlaced => assert_ne!(wrote, Wrote::Placed),
+                    _ => assert_eq!(wrote, Wrote::Placed),
+                }
+                let (channel, ..) = play_hook(&spawned, &own, 0);
+                let session = got.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+                // The process ends: its channel hangs up, its session is let go, and its
+                // launcher says it exited.
+                drop(channel);
+                drop(session);
+                if planted != Planted::NeverExited {
+                    program.exited(started);
+                }
+            }
+            // The threads of the last launches end on their own, a moment after their
+            // sessions were handed over: bounded, 10 s.
+            let ended = std::time::Instant::now() + Duration::from_secs(10);
+            while (host.handshakes() != 0 || program.starting() != 0)
+                && std::time::Instant::now() < ended
+            {
+                std::thread::yield_now();
+            }
+            let held = Held {
+                waiting: host.waiting(),
+                starts: program.starts_held(),
+                processes: memory.lock().processes.len(),
+                handshakes: host.handshakes(),
+                starting: program.starting(),
+            };
+            let moved = identity(&path) != before;
+            let _ = std::fs::remove_dir_all(&dir);
+            (held, moved)
+        }
     }
 }

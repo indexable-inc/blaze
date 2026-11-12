@@ -6,7 +6,7 @@
 
 use std::io::IsTerminal as _;
 
-use blaze_report::terminal::{Color, Config, Terminal};
+use blaze_report::terminal::{Config, Terminal};
 
 /// `[terminal]` of blaze's `config.toml`, its defaults where there is no file. A file that can't
 /// be read, or that says what `[terminal]` does not take, is an error naming it.
@@ -22,22 +22,9 @@ pub fn config() -> Result<Config, String> {
     }
 }
 
-/// The `--color` a command takes from `config` where it gives none and `CARGO_TERM_COLOR` says
-/// nothing: `--color`, then `CARGO_TERM_COLOR`, then `[terminal] color`.
-pub fn color_flag<'a>(
-    flag: Option<&'a str>,
-    config: &Config,
-    var: impl Fn(&str) -> Option<String>,
-) -> Option<&'a str> {
-    if flag.is_some() || var("CARGO_TERM_COLOR").is_some() {
-        return flag;
-    }
-    match config.color {
-        Color::Always => Some("always"),
-        Color::Never => Some("never"),
-        Color::Auto => None,
-    }
-}
+// The `--color` a command takes from `config` where it gives none and `CARGO_TERM_COLOR` says
+// nothing: blaze-thin's, which the thin `blaze` asks too.
+pub use blaze_thin::request::color_flag;
 
 /// What stderr's terminal does under `config`, its colour as the command decided it (`color`).
 pub fn stderr(config: &Config, color: bool) -> Terminal {

@@ -111,7 +111,7 @@ impl SourceFile {
 
 /// What a job's work is, as far as its units' work differs by it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Goal {
+pub enum JobKind {
     /// Stops after the front end.
     Check,
     Build,
@@ -130,7 +130,7 @@ pub struct Selection<'a> {
     /// Every test, not only those the change reached.
     pub all: bool,
     /// Each test run in blaze's MIR evaluator, checked for undefined behavior. The job's
-    /// units were checked only ([`Goal::Check`]): `built` is empty, nothing is linked.
+    /// units were checked only ([`JobKind::Check`]): `built` is empty, nothing is linked.
     pub ub: Option<Ub>,
 }
 
@@ -174,7 +174,12 @@ pub struct JobInput {
     /// How many of the functions blaze could not compile an error names, every one with `None`
     /// ([`blaze_api::Cargo::refused`]; [`crate::REFUSED_SHOWN`] for an agent's request).
     pub refused: Option<u32>,
-    pub goal: Goal,
+    pub kind: JobKind,
+    /// The request's `--goal` ([`blaze_api::Targets::goal`]): what its build waits for, tier 0
+    /// code or optimized code (docs/v2/plan/design/tiers.md). `None` for each profile's own
+    /// ([`blaze_api::Goal::of_profile`]); the goal of one unit is
+    /// `unit::codegen::goal`'s to say.
+    pub goal: Option<blaze_api::Goal>,
     /// Set once the job is cancelled: long work looks at it between pieces and stops with
     /// [`Failed::Again`], which the loop drops for a cancelled job.
     pub cancelled: Arc<AtomicBool>,
@@ -253,9 +258,54 @@ pub struct Output {
     pub key: blaze_cas::Key,
     pub executable: bool,
     /// The file itself, where this compile linked it: the loop places it from these bytes
-    /// (`blaze_cas::Store::place_made`), never from a file of the store. None for a file the
-    /// store places from its value (a library, a record replayed).
-    pub made: Option<Arc<blaze_cas::Sparse>>,
+    /// ([`Made`]), never from a file of the store. None for a file the store places from its
+    /// value (a library, a record replayed).
+    pub made: Option<Arc<Made>>,
+}
+
+/// A file a compile linked, as the loop places it ([`Output::made`]).
+pub enum Made {
+    /// The whole file, as the runs of it that hold bytes: written into a file of holes
+    /// (`blaze_cas::Store::place_made`). An image's first link, or one from scratch.
+    Whole(blaze_cas::Sparse),
+    /// What a link changed of the file before it: the file of key `base` with `file`'s runs
+    /// written over it, cut to `file`'s length. Where the path holds the file of `base` as
+    /// the loop placed it, the place is a clone of it with those runs written
+    /// (`blaze_cas::Store::place_patched`): a few kilobytes for a one-function edit,
+    /// whatever the file's length. Where it does not (nothing was placed there by this
+    /// daemon, a place failed, the file was changed or removed since), `whole` makes the
+    /// file's runs and it is placed as [`Made::Whole`] is: one route, picked by what the
+    /// path holds, and said on the place's span.
+    Patch { base: blaze_cas::Key, file: blaze_cas::Sparse, whole: Whole },
+}
+
+/// The whole of a file a link patched, as the runs of it that hold bytes: read from what
+/// the link holds of it when asked, on the loop's thread, and only when asked.
+pub type Whole = Arc<dyn Fn() -> blaze_cas::Sparse + Send + Sync>;
+
+impl PartialEq for Made {
+    fn eq(&self, other: &Made) -> bool {
+        match (self, other) {
+            (Made::Whole(a), Made::Whole(b)) => a == b,
+            (Made::Patch { base: a, file: x, .. }, Made::Patch { base: b, file: y, .. }) => {
+                a == b && x == y
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Made {}
+
+impl std::fmt::Debug for Made {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Made::Whole(file) => write!(f, "Whole({} bytes in {} runs of {})", file.bytes(), file.runs.len(), file.len),
+            Made::Patch { base, file, .. } => {
+                write!(f, "Patch({} bytes in {} runs of {} over {base:?})", file.bytes(), file.runs.len(), file.len)
+            }
+        }
+    }
 }
 
 /// What came of one unit's compile.
@@ -291,9 +341,10 @@ pub struct Compiled {
     /// A device unit's MSL (`blaze_units::UnitPlan::gpu_msl`), as it made or kept it: the loop
     /// asks the job's [`Writer::gpu_msl`] with it. None for any other unit.
     pub gpu_msl: Option<Vec<u8>>,
-    /// Each image the compile linked, by its path, and how the link reached it: what the job's
-    /// [`blaze_api::Worked`] says, and the bench fails an edit by.
-    pub links: Vec<(String, Linking)>,
+    /// Each image the compile linked, by its path, how the link reached it, and its goal with
+    /// how many of its functions are optimized (none for build-time code and wasm, which no
+    /// goal reaches): what the job's [`blaze_api::Worked`] says, and the bench fails an edit by.
+    pub links: Vec<(String, Linking, Option<blaze_api::Tiers>)>,
     /// Why its record and each template its codegen missed were not in the store, each with
     /// its subject within the unit ([`blaze_kernel::Miss`]): what `blaze why` explains once
     /// the build ends. Empty for a unit its record replayed.
@@ -682,9 +733,17 @@ pub trait Steps: Sized + Send + Sync + 'static {
     }
     /// On the loop: `blaze run`'s start of the built program at `program` as process `pid`
     /// ([`blaze_api::Request::Launch`]): the variables it runs on the daemon's code memory
-    /// with, or `None` for a program that is no dev executable and runs its file.
-    fn launch(&self, program: &str, pid: u32) -> Result<Option<Vec<(String, String)>>, ApiError> {
-        let _ = (program, pid);
+    /// with, or `None` for a program that is no dev executable and runs its file. `placed`
+    /// is the content key of the output the jobs placed at `program` and found unchanged at
+    /// their last look ([`crate::serve::job::Jobs::placed_key`]): a launch of that very file
+    /// writes nothing.
+    fn launch(
+        &self,
+        program: &str,
+        pid: u32,
+        placed: Option<[u8; 32]>,
+    ) -> Result<Option<Vec<(String, String)>>, ApiError> {
+        let _ = (program, pid, placed);
         Ok(None)
     }
     /// On the loop, once at start: the queries of the daemon's database.
@@ -958,7 +1017,7 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
     /// whether nothing of it will be made again (cargo's `Fresh`).
     fn fresh(&self, unit: usize) -> bool;
     /// On a worker: phase `phase` of unit `unit` (any mode but `RunCustomBuild`), which is
-    /// checked and, unless the goal is [`Goal::Check`] or the unit is a check, compiled and
+    /// checked and, unless the job is a [`JobKind::Check`] or the unit is a check, compiled and
     /// linked. Every unit it depends on is done, the runs of build scripts it depends on
     /// applied, and the phases before `phase` ([`Phase`]) are done; what each made waits for
     /// the next with the front. [`Phase::Store`] gives the compile; every other phase none.
@@ -1046,7 +1105,7 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
         writer: S::Writer,
         images: &[(&'static str, u64, u64)],
     ) -> Result<Vec<Table>, Failed>;
-    /// On a worker, once every unit of a [`Goal::Check`] build is checked and every build
+    /// On a worker, once every unit of a [`JobKind::Check`] build is checked and every build
     /// script's run and proc macro's load applied, for `blaze doc`: the documentation of the crates
     /// `cargo doc` documents for the check's root units (`blaze-doc`), and unless `no_deps` of
     /// every library they depend on, made through the job's `writer`, the front end's last use,

@@ -65,6 +65,7 @@ fn span(
         unit: None,
         awaits: None,
         owner: None,
+        owned_by: None,
         job: None,
         creator: None,
         start_ns,
@@ -495,6 +496,76 @@ fn a_thread_no_switch_names_is_a_lane_running_between_its_wait_spans() {
         ]
     );
     assert_eq!(span_time(&m, 1).uncovered_ns(), 20);
+}
+
+/// A client (process 8) waits from 5 to 90 for its daemon (process `P`), whose loop thread
+/// plans from 6 to 50 and makes the answer from 84 to 88: the client's `wait` and the daemon's
+/// spans, `daemon_answers` leaving the answer span out.
+fn client_and_daemon(daemon_answers: bool) -> Model {
+    const CLIENT: u32 = 8;
+    let command = SpanIn { process: CLIENT, ..span(50, 1, None, "client: blaze build", 0, 100) };
+    let mut wait = SpanIn { process: CLIENT, depth: 1, ..span(50, 2, Some(1), WAIT_SPAN, 5, 85) };
+    wait.awaits = Some("io the daemon's answer to the request".into());
+    wait.owned_by = Some(OwnedBy::Daemon);
+    // An answer of the client's own process is never what its wait for the daemon waited on.
+    let own = SpanIn { process: CLIENT, ..span(51, 3, None, ANSWER_SPAN, 60, 5) };
+    let plan = span(10, 1, None, "loop: plan", 6, 44);
+    let mut spans = vec![command, wait, own, plan];
+    if daemon_answers {
+        spans.push(span(10, 2, None, ANSWER_SPAN, 84, 4));
+    }
+    model(vec![], spans, Some((0, 100)))
+}
+
+#[test]
+fn the_critical_path_crosses_from_a_clients_wait_into_the_daemons_answer() {
+    let m = client_and_daemon(true);
+    let client = m.lane(LaneId::Thread { process: 8, thread: 50 }).unwrap();
+    let daemon = m.lane(LaneId::Thread { process: P, thread: 10 }).unwrap();
+    let [wait] = &m.waits[..] else { panic!("the client's wait is the one wait: {:?}", m.waits) };
+    assert_eq!(wait.lane, client);
+    assert_eq!(wait.waker, Waker::Answer { lane: daemon }, "the daemon's answer ended the wait");
+    assert_eq!(wait.waker.name(), "answer");
+    let path = path::critical(&m);
+    let on = |lane: usize, kind: LinkKind| {
+        path.links
+            .iter()
+            .filter(|it| it.lane == lane && it.kind == kind)
+            .map(|it| (it.from_ns, it.to_ns))
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        on(client, LinkKind::Waited).is_empty(),
+        "the wait is crossed, not a link of its own: {:?}",
+        path.links
+    );
+    assert_eq!(
+        on(daemon, LinkKind::Ran),
+        [(6, 50), (84, 88)],
+        "the daemon's work stands on the path in the wait's place"
+    );
+    assert_eq!(on(client, LinkKind::Wake), [(88, 90)], "from the answer to the client's resume");
+    assert_eq!(on(client, LinkKind::Ran), [(90, 100)]);
+    assert!(path.links.iter().any(|it| it.wakes == Some(0)), "a link says it woke the wait");
+}
+
+/// The control of the crossing: with no answer of the daemon's in the record the wait names the
+/// daemon and is crossed to nothing (never to another lane guessed in its place), and stands on
+/// the path as its own link.
+#[test]
+fn a_clients_wait_with_no_answer_in_the_record_is_a_link_of_its_own() {
+    let m = client_and_daemon(false);
+    let client = m.lane(LaneId::Thread { process: 8, thread: 50 }).unwrap();
+    let [wait] = &m.waits[..] else { panic!("the client's wait is the one wait: {:?}", m.waits) };
+    assert_eq!(wait.waker, Waker::Unknown, "its own process's answer span is not the daemon's");
+    let path = path::critical(&m);
+    let waited: Vec<_> = path
+        .links
+        .iter()
+        .filter(|it| it.lane == client && it.kind == LinkKind::Waited)
+        .map(|it| (it.from_ns, it.to_ns))
+        .collect();
+    assert_eq!(waited, [(5, 90)]);
 }
 
 #[test]

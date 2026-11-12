@@ -139,7 +139,7 @@ impl Visitor<'_, '_, '_> {
     fn expr(&mut self, expr: ExprId) {
         let b = self.b;
         let store = b.store();
-        if self.is_op(b.source_map.expr_syntax(expr).ok()) || is_unsafe_call(b, expr) {
+        if self.is_op(b.source_map().expr_syntax(expr).ok()) || is_unsafe_call(b, expr) {
             self.requires_unsafe();
         }
         match store.expr(expr) {
@@ -208,7 +208,7 @@ impl Visitor<'_, '_, '_> {
 
     fn pat(&mut self, pat: PatId) {
         let b = self.b;
-        if self.is_op(b.source_map.pat_syntax(pat).ok()) {
+        if self.is_op(b.source_map().pat_syntax(pat).ok()) {
             self.requires_unsafe();
         }
         match b.store().pat(pat) {

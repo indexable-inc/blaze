@@ -102,6 +102,8 @@ tar = { workspace = true, features = ["default"] }
 zip = { workspace = true, features = ["deflate-flate2"] }
 # The `.tar.gz` files build scripts download (FFmpeg's source, `cargo/fetches.rs`).
 flate2 = { workspace = true, features = ["default"] }
+# A flight recording's body is one zstd frame (`serve/flightrec.rs`).
+zstd.workspace = true
 # The `.tar.xz` files of blaze's own toolchain (`cargo/toolchain/own.rs`): in Rust, within 1.3x
 # of liblzma's time on rustc's 84 MB.
 lzma-rust2 = { workspace = true, features = ["std", "xz", "optimization"] }
@@ -109,6 +111,10 @@ blaze-live.workspace = true
 # blaze v2's daemon (`serve`): the agent API, the sans-IO core and its drivers, the VFS, the
 # query database, the store, the workspace load's queries, user code, codegen and the linker.
 blaze-api.workspace = true
+# What the thin `blaze` and this CLI must say and send alike, each written once there: the
+# status and `Finished` lines, the color rule, the request of a plain build or run, and what
+# the thin `blaze` hands a command it began to this one with (`cli/resume.rs`).
+blaze-thin.workspace = true
 blaze-core.workspace = true
 blaze-vfs.workspace = true
 blaze-query.workspace = true
@@ -152,6 +158,8 @@ tempfile.workspace = true
 hegeltest.workspace = true
 # minicore, the `core` of the gpu dependency's end-to-end test (`serve/unit/tests/gpu.rs`).
 test-utils.workspace = true
+# A database of a fixture's files, for a unit's check run again (`serve/unit/checks/tests.rs`).
+hir-expand = { workspace = true, features = ["fixture"] }
 
 [target.'cfg(windows)'.dependencies]
 uds_windows.workspace = true

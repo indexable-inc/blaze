@@ -36,10 +36,6 @@ use crate::check::Cx;
 
 const LINT: Lint = Lint::SyscallInLoop;
 
-/// The most steps followed from a call to the stat or open it reaches, to name that (the walk
-/// itself is bounded by its memo; this bounds only the naming, rule 18).
-const LONGEST_CHAIN: usize = 24;
-
 /// The crates whose file system work is batched, besides those denying `blaze::hot`.
 const STORE_CRATES: &[&str] = &["blaze_cas", "blaze_vfs"];
 
@@ -196,16 +192,13 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     found
 }
 
-/// The stat or open that `first`, what a call runs, reaches: at most [`LONGEST_CHAIN`] steps
-/// down, named as `Type::name` or a free function's name.
+/// The stat or open that `first`, what a call runs, reaches, named as `Type::name` or a free
+/// function's name: the root of a shortest chain ([`alloc::chain_to_root`]), or `first`
+/// itself where the search names none within its bound.
 fn root_of<'db>(db: &'db Db, env: ParamEnvAndCrate<'db>, first: Resolved<'db>) -> String {
-    let mut at = first;
-    for _ in 0..LONGEST_CHAIN {
-        match alloc::next_step(db, env, at, true, Roots::Syscall) {
-            Some(next) => at = next,
-            None => break,
-        }
-    }
+    let at = alloc::chain_to_root(db, env, first, true, Roots::Syscall)
+        .and_then(|it| it.last().copied())
+        .unwrap_or(first);
     match at {
         Resolved::Function(f, _) => fn_name(db, f),
         Resolved::Derived(..) => "a derived method".to_owned(), // alloc: a message's part

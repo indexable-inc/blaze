@@ -12,15 +12,57 @@ use cranelift_codegen::{
     isa::{self, CallConv, OwnedTargetIsa},
     settings::{self, Configurable, OptLevel},
 };
+use blaze_codegen::slot::Slot;
 use blaze_core::lock::Lock;
 
-/// Each target a unit has named ([`Target::of`]), parsed once and kept for the process. A
-/// process builds for a handful (the host, wasm32 for proc macros), so a scan finds one.
-static NAMED: Lock<Vec<&'static Target>> = Lock::new("codegen.target.named", Vec::new());
+/// Each target a unit has named ([`Target::of`]), parsed once and kept for the process.
+static NAMED: Named = Named::new();
 
 /// The most targets one process lowers units for. A code generator is kept per target and
 /// set of features (`crate::target_of`), by the target's place in [`NAMED`].
 pub(crate) const MOST_TARGETS: usize = 8;
+
+/// The targets named, one a triple, each in a slot written once ([`Slot`]) and numbered by its
+/// place: filled in order, so a slot not written yet ends them. Every function compiled asks
+/// for its unit's target, on every core at once, so a look takes no lock: a scan of the slots
+/// written, a handful (the host, wasm32 for proc macros), each one acquire load.
+struct Named([Slot<Target>; MOST_TARGETS]);
+
+impl Named {
+    const fn new() -> Named {
+        Named([const { Slot::new() }; MOST_TARGETS])
+    }
+
+    /// The target `triple` names: the one of the slot that holds it, else parsed into the
+    /// first slot not written. Two threads that name one triple first at once write one slot
+    /// and both get the one kept; two that name two triples get two slots, the one whose
+    /// write was refused going on to the next. A triple is never in two slots: each writer
+    /// looks at every slot before the one it writes, and a slot once written keeps its
+    /// target.
+    ///
+    /// # Errors
+    ///
+    /// A triple blaze emits no code for ([`Target::parse`]), and one past [`MOST_TARGETS`],
+    /// each naming it.
+    fn of(&self, triple: &str) -> Result<&Target, String> {
+        for (index, slot) in self.0.iter().enumerate() {
+            let target = match slot.get() {
+                Some(target) => target,
+                // A write refused is another thread's target, named into this slot first:
+                // looked at as any other.
+                None => match slot.set(Target::parse(triple, index as u8)?) {
+                    Ok(target) => target,
+                    Err(refused) => refused.kept,
+                },
+            };
+            if target.triple == triple {
+                return Ok(target);
+            }
+        }
+        // alloc: an error
+        Err(format!("{triple} is past the {MOST_TARGETS} targets one process lowers for"))
+    }
+}
 
 /// The most sets of target features one process compiles with: each toolchain's
 /// (`Toolchain::features`: a dev job's host features, a release job's baseline) and each
@@ -269,21 +311,7 @@ impl Target {
     /// The target `triple` names, for one unit: each unit's codegen and layout ask its own,
     /// so units of two targets lower side by side in one process with nothing shared.
     pub fn of(triple: &str) -> Result<&'static Target, String> {
-        let mut named = NAMED.lock();
-        if let Some(target) = named.iter().find(|it| it.triple == triple) {
-            return Ok(target);
-        }
-        if named.len() >= MOST_TARGETS {
-            // alloc: an error
-            return Err(format!(
-                "{triple} is past the {MOST_TARGETS} targets one process lowers for"
-            ));
-        }
-        let index = named.len() as u8;
-        // alloc: leaked once per target named, for the process (setup)
-        let target: &'static Target = Box::leak(Box::new(Target::parse(triple, index)?));
-        named.push(target);
-        Ok(target)
+        NAMED.of(triple)
     }
 
     /// Its place among the targets the process has named, below [`MOST_TARGETS`].
@@ -582,8 +610,15 @@ impl Target {
     /// a function that calls and keeps no frame record leaves its return address where only
     /// its DWARF rows say. `-C force-frame-pointers=no` cannot take it away, as in rustc
     /// (`FramePointer::ratchet`).
+    ///
+    /// And `aarch64-unknown-linux-gnu`'s, whose rustc target spec has `frame_pointer: NonLeaf`
+    /// too (AAPCS64 expects a frame record in every function that calls): without it x29 is
+    /// any register, and a walk by the frame chain of a blaze-built program finds nothing.
+    /// blaze's own daemon is such a program: its heap and CPU samples' stacks were one frame,
+    /// an address in no function (2026-11-11, lane mem-1111: every `alloc_samples` site of a
+    /// self-built daemon read `[blaze1]`).
     pub(crate) fn requires_frame_pointers(&self) -> bool {
-        self.triple().contains("-apple-")
+        self.triple().contains("-apple-") || self.triple() == "aarch64-unknown-linux-gnu"
     }
 
     /// LLVM's `"frame-pointer"` attribute of a function of this target: `all` when its unit
@@ -804,7 +839,78 @@ pub(crate) fn renamed_for_llvm(
 mod tests {
     use cranelift_codegen::settings::OptLevel;
 
-    use super::{AARCH64_FEATURES, Arch, Features, MOST_FEATURE_SETS, Target, X86_FEATURES};
+    use super::{
+        AARCH64_FEATURES, Arch, Features, MOST_FEATURE_SETS, MOST_TARGETS, Named, Target,
+        X86_FEATURES,
+    };
+
+    /// The oracle of [`many_threads_name_each_target_once`]: many threads look each of
+    /// `triples` up through `of` at once; every look of a triple must give one `Target` (one
+    /// address), of that triple, at a place below [`MOST_TARGETS`] that no other triple has.
+    fn one_target_a_triple<'t>(
+        triples: &[String],
+        of: impl Fn(&str) -> &'t Target + Sync,
+    ) -> Result<(), String> {
+        const THREADS: usize = 16;
+        let seen: Vec<Vec<&Target>> = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..THREADS)
+                .map(|thread| {
+                    let of = &of;
+                    scope.spawn(move || {
+                        // Each thread from another triple, so the first to name one varies.
+                        (0..triples.len() * 4)
+                            .map(|step| of(&triples[(step + thread * 3) % triples.len()]))
+                            .collect::<Vec<&Target>>()
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|it| it.join().expect("a thread of the test")).collect()
+        });
+        let mut places = [None; MOST_TARGETS];
+        for triple in triples {
+            let one = of(triple);
+            if one.triple != *triple {
+                return Err(format!("{triple} named the target of {}", one.triple));
+            }
+            if seen.iter().flatten().any(|it| it.triple == *triple && !std::ptr::eq(*it, one)) {
+                return Err(format!("{triple} named two targets"));
+            }
+            let Some(place) = places.get_mut(one.index()) else {
+                return Err(format!("{triple} is at place {}, past the table", one.index()));
+            };
+            if let Some(other) = place.replace(triple) {
+                return Err(format!("{triple} and {other} are at one place, {}", one.index()));
+            }
+        }
+        Ok(())
+    }
+
+    fn triples() -> Vec<String> {
+        (0..MOST_TARGETS).map(|at| format!("x86_64-vendor{at}-linux-gnu")).collect()
+    }
+
+    /// The invariant: a triple names one target for good, whichever threads name it first and
+    /// whatever else is named beside it ([`one_target_a_triple`]); one triple more than the
+    /// table holds is refused by name, and a triple blaze emits no code for takes no slot.
+    #[test]
+    fn many_threads_name_each_target_once() {
+        let named = Named::new();
+        assert!(named.of("riscv64gc-unknown-linux-gnu").is_err(), "no code for RISC-V");
+        assert_eq!(one_target_a_triple(&triples(), |it| named.of(it).expect("a target")), Ok(()));
+        let refused = named.of("aarch64-unknown-linux-gnu").expect_err("one target too many");
+        assert!(refused.contains("aarch64-unknown-linux-gnu"), "{refused}");
+        assert!(refused.contains("past the 8 targets"), "{refused}");
+    }
+
+    /// The planted bug: a table that parses a target at each look and keeps none, so a triple
+    /// has as many targets as looks, all at one place.
+    #[test]
+    fn the_oracle_catches_a_target_made_at_each_look() {
+        let found = one_target_a_triple(&triples(), |it| {
+            Box::leak(Box::new(Target::parse(it, 0).expect("a target")))
+        });
+        assert_eq!(found, Err("x86_64-vendor0-linux-gnu named two targets".to_owned()));
+    }
 
     fn setting(target: &Target, name: &str) -> Option<bool> {
         setting_with(target, Features::BASELINE, name)
@@ -833,17 +939,17 @@ mod tests {
         assert!(Features::BASELINE.names().is_empty());
     }
 
-    /// rustc's frame pointers: `all` when forced, Apple's `non-leaf` whatever the flags, else
+    /// rustc's frame pointers: `all` when forced, Apple's and aarch64 Linux's `non-leaf` whatever the flags, else
     /// LLVM's default.
     #[test]
     fn frame_pointers_are_forced_or_the_abis() {
-        for apple in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+        for apple in ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux-gnu"] {
             let apple = Target::of(apple).expect("a target");
             assert!(apple.requires_frame_pointers());
             assert_eq!(apple.llvm_frame_pointer(false), Some("non-leaf"), "{}", apple.triple());
             assert_eq!(apple.llvm_frame_pointer(true), Some("all"));
         }
-        for other in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
+        for other in ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
             let other = Target::of(other).expect("a target");
             assert!(!other.requires_frame_pointers(), "{}", other.triple());
             assert_eq!(other.llvm_frame_pointer(false), None);

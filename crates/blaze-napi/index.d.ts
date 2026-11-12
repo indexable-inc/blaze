@@ -1,5 +1,5 @@
 // blaze's daemon from TypeScript (docs/client.md). The shapes are the agent API's
-// (crates/blaze-api/src/lib.rs, schema 48) as its JSON rendering writes them, and
+// (crates/blaze-api/src/lib.rs, schema 50) as its JSON rendering writes them, and
 // blaze-client's options and outcome (crates/blaze-client/src/ask.rs), written here by hand:
 // a field renamed there is renamed here in the same change.
 //
@@ -141,6 +141,8 @@ export interface Artifact {
 export type LinkHow = 'First' | 'Spliced' | 'Unchanged' | { Full: { why: string[] } };
 
 export interface Worked {
+  /** Why the build recomputed what it did, when the daemon had it as it answered; else null. */
+  why: Report[] | null;
   link: 'Patched' | 'Placed';
   found: number;
   green: number;
@@ -158,6 +160,8 @@ export interface Worked {
   compiled: number;
   steps_us: [NodeKind, number][];
   critical_path_us: number;
+  /** The build's goal and how much of the code it linked is optimized; null when it compiles no program. */
+  tiers: { goal: 'edit' | 'max'; optimized: number; functions: number } | null;
 }
 
 export interface Unchecked {
@@ -329,6 +333,8 @@ export interface Options {
   target?: string;
   /** `dev` of a build and a check, `test` of a test, when left out. */
   profile?: string;
+  /** What the request waits for; omitted for the profile's own (dev edits, release is max). */
+  goal?: 'edit' | 'max';
   verbose?: number;
   features?: string[];
   /** Packages by name; the workspace's default members when empty. */

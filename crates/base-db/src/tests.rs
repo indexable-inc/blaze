@@ -1983,3 +1983,46 @@ fn a_target_kinds_tag_is_the_old_match() {
         assert_eq!(kind.tag(), old(kind), "{kind:?}");
     }
 }
+
+/// The rows the engine's walk found changed after the process's variables are set to
+/// `after`, a query having read `FOO` when they were `before`.
+fn changed_after_env(before: &[(&str, &str)], after: &[(&str, &str)]) -> (u64, Option<String>) {
+    let vars = |of: &[(&str, &str)]| {
+        crate::Env::from_iter(of.iter().map(|(name, value)| ((*name).into(), (*value).into())))
+    };
+    let mut db = Db::for_tests();
+    crate::set_process_env(&mut db, vars(before));
+    assert_eq!(crate::process_env_var(&db, "FOO"), Some("1".to_owned()));
+    // A walk with nothing written, so the next counts the write below alone.
+    blaze_query::db::plumbing::walk_changed_set(&db);
+    crate::set_process_env(&mut db, vars(after));
+    let work = blaze_query::db::plumbing::walk_changed_set(&db);
+    assert!(work.written >= 1, "the variables were written: {work:?}");
+    assert!(work.visited <= 1, "one row reads the variables: {work:?}");
+    (work.changed, crate::process_env_var(&db, "FOO"))
+}
+
+/// The invariant: a change of a process variable nothing reads changes no row. A query that
+/// reads `FOO` reads `FOO`'s own memo; with `UNRELATED` changed, added or removed, the
+/// walk from the variables written verifies that one memo, finds it equal and stops: 0 rows
+/// changed, so nothing that read `FOO` runs again.
+#[test]
+fn a_process_variable_nothing_reads_changes_no_row() {
+    let before = [("FOO", "1"), ("UNRELATED", "a")];
+    for after in [
+        &[("FOO", "1"), ("UNRELATED", "b")][..],
+        &[("FOO", "1")][..],
+        &[("FOO", "1"), ("UNRELATED", "a"), ("MORE", "x")][..],
+    ] {
+        assert_eq!(changed_after_env(&before, after), (0, Some("1".to_owned())), "{after:?}");
+    }
+}
+
+/// The control of [`a_process_variable_nothing_reads_changes_no_row`]: the variable that is
+/// read, changed, is a changed row, and its reader gets the new value.
+#[test]
+fn the_oracle_catches_a_read_variable_that_changed() {
+    let (changed, value) =
+        changed_after_env(&[("FOO", "1"), ("UNRELATED", "a")], &[("FOO", "2"), ("UNRELATED", "a")]);
+    assert_eq!((changed, value), (1, Some("2".to_owned())));
+}

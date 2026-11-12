@@ -276,6 +276,16 @@ pub(crate) enum Special {
         name: SectionName,
         end: bool,
     },
+    /// [`Special::Section`] for a name every reference to is weak, on ELF: 0 when no region
+    /// has the name. GNU ld and lld define `__start_X` and `__stop_X` only when an output
+    /// section `X` exists; without one the name is an undefined symbol like any other, 0 to a
+    /// weak reference (libFuzzer's `__start___libfuzzer_extra_counters`) and an error to a
+    /// strong one. Decided when the image is written, where the kept regions are known, so
+    /// that a section a later change adds is bounded then.
+    WeakSection {
+        name: SectionName,
+        end: bool,
+    },
     /// An address the writer computes from the placed regions (ELF's `_end`, `etext`,
     /// `__bss_start`, `_DYNAMIC`).
     Placed(fn(&[Region]) -> u64),
@@ -370,6 +380,15 @@ pub(crate) enum Apply {
     A64TlsDescLo12,
     A64TlsDescAdd12,
     A64TlsDescCall,
+    /// A TLS descriptor's sequence in an executable ([`crate::reloc::in_output`]), where no
+    /// descriptor is needed: relaxed to initial exec, `adrp x0, G; ldr x0, [x0, G]; nop;
+    /// nop` with `G` the GOT cell holding the offset from the thread pointer, when the
+    /// target is imported.
+    A64TlsDescIe(TlsDescStep),
+    /// The same relaxed to local exec, `movz x0, #hi16, lsl #16; movk x0, #lo16; nop; nop`
+    /// of the offset from the thread pointer, when the link knows it
+    /// ([`crate::reloc::known`]). No reader emits it and no fixup holds it.
+    A64TlsDescLe(TlsDescStep),
     /// Mach-O TLV (`TLVP_LOAD_*`): the page and low 12 bits (an `LDR`) of a GOT cell holding
     /// the address of `S`'s descriptor (`S` itself for a native one in `__thread_vars`, the one
     /// the core makes in [`Class::ThreadVars`] for a thread-local static).
@@ -385,6 +404,16 @@ pub(crate) enum Apply {
     TpOff64,
     /// A relocation only the format's writer applies ([`Writer::apply`]), by its own type.
     Native(u32),
+}
+
+/// Which instruction of a TLS descriptor's four (`adrp x0; ldr x1, [x0]; add x0, x0; blr x1`)
+/// a relaxed relocation is on: `TLSDESC_ADR_PAGE21`, `_LD64_LO12`, `_ADD_LO12`, `_CALL`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum TlsDescStep {
+    Page,
+    Load,
+    Add,
+    Call,
 }
 
 /// One relocation of a piece.

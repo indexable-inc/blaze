@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: A dev build's executable carries no debug info - it is a side file every debugger and std's backtrace find unaided (ELF `<name>.debug` by `.gnu_debuglink` with a CRC that is a function of the build id, Mach-O `<name>.dSYM` by `LC_UUID`), kept as per-function records patched in place; one program is one link however many paths it is placed at. Built - the side file, its model and writer, updates that encode only a link's changed functions, the profile default, one link per unhashed program, a build id of what the image holds and not of its directory, `link write` events by region. Not built - the write moved after the answer, the side file as a store output, the kept image keyed by inputs, the writers' tables by entry, the maps as records, the patch room out of the file (patch-in-place.md). The 162 MB is mostly not debug info - at least 128 MiB is the two patch regions' room.
+summary: A dev build's executable carries no debug info - it is a side file every debugger and std's backtrace find unaided (ELF `<name>.debug` by `.gnu_debuglink` with a CRC that is a function of the build id, Mach-O `<name>.dSYM` by `LC_UUID`), kept as per-function records patched in place; one program is one link however many paths it is placed at. Built - the side file, its model and writer, updates that encode only a link's changed functions, the profile default, one link per unhashed program, a build id of what the image holds and not of its directory, `link write` events by region, the files placed after the answer from bytes the daemon holds (2026-11-11, written, not built or run). Not built - the side file as a store output, the kept image keyed by inputs, the writers' tables by entry, the maps as records, the patch room out of the file (patch-in-place.md). The 162 MB is mostly not debug info - at least 128 MiB is the two patch regions' room.
 date: 2026-11-10
 ---
 # Debug info beside the executable
@@ -70,10 +70,39 @@ anchor. Otherwise (first write, full layout, rollback, a skipped update, records
 number the image's functions) every function is encoded, and `DebugWrite::all` says why. Still
 of the program each update: a count of the pieces, the symbol table compared by block. A patch
 names the build id of the file it is over (`DebugWrite::base`); `apply` refuses any other.
+The ELF seal (the CRC-32 of the whole file) is kept by 4 KiB block (`beside/crc.rs`: a tree
+of sums, CRC being linear), so a patch reads the blocks it wrote (`DebugWrite::summed`), not
+the file: summing 8.6 MB again was 19.5 ms of each edit's link until 2026-11-11.
 
 **Between the answer and the write** a debugger sees the previous side file: on ELF gdb refuses
 it by CRC and std reads it (the edited function's lines stale); on macOS both refuse it by UUID
-and use symbols. It is replaced by an unsynced write of a clone and a rename.
+and use symbols. It is replaced by an unsynced write of a new file and a rename.
+
+## Placed after the answer, from memory (2026-11-11; written, not built or run)
+
+`codegen::debug_side` ran in the link and wrote the files itself: 72 ms of a 171 ms `unit link`
+on ripgrep, almost all of it two copies of the whole file. Why two: a file renamed into place
+is never written again (a running program may hold it mapped), so the last file was copied
+whole to be patched, the only place its other bytes were; and the executable is at two paths
+(its own and cargo's copy), each of which a debugger looks beside, so the patched file was
+copied whole again.
+
+The side file's bytes are held once, by the linker's model of it (`beside::Kept`), shared
+with whoever places the file (`Image::debug_file_view`); the daemon keeps no copy of its own
+(until 2026-11-11 `codegen::Linked::side` was a second one, copied whole a link). A link
+hands the loop what its update wrote (`work::Made::Patch`: the ranges, a few kilobytes) and
+the loop writes them into a clone of the file at each path (`Store::place_patched`), or the
+whole file as the runs that hold bytes where a path does not hold the file the patch is
+over (the first link, a file changed since), one output a path, with the bundle's
+`Info.plist` on Mach-O. Each is renamed onto its path as any output the build made, and since no artifact
+names them the build's answer does not wait ([clone-out.md](clone-out.md), "What the answer
+waits for"): a run of the daemon's own starts only once they are placed, a later link's files
+queue behind them, a failure is a loss said. No file on the disk is read or copied; each path
+is written once. They are in no record: a build that replays the record places none, as before.
+A link that changed nothing of the side file writes nothing. Spans: `link debug file` (now with
+`placed_bytes`), under it `link debug file: patch in memory` and `link debug file: its runs`;
+`link debug file: copy and patch`, `: copy beside` and `: patch in memory` are gone. What it
+costs: the file's bytes in memory once per kept image, and the patch's bytes a path.
 
 ## One link for one program
 
@@ -96,11 +125,8 @@ now of lineage, generation and what the image holds (`Change::given`, `Rows::giv
 
 ## Not built, and why
 
-- **The write after the answer.** `codegen::debug_side` runs in the link, in the span
-  `link debug file` (`bytes written ranges records encoded all whole`). The hook is a `Steps`
-  method that takes the kept image after the answer, calls `Image::debug_file()` and writes
-  as `write_side` does, its failure a `Settling` loss. Not written blind: `job.rs` is a
-  simulated state machine generic over `Steps`; a new task kind there needs its tests run.
+- **The update itself after the answer.** The link still encodes the changed functions' rows
+  and patches the held bytes (`link debug file`); only the files' writes are after the answer.
 - **The side file in the store**, so a build that places the executable without linking
   places it too (today it writes none: no lines in backtraces until the next link). It fits
   `Written::Derived`: a `digest::Digest` kept by its writes, an output beside each path.

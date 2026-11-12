@@ -16,25 +16,31 @@
 //! - the kept names ([`super::KEPT`]: threads' names, `&'static str`s): one log, appended as a
 //!   name is first given and read back newest first. Every other name a row holds is defined
 //!   in the rows of its ring ([`super::names`]), so the rings are all a postmortem needs of them;
-//! - the rings' [`Store`]s: [`MAPPED_RINGS`] of them, back to back, reserved on disk and
-//!   mapped as one when the recorder is persisted, and handed to rings as they are made.
+//! - the rings' [`Store`]s: room for [`MAPPED_RINGS`] of them, back to back, mapped as one
+//!   when the recorder is persisted and handed to rings as they are made. The file ends after
+//!   the last store handed out: each store's disk is reserved as it is handed out, never
+//!   before (until 2026-11-11 all 256 were reserved up front, 516 MiB a daemon, of which a
+//!   daemon on 18 cores used 26).
 //!
 //! Recording costs what it did: a thread writes its store with the same plain atomics, the
 //! hot path makes no system call and allocates nothing, and no row holds an address (sites and
 //! names are numbers, decoded through the file's own tables). Only a ring's thread writes its
 //! store; [`persist`] moves a ring no thread holds itself and leaves the others a store to move
-//! to as their thread next writes ([`super::Ring::move_store`]). Every byte the file will hold
-//! is reserved as it is made, so [`persist`] is the one place that can fail for want of disk
-//! (a typed error naming the file and why); no ring is ever left on the heap once the recorder
-//! is persisted: a thread past [`MAPPED_RINGS`] recording at once gets no ring and its spans
-//! count as ringless, as past [`super::RINGS_MAX`] in any process, and the next flush says the
-//! bound was hit ([`failed`]). Handing out a store, a name or a site writes the file under the
-//! lock its caller already holds and does no system call.
+//! to as their thread next writes ([`super::Ring::move_store`]). No byte of the mapping is
+//! written before the disk under it is reserved, so a full disk is a typed error naming the
+//! file and why, never a SIGBUS: [`persist`] reserves the fixed part and a store for each ring
+//! made so far, or fails whole; a ring made later has its store reserved as it is handed out
+//! ([`Mapping::store`], one system call a ring, under the lock its maker already holds, never
+//! on a recording path). No ring is ever left on the heap once the recorder is persisted: a
+//! thread whose store the disk has no room for, or past [`MAPPED_RINGS`] recording at once,
+//! gets no ring and its spans count as ringless, as past [`super::RINGS_MAX`] in any process,
+//! and the next flush says why ([`failed`]). Handing out a name or a site writes the file
+//! under the lock its caller already holds and does no system call.
 //!
-//! The file's size is fixed as it is made: the fixed part (about 3.3 MiB: the header 64 KiB,
-//! sites 2 MiB, builds 256 KiB, kept names 1 MiB) and [`MAPPED_RINGS`] stores of a [`Store`]
-//! each (2 MiB of rows, [`super::CAP`] rows of 64 bytes, and 4 KiB of head), about 516 MiB in
-//! all.
+//! The file's size: the fixed part (about 3.3 MiB: the header 64 KiB, sites 2 MiB, builds
+//! 256 KiB, kept names 1 MiB) and a [`Store`] for each ring ever made (2 MiB of rows,
+//! [`super::CAP`] rows of 64 bytes, and 4 KiB of head): about 55 MiB for a daemon on 18 cores
+//! (26 rings), at most about 516 MiB ([`FILE_MOST`], all [`MAPPED_RINGS`]).
 //! The history counts it, and the crash records beside it, against its cap
 //! ([`crate::history::CAP_BYTES`]).
 //!
@@ -117,7 +123,8 @@ const LOG_BYTES: usize = 1 << 20;
 const LOGS_AT: usize = BUILDS_AT + BUILDS_BYTES;
 /// Where the first ring's store is: what is mapped as one, the fixed part.
 const RINGS_AT: usize = LOGS_AT + LOGS * LOG_BYTES;
-/// Threads a persisted process records on at once: the stores reserved up front. A ring is
+/// Threads a persisted process records on at once: the stores the file has room for, each
+/// reserved on disk as it is handed out. A ring is
 /// 2 MiB of rows ([`super::CAP`]), which the drain needs (a busy worker writes thousands of
 /// rows between two drains), so the bound is on rings, not their size: [`super::RINGS_MAX`]
 /// (4094) of them would reserve 8 GiB. A daemon records on its pool's threads, its IO and
@@ -129,8 +136,13 @@ pub(crate) const MAPPED_RINGS: usize = 256;
 const STORE_BYTES: usize = std::mem::size_of::<Store>().div_ceil(8) * 8;
 /// The stores' part of the file, whole pages.
 const STORES_BYTES: usize = (MAPPED_RINGS * STORE_BYTES).div_ceil(PAGE) * PAGE;
-/// The file's length, reserved as it is made.
-pub(crate) const FILE_BYTES: u64 = (RINGS_AT + STORES_BYTES) as u64;
+/// The most the file ever is: every store handed out.
+pub(crate) const FILE_MOST: u64 = (RINGS_AT + STORES_BYTES) as u64;
+/// The file's length with `stores` of them handed out: what is reserved on disk.
+const fn file_bytes(stores: usize) -> u64 {
+    (RINGS_AT + stores * STORE_BYTES) as u64
+}
+const _: () = assert!(file_bytes(MAPPED_RINGS) <= FILE_MOST);
 /// Bytes of a name a log keeps; a longer one is cut at a character's boundary and marked.
 const NAME_MAX: usize = 4096;
 /// The longest name and target a site record keeps.
@@ -475,14 +487,25 @@ pub(crate) struct Mapping {
     sites: Lock<()>,
     /// The build each build record holds, 0 for none.
     builds: Lock<[u64; BUILD_SLOTS]>,
-    /// The stores' part, `RINGS_AT..FILE_BYTES`, mapped shared and never unmapped.
+    /// The stores' part, `RINGS_AT..FILE_MOST`, mapped shared and never unmapped. The file
+    /// ends at [`file_bytes`] of the stores reserved: no byte past it is ever touched.
     stores: std::ptr::NonNull<u8>,
-    /// Stores handed to rings.
-    given: Lock<usize>,
+    /// Stores handed to rings, and stores reserved on disk (never fewer).
+    given: Lock<Given>,
     /// Its nonce ([`H_NONCE`]).
     nonce: u64,
     /// One flush marks at a time ([`mark_flush`]).
     marking: Lock<()>,
+    /// A planted bug for the test of the reservation: a store is handed out with no disk
+    /// reserved under it (the file is not grown), as a sparse mapping would.
+    #[cfg(test)]
+    plant_no_reserve: std::sync::atomic::AtomicBool,
+}
+
+/// See [`Mapping::given`].
+struct Given {
+    given: usize,
+    reserved: usize,
 }
 
 // SAFETY: `fixed` and `stores` point into shared mappings that are never unmapped; a store is
@@ -495,8 +518,9 @@ unsafe impl Send for Mapping {}
 unsafe impl Sync for Mapping {}
 
 impl Mapping {
-    /// Makes the file of process `pid` in `dir`, locks it, reserves all of it on disk
-    /// ([`FILE_BYTES`]) and maps it, and writes its header, the magic last.
+    /// Makes the file of process `pid` in `dir`, locks it, reserves its fixed part on disk
+    /// (no store yet: [`Mapping::reserve`]) and maps it with the room of every store, and
+    /// writes its header, the magic last.
     pub(crate) fn create(
         dir: &Path,
         pid: u32,
@@ -537,14 +561,13 @@ impl Mapping {
             // A file of a dead process of this pid that no postmortem read: its rows are lost
             // here, as the history opened before this and read every file no one held.
             file.set_len(0).map_err(io_error(&path, "emptying"))?;
-            // Every ring's store with the fixed part: a full disk is this error, never a SIGBUS
-            // on a page a ring writes later, and never a ring left on the heap.
-            if let Err(error) = sys::reserve(&file, 0, FILE_BYTES) {
+            // The fixed part: a full disk is this error, never a SIGBUS on a page written
+            // later. The stores are reserved as they are handed out ([`Mapping::reserve`]).
+            if let Err(error) = sys::reserve(&file, 0, file_bytes(0)) {
                 _ = fs::remove_file(&path);
-                return Err(io_error(
-                    &path,
-                    "reserving the disk of every ring's store (about 516 MiB) for",
-                )(error));
+                return Err(io_error(&path, "reserving the disk of the fixed part (about 3.3 MiB) of")(
+                    error,
+                ));
             }
             let fixed = sys::map(&file, 0, RINGS_AT)
                 .map_err(io_error(&path, "mapping the fixed part of"))?;
@@ -558,9 +581,11 @@ impl Mapping {
                 sites: Lock::unrecorded("profile.postmortem.sites", ()),
                 builds: Lock::unrecorded("profile.postmortem.builds", [0; BUILD_SLOTS]),
                 stores,
-                given: Lock::unrecorded("profile.postmortem.given", 0),
+                given: Lock::unrecorded("profile.postmortem.given", Given { given: 0, reserved: 0 }),
                 nonce: nonce(pid),
                 marking: Lock::unrecorded("profile.postmortem.marking", ()),
+                #[cfg(test)]
+                plant_no_reserve: std::sync::atomic::AtomicBool::new(false),
             };
             mapping.header(pid, blaze, process, counting_copies);
             Ok(mapping)
@@ -623,11 +648,17 @@ impl Mapping {
         self.word(H_CLOCK_AT).store(next as u64, Ordering::Release);
     }
 
-    /// The next store, for the ring `number`: reserved and mapped as the file was made, so
-    /// handing it out does no system call; [`PostmortemError::Full`] past [`MAPPED_RINGS`].
-    pub(crate) fn store(&self, number: u16) -> Result<&'static Store, PostmortemError> {
-        let mut given = self.given.lock();
-        if *given == MAPPED_RINGS {
+    /// Reserves the disk of the first `stores` stores, growing the file to hold them: what
+    /// [`persist`] asks for the rings made so far, before any moves, so it fails whole.
+    pub(crate) fn reserve(&self, stores: usize) -> Result<(), PostmortemError> {
+        self.reserve_in(&mut self.given.lock(), stores)
+    }
+
+    fn reserve_in(&self, given: &mut Given, stores: usize) -> Result<(), PostmortemError> {
+        if stores <= given.reserved {
+            return Ok(());
+        }
+        if stores > MAPPED_RINGS {
             return Err(PostmortemError::Full {
                 // alloc: an error
                 path: self.path.clone(),
@@ -635,17 +666,46 @@ impl Mapping {
                 most: MAPPED_RINGS,
             });
         }
-        // SAFETY: `*given < MAPPED_RINGS`, so the store's `STORE_BYTES` lie inside the stores'
+        #[cfg(test)]
+        if self.plant_no_reserve.load(Ordering::Relaxed) {
+            given.reserved = stores;
+            return Ok(());
+        }
+        sys::reserve(&self.file, file_bytes(given.reserved), file_bytes(stores)).map_err(io_error(
+            &self.path,
+            "reserving the disk of a ring's store (2 MiB; its thread is not recorded) in",
+        ))?;
+        given.reserved = stores;
+        Ok(())
+    }
+
+    /// The next store, for the ring `number`: mapped as the file was made, its disk reserved
+    /// here unless [`Mapping::reserve`] did (one system call, under the lock the ring's maker
+    /// holds); an error when the disk has no room for it, and [`PostmortemError::Full`] past
+    /// [`MAPPED_RINGS`].
+    pub(crate) fn store(&self, number: u16) -> Result<&'static Store, PostmortemError> {
+        let mut state = self.given.lock();
+        let at = self.claim(&mut state)?;
+        // SAFETY: `at < MAPPED_RINGS`, so the store's `STORE_BYTES` lie inside the stores'
         // mapping (`MAPPED_RINGS * STORE_BYTES <= STORES_BYTES`), 8-aligned (the base is page
         // aligned and `STORE_BYTES` a multiple of 8, a `Store`'s alignment at most 8), of bytes
-        // the file reserved as zeros; the mapping is never unmapped, all-zero is a valid `Store`
-        // (atomics and integers), and `given` hands each one to one ring alone.
+        // the file reserved as zeros (`claim` grew the file past this store before handing it
+        // out, so its pages are the file's, never past its end); the mapping is never
+        // unmapped, all-zero is a valid `Store` (atomics and integers), and `claim` hands each
+        // one to one ring alone.
         let store: &'static Store =
-            unsafe { &*self.stores.as_ptr().add(*given * STORE_BYTES).cast::<Store>() };
+            unsafe { &*self.stores.as_ptr().add(at * STORE_BYTES).cast::<Store>() };
         store.number.store(u64::from(number), Ordering::Relaxed);
-        *given += 1;
-        self.word(H_RINGS).store(*given as u64, Ordering::Release);
+        self.word(H_RINGS).store(state.given as u64, Ordering::Release);
         Ok(store)
+    }
+
+    /// Takes the next store: its disk reserved, then counted as handed out. Which one it is.
+    fn claim(&self, state: &mut Given) -> Result<usize, PostmortemError> {
+        let at = state.given;
+        self.reserve_in(state, at + 1)?;
+        state.given = at + 1;
+        Ok(at)
     }
 
     /// Logs the kept name `name` as `sym`, under [`super::KEPT`]'s lock.
@@ -870,8 +930,12 @@ mod sys {
     pub(super) fn reserve(file: &File, from: u64, to: u64) -> io::Result<()> {
         let len = libc::off_t::try_from(to - from)
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // All of it or an error (`F_ALLOCATEALL`), in one run when there is one
+        // (`F_ALLOCATECONTIG`). `F_ALLOCATECONTIG` alone succeeds with whatever run it found:
+        // until 2026-11-11 this asked that way, and a 3.4 MiB ask came back as 20 KiB taken
+        // for the whole (APFS, a nearly full volume), the rest of the mapping a hole.
         let mut store = libc::fstore_t {
-            fst_flags: libc::F_ALLOCATECONTIG,
+            fst_flags: libc::F_ALLOCATECONTIG | libc::F_ALLOCATEALL,
             fst_posmode: libc::F_PEOFPOSMODE,
             fst_offset: 0,
             fst_length: len,
@@ -883,8 +947,9 @@ mod sys {
             libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, std::ptr::from_mut(&mut store))
         } == -1
         {
-            // No contiguous run that long: any run.
+            // No contiguous run that long: any runs.
             store.fst_flags = libc::F_ALLOCATEALL;
+            store.fst_bytesalloc = 0;
             // SAFETY: as above.
             if unsafe {
                 libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, std::ptr::from_mut(&mut store))
@@ -892,6 +957,13 @@ mod sys {
             {
                 return Err(io::Error::last_os_error());
             }
+        }
+        if store.fst_bytesalloc < len {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                // alloc: an error
+                format!("the file system reserved {} of the {len} bytes asked for", store.fst_bytesalloc),
+            ));
         }
         file.set_len(to)
     }
@@ -953,6 +1025,14 @@ pub(super) fn persist(dir: &Path, blaze: &str, process: &str) -> Result<(), Post
                 what: "threads recording at once as the recorder was persisted",
                 most: MAPPED_RINGS,
             });
+        }
+        // A store for each ring made so far, before any ring moves: a full disk fails the
+        // whole of it here, with no ring left half way between the heap and the file.
+        if let Err(error) = made.reserve(rings.len()) {
+            let path = made.path.clone(); // alloc: an error
+            drop(made);
+            _ = fs::remove_file(&path);
+            return Err(error);
         }
         if let Err(made) = MAPPING.set(made) {
             // Another thread persisted meanwhile (its lock on the one file of this pid would
@@ -1948,6 +2028,101 @@ mod tests {
         assert_eq!(rows(None), 20, "no manifest names it: past the last commit the mapping saw");
         assert_eq!(rows(Some(4)), 20, "the manifest has flush 4: flush 5 did not commit");
         assert_eq!(rows(Some(5)), 10, "the manifest has flush 5: its rows are in files");
+        _ = fs::remove_dir_all(&dir);
+    }
+
+    /// What the reservation promises, checked from outside the mapping: the file is as long
+    /// as its fixed part and every store handed out, and the disk holds that many bytes of
+    /// it, so no page a ring writes is past the file's end or a hole.
+    fn disk_is_under_every_store(mapping: &Mapping) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let given = mapping.given.lock().given;
+        let meta = fs::metadata(&mapping.path).map_err(|error| error.to_string())?;
+        let needed = file_bytes(given);
+        if meta.len() < needed {
+            return Err(format!(
+                "{given} stores are handed out, which end at byte {needed}, and the file ends at {}",
+                meta.len()
+            ));
+        }
+        if meta.blocks() * 512 < needed {
+            return Err(format!(
+                "{given} stores are handed out, {needed} bytes, and the disk holds {} of the file",
+                meta.blocks() * 512
+            ));
+        }
+        Ok(())
+    }
+
+    /// The invariant: every store handed out lies in disk the file reserved, and the file
+    /// holds no store's disk before it is handed out.
+    #[test]
+    fn a_store_s_disk_is_reserved_as_it_is_handed_out_and_not_before() {
+        let dir = scratch("reserve");
+        let mapping = Mapping::create(&dir, DEAD, "c0ffee", "blaze serve", false).unwrap();
+        let len = || fs::metadata(&mapping.path).unwrap().len();
+        assert_eq!(len(), file_bytes(0), "no store's disk before one is handed out");
+        disk_is_under_every_store(&mapping).unwrap();
+        // What `persist` asks for the rings made so far.
+        mapping.reserve(2).unwrap();
+        assert_eq!(len(), file_bytes(2));
+        for number in 1..=3u16 {
+            let store = mapping.store(number).unwrap();
+            disk_is_under_every_store(&mapping).unwrap();
+            // The store's last row is the file's, not past its end: this write would be a
+            // SIGBUS otherwise.
+            let ring = Ring::with_store(number, store);
+            for i in 0..CAP as u64 {
+                ring.put(plot_row(1, i));
+            }
+        }
+        assert_eq!(len(), file_bytes(3), "three stores handed out, three reserved");
+        let Err(PostmortemError::Full { most, .. }) = mapping.reserve(MAPPED_RINGS + 1) else {
+            panic!("a store past the mapping's room is refused");
+        };
+        assert_eq!(most, MAPPED_RINGS);
+        _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_oracle_catches_a_store_handed_out_with_no_disk_under_it() {
+        let dir = scratch("reserve-plant");
+        let mapping = Mapping::create(&dir, DEAD, "c0ffee", "blaze serve", false).unwrap();
+        mapping.plant_no_reserve.store(true, Ordering::Relaxed);
+        // Claimed, never written: its pages are past the file's end, and a write to them is
+        // the SIGBUS the reservation is there to prevent.
+        assert_eq!(mapping.claim(&mut mapping.given.lock()).unwrap(), 0);
+        let said = disk_is_under_every_store(&mapping).expect_err("no disk under the store");
+        assert!(said.contains("1 stores are handed out"), "{said}");
+        _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file of the layout's earlier length (every store's room reserved up front, the file
+    /// [`FILE_MOST`] long whatever was handed out, as blaze made it until 2026-11-11) reads
+    /// back as one that ends after its last store does: the same rows.
+    #[test]
+    fn a_file_of_the_previous_length_reads_back_the_same_rows() {
+        let dir = scratch("previous-length");
+        let mapping = Mapping::create(&dir, DEAD, "c0ffee", "blaze serve", false).unwrap();
+        mapping.set_clock(&clock::Scale::now());
+        let store = mapping.store(1).unwrap();
+        let ring = Ring::with_store(1, store);
+        store.mirror(&[Owner { from: 0, tid: 42, name: 0 }]);
+        let t0 = clock::ticks();
+        for i in 0..30 {
+            ring.put(plot_row(t0, i));
+        }
+        let path = mapping.path.clone();
+        drop(mapping);
+        let read = |dir: &Path| {
+            let found = dead(dir).unwrap();
+            format!("{:?}", found[0].read(None).unwrap().read.counters)
+        };
+        let now = read(&dir);
+        assert_eq!(fs::metadata(&path).unwrap().len(), file_bytes(1));
+        fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(FILE_MOST).unwrap();
+        assert_eq!(read(&dir), now);
+        assert!(now.len() > 2, "{now}");
         _ = fs::remove_dir_all(&dir);
     }
 

@@ -460,7 +460,7 @@ guards](#the-smokes-guards). The rest are not in CI yet.
 | `corpus.py` | blaze, nushell, ripgrep, helix and the 52 pinned crates.io crates of `corpus.json` (each `.crate` checked against the sparse index's checksum), built, run and tested by blaze: each build exits 0, each run exits 0, and each test passes by its own verdict (`blaze_cli.test_verdict`) unless the project's `OPEN` list names it; the backends are held to each other. It still resolves each project with `cargo fetch`, a no-rustc bug; whole workspaces are [realprojects.py's](#real-projects-the-verdict) |
 | `frontend/cases.py` | The front end's cases under `frontend/cases/<area>/`, each held to its own header: `//@ expect: reject KEYS` has blaze give exactly those errors, `accept` none, and an accepted program exits 0 (or panics, with `//@ run: panic`) and prints its `.stdout` when one is beside it. `rejects/` holds the cases of [#1522](https://github.com/indexable-inc/blaze/issues/1522) and [#1440](https://github.com/indexable-inc/blaze/issues/1440); `bodies-cache/` is built twice on one store, the second serving each dependency from it |
 | `debug_side.py` | Hello world built with its debug info beside it (the default) and inside (`split-debuginfo = "off"`): the default's executable has no debug section and a side file beside it at each path, the side file carries the executable's build id (and on ELF the CRC-32 its `.gnu_debuglink` names), a panic's `RUST_BACKTRACE=1` backtrace has the same functions and `file:line` both ways, and `gdb` and `lldb` resolve a function to its line where they are installed ("not checked: no gdb" otherwise). Records the executable's and the side file's sizes |
-| `determinism.py` | Two cold builds at the same path, pinned to different core counts (Linux), dev and release, of pinned projects and the oracle's fixture, must be byte for byte the same |
+| `determinism.py` | Two cold builds at the same path, pinned to different core counts (Linux), dev and release, of pinned projects and the oracle's fixture, must be byte for byte the same. Across units (`across units release`): `harness/v2/across`'s `first` built in release into an empty home, then its `second`, which reaches the same library functions another way, by a new daemon on that store with `BLAZE_VERIFY_STORE=1`: every function the store gives it is computed again and must be the stored bytes, and none checked is an error |
 | `worktree_keys.py` | `a_second_checkout_at_another_path_reuses_every_key` (after kache's benchmark): one commit of ripgrep copied to checkouts at three paths and built in order by one daemon with one store, A from an empty store. B and C must compile nothing A compiled: every unit `fresh`, every build-script run found and naming only its own checkout's places, no `macro expand` span and no `compiled` macro module in their builds' history, the same `codegen-inputs`. C tells the portable keys' first-use verification apart from a key that differs. Naming each function B compiled with its key's parts needs `blaze-keys` lines blaze does not print yet, an error until it does |
 | `tightmemory.py` | A cold build in a cgroup limited to 1.0 and 0.5 times cargo's peak, with swap off and `BLAZE_DAEMON_MEMORY_GB` saying the same size, finishes with a program that prints what the unlimited cold build's prints, or refuses below 1.0 saying what it needs. It must never be OOM-killed or hang (Linux; `systemd-run --user` or a writable cgroup) |
 | `budgets.py` | The targets of [v2/plan/targets.md](v2/plan/objectives.md) as rows, each with the number measured, the budget and today's figure: edit to result, signature and formatting edits, no-op, warm start, memory against cargo, dev and release code speed, a big crate, the cold build's core use and critical path, CI for a small PR. [v2/plan/data.md](v2/plan/design/data.md)'s rows: bytes per token, node, expression, statement, memo, edge and relocation, memory per thousand lines, and cache misses per edit. `projects` and `budgets` choose rows, each empty for all; a budget named with no row for any project named (or a project with no row for any budget named) stops the run naming it, never a quiet subset. `{"command": "smoke", ...}` is the smoke above. Every edit row (and the smoke's body edit) also reads its build's profile and fails, whatever its time, when the daemon's loop thread stalled (a `loop stalled` span, listed with its step and ms) or the answer was held more than `hold_ms` (200) by `the job's answer waits for what it still does`, listed with what it waited for; and when the daemon's log gained a line saying a build's results `were not kept after its answer was sent` over the row's builds, quoted (what the build left for the store was lost, and the next build started from less; `blaze slow` and `blaze why` say the same first) |
@@ -538,6 +538,103 @@ result's shape).
 daemon and a warm store build to what blaze builds of the same source from nothing. How to run
 longer runs, what a finding is and what the fuzzer does not cover are in [fuzzing.md](fuzzing.md).
 
+## Revision tests
+
+A revision test is a small project and a sequence of revisions of its files, built one after
+another on incremental state that is kept between them. After each revision three things are
+held: the result is what a clean build of that revision gives, what was made again and what was
+reused is what the test states, and nothing panicked on the way. The pattern is rustc's
+`tests/incremental` (revisions of one source, built on one incremental directory), with the
+assertions in blaze's own terms: functions made again by path, engine memos run and verified,
+the no-op lane, how the image was linked.
+
+A case is `crates/blaze-engine/tests/revisions/cases/<name>/`: `base/` (the project), `rev2/`,
+`rev3/` .. (the files each revision changes), and `test.toml`:
+
+    about = "A body edit makes that function's code again and no other's."
+    drivers = ["sim", "real"]
+
+    [[revision]]                 # rev1: base/
+    action = "run"               # check, build, run or test
+    prints = "2 4\n"
+
+    [[revision]]                 # rev2: base/ with rev2/ over it
+    steps = ["stop", "edit"]     # what happens before the action; the default is ["edit"]
+    action = "run"
+    prints = "11 4\n"
+    redone = ["app::f"]          # exactly these functions' code is made again
+    max_executed = 200           # engine memos run; max_verified, max_units, max_ms alike
+    known = { "real: max_executed" = "why it fails today" }
+
+Steps: `edit`, `edit by rename` (written beside and renamed over), `edit by truncate then write`,
+`stop` (`blaze stop`), `kill` (`kill -9` of the daemon), `touch PATH`, and `check`, `build`, `run`,
+`test` (a command that only has to succeed). Expectations: `fails` (the action fails saying
+this), `prints`, `says`, `redone` (exactly), `redone_has`, `reused`, `max_units`, `max_executed`,
+`max_verified`, `max_ms`, `noop` (answered as the last build was, with no walk), `link` (`first`,
+`spliced`, `unchanged`, `full`, `none`), `bytes` (the linked bytes equal a clean build's), `env`
+(variables of every command from that revision on), `args`, `remove`. A key the harness does
+not know is refused. `known` lists checks that fail today, each with its cause (`"real: check"`
+or `"sim: check"` for one driver): a known failure is printed and passes; one that stops
+failing fails the test until its row is removed, so the list stays true.
+
+Two drivers run the same cases (`crates/blaze-engine/tests/revisions/spec.rs` and `check.rs` are
+shared by both):
+
+- **The simulated driver** (`crates/hir-ty-codegen/v2/edits/revisions.rs`): in process, no
+  daemon, no file system, no clock. It runs the pipeline from source text to code records (the
+  front end over one database, the code generator's driver with the memo and store the
+  revisions before left, every store hit recomputed and compared) and holds each revision to a
+  clean database with the edit fuzzer's oracle, byte for byte. Each case runs under `seeds`
+  seeds (8 unless the case says): a seed draws restarts, torn states of a file between the two
+  writes of a save, and repeated builds; seed 0 draws nothing. A failure names its seed, and
+  `BLAZE_REVISIONS_SEED=<n>` runs it alone. It simulates the case's `src/lib.rs` over minicore,
+  so a case under both drivers keeps its logic in a `#![no_std]` library and prints from a
+  `src/main.rs` only the real driver builds. It does not see `prints`, `says`, `link`, `noop`,
+  `max_units`, `max_ms` or the memo counts, and says so by leaving them `-` in its rows. 13
+  cases under 8 seeds run in 1.4 s.
+
+      cargo +nightly-<date> test --release -p hir-ty-codegen --lib -- edits::revisions
+
+- **The real driver** (`crates/blaze-engine/tests/revisions/real.rs`): real processes. One
+  daemon in a home of its own serves every revision; then each revision is built from nothing
+  at the same paths (a fresh home, cache and checkout) and the two are compared: outcome and
+  output always, linked bytes where the case asks. It reads `--message-format=json`'s
+  `blaze-work` and `build-finished` lines, `blaze why --all --json` and
+  `blaze explain edit_work`. Every command runs under `env_clear` and a short list, in
+  `/private/tmp` (never `/tmp`, a symlink), with `BLAZE_VERIFY_STORE=1`. At most 4 cases run at
+  once (`BLAZE_REVISIONS_JOBS`): a daemon's store pool reserves a large address range. 21 cases
+  take six to nine minutes on an 18-core Mac (371 s and 523 s, 2026-11-11), most of it the
+  standard library built cold for each home: too slow for the gate as it stands, which is why
+  the simulated driver is the primary one. It is for what only a kernel shows (the watcher's event order, `kill -9`, a program
+  really run, a splice of a real image) and as the cross-check of the simulated driver.
+
+      RUST_TEST_THREADS=6 cargo +nightly-<date> test --release -p blaze-engine --test revisions --no-fail-fast
+
+`BLAZE_REVISIONS_REPORT=<file>` appends one JSON line a revision; each row is also printed
+(`revisions: real <case> rev2 run ok units=1 executed=..`).
+
+To add a case: make the directory, list it in `real!` (main.rs) and, if it names `sim`, in
+`sim!` (revisions.rs); a case no list holds fails `every_case_is_listed`. To turn an
+invalidation bug into one: copy the smallest project that shows it into `base/`, put the edit
+that breaks it in `rev2/`, state what a correct build prints and makes again, and run it under
+the simulated driver first; if it fails there the seed replays it in milliseconds and the
+project can be cut down until it stops failing. If only the real driver fails, the bug is
+below code records (the daemon, the store, the splice) or in what std brings.
+
+rustc's own corpus runs through the real driver (`rustc.rs`): fetch `tests/incremental` of
+rust-lang/rust at the commit `library/UPSTREAM` names into a new directory outside the tree,
+then
+
+    BLAZE_REVISIONS_RUSTC=<dir>/tests/incremental BLAZE_REVISIONS_RUSTC_REPORT=<file> \
+        cargo +nightly-<date> test --release -p blaze-engine --test revisions -- --ignored rustc_incremental_corpus --nocapture
+
+Each file is a package's root; a revision is a `revision` file a generated build script turns
+into `cargo::rustc-cfg`; `rpass` programs are built and not run (the corpus is untrusted data).
+The report groups failures by cause. It is not in the gate. On 2026-11-11 (all-1111 at
+6b5b794d0d): 180 files with revisions, 120 run, 53 pass, 67 fail (61 of them one refusal of the
+splice when a cfg swaps a function for its twin), 60 not run (25 have one revision, 35 use a
+directive or flag the importer has no place for); about 30 minutes.
+
 ## Adding a test
 
 A bug found in a real crate is proven fixed by that crate's own tests passing under blaze
@@ -545,7 +642,9 @@ A bug found in a real crate is proven fixed by that crate's own tests passing un
 is small enough to state, by a unit test beside the
 code that was wrong. A test states its expected result itself; none is "what rustc does". A
 bug of the daemon, the store or the splice goes in the harness of that area as a step whose
-warm build has to give what blaze's build from nothing gives.
+warm build has to give what blaze's build from nothing gives. An invalidation bug (stale
+code, something made again that should not be, a restart or a save that breaks the next build)
+becomes a [revision test](#revision-tests).
 
 ## Reproducing a failure
 

@@ -53,6 +53,9 @@ gimli = { workspace = true, features = ["endian-reader"] }
 object.workspace = true
 regex.workspace = true
 rustc-demangle.workspace = true
+# The explorer's typed headers and what its session reads of a request, serialized and read
+# field by field: no JSON map is made in the session core (`explore::session`).
+serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, optional = true }

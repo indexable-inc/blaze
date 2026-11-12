@@ -418,6 +418,38 @@ pub fn inherit_in_child(command: &mut std::process::Command, fd: std::os::fd::Ra
     };
 }
 
+/// A descriptor of this process's own for what `fd` names: one this process was started with
+/// open (a program that became this one by `exec` left it so, and named it on the command
+/// line). It is a duplicate, close-on-exec, so it is owned by nothing else whatever `fd` is,
+/// and `fd` itself is made close-on-exec too: no program this process starts gets either. An
+/// error for a number that is no open descriptor, or one of the three standard streams.
+#[cfg(unix)]
+pub fn inherited(fd: std::os::fd::RawFd) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+    if fd <= libc::STDERR_FILENO {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("descriptor {fd} is a standard stream's number, or none"),
+        ));
+    }
+    // SAFETY: `fcntl` with `F_DUPFD_CLOEXEC` reads and writes no memory of this process; on a
+    // number that is no open descriptor it fails with `EBADF`, which is the error below.
+    let own = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, libc::STDERR_FILENO + 1) };
+    if own == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `own` is a descriptor the call above just made, which nothing else knows of, so
+    // this value is its one owner.
+    let own = unsafe { std::os::fd::OwnedFd::from_raw_fd(own) };
+    // SAFETY: as the first call: no memory is read or written, and `fd` is open (it was
+    // duplicated). Whoever owns `fd`, a flag that closes it in programs started later takes
+    // nothing from this process.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(own)
+}
+
 /// Whose CPU time [`cpu_time`] reads.
 #[cfg(unix)]
 #[derive(Clone, Copy)]

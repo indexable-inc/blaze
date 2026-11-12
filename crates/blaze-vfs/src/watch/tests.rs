@@ -158,8 +158,40 @@ impl<W: Watch> Run<W> {
 
     /// Runs everything in flight, handing each completion to whichever asked for it.
     fn pump(&mut self) {
+        self.pump_with(None);
+    }
+
+    /// As [`Run::pump`], but each read of a file the watcher asks for is kept in `held`
+    /// instead of handed to the machine: in flight, its stamp taken and its bytes not yet
+    /// read, while the test changes the disk. [`Run::finish_reads`] does them.
+    fn pump_holding_reads(&mut self, held: &mut Vec<Effect>) {
+        self.pump_with(Some(held));
+    }
+
+    /// Completes the reads `held` against the disk as it is now, as [`Effect::ReadAll`] does
+    /// (a file not there reads as empty), before the journal tells anything more: the point
+    /// of a transcript where a read falls after a change and before its event. Then pumps.
+    fn finish_reads(&mut self, held: &mut Vec<Effect>) {
+        for effect in held.drain(..) {
+            let Effect::ReadAll { file, tag } = effect else { panic!("held {effect:?}") };
+            let path = &file.as_str()["ws/".len()..];
+            self.reads.push(path.into());
+            let bytes = self.disk.get(path).cloned().unwrap_or_default();
+            let done = Done::Read(bytes);
+            let out = self.watcher.complete(&mut self.vfs, Completion { tag, done }, &mut self.effects);
+            self.out.extend(out);
+        }
+        self.pump();
+    }
+
+    fn pump_with(&mut self, mut held: Option<&mut Vec<Effect>>) {
         let mut done = Vec::new();
         loop {
+            if let Some(held) = held.as_deref_mut() {
+                let is_read =
+                    |it: &Effect| matches!(it, Effect::ReadAll { .. } | Effect::ReadLink { .. });
+                held.extend(self.effects.extract_if(.., |it| is_read(it)));
+            }
             for effect in &self.effects {
                 match effect {
                     Effect::ReadAll { file, .. } | Effect::ReadLink { file, .. } => {
@@ -186,6 +218,35 @@ impl<W: Watch> Run<W> {
                 }
             }
         }
+    }
+
+    /// The journal tells `files` changed, as one batch.
+    fn tell(&mut self, files: &[&str]) {
+        let cursor = self.vfs.disks.get("disk").expect("a disk").cursor;
+        let mut files: Vec<FileName> = files.iter().map(|it| ws(it)).collect();
+        files.sort_unstable();
+        files.dedup();
+        let told = Journaled { files, lost: Vec::new(), cursor, caught_up: true };
+        let journal = Completion { tag: Tag(TAGS), done: Done::Journaled(Box::new(told)) };
+        let out = self.watcher.complete(&mut self.vfs, journal, &mut self.effects);
+        self.out.extend(out);
+    }
+
+    /// The bytes `path` had in each root the watcher committed, in order (`None` where it
+    /// was not there).
+    fn committed(&self, path: &str) -> Vec<Option<Vec<u8>>> {
+        let tree = &self.vfs.tree;
+        let commits = self.out.iter().filter_map(|it| match it {
+            Watched::Committed(commit) => Some(commit.root),
+            _ => None,
+        });
+        commits
+            .map(|root| {
+                let root = self.vfs.root(root).expect("a committed root");
+                tree.entry(root, path)
+                    .map(|(node, _)| tree.bytes(node).expect("not corrupt").expect("a file").to_vec())
+            })
+            .collect()
     }
 
     /// blaze stops: the machine keeps its disk and journal, the watch is gone, and the column
@@ -346,7 +407,9 @@ fn a_symlink_to_a_directory_found_by_a_relisting_is_read_as_a_link() {
         run.pump();
         run.check(what);
         assert_eq!(run.lost(), [(".claude", Lost::Unnamed)], "{what}");
-        assert_eq!(run.stamped, Vec::<String>::new(), "{what}");
+        // Nothing but the two links read, each stamped once more after its read.
+        run.stamped.sort_unstable();
+        assert_eq!(run.stamped, ["ws/.claude/rules", "ws/.claude/skills"], "{what}");
         for link in [".claude/skills", ".claude/rules"] {
             assert_eq!(run.mode(link), Some(Mode::Symlink), "{what}: {link}");
             let file = ws(link);
@@ -531,7 +594,8 @@ fn an_unnamed_change_lists_its_directory_alone() {
     run.pump();
     run.check("unnamed");
     assert_eq!(run.lost(), [("src", Lost::Unnamed)]);
-    assert_eq!(run.stamped, Vec::<String>::new());
+    // Nothing but the one file read, stamped once more after its read.
+    assert_eq!(run.stamped, ["ws/src/c.rs"]);
     assert_eq!(run.reads(), BTreeSet::from(["src/c.rs"]));
     assert!(!run.head().keys().any(|it| it.starts_with("src/old")));
 }
@@ -825,10 +889,436 @@ fn a_warm_batch_allocates_only_the_names_its_reads_hand_the_driver() {
             run.effects.iter().filter(|it| matches!(it, Effect::ReadAll { .. })).count() as u64,
             n
         );
+        // Each read done with the bytes the disk has; with the last, the files read are
+        // stamped once more, in the batch's own buffer: no allocation.
+        let reads: Vec<Completion> = run
+            .effects
+            .drain(..)
+            .map(|effect| {
+                let Effect::ReadAll { file, tag } = effect else { panic!("{effect:?}") };
+                let bytes = run.disk[&file.as_str()["ws/".len()..]].clone();
+                Completion { tag, done: Done::Read(bytes) }
+            })
+            .collect();
+        assert_at_most(budget(0), "their reads, and their stamps asked for again", || {
+            for completion in reads {
+                let out = run.watcher.complete(&mut run.vfs, completion, &mut run.effects);
+                assert!(out.is_empty(), "{out:?}");
+            }
+        });
+        // The stamps taken again are those taken before the reads: the bytes are committed.
+        let completion = stamps(&mut run, 1);
+        run.watcher.complete(&mut run.vfs, completion, &mut run.effects);
         run.pump();
         assert!(run.watcher.idle());
         assert_eq!(run.head(), run.disk, "the same bytes read make no change");
     }
+}
+
+const OLD: &str = "fn main() { old() }";
+const NEW: &str = "fn main() { the_new_one() }";
+const TEMP: &str = "src/.main.rs.tmp";
+const MAIN: &str = "src/main.rs";
+
+/// A run whose journal tells nothing by itself (the machine's watch is stopped once the
+/// start's sweep is in, as the tests of changes no watch hears do): the test tells each batch
+/// ([`Run::tell`]), so a transcript says exactly which names a batch holds and where each
+/// read falls.
+fn transcript<W: Watch>(seed: u64, files: &[(&str, &str)]) -> Run<W> {
+    let mut run: Run<W> = Run::with(seed, Journal::Usn, files);
+    run.check("start");
+    run.watcher.stop(&mut run.effects);
+    run.pump();
+    assert!(run.out.contains(&Watched::Ended(None)));
+    run.out.clear();
+    run
+}
+
+/// Every commit of `run` held `path`, where it had it, as one of `had`.
+fn only_ever<W: Watch>(run: &Run<W>, path: &str, had: &[&[u8]]) -> Result<(), String> {
+    for bytes in run.committed(path).into_iter().flatten() {
+        if !had.contains(&&bytes[..]) {
+            return Err(format!(
+                "a commit held {path} as {:?}, which it never was",
+                String::from_utf8_lossy(&bytes)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// How the journal tells an editor's rename of a temporary file over `src/main.rs`, after the
+/// batch that told of the temporary file: FSEvents names both paths in one batch (seen
+/// 2026-11-11), inotify and fanotify tell a move as two events (from, to), which the watch's
+/// reads of them may hand on as one batch or two, in the order they happened; the last is two
+/// batches the other way round, which no kernel tells and the watcher must still stand.
+const TOLD: [&[&[&str]]; 4] =
+    [&[&[TEMP, MAIN]], &[&[TEMP], &[MAIN]], &[&[TEMP], &[TEMP, MAIN]], &[&[MAIN], &[TEMP]]];
+
+/// The transcript seen on macOS on 2026-11-11 (`blaze run` at once after `sed -i ''` or any
+/// write-then-rename: E0601 "`main` function not found", until the file was written again),
+/// under a watcher that saves a file's first stamp whatever its read met (`trusts_reads`) or
+/// today's: the journal tells of the temporary file; it is stamped (there, with the new
+/// bytes); the editor renames it over `src/main.rs`; its read is done, by name, of a file no
+/// longer there, which `ReadAll` gives as empty; the journal tells the rename as `told` says.
+/// `Err` says what a commit held that the file never was, or that the head did not end as the
+/// disk is.
+fn renamed_over<W: Watch>(
+    seed: u64,
+    told: &[&[&str]],
+    plant: impl FnOnce(&mut Run<W>),
+) -> Result<(), String> {
+    let mut run: Run<W> = transcript(seed, &[("Cargo.toml", "[package]"), (MAIN, OLD)]);
+    plant(&mut run);
+    run.write(TEMP, NEW);
+    run.tell(&[TEMP]);
+    let mut held = Vec::new();
+    run.pump_holding_reads(&mut held);
+    assert_eq!(held.len(), 1, "the temporary file is stamped and its read asked for");
+    run.rename(TEMP, MAIN);
+    run.finish_reads(&mut held);
+    for batch in told {
+        run.tell(batch);
+        if seed % 2 == 0 {
+            run.pump();
+        }
+    }
+    run.pump();
+    only_ever(&run, MAIN, &[OLD.as_bytes(), NEW.as_bytes()])?;
+    match run.head() == run.disk && run.watcher.idle() {
+        true => Ok(()),
+        false => Err(format!("the head is {:?} and the disk {:?}", run.head(), run.disk)),
+    }
+}
+
+/// The invariant: a file an editor replaces by a rename is seen as what it was or what it is,
+/// never as empty, whichever way the journal tells the rename and wherever the read of the
+/// temporary file falls; and once everything told is looked at, the head is the disk.
+#[test]
+fn a_file_renamed_over_another_between_its_stamp_and_its_read_is_never_read_as_empty() {
+    for (order, told) in TOLD.iter().enumerate() {
+        for seed in 0..10 {
+            for (who, got) in [
+                ("the watcher", renamed_over::<Watcher>(seed, told, |_| {})),
+                ("the reference", renamed_over::<reference::Watcher>(seed, told, |_| {})),
+            ] {
+                assert_eq!(got, Ok(()), "{who}, told as {order}, seed {seed}");
+            }
+        }
+    }
+}
+
+/// The control: a watcher that saves a file's first stamp whatever its read met, as until
+/// 2026-11-11, commits `src/main.rs` empty when the journal names both paths of the rename
+/// in one batch, as FSEvents does.
+#[test]
+fn the_oracle_catches_a_stamp_saved_for_a_read_that_found_the_file_renamed_away() {
+    for seed in 0..10 {
+        let got = renamed_over::<Watcher>(seed, TOLD[0], |run| run.watcher.trusts_reads = true);
+        let why = got.expect_err("the planted bug was not caught");
+        assert!(why.contains("src/main.rs as \"\""), "seed {seed}: caught as {why}");
+    }
+}
+
+/// The transcripts of the other ways a path changes between its stamp and its read: each ends
+/// with the head as the disk is and no commit of bytes the file never had. `told` is what the
+/// journal names for the change.
+#[test]
+fn a_path_that_changes_between_its_stamp_and_its_read_is_looked_at_again() {
+    type Change = fn(&mut Run);
+    const FIRST: &str = "fn main() { a_first_edit() }";
+    let changes: [(&str, Change, &[&str]); 5] = [
+        ("deleted", |run| run.delete(MAIN), &[MAIN]),
+        (
+            "deleted and made again",
+            |run| {
+                run.delete(MAIN);
+                run.write(MAIN, NEW);
+            },
+            &[MAIN],
+        ),
+        ("renamed away", |run| run.rename(MAIN, "src/moved.rs"), &[MAIN, "src/moved.rs"]),
+        (
+            "replaced by a rename",
+            |run| {
+                run.write(TEMP, NEW);
+                run.rename(TEMP, MAIN);
+            },
+            &[TEMP, MAIN],
+        ),
+        (
+            "written in place",
+            |run| {
+                run.sim.advance(Duration::from_millis(1));
+                run.write(MAIN, NEW);
+            },
+            &[MAIN],
+        ),
+    ];
+    for (name, change, told) in changes {
+        for seed in 0..10 {
+            let what = format!("{name}, seed {seed}");
+            let mut run: Run = transcript(seed, &[(MAIN, OLD)]);
+            // A first write, told and stamped; its read is in flight when the path changes.
+            run.sim.advance(Duration::from_millis(1));
+            run.write(MAIN, FIRST);
+            run.tell(&[MAIN]);
+            let mut held = Vec::new();
+            run.pump_holding_reads(&mut held);
+            assert_eq!(held.len(), 1, "{what}");
+            change(&mut run);
+            run.finish_reads(&mut held);
+            run.tell(told);
+            run.pump();
+            let had = [OLD.as_bytes(), FIRST.as_bytes(), NEW.as_bytes()];
+            assert_eq!(only_ever(&run, MAIN, &had), Ok(()), "{what}");
+            run.check(&what);
+        }
+    }
+}
+
+/// A file that really is empty is read as empty: one made empty, and one truncated in place.
+#[test]
+fn an_empty_file_is_read_as_empty() {
+    let mut run: Run = transcript(3, &[(MAIN, OLD)]);
+    run.write("src/empty.rs", "");
+    run.tell(&["src/empty.rs"]);
+    run.pump();
+    run.check("made empty");
+    assert_eq!(run.head()["src/empty.rs"], b"");
+    run.sim.advance(Duration::from_millis(1));
+    run.write(MAIN, "");
+    run.tell(&[MAIN]);
+    run.pump();
+    run.check("truncated");
+    assert_eq!(run.head()[MAIN], b"");
+}
+
+/// One run of an editor against the watcher: `src/main.rs` replaced by a rename `rounds`
+/// times (a temporary file written, then renamed over it), each version its own text. After
+/// each of the editor's steps `rng` picks what happens before the next: the journal tells
+/// some of what changed so far (several changes as one batch, as FSEvents hands them, or one
+/// each, as inotify does), the watcher's looks run with their reads held in flight, or the
+/// reads held are done. After half the replacements a request is made: everything is told
+/// and looked at, and the head must then be the disk, which is what the request builds.
+/// `Err` names a request that would build something else, or a commit that held
+/// `src/main.rs` with bytes it never had.
+fn replaced_by_renames(seed: u64, rounds: u64, trusts_reads: bool) -> Result<(), String> {
+    let mut rng = Rng::new(seed ^ 0x7265_706c);
+    let mut run: Run = transcript(seed, &[(MAIN, "fn main() { v0() }")]);
+    run.watcher.trusts_reads = trusts_reads;
+    let mut versions = vec![b"fn main() { v0() }".to_vec()];
+    let mut held = Vec::new();
+    // What changed and the journal has not told yet, in the order it happened.
+    let mut untold: Vec<String> = Vec::new();
+    fn tell_some(run: &mut Run, untold: &mut Vec<String>, rng: &mut Rng) {
+        if untold.is_empty() {
+            return;
+        }
+        let n = 1 + rng.below(untold.len() as u64) as usize;
+        let batch: Vec<String> = untold.drain(..n).collect();
+        let batch: Vec<&str> = batch.iter().map(String::as_str).collect();
+        run.tell(&batch);
+    }
+    let mut step = |run: &mut Run, held: &mut Vec<Effect>, untold: &mut Vec<String>| {
+        match rng.below(5) {
+            0 => {
+                tell_some(run, untold, &mut rng);
+                run.pump_holding_reads(held);
+            }
+            1 => {
+                tell_some(run, untold, &mut rng);
+                run.finish_reads(held);
+            }
+            2 => run.finish_reads(held),
+            3 => run.pump_holding_reads(held),
+            _ => {}
+        }
+        rng.below(2) == 0
+    };
+    for round in 1..=rounds {
+        let text = format!("fn main() {{ v{round}() }}");
+        let temp = format!("src/.main.rs.tmp{round}");
+        run.sim.advance(Duration::from_millis(1));
+        run.write(&temp, &text);
+        untold.push(temp.clone());
+        step(&mut run, &mut held, &mut untold);
+        run.rename(&temp, MAIN);
+        untold.extend([temp, MAIN.to_owned()]);
+        versions.push(text.into_bytes());
+        let request = step(&mut run, &mut held, &mut untold);
+        if request || round == rounds {
+            while !untold.is_empty() {
+                let n = 1 + rng_below(seed, round, untold.len());
+                let batch: Vec<String> = untold.drain(..n).collect();
+                let batch: Vec<&str> = batch.iter().map(String::as_str).collect();
+                run.tell(&batch);
+            }
+            run.finish_reads(&mut held);
+            if run.head() != run.disk || !run.watcher.idle() {
+                return Err(format!(
+                    "round {round}: a request would build src/main.rs as {:?}, and the disk has {:?}",
+                    run.head().get(MAIN).map(|it| String::from_utf8_lossy(it).into_owned()),
+                    String::from_utf8_lossy(&run.disk[MAIN])
+                ));
+            }
+        }
+    }
+    let versions: Vec<&[u8]> = versions.iter().map(Vec::as_slice).collect();
+    only_ever(&run, MAIN, &versions)
+}
+
+/// How many of `len` untold changes a request's batch takes, from the seed and the round.
+fn rng_below(seed: u64, round: u64, len: usize) -> usize {
+    Rng::new(seed.wrapping_mul(0x9e37_79b9).wrapping_add(round)).below(len as u64) as usize
+}
+
+/// The invariant: whatever falls between a file's stamp and its read, a file replaced by a
+/// rename is seen as what it was or what it is, never as anything else, and a request made
+/// after a replacement builds what the disk has. 500 replacements a seed, with a request
+/// after about half of them.
+#[test]
+fn a_file_replaced_by_renames_500_times_is_always_one_of_its_versions() {
+    for seed in 0..16 {
+        if let Err(why) = replaced_by_renames(seed, 500, false) {
+            panic!("seed {seed}: {why}");
+        }
+    }
+}
+
+/// The control of [`a_file_replaced_by_renames_500_times_is_always_one_of_its_versions`]: a
+/// watcher that saves a file's first stamp whatever its read met is caught in every seed.
+#[test]
+fn the_oracle_catches_a_request_that_builds_what_the_disk_never_had() {
+    for seed in 0..16 {
+        let why = replaced_by_renames(seed, 500, true).expect_err("the planted bug was not caught");
+        assert!(why.contains("src/main.rs as"), "seed {seed}: {why}");
+    }
+}
+
+/// The same on this machine's own kernel and journal (FSEvents on macOS, fanotify on Linux),
+/// through the driver the daemon runs: `src/main.rs` is replaced by a rename 500 times, the
+/// rename held back in two rounds of three until the watcher has stamped the temporary file
+/// and asked for its read, so that its look falls across the rename, and a request follows
+/// each at once (a flush
+/// of the watch, then everything told looked at, as the daemon holds a request). No commit
+/// may hold `src/main.rs` as anything but the version before or the new one, and the request
+/// must see the new one.
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn a_file_replaced_by_renames_500_times_on_this_kernel_is_always_one_of_its_versions() {
+    use std::time::Instant;
+
+    use blaze_core::wait::Deadline;
+
+    const FLUSHES: u64 = TAGS + (1 << 33);
+    let root = std::env::temp_dir().join(format!("blaze-vfs-renames-{}", std::process::id()));
+    _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("ws/src")).unwrap();
+    std::fs::create_dir_all(root.join("state")).unwrap();
+    let main = root.join("ws/src/main.rs");
+    std::fs::write(&main, "fn main() { v0() }").unwrap();
+
+    let mut driver = blaze_core::native(&root, 2).unwrap();
+    let mut vfs = Vfs::recover(name("state/journal"), 0, &[]).0;
+    let mut watcher = Watcher::new("disk", name("ws"), TAGS);
+    let mut effects = Vec::new();
+    watcher.start(&vfs, &mut effects);
+    let read = |vfs: &Vfs| -> Option<Vec<u8>> {
+        let root = vfs.root(vfs.head("disk")?).expect("a head's root");
+        let (node, _) = vfs.tree.entry(root, MAIN)?;
+        Some(vfs.tree.bytes(node).expect("not corrupt").expect("a file").to_vec())
+    };
+    // One turn of the driver: what was asked is handed on, what is done within `wait` is
+    // taken in. `allowed` is what `src/main.rs` may be in a commit made now. Returns the
+    // flush told, if one was.
+    let mut done = Vec::new();
+    let mut turn = |driver: &mut blaze_core::Native,
+                    vfs: &mut Vfs,
+                    watcher: &mut Watcher,
+                    effects: &mut Vec<Effect>,
+                    wait: Duration,
+                    allowed: [&str; 2],
+                    round: u64|
+     -> (Option<u64>, bool) {
+        driver.submit(effects);
+        driver.poll(&mut done, Deadline::after(driver.now(), wait));
+        let (mut flushed, mut scanned) = (None, false);
+        for completion in done.drain(..) {
+            if vfs.owns(completion.tag) {
+                vfs.complete(completion, effects);
+            } else if watcher.owns(completion.tag) {
+                for out in watcher.complete(vfs, completion, effects) {
+                    match out {
+                        Watched::Committed(_) => {
+                            let bytes = read(vfs).expect("src/main.rs is never deleted");
+                            assert!(
+                                allowed.iter().any(|it| it.as_bytes() == bytes),
+                                "round {round}: a commit held src/main.rs as {:?}, which is neither {allowed:?}",
+                                String::from_utf8_lossy(&bytes)
+                            );
+                        }
+                        Watched::Scanned => scanned = true,
+                        Watched::Lost { .. } => {}
+                        other => panic!("round {round}: {other:?}"),
+                    }
+                }
+            } else {
+                assert_eq!(completion.done, Done::Flushed, "round {round}: {completion:?}");
+                flushed = Some(completion.tag.0);
+            }
+        }
+        (flushed, scanned)
+    };
+    // Bounded: a wait that does not end fails naming what it waited for.
+    let within = |began: Instant, what: &str| {
+        assert!(began.elapsed() < Duration::from_secs(60), "60 s and still waiting for {what}");
+    };
+    let began = Instant::now();
+    let mut scanned = false;
+    while !(scanned && watcher.idle()) {
+        within(began, "the start's sweep");
+        let wait = Duration::from_millis(20);
+        scanned |= turn(&mut driver, &mut vfs, &mut watcher, &mut effects, wait, ["fn main() { v0() }"; 2], 0).1;
+    }
+    let mut last = String::from("fn main() { v0() }");
+    // The rounds whose rename fell between the temporary file's stamp and its read.
+    let mut crossed = 0u64;
+    for round in 1..=500u64 {
+        let text = format!("fn main() {{ v{round}() }}");
+        let temp = root.join(format!("ws/src/.main.rs.tmp{round}"));
+        std::fs::write(&temp, &text).unwrap();
+        // Two rounds in three, the rename waits (up to 200 ms) until the watcher has stamped
+        // the temporary file and asked for its read, which is then done after the rename:
+        // the interleaving that read it as empty. The third renames at once.
+        let reads_temp = |effects: &[Effect]| {
+            effects.iter().any(|it| matches!(it, Effect::ReadAll { file, .. } if file.as_str().contains(".tmp")))
+        };
+        let began = Instant::now();
+        while round % 3 != 0 && !reads_temp(&effects) && began.elapsed() < Duration::from_millis(200) {
+            let wait = Duration::from_millis(1);
+            turn(&mut driver, &mut vfs, &mut watcher, &mut effects, wait, [&last, &text], round);
+        }
+        crossed += u64::from(reads_temp(&effects));
+        std::fs::rename(&temp, &main).unwrap();
+        // The request, at once: the watch flushed, and everything told before it looked at.
+        effects.push(Effect::Flush { watch: Tag(TAGS), tag: Tag(FLUSHES + round) });
+        let (began, mut flushed) = (Instant::now(), false);
+        while !(flushed && watcher.idle()) {
+            within(began, &format!("round {round}'s request"));
+            let wait = Duration::from_millis(20);
+            let told = turn(&mut driver, &mut vfs, &mut watcher, &mut effects, wait, [&last, &text], round).0;
+            flushed |= told == Some(FLUSHES + round);
+        }
+        let got = read(&vfs).expect("src/main.rs is never deleted");
+        assert_eq!(String::from_utf8_lossy(&got), text, "round {round}: what a request builds");
+        last = text;
+    }
+    watcher.stop(&mut effects);
+    driver.submit(&mut effects);
+    drop(driver);
+    _ = std::fs::remove_dir_all(&root);
+    assert!(crossed >= 100, "only {crossed} of 500 renames fell between a stamp and its read");
 }
 
 /// `cmp_below` is the order of a name against a directory and a `/`, and `is_below` whether it

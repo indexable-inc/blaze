@@ -45,26 +45,121 @@ pub struct OutFile {
     /// `/`-separated, relative, with no `.` or `..`.
     pub path: String,
     pub executable: bool,
-    /// `None` for a directory, which is kept even when empty.
+    /// `None` for a directory, which is kept even when empty, and for a link ([`OutFile::link`]).
     pub bytes: Option<Vec<u8>>,
+    /// For a link the run left that leads into its own package ([`collect`]): where it leads,
+    /// absolute. In a value as it is kept that path is ported ([`crate::roots::Roots::stored`]),
+    /// the package's root its placeholder, so a reuse in another checkout
+    /// ([`crate::roots::Roots::restored`], [`restore`]) makes the link into that checkout's
+    /// package. What is behind it is the package's, never kept: what the run read through it
+    /// is in its trace as any read of its package ([`through_links`]).
+    pub link: Option<String>,
 }
+
+/// A value's layout with no link in it: what [`Value::encode`] writes of a value that has
+/// none, byte for byte what was written before a link could be kept, so a value kept then and
+/// the same value kept now are the same bytes under the same key.
+#[derive(Serialize)]
+struct PlainRef<'a> {
+    code: Option<i32>,
+    signal: Option<i32>,
+    stdout: &'a [u8],
+    stderr: &'a [u8],
+    files: Vec<PlainFileRef<'a>>,
+}
+
+#[derive(Serialize)]
+struct PlainFileRef<'a> {
+    path: &'a str,
+    executable: bool,
+    bytes: Option<&'a [u8]>,
+}
+
+/// [`PlainRef`], read.
+#[derive(Deserialize)]
+struct Plain {
+    code: Option<i32>,
+    signal: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    files: Vec<PlainFile>,
+}
+
+#[derive(Deserialize)]
+struct PlainFile {
+    path: String,
+    executable: bool,
+    bytes: Option<Vec<u8>>,
+}
+
+/// What the bytes of a kept value start with when no file of it is a link ([`PlainRef`]).
+const PLAIN: &[u8] = b"blaze v2 run value 1";
+/// And when one is: the whole [`Value`], each file with its link.
+const LINKED: &[u8] = b"blaze v2 run value 2";
 
 impl Value {
     pub fn succeeded(&self) -> bool {
         self.code == Some(0)
     }
 
+    /// The bytes the store keeps. One value has one encoding: the layout with no link
+    /// ([`PLAIN`]) exactly when no file of it is a link, the one with links ([`LINKED`])
+    /// otherwise.
     pub fn encode(&self) -> Vec<u8> {
+        if self.files.iter().any(|it| it.link.is_some()) {
+            // alloc: the bytes the store keeps, encoded after the magic in one buffer
+            return postcard::to_extend(self, LINKED.to_vec()).expect("a value is always encodable");
+        }
+        let plain = PlainRef {
+            code: self.code,
+            signal: self.signal,
+            stdout: &self.stdout,
+            stderr: &self.stderr,
+            // alloc: once per value encoded, a borrowed entry a file
+            files: self
+                .files
+                .iter()
+                .map(|it| PlainFileRef {
+                    path: &it.path,
+                    executable: it.executable,
+                    bytes: it.bytes.as_deref(),
+                })
+                .collect(),
+        };
         // alloc: the bytes the store keeps, encoded after the magic in one buffer
-        postcard::to_extend(self, b"blaze v2 run value 1".to_vec())
-            .expect("a value is always encodable")
+        postcard::to_extend(&plain, PLAIN.to_vec()).expect("a value is always encodable")
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Value, String> {
-        let rest = bytes
-            .strip_prefix(b"blaze v2 run value 1".as_slice())
-            .ok_or_else(|| "not a run's value".to_owned())?; // alloc: error path
-        postcard::from_bytes(rest).map_err(|error| format!("a run's value: {error}")) // alloc: error path
+        if let Some(rest) = bytes.strip_prefix(LINKED) {
+            let value: Value =
+                postcard::from_bytes(rest).map_err(|error| format!("a run's value: {error}"))?; // alloc: error path
+            // One encoding a value: a value with no link is never written in this layout.
+            if !value.files.iter().any(|it| it.link.is_some()) {
+                return Err("a run's value in the layout with links has none".to_owned()); // alloc: error path
+            }
+            return Ok(value);
+        }
+        let rest = bytes.strip_prefix(PLAIN).ok_or_else(|| "not a run's value".to_owned())?; // alloc: error path
+        let plain: Plain =
+            postcard::from_bytes(rest).map_err(|error| format!("a run's value: {error}"))?; // alloc: error path
+        Ok(Value {
+            code: plain.code,
+            signal: plain.signal,
+            stdout: plain.stdout,
+            stderr: plain.stderr,
+            // alloc: the value's files, moved
+            files: plain
+                .files
+                .into_iter()
+                .map(|it| OutFile {
+                    path: it.path,
+                    executable: it.executable,
+                    bytes: it.bytes,
+                    link: None,
+                })
+                .collect(),
+        })
     }
 
     fn of(exit: Exit, files: Vec<OutFile>) -> Value {
@@ -387,22 +482,26 @@ impl Run {
                 self.spec.command.program.display()
             )));
         };
-        keyed(&mut traced).map_err(|error| RunError::Traced { key: self.spec.key, error })?;
-        if let Some(out_dir) = &self.spec.out_dir {
-            traced.files.retain(|it| !it.0.starts_with(out_dir));
-            traced.dirs.retain(|it| !it.0.starts_with(out_dir));
-        }
         let files = match &self.spec.out_dir {
             Some(out_dir) => {
                 // Stamped before and after it is read: what was read is what the stamps are
                 // of only when nothing was written between ([`left`]).
                 let before = stamps(out_dir).ok();
-                let files = collect(out_dir).map_err(RunError::OutDir)?;
+                let package = self.spec.roots.view().get(crate::roots::Role::Package);
+                let files = collect(out_dir, package.map(Path::new)).map_err(RunError::OutDir)?;
                 left(out_dir, &files, before);
+                // Before the trace is checked against the key and its reads in the `OUT_DIR`
+                // dropped: a read through a link into the package is a read of the package.
+                through_links(&mut traced, out_dir, &files);
                 files
             }
             None => Vec::new(), // alloc: none, an empty list
         };
+        keyed(&mut traced).map_err(|error| RunError::Traced { key: self.spec.key, error })?;
+        if let Some(out_dir) = &self.spec.out_dir {
+            traced.files.retain(|it| !it.0.starts_with(out_dir));
+            traced.dirs.retain(|it| !it.0.starts_with(out_dir));
+        }
         let key = self.spec.key;
         let rule = (exit.code == Some(0))
             .then(|| rule(&exit))
@@ -594,9 +693,10 @@ pub fn differs(kept: &Value, ran: &Value) -> Option<String> {
         return Some(format!("its OUT_DIR holds {ran:?}, not {kept:?}")); // alloc: a difference said
     }
     kept.files.iter().zip(&ran.files).find(|(a, b)| a != b).map(|(a, b)| {
-        let shown = |it: &OutFile| match &it.bytes {
-            None => "a directory".to_owned(), // alloc: a difference said
-            Some(bytes) => format!(
+        let shown = |it: &OutFile| match (&it.link, &it.bytes) {
+            (Some(link), _) => format!("a link to {link}"), // alloc: a difference said
+            (None, None) => "a directory".to_owned(),       // alloc: a difference said
+            (None, Some(bytes)) => format!(
                 "{} bytes{} hashing {}",
                 bytes.len(),
                 if it.executable { ", executable," } else { "" },
@@ -648,16 +748,24 @@ fn empty(dir: &Path) -> Result<(), String> {
 }
 
 /// What `dir` holds: every file and directory below it, by path, sorted. A link is what it
-/// leads to when that is inside `dir`, and an error otherwise: what a later step reads
+/// leads to when that is inside `dir`. One that leads into `package`, the run's own package
+/// (a script that configures its bundled C sources out of tree links them into its `OUT_DIR`:
+/// gmp-mpfr-sys), is kept as that link ([`OutFile::link`]), written below `package` as it is
+/// given, and not walked: the package is read-only to the run and is there wherever the run
+/// is reused, and what is read through the link is traced as a read of the package
+/// ([`through_links`]). A link that leads anywhere else is an error: what a later step reads
 /// through it would be read outside every trace.
 ///
 /// An entry's kind is the listing's (`d_type`), so a directory costs no call of its own, and a
 /// file is opened once, its mode and length read on the descriptor: open, fstat, two reads and
 /// close, the path resolved once (docs/v2/plan.md, "A run's
 /// `OUT_DIR`").
-pub fn collect(dir: &Path) -> Result<Vec<OutFile>, String> {
+pub fn collect(dir: &Path, package: Option<&Path>) -> Result<Vec<OutFile>, String> {
     use std::io::Read as _;
     let top = std::fs::canonicalize(dir).map_err(|error| format!("{}: {error}", dir.display()))?; // alloc: error path
+    // The package with its links followed, as a link's target is compared: read at the first
+    // link that leaves `dir`, most often never.
+    let mut real_package: Option<Option<PathBuf>> = None;
     let mut out = Vec::new(); // alloc: the files the value keeps, read once as a run ends
     let mut stack = vec![PathBuf::new()]; // alloc: once per OUT_DIR collected
     while let Some(rel) = stack.pop() {
@@ -679,13 +787,40 @@ pub fn collect(dir: &Path) -> Result<Vec<OutFile>, String> {
                 let target = std::fs::canonicalize(&path)
                     .map_err(|error| format!("{}: a link to nothing: {error}", path.display()))?; // alloc: error path
                 if !target.starts_with(&top) {
-                    return Err(format!(
-                        // alloc: error path
-                        "{} is a link to {}, outside the OUT_DIR: what is read through it \
-                         would be read outside every trace",
-                        path.display(),
-                        target.display()
-                    ));
+                    let real = real_package
+                        .get_or_insert_with(|| package.and_then(|it| std::fs::canonicalize(it).ok()));
+                    let below = real.as_deref().and_then(|real| target.strip_prefix(real).ok());
+                    let (Some(package), Some(below)) = (package, below) else {
+                        return Err(format!(
+                            // alloc: error path
+                            "{} is a link to {}, outside the OUT_DIR and outside the run's \
+                             own package ({}): what is read through it would be read outside \
+                             every trace",
+                            path.display(),
+                            target.display(),
+                            package.map_or("it has none".to_owned(), |it| it.display().to_string()), // alloc: error path
+                        ));
+                    };
+                    let to = match below.as_os_str().is_empty() {
+                        true => package.to_owned(),
+                        false => package.join(below),
+                    };
+                    let Some(to) = to.to_str() else {
+                        return Err(format!(
+                            // alloc: error path
+                            "{} is a link into the run's own package, to {}, a path that is \
+                             not UTF-8: it can't be kept",
+                            path.display(),
+                            to.display()
+                        ));
+                    };
+                    out.push(OutFile {
+                        path: rel_name(&rel),
+                        executable: false,
+                        bytes: None,
+                        link: Some(to.to_owned()), // alloc: the link the value keeps
+                    });
+                    continue;
                 }
             }
             let is_dir = match linked {
@@ -698,7 +833,7 @@ pub fn collect(dir: &Path) -> Result<Vec<OutFile>, String> {
             let name = rel_name(&rel);
             match is_dir {
                 true => {
-                    out.push(OutFile { path: name, executable: false, bytes: None });
+                    out.push(OutFile { path: name, executable: false, bytes: None, link: None });
                     // A link to a directory inside is kept as what it leads to, but not
                     // walked twice.
                     if !linked {
@@ -718,13 +853,49 @@ pub fn collect(dir: &Path) -> Result<Vec<OutFile>, String> {
                     // alloc: error path
                     let (executable, bytes) =
                         read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-                    out.push(OutFile { path: name, executable, bytes: Some(bytes) });
+                    out.push(OutFile { path: name, executable, bytes: Some(bytes), link: None });
                 }
             }
         }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+/// What `traced` read below a link the run left in its `OUT_DIR` into its own package
+/// (`files`, as [`collect`] gave them), written as the read of the package it is: the tracer
+/// names a path as the program gave it, links not followed, and what a run reads in its
+/// `OUT_DIR` is otherwise its own writing and no input. Each list is left sorted, each entry
+/// once, as [`crate::trace::assemble`] gives it.
+fn through_links(traced: &mut Traced, out_dir: &Path, files: &[OutFile]) {
+    let moved = |path: &Path| -> Option<PathBuf> {
+        let rel = path.strip_prefix(out_dir).ok()?;
+        files.iter().find_map(|file| {
+            let below = rel.strip_prefix(&file.path).ok()?;
+            let link = Path::new(file.link.as_deref()?);
+            Some(match below.as_os_str().is_empty() {
+                true => link.to_owned(), // alloc: a read through a link, renamed once
+                false => link.join(below),
+            })
+        })
+    };
+    let mut any = false;
+    for (path, _) in &mut traced.files {
+        if let Some(to) = moved(path) {
+            (*path, any) = (to, true);
+        }
+    }
+    for (path, _) in &mut traced.dirs {
+        if let Some(to) = moved(path) {
+            (*path, any) = (to, true);
+        }
+    }
+    if any {
+        traced.files.sort();
+        traced.files.dedup_by(|later, first| later.0 == first.0);
+        traced.dirs.sort();
+        traced.dirs.dedup_by(|later, first| later.0 == first.0);
+    }
 }
 
 /// `rel`, `/`-separated: the path an [`OutFile`] keeps.
@@ -824,7 +995,8 @@ fn files_id(files: &[OutFile]) -> blaze_ids::ContentId {
         hasher
             .part(file.path.as_bytes())
             .part(&[u8::from(file.executable)])
-            .opt_part(file.bytes.as_deref());
+            .opt_part(file.bytes.as_deref())
+            .opt_part(file.link.as_deref().map(str::as_bytes));
     }
     hasher.finish()
 }
@@ -882,6 +1054,23 @@ pub fn restore(dir: &Path, files: &[OutFile]) -> Result<(), String> {
         if !ok {
             return Err(format!("a kept OUT_DIR names {:?}, which would leave it", file.path)); // alloc: error path
         }
+        // A link is made only to a whole path with nothing to walk back up: what `collect`
+        // gave, or that written against this run's roots.
+        if let Some(link) = &file.link {
+            use std::path::Component;
+            let whole = Path::new(link).is_absolute()
+                && Path::new(link)
+                    .components()
+                    .all(|it| !matches!(it, Component::ParentDir | Component::CurDir));
+            if !whole || file.bytes.is_some() {
+                return Err(format!(
+                    // alloc: error path
+                    "a kept OUT_DIR names {:?} as a link to {link:?}, which is not a whole \
+                     path into the run's package",
+                    file.path
+                ));
+            }
+        }
     }
     let id = files_id(files);
     if in_place(dir, &id) {
@@ -896,6 +1085,27 @@ pub fn restore(dir: &Path, files: &[OutFile]) -> Result<(), String> {
     let mut made = blaze_hash::HashSet::<&str, std::alloc::Global>::default();
     for file in files {
         let path = dir.join(&file.path);
+        if let Some(link) = &file.link {
+            if let Some((parent, _)) = file.path.rsplit_once('/')
+                && made.insert(parent)
+            {
+                let parent = dir.join(parent);
+                // alloc: error path
+                std::fs::create_dir_all(&parent)
+                    .map_err(|error| format!("{}: {error}", parent.display()))?;
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(link, &path)
+                .map_err(|error| format!("{}: linking it to {link}: {error}", path.display()))?; // alloc: error path
+            #[cfg(not(unix))]
+            return Err(format!(
+                // alloc: error path
+                "{}: a kept link to {link}: no run here keeps a link",
+                path.display()
+            ));
+            #[cfg(unix)]
+            continue;
+        }
         match &file.bytes {
             None => {
                 if made.insert(file.path.as_str()) {
@@ -1365,8 +1575,13 @@ mod tests {
             stdout: b"cargo:rustc-cfg=a\ncargo:rustc-cfg=b\n".to_vec(),
             stderr: Vec::new(),
             files: vec![
-                OutFile { path: "gen".into(), executable: false, bytes: None },
-                OutFile { path: "gen/a.rs".into(), executable: false, bytes: Some(b"x".to_vec()) },
+                OutFile { path: "gen".into(), executable: false, bytes: None, link: None },
+                OutFile {
+                    path: "gen/a.rs".into(),
+                    executable: false,
+                    bytes: Some(b"x".to_vec()),
+                    link: None,
+                },
             ],
         }
     }
@@ -1406,16 +1621,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("blaze-out-dir-test-{}", std::process::id()));
         empty(&dir).unwrap();
         restore(&dir, &value().files).unwrap();
-        assert_eq!(collect(&dir).unwrap(), value().files);
-        let bad = [OutFile { path: "../x".into(), executable: false, bytes: Some(Vec::new()) }];
+        assert_eq!(collect(&dir, None).unwrap(), value().files);
+        let bad = [OutFile {
+            path: "../x".into(),
+            executable: false,
+            bytes: Some(Vec::new()),
+            link: None,
+        }];
         assert!(restore(&dir, &bad).is_err());
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink("/etc/hosts", dir.join("out")).unwrap();
-            assert!(collect(&dir).unwrap_err().contains("outside the OUT_DIR"));
+            assert!(collect(&dir, None).unwrap_err().contains("outside the OUT_DIR"));
             std::fs::remove_file(dir.join("out")).unwrap();
             std::os::unix::fs::symlink(dir.join("gen/a.rs"), dir.join("in")).unwrap();
-            let files = collect(&dir).unwrap();
+            let files = collect(&dir, None).unwrap();
             assert!(
                 files
                     .iter()
@@ -1423,6 +1643,121 @@ mod tests {
             );
         }
         _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A link a run left in its `OUT_DIR` into its own package (gmp-mpfr-sys links its bundled
+    /// sources there to configure out of tree) is kept as that link, not walked, and restored
+    /// as a link; what the run read through it is a read of the package in its trace. A link
+    /// that leads anywhere else, or into the package of a run that has none, is refused by
+    /// name.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_into_the_runs_own_package_is_kept_as_a_link_and_any_other_is_refused() {
+        let top = std::env::temp_dir().join(format!("blaze-out-dir-link-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&top);
+        let (package, out, sibling) = (top.join("pkg"), top.join("out"), top.join("sibling"));
+        for dir in [package.join("vendor"), out.join("build"), sibling.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(package.join("vendor/a.c"), "int a;").unwrap();
+        std::os::unix::fs::symlink(package.join("vendor"), out.join("build/src")).unwrap();
+        let link = package.join("vendor").to_str().unwrap().to_owned();
+        let files = collect(&out, Some(&package)).unwrap();
+        let expected = [
+            OutFile { path: "build".into(), executable: false, bytes: None, link: None },
+            OutFile {
+                path: "build/src".into(),
+                executable: false,
+                bytes: None,
+                link: Some(link.clone()),
+            },
+        ];
+        assert_eq!(files, expected, "the link is kept, and nothing behind it");
+
+        // What it read through the link is a read of its package; what it read of its own
+        // writing stays under the OUT_DIR, for the caller to drop.
+        let mut traced = Traced {
+            files: vec![
+                (package.join("vendor/a.c"), Some([1; 32])),
+                (out.join("build/src/a.c"), Some([1; 32])),
+                (out.join("build/src/b.c"), None),
+                (out.join("build/srcs"), None),
+                (out.join("gen.rs"), Some([2; 32])),
+            ],
+            dirs: vec![(out.join("build/src"), [3; 32])],
+            ..Traced::default()
+        };
+        through_links(&mut traced, &out, &files);
+        let mut read = vec![
+            (package.join("vendor/a.c"), Some([1; 32])),
+            (package.join("vendor/b.c"), None),
+            (out.join("build/srcs"), None),
+            (out.join("gen.rs"), Some([2; 32])),
+        ];
+        read.sort();
+        assert_eq!(traced.files, read);
+        assert_eq!(traced.dirs, [(package.join("vendor"), [3; 32])]);
+
+        // Restored: the link again, and collected back the same.
+        let again = top.join("again");
+        restore(&again, &files).unwrap();
+        assert_eq!(std::fs::read(again.join("build/src/a.c")).unwrap(), b"int a;");
+        assert!(again.join("build/src").symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(collect(&again, Some(&package)).unwrap(), expected);
+        let mut up = expected.clone();
+        up[1].link = Some(format!("{link}/../../sibling"));
+        assert!(restore(&again, &up).unwrap_err().contains("not a whole path"));
+
+        // Refused: a link to a sibling of the package, and the same link of a run with no
+        // package.
+        std::os::unix::fs::symlink(&sibling, out.join("away")).unwrap();
+        let refused = collect(&out, Some(&package)).unwrap_err();
+        assert!(
+            refused.contains("away is a link to")
+                && refused.contains("outside the OUT_DIR and outside the run's own package"),
+            "{refused}"
+        );
+        std::fs::remove_file(out.join("away")).unwrap();
+        let refused = collect(&out, None).unwrap_err();
+        assert!(refused.contains("build/src is a link to") && refused.contains("it has none"));
+        _ = std::fs::remove_dir_all(&top);
+    }
+
+    /// A value with no link is the bytes it was before a link could be kept (the previous
+    /// layout, read and written as it was), and one with a link is the other layout, which
+    /// round-trips; neither layout reads as the other.
+    #[test]
+    fn a_value_without_a_link_keeps_its_previous_layout() {
+        let plain = Value {
+            code: Some(0),
+            signal: None,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            files: vec![OutFile {
+                path: "a".into(),
+                executable: false,
+                bytes: Some(b"x".to_vec()),
+                link: None,
+            }],
+        };
+        let mut previous = b"blaze v2 run value 1".to_vec();
+        previous.extend_from_slice(&[1, 0, 0, 0, 0, 1, 1, b'a', 0, 1, 1, b'x']);
+        assert_eq!(plain.encode(), previous);
+        assert_eq!(Value::decode(&previous), Ok(plain.clone()));
+        let mut linked = plain.clone();
+        linked.files.push(OutFile {
+            path: "src".into(),
+            executable: false,
+            bytes: None,
+            link: Some("\0p/vendor".into()),
+        });
+        let bytes = linked.encode();
+        assert!(bytes.starts_with(b"blaze v2 run value 2"));
+        assert_eq!(Value::decode(&bytes), Ok(linked));
+        // The layout with links, holding none: one value has one encoding.
+        let mut none = b"blaze v2 run value 2".to_vec();
+        none.extend(postcard::to_allocvec(&plain).unwrap());
+        assert!(Value::decode(&none).unwrap_err().contains("has none"));
     }
 
     /// Directories made once, whichever way the value lists them: a parent it does not list, a
@@ -1434,8 +1769,10 @@ mod tests {
             path: path.into(),
             executable,
             bytes: Some(bytes.to_vec()),
+            link: None,
         };
-        let listed = |path: &str| OutFile { path: path.into(), executable: false, bytes: None };
+        let listed =
+            |path: &str| OutFile { path: path.into(), executable: false, bytes: None, link: None };
         let given = [
             file("a/b/deep.rs", false, b"deep"),
             listed("a"),
@@ -1451,21 +1788,21 @@ mod tests {
         expected.sort_by(|a, b| a.path.cmp(&b.path));
         #[cfg(not(unix))]
         expected.iter_mut().for_each(|it| it.executable = false);
-        assert_eq!(collect(&dir).unwrap(), expected);
+        assert_eq!(collect(&dir, None).unwrap(), expected);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             let mode = std::fs::metadata(dir.join("run.sh")).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o755);
             std::os::unix::fs::symlink(dir.join("a/b"), dir.join("to-b")).unwrap();
-            let files = collect(&dir).unwrap();
+            let files = collect(&dir, None).unwrap();
             let to_b = files.iter().find(|it| it.path == "to-b").unwrap();
             assert_eq!(to_b.bytes, None, "a link to a directory inside is kept as the directory");
             assert!(!files.iter().any(|it| it.path.starts_with("to-b/")), "and not walked twice");
         }
         // Restored again over what is there: emptied first, the same files.
         restore(&dir, &expected).unwrap();
-        assert_eq!(collect(&dir).unwrap(), expected);
+        assert_eq!(collect(&dir, None).unwrap(), expected);
         _ = std::fs::remove_dir_all(&dir);
     }
 }

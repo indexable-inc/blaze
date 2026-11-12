@@ -60,12 +60,194 @@ a reboot, takes about as long as the same answer from a warm daemon, plus a few 
 
   The budgets are `harness/v2/budgets.py`'s `restart-first-answer-clean` and
   `restart-first-answer-kill9`.
-- **Still not restored: the front end itself.** The kept front end (`KeptLowered`: the dense
-  `base_db` database with its def maps, inference and MIR of the members) lives in memory
-  only. A restarted daemon lowers the workspace again and resolves its members again, reading
-  dependencies from their images. Restoring it needs the front end's memos in the image as
-  `Persist` values, the work [query-unify](../../plan.md) names.
+- **Still not restored: the front end itself.** The design is the next section; what it
+  replaces is the plan to put the front end's memos in the image as `Persist` values.
 
+## A dependency's front end is records (2026-11-11, lane records-1111; D5, D21)
+
+One change for three gaps: the daemon's memory, the first request after a restart, and a
+machine that never built std. A crate that does not change while the workspace is edited (std,
+a registry dependency) has its front end in the store as records, read in place through the
+pool when asked; only the workspace's own crates are heap memos.
+
+**Measured** (hello-world, Linux aarch64, 32 cores, cargo-built `e453ac295a`, fresh home,
+cold build, five edits, idle; `measure.py` with its restart rows):
+
+| | resident | of it |
+|---|---|---|
+| after a cold build and five edits | 5,143 MB | regions 1,660, heap live 1,426, freed and kept 2,041 |
+| after a restart, a no-op and two edits | 6,081 MB | regions 1,645, heap live 2,080, freed and kept 2,334 |
+
+The first no-op after a restart is 3.9 s (`lower workspace` 2.6 s, of it `maintain` 2.45 s:
+F2, R8) and the first edit 9.3 s (`codegen walk describe` 5.4 s: R7). So an image served today
+saves no memory: it is decoded into the same heap values, after the crate was resolved from
+source anyway. And a value let go from the heap gives nothing back: letting go of every
+durable row's unread value (tried, taken out) freed 110 MiB live and 0 MB resident, for 15 ms
+a build's end. Only what is a whole array, a region or a pool page leaves; that is why the
+values have to be records and not smaller heap.
+
+**Keys.** A record is found by content alone: the crate's source and manifest content
+hashes, its cfg and features, the *content* hashes of its dependencies' records of the kinds
+it reads (never their keys, so a dependency that changes and yields equal records stops
+there), and the code identity of the stage that makes the kind (name resolution, signatures,
+bodies: each its own, from `blaze_codegen_code`, the same in a cargo-built blaze). No path, no
+directory. `deps::key` is this but for two things to change: it hashes each dependency's key,
+and one identity for the whole front end.
+
+**Kinds**, a crate each, largest first, and where each is today:
+
+| Kind | Held live now | Today |
+|---|---|---|
+| the rows' graph (edges 108, readers 106, nodes 105 MiB) | 320 MiB | readers: not held for a library's rows (built, below); edges: step 2 |
+| def map, lang items, name resolution's state | about 470 MiB | a record (`nameres::frozen`), decoded to heap; the maintainer keeps state for a served crate's readers |
+| syntax, item trees, macro expansions | about 550 MiB | library trees in the daemon image; expansions heap only |
+| signatures | about 110 MiB | a record read in place an item (`deps::signatures`), then memoized on the heap |
+| bodies, inference, MIR | let go at a build's end | records by body key (the item store) |
+| impls and method resolution's tables | with nameres | none |
+
+**The engine.** A crate with records is *sealed*: one input of kind `HIGH` a crate, whose
+value is the content hash of its records. A query keyed in a sealed crate is answered by a
+reader (`Persist::Ref` into a page the task pins), not by a run: no value on the heap, no
+edges, and its node is read as that one leaf. Next after the readers below, the same for a
+library row's forward edges: it verifies by its input summary alone, and a durable write that
+meets the summary runs it again; then the reader functions, kind by kind.
+
+**Built: a library's rows are not kept as readers** (`blaze_query::db::frontier`, "Durable
+readers"). A row that read nothing below kind `MEDIUM` is left out of the reverse index when
+the host packs it at a build's end, once two packs in a row saw no durable write between
+them (twice as many after each shed a durable write ended); a durable write makes the index
+again from the rows before its view's walk. Measured on the same script: the index 102.5 to
+12.9 MiB live (25.5 million readers to 1.09 million; the query storage 849.6 to 778.0 MiB);
+the daemon's resident size the same within the runs' spread (5,502 against 5,493 MB after
+the rows), so it is live memory the next step can give back, not footprint yet. The pack
+that sheds is 103 to 116 ms (40 ms whole), after the answer; no row of the edit loop moved
+past the runs' spread (the table). Tests: the changed set's simulation with inputs of each kind
+and packs among its steps, its control `the_oracle_catches_a_durable_write_over_an_index_left_shed`,
+`a_pack_sheds_the_durable_readers_and_a_durable_write_makes_the_index_again`, and the core's
+`a_shedding_pack_keeps_every_reader_it_was_not_told_to_shed` with its control.
+
+| Row (median, ms) | base, two runs | with the shed |
+|---|---|---|
+| no-op build | 11.6, 12.6 | 11.5 |
+| no-op run | 13.4, 14.0 | 15.1 |
+| body edit + run (25th percentile) | 130.5, 138.8 | 133.9 |
+| comment edit + run | 20.5, 38.4 | 24.3 |
+| body edit after 3.5 s idle | 153.8, 155.5 | 162.1 |
+| body edit after 8 s idle | 148.0, 180.0 | 163.4 |
+| resident after the rows, MB | 5,493, 5,585 | 5,502 |
+| first no-op after a restart, s (three runs each) | 3.9, 3.9, 4.1 | 5.1, 5.2, 4.4 |
+| first edit after a restart, s | 9.3, 11.2, 9.5 | 9.4, 9.3, 9.7 |
+| resident after the restart's builds, MB | 6,081, 5,975, 6,020 | 6,013, 5,898, 5,946 |
+
+The restart's first no-op is not explained: its request is 3.38 s on the base and 3.48 s with
+the shed, and the rest is before the daemon listens, where one `profile fsync` took 0.13 to
+1.34 s on both binaries. Until that is off the start's path the row cannot be compared.
+
+
+**Found: a library's rows are not at `HIGH`.** Of hello-world's 2,105,574 rows 181,865 are at
+`HIGH`, 1,906,504 at `MEDIUM` and 17,205 at `LOW` (the pack's span says it): std's rows read
+the maintainers' published tables (`Resolutions`, `ImplSlices`), the crate graph and their
+files' source roots, all `MEDIUM`. So "a durable row is current with one compare" holds only
+until any of those is written, and a sealed crate's leaf has to be an input of its own at
+`HIGH`, apart from the workspace's tables. That is the first thing step 2 changes.
+
+**The pool.** What is hot is resident; the rest is evicted under `Tag::Pool`'s budget, by
+reload cost a byte, then recency, and the pages go back (`Store::evict_pool`, called by the
+idle give-back and the ceiling guard; it has no caller yet). A miss is a page read. A record
+that is missing or of an older layout is a named miss, `records of <crate>, <kind>, layout
+<n>: made again from source`, never an empty answer.
+
+**Restart** reads nothing eagerly. The lowering's batch asks the store before any crate is
+resolved (F2) and writes no input after a result exists (the restart-then-edit build wrote
+4,722 inputs over 551,000 rows, and ran 2.29 million queries); a describe is a record (R7);
+the no-op's answer is kept (F3). **A new machine** fetches the same records by key from the
+global cache (F4); nothing else differs.
+
+**Order**, each step with before and after from `measure.py`, a round trip, and no edit-loop
+row over 10% slower: (1) the graph's readers (built: above); (2) a sealed crate's leaf at
+`HIGH`, then the graph's edges; (3) def
+maps read in place and name resolution's state dropped for a sealed crate; (4) F2 and R8, then
+R7; (5) `evict_pool` wired. Milestones: under 1 GB, then 500 MB; the first request after a
+restart under 1 s, then 300 ms. The largest single part is none of the kinds: 2,041 MB freed
+and kept by the allocator (transparent huge pages 1,134, sparse pages 293), which records
+take down only by taking the churn off the heap.
+
+## A second kind of target, and where a restart's time goes (2026-11-11, lane share-front-1111)
+
+Read from the profile of a hello-world on an 18-core Mac (`query_counts`, `misses`,
+`key_parts`, the spans), then from the code. Nothing of this lane was compiled or run by it.
+
+**`blaze test` after `blaze run` rebuilt the standard library: fixed.** A test in libtest's
+harness asks std for `test` too (`std_key`, `crates/blaze-units/src/load/units.rs`), and the
+directory of every std unit's outputs and `OUT_DIR` was named by the whole `StdKey`, the crates
+asked among it. So all 31 std units missed, 27 of them for their `plan` alone (the outputs'
+paths), and each crate above a build script (all but `core`) was another crate to the front end
+(its `OUT_DIR`), with other content IDs up to `std`. The directory is now
+`StdKey::placement`, the key without the crates asked; a unit's own paths already carry cargo's
+hash of what it is made from. Tests: `a_test_build_plans_the_standard_library_the_program_build_did`
+(blaze-units), `a_dependency_is_keyed_the_same_whatever_kind_of_target_uses_it` (blaze-lower),
+each with its control.
+
+**What is left of it (F1): the front end is one database a plan.** `unkept`
+(`crates/blaze-cargo/src/serve/unit.rs`) lets the kept front end go when the plan's units are
+not equal, and `blaze_lower::lower` makes a new `Db`. With the fix above the second build then
+costs what a restart does (below), not a cold build; it does not yet cost only the crate under
+test. The design: a checkout keeps one database, and a plan is lowered into it.
+`blaze_lower::Lowered` keeps across plans what `lower_writes` now makes per plan:
+
+| Kept across plans | So that |
+|---|---|
+| each load's source root ID, by the load's directory, with one allocator for package roots and doctests' (`other` no longer the count of sets) | a file keeps its `FileId` and its root |
+| `made`: every crate by its root file with what it was made of, its `workspace` compared by content and its runs by their classes' unit IDs (never unit indexes, which are a plan's) | a unit whose crate inputs are equal gets the same `Crate`, and its memos stand |
+| `applied` by run class unit ID; the proc macros given | a crate kept is not given `NotYetBuilt` or its base cfg again |
+| the session's keys (`deps::Session`) | a kept crate is not asked of the store again |
+
+`all_crates` is the plan's crates; a crate of an earlier plan stays, unread, until the database
+holds more of them than a bound and is let go by name. Two things below it must change first, or
+the kept database buys little: a crate graph change (`Written::crates`) runs every crate of the
+name-resolution and impls maintainers from empty (`unreached`, `crates/hir-def/src/nameres/delta.rs`;
+R8 is the same cause for a serve), so a plan that adds four crates must name them; and
+`const_macros`, doctests' crates and macro hosts are made per plan and need the same find-or-make.
+Its check: lower a fixture as a program, then as its tests, into one front end, and count the
+runs of a dependency's rows: none (the engine's `Counts::executed` by crate).
+
+**Where a restart's 6.7 s goes** (same binary's state, everything built; build 175 of the
+profile). Before the daemon listens, 2.6 s: the profile history's two `profile fsync`s (0.72 s),
+`restore blaze why's ledger` (0.39 s, `crates/blaze-cargo/src/serve/why/file.rs`), `daemon
+start` itself 0.19 s. Then the request, 7.8 s:
+
+| Span | Time | What it is |
+|---|---|---|
+| the watches, `std library`, `plan` | 0.45 s | |
+| `lower workspace` > `maintain` (`the build lowered`) | 3.83 s | the lowering's batch ends in a pass over every crate from its source: name resolution 2.95 s (`core` 1.39 s, then `std` 1.06 s, a layer at a time), impls 0.88 s. No image is in the database yet: `deps::serve` runs after `blaze_lower::lower` returns (`Steps::lower`), so each crate an image is then found for was resolved for nothing |
+| `maintain` (`the dependencies' images served`) | 0.90 s | the five crates no build script reaches |
+| `maintain` x 3, after std's and compiler_builtins' runs are applied and the other 23 crates are served | 0.98 s | every crate again each time (`note_crates_changed`, R8) |
+| the walk, the link, `store kept front end` | 0.5 s | |
+
+777,858 queries ran, none of them inference or MIR: the item store answered those. So a
+restart recomputes exactly what the store already holds as records (the def maps), because
+the order asks the store last.
+
+**F2: no crate is resolved before the store was asked for it.** The lowering's batch takes the
+images of every crate whose key is known, and the std scripts' runs (blaze's own ports,
+`blaze_units::stdlib::scripts`, pure functions of the plan) are applied in it, so every crate of
+std is keyed there. Two things stand in the way and are the work: `withdraw_moved`
+(`crates/hir-def/src/deps/serve.rs`) takes away any image served in a batch that also wrote its
+crate's files, by design, so a serve has to say which crates it keyed after the batch's file
+writes; and a crate whose key waits on a run not yet applied has to be left unmaintained (a
+third state beside served and resolved) until its serve says hit or miss, with a reader of it
+before then an error naming the crate. The budget: the lowering's pass after a restart is the
+decode of the served maps (the 0.9 s pass, less R8), and no `nameres crate` span is of a crate
+with an image.
+
+**F3: the no-op after a restart is the answer said again.** A running daemon answers a no-op
+from `noop::LastAnswer` in 20 to 50 ms with no plan and no lowering; a restart loses it (memory
+only), and its safety rests on watches that vouch without a gap, which a restart breaks. Kept in
+the image, it is said again only after each thing a watch vouched for is checked once at the
+start: the view's root (the journal), each output's and each outside path's stat against what
+the answer recorded. That is durable state deciding a build, so it lands with its simulation
+(a crash and an edit between the stop and the start, the oracle that no answer is said over a
+changed input), not before.
 
 ## A restore that cannot be trusted (2026-11-11)
 
@@ -98,3 +280,138 @@ by hand. What holds now:
   command that sets the part aside whole (`blaze stop && mv <state>/db <state>/db.suspect-<time>`);
   it moves and deletes nothing itself, and exits 101. It reads files, so it is not a request
   of the daemon's API: it is for when no daemon starts.
+
+## Persisted state that is hard to get wrong (2026-11-11, lane restart-1111)
+
+What is written here is built unless it names a ledger row (R1 to R9 in
+[objectives.md](../objectives.md)); nothing of this lane was compiled or run by it.
+
+### What is persisted, and what ties it
+
+| File | Holds | Its commit | Tied to the root by |
+|---|---|---|---|
+| `<state>/db/image` | the query database's memos, the VFS tree, the plane's history, the symbols, the library syntax trees | one rename (`blaze_image::place`), after the clone's sync | it is the root: its hash covers the spine, the spine every group's CRC and each section's schema |
+| `<state>/journal` | VFS changes since the image | appends, cut at the last whole record | names the image's hash; a journal of another image stops the start (`VfsFault::Unnamed`) |
+| `<state>/store`, the shared std store | records by content key: dependency images, checked bodies, the item store, goals, templates, outputs | the store's own (blaze-cas) | nothing: a record is found by a key that covers its inputs and is checked against it, so one that is missing or fails is a miss, never a wrong value |
+| `<state>/db/cold/<n>` | memo values moved out of memory | none | nothing, and no start reads one: garbage after a restart (R3: removed at start) |
+| `<home>/v2/profile` | the profile history | `manifest.json` under its lock | nothing: it decides no build |
+
+So there are two commit points a build's state depends on, the image's rename and the
+store's commit, and they cannot disagree in a way a later start accepts: the image holds
+no key of a store record that the store may not have (a store miss is recomputed), and the
+journal names its image.
+
+### The six constraints
+
+1. **One commit point.** Held by the image for everything addressed by ID. The store is
+   content-addressed and is reached only by keys computed from inputs, so it needs no
+   root. Not held: cold packs are written and never reclaimed across a restart (R3).
+2. **No process-local ID crosses the process boundary.** By table:
+   - the query database's memos: content IDs (`QueryKey`), never a dense ID;
+   - symbols: IDs of the image's own symbol table, restored first and checked whole; a
+     database section is used only when `intern::restored_from()` is its image's hash;
+   - dependency images, checked bodies, the item store, signatures: every ID goes through
+     a relocation table (`hir_ty::check_cache::ids`, `hir_def::hir::persist::relocating`)
+     to a portable form, and is made again by interning; a table index is checked for
+     bound and kind at decode (`IdRefused`);
+   - the front end's dense database (`blaze_query::db`): not persisted at all.
+   `Id::decode` is the one way from a word to an `Id`; it now states its contract and is
+   `#[blaze::nopanic]`. Not held structurally: the relocating scope is a thread-local, so a
+   record written outside it holds this process's IDs and nothing in the type says which
+   it is (R4: the encoder takes the table as an argument).
+3. **Every record self-verifies.** The image: a CRC32C per 64 KiB group, checked on the
+   group's first read (about 3 µs, then one relaxed load a read), and the reference check
+   at open. The store: by its key (not re-read by this lane).
+4. **Persisted state is only a cache.** A start uses a part or says why not
+   (`Started`); a damaged image stops the start naming the file. Granular recompute of
+   one damaged group, in place of the stop, is not built (R3).
+5. **The write path is a type.** `blaze_image::Txn` is `#[blaze::linear]`: an image begun
+   ends in `commit` (to the placer) or `abort`, or the code does not compile; and
+   `Placer::place` is the crate's own, so no code writes the image's file without one.
+   The placer stays the `#![blaze::sans_io]` core the crash simulation drives.
+6. **Evidence.** (a) `blaze-image/src/place/tests.rs` (every effect of a placing, torn
+   writes) and `blaze-query/src/tests/restore.rs` (the database across images, power cuts
+   and starts); (b) the last step of that test changes a byte of the file and holds every
+   answer to the model or a typed refusal, and `a_corrupt_group_fails_the_keys_in_it`;
+   (c) restored, warm and fresh databases answer alike in the same test; (d) the kill
+   loop on a real build is R3, not written.
+
+Costs: the transaction adds nothing to a commit. An open reads the spine (128 bytes, 64 a
+section, 4 a group) and hashes it once, then the table (8 bytes a slot) and the memo
+records (192 a memo): for 100,000 memos about 21 MiB read and CRC'd, some tens of
+milliseconds, measured by the span `check the image's references`.
+
+### Language features used, and what waits
+
+| Feature | Used here | Waits on |
+|---|---|---|
+| `#[blaze::linear]`, `#[blaze::consumes]` | `blaze_image::Txn` | |
+| `#[blaze::nopanic]`, `#[blaze::noalloc]` | `blaze_query::db::Id::new`, `Id::decode` | R4: the open path (`Image::open`, `ImageMap::open`, `check_references`, `open_image`). `nopanic` refuses every global allocation (`handle_alloc_error`) and every index, so the path's lists go to a frame and its `bytes[a..b]` to `get` first |
+| native `ensures` (`blaze_verify`) | `Id::decode` | R5: `restore(persist(x)) == x` on `blaze_format::Persist`, which needs a clause that names a value behind a reference; contracts.md says today's lowering takes the return and by-value arguments only |
+| `#![blaze::sans_io]` | the placer (already) | |
+| reflection (`for const`) for layouts and schema hashes | none | R5: the generic `Persist` over `for const` is planned in memory-and-data and not in this tree; the hand-written `SchemaHash`es stay until it is |
+| `fn_info(&f).code_id` as a memo's producer | none | R6: const eval does not answer `fn_info` yet (comptime.md, "Wired once hir-ty-identity compiles"); `Query::PRODUCER` is a string versioned by hand. `the_oracle_catches_code_changed_under_one_producer` shows what that allows |
+
+Version skew is tested at the level the tree has: an image of another layout or schema
+starts empty by rule, and a memo of another producer is never read
+(`a_memo_made_by_other_code_is_never_read_as_this_codes`).
+
+### What an edit needs (A: a restart, then a body edit)
+
+Measured: 53 to 57 s and 375 s of CPU, against about 1 s warm. Read: nothing of the front
+end is in the image, by design (its IDs are a process's). What a restart can read is in
+the store, by content key, lazily: dependency def maps and signatures, each dependency's
+checked bodies (`check_cache`), each body's inference, MIR and borrow check verdict (the
+item store), goals, templates. What it cannot read:
+
+| Recomputed | Count on ripgrep | Why | Row |
+|---|---|---|---|
+| inference | 21,624 ran | each is a miss of both stores (`infer_body_query` asks them first). Which miss is not known: the event `item store flushed` now says hits, runs and refusals by step, with the read that kept most out | R1 |
+| describes | 86,702 | a describe is a memo of the dense database only; the kept walk names its IDs | R7 |
+| the walk, lists, link base | whole | kept in memory beside the database | R7 |
+| the workspace's lowering | 4.7 s | `KeptLowered` is memory only | R1 |
+
+The design: the store stays the one place, and a describe becomes a record there
+(`Step::Describe` beside the item store's three: base key from the instance's identity,
+the requester and `Facing`; shapes of the facts it read; the answer with its references in
+portable form). A walk after a restart is then 86,702 lookups on all cores, not 130 s of
+describing, and the walk itself is made again from them: nothing ID-bearing is written.
+It is not built here because a describe's reads have to be classified as facts
+(`BodyFacts::classify`) and that cannot be done without running one; built blind it would
+refuse most describes or, worse, cover too little (keys-cover-every-input).
+
+The budget (R1): restart to the end of the first body edit at most 2 s over a warm edit
+on ripgrep, reading at most 64 MiB; bounded by the instances the roots reach, one lookup
+each. The no-op after a restart is 13 to 14 s today and should be the start's spans plus
+one plan verify; which span holds it is not known from reading (`daemon start: *`,
+`lower`, the plan's verify are the candidates).
+
+### B: the first edit after a cold build
+
+5.7 s against 0.95 s. Read (incremental-walk.md has the table): the cold build let go of
+the edited crate's inference by name and of every MIR; the check's memos held, so the only
+readers were the body lints, on one thread. Built: a cold build holds the inference of the
+last `EDIT_CRATES` workspace crates it finished. Left (R2): their MIR still goes, and the
+lints still read on one thread.
+
+### C: a daemon that starts on bad state
+
+Not found by reading. What reading rules out: a dense `Id` cannot come from the image or
+a store record without passing `Id::new` (which refuses 0), so `Id(0)` was read from zeroed
+memory of the running process. Ranked:
+
+1. A value of the dense database read after the release let it go. The restored part that
+   changes this is the plane's history, which changes how many tasks run at once and in
+   what order; the first `Id(0)` (2026-11-09) came with no restore.
+2. A served dependency image with zero bytes inside a part that passes its key.
+3. The method-resolution stall is separate: each `deps::serve` that fetches a crate raises
+   `written.crates`, and every such write warms every crate again (R8). A fresh store
+   fetches nothing, so it never happens there. The stop's guard then ended the daemon
+   because verified memos and loop items were not counted as work (fixed).
+
+### Which part a fault follows
+
+`BLAZE_RESTORE_WITHOUT=database,history,trees` starts a daemon that leaves those parts of
+a good image unused, each said in the start's log. On a kept bad state: all three (the
+VFS alone is restored), then one at a time. The part whose absence makes the build clean
+holds the fault; `history` alone clean is candidate 1.

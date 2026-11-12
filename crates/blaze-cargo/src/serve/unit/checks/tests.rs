@@ -24,3 +24,60 @@ fn a_check_fails_its_unit_on_an_error_cargo_shows_and_nothing_else() {
     assert!(failed(&[warning.clone(), error]));
     assert!(failed(&[warning, denied]), "a denied lint fails the unit as rustc's error does");
 }
+
+/// A crate with a type error in one body and none in another.
+const ONE_BODY_BROKEN: &str = r#"
+//- /lib.rs crate:main
+pub fn clean() -> u8 { 1 }
+pub fn broken() { let _: u8 = (); }
+"#;
+
+/// A unit's body check gives way (a cycle of waits, memory) and its task is posted again
+/// whole, with the `Checking` its names phase made: the run after gives what the first gave,
+/// once more and again after that, where a plan run twice panics ("a plan of a check runs
+/// once"). Each run is the whole check (`blaze_diagnostics::check_planned`), so this holds a
+/// run that gave way after its plan ended; codegen's `reached` between two runs is taken.
+#[test]
+fn a_check_posted_again_runs_a_plan_of_its_own() {
+    let fixture = hir_expand::fixture::db(ONE_BODY_BROKEN);
+    let file = fixture.file_at("/lib.rs").file_id(fixture.db());
+    let db = fixture.into_db();
+    let names = [(file, "src/lib.rs".to_owned())].into_iter().collect();
+    let files = Files::new(&names, "");
+    let options = Options::default();
+    let krate = blaze_query::db::attach(&db, || hir::check::workspace_crates(&db)[0]);
+    let checking = blaze_query::db::attach(&db, || Checking::new(&db, krate));
+
+    let first = checking.check(&db, files, &options);
+    assert!(failed(&first.diags), "the broken body fails the check: {:?}", first.diags);
+    assert!(checking.stopped());
+    for _ in 0..2 {
+        checking.reached(&[]);
+        let again = checking.check(&db, files, &options);
+        assert_eq!(again.diags, first.diags);
+        assert_eq!(again.items_broken, first.items_broken);
+    }
+}
+
+/// The invariant: a unit's check runs in the view its worker takes it in, whatever view its
+/// `Checking` was made in. Between the two the database may go on (another unit's sources are
+/// set): the plan made ahead is of a view gone by, and the check makes its own and answers
+/// for the sources as they are. tempo-node's build script failed a cold build of tempo with
+/// "a plan of every body runs in the database and view it was made in" (views 42675 and
+/// 51122); with the plan `new` made run regardless, this test panics with the same.
+#[test]
+fn a_check_begun_in_a_later_view_than_its_checking_runs_a_plan_of_that_view() {
+    let fixture = hir_expand::fixture::db(ONE_BODY_BROKEN);
+    let file = fixture.file_at("/lib.rs").file_id(fixture.db());
+    let mut db = fixture.into_db();
+    let names = [(file, "src/lib.rs".to_owned())].into_iter().collect();
+    let files = Files::new(&names, "");
+    let options = Options::default();
+    let krate = blaze_query::db::attach(&db, || hir::check::workspace_crates(&db)[0]);
+    let checking = blaze_query::db::attach(&db, || Checking::new(&db, krate));
+
+    db.set_file_text(file, "pub fn clean() -> u8 { 1 }\npub fn broken() { let _: u8 = 2; }\n");
+    let check = checking.check(&db, files, &options);
+    assert!(!failed(&check.diags), "the body is mended in the view checked: {:?}", check.diags);
+    assert!(!checking.stopped());
+}

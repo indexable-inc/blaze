@@ -191,11 +191,23 @@ impl Sparse {
 /// running the path's last file holds that file (on Linux a write of it is refused,
 /// `ETXTBSY`, and anywhere its mapped pages would change under it), and a reader of the
 /// path sees the old bytes or the new, whole.
+///
+/// An output that is the path's own file with a few ranges written ([`Content::Over`]: an
+/// edit's link, whose patch is a few kilobytes of a file of megabytes) starts from a clone
+/// of that file in place of the file of holes: after the clear, the path's file is cloned
+/// under the staged name, then cut, written and renamed as the other is. So what it writes
+/// is the patch and never the file (until 2026-11-11 every edit wrote the image's runs
+/// whole at each path, 21 MB twice for hello world: 27 ms of the answer). The clone is of
+/// the path's own file and of no file of the store's; what it can force out is what that
+/// file had written since its write-back, which every place asks for as it ends
+/// ([`crate::Store::runs_step`]) and no place waits for: the last patch's ranges at most.
 pub(crate) struct Writing {
     pub(crate) to: FileName,
     /// The hidden name beside `to` it is made under ([`crate::Store::staging_name`]).
     pub(crate) temp: FileName,
-    len: u64,
+    pub(crate) len: u64,
+    /// Whether it starts from a clone of the path's own file ([`Content::Over`]).
+    pub(crate) over: bool,
     /// The runs, until the cut is made and they go to their writes.
     runs: Vec<(u64, Vec<u8>)>,
     /// The writes still in flight, and the first that failed.
@@ -231,6 +243,8 @@ pub(crate) enum Plant {
 pub(crate) enum Step {
     /// The staged name removed.
     Clear,
+    /// The path's own file cloned under the staged name ([`Content::Over`]).
+    Clone,
     /// The staged name made a file of the length.
     Cut,
     /// One run written.
@@ -259,7 +273,13 @@ fn step_span(to: &FileName, step: &'static str, bytes: u64) -> tracing::Span {
 impl Writing {
     /// The write of `file` to `to` under `temp` begun for the place `asked`: the effect that
     /// clears the staged name, whose completion is its first step ([`Step::Clear`]).
-    pub(crate) fn begin(to: FileName, temp: FileName, file: Sparse, asked: Tag) -> (Writing, Effect) {
+    pub(crate) fn begin(
+        to: FileName,
+        temp: FileName,
+        file: Sparse,
+        over: bool,
+        asked: Tag,
+    ) -> (Writing, Effect) {
         // clone: the effect and the state each own the name; once per place
         let clear = Effect::Remove { file: temp.clone(), tag: asked };
         let Sparse { len, runs } = file;
@@ -268,6 +288,7 @@ impl Writing {
             to,
             temp,
             len,
+            over,
             runs,
             left: 0,
             failed: None,
@@ -292,15 +313,31 @@ impl Writing {
         effects: &mut Vec<Effect>,
     ) -> Next {
         match (step, done) {
-            (Step::Clear, Done::Removed) => {
+            (Step::Clear, Done::Removed) if self.over => {
+                // The path's own file, its blocks shared: what the runs do not write is what
+                // it holds.
+                // clone: the effect owns the names; once per place
+                let (from, to) = (self.to.clone(), self.temp.clone());
+                self.span = step_span(&self.to, "clone the path's file", 0);
+                effects.push(Effect::Clone { from, to, tag: ask(Step::Clone) });
+                Next::Going
+            }
+            (Step::Clear, Done::Removed) | (Step::Clone, Done::Cloned) => {
                 // The file of holes: made at its length, so what no run writes reads as zeros
-                // and takes no block.
+                // and takes no block. A clone is cut to the length the same way.
                 // clone: the effect owns the name; once per place
                 let file = self.temp.clone();
                 self.span = step_span(&self.to, "cut it to its length", 0);
                 effects.push(Effect::Truncate { file, len: self.len, tag: ask(Step::Cut) });
                 Next::Going
             }
+            // alloc: an error, once per place that fails
+            (Step::Clone, done) => Next::Failed(format!(
+                "cloning {} to {} to write what changed of it: {}",
+                self.to,
+                self.temp,
+                crate::describe(done)
+            )),
             (Step::Cut, Done::Truncated) => {
                 let runs = std::mem::take(&mut self.runs);
                 if runs.is_empty() {
@@ -414,6 +451,10 @@ pub(crate) enum Content {
     /// These runs, the rest of the file holes: written under a staged name and renamed onto
     /// the path ([`Writing`]). `how`: `write runs`.
     Sparse(Sparse),
+    /// The path's own file with these runs written over it, cut to the length: a clone of
+    /// it under a staged name, written and renamed onto the path ([`Writing`]). `how`:
+    /// `patch`.
+    Over(Sparse),
     /// `from`'s, `len` bytes that hash to `content`: cloned under a staged name and renamed
     /// onto the path. `of`, the whole file of the store's it is, counted as cloned until the
     /// clone ends. `how`: `clone`.
@@ -430,6 +471,7 @@ impl Content {
         match self {
             Content::Bytes(_) => "write",
             Content::Sparse(_) => "write runs",
+            Content::Over(_) => "patch",
             Content::File { .. } => "clone",
             Content::Patch { .. } => "derive",
         }

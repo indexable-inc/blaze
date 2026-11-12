@@ -266,6 +266,45 @@ pub fn heap_committed_by(committed: fn() -> u64) {
     _ = HEAP_COMMITTED.set(committed);
 }
 
+/// What the global allocator's pages hold for one tag's heap, read from the allocator's own
+/// page headers ([`heap_pages`]): the gap between `committed` and `used` is memory freed and
+/// kept, by whom. `empty` and `sparse` say what kind of gap: whole free pages the allocator
+/// has not given back, or pages a few live blocks pin.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct HeapPages {
+    /// The allocator's pages (mimalloc's: 64 KiB, 512 KiB or 4 MiB, each of one block size).
+    pub pages: u64,
+    /// The bytes of the blocks its pages have ever handed out or made ready (a page's capacity
+    /// times its block size): what the pages hold resident, at most.
+    pub committed: u64,
+    /// The bytes of its live blocks, each at its size class's size.
+    pub used: u64,
+    /// Of `committed`, what pages with no live block hold.
+    pub empty: u64,
+    /// Of `committed`, what pages under a quarter in use hold, `empty` ones aside.
+    pub sparse: u64,
+}
+
+/// The global allocator's walk of its pages, by tag then the pages of no tag: set once
+/// ([`heap_pages_by`]).
+static HEAP_PAGES: OnceLock<fn(&mut [HeapPages; Tag::COUNT + 1])> = OnceLock::new();
+
+/// The global allocator says what its pages hold, heap by heap, with `walk`: it fills one
+/// [`HeapPages`] a tag and a last one for the pages of no tag. The first call wins.
+pub fn heap_pages_by(walk: fn(&mut [HeapPages; Tag::COUNT + 1])) {
+    _ = HEAP_PAGES.set(walk);
+}
+
+/// What the global allocator's pages hold now, a tag's heap each and last the heap of no tag;
+/// `None` where the allocator does not say (std's). A diagnostic read while other threads
+/// allocate: each number is one page header's at some moment, so the sums are near, not exact.
+pub fn heap_pages() -> Option<[HeapPages; Tag::COUNT + 1]> {
+    let walk = HEAP_PAGES.get()?;
+    let mut pages = [HeapPages::default(); Tag::COUNT + 1];
+    walk(&mut pages);
+    Some(pages)
+}
+
 mod give_back;
 
 pub use give_back::Settle;

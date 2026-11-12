@@ -29,6 +29,17 @@
 //! that look at that kind of node; a pass is a variant of [`Pass`], called by `match`, never
 //! through a vtable. What a body needs only for some passes (its preorder, its taint, its MIR)
 //! is computed the first time one asks, into buffers reused from body to body.
+//!
+//! Each body's lints are a memo of the database ([`body_lints_clean`]): whether the passes
+//! that run in the crate ([`Gate`]) find nothing in the body. A check asks every body's memo,
+//! in parallel ([`sweep`]); the query engine verifies one against what its run read (the body,
+//! its inference, its MIR, the signatures and attributes it names) without running it, so
+//! after an edit only the bodies one of whose reads changed are linted again, each on a
+//! worker. The memo is one bit: what a lint says names files as the build names them and
+//! prints types by the crate's names, which no query's key holds, so a body the memo says a
+//! lint is found in is linted here for what it says, as before, in rustc's order. Until
+//! 2026-11-11 the lints were a loop over every body on the check's one thread, each build
+//! (ripgrep, a one-line edit of `rg::main`: 1,165 bodies linted again).
 
 mod calls;
 mod liveness;
@@ -52,6 +63,7 @@ use base_db::Db;
 use blaze_hash::HashMap;
 use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
+use blaze_mem::{Tag, frame};
 use hir::{DefWithBody, InFile, db::HirDatabase};
 use hir_def::{
     AdtId, DefWithBodyId, Lookup, ModuleDefId,
@@ -92,65 +104,181 @@ pub(crate) fn before_abort(cx: &Cx<'_, '_>, codegen: bool) -> Vec<Found> {
         // alloc: an empty `Vec` allocates nothing.
         return Vec::new();
     }
+    let owners = body_owners(cx);
+    let gate = Gate { may_fire: cx.may_fire_set(), codegen, late: false };
     // alloc: the lints found, empty until one is.
     let mut found = Vec::new();
     let mut scratch = Scratch::default();
     let mut pool = liveness::Pool::default();
-    for owner in body_owners(cx) {
+    for owner in sweep(cx, &owners, gate) {
         let Some(mut b) = BodyCx::new(cx, owner) else { continue };
         b.lend(std::mem::take(&mut scratch));
-        b.elaborated = codegen || b.is_const_context();
-        if runs.unstable_names {
-            found.extend(unstable_names::lints(&b));
-        }
-        if runs.reachable {
-            found.extend(reachable::lints(&b));
-        }
-        if runs.patterns {
-            found.extend(patterns::lints(&b));
-        }
-        if runs.unsafety {
-            found.extend(unsafety::lints(&b));
-        }
-        if runs.reachable {
-            found.extend(reachable::after_calls(&b));
-        }
-        if runs.recursion {
-            found.extend(recursion::calls(&b));
-        }
-        if runs.liveness {
-            found.extend(liveness::lints(&b, &mut pool));
-        }
-        if runs.recursion {
-            found.extend(recursion::drops(&b));
-        }
-        if runs.panics {
-            found.extend(panics::lints(&b));
-        }
+        early(&mut b, runs, codegen, &mut pool, &mut found);
         scratch = b.into_scratch();
     }
     found
+}
+
+/// The passes of [`before_abort`] that run in the crate (`runs`), over the one body `b`, in
+/// rustc's order: what they find is appended to `found`.
+fn early<'db>(
+    b: &mut BodyCx<'_, '_, 'db>,
+    runs: Runs,
+    codegen: bool,
+    pool: &mut liveness::Pool<'db>,
+    found: &mut Vec<Found>,
+) {
+    b.elaborated = codegen || b.is_const_context();
+    let b = &*b;
+    if runs.unstable_names {
+        found.extend(unstable_names::lints(b));
+    }
+    if runs.reachable {
+        found.extend(reachable::lints(b));
+    }
+    if runs.patterns {
+        found.extend(patterns::lints(b));
+    }
+    if runs.unsafety {
+        found.extend(unsafety::lints(b));
+    }
+    if runs.reachable {
+        found.extend(reachable::after_calls(b));
+    }
+    if runs.recursion {
+        found.extend(recursion::calls(b));
+    }
+    if runs.liveness {
+        found.extend(liveness::lints(b, pool));
+    }
+    if runs.recursion {
+        found.extend(recursion::drops(b));
+    }
+    if runs.panics {
+        found.extend(panics::lints(b));
+    }
 }
 
 /// What rustc's late lint passes lint in bodies (`unused_comparisons`, `path_statements`,
 /// `overflowing_literals`, ..), run only when nothing failed: each pass at each node of each
 /// body, in rustc's order.
 pub(crate) fn after_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
-    let mut passes = Passes::new(cx);
-    if !passes.any {
+    if !Passes::new(cx).any {
         // alloc: an empty `Vec` allocates nothing.
         return Vec::new();
     }
+    let owners = body_owners(cx);
+    // Whether code is made changes nothing the late passes read: one key for both.
+    let gate = Gate { may_fire: cx.may_fire_set(), codegen: false, late: true };
     // alloc: the lints found, empty until one is.
     let mut found = Vec::new();
     let mut scratch = Scratch::default();
-    for owner in body_owners(cx) {
+    for owner in sweep(cx, &owners, gate) {
         let Some(mut b) = BodyCx::new(cx, owner) else { continue };
         b.lend(std::mem::take(&mut scratch));
+        // The passes as the body's memo ran them, made for the one body: what a pass keeps
+        // (a `match`'s arms, the last negation) is the body's, as rustc's is its owner's.
+        // The tables are fixed arrays, built without allocating.
+        let mut passes = Passes::new(cx);
         Late { b: &b, passes: &mut passes, out: &mut found }.body();
         scratch = b.into_scratch();
     }
     found
+}
+
+/// What a body's lints are run with beyond the database: the key of [`body_lints_clean`]
+/// beside the body, so a memo is never read for other passes than it ran
+/// (keys-cover-every-input).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Gate {
+    /// The lints that may fire anywhere in the crate ([`Cx::lint_may_fire`]), made of the lint
+    /// flags and the crate's lint attributes: which passes run ([`Runs`], [`Passes`]), and
+    /// what a pass that asks of one lint is told.
+    may_fire: LintSet,
+    /// Of the passes before the abort: whether rustc makes code of the crate
+    /// ([`before_abort`]). False of the late passes, which do not read it.
+    codegen: bool,
+    /// The late passes ([`after_abort`]), not those before the abort ([`before_abort`]).
+    late: bool,
+}
+
+/// Whether the passes `gate` names find nothing in the body of `owner`: one bit, kept by the
+/// database, so the next build's check verifies it where this one ran it, and a body nothing
+/// changed for is not linted again ([`sweep`]). The lints of a body that has any are made by
+/// the check, with the build's names ([`before_abort`], [`after_abort`]).
+///
+/// What it promises: `true` only when the check's own context finds nothing in the body. The
+/// run here is the check's but for its context, a probe ([`Cx::probe`]): the passes that run
+/// are the key's, what they read is the database's, and a run that asked the probe for
+/// anything else (a printed type or path, the lint flags, the crate's walk) says `false`,
+/// whatever it found, and leaves the body to the check. A file's name is the one thing a
+/// probe gives otherwise than the build and does not note: a lint may compare two spans'
+/// files, never read a name.
+#[blaze_query::tracked(returns(copy))]
+pub(crate) fn body_lints_clean(db: &Db, owner: DefWithBodyId, gate: Gate) -> bool {
+    #[cfg(test)]
+    tests::LINTED.lock().push((db.nonce_and_revision().0, owner, gate.late));
+    let krate = hir::Crate::from(hir_def::HasModule::krate(&owner, db));
+    frame::task(Tag::Diagnostics, |frame| {
+        let cx = Cx::probe(db, krate, frame, gate.may_fire);
+        let Some(mut b) = BodyCx::new(&cx, owner) else { return true };
+        // alloc: the lints found, empty until one is: none of a clean body
+        let mut found = Vec::new();
+        if gate.late {
+            let mut passes = Passes::new(&cx);
+            if passes.any {
+                Late { b: &b, passes: &mut passes, out: &mut found }.body();
+            }
+        } else {
+            let runs = Runs::of(&cx);
+            let mut pool = liveness::Pool::default();
+            early(&mut b, runs, gate.codegen, &mut pool, &mut found);
+        }
+        found.is_empty() && !cx.beyond()
+    })
+}
+
+/// Of `owners`, the bodies of the crate in rustc's order, those the passes of `gate` find a
+/// lint in, in that order: each body's memo asked ([`body_lints_clean`]), all at once on the
+/// database's workers ([`Db::run_all`]), then read here in order. A task only asks, so
+/// neither the workers nor the order they ran in changes what is read, and a database that
+/// leaves its tasks to their readers computes each memo at its read.
+///
+/// The span `body lints sweep` is the sweep, with `linted_bodies`, how many it asked; the
+/// span `body lints found` after it says in how many of them a lint is found
+/// (`lints_found_in`), which the check lints itself. How many memos ran and how many were
+/// verified is the build's `query_counts` row of `body_lints_clean` (`executed`, `verified`):
+/// an edit of one body runs the bodies whose reads it changed, never `linted_bodies`.
+fn sweep(cx: &Cx<'_, '_>, owners: &[DefWithBodyId], gate: Gate) -> Vec<DefWithBodyId> {
+    let phase = if gate.late { "late passes" } else { "passes before the abort" };
+    let sweeping = tracing::info_span!(
+        target: "blaze",
+        "body lints sweep",
+        function = phase,
+        linted_bodies = owners.len(),
+    )
+    .entered();
+    let db = cx.db;
+    db.run_all(Tag::Diagnostics, owners.len(), |db, at| {
+        body_lints_clean(db, owners[at], gate);
+    });
+    // alloc: the bodies a lint is found in, empty for a crate with none
+    let mut found_in = Vec::new();
+    for &owner in owners {
+        if !body_lints_clean(db, owner, gate) {
+            found_in.push(owner);
+        }
+    }
+    drop(sweeping);
+    tracing::info_span!(
+        target: "blaze",
+        "body lints found",
+        function = phase,
+        linted_bodies = owners.len(),
+        lints_found_in = found_in.len(),
+    )
+    .in_scope(|| {});
+    found_in
 }
 
 /// Whether one of `lints` can be given in the crate: rustc's `lints_that_dont_need_to_run`
@@ -224,7 +352,8 @@ pub(crate) struct BodyCx<'a, 'c, 'db> {
     pub(crate) cx: &'a Cx<'c, 'db>,
     pub(crate) owner: DefWithBodyId,
     pub(crate) body: &'db Body,
-    pub(crate) source_map: &'db BodySourceMap,
+    /// [`BodyCx::source_map`], once asked.
+    source_map: OnceCell<&'db BodySourceMap>,
     pub(crate) infer: &'db InferenceResult<'db>,
     /// rustc runs `mir_drops_elaborated_and_const_checked` on the body before it aborts, so
     /// its lints (the known-panics lint, a `Drop` impl's `unconditional_recursion`): it makes
@@ -252,8 +381,7 @@ impl<'a, 'c, 'db> BodyCx<'a, 'c, 'db> {
     )]
     pub(crate) fn new(cx: &'a Cx<'c, 'db>, owner: DefWithBodyId) -> Option<BodyCx<'a, 'c, 'db>> {
         let db = cx.db;
-        let (body, source_map) = Body::with_source_map(db, owner);
-        let body: &'db Body = body;
+        let body: &'db Body = Body::of(db, owner);
         if matches!(body.expr(body.root_expr()), Expr::Missing) && body.params.is_empty() {
             return None;
         }
@@ -262,7 +390,7 @@ impl<'a, 'c, 'db> BodyCx<'a, 'c, 'db> {
             cx,
             owner,
             body,
-            source_map,
+            source_map: OnceCell::new(),
             infer,
             elaborated: false,
             tainted: Cell::new(None),
@@ -296,6 +424,21 @@ impl<'a, 'c, 'db> BodyCx<'a, 'c, 'db> {
         &self.body.store
     }
 
+    /// Where each part of the body is written in its file. An edit above the body in its file
+    /// moves it, so a lint reads this only for a place it reports or a node it looks at: a
+    /// body whose lints read no place stays verified ([`body_lints_clean`]) when it moves.
+    /// What needs no place reads [`BodyCx::unmoved_source_map`].
+    pub(crate) fn source_map(&self) -> &'db BodySourceMap {
+        self.source_map.get_or_init(|| Body::source_map(self.db(), self.owner))
+    }
+
+    /// The body's source map for what needs of it only which patterns bind a binding, the
+    /// file or expansion a part is written in, the macro calls and what lowering found, and
+    /// not where in the file (`Body::unmoved_source_map`): the same while the body moves.
+    pub(crate) fn unmoved_source_map(&self) -> &'db BodySourceMap {
+        Body::unmoved_source_map(self.db(), self.owner)
+    }
+
     /// rustc's `tainted_by_errors`: type checking the body gave an error, or AST lowering gave
     /// it an error expression or loop destination, so rustc builds no THIR of it and runs none
     /// of its MIR lints (match checking, unsafety, liveness, known panics).
@@ -304,7 +447,7 @@ impl<'a, 'c, 'db> BodyCx<'a, 'c, 'db> {
             return tainted;
         }
         let tainted = self.infer.diagnostics().iter().any(taints)
-            || lowering_failed(self.db(), self.source_map);
+            || lowering_failed(self.db(), self.unmoved_source_map());
         self.tainted.set(Some(tainted));
         tainted
     }
@@ -333,12 +476,12 @@ impl<'a, 'c, 'db> BodyCx<'a, 'c, 'db> {
 
     /// The node `expr` is written as, if it is written (not made by lowering).
     pub(crate) fn expr_node(&self, expr: ExprId) -> Option<InFile<SyntaxNodePtr>> {
-        let source = self.source_map.expr_syntax(expr).ok()?;
+        let source = self.source_map().expr_syntax(expr).ok()?;
         Some(source.map(|it| it.syntax_node_ptr()))
     }
 
     pub(crate) fn pat_node(&self, pat: PatId) -> Option<InFile<SyntaxNodePtr>> {
-        let source = self.source_map.pat_syntax(pat).ok()?;
+        let source = self.source_map().pat_syntax(pat).ok()?;
         Some(source.map(|it| it.syntax_node_ptr()))
     }
 
@@ -349,9 +492,12 @@ impl<'a, 'c, 'db> BodyCx<'a, 'c, 'db> {
             .self_param
             .is_some_and(|it| it.formal == binding || it.user_written == binding);
         if is_self {
-            return self.source_map.self_param_syntax().map(|it| it.map(|it| it.syntax_node_ptr()));
+            return self
+                .source_map()
+                .self_param_syntax()
+                .map(|it| it.map(|it| it.syntax_node_ptr()));
         }
-        let pat = *self.source_map.patterns_for_binding(binding).first()?;
+        let pat = *self.source_map().patterns_for_binding(binding).first()?;
         self.pat_node(pat)
     }
 
@@ -433,7 +579,7 @@ impl<'a, 'c, 'db> BodyCx<'a, 'c, 'db> {
             MirSpan::PatId(pat) => self.pat_node(pat),
             MirSpan::BindingId(binding) => self.binding_node(binding),
             MirSpan::SelfParam => {
-                let param = self.source_map.self_param_syntax()?;
+                let param = self.source_map().self_param_syntax()?;
                 Some(param.map(|it| it.syntax_node_ptr()))
             }
             // Lints read built MIR, which inlines nothing.

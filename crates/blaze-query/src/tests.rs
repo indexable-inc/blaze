@@ -54,6 +54,8 @@ impl Persist for Num {
     }
 }
 
+mod restore;
+
 thread_local! {
     static RUNS: RefCell<HashMap<&'static str, usize>> = RefCell::new(HashMap::new());
 }

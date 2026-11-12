@@ -57,7 +57,7 @@ ORDER BY coalesce(ran_changed, 0) + coalesce(ran_untracked, 0) + coalesce(ran_cy
 LIMIT $limit
 
 -- name: critical_path
--- says: a build's critical path, first step first: from the work that ended the build back through each wait to whoever ran what it waited on (a wait's owner), each step what ran on which lane (a fiber job, or a thread) and for how long, a wait nobody owns a step of its own; on every row the whole path's seconds, its share of the wall time (near 100: the path bounds the build) the build's parallelism (busy threads on average), and whether the walk reached the build's start within its bound of 100000 steps (false: the path is cut short)
+-- says: a build's critical path, first step first: from the work that ended the build back through each wait to whoever ran what it waited on (a wait's owner: a job as `switches.job` names it, generation and slot, the numbering since schema 2), each step what ran on which lane (a fiber job, or a thread) and for how long, a wait nobody owns a step of its own; on every row the whole path's seconds, its share of the wall time (near 100: the path bounds the build) the build's parallelism (busy threads on average), and whether the walk reached the build's start within its bound of 100000 steps (false: the path is cut short)
 WITH RECURSIVE bounds AS (
     SELECT started_ns AS t0, started_ns + dur_ns AS t1
     FROM builds
@@ -70,21 +70,19 @@ WITH RECURSIVE bounds AS (
 ), waits AS (
     SELECT process, span_id, lane, awaits, owner, start_ns, end_ns FROM laned WHERE name = 'wait'
 ), job_starts AS (
-    SELECT process, job, job & 4294967295 AS slot, t_ns
+    SELECT process, job, min(t_ns) AS t_ns
     FROM switches, bounds
     WHERE event = 'started' AND t_ns <= t1
-), job_ends AS (
-    SELECT process, job, min(t_ns) AS ended_ns FROM switches WHERE event = 'ended' GROUP BY process, job
-), matched AS (
-    SELECT waits.*, job_starts.job AS slot_job
-    FROM waits ASOF LEFT JOIN job_starts
-        ON job_starts.process = waits.process AND job_starts.slot = waits.owner - 1 AND job_starts.t_ns <= waits.end_ns
+    GROUP BY process, job
 ), owned AS (
-    -- A slot's last job to start is the owner only if it had not ended when the wait began: a
-    -- runner on no fiber (a client thread's job) has no switches, and its slot's older job is not it.
-    SELECT matched.*,
-        CASE WHEN job_ends.ended_ns IS NULL OR job_ends.ended_ns >= matched.start_ns THEN matched.slot_job END AS owner_lane
-    FROM matched LEFT JOIN job_ends ON job_ends.process = matched.process AND job_ends.job = matched.slot_job
+    -- A wait's `owner` is its runner's job as the switches name it (generation << 32 | slot),
+    -- so the owner's lane is that job's, if it has one: a runner on no fiber (a thread's own
+    -- job) has no switches, and the wait stays on its lane. Until 2026-11-11 this matched the
+    -- owner as schema 1 numbered it (slot + 1), which no file since schema 2 holds: the walk
+    -- crossed no wait.
+    SELECT waits.*,
+        CASE WHEN job_starts.t_ns <= waits.end_ns THEN job_starts.job END AS owner_lane
+    FROM waits LEFT JOIN job_starts ON job_starts.process = waits.process AND job_starts.job = waits.owner
 ), stepped AS (
     SELECT owned.*,
         CASE WHEN owner_lane IS NOT NULL AND owner_lane <> lane THEN owner_lane ELSE lane END AS next_lane,
@@ -402,6 +400,54 @@ UNION ALL
 SELECT replace(area, ' bytes', ''), 'process', round(mem / 1073741824, 2), NULL, NULL, NULL, NULL
 FROM process
 ORDER BY kind DESC, held_gib DESC NULLS LAST, area
+
+-- name: memory_held
+-- says: what a build's global heap held, by call site (`held_samples`: the sampled blocks nobody had freed): the daemon's last reading at or before the build's footprint peaked (its first, where none was that early), each site's bytes held (its samples' weights summed, within a sample's), its share, the tags of the tasks that allocated there, its samples and their mean block size, and how long ago the oldest was allocated, most first
+WITH peak AS (
+    SELECT process, arg_max(t_ns, value) AS t_ns FROM counters
+    WHERE build_id = $build AND name = 'footprint bytes' GROUP BY process
+    ORDER BY max(value) DESC LIMIT 1
+),
+reading AS (
+    SELECT coalesce(max(read_ns) FILTER (WHERE read_ns <= (SELECT t_ns FROM peak)), min(read_ns)) AS read_ns
+    FROM held_samples
+    WHERE process = (SELECT process FROM peak)
+),
+s AS (SELECT * FROM held_samples WHERE read_ns = (SELECT read_ns FROM reading))
+SELECT
+    coalesce(site, '(in the allocator)') AS site,
+    round(sum(bytes) / 1073741824, 2) AS held_gib,
+    round(100.0 * sum(bytes) / (SELECT sum(bytes) FROM s), 1) AS pct,
+    string_agg(DISTINCT coalesce(tag, 'outside'), ', ' ORDER BY coalesce(tag, 'outside')) AS tags,
+    count(*) AS samples,
+    CAST(avg(block_bytes) AS BIGINT) AS mean_block_bytes,
+    round((max(read_ns) - min(t_ns)) / 60e9, 1) AS oldest_min
+FROM s
+GROUP BY site
+ORDER BY held_gib DESC, site
+LIMIT $limit
+
+-- name: memory_held_now
+-- says: what the global heap holds now, by call site (`held_samples`: the sampled blocks nobody has freed), from the newest reading of the newest daemon that has one (a reading a minute, so an idle daemon's is of its idle heap): each site's bytes held, its share, the tags of the tasks that allocated there, its samples and their mean block size, and how long ago the oldest was allocated, most first
+WITH reading AS (
+    SELECT process, read_ns FROM held_samples ORDER BY read_ns DESC LIMIT 1
+),
+s AS (
+    SELECT * FROM held_samples
+    WHERE read_ns = (SELECT read_ns FROM reading) AND process = (SELECT process FROM reading)
+)
+SELECT
+    coalesce(site, '(in the allocator)') AS site,
+    round(sum(bytes) / 1048576, 0) AS held_mib,
+    round(100.0 * sum(bytes) / (SELECT sum(bytes) FROM s), 1) AS pct,
+    string_agg(DISTINCT coalesce(tag, 'outside'), ', ' ORDER BY coalesce(tag, 'outside')) AS tags,
+    count(*) AS samples,
+    CAST(avg(block_bytes) AS BIGINT) AS mean_block_bytes,
+    round((max(read_ns) - min(t_ns)) / 60e9, 1) AS oldest_min
+FROM s
+GROUP BY site
+ORDER BY held_mib DESC, site
+LIMIT $limit
 
 -- name: memory_sites
 -- says: what churns a build's global heap, by call site (`alloc_samples`, `blaze explain memory`): each site's bytes allocated (its samples' weights summed, within a sample's), its share of the build's, the tags of the tasks that allocated there, its samples and their mean block size, most first
@@ -886,6 +932,54 @@ ORDER BY tied.of_build DESC,
     count(*) DESC, tied.source
 LIMIT $limit
 
+-- name: wait_owner
+-- says: a build's `wait` spans of `min_ms` (20) or longer, longest first, each with who ended it and what that owner was doing meanwhile: `awaits`, how long (`ms`), the waiter's thread and when the wait began from the build's start (`at_ms`), `owned_by` (job, the scope's jobs, whoever sends, the kernel, the lock's holder, the daemon, not said), the `owner` job, and for a job's the spans of that job that overlapped the wait, the most overlap first (`owner_did`: each span's name and what it was of with the milliseconds of the wait it covered, so a wait behind a query's run shows the run and the queries under it, and a wait behind a verify shows no run of the awaited key at all) with the owner's thread; `owner_did` null with a job owner means that job has no span in the wait's window (it was parked or queued itself: see `critical_path`)
+WITH bounds AS (
+    SELECT min(started_ns) AS t0 FROM builds WHERE build_id = $build
+), waits AS (
+    SELECT process, span_id, CAST(thread_name AS VARCHAR) AS thread, awaits, owner,
+        CAST(owned_by AS VARCHAR) AS owned_by, CAST(waits_on AS VARCHAR) AS waits_on,
+        start_ns, start_ns + dur_ns AS end_ns, dur_ns
+    FROM spans
+    WHERE build_id = $build AND name = 'wait' AND dur_ns >= $min_ms * 1e6
+), runs AS (
+    SELECT process, thread, t_ns, CASE WHEN event = 'started' OR event = 'resumed' THEN job END AS on_job
+    FROM switches
+), laned AS (
+    SELECT s.process, CAST(s.thread_name AS VARCHAR) AS thread, CAST(s.name AS VARCHAR) AS name, s.function, s.unit,
+        s.start_ns, s.start_ns + s.dur_ns AS end_ns, runs.on_job
+    FROM spans AS s ASOF LEFT JOIN runs
+        ON s.process = runs.process AND s.thread = runs.thread AND s.start_ns >= runs.t_ns
+    WHERE s.name NOT IN ('wait', 'job', 'worker')
+), covered AS (
+    SELECT waits.process, waits.span_id, laned.thread, laned.name, coalesce(laned.function, laned.unit) AS what,
+        sum(least(laned.end_ns, waits.end_ns) - greatest(laned.start_ns, waits.start_ns)) AS ns
+    FROM waits JOIN laned
+        ON laned.process = waits.process AND laned.on_job = waits.owner
+        AND laned.start_ns < waits.end_ns AND laned.end_ns > waits.start_ns
+    GROUP BY ALL
+), did AS (
+    SELECT process, span_id, any_value(thread) AS owner_thread,
+        string_agg(name || coalesce(' ' || what, '') || ' ' || CAST(round(ns / 1e6, 1) AS VARCHAR) || ' ms', '; ' ORDER BY ns DESC, name, what) AS owner_did
+    FROM (SELECT *, row_number() OVER (PARTITION BY process, span_id ORDER BY ns DESC, name, what) AS rank FROM covered)
+    WHERE rank <= 8
+    GROUP BY process, span_id
+)
+SELECT
+    round(waits.dur_ns / 1e6, 3) AS ms,
+    waits.awaits,
+    waits.waits_on,
+    waits.thread,
+    round((waits.start_ns - bounds.t0) / 1e6, 3) AS at_ms,
+    coalesce(waits.owned_by, CASE WHEN waits.owner IS NULL THEN 'not recorded (a blaze before owned_by)' ELSE 'job' END) AS owned_by,
+    waits.owner,
+    did.owner_thread,
+    did.owner_did
+FROM waits CROSS JOIN bounds
+LEFT JOIN did ON did.process = waits.process AND did.span_id = waits.span_id
+ORDER BY waits.dur_ns DESC, waits.start_ns
+LIMIT $limit
+
 -- name: timeline
 -- says: a build as rows in the order things began: each span of `min_ms` (1) or longer with when it began from the build's start (`at_ms`), how long it was open (`ms`), its own CPU (`cpu_ms`, less the spans under it), its thread, its depth on that thread, and what it was of (its function, what a wait awaited, its unit, its crate, or its other fields); spans of no build in the build's window are its too. A gap between one row's end and the next row's `at_ms` on the same thread and depth is time under no span of that size. The path across waits to the jobs that ended them is `critical_path`
 WITH bounds AS (
@@ -922,14 +1016,15 @@ ORDER BY s.dur_ns DESC, s.start_ns
 LIMIT $limit
 
 -- name: waits_by_reason
--- says: a build's waits by what they waited for (`wait` spans by `awaits`, `admission` spans by what held the task back): how many, their time summed over the threads waiting (not wall time), the longest, and a thread that waited; waits too short for a row (`folded`) are not counted
+-- says: a build's waits by what they waited for (`wait` spans by `awaits`, `admission` spans by what held the task back): how many, their time summed over the threads waiting (not wall time), the longest, a thread that waited, and who ends such a wait (`owned_by`; what its owner did meanwhile is `wait_owner`); waits too short for a row (`folded`) are not counted
 SELECT
     CAST(s.name AS VARCHAR) AS waited_in,
     coalesce(s.awaits, '(unnamed)') AS reason,
     count(*) AS waits,
     round(sum(s.dur_ns) / 1e6, 3) AS ms,
     round(max(s.dur_ns) / 1e6, 3) AS longest_ms,
-    CAST(any_value(s.thread_name) AS VARCHAR) AS a_thread
+    CAST(any_value(s.thread_name) AS VARCHAR) AS a_thread,
+    CAST(any_value(s.owned_by) AS VARCHAR) AS owned_by
 FROM spans AS s
 WHERE s.build_id = $build AND s.name IN ('wait', 'admission')
 GROUP BY s.name, s.awaits
@@ -1083,4 +1178,40 @@ WHERE (calls.on_thread LIKE $thread
     AND (coalesce(calls.inside, '') LIKE $within OR coalesce(calls.call, '') LIKE $within)
     AND (calls.took_ns IS NULL OR calls.took_ns >= $min_ms * 1e6)
 ORDER BY calls.began_ns, calls.seen_as
+LIMIT $limit
+
+-- name: edit_work
+-- says: the work a build did, by stage, as each stage counted it: how many things it visited, asked of or made again, which after an edit should be the edit's size and not the program's (rule incremental-first). `engine memos` are the query engine's rows run (`executed`) and proved unchanged without running (`verified`), from `query_counts`; `changed set` is the engine's walk from what was written (`visited` rows verified, `changed` the rows whose value moved); `body check` is each unit's plan (`visited_bodies` and `visited_modules` got a task, `held_*` is the crate, `whole` counts plans that visited everything); `codegen walk` is each program's walk (`asked` functions asked of again, `described` made again, `replaced` rows of the kept lists, `whole` walks from the roots); `dependency image keys` are the keys a serve asked of the database (`asked`), those that moved (`moved`) and those made again (`computed`); `link` is each link's rows made again (`rows`) and the names and patchable functions it went over (`symbols`, `patchable`, the part that still follows the program). `total` sums a counter over the build, `times` is how many units or walks said it; a counter nothing said has no row. Events `edit work` (crates/blaze-query/src/db/edit_work.rs names the stages)
+WITH said AS (
+    SELECT
+        e.process AS said_process,
+        e.event_id AS said_event,
+        max(v.value_text) FILTER (WHERE v.key = 'stage') AS stage
+    FROM events AS e
+    JOIN event_values AS v ON v.process = e.process AND v.event_id = e.event_id
+    WHERE e.build_id = $build AND e.message = 'edit work'
+    GROUP BY e.process, e.event_id
+), counted AS (
+    SELECT said.stage AS stage, v.key AS counter, CAST(v.value_int AS BIGINT) AS n
+    FROM said
+    JOIN event_values AS v ON v.process = said.said_process AND v.event_id = said.said_event
+    WHERE v.value_int IS NOT NULL
+    UNION ALL
+    SELECT 'engine memos' AS stage, 'executed' AS counter, CAST(sum(q.executed) AS BIGINT) AS n
+    FROM query_counts AS q
+    WHERE q.build_id = $build
+    UNION ALL
+    SELECT 'engine memos' AS stage, 'verified' AS counter, CAST(sum(q.verified) AS BIGINT) AS n
+    FROM query_counts AS q
+    WHERE q.build_id = $build
+    UNION ALL
+    SELECT 'dependency image keys' AS stage, 'computed' AS counter, CAST(sum(q.executed) AS BIGINT) AS n
+    FROM query_counts AS q
+    WHERE q.build_id = $build AND ends_with(CAST(q.query AS VARCHAR), 'crate_image_key')
+)
+SELECT stage, counter, CAST(sum(n) AS BIGINT) AS total, count(*) AS times
+FROM counted
+WHERE n IS NOT NULL
+GROUP BY stage, counter
+ORDER BY stage, counter
 LIMIT $limit
