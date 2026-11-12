@@ -378,9 +378,11 @@ impl Driver {
             code: bind.code,
         }));
         self.out.clear();
+        let _st = crate::times::span(15);
         self.core
             .stage(&Edit { txn, binds: &self.binds, together }, &mut self.out)
             .map_err(|why| EditError::Failed(Error::Core(why)))?;
+        drop(_st);
         if let Err(why) = self.fill(txn, binds, records) {
             // Nothing names what was staged: give it up, and free what was handed out.
             self.out.clear();
@@ -394,6 +396,7 @@ impl Driver {
             });
         }
         self.out.clear();
+        let _cm = crate::times::span(16);
         let committed = match self.core.commit(txn, &mut self.out) {
             Ok(committed) => committed,
             Err(core) => return Err(EditError::Broken(Error::Core(core))),
@@ -420,17 +423,23 @@ impl Driver {
                     let slot = bind.slot;
                     let place = Place { at: base + range.at, words, thunks, slots };
                     self.scratch.clear();
+                    let _c = crate::times::span(11);
                     records
                         .code(bind, place, &mut self.scratch)
                         .map_err(|why| Error::Record { txn, slot, why })?;
+                    drop(_c);
                     let got = self.scratch.len() as u64;
                     if got != range.len {
                         return Err(Error::Length { txn, slot, said: range.len, got });
                     }
+                    let _c = crate::times::span(12);
                     self.code.copy(self.area + range.at as usize, &self.scratch)?;
+                    drop(_c);
+                    let _c = crate::times::span(13);
                     records
                         .placed(base + range.at, range.len)
                         .map_err(|why| Error::Record { txn, slot, why })?;
+                    drop(_c);
                 }
                 // The flag, clear. The area's offsets are never used twice, so the bytes are
                 // the zeroes the mapping began with; they are written all the same, so the
@@ -455,7 +464,7 @@ impl Driver {
                 }
             }
         }
-        // Once for the whole edit, before the commit stores a word that names any of it.
+        let _c = crate::times::span(14);
         self.code.settle()?;
         Ok(())
     }

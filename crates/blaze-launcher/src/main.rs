@@ -127,6 +127,9 @@ unsafe extern "C" {
 }
 
 fn main() {
+    use blaze_launch_rt::times as tm;
+    tm::now();
+    let _s = tm::span(0);
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(why) => stop(CANNOT_RUN, &format!("this process's own path does not read: {why}")),
@@ -137,6 +140,8 @@ fn main() {
         Ok(found) => found,
         Err(why) => stop(CANNOT_RUN, &why),
     };
+    drop(_s);
+    let _s = tm::span(1);
     let socket = match UnixStream::connect(&socket_path) {
         Ok(socket) => socket,
         Err(why) => stop(
@@ -149,10 +154,14 @@ fn main() {
             ),
         ),
     };
+    drop(_s);
+    let _s = tm::span(2);
     let driver = match Driver::new(Config::PROGRAM) {
         Ok(driver) => driver,
         Err(why) => stop(CANNOT_RUN, &format!("the launcher could not map its code area: {why}")),
     };
+    drop(_s);
+    let _s = tm::span(3);
     let shared = driver.shared();
     let me = match blaze_launch_rt::threads::adopt(&shared) {
         Ok(me) => me,
@@ -162,10 +171,12 @@ fn main() {
     // The control thread: the one writer of code, for the life of the process. It is never
     // joined: the process ends through the program's `main` or an `exit` of its own.
     let control = std::thread::Builder::new().name("blaze-launch".to_owned()).spawn(move || {
+        let _l = tm::span(4);
         let mut records = match Loaded::new() {
             Ok(records) => records,
             Err(why) => stop(CANNOT_RUN, &format!("the launcher could not map the program's data: {why}")),
         };
+        drop(_l);
         let (_driver, served) = blaze_launch_rt::run(driver, socket, program, &mut records, ready, restart);
         if let Err(why) = served {
             stop(101, &format!("the launcher stopped serving code: {why}"));
@@ -176,12 +187,14 @@ fn main() {
     }
     // The wait: for the daemon's word to start the program (its statics are defined), or
     // for why it cannot; it ends when the daemon answers or its socket closes.
+    drop(_s);
     let start = match start.recv() {
         Ok(Ok(start)) => start,
         Ok(Err(why)) => stop(CANNOT_RUN, &format!("{} cannot start: {why}", exe.display())),
         Err(_) => stop(CANNOT_RUN, "the launcher's control thread ended before the program could start"),
     };
 
+    tm::set(18, tm::now());
     // The program's arguments, as `main` takes them: this process's, leaked for its life.
     // alloc: the program's `argv`, once
     let args: Vec<*const c_char> = std::env::args_os()
@@ -196,6 +209,7 @@ fn main() {
     let argv = args.leak().as_ptr();
     // SAFETY: reads the C library's pointer to the environment, as a program's start does.
     let envp = unsafe { environ };
+    let _s = tm::span(19);
     for init in &start.inits {
         // SAFETY: `init` is the address of a static of the program's initializer section,
         // which the launcher placed and never unmaps: one word, the address of a function
@@ -208,7 +222,11 @@ fn main() {
     // the program's C `main`, compiled when this first call fires its stub.
     let entry: extern "C" fn(c_int, *const *const c_char) -> c_int =
         unsafe { core::mem::transmute(start.entry) };
+    drop(_s);
+    let _s = tm::span(20);
     let status = entry(argc, argv);
+    drop(_s);
+    tm::dump();
     // The main thread stays a mutator to the end: `exit` runs the program's `atexit`
     // functions, which are its code.
     core::mem::forget(me);

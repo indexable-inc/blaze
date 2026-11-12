@@ -173,6 +173,7 @@ pub fn run(
         ready,
         restart,
     };
+    let _b = crate::times::span(5);
     let reader = match control.begin(program, &shared) {
         Ok(reader) => Some(reader),
         Err(why) => {
@@ -180,6 +181,7 @@ pub fn run(
             None
         }
     };
+    drop(_b);
     loop {
         // Collect only once the queue is empty: every birth announced so far is then known.
         let event = match control.driver.ready() {
@@ -188,6 +190,7 @@ pub fn run(
                 if let Err(why) = control.driver.collect(&mut *control.records) {
                     control.lose(why.into());
                 }
+                let _w = crate::times::span(6);
                 control.driver.wait()
             }
         };
@@ -349,8 +352,11 @@ impl Control<'_> {
     /// A message of the daemon's.
     fn tell(&mut self, item: &[u8]) -> Result<(), ControlError> {
         let (id, tell) = Tell::decode(item).map_err(ControlError::Wire)?;
+        crate::times::add(21, 1); crate::times::add(22, item.len() as u64);
+        if crate::times::ACC[23].load(core::sync::atomic::Ordering::Relaxed) == 0 { crate::times::set(23, crate::times::now()); }
         match tell {
             Tell::Welcome { slots } => {
+                let _s = crate::times::span(9);
                 self.driver.declare(slots)?;
             }
             Tell::Start { entry, inits } => {
@@ -367,13 +373,16 @@ impl Control<'_> {
                 }
                 // The program's main thread waits for this; were it gone, the process is
                 // ending and there is no one to tell.
+                crate::times::set(17, crate::times::now());
                 drop(self.ready.send(Ok(Start { entry: thunk, inits: addresses })));
             }
             Tell::Record { id, bytes } => {
+                let _s = crate::times::span(7);
                 self.records.record(id, bytes).map_err(ControlError::Store)?;
             }
             Tell::Statics { defs } => {
                 // alloc: the definitions out of the frame, for the length of the message.
+                let _s = crate::times::span(8);
                 let defs: Vec<wire::StaticDef<'_>> = defs.iter().collect();
                 let place = self.driver.place();
                 let defined = self.records.statics(&defs, place);
@@ -381,7 +390,9 @@ impl Control<'_> {
                 defined.map_err(ControlError::Store)?;
             }
             Tell::Edit { txn, binds, declare, together } => {
+                let _s = crate::times::span(10);
                 if declare > 0 {
+                    let _s = crate::times::span(9);
                     self.driver.declare(declare)?;
                 }
                 // alloc: the edit's binds out of the frame, for the length of the edit.

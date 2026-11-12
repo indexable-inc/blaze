@@ -43,6 +43,7 @@ pub mod records;
 pub mod sys;
 pub mod table;
 pub mod threads;
+pub mod times;
 pub mod tls;
 pub mod unwind;
 
