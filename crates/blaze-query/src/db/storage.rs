@@ -446,19 +446,26 @@ impl Storage {
     }
 
     /// Whether the row of node `node` (`row`), of durability `durability` and verified in
-    /// `verified`, holds in this view with no look at its edges: no input of its kind or
-    /// above was written since, or none whose bits its summary has; counted from the view it
-    /// was verified in, or from the changed set's floor where that is later and holds the row
-    /// ([`super::frontier::floor`]).
+    /// `verified`, whose last run made no untracked read, holds in this view with no look at
+    /// its edges: no input of its kind or above was written since, or none whose bits its
+    /// summary has; counted from the view it was verified in, or from the changed set's floor
+    /// where that is later and holds the row ([`super::frontier::floor`]); or the changed
+    /// set's walk of this view says it is unchanged ([`super::frontier::unreached`]).
     #[inline]
     pub(crate) fn holds(&self, node: u32, row: &NodeRow, durability: u8, verified: u32) -> bool {
         if self.unchanged_since(durability, verified) || self.inputs_unchanged(row, verified) {
             return true;
         }
         let floor = super::frontier::floor(self);
-        floor > verified
+        if floor > verified
             && (self.unchanged_since(durability, floor) || self.inputs_unchanged(row, floor))
             && super::frontier::floored(self, node)
+        {
+            return true;
+        }
+        // Or the changed set's walk of this view says so: it ended, or the row is outside
+        // its reach.
+        super::frontier::unreached(self, node)
     }
 
     /// Node `node`: one check of its index for all it holds.
@@ -676,6 +683,8 @@ impl Storage {
         if durability.0 >= Durability::HIGH.0 {
             self.high_opened = self.opened;
         }
+        // The reaches of the view before are no view's now.
+        self.drop_reaches();
         // Before the edge array settles: the fold reads the spans runs replaced.
         self.fold_reverse();
         // Before the write's mask is tested against any row: every reader's summary holds

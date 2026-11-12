@@ -694,24 +694,37 @@ struct FirstEdit {
 /// written-field history holds, as a build's hundreds of writes are.
 const BUILD_WRITES: u64 = 70;
 
+/// The inputs a wide library reads beside its configuration: enough that the summary of its
+/// top holds every bit, as a real library's does, and no write is passed over by it.
+const WIDE_INPUTS: usize = 200;
+
 /// A build of a library of `library` pairs of rows under one top row, an application row and
 /// a second package's row, then a first edit, as a host does them: row `2i` reads the
 /// library's configuration (input 0) and row `2i + 1` reads row `2i`; the top reads every row
 /// `2i + 1`; the application's row reads its source (input 1) and the top; the last row reads
-/// the second package's configuration (input 2). The build makes every row, then the
-/// library's configuration is written (a build script's result applied after the rows that
-/// read it were made) and the build pulls every row again: each library row runs again and
-/// says it changed, with no walk. Then the second package's configuration is written
+/// the second package's configuration (input 2). In a `wide` library row `2i` also reads one
+/// of [`WIDE_INPUTS`] inputs of its own. The build makes every row, then the library's
+/// configuration is written (a build script's result applied after the rows that read it
+/// were made) and the build pulls every row again: each library row runs again and says it
+/// changed, with no walk. Then the second package's configuration is written
 /// [`BUILD_WRITES`] times and its row pulled each time, so the library's rows were verified
 /// more views back than the written-field history holds. At its end the host settles the
-/// changed set (off the answer's path). The edit writes the application's source, asks for
-/// the changed set since the build's end and pulls the rows it holds. Every answer is checked
-/// against a run from scratch.
-fn a_first_edit_after_a_build(library: usize, plant: Plant) -> FirstEdit {
+/// changed set (off the answer's path).
+///
+/// The edit writes the application's source. A narrow library's top is pulled first, before
+/// any walk (as a host's maintainers pull before its body check walks): only the floor can
+/// prove it without its edges. Then the host asks for the changed set since the build's end
+/// (in a wide library the walk's verification of the application's row is what asks the top:
+/// only the reach can prove it) and pulls the rows it holds. Every answer is checked against
+/// a run from scratch.
+fn a_first_edit_after_a_build(library: usize, wide: bool, plant: Plant) -> FirstEdit {
     let _one = BUILT.lock();
     let mut flow: Vec<FlowNode> = Vec::with_capacity(2 * library + 3);
     for at in 0..library {
-        flow.push(sum(&[Dep::Input(0)]));
+        flow.push(match wide {
+            true => sum(&[Dep::Input(0), Dep::Input(3 + at % WIDE_INPUTS)]),
+            false => sum(&[Dep::Input(0)]),
+        });
         flow.push(sum(&[Dep::Query(2 * at)]));
     }
     let top = flow.len();
@@ -725,6 +738,7 @@ fn a_first_edit_after_a_build(library: usize, plant: Plant) -> FirstEdit {
     db.storage_mut().plant_in_changed_set(plant);
     *db.flow.lock() = flow.clone();
     let mut inputs = vec![1u64, 10, 100];
+    inputs.extend((0..WIDE_INPUTS as u64).map(|at| at % 7));
     let cells: Vec<Cell> = inputs.iter().map(|&value| Cell::new(&db, value, 0)).collect();
     db.cells.lock().extend(cells.iter().map(|it| it.0));
     let pull = |db: &TestDb, inputs: &[u64], held: &[usize]| {
@@ -751,6 +765,9 @@ fn a_first_edit_after_a_build(library: usize, plant: Plant) -> FirstEdit {
     // The first edit.
     inputs[1] = 11;
     cells[1].set_a(&mut db, 11);
+    if !wide {
+        pull(&db, &inputs, &[top]);
+    }
     let changed = changed_since::<Built>(&db, since);
     let Changed::Keys(keys) = changed else { panic!("unknown: {changed:?}") };
     let edit = db.storage().changed_set_work();
@@ -776,20 +793,23 @@ fn a_first_edit_after_a_build(library: usize, plant: Plant) -> FirstEdit {
 /// changed; each reader of one was verified after it changed, so the settle at the build's
 /// end takes every one out of the next walk's start with a load a reader, running nothing,
 /// and its view becomes the floor. The edit's walk starts from the edit's write alone: one
-/// reverse edge, one row asked, none set apart, one row named; and the library's top, which
-/// the application's row reads and which was verified more views back than the written-field
-/// history holds, is proved from the floor with no look at what it read: two rows proved
-/// unchanged (it and the second package's), the same in a database of 203 rows and one of
-/// 4,003.
+/// reverse edge, one row asked, none set apart, one row named. The library's top, which the
+/// application's row reads and which was verified more views back than the written-field
+/// history holds, is proved with no look at what it read: pulled before the walk, from the
+/// floor (a narrow library, whose summary the edit's write shares no bit with); asked by the
+/// walk's own verification, by being outside the walk's reach (a wide one, whose summary
+/// holds every bit). Two rows proved unchanged (it and the second package's), the same in a
+/// database of 203 rows and one of 4,003.
 #[test]
 fn the_first_edit_after_a_build_costs_what_it_reaches_at_two_sizes() {
-    let small = a_first_edit_after_a_build(100, Plant::None);
-    let large = a_first_edit_after_a_build(2000, Plant::None);
-    assert_eq!(
-        small,
-        FirstEdit { left: 0, asked: 1, marked: 0, edit: (0, 1, 1), named: 1, verified: 2 }
-    );
-    assert_eq!(large, small, "the first edit's work grew with the database");
+    let bounded =
+        FirstEdit { left: 0, asked: 1, marked: 0, edit: (0, 1, 1), named: 1, verified: 2 };
+    for wide in [false, true] {
+        let small = a_first_edit_after_a_build(100, wide, Plant::None);
+        let large = a_first_edit_after_a_build(2000, wide, Plant::None);
+        assert_eq!(small, bounded, "wide: {wide}");
+        assert_eq!(large, small, "the first edit's work grew with the database (wide: {wide})");
+    }
 }
 
 /// The control of [`the_first_edit_after_a_build_costs_what_it_reaches_at_two_sizes`]: a
@@ -798,23 +818,79 @@ fn the_first_edit_after_a_build_costs_what_it_reaches_at_two_sizes() {
 /// settled, the edit's walk is the database's size, and the oracle says so at both sizes.
 #[test]
 fn the_oracle_catches_a_walk_that_asks_the_readers_that_saw_the_change() {
-    let small = a_first_edit_after_a_build(100, Plant::AsksReadersThatSawTheChange);
-    let large = a_first_edit_after_a_build(2000, Plant::AsksReadersThatSawTheChange);
+    let small = a_first_edit_after_a_build(100, true, Plant::AsksReadersThatSawTheChange);
+    let large = a_first_edit_after_a_build(2000, true, Plant::AsksReadersThatSawTheChange);
     assert!(small.left >= 200 && small.marked >= 200 && small.asked >= 200, "{small:?}");
     assert!(large.left >= 4000 && large.marked >= 4000 && large.asked >= 4000, "{large:?}");
     assert_ne!(small, large);
 }
 
-/// The second control of it: with no floor kept, the edit's walk is as small, but the
-/// library's top is proved by a walk of everything it read, every row of the library, and
-/// the oracle says so at both sizes.
+/// The second control of it: with no floor kept, the edit's walk is as small, but the narrow
+/// library's top, pulled before the walk, is proved by a walk of everything it read, every
+/// row of the library, and the oracle says so at both sizes.
 #[test]
 fn the_oracle_catches_an_edit_that_walks_what_the_build_verified() {
-    let small = a_first_edit_after_a_build(100, Plant::KeepsNoFloor);
-    let large = a_first_edit_after_a_build(2000, Plant::KeepsNoFloor);
+    let small = a_first_edit_after_a_build(100, false, Plant::KeepsNoFloor);
+    let large = a_first_edit_after_a_build(2000, false, Plant::KeepsNoFloor);
     assert_eq!((small.asked, small.marked, small.named), (1, 0, 1), "{small:?}");
     assert!(small.verified >= 200, "{small:?}");
     assert!(large.verified >= 4000, "{large:?}");
+}
+
+/// The third control of it: with no reach worked out, the wide library's top, asked by the
+/// walk's verification of the application's row, is proved by a walk of everything it read
+/// (its summary holds every bit, so neither its own view nor the floor proves it), and the
+/// oracle says so at both sizes.
+#[test]
+fn the_oracle_catches_a_walk_with_no_reach() {
+    let small = a_first_edit_after_a_build(100, true, Plant::WalksWithNoReach);
+    let large = a_first_edit_after_a_build(2000, true, Plant::WalksWithNoReach);
+    assert_eq!((small.asked, small.marked, small.named), (1, 0, 1), "{small:?}");
+    assert!(small.verified >= 200, "{small:?}");
+    assert!(large.verified >= 4000, "{large:?}");
+}
+
+/// Row 2 reads input 1 and row 1; row 1 reads row 0; row 0 reads input 0. Both inputs are
+/// written. The walk's first level is row 2 (it reads input 1) and row 0; row 2, the older
+/// node, is verified first and reads row 1, which is behind row 0, which is behind the
+/// write. Returns what row 2 answers after the walk (the model says 12).
+fn a_row_read_through_a_row_that_is_behind(plant: Plant) -> u64 {
+    let flow = vec![
+        sum(&[Dep::Input(0)]),
+        sum(&[Dep::Query(0)]),
+        sum(&[Dep::Input(1), Dep::Query(1)]),
+    ];
+    let mut db = TestDb::new();
+    db.storage_mut().plant_in_changed_set(plant);
+    *db.flow.lock() = flow.clone();
+    let mut inputs = vec![1u64, 1];
+    let cells: Vec<Cell> = inputs.iter().map(|&value| Cell::new(&db, value, 0)).collect();
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
+    assert_eq!(*fetch::<Flow>(&db, node(&db, 2)), 2);
+    let since = db.storage().view();
+    inputs[0] = 7;
+    cells[0].set_a(&mut db, 7);
+    inputs[1] = 5;
+    cells[1].set_a(&mut db, 5);
+    _ = changed_since::<Flow>(&db, since);
+    assert_eq!(evaluate(&flow, &inputs, 0)[2], 12);
+    *fetch::<Flow>(&db, node(&db, 2))
+}
+
+/// The invariant: the walk's reach holds every row behind a row that is behind, at any
+/// depth: a row a suspect reads is proved unchanged by the reach only when no write reaches
+/// it.
+#[test]
+fn a_row_behind_a_row_that_is_behind_is_inside_the_reach() {
+    assert_eq!(a_row_read_through_a_row_that_is_behind(Plant::None), 12);
+}
+
+/// The control of [`a_row_behind_a_row_that_is_behind_is_inside_the_reach`]: a reach of one
+/// level takes row 1 as unreached, row 2 is made from its old value, and the oracle sees the
+/// stale answer.
+#[test]
+fn the_oracle_catches_a_reach_of_one_level() {
+    assert_eq!(a_row_read_through_a_row_that_is_behind(Plant::ReachesOneLevel), 6);
 }
 
 /// A row with 70 readers, each read by nothing, and one row that reads another input; the

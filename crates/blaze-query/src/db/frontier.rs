@@ -53,7 +53,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::{
         Arc,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -154,6 +154,10 @@ fn merge_oldest(log: &mut Vec<Arc<Found>>) {
 /// too, which may be unchanged (a name too many costs its host one ask).
 const WIDE: usize = 64;
 
+/// The most rows a walk's reach holds ([`reach`]): past it the reach is let go, and rows are
+/// proved as without it. A set of this many rows is 2 MiB and a few milliseconds.
+const REACH_MOST: usize = 1 << 18;
+
 /// The verifications one walk contains the unwinding of before it stops verifying: from the
 /// row after the last of them it marks, as past a wide level ([`WIDE`]), and warns once.
 ///
@@ -219,6 +223,14 @@ pub struct ChangedSetWork {
     pub changed: u64,
     /// Verifications that unwound and were contained.
     pub unwound: u64,
+    /// Rows the walk's writes and changed nodes reach through the reverse edges with no
+    /// cutoff ([`reach`]): every row that can be behind. 0 when it passed [`REACH_MOST`]
+    /// (`reach_over`).
+    pub reach: u64,
+    /// Reverse edges followed to find it.
+    pub reach_edges: u64,
+    /// Whether the reach passed [`REACH_MOST`] and was let go: no row is proved by it.
+    pub reach_over: bool,
     /// Rows marked unverified: those of the first wide level ([`WIDE`] rows) and every row
     /// reached past it, or past the walk's most unwinds ([`UNWOUND_MOST`]). 0 for an edit
     /// whose every level is narrow and whose rows verify.
@@ -263,6 +275,12 @@ pub(crate) enum Plant {
     /// ([`Storage::complete_summaries`] taken out): a reader marked unchanged with no look at
     /// its edges does not learn what its dependency reads now.
     LeavesReadersSummaries,
+    /// The walk works out no reach ([`reach`]): a row it verifies proves what it read by
+    /// durability, summary or a walk of its edges, as before 2026-11-12.
+    WalksWithNoReach,
+    /// The reach stops at the readers of what was written and said ([`reach`]'s closure
+    /// taken out): a row behind a row that is behind is taken as unreached.
+    ReachesOneLevel,
 }
 
 /// The storage's part of the changed set.
@@ -282,6 +300,13 @@ pub(crate) struct Frontier {
     /// The stamp of the view every row but those set apart or untracked is known to hold as
     /// of ([`floor`]); 0 for none. Renumbered with the stamps ([`Storage::restamp`]).
     pub(crate) floor: AtomicU32,
+    /// The view the walk under way (or the last) worked out its reach in ([`reach`]), and
+    /// the reach: null when it passed [`REACH_MOST`]. Set by the walk's holder; a set
+    /// replaced stays in `reached_before` until the next view boundary frees it (`&mut`).
+    reach_at: AtomicU64,
+    reached: AtomicPtr<Seen>,
+    #[expect(clippy::disallowed_types, reason = "held to push or drain a pointer, never across a call")]
+    reached_before: blaze_core::lock::Lock<Vec<Box<Seen>>>,
     /// How many rows [`Walked::apart`] holds.
     unwound: AtomicU32,
     plant: Plant,
@@ -299,6 +324,9 @@ impl Frontier {
             walked: blaze_core::lock::Lock::new("query.frontier.walked", Walked::default()),
             clean_at: AtomicU64::new(0),
             floor: AtomicU32::new(0),
+            reach_at: AtomicU64::new(0),
+            reached: AtomicPtr::new(std::ptr::null_mut()),
+            reached_before: blaze_core::lock::Lock::new("query.frontier.reached_before", Vec::new()),
             unwound: AtomicU32::new(0),
             plant: Plant::None,
         }
@@ -741,10 +769,16 @@ struct Taken<'a> {
     frontier: &'a Frontier,
     written: Vec<u32>,
     untracked: Vec<u32>,
+    /// The nodes that had said they changed, taken off the queue by this walk: put back if
+    /// it unwinds, so the next walk asks their readers (until 2026-11-12 they were lost).
+    said: Vec<u32>,
 }
 
 impl Drop for Taken<'_> {
     fn drop(&mut self) {
+        for &node in &self.said {
+            self.frontier.changed.push(node);
+        }
         let mut walked = self.frontier.walked.lock();
         walked.written = std::mem::take(&mut self.written);
         walked.untracked = std::mem::take(&mut self.untracked);
@@ -828,6 +862,7 @@ fn walk(db: *const (), storage: &Storage) {
             frontier,
             written: std::mem::take(&mut walked.written),
             untracked: std::mem::take(&mut walked.untracked),
+            said: Vec::new(),
         };
         (taken, Arc::clone(&walked.apart)) // clone: a count
     };
@@ -846,6 +881,9 @@ fn walk(db: *const (), storage: &Storage) {
         changed = tracing::field::Empty,
         unwound = tracing::field::Empty,
         marked = tracing::field::Empty,
+        reach = tracing::field::Empty,
+        reach_edges = tracing::field::Empty,
+        reach_over = tracing::field::Empty,
     );
     let _entered = walking.enter();
     let mut plan = Plan::new();
@@ -889,6 +927,21 @@ fn walk(db: *const (), storage: &Storage) {
             work.untracked += 1;
         }
     }
+    // What said it changed by any pull since the last walk: the walk's start, beside what
+    // was written.
+    if plant != Plant::ForgetsReadersOfWritten {
+        while let Some(node) = frontier.changed.pop() {
+            changed.push(changed_in(storage, node, plant));
+            found.push(node);
+            taken.said.push(node); // alloc: the walk's start, a word a node
+            work.said += 1;
+        }
+    }
+    // The reach, before any row is verified: a verification under this walk proves a row
+    // outside it with one look ([`unreached`]), where it walked everything the row read.
+    if plant != Plant::WalksWithNoReach {
+        reach(storage, &changed, &taken.untracked, &mut work);
+    }
     // The rows set apart, by node: those kept from the walks before and this walk's.
     let mut apart_now = Seen::with_hasher(blaze_hash::FixedState);
     apart_now.extend(unwound.iter().map(|it| it.0)); // alloc: as above
@@ -899,17 +952,15 @@ fn walk(db: *const (), storage: &Storage) {
         Plant::ContainsEveryUnwind => u64::MAX,
         _ => UNWOUND_MOST,
     };
-    let mut first = true;
     loop {
-        // What said it changed, by this walk's verifications or by any pull since the last.
-        if first || plant != Plant::StopsAtChangedReader {
+        // What said it changed by this walk's verifications, or by a pull meanwhile.
+        if plant != Plant::StopsAtChangedReader {
             while let Some(node) = frontier.changed.pop() {
                 changed.push(changed_in(storage, node, plant));
                 found.push(node);
-                work.said += u64::from(first);
+                taken.said.push(node); // alloc: as above
             }
         }
-        first = false;
         if plant == Plant::ForgetsReadersOfWritten {
             changed.clear();
         }
@@ -1023,6 +1074,9 @@ fn walk(db: *const (), storage: &Storage) {
     walking.record("changed", work.changed);
     walking.record("unwound", work.unwound);
     walking.record("marked", work.marked);
+    walking.record("reach", work.reach);
+    walking.record("reach_edges", work.reach_edges);
+    walking.record("reach_over", work.reach_over);
     // The walk's work, kept with the build it ran in (`blaze explain edit_work`): a walk
     // that verified or reached more than the edit did shows here first.
     tracing::info!(
@@ -1037,6 +1091,8 @@ fn walk(db: *const (), storage: &Storage) {
         changed = work.changed,
         unwound = work.unwound,
         marked = work.marked,
+        reach = work.reach,
+        reach_edges = work.reach_edges,
         "edit work"
     );
 
@@ -1046,6 +1102,7 @@ fn walk(db: *const (), storage: &Storage) {
     let apart = u32::try_from(unwound.len()).unwrap_or(u32::MAX);
     let unwound = Arc::new(unwound); // alloc: as above
     taken.written.clear();
+    taken.said.clear();
     let mut walked = frontier.walked.lock();
     walked.log = log;
     walked.apart = unwound;
@@ -1215,26 +1272,151 @@ fn verified_word(storage: &Storage, node: u32) -> u32 {
     row_of(storage, node).map_or(0, |(header, _, _)| header.verified.load(Ordering::Acquire))
 }
 
-/// Whether the row of `node`, verified in an earlier view, holds in this one with no look at
-/// its edges: a walk ended in this view, and what a walk leaves is that every row made before
-/// it is verified in its view or unchanged (the module's argument), but a row whose last run
-/// made an untracked read (it runs again in every view) and one whose verification by the
-/// walk unwound. So after a walk a pull of an unchanged row costs this, not its edges: what
-/// makes a host's pass over every row it holds cost a few loads a row.
+/// Works out the reach of the walk that starts from `changed` (the fields written and the
+/// nodes that said they changed, each with its stamp) and the `untracked` rows, and publishes
+/// it for this view: every row that reads one of them through the reverse edges, at any
+/// depth, with no cutoff. The readers of a changed node that saw its change are passed over
+/// as the walk passes them ([`Plan::suspects`]); past the first step every reader counts,
+/// since a row that is behind may change when it is brought up to date.
 ///
-/// A walk that started again in the same view changes nothing here: only a row set apart
-/// can change behind a walk that ended, and its readers are set apart with it (a reader's
-/// verification pulls it and unwinds as it does).
+/// The invariant: while the reach is this view's, a row outside it that no earlier walk set
+/// apart and whose last run made no untracked read is unchanged ([`unreached`]). Every row
+/// held at the last walk's end but those set apart (the module's argument); a row changes
+/// only by running again for a read that changed, and a read changes only by being written,
+/// by running again (then it says so) or by an untracked read: each of those is a start of
+/// this closure or inside it, and the reverse index names every reader of each. A row that
+/// runs during the walk is inside it, and so is every reader of it.
+///
+/// Why: the walk verifies its suspects as a pull does, and a pull proves each row a suspect
+/// read by durability, by its input summary, or by walking what it read. After a write of
+/// workspace structure (a file added: `MEDIUM`) neither of the first two holds for a
+/// library's rows, and the 41 suspects of a hello-world's first edit walked 1,077,205 rows
+/// that the edit could not reach (2026-11-12). The reach says so for each in one look.
+///
+/// Bounded by [`REACH_MOST`] rows (rule 18): a reach past it is let go, and the walk goes on
+/// as without one.
+fn reach(storage: &Storage, changed: &[ChangedIn], untracked: &[u32], work: &mut ChangedSetWork) {
+    let frontier = &storage.frontier;
+    let one_level = frontier.plant == Plant::ReachesOneLevel;
+    // alloc: the walk's reach, 8 bytes a row it can reach
+    let mut reached = Box::new(Seen::with_hasher(blaze_hash::FixedState));
+    let mut next: Vec<u32> = Vec::new(); // alloc: as above
+    let mut edges = 0u64;
+    for &(node, since) in changed {
+        edges += frontier.reverse.readers(node, |reader| {
+            if (since == ASSUMED || verified_in(storage, reader) < since) && reached.insert(reader) {
+                next.push(reader); // alloc: as above
+            }
+        });
+    }
+    for &node in untracked {
+        if reached.insert(node) {
+            next.push(node); // alloc: as above
+        }
+    }
+    let mut over = false;
+    while let Some(node) = next.pop() {
+        if one_level {
+            break;
+        }
+        if reached.len() > REACH_MOST {
+            over = true;
+            break;
+        }
+        edges += frontier.reverse.readers(node, |reader| {
+            if reached.insert(reader) {
+                next.push(reader); // alloc: as above
+            }
+        });
+    }
+    work.reach_edges = edges;
+    work.reach_over = over;
+    work.reach = if over { 0 } else { reached.len() as u64 };
+    let new = if over { std::ptr::null_mut() } else { Box::into_raw(reached) };
+    // The view first, at one no reach is of, so no reader pairs the old view with the new
+    // set or the new view with the old one.
+    frontier.reach_at.store(0, Ordering::Release);
+    let old = frontier.reached.swap(new, Ordering::AcqRel);
+    frontier.reach_at.store(storage.view().as_u64(), Ordering::Release);
+    if !old.is_null() {
+        // SAFETY: `old` came from `Box::into_raw` in an earlier call and was taken out of
+        // `reached` by the swap above, so this is its one owner. A reader that loaded it
+        // before the swap may still read it: it is kept, not freed, until the next view
+        // boundary (`Storage::drop_reaches`, `&mut`: no reader).
+        frontier.reached_before.lock().push(unsafe { Box::from_raw(old) }); // alloc: a pointer a walk
+    }
+}
+
+impl Storage {
+    /// Frees the reaches the walks of the view before replaced, and forgets the last: with
+    /// `&mut`, at a view boundary, so no reader holds one.
+    pub(crate) fn drop_reaches(&mut self) {
+        *self.frontier.reach_at.get_mut() = 0;
+        let last = std::mem::replace(self.frontier.reached.get_mut(), std::ptr::null_mut());
+        if !last.is_null() {
+            // SAFETY: from `Box::into_raw` in `reach`, and `&mut self`: no reader, one owner.
+            drop(unsafe { Box::from_raw(last) });
+        }
+        self.frontier.reached_before.get_mut().clear();
+    }
+}
+
+impl Drop for Frontier {
+    fn drop(&mut self) {
+        let last = *self.reached.get_mut();
+        if !last.is_null() {
+            // SAFETY: from `Box::into_raw` in `reach`; the storage is going, one owner.
+            drop(unsafe { Box::from_raw(last) });
+        }
+    }
+}
+
+/// Whether the changed set says the row of `node`, verified in an earlier view, is unchanged
+/// in this one with no look at its edges, for a row whose last run made no untracked read
+/// (the caller's to know):
+/// - a walk ended in this view: what a walk leaves is that every row made before it is
+///   verified in its view or unchanged (the module's argument), but one set apart;
+/// - or a walk of this view is under way and the row is outside its reach ([`reach`]) and
+///   was not set apart by the walks before.
+///
+/// A walk that started again in the same view changes nothing of the first: only a row set
+/// apart can change behind a walk that ended, and its readers are set apart with it (a
+/// reader's verification pulls it and unwinds as it does).
+#[inline]
+pub(crate) fn unreached(storage: &Storage, node: u32) -> bool {
+    let frontier = &storage.frontier;
+    let view = storage.view().as_u64();
+    if frontier.clean_at.load(Ordering::Acquire) == view {
+        return frontier.unwound.load(Ordering::Acquire) == 0 || !set_apart(frontier, node);
+    }
+    if frontier.reach_at.load(Ordering::Acquire) != view {
+        return false;
+    }
+    outside_reach(storage, node)
+}
+
+#[cold]
+fn outside_reach(storage: &Storage, node: u32) -> bool {
+    let frontier = &storage.frontier;
+    let reached = frontier.reached.load(Ordering::Acquire);
+    // The view again: a set loaded between a later walk's two stores is not this view's.
+    if reached.is_null() || frontier.reach_at.load(Ordering::Acquire) != storage.view().as_u64() {
+        return false;
+    }
+    // SAFETY: a non-null `reached` is a live `Box<Seen>` until a view boundary frees it
+    // (`Storage::drop_reaches`, `&mut`), and this reader borrows the storage: a walk that
+    // replaces it meanwhile keeps it in `reached_before`. The set is never written after
+    // `reach` publishes it.
+    let reached = unsafe { &*reached };
+    !reached.contains(&node)
+        && (frontier.unwound.load(Ordering::Acquire) == 0 || !set_apart(frontier, node))
+}
+
+/// [`unreached`] for a row read with its header: `false` for one whose last run made an
+/// untracked read (it runs again in every view).
 #[inline]
 pub(crate) fn clean(storage: &Storage, header: &Header, node: u32) -> bool {
-    let frontier = &storage.frontier;
-    if frontier.clean_at.load(Ordering::Acquire) != storage.view().as_u64() {
-        return false;
-    }
-    if header.meta.load(Ordering::Relaxed) & UNTRACKED != 0 {
-        return false;
-    }
-    frontier.unwound.load(Ordering::Acquire) == 0 || !set_apart(frontier, node)
+    header.meta.load(Ordering::Relaxed) & UNTRACKED == 0 && unreached(storage, node)
 }
 
 #[cold]
