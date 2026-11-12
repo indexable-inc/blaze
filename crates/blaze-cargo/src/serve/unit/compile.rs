@@ -38,6 +38,14 @@
 #![forbid(unsafe_code)]
 
 pub(super) mod doctest;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the record of a unit's read parts and its check; the trace that fills it from a unit's making is not built (docs/v2/plan/design/store.md, \"Early cutoff between crates\")"
+    )
+)]
+pub(super) mod parts;
 
 use std::{fmt, sync::Arc};
 
@@ -397,9 +405,10 @@ fn narrow_identity(job: &Job, unit: usize) -> Result<Option<ContentId>, ApiError
 /// - it builds code and makes a library ([`Makes::Library`]): nothing is linked, and what it
 ///   compiles is in the store by each function's own key. A program's unit links every
 ///   function it reaches, so it holds them all by their code;
-/// - its profile's `opt-level` is 0 and its goal is tier 0 code: the MIR inliner then builds
-///   into a caller only what is `#[inline]` by its attributes, a body the interface holds
-///   whole. Optimized, it infers of a small leaf of another crate that it may be inlined, from
+/// - its profile's `opt-level` is 0 and its goal is tier 0 code: nothing is then built into
+///   a caller's own code but an `#[inline(always)]` body, which the surface holds whole with
+///   its place; a copy of a generic or `#[inline]` function is a function of its own, under
+///   its own key, in no library's record. Optimized, it infers of a small leaf of another crate that it may be inlined, from
 ///   that function's body (`hir_ty_mir`'s `cross_crate_inlinable`), which no interface holds.
 ///
 /// What such a unit's record holds, each from its own code text and its dependencies'
@@ -608,6 +617,31 @@ fn places(job: &Job, edition: ::span::Edition, said: &Said) -> Option<drawn::Pla
     // clone: once per unit stored with diagnostics, to find their places
     let shown: Vec<Diag> = said.code().cloned().collect();
     placed_from(|name| quoted_text(job, name), edition, &shown).map(|it| it.files)
+}
+
+/// Whether every span of `diags` is in a file of `krate`'s own modules ([`crate_files`]).
+/// A diagnostic is kept as places only then: a narrow key holds the unit's own files with
+/// every token's line and column, and of the crates below it their surfaces
+/// ([`blaze_lower::Narrowed`]), which hold no position, so a place in a file of another crate
+/// (a note at a definition there) is not one the key keeps. Such a record is under what its
+/// diagnostics quote ([`quoted_key`], those files' bytes) or its whole key, and such a
+/// check's outcome is not kept.
+fn in_own_files(job: &Job, reader: &UnitReader, krate: base_db::Crate, diags: &[Diag]) -> bool {
+    if diags.is_empty() {
+        return true;
+    }
+    let own = crate_files(reader, krate);
+    // alloc: once per unit stored with diagnostics, a name each span
+    let mut files: Vec<String> = Vec::new();
+    for diag in diags {
+        // clone: the diagnostic, to walk its spans with the one walk there is
+        let mut diag = diag.clone();
+        // clone: a file's name per span
+        each_span_mut(&mut diag, &mut |span| files.push(span.file.clone()));
+    }
+    files.sort_unstable();
+    files.dedup();
+    files.iter().all(|name| own.binary_search(&job.mounted.absolute(name)).is_ok())
 }
 
 /// `diags` with the place of each end of each of their spans ([`Placed`]; none as
@@ -916,7 +950,11 @@ fn check_puts(
     let placed = match diags.is_empty() {
         true => None,
         false => {
-            let edition = crate_of(job, unit, u)?.data(reader.db()).edition;
+            let krate = crate_of(job, unit, u)?;
+            if !in_own_files(job, reader, krate, diags) {
+                return Ok(none);
+            }
+            let edition = krate.data(reader.db()).edition;
             match placed_from(|name| quoted_text(job, name), edition, diags) {
                 Some(placed) => Some(placed),
                 None => return Ok(none),
@@ -3162,7 +3200,12 @@ fn store(
     said.places = match (narrow, &quoted) {
         (Some(_), Some((count, _))) if *count == said.items.len() && !said.items.is_empty() => {
             let _span = tracing::info_span!(target: "blaze", "unit diagnostics places").entered();
-            places(job, krate.data(reader.db()).edition, &said)
+            // clone: once per unit stored with diagnostics, to find the files they point into
+            let shown: Vec<Diag> = said.code().cloned().collect();
+            match in_own_files(job, reader, krate, &shown) {
+                true => places(job, krate.data(reader.db()).edition, &said),
+                false => None,
+            }
         }
         _ => None,
     };

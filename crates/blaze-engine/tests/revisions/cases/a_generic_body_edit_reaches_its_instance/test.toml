@@ -1,4 +1,4 @@
-about = "A generic function of `a` that `c` instantiates: an edit of its body makes the instance again and no other function of `c`, `b` or `a` (each is found by its own code), and the program prints the new value: a library's key holds the bodies it compiles a copy of, so `c`'s record is not found stale. What it does not show yet: `b`, which instantiates nothing of `a`, is made again as a unit too (no function of it), because the interface is one text a crate today; per instance is store.md's `Not built` (1)."
+about = "A generic function of `a` that `c` instantiates: an edit of its body makes the instance again and no other function, and two units, `a`'s library and the program, whose walk compiles the copy; the libraries `b` and `c` are found, as no front end reads a generic body and no library's record holds a copy of one (store.md, \"Early cutoff between crates\"). The program prints the new value, so the instance is not stale."
 drivers = ["real"]
 
 [[revision]]
@@ -12,4 +12,5 @@ args = ["-p", "app"]
 prints = "11 10\n"
 redone_has = ["a::twice<u32>"]
 reused = ["c::top", "c::top_beside", "b::mid", "b::mid_beside", "a::base", "a::beside"]
-max_units = 4
+max_units = 2
+max_records = 2

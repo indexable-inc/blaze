@@ -1051,3 +1051,202 @@ fn the_still_text_leaves_out_what_ends_a_line_and_nothing_else() {
         still("const A: &str = \"a // c\";\n")
     );
 }
+
+/// What a crate of the one file `text` shows another crate's front end, positions left out
+/// ([`super::own_narrow`]'s choice for it: its surface text, or its code text where no body
+/// may be left out).
+fn surfaced(text: &str) -> ContentId {
+    let code = code(text);
+    match code.unplain {
+        true => code.inert,
+        false => code.surface,
+    }
+}
+
+/// Whether another crate's front end reads the body or value of an item of `kind`: it
+/// evaluates it, infers a type through it, or finds an item or a macro's tokens in it. A
+/// generic, `#[inline]` or default-method body is checked against by its signature.
+fn front_reads(kind: Kind) -> bool {
+    matches!(kind, Kind::Const | Kind::Hidden | Kind::Holds | Kind::Calls | Kind::Value | Kind::Macro)
+}
+
+/// Whether an item of `kind` is in the surface with where it is: a macro's definition, and a
+/// call of a macro that is not the standard library's.
+fn placed(kind: Kind) -> bool {
+    matches!(kind, Kind::Macro | Kind::Calls)
+}
+
+/// The oracle of the surface text: the surface of `items` and of `items` after `edit` of
+/// item `at` differ exactly when another crate's front end can observe the edit. A position
+/// counts only where the surface holds one: an edit that moves a line is observed when an
+/// item after it is [`placed`], and not otherwise.
+fn check_surface(items: &[Item], at: usize, edit: Edit) -> Result<(), String> {
+    let item = items[at];
+    let later_placed = items[at + 1..].iter().any(|it| placed(it.kind));
+    let observed = match edit {
+        Edit::Body => front_reads(item.kind),
+        Edit::Lines if item.has_body() => front_reads(item.kind) || later_placed,
+        Edit::Lines | Edit::Signature | Edit::Removed | Edit::Added | Edit::Cfg => true,
+        // A macro's definition is held as its bytes, a comment among them too.
+        Edit::Comment => item.kind == Kind::Macro,
+    };
+    let (after, _) = edited(items, at, edit);
+    let (before, after) = (file(items), file(&after));
+    let moved = surfaced(&before) != surfaced(&after);
+    match (observed, moved) {
+        (true, false) => Err(format!(
+            "{:?} {edit:?}: a front end can observe it, and the surface text is as it was",
+            item.kind
+        )),
+        (false, true) => Err(format!(
+            "{:?} {edit:?}: no front end can observe it, and the surface text moved",
+            item.kind
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The invariant: any edit of a file that changes what the front end of a crate above it can
+/// observe (a signature, an item or a `cfg` that comes or goes, a constant's value, a macro's
+/// tokens, a `const` or `impl Trait` body, a body that defines an item or calls an unknown
+/// macro, the line of a macro's definition or of such a call) changes its surface text, and
+/// an edit of a comment, of a plain, generic, `#[inline]` or default-method body, or of the
+/// lines of one with nothing placed after it, leaves it as it was.
+/// Drawn: up to five items of any kind, and one edit of one of them.
+#[hegel::test]
+fn the_surface_text_moves_exactly_with_what_a_front_end_observes(tc: TestCase) {
+    let drawn: Vec<(u8, u8, u8, bool)> = tc.draw(
+        gs::vecs(gs::tuples!(
+            gs::integers().max_value(10),
+            gs::integers().max_value(2),
+            gs::integers().max_value(9),
+            gs::booleans()
+        ))
+        .min_size(1)
+        .max_size(5),
+    );
+    let items: Vec<Item> = drawn
+        .iter()
+        .map(|&(kind, sig, value, long)| Item {
+            kind: KINDS[usize::from(kind)],
+            sig,
+            value,
+            long,
+            gated: false,
+            noted: false,
+        })
+        .collect();
+    let at: usize = tc.draw(gs::integers().max_value(items.len() - 1));
+    let edit: usize = tc.draw(gs::integers().max_value(EDITS.len() - 1));
+    if let Err(found) = check_surface(&items, at, EDITS[edit]) {
+        panic!("{found}\n{}", file(&items));
+    }
+}
+
+/// One item of `kind`, edited by `edit`, asked of the surface text.
+fn directed_surface(kind: Kind, edit: Edit) -> Result<(), String> {
+    let item = Item { kind, sig: 0, value: 1, long: false, gated: false, noted: false };
+    check_surface(&[item], 0, edit)
+}
+
+/// Every edit of every kind of item, one item a file: the surface's oracle case by case.
+#[test]
+fn the_surface_text_holds_every_edit_of_every_kind_of_item() {
+    for kind in KINDS {
+        for edit in EDITS {
+            assert_eq!(directed_surface(kind, edit), Ok(()), "{kind:?} {edit:?}");
+        }
+    }
+}
+
+/// With a surface that keeps a left-out body's count of lines, a line added to a plain body
+/// moves it, the cutoff of positions gone: the oracle says so (the cause removed: without the
+/// plant the same edit moves nothing).
+#[test]
+fn the_oracle_catches_a_surface_that_holds_a_bodys_lines() {
+    for kind in [Kind::Plain, Kind::Method, Kind::Generic, Kind::Inline, Kind::Default] {
+        assert_eq!(directed_surface(kind, Edit::Lines), Ok(()), "{kind:?}");
+        assert_eq!(
+            planting(Plant::Lines, || directed_surface(kind, Edit::Lines)),
+            Err(format!("{kind:?} Lines: no front end can observe it, and the surface text moved")),
+            "{kind:?}"
+        );
+    }
+}
+
+/// A position a constant can hold is in the surface: `line!()`, `column!()` and `Location`
+/// with their line and what is before them on it, so a line added above one, in a body the
+/// surface leaves out, moves the surface, and a line added below it does not. With the
+/// planted bug (no position held) the constant's crate is as it was after its line moved: a
+/// stale constant above it.
+#[test]
+fn a_position_a_constant_holds_is_in_the_surface() {
+    for reader in ["line!()", "column!()", "core::panic::Location::caller().line()"] {
+        let text = |above: &str, below: &str| {
+            format!(
+                "pub fn above() -> u32 {{\n{above}    1\n}}\npub const AT: u32 = {reader};\npub fn below() -> u32 {{\n{below}    2\n}}\n"
+            )
+        };
+        let was = surfaced(&text("", ""));
+        assert_eq!(was, surfaced(&text("", "    let _more = 0;\n")), "{reader}: a line below");
+        assert_ne!(was, surfaced(&text("    let _more = 0;\n", "")), "{reader}: a line above");
+        assert_eq!(
+            planting(Plant::Unstamped, || surfaced(&text("", ""))),
+            planting(Plant::Unstamped, || surfaced(&text("    let _more = 0;\n", ""))),
+            "{reader}: the control holds no position, so it misses the moved line"
+        );
+    }
+    // The same token moved along its line is another column.
+    assert_ne!(
+        surfaced("pub const AT: u32 = column!();\n"),
+        surfaced("pub const AT: u32 =  column!();\n")
+    );
+}
+
+/// What a front end does not read and a code generator does: a generic, `#[inline]` or
+/// default-method body's edit moves the interface text, which a unit that compiles copies is
+/// keyed by, and not the surface. An `#[inline(always)]` body, built into its callers' own
+/// code even unoptimized, moves both, and so does the line it is on.
+#[test]
+fn a_body_only_a_code_generator_reads_is_in_the_interface_and_not_the_surface() {
+    for head in ["pub fn f<T>(t: T) -> u32", "#[inline]\npub fn f() -> u32", "impl<T> S<T> {\npub fn f(&self) -> u32"] {
+        let tail = if head.starts_with("impl") { "\n}" } else { "" };
+        let text = |value: u8| format!("{head} {{\n    {value}\n}}{tail}\n");
+        let (was, now) = (code(&text(1)), code(&text(2)));
+        assert_ne!(was.interface, now.interface, "{head}");
+        assert_eq!(was.surface, now.surface, "{head}");
+        assert_eq!(was.surface_strict, now.surface_strict, "{head}");
+    }
+    let always = |lead: &str, value: u8| {
+        format!("{lead}#[inline(always)]\npub fn f() -> u32 {{\n    {value}\n}}\n")
+    };
+    let was = code(&always("", 1));
+    assert_ne!(was.surface, code(&always("", 2)).surface, "its body");
+    assert_ne!(was.surface, code(&always("\n", 1)).surface, "its line");
+}
+
+/// The flags a crate above is asked of positions by: a `#[track_caller]` `const fn`, the name
+/// `Location`, and a call where a constant is evaluated, never one in a closure or in a
+/// function that is not `const`.
+#[test]
+fn what_could_give_a_constant_its_callers_position_is_flagged() {
+    let flags = |text: &str| {
+        let code = code(text);
+        (code.tracks, code.names_location, code.calls)
+    };
+    assert_eq!(flags("pub fn f() -> u32 {\n    g()\n}\n"), (false, false, false));
+    assert_eq!(flags("#[track_caller]\npub fn f() {}\n"), (false, false, false));
+    assert_eq!(flags("#[track_caller]\npub const fn f() {}\n"), (true, false, false));
+    assert_eq!(flags("use core::panic::Location;\n"), (false, true, false));
+    assert_eq!(flags("pub const C: u32 = g();\n"), (false, false, true));
+    assert_eq!(flags("pub static C: u32 = x.g();\n"), (false, false, true));
+    assert_eq!(flags("pub const fn f() -> u32 {\n    g()\n}\n"), (false, false, true));
+    assert_eq!(flags("pub struct S([u8; g()]);\n"), (false, false, true));
+    assert_eq!(
+        flags("pub static C: Lazy<u32> = Lazy::new(|| g());\n"),
+        (false, false, true),
+        "the call of `Lazy::new` is evaluated; the one in its closure is not"
+    );
+    assert_eq!(flags("pub static C: Lazy<u32> = Lazy(|| g());\n"), (false, false, true));
+    assert_eq!(flags("pub fn f() -> impl Copy {\n    g()\n}\n"), (false, false, false));
+}

@@ -243,7 +243,7 @@ to a proc macro (no trace names it): a closure with either is filed here too.
 | Reader | Reads of a dependency | Digest today |
 |---|---|---|
 | a dependent's check | signatures, types, generic, `const`, `#[inline]` and `impl Trait` bodies, positions | `Narrow::interface` (interface text; a plain body is its shape) |
-| a dependent library's codegen | at `opt-level` 0 the same; optimized, plus what it inlines | `Narrow::built` (the interface) at `opt-level` 0, "Early cutoff between crates" below; `Narrow::code` (every body) optimized |
+| a dependent library's codegen | at `opt-level` 0 what its front end reads and `#[inline(always)]` bodies; optimized, plus what it inlines | `Narrow::built` (the surfaces) at `opt-level` 0, "Early cutoff between crates" below; `Narrow::code` (every body) optimized |
 | a link | every function's code record | each `Code` record's key; the unit key holds `Narrow::code` |
 | a build script's or macro's user | what the run printed and wrote, by value | `blaze_usercode` shapes (already by output) |
 
@@ -476,94 +476,114 @@ interposers, which decide what a run can read) was not checked by this lane.
 
 ## Early cutoff between crates
 
-2026-11-12, lane cutoff-1112 (D21). The digest "Content keys" item 3 asks for ("for each
-dependency the digest of what the stage reads of it"), defined once: a unit's key, a sealed
-crate's leaf ([restore.md](restore.md), "Sealed crates") and a describe's home all mean this.
-Written, not yet compiled or run: the tests are named, their results are the round's. Code:
-`blaze_lower::Narrowed` (`crates/blaze-lower/src/lib.rs`, `narrow_of`), the texts in
-`crates/blaze-lower/src/code.rs`, `cut_at_crates` in `crates/blaze-cargo/src/serve/unit/compile.rs`.
+2026-11-12, lane cutoff-1112 (D21). The rule of "What a step reads", for a unit's
+dependencies: **a dependent's key covers exactly what it read of the crates below it, and
+nothing else.** Not one digest a crate that every dependent takes whole: a part per thing read,
+recorded when the unit is made, checked as traced reads are. Three layers. The first two are
+written and not yet compiled or run (what compiled, at b16074567d, is their first form: a
+library keyed by its dependencies' positioned interface texts); the third has its record and
+check written and its trace not.
 
-**The bug.** A unit that builds code was keyed by the code text of every crate below it,
-deeply (`Narrowed::code`), because its walk reaches into them and its record listed what it
-found. On reth a one-line body edit in `reth-chainspec` missed 54 units (lane reth-1112: 52 s
-against 7 to 16 s for a leaf), each then checked and walked again.
+**The parts** (`blaze_items::Fact`, the item store's vocabulary, plus positions):
 
-**What each stage of a dependent reads of a dependency, and the digest that covers it.**
+| The dependent | reads | part | negative read |
+|---|---|---|---|
+| resolves a path, an import, a glob | what a name is in a scope | `Resolves { scope, name }` | yes: asked of the scope's index, so a name absent (the glob gave none, the dependent's own item won) is a value, and an item added under it moves it |
+| expands a macro | the macro's tokens (found by `Resolves`) | `Signature` of the macro item | through `Resolves` |
+| checks a call, a use of a type | the callee's signature, generics, bounds; a type's fields | `Signature(item)`, `Field { ty, field }` | no |
+| holds or moves a value | size, alignment, offsets, niches | `Layout(type)` | no |
+| selects an impl, resolves a method | which impls a trait has for a type; what `x.m()` is | `Implements { trait, self type }`, `Method { self type, name }`, `Vtable`, `Coherence`, `Specializes` | yes: asked of the impl index by simplified self type, so "no impl" is a value and an impl added moves it |
+| evaluates a constant, a discriminant, an array's length | the value, not the expression | `ConstValue(item)` | no |
+| types through a body | an `impl Trait`'s hidden type, auto-trait leakage, a closure's captures | `HiddenTypes`, `AutoTraits`, `RpititTys`, `Captures` | no |
+| compiles a copy (a generic, `#[inline]`, a default method), or inlines when optimized | the body | `Code(item)` | no |
+| names an item where the program can see it (`type_name`, a symbol) | its path | `Name(item)` | no |
+| holds a copy's panic location or debug info, or links | where the item's code is written | `Spans(item)` (new, `compile/parts.rs`) | no |
+| anything of a crate lowered as one batch | the crate | `Crate(crate)` | - |
 
-| Stage of the dependent | Reads | Covered by |
-|---|---|---|
-| name resolution | module tree, names, visibility, re-exports, globs, `#[macro_export]` and `pub macro` names, lang items, the crate's name, edition and cfg | the interface: every token outside a left-out body; the crate's settings |
-| macro expansion | a `macro_rules!` or `macro` body's tokens; a proc macro's code (run) | the interface holds macro bodies whole; a proc-macro, build-script or const-macro crate is its code |
-| type checking, trait solving | signatures, generics, bounds, fields, variants, `repr`, impl headers and their items' names, trait items, associated types and consts, attributes that change meaning (`must_use`, `deprecated`, `non_exhaustive`, `track_caller`, `inline`) | the interface (all are tokens outside bodies) |
-| hidden types, auto-trait leakage | the body of a function whose signature or `impl` hides a type (`impl Trait`, `async`) | kept whole (`plain_body` refuses it) |
-| const evaluation (types, array lengths, discriminants, patterns) | a `const`'s or `static`'s value, a `const fn`'s body | kept whole |
-| borrow checking, lints of the dependent | signatures and variance (from fields) | the interface |
-| blaze's extensions (effects, contracts, `fn_info`) | bodies below, through what is proved over them | a crate that names them, or is above a workspace crate that does, gives and takes no interface |
-| codegen: instantiation | the bodies it compiles a copy of: a generic (of the fn, its `impl` or its trait), a default method, `#[inline]`, a closure in one of those, a body that defines an item | kept whole, with its position, so each instance's code identity is a function of the interface |
-| codegen: inlining across crates | at `opt-level` 0, only `#[inline]` bodies (above). Optimized, the inliner infers that a small leaf may be built into its callers from that leaf's own body (`cross_crate_inlinable`) | optimized units keep the deep key (`Narrowed::code`) |
-| codegen: a call of any other function | its symbol and what a caller assumes of it (`Described::abi`): its signature and the layouts it names | the interface; the callee is a place the link fills |
-| link | every function's code record, by content | a program's unit holds the code of every crate it links (`Narrowed::code`) and finds each function by its own key |
-| positions | a diagnostic into the dependency (the record is then under the files it quotes, `quoted_key`); `line!`, `Location`, span tables and debug info of code instantiated from it | each left-out body and comment as its shape (line ends, last line's length), so every kept token is where it was |
+No part's value but `Spans` has a position in it, so a line added to a private body moves no
+front-end part of any dependent, and only the units that hold a copy of code below the line,
+or link it, read a `Spans` that moved.
 
-The dependent's front end does not read a generic or `#[inline]` body: it checks calls against
-signatures (`plain_body`'s list is of what a *check or a build* may read; the bodies kept for
-instantiation alone are the rows "codegen: instantiation"). They are in the one interface text
-today, so a check-only unit is made again by a generic body's edit below it: one text, not two,
-is the first thing listed under "not built".
+**Layer 1, the quick check (built): the surface.** `blaze_lower`'s `CodeText::surface`: a
+file's tokens, each with whether whitespace parts it from the one before; no comment; every
+body no other crate's front end reads as a mark (a plain body, and a generic, `#[inline]` or
+default-method body: a front end checks a call against the signature); no line count. A
+position stays only where a constant could hold it: the line and the line's text before each
+`line!`, `column!` and `Location`; a macro's definition, a call of a macro that is not std's
+and an `#[inline(always)]` function (built into its callers' own code even unoptimized), each
+with where it starts and its bytes. A crate that calls a function where a constant is
+evaluated, with a `#[track_caller]` `const fn` that can read a `Location` at or below it, has
+no surface (the call's position is in no token) and its positioned interface text stands in.
+Equal surfaces mean no front-end part of the crate moved.
 
-**The key.** A unit's narrow key holds its own crate's code text and, per crate below it:
+**Layer 2, the key today (built): surfaces as the key, for the units whose record holds
+nothing else.** A check-only unit (`Narrowed::checked`) and a library built at `opt-level` 0
+for tier 0 code (`Narrowed::built`, `cut_at_crates`) hold their own code text and the surface
+of each crate below. Sound for the library because its record holds its check's outcome, its
+file and its own roots (`owned_inputs`, record format 14): a copy of a generic is a function
+under its own key, made by whichever unit walks to it (the program that links it always
+does), in no library's record. A diagnostic that points into another crate's file is kept by
+what it quotes, never as places (`in_own_files`). A program, a test, a proc macro, a build
+script and an optimized library hold the code of every crate below (`Narrowed::code`).
 
-- a unit that only checks: the interface (`Narrowed::checked`, as before);
-- a unit that makes a library at `opt-level` 0 for tier 0 code (`cut_at_crates`): the
-  interface (`Narrowed::built`, new). Its record no longer lists what its walk found in other
-  crates (`owned_inputs`: its roots alone), so nothing in it is made from a body the interface
-  leaves out. Record format 14;
-- a program, a test, a proc macro, a build script, an optimized library: the code, deeply
-  (`Narrowed::code`). It is made again by any body edit below it, and that is a walk over
-  kept describes, one function compiled and a relink.
+This is a superset of what was read, so it is sound, and it is not yet the rule: a signature
+changed in `a` still makes every unit above `a` again, read or not. That is layer 3.
 
-So a private body edit that keeps its lines moves the key of its own crate's units and of the
-programs that link it, and of no library above it. With the key as it was the unit is fresh:
-no check and no walk, so it asks for no body's inference. Whether the 12,209 evicted
-inferences of the evidence were all asked by the units that missed is not measured here (a
-guess from the code: only a unit that is made asks); why they had been evicted is lane
-memgive-1112's.
+**Layer 3, the rule (record and check built, trace not): parts.** `compile/parts.rs`: a
+unit's `Parts` are its reads `(crate, part, value)` and, per crate, a quick digest with what
+it covers (`Cover::Surface`, or `Cover::Code` when a `Code` or `Spans` part was read; a record
+whose digest covers less than its parts is refused, `QuickTooNarrow`). The record is filed
+under the unit's base key (its own code text and which crates it depends on, by name) and
+`Parts::filed`, the parts with their values; the list is a slot under the base key, as a
+build script's reads are. A lookup reads the slot and asks `Parts::check`: a crate whose
+quick digest stands is passed over; of any other, each part's value is worked out
+(`blaze_items::facts::value`) and the record is the unit's only if none moved.
 
-**Others.** rustc writes an `.rmeta` per crate and cargo pipelines on it (dependents start once
-metadata exists), but cargo's fingerprint of a dependent holds its dependencies' fingerprints,
-which hold their sources' mtimes or hashes: any edit rebuilds every dependent, and the rmeta's
-own hash (SVH) moves with spans and private items. Bazel's `ijar` and `rules_rust`'s
-metadata-only actions, and Buck2's rmeta pipelining with content-hashed action inputs, do cut
-off: a dependent's check reruns only when the interface file's bytes change; for rustc those
-bytes hold spans and every private item's metadata, so most body edits still move them, and
-codegen of dependents is cut off only because rustc compiles nothing of a non-generic callee.
-blaze's digest leaves bodies and comments out by construction and is per file today; per item
-is the next step, below.
+The trace that fills it is the engine's: a crate's rows record every row and input field
+outside the crate that they read (lane sealgroups' imports, `blaze_query::db::seal`), and
+`blaze_item_hash::reads` already maps such a read to the fact it stands for, or refuses it.
+A unit's parts are its crate's imports mapped so; an import that maps to nothing keeps the
+unit on layer 2, named. Sealing uses the same set by stamp ("a dependent stays sealed while
+the parts it read are unchanged"); the store uses it by value, so another machine finds the
+record. Not built: that mapping for imports (today it is per body step), `Spans` values from
+the code generator's span tables, the slot in `compile.rs`.
 
-**Not built, in order.** (1) Two digests, not one text: the front end's (position-free, no
-instantiable body) and, per instance, the code identity of what the unit compiles of the
-dependency; the unit's record filed under the first and a slot listing the second (as
-`quotes_slot` does for quoted files), from describe records. Then a generic body's edit
-reaches the units that instantiate it and no check, and a line moved reaches the instances
-below it and no front end. It needs each by-value reader of a position (`line!` in a constant,
-a `#[track_caller]` `const fn`, a proc macro reading spans: item-hash.md section 15) keyed as
-a slot first. (2) Per item: the interface as the fold of `blaze_items`' interface and layout
-hashes of what the public surface reaches, so a private item's signature is not in it; today
-every signature of the crate is. (3) The walk itself stopping at the crate boundary
-(`blaze_codegen::driver`): a library's walk still describes and finds the functions below it,
-which costs time on a miss and nothing on a hit. (4) A crate with an item-level call of an
-unknown macro, or that shadows a standard macro, has no interface (`CodeText::unplain`) and
-cuts nothing off. (5) Optimized libraries.
+**Expected.** reth, a line added in a private body of `reth-chainspec` (54 units missed):
+with layer 2, every library above is found provided no position kept by the surface lies
+below the edit in that file (a macro's definition, a call of a non-std macro outside a
+left-out body, `line!`); if one does, the libraries above miss and `blaze why` names "the
+interface its narrow key holds of the crate reth_chainspec". Not measured; which of the two
+`spec.rs` is, is the run's to say. With layer 3: 0 libraries either way. The units that link
+the crate are made again in both (the edit changes a function's code).
 
-**Checks.** `blaze-lower`: `a_dependents_key_moves_only_with_what_it_observes_of_a_dependency`
-(now also `built`), `a_library_built_over_a_crate_is_keyed_by_what_it_compiles_of_it`, and the
-control `the_oracle_catches_a_library_built_under_its_dependencies_code`. Revision cases
-`a_body_edit_makes_its_crate_and_nothing_above_it`, `a_generic_body_edit_reaches_its_instance`
-and the control `a_body_edit_below_with_libraries_keyed_by_code` (`BLAZE_UNIT_KEY_DEEP=1`).
-A digest that misses something a dependent reads is a stale program: the soundness oracle
-(`crates/blaze-engine/tests/revisions/oracle.rs`) is the check, and today it draws no edit
-below a library (its `up` is used by `main.rs` alone): it needs `app`'s library to call a
-plain function of `up` whose body and line count are drawn.
+**Others.** cargo's fingerprint of a dependent holds its dependencies' fingerprints (source
+mtimes or hashes), so any edit rebuilds every dependent; rustc's `.rmeta` and its SVH hold
+spans and private items. Bazel's `ijar` and Buck2's metadata actions cut a dependent off when
+the interface file's bytes are equal, per crate, positions included. Per item and per read is
+what none of them has.
+
+**Not built.** Layer 3's trace and slot. A crate with an item-level call of an unknown macro
+has no surface. Optimized libraries. The walk stopping at the crate boundary (a library that
+misses still walks into its dependencies).
+
+**Checks.** `blaze-lower`, `code::tests`: `the_surface_text_moves_exactly_with_what_a_front_end_observes`
+(Hegel) with controls `the_oracle_catches_a_surface_that_holds_a_bodys_lines` and
+`a_position_a_constant_holds_is_in_the_surface` (`Plant::Unstamped`); `tests`:
+`a_dependents_key_moves_only_with_what_it_observes_of_a_dependency`,
+`a_library_built_over_a_crate_is_keyed_by_what_it_compiles_of_it`, controls
+`the_oracle_catches_a_library_built_under_its_dependencies_code` and
+`the_oracle_catches_a_dependents_key_that_holds_a_bodys_lines`. `blaze-cargo`,
+`compile::parts::tests`: a model crate, units and edits under Hegel
+(`no_unit_is_found_stale_after_any_edit_of_the_crate_below`), the directed cases (a line or a
+body below, a signature one unit reads, an item that shadows, an impl that changes
+selection), controls `the_oracle_catches_a_trace_without_its_negative_reads` and
+`the_quick_digest_covers_every_part_or_the_record_is_refused`. Revision cases
+`a_body_edit_makes_its_crate_and_nothing_above_it`, `a_line_added_below_makes_nothing_above_it`,
+`a_generic_body_edit_reaches_its_instance`, control
+`a_body_edit_below_with_libraries_keyed_by_code` (`BLAZE_UNIT_KEY_DEEP=1`). The end check is
+the soundness oracle (`crates/blaze-engine/tests/revisions/oracle.rs`): a key that misses a
+read is a stale program. It draws no edit below a library today (its `up` is called from
+`main.rs` alone).
 
 ## Cold start as a fetch: the standard library (F4)
 

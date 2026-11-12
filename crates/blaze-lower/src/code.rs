@@ -62,6 +62,33 @@
 //! in code instantiated from it and its span tables all read lines and columns, which no
 //! side table holds apart from the code yet. [`crate::Lowered::narrowed`] says which unit
 //! reads which text.
+//!
+//! # The surface text
+//!
+//! What another crate's *front end* (name resolution, expansion, type checking, constant
+//! evaluation) can observe of a file ([`CodeText::surface`]), and nothing a position alone
+//! moves: a line added to a body, a comment on a line of its own or a reformat leaves it as
+//! it was. It is the quick check of docs/v2/plan/design/store.md, "Early cutoff between
+//! crates": equal surfaces mean no part a dependent read of the crate moved.
+//!
+//! - Tokens, not bytes: each token's text with whether whitespace or a comment parts it from
+//!   the one before (what a macro given the tokens can tell), no comment, a doc comment no
+//!   macro sees as a mark.
+//! - A body is a mark where no other crate's front end reads it ([`left_out`] for
+//!   [`Reader::FrontEnd`]): a plain body, and also a generic, `#[inline]` or default-method
+//!   body, which a front end checks calls of against the signature alone. A code generator
+//!   compiles copies of those; a unit that does is not keyed by the surface for them.
+//! - An `#[inline(always)]` function is kept with where it is and its bytes: the code
+//!   generator builds it into its callers' own code even unoptimized.
+//! - Positions, where a constant could hold one, are kept as what they are: the line and the
+//!   line's text before the token of each `line!`, `column!` and `Location`; a macro's
+//!   definition and a call of a macro that is not the standard library's, each with where it
+//!   starts and its bytes as they are (a proc macro may ask its input's spans for their
+//!   lines). A constant made by a call of a `#[track_caller]` `const fn` holds the call's
+//!   position with none of those written: a crate that calls a function where a constant is
+//!   evaluated ([`CodeText::calls`]), with a crate at or below it that has such a function
+//!   and can read a `Location` ([`CodeText::tracks`], [`CodeText::names_location`]), has no
+//!   surface, and its interface text stands in ([`crate::Lowered::narrowed`]).
 
 use std::alloc::Global;
 
@@ -83,6 +110,8 @@ const INTERFACE_TEXT: &str = "blaze v2 file interface text 2";
 /// 2: the crate's settings and its files' paths as a portable key writes them
 /// ([`ported_crate`], [`base_db::Files::ported`]).
 const OWN_NARROW: &str = "blaze v2 crate own narrow 2";
+/// The domain of a file's surface text ([`CodeText::surface`]).
+const SURFACE_TEXT: &str = "blaze v2 file surface text 1";
 
 /// `krate`'s settings as a portable key holds them ([`Crate::ported_content`]), each crate it
 /// depends on by its own: the database's memo, so a crate's is made once and made again only
@@ -137,6 +166,25 @@ pub struct CodeText {
     /// Whether it may read a file by path (`#[path]`, `include!` and its kin): its crate may be
     /// made from another crate's file.
     pub reaches: bool,
+    /// What another crate's front end can observe of it, with no position in it but the ones
+    /// a constant can hold (the module's docs, "The surface text"): its tokens, each with
+    /// whether whitespace parts it from the one before, every body no other crate's front end
+    /// reads ([`left_out`] for [`Reader::FrontEnd`]) as a mark, and no comment.
+    pub surface: ContentId,
+    /// As `surface`, the standard derives, `test` and `bench` taken as macros that see their
+    /// item.
+    pub surface_strict: ContentId,
+    /// Whether it has a `#[track_caller]` `const fn`: one that is given its caller's
+    /// position, at compile time too. With `names_location` in its crate, or a crate below
+    /// that gives positions, a call of it in a constant of a crate above holds a position no
+    /// token of that crate says ([`crate::Lowered::narrowed`]).
+    pub tracks: bool,
+    /// Whether it names `Location`, what a tracked function reads its caller's position by.
+    pub names_location: bool,
+    /// Whether it calls a function where a constant is evaluated ([`evaluated`]): a
+    /// constant's or a static's value, a `const fn`'s body, a discriminant, an array's
+    /// length. Such a call could be of a function that gives its caller's position.
+    pub calls: bool,
 }
 
 /// The code identity of `krate`: [`own_code`] of it and of every crate it depends on,
@@ -463,6 +511,18 @@ pub(crate) struct OwnNarrow {
     pub(crate) extends: bool,
     /// [`CodeText::reaches`] of any of its files.
     pub(crate) reaches: bool,
+    /// What another crate's front end can observe of it, positions left out
+    /// ([`CodeText::surface`] of each file): none where `interface` is none.
+    pub(crate) surface: Option<ContentId>,
+    /// Whether it could give a constant of a crate above it that constant's own position:
+    /// a file of it has a `#[track_caller]` `const fn` ([`CodeText::tracks`]). With
+    /// `names_location`, or above a crate that gives positions, it does
+    /// ([`crate::Lowered::narrowed`]).
+    pub(crate) tracks: bool,
+    /// [`CodeText::names_location`] of any of its files.
+    pub(crate) names_location: bool,
+    /// [`CodeText::calls`] of any of its files.
+    pub(crate) calls: bool,
 }
 
 /// [`OwnNarrow`] of `krate`: the files [`crate::Lowered::identity`] holds of it (its root
@@ -519,7 +579,7 @@ pub(crate) fn library_key(db: &Db, krate: Crate, front_end: &ContentId) -> Conte
     let data = krate.data(db);
     let mut hasher = Hasher::new(LIBRARY_KEY);
     hasher.id(front_end);
-    for domain in [CODE_TEXT, INTERFACE_TEXT, OWN_NARROW] {
+    for domain in [CODE_TEXT, INTERFACE_TEXT, SURFACE_TEXT, OWN_NARROW] {
         hasher.part(domain.as_bytes());
     }
     hasher
@@ -531,28 +591,47 @@ pub(crate) fn library_key(db: &Db, krate: Crate, front_end: &ContentId) -> Conte
 
 impl OwnNarrow {
     /// A crate that keeps its whole text.
-    const WHOLE: OwnNarrow =
-        OwnNarrow { code: None, interface: None, extends: false, reaches: false };
+    const WHOLE: OwnNarrow = OwnNarrow {
+        code: None,
+        interface: None,
+        extends: false,
+        reaches: false,
+        surface: None,
+        tracks: false,
+        names_location: false,
+        calls: false,
+    };
 
     /// How many bytes [`OwnNarrow::kept`] is.
-    pub(crate) const KEPT: usize = 4 + 1 + 32 + 32;
-    const MAGIC: &[u8; 4] = b"BZN1";
+    pub(crate) const KEPT: usize = 4 + 1 + 32 + 32 + 32;
+    /// 2: the surface text and the two flags of positions. One of layout 1 (`BZN1`, 69
+    /// bytes) is under a [`library_key`] of other domains, which no lookup of this one makes;
+    /// its bytes are refused by their length.
+    const MAGIC: &[u8; 4] = b"BZN2";
 
     /// It as the store keeps it: [`Self::MAGIC`], a byte of flags (1: it has a code text, 2:
-    /// an interface, 4: `extends`, 8: `reaches`), then the code text's hash and the
-    /// interface's, zeros for one it lacks.
+    /// an interface, 4: `extends`, 8: `reaches`, 16: a surface, 32: `tracks`, 64: `calls`,
+    /// 128: `names_location`),
+    /// then the code text's hash, the interface's and the surface's, zeros for one it lacks.
     pub(crate) fn kept(&self) -> [u8; Self::KEPT] {
         let mut out = [0; Self::KEPT];
         out[..4].copy_from_slice(Self::MAGIC);
         out[4] = u8::from(self.code.is_some())
             | u8::from(self.interface.is_some()) << 1
             | u8::from(self.extends) << 2
-            | u8::from(self.reaches) << 3;
+            | u8::from(self.reaches) << 3
+            | u8::from(self.surface.is_some()) << 4
+            | u8::from(self.tracks) << 5
+            | u8::from(self.calls) << 6
+            | u8::from(self.names_location) << 7;
         if let Some(code) = &self.code {
             out[5..37].copy_from_slice(&code.0);
         }
         if let Some(interface) = &self.interface {
             out[37..69].copy_from_slice(&interface.0);
+        }
+        if let Some(surface) = &self.surface {
+            out[69..101].copy_from_slice(&surface.0);
         }
         out
     }
@@ -569,9 +648,6 @@ impl OwnNarrow {
             return Err("it does not start as one does".to_owned()); // alloc: error path
         }
         let flags = bytes[4];
-        if flags >> 4 != 0 {
-            return Err(format!("flags {flags:#x}, of which it knows the low four")); // alloc: error path
-        }
         let hash = |at: usize, has: bool| -> Result<Option<ContentId>, String> {
             let mut id = [0; 32];
             id.copy_from_slice(&bytes[at..at + 32]);
@@ -587,6 +663,10 @@ impl OwnNarrow {
             interface: hash(37, flags & 2 != 0)?,
             extends: flags & 4 != 0,
             reaches: flags & 8 != 0,
+            surface: hash(69, flags & 16 != 0)?,
+            tracks: flags & 32 != 0,
+            calls: flags & 64 != 0,
+            names_location: flags & 128 != 0,
         })
     }
 }
@@ -633,22 +713,28 @@ fn narrow_from(
     let texts = || std::iter::once(root_text).chain(files.iter().filter_map(|it| it.2));
     let extends = texts().any(|it| it.extends);
     let reaches = texts().any(|it| it.reaches);
+    let tracks = texts().any(|it| it.tracks);
+    let names_location = texts().any(|it| it.names_location);
+    let calls = texts().any(|it| it.calls);
     if texts().any(|it| it.whole) {
-        return OwnNarrow { extends, reaches, ..whole };
+        return OwnNarrow { extends, reaches, tracks, names_location, calls, ..whole };
     }
     let strict = texts().any(|it| it.shadows);
     let unplain = texts().any(|it| it.unplain);
-    let hashed = |interface: bool| {
-        let pick = |code: &CodeText| match (interface, strict) {
-            (false, false) => code.inert,
-            (false, true) => code.strict,
-            (true, false) => code.interface,
-            (true, true) => code.interface_strict,
+    // Which text of each file: 0 its code text, 1 its interface, 2 its surface.
+    let hashed = |which: u8| {
+        let pick = |code: &CodeText| match (which, strict) {
+            (0, false) => code.inert,
+            (0, true) => code.strict,
+            (1, false) => code.interface,
+            (1, true) => code.interface_strict,
+            (_, false) => code.surface,
+            (_, true) => code.surface_strict,
         };
         let mut hasher = Hasher::new(OWN_NARROW);
         hasher
             .id(&ported_crate(db, krate))
-            .update(&[u8::from(interface), u8::from(strict), u8::from(alone)])
+            .update(&[which, u8::from(strict), u8::from(alone)])
             .id(&pick(&root_text))
             .opt_part(db.file_text(root_file).appended_root_module(db));
         hasher.update(&(files.len() as u64).to_le_bytes());
@@ -666,10 +752,14 @@ fn narrow_from(
         hasher.finish()
     };
     OwnNarrow {
-        code: Some(hashed(false)),
-        interface: (!unplain).then(|| hashed(true)),
+        code: Some(hashed(0)),
+        interface: (!unplain).then(|| hashed(1)),
         extends,
         reaches,
+        surface: (!unplain).then(|| hashed(2)),
+        tracks,
+        names_location,
+        calls,
     }
 }
 
@@ -738,6 +828,12 @@ pub fn code_text_of(root: &SyntaxNode, text: &str) -> CodeText {
         unplain: false,
         extends: false,
         reaches: false,
+        surface: Surface::new(),
+        surface_strict: Surface::new(),
+        place: Place { line: 0, line_start: 0 },
+        tracks: false,
+        names_location: false,
+        calls: false,
         // alloc: once per file keyed, a node of its depth each
         seen: Vec::new(),
     };
@@ -759,6 +855,11 @@ pub fn code_text_of(root: &SyntaxNode, text: &str) -> CodeText {
         unplain: walk.unplain,
         extends: walk.extends,
         reaches: walk.reaches,
+        surface: walk.surface.finish(),
+        surface_strict: walk.surface_strict.finish(),
+        tracks: walk.tracks,
+        names_location: walk.names_location,
+        calls: walk.calls,
     }
 }
 
@@ -1019,9 +1120,164 @@ struct Walk<'a> {
     unplain: bool,
     extends: bool,
     reaches: bool,
+    /// [`CodeText::surface`] and [`CodeText::surface_strict`].
+    surface: Surface,
+    surface_strict: Surface,
+    /// Where the walk is: the line of the next token and where that line starts.
+    place: Place,
+    tracks: bool,
+    names_location: bool,
+    calls: bool,
     /// Of each node entered and not left: whether a macro sees it, with the prelude's derives,
     /// `test` and `bench` inert, and not.
     seen: Vec<(bool, bool)>,
+}
+
+/// A place in a file as the walk counts it: how many lines' ends are before it, and where its
+/// line starts. The text from there to a token is its column, however a column is counted.
+#[derive(Clone, Copy)]
+struct Place {
+    line: u64,
+    line_start: usize,
+}
+
+/// A file's surface text being hashed ([`CodeText::surface`]).
+struct Surface {
+    hasher: Hasher,
+    /// Where what is left out, or was hashed as its bytes, ends: no token before it is hashed.
+    skip: usize,
+    /// Whether whitespace or a comment parts the next token from the one before.
+    spaced: bool,
+}
+
+impl Surface {
+    fn new() -> Surface {
+        Surface { hasher: Hasher::new(SURFACE_TEXT), skip: 0, spaced: false }
+    }
+
+    /// The body at `start..end` of `text` as a mark: a byte no token's record starts with
+    /// (each starts with 0 or 1), and nothing of its lines. With the planted bug its count of
+    /// lines' ends, as the interface text keeps it.
+    fn left_out(&mut self, text: &str, start: usize, end: usize) {
+        if start < self.skip {
+            return;
+        }
+        self.hasher.update(&[0xFE]);
+        if planted(Plant::Lines) {
+            self.hasher.update(&(text[start..end].matches('\n').count() as u64).to_le_bytes());
+        }
+        self.skip = end;
+        self.spaced = false;
+    }
+
+    /// `place`, where the token or region at `start` of `text` is: its line and the text of
+    /// that line before it. Nothing, with the planted bug.
+    fn at(&mut self, text: &str, place: Place, start: usize) {
+        if planted(Plant::Unstamped) {
+            return;
+        }
+        self.hasher
+            .update(&place.line.to_le_bytes())
+            .part(&text.as_bytes()[place.line_start.min(start)..start]);
+    }
+
+    /// The region `start..end` of `text` with where it is and its bytes as they are: a
+    /// macro's definition or a call of a macro that is not the standard library's, whose
+    /// expansion may hold the position of any token of it.
+    fn placed(&mut self, text: &str, place: Place, start: usize, end: usize) {
+        if start < self.skip {
+            return;
+        }
+        self.hasher.update(&[0xFB]);
+        self.at(text, place, start);
+        self.hasher.part(&text.as_bytes()[start..end]);
+        self.skip = end;
+        self.spaced = false;
+    }
+
+    /// `token`, at `start` of `text`: whitespace and a comment as that they part two tokens,
+    /// a doc comment no macro sees (`seen` says one does) as a mark, any other token as its
+    /// text; one that reads its own position (`reads_place`) with `place` before it.
+    fn token(
+        &mut self,
+        text: &str,
+        place: Place,
+        token: &SyntaxToken,
+        start: usize,
+        seen: bool,
+        reads_place: bool,
+    ) {
+        if start < self.skip {
+            return;
+        }
+        match token.kind() {
+            SyntaxKind::WHITESPACE | SyntaxKind::COMMENT => self.spaced = true,
+            kind @ (SyntaxKind::OUTER_DOC_COMMENT | SyntaxKind::INNER_DOC_COMMENT) if !seen => {
+                self.hasher.update(&[0xFC, u8::from(kind == SyntaxKind::INNER_DOC_COMMENT)]);
+                self.spaced = true;
+            }
+            _ => {
+                if reads_place {
+                    self.hasher.update(&[0xFA]);
+                    self.at(text, place, start);
+                }
+                self.hasher.update(&[u8::from(self.spaced)]).part(token.text().as_bytes());
+                self.spaced = false;
+            }
+        }
+    }
+
+    fn finish(self) -> ContentId {
+        self.hasher.finish()
+    }
+}
+
+/// Whether `function` is `#[inline(always)]`: an attribute of it names both. The code
+/// generator builds such a body into its callers' own code even unoptimized (LLVM's
+/// always-inliner at `-O0`, `Described::built_in`), so a caller's code, and its key, is made
+/// from it.
+fn inline_always(function: &SyntaxNode) -> bool {
+    function.children().filter(|it| it.kind() == SyntaxKind::ATTR).any(|attr| {
+        let named = |name: &str| {
+            attr.descendants_with_tokens()
+                .filter_map(NodeOrToken::into_token)
+                .any(|it| it.kind() == SyntaxKind::IDENT && it.text() == name)
+        };
+        named("inline") && named("always")
+    })
+}
+
+/// Whether `node`, a function, a trait or an `impl`, is written `const`.
+fn is_const(node: &SyntaxNode) -> bool {
+    node.children_with_tokens().any(|it| it.kind() == SyntaxKind::CONST_KW)
+}
+
+/// Whether `node`, a call, is where a constant is evaluated: in a constant's or a static's
+/// value, a discriminant, an array's length or a const argument, or the body of a `const fn`;
+/// never in a closure (none is called at compile time) or in any other function's body. A
+/// call under none of those is taken to be.
+fn evaluated(node: &SyntaxNode) -> bool {
+    for at in node.ancestors().skip(1) {
+        match at.kind() {
+            SyntaxKind::FN => return is_const(&at),
+            SyntaxKind::CLOSURE_EXPR => return false,
+            SyntaxKind::CONST
+            | SyntaxKind::STATIC
+            | SyntaxKind::VARIANT
+            | SyntaxKind::ARRAY_TYPE
+            | SyntaxKind::CONST_ARG => return true,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Whether the token after `token` that is not whitespace or a comment is `!`: `token` names
+/// a macro that is called.
+fn called_as_macro(token: &SyntaxToken) -> bool {
+    std::iter::successors(token.next_token(), SyntaxToken::next_token)
+        .find(|it| !it.kind().is_trivia())
+        .is_some_and(|it| it.kind() == SyntaxKind::BANG)
 }
 
 impl Walk<'_> {
@@ -1044,6 +1300,39 @@ impl Walk<'_> {
                     Seen::Prelude => strict = true,
                     Seen::Yes => (inert, strict) = (true, true),
                 }
+            }
+        }
+        // The surface text: what is hashed with where it is, and what is left out of it.
+        {
+            let range = node.text_range();
+            let (start, end) = (usize::from(range.start()), usize::from(range.end()));
+            let (text, place) = (self.text, self.place);
+            match kind {
+                SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF => {
+                    self.surface.placed(text, place, start, end);
+                    self.surface_strict.placed(text, place, start, end);
+                }
+                SyntaxKind::MACRO_CALL if !plain_call(node) => {
+                    self.surface.placed(text, place, start, end);
+                    self.surface_strict.placed(text, place, start, end);
+                }
+                // Built into its callers' code at every level, positions and all.
+                SyntaxKind::FN if inline_always(node) => {
+                    self.surface.placed(text, place, start, end);
+                    self.surface_strict.placed(text, place, start, end);
+                }
+                SyntaxKind::BLOCK_EXPR if left_out(node, Reader::FrontEnd) => {
+                    if !inert {
+                        self.surface.left_out(text, start, end);
+                    }
+                    if !strict {
+                        self.surface_strict.left_out(text, start, end);
+                    }
+                }
+                SyntaxKind::CALL_EXPR | SyntaxKind::METHOD_CALL_EXPR => {
+                    self.calls |= evaluated(node);
+                }
+                _ => {}
             }
         }
         match kind {
@@ -1103,6 +1392,33 @@ impl Walk<'_> {
         // A token of a body an interface left out is part of that body's shape.
         let at = usize::from(token.text_range().start());
         let (in_interface, in_interface_strict) = (at >= self.skip.0, at >= self.skip.1);
+        // The surface text, and what the crate above it is asked of positions.
+        {
+            let name = match token.kind() {
+                SyntaxKind::IDENT => token.text(),
+                _ => "",
+            };
+            let reads_place = name == "Location"
+                || (matches!(name, "line" | "column") && called_as_macro(token));
+            let (text, place) = (self.text, self.place);
+            self.surface.token(text, place, token, at, inert, reads_place);
+            self.surface_strict.token(text, place, token, at, strict, reads_place);
+            self.names_location |= name == "Location";
+            self.tracks |= name == "track_caller"
+                && token
+                    .parent()
+                    .into_iter()
+                    .flat_map(|it| it.ancestors())
+                    .any(|it| it.kind() == SyntaxKind::FN && is_const(&it));
+            // A call through an operator of a type's own needs a `const` impl of its trait.
+            self.calls |= name == "const_trait_impl";
+            // Where the next token is.
+            let bytes = token.text().as_bytes();
+            if let Some(last) = bytes.iter().rposition(|it| *it == b'\n') {
+                self.place.line += bytes.iter().filter(|it| **it == b'\n').count() as u64;
+                self.place.line_start = at + last + 1;
+            }
+        }
         match token.kind() {
             // With the planted bug every text holds its file's bytes, comments and all.
             SyntaxKind::COMMENT | SyntaxKind::WHITESPACE if planted(Plant::Bytes) => {}
@@ -1275,6 +1591,16 @@ pub(crate) enum Plant {
     /// A library's build is keyed by the code of the crates it depends on, not their
     /// interfaces: no cutoff between crates ([`crate::Narrowed::built`]).
     Uncut,
+    /// A body the surface leaves out leaves its count of lines: a line added to a body moves
+    /// every key above its crate, the cutoff of positions gone ([`CodeText::surface`]).
+    Lines,
+    /// The surface holds no position: a constant made from `line!()` is stale after its line
+    /// moved.
+    Unstamped,
+    /// A crate that calls something in its constants, above one that could give a call's
+    /// position, has a surface all the same: a constant made by a `#[track_caller]`
+    /// `const fn` is stale after its line moved ([`crate::Lowered::narrowed`]).
+    Located,
     /// A file's texts hold its bytes, comments and whitespace as they are: a unit keyed by
     /// them is made again by an edit that moves no token and no position, no cutoff.
     Bytes,
@@ -1334,6 +1660,27 @@ pub(crate) fn planted(_plant: Plant) -> bool {
 /// ([`CodeText::extends`]). A code generator reads every body it reaches: a unit that builds
 /// code takes no interface either.
 pub(crate) fn plain_body(body: &SyntaxNode) -> bool {
+    left_out(body, Reader::Any)
+}
+
+/// Who of another crate reads a body ([`left_out`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Reader {
+    /// Its check or its build: the list of [`plain_body`].
+    Any,
+    /// Its front end alone, which never instantiates or inlines: of [`plain_body`]'s list it
+    /// reads a body only to infer a type the signature hides, to evaluate it (`const`) or to
+    /// find an item it defines. A body with a type or const parameter (its own, its
+    /// `impl`'s or its trait's), a `where` clause or an `#[inline]`, and a trait's default
+    /// method, are checked against by their signatures and left out for it.
+    FrontEnd,
+}
+
+/// Whether `body`, a block, is a function's body that `by` of another crate does not read:
+/// [`plain_body`]'s rule for [`Reader::Any`], and for [`Reader::FrontEnd`] the same with a
+/// generic, `where`-bounded, `#[inline]` or default-method body left out too.
+pub(crate) fn left_out(body: &SyntaxNode, by: Reader) -> bool {
+    let front = by == Reader::FrontEnd;
     let Some(function) = body.parent().filter(|it| it.kind() == SyntaxKind::FN) else {
         return false;
     };
@@ -1353,13 +1700,17 @@ pub(crate) fn plain_body(body: &SyntaxNode) -> bool {
         NodeOrToken::Node(node) => match node.kind() {
             SyntaxKind::ATTR => {
                 planted(Plant::Inline)
+                    || (front && !inline_always(&function))
                     || !node
                         .descendants_with_tokens()
                         .filter_map(NodeOrToken::into_token)
                         .any(|it| it.kind() == SyntaxKind::IDENT && it.text() == "inline")
             }
             SyntaxKind::VISIBILITY | SyntaxKind::ABI | SyntaxKind::NAME => true,
-            SyntaxKind::GENERIC_PARAM_LIST => lifetimes_only(&node) || planted(Plant::Generic),
+            SyntaxKind::GENERIC_PARAM_LIST => {
+                front || lifetimes_only(&node) || planted(Plant::Generic)
+            }
+            SyntaxKind::WHERE_CLAUSE => front,
             SyntaxKind::PARAM_LIST | SyntaxKind::RET_TYPE => {
                 planted(Plant::Hidden)
                     || !node.descendants().any(|it| {
@@ -1382,15 +1733,20 @@ pub(crate) fn plain_body(body: &SyntaxNode) -> bool {
             at.children_with_tokens().all(|element| match element {
                 NodeOrToken::Token(token) => token.kind() != SyntaxKind::CONST_KW,
                 NodeOrToken::Node(node) => match node.kind() {
-                    SyntaxKind::WHERE_CLAUSE => false,
-                    SyntaxKind::GENERIC_PARAM_LIST => lifetimes_only(&node),
+                    SyntaxKind::WHERE_CLAUSE => front,
+                    SyntaxKind::GENERIC_PARAM_LIST => front || lifetimes_only(&node),
                     _ => true,
                 },
             // An associated type that hides its type (`type Item = impl Trait;`) is given it
             // by the bodies of its `impl`'s functions, whatever their signatures say.
             }) && !at.descendants().any(|it| it.kind() == SyntaxKind::IMPL_TRAIT_TYPE)
         }
-        SyntaxKind::TRAIT => planted(Plant::Trait),
+        // A default method: never a `const` trait's, whose methods a constant may call.
+        SyntaxKind::TRAIT => {
+            planted(Plant::Trait)
+                || (front
+                    && at.children_with_tokens().all(|it| it.kind() != SyntaxKind::CONST_KW))
+        }
         _ => false,
     });
     placed
