@@ -106,8 +106,8 @@ use serde::{Deserialize, Serialize};
 /// a build linked is optimized. 51: [`Worked::storage`] ([`Storage`]: what the daemon's store
 /// and its home hold against their budget, on every build's end), `unkept` of
 /// [`Request::Gc`], and [`Status::placed_by`]. 52: [`UnitOf::primary`], by which `check --fix` edits only the packages the
-/// request asked for.
-pub const SCHEMA: u32 = 52;
+/// request asked for. 53: [`Request::Store`] (not the `Request::Pack` that 48 removed: packs of store records, docs/remote-cache.md).
+pub const SCHEMA: u32 = 53;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -426,6 +426,14 @@ pub enum Request {
     Gc {
         dry_run: bool,
         unkept: bool,
+    },
+    /// `blaze store export|import|install ...` (docs/remote-cache.md, "Packs") while a daemon
+    /// holds the home's store: `words` are the command's words after `store`, run by the
+    /// daemon over its own store as the CLI runs them over a store no daemon holds. Answered
+    /// with what it did as note [`Response::Diagnostic`]s, or its error, by the daemon's
+    /// loop, which holds the store.
+    Store {
+        words: Vec<String>,
     },
     /// `blaze why [ITEM]`: what the last build that ended in this daemon's life computed again
     /// instead of reusing, grouped by step and reason, each group with its first items (every

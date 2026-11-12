@@ -459,6 +459,7 @@ blaze-hashcons = { path = "crates/blaze-hashcons" }
 blaze-history = { path = "crates/blaze-history" }
 blaze-inproc = { path = "crates/blaze-inproc" }
 blaze-launch = { path = "crates/blaze-launch" }
+blaze-pack = { path = "crates/blaze-pack" }
 blaze-launch-host = { path = "crates/blaze-launch-host" }
 blaze-launch-rt = { path = "crates/blaze-launch-rt" }
 blaze-inproc-rt = { path = "crates/blaze-inproc-rt" }

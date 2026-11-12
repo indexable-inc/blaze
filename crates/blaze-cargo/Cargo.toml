@@ -131,6 +131,8 @@ blaze-lazy = { workspace = true, features = ["daemon"] }
 blaze-link.workspace = true
 # The launcher's protocol and the daemon's side of a launched program (`serve/unit/run/launch.rs`).
 blaze-launch.workspace = true
+# Packs (docs/remote-cache.md, "Packs"): the sans-IO cores `serve/packs` and `cli/store` drive.
+blaze-pack.workspace = true
 blaze-launch-host.workspace = true
 blaze-lower.workspace = true
 # The device build of an `artifact = "gpu"` dependency: its `GPU_ENTRIES` written as MSL at its

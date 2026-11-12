@@ -229,6 +229,9 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
     if let Some(refused) = refused {
         say_start(&socket, &refused)?;
     }
+    // Lane packs-1112: a home with no store yet and an `install` base in its settings gets
+    // the configured packs before its first daemon starts (`super::store::first_use`).
+    super::store::first_use().map_err(anyhow::Error::msg)?;
     use anyhow::Context as _;
     let (log, ready, mut child) = started()?;
     let pid = child.id();

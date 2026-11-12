@@ -46,6 +46,10 @@ pub fn main(words: &[OsString], color: bool) -> i32 {
         Some(["gc", "--unkept"]) => collect(false, true),
         Some(["gc", "--unkept", "--dry-run" | "-n"]) => collect(true, true),
         Some(["gc", "--last"]) => last_runs(),
+        // Lane packs-1112: packs out of and into the store (`cli::store`).
+        Some(["store", "export" | "import" | "install", ..]) => {
+            return super::store::main(&words.as_deref().unwrap_or_default()[1..], color);
+        }
         Some(["store", "verify"]) => verify(false),
         Some(["store", "verify", "--dry-run" | "-n"]) => verify(true),
         Some(["gc", "--budget", size]) => budget(size).and_then(|mut said| {

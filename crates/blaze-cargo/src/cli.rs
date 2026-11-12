@@ -31,6 +31,8 @@
 pub mod args;
 pub mod baselines;
 pub mod cache;
+// Lane packs-1112: `blaze store export`, `import` and `install`.
+pub mod store;
 pub mod clean;
 pub mod client_rows;
 pub mod daemon;

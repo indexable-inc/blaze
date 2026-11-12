@@ -1,0 +1,21 @@
+[package]
+name = "blaze-pack"
+description = "blaze's transfer packs (docs/remote-cache.md, \"Packs\"): a set of store records under a manifest in deterministic CBOR, named by the manifest's BLAKE3, each record checked against its own hash before it is kept; the sans-IO cores of export, import, fetch on miss from several sources, the signed head and the peer endpoint"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# No dependency: `core` and `alloc` alone. Not bstd yet (src/lib.rs says why and when it moves).
+# The hash and the signature check are its driver's, handed in (`Hashes`, `Signatures`).
+[dependencies]
+
+[lints]
+workspace = true

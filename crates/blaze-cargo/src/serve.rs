@@ -27,6 +27,8 @@ mod fetch_url;
 pub(crate) mod flightrec;
 mod collect;
 mod gc;
+// Lane packs-1112: packs read on a miss, and the endpoint peers read this store through.
+pub(crate) mod packs;
 mod heads;
 #[blaze::sans_io]
 mod idle;

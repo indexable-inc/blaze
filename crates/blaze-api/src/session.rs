@@ -801,6 +801,7 @@ impl Session {
             | Request::Rebuilt { .. }
             | Request::Launch { .. }
             | Request::FetchUrl { .. }
+            | Request::Store { .. }
             | Request::ClientRows { .. } => {
                 return Err(ApiError::new(
                     "the explorer, the live feed, the profile history's flush, the collector, the \
@@ -1160,6 +1161,7 @@ fn request_name(request: &Request) -> &'static str {
         Request::Rebuilt { .. } => "blaze why",
         Request::Launch { .. } => "blaze run",
         Request::FetchUrl { .. } => "blaze fetch-url",
+        Request::Store { .. } => "blaze store",
         Request::ClientRows { .. } => "a client's profile rows",
         _ => "a request",
     }
