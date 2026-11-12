@@ -44,7 +44,7 @@ pub use crate::{
         BuiltCrateData, BuiltDependency, BuiltFor, Crate, CrateBuilder, CrateBuilderId,
         CrateDataBuilder, CrateDisplayName, CrateGraphBuilder, CrateName, CrateNamed, CrateOrigin,
         CrateType, CrateTypes, CratesIdMap, CratesMap, DependencyBuilder, Env, ExtraCrateData,
-        Given,
+        CrateSlot, Given,
         LangCrateOrigin, ProcMacroLoadingError, ProcMacroPaths, ReleaseChannel, SourceRoot,
         SourceRootId, TargetKind, UniqueCrateData, UnnamedCrate,
     },

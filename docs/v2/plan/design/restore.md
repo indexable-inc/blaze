@@ -352,9 +352,8 @@ whole for the session (`Reader::pinned`), so the saving is the decoded heap valu
 image's bytes: the image without that part is next, then lang items and signatures the same
 way. (2) A module's names are written twice (scope segment and entries). (3) Impl tables
 (`hir-ty`'s frozen impls) are as they were. (4) A workspace crate is never paged: only a
-crate with an image is. (5) b3 and d are not built: a crate is still resolved from source
-before the store is asked (F2), which is the restart's time; pages make the served crate cheap
-to open, not the order right. F2's two blockers are as written in that section.
+crate with an image is. (5) b3 and d are not built. F2 is written (below): a crate with records is no longer
+resolved from source before the store is asked.
 (6) No new `blaze_cas::Kind`: pages are `Kind::Query` like the image; their keys are what a
 pin of "toolchain" or "bstd" names (`pages_key` of each crate's `Image::key`).
 
@@ -368,32 +367,73 @@ So the next record is the impls and traits of a crate by module (what `served_de
 written beside the pages and handed over without a scope; until then expect `scope_memo` rows
 about equal to the served crates' modules.
 
-**F2 as it has to be built (not built; this lane's next piece).** Read from the code: both
-maintainers work at the write. `nameres::delta::unreached` gives a job to every crate with no
-state that no image serves, and `method_resolution::delta::state::prepare` gives every crate
-not served a state and a node; `crate_local_def_map` of a crate neither served nor published
-is `Unmaintained`. So "not resolved until asked" is a third state both maintainers know:
+**F2: a crate added is awaited, not resolved (written 2026-11-12 by lane records-1112c, not
+compiled or run by it; the round's results decide).** Read from the code: both maintainers
+worked at the write (`nameres::delta::unreached` gave a job to every crate with no state that
+no image serves; `method_resolution::delta::state::prepare` gave every unserved crate a state
+and a node), the daemon's `harness::write` read each ready unit's def map before the first
+serve, and every serve that changed anything was a change of the whole crate graph, which ran
+every unserved crate cold again. As built:
 
-- an input beside `DepImages`, the crates *awaited* (their records not asked for yet), with
-  the set closed upward once a change (a crate is blocked when it or a crate below it is
-  awaited): `unreached` is true for a blocked crate, `prepare` and the impls nodes pass over
-  one, and a reader of one is `Unmaintained` naming it, as today;
-- `blaze_lower::lower_writes` awaits every crate it makes, in the write that makes it
-  (`add_crates`), so that write resolves nothing; `deps::serve` takes from the set every crate
-  it was asked about, hit or miss, in its own write, where a miss and everything above it get
-  their first run (a crate with no state and no image is reached by any pass). A serve that
-  finds no key moved (`unit/deps.rs` `images` returning `None`) must still release;
-- a unit not ready (it waits on a build script's run) stays awaited, and so does everything
-  above it, until the serve after that run: today it is resolved twice, before the run and
-  after;
-- the count test, in blaze-lower beside `a_plan_lowered_again_is_found_whole_and_writes_nothing`:
-  a store filled by one database, a second database lowered over it, and `Counts::executed`
-  of the nameres and impls maintainers' queries for the crates with records: none; control:
-  the await left out.
+- `hir_def::deps::awaited` (`Awaited`, one input): the crates whose records were not asked for
+  yet. A crate is *blocked* while it or a crate below it is awaited (`blocked`, inputs alone):
+  `unreached` gives it no job (`LastWrite::blocked`, fixed at the pass's start), `prepare` and
+  `run_nodes` no state, slot or node, and a reader is stopped with `Unmaintained` naming the
+  crate it waits for.
+- Only a database whose driver promised to serve has the set: `blaze_lower::lower_awaiting`
+  (every front end of the daemon; `serve/unit.rs`), where `lower_writes` awaits the crates a
+  plan makes in the write that makes them. `blaze_lower::lower` (tests, tools with no store)
+  awaits nothing, and `Lowered::serve_deps` refuses such a front end by name, so there is one
+  production path.
+- `deps::serve_asked(db, asked, crates, ..)` releases `asked` and all below them
+  (`awaited::release`) and sets the images found, in one write; a released crate is noted as a
+  crate added (`Db::note_crates_added`), so one with an image is read from it and was never
+  resolved, one without gets its first run there, and the crates released before are left
+  alone (the write is a change of the whole graph only when a crate the maintainers knew
+  gains, loses or swaps an image). `unit/deps.rs` `images` releases what it was asked about
+  whether or not a key moved (`release`), writing nothing when none was awaited.
+- The daemon serves the ready units *before* their harnesses are written (`unit.rs` `lower`,
+  and `serve_written` in `UnitWriter::apply`), and again after the identities for a key the
+  harness's roots moved. A unit that waits on a build script stays awaited, with everything
+  above it, until the serve after that run.
+- Checks: hir-def `deps::awaited::tests::a_crate_is_blocked_while_it_or_one_below_it_is_awaited`;
+  blaze-lower `tests::awaited::a_crate_added_to_an_awaiting_front_end_is_not_resolved_until_it_is_asked_about`
+  (4 and 40 library crates: no nameres or impls record and no item-tree row after lowering,
+  each crate resolved once at its release) with its control
+  `the_control_a_front_end_that_awaits_nothing_resolves_every_crate_as_it_is_added`;
+  blaze-cargo `serve::unit::tests::awaited::a_dependency_with_records_is_never_resolved_by_the_daemon_that_finds_them`.
+- Not covered: a count with many crates that have records (the store is blaze-cargo's, whose
+  fixture has one registry crate); the impls maintainer still keys every served crate's impls
+  from `served_delta` (next piece); a workspace test or program crate is resolved once before
+  its harness root is appended and its root's group again after.
 
-Files: `hir-def/src/nameres/delta.rs`, `hir-def/src/deps/serve.rs`,
-`hir-ty/src/method_resolution/delta/state.rs`, `blaze-lower/src/lib.rs` (`lower_writes`,
-`serve_deps`), `blaze-cargo/src/serve/unit/deps.rs` (`images`).
+**What is left, in order (for the next lane; nothing below is built).**
+
+1. *Impl tables as records.* `hir_ty::method_resolution::frozen` already writes a crate's
+   `TraitImpls` and `InherentImpls` whole (`encode`), read whole (`FrozenImpls`, never set in
+   a build). Make it the pages discipline: one store value a crate beside the def-map pages
+   (key: `pages_key`'s inputs and this record's layout), a table by trait and by simplified
+   self type (open-addressed slots over the FNV-1a of the key's portable bytes, as
+   `pages::Modules::name`), each entry the impl ids of that key; written by `deps::store`
+   where pages are (`store_missing_pages`), handed over by `serve_asked` as one input a crate.
+   Then `frozen::served` is true for the crate, the impls maintainer passes over it
+   (`prepare`, `run_nodes` already do), `served_delta` gives it no delta, and
+   `TraitImpls::for_crate_and_trait` / `InherentImpls::in_crate_for_self_ty` read a key's
+   entry. The candidate names (`candidate_traits`) need the same table by name. Tests: round
+   trip against `TraitImpls::for_crate`, identical bytes from two databases, layout refused
+   by name, pages touched per lookup bounded at two sizes, `scope_memo` rows after a serve 0.
+2. *One input a crate* for what a crate is read from (pages, impls, image), replacing the
+   three maps `PagedDefMaps`, `FrozenDefMaps`, `DepImages` (sealgroups-1112 asked: the input
+   takes the crate's seal group, `seal_group(self, db, group)`; the provider shape is
+   `provide::<F>(storage, fn(&Db, Key) -> Provided<Value>)`, `scope_memo` and `tail` each
+   with one).
+3. *The image not pinned whole*: its def-map part is no longer read once a crate is paged;
+   write the image without that part and read lang items and signatures through
+   `Reader::part`; remove the second write of a module's names (scope segment and entries).
+4. *b3*: with 1 to 3, a crate with records makes no syntax, item tree or expansion; what
+   still parses is a body asked for (`nameres::demand`).
+5. *d*: `deps::key` takes each dependency's record content hash, not its key; the first no-op
+   after a restart then reads only the keys' inputs. Bounds to hold: hello-world under 300 ms.
 
 **Checks** (hir-def `nameres::frozen::pages::tests`, blaze-cas `tests::part`):
 `a_crate_read_from_pages_answers_as_the_one_resolved` (the refinement: the whole def map and

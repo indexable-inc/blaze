@@ -819,14 +819,76 @@ pub struct Crate {
     #[get(lint_options_field)]
     #[set(set_lint_options_field)]
     lint_options: LintOptions,
-    /// The crate's proc macros, as hir-expand gives them (`ProcMacros::give`): a field of the
-    /// crate, never an entry of one map of every crate, so giving one crate its macros writes
-    /// that crate's input alone and no row of another crate reads it
-    /// (`blaze_query::db::seal`: the field is an input of the crate's own seal group). Not in
-    /// its content ID, as the map was not.
+    /// What the crates above base-db gave this crate, a slot a kind ([`Crate::give`]): which
+    /// slots there are, added to when a kind is first given and never else. Not in its
+    /// content ID.
     #[default]
     #[returns(ref)]
-    pub given_proc_macros: Given,
+    #[get(slots_field)]
+    #[set(set_slots_field)]
+    slots: Vec<(std::any::TypeId, CrateSlot)>,
+}
+
+/// One thing given to one crate ([`Crate::give`]): an input of its own, of the crate's seal
+/// group, so a write of it is a write of that crate's and of that kind alone.
+#[blaze_query::input(debug)]
+pub struct CrateSlot {
+    #[returns(ref)]
+    pub value: Given,
+}
+
+impl Crate {
+    /// What was given to this crate as kind `K` ([`Crate::give`]), if it is a `T`; `None`
+    /// when nothing was. Reads the crate's list of slots and the one slot: inside a query,
+    /// both are recorded, and neither is written by a gift to another crate or of another
+    /// kind.
+    ///
+    /// The invariant: what is "one value a crate" is kept a crate, never as an entry of one
+    /// map of every crate. A map of every crate is an input every crate's rows read, so
+    /// giving one crate its value was a write all of them verified after (the proc-macro
+    /// map: a build of reth with nothing changed, 53 writes and 23 million rows verified,
+    /// 2026-11-12), and no seal group could own it (`blaze_query::db::seal`).
+    pub fn given<K: 'static, T: std::any::Any>(self, db: &Db) -> Option<&T> {
+        let kind = std::any::TypeId::of::<K>();
+        let slot = self.slots_field(db).iter().find(|it| it.0 == kind)?.1;
+        slot.value(db).get::<T>()
+    }
+
+    /// Gives this crate `value` as kind `K` (a type of the giver's, naming what it is), of
+    /// durability `durability`: whether anything was written. The kind's first gift makes its
+    /// slot, in the crate's seal group, and adds it to the crate's list; later ones write the
+    /// slot alone. The giver compares what the crate holds first: two [`Given`] are equal
+    /// only when they are one value.
+    pub fn give<K: 'static>(self, db: &mut Db, value: Given, durability: Durability) -> bool {
+        let kind = std::any::TypeId::of::<K>();
+        let found = self.slots_field(&*db).iter().find(|it| it.0 == kind).map(|it| it.1);
+        match found {
+            Some(slot) => {
+                if *slot.value(&*db) == value {
+                    return false;
+                }
+                slot.set_value(db).with_durability(durability).to(value);
+            }
+            None => {
+                let slot = CrateSlot::new(&*db, durability, value);
+                if let Some(group) = self.seal_group_of(&*db) {
+                    slot.seal_group(db, group);
+                }
+                let mut slots = self.slots_field(&*db).clone(); // clone: a crate's few slots, once a kind
+                slots.push((kind, slot)); // alloc: as above
+                // `HIGH`: the list only gains a slot, the first time a kind is given.
+                self.set_slots_field(db).with_durability(Durability::HIGH).to(slots);
+            }
+        }
+        true
+    }
+
+    /// This crate's seal group (`blaze_query::db::seal`), made with the crate ([`seal_crate`]):
+    /// what an input made for one crate by a crate above base-db is given, so a write of it
+    /// opens that crate's group and no other.
+    pub fn seal_group_of(self, db: &Db) -> Option<SealGroup> {
+        db.crates_map().lock().seal.get(&self).copied()
+    }
 }
 
 /// What a crate above base-db gives one crate and base-db only keeps: a value of a type of

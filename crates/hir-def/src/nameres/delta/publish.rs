@@ -1,5 +1,5 @@
 //! What the maintainer publishes (design §9): one [`ScopeInput`] per module, one
-//! [`CrateResolution`] per crate, and the singleton [`Resolutions`] that finds the latter. Each is
+//! [`CrateResolution`] per crate, found through a slot of the crate's own ([`enter`]). Each is
 //! set only when its content changed, so a query reads a change only when its slice changed. A
 //! read of a published scope during a maintainer run is noted (`reads`): another crate's, or
 //! one of this crate the run does not hold.
@@ -94,32 +94,11 @@ pub(in crate::nameres) struct CrateResolution {
     records: OwnedRecords,
 }
 
-/// Every maintained workspace crate's [`CrateResolution`] (a crate whose inputs are of kind
-/// `LOW`, [`base_db::crate_durability`]): changes only when one gains or loses its state.
-#[blaze_query::input(singleton)]
-pub(in crate::nameres) struct Resolutions {
-    #[returns(ref)]
-    crates: HashMap<Crate, CrateResolution, Global>,
-}
-
-/// Every maintained library crate's [`CrateResolution`] (the toolchain's crates, registry and
-/// git dependencies: kind `HIGH`), apart from the workspace's, so a reader of a library
-/// crate's resolution reads nothing below `HIGH`.
-///
-/// The invariant: no row keyed in a library crate is held below `HIGH` by the table that
-/// finds its crate's resolution. Until 2026-11-12 one `MEDIUM` table held both, and every row
-/// of std was `MEDIUM` through it (1,901,122 of hello-world's 2,100,144; 181,789 `HIGH`):
-/// docs/v2/plan/design/restore.md, step b1.
-#[blaze_query::input(singleton)]
-pub(in crate::nameres) struct LibraryResolutions {
-    #[returns(ref)]
-    crates: HashMap<Crate, CrateResolution, Global>,
-}
-
-/// Whether `krate`'s resolution is found in [`LibraryResolutions`]: its inputs are of kind
-/// `HIGH`. Reads the crate's own data alone, which is of that kind for such a crate.
-fn is_library(db: &Db, krate: Crate) -> bool {
-    base_db::crate_durability(db, krate) >= Durability::HIGH
+/// The kind of the slot that finds `krate`'s resolution: `HIGH` for a library crate (so a
+/// reader of a library crate's resolution reads nothing below `HIGH`), `MEDIUM` for a
+/// workspace crate (it changes only as the crate gains or loses its state).
+fn slot_durability(db: &Db, krate: Crate) -> Durability {
+    base_db::crate_durability(db, krate).max(Durability::MEDIUM)
 }
 
 fn scope_input(id: blaze_query::db::Id) -> ScopeInput {
@@ -205,21 +184,16 @@ pub(in crate::nameres) fn published_records(db: &Db, id: blaze_query::db::Id) ->
     resolution(id).records(db)
 }
 
-/// `krate`'s entry of [`Resolutions`]: what a reader of one crate's resolution depends on, so a
-/// crate that gains or loses its resolution leaves every other crate's readers as they were.
+/// `krate`'s resolution, as its maintainer entered it ([`enter`]): a slot of the crate's own
+/// (`base_db::Crate::give`), in the crate's seal group.
+///
+/// The invariant: a crate that gains or loses its resolution writes that crate's slot and no
+/// other, so no reader of another crate's resolution verifies again and no other crate's seal
+/// is checked. Until 2026-11-12 two maps of every crate held them (`Resolutions` and
+/// `LibraryResolutions`), which every crate's rows read.
 #[blaze_query::tracked(returns(copy))]
 fn resolution_of(db: &Db, krate: Crate) -> Option<CrateResolution> {
-    // A library crate is looked for in the libraries' table first, and a hit there reads
-    // nothing below `HIGH`. A miss goes on to the workspace's table: a crate whose origin was
-    // set after it was entered is still where it was entered until its next pass moves it
-    // ([`enter`]), and a crate in neither has no resolution.
-    if is_library(db, krate)
-        && let Some(found) =
-            LibraryResolutions::try_get(db).and_then(|all| all.crates(db).get(&krate).copied())
-    {
-        return Some(found);
-    }
-    Resolutions::try_get(db)?.crates(db).get(&krate).copied()
+    krate.given::<CrateResolution, CrateResolution>(db).copied()
 }
 
 /// The crate's def map as the maintainer published it, `None` when no maintainer ran for it.
@@ -255,7 +229,6 @@ pub(in crate::nameres) fn published(db: &Db, krate: Crate) -> Option<(DefMap, Lo
 /// write that changes none of them runs no `crate_local_def_map` of the crate again.
 #[cfg(test)]
 pub(in crate::nameres) struct Slices {
-    resolutions: HashMap<Crate, CrateResolution, Global>,
     resolution: CrateResolution,
     root: ModuleId,
     local: LocalDefMap,
@@ -268,13 +241,10 @@ pub(in crate::nameres) struct Slices {
 #[cfg(test)]
 impl Slices {
     pub(in crate::nameres) fn of(db: &Db, krate: Crate) -> Slices {
-        let resolutions = match LibraryResolutions::try_get(db) {
-            Some(all) if all.crates(db).contains_key(&krate) => all.crates(db),
-            _ => Resolutions::get(db).crates(db),
-        };
-        let resolution = *resolutions.get(&krate).expect("the crate is maintained");
+        let resolution = *krate
+            .given::<CrateResolution, CrateResolution>(db)
+            .expect("the crate is maintained");
         Slices {
-            resolutions: resolutions.clone(), // clone: a test's snapshot of the crate -> input map
             resolution,
             root: resolution.root(db),
             local: LocalDefMap { extern_prelude: resolution.local(db).extern_prelude.clone() },
@@ -288,7 +258,6 @@ impl Slices {
     /// The fields that differ between `self` and `other`, by name, `data` with both values.
     pub(in crate::nameres) fn differing(&self, other: &Slices) -> Vec<String> {
         let fields = [
-            ("resolutions", self.resolutions == other.resolutions),
             ("resolution", self.resolution == other.resolution),
             ("root", self.root == other.root),
             ("local", self.local == other.local),
@@ -320,7 +289,12 @@ pub(super) fn set_scope(
 ) -> bool {
     let Some(input) = *slot else {
         let durability = base_db::crate_durability(&*db, krate);
-        *slot = Some(ScopeInput::new(db, durability, module, scope, children));
+        let input = ScopeInput::new(db, durability, module, scope, children);
+        // The crate's own input, of the crate's seal group.
+        if let Some(group) = krate.seal_group_of(&*db) {
+            input.seal_group(db, group);
+        }
+        *slot = Some(input);
         return true;
     };
     let mut set = false;
@@ -363,7 +337,7 @@ pub(super) struct Assembled {
 }
 
 /// Sets each field of the crate's resolution that differs from `new` (makes the input for a
-/// crate first seen, and enters it in [`Resolutions`]); the number of fields set.
+/// crate first seen, and enters it in the crate's slot, [`enter`]); the number of fields set.
 pub(super) fn set_resolution(
     db: &mut Db,
     krate: Crate,
@@ -393,6 +367,10 @@ pub(super) fn set_resolution(
             session_macros,
             records.expect("nameres delta: a crate's first resolution has its records"),
         );
+        // The crate's own input, of the crate's seal group.
+        if let Some(group) = krate.seal_group_of(&*db) {
+            it.seal_group(db, group);
+        }
         *slot = Some(it);
         enter(db, krate, Some(it));
         return 1;
@@ -437,38 +415,16 @@ pub(super) fn set_resolution(
     set
 }
 
-/// Enters `krate`'s resolution in the table of its kind, [`LibraryResolutions`] or
-/// [`Resolutions`] (`None` takes it out), and takes it out of the other: a crate whose origin
-/// moved is found where [`resolution_of`] now looks, and nowhere else.
+/// Enters `krate`'s resolution in the crate's slot (`None` takes it out): where
+/// [`resolution_of`] looks. Writes nothing when the slot holds it already.
 pub(super) fn enter(db: &mut Db, krate: Crate, resolution: Option<CrateResolution>) {
-    let library = is_library(&*db, krate);
-    for table_is_library in [true, false] {
-        let entry = if table_is_library == library { resolution } else { None };
-        let held = match table_is_library {
-            true => LibraryResolutions::try_get(&*db).map(|all| all.crates(&*db)),
-            false => Resolutions::try_get(&*db).map(|all| all.crates(&*db)),
-        };
-        if held.and_then(|crates| crates.get(&krate)).copied() == entry {
-            continue;
-        }
-        // clone: the crate -> input map, once per crate gained or lost
-        let mut crates = held.cloned().unwrap_or_else(|| HashMap::new_in(Global));
-        match entry {
-            Some(it) => crates.insert(krate, it),
-            None => crates.remove(&krate),
-        };
-        match table_is_library {
-            true => match LibraryResolutions::try_get(&*db) {
-                Some(all) => _ = all.set_crates(db).to(crates),
-                // HIGH: set only as a library crate gains or loses its state, which a
-                // workspace edit never does.
-                None => _ = LibraryResolutions::new(db, Durability::HIGH, crates),
-            },
-            false => match Resolutions::try_get(&*db) {
-                Some(all) => _ = all.set_crates(db).to(crates),
-                // MEDIUM: set only as a workspace crate gains or loses its state.
-                None => _ = Resolutions::new(db, Durability::MEDIUM, crates),
-            },
-        }
+    if krate.given::<CrateResolution, CrateResolution>(&*db).copied() == resolution {
+        return;
     }
+    let given = match resolution {
+        Some(it) => base_db::Given::new(it),
+        None => base_db::Given::default(),
+    };
+    let durability = slot_durability(&*db, krate);
+    krate.give::<CrateResolution>(db, given, durability);
 }

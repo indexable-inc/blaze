@@ -2,7 +2,7 @@
 //! and per (crate, name), each with its content, set only when the content changed, and its
 //! `ContentId` a query over it, asked only by lane item-hash (through the identities it
 //! installs, [`ImplIdentities`]); the crate's [`SliceDirectory`] for keys a reader asks of
-//! before they have a slice; and the singleton [`ImplSlices`] that finds a crate's directory
+//! before they have a slice; and the crate's own slot ([`register_slots`]) that finds a crate's directory
 //! through its [`DirectorySlot`].
 //!
 //! A crate maintained for the first time gets its slot (one write for every such crate, before
@@ -135,28 +135,10 @@ pub(crate) fn slot_name(db: &Db, krate: Crate) -> SlotName {
     }
 }
 
-/// The directory slot of every workspace crate the maintainer has gone over (a crate whose
-/// inputs are of kind `LOW`, [`base_db::crate_durability`]); set when a crate is first.
-#[blaze_query::input(singleton, debug)]
-pub struct ImplSlices {
-    #[returns(ref)]
-    pub crates: Arc<HashMap<Crate, DirectorySlot, Global>>,
-}
-
-/// The directory slot of every library crate the maintainer has gone over (the toolchain's
-/// crates, registry and git dependencies: kind `HIGH`), apart from the workspace's, so a
-/// reader of a library crate's impls reads nothing below `HIGH`
-/// (`hir_def`'s `LibraryResolutions` states the invariant; docs/v2/plan/design/restore.md,
-/// step b1).
-#[blaze_query::input(singleton, debug)]
-pub struct LibraryImplSlices {
-    #[returns(ref)]
-    pub crates: Arc<HashMap<Crate, DirectorySlot, Global>>,
-}
-
-/// Whether `krate`'s slot is in [`LibraryImplSlices`]: its inputs are of kind `HIGH`.
-fn is_library(db: &Db, krate: Crate) -> bool {
-    base_db::crate_durability(db, krate) >= Durability::HIGH
+/// The kind of the slot that finds `krate`'s directory: `HIGH` for a library crate (a reader
+/// of a library crate's impls reads nothing below `HIGH`), `MEDIUM` for a workspace crate.
+fn slot_durability(db: &Db, krate: Crate) -> Durability {
+    base_db::crate_durability(db, krate).max(Durability::MEDIUM)
 }
 
 /// The directory of `krate`, waiting for its node to fill its slot on the pass that first
@@ -164,14 +146,11 @@ fn is_library(db: &Db, krate: Crate) -> bool {
 /// serves, has none: that is a bug in the caller (no maintainer ran), reported with the crate;
 /// as is a slot read before its node began, or given up unfilled ([`blaze_query::db::SlotError`]).
 pub(crate) fn directory(db: &Db, krate: Crate) -> SliceDirectory {
-    // A library crate's slot is looked for in the libraries' table first (a hit reads nothing
-    // below `HIGH`), then where a crate whose origin was set after its first pass still is.
-    let library = match is_library(db, krate) {
-        true => LibraryImplSlices::try_get(db).and_then(|it| it.crates(db).get(&krate).copied()),
-        false => None,
-    };
-    let found = library
-        .or_else(|| ImplSlices::try_get(db).and_then(|it| it.crates(db).get(&krate).copied()));
+    // The crate's directory slot is a slot of the crate's own (`base_db::Crate::give`, set by
+    // [`register_slots`]): a crate first maintained writes its own input and no other crate's
+    // readers. Until 2026-11-12 two maps of every crate held them (`ImplSlices` and
+    // `LibraryImplSlices`).
+    let found = krate.given::<DirectorySlot, DirectorySlot>(db).copied();
     let Some(slot) = found else {
         panic!("impls: no maintained impl tables for crate {krate:?}: no maintainer ran")
     };
@@ -717,39 +696,20 @@ impl Published {
     }
 }
 
-/// Adds the slots of the crates a pass first maintains to the singleton, with one write before
-/// any crate's node runs: a write opens a view, which sweeps every `lru` table, so one per crate
-/// was a sweep per crate. Nothing when there are none.
+/// Gives each crate a pass first maintains its directory slot, before any crate's node runs:
+/// a slot of the crate's own, so each write is of that crate alone. Nothing for a crate that
+/// holds the slot already.
 pub(crate) fn register_slots(db: &mut Db, slots: &[(Crate, DirectorySlot)]) {
-    for library in [true, false] {
-        // alloc: the slots of one kind, once per write that first maintains a crate
-        let of_kind: Vec<(Crate, DirectorySlot)> =
-            slots.iter().copied().filter(|&(krate, _)| is_library(&*db, krate) == library).collect();
-        if of_kind.is_empty() {
+    for &(krate, slot) in slots {
+        if krate.given::<DirectorySlot, DirectorySlot>(&*db).copied() == Some(slot) {
             continue;
         }
-        let held = match library {
-            true => LibraryImplSlices::try_get(&*db).map(|all| all.crates(&*db)),
-            false => ImplSlices::try_get(&*db).map(|all| all.crates(&*db)),
-        };
-        // alloc: clone: the crate map, once per write that first maintains a crate
-        let mut crates = held.map_or_else(|| HashMap::new_in(Global), |it| (**it).clone());
-        crates.extend(of_kind);
-        // alloc: the singleton's map, once per write that first maintains a crate
-        let crates = Arc::new(crates);
-        match library {
-            true => match LibraryImplSlices::try_get(&*db) {
-                Some(all) => _ = all.set_crates(db).to(crates),
-                // HIGH: set only when a library crate is first maintained.
-                None => _ = LibraryImplSlices::new(db, Durability::HIGH, crates),
-            },
-            false => match ImplSlices::try_get(&*db) {
-                Some(all) => _ = all.set_crates(db).to(crates),
-                // MEDIUM: set only when a workspace crate is first maintained, a crate graph
-                // change.
-                None => _ = ImplSlices::new(db, Durability::MEDIUM, crates),
-            },
+        // The slot is the crate's own input too, of the crate's seal group.
+        if let Some(group) = krate.seal_group_of(&*db) {
+            slot.seal_group(db, group);
         }
+        let durability = slot_durability(&*db, krate);
+        krate.give::<DirectorySlot>(db, base_db::Given::new(slot), durability);
     }
 }
 
