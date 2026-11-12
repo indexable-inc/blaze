@@ -8,7 +8,7 @@ use object::write::Object as Builder;
 use object::{Architecture, BinaryFormat, Endianness, SectionKind};
 
 use super::{
-    Ask, Cache, CrateLibs, Glibc, Located, RunsOn, Target, caseless, fhs, listing, loader,
+    Ask, Cache, CrateLibs, Located, RunsOn, Target, caseless, fhs, listing, loader,
     locate_any, locate_with, machine_facts, output_with, parse_version, reactor_with, rpaths,
     top_level_string,
 };
@@ -332,7 +332,7 @@ fn a_link_of_rust_alone_asks_the_machine_nothing_and_takes_only_what_blaze_ships
         .unwrap();
         assert_eq!(located, again);
     }
-    assert_eq!(Glibc::DEFAULT, Glibc(2, 28));
+    assert_eq!(super::Glibc::DEFAULT, super::Glibc(2, 28));
 }
 
 #[test]

@@ -59,7 +59,7 @@ mod tests {
         assert_eq!(pin_sha256(LLVM_JSON, "riscv64gc-unknown-linux-gnu"), Ok(None));
         let unsummed = r#"{"targets": {"t": {"name": "n"}, "u": {"sha256": "ab"}}}"#;
         assert!(pin_sha256(unsummed, "t").is_err());
-        assert_eq!(pin_sha256(unsummed, "u").as_deref(), Ok(Some("ab")));
+        assert_eq!(pin_sha256(unsummed, "u"), Ok(Some("ab".to_owned())));
     }
 
     #[test]
