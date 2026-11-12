@@ -1341,6 +1341,83 @@
    "cause": "the profile has no table of who asked a memo from outside a query; `query_counts` says how many",
    "workaround": "the counter starts when a file appears; report lines begin with a letter",
    "state": "open: a `verified_by` sample (the asker's innermost non-engine frame, one in N) in the profile would have answered this with no build"
+  },
+  {
+   "id": "newproj-1",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane newproj-1111",
+   "where": "a unit record's miss (`blaze explain key_part_diff`)",
+   "what": "A unit's record that missed said `its crate's settings in the front end (its root's path, cfgs, env, edition and target)` with one hash: which of a dozen settings and forty environment variables moved was not said, for any of the standard library's 26 units.",
+   "cost": "a rebuild with a part a setting before the cause could be named (the directory proc macros run in)",
+   "cause": "the crate's content ID is one hash, and the miss's parts named it whole",
+   "workaround": "none",
+   "state": "fixed on newproj-1111 (34522b6779): each setting and each variable is a part of its own"
+  },
+  {
+   "id": "newproj-2",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane newproj-1111",
+   "where": "the brief's measurement and the lane's VM",
+   "what": "The brief's numbers were a Mac's (first run 6.9 s, 68 describes); the lane's VM is Linux arm64, where a dev program is walked and linked whole (14,202 describes, 12,043 functions, first run 13 to 34 s). The two platforms' first builds are different work, and nothing on the VM says what the Mac's does.",
+   "cost": "an hour reading the VM's profile against the brief's spans before seeing they are not the same build",
+   "cause": "a dev executable takes the dependency image on macOS and not on this VM (not looked into further)",
+   "workaround": "attribute and measure on the platform at hand, and say so",
+   "state": "open: a brief should name the platform its numbers are of"
+  },
+  {
+   "id": "newproj-3",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane newproj-1111",
+   "where": "an ix VM used for timing",
+   "what": "The same binary's cold hello-world build took 17 to 48 s and the same first build of a new project 13 to 34 s across an hour on one VM (`khugepaged` at 9% of a core, the guest's memory growing from 3 to 47 GiB as it was used, `the flight recorder lost rows`): medians of five moved by a factor of two between two runs of the same script.",
+   "cost": "two measuring runs thrown away; every claim made from an interleaved run and a matched pair instead of medians",
+   "cause": "unknown: the VM was made without `--memory-commit` or a CPU class, as the brief's command said",
+   "workaround": "interleave the binaries round by round (abab.py) and read CPU time and counts beside wall time",
+   "state": "open: a lane that measures should get `--memory-commit` and `--cpu` in its brief's `ix new`"
+  },
+  {
+   "id": "newproj-4",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane newproj-1111",
+   "where": "measuring scripts and `blaze stop`",
+   "what": "`blaze stop` answers before the daemon has exited, and a daemon goes on working for seconds after a build's answer (`store kept front end`, 5 cores busy): a sample started right after the last ran beside the previous sample's daemon.",
+   "cost": "one interleaved run of ten samples thrown away",
+   "cause": "the stop's answer comes before the process's end (already a row, revisions-1111); nothing says when a daemon is idle",
+   "workaround": "wait for the daemon's process to go, and for it to use no CPU, before timing (measure.py's `stop` and `quiet`)",
+   "state": "open: `blaze stop --wait`, and a `blaze status` that says idle"
+  },
+  {
+   "id": "newproj-5",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane newproj-1111",
+   "where": "`ix shell vm -- bash -c '... pkill -f abab.py ...'`",
+   "what": "Met the row of another lane again: `pkill -f` inside `ix shell -- bash -c` killed its own shell, since its command line holds the pattern, and the rest of the line did not run, silently.",
+   "cost": "a restart of a measuring run that never started",
+   "cause": "as that row says",
+   "workaround": "a script file run by `bash file`, and `pgrep -f 'abab[.]py'`",
+   "state": "open"
+  },
+  {
+   "id": "newproj-6",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane newproj-1111",
+   "where": "blaze-lower's tests under cargo",
+   "what": "Two tests of blaze-lower fail on this lane with or without its changes to the crate's code, both in code the lane did not touch: `code::tests::what_could_read_another_file_is_not_alone` (`a path's macro a macro is given`) and `tests::readers_of_two_run_classes_keep_their_keys_apart_by_the_runs_identities` (`Crate::set_extra_data` wrote the database outside a `Db::batch`). Not run on the untouched tip: that needs a second target directory.",
+   "cost": "ten minutes telling them from the lane's three new tests",
+   "cause": "not looked into",
+   "workaround": "none",
+   "state": "open"
+  },
+  {
+   "id": "newproj-7",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane newproj-1111",
+   "where": "the daemon with two projects",
+   "what": "A second project's first build let go of the first project's kept front end (`a task waits for 7.45 GiB the process holds besides its tasks`): the program's codegen, never measured, asks the whole budget and was counted short of everything held, though no amount let go starts it. The first project's next edit then took 13.2 s where an edit takes 1 s.",
+   "cost": "found only because the measuring script went back to the first project",
+   "cause": "`Plane::pick` set `short` for a task that asks the whole ceiling",
+   "workaround": "none",
+   "state": "fixed on newproj-1111 (37495ec94d); open: a program never measured still waits for every granted task to end (1.2 s of a new hello-world's first build under `admission`) and is granted 101.8 GB where it peaks at 1.2 GB"
   }
  ]
 }

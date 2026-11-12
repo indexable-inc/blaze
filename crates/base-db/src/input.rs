@@ -1032,6 +1032,113 @@ impl Crate {
     }
 }
 
+/// The domain of each hash [`Crate::settings_parts`] gives: of a message, never of a key.
+const SETTING_PART: &str = "blaze v2 crate setting part 1";
+
+impl Crate {
+    /// What [`Crate::content`] is made of, a setting at a time, each by what it is and a hash
+    /// of its own: a message that the crate's settings moved (`blaze why`, a unit's record
+    /// that missed) names the one that did, where the content ID says only that one of them
+    /// has. Each environment variable is a part of its own, by name. Read on a miss; never
+    /// part of a key, which [`Crate::content`] alone is.
+    pub fn settings_parts(self, db: &Db) -> Vec<(String, ContentId)> {
+        let data = self.data(db);
+        let (extra, workspace) = (self.extra_data(db), self.workspace_data(db));
+        let of = |fill: &dyn Fn(&mut Hasher)| {
+            let mut hasher = Hasher::new(SETTING_PART);
+            fill(&mut hasher);
+            hasher.finish()
+        };
+        // alloc: once a miss, a part a setting
+        let mut parts = vec![
+            (
+                "its crate's root file's path".to_owned(),
+                of(&|h| {
+                    h.part(&content::path_key(root_path(db, data.root_file_id)));
+                }),
+            ),
+            (
+                "its crate's edition".to_owned(),
+                of(&|h| {
+                    h.update(&(data.edition.number() as u64).to_le_bytes());
+                }),
+            ),
+            (
+                "its crate's origin (which package it is of)".to_owned(),
+                of(&|h| {
+                    data.origin.hash_into(h);
+                }),
+            ),
+            (
+                "its crate's kind of target and crate types".to_owned(),
+                of(&|h| {
+                    h.update(&[
+                        data.target_kind.tag(),
+                        data.manifest_kind.tag(),
+                        data.crate_types.bits(),
+                    ]);
+                }),
+            ),
+            (
+                "the directory its crate's proc macros run in".to_owned(),
+                of(&|h| {
+                    h.part(data.proc_macro_cwd.as_str().as_bytes());
+                }),
+            ),
+            (
+                "its crate's name and version".to_owned(),
+                of(&|h| {
+                    h.opt_part(extra.version.as_deref());
+                    if let Some(name) = &extra.display_name {
+                        h.part(name.crate_name().as_str().as_bytes())
+                            .part(name.canonical_name().as_str().as_bytes());
+                    }
+                }),
+            ),
+            (
+                "what its crate is built for (the host, a target, the macro host)".to_owned(),
+                of(&|h| {
+                    extra.built_for.hash_into(h);
+                }),
+            ),
+            (
+                "its crate's build script runs".to_owned(),
+                of(&|h| {
+                    for run in &extra.build_script_runs {
+                        h.part(run.as_bytes());
+                    }
+                }),
+            ),
+            (
+                "what its crate shares with every crate of its target (the target's layout, the toolchain, the const-eval budget, the trusted crates)".to_owned(),
+                workspace.content(),
+            ),
+            ("its crate's cfg".to_owned(), cfg_options_content(self.cfg_options(db))),
+            (
+                "its crate's lint levels".to_owned(),
+                of(&|h| {
+                    let lints = self.lint_options(db);
+                    for (lint, level) in &lints.opts {
+                        h.part(lint.as_bytes()).update(&[*level as u8]);
+                    }
+                    if let Some(cap) = lints.cap {
+                        h.update(&[1, cap as u8]);
+                    }
+                }),
+            ),
+        ];
+        for (name, value) in self.env(db).iter() {
+            parts.push((
+                format!("its crate's environment variable `{name}`"),
+                of(&|h| {
+                    h.part(value.as_bytes());
+                }),
+            ));
+        }
+        parts
+    }
+}
+
 /// The path of a crate's root file: its identity in the crate's content ID.
 fn root_path(db: &Db, file: FileId) -> &VfsPath {
     let root_id = db.file_source_root(file).source_root_id(db);

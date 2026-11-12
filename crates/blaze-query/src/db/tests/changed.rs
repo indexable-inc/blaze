@@ -152,6 +152,9 @@ enum Step {
     /// Asks for these nodes' values without asking for the changed set: a pull in a view no
     /// walk may ever run in.
     Pull(Vec<usize>),
+    /// Folds what ran into the reverse index now, as a host does after a build's answer
+    /// ([`crate::db::Storage::pack_reverse`]), where a view's boundary would fold it later.
+    Pack,
     /// Asks for the changed set since the ask `back` asks ago (0: the last; past the first:
     /// since the storage's first view), then for every node made.
     Ask(usize),
@@ -185,12 +188,13 @@ fn program(tc: &TestCase) -> Program {
     }
     let mut steps = Vec::new();
     for _ in 0..int(1, 16) {
-        steps.push(match int(0, 9) {
+        steps.push(match int(0, 10) {
             0..=3 => Step::Write(int(0, inputs - 1), tc.draw(gs::integers::<u64>().max_value(6))),
             4 => Step::World(tc.draw(gs::integers::<u64>().max_value(3))),
             5 => Step::Evict,
             6 => Step::Epoch,
             7 | 8 => Step::Pull((0..int(1, 3)).map(|_| int(0, nodes - 1)).collect()),
+            9 => Step::Pack,
             _ => Step::Ask(int(0, 3)),
         });
     }
@@ -242,6 +246,15 @@ fn simulate(program: &Program, plant: Plant) -> Result<(), String> {
             }
             Step::Epoch => {
                 db.storage_mut().end_epoch();
+            }
+            Step::Pack => {
+                db.storage_mut().pack_reverse();
+                if db.storage().runs_unfolded() != 0 {
+                    return Err(format!(
+                        "step {at}: {} runs' edges are left to the next view's boundary after a fold",
+                        db.storage().runs_unfolded()
+                    ));
+                }
             }
             Step::Pull(pulled) => {
                 let now = evaluate(&program.flow, &inputs, world);
@@ -349,6 +362,30 @@ fn the_oracle_catches_a_reverse_edge_not_recorded() {
 
 /// A row that read input 1, runs again and reads input 2 instead: the plant keeps only its
 /// first edges, so a write of input 2 never reaches it.
+/// The fold a host asks for after a build's answer is the fold a view's boundary would have
+/// made: the runs before it are in the reverse index, none is left for the next write, and
+/// the walk after that write names what the write reached. Its control: with an edge dropped
+/// in the fold, that walk misses a reader, and the oracle says so.
+#[test]
+fn a_fold_asked_for_after_the_runs_feeds_the_next_walk() {
+    // The chains of `the_oracle_catches_a_reverse_edge_not_recorded`: some reader's node is
+    // even, so the plant drops the edges to it.
+    let flow: Vec<FlowNode> = (0..4)
+        .flat_map(|chain| {
+            [
+                sum(&[Dep::Input(chain)]),
+                sum(&[Dep::Query(3 * chain)]),
+                sum(&[Dep::Query(3 * chain + 1)]),
+            ]
+        })
+        .collect();
+    let mut steps = vec![Step::Pull((0..12).collect()), Step::Pack, Step::Ask(0)];
+    steps.extend((0..4).map(|input| Step::Write(input, 10 + input as u64)));
+    steps.push(Step::Ask(0));
+    let program = Program { inputs: 4, flow, steps };
+    caught(&program, Plant::DropsAnEdge, "does not name it");
+}
+
 #[test]
 fn the_oracle_catches_a_stale_edge_after_a_rows_dependencies_change() {
     let pick = FlowNode {

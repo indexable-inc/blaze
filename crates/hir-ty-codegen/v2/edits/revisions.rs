@@ -223,6 +223,10 @@ fn one(test: &Test, seed: u64) -> (Vec<Row>, Vec<String>) {
                     state.log.push("the same text set again".to_owned());
                     state.db.set_file_text(state.file, &text);
                 }
+                Step::Project(name) => panic!(
+                    "{}: the step `project {name}` is the real driver's: the simulation has one project and one database",
+                    test.name
+                ),
                 Step::Do(_) => {
                     state.log.push("a build".to_owned());
                     if let Ok(built) = state.build() {
