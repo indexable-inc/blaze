@@ -351,6 +351,25 @@ pub enum Effect {
         file: FileName,
         tag: Tag,
     },
+    /// Everything written to the file before this was asked for is ordered before every write
+    /// (to any file of its file system) asked for after this completes: a crash never keeps
+    /// one of those and loses any of these. It does not wait for the drive to keep them, so a
+    /// power failure right after may lose both; they are durable once any sync of the file
+    /// system that waits for the drive ([`Effect::Sync`], [`Effect::SyncDir`],
+    /// [`Effect::Write`], [`Effect::Rename`]) asked for after this completes has completed.
+    /// What a commit point needs of the bytes it names when losing the commit whole costs
+    /// only work: the bytes ordered before the name, at a fraction of a sync's wait.
+    ///
+    /// Apple's systems: `fcntl(F_BARRIERFSYNC)`, the file written out and a barrier sent to
+    /// the drive, with no flush of its cache (`F_FULLFSYNC`, which [`Effect::Sync`] is, waits
+    /// for that flush). Linux has no barrier without the flush: `fdatasync` (the ring's
+    /// `IORING_OP_FSYNC` with `IORING_FSYNC_DATASYNC`), the cheapest call that orders, which
+    /// is also durable. Elsewhere the data sync the system has. The file is made where it is
+    /// missing, as a sync makes it. Completes with [`Done::Ordered`].
+    Barrier {
+        file: FileName,
+        tag: Tag,
+    },
     /// The file's data that is still only in memory begun to be written to its device, and
     /// the completion told once it is there ([`Durable::Started`]): no metadata is committed
     /// and no device cache flushed, so nothing of it is durable, and the asker waits for
@@ -794,6 +813,7 @@ impl Effect {
             | Effect::ReadLink { tag, .. }
             | Effect::Append { tag, .. }
             | Effect::Sync { tag, .. }
+            | Effect::Barrier { tag, .. }
             | Effect::WriteBack { tag, .. }
             | Effect::SyncDir { tag, .. }
             | Effect::Truncate { tag, .. }
@@ -1119,6 +1139,9 @@ pub enum Done {
     },
     Appended,
     Synced,
+    /// Of an [`Effect::Barrier`]: what was written to the file is ordered before what is
+    /// written after (not durably).
+    Ordered,
     /// Of an [`Effect::WriteBack`]: the file's data was written to its device (not durably).
     WrittenBack,
     Truncated,

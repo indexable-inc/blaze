@@ -509,6 +509,7 @@ impl Kqueue {
             | Effect::ReadLink { .. }
             | Effect::Append { .. }
             | Effect::Sync { .. }
+            | Effect::Barrier { .. }
             | Effect::WriteBack { .. }
             | Effect::SyncDir { .. }
             | Effect::Truncate { .. }
@@ -1779,7 +1780,8 @@ mod tests {
         driver.submit(&mut vec![Effect::Pressure { tag: Tag(1) }]);
         let mut out = Vec::new();
         // The registration is made with this wait; a refusal comes back as its event.
-        driver.poll(&mut out, Duration::from_millis(20));
+        let until = Deadline::after(driver.now(), Duration::from_millis(20));
+        driver.poll(&mut out, until);
         assert!(
             out.iter().all(|it| matches!(it.done, Done::Pressed { .. })),
             "the kernel refused a knote of EVFILT_MEMORYSTATUS (-14), the filter of \

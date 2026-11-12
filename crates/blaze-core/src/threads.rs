@@ -1036,6 +1036,10 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             fs::sync_dir(path)?;
             Ok(Done::Synced)
         }),
+        Effect::Barrier { file, .. } => at(root, &file, |path| {
+            fs::barrier(path)?;
+            Ok(Done::Ordered)
+        }),
         // Waited for on this thread; the asker waits for nothing, and nothing is durable.
         Effect::WriteBack { file, .. } => at(root, &file, |path| {
             fs::write_back(path)?;

@@ -186,6 +186,14 @@ impl Disk {
                 // clone: the ledger's name of the file, a refcount.
                 self.flushing.push((*tag, file.clone(), covered));
             }
+            // A barrier writes out what a flush writes out and makes nothing durable by
+            // itself: the simulation orders it before what is written after.
+            Effect::Barrier { file, tag } => {
+                self.counts.writebacks += 1;
+                let covered = self.dirty_of(file);
+                // clone: the ledger's name of the file, a refcount.
+                self.flushing.push((*tag, file.clone(), covered));
+            }
             // A write-back cleans what a flush cleans (a clone after it forces nothing out)
             // and makes nothing durable: the simulation still tears the file at a crash.
             Effect::WriteBack { file, tag } => {
@@ -241,7 +249,7 @@ impl Disk {
         }
         if let Some(at) = self.flushing.iter().position(|(it, _, _)| *it == tag) {
             let (_, file, covered) = self.flushing.swap_remove(at);
-            if matches!(completion.done, Done::Synced | Done::WrittenBack) {
+            if matches!(completion.done, Done::Synced | Done::Ordered | Done::WrittenBack) {
                 if let Some((_, dirty)) = self.dirty.iter_mut().find(|(it, _)| *it == file) {
                     // What was written after the flush was asked is still unflushed.
                     *dirty = dirty.saturating_sub(covered);

@@ -177,6 +177,15 @@ pub(crate) fn sync(path: &Path) -> io::Result<()> {
     sys::fsync(file.fd()).map_err(|errno| os_error(errno, Plant::None))
 }
 
+/// [`crate::Effect::Barrier`]: the file at `path`, made where it is missing, with its data
+/// (and the metadata a read of it needs: its length) on the device: `fdatasync`.
+pub(crate) fn barrier(path: &Path) -> io::Result<()> {
+    let flags = OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::APPEND;
+    let file = open(path, flags, Plant::None)?;
+    // durable: the effect is the ordering its caller asked for; Linux's cheapest call for it is a data sync.
+    sys::fdatasync(file.fd()).map_err(|errno| os_error(errno, Plant::None))
+}
+
 /// [`crate::Effect::WriteBack`]: the file's data that is only in memory written to its
 /// device and waited for (`sync_file_range` with `WAIT_BEFORE | WRITE | WAIT_AFTER` over the
 /// whole file), nothing made durable. Opened to read, so a file sealed read-only is written
