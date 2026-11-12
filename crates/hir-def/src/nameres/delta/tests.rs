@@ -1298,6 +1298,94 @@ fn an_item_under_an_attribute_macro_given_after_its_map_was_read_is_expanded_aga
     assert!(failures.is_empty(), "{failures}");
 }
 
+/// A crate `main` whose module `multicall::bindings` calls another crate's macro on a module
+/// (`pm::sol! { pub mod made { .. } }`), with imports from that module beside it and in a
+/// sibling; `pm`, with no macros given yet; and its macro given, an identity.
+fn a_macro_that_declares_a_module() -> (Loaded, Crate, Crate, Vec<hir_expand::proc_macro::ProcMacro>)
+{
+    use hir_expand::proc_macro::{ProcMacro, ProcMacroKind, ProcMacros};
+    let loaded = Loaded::new(
+        "//- proc_macros: identity\n//- /pm.rs crate:proc-macro:pm\n#[proc_macro]\npub fn sol(input: TokenStream) -> TokenStream { input }\n//- /main.rs crate:main deps:pm\npub mod multicall {\n    pub mod bindings {\n        pm::sol! {\n            pub mod made {\n                pub struct Call;\n                pub struct Result;\n            }\n        }\n    }\n    pub mod inner {\n        use super::bindings::made::Call;\n        pub fn f(_: &Call) {}\n    }\n    use bindings::made::Result as R;\n    pub fn g(_: &R) {}\n}\n",
+    );
+    let (main, pm) = (loaded.file("/main.rs"), loaded.file("/pm.rs"));
+    let db = &loaded.db;
+    let krate =
+        |file| *all_crates(db).iter().find(|it| it.data(db).root_file_id == file).expect("a crate");
+    let (main, pm) = (krate(main), krate(pm));
+    let fixtures = *all_crates(db)
+        .iter()
+        .find(|it| **it != pm && it.data(db).target_kind.is_proc_macro())
+        .expect("`proc_macros`");
+    let identity = ProcMacros::get_for_crate(db, fixtures)
+        .and_then(|it| it.macros().map(<[_]>::to_vec))
+        .expect("listed")
+        .into_iter()
+        .next()
+        .expect("`identity`");
+    let given = vec![ProcMacro {
+        name: Symbol::intern("sol"),
+        kind: ProcMacroKind::Bang,
+        expander: identity.expander,
+        disabled: false,
+    }];
+    (loaded, main, pm, given)
+}
+
+/// Whether `multicall` names `R` and `multicall::inner` names `Call`, in `main`'s map.
+fn imports_from_the_made_module(db: &Db, main: Crate) -> [bool; 2] {
+    let map = crate_local_def_map(db, main).def_map(db);
+    let child = |of: ModuleId, it: &str| match map.module(db, of).scope(db).get(&name(it)).take_types() {
+        Some(crate::ModuleDefId::ModuleId(it)) => it,
+        other => panic!("`{it}` is not a module: {other:?}"),
+    };
+    let multicall = child(map.root, "multicall");
+    let inner = child(multicall, "inner");
+    [
+        map.module(db, multicall).scope(db).get(&name("R")).take_types().is_some(),
+        map.module(db, inner).scope(db).get(&name("Call")).take_types().is_some(),
+    ]
+}
+
+/// The invariant: a module that another crate's macro declares, once that crate is given its
+/// macros, is read by the modules that import from it. The calling module's round-0 log holds
+/// the expansion, the module it declares a round-0 child, so the group woken by the macro's
+/// new binding has its log read again and its new child is a group of the run. alloy-provider's
+/// `sol! { interface IMulticall3 { .. } }` in `multicall::bindings`, with `use
+/// bindings::IMulticall3::Result` beside it, panicked the builds of tempo and of reth:
+/// "ModuleId not found in ModulesMap".
+#[test]
+fn a_module_an_expansion_declares_once_its_macro_is_given_is_read_by_its_importers() {
+    use hir_expand::proc_macro::ProcMacros;
+    let (mut loaded, main, pm, given) = a_macro_that_declares_a_module();
+    assert_eq!(
+        imports_from_the_made_module(&loaded.db, main),
+        [false, false],
+        "before its macros are built"
+    );
+    ProcMacros::give(&mut loaded.db, [(pm, Ok(given))]);
+    assert_eq!(
+        imports_from_the_made_module(&loaded.db, main),
+        [true, true],
+        "given its built macros after its map was read"
+    );
+    let mut failures = String::new();
+    check_db(&loaded.db, "given built macros", &Exempt::NONE, true, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}
+
+/// The control of the invariant above: with a woken group run again on the round-0 children
+/// its state had, the module its new log declares has a name and no row, and the import that
+/// reads through it panics as the builds did.
+#[test]
+#[should_panic(expected = "ModuleId not found in ModulesMap")]
+fn the_oracle_catches_a_woken_group_whose_log_is_not_read_again() {
+    use hir_expand::proc_macro::ProcMacros;
+    let (mut loaded, main, pm, given) = a_macro_that_declares_a_module();
+    let _ = imports_from_the_made_module(&loaded.db, main);
+    super::input::WOKEN_LOGS_ARE_NOT_READ.set(true);
+    ProcMacros::give(&mut loaded.db, [(pm, Ok(given))]);
+}
+
 /// The expanders of the macros `names` of the proc-macro crate `pm`, in its own map: whether
 /// each is one the crate's list gave.
 fn own_expanders(db: &Db, pm: Crate, names: &[&str]) -> Vec<bool> {

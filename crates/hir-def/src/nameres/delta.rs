@@ -390,7 +390,8 @@ fn read_crate(db: &Db, written: &Written<'_>, run: &mut CrateRun) {
         old => (true, CrateState::cold(root, old)),
     };
     let work = &mut run.work;
-    let mut delta = input::read(db, krate, &mut cs, written, cold, run.deps_changed);
+    let mut wakes = std::mem::take(&mut run.wakes);
+    let mut delta = input::read(db, krate, &mut cs, written, cold, run.deps_changed, &wakes);
     work.ops += delta.ops;
     // The root of a crate exporting procedural macros is published censored, and its state row
     // keeps the scope before the censor: a run makes both.
@@ -415,7 +416,6 @@ fn read_crate(db: &Db, written: &Written<'_>, run: &mut CrateRun) {
         true => diff::update_positions(&mut cs),
         false => Vec::new(), // alloc: empty, allocates nothing
     };
-    let mut wakes = std::mem::take(&mut run.wakes);
     enum_glob_wakes(db, &mut cs, &delta, &mut wakes);
     let mut region = initial_region(&cs, &mut run.scratch, &delta, wakes, cold);
     if region.is_empty() && !delta.deleted.is_empty() {
@@ -1181,7 +1181,7 @@ fn cold(
         included: &[],
         proc_macros: &[],
     };
-    input::read(db, krate, &mut cs, &none, true, false);
+    input::read(db, krate, &mut cs, &none, true, false, &[]);
     let mut region: HashSet<ModuleId, Global> = cs.groups.keys().copied().collect();
     let mut work = Work::default();
     let Cutoff { mut out, mut outside, order, .. } = cutoff(
