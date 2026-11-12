@@ -1383,11 +1383,10 @@ mod tests {
         }
     }
 
-    /// A build large enough that code IDs are hashed on several threads, both at the start and
-    /// in a round that renames thousands: the same answer as the reference, with and without
-    /// originals.
+    /// A build of 32,768 functions, as the benchmark's, renaming thousands a round: the same
+    /// answer as the reference, with and without originals.
     #[test]
-    fn a_build_hashed_on_threads_agrees_with_a_pass_over_every_function() {
+    fn a_large_build_agrees_with_a_pass_over_every_function() {
         let wide = |n: usize| InstanceKey(ContentId::of("dedupe test key", &(n as u64).to_le_bytes()));
         let (bodies, instances) = (4096, 8);
         let make = || -> Vec<CompiledFunction> {
