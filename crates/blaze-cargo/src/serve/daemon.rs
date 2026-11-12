@@ -2606,21 +2606,6 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let memory = blaze_mem::tag::snapshot();
         blaze_profile::plot(Plot::FrameBytes, memory.get(blaze_mem::Tag::Frames).live);
         blaze_profile::plot(Plot::LiveBytes, memory.live());
-        // Nothing to do for a while: the warm memory each thread keeps for its next task goes
-        // back, once a stretch, on the purger's thread and the workers' own as they park
-        // ([`super::idle`]). From then until the daemon works again the allocator gives a
-        // freed page back as it is freed, so what each worker's give-back frees leaves at
-        // once, whichever thread's purge comes last (mimalloc lets one thread purge at a
-        // time, and a page only scheduled would wait for the next forced purge).
-        let working = self.jobs.build_under_way() != 0 || self.plane.running() != 0;
-        if self.idle.look(now, working) {
-            tracing::info!(target: "blaze", "idle: the daemon gives its warm memory back");
-            blaze_mem::tag::keep_freed_pages_for(0);
-            blaze_mem::frame::ask_spare_trim();
-            crate::raw::memory::purger().ask();
-            self.jobs.say_what_the_kept_front_ends_hold();
-        }
-        let idle = self.idle.gave();
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(bytes) = crate::raw::memory::own_footprint() {
             blaze_profile::plot(Plot::Footprint, bytes);
@@ -2631,8 +2616,6 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             // Past the limit's line, or keeping more than a quarter of the budget freed (the
             // high water): the purger's thread gives it back, never the loop, since a purge
             // waits for each worker's heaps ([`crate::raw::memory::purge`]).
-            let warm = if idle { 0 } else { super::idle::warm(bytes, limit) };
-            blaze_mem::tag::keep_freed_pages_for(warm);
             let high_water = kept > limit / KEPT_HIGH_WATER;
             if (pressure.squeezed() || high_water)
                 && now.saturating_sub(self.given_back) >= GIVE_BACK_EVERY
@@ -2640,6 +2623,16 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 self.given_back = now;
                 crate::raw::memory::purger().ask();
             }
+        }
+        // Nothing to do for a while: the warm memory each thread keeps for its next task goes
+        // back, once a stretch, on the purger's thread and the workers' own as they park
+        // ([`super::idle`]).
+        let working = self.jobs.build_under_way() != 0 || self.plane.running() != 0;
+        if self.idle.look(now, working) {
+            tracing::info!(target: "blaze", "idle: the daemon gives its warm memory back");
+            blaze_mem::frame::ask_spare_trim();
+            crate::raw::memory::purger().ask();
+            self.jobs.say_what_the_kept_front_ends_hold();
         }
         blaze_profile::plot(Plot::AllocatorPurgedBytes, crate::raw::memory::purged_bytes());
         blaze_profile::plot(Plot::CommittedBytes, memory.committed);

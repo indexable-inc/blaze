@@ -370,14 +370,8 @@ impl Release<Crate> {
         }
         // What was let go goes back to the system now, not when mimalloc's purge delay and the
         // next page taken get to it: this thread's heaps and every freed page at once, each
-        // other thread's heaps as it next allocates or idles (memcap5). Not while the daemon
-        // holds little and memory did not make this release due: the freed pages are then the
-        // next edit's build's, with no page fault (an edit's build allocated and freed 95 MiB
-        // of the global heap, 17 ms of faults on 4 KiB pages, lane mem2-1111), and the idle
-        // daemon gives them back ([`crate::serve::idle`]).
-        if pressed || !blaze_mem::tag::keeps_freed_pages() {
-            blaze_mem::tag::give_back_heap();
-        }
+        // other thread's heaps as it next allocates or idles (memcap5).
+        blaze_mem::tag::give_back_heap();
         let after = Pressure::now();
         if pressed {
             self.squeeze.released(after);

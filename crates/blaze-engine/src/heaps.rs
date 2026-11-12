@@ -156,16 +156,6 @@ pub(crate) fn purge_at_once() {
     unsafe { libmimalloc_sys::mi_option_set(PURGE_DELAY, 0) };
 }
 
-/// Has mimalloc keep a freed page `millis` before it purges it, 0 for at once
-/// ([`blaze_mem::tag::keep_freed_pages_for`]). A page kept is purged as some thread next takes
-/// or frees a page after the delay, or by a forced collect ([`give_back_here`]) whatever its
-/// age, which is what an idle daemon and memory running short ask.
-fn purge_after(millis: u64) {
-    let millis = std::ffi::c_long::try_from(millis).unwrap_or(std::ffi::c_long::MAX);
-    // SAFETY: as `purge_at_once`.
-    unsafe { libmimalloc_sys::mi_option_set(PURGE_DELAY, millis) };
-}
-
 /// mimalloc, a heap per tag ([`Holders`]).
 pub(crate) struct Heaps;
 
@@ -354,7 +344,6 @@ fn make(tag: Tag) -> Option<*mut mi_heap_t> {
             blaze_mem::tag::heap_committed_by(committed);
             blaze_mem::tag::heap_gives_back_by(settle);
             blaze_mem::tag::heap_pages_by(pages);
-            blaze_mem::tag::heap_purge_delay_by(purge_after);
             Some(made)
         }
         Err(theirs) => {

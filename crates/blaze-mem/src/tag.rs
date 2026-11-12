@@ -305,38 +305,6 @@ pub fn heap_pages() -> Option<[HeapPages; Tag::COUNT + 1]> {
     Some(pages)
 }
 
-/// How long the global allocator keeps a freed page before it gives it back, in milliseconds;
-/// 0 for at once ([`keep_freed_pages_for`]).
-static HEAP_PURGE_DELAY: AtomicU64 = AtomicU64::new(0);
-
-/// The global allocator's setter of its purge delay ([`heap_purge_delay_by`]).
-static HEAP_PURGE_DELAY_SET: OnceLock<fn(u64)> = OnceLock::new();
-
-/// The global allocator keeps a freed page for as many milliseconds as `set` is told before it
-/// gives it back to the system (mimalloc's `purge_delay`). The first call wins.
-pub fn heap_purge_delay_by(set: fn(u64)) {
-    _ = HEAP_PURGE_DELAY_SET.set(set);
-}
-
-/// Has the global allocator keep a freed page `millis` before it gives it back, 0 for at once:
-/// what the daemon decides by how much it holds. While it holds little, a page an edit's build
-/// freed is the next edit's without a page fault, and an idle daemon asks for them all back
-/// ([`ask_heap_give_back`]); once it holds much, freed pages go back as they are freed.
-/// Nothing where the delay is already `millis` or the allocator has no such setting.
-pub fn keep_freed_pages_for(millis: u64) {
-    let Some(set) = HEAP_PURGE_DELAY_SET.get() else { return };
-    if HEAP_PURGE_DELAY.swap(millis, Ordering::AcqRel) != millis {
-        set(millis);
-    }
-}
-
-/// Whether the global allocator keeps freed pages a while ([`keep_freed_pages_for`]): then a
-/// build's end leaves its freed pages for the next build, and the idle daemon's give-back or
-/// memory running short takes them.
-pub fn keeps_freed_pages() -> bool {
-    HEAP_PURGE_DELAY.load(Ordering::Acquire) != 0
-}
-
 mod give_back;
 
 pub use give_back::Settle;
