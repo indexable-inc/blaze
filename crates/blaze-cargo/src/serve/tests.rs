@@ -517,6 +517,7 @@ pub(super) fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units 
             said: Vec::new(),
         }),
         warnings: vec![manifest],
+        notes: Vec::new(),
         target_dir: format!("{root}/target"),
         build_dir: format!("{root}/target"),
         finished: FINISHED.into(),

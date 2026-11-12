@@ -289,6 +289,26 @@ fn a_lint_of_the_when_ready_table_is_set_once_its_switch_is_on() {
     assert_eq!(std_use.last().map(|it| it.as_str()), Some("--deny=blaze::std_use"), "{own:?}");
 }
 
+/// Whether `flags`, made from a workspace whose ratchet sets `ratchet` and whose levels table
+/// sets `levels` (each `(lint, level)`), hold the invariant below: no lint only the levels
+/// table names is flagged, and each lint the ratchet sets is last flagged at its level. The
+/// first way they do not.
+fn ratchet_held(ratchet: &[(&str, &str)], levels: &[(&str, &str)], flags: &[String]) -> Result<(), String> {
+    let last = |lint: &str| flags.iter().rev().find(|it| it.ends_with(&format!("=blaze::{lint}")));
+    for (lint, _) in levels.iter().filter(|(lint, _)| !ratchet.iter().any(|(it, _)| it == lint)) {
+        if let Some(flag) = last(lint) {
+            return Err(format!("`{flag}`: `{lint}` is set only by the levels table, read beside a ratchet"));
+        }
+    }
+    for (lint, level) in ratchet {
+        let want = format!("--{level}=blaze::{lint}");
+        if last(lint) != Some(&want) {
+            return Err(format!("the ratchet sets `{lint}` to {level}, and its last flag is {:?}", last(lint)));
+        }
+    }
+    Ok(())
+}
+
 /// The invariant: where a workspace has `[workspace.metadata.blaze.lints-ratchet]`, this blaze
 /// reads its levels in place of `[workspace.metadata.blaze.lints]` (which a released blaze reads)
 /// and after `lints-when-ready`, so the ratchet's level of a lint is the one that holds.
@@ -299,10 +319,12 @@ fn the_ratchet_is_read_in_place_of_the_levels_table() {
         flags::workspace_lints(Some(&toml::Value::Table(toml::from_str(text).unwrap())), manifest)
     };
     let levels = "[blaze.lints]\nhot_alloc = \"warn\"\n";
-    assert_eq!(of(levels).unwrap(), ["--warn=blaze::hot_alloc"], "the control: no ratchet");
+    assert_eq!(of(levels).unwrap(), ["--warn=blaze::hot_alloc"], "with no ratchet, the levels table");
     let ratchet = "[blaze.lints-ratchet]\nbaselines = \"b\"\ninternal = \"deny\"\nhot = \"allow\"\n";
+    let read = of(&format!("{levels}{ratchet}")).unwrap();
+    ratchet_held(&[("internal", "deny"), ("hot", "allow")], &[("hot_alloc", "warn")], &read).unwrap();
     assert_eq!(
-        of(&format!("{levels}{ratchet}")).unwrap(),
+        read,
         ["--deny=blaze::internal", "--allow=blaze::hot"],
         "`lints` is not read beside a ratchet, and `baselines` is no level"
     );
@@ -310,12 +332,89 @@ fn the_ratchet_is_read_in_place_of_the_levels_table() {
         "{ratchet}std_use = \"deny\"\n[blaze.lints-when-ready]\nstd_use = \"warn\"\n"
     ))
     .unwrap();
+    ratchet_held(&[("internal", "deny"), ("hot", "allow"), ("std_use", "deny")], &[], &both).unwrap();
     assert_eq!(both.last().map(String::as_str), Some("--deny=blaze::std_use"), "{both:?}");
     let unknown = of("[blaze.lints-ratchet]\nhot_allocs = \"deny\"\n").unwrap_err();
     assert_eq!(
         unknown.what,
         "[workspace.metadata.blaze.lints-ratchet] in /w/Cargo.toml: `hot_allocs` is no lint or group of blaze's (`blaze::hot_allocs`)"
     );
+}
+
+#[test]
+fn the_oracle_catches_the_levels_table_read_beside_the_ratchet() {
+    // The planted bug: both tables read, the levels table first, as a blaze that merged them.
+    let read = strings(&["--warn=blaze::hot_alloc", "--deny=blaze::internal"]);
+    let why = ratchet_held(&[("internal", "deny")], &[("hot_alloc", "warn")], &read)
+        .expect_err("the oracle missed the levels table read beside a ratchet");
+    assert!(why.contains("`--warn=blaze::hot_alloc`: `hot_alloc` is set only by the levels table"), "{why}");
+}
+
+#[test]
+fn the_oracle_catches_lints_when_ready_read_after_the_ratchet() {
+    // The planted bug: `lints-when-ready` appended after the ratchet, so its level wins.
+    let read = strings(&["--deny=blaze::std_use", "--warn=blaze::std_use"]);
+    let why = ratchet_held(&[("std_use", "deny")], &[], &read)
+        .expect_err("the oracle missed `lints-when-ready` read after the ratchet");
+    assert!(why.contains("the ratchet sets `std_use` to deny, and its last flag is Some(\"--warn=blaze::std_use\")"), "{why}");
+}
+
+/// What a member's ratchet downgrades must be, from the baselines (`(file name, text)`): each
+/// crate a `blaze.<lint>.txt` lists, counted or `unmeasured`, at `--warn=blaze::<lint>`, and
+/// nothing from any other file. The reference the invariant below holds `held` to, its lists
+/// compared as sets; the first difference.
+fn downgrades_held(
+    baselines: &[(&str, &str)],
+    held: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Result<(), String> {
+    let mut want: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    for (name, text) in baselines {
+        let Some(lint) = name.strip_prefix("blaze.").and_then(|it| it.strip_suffix(".txt")) else {
+            continue;
+        };
+        for line in text.lines() {
+            let krate = line.split('\t').next().unwrap_or(line);
+            want.entry(krate.to_owned()).or_default().push(format!("--warn=blaze::{lint}"));
+        }
+    }
+    let sorted = |map: &std::collections::BTreeMap<String, Vec<String>>| {
+        map.iter()
+            .map(|(krate, flags)| {
+                let mut flags = flags.clone();
+                flags.sort();
+                (krate.clone(), flags)
+            })
+            .collect::<Vec<_>>()
+    };
+    let (want, got) = (sorted(&want), sorted(held));
+    match want.iter().zip(&got).find(|(a, b)| a != b) {
+        Some((a, b)) => Err(format!("held {b:?} where the baselines say {a:?}")),
+        None if want.len() != got.len() => Err(format!("held {got:?} where the baselines say {want:?}")),
+        None => Ok(()),
+    }
+}
+
+#[test]
+fn the_oracle_catches_an_unmeasured_crate_dropped_from_the_downgrades() {
+    let baselines = [("blaze.std_use.txt", "a\tunmeasured\nb\t3\n"), ("clippy.disallowed_types.txt", "c\t1\n")];
+    // The planted bug: `unmeasured` read as no count, so its crate is held at nothing.
+    let held = [("b".to_owned(), strings(&["--warn=blaze::std_use"]))].into_iter().collect();
+    let why = downgrades_held(&baselines, &held).expect_err("the oracle missed an unmeasured crate dropped");
+    assert!(why.contains("\"a\""), "{why}");
+}
+
+#[test]
+fn the_oracle_catches_a_crate_held_from_a_clippy_baseline() {
+    let baselines = [("blaze.std_use.txt", "b\t3\n"), ("clippy.disallowed_types.txt", "c\t1\n")];
+    // The planted bug: every baseline file read, a clippy lint's too.
+    let held = [
+        ("b".to_owned(), strings(&["--warn=blaze::std_use"])),
+        ("c".to_owned(), strings(&["--warn=blaze::disallowed_types"])),
+    ]
+    .into_iter()
+    .collect();
+    let why = downgrades_held(&baselines, &held).expect_err("the oracle missed a crate held from clippy's baseline");
+    assert!(why.contains("disallowed_types"), "{why}");
 }
 
 /// The invariant: a member is held at `warn` on exactly the blaze lints whose baseline lists
@@ -335,12 +434,21 @@ fn a_crate_its_baseline_lists_is_held_at_warn_and_no_other() {
     dir.write("b/blaze.wall_clock.txt", "a\t1\n");
     dir.write("b/clippy.disallowed_types.txt", "c\t1\n");
     let held = of(&ratchet).unwrap();
+    downgrades_held(
+        &[
+            ("blaze.std_use.txt", "a\tunmeasured\nb\t3\n"),
+            ("blaze.wall_clock.txt", "a\t1\n"),
+            ("clippy.disallowed_types.txt", "c\t1\n"),
+        ],
+        &held,
+    )
+    .unwrap();
     let wanted: Vec<(String, Vec<String>)> = vec![
         ("a".to_owned(), strings(&["--warn=blaze::std_use", "--warn=blaze::wall_clock"])),
         ("b".to_owned(), strings(&["--warn=blaze::std_use"])),
     ];
     assert_eq!(held.into_iter().collect::<Vec<_>>(), wanted);
-    // The control: a crate's line gone, it is held at nothing.
+    // A crate's line gone, it is held at nothing.
     dir.write("b/blaze.wall_clock.txt", "");
     assert_eq!(of(&ratchet).unwrap().get("a"), Some(&strings(&["--warn=blaze::std_use"])));
     assert!(of(&metadata("[blaze.lints]\ninternal = \"warn\"\n")).unwrap().is_empty());

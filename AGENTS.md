@@ -16,9 +16,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 
 1. **no-rustc**: blaze never runs rustc, rustdoc or a cargo that runs them; each place that still does
    is a bug to remove, never to extend. Skill: `compiler-correctness`.
-2. **blaze-builds-blaze**: Build, check, test, bench and release blaze only with blaze, never cargo,
-   rustc or sccache, anywhere (dev loop, CI, harnesses, release); stage 0 is a blaze binary; when
-   blaze fails on blaze, that failure is the work. Skill: `build-and-test`.
+2. **blaze-builds-blaze**: Until blaze builds blaze fast, cargo with the pinned nightly is the dev-loop
+   builder of blaze (check, build, unit tests), and the tree stays accepted by both; blaze still
+   builds blaze as the proof, every verdict about blaze's behaviour comes from a blaze, and when
+   blaze fails on blaze that failure is still the work. Skill: `build-and-test`.
 3. **no-fallback**: No fallback, ever, and failures are loud: when blaze can't do something it stops
    with an error naming what and where; nothing is accepted and ignored, skipped quietly or answered
    with an empty result. Skill: `runtime-code`.
@@ -46,9 +47,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 13. **fix-through-blaze-lints**: Move a type, path, API or idiom across the code with a `.clippy.toml`
     ban and `blaze check --fix` (or `blaze check --replace A=B`), by name resolution, never by text.
     Skill: `changing-code`.
-14. **sans-io-cores**: Every core is a synchronous state machine on an injected clock that owns no IO,
-    marked `#![blaze::sans_io]` so the lint enforces it; drivers do the IO and stay thin. Skill:
-    `runtime-code`.
+14. **sans-io-cores**: Everything is sans-IO: all logic lives in synchronous state machines on an
+    injected clock that own no IO, marked `#![blaze::sans_io]` so the lint enforces it, with thin
+    drivers doing the IO; code that is not is not done, so convert it when you meet it, unasked, run
+    the real code under simulation and delete the fake that stood in for it. Skill: `runtime-code`.
 15. **every-wait-says-what**: Every blocking wait opens a span naming what it waits for. Skill:
     `runtime-code`.
 16. **slow-is-p0-traced**: Anything slow is a P0 until a span names it; the trace comes before the speed
@@ -93,8 +95,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     deterministic CBOR. Skill: `docs-and-scripts`.
 34. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run on the Mac or in an ix VM, never
     on AWS. Skill: `build-and-test`.
-35. **fan-out-write-only**: Subagents only write code; the main agent applies all of it to one tree and
-    runs `blaze check` and `blaze test` once. Skill: `build-and-test`.
+35. **fan-out-write-only**: One tree, one VM, one run: lanes only write code and push it to their
+    branch; the main agent merges every lane's branch into the one integration tree on the one build
+    VM, builds it once, and runs every check that makes sense on that one binary, then hands each
+    failure back to the lane that owns the code. Skill: `build-and-test`.
 36. **worktree-per-lane**: One uniquely named worktree per lane; never `git stash`. Skill:
     `build-and-test`.
 37. **land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`;
@@ -124,8 +128,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 47. **every-agent-has-a-task**: Every agent is started on one task (an objective id or a named piece of
     one) that says its outcome and its check; people follow tasks, not agents. Skill:
     `build-and-test`.
-48. **agents-are-a-cost**: Use the fewest agents that do the work: a worker only for a piece that is
-    independent and large enough to pay for its context; four is a lot. Skill: `build-and-test`.
+48. **agents-are-a-cost**: Run every independent, large piece of the work at once, each in its own lane;
+    never an agent for a piece that is small, dependent on another, or only reading. Skill:
+    `build-and-test`.
 49. **docs-stay-small**: Keep docs few and short: the plan, the ledger, the bounds and one spec per
     unbuilt design; no lane notes, pass reports or indexes; delete a doc when it stops being true or
     needed. Skill: `docs-and-scripts`.
@@ -142,9 +147,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     invariant:` or `/// The refinement:` on its test) and raise its level of evidence as needed:
     tested, simulated, model-checked, proved in Lean; `scripts/src/bin/invariants.rs` lists them and
     the gate holds each to its control. Skill: `testing`.
-54. **guard-the-cause**: When you find bad code or a bad decision, find why it was made and remove that
-    cause with a guard (a lint, a check in the gate, a rule or a skill's instruction), so it cannot
-    be written again; do this unasked. Skill: `changing-code`.
+54. **guard-the-cause**: For every issue or annoyance, however small, ask why until you reach the core
+    reason (about five whys), name the whole class of problem it belongs to, change the architecture
+    so that class cannot happen, and build that change, unasked; a guard (a lint, a gate check, a
+    rule) is the least, not the goal. Skill: `changing-code`.
 55. **own-the-language**: blaze owns its compiler and is its own first user: never design around what
     Rust lacks; when code would be clearer, safer or zero-cost with a language feature Rust has not
     stabilized or does not have (const generic expressions, for one), build it properly in blaze as
@@ -166,6 +172,20 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     (no-op, comment, body edit, first edit, edit after restart, memory while warm); design so cold
     builds can be fast too, but do not spend on them ahead of incremental for now. Skill:
     `perf-and-tracing`.
+61. **claims-from-evidence**: State as fact only what a tool call in this session showed (a query's
+    rows, a command's output, the code read); anything else is said as a guess or as not measured,
+    never as a cause, a number or a status. Skill: `debugging`.
+62. **sota-first**: Go for the state of the art right away: design the end state and build it directly,
+    all its independent pieces in parallel, not a step-by-step climb through halfway versions; then
+    prove it on the real targets. Skill: `changing-code`.
+63. **agents-json**: `agents.json` (at the top of the repository) is what agents here have learned: read
+    it before starting, do a task the way its `howto` says, and add to it as you work, with who you
+    are: an `annoyances` row for whatever slows, surprises or annoys you, however slightly, and a
+    `howto` row when you find the right way to do something. Skill: `changing-code`.
+64. **simulate-first**: A test of anything stateful, incremental, concurrent or durable runs in the
+    deterministic simulation by default, in process, under many seeds; a real process, daemon or
+    kernel is used only for what the simulation cannot model, and a part that cannot run under
+    simulation is a sans-IO gap to close. Skill: `testing`.
 
 ## Code Review Rules
 

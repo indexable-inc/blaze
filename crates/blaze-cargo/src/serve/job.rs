@@ -5368,6 +5368,11 @@ impl<S: Steps> Jobs<S> {
         for warning in &units.warnings {
             w.said.push(Said::Report(id, Response::Diagnostic(warned(warning))));
         }
+        for note in &units.notes {
+            // alloc: a note of the load, once per plan that has one
+            let note = Diagnostic::note(note.to_owned());
+            w.said.push(Said::Report(id, Response::Diagnostic(note)));
+        }
         // `blaze lock` stops here: its plan wrote the lock files; nothing is lowered or built. The
         // job finishes once those writes are placed ([`Jobs::wind_up`]).
         if self.jobs.get(key_of(id)).is_some_and(|job| matches!(job.work, Work::Lock(_))) {

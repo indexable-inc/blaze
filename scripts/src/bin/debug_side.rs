@@ -19,6 +19,7 @@ use blaze_script::{
     expect, fail,
     input::{self, Fields, Input, InputError},
     pyfmt::{repr_bytes, repr_str},
+    pypath::rglob,
     pystr::splitlines,
     regex::Regex,
     report::{Number, Report, Verdict},
@@ -320,26 +321,6 @@ fn same_build(exe: &[u8], side: &[u8]) -> Result<String, Fault> {
     Ok(String::new())
 }
 
-/// Every path under `top` named `name`, as `top.rglob(name)` walks (into no symlinked
-/// directory), that is a file.
-fn rglob_files(top: &Path, name: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut dirs = vec![top.to_path_buf()];
-    while let Some(dir) = dirs.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if entry.file_type().is_ok_and(|it| it.is_dir()) {
-                dirs.push(path.clone());
-            }
-            if entry.file_name() == name && path.is_file() {
-                out.push(path);
-            }
-        }
-    }
-    out
-}
-
 /// `blaze build` of the program with `manifest`, with an empty home and a daemon of its own,
 /// then the program run with a backtrace.
 fn build(eng: &Engine, top: &Path, label: &str, manifest: &str) -> Result<Built, Fault> {
@@ -366,8 +347,9 @@ fn build(eng: &Engine, top: &Path, label: &str, manifest: &str) -> Result<Built,
     // what is raised.
     eng.stop(&tree, &env)?;
     let target = built?;
-    let mut found: Vec<PathBuf> = rglob_files(&target, "debugside")
+    let mut found: Vec<PathBuf> = rglob(&target, |name| name == "debugside")
         .into_iter()
+        .filter(|path| path.is_file())
         .filter(|path| {
             let parts: Vec<_> = path.components().map(|it| it.as_os_str().to_owned()).collect();
             // `"debug" in path.parts`: any part of the whole path, as the Python looks.

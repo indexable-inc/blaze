@@ -6,6 +6,7 @@ import { UiTree, interval } from './tree.ts';
 import type { UiNode } from './tree.ts';
 import { currentTask, inTask, taskCall, taskCount, type Task } from '../tasks.ts';
 import { req } from '../daemon.ts';
+import { tellAgent } from '../tell.ts';
 
 /*
  * What a cell is handed for UI: the element components (`Column`, `Text`, ...), `render`, `svelte` (a template tag compile.ts expands
@@ -111,16 +112,6 @@ export function show(t: Task, component: unknown, props: Record<string, unknown>
  * answer given after the agent stopped waiting reaches it, and wakes it. With no session (a kernel run by hand) or no daemon
  * it is only in the cell's logs.
  */
-function tellAgent(t: Task, text: string) {
-  t.logs.push(`[ask] ${text}`);
-  t.touch();
-  const sid = process.env.HARNESS_SESSION;
-  if (!sid) return;
-  req({ op: 'rpc', id: `s${sid}`, method: 'prompt', args: { text, submit: true } }).catch((error) => {
-    t.logs.push(`[ask] that answer could not be sent to the agent: ${error instanceof Error ? error.message : String(error)}`);
-    t.touch();
-  });
-}
 
 /**
  * `ask(text, {options, default, detail, allowText, block})` (ask.ts): the question goes below what the calling cell shows, drawn

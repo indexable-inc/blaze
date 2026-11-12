@@ -227,6 +227,33 @@ impl Profiles {
         maker.get_profile(None, true, false)
     }
 
+    /// blaze: each `strip` the requested profile sets that asks for something stripped, as
+    /// where it is set and its value as the manifest writes it (`true`, `"symbols"`): the
+    /// profile, then its `build-override`, then its package overrides by spec. Its `inherits`
+    /// chain and the config's profiles are merged in, as every unit's profile has them; `false`
+    /// and `"none"` ask for nothing, so they are not here.
+    pub fn strips(&self) -> Vec<(String, String)> {
+        let name = &self.requested_profile;
+        let Some(toml) = self.by_name.get(name).and_then(|it| it.toml.as_ref()) else {
+            return Vec::new();
+        };
+        let mut strips = Vec::new(); // alloc: a few settings, once per load
+        let mut said = |at: String, strip: Option<&StringOrBool>| match strip {
+            None | Some(StringOrBool::Bool(false)) => {}
+            Some(StringOrBool::String(it)) if it == "none" => {}
+            Some(StringOrBool::Bool(true)) => strips.push((at, "true".to_owned())),
+            Some(StringOrBool::String(it)) => strips.push((at, format!("\"{it}\""))),
+        };
+        said(format!("profile `{name}`"), toml.strip.as_ref());
+        if let Some(it) = &toml.build_override {
+            said(format!("profile `{name}`'s `build-override`"), it.strip.as_ref());
+        }
+        for (spec, it) in toml.package.iter().flatten() {
+            said(format!("profile `{name}`'s override of package `{spec}`"), it.strip.as_ref());
+        }
+        strips
+    }
+
     /// The directory under the target directory, like `debug` or `release`.
     pub fn get_dir_name(&self) -> &str {
         self.dir_names.get(&self.requested_profile).unwrap_or(&self.requested_profile)

@@ -302,6 +302,7 @@ fn one_package_plans_its_library_and_binary_with_the_standard_library() {
     assert!(!units.target_dir.starts_with("/home/u/ws/"));
     assert_eq!(units.finished, "`dev` profile [unoptimized + debuginfo]");
     assert!(units.warnings.is_empty(), "{:?}", units.warnings);
+    assert!(units.notes.is_empty(), "{:?}", units.notes);
     let lock = units.lock.as_ref().and_then(|it| it.file("Cargo.lock")).expect("a new lock file");
     assert_eq!(lock.path, "/home/u/ws/Cargo.lock");
     assert_eq!(lock.text, format!("{HEADER}\n[[package]]\nname = \"a\"\nversion = \"0.1.0\"\n"));
@@ -443,6 +444,54 @@ fn std_panic_abort_aborts_by_its_profile_not_its_rustflags() {
     assert_eq!(unit.profile.rustflags, ["-Cpanic=abort"]);
     let plan = &units.plans[at];
     assert!(!plan.rustflags.iter().any(|it| it.contains("panic")), "{plan:?}");
+}
+
+// A `strip` blaze accepts and does not honour yet (ledger D44) is said on every build that sets
+// it, one named note per setting, the inherited one included, and nothing for `strip = false`.
+// Not a refusal: real projects set it.
+#[test]
+fn a_strip_blaze_does_not_honour_is_a_note_on_every_build_that_sets_it() {
+    let fixture = Fixture::new();
+    let notes = |manifest: &str| {
+        let files = [("ws/Cargo.toml", manifest), ("ws/src/main.rs", "fn main() {}\n")];
+        ready(fixture.plan(fixture.open(&ask(&files)))).notes
+    };
+    let not_yet = "blaze accepts it and does not strip yet: its linker writes the symbol table \
+                   and debug info all the same (ledger D44)";
+    assert_eq!(
+        notes(&format!(
+            "{A}\n[profile.dev]\nstrip = true\n[profile.dev.build-override]\nstrip = \"debuginfo\"\n"
+        )),
+        [
+            format!("profile `dev` sets `strip = true`: {not_yet}"),
+            format!("profile `dev`'s `build-override` sets `strip = \"debuginfo\"`: {not_yet}"),
+        ]
+    );
+    assert_eq!(notes(&format!("{A}\n[profile.dev]\nstrip = false\n")), Vec::<String>::new());
+    assert_eq!(notes(&format!("{A}\n[profile.release]\nstrip = \"symbols\"\n")), Vec::<String>::new(), "another profile's");
+    let files = [("ws/Cargo.toml", A), ("ws/src/main.rs", "fn main() {}\n")];
+    let view = fixture.open(&Ask { env: &[("RUSTFLAGS", "-Cstrip=symbols")], ..ask(&files) });
+    assert_eq!(ready(fixture.plan(view)).notes, [format!("the rustflags pass `-C strip=symbols`: {not_yet}")]);
+}
+
+#[test]
+fn a_strip_in_the_rustflags_is_one_note_per_value() {
+    let flags = |words: &[&str]| words.iter().map(|it| (*it).to_owned()).collect::<Vec<String>>();
+    let (a, b, c) = (
+        flags(&["-C", "strip=symbols", "-Copt-level=1"]),
+        flags(&["-Cstrip=symbols", "--codegen=strip=debuginfo"]),
+        flags(&["-C", "strip=none", "--codegen", "opt-level=2"]),
+    );
+    let notes = super::units::strip_notes(&[], [a.as_slice(), b.as_slice(), c.as_slice()]);
+    let not_yet = "blaze accepts it and does not strip yet: its linker writes the symbol table \
+                   and debug info all the same (ledger D44)";
+    assert_eq!(
+        notes,
+        [
+            format!("the rustflags pass `-C strip=debuginfo`: {not_yet}"),
+            format!("the rustflags pass `-C strip=symbols`: {not_yet}"),
+        ]
+    );
 }
 
 // The standard library is built to unwind whatever the profile's `panic`, as the toolchain's
@@ -1127,7 +1176,7 @@ impl Query for HostMacros {
     const KIND: blaze_query::QueryKind = blaze_query::QueryKind(0x63f3);
     const NAME: &'static str = "cargo test plan with host macros";
     const PRODUCER: ContentId =
-        crate::query::producer("blaze v2 cargo test plan with host macros 1");
+        crate::query::producer("blaze v2 cargo test plan with host macros 2");
     type Key = ();
     type Value = crate::query::Cbor<Planned>;
 
@@ -1151,6 +1200,7 @@ impl Query for HostMacros {
                 packages: built.packages,
                 lock: built.lock,
                 warnings: built.warnings,
+                notes: built.notes,
                 target_dir: built.target_dir,
                 build_dir: built.build_dir,
                 finished: built.finished,
