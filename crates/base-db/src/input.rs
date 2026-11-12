@@ -983,12 +983,69 @@ impl Crate {
         env: &Env,
         lints: &LintOptions,
     ) -> ContentId {
-        let mut hasher = Hasher::new(Crate::DOMAIN);
-        hasher.part(&content::path_key(root));
+        let as_it_is = |bytes: &[u8]| -> Vec<u8> { bytes.to_vec() }; // alloc: a path, once per crate content ID (setup)
+        Crate::content_with(
+            Crate::DOMAIN,
+            root,
+            data,
+            extra,
+            workspace,
+            cfg,
+            env,
+            lints,
+            &as_it_is,
+            &|dep| dep.content(db),
+        )
+    }
+
+    /// The domain of [`Crate::ported_content`].
+    pub const PORTED_DOMAIN: &'static str = "blaze v2 crate ported 1";
+
+    /// [`Crate::content`] with every path it holds written as the database's portable keys
+    /// write paths ([`crate::Files::ported`]: its root file's path, the directory its proc
+    /// macros run in, each variable's value), and each crate it depends on as `dep` gives it
+    /// (its own ported content, the caller's memo). Everything else as the content ID has it,
+    /// from the one function both are made by ([`Crate::content_with`]), so a field one covers
+    /// the other does. What a key that must be the same for the same sources in another
+    /// directory holds of a crate's settings (docs/v2/plan/design/store.md, "Content keys");
+    /// what reads a path's own bytes (`env!("CARGO_MANIFEST_DIR")`) is the reader's to key.
+    pub fn ported_content(self, db: &Db, dep: &dyn Fn(Crate) -> ContentId) -> ContentId {
+        let data = self.data(db);
+        let files = db.files();
+        Crate::content_with(
+            Crate::PORTED_DOMAIN,
+            root_path(db, data.root_file_id),
+            data,
+            self.extra_data(db),
+            self.workspace_data(db),
+            self.cfg_options(db),
+            self.env(db),
+            self.lint_options(db),
+            &|bytes| files.ported(bytes).into_owned(), // alloc: a path, once per crate's ported content
+            dep,
+        )
+    }
+
+    /// What [`Crate::content_of`] and [`Crate::ported_content`] hash: `text` writes what may
+    /// hold a path, `dep` gives each crate depended on.
+    fn content_with(
+        domain: &'static str,
+        root: &VfsPath,
+        data: &BuiltCrateData,
+        extra: &ExtraCrateData,
+        workspace: &CrateWorkspaceData,
+        cfg: &CfgOptions,
+        env: &Env,
+        lints: &LintOptions,
+        text: &dyn Fn(&[u8]) -> Vec<u8>,
+        dep_content: &dyn Fn(Crate) -> ContentId,
+    ) -> ContentId {
+        let mut hasher = Hasher::new(domain);
+        hasher.part(&text(&content::path_key(root)));
         hasher.update(&(data.edition.number() as u64).to_le_bytes());
         content::len(&mut hasher, data.dependencies.len());
         for dep in &data.dependencies {
-            hasher.id(&dep.crate_id.content(db)).part(dep.name.as_str().as_bytes()).update(&[
+            hasher.id(&dep_content(dep.crate_id)).part(dep.name.as_str().as_bytes()).update(&[
                 dep.prelude as u8,
                 dep.sysroot as u8,
                 dep.private as u8,
@@ -1001,7 +1058,7 @@ impl Crate {
         }
         hasher
             .update(&[data.target_kind.tag(), data.manifest_kind.tag(), data.crate_types.bits()])
-            .part(data.proc_macro_cwd.as_str().as_bytes())
+            .part(&text(data.proc_macro_cwd.as_str().as_bytes()))
             .opt_part(extra.version.as_deref());
         match &extra.display_name {
             None => hasher.update(&[0]),
@@ -1017,9 +1074,9 @@ impl Crate {
         extra.built_for.hash_into(&mut hasher);
         content::len(&mut hasher, extra.build_script_runs.len());
         for run in &extra.build_script_runs {
-            hasher.part(run.as_bytes());
+            hasher.part(&text(run.as_bytes()));
         }
-        hasher.id(&workspace.content()).id(&cfg_options_content(cfg)).id(&env.content());
+        hasher.id(&workspace.content()).id(&cfg_options_content(cfg)).id(&env.content_with(text));
         content::len(&mut hasher, lints.opts.len());
         for (lint, level) in &lints.opts {
             hasher.part(lint.as_bytes()).update(&[*level as u8]);
@@ -1952,13 +2009,19 @@ impl Env {
 
     /// Of its variables sorted by name, each as its name and value.
     pub fn content(&self) -> ContentId {
+        self.content_with(&|value| value.to_vec()) // alloc: a value, once per crate content ID (setup)
+    }
+
+    /// [`Env::content`] with each value as `text` writes it (a portable key's paths,
+    /// [`Crate::ported_content`]).
+    pub fn content_with(&self, text: &dyn Fn(&[u8]) -> Vec<u8>) -> ContentId {
         // alloc: an env's variables sorted, once per crate content ID (setup).
         let mut entries: Vec<_> = self.entries.iter().collect();
         entries.sort_unstable();
         let mut hasher = Hasher::new(Env::DOMAIN);
         content::len(&mut hasher, entries.len());
         for (key, value) in entries {
-            hasher.part(key.as_bytes()).part(value.as_bytes());
+            hasher.part(key.as_bytes()).part(&text(value.as_bytes()));
         }
         hasher.finish()
     }

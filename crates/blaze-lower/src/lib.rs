@@ -1002,6 +1002,16 @@ impl Lowered {
         self.crates.units.get(unit).map_or("", |it| it.what.as_str())
     }
 
+    /// Tells the front end how its portable keys write paths ([`base_db::Port`]), once a
+    /// database and before any identity is asked ([`Lowered::identity`],
+    /// [`Lowered::narrowed`]): each unit's identity then holds its crate's paths against the
+    /// directories the port names, and is the same for the same sources wherever those are.
+    /// Told again (a kept front end a later build lowers into), the first stays: one database
+    /// is one checkout's under one home, whose directories do not move.
+    pub fn set_port(&self, port: std::sync::Arc<dyn base_db::Port>) {
+        let _ = self.db.files().set_port(port);
+    }
+
     /// What every task reads: each unit's crate. Made once by [`lower`] and never written.
     pub fn crates(&self) -> &std::sync::Arc<Crates> {
         &self.crates
@@ -1261,13 +1271,13 @@ impl Lowered {
         let data = krate.data(db);
         let root_file = data.root_file_id;
         let root = db.source_root(db.file_source_root(root_file).source_root_id(db));
-        let settings = krate.content(db);
+        let settings = code::ported_crate(db, krate);
         let alone = code::root_alone(db, krate);
         let mut hasher = Hasher::new(IDENTITY);
         hasher.id(&settings).id(&db.file_text(root_file).content(db));
         match alone {
             true => hasher.update(ROOT_ALONE),
-            false => hasher.id(&root.content(db)),
+            false => hasher.id(&code::ported_files(db, krate)),
         };
         let mut spelled = Hasher::new(IDENTITY_PART);
         match self.spellings.of(krate) {
@@ -1279,8 +1289,7 @@ impl Lowered {
                 hasher.update(&[1]);
                 spelled.update(&[1]);
                 for text in [&spelling.dir, &spelling.passed] {
-                    hasher.update(&(text.len() as u64).to_le_bytes());
-                    hasher.update(text.as_bytes());
+                    hasher.part(&db.files().ported(text.as_bytes()));
                     spelled.part(text.as_bytes());
                 }
             }
@@ -1822,7 +1831,10 @@ fn canonical_run<'a>(crates: &Crates, run: usize, ran: &'a Ran) -> Cow<'a, Ran> 
 const INCLUDED_MOVED: Trigger<'static> =
     Trigger::named("files include_bytes! or include_str! read moved on disk");
 
-const IDENTITY: &str = "blaze v2 cargo unit identity 5";
+/// 6: a crate's settings, its files' paths and how cargo passes its root are written as a
+/// portable key writes paths ([`base_db::Files::ported`]), so the identity does not say where
+/// the checkout, its build directory or the machine's shared directories are.
+const IDENTITY: &str = "blaze v2 cargo unit identity 6";
 
 /// The domain of a part of an identity hashed alone ([`Lowered::identity_parts`]).
 const IDENTITY_PART: &str = "blaze v2 cargo unit identity part 1";
@@ -1894,9 +1906,9 @@ struct Narrow {
     extends: bool,
 }
 
-const NARROW_CODE: &str = "blaze v2 cargo unit narrow code 1";
-const NARROW_INTERFACE: &str = "blaze v2 cargo unit narrow interface 1";
-const NARROW_CHECKED: &str = "blaze v2 cargo unit narrow checked 1";
+const NARROW_CODE: &str = "blaze v2 cargo unit narrow code 2";
+const NARROW_INTERFACE: &str = "blaze v2 cargo unit narrow interface 2";
+const NARROW_CHECKED: &str = "blaze v2 cargo unit narrow checked 2";
 
 /// [`Lowered::narrowed`] of `krate`, each crate of its closure worked out once into `known`,
 /// dependencies first, with a stack of its own; `whole` holds the whole identity
@@ -1956,7 +1968,7 @@ fn narrow_of(
                 Some(spelling) => {
                     hasher.update(&[1]);
                     for text in [&spelling.dir, &spelling.passed] {
-                        hasher.part(text.as_bytes());
+                        hasher.part(&db.files().ported(text.as_bytes()));
                     }
                 }
             }
@@ -2020,15 +2032,17 @@ fn identity_of(
             );
             continue;
         }
-        let root = db.file_source_root(data.root_file_id).source_root_id(db);
+        // Its settings and its files' paths as a portable key writes them
+        // ([`code::ported_crate`], [`code::ported_files`]): the same sources in another
+        // directory, under another home or on another machine are the same identity.
         let mut hasher = Hasher::new(IDENTITY);
-        hasher.id(&at.content(db)).id(&db.file_text(data.root_file_id).content(db));
+        hasher.id(&code::ported_crate(db, at)).id(&db.file_text(data.root_file_id).content(db));
         // The files of its source root, unless its root file proves it can read none of them
         // but itself ([`code::root_alone`]): then the root's text above is all of them it is
         // made from, and an edit of another target's source in the package leaves it as it was.
         match code::root_alone(db, at) {
             true => hasher.update(ROOT_ALONE),
-            false => hasher.id(&db.source_root(root).content(db)),
+            false => hasher.id(&code::ported_files(db, at)),
         };
         // How rustc names the crate's files, which its code says (`file!()`, panic locations).
         match spellings.of(at) {
@@ -2038,8 +2052,7 @@ fn identity_of(
             Some(spelling) => {
                 hasher.update(&[1]);
                 for text in [&spelling.dir, &spelling.passed] {
-                    hasher.update(&(text.len() as u64).to_le_bytes());
-                    hasher.update(text.as_bytes());
+                    hasher.part(&db.files().ported(text.as_bytes()));
                 }
             }
         }

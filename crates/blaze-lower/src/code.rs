@@ -80,7 +80,49 @@ const OWN_CODE: &str = "blaze v2 crate own code 1";
 const CODE_TEXT: &str = "blaze v2 file code text 3";
 /// 2: as [`CODE_TEXT`] 3.
 const INTERFACE_TEXT: &str = "blaze v2 file interface text 2";
-const OWN_NARROW: &str = "blaze v2 crate own narrow 1";
+/// 2: the crate's settings and its files' paths as a portable key writes them
+/// ([`ported_crate`], [`base_db::Files::ported`]).
+const OWN_NARROW: &str = "blaze v2 crate own narrow 2";
+const PORTED_FILES: &str = "blaze v2 crate ported files 1";
+
+/// `krate`'s settings as a portable key holds them ([`Crate::ported_content`]), each crate it
+/// depends on by its own: the database's memo, so a crate's is made once and made again only
+/// when a setting of its closure moved. The directories a path is written against are told
+/// the database once, before any key is asked ([`base_db::Files::set_port`]), and are not an
+/// input: a database is one checkout's under one home.
+#[blaze_query::tracked(returns(copy))]
+pub(crate) fn ported_crate(db: &Db, krate: Crate) -> ContentId {
+    krate.ported_content(db, &|dep| ported_crate(db, dep))
+}
+
+/// The files of `krate`'s source root as a portable key holds them: what
+/// [`base_db::SourceRoot::content`] is of (whether it is a library's, and each file's path
+/// and content ID), each path as [`base_db::Files::ported`] writes it and in that order. A
+/// file with no path on disk is its own name, as the source root has it.
+#[blaze_query::tracked(returns(copy))]
+pub(crate) fn ported_files(db: &Db, krate: Crate) -> ContentId {
+    let root_file = krate.data(db).root_file_id;
+    let root = db.source_root(db.file_source_root(root_file).source_root_id(db));
+    let set = root.source_root_ref(db);
+    // alloc: once per crate whose source root's files moved, a file each
+    let mut files: Vec<(Vec<u8>, ContentId)> = set
+        .iter()
+        .map(|file| {
+            let path = match set.path_for_file(&file) {
+                Some(path) => path.to_string(), // alloc: as above
+                None => String::new(),          // alloc: none
+            };
+            (db.files().ported(path.as_bytes()).into_owned(), db.file_content(file))
+        })
+        .collect();
+    files.sort_unstable();
+    let mut hasher = Hasher::new(PORTED_FILES);
+    hasher.update(&[u8::from(set.is_library)]).update(&(files.len() as u64).to_le_bytes());
+    for (path, content) in &files {
+        hasher.part(path).id(content);
+    }
+    hasher.finish()
+}
 
 /// What of a file its crate's code can observe ([`code_text`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -591,8 +633,11 @@ fn narrow_from(
     // source root's files.
     let Some(root_text) = text_of(root_file) else { return whole };
     let alone = alone();
+    // Each file by its path as a portable key writes it ([`base_db::Files::ported`]), and in
+    // that path's order: the same files in another checkout hash alike, in the same order,
+    // wherever the checkout and its build directory are.
     // alloc: once per workspace crate keyed in a revision, a file of its source root each
-    let mut files: Vec<(&str, base_db::FileId, Option<CodeText>)> = Vec::new();
+    let mut files: Vec<(std::borrow::Cow<'_, [u8]>, base_db::FileId, Option<CodeText>)> = Vec::new();
     if !alone {
         for file in set.iter() {
             let Some(path) =
@@ -604,9 +649,9 @@ fn narrow_from(
                 true => text_of(file),
                 false => None,
             };
-            files.push((path, file, code));
+            files.push((db.files().ported(path.as_bytes()), file, code));
         }
-        files.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     }
     let texts = || std::iter::once(root_text).chain(files.iter().filter_map(|it| it.2));
     let extends = texts().any(|it| it.extends);
@@ -625,7 +670,7 @@ fn narrow_from(
         };
         let mut hasher = Hasher::new(OWN_NARROW);
         hasher
-            .id(&krate.content(db))
+            .id(&ported_crate(db, krate))
             .update(&[u8::from(interface), u8::from(strict), u8::from(alone)])
             .id(&pick(&root_text))
             .opt_part(db.file_text(root_file).appended_root_module(db));
@@ -635,7 +680,7 @@ fn narrow_from(
                 true => db.file_text(*file).appended_root_module(db),
                 false => None,
             };
-            hasher.part(path.as_bytes()).opt_part(appended);
+            hasher.part(path).opt_part(appended);
             match code {
                 Some(code) => hasher.update(&[1]).id(&pick(code)),
                 None => hasher.update(&[0]).id(&db.file_content(*file)),

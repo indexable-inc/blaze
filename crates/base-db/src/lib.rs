@@ -38,7 +38,7 @@ pub use crate::{
     },
     db::{Db, Reader, RunOrder, Shared, executions, set_run_order},
     editioned_file_id::EditionedFileId,
-    files::{AliasError, ExpansionRead, Files, ReadBy},
+    files::{AliasError, ExpansionRead, Files, Port, ReadBy},
     input::{
         BuiltCrateData, BuiltDependency, BuiltFor, Crate, CrateBuilder, CrateBuilderId,
         CrateDataBuilder, CrateDisplayName, CrateGraphBuilder, CrateName, CrateNamed, CrateOrigin,

@@ -42,6 +42,7 @@ mod intent;
 mod layout;
 mod memo;
 mod perf;
+mod portable;
 mod reach;
 mod reads;
 pub(super) mod release;
@@ -396,7 +397,17 @@ impl Steps for Real {
                     }
                     None => (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new()),
                 };
-                // Before any key is resolved: two crates of one key would take each other's items.
+                // How the front end's identities write paths, told before any is asked: against
+                // the build's directories ([`portable::Places`]), so a unit's record key does
+                // not say where the checkout, its build directory or the machine's are.
+                lowered.set_port(std::sync::Arc::new(portable::Places::new(
+                    &input.config.invocation.root,
+                    &input.units.target_dir,
+                    &input.config.std,
+                    &self.shared.tools,
+                    &self.shared.launcher,
+                )));
+                                // Before any key is resolved: two crates of one key would take each other's items.
                 blaze_items::key::check_crate_keys(lowered.db()).map_err(|clash| {
                     Failed::Error(ApiError::new(format!("blaze-items: {clash}"), None))
                 })?; // alloc: an error, once
