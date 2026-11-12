@@ -256,7 +256,7 @@ moved a row by 2 to 6 times until taken out, `agents.json` memstrat-h1):
 | c | the pool's give-back has callers: one lap of the sweep each 30 s of idleness, every unpinned page at the limit's line and on a pressure event | the pool's pages of an idle daemon go (66 MiB to 0 after 60 s); no row moves | built |
 | b0 | a library's rows not kept as readers (lane records-1111's shed, `2b173f8632`) | 100 MiB live less | measured here, left off: a comment edit 20.0 to 34.7 ms |
 | b1 | a sealed crate's tables (`Resolutions`, `ImplSlices`, the crate graph, source roots) as `HIGH` leaves apart from the workspace's; then its rows keep no edges | library rows at `HIGH` (181,865 of 2.1 million today); 320 MiB live less | not built |
-| b2 | def maps and impl tables read in place; name resolution's state dropped for a sealed crate | 470 MiB less; under 2 GB | not built |
+| b2 | def maps and impl tables read in place; name resolution's state dropped for a sealed crate | 470 MiB less; under 2 GB | def maps: written, behind `BLAZE_DEF_MAP_PAGES=1`, not yet compiled or measured ("Def maps read in place", below); impl tables not built |
 | b3 | syntax, item trees and expansions of a sealed crate not held; signatures not memoized | 660 MiB less; under 1 GB | not built |
 | b4 | link and codegen tables as records | 400 MiB less; under 500 MB | not built (the engine's edit path is another lane's) |
 | d | restart and cold start read records: F2 and R8, then R7 | first no-op after a restart under 300 ms; then an idle daemon may drop to the budget | not built |
@@ -297,6 +297,78 @@ what follows if the growth stays).
 Tried and left out, each built and measured: a purge delay under mimalloc (300 MB more held,
 no row faster); the flight recorder's read room by bytes (the `profile` holder 64 to 76 MiB to
 58, a comment edit 22.7 to 26.6 ms).
+
+## Def maps read in place (2026-11-12, lane records-1112b; D21, D29)
+
+Step b2's first half. **Written, not compiled or run by this lane**: the round's results
+decide; every number below that is not quoted from another section is a prediction. Off unless
+a request sets `BLAZE_DEF_MAP_PAGES=1`; unset, the image's def map part is decoded whole and is
+the only path. A crate given pages is read from them alone (`frozen::served`), never both.
+
+**The record** (`crates/hir-def/src/nameres/frozen/pages.rs`): a crate's `DefMap` as one store
+value of segments found by offsets from its start, little-endian, nothing fixed up at a read.
+
+| Segment | Holds | Read when |
+|---|---|---|
+| header (56 bytes), a row a module (24) | the layout, the encoding, where each segment is | the crate is first asked for |
+| files | each file the segments name: owning crate, path from its root, content ID | with the header |
+| head | crate data, the module tree (origin, visibility, parent, children), preludes, whether a scope shadows a primitive type | with the header |
+| a module's name table | open-addressed slots (16 bytes: the hash of a name's text, where its entry is), at most half full | a name is looked up in that module |
+| a name's entry | the name and its `PerNs` | that name is looked up |
+| a module's scope | the whole `ItemScope` | something lists the scope (a glob, the traits in scope, impls) |
+| tail | name records, diagnostics, derive helpers | a lint or diagnostic asks |
+
+A lookup of a name (`Modules::name`, the one memo of a path segment) reads a window of four
+slots and the entry of the slot whose hash is the name's: two reads of a few dozen bytes, at
+most six pages, for a crate of any size. The whole scope is decoded only for a reader of all
+of it, a module at a time (`ScopeSlot::Paged`); the records only when asked
+(`RecordsSlot::Paged`). The head is decoded once a crate and is the `DefMap` value.
+
+**Through the pool.** The bytes come through `PageSource::read(at, len)`, which holds them only
+while the read runs. The driver's is `blaze_cas::Reader::part` (new): a raw record of a pack
+that one whole read verified is read a part at a time, the part's pages pinned for the task and
+no longer; the pool checks each block as it loads it. Nothing is pinned between reads, so the
+idle give-back takes the pages back. A value the store keeps another way (compressed, a file of
+its own from 4 MiB, still in a segment) is read whole and the part is of that: the same bytes,
+without the bound. The key is `deps::pages_key`: the image's filed key (every input of the
+crate and what it read), the layout and the encoding.
+
+**Ids.** Nothing in the record is a database's id; each kind is written as `nameres::frozen`
+writes it, and read by interning again:
+
+| Id | Written as |
+|---|---|
+| crate | its index in the crate's dependency closure, breadth first |
+| file | its owning crate's index and path from that crate's root (`\0ROOT`, `\0OUT_DIR`), once in the files table, with its content ID |
+| module | its crate's index and its index in that crate's `DefMap`; a block's by its body's owner |
+| item (`FunctionId`, `StructId`, `ImplId`, `UseId`, `ExternCrateId`, macros, ..) | the location it interns: container and `AstId` (file or macro call, and the erased id) |
+| macro call | its `MacroCallLoc` whole, the first time a *segment* names it, by index in that segment after |
+| syntax context | its outer call, transparency, edition and parents, likewise |
+| name | its text; a keyed name with its context |
+| a name's slot | FNV-1a of its text (never a hash of an interned id) |
+
+**What it does not do yet.** (1) The image still holds the def map part and is held pinned
+whole for the session (`Reader::pinned`), so the saving is the decoded heap values, not the
+image's bytes: the image without that part is next, then lang items and signatures the same
+way. (2) A module's names are written twice (scope segment and entries). (3) Impl tables
+(`hir-ty`'s frozen impls) are as they were. (4) A workspace crate is never paged: only a
+crate with an image is. (5) b3 and d are not built: a crate is still resolved from source
+before the store is asked (F2), which is the restart's time; pages make the served crate cheap
+to open, not the order right. F2's two blockers are as written in that section.
+(6) No new `blaze_cas::Kind`: pages are `Kind::Query` like the image; their keys are what a
+pin of "toolchain" or "bstd" names (`pages_key` of each crate's `Image::key`).
+
+**Checks** (hir-def `nameres::frozen::pages::tests`, blaze-cas `tests::part`):
+`a_crate_read_from_pages_answers_as_the_one_resolved` (the refinement: the whole def map and
+every name of every module, against the resolved crate) with its control
+`the_oracle_catches_a_name_left_out_of_its_table`; `the_same_pages_from_two_databases` with
+`the_pages_of_another_source_are_other_bytes`; `a_previous_or_foreign_layout_is_refused_by_name`;
+`a_lookup_reads_a_bounded_number_of_pages` (40 and 4,000 items: at most six pages each) with
+`a_whole_scope_reads_more_pages_than_a_name`;
+`a_part_of_a_value_is_that_range_of_it_wherever_it_is_kept` with
+`a_part_of_a_compressed_value_is_of_the_value_made_whole`. To measure with the switch on and
+off: idle footprint on hello-world and the six-dependency fixture, the edit rows, and how many
+`scope_memo` rows ran against how many modules std has (how lazy a real build is).
 
 ## A second kind of target, and where a restart's time goes (2026-11-11, lane share-front-1111)
 

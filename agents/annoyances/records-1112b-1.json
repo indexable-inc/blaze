@@ -1,0 +1,20 @@
+{
+ "id": "records-1112b-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-1112b",
+ "where": "crates/blaze-cas: Reader::get, Reader::pinned",
+ "what": "The store's reader gives a value whole or not at all: `get` checks and pins every page of the record, `pinned` holds them all for as long as the caller keeps the value. A def map record read for one name therefore loaded the crate's whole record, and a dependency image is pinned whole for a session. To read one name's pages I had to add `Reader::part` in the store lane's files.",
+ "cost": "an hour reading read.rs to find what a ranged read may trust; one additive method in another lane's file",
+ "cause": "every reader so far wanted the whole value (a template, a unit record), so the pool's ranged pin (`Look::pack_bytes`) was never given a public door",
+ "whys": [
+  "why whole: a value is verified by its one content hash",
+  "why is that enough for a part: the pool checks every block against its file's checks as it loads it, so after one whole verification a part is of bytes that were hashed",
+  "why was it not exposed: no record was large and read sparsely until def maps were",
+  "why does a session pin an image whole: `Held` is one buffer of bytes, with no notion of a read's lifetime"
+ ],
+ "class": "an interface that offers only the whole of a thing whose readers want a part",
+ "prevention": "`hir_def::deps::PageSource` is the one way a front-end record is read: a part, held for the read; the image's `Held` (whole, for the session) is to go as each part of the image becomes a record of its own (restore.md, 'Def maps read in place', what it does not do yet (1))",
+ "workaround": "none",
+ "fix": "`blaze_cas::Reader::part`, with `tests::part`",
+ "state": "open: lang items and signatures are still read from the pinned image"
+}

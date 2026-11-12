@@ -118,8 +118,7 @@ fn agree(resolved: &Db, read: &Db, names: &[&str]) -> Result<(), String> {
             return Err(format!("{name}: {} modules, {} read", table_a.len(), table_b.len()));
         }
         let mut looked = 0;
-        for (index, ((&id_a, data), (&id_b, _))) in table_a.iter().zip(table_b.iter()).enumerate()
-        {
+        for (index, ((id_a, data), (id_b, _))) in table_a.iter().zip(table_b.iter()).enumerate() {
             let mut asked = names_of(data.scope(resolved));
             // A keyed name holds a context of the database that made it.
             asked.retain(|it| it.key().is_none());

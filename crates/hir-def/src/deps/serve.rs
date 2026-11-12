@@ -12,7 +12,7 @@ use std::{ops::Range, sync::Arc};
 
 use base_db::{Crate, Db, Env};
 use blaze_hash::{HashMap, HashSet};
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, Hasher};
 use hir_expand::{
     InFile, MacroCallId, MacroCallKind, MacroDefKind, builtin::include_input_to_file_id,
 };
@@ -31,9 +31,28 @@ use crate::{
     nameres::{
         crate_def_map,
         diagnostics::DefDiagnosticKind,
-        frozen::{self, Frozen, FrozenDefMaps, FrozenLangItems, Mode},
+        frozen::{
+            self, Frozen, FrozenDefMaps, FrozenLangItems, Mode,
+            pages::{self, PageSource, Paged},
+        },
     },
 };
+
+/// The domain of the key a crate's def map pages are kept under ([`pages_key`]).
+pub const PAGES_DOMAIN: &str = "blaze v2 def map pages";
+
+/// Where the def map pages of the crate whose image is filed under `filed` are: the image's
+/// key (which covers every input of the crate and what it read, [`Image::key`]), and the
+/// layout and encoding of the record, so pages of another layout are another key and are
+/// never asked for.
+pub fn pages_key(filed: ContentId) -> ContentId {
+    let mut hasher = Hasher::new(PAGES_DOMAIN);
+    hasher
+        .id(&filed)
+        .update(&pages::LAYOUT.to_le_bytes())
+        .part(frozen::ENCODING.as_bytes());
+    hasher.finish()
+}
 
 /// Where images are kept, and the threads that read and write them: what the driver adapts the
 /// store or the global cache and its pool to. Every method is called from those threads.
@@ -52,6 +71,23 @@ pub trait ImageStore: Sync {
     /// ran: the daemon's `proc_macro_api::kept::Keeping::reads_now`. A variable is the calling crate's (`env`, what the
     /// expansion was given) before the process's. `Err` when one of them can't be read.
     fn reads_now(&self, env: &Env, shape: &[u8]) -> Result<ContentId, String>;
+
+    /// Whether a crate's def map is kept as pages beside its image and read from them
+    /// ([`pages`]): a name looked up reads the page it is on, where the image's def map part
+    /// is decoded whole. Off unless the driver turns it on; a store that says yes answers
+    /// [`ImageStore::pages`] with a source that reads a part at a time.
+    fn paged(&self) -> bool {
+        false
+    }
+
+    /// The record kept under `key`, read a part at a time: the store's own pages, held only
+    /// while a part is read. As given here, the whole value held in place: what a store with
+    /// no way to read a part gives (a test's, a value just fetched from the global cache).
+    // dyn: the driver's holder of one record, once per crate per session
+    fn pages(&self, key: &ContentId) -> Result<Option<Arc<dyn PageSource>>, String> {
+        // dyn: as above; alloc: one holder per crate read from pages
+        Ok(self.get(key)?.map(|bytes| Arc::new(pages::Whole(bytes)) as Arc<dyn PageSource>))
+    }
 
     /// Runs `task(at)` for each `at` in `0..count`, on every core the driver has: a crate's
     /// image is checked and encoded by one task, so [`serve`] and [`store`] take the larger of
@@ -91,6 +127,21 @@ impl ImageStore for ReadThrough<'_> {
 
     fn reads_now(&self, env: &Env, shape: &[u8]) -> Result<ContentId, String> {
         self.local.reads_now(env, shape)
+    }
+
+    fn paged(&self) -> bool {
+        self.local.paged()
+    }
+
+    // dyn: as `ImageStore::pages`
+    fn pages(&self, key: &ContentId) -> Result<Option<Arc<dyn PageSource>>, String> {
+        if let Some(found) = self.local.pages(key)? {
+            return Ok(Some(found));
+        }
+        // From the global cache, kept in the local store by `get`: held whole this session,
+        // read from the local store's pool from the next.
+        // dyn: as above; alloc: one holder per crate read from pages
+        Ok(self.get(key)?.map(|bytes| Arc::new(pages::Whole(bytes)) as Arc<dyn PageSource>))
     }
 
     // dyn: as `ImageStore::for_each`
@@ -265,6 +316,10 @@ pub fn serve(
     let mut served = (*before).clone();
     let mut maps = copied(FrozenDefMaps::try_get(&*db).map(|it| it.maps(&*db)));
     let mut lang_items = copied(FrozenLangItems::try_get(&*db).map(|it| it.maps(&*db)));
+    // The crates read from pages: only in `Mode::Serve` (the other modes compare the image's
+    // def map part, which pages are not), and only where the store keeps them so.
+    let paging = mode == Mode::Serve && images.paged();
+    let mut paged = pages::all(&*db);
     // alloc: setup, as above
     let mut stale = Vec::new();
     // Whether what the database was given changes: an image served, or one served before
@@ -278,6 +333,7 @@ pub fn serve(
         changed |= served.remove(&krate).is_some();
         changed |= maps.remove(&krate).is_some();
         changed |= lang_items.remove(&krate).is_some();
+        changed |= paged.remove(&krate).is_some();
         let (bytes, parts, filed) = match found? {
             Found::Hit { bytes, parts, filed } => (bytes, parts, filed),
             Found::Miss { stale: true } => {
@@ -289,6 +345,21 @@ pub fn serve(
         let part = |part| PartBytes::of(&bytes, &parts, part);
         maps.insert(krate, Frozen { bytes: part(Part::DefMap), mode });
         lang_items.insert(krate, Frozen { bytes: part(Part::LangItems), mode });
+        if paging {
+            // A crate whose image is found and whose pages are not is read from the image,
+            // as a store written before pages were is; [`store`] writes its pages, and the
+            // next database reads them. Pages that are found and do not read stop the query
+            // that reads them (`frozen::Unreadable`), never a crate read from the image
+            // instead.
+            let key = pages_key(filed);
+            let found = images.pages(&key).map_err(|why| {
+                // alloc: error text
+                format!("reading the def map pages of crate {} (key {key:?}): {why}", krate.named(db))
+            })?;
+            if let Some(source) = found {
+                paged.insert(krate, Paged { key, source });
+            }
+        }
         served.insert(krate, Image { base, key: filed, bytes, parts, mode });
         hits.push(krate);
         changed = true;
@@ -326,6 +397,9 @@ pub fn serve(
     }
     frozen::set(db, maps);
     frozen::set_lang_items(db, lang_items);
+    if paging || !paged.is_empty() || !pages::all(&*db).is_empty() {
+        pages::set(db, paged);
+    }
     set_images(db, served);
     // A served crate's modules are the decoded map's, not the ones its dependents were
     // maintained against: the maintainers run again over the crates now served.
@@ -452,6 +526,7 @@ fn served_crates(db: &Db) -> Vec<Crate> {
     if let Some(it) = FrozenLangItems::try_get(db) {
         crates.extend(it.maps(db).keys().copied());
     }
+    crates.extend(pages::all(db).keys().copied());
     crates.sort_unstable();
     crates.dedup();
     crates
@@ -499,13 +574,19 @@ fn withdraw(db: &mut Db, gone: &[Crate]) {
         DepImages::try_get(&*db).map(|it| (**it.images(&*db)).clone()).unwrap_or_default();
     let mut maps = copied(FrozenDefMaps::try_get(&*db).map(|it| it.maps(&*db)));
     let mut lang_items = copied(FrozenLangItems::try_get(&*db).map(|it| it.maps(&*db)));
+    let mut paged = pages::all(&*db);
+    let mut paged_gone = false;
     for krate in gone {
         images.remove(krate);
         maps.remove(krate);
         lang_items.remove(krate);
+        paged_gone |= paged.remove(krate).is_some();
     }
     frozen::set(db, maps);
     frozen::set_lang_items(db, lang_items);
+    if paged_gone {
+        pages::set(db, paged);
+    }
     set_images(db, images);
     db.note_crates_changed();
 }
@@ -571,6 +652,9 @@ pub fn store(db: &Db, served: &Served, images: &dyn ImageStore) -> Result<Stored
             Err(why) => stored.refused.push((krate, why)),
         }
     }
+    if images.paged() {
+        store_missing_pages(db, served, images)?;
+    }
     Ok(stored)
 }
 
@@ -606,13 +690,77 @@ fn make(
         Ok(filed) => filed,
         Err(why) => return Ok(Err(why)),
     };
+    // The crate's pages, written before anything is kept: a def map that does not write as
+    // pages refuses the crate whole, so no image is kept whose pages never will be.
+    let paged = match images.paged() {
+        true => match pages::encode(db, krate) {
+            Ok(paged) => Some(paged),
+            Err(why) => return Ok(Err(Refused::Encode { part: Part::DefMap, why })),
+        },
+        false => None,
+    };
     let image = write_image(filed, [&parts[0], &parts[1], &parts[2]]);
     drop(parts);
     images.put(filed, image).map_err(|why| {
         // alloc: error text
         format!("keeping the image of crate {} (key {filed:?}): {why}", krate.named(db))
     })?;
+    if let Some(paged) = paged {
+        keep_pages(db, krate, filed, paged, images)?;
+    }
     Ok(Ok(filed))
+}
+
+/// Keeps `paged`, the def map pages of `krate`, whose image is filed under `filed`.
+fn keep_pages(
+    db: &Db,
+    krate: Crate,
+    filed: ContentId,
+    paged: Vec<u8>,
+    // dyn: the driver's store, one call per crate per session
+    images: &dyn ImageStore,
+) -> Result<(), String> {
+    let key = pages_key(filed);
+    images.put(key, paged).map_err(|why| {
+        // alloc: error text
+        format!("keeping the def map pages of crate {} (key {key:?}): {why}", krate.named(db))
+    })
+}
+
+/// Writes the pages of each crate [`serve`] read from an image and found no pages of (a
+/// store written before pages were, or with them off), from the def map the image gave: one
+/// task a crate. Pages that do not write are an error naming the crate: its def map was
+/// written once, as the image's part.
+// dyn: the driver's store, one call per crate per session
+fn store_missing_pages(db: &Db, served: &Served, images: &dyn ImageStore) -> Result<(), String> {
+    // alloc: setup: once per store
+    let lacking: Vec<(Crate, ContentId)> = (served.hits.iter())
+        .filter(|krate| !pages::is_paged(db, **krate))
+        .filter_map(|&krate| super::image_of(db, krate).as_ref().map(|image| (krate, image.key())))
+        .filter(|(_, filed)| !matches!(images.pages(&pages_key(*filed)), Ok(Some(_))))
+        .collect();
+    #[expect(clippy::disallowed_types, reason = "page writing results, set once per crate in a session: not global")]
+    let made: Vec<std::sync::OnceLock<Result<(), String>>> =
+        // alloc: setup: one slot per crate, once per store
+        lacking.iter().map(|_| std::sync::OnceLock::new()).collect();
+    images.for_each(lacking.len(), &|at| {
+        let (krate, filed) = lacking[at];
+        let kept = match pages::encode(db, krate) {
+            Ok(paged) => keep_pages(db, krate, filed, paged, images),
+            // alloc: error text
+            Err(why) => Err(format!(
+                "the def map of crate {}, read from its image, does not write as pages: {why}",
+                krate.named(db)
+            )),
+        };
+        _ = made[at].set(kept);
+    });
+    for (&(krate, _), made) in lacking.iter().zip(made) {
+        made.into_inner().unwrap_or_else(|| {
+            panic!("`ImageStore::for_each` did not run the task of crate {}", krate.named(db))
+        })?;
+    }
+    Ok(())
 }
 
 /// The parts of the image of `krate`, in the order of [`Part::ALL`], and in `calls` the macro

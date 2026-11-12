@@ -1,0 +1,19 @@
+{
+ "id": "records-1112b-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-1112b",
+ "where": "crates/hir-def tests; base-db's maintainers",
+ "what": "A test that a crate with records runs no resolution, expansion or item-tree query cannot be written against a fixture database: setting the crate graph resolves every crate from source at once (the name-resolution maintainer's pass), before anything can give the database a record. It is F2 in a test's clothes: the store is asked last.",
+ "cost": "the restart test of the lane's brief is not written; the lane's tests show that a served crate answers alike and reads few pages, not that nothing was resolved",
+ "cause": "the maintainers run in the write that makes the crates, and a served crate is told apart only by an input set afterwards",
+ "whys": [
+  "why at the write: a reader must never find a crate unmaintained",
+  "why is served-ness set afterwards: an image's key needs the crate graph, which that write makes",
+  "why not keyed in the same write: `deps::keys` reads the database (source roots, crate data), so it needs the write done"
+ ],
+ "class": "an order fixed by who needs whose output, where the cheaper answer (a record) is only askable after the dearer one (resolving) was computed",
+ "prevention": "restore.md F2: the lowering's batch keys every crate and asks the store before its maintenance pass, a crate whose key is not known yet stays unmaintained with a reader of it an error; then the count test (`Counts::executed` by crate) is the guard",
+ "workaround": "none",
+ "fix": "none",
+ "state": "open: F2 is not built"
+}

@@ -53,6 +53,7 @@ use triomphe::Arc as TArc;
 use super::{Dec, Enc, R, Unreadable, closure};
 use crate::{
     ExternCrateId, FxIndexMap, MacroId, ModuleDefId, ModuleId, TraitId, UseId,
+    builtin_type::BuiltinType,
     item_scope::ItemScope,
     nameres::{
         DefMap, DefMapCrateData, DiagnosticsByModule, LocalDefMap, ModuleData, ModuleOrigin,
@@ -414,9 +415,25 @@ pub(crate) struct Head {
     own: Box<[ModuleId]>,
     data: TArc<DefMapCrateData>,
     modules: Box<[HeadModule]>,
+    /// Whether a module of the crate has a primitive type's name in its type namespace
+    /// ([`shadows_primitive_in`]).
+    shadows_primitive: bool,
     prelude: Option<(ModuleId, Option<UseId>)>,
     macro_use_prelude: HashMap<Name, (MacroId, Option<ExternCrateId>), Global>,
     extern_prelude: FxIndexMap<Name, (ModuleId, Option<ExternCrateId>)>,
+}
+
+/// Whether `scope` has a primitive type's name (`u8`, `str`, `bool`, ..) in its type
+/// namespace: one module's part of `crate_shadows_primitive_type`.
+pub(in crate::nameres) fn shadows_primitive_in(scope: &ItemScope) -> bool {
+    scope.types().any(|(name, _)| BuiltinType::by_name(name).is_some())
+}
+
+/// Whether a module of `krate` has a primitive type's name in its type namespace, when the
+/// crate is read from pages: its head says, so no scope is decoded to answer. `None` for a
+/// crate not read from pages.
+pub(in crate::nameres) fn shadows_primitive(db: &Db, krate: Crate) -> Option<bool> {
+    is_paged(db, krate).then(|| head(db, krate).shadows_primitive)
 }
 
 /// `krate` and the crates it depends on, as [`closure`] lists them: what every segment's
@@ -941,6 +958,9 @@ impl Enc<'_> {
 
         // The modules first, so that everything after can name any of them.
         let table = it.table(db);
+        // What `crate_shadows_primitive_type` asks of every scope of the crate, answered once
+        // here: read from pages, that question must not decode each module's scope.
+        self.bool(table.iter().any(|(_, data)| shadows_primitive_in(data.scope(db))));
         if table.get_index(0).map(|it| *it.0) != Some(*root) {
             // alloc: error path
             return Err("a def map whose root is not its first module".to_owned());
@@ -1084,6 +1104,7 @@ impl Dec<'_> {
             features.enable(it);
         }
         data.unstable_features = features;
+        let shadows_primitive = self.bool()?;
 
         // The modules, each with the id it has when its crate is resolved: the root as
         // `DefMap::empty` makes it, the others as the collector does, each in its parent.
@@ -1173,6 +1194,7 @@ impl Dec<'_> {
             // alloc: the crate's data, once per crate read from pages
             data: TArc::new(data),
             modules: modules.into_boxed_slice(),
+            shadows_primitive,
             prelude,
             macro_use_prelude,
             extern_prelude,

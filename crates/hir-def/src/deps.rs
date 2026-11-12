@@ -44,9 +44,12 @@ pub use crate::deps::{
     image::{Held, IMAGE_SCHEMA, ImageBuf, ImageError, ImageRef, Part, PartBytes, write_image},
     key::{KEY_DOMAIN, KeyInputs, KeyWalk, PRODUCER, absolute, eligible, key_inputs, keys},
     reads::{READS_DOMAIN, Reads, SLOTS, image_key, slot},
-    serve::{ImageStore, ReadThrough, Refused, Served, Stored, serve, store},
+    serve::{
+        ImageStore, PAGES_DOMAIN, ReadThrough, Refused, Served, Stored, pages_key, serve, store,
+    },
 };
 pub use crate::nameres::frozen::Mode;
+pub use crate::nameres::frozen::pages::{PageSource, Paged, is_paged};
 
 /// An image a database was given: the buffer, which [`serve`] opened and checked against the
 /// key it is filed under, where its parts are, and what is done with it.

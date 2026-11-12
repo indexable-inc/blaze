@@ -438,7 +438,8 @@ pub(crate) fn session(
     let mut read = EnvReads::default();
     let items_mode = items_in(&mut read, env)?;
     // alloc: setup, once per database; clone: an `Arc` each
-    let images = Arc::new(Images::new(store.clone(), Arc::clone(macros)));
+    let paged = pages_in(&mut read, env)?;
+    let images = Arc::new(Images::new(store.clone(), Arc::clone(macros)).reading_pages(paged));
     // dyn: the goal store keeps both for the database's life; called once per database
     let adapter: Arc<dyn ImageStore + Send + Sync> = images.clone(); // clone: an `Arc`, once per database
     // dyn: hir-ty's goal store takes its facts as `dyn` (blaze-items depends on hir-ty, which can't name `Goals`); made once per database
@@ -489,6 +490,31 @@ fn items_in(
                 "{ITEMS}={value} is not a value blaze takes: `verify` runs each body's inference, MIR and \
                  borrow check the item store holds as well and fails on a difference, `off` uses no item \
                  store, unset reads it"
+            ),
+            None,
+        )),
+    }
+}
+
+/// The switch of def map pages (docs/v2/plan/design/restore.md, "Def maps read in place"):
+/// set to `1`, a dependency's def map is kept as pages beside its image and read from them, a
+/// name at a time through the store's pool; unset, the image's def map part is decoded whole,
+/// as before. Off until the round's measurements say on; then the image's part goes and this
+/// with it. It is a read of the session ([`EnvReads`]), so a request that sets it otherwise
+/// lets the kept front end go.
+const PAGES: &str = "BLAZE_DEF_MAP_PAGES";
+
+/// What the job's [`PAGES`] asks: unset or `0` reads def maps from their images, `1` from
+/// their pages; any other value is an error naming it.
+fn pages_in(read: &mut EnvReads, env: &[(String, String)]) -> Result<bool, ApiError> {
+    match read.var(env, PAGES, "whether def maps are read from pages").map_err(|why| ApiError::new(why, None))? {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(value) => Err(ApiError::new(
+            // alloc: error path
+            format!(
+                "{PAGES}={value} is not a value blaze takes: `1` reads a dependency's def map from its \
+                 pages, a name at a time; `0` or unset decodes it whole from its image"
             ),
             None,
         )),
@@ -943,6 +969,8 @@ struct Images {
     /// What it asked to keep; a write path, once per crate it images and per goal and body's
     /// step a flush writes.
     puts: Lock<Puts>,
+    /// Whether def maps are kept as pages and read from them ([`PAGES`]).
+    pages: bool,
 }
 
 /// What an [`Images`] was asked to keep since the last take: the puts in the order asked, and
@@ -961,7 +989,13 @@ struct Puts {
 impl Images {
     fn new(store: blaze_cas::Reader, macros: Arc<blaze_macro_eval::Macros>) -> Images {
         let puts = Puts { list: Vec::new(), at: HashMap::new_in(Global) }; // alloc: none until a put
-        Images { store, macros, puts: Lock::new("serve.deps.images.puts", puts) }
+        Images { store, macros, puts: Lock::new("serve.deps.images.puts", puts), pages: false }
+    }
+
+    /// These images, def maps kept as pages and read from them when `on` ([`PAGES`]).
+    fn reading_pages(mut self, on: bool) -> Images {
+        self.pages = on;
+        self
     }
 
     /// What it was asked to keep since the last take, in the order asked.
@@ -983,7 +1017,59 @@ impl Held for InStore {
     }
 }
 
+/// A record of the store read a part at a time ([`blaze_cas::Reader::part`]): each read pins
+/// the pages its part is on for as long as the read runs, and nothing between reads, so the
+/// pool's sweep and its idle give-back take the pages no reader came back to.
+struct InPool {
+    store: blaze_cas::Reader,
+    key: Key,
+    len: u64,
+}
+
+impl hir_def::deps::PageSource for InPool {
+    fn size(&self) -> u64 {
+        self.len
+    }
+
+    // dyn: hir-def's reader of one segment, once per read
+    fn read(&self, at: u64, len: u64, with: &mut dyn FnMut(&[u8])) -> Result<(), String> {
+        let guard = blaze_cas::enter();
+        match self.store.part(&guard, &self.key, at, len) {
+            Ok(Some(bytes)) => {
+                with(bytes);
+                Ok(())
+            }
+            // A record that was there when its crate was served and is not now: the store's
+            // collector took it while a database reads it, which a pin of the crate's records
+            // prevents. Said, never read as empty.
+            // alloc: error path
+            Ok(None) => Err(format!("the store no longer holds {:?}", self.key.0)),
+            Err(corrupt) => Err(corrupt.to_string()),
+        }
+    }
+}
+
 impl ImageStore for Images {
+    fn paged(&self) -> bool {
+        self.pages
+    }
+
+    // dyn: hir-def's holder of one record, once per crate per front end
+    fn pages(&self, key: &ContentId) -> Result<Option<Arc<dyn hir_def::deps::PageSource>>, String> {
+        let guard = blaze_cas::enter();
+        // The one whole read of the record: it is checked against its content hash here, so
+        // every part read after is of bytes that were. Its pages are let go with the guard.
+        match self.store.get(&guard, &Key(*key)) {
+            Ok(Some(entry)) => {
+                let len = entry.bytes.len() as u64;
+                // clone: a count of the store's reader; alloc: one holder per crate read from pages
+                Ok(Some(Arc::new(InPool { store: self.store.clone(), key: Key(*key), len })))
+            }
+            Ok(None) => Ok(None),
+            Err(corrupt) => Err(corrupt.to_string()),
+        }
+    }
+
     fn get(&self, key: &ContentId) -> Result<Option<ImageBuf>, String> {
         let guard = blaze_cas::enter();
         match self.store.pinned(&guard, &Key(*key)) {

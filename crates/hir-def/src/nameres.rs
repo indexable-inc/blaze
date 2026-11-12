@@ -588,8 +588,8 @@ impl<'db> Modules<'db> {
         };
         // A module of a crate read from pages: the one name, from the page it is on. This memo
         // is the name's; nothing else of the scope is decoded.
-        if let ScopeSlot::Paged(paged) = data.scope {
-            return frozen::pages::name_now(db, paged, &name);
+        if let ScopeSlot::Paged(paged) = &data.scope {
+            return frozen::pages::name_now(db, *paged, &name);
         }
         data.scope(db).get(&name)
     }
@@ -722,10 +722,14 @@ pub fn crate_recursion_limit(db: &Db, krate: Crate) -> u32 {
 pub fn crate_shadows_primitive_type(db: &Db, krate: Crate) -> bool {
     let pair = crate_local_def_map(db, krate);
     let def_map = pair.def_map(db);
-    let shadows =
-        |scope: &ItemScope| scope.types().any(|(name, _)| BuiltinType::by_name(name).is_some());
-    def_map.modules(db).any(|(_, module)| shadows(module.scope(db)))
-        || pair.local(db).extern_prelude().any(|(name, _)| BuiltinType::by_name(name).is_some())
+    let shadows = frozen::pages::shadows_primitive_in;
+    // A crate read from pages says this of its own modules in its head: asking each scope
+    // would decode every module of it for one answer.
+    let own = match frozen::pages::shadows_primitive(db, krate) {
+        Some(own) => own,
+        None => def_map.modules(db).any(|(_, module)| shadows(module.scope(db))),
+    };
+    own || pair.local(db).extern_prelude().any(|(name, _)| BuiltinType::by_name(name).is_some())
         || def_map
             .prelude()
             .is_some_and(|(prelude, _)| shadows(prelude.def_map(db).module(db, prelude).scope(db)))
