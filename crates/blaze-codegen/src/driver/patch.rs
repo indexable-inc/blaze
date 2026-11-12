@@ -527,7 +527,11 @@ impl<'a, B: Prepare> Build<'a, B> {
             every,
         )
         .entered();
-        let answers: Vec<Result<Answer<_, _>, &'static str>> = par::map(&asks, |item| {
+        // An edit's asks are a few (what it changed, what is asked each build): where they
+        // are predicted to cost less than a dispatch they run on this thread, no job
+        // submitted ([`par::Small`]).
+        static ASKS: par::Small = par::Small::new("codegen walk: ask functions");
+        let answers: Vec<Result<Answer<_, _>, &'static str>> = par::map_small(&ASKS, &asks, |item| {
             let Some(it) = keep.function(*item) else {
                 return Err("a kept walk asks of a function it does not hold");
             };
@@ -700,7 +704,9 @@ impl<'a, B: Prepare> Build<'a, B> {
                     Fresh::Static(_) => None,
                 })
                 .collect();
-            let described = par::map(&functions, |(_, asked)| {
+            // The functions an edit brought in: a few, run here where that is cheaper.
+            static NEW: par::Small = par::Small::new("codegen walk: describe new functions");
+            let described = par::map_small(&NEW, &functions, |(_, asked)| {
                 let described = self.described(asked, 0, &counts)?;
                 let node = self.node(&asked.0, asked.1, described)?;
                 let counted = self.frontend.counted(std::slice::from_ref(asked));

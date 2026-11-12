@@ -66,6 +66,10 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
+/// The sweep's loop, as the pool's small-loop predictor knows it: an edit's one or two tasks
+/// run on the thread that runs the plan.
+pub(crate) static SWEEP: blaze_query::db::Small = blaze_query::db::Small::new("body check sweep");
+
 /// No body: an empty place of the reached ring, a task checking none.
 const NONE: u32 = u32::MAX;
 
@@ -901,7 +905,10 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
         if let Some(why) = &work.whole {
             sweep.record("why", tracing::field::display(why));
         }
-        db.run_all(Tag::Infer, self.tasks.len(), |task_db, task| {
+        // A plan from a kept check has the edit's few tasks: where they are predicted to
+        // cost less than a dispatch they run on this thread, one after the other, with no
+        // job submitted (`Db::run_all_small`); a whole plan's run on the pool.
+        db.run_all_small(&SWEEP, Tag::Infer, self.tasks.len(), |task_db, task| {
             assert_eq!(
                 ptr::from_ref(task_db).cast::<()>().addr(),
                 home,

@@ -125,8 +125,12 @@ fn merge_oldest(log: &mut Vec<Arc<Found>>) {
     log.insert(0, Arc::new(Found { at, nodes: all })); // alloc: as above
 }
 
-/// The rows one level of a walk verifies before it hands them to the pool.
-const PAR_AT: usize = 64;
+/// A level of a walk, as the pool's small-loop predictor knows it: a level of a few rows
+/// predicted to verify in under a few milliseconds runs on the walker's thread, with no job
+/// submitted; a larger or dearer one on the pool ([`super::par_for_each_small`]). An edit's
+/// own chain (its file's text, the items parsed from it, the one body) is levels of one to a
+/// few rows.
+static LEVEL: blaze_graph::par::Small = blaze_graph::par::Small::new("changed set: verify a level");
 
 /// What the walks keep between them. Its vectors are taken out by the walker (the holder of
 /// the walk's flight) and put back, so the lock is held for moves only.
@@ -682,11 +686,7 @@ fn walk(db: *const (), storage: &Storage) {
         let one = |at: usize| {
             seen[at].store(verify(db, storage, suspects[at], plant) as u8, Ordering::Relaxed);
         };
-        if suspects.len() < PAR_AT {
-            (0..suspects.len()).for_each(one);
-        } else {
-            super::par_for_each(suspects.len(), one);
-        }
+        super::par_for_each_small(&LEVEL, suspects.len(), one);
         for (at, &node) in suspects.iter().enumerate() {
             let seen = seen[at].load(Ordering::Relaxed);
             if seen == Seen1::Unsure as u8 || seen == Seen1::Unwound as u8 {
