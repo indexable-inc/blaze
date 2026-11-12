@@ -72,6 +72,38 @@ would compile std's bodies at level 1 too; not done here, since it changes dev c
 The tier 0 template key also hashes `refs` (the callees' keys it calls, for placement), not
 their bodies.
 
+**What making tier 0 hold for the library's bodies takes** (read from the code and a profile
+of a new hello-world, 2026-11-12, lane newproj-1111; not built). Changing `Build::options` so a
+library body follows a unit that is not optimized is the small part. Three more things read a
+callee's optimized body under a tier 0 unit today:
+
+1. *The walk is one answer for every requester.* An instance its users compile (a generic, a
+   closure, an `#[inline]` function) is walked with the inlined passes when any origin's
+   units inline (`Units::any`, `frontend.rs` `inlines_as`), and std's own units are `-O3` in
+   every dev build, so every such instance a tier 0 member asks for is described under
+   `Build::WALKS_INLINED` too, and its tier 0 template key hashes the references those passes
+   list. A per-requester walk needs the origin where a function is prepared
+   (`Prepare::prepare` has the unit and its spec, not its origin) and one rule for two origins
+   of equal settings whose later specs differ (a node merges their describes by key).
+2. *`Build::WALK` is every unit's pass.* It lists what a unit that optimizes and does not
+   MIR-inline (`opt-level` 1, `s`, `z`, a release build that patches) builds: its own body
+   plain, the library's inlined. With the library at level 1 under `WALK`, such a unit needs
+   a pass of its own (optimized, not inlining), or its references are not listed.
+3. *Which library functions a user compiles is inferred from optimized bodies.*
+   `home::compiled_by_user` asks `shipped_cross_crate_inlinable` of each library function no
+   attribute decides, which builds its body at level 2 with the inliner
+   (`optimize/inline.rs`), and that reads its callees' and their effect summaries: in the
+   profile, `key cross_crate_inlinable` held the walk up 2.7 s and `summary_in` ran 58,602
+   times. The answer is one for the whole program (std's own units and the user's must
+   agree), a function of the library crate's identity and the front end's code, so it is a
+   record to keep under those (rule 52), a table a library crate, not a thing to compute in
+   each database.
+
+On Linux a dev program is walked whole (14,202 describes for hello-world, 12,043 functions
+reached, all but `main` a store hit by a key that needs the describe first), so there the
+describes are std's own `-O3` ones and only a kept describe (R7) or the trace-keyed entry
+below takes them away.
+
 **Optimized code cannot have one.** What it inlined and which summaries it read are found while
 compiling. The design: store it under (f, tier, stage identity) with a recorded trace of
 (dependency, hash) pairs, and reuse it when the trace verifies. What the tree records now, to

@@ -898,6 +898,34 @@ fn a_task_that_fits_the_budget_starts_alone_whatever_the_process_holds() {
     assert_eq!(runs(&built(&mut plane, 2)), [3]);
 }
 
+/// A task that asks the whole budget (one never measured, which runs alone) is short of
+/// nothing the process holds besides its grants: no amount let go makes it fit beside a
+/// grant, and with none granted it starts whatever is held, at the ledger's next turn. So
+/// the driver lets go of no kept front end for it. Held back by the room between two turns
+/// with nothing granted, it was counted short of all that is held besides (40 here), and a
+/// second project's first build let go of the first project's kept front end, whose next
+/// edit then lowered anew. A task that asks less is short of what would start it
+/// (`a_task_that_fits_the_budget_starts_alone_whatever_the_process_holds`: 5 of 6).
+#[test]
+fn a_task_that_asks_the_whole_budget_is_short_of_nothing() {
+    let mut plane = Plane::new(PlaneConfig { budget: budget(160), ..config(1, 4) }).unwrap();
+    open(&mut plane, 1, 1, true);
+    plane.step(PlaneInput::Held { at_ns: 0, bytes: 40 }).unwrap();
+    // A turn: 40 charged and 10 leased, so 50 of room until the next.
+    plane.step(PlaneInput::Allowance { at_ns: 0, bytes: 160 }).unwrap();
+    assert_eq!(plane.room(), 50);
+    // 160 asked of 160, nothing granted: past the room, it waits for the turn.
+    assert_eq!(
+        runs(&add(&mut plane, 1, vec![node(1, &[], Pool::Work, 100, None, 160)])),
+        Vec::<u32>::new()
+    );
+    assert!(plane.held_back() && plane.turn_wanted());
+    assert_eq!(plane.short(), 0, "letting go of the 40 held besides would not start it");
+    let out = plane.step(PlaneInput::Allowance { at_ns: 1, bytes: 160 }).unwrap();
+    assert_eq!(runs(&out), [1], "alone at the turn, it starts though 40 are held");
+    assert_eq!(plane.short(), 0);
+}
+
 /// A task the room between two turns of the machine's ledger holds back is short of nothing:
 /// the next turn starts it, so the driver lets go of no kept front end for it. Counted against
 /// the room it was short of all the process holds besides its grants, at every build.

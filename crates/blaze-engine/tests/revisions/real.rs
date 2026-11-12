@@ -292,6 +292,7 @@ impl Real {
         if seen.noop == Some(true) {
             // No build ran: nothing was made again, and no memo ran.
             (seen.redone, seen.executed, seen.verified) = (Some(Vec::new()), Some(0), Some(0));
+            seen.records = Some(0);
             seen.why = "answered as the last build was (the no-op lane)".to_owned();
             return seen;
         }
@@ -300,7 +301,11 @@ impl Real {
         match serde_json::from_str::<serde_json::Value>(why.stdout.trim()) {
             Ok(value) if why.ok && value["build"].as_u64() == build && build.is_some() => {
                 let mut redone = Vec::new();
+                let mut records = 0;
                 for group in value["groups"].as_array().into_iter().flatten() {
+                    if group["step"].as_str() == Some("unit") {
+                        records += group["items"].as_array().map_or(0, |it| it.len() as u64);
+                    }
                     if group["step"].as_str().is_some_and(|it| it.starts_with("codegen")) {
                         redone.extend(group["items"].as_array().into_iter().flatten().filter_map(|it| it.as_str()).map(str::to_owned));
                     }
@@ -308,6 +313,7 @@ impl Real {
                 redone.sort();
                 redone.dedup();
                 seen.redone = Some(redone);
+                seen.records = Some(records);
             }
             _ => seen.why = format!("`blaze why --all --json` of build {build:?} said: {}{}\n", why.stdout, why.stderr),
         }

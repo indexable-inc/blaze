@@ -571,7 +571,8 @@ Steps: `edit`, `edit by rename` (written beside and renamed over), `edit by trun
 on the commands run in a second checkout beside the first, served by the same daemon; the
 revision's overlay is that project's files whole; the real driver only), and `check`, `build`,
 `run`, `test` (a command that only has to succeed). Expectations: `fails` (the action fails saying
-this), `prints`, `says`, `redone` (exactly), `redone_has`, `reused`, `max_units`, `max_executed`,
+this), `prints`, `says`, `redone` (exactly), `redone_has`, `reused`, `max_units`, `max_records` (units whose record
+missed, compiled or not), `max_executed`,
 `max_verified`, `max_ms`, `noop` (answered as the last build was, with no walk), `link` (`first`,
 `spliced`, `unchanged`, `full`, `none`), `bytes` (the linked bytes equal a clean build's), `env`
 (variables of every command from that revision on), `args`, `remove`. A key the harness does

@@ -368,7 +368,17 @@ fn the_oracle_catches_a_reverse_edge_not_recorded() {
 /// in the fold, that walk misses a reader, and the oracle says so.
 #[test]
 fn a_fold_asked_for_after_the_runs_feeds_the_next_walk() {
-    let flow: Vec<FlowNode> = (0..12).map(|at| sum(&[Dep::Input(at % 4)])).collect();
+    // The chains of `the_oracle_catches_a_reverse_edge_not_recorded`: some reader's node is
+    // even, so the plant drops the edges to it.
+    let flow: Vec<FlowNode> = (0..4)
+        .flat_map(|chain| {
+            [
+                sum(&[Dep::Input(chain)]),
+                sum(&[Dep::Query(3 * chain)]),
+                sum(&[Dep::Query(3 * chain + 1)]),
+            ]
+        })
+        .collect();
     let mut steps = vec![Step::Pull((0..12).collect()), Step::Pack, Step::Ask(0)];
     steps.extend((0..4).map(|input| Step::Write(input, 10 + input as u64)));
     steps.push(Step::Ask(0));
