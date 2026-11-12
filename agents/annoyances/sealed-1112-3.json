@@ -1,0 +1,19 @@
+{
+ "id": "sealed-1112-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane sealed-1112",
+ "where": "the lane's scope",
+ "what": "The lane was given b1, b2, b3 and d, then (mid-task) dynamic sealing of workspace crates, then one front end a checkout (F1) as first priority, then memory at Relax's level as an equal target. Built and measured: the census and the first half of b1 (library rows at HIGH). Written, not built: the sealed definition with seal groups in the engine, and F1's list of what lower_writes makes a plan. b1's second half, b2, b3, d, F1 and dynamic sealing are not built.",
+ "cost": "the report says not built for most of the brief",
+ "cause": "each of F1, seal groups and F2 is a change across blaze-lower, the engine or the serve path with its own simulation; reading the code to the point of a correct first change took most of the session",
+ "workaround": "none",
+ "fix": "three lanes with one outcome each: F1 (blaze-lower and unkept), seal groups (blaze-query row, function, storage), F2 with records read in place (hir-def deps and nameres::frozen)",
+ "whys": [
+  "the brief grew by three outcomes while the first was being measured",
+  "each outcome meets a different 1,500 to 3,000 line file that had to be read first",
+  "nothing sized the steps against a session before they were handed over"
+ ],
+ "class": "a brief larger than one context can read the code for",
+ "prevention": "a brief names one outcome whose files total a size one agent can read (rule every-agent-has-a-task); additions mid-task go to a new lane unless they are the same files",
+ "state": "open"
+}

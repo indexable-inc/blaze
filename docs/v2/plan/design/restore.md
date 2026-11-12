@@ -541,3 +541,113 @@ memory of the running process. Ranked:
 a good image unused, each said in the start's log. On a kept bad state: all three (the
 VFS alone is restored), then one at a time. The part whose absence makes the build clean
 holds the fault; `history` alone clean is candidate 1.
+
+## Sealed crates (2026-11-12, lane sealed-1112; D21, D29)
+
+What is built is said as built; the rest is the design the next commits follow.
+
+**What "sealed" is.** A crate is *sealed* while all three hold, whatever its source (the
+toolchain's, a registry or git package, a path dependency, a workspace member):
+
+1. *Quiet.* None of its inputs was written for a while: the files of its source root, its
+   crate data, cfg, env, proc macros and the build-script runs applied to it. A library crate
+   (origin not `Local`) is quiet from the moment it is lowered. A local crate is quiet once
+   two builds in a row of its checkout ended without a write to any of them (the same two the
+   reader shed waits for, `blaze_query::db::frontier`); the count is the checkout's, kept with
+   its front end, never a clock.
+2. *Keyed by content.* Its key is `hir_def::deps::keys`' (source root file contents by path
+   under the package, crate inputs, the front end's code identity; no absolute path), with
+   one change still to make: each dependency enters as the content hash of its *interface
+   record*, not as its key (content-keys-1112's rule for units: dependencies by interface
+   digest). One key rule, one store (`blaze_cas`), the same key for a unit record's front-end
+   part.
+3. *Recorded.* Its records are in the store under that key: the interface (def map, lang
+   items, signatures: today's image parts; impls by self type and trait are to be added), and
+   by body key its bodies, inference and MIR (the item store).
+
+A sealed crate is, to the engine, one leaf: an input `Seal(crate)` whose value is the content
+hash of its interface record. **What a dependent's front end gets** is that interface record
+read in place (names to items, signatures, impls), and bodies by body key when it asks
+(generic and `#[inline]` functions, constants): a read of a body is a read of that body's
+record, so a body edit below reaches the dependents that read that body and no other.
+
+**What unseals one.** A write to any of its inputs, at once, in that write: the write finds
+the crate from the input (file to source root to crates: `base_db::source_root_crates`; a
+crate's own fields name it), with no walk of rows, as `hir_def::deps::withdraw_moved` does
+today for a served crate's image. Only that crate is unsealed. Its dependents stay sealed
+while its interface record's hash is the same after the edit (a body edit), and are unsealed
+by the write of `Seal(crate)` when it is not (a signature edit): that write is the host's,
+after the edited crate's interface is made again, before any dependent is asked.
+
+**What an unseal costs** (the first edit of a crate, with a person waiting): the edited file
+is parsed; the crate's def map is decoded from its interface record (hello-world's `core`,
+the largest, decodes in under 0.9 s with every other served crate today, restore.md above; a
+workspace crate is a fraction of it); its rows are made again as they are asked, each body's
+inference and MIR found by body key in the item store. Bound: the crate's own items, never
+its dependencies' or its dependents'. Not measured yet for a workspace crate: nothing seals
+one today.
+
+**What sealing again costs.** After the answer, never on a request's path: the quiet crate's
+records are written if its key is new (the `store kept front end` task does this for
+libraries today), its rows' kind is raised by one pass over its rows, and its heap values are
+let go. A request that arrives stops it.
+
+**The engine change this needs** (not built; it is the reason the two tests below are not
+written): three kinds for the whole database cannot say "only it". A write of kind `HIGH`
+makes every `HIGH` row verify again, so unsealing one crate today costs a walk over every
+sealed crate. The kind becomes a *seal group* a crate, ordered by the crate graph: a row keeps
+its crate's group (16 bits of `Header::meta`), the storage keeps a view a group
+(`closure_changed[g]`: the last view a leaf of `g` or of a group `g` depends on was written
+in), and a row verified at or after its group's view is current with one compare, as a
+durable row is now. A write to an input of crate `x` stamps `x`'s group and, only when
+`Seal(x)` is written, each group above it: a loop over crates, no rows. A row that reads a
+body below its own crate's interface records the body's group as well (a second word), so
+the compare stays exact. Then a sealed crate's rows need no edges (they verify by the group)
+and no place in the reverse index: the 108 and 106 MiB of step b1's second half.
+
+**Where this meets the other lanes.** firstedit-1112 changes how a walk uses what changed
+(readers that saw the change are passed over); this lane changes which rows a walk can reach
+at all. They meet at `Plan::suspects` and `frontier::clean`: a row of a sealed group is never
+a suspect, and `clean` must answer for it from its group's view, not from the walk. No file
+of the two lanes overlaps until the seal groups are built (`row.rs`, `function.rs`,
+`storage.rs` then; `frontier.rs` one line). content-keys-1112 owns the interface digest a
+unit's key takes for a dependency; the leaf's value is that same digest, made once
+(`hir_def::deps`), and its unit keys read it.
+
+**Built (b1, first half): a library crate's rows are `HIGH`.** The census
+(`Storage::durability_census`, said by a release when `BLAZE_DURABILITY_CENSUS` is set) names
+the fields that held them at `MEDIUM`: not `Resolutions` and `ImplSlices` by many direct
+reads (28 and 7,191 rows) but through what those few rows make: each crate's `DefMapPair`
+(466,718 rows read one), `ModuleScope` (117,442), `ItemBodySyntax` (116,449), `Modules`
+(65,809); and each file's source root and each root's file set (7,586 and 7,546). Library
+crates are now found in tables of their own at `HIGH` (`LibraryResolutions`,
+`LibraryImplSlices`), and a library root's file set and its files' roots are `HIGH`. The
+numbers are in the lane's report with the binaries they are of.
+
+**One front end a checkout (F1, above): not built, and it comes before the rest of this
+section.** Measured by the owner on hello-world: `build`, then `test`, then `build` costs
+about 4.5 s at each switch (`lower workspace` 3.6 s, `maintain` 2.7 s, 820,026 queries run,
+5,087 inputs written), because `unkept` lets the front end go when the plan's units differ.
+The invariant to build to: *a request's units are a view over one crate graph a checkout; a
+switch of goal writes no input of a crate both plans hold, and runs a number of queries
+bounded by the crates the new plan adds.* What `blaze_lower::lower_writes` makes a plan and
+has to find-or-make in the kept `Lowered` instead:
+
+| Made per plan now | Kept across plans by |
+|---|---|
+| source root ids, `0..sets` in the plan's order of package sets, and `other` | the load's directory (std's root, each package's) |
+| `LibraryRoots`, `LocalRoots` (`::new`, a second call panics) | set when a root is added |
+| `made`: a `Crate` a distinct (root file, data, cfg, env, runs, spelling) | the same tuple, with runs by run class unit id, not unit index; `Crate::create` only on a miss |
+| `all_crates` (set to the plan's) | the union; a plan's own list in `Lowered` (`Crates::units`), which every `job.crates.krate(unit)` already goes through |
+| `Lowered::{applied, class_runs, identities, narrowed, appended}` by unit index | by run class unit id and by `Crate` |
+| `ProcMacros::give(NotYetBuilt)` for every proc-macro crate | only for a crate made by this plan |
+| const macros' crates, macro hosts, doctests' crates | find-or-make by their file and content |
+| `KeptLowered::{units, session}` compared whole (`unkept`) | `units` no longer compared; the session's keys by `Crate` stay |
+
+and below it: a crate added to the graph (`Written::crates`) must give the name-resolution
+and impls maintainers a job for the added crates alone (`delta::unreached` returns false for
+every crate when `written.crates` is set), so the write names the crates it added. Its
+checks: a revision case `build, test, build, test, run, check` whose every switch after the
+first of each goal runs no query of a crate both plans hold (the engine's `Counts::executed`
+by crate) and writes no shared input, at two sizes of the dependency; the control makes the
+units part of the kept front end's identity again (`unkept`'s first test put back).
