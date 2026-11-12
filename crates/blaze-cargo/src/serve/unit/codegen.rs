@@ -2393,11 +2393,21 @@ fn launched(
     let plan = job.plan(unit).map_err(|it| it.what)?;
     let sidecar = Arc::new(Made::Whole(whole(&linked.sidecar)));
     let key = blaze_cas::Key(ContentId::of("blaze v2 serve launch sidecar", &linked.sidecar));
-    // alloc: the sidecar's paths, once a link
-    let side = std::iter::once(path)
-        .chain(super::artifact::uplifted(path, plan))
-        .map(|it| SideFile { path: super::run::launch::sidecar_of(it), key, file: Arc::clone(&sidecar) })
-        .collect();
+    // The file and its sidecar are the same bytes at every build of the program: placed by
+    // its first, and left as they are by every later one, so a running launcher's file is
+    // never replaced under it and a build that changed a body writes no file at all.
+    // alloc: the sidecar's paths, once a program
+    let side = match linked.first {
+        true => std::iter::once(path)
+            .chain(super::artifact::uplifted(path, plan))
+            .map(|it| SideFile {
+                path: super::run::launch::sidecar_of(it),
+                key,
+                file: Arc::clone(&sidecar),
+            })
+            .collect(),
+        false => Vec::new(), // alloc: none, empty
+    };
     let restart = linked.told.iter().find_map(|it| match it {
         Told::Restart { why } => Some(why.clone()), // clone: the reason, into the build's answer
         Told::Nothing | Told::Edit { .. } => None,
@@ -2410,7 +2420,7 @@ fn launched(
     };
     let tiers = tiers(job, unit, generated.built, generated.policy.toolchain.arch)?;
     Ok(LinkMade {
-        made: Some(Made::Whole(whole(&linked.file))),
+        made: linked.first.then(|| Made::Whole(whole(&linked.file))),
         written: Written::Bytes(linked.file),
         side,
         read: Vec::new(), // alloc: none, empty

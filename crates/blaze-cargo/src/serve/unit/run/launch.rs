@@ -327,6 +327,21 @@ fn serve(conn: Conn, mut socket: UnixStream, programs: &SharedMap<[u8; 32], Arc<
     };
     if let Err(why) = ended {
         tracing::error!(target: "blaze", "launcher {} of {}: {why}", conn.0, held.path);
+        // The launcher is told why it is served no more, so the program stops naming it.
+        let mut out = Vec::new(); // alloc: one frame
+        let unheld = Tell::Unheld { why: &why };
+        if unheld.encode(u64::MAX, &mut out).is_ok() {
+            // Written here, after everything queued: the writer thread may be mid-frame.
+            drop(send.send(out));
+            // The writer drains its queue before the socket is shut down below: bounded by
+            // the frames queued, a handful.
+            for _ in 0..1000 {
+                if send.is_empty() {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
     }
     let mut core = held.core.lock();
     core.program.disconnected(conn);
@@ -380,24 +395,25 @@ pub(crate) fn link(
     })?;
     let first = launches.programs.pin().get(&program_id(path)).is_none();
     let told = launches.built(path, generated.built, "main", |held| {
-        // The tables as a change of those the program holds, when the build's are of that
-        // snapshot; else every table.
+        // What `LinkInputs` says, against the snapshot the program holds: the same snapshot
+        // (nothing changed), a change of it, every table made anew (`work.whole`), or a
+        // snapshot the program does not hold, when every table is asked for.
         let side = generated.side()?;
+        // clone (each below): tables into the program's own copy
+        let changed = || Given::Changed {
+            tables: side.tables.iter().map(|it| (it.anchor, it.bytes.clone())).collect(),
+            removed: side.removed.clone(),
+        };
         match (side.base, held) {
-            (Some(base), Some(held)) if base == held => Ok((
+            (None, Some(held)) if held == side.serial => {
+                // alloc: none, both empty
+                Ok((side.serial, Given::Changed { tables: Vec::new(), removed: Vec::new() }))
+            }
+            (Some(base), Some(held)) if base == held => Ok((side.serial, changed())),
+            (None, _) if side.work.whole.is_some() => Ok((
                 side.serial,
-                Given::Changed {
-                    // clone: the changed tables, into the program's own copy
-                    tables: side.tables.iter().map(|it| (it.anchor, it.bytes.clone())).collect(),
-                    removed: side.removed.clone(), // clone: a few anchors
-                },
-            )),
-            (None, _) => Ok((
-                side.serial,
-                // clone: every table, into the program's own copy, once per program
                 Given::Whole(side.tables.iter().map(|it| (it.anchor, it.bytes.clone())).collect()),
             )),
-            // clone: every table, as above
             _ => Ok((side.serial, Given::Whole(generated.spans()?.to_vec()))),
         }
     })?;
