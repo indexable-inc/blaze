@@ -242,6 +242,10 @@ pub struct Storage {
     /// `opened` as the last write of kind `HIGH` left it: never renumbered, so a holder that
     /// kept it across views compares it ([`Storage::durable_view`]).
     high_opened: u64,
+    /// `opened` as the last write of kind [`SHED_FROM`](super::frontier::SHED_FROM) or above
+    /// left it: a pack sheds the reverse index's durable readers only once a walk ended at or
+    /// after it.
+    shed_opened: u64,
     /// `opened` when the views were last renumbered (0: never): the stamps of the views
     /// since are in step with `opened`, those before are not ([`Storage::stamp_of`]).
     renumbered: u64,
@@ -338,6 +342,7 @@ impl Storage {
             opened: u64::from(view),
             last_changed: [view; Durability::KINDS],
             high_opened: u64::from(view),
+            shed_opened: u64::from(view),
             renumbered: 0,
             written: [[0; 2]; HISTORY],
             dirs,
@@ -376,6 +381,12 @@ impl Storage {
     #[inline]
     pub fn view(&self) -> View {
         View(self.opened)
+    }
+
+    /// `opened` as the last write of kind [`SHED_FROM`](super::frontier::SHED_FROM) or above
+    /// left it.
+    pub(crate) fn shed_opened(&self) -> u64 {
+        self.shed_opened
     }
 
     /// The view the last write of kind `HIGH` opened ([`Storage::view`]'s numbering, never
@@ -639,7 +650,11 @@ impl Storage {
             self.high_opened = self.opened;
         }
         // Before the edge array settles: the fold reads the spans runs replaced.
-        self.fold_reverse();
+        let sheds = durability >= super::frontier::SHED_FROM;
+        if sheds {
+            self.shed_opened = self.opened;
+        }
+        self.fold_reverse(sheds);
         self.settle();
         self.sweep();
         self.view

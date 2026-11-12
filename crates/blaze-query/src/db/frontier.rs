@@ -40,6 +40,36 @@
 //! again until something else brought it up to date ([`Walked::apart`]). A walk contains at
 //! most [`UNWOUND_MOST`] of them: past that it marks what it reaches, verifying nothing.
 //!
+//! # Durable readers
+//!
+//! A row is *durable* here when it read nothing below kind [`SHED_FROM`] (a library's: nearly
+//! all of a daemon's rows). Such a row is not kept as a reader once the host packs the index
+//! ([`Storage::pack_reverse`]): the packed tier is made without it, the storage says so
+//! (`Frontier::shed`), and while it does a fold adds no run of a row that is durable then.
+//!
+//! The invariant, with the index shed: for every row `r` that is not durable and whose stored
+//! edges hold a node `d`, the index gives `r` among `d`'s readers; a walk ended at or after
+//! the last write of kind `SHED_FROM` or above before the pack (else the pack sheds nothing:
+//! that write's fields are still to be walked from, through durable readers); and no view was
+//! opened by such a write since the pack. Why that is enough: a durable row read only fields
+//! of kind `SHED_FROM` or above and durable rows, and made no untracked read, so by induction
+//! nothing but a write of such a kind changes what any of its reads gives, and a walk from a
+//! lower write, from a row such a write changed (which is not durable: it read the field) or
+//! from an untracked row (`LOW`) never has a durable row to find. It is the argument by which
+//! a pull verifies such a row with one compare and no walk of its edges
+//! (`Storage::unchanged_since`). A row that is emptied or evicted and made again reads the
+//! same and stays durable; a row only stops being durable by a run that such a write caused.
+//!
+//! A pack sheds only when its storage has been quiet: no durable write since the pack before
+//! it, and since more packs each time a durable write ended a shed (`quiet_due`).
+//!
+//! A write of kind `SHED_FROM` or above ends it: the boundary that opens its view makes the
+//! index again from every row's stored edges ([`Storage::fold_reverse`], the same pass as when
+//! stale readers pass twice the edges), before any run or walk of that view, so the walk from
+//! the written field finds its durable readers as an index never shed does. The cost is the
+//! rows' edges, once such a write, never a body edit's; the host's next pack sheds again. The
+//! fold's span says `unshed`, and the pack's how many rows are of each kind.
+//!
 //! Persistence: none. The storage is memory (a restart makes another storage), and the index
 //! is made from the rows' own edges: empty with an empty storage, it holds the invariant from
 //! the first run on.
@@ -61,7 +91,7 @@ use super::{
     local,
     reverse::{Plan, Reverse, Seen},
     row::{Header, PROVISIONAL, RUNNING, UNTRACKED, VALUE, VIEW_MASK, span},
-    storage::{Database, Storage, View, key_parts},
+    storage::{Database, Durability, Storage, View, key_parts},
 };
 
 /// The edges one run stored: its row's node, the span it held before (0 for none) and the
@@ -237,7 +267,17 @@ pub(crate) enum Plant {
     /// The walk goes on verifying however many verifications unwound ([`UNWOUND_MOST`]
     /// taken out): a panic a row for everything keyed by what an edit removed.
     ContainsEveryUnwind,
+    /// A write of a durable input leaves the reverse index as a pack shed it: the durable
+    /// readers of what was written are not in it, and are not asked.
+    KeepsShedAcrossDurableWrite,
 }
+
+/// The lowest kind of row a pack sheds from the reverse index, and of write that ends the shed
+/// (the module's "Durable readers"). `MEDIUM`: a library's rows read the maintainers' published
+/// tables, the crate graph and their files' source roots, all of kind `MEDIUM`, so nearly none
+/// is at `HIGH` (hello-world, 2026-11-11: of 2,105,574 rows 181,865 at `HIGH`, 1,906,504 at
+/// `MEDIUM`, 17,205 at `LOW`).
+pub(crate) const SHED_FROM: Durability = Durability::MEDIUM;
 
 /// The storage's part of the changed set.
 pub(crate) struct Frontier {
@@ -253,7 +293,29 @@ pub(crate) struct Frontier {
     clean_at: AtomicU64,
     /// How many rows [`Walked::apart`] holds.
     unwound: AtomicU32,
+    /// The reverse index holds no reader that was durable when it was last packed
+    /// ([`Storage::pack_reverse`], the module's "Durable readers"). Written at a view boundary
+    /// or a pack (`&mut`).
+    shed: bool,
+    /// How many times a durable write ended a shed ([`Storage::fold_reverse`]'s `unshed`), and
+    /// how many packs in a row since the last such write found none between them: a pack
+    /// sheds only once the second reaches [`quiet_due`] of the first.
+    unsheds: u32,
+    quiet: u32,
+    /// [`Storage::shed_opened`] as the last pack saw it.
+    packed_at: u64,
     plant: Plant,
+}
+
+/// How many packs in a row with no durable write between them a shed waits for, after
+/// `unsheds` sheds a durable write ended: 2, then twice as many each time, at most 64. Making
+/// the index again costs every row's edges (543 ms on hello-world's 25.5 million), so a
+/// storage whose builds keep writing durable inputs pays it a number of times logarithmic in
+/// its builds, never once a build. Two at first: the build after a cold one writes durable
+/// inputs once more (it is served the images the cold build stored).
+#[blaze::pure]
+fn quiet_due(unsheds: u32) -> u32 {
+    2 << unsheds.min(5)
 }
 
 impl Frontier {
@@ -267,6 +329,10 @@ impl Frontier {
             walked: blaze_core::lock::Lock::new("query.frontier.walked", Walked::default()),
             clean_at: AtomicU64::new(0),
             unwound: AtomicU32::new(0),
+            shed: false,
+            unsheds: 0,
+            quiet: 0,
+            packed_at: 0,
             plant: Plant::None,
         }
     }
@@ -335,6 +401,12 @@ impl Storage {
         self.frontier.plant = Plant::ForgetsReadersOfWritten;
     }
 
+    /// The readers the reverse index holds now, in both tiers.
+    #[cfg(test)]
+    pub(crate) fn reverse_readers(&self) -> u64 {
+        self.frontier.held()
+    }
+
     /// An input field's node was written (with `&mut`: its setter).
     pub(crate) fn note_written(&mut self, node: u32) {
         self.frontier.walked.get_mut().written.push(node); // alloc: the writes since the last walk, a word each
@@ -351,11 +423,17 @@ impl Storage {
     /// the index holds more than twice the edges the rows name (and a margin of the nodes),
     /// stale readers are most of it, and it is made again from every row: at most the readers
     /// it frees.
-    pub(crate) fn fold_reverse(&mut self) {
-        if self.frontier.stored.is_empty() {
+    ///
+    /// `durable`: the view this boundary opens was opened by a write of kind [`SHED_FROM`] or
+    /// above. An index
+    /// shed of its durable readers is then made again from every row, here, before any run or
+    /// walk of the view (the module's "Durable readers").
+    pub(crate) fn fold_reverse(&mut self, durable: bool) {
+        let plant = self.frontier.plant;
+        let unshed = durable && self.frontier.shed && plant != Plant::KeepsShedAcrossDurableWrite;
+        if self.frontier.stored.is_empty() && !unshed {
             return;
         }
-        let plant = self.frontier.plant;
         let mut reverse = std::mem::take(&mut self.frontier.reverse);
         // Named, so a view's time folding is its own, never its writer's self time (rule 16).
         let fold = tracing::info_span!(
@@ -366,14 +444,29 @@ impl Storage {
             readers = tracing::field::Empty,
             remade = tracing::field::Empty,
             packed = tracing::field::Empty,
+            durable_runs = tracing::field::Empty,
+            unshed,
         );
         let _entered = fold.enter();
         let mut seen = Seen::with_hasher(blaze_hash::FixedState);
         let (mut old, mut new) = (Vec::new(), Vec::new()); // alloc: none until a run is folded, then scratch of one row's edges
         let mut runs = 0u64;
+        // While the index stays shed, a run of a row that is durable now adds nothing: it is
+        // no reader the invariant asks for, and the pass that ends the shed reads its edges
+        // from the row. One load of its header in place of a copy of its edges, old and new
+        // (a build's store of its dependencies' signatures runs a million and a half of them).
+        let shed = self.frontier.shed && !unshed;
+        let mut durable_runs = 0u64;
         while let Some(stored) = self.frontier.stored.pop() {
             runs += 1;
             if plant == Plant::KeepsOldEdges && stored.old != 0 {
+                continue;
+            }
+            if shed
+                && row_of(self, stored.node)
+                    .is_some_and(|(header, _, _)| header.durability() >= SHED_FROM.as_u8())
+            {
+                durable_runs += 1;
                 continue;
             }
             self.copy_edges(stored.old, &mut old);
@@ -384,8 +477,14 @@ impl Storage {
             reverse.stored(stored.node, &old, &new, &mut seen);
         }
         let nodes = u64::from(self.nodes_made());
-        let remade = plant == Plant::None && reverse.held() > 2 * self.live_edges() + nodes + (1 << 16);
+        let remade = unshed
+            || (plant == Plant::None && reverse.held() > 2 * self.live_edges() + nodes + (1 << 16));
         if remade {
+            // Made from every row, the durable ones too: whole again.
+            self.frontier.shed = false;
+            if unshed {
+                self.frontier.unsheds = self.frontier.unsheds.saturating_add(1);
+            }
             reverse.clear();
             for node in 1..self.nodes_made() {
                 let Some((header, _, _)) = row_of(self, node) else { continue };
@@ -400,18 +499,54 @@ impl Storage {
             reverse.pack();
         }
         fold.record("runs", runs);
+        fold.record("durable_runs", durable_runs);
         fold.record("readers", reverse.held());
         fold.record("remade", remade);
         fold.record("packed", packed);
         self.frontier.reverse = reverse;
     }
 
-    /// Packs the reverse index where its lists hold enough readers to pay
-    /// ([`Reverse::worth_packing`]): what a host does with time to spare (a build's end), so
-    /// what a build's runs added is held at 4 bytes a reader from then on. With `&mut`: no
-    /// walk reads the index meanwhile.
+    /// Packs the reverse index and sheds its durable readers (the module's "Durable
+    /// readers"): what a host does with time to spare (a build's end), so what a build's runs
+    /// added is held at 4 bytes a reader from then on, and of the rows that read nothing below
+    /// kind `HIGH` (a library's: most of a daemon's rows) nothing is held. With `&mut`: no
+    /// walk reads the index meanwhile. An index already shed is packed again only where its
+    /// lists hold enough readers to pay ([`Reverse::worth_packing`]).
+    ///
+    /// Costs one load of every row's header (which rows are durable now) and two passes over
+    /// the readers held.
     pub fn pack_reverse(&mut self) {
-        if !self.frontier.reverse.worth_packing() {
+        // No walk ended since the last write of kind `SHED_FROM` or above: what it wrote is still to be
+        // walked from, through durable readers. Packed whole, shed at a later pack.
+        // And a storage whose durable inputs are being written (a build's script runs, a serve
+        // of images) is not shed until its packs have been quiet for long enough
+        // ([`quiet_due`]): each shed such a write ends costs every row's edges.
+        let written = self.shed_opened();
+        self.frontier.quiet = match written == self.frontier.packed_at {
+            true => self.frontier.quiet.saturating_add(1),
+            false => 0,
+        };
+        self.frontier.packed_at = written;
+        if self.frontier.clean_at.load(Ordering::Relaxed) < written
+            || self.frontier.quiet < quiet_due(self.frontier.unsheds)
+        {
+            if self.frontier.reverse.worth_packing() {
+                let pack = tracing::info_span!(
+                    target: "blaze",
+                    "reverse edges pack",
+                    readers = self.frontier.reverse.held(),
+                    before = self.frontier.reverse.bytes(),
+                    after = tracing::field::Empty,
+                    kept = tracing::field::Empty,
+                );
+                let _entered = pack.enter();
+                self.frontier.reverse.pack();
+                pack.record("after", self.frontier.reverse.bytes());
+                pack.record("kept", self.frontier.reverse.held());
+            }
+            return;
+        }
+        if self.frontier.shed && !self.frontier.reverse.worth_packing() {
             return;
         }
         let pack = tracing::info_span!(
@@ -420,10 +555,37 @@ impl Storage {
             readers = self.frontier.reverse.held(),
             before = self.frontier.reverse.bytes(),
             after = tracing::field::Empty,
+            kept = tracing::field::Empty,
+            rows_low = tracing::field::Empty,
+            rows_medium = tracing::field::Empty,
+            rows_high = tracing::field::Empty,
         );
         let _entered = pack.enter();
-        self.frontier.reverse.pack();
-        pack.record("after", self.frontier.reverse.bytes());
+        // A bit a node: whether it is a row that read nothing below `HIGH`.
+        let nodes = self.nodes_made() as usize;
+        let mut durable = vec![0u64; nodes / 64 + 1]; // alloc: scratch of one pack, a bit a node
+        // How many rows are of each kind: what says how much a shed can take (a library's
+        // rows that read one input below `HIGH` are all kept).
+        let mut kinds = [0u64; Durability::KINDS];
+        for node in 1..nodes {
+            let Some((header, _, _)) = row_of(self, node as u32) else { continue };
+            let kind = Durability::from_bits(header.durability());
+            kinds[kind.as_u8() as usize] += 1;
+            if kind >= SHED_FROM {
+                durable[node / 64] |= 1 << (node % 64);
+            }
+        }
+        pack.record("rows_low", kinds[0]);
+        pack.record("rows_medium", kinds[1]);
+        pack.record("rows_high", kinds[2]);
+        let mut reverse = std::mem::take(&mut self.frontier.reverse);
+        reverse.pack_without(|reader| {
+            durable.get(reader as usize / 64).is_some_and(|word| word >> (reader % 64) & 1 == 1)
+        });
+        pack.record("after", reverse.bytes());
+        pack.record("kept", reverse.held());
+        self.frontier.reverse = reverse;
+        self.frontier.shed = true;
     }
 
     /// The nodes of the edge span `span`, into `out` (emptied first).

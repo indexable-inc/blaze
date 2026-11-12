@@ -149,6 +149,8 @@ enum Step {
     Evict,
     /// Ends an epoch: values unread for two go.
     Epoch,
+    /// Packs the reverse index, shedding its durable readers (a build's end).
+    Pack,
     /// Asks for these nodes' values without asking for the changed set: a pull in a view no
     /// walk may ever run in.
     Pull(Vec<usize>),
@@ -160,6 +162,10 @@ enum Step {
 #[derive(Clone, Debug)]
 struct Program {
     inputs: usize,
+    /// The inputs of kind `MEDIUM` or `HIGH` (a library's), by index and whether `HIGH`; the
+    /// rest are `LOW`. A row that reads only these is durable, and a pack sheds it from the
+    /// reverse index.
+    durable: Vec<(usize, bool)>,
     flow: Vec<FlowNode>,
     steps: Vec<Step>,
 }
@@ -167,6 +173,8 @@ struct Program {
 fn program(tc: &TestCase) -> Program {
     let int = |low: usize, high: usize| tc.draw(gs::integers::<usize>().min_value(low).max_value(high));
     let inputs = int(1, 5);
+    let durable =
+        (0..inputs).filter(|_| tc.draw(gs::booleans())).map(|at| (at, tc.draw(gs::booleans()))).collect();
     let nodes = int(1, 10);
     let mut flow = Vec::with_capacity(nodes);
     for at in 0..nodes {
@@ -189,13 +197,13 @@ fn program(tc: &TestCase) -> Program {
             0..=3 => Step::Write(int(0, inputs - 1), tc.draw(gs::integers::<u64>().max_value(6))),
             4 => Step::World(tc.draw(gs::integers::<u64>().max_value(3))),
             5 => Step::Evict,
-            6 => Step::Epoch,
+            6 => [Step::Epoch, Step::Pack][int(0, 1)].clone(),
             7 | 8 => Step::Pull((0..int(1, 3)).map(|_| int(0, nodes - 1)).collect()),
             _ => Step::Ask(int(0, 3)),
         });
     }
     steps.push(Step::Ask(0));
-    Program { inputs, flow, steps }
+    Program { inputs, durable, flow, steps }
 }
 
 /// One ask the simulation made: the view it was made in, the step it followed, and the nodes
@@ -214,7 +222,13 @@ fn simulate(program: &Program, plant: Plant) -> Result<(), String> {
     *db.flow.lock() = program.flow.clone();
     let mut inputs: Vec<u64> = (0..program.inputs as u64).collect();
     let mut world = 0u64;
-    let cells: Vec<Cell> = inputs.iter().map(|&value| Cell::new(&db, value, 0)).collect();
+    let kind = |input: usize| match program.durable.iter().find(|it| it.0 == input) {
+        Some((_, true)) => Durability::HIGH,
+        Some((_, false)) => Durability::MEDIUM,
+        None => Durability::LOW,
+    };
+    let cells: Vec<Cell> =
+        inputs.iter().enumerate().map(|(at, &value)| Cell::of(&db, value, 0, kind(at))).collect();
     db.cells.lock().extend(cells.iter().map(|it| it.0));
     let nodes = program.flow.len();
     let ids: BTreeMap<u32, usize> =
@@ -242,6 +256,13 @@ fn simulate(program: &Program, plant: Plant) -> Result<(), String> {
             }
             Step::Epoch => {
                 db.storage_mut().end_epoch();
+            }
+            Step::Pack => {
+                // As many packs in a row as a shed ever waits for (`frontier::quiet_due`'s
+                // most), so each such step sheds where a walk allows it, whatever came before.
+                for _ in 0..=64 {
+                    db.storage_mut().pack_reverse();
+                }
             }
             Step::Pull(pulled) => {
                 let now = evaluate(&program.flow, &inputs, world);
@@ -343,7 +364,7 @@ fn the_oracle_catches_a_reverse_edge_not_recorded() {
     let mut steps = vec![Step::Pull((0..12).collect()), Step::Ask(0)];
     steps.extend((0..4).map(|input| Step::Write(input, 10 + input as u64)));
     steps.push(Step::Ask(0));
-    let program = Program { inputs: 4, flow, steps };
+    let program = Program { inputs: 4, durable: Vec::new(), flow, steps };
     caught(&program, Plant::DropsAnEdge, "does not name it");
 }
 
@@ -363,7 +384,7 @@ fn the_oracle_catches_a_stale_edge_after_a_rows_dependencies_change() {
         Step::Write(2, 9),
         Step::Ask(0),
     ];
-    let program = Program { inputs: 3, flow: vec![pick], steps };
+    let program = Program { inputs: 3, durable: Vec::new(), flow: vec![pick], steps };
     caught(&program, Plant::KeepsOldEdges, "does not name it");
 }
 
@@ -372,7 +393,7 @@ fn the_oracle_catches_a_stale_edge_after_a_rows_dependencies_change() {
 fn the_oracle_catches_a_changed_reader_that_does_not_pass_the_walk_on() {
     let flow = vec![sum(&[Dep::Input(0)]), sum(&[Dep::Query(0)])];
     let steps = vec![Step::Pull(vec![1]), Step::Ask(0), Step::Write(0, 5), Step::Ask(0)];
-    let program = Program { inputs: 1, flow, steps };
+    let program = Program { inputs: 1, durable: Vec::new(), flow, steps };
     caught(&program, Plant::StopsAtChangedReader, "does not name it");
 }
 
@@ -381,7 +402,7 @@ fn the_oracle_catches_a_changed_reader_that_does_not_pass_the_walk_on() {
 fn the_oracle_catches_a_cutoff_not_applied() {
     let flow = vec![FlowNode { op: FlowOp::Mod3, deps: vec![Dep::Input(0)] }];
     let steps = vec![Step::Pull(vec![0]), Step::Ask(0), Step::Write(0, 3), Step::Ask(0)];
-    let program = Program { inputs: 1, flow, steps };
+    let program = Program { inputs: 1, durable: Vec::new(), flow, steps };
     caught(&program, Plant::NamesEqualRows, "never moved");
 }
 
@@ -392,8 +413,82 @@ fn the_oracle_catches_an_evicted_row_passed_over() {
     let flow = vec![sum(&[Dep::Input(0)])];
     let steps =
         vec![Step::Pull(vec![0]), Step::Ask(0), Step::Evict, Step::Write(0, 5), Step::Ask(0)];
-    let program = Program { inputs: 1, flow, steps };
+    let program = Program { inputs: 1, durable: Vec::new(), flow, steps };
     caught(&program, Plant::SkipsEvictedRows, "does not name it");
+}
+
+/// A durable row shed from the reverse index and then a write of the durable input it reads:
+/// the plant leaves the index shed, so the walk from the written field finds no reader. The
+/// second row reads a `LOW` input as well, is never shed, and shows the pack alone loses
+/// nothing: the program passes as the engine is.
+#[test]
+fn the_oracle_catches_a_durable_write_over_an_index_left_shed() {
+    let flow = vec![sum(&[Dep::Input(0)]), sum(&[Dep::Query(0), Dep::Input(1)])];
+    let steps = vec![
+        Step::Pull(vec![0, 1]),
+        // A view boundary, so the runs' edges are in the index the pack sheds, and a walk
+        // after it, so the pack does shed.
+        Step::Write(1, 3),
+        Step::Ask(0),
+        // The first pack sees the inputs' making; the next two, nothing durable written
+        // since, and the second of them sheds.
+        Step::Pack,
+        Step::Pack,
+        Step::Pack,
+        Step::Write(1, 7),
+        Step::Ask(0),
+        Step::Write(0, 5),
+        Step::Ask(0),
+    ];
+    for high in [false, true] {
+        let program =
+            Program { inputs: 2, durable: vec![(0, high)], flow: flow.clone(), steps: steps.clone() };
+        caught(&program, Plant::KeepsShedAcrossDurableWrite, "does not name it");
+    }
+}
+
+/// What a pack sheds and what a durable write brings back, counted: two durable rows and one
+/// below `HIGH` over the same durable row; the pack keeps the one reader below `HIGH`, and
+/// the fold of a write of the durable input holds all three again.
+#[test]
+fn a_pack_sheds_the_durable_readers_and_a_durable_write_makes_the_index_again() {
+    let mut db = TestDb::new();
+    let flow = vec![
+        sum(&[Dep::Input(0)]),
+        sum(&[Dep::Query(0)]),
+        sum(&[Dep::Query(0), Dep::Input(1)]),
+    ];
+    *db.flow.lock() = flow;
+    let cells = [Cell::of(&db, 1, 0, Durability::MEDIUM), Cell::new(&db, 2, 0)];
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
+    for at in 0..3 {
+        fetch::<Flow>(&db, node(&db, at));
+    }
+    // A view boundary folds what the runs stored: input 0 -> row 0, row 0 -> rows 1 and 2,
+    // input 1 -> row 2.
+    cells[1].set_a(&mut db, 3);
+    assert_eq!(db.storage().reverse_readers(), 4);
+    db.storage_mut().pack_reverse();
+    assert_eq!(db.storage().reverse_readers(), 4, "no walk since the inputs were made: nothing is shed");
+    let since = db.storage().view();
+    assert!(matches!(changed_since::<Flow>(&db, since), Changed::Keys(_)));
+    db.storage_mut().pack_reverse();
+    assert_eq!(db.storage().reverse_readers(), 4, "one quiet pack: a shed waits for two");
+    db.storage_mut().pack_reverse();
+    assert_eq!(db.storage().reverse_readers(), 2, "row 2's two edges: it reads a `LOW` input");
+    cells[1].set_a(&mut db, 4);
+    assert_eq!(db.storage().reverse_readers(), 2, "a `LOW` write leaves the index shed");
+    cells[0].set_a(&mut db, 5);
+    assert_eq!(db.storage().reverse_readers(), 4, "a `MEDIUM` write makes it again from every row");
+    assert_eq!(*fetch::<Flow>(&db, node(&db, 2)), 9);
+    // One shed was ended by a durable write, so the next waits for four quiet packs: the
+    // first pack after the write is not quiet, then four are.
+    let since = db.storage().view();
+    assert!(matches!(changed_since::<Flow>(&db, since), Changed::Keys(_)));
+    for (pack, held) in [4, 4, 4, 4, 2].into_iter().enumerate() {
+        db.storage_mut().pack_reverse();
+        assert_eq!(db.storage().reverse_readers(), held, "pack {pack} after the durable write");
+    }
 }
 
 /// A row that made an untracked read is asked by every walk: the world changes with nothing
@@ -402,7 +497,7 @@ fn the_oracle_catches_an_evicted_row_passed_over() {
 fn an_untracked_read_puts_its_row_in_every_walk() {
     let flow = vec![FlowNode { op: FlowOp::World, deps: vec![Dep::Input(0)] }, sum(&[Dep::Query(0)])];
     let steps = vec![Step::Pull(vec![1]), Step::Ask(0), Step::World(2), Step::Ask(0)];
-    let program = Program { inputs: 1, flow: flow.clone(), steps };
+    let program = Program { inputs: 1, durable: Vec::new(), flow: flow.clone(), steps };
     assert_eq!(simulate(&program, Plant::None), Ok(()));
     let mut db = TestDb::new();
     *db.flow.lock() = flow;

@@ -11,7 +11,9 @@
 //! The invariant: for every row `r` whose stored edges, as of the last fold, hold a node `d`,
 //! [`Reverse::readers`] of `d` gives `r`. It may give more (a row that ran again without the
 //! edge stays, until [`Reverse::clear`] and a fold of every row): a reader named too often
-//! costs one verification, a reader missed is a stale result.
+//! costs one verification, a reader missed is a stale result. [`Reverse::pack_without`] takes
+//! readers out by the driver's rule, which states what holds of them from then on
+//! ([`super::frontier`], "Durable readers").
 //!
 //! Memory: two tiers. Readers added since the last [`Reverse::pack`] are in lists: a reader
 //! is one `u32` in a block of its node's list, blocks double from [`FIRST`] to [`MOST`]
@@ -128,6 +130,40 @@ impl Reverse {
         self.packed = packed;
         // The lists' arrays go back whole: what they grew to is a build's burst, not what the
         // next edits add.
+        self.heads = Vec::new();
+        self.blocks = Vec::new();
+        self.held = 0;
+    }
+
+    /// [`Reverse::pack`] that leaves out every reader `shed` names: after it,
+    /// [`Reverse::readers`] gives each node the readers it gave before that `shed` does not
+    /// name, and the packed tier is as large as those. Two passes over the readers held (the
+    /// first counts, so the tier is taken at its size and no larger); it runs with nothing in
+    /// the lists too, as the packed tier may hold readers to shed.
+    ///
+    /// What may be shed is the driver's to say ([`super::frontier`], "Durable readers").
+    pub(crate) fn pack_without(&mut self, shed: impl Fn(u32) -> bool) {
+        let nodes = self.heads.len().max(self.starts.len().saturating_sub(1));
+        let mut total = 0usize;
+        for node in 0..nodes {
+            total += self.packed_of(node as u32).iter().filter(|&&reader| !shed(reader)).count();
+            self.listed(node as u32, |reader| total += usize::from(!shed(reader)));
+        }
+        let mut starts: Vec<u32> = Vec::with_capacity(nodes + 1); // alloc: the reverse index, kept for the storage's life
+        let mut packed: Vec<u32> = Vec::with_capacity(total); // alloc: as above
+        for node in 0..nodes {
+            starts.push(packed.len() as u32); // alloc: within the capacity taken above
+            packed.extend(self.packed_of(node as u32).iter().copied().filter(|&reader| !shed(reader))); // alloc: within the capacity taken above
+            self.listed(node as u32, |reader| {
+                if !shed(reader) {
+                    packed.push(reader); // alloc: within the capacity taken above
+                }
+            });
+        }
+        starts.push(packed.len() as u32); // alloc: within the capacity taken above
+        debug_assert_eq!(packed.len(), total);
+        self.starts = starts;
+        self.packed = packed;
         self.heads = Vec::new();
         self.blocks = Vec::new();
         self.held = 0;
@@ -396,6 +432,74 @@ mod tests {
             let want = model.get(&dep).cloned().unwrap_or_default();
             if given != want {
                 return Err(format!("node {dep}: given {given:?}, added {want:?}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The invariant: after any run of adds, packs and sheds, a node gives exactly the readers
+    /// added to it since each was last shed. Checked against a model that takes the shed
+    /// readers out of every node's set, from a seeded generator, readers spanning both tiers.
+    #[test]
+    fn a_shedding_pack_keeps_every_reader_it_was_not_told_to_shed() {
+        for seed in 0..200u64 {
+            if let Err(why) = shed_against_the_model(seed, false) {
+                panic!("seed {seed}: {why}");
+            }
+        }
+    }
+
+    /// The oracle catches a shed that packs and sheds nothing (the planted bug): the readers
+    /// the model took out are still given.
+    #[test]
+    fn the_oracle_catches_a_shed_that_keeps_what_it_was_told_to_shed() {
+        let caught = (0..200u64).filter(|&seed| shed_against_the_model(seed, true).is_err()).count();
+        assert!(caught > 100, "the planted bug was caught in {caught} of 200 runs");
+    }
+
+    /// One run of adds, packs and sheds against the model; `planted` sheds nothing.
+    fn shed_against_the_model(seed: u64, planted: bool) -> Result<(), String> {
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut draw = |below: u64| {
+            // xorshift64*: a seeded stream, the same on every run (rule 25).
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D) % below
+        };
+        let mut reverse = Reverse::default();
+        let mut model: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+        let steps = 50 + draw(350);
+        for step in 0..steps {
+            match draw(40) {
+                0 => reverse.pack(),
+                1 => {
+                    // Which readers go: those of one residue of a small modulus, so a shed
+                    // takes some of most nodes' readers and leaves the rest.
+                    let (modulus, residue) = (2 + draw(3) as u32, draw(2) as u32);
+                    let shed = |reader: u32| reader % modulus == residue;
+                    match planted {
+                        false => reverse.pack_without(shed),
+                        true => reverse.pack(),
+                    }
+                    for readers in model.values_mut() {
+                        readers.retain(|&reader| !shed(reader));
+                    }
+                }
+                _ => {
+                    let dep = draw(4 + step * 20 / steps) as u32;
+                    let reader = 100 + draw(64) as u32;
+                    reverse.add(dep, reader);
+                    model.entry(dep).or_default().insert(reader);
+                }
+            }
+        }
+        for dep in 0..32u32 {
+            let given: BTreeSet<u32> = readers(&reverse, dep).into_iter().collect();
+            let want = model.get(&dep).cloned().unwrap_or_default();
+            if given != want {
+                return Err(format!("node {dep}: given {given:?}, kept {want:?}"));
             }
         }
         Ok(())
