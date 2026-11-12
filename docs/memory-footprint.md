@@ -192,9 +192,12 @@ Built, each with before and after from the same script:
   the largest flush's. The heap outside any task 336 to 130 MiB.
 - **The reverse edges are packed** at 4 bytes a reader once the lists hold as many readers as
   the packed tier, and at a build's end (`blaze_query::db::reverse`). 267 to 106 MiB.
-- **mimalloc's huge pages are kept**, knowingly (`crates/blaze-engine/src/huge.rs` has the
-  table): built with `no_thp` the daemon is 3,867 to 4,066 MiB and a body edit 3.5 s after the
-  last is 5% to 22% slower in four alternated pairs (medians of 20 or 30).
+- **mimalloc's huge pages were kept** by that lane (built with `no_thp` the daemon was 3,867
+  to 4,066 MiB and a body edit 3.5 s after the last read 5% to 22% slower), and taken out the
+  day after (lane memstrat-1111, `crates/blaze-engine/src/huge.rs` has the table): measured
+  again with the home on tmpfs and the VM's memory fully added, the edit rows are within the
+  runs' spread and the daemon is 1.25 GiB smaller; what it costs is an edit of a daemon that
+  has already taken a hundred, a quarter slower.
 
 Together: 5,796 to 5,224 MiB resident (two runs each), with every edit-loop row within the
 runs' spread of the base's. With `no_thp` as well: 3,867 to 4,037 MiB.
@@ -210,6 +213,9 @@ what takes it down, and nothing of step 4 was built by this lane. An edit's buil
 allocates and frees 95 MiB of the global heap (`CompiledFunction::clone` 27, the linker's
 `file::fill` 20, `patch_lists` 13, the debug side 15), which is what makes huge pages worth
 17% of an edit; with that gone, `no_thp` is 1.0 GiB for nothing.
+
+What came next (the pool's give-back wired, mimalloc on base pages, the order for the rest):
+[v2/plan/design/restore.md](v2/plan/design/restore.md), "Memory: a bounded cache over records".
 
 ### 4. Outputs as records in the store's buffer pool
 

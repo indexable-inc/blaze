@@ -586,10 +586,10 @@ libc = "0.2.191"
 memchr = "2.8.3"
 # mimalloc's C side: the `blaze` binary's general-purpose allocator, a first-class heap per
 # blaze-mem tag (blaze-engine's `heaps.rs`, docs/v2/plan/design/memory.md), `mi_collect` when the
-# daemon gives freed pages back, and (`extended`) its options. Not `no_thp`: its arenas stay
-# advised onto transparent huge pages, which is 17% of a body edit's time against 1.0 GiB
-# resident (blaze-engine's `huge.rs` has the measurement).
-libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
+# daemon gives freed pages back, and (`extended`) its options. `no_thp`: its arenas are on base
+# pages, not advised onto transparent huge pages, which were 1.25 GiB of a hello-world daemon
+# for nothing it holds (blaze-engine's `huge.rs` has the measurement).
+libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended", "no_thp"] }
 postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
 pulldown-cmark = { version = "0.13.6", default-features = false }
 syntax-tree = { path = "crates/syntax-tree", version = "0.0.0" }

@@ -263,6 +263,26 @@ impl Side {
         swept
     }
 
+    /// One lap of the sweep over the pool's pages ([`Sweep::lap`]): what was not read again
+    /// since the sweep last came by is given back, what was stays for one lap more.
+    pub(crate) fn trim(&self) -> Swept {
+        let span = tracing::info_span!(
+            target: "blaze",
+            "store pool trim",
+            freed = tracing::field::Empty,
+            visited = tracing::field::Empty,
+        );
+        let _in = span.enter();
+        let mut gate = self.gate.lock();
+        let Gate { windows, sweep } = &mut *gate;
+        let swept = sweep.lap(&*self.pool, windows);
+        drop(gate);
+        span.record("freed", &swept.freed);
+        span.record("visited", &swept.visited);
+        counts::evicted(swept.freed);
+        swept
+    }
+
     /// The pool's pages as one walk of their state words finds them: what is loaded, what
     /// of it is pinned, and what a sweep could give back now.
     pub(crate) fn census(&self) -> Census {
@@ -1024,6 +1044,12 @@ impl Hot {
     pub(crate) fn evict(&mut self, bytes: u64) -> Option<Swept> {
         let open = self.open.as_mut().ok()?;
         Some(open.side.evict(bytes))
+    }
+
+    /// One lap of the sweep ([`Side::trim`]).
+    pub(crate) fn trim(&mut self) -> Option<Swept> {
+        let open = self.open.as_mut().ok()?;
+        Some(open.side.trim())
     }
 
     /// The pool's census ([`Side::census`]).

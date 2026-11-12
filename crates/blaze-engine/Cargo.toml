@@ -50,7 +50,7 @@ anyhow.workspace = true
 # The host's target triple, which names the release archive a pin fetches (`versions.rs`).
 hir-ty-codegen.workspace = true
 blaze-graph.workspace = true
-# mimalloc, a heap per blaze-mem tag (`heaps.rs`), on the huge pages `blaze-mem` chose (`huge.rs`).
+# mimalloc, a heap per blaze-mem tag (`heaps.rs`), on base pages (`huge.rs`).
 libmimalloc-sys = { workspace = true, optional = true, features = ["extended"] }
 blaze-mem.workspace = true
 # Reported bugs leave the binary's exit status alone (`program.rs`): its daemon says them.

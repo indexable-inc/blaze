@@ -215,6 +215,16 @@ const GIVE_BACK_EVERY: Duration = Duration::from_secs(1);
 /// ([`blaze_graph::arena::kept_of`]) get a purge whatever the footprint: one in 4. Freed pages
 /// kept past it are memory admission cannot grant and the ceiling counts.
 const KEPT_HIGH_WATER: u64 = 4;
+/// Which of the stores' pool pages a give-back takes ([`Daemon::give_pools_back`]).
+#[derive(Clone, Copy, Debug)]
+enum PoolGive {
+    /// What nothing read again since the sweep last came by (`Store::trim_pool`): an idle
+    /// daemon's, each [`super::idle::POOL_AFTER`] of a stretch of idleness.
+    Unread,
+    /// Every page no task pins (`Store::evict_pool`): a daemon past its limit's line or told
+    /// of memory pressure by the system, before it holds work back.
+    Unpinned,
+}
 /// How often, at most, the daemon looks for builds held back for memory to tell their clients
 /// ([`Jobs::tell_paused`]): a quarter of the second a build waits before it is told.
 const PAUSED_EVERY: Duration = Duration::from_millis(250);
@@ -744,6 +754,9 @@ pub struct Daemon<D: Driver, S: Steps> {
     given_back: Duration,
     /// Whether this stretch with nothing to do gave its warm memory back ([`super::idle`]).
     idle: super::idle::Idle,
+    /// When this stretch with nothing to do last gave the stores' pool pages back: again
+    /// each [`super::idle::POOL_AFTER`] of it.
+    pool_idle: super::idle::Idle,
     /// Whether the system's memory pressure is watched ([`PRESSURE`]): from the start until its
     /// watch fails (no source here) or is undone at the stop.
     pressure_watched: bool,
@@ -1774,6 +1787,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             memory_logged: Duration::ZERO,
             given_back: Duration::ZERO,
             idle: super::idle::Idle::default(),
+            pool_idle: super::idle::Idle::every(super::idle::POOL_AFTER),
             pressure_watched: true,
             paused_checked: Duration::ZERO,
             gc: None,
@@ -2524,6 +2538,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 if now.saturating_sub(self.given_back) >= GIVE_BACK_EVERY {
                     self.given_back = now;
                     crate::raw::memory::purger().ask();
+                    self.give_pools_back(PoolGive::Unpinned);
                 }
             }
             Done::Unwatched => self.pressure_watched = false,
@@ -2609,6 +2624,20 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.said(said);
     }
 
+    /// The stores' buffer pools give pages back to the kernel, on the loop (which alone
+    /// writes the stores): `what` says which. Records are immutable, so nothing is written
+    /// and a page given back is a read when it is next asked for
+    /// (docs/v2/plan/design/restore.md, "Memory: a bounded cache over records").
+    fn give_pools_back(&mut self, what: PoolGive) {
+        let freed = match what {
+            PoolGive::Unread => self.store.trim_pool() + self.std.trim_pool(),
+            PoolGive::Unpinned => self.store.evict_pool(u64::MAX) + self.std.evict_pool(u64::MAX),
+        };
+        if freed != 0 {
+            tracing::info!(target: "blaze", freed, ?what, "the stores' pools gave pages back");
+        }
+    }
+
     /// The plane's and the memory's plots, at most once each [`PLOT_EVERY`] of the driver's
     /// clock, and the memory's breakdown by area once each [`super::breakdown::EVERY`]: each
     /// row of the build under way ([`Jobs::build_under_way`]), 0 while none is.
@@ -2639,6 +2668,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             {
                 self.given_back = now;
                 crate::raw::memory::purger().ask();
+                if pressure.squeezed() {
+                    self.give_pools_back(PoolGive::Unpinned);
+                }
             }
         }
         // Nothing to do for a while: the warm memory each thread keeps for its next task goes
@@ -2650,6 +2682,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             blaze_mem::frame::ask_spare_trim();
             crate::raw::memory::purger().ask();
             self.jobs.say_what_the_kept_front_ends_hold();
+        }
+        // Longer still: the stores' pools give back the pages nothing read again.
+        if self.pool_idle.look(now, working) {
+            self.give_pools_back(PoolGive::Unread);
         }
         blaze_profile::plot(Plot::AllocatorPurgedBytes, crate::raw::memory::purged_bytes());
         blaze_profile::plot(Plot::CommittedBytes, memory.committed);
