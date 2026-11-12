@@ -168,6 +168,30 @@
    "why": "Andrew, 2026-11-11: \"we strictly need better compile times and faster code than our competitor\", \"we need to be categorically better\". Relax publishes 50 to 200 ms save-to-patch and optimized code 1.14 to 2.29 times slower than rustc --release.",
    "recommended": "Yes; these are targets, none is measured yet.",
    "state": "harness to build"
+  },
+  {
+   "id": "D22",
+   "date": "2026-11-11",
+   "decision": "Agents first: the hub's primary interface is an API on a lane (read, write, patch, one transaction per multi-file change), with no local checkout needed. Every tree is a BLAKE3 Merkle tree and a lane is a root; sync is root comparison. A local directory with a watcher is a compatibility path; a mounted filesystem for people is out of scope.",
+   "why": "Andrew, 2026-11-11: \"what if we do it the Unison way: every single tree is a Merkle BLAKE tree\", \"we only really care about agents; design agent first\".",
+   "recommended": "Yes.",
+   "state": "being specified and started by the hub lane (docs/v2/plan/design/hub.md, branch hub-1111)"
+  },
+  {
+   "id": "D23",
+   "date": "2026-11-11",
+   "decision": "Git stays the origin and the hub is a derived index: every object is indexed by its BLAKE3 hash and its git object id, a commit imports to a root and a lane exports as a commit, the hub speaks git's protocol for reads, and it is self-hostable. Adoption is four steps, each useful alone: blaze as a drop-in for cargo, a shared store, the hub for agent lanes, the hub's check as a required status.",
+   "why": "Andrew, 2026-11-11: large companies have all their infrastructure on git; \"we want OpenAI and other large companies to use this, what is the best way\"; \"ok sounds good do this\".",
+   "recommended": "Yes: never ask a company to leave git; losing the hub loses warmth, never work.",
+   "state": "in the hub lane's brief"
+  },
+  {
+   "id": "D24",
+   "date": "2026-11-11",
+   "decision": "After a design review: tier 0 code depends only on a function's own MIR and the signatures and layouts it names; optimized code is stored with a recorded trace; invalidation is pushed from the edit and the edit's chain runs on one thread; functions are reached through entry slots with code appended, never written over; the call graph's cycles are computed as an explicit query; identities become per stage. Type and borrow checking stay eager.",
+   "why": "A no-code review of the plan by a second Fable at high effort, asked for by Andrew, 2026-11-11; its main finding was that the lanes then running did not follow the plan's own order (nobody was on the edit path).",
+   "recommended": "Adopt all of it; the code-speed target is stated as faster than default rustc --release until measured.",
+   "state": "edit-path, launcher and hub lanes started; promotion deferred"
   }
  ]
 }
