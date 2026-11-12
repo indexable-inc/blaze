@@ -81,10 +81,6 @@ inventory::submit! {
 #[derive(Default)]
 pub struct LastWrite {
     pub crates: Vec<CrateDelta>,
-    /// The crates blocked in this write ([`crate::deps::awaited::blocked`]: awaited, or above
-    /// an awaited crate), fixed at the pass's start: this maintainer gives none a job, and
-    /// the impls maintainer none a node. Empty when nothing is awaited.
-    pub blocked: HashSet<Crate, Global>,
 }
 
 /// One crate's share of [`LastWrite`]; a crate the write left alone has none.
@@ -131,7 +127,6 @@ fn read_step(db: &Db, written: &Written<'_>, reads: &mut Reads) {
         db.lend_state::<State, _>(|state| {
             if first {
                 last.crates.clear();
-                last.blocked = crate::deps::awaited::blocked(db);
                 state.pass.modules_changed.clear();
                 state.pass.scoped.clear();
                 state.pass.reached.clear();
@@ -152,7 +147,7 @@ fn read_step(db: &Db, written: &Written<'_>, reads: &mut Reads) {
                 let layer = std::mem::take(&mut state.pass.layers[at]);
                 let mut runs: Vec<CrateRun> = Vec::new(); // alloc: a layer's jobs, none for a layer the write does not reach
                 for &krate in &layer {
-                    if unreached(db, krate, state, written, &last.blocked) {
+                    if unreached(db, krate, state, written) {
                         continue;
                     }
                     state.pass.reached.insert(krate);
@@ -226,25 +221,7 @@ pub(super) fn forgets_included() -> bool {
 ///   drop.
 /// A crate reached is noted ([`state::Pass::reached`]) whether or not its job then changes
 /// anything, so every crate above a written one has its job, as before.
-///
-/// A crate of `blocked` (awaited, or above an awaited crate: [`crate::deps::awaited`]) has no
-/// job whatever the write changed: it has no state and nothing published, no crate with a job
-/// depends on it (every crate above it is blocked too), and the write that releases it names
-/// it as a crate added, which reaches it then.
-fn unreached(
-    db: &Db,
-    krate: Crate,
-    state: &State,
-    written: &Written<'_>,
-    blocked: &HashSet<Crate, Global>,
-) -> bool {
-    if blocked.contains(&krate) {
-        debug_assert!(
-            !state.crates.contains_key(&krate),
-            "nameres delta: the blocked crate {krate:?} has a state"
-        );
-        return true;
-    }
+fn unreached(db: &Db, krate: Crate, state: &State, written: &Written<'_>) -> bool {
     if written.crate_graph_reaches(krate)
         || files_reach(db, krate, written)
         || written.proc_macros.binary_search(&krate).is_ok()

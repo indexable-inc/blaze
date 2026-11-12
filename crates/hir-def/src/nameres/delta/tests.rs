@@ -705,7 +705,7 @@ pub struct L;
     let Err(error) = caught else {
         panic!("`lib`'s def map was given with no maintained resolution")
     };
-    assert_eq!(error, Unmaintained { krate: lib, name: Some("lib".to_owned()), asking: None, awaited: None });
+    assert_eq!(error, Unmaintained { krate: lib, name: Some("lib".to_owned()), asking: None });
     let text = error.to_string();
     assert!(text.contains("`lib`") && text.contains("no maintainer ran"), "{text}");
 }
