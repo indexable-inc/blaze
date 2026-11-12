@@ -49,12 +49,11 @@ use super::{
     },
 };
 use crate::{
-    AdtId, AssocItemId, AstId, AttrDefId, HasModule, ImplId, Lookup, MacroId, ModuleDefId,
-    ModuleId, TraitId,
+    AdtId, AssocItemId, AstId, AttrDefId, DefDiagnostics, HasModule, ImplId, Lookup, MacroId,
+    ModuleDefId, ModuleId, TraitId,
     attrs::AttrFlags,
     deps::signatures::key::Key,
     nameres::{
-        DefDiagnostics,
         assoc::{ImplItems, TraitItems},
         crate_def_map,
     },
@@ -637,7 +636,7 @@ fn asked(db: &Db, krate: Crate) -> Vec<Asked> {
             );
         }
     };
-    for (&module, data) in crate_def_map(db, krate).table(db).iter() {
+    for (module, data) in crate_def_map(db, krate).table(db).iter() {
         let scope = data.scope(db);
         flags(&mut all, AttrDefId::ModuleId(module));
         for def in scope.declarations() {
