@@ -781,6 +781,7 @@ impl Target {
             probe_stack: true,
             probe_log2: 12,
             counts: false,
+            slots: false,
         })
     }
 

@@ -14,11 +14,15 @@
 //! | arrives | the control thread |
 //! |---|---|
 //! | (start) | says `Hello` |
-//! | `Welcome { slots, store, statics }` | opens the records, declares the slots |
+//! | `Welcome { slots }` | declares the slots |
+//! | `Start { entry, inits }` | gives the thread that waits to run the program the addresses of its initializers and its entry |
+//! | `Record { id, bytes }` | hands the record to [`Records`], which keeps it for the message that names it |
+//! | `Statics { defs }` | has [`Records`] give each static its memory and its value |
 //! | a stub's need of a slot | says `Need` once a slot, however many threads wait in its stub |
 //! | `Edit { txn, binds, declare, together }` | declares, runs [`Driver::edit`], says `Applied` (and lets the stubs of the slots it bound go on) or `Failed` |
 //! | `Refused { slot, diagnostic }` | gives the diagnostic to the threads in that slot's stub, which stop the program with it |
-//! | `Probe`, `Restart` | not built (launcher.md, step 5): a failure that says so |
+//! | `Restart { txn, why }` | says `Restarting` and starts the program again in place (the caller's `restart`) |
+//! | `Probe` | not built (launcher.md, step 5): a failure that says so |
 //!
 //! A failure (the socket ends, a message is not of the schema, the driver breaks) does not
 //! end the loop: program threads may still be running and reporting, and one may yet fire a
@@ -52,8 +56,17 @@ pub enum ControlError {
     Socket { call: &'static str, why: String },
     /// The daemon's socket ended.
     Closed(String),
-    /// [`Records::open`] refused the store.
+    /// [`Records`] refused a record or a static's definition.
     Store(String),
+    /// A `Start` whose entry is no slot of the table.
+    Entry { entry: Slot },
+    /// A `Start` that names as an initializer a static the daemon did not define, or a
+    /// thread-local.
+    Init { number: u32 },
+    /// The daemon said the program must start again ([`Tell::Restart`]), and why.
+    Restart { why: String },
+    /// The daemon holds no code of the program, and why.
+    Unheld { why: String },
     /// A `Refused` for a slot no thread asked for.
     Unasked { slot: Slot },
     /// A message whose handling is not built yet.
@@ -69,7 +82,19 @@ impl core::fmt::Display for ControlError {
                 write!(f, "the daemon's socket: {call} failed: {why}")
             }
             ControlError::Closed(why) => write!(f, "the daemon's socket ended: {why}"),
-            ControlError::Store(why) => write!(f, "the store: {why}"),
+            ControlError::Store(why) => write!(f, "the daemon's records: {why}"),
+            ControlError::Entry { entry } => write!(
+                f,
+                "the daemon named slot {} as the program's entry, which is not declared",
+                entry.0
+            ),
+            ControlError::Init { number } => write!(
+                f,
+                "the daemon named static {number} as an initializer, which is not a static \
+                 with an address here"
+            ),
+            ControlError::Restart { why } => write!(f, "restart needed: {why}"),
+            ControlError::Unheld { why } => write!(f, "{why}"),
             ControlError::Unasked { slot } => {
                 write!(f, "the daemon refused slot {}, which no thread asked for", slot.0)
             }
@@ -109,6 +134,20 @@ struct Control<'a> {
     lost: Option<ControlError>,
     /// One frame on its way out.
     out: Vec<u8>,
+    /// Where the program's main thread waits for what to run ([`Start`], once the daemon
+    /// said the statics are defined), or for why nothing can.
+    ready: Sender<Result<Start, String>>,
+    /// What a [`Tell::Restart`] does: starts the program again in place. It returns only
+    /// when it could not, with why.
+    restart: fn(&str) -> String,
+}
+
+/// What the program's main thread runs: the addresses of its initializer statics (each
+/// holds the address of a function to call first, in this order), then of its entry.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Start {
+    pub entry: usize,
+    pub inits: Vec<usize>,
 }
 
 /// Runs the control thread's loop on this thread until [`Shared::stop`]: says `Hello` for
@@ -119,10 +158,21 @@ pub fn run(
     socket: UnixStream,
     program: ProgramId,
     records: &mut dyn Records,
+    ready: Sender<Result<Start, String>>,
+    restart: fn(&str) -> String,
 ) -> (Driver, Result<(), ControlError>) {
     let shared = driver.shared();
-    let mut control =
-        Control { driver, socket, records, needs: Vec::new(), said: 0, lost: None, out: Vec::new() };
+    let mut control = Control {
+        driver,
+        socket,
+        records,
+        needs: Vec::new(),
+        said: 0,
+        lost: None,
+        out: Vec::new(),
+        ready,
+        restart,
+    };
     let reader = match control.begin(program, &shared) {
         Ok(reader) => Some(reader),
         Err(why) => {
@@ -135,7 +185,7 @@ pub fn run(
         let event = match control.driver.ready() {
             Some(event) => event,
             None => {
-                if let Err(why) = control.driver.collect() {
+                if let Err(why) = control.driver.collect(&mut *control.records) {
                     control.lose(why.into());
                 }
                 control.driver.wait()
@@ -226,7 +276,11 @@ impl Control<'_> {
     /// No code can come any more, for `why`: keeps the first such failure and answers every
     /// stub that waits.
     fn lose(&mut self, why: ControlError) {
-        self.answer(&why.to_string());
+        let said = why.to_string();
+        self.answer(&said);
+        // A main thread still waiting for its entry is told too (one that has it ignores
+        // the queue from then on).
+        drop(self.ready.try_send(Err(said)));
         self.lost.get_or_insert(why);
     }
 
@@ -284,17 +338,50 @@ impl Control<'_> {
     fn tell(&mut self, item: &[u8]) -> Result<(), ControlError> {
         let (id, tell) = Tell::decode(item).map_err(ControlError::Wire)?;
         match tell {
-            Tell::Welcome { slots, store, statics } => {
-                self.records.open(store, statics).map_err(ControlError::Store)?;
+            Tell::Welcome { slots } => {
                 self.driver.declare(slots)?;
+            }
+            Tell::Start { entry, inits } => {
+                let Some(thunk) = self.driver.thunk(entry) else {
+                    return Err(ControlError::Entry { entry });
+                };
+                // alloc: the addresses of the program's initializer statics, once a process
+                let mut addresses = Vec::with_capacity(inits.len());
+                for number in inits.iter() {
+                    match self.records.static_at(number) {
+                        Some(address) => addresses.push(address),
+                        None => return Err(ControlError::Init { number }),
+                    }
+                }
+                // The program's main thread waits for this; were it gone, the process is
+                // ending and there is no one to tell.
+                drop(self.ready.send(Ok(Start { entry: thunk, inits: addresses })));
+            }
+            Tell::Record { id, bytes } => {
+                self.records.record(id, bytes).map_err(ControlError::Store)?;
+            }
+            Tell::Statics { defs } => {
+                // alloc: the definitions out of the frame, for the length of the message.
+                let defs: Vec<wire::StaticDef<'_>> = defs.iter().collect();
+                let place = self.driver.place();
+                let defined = self.records.statics(&defs, place);
+                self.records.release();
+                defined.map_err(ControlError::Store)?;
             }
             Tell::Edit { txn, binds, declare, together } => {
                 if declare > 0 {
                     self.driver.declare(declare)?;
                 }
                 // alloc: the edit's binds out of the frame, for the length of the edit.
-                let binds: Vec<wire::Bind> = binds.iter().collect();
-                match self.driver.edit(txn, &binds, together, &mut *self.records) {
+                let binds: Vec<wire::Bind<'_>> = binds.iter().collect();
+                // An edit that only adds functions binds nothing: the new slots are stubs.
+                if binds.is_empty() {
+                    self.ask(Some(id), &Ask::Applied { txn, epoch: self.driver.shared().epoch() })?;
+                    return Ok(());
+                }
+                let edited = self.driver.edit(txn, &binds, together, &mut *self.records);
+                self.records.release();
+                match edited {
                     Ok(committed) => {
                         self.wake();
                         self.ask(Some(id), &Ask::Applied { txn, epoch: committed.epoch })?;
@@ -314,11 +401,19 @@ impl Control<'_> {
                     drop(waiter.send(Bound::Refused(diagnostic.to_owned())));
                 }
             }
+            Tell::Unheld { why } => return Err(ControlError::Unheld { why: why.to_owned() }),
             Tell::Probe { .. } => {
                 return Err(ControlError::NotBuilt { what: "Probe (launcher.md, step 5)" });
             }
-            Tell::Restart { .. } => {
-                return Err(ControlError::NotBuilt { what: "Restart (launcher.md, step 5)" });
+            Tell::Restart { txn, why } => {
+                // The launcher's answer, then the program again in place: the same process
+                // id, terminal and environment, on the code the daemon has now. Nothing of
+                // the old program runs on: `restart` does not come back unless it failed, and
+                // then every stub is answered with why and the program stops on its next
+                // first call (`lose`), never quietly on stale code.
+                self.ask(Some(id), &Ask::Restarting { txn })?;
+                let failed = (self.restart)(why);
+                return Err(ControlError::Restart { why: failed });
             }
         }
         Ok(())

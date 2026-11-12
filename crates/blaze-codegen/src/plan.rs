@@ -247,6 +247,11 @@ pub enum Mode {
     /// `blaze-lazy`): code at opt-level 0 starts as stencils that count, and
     /// `blaze_stencil::tier` decides each one's tier-up by its counts.
     Tiered,
+    /// A program blaze's launcher runs under the `edit` goal (`blaze run`;
+    /// docs/v2/plan/design/launcher.md): nothing is linked. Every function, a member's or
+    /// not, is reached through its slot word ([`Spec::slots`] of its stencil code), compiled
+    /// when it is first called and replaced while the program runs.
+    Launched,
 }
 
 /// How every function of one build is compiled.
@@ -423,6 +428,8 @@ impl Policy {
             (backend, _) => backend,
         };
         let live = self.mode == Mode::Live;
+        // Build-time code runs out of the launcher's process: it is an output's.
+        let launched = self.mode == Mode::Launched && !matches!(origin, Origin::BuildTime(_));
         let spec = Spec {
             // A `Spec` owns its toolchain (an interface across crates); could be an interned ID.
             // clone: once per function planned
@@ -436,7 +443,7 @@ impl Policy {
             fold: self.fold && backend.is_cranelift(),
             counted: false,
             // A member's code built into another function's would outlive a patch of it.
-            mir_inline: matches!(level, OptLevel::O2 | OptLevel::O3) && !live,
+            mir_inline: matches!(level, OptLevel::O2 | OptLevel::O3) && !live && !launched,
             sanitize: self.sanitize,
             pgo: self.pgo,
             proc_macro_bridge: self.proc_macro_bridge,
@@ -452,6 +459,9 @@ impl Policy {
                 && native
                 && !self.proc_macro_bridge
                 && !matches!(origin, Origin::BuildTime(_)),
+            // Only stencil code calls through slot words: LLVM's code under a launcher is
+            // placed with its direct calls bound to entry thunks (launcher.md, "Step 3").
+            slots: launched && backend == Backend::Stencil,
         };
         // Build-time code runs out of the run's process, where no counter cells are: it is
         // compiled as an output's.
@@ -459,7 +469,9 @@ impl Policy {
             && level == OptLevel::O0
             && !matches!(origin, Origin::BuildTime(_));
         // A live build's LLVM code starts as stencils until LLVM's is in the slot.
-        let tiered = live && backend.is_release();
+        // So does a launched program's: its first code is tier 0, whatever its level, and
+        // promotion lands the optimized code later (docs/v2/plan/design/tiers.md).
+        let tiered = (live || launched) && backend.is_release();
         let stencils = counted || tiered || backend == Backend::Stencil;
         if stencils && self.toolchain.stencils.is_none() {
             // clone: an error names the target
@@ -489,11 +501,17 @@ impl Policy {
                 patchable: true,
             });
         }
-        let patchable = live && member;
+        // Under the launcher every function has a slot, whoever wrote it.
+        let patchable = (live && member) || launched;
         Ok(if tiered {
             // The first tier runs only until LLVM's code is in the slot: compiled fast.
             Choice {
-                first: Spec { fold: false, report: false, ..spec.at(Backend::Stencil) },
+                first: Spec {
+                    fold: false,
+                    report: false,
+                    slots: launched,
+                    ..spec.at(Backend::Stencil)
+                },
                 then: Some(spec),
                 patchable,
             }
@@ -577,6 +595,36 @@ mod tests {
         assert!(own.patchable && own.then.is_none());
         let dependency = policy.choose(&Origin::Dependency(Package::new("regex")), None).unwrap();
         assert!(!dependency.patchable);
+    }
+
+    /// The invariant (docs/v2/plan/design/launcher.md, "Step 3"): a launched program's first
+    /// code is tier 0 code that calls through slot words, for every function whoever wrote
+    /// it (a member, a dependency, std at its shipped `-O3`), and each has a slot; build-time
+    /// code, which runs out of the launcher's process, is an output's. The launcher's code
+    /// and a linked build's are two keys (`keys-cover-every-input`): their bytes differ.
+    #[test]
+    fn a_launched_programs_functions_all_start_as_tier_zero_through_slots() {
+        for level in [OptLevel::O0, OptLevel::O3] {
+            let policy = policy(level, Mode::Launched);
+            for origin in [member(), Origin::Dependency(Package::new("regex")), Origin::Std] {
+                let choice = policy.choose(&origin, None).unwrap();
+                assert_eq!(choice.first.backend, Backend::Stencil, "{level:?} {origin:?}");
+                assert!(choice.first.slots && choice.patchable, "{level:?} {origin:?}");
+                assert!(!choice.first.mir_inline, "{level:?} {origin:?}: a body built in");
+                let linked = Spec { slots: false, ..choice.first.clone() }; // clone: a test
+                assert_ne!(choice.first.settings(), linked.settings());
+                // What promotion lands is the code a `max` build makes: never the launcher's.
+                assert!(choice.then.iter().all(|then| !then.slots && then.backend.is_release()));
+            }
+            let build = Origin::BuildTime(Package::new("serde_derive"));
+            let choice = policy.choose(&build, None).unwrap();
+            assert!(!choice.first.slots && !choice.patchable);
+        }
+        // The control: no other mode makes code for the launcher.
+        for mode in [Mode::Output, Mode::Live, Mode::Tiered] {
+            let choice = policy(OptLevel::O0, mode).choose(&member(), None).unwrap();
+            assert!(!choice.first.slots, "{mode:?}");
+        }
     }
 
     /// AGENTS.md rule 10: native code is stencils or LLVM's at every level, origin and mode,

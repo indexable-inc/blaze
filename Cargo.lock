@@ -1412,6 +1412,7 @@ dependencies = [
 name = "blaze-launch-rt"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "blaze-launch",
  "crossbeam-channel",
  "libc",
@@ -2014,6 +2015,7 @@ name = "blaze-stencil"
 version = "0.0.0"
 dependencies = [
  "base-db",
+ "blake3",
  "blaze-alloc-count",
  "blaze-bytes",
  "blaze-codegen",
@@ -2021,6 +2023,8 @@ dependencies = [
  "blaze-format",
  "blaze-ids",
  "blaze-inproc",
+ "blaze-launch",
+ "blaze-launch-rt",
  "blaze-lower",
  "blaze-macro-eval",
  "blaze-mem",
@@ -2033,6 +2037,7 @@ dependencies = [
  "cranelift-frontend",
  "cranelift-interpreter",
  "cranelift-reader",
+ "crossbeam-channel",
  "gimli",
  "hir-ty-codegen",
  "libc",

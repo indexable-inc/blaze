@@ -129,6 +129,9 @@ blaze-store-check.workspace = true
 blaze-testsel.workspace = true
 blaze-lazy = { workspace = true, features = ["daemon"] }
 blaze-link.workspace = true
+# The launcher's protocol and the daemon's side of a launched program (`serve/unit/run/launch.rs`).
+blaze-launch.workspace = true
+blaze-launch-host.workspace = true
 blaze-lower.workspace = true
 # The device build of an `artifact = "gpu"` dependency: its `GPU_ENTRIES` written as MSL at its
 # link (`serve/unit/compile.rs`, `assemble`), which the record key covers as this crate's code.
