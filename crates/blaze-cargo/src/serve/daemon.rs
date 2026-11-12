@@ -2616,6 +2616,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             // Past the limit's line, or keeping more than a quarter of the budget freed (the
             // high water): the purger's thread gives it back, never the loop, since a purge
             // waits for each worker's heaps ([`crate::raw::memory::purge`]).
+            blaze_mem::tag::keep_freed_pages_for(super::idle::warm(bytes, limit));
             let high_water = kept > limit / KEPT_HIGH_WATER;
             if (pressure.squeezed() || high_water)
                 && now.saturating_sub(self.given_back) >= GIVE_BACK_EVERY

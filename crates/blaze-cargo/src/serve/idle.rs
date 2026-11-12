@@ -4,7 +4,8 @@
 //! back what that freed as the thread next allocates or parks. What is left is what a thread
 //! keeps warm for its next task: its frame shelf (`blaze_mem::frame::WARM`, 32 MiB a thread
 //! at most, charged to no task) and the allocator's retired pages. Warm memory pays for itself
-//! while edits follow one another; once the daemon has had nothing to do for [`AFTER`] it is
+//! while edits follow one another (so does a freed page: [`warm`]); once the daemon has had
+//! nothing to do for [`AFTER`] it is
 //! only footprint, so the loop asks for it back, once a stretch of idleness, on the purger's
 //! thread and the workers' own as they park, never on a request's path. The next task after
 //! that takes its pages from the kernel again: a page fault a page it touches.
@@ -19,7 +20,24 @@ use std::time::Duration;
 /// How long the daemon has nothing to do before it gives its warm memory back: past the gap
 /// between the edits of someone typing and saving, short enough that a daemon left alone is
 /// small within seconds.
-pub(crate) const AFTER: Duration = Duration::from_secs(2);
+pub(crate) const AFTER: Duration = Duration::from_secs(5);
+
+/// The daemon keeps freed pages warm between builds while its footprint is under one part in
+/// this many of its limit ([`warm`]).
+pub(crate) const WARM_UNDER: u64 = 8;
+
+/// How long the allocator keeps a freed page, in milliseconds, for a daemon whose footprint is
+/// `footprint` under the limit `limit`: [`AFTER`] while it holds under one part in
+/// [`WARM_UNDER`] of the limit, so the pages one edit's build freed are the next one's with no
+/// page fault and the idle give-back returns them; 0, at once, past that, where freed pages
+/// kept are memory admission cannot grant (docs/memory-footprint.md, step 3).
+#[blaze::pure]
+pub(crate) fn warm(footprint: u64, limit: u64) -> u64 {
+    match footprint < limit / WARM_UNDER {
+        true => AFTER.as_millis() as u64,
+        false => 0,
+    }
+}
 
 /// Whether this stretch of idleness gave back yet.
 #[derive(Default)]
@@ -50,6 +68,15 @@ impl Idle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn freed_pages_are_kept_warm_only_while_the_daemon_holds_little() {
+        let limit = 96 << 30;
+        assert_eq!(warm(4 << 30, limit), 5000);
+        assert_eq!(warm(limit / WARM_UNDER, limit), 0, "at the line: at once");
+        assert_eq!(warm(80 << 30, limit), 0);
+        assert_eq!(warm(0, 0), 0, "no limit known: at once");
+    }
 
     /// The invariant: over any run of looks, a give-back comes only at a look that saw no
     /// work and whose idle stretch is at least [`AFTER`] old, and at most once a stretch.
