@@ -99,6 +99,28 @@ use blaze_query::db::{Database as _, MemoryUsage};
 #[cfg(test)]
 mod tests;
 
+/// What codegen's tasks left on the global heap and nobody freed: with no codegen task
+/// running, that is what codegen keeps between builds, its kept walks first
+/// ([`hir_ty_codegen::v2::let_go_kept_walks`]: 13 GiB of a cold build of blaze). An estimate
+/// and an upper bound (`blaze_graph::giveback::Rung::Caches`): the tag's heap also holds what
+/// a kept image's link state took from codegen.
+pub(crate) fn kept_caches() -> u64 {
+    blaze_mem::tag::snapshot().get(blaze_mem::Tag::Codegen).heap
+}
+
+/// Lets go of codegen's kept walks, every database's and configuration's; the bytes the
+/// codegen tag's heap fell by. The next walk over each begins with nothing kept and says why
+/// (`blaze_codegen::driver::Fresh::LetGo`). For the loop, while no task that may walk runs:
+/// a walk in flight would keep its own table until it ends.
+pub(crate) fn give_kept_caches() -> u64 {
+    let before = kept_caches();
+    let describes = hir_ty_codegen::v2::let_go_kept_walks();
+    blaze_mem::tag::give_back_heap();
+    let gave = before.saturating_sub(kept_caches());
+    tracing::info!(target: "blaze", describes, gave, "codegen's kept walks were let go");
+    gave
+}
+
 /// What a kept front end's query storage holds, from counters
 /// (`blaze_query::db::Storage::held_bytes`): what letting go of the whole front end gives
 /// back, at least (`blaze_graph::giveback::Rung::FrontEnd`).

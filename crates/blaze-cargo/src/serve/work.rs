@@ -721,6 +721,18 @@ pub trait Steps: Sized + Send + Sync + 'static {
         let _ = kept;
         blaze_query::db::Taken::default()
     }
+    /// On the loop: the bytes of the caches the back end keeps only to make its next build
+    /// cheaper (codegen's kept walks), an estimate, at most
+    /// ([`blaze_graph::giveback::Rung::Caches`]). 0 for steps that keep none.
+    fn kept_caches(&self) -> u64 {
+        0
+    }
+    /// On the loop, while no task that may walk a program runs
+    /// (`super::plane::Plane::walks_in_flight`): lets go of those caches, every one; the
+    /// bytes they held, as the same estimate says.
+    fn give_caches(&self) -> u64 {
+        0
+    }
     /// On a worker, by the task that stores a kept front end, after [`Steps::store_kept`] and
     /// after the build's answer: what the build's end lets go of its front end (every MIR it
     /// made, and the values no build read since the one before). The front end is the task's

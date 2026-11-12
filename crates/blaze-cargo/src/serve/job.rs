@@ -35,7 +35,7 @@
 #![forbid(unsafe_code)]
 
 pub(super) mod doing;
-mod giving;
+pub(super) mod giving;
 mod kept;
 mod noop;
 mod slab;
@@ -200,6 +200,10 @@ pub enum Value<S: Steps> {
         Result<Vec<super::work::KeptPut>, ApiError>,
         Vec<ProvenanceRow>,
     ),
+    /// A kept front end given back by the task that swept its values for memory
+    /// ([`Does::GiveValues`]), with the bytes that went: none when the sweep panicked, as it
+    /// may be half swept.
+    GaveValues(Option<S::KeptFront>, u64),
 }
 
 /// What jobs tell the session, in order.
@@ -449,6 +453,17 @@ pub(super) enum Does<S: Steps> {
         logs: bool,
         wanted: Arc<AtomicBool>,
     },
+    /// A kept front end gives back about `bytes` of the values it keeps, because memory is
+    /// short ([`Jobs::give_values`]): taken by the task, swept in slices
+    /// ([`giving::give_in_slices`]) and given back in its value. `wanted` is set once a build
+    /// a client waits on is held for the front end: the task stops at its slice's end. The
+    /// front end is shared with the loop so a task the plane refuses gives it back.
+    GiveValues {
+        kept: Arc<Lock<Option<S::KeptFront>>>,
+        checkout: String,
+        bytes: u64,
+        wanted: Arc<AtomicBool>,
+    },
 }
 
 impl<S: Steps> Step<S> {
@@ -514,6 +529,7 @@ impl<S: Steps> plane::Work for Step<S> {
             Does::Ahead { .. } => tracing::info_span!("ahead"),
             Does::Doc { .. } => tracing::info_span!("doc"),
             Does::StoreKept { checkout, .. } => tracing::info_span!(target: "blaze", "store kept front end", checkout = %checkout),
+            Does::GiveValues { checkout, bytes, .. } => tracing::info_span!(target: "blaze", "give back a kept front end's values", checkout = %checkout, bytes = *bytes),
         }
         .entered();
         match &self.does {
@@ -785,6 +801,30 @@ impl<S: Steps> plane::Work for Step<S> {
                     }
                 };
                 self.settle(stored.map_err(Failed::Error), |it| Value::StoredKept(front, it, ran))
+            }
+            Does::GiveValues { kept, bytes, wanted, .. } => {
+                let Some(mut front) = kept.lock().take() else {
+                    let error = ApiError::new(
+                        "the kept front end to give values back from was taken before its task ran",
+                        None,
+                    );
+                    return self
+                        .settle(Err::<(), _>(Failed::Error(error)), |_| Value::GaveValues(None, 0));
+                };
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    giving::give_in_slices(&mut front, *bytes, wanted)
+                }));
+                let (front, gave) = match caught {
+                    Ok(gave) => (Some(front), gave),
+                    Err(payload) => {
+                        // Half swept, it is dropped as a store's is: the loop says the loss.
+                        let panic = plane::panicked(&*payload);
+                        tracing::error!(target: "blaze", "blaze {panic}, giving back a kept front end's values; its front end is dropped");
+                        drop(front);
+                        (None, 0)
+                    }
+                };
+                self.settle(Ok::<(), Failed>(()), |_| Value::GaveValues(front, gave))
             }
         }
     }
@@ -3458,7 +3498,7 @@ pub struct Jobs<S: Steps> {
     pub errors: Vec<blaze_profile::errors::ErrorRow>,
     /// What the daemon gives back when memory is short, and in which order
     /// ([`Jobs::give_back`], `blaze_graph::giveback`).
-    giving: giving::Giving,
+    giving: giving::Giving<S>,
     /// Each job with a plane request, from its opening until its `Finish` is heard: the
     /// build it is in the history and how many `errors` rows it has, so a build that ends
     /// not ok with none is given one ([`Jobs::note_errors`]).
@@ -4657,15 +4697,15 @@ impl<S: Steps> Jobs<S> {
     }
 
     /// The system says memory is short (docs/memory-budget.md section 7, "Pressure"): the
-    /// kept front ends let go of the values they keep by bytes ([`Jobs::press_kept`]), none of
-    /// them whole, and each build's front end is asked for a release now
+    /// kept front ends let go of the values they keep by bytes, on a worker, from the loop's
+    /// next turn ([`Jobs::press_kept`]), none of them whole, and each build's front end is asked for a release now
     /// ([`Writer::pressed`]), whatever this daemon's own budget says. Until 2026-11-12 every
     /// kept front end was let go here, as for any task held back for memory: the next edit
     /// of each checkout then lowered anew, which takes minutes (reth: 195 s for a one-line
     /// revert). A limit that falls under what the daemon holds is [`Jobs::give_back`]'s to
     /// answer, cheapest first.
     pub fn pressed(&mut self) {
-        self.press_kept();
+        self.giving.press();
         for &id in &self.order {
             let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
             if let Stage::Units(build) = &mut job.stage {
@@ -4946,6 +4986,7 @@ impl<S: Steps> Jobs<S> {
                     storing.value = Some((front, stored));
                 }
             }
+            Value::GaveValues(front, gave) => self.gave_values(w, node, front, gave),
             value => {
                 if let Some(job) =
                     self.batches.job_of(node).and_then(|id| self.jobs.get_mut(key_of(id)))
@@ -4964,6 +5005,9 @@ impl<S: Steps> Jobs<S> {
         why: Option<String>,
         skipped: Option<NodeId>,
     ) {
+        // A give-back of a kept front end's values, which is no job's: its value came before
+        // this ([`Jobs::gave_values`]), or never will ([`Jobs::give_settled`]).
+        self.give_settled(w, node);
         // The store of a kept front end whose job answered already ([`Settling`]): no batch
         // names it any more.
         let settling = self
@@ -5638,6 +5682,9 @@ impl<S: Steps> Jobs<S> {
                         storing.promoted = true;
                     }
                 }
+                // Or its values are being given back for memory, on a worker: that give
+                // stops at its slice's end for a build asked now ([`giving::Giving::wanted`]).
+                let on = on.or(self.giving.wanted(root, job_idle));
                 let span = tracing::info_span!(
                     target: "blaze",
                     "lowering waits for the kept front end's store",
@@ -5888,6 +5935,13 @@ impl<S: Steps> Jobs<S> {
         if let Some(what) = lost {
             self.lose(id, &command, Some(&checkout), what);
         }
+        self.lower_waiting(w, root);
+    }
+
+    /// The lowerings held for checkout `root`'s front end posted, once nothing holds it any
+    /// more: no store of it and no give-back of its values is under way
+    /// ([`Jobs::stored_kept`], [`Jobs::gave_values`]).
+    fn lower_waiting(&mut self, w: &mut World<'_, S>, root: u32) {
         // Another store of the root's front end still under way: its lowerings wait for it.
         if self.roots.storing[root as usize] > 0 {
             return;

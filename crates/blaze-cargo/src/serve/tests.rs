@@ -706,10 +706,24 @@ pub(super) struct FakeInputs {
     checkout: String,
 }
 
-/// The fakes' front end has no database: their images store no library trees.
+/// The fakes' front end has no database: their images store no library trees. What it holds
+/// and gives back for memory is the give-back simulation's model of its checkout
+/// (`job::giving::sim`): nothing, unless a test says so.
 impl KeptDb for FakeInputs {
     fn db(&self) -> Option<&base_db::Db> {
         None
+    }
+
+    fn held(&self) -> u64 {
+        super::job::giving::sim::held(&self.checkout)
+    }
+
+    fn values(&mut self) -> u64 {
+        super::job::giving::sim::values(&self.checkout)
+    }
+
+    fn give_values(&mut self, bytes: u64) -> u64 {
+        super::job::giving::sim::give(&self.checkout, bytes)
     }
 }
 
@@ -4946,3 +4960,4 @@ fn command_env() -> Vec<(String, String)> {
 }
 
 mod ahead;
+mod giving;

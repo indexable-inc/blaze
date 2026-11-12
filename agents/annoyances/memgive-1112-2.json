@@ -1,0 +1,20 @@
+{
+ "id": "memgive-1112-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane memgive-1112",
+ "where": "the daemon's memory line (crates/blaze-cargo/src/serve/daemon.rs, MemoryLine)",
+ "what": "The line said `43.66 freed: kept, or purged and still counted`, which reads as if purged pages were charged to the limit. They are not: admission and the releases read the system's footprint (VmRSS on Linux, phys_footprint on macOS), and the number in the line is mimalloc's committed count less the live heap, a count that never falls on a purge. From that log alone nobody can say how much a purge would have returned.",
+ "cost": "a wrong lead in the task brief (the limit was not charged with purged memory); time reading the allocator to rule it out",
+ "cause": "a number that is an upper bound printed with words that say what it might be, not what it is",
+ "whys": [
+  "why wrong: the line's words offered two readings and one of them is a bug that does not exist",
+  "why possible: mimalloc keeps no count that falls on a purge, and the line printed the one it has",
+  "why not caught: the next clause (`at most N of it freed and resident`) has the real bound, after the misleading one",
+  "property: a derived number shown without saying it is a bound and that nothing decides on it"
+ ],
+ "class": "a log line that suggests a cause it cannot show",
+ "prevention": "the line now says `not live: kept freed, or purged; this count never falls on a purge and nothing is charged by it`; every give-back and purge is a span with the footprint before and after, which `blaze explain memory` lists (memory_give_backs)",
+ "workaround": "read `at most N of it freed and resident` and the `memory purge` spans' `returned`",
+ "fix": "daemon.rs MemoryLine and its test (written, not compiled)",
+ "state": "written on int-1112, not compiled or run"
+}

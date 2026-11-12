@@ -170,7 +170,7 @@ reading taken after a rung's gives before the next is asked (at most 2 s is wait
 |---|---|---|
 | 1 allocator | pages the allocators freed and hold (`raw::memory::purge`) | nothing |
 | 2 pool | the stores' pool pages no task pins (`Store::evict_pool`) | a read |
-| 3 caches | caches made again in milliseconds | milliseconds |
+| 3 caches | what codegen keeps between builds (its kept walks), only while no task that may walk a program runs (`Plane::walks_in_flight`, a count the plane owns: a walk in flight keeps its own table, so a give then frees nothing and loses its result) | the next walk, which describes again |
 | 4 values | a front end's values kept by bytes, least recently verified first; a running build's MIR and inference nothing still to compile reads | the engine, from their memos |
 | 5 front end | one checkout's kept front end, whole | lowering anew: minutes |
 
@@ -219,9 +219,22 @@ changes, asks and builds, whose oracle checks the order, the proportion, the flo
 and the measure between rungs, with five planted bugs each caught, the first of them the
 rule before (every front end, whole, for any ask).
 
-**Not built.** The caches rung has no source (codegen's kept walks go only while no walk is
-in flight, which the loop cannot say). A front end is given whole or by its values, not yet
-by crate. A give of values runs on the loop.
+**Off the loop.** A kept front end's values are swept by a task on a worker
+(`kinds::GIVE_BACK`, pushed with no memory of its own, since it runs because memory is
+short): the front end is taken from its checkout as it is for its store and is the
+checkout's again when the task's value is back. A build of that checkout asked meanwhile
+waits for it under a span that names the wait (`lowering waits for a memory give-back of its
+front end's values`), and the wait is bounded: the task sweeps in at most eight slices and
+stops at the first slice's end after a build asks. Nothing more is planned while a give is
+out, and the planner measures it by a reading after its return.
+
+**Proof of the wiring.** `serve::tests::giving`, on the daemon's simulation with a model of
+its memory: a small wait costs a purge and the next build lowers into the kept front end;
+values go on a worker and a build asked meanwhile waits and lowers into the front end; the
+control is a driver that gives with no plan, which drops the front end for the same wait.
+
+**Not built.** A front end is given whole or by its values, not yet by crate. The size of
+codegen's caches is the codegen tag's heap with no codegen task running, an upper bound.
 
 ## Proof
 

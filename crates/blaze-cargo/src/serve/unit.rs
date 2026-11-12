@@ -308,6 +308,14 @@ impl Steps for Real {
         hir_def::span_names::take_run_log(kept.lowered.db())
     }
 
+    fn kept_caches(&self) -> u64 {
+        release::kept_caches()
+    }
+
+    fn give_caches(&self) -> u64 {
+        release::give_kept_caches()
+    }
+
     fn release_kept(&self, kept: &mut KeptLowered, wanted: &std::sync::atomic::AtomicBool) {
         let Some(mut release) = kept.release.take() else { return };
         // A request of the checkout waits for this front end: it goes back now, and that

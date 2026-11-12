@@ -1952,6 +1952,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.jobs.storing()
     }
 
+    /// How many kept front ends give back values on a worker now
+    /// ([`Jobs::giving_values`]).
+    pub fn giving_values(&self) -> usize {
+        self.jobs.giving_values()
+    }
+
     pub fn db(&self) -> &Database {
         &self.db
     }

@@ -2,6 +2,14 @@
  "about": "Decisions the main agent made on its own authority, with what it recommended and where each stands. Andrew, 2026-11-11: \"just be proactive and do what you need to do; make a decisions.json file with all your decisions and what you recommended and just do things and get blaze to work\". A decision here is reversed by Andrew saying so; one that changes a rule also changes tools/agents/rules.ts.",
  "decisions": [
   {
+   "id": "memgive-1112-D1",
+   "date": "2026-11-12",
+   "decision": "When memory is short the daemon gives back in one order, cheapest to make again first, each step measured before the next (`blaze_graph::giveback::Planner`): the allocators' freed pages, the stores' pool pages, caches, a front end's values by bytes, and last one checkout's kept front end. Three behaviours change with it. (1) A system memory-pressure event takes the values of every kept front end and no front end whole; before, it dropped every kept front end. (2) The builds under way are asked for a release (`Writer::short`) only when their MIR and inference are in proportion to what is short (at most four times the need and its margin), not on every task held back. (3) The front end of the checkout built last (the floor) is never dropped: a task whose wait only the floor could meet waits for a task to end or starts alone, and when the limit falls under what the daemon holds with only the floor left the daemon says so by name and keeps it.",
+   "why": "lane memgive-1112 (claude-fable-5-2). On 2026-11-12 a task that waited for 0.09 GiB made the daemon drop reth's kept front end (about 55 GiB held of a limit of 67.08 GiB) and the next build, a one-line revert, took 195.4 s where it takes 4 to 16 s; the same night three daemons squeezed each other and each pressure event dropped every kept front end. Rule incremental-first: the edit loop is what blaze is judged by, and a front end is the dearest thing the daemon holds. What is given up: under real pressure the daemon keeps up to one front end it would have freed (the ceiling's guard and admission's cap are still the last line), and a large task may start alone, serially, where dropping the floor would have let it run beside others.",
+   "recommended": "Yes. Confirm on reth's daemon with the limit lowered in steps (docs/v2/plan/design/memory.md, \"Giving memory back\"): no `is let go` line and edits in seconds while the footprint is under the limit.",
+   "state": "written on int-1112 (34b4f5600e), not compiled or measured; the coordinator confirmed the three changes on 2026-11-12; the owner has not seen it"
+  },
+  {
    "id": "D1",
    "date": "2026-11-11",
    "decision": "Lanes with their own ix VM build, check and test their own work. Merges to main, measurements that claims rest on, persisted-state and bootstrap changes, and the check before a merge stay with the main agent.",

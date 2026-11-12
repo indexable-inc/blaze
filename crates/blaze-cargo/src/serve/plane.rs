@@ -809,6 +809,10 @@ pub struct Plane<W: Work, P: Predict> {
     /// them right after a purge: what a give-back is measured by ([`Plane::reading`]).
     readings: u64,
     purged_readings: u64,
+    /// The thread tasks posted and not yet taken whose kind is codegen's
+    /// (`admission::tag_of`: a library's, a unit's or a program's codegen, a reach): each may
+    /// walk a program over codegen's kept walks ([`Plane::walks_in_flight`]).
+    walking: usize,
     /// The purge asked of the purger's thread and not yet done ([`Purging`]).
     purging: Option<Purging>,
     /// Each request's live model, fed every record the plane says of it ([`Folds`]).
@@ -976,6 +980,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
             purge_due: false,
             readings: 0,
             purged_readings: 0,
+            walking: 0,
             purging: None,
             folds: Folds::new(),
         })
@@ -1076,6 +1081,27 @@ impl<W: Work, P: Predict> Plane<W, P> {
     pub fn push(&self, fresh: &mut Fresh, node: NodeRef<'_>, task: Task) -> NodeId {
         let learn = node.key;
         self.push_predicted(fresh, node, task, learn)
+    }
+
+    /// The next node of `fresh`, as [`Plane::push`], but with the memory and cost `node` says
+    /// and no prediction: for a task that runs because memory is short (a give-back,
+    /// `kinds::GIVE_BACK`), which a predicted peak would hold back behind the very tasks it
+    /// makes room for.
+    ///
+    /// # Panics
+    ///
+    /// As [`Plane::push`].
+    pub fn push_free(&self, fresh: &mut Fresh, node: NodeRef<'_>, task: Task) -> NodeId {
+        assert!(
+            (fresh.tasks.len() as u32) < fresh.count,
+            "a batch of {} nodes given another",
+            fresh.count
+        );
+        assert!(task != Task::Gone, "node {} is pushed with no task", node.name);
+        fresh.tasks.push(task);
+        fresh.keys.push(node.key);
+        fresh.sizes.push(0);
+        fresh.nodes.push(node)
     }
 
     /// The next node of `fresh`, as [`Plane::push`], but predicted and taught by `learn`, a
@@ -1516,6 +1542,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
         if !again {
             self.happened.push(Happened::Started { id: task.id });
         }
+        self.walks(task.kind, true);
         self.runner.post(task, work, readers);
     }
 
@@ -1552,6 +1579,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
         self.runner.take(&mut ran);
         for Ran { task, ended, peak, ran_ns, puts } in ran.drain(..) {
             let id = task.id;
+            self.walks(task.kind, false);
             if let Some(purging) = &mut self.purging {
                 purging.freed = true;
             }
@@ -1689,6 +1717,31 @@ impl<W: Work, P: Predict> Plane<W, P> {
             kept: self.graph.allocator_kept(),
             readings: self.readings,
             purged: self.purged_readings,
+        }
+    }
+
+    /// How many thread tasks that may walk a program run now: those of codegen's kinds
+    /// posted to the runner and not yet taken back. While it is 0 no walk holds codegen's
+    /// kept walks, so letting go of them frees them at once and loses no walk's result
+    /// (`blaze_graph::giveback::Rung::Caches`); while one runs, it keeps its own table until
+    /// it ends and what it then keeps is dropped with that table.
+    pub fn walks_in_flight(&self) -> usize {
+        self.walking
+    }
+
+    /// A thread task of `kind` is posted to the runner (`posted`) or taken back from it:
+    /// counted where it may walk a program ([`Plane::walks_in_flight`]).
+    fn walks(&mut self, kind: TaskKind, posted: bool) {
+        if admission::tag_of(kind) != blaze_mem::Tag::Codegen {
+            return;
+        }
+        match posted {
+            true => self.walking += 1,
+            false => {
+                self.walking = self.walking.checked_sub(1).unwrap_or_else(|| {
+                    panic!("a codegen task of kind {:#x} was taken back that was never posted", kind.0)
+                });
+            }
         }
     }
 
@@ -1879,6 +1932,7 @@ impl<W: Work, P: Predict> Plane<W, P> {
                 } else {
                     let work = batch.work.clone().expect("checked by add");
                     self.happened.push(Happened::Started { id });
+                    self.walks(task.kind, true);
                     self.runner.post(task, work, W::Readers::default());
                 }
             }

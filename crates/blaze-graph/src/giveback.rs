@@ -286,7 +286,8 @@ struct Asked {
     unread: bool,
     /// Whether it was asked since it was last made again (or ever, if never remade).
     given: bool,
-    /// Whether it was given and made again at least once.
+    /// Whether it was given and made again since it was last given: its next give is a
+    /// thrash.
     remade: bool,
     /// Until when its remake holds it.
     hold_until_ns: u64,
@@ -409,6 +410,17 @@ impl Planner {
                     || now.at_ns >= awaiting.since_ns.saturating_add(MEASURE_WITHIN_NS)
             }
             None => true,
+        }
+    }
+
+    /// The gives the planner waits to see measured were done only now (a give that runs off
+    /// the driver's thread): the reading that measures them is one taken after `now`, and the
+    /// wait for it counts from `now`.
+    pub fn done(&mut self, now: &Now) {
+        if let Some(awaiting) = &mut self.awaiting {
+            awaiting.reading = now.reading;
+            awaiting.purged = now.purged;
+            awaiting.since_ns = now.at_ns;
         }
     }
 
@@ -538,6 +550,7 @@ impl Planner {
                 seen.at_ask = source.gives;
                 seen.unread = true;
                 seen.given = true;
+                seen.remade = false;
                 if again {
                     self.counts.thrash += 1;
                 }
