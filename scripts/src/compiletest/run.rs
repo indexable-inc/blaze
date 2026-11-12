@@ -111,13 +111,14 @@ impl Engine {
         #[allow(clippy::disallowed_methods, reason = "the one place this script starts blaze; the environment is given whole and `cwd` always")]
         let mut command = Command::new(program);
         command.env_clear();
-        for name in ["HOME"] {
+        // The caller's `HOME` (the toolchain blaze fetched is the machine's) and `PATH` (the C
+        // driver blaze's linker asks for the C runtime's files); nothing else is inherited.
+        for name in ["HOME", "PATH"] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);
             }
         }
         command
-            .env("PATH", "/run/current-system/sw/bin:/usr/bin:/bin:/usr/sbin:/sbin")
             .env("TMPDIR", &self.tmp)
             .env("BLAZE_HOME", &self.home)
             .env("XDG_CACHE_HOME", &self.cache)

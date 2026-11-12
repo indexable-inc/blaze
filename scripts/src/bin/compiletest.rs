@@ -16,7 +16,8 @@ The input is one JSON object (inline, a file's path, or `-`); an unknown field i
                   run    plan, run every test that has a plan against one daemon, print the
                          table and the causes, and hold the result to the expectations
     root          the checkout (".")
-    corpus        the directory `fetch` fills; the tests are under `<corpus>/src/tests`
+    corpus        the directory `fetch` fills; the tests are under `<corpus>/src/tests`. Without
+                  it: the machine's, `~/.blaze/compiletest/<the pin's sha256>`, beside the toolchain
     blaze         run: the blaze client under test (`blaze-engine` is beside it)
     work          run: a directory of this run's own (packages, the daemon's home); it is made
     suites        which of ui, incremental, crashes (all three)
@@ -105,7 +106,7 @@ impl Input for Given {
         Ok(Given {
             command: f.one_of("command", &["fetch", "list", "run"], None)?,
             root: f.str("root", Some("."))?,
-            corpus: f.str("corpus", None)?,
+            corpus: f.str("corpus", Some(""))?,
             blaze: f.str("blaze", Some(""))?,
             work: f.str("work", Some(""))?,
             suites: f.ones_of("suites", &["ui", "incremental", "crashes"], &["ui", "incremental", "crashes"])?,
@@ -153,6 +154,15 @@ fn pin(root: &Path) -> Pin {
     pin
 }
 
+/// Where the corpus is: the directory given, else the machine's, named by the pin.
+fn corpus_of(given: &Given, pin: &Pin) -> PathBuf {
+    if !given.corpus.is_empty() {
+        return PathBuf::from(&given.corpus);
+    }
+    let home = std::env::var_os("HOME").unwrap_or_else(|| fail(SCRIPT, "no `corpus` was given and there is no HOME to keep the machine's under"));
+    PathBuf::from(home).join(".blaze/compiletest").join(&pin.sha256)
+}
+
 /// A program run to its end with its output shown; the script stops when it fails.
 fn must(argv: &[&str], cwd: &Path) {
     match blaze_script::run_shown(argv, cwd) {
@@ -180,7 +190,7 @@ fn sha256(file: &Path, cwd: &Path) -> String {
 /// pinned paths alone. The corpus is data: nothing of it runs here.
 fn fetch(given: &Given) {
     let pin = pin(Path::new(&given.root));
-    let corpus = PathBuf::from(&given.corpus);
+    let corpus = corpus_of(given, &pin);
     let marker = corpus.join("PINNED");
     if std::fs::read_to_string(&marker).is_ok_and(|it| it.trim() == pin.sha256) {
         println!("{SCRIPT}: {} holds the pinned corpus ({})", corpus.display(), pin.sha256);
@@ -411,7 +421,7 @@ fn main() {
     }
     let root = PathBuf::from(&given.root);
     let pinned = pin(&root);
-    let corpus = PathBuf::from(&given.corpus);
+    let corpus = corpus_of(&given, &pinned);
     if !std::fs::read_to_string(corpus.join("PINNED")).is_ok_and(|it| it.trim() == pinned.sha256) {
         fail(SCRIPT, &format!("{} is not the pinned corpus ({}): run `{{\"command\": \"fetch\", \"corpus\": ..}}`", corpus.display(), pinned.sha256));
     }
