@@ -109,8 +109,10 @@ impl Real {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         // The daemon's socket is `<home>/v2.sock`, at most 104 bytes on macOS; and
         // `/private/tmp`, not `/tmp`, which is a link there.
-        let tmp = if Path::new("/private/tmp").is_dir() { "/private/tmp" } else { "/tmp" };
-        let root = Path::new(tmp).join(format!("brv-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        // `BLAZE_REVISIONS_ROOT`: another directory to work under (short, and off any link).
+        let tmp = std::env::var("BLAZE_REVISIONS_ROOT")
+            .unwrap_or_else(|_| if Path::new("/private/tmp").is_dir() { "/private/tmp" } else { "/tmp" }.to_owned());
+        let root = Path::new(&tmp).join(format!("brv-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("test"), &test.name).unwrap();
