@@ -408,7 +408,7 @@ def speed(it):
     writes its results; exits 1 when it failed."""
     data = json.load(open(it.bench))
     repro = (f"BLAZE_BIN=\"$(dirname \"$(command -v blaze)\")/blaze-engine\" "
-             f"python3 harness/bench.py {it.project} --backend cranelift --runs 1 --cold-runs 1 --tests")
+             f"python3 harness/bench.py '{json.dumps(dict(projects=[it.project], backends=['cranelift'], runs=1, cold_runs=1, tests=True))}'")
     checks = []
 
     def check(what, why, seconds=0):
@@ -433,8 +433,8 @@ def speed(it):
     if not data["results"]:
         check("bench", "bench.py measured nothing")
     if it.baseline and os.path.exists(it.baseline):
-        compared = subprocess.run([sys.executable, os.path.join(ROOT, "harness", "bench.py"), "--compare", it.baseline,
-                                   it.bench, "--threshold", str(it.threshold)], capture_output=True, text=True)
+        compared = subprocess.run([sys.executable, os.path.join(ROOT, "harness", "bench.py"), json.dumps(dict(
+            command="compare", baseline=it.baseline, result=it.bench, threshold=float(it.threshold)))], capture_output=True, text=True)
         worse = [line for line in compared.stdout.splitlines() if line.strip()] if compared.returncode else []
         if compared.returncode and not worse:
             worse = [compared.stderr.strip()[-3000:] or f"bench.py --compare exited {compared.returncode}"]

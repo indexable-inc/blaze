@@ -1,7 +1,7 @@
 # The benchmark tables of docs/benchmarks.md and the README's numbers, measured on real projects, as a matrix over
-# the platforms of harness/benchplatforms.py: macOS arm64, Linux aarch64 and Linux x86-64. Each
-# runs on its own dedicated benchmark machine (a self-hosted runner labelled bench-macos,
-# bench-arm64 or bench-x86; docs/benchmarks.md "The machines"), never on a shared GitHub runner:
+# the platforms of harness/benchplatforms.py: macOS arm64, Linux aarch64, Linux x86-64 and Windows
+# x86-64. Each runs on its own dedicated benchmark machine (a self-hosted runner labelled
+# bench-macos, bench-arm64, bench-x86 or bench-windows; docs/benchmarks.md "The machines"), never on a shared GitHub runner:
 # their neighbours make the numbers noise. A platform runs only once its runner is registered (the
 # repository variable BENCH_RUNNERS names it); the others are skipped and the README keeps their
 # last numbers, with their date and commit.
@@ -62,7 +62,8 @@ jobs:
         env:
           BENCH_RUNNERS: ${{ vars.BENCH_RUNNERS }}
           BENCH_RUNNER: ${{ vars.BENCH_RUNNER }}
-        run: python3 harness/benchplatforms.py matrix
+        run: |
+          python3 harness/benchplatforms.py "$(printf '{"workflow": "bench-readme", "runners": "%s", "runner": "%s"}' "$BENCH_RUNNERS" "$BENCH_RUNNER")"
 
   bench:
     name: bench (real projects, ${{ matrix.name }})
@@ -102,25 +103,46 @@ jobs:
       # is, so blaze itself builds incrementally), run in the bench shell for the pinned LLVM and
       # the C toolchain. Its daemon ends before the measured blaze starts.
       - name: Build blaze
+        if: runner.os != 'Windows'
         run: |
           mkdir -p "$BENCH_HOME"
           CARGO_HOME="$BENCH_HOME/stage0" sh site/install.sh --version "$(cat .github/blaze-version)" --verbose
           stage0="$BENCH_HOME/stage0/bin/blaze"
           CARGO_TARGET_DIR="$BENCH_HOME/target" nix develop .#bench -c "$stage0" build -p blaze-engine --release --locked
           "$stage0" stop
+      # Windows has no Nix: the pinned nightly (cargo's side) from rustup, and the Build Tools'
+      # environment (link.exe first on PATH, not Git Bash's coreutils `link`).
+      - if: runner.os == 'Windows'
+        uses: ./.github/actions/toolchain
+      # The same stage 0 build, once a release of blaze for Windows exists to be stage 0: there
+      # is none yet (blaze-platform.yaml's tests stop on the same), and cargo never builds blaze.
+      - name: Build blaze (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          echo "::error::the Windows bench needs a release of blaze for Windows to build blaze with (release.yaml makes none yet); blaze builds blaze, never cargo (AGENTS.md rule blaze-builds-blaze)"
+          exit 1
       - name: Bench
         id: bench
+        env:
+          PROJECTS: ${{ toJSON(matrix.projects) }}
         run: |
-          export BLAZE_BIN="$BENCH_HOME/target/release/blaze-engine"
+          # On Windows: no Nix shell, the Python on PATH, and paths in JSON as C:/... (cygpath -m).
+          if [ "$RUNNER_OS" = Windows ]; then shell=() py=python exe=.exe; else shell=(nix develop .#bench -c) py=python3 exe=; fi
+          path() { if [ "$RUNNER_OS" = Windows ]; then cygpath -m "$1"; else printf %s "$1"; fi; }
+          export BLAZE_BIN="$BENCH_HOME/target/release/blaze-engine$exe"
           export BLAZE_PROJECTS="$BENCH_HOME/projects"
           work=${BENCH_WORK:-$BENCH_HOME/work}
           rm -rf "$work" "$BENCH_HOME/reference"
           mkdir -p "$RUNNER_TEMP/results"
-          full=()
-          [ "$FULL" = true ] && full=(--setups all --setups-on "ripgrep,nushell" --tests)
-          nix develop .#bench -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py \
-            ripgrep fd bat hyperfine just axum nushell helix bevy biome --runs 5 --cold-runs 5 "${full[@]}" \
-            --work "$work" --reference "$BENCH_HOME/reference" --out "$RUNNER_TEMP/results/bench.json" \
+          # The other setups are Linux's and macOS's linkers and cg_clif: the tests alone on Windows.
+          full=
+          if [ "$FULL" = true ]; then
+            full=', "tests": true'
+            [ "$RUNNER_OS" = Windows ] || full=', "setups": ["all"], "setups_on": ["ripgrep", "nushell"], "tests": true'
+          fi
+          input=$(printf '{"projects": %s, "runs": 5, "cold_runs": 5, "work": "%s", "reference": "%s", "out": "%s"%s}' \
+            "$PROJECTS" "$(path "$work")" "$(path "$BENCH_HOME/reference")" "$(path "$RUNNER_TEMP/results/bench.json")" "$full")
+          "${shell[@]}" env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER "$py" harness/bench.py "$input" \
             || { status=$?; [ "$status" = 3 ] || exit "$status"; echo "wrong=true" >> "$GITHUB_OUTPUT"; }
       - uses: actions/upload-artifact@v7
         if: always()
