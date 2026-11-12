@@ -1,12 +1,13 @@
 ---
 status: current
-summary: How long an edit takes to build, the memory and disk it uses and how fast its programs run, against cargo, on three platforms.
+summary: How long an edit takes to build, the memory and disk it uses and how fast its programs run, against cargo, on four platforms.
 ---
 # Benchmarks
 
 How long an edit takes to build under blaze, how much memory and disk it uses, and how fast the
-programs it builds run, against cargo. Each table is a matrix over three platforms, macOS arm64,
-Linux aarch64 and Linux x86-64, each measured on a dedicated machine of its own, on real
+programs it builds run, against cargo. Each table is a matrix over four platforms, macOS arm64,
+Linux aarch64, Linux x86-64 and Windows x86-64 (MSVC), each measured on a dedicated machine of
+its own, on real
 projects at pinned commits, against plain cargo on the same machine, and written back here (and
 the README's numbers with them) by a bot commit. A platform's numbers compare with each other
 and with its own history, not with another platform's: the machines differ in more than their
@@ -355,7 +356,7 @@ state.
 | Phase | What happens | blaze | cargo |
 |---|---|---|---|
 | Cold | build from an empty target directory and an empty blaze store; crates are already downloaded | the build returns (under v1, cargo built the first time) and then the daemon loads the workspace in the background; both are reported | `cargo build` |
-| Cold, warm store | after everything else, `--cold-runs` times: a second copy of the project with an empty target directory and a daemon of its own, but the store the measured copy filled with its cold build and edits (as a second checkout of the same project, or a teammate's store, would have) | build and daemon ready, as cold | |
+| Cold, warm store | after everything else, `cold_runs` times: a second copy of the project with an empty target directory and a daemon of its own, but the store the measured copy filled with its cold build and edits (as a second checkout of the same project, or a teammate's store, would have) | build and daemon ready, as cold | |
 | Nothing changed | build again with no edit | | |
 | Edit a function | one statement is added to a function in the main crate | | incremental |
 | Edit a widely used function | one statement in a function many places call: in a library crate of the workspace when there is one (ripgrep's `grep-matcher`, axum's `axum-core`, nushell's `nu-path`, bat's library), otherwise in a module the rest of the crate uses (fd, hyperfine, just) | | incremental |
@@ -363,7 +364,10 @@ state.
 | Edit a generic function | a statement in a generic function used at many types (ripgrep and nushell) | | incremental |
 | Add a function | a new function in the main crate, called from the function of "Edit a function" | | incremental |
 | Add a struct field | a struct gets one more field (`_bench_edit: ()`) and every place that builds it sets it; in a library crate where there is one (nushell's `nu-protocol::Alias`, built in `nu-parser`) | | incremental |
-| Tests | (`--tests`) the project's test suite, or the crates of it named in `PROJECTS`, after the edits: `blaze test` and `cargo test`, run twice each, the second timed; every test has to pass under blaze by its own verdict (cargo is only timed) | | |
+| Move a dependency to another version | (projects with a `dependency` in `PROJECTS`: ripgrep's memchr, 2.7.6 to 2.7.5) Cargo.lock as `cargo update --precise` writes it, the new source fetched before the build is timed; how it linked is recorded, not held to a splice, since every crate above the dependency changed | | incremental |
+| Move it back | the lock as it was: what the store already has | | incremental |
+| Edit a function after a restart | the daemon stopped, then "Edit a function" built by a new daemon on the store the old one kept: the first edit after a restart, which has to splice into the program as a warm edit does | | incremental |
+| Tests | (`tests`) the project's test suite, or the crates of it named in `PROJECTS`, after the edits: `blaze test` and `cargo test`, run twice each, the second timed; every test has to pass under blaze by its own verdict (cargo is only timed) | | |
 | Runtime | (ripgrep) the program blaze linked, cargo's debug build and cargo's release build run the same search over the toolchain's own library source | | |
 
 The edits do not change what the program does. After the first edit of each kind the program
@@ -372,13 +376,13 @@ status, stdout and stderr); in the runtime phase each of the three programs has 
 is the speed baseline, not the answer (2026-10-30: no harness compares blaze's output with
 cargo's). A run in which a program is wrong is not published (`benchreport.py` refuses it and the workflow fails).
 
-Each edit is made and taken back `--runs` times (5 in CI). The summary tables show the median of
+Each edit is made and taken back `runs` times (5 in CI). The summary tables show the median of
 the edits; the results below also show the fastest and slowest run of each side, and the raw JSON keeps
 every sample, the time of taking each edit back, who built each step (the daemon, or cargo and
 why), whether the daemon spliced the change into the program or linked it again, how many
 functions it compiled, the memory of both sides (below) and the daemon's own timeline of each
 build.
-Cold is `--cold-runs` runs of each (5 in CI), each with a new target directory, home and store;
+Cold is `cold_runs` runs of each (5 in CI), each with a new target directory, home and store;
 the store size after it is kept too.
 
 An edit v1's daemon handed to cargo (a fallback) was measured once, marked `(c)` in the tables,
@@ -394,6 +398,7 @@ side leaves behind. [The summary](#how-much-memory-and-disk-it-takes) is at the 
 |---|---|---|
 | Peak, each phase and edit | the most `blaze build`, the daemon and every process under either held at once: under v1, cargo when the client handed it the build, its rustc, build scripts and linker, the daemon's workers and what they run | the most `cargo build`, rustc, build scripts and the linker held at once |
 | Largest process | the peak of the largest of those processes on its own | the same |
+| CPU time, each phase and edit | user and system time of the command, what it started and the daemon over the build | the same of cargo and what it ran |
 | Daemon between edits | what the daemon and its workers hold once it is ready, after nothing changed, after each kind of edit and at the end of the run, with the number of builds so far: memory that grows with every edit shows here | |
 | On disk | the target directory, the store and blaze's home | the target directory |
 | Cold, warm store | the peak, and what the daemon holds once ready | |
@@ -426,6 +431,18 @@ memory uses it. It combines two readings:
 The peak reported is the sum, and never less than the peak of the largest process. What the
 daemon holds between edits is one reading of its tree when it is idle.
 
+**On Windows** both numbers are exact. Each timed command starts suspended in a job object of
+its own and runs once it is in the job, so everything it starts is in the job too, the daemon
+included (blaze starts it detached from the console, not out of the job). When the command
+ends, the job says the most one of its processes committed (`PeakProcessMemoryUsed`) and the
+most all of them committed at once (`PeakJobMemoryUsed`), and the CPU time all of them used. A
+process holds its private commit (`PrivateUsage`): the memory it owns in RAM or in the page file,
+without the shared pages of the DLLs, the same count as macOS's footprint and the number a job's
+memory limit enforces. A daemon started before the command is outside its job: the sampler reads
+its private commit (and its peak) every 10 ms as on the other platforms, with the process tree
+from a Toolhelp snapshot, a child counted only when it started after its parent (Windows reuses
+a pid while a child still names it as parent).
+
 **Error.** The sum can miss a rise shorter than 10 ms and a process that lives less than
 10 ms (a short `cc` or build script): it reads low by at most what such a process held. On
 Linux it can also read high: a page of a shared library that several processes have mapped
@@ -447,7 +464,9 @@ copy the file system made by sharing the blocks (a reflink, which `std::fs::copy
 XFS and Btrfs, and which v1's copies of rustc's objects and libraries were) takes no
 more disk than the one file, and is counted so, where `du` counts it once per file. The
 kernel says which blocks are shared (`FIEMAP`); where it does not, a file is counted as
-`du` counts it. On macOS a clone is counted as `du` counts it, once per file.
+`du` counts it. On macOS a clone is counted as `du` counts it, once per file, and on Windows a
+file is its allocation (`FILE_STANDARD_INFO`'s `AllocationSize`, Explorer's "size on disk"),
+a block clone on ReFS once per file too.
 
 The history (`rss_mb`) still has the daemon's workers' high-water marks summed, as before; the
 history's memory alerts check the new numbers too (below).
@@ -512,7 +531,7 @@ backend in the result.
 
 ## The fastest setups
 
-With `--setups` (all of them in the nightly run, `--setups-on ripgrep,nushell`), every step plain
+With `setups` (all of them in the nightly run, on ripgrep and nushell: `setups_on`), every step plain
 cargo builds is built again by each of the fastest ways to build Rust there already are, each
 into a target directory of its own, right after plain cargo, on the same source:
 
@@ -578,25 +597,32 @@ patch, today Linux.
 Every result records its machine and platform: the name it was given (`BLAZE_BENCH_MACHINE`),
 the CPU, the cores the run could use (it may be pinned with `taskset`) and the machine's total,
 memory, OS, kernel, rustc, C compiler, linker, LLVM version and the load average when it
-started (below and in the JSON). The platforms, their runners' labels and how a result is
-filed are `harness/benchplatforms.py`.
+started (below and in the JSON). On Windows, which keeps no load average, it records instead
+Windows' build, the Visual Studio Build Tools with the C++ tools (`vswhere`) and their
+`link.exe`'s version, the file system of the work directory (ReFS on a Dev Drive, or NTFS) and
+Defender's real-time scanning with its exclusions (which Defender shows an administrator only;
+otherwise its refusal is what is recorded). The platforms, their runners' labels, the projects
+each measures and how a result is filed are `harness/benchplatforms.py`.
 
 Each platform is meant to run on a dedicated machine that runs nothing else, registered as a
 self-hosted GitHub Actions runner. A shared runner is no use: GitHub's hosted macOS arm64 runner
 (`macos-15`) is a 3-core VM with 7 GB of memory, less than nushell's daemon holds, with
-neighbours that move the numbers. The three:
+neighbours that move the numbers. The four:
 
 | Platform | Runner labels | Machine | Why |
 |---|---|---|---|
 | Linux x86-64 | `self-hosted, linux, x64, bench-x86` | `dev-aws-bench-x86` (i-01666717f0de39201, us-west-2a), resized to m8a.4xlarge: 16 AMD EPYC 9R45 (Zen 5) cores, one thread per core, 64 GiB | already launched for it, on demand, ttl a year, tagged `ix-dev-purpose=blaze-bench`; launched as a c8a.4xlarge (32 GiB), too little for nushell's daemon (15 GB) beside cargo |
 | Linux aarch64 | `self-hosted, linux, ARM64, bench-arm64` | a new `dev-aws-bench-arm64`, m8g.4xlarge: 16 Graviton4 (Neoverse V2) cores, 64 GiB, on demand | the same core count and memory as the x86 machine; a cloud VM is not bare metal, but its cores are not shared with other tenants |
 | macOS arm64 | `self-hosted, macOS, ARM64, bench-macos` | a Mac mini M4 Pro (14 cores, 64 GB) kept for it, plugged in, not sleeping (`sudo pmset -a sleep 0`), or an EC2 mac-m4pro.metal host if it has to be in AWS | bare metal, and the only way to measure macOS: a MacBook in use is busy with other work |
+| Windows x86-64 | `self-hosted, windows, x64, bench-windows` | none yet: 16 x86-64 cores and 64 GiB as the Linux machine has, the work on a Dev Drive (ReFS, where blaze clones its outputs into place), Visual Studio Build Tools with the C++ tools, Git for Windows (the job runs in its Bash) and Python 3 | measures ripgrep and fd until the other projects are shown to build there; its job stops at the build of blaze until a release of blaze for Windows exists to be stage 0 (blaze builds blaze) |
 
 `harness/benchrunner.sh PLATFORM MACHINE` sets a runner up: it checks the platform is the
 machine's, installs the runner in `~/actions-runner`, registers it with the platform's labels and
 runs it at boot (on Linux as user `andrew` from a user systemd unit,
 `blaze-bench-runner.service`, lingering; on macOS as the runner's launchd service), and its
-`.env` names the machine for the results. It needs Nix with flakes on the machine:
+`.env` names the machine for the results. It needs Nix with flakes on the machine (a Windows
+machine is registered by GitHub's own runner installer, with the labels above and
+`BLAZE_BENCH_MACHINE` in the runner's `.env`):
 
 ```
 scp harness/benchrunner.sh HOST:
@@ -605,7 +631,9 @@ gh api -X POST repos/indexable-inc/blaze/actions/runners/registration-token --jq
 ```
 
 Then name the platform in the repository variable `BENCH_RUNNERS`, comma-separated, which turns
-its jobs on: `gh variable set BENCH_RUNNERS -R indexable-inc/blaze -b linux-x86-64,linux-aarch64,macos-arm64`.
+its jobs on: `gh variable set BENCH_RUNNERS -R indexable-inc/blaze -b linux-x86-64,linux-aarch64,macos-arm64,windows-x86-64`.
+Windows runs bench-readme alone: bench-bun's build of bun's C and C++ is Nix's, and Windows has
+no instruction counts for bench-counts.
 A platform it does not name is skipped by every run rather than left waiting for a runner that
 is not there, and the tables keep its last numbers, under their machine, date and commit.
 (`BENCH_RUNNER=true`, from before there were platforms, still means Linux x86-64.)
@@ -696,11 +724,11 @@ shows.
 
 ### The stress corpus and the per-merge run
 
-`bench.py --stress` adds the crates of `harness/stress-corpus/manifest.json` (`{"version": 1,
+bench.py's `stress` adds the crates of `harness/stress-corpus/manifest.json` (`{"version": 1,
 "crates": [{"name", "path", "what"}]}`, paths relative to `harness/stress-corpus`): small crates,
 each a shape that is hard for a compiler. Each is copied out as a workspace of its own and built
 from nothing (no target directory, an empty home and store, no daemon) by `blaze check` and then
-`blaze build`, `--runs` times each, until the daemon is ready and quiet: wall time, blaze's
+`blaze build`, `runs` times each, until the daemon is ready and quiet: wall time, blaze's
 peak memory and the counts. They are in the result under `stress` (and `stress_gap` when the
 manifest is not in the tree), and in a history line as `stress:<crate>/<backend>`.
 
@@ -755,19 +783,29 @@ As v1 was measured (against v2 this stops where [the top of the page](#benchmark
 ```
 nix develop .#bench
 cargo build -p blaze-engine --release
-python3 harness/bench.py ripgrep fd --runs 5 --out /tmp/bench.json   # any of the projects
+python3 harness/bench.py '{"projects": ["ripgrep", "fd"], "runs": 5, "out": "/tmp/bench.json"}'
 python3 harness/benchreport.py /tmp/bench.json --check               # what would change
 ```
 
-`--backend cranelift` measures one tier. `--cold-runs 5` repeats the cold builds, `--setups
-all --setups-on ripgrep,nushell` adds the setups above, `--tests` the test suites, and
-`--reference DIR` puts cargo's target directories outside the work directory.
+`"backends": ["cranelift"]` measures one tier. `"cold_runs": 5` repeats the cold builds,
+`"setups": ["all"], "setups_on": ["ripgrep", "nushell"]` adds the setups above, `"tests": true`
+the test suites, and `"reference": DIR` puts cargo's target directories outside the work
+directory; the top of `harness/bench.py` has every field.
+
+On Windows x86-64, in Git Bash from a Developer PowerShell for VS (so that MSVC's `link.exe`
+comes before Git's coreutils `link`), with the pinned nightly from rustup and a blaze for Windows
+in `BLAZE_BIN`, the work on a Dev Drive:
+
+```
+python harness/bench.py '{"projects": ["ripgrep", "fd"], "runs": 5, "work": "D:/bench", "out": "D:/bench.json"}'
+```
 Projects are cloned once into `BLAZE_PROJECTS`
 (default `~/blaze-projects`). The whole CI set (seven projects, both tiers, five runs) took 38
 minutes on 16 Zen 5 cores, plus the build of blaze. It needs about 20 GB of memory (nushell)
 and 30 GB of disk.
-`python3 harness/bench.py --compare OLD.json NEW.json` lists what got slower or holds more
-memory. On macOS give `--work` a short directory (`--work /tmp/bench`): the daemon's socket
+`python3 harness/bench.py '{"command": "compare", "baseline": "OLD.json", "result": "NEW.json"}'`
+lists what got slower or holds more memory. On macOS give `work` a short directory
+(`"work": "/tmp/bench"`): the daemon's socket
 path has to fit in 104 bytes, which a work directory under `$TMPDIR` does not leave room for.
 `python3 harness/benchreport.py RESULT` publishes a run as its platform's (the machine it ran
 on): `BLAZE_BENCH_MACHINE` names that machine in the tables, and `taskset -c 0-15` before
@@ -784,7 +822,7 @@ every table and chart again from the stored results.
 - One machine, one OS. The numbers on a laptop will differ; the ratios are what carries over.
 - Cold is the least precise number here: five runs at most, each minutes long on the large
   projects.
-- The setups compared are measured on ripgrep and nushell only (`--setups-on`): seven more
+- The setups compared are measured on ripgrep and nushell only (`setups_on`): seven more
   builds of every step on every project would make the nightly run too long for one machine.
 - An edit is a small, fixed change. A larger change (many functions, a new type) costs more.
 - axum's output is not checked (it is a server); its build is.

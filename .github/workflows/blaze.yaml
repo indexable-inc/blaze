@@ -133,6 +133,9 @@ jobs:
       # The list of tests that may fail holds together and is as its recorder writes it, and the
       # comparison and the recording do what they say on made-up results.
       - run: uv run --frozen python harness/failures.py selftest
+      # The memory and CPU time the benchmarks report, against a 300 MB process that starts a
+      # 200 MB one and burns half a second (harness/memory.py; it passes on Windows's job objects too).
+      - run: uv run --frozen python harness/memory.py selftest
       # The agent rules: tools/agents/rules.ts type-checks, and AGENTS.md and the rules in .agents/skills/*/SKILL.md are what it generates.
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile --cwd site

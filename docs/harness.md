@@ -346,9 +346,9 @@ tables and the README's numbers: [benchmarks.md](benchmarks.md). It runs every b
 under `--message-format=json` and reads how it linked, what it compiled and its steps' times
 from the `blaze-work` line (`links`, `compiled`, `steps_us`), and the daemon's pid from its lock.
 Besides the edits `bench.py` times repeated cold builds
-against fresh cargo with an empty and with a warm store (`--cold-runs`), the same steps under
-the fastest cargo setups (`--setups`: mold, wild, `-Zthreads=8`, cg_clif and `cargo check`) and
-the test suites under both (`--tests`). v2 has no runtime bench yet: benchmarks.md's runtime
+against fresh cargo with an empty and with a warm store (`cold_runs`), the same steps under
+the fastest cargo setups (`setups`: mold, wild, `-Zthreads=8`, cg_clif and `cargo check`) and
+the test suites under both (`tests`). v2 has no runtime bench yet: benchmarks.md's runtime
 table is v1's `runbench.py`'s last result. `abbench.py` runs two or more builds of blaze against each other on `bench.py`'s
 edits, in interleaved rounds: an edit's wall time, its steps' times from the `blaze-work`
 line's `steps_us`, the daemon's cycles and instructions (counters.py; the cold start's on macOS

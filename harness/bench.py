@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """bench.py: what a build costs through `blaze`, phase by phase, against plain cargo.
 
-    bench.py [PROJECT...] [--backend cranelift|llvm]... [--runs N] [--out FILE] [--work DIR]
-             [--reference DIR] [--keep] [--stress]
-    bench.py --compare BASELINE RESULT [--threshold PERCENT]
+    bench.py '{"projects": ["ripgrep"], "backends": ["cranelift"], "runs": 5, "out": "bench.json"}'
+    bench.py '{"command": "compare", "baseline": "bench-baseline.json", "result": "bench.json", "threshold": 200.0}'
+
+The input is one JSON object (inline, a file's path, or `-`; `Input` below has every field):
+`projects` (empty: every project but those `prepare` or `named` keeps out), `backends` (empty:
+both), `runs` (3), `cold_runs` (1), `out` (harness/bench.json), `work` (a new directory under
+the system's temporary one), `reference` (WORK/reference), `setups` (`["all"]` for every one),
+`setups_on` (the projects the setups run on; empty: all), `keep`, `tests`, `stress`; for
+`compare`, `baseline`, `result` and `threshold` (percent, 25.0).
 
 Each project is one pinned checkout (cloned into `BLAZE_PROJECTS` as blaze_cli.py does, and
 copied; the clone is never written to). A project with `prepare` (bun) is copied from the tree
@@ -12,7 +18,7 @@ that module's `prepare` makes beside the clone, and is measured only when named,
 with `dir` is built in that directory of its checkout (codex: codex-rs), and its edits are
 paths in it. Under each
 backend, with a store, a daemon and a home of its own, and plain cargo building the same source
-into a target directory of its own outside the checkout (under `--reference`, which lets the two be on different disks, or `WORK/reference`):
+into a target directory of its own outside the checkout (under `reference`, which lets the two be on different disks, or `WORK/reference`):
   cold       `blaze build` from nothing, which starts the daemon and is its first build; the
              standard library's crates are units of that build like any other, built into the
              empty store
@@ -21,10 +27,16 @@ into a target directory of its own outside the checkout (under `--reference`, wh
   signature  a function gets another parameter, and every caller the argument
   leaf       a body in a crate of the workspace that the others depend on
   generic    the body of a generic function that is used at many types
+  dep-bump   (projects with a `dependency`) Cargo.lock moves one dependency to another version
+             of the same major, as `cargo update --precise` writes it, its source fetched before
+             the build is timed; dep-restore puts the lock back as it was
+  restart    (projects with a `body` edit) the daemon stopped, then that edit built by the
+             new daemon on the warm store: the first edit after a restart, which has to splice
+             as a warm edit does; cargo's time is the same edit's incremental build
   runtime    (projects with a `runtime` workload) the program blaze linked, cargo's debug build
-             and cargo's release build run the same command in turn, `--runs` times (at least
+             and cargo's release build run the same command in turn, `runs` times (at least
              10) each, as speed baselines; each has to exit 0
-Every edit is made and taken back `--runs` times, or once when the daemon turned it down and
+Every edit is made and taken back `runs` times, or once when the daemon turned it down and
 cargo built it; the time of each is the median, and every sample of both sides is kept. None of
 them changes what the program does: after the first of each kind the program is run and has
 to say what the program of blaze's cold build said; one that does not, or a test that fails
@@ -38,11 +50,13 @@ into docs/benchmarks.md's tables and the README's numbers.
 
 For every phase the result has the wall time of the command, cargo's time for the same
 step, the memory of both sides (`memory`: the most every process doing the work held at once,
-and the largest of them; harness/memory.py, docs/benchmarks.md "Memory and disk"), the most
+and the largest of them, and `cpu_s`, the CPU time of every process doing the work, the
+daemon's included; harness/memory.py, docs/benchmarks.md "Memory and disk"), the most
 the daemon has held so far (`rss_mb`), whether the build finished, and from the `blaze-work`
 line blaze builds print under `--message-format=json`: whether the daemon added the change to
 the linked program or linked again (and why), how many functions it compiled, and what it
-timed itself by step (`steps_us`). The result also has what the daemon held once ready and after each phase
+timed itself by step (`steps_us`; each edit's `link_ms` is its `link` step, blaze's alone:
+cargo's link is not timed apart from its build). The result also has what the daemon held once ready and after each phase
 (`resident`), and what each side has on disk at the end (`disk_mb`); the runtime phase has each
 program's peak and size.
 
@@ -52,20 +66,30 @@ Every blaze step also has the instructions and cycles blaze's processes retired 
 quiet, user mode on Linux. Where they can't be counted they are null and `counts_gap` says why.
 The test phases are not counted.
 
-`--stress` adds the stress corpus (harness/stress-corpus/manifest.json; with no project named,
-it alone): a cold `blaze check` and a cold `blaze build` of each crate, `--runs` times each, every
+`stress` adds the stress corpus (harness/stress-corpus/manifest.json; with no project named,
+it alone): a cold `blaze check` and a cold `blaze build` of each crate, `runs` times each, every
 one from nothing until the daemon is ready, with its wall time, blaze's peak memory and its
 counts, under `stress` in the result. Without the manifest the result says so in `stress_gap`.
 
-`--compare` reads two results and exits 1 when a phase of the second is slower or larger
+`compare` reads two results and exits 1 when a phase of the second is slower or larger
 than in the first by more than the threshold, was built by cargo where the daemon built it,
 was linked again where it was added, or is missing. Differences under 50 ms are not counted.
+
+On Windows (x86-64 MSVC) the run is the same, in Git Bash with the Build Tools' environment
+(`link.exe` first on PATH): memory and CPU time come from a job object (memory.py), there are no
+instruction counts (`counts_gap` says so), and the host says the Build Tools' version, the
+linker's, the work directory's file system and whether Defender scans it.
 
 Both backends run one blaze, `BLAZE_BIN`, which has LLVM as every native blaze does. A backend
 is a profile, as v2 picks it: `cranelift` builds the dev profile, `llvm` the release profile
 (`--release`), on both sides.
 """
-import glob, importlib, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
+import ctypes, glob, importlib, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
+from dataclasses import dataclass
+from typing import Literal
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "tools", "typed-input", "src"))
+from typed_input import fail, parse
 
 import blaze_cli, counters, memory, storelib
 from blaze_cli import HERE, ROOT, TOOLCHAIN, Side, fetch, how_built, program_output, test_results, test_verdict, timed
@@ -99,6 +123,15 @@ def field(file, header, literals):
         (files, opening, opening + "\n            _bench_edit: (),") for files, opening in literals]
 
 
+def dependency(name, old, new, old_checksum, new_checksum):
+    """An edit of Cargo.lock that moves `name` from version `old` to `new`, as `cargo update
+    -p NAME --precise NEW` writes it (checked by hand when the pin is chosen); taking it back is
+    the dependency restored."""
+    entry = lambda version, checksum: (f'name = "{name}"\nversion = "{version}"\n'
+                                       f'source = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "{checksum}"\n')
+    return [("Cargo.lock", entry(old, old_checksum), entry(new, new_checksum))]
+
+
 PROJECTS = {
     "ripgrep": dict(
         repo="BurntSushi/ripgrep", tag="15.1.0", rev="af60c2de9d85e7f3d81c78601669468cf02dabab",
@@ -112,6 +145,9 @@ PROJECTS = {
             struct=field("crates/printer/src/jsont.rs", "pub(crate) struct SubMatch<'a> {", [("crates/printer/src/json.rs", "jsont::SubMatch {")]),
         ),
         test=["--workspace"],
+        # memchr is under every searcher and printer: the crates above it build again.
+        dependency=dependency("memchr", "2.7.6", "2.7.5", "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273",
+                              "32a282da65faaf38286cf3be983213fcf1d2e2a58700e808f83f4ea9a4804bc0"),
         # The standard library's source, blaze's library/, which its digest pins.
         runtime=dict(bin="rg", args=["-uuu", "--sort", "path", "-c", r"\w+_unchecked\(|unsafe \{", "{library}"]),
     ),
@@ -452,26 +488,41 @@ def seconds(text):
 
 def write_edit(ws, changes, back):
     """Makes every change of an edit, or takes it back. The result is how many places changed.
-    A change whose old text is None appends its new text to the end of the file."""
+    A change whose old text is None appends its new text to the end of the file. A file keeps
+    its own line endings: in a checkout with CRLF (git's autocrlf on Windows) every line the
+    edit writes ends with CRLF too, and nothing else of the file changes."""
+    def read(path):
+        with open(path, encoding="utf-8", newline="") as f:
+            return f.read()
+
+    def write(path, text):
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+
+    def ends(text, it):
+        return it.replace("\n", "\r\n") if it is not None and "\r\n" in text else it
+
     places = 0
     for pattern, old, new in changes:
         if old is None:
             path = os.path.join(ws, pattern)
-            text = open(path).read()
+            text = read(path)
+            added = ends(text, new)
             if back:
-                assert text.endswith(new), f"{path} does not end with what was appended"
-                text = text[:-len(new)]
+                assert text.endswith(added), f"{path} does not end with what was appended"
+                text = text[:-len(added)]
             else:
-                text += new
-            open(path, "w").write(text)
+                text += added
+            write(path, text)
             places += 1
             continue
         old, new = (new, old) if back else (old, new)
         for path in sorted(glob.glob(os.path.join(ws, pattern), recursive=True)):
-            text = open(path).read()
-            if old in text:
-                places += text.count(old)
-                open(path, "w").write(text.replace(old, new))
+            text = read(path)
+            here_old, here_new = ends(text, old), ends(text, new)
+            if here_old in text:
+                places += text.count(here_old)
+                write(path, text.replace(here_old, here_new))
     assert places >= len(changes), f"an edit found only {places} places: {changes}"
     return places
 
@@ -497,9 +548,15 @@ class Daemon:
         return []
 
     def peak_mb(self):
-        """The most memory the daemon has held so far: its VmHWM, or where there is none
-        (macOS) the sampled peak of the daemon's tree."""
+        """The most memory the daemon has held so far: its VmHWM, on Windows the peak of its
+        private commit (memory.held_kb), or where there is neither (macOS) the sampled peak of
+        the daemon's tree."""
         pid = self.pid()
+        if memory.WINDOWS and pid:
+            held = memory.held_kb(pid)
+            if held is not None:
+                self.peak = max(self.peak, round(held[1] / 1024))
+            return self.peak
         if not os.path.isdir("/proc/self") or not pid:
             self.peak = max(self.peak, self.sampled)
             return self.peak
@@ -525,8 +582,10 @@ def metered(side, args, daemon=None, sampler=None, command="build", meter=None):
     command, and what it starts, is counted by it; the caller reads the meter around it."""
     own = sampler is None
     sampler = sampler or memory.Sampler()
-    if daemon:
-        sampler.add(daemon.pid())
+    was = daemon.pid() if daemon else None
+    if was:
+        sampler.add(was)
+    cpu_before = memory.cpu_seconds(was) if was else None
     if own:
         sampler.start()
     took, ran, used = memory.run(side.argv(command, *args), side.ws, side.env, 7200, sampler=sampler, meter=meter)
@@ -534,10 +593,33 @@ def metered(side, args, daemon=None, sampler=None, command="build", meter=None):
     blaze_cli.read_build(ran, cut=side.blaze and bool(blaze_cli.machine_format(command, args)))
     if own:
         sampler.stop()
-    used = dict(peak_mb=max(sampler.peak_mb, used["largest_mb"]), largest_mb=max(used["largest_mb"], sampler.largest_mb))
+    cpu = used["cpu_s"] + daemon_cpu(daemon, was, cpu_before)
+    used = dict(peak_mb=max(sampler.peak_mb, used["largest_mb"], used["peak_mb"] or 0), largest_mb=max(used["largest_mb"], sampler.largest_mb),
+                cpu_s=round(cpu, 3))
     if daemon:
         daemon.sampled = max(daemon.sampled, used["peak_mb"])
     return took, ran, used
+
+
+def daemon_cpu(daemon, was, before):
+    """The CPU time the daemon used for a command that ran while `was` (its pid before, or
+    None) was the daemon and `before` its CPU time then, beyond what memory.run counted: all of
+    it for a daemon already running; for one the command started, nothing on Windows, whose job
+    counted it, and all of it elsewhere, where `wait4` counts only what it waited for. A daemon
+    that was there and is gone, or that cannot be read, stops the run: its time is not known."""
+    if daemon is None:
+        return 0.0
+    now = daemon.pid()
+    if now is None:
+        if was is not None:
+            raise Failed(f"the daemon {was} ended during the build: its CPU time is not known")
+        return 0.0
+    after = memory.cpu_seconds(now)
+    if after is None:
+        raise Failed(f"the CPU time of the daemon {now} cannot be read")
+    if now == was:
+        return after - before
+    return 0.0 if memory.WINDOWS else after
 
 
 def memory_phase(rows, resident=None):
@@ -547,7 +629,8 @@ def memory_phase(rows, resident=None):
     def side(used):
         peaks = [u["peak_mb"] for u in used]
         return dict(peak_mb=round(statistics.median(peaks)), peak_max_mb=max(peaks),
-                    largest_mb=round(statistics.median(u["largest_mb"] for u in used)))
+                    largest_mb=round(statistics.median(u["largest_mb"] for u in used)),
+                    cpu_s=round(statistics.median(u["cpu_s"] for u in used), 3))
     result = {"blaze": side([r[0] for r in rows]), "cargo": side([r[1] for r in rows])}
     if resident is not None:
         result["blaze"]["resident_mb"] = resident
@@ -813,12 +896,13 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         the wait for it to be ready (`warm`) is 0."""
         before = counting.snapshot()
         with memory.Sampler() as sampler:
-            took, mine, used = metered(side, [*build, JSON], sampler=sampler, meter=counting)
+            # The daemon it starts is `watched`'s: its CPU time is the build's too (daemon_cpu).
+            took, mine, used = metered(side, [*build, JSON], daemon=watched, sampler=sampler, meter=counting)
             if mine.returncode != 0:
                 raise Failed(f"{name} {backend}: the first `blaze build` ({label}) failed:\n{mine.stderr[-3000:]}")
         warm = 0.0
-        used = dict(peak_mb=max(sampler.peak_mb, used["largest_mb"]), largest_mb=max(used["largest_mb"], sampler.largest_mb),
-                    resident_mb=watched.resident_mb())
+        used = dict(peak_mb=max(sampler.peak_mb, used["peak_mb"]), largest_mb=max(used["largest_mb"], sampler.largest_mb),
+                    cpu_s=used["cpu_s"], resident_mb=watched.resident_mb())
         watched.sampled = max(watched.sampled, used["peak_mb"])
         if pid := watched.pid():
             # macOS: the daemon left the command's tree; Linux's counter already follows it.
@@ -903,11 +987,66 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         resident["after"].append(dict(phase=kind, builds=builds[0], mb=held))
         report(kind, dict(memory=memory_phase([(s["used"], s["cargo_used"]) for s in made], held), wall_s=median(made, "wall_s"), cargo_s=median(made, "cargo_s"), rss_mb=daemon.peak_mb(),
                           built=slowest["built"], link=slowest["link"], compiled=max(s["compiled"] for s in made), places=places,
-                          steps_ms=slowest["steps_ms"], threads_s=slowest["threads_s"], slowest_s=round(slowest["wall_s"], 3),
+                          steps_ms=slowest["steps_ms"], link_ms=slowest["steps_ms"].get("link"),
+                          threads_s=slowest["threads_s"], slowest_s=round(slowest["wall_s"], 3),
                           back_s=median(back, "wall_s"), back_cargo_s=median(back, "cargo_s"),
                           back_link=max(back, key=lambda s: s["wall_s"])["link"],
                           samples_s=[round(s["wall_s"], 3) for s in made], cargo_samples_s=[round(s["cargo_s"], 3) for s in made],
                           setups=setup_times(setups, [s["setups"] for s in made]), **counters.summary([s["counts"] for s in made])))
+    def phase_of(rows, label):
+        """A phase from its runs, each what `both` timed of one build, as the edits' are."""
+        held = daemon.resident_mb()
+        resident["after"].append(dict(phase=label, builds=builds[0], mb=held))
+        slowest = max(rows, key=lambda r: r["wall_s"])
+        median = lambda key: round(statistics.median(r[key] for r in rows), 3)
+        return dict(memory=memory_phase([(r["used"], r["cargo_used"]) for r in rows], held), wall_s=median("wall_s"),
+                    cargo_s=median("cargo_s"), rss_mb=daemon.peak_mb(), built=slowest["built"], link=slowest["link"],
+                    link_ms=slowest["steps_ms"].get("link"), compiled=max(r["compiled"] for r in rows),
+                    steps_ms=slowest["steps_ms"], slowest_s=round(slowest["wall_s"], 3),
+                    samples_s=[round(r["wall_s"], 3) for r in rows], cargo_samples_s=[round(r["cargo_s"], 3) for r in rows],
+                    setups=setup_times(setups, [r["setups"] for r in rows]), **counters.summary([r["counts"] for r in rows]))
+
+    def row(took, reference, built, theirs_too, used, cargo_used, said, counted, link):
+        return dict(wall_s=took, cargo_s=reference, built=built, link=link, compiled=compiled(said), steps_ms=daemon_steps(said),
+                    setups=theirs_too, used=used, cargo_used=cargo_used, counts=counted)
+
+    # A dependency moved to another version and back. A full link here is how the build went,
+    # not a finding: every crate above the dependency changed.
+    if changes := spec.get("dependency"):
+        bumped, restored = [], []
+        for turn in range(runs):
+            for back in (False, True):
+                write_edit(ws, changes, back)
+                # The new version's source is downloaded before the build is timed, on both sides.
+                fetched = subprocess.run(["cargo", "fetch"], cwd=ws, env=env, capture_output=True, text=True)
+                if fetched.returncode != 0:
+                    raise Failed(f"{name} {backend}: `cargo fetch` of the dependency edit failed:\n{fetched.stderr[-3000:]}")
+                *timed, said, counted = both()
+                link = link_kind(said, frozenset(linked))
+                linked.update(it.path for it in links(said))
+                (restored if back else bumped).append(row(*timed, said, counted, link))
+                if turn == 0:
+                    runs_right("dep-restore" if back else "dep-bump")
+        report("dep-bump", dict(phase_of(bumped, "dep-bump"), places=len(changes)))
+        report("dep-restore", phase_of(restored, "dep-restore"))
+
+    # The first edit after the daemon restarts on the store it kept: the `body` edit, which has
+    # to splice into the image the old daemon kept as a warm edit does.
+    if restart := spec["edits"].get("body"):
+        again = []
+        for turn in range(runs):
+            ours.cargo("stop")
+            write_edit(ws, restart, False)
+            *timed, said, counted = both()
+            again.append(row(*timed, said, counted, edit_link("restart", "edit", said)))
+            if pid := daemon.pid():
+                meter.adopt(pid)
+            if turn == 0:
+                runs_right("restart")
+            write_edit(ws, restart, True)
+            *_, said, _ = both()
+            edit_link("restart", "edit taken back", said)
+        report("restart", phase_of(again, "restart"))
     resident.update(end_mb=resident["after"][-1]["mb"], builds=builds[0])
     end_disk = disk(ws, ours, theirs)
     if tests and "test" in spec:
@@ -1134,8 +1273,48 @@ def runtime(name, spec, theirs, ws, build, runs, wrong):
     return dict(command=[spec["bin"], *spec["args"]], **result)
 
 
-def machine():
-    """What the numbers were measured on."""
+VSWHERE = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Microsoft Visual Studio", "Installer", "vswhere.exe")
+
+
+def windows_host(work):
+    """What only a Windows host says of itself: the processor's name, Windows' build, the
+    Visual Studio Build Tools with the C++ tools (by vswhere, which names other products too
+    without `-requires`) and the version of their linker, the file system the work is on (ReFS
+    on a Dev Drive, or NTFS) and Defender's real-time scanning, with its exclusions as Defender
+    says them (to an administrator only: otherwise its refusal, kept as it said it)."""
+    import winreg
+
+    def said(*argv):
+        try:
+            ran = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return f"unknown: {argv[0]}: {error}"
+        return (ran.stdout.strip() or ran.stderr.strip() or f"unknown: {argv[0]} said nothing").splitlines()[0].strip()
+
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as key:
+        cpu = winreg.QueryValueEx(key, "ProcessorNameString")[0].strip()
+    vc = "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+    tools = said(VSWHERE, "-latest", "-products", "*", "-requires", vc, "-property", "installationPath")
+    build_tools = said(VSWHERE, "-latest", "-products", "*", "-requires", vc, "-property", "catalog_productDisplayVersion")
+    linker = None
+    if not tools.startswith("unknown"):
+        with open(os.path.join(tools, "VC", "Auxiliary", "Build", "Microsoft.VCToolsVersion.default.txt")) as f:
+            msvc = f.read().strip()
+        link = os.path.join(tools, "VC", "Tools", "MSVC", msvc, "bin", "Hostx64", "x64", "link.exe")
+        # `link` with no argument prints its banner: "Microsoft (R) Incremental Linker Version ...".
+        linker = said(link)
+    name = ctypes.create_unicode_buffer(32)
+    root = os.path.splitdrive(os.path.abspath(work))[0] + "\\"
+    if not ctypes.windll.kernel32.GetVolumeInformationW(root, None, 0, None, None, None, name, len(name)):
+        raise OSError(f"GetVolumeInformationW of {root} failed: the work directory's file system is unknown")
+    powershell = lambda command: said("powershell", "-NoProfile", "-NonInteractive", "-Command", command)
+    return dict(cpu=cpu, windows=platform.version(), build_tools=build_tools, link=linker, work_fs=name.value,
+                defender=dict(realtime=powershell("(Get-MpComputerStatus).RealTimeProtectionEnabled"),
+                              exclusions=powershell("(Get-MpPreference).ExclusionPath -join ';'")))
+
+
+def machine(work):
+    """What the numbers were measured on, `work` being where the builds are."""
     def first_line(*argv):
         try:
             ran = subprocess.run(argv, capture_output=True, text=True, env=dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN))
@@ -1150,7 +1329,7 @@ def machine():
         except OSError:
             return None
 
-    memory = read("/proc/meminfo", r"^MemTotal:\s+(\d+) kB")
+    total_kb = read("/proc/meminfo", r"^MemTotal:\s+(\d+) kB")
     cpu = read("/proc/cpuinfo", r"^model name\s*:\s*(.*)$")
     if not cpu and platform.system() == "Linux":
         # An Arm core's /proc/cpuinfo has no model name; lscpu names it from the part number.
@@ -1161,24 +1340,30 @@ def machine():
             pass
     if platform.system() == "Darwin":
         cpu = first_line("sysctl", "-n", "machdep.cpu.brand_string")
-        memory = str(int(first_line("sysctl", "-n", "hw.memsize") or 0) // 1024) or None
+        total_kb = str(int(first_line("sysctl", "-n", "hw.memsize") or 0) // 1024) or None
+    windows = windows_host(work) if memory.WINDOWS else {}
+    if windows:
+        cpu, total_kb = windows.pop("cpu"), memory.system_mb()["total"] * 1024
     # A run pinned to some of the cores (taskset) has those, and cargo's jobs follow them.
     cores = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
     return dict(
         # Named by whoever runs it (the workflow names the instance type).
         name=os.environ.get("BLAZE_BENCH_MACHINE"),
         cpu=cpu, cores=cores, machine_cores=os.cpu_count(),
-        # What else the machine was running: 1, 5 and 15 minute averages when the run started.
-        load=", ".join(f"{v:.1f}" for v in os.getloadavg()),
-        memory_gib=round(int(memory) / 1024 / 1024) if memory else None,
+        # What else the machine was running: 1, 5 and 15 minute averages when the run started
+        # (Windows keeps none).
+        load=", ".join(f"{v:.1f}" for v in os.getloadavg()) if hasattr(os, "getloadavg") else None,
+        memory_gib=round(int(total_kb) / 1024 / 1024) if total_kb else None,
         os=platform.system(), arch=platform.machine(), kernel=platform.release(),
-        rustc=storelib.blaze_toolchain(blaze_cli.BLAZE, dict(os.environ)).rustc, cc=first_line("cc", "--version"), ld=first_line("ld", "--version"),
+        rustc=storelib.blaze_toolchain(blaze_cli.BLAZE, dict(os.environ)).rustc,
+        cc=None if windows else first_line("cc", "--version"), ld=None if windows else first_line("ld", "--version"),
         llvm=first_line("llvm-config", "--version"),
         incremental=os.environ.get("CARGO_INCREMENTAL", "profile default (on for dev)"),
-        wrapper=None, linker="the toolchain's default (cc)",
+        wrapper=None, linker="MSVC's link.exe" if windows else "the toolchain's default (cc)",
         # Nix's linker wrapper runs `realpath` for each of these on every link cargo makes (not
         # on blaze's): runs are comparable only with the same count.
         library_dirs=sum(arg.startswith("-L") for arg in os.environ.get("NIX_LDFLAGS", "").split()) or None,
+        **windows,
     )
 
 
@@ -1220,47 +1405,62 @@ def compare(baseline, result, threshold):
     return worse
 
 
-def options(argv, name, default=None):
-    """The values given to every `--name VALUE` in `argv`, which loses them."""
-    found = []
-    while name in argv:
-        at = argv.index(name)
-        found.append(argv[at + 1])
-        del argv[at:at + 2]
-    return found or ([default] if default is not None else [])
+@dataclass(frozen=True)
+class Input:
+    """bench.py's one input (the module's doc says each field)."""
+    command: Literal["run", "compare"] = "run"
+    projects: tuple[str, ...] = ()
+    backends: tuple[Literal["cranelift", "llvm"], ...] = ()
+    runs: int = 3
+    cold_runs: int = 1
+    out: str = ""
+    work: str = ""
+    reference: str = ""
+    setups: tuple[str, ...] = ()
+    setups_on: tuple[str, ...] = ()
+    keep: bool = False
+    tests: bool = False
+    stress: bool = False
+    baseline: str = ""
+    result: str = ""
+    threshold: float = 25.0
 
 
 def main():
-    argv = sys.argv[1:]
-    threshold = float(options(argv, "--threshold", "25")[0])
-    if "--compare" in argv:
-        argv.remove("--compare")
-        baseline, result = (json.load(open(path)) for path in argv)
+    if len(sys.argv) != 2:
+        fail("bench.py", "takes one JSON object (inline, a file's path, or `-`): see the top of harness/bench.py")
+    it = parse(Input, sys.argv[1], "bench.py")
+    threshold = it.threshold
+    if it.command == "compare":
+        if not (it.baseline and it.result):
+            fail("bench.py", "`compare` needs `baseline` and `result`")
+        baseline, result = (json.load(open(path)) for path in (it.baseline, it.result))
         worse = compare(baseline, result, threshold)
         print("\n".join(worse) or f"nothing over {threshold:.0f}% worse than the baseline")
         sys.exit(1 if worse else 0)
-    backends, runs = options(argv, "--backend") or list(BACKENDS), int(options(argv, "--runs", "3")[0])
-    out = options(argv, "--out", os.path.join(HERE, "bench.json"))[0]
-    work = (options(argv, "--work") or [None])[0] or tempfile.mkdtemp(prefix="blaze-bench-")
+    if unknown := [p for p in (*it.projects, *it.setups_on) if p not in PROJECTS]:
+        fail("bench.py", f"no project {', '.join(unknown)}: the projects are {', '.join(PROJECTS)}")
+    backends, runs = list(it.backends) or list(BACKENDS), it.runs
+    out = it.out or os.path.join(HERE, "bench.json")
+    work = it.work or tempfile.mkdtemp(prefix="blaze-bench-")
     # Never inside the checkout: cargo takes a target directory there that is not `target` for
     # a source of the package, and a build script without `rerun-if-changed` (ripgrep's, fd's,
     # hyperfine's) runs again, and the package builds again, at every build.
-    reference_dir = (options(argv, "--reference") or [None])[0] or os.path.join(work, "reference")
-    cold_runs = int(options(argv, "--cold-runs", "1")[0])
-    setup_names = [s for given in options(argv, "--setups") for s in given.split(",")]
-    setup_names = list(SETUPS) if setup_names == ["all"] else setup_names
-    setups_on = [p for given in options(argv, "--setups-on") for p in given.split(",")]
+    reference_dir = it.reference or os.path.join(work, "reference")
+    cold_runs = it.cold_runs
+    setup_names = list(SETUPS) if list(it.setups) == ["all"] else list(it.setups)
+    setups_on = list(it.setups_on)
     unknown = [s for s in setup_names if s not in SETUPS]
     if unknown:
-        raise SystemExit(f"no setup {unknown}: the setups are {', '.join(SETUPS)}")
-    keep, tests, stress = "--keep" in argv, "--tests" in argv, "--stress" in argv
-    # `--stress` with no project measures the stress corpus alone.
-    names = [a for a in argv if not a.startswith("--")] or (
+        fail("bench.py", f"no setup {unknown}: the setups are {', '.join(SETUPS)}")
+    keep, tests, stress = it.keep, it.tests, it.stress
+    # `stress` with no project measures the stress corpus alone.
+    names = list(it.projects) or (
         [] if stress else [n for n, spec in PROJECTS.items() if "prepare" not in spec and not spec.get("named")])
     os.makedirs(work, exist_ok=True)
     os.makedirs(reference_dir, exist_ok=True)
     result = dict(toolchain=TOOLCHAIN, machine=platform.machine(), cores=os.cpu_count(), runs=runs, cold_runs=cold_runs,
-                  commit=blaze_commit(), date=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), host=machine(),
+                  commit=blaze_commit(), date=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), host=machine(work),
                   backends={b: BACKENDS[b] for b in backends}, setups={s: SETUPS[s] for s in setup_names}, results={})
     if any(SETUPS[s].get("nightly") for s in setup_names):
         result["host"]["nightly"] = subprocess.run([os.path.join(os.environ.get("BLAZE_NIGHTLY", ""), "bin/rustc"), "-V"],

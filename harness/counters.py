@@ -23,8 +23,9 @@ one way memory is measured. What it counts, and how far off it can be, is docs/b
   read once more when it exited, before it is reaped (`Meter.exited`). A short-lived process
   below the daemon that comes and goes between two reads is not counted (`partial` says so
   when one the meter had seen is gone).
-- Where neither can count (another OS, a refused or missing counter), a count is None with a
-  `gap` naming why: never a zero, never a guess (AGENTS.md, no-fallback).
+- Where neither can count (Windows, which has no per-process instruction count a user can read;
+  another OS; a refused or missing counter), a count is None with a `gap` naming why: never a
+  zero, never a guess (AGENTS.md, no-fallback).
 
 `Meter.settle` waits, at most `SETTLE_SECS`, until what is counted retires fewer than
 `QUIET_INSTRUCTIONS` in `QUIET_SECS` (a daemon finishing work after it answered), so a step's
@@ -36,7 +37,6 @@ import ctypes
 import errno
 import os
 import platform
-import resource
 import signal
 import statistics
 import struct
@@ -319,6 +319,8 @@ class Meter:
         self._pids: set[int] = set()
         self._final: dict[int, tuple[int, int]] = {}
         if LINUX:
+            import resource
+
             # Two descriptors for every command counted: let a long run have them.
             soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
             want = max(soft, 65536) if hard == resource.RLIM_INFINITY else hard

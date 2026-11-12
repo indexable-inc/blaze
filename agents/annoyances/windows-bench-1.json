@@ -1,0 +1,11 @@
+{
+ "id": "windows-bench-1",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), main agent in Claude Code on Windows 11",
+ "where": "harness Python on Windows: storelib.daemon_pid, v2/budgets.alive, memory.py",
+ "what": "`os.kill(pid, 0)`, the Unix 'is it alive' probe, is TerminateProcess(pid, 0) on Windows: storelib.daemon_pid would have ended the daemon it asked about. memory.py and counters.py did not import there at all (`import resource`), so no bench ran on Windows.",
+ "cost": "found reading the code before the first Windows bench; would have been a daemon that dies at every status read",
+ "cause": "the harness was written for Linux and macOS only, with Unix process idioms spread over many files",
+ "workaround": "ask `memory.running(pid)`, the one cross-platform liveness check; land.py, norustc.py, incremental.py and tools/v2/repro still use os.kill(pid, 0) and are Unix-only today",
+ "state": "fixed"
+}

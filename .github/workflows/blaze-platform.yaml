@@ -581,8 +581,8 @@ jobs:
         working-directory: harness
         run: |
           export BLAZE_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine" BLAZE_LLVM_BIN="$GITHUB_WORKSPACE/target/release/blaze-engine"
-          $PYTHON bench.py ripgrep --out "$RUNNER_TEMP/bench.json"
-          $PYTHON bench.py --compare bench-baseline.json "$RUNNER_TEMP/bench.json" --threshold 200
+          $PYTHON bench.py "$($PYTHON -c 'import json, os; print(json.dumps({"projects": ["ripgrep"], "out": os.environ["RUNNER_TEMP"] + "/bench.json"}))')"
+          $PYTHON bench.py "$($PYTHON -c 'import json, os; print(json.dumps({"command": "compare", "baseline": "bench-baseline.json", "result": os.environ["RUNNER_TEMP"] + "/bench.json", "threshold": 200.0}))')"
       - uses: actions/upload-artifact@v7
         if: always()
         with:

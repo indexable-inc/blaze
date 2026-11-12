@@ -47,7 +47,8 @@ jobs:
         env:
           BENCH_RUNNERS: ${{ vars.BENCH_RUNNERS }}
           BENCH_RUNNER: ${{ vars.BENCH_RUNNER }}
-        run: python3 harness/benchplatforms.py matrix
+        run: |
+          python3 harness/benchplatforms.py "$(printf '{"workflow": "bench-bun", "runners": "%s", "runner": "%s"}' "$BENCH_RUNNERS" "$BENCH_RUNNER")"
 
   bench:
     name: bench (bun, ${{ matrix.name }})
@@ -95,8 +96,10 @@ jobs:
           work=${work:-$BENCH_HOME/work-bun}
           rm -rf "$work" "$BENCH_HOME/reference-bun"
           mkdir -p "$RUNNER_TEMP/results"
-          nix develop .#bench-bun -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py bun \
-            --runs 3 --work "$work" --reference "$BENCH_HOME/reference-bun" --out "$RUNNER_TEMP/results/bench-bun.json" \
+          # bench.py's one input (harness/bench.py); the runner's paths have no quote or backslash.
+          input=$(printf '{"projects": ["bun"], "runs": 3, "work": "%s", "reference": "%s", "out": "%s"}' \
+            "$work" "$BENCH_HOME/reference-bun" "$RUNNER_TEMP/results/bench-bun.json")
+          nix develop .#bench-bun -c env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py "$input" \
             || { status=$?; [ "$status" = 3 ] || exit "$status"; echo "wrong=true" >> "$GITHUB_OUTPUT"; }
       - uses: actions/upload-artifact@v7
         if: always()

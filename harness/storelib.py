@@ -45,6 +45,8 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Literal, cast
 
+import memory
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 STRESS = os.path.join(HERE, "stress")
 PROGRAM = "sapp"
@@ -342,13 +344,7 @@ def daemon_pid(home: str) -> int | None:
     if len(words) != 1 or not words[0].isdigit():
         return None
     pid = int(words[0])
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return None
-    except PermissionError:
-        pass
-    return pid
+    return pid if memory.running(pid) else None
 
 
 class Built:

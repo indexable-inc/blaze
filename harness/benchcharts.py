@@ -351,8 +351,10 @@ TREND_START, TREND_END = "<!-- benchtrend:start -->", "<!-- benchtrend:end -->"
 # At most this many lines in a chart (the colours there are), over the last this many runs.
 MOST_SERIES, MOST_RUNS = 8, 120
 PLOT_H = 230
-# The phases of a project's result that are not edits, and those of a stress crate's.
-NOT_EDITS = ("cold", "test", "test-edit")
+# The phases of a project's result that are not edits of its source, and those of a stress
+# crate's. A dependency moved and a restart are their own series: in the edits' they would move
+# every project's median the first run they appear.
+NOT_EDITS = ("cold", "test", "test-edit", "dep-bump", "dep-restore", "restart")
 STRESS_PHASES = ("check", "build")
 # The live modes, the first a history has being the one charted: `cargo` is what
 # live-latency.yaml times now, the others what it timed before.

@@ -1677,6 +1677,9 @@ def until_gone(what: str, running: Callable[[], bool]) -> None:
 
 
 def alive(pid: int) -> bool:
+    if memory.WINDOWS:
+        # os.kill(pid, 0) would end it there (memory.running).
+        return memory.running(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

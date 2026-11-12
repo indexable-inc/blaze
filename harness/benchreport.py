@@ -100,8 +100,13 @@ EDITS = {
     "newfn": "Add a function",
     "struct": "Add a struct field",
     "no-op": "Nothing changed",
+    "dep-bump": "Move a dependency to another version",
+    "dep-restore": "Move it back",
+    "restart": "Edit a function after a restart",
 }
-DOC_PHASES = ["body", "leaf", "signature", "generic", "newfn", "struct", "no-op"]
+DOC_PHASES = ["body", "leaf", "signature", "generic", "newfn", "struct", "no-op", "dep-bump", "dep-restore", "restart"]
+# The phases that are not an edit of the project's source: the headline speed-ups leave them out.
+NOT_SOURCE_EDITS = ("no-op", "dep-bump", "dep-restore", "restart")
 # What docs/benchmarks.md calls each setup of bench.py, in the order of its table.
 SETUPS = {
     "check": "`cargo check`",
@@ -342,7 +347,7 @@ def edit_speedups(results, backend):
             measured = r["results"].get(key)
             if measured:
                 by[p] = [ph["cargo_s"] / ph["wall_s"] for label, ph in measured["phases"].items()
-                         if label in EDITS and label != "no-op" and ph.get("cargo_s") and ph.get("wall_s")]
+                         if label in EDITS and label not in NOT_SOURCE_EDITS and ph.get("cargo_s") and ph.get("wall_s")]
         rows.append((label_of(results, key), by))
     return rows
 

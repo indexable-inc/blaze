@@ -273,8 +273,9 @@ jobs:
           export PATH="$CARGO_HOME/bin:$PATH" BLAZE_BIN="$engine" BLAZE_PROJECTS="$WORK/projects"
           bench="$OUT/bench-$OS-$APP.json"
           status=0
-          $SHELL_OF_APP env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py "$APP" --backend cranelift \
-            --runs 1 --cold-runs 1 --tests --work "$WORK/bench" --out "$bench" || status=$?
+          input=$(jq -nc --arg app "$APP" --arg work "$WORK/bench" --arg out "$bench" \
+            '{projects: [$app], backends: ["cranelift"], runs: 1, cold_runs: 1, tests: true, work: $work, out: $out}')
+          $SHELL_OF_APP env -u CARGO_INCREMENTAL -u RUSTC_WRAPPER python3 harness/bench.py "$input" || status=$?
           # 3: bench.py measured and wrote what went wrong; the verdict below reads it.
           [ "$status" = 0 ] || [ "$status" = 3 ] || exit "$status"
           baseline=""
