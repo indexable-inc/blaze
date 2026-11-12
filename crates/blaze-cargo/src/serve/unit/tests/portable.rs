@@ -49,6 +49,7 @@ impl Where {
             &format!("{}/std/m", self.machine),
             Path::new(&format!("{}/tools", self.home)),
             Path::new(&format!("{}/bin/blaze", self.home)),
+            Path::new(&format!("{}/sources", self.home)),
         )
     }
 }
@@ -315,7 +316,7 @@ fn a_value_is_written_against_the_directories_and_back() {
     assert!(first.cbor(&[0x62, b'a'], &mut Vec::new()).is_err(), "a string cut short");
     assert!(first.cbor(&[0x01, 0x01], &mut Vec::new()).is_err(), "bytes after the value");
     // A placeholder of a directory the reading build has none of is an error.
-    let none = Places::new("/w", "relative", "", Path::new(""), Path::new(""));
+    let none = Places::new("/w", "relative", "", Path::new(""), Path::new(""), Path::new(""));
     assert!(none.cbor_real(&kept, &mut Vec::new()).is_err());
 }
 

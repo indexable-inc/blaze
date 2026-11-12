@@ -88,13 +88,18 @@ pub enum Role {
     /// Where the machine's daemons share the standard library's units (`<machine>/std/<makers>`):
     /// a unit record's root alone (`blaze-cargo`'s `serve::unit::portable`), no run's.
     Std,
+    /// Where blaze keeps the packages it fetches (`blaze_manifest::home::sources`): a unit
+    /// record's and a front-end record's root (`blaze-cargo`'s `serve::unit::portable`,
+    /// `hir_def::nameres::frozen`), so a registry crate's records are the same under every
+    /// home. No run's: to a run it is a machine-wide place ([`RootMap::with_sources`]).
+    Sources,
 }
 
 impl Role {
     /// In the order of their declaration; a role is only ever added at the end, so what is
     /// written role by role ([`Roots::layout`], `verify::Origin`) is as it was for the roots a
     /// run had before.
-    pub const ALL: [Role; 7] = [
+    pub const ALL: [Role; 8] = [
         Role::Package,
         Role::OutDir,
         Role::Target,
@@ -102,6 +107,7 @@ impl Role {
         Role::Tools,
         Role::Launcher,
         Role::Std,
+        Role::Sources,
     ];
 
     /// The byte after `\0` in its placeholder.
@@ -114,6 +120,7 @@ impl Role {
             Role::Tools => b'b',
             Role::Launcher => b'l',
             Role::Std => b's',
+            Role::Sources => b'f',
         }
     }
 
@@ -130,6 +137,7 @@ impl Role {
             Role::Tools => "tools",
             Role::Launcher => "launcher",
             Role::Std => "shared standard library directory",
+            Role::Sources => "fetched sources directory",
         }
     }
 

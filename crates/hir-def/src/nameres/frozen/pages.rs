@@ -97,8 +97,15 @@ pub(super) const fn fnv(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// The encoding of the segments, as the header names it.
-const ENCODING: u64 = fnv(super::ENCODING.as_bytes());
+/// The function a name's slot is found by ([`fnv`]), by name: part of the encoding word, so
+/// pages whose slots another function placed are refused by the header and never probed
+/// with this one. Change it with the function.
+const SLOT_HASH: &str = "fnv-1a 64 of the name's text";
+
+/// The encoding of the segments, as the header names it: [`super::ENCODING`] and
+/// [`SLOT_HASH`].
+const ENCODING: u64 =
+    fnv(super::ENCODING.as_bytes()) ^ fnv(SLOT_HASH.as_bytes()).rotate_left(1);
 
 /// The hash a name's slot is found by: of its text alone, so a reader needs no context to
 /// make it. Two names of one text (a keyed one and a plain one) share a slot's hash and are
@@ -568,6 +575,45 @@ pub(super) fn served(db: &Db, krate: Crate) -> (DefMap, LocalDefMap) {
     // clone: the crate's extern prelude, once per crate read from pages
     let local = LocalDefMap { extern_prelude: head.extern_prelude.clone() };
     (def_map, local)
+}
+
+/// What a read of one of a paged scope's memos was of.
+pub(crate) enum PagedRead {
+    /// One name, in the scope's namespaces or among its textual macros.
+    Name(Name),
+    Traits,
+    /// The whole scope, decoded.
+    Whole,
+}
+
+/// The crate and paged scope a read of one of this file's memos was of, and what of it
+/// (`crate::nameres::name_read`): `name` is the memo's name as the engine has it, `key` its
+/// key. `None` for a row that is no memo of a scope (the head, the tail, the crate's slot).
+pub(crate) fn read_of(
+    db: &Db,
+    name: &str,
+    key: blaze_query::db::Id,
+) -> Option<(Crate, blaze_query::db::Id, PagedRead)> {
+    use blaze_query::db::AsId;
+    let (paged, of) = match name {
+        "name_memo" => {
+            let (paged, name) = name_memo::arguments(db, key)?;
+            (paged, PagedRead::Name(name))
+        }
+        "legacy_macro_memo" => {
+            let (paged, name) = legacy_macro_memo::arguments(db, key)?;
+            (paged, PagedRead::Name(name))
+        }
+        "scope_memo" => (key_of(db, key).0, PagedRead::Whole),
+        "traits_memo" => (key_of(db, key).0, PagedRead::Traits),
+        _ => return None,
+    };
+    Some((paged.krate(db), paged.as_id(), of))
+}
+
+/// The place of the paged scope `paged`'s module in its crate's table of modules.
+pub(crate) fn paged_index(db: &Db, paged: blaze_query::db::Id) -> usize {
+    key_of(db, paged).2
 }
 
 fn key_of(db: &Db, paged: blaze_query::db::Id) -> (PagedScope, Crate, usize) {

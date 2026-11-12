@@ -1936,3 +1936,177 @@ impl IndexMut<ModuleId> for ModulesMap {
             .unwrap_or_else(|| panic!("ModuleId not found in ModulesMap: {id:#?}"))
     }
 }
+
+/// What one read of a row of name resolution was a read of, for whoever records a result's
+/// reads as facts (the item store, `blaze_item_hash::reads`): the rows themselves are private
+/// to this module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameRead {
+    /// One name looked up in a module's scope, in its namespaces or among its textual macros;
+    /// found or not.
+    Name(ModuleId, Name),
+    /// The traits in scope in a module.
+    Traits(ModuleId),
+    /// The whole of a module's scope: an iteration of it.
+    WholeScope(ModuleId),
+    /// The modules declared in a module, by name.
+    Children(ModuleId),
+    /// What a crate's `DefMap` holds outside its modules' scopes: its prelude, extern prelude
+    /// and `#[macro_use]` prelude, what its root's attributes decide, whether a module of it
+    /// shadows a primitive type.
+    Crate(Crate),
+    /// A row whose value is ids (a module's, a scope's, a def map's) that name the same thing
+    /// for as long as they are current, and nothing a name means: nothing to record.
+    Handle,
+}
+
+/// What `read` was of: `None` when it is of no row of name resolution this function knows. The
+/// rows are told apart by their name and the file they are declared in, as the engine has them.
+pub fn name_read(
+    db: &Db,
+    read: blaze_query::db::DatabaseKeyIndex,
+    kind: blaze_query::db::ReadKind,
+) -> Option<NameRead> {
+    use blaze_query::db::{FromId, ReadKind};
+    if kind == ReadKind::Interned {
+        return None;
+    }
+    let storage = blaze_query::db::Database::storage(db);
+    let name = storage.read_name(read, kind);
+    let file = storage.ingredient_file(read.ingredient_index());
+    let key = read.key_index();
+    let in_file = |tail: &str| file.ends_with(tail);
+    if in_file("nameres/delta/publish.rs") {
+        return delta::name_read(db, name, kind, key);
+    }
+    if in_file("nameres/frozen/pages.rs") {
+        let (krate, paged, of) = frozen::pages::read_of(db, name, key)?;
+        let module = paged_module(db, krate, paged);
+        return Some(match of {
+            frozen::pages::PagedRead::Name(name) => NameRead::Name(module, name),
+            frozen::pages::PagedRead::Traits => NameRead::Traits(module),
+            frozen::pages::PagedRead::Whole => NameRead::WholeScope(module),
+        });
+    }
+    if in_file("nameres/facts/queries.rs") {
+        return (name == "row" && kind == ReadKind::Function).then_some(NameRead::Handle);
+    }
+    if in_file("hir-def/src/lib.rs") {
+        return matches!(name, "ModuleIdLt" | "BlockIdLt").then_some(NameRead::Handle);
+    }
+    if !in_file("hir-def/src/nameres.rs") {
+        return None;
+    }
+    let scope_module = |key| <ModuleScope<'_> as FromId>::from_id(key).module(db).to_static();
+    let pair_crate = |key| <DefMapPair<'_> as FromId>::from_id(key).def_map(db).krate();
+    Some(match (name, kind) {
+        ("Modules::name", ReadKind::Function) => {
+            let (_, module, name) = Modules_name::arguments(db, key)?;
+            NameRead::Name(module, name)
+        }
+        ("ModuleScope::name", ReadKind::Function) => {
+            let (scope, name) = ModuleScope_name::arguments(db, key)?;
+            NameRead::Name(scope.module(db).to_static(), name)
+        }
+        ("ModuleScope::legacy_macro", ReadKind::Function) => {
+            let (scope, name) = ModuleScope_legacy_macro::arguments(db, key)?;
+            NameRead::Name(scope.module(db).to_static(), name)
+        }
+        ("ModuleScope::traits", ReadKind::Function) => NameRead::Traits(scope_module(key)),
+        ("scope", ReadKind::TrackedField(_)) => NameRead::WholeScope(scope_module(key)),
+        ("children", ReadKind::TrackedField(_)) => NameRead::Children(scope_module(key)),
+        // A module's row or the table of them: its origin, visibility, parent and the id of
+        // its scope. What a name of it means is read through that scope's own rows.
+        ("Modules::module", ReadKind::Function)
+        | ("table", ReadKind::TrackedField(_))
+        | ("Modules" | "ModuleScope", ReadKind::Function)
+        | ("crate_local_def_map", ReadKind::Function) => NameRead::Handle,
+        // The pair's untracked half is the extern prelude; the `DefMap` holds the preludes
+        // and the root's attributes.
+        ("DefMapPair", ReadKind::Function) | ("def_map", ReadKind::TrackedField(_)) => {
+            NameRead::Crate(pair_crate(key))
+        }
+        ("crate_shadows_primitive_type", ReadKind::Function) => {
+            NameRead::Crate(<Crate as FromId>::from_id(key))
+        }
+        // A block's def map: its one module's scope, with the items the block declares.
+        ("block_def_map", ReadKind::Function) => {
+            let block = <BlockIdLt<'_> as FromId>::from_id(key);
+            NameRead::WholeScope(block_def_map(db, block).root)
+        }
+        _ => return None,
+    })
+}
+
+/// The module of `krate` whose scope is the paged scope `paged`
+/// (`frozen::pages::PagedScope`, whose `module` is the module's place in the crate's table).
+fn paged_module(db: &Db, krate: Crate, paged: blaze_query::db::Id) -> ModuleId {
+    let at = frozen::pages::paged_index(db, paged);
+    match crate_def_map(db, krate).table(db).get_index(at) {
+        Some((&module, data)) if data.scope == ScopeSlot::Paged(paged) => module,
+        _ => panic!(
+            "paged scope {at} of {} is not the scope of module {at} of its def map",
+            crate_display_name(db, krate)
+        ),
+    }
+}
+
+/// What `krate`'s def map holds outside its modules' scopes, for a hash of it
+/// ([`NameRead::Crate`]): `each` is given, in an order that is the same in every database,
+/// a tag and one row at a time.
+pub fn crate_names(db: &Db, krate: Crate, each: &mut dyn FnMut(CrateName<'_>)) {
+    let pair = crate_local_def_map(db, krate);
+    let def_map = pair.def_map(db);
+    if let Some((prelude, _)) = def_map.prelude() {
+        each(CrateName::Prelude(prelude));
+    }
+    // alloc: the two preludes' names, sorted for an order no map decides; once per change of
+    // a crate's def map, a few dozen names
+    let mut externs: Vec<(&Name, ModuleId)> =
+        pair.local(db).extern_prelude().map(|(name, (root, _))| (name, root)).collect();
+    externs.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    for (name, root) in externs {
+        each(CrateName::Extern(name, root));
+    }
+    // alloc: as above
+    let mut macros: Vec<(&Name, MacroId)> =
+        def_map.macro_use_prelude().iter().map(|(name, &(it, _))| (name, it)).collect();
+    macros.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    for (name, it) in macros {
+        each(CrateName::MacroUse(name, it));
+    }
+    let data = &*def_map.data;
+    for tool in &data.registered_tools {
+        each(CrateName::Tool(tool.as_str()));
+    }
+    let flags = [
+        data.rustc_coherence_is_core,
+        data.no_core,
+        data.no_std,
+        data.proc_macro,
+        data.arbitrary_ints,
+        data.handles,
+        data.views,
+        data.pattern_types,
+        data.early_drop,
+        def_map.session_macros,
+        crate_shadows_primitive_type(db, krate),
+    ];
+    each(CrateName::Flags(&flags, data.edition));
+}
+
+/// One row of [`crate_names`].
+#[derive(Debug, Clone, Copy)]
+pub enum CrateName<'a> {
+    /// The module whose names every module of the crate sees last.
+    Prelude(ModuleId),
+    /// A name of the extern prelude and the crate root it names.
+    Extern(&'a Name, ModuleId),
+    /// A macro a `#[macro_use] extern crate` brought to every module.
+    MacroUse(&'a Name, MacroId),
+    /// A registered tool, in the order the root registers them.
+    Tool(&'a str),
+    /// What the root's attributes and the crate's names decide for every module, and the
+    /// edition.
+    Flags(&'a [bool], Edition),
+}

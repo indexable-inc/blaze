@@ -6,8 +6,8 @@
 //!
 //! The directories are the build's [`Places`], each a root of blaze-usercode's roots
 //! ([`blaze_usercode::roots`], the one home of writing a path against what it is under): the
-//! workspace, the build directory, the shared standard library directory, blaze's tools and its
-//! launcher. Three things are written against them:
+//! workspace, the build directory, the shared standard library directory, blaze's tools, its
+//! launcher and where it keeps the packages it fetches. Three things are written against them:
 //!
 //! - **The key.** Every string a key encodes ([`Places::cbor`], the unit, its plan, how its
 //!   program is run, what its build scripts printed) and every path the front end's identity
@@ -32,10 +32,13 @@
 //! whose value holds a root, read through `env!` or `option_env!`, or given to a proc macro:
 //! [`super::reads::Reads`] names them, and a record whose closure made one is kept here.
 //!
-//! Not a root, so still in every key that holds it: where blaze keeps fetched packages
-//! (`<home>/sources`), whose files' names a registry crate's code says (`file!()`, a panic's
-//! location) by their real path. Until those are named by package and version, a registry
-//! crate's record is one home's.
+//! Where blaze keeps fetched packages (`<home>/sources`, [`Role::Sources`]) is a root like the
+//! others (2026-11-12): a registry crate's key says nothing of the home, and its front-end
+//! records (`hir_def::nameres::frozen`, which writes a literal's paths with this port and
+//! refuses bytes that still hold a root) are every home's. A registry crate's code says its
+//! files' names by their real path (`file!()`, a panic's location), so its unit record, whose
+//! object code holds that path, is tied ([`Places::tied`]) and kept here ([`Places::here`]):
+//! one home's, by what it holds and not by its key.
 
 #![forbid(unsafe_code)]
 
@@ -64,15 +67,17 @@ const URL: &[u8] = b"file://";
 
 impl Places {
     /// The roots of a build of the workspace at `workspace` whose build directory is `target`,
-    /// by a daemon whose shared standard library directory is `std`, tools `tools` and launcher
-    /// `launcher`. One that is not absolute, not UTF-8 or the file system's root is no root:
-    /// what is under it stays as it is in every key.
+    /// by a daemon whose shared standard library directory is `std`, tools `tools`, launcher
+    /// `launcher` and fetched packages' directory `sources`
+    /// (`blaze_manifest::home::sources`). One that is not absolute, not UTF-8 or the file
+    /// system's root is no root: what is under it stays as it is in every key.
     pub(crate) fn new(
         workspace: &str,
         target: &str,
         std: &str,
         tools: &std::path::Path,
         launcher: &std::path::Path,
+        sources: &std::path::Path,
     ) -> Places {
         let given = [
             (Role::Workspace, Some(workspace)),
@@ -80,6 +85,7 @@ impl Places {
             (Role::Std, Some(std)),
             (Role::Tools, tools.to_str()),
             (Role::Launcher, launcher.to_str()),
+            (Role::Sources, sources.to_str()),
         ];
         // alloc: once per job's places, a root each
         let roots = given
@@ -98,6 +104,7 @@ impl Places {
             &job.input.config.std,
             &job.shared.tools,
             &job.shared.launcher,
+            &job.shared.sources,
         )
     }
 
@@ -183,6 +190,15 @@ impl Places {
 impl base_db::Port for Places {
     fn ported<'b>(&self, bytes: &'b [u8]) -> Cow<'b, [u8]> {
         self.text(bytes)
+    }
+
+    fn placed<'b>(&self, bytes: &'b [u8]) -> Result<Cow<'b, [u8]>, String> {
+        self.real(bytes)
+    }
+
+    /// The one searcher of a root left in bytes (`Roots::embedded`, as [`Places::tied`]).
+    fn held(&self, bytes: &[u8]) -> Option<&'static str> {
+        self.view().embedded(bytes).iter().next().map(Role::name)
     }
 }
 

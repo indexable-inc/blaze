@@ -80,7 +80,7 @@ fn an_image_is_put_once_for_the_loop_and_other_bytes_under_its_key_are_an_error(
     assert!(images.get(&key(1)).unwrap().is_none());
     images.put(key(1), b"image one".to_vec()).unwrap();
     images.put(key(1), b"image one".to_vec()).unwrap();
-    assert!(images.put(key(1), b"another".to_vec()).unwrap_err().contains("two images"));
+    assert!(images.put(key(1), b"another".to_vec()).unwrap_err().contains("two values"));
     images.put(key(2), b"image two".to_vec()).unwrap();
     let puts = images.take_puts();
     assert!(images.take_puts().is_empty(), "a take empties what was asked for");
@@ -98,6 +98,44 @@ fn an_image_is_put_once_for_the_loop_and_other_bytes_under_its_key_are_an_error(
     images.put(key(2), b"image two".to_vec()).unwrap();
     assert!(images.put(key(2), b"changed".to_vec()).unwrap_err().contains("other bytes"));
     assert!(images.puts.into_inner().list.is_empty());
+}
+
+/// The invariant: a per-item entry is found by its key alone, under any set, once the loop
+/// has put it; it is asked for once, in a list of its own that a take of the images' puts
+/// does not empty (a serve takes those and must lose no entry a query kept while it ran);
+/// other bytes under its key are an error naming the key.
+///
+/// The control is the read before the put: the same key under the same set finds nothing.
+#[test]
+fn an_entry_is_kept_apart_from_the_images_and_found_by_its_key_under_any_set() {
+    use hir_def::nameres::frozen::entries::Entries;
+    let mut sim = Sim::new(1, Faults::default());
+    let mut store = opened(&mut sim);
+    let reader = store.reader();
+    let images = Images::new(reader.clone(), no_macros());
+    let read = |images: &Images, set: u8, at: u8| {
+        let mut found = Vec::new();
+        let held = Entries::get(images, &key(set), &key(at), &mut |bytes| found.extend_from_slice(bytes));
+        held.unwrap().then_some(found)
+    };
+    assert_eq!(read(&images, 9, 1), None, "the control: nothing is kept yet");
+    Entries::put(&images, &key(9), key(1), b"entry one").unwrap();
+    Entries::put(&images, &key(9), key(1), b"entry one").unwrap();
+    assert!(Entries::put(&images, &key(9), key(1), b"another").unwrap_err().contains("two values"));
+    assert_eq!(read(&images, 9, 1), None, "asked, not yet put by the loop");
+    assert!(images.take_puts().is_empty(), "an entry is no put of a flush");
+    let puts = images.take_entries();
+    assert!(images.take_entries().is_empty(), "a take empties what was asked for");
+    assert_eq!(puts.iter().map(|it| it.key).collect::<Vec<Key>>(), [Key(key(1))]);
+    assert!(puts.iter().all(|it| it.kind == Kind::Query));
+    for put in puts {
+        store.put(put.key, put.kind, &put.bytes).unwrap();
+    }
+    assert_eq!(read(&images, 9, 1).as_deref(), Some(&b"entry one"[..]));
+    assert_eq!(read(&images, 8, 1).as_deref(), Some(&b"entry one"[..]), "under a set that moved");
+    Entries::put(&images, &key(8), key(1), b"entry one").unwrap();
+    assert!(images.take_entries().is_empty(), "held by the store: not asked for again");
+    assert!(Entries::put(&images, &key(8), key(1), b"changed").unwrap_err().contains("other bytes"));
 }
 
 #[test]

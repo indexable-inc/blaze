@@ -782,6 +782,13 @@ pub(crate) fn store(
         };
         puts.push(KeptPut { put, what });
     }
+    // The per-item entries asked since the last store, by whichever query made each: during
+    // the serves and the build's tasks. One asked after this is written by the next store.
+    let entry: Arc<str> =
+        Arc::from("a per-item entry (a file's entry set, a macro definition's source or tokens)");
+    puts.extend(
+        images.take_entries().into_iter().map(|put| KeptPut { put, what: Arc::clone(&entry) }),
+    );
     let mut stage = |what: &'static str| {
         let what: Arc<str> = Arc::from(what);
         puts.extend(
@@ -1143,6 +1150,10 @@ struct Images {
     /// What it asked to keep; a write path, once per crate it images and per goal and body's
     /// step a flush writes.
     puts: Lock<Puts>,
+    /// The per-item entries it was asked to keep ([`hir_def::nameres::frozen::entries`]), apart
+    /// from `puts`: an entry is kept by whichever query made it, during a serve or a build's
+    /// tasks, where `puts` is written only by a flush and taken stage by stage.
+    entries: Lock<Puts>,
     /// Whether def maps are kept as pages and read from them ([`PAGES`]).
     pages: bool,
 }
@@ -1163,7 +1174,14 @@ struct Puts {
 impl Images {
     fn new(store: blaze_cas::Reader, macros: Arc<blaze_macro_eval::Macros>) -> Images {
         let puts = Puts { list: Vec::new(), at: HashMap::new_in(Global) }; // alloc: none until a put
-        Images { store, macros, puts: Lock::new("serve.deps.images.puts", puts), pages: false }
+        let entries = Puts { list: Vec::new(), at: HashMap::new_in(Global) }; // alloc: none until a put
+        Images {
+            store,
+            macros,
+            puts: Lock::new("serve.deps.images.puts", puts),
+            entries: Lock::new("serve.deps.images.entries", entries),
+            pages: false,
+        }
     }
 
     /// These images, def maps kept as pages and read from them when `on` ([`PAGES`]).
@@ -1178,6 +1196,88 @@ impl Images {
         puts.at.clear();
         std::mem::take(&mut puts.list)
     }
+
+    /// The per-item entries it was asked to keep since the last take, in the order asked.
+    fn take_entries(&self) -> Vec<Put> {
+        let mut puts = self.entries.lock();
+        puts.at.clear();
+        std::mem::take(&mut puts.list)
+    }
+}
+
+impl Images {
+    /// Asks the loop, in `into`, to keep `value` under `key` as a query's record: nothing when the store
+    /// or an earlier ask of this flush holds these bytes under it, and an error naming the
+    /// key when either holds other bytes (two values under one key: the key misses an input).
+    /// The bytes are copied only when the put is new.
+    fn ask(
+        &self,
+        into: &Lock<Puts>,
+        key: ContentId,
+        value: std::borrow::Cow<'_, [u8]>,
+    ) -> Result<(), String> {
+        let guard = blaze_cas::enter();
+        match self.store.get(&guard, &Key(key)) {
+            Ok(Some(entry)) if entry.bytes[..] == *value => return Ok(()),
+            Ok(Some(_)) => return Err(format!("the store holds other bytes under {key:?}")), // alloc: error path
+            Ok(None) => {}
+            Err(corrupt) => return Err(corrupt.to_string()),
+        }
+        let mut puts = into.lock();
+        let Puts { list, at } = &mut *puts;
+        match at.get(&key).copied() {
+            Some(asked) if list[asked].bytes[..] == *value => {}
+            Some(_) => return Err(format!("two values were made under {key:?}")), // alloc: error path
+            None => {
+                at.insert(key, list.len()); // alloc: the index, one entry per put of a flush
+                // alloc: the put's bytes, until the loop writes them
+                list.push(Put { key: Key(key), kind: Kind::Query, bytes: value.into_owned() });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Per-item entries (`hir_def::nameres::frozen::entries`: a file's entry set, a macro
+/// definition's source and tokens) as plain values of the store, each under its own key as a
+/// query's record. `set` is not used: an entry is found by its key alone, so one whose set
+/// moved is found as before.
+///
+/// As a get of an image, a get does not read the puts asked and not yet written: an entry
+/// asked twice before the store that writes it is made twice, to the same bytes
+/// (`Images::ask` checks). Entries are asked into a list of their own (`Images::entries`),
+/// which [`store`] takes once a build.
+impl hir_def::nameres::frozen::entries::Entries for Images {
+    // dyn: hir-def's reader of one entry, once per read
+    fn get(
+        &self,
+        _set: &ContentId,
+        key: &ContentId,
+        with: &mut dyn FnMut(&[u8]),
+    ) -> Result<bool, String> {
+        let guard = blaze_cas::enter();
+        match self.store.get(&guard, &Key(*key)) {
+            Ok(Some(entry)) => {
+                with(&entry.bytes[..]);
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(corrupt) => Err(corrupt.to_string()),
+        }
+    }
+
+    fn put(&self, _set: &ContentId, key: ContentId, bytes: &[u8]) -> Result<(), String> {
+        self.ask(&self.entries, key, std::borrow::Cow::Borrowed(bytes))
+    }
+}
+
+/// Has `lowered`'s database keep and find its per-item entries in `session`'s store
+/// (`hir_def::nameres::frozen::entries::set`): once, for a database made freshly, before any
+/// crate of it is served. A write, as [`Lowered::ran`] is.
+pub(crate) fn entries(lowered: &mut Lowered, session: &Session) {
+    // clone: an `Arc`, once per database; dyn: the database's one holder of entries
+    let held: Arc<dyn hir_def::nameres::frozen::entries::Entries> = session.images.clone();
+    hir_def::nameres::frozen::entries::set(lowered.served_db(), held);
 }
 
 /// A value of the store held in place past the read ([`blaze_cas::Reader::pinned`]): verified
@@ -1260,24 +1360,7 @@ impl ImageStore for Images {
     }
 
     fn put(&self, key: ContentId, value: Vec<u8>) -> Result<(), String> {
-        let guard = blaze_cas::enter();
-        match self.store.get(&guard, &Key(key)) {
-            Ok(Some(entry)) if entry.bytes == value.as_slice() => return Ok(()),
-            Ok(Some(_)) => return Err(format!("the store holds other bytes under {key:?}")),
-            Ok(None) => {}
-            Err(corrupt) => return Err(corrupt.to_string()),
-        }
-        let mut puts = self.puts.lock();
-        let Puts { list, at } = &mut *puts;
-        match at.get(&key).copied() {
-            Some(asked) if list[asked].bytes == value => {}
-            Some(_) => return Err(format!("two images were made under {key:?}")),
-            None => {
-                at.insert(key, list.len()); // alloc: the index, one entry per put of a flush
-                list.push(Put { key: Key(key), kind: Kind::Query, bytes: value });
-            }
-        }
-        Ok(())
+        self.ask(&self.puts, key, std::borrow::Cow::Owned(value))
     }
 
     fn reads_now(&self, env: &Env, shape: &[u8]) -> Result<ContentId, String> {

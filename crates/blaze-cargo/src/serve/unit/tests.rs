@@ -84,7 +84,14 @@ fn unit(pkg: &str, target: Target, mode: Mode, deps: &[usize]) -> Unit {
 /// workspace at `/w`, its build directory in it, the daemon's own under `/s`.
 fn test_places() -> super::portable::Places {
     use std::path::Path;
-    super::portable::Places::new("/w", "/w/target", "/s/std", Path::new("/s/tools"), Path::new("/s/blaze"))
+    super::portable::Places::new(
+        "/w",
+        "/w/target",
+        "/s/std",
+        Path::new("/s/tools"),
+        Path::new("/s/blaze"),
+        Path::new("/s/sources"),
+    )
 }
 
 fn plan(extra: &str, outputs: &[&str]) -> UnitPlan {

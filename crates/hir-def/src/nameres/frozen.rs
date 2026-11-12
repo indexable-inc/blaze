@@ -16,7 +16,6 @@
 //! resolution computes: [`Mode::Check`] computes both and records any difference, which is a
 //! bug, never a reason to use the live one.
 
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use base_db::{Crate, Db};
@@ -74,6 +73,7 @@ use crate::{
     visibility::Visibility,
 };
 
+pub mod entries;
 pub mod items;
 pub mod pages;
 pub mod segments;
@@ -87,7 +87,7 @@ const KEYED_NAME: &str = "\0";
 /// The version of what this module writes, for the key frozen bytes are stored under: it
 /// changes with every change to the bytes [`Enc`] writes, the list of lang items included, so
 /// bytes of another version are never read.
-pub const ENCODING: &str = "blaze frozen def map 21";
+pub const ENCODING: &str = "blaze frozen def map 22";
 
 /// What name resolution does with the frozen bytes of a crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -614,15 +614,14 @@ fn includes(loc: &MacroCallLoc) -> bool {
     loc.def.is_include() && matches!(loc.kind, MacroCallKind::FnLike { eager: Some(_), .. })
 }
 
+/// The domain of [`hash128`].
+const PRINT_DOMAIN: &str = "blaze v2 frozen print 1";
+
+/// The print of a macro call or a syntax context inside a persisted fingerprint: an
+/// identity, so BLAKE3 under a domain (docs/v2/plan/design/caches.md, "Hash functions";
+/// it was zero-key SipHash run twice until `ENCODING` 22, lane cache-audit-1112's finding).
 fn hash128(bytes: &[u8]) -> u128 {
-    let half = |seed: u8| {
-        #[allow(deprecated)]
-        let mut hasher = std::hash::SipHasher::new();
-        seed.hash(&mut hasher);
-        bytes.hash(&mut hasher);
-        hasher.finish()
-    };
-    (u128::from(half(0)) << 64) | u128::from(half(1))
+    blaze_ids::ContentId::of(PRINT_DOMAIN, bytes).fingerprint().0
 }
 
 fn encode_maps(db: &Db, krate: Crate, def_map: &DefMap, local: &LocalDefMap) -> R<Vec<u8>> {
@@ -681,11 +680,17 @@ impl<'a> Enc<'a> {
     /// [`Enc::finish`], each file in the header with its content ID when `contents`; without,
     /// the bytes are no image's, only what a test compares ([`encode_without_contents`]).
     fn finish_naming(mut self, contents: bool) -> R<Vec<u8>> {
-        // The target directories the closure's build scripts wrote below, which nothing the
-        // bytes say may name: they are of one checkout.
+        // The directories the closure's build scripts wrote below, which nothing the bytes
+        // say may name: they are of one checkout. An `OUT_DIR` is
+        // `<target>/<profile>/build/<package>/out`, so the directory is what is before its
+        // LAST `/build/`: the first one is the home's own where the target directory is
+        // blaze's default (`<home>/build/<name>-<id>`, `blaze_manifest::home::build_dir`),
+        // and taking it made the whole home a place, so every fetched registry source
+        // (`<home>/sources/..`) was "a file below" it and no registry crate had an image
+        // (80 of 80 refused on a hello-world, lane reth-1112, 2026-11-12).
         let mut places: Vec<String> = (self.out_dirs.iter())
             // alloc: encoding, once per crate per image write (not on a build's path)
-            .map(|(_, out)| out.find("/build/").map_or(out.clone(), |at| out[..at + 1].to_owned()))
+            .map(|(_, out)| out.rfind("/build/").map_or(out.clone(), |at| out[..at + 1].to_owned()))
             // alloc: encoding, once per crate per image write (not on a build's path)
             .collect();
         places.sort_unstable();
@@ -708,33 +713,64 @@ impl<'a> Enc<'a> {
                 let full = joined(&self.dirs[&owner], &path);
                 if let Some(place) = places.iter().find(|it| full.starts_with(it.as_str())) {
                     // alloc: error path
-                    return Err(format!("a file below {place}, a place of one checkout: {full}"));
+                    return Err(format!(
+                        "a file below {place}, a build directory of one checkout, that is in no `OUT_DIR` of the crates it depends on: {full}"
+                    ));
                 }
             }
         }
         self.out.extend_from_slice(&body);
         if let Some(place) = places.iter().find(|it| holds(&self.out, it.as_bytes())) {
             // alloc: error path
-            return Err(format!("the bytes name {place}, a place of one checkout"));
+            return Err(format!("the bytes name {place}, a build directory of one checkout"));
+        }
+        // And no directory the database's port names (`base_db::Port`: the checkout, its
+        // build directory, the home's fetched sources, the shared standard library): a file
+        // is named from its crate's root and a literal's paths are written with the port
+        // ([`Enc::unplaced`]), so bytes that still hold one (a directory after a path byte,
+        // another spelling of it) would be read under another checkout or home as this
+        // one's place. The one searcher, the port's (`Roots::embedded`).
+        if let Some(root) = self.db.files().held(&self.out) {
+            // alloc: error path
+            return Err(format!(
+                "the bytes hold the path of this build's {root}, which another checkout or home has elsewhere, where the port writes none (`base_db::Port::ported`)"
+            ));
         }
         Ok(self.out)
     }
 
     /// A literal's text with each `OUT_DIR` of the closure as [`OUT`], the crate's index and a
-    /// NUL.
+    /// NUL, and, in what is between those, each directory the database's port names as the
+    /// port's mark of it (`base_db::Files::ported`: the checkout, the home's fetched
+    /// sources, ..), so the literal of `env!("CARGO_MANIFEST_DIR")` in a registry crate is
+    /// the same bytes under every home. [`Dec::placed`] is the inverse. A mark of the port
+    /// is a NUL and a lower-case letter, so no mark of it reads as [`OUT`].
     fn unplaced(&self, text: &Symbol) -> R<Symbol> {
+        use std::fmt::Write;
         let written = text.as_str();
         if written.contains('\0') {
             // alloc: error path
             return Err("a literal holding a NUL".to_owned());
         }
+        let files = self.db.files();
         // alloc: encoding, once per crate per image write (not on a build's path)
-        let mut unplaced = written.to_owned();
-        for (index, out) in &self.out_dirs {
-            if unplaced.contains(out.as_str()) {
-                // alloc: encoding, once per crate per image write (not on a build's path)
-                unplaced = unplaced.replace(out.as_str(), &format!("{OUT} {index}\0"));
-            }
+        let mut unplaced = String::with_capacity(written.len());
+        let mut rest = written;
+        loop {
+            // The first `OUT_DIR` in what is left; of those that start there, the longest,
+            // then the closure's first.
+            let next = (self.out_dirs.iter())
+                .filter_map(|(index, out)| Some((rest.find(out.as_str())?, out.len(), *index)))
+                .min_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            let piece = next.map_or(rest, |(at, ..)| &rest[..at]);
+            let ported = files.ported(piece.as_bytes());
+            unplaced.push_str(
+                std::str::from_utf8(&ported)
+                    .map_err(|_| "a literal that is not UTF-8 once the port marked its directories")?,
+            );
+            let Some((at, len, index)) = next else { break };
+            let _ = write!(unplaced, "{OUT} {index}\0");
+            rest = &rest[at + len..];
         }
         Ok(if unplaced == written { *text } else { Symbol::intern(&unplaced) })
     }
@@ -2363,15 +2399,32 @@ impl<'a> Dec<'a> {
         Ok(dec)
     }
 
-    /// A literal's text with each `OUT_DIR` [`Enc::unplaced`] took out as this database has it.
+    /// A literal's text with each `OUT_DIR` and each directory of the port
+    /// [`Enc::unplaced`] took out as this database has it. A mark left in it (bytes written
+    /// with a port, read by a database told none, or a mark of a directory this one lacks)
+    /// is an error: no literal holds a NUL.
     fn placed(&self, text: Symbol) -> R<Symbol> {
         if !text.as_str().contains('\0') {
             return Ok(text);
         }
+        let files = self.db.files();
+        let piece = |placed: &mut String, piece: &str| -> R {
+            let real = files.placed(piece.as_bytes())?;
+            let real = std::str::from_utf8(&real)
+                .map_err(|_| "a literal that is not UTF-8 once its directories are put back")?;
+            if real.contains('\0') {
+                // alloc: error path
+                return Err(format!(
+                    "a literal with the mark of a directory this database was told none of (`base_db::Files::set_port`): {piece:?}"
+                ));
+            }
+            placed.push_str(real);
+            Ok(())
+        };
         // alloc: the decoded map's own storage, once per crate served
         let (mut placed, mut rest) = (String::new(), text.as_str());
         while let Some(at) = rest.find(OUT) {
-            placed.push_str(&rest[..at]);
+            piece(&mut placed, &rest[..at])?;
             let mark = rest[at + OUT.len()..].strip_prefix(' ').and_then(|it| it.split_once('\0'));
             let (index, after) = mark.ok_or("a literal with half a mark of an OUT_DIR")?;
             let krate = index.parse::<usize>().ok().and_then(|it| self.closure.get(it).copied());
@@ -2379,7 +2432,7 @@ impl<'a> Dec<'a> {
             placed.push_str(&out_dir(self.db, krate).ok_or("an OUT_DIR the crate lacks")?);
             rest = after;
         }
-        placed.push_str(rest);
+        piece(&mut placed, rest)?;
         Ok(Symbol::intern(&placed))
     }
 
@@ -4070,6 +4123,140 @@ pub mod inside { pub fn f() {} }
                 |db: &TestDB| super::super::crate_def_map(db, crate_named(db, name)).dump(db);
             assert_eq!(dump(&served), dump(&other), "{name}");
         }
+    }
+
+    /// A test's port ([`base_db::Port`]) of one directory, a home's fetched sources: marked
+    /// where it starts the bytes (as blaze-usercode's roots mark one where it starts a
+    /// path), found anywhere by [`base_db::Port::held`].
+    struct Sources(&'static str);
+
+    impl base_db::Port for Sources {
+        fn ported<'b>(&self, bytes: &'b [u8]) -> std::borrow::Cow<'b, [u8]> {
+            match bytes.strip_prefix(self.0.as_bytes()) {
+                Some(rest) => std::borrow::Cow::Owned([b"\0f".as_slice(), rest].concat()),
+                None => std::borrow::Cow::Borrowed(bytes),
+            }
+        }
+
+        fn placed<'b>(&self, bytes: &'b [u8]) -> Result<std::borrow::Cow<'b, [u8]>, String> {
+            match bytes.strip_prefix(b"\0f") {
+                Some(rest) => Ok(std::borrow::Cow::Owned([self.0.as_bytes(), rest].concat())),
+                None if bytes.contains(&0) => Err("a mark of no directory of the test".to_owned()),
+                None => Ok(std::borrow::Cow::Borrowed(bytes)),
+            }
+        }
+
+        fn held(&self, bytes: &[u8]) -> Option<&'static str> {
+            holds(bytes, self.0.as_bytes()).then_some("fetched sources directory")
+        }
+    }
+
+    /// A registry crate as a daemon has it: fetched below the home's sources, its build
+    /// script's file below the home's default build directory (`<home>/build/<name>-<id>`),
+    /// and a macro call whose argument is a path below its own sources, as
+    /// `env!("CARGO_MANIFEST_DIR")` leaves one. `LITERAL` is that argument.
+    const FETCHED: &str = r#"
+//- /main.rs crate:main deps:lib
+pub use lib::inside::f;
+//- /homeA/sources/registry/lib/src/lib.rs crate:lib env:OUT_DIR=/homeA/build/ws-1/debug/build/lib-1/out
+#[rustc_builtin_macro]
+macro_rules! include { () => {} }
+#[rustc_builtin_macro]
+macro_rules! concat { () => {} }
+#[rustc_builtin_macro]
+macro_rules! env { () => {} }
+macro_rules! at { ($path:literal) => { pub fn at() {} } }
+at!("LITERAL");
+include!(concat!(env!("OUT_DIR"), "/made.rs"));
+//- /homeA/build/ws-1/debug/build/lib-1/out/made.rs
+pub mod inside { pub fn f() {} }
+"#;
+
+    fn fetched(home: &str, literal: &str, port: Option<&'static str>) -> TestDB {
+        let text = FETCHED.replace("LITERAL", literal).replace("homeA", home);
+        let db = fixture::db(&text).into_db();
+        if let Some(sources) = port {
+            assert!(db.files().set_port(std::sync::Arc::new(Sources(sources))));
+        }
+        db
+    }
+
+    /// The invariant: a crate fetched under one home has an image, the image is the same
+    /// bytes under another home, and read there every literal names the reading home's
+    /// directory, so the crate answers as the one resolved from source there.
+    #[test]
+    fn a_crate_fetched_under_one_home_is_the_same_bytes_under_another() {
+        const LITERAL: &str = "/homeA/sources/registry/lib/assets";
+        let a = fetched("homeA", LITERAL, Some("/homeA/sources"));
+        let b = fetched("homeB", LITERAL, Some("/homeB/sources"));
+        // It encodes: its sources are below the home, as its build directory is, and only
+        // the build directory is a place of one checkout.
+        let bytes: Vec<_> = ["lib", "main"]
+            .into_iter()
+            .map(|name| (name, encode(&a, crate_named(&a, name)).unwrap()))
+            .collect();
+        for (name, written) in &bytes {
+            assert!(!holds(written, b"homeA"), "{name}: the bytes name the home");
+            let krate = crate_named(&b, name);
+            assert_eq!(encode(&b, krate).as_ref(), Ok(written), "{name}");
+            assert_eq!(unreadable(&b, krate, written), None, "{name}");
+        }
+        // Read under the other home, it is the crate resolved there, its literal that home's.
+        let mut served = fetched("homeB", LITERAL, Some("/homeB/sources"));
+        let maps = (bytes.iter())
+            .map(|(name, bytes)| {
+                let frozen = Frozen { bytes: bytes.as_slice().into(), mode: Mode::Serve };
+                (crate_named(&served, name), frozen)
+            })
+            .collect();
+        set(&mut served, maps);
+        for name in ["lib", "main"] {
+            let dump =
+                |db: &TestDB| super::super::crate_def_map(db, crate_named(db, name)).dump(db);
+            assert_eq!(dump(&served), dump(&b), "{name}");
+        }
+        // And the same image written back there is the same bytes again: the literal was
+        // read as home B's path, not kept as a mark or as home A's.
+        let lib = crate_named(&served, "lib");
+        assert_eq!(encode(&served, lib).as_ref(), Ok(&bytes[0].1));
+    }
+
+    /// The control: databases told no port keep the path, so two homes write other bytes
+    /// (and a key that named no home would give one home's literal to the other).
+    #[test]
+    fn the_control_a_path_kept_absolute_is_other_bytes_under_another_home() {
+        const LITERAL: &str = "/homeA/sources/registry/lib/assets";
+        let a = fetched("homeA", LITERAL, None);
+        let b = fetched("homeB", LITERAL, None);
+        let of = |db: &TestDB| encode(db, crate_named(db, "lib")).unwrap();
+        assert!(holds(&of(&a), b"/homeA/sources/registry/lib/assets"));
+        assert_ne!(of(&a), of(&b));
+        // Bytes written with a port are refused by a database told none, by name: the mark
+        // is not read as text.
+        let ported = fetched("homeA", LITERAL, Some("/homeA/sources"));
+        let bytes = encode(&ported, crate_named(&ported, "lib")).unwrap();
+        let mut served = fetched("homeA", LITERAL, None);
+        let lib = crate_named(&served, "lib");
+        let frozen = Frozen { bytes: bytes.as_slice().into(), mode: Mode::Serve };
+        set(&mut served, [(lib, frozen)].into_iter().collect());
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::super::crate_def_map(&served, lib).dump(&served)
+        }));
+        assert!(read.is_err(), "a mark with no port told is no literal");
+    }
+
+    /// A directory of the port the port does not mark (here: after a path byte) is still
+    /// found in the bytes, and the crate is refused naming the directory, never written
+    /// with one home's path under a key that names no home.
+    #[test]
+    fn a_literal_that_still_holds_a_directory_is_refused_by_its_name() {
+        let a = fetched("homeA", "-I/homeA/sources/registry/lib/include", Some("/homeA/sources"));
+        let why = encode(&a, crate_named(&a, "lib")).unwrap_err();
+        assert!(why.contains("fetched sources directory"), "{why}");
+        // A path under no directory of the port is no place of this build: kept as it is.
+        let free = fetched("homeA", "/usr/include/x.h", Some("/homeA/sources"));
+        let bytes = encode(&free, crate_named(&free, "lib")).unwrap();
+        assert!(holds(&bytes, b"/usr/include/x.h"));
     }
 
     #[test]
