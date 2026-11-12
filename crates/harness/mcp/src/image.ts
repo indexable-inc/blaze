@@ -3,6 +3,7 @@
 // Only a raster or PDF the cell asks for (`format`, or an `out` that is not `.svg`) is converted: an SVG by `rsvg-convert`
 // (librsvg), a raster file by `sips` (macOS). The file the cell asked for is recorded as a write step; the converter is not
 // an exec step of its own.
+import type { Docs } from "./docs.ts";
 import { stat, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { extname, resolve } from "node:path";
@@ -101,3 +102,15 @@ export async function image(input: string | Uint8Array, options?: ImageOptions):
     return { path: plan.out, bytes: n, format: plan.format } as ImageResult;
   }, (r) => ({ detail: `${r.format} · ${size(r.bytes ?? 0)}` }));
 }
+
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  image: {
+    area: "files",
+    for: "convert or resize an image; SVG to PNG",
+    sig: "image(path | svgMarkup, { format?: 'png'|'jpeg'|'pdf', width?, height?, out? }): Promise<{ path, bytes, format }>",
+    about: "convert or resize (rsvg-convert, sips); an SVG with no format stays an SVG.",
+    example: "await image('diagram.svg', { format: 'png', width: 800 })",
+    throws: "Error naming the converter (rsvg-convert, sips) and what it said.",
+  },
+};

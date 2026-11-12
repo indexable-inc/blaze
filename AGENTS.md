@@ -93,20 +93,22 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     `compiler-correctness`.
 33. **no-mcp**: No MCP: agent interfaces are a Unix socket or HTTP with one versioned schema in
     deterministic CBOR. Skill: `docs-and-scripts`.
-34. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run on the Mac or in an ix VM, never
-    on AWS. Skill: `build-and-test`.
-35. **fan-out-write-only**: A lane with its own ix VM builds, checks and tests its own work there; a
-    lane without one only writes. The main agent keeps the merges to main, the measurements claims
-    rest on, persisted-state and bootstrap changes, and one check of the exact tip before anything
-    lands. Skill: `build-and-test`.
-36. **worktree-per-lane**: One uniquely named worktree per lane; never `git stash`. Skill:
-    `build-and-test`.
+34. **work-in-ix-vms**: Everything that runs on Linux runs on the one build VM, `blaze-vm`, through its
+    one build queue; never a VM per lane, never AWS; the Mac is for what only macOS can show, one
+    build at a time. Skill: `build-and-test`.
+35. **fan-out-write-only**: One tree, one VM, one run: lanes only write code, in the one integration
+    directory; the main agent commits it, builds the one tree once on the one build VM, and runs
+    every check that makes sense on that one binary, then hands each failure back to the lane that
+    owns the code. Skill: `build-and-test`.
+36. **worktree-per-lane**: Lanes write in the one integration directory, each in its own files, and
+    everything is tested at once; a worktree is the exception, for two lanes that must change the
+    same file or a variant tree; never `git stash`. Skill: `build-and-test`.
 37. **land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`;
     never push to main. Skill: `landing`.
 38. **own-prs-to-merge**: Any agent may take any open pull request or issue to done; tell the owning
     lane what changed. Skill: `landing`.
-39. **clean-up-lane**: When a lane is done, delete its build directory, worktree, ix VM and merged
-    branch. Skill: `build-and-test`.
+39. **clean-up-lane**: When a lane is done, delete what it made: its state on the build VM, any
+    worktree, branch or exception machine. Skill: `build-and-test`.
 40. **credit-people**: Credit a suggestion, diagnosis or patch with a `Co-authored-by:` trailer. Skill:
     `landing`.
 41. **docs-say-what-they-are**: Every doc under `docs/` says in front matter whether it is current,
@@ -147,9 +149,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     invariant:` or `/// The refinement:` on its test) and raise its level of evidence as needed:
     tested, simulated, model-checked, proved in Lean; `scripts/src/bin/invariants.rs` lists them and
     the gate holds each to its control. Skill: `testing`.
-54. **guard-the-cause**: When you find bad code or a bad decision, find why it was made and remove that
-    cause with a guard (a lint, a check in the gate, a rule or a skill's instruction), so it cannot
-    be written again; do this unasked. Skill: `changing-code`.
+54. **guard-the-cause**: For every issue or annoyance, however small, ask why until you reach the core
+    reason (about five whys), name the whole class of problem it belongs to, change the architecture
+    so that class cannot happen, and build that change, unasked; a guard (a lint, a gate check, a
+    rule) is the least, not the goal. Skill: `changing-code`.
 55. **own-the-language**: blaze owns its compiler and is its own first user: never design around what
     Rust lacks; when code would be clearer, safer or zero-cost with a language feature Rust has not
     stabilized or does not have (const generic expressions, for one), build it properly in blaze as

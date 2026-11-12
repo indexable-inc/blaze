@@ -692,6 +692,7 @@ dependencies = [
  "blaze-protocol",
  "blaze-report",
  "blaze-rng",
+ "blaze-screen",
  "hegeltest",
  "libc",
  "serde",

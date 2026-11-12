@@ -1,10 +1,13 @@
 // The harnessd socket, one request per connection in harness's schema (wire.ts): the client's hello and its request go
 // out back to back as T_CBOR frames; the daemon answers with its hello (or an error naming both versions), then the reply.
 import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { HOME } from "./self.ts";
 import { decode, encode } from "./cbor.ts";
 import { SCHEMA, T_CBOR, frame, split, type Down, type Request } from "./wire.ts";
 
-export const SOCK = () => process.env.HARNESS_SOCK ?? `${process.env.HOME}/.harness/harnessd.sock`;
+/** The daemon's socket: in harness's state directory, as the daemon puts it (harness/src/paths.rs). */
+export const SOCK = () => process.env.HARNESS_SOCK ?? join(HOME(), "harnessd.sock");
 
 /** Whether the daemon socket exists (a stale file still fails at connect time; callers fall back then). */
 export const daemonPresent = () => existsSync(SOCK());

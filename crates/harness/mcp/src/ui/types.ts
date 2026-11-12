@@ -2,7 +2,7 @@ import type { ElementName } from './element.ts';
 
 /*
  * The props of every element a cell can write as Svelte markup, as types. Events are lowercase, `onselect`, as Svelte 5 writes
- * them, and go to the harness app as `onSelect`. Cells are not type-checked (their types are erased), so these are the reference
+ * them, and go to the harness app as `onSelect`. A cell of markup is checked by its compiler, not by TypeScript (typecheck.ts), so these are the reference
  * an editor, a test or a component library written in TypeScript checks against; element.ts checks the same rules at run time
  * (PROPS and its rules), and the app draws them (harness-native/src/app/chat/genui.rs). Cut down from den's repl/src/ui/types.ts
  * to the elements the harness app draws, with den's props every element takes (`CommonProps`).

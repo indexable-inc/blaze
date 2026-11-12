@@ -58,34 +58,67 @@ committing. A result you can't tie to a tree is not evidence.
 
 ## work-in-ix-vms (rule 34)
 
-Builds, tests, benchmarks and experiments run on the Mac or in an ix VM (`ix new`, `ix shell`, `ix
-rm`), never on AWS. Where neither can do it, stop and say what is missing.
+There is one ix VM for all of blaze's work: `blaze-vm` (arm64, 128 cores, 256 GiB committed;
+`agents.json` row H12 has its layout and how to remake it). Builds, tests, benchmarks, real-project
+runs and experiments on Linux all run there: nobody makes another VM (`ix new`) for a lane, a
+measurement or a project. It holds the one tree at `/root/blaze` with a warm build; blaze is built
+only through `/root/loop.sh <branch> <command...>`, which takes a lock, checks out the branch,
+builds once, installs to `/root/inst` and runs the command (ten minutes at most inside the lock); a
+lane's own state lives under `/root/wt/<lane>/` and long runs are systemd units it polls. Because
+every lane shares the machine, a timing names the load average it was taken under and compares base
+and new alternately in one window; for a table a claim rests on, the main agent holds the other work
+and the row says so. The exceptions are facts the one VM cannot give, each named in the lane's brief
+with its reason: an x86_64 or other-architecture machine to RUN binaries on (never to build), and
+the Mac for macOS behaviour (one build at a time, since three at once made every number of a night
+unusable). Never AWS (`fleet-ops`, `dev-aws-N`). Where none of these can do it, stop and say what is
+missing.
 
 See [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#working-in-parallel).
 
 ## fan-out-write-only (rule 35)
 
-The time that matters is from a change to knowing whether it works. A lane given its own ix VM (one
-per lane, `ix new --name <lane>`, named in its brief; never the Mac, never a shared VM, never AWS)
-closes that loop itself: it ships its worktree there, runs `blaze check` with tests and `blaze test`
-for what it touched, reads the errors and fixes them, and reports results, not "nothing was
-compiled". It builds only with blaze (`blaze-builds-blaze`), on the compiler its brief names,
-touches nothing it did not make, and removes its VM when done (`clean-up-lane`). A lane with no VM
-only reads and writes code and says plainly that nothing was built. What stays with the main agent:
-merging to main, and before a merge one check of the exact tip being merged, tests included (a
-library build alone is not "compiles"); every measurement a speed or memory claim rests on, with its
-exact tree (`measure-the-exact-tree`); changes to persisted state, the bootstrap and the pinned
-compiler; and deciding what to do next. Use few lanes (`agents-are-a-cost`): a VM per lane is 64
-cores, so each must be worth it.
+There is one integration tree (branch `int-<date>`, main plus every lane's pushed branch) and one
+build VM that holds it with a warm build, so a merge costs an incremental build, not a cold one. A
+lane has its paths in the one integration directory and nothing else (`worktree-per-lane` says when
+a worktree is right instead): it reads and writes code and tests there and never makes a VM
+(`work-in-ix-vms`: there is one, `blaze-vm`), runs cargo or blaze on its own, or starts a daemon of
+its own; it says plainly what it has not run. A lane that must see its code run asks the one queue:
+`ix shell blaze-vm --noninteractive -- /root/loop.sh <branch> <command...>` builds the pushed branch
+in the one tree and runs the command with that binary. The main agent runs the integration loop
+(`harness/v2/integrate.py`, one JSON value naming the branches): fetch, merge each branch (a branch
+that conflicts is left out and named), one build, then every check at once on that one binary: the
+edit-loop table beside the reference, the stale-answer run, new project, restart, memory, disk, the
+revision tests and the unit tests of the crates touched. One table comes out, tied to the tree's
+commit. A build error or failed check goes back to the lane whose files it names, with the tree, the
+command and the output; the lane fixes and pushes, and the loop runs again. A lane that needs to see
+something at run time asks for it as a check added to the loop (a script, a test, a span query), or
+is given the loop's built binary and its own `BLAZE_HOME` on the build VM to run read-only
+experiments; it does not build its own copy. What only one lane's change can show (a causal claim,
+`test-the-cause`) is run by the main agent as a patch on the tree. Landing: main takes the
+integration tree, or a branch of it, when the table and the tests are clean on that exact commit.
+Exceptions are named in the lane's brief with the reason: work that cannot share the VM (a benchmark
+that needs quiet cores gets a VM of its own; a macOS-only fact is measured on the Mac, one build at
+a time).
 
 ## worktree-per-lane (rule 36)
 
-One uniquely named worktree per lane; its build directory is its own under blaze's root, never in
-the checkout, so it needs no `CARGO_TARGET_DIR`; never `git stash`.
+The default is one directory: the integration checkout on the Mac (`agents.json` row H12 names it),
+on the integration branch. Every lane edits there, within the paths its brief gives it, and does not
+run git: the main agent commits (one commit per lane's piece, crediting it), pushes, and has the one
+VM build and test the whole tree at once. A lane says when its piece is ready to be built and what
+test shows it; until then its half-written files must not break the build for the others (add new
+code beside the old and switch over last, or keep it behind a module that is not yet referenced).
+Two lanes never write the same file: the brief's paths say who owns what, and a lane that needs a
+line in another's file asks the main agent. A worktree (uniquely named, with its own branch) is for
+the cases the one directory cannot serve: two lanes that must rewrite the same file, a bisect or a
+causal test that needs a variant tree, a long-lived rewrite that cannot keep the tree building; the
+brief says which. Never `git stash`: it is one stack shared by every worktree.
 
 ## clean-up-lane (rule 39)
 
-When a lane is done, delete its build directory (`blaze clean`), worktree, ix VM and merged branch.
+When a lane is done, delete what it made: its directory under `/root/wt/<lane>/` and its homes on
+`blaze-vm`, any daemons it started there (by pid), any worktree and merged branch, and any exception
+machine its brief allowed (`ix rm`). The build VM itself is never removed by a lane.
 
 ## ledger-decides (rule 46)
 

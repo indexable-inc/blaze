@@ -1,5 +1,5 @@
 {
- "about": "What agents working on blaze have learned, in one file every agent reads before starting and adds to while working. `howto`: the right way to do a recurring task here, as a command or a short recipe, with why. `annoyances`: whatever slowed, surprised or annoyed someone, however slightly, written when it happened, with the workaround and, when known, the `fix` that would remove the cause. A rule (what must hold) belongs in tools/agents/rules.ts, not here; a how-to that keeps being broken becomes a rule or a guard. Rows are never deleted: set `state` (howto: current or superseded by <id>; annoyances: open, accepted, or fixed with the commit).",
+ "about": "What agents working on blaze have learned, in one file every agent reads before starting and adds to while working. `howto`: the right way to do a recurring task here, as a command or a short recipe, with why. `annoyances`: whatever slowed, surprised or annoyed someone, however slightly, written when it happened, with the workaround, the `fix` that would remove the cause, and where it has been worked out the `whys` down to a property of the design, the `class` of problem that property allows and the `prevention` that makes the class impossible (rule guard-the-cause). A rule (what must hold) belongs in tools/agents/rules.ts, not here; a how-to that keeps being broken becomes a rule or a guard. Rows are never deleted: set `state` (howto: current or superseded by <id>; annoyances: open, accepted, or fixed with the commit).",
  "howto": [
   {
    "id": "H1",
@@ -44,7 +44,7 @@
    "task": "Run a lane",
    "do": "One worktree and one branch per lane, named with the date; a lane that needs to run code gets its own ix VM (`ix new --name <lane> --no-shell --arch arm64 --cpus 32 --memory 128 --ttl 3d`) and removes it when done; small commits pushed to its branch; the main agent merges, measures on the exact tip and lands. The brief gives the outcome, the check, the measured facts with their source, the paths, what other lanes own, and what done prints.",
    "why": "Rules fan-out-write-only, worktree-per-lane, every-agent-has-a-task.",
-   "state": "current"
+   "state": "superseded by H9"
   },
   {
    "id": "H6",
@@ -76,6 +76,33 @@
   {
    "id": "H9",
    "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+   "task": "Run lanes and test their work",
+   "do": "Lanes only write: one worktree and branch each, small commits, pushed often; no VM, no cargo, no daemon. The main agent runs `python3 -I harness/v2/integrate.py '{\"branches\":[...],\"tests\":true}'`: it merges every branch into the integration worktree, builds once, and prints one table (edit loop beside Relax, stale answers, new project, restart, memory, disk, tests). Failures go back to the lane whose files they name. The script's paths are the Mac's today (integration worktree /Volumes/Projects/blaze-int-1112, Relax at /tmp/relax-src); moving it to the one build VM is open.",
+   "why": "Rule fan-out-write-only as rewritten 2026-11-12: ten lanes each building in their own VM cost a cold build and hours each, and their numbers had to be redone on the combined tree anyway.",
+   "state": "superseded by H12"
+  },
+  {
+   "id": "H10",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane repl-clean-1112",
+   "task": "Change or drive the harness ts kernel (crates/harness/mcp)",
+   "do": "In crates/harness/mcp: `bun install` (a new worktree has no node_modules), `bun test` (about 10 s; bunfig.toml preloads src/test-setup.ts, so no test reaches the live daemon or ~/.harness), `bunx tsc --noEmit`. Drive the real kernel from a shell with `bun scripts/cell.ts '{\"cells\": [\"help()\", \"1 + 1\"]}'` (a kernel of its own) or `{\"sock\": path, \"cells\": [...]}` for one started with HARNESS_REPL_SOCK=path. Decisions live in pure modules with their tests (patience.ts, stop.ts, notices.ts, disclose.ts, help.ts, journal.ts, shell-rule.ts); kernel.ts is the one API and mcp.ts/serve.ts only adapt it. A new function needs a `docs` entry beside it or functions/docs.test.ts fails. HARNESS_REPL_TYPECHECK=0 starts a kernel that does not type-check cells.",
+   "why": "Nothing here needs cargo or a VM, so this is the one place a lane runs its own tests; the end-to-end test (src/e2e.test.ts) starts the real MCP server, which is how a wrong reply is seen before an agent sees it.",
+   "state": "current"
+  },
+  {
+   "id": "H12",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+   "task": "Where work runs and where code is written",
+   "do": "One VM: `blaze-vm` (ix, arm64, 128 cores, 256 GiB committed, TTL 7 days from 2026-11-12; remake it with /tmp/blazevm.sh's steps: `ix new --name blaze-vm --no-shell --arch arm64 --cpus 128 --memory 256 --memory-commit --ttl 7d`, rustup + the pinned nightly, the pinned LLVM under /root/.blaze/native, `git clone` to /root/blaze, one release build, then /root/loop.sh and /root/lockwatch.sh). Build and run only through `ix shell blaze-vm --noninteractive -- /root/loop.sh <branch> <command...>`: one caller at a time, the branch checked out in /root/blaze, one incremental build, installed to /root/inst, the command run with BLAZE=/root/inst/blaze and BLAZE_HOME=/root/homes/<branch>, ten minutes at most; copy the binaries to /root/wt/<lane>/inst inside the call before measuring, keep projects and homes under /root/wt/<lane>/, start long runs as systemd units (export HOME=/root and PATH=/root/.cargo/bin:/run/current-system/sw/bin:$PATH in the unit's script) and poll them. One directory: lanes write in the integration checkout on the Mac (/Volumes/Projects/blaze-int-1112, branch int-1112), each in its own paths, without running git; the main agent commits, pushes and runs `harness/v2/integrate.py`. Timings name the load average and alternate base and new.",
+   "why": "Rules work-in-ix-vms, fan-out-write-only and worktree-per-lane as rewritten 2026-11-12: ten lane VMs and seventeen worktrees cost a cold build each and an hour of merging; a first shared queue on a 32-core VM (lanebase-1112) jammed for 22 minutes on a lock a daemon inherited, fixed in loop.sh (children start with the lock closed).",
+   "state": "current"
+  },
+  {
+   "id": "H13",
+   "date": "2026-11-12",
    "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
    "task": "Change what build, run, check or test show",
    "do": "Change blaze-screen's core (crates/blaze-screen/src/screen.rs) and read the frames: UPDATE_EXPECT=1 cargo test -p blaze-screen rewrites tests/golden/*.txt from the recorded transcripts at 80x24, 200x60 and 40x10; read the diff. Record a new transcript from a real build with BLAZE_UI_TRANSCRIPT=<file> blaze build.",
@@ -83,7 +110,7 @@
    "state": "current"
   },
   {
-   "id": "H10",
+   "id": "H14",
    "date": "2026-11-12",
    "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
    "task": "Look at what blaze draws on a real terminal from an ix VM",
@@ -92,7 +119,7 @@
    "state": "current"
   },
   {
-   "id": "H11",
+   "id": "H15",
    "date": "2026-11-12",
    "who": "claude-fable-5-2 (Claude Fable 5.2), lane termui-1112",
    "task": "Get blaze's pinned LLVM onto a Linux ix VM",
@@ -1226,6 +1253,134 @@
    "cause": "two binaries with one name and different versions; `stop` looked at a different daemon than the one on the socket",
    "workaround": "stopped it with its own binary",
    "fix": "`--version` prints both the launcher and the version it runs; `stop` names the daemon on the socket whatever built it",
+   "state": "open"
+  },
+  {
+   "id": "A38",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+   "where": "docs/harness.md, the workflow table",
+   "what": "Two rows for `blaze.yaml` (`gate`) stood one after the other and disagreed: one said `blaze test`, only the tests the change reached, and check with `--all-targets`; the other `blaze test --workspace`, every test, and no `--all-targets`. The workflow runs every test (harness/unittests.py with no `reached`, blaze-platform.yaml:148) and both checks (blaze.yaml:439, :447). Found by the blaze-d4 session.",
+   "cost": "a current doc that was half wrong either way you read it",
+   "cause": "commit 2476469518 (2026-11-10) added the new row and left the old one; nothing checks a table for two rows with the same first cells",
+   "workaround": "merged into one true row",
+   "fix": "the docs check refuses a table with two rows whose first two cells are equal",
+   "state": "open"
+  },
+  {
+   "id": "A39",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+   "where": "my own test reruns (cargo test with a name filter); harness/v2/integrate.py's terminal-width check",
+   "what": "I reported an intermittent revision test as `main: pass 6 fail 0` and `main+edit3: pass 12 fail 0`: the test did not exist on those trees, the filter matched nothing, and `test result: ok. 0 passed` was counted as a pass. The same night the combined run's terminal-width row used `script` to make a terminal, which fails when stdin is a socket, so blaze never ran and the row said `recomputed-note=False`.",
+   "cost": "two false statements to the owner, both retracted; a wrong suspect (the handshake lane) held for an hour",
+   "cause": "my scripts grepped for a success phrase instead of checking that the named check ran",
+   "whys": [
+    "why wrong: zero tests ran and the run said ok",
+    "why possible: a filter that matches nothing is success for libtest, and my loop looked only for `test result: ok`",
+    "why not caught: nothing compares the tests run with the tests asked for",
+    "why easy: every tool here reports absence of failure, not presence of the check",
+    "property: a check that executes nothing reports success"
+   ],
+   "class": "vacuous success: any check, test run, measurement row or gate step that passes when it ran nothing (a filter matching no test, a skipped step, a command that failed before the thing measured, an empty input set)",
+   "prevention": "every check states what it expected to run and fails when it ran less: integrate.py counts tests run per named test and refuses zero; a measurement row carries the exit status and a proof the program ran (its output); `blaze test` with a filter that matches nothing is an error naming the filter; the gate refuses a step that reports zero checks. State: integrate.py's width row fixed (pty, exit status, output checked); the rest open",
+   "workaround": "count `1 passed`, not `ok`",
+   "fix": "see prevention",
+   "state": "open"
+  },
+  {
+   "id": "repl-1",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane repl-clean-1112",
+   "where": "crates/harness/mcp/src/daemon.ts `SOCK`; every test that runs a cell",
+   "what": "The daemon socket's path ignored HARNESS_HOME (`$HOME/.harness/harnessd.sock` unless HARNESS_SOCK was set), so a test or script that set only HARNESS_HOME to a scratch directory would still post its cells to, and run its `sh` through, the person's live daemon. I noticed only because the live socket exists on this Mac.",
+   "cost": "ten minutes; no harm found, but any new test that ran a cell would have written `repl` objects into the live index",
+   "cause": "two derivations of one path: the Rust daemon uses home().join(\"harnessd.sock\"), the kernel had its own",
+   "whys": [
+    "why possible: the kernel computed the socket path from $HOME, not from the state directory",
+    "why not caught: each test that ran cells remembered to set HARNESS_SOCK by hand",
+    "property: isolation from the live harness was each test's own job"
+   ],
+   "class": "a test or script reaching the person's live state because isolation is opt-in per file",
+   "prevention": "SOCK() derives from HOME() (src/self.ts) as the daemon does; bunfig.toml preloads src/test-setup.ts, which gives every `bun test` run its own empty HARNESS_HOME and unsets HARNESS_SOCK and HARNESS_SESSION",
+   "fix": "done in this lane",
+   "state": "fixed on branch repl-clean-1112 (not merged)"
+  },
+  {
+   "id": "repl-2",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane repl-clean-1112",
+   "where": "crates/harness/mcp/src/typecheck.ts, first version in this lane",
+   "what": "The type checker's TypeScript process was started lazily by the first cell that needed a check, inside that cell's async context, so the cell owned it: cancelling that cell killed the checker and the next cell was refused with `the type checker failed (Connection is closed.)`. No test showed it; I saw `Killed: pid … (…/@typescript/…)` in a real stop's reply while reading replies by hand.",
+   "cost": "found by luck before anyone used it; fifteen minutes",
+   "cause": "ownership follows AsyncLocalStorage, and anything started lazily inherits the context of whoever touched it first",
+   "whys": [
+    "why possible: a process the kernel needs for its whole life was started on first use inside a cell",
+    "why not caught: every test started its checker outside a cell",
+    "property: 'whoever starts it owns it' applied to kernel-lifetime helpers"
+   ],
+   "class": "a kernel-lifetime resource created lazily in a cell's context is owned, and ended, by that cell",
+   "prevention": "tasks.ts `outsideTask(fn)` runs kernel-owned work in no cell; the checker starts through it and is warmed at kernel start; typecheck.test.ts admits a cell from inside a task on a fresh checker and asserts the task owns nothing (it fails, naming the pid, when outsideTask is removed)",
+   "fix": "done in this lane",
+   "state": "fixed on branch repl-clean-1112 (not merged)"
+  },
+  {
+   "id": "repl-3",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane repl-clean-1112",
+   "where": "crates/harness/mcp/scripts/effects-smoke.ts (deleted in this lane); .github",
+   "what": "effects-smoke.ts answered the kernel in JSON frames (`[type u8][len u32][json]`), the protocol before deterministic CBOR, and nothing said it no longer matched. A grep of .github for `bun test` and `harness/mcp` finds nothing, so I believe no gate runs this package's tests or tsc (not checked beyond that grep).",
+   "cost": "twenty minutes working out whether it was mine to keep working",
+   "cause": "a check kept as a script someone runs by hand, and a test suite no gate runs",
+   "class": "a check outside the gate rots silently",
+   "prevention": "the smoke scripts are replaced by src/e2e.test.ts and src/tell.test.ts inside `bun test`; still missing: a gate step that runs `bun test` and `bunx tsc --noEmit` in crates/harness/mcp",
+   "fix": "add crates/harness/mcp's `bun test` and `tsc` to the merge gate",
+   "state": "open"
+  },
+  {
+   "id": "repl-4",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane repl-clean-1112",
+   "where": "Bun 1.4.2: process.on('unhandledRejection'), node:worker_threads",
+   "what": "Two engine behaviours cost time. (1) Bun calls unhandledRejection with no AsyncLocalStorage store and, in the kernel, only after the cell that dropped the promise had replied, so it cannot be attributed by context: it is attributed by the cell's name in the stack (each cell is compiled with `//# sourceURL=t3.cell.ts`). uncaughtException does keep the store. (2) A watchdog Worker created just before a synchronous loop never started, and a worker's process.stderr write did not appear while the main thread was held.",
+   "cost": "about forty minutes across both",
+   "cause": "engine behaviour found by experiment, not read in documentation",
+   "workaround": "sourceURL per cell for attribution; the watchdog is started at kernel start, takes its inputs as workerData, and writes only to the journal file before it kills",
+   "fix": "none here; e2e.test.ts ('an unawaited rejection…') and kernel.test.ts ('a cell that never awaits…') fail if a Bun update changes either",
+   "state": "accepted"
+  },
+  {
+   "id": "repl-5",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane repl-clean-1112",
+   "where": "my own one-off migration script in this lane (doc strings moved next to their functions)",
+   "what": "The script put `import type { Docs }` before the first `import ` it found in each file by text; in packages.ts and three others the first match was inside the header comment, so the import landed in the middle of a comment.",
+   "cost": "ten minutes, caught by reading the output",
+   "cause": "an edit by text where the tree has no by-name tool for TypeScript",
+   "class": "text edits that match inside comments or strings",
+   "prevention": "none built: rule fix-through-blaze-lints covers Rust only. For TypeScript here, anchor on `^import ` and read the diff.",
+   "fix": "a by-syntax edit tool for the TypeScript in crates/harness if such moves recur",
+   "state": "open"
+  },
+  {
+   "id": "A40",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+   "where": "/root/loop.sh on the build VM (my script)",
+   "what": "The one build queue stood still for 22 minutes with five lanes waiting and the VM idle: `lslocks` showed `/root/loop.lock` held by `blaze-engine serve`, a daemon started by an earlier loop command. Two lanes reported it and both named the wrong holder (the first waiter); I ended that waiter's `flock`, which made it build without the lock until I stopped it.",
+   "cost": "22 minutes for five lanes; one build started outside the lock",
+   "cause": "the lock was `exec 9>lock; flock 9`, and every child inherited descriptor 9; a daemon outlives the command that started it",
+   "whys": [
+    "why stuck: a daemon held the lock",
+    "why possible: the lock is a property of an open descriptor and children inherit descriptors",
+    "why not caught: nothing said who held the lock; waiters looked the same as the holder in `ps`",
+    "why easy: the shell idiom for a lock is inheritable by default",
+    "property: a resource meant for one scope is held by whatever outlives that scope"
+   ],
+   "class": "scope leak: a lock, pipe, descriptor or lease taken for one command is inherited by a process that outlives it (the same class as a daemon holding a caller's stdout pipe open, which also happened in that script)",
+   "prevention": "loop.sh starts every child with the lock closed (9>&-), sends a command's output to a file and prints it after, stops a command at 600 s, and says who holds the lock; a watchdog ends a stray holder. Open: blaze's own daemon closes every descriptor it did not ask for when it starts (CLOEXEC by default, close_range at spawn), with a test that a daemon started from a process holding a lock does not hold it",
+   "workaround": "killed the daemon",
+   "fix": "loop.sh fixed 2026-11-12; the daemon-side close is open",
    "state": "open"
   },
   {

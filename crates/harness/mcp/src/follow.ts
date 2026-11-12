@@ -9,10 +9,13 @@
 // CARGO_TERM_PROGRESS_WHEN, so the unit total is cargo's), `--keep-going` (test: `--no-fail-fast`) so one run shows every
 // error, and, for tests, libtest's stable text. When it fails, `unchecked` says what was left unbuilt or unrun, from what
 // the JSON says (units planned by the bar vs compiler-artifact messages; test executables built vs run).
+import type { Docs } from "./docs.ts";
 import { closeSync, existsSync, openSync, readFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { oneLine, quiet, step as beginStep, type Step as LiveStep } from "./effects.ts";
+import { quiet, step as beginStep, type Step as LiveStep } from "./effects.ts";
+import { oneLine } from "./disclose.ts";
+import { signal, terminateGroup } from "./cancel.ts";
 
 /**
  * Something the command found: a compiler diagnostic, a failed test. `at` is `file:line` (absolute, or relative to the
@@ -89,8 +92,6 @@ const LIVE_ROWS = 200;
 const UPDATE_MS = 200;
 /** After the process exits, a grandchild holding its pipes open delays the digest by at most this. */
 const DRAIN_MS = 2_000;
-/** A timed-out command gets SIGTERM, then SIGKILL after this. */
-const KILL_GRACE_MS = 2_000;
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n.toLocaleString("en-US")} ${n === 1 ? one : many}`;
 /** "4.2 s", "41 s", "2 min 5 s". */
@@ -149,31 +150,6 @@ const listed = (f: Finding, cwd: string): Finding => ({
   ...(f.at ? { at: shortPath(f.at, cwd) } : {}),
   text: f.text.length > FINDING_TEXT ? `${f.text.slice(0, FINDING_TEXT)}…` : f.text,
 });
-
-/** Every process below `pid`, deepest last (from one `ps`). */
-function descendants(pid: number): number[] {
-  const r = quiet(() => Bun.spawnSync(["ps", "-A", "-o", "pid=,ppid="], { stdout: "pipe", stderr: "ignore" }));
-  const children = new Map<number, number[]>();
-  for (const line of r.stdout.toString().split("\n")) {
-    const [c, p] = line.trim().split(/\s+/).map(Number);
-    if (!c || p === undefined || Number.isNaN(p)) continue;
-    (children.get(p) ?? children.set(p, []).get(p)!).push(c);
-  }
-  const out: number[] = [];
-  const queue = [pid];
-  while (queue.length) for (const c of children.get(queue.shift()!) ?? []) { out.push(c); queue.push(c); }
-  return out;
-}
-
-/** SIGTERM to the process and everything below it, SIGKILL to what is left after KILL_GRACE_MS. */
-function killTree(sub: Bun.Subprocess) {
-  const signal = (sig: NodeJS.Signals) => {
-    for (const pid of [sub.pid, ...descendants(sub.pid)]) { try { process.kill(pid, sig); } catch { /* already gone */ } }
-  };
-  signal("SIGTERM");
-  const late = setTimeout(() => { if (sub.exitCode === null && sub.signalCode === null) signal("SIGKILL"); }, KILL_GRACE_MS);
-  void sub.exited.then(() => clearTimeout(late));
-}
 
 /**
  * `follow(cmd, options)`: runs `cmd` (a string, run by bash, or an argv) as one live "build" step and resolves to the digest.
@@ -260,8 +236,9 @@ export async function follow<M = unknown>(cmd: string | readonly string[], optio
   let broke: string | undefined;
   try {
     // quiet: the spawn is this step's, not an exec step of its own.
-    const sub = quiet(() => Bun.spawn(argv, { cwd, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" }));
-    const timer = options.timeout ? setTimeout(() => { timedOut = true; killTree(sub); }, options.timeout) : undefined;
+    // Its own process group, so its timeout and a stop of the cell (cancel.ts) kill everything it started.
+    const sub = quiet(() => Bun.spawn(argv, { cwd, env, stdin: "ignore", stdout: "pipe", stderr: "pipe", detached: true }));
+    const timer = options.timeout ? setTimeout(() => { timedOut = true; terminateGroup(sub.pid, sub.exited); }, options.timeout) : undefined;
     const pump = async (from: "stdout" | "stderr", stream: ReadableStream<Uint8Array>) => {
       const split = new LineSplitter();
       const dec = new TextDecoder();
@@ -308,6 +285,8 @@ export async function follow<M = unknown>(cmd: string | readonly string[], optio
     const detail = timedOut ? "timed out" : broke ? broke : exitCode === null ? "killed" : `exit ${exitCode}`;
     live.end(done.ok, detail, digest, findings.length ? findings.map(f => listed(f, cwd)) : undefined);
   }
+  // The cell was stopped, which killed the command: its code does not go on with the digest of a killed run.
+  signal()?.throwIfAborted();
   return digest;
 }
 
@@ -678,10 +657,22 @@ export const cargo = {
   test,
 };
 
-/** For the tool description, in the style of functions/index.ts. */
-export const followDocs = {
-  follow:
-    "follow(cmd: string | string[], { step?, find?, json?, total?, summary?, failure?, title?, cwd?, env?, timeout?, limit? = 20 }): Promise<{ ok; summary; counts; findings: { level; at?; text }[]; more?; failure?; log }> — run a command live as one build step and get a digest, never its output: each stdout/stderr line (\\r ends one; stdout JSON parsed with json) goes to step(line, { from, tally }) → label | { label, done, total } and find(line, ctx) → finding(s); log is the path of the full raw output.",
-  cargo:
-    "cargo.check | clippy | build | test(args?: string | string[], { cwd?, env?, timeout?, limit? }): Promise<digest & { unchecked? }> — cargo with --message-format=json and --keep-going (test: --no-fail-fast), live as one build step; findings are rustc's errors and warnings at file:line (relative to cwd) and, for test, each failed test at its panic, with passed/failed/ignored counted; unchecked says what a failure left unbuilt or unrun.",
-} as const;
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  follow: {
+    area: "builds",
+    for: "run a long build, lint or test command and get its findings",
+    sig: "follow(cmd: string | string[], { step?, find?, json?, total?, summary?, failure?, title?, cwd?, env?, timeout?, limit? = 20 }): Promise<{ ok; summary; counts; findings: { level; at?; text }[]; more?; failure?; log }>",
+    about: "run a command live as one build step and get a digest, never its output: each stdout/stderr line (\\r ends one; stdout JSON parsed with json) goes to step(line, { from, tally }) → label | { label, done, total } and find(line, ctx) → finding(s); log is the path of the full raw output.",
+    example: "await follow('bunx tsc --noEmit')",
+    throws: "Never for a failing command: the digest has ok: false and failure. Error when the command cannot be started.",
+  },
+  cargo: {
+    area: "builds",
+    for: "build, check, lint or test Rust",
+    sig: "cargo.check | clippy | build | test(args?: string | string[], { cwd?, env?, timeout?, limit? }): Promise<digest & { unchecked? }>",
+    about: "cargo with --message-format=json and --keep-going (test: --no-fail-fast), live as one build step; findings are rustc's errors and warnings at file:line (relative to cwd) and, for test, each failed test at its panic, with passed/failed/ignored counted; unchecked says what a failure left unbuilt or unrun.",
+    example: "await cargo.test('-p blaze-core scheduler')",
+    throws: "Never for a failed build: the digest has ok: false, failure and unchecked. Error when cargo cannot be started.",
+  },
+};

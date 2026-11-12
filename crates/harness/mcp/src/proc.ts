@@ -1,10 +1,14 @@
 // Process table for subprocesses started from the REPL: sh() spawns and returns a handle at once;
 // stdout/stderr are kept in memory (last maxBytes per stream, older lines dropped but still numbered).
+import type { Docs } from "./docs.ts";
 import { table, type Table } from "./table.ts";
-import { req, daemonPresent, DaemonUnreachable } from "./daemon.ts";
-import { REPL_ID } from "./repl.ts";
-import { oneLine, quiet, step } from "./effects.ts";
-import { checkShell, refusal } from "./shell-check.ts";
+import { req, daemonPresent, DaemonUnreachable, SOCK } from "./daemon.ts";
+import { abortable, killGroup, own } from "./cancel.ts";
+import { currentTask } from "./tasks.ts";
+import { REPL_ID, session as selfSession } from "./self.ts";
+import { quiet, step } from "./effects.ts";
+import { oneLine } from "./disclose.ts";
+import { checkShell, refusal } from "./shell-rule.ts";
 
 type Stream = "stdout" | "stderr";
 
@@ -35,12 +39,13 @@ export type ShOpts = {
   cwd?: string; env?: Record<string, string>; stdin?: string; maxBytes?: number; timeoutMs?: number;
   /** Spawn here with Bun.spawn instead of through harnessd (no stored stages). */
   local?: boolean;
-  /** Why a command that only reads files or the tree needs the shell; without it such a command is refused (shell-check.ts). */
+  /** Keep it running when the cell that started it is stopped (a server, a watcher). Only through harnessd, which holds it as a run every agent sees in objects(). */
+  detach?: boolean;
+  /** Why a command that only reads files or the tree needs the shell; without it such a command is refused (shell-rule.ts). */
   why?: string;
 };
 export type ShResult = { id: string; run: string | null; pid: number; exit_code: number | null; signal: string | null; stdout: string; stderr: string };
 
-const selfSession = (): number | null => (process.env.HARNESS_SESSION ? Number(process.env.HARNESS_SESSION) : null);
 const shq = (a: string) => (/^[\w@%+=:,./-]+$/.test(a) ? a : `'${a.replaceAll("'", `'\\''`)}'`);
 type ReadResp = { data: string; offset: number; next_offset: number; size: number; eof: boolean; done: boolean };
 
@@ -59,14 +64,14 @@ export class Proc {
   readonly started_on: Promise<void>;
   #ready!: () => void;
   #sub?: Bun.Subprocess<"ignore" | Blob, "pipe", "pipe">;
-  #killed?: NodeJS.Signals | number;
+  #killed?: NodeJS.Signals;
   constructor(readonly id: string, readonly cmd: string, readonly cwd: string, argv: string[], readonly opts: ShOpts) {
     const max = opts.maxBytes ?? 8 << 20;
     this.out = { stdout: new Buf(max), stderr: new Buf(max) };
     this.started_on = new Promise((r) => (this.#ready = r));
     this.exited = !opts.local && daemonPresent()
       ? this.#daemon().catch((e) => {
-        if (e instanceof DaemonUnreachable) return this.#local(argv);
+        if (e instanceof DaemonUnreachable && !opts.detach) return this.#local(argv);
         throw e;
       })
       : this.#local(argv);
@@ -83,6 +88,9 @@ export class Proc {
     this.run = r.id;
     this.pid = r.pid;
     this.#ready();
+    // The cell owns the run (stopping the cell kills it, cancel.ts) unless it was detached on purpose, which the stop's report names.
+    if (this.opts.detach) currentTask()?.detached.push(`${r.id} (${oneLine(this.cmd, 60)})`);
+    else own({ what: `${r.id} (${oneLine(this.cmd, 60)})`, exited: this.exited, kill: () => void req({ op: "run_kill", id: r.id }).catch((e) => console.error(`kill ${r.id}: ${e}`)) });
     if (this.#killed !== undefined) await req({ op: "run_kill", id: r.id });
     const timer = this.opts.timeoutMs ? setTimeout(() => this.kill(), this.opts.timeoutMs) : undefined;
     const pump = async (s: Stream, stream: "out" | "err") => {
@@ -107,12 +115,15 @@ export class Proc {
     const opts = this.opts;
     const sub = (this.#sub = Bun.spawn(argv, {
       cwd: this.cwd, env: { ...process.env, ...opts.env }, stdin: opts.stdin != null ? new Blob([opts.stdin]) : "ignore", stdout: "pipe", stderr: "pipe",
-      ...(opts.timeoutMs ? { timeout: opts.timeoutMs } : {}),
+      // Its own process group: kill() and a stop of the cell (the cell owns it, effects.ts) end everything it started.
+      detached: true,
     }));
+    const timer = opts.timeoutMs ? setTimeout(() => this.kill(), opts.timeoutMs) : undefined;
+    void sub.exited.then(() => clearTimeout(timer));
     this.backend = "local";
     this.pid = sub.pid;
     this.#ready();
-    if (this.#killed !== undefined) sub.kill(this.#killed);
+    if (this.#killed !== undefined) killGroup(sub.pid, this.#killed);
     const pump = async (s: Stream, r: ReadableStream<Uint8Array>) => {
       const dec = new TextDecoder();
       for await (const c of r) this.out[s].push(dec.decode(c, { stream: true }), c.byteLength);
@@ -136,11 +147,11 @@ export class Proc {
     return { id, run, pid, exit_code, signal, stdout: this.out.stdout.text, stderr: this.out.stderr.text };
   }
   /** `await sh(...)` waits for exit and gives { exit_code, stdout, stderr }. */
-  then<A, B>(ok?: ((r: ShResult) => A | PromiseLike<A>) | null, fail?: ((e: unknown) => B | PromiseLike<B>) | null) { return this.exited.then(ok, fail); }
-  /** Daemon runs: SIGTERM to the run's process group, SIGKILL after 3s (the signal argument is ignored). */
-  kill(signal: NodeJS.Signals | number = "SIGTERM") {
+  then<A, B>(ok?: ((r: ShResult) => A | PromiseLike<A>) | null, fail?: ((e: unknown) => B | PromiseLike<B>) | null) { return abortable(this.exited).then(ok, fail); }
+  /** Signal the command and everything it started (its process group). Daemon runs: SIGTERM, then SIGKILL after 3s (the signal argument is ignored). */
+  kill(signal: NodeJS.Signals = "SIGTERM") {
     if (this.run) req({ op: "run_kill", id: this.run }).catch((e) => console.error(`kill ${this.run}: ${e}`));
-    else if (this.#sub) this.#sub.kill(signal);
+    else if (this.#sub) killGroup(this.#sub.pid, signal);
     else this.#killed = signal;
     return this;
   }
@@ -160,7 +171,10 @@ let seq = 0;
 export function sh(cmd: string | string[], opts: ShOpts = {}): Proc {
   const text = typeof cmd === "string" ? cmd : cmd.map(shq).join(" ");
   // The shell is for running programs; reading files or the tree has typed calls (glob, ls, du, rg, Bun.file) that the person
-  // sees as what they did. Needs initShellCheck() at startup (functions/index.ts).
+  // sees as what they did.
+  if (opts.detach && (opts.local || !daemonPresent())) {
+    throw new Error(`sh(${JSON.stringify(oneLine(text, 60))}, { detach: true }): a detached command is held by harnessd, so it stays visible in objects() after its cell is gone; ${opts.local ? "it cannot also be local: true" : `harnessd is not running (no ${SOCK()})`}`);
+  }
   const verdict = checkShell(text, opts.why);
   if (!verdict.ok) throw refusal(verdict.message);
   const argv = typeof cmd === "string" ? ["/bin/sh", "-c", cmd] : cmd;
@@ -297,7 +311,7 @@ export function err(ref: ProcRef, opts: ReadOpts & { stage?: number | "final" } 
   return lines(ref, "stderr", opts).map((r) => r.text).join("\n");
 }
 /** Signal a process (default SIGTERM). */
-export const kill = (ref: ProcRef, signal?: NodeJS.Signals | number) => getProc(ref).kill(signal).view();
+export const kill = (ref: ProcRef, signal?: NodeJS.Signals) => getProc(ref).kill(signal).view();
 
 /** The REPL's process tree (from `ps`): every descendant of this server, indented by depth; proc is the sh() id if tracked. */
 export async function ptree() {
@@ -332,3 +346,63 @@ export async function ptree() {
   }
   return table(rows);
 }
+
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  sh: {
+    area: "shell",
+    for: "run a program; start a server or a watcher that keeps running",
+    sig: "sh(cmd: string | string[], { cwd?, env?, stdin?: string, why?, maxBytes? = 8MB per stream kept in memory (oldest lines dropped, line numbers kept), timeoutMs?, local?: true to bypass harnessd, detach?: true }): Proc",
+    about: "the awaitable form of spawn('proc'): start now, return a handle at once; `await sh(...)` (or a cell ending in sh(...)) waits and gives { id: 'p1', run: 'r12' | null, pid, exit_code, signal, stdout, stderr }. Runs through harnessd (bash) when it's up: the command is split at top-level ; && || and |, and the FULL stdout and stderr of EVERY pipeline stage is stored as run r12 stage 0, 1, ... readable later by any agent (`cargo clippy 2>&1 | head -n5` shows you 5 lines, clippy still runs to the end and stage(r, 0) has all of it — so pipe through head/tail/grep freely, nothing is lost). stdout here = last stage of each pipeline; stderr = every stage's. With no daemon it is a local process (run: null). Handle: id, run, pid, status running|exited|killed, kill(). The cell that starts a command owns it: when the cell is stopped (cancel, its limit) the command and everything it started is killed; a cell that ends normally leaves it running. { detach: true } keeps it through a stop too (harnessd holds it; objects() shows it). The shell is for running programs: a command line that only reads files or the tree (cat, head, tail, grep, rg, find, ls, stat, wc, sed -n, awk, du, tree, which), a GitHub read through gh, or curl/wget is refused with the typed call to use unless { why } says why the shell is needed; filtering a program's output (cargo test 2>&1 | grep FAIL) runs.",
+    example: "const server = sh('bun run dev', { detach: true }); await Bun.sleep(500); out(server, { new: true })",
+    throws: "Error 'Not run: ...' for a command that only reads files or the tree (it names the typed call; { why } lets it run); Error for { detach: true } without harnessd. `await sh(...)` does not throw on a non-zero exit: read exit_code.",
+  },
+  procs: {
+    area: "shell",
+    sig: "procs(): Table<{ id; run; pid; cmd; status; exit_code; started; elapsed_ms; stdout_bytes; stderr_bytes; truncated }>",
+    about: "this REPL's sh() processes, finished included.",
+  },
+  out: {
+    area: "shell",
+    for: "read what a process printed so far",
+    sig: "out(p: 'p1' | 'r12' | pid | Proc, { from?, to?, tail?, new?: true, cursor? = 'default', stage? }): string",
+    about: "stdout lines; from/to are 1-based inclusive line numbers, tail last N; new: only output since the previous read with that cursor (every read moves it to the end). With stage: n | 'final' it returns Promise<string> of that stored stage (same as stage()).",
+    example: "out('p1', { tail: 20 })",
+  },
+  err: {
+    area: "shell",
+    sig: "err(p, opts?): string",
+    about: "stderr, same options as out() (stage too).",
+  },
+  lines: {
+    area: "shell",
+    sig: "lines(p, 'stdout' | 'stderr' = 'stdout', opts?): Table<{ n; text }>",
+    about: "same options as out(), as numbered rows.",
+  },
+  kill: {
+    area: "shell",
+    for: "stop a process",
+    sig: "kill(p, signal? = 'SIGTERM'): proc record",
+    about: "signal a command and everything it started (its process group). harnessd runs: SIGTERM to the run's process group, SIGKILL after 3s.",
+  },
+  ptree: {
+    area: "shell",
+    sig: "ptree(): Promise<Table<{ pid; ppid; depth; proc: 'p1' | null; stat; etime; command (indented by depth) }>>",
+    about: "live process tree of everything this REPL spawned, grandchildren included, plus each live harnessd run's tree (from ps).",
+  },
+  runs: {
+    area: "shell",
+    sig: "runs({ all?: boolean, session?: number, limit? = 50 }): Promise<Table<{ id: 'r12'; session; status: running|exited|killed|lost; exit_code; stages: '0:0 1:running' (index:exit|status); cmd; cwd; started; elapsed_ms; out_bytes; err_bytes }>>",
+    about: "harnessd runs newest first: this agent's by default, every agent's with all: true (or one session's).",
+  },
+  stage: {
+    area: "shell",
+    sig: "stage(run: 'r12' | Proc, i: number | 'final' = 'final', { stream?: 'out' | 'err' = 'out', from?, to?, tail?, new?, cursor? }): Promise<string>",
+    about: "stored output of one pipeline stage of any agent's run (works while it runs: new: true tails it); 'final' = what the caller saw (stdout of each pipeline's last stage; stream 'err' = all stderr).",
+  },
+  runInfo: {
+    area: "shell",
+    sig: "runInfo(run: 'r12' | Proc): Promise<{ id; cmd; cwd; session; parent; status; exit_code; signal; start_ms; end_ms; pipelines: { op: ';'|'&&'|'||'|null; stages: number[] }[]; stages: Table<{ i; text; pipeline; pid; exit_code; signal; status: pending|running|done|skipped|unknown; start_ms; end_ms; stdout_bytes; stderr_bytes }>; procs?: live process tree while running }>",
+    about: "the run graph for one command.",
+  },
+};
