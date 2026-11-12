@@ -1,4 +1,4 @@
-about = "A body edit makes that function's code again and no other's, runs and verifies a number of engine memos that does not grow with std, and taking it back makes nothing."
+about = "A body edit makes that function's code again and no other's, runs and verifies a number of engine memos that does not grow with std, and taking it back makes nothing. The first edit after the cold build is known to cost more (rev2); the edits after it (rev4, rev5) are held to the bounds."
 drivers = ["sim", "real"]
 
 [[revision]]
@@ -27,3 +27,19 @@ redone = []
 max_executed = 200
 max_verified = 2000
 bytes = true
+
+[[revision]]
+action = "run"
+prints = "21 4\n"
+redone = ["app::f"]
+max_executed = 200
+max_verified = 2000
+link = "spliced"
+
+[[revision]]
+action = "run"
+prints = "31 4\n"
+redone = ["app::f"]
+max_executed = 200
+max_verified = 2000
+link = "spliced"
