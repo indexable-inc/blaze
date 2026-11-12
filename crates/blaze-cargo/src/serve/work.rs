@@ -957,6 +957,18 @@ pub trait Writer<S: Steps>: Send + 'static {
     fn still(&self) -> Result<Vec<(String, ::span::Edition)>, String> {
         Err("its front end does not say which sources it held by code text".to_owned()) // alloc: a reason, once a build
     }
+    /// On the loop, where [`Writer::still`] is asked: the variables of the request's
+    /// environment that the build's steps asked for by name (a build script's or its
+    /// programs' traced reads of a variable, a crate's `env!` and `option_env!`), each at
+    /// least once, in any order. With the variables a step reads without asking
+    /// (`serve::job::read_unasked`) they are all of the environment the build's answer rests
+    /// on, so the no-op lane says it again whatever a variable nothing read holds
+    /// (`serve::job::noop`, "The request's environment"). Or why they are not all known: a
+    /// reason, and then every variable is compared. It runs no query and reads no file: what
+    /// the build noted. A front end that does not say names none it can vouch for.
+    fn env_named(&self) -> Result<Vec<String>, String> {
+        Err("its front end does not say which variables its steps read by name".to_owned()) // alloc: a reason, once a build
+    }
     /// Under `-v`: the note of what storing the kept front end this build lowered into did with
     /// the goals its build offered to the persistent goal cache. None when nothing was kept.
     fn goals_noted(&self) -> Option<blaze_api::Diagnostic>;

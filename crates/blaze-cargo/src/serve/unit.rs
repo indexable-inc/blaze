@@ -1274,6 +1274,36 @@ impl Writer<Real> for UnitWriter {
             .collect()) // alloc: once a build that walked and made nothing
     }
 
+    /// The variables of the request's environment this build's steps asked for by name:
+    /// what each build script's kept run was checked against by name ([`script::ReadBytes`],
+    /// noted as [`script::fresh`] found it kept), what any unit record of this process was
+    /// looked up or filed by ([`reads::named_env`]: its crates' `env!` and `option_env!`),
+    /// what the front end's crates read that way ([`base_db::process_env_reads`]) and what the
+    /// daemon read into what it keeps with the front end ([`deps::Session::env_read`]). More
+    /// names than this build's own is sound (a name more is a variable more compared); a
+    /// name less is not, so: none, with the reason, when a build script's run was not found
+    /// kept by `fresh` (its reads are not noted).
+    fn env_named(&self) -> Result<Vec<String>, String> {
+        let job = &self.job;
+        let noted = job.script_reads.lock();
+        for (unit, it) in job.units().graph.units.iter().enumerate() {
+            if it.mode == Mode::RunCustomBuild && !noted.noted(unit) {
+                // alloc: a reason, once a build
+                return Err(format!(
+                    "the variables the build script of {} read are not noted: its run was not found kept as the build began",
+                    it.pkg_id
+                ));
+            }
+        }
+        let mut names = noted.env.clone(); // clone: once a build that walked and made nothing
+        drop(noted);
+        names.extend(reads::named_env());
+        names.extend(base_db::process_env_reads(self.front.db()).into_iter().map(|(_, name)| name));
+        // alloc: a name each, once a build that walked and made nothing
+        names.extend(self.session.env_read().names().map(|(name, _)| name.to_owned()));
+        Ok(names)
+    }
+
     fn keep(mut self) -> Result<KeptLowered, ApiError> {
         // The writes still asked for are applied. With none, only that no reader is alive is
         // asked: a release that is due stays for the task that stores the front end.

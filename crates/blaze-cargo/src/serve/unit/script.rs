@@ -823,6 +823,12 @@ pub(crate) struct ReadBytes {
     /// A run hashed everything below a directory (`rerun-if-changed` of one, or a package
     /// whole): any file may be under it.
     pub(crate) trees: bool,
+    /// The variables the runs were checked against by name: each one a kept run, or a
+    /// program it started, asked for (`env::var`, `getenv`; a `rerun-if-env-changed`). What
+    /// the no-op lane compares of the request's environment for the scripts' sake, beside
+    /// what a walk of the environment sees (`UnitWriter::env_named`). A name that is not
+    /// text names no variable of a request, whose environment is text.
+    pub(crate) env: Vec<String>,
 }
 
 impl ReadBytes {
@@ -835,6 +841,7 @@ impl ReadBytes {
         self.runs.push(unit as u32);
         self.names.extend(read.names);
         self.trees |= read.trees;
+        self.env.extend(read.env);
     }
 
     /// Whether the reads of run `unit` are noted.
@@ -874,10 +881,15 @@ impl<I: blaze_usercode::trace::Inputs> blaze_usercode::trace::Inputs for Noting<
     }
 
     fn env(&mut self, name: &std::ffi::OsStr) -> Option<&std::ffi::OsStr> {
+        if let Some(name) = name.to_str() {
+            self.read.env.push(name.to_owned()); // alloc: a name, once a variable a kept run read
+        }
         self.inner.env(name)
     }
 
     fn env_all(&mut self) -> &[(OsString, OsString)] {
+        // What a walk of the environment sees is a fixed set, compared for every answer
+        // (`serve::job::read_unasked`): nothing to note.
         self.inner.env_all()
     }
 

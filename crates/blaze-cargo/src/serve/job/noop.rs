@@ -991,6 +991,7 @@ impl<H> Answers<H> {
     }
 
     /// The answer kept of `shape`.
+    #[cfg(test)]
     pub(super) fn answer(&self, shape: &ContentId) -> Option<&LastAnswer> {
         self.at(shape).and_then(|at| self.shapes[at].last.as_ref().ok())
     }

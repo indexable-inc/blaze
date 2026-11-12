@@ -50,6 +50,33 @@ const DOMAIN: &str = "blaze v2 cargo unit record reads 4";
 /// The first byte of a slot's bytes: the version of [`Reads::encode`].
 const VERSION: u8 = 4;
 
+/// Every process variable a record's reads named in a lookup or a filing in this process
+/// ([`Reads::hash`]): the `env!` and `option_env!` reads a unit record is found or kept by.
+/// What the no-op lane compares of a request's environment for the records' sake
+/// ([`named_env`]). The process's, not a job's: a name another checkout's record read is a
+/// variable more compared, never one missed. A few names (the variables crates read at
+/// compile time), each once.
+static NAMED: blaze_core::lock::Lock<Vec<String>> =
+    blaze_core::lock::Lock::new("serve.unit.reads.named", Vec::new());
+
+/// Each of `names` noted in [`NAMED`].
+fn note_named(names: &[String]) {
+    if names.is_empty() {
+        return;
+    }
+    let mut named = NAMED.lock();
+    for name in names {
+        if !named.contains(name) {
+            named.push(name.clone()); // clone: a name, once for the process's life
+        }
+    }
+}
+
+/// The process variables any record's reads named in this process so far ([`NAMED`]).
+pub(crate) fn named_env() -> Vec<String> {
+    NAMED.lock().clone() // clone: once a build that walked and made nothing
+}
+
 /// How many sets of names one base key keeps. A crate's code reads other names only where a
 /// value it read picks them (`env!(concat!(env!("A"), ..))`), so one in practice.
 pub(crate) const SLOTS: u32 = hir_def::deps::SLOTS;
@@ -461,6 +488,9 @@ impl Reads {
             |name: &str| env.iter().find(|(it, _)| it == name).map(|(_, value)| value.as_bytes());
         let mut hasher = Hasher::new(DOMAIN);
         hasher.part(b"values");
+        // Every lookup and every filing of a record by its reads passes here: the names
+        // are noted for the no-op lane, which compares them of a later request.
+        note_named(&self.names);
         for name in &self.names {
             hasher.opt_part(var(name));
         }
