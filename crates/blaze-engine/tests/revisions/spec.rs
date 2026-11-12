@@ -92,6 +92,18 @@ pub enum Step {
     Touch(String),
     /// A command whose outcome only has to be success: `build`, `run`, `check`, `test`.
     Do(Action),
+    /// `run`, started and left running: the program keeps running across the revisions that
+    /// follow, until [`Step::End`] or the test's end. Only the real driver has a process.
+    Start,
+    /// The running program's standard output holds `text` no later than `within_ms` after
+    /// the last edit step (after [`Step::Start`], with none since): how long a save takes to
+    /// reach a running program.
+    Await { within_ms: u64, text: String },
+    /// The running program's standard output so far holds `text` exactly `times` times: a
+    /// program that prints a line as it starts did not start again.
+    Count { times: u64, text: String },
+    /// The running program is ended.
+    End,
 }
 
 /// What must come of a revision's action. Every list is of function paths as `blaze why`
@@ -188,12 +200,26 @@ fn step(word: &str, at: &str) -> Step {
         "edit by truncate then write" => Step::EditTruncateWrite,
         "stop" => Step::Stop,
         "kill" => Step::Kill,
+        "start" => Step::Start,
+        "end" => Step::End,
         _ => match word.split_once(' ') {
             Some(("touch", path)) => Step::Touch(path.to_owned()),
+            Some((which @ ("await" | "count"), rest)) => {
+                let (number, text) = rest.split_once(' ').unwrap_or_else(|| {
+                    panic!("{at}: `{word}`: `await MS TEXT` or `count TIMES TEXT`")
+                });
+                let number: u64 =
+                    number.parse().unwrap_or_else(|_| panic!("{at}: `{word}`: `{number}` is no number"));
+                match which {
+                    "await" => Step::Await { within_ms: number, text: text.to_owned() },
+                    _ => Step::Count { times: number, text: text.to_owned() },
+                }
+            }
             _ => Step::Do(Action::of(word).unwrap_or_else(|| {
                 panic!(
                     "{at}: no step `{word}`: `edit`, `edit by rename`, `edit by truncate then write`, `stop`, \
-                     `kill`, `touch PATH`, `check`, `build`, `run`, `test`"
+                     `kill`, `touch PATH`, `start`, `await MS TEXT`, `count TIMES TEXT`, `end`, `check`, `build`, \
+                     `run`, `test`"
                 )
             })),
         },

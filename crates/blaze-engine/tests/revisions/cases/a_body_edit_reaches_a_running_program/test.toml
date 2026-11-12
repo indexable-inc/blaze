@@ -1,0 +1,18 @@
+about = "Under blaze's launcher a body edit reaches a program that keeps running: after each save and build its output changes within the bound, and the program, which prints a line as it starts, started once."
+drivers = ["real"]
+
+[[revision]]
+action = "build"
+env = { BLAZE_LAUNCH = "1" }
+
+[[revision]]
+steps = ["start", "await 120000 value 1", "edit"]
+action = "build"
+
+[[revision]]
+steps = ["await 30000 value 2", "count 1 started", "edit"]
+action = "build"
+
+[[revision]]
+steps = ["await 5000 value 3", "count 1 started", "end"]
+action = "build"

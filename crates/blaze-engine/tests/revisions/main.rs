@@ -48,6 +48,7 @@ macro_rules! real {
 }
 
 real! {
+    a_body_edit_reaches_a_running_program
     a_body_edit_remakes_one_function
     a_broken_revision_fails_and_recovers
     a_cfg_twin_chosen_by_a_build_script
