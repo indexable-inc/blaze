@@ -1779,8 +1779,15 @@ fn a_pack_a_batch_waiting_on_its_maps_moves_records_into_is_not_retired() {
     flush(&mut sim, &mut store);
     settle(&mut sim, &mut store);
     settle(&mut sim, &mut store);
-    let settled = settle(&mut sim, &mut store);
-    assert_eq!(settled.demoted, 12, "{settled:?}");
+    // A step with room for eleven of the twelve moves, so none for the pack's rewrite: a
+    // whole settle would retire pack 0 as it leaves it dead, the pack its unit appends to or
+    // not.
+    assert!(store.end_period());
+    let mut effects = Vec::new();
+    let most: u64 = keys[..12].iter().map(|&n| value(n).len() as u64).sum();
+    let settled = store.settle_step(most - 1, &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    assert_eq!((settled.demoted, settled.retired, settled.more), (11, 0, true), "{settled:?}");
     for &n in &keys[12..] {
         store.put(key(n), Kind::Code, &value(n)).unwrap();
     }
@@ -3364,6 +3371,94 @@ fn what_is_unread_for_two_periods_goes_cold_and_what_is_read_stays_hot() {
         assert_eq!(bytes_of(&store, &key(n)).unwrap(), text(n, 8 << 10), "{n}");
     }
     assert_eq!(form_of(&store, &key(4)), Form::Zstd);
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+/// Ends a period and makes its moves in steps of at most `most` bytes each, a commit after
+/// each, as the daemon's loop does between requests: what all the steps did, summed.
+fn settle_in_steps(sim: &mut Sim, store: &mut Store, most: u64) -> Settled {
+    let mut all = Settled::default();
+    if !store.end_period() {
+        all.more = true;
+        return all;
+    }
+    // Bounded: a plan lists each record once, and a step moves at least one.
+    for _ in 0..100_000 {
+        let mut effects = Vec::new();
+        let settled = store.settle_step(most, &mut effects);
+        drive(sim, store, &mut effects);
+        all.demoted += settled.demoted;
+        all.promoted += settled.promoted;
+        all.retired += settled.retired;
+        if !settled.more {
+            assert!(!store.settling(), "a step that says no more left a plan");
+            return all;
+        }
+    }
+    panic!("the steps of one period's plan did not end: {all:?}");
+}
+
+/// The daemon's settle: a period's end plans, steps of a bounded number of bytes move. Small
+/// steps move what one whole settle moves, a record read between two steps stays hot though
+/// the plan listed it, and a store of one pack gives its dead bytes back: the pack its unit
+/// appends to is rewritten and removed with its dictionary moved on, where it used to stay for
+/// good (a home's `pack-000000`).
+#[test]
+fn a_period_s_moves_made_in_steps_are_a_settle_s_and_one_pack_gives_its_dead_bytes_back() {
+    let mut sim = Sim::new(34, quiet());
+    let mut store = open(&mut sim, "store");
+    let count = cold::TRAIN_VALUES as u64 + 40;
+    let value = |n: u64| text(n, 6 << 10);
+    for n in 0..count {
+        store.put(key(n), Kind::Code, &value(n)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    assert_eq!(settle_in_steps(&mut sim, &mut store, 4 << 10), Settled::default());
+    assert_eq!(settle_in_steps(&mut sim, &mut store, 4 << 10), Settled::default());
+    // The third period's end lists every record; its first step moves one, then key 7 is read.
+    assert!(store.end_period());
+    let mut effects = Vec::new();
+    let first = store.settle_step(1, &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    assert_eq!((first.demoted, first.more), (1, true), "{first:?}");
+    assert_eq!(bytes_of(&store, &key(7)).unwrap(), value(7));
+    let mut demoted = first.demoted;
+    let mut retired = 0;
+    for _ in 0..100_000 {
+        let mut effects = Vec::new();
+        // Each step's commit ends its pack on a block, so few steps: little padding.
+        let settled = store.settle_step(200 << 10, &mut effects);
+        drive(&mut sim, &mut store, &mut effects);
+        demoted += settled.demoted;
+        retired += settled.retired;
+        if !settled.more {
+            break;
+        }
+    }
+    assert!(!store.settling());
+    assert_eq!(form_of(&store, &key(7)), Form::Raw, "read after its period ended: it stays hot");
+    assert_eq!(demoted, count - 1, "every other record moved cold");
+    assert_eq!(store.tiers[0].dictionaries.len(), 1, "the kind's dictionary was trained");
+    // What the steps left dead is given back: the first pack goes, though its unit appended to
+    // it and it held the dictionary.
+    let rest = settle_in_steps(&mut sim, &mut store, 16 << 10);
+    assert!(retired + rest.retired >= 1, "{rest:?}");
+    assert!(store.tiers[0].packs[0].removed, "the first pack is removed");
+    assert!(!sim.exists(&name("store/pack-000000")), "its file is gone");
+    assert_ne!(store.tiers[0].dictionaries[0].pack, 0, "the dictionary moved on with the rest");
+    let live: u64 = store.tiers[0].packs.iter().filter(|it| !it.removed).map(|it| it.committed).sum();
+    assert!(live < count * (6 << 10) / 2, "{live} bytes of packs hold {count} values of 6 KiB");
+    for n in 0..count {
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), value(n), "{n}");
+    }
+    assert_eq!(store.verify(None), Vec::new());
+    flush(&mut sim, &mut store);
+    drop(store);
+    let store = open(&mut sim, "store");
+    for n in 0..count {
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), value(n), "{n} after a reopen");
+    }
+    assert_eq!(form_of(&store, &key(8)), Form::Zstd);
     assert_eq!(store.verify(None), Vec::new());
 }
 

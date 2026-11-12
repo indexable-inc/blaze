@@ -974,6 +974,9 @@ pub struct Store {
     /// How many times the own tier's read flags have rotated since its rows were last
     /// numbered afresh: a record is unread for two periods only once there have been two.
     periods: u32,
+    /// What the last period's end ([`Store::end_period`]) planned and no
+    /// [`Store::settle_step`] has made yet.
+    moves: Option<Moves>,
     /// The encodings of each schema whose values it keeps in columns.
     columns: Arc<Encodings>,
     /// The other writers of its directory's shared one ([`Store::open_shared`]).
@@ -1298,6 +1301,19 @@ pub struct Settled {
     pub retired: u64,
     /// It stopped at its budget, or could not start while a commit was in flight: call again.
     pub more: bool,
+}
+
+/// The moves between tiers a period's end planned ([`Store::plan_moves`]), and how far they
+/// are made.
+struct Moves {
+    /// To move colder, by kind and then by place; `demoted` of them are done. Each with its
+    /// row as the plan found it, which only the settle that made the plan may use: a step
+    /// comes after commits, and an index swap between two numbers the rows afresh.
+    demote: Vec<(Key, Loc, Row)>,
+    demoted: usize,
+    /// To move hot, by place; `promoted` of them are done.
+    promote: Vec<(Key, Loc, Row)>,
+    promoted: usize,
 }
 
 /// Why a record's bytes are wanted, which decides whether its check is remembered and
@@ -1956,6 +1972,7 @@ impl Store {
             new_keys: None,
             epoch: 0,
             periods: 0,
+            moves: None,
             columns,
             peers,
             staging,
@@ -2251,9 +2268,9 @@ impl Store {
     /// colder: a value of a schema it was given encodings for ([`Store::encode_columns`]) goes
     /// from hot to warm columns (or straight to cold where warm saves too little) and from warm
     /// to cold columns; any other goes from raw or LZ4 to zstd. A record read in two periods
-    /// running moves hot. The daemon
-    /// calls it when idle, never on the way of a get or a put, and it moves a bounded number of
-    /// bytes a call.
+    /// running moves hot. It moves a bounded number of bytes a call ([`SETTLE_MOST`]), which
+    /// is still far more than a caller with someone waiting can afford: the daemon's loop ends
+    /// its periods with [`Store::end_period`] and moves in [`Store::settle_step`]s.
     pub fn settle(&mut self, effects: &mut Vec<Effect>) -> Settled {
         assert!(self.tiers[0].opened, "a settle of a store that is not open");
         self.tidy();
@@ -2265,10 +2282,76 @@ impl Store {
             settled.more = true;
             return settled;
         }
-        let mut spent: u64 = 0;
-        // What short cold records took of `spent`, and whether some were left for the next.
-        let (mut spent_short, mut more_short) = (0u64, false);
-        let encodings = Arc::clone(&self.columns);
+        // What an earlier period's steps left is planned again from this period's flags.
+        self.moves = None;
+        let mut moves = self.plan_moves();
+        let settled = self.work_moves(&mut moves, SETTLE_MOST, SHORT_MOST, false);
+        self.rotate_period();
+        self.start_commit(effects);
+        settled
+    }
+
+    /// Ends a period of reading and plans what its end moves ([`Store::settle`]'s rule), moving
+    /// nothing: [`Store::settle_step`] does the moves, a bounded number of bytes a call.
+    /// `false`, and no period ended, while the store cannot plan (it is broken, or a commit, an
+    /// index swap or its fold is in flight): ask again later. What an earlier period's steps
+    /// had not reached is planned again, by this period's flags.
+    pub fn end_period(&mut self) -> bool {
+        assert!(self.tiers[0].opened, "a period ended of a store that is not open");
+        self.tidy();
+        if self.broken.is_some()
+            || self.commit.is_some()
+            || self.index_mapping
+            || self.migrating.is_some()
+        {
+            return false;
+        }
+        let moves = self.plan_moves();
+        self.rotate_period();
+        self.moves = Some(moves);
+        true
+    }
+
+    /// Whether a period's end left moves a [`Store::settle_step`] has not made.
+    pub fn settling(&self) -> bool {
+        self.moves.is_some()
+    }
+
+    /// One step of the moves the last [`Store::end_period`] planned: at most `most` bytes of
+    /// values moved (one value, however long, when nothing was moved yet), then a commit of
+    /// what moved. `more` while the plan has moves left, or the step could not run (a commit
+    /// in flight): call again. A record read since the period ended is left where it is.
+    ///
+    /// A step compresses on the caller's thread: about `most` bytes at zstd's level 6, so a
+    /// caller that must answer within a bound chooses `most` by it.
+    pub fn settle_step(&mut self, most: u64, effects: &mut Vec<Effect>) -> Settled {
+        assert!(self.tiers[0].opened, "a settle of a store that is not open");
+        self.tidy();
+        let mut settled = Settled::default();
+        if self.broken.is_some() {
+            self.moves = None;
+            return settled;
+        }
+        let Some(mut moves) = self.moves.take() else { return settled };
+        if self.commit.is_some() || self.index_mapping || self.migrating.is_some() {
+            self.moves = Some(moves);
+            settled.more = true;
+            return settled;
+        }
+        // An index swap since the plan numbered the rows afresh. The plan stands: a step
+        // finds each record by its key again and never by the plan's row.
+        let settled = self.work_moves(&mut moves, most, u64::MAX, true);
+        if settled.more && self.broken.is_none() {
+            self.moves = Some(moves);
+        }
+        if settled.demoted + settled.promoted + settled.retired > 0 {
+            self.start_commit(effects);
+        }
+        settled
+    }
+
+    /// The moves the period ending now asks for, in the order they are made.
+    fn plan_moves(&mut self) -> Moves {
         let (mut demote, mut promote) = self.tier_moves();
         radix::sort_by_key(&mut demote, |(_, loc, _)| {
             (u128::from(loc.kind.code()) << 96) | radix::pack_64(u64::from(loc.pack), loc.offset)
@@ -2276,15 +2359,59 @@ impl Store {
         radix::sort_by_key(&mut promote, |(_, loc, _)| {
             radix::pack_64(u64::from(loc.pack), loc.offset)
         });
-        'kinds: for group in demote.chunk_by(|a, b| a.1.kind == b.1.kind) {
-            let kind = group[0].1.kind;
+        Moves { demote, demoted: 0, promote, promoted: 0 }
+    }
+
+    /// The period of reading ended: this period's flags are the period before's.
+    fn rotate_period(&mut self) {
+        let own = &self.tiers[0];
+        if let Some(index) = &own.index {
+            index.bits.rotate();
+        }
+        own.delta.rotate(Flag::Read as usize, Flag::ReadBefore as usize);
+        own.delta.rotate(Flag::New as usize, Flag::NewBefore as usize);
+        self.periods = self.periods.saturating_add(1);
+    }
+
+    /// Whether the record of `key` at `loc` was read since the period ended whose plan
+    /// listed it (a step's question: the flags rotated before its plan's moves began).
+    fn read_since(&self, key: &Key, loc: Loc) -> bool {
+        match self.look().find(key) {
+            Some(Ok(found)) if found.place == Place::Pack(loc) => found.at.get(Flag::Read),
+            _ => false,
+        }
+    }
+
+    /// Makes the moves of `moves` from where the last call left them: at most `most` bytes of
+    /// values (the first whatever its length), of which short cold records get `short_most`.
+    /// `stepped`: the plan's period ended before this call (a [`Store::settle_step`]), so a
+    /// record read since stays, and a row is its key's row now, not the plan's.
+    fn work_moves(
+        &mut self,
+        moves: &mut Moves,
+        most: u64,
+        short_most: u64,
+        stepped: bool,
+    ) -> Settled {
+        let mut settled = Settled::default();
+        let mut spent: u64 = 0;
+        // What short cold records took of `spent`, and whether some were left for the next.
+        let (mut spent_short, mut more_short) = (0u64, false);
+        let encodings = Arc::clone(&self.columns);
+        'kinds: while moves.demoted < moves.demote.len() {
+            let from = moves.demoted;
+            let kind = moves.demote[from].1.kind;
+            let to = from
+                + moves.demote[from..].iter().take_while(|(_, loc, _)| loc.kind == kind).count();
             if self.dictionary_of(kind).is_none() {
                 // Long records are not sampled, as `put` does not sample them: a few would fill the
                 // samples with too few values and give the kind up.
                 let long = cold::LONG_FROM as u64;
-                for &(_, loc, _) in
-                    group.iter().filter(|(_, loc, _)| loc.form == Form::Raw && loc.raw < long)
-                {
+                for at in from..to {
+                    let (_, loc, _) = moves.demote[at];
+                    if loc.form != Form::Raw || loc.raw >= long {
+                        continue;
+                    }
                     // The samples are full (and trained, or gave up) or the kind gave up: a
                     // copy would be kept as no sample.
                     if !self.training[kind.code() as usize].wants_samples() {
@@ -2325,26 +2452,34 @@ impl Store {
                     return settled;
                 }
             };
-            for &(key, loc, row) in group {
+            for at in from..to {
+                let (key, loc, row) = moves.demote[at];
                 let short = loc.raw < DEMOTE_FROM;
                 // A short cold record is listed while its kind has no dictionary only to be
                 // sampled (`tier_moves`). It is not moved yet: without the dictionary it saves
                 // too little, and would be marked tried and never moved once one is trained.
                 if short && number.is_none() {
+                    moves.demoted = at + 1;
                     continue;
                 }
                 // A short record costs a record's work: counted as `DEMOTE_FROM` bytes, so a
                 // settle of many short records stays a short step too. They have at most
-                // `SHORT_MOST` of a settle, so a backlog of them leaves the rest of the step to
+                // `short_most` of a settle, so a backlog of them leaves the rest of the step to
                 // longer records, promotion and retiring.
                 let cost = loc.raw.max(DEMOTE_FROM);
-                if short && spent_short.saturating_add(cost) > SHORT_MOST {
+                if short && spent_short.saturating_add(cost) > short_most {
                     more_short = true;
+                    moves.demoted = at + 1;
                     continue;
                 }
-                if spent > 0 && spent.saturating_add(cost) > SETTLE_MOST {
+                if spent > 0 && spent.saturating_add(cost) > most {
                     settled.more = true;
+                    moves.demoted = at;
                     break 'kinds;
+                }
+                moves.demoted = at + 1;
+                if stepped && self.read_since(&key, loc) {
+                    continue;
                 }
                 let Some((content, bytes)) = self.movable(key, loc) else { continue };
                 spent += cost;
@@ -2357,11 +2492,11 @@ impl Store {
                             self.replace(key, loc, form, 0, content, &payload);
                             settled.demoted += 1;
                         }
-                        Ok(None) => self.set_flag(row, Flag::Tried),
+                        Ok(None) => self.set_tried(key, loc, row, stepped),
                         Err(why) => {
                             // alloc: a problem reported, an encoding that failed
                             self.problems.push(format!("{:x} is not moved colder: {why}", key.0));
-                            self.set_flag(row, Flag::Tried);
+                            self.set_tried(key, loc, row, stepped);
                         }
                     }
                     continue;
@@ -2377,7 +2512,7 @@ impl Store {
                     }
                 };
                 if stored.len() as u64 + loc.raw / 8 > loc.raw {
-                    self.set_flag(row, Flag::Tried);
+                    self.set_tried(key, loc, row, stepped);
                     continue;
                 }
                 let dictionary = if long { NO_DICTIONARY } else { number.unwrap_or(NO_DICTIONARY) };
@@ -2385,11 +2520,13 @@ impl Store {
                 settled.demoted += 1;
             }
         }
-        for (key, loc, row) in promote {
-            if settled.more || (spent > 0 && spent.saturating_add(loc.raw) > SETTLE_MOST) {
+        while moves.promoted < moves.promote.len() {
+            let (key, loc, _) = moves.promote[moves.promoted];
+            if settled.more || (spent > 0 && spent.saturating_add(loc.raw) > most) {
                 settled.more = true;
                 break;
             }
+            moves.promoted += 1;
             let Some((content, bytes)) = self.movable(key, loc) else { continue };
             spent += loc.raw;
             match (loc.kind == Kind::Output).then(|| cold::lz4(&bytes)).flatten() {
@@ -2404,30 +2541,70 @@ impl Store {
             }
             let Some(live) = self.live_records(at) else { continue };
             let bytes: u64 = live.iter().map(|(header, _)| header.span()).sum();
-            if spent > 0 && spent + bytes > SETTLE_MOST {
+            if spent > 0 && spent + bytes > most {
                 settled.more = true;
                 break;
             }
             spent += bytes;
             let unit = Unit(self.tiers[0].packs[at].unit);
+            // Before anything of it is written again: what is copied on, and the dictionaries
+            // it holds, go to a pack that stays (`writable_pack` passes a retiring one by).
+            self.tiers[0].packs[at].retiring = true;
             for (header, payload) in live {
                 self.rehome(unit, header, &payload);
             }
-            self.tiers[0].packs[at].retiring = true;
+            self.move_dictionaries(at);
             settled.retired += 1;
         }
         // Short records left by their share are more to do, said only now: `settled.more` set
         // earlier would stop promotion and retiring in this settle.
         settled.more |= more_short;
-        let own = &self.tiers[0];
-        if let Some(index) = &own.index {
-            index.bits.rotate();
-        }
-        own.delta.rotate(Flag::Read as usize, Flag::ReadBefore as usize);
-        own.delta.rotate(Flag::New as usize, Flag::NewBefore as usize);
-        self.periods = self.periods.saturating_add(1);
-        self.start_commit(effects);
         settled
+    }
+
+    /// A record whose move colder saved too little is not tried again: by its row as the plan
+    /// had it, or, in a step (an index swap between steps numbers rows afresh), by the row its
+    /// key has now.
+    fn set_tried(&self, key: Key, loc: Loc, row: Row, stepped: bool) {
+        if !stepped {
+            return self.set_flag(row, Flag::Tried);
+        }
+        if let Some(Ok(found)) = self.look().find(&key)
+            && found.place == Place::Pack(loc)
+        {
+            found.at.set(Flag::Tried);
+        }
+    }
+
+    /// Writes the dictionaries the own pack `at` holds again, into a pack that stays, and
+    /// names them there: the pack is retiring, and the head that names it removed names each
+    /// dictionary's new place, written by the same commit before that head.
+    fn move_dictionaries(&mut self, at: usize) {
+        for number in 0..self.tiers[0].dictionaries.len() {
+            let dictionary = &self.tiers[0].dictionaries[number];
+            if dictionary.pack as usize != at {
+                continue;
+            }
+            // clone: an `Arc`, once per dictionary of a pack retired (idle)
+            let Ok(prepared) = dictionary.bytes.clone() else {
+                unreachable!("`retirable` leaves a pack holding a dictionary that did not load")
+            };
+            let kind = dictionary.kind;
+            let bytes = prepared.bytes();
+            let header = RecordHeader {
+                kind,
+                form: Form::Dictionary,
+                dictionary: 0,
+                stored: bytes.len() as u64,
+                raw: bytes.len() as u64,
+                key: Key(ContentId::of(DICTIONARY_DOMAIN, bytes)),
+                content: content_of(bytes),
+            };
+            let loc = self.append_record(Unit::SHARED, header, bytes);
+            let dictionary = &mut self.tiers[0].dictionaries[number];
+            dictionary.pack = loc.pack;
+            dictionary.offset = loc.offset;
+        }
     }
 
     /// The own tier's records in its packs to move cold and to move hot, as of the period
@@ -2567,9 +2744,13 @@ impl Store {
         delta.set_flag(row, Flag::New as usize);
     }
 
-    /// The own packs that are at least half dead bytes, wholly committed, not the one their
-    /// kind appends to, holding no dictionary, and no pack a batch whose moves wait moves
-    /// records into. Maps answer in any order (a driver answers each as it ends; the sim
+    /// The own packs that are at least half dead bytes, wholly committed (nothing drained
+    /// waits in them for a commit), holding no dictionary that did not load (one that loaded
+    /// is written again where the live records go, [`Store::move_dictionaries`]), and no pack
+    /// a batch whose moves wait moves records into. The pack its unit appends to is one of
+    /// them: what is copied out of it, and every later append, goes to a new pack
+    /// ([`Store::writable_pack`]), so a store of one pack gives its dead bytes back too. Maps answer in any order (a driver
+    /// answers each as it ends; the sim
     /// shuffles what is due), so such a pack can be mapped while its batch waits on another
     /// file's map: its records are not yet what their keys find, so `live_records` would
     /// leave them out, and the batch would then point their keys into the removed pack.
@@ -2590,9 +2771,10 @@ impl Store {
                     && pack.usable == pack.committed
                     && pack.committed > PACK_HEADER
                     && pack.dead * 2 >= pack.committed - PACK_HEADER
-                    && own.packs.iter().rposition(|it| it.unit == pack.unit && !it.removed)
-                        != Some(at)
-                    && !own.dictionaries.iter().any(|it| it.pack as usize == at)
+                    && !own
+                        .dictionaries
+                        .iter()
+                        .any(|it| it.pack as usize == at && it.bytes.is_err())
             })
             // alloc: once a settle (idle), the packs it may rewrite, which it appends to as it goes
             .collect()
@@ -4837,7 +5019,10 @@ impl Store {
     /// The own pack of `kind` a record of `span` bytes goes into, made if none has room.
     fn writable_pack(&mut self, unit: Unit, span: u64) -> usize {
         let own = &mut self.tiers[0];
-        if let Some(at) = own.packs.iter().rposition(|it| it.unit == unit.0 && !it.removed) {
+        // A retiring pack takes no more: the next head names it removed.
+        if let Some(at) =
+            own.packs.iter().rposition(|it| it.unit == unit.0 && !it.removed && !it.retiring)
+        {
             let pack = &own.packs[at];
             if pack.end == PACK_HEADER || pack.end + span <= PACK_MOST {
                 return at;
