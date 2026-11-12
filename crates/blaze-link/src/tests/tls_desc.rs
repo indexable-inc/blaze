@@ -112,7 +112,7 @@ fn initial_exec(words: &[u32]) -> usize {
 }
 
 /// The dynamic relocations of `r_type`, each as the name of its symbol ("" for none).
-fn dynamic(file: &ElfFile64<'_, Endianness>, r_type: u32) -> Vec<String> {
+fn dynamic(file: &ElfFile64<'_, Endianness>, r_type: elf::RelocationType) -> Vec<String> {
     use object::ObjectSymbolTable as _;
     let mut out: Vec<String> = file
         .dynamic_relocations()
@@ -172,8 +172,8 @@ fn an_executables_tls_descriptors_are_relaxed_and_it_reads_its_thread_locals() {
     // Initial exec: `imported`, read in two places through one cell.
     assert_eq!(initial_exec(&words), 2, "`imported`, read in two places");
     assert!(!words.contains(&BLR_X1), "no descriptor is called");
-    assert_eq!(dynamic(&file, elf::R_AARCH64_TLS_TPREL64.0), ["imported"]);
-    assert_eq!(dynamic(&file, elf::R_AARCH64_TLSDESC.0), [""; 0]);
+    assert_eq!(dynamic(&file, elf::R_AARCH64_TLS_TPREL), ["imported"]);
+    assert_eq!(dynamic(&file, elf::R_AARCH64_TLSDESC), [""; 0]);
 
     if !host {
         return;
@@ -213,6 +213,6 @@ fn a_shared_librarys_tls_descriptors_are_kept() {
     let words = code(&file);
     assert_eq!(words.iter().filter(|it| **it == BLR_X1).count(), 6, "each descriptor is called");
     assert_eq!((local_exec(&words), initial_exec(&words)), (Vec::new(), 0), "none is relaxed");
-    assert_eq!(dynamic(&file, elf::R_AARCH64_TLSDESC.0), ["", "", "imported"]);
-    assert_eq!(dynamic(&file, elf::R_AARCH64_TLS_TPREL64.0), [""; 0]);
+    assert_eq!(dynamic(&file, elf::R_AARCH64_TLSDESC), ["", "", "imported"]);
+    assert_eq!(dynamic(&file, elf::R_AARCH64_TLS_TPREL), [""; 0]);
 }

@@ -1794,7 +1794,9 @@ fn a_start_symbol_of_no_section_is_zero_to_a_weak_reference() {
     let linked = link(&[("counters.o", counters_object(true).into())]).unwrap();
     assert_eq!(cell(&linked), 0, "an undefined weak symbol's GOT cell holds 0");
 
-    let error = link(&[("counters.o", counters_object(false).into())]).unwrap_err();
+    let error = link(&[("counters.o", counters_object(false).into())])
+        .err()
+        .expect("a strong reference to the start of a section no input has");
     assert!(
         error.what.contains("undefined symbol `__start___libfuzzer_extra_counters`")
             && error.what.contains("no input has a section `__libfuzzer_extra_counters`"),
