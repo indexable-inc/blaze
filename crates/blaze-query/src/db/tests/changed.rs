@@ -20,6 +20,24 @@ use super::{
     *,
 };
 
+/// The thread each run of [`Flow`] was on, by the address of the database it ran in: what
+/// tells a row verified on the walker's thread from one handed to the pool.
+static RAN_ON: Lock<Vec<(usize, std::thread::ThreadId)>> =
+    Lock::new("test.query.changed.ran_on", Vec::new());
+
+/// The threads the runs of `db`'s rows were on since the last take.
+fn take_ran_on(db: &TestDb) -> Vec<std::thread::ThreadId> {
+    let of = std::ptr::from_ref(db).addr();
+    let mut own = Vec::new();
+    RAN_ON.lock().retain(|&(it, thread)| {
+        if it == of {
+            own.push(thread);
+        }
+        it != of
+    });
+    own
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FlowOp {
     /// The sum of every read.
@@ -55,6 +73,7 @@ impl Spec for Flow {
     }
 
     fn compute(db: &TestDb, key: Node) -> u64 {
+        RAN_ON.lock().push((std::ptr::from_ref(db).addr(), std::thread::current().id()));
         let at = *interned_fields::<Indices>(db.storage(), key.0) as usize;
         let spec = db.flow.lock()[at].clone();
         let read = |dep: Dep| match dep {
@@ -432,4 +451,60 @@ fn the_work_of_an_edit_is_its_readers_among_a_thousand_rows() {
     // Asked again in the same view: no walk, the same answer.
     assert_eq!(changed_since::<Flow>(&db, since), Changed::Keys(expected));
     assert_eq!(changed_since::<Flow>(&db, db.storage().view()), Changed::Keys(Vec::new()));
+}
+
+/// The invariant: a walk's level of fewer rows than its serial bound is verified on the
+/// walker's thread, every row, with no job handed to the pool. The rows of an edit's level
+/// read each other; as jobs they wait on each other's runs (a hello-world body edit hung so,
+/// 2026-11-11, when a level of about 55 rows was sent to the pool). 50 readers of one input,
+/// more than the small-loop predictor's 32 and fewer than the walk's 64: each runs again on
+/// the thread that asked for the changed set. Asked from a thread of no pool, so a row
+/// handed to the pool would run on a worker, never here.
+#[test]
+fn a_level_under_the_walks_serial_bound_is_verified_on_the_walkers_thread() {
+    const WIDE: usize = 50;
+    assert!(WIDE > crate::db::SMALL_ITEMS, "past the small-loop predictor's bound");
+    let flow: Vec<FlowNode> = (0..WIDE).map(|_| sum(&[Dep::Input(0)])).collect();
+    let mut db = TestDb::new();
+    *db.flow.lock() = flow;
+    let cells: Vec<Cell> = (0..2).map(|_| Cell::new(&db, 1, 0)).collect();
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
+    for at in 0..WIDE {
+        fetch::<Flow>(&db, node(&db, at));
+    }
+    take_ran_on(&db);
+    let since = db.storage().view();
+    cells[0].set_a(&mut db, 7);
+    let me = std::thread::current().id();
+    let changed = changed_since::<Flow>(&db, since);
+    let Changed::Keys(keys) = changed else { panic!("unknown: {changed:?}") };
+    assert_eq!(keys.len(), WIDE);
+    let on = take_ran_on(&db);
+    assert_eq!(on.len(), WIDE, "each reader ran again once");
+    assert!(on.iter().all(|thread| *thread == me), "a row of the level left the walker's thread");
+}
+
+/// The control of [`a_level_under_the_walks_serial_bound_is_verified_on_the_walkers_thread`]:
+/// a level at the bound or past it is the pool's, and its rows run on workers, so the oracle
+/// tells where a level ran.
+#[test]
+fn the_oracle_catches_a_level_handed_to_the_pool() {
+    const WIDE: usize = 100;
+    let flow: Vec<FlowNode> = (0..WIDE).map(|_| sum(&[Dep::Input(0)])).collect();
+    let mut db = TestDb::new();
+    *db.flow.lock() = flow;
+    let cells: Vec<Cell> = (0..2).map(|_| Cell::new(&db, 1, 0)).collect();
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
+    for at in 0..WIDE {
+        fetch::<Flow>(&db, node(&db, at));
+    }
+    take_ran_on(&db);
+    let since = db.storage().view();
+    cells[0].set_a(&mut db, 7);
+    let me = std::thread::current().id();
+    let changed = changed_since::<Flow>(&db, since);
+    assert!(matches!(changed, Changed::Keys(ref keys) if keys.len() == WIDE), "{changed:?}");
+    let on = take_ran_on(&db);
+    assert_eq!(on.len(), WIDE);
+    assert!(on.iter().any(|thread| *thread != me), "every row of a wide level ran on the walker's thread");
 }
