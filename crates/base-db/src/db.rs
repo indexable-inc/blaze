@@ -125,6 +125,22 @@ mod tests;
 
 pub use shared::{Reader, Shared};
 
+/// What a read of an included file gave, in a few words: its length and content, or its error.
+fn read_said(read: &Result<std::sync::Arc<[u8]>, crate::ReadError>) -> String {
+    match read {
+        // alloc: a moved file's event, at most [`MOVED_NAMED`] a reload
+        Ok(bytes) => format!(
+            "{} bytes, content {:?}",
+            bytes.len(),
+            IncludedFile::content_of(Ok(bytes.as_ref()))
+        ),
+        Err(error) => format!("unreadable: {error}"), // alloc: as above
+    }
+}
+
+/// The most moved files one [`Db::reload_included_files`] names in events.
+const MOVED_NAMED: usize = 16;
+
 impl Db {
     /// The database of a build: no crate, no source root, and its batches run as plane tasks
     /// of the process's pool. What the crates above need set before a query runs (proc-macro
@@ -326,6 +342,23 @@ impl Db {
             return moved;
         }
         moved.sort();
+        // Each file that moved is named with what was read of it and what is read now: a
+        // write that every reader of the file runs again for must say which file it was
+        // (rule 19). Bounded: the first [`MOVED_NAMED`] of them, the rest counted.
+        for path in moved.iter().take(MOVED_NAMED) {
+            let path: &AbsPath = path.as_path();
+            let on_disk = files.on_disk(path.as_ref());
+            let was = files.find_included(path).map(|it| read_said(it.read_field(db)));
+            let now = read_said(&IncludedFile::read_now(&on_disk));
+            tracing::info!(
+                target: "blaze",
+                path = %path,
+                on_disk = %on_disk.display(),
+                was = was.as_deref().unwrap_or("never read"),
+                now = %now,
+                "an included file outside the VFS moved on disk"
+            );
+        }
         // Read once more as each is set: one changed back since is not set, nor listed.
         self.batch(trigger, |db| moved.retain(|path| db.reload_included_file(path)));
         span.record("moved", moved.len() as u64);
