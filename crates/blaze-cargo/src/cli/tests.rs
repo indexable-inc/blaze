@@ -756,21 +756,98 @@ fn the_thin_blaze_prints_a_plain_answer_as_this_cli_does() {
     }
 }
 
-/// The control of the test above, and the other half of the thin `blaze`'s rule: each response
-/// this CLI's printer says more of than `Finished` is one the thin `blaze` does not take, so
-/// it is this CLI that prints it.
+/// An edit's answer: a unit compiled and ended with no diagnostic, the outputs, the work with
+/// a step computed again and its image spliced, the `Done`.
+fn built_answer() -> Vec<Response> {
+    let mut answer = plain_answer();
+    answer[0] = foo_compiling();
+    let Response::Work(worked) = &mut answer[2] else { panic!("the work is third") };
+    worked.misses = 1;
+    worked.found = 0;
+    worked.compiled = 1;
+    worked.links[0].how = blaze_api::LinkHow::Spliced;
+    let foo = crate::cli::run::tests::artifact("foo", "bin", "foo", false, Some("foo"));
+    let ended = Response::UnitEnded(blaze_api::UnitOf {
+        id: 0,
+        test: false,
+        target: foo.target,
+        doctest: false,
+        package_id: "path+file:///w/foo#0.1.0".to_owned(),
+        manifest_path: "/w/foo/Cargo.toml".to_owned(),
+    });
+    answer.insert(1, ended);
+    answer
+}
+
+/// The invariant of the test above for an edit's answer (a unit compiled, its image spliced):
+/// for a `run` and a quiet `build`, which say nothing of what the build recomputed, the thin
+/// `blaze` prints what this CLI prints of the same responses and runs the program it runs.
+/// The control: a `build` that is not quiet says why it recomputed, which is this CLI's
+/// printer's, and the thin `blaze` hands that answer over at its first unit.
+#[test]
+fn the_thin_blaze_prints_an_edits_answer_as_this_cli_does() {
+    use blaze_thin::answer::{Exec, Plain, Step};
+    let table: &[&[&str]] = &[&["build", "-q"], &["run"], &["run", "-q"], &["run", "a", "--", "b=1"]];
+    for typed in table {
+        let thin = thin_asked(typed);
+        let reports = thin.command == blaze_thin::route::Command::Build && !thin.quiet;
+        let mut plain = Plain::of(reports);
+        let steps: Vec<Step> = built_answer().into_iter().map(|it| plain.take(it)).collect();
+        assert_eq!(steps, [Step::More, Step::More, Step::More, Step::More, Step::Done], "{typed:?}");
+        let mut said = plain.said(thin.quiet, false, std::time::Duration::ZERO);
+
+        let mut api = FakeApi::answering(built_answer());
+        let mut words = vec!["blaze"];
+        words.extend(typed.iter());
+        let (then, out, err) = driven(&mut api, &words, &mut Fake::default());
+        assert_eq!(out, "", "{typed:?}");
+        match thin.command {
+            blaze_thin::route::Command::Build => assert_eq!(then, Then::Exit(0), "{typed:?}"),
+            blaze_thin::route::Command::Run => {
+                let program = plain.program().expect("the one bin runs");
+                let exec = Exec::of(
+                    program.executable.as_deref().unwrap(),
+                    &program.env,
+                    &thin.program,
+                    std::path::Path::new("/w"),
+                );
+                if !thin.quiet {
+                    said.push_str(&exec.running(false));
+                }
+                let Then::Exec(cli) = then else { panic!("{typed:?}: {then:?}: {err}") };
+                assert_eq!(
+                    (exec.program, exec.args, exec.env, exec.cwd),
+                    (cli.program, cli.args, cli.env, cli.cwd),
+                    "{typed:?}"
+                );
+            }
+        }
+        assert_eq!(untimed(&said), untimed(&err), "{typed:?}");
+        if !thin.quiet {
+            assert!(said.starts_with("   Compiling foo v0.1.0 (/w/foo)\nlink: /w/target/debug/foo (spliced)\n"), "{said}");
+        }
+    }
+    let build = thin_asked(&["build"]);
+    assert!(build.command == blaze_thin::route::Command::Build && !build.quiet);
+    let first = built_answer().into_iter().next().expect("a unit");
+    assert!(matches!(Plain::of(true).take(first), Step::HandOver(_)));
+}
+
+/// The control of the tests above, and the other half of the thin `blaze`'s rule: each response
+/// this CLI's printer says more of than cargo's status lines is one the thin `blaze` does not
+/// take, so it is this CLI that prints it.
 #[test]
 fn what_this_clis_printer_says_more_of_the_thin_blaze_hands_over() {
     use blaze_thin::answer::{Plain, Step};
     let handed = |response: Response| matches!(Plain::new().take(response), Step::HandOver(_));
-    assert!(handed(foo_compiling()));
+    assert!(matches!(Plain::of(true).take(foo_compiling()), Step::HandOver(_)));
     assert!(handed(Response::Done { ok: false }));
     assert!(handed(Response::Error(blaze_api::ApiError::new("no", None))));
     assert!(handed(Response::Diagnostic(blaze_api::Diagnostic::note("said".to_owned()))));
     let mut recomputed = plain_answer();
     let Response::Work(worked) = &mut recomputed[2] else { panic!("the work is third") };
     worked.misses = 1;
-    let mut plain = Plain::new();
+    let mut plain = Plain::of(true);
     let steps: Vec<bool> =
         recomputed.into_iter().map(|it| matches!(plain.take(it), Step::HandOver(_))).collect();
     assert_eq!(steps[..3], [false, false, true]);

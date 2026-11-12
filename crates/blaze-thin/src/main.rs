@@ -84,26 +84,16 @@ mod unix {
     use blaze_report::terminal::Config;
     use blaze_thin::{
         ENGINE, VERSION, VERSION_LINE,
-        answer::{Exec, Plain, Step},
-        handover::{self, Began, Held},
+        handover::{Began, Held},
         pin, request,
-        route::{self, Asked, Command, Route},
+        route::{self, Asked, Route},
+        talk::{self, BUILD, Ended, Read},
     };
 
     use super::{ROUTE, sys};
 
-    /// How long the daemon is given to say which engine it is, and to answer a launch: both
-    /// are answered by its loop as they are read. Past it the engine runs the command, and
-    /// says what the daemon is doing.
-    const ASKED_WITHIN: Duration = Duration::from_secs(2);
-
     /// The most bytes one read takes.
     const RECEIVE: usize = 64 << 10;
-
-    /// The request ids of a command's connection, in the order they are sent.
-    const STATUS: u64 = 1;
-    const BUILD: u64 = 2;
-    const LAUNCH: u64 = 3;
 
     fn failed() -> ExitCode {
         ExitCode::from(u8::try_from(Exit::Failed.code()).unwrap_or(101))
@@ -216,100 +206,40 @@ mod unix {
         let stream = UnixStream::connect(&homes.socket)
             .map_err(|error| format!("no daemon answers at {}: {error}", homes.socket.display()))?;
         let mut daemon = Daemon::new(stream);
-        // No request of this blaze runs on another's daemon: the daemon says which engine it
-        // is, and any but the one beside this program is the engine's to replace.
-        daemon.send(STATUS, &Request::Status)?;
-        let mut status = None;
-        let until = daemon.within(ASKED_WITHIN);
-        loop {
-            match daemon.next(until, "the daemon to say which blaze it is")? {
-                Read::Response(Envelope { id: STATUS, body: Response::Status(it), .. }) => status = Some(it),
-                Read::Response(Envelope { id: STATUS, body: Response::Done { ok: true }, .. }) => break,
-                Read::Response(_) => return Err("the daemon answered its status with something else".to_owned()),
-                Read::Deadline => return Err("the daemon did not say which blaze it is in time".to_owned()),
-                Read::HungUp => return Err("the daemon hung up".to_owned()),
-            }
-        }
-        let status = status.ok_or("the daemon answered its status with no status")?;
-        if !engine.is(&status.build.exe) {
-            return Err(format!(
+        let spoken = talk::Spoken {
+            asked: &asked,
+            request: &request,
+            color,
+            cwd: &place.cwd,
+            pid: std::process::id(),
+        };
+        // The whole of what is said to the daemon, on this one connection ([`talk::talk`]).
+        let is_engine = |theirs: &blaze_api::Executable| match engine.is(theirs) {
+            true => Ok(()),
+            false => Err(format!(
                 "the daemon is {}, not the engine beside this program, {}",
-                status.build.exe.path,
+                theirs.path,
                 engine.path.display()
-            ));
-        }
-        if daemon.held() != 0 {
-            return Err("the daemon sent more after its status".to_owned());
-        }
-        daemon.forget();
-
-        // From here the request is sent: what follows ends in this program's own answer or
-        // in the engine taking the answer over, never in the command asked a second time.
-        let frame = daemon.send(BUILD, &request)?;
-        let handed = |daemon: Daemon| hand_over(daemon, &frame, &engine, &homes.state, words);
-        let until = daemon.within(handover::AFTER);
-        let mut plain = Plain::new();
-        loop {
-            match daemon.next(until, "the daemon's answer to the request") {
-                Ok(Read::Response(Envelope { id: BUILD, body, .. })) => match plain.take(body) {
-                    Step::More => {}
-                    Step::Done => break,
-                    Step::HandOver(_) => return Ok(handed(daemon)),
-                },
-                // A response to no request of this connection, an answer not ended in time,
-                // a daemon that hung up or bytes that are not the API's: the engine reads what
-                // was read and says which.
-                Ok(Read::Response(_) | Read::Deadline | Read::HungUp) | Err(_) => return Ok(handed(daemon)),
+            )),
+        };
+        match talk::talk(&mut daemon, &spoken, is_engine, || started.elapsed()) {
+            Ended::Engine(why) => Err(why),
+            Ended::HandOver { request } => Ok(hand_over(daemon, &request, &engine, &homes.state, words)),
+            Ended::Said { said, exec: None } => Ok(wrote(&said)),
+            Ended::Said { said, exec: Some(exec) } => {
+                let _ = std::io::stderr().write_all(said.as_bytes());
+                let _ = std::io::stderr().flush();
+                let mut command = std::process::Command::new(&exec.program);
+                command
+                    .args(&exec.args)
+                    .envs(exec.env.iter().map(|(name, value)| (name, value)))
+                    .current_dir(&exec.cwd);
+                // This process becomes the program, which ends the command as it ends.
+                let error = command.exec();
+                // It could not be executed: cargo's error for that is the engine's to say.
+                Err(format!("the program {} could not be executed: {error}", exec.program.display()))
             }
         }
-        if daemon.held() != 0 {
-            return Ok(handed(daemon));
-        }
-        let said = plain.said(asked.quiet, color, started.elapsed());
-        if asked.command == Command::Build {
-            return Ok(wrote(&said));
-        }
-        // `run`: the one program of what was built, started as the daemon says to start it.
-        let program = plain.program().and_then(|it| Some((it.executable.as_deref()?, it.env.as_slice())));
-        let Some((executable, cargo_env)) = program else { return Ok(handed(daemon)) };
-        let mut exec = Exec::of(executable, cargo_env, &asked.program, &place.cwd);
-        // The answer is whole and plain, and nothing is written yet: a launch the daemon
-        // refuses, or does not answer, is the engine's to say, which runs the command again
-        // (its build is answered as this one was).
-        let launch = Request::Launch { program: executable.to_owned(), pid: std::process::id() };
-        daemon.send(LAUNCH, &launch)?;
-        let until = daemon.within(ASKED_WITHIN);
-        let mut launched = None;
-        loop {
-            match daemon.next(until, "the daemon's answer to the program's launch")? {
-                Read::Response(Envelope { id: LAUNCH, body: Response::Launched { env, live }, .. }) => {
-                    launched = Some((env, live));
-                }
-                Read::Response(Envelope { id: LAUNCH, body: Response::Done { ok: true }, .. }) => break,
-                Read::Response(_) => return Err("the daemon refused the program's launch".to_owned()),
-                Read::Deadline => return Err("the daemon did not answer the program's launch in time".to_owned()),
-                Read::HungUp => return Err("the daemon hung up".to_owned()),
-            }
-        }
-        let (launch_env, live) = launched.ok_or("the daemon answered the launch with no `Launched`")?;
-        if live {
-            exec.env.extend(launch_env);
-        }
-        let mut said = said;
-        if !asked.quiet {
-            said.push_str(&exec.running(color));
-        }
-        let _ = std::io::stderr().write_all(said.as_bytes());
-        let _ = std::io::stderr().flush();
-        let mut command = std::process::Command::new(&exec.program);
-        command
-            .args(&exec.args)
-            .envs(exec.env.iter().map(|(name, value)| (name, value)))
-            .current_dir(&exec.cwd);
-        // This process becomes the program, which ends the command as it ends.
-        let error = command.exec();
-        // It could not be executed: cargo's error for that is the engine's to say.
-        Err(format!("the program {} could not be executed: {error}", exec.program.display()))
     }
 
     /// `said` written to stderr: the command's exit code, 0 unless stderr is closed under it.
@@ -374,14 +304,6 @@ mod unix {
         }
     }
 
-    /// What a read of the daemon's connection came to.
-    #[allow(clippy::large_enum_variant, reason = "one a read, matched and moved at once")]
-    enum Read {
-        Response(Envelope<Response>),
-        Deadline,
-        HungUp,
-    }
-
     /// The connection to the daemon: requests out, responses in, and every byte read since
     /// [`Daemon::forget`] kept as it came, for the engine should it take the answer over.
     struct Daemon {
@@ -403,6 +325,11 @@ mod unix {
                 buffer: vec![0; RECEIVE],    // alloc: once a command, every read's
             }
         }
+
+    }
+
+    impl talk::Link for Daemon {
+        type Until = Deadline;
 
         /// `wait` from now, on this connection's clock.
         fn within(&self, wait: Duration) -> Deadline {
