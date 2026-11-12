@@ -1175,26 +1175,6 @@ pub(crate) fn generate<'db>(
     match built {
         Ok(mut built) => {
             built.puts.extend(profile);
-            // What the walk and the passes after it did, kept with the build (`blaze explain
-            // edit_work`): after an edit each follows the edit, and `whole` says a walk that
-            // ran over the program.
-            let (walk, work) = (&built.walk, &built.work);
-            tracing::info!(
-                target: "blaze",
-                stage = blaze_query::db::edit_work::CODEGEN_WALK,
-                asked = work.asked as u64,
-                named = work.named as u64,
-                held = work.held as u64,
-                each_build = work.each_build as u64,
-                described = walk.described as u64,
-                verified = walk.verified as u64,
-                reached = walk.reached as u64,
-                visited = walk.visited as u64,
-                replaced = work.replaced as u64,
-                copied = work.copied as u64,
-                whole = u64::from(walk.whole.is_some()),
-                "edit work"
-            );
             if let Some(slot) = job.counted.get(unit) {
                 // alloc: once per unit built, one entry per profile it used (none or one)
                 let _ = slot
@@ -2700,21 +2680,6 @@ fn relink(
     if let Some(why) = work.whole {
         delta.record("whole", why);
     }
-    // What the link touched, kept with the build (`blaze explain edit_work`). `rows` and
-    // `tables` follow the edit. `symbols` and `patchable` are every name and every function
-    // reached through a slot of the program: this link goes over each of them once (the
-    // names are copied out of the `Built` and compared with the last link's), which is the
-    // part of a link that still grows with the program and not with the edit.
-    tracing::info!(
-        target: "blaze",
-        stage = blaze_query::db::edit_work::LINK,
-        rows = work.rows as u64,
-        tables = work.tables as u64,
-        symbols = names.len() as u64,
-        patchable = patchable.len() as u64,
-        whole = u64::from(work.whole.is_some()),
-        "edit work"
-    );
     let mut now_named: Vec<&str> = names.iter().map(|it| it.0.as_str()).collect();
     let (kept_names, unnamed) = renamed(std::mem::take(&mut linked.names), &mut now_named);
     let given = linked.rows.given(built.id, &native_ids);

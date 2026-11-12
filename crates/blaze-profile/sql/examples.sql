@@ -1131,39 +1131,3 @@ WHERE (calls.on_thread LIKE $thread
     AND (calls.took_ns IS NULL OR calls.took_ns >= $min_ms * 1e6)
 ORDER BY calls.began_ns, calls.seen_as
 LIMIT $limit
-
--- name: edit_work
--- says: the work a build did, by stage, as each stage counted it: how many things it visited, asked of or made again, which after an edit should be the edit's size and not the program's (rule incremental-first). `engine memos` are the query engine's rows run (`executed`) and proved unchanged without running (`verified`), from `query_counts`; `changed set` is the engine's walk from what was written (`visited` rows verified, `changed` the rows whose value moved); `body check` is each unit's plan (`visited_bodies` and `visited_modules` got a task, `held_*` is the crate, `whole` counts plans that visited everything); `codegen walk` is each program's walk (`asked` functions asked of again, `described` made again, `replaced` rows of the kept lists, `whole` walks from the roots); `dependency image keys` are the keys a serve asked of the database (`asked`), those that moved (`moved`) and those made again (`computed`); `link` is each link's rows made again (`rows`) and the names and patchable functions it went over (`symbols`, `patchable`, the part that still follows the program). `total` sums a counter over the build, `times` is how many units or walks said it; a counter nothing said has no row. Events `edit work` (crates/blaze-query/src/db/edit_work.rs names the stages)
-WITH said AS (
-    SELECT
-        e.process AS said_process,
-        e.event_id AS said_event,
-        max(v.value_text) FILTER (WHERE v.key = 'stage') AS stage
-    FROM events AS e
-    JOIN event_values AS v ON v.process = e.process AND v.event_id = e.event_id
-    WHERE e.build_id = $build AND e.message = 'edit work'
-    GROUP BY e.process, e.event_id
-), counted AS (
-    SELECT said.stage AS stage, v.key AS counter, CAST(v.value_int AS BIGINT) AS n
-    FROM said
-    JOIN event_values AS v ON v.process = said.said_process AND v.event_id = said.said_event
-    WHERE v.value_int IS NOT NULL
-    UNION ALL
-    SELECT 'engine memos' AS stage, 'executed' AS counter, CAST(sum(q.executed) AS BIGINT) AS n
-    FROM query_counts AS q
-    WHERE q.build_id = $build
-    UNION ALL
-    SELECT 'engine memos' AS stage, 'verified' AS counter, CAST(sum(q.verified) AS BIGINT) AS n
-    FROM query_counts AS q
-    WHERE q.build_id = $build
-    UNION ALL
-    SELECT 'dependency image keys' AS stage, 'computed' AS counter, CAST(sum(q.executed) AS BIGINT) AS n
-    FROM query_counts AS q
-    WHERE q.build_id = $build AND ends_with(CAST(q.query AS VARCHAR), 'crate_image_key')
-)
-SELECT stage, counter, CAST(sum(n) AS BIGINT) AS total, count(*) AS times
-FROM counted
-WHERE n IS NOT NULL
-GROUP BY stage, counter
-ORDER BY stage, counter
-LIMIT $limit

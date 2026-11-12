@@ -3320,5 +3320,4 @@ fn after_editing_one_input_every_rerun_memos_cause_chain_leads_back_to_it(tc: Te
 /// The changed set ([`super::frontier`]): its deterministic simulation and planted bugs.
 mod changed;
 mod joined;
-mod small;
 mod stale_head;

@@ -102,73 +102,11 @@ pub struct Session {
     /// oldest first: what [`Request::Why`] reads, since a view's reruns are its own.
     kept: VecDeque<(ContentId, ViewId)>,
     intents: Intents,
-    /// What a save of each head builds ahead ([`ahead_of_a_save`]): the last request that
-    /// built the head, as the work its front end shares. A list, scanned: a head a checkout.
-    ahead: Vec<(String, Work)>,
-    /// The builds ahead the daemon started for saves since the last request that built a
-    /// view: at most [`SAVES_AHEAD`], so a build whose own writes move its head (a build
-    /// script that writes into its sources) cannot start builds without end (rule 18).
-    saves_ahead: u32,
     /// The clock as [`Session::tick`] last gave it.
     now_ns: u64,
     /// Each subsystem's allocation rate since the last [`Request::Memory`].
     rate: Rate,
     buffers: Buffers,
-}
-
-/// The most builds ahead of saves between two requests that build ([`Session::save_ahead`]).
-pub const SAVES_AHEAD: u32 = 8;
-
-/// How long a build ahead of a save waits for a request to take it over before it is
-/// cancelled, in milliseconds: long enough that the build of an edit ends, short enough
-/// that a save nobody builds holds no work.
-const SAVE_AHEAD_MS: u64 = 60_000;
-
-/// What the daemon did with a save it saw ([`Session::save_ahead`]): a typed outcome, so its
-/// caller says it (the session has no log).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SaveAhead {
-    /// A build ahead of the head's new root began, as an intent's: the edit is pushed
-    /// through the front end now, and the next request that builds the root takes it over.
-    Started,
-    /// No request has built this head, so there is nothing to build ahead of.
-    NothingBuilt,
-    /// A request's job or another intent's is at work: the save is the next request's.
-    Busy,
-    /// [`SAVES_AHEAD`] builds ahead began since the last request that built.
-    Spent,
-    /// The head's new root could not be opened; the next request reports why.
-    NotOpened,
-}
-
-/// What a save of a head builds ahead, given the last request that built the head as
-/// `work`: the part of it that changes nothing a person can see. A check, a build and a run
-/// are checked ahead ([`Work::Check`]): the file is read, parsed and resolved again and the
-/// changed bodies checked again in the database the request will use, and no program is
-/// linked, patched or run before it is asked for. A test is built ahead as
-/// [`crate::Request::WillTest`] builds it ([`Work::Ahead`]), which runs none. Any other
-/// work builds nothing ahead.
-fn ahead_of_a_save(work: &Work) -> Option<Work> {
-    match work {
-        // clone: once per request that builds a head, its targets kept for the next save
-        Work::Check(targets) | Work::Build(targets) | Work::Run { targets, .. } => {
-            Some(Work::Check(targets.clone()))
-        }
-        Work::Test { targets, filter, .. } => {
-            // clone: as above
-            Some(Work::Ahead { targets: targets.clone(), filter: filter.clone() })
-        }
-        Work::Reach { .. }
-        | Work::Verify(_)
-        | Work::Snapshot
-        | Work::CodegenInputs(_)
-        | Work::Trace(_)
-        | Work::Tables
-        | Work::Doc { .. }
-        | Work::Edit(_)
-        | Work::Ahead { .. }
-        | Work::Lock(_) => None,
-    }
 }
 
 /// Buffers kept between calls, cleared and refilled, so a warm call allocates none of them.
@@ -303,9 +241,6 @@ impl Session {
             held: HashMap::new_in(Global),
             kept: VecDeque::new(),
             intents: Intents::default(),
-            // alloc: none, empty
-            ahead: Vec::new(),
-            saves_ahead: 0,
             now_ns: 0,
             rate: Rate::new(),
             buffers: Buffers::default(),
@@ -362,44 +297,6 @@ impl Session {
     /// taken over or cancelled as by a commit request.
     pub fn head_moved(&mut self, cx: &mut Daemon<'_>, head: &str, root: ContentId) {
         self.intents.moved(cx.builder, head, root);
-    }
-
-    /// Builds ahead of a save: `head` moved to `root` by the watcher's commit with no
-    /// request waiting on it (the daemon calls this after [`Session::head_moved`], and not
-    /// for a move a held request's flush brought in: that request builds the root itself).
-    ///
-    /// The build ahead is what pushes an edit at the save and not at the next request: the
-    /// head's last build-shaped request, as [`ahead_of_a_save`] makes it, started on `root`
-    /// as an intent's job ([`Builder::speculate`]), so the file written is read into the
-    /// database, the engine marks what read it and the changed bodies are checked while the
-    /// person is still reaching for `blaze run`. That request then takes the job over
-    /// ([`Intents::take_over`]) and finds the front end's work done. Nothing a person sees
-    /// changes before they ask: an intent's reports are dropped and it links and runs
-    /// nothing.
-    ///
-    /// It starts only where it cannot get in a request's way or feed itself: no request's
-    /// job is under way, no other intent's job is at work (one this move cancelled is not),
-    /// some request built this head before, and fewer than [`SAVES_AHEAD`] began since the
-    /// last request that built. What it did is returned, for the daemon to say.
-    pub fn save_ahead(&mut self, cx: &mut Daemon<'_>, head: &str, root: ContentId) -> SaveAhead {
-        let Some(work) = self.ahead.iter().find(|(it, _)| it == head).map(|(_, work)| work) else {
-            return SaveAhead::NothingBuilt;
-        };
-        if self.building() != 0 || !self.intents.idle() {
-            return SaveAhead::Busy;
-        }
-        if self.saves_ahead >= SAVES_AHEAD {
-            return SaveAhead::Spent;
-        }
-        // clone: once per save built ahead, the work its job owns
-        let work = work.clone();
-        let Ok(opened) = open(cx, root) else { return SaveAhead::NotOpened };
-        self.saves_ahead += 1;
-        let job = self.job(Job::Intent);
-        // alloc: once per save built ahead, the head's name the intent is cancelled by
-        self.intents.add_saved(job, opened, head.to_owned(), SAVE_AHEAD_MS);
-        cx.builder.speculate(job, opened, work);
-        SaveAhead::Started
     }
 
     pub fn arrive(&mut self, cx: &mut Daemon<'_>, arrived: Arrived, out: &mut Vec<Reply>) {
@@ -969,18 +866,6 @@ impl Session {
     ) -> Result<(), ApiError> {
         let root = resolve(cx.vfs, view)?;
         let opened = open(cx, root)?;
-        // A request that builds a head says what a save of that head builds ahead
-        // ([`Session::save_ahead`]), and gives the saves after it their builds ahead again.
-        if let ViewRef::Head(head) = view
-            && let Some(ahead) = ahead_of_a_save(&work)
-        {
-            match self.ahead.iter_mut().find(|(it, _)| it == head) {
-                Some(kept) => kept.1 = ahead,
-                // alloc: once per head a request builds, its name and work kept
-                None => self.ahead.push((head.clone(), ahead)), // clone: as above
-            }
-            self.saves_ahead = 0;
-        }
         self.start(cx, req, Some(opened), [Some(opened), None], work);
         Ok(())
     }

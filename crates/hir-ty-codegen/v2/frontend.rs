@@ -1151,11 +1151,8 @@ impl Frontend for HirFrontend<'_> {
     /// described under; a changed key of another facing names its instance and requester all
     /// the same, which costs the walk one ask where it holds them.
     ///
-    /// Unknown, with the engine's reason, when any of the three is: the view is none of this
-    /// database's, or the set is asked for inside a query while the engine's walk is due. The
-    /// engine's log of changed sets answers from any earlier view (it merges its oldest
-    /// findings, never drops them). The driver refuses a build whose front end answers
-    /// Unknown: no walk asks of everything in the set's place.
+    /// Unknown, with the engine's reason, when any of the three is: the view is from before
+    /// the changed sets the engine keeps, or is none of this database's.
     fn changed_since(&self, view: u64) -> Changed<HirInstance, HirStatic> {
         use blaze_query::db::{Changed as Keys, View};
         let since = View::from_u64(view);

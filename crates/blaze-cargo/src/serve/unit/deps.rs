@@ -190,16 +190,6 @@ pub(crate) fn images(
         .filter(|&(krate, key)| session.keyed.get(krate) != Some(key))
         .map(|(&krate, _)| krate)
         .collect(); // alloc: once per serve, one per crate whose key moved
-    // What the serve asked and what moved, kept with the build (`blaze explain edit_work`).
-    // A key asked is the database's memo's answer (`hir_def::deps`): how many were made
-    // again is `query_counts`' `executed` of that memo, which the view prints beside these.
-    tracing::info!(
-        target: "blaze",
-        stage = blaze_query::db::edit_work::IMAGE_KEYS,
-        asked = keys.len() as u64,
-        moved = moved.len() as u64,
-        "edit work"
-    );
     if moved.is_empty() {
         // `keyed` holds every key walked already.
         session.walked.note(at, build, crates.iter().chain(keys.keys()));
@@ -283,11 +273,6 @@ pub(crate) struct Session {
 /// [`Session::walked`]: the crates keyed at one view of one database by one `build`, each of
 /// whose keys (and its dependencies') `keyed` holds; no view while a serve that moved a key is
 /// writing.
-///
-/// Each key is the database's memo (`hir_def::deps`' `crate_image_key`): a walk asks the memo
-/// of each crate, which makes a key again only when something the key was made from changed,
-/// so the walk after an edit of a workspace member hashes no dependency's files. What is
-/// kept here is which crates a serve at this view asked, so a batch asks none twice.
 ///
 /// The walk itself is kept with them (`walk`), so the keys of one view are made once: a
 /// build's serves come a batch of units at a time (eight in an edit of ripgrep, each of which

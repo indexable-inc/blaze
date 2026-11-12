@@ -86,58 +86,8 @@ pub static PRODUCER: std::sync::LazyLock<ContentId> = std::sync::LazyLock::new(|
 /// dependencies is one either (a member's def map changes with every edit, so nothing that
 /// names it is kept), and every proc-macro crate among them with its library known.
 pub fn eligible(db: &Db, krate: Crate) -> bool {
-    fn of(db: &Db, krate: Crate, memo: &mut HashMap<Crate, bool, Global>) -> bool {
-        if let Some(&known) = memo.get(&krate) {
-            return known;
-        }
-        let data = krate.data(db);
-        let mut eligible = !data.origin.is_local() && libraries_known(db, krate);
-        for dep in &data.dependencies {
-            eligible &= of(db, dep.crate_id, memo);
-        }
-        memo.insert(krate, eligible);
-        eligible
-    }
-    of(db, krate, &mut HashMap::new_in(Global))
-}
-
-/// The key of `krate`'s image by `build`, or `None` when the crate is not [`eligible`]: the
-/// database's memo, so a key is made once and made again only when something it was made
-/// from changed.
-///
-/// Why a memo. Until 2026-11-11 the keys were a host's walk kept by the database's view
-/// ([`KeyWalk`]): any write, an edit of one function of a workspace member too, forgot every
-/// key, and the next serve listed and hashed every file of every dependency again (ripgrep:
-/// the `dependency image keys` span on each edit). A key reads only its own crate's inputs
-/// and its dependencies' keys, none of which an edit of a member touches, so as a memo it is
-/// verified (a few loads) where it was made again.
-///
-/// Why the memo is complete (rule keys-cover-every-input). Everything [`key`] hashes it
-/// reads from the database inside this run: the crate's data and extra data, its workspace
-/// data, cfg and env, its source root's file set, each file's content, its proc macros'
-/// libraries, and each dependency's key through this same query. The engine records each
-/// read, so a write of any of them runs the key again, and a key that comes out the same
-/// stops there (its dependents are not run). `build` and the crate are the memo's own key;
-/// [`PRODUCER`] is the process's, and a process is one build of blaze.
-///
-/// The crate graph has no cycles, which [`Crate::transitive_deps`] relies on too, so the
-/// recursion ends.
-#[blaze_query::tracked(returns(copy))]
-pub(crate) fn image_key(db: &Db, krate: Crate, build: ContentId) -> Option<ContentId> {
-    #[cfg(test)]
-    super::tests::KEYED.lock().push((db.nonce_and_revision().0, krate));
-    let data = krate.data(db);
-    let mut eligible = !data.origin.is_local() && libraries_known(db, krate);
-    // alloc: once per run of a crate's key, one key a dependency
-    let mut deps = Vec::with_capacity(data.dependencies.len());
-    // Every dependency is asked, eligible or not: a dependency that becomes eligible, or
-    // stops being, is a read of this key.
-    for dep in &data.dependencies {
-        let key = image_key(db, dep.crate_id, build);
-        eligible &= key.is_some();
-        deps.push(key.unwrap_or_default());
-    }
-    eligible.then(|| key(db, krate, build, &deps))
+    let mut memo = HashMap::new_in(Global);
+    walk(db, krate, &mut |_, _| ContentId::default(), &mut memo).is_some()
 }
 
 /// The key of each of `crates` that is [`eligible`], by `build`, the front end that reads and
@@ -160,10 +110,6 @@ pub fn keys(db: &Db, crates: &[Crate], build: ContentId) -> HashMap<Crate, Conte
 /// data, its source root's files and their content IDs, its proc macros' libraries are all
 /// inputs) and `build`. A caller that sees any of the three move calls [`KeyWalk::clear`]
 /// first. [`PRODUCER`] is the process's.
-///
-/// What it holds is which crates were asked, not the work of a key: each key is the
-/// database's memo ([`image_key`]), so a walk after [`KeyWalk::clear`] asks the memo of each
-/// crate (a few loads where nothing it read changed) and hashes no file again.
 pub struct KeyWalk {
     memo: Memo,
 }
@@ -205,11 +151,13 @@ impl KeyWalk {
         // alloc: once per call that walks a crate, one entry per crate newly keyed
         let mut fresh = HashMap::new_in(Global);
         // Called once for each eligible crate the walk had not seen ([`walk`]).
-        let mut seen = |krate, key| {
-            fresh.insert(krate, key);
+        let mut hash = |krate, memo: &Memo| {
+            let made = key(db, krate, build, memo);
+            fresh.insert(krate, made);
+            made
         };
         for &krate in crates {
-            walk(db, krate, build, &mut seen, &mut self.memo);
+            walk(db, krate, &mut hash, &mut self.memo);
         }
         fresh
     }
@@ -261,8 +209,9 @@ pub fn key_inputs(
 /// with its key or `None` when it is not [`eligible`].
 fn walked(db: &Db, crates: &[Crate], build: ContentId) -> Memo {
     let mut memo = HashMap::new_in(Global);
+    let mut hash = |krate, memo: &Memo| key(db, krate, build, memo);
     for &krate in crates {
-        walk(db, krate, build, &mut |_, _| {}, &mut memo);
+        walk(db, krate, &mut hash, &mut memo);
     }
     memo
 }
@@ -270,29 +219,24 @@ fn walked(db: &Db, crates: &[Crate], build: ContentId) -> Memo {
 /// Each crate walked: its key, or `None` when it is not [`eligible`].
 type Memo = HashMap<Crate, Option<ContentId>, Global>;
 
-/// `krate`'s key by `build` ([`image_key`], the database's memo) into `memo`, its
-/// dependencies' first, so `memo` holds every crate `krate`'s key covers; `seen` is told each
-/// eligible crate the walk had not met, with its key. A crate met before costs a lookup; one
-/// not met costs the memo's answer, which makes a key only when something it was made from
-/// changed. The crate graph has no cycles, which [`Crate::transitive_deps`] relies on too, so
-/// the walk ends.
+/// `krate`'s key by `hash` of it and the memo holding its dependencies' keys, if it and every
+/// crate it depends on is eligible, its dependencies' first. The crate graph has no cycles,
+/// which [`Crate::transitive_deps`] relies on too, so the walk ends.
 fn walk(
     db: &Db,
     krate: Crate,
-    build: ContentId,
-    seen: &mut impl FnMut(Crate, ContentId),
+    hash: &mut impl FnMut(Crate, &Memo) -> ContentId,
     memo: &mut Memo,
 ) -> Option<ContentId> {
     if let Some(&key) = memo.get(&krate) {
         return key;
     }
-    for dep in &krate.data(db).dependencies {
-        walk(db, dep.crate_id, build, seen, memo);
+    let data = krate.data(db);
+    let mut eligible = !data.origin.is_local() && libraries_known(db, krate);
+    for dep in &data.dependencies {
+        eligible &= walk(db, dep.crate_id, hash, memo).is_some();
     }
-    let key = image_key(db, krate, build);
-    if let Some(key) = key {
-        seen(krate, key);
-    }
+    let key = eligible.then(|| hash(krate, memo));
     memo.insert(krate, key);
     key
 }
@@ -310,20 +254,20 @@ fn libraries_known(db: &Db, krate: Crate) -> bool {
     }
 }
 
-/// The key of `krate` from its inputs and its dependencies' keys `deps`, in the order the
-/// crate lists them: each is a key, since [`image_key`] found every dependency eligible.
-fn key(db: &Db, krate: Crate, build: ContentId, deps: &[ContentId]) -> ContentId {
+/// The key of `krate` from its inputs and its dependencies' keys in `memo`, in the order the
+/// crate lists them: each is there, since [`walk`] found every dependency eligible.
+fn key(db: &Db, krate: Crate, build: ContentId, memo: &Memo) -> ContentId {
     let base = Base::of(db, krate);
     let mut hasher = Hasher::new(KEY_DOMAIN);
     hasher.id(&PRODUCER).id(&build);
-    crate_inputs(db, krate, &base, deps, &mut hasher);
+    crate_inputs(db, krate, &base, memo, &mut hasher);
     files(db, krate, &base, &mut hasher);
     libraries(db, krate, &mut hasher);
     hasher.finish()
 }
 
-/// The crate's own inputs, its dependencies by their keys `deps`, in the crate's order.
-fn crate_inputs(db: &Db, krate: Crate, base: &Base, deps: &[ContentId], hasher: &mut Hasher) {
+/// The crate's own inputs, its dependencies by their keys in `memo`.
+fn crate_inputs(db: &Db, krate: Crate, base: &Base, memo: &Memo, hasher: &mut Hasher) {
     let base_db::BuiltCrateData {
         root_file_id,
         edition,
@@ -355,10 +299,9 @@ fn crate_inputs(db: &Db, krate: Crate, base: &Base, deps: &[ContentId], hasher: 
     hasher.id(&db.file_content(*root_file_id));
     hasher.update(&(edition.number() as u64).to_le_bytes());
     hasher.update(&(dependencies.len() as u64).to_le_bytes());
-    assert_eq!(dependencies.len(), deps.len(), "a key of each dependency, in the crate's order");
-    for (dep, key) in dependencies.iter().zip(deps) {
+    for dep in dependencies {
         hasher
-            .id(key)
+            .id(&memo[&dep.crate_id].expect("`walk` keys every dependency first"))
             .part(dep.name.as_str().as_bytes())
             .update(&[dep.is_prelude() as u8, dep.is_sysroot() as u8, dep.is_private() as u8]);
     }
@@ -454,8 +397,7 @@ fn libraries(db: &Db, krate: Crate, hasher: &mut Hasher) {
             ProcMacroKind::Bang => 1,
             ProcMacroKind::Attr => 2,
         };
-        let code =
-            it.expander.code().expect("`image_key` keys only crates whose libraries are known");
+        let code = it.expander.code().expect("`walk` keys only crates whose libraries are known");
         hasher.part(it.name.as_str().as_bytes()).update(&[kind, it.disabled as u8]).id(&code);
     }
 }

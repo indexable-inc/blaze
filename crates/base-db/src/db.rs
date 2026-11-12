@@ -573,27 +573,7 @@ impl Db {
     /// caller's file and line in `function`, so a profile says whose tasks a stretch ran.
     #[track_caller]
     pub fn run_all<F: Fn(&Db, usize) + Sync>(&self, tag: Tag, count: usize, task: F) {
-        self.run_tasks(std::panic::Location::caller(), count, false, None, |db, at| {
-            frame::task(tag, |_| task(db, at))
-        });
-    }
-
-    /// [`Db::run_all`] for tasks that may be an edit's few: where `small` predicts the batch
-    /// costs less than its dispatch (at most [`blaze_graph::par::SMALL_ITEMS`] tasks,
-    /// predicted under a few milliseconds from this site's own small runs) they run on the
-    /// calling thread, one after the other, with no job submitted
-    /// ([`blaze_query::db::par_for_each_small`]); a larger or dearer batch runs as
-    /// [`Db::run_all`]'s does. A test database runs them here in [`RunOrder`] either way, and
-    /// under [`RunOrder::OnPool`] as a build's database does.
-    #[track_caller]
-    pub fn run_all_small<F: Fn(&Db, usize) + Sync>(
-        &self,
-        small: &blaze_graph::par::Small,
-        tag: Tag,
-        count: usize,
-        task: F,
-    ) {
-        self.run_tasks(std::panic::Location::caller(), count, false, Some(small), |db, at| {
+        self.run_tasks(std::panic::Location::caller(), count, false, |db, at| {
             frame::task(tag, |_| task(db, at))
         });
     }
@@ -603,7 +583,7 @@ impl Db {
     /// what the maintainer's apply diffs, and no reader asks for it.
     #[track_caller]
     pub(crate) fn run_every<F: Fn(&Db, usize) + Sync>(&self, count: usize, task: F) {
-        self.run_tasks(std::panic::Location::caller(), count, true, None, task);
+        self.run_tasks(std::panic::Location::caller(), count, true, task);
     }
 
     /// Runs `task(db, item)` on every one of `items` at once, each in a frame of its own tagged
@@ -675,16 +655,12 @@ impl Db {
         caller: &'static std::panic::Location<'static>,
         count: usize,
         every: bool,
-        small: Option<&blaze_graph::par::Small>,
         task: F,
     ) {
         if count == 0 {
             return;
         }
-        // Whether the batch runs on this thread, with no job submitted: said on the span, so
-        // a profile tells an edit's inline chain from a dispatch (rule 16).
-        let here = small.is_some_and(|small| small.here(count));
-        let all = tracing::info_span!(target: "blaze", "run_all", function = tracing::field::Empty, count, here);
+        let all = tracing::info_span!(target: "blaze", "run_all", function = tracing::field::Empty, count);
         // alloc: only while a subscriber records the span, which interns it
         let site = (!all.is_disabled()).then(|| format!("{}:{}", caller.file(), caller.line()));
         if let Some(site) = &site {
@@ -699,16 +675,10 @@ impl Db {
             let _span = span.entered();
             blaze_query::db::attach(db, || task(db, at))
         };
-        let pooled = |count: usize| match small {
-            Some(small) => {
-                blaze_query::db::par_for_each_small(small, count, |at| run(self, at));
-            }
-            None => blaze_query::db::par_for_each(count, |at| run(self, at)),
-        };
         match self.run {
-            Run::Pool => pooled(count),
+            Run::Pool => blaze_query::db::par_for_each(count, |at| run(self, at)),
             Run::Here => match RUN_ORDER.get() {
-                RunOrder::OnPool => pooled(count),
+                RunOrder::OnPool => blaze_query::db::par_for_each(count, |at| run(self, at)),
                 RunOrder::InOrder => (0..count).for_each(|at| run(self, at)),
                 RunOrder::Reversed => (0..count).rev().for_each(|at| run(self, at)),
                 RunOrder::Strided(stride) => {

@@ -2807,11 +2807,6 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     }
 
     fn outs(&mut self, mut out: Vec<Out>) {
-        // A request handed on with these, or still held for its checkout's flush, builds
-        // what the watcher committed itself: a move of a head in the same stretch is that
-        // request's change, not a save to build ahead of.
-        let asked = self.heads.holds_a_request()
-            || out.iter().any(|it| matches!(it, Out::Pass(Arrived::Request { .. })));
         for it in out.drain(..) {
             match &it {
                 Out::Pass(Arrived::Request {
@@ -2927,15 +2922,6 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 Out::Answer(reply) => self.reply(&reply),
                 Out::Moved { head, root } => {
                     self.session.head_moved(&mut cx!(self), &head, root);
-                    // A save the watcher committed with no request waiting on it: built
-                    // ahead where the head was built before and nothing else is at work, so
-                    // the edit is pushed through the front end now and not at the next
-                    // request. What was done is said; `None` is a move a request asked for.
-                    let ahead = match asked {
-                        true => None,
-                        false => Some(self.session.save_ahead(&mut cx!(self), &head, root)),
-                    };
-                    tracing::info!(target: "blaze", head = head.as_str(), ahead = ?ahead, "save seen");
                     self.after_session();
                 }
             }
