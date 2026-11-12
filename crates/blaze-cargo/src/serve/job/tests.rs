@@ -641,3 +641,77 @@ fn a_builds_outputs_are_vouched_for_by_the_directories_under_its_build_dirs() {
     assert_eq!(dirs(&["/b/debug/a", "/b/app"]), Err("/b/app".into()), "an output right in the build dir");
     assert_eq!(dirs(&["/elsewhere/debug/app"]), Err("/elsewhere/debug/app".into()), "an output under no build dir");
 }
+
+/// A cargo request's targets, its client shown diagnostics as given.
+fn cargo_targets(args: &[&str], color: bool, width: Option<u32>) -> Targets {
+    let cargo = blaze_api::Cargo {
+        cwd: "/w".into(),
+        env: vec![("PATH".to_owned(), "/bin".to_owned())],
+        args: args.iter().map(|it| (*it).to_owned()).collect(),
+        root: "/w".into(),
+        color,
+        files: Vec::new(),
+        width,
+        command: "build".into(),
+        refused: Some(16),
+        verbose: 0,
+    };
+    Targets { cargo: Some(cargo), ..targets() }
+}
+
+/// How a request's client is shown diagnostics (`--message-format`, `--color`, its width) is
+/// no part of the view's config, which the plan is keyed by and the units are loaded from,
+/// nor of the request's own identity: only of the identity of how it is drawn. So a build
+/// from a terminal of another width, or with `--message-format short`, plans what the last
+/// one planned, from the same plan. What follows `--` is the program's and is kept; what says
+/// what is built (a package, a feature, `-v`) is in the config or the request as before.
+#[test]
+fn how_a_client_is_shown_diagnostics_is_in_no_config_and_no_request_identity() {
+    let words = |args: &[&str]| -> Vec<String> { args.iter().map(|it| (*it).to_owned()).collect() };
+    assert_eq!(
+        undrawn(&words(&[
+            "-p",
+            "a",
+            "--message-format",
+            "short",
+            "--color=always",
+            "--release",
+            "--message-format=json",
+            "--color",
+            "never",
+            "--",
+            "--color",
+            "always",
+            "--message-format=short"
+        ])),
+        words(&["-p", "a", "--release", "--", "--color", "always", "--message-format=short"])
+    );
+    assert_eq!(undrawn(&words(&["--colorful", "--message-formats=x"])).len(), 2, "other flags stay");
+    assert_eq!(short(&words(&["--message-format", "short"])), Ok(true));
+    assert_eq!(short(&words(&["--message-format=json-diagnostic-short"])), Ok(true));
+    assert_eq!(short(&words(&["--", "--message-format", "short"])), Ok(false), "the program's own");
+    assert!(short(&words(&["--message-format", "nonsense"])).is_err());
+
+    let plain = Work::Build(cargo_targets(&["-p", "a"], false, None));
+    let config = |work: &Work| invocation(work, targets_of(work), "/w", &[]).args;
+    for (args, color, width) in [
+        (&["-p", "a"][..], true, None),
+        (&["-p", "a"][..], false, Some(80)),
+        (&["-p", "a", "--message-format", "short"][..], false, None),
+        (&["--color", "always", "-p", "a"][..], true, Some(200)),
+    ] {
+        let drawn = Work::Build(cargo_targets(args, color, width));
+        assert_eq!(config(&drawn), config(&plain), "{args:?}: the config's arguments");
+        assert_eq!(request_id(&drawn), request_id(&plain), "{args:?} {color} {width:?}");
+        assert_ne!(drawn_id(&drawn), drawn_id(&plain), "{args:?} {color} {width:?}");
+    }
+    // What says what is built or how much is said of it moves the request or the config.
+    let other = Work::Build(cargo_targets(&["-p", "b"], false, None));
+    assert_ne!(config(&other), config(&plain));
+    assert_eq!(drawn_id(&other), drawn_id(&plain));
+    let mut verbose = cargo_targets(&["-p", "a"], false, None);
+    if let Some(cargo) = &mut verbose.cargo {
+        cargo.verbose = 2;
+    }
+    assert_ne!(request_id(&Work::Build(verbose)), request_id(&plain));
+}

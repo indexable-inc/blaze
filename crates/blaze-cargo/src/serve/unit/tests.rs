@@ -25,6 +25,8 @@ use super::{artifact, codegen, compile, graph, run, script, test, unit_target};
 mod drawn;
 /// `artifact = "gpu"` dependencies, their device build and its MSL applied to the host.
 mod gpu;
+/// Content keys: a unit's key and record in another directory, under another home.
+mod portable;
 
 const HOST: &str = "x86_64-unknown-linux-gnu";
 
@@ -74,6 +76,13 @@ fn unit(pkg: &str, target: Target, mode: Mode, deps: &[usize]) -> Unit {
             })
             .collect(),
     }
+}
+
+/// The directories of the builds these tests lower ([`super::portable::Places`]): the
+/// workspace at `/w`, its build directory in it, the daemon's own under `/s`.
+fn test_places() -> super::portable::Places {
+    use std::path::Path;
+    super::portable::Places::new("/w", "/w/target", "/s/std", Path::new("/s/tools"), Path::new("/s/blaze"))
 }
 
 fn plan(extra: &str, outputs: &[&str]) -> UnitPlan {
@@ -725,7 +734,7 @@ fn a_link_library_is_read_as_rustc_reads_l() {
 #[test]
 fn a_crate_record_is_an_archive_of_one_member() {
     let lib = unit(P, target("p", "lib", "/w/p/src/lib.rs"), Mode::Build, &[]);
-    let bytes = compile::crate_record(&lib, Some(ContentId::of("blaze v2 test 1", b"id")), &[]);
+    let bytes = compile::crate_record(&lib, &test_places(), Some(ContentId::of("blaze v2 test 1", b"id")), &[]);
     assert!(bytes.starts_with(b"!<arch>\nlib.rmeta/"));
     assert_eq!(bytes.len() % 2, 0);
 }
@@ -1368,7 +1377,7 @@ fn a_check_links_its_proc_macros_as_wasm_modules() {
 fn an_archive_where_a_wasm_module_is_expected_is_refused_naming_both_kinds() {
     let mut macros = target("m", "proc-macro", "/w/m/src/lib.rs");
     macros.crate_types = vec!["proc-macro".to_owned()];
-    let record = compile::crate_record(&unit(P, macros, Mode::Build, &[]), None, &[]);
+    let record = compile::crate_record(&unit(P, macros, Mode::Build, &[]), &test_places(), None, &[]);
     let path = "/t/wasm32-wasip1+macros/debug/build/m/0/out/m-0.wasm";
     let error = compile::module_at(path, record).unwrap_err();
     assert_eq!(
@@ -1623,6 +1632,7 @@ fn script_front_for(
     let script = &units.graph.units[1];
     let base = compile::RecordInputs {
         identity,
+        places: &test_places(),
         unit: compile::KeyedUnit::among(script, |at| Ok(&units.graph.units[at])).unwrap(),
         plan: &units.plans[1],
         run_env: &[],
@@ -2338,6 +2348,7 @@ fn each_maker_of_a_record_moves_its_key() {
         let u = &front.units.graph.units[0];
         compile::RecordInputs {
             identity,
+            places: &test_places(),
             unit: compile::KeyedUnit::among(u, |at| Ok(&front.units.graph.units[at])).unwrap(),
             plan: &front.units.plans[0],
             run_env: &[],
@@ -2383,6 +2394,7 @@ fn the_goal_moves_a_units_record_key() {
         let u = &front.units.graph.units[0];
         compile::RecordInputs {
             identity,
+            places: &test_places(),
             unit: compile::KeyedUnit::among(u, |at| Ok(&front.units.graph.units[at])).unwrap(),
             plan: &front.units.plans[0],
             run_env: &[],
@@ -2423,6 +2435,7 @@ fn a_dependency_gaining_sealed_moves_a_reached_only_dependents_key_and_checks_it
         let u = &front.units.graph.units[unit];
         compile::RecordInputs {
             identity,
+            places: &test_places(),
             unit: compile::KeyedUnit::among(u, |at| Ok(&front.units.graph.units[at])).unwrap(),
             plan: &front.units.plans[unit],
             run_env: &[],

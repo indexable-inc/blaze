@@ -126,6 +126,24 @@ pub struct Files {
     views: Log<Box<[View]>>,
     /// The index in `views` of the list in use, plus one; 0 for none.
     view: AtomicU32,
+    /// How a key that must not say where this database's checkout is writes a path
+    /// ([`Port`]): told once a database ([`Files::set_port`]), before any key is asked.
+    port: OnceLock<std::sync::Arc<dyn Port>>,
+}
+
+/// How a path is written in a key that must not say where a checkout, its build directory or
+/// the machine's shared directories are (docs/v2/plan/design/store.md, "Content keys"): each
+/// of those directories, wherever it starts a path in `bytes`, as what it is (the workspace,
+/// the build directory), so the same sources in another directory, under another home or on
+/// another machine give the same bytes. The one implementation is blaze-usercode's roots
+/// (`Roots::ported`), handed in by whoever knows the directories (blaze-cargo's
+/// `serve::unit::portable`); a database told none writes every path as it is.
+///
+/// The invariant: for one set of directories, two byte strings are ported to the same bytes
+/// only when they are equal (`Roots::unport` gives a ported string back), so a ported key
+/// tells apart everything the unported one did but where the directories are.
+pub trait Port: Send + Sync + 'static {
+    fn ported<'b>(&self, bytes: &'b [u8]) -> std::borrow::Cow<'b, [u8]>;
 }
 
 struct Included {
@@ -353,6 +371,7 @@ impl Default for Files {
             expansions_read: ReadLock::new("db.files.expansions_read", Default::default()),
             views: Log::new(1 << 16),
             view: AtomicU32::new(0),
+            port: OnceLock::new(),
         }
     }
 }
@@ -1112,6 +1131,21 @@ impl Files {
 
     pub fn env_is_read(&self, krate: Crate, key: &str) {
         note_env(&self.env_read, krate, key);
+    }
+
+    /// Tells the database how its portable keys write paths ([`Port`]): once, before any is
+    /// asked. A second telling is refused (`false`): a key made under the first would stay,
+    /// made from other directories than the second names.
+    pub fn set_port(&self, port: std::sync::Arc<dyn Port>) -> bool {
+        self.port.set(port).is_ok()
+    }
+
+    /// `bytes` as a portable key writes them ([`Port`]): as they are while no port is told.
+    pub fn ported<'b>(&self, bytes: &'b [u8]) -> std::borrow::Cow<'b, [u8]> {
+        match self.port.get() {
+            Some(port) => port.ported(bytes),
+            None => std::borrow::Cow::Borrowed(bytes),
+        }
     }
 
     /// Sorted.

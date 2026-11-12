@@ -85,11 +85,24 @@ pub enum Role {
     Tools,
     /// The launcher that makes the sandbox.
     Launcher,
+    /// Where the machine's daemons share the standard library's units (`<machine>/std/<makers>`):
+    /// a unit record's root alone (`blaze-cargo`'s `serve::unit::portable`), no run's.
+    Std,
 }
 
 impl Role {
-    pub const ALL: [Role; 6] =
-        [Role::Package, Role::OutDir, Role::Target, Role::Workspace, Role::Tools, Role::Launcher];
+    /// In the order of their declaration; a role is only ever added at the end, so what is
+    /// written role by role ([`Roots::layout`], `verify::Origin`) is as it was for the roots a
+    /// run had before.
+    pub const ALL: [Role; 7] = [
+        Role::Package,
+        Role::OutDir,
+        Role::Target,
+        Role::Workspace,
+        Role::Tools,
+        Role::Launcher,
+        Role::Std,
+    ];
 
     /// The byte after `\0` in its placeholder.
     pub fn tag(self) -> u8 {
@@ -100,6 +113,7 @@ impl Role {
             Role::Workspace => b'w',
             Role::Tools => b'b',
             Role::Launcher => b'l',
+            Role::Std => b's',
         }
     }
 
@@ -115,6 +129,7 @@ impl Role {
             Role::Workspace => "workspace",
             Role::Tools => "tools",
             Role::Launcher => "launcher",
+            Role::Std => "shared standard library directory",
         }
     }
 

@@ -75,6 +75,7 @@ real! {
     build_then_run_then_build_are_no_ops
     the_first_edit_after_a_cold_build_with_a_build_script_dependency
     the_first_test_after_a_run
+    the_same_sources_in_another_directory_under_another_home
 }
 
 /// Every directory of `cases/` runs under each driver it names: a case no list holds would

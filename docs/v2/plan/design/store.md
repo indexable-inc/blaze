@@ -204,6 +204,80 @@ find each other's results (`crates/blaze-usercode/src/roots.rs`).
   completions, flush it and lend it to jobs (`JobInput`) and to `Expansions`, and puts to say
   which store they go to.
 
+## Content keys
+
+2026-11-12, lane content-keys-1112. The rule every record key follows, what is built of it, and
+what is not. Code: `crates/blaze-cargo/src/serve/unit/portable.rs`.
+
+**The rule.** A record's key is the hash of three things and nothing else:
+
+1. *The action*: which stage made it (front end, code generator, record maker, linker), by that
+   stage's code identity.
+2. *The content of each input*: a source by its content hash under its logical name (a
+   workspace file by its path from the workspace's root, a std file under
+   `/rustc/<commit>/library`, an `OUT_DIR` file by its path from the build directory); cfg,
+   features, target, profile, the goal; flags as text. Never an absolute path of a checkout, a
+   home or a machine directory.
+3. *For each dependency, the digest of what this stage reads of it*, not the dependency's key.
+
+**Paths.** The build names its directories by what they are (`Places`: workspace, build
+directory, shared std directory, tools, launcher; the roots of "Portable keys" above, one
+mechanism). A key holds each as its placeholder plus how they sit to each other
+(`Roots::layout`); the real path is bound at use: a record's strings are written against the
+making build's directories and read back against the finding build's. This is what rustc's
+`--remap-path-prefix` does to the *output* only (cargo still keys on the absolute path, so
+sccache needs identical paths), and what Bazel and Buck2 get by running actions in an exec root
+with relative paths. blaze does the Buck2 thing for keys and the remap thing for values.
+
+**Where a crate really embeds a path, the key covers it; this is read, never guessed.** After a
+record and each output are written against the directories, their bytes are searched for every
+directory in any spelling (`Roots::embedded`). One that still holds a directory (a constant
+from `env!("CARGO_MANIFEST_DIR")`, a diagnostic quoting an absolute name, a search path linked
+in) is filed under its key *here* (the key and each directory's real path), which only a build
+with the same directories asks. A dependence that leaves no bytes (a path's length) can only
+come from a crate's own path-valued variable read by `env!` (the `env!` log names it) or given
+to a proc macro (no trace names it): a closure with either is filed here too.
+
+**Interface, per stage** (what item 3 means):
+
+| Reader | Reads of a dependency | Digest today |
+|---|---|---|
+| a dependent's check | signatures, types, generic, `const`, `#[inline]` and `impl Trait` bodies, positions | `Narrow::interface` (interface text; a plain body is its shape) |
+| a dependent library's codegen | the same, plus every body its walk reaches | `Narrow::code` (every body): **no cutoff yet** |
+| a link | every function's code record | each `Code` record's key; the unit key holds `Narrow::code` |
+| a build script's or macro's user | what the run printed and wrote, by value | `blaze_usercode` shapes (already by output) |
+
+So early cutoff holds today for check-only units and for runs; a library's build unit is cut
+off only once its walk stops at the crate boundary for a dependency's plain bodies (then its
+key takes `interface`), which is the walk's lane.
+
+**Determinism.** A portable key promises that two builds of one key make the same bytes. Tested
+by building in two directories under two homes and asking for zero misses with the first's store
+(`crates/blaze-engine/tests/revisions`), and in process
+(`serve/unit/tests/portable.rs`, with the path planted back as the control). `BLAZE_VERIFY_STORE`
+should also rebuild a found record and compare; not built.
+
+**Not built (each is a key that still says where something is, so a miss, never a wrong hit):**
+fetched packages (`<home>/sources`; their `file!()` names are real paths until named
+`<name>-<version>/..`); an image patched in place (`Written::Derived`, not read again, so filed
+here); doctest image records and `code_identity` (`own_code`); the daemon image; a crate that
+calls any proc macro (until macros are given virtual paths); Windows (no roots there).
+
+**The reuse mechanisms, and which collapse.** Counted from the code:
+
+| Mechanism | Key | Under this rule |
+|---|---|---|
+| unit record (whole key) | identity + plan + makers | the record, keyed as above |
+| unit record (narrow, quoted keys) | the same over code text | the same record under a narrower input digest: stays, as item 2's "content" of a source |
+| check entry | the same over `checked` | collapses into the unit record once a unit is two actions (check, build) each with its own record |
+| library narrow (`library_key`) | crate settings + files | an input digest's memo: stays |
+| build-script run, pure script, expansion | `RunKey` against roots | already this rule (by content, verified before shared) |
+| code templates | code identity | already this rule |
+| dependency image, check outcome | `image_key` with path markers | already this rule; its `Base` markers and `Places` are two homes for one concept, to merge into roots |
+| doctest image record | unit part + `code_identity` | collapses into unit records once a doctest is a unit |
+| no-op lane's answer | request + view, in memory | not a store record: stays |
+| daemon image | the database, by path | not content-keyed: stays, one checkout's |
+
 ## Cold start as a fetch: the standard library (F4)
 
 2026-11-11. A machine that has never built std spends its first build on it (10 to 12 s for

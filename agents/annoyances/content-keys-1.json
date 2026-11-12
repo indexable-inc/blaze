@@ -1,0 +1,12 @@
+{
+ "id": "content-keys-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane content-keys-1112",
+ "where": "`/root/loop.sh` on lanebase-1112",
+ "what": "The first call waited 22 minutes and never held the lock: a daemon started by an earlier caller's command had inherited the lock's descriptor. Its output, piped to `tail`, showed nothing meanwhile, so a queue and a stuck lock looked the same.",
+ "cost": "22 minutes with no measurement; the baseline of this lane was never taken on its own tree before the change",
+ "cause": "the lock's descriptor was open in the children of the loop",
+ "workaround": "none from a lane; the coordinator ended the call",
+ "fix": "done by the coordinator: children start with the lock closed, a watchdog ends a stray holder",
+ "state": "fixed in /root/loop.sh on the VM (not in the tree)"
+}

@@ -38,7 +38,7 @@ pub use crate::{
     },
     db::{Db, Reader, RunOrder, Shared, executions, set_run_order},
     editioned_file_id::EditionedFileId,
-    files::{AliasError, ExpansionRead, Files, ReadBy},
+    files::{AliasError, ExpansionRead, Files, Port, ReadBy},
     input::{
         BuiltCrateData, BuiltDependency, BuiltFor, Crate, CrateBuilder, CrateBuilderId,
         CrateDataBuilder, CrateDisplayName, CrateGraphBuilder, CrateName, CrateNamed, CrateOrigin,
@@ -874,6 +874,42 @@ pub fn crate_root_content(db: &Db, krate: Crate) -> ContentId {
         }
         hasher.finish()
     })
+}
+
+/// The domain of [`crate_root_ported`].
+const PORTED_ROOT_DOMAIN: &str = "blaze v2 crate ported files 1";
+
+/// [`crate_root_content`] for a key that must not say where the checkout is: the same files
+/// (every file of `krate`'s source root but those under another crate's `OUT_DIR`,
+/// [`other_out_dirs`], the one selection both make), each as its path written by
+/// [`Files::ported`] and its content ID, sorted by that path. A file with no path on disk is
+/// under no directory and has the empty path, as there.
+///
+/// The invariants: [`crate_root_content`]'s (a run applied for another crate leaves it), and
+/// the same files in another checkout, whose paths differ only in where the build's
+/// directories are, give the same ID.
+#[blaze_query::tracked(returns(copy))]
+pub fn crate_root_ported(db: &Db, krate: Crate) -> ContentId {
+    let root = db.source_root(db.file_source_root(krate.data(db).root_file_id).source_root_id(db));
+    let others = other_out_dirs(db, krate);
+    let set = root.source_root_ref(db);
+    // alloc: once per crate whose source root's files moved, a file each
+    let mut files: Vec<(Vec<u8>, ContentId)> = Vec::new();
+    for file in set.iter() {
+        let path = set.path_for_file(&file);
+        if path.and_then(|it| it.as_path()).is_some_and(|it| below_any(it.as_str(), others)) {
+            continue;
+        }
+        let path = path.map(|it| it.to_string()).unwrap_or_default(); // alloc: as above
+        files.push((db.files().ported(path.as_bytes()).into_owned(), db.file_content(file)));
+    }
+    files.sort_unstable();
+    let mut hasher = Hasher::new(PORTED_ROOT_DOMAIN);
+    hasher.update(&[u8::from(set.is_library)]).update(&(files.len() as u64).to_le_bytes());
+    for (path, content) in &files {
+        hasher.part(path).id(content);
+    }
+    hasher.finish()
 }
 
 pub fn relevant_crates(db: &Db, file_id: FileId) -> &[Crate] {

@@ -109,6 +109,12 @@ pub enum Step {
     /// whole, and the revisions after it change that project. Only the real driver has two
     /// checkouts.
     Project(String),
+    /// From here on the commands run under another home and another machine directory, of
+    /// this name: the daemon is stopped, and the new home starts with a copy of the store the
+    /// first home's daemon left (as a store fetched from another machine is). With
+    /// `project NAME` before it, the same sources in another directory under another home.
+    /// Only the real driver has homes.
+    Home(String),
 }
 
 /// What must come of a revision's action. Every list is of function paths as `blaze why`
@@ -201,6 +207,7 @@ impl Step {
             Step::Wait(ms) => format!("wait {ms} ms"),
             Step::Do(action) => action.word().to_owned(),
             Step::Project(name) => format!("project {name}"),
+            Step::Home(name) => format!("home {name}"),
         }
     }
 }
@@ -249,6 +256,13 @@ fn step(word: &str, at: &str) -> Step {
         "kill" => Step::Kill,
         _ => match word.split_once(' ') {
             Some(("touch", path)) => Step::Touch(path.to_owned()),
+            Some(("home", name)) => {
+                assert!(
+                    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                    "{at}: `home NAME` names a home beside the first, by letters, digits and `_`, not `{name}`"
+                );
+                Step::Home(name.to_owned())
+            }
             Some(("wait", ms)) => Step::Wait(
                 ms.strip_suffix(" ms")
                     .and_then(|it| it.parse().ok())
@@ -278,8 +292,8 @@ fn step(word: &str, at: &str) -> Step {
             _ => Step::Do(Action::of(word).unwrap_or_else(|| {
                 panic!(
                     "{at}: no step `{word}`: `edit`, `edit by rename`, `edit by truncate then write`, `edit twice`, \
-                     `stop`, `kill`, `touch PATH`, `wait N ms`, `project NAME`, `beside NAME`, `cancel build after N ms`, `check`, \
-                     `build`, `run`, `test`"
+                     `stop`, `kill`, `touch PATH`, `wait N ms`, `project NAME`, `beside NAME`, `home NAME`, \
+                     `cancel build after N ms`, `check`, `build`, `run`, `test`"
                 )
             })),
         },

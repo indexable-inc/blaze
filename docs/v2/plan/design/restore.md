@@ -375,6 +375,75 @@ the answer recorded. That is durable state deciding a build, so it lands with it
 (a crash and an edit between the stop and the start, the oracle that no answer is said over a
 changed input), not before.
 
+## A new project in a warm daemon (2026-11-12, lane newproj-1111; D21)
+
+The first `blaze run` of a brand-new hello-world, in a daemon that has just built another
+hello-world, should cost its own `main`. Measured on a Linux arm64 ix VM (32 cores; base
+e59419ab97, the lane's 37495ec94d; one fixed `env -i` environment, a fresh home a sample,
+outputs and exit status checked, the two binaries interleaved round by round, n = 6;
+`/tmp/newproj-1111/measure.py` and `abab.py` on the Mac, not in the tree). A dev program is
+walked and linked whole on this VM, where a Mac's takes std from the dependency image, so the
+codegen rows below are Linux's: **macOS was not run.**
+
+| | before | after | |
+|---|---|---|---|
+| first run of the new project | 13.85 s (12.9 to 19.3) | 13.70 s (13.5 to 14.3) | unchanged |
+| its second run | 1.07 s (0.96 to 1.12) | 0.67 s (0.64 to 0.75) | the fold, below |
+| its third run | 20 ms | 22 ms | the no-op lane |
+| an edit and run of the first project afterwards | 12.96 s (12.3 to 13.9) | 0.79 s (0.76 to 0.99) | its front end is kept |
+| unit records missed by the new project's first build | 27 | 2 | its own unit and its run |
+| the daemon's CPU over that build, user + system | 48.6 + 34.1 s | 39.4 + 4.3 s | one matched pair |
+
+The edit loop of one hello-world, the two binaries interleaved (5 rounds of 10 edits,
+medians): a no-op run 18.0 to 17.0 ms, a body edit and run 78.8 to 68.3 ms (66.0 to 59.7 ms
+from the fifth edit on), a comment edit and run 22.6 to 20.8 ms. The first body edit after
+the builds is 761 and 752 ms at the median; over two runs of the script it took more than a
+second once in ten before and three times in ten after, which this lane did not explain.
+
+**Where the first run's 14 s go** (build 7 of a matched pair's profiles; `spans`,
+`query_counts`, `misses`, `key_parts`):
+
+| Stage | Wall | What is computed again that the other project's build computed |
+|---|---|---|
+| `lower workspace` | 2.6 s | a database a checkout: `maintain` (`the build lowered`) 1.9 to 2.1 s resolves all 26 crates of std from source (nameres 1.4 to 1.5 s, impls 0.5 to 0.6 s) before any image is asked for (F2), then `the dependencies' images served` 0.3 to 0.6 s |
+| `unit names`, `unit check setup` of std's 26 units | 2.3 s, beside the rest | **fixed**: every unit of std missed its record (`misses`: 26 of `unit`, cause `first`); `key_part_diff` named one part, `the directory its crate's proc macros run in` |
+| `admission` of `program (Codegen)` | 1.2 to 1.3 s, then 0.3 s | a program never measured asks the whole budget (granted 101.8 GB, peak 1.2 GB) and waits to run alone; **fixed**: it no longer lets go of the other checkout's kept front end while it waits |
+| `unit codegen` | 7.0 to 8.8 s | `codegen walk`: `described 14202, verified 0, reached 12043` (5.5 s): every function the program reaches is described again, `mir optimize` 5,279 times, `Inline` 3,735, `SpendFacts unwind` 3,192, since a describe lives beside its database; one template is compiled (`main`), every other function's code is a store hit by a key that needs its describe first (R7; tiers.md) |
+| `unit link` | 0.6 s | the first link of the program: 12,043 functions, 20.9 MB written whole |
+
+2.13 to 2.37 million queries run (`inner_items` 180,422, `AttrFlags::query` 100,904,
+`item_key` 96,813, `Body::of` 83,407, `monomorphized_runtime_mir_body_query` 60,355,
+`summary_in` 58,602): none of them is new work; all of it is the other project's, in a
+database that project's checkout owns.
+
+**What was wrong, and is fixed.**
+
+- *A crate of std named the workspace that asked for it.* The library's packages are members
+  of the library's own workspace, and `crates::proc_macro_cwd` gave each the asking
+  workspace's root, which is in the crate's content ID; so every std crate, its identity and
+  each of its units' record keys moved with the project. They now run in the library's root.
+  The workspace's root was also found from the first member in the plan's order, which is a
+  package of std whenever the checkout's path sorts after the library's (`/tmp/..` against
+  `/rustc/..`): there std kept one key by accident and the workspace was given the library's
+  root, its `const-eval` budget and trusted list. `crates::root` now takes a member that is
+  not the library's. A miss now names the setting that moved
+  (`base_db::Crate::settings_parts`).
+- *The second run folded the first's edges.* 1.49 million runs' edges were folded into the
+  reverse index at the next build's first write (`reverse edges fold` 0.49 to 0.65 s of the
+  second run); `Storage::pack_reverse`, called after the answer, folds first, and storing the
+  kept front end calls it.
+- *A second project took the first one's front end.* `Plane::pick` counted a task that asks
+  the whole ceiling short of everything the process holds besides its grants, and the driver
+  let go of every kept front end for it, though no amount let go starts such a task.
+
+**What is left, which is all of the first run.** Sharing the front end (one database serving
+both checkouts: F1 above, with the two changes below it), or making a new database cheap
+(F2, then a describe as a record, R7, and optimized code under a trace, tiers.md). Neither
+was built by this lane; the target (under 100 ms) stands unmet. The case
+`a_second_project_reuses_the_standard_library` (docs/harness.md, `project NAME`) holds the
+second project to one record missed and two functions compiled, and lists its 2.3 million
+queries as known, so the bound is there to tighten.
+
 ## A restore that cannot be trusted (2026-11-11)
 
 On 2026-11-10 a daemon restored a bad `<state>/db` and failed builds of unrelated crates with
