@@ -1188,6 +1188,7 @@ pub(crate) fn generate<'db>(
             .verify_store(verify)
             .explain_misses(true)
             .keeping(&kept)
+            .recording(&job.input.store)
             .run_with_statics(&asked, &roots.statics, &roots.check_roots(origin), &store)
     };
     match built {
