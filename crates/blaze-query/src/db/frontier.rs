@@ -209,8 +209,9 @@ pub(crate) enum Plant {
     NamesEqualRows,
     /// The walk passes over a row whose value was evicted.
     SkipsEvictedRows,
-    /// The walk follows no reverse edge out of an input field that was written: the rows
-    /// that read what an edit wrote are never asked, so nothing the edit changed is found.
+    /// The walk follows no reverse edge: neither the readers of an input field that was
+    /// written nor those of a row a pull ran and found changed are asked, so nothing the
+    /// walk alone would find is found.
     ForgetsReadersOfWritten,
 }
 
@@ -302,9 +303,9 @@ impl Storage {
 
     /// Plants [`Plant::ForgetsReadersOfWritten`] in this storage's changed set: for the
     /// control of a host's test that an edit reaches what reads it (hir's body check), which
-    /// cannot name the engine's own plants. With the reverse edges out of a written input
-    /// dropped, every row is taken as unchanged after an edit, and the host's oracle, a build
-    /// from scratch, must say so. Never called outside a test.
+    /// cannot name the engine's own plants. With every reverse edge dropped, a row no pull
+    /// ran is taken as unchanged after an edit, and the host's oracle, a build from scratch,
+    /// must say so. Never called outside a test.
     #[doc(hidden)]
     pub fn plant_forgotten_readers_of_written(&mut self) {
         self.frontier.plant = Plant::ForgetsReadersOfWritten;
@@ -711,6 +712,9 @@ fn walk(db: *const (), storage: &Storage) {
             }
         }
         first = false;
+        if plant == Plant::ForgetsReadersOfWritten {
+            changed.clear();
+        }
         plan.suspects(&frontier.reverse, &mut changed, &mut suspects);
         if suspects.is_empty() {
             if frontier.changed.is_empty() || plant == Plant::StopsAtChangedReader {
