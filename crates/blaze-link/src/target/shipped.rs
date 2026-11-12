@@ -1,5 +1,5 @@
 //! What blaze ships of a target's C library, so a link of Rust alone reads nothing the machine
-//! installed (docs/linking.md, "Cross compilation"; docs/v2/plan/design/toolchain-c.md, slice 9's
+//! installed (docs/v2/plan/design/toolchain-c.md, "Cross compilation"; docs/v2/plan/design/toolchain-c.md, slice 9's
 //! link half):
 //!
 //! - glibc: which symbols each of its libraries exports at each release, from glibc's own

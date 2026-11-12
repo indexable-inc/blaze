@@ -807,7 +807,7 @@ impl Target {
     /// Otherwise why not, naming the first input that is not: such a link takes the machine's
     /// C toolchain for all of it, since an object compiled against the machine's libc and a
     /// library found on the machine go with that libc, not with blaze's list of another
-    /// release (docs/linking.md, "Cross compilation").
+    /// release (docs/v2/plan/design/toolchain-c.md, "Cross compilation").
     fn ships(self, output: &Output, libs: &[CrateLibs<'_>]) -> Result<(), String> {
         let named: fn(Target, &str) -> bool = match self {
             Target::LinuxX86_64 | Target::LinuxAarch64 => {

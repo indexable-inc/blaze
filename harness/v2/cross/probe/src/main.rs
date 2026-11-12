@@ -1,4 +1,4 @@
-//! What a cross-built program is run for on its target (docs/linking.md, "Cross compilation"):
+//! What a cross-built program is run for on its target (docs/v2/plan/design/toolchain-c.md, "Cross compilation"):
 //! five checks of std over the target's C library, each printed as `ok <name>`, then
 //! `cross-probe: 5 of 5`. Any failure panics, so the exit status says it. Pure Rust: it links
 //! nothing but what blaze ships for the target.
