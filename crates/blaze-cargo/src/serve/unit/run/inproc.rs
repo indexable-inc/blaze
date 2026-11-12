@@ -595,8 +595,11 @@ fn held(
 }
 
 /// The runs a `blaze run` started by process ID ([`Loaded::launch`]): each one's start, which
-/// the program is told has exited when its channel hangs up.
-type Launched = Arc<SharedMap<u32, Started>>;
+/// the program is told has exited when its channel hangs up, and when it was launched (for
+/// the `dev run attached` span). One whose start hook never attached is taken out when its
+/// start's wait ends ([`sessions_of`]), so an entry lives no longer than its process, or
+/// than the start's 60 s for a process that never attached.
+type Launched = Arc<SharedMap<u32, (Started, std::time::Instant)>>;
 
 /// What the thread that serves a program's runs holds of it: the program itself only weakly,
 /// so dropping the program ends the thread.
@@ -738,7 +741,7 @@ impl Loaded {
         };
         let (command, started, wrote) =
             self.program.command_placed(command, false, placed).map_err(|it| it.to_string())?;
-        self.launched.pin().insert(pid, started);
+        self.launched.pin().insert(pid, (started, std::time::Instant::now()));
         let env = command
             .env
             .into_iter()
@@ -779,6 +782,18 @@ fn sessions_of(
         match session {
             Ok(session) => {
                 let pid = session.pid;
+                // How long the program's start took from the daemon's side: from the launch
+                // answered to its start hook attached (the CLI's exec, the loader, and the
+                // handshake that lays the code memory over the image before `main`).
+                if let Some((_, at)) = served.launched.pin().get(&pid) {
+                    tracing::info_span!(
+                        target: "blaze",
+                        "dev run attached",
+                        pid,
+                        after_us = at.elapsed().as_micros() as u64,
+                    )
+                    .in_scope(|| {});
+                }
                 // clone: three counts and a weak one, once per run started
                 let (patch, failures, launched, program) = (
                     served.patch.clone(),
@@ -790,7 +805,7 @@ fn sessions_of(
                     .name("blaze dev run asks".to_owned())
                     .spawn(move || {
                         serve(session, &patch, &failures);
-                        let started = launched.pin().remove(&pid).copied();
+                        let started = launched.pin().remove(&pid).map(|(started, _)| *started);
                         if let (Some(started), Some(program)) = (started, program.upgrade()) {
                             program.exited(started);
                         }
@@ -799,7 +814,19 @@ fn sessions_of(
                     served.failures.push(format!("serving process {pid}'s asks: {error}"));
                 }
             }
-            Err(error) => served.failures.push(error.to_string()),
+            Err(error) => {
+                served.failures.push(error.to_string());
+                // The start that failed names no process: each launched run whose start
+                // ended unattached is forgotten, here and by the program.
+                if let Some(program) = served.program.upgrade() {
+                    let launched = served.launched.pin();
+                    for (pid, (started, _)) in launched.iter() {
+                        if program.forget_ended(*started) {
+                            launched.remove(pid);
+                        }
+                    }
+                }
+            }
         }
     }
 }
