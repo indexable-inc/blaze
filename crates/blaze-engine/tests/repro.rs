@@ -994,8 +994,8 @@ fn blaze_new_then_run_works_for_the_blaze_edition_and_for_rust() {
 }
 
 /// `blaze::not_latest_edition` (docs/lints.md#not_latest_edition), through `blaze check`: a
-/// workspace package on a Rust edition is told exactly once; its path dependency outside
-/// the workspace is not told; allowing the lint silences it; denying it fails the check
+/// workspace package on a Rust edition is told exactly once; its path dependency that is no
+/// member of the workspace is not told; allowing the lint silences it; denying it fails the check
 /// naming the lint; a package of the blaze edition is told nothing. The workspace asks for
 /// the lint by name, since its default waits for `ready::EDITION_SHIPS`.
 #[test]
@@ -1009,7 +1009,9 @@ fn a_package_not_on_the_latest_blaze_edition_is_told_once() {
             "" => String::new(),
             level => format!("\n[workspace.metadata.blaze.lints]\nnot_latest_edition = \"{level}\"\n"),
         };
-        format!("{}{lints}", edition_program("2024", "old = { path = \"old\" }\n"))
+        // `old` is beneath the workspace's root, which would make it a member, told as one:
+        // excluded, it is a dependency by path that is not the workspace's own.
+        format!("{}exclude = [\"old\"]\n{lints}", edition_program("2024", "old = { path = \"old\" }\n"))
     };
     case.write("Cargo.toml", &with("warn"));
     let out = case.ok_in("", &["check"]);
