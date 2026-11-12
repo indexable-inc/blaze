@@ -38,6 +38,9 @@ impl Instant {
 
     /// The deadline at this moment.
     #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn deadline(self) -> Deadline {
         Deadline::at(self.0)
     }
@@ -72,6 +75,9 @@ impl core::error::Error for SleepError {}
 
 impl From<Stopped> for SleepError {
     #[blaze::pure]
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 fn from(stopped: Stopped) -> SleepError {
         SleepError::Stopped(stopped)
     }
@@ -79,6 +85,8 @@ fn from(stopped: Stopped) -> SleepError {
 
 impl Clock {
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn new(io: Io) -> Clock {
         Clock { io }
     }

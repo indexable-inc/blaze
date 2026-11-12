@@ -339,6 +339,7 @@ fn chunk<A: Allocator>(out: &mut Vec<u8, A>, name: ChunkName, data: &[u8]) {
 }
 
 #[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn encode<A: Allocator + Clone, B: Allocator>(image: &Image<B>, alloc: A) -> Result<Vec<u8, A>, ImageError> {
     let (width, height) = (image.width(), image.height());
     let stride = image.stride();

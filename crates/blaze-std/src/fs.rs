@@ -176,6 +176,9 @@ impl Durable {
 
 impl From<Unsynced> for Durable {
     #[blaze::pure]
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 fn from(unsynced: Unsynced) -> Durable {
         match unsynced {
             Unsynced::No => Durable::No,
@@ -240,6 +243,9 @@ enum Kind<'a> {
 impl<'a> Content<'a> {
     /// These bytes, written.
     #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub const fn bytes(bytes: &'a [u8]) -> Content<'a> {
         Content { kind: Kind::Bytes(bytes) }
     }
@@ -248,6 +254,8 @@ impl<'a> Content<'a> {
     /// none are forced out. A file system that cannot share blocks fails the publish, naming
     /// both volumes; nothing copies in its place ([`Content::copy_of`] is the copy).
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub const fn file(base: &'a Flushed) -> Content<'a> {
         Content { kind: Kind::CloneOf(base) }
     }
@@ -257,6 +265,8 @@ impl<'a> Content<'a> {
     /// out, and for a file system that cannot share blocks. Each chunk passes through one
     /// buffer of the driver's.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub const fn copy_of(of: &'a File<ReadOnly>, chunk: NonZero<usize>) -> Content<'a> {
         Content { kind: Kind::CopyOf { of, chunk } }
     }
@@ -264,6 +274,8 @@ impl<'a> Content<'a> {
     /// What `base` holds with each of `patches` written over it, in order: a clone, then the
     /// ranges that differ.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub const fn patch_of(base: &'a Flushed, patches: &'a [Patch<'a>]) -> Content<'a> {
         Content { kind: Kind::PatchOf { base, patches } }
     }
@@ -287,6 +299,8 @@ pub enum Placed {
 impl Placed {
     /// The file, to read.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn as_file(&self) -> &File<ReadOnly> {
         match self {
             Placed::Written(written) => written.as_file(),
@@ -432,6 +446,8 @@ impl FsError {
 
     /// The stop, if the wait stopped.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn stopped(&self) -> Option<&Stopped> {
         match &self.kind {
             FsKind::Stopped(stopped) => Some(stopped),
@@ -685,6 +701,8 @@ pub struct Fs {
 
 impl Fs {
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn new(io: Io) -> Fs {
         Fs { io }
     }
@@ -762,6 +780,7 @@ impl Dir<ReadWrite> {
 
     /// The bytes that may still be written through it; `None` with no quota.
     #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn quota_left(&self) -> Option<u64> {
         self.quota.as_deref().map(Budget::left)
     }
@@ -770,6 +789,8 @@ impl Dir<ReadWrite> {
 impl<#[blaze::linear] P: Rights> Dir<P> {
     /// Where it is, under the driver's root.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn name(&self) -> &FileName {
         &self.base
     }
@@ -793,6 +814,8 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
 
     /// The world it is in: for a capability made from a directory ([`crate::local::Local`]).
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn io(&self) -> &Io {
         &self.io
     }
@@ -1164,6 +1187,8 @@ impl From<File<ReadOnly>> for Written {
     /// Any file may be taken as one whose bytes may not have reached the disk: it claims
     /// less.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn from(file: File<ReadOnly>) -> Written {
         Written { file }
     }
@@ -1173,6 +1198,8 @@ impl From<Flushed> for Written {
     /// A flushed file taken as one that may not be: it claims less. The way back from a
     /// stale `Flushed` is this and [`Written::flush`].
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn from(flushed: Flushed) -> Written {
         Written { file: flushed.file }
     }
@@ -1185,11 +1212,15 @@ impl Written {
 
     /// The file, to read.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn as_file(&self) -> &File<ReadOnly> {
         &self.file
     }
 
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn name(&self) -> &FileName {
         &self.file.name
     }
@@ -1253,11 +1284,15 @@ impl Flushed {
 
     /// The file, to read.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn as_file(&self) -> &File<ReadOnly> {
         &self.file
     }
 
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn name(&self) -> &FileName {
         &self.file.name
     }
@@ -1335,6 +1370,8 @@ impl<#[blaze::linear] P: Rights> fmt::Debug for File<P> {
 
 impl<#[blaze::linear] P: Rights> File<P> {
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn name(&self) -> &FileName {
         &self.name
     }

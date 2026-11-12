@@ -396,6 +396,7 @@ impl SimWorld {
     /// The world of [`Io::sim`]: no faults beyond latency, no environment, no arguments, the
     /// simulated host, every capability offered, with the bounds `limits`.
     #[blaze::pure]
+    #[blaze::nonblocking]
     pub fn new(seed: u64, limits: Limits) -> SimWorld {
         SimWorld {
             limits,
@@ -580,6 +581,8 @@ impl Io {
 
     /// What the host offers: fixed when this `Io` was made.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn offers(&self) -> Offers {
         self.offers
     }

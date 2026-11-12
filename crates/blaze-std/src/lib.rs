@@ -409,6 +409,9 @@ impl core::error::Error for Stopped {}
 /// [`fs::ReadWrite`]): the one way such a value ends, besides its type's own consuming calls.
 #[blaze::consumes]
 #[blaze::pure]
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn consume<#[blaze::linear] T>(_: T) {}
 
 /// A safeguard a test turns off to prove its oracle sees the bug (skill `testing`, planted-bug

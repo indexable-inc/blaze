@@ -78,6 +78,7 @@ impl NameChange {
 
 /// The directory `name` is in: everything before its last `/`, or the root's empty name.
 #[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn dir_of(name: &FileName) -> &str {
     match name.as_str().rsplit_once('/') {
         Some((dir, _)) => dir,
@@ -126,12 +127,15 @@ pub(crate) fn new(seed: u64) -> Disk {
     }
 
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn counts(&self) -> DiskCounts {
         self.counts
     }
 
     /// A caller waited for the device: a flush or a name sync it did not return before.
     #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn waited(&mut self) {
         self.counts.device_waits += 1;
     }

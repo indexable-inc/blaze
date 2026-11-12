@@ -51,6 +51,8 @@ pub struct Module {
 
 impl Module {
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn name(&self) -> &ModuleName {
         &self.name
     }
@@ -65,6 +67,8 @@ pub struct Code {
 
 impl Code {
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn new(io: Io) -> Code {
         Code { io, allowed: Allowed::Any }
     }

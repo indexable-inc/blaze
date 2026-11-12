@@ -78,6 +78,9 @@ pub struct KeyEvent {
 impl KeyEvent {
     /// `key` with no modifier.
     #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn plain(key: Key) -> KeyEvent {
         KeyEvent { key, ctrl: false, alt: false }
     }
@@ -98,6 +101,8 @@ pub struct SimTerm {
 impl SimTerm {
     /// 80 by 24, cooked, with nothing written and no key to send.
     #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::nonblocking]
     pub fn new() -> SimTerm {
         SimTerm {
             size: Size { cols: 80, rows: 24 },
@@ -112,6 +117,8 @@ impl SimTerm {
 
 impl Default for SimTerm {
     #[blaze::pure]
+#[blaze::nopanic]
+#[blaze::nonblocking]
 fn default() -> SimTerm {
         SimTerm::new()
     }
@@ -150,6 +157,8 @@ pub struct Term {
 
 impl Term {
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn new(io: Io) -> Term {
         Term { io }
     }

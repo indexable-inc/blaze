@@ -31,6 +31,8 @@ pub struct Resolver {
 
 impl Resolver {
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn new(io: Io, reach: net::Allowed) -> Resolver {
         Resolver { io, reach, allowed: Allowed::Any }
     }

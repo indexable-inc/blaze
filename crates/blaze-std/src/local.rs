@@ -163,6 +163,8 @@ pub fn pair(name: &'static str, capacity: NonZero<usize>) -> Pair {
 impl End {
     /// The pair's name.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn pair(&self) -> &'static str {
         self.half.link.name
     }

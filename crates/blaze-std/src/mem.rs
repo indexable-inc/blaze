@@ -43,12 +43,15 @@ pub struct Bytes<'a> {
 impl<'a> Bytes<'a> {
     /// Empty bytes in `frame`, which say they are `arena`'s when they run out of room.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn new_in(frame: &'a Frame, arena: &'static str) -> Bytes<'a> {
         Bytes { bytes: Vec::new_in(frame), arena }
     }
 
     /// `more` added at the end, or [`Stopped::OutOfMemory`] with the bytes as they were.
     #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn try_extend(&mut self, more: &[u8]) -> Result<(), Stopped> {
         self.try_reserve(more.len())?;
         self.bytes.extend_from_slice(more);
@@ -57,6 +60,7 @@ impl<'a> Bytes<'a> {
 
     /// Room for `more` bytes past the end, or [`Stopped::OutOfMemory`].
     #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn try_reserve(&mut self, more: usize) -> Result<(), Stopped> {
         self.bytes
             .try_reserve(more)
@@ -67,6 +71,7 @@ impl<'a> Bytes<'a> {
     /// [`crate::pending::Pending`] read), or [`Stopped::OutOfMemory`] with the bytes as they
     /// were.
     #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn grow_zeroed(&mut self, more: usize) -> Result<&mut [u8], Stopped> {
         self.try_reserve(more)?;
         let at = self.bytes.len();
@@ -76,32 +81,44 @@ impl<'a> Bytes<'a> {
 
     /// Only the first `len` bytes kept; nothing changes if it holds no more.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn truncate(&mut self, len: usize) {
         self.bytes.truncate(len);
     }
 
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn as_slice(&self) -> &[u8] {
         &self.bytes
     }
 
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn len(&self) -> usize {
         self.bytes.len()
     }
 
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
 
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn clear(&mut self) {
         self.bytes.clear();
     }
 
     /// The name its running out of room says.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn arena(&self) -> &'static str {
         self.arena
     }
@@ -121,6 +138,8 @@ pub struct Mem {
 
 impl Mem {
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn new(io: Io) -> Mem {
         Mem { io }
     }
@@ -148,23 +167,31 @@ pub struct Arena {
 
 impl Arena {
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn name(&self) -> &'static str {
         self.name
     }
 
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn limit(&self) -> usize {
         self.limit
     }
 
     /// Bytes handed out so far, alignment included: never more than [`Arena::limit`].
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn used(&self) -> usize {
         self.frame.used()
     }
 
     /// Empty bytes in the arena.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn bytes(&self) -> Bytes<'_> {
         Bytes::new_in(&self.frame, self.name)
     }
@@ -172,6 +199,8 @@ pub fn limit(&self) -> usize {
     /// The arena's frame itself, its limit kept: for an owner that shares it between a
     /// collection and its elements ([`crate::eval`]'s generations).
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn into_frame(self) -> Frame {
         self.frame
     }
@@ -179,6 +208,8 @@ pub fn limit(&self) -> usize {
     /// The allocator, for a collection of the caller's (`Vec::new_in(arena.alloc())`), grown
     /// through its `try_` forms.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn alloc(&self) -> &Frame {
         &self.frame
     }

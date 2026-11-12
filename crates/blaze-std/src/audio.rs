@@ -117,6 +117,8 @@ pub struct Audio {
 
 impl Audio {
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn new(io: Io) -> Audio {
         Audio { io }
     }

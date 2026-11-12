@@ -30,6 +30,8 @@ pub struct Roots {
 
 impl Roots {
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn new(anchors: Arc<[Anchor]>, plant: Plant) -> Roots {
         Roots { anchors, allowed: Allowed::Any, plant }
     }
@@ -49,18 +51,24 @@ pub(crate) fn new(anchors: Arc<[Anchor]>, plant: Plant) -> Roots {
 
     /// Whether `name` is trusted.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn trusts(&self, name: &Authority) -> bool {
         self.each().any(|anchor| &anchor.name == name)
     }
 
     /// Each anchor trusted, in the host's order.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn each(&self) -> impl Iterator<Item = &Anchor> {
         self.anchors.iter().filter(|anchor| self.allowed.allows(&anchor.name))
     }
 
     /// Whether it trusts no one.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn is_empty(&self) -> bool {
         self.each().next().is_none()
     }

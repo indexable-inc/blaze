@@ -52,6 +52,8 @@ impl core::error::Error for VarNameError {}
 /// Why `raw` is no variable name, if it is not. A `const fn`, so [`crate::var!`] checks a
 /// literal as the crate compiles with the same rule [`VarName::new`] checks at run time.
 #[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub const fn refused(raw: &str) -> Option<VarNameWhy> {
     let bytes = raw.as_bytes();
     if bytes.is_empty() {
@@ -71,6 +73,8 @@ pub const fn refused(raw: &str) -> Option<VarNameWhy> {
 
 /// [`refused`], as a compile-time panic: what [`crate::var!`] evaluates in a `const`.
 #[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub const fn check_literal(raw: &str) {
     if let Some(why) = refused(raw) {
         panic!("{}", why.says());
@@ -79,6 +83,7 @@ pub const fn check_literal(raw: &str) {
 
 impl VarName {
     #[blaze::pure]
+#[blaze::nonblocking]
 pub fn new(raw: &str) -> Result<VarName, VarNameError> {
         if let Some(why) = refused(raw) {
             // alloc: an error's message.
@@ -89,6 +94,8 @@ pub fn new(raw: &str) -> Result<VarName, VarNameError> {
     }
 
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -110,6 +117,7 @@ impl TryFrom<&str> for VarName {
     type Error = VarNameError;
 
     #[blaze::pure]
+#[blaze::nonblocking]
 fn try_from(raw: &str) -> Result<VarName, VarNameError> {
         VarName::new(raw)
     }
@@ -151,6 +159,8 @@ pub struct Env {
 
 impl Env {
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn new(vars: Arc<[(String, String)]>, plant: Plant) -> Env {
         Env { vars, allowed: None, plant }
     }
@@ -159,6 +169,7 @@ pub(crate) fn new(vars: Arc<[(String, String)]>, plant: Plant) -> Env {
     /// this may not read it. The two are never one answer: a program that was narrowed away
     /// from a variable does not take it for unset.
     #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn get(&self, name: &VarName) -> Result<Option<&str>, NotAllowed> {
         if !self.may_read(name) {
             // clone: an error's name of its variable, a refcount.
@@ -169,6 +180,8 @@ pub(crate) fn new(vars: Arc<[(String, String)]>, plant: Plant) -> Env {
 
     /// Whether this may read `name`, set or not.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn may_read(&self, name: &VarName) -> bool {
         self.may_read_str(name.as_str())
     }
@@ -191,6 +204,8 @@ pub(crate) fn new(vars: Arc<[(String, String)]>, plant: Plant) -> Env {
 
     /// Each variable this may read that is set, in the world's order.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn each(&self) -> impl Iterator<Item = (&str, &str)> {
         self.vars
             .iter()

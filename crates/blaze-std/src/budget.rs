@@ -109,6 +109,7 @@ impl Budget {
 
     /// That this budget has no room for `asked` bytes, as it stands.
     #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn over(&self, asked: u64) -> Over {
         Over { limit: self.limit, used: self.used.load(Ordering::Acquire), asked }
     }

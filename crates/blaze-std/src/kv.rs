@@ -86,6 +86,8 @@ impl core::error::Error for KeyError {}
 
 /// Why `raw` is no key, if it is not.
 #[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub const fn refused(raw: &str) -> Option<KeyWhy> {
     let bytes = raw.as_bytes();
     if bytes.is_empty() {
@@ -112,6 +114,7 @@ impl Key {
     ///
     /// The contract: a key is 1 to [`KEY_MOST`] bytes.
     #[blaze::pure]
+    #[blaze::nonblocking]
     pub fn new(raw: &str) -> (r: Result<Key, KeyError>)
         ensures match &r {
             Ok(key) => !key.as_str().is_empty() && key.as_str().len() <= KEY_MOST,
@@ -126,6 +129,8 @@ impl Key {
     }
 
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -152,6 +157,7 @@ impl TryFrom<&str> for Key {
     type Error = KeyError;
 
     #[blaze::pure]
+#[blaze::nonblocking]
 fn try_from(raw: &str) -> Result<Key, KeyError> {
         Key::new(raw)
     }
@@ -190,6 +196,8 @@ impl core::error::Error for KvError {}
 impl KvError {
     /// The stop, if the wait under it stopped.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn stopped(&self) -> Option<&Stopped> {
         self.under.stopped()
     }

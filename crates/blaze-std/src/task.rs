@@ -276,18 +276,23 @@ impl<'p> Scope<'p> {
     /// Cancels the scope: the next wait of each task under it ends with
     /// [`Stopped::Cancelled`].
     #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn cancel(&self) {
         self.live.cx.cancel();
     }
 
     /// The scope's own context.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn cx(&self) -> &Cx {
         &self.live.cx
     }
 
     /// How many of its tasks are running now: none, under `Inline`, outside a task.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn running(&self) -> usize {
         self.live.running.get()
     }
@@ -316,6 +321,8 @@ impl<'p> Scope<'p> {
 impl<T> Task<'_, T> {
     /// Its name in its scope.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn name(&self) -> &'static str {
         self.name
     }
@@ -324,6 +331,8 @@ impl<T> Task<'_, T> {
     /// name). Under `Inline` it ended at its spawn, so this does not wait.
     #[blaze::consumes]
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn join(self, _cx: &Cx) -> Result<T, TaskError> {
         self.outcome
     }

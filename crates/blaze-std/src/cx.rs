@@ -147,23 +147,31 @@ impl Cx {
 
     /// The task's frame, for `Vec::new_in(cx.frame())`: freed when the task ends.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn frame(&self) -> &Frame {
         &self.frame
     }
 
     /// Empty bytes in the task's frame, named by the span when they run out of room.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn bytes(&self) -> Bytes<'_> {
         Bytes::new_in(&self.frame, self.span)
     }
 
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn plant(&self) -> Plant {
         self.plant
     }
 
     /// The world it came from.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn io(&self) -> &Io {
         &self.world
     }
@@ -271,6 +279,7 @@ pub(crate) fn plant(&self) -> Plant {
 
     /// Whether this context stopped already at `now`: then a call asks nothing of the driver.
     #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn stopped_by(&self, now: core::time::Duration) -> Result<(), Stopped> {
         if self.plant != Plant::WaitIgnoresCancel {
             self.check()?;
@@ -296,6 +305,7 @@ pub(crate) fn plant(&self) -> Plant {
     /// Cancels the scope this context's cancellation is: every context sharing it, and every
     /// scope inside it.
     #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn cancel(&self) {
         self.cancel.set.store(true, Ordering::Release);
     }

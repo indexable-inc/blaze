@@ -92,6 +92,8 @@ const fn refused(raw: &str, parent: bool) -> Option<PathWhy> {
 /// [`Path::new`]'s check, as a compile-time panic: what [`crate::path!`] evaluates in a
 /// `const`.
 #[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub const fn check_literal(raw: &str) {
     if let Some(why) = refused(raw, false) {
         panic!("{}", why.says());
@@ -110,6 +112,7 @@ macro_rules! path {
 
 impl Path {
     #[blaze::pure]
+#[blaze::nonblocking]
 pub fn new(raw: &str) -> Result<Path, PathError> {
         if let Some(why) = refused(raw, false) {
             // alloc: an error's message.
@@ -132,6 +135,8 @@ pub fn new(raw: &str) -> Result<Path, PathError> {
     }
 
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -145,11 +150,15 @@ pub fn as_str(&self) -> &str {
     }
 
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn name(&self) -> &FileName {
         &self.0
     }
 
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn of(name: FileName) -> Path {
         Path(name)
     }
@@ -171,6 +180,7 @@ impl TryFrom<&str> for Path {
     type Error = PathError;
 
     #[blaze::pure]
+#[blaze::nonblocking]
 fn try_from(raw: &str) -> Result<Path, PathError> {
         Path::new(raw)
     }

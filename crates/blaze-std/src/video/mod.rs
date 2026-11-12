@@ -49,6 +49,9 @@ pub enum PixelFormat {
 impl PixelFormat {
     /// Bytes a sample.
     #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub const fn sample_bytes(self) -> usize {
         match self {
             PixelFormat::Nv12 => 1,
@@ -80,6 +83,8 @@ impl<A: Allocator> Frame<A> {
     /// and height are even and at least 2, each plane's stride holds a row and its bytes hold
     /// every row.
     #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn new(
         format: PixelFormat,
         (width, height): (u32, u32),
@@ -111,33 +116,45 @@ impl<A: Allocator> Frame<A> {
     }
 
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn format(&self) -> PixelFormat {
         self.format
     }
 
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
 
     /// Luma, then CbCr.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn planes(&self) -> &[Plane<A>; 2] {
         &self.planes
     }
 
     /// When it is shown, in ticks of [`Frame::timescale`].
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn time(&self) -> i64 {
         self.time
     }
 
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn duration(&self) -> u32 {
         self.duration
     }
 
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn timescale(&self) -> u32 {
         self.timescale
     }
@@ -194,6 +211,8 @@ impl Mastering {
     /// The 24 bytes, big-endian, that the `mdcv` box and VideoToolbox's
     /// `MasteringDisplayColorVolume` both hold.
     #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn to_bytes(&self) -> [u8; 24] {
         let mut out = [0u8; 24];
         for (i, (x, y)) in self.primaries.iter().enumerate() {
@@ -219,6 +238,9 @@ impl ContentLight {
     /// The 4 bytes, big-endian, that the `clli` box and VideoToolbox's
     /// `ContentLightLevelInfo` both hold.
     #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn to_bytes(&self) -> [u8; 4] {
         let [a, b] = self.max_cll.to_be_bytes();
         let [c, d] = self.max_fall.to_be_bytes();
@@ -241,6 +263,9 @@ pub struct Colour {
 impl Colour {
     /// HDR10: BT.2020 primaries and matrix (9, 9), the PQ transfer (16), limited range.
     #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub const fn hdr10(mastering: Mastering, light: Option<ContentLight>) -> Colour {
         Colour { primaries: 9, transfer: 16, matrix: 9, full_range: false, mastering: Some(mastering), light }
     }
@@ -329,6 +354,9 @@ impl Encoder {
     /// engine; a software encoder is never taken in its place). Elsewhere
     /// [`VideoError::NoProvider`].
     #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn hardware(gpu: &Gpu, config: &EncoderConfig) -> Result<Encoder, VideoError> {
         config.check()?;
         Ok(Encoder { provider: hardware(gpu, config)? })
@@ -340,6 +368,8 @@ impl Encoder {
     /// reads no clock).
     #[cfg_attr(not(target_os = "macos"), expect(unused_variables, reason = "no provider here: no Encoder exists"))]
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn send<A: Allocator>(&mut self, frame: &Frame<A>) -> Result<(), VideoError> {
         match self.provider {
             #[cfg(target_os = "macos")]
@@ -351,6 +381,9 @@ impl Encoder {
     /// none is ready yet. Never waits.
     #[cfg_attr(not(target_os = "macos"), expect(unused_variables, reason = "no provider here: no Encoder exists"))]
     #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn receive<A: Allocator>(&mut self, alloc: A) -> Result<Option<Packet<A>>, VideoError> {
         match self.provider {
             #[cfg(target_os = "macos")]
@@ -361,6 +394,9 @@ impl Encoder {
     /// Every frame sent is finished: after this, [`Encoder::receive`] gives the rest of the
     /// packets and then `None`.
     #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn finish(&mut self) -> Result<(), VideoError> {
         match self.provider {
             #[cfg(target_os = "macos")]
@@ -371,6 +407,9 @@ impl Encoder {
     /// The stream's decoder configuration, an `HEVCDecoderConfigurationRecord` (`hvcC`'s
     /// payload, which a [`Track`] takes): known once the first packet has been received.
     #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn hvcc(&self) -> Option<&[u8]> {
         match self.provider {
             #[cfg(target_os = "macos")]

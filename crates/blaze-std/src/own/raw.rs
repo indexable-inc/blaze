@@ -14,12 +14,17 @@ use super::reach::Shape;
 
 /// The id of `T`, which need not outlive `'static`: an instance is its own id.
 #[blaze::pure]
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub const fn id<T: ?Sized>() -> TypeId {
     type_info::of::<T>()
 }
 
 /// Whether two ids are of one type.
 #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub const fn same(a: TypeId, b: TypeId) -> bool {
     a == b
 }
@@ -27,6 +32,8 @@ pub const fn same(a: TypeId, b: TypeId) -> bool {
 /// What a type with no `Owns` impl is.
 #[rustc_comptime]
 #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn shape(id: TypeId) -> Shape {
     match id.info().kind {
         TypeKind::Bool
@@ -48,6 +55,8 @@ pub fn shape(id: TypeId) -> Shape {
 /// How many variants: an enum's, one for anything else.
 #[rustc_comptime]
 #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn variants(id: TypeId) -> usize {
     id.variants()
 }
@@ -55,6 +64,8 @@ pub fn variants(id: TypeId) -> usize {
 /// How many fields the variant has.
 #[rustc_comptime]
 #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn fields(id: TypeId, variant: usize) -> usize {
     id.fields(variant)
 }
@@ -62,6 +73,8 @@ pub fn fields(id: TypeId, variant: usize) -> usize {
 /// The type of a field.
 #[rustc_comptime]
 #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn field(id: TypeId, variant: usize, field: usize) -> TypeId {
     id.field(variant, field).type_id()
 }
@@ -69,6 +82,8 @@ pub fn field(id: TypeId, variant: usize, field: usize) -> TypeId {
 /// The name of a field: a tuple's is its index.
 #[rustc_comptime]
 #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn field_name(id: TypeId, variant: usize, field: usize) -> &'static str {
     id.field(variant, field).name()
 }
@@ -76,6 +91,8 @@ pub fn field_name(id: TypeId, variant: usize, field: usize) -> &'static str {
 /// The name of an enum's variant.
 #[rustc_comptime]
 #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn variant_name(id: TypeId, variant: usize) -> &'static str {
     id.variant(variant).name()
 }
@@ -83,6 +100,8 @@ pub fn variant_name(id: TypeId, variant: usize) -> &'static str {
 /// What an array or slice holds, what a reference or raw pointer points at.
 #[rustc_comptime]
 #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn inner(id: TypeId) -> Option<TypeId> {
     match id.element_ty() {
         Some(element) => Some(element),
@@ -93,6 +112,8 @@ pub fn inner(id: TypeId) -> Option<TypeId> {
 /// How many generic arguments the type has.
 #[rustc_comptime]
 #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn args(id: TypeId) -> usize {
     id.generics().len()
 }
@@ -100,6 +121,7 @@ pub fn args(id: TypeId) -> usize {
 /// The generic argument at `at`, when it is a type.
 #[rustc_comptime]
 #[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn arg(id: TypeId, at: usize) -> Option<TypeId> {
     match &id.generics()[at] {
         Generic::Type(it) => Some(it.ty),
@@ -112,6 +134,8 @@ pub fn arg(id: TypeId, at: usize) -> Option<TypeId> {
 /// unsized type: a `dyn Job` is asked whether its trait vouches for it.
 #[rustc_comptime]
 #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn implements(id: TypeId, marker: TypeId) -> bool {
     core::intrinsics::reflection::type_id_vtable(id, marker).is_some()
 }
@@ -119,12 +143,16 @@ pub fn implements(id: TypeId, marker: TypeId) -> bool {
 /// The type as a diagnostic names it (`Shared<Parent>`).
 #[rustc_comptime]
 #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn name(id: TypeId) -> &'static str {
     core::reflect::name_of(id)
 }
 
 /// The first `len` bytes of `bytes` as text.
 #[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub const fn text(bytes: &[u8], len: usize) -> &str {
     // SAFETY: `len` is at most `bytes.len()` (`Reason` counts what it wrote into its own
     // array), and the bytes are whole `&str`s written one after another (`Reason::push`), so

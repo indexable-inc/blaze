@@ -46,11 +46,16 @@ pub(crate) struct Crc(u32);
 
 impl Crc {
     #[blaze::pure]
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn new() -> Crc {
         Crc(0xFFFF_FFFF)
     }
 
     #[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn update(&mut self, bytes: &[u8]) {
         for &b in bytes {
             self.0 = CRC_TABLE[((self.0 ^ u32::from(b)) & 0xFF) as usize] ^ (self.0 >> 8);
@@ -58,6 +63,9 @@ pub(crate) fn update(&mut self, bytes: &[u8]) {
     }
 
     #[blaze::pure]
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn finish(&self) -> u32 {
         self.0 ^ 0xFFFF_FFFF
     }
@@ -65,6 +73,8 @@ pub(crate) fn finish(&self) -> u32 {
 
 /// Adler-32 of `bytes`.
 #[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn adler32(bytes: &[u8]) -> u32 {
     const MOD: u32 = 65_521;
     // 5552 bytes is the most that can be summed before `b` could pass u32 (RFC 1950's NMAX).
@@ -91,18 +101,27 @@ pub(crate) struct Inflate {
 
 impl Inflate {
     #[blaze::pure]
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn new() -> Inflate {
         Inflate { state: DecompressorOxide::new(), at: 0, done: false }
     }
 
     /// Bytes written so far.
     #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn written(&self) -> usize {
         self.at
     }
 
     /// Whether the stream has ended (and its Adler-32 matched).
     #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn done(&self) -> bool {
         self.done
     }
@@ -288,6 +307,8 @@ impl<A: Allocator> Bits<'_, A> {
 
 /// A vector of `len` zeroes in `alloc`, or the error naming `what`.
 #[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn zeroed<T: Copy + Default, A: Allocator>(
     len: usize,
     alloc: A,
@@ -302,6 +323,8 @@ pub(crate) fn zeroed<T: Copy + Default, A: Allocator>(
 
 /// `data` as one zlib stream, made in `alloc`.
 #[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn compress<A: Allocator + Clone>(data: &[u8], alloc: A) -> Result<Vec<u8, A>, ImageError> {
     let n = data.len();
     // The chain heads and links hold a position plus one; 0 is none.

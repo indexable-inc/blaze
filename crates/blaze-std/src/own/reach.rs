@@ -167,6 +167,8 @@ impl Reason {
 
     /// The refusal's text.
     #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub const fn as_str(&self) -> &str {
         let len = if self.len == NONE {
             // Cut short: the bytes up to the dots, which follow the last whole piece.
@@ -356,6 +358,7 @@ const fn unseen(shape: Shape) -> &'static str {
 /// The answer to `ask` about the type `start`.
 #[rustc_comptime]
 #[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn walk(start: TypeId, ask: &Ask) -> Verdict {
     let mut walk = Walk::new(start);
     let mut at = 0;

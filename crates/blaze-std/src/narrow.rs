@@ -16,12 +16,15 @@ pub(crate) enum Allowed<T> {
 impl<T: Clone + PartialEq> Allowed<T> {
     /// Nothing at all.
     #[blaze::pure]
+    #[blaze::nonblocking]
     pub(crate) fn nothing() -> Allowed<T> {
         // alloc: once per capability that reaches nothing, an empty list's count.
         Allowed::Only(Arc::from(Vec::new()))
     }
 
     #[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn allows(&self, thing: &T) -> bool {
         match self {
             Allowed::Any => true,
@@ -31,6 +34,8 @@ pub(crate) fn allows(&self, thing: &T) -> bool {
 
     /// Whether it was never narrowed.
     #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn whole(&self) -> bool {
         matches!(self, Allowed::Any)
     }
