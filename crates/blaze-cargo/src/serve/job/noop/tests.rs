@@ -800,10 +800,10 @@ fn an_answer_with_no_diagnostic_is_said_again_to_a_client_shown_them_another_way
     let same = kept_then(&[BUILD, BUILD]);
     let quiet = runs(plain(), &ops, None).unwrap();
     assert_eq!(quiet, runs(plain(), &same, None).unwrap(), "every build after the kept one");
-    assert_eq!(quiet, 3);
+    assert_eq!(quiet, 2);
     let warns = World { warns: true, ..plain() };
-    assert_eq!(runs(warns.clone(), &same, None).unwrap(), 3);
-    assert_eq!(runs(warns, &ops, None).unwrap(), 1, "each one draws the warning again");
+    assert_eq!(runs(warns.clone(), &same, None).unwrap(), 2);
+    assert_eq!(runs(warns, &ops, None).unwrap(), 0, "each one walks, and draws the warning again");
 }
 
 #[test]
