@@ -249,10 +249,11 @@ pub fn check(
     traced: &Traced,
 ) -> Result<Read, Error> {
     // alloc: error path
+    // The one message every refusal here starts with: the script, and that it was proved pure.
+    let refusal =
+        |what: String| Error(format!("the build script of `{script}` was proved pure, but {what}"));
     let bug = |what: String| {
-        Error(format!(
-            "the build script of `{script}` was proved pure, but its run {what}: a bug in blaze's purity proof (hir-ty-pure)"
-        ))
+        refusal(format!("its run {what}: a bug in blaze's purity proof (hir-ty-pure)"))
     };
     if let Some(it) = traced.untraceable.first() {
         // Who read it, as the run's sandbox described the caller (`crate::calls`): the
@@ -330,11 +331,11 @@ pub fn check(
                 let search: Vec<String> =
                     places.search.iter().map(|it| it.display().to_string()).collect();
                 // alloc: error path
-                return Err(Error(format!(
-                    "the build script of `{script}` was proved pure, but a process of its run looked at {} (a directory, or a name with nothing there), outside its package and OUT_DIR and on no library search path blaze gave it ({}), and read no file there: the search of a loader for a library (a RUNPATH of the program or of a library loaded into it, the sandbox's own among them) rather than a read its proof denies; which program and call made it is not recorded for a read that is traced. Nothing is kept: its pure key does not cover that directory (keys-cover-every-input)",
+                return Err(refusal(format!(
+                    "a process of its run looked at {} (a directory, or a name with nothing there), outside its package and OUT_DIR and on no library search path blaze gave it ({}), and read no file there: the search of a loader for a library (a RUNPATH of the program or of a library loaded into it, the sandbox's own among them) rather than a read its proof denies; which program and call made it is not recorded for a read that is traced. Nothing is kept: its pure key does not cover that directory (keys-cover-every-input)",
                     path.display(),
                     search.join(":")
-                )));
+                ))));
             }
             // alloc: error path
             return Err(bug(format!(

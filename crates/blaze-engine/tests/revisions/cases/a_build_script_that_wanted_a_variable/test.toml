@@ -19,6 +19,8 @@ args = ["-p", "app"]
 env = { NEEDED_BY_THE_SCRIPT = "here" }
 prints = "52 here\n"
 reused = ["up::sum"]
-max_units = 2
+# The script's run, its library and the program: a run is counted among the units made.
+max_units = 3
 max_records = 2
 max_runs = 1
+known = { alarms = "the build after one that failed first does the work that one left, and `blaze why` has no recorded reason for 1 step it recomputed (2026-11-12, int-1112 d45e70ddcd: unexplained=1); the units made are as bounded (3)" }

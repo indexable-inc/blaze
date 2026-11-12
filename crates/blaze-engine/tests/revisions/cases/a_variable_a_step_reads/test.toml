@@ -13,7 +13,8 @@ args = ["-p", "app"]
 env = { MADE_VALUE = "41" }
 prints = "53 none\n"
 reused = ["up::sum"]
-max_units = 2
+# The script's run, its library and the program: a run is counted among the units made.
+max_units = 3
 max_records = 2
 max_runs = 1
 
@@ -37,6 +38,7 @@ reused = ["up::sum"]
 max_units = 1
 max_records = 1
 max_runs = 0
+known = { alarms = "after a variable a crate reads with option_env! moved, the kept front end is let go and the build lowers anew, and `blaze why` has no recorded reason for 2 of the steps that build recomputed (2026-11-12, int-1112 d45e70ddcd: unexplained=2); the units made are as bounded (1: app, redone app::tag)" }
 
 [[revision]]
 steps = []
@@ -45,5 +47,5 @@ args = ["-p", "app"]
 env = { MADE_VALUE = "40" }
 prints = "52 tagged\n"
 reused = ["up::sum"]
-max_units = 2
+max_units = 3
 max_runs = 1

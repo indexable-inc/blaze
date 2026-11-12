@@ -2210,7 +2210,13 @@ fn an_agents_targets_are_the_views_invocation() {
             args: args.iter().map(|it| (*it).to_owned()).collect(),
             root: at.clone(),
             cwd: at.clone(),
-            env: options().env,
+            // The view is opened with what the load reads of the environment
+            // (`BuildConfig::planned`): `HOME`, and not `PATH`, which no plan reads.
+            env: options()
+                .env
+                .into_iter()
+                .filter(|(name, _)| blaze_units::query::read_by_plan(name))
+                .collect(),
             files: Vec::new(),
         }
     );
