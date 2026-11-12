@@ -15,6 +15,7 @@ mod part;
 mod place_copy;
 mod place_whole;
 mod rebuild;
+mod sealed;
 mod sets;
 mod place_crash;
 mod place_made;

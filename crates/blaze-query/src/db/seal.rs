@@ -305,6 +305,9 @@ pub(crate) struct Seals {
     unsettled: AtomicU32,
     /// Rows whose group changed as a run ended, for the next pass to list under their group.
     moved: SegQueue<u32>,
+    /// [`Plant::SecondClaimAdmitted`]: a group being checked is claimed again by whoever
+    /// asks. False outside that control.
+    second_claims: bool,
     /// Checks run, seals broken and groups opened, over the storage's life.
     checks: AtomicU64,
     breaks: AtomicU64,
@@ -332,6 +335,7 @@ impl Seals {
             sealed: 0,
             unsettled: AtomicU32::new(0),
             moved: SegQueue::new(),
+            second_claims: false,
             checks: AtomicU64::new(0),
             breaks: AtomicU64::new(0),
             opens: 0,
@@ -399,7 +403,18 @@ impl Seals {
             return None;
         }
         let word = self.word(node);
-        (word & SEALED != 0 && self.state(word & GROUP) == SUSPECT).then_some((word & GROUP) as u16)
+        if word & SEALED == 0 {
+            return None;
+        }
+        let state = self.state(word & GROUP);
+        (state == SUSPECT || (self.second_claims && state == CHECKING))
+            .then_some((word & GROUP) as u16)
+    }
+
+    /// Plants or takes out [`Plant::SecondClaimAdmitted`].
+    #[cfg(test)]
+    pub(crate) fn admit_second_claims(&mut self, admit: bool) {
+        self.second_claims = admit;
     }
 
     /// Whether a group is suspect, being checked or broken.
@@ -567,11 +582,10 @@ impl Seals {
     }
 
     /// Makes, for each broken seal that has none, the group's own reverse index from the
-    /// edges of the rows behind it, and returns those groups: called by the walk (one walker
-    /// at a time, its flight), so a group is indexed once. Costs the group's rows and their
+    /// edges of the rows behind it: called by the walk (one walker at a time, its flight), so
+    /// a group is indexed once. Costs the group's rows and their
     /// edges, loads only: no row is verified or run.
-    pub(crate) fn index_broken(&self, storage: &Storage) -> Vec<u16> {
-        let mut indexed: Vec<u16> = Vec::new(); // alloc: the groups whose seal broke in this view, few
+    pub(crate) fn index_broken(&self, storage: &Storage) {
         for (number, group) in self.groups.iter().enumerate().skip(1) {
             if group.state.load(Ordering::Acquire) != BROKEN
                 || !group.overlay.load(Ordering::Acquire).is_null()
@@ -605,9 +619,32 @@ impl Seals {
             span.record("edges", read);
             // Release: a walk that loads the pointer sees the index whole.
             group.overlay.store(Box::into_raw(reverse), Ordering::Release);
-            indexed.push(number as u16); // alloc: as above
         }
-        indexed
+    }
+
+    /// The groups whose seal is broken and whose rows are indexed ([`Seals::index_broken`]).
+    pub(crate) fn broken(&self) -> Vec<u16> {
+        self.groups
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(_, group)| {
+                group.state.load(Ordering::Acquire) == BROKEN
+                    && !group.overlay.load(Ordering::Acquire).is_null()
+            })
+            .map(|(number, _)| number as u16)
+            .collect() // alloc: the groups whose seal broke in this view, few
+    }
+
+    /// Gives `each` the rows behind the broken seal of `group` that read `dep`, from the
+    /// group's own index; returns how many. Nothing for a group not indexed.
+    pub(crate) fn readers_in_group(&self, group: u16, dep: u32, each: impl FnMut(u32)) -> u64 {
+        let overlay = self.groups[group as usize].overlay.load(Ordering::Acquire);
+        if overlay.is_null() {
+            return 0;
+        }
+        // SAFETY: as in `Seals::readers_in_broken`: live until a `&mut` of the storage.
+        unsafe { &*overlay }.readers(dep, each)
     }
 
     /// Gives `each` the rows behind a broken seal that read `dep`, from the groups' own
@@ -1579,7 +1616,7 @@ pub(crate) fn resolve(db: *const (), storage: &Storage, group: u16, apart: Optio
         of.state.compare_exchange(SUSPECT, CHECKING, Ordering::AcqRel, Ordering::Acquire)
     {
         // Another task's claim is not this one's: one check a group at a time.
-        if !(now == CHECKING && storage.frontier.plant == Plant::SecondClaimAdmitted) {
+        if !(now == CHECKING && seals.second_claims) {
             return now == HELD;
         }
     }

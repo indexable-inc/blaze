@@ -466,23 +466,55 @@ impl PeriodScan {
     }
 
     /// Walks the rows. Reads no value but the pins' and the lists of the rooted records that
-    /// name others (a chunked value's list, a derived value's recipe).
+    /// name others (a chunked value's list, a derived value's recipe, an item set's
+    /// listing).
+    ///
+    /// The rows are walked twice, one at a time ([`Look::each_row`]), and never listed:
+    /// what a scan holds is the keys it roots, the records that name others and the moves
+    /// it plans, not a row of the store each. The first walk reads the pins, plans each
+    /// row and notes the records that name others; then the roots are followed; the second
+    /// walk measures what is rooted. A record read between the two walks counts as used in
+    /// the measure alone.
     pub fn run(&mut self) {
         let guard = enter();
         let shared = Arc::clone(&self.reader.shared); // clone: a count, once a scan
         let look = Look::new(&shared, Held::task(&guard));
         // alloc: once a scan (a worker's); empty unless a slot is not whole
         let mut bad = Vec::new();
-        let rows = look.rows(0, &mut bad);
         // alloc: once a scan, the pins it finds: a few
         let mut pins = Vec::new();
-        for (key, found) in &rows {
-            if found.place.kind() != Kind::Pin {
-                continue;
+        // What is kept beyond the flags, and of it what is still to be looked at for the
+        // records it names.
+        // alloc: once a scan, the keys to follow
+        let mut work: Vec<Key> = Vec::new();
+        // alloc: once a scan, the records that name others and may be forgotten
+        let mut maybe: Vec<(Key, Found<'_>)> = Vec::new();
+        let used = |found: &Found<'_>| {
+            let flag = |flag| found.at.get(flag);
+            flag(Flag::Read) || flag(Flag::ReadBefore) || flag(Flag::New) || flag(Flag::NewBefore)
+        };
+        // alloc: once a scan, the pins' rows: a few
+        let mut pin_rows: Vec<(Key, Found<'_>)> = Vec::new();
+        look.each_row(0, &mut bad, |key, found| {
+            // Read after the walk: a value is not read inside the walk's frame.
+            if found.place.kind() == Kind::Pin {
+                pin_rows.push((key, found));
             }
-            match look.value(*found, key, Use::Check) {
+            // What a record names it needs for as long as it is there. One that cannot be
+            // forgotten (used, or held by the delta and not the index table) roots what it
+            // names; one that can is looked at below, once what the roots reach is known.
+            if names_others(found.place) {
+                match used(&found) || !matches!(found.at, At::Slot(..)) {
+                    true => work.push(key),
+                    false => maybe.push((key, found)),
+                }
+            }
+            self.plan_row(look, key, found);
+        });
+        for (key, found) in pin_rows {
+            match look.value(found, &key, Use::Check) {
                 Ok((_, bytes)) => match Pin::decode(&bytes) {
-                    Ok(pin) => pins.push((*key, pin)),
+                    Ok(pin) => pins.push((key, pin)),
                     Err(why) => {
                         self.sound = false;
                         // alloc: a problem reported
@@ -497,10 +529,6 @@ impl PeriodScan {
             }
         }
         self.pins = current_pins(pins);
-        // What is kept beyond the flags, and of it what is still to be looked at for the
-        // records it names.
-        // alloc: once a scan, the keys to follow
-        let mut work: Vec<Key> = Vec::new();
         for (key, pin) in &self.pins {
             self.rooted.insert(*key);
             for key in &pin.keys {
@@ -513,28 +541,6 @@ impl PeriodScan {
             if self.rooted.insert(*key) {
                 work.push(*key);
             }
-        }
-        // alloc: once a scan, a flag a row
-        let mut flagged = vec![false; rows.len()];
-        // alloc: once a scan, the records that name others and may be forgotten
-        let mut maybe: Vec<(Key, Found<'_>)> = Vec::new();
-        for (at, (key, found)) in rows.iter().enumerate() {
-            let flag = |flag| found.at.get(flag);
-            let used = flag(Flag::Read)
-                || flag(Flag::ReadBefore)
-                || flag(Flag::New)
-                || flag(Flag::NewBefore);
-            flagged[at] = used;
-            // What a record names it needs for as long as it is there. One that cannot be
-            // forgotten (used, or held by the delta and not the index table) roots what it
-            // names; one that can is looked at below, once what the roots reach is known.
-            if names_others(found.place) {
-                match used || !matches!(found.at, At::Slot(..)) {
-                    true => work.push(*key),
-                    false => maybe.push((*key, *found)),
-                }
-            }
-            self.plan_row(look, *key, *found);
         }
         while let Some(key) = work.pop() {
             let Some(found) = look.find(&key) else { continue };
@@ -574,15 +580,18 @@ impl PeriodScan {
                 self.problems.push(why);
             }
         }
-        for (at, (key, found)) in rows.iter().enumerate() {
-            let Place::Pack(loc) = found.place else { continue };
+        // The second walk: slots that were not whole were said by the first.
+        // alloc: once a scan; empty unless a slot is not whole
+        let mut bad_again = Vec::new();
+        look.each_row(0, &mut bad_again, |key, found| {
+            let Place::Pack(loc) = found.place else { return };
             let span = disk::span_of(loc.stored).unwrap_or(0);
             self.scanned.records += 1;
             self.scanned.live_bytes += span;
-            if flagged[at] || self.rooted.contains(key) {
+            if used(&found) || self.rooted.contains(&key) {
                 self.scanned.rooted_bytes += span;
             }
-        }
+        });
         radix::sort_by_key(&mut self.demote, |(_, loc, _)| {
             (u128::from(loc.kind.code()) << 96) | radix::pack_64(u64::from(loc.pack), loc.offset)
         });
@@ -1108,17 +1117,38 @@ impl Store {
         when: u64,
         keys: &[Key],
     ) -> Result<PinAdded, Mismatch> {
+        self.pin_change(name, why, when, keys, &[])
+    }
+
+    /// [`Store::pin_add`] of `add` with `drop` let go: the name's keys as they are, less
+    /// `drop`, and `add` (a key in both stays). For a pin that names index values (an item
+    /// set's root, [`crate::sets`]): a set's new root takes the place of its root before,
+    /// so the pin stays a key a set and what only the old root named is let go. Written
+    /// only when the keys change; [`PinAdded::NotRead`] as [`Store::pin_add`] says it.
+    pub fn pin_change(
+        &mut self,
+        name: &str,
+        why: &str,
+        when: u64,
+        add: &[Key],
+        drop: &[Key],
+    ) -> Result<PinAdded, Mismatch> {
         if self.collecting.generations == 0 {
             return Ok(PinAdded::NotRead);
         }
-        // alloc: once per pin grown, its keys
-        let mut all: Vec<Key> =
+        // alloc: once per pin changed, its keys
+        let had: Vec<Key> =
             self.pins().find(|pin| pin.name == name).map_or_else(Vec::new, |pin| pin.keys.clone());
-        let had = all.len();
-        all.extend_from_slice(keys);
+        // alloc: as above
+        let mut all: Vec<Key> = had.iter().filter(|key| !drop.contains(key)).copied().collect();
+        all.extend_from_slice(add);
         all.sort_unstable();
         all.dedup();
-        if all.len() == had {
+        // alloc: as above
+        let mut before = had;
+        before.sort_unstable();
+        before.dedup();
+        if all == before {
             return Ok(PinAdded::Unchanged);
         }
         self.pin(name, why, when, &all).map(PinAdded::Written)

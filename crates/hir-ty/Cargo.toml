@@ -51,6 +51,7 @@ blaze-ids.workspace = true
 blaze-phf.workspace = true
 blaze-query.workspace = true
 blaze-reclaim.workspace = true
+blaze-record.workspace = true
 blaze-mem.workspace = true
 hashbrown.workspace = true
 stdx.workspace = true

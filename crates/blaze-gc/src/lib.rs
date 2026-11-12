@@ -59,6 +59,8 @@ mod netfs;
 pub mod pace;
 pub mod plan;
 pub mod record;
+pub mod roots;
+pub mod roots_fs;
 pub mod settings;
 pub mod space;
 
@@ -66,6 +68,8 @@ pub mod space;
 mod fs_tests;
 #[cfg(test)]
 mod pace_tests;
+#[cfg(test)]
+mod roots_tests;
 #[cfg(test)]
 mod tests;
 

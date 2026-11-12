@@ -43,18 +43,6 @@ mod tests;
 pub(super) const SCHEMA: SchemaHash =
     schema_of(&[Part::Str("blaze v2 item store constant value 1"), Part::U64(codec::VERSION as u64)]);
 
-#[cfg(test)]
-thread_local! {
-    /// How many times this thread evaluated a constant the store was asked about.
-    pub(super) static RAN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
-fn ran<T>(run: impl FnOnce() -> T) -> T {
-    #[cfg(test)]
-    RAN.with(|ran| ran.set(ran.get() + 1));
-    run()
-}
-
 /// `const_eval_query`'s store, for a constant with no generic arguments: `def`'s value, `run`
 /// unless it is stored, and offered after `run` with what it read. With no item store
 /// installed, one load and a branch.
@@ -78,9 +66,9 @@ fn stored<'db>(
 ) -> Result<StoredAllocation, ConstEvalError<'db>> {
     let body = DefWithBodyId::ConstId(def);
     match lookup(db, body) {
-        Lookup::Off => ran(run),
+        Lookup::Off => run(),
         Lookup::Miss => {
-            let (value, reads) = blaze_query::db::capture_reads(db, || ran(run));
+            let (value, reads) = blaze_query::db::capture_reads(db, run);
             // An error is not a value: the next build evaluates again and says it again.
             if let Ok(value) = &value {
                 offer(db, body, value, reads);
@@ -89,7 +77,7 @@ fn stored<'db>(
         }
         Lookup::Hit { value, verify: false } => Ok(value),
         Lookup::Hit { value, verify: true } => {
-            let fresh = ran(run);
+            let fresh = run();
             if fresh.as_ref().ok() != Some(&value) {
                 super::fail(
                     db,

@@ -715,12 +715,43 @@ own container of pages goes once (4) is in.
   file was edited still finds the unchanged items: no key → set step is needed for the live
   form. The collector's scan follows a listing (`collect::named_by`) and reads it again at
   every scan (not yet remembered by key).
-- Not built: the sealed form (and with it std and registry crates written sealed, which
-  gives up sharing an item between two versions of such a crate: accepted by the owner),
-  compaction of a quiet live set, `toolchain`/`bstd` moved to roots (`StoreEntries::keep`
-  is there; no build calls `StoreEntries::list` or `entries::set` yet), the incremental
-  scan, the cold tier in groups, a collection (not only a scan) under a pinned root in the
-  collector's simulation.
+- Built (lane storegc3; written, not yet compiled or run): the sealed form
+  (`crates/blaze-cas/src/sealed.rs`, `Sets::seal_at_once`, `seal`, `quiet`, `adopt`,
+  `follows`; simulation `tests::sealed`). As built it differs from the table above:
+  - A sealed set is keyed by its own bytes, never by its set: which items a set holds
+    depends on what was asked of the crate, so two machines would put different values
+    under a key made of the set (rule keys-cover-every-input). What finds a set's sealed
+    sets is its root, which lists them; a daemon started again learns a set's root from
+    what names it durably (a pin's keys, a build's record) through `Sets::adopt`. A set
+    whose root nothing durable names is not found after a restart: its crate's items are
+    made again. Open: registry crates have no such name yet.
+  - The directory's load is 3/4, not 7/8 (a lookup that finds reads two or three slots,
+    one that misses eight or nine, in runs of eight slots a part): an item costs its
+    32-byte key, 21 bytes of slots and padding to 8, about 57 bytes over its own.
+  - Given up, and accepted by the owner: an item of a set written sealed at once (std, a
+    registry crate) is found only under that set and the sets that follow it, never by
+    its key alone, so two versions of such a crate share no item unless the driver says
+    the new one follows the old (`Sets::follows`). Until its seal such an item is in
+    memory only: a crash before the seal loses it and it is made again.
+  - A set has at most four sealed sets; the seal that would make a fifth merges them.
+    A compaction drops nothing: the records it sealed go when the collector finds no kept
+    root naming them, so the caller moves its pin to the new root once the seal is durable.
+- Built (storegc3, not compiled): pins by index value. `Store::pin_change` adds keys and
+  lets others go in one write; `StoreEntries::keep` queues a set's root in place of the
+  root the pin named for it before, and `StoreEntries::adopt_pin` learns those roots from
+  a pin after a restart. A pin is a key a set and is rewritten (a key a set, not a key an
+  item) only when a set's root changes.
+- Built (storegc3, not compiled): a period's scan walks the rows twice through
+  `Look::each_row` and lists none of them. It is still one run on a worker under one
+  guard, not steps from a cursor, and it still holds every rooted key (32 bytes each).
+- Decided, not built: a scan reads a kept listing again each time. Remembering what a
+  listing names would hold 32 bytes an item in memory to save one page read in 128 item
+  marks; to be revisited only if the scan's span says the reads cost.
+- Not built: the driver's calls (`StoreEntries::seal_at_once` for std and registry sets,
+  `seal` and `quiet` at a build's end on a worker, `adopt_pin` once the pins are read,
+  `keep(TOOLCHAIN|BSTD, sets)` in place of item keys; no build calls `StoreEntries::list`
+  or `entries::set` yet), the scan in steps from a cursor, the cold tier in groups, a
+  collection (not only a scan) under a pinned root in the collector's simulation.
 
 ## Issues this lane takes in
 

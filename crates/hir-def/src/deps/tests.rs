@@ -1068,9 +1068,9 @@ fn process_variables_read_file_the_image_by_their_values() {
     base_db::set_process_env(&mut db, Env::from_iter([("BLAZE_DEPS_TEST".into(), "2".into())]));
     let two = reads.values_then(&db, of);
     assert!(unset != one && one != two && unset != two);
-    let record = reads.encode();
-    let key = ContentId([4; 32]);
-    assert_ne!(reads::image_key(key, &record, one), reads::image_key(key, &record, two));
+    let mut list = Vec::new();
+    reads::write_list(&mut list, ContentId([4; 32]), &reads.encode());
+    assert_ne!(reads::image_key(&list, one), reads::image_key(&list, two));
     let lib = crate_named(&db, "lib");
     assert_eq!(reads.values_now(&db, lib, &Memory::default(), |_, _| {}).unwrap(), two);
 }
@@ -1663,6 +1663,71 @@ pub fn f() {}
         "{:?}",
         stored.refused
     );
+}
+
+/// A registry crate under `dir` that includes `<dir>/outside.rs`, a file of no source root.
+fn outside_fixture(dir: &std::path::Path) -> String {
+    let dir = dir.to_str().expect("a UTF-8 temporary directory");
+    format!(
+        "//- {dir}/lib/src/lib.rs crate:lib new_source_root:library\n\
+         #[rustc_builtin_macro]\nmacro_rules! include {{ () => {{}} }}\n\
+         include!(\"../../outside.rs\");\n"
+    )
+}
+
+/// The invariant: a crate that includes a file outside the VFS has an image, filed by that
+/// file's content: the image is served while the file is as it was read, missed once it is
+/// edited (the key, which cannot cover the file, does not move), and found again when the
+/// file is put back. Until 2026-11-12 such a crate was refused an image whole.
+///
+/// The control: the same reads with the file left out have one value before and after the
+/// edit, so the image made before would be served after it.
+#[test]
+fn an_include_of_a_file_outside_the_vfs_files_the_image_by_the_files_content() {
+    let _turn = TURN.lock();
+    base_db::LOOKS_EVERY_TIME.set(true);
+    let dir = std::env::temp_dir().join(format!("blaze-deps-outside-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("outside.rs");
+    let fixture = outside_fixture(&dir);
+    let hits = |memory: &Memory| {
+        let mut db = fixture::db(&fixture).into_db();
+        let crates = all(&db);
+        let served = serve(&mut db, &crates, BUILD, memory, Mode::Serve).unwrap();
+        let hits = names(&db, &served.hits);
+        let stored = store(&db, &served, memory).unwrap();
+        assert_eq!(stored.refused, Vec::new());
+        (hits, stored.written.len())
+    };
+    let reads = || {
+        let db = fixture::db(&fixture).into_db();
+        let lib = crate_named(&db, "lib");
+        let reads = Reads::of(&db, lib, &[]).unwrap();
+        let values = reads.values_then(&db, lib);
+        let without = reads.clone().without_files_for_tests().values_then(&db, lib);
+        (reads.encode(), values, without)
+    };
+
+    std::fs::write(&file, "pub fn one() {}\n").unwrap();
+    let key = key_of(&fixture, "lib", BUILD);
+    let one = reads();
+    let memory = Memory::default();
+    assert_eq!(hits(&memory), (Vec::new(), 1), "imaged, where it was refused");
+    assert_eq!(hits(&memory), (vec!["lib".to_owned()], 0), "served while the file is as read");
+
+    std::fs::write(&file, "pub fn two() {}\n").unwrap();
+    assert_eq!(key_of(&fixture, "lib", BUILD), key, "premise: the file is not in the key");
+    let two = reads();
+    assert_eq!(one.0, two.0, "the same file is read");
+    assert_ne!(one.1, two.1, "by another content");
+    assert_eq!(one.2, two.2, "the control: with the file left out, the stale image's values");
+    assert_eq!(hits(&memory), (Vec::new(), 1), "the edit misses the image, and another is made");
+    assert_eq!(hits(&memory), (vec!["lib".to_owned()], 0));
+
+    std::fs::write(&file, "pub fn one() {}\n").unwrap();
+    assert_eq!(hits(&memory), (vec!["lib".to_owned()], 0), "put back: the first image again");
+    base_db::LOOKS_EVERY_TIME.set(false);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// A crate that includes what its build script wrote, through `concat!` and `env!`.

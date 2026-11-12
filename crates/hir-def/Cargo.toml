@@ -55,6 +55,7 @@ blaze-mem.workspace = true
 inventory.workspace = true
 blaze-phf.workspace = true
 blaze-query.workspace = true
+blaze-record.workspace = true
 
 # This is a transitive dep, but we need to specify this
 # for the workspace-wide pinning

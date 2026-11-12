@@ -14,7 +14,11 @@
 //!
 //! The workspace: the package `app` at the root (a `#![no_std]` library, which the simulated
 //! driver builds alone, and a `main.rs` that prints), and, each where [`Parts`] says, `up` (a
-//! library with a generic `app` instantiates), `vendor/made` (outside the workspace, with a
+//! library with a generic `app` instantiates), `mid` (a library built over `up`: a plain
+//! call, a generic's copy, a `const` and a generic that hold a `line!()`, an
+//! `#[inline(always)]` callee, a call whose text stays while `up`'s signature or the method it
+//! selects changes; the edits are all in `up`, so `mid`'s record found in the store across
+//! them is right only if its key covers what it read of `up`), `vendor/made` (outside the workspace, with a
 //! build script that reads two files, writes one into `OUT_DIR` for an `include!` and sets a
 //! `cfg`), and `mac` (a proc macro). The library holds a struct whose layout changes, a trait
 //! with a provided method and two impls, a call through `dyn`, a generic, a module made by
@@ -42,11 +46,14 @@ pub struct Parts {
     pub up: bool,
     pub made: bool,
     pub mac: bool,
+    /// `mid`, a library built over `up` (so `up` is there too): what early cutoff between
+    /// crates finds in the store, or must not, after an edit of `up`.
+    pub mid: bool,
 }
 
 impl Parts {
     /// The simulated driver's: the library alone.
-    pub const LIBRARY: Parts = Parts { up: false, made: false, mac: false };
+    pub const LIBRARY: Parts = Parts { up: false, made: false, mac: false, mid: false };
 }
 
 /// One edit of the workspace. A value is what the edit sets; setting what is there already
@@ -80,6 +87,22 @@ pub enum Edit {
     Generated(u8),
     /// The body of `up::sum`'s closure.
     Up(u8),
+    /// The body of `up::plain`, which `mid` calls: the baseline of an edit below a library.
+    UpPlain(u8),
+    /// A comment line more at the top of `up`, to three, then none: positions only, and
+    /// `mid` reads a `line!()` of a generic and of a `const` of `up`.
+    UpLines,
+    /// A statement more in `up::plain`'s body, or not: the lines below it move.
+    UpPad,
+    /// The body of the generic `up::twist`, whose copy for `u32` is `mid`'s to ask for.
+    UpTwist(u8),
+    /// `up::scale`'s parameter, `u32` or `u64`: `mid`'s call keeps its text.
+    UpSignature,
+    /// The body of `up::always`, `#[inline(always)]`, called from `mid`.
+    UpAlways(u8),
+    /// An inherent `name` on `up::Thing`, there or not: it wins over the trait's, so the
+    /// method `mid`'s call selects changes with no change of `mid`'s text.
+    UpInherent,
     /// The build script's own text.
     Script(u8),
     /// The file the build script reads and tells cargo of.
@@ -185,6 +208,13 @@ pub struct Model {
     loud: bool,
     generated: u8,
     up: u8,
+    up_plain: u8,
+    up_lines: u8,
+    up_pad: bool,
+    up_twist: u8,
+    up_wide: bool,
+    up_always: u8,
+    up_inherent: bool,
     script: u8,
     input: u8,
     spicy: bool,
@@ -211,6 +241,13 @@ impl Model {
             loud: false,
             generated: 0,
             up: 0,
+            up_plain: 0,
+            up_lines: 0,
+            up_pad: false,
+            up_twist: 0,
+            up_wide: false,
+            up_always: 0,
+            up_inherent: false,
             script: 0,
             input: 0,
             spicy: false,
@@ -236,6 +273,13 @@ impl Model {
             Edit::Feature => self.loud = !self.loud,
             Edit::Generated(value) => self.generated = value,
             Edit::Up(value) => self.up = value,
+            Edit::UpPlain(value) => self.up_plain = value,
+            Edit::UpLines => self.up_lines = (self.up_lines + 1) % 4,
+            Edit::UpPad => self.up_pad = !self.up_pad,
+            Edit::UpTwist(value) => self.up_twist = value,
+            Edit::UpSignature => self.up_wide = !self.up_wide,
+            Edit::UpAlways(value) => self.up_always = value,
+            Edit::UpInherent => self.up_inherent = !self.up_inherent,
             Edit::Script(value) => self.script = value,
             Edit::ScriptInput(value) => self.input = value,
             Edit::ScriptCfg => self.spicy = !self.spicy,
@@ -280,7 +324,23 @@ impl Model {
             false => 0,
         };
         let mac = if self.parts.mac { 500 + u32::from(self.mac) } else { 0 };
-        format!("{} {local} {sum} {made} {mac}\n", self.entry())
+        if !self.parts.mid {
+            return format!("{} {local} {sum} {made} {mac}\n", self.entry());
+        }
+        // `mid::values()` and `mid::lines()`, as `mid`'s text computes them; the two lines
+        // are where `up`'s text has its two `line!()`s.
+        let named = if self.up_inherent { 2 } else { 1 };
+        let values = (1 ^ u32::from(self.up_plain))
+            ^ ((3 ^ u32::from(self.up_twist)) << 4)
+            ^ ((2 ^ u32::from(self.up_always)) << 8)
+            ^ (named << 12)
+            ^ ((9 ^ 8) << 16);
+        let up = self.up_library();
+        let line_of = |marker: &str| {
+            1 + up.lines().position(|line| line.contains(marker)).unwrap_or_else(|| panic!("`up` has no line with `{marker}`")) as u32
+        };
+        let lines = line_of("// the generic's line") * 1000 + line_of("// the const's line");
+        format!("{} {local} {sum} {made} {mac} {values} {lines}\n", self.entry())
     }
 
     fn library(&self) -> String {
@@ -333,14 +393,48 @@ impl Model {
         out
     }
 
+    /// `up/src/lib.rs`: what `main.rs` uses and, with `mid`, what `mid` is built over.
+    fn up_library(&self) -> String {
+        let mut out = "// top\n".repeat(usize::from(self.up_lines));
+        _ = write!(
+            out,
+            "pub fn pick<T: Copy>(a: T, _b: T) -> T {{\n    a\n}}\n\n\
+             pub fn sum(xs: &[u32]) -> u32 {{\n    let each: Vec<u32> = xs.iter().map(|x| x ^ {}).collect();\n    each.iter().fold(0, |a, b| a ^ b)\n}}\n",
+            self.up
+        );
+        if self.parts.mid {
+            _ = write!(
+                out,
+                "\npub fn plain(x: u32) -> u32 {{\n{pad}    x ^ {plain}\n}}\n\n\
+                 pub fn here<T>() -> u32 {{\n    line!() // the generic's line\n}}\n\n\
+                 pub const LINE: u32 = line!(); // the const's line\n\n\
+                 pub fn twist<T: Copy + Into<u64>>(x: T) -> u32 {{\n    (x.into() as u32) ^ {twist}\n}}\n\n\
+                 pub fn scale(x: {scale}) -> u32 {{\n    (x as u32) ^ 8\n}}\n\n\
+                 #[inline(always)]\npub fn always(x: u32) -> u32 {{\n    x ^ {always}\n}}\n\n\
+                 pub struct Thing;\n\n\
+                 pub trait Named {{\n    fn name(&self) -> u32 {{\n        1\n    }}\n}}\n\n\
+                 impl Named for Thing {{}}\n{inherent}",
+                pad = if self.up_pad { "    let _pad = 0;\n" } else { "" },
+                plain = self.up_plain,
+                twist = self.up_twist,
+                scale = if self.up_wide { "u64" } else { "u32" },
+                always = self.up_always,
+                inherent = if self.up_inherent { "\nimpl Thing {\n    pub fn name(&self) -> u32 {\n        2\n    }\n}\n" } else { "" },
+            );
+        }
+        out
+    }
+
     fn main(&self) -> String {
+        let mid = if self.parts.mid { ", mid::values(), mid::lines()" } else { "" };
+        let holes = if self.parts.mid { " {} {}" } else { "" };
         let sum = if self.parts.up { "up::sum(&[1, 2, up::pick(app::shown(), 0u32)])" } else { "0" };
         let made = if self.parts.made { "made::MADE * 10 + made::flavor()" } else { "0" };
         let mac = if self.parts.mac { "mac::answer!()" } else { "0" };
         format!(
             "// note {}\n\
              fn local() -> u32 {{\n    {}\n}}\n\n\
-             fn main() {{\n    let unused_at_the_far_end = 9;\n    println!(\"{{}} {{}} {{}} {{}} {{}}\", app::entry(), local(), {sum}, {made}, {mac});\n}}\n",
+             fn main() {{\n    let unused_at_the_far_end = 9;\n    println!(\"{{}} {{}} {{}} {{}} {{}}{holes}\", app::entry(), local(), {sum}, {made}, {mac}{mid});\n}}\n",
             self.comment,
             300 + u32::from(self.main_body),
         )
@@ -362,13 +456,29 @@ impl Model {
             manifest.push_str("up = { path = \"up\" }\n");
             members.push("\"up\"");
             put("up/Cargo.toml", "[package]\nname = \"up\"\nversion = \"0.1.0\"\nedition = \"2024\"\n".to_owned());
+            put("up/src/lib.rs", self.up_library());
+        }
+        if self.parts.mid {
+            manifest.push_str("mid = { path = \"mid\" }\n");
+            members.push("\"mid\"");
             put(
-                "up/src/lib.rs",
-                format!(
-                    "pub fn pick<T: Copy>(a: T, _b: T) -> T {{\n    a\n}}\n\n\
-                     pub fn sum(xs: &[u32]) -> u32 {{\n    let each: Vec<u32> = xs.iter().map(|x| x ^ {}).collect();\n    each.iter().fold(0, |a, b| a ^ b)\n}}\n",
-                    self.up
-                ),
+                "mid/Cargo.toml",
+                "[package]\nname = \"mid\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nup = { path = \"../up\" }\n".to_owned(),
+            );
+            // Never edited: every change `mid`'s record must answer for is in `up`.
+            put(
+                "mid/src/lib.rs",
+                "use up::Named;\n\n\
+                 pub fn plain() -> u32 {\n    up::plain(1)\n}\n\n\
+                 pub fn here() -> u32 {\n    up::here::<u8>()\n}\n\n\
+                 pub const LINE: u32 = up::LINE;\n\n\
+                 pub fn twist() -> u32 {\n    up::twist(3u32)\n}\n\n\
+                 pub fn scaled() -> u32 {\n    up::scale(9)\n}\n\n\
+                 pub fn inlined() -> u32 {\n    up::always(2)\n}\n\n\
+                 pub fn named() -> u32 {\n    up::Thing.name()\n}\n\n\
+                 pub fn values() -> u32 {\n    plain() ^ (twist() << 4) ^ (inlined() << 8) ^ (named() << 12) ^ (scaled() << 16)\n}\n\n\
+                 pub fn lines() -> u32 {\n    here() * 1000 + LINE\n}\n"
+                    .to_owned(),
             );
         }
         if self.parts.made {
@@ -446,6 +556,15 @@ fn kinds(parts: Parts, library_only: bool) -> Vec<(&'static str, fn(u8) -> Edit)
         all.push(("feature", |_| Edit::Feature));
         if parts.up {
             all.push(("up", Edit::Up));
+            if parts.mid {
+                all.push(("upplain", Edit::UpPlain));
+                all.push(("uplines", |_| Edit::UpLines));
+                all.push(("uppad", |_| Edit::UpPad));
+                all.push(("uptwist", Edit::UpTwist));
+                all.push(("upsignature", |_| Edit::UpSignature));
+                all.push(("upalways", Edit::UpAlways));
+                all.push(("upinherent", |_| Edit::UpInherent));
+            }
         }
         if parts.made {
             all.push(("script", Edit::Script));
@@ -463,7 +582,8 @@ fn kinds(parts: Parts, library_only: bool) -> Vec<(&'static str, fn(u8) -> Edit)
 /// The workspace's parts, drawn; none is the simplest.
 pub fn parts(draw: &mut dyn Draw) -> Parts {
     let mut part = |name: &str| !skipped(name) && draw.below(2) == 1;
-    Parts { up: part("up-part"), made: part("made-part"), mac: part("mac-part") }
+    let (up, made, mac) = (part("up-part"), part("made-part"), part("mac-part"));
+    Parts { up, made, mac, mid: up && part("mid-part") }
 }
 
 /// One turn, drawn; the simplest is a build of what is there.
@@ -658,7 +778,7 @@ pub fn test(name: &str, parts: Parts, turns: &[Turn], drivers: &[&str]) -> Test 
 pub fn parse(text: &str) -> (Parts, Vec<Turn>) {
     let mut parts = Parts::LIBRARY;
     let mut turns = Vec::new();
-    let every = Parts { up: true, made: true, mac: true };
+    let every = Parts { up: true, made: true, mac: true, mid: true };
     for (index, words) in text.split(';').map(str::trim).enumerate() {
         let mut words = words.split_whitespace().peekable();
         if index == 0 && words.peek() == Some(&"parts") {
@@ -667,7 +787,8 @@ pub fn parse(text: &str) -> (Parts, Vec<Turn>) {
                     "up" => parts.up = true,
                     "made" => parts.made = true,
                     "mac" => parts.mac = true,
-                    other => panic!("no part `{other}`: up, made, mac"),
+                    "mid" => (parts.up, parts.mid) = (true, true),
+                    other => panic!("no part `{other}`: up, made, mac, mid"),
                 }
             }
             continue;

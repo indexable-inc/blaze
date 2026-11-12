@@ -1,25 +1,17 @@
-//! A constant an entry (AGENTS.md `granular-caching`), by counts: of N constants of one crate,
-//! an edit of one finds the other N - 1 in the store with no evaluation run, where the key
-//! this replaced (the crate's check key in every constant's key) finds none.
-
-use std::sync::Arc;
+//! The control of a constant an entry (AGENTS.md `granular-caching`, test-the-cause): what the
+//! key this replaced does on the edit the count test makes. The count test itself (of N
+//! constants, an edit of one finds the other N - 1 with none evaluated) evaluates constants,
+//! which needs MIR, and hir-ty's own test database builds none: it is hir-ty-mir's
+//! `tests::consteval::items`. This evaluates nothing.
 
 use base_db::Db;
 use blaze_ids::ContentId;
 use hir_def::{ConstId, DefWithBodyId, nameres::demand::crate_body_owners, signatures::ConstSignature};
 use hir_expand::name::Name;
 
-use super::RAN;
-use crate::{
-    body_store::{
-        Mode, Step, StepCounts,
-        tests::{Defs, Memory, db_of, second, session},
-    },
-    consteval::{const_eval, deps},
-    next_solver::GenericArgs,
-};
+use crate::{body_store::tests::db_of, consteval::deps};
 
-/// Five constants of one crate, none reading another.
+/// Five constants of one crate, none reading another: hir-ty-mir's `items` fixture.
 const NAMES: [&str; 5] = ["A", "B", "C", "D", "E"];
 
 fn fixture(b: u32) -> String {
@@ -44,50 +36,6 @@ fn constant(db: &Db, name: &str) -> ConstId {
         .unwrap_or_else(|| panic!("no constant `{name}`"))
 }
 
-/// Each constant's memory, evaluated in `db`, and how many evaluations ran for them.
-fn evaluated(db: &Db) -> (Vec<Vec<u8>>, u32) {
-    RAN.with(|ran| ran.set(0));
-    let values = blaze_query::db::attach(db, || {
-        NAMES
-            .iter()
-            .map(|name| {
-                let value = const_eval(db, constant(db, name), GenericArgs::empty(), None)
-                    .unwrap_or_else(|error| panic!("`{name}` evaluates: {error:?}"));
-                value.memory.to_vec()
-            })
-            .collect()
-    });
-    (values, RAN.with(|ran| ran.get()))
-}
-
-/// The invariant: a constant is found by its own item and what its evaluation read, so an
-/// edit of one of N leaves the other N - 1 entries found, in a database whose ids differ, with
-/// none of them evaluated; the edited one is evaluated and has its new value.
-#[test]
-fn an_edit_of_one_constant_finds_the_others_and_runs_one() {
-    let memory = Arc::new(Memory::default());
-    let defs = Defs::default();
-    let first = session(db_of(&fixture(2)), &memory, &defs, None, Mode::Serve);
-    let (values, ran) = evaluated(&first.db);
-    assert_eq!(ran, NAMES.len() as u32, "an empty store: each is evaluated");
-    assert_eq!(values[1], 2u32.to_le_bytes());
-    let flushed = first.installed.flush().unwrap();
-    let all = StepCounts { ran: NAMES.len() as u64, ..StepCounts::default() };
-    assert_eq!(flushed.steps[Step::Const as usize], all, "{flushed:?}");
-    drop(first);
-
-    let edited = session(second(&fixture(20)), &memory, &defs, None, Mode::Serve);
-    let (now, ran) = evaluated(&edited.db);
-    assert_eq!(ran, 1, "only the edited constant is evaluated");
-    assert_eq!(now[1], 20u32.to_le_bytes(), "the edited constant has its new value");
-    for at in [0, 2, 3, 4] {
-        assert_eq!(now[at], values[at], "`{}` is the stored value", NAMES[at]);
-    }
-    let flushed = edited.installed.flush().unwrap();
-    let counts = StepCounts { hits: NAMES.len() as u64 - 1, ran: 1, refused: 0 };
-    assert_eq!(flushed.steps[Step::Const as usize], counts, "N - 1 hit: {flushed:?}");
-}
-
 /// The control (test-the-cause): under the key this replaced, a constant's item key with its
 /// crate's check key, which is made of every file of the crate, the same edit moves the key
 /// of every one of the N constants: none would be found.
@@ -106,23 +54,4 @@ fn keyed_by_its_crate_every_constant_misses() {
             .count()
     });
     assert_eq!(moved, NAMES.len(), "the crate's key in each constant's key: all N move");
-}
-
-/// Under `Mode::Verify` a hit evaluates as well, and a stored value equal to the evaluation
-/// is no error. (That a differing one is an error is `stored`'s one comparison; a test that
-/// plants one needs a store entry written under another body's key, which the fixtures here
-/// do not make: not covered.)
-#[test]
-fn verify_evaluates_each_hit_and_equal_values_are_no_error() {
-    let memory = Arc::new(Memory::default());
-    let defs = Defs::default();
-    let first = session(db_of(&fixture(2)), &memory, &defs, None, Mode::Serve);
-    evaluated(&first.db);
-    first.installed.flush().unwrap();
-    drop(first);
-    let verify = session(db_of(&fixture(2)), &memory, &defs, None, Mode::Verify);
-    let (now, ran) = evaluated(&verify.db);
-    assert_eq!(ran, NAMES.len() as u32, "verify evaluates each hit");
-    assert_eq!(now[1], 2u32.to_le_bytes());
-    assert_eq!(verify.installed.errors(), Ok(()), "equal values are no error");
 }

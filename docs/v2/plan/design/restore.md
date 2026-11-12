@@ -937,14 +937,38 @@ own is not kept, a layout refused by name, the key's parts); hir-def
 with `without_kept_definitions_the_same_asks_parse_the_file`, and
 `one_macro_of_n_edited_finds_the_tokens_of_the_others` (N-1 found; the edited one a miss).
 
-Left, in order: the whole-file index with `ItemSource` (`body` is the subtree hash of the body
-node alone; `BodySyntax::item_hash`, the whole item node, is another value and is deleted then), the source row folded into it; attr flags, assoc items and includes
-as entries (keys in `/tmp/records-items/next.md`); the per-crate index; the driver's
-`entries::set` over the store; `items.rs` deleted; macro definitions a macro wrote (keyed on
-the outermost call's inputs) and the expansion key; then rows B, C, E of the table. Not
-written for macro definitions: identical bytes from two databases as a database test (the
-codec test compares two writes), and every macro of std and bstd keeping (needs a harness with
-a real std).
+**State (2026-11-12, lane records-items3; written, not compiled or run by this lane).** The
+file index is `crates/hir-expand/src/declarative/stored/index.rs`: one entry a file under
+H(file content, edition and extensions, layout), a row an item, assoc item, extern item, variant
+and the file, by ast id: `ItemSource { attrs, header, body }` and three bits (`attrs_cfg`,
+`header_cfg`: the hashed text names `cfg`; `plain`: an impl or trait whose assoc items take no
+name's lookup). The hashes are of text (kind and text, bodies cut by range, the inner attributes
+of a cut body kept in the header), not `FlatTree::subtree_hash`, which hashes a lazy body and a
+parsed one differently: an outline and a full parse make the same bytes. Found by content with
+no parse; the macro source row is this index's row (`def_hash` is its `header`).
+`BodySyntax::item_hash` is replaced by `header` and `body` by lane records-bodies4.
+
+Entries of an item are `crates/hir-def/src/nameres/frozen/entries/items.rs`, each a cache
+before its query (found: nothing parsed or collected; not found: the query runs and its answer
+is kept; no per-crate encode pass). `attr flags`: H(kind, how the file is read, `attrs`, the
+crate's cfg only when `attrs_cfg`), every file-written item but a module. `assoc items`:
+H(impl or trait, how the file is read, `header`, the cfg only when `header_cfg`), only for a
+`plain` impl or trait; the value is each item's kind, ast id and name, and the reader interns
+the ids under the container it asked of. Checks: hir-expand `declarative::stored::index::tests`;
+hir-def `nameres::frozen::entries::items::tests` (one impl of N edited: N-1 found and one
+collection; keyed by the file: all N miss; a body edit: no entry made again; two databases:
+equal bytes; a layout refused by name).
+
+Left, in order: resolution facts ((module, path) to macro definition, absent included) and the
+expansion key, so impls with macro calls, attribute macros or tool attributes, items a macro
+wrote, and `include!` calls (one entry a call) are kept too: until then they run as before;
+the cfg part as the truth of the atoms named, not the crate's whole cfg; module flags (the
+declaration's row, the file's row, the command line's files); the per-crate index (item key to
+entry key: with entries found under their own keys it saves only the hashing); `items.rs` and
+`items_key` deleted with their uses in `deps/serve.rs` (lane records-1112g), which the two
+served branches in `assoc.rs`, `attrs.rs` and `lib.rs` wait on; the driver's `entries::set`
+over the store; the index moved to `hir_expand::file_index`; a no-parse check of an impl's
+entries end to end (needs the def-map record in the same test); then rows B, C, E of the table.
 
 ## Impl tables read in place (2026-11-12, lane records-impls; D21, D29)
 
@@ -1008,6 +1032,11 @@ table from a self type to the traits with a row for it; in the per-item layout b
 `a_whole_impl_table_reads_more_pages_than_a_row` and
 `the_oracle_catches_an_absent_row_found_by_a_scan`. Still passing: hir-ty-mir `tests::frozen`
 (Check and Verify over the pages), hir-ty `delta::tests::tables`.
+
+**Paused 2026-11-12 (rule 66).** Front-end loading is being redesigned as one route
+(`docs/v2/plan/design/end-state.md`); this lane adds no piece until that assigns it. What is
+written (the pages, the narrow readers, the reader ports) is uncompiled and its compile
+errors are this lane's; what follows is the design it had, for that spec to take or replace.
 
 **Rule 65: the record is still keyed a crate (`frozen::key`), which is not allowed; the
 per-item form, approved 2026-11-12, not built.** An entry (a row, a trait's blanket set, an
@@ -1993,12 +2022,84 @@ yet built (ready list `/tmp/round2/ready/records-bodies3.txt`):
   one value. A macro definition's hash for the call chain:
   `hir_expand::declarative::stored::def_hash(db, AstId<ast::Macro>, def_crate) -> u128`
   (records-items2, written, uncompiled).
-- *Next, exactly:* c, second half: `identity::early_identity(db, def)` beside `identity` in
-  blaze-item-hash `identity.rs`, made with no `Body::of`: `body_syntax(db, def)`'s
-  `item_hash`, the owner part and module chain as `identity::owner` gives them by key (no
-  signature hash: signatures are facts now), the crate's settings (`crate_inputs` less the
-  dependencies' contents), and for a body a macro writes (`body_syntax` is `None`) each
-  macro of its call chain by item key and `Signature` value, with the outermost call's
-  tokens; a body with neither has no early identity (counted `no_identity`). Then make
-  `RecordedNames::identity` (`lib.rs`) return it. Then d, e, f as listed in the lane's
-  brief; none of them is started.
+- *Next:* the paragraph below (lane records-bodies4 took over here).
+
+**State (2026-11-12, lane records-bodies4; successor of records-bodies3, same letters).**
+Written, not yet built (ready list `/tmp/round2/ready/records-bodies4.txt`):
+
+- *c, done.* `identity::early_identity` / `early_parts` (blaze-item-hash `identity.rs`), what
+  `RecordedNames::identity` returns; `Bodies` is unchanged. Four named parts: "crate inputs"
+  (`crate_inputs` as it is: read, it hashes crate keys and settings, nothing a crate holds),
+  "owner" (the kind of body, the own item's key, the container impl's or trait's key; no
+  signature), "module chain", "source". The source of a body written in a file is its
+  `ItemSource` (`hir_expand::declarative::stored::index::source`: `header` and `body`, text
+  hashes, the whole item between them; `BodySyntax::item_hash` is deleted: a tree hash differs
+  between a lazy and a parsed body). Of a body a macro wrote (`macro_chain`): each macro of the
+  chain of calls by its crate's key, kind, edition and `stored::def_hash`, then the outermost
+  call's node (`hir_def::expr_store::body::ast_node_hash`, or the item's `ItemSource` for a
+  derive or attribute). Under `Names::Facts` the owner's own `Signature` and `Attrs` reads
+  are facts (`reads.rs`, end of `apply`): the key hashes neither. Tests:
+  `blaze-item-hash` `tests::early` (four).
+- *No early identity (`Err`, counted `no_identity`), each to close:* an item of a block
+  (keyed with its body: by design); a body a proc macro wrote whose expander is not
+  loaded; a body an
+  eager macro wrote (`include!` reads a file: needs that file's content as a part); a chain
+  longer than 256.
+- *Unchecked guesses, now five (5 is under the proc-macro item):* the predecessor's
+  three (paged scope index = place in
+  `DefMap::table`; `exported_derives`, `fn_proc_macro_mapping`, `derive_helpers_in_scope`
+  left out of `CRATE_NAMES`; `ModuleData` visibility and origin as a handle), none touched;
+  and 4: a macro 2.0 (`macro`) is named in a chain by crate key and definition hash, not by
+  its defining module, which its def-site names resolve in: read how a `MacroDef` body's
+  hygiene resolves (`hir_expand::hygiene`, `Transparency::Opaque`) and add the module's key
+  to the chain if it matters.
+- *Narrowing, later:* the key takes the whole item (`header` and `body`). Taking only the
+  block, the parameter list and the attributes lowering reads is an optimisation to make
+  only with a test that nothing else of the item is read.
+- *Proc-macro-written bodies, written.* `macro_chain`'s `ProcMacro` arm: the macro crate's
+  key, the ast id of the macro's function (`ErasedFileAstId::into_raw`: unchecked guess 5,
+  that it is the same number in every database for the same file), and `expander_code`:
+  every macro of the crate by name, kind and `expander.code()` (the shape of
+  `hir-def/src/deps/key.rs` `libraries`); no early identity while the expander is not
+  loaded. Not checked: whether `blaze_macro_eval::code::of` hashes paths (two checkouts
+  would differ). Not done: counting the bodies with no early identity by reason in `Flushed`
+  (a `Vec<(&'static str, u64)>` beside `no_identity`; `BodyFacts::identity` must then
+  return the reason, `Result<ContentId, &'static str>`, a whole port of its implementors),
+  and no test of this arm (the fixture's proc macros say no `code`).
+- *`Step::Const = 3`, done* (cache-audit-1112's hunks: a constant's value is the fourth
+  step, `body_store/konst.rs`, its file). Arrays by step are `[StepCounts; Step::COUNT]`
+  in hir-ty; `blaze-cargo/src/serve/unit/deps.rs` and its tests name 4 (records-1112g's
+  script, run). A `const fn` a constant calls is refused until the callee's code is a fact.
+- *d, designed, not written.* (1) `Step::Lower = 4` (`body_store/facts.rs`: `Step::ALL` of
+  five, `what`'s arm, `value.rs`'s arm; the arrays follow `Step::COUNT` but
+  `blaze-cargo/src/serve/unit/deps.rs` names 4 and a fifth name, "lowering"). (2) A new `body_store/lower.rs`:
+  a tracked `lowering(db, def) -> Lowered { exprs, pats, bindings, closures: Box<[ExprId]>,
+  errors: bool, located: bool, value: Option<ContentId> }`, looked up as `Step::Lower` and on
+  a miss made from `Body::of`, `closure_exprs`' filter, `Body::has_lowering_errors` and
+  `location_literals`, under `capture`. (3) Its offer reads the capture with
+  `Reads::for_each_read_through(storage, through, each)` where `through` is a new
+  `BodyFacts::lowering_row(db, def, read, kind, name) -> bool` (blaze-item-hash: the rule is
+  `Rule::OwnBody` and the key is `def`; `false` for `Bodies`); a `RowRead::Stored` refuses
+  the offer by the row's name. The rows inside `Body::of` that are the item's own text
+  (`ItemBodySyntax::syntax`, `placed_body_syntax`, `file_body_syntax`, the file's text and
+  parse) need rules that say covered; the first run's `Flushed::refused` lists the rest.
+  (4) The value of the fact "own lowering" (`STEP_LOWER`, a new kind in `values.rs` after
+  `0x1808`; `step_value(db, def, Step::Lower)`) is NOT the hash of the answer (two bodies
+  of equal counts differ in what their lowering read): it is the digest of what the lowering
+  read, `AnswerKey::new(base)` fed the shape's fact values in order, the same on a hit
+  (`Store::answer_key_now` has the values) and on a miss (`Store::offered` has
+  `scratch.values`), independent of the slot. `Lowered::value` holds it; `None` when the
+  offer was refused, so a step that read the lowering is refused too and counted.
+  (5) `reads.rs` under `Names::Facts`: a read of `lowering` of `def`, and `Rule::OwnBody`
+  and `Rule::OwnStore` of `def`, are `Classified::Fact(STEP_LOWER of OWN)`; each step's
+  query fetches `lowering(db, def)` first so the fact has a value. (6) `closure_exprs`
+  (hir-ty `db.rs`) answers from `lowering(db, def).closures` when the owner is a body and a
+  store is installed; `Bounds`/`Nodes` at decode come from it (`body_store/mir.rs`
+  `locations`: `Body::of` only when `located`; `check_cache/runtime.rs` `encode_entry`;
+  `value.rs` `mir_hash` walks `closures`, not `store.exprs()`, and needs each closure's
+  kind: keep it in `Lowered` beside the expression). A step's order: `reads.rs`
+  `Rule::OwnStep` compares steps by number, so "lowering is earlier than every step" is a
+  rule of its own there, not `Step::Lower < step`.
+- *Next, exactly:* write d (1) to (4) in hir-ty as one whole piece with its test (a body
+  whose macro's definition changes: equal counts, another `Lowered::value`; control: the
+  value taken from the answer's bytes is equal), then (5), (6), the proc-macro arm, f1, e.

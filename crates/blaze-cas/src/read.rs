@@ -834,20 +834,33 @@ impl<'a> Look<'a> {
         tier: usize,
         bad: &mut Vec<(Key, &'static str)>,
     ) -> Vec<(Key, Found<'a>)> {
+        // alloc: the listing is the output, for checks
+        let mut out = Vec::new();
+        self.each_row(tier, bad, |key, found| out.push((key, found)));
+        out
+    }
+
+    /// [`Look::rows`] given to `each` one at a time, in the same order, with no list of
+    /// them made: what a period's scan walks, twice, so that what it holds does not grow
+    /// with the rows (but for the keys of the deltas, which are bounded, while it walks).
+    pub(crate) fn each_row(
+        self,
+        tier: usize,
+        bad: &mut Vec<(Key, &'static str)>,
+        mut each: impl FnMut(Key, Found<'a>),
+    ) {
         let view = self.view();
         let it = &view.tiers[tier];
-        // alloc: the listing is the output, for collection and checks
-        let mut out = Vec::new();
-        // The keys seen live only while the listing is made: a frame's.
+        // The keys seen live only while the rows are walked: a frame's.
         blaze_mem::frame::task(blaze_mem::Tag::Store, |frame| {
             let mut shadow = blaze_hash::HashSet::new_in(frame);
             for table in std::iter::once(&it.delta).chain(&it.prev) {
                 for (row, spot) in table.iter(self.held) {
                     if shadow.insert(spot.key) {
-                        out.push((
+                        each(
                             spot.key,
                             Found { view, tier, place: spot.place, at: At::Spot(table, row, spot) },
-                        ));
+                        );
                     }
                 }
             }
@@ -856,7 +869,7 @@ impl<'a> Look<'a> {
                     match loc {
                         Ok(_) if shadow.contains(&key) => {}
                         Ok(loc) if it.gone(loc) => {}
-                        Ok(loc) => out.push((
+                        Ok(loc) => each(
                             key,
                             Found {
                                 view,
@@ -864,13 +877,12 @@ impl<'a> Look<'a> {
                                 place: Place::Pack(loc),
                                 at: At::Slot(index, slot),
                             },
-                        )),
+                        ),
                         Err(what) => bad.push((key, what)),
                     }
                 }
             }
         });
-        out
     }
 
     pub(crate) fn columns_of(self, bytes: &[u8]) -> Option<&'a Columns> {

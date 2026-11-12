@@ -75,18 +75,38 @@ struct Kept {
     name: std::sync::Arc<str>,
     why: std::sync::Arc<str>,
     keys: Vec<blaze_cas::Key>,
+    /// Keys the pin lets go as it takes `keys`: a set's root before its new one.
+    drop: Vec<blaze_cas::Key>,
+}
+
+/// As [`keep`], with `drop` let go by the pin in the same write: `keys` are index values
+/// (an item set's root), each taking the place of the root its set had before.
+pub(crate) fn keep_in_place_of(
+    name: &'static str,
+    keys: impl Iterator<Item = blaze_cas::Key>,
+    drop: Vec<blaze_cas::Key>,
+) {
+    let why = why_of(name);
+    // alloc: once per call, what is queued for the daemon's loop
+    let keys: Vec<blaze_cas::Key> = keys.collect();
+    if !keys.is_empty() || !drop.is_empty() {
+        KEPT.push(Kept { name: name.into(), why: why.into(), keys, drop });
+    }
+}
+
+fn why_of(name: &str) -> &'static str {
+    match name {
+        TOOLCHAIN => "the standard library's records, which every build of this toolchain reads",
+        BSTD => "bstd's records, which blaze's own crates are built on",
+        _ => "kept by name",
+    }
 }
 
 /// `keys` are pin `name`'s from the next build's end on: called by a build's task as it
 /// finds a standard library unit's record, or bstd's, in the store. `name` is one of
 /// [`TOOLCHAIN`] and [`BSTD`]; any other name is [`keep_as`]'s.
 pub(crate) fn keep(name: &'static str, keys: impl Iterator<Item = blaze_cas::Key>) {
-    let why = match name {
-        TOOLCHAIN => "the standard library's records, which every build of this toolchain reads",
-        BSTD => "bstd's records, which blaze's own crates are built on",
-        _ => "kept by name",
-    };
-    keep_as(name, why, keys);
+    keep_as(name, why_of(name), keys);
 }
 
 /// `keys` are added to the pin `name` (any name: a build kept as a name, a package's
@@ -96,7 +116,7 @@ pub(crate) fn keep_as(name: &str, why: &str, keys: impl Iterator<Item = blaze_ca
     // alloc: once per call, what is queued for the daemon's loop
     let keys: Vec<blaze_cas::Key> = keys.collect();
     if !keys.is_empty() {
-        KEPT.push(Kept { name: name.into(), why: why.into(), keys });
+        KEPT.push(Kept { name: name.into(), why: why.into(), keys, drop: Vec::new() });
     }
 }
 
@@ -108,12 +128,20 @@ pub(crate) fn keep_as(name: &str, why: &str, keys: impl Iterator<Item = blaze_ca
 pub(crate) struct StoreEntries {
     handle: &'static blaze_cas::Handle,
     sets: std::sync::Arc<blaze_cas::sets::Sets>,
+    /// The root each pin names for each set, as this daemon queued it or adopted it: what
+    /// the set's next root takes the place of.
+    // alloc: the daemon's own table, a row a set a pin names
+    kept: blaze_core::lock::Lock<std::collections::BTreeMap<(&'static str, blaze_ids::ContentId), blaze_cas::Key>>,
 }
 
 impl StoreEntries {
     pub(crate) fn new(handle: &'static blaze_cas::Handle) -> std::sync::Arc<StoreEntries> {
         // alloc: once a daemon
-        std::sync::Arc::new(StoreEntries { handle, sets: blaze_cas::sets::Sets::new() })
+        std::sync::Arc::new(StoreEntries {
+            handle,
+            sets: blaze_cas::sets::Sets::new(),
+            kept: blaze_core::lock::Lock::new("serve.entries.kept", std::collections::BTreeMap::new()),
+        })
     }
 
     /// Lists the sets got or put since the last call (their leaves and roots put, only what
@@ -124,9 +152,12 @@ impl StoreEntries {
         self.sets.list(self.handle).map(|(_, listed)| listed)
     }
 
-    /// The roots of `sets` are pin `name`'s from the next build's end on ([`keep`]): a key a
-    /// set. A set not listed yet ([`StoreEntries::list`]) is an error naming it, never
-    /// skipped.
+    /// The roots of `sets` are pin `name`'s from the next build's end on: a key a set, an
+    /// index value the collector follows to the set's items. A set's root takes the place
+    /// of the root the pin named for it before ([`keep_in_place_of`]), so the pin does not
+    /// grow as a set changes and what only the old root named is let go. A set not listed
+    /// yet ([`StoreEntries::list`]) is an error naming it, never skipped. Call it once the
+    /// roots are durable (a seal's [`blaze_cas::sets::Sealing::durable`]).
     pub(crate) fn keep(
         &self,
         name: &'static str,
@@ -134,16 +165,78 @@ impl StoreEntries {
     ) -> Result<(), String> {
         // alloc: once a crate kept, a root a set
         let mut roots = Vec::new();
+        // alloc: as above
+        let mut before = Vec::new();
+        let mut kept = self.kept.lock();
         for set in sets {
             let root = self
                 .sets
                 .root(&set)
                 // alloc: error path
                 .ok_or_else(|| format!("the set {set:?} is kept as `{name}` before it was listed"))?;
-            roots.push(root);
+            match kept.insert((name, set), root) {
+                Some(old) if old == root => {}
+                Some(old) => {
+                    before.push(old);
+                    roots.push(root);
+                }
+                None => roots.push(root),
+            }
         }
-        keep(name, roots.into_iter());
+        drop(kept);
+        keep_in_place_of(name, roots.into_iter(), before);
         Ok(())
+    }
+
+    /// Takes the roots among `keys`, the keys of the pin `name` as the store read them
+    /// after it opened, as their sets' ([`StoreEntries::adopt`]), and as what the pin
+    /// names for each: so the set's next root takes that root's place in the pin. On a
+    /// worker (it reads each key's record), once the store's pins are read and before the
+    /// first build's end keeps a root. How many were roots.
+    pub(crate) fn adopt_pin(&self, name: &'static str, keys: &[blaze_cas::Key]) -> Result<usize, String> {
+        let _span = tracing::info_span!(target: "blaze", "store sets adopt", pin = name).entered();
+        let mut roots = 0;
+        for key in keys {
+            if let Some(set) = self.sets.adopt(self.handle, *key)? {
+                self.kept.lock().entry((name, set)).or_insert(*key);
+                roots += 1;
+            }
+        }
+        Ok(roots)
+    }
+
+    /// Says `set` is of a crate not edited under its version (the standard library, a
+    /// registry crate): what is put under it is held and written as one sealed value by
+    /// [`StoreEntries::seal`], never a record an item. Before the set's first put.
+    pub(crate) fn seal_at_once(&self, set: &blaze_ids::ContentId) {
+        self.sets.seal_at_once(set);
+    }
+
+    /// Writes what `set` holds as one sealed value and a root naming it: at a build's end,
+    /// on a worker, for a set written sealed at once, and for a quiet live set
+    /// ([`StoreEntries::quiet`]): its compaction. The root is what [`StoreEntries::keep`]
+    /// names from here on; the records it replaced go when the collector finds no root
+    /// naming them.
+    pub(crate) fn seal(&self, set: &blaze_ids::ContentId) -> Result<Option<blaze_cas::sets::Sealing>, String> {
+        let _span = tracing::info_span!(target: "blaze", "store set seal").entered();
+        self.sets.seal(self.handle, set)
+    }
+
+    /// The live sets due a compaction: unchanged at each of the last `listings` listings
+    /// and of `items` members or more.
+    pub(crate) fn quiet(&self, listings: u32, items: usize) -> Vec<blaze_ids::ContentId> {
+        self.sets.quiet(listings, items)
+    }
+
+    /// Takes a root an earlier run of the daemon wrote (a pin names it) as its set's, so
+    /// the set's sealed values are read and its next listing names what that root named.
+    pub(crate) fn adopt(&self, root: blaze_cas::Key) -> Result<Option<blaze_ids::ContentId>, String> {
+        self.sets.adopt(self.handle, root)
+    }
+
+    /// Gives `set` the sealed values of `before`, its crate's version before.
+    pub(crate) fn follows(&self, set: &blaze_ids::ContentId, before: &blaze_ids::ContentId) {
+        self.sets.follows(set, before);
     }
 }
 
@@ -333,17 +426,25 @@ impl Collects {
         self.builds += 1;
         // Each name's keys, in the order of the names (rule deterministic-output).
         // alloc: once a build's end, what it found to pin
-        let mut found: std::collections::BTreeMap<std::sync::Arc<str>, (std::sync::Arc<str>, Vec<blaze_cas::Key>)> =
-            std::collections::BTreeMap::new();
-        while let Some(Kept { name, why, mut keys }) = KEPT.pop() {
-            found.entry(name).or_insert_with(|| (why, Vec::new())).1.append(&mut keys);
+        let mut found: std::collections::BTreeMap<
+            std::sync::Arc<str>,
+            (std::sync::Arc<str>, Vec<blaze_cas::Key>, Vec<blaze_cas::Key>),
+        > = std::collections::BTreeMap::new();
+        while let Some(Kept { name, why, mut keys, mut drop }) = KEPT.pop() {
+            let of_name = found.entry(name).or_insert_with(|| (why, Vec::new(), Vec::new()));
+            // A key let go and then kept again by a later call stays; one kept and then
+            // let go by a later call (a root, then the root after it) goes.
+            of_name.1.retain(|key| !drop.contains(key));
+            of_name.2.retain(|key| !keys.contains(key));
+            of_name.1.append(&mut keys);
+            of_name.2.append(&mut drop);
         }
-        for (name, (why, keys)) in found {
-            match store.pin_add(&name, &why, blaze_gc::record::now_ns(), &keys) {
+        for (name, (why, keys, drop)) in found {
+            match store.pin_change(&name, &why, blaze_gc::record::now_ns(), &keys, &drop) {
                 Ok(blaze_cas::collect::PinAdded::Written(_) | blaze_cas::collect::PinAdded::Unchanged) => {}
                 // No scan has read the store's pins since it opened: the keys wait for the
                 // next build's end.
-                Ok(blaze_cas::collect::PinAdded::NotRead) => KEPT.push(Kept { name, why, keys }),
+                Ok(blaze_cas::collect::PinAdded::NotRead) => KEPT.push(Kept { name, why, keys, drop }),
                 Err(mismatch) => {
                     tracing::error!(target: "blaze", "the pin `{name}` was not written: {mismatch:?}");
                 }

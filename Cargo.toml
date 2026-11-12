@@ -444,6 +444,7 @@ blaze-ids = { path = "crates/blaze-ids" }
 blaze-lir = { path = "crates/blaze-lir" }
 blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-radix = { path = "crates/blaze-radix" }
+blaze-record = { path = "crates/blaze-record" }
 blaze-rng = { path = "crates/blaze-rng" }
 blaze-sha256 = { path = "crates/blaze-sha256" }
 # bstd, blaze's own standard library (docs/v2/plan/design/std.md).

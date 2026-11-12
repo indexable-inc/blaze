@@ -1075,6 +1075,59 @@ WHERE build_id = $build AND (executed > 0 OR written > 0)
 ORDER BY executed DESC, written DESC NULLS LAST, query
 LIMIT $limit
 
+-- name: validity
+-- says: how a build's rows of an earlier view were proved unchanged (the validity census: `query_counts`' `proved_*` and `edge_*` columns summed over its queries, each row counted under the first proof to answer): by each shortcut that looks at no edge, in the order the engine asks them (the seal, durability, the input summary, the floor by each, a changed-set walk's end, a walk's reach), and by comparing edges (the claim-free walk, the claimed path), each with its share of them all in percent; then, with no share, the walk-end and reach proofs a fetch asked before any other, the rows left on walks that gave up, and the edges compared. A shortcut at 0 on every row of the edit loop is one to delete (docs/v2/plan/design/end-state.md); null counts are a history from before the census
+WITH census AS (
+    SELECT
+        CAST(sum(q.proved_seal) AS BIGINT) AS seal,
+        CAST(sum(q.proved_durability) AS BIGINT) AS durability,
+        CAST(sum(q.proved_summary) AS BIGINT) AS summary,
+        CAST(sum(q.proved_floor_durability) AS BIGINT) AS floor_durability,
+        CAST(sum(q.proved_floor_summary) AS BIGINT) AS floor_summary,
+        CAST(sum(q.proved_walk_end) AS BIGINT) AS walk_end,
+        CAST(sum(q.proved_reach) AS BIGINT) AS reach,
+        CAST(sum(q.edge_walked) AS BIGINT) AS walked,
+        CAST(sum(q.edge_claimed) AS BIGINT) AS claimed,
+        CAST(sum(q.proved_first) AS BIGINT) AS asked_first,
+        CAST(sum(q.edge_gave_up) AS BIGINT) AS gave_up,
+        CAST(sum(q.edges_compared) AS BIGINT) AS compared
+    FROM query_counts AS q
+    WHERE q.build_id = $build
+), ways AS (
+    SELECT 1 AS ord, 'shortcut: seal' AS how, census.seal AS n, true AS shared FROM census
+    UNION ALL
+    SELECT 2 AS ord, 'shortcut: durability' AS how, census.durability AS n, true AS shared FROM census
+    UNION ALL
+    SELECT 3 AS ord, 'shortcut: summary' AS how, census.summary AS n, true AS shared FROM census
+    UNION ALL
+    SELECT 4 AS ord, 'shortcut: floor, by durability' AS how, census.floor_durability AS n, true AS shared FROM census
+    UNION ALL
+    SELECT 5 AS ord, 'shortcut: floor, by summary' AS how, census.floor_summary AS n, true AS shared FROM census
+    UNION ALL
+    SELECT 6 AS ord, 'shortcut: walk end' AS how, census.walk_end AS n, true AS shared FROM census
+    UNION ALL
+    SELECT 7 AS ord, 'shortcut: reach' AS how, census.reach AS n, true AS shared FROM census
+    UNION ALL
+    SELECT 8 AS ord, 'edges: claim-free walk' AS how, census.walked AS n, true AS shared FROM census
+    UNION ALL
+    SELECT 9 AS ord, 'edges: claimed path' AS how, census.claimed AS n, true AS shared FROM census
+    UNION ALL
+    SELECT 10 AS ord, 'of walk end and reach: asked first by a fetch' AS how, census.asked_first AS n, false AS shared FROM census
+    UNION ALL
+    SELECT 11 AS ord, 'rows on walks that gave up' AS how, census.gave_up AS n, false AS shared FROM census
+    UNION ALL
+    SELECT 12 AS ord, 'edges compared' AS how, census.compared AS n, false AS shared FROM census
+), whole AS (
+    SELECT sum(ways.n) AS proofs FROM ways WHERE ways.shared
+)
+SELECT
+    ways.how,
+    ways.n AS proved,
+    CASE WHEN ways.shared THEN round(100.0 * ways.n / nullif(whole.proofs, 0), 2) END AS pct
+FROM ways
+CROSS JOIN whole
+ORDER BY ways.ord
+
 -- name: writes
 -- says: the inputs a build wrote, by kind with names: each input a setter wrote (`query_counts.written`, an equal value too), and beside it each of its fields a rerun names as its cause (`provenance.cause_key`: which file, which crate, which module's scope) with how many memos ran again for it; an input written that made nothing run has one row with no field
 WITH wrote AS (

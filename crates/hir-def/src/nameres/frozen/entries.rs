@@ -18,6 +18,7 @@ use std::alloc::Global;
 
 type R<T = ()> = Result<T, String>;
 
+pub(crate) mod items;
 #[cfg(test)]
 mod tests;
 

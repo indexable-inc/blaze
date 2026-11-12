@@ -19,10 +19,15 @@ pub enum Step {
     Mir = 1,
     /// `hir_ty_borrowck::gate::checked`: that the borrow check passed.
     Borrowck = 2,
+    /// `const_eval_query` of a `const` item with no generic arguments: its value
+    /// (`super::konst`).
+    Const = 3,
 }
 
 impl Step {
-    pub const ALL: [Step; 3] = [Step::Infer, Step::Mir, Step::Borrowck];
+    pub const ALL: [Step; 4] = [Step::Infer, Step::Mir, Step::Borrowck, Step::Const];
+    /// How many steps there are: the length of an array indexed by a step.
+    pub const COUNT: usize = Step::ALL.len();
 }
 
 /// What one read a step made stands for.

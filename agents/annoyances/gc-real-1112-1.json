@@ -1,0 +1,21 @@
+{
+ "id": "gc-real-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane gc-real-1112",
+ "where": "crates/blaze-gc/src/fs.rs workspace(); ~/.cache/blaze/build on the Mac",
+ "what": "The collector kept 498 GB as Refused at full pressure with 2.4 GB free: 13 of the 14 directories under build/ were cargo target dirs (lanes had set CARGO_TARGET_DIR=~/.cache/blaze/build/<name> on Nov 2-4), with no .blaze-lease and no .blaze-record, and a directory with no lease was refused for ever.",
+ "cost": "a full disk on the owner's Mac; a session spent on diagnosis",
+ "cause": "a rule that keeps what it does not recognise, inside a directory that is blaze's own",
+ "whys": [
+  "the disk filled: the collector freed 0 bytes over runs 120-130",
+  "every tracked byte was Refused: 'its workspace is refused'",
+  "the workspaces had no lease file (fs.rs no_lease)",
+  "they were cargo's, not blaze's: lanes pointed cargo at blaze's build/",
+  "nothing says who owns a name under a blaze home, so 'unknown' was read as 'not ours, keep' even inside blaze's own root"
+ ],
+ "class": "bytes a collector knows and can never free (refusal with no expiry inside an owned root)",
+ "prevention": "build/ is a registered root: a lease-less directory in it is adopted and collected (fs.rs workspace, cargo_locked); docs/gc.md 'Every byte has an owner'",
+ "workaround": "the owner removes the 13 directories by hand",
+ "fix": "written in int-1112, not built or run yet",
+ "state": "open"
+}

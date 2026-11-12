@@ -314,7 +314,7 @@ pub fn step_fact(step: Step) -> Option<FactRef> {
     let kind = match step {
         Step::Infer => kinds::STEP_INFER,
         Step::Mir => kinds::STEP_MIR,
-        Step::Borrowck => return None,
+        Step::Borrowck | Step::Const => return None,
     };
     Some(FactRef { kind, subject: OWN, object: FactObject::None })
 }

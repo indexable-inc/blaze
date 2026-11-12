@@ -642,7 +642,22 @@ fn query_count_row(
         ran_changed,
         ran_untracked,
         ran_cycle,
+        validity,
     } = counts;
+    let blaze_query::db::Validity {
+        proved_seal,
+        proved_durability,
+        proved_summary,
+        proved_floor_durability,
+        proved_floor_summary,
+        proved_walk_end,
+        proved_reach,
+        proved_first,
+        edge_walked,
+        edge_gave_up,
+        edge_claimed,
+        edges_compared,
+    } = validity;
     QueryCountRow {
         build_id,
         query,
@@ -660,6 +675,20 @@ fn query_count_row(
         ran_changed,
         ran_untracked,
         ran_cycle,
+        validity: blaze_profile::facts::Validity {
+            proved_seal,
+            proved_durability,
+            proved_summary,
+            proved_floor_durability,
+            proved_floor_summary,
+            proved_walk_end,
+            proved_reach,
+            proved_first,
+            edge_walked,
+            edge_gave_up,
+            edge_claimed,
+            edges_compared,
+        },
     }
 }
 
@@ -2130,6 +2159,20 @@ mod tests {
             ran_changed: 11,
             ran_untracked: 12,
             ran_cycle: 13,
+            validity: blaze_query::db::Validity {
+                proved_seal: 14,
+                proved_durability: 15,
+                proved_summary: 16,
+                proved_floor_durability: 17,
+                proved_floor_summary: 18,
+                proved_walk_end: 19,
+                proved_reach: 20,
+                proved_first: 21,
+                edge_walked: 22,
+                edge_gave_up: 23,
+                edge_claimed: 24,
+                edges_compared: 25,
+            },
         };
         let row = query_count_row(71, "mir_body_query", counts);
         assert_eq!(
@@ -2150,6 +2193,38 @@ mod tests {
                 row.ran_cycle
             ],
             [6384, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        );
+        let blaze_profile::facts::Validity {
+            proved_seal,
+            proved_durability,
+            proved_summary,
+            proved_floor_durability,
+            proved_floor_summary,
+            proved_walk_end,
+            proved_reach,
+            proved_first,
+            edge_walked,
+            edge_gave_up,
+            edge_claimed,
+            edges_compared,
+        } = row.validity;
+        assert_eq!(
+            [
+                proved_seal,
+                proved_durability,
+                proved_summary,
+                proved_floor_durability,
+                proved_floor_summary,
+                proved_walk_end,
+                proved_reach,
+                proved_first,
+                edge_walked,
+                edge_gave_up,
+                edge_claimed,
+                edges_compared,
+            ],
+            [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25],
+            "each count of the validity census under its own name"
         );
         let ended = Ended {
             row: BuildRow {

@@ -8,10 +8,11 @@
 //!   with each definition by its item key, then the typing mode, the regions flag and the
 //!   crate's recursion limit. Its key hashes that form with the solver version and the crate's
 //!   key (its identity and lang items).
-//! - Under the goal's key, in one of [`record::SLOTS`] slots, a **shape** record lists the facts
-//!   the evaluation read; the **answer** is filed under the shape's key and those facts' values
-//!   when it was solved ([`record`]). A lookup reads the shapes, hashes their facts as they are
-//!   now, and asks for the answer: a constructive trace, as Bazel's action cache and Shake keep.
+//! - Under the goal's key, in a slot of its chain, a **shape** record lists the facts the
+//!   evaluation read; the **answer** is filed under the shape's bytes and those facts' values
+//!   when it was solved ([`record`]; the form, its keys and the chain are `blaze_record`'s). A
+//!   lookup reads the shapes, hashes their facts as they are now, and asks for the answer: a
+//!   constructive trace, as Bazel's action cache and Shake keep.
 //! - Only what the global-goal table offers is offered here: root, shareable, global goals,
 //!   never a cycle's provisional answer nor one with inference variables. A goal is stored only
 //!   when every read of its evaluation is an interned value or a fact; any other read (a query
@@ -45,6 +46,7 @@ use blaze_core::lock::Lock;
 use blaze_ids::{ContentId, Hasher};
 use blaze_query::QueryKind;
 use blaze_reclaim::Limbo;
+use blaze_record::{AnswerKey, Bounds, Digest, Filing, Kept, Kind, Placed};
 use hir_def::deps::ImageStore;
 
 use super::{
@@ -52,7 +54,6 @@ use super::{
     global_goals::{Answer, GoalKey},
 };
 use pending::{Pending, Tallies};
-use record::{AnswerKey, SLOTS, ShapeRef, shape_key};
 use stable::Goal;
 
 /// What a goal's stable form and its facts come from, above hir-ty: lane items' item keys and
@@ -176,6 +177,9 @@ struct Store {
     // dyn: lane items' keys and facts, above hir-ty; asked on a miss and after a solve, never on a hit
     facts: Arc<dyn GoalFacts>,
     pending: Pending,
+    /// Lookups since the last flush that found their goal's chain at its bound:
+    /// [`Flushed::lookups_full`].
+    full_lookups: AtomicUsize,
     /// The first error a lookup met (a store that could not be read, a record that does not
     /// open under its key): [`Installed::flush`] stops with it. The goal it met it on was
     /// solved instead, which gives the same answer, so the build's error comes at the flush.
@@ -224,64 +228,61 @@ impl Store {
         let db = interner.db;
         let crate_key = self.facts.crate_key(db, interner.krate());
         let goal_key = stable::goal_key(interner, &*self.facts, &self.version, &crate_key, goal)?;
-        for n in 0..SLOTS {
-            let at = shape_key(&goal_key, n);
-            let shape = match self.images.get(&at) {
-                Ok(Some(shape)) => shape,
-                Ok(None) => return None,
+        // What `blaze_record::lookup` cannot say through a read's digest: a name in a shape
+        // that is no fact. The shape is passed over, and the lookup is an error.
+        let mut no_fact = None;
+        let found = blaze_record::lookup(
+            &self.records(),
+            Bounds::STANDARD,
+            &goal_key,
+            |name| match slots::fact_of(name) {
+                Ok(fact) => self.facts.value(db, interner.krate(), fact).map(Digest::Is),
                 Err(why) => {
-                    // alloc: error text
-                    self.fail(format!("reading the shape of goal {goal_key:x} in slot {n}: {why}"));
-                    return None;
+                    no_fact.get_or_insert(why);
+                    None
                 }
-            };
-            let shape = match ShapeRef::open(shape.bytes(), &goal_key, &self.version) {
-                Ok(shape) => shape,
-                Err(why) => {
-                    // alloc: error text
-                    self.fail(format!("the shape of goal {goal_key:x} in slot {n}: {why}"));
-                    return None;
-                }
-            };
-            let Some(answer_key) = self.answer_key_now(db, interner.krate(), &at, &shape) else {
-                continue;
-            };
-            match self.images.get(&answer_key) {
-                Ok(Some(found)) => match record::open_answer(found.bytes(), &answer_key) {
-                    Ok(answer) => return Some(answer),
+            },
+        );
+        if let Some(why) = no_fact {
+            // alloc: error text
+            self.fail(format!("the shape of goal {goal_key:x}: {why}"));
+            return None;
+        }
+        match found {
+            Ok(blaze_record::Found::Hit { answer, key, at }) => {
+                match record::open_answer(answer.bytes(), &key) {
+                    Ok(answer) => Some(answer),
                     Err(why) => {
                         // alloc: error text
-                        self.fail(format!("the answer of goal {goal_key:x} in slot {n}: {why}"));
-                        return None;
+                        self.fail(format!(
+                            "the answer of goal {goal_key:x} in generation {} slot {}: {why}",
+                            at.generation, at.n
+                        ));
+                        None
                     }
-                },
-                Ok(None) => {}
-                Err(why) => {
-                    // alloc: error text
-                    self.fail(format!(
-                        "reading the answer of goal {goal_key:x} in slot {n}: {why}"
-                    ));
-                    return None;
                 }
             }
+            // A chain at its bound is counted here, and where the goal's shape is then not
+            // placed (`Flushed::slots_full`, which names the goal).
+            Ok(blaze_record::Found::Miss { lists: _, full }) => {
+                if full {
+                    self.full_lookups.fetch_add(1, Ordering::Relaxed);
+                }
+                None
+            }
+            Err(error) => {
+                let slots::Refused { doing, why } = error.into();
+                // alloc: error text
+                self.fail(format!("{doing} goal {goal_key:x}: {why}"));
+                None
+            }
         }
-        None
     }
 
-    /// The key the answer of the shape at `shape_key` has under its facts' values now; `None`
-    /// when one of them cannot be hashed now.
-    fn answer_key_now(
-        &self,
-        db: &Db,
-        krate: Option<Crate>,
-        shape_key: &ContentId,
-        shape: &ShapeRef<'_>,
-    ) -> Option<ContentId> {
-        let mut key = AnswerKey::new(shape_key);
-        for fact in shape.facts() {
-            key.value(&self.facts.value(db, krate, fact)?);
-        }
-        Some(key.finish())
+    /// The driver's store as `blaze_record` reads and writes a goal's records: each under its
+    /// own key.
+    fn records(&self) -> slots::Records<'_, impl Fn(Kind, &ContentId) -> ContentId> {
+        slots::Records { images: &*self.images, at: |_: Kind, key: &ContentId| *key }
     }
 
     fn offer<'db>(
@@ -360,46 +361,43 @@ impl Store {
         error.get_or_insert(why);
     }
 
-    /// Writes one buffered goal: its shape in the first slot that holds it or is free
-    /// (`claimed`: what this flush placed in the slots of the goal's key before, [`slots`]),
-    /// then its answer under the shape's key and the values its facts had.
+    /// Writes one buffered goal: its shape in its key's chain where it is held or the first
+    /// slot is free (`filing`: the placing of this flush's shapes of the goal's key,
+    /// [`slots::filing`]), then its answer under the shape's bytes and the values its facts
+    /// had.
     fn write<'a>(
         &self,
         entry: &pending::Entry<'a>,
-        claimed: &mut slots::Claimed<'a, { SLOTS as usize }>,
+        filing: &mut Filing<'a>,
     ) -> Result<Wrote, String> {
         let goal = entry.goal_key;
         // alloc: error text
         let error = |what: &str, why: String| format!("{what} goal {goal:x}: {why}");
-        let placed = claimed
-            .claim(&*self.images, entry.shape, |n| shape_key(&goal, n))
-            .map_err(|slots::Refused { doing, why }| error(doing, why))?;
-        let Some(slots::Slot { n, written }) = placed else { return Ok(Wrote::SlotsFull) };
-        let wrote = match written {
-            true => Wrote::Written,
-            false => Wrote::Kept,
+        let refused = |refused: blaze_record::Error<String>| {
+            let slots::Refused { doing, why } = refused.into();
+            error(doing, why)
         };
-        let at = shape_key(&goal, n);
-        let mut key = AnswerKey::new(&at);
+        let records = self.records();
+        let wrote = match filing.place(&records, entry.shape).map_err(&refused)? {
+            Placed::Written(_) => Wrote::Written,
+            Placed::Kept(_) => Wrote::Kept,
+            Placed::Full => return Ok(Wrote::SlotsFull),
+        };
+        let mut key = AnswerKey::new(entry.shape);
         for value in entry.values() {
-            key.value(&value);
+            key.value(Digest::Is(value));
         }
         let answer_key = key.finish();
         let answer = record::answer_record(&answer_key, entry.answer);
-        match self.images.get(&answer_key).map_err(|why| error("reading the answer of", why))? {
-            Some(kept) if kept.bytes() == answer => Ok(wrote),
-            Some(_) => Err(error(
+        match blaze_record::keep_answer(&records, answer_key, &answer) {
+            Ok(Kept::Written) => Ok(Wrote::Written),
+            Ok(Kept::Held) => Ok(wrote),
+            Err(blaze_record::Error::TwoAnswers { key: _ }) => Err(error(
                 "two answers under the same fact values of",
                 // alloc: error text
                 String::from("its evaluation read something its facts do not cover"),
             )),
-            None => {
-                // alloc: the answer's bytes, once per goal written
-                self.images
-                    .put(answer_key, answer.to_vec())
-                    .map_err(|why| error("keeping the answer of", why))?;
-                Ok(Wrote::Written)
-            }
+            Err(other) => Err(refused(other)),
         }
     }
 }
@@ -411,7 +409,7 @@ enum Wrote {
     Written,
     /// The store had both already.
     Kept,
-    /// Every slot of its key holds another shape.
+    /// Every slot of its key's chain holds another shape (`blaze_record::Placed::Full`).
     SlotsFull,
 }
 
@@ -422,8 +420,16 @@ pub struct Flushed {
     pub written: usize,
     /// Goals the store had already.
     pub kept: usize,
-    /// Goals not written as every slot of their key holds another shape.
+    /// Goals not written as every slot of their key's chain holds another shape: the chain's
+    /// bound (`blaze_record::Bounds::STANDARD`), which a later lookup of the goal misses on.
     pub slots_full: usize,
+    /// Lookups that found their key's chain at its bound (`blaze_record::Found::Miss`'s
+    /// `full`): what was run for one of them is among `slots_full` at the next flush, unless
+    /// the chain holds its shape where a placing looks.
+    pub lookups_full: usize,
+    /// The first, in the order the flush writes, of those counted in `slots_full`: which it
+    /// is, by its key, and the bound.
+    pub full: Option<String>,
     /// For each query or input whose read kept goals out (it stands for no fact), how many,
     /// most first: the facts lane items is asked for.
     pub inexpressible: Vec<(&'static str, u64)>,
@@ -512,6 +518,7 @@ pub fn install(
         images,
         facts,
         pending: Pending::new(),
+        full_lookups: AtomicUsize::new(0),
         error: Lock::new("ty.goal_store.error", None),
     }));
     for (at, slot) in REGISTRY.iter().enumerate() {
@@ -575,15 +582,24 @@ impl Installed {
             |a, b| entries[a].goal_key == entries[b].goal_key,
         );
         store.images.for_each(runs.len(), &|run| {
-            let mut claimed = slots::Claimed::new();
             // clone: a range of two words
-            for &at in &order[runs[run].clone()] {
-                _ = results[at].set(store.write(&entries[at], &mut claimed));
+            let run = &order[runs[run].clone()];
+            // A run is the entries of one goal key, and never empty.
+            let mut filing = slots::filing(entries[run[0]].goal_key);
+            for &at in run {
+                _ = results[at].set(store.write(&entries[at], &mut filing));
             }
         });
         let Tallies { inexpressible, unhashable, too_long, dropped } = tallies;
-        let mut flushed =
-            Flushed { inexpressible, unhashable, too_long, dropped, ..Flushed::default() };
+        let lookups_full = store.full_lookups.swap(0, Ordering::Relaxed);
+        let mut flushed = Flushed {
+            lookups_full,
+            inexpressible,
+            unhashable,
+            too_long,
+            dropped,
+            ..Flushed::default()
+        };
         let mut results = results;
         // In the order written, so the failure named is the same one whichever thread wrote it.
         for at in order {
@@ -593,7 +609,17 @@ impl Installed {
             match wrote {
                 Ok(Wrote::Written) => flushed.written += 1,
                 Ok(Wrote::Kept) => flushed.kept += 1,
-                Ok(Wrote::SlotsFull) => flushed.slots_full += 1,
+                Ok(Wrote::SlotsFull) => {
+                    flushed.slots_full += 1;
+                    if flushed.full.is_none() {
+                        // alloc: once per flush that met a full chain
+                        flushed.full = Some(format!(
+                            "goal {:x}, whose chain holds {} other shapes",
+                            entries[at].goal_key,
+                            slots::full_chain()
+                        ));
+                    }
+                }
                 Err(why) => {
                     flushed.failed += 1;
                     flushed.failure.get_or_insert(why);

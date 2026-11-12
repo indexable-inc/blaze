@@ -63,7 +63,7 @@ pub(super) struct Counts {
     pub(super) unencodable: u64,
     pub(super) dropped: u64,
     /// By [`Step`] as an index.
-    pub(super) steps: [StepCounts; 3],
+    pub(super) steps: [StepCounts; Step::COUNT],
 }
 
 impl Counts {
@@ -203,7 +203,7 @@ impl Pending {
 
     /// What each step's lookups found and its offers met since the last [`Pending::take`], left
     /// in place.
-    pub(super) fn steps(&self) -> [StepCounts; 3] {
+    pub(super) fn steps(&self) -> [StepCounts; Step::COUNT] {
         let mut counts = Counts::default();
         for shard in &self.shards {
             let shard = shard.0.lock();

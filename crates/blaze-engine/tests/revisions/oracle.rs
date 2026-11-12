@@ -41,7 +41,15 @@ fn out() -> PathBuf {
 
 /// The case of `turns` over `parts`, run and judged.
 fn case(parts: Parts, turns: &[Turn]) {
-    let test = generate::test(&generate::name(parts, turns), parts, turns, &["real"]);
+    let mut test = generate::test(&generate::name(parts, turns), parts, turns, &["real"]);
+    // `BLAZE_ORACLE_ENV=NAME=VALUE,..`: variables of every command from the first revision
+    // on (the driver clears its own environment, so one exported to this test never arrives).
+    if let Ok(all) = std::env::var("BLAZE_ORACLE_ENV") {
+        for pair in all.split(',').filter(|it| !it.is_empty()) {
+            let (name, value) = pair.split_once('=').unwrap_or_else(|| panic!("BLAZE_ORACLE_ENV: `{pair}` is not NAME=VALUE"));
+            test.revisions[0].env.push((name.to_owned(), value.to_owned()));
+        }
+    }
     let clean = match std::env::var("BLAZE_ORACLE_CLEAN").as_deref() {
         Ok("when-wrong") => Clean::WhenWrong,
         Ok(other) if other != "always" => panic!("BLAZE_ORACLE_CLEAN={other}: `always` or `when-wrong`"),
@@ -102,7 +110,7 @@ fn any_turn_sequence_builds_as_clean() {
 #[test]
 #[ignore = "minutes of real builds: docs/harness.md, \"The oracle\""]
 fn each_kind_once_builds_as_clean() {
-    let parts = Parts { up: true, made: true, mac: std::env::var_os("BLAZE_ORACLE_NO_MAC").is_none() };
+    let parts = Parts { up: true, made: true, mac: std::env::var_os("BLAZE_ORACLE_NO_MAC").is_none(), mid: true };
     let turn = |edits: &[Edit], save, event, event_last, width| Turn { request: Request::RUN, edits: edits.to_vec(), save, event, event_last, width };
     let mut turns = vec![
         turn(&[Edit::Body(1)], Save::Write, Event::Nothing, false, None),
@@ -125,6 +133,23 @@ fn each_kind_once_builds_as_clean() {
     if parts.mac {
         turns.push(turn(&[Edit::Mac(1)], Save::Write, Event::Nothing, false, None));
     }
+    // Below a library (`mid` over `up`): each alone, so a record of `mid` found across it
+    // that should not have been shows as that turn's stale number.
+    let below = [
+        Edit::UpPlain(1),
+        Edit::UpLines,
+        Edit::UpPad,
+        Edit::UpTwist(1),
+        Edit::UpSignature,
+        Edit::UpAlways(1),
+        Edit::UpInherent,
+        Edit::UpInherent,
+        Edit::UpPlain(0),
+    ];
+    // After the first turn, before the cfg flips whose splice is refused (row sound-1112-5).
+    for (at, edit) in below.into_iter().enumerate() {
+        turns.insert(1 + at, turn(&[edit], Save::Write, Event::Nothing, false, None));
+    }
     case(parts, &turns);
 }
 
@@ -145,7 +170,7 @@ fn replay() {
 #[test]
 #[ignore = "minutes of real builds: docs/harness.md, \"The oracle\""]
 fn alternating_requests_of_unchanged_sources_are_no_ops() {
-    let parts = Parts { up: true, made: true, mac: false };
+    let parts = Parts { up: true, made: true, mac: false, mid: true };
     let ask = |action, release, loud, short, width| Turn {
         request: Request { action, release, loud, short },
         edits: Vec::new(),
@@ -182,7 +207,7 @@ fn alternating_requests_of_unchanged_sources_are_no_ops() {
 #[test]
 #[ignore = "minutes of real builds: docs/harness.md, \"The oracle\""]
 fn the_oracle_catches_a_build_of_the_sources_before() {
-    let parts = Parts { up: false, made: false, mac: false };
+    let parts = Parts { up: false, made: false, mac: false, mid: false };
     let turns = [Turn { request: Request::RUN, edits: vec![Edit::Body(1)], save: Save::Write, event: Event::Nothing, event_last: false, width: None }];
     let mut test = generate::test("control", parts, &turns, &["real"]);
     // The planted bug: the edit is never saved, so the build is of the sources before.

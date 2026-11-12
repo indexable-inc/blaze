@@ -100,6 +100,28 @@ pub struct QueryCountRow {
     pub ran_changed: u64,
     pub ran_untracked: u64,
     pub ran_cycle: u64,
+    /// How its rows were proved unchanged.
+    pub validity: Validity,
+}
+
+/// The validity census columns of a `query_counts` row (`blaze_query::db::Validity`, field for
+/// field): how the query's rows of an earlier view were proved unchanged, each under the first
+/// proof to answer in the engine's order, and what proving by edges cost. Each field is the
+/// column of its name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Validity {
+    pub proved_seal: u64,
+    pub proved_durability: u64,
+    pub proved_summary: u64,
+    pub proved_floor_durability: u64,
+    pub proved_floor_summary: u64,
+    pub proved_walk_end: u64,
+    pub proved_reach: u64,
+    pub proved_first: u64,
+    pub edge_walked: u64,
+    pub edge_gave_up: u64,
+    pub edge_claimed: u64,
+    pub edges_compared: u64,
 }
 
 /// What a `provenance` row says happened ([`ProvenanceRow::outcome`]).
@@ -408,6 +430,18 @@ pub fn query_counts(rows: &[QueryCountRow]) -> Result<RecordBatch, ArrowError> {
         count(|it| it.ran_changed),
         count(|it| it.ran_untracked),
         count(|it| it.ran_cycle),
+        count(|it| it.validity.proved_seal),
+        count(|it| it.validity.proved_durability),
+        count(|it| it.validity.proved_summary),
+        count(|it| it.validity.proved_floor_durability),
+        count(|it| it.validity.proved_floor_summary),
+        count(|it| it.validity.proved_walk_end),
+        count(|it| it.validity.proved_reach),
+        count(|it| it.validity.proved_first),
+        count(|it| it.validity.edge_walked),
+        count(|it| it.validity.edge_gave_up),
+        count(|it| it.validity.edge_claimed),
+        count(|it| it.validity.edges_compared),
     ];
     RecordBatch::try_new(batches::schema_of(&schema::QUERY_COUNTS), columns)
 }

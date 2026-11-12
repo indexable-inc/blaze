@@ -43,13 +43,15 @@ workspaces whose checkout is gone, then what is past its TTL or a cap, then the 
 used profiles across every workspace, then each workspace's last transactions' profiles (none
 in the daemon yet: nothing feeds the collector transactions), then whole shared std stores and
 build dirs, least recently used first. What is leased, a live head's workspace directory and the
-profiles it keeps (below), and anything within the grace never goes, however full the disk.
+profiles it keeps (below), and anything within the grace never goes, however full the disk;
+the grace itself shrinks with pressure ([Every byte has an owner](#every-byte-has-an-owner)).
 
 A checkout counts as gone only when its path is not found and its parent is there; any other
 error (a permission, an unmounted volume) refuses the workspace. A workspace whose checkout is
 gone keeps a day's grace, so a checkout moved away for a while keeps its build.
 
-Nothing goes within the grace (an hour since its last use), and neither does a directory that
+Nothing goes within the grace (an hour since its last use up to half pressure, then linearly
+less, a minute at full pressure and in an urgent run), and neither does a directory that
 holds something within it: a workspace whose checkout is gone stays while a profile in it was
 used within the hour. A workspace whose checkout is a live head of the daemon (a checkout it
 watches), or that something leases, stays. A live head keeps its workspace directory, its
@@ -235,8 +237,14 @@ directory, keeps it: the rename needs the exclusive lock, which the collector on
   dir strictly inside the checkout (a project's `./target`) is leased only when blaze makes it
   now or it already carries a build directory's mark (cargo's `CACHEDIR.TAG` among them), so
   `blaze clean` sees a build that writes into it; a directory of the user's never is.
-- A directory with no lease file, or a workspace with no record of its checkout, is refused:
-  never collected, as no blaze that takes leases used it.
+- A std store with no lease file is refused: never collected, as no blaze that takes leases
+  used it. A directory under `build/` with no lease file is adopted, not refused: `build/` is
+  blaze's, so the scan makes its lease (a dry run too: it removes nothing) and from then on it
+  is a workspace like any other. With no record it names no checkout: its last use is its
+  newest stamp, it goes unused past the TTL or under pressure, and while a cargo holds a
+  `.cargo-lock` in it or in a profile of it, it counts as leased (`fs.rs`, `workspace`,
+  `cargo_locked`). Before 2026-11-12 it was refused for ever: thirteen cargo target dirs
+  someone had pointed at `build/` held 464 GB of a full disk that way.
 - A job that stalls keeps its leases until its tasks let go of it, so a task still writing
   holds its build dir.
 - Network and FUSE file systems (NFS, SMB, AFS, FUSE, virtiofs, vboxsf, GFS2, OCFS2, BeeGFS,
@@ -459,6 +467,78 @@ when a write fails for want of space, as [above](#pacing-how-hard-it-works).
 **Measured by** `harness/storegc.py` (one JSON value): a home filled by several generated
 programs, the budget set to a share of what it holds, body edits before, during and after the
 collection, the bytes at each step, and what `blaze gc --dry-run` says is kept.
+
+## Every byte has an owner
+
+The class this closes: bytes under a home that no collector knows, and bytes a collector knows
+and will never free. Measured on one machine on 2026-11-12, its disk at 2.4 GB free: the home
+held 1,337 GB; the collector tracked 498 GB of it, all `Refused`, and freed nothing at full
+pressure; 840 GB was in names it never listed (lane scratch, a nested home, a store set aside
+by hand after a format change, the directories of the daemon before v2).
+
+The rule: **every entry right under a home has exactly one owner, every byte under the home is
+counted to its entry's owner, and when not enough can be freed the report names the largest
+holders with the reason each stays.** The registry is `blaze_gc::roots::ROOTS`
+(`crates/blaze-gc/src/roots.rs`), one line a name:
+
+| Owner | Names | Who removes it |
+|---|---|---|
+| builds | `build/` | the collector above; a directory in it with no lease is adopted |
+| std | `std/` | the collector above |
+| state | `v2/` | the store's collector, record by record; the rest is bounded by its writers |
+| trash | `.blaze-trash/` | the collector's trash phase |
+| fetched | `sources/`, `toolchains/`, `library/` | nothing yet: counted, and named as held for that reason |
+| fixed | sockets, locks, `gc.json`, `.blaze-collector`, `homes.json` | nobody: small, fixed size |
+| backup | `<root>.<label>.backup-<digits>` of a registered root (`v2.store-format-3.backup-20261111`) | the home's pass: 7 days after its last write, or under pressure |
+| retired | what the daemon before v2 wrote (`workers/`, `checkers/`, `spares/`, `sandbox/`, `store/`, `daemon.log`, `last-build`, ...) | the home's pass: 14 days after its last write, or under pressure |
+| foreign | any other name | nobody: no blaze made it, so blaze does not remove it; it is counted and named |
+
+The home's pass (`roots::account`, a function of the listing, the time and the pressure; its
+driver `roots_fs::pass`) runs before a collection (`fs::home_pass`, from `fs::run_now`). It
+lists every entry right under the home with its bytes on disk, its newest stamp and whether a
+lock file in it (right inside or one directory down) is held. In order: what a lock holds
+stays; what was written within the grace at this pressure stays; a backup or a retired name
+past its lifetime goes; then, while the volume still has bytes to free, backups and then
+retired names go, least recently written first. What goes is renamed into the home's trash
+while every lock file in it is held by the pass; the collection that follows unlinks it, so
+there is one unlink path and a crash leaves an entry where it was or whole in trash. All of the
+home's bytes, a foreign name's too, count against blaze's share of the volume, so what is to
+be freed is no longer computed from a part of the home.
+
+The graces shrink by one rule (`roots::grace_at`): whole up to half pressure, then linearly
+down to a minute at full pressure; an urgent run is at full pressure. The hour's grace, and the
+day's for a checkout that is gone, covered the moment before a new directory's lease is taken
+and a checkout moved away for a while; neither is worth a full disk, and a minute still covers
+the first. A lease, a live head, a pin and a held lock keep what is in use at any pressure, so
+a disk can fill only with what is in use or what is not blaze's, and then the report says which.
+
+The report (`blaze cache gc`, `--last`, `--dry-run`) carries the account: the home's bytes and
+how many are in what no blaze made, each entry that goes with why, and the twelve largest
+entries that stay, each with its reason (`Account::lines`).
+
+Nothing may be written right under a home outside a registered name. The guard:
+`roots_fs::unregistered(home)` lists the names no blaze makes; a test that builds into a fresh
+home fails on any (not wired into a daemon test yet, below). An agent's or a person's files do
+not belong under a blaze home: a foreign name there is theirs to move out.
+
+Evidence: `crates/blaze-gc/src/roots_tests.rs` plays the pass on a model home under 2,000
+seeds, crashing after every rename and every unlink and restarting. The oracle: nothing a lock,
+the grace or another owner keeps is removed or changed, nothing outside trash is partly
+removed, no byte leaves the count, a restart empties trash; its dual: at full pressure with
+garbage present, bytes are freed, and either enough are or no garbage is left. Controls the
+oracle catches: the grace not shortened under pressure, a foreign directory left out of the
+account, a held lock not seen. Not run yet (written 2026-11-12 in a lane that builds nothing).
+
+Not built: the daemon's own collection does not run the home's pass yet (only `blaze cache gc`
+does, when no daemon holds the home); a build's output does not warn with the holders; the
+guard is not called from a test that builds; `sources/` and `toolchains/` have no collector;
+a home made for a lane or a test has no lifetime. The design for the last: each home registers
+itself in the machine's list (`<machine>/homes.json`: path, creator, made, expires; written
+whole under the list's lock as a daemon first starts on the home; `BLAZE_HOME_EXPIRES` or a
+default of 7 days for a home outside `~/.cache`, none for the user's own), `blaze cache homes`
+lists them with sizes and expiry, and a collection on any home removes a listed home that is
+past its expiry, whose collector lock is free and whose directory still carries the list's
+nonce, by the same rename into its own trash.
 
 ## Not done yet
 

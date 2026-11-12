@@ -29,7 +29,9 @@ use crate::span;
 /// last typed column of the span registry, nullable and at the table's end: a file from before
 /// reads it as null through the table's schema file. Still 5 with `spans.owned_by` after it
 /// (2026-11-11), who ends a `wait`, said by every one: null in a file from before, where a null
-/// `owner` meant "not known".
+/// `owner` meant "not known". Still 5 with `query_counts`' validity census (2026-11-12:
+/// `proved_*`, `edge_*` and `edges_compared`), nullable and at the table's end: null in a file
+/// from before, where nothing counted them.
 pub const VERSION: u32 = 5;
 
 /// A version before [`VERSION`] whose files a reader reads as [`VERSION`]'s, and what reading
@@ -947,6 +949,66 @@ pub const QUERY_COUNTS: Table = Table {
             "ran_cycle",
             Type::U64,
             "of its runs, those for a cycle: a stale provisional row, or a verify that re-entered a cycle; null before it",
+        ),
+        opt(
+            "proved_seal",
+            Type::U64,
+            "of its rows proved unchanged, those proved by their seal with no look at an edge (the validity census: each row counted under the first proof to answer, in the engine's order); null in files of a blaze before the census",
+        ),
+        opt(
+            "proved_durability",
+            Type::U64,
+            "those proved by durability from the view they were verified in: no input of their kind or above was written since; null in files of a blaze before the census",
+        ),
+        opt(
+            "proved_summary",
+            Type::U64,
+            "those proved by their input summary from the view they were verified in: no bit of it was written since; null in files of a blaze before the census",
+        ),
+        opt(
+            "proved_floor_durability",
+            Type::U64,
+            "those proved by durability from the changed set's floor; null in files of a blaze before the census",
+        ),
+        opt(
+            "proved_floor_summary",
+            Type::U64,
+            "those proved by their input summary from the changed set's floor; null in files of a blaze before the census",
+        ),
+        opt(
+            "proved_walk_end",
+            Type::U64,
+            "those proved by a changed-set walk that ended in the view and did not set them apart; null in files of a blaze before the census",
+        ),
+        opt(
+            "proved_reach",
+            Type::U64,
+            "those proved by being outside the reach of a changed-set walk under way; null in files of a blaze before the census",
+        ),
+        opt(
+            "proved_first",
+            Type::U64,
+            "of `proved_walk_end` and `proved_reach`, those a fetch asked before any other proof, so no shortcut ahead of them had its turn; null in files of a blaze before the census",
+        ),
+        opt(
+            "edge_walked",
+            Type::U64,
+            "its rows the claim-free walk proved by comparing every edge; null in files of a blaze before the census",
+        ),
+        opt(
+            "edge_gave_up",
+            Type::U64,
+            "its rows on a claim-free walk's stack when the walk gave up (the claimed path looks at the walk's root again); null in files of a blaze before the census",
+        ),
+        opt(
+            "edge_claimed",
+            Type::U64,
+            "its rows whose edges the claimed path compared, whatever it found; null in files of a blaze before the census",
+        ),
+        opt(
+            "edges_compared",
+            Type::U64,
+            "the edges compared for `edge_walked`, `edge_gave_up` and `edge_claimed`; null in files of a blaze before the census",
         ),
     ],
 };

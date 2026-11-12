@@ -20,7 +20,23 @@
 //! put under its set since the daemon started; so while a root is kept (a pin names it, a
 //! reader keeps it), the collector forgets none of them. Tested in `tests::sets` (the
 //! collector's simulation with a pinned root; the control is a collector that does not
-//! follow listings, `collect::Plant::SetNotFollowed`).
+//! follow listings, `collect::SET_NOT_FOLLOWED`).
+//!
+//! The sealed form ([`crate::sealed`]) is beside it: a set's items in one value, which the
+//! set's root names. A set the driver says is written sealed at once
+//! ([`Sets::seal_at_once`]: a crate not edited under its version) holds what is put under
+//! it in memory until [`Sets::seal`] writes them as one sealed set; a live set that has
+//! been quiet ([`Sets::quiet`]) is compacted by the same [`Sets::seal`], its records left
+//! to the collector once no root names them. A get looks at the record under the key, then
+//! at what its set holds in memory, then in the sealed sets its set's root names
+//! ([`Sets::follows`] gives a crate's next version the sealed sets of the one before).
+//!
+//! The invariant of a seal: the root [`Sets::seal`] returns names, through its sealed sets
+//! and its leaves, every item the root before it named and every item put under the set
+//! before the seal began; an item is in a record a root names or in a sealed set a root
+//! names at every point, never in neither. Tested in `tests::sealed` (a crash at every
+//! completion of the seal's commit and of the pin's; the control is a root that leaves its
+//! sealed set out, [`SEALED_NOT_NAMED`]).
 
 use std::{alloc::Global, sync::Arc};
 
@@ -28,7 +44,17 @@ use blaze_core::lock::Lock;
 use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 
-use crate::{Handle, Key, Kind};
+use crate::{Handle, Key, Kind, Ticket, enter, sealed};
+
+#[cfg(test)]
+thread_local! {
+    /// A planted bug for the seal's test: the root a seal writes leaves out the sealed set
+    /// it just made.
+    pub(crate) static SEALED_NOT_NAMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// A set has at most this many sealed sets: a seal that would make one more merges them all
+/// into the one it writes, so a get that misses reads this many directories at most.
+pub const MAX_SEALED: usize = 4;
 
 /// The first bytes of a listing: its layout's version is the last.
 const MAGIC: [u8; 8] = *b"BLZSET\x00\x01";
@@ -201,6 +227,63 @@ struct Members {
     root: Option<Key>,
     /// The keys of its last listing's leaves, ascending: a leaf among them is in the store.
     leaves: Vec<Key>,
+    /// The sealed sets its root names, oldest first, each with its header as read once.
+    sealed: Vec<(Key, sealed::Header)>,
+    /// `Some` for a set written sealed at once: what was put under it and is in no sealed
+    /// set yet, by key.
+    held: Option<HashMap<Key, Vec<u8>, Global>>,
+    /// A root adopted ([`Sets::adopt`]) whose leaves are not read into `keys` yet.
+    base: Option<Key>,
+    /// How many listings in a row found its members as they were.
+    quiet: u32,
+}
+
+/// What [`Sets::seal`] wrote.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Sealing {
+    /// The set's root from here on: what a pin or a keep names once `durable` is.
+    pub root: Key,
+    /// The sealed set written.
+    pub sealed: Key,
+    /// The items in it, and the bytes of the sealed set.
+    pub items: u64,
+    pub bytes: u64,
+    /// Of the items, those that came from the set's earlier sealed sets, merged into this.
+    pub merged: u64,
+    /// Members whose record the store no longer has (forgotten while no root named them):
+    /// not in the sealed set.
+    pub gone: u64,
+    /// The later of the two puts (the sealed set, then the root): both are the handle's
+    /// one writer's, so the later is durable when both are.
+    pub durable: Ticket,
+}
+
+/// A sealed set in the store, read a part at a time under a task's guard.
+struct InStore<'g> {
+    handle: &'g Handle,
+    guard: &'g crate::Guard,
+    key: Key,
+}
+
+impl sealed::Parts for InStore<'_> {
+    fn part(&self, at: u64, len: u64) -> Result<&[u8], String> {
+        match self.handle.reader().part(self.guard, &self.key, at, len) {
+            Ok(Some(bytes)) => Ok(bytes),
+            // alloc: error path
+            Ok(None) => Err(format!("the sealed set {:?} is not in the store", self.key.0)),
+            Err(corrupt) => Err(corrupt.to_string()), // alloc: error path
+        }
+    }
+}
+
+/// The header of the sealed set under `key`, read from the store.
+fn header_of(handle: &Handle, key: Key) -> Result<sealed::Header, String> {
+    use sealed::Parts as _;
+    let guard = enter();
+    let from = InStore { handle, guard: &guard, key };
+    sealed::Header::decode(from.part(0, sealed::FIXED as u64)?)
+        // alloc: error path
+        .map_err(|why| format!("the sealed set {:?}: {why}", key.0))
 }
 
 /// What [`Sets::list`] did.
@@ -222,6 +305,36 @@ pub struct Listed {
 pub struct Sets {
     // alloc: the daemon's own tables, for its life
     shards: Vec<Lock<HashMap<ContentId, Members, Global>>>,
+    /// Held by a listing and by a seal from end to end: one of them at a time.
+    listing: Lock<()>,
+}
+
+/// The item keys the leaves of `root` list: what a root an earlier run wrote named.
+fn keys_of_root(handle: &Handle, root: Key) -> Result<Vec<Key>, String> {
+    let read = |key: Key| {
+        handle
+            .read(&key, |entry| decode(entry.bytes))
+            // alloc: error path
+            .map_err(|corrupt| format!("the listing {:?} does not read: {corrupt}", key.0))?
+            // alloc: error path
+            .ok_or_else(|| format!("the listing {:?} is not in the store, and a root names it", key.0))?
+            // alloc: error path
+            .map_err(|why| format!("the listing {:?}: {why}", key.0))
+    };
+    let Listing::Root { leaves, .. } = read(root)? else {
+        // alloc: error path
+        return Err(format!("{:?} was adopted as a root and is a leaf", root.0));
+    };
+    // alloc: once a set adopted and then touched, its keys
+    let mut keys = Vec::new();
+    for leaf in leaves {
+        match read(leaf)? {
+            Listing::Leaf(named) => keys.extend(named),
+            // alloc: error path
+            Listing::Root { .. } => return Err(format!("the root {:?} names the root {:?} as a leaf", root.0, leaf.0)),
+        }
+    }
+    Ok(keys)
 }
 
 impl Sets {
@@ -232,6 +345,7 @@ impl Sets {
                 .map(|_| Lock::new("store.sets.members", HashMap::new_in(Global)))
                 // alloc: the daemon's own tables, for its life
                 .collect(),
+            listing: Lock::new("store.sets.listing", ()),
         })
     }
 
@@ -265,14 +379,141 @@ impl Sets {
             .is_some();
         if found {
             self.member(set, Key(*key));
+            return Ok(true);
         }
-        Ok(found)
+        // Not a record: held for a seal, or in a sealed set of this set.
+        let sealed_sets = {
+            let shard = self.shards[set.0[0] as usize % SHARDS].lock();
+            let Some(members) = shard.get(set) else { return Ok(false) };
+            if let Some(bytes) = members.held.as_ref().and_then(|held| held.get(&Key(*key))) {
+                with(bytes);
+                return Ok(true);
+            }
+            if members.sealed.is_empty() {
+                return Ok(false);
+            }
+            // alloc: a get that missed its record, the set's few sealed sets (MAX_SEALED)
+            members.sealed.clone()
+        };
+        let guard = enter();
+        // The newest first: what was sealed last is what was put last.
+        for (sealed_key, header) in sealed_sets.iter().rev() {
+            let from = InStore { handle, guard: &guard, key: *sealed_key };
+            let mut probe = sealed::Probe::default();
+            let item = sealed::find(&from, header, &Key(*key), &mut probe)
+                // alloc: error path
+                .map_err(|why| format!("the item {key:?} of the set {set:?} in the sealed set {:?}: {why}", sealed_key.0))?;
+            if let Some(bytes) = item {
+                with(bytes);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Says `set` is written sealed at once: what is put under it from here on is held in
+    /// memory, readable by [`Sets::get`] under this set, and written by [`Sets::seal`] as
+    /// one sealed set, never as a record each. For a crate that is not edited under its
+    /// version (the standard library, a registry crate); such an item is not found under
+    /// another set, which is the sharing the sealed form gives up.
+    pub fn seal_at_once(&self, set: &ContentId) {
+        let mut shard = self.shards[set.0[0] as usize % SHARDS].lock();
+        let members = shard.entry(*set).or_default();
+        if members.held.is_none() {
+            members.held = Some(HashMap::new_in(Global));
+        }
+    }
+
+    /// Gives `set` the sealed sets of `before`, the set of its crate's version before: an
+    /// unchanged item of the new version is found there, and only what changed is written.
+    /// The next listing or seal of `set` names them in its root.
+    pub fn follows(&self, set: &ContentId, before: &ContentId) {
+        // alloc: once a crate's new version, the few sealed sets of the one before
+        let theirs = self.shards[before.0[0] as usize % SHARDS]
+            .lock()
+            .get(before)
+            .map_or_else(Vec::new, |it| it.sealed.clone());
+        if theirs.is_empty() {
+            return;
+        }
+        let mut shard = self.shards[set.0[0] as usize % SHARDS].lock();
+        let members = shard.entry(*set).or_default();
+        for it in theirs {
+            if !members.sealed.iter().any(|mine| mine.0 == it.0) {
+                // alloc: as above
+                members.sealed.push(it);
+                members.touched = true;
+                // Its root does not name them yet: the next listing writes one that does.
+                members.root = None;
+            }
+        }
+    }
+
+    /// Takes `root`, a set's root an earlier run of the daemon wrote (a pin names it, or a
+    /// build's record), as the set's: its sealed sets are looked in by [`Sets::get`], and
+    /// the next listing of the set names what it named and what was got or put since. The
+    /// set it is of is returned. A set that has a root already keeps it. `None` for a key
+    /// that is no root (a pin names other records too: no value, a value that is not a
+    /// listing, a leaf); a listing of another layout or a cut one is an error.
+    pub fn adopt(&self, handle: &Handle, root: Key) -> Result<Option<ContentId>, String> {
+        let listing = handle
+            .read(&root, |entry| {
+                (entry.bytes.len() >= 7 && entry.bytes[..7] == MAGIC[..7]).then(|| decode(entry.bytes))
+            })
+            // alloc: error path
+            .map_err(|corrupt| format!("the root {:?} does not read: {corrupt}", root.0))?;
+        let Some(Some(listing)) = listing else { return Ok(None) };
+        // alloc: error path
+        let listing = listing.map_err(|why| format!("the root {:?}: {why}", root.0))?;
+        let Listing::Root { set, leaves, sealed: sealed_keys } = listing else { return Ok(None) };
+        // alloc: once a root adopted, its few sealed sets
+        let mut sealed_sets = Vec::with_capacity(sealed_keys.len());
+        for key in sealed_keys {
+            sealed_sets.push((key, header_of(handle, key)?));
+        }
+        let mut shard = self.shards[set.0[0] as usize % SHARDS].lock();
+        let members = shard.entry(set).or_default();
+        if members.root.is_none() && members.base.is_none() {
+            members.root = Some(root);
+            members.base = Some(root);
+            members.leaves = leaves;
+            members.leaves.sort_unstable();
+            for it in sealed_sets {
+                if !members.sealed.iter().any(|mine| mine.0 == it.0) {
+                    members.sealed.push(it); // alloc: as above
+                }
+            }
+        }
+        Ok(Some(set))
     }
 
     /// Keeps `bytes` under `key`, a member of `set`. A key the store has is the same bytes
     /// (a key covers every input of its item) and writes nothing; other bytes under it are
     /// refused, naming the key (rule keys-cover-every-input).
     pub fn put(&self, handle: &Handle, set: &ContentId, key: ContentId, bytes: &[u8]) -> Result<(), String> {
+        {
+            let mut shard = self.shards[set.0[0] as usize % SHARDS].lock();
+            if let Some(members) = shard.get_mut(set)
+                && let Some(held) = members.held.as_mut()
+            {
+                // A set written sealed at once: held until its seal.
+                members.touched = true;
+                return match held.get(&Key(key)) {
+                    Some(kept) if kept.as_slice() == bytes => Ok(()),
+                    // alloc: error path
+                    Some(kept) => Err(format!(
+                        "the item {key:?} of the set {set:?} was refused: {} bytes are held under it and {} other bytes were put",
+                        kept.len(),
+                        bytes.len()
+                    )),
+                    None => {
+                        // alloc: an item held until its set is sealed (`Sets::seal`)
+                        held.insert(Key(key), bytes.to_vec());
+                        Ok(())
+                    }
+                };
+            }
+        }
         handle
             .put(Key(key), Kind::Query, bytes)
             // alloc: error path
@@ -300,6 +541,7 @@ impl Sets {
         // tables' own.
         // alloc: once a build's end, the sets it touched
         let mut touched: Vec<ContentId> = Vec::new();
+        let _one = self.listing.lock();
         for shard in &self.shards {
             touched.extend(shard.lock().iter().filter(|(_, it)| it.touched).map(|(set, _)| *set));
         }
@@ -309,12 +551,49 @@ impl Sets {
             let Some(members) = shard.get_mut(set) else { continue };
             members.touched = false;
             listed.sets += 1;
+            // A member that is an item of one of the set's sealed sets (its record was
+            // still there to be got) is kept by the sealed set: not listed as a record.
+            if !members.sealed.is_empty() && members.keys.len() > members.listed {
+                let guard = enter();
+                // alloc: once a listing of a set that has sealed sets, its new members
+                let mut fresh = members.keys.split_off(members.listed);
+                let mut failed = None;
+                fresh.retain(|key| {
+                    members.sealed.iter().all(|(sealed_key, header)| {
+                        let from = InStore { handle, guard: &guard, key: *sealed_key };
+                        match sealed::find(&from, header, key, &mut sealed::Probe::default()) {
+                            Ok(found) => found.is_none(),
+                            Err(why) => {
+                                // alloc: error path
+                                failed = Some(format!("the sealed set {:?} of the set {set:?}: {why}", sealed_key.0));
+                                true
+                            }
+                        }
+                    })
+                });
+                members.keys.append(&mut fresh);
+                if let Some(why) = failed {
+                    return Err(why);
+                }
+            }
+            // What an adopted root named is the set's too: read once, here.
+            if let Some(base) = members.base {
+                let mut named = keys_of_root(handle, base)?;
+                named.sort_unstable();
+                named.dedup();
+                members.listed = named.len();
+                members.keys.append(&mut named);
+                members.base = None;
+            }
             members.keys.sort_unstable();
             members.keys.dedup();
             let changed = members.keys.len() != members.listed || members.root.is_none();
+            members.quiet = if changed { 0 } else { members.quiet.saturating_add(1) };
             if changed {
                 listed.changed += 1;
-                let (leaves, root) = listing_of(set, &members.keys, &[]);
+                // alloc: once a set listed, its few sealed sets
+                let sealed_keys: Vec<Key> = members.sealed.iter().map(|it| it.0).collect();
+                let (leaves, root) = listing_of(set, &members.keys, &sealed_keys);
                 for (key, bytes) in leaves.iter().chain([&root]) {
                     // A leaf of the listing before is the same record: not put again.
                     if members.leaves.binary_search(key).is_ok() {
@@ -336,5 +615,146 @@ impl Sets {
             roots.push((*set, members.root.expect("a set listed has a root")));
         }
         Ok((roots, listed))
+    }
+
+    /// The live sets a seal is due for: at least `items` members, and as they were at each
+    /// of the last `listings` listings. In the order of the sets.
+    pub fn quiet(&self, listings: u32, items: usize) -> Vec<ContentId> {
+        // alloc: once a build's end, the sets due
+        let mut due = Vec::new();
+        for shard in &self.shards {
+            due.extend(
+                shard
+                    .lock()
+                    .iter()
+                    .filter(|(_, it)| it.held.is_none() && it.quiet >= listings && it.keys.len() >= items)
+                    .map(|(set, _)| *set),
+            );
+        }
+        due.sort_unstable();
+        due
+    }
+
+    /// Writes what `set` holds as one sealed set and a root that names it: the items held
+    /// for it (a set written sealed at once) and its members' records (a live set that has
+    /// been quiet: its compaction), with the items of its earlier sealed sets when there
+    /// are [`MAX_SEALED`] of them. `None` when it holds nothing to seal. Not for the
+    /// daemon's loop: it reads every item and hashes the sealed set.
+    ///
+    /// Nothing is dropped here. The records sealed stay until the collector forgets them,
+    /// which it does only once no kept root names them: the caller moves its pin or keep
+    /// to [`Sealing::root`] when [`Sealing::durable`] is, and until then the root before
+    /// keeps them.
+    pub fn seal(&self, handle: &Handle, set: &ContentId) -> Result<Option<Sealing>, String> {
+        let _one = self.listing.lock();
+        let shard_of = || self.shards[set.0[0] as usize % SHARDS].lock();
+        // What the set holds now: sealed from this, whatever is put while the seal runs.
+        let (mut keys, held, earlier, base) = {
+            let shard = shard_of();
+            let Some(members) = shard.get(set) else { return Ok(None) };
+            // alloc: once a seal, the set's keys and what is held for it
+            let held: Vec<(Key, Vec<u8>)> = members
+                .held
+                .as_ref()
+                .map_or_else(Vec::new, |held| held.iter().map(|(key, bytes)| (*key, bytes.clone())).collect());
+            (members.keys.clone(), held, members.sealed.clone(), members.base)
+        };
+        if let Some(base) = base {
+            keys.extend(keys_of_root(handle, base)?);
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        // alloc: once a seal, the items' bytes until the sealed set is put
+        let mut items: Vec<(Key, Vec<u8>)> = held;
+        // alloc: once a seal, the keys held
+        let mut held_keys: Vec<Key> = items.iter().map(|it| it.0).collect();
+        held_keys.sort_unstable();
+        let mut gone = 0;
+        for key in &keys {
+            let read = handle
+                .read(key, |entry| entry.bytes.to_vec()) // alloc: as `items`
+                // alloc: error path
+                .map_err(|corrupt| format!("the item {:?} of the set {set:?} does not read: {corrupt}", key.0))?;
+            match read {
+                Some(bytes) => items.push((*key, bytes)),
+                None => gone += 1,
+            }
+        }
+        let fresh = items.len();
+        let merge = earlier.len() >= MAX_SEALED;
+        if merge {
+            for (sealed_key, _) in &earlier {
+                handle
+                    .read(sealed_key, |entry| {
+                        sealed::decode(entry.bytes).map(|(_, theirs)| {
+                            // alloc: as `items`
+                            items.extend(theirs.into_iter().map(|(key, bytes)| (key, bytes.to_vec())));
+                        })
+                    })
+                    // alloc: error path
+                    .map_err(|corrupt| format!("the sealed set {:?} of the set {set:?} does not read: {corrupt}", sealed_key.0))?
+                    // alloc: error path
+                    .ok_or_else(|| format!("the sealed set {:?} of the set {set:?} is not in the store", sealed_key.0))?
+                    // alloc: error path
+                    .map_err(|why| format!("the sealed set {:?} of the set {set:?}: {why}", sealed_key.0))?;
+            }
+        }
+        if fresh == 0 {
+            return Ok(None);
+        }
+        // By key; of two of one key the first is kept: what is held or a record, before an
+        // earlier sealed set's (the same bytes: a key covers every input of its item).
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+        let with_merged = items.len();
+        items.dedup_by(|later, first| later.0 == first.0);
+        let merged = (with_merged - fresh).saturating_sub(with_merged - items.len()) as u64;
+        // alloc: once a seal, a reference an item
+        let refs: Vec<(Key, &[u8])> = items.iter().map(|(key, bytes)| (*key, bytes.as_slice())).collect();
+        let bytes = sealed::encode(set, &refs)?;
+        let sealed_key = sealed::key_of(&bytes);
+        let header = sealed::Header::decode(&bytes).expect("the header just encoded");
+        let first = handle
+            .put(sealed_key, Kind::Query, &bytes)
+            // alloc: error path
+            .map_err(|mismatch| format!("the sealed set of the set {set:?} was refused: {mismatch:?}"))?;
+        let mut sealed_sets = if merge { Vec::new() } else { earlier }; // alloc: the set's few sealed sets
+        if !sealed_sets.iter().any(|it| it.0 == sealed_key) {
+            sealed_sets.push((sealed_key, header)); // alloc: as above
+        }
+        // alloc: as above
+        let mut named: Vec<Key> = sealed_sets.iter().map(|it| it.0).collect();
+        #[cfg(test)]
+        if SEALED_NOT_NAMED.with(|it| it.get()) {
+            named.retain(|it| *it != sealed_key);
+        }
+        let (_, (root, root_bytes)) = listing_of(set, &[], &named);
+        let second = handle
+            .put(root, Kind::Set, &root_bytes)
+            // alloc: error path
+            .map_err(|mismatch| format!("the root of the set {set:?} was refused: {mismatch:?}"))?;
+        let mut shard = shard_of();
+        let members = shard.get_mut(set).expect("a set is never removed");
+        // What was got or put while the seal ran is still a member, or still held.
+        members.keys.retain(|key| keys.binary_search(key).is_err());
+        if let Some(held) = members.held.as_mut() {
+            for key in &held_keys {
+                held.remove(key);
+            }
+        }
+        members.listed = 0;
+        members.leaves = Vec::new();
+        members.base = None;
+        members.sealed = sealed_sets;
+        members.root = Some(root);
+        members.quiet = 0;
+        Ok(Some(Sealing {
+            root,
+            sealed: sealed_key,
+            items: refs.len() as u64,
+            bytes: bytes.len() as u64,
+            merged,
+            gone,
+            durable: first.max(second),
+        }))
     }
 }

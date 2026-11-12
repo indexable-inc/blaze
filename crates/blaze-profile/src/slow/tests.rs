@@ -810,6 +810,7 @@ fn a_builds_account_and_its_warnings_are_said_before_the_findings() {
         ran_changed: 0,
         ran_untracked: 0,
         ran_cycle: 0,
+        validity: crate::facts::Validity::default(),
     };
     let switches = || vec![switch(1, 0, Event::Started, 1), switch(1, 100, Event::Ended, 1)];
     let spans = || vec![span(1, 1, None, "job", 0, 100, 1)];

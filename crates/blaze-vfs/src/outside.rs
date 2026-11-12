@@ -910,6 +910,42 @@ pub fn last_look() -> Option<PathBuf> {
     (!last.as_os_str().is_empty()).then(|| last.clone())
 }
 
+/// Each directory wanted at or above `path` with its state, beside `generation` and the
+/// table's: why [`unchanged_since`] says what it says of a directory asked of whole, for a
+/// person. Cold.
+pub fn why_changed(path: &Path, generation: u64) -> String {
+    let dirs = &*DIRS;
+    let bytes = trimmed(path);
+    // alloc: a reason, once a refusal said
+    let mut said = format!(
+        "asked at generation {generation}, now {}, settled {}:",
+        dirs.generation(),
+        dirs.hot.settled.load(Ordering::Acquire)
+    );
+    let mut any = false;
+    prefixes(bytes, |end, tag| {
+        if let Some(dir) = dirs.find(&bytes[..end], tag) {
+            any = true;
+            let since = match dir.since() {
+                UNCONFIRMED => "unconfirmed".to_owned(), // alloc: as above
+                since => since.to_string(),
+            };
+            said.push_str(&format!(
+                " {} (watched since {since}, changed at {}, asked of whole: {}, taken over: {});",
+                dir.path().display(),
+                dir.changed(),
+                dir.entry.recursive.load(Ordering::Acquire),
+                dir.subsumed_by().is_some()
+            ));
+        }
+        true
+    });
+    if !any {
+        said.push_str(" no directory at or above it is wanted");
+    }
+    said
+}
+
 /// Why no watch vouches for `path` now, for a person: the directory wanted at or above it and
 /// its two generations beside the table's, or that none is wanted. Cold: asked of the few
 /// paths a build names as looked at.

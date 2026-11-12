@@ -32,7 +32,7 @@ use crate::{
     CallableDefId, InferBodyId, MemoryMap,
     body_store::{
         BodyFacts, Flushed, Lookup, Mode, Step, StepCounts,
-        record::{self, AnswerKey, ShapeRef},
+        record::{self, ShapeRef},
         tests::{
             BUILD, Defs, FIXTURE, Memory, Session, db_of, function, second, session, without_steps,
         },
@@ -325,12 +325,13 @@ fn answer_of<'db>(
     let identity = s.facts.identity(&s.db, def).expect("a module's function has an identity");
     let base = record::base_key(&identity, Step::Mir, &schema, &solver_version(&BUILD));
     let shape_key = record::shape_key(&base, 0);
-    let shape =
+    let held =
         memory.get(&record::shape_at(Step::Mir, &shape_key)).unwrap().expect("a shape in slot 0");
-    let shape = ShapeRef::open(shape.bytes(), &base).unwrap();
-    let mut key = AnswerKey::new(&shape_key);
+    let shape = ShapeRef::open(held.bytes(), &base).unwrap();
+    // An answer is under its shape's bytes, wherever in the chain the shape is.
+    let mut key = blaze_record::AnswerKey::new(held.bytes());
     for fact in shape.facts() {
-        key.value(&s.facts.value(&s.db, def, fact).unwrap());
+        key.value(blaze_record::Digest::Is(s.facts.value(&s.db, def, fact).unwrap()));
     }
     let answer_key = key.finish();
     (record::answer_at(Step::Mir, &answer_key), answer_key)

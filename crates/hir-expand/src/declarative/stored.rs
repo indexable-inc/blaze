@@ -123,7 +123,7 @@ pub fn of(db: &Db) -> Option<&dyn Kept> {
 }
 
 /// The edition and syntax extensions `file` is read under, as one byte.
-fn read_as(db: &Db, file: EditionedFileId) -> u8 {
+pub fn read_as(db: &Db, file: EditionedFileId) -> u8 {
     file.edition(db) as u8 | file.extensions(db).bits() << 4
 }
 

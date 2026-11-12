@@ -361,12 +361,6 @@ pub struct BodySyntax {
     outline: bool,
     /// The item in [`BodySyntax::tree`].
     pub item: SyntaxNodePtr,
-    /// [`tree_hash`] of the item's own node: what the item is made of and nothing of where it
-    /// is or of the rest of its anchor (the other methods of its `impl`), the same in every
-    /// database. What a result of the item's body is keyed by before the body is lowered: the
-    /// whole item, its header and its body in one value. Made from `tree` and `item`, so
-    /// equality need not compare it.
-    pub item_hash: u128,
     /// The maps of the anchor, the same for every body written in it, and so shared by them.
     pub ast_id_map: Arc<AstIdMap>,
     pub span_map: Arc<RealSpanMap>,
@@ -706,8 +700,6 @@ fn in_owner_body_syntax(db: &Db, def: DefWithBodyId) -> Option<BodySyntax> {
     let owner = def.module(db).block(db)?.owner(db)?;
     let owner = body_syntax(db, owner).as_ref().filter(|it| it.file_id == file_id)?;
     let item = owner.ast_id_map.try_get_erased(ast_id)?;
-    let tree = owner.tree(db);
-    let item_hash = tree_hash(view::try_to_node(item, view::Node::root(&tree))?);
     Some(BodySyntax {
         file_id,
         tree: owner.tree,
@@ -718,7 +710,6 @@ fn in_owner_body_syntax(db: &Db, def: DefWithBodyId) -> Option<BodySyntax> {
         edition: owner.edition,
         outline: owner.outline,
         item,
-        item_hash,
         // clone: a count of the anchor's maps
         ast_id_map: owner.ast_id_map.clone(),
         // clone: a count of the anchor's maps
@@ -773,7 +764,6 @@ fn anchored_body_syntax(
         edition,
         outline,
         item: view::ptr(relative),
-        item_hash: tree_hash(relative),
         ast_id_map,
         span_map,
         anchor: span_anchor,

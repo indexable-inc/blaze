@@ -4,10 +4,11 @@
 //!
 //! - A body's step is filed under its **base key** (its identity from [`BodyFacts::identity`],
 //!   the step, the schema of the step's answers, the records' schema and the solver version).
-//!   Under it, in one of [`record::SLOTS`] slots, a **shape** lists the facts the step read; the
-//!   **answer** is filed under the shape's key and those facts' values when it ran
-//!   ([`record`]). A lookup reads the shapes, hashes their facts as they are now, and asks for
-//!   the answer: the goal store's constructive trace (`next_solver::goal_store`), one level up.
+//!   Under it, in a slot of its chain, a **shape** lists the facts the step read; the
+//!   **answer** is filed under the shape's bytes and those facts' values when it ran
+//!   ([`record`]; the form, its keys and the chain are `blaze_record`'s). A lookup reads the
+//!   shapes, hashes their facts as they are now, and asks for the answer: the goal store's
+//!   constructive trace (`next_solver::goal_store`), one level up.
 //! - A step is stored only when every read it made is covered by the identity or stands for a
 //!   fact ([`BodyFacts::classify`]); any other read keeps it out, counted by name in
 //!   [`Flushed::refused`]. Only passing borrow checks are stored.
@@ -25,6 +26,7 @@
 
 mod facts;
 mod infer;
+mod konst;
 mod mir;
 mod pending;
 mod record;
@@ -48,10 +50,12 @@ use blaze_core::lock::Lock;
 use blaze_format::{Part, SchemaHash, schema_of};
 use blaze_ids::ContentId;
 use blaze_reclaim::Limbo;
+use blaze_record::{AnswerKey, Bounds, Digest, Filing, Placed};
 use hir_def::{DefWithBodyId, deps::ImageStore};
 
 pub use facts::{BodyFacts, Classified, Step};
 pub(crate) use infer::inference;
+pub(crate) use konst::constant;
 #[cfg(test)]
 use infer::lookup_inference;
 pub(crate) use mir::built as built_mir;
@@ -60,13 +64,8 @@ pub use mir::location_literals;
 pub use crate::check_cache::ids::{closure_kind_code, closure_kind_of};
 pub use value::step_value;
 
-use crate::next_solver::goal_store::{
-    FactRef,
-    slots::{self, Claimed},
-    solver_version,
-};
+use crate::next_solver::goal_store::{FactRef, slots, solver_version};
 use pending::{Counts, Offered, Pending, Tallies};
-use record::{AnswerKey, SLOTS, ShapeRef};
 
 /// What a store does on a hit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,6 +107,7 @@ fn what(step: Step) -> &'static str {
         Step::Infer => "inference",
         Step::Mir => "MIR",
         Step::Borrowck => "borrow check",
+        Step::Const => "constant value",
     }
 }
 
@@ -150,6 +150,9 @@ struct Store {
     // dyn: lane item-hash's identities and facts, above hir-ty; memoized queries on a hit
     facts: Arc<dyn BodyFacts>,
     pending: Pending,
+    /// Lookups since the last flush that found their base key's chain at its bound:
+    /// [`Flushed::lookups_full`].
+    full_lookups: AtomicUsize,
     /// The first error a lookup met (a store that could not be read, a record that does not
     /// open under its key, a stored result that differs from running the step under
     /// [`Mode::Verify`]): [`Installed::flush`] stops with it.
@@ -237,7 +240,7 @@ impl Store {
         found
     }
 
-    /// The answer record of the first slot of `base` whose facts hash the same now, and its
+    /// The answer record of the first shape of `base` whose facts hash the same now, and its
     /// answer key.
     fn find(
         &self,
@@ -246,61 +249,56 @@ impl Store {
         step: Step,
         base: &ContentId,
     ) -> Option<(hir_def::deps::ImageBuf, ContentId)> {
-        for n in 0..SLOTS {
-            let shape_key = record::shape_key(base, n);
-            let shape = match self.images.get(&record::shape_at(step, &shape_key)) {
-                Ok(Some(shape)) => shape,
-                Ok(None) => return None,
+        // What `blaze_record::lookup` cannot say through a read's digest: a name in a shape
+        // that is no fact. The shape is passed over, and the lookup is an error.
+        let mut no_fact = None;
+        let found = blaze_record::lookup(
+            &self.records(step),
+            Bounds::STANDARD,
+            base,
+            |name| match slots::fact_of(name) {
+                Ok(fact) => self.facts.value(db, def, fact).map(Digest::Is),
                 Err(why) => {
-                    self.fail(format_args!(
-                        "reading the shape of the {} of {def:?} in slot {n}: {why}",
-                        what(step)
-                    ));
-                    return None;
+                    no_fact.get_or_insert(why);
+                    None
                 }
-            };
-            let shape = match ShapeRef::open(shape.bytes(), base) {
-                Ok(shape) => shape,
-                Err(why) => {
-                    self.fail(format_args!(
-                        "the shape of the {} of {def:?} in slot {n}: {why}",
-                        what(step)
-                    ));
-                    return None;
+            },
+        );
+        if let Some(why) = no_fact {
+            self.fail(format_args!("the shape of the {} of {def:?}: {why}", what(step)));
+            return None;
+        }
+        match found {
+            Ok(blaze_record::Found::Hit { answer, key, at: _ }) => Some((answer, key)),
+            // A chain at its bound is counted here, and where the step's shape is then not
+            // placed (`Flushed::slots_full`, which names the step).
+            Ok(blaze_record::Found::Miss { lists: _, full }) => {
+                if full {
+                    self.full_lookups.fetch_add(1, Ordering::Relaxed);
                 }
-            };
-            let Some(answer_key) = self.answer_key_now(db, def, &shape_key, shape) else {
-                continue;
-            };
-            match self.images.get(&record::answer_at(step, &answer_key)) {
-                Ok(Some(found)) => return Some((found, answer_key)),
-                Ok(None) => {}
-                Err(why) => {
-                    self.fail(format_args!(
-                        "reading the answer of the {} of {def:?} in slot {n}: {why}",
-                        what(step)
-                    ));
-                    return None;
-                }
+                None
+            }
+            Err(error) => {
+                let slots::Refused { doing, why } = error.into();
+                self.fail(format_args!("{doing} the {} of {def:?}: {why}", what(step)));
+                None
             }
         }
-        None
     }
 
-    /// The key the answer of the shape at `shape_key` has under its facts' values now; `None`
-    /// when one of them cannot be hashed now.
-    fn answer_key_now(
+    /// The driver's store as `blaze_record` reads and writes the records of `step`: a shape
+    /// under [`record::shape_at`] of its key, an answer under [`record::answer_at`] of its.
+    fn records(
         &self,
-        db: &Db,
-        def: DefWithBodyId,
-        shape_key: &ContentId,
-        shape: ShapeRef<'_>,
-    ) -> Option<ContentId> {
-        let mut key = AnswerKey::new(shape_key);
-        for fact in shape.facts() {
-            key.value(&self.facts.value(db, def, fact)?);
+        step: Step,
+    ) -> slots::Records<'_, impl Fn(blaze_record::Kind, &ContentId) -> ContentId> {
+        slots::Records {
+            images: &*self.images,
+            at: move |kind: blaze_record::Kind, key: &ContentId| match kind {
+                blaze_record::Kind::List => record::shape_at(step, key),
+                blaze_record::Kind::Answer => record::answer_at(step, key),
+            },
         }
-        Some(key.finish())
     }
 
     fn offer(
@@ -396,50 +394,46 @@ impl Store {
         }
     }
 
-    /// Writes one buffered step: its shape in the first slot that holds it or is free
-    /// (`claimed`: what this flush placed in the slots of the step's base key before,
-    /// `goal_store::slots`), then its answer under the shape's key and the values its facts
-    /// had.
+    /// Writes one buffered step: its shape in its base key's chain where it is held or the
+    /// first slot is free (`filing`: the placing of this flush's shapes of the step's base
+    /// key, `goal_store::slots::filing`), then its answer under the shape's bytes and the
+    /// values its facts had.
     fn write<'a>(
         &self,
         entry: &pending::Entry<'a>,
-        claimed: &mut Claimed<'a, { SLOTS as usize }>,
+        filing: &mut Filing<'a>,
     ) -> Result<Wrote, String> {
         let (step, def) = (entry.step, entry.def);
         // alloc: error text
         let error = |doing: &str, why: String| {
             format!("the item store: {doing} the {} of {def:?}: {why}", what(step))
         };
-        let placed = claimed
-            .claim(&*self.images, entry.shape, |n| {
-                record::shape_at(step, &record::shape_key(&entry.base, n))
-            })
-            .map_err(|slots::Refused { doing, why }| error(doing, why))?;
-        let Some(slots::Slot { n, written }) = placed else { return Ok(Wrote::SlotsFull) };
-        let wrote = match written {
-            true => Wrote::Written,
-            false => Wrote::Kept,
+        let refused = |refused: blaze_record::Error<String>| {
+            let slots::Refused { doing, why } = refused.into();
+            error(doing, why)
         };
-        let shape_key = record::shape_key(&entry.base, n);
-        let mut key = AnswerKey::new(&shape_key);
+        let records = self.records(step);
+        let wrote = match filing.place(&records, entry.shape).map_err(&refused)? {
+            Placed::Written(_) => Wrote::Written,
+            Placed::Kept(_) => Wrote::Kept,
+            Placed::Full => return Ok(Wrote::SlotsFull),
+        };
+        let mut key = AnswerKey::new(entry.shape);
         for value in entry.values() {
-            key.value(&value);
+            key.value(Digest::Is(value));
         }
         let answer_key = key.finish();
-        let at = record::answer_at(step, &answer_key);
         // alloc: the answer's bytes, once per step written
         let answer = record::write_answer(&answer_key, entry.answer);
-        match self.images.get(&at).map_err(|why| error("reading the answer of", why))? {
-            Some(kept) if kept.bytes() == answer.as_slice() => Ok(wrote),
-            Some(_) => Err(error(
+        match blaze_record::keep_answer(&records, answer_key, &answer) {
+            Ok(blaze_record::Kept::Written) => Ok(Wrote::Written),
+            Ok(blaze_record::Kept::Held) => Ok(wrote),
+            Err(blaze_record::Error::TwoAnswers { key: _ }) => Err(error(
                 "two answers under one key of fact values for",
                 // alloc: error text
                 String::from("the step read something its identity and facts do not cover"),
             )),
-            None => {
-                self.images.put(at, answer).map_err(|why| error("keeping the answer of", why))?;
-                Ok(Wrote::Written)
-            }
+            Err(other) => Err(refused(other)),
         }
     }
 }
@@ -451,7 +445,7 @@ enum Wrote {
     Written,
     /// The store had both already.
     Kept,
-    /// Every slot of its base key holds another shape.
+    /// Every slot of its base key's chain holds another shape (`blaze_record::Placed::Full`).
     SlotsFull,
 }
 
@@ -462,8 +456,17 @@ pub struct Flushed {
     pub written: usize,
     /// Steps the store had already.
     pub kept: usize,
-    /// Steps not written as every slot of their base key holds another shape.
+    /// Steps not written as every slot of their base key's chain holds another shape: the
+    /// chain's bound (`blaze_record::Bounds::STANDARD`), which a later lookup of the step
+    /// misses on.
     pub slots_full: usize,
+    /// Lookups that found their key's chain at its bound (`blaze_record::Found::Miss`'s
+    /// `full`): what was run for one of them is among `slots_full` at the next flush, unless
+    /// the chain holds its shape where a placing looks.
+    pub lookups_full: usize,
+    /// The first, in the order the flush writes, of those counted in `slots_full`: which it
+    /// is, by its key, and the bound.
+    pub full: Option<String>,
     /// For each query or input whose read kept steps out (neither covered nor a fact), how
     /// many, most first: what lane item-hash's classification is asked to cover.
     pub refused: Vec<(&'static str, u64)>,
@@ -490,7 +493,7 @@ pub struct Flushed {
     pub failure: Option<String>,
     /// What each step's lookups found and its offers met since the last flush, by [`Step`] as an
     /// index.
-    pub steps: [StepCounts; 3],
+    pub steps: [StepCounts; Step::COUNT],
 }
 
 /// What one step's lookups found and its offers met.
@@ -694,6 +697,7 @@ pub fn install(
         images,
         facts,
         pending: Pending::new(),
+        full_lookups: AtomicUsize::new(0),
         error: Lock::new("ty.body_store.error", None),
     }));
     for (at, slot) in REGISTRY.iter().enumerate() {
@@ -732,7 +736,7 @@ impl Installed {
 
     /// What each step's lookups found and its offers met since the last flush, by [`Step`] as an
     /// index; the next flush's [`Flushed::steps`] has them too.
-    pub fn steps(&self) -> [StepCounts; 3] {
+    pub fn steps(&self) -> [StepCounts; Step::COUNT] {
         self.store().pending.steps()
     }
 
@@ -778,15 +782,18 @@ impl Installed {
             |a, b| entries[a].base == entries[b].base,
         );
         store.images.for_each(runs.len(), &|run| {
-            let mut claimed = Claimed::new();
             // clone: a range of two words
-            for &at in &order[runs[run].clone()] {
-                _ = results[at].set(store.write(&entries[at], &mut claimed));
+            let run = &order[runs[run].clone()];
+            // A run is the entries of one base key, and never empty.
+            let mut filing = slots::filing(entries[run[0]].base);
+            for &at in run {
+                _ = results[at].set(store.write(&entries[at], &mut filing));
             }
         });
         let Tallies { refused, scans, counts } = tallies;
         let Counts { unhashable, no_identity, unshareable, unencodable, dropped, steps } = counts;
         let mut flushed = Flushed {
+            lookups_full: store.full_lookups.swap(0, Ordering::Relaxed),
             refused,
             scans,
             unhashable,
@@ -806,7 +813,20 @@ impl Installed {
             match wrote {
                 Ok(Wrote::Written) => flushed.written += 1,
                 Ok(Wrote::Kept) => flushed.kept += 1,
-                Ok(Wrote::SlotsFull) => flushed.slots_full += 1,
+                Ok(Wrote::SlotsFull) => {
+                    flushed.slots_full += 1;
+                    if flushed.full.is_none() {
+                        let entry = &entries[at];
+                        // alloc: once per flush that met a full chain
+                        flushed.full = Some(format!(
+                            "the {} of {:?} (base key {:x}), whose chain holds {} other shapes",
+                            what(entry.step),
+                            entry.def,
+                            entry.base,
+                            slots::full_chain()
+                        ));
+                    }
+                }
                 Err(why) => {
                     flushed.failed += 1;
                     flushed.failure.get_or_insert(why);

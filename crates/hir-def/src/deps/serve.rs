@@ -1006,9 +1006,15 @@ pub(super) fn refusal(db: &Db, krate: Crate) -> Option<Refused> {
 
 /// Why the image of `krate` would leave out a file an `include!`, `include_str!` or
 /// `include_bytes!` it depends on reads, if it would: one of `calls` (those its signatures
-/// name) or of its modules' scopes, or one any of them is expanded in, whose file is outside
-/// the crate's source root or not known ([`refusal`]). The calls walked are those its reads
-/// are worked out from ([`super::reads::image_calls`]).
+/// name) or of its modules' scopes, or one any of them is expanded in, whose file is a file of
+/// the VFS in another package's source root, or not known ([`refusal`]). The calls walked are
+/// those its reads are worked out from ([`super::reads::image_calls`]).
+///
+/// A file outside the VFS is no refusal: the crate is noted as having read it
+/// (`base_db::Files::included_by`) and its image is filed by the file's content
+/// ([`Reads`]' files), so an edit of the file misses the image. A file of the VFS in another
+/// source root still is one: nothing reads such a file's content by its path before the
+/// crate is resolved, which a search by reads would need.
 pub(super) fn include_refusal(db: &Db, krate: Crate, calls: &[MacroCallId]) -> Option<Refused> {
     let root = db.file_source_root(krate.data(db).root_file_id).source_root_id(db);
     let todo = super::reads::image_calls(db, krate, calls);
@@ -1025,6 +1031,9 @@ pub(super) fn include_refusal(db: &Db, krate: Crate, calls: &[MacroCallId]) -> O
             Ok(file) => {
                 let file = file.file_id(db);
                 if db.file_source_root(file).source_root_id(db) == root {
+                    return Ok(());
+                }
+                if db.files().included_source_path(file).is_some() {
                     return Ok(());
                 }
                 // alloc: why a crate is refused, once per refused crate

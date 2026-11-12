@@ -169,6 +169,7 @@ pub const VIEWS: &[View] = &[
     const { view("wait_owner", &[BUILD, LONG_MS, LIMIT]) },
     const { view("waits_by_reason", &[BUILD, LIMIT]) },
     const { view("counts_by_cause", &[BUILD, MANY]) },
+    const { view("validity", &[BUILD]) },
     const { view("writes", &[BUILD, MANY]) },
     const { view("scripts", &[BUILD, MANY]) },
     const { view("pool", &[ENDED_BUILD]) },

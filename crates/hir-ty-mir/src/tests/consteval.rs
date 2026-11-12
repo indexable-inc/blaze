@@ -32,6 +32,7 @@ mod const_macro;
 mod const_traits;
 mod deps;
 mod intrinsics;
+mod items;
 mod memo;
 pub(crate) mod reach;
 mod records;

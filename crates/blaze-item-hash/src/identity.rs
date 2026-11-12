@@ -23,22 +23,23 @@ mod item;
 pub(crate) mod names;
 mod slots;
 
-use base_db::Db;
+use base_db::{Crate, Db};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, key};
 use blaze_mem::scratch;
 use hir_def::{
     AttrDefId, DefWithBodyId, GenericDefId, HasModule as _, ItemContainerId, Lookup as _,
-    expr_store::{
-        Body,
-        body::{ast_node_hash, body_syntax},
-    },
+    expr_store::{Body, body::ast_node_hash},
     hir::generics::GenericParams,
     item_hash::portable_body,
 };
 use hir_expand::{
-    InFile, MacroCallId, MacroCallKind, MacroDefKind, declarative::stored::def_hash, name::Name,
+    HirFileId, InFile, MacroCallId, MacroCallKind, MacroDefKind,
+    declarative::stored::{def_hash, index},
+    name::Name,
+    proc_macro::{ProcMacroKind, ProcMacros},
 };
+use span::ErasedFileAstId;
 use smallvec::SmallVec;
 
 pub use inputs::{FrontEnd, crate_inputs, set_build};
@@ -161,8 +162,8 @@ pub const EARLY_PARTS: usize = 4;
 ///   this part, and what a step reads of either item is a fact;
 /// - "module chain": the modules it is in, by key;
 /// - "source": for a body written in a file, the position-free hash of the item's own node
-///   (`BodySyntax::item_hash`: the whole item, since lowering reads its parameters and
-///   attributes with its block); for one a macro writes, the outermost call's node and each
+///   ([`item_source`]: the whole item, since lowering reads its parameters and attributes
+///   with its block); for one a macro writes, the outermost call's node and each
 ///   macro of the chain of calls that wrote it ([`macro_chain`]).
 ///
 /// `Err` for a body with no key of its own: an item of a block (it is keyed with the body it
@@ -179,6 +180,7 @@ pub fn early_parts(
         h.part(name.as_bytes());
         h
     };
+    let home = def.module(db).krate(db);
     let InFile { file_id, value: ast_id } = def.erased_ast_id(db);
     if ast_id.in_body() || def.module(db).block(db).is_some() {
         return Err("an item of a block has no key of its own");
@@ -203,21 +205,71 @@ pub fn early_parts(
     let mut h = part("source");
     match file_id.macro_file() {
         None => {
-            let syntax = body_syntax(db, def).as_ref().ok_or("its item is not found in its file")?;
-            h.update(&[0]).update(&syntax.item_hash.to_le_bytes());
+            h.update(&[0]);
+            item_source(db, file_id, ast_id, home, &mut h)
+                .ok_or("its item has no row in its file's index")?;
         }
         Some(call) => {
             h.update(&[1]);
-            macro_chain(db, call, &mut h)?;
+            macro_chain(db, call, home, &mut h)?;
         }
     }
     let source = h.finish();
     Ok([
-        ("crate inputs", crate_inputs(db, def.module(db).krate(db))),
+        ("crate inputs", crate_inputs(db, home)),
         ("owner", owner),
         ("module chain", module_chain(db, def, part("module chain"))),
         ("source", source),
     ])
+}
+
+/// The source hashes of the item `ast` of the file `file`, onto `h`: its
+/// [`ItemSource`](index::ItemSource) `header` (the item with every body cut, its attributes
+/// with it) and `body`, the whole item between them, hashed from its text and so the same for
+/// an outline and a full parse of its file. `None` when the file's index has no row for it.
+fn item_source(
+    db: &Db,
+    file: HirFileId,
+    ast: ErasedFileAstId,
+    krate: Crate,
+    h: &mut Hasher,
+) -> Option<()> {
+    let source = index::source(db, file, ast, krate)?;
+    h.update(&source.header.to_le_bytes());
+    match source.body {
+        Some(body) => h.update(&[1]).update(&body.to_le_bytes()),
+        None => h.update(&[0]),
+    };
+    Some(())
+}
+
+/// What the proc macros of `krate` expand with, onto `h`: each macro's name, kind and the
+/// content of its compiled expander (`ProcMacroExpander::code`: the macro crate's code, its
+/// dependencies' and the module made of them), as `hir_def::deps`' image key hashes them. A
+/// body a proc macro wrote is a function of this and of the call. `Err` while the crate's
+/// expander is not loaded or does not say what it is: nothing is expanded to find out.
+fn expander_code(db: &Db, krate: Crate, h: &mut Hasher) -> Result<(), &'static str> {
+    let macros = ProcMacros::get_for_crate(db, krate)
+        .and_then(|it| it.macros())
+        .ok_or("a proc macro wrote it, and its crate's expander is not loaded")?;
+    h.update(&(macros.len() as u64).to_le_bytes());
+    for it in macros {
+        let code = it
+            .expander
+            .code()
+            .ok_or("a proc macro wrote it, and its expander does not say what its code is")?;
+        h.part(it.name.as_str().as_bytes());
+        h.update(&[
+            match it.kind {
+                ProcMacroKind::CustomDerive => 0,
+                ProcMacroKind::Bang => 1,
+                ProcMacroKind::Attr => 2,
+            },
+            u8::from(it.disabled),
+        ]);
+        h.id(&code);
+    }
+    Ok(())
 }
 
 /// The longest chain of calls [`macro_chain`] follows: past it the body has no early identity.
@@ -226,32 +278,46 @@ const MACRO_CHAIN_BOUND: u32 = 256;
 /// What a body written by the macro call `call` is made of, onto `h`, with no expansion made:
 /// each macro of the chain of calls from the one that wrote the item out to the one written
 /// in a file, by which macro it is (its crate's key, its kind, its edition) and the hash of
-/// its definition (`hir_expand::declarative::stored::def_hash`), then the node of that
-/// outermost call in its file (a call's path and tokens; the item a derive or an attribute is
-/// on). The calls between are tokens the outer expansion wrote, a function of these. Every
+/// its definition (`hir_expand::declarative::stored::def_hash`), then that outermost
+/// call as it is written in its file (a call's path and tokens by its node's hash; the item a
+/// derive or an attribute is on by its `ItemSource`). The calls between are tokens the outer expansion wrote, a function of these. Every
 /// macro is named, not only hashed: two definitions of equal tokens in two crates resolve
 /// their own names (`$crate`) in different scopes.
 ///
-/// `Err` for a chain this cannot answer for: a proc macro (its dylib's identity is in no key
-/// yet), an eager macro (its input is expanded before it and `include!` reads a file).
-fn macro_chain(db: &Db, call: MacroCallId, h: &mut Hasher) -> Result<(), &'static str> {
+/// A proc macro is named by its crate's key and its function's ast id, with what its crate's
+/// expander is ([`expander_code`]) in place of a definition's hash.
+///
+/// `Err` for a chain this cannot answer for: a proc macro whose expander is not loaded, an
+/// eager macro (its input is expanded before it and `include!` reads a file).
+fn macro_chain(
+    db: &Db,
+    call: MacroCallId,
+    home: Crate,
+    h: &mut Hasher,
+) -> Result<(), &'static str> {
     let mut call = call;
     for _ in 0..MACRO_CHAIN_BOUND {
         let loc = call.loc(db);
         let (tag, id) = match loc.def.kind {
-            MacroDefKind::Declarative(id, _) => (0u8, id),
-            MacroDefKind::BuiltIn(id, _) => (1, id),
-            MacroDefKind::BuiltInAttr(id, _) => (2, id),
-            MacroDefKind::BuiltInDerive(id, _) => (3, id),
-            MacroDefKind::UnimplementedBuiltIn(id) => (4, id),
+            MacroDefKind::Declarative(id, _) => (0u8, Some(id)),
+            MacroDefKind::BuiltIn(id, _) => (1, Some(id)),
+            MacroDefKind::BuiltInAttr(id, _) => (2, Some(id)),
+            MacroDefKind::BuiltInDerive(id, _) => (3, Some(id)),
+            MacroDefKind::UnimplementedBuiltIn(id) => (4, Some(id)),
             MacroDefKind::BuiltInEager(..) => return Err("an eager macro wrote it"),
-            MacroDefKind::ProcMacro(..) => {
-                return Err("a proc macro wrote it, and its dylib's identity is in no key yet");
+            MacroDefKind::ProcMacro(function, _, _) => {
+                // Which macro of its crate: the ast id of its function, a number made of
+                // the function's kind and name.
+                h.update(&function.value.erase().into_raw().to_le_bytes());
+                expander_code(db, loc.def.krate, h)?;
+                (5, None)
             }
         };
         h.update(&[tag, loc.def.edition as u8, u8::from(loc.def.local_inner)]);
         h.id(&key::crate_key(db, loc.def.krate));
-        h.update(&def_hash(db, id, loc.def.krate).to_le_bytes());
+        if let Some(id) = id {
+            h.update(&def_hash(db, id, loc.def.krate).to_le_bytes());
+        }
         let (kind, at) = match &loc.kind {
             MacroCallKind::FnLike { eager: Some(_), .. } => {
                 return Err("an eager macro wrote it");
@@ -267,7 +333,16 @@ fn macro_chain(db: &Db, call: MacroCallId, h: &mut Hasher) -> Result<(), &'stati
         match at.file_id.macro_file() {
             Some(outer) => call = outer,
             None => {
-                h.update(&[0xff]).update(&ast_node_hash(db, at).to_le_bytes());
+                // The item a derive or an attribute is on has a row in its file's index; a
+                // call written as an item may have none, and is a path and tokens, which
+                // no parse leaves lazy: its node's hash.
+                if kind == 0 {
+                    h.update(&[0xff]).update(&ast_node_hash(db, at).to_le_bytes());
+                } else {
+                    h.update(&[0xfe]);
+                    item_source(db, at.file_id, at.value, home, h)
+                        .ok_or("the item its macro is on has no row in its file's index")?;
+                }
                 return Ok(());
             }
         }

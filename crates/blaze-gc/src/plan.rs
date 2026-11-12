@@ -1984,6 +1984,17 @@ impl Collector {
         let mut verdicts: Vec<Verdict> = Vec::with_capacity(objects.len());
         let mut marked = (0u64, 0u64);
         let mut total = 0u64;
+        // The graces at this pressure ([`crate::roots::grace_at`]): whole up to half pressure,
+        // then linearly down to a minute at full, so a disk cannot fill while what only a grace
+        // keeps is there. A lease, a root and a pin keep what is in use at any pressure.
+        let least = crate::roots::Rules::default().least_grace_ns;
+        // An urgent run is at full pressure whatever the pacer last stepped to.
+        let pressure = match self.run.as_ref().is_some_and(|it| it.slice.urgent) {
+            true => crate::roots::FULL,
+            false => self.paced,
+        };
+        let grace = crate::roots::grace_at(config.grace_ns, least, pressure);
+        let gone_grace = crate::roots::grace_at(config.gone_grace_ns, least, pressure);
         for object in objects {
             total = total.saturating_add(object.bytes);
             let age = now.saturating_sub(object.used_ns);
@@ -2018,16 +2029,16 @@ impl Collector {
             ) {
                 marked = (marked.0 + 1, marked.1 + object.bytes);
                 Fate::Keep(keep)
-            } else if age < config.grace_ns {
-                Fate::Keep(Keep::Grace { left_ns: config.grace_ns - age })
+            } else if age < grace {
+                Fate::Keep(Keep::Grace { left_ns: grace - age })
             } else {
                 match object.class {
                     Class::Workspace => match &object.checkout {
-                        Some(checkout) if !checkout.exists && age >= config.gone_grace_ns => {
+                        Some(checkout) if !checkout.exists && age >= gone_grace => {
                             Fate::Go(Reason::CheckoutGone { checkout: checkout.path.clone() })
                         }
                         Some(checkout) if !checkout.exists => {
-                            Fate::Keep(Keep::Grace { left_ns: config.gone_grace_ns - age })
+                            Fate::Keep(Keep::Grace { left_ns: gone_grace - age })
                         }
                         _ if age >= config.ttl_ns => Fate::Go(Reason::Unused { for_ns: age }),
                         _ => Fate::Keep(Keep::Fresh),

@@ -916,6 +916,7 @@ mod tests {
             ran_changed: 0,
             ran_untracked: 0,
             ran_cycle: 0,
+            validity: crate::facts::Validity::default(),
         }
     }
 

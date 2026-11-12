@@ -43,9 +43,28 @@ pub(crate) fn unclaimed(storage: &Storage, header: &Header, word: u32, node: u32
     local::with(|local| {
         let base = local.walk.len();
         let proved = walk(storage, &mut local.walk, base, header, word, node);
+        if !proved {
+            gave_up(storage, &local.walk[base..]);
+        }
         local.walk.truncate(base);
         proved
     })
+}
+
+/// Counts the rows a walk that gave up left on its stack, each with the edges it had compared
+/// (the validity census, [`counts::EDGE_GAVE_UP`]): the rows it proved are counted as it
+/// proved them.
+#[cold]
+fn gave_up(storage: &Storage, left: &[Walk]) {
+    for row in left {
+        // SAFETY: the header is in a row page of `storage` (pushed from one by `walk`), which
+        // lives as long as the storage, borrowed for this call.
+        let header = unsafe { &*row.header };
+        let len = span::len(header.edges.load(Ordering::Acquire));
+        // Its edges less those not yet looked at: a row that ran again meanwhile counts none.
+        let compared = len.saturating_sub(row.end - row.next);
+        counts::edges(key_parts(storage.node(row.node).key()).0, counts::EDGE_GAVE_UP, compared);
+    }
 }
 
 fn entry(header: &Header, word: u32, node: u32) -> Walk {
@@ -87,6 +106,9 @@ fn walk(
             if !mark(storage, header, done.word, row) {
                 return false;
             }
+            // The census: a row proved by its edges, every one compared.
+            let compared = span::len(header.edges.load(Ordering::Acquire));
+            counts::edges(key_parts(row.key()).0, counts::EDGE_WALKED, compared);
             stack.pop();
             if stack.len() == base {
                 return true;

@@ -2198,6 +2198,7 @@ fn counts_of(query: &str) -> Counts {
                 ran_changed: was.ran_changed + counts.ran_changed,
                 ran_untracked: was.ran_untracked + counts.ran_untracked,
                 ran_cycle: was.ran_cycle + counts.ran_cycle,
+                validity: was.validity.plus(counts.validity),
             };
         }
         None => taken.push((name, counts)),
@@ -3347,6 +3348,8 @@ mod changed;
 mod sealed;
 mod small;
 mod stale_head;
+/// The validity census ([`super::Validity`]): each proof of a row counted under its own name.
+mod validity;
 
 /// One request of the no-op simulation ([`requests_cost_what_they_change`]).
 #[derive(Clone, Copy, Debug)]

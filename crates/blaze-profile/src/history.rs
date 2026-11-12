@@ -2794,6 +2794,11 @@ mod tests {
             ran_changed: 11,
             ran_untracked: 12,
             ran_cycle: 13,
+            validity: crate::facts::Validity {
+                proved_seal: 14,
+                edges_compared: 15,
+                ..Default::default()
+            },
         };
         history.query_counted([
             mir,
@@ -2832,10 +2837,12 @@ mod tests {
                 "ran_new",
                 "ran_changed",
                 "ran_untracked",
-                "ran_cycle"
+                "ran_cycle",
+                "proved_seal",
+                "edges_compared"
             ]
             .map(|it| count(it, 0)),
-            [63, 6384, 10, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+            [63, 6384, 10, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
             "each count in its own column"
         );
         assert_eq!(count("executed", 1), 7566);

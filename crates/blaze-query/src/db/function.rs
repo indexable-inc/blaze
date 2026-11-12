@@ -502,6 +502,7 @@ fn refresh<F: Function>(
         {
             // A changed-set walk ended in this view and did not reach the row: it is
             // unchanged, with no look at its edges. A mark another task won is looked at again.
+            counts::count(index, counts::PROVED_FIRST);
             mark(storage, header, word, node, index, id);
             continue;
         } else if word & RUNNING == 0
@@ -838,7 +839,10 @@ fn verify_claimed(
     let edges = header.edges.load(Ordering::Acquire);
     let (start, len) = (span::start(edges), span::len(edges));
     let mut summary = [0; 2];
+    // The census: this row's edges are looked at, and how many, counted when the look ends.
+    let mut census = counts::Claimed::of(key_parts(storage.key_of(row_node)).0);
     for at in start..start + len {
+        census.compared += 1;
         let node = storage.edge(at);
         let row = storage.node(node);
         let mut seen = row.color();

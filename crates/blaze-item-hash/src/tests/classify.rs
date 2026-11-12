@@ -822,6 +822,8 @@ fn several_argument_reads_are_facts_of_their_first() {
             }
             Classified::Refused => assert_ne!(want, kinds::FIELDS, "{}: refused", it.name),
             Classified::Covered => panic!("{}: covered", it.name),
+            // Only the name-facts classification makes a scan; these reads are of other rules.
+            Classified::Scan(_) => panic!("{}: a scan", it.name),
         }
     }
     assert!(facts > 0, "no read of the steps by several arguments is a fact");
@@ -844,6 +846,7 @@ fn own_earlier_steps_are_step_facts() {
             }
             Classified::Refused => {}
             Classified::Covered => panic!("{}: covered", it.name),
+            Classified::Scan(_) => panic!("{}: a scan", it.name),
         }
     }
     assert!(infer && mir, "no MIR read of inference ({infer}) or borrow check read of MIR ({mir})");
@@ -940,7 +943,7 @@ fn alike_bodies_list_one_shape(
                 .filter(|it| it.def == def && it.step == step)
                 .filter_map(|it| match it.class {
                     Classified::Fact(fact) => Some(listed(def, fact)),
-                    Classified::Covered | Classified::Refused => None,
+                    Classified::Covered | Classified::Refused | Classified::Scan(_) => None,
                 })
                 .collect();
             facts.sort_unstable();

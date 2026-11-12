@@ -176,8 +176,13 @@ pub fn run_now(
     collector.advance_clocks(record::now_ns(), record::boot_ns());
     // An area that does not measure is named in the report; the rest are collected (review N12).
     measure(collector);
-    collector.ask(dry_run);
     let mut sizes = Sizes::new();
+    // The home's pass first ([`crate::roots`]): what it renames into trash, this run's scan
+    // finds there and its trash phase unlinks. A home another collector holds is left to it.
+    if let Some(home) = areas.first().filter(|it| !it.is_empty()) {
+        home_pass(collector, Path::new(home), dry_run, &mut sizes);
+    }
+    collector.ask(dry_run);
     let bound = u64::from(collector.config().fuel) * 2 + 16;
     for _ in 0..bound {
         collector.advance_clocks(record::now_ns(), record::boot_ns());
@@ -200,6 +205,37 @@ pub fn run_now(
     Err(format!(
         "the collection asked for more than the {bound} rounds its fuel allows and did not end"
     ))
+}
+
+/// One pass over `home` ([`crate::roots_fs::pass`]) at the collector's clock and pressure: every
+/// entry right under the home counted to its owner, backups and retired names past their
+/// lifetime (or, under pressure, the oldest of them) renamed into trash, and the account noted
+/// in the collector's next report: the home's bytes, what went, and the largest holders with
+/// the reason each stays. A pass that fails is noted, naming why; the run goes on.
+pub fn home_pass(collector: &mut Collector, home: &Path, dry_run: bool, sizes: &mut Sizes) {
+    let pressure = collector.pressure();
+    let levels = collector.config().levels;
+    let asked = crate::roots_fs::Pass {
+        now_ns: collector.clock().now(),
+        pressure,
+        dry_run,
+        rules: crate::roots::Rules::default(),
+    };
+    let to_free = |held: u64| match (pressure > 0, crate::space::volume(home)) {
+        (true, Ok(volume)) => levels.to_free(&volume, held),
+        _ => 0,
+    };
+    match crate::roots_fs::pass(home, &asked, &to_free, sizes) {
+        Ok((account, problems)) => {
+            for line in account.lines(&text(home), crate::roots_fs::HOLDERS, dry_run) {
+                collector.note(line);
+            }
+            for problem in problems {
+                collector.note(problem);
+            }
+        }
+        Err(why) => collector.note(format!("the pass over {} did not run: {why}", home.display())),
+    }
 }
 
 /// Each area's volume measured into `collector` ([`crate::space::volume`]); one that does not
@@ -456,22 +492,34 @@ fn workspace(
     let read = record::read(dir);
     let record = read.as_ref().ok().and_then(Option::as_ref);
     let checkout = record.and_then(|it| it.checkout.as_deref()).map(checkout_of);
-    let refused = if !lease::has_lease(dir) {
-        Some(no_lease(dir))
-    } else {
-        match (&read, &checkout) {
+    // `build/` is blaze's registered root ([`crate::roots`]): everything right under it is this
+    // collector's, with or without a lease or a record. A directory no blaze that takes leases
+    // made (a cargo target dir someone pointed there, a build dir of an earlier blaze) is
+    // adopted: its lease is made now, so whoever builds into it next holds it and the rename
+    // takes it as any other's. Until then its stamps say when it was used, and cargo's own
+    // lock whether a cargo builds into it now ([`cargo_locked`]). Refusing it instead kept it
+    // for ever: 464 GB of thirteen such directories on one machine, with the disk full.
+    let adopted = match lease::has_lease(dir) {
+        true => Ok(()),
+        false => lease::make(dir),
+    };
+    let refused = match adopted {
+        Err(why) => Some(why),
+        Ok(()) => match (&read, &checkout) {
             (Ok(Some(_)), Some(Ok(_))) => None,
             (Ok(Some(_)), Some(Err(why))) => Some(why.clone()),
             (Ok(Some(_)), None) => Some("its record names no checkout".to_owned()),
-            (Ok(None), _) => Some("it has no record of its checkout and last use".to_owned()),
+            // No record: no build of a blaze that writes one used it. It names no checkout, so
+            // it goes as a workspace unused past the time to live, or under pressure.
+            (Ok(None), _) => None,
             (Err(why), _) => Some(why.clone()),
-        }
+        },
     };
     // A mount anywhere in it refuses it whole, and so its profiles.
     let refused = refused.or_else(|| mount_in(mounts, dir));
     let used_ns = record.map_or_else(|| modified_ns(dir), |it| it.used_ns);
     let checkout = checkout.and_then(Result::ok);
-    let leased = refused.is_none() && probe(dir, problems);
+    let leased = refused.is_none() && (probe(dir, problems) || cargo_locked(dir, problems));
     let mut own = 0u64;
     for entry in entries(dir, problems) {
         let Ok(meta) = std::fs::symlink_metadata(&entry) else { continue };
@@ -537,6 +585,46 @@ fn checkout_of(path: &str) -> Result<Checkout, String> {
         Err(error) => return Err(format!("its checkout {path} cannot be read: {error}")),
     };
     Ok(Checkout { path: path.to_owned(), exists })
+}
+
+/// Whether a cargo builds into `dir` now: cargo holds `.cargo-lock` in the directory it builds
+/// into (a profile's, `<dir>/<profile>` or `<dir>/<target>/<profile>`, and newer ones the
+/// target dir's own) for as long as it compiles. The lock is tried and let go at once; one that
+/// cannot be opened or tried counts as held, and why is a problem.
+fn cargo_locked(dir: &Path, problems: &mut Vec<String>) -> bool {
+    fn locked(at: &Path, problems: &mut Vec<String>) -> bool {
+        let lock = at.join(".cargo-lock");
+        let file = match std::fs::File::open(&lock) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+            Err(error) => {
+                problems.push(format!("opening {}: {error}", lock.display()));
+                return true;
+            }
+        };
+        match stdx::file_lock::Locked::try_lock(file) {
+            Ok(Ok(_free)) => false,
+            Ok(Err(_held)) => true,
+            Err(error) => {
+                problems.push(format!("locking {}: {error}", lock.display()));
+                true
+            }
+        }
+    }
+    if locked(dir, problems) {
+        return true;
+    }
+    for profile in dirs(dir, problems) {
+        if locked(&profile, problems) {
+            return true;
+        }
+        for below in dirs(&profile, problems) {
+            if locked(&below, problems) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn no_lease(dir: &Path) -> String {
@@ -612,7 +700,7 @@ fn entries(dir: &Path, problems: &mut Vec<String>) -> Vec<PathBuf> {
     found
 }
 
-fn modified_ns(path: &Path) -> u64 {
+pub(crate) fn modified_ns(path: &Path) -> u64 {
     std::fs::symlink_metadata(path)
         .and_then(|it| it.modified())
         .ok()
@@ -622,7 +710,7 @@ fn modified_ns(path: &Path) -> u64 {
 
 /// The newest modification time of `dir` and the directories directly in it (`deps`,
 /// `build`, ...), which a build writes into.
-fn newest_ns(dir: &Path) -> u64 {
+pub(crate) fn newest_ns(dir: &Path) -> u64 {
     let mut newest = modified_ns(dir);
     if let Ok(read) = std::fs::read_dir(dir) {
         for entry in read.flatten() {
@@ -635,7 +723,7 @@ fn newest_ns(dir: &Path) -> u64 {
 /// Bytes on disk under `path` (allocated blocks, so a sparse or reflinked file counts what it
 /// holds; a file with more than one link once), symlinks not followed. Refuses, naming it, a
 /// directory inside on another device than `path`'s: a mount, which nothing of blaze's removes.
-fn size(path: &Path, problems: &mut Vec<String>) -> Result<u64, String> {
+pub(crate) fn size(path: &Path, problems: &mut Vec<String>) -> Result<u64, String> {
     let root = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
@@ -784,7 +872,7 @@ impl Sizes {
     }
 
     /// The bytes under `dir` ([`size`]), from the last measure when nothing says it changed.
-    fn of(&mut self, dir: &Path, problems: &mut Vec<String>) -> Result<u64, String> {
+    pub(crate) fn of(&mut self, dir: &Path, problems: &mut Vec<String>) -> Result<u64, String> {
         let now = record::now_ns();
         let inode = std::fs::symlink_metadata(dir).map(|it| inode_of(&it)).unwrap_or(0);
         let stamp = newest_ns(dir);

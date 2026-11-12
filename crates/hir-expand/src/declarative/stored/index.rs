@@ -20,6 +20,7 @@
 
 use base_db::{Crate, Db, EditionedFileId};
 use blaze_ids::{ContentId, Hasher};
+use intern::Symbol;
 use span::{AstIdMap, ErasedFileAstId, ROOT_ERASED_FILE_AST_ID};
 use syntax::{
     NodeOrToken, SyntaxKind, ast,
@@ -66,7 +67,24 @@ pub struct ItemSource {
     /// The item's own body node (a `fn`'s block, a `const`'s or `static`'s value, a variant's
     /// discriminant), and nothing of its header; `None` for an item with none.
     pub body: Option<u128>,
+    /// Whether the text `attrs` covers has `cfg` in it: only then can what is made of the
+    /// attributes differ with the crate's cfg.
+    pub attrs_cfg: bool,
+    /// The same of the text `header` covers.
+    pub header_cfg: bool,
+    /// Of an `impl` or a `trait`: its assoc items are a function of its header and the cfg
+    /// alone, with no name looked up. No macro call at assoc position, no inner attribute in
+    /// an assoc `fn`'s body, and every attribute of an assoc item one word that is built in
+    /// (as `DefMap::is_builtin_or_registered_attr` says of any crate) and not `cfg_attr`.
+    pub plain: bool,
 }
+
+const HAS_BODY: u32 = 1;
+const ATTRS_CFG: u32 = 2;
+const HEADER_CFG: u32 = 4;
+const PLAIN: u32 = 8;
+/// Every bit of a row's flag word.
+const FLAGS: u32 = 15;
 
 /// The index of one file, as its entry's bytes, read in place.
 #[derive(Debug, PartialEq, Eq)]
@@ -91,11 +109,14 @@ impl FileIndex {
 
     fn row(&self, at: usize) -> (u32, ItemSource) {
         let row = &self.bytes[HEAD + at * ROW..HEAD + (at + 1) * ROW];
-        let has_body = u32_at(row, 4) != 0;
+        let flags = u32_at(row, 4);
         let source = ItemSource {
             attrs: u128_at(row, 8),
             header: u128_at(row, 24),
-            body: has_body.then(|| u128_at(row, 40)),
+            body: (flags & HAS_BODY != 0).then(|| u128_at(row, 40)),
+            attrs_cfg: flags & ATTRS_CFG != 0,
+            header_cfg: flags & HEADER_CFG != 0,
+            plain: flags & PLAIN != 0,
         };
         (u32_at(row, 0), source)
     }
@@ -191,7 +212,11 @@ pub fn make(root: view::Node<'_>, map: &AstIdMap) -> Vec<u8> {
     out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
     for (id, source) in rows {
         out.extend_from_slice(&id.to_le_bytes());
-        out.extend_from_slice(&u32::from(source.body.is_some()).to_le_bytes());
+        let flags = if source.body.is_some() { HAS_BODY } else { 0 }
+            | if source.attrs_cfg { ATTRS_CFG } else { 0 }
+            | if source.header_cfg { HEADER_CFG } else { 0 }
+            | if source.plain { PLAIN } else { 0 };
+        out.extend_from_slice(&flags.to_le_bytes());
         out.extend_from_slice(&source.attrs.to_le_bytes());
         out.extend_from_slice(&source.header.to_le_bytes());
         out.extend_from_slice(&source.body.unwrap_or(0).to_le_bytes());
@@ -222,7 +247,7 @@ pub fn decode(bytes: &[u8]) -> R<FileIndex> {
     for at in 0..count {
         let (id, _) = index.row(at);
         let flag = u32_at(&index.bytes[HEAD + at * ROW..], 4);
-        if last.is_some_and(|last| last >= id) || flag > 1 {
+        if last.is_some_and(|last| last >= id) || flag & !FLAGS != 0 {
             // alloc: error path
             return Err(format!("a file index whose row {at} (ast id {id:#x}) is out of order"));
         }
@@ -235,12 +260,20 @@ pub fn decode(bytes: &[u8]) -> R<FileIndex> {
 fn rows(root: view::Node<'_>, map: &AstIdMap) -> Vec<(u32, ItemSource)> {
     // alloc: one file's rows, while its index is made
     let mut out = Vec::new();
-    let mut attrs = Hasher::new(ATTRS_DOMAIN);
-    piece(&mut attrs, END, "");
+    let mut attrs = Feed::new(ATTRS_DOMAIN);
+    attrs.mark(END);
     inner_attrs(root, &mut attrs);
-    let attrs = attrs.finish().fingerprint().0;
+    let (attrs, cfg) = attrs.finish();
     // The file has no header of its own: its items have their rows.
-    out.push((ROOT_ERASED_FILE_AST_ID.into_raw(), ItemSource { attrs, header: attrs, body: None }));
+    let file = ItemSource {
+        attrs,
+        header: attrs,
+        body: None,
+        attrs_cfg: cfg,
+        header_cfg: cfg,
+        plain: false,
+    };
+    out.push((ROOT_ERASED_FILE_AST_ID.into_raw(), file));
     if let Some(file) = view::SourceFile::cast(root) {
         for item in file.items() {
             item_rows(item, map, &mut out);
@@ -274,7 +307,7 @@ fn item_rows(item: view::Item<'_>, map: &AstIdMap, out: &mut Vec<(u32, ItemSourc
             for variant in it.variant_list().into_iter().flat_map(|list| list.variants()) {
                 let id = map.ast_id_of_view::<ast::Variant>(variant).erase().into_raw();
                 let body = variant.const_arg().map(|it| it.syntax());
-                out.push((id, node_source(variant.syntax(), body.as_slice(), body, None)));
+                out.push((id, node_source(variant.syntax(), body.as_slice(), body, None, false)));
             }
         }
         _ => {}
@@ -318,19 +351,24 @@ pub fn item_source(item: view::Item<'_>) -> ItemSource {
     let mut cuts = Vec::new();
     cuts.extend(body);
     let mut inner = body.filter(|_| matches!(item, view::Item::Fn(_)));
-    let assoc = |list: Option<view::AssocItemList<'_>>, cuts: &mut Vec<view::Node<'_>>| {
+    // A function, not a closure: the list and the cuts share one lifetime, which a closure's
+    // elided lifetimes cannot say.
+    fn assoc<'a>(list: Option<view::AssocItemList<'a>>, cuts: &mut Vec<view::Node<'a>>) {
         for child in list.into_iter().flat_map(|list| list.assoc_items()) {
             cuts.extend(body_of(assoc_as_item(child)));
         }
-    };
+    }
+    let mut plain = false;
     match item {
         view::Item::Impl(it) => {
             inner = it.assoc_item_list().map(|it| it.syntax());
             assoc(it.assoc_item_list(), &mut cuts);
+            plain = is_plain(it.assoc_item_list());
         }
         view::Item::Trait(it) => {
             inner = it.assoc_item_list().map(|it| it.syntax());
             assoc(it.assoc_item_list(), &mut cuts);
+            plain = is_plain(it.assoc_item_list());
         }
         view::Item::Enum(it) => {
             for variant in it.variant_list().into_iter().flat_map(|list| list.variants()) {
@@ -344,7 +382,37 @@ pub fn item_source(item: view::Item<'_>) -> ItemSource {
         view::Item::ExternBlock(it) => inner = it.extern_item_list().map(|it| it.syntax()),
         _ => {}
     }
-    node_source(item.syntax(), &cuts, body, inner)
+    node_source(item.syntax(), &cuts, body, inner, plain)
+}
+
+/// Whether the assoc items of `list` are found with no name looked up ([`ItemSource::plain`]).
+fn is_plain(list: Option<view::AssocItemList<'_>>) -> bool {
+    list.into_iter().flat_map(|list| list.assoc_items()).all(|item| {
+        let body = match item {
+            view::AssocItem::MacroCall(_) => return false,
+            view::AssocItem::Fn(it) => it.body().map(|it| it.syntax()),
+            view::AssocItem::Const(_) | view::AssocItem::TypeAlias(_) => None,
+        };
+        if body.is_some_and(|it| view::block_may_start_with_inner_attr(it.text(), true)) {
+            return false;
+        }
+        item.syntax().children_with_tokens().all(|child| match child {
+            NodeOrToken::Node(child) => view::Attr::cast(child).is_none_or(is_inert),
+            NodeOrToken::Token(_) => true,
+        })
+    })
+}
+
+/// Whether `attr` is an attribute no crate resolves as a macro: one word, built in or
+/// `rustc_`'s, and not `cfg_attr`, which may write any attribute.
+fn is_inert(attr: view::Attr<'_>) -> bool {
+    let Some(path) = attr.path() else { return false };
+    let word = path.syntax().text();
+    word != "cfg_attr"
+        && !word.is_empty()
+        && word.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && (word.starts_with("rustc_")
+            || crate::inert_attr_macro::find_builtin_attr_idx(&Symbol::intern(word)).is_some())
 }
 
 /// The hashes of `node`: its header with `cuts` (nodes within it, in its order, none within
@@ -355,59 +423,84 @@ fn node_source(
     cuts: &[view::Node<'_>],
     body: Option<view::Node<'_>>,
     inner: Option<view::Node<'_>>,
+    plain: bool,
 ) -> ItemSource {
-    let mut attrs = Hasher::new(ATTRS_DOMAIN);
+    let mut attrs = Feed::new(ATTRS_DOMAIN);
     for child in node.children_with_tokens() {
         if let NodeOrToken::Node(child) = child
             && view::AnyAttr::can_cast(child.kind())
         {
-            piece(&mut attrs, child.text().len() as u32, child.text());
+            attrs.piece(child.text());
         }
     }
-    piece(&mut attrs, END, "");
+    attrs.mark(END);
     if let Some(inner) = inner {
         inner_attrs(inner, &mut attrs);
     }
 
-    let mut header = Hasher::new(HEADER_DOMAIN);
-    header.update(&(node.kind() as u16).to_le_bytes());
+    let mut header = Feed::new(HEADER_DOMAIN);
+    header.kind(node.kind());
     let text = node.text();
     let start = node.text_range().start();
     let mut at = 0;
     for cut in cuts {
         let range = cut.text_range();
         let (from, to) = (u32::from(range.start() - start) as usize, u32::from(range.end() - start) as usize);
-        piece(&mut header, (from - at) as u32, &text[at..from]);
-        piece(&mut header, CUT, "");
-        header.update(&(cut.kind() as u16).to_le_bytes());
+        header.piece(&text[at..from]);
+        header.mark(CUT);
+        header.kind(cut.kind());
         inner_attrs(*cut, &mut header);
-        piece(&mut header, END, "");
+        header.mark(END);
         at = to;
     }
-    piece(&mut header, (text.len() - at) as u32, &text[at..]);
+    header.piece(&text[at..]);
 
     let body = body.map(|body| {
         let mut hasher = Hasher::new(BODY_DOMAIN);
         hasher.update(&(body.kind() as u16).to_le_bytes()).update(body.text().as_bytes());
         hasher.finish().fingerprint().0
     });
-    ItemSource {
-        attrs: attrs.finish().fingerprint().0,
-        header: header.finish().fingerprint().0,
-        body,
-    }
+    let (attrs, attrs_cfg) = attrs.finish();
+    let (header, header_cfg) = header.finish();
+    ItemSource { attrs, header, body, attrs_cfg, header_cfg, plain }
 }
 
-/// Feeds one piece: its length (or a mark no length is) and its text.
-fn piece(hasher: &mut Hasher, len: u32, text: &str) {
-    hasher.update(&len.to_le_bytes()).update(text.as_bytes());
+/// One hash being fed, and whether any text fed has `cfg` in it.
+struct Feed {
+    hasher: Hasher,
+    cfg: bool,
+}
+
+impl Feed {
+    fn new(domain: &'static str) -> Feed {
+        Feed { hasher: Hasher::new(domain), cfg: false }
+    }
+
+    /// Feeds one piece of text: its length, then its bytes.
+    fn piece(&mut self, text: &str) {
+        self.cfg |= text.contains("cfg");
+        self.hasher.update(&(text.len() as u32).to_le_bytes()).update(text.as_bytes());
+    }
+
+    /// Feeds a mark: a word no piece's length is.
+    fn mark(&mut self, mark: u32) {
+        self.hasher.update(&mark.to_le_bytes());
+    }
+
+    fn kind(&mut self, kind: SyntaxKind) {
+        self.hasher.update(&(kind as u16).to_le_bytes());
+    }
+
+    fn finish(self) -> (u128, bool) {
+        (self.hasher.finish().fingerprint().0, self.cfg)
+    }
 }
 
 /// Feeds the inner attributes and inner doc comments `node` holds, in order: of a file, a
 /// list of items, or a body (its statement list's). A block whose text surely starts with
 /// none feeds none and is not walked, so a lazy body stays unparsed and feeds what a parsed
 /// one does; any other is walked, which parses a lazy one.
-fn inner_attrs(node: view::Node<'_>, hasher: &mut Hasher) {
+fn inner_attrs(node: view::Node<'_>, feed: &mut Feed) {
     if node.kind() == SyntaxKind::BLOCK_EXPR
         && !view::block_may_start_with_inner_attr(node.text(), true)
     {
@@ -416,9 +509,9 @@ fn inner_attrs(node: view::Node<'_>, hasher: &mut Hasher) {
     for child in node.children_with_tokens() {
         let NodeOrToken::Node(child) = child else { continue };
         if child.kind() == SyntaxKind::STMT_LIST {
-            inner_attrs(child, hasher);
+            inner_attrs(child, feed);
         } else if view::AnyAttr::cast(child).is_some_and(|attr| attr.kind().is_inner()) {
-            piece(hasher, child.text().len() as u32, child.text());
+            feed.piece(child.text());
         }
     }
 }
@@ -530,6 +623,23 @@ mod tests {
             assert_ne!(with[1].1.header, without[1].1.header, "the impl's header");
             assert_ne!(with[2].1.attrs, without[2].1.attrs, "the fn's attrs");
         }
+    }
+
+    /// `plain` is said only of an impl whose assoc items no crate could read otherwise; the
+    /// controls are each thing that takes a name's lookup.
+    #[test]
+    fn an_impl_is_plain_only_with_no_macro_and_built_in_attributes() {
+        let plain = |assoc: &str| rows_of(&format!("impl S {{ {assoc} }}"), false)[1].1.plain;
+        assert!(plain("#[inline] fn a() {} /// doc\n const C: u8 = 1; type T = u8;"));
+        assert!(plain("#[rustc_const_stable(feature = \"x\")] #[cfg(unix)] fn a() {}"));
+        assert!(!plain("m!();"));
+        assert!(!plain("#[tokio::main] fn a() {}"));
+        assert!(!plain("#[my_attr] fn a() {}"));
+        assert!(!plain("#[cfg_attr(unix, my_attr)] fn a() {}"));
+        assert!(!plain("fn a() { #![my_attr] }"));
+        let rows = rows_of("impl S { #[cfg(unix)] fn a() {} }\nimpl S { fn b() { cfg!(unix); } }", false);
+        assert!(rows[1].1.header_cfg && !rows[1].1.attrs_cfg && rows[2].1.attrs_cfg);
+        assert!(!rows[3].1.header_cfg, "a body's text is not of the header");
     }
 
     #[test]

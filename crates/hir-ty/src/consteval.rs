@@ -651,13 +651,23 @@ pub fn const_eval_query<'db>(
     trait_env: Option<StoredParamEnvAndCrate>,
 ) -> Result<StoredAllocation, ConstEvalError<'db>> {
     let subst = subst.as_ref();
-    if let Some(kept) = deps::cached(db, def, subst)? {
-        return Ok(kept.store());
-    }
     let trait_env = trait_env.as_ref().map(|env| env.as_ref(db));
-    let value = evaluate(db, def.into(), subst, trait_env).map(|it| it.store());
-    deps::record(db, def, subst, &value);
-    value
+    // The form that goes (docs/v2/plan/design/caches.md, "Unowned defects" 1): a dependency's
+    // constant under its crate's check key. It is asked only where the item store below has
+    // no entry, and is deleted with `deps` once the global cache's rule for a constant
+    // (`blaze-global` `DerivedMade::Const`) is made of the item store's key.
+    let run = || -> Result<StoredAllocation, ConstEvalError<'db>> {
+        if let Some(kept) = deps::cached(db, def, subst)? {
+            return Ok(kept.store());
+        }
+        let value = evaluate(db, def.into(), subst, trait_env).map(|it| it.store());
+        deps::record(db, def, subst, &value);
+        value
+    };
+    // A constant with no generic arguments has one value for every asker (`deps`' module doc):
+    // it is an entry of the item store, under its own identity and the facts its evaluation
+    // read, asked before anything of its body is (`body_store::konst`).
+    if subst.is_empty() { crate::body_store::constant(db, def, run) } else { run() }
 }
 
 fn const_eval_cycle_result<'db>(

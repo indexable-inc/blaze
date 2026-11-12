@@ -145,13 +145,16 @@ impl Mounts {
     }
 
     /// Where each local mount is that must be read again before a job reads it, sorted: one
-    /// file always (no watch vouches for it), a directory unless `unchanged(watched,
+    /// file unless `same_file(at, generation)` says the watches heard nothing of its name
+    /// since it was read (a directory named through a link too, of which that never says
+    /// so), a directory unless `unchanged(watched,
     /// generation)` says nothing under it changed since it was read, and a path read as
     /// absent unless `absent(at)` says nothing is there now (a look at the disk at each ask,
     /// which is the whole of what an absent path is).
     pub fn stale_locals(
         &self,
         unchanged: impl Fn(&str, u64) -> bool,
+        same_file: impl Fn(&str, u64) -> bool,
         absent: impl Fn(&str) -> bool,
     ) -> Vec<String> {
         // alloc: once per job, the locals to read again
@@ -161,7 +164,7 @@ impl Mounts {
             .filter(|(at, it)| match (it.watched.as_deref(), it.absent) {
                 (Some(dir), _) => !unchanged(dir, it.generation),
                 (None, true) => !absent(at.as_str()),
-                (None, false) => true,
+                (None, false) => !same_file(at.as_str(), it.generation),
             })
             .map(|(at, _)| at.clone()) // clone: once per local read again
             .collect();

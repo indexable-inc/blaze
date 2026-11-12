@@ -72,6 +72,7 @@ mod read;
 pub mod rebuild;
 pub mod remote;
 mod segment;
+pub mod sealed;
 pub mod sets;
 mod sync;
 mod table;

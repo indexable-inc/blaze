@@ -206,3 +206,45 @@ fn a_kept_root_keeps_exactly_what_its_listing_names() {
     let (_, rooted, in_set, _) = kept_by_root(true, false);
     assert!(rooted < in_set / 4, "the planted bug keeps the root and no item: {rooted}");
 }
+
+/// The invariant: a pin that names roots stays a key a set. A set's new root takes its old
+/// root's place in one write ([`Store::pin_change`]), the pin's other keys stay, the same
+/// change again writes nothing, and before the store's pins are read nothing is written.
+/// The control is [`Store::pin_add`], under which the pin keeps every root a set ever had.
+#[test]
+fn a_sets_new_root_takes_its_old_roots_place_in_a_pin() {
+    use crate::collect::PinAdded;
+    let mut sim = Sim::new(21, quiet());
+    let mut store = open(&mut sim, "store");
+    let roots: Vec<Key> = (0..3)
+        .map(|n| {
+            let (_, root) = sets::listing_of(&set_id(1), &sorted(0..n), &[]);
+            store.put(root.0, Kind::Set, &root.1).unwrap();
+            root.0
+        })
+        .collect();
+    assert_eq!(store.pin_change("crate", "the test's", 1, &[roots[0]], &[]), Ok(PinAdded::NotRead));
+    flush(&mut sim, &mut store);
+    let mut scan = (0..8).find_map(|_| store.pins_take()).expect("the pins can be read");
+    scan.run();
+    store.pins_put(scan);
+    let keys = |store: &Store, name: &str| store.pins().find(|pin| pin.name == name).map(|pin| pin.keys.clone());
+    let mut both = vec![key(77), roots[0]];
+    both.sort_unstable();
+    assert!(matches!(store.pin_change("crate", "the test's", 2, &both, &[]), Ok(PinAdded::Written(_))));
+    for (when, n) in [(3, 1), (4, 2)] {
+        let changed = store.pin_change("crate", "the test's", when, &[roots[n]], &[roots[n - 1]]);
+        assert!(matches!(changed, Ok(PinAdded::Written(_))), "{changed:?}");
+        let mut want = vec![key(77), roots[n]];
+        want.sort_unstable();
+        assert_eq!(keys(&store, "crate"), Some(want), "the root took its place, the other key stayed");
+        assert_eq!(
+            store.pin_change("crate", "the test's", when, &[roots[n]], &[roots[n - 1]]),
+            Ok(PinAdded::Unchanged)
+        );
+    }
+    for (when, n) in [(5, 0), (6, 1), (7, 2)] {
+        store.pin_add("grows", "the control", when, &[roots[n]]).unwrap();
+    }
+    assert_eq!(keys(&store, "grows").map(|it| it.len()), Some(3), "the control keeps every root");
+}

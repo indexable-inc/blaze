@@ -319,6 +319,16 @@ pub(crate) enum Plant {
     /// moved ([`super::seal::Seals::moved_readers`]): the grain of what is redone is the
     /// crate.
     BrokenSealNamesEveryRow,
+    /// A walk that enters a group whose seal broke hands out the readers of the imports that
+    /// moved and not those of what had changed before the group's rows could be found (a row
+    /// behind the seal that a pull ran again first): the bug the refinement's simulation
+    /// found on 2026-11-12.
+    BrokenGroupMissesEarlierChanges,
+    /// A settle that left nothing makes its view the floor whether or not a row with an
+    /// untracked read has run in the view ([`nothing_to_walk`]'s test taken out), as it did
+    /// until 2026-11-12: a row that reads such a row is proved from the floor with its old
+    /// value.
+    SettleFloorsOverUntrackedRows,
     /// A task that finds a group being checked claims it too ([`super::seal::resolve`]'s
     /// compare-and-swap from suspect taken out): two checks of one group run at once.
     SecondClaimAdmitted,
@@ -436,6 +446,7 @@ impl Storage {
     #[cfg(test)]
     pub(crate) fn plant_in_changed_set(&mut self, plant: Plant) {
         self.frontier.plant = plant;
+        self.seals.admit_second_claims(plant == Plant::SecondClaimAdmitted);
     }
 
     /// Plants [`Plant::ForgetsReadersOfWritten`] in this storage's changed set: for the
@@ -1084,6 +1095,9 @@ fn walk(db: *const (), storage: &Storage) {
     // Whether a wide level was met, or the walk's most unwinds: from then on it marks and
     // verifies nothing.
     let mut broad = false;
+    // The groups with a broken seal whose rows this walk has handed out
+    // ([`super::seal::moved_readers`]): each once a walk.
+    let mut entered: Vec<u16> = Vec::new(); // alloc: the groups whose seal broke in this view, few
     let unwound_most = match plant {
         Plant::ContainsEveryUnwind => u64::MAX,
         _ => UNWOUND_MOST,
@@ -1125,7 +1139,15 @@ fn walk(db: *const (), storage: &Storage) {
                 // is redone: the group's rows are indexed (its own edges, no row verified),
                 // and only the rows that read an import that moved are handed out, to be
                 // verified as any suspect; their readers follow as any row's.
-                for group in storage.seals.index_broken(storage) {
+                //
+                // Once a walk, each group: a walk that unwound after a group was indexed
+                // left its rows unverified, and the next walk hands them out again.
+                storage.seals.index_broken(storage);
+                for group in storage.seals.broken() {
+                    if entered.contains(&group) {
+                        continue;
+                    }
+                    entered.push(group); // alloc: as above
                     if plant == Plant::BrokenSealNamesEveryRow {
                         let mut rows: Vec<(u32, u32)> = Vec::new(); // alloc: the control's list, every row of the group
                         storage.seals.every_row_behind(storage, group, &mut rows);
@@ -1144,6 +1166,29 @@ fn walk(db: *const (), storage: &Storage) {
                             suspects.push(reader); // alloc: a walk's list, the rows it reaches
                         }
                     });
+                    // And what changed before the group's rows could be found as readers: a
+                    // row behind the seal that a pull ran again before this walk (the pull
+                    // broke the seal, or met another task's claim), and any node this walk
+                    // gathered while the group was still sealed. The plan gathers a node once
+                    // a stamp, so its readers behind the seal are asked for here, by the
+                    // plan's own rule (a reader verified since the change has seen it).
+                    // Without this a row that reads a changed row of its own group was never
+                    // reached, and the walk's end proved it unchanged (found by the
+                    // refinement's simulation, 2026-11-12: "row 2 is 4, from scratch 2").
+                    let earlier = match plant {
+                        Plant::BrokenGroupMissesEarlierChanges => &[][..],
+                        _ => &found[..],
+                    };
+                    for &node in earlier.iter().chain(&taken.written) {
+                        let (_, since) = changed_in(storage, node, plant);
+                        storage.seals.readers_in_group(group, node, |reader| {
+                            if (since == ASSUMED || verified_in(storage, reader) < since)
+                                && plan.ask(reader)
+                            {
+                                suspects.push(reader); // alloc: as above
+                            }
+                        });
+                    }
                 }
                 suspects.sort_unstable();
                 if !suspects.is_empty()
@@ -1446,11 +1491,11 @@ impl Storage {
         walked.written = written;
         walked.log = log;
         drop(walked);
-        // Nothing left: every node that changed since the last walk has been seen by every
-        // reader, so every row holds in this view as after a walk that found no suspect, and
-        // this view is the floor ([`floor`]). The rows set apart stay apart. Not while a sealed
-        // group waits for its check: its rows are not known to hold until it is checked.
-        if left == 0 && !storage.seals.unsettled() {
+        // The floor is the view of a walk that ended, or of a settle after which a walk
+        // would have nothing to start from ([`nothing_to_walk`]): only then does every row
+        // hold in this view as after a walk that found no suspect. The rows set apart stay
+        // apart.
+        if left == 0 && nothing_to_walk(storage) {
             frontier.floor.store(storage.view_bits(), Ordering::Release);
         }
         span.record("said", done.said);
@@ -1459,6 +1504,46 @@ impl Storage {
         span.record("left", done.left);
         done
     }
+}
+
+/// Whether a walk of this view would start from nothing beside what was written and what
+/// said it changed (the settle's own count, `left`): the one statement of when a settle may
+/// stand for a walk's end and make this view the floor.
+///
+/// The invariant: the floor says every row but those set apart or untracked holds in its
+/// view. A walk's end says so because the walk asked every start it has: the written fields,
+/// the nodes that said they changed, every row whose last run made an untracked read (such a
+/// row runs again in every view, and a row that reads it holds only once it has), and every
+/// sealed group that waits for its check. A settle looks at the first two; it may make the
+/// floor only when the other two are empty too. Until 2026-11-12 it did not ask about the
+/// untracked rows: after a view opened with nothing written (a host's outside input
+/// changed), a settle made the floor, and a row that read an untracked row not yet run in
+/// the view was proved from it with its old value (found by the seal groups' refinement
+/// simulation: "row 6 is 0, from scratch 1"; no seal group was involved).
+///
+/// With `&mut` of the storage (the settle's): the untracked rows said since the last walk
+/// are moved to the walk's kept list, where the walk would have put them.
+fn nothing_to_walk(storage: &Storage) -> bool {
+    let frontier = &storage.frontier;
+    if storage.seals.unsettled() {
+        return false;
+    }
+    if frontier.plant == Plant::SettleFloorsOverUntrackedRows {
+        return true;
+    }
+    let view = storage.view_bits();
+    let mut walked = frontier.walked.lock();
+    while let Some(node) = frontier.untracked.pop() {
+        walked.untracked.push(node); // alloc: the untracked rows, a word each
+    }
+    !walked.untracked.iter().any(|&node| {
+        row_of(storage, node).is_some_and(|(header, _, _)| {
+            let word = header.verified.load(Ordering::Acquire);
+            header.meta.load(Ordering::Relaxed) & UNTRACKED != 0
+                && word & VIEW_MASK != 0
+                && (word & (RUNNING | PROVISIONAL) != 0 || word & VIEW_MASK != view)
+        })
+    })
 }
 
 /// The `verified` word of the row of `node`; 0 for a node with no row.
@@ -1590,12 +1675,26 @@ pub(crate) fn unreached(storage: &Storage, node: u32) -> bool {
     let frontier = &storage.frontier;
     let view = storage.view().as_u64();
     if frontier.clean_at.load(Ordering::Acquire) == view {
-        return frontier.unwound.load(Ordering::Acquire) == 0 || !set_apart(frontier, node);
+        let holds = frontier.unwound.load(Ordering::Acquire) == 0 || !set_apart(frontier, node);
+        if holds {
+            proved(storage, node, super::counts::PROVED_WALK_END);
+        }
+        return holds;
     }
     if frontier.reach_at.load(Ordering::Acquire) != view {
         return false;
     }
-    outside_reach(storage, node)
+    let outside = outside_reach(storage, node);
+    if outside {
+        proved(storage, node, super::counts::PROVED_REACH);
+    }
+    outside
+}
+
+/// Counts the proof of the row of `node` by `by` to its ingredient: the validity census
+/// ([`super::counts::proved`]).
+fn proved(storage: &Storage, node: u32, by: usize) {
+    super::counts::proved(key_parts(storage.key_of(node)).0, by);
 }
 
 #[cold]

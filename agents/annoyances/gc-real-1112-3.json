@@ -1,0 +1,19 @@
+{
+ "id": "gc-real-1112-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane gc-real-1112",
+ "where": "crates/blaze-cargo/src/cli/cache.rs collect()",
+ "what": "`blaze cache gc --dry-run` is not read-only: it takes each area's collector lock and writes its own name into .blaze-collector (and, since this lane's change, makes a lease in a lease-less build dir). A lane told to run only read-only commands cannot use it on a home it may not modify.",
+ "cost": "the per-verdict counts of the tracked objects were taken from --last instead",
+ "cause": "a dry run shares the real run's locking",
+ "whys": [
+  "dry-run writes .blaze-collector",
+  "collector_lock writes the holder's name on taking the lock",
+  "a dry run takes the same lock as a run that removes"
+ ],
+ "class": "an inspection command that writes",
+ "prevention": "none yet: a dry run could plan under a shared lock and write nothing",
+ "workaround": "read `blaze cache gc --last` (the ledger) instead",
+ "fix": "none",
+ "state": "open"
+}

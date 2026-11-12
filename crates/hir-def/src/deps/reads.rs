@@ -4,13 +4,13 @@
 //! besides its call (files, listings, variables of the shell), as the expansion server traced
 //! it.
 //!
-//! A crate's [`Reads`] are kept beside its image the way a run of user code keeps its shapes
-//! (`blaze_usercode::index`): the names it read, without their values, in the first free of
-//! [`SLOTS`] slots under the crate's key ([`slot`]), and the image under the key, those names
-//! and the values they had ([`image_key`]). Serving asks each slot in turn, works out the
-//! values of its names now, and gets the image they name: one get when nothing changed, and an
-//! image is never used once a value it was made from is another. A crate that reads nothing of
-//! the kind has its image under its key alone and no slot.
+//! A crate's [`Reads`] are kept beside its image in `blaze_record`'s form (base key,
+//! read-lists, answer): the names it read, without their values, as a read-list in the first
+//! free of [`SLOTS`] slots under the crate's key ([`slot`]), and the image under that list's
+//! bytes and the values the names had ([`image_key`]). Serving asks each slot in turn, works
+//! out the values of its names now, and gets the image they name: one get when nothing
+//! changed, and an image is never used once a value it was made from is another. A crate that
+//! reads nothing of the kind has its image under its key alone and no slot.
 //!
 //! A crate's reads hold its dependencies' expansions' too ([`Reads::deps`]): its image holds
 //! what they made, and no key covers what they read.
@@ -39,17 +39,24 @@ use crate::{
     nameres::crate_def_map,
 };
 
-/// The domain of the slots, the images filed by reads, and the reads' encoding.
+/// The domain of the reads' encoding and of their values' hash (the keys of the slots and of
+/// what is filed by reads are `blaze_record`'s).
 /// 2: a crate's reads hold its dependencies' ([`Reads::deps`]). 3: and which crates read
-/// `CARGO_PRIMARY_PACKAGE` ([`Reads::primary`]).
-pub const READS_DOMAIN: &str = "blaze v2 dependency image reads 3";
+/// `CARGO_PRIMARY_PACKAGE` ([`Reads::primary`]). 4: and the files outside the VFS the crates of
+/// the closure read ([`Reads::files`]).
+pub const READS_DOMAIN: &str = "blaze v2 dependency image reads 4";
 
 /// How many sets of names one key keeps: a crate's expansions read other names only as what
 /// they read decides it, so one or two in practice.
 pub const SLOTS: u32 = 16;
 
+/// The chain of a crate key's read-lists: one generation of [`SLOTS`]. With every slot full of
+/// other reads a crate is refused ([`Refused::Reads`]), named, and nothing is searched but
+/// these slots.
+pub(super) const BOUNDS: blaze_record::Bounds = blaze_record::Bounds::new(SLOTS, 1);
+
 /// The first byte of a slot's bytes: the version of [`Reads::encode`].
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 
 /// What a crate read besides the inputs of its key: each sorted, with no repeats.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -75,11 +82,22 @@ pub struct Reads {
     /// [`Reads::deps`]: its value is the crate's own (whether it is primary), then the
     /// process's, and no key covers either.
     primary: Vec<u32>,
+    /// The files outside the VFS that the crate and the crates it depends on read (an
+    /// `include!`, `include_str!` or `include_bytes!` of one, a `#[path]` module in one:
+    /// [`base_db::Files::included_by`]), each by its path as a portable key writes it
+    /// ([`base_db::Files::ported`]), with the content ID of what was read of it
+    /// ([`base_db::IncludedFile::content`]: of its bytes, or of why it could not be read):
+    /// known for reads made in this database, not for reads decoded from a slot. Such a file
+    /// is known only once its crate is resolved, so no key covers it; until 2026-11-12 a
+    /// crate that included one was refused an image whole. One list for the closure: a file
+    /// is one input whichever crate read it.
+    files: Vec<(Box<[u8]>, Option<ContentId>)>,
 }
 
 impl Reads {
     pub fn is_empty(&self) -> bool {
-        self.env.is_empty()
+        self.files.is_empty()
+            && self.env.is_empty()
             && self.macros.is_empty()
             && self.deps.is_empty()
             && self.primary.is_empty()
@@ -133,6 +151,7 @@ impl Reads {
                 None => Reads::own(db, dep, &[])?,
             };
             self.env.extend(read.env);
+            self.files.extend(read.files);
             let at = u32::try_from(at).expect("fewer than 2^32 crates");
             if !read.primary.is_empty() {
                 self.primary.push(at);
@@ -145,7 +164,27 @@ impl Reads {
         self.env.dedup();
         self.primary.sort_unstable();
         self.primary.dedup();
+        self.settle_files()
+    }
+
+    /// Its files sorted, each once: two contents read of one path are a refusal.
+    fn settle_files(&mut self) -> Result<(), Refused> {
+        self.files.sort_unstable();
+        self.files.dedup();
+        if self.files.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(Refused::Reads {
+                why: "two reads of one file outside the VFS found other contents: an input \
+                      changed while the crate was resolved",
+            });
+        }
         Ok(())
+    }
+
+    /// Where this database has each of its files ([`base_db::Files::placed`]) and the content
+    /// ID each has on disk now ([`base_db::IncludedFile::content_now`]): what a crate served
+    /// by these reads is noted as having read (`base_db::Files::included_are_served`).
+    pub(crate) fn files_now(&self, db: &Db) -> Result<Vec<(base_db::AbsPathBuf, ContentId)>, String> {
+        self.files.iter().map(|(path, _)| file_now(db, path)).collect() // alloc: once per slot found, a file each
     }
 
     /// The reads of `krate` from the proc-macro expansions of `todo` and of each call any of
@@ -184,6 +223,8 @@ impl Reads {
         // Every `env!` and `option_env!` expansion notes its variable as it runs, nested ones
         // too, and the log is never cleared: what the crate's resolution read is in it.
         env_reads(db, krate, own, &mut reads);
+        file_reads(db, krate, &mut reads);
+        reads.settle_files()?;
         reads.env.sort_unstable();
         reads.env.dedup();
         reads.macros.sort_unstable();
@@ -226,6 +267,10 @@ impl Reads {
         for at in &self.primary {
             out.put_u32(*at);
         }
+        out.put_u32(count(self.files.len()));
+        for (path, _) in &self.files {
+            out.put_bytes_u32(path);
+        }
         out
     }
 
@@ -262,7 +307,13 @@ impl Reads {
         for _ in 0..read.count_u32(4).map_err(short)? {
             reads.primary.push(read.u32().map_err(short)?);
         }
+        for _ in 0..read.count_u32(4).map_err(short)? {
+            reads.files.push((read.bytes_u32().map_err(short)?.into(), None)); // alloc: setup, as above
+        }
         read.finish().map_err(|_| "bytes after the reads")?;
+        if !reads.files.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+            return Err("files out of order");
+        }
         if !reads.primary.windows(2).all(|pair| pair[0] < pair[1]) {
             return Err("the crates that read `CARGO_PRIMARY_PACKAGE` out of order");
         }
@@ -281,10 +332,9 @@ impl Reads {
     /// The values the reads had as `db` resolved `krate`, whose they are: what the image is
     /// filed by.
     pub(crate) fn values_then(&self, db: &Db, krate: Crate) -> ContentId {
-        self.values(db, krate, |_, _, then| {
-            Ok(then.expect("reads made in this database know their values"))
-        })
-        .expect("values made in this database do not fail")
+        let known = "reads made in this database know their values";
+        self.values(db, krate, |_, _, then| Ok(then.expect(known)), |_, then| Ok(then.expect(known)))
+            .expect("values made in this database do not fail")
     }
 
     /// The values the reads of `krate` have now: the process variables in `db`, each
@@ -303,14 +353,19 @@ impl Reads {
     ) -> Result<ContentId, String> {
         // What the expansions were given ([`base_db::macro_env`]).
         let env = base_db::macro_env(db, krate);
-        self.values(db, krate, |by, shape, _| {
-            if by != krate {
-                return store.reads_now(base_db::macro_env(db, by), shape);
-            }
-            let values = store.reads_now(env, shape)?;
-            each(shape, values);
-            Ok(values)
-        })
+        self.values(
+            db,
+            krate,
+            |by, shape, _| {
+                if by != krate {
+                    return store.reads_now(base_db::macro_env(db, by), shape);
+                }
+                let values = store.reads_now(env, shape)?;
+                each(shape, values);
+                Ok(values)
+            },
+            |path, _| file_now(db, path).map(|(_, content)| content),
+        )
     }
 
     /// The hash of the values of the reads of `krate`, each expansion's as `expansion` gives
@@ -320,11 +375,17 @@ impl Reads {
         db: &Db,
         krate: Crate,
         mut expansion: impl FnMut(Crate, &[u8], Option<ContentId>) -> Result<ContentId, String>,
+        mut file: impl FnMut(&[u8], Option<ContentId>) -> Result<ContentId, String>,
     ) -> Result<ContentId, String> {
         let mut hasher = Hasher::new(READS_DOMAIN);
         hasher.part(b"values");
         for name in &self.env {
             hasher.opt_part(base_db::process_env_var(db, name));
+        }
+        // Each file's content, as `file` gives it for the path and the content it was read with.
+        hasher.part(b"files");
+        for (path, then) in &self.files {
+            hasher.id(&file(path, *then)?);
         }
         for (shape, then) in &self.macros {
             hasher.id(&expansion(krate, shape, *then)?);
@@ -412,6 +473,9 @@ fn served(db: &Db, krate: Crate, base: ContentId) -> Result<Reads, Refused> {
     let own = krate.env(db);
     let mut reads = Reads::default();
     env_reads(db, krate, own, &mut reads);
+    // What serving it noted (`base_db::Files::included_are_served`): the files it was found by.
+    file_reads(db, krate, &mut reads);
+    reads.settle_files()?;
     for read in db.files().expansions_read_by(krate, base_db::ReadBy::Served(base)) {
         match read {
             base_db::ExpansionRead::Traced { shape, values } => {
@@ -459,19 +523,59 @@ fn env_reads(db: &Db, krate: Crate, own: &base_db::Env, reads: &mut Reads) {
     }
 }
 
-/// Slot `n` of the crate whose key is `key`: where the `n`th set of names it read is kept.
-pub fn slot(key: ContentId, n: u32) -> ContentId {
-    let mut hasher = Hasher::new(READS_DOMAIN);
-    hasher.part(b"slot").id(&key).update(&n.to_le_bytes());
-    hasher.finish()
+/// The files outside the VFS that `krate` read, or was served by, into `reads`
+/// ([`Reads::files`]), each path as a portable key writes it.
+fn file_reads(db: &Db, krate: Crate, reads: &mut Reads) {
+    for (path, content) in db.files().included_by(db, krate) {
+        let ported = db.files().ported(path.as_str().as_bytes());
+        // alloc: once per file outside the VFS a crate imaged read
+        reads.files.push((ported.into_owned().into_boxed_slice(), Some(content)));
+    }
 }
 
-/// Where the image of the crate whose key is `key` is, for the reads `record` (a slot's bytes)
-/// and the values `values` they have.
-pub fn image_key(key: ContentId, record: &[u8], values: ContentId) -> ContentId {
-    let mut hasher = Hasher::new(READS_DOMAIN);
-    hasher.part(b"image").id(&key).part(record).id(&values);
-    hasher.finish()
+/// The file outside the VFS that a read names by `ported`, where this database has it, and
+/// the content ID it has on disk now. An error naming the path when it is no path here.
+fn file_now(db: &Db, ported: &[u8]) -> Result<(base_db::AbsPathBuf, ContentId), String> {
+    let shown = || String::from_utf8_lossy(ported).into_owned(); // alloc: error path
+    // alloc: error path
+    let placed = db.files().placed(ported).map_err(|why| format!("the file read `{}`: {why}", shown()))?;
+    let path = std::str::from_utf8(&placed)
+        .ok()
+        .and_then(|it| base_db::AbsPathBuf::try_from(it).ok())
+        // alloc: error path
+        .ok_or_else(|| format!("the file read `{}` is no absolute path here", shown()))?;
+    let content = base_db::IncludedFile::content_now(AsRef::<std::path::Path>::as_ref(&path));
+    Ok((path, content))
+}
+
+/// Slot `n` of the crate whose key is `key`: where the `n`th set of names it read is kept.
+pub fn slot(key: ContentId, n: u32) -> ContentId {
+    blaze_record::list_key(&key, blaze_record::Slot { generation: 0, n })
+}
+
+/// The read-list a slot of the crate whose key is `key` holds for the reads `record`
+/// ([`Reads::encode`]'s bytes), appended to `out`: one read, named by all of them, as their
+/// values are one hash ([`Reads::values_now`]).
+pub(super) fn write_list(out: &mut Vec<u8>, key: ContentId, record: &[u8]) {
+    // alloc: the caller's buffer, once per crate kept
+    blaze_record::write_list(out, &key, &[], [record]);
+}
+
+/// The reads a slot's read-list `list` names ([`write_list`]'s `record`).
+pub(super) fn listed(list: blaze_record::ListRef<'_>) -> Result<&[u8], &'static str> {
+    let mut names = list.reads();
+    match (names.next(), names.next()) {
+        (Some(record), None) if list.note().is_empty() => Ok(record),
+        _ => Err("a read-list that is not one set of reads and no note"),
+    }
+}
+
+/// Where what is filed by the reads in the read-list `list` (a slot's bytes) is, for the
+/// values `values` they have.
+pub fn image_key(list: &[u8], values: ContentId) -> ContentId {
+    let mut key = blaze_record::AnswerKey::new(list);
+    key.value(blaze_record::Digest::Is(values));
+    key.finish()
 }
 
 #[cfg(test)]
@@ -482,10 +586,17 @@ impl Reads {
             macros: macros.iter().map(|&(shape, values)| (shape.into(), Some(values))).collect(),
             deps: Vec::new(),
             primary: Vec::new(),
+            files: Vec::new(),
         };
         reads.env.sort_unstable();
         reads.macros.sort_unstable();
         reads
+    }
+
+    /// These reads with no file among them: the control of a test of [`Reads::files`].
+    pub(super) fn without_files_for_tests(mut self) -> Reads {
+        self.files.clear();
+        self
     }
 
     /// These reads with `deps` as what the crates of the closure read ([`Reads::deps`]) and

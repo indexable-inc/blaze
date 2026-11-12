@@ -36,7 +36,8 @@ pub fn step_value(db: &Db, def: DefWithBodyId, step: Step) -> Option<ContentId> 
     match step {
         Step::Infer => inference_value(db, def),
         Step::Mir => mir_value(db, def),
-        Step::Borrowck => None,
+        // A reader of a constant reads its `ConstValue` fact, not its step.
+        Step::Borrowck | Step::Const => None,
     }
 }
 

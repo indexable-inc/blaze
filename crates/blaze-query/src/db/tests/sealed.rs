@@ -990,3 +990,82 @@ fn the_oracle_catches_a_result_stored_over_a_seal_the_walk_broke() {
         assert_eq!(left.state, SealState::Sealed, "seed {seed}: {left:?}");
     }
 }
+
+/// The program Hegel shrank the refinement's first failure to (2026-11-12): one group; rows 0
+/// and 1 read its input and inputs of no group, row 2 reads both rows. All sealed; an input
+/// of no group that row 1 reads is written; row 1 is pulled (the pull's check breaks the seal
+/// and runs row 1 again); then the walk.
+fn a_row_ran_again_by_a_pull_before_the_walk() -> Program {
+    Program {
+        groups: vec![vec![]],
+        inputs: vec![None, Some(0), None],
+        flow: vec![
+            sum(&[Dep::Input(0), Dep::Input(1)]),
+            sum(&[Dep::Input(0), Dep::Input(1), Dep::Input(2)]),
+            sum(&[Dep::Input(0), Dep::Query(0), Dep::Query(1)]),
+        ],
+        steps: vec![Step::Pull(vec![2]), Step::Seal, Step::Write(2, 0), Step::Pull(vec![1]), Step::Ask],
+    }
+}
+
+/// The invariant: when a walk enters a group whose seal broke, every row behind the seal
+/// that reads something that changed is reached, whenever that thing changed: an import that
+/// moved, and a row of the group itself that a pull ran again before the walk began. Row 2
+/// reads row 1, which the pull changed; the walk reaches it, and it answers as from scratch.
+#[test]
+fn a_walk_into_a_broken_seal_reaches_the_readers_of_what_a_pull_changed_first() {
+    assert_eq!(simulate(&a_row_ran_again_by_a_pull_before_the_walk(), Plant::None), Ok(()));
+}
+
+/// The control of [`a_walk_into_a_broken_seal_reaches_the_readers_of_what_a_pull_changed_first`]:
+/// handing out only the readers of the imports that moved leaves row 2 unreached, the walk's
+/// end proves it unchanged, and it answers its old value.
+#[test]
+fn the_oracle_catches_a_walk_that_misses_what_changed_before_it_entered_the_group() {
+    let why = simulate(
+        &a_row_ran_again_by_a_pull_before_the_walk(),
+        Plant::BrokenGroupMissesEarlierChanges,
+    )
+    .expect_err("the oracle missed a row behind a broken seal that was never reached");
+    assert!(why.contains("from scratch") || why.contains("does not name it"), "{why}");
+}
+
+/// The program Hegel shrank the refinement's second failure to (2026-11-12), less the rows
+/// that take no part: no input is of a group, so no row is and no seal is involved. Row 0
+/// reads the world, which the engine cannot see; row 1 reads row 0. Both are pulled; the
+/// world changes (a view opens with nothing written); the host settles at its build's end;
+/// then it asks for the changed set and for both rows.
+fn a_settle_before_an_untracked_row_ran() -> Program {
+    Program {
+        groups: vec![vec![]],
+        inputs: vec![None],
+        flow: vec![
+            FlowNode { op: FlowOp::World, deps: vec![Dep::Input(0)] },
+            sum(&[Dep::Query(0)]),
+        ],
+        steps: vec![Step::Pull(vec![1]), Step::World(1), Step::Seal, Step::Ask],
+    }
+}
+
+/// The invariant ([`crate::db::frontier`]'s `nothing_to_walk`): a settle makes its view the
+/// floor only when a walk would have nothing to start from, the rows with an untracked read
+/// among its starts. After the world changed, the settle leaves the floor where it was, the
+/// walk runs the untracked row again, and the row that reads it is verified by its reads:
+/// both answer as from scratch.
+#[test]
+fn a_settle_is_no_floor_while_an_untracked_row_has_not_run_in_the_view() {
+    assert_eq!(simulate(&a_settle_before_an_untracked_row_ran(), Plant::None), Ok(()));
+}
+
+/// The control of [`a_settle_is_no_floor_while_an_untracked_row_has_not_run_in_the_view`]:
+/// with the floor made by any settle that left nothing, the row that reads the untracked row
+/// is proved from the floor and answers its old value.
+#[test]
+fn the_oracle_catches_a_floor_made_over_an_untracked_row_that_has_not_run() {
+    let why = simulate(
+        &a_settle_before_an_untracked_row_ran(),
+        Plant::SettleFloorsOverUntrackedRows,
+    )
+    .expect_err("the oracle missed a row proved from a floor made before its read ran");
+    assert!(why.contains("from scratch") || why.contains("does not name it"), "{why}");
+}

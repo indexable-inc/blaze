@@ -2122,8 +2122,11 @@ impl AttrFlags {
         if let Some(served) = crate::nameres::frozen::items::attr_flags(db, owner) {
             return served;
         }
-        let mut column = |file: EditionedFileId, krate: Crate| file_attr_flags(db, file, krate);
-        column_flags(db, owner, &mut column).unwrap_or_else(|| walked_flags(db, owner))
+        // The item's own entry where one is kept (rule 65), else walked off its syntax and kept.
+        crate::nameres::frozen::entries::items::attr_flags(db, owner, || {
+            let mut column = |file: EditionedFileId, krate: Crate| file_attr_flags(db, file, krate);
+            column_flags(db, owner, &mut column).unwrap_or_else(|| walked_flags(db, owner))
+        })
     }
 
     #[inline]

@@ -10,7 +10,7 @@ list was filed. This refuses a lane's list when
       tracked by git nor covered by the list (2026-11-12: `pub mod awaited;` in a listed
       deps.rs, awaited.rs in nobody's list; the commit was reverted), or
   (b) a listed file changed in the last `quiet_seconds` (someone is still writing it), or
-  (c) a listed path does not exist.
+  (c) a listed path does not exist, unless git tracks it: that is a deletion, and is committed.
 
 Input, one JSON value:
 
@@ -106,9 +106,15 @@ def module_files(file: Path, inside: tuple[str, ...], name: str) -> tuple[Path, 
     return home / f"{name}.rs", home / name / "mod.rs"
 
 
-def findings(repo: Path, tracked: set[str], paths: list[str], quiet: int, now: float) -> list[str]:
+def findings(repo: Path, tracked: set[str], deleted: set[str], paths: list[str], quiet: int, now: float) -> list[str]:
     files, missing = listed_files(repo, paths)
-    found = [f"{path}: listed, and there is no such file or directory" for path in missing]
+    # A listed path git tracks and the directory no longer has is a deletion the lane means
+    # (2026-11-12: crates/blaze-premap, deleted on purpose, was refused as missing).
+    found = [
+        f"{path}: listed, and there is no such file or directory (nor one git tracks, which would be a deletion)"
+        for path in missing
+        if path not in deleted and not any(it.startswith(path + "/") for it in deleted)
+    ]
     covered = {str(it.relative_to(repo)) for it in files}
     for file in files:
         age = now - file.stat().st_mtime
@@ -141,7 +147,13 @@ def main(argv: list[str]) -> None:
     done = subprocess.run(["git", "-C", str(repo), "ls-files"], capture_output=True, text=True, check=False)
     if done.returncode != 0:
         sys.exit(f"ready_check.py: git ls-files in {repo}: {done.stderr.strip()}")
-    tracked = set(done.stdout.splitlines())
+    gone = subprocess.run(["git", "-C", str(repo), "ls-files", "--deleted"], capture_output=True, text=True, check=False)
+    if gone.returncode != 0:
+        sys.exit(f"ready_check.py: git ls-files --deleted in {repo}: {gone.stderr.strip()}")
+    # Tracked and gone from the directory: a deletion to commit when listed, and no longer a
+    # file a `mod x;` can name.
+    deleted = set(gone.stdout.splitlines())
+    tracked = set(done.stdout.splitlines()) - deleted
     lanes = ask.lanes or tuple(sorted(it.stem for it in ready.glob("*.txt")))
     now, refused = time.time(), False
     # A module file another lane of this run lists counts as there: lanes that share a file
@@ -160,7 +172,7 @@ def main(argv: list[str]) -> None:
             refused = True
             continue
         paths = [it.strip().rstrip("/") for it in file.read_text().splitlines() if it.strip()]
-        found = findings(repo, tracked | together, paths, ask.quiet_seconds, now)
+        found = findings(repo, tracked | together, deleted, paths, ask.quiet_seconds, now)
         list_age = now - os.stat(file).st_mtime
         if list_age < ask.quiet_seconds:
             found.append(f"{file}: the list itself changed {list_age:.0f} s ago")

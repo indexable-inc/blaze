@@ -42,7 +42,7 @@ impl Filled {
         let handle = driven.handle();
         let keys: Vec<Key> = (0..COUNT as u64).map(key_of).collect();
         for (n, key) in keys.iter().enumerate() {
-            handle.put(*key, Kind::Query, vec![n as u8; LEN]).expect("a put");
+            handle.put(*key, Kind::Query, &vec![n as u8; LEN]).expect("a put");
         }
         driven.flush().expect("a commit");
         Filled { _driven: driven, handle, keys }
@@ -60,7 +60,7 @@ fn benchmarks() -> impl IntoBenchmarks {
             let store = Filled::new("put");
             let key = key_of(u64::MAX - 1);
             let value = vec![0x5a; 1024];
-            b.iter(move || store.handle.put(key, Kind::Query, black_box(value.clone())).is_ok())
+            b.iter(move || store.handle.put(key, Kind::Query, black_box(&value)).is_ok())
         }),
         benchmark_fn("store/get_hit", |b| {
             let store = Filled::new("hit");

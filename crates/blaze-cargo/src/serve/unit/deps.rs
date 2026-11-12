@@ -660,7 +660,7 @@ pub(crate) fn item_errors(session: &Session) -> Result<(), ApiError> {
 
 impl Session {
     /// What this build's item store lookups found, step by step; None with no item store.
-    pub(crate) fn item_steps(&self) -> Option<[body_store::StepCounts; 3]> {
+    pub(crate) fn item_steps(&self) -> Option<[body_store::StepCounts; 4]> {
         self.items.as_ref().map(body_store::Installed::steps)
     }
 
@@ -846,7 +846,7 @@ pub(crate) fn store(
         // nothing was stored (`ran` with no refusal), the step was kept out (`refused`, the
         // read named most first) or the body has no identity (restore.md, "What an edit
         // needs").
-        let [infer, mir, borrowck] = &items.steps;
+        let [infer, mir, borrowck, ..] = &items.steps;
         let (read, bodies) = items.refused.first().map_or(("", 0), |&(read, bodies)| (read, bodies));
         tracing::info!(
             target: "blaze",
@@ -925,7 +925,7 @@ impl Flushes {
 /// found, step by step (`steps`, from [`Session::item_steps`]). None when there is neither.
 pub(crate) fn noted(
     flushes: Option<&Flushes>,
-    steps: Option<&[body_store::StepCounts; 3]>,
+    steps: Option<&[body_store::StepCounts; 4]>,
 ) -> Option<Diagnostic> {
     let note = flushes.map(|it| flushed(&it.goals));
     let mut message = String::new();
@@ -936,7 +936,7 @@ pub(crate) fn noted(
     if let Some(steps) = steps {
         message.push_str("; the item store, this build:");
         for (at, (counts, step)) in
-            steps.iter().zip(["inference", "MIR", "borrow check"]).enumerate()
+            steps.iter().zip(["inference", "MIR", "borrow check", "constant"]).enumerate()
         {
             let body_store::StepCounts { hits, ran, refused } = counts;
             let sep = if at == 0 { "" } else { ";" };
@@ -967,12 +967,27 @@ pub(crate) fn noted(
     Some(note)
 }
 
+/// What a flush says of a chain at its bound, written after `message`'s end: nothing when no
+/// lookup met one and every shape was placed.
+fn full_chain(lookups_full: usize, full: Option<&str>, message: &mut String) {
+    if let Some(full) = full {
+        // alloc: under `-v`, once per build that stored a front end
+        message.push_str(&format!(" (the first: {full})"));
+    }
+    if lookups_full > 0 {
+        // alloc: as above
+        message.push_str(&format!("; {lookups_full} lookups met a chain with every slot full"));
+    }
+}
+
 /// What the item store's flush did, written after `message`'s end.
 fn items_flushed(items: &body_store::Flushed, message: &mut String) {
     let body_store::Flushed {
         written,
         kept,
         slots_full,
+        lookups_full,
+        full,
         refused,
         unhashable,
         no_identity,
@@ -982,11 +997,20 @@ fn items_flushed(items: &body_store::Flushed, message: &mut String) {
         failed,
         failure: _,
         steps: _,
+        scans,
     } = items;
     // alloc: under `-v`, once per build that stored a front end
     message.push_str(&format!(
         "the item store: {written} written, {kept} kept, {slots_full} with every slot full"
     ));
+    full_chain(*lookups_full, full.as_deref(), message);
+    if !scans.is_empty() {
+        // Who read a whole scope (a listing, not a lookup of a name): each is a read no finer
+        // than a module, so the rows that do it are named.
+        let by: Vec<String> =
+            scans.iter().map(|(step, row, count)| format!("`{row}` in {step} ({count})")).collect(); // alloc: as above
+        message.push_str(&format!("; whole scopes read by {}", by.join(", "))); // alloc: as above
+    }
     if *failed > 0 {
         // alloc: as above
         message.push_str(&format!("; {failed} the store would not keep (the daemon's log says which)"));
@@ -1016,6 +1040,8 @@ pub(crate) fn flushed(flushed: &goal_store::Flushed) -> Diagnostic {
         written,
         kept,
         slots_full,
+        lookups_full,
+        full,
         inexpressible,
         unhashable,
         too_long,
@@ -1027,6 +1053,7 @@ pub(crate) fn flushed(flushed: &goal_store::Flushed) -> Diagnostic {
     let mut message = format!(
         "the persistent goal cache, of the last build: {written} written, {kept} kept, {slots_full} with every slot full"
     );
+    full_chain(*lookups_full, full.as_deref(), &mut message);
     if !inexpressible.is_empty() {
         let by: Vec<String> =
             inexpressible.iter().map(|(query, count)| format!("`{query}` ({count})")).collect(); // alloc: as above

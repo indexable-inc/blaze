@@ -563,6 +563,7 @@ dependencies = [
  "blaze-mem",
  "blaze-metadata",
  "blaze-new",
+ "blaze-pack",
  "blaze-profile",
  "blaze-protocol",
  "blaze-query",
@@ -1717,6 +1718,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-pack"
+version = "0.0.0"
+
+[[package]]
 name = "blaze-phf"
 version = "0.0.0"
 dependencies = [
@@ -1828,6 +1833,14 @@ name = "blaze-reclaim"
 version = "0.0.0"
 dependencies = [
  "blaze-check",
+]
+
+[[package]]
+name = "blaze-record"
+version = "0.0.0"
+dependencies = [
+ "blaze-ids",
+ "blaze-rng",
 ]
 
 [[package]]
@@ -3675,6 +3688,7 @@ dependencies = [
  "blaze-mem",
  "blaze-phf",
  "blaze-query",
+ "blaze-record",
  "cfg",
  "cov-mark",
  "crossbeam-channel",
@@ -3807,6 +3821,7 @@ dependencies = [
  "blaze-phf",
  "blaze-query",
  "blaze-reclaim",
+ "blaze-record",
  "blaze-serde",
  "cfg",
  "cov-mark",

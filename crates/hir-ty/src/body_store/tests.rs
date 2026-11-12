@@ -25,12 +25,13 @@ use hir_def::{
 use hir_expand::fixture;
 use hir_expand::name::Name;
 use blaze_core::lock::Lock;
+use blaze_record::{AnswerKey, Digest};
 use std::alloc::Global;
 
 use super::{
     BodyFacts, Classified, Flushed, Lookup, Mode, Step, StepCounts, capture, infer, install,
     lookup_inference, lookup_passed, offer_passed,
-    record::{self, AnswerKey, ShapeRef},
+    record::{self, ShapeRef},
     step_value,
 };
 use crate::{
@@ -325,8 +326,8 @@ pub(super) fn session(
 }
 
 /// [`Flushed::steps`] with `counts` for `step` and none for the others.
-pub(super) fn only(step: Step, counts: StepCounts) -> [StepCounts; 3] {
-    let mut steps = [StepCounts::default(); 3];
+pub(super) fn only(step: Step, counts: StepCounts) -> [StepCounts; Step::COUNT] {
+    let mut steps = [StepCounts::default(); Step::COUNT];
     steps[step as usize] = counts;
     steps
 }
@@ -381,12 +382,13 @@ fn answer_of(memory: &Memory, s: &Session, def: DefWithBodyId) -> (ContentId, Co
     let identity = s.facts.identity(&s.db, def).expect("a module's function has an identity");
     let base = record::base_key(&identity, Step::Infer, &infer::SCHEMA, &solver_version(&BUILD));
     let shape_key = record::shape_key(&base, 0);
-    let shape =
+    let held =
         memory.get(&record::shape_at(Step::Infer, &shape_key)).unwrap().expect("a shape in slot 0");
-    let shape = ShapeRef::open(shape.bytes(), &base).unwrap();
-    let mut key = AnswerKey::new(&shape_key);
+    let shape = ShapeRef::open(held.bytes(), &base).unwrap();
+    // An answer is under its shape's bytes, wherever in the chain the shape is.
+    let mut key = AnswerKey::new(held.bytes());
     for fact in shape.facts() {
-        key.value(&s.facts.value(&s.db, def, fact).unwrap());
+        key.value(Digest::Is(s.facts.value(&s.db, def, fact).unwrap()));
     }
     let answer_key = key.finish();
     let at = record::answer_at(Step::Infer, &answer_key);
@@ -488,7 +490,11 @@ fn a_stored_inference_is_read_in_a_fresh_database_without_inferring() {
     assert_eq!(fresh.installed.steps(), hits, "this build's counts, before the flush");
     let flushed = fresh.installed.flush().unwrap();
     assert_eq!(flushed, Flushed { steps: hits, ..Flushed::default() }, "a hit offers nothing");
-    assert_eq!(fresh.installed.steps(), [StepCounts::default(); 3], "a flush takes the counts");
+    assert_eq!(
+        fresh.installed.steps(),
+        [StepCounts::default(); Step::COUNT],
+        "a flush takes the counts"
+    );
 }
 
 #[test]
@@ -908,7 +914,7 @@ fn two_shapes_of_one_base_key_flushed_at_once() -> Result<(), String> {
     store.commit();
     let mut taken = Vec::new();
     for (shape, value, answer) in &shapes {
-        let slot = (0..record::SLOTS).find(|&n| {
+        let slot = (0..blaze_record::Bounds::STANDARD.width()).find(|&n| {
             let at = record::shape_at(Step::Mir, &record::shape_key(&base, n));
             store.get(&at).unwrap().is_some_and(|kept| kept.bytes() == shape.as_slice())
         });
@@ -919,11 +925,11 @@ fn two_shapes_of_one_base_key_flushed_at_once() -> Result<(), String> {
             return Err(format!("two shapes in slot {n}"));
         }
         taken.push(n);
-        let mut key = AnswerKey::new(&record::shape_key(&base, n));
-        key.value(value);
+        let mut key = AnswerKey::new(shape);
+        key.value(Digest::Is(*value));
         let answer_key = key.finish();
         let Some(kept) = store.get(&record::answer_at(Step::Mir, &answer_key)).unwrap() else {
-            return Err(format!("no answer {answer:?} under its shape's slot {n}"));
+            return Err(format!("no answer {answer:?} under its shape, of slot {n}"));
         };
         if record::open_answer(kept.bytes(), &answer_key)? != *answer {
             return Err(format!("another answer than {answer:?} under its key"));
@@ -991,8 +997,10 @@ fn a_step_the_store_refuses_keeps_no_other_step_out() {
     let why = flushed.failure.expect("the refusal is named");
     assert!(why.contains("the answer of the inference of") && why.contains("FunctionId"), "{why}");
     store.commit();
-    let mut key = AnswerKey::new(&record::shape_key(&other, 0));
-    key.value(&value);
+    let mut shape = Vec::new();
+    record::write_shape(&mut shape, &other, &[IMPLS]);
+    let mut key = AnswerKey::new(&shape);
+    key.value(Digest::Is(value));
     let at = record::answer_at(Step::Infer, &key.finish());
     assert!(store.get(&at).unwrap().is_some(), "the other step's answer is kept");
 }

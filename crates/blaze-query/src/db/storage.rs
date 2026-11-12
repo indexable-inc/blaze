@@ -468,14 +468,26 @@ impl Storage {
     /// summary has; counted from the view it was verified in, or from the changed set's floor
     /// where that is later and holds the row ([`super::frontier::floor`]); or the changed
     /// set's walk of this view says it is unchanged ([`super::frontier::unreached`]).
+    ///
+    /// Each proof is counted to the row's ingredient under the branch that made it, the
+    /// first in this order (the validity census, [`counts::proved`]): a branch the census of
+    /// real builds shows unused is one to delete.
     #[inline]
     pub(crate) fn holds(&self, node: u32, row: &NodeRow, durability: u8, verified: u32) -> bool {
         // A row behind a seal that holds: one check of its group stood for every row of it
         // ([`super::seal`]).
         if self.seals.proves(node) {
+            counts::proved(key_parts(row.key()).0, counts::PROVED_SEAL);
             return true;
         }
         if self.unchanged_since(durability, verified) || self.inputs_unchanged(row, verified) {
+            // The census: which of the two proved it, asked again in their order.
+            let by = if self.unchanged_since(durability, verified) {
+                counts::PROVED_DURABILITY
+            } else {
+                counts::PROVED_SUMMARY
+            };
+            counts::proved(key_parts(row.key()).0, by);
             return true;
         }
         let floor = super::frontier::floor(self);
@@ -483,10 +495,17 @@ impl Storage {
             && (self.unchanged_since(durability, floor) || self.inputs_unchanged(row, floor))
             && super::frontier::floored(self, node)
         {
+            let by = if self.unchanged_since(durability, floor) {
+                counts::PROVED_FLOOR_DURABILITY
+            } else {
+                counts::PROVED_FLOOR_SUMMARY
+            };
+            counts::proved(key_parts(row.key()).0, by);
             return true;
         }
         // Or the changed set's walk of this view says so: it ended, or the row is outside
-        // its reach.
+        // its reach. It counts its own proofs ([`counts::PROVED_WALK_END`],
+        // [`counts::PROVED_REACH`]).
         super::frontier::unreached(self, node)
     }
 
