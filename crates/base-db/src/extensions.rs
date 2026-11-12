@@ -75,7 +75,14 @@ fn leading_attrs<'t>(text: &'t str, edition: Edition, mut each: impl FnMut(&[&st
     let lexed = LexedStr::new(edition, text);
     let tokens = (0..lexed.len()).filter(|&at| {
         let kind = lexed.kind(at);
-        !kind.is_trivia() && !matches!(kind, SyntaxKind::SHEBANG | SyntaxKind::FRONTMATTER)
+        // An inner doc comment (`//! ..`, `/*! .. */`) is a token of its own kind, not
+        // trivia, and stands where an inner attribute does: a root that opens with its docs
+        // still has its attributes read.
+        !kind.is_trivia()
+            && !matches!(
+                kind,
+                SyntaxKind::SHEBANG | SyntaxKind::FRONTMATTER | SyntaxKind::INNER_DOC_COMMENT
+            )
     });
     // alloc: as above, the indices of the non-trivia tokens
     let tokens: Vec<usize> = tokens.collect();
@@ -214,6 +221,11 @@ mod tests {
             // failure says which the reader does not take.
             ("#![allow(x)]\n#![blaze::edition = \"2026.11\"]", is.clone()),
             ("#![blaze :: edition = \"2026.11\"]\n", is.clone()),
+            // After the crate's own docs, which most roots open with.
+            ("//! docs\n/*! more */\n#![blaze::edition = \"2026.11\"]\nfn f() {}\n", is.clone()),
+            // An outer doc comment belongs to the item after it: what follows is no leading
+            // inner attribute.
+            ("/// of f\n#![blaze::edition = \"2026.11\"]\nfn f() {}\n", SaidBlazeEdition::None),
             // After a comment that is not a doc comment.
             ("// a comment\n#![blaze::edition = \"2026.11\"]\nfn f() {}\n", is.clone()),
             ("#![blaze::edition = \"2026.11\"]\n#![blaze::edition = \"2026.11\"]", is.clone()),
