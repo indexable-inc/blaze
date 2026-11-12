@@ -1,0 +1,11 @@
+{
+ "id": "A12",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "blaze: docs",
+ "what": "The `docs` and `invariants` scripts need a blaze that builds them, and main's Cargo.lock was out of date on macOS, so generated files (docs/README.md's index, invariants.md) were edited by hand by me and by four lanes.",
+ "cost": "small each time; a standing risk that the gate's check fails later",
+ "cause": "generated docs need a working self-build",
+ "workaround": "hand edit, say so in the PR",
+ "state": "open"
+}

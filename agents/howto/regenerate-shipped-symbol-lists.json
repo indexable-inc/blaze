@@ -1,0 +1,9 @@
+{
+ "id": "regenerate-shipped-symbol-lists",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane cross-1112",
+ "task": "Regenerate the symbol lists blaze-link ships (glibc by release, libSystem)",
+ "do": "glibc: put each release's sysdeps/unix/sysv/linux/{x86_64/64,aarch64}/*.abilist (older tags: .../nptl/, ports/...) under <dir>/<release>/<arch>/<lib>.abilist with <dir>/commits.json (release to tag commit, as crates/blaze-link/src/target/shipped/glibc-commits.json), then `blaze run -q -p scripts --bin cross -- '{\"command\": \"glibc-list\", \"abilists\": \"<dir>\", \"write\": true}'`. libSystem: on a Mac, `... '{\"command\": \"darwin-list\", \"sdk\": \"$(xcrun --sdk macosx --show-sdk-path)\", \"write\": true}'`, and set MACOS_SDK in target/shipped.rs to that SDK's version. Without `write` both compare and fail on a difference.",
+ "why": "The lists are bytes of the blaze binary and inputs of every link of Rust alone; a hand edit would not be reproducible. The files in the tree on 2026-11-12 were written by a Python prototype of the same algorithm, since a lane may not build: the first run of the Rust generator must show it writes the same bytes.",
+ "state": "current"
+}

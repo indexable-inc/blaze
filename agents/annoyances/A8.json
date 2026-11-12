@@ -1,0 +1,11 @@
+{
+ "id": "A8",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "blaze: profile",
+ "what": "An 80-minute build's profile kept only its last five minutes of task spans, so the question it was needed for could not be answered from it.",
+ "cost": "an answer I had to get from another run",
+ "cause": "files were retired by the newest build named in them",
+ "workaround": "query sooner; use another run",
+ "state": "fix written on all-1111 (763371a943), not yet exercised on a long build"
+}

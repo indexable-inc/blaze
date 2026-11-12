@@ -1,0 +1,11 @@
+{
+ "id": "redit-2",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+ "where": "blaze: `included files read again`",
+ "what": "The span said `files=2 moved=1` and the write it made woke `core`, `std` and `gimli`'s name resolution, with nothing naming the file or what was read of it before.",
+ "cost": "an instrumented build to learn it was `OUT_DIR/private.rs` of thiserror, read as `No such file` before its build script ran",
+ "cause": "a write that names a count, not the thing (rule 19)",
+ "workaround": "none needed",
+ "state": "fixed on redit-1111 (3a569448e4: an event a moved file with its path, what was read and what is read now)"
+}

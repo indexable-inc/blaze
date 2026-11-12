@@ -1,0 +1,11 @@
+{
+ "id": "A30",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "blaze: no-op lane",
+ "what": "With `BLAZE_HOME=/tmp/…` on macOS (`/tmp` is a symlink to `/private/tmp`) the daemon's no-op lane is disabled by design and says nothing, so every `build` and `run` I measured all afternoon was a full walk.",
+ "cost": "every blaze number I reported before 18:40 PST was 2 to 10 times too slow on the no-op rows",
+ "cause": "a path through a symlink is not vouched for; nothing reports that the lane is off",
+ "workaround": "use `/private/tmp/…`",
+ "state": "open: say so once per daemon, or resolve the path"
+}

@@ -1279,23 +1279,12 @@ impl ToolchainFailed {
         )
     }
 
-    /// The job's report of the item: an error of no unit, its text the item, its crate and why,
-    /// then each of the front end's errors of its body as rustc writes them, each its child.
-    /// Its files' text is added to `sources`, and what the database had none of is read
-    /// through `mounted`. The same for every unit that reaches the item, so the job, which says
-    /// a diagnostic of no unit once, says it once.
-    pub(crate) fn report(
-        &self,
-        sources: &mut blaze_diagnostics::emit::Sources,
-        mounted: &Mounted,
-        style: blaze_diagnostics::emit::Style,
-        color: bool,
-    ) -> Result<blaze_api::Diagnostic, String> {
-        for (name, text) in &self.sources {
-            // clone: a file of the error path, once per unit that reaches the item
-            sources.add(name, Some(text.clone()));
-        }
-        mounted.add_sources(sources, &self.diags);
+    /// The job's report of the item, as a unit's record keeps it ([`drawn::Item::Toolchain`]):
+    /// an error of no unit, its text the item, its crate and why, then each of the front end's
+    /// errors of its body, each its child once drawn; with the text of each file they point
+    /// into as the database has it, which the record keeps too. The same for every unit that
+    /// reaches the item, so the job, which says a diagnostic of no unit once, says it once.
+    pub(crate) fn report(&self) -> (super::drawn::Item, &[(String, String)]) {
         let after = match self.diags.len() {
             0 => "the front end reports no error of its body, so the fault is blaze's",
             1 => "the front end's error of its body follows",
@@ -1307,20 +1296,8 @@ impl ToolchainFailed {
              unit that calls it is built (said once a build): {}\n  {after}",
             self.path, self.krate, self.why,
         );
-        let mut report = super::say::refused(message, None, color);
-        for diag in &self.diags {
-            let it =
-                blaze_diagnostics::api::diagnostic(diag, sources, style, None).map_err(|why| {
-                    // alloc: the error path
-                    format!(
-                        "{why}, in the front end's error `{}` of `{}` in `{}`",
-                        diag.message, self.path, self.krate
-                    )
-                })?;
-            report.rendered.push_str(&it.rendered);
-            report.children.push(it);
-        }
-        Ok(report)
+        // clone: the error path, the front end's errors of one body
+        (super::drawn::Item::Toolchain { message, diags: self.diags.clone() }, &self.sources)
     }
 }
 

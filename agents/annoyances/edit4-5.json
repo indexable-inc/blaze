@@ -1,0 +1,11 @@
+{
+ "id": "edit4-5",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+ "where": "blaze: the CPU samples of an edit",
+ "what": "`link patch` took 8.6 ms of every edit and the profile's sampler had 6 on-CPU samples in it over 30 edits: nothing said which step of a stage the time was in.",
+ "cost": "the fix was designed before the time was located (`.rela.dyn` turned out to be about 2 of the 8.6 ms)",
+ "cause": "a stage had one span; the sampler's rate is for long builds",
+ "workaround": "added a span a step (`link stage: apply the change`, `place`, `relocate`, `lists`, `the writer's tables`, `the writer's file`, `the ranges written`)",
+ "state": "fixed on edit4-1111 (the spans); what they say: `lists` 3.3 ms and `apply the change` 1.8 to 2.5 ms are each a pass over the image"
+}

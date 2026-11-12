@@ -1,0 +1,11 @@
+{
+ "id": "A6",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "blaze: daemon",
+ "what": "A rebuilt blaze cannot stop the previous build's daemon (`speaks API schema 49, this blaze 50`), so every rebuild needs `pgrep` and `kill` by pid.",
+ "cost": "a minute per rebuild, dozens of rebuilds",
+ "cause": "`stop` goes through the versioned API",
+ "workaround": "kill by pid",
+ "state": "open: `stop` should work across schema versions"
+}

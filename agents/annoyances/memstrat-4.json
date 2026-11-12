@@ -1,0 +1,11 @@
+{
+ "id": "memstrat-4",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+ "where": "Relax on Linux arm64",
+ "what": "Relax at its main (c98d396e) does not build on Linux aarch64: 17 errors in relax-compiler (`inspect::cfi::Foreign` and others not found). Its README names Linux x86-64 and macOS arm64.",
+ "cost": "no Relax numbers on the VM; Relax and blaze were compared on the Mac instead",
+ "cause": "an unported module",
+ "workaround": "measured both on the Mac",
+ "state": "accepted"
+}

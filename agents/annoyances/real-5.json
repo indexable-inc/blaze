@@ -1,0 +1,11 @@
+{
+ "id": "real-5",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane real-1111",
+ "where": "blaze: tests under cargo",
+ "what": "Tests that had never compiled under cargo (`hir-ty-codegen` wasm lowering tests, `blaze-link` `tests.rs:1797`, a duplicate call in `blaze-macro-eval`'s wasm tests) and a control that failed since it was written (`the_oracle_catches_a_given_crate_whose_root_runs_again_only_for_its_log`).",
+ "cost": "a detour in four fixes",
+ "cause": "landed by lanes that could not build or run them",
+ "workaround": "fixed each where met",
+ "state": "fixed where met; unrun tests landing is open"
+}
