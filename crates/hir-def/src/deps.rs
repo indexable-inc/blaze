@@ -23,7 +23,6 @@
 //! unchanged. The key has no absolute path in it ([`key`]), so a checkout at another path, or
 //! another machine through the global cache ([`ReadThrough`]), finds the same image.
 
-pub mod awaited;
 mod filed;
 mod image;
 mod key;
@@ -45,10 +44,8 @@ pub use crate::deps::{
     image::{Held, IMAGE_SCHEMA, ImageBuf, ImageError, ImageRef, Part, PartBytes, write_image},
     key::{KEY_DOMAIN, KeyInputs, KeyWalk, PRODUCER, absolute, eligible, key_inputs, keys},
     reads::{READS_DOMAIN, Reads, SLOTS, image_key, slot},
-    awaited::{any_awaited, await_added, await_crates, awaits_added, is_awaited, release},
     serve::{
-        ImageStore, PAGES_DOMAIN, ReadThrough, Refused, Served, Stored, pages_key, serve,
-        serve_asked, store,
+        ImageStore, PAGES_DOMAIN, ReadThrough, Refused, Served, Stored, pages_key, serve, store,
     },
 };
 pub use crate::nameres::frozen::Mode;

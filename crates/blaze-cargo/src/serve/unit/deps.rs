@@ -164,14 +164,7 @@ pub(crate) fn images(
     mode: Mode,
 ) -> Result<Option<Served>, ApiError> {
     let at = lowered.db().nonce_and_revision();
-    // While a crate of the front end is awaited (`hir_def::deps::awaited`: added, its records
-    // not asked for yet), every serve releases what it is asked about, whether or not a key
-    // moved: a crate with no key (a workspace member) is only ever released this way.
-    let awaiting = lowered.any_awaited();
     if session.walked.covers(at, build, crates) {
-        if awaiting {
-            release(lowered, crates, build, session, mode)?;
-        }
         return Ok(None);
     }
     // The crates this walk is the first to key at this view, and their dependencies: those
@@ -225,13 +218,10 @@ pub(crate) fn images(
     if moved.is_empty() {
         // `keyed` holds every key walked already.
         session.walked.note(at, build, crates.iter().chain(keys.keys()));
-        if awaiting {
-            release(lowered, crates, build, session, mode)?;
-        }
         return Ok(None);
     }
     moved.sort_unstable();
-    let served = match lowered.serve_deps(crates, &moved, build, &*session.images, mode) {
+    let served = match lowered.serve_deps(&moved, build, &*session.images, mode) {
         Ok(served) => served,
         Err(error) => {
             // The walk keyed crates `keyed` does not hold: nothing of it is kept, so the next
@@ -256,28 +246,6 @@ pub(crate) fn images(
         stale: stale.into_iter().filter(of_moved).collect(),
         build,
     }))
-}
-
-/// Releases `asked` and what they depend on from the front end's awaited crates with nothing
-/// fetched ([`Lowered::serve_deps`] with no crate to fetch): what a serve that found no key
-/// moved still owes the crates it was asked about. Each released crate gets its first run in
-/// that write; nothing is written, and the view stands, when none of them was awaited.
-fn release(
-    lowered: &mut Lowered,
-    asked: &[Crate],
-    build: ContentId,
-    session: &mut Session,
-    mode: Mode,
-) -> Result<(), ApiError> {
-    let before = lowered.db().nonce_and_revision();
-    lowered.serve_deps(asked, &[], build, &*session.images, mode).map_err(super::lower_error)?;
-    let now = lowered.db().nonce_and_revision();
-    if now != before && session.walked.at == Some((before.0, before.1, build)) {
-        // The release wrote the awaited set alone, which is no input of a key: the keys
-        // walked at the view before it stand at the view it leaves.
-        session.walked.at = Some((now.0, now.1, build));
-    }
-    Ok(())
 }
 
 /// Each crate of `units` that `keyed` has a key of (an eligible dependency), once, with the lint
@@ -637,30 +605,6 @@ pub(crate) fn store(
         None => None,
     };
     let db = lowered.db();
-    // The front-end records of the toolchain's own crates and of bstd (each crate's image and
-    // its def map pages) are handed to the store's collector to pin, as their unit records
-    // are (`compile::pin_kept`): kept whatever their last use (docs/gc.md). On use, not only
-    // on write: a crate whose image this build found is queued as one it wrote is, so a store
-    // filled by an earlier blaze, or imported, has them pinned by the first build that reads
-    // them. Queuing a key a pin already names writes nothing (`Collects::build_ended`).
-    let found = kept.iter().flat_map(|kept| &kept.served.hits).filter_map(|krate| {
-        Some((*krate, cache::image_key(db, *krate)?))
-    });
-    let wrote = stored.iter().flat_map(|stored| &stored.filed).map(|(krate, filed)| (*krate, *filed));
-    for (krate, filed) in found.chain(wrote) {
-        let name = match &krate.data(db).origin {
-            base_db::CrateOrigin::Lang(_) => crate::serve::collect::TOOLCHAIN,
-            base_db::CrateOrigin::Local { name: Some(name), .. }
-            | base_db::CrateOrigin::Library { name, .. }
-                if name.as_str() == "bstd" =>
-            {
-                crate::serve::collect::BSTD
-            }
-            _ => continue,
-        };
-        let keys = [blaze_cas::Key(filed), blaze_cas::Key(hir_def::deps::pages_key(filed))];
-        crate::serve::collect::keep(name, keys.into_iter());
-    }
     // Each stage's puts taken as it ends, so each says what it is in an error ([`KeptPut`]).
     let mut puts = Vec::new(); // alloc: once per front end stored, one per value put
     // alloc: once per front end stored, one per image written
@@ -1080,11 +1024,6 @@ struct InPool {
     store: blaze_cas::Reader,
     key: Key,
     len: u64,
-    /// Keeps the record from the store's collector while a database reads it: its flags of
-    /// use last two periods and its pack's age an hour, and a database may read no part for
-    /// longer. Taken as the record is found, which is during the build that serves its crate
-    /// (`blaze_cas::collect::Keep`'s rule).
-    _kept: blaze_cas::collect::Keep,
 }
 
 impl hir_def::deps::PageSource for InPool {
@@ -1100,8 +1039,9 @@ impl hir_def::deps::PageSource for InPool {
                 with(bytes);
                 Ok(())
             }
-            // A record that was there when its crate was served and is not now, though this
-            // holds a keep of it: a bug in the collector or the keep. Said, never read as empty.
+            // A record that was there when its crate was served and is not now: the store's
+            // collector took it while a database reads it, which a pin of the crate's records
+            // prevents. Said, never read as empty.
             // alloc: error path
             Ok(None) => Err(format!("the store no longer holds {:?}", self.key.0)),
             Err(corrupt) => Err(corrupt.to_string()),
@@ -1123,8 +1063,7 @@ impl ImageStore for Images {
             Ok(Some(entry)) => {
                 let len = entry.bytes.len() as u64;
                 // clone: a count of the store's reader; alloc: one holder per crate read from pages
-                let _kept = self.store.keep(Key(*key));
-                Ok(Some(Arc::new(InPool { store: self.store.clone(), key: Key(*key), len, _kept })))
+                Ok(Some(Arc::new(InPool { store: self.store.clone(), key: Key(*key), len })))
             }
             Ok(None) => Ok(None),
             Err(corrupt) => Err(corrupt.to_string()),
