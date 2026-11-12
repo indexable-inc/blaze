@@ -13,9 +13,9 @@
 //! under one named lock a program; frames are queued to a launcher's writer under that lock,
 //! so a launcher is written what the core decided, in the order it decided it.
 //!
-//! A launched program's unit is built by every build that reaches it, never replayed from
-//! its record ([`never_replayed`]), so the core holds the code of exactly the build that
-//! answered. A launcher started by hand against a daemon that holds none of it (a file from
+//! A launched program's unit is replayed from its record only where the core holds the code
+//! of the build that record is of, and is built otherwise ([`not_replayed`]), so the core
+//! holds the code of exactly the build that answered. A launcher started by hand against a daemon that holds none of it (a file from
 //! before the daemon restarted, and no build since) stops and says so.
 //!
 //! Not built, each a refusal by name and never a quiet path: test binaries, which stay dev
@@ -68,22 +68,24 @@ pub(crate) fn launched(job: &Job, unit: usize, policy: &Policy) -> Result<bool, 
     Ok(codegen::triple(job, u) == job.input.config.host)
 }
 
-/// Whether `unit`, whose kept record names `outputs` (path, key, whether it is executable),
-/// is a launcher's program, whose record is never replayed: the unit is built, so that the
-/// program's core holds the code of exactly this build before a launcher asks for it.
+/// Whether `unit`, whose kept record names `outputs` (path, key, whether it is executable)
+/// and whose whole record key is `key` now, is a launcher's program whose record must not be
+/// replayed: the unit is then built, so that the program's core holds the code of exactly
+/// this build before a launcher asks for it.
 ///
 /// A record says which file a build made, and a launched program's file is the launcher's,
-/// the same bytes for every build of it: replaying a record would leave the core on the
-/// code of whatever build it was last given (a source edited and then put back replays the
-/// first build's record while the core holds the second's, and the program ran the second's:
-/// found by the measurement's check of its output, 2026-11-12), or on none after the daemon
-/// restarted. What the build costs is its codegen's walk over what is kept; nothing is
-/// compiled again. `false` with [`VAR`] off, for a unit that makes no program, and for one
-/// built any other way.
-pub(crate) fn never_replayed(
+/// the same bytes for every build of it: a replay gives the core nothing. So a record is
+/// replayed only where the core already holds the code of the build that record is of: the
+/// program's last launch link was of a build with this same record key (a key covers every
+/// input of its unit, rule keys-cover-every-input). A source edited and then put back has
+/// the first build's key while the core holds the second's (found by the measurement's check
+/// of its output, 2026-11-12); a daemon that restarted holds none. `false` with [`VAR`] off,
+/// for a unit that makes no program, and for one built any other way.
+pub(crate) fn not_replayed(
     job: &Job,
     unit: usize,
     outputs: &[(String, blaze_cas::Key, bool)],
+    key: Option<blaze_cas::Key>,
 ) -> Result<bool, String> {
     if !on() || !outputs.iter().any(|it| it.2) {
         return Ok(false);
@@ -94,7 +96,15 @@ pub(crate) fn never_replayed(
     }
     let plan = job.plan(unit).map_err(|it| it.what)?;
     let made = super::super::artifact::made(plan);
-    Ok(outputs.iter().any(|(path, _, executable)| *executable && made.contains(&path.as_str())))
+    let programs = job.shared.launches.programs.pin();
+    Ok(outputs.iter().any(|(path, _, executable)| {
+        *executable
+            && made.contains(&path.as_str())
+            && !programs.get(&program_id(path)).is_some_and(|held| {
+                let core = held.core.lock();
+                key.is_some() && core.record == key
+            })
+    }))
 }
 
 /// One program this daemon built for a launcher, and the launchers running it.
@@ -110,6 +120,9 @@ struct Core {
     writers: Vec<(Conn, Sender<Vec<u8>>)>,
     /// The serial of the span tables the program was last given (`LinkInputs::serial`).
     spans: Option<u64>,
+    /// The whole record key of the unit's build the program was last given: the build whose
+    /// code the core holds ([`not_replayed`]).
+    record: Option<blaze_cas::Key>,
 }
 
 /// The daemon's launcher programs, by id, and the socket their launchers connect to: made
@@ -202,6 +215,7 @@ impl Launches {
         path: &str,
         built: &Built,
         entry: &str,
+        record: Option<blaze_cas::Key>,
         tables: impl FnOnce(Option<u64>) -> Result<(u64, Given), String>,
     ) -> Result<Vec<Told>, String> {
         let id = program_id(path);
@@ -215,7 +229,7 @@ impl Launches {
                     core: Lock::new(
                         "serve.launches.program",
                         // alloc: once per program, its tables
-                        Core { program: Program::new(), writers: Vec::new(), spans: None },
+                        Core { program: Program::new(), writers: Vec::new(), spans: None, record: None },
                     ),
                 });
                 self.programs.pin().insert(id, Arc::clone(&made));
@@ -226,6 +240,9 @@ impl Launches {
         // is queued to each launcher's writer under it, so the order of frames is the order
         // of decisions.
         let mut core = held.core.lock();
+        // Until this build is the core's, no record is the core's: a failure below leaves
+        // the next build to be made, never replayed.
+        core.record = None;
         let (serial, given) = tables(core.spans)?;
         let told = match &given {
             Given::Whole(all) => core.program.built(built, entry, Tables::Whole(all)),
@@ -237,6 +254,7 @@ impl Launches {
         }
         .map_err(|why| format!("{}: {why}", held.path))?;
         core.spans = Some(serial);
+        core.record = record;
         let mut what = Vec::with_capacity(told.len()); // alloc: once a build
         for (conn, frames, said) in told {
             if let Some((_, writer)) = core.writers.iter().find(|it| it.0 == conn)
@@ -437,6 +455,7 @@ pub(crate) fn sidecar_of(path: &str) -> String {
 /// are handed back for the loop to place.
 pub(crate) fn link(
     job: &Job,
+    unit: usize,
     path: &str,
     generated: &codegen::Generated<'_>,
 ) -> Result<Linked, String> {
@@ -445,7 +464,8 @@ pub(crate) fn link(
     let socket = launches.listen()?;
     let (file, key) = launches.launcher(&job.shared.launcher, path)?;
     let first = launches.programs.pin().get(&program_id(path)).is_none();
-    let told = launches.built(path, generated.built, "main", |held| {
+    let record = super::super::compile::record_key(job, unit).map_err(|it| it.what)?;
+    let told = launches.built(path, generated.built, "main", record, |held| {
         // What `LinkInputs` says, against the snapshot the program holds: the same snapshot
         // (nothing changed), a change of it, every table made anew (`work.whole`), or a
         // snapshot the program does not hold, when every table is asked for.

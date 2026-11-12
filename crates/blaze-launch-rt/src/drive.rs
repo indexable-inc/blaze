@@ -427,7 +427,7 @@ impl Driver {
                     if got != range.len {
                         return Err(Error::Length { txn, slot, said: range.len, got });
                     }
-                    self.code.write(self.area + range.at as usize, &self.scratch)?;
+                    self.code.copy(self.area + range.at as usize, &self.scratch)?;
                     records
                         .placed(base + range.at, range.len)
                         .map_err(|why| Error::Record { txn, slot, why })?;
@@ -436,7 +436,7 @@ impl Driver {
                 // the zeroes the mapping began with; they are written all the same, so the
                 // gate does not rest on that.
                 Write::Gate { range, .. } => {
-                    self.code.write(self.area + range.at as usize, &[0; 8])?;
+                    self.code.copy(self.area + range.at as usize, &[0; 8])?;
                 }
                 Write::GateEntry { gate, entry, old, new } => {
                     let offset = gate.at + GATE_HEAD + u64::from(entry) * GATE_ENTRY;
@@ -444,7 +444,7 @@ impl Driver {
                     let old = self.address(slot, old) as u64;
                     let code = arch::gate_entry(base + offset, base + gate.at, old, base + new.at)
                         .map_err(Error::Reach)?;
-                    self.code.write(self.area + offset as usize, &code)?;
+                    self.code.copy(self.area + offset as usize, &code)?;
                 }
                 write @ (Write::Slot { .. }
                 | Write::Commit { .. }
@@ -455,6 +455,8 @@ impl Driver {
                 }
             }
         }
+        // Once for the whole edit, before the commit stores a word that names any of it.
+        self.code.settle()?;
         Ok(())
     }
 

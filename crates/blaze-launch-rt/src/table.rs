@@ -163,6 +163,18 @@ impl Shared {
         self.bell.put(());
     }
 
+    /// Puts `event` on the queue without ringing: for a run of events one [`Shared::ring`]
+    /// follows (the frames of one read of the daemon's socket: a launcher's start is some
+    /// two hundred frames, and a wake of the control thread for each was most of its time).
+    pub(crate) fn push(&self, event: Event) {
+        self.queue.push(event);
+    }
+
+    /// Rings the control thread's bell for what [`Shared::push`] queued.
+    pub(crate) fn ring(&self) {
+        self.bell.put(());
+    }
+
     /// The next event, when one is there.
     pub(crate) fn next(&self) -> Option<Event> {
         self.queue.pop()

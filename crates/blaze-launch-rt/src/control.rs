@@ -200,29 +200,41 @@ pub fn run(
     control.end(reader)
 }
 
-/// The reader thread: every whole frame of `from` onto the queue, then why it ended.
+/// The reader thread: every whole frame of `from` onto the queue, then why it ended. The
+/// frames of one read are queued together and the control thread is woken once for them.
 fn read(mut from: UnixStream, shared: &Shared) {
     // alloc: the socket's bytes not yet a whole frame; one buffer for the thread's life.
     let mut bytes = Vec::new();
-    let mut chunk = [0u8; 4096];
+    // alloc: one read's bytes; on the heap, as a reader thread's stack need not hold it.
+    let mut chunk = vec![0u8; 256 << 10];
     let why = loop {
-        let (item, took) = match wire::split(&bytes) {
-            Ok(Some((item, took))) => (item.to_vec(), took),
-            Ok(None) => {
-                // The wait: for the daemon's next bytes. It ends when the daemon writes,
-                // closes, or the control thread shuts the socket down to stop.
-                match from.read(&mut chunk) {
-                    Ok(0) => break "the daemon closed it".to_owned(),
-                    Ok(got) => bytes.extend_from_slice(&chunk[..got]),
-                    Err(why) if why.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(why) => break format!("read failed: {why}"),
+        // Every whole frame that is here.
+        let mut at = 0;
+        let refused = loop {
+            match wire::split(&bytes[at..]) {
+                Ok(Some((item, took))) => {
+                    shared.push(Event::Frame(item.to_vec())); // alloc: one message of the daemon's
+                    at += took;
                 }
-                continue;
+                Ok(None) => break None,
+                Err(why) => break Some(format!("a frame was refused: {why}")),
             }
-            Err(why) => break format!("a frame was refused: {why}"),
         };
-        drop(bytes.drain(..took));
-        shared.send(Event::Frame(item));
+        if at > 0 {
+            drop(bytes.drain(..at));
+            shared.ring();
+        }
+        if let Some(why) = refused {
+            break why;
+        }
+        // The wait: for the daemon's next bytes. It ends when the daemon writes, closes, or
+        // the control thread shuts the socket down to stop.
+        match from.read(&mut chunk) {
+            Ok(0) => break "the daemon closed it".to_owned(),
+            Ok(got) => bytes.extend_from_slice(&chunk[..got]),
+            Err(why) if why.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(why) => break format!("read failed: {why}"),
+        }
     };
     shared.send(Event::Closed(why));
 }

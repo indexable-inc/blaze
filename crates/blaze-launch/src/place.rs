@@ -83,15 +83,19 @@ impl<A: Allocator> Pool<A> {
 
 /// Lays out the pool of `record`, a function's: one entry for each distinct thing a fixup
 /// reaches through a word that is not a function's slot word, in the order of the fixups.
-pub fn pool<A: Allocator>(record: &Record<'_>, alloc: A) -> Result<Pool<A>, PlaceError> {
+pub fn pool<A: Allocator + Clone>(record: &Record<'_>, alloc: A) -> Result<Pool<A>, PlaceError> {
     if record.what != What::Code {
         return Err(PlaceError { at: None, what: "a static's record placed as code", value: 0 });
     }
+    // Which places are functions, read once: a list in a record is read item by item.
+    // clone: the allocator's handle, for a second list of the same lifetime
+    let mut functions = Vec::with_capacity_in(record.places.len(), alloc.clone());
+    functions.extend(record.places.iter().map(|it| it == Place::Function));
     let mut pool = Pool { entries: Vec::new_in(alloc), len: record.size.next_multiple_of(8) };
     for fixup in record.fixups.iter() {
         let through = fixup.kind.through();
         let function = match fixup.to {
-            To::Place(place) => record.places.iter().nth(place as usize) == Some(Place::Function),
+            To::Place(place) => functions.get(place as usize).copied().unwrap_or(false),
             To::Data(_) | To::Own => false,
         };
         let bytes = match through {

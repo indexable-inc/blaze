@@ -227,6 +227,17 @@ impl Code {
         Ok(())
     }
 
+    /// As [`Code::write`]: on macOS `sys_icache_invalidate` is all a write needs, so there
+    /// is nothing to put off.
+    pub fn copy(&mut self, at: usize, bytes: &[u8]) -> Result<(), SysError> {
+        self.write(at, bytes)
+    }
+
+    /// Nothing: [`Code::copy`] is a whole write here.
+    pub fn settle(&mut self) -> Result<(), SysError> {
+        Ok(())
+    }
+
     /// Gives the memory of whole pages back to the system. Their addresses stay reserved and
     /// are never used again (the core hands an offset out once).
     pub fn decommit(&mut self, at: usize, len: usize) -> Result<(), SysError> {
@@ -360,11 +371,32 @@ impl Code {
             unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), to.add(at), bytes.len()) };
         });
         #[cfg(target_arch = "aarch64")]
-        {
-            linux::icache(self.base() + at, bytes.len());
-            if !linux::membarrier(linux::PRIVATE_EXPEDITED_SYNC_CORE) {
-                return Err(failed("membarrier(PRIVATE_EXPEDITED_SYNC_CORE)", at, bytes.len()));
-            }
+        linux::icache(self.base() + at, bytes.len());
+        self.settle()
+    }
+
+    /// [`Code::write`] without its last step: the bytes are in memory and the instruction
+    /// caches were told, and no core has yet been made to drop what it fetched before. For
+    /// several writes of one edit, each of bytes nothing names: the caller calls
+    /// [`Code::settle`] once after the last, before any word names what was written. (One
+    /// `membarrier` a function made a launcher's start of 210 functions 210 system calls.)
+    pub fn copy(&mut self, at: usize, bytes: &[u8]) -> Result<(), SysError> {
+        self.within("write", at, bytes.len())?;
+        self.writable(|to| {
+            // SAFETY: as `write`'s copy.
+            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), to.add(at), bytes.len()) };
+        });
+        #[cfg(target_arch = "aarch64")]
+        linux::icache(self.base() + at, bytes.len());
+        Ok(())
+    }
+
+    /// Every core runs what [`Code::copy`] wrote from here on: on AArch64,
+    /// `membarrier(PRIVATE_EXPEDITED_SYNC_CORE)`; on x86-64 nothing is needed.
+    pub fn settle(&mut self) -> Result<(), SysError> {
+        #[cfg(target_arch = "aarch64")]
+        if !linux::membarrier(linux::PRIVATE_EXPEDITED_SYNC_CORE) {
+            return Err(failed("membarrier(PRIVATE_EXPEDITED_SYNC_CORE)", 0, 0));
         }
         Ok(())
     }

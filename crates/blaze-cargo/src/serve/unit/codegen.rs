@@ -2408,7 +2408,7 @@ fn launched(
     generated: &Generated<'_>,
 ) -> Result<LinkMade, String> {
     use blaze_launch_host::Told;
-    let linked = super::run::launch::link(job, path, generated)?;
+    let linked = super::run::launch::link(job, unit, path, generated)?;
     let whole = |bytes: &[u8]| blaze_cas::Sparse {
         len: bytes.len() as u64,
         runs: vec![(0, bytes.to_vec())], // alloc: the file's one run, once a link

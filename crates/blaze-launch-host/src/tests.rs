@@ -146,8 +146,8 @@ struct Launcher {
     inbound: VecDeque<u8>,
     /// Its messages, not yet read by the daemon.
     outbound: VecDeque<Vec<u8>>,
-    /// The records given since the last edit.
-    held: Vec<RecordId>,
+    /// The records given since the last edit, with their bytes.
+    held: Vec<(RecordId, Vec<u8>)>,
     declared: u32,
     /// By slot: the record bound.
     bound: Vec<Option<RecordId>>,
@@ -160,6 +160,30 @@ struct Launcher {
 }
 
 impl Launcher {
+    /// Holds a bind or a definition to what a real launcher refuses it for: its record was
+    /// given, it has a number for each numbered place, and each function it names has a slot
+    /// this launcher was told to declare.
+    fn named(&self, record: RecordId, refs: impl Iterator<Item = u32>) {
+        use blaze_launch::record::{Place, Record};
+        let Some((_, bytes)) = self.held.iter().find(|it| it.0 == record) else {
+            panic!("a record that was not given is named");
+        };
+        let record = Record::decode(bytes).expect("a record");
+        let refs: Vec<u32> = refs.collect();
+        let numbered: Vec<Place<'_>> = record.places.iter().filter(Place::numbered).collect();
+        assert_eq!(refs.len(), numbered.len(), "`{}`: numbers for its places", record.name);
+        for (place, number) in numbered.iter().zip(&refs) {
+            if *place == Place::Function {
+                assert!(
+                    *number < self.declared,
+                    "`{}` names slot {number}, and this launcher declared {}",
+                    record.name,
+                    self.declared
+                );
+            }
+        }
+    }
+
     fn say(&mut self, ask: &Ask<'_>) {
         let mut frame = Vec::new();
         ask.encode(1, &mut frame).expect("fits a frame");
@@ -178,10 +202,10 @@ impl Launcher {
                 self.declared = slots;
                 self.bound.resize(slots as usize, None);
             }
-            Tell::Record { id, .. } => self.held.push(id),
+            Tell::Record { id, bytes } => self.held.push((id, bytes.to_vec())),
             Tell::Statics { defs } => {
                 for def in defs.iter() {
-                    assert!(self.held.contains(&def.record), "a static's record was not given");
+                    self.named(def.record, def.refs.iter());
                 }
                 self.held.clear();
             }
@@ -189,11 +213,8 @@ impl Launcher {
                 self.declared += declare;
                 self.bound.resize(self.declared as usize, None);
                 for bind in binds.iter() {
-                    assert!(self.held.contains(&bind.record), "an edit binds a record not given");
                     assert!(bind.slot.0 < self.declared, "an edit binds a slot not declared");
-                    for slot in bind.refs.iter() {
-                        assert!(slot < self.declared.max(u32::MAX), "a bind names nothing");
-                    }
+                    self.named(bind.record, bind.refs.iter());
                     self.bound[bind.slot.0 as usize] = Some(bind.record);
                     self.waiting.retain(|it| *it != bind.slot.0);
                 }
@@ -413,16 +434,17 @@ fn no_schedule_leaves_a_launcher_on_code_of_an_old_build(tc: TestCase) {
     }
 }
 
-/// The schedules that show each planted bug: a launcher bound, then an edit.
+/// The schedules that show each planted bug: a launcher whose entry (slot 0, the one slot a
+/// launcher has before it calls anything) is bound, then an edit.
 fn bound_then(edit: Op) -> Vec<Op> {
-    vec![Op::Connect, Op::Heard(0), Op::Read(0), Op::Read(0), Op::Read(0), Op::Read(0), Op::Read(0), Op::Need(0, 1), Op::Heard(0), edit]
+    vec![Op::Connect, Op::Heard(0), Op::Read(0), Op::Read(0), Op::Read(0), Op::Read(0), Op::Read(0), Op::Need(0, 0), Op::Heard(0), edit]
 }
 
 /// The control: a daemon that rebinds nothing at a build leaves a launcher on the old body,
 /// and the oracle says so.
 #[test]
 fn the_oracle_catches_a_build_that_rebinds_nothing() {
-    let ops = bound_then(Op::OneBody(1));
+    let ops = bound_then(Op::OneBody(0));
     assert_eq!(run(&ops, Plant::None), Ok(()));
     let caught = run(&ops, Plant::NoRebind).unwrap_err();
     assert!(caught.contains("not the newest build's"), "{caught}");
@@ -436,6 +458,18 @@ fn the_oracle_catches_two_changed_bodies_sent_as_an_edit() {
     assert_eq!(run(&ops, Plant::None), Ok(()));
     let caught = run(&ops, Plant::NoRestart).unwrap_err();
     assert!(caught.contains("cannot take live"), "{caught}");
+}
+
+/// The control: a daemon that counts the slots an edit declares before its records name
+/// their callees binds a record that names a slot the launcher has not declared (found on a
+/// real program, 2026-11-12, when slots began to be given on first reference), and the model
+/// launcher refuses it as a real one does.
+#[test]
+fn the_oracle_catches_an_edit_that_declares_before_its_records_name() {
+    let ops = bound_then(Op::Need(0, 0));
+    assert_eq!(run(&ops, Plant::None), Ok(()));
+    let caught = std::panic::catch_unwind(|| run(&ops, Plant::DeclareFirst));
+    assert!(caught.is_err(), "a bind that names an undeclared slot was taken");
 }
 
 /// What a build is classified as, one case each (the table in `program`'s documentation).
