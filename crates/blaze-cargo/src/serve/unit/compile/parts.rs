@@ -5,8 +5,9 @@
 //! A unit made records each thing it read of a crate below it as a [`Part`] with the value
 //! it had ([`Parts`]). Its record is filed under its own inputs and those parts; a lookup
 //! works each part's value out again and finds the record only when none moved
-//! ([`Parts::check`]). A part is a fact of the item store's vocabulary
-//! ([`blaze_items::Fact`]): a signature for a call, a layout for a type used by value, a body
+//! ([`Parts::check`]). A part is a fact in the item store's one form ([`FactRef`]: a kind, a
+//! subject and an object; lane items' kinds, `blaze_items::kinds`, and the item store's own,
+//! `blaze_item_hash::values::kinds`): a signature for a call, a layout for a type used by value, a body
 //! for a copy compiled, a constant's value, the impls a trait was selected through, what a
 //! name resolved to in a scope. The last two are asked of indexes, so a read that found
 //! nothing is a part too (a name not in a glob's set, no impl of a trait for a type) and an
@@ -23,7 +24,9 @@
 //! built; nothing calls this yet but its tests.
 
 use blaze_ids::{ContentId, Hasher};
-use blaze_items::{Fact, ItemKey};
+use blaze_items::ItemKey;
+use blaze_query::QueryKind;
+use hir_ty::next_solver::goal_store::{FactObject, FactRef};
 use serde::{Deserialize, Serialize};
 
 /// The record's layout, in its bytes and in [`Parts::filed`]'s domain: bumped by hand on any
@@ -39,10 +42,12 @@ pub(crate) const MOST_PARTS: usize = 1 << 20;
 
 /// One thing a unit read of a crate below it.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[serde(into = "PartRow", try_from = "PartRow")]
 pub(crate) enum Part {
-    /// A fact of an item or of an index, as the item store names what a step read. Its value
-    /// has no position in it.
-    Fact(Fact),
+    /// A fact of an item or of an index, in the form the item store names what a step read
+    /// by, so a body's entry and a unit's parts are one vocabulary. Its value
+    /// (`blaze_item_hash::values::value`) has no position in it.
+    Fact(FactRef),
     /// Where an item's code is written: its span table, by the item's key. Read by a unit
     /// that compiles a copy of the item (a generic, an `#[inline]` function), builds it into
     /// its own code, or links it: what a panic's location and debug info are made from.
@@ -57,8 +62,66 @@ impl Part {
     fn in_surface(&self) -> bool {
         match self {
             Part::Spans(_) => false,
-            Part::Fact(Fact::Code(_) | Fact::Crate(_)) => false,
-            Part::Fact(_) => true,
+            Part::Fact(fact) => {
+                fact.kind != blaze_items::kinds::CODE && fact.kind != blaze_items::kinds::CRATE
+            }
+        }
+    }
+}
+
+/// A [`Part`] as its bytes hold it: [`FactRef`] derives no encoding, so a part is written as
+/// plain fields, in the item store's own layout of a fact (`hir_ty::body_store`'s `FactRow`:
+/// subject, object, kind, a tag for the object) with one tag more for the part's kind.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+struct PartRow {
+    /// 0: a fact. 1: an item's spans (`subject` its key; nothing else set).
+    part: u8,
+    kind: u16,
+    subject: ContentId,
+    /// 0: no object. 1: a field, `field` its position. 2: an id, `object`.
+    tag: u8,
+    field: u32,
+    object: ContentId,
+}
+
+impl From<Part> for PartRow {
+    fn from(part: Part) -> PartRow {
+        let none = ContentId::default();
+        match part {
+            Part::Spans(item) => {
+                PartRow { part: 1, kind: 0, subject: item.0, tag: 0, field: 0, object: none }
+            }
+            Part::Fact(FactRef { kind, subject, object }) => {
+                let (tag, field, object) = match object {
+                    FactObject::None => (0, 0, none),
+                    FactObject::Field(field) => (1, field, none),
+                    FactObject::Id(id) => (2, 0, id),
+                };
+                PartRow { part: 0, kind: kind.0, subject, tag, field, object }
+            }
+        }
+    }
+}
+
+impl TryFrom<PartRow> for Part {
+    type Error = String;
+
+    /// The part a row is: one row a part, so a field set where its tags say none is refused.
+    fn try_from(row: PartRow) -> Result<Part, String> {
+        let none = ContentId::default();
+        let PartRow { part, kind, subject, tag, field, object } = row;
+        let object = match (tag, field, object == none) {
+            (0, 0, true) => FactObject::None,
+            (1, field, true) => FactObject::Field(field),
+            (2, 0, _) => FactObject::Id(object),
+            // alloc: error path
+            _ => return Err(format!("a part's object with tag {tag}, field {field}")),
+        };
+        match (part, kind, object) {
+            (0, kind, object) => Ok(Part::Fact(FactRef { kind: QueryKind(kind), subject, object })),
+            (1, 0, FactObject::None) => Ok(Part::Spans(ItemKey(subject))),
+            // alloc: error path
+            _ => Err(format!("a part of tag {part} with kind {kind:#x}")),
         }
     }
 }

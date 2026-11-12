@@ -57,6 +57,7 @@ use infer::lookup_inference;
 pub(crate) use mir::built as built_mir;
 pub(crate) use mir::{NONE as NO_PLACE, in_body, kind_code};
 pub use mir::location_literals;
+pub use crate::check_cache::ids::{closure_kind_code, closure_kind_of};
 pub use value::step_value;
 
 use crate::next_solver::goal_store::{
@@ -349,6 +350,11 @@ impl Store {
                     facts.push(fact);
                     ControlFlow::Continue(())
                 }
+                Classified::Scan(fact) => {
+                    self.pending.scanned(what(step), name);
+                    facts.push(fact);
+                    ControlFlow::Continue(())
+                }
                 Classified::Refused => {
                     refused = Some(name);
                     ControlFlow::Break(())
@@ -461,6 +467,11 @@ pub struct Flushed {
     /// For each query or input whose read kept steps out (neither covered nor a fact), how
     /// many, most first: what lane item-hash's classification is asked to cover.
     pub refused: Vec<(&'static str, u64)>,
+    /// Reads that took a whole table where a lookup would do ([`Classified::Scan`]: an
+    /// iteration of a module's scope), by the step that read (as [`what`] names it) then the
+    /// row read, with how many offers made each, most first: each is a fact that any change
+    /// of the table changes, so who makes them is what to fix.
+    pub scans: Vec<(&'static str, &'static str, u64)>,
     /// Steps kept out as a fact they read could not be hashed.
     pub unhashable: u64,
     /// Lookups of bodies with no identity, which are neither looked up nor stored.
@@ -773,10 +784,11 @@ impl Installed {
                 _ = results[at].set(store.write(&entries[at], &mut claimed));
             }
         });
-        let Tallies { refused, counts } = tallies;
+        let Tallies { refused, scans, counts } = tallies;
         let Counts { unhashable, no_identity, unshareable, unencodable, dropped, steps } = counts;
         let mut flushed = Flushed {
             refused,
+            scans,
             unhashable,
             no_identity,
             unshareable,

@@ -3,7 +3,8 @@
 //! unit's result is; the oracle holds the check of its recorded parts to it.
 
 use blaze_ids::{ContentId, Hasher};
-use blaze_items::{Fact, ItemKey, NameHash, SimplifiedType};
+use blaze_items::{ItemKey, kinds};
+use hir_ty::next_solver::goal_store::{FactObject, FactRef};
 use hegel::TestCase;
 use hegel::generators as gs;
 
@@ -96,41 +97,77 @@ impl Below {
                 .find(|it| Below::item(it.name) == *key)
                 .ok_or_else(|| format!("no item {key:?}"))
         };
-        Ok(match part {
-            Part::Fact(Fact::Resolves { name, .. }) => {
-                let found = self.functions.iter().find(|it| Below::name(it.name) == *name);
+        let fact = match part {
+            Part::Spans(key) => {
+                let function = of_item(key)?;
+                return Ok(id("spans", &[self.line(function.name), u64::from(function.lines)]));
+            }
+            Part::Fact(fact) => fact,
+        };
+        let item = ItemKey(fact.subject);
+        Ok(match (fact.kind, fact.object) {
+            (kinds::RESOLVES, FactObject::Id(name)) => {
+                let found = self.functions.iter().find(|it| Below::name(it.name) == name);
                 id("resolves", &[found.map_or(u64::MAX, |it| u64::from(it.name))])
             }
-            Part::Fact(Fact::Signature(key)) => id("signature", &[u64::from(of_item(key)?.signature)]),
-            Part::Fact(Fact::Code(key)) => id("code of", &[u64::from(of_item(key)?.body)]),
-            Part::Fact(Fact::Implements { trait_, self_ty }) => {
+            (kinds::SIGNATURE, FactObject::None) => {
+                id("signature", &[u64::from(of_item(&item)?.signature)])
+            }
+            (kinds::CODE, FactObject::None) => id("code of", &[u64::from(of_item(&item)?.body)]),
+            (kinds::IMPLEMENTS, FactObject::Id(self_ty)) => {
                 let mut which: Vec<u64> = self
                     .impls
                     .iter()
-                    .filter(|it| Below::trait_(it.0) == *trait_ && Below::ty(it.1) == *self_ty)
+                    .filter(|it| Below::trait_(it.0) == fact.subject && Below::ty(it.1) == self_ty)
                     .map(|it| u64::from(it.2))
                     .collect();
                 which.sort_unstable();
                 id("implements", &which)
             }
-            Part::Spans(key) => {
-                let function = of_item(key)?;
-                id("spans", &[self.line(function.name), u64::from(function.lines)])
-            }
-            Part::Fact(other) => return Err(format!("the model has no {other:?}")),
+            _ => return Err(format!("the model has no {fact:?}")),
         })
     }
 
-    fn name(name: u8) -> NameHash {
-        NameHash(id("name", &[u64::from(name)]))
+    fn name(name: u8) -> ContentId {
+        id("name", &[u64::from(name)])
     }
 
-    fn trait_(trait_: u8) -> ItemKey {
-        ItemKey(id("trait", &[u64::from(trait_)]))
+    fn trait_(trait_: u8) -> ContentId {
+        id("trait", &[u64::from(trait_)])
     }
 
-    fn ty(ty: u8) -> SimplifiedType {
-        SimplifiedType(id("type", &[u64::from(ty)]))
+    fn ty(ty: u8) -> ContentId {
+        id("type", &[u64::from(ty)])
+    }
+
+    /// What `name` is in the crate's root module: found or not, one fact.
+    fn resolves(name: u8) -> Part {
+        Part::Fact(FactRef {
+            kind: kinds::RESOLVES,
+            subject: id("root module", &[]),
+            object: FactObject::Id(Below::name(name)),
+        })
+    }
+
+    fn signature(name: u8) -> Part {
+        Part::Fact(FactRef {
+            kind: kinds::SIGNATURE,
+            subject: Below::item(name).0,
+            object: FactObject::None,
+        })
+    }
+
+    fn code_of(name: u8) -> Part {
+        Part::Fact(FactRef { kind: kinds::CODE, subject: Below::item(name).0, object: FactObject::None })
+    }
+
+    /// Which impls `trait_` has for `ty`: none is an answer.
+    fn implements(trait_: u8, ty: u8) -> Part {
+        Part::Fact(FactRef {
+            kind: kinds::IMPLEMENTS,
+            subject: Below::trait_(trait_),
+            object: FactObject::Id(Below::ty(ty)),
+        })
     }
 }
 
@@ -166,8 +203,7 @@ impl Unit {
             reads.push(Read { krate, part, value });
         };
         for &name in &self.calls {
-            let scope = ItemKey(id("root module", &[]));
-            let resolves = Part::Fact(Fact::Resolves { scope, name: Below::name(name) });
+            let resolves = Below::resolves(name);
             match below.named(name) {
                 None => {
                     if plant != Plant::NoNegative {
@@ -177,10 +213,10 @@ impl Unit {
                 }
                 Some(function) => {
                     read(resolves);
-                    read(Part::Fact(Fact::Signature(Below::item(name))));
+                    read(Below::signature(name));
                     out.extend([1, u64::from(function.signature)]);
                     if function.generic {
-                        read(Part::Fact(Fact::Code(Below::item(name))));
+                        read(Below::code_of(name));
                         read(Part::Spans(Below::item(name)));
                         out.extend([
                             u64::from(function.body),
@@ -195,10 +231,7 @@ impl Unit {
             let chosen =
                 below.impls.iter().filter(|it| it.0 == trait_ && it.1 == ty).map(|it| it.2).max();
             if chosen.is_some() || plant != Plant::NoNegative {
-                read(Part::Fact(Fact::Implements {
-                    trait_: Below::trait_(trait_),
-                    self_ty: Below::ty(ty),
-                }));
+                read(Below::implements(trait_, ty));
             }
             out.extend([2, chosen.map_or(u64::MAX, u64::from)]);
         }
@@ -442,7 +475,7 @@ fn a_changed_signature_moves_exactly_the_units_that_read_it() {
     let (was, now) = after(edit);
     assert!(matches!(
         hold(&reads, &was, &now, Plant::None),
-        Ok(Verdict::Moved { read: Read { part: Part::Fact(Fact::Signature(_)), .. }, .. })
+        Ok(Verdict::Moved { read: Read { part, .. }, .. }) if part == Below::signature(0)
     ));
 }
 
@@ -487,7 +520,7 @@ fn the_oracle_catches_a_trace_without_its_negative_reads() {
 fn the_quick_digest_covers_every_part_or_the_record_is_refused() {
     let krate = Below::krate();
     let below = below();
-    let part = Part::Fact(Fact::Code(Below::item(2)));
+    let part = Below::code_of(2);
     let read = Read { krate, part, value: below.value(&part).unwrap() };
     let quick = Quick { krate, cover: Cover::Surface, digest: below.surface() };
     assert_eq!(Parts::new(vec![quick], vec![read]), Err(Refused::QuickTooNarrow(part)));
@@ -504,7 +537,7 @@ fn the_quick_digest_covers_every_part_or_the_record_is_refused() {
 fn a_record_that_is_not_one_is_refused_by_name() {
     let krate = Below::krate();
     let below = below();
-    let part = Part::Fact(Fact::Signature(Below::item(0)));
+    let part = Below::signature(0);
     let value = below.value(&part).unwrap();
     let quick = Quick { krate, cover: Cover::Surface, digest: below.surface() };
     let read = Read { krate, part, value };
@@ -519,4 +552,30 @@ fn a_record_that_is_not_one_is_refused_by_name() {
     // The layout before this one had no record: bytes of any other layout are refused.
     let other = blaze_protocol::cbor::to_vec(&(0u32, Vec::<Quick>::new(), Vec::<Read>::new())).unwrap();
     assert!(matches!(Parts::decoded(&other), Err(Refused::Bytes(_))));
+}
+
+/// A part's bytes read back as the part, for a fact with each kind of object and for an
+/// item's spans, and a row no part writes is refused: a part's record means one thing.
+#[test]
+fn a_part_reads_back_from_its_bytes_and_no_other_row_reads() {
+    let field = Part::Fact(FactRef {
+        kind: kinds::FIELD,
+        subject: id("a type", &[]),
+        object: FactObject::Field(3),
+    });
+    for part in [Below::signature(1), Below::resolves(2), field, Part::Spans(Below::item(4))] {
+        let bytes = blaze_protocol::cbor::to_vec(&part).unwrap();
+        let read: Part = blaze_protocol::cbor::from_slice(&bytes).unwrap();
+        assert_eq!(read, part);
+    }
+    let row = |part: u8, kind: u16, tag: u8, field: u32| {
+        let none = ContentId::default();
+        blaze_protocol::cbor::to_vec(&(part, kind, none, tag, field, none)).unwrap()
+    };
+    // The same fields as a struct's map would hold are not what a tuple writes: whichever
+    // the encoding, a row with a field set under "no object", or spans with a kind, must not
+    // read as a part.
+    for bytes in [row(0, kinds::SIGNATURE.0, 0, 7), row(1, kinds::SIGNATURE.0, 0, 0), row(9, 0, 0, 0)] {
+        assert!(blaze_protocol::cbor::from_slice::<Part>(&bytes).is_err());
+    }
 }

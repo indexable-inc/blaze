@@ -484,12 +484,18 @@ written and not yet compiled or run (what compiled, at b16074567d, is their firs
 library keyed by its dependencies' positioned interface texts); the third has its record and
 check written and its trace not.
 
-**The parts** (`blaze_items::Fact`, the item store's vocabulary, plus positions):
+**The parts**, in the item store's one form (`FactRef`: a kind, a subject, an object; lane
+items' kinds `blaze_items::kinds`, the item store's own `blaze_item_hash::values::kinds`;
+value `blaze_item_hash::values::value(db, crate, fact)`), plus positions. A body's entry and
+a unit's parts are one vocabulary:
 
 | The dependent | reads | part | negative read |
 |---|---|---|---|
 | resolves a path, an import, a glob | what a name is in a scope | `Resolves { scope, name }` | yes: asked of the scope's index, so a name absent (the glob gave none, the dependent's own item won) is a value, and an item added under it moves it |
-| expands a macro | the macro's tokens (found by `Resolves`) | `Signature` of the macro item | through `Resolves` |
+| expands a macro | the macro's definition tokens, no position (found by `Resolves`, whose value holds a name's textual-scope macros beside its three namespaces) | `Signature` of the macro item | through `Resolves` |
+| resolves a method or an operator through traits | the traits in scope of a module | `TRAITS_IN_SCOPE(module)` (the item store's kind 0x1806): the traits' keys, sorted | - |
+| iterates a scope (a glob import's set) | every name of the scope | `WHOLE_SCOPE(module)` (0x1807): every name with its `Resolves` value, so any name added moves it; a lookup alone is `Resolves` | - |
+| reads a crate's def map itself | the prelude, the extern prelude, the `#[macro_use]` prelude, the root's flags | `CRATE_NAMES(root module)` (0x1808). Not in its value, and unchecked: the crate's exported derives, its proc-macro functions' mapping and the derive helpers in scope; a unit that reads one of those through the def map is not covered by this part and keeps its surface key | - |
 | checks a call, a use of a type | the callee's signature, generics, bounds; a type's fields | `Signature(item)`, `Field { ty, field }` | no |
 | holds or moves a value | size, alignment, offsets, niches | `Layout(type)` | no |
 | selects an impl, resolves a method | which impls a trait has for a type; what `x.m()` is | `Implements { trait, self type }`, `Method { self type, name }`, `Vtable`, `Coherence`, `Specializes` | yes: asked of the impl index by simplified self type, so "no impl" is a value and an impl added moves it |
@@ -615,6 +621,106 @@ hello-world); every input of that work is public and the same on every machine o
   for this target, a signature refused) with what will be compiled instead. (4) F2 of
   [restore.md](restore.md): a fetched image is only worth its bytes if no crate is resolved
   before the store is asked.
+
+## Item sets: one value an item (rule granular-caching)
+
+2026-11-12, lane storegc-1112. Designed, not built; the order to build is at the end. Sizes are
+from the code's layouts, none measured.
+
+**Why.** The front end keeps one value an item (attribute flags, an impl's items, a body's
+inference, MIR): 16 to 200 bytes for the small kinds, 0.5 to 20 KiB for bodies, 10^4 to 10^5 of
+them a crate, each under a 32-byte key made of the item's own content and what it read, never
+of its crate's image key (so an unchanged item under a new version of its crate is the same
+value). The store as it is holds each as a record: a 96-byte header and up to 15 bytes of
+padding on disk, a 64-byte index row at 7/8 load (74 bytes) and a byte of flags, 170 to 290
+bytes over the value. Records are already packed one after another into shared packs (13 to 35
+small ones a 4 KiB page), and a get is one index probe and one pool page. What does not hold up
+at these counts: the index table is rewritten whole on the daemon's loop every 65,536 new
+records; a period's scan walks every row and lists them all in memory; the cold tier rewrites
+each unread value on its own; a pin lists keys (32 bytes each, rewritten whole when one is
+added, each looked up at every scan).
+
+**One pair.** `put(set, key, bytes)` and `get(set, key)` (`hir_def::nameres::frozen::entries`'s
+`Entries` is the front end's side of it). `key` is the item's; `set` says which items are kept
+together (a crate's, or a file's items within it) and is a hint for where to look, never part
+of what finds the value: a value is found by `key` under any `set`. A get looks, in order, at
+the record under `key`, the sealed set under `set`, and the sealed sets the crate's root names
+as earlier ones (below). Two forms underneath.
+
+| Form | For | An item costs over its bytes | What changes on one item's edit |
+|---|---|---|---|
+| live | a crate being edited (every workspace crate, bstd among them) | a record: 96 + padding, 74 in the index, 1 of flags, and 32 in a leaf of its set's index value: about 210 | one record, one leaf (4 KiB) and the root (32 bytes a leaf) |
+| sealed | a crate never edited under its version (std, registry crates), and a live set whose crate has been quiet | 16 in a directory at 7/8 load, its 32-byte key before the value for the check, padding to 8: about 50 | nothing: a sealed set is written once |
+
+**Live set.** Each item is a record under its own key, as today. The set is an index value, a
+record of `Kind::Query` in the form `Listing`: a root that lists the keys of its leaves, each
+leaf a record listing up to 128 item keys, sorted by key, so one item's change rewrites one leaf
+and the root, and two sets that hold the same item name one record. The root also names the
+sealed sets its crate's earlier versions were compacted to. The collector follows a listing as
+it follows a chunked output's chunks (`collect.rs`, `named_by`): what a kept root lists is
+kept. A listing is immutable, so what it names is read once and remembered by its key, never
+read again at each scan.
+
+**Sealed set.** One store value under the set's key: a header, a directory (open addressing
+on the first 8 bytes of the item key: offset and length, 16 bytes a slot), then each item's
+32-byte key and bytes end to end. A get reads the directory's slot and the value a part at a
+time (`Reader::part`): two pool pages, three when the value straddles. It is one index row, one
+record for the collector, one key in a pin. std and registry crates are written sealed at once;
+that gives up sharing an item between two versions of such a crate, which is accepted: they
+are not edited under a version. A live set whose crate was quiet (lane sealgroups' rule) is
+compacted to a sealed one in the background, on a worker, as a pack is collected; the next
+version's root names it, so the unchanged items of an edited crate are found there and only
+what changed is written as records.
+
+**Pins and keeps.** A pin names set keys (roots and sealed sets), not items: `toolchain` and
+`bstd` list a key a crate, not 50,000. `serve::collect::front_keys` gives a crate's set keys.
+Growing a pin still rewrites it, at a key a crate.
+
+**The scan of a period's end** becomes bounded and incremental: it walks a fixed number of
+rows a step from a cursor and keeps no list of them all; flags rotate when the cursor wraps.
+With sets, the rows are the records of live sets and one row a sealed set.
+
+**The index table** is built on a worker from a `Reader` and handed back for the write, as the
+period's scan is; the loop only starts it and takes the bytes. This is first: it is the worst
+cost at these counts and is needed whichever form an item is in.
+
+**Tests** (blaze-cas, the simulation): 50,000 items put as a live set, then one changed: one
+record, one leaf and the root are written and nothing else (counted in bytes appended); the
+collector, with the root kept, keeps exactly what the listing names and forgets an item no
+listing names; the control is a pin naming the items directly, which is 1.6 MB rewritten and
+50,000 lookups a scan. A sealed set: every item reads back by key under its set and under
+another set whose root names it; a crash at any point of a compaction leaves the live records
+or the sealed set, never neither. The index built on a worker: a commit that would write it
+holds the loop for no walk of the rows (counted in rows visited on the store's thread).
+
+**Order to build.** (1) the index table on a worker; (2) the `Listing` form, the collector
+following it, pins by set key; (3) the `put`/`get` pair with live sets, and the front end's
+`Entries` on it; (4) sealed sets and `Reader::part` reads, std and registry crates written
+sealed; (5) compaction of a quiet live set; (6) the incremental scan. `hir_ty::check_cache`'s
+own container of pages goes once (4) is in.
+
+**State, 2026-11-12 (lane storegc2; written, not yet compiled or run).**
+
+- Built: (1) the index table off the loop (`crates/blaze-cas/src/rebuild.rs`). The store's
+  thread does O(packs) at a take and at a put; the swap after a table is written still walks
+  the delta there (65,536 rows and what was put while the build ran, never the table's rows).
+  A daemon with no collector still builds its table in the commit. The head that names a
+  built table names each pack's end at the take as indexed. Simulation: `tests::rebuild`.
+- Built: the live form (`crates/blaze-cas/src/sets.rs`, `Kind::Set`), not as first drawn:
+  a listing is keyed by its own bytes, and leaves end at keys chosen by the key itself (one in
+  128), not at every 128th, so one item more changes one leaf (two when its key ends one)
+  and the root. A daemon's `Sets` holds each set's members (what was got or put under it)
+  and lists the sets a build touched at its end; `serve::collect::StoreEntries` is the front
+  end's `Entries` on it. A get finds an item by its key alone, so a file-sized set whose
+  file was edited still finds the unchanged items: no key → set step is needed for the live
+  form. The collector's scan follows a listing (`collect::named_by`) and reads it again at
+  every scan (not yet remembered by key).
+- Not built: the sealed form (and with it std and registry crates written sealed, which
+  gives up sharing an item between two versions of such a crate: accepted by the owner),
+  compaction of a quiet live set, `toolchain`/`bstd` moved to roots (`StoreEntries::keep`
+  is there; no build calls `StoreEntries::list` or `entries::set` yet), the incremental
+  scan, the cold tier in groups, a collection (not only a scan) under a pinned root in the
+  collector's simulation.
 
 ## Issues this lane takes in
 

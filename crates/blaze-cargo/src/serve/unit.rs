@@ -42,7 +42,9 @@ mod intent;
 mod layout;
 mod memo;
 mod perf;
-mod portable;
+// Lane packs-1112: `Places` is also the export's guard against a record that holds a
+// directory of this machine (`serve::packs::home_places`).
+pub(crate) mod portable;
 mod reach;
 mod reads;
 pub(super) mod release;
@@ -118,6 +120,10 @@ pub(crate) struct Shared {
     /// The directory of blaze's stand-ins for the tools cargo names to a build script:
     /// `rustc` and `rustdoc`, each blaze's own executable under that name.
     pub(crate) tools: PathBuf,
+    /// blaze's sources directory ([`blaze_manifest::home::sources`]): a root of every
+    /// build's places ([`portable::Places`]), so a registry crate's keys and front-end
+    /// records do not say which home fetched it.
+    pub(crate) sources: PathBuf,
     /// The code generator's memo, which each job takes at its start ([`Job::memo`]).
     pub(crate) memos: Arc<memo::Memos>,
     /// What `-C target-cpu=native` is on this machine; none without LLVM.
@@ -142,6 +148,8 @@ impl Real {
             state: paths.state.clone(),
             launcher: paths.launcher.clone(),
             tools,
+            // clone: once a daemon
+            sources: sources.clone(),
             memos: memo::Memos::new(),
             host_cpu: hir_ty_codegen::host_cpu().map(|(name, features)| {
                 blaze_units::stdlib::target::HostCpu {
@@ -462,6 +470,7 @@ impl Steps for Real {
                     &input.config.std,
                     &self.shared.tools,
                     &self.shared.launcher,
+                    &self.shared.sources,
                 )));
                 // Each crate's surface, which a crate above it enters its image key by
                 // (`hir_def::deps::key`), given now that the port is told and before the
@@ -504,6 +513,11 @@ impl Steps for Real {
                         &input.config.invocation.env,
                     )?,
                 };
+                if fresh {
+                    // Where the database keeps its per-item entries, told before the first
+                    // serve below reads a crate from them.
+                    deps::entries(&mut lowered, &session);
+                }
                 let mut job =
                     Job::new(input.clone(), lowered.crates().clone(), self.shared.clone(), held)?;
                 job._seeded = seeded;
