@@ -340,6 +340,12 @@ impl Storage {
         self.frontier.walked.get_mut().written.push(node); // alloc: the writes since the last walk, a word each
     }
 
+    /// The runs whose edges are not yet folded into the reverse index: what the next fold
+    /// ([`Storage::pack_reverse`], or the next view's boundary) costs.
+    pub fn runs_unfolded(&self) -> usize {
+        self.frontier.stored.len()
+    }
+
     /// What the last changed-set walk of this storage did.
     pub fn changed_set_work(&self) -> ChangedSetWork {
         self.frontier.walked.lock().work
@@ -410,7 +416,15 @@ impl Storage {
     /// ([`Reverse::worth_packing`]): what a host does with time to spare (a build's end), so
     /// what a build's runs added is held at 4 bytes a reader from then on. With `&mut`: no
     /// walk reads the index meanwhile.
+    ///
+    /// It folds first ([`Storage::fold_reverse`]): the edges of the runs since the last view
+    /// boundary are otherwise folded at the next one, which is the next build's first write,
+    /// on its path. A build of a new hello-world left 1.49 million runs to it, and the
+    /// project's second build spent 0.49 to 0.65 s of its 1.1 s there (`reverse edges fold`,
+    /// 2026-11-11). A fold needs only `&mut` and may come at any time before the edge array
+    /// settles, which only a view boundary does, after folding itself.
     pub fn pack_reverse(&mut self) {
+        self.fold_reverse();
         if !self.frontier.reverse.worth_packing() {
             return;
         }

@@ -60,6 +60,7 @@ real! {
     a_feature_flip_follows_the_cfg
     a_renamed_function_keeps_its_code
     a_save_by_rename_is_read_whole
+    a_second_project_reuses_the_standard_library
     a_signature_change_remakes_the_callers
     a_touch_without_a_change
     an_added_and_a_removed_function

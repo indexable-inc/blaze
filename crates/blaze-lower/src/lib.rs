@@ -742,7 +742,11 @@ fn lower_writes<T: blaze_query::Tree>(
                             root: macros_root,
                             const_ast_root,
                             const_ast_dir: &const_ast_dir,
-                            proc_macro_cwd: abs(&crates::proc_macro_cwd(&workspace_root, package))?,
+                            proc_macro_cwd: abs(&crates::proc_macro_cwd(
+                                &workspace_root,
+                                package,
+                                unit.is_std.then_some(config.library.as_str()),
+                            ))?,
                             durability,
                         };
                         let (made, listed) =
@@ -828,7 +832,11 @@ fn lower_writes<T: blaze_query::Tree>(
             target_kind: crates::target_kind(unit, plan, what)?,
             manifest_kind: crates::manifest_kind(unit, what)?,
             crate_types: crates::crate_types(unit, plan, what)?,
-            proc_macro_cwd: Arc::new(abs(&crates::proc_macro_cwd(&workspace_root, package))?),
+            proc_macro_cwd: Arc::new(abs(&crates::proc_macro_cwd(
+                &workspace_root,
+                package,
+                unit.is_std.then_some(config.library.as_str()),
+            ))?),
         };
         let extra = base_db::ExtraCrateData {
             version: Some(package.version.clone()),
@@ -1279,6 +1287,9 @@ impl Lowered {
         }
         // alloc: once a unit's record missed, a part each thing its identity is made of
         let mut parts = vec![IdentityPart::Settings(settings)];
+        parts.extend(
+            krate.settings_parts(db).into_iter().map(|(what, id)| IdentityPart::Setting { what, id }),
+        );
         let set = root.source_root_ref(db);
         let path = |file: &FileId| {
             set.path_for_file(file).and_then(|it| it.as_path()).map(|it| it.as_str())
@@ -1844,6 +1855,9 @@ pub enum IdentityPart {
     /// Its crate's own settings ([`base_db::Crate::content`]: its root's path, cfgs, env,
     /// edition, target and the rest).
     Settings(ContentId),
+    /// One of those settings by what it is ([`base_db::Crate::settings_parts`]), with a hash
+    /// of its own: what says which setting moved when [`IdentityPart::Settings`] did.
+    Setting { what: String, id: ContentId },
     /// A file it is made from, by its absolute path: its bytes' content, and for a Rust file
     /// of a workspace crate what code can observe of it (its text with each comment no macro
     /// sees as its shape), so an edit that moves the first and not the second changed no item.
