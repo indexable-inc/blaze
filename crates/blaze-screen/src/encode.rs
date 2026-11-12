@@ -93,33 +93,45 @@ pub fn encode(frame: &Frame, terminal: &Terminal, out: &mut String) {
     if frame.is_empty() {
         return;
     }
-    out.push_str("\x1b[?2026h");
-    if frame.erase > 0 {
-        // Writing to a String cannot fail.
-        let _ = write!(out, "\r\x1b[{}A", frame.erase);
-        for _ in 0..frame.erase {
-            out.push_str("\x1b[2K\n");
+    // The update whole, then its brackets: a frame that comes to nothing for this terminal
+    // (a notification it has no way to show) writes nothing.
+    let mut update = String::new(); // alloc: a frame's bytes, once a frame
+    {
+        let out = &mut update;
+        if frame.erase > 0 {
+            // Writing to a String cannot fail.
+            let _ = write!(out, "\r\x1b[{}A", frame.erase);
+            for _ in 0..frame.erase {
+                out.push_str("\x1b[2K\n");
+            }
+            let _ = write!(out, "\x1b[{}A", frame.erase);
         }
-        let _ = write!(out, "\x1b[{}A", frame.erase);
+        match frame.hide_cursor {
+            Some(true) => out.push_str("\x1b[?25l"),
+            Some(false) => out.push_str("\x1b[?25h"),
+            None => {}
+        }
+        frame.above.iter().for_each(|it| line(out, it, color, links));
+        frame.region.iter().for_each(|it| line(out, it, color, links));
+        if let Some(progress) = frame.progress {
+            let progress = match progress {
+                Progress::Clear => terminal::Progress::Clear,
+                Progress::Unknown => terminal::Progress::Indeterminate,
+                Progress::Percent(percent) => terminal::Progress::Normal(percent),
+                Progress::Failed(percent) => terminal::Progress::Error(percent),
+            };
+            terminal.progress_into(out, progress);
+        }
+        if let Some(ended) = &frame.ended
+            && terminal.notifies(ended.failed, ended.took_ms / 1000)
+        {
+            terminal.notify_into(out, &ended.title, &ended.body);
+        }
     }
-    match frame.hide_cursor {
-        Some(true) => out.push_str("\x1b[?25l"),
-        Some(false) => out.push_str("\x1b[?25h"),
-        None => {}
+    if update.is_empty() {
+        return;
     }
-    frame.above.iter().for_each(|it| line(out, it, color, links));
-    frame.region.iter().for_each(|it| line(out, it, color, links));
-    if let Some(progress) = frame.progress {
-        let progress = match progress {
-            Progress::Clear => terminal::Progress::Clear,
-            Progress::Unknown => terminal::Progress::Indeterminate,
-            Progress::Percent(percent) => terminal::Progress::Normal(percent),
-            Progress::Failed(percent) => terminal::Progress::Error(percent),
-        };
-        terminal.progress_into(out, progress);
-    }
-    if let Some((title, body)) = &frame.notify {
-        terminal.notify_into(out, title, body);
-    }
+    out.push_str("\x1b[?2026h");
+    out.push_str(&update);
     out.push_str("\x1b[?2026l");
 }

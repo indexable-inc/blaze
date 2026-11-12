@@ -1,4 +1,4 @@
-//! The reference model: a terminal as the screen's bytes need one, small enough to read. It
+//! A terminal as the screen's bytes need one, small enough to read ([`Vt`]). It
 //! keeps rows as a terminal does, each knowing whether it wrapped into the next, and reflows
 //! them when its width changes, as terminals do. It knows the sequences the encoder writes
 //! and refuses any other, so a test that reads a screen from it has also checked that nothing
@@ -15,10 +15,14 @@
 //!
 //! Erasing to the end of the screen (ED) is refused: tmux takes one from the top-left corner
 //! for a clear of the whole screen and pushes the screen into its history first, so a region
-//! redrawn with it is copied into the scrollback a frame (seen on 2026-11-12 in tmux 3.5a).
+//! redrawn with it is copied into the scrollback a frame (seen on 2026-11-12 in tmux 3.8).
 
 #![allow(dead_code, reason = "each test file uses a part of it")]
 
+/// The reference model: a terminal that takes the encoder's sequences and no other, keeps
+/// rows with their wraps, reflows them when resized, never moves its cursor above its top row,
+/// and erases a row only when told to: what the screen's properties read a terminal's state
+/// from.
 pub(crate) struct Vt {
     pub(crate) cols: usize,
     pub(crate) rows: usize,

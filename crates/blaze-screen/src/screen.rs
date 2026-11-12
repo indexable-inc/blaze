@@ -24,7 +24,7 @@ use blaze_protocol::now::{Now, Phase};
 
 use crate::{
     event::{BinaryEnd, Built, Command, Event, Test, Verdict, Why},
-    frame::{Frame, Line, Mark, Progress, Role},
+    frame::{Ended, Frame, Line, Mark, Progress, Role},
     text,
 };
 
@@ -55,13 +55,11 @@ pub struct Options {
     pub verbose: bool,
     /// The checkout's root, for a diagnostic's path to become a link.
     pub root: Option<String>,
-    /// A build at least this long ends with a notification, where the terminal has them.
-    pub notify_after_ms: Option<u64>,
 }
 
 impl Options {
     pub fn of(command: Command) -> Options {
-        Options { command, quiet: false, verbose: false, root: None, notify_after_ms: None }
+        Options { command, quiet: false, verbose: false, root: None }
     }
 }
 
@@ -185,7 +183,7 @@ pub struct Screen {
     region: Vec<Line>,
     hidden: bool,
     progress: Progress,
-    notify: Option<(String, String)>,
+    notify: Option<Ended>,
     plain_at: u64,
     dirty: bool,
     plant: Plant,
@@ -332,7 +330,7 @@ impl Screen {
             self.progress = progress;
             frame.progress = Some(progress);
         }
-        frame.notify = self.notify.take();
+        frame.ended = self.notify.take();
         let hide = !region.is_empty();
         if hide != self.hidden {
             self.hidden = hide;
@@ -724,15 +722,13 @@ impl Screen {
                 }
             }
         }
-        if self.caps.live
-            && !built.tests_follow
-            && self.opts.notify_after_ms.is_some_and(|after| took >= after)
-        {
+        if self.caps.live && !built.tests_follow {
             let title = match built.ok {
-                true => format!("blaze {} done", self.opts.command.word()), // alloc: once a long build
+                true => format!("blaze {} done", self.opts.command.word()), // alloc: once a build
                 false => format!("blaze {} failed", self.opts.command.word()), // alloc: as above
             };
-            self.notify = Some((title, text::time(took)));
+            self.notify =
+                Some(Ended { title, body: text::time(took), failed: !built.ok, took_ms: took });
         }
     }
 

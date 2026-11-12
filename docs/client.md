@@ -123,8 +123,9 @@ bun crates/blaze-napi/test/smoke.ts
 the options `blaze-fast --help` lists (packages, features, profile, target, the target
 selection flags, `--color`, `-v`, `-q`, `--json`) and refuses any other word by name, saying
 to use `blaze`; it never runs `blaze` in its place. It prints each diagnostic as the daemon
-rendered it, blaze's reports through blaze-report's renderer, and cargo's `Compiling`,
-`Checking` and `Finished` lines; with `--json`, each response as one line of the API's JSON.
+rendered it, blaze's reports through blaze-report's renderer, and of the build the lines
+[terminal.md](terminal.md) gives a pipe (`blaze: progress`, then `blaze: ok` or `blaze: failed`);
+with `--json`, each response as one line of the API's JSON.
 `why` and `status` print the answer as JSON. It exits 0 when the request ended ok, 101 when it
 did not, 2 for a command line it does not handle.
 

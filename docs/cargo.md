@@ -113,9 +113,9 @@ not compile a build's error names, the first `N` (16 without it) or every one. `
 function has its optimized code (LLVM's), and fails, naming the function, where it cannot.
 Without the flag the profile says: `dev` and `test` edit, `release` and `bench` (and any
 profile at `opt-level` 2, 3, `s` or `z`) are `max`. A package cargo gives its own `opt-level`
-(`[profile.*.package.*]`) keeps it under both. The `Finished` line ends with the goal and how
-much of the linked code is optimized: `(goal edit: tier 0 · 38% optimized)`
-([v2/plan/design/tiers.md](v2/plan/design/tiers.md)).
+(`[profile.*.package.*]`) keeps it under both. The build's last line says where the linked
+code stands: `tier 0 · 38% optimized` ([v2/plan/design/tiers.md](v2/plan/design/tiers.md),
+[terminal.md](terminal.md)).
 `serve` is the daemon itself ([below](#the-daemon)); `codegen-inputs`, `trace` and `tables`
 print what the daemon's last build of the checkout did (each instance it made with its code
 hash, every result with its edges as CBOR, the size of each long-lived table); `check --replace std::sync::Mutex=parking_lot::Mutex` retargets every
@@ -154,11 +154,12 @@ dev-dependencies; a member the selected packages only depend on is checked as it
 in the same layout, under the workspace's build directory, which is never in the checkout
 ([Where a build writes](#where-a-build-writes)). The client reads no manifest: it finds the checkout, sends the
 daemon one request with the whole command line, its environment and the configuration files
-outside the checkout, and prints the responses as cargo prints its build (`Compiling`,
-`Fresh` under `-v`, warnings, `Finished`), with cargo's exit codes. `check` is the daemon's
-check of every body of each crate the command picks, as rustc checks them
-(`crates/blaze-cargo/src/serve/unit/checks.rs`): the errors a build would fail with, or
-`Finished`, and no rustc. `--message-format` takes each of cargo's values; in JSON the
+outside the checkout, and shows the responses as [terminal.md](terminal.md) says (on a
+terminal a region redrawn while the build runs and one line when it ends; off one the
+diagnostics and one `blaze: ok` or `blaze: failed` line), with cargo's exit codes. `check` is
+the daemon's check of every body of each crate the command picks, as rustc checks them
+(`crates/blaze-cargo/src/serve/unit/checks.rs`): the errors a build would fail with, or that
+one line, and no rustc. `--message-format` takes each of cargo's values; in JSON the
 messages are cargo's (`compiler-artifact`, `build-script-executed`, `compiler-message` with
 rustc's diagnostic, `build-finished`), written as cargo and rustc write them
 (`crates/blaze-cargo/src/cli/json.rs`), which is what rust-analyzer's check-on-save and other
@@ -170,7 +171,7 @@ watches and the memory it holds of its budget (`--json`: one object, [The daemon
 Under a JSON `--message-format` every `build`, `check`, `run`, `test` and `bench` ends its build
 with one `build-finished` line on stdout, the last of its JSON messages and before anything the
 program or the tests print. cargo's has only `success`; blaze's carries what a tool would
-otherwise read from the human `Finished` line and the daemon's log, each field always present,
+otherwise read from the build's last line on stderr and the daemon's log, each field always present,
 `null` where there is nothing to say:
 
     {"reason":"build-finished","success":true,"profile":"dev","served":"daemon","took_ms":812,"build_id":7,"units":{"built":2,"replayed":40},"links":{"first":0,"spliced":1,"unchanged":0,"full":0}}
@@ -288,7 +289,8 @@ them.
 `run` then becomes the program and `test` runs the test executables the client was told of, as
 cargo's `ops::run_tests` does (`crates/blaze-cargo/src/cli/test.rs`): in cargo's order, on the
 terminal, with the variables and working directory cargo gives, cargo's `Running` lines, then
-the doc tests; `--no-run` lists them. By default blaze builds every unit it can, runs every
+the doc tests (on a terminal that redraws, `test` runs them under the screen instead:
+[terminal.md](terminal.md)); `--no-run` lists them. By default blaze builds every unit it can, runs every
 test executable and doc test that built whichever failed, and ends listing the targets that
 failed (with what reruns each), then each test executable or doc test that never built and the
 failure that held it back: its own compile's, or the unit it was skipped behind
@@ -1177,7 +1179,7 @@ Anything else is an error naming the variable, the value and what it takes. The 
 the daemon's plane, its worker pool, test runs (a test binary's `--test-threads` is taken from
 the same budget as the processes running beside it) and the `NUM_JOBS` a build script's `cc`
 is told (a quarter of the budget: blaze has no jobserver to share, and scripts often run a
-few at once). `blaze test`'s live view runs a quarter of the budget's test binaries at once,
+few at once). `blaze test` on a terminal runs a quarter of the budget's test binaries at once,
 each with `RUST_TEST_THREADS` at a quarter, unless the command sets `RUST_TEST_THREADS`
 itself. Background priority is nice 10 (`setpriority`), which every thread and child process
 inherits; on macOS the worker pool's threads also drop from `user-initiated` to the `default`

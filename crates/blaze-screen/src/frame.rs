@@ -107,6 +107,15 @@ pub enum Progress {
     Failed(u8),
 }
 
+/// A build's end, for a notification of it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Ended {
+    pub title: String,
+    pub body: String,
+    pub failed: bool,
+    pub took_ms: u64,
+}
+
 /// One frame: what the driver writes, in this order.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Frame {
@@ -125,8 +134,9 @@ pub struct Frame {
     pub hide_cursor: Option<bool>,
     /// The terminal's progress report, when it changes.
     pub progress: Option<Progress>,
-    /// A notification: its title and body. Only for a long build's end.
-    pub notify: Option<(String, String)>,
+    /// The build ended: what a notification of it says, where the terminal has them and its
+    /// settings ask for one of a build that failed or took this long.
+    pub ended: Option<Ended>,
 }
 
 impl Frame {
