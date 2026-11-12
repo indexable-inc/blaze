@@ -127,7 +127,7 @@ struct Control<'a> {
     socket: UnixStream,
     records: &'a mut dyn Records,
     /// By slot: the threads waiting in its stub, for which one `Need` was said.
-    needs: Vec<(Slot, Vec<Sender<Bound>>)>,
+    needs: Vec<(Slot, Vec<std::sync::Arc<sys::Handoff<Bound>>>)>,
     /// The id of the last message this side began.
     said: u64,
     /// The first failure: no code can come any more.
@@ -200,29 +200,41 @@ pub fn run(
     control.end(reader)
 }
 
-/// The reader thread: every whole frame of `from` onto the queue, then why it ended.
+/// The reader thread: every whole frame of `from` onto the queue, then why it ended. The
+/// frames of one read are queued together and the control thread is woken once for them.
 fn read(mut from: UnixStream, shared: &Shared) {
     // alloc: the socket's bytes not yet a whole frame; one buffer for the thread's life.
     let mut bytes = Vec::new();
-    let mut chunk = [0u8; 4096];
+    // alloc: one read's bytes; on the heap, as a reader thread's stack need not hold it.
+    let mut chunk = vec![0u8; 256 << 10];
     let why = loop {
-        let (item, took) = match wire::split(&bytes) {
-            Ok(Some((item, took))) => (item.to_vec(), took),
-            Ok(None) => {
-                // The wait: for the daemon's next bytes. It ends when the daemon writes,
-                // closes, or the control thread shuts the socket down to stop.
-                match from.read(&mut chunk) {
-                    Ok(0) => break "the daemon closed it".to_owned(),
-                    Ok(got) => bytes.extend_from_slice(&chunk[..got]),
-                    Err(why) if why.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(why) => break format!("read failed: {why}"),
+        // Every whole frame that is here.
+        let mut at = 0;
+        let refused = loop {
+            match wire::split(&bytes[at..]) {
+                Ok(Some((item, took))) => {
+                    shared.push(Event::Frame(item.to_vec())); // alloc: one message of the daemon's
+                    at += took;
                 }
-                continue;
+                Ok(None) => break None,
+                Err(why) => break Some(format!("a frame was refused: {why}")),
             }
-            Err(why) => break format!("a frame was refused: {why}"),
         };
-        drop(bytes.drain(..took));
-        shared.send(Event::Frame(item));
+        if at > 0 {
+            drop(bytes.drain(..at));
+            shared.ring();
+        }
+        if let Some(why) = refused {
+            break why;
+        }
+        // The wait: for the daemon's next bytes. It ends when the daemon writes, closes, or
+        // the control thread shuts the socket down to stop.
+        match from.read(&mut chunk) {
+            Ok(0) => break "the daemon closed it".to_owned(),
+            Ok(got) => bytes.extend_from_slice(&chunk[..got]),
+            Err(why) if why.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(why) => break format!("read failed: {why}"),
+        }
     };
     shared.send(Event::Closed(why));
 }
@@ -290,7 +302,7 @@ impl Control<'_> {
             for waiter in waiters {
                 // A waiter is a thread blocked on this answer; were it gone, there is no one
                 // to tell.
-                drop(waiter.send(Bound::Lost(why.to_owned())));
+                waiter.put(Bound::Lost(why.to_owned()));
             }
         }
     }
@@ -312,15 +324,15 @@ impl Control<'_> {
         &mut self,
         slot: Slot,
         thread: Thread,
-        reply: Sender<Bound>,
+        reply: std::sync::Arc<sys::Handoff<Bound>>,
     ) -> Result<(), ControlError> {
         if let Some(lost) = &self.lost {
-            drop(reply.send(Bound::Lost(lost.to_string())));
+            reply.put(Bound::Lost(lost.to_string()));
             return Ok(());
         }
         // Bound since the thread loaded the word: it calls through the word again.
         if matches!(self.driver.target(slot), Ok(Target::Body(_) | Target::Gate { .. })) {
-            drop(reply.send(Bound::Code));
+            reply.put(Bound::Code);
             return Ok(());
         }
         match self.needs.iter_mut().find(|(waited, _)| *waited == slot) {
@@ -398,7 +410,7 @@ impl Control<'_> {
                     return Err(ControlError::Unasked { slot });
                 };
                 for waiter in self.needs.swap_remove(at).1 {
-                    drop(waiter.send(Bound::Refused(diagnostic.to_owned())));
+                    waiter.put(Bound::Refused(diagnostic.to_owned()));
                 }
             }
             Tell::Unheld { why } => return Err(ControlError::Unheld { why: why.to_owned() }),
@@ -428,7 +440,7 @@ impl Control<'_> {
                 return true;
             }
             for waiter in waiters {
-                drop(waiter.send(Bound::Code));
+                waiter.put(Bound::Code);
             }
             false
         });
@@ -464,7 +476,7 @@ impl Control<'_> {
                 }
                 Event::Need { reply, .. } => {
                     let why = "the launcher's control thread was stopped";
-                    drop(reply.send(Bound::Lost(why.to_owned())));
+                    reply.put(Bound::Lost(why.to_owned()));
                 }
                 Event::Frame(_) | Event::Closed(_) | Event::Stop => {}
             }

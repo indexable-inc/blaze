@@ -1,0 +1,12 @@
+{
+ "id": "launch3-8",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+ "where": "hir-ty-codegen's fixtures",
+ "what": "`Target::for_fixtures()` is x86-64 Linux whatever the host, so no test of hir-ty-codegen can run the code it compiles: the test that runs tier 0 code in the launcher builds its functions as Cranelift IR in blaze-stencil, and the Rust front end is in it only through `blaze run`.",
+ "cost": "no crate-level test of front end to launcher; that path is checked by running programs",
+ "cause": "the fixtures' tests inspect code and never run it",
+ "workaround": "none",
+ "state": "open",
+ "fix": ""
+}

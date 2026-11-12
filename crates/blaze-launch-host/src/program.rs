@@ -10,8 +10,9 @@
 //!
 //! A function's slot is its *identity*'s (`blaze_codegen::backend::Described::identity`:
 //! the item, which instance of it, its type arguments), which an edit of its body keeps. A
-//! slot is given once and never taken back: an identity new to a build gets the next one, and
-//! a launcher that runs already is told to declare it (`Edit::declare`).
+//! slot is given once and never taken back, and is given when a record that is sent somewhere
+//! first names the function (never to the whole program up front); a launcher that runs
+//! already is told to declare the new ones (`Edit::declare`).
 //!
 //! # What a launcher has
 //!
@@ -156,6 +157,42 @@ struct Image {
     arch: Arch,
 }
 
+/// The build's instances by identity, each with its key and its code: `identities` (by key)
+/// and `codes` beside it, sorted by identity. An identity is a BLAKE3 hash, so the list is
+/// first dealt into 4096 runs by its leading twelve bits (in the order `ContentId` compares:
+/// its bytes) and each run of a few is sorted: a pass and a half over the list where a sort
+/// of twelve thousand 96-byte rows was a millisecond of every build.
+fn by_identity(identities: &[(InstanceKey, ContentId)], codes: &[CodeHash]) -> Vec<(ContentId, InstanceKey, CodeHash)> {
+    const RUNS: usize = 1 << 12;
+    let run = |identity: &ContentId| (usize::from(identity.0[0]) << 4) | usize::from(identity.0[1] >> 4);
+    // alloc (each below): once a build, let go at its end
+    let mut ends = vec![0u32; RUNS + 1];
+    for (_, identity) in identities {
+        ends[run(identity) + 1] += 1;
+    }
+    for at in 1..ends.len() {
+        ends[at] += ends[at - 1];
+    }
+    // Each run's next free place, then its end once every row is dealt.
+    let mut order = vec![0u32; identities.len()];
+    let mut next = ends[..RUNS].to_vec();
+    for (at, (_, identity)) in identities.iter().enumerate() {
+        let run = run(identity);
+        order[next[run] as usize] = at as u32;
+        next[run] += 1;
+    }
+    for run in 0..RUNS {
+        order[ends[run] as usize..ends[run + 1] as usize].sort_unstable_by_key(|at| identities[*at as usize].1);
+    }
+    order
+        .iter()
+        .map(|at| {
+            let (key, identity) = identities[*at as usize];
+            (identity, key, codes[*at as usize])
+        })
+        .collect()
+}
+
 /// One launcher.
 struct Launcher {
     conn: Conn,
@@ -172,6 +209,16 @@ struct Launcher {
     restarting: bool,
     /// The edits sent to answer a stub and not yet answered: the transaction and its slot.
     needs: Vec<(u64, u32)>,
+}
+
+/// The answer to a `Hello`, kept ([`Program::welcome`]).
+struct Welcome {
+    /// `Program::builds` and `Program::needed.len()` when it was made.
+    of: (u64, usize),
+    frames: Vec<u8>,
+    declared: u32,
+    bound: Vec<Option<RecordId>>,
+    statics: Vec<StaticId>,
 }
 
 /// Why the program cannot serve a launcher.
@@ -198,6 +245,13 @@ pub struct Program {
     needed: Vec<u32>,
     /// By slot: whether it is in `needed`.
     is_needed: Vec<bool>,
+    /// How many builds the program was given: which image a kept answer is of.
+    builds: u64,
+    /// The answer to the last `Hello`, kept while it is still the answer: the image and the
+    /// needed set it was made of, its frames, and what a launcher that carries them out has
+    /// bound. A second run of an unchanged program is then told a copy of bytes (the
+    /// answer was 0.8 to 1.0 ms of a launcher's 3.2 ms start, measured 2026-11-12).
+    welcome: Option<Welcome>,
     /// The last transaction's number, over every launcher.
     txn: u64,
     /// The last message's id.
@@ -215,6 +269,8 @@ pub(crate) enum Plant {
     NoRebind,
     /// Two bodies changed at once are sent as an edit.
     NoRestart,
+    /// An edit counts the slots it declares before its records name their callees.
+    DeclareFirst,
 }
 
 impl Default for Program {
@@ -245,6 +301,8 @@ impl Program {
             launchers: Vec::new(), // alloc: as above
             needed: Vec::new(),    // alloc: as above
             is_needed: Vec::new(), // alloc: as above
+            builds: 0,
+            welcome: None,
             txn: 0,
             said: 0,
             plant: Plant::None,
@@ -287,17 +345,16 @@ impl Program {
         }
     }
 
-    /// The slot of the function `key` names in the image.
-    fn slot_of(&self, image: &Image, key: InstanceKey) -> Result<u32, Refusal> {
-        let identity = image
-            .identities
-            .binary_search_by_key(&key, |it| it.0)
-            .map(|at| image.identities[at].1)
-            .map_err(|_| format!("{key:?} is named by the program's code and is no instance of its build"))?;
-        self.slots
-            .get(&identity)
-            .copied()
-            .ok_or_else(|| format!("{key:?} has an identity with no slot"))
+    /// The slot of `identity`: the one it has, or the next, given now.
+    fn slot_for(
+        slots: &mut HashMap<ContentId, u32, Global>,
+        identities: &mut Vec<ContentId>,
+        identity: ContentId,
+    ) -> u32 {
+        *slots.entry(identity).or_insert_with(|| {
+            identities.push(identity);
+            (identities.len() - 1) as u32
+        })
     }
 
     /// The record of `slot`'s function in the newest build, made once a build.
@@ -333,14 +390,27 @@ impl Program {
     }
 
     /// The numbers a bind gives for `made`'s places: slots and statics' numbers.
-    fn refs(&self, made: &Made) -> Result<Vec<u32>, Refusal> {
-        let Some(image) = &self.image else {
+    ///
+    /// A function gets its slot here, the first time a record names it: a slot is given to
+    /// what code that is sent somewhere names, never to the whole program, so what a launcher
+    /// declares at its start follows what it runs and not how much there is (hello world
+    /// names some 14,000 functions and a run calls some 200; declaring every one was a tenth
+    /// of a launcher's start).
+    fn refs(&mut self, made: &Made) -> Result<Vec<u32>, Refusal> {
+        let Program { image, slots, identities, .. } = self;
+        let Some(image) = image else {
             return Err("no build of the program is held".to_owned()); // alloc: an error
         };
         made.named
             .iter()
             .map(|named| match named {
-                Named::Function(key) => self.slot_of(image, *key),
+                Named::Function(key) => image
+                    .identities
+                    .binary_search_by_key(key, |it| it.0)
+                    .map(|at| Program::slot_for(slots, identities, image.identities[at].1))
+                    .map_err(|_| {
+                        format!("{key:?} is named by the program's code and is no instance of its build")
+                    }),
                 Named::Static(id) => image
                     .statics
                     .binary_search_by_key(id, |it| it.0)
@@ -360,13 +430,13 @@ impl Program {
         let mut refs: Vec<Vec<u32>> = Vec::with_capacity(numbers.len());
         let mut ids = Vec::with_capacity(numbers.len());
         for number in numbers {
-            let (id, bytes, made_refs) = {
+            let made = {
                 let Some(image) = &self.image else {
                     return Err("no build of the program is held".to_owned()); // alloc: an error
                 };
-                let made = &image.statics[*number as usize].1;
-                (made.id, made.bytes.clone(), self.refs(made)?) // clone: the record's bytes into the frame's builder
+                image.statics[*number as usize].1.clone() // clone: a static's record, into the frame's builder
             };
+            let (id, bytes, made_refs) = (made.id, made.bytes.clone(), self.refs(&made)?); // clone: as above
             self.frame(&Tell::Record { id, bytes: &bytes }, out)?;
             refs.push(made_refs);
             ids.push(id);
@@ -393,11 +463,7 @@ impl Program {
         together: bool,
         out: &mut Vec<u8>,
     ) -> Result<(), Refusal> {
-        let declared = self.launchers[launcher].declared;
-        let declare = (self.identities.len() as u32).saturating_sub(declared);
-        if slots.is_empty() && declare == 0 {
-            return Ok(());
-        }
+        let early = (self.identities.len() as u32).saturating_sub(self.launchers[launcher].declared);
         // alloc: the binds of one edit
         let mut mades = Vec::with_capacity(slots.len());
         let mut refs = Vec::with_capacity(slots.len());
@@ -406,6 +472,16 @@ impl Program {
             refs.push(self.refs(&made)?);
             self.frame(&Tell::Record { id: made.id, bytes: &made.bytes }, out)?;
             mades.push(made);
+        }
+        // After the records' numbers were given: naming a function gives it its slot, and
+        // the edit declares every slot given since this launcher last declared.
+        let declared = self.launchers[launcher].declared;
+        let declare = match self.plant {
+            Plant::DeclareFirst => early,
+            _ => (self.identities.len() as u32).saturating_sub(declared),
+        };
+        if slots.is_empty() && declare == 0 {
+            return Ok(());
         }
         let binds: Vec<wire::Bind<'_>> = slots // alloc: as above
             .iter()
@@ -458,17 +534,37 @@ impl Program {
                 if arch != ours {
                     return Err(format!("a launcher of {arch:?} asked for a program built for {ours:?}"));
                 }
-                let slots = self.identities.len() as u32;
+                let of = (self.builds, self.needed.len());
+                if let Some(kept) = self.welcome.as_ref().filter(|it| it.of == of) {
+                    out.extend_from_slice(&kept.frames);
+                    let launcher = &mut self.launchers[at];
+                    launcher.declared = kept.declared;
+                    launcher.bound = kept.bound.clone(); // clone: a launcher's own table
+                    launcher.statics = kept.statics.clone(); // clone: as above
+                    launcher.welcomed = true;
+                    return Ok(());
+                }
+                let began = out.len();
                 let numbers: Vec<u32> = (0..image.statics.len() as u32).collect(); // alloc: once a launcher
                 let statics: Vec<StaticId> = image.statics.iter().map(|it| it.0).collect(); // alloc: as above
                 let inits = image.inits.clone(); // clone: a few numbers, once a launcher
-                let entry = self
-                    .slots
-                    .get(&image.entry)
-                    .copied()
-                    .ok_or_else(|| "the program's entry has no slot".to_owned())?;
+                let entry_identity = image.entry;
+                let entry = Program::slot_for(&mut self.slots, &mut self.identities, entry_identity);
+                // What the runs before this one called, bound before it starts: those of
+                // them the newest build still has code for.
+                let prefetch: Vec<u32> = // alloc: once a launcher
+                    self.needed.clone().into_iter().filter(|slot| self.record(*slot).is_ok()).collect(); // clone: a list of numbers, once a launcher
+                // Every slot the statics and those records name is given first, so that the
+                // welcome declares them all and nothing below names one not declared.
+                let mut body = Vec::new(); // alloc: once a launcher, the frames after the welcome
+                self.define(&numbers, &mut body)?;
+                for slot in &prefetch {
+                    let made = self.record(*slot)?;
+                    self.refs(&made)?;
+                }
+                let slots = self.identities.len() as u32;
                 self.frame(&Tell::Welcome { slots }, out)?;
-                self.define(&numbers, out)?;
+                out.extend_from_slice(&body);
                 {
                     let launcher = &mut self.launchers[at];
                     launcher.declared = slots;
@@ -476,12 +572,16 @@ impl Program {
                     launcher.statics = statics;
                     launcher.welcomed = true;
                 }
-                // What the runs before this one called, bound before it starts: those of
-                // them the newest build still has code for.
-                let prefetch: Vec<u32> = // alloc: once a launcher
-                    self.needed.clone().into_iter().filter(|slot| self.record(*slot).is_ok()).collect(); // clone: a list of numbers, once a launcher
                 self.edit(at, &prefetch, false, out)?;
                 self.frame(&Tell::Start { entry: Slot(entry), inits: List::of(&inits) }, out)?;
+                let launcher = &self.launchers[at];
+                self.welcome = Some(Welcome {
+                    of,
+                    frames: out[began..].to_vec(), // alloc: the kept answer, once an image
+                    declared: launcher.declared,
+                    bound: launcher.bound.clone(),     // clone: the kept answer's table
+                    statics: launcher.statics.clone(), // clone: as above
+                });
             }
             Ask::Need { slot, .. } => {
                 // The newest build's record of the slot, whatever build the stub fired on.
@@ -596,23 +696,21 @@ impl Program {
             return Err("a build of no function".to_owned()); // alloc: an error
         };
         let arch = first.arch;
-        // Slots for the identities new to this build, in the order of their keys.
-        for (_, identity) in &built.identities {
-            if !self.slots.contains_key(identity) {
-                self.slots.insert(*identity, self.identities.len() as u32);
-                self.identities.push(*identity);
+        // alloc: the image's lists, once a build (each a copy of a list of the build's)
+        // Each identity's code, in the identities' order: both lists are by key, so one pass
+        // over the two.
+        let mut codes: Vec<CodeHash> = Vec::with_capacity(built.identities.len());
+        let mut owner = 0;
+        for (key, _) in &built.identities {
+            while built.owners.get(owner).is_some_and(|it| it.0 < *key) {
+                owner += 1;
+            }
+            match built.owners.get(owner) {
+                Some(it) if it.0 == *key => codes.push(it.2),
+                _ => return Err(format!("{key:?} has an identity and no owner in its build")),
             }
         }
-        // alloc: the image's lists, once a build (each a copy of a list of the build's)
-        let mut by_identity: Vec<(ContentId, InstanceKey, CodeHash)> = Vec::with_capacity(built.identities.len());
-        for (key, identity) in &built.identities {
-            let code = match built.owners.binary_search_by_key(key, |it| it.0) {
-                Ok(at) => built.owners[at].2,
-                Err(_) => return Err(format!("{key:?} has an identity and no owner in its build")),
-            };
-            by_identity.push((*identity, *key, code));
-        }
-        by_identity.sort_unstable_by_key(|it| it.0);
+        let by_identity = by_identity(&built.identities, &codes);
         let Some(entry_key) = built.symbols.iter().find(|it| it.1 == entry).map(|it| it.0) else {
             return Err(format!("the build defines no `{entry}`: it is no program"));
         };
@@ -638,12 +736,26 @@ impl Program {
             }
             statics.push(((of.item, of.instance), record::of_static(of, &name, arch, &self.spans)?));
         }
+        // Nothing below refuses: the build before is taken, and the new one is the program's
+        // before this returns. A name the build before had under the same key is moved, not
+        // copied: a body edit changes one key of some twelve thousand.
+        let mut before = self.image.take();
+        let mut was = before.as_mut().map(|it| std::mem::take(&mut it.names)).unwrap_or_default().into_iter().peekable();
+        let mut names: Vec<(InstanceKey, String)> = Vec::with_capacity(built.debug_names.len());
+        for (key, name) in &built.debug_names {
+            while was.next_if(|it| it.0 < *key).is_some() {}
+            match was.next_if(|it| it.0 == *key && it.1 == *name) {
+                Some(kept) => names.push(kept),
+                None => names.push((*key, name.clone())), // clone: a name the build before had not
+            }
+        }
+        drop(was);
         let image = Image {
             functions: built.functions.clone(), // clone: a count a function
             merged: built.deduped.merged.iter().map(|(from, to)| (*from, *to)).collect(),
             identities: built.identities.clone(), // clone: the build's list, once a build
             by_identity,
-            names: built.debug_names.clone(), // clone: the build's names, once a build
+            names,
             statics,
             inits,
             entry: entry_identity,
@@ -651,7 +763,9 @@ impl Program {
         };
 
         // What changed, against the build before.
-        let before = self.image.replace(image);
+        self.builds += 1;
+        self.welcome = None;
+        self.image = Some(image);
         let image = self.image.as_ref().expect("just set");
         let mut restart: Option<String> = None;
         let mut bodies: Vec<(CodeHash, CodeHash, ContentId)> = Vec::new(); // alloc: once a build
@@ -659,12 +773,16 @@ impl Program {
             if before.entry != image.entry {
                 restart = Some("the program's entry is another function".to_owned()); // alloc: once
             }
-            for (identity, key, code) in &image.by_identity {
-                let Ok(at) = before.by_identity.binary_search_by_key(identity, |it| it.0) else {
+            // Both by identity: one pass over the two.
+            let mut was = 0;
+            for (identity, _, code) in &image.by_identity {
+                while before.by_identity.get(was).is_some_and(|it| it.0 < *identity) {
+                    was += 1;
+                }
+                let Some((_, _, old_code)) = before.by_identity.get(was).copied().filter(|it| it.0 == *identity)
+                else {
                     continue;
                 };
-                let (_, _, old_code) = before.by_identity[at];
-                let _ = key;
                 // The entry (the C `main` the front end makes around the program's `fn
                 // main`) follows `fn main`'s code and has no body of its own to edit, and its
                 // one frame is the process's first: it is rebound with `fn main` and not
@@ -756,7 +874,11 @@ impl Program {
                 continue;
             }
             let ids: Vec<StaticId> = added.iter().map(|it| image.statics[*it as usize].0).collect(); // alloc: as above
-            self.define(&added, &mut out)?;
+            // The slots the new statics name are declared before the statics are defined.
+            let mut defined = Vec::new(); // alloc: once a launcher a build
+            self.define(&added, &mut defined)?;
+            self.edit(at, &[], false, &mut out)?;
+            out.extend_from_slice(&defined);
             self.launchers[at].statics.extend(ids);
             // The bound slots whose record is another now.
             let mut rebind = Vec::new(); // alloc: once a launcher a build

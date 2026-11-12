@@ -11,6 +11,7 @@
 //! | [`records`] | [`Loaded`]: the records the daemon sends, checked against their ids; the program's data and statics in a mapping of their own; outside symbols by `dlsym` |
 //! | [`tls`] | the program's thread-locals: a table a thread, a copy made on first touch, reached through a record's pool |
 //! | [`threads`] | the program's own threads told to the core: its `pthread_create` announces each birth, a key's destructor each end |
+//! | [`symbols`] | the names of placed code where the program's own backtrace looks: one more image of `dl_iterate_phdr`, whose file is a symbol table (Linux) |
 //! | [`unwind`] | a placed function's unwind entry, told to the system's unwinder and taken back when the body is freed |
 //!
 //! Who touches what, which is the whole of the design's safety:
@@ -40,6 +41,7 @@ pub mod arch;
 pub mod control;
 pub mod drive;
 pub mod records;
+pub mod symbols;
 pub mod sys;
 pub mod table;
 pub mod threads;

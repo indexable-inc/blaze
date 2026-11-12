@@ -672,7 +672,7 @@ fn calls_and_addresses_relocate_as_cranelifts() {
     assert_eq!(ours.words[bl.at as usize / 4], 0x9400_0000);
 }
 
-/// The invariant (docs/v2/plan/design/launcher.md, "Step 3"): under `Target::slots` a call
+/// The code's shape (docs/v2/plan/design/launcher.md, "Step 3"): under `Target::slots` a call
 /// of a named function is `adrp x16; ldr x16, [x16, lo12]; blr x16` against the callee's GOT
 /// entry (its slot word), colocated or not; a return call loads the word into `x17` and ends
 /// in `br x17`; and a colocated function's address is `adrp; add`, never a GOT load. A GOT

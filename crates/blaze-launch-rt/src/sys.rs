@@ -227,6 +227,17 @@ impl Code {
         Ok(())
     }
 
+    /// As [`Code::write`]: on macOS `sys_icache_invalidate` is all a write needs, so there
+    /// is nothing to put off.
+    pub fn copy(&mut self, at: usize, bytes: &[u8]) -> Result<(), SysError> {
+        self.write(at, bytes)
+    }
+
+    /// Nothing: [`Code::copy`] is a whole write here.
+    pub fn settle(&mut self) -> Result<(), SysError> {
+        Ok(())
+    }
+
     /// Gives the memory of whole pages back to the system. Their addresses stay reserved and
     /// are never used again (the core hands an offset out once).
     pub fn decommit(&mut self, at: usize, len: usize) -> Result<(), SysError> {
@@ -360,11 +371,32 @@ impl Code {
             unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), to.add(at), bytes.len()) };
         });
         #[cfg(target_arch = "aarch64")]
-        {
-            linux::icache(self.base() + at, bytes.len());
-            if !linux::membarrier(linux::PRIVATE_EXPEDITED_SYNC_CORE) {
-                return Err(failed("membarrier(PRIVATE_EXPEDITED_SYNC_CORE)", at, bytes.len()));
-            }
+        linux::icache(self.base() + at, bytes.len());
+        self.settle()
+    }
+
+    /// [`Code::write`] without its last step: the bytes are in memory and the instruction
+    /// caches were told, and no core has yet been made to drop what it fetched before. For
+    /// several writes of one edit, each of bytes nothing names: the caller calls
+    /// [`Code::settle`] once after the last, before any word names what was written. (One
+    /// `membarrier` a function made a launcher's start of 210 functions 210 system calls.)
+    pub fn copy(&mut self, at: usize, bytes: &[u8]) -> Result<(), SysError> {
+        self.within("write", at, bytes.len())?;
+        self.writable(|to| {
+            // SAFETY: as `write`'s copy.
+            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), to.add(at), bytes.len()) };
+        });
+        #[cfg(target_arch = "aarch64")]
+        linux::icache(self.base() + at, bytes.len());
+        Ok(())
+    }
+
+    /// Every core runs what [`Code::copy`] wrote from here on: on AArch64,
+    /// `membarrier(PRIVATE_EXPEDITED_SYNC_CORE)`; on x86-64 nothing is needed.
+    pub fn settle(&mut self) -> Result<(), SysError> {
+        #[cfg(target_arch = "aarch64")]
+        if !linux::membarrier(linux::PRIVATE_EXPEDITED_SYNC_CORE) {
+            return Err(failed("membarrier(PRIVATE_EXPEDITED_SYNC_CORE)", 0, 0));
         }
         Ok(())
     }
@@ -515,5 +547,91 @@ impl Data {
         // slice); no thread reads the range yet (the type's invariant).
         unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len()) };
         Ok(())
+    }
+}
+
+/// One value handed from a thread to another that waits for it, with nothing of the Rust
+/// runtime under it: a pthread mutex and condition variable.
+///
+/// Why not a channel or `std::sync`: a program thread waits here (a stub's wait for its
+/// code) and says things to the control thread at any point of its life, its end included,
+/// where the launcher's own thread-locals for that thread may be gone. A channel finds a
+/// waiting receiver through the sender's thread id, which lives in a thread-local, and
+/// `std::thread::current()` panics once that is destroyed (found on Linux: a function
+/// first called while a thread was ending aborted the program). pthread's primitives need
+/// no thread-local.
+pub struct Handoff<T> {
+    lock: core::cell::UnsafeCell<libc::pthread_mutex_t>,
+    cond: core::cell::UnsafeCell<libc::pthread_cond_t>,
+    /// Read and written only with `lock` held.
+    value: core::cell::UnsafeCell<Option<T>>,
+}
+
+// SAFETY: `value` is touched only under the pthread mutex, which makes a `Handoff<T>` a
+// lock around an `Option<T>`: shared between threads when `T` may be sent between them.
+unsafe impl<T: Send> Send for Handoff<T> {}
+// SAFETY: as above.
+unsafe impl<T: Send> Sync for Handoff<T> {}
+
+impl<T> Handoff<T> {
+    /// Empty. A `Handoff` must not be moved once a thread uses it (pthread's objects are
+    /// tied to their address): every user keeps it behind an `Arc` or in a value that stays.
+    pub const fn new() -> Handoff<T> {
+        Handoff {
+            lock: core::cell::UnsafeCell::new(libc::PTHREAD_MUTEX_INITIALIZER),
+            cond: core::cell::UnsafeCell::new(libc::PTHREAD_COND_INITIALIZER),
+            value: core::cell::UnsafeCell::new(None),
+        }
+    }
+
+    /// Runs `with` on the value, with the mutex held.
+    fn locked<R>(&self, with: impl FnOnce(&mut Option<T>) -> R) -> R {
+        // SAFETY: the mutex was statically initialized and is at a fixed address (`new`'s
+        // contract); locking it is sound from any thread.
+        unsafe { libc::pthread_mutex_lock(self.lock.get()) };
+        // SAFETY: the mutex is held, so this thread alone touches `value`.
+        let result = with(unsafe { &mut *self.value.get() });
+        // SAFETY: held by this thread, locked above.
+        unsafe { libc::pthread_mutex_unlock(self.lock.get()) };
+        result
+    }
+
+    /// Hands `value` over, replacing one not yet taken, and wakes a thread that waits.
+    pub fn put(&self, value: T) {
+        self.locked(|held| *held = Some(value));
+        // SAFETY: a statically initialized condition variable at a fixed address.
+        unsafe { libc::pthread_cond_signal(self.cond.get()) };
+    }
+
+    /// Waits for a value and takes it. The wait has no clock: it ends when another thread
+    /// calls [`Handoff::put`], which every user arranges (the control thread answers every
+    /// stub, with code or with why none can come).
+    pub fn take(&self) -> T {
+        // SAFETY: as `locked`.
+        unsafe { libc::pthread_mutex_lock(self.lock.get()) };
+        loop {
+            // SAFETY: the mutex is held.
+            if let Some(value) = unsafe { (*self.value.get()).take() } {
+                // SAFETY: held by this thread.
+                unsafe { libc::pthread_mutex_unlock(self.lock.get()) };
+                return value;
+            }
+            // SAFETY: the mutex is held by this thread, as `pthread_cond_wait` asks; it
+            // comes back with it held. A spurious return loops.
+            unsafe { libc::pthread_cond_wait(self.cond.get(), self.lock.get()) };
+        }
+    }
+}
+
+impl<T> core::fmt::Debug for Handoff<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // What it holds is behind its mutex: not read for a debug line.
+        f.write_str("Handoff")
+    }
+}
+
+impl<T> Default for Handoff<T> {
+    fn default() -> Handoff<T> {
+        Handoff::new()
     }
 }

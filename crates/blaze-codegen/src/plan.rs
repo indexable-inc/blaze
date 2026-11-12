@@ -597,7 +597,7 @@ mod tests {
         assert!(!dependency.patchable);
     }
 
-    /// The invariant (docs/v2/plan/design/launcher.md, "Step 3"): a launched program's first
+    /// What `Mode::Launched` plans (docs/v2/plan/design/launcher.md, "Step 3"): a launched program's first
     /// code is tier 0 code that calls through slot words, for every function whoever wrote
     /// it (a member, a dependency, std at its shipped `-O3`), and each has a slot; build-time
     /// code, which runs out of the launcher's process, is an output's. The launcher's code

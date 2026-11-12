@@ -13,10 +13,14 @@
 //! under one named lock a program; frames are queued to a launcher's writer under that lock,
 //! so a launcher is written what the core decided, in the order it decided it.
 //!
-//! Not built, each a refusal by name and never a quiet path: a program this daemon did not
-//! build since it started (its record replays, and no code of it is held: the launcher stops
-//! and says so); test binaries, which stay dev executables; the eager background check
-//! (launcher.md, section 4): a build is whole before its program can start.
+//! A launched program's unit is replayed from its record only where the core holds the code
+//! of the build that record is of, and is built otherwise ([`not_replayed`]), so the core
+//! holds the code of exactly the build that answered. A launcher started by hand against a daemon that holds none of it (a file from
+//! before the daemon restarted, and no build since) stops and says so.
+//!
+//! Not built, each a refusal by name and never a quiet path: test binaries, which stay dev
+//! executables; the eager background check (launcher.md, section 4): a build is whole before
+//! its program can start.
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -64,6 +68,45 @@ pub(crate) fn launched(job: &Job, unit: usize, policy: &Policy) -> Result<bool, 
     Ok(codegen::triple(job, u) == job.input.config.host)
 }
 
+/// Whether `unit`, whose kept record names `outputs` (path, key, whether it is executable)
+/// and whose whole record key is `key` now, is a launcher's program whose record must not be
+/// replayed: the unit is then built, so that the program's core holds the code of exactly
+/// this build before a launcher asks for it.
+///
+/// A record says which file a build made, and a launched program's file is the launcher's,
+/// the same bytes for every build of it: a replay gives the core nothing. So a record is
+/// replayed only where the core already holds the code of the build that record is of: the
+/// program's last launch link was of a build with this same record key (a key covers every
+/// input of its unit, rule keys-cover-every-input). A source edited and then put back has
+/// the first build's key while the core holds the second's (found by the measurement's check
+/// of its output, 2026-11-12); a daemon that restarted holds none. `false` with [`VAR`] off,
+/// for a unit that makes no program, and for one built any other way.
+pub(crate) fn not_replayed(
+    job: &Job,
+    unit: usize,
+    outputs: &[(String, blaze_cas::Key, bool)],
+    key: Option<blaze_cas::Key>,
+) -> Result<bool, String> {
+    if !on() || !outputs.iter().any(|it| it.2) {
+        return Ok(false);
+    }
+    let policy = codegen::toolchain(job, unit).and_then(|it| codegen::policy(job, unit, it))?;
+    if policy.mode != blaze_codegen::plan::Mode::Launched {
+        return Ok(false);
+    }
+    let plan = job.plan(unit).map_err(|it| it.what)?;
+    let made = super::super::artifact::made(plan);
+    let programs = job.shared.launches.programs.pin();
+    Ok(outputs.iter().any(|(path, _, executable)| {
+        *executable
+            && made.contains(&path.as_str())
+            && !programs.get(&program_id(path)).is_some_and(|held| {
+                let core = held.core.lock();
+                key.is_some() && core.record == key
+            })
+    }))
+}
+
 /// One program this daemon built for a launcher, and the launchers running it.
 struct Held {
     /// The path its link was asked for: what errors name it by.
@@ -77,6 +120,9 @@ struct Core {
     writers: Vec<(Conn, Sender<Vec<u8>>)>,
     /// The serial of the span tables the program was last given (`LinkInputs::serial`).
     spans: Option<u64>,
+    /// The whole record key of the unit's build the program was last given: the build whose
+    /// code the core holds ([`not_replayed`]).
+    record: Option<blaze_cas::Key>,
 }
 
 /// The daemon's launcher programs, by id, and the socket their launchers connect to: made
@@ -89,6 +135,8 @@ pub(crate) struct Launches {
     programs: Arc<SharedMap<[u8; 32], Arc<Held>>>,
     /// The last connection's number.
     conns: Arc<std::sync::atomic::AtomicU64>,
+    /// blaze's launcher, read once a daemon: its bytes and the store's key of them.
+    launcher: Lock<Option<(Arc<Vec<u8>>, blaze_cas::Key)>>,
 }
 
 /// The id of the program whose link is asked for at `path`: what its sidecar names.
@@ -103,7 +151,32 @@ impl Launches {
             listening: Lock::new("serve.launches.listening", false),
             programs: Arc::new(SharedMap::default()),
             conns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            launcher: Lock::new("serve.launches.launcher", None),
         }
+    }
+
+    /// blaze's launcher (`blaze-launcher`, beside blaze's own executable `blaze`): its bytes
+    /// and their key, read at the first program's link.
+    fn launcher(&self, blaze: &std::path::Path, path: &str) -> Result<(Arc<Vec<u8>>, blaze_cas::Key), String> {
+        // clone: two counts, once a link
+        if let Some(held) = self.launcher.lock().clone() {
+            return Ok(held);
+        }
+        let launcher = blaze
+            .parent()
+            .map(|it| it.join("blaze-launcher"))
+            .ok_or_else(|| format!("{} has no directory to find blaze-launcher in", blaze.display()))?;
+        // Read outside the lock: two links that race read it twice and keep one.
+        let file = std::fs::read(&launcher).map_err(|why| {
+            format!(
+                "{path} is built to run under blaze's launcher ({VAR} is on), and the launcher {} does not read: {why}",
+                launcher.display()
+            )
+        })?;
+        let key = crate::serve::unit::compile::output_key(&file);
+        let held = (Arc::new(file), key);
+        *self.launcher.lock() = Some(held.clone()); // clone: two counts
+        Ok(held)
     }
 
     fn socket(&self) -> PathBuf {
@@ -142,6 +215,7 @@ impl Launches {
         path: &str,
         built: &Built,
         entry: &str,
+        record: Option<blaze_cas::Key>,
         tables: impl FnOnce(Option<u64>) -> Result<(u64, Given), String>,
     ) -> Result<Vec<Told>, String> {
         let id = program_id(path);
@@ -155,7 +229,7 @@ impl Launches {
                     core: Lock::new(
                         "serve.launches.program",
                         // alloc: once per program, its tables
-                        Core { program: Program::new(), writers: Vec::new(), spans: None },
+                        Core { program: Program::new(), writers: Vec::new(), spans: None, record: None },
                     ),
                 });
                 self.programs.pin().insert(id, Arc::clone(&made));
@@ -166,7 +240,11 @@ impl Launches {
         // is queued to each launcher's writer under it, so the order of frames is the order
         // of decisions.
         let mut core = held.core.lock();
+        // Until this build is the core's, no record is the core's: a failure below leaves
+        // the next build to be made, never replayed.
+        core.record = None;
         let (serial, given) = tables(core.spans)?;
+        let _span = tracing::info_span!(target: "blaze", "launch link: the program takes the build").entered();
         let told = match &given {
             Given::Whole(all) => core.program.built(built, entry, Tables::Whole(all)),
             Given::Changed { tables, removed } => {
@@ -177,6 +255,7 @@ impl Launches {
         }
         .map_err(|why| format!("{}: {why}", held.path))?;
         core.spans = Some(serial);
+        core.record = record;
         let mut what = Vec::with_capacity(told.len()); // alloc: once a build
         for (conn, frames, said) in told {
             if let Some((_, writer)) = core.writers.iter().find(|it| it.0 == conn)
@@ -296,9 +375,12 @@ fn serve(conn: Conn, mut socket: UnixStream, programs: &SharedMap<[u8; 32], Arc<
             }
         }
     });
-    if let Err(why) = written {
-        return tracing::error!(target: "blaze", "launcher {}'s writer thread did not start: {why}", conn.0);
-    }
+    let written = match written {
+        Ok(written) => written,
+        Err(why) => {
+            return tracing::error!(target: "blaze", "launcher {}'s writer thread did not start: {why}", conn.0);
+        }
+    };
     {
         let mut core = held.core.lock();
         core.program.connected(conn);
@@ -331,21 +413,20 @@ fn serve(conn: Conn, mut socket: UnixStream, programs: &SharedMap<[u8; 32], Arc<
         let mut out = Vec::new(); // alloc: one frame
         let unheld = Tell::Unheld { why: &why };
         if unheld.encode(u64::MAX, &mut out).is_ok() {
-            // Written here, after everything queued: the writer thread may be mid-frame.
+            // Queued after everything the core decided for it: written last.
             drop(send.send(out));
-            // The writer drains its queue before the socket is shut down below: bounded by
-            // the frames queued, a handful.
-            for _ in 0..1000 {
-                if send.is_empty() {
-                    break;
-                }
-                std::thread::yield_now();
-            }
         }
     }
-    let mut core = held.core.lock();
-    core.program.disconnected(conn);
-    core.writers.retain(|it| it.0 != conn);
+    {
+        let mut core = held.core.lock();
+        core.program.disconnected(conn);
+        core.writers.retain(|it| it.0 != conn);
+    }
+    // Both senders are gone now, so the writer ends once it wrote what was queued. The wait:
+    // for that; it ends when the queue is drained or the launcher's socket refuses a write
+    // (a launcher that is alive and reads nothing holds this one thread, and nothing else).
+    drop(send);
+    drop(written.join());
     // The launcher's process is told nothing more: closing its socket ends its code service,
     // which it says by name if a stub still fires.
     drop(socket.shutdown(std::net::Shutdown::Both));
@@ -355,8 +436,9 @@ fn serve(conn: Conn, mut socket: UnixStream, programs: &SharedMap<[u8; 32], Arc<
 /// program's path, the sidecar's for each path the program runs from, and what the running
 /// launchers were told of this build.
 pub(crate) struct Linked {
-    /// The launcher binary: the file at cargo's path.
-    pub(crate) file: Vec<u8>,
+    /// The launcher binary, the file at cargo's path, and the store's key of it.
+    pub(crate) file: Arc<Vec<u8>>,
+    pub(crate) key: blaze_cas::Key,
     /// The sidecar's text, the same beside every path.
     pub(crate) sidecar: Vec<u8>,
     pub(crate) told: Vec<Told>,
@@ -374,31 +456,24 @@ pub(crate) fn sidecar_of(path: &str) -> String {
 /// are handed back for the loop to place.
 pub(crate) fn link(
     job: &Job,
+    unit: usize,
     path: &str,
     generated: &codegen::Generated<'_>,
 ) -> Result<Linked, String> {
     let _span = tracing::info_span!(target: "blaze", "launch link", unit = %path).entered();
     let launches = &job.shared.launches;
     let socket = launches.listen()?;
-    // blaze's launcher: beside blaze's own executable.
-    let launcher = job
-        .shared
-        .launcher
-        .parent()
-        .map(|it| it.join("blaze-launcher"))
-        .ok_or_else(|| format!("{} has no directory to find blaze-launcher in", job.shared.launcher.display()))?;
-    let file = std::fs::read(&launcher).map_err(|why| {
-        format!(
-            "{path} is built to run under blaze's launcher ({VAR} is on), and the launcher {} does not read: {why}",
-            launcher.display()
-        )
-    })?;
+    let (file, key) = launches.launcher(&job.shared.launcher, path)?;
     let first = launches.programs.pin().get(&program_id(path)).is_none();
-    let told = launches.built(path, generated.built, "main", |held| {
+    let record = tracing::info_span!(target: "blaze", "launch link: the unit's record key")
+        .in_scope(|| super::super::compile::record_key(job, unit))
+        .map_err(|it| it.what)?;
+    let told = launches.built(path, generated.built, "main", record, |held| {
         // What `LinkInputs` says, against the snapshot the program holds: the same snapshot
         // (nothing changed), a change of it, every table made anew (`work.whole`), or a
         // snapshot the program does not hold, when every table is asked for.
-        let side = generated.side()?;
+        let side = tracing::info_span!(target: "blaze", "launch link: the build's span tables")
+            .in_scope(|| generated.side())?;
         // clone (each below): tables into the program's own copy
         let changed = || Given::Changed {
             tables: side.tables.iter().map(|it| (it.anchor, it.bytes.clone())).collect(),
@@ -426,5 +501,5 @@ pub(crate) fn link(
         let _ = write!(sidecar, "{byte:02x}");
     }
     sidecar.push('\n');
-    Ok(Linked { file, sidecar: sidecar.into_bytes(), told, first })
+    Ok(Linked { file, key, sidecar: sidecar.into_bytes(), told, first })
 }

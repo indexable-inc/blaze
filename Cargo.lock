@@ -1433,6 +1433,7 @@ dependencies = [
  "blake3",
  "blaze-launch",
  "crossbeam-channel",
+ "crossbeam-queue",
  "libc",
 ]
 

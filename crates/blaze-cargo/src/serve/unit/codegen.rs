@@ -2393,7 +2393,7 @@ fn launched(
     generated: &Generated<'_>,
 ) -> Result<LinkMade, String> {
     use blaze_launch_host::Told;
-    let linked = super::run::launch::link(job, path, generated)?;
+    let linked = super::run::launch::link(job, unit, path, generated)?;
     let whole = |bytes: &[u8]| blaze_cas::Sparse {
         len: bytes.len() as u64,
         runs: vec![(0, bytes.to_vec())], // alloc: the file's one run, once a link
@@ -2429,7 +2429,12 @@ fn launched(
     let tiers = tiers(job, unit, generated.built, generated.policy.toolchain.arch)?;
     Ok(LinkMade {
         made: linked.first.then(|| Made::Whole(whole(&linked.file))),
-        written: Written::Bytes(linked.file),
+        // The store is given the launcher's bytes by a program's first build; every later
+        // one names what it keeps, and hashes and writes nothing.
+        written: match linked.first {
+            true => Written::Bytes(linked.file.to_vec()), // alloc: the file, once a program
+            false => Written::Kept(linked.key),
+        },
         side,
         read: Vec::new(), // alloc: none, empty
         table: None,

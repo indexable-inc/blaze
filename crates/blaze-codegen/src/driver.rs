@@ -5185,6 +5185,8 @@ mod kept;
 pub use kept::{Kept, Walk, Work};
 mod later;
 mod lists;
+mod near;
+pub use near::{Callee, Near};
 mod patch;
 mod recursion;
 use recursion::Step;

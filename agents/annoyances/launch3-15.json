@@ -1,0 +1,21 @@
+{
+ "id": "launch3-15",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+ "where": "measuring `blaze run` under the launcher; crates/blaze-thin/src/route.rs",
+ "what": "Every launcher number I reported first (warm no-op 32 ms, edit then run 56 ms, live edit 48 ms) was 6 to 8 ms too high a request: my series had BLAZE_LAUNCH=1 in every command's environment, and any BLAZE_* variable other than BLAZE_HOME sends the thin client to blaze-engine. The switch is read by the daemon only.",
+ "cost": "a reported 19 ms gap to today's path of which about half was the measurement; an hour timing the launcher's phases before the client was suspected",
+ "cause": "a daemon-side switch set as a client-side environment variable, and a client whose routing depends on variables it does not name in its output",
+ "whys": [
+  "why wrong: the number measured the engine's start, not the launcher",
+  "why possible: the thin client routes on any BLAZE_* variable, silently",
+  "why not caught: both paths printed the same output; nothing says which client answered",
+  "why easy: H2 says to fix one environment a series, which I did, with the variable in it",
+  "property: a measured path differs from the intended one with no trace in the output"
+ ],
+ "class": "silent path change by environment: a variable meant for one process changes which code another process runs, and the run's output does not say so",
+ "prevention": "the profile's build row carries which client served the request (thin or engine) and why, and the measurement how-to (H2) says to query it for every series; daemon-only switches are read from the daemon's config, not a variable every client inherits",
+ "workaround": "BLAZE_LAUNCH=1 on the command that starts the daemon only",
+ "state": "open",
+ "fix": ""
+}

@@ -50,6 +50,7 @@ macro_rules! real {
 }
 
 real! {
+    a_body_edit_reaches_a_running_program
     a_body_edit_remakes_one_function
     a_broken_revision_fails_and_recovers
     a_cfg_twin_chosen_by_a_build_script
@@ -60,6 +61,7 @@ real! {
     a_comment_edit_remakes_nothing
     a_dependency_edit_reaches_only_what_uses_it
     a_feature_flip_follows_the_cfg
+    a_panic_under_the_launcher_names_its_frames
     a_renamed_function_keeps_its_code
     a_save_by_rename_is_read_whole
     a_save_is_built_before_it_is_asked_for

@@ -1,0 +1,12 @@
+{
+ "id": "launch3-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+ "where": "blaze-cargo daemon threads",
+ "what": "`tracing::error!(target: \"blaze\", ..)` from a thread of the daemon that is no job's is in no file a person reads: the launch driver's refusal of a launcher was nowhere (`serve.log` has the memory lines only), and the launcher said only `the daemon's socket ended: the daemon closed it`.",
+ "cost": "a rebuild to carry the reason to the launcher before the cause could be read",
+ "cause": "the daemon's own stderr and its tracing go to different places, and an error outside a build has no reader",
+ "workaround": "the driver tells the launcher why (`Tell::Unheld`) before it closes the socket",
+ "state": "open",
+ "fix": ""
+}

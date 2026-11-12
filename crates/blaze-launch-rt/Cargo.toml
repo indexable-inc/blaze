@@ -18,6 +18,8 @@ doctest = false
 blaze-launch.workspace = true
 # The one channel (rule standard-structures): what threads tell the control thread.
 crossbeam-channel.workspace = true
+# The one queue (rule standard-structures): what threads say to the control thread.
+crossbeam-queue.workspace = true
 # A record's id is the BLAKE3 hash of its bytes: checked when the daemon gives one.
 blake3.workspace = true
 

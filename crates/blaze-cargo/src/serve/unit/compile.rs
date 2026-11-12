@@ -337,7 +337,7 @@ pub(crate) mod header {
 /// with what its code read: none while the front end can't say what the unit's inputs are.
 /// Worked out once per job and unit, once the writer has set the unit's identity; before
 /// that, none and nothing memoized.
-fn record_key(job: &Job, unit: usize) -> Result<Option<Key>, ApiError> {
+pub(crate) fn record_key(job: &Job, unit: usize) -> Result<Option<Key>, ApiError> {
     if let Some(key) = job.keys.get(unit).and_then(|it| it.get()) {
         return Ok(*key);
     }
@@ -2274,6 +2274,17 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
     let kept = {
         let _span = tracing::info_span!("unit record lookup").entered();
         kept(job, unit)?
+    };
+    // A launcher's program is replayed only where the daemon holds the code of the very
+    // build its record is of; else it is built ([`super::run::launch::not_replayed`]).
+    let kept = match kept {
+        Some(kept)
+            if super::run::launch::not_replayed(job, unit, &kept.record.outputs, record_key(job, unit)?)
+                .map_err(|what| ApiError::new(what, None))? =>
+        {
+            None
+        }
+        other => other,
     };
     if kept.is_none() {
         let miss = missed(job, reader, unit);

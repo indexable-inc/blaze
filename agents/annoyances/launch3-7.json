@@ -1,0 +1,12 @@
+{
+ "id": "launch3-7",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+ "where": "crates/blaze-engine/tests/revisions",
+ "what": "The real driver runs each action to its end (`real.rs:145`, the wait for the child) and has no step that keeps a program running across an edit, so \"a body edit while the program runs\" cannot be a revision test.",
+ "cost": "the live edit is shown by a script (the measurement) and by blaze-stencil's and blaze-launch-host's tests, not by the revision suite",
+ "cause": "the driver's steps are a build, a run or a test, each a whole process",
+ "workaround": "none",
+ "state": "open: a step that starts `run` and one that waits for a line of its output",
+ "fix": "open: a step that starts `run` and one that waits for a line of its output"
+}

@@ -90,6 +90,48 @@ struct Real {
     log_read: u64,
     /// Whether a failure leaves the root in place, for its logs.
     keep: bool,
+    /// The program [`Step::Start`] started, while it runs.
+    running: Option<Running>,
+    /// When the last edit step wrote its files.
+    edited: Option<Instant>,
+}
+
+/// A program started by [`Step::Start`] and left running: `blaze run`'s process (which
+/// becomes or waits for the program), and what the program printed, each read of its
+/// standard output with when it arrived.
+struct Running {
+    child: std::process::Child,
+    started: Instant,
+    printed: std::sync::Arc<std::sync::Mutex<Vec<(Instant, Vec<u8>)>>>,
+    said: thread::JoinHandle<String>,
+}
+
+impl Running {
+    /// Everything printed so far, and for each byte's read when it arrived.
+    fn printed(&self) -> (Vec<u8>, Vec<(usize, Instant)>) {
+        let reads = self.printed.lock().unwrap_or_else(|it| it.into_inner());
+        let (mut all, mut ends) = (Vec::new(), Vec::new());
+        for (at, bytes) in reads.iter() {
+            all.extend_from_slice(bytes);
+            ends.push((all.len(), *at));
+        }
+        (all, ends)
+    }
+
+    /// When `text` was first whole in the output, if it is there. `from` is not a bound on
+    /// it: a text printed before `from` is found as printed then (an `await` of what was
+    /// there already is met at once).
+    fn first_after(&self, text: &str, from: Instant) -> Option<Instant> {
+        let (all, ends) = self.printed();
+        let at = all.windows(text.len().max(1)).position(|it| it == text.as_bytes())?;
+        ends.iter().find(|(end, _)| *end >= at + text.len()).map(|it| it.1.max(from))
+    }
+
+    fn end(mut self) -> String {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.said.join().unwrap_or_default()
+    }
 }
 
 fn drain(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<String> {
@@ -117,7 +159,18 @@ impl Real {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("test"), &test.name).unwrap();
         let blaze = std::env::var_os("BLAZE_REVISIONS_BLAZE").map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_blaze")), PathBuf::from);
-        Real { blaze, dir: root.join("w"), home: root.join("h"), cache: root.join("c"), others: Vec::new(), root, log_read: 0, keep: true }
+        Real {
+            blaze,
+            dir: root.join("w"),
+            home: root.join("h"),
+            cache: root.join("c"),
+            others: Vec::new(),
+            root,
+            log_read: 0,
+            keep: true,
+            running: None,
+            edited: None,
+        }
     }
 
     /// A `build` started and interrupted `after` milliseconds in, and waited for: its
@@ -138,6 +191,7 @@ impl Real {
         }
     }
 
+    /// `blaze ARGS` in the checkout, in the environment every command of the test has.
     fn command(&self, args: &[&str], env: &BTreeMap<String, String>) -> Command {
         let mut command = Command::new(&self.blaze);
         command.env_clear();
@@ -398,10 +452,19 @@ impl Real {
         seen
     }
 
+    /// The running program ended, if one runs: what it and `blaze run` said on standard error.
+    fn end_running(&mut self) -> String {
+        self.running.take().map(Running::end).unwrap_or_default()
+    }
+
     /// `before`: the project's files as the revision before left them.
     fn step(&mut self, step: &Step, revision: &Revision, env: &BTreeMap<String, String>, before: &BTreeMap<String, Vec<u8>>) {
+        let label = &revision.label;
         match step {
-            Step::Edit | Step::EditByRename | Step::EditTruncateWrite | Step::EditTwice => self.write(&revision.changes, step),
+            Step::Edit | Step::EditByRename | Step::EditTruncateWrite | Step::EditTwice => {
+                self.write(&revision.changes, step);
+                self.edited = Some(Instant::now());
+            }
             Step::Cancel(after) => {
                 let mut args = vec!["build"];
                 args.extend(revision.args.iter().map(String::as_str));
@@ -418,6 +481,76 @@ impl Real {
                 let out = self.blaze(&args, env);
                 self.dir = first;
                 assert!(out.ok, "{}: the build of the second checkout `{name}` failed:\n{}", revision.label, out.stderr);
+            }
+            Step::Start => {
+                assert!(self.running.is_none(), "{label}: `start` with a program already running");
+                let mut args = vec!["run"];
+                args.extend(revision.args.iter().map(String::as_str));
+                let mut child = self
+                    .command(&args, env)
+                    .spawn()
+                    .unwrap_or_else(|error| panic!("{label}: starting {}: {error}", self.blaze.display()));
+                let printed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let (mut out, into) = (child.stdout.take().unwrap(), std::sync::Arc::clone(&printed));
+                // Each read with when it arrived, until the program's output ends.
+                thread::spawn(move || {
+                    let mut chunk = [0u8; 4096];
+                    while let Ok(got @ 1..) = out.read(&mut chunk) {
+                        let read = (Instant::now(), chunk[..got].to_vec());
+                        into.lock().unwrap_or_else(|it| it.into_inner()).push(read);
+                    }
+                });
+                let said = drain(child.stderr.take().unwrap());
+                self.running = Some(Running { child, started: Instant::now(), printed, said });
+                self.edited = None;
+            }
+            Step::Await { within_ms, text } => {
+                let Some(running) = &mut self.running else {
+                    panic!("{label}: `await` with no program running: `start` one first");
+                };
+                // From the last save, or from the start with none since.
+                let from = self.edited.unwrap_or(running.started);
+                let by = from + Duration::from_millis(*within_ms);
+                let seen = loop {
+                    if let Some(seen) = running.first_after(text, from) {
+                        break Some(seen);
+                    }
+                    let gone = running.child.try_wait().unwrap().is_some();
+                    if gone || Instant::now() > by {
+                        break None;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                };
+                let took = seen.map(|it| it.saturating_duration_since(from).as_millis());
+                if !seen.is_some_and(|it| it <= by) {
+                    let (all, _) = running.printed();
+                    let tail = String::from_utf8_lossy(&all[all.len().saturating_sub(400)..]).into_owned();
+                    let said = self.end_running();
+                    panic!(
+                        "{label}: the running program did not print `{text}` within {within_ms} ms of {} (it took \
+                         {took:?} ms); its output ends:\n{tail}\nand it and `blaze run` said:\n{said}",
+                        if self.edited.is_some() { "the save" } else { "its start" },
+                    );
+                }
+                eprintln!("{label}: the running program printed `{text}` {} ms after {}", took.unwrap_or(0), if self.edited.is_some() { "the save" } else { "its start" });
+            }
+            Step::Count { times, text } => {
+                let Some(running) = &self.running else {
+                    panic!("{label}: `count` with no program running: `start` one first");
+                };
+                let (all, _) = running.printed();
+                let found = all.windows(text.len().max(1)).filter(|it| *it == text.as_bytes()).count() as u64;
+                if found != *times {
+                    let said = self.end_running();
+                    panic!(
+                        "{label}: the running program printed `{text}` {found} times, not {times} (a program \
+                         that prints it as it starts started {found} times); it and `blaze run` said:\n{said}"
+                    );
+                }
+            }
+            Step::End => {
+                assert!(self.running.is_some(), "{label}: `end` with no program running");
+                self.end_running();
             }
             Step::Stop => self.stop(),
             Step::Kill => {
@@ -507,6 +640,7 @@ fn copy_dir(from: &Path, to: &Path) {
 
 impl Drop for Real {
     fn drop(&mut self) {
+        self.end_running();
         if self.home.exists() {
             self.kill_daemon();
         }
@@ -543,6 +677,7 @@ pub fn rows(test: &Test, clean_when: Clean) -> (Vec<Row>, String) {
         let failed = check::held(revision, &seen, None, &[]);
         rows.push(Row { label: revision.label.clone(), seen, failed, clean_ok: None });
     }
+    real.end_running();
     real.stop();
     real.set_aside("incremental");
     // Each revision from nothing, at the same paths. Two revisions of one state, action and
