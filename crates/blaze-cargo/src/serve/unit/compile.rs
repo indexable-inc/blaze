@@ -712,6 +712,7 @@ pub(super) fn record_of(ok: bool, said: &Said) -> Vec<u8> {
         outputs: Vec::new(),
         artifact: None,
         made: &Made::default(),
+        ported: Vec::new(),
     };
     let mut bytes = Vec::new();
     header::write(&mut bytes, &[], &[], &[]);
