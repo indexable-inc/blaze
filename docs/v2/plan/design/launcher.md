@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: "How a program runs under the `edit` goal (D18, D21) - a launcher in the program's own process places code records behind one slot word a function, appends and never overwrites, retires old bodies by per-thread epochs, takes an edit as one gated transaction, and is to run many tests in one process as domains. Built - steps 1 and 2 (`crates/blaze-launch`, `crates/blaze-launch-rt`), step 3 (tier 0 code that calls through slot words, the record, its placement, data, statics, thread-locals, unwind entries), step 4 behind `BLAZE_LAUNCH=1` (`blaze run` of a binary runs in `blaze-launcher`, unlinked; the daemon still compiles the whole program first), step 5 in a first version (one changed body applied to the running program, anything else a restart in place). Not built - the scan of a thread from outside, lazy compiles in the daemon, test binaries, backtrace names, x86-64 (compiled, never run), domains, promotion."
+summary: "How a program runs under the `edit` goal (D18, D21) - a launcher in the program's own process places code records behind one slot word a function, appends and never overwrites, retires old bodies by per-thread epochs, takes an edit as one gated transaction, and is to run many tests in one process as domains. Built - steps 1 and 2 (`crates/blaze-launch`, `crates/blaze-launch-rt`), step 3 (tier 0 code that calls through slot words, the record, its placement, data, statics, thread-locals, unwind entries), step 4 behind `BLAZE_LAUNCH=1` (`blaze run` of a binary runs in `blaze-launcher`, unlinked; the daemon still compiles the whole program first), step 5 in a first version (one changed body applied to the running program, anything else a restart in place), the walk's frontier form in the codegen driver (one function ready to compile with no walk; nothing in the daemon calls it yet). Not built - the scan of a thread from outside, lazy serving of needs in the daemon (the seam is written here), placed code kept across runs, test binaries, backtrace names, x86-64 (compiled, never run), domains, promotion."
 date: 2026-11-12
 ---
 # The launcher: running a program under `edit`
@@ -440,11 +440,14 @@ control thread; `Command`'s children run, since nothing they call before `exec` 
   (`blaze-codegen/src/driver/later.rs`) is still uncalled, because answering a `Need` with
   it needs the front end's database after the job that built the program ended. The cold
   run is therefore no faster than today's (below).
-- A launched program's unit is built by every build that reaches it and never replayed
-  from its record (`launch::never_replayed`): the record names the launcher's file, the
-  same for every build, and says nothing of which build's code the daemon holds. The cost
-  is the codegen walk over what is kept; a no-op `run` answered before its units are
-  reached pays nothing.
+- A launched program's unit is replayed from its record only while the daemon's program
+  holds the code of the build that record is of (`launch::not_replayed`: the program keeps
+  the whole record key of the build it took, and a replay is taken when the unit's key now
+  is that one). The record names the launcher's file, the same for every build, so the
+  file says nothing of whose code the daemon holds; the key does. Any other build of the
+  unit is made, and given to the program. Until 5226c3d363 no record of a launched unit was
+  replayed, which kept every no-op `run` out of the no-op lane and, once other projects had
+  been built, walked the whole program again (12 s).
 - Test binaries stay dev executables.
 - `RUST_BACKTRACE` prints no frames: std's symbolizer does not know placed code (the
   launcher has each body's name, `Loaded::named`, and nothing asks it yet). A panic's
@@ -522,9 +525,112 @@ What these say, and do not:
   linked file just starts. Under 100 ms on the quiet machine, not on the loaded Mac.
 - **The cold run is what it was**: the whole program is still compiled first.
 - Found by the output checks while measuring, and fixed: a replayed record left the
-  program on another build's code (`never_replayed`); every build of a launched program
-  put the launcher's 858 KB in the store (a body edit then run was 910 ms at the median
-  until then).
+  program on another build's code (now `not_replayed`, by the record's key); every build of
+  a launched program put the launcher's 858 KB in the store (a body edit then run was 910 ms
+  at the median until then).
+- **Every launcher number of this table is 6 to 8 ms too high a request.** The series had
+  `BLAZE_LAUNCH=1` in every command's environment, and any `BLAZE_*` variable but
+  `BLAZE_HOME` sends the thin client to `blaze-engine` (`crates/blaze-thin/src/route.rs`).
+  The switch is read by the daemon alone: it belongs on the command that starts the daemon.
+  The table below is measured so.
+
+### Measured again (2026-11-12, tree b2da8a9186; the VM, restarted before the series)
+
+The switch on the daemon-starting command only; launcher and today's path interleaved a
+round; output and exit status checked; one fixed `env -i` environment a series.
+
+| | under the launcher | today (dev executable) |
+|---|---|---|
+| warm no-op `run` (n=20) | 15.1 ms (10.4 to 17.2) | 12.1 ms (9.6 to 26.5) |
+| body edit, then `run` (n=20) | 44.1 ms (41.1 to 122.3) | 62.3 ms (55.6 to 175.3) |
+| body edit while the program runs, save to new output (n=20) | 30.0 ms (26.5 to 589.0); one process through 22 edits | never (as above) |
+| the program alone, exec to exit (n=55, tree 5226c3d363) | 2.84 ms (2.70 to 3.04) | 1.10 ms (1.02 to 1.22) |
+| the program's file | 883 KB | 158 MB |
+
+What moved the no-op from 32 to 15 ms: the routing above; the keyed replay; the daemon
+keeps its answer to `Hello` for a build (641 KB of frames, 0.8 to 1.0 ms to make each run);
+slots are declared as records first name them (`Welcome` declared every identity of the
+program); the launcher writes an edit's records with one `membarrier` and reads a socket
+read's frames with one ring. **It is not at parity**: what is left (about 1.7 ms of the
+program's 2.84) is carrying, hashing and placing 641 KB in 210 records each run. Parity
+needs the placed code kept across runs (a file of the area the launcher maps, checked
+against the daemon's ids); not built.
+
+The live edit's 30 ms, by the daemon's spans (medians of the 20 edit builds): `plan` 3.0 ms,
+`lower workspace` 1.65, the binary's `unit names` 1.7 to 2.8, `unit codegen` 1.6, `unit
+link` 4.0 (all of it `launch link`: the build's span tables 1.7, the program taking the
+build 2.0, which was 3.5 until b2da8a9186), `unit store` 1.1. A launched build has no file
+link, no placement after the first build and no debug side file: `unit link` is the
+program's intake alone. The span tables are still made (`HirFrontend::link_inputs`: the
+records read them); the record is still stored (the keyed replay reads it). What the spans
+do not name: between `lower workspace` ending and the binary's `unit names` starting, 5 to
+11 ms pass in which the workers' spans add to under 1 ms. That stretch is the daemon's
+loop (`serve/job.rs`), outside this lane's files, and is the largest part of the edit.
+
+The revision driver holds this: `a_body_edit_reaches_a_running_program`
+(`crates/blaze-engine/tests/revisions`; steps `start`, `await MS TEXT`, `count TIMES TEXT`,
+`end`) keeps one program running through two body edits, bounds the save-to-output time and
+counts its starts; without the switch it fails at the first `await`.
+
+## The lazy path: the seam (design; not built)
+
+Measured on the VM (merged tree 7f20879f6d): a cold `run` is 11.2 s, of which `unit
+codegen` is 5.1 s and its `codegen walk` 4.6 s ("described 14233, reached 12071"), the
+compiles after the walk about 0.5 s. The first run of a new project in a warm daemon is
+11.9 and 12.7 s: 13,873 `codegen describe` spans, 44.5 s of CPU, `mir` 13.7 s. So the cost
+of a first run is describing the program, not compiling it, and it is the same describes
+for every project (std's). Two things remove it, in this order:
+
+1. **Describes are lookups** (lanes content-keys-1112 and memstrat-1111): a function's
+   describe is a store record keyed by its code identity, so a second project, a restart and
+   a cold start read std's. Until then a lazy path only moves the describes later.
+2. **The frontier walk, served by the kept front end.** Built, bottom-up
+   (`blaze-codegen/src/driver/near.rs`, `Build::near` and `Build::compile_near`): one
+   function made ready to compile from its own describe and those of what it refers to
+   directly, held by a Hegel property to the whole walk's key, unit, places, built-in set
+   and code. The file names each pass of the whole walk the frontier form leaves out
+   (which references are direct, the recursion limit, symbols defined twice, the front
+   end's closed facts, the least origin of a key, dedupe) and why a launched first call
+   goes without it.
+
+The seam in the daemon, for whoever builds it (none of it is built; `job.rs`, `unit.rs`
+and `linked.rs` are other lanes'):
+
+- **Where the front end is after the answer.** Every build's answer is followed by the
+  kept-front-end task (`serve/job.rs`, `Does::StoreKept`: `kept_run_log`, `store_kept`,
+  `release_kept(&mut front, wanted)`). It owns the front end alone, as the job's writer
+  did, until the checkout's next request sets `wanted`. That task is where needs are
+  served: between `store_kept` and `release_kept` it answers `Need`s with `Build::near`
+  and `compile_near` against the front end it holds, until `wanted` is set or the
+  launcher's program has no launcher attached, and only then releases.
+- **Why not a reader.** A `UnitReader` holds `Arc<Lowered>`, and a write waits for every
+  reader (`Writer::apply` waits on `Arc::get_mut`; `keep` refuses with a reader alive). A
+  reader kept while a program runs would block the next edit: the opposite of the goal.
+  The task above holds what the writer held, and gives it back the moment a request wants
+  it.
+- **What the build does instead of the whole walk.** For a launched unit, `generate`
+  compiles the entry and what the start sections name (`Build::run_later`'s set), and the
+  whole walk runs behind the program as the eager check (section 4): its refusals (the
+  recursion limit, a symbol defined twice, a function whose IR does not build) arrive as a
+  diagnostic and a `Refused`, not before `Start`. A need that arrives while a request holds
+  the front end waits for that build, which answers it from its own walk.
+- **What it holds, and what releases it.** The checkout's lowered front end (what
+  `KeptLowered` is today, with its MIR not yet released), for as long as a launcher is
+  attached and no request wants it. Footprint decides (rule 50): past the limit's line
+  `release_kept` runs whatever is attached, and a later need lowers what it reads again.
+- **An edit.** The next request takes the front end as today; its build gives
+  `Program::built` the functions the program has bound (their records made by the frontier
+  form against the new revision) instead of a whole `Built`. `Program` today reads a whole
+  `Built` (identities, owners, statics, names); its intake becomes "these identities
+  changed, these were added", which the kept walk's changed set already says.
+
+Not checked, each to be read before building: how the plane settles a job whose
+kept-front-end task stays open (today the task ends in microseconds to milliseconds;
+`blaze stop`, the idle give-back and a second checkout's admission may all wait for it);
+what `Pressure::now().squeezed()` does to a task that is parked on a socket; whether
+`store_kept`'s puts may land while needs are served (they are made on the loop after the
+task returns today); and a daemon restart, after which no front end is kept and the first
+need lowers the checkout (the cold cost again, unless describes are lookups).
 
 ### What goes, and why each thing that stays does
 

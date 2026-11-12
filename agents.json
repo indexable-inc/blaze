@@ -1421,6 +1421,128 @@
    "cause": "the edit's link and the walk copy whole-program tables",
    "workaround": "none",
    "state": "mostly fixed on edit2-1111 (2026-11-11): the `Built`'s functions are shared and the `Built` is given back and written into (no clone, no `patch_lists` lists), a patch's place writes the patch (no `file::fill` of the file's runs), the side file is patched by the loop and held once; what is left, about 15 MiB an edit by the samples, is the ELF writer's tables made whole each stage, the store's encoding of the patch, and `Reach::patched`"
+  },
+  {
+   "id": "launch3-15",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+   "where": "measuring `blaze run` under the launcher; crates/blaze-thin/src/route.rs",
+   "what": "Every launcher number I reported first (warm no-op 32 ms, edit then run 56 ms, live edit 48 ms) was 6 to 8 ms too high a request: my series had BLAZE_LAUNCH=1 in every command's environment, and any BLAZE_* variable other than BLAZE_HOME sends the thin client to blaze-engine. The switch is read by the daemon only.",
+   "cost": "a reported 19 ms gap to today's path of which about half was the measurement; an hour timing the launcher's phases before the client was suspected",
+   "cause": "a daemon-side switch set as a client-side environment variable, and a client whose routing depends on variables it does not name in its output",
+   "whys": [
+    "why wrong: the number measured the engine's start, not the launcher",
+    "why possible: the thin client routes on any BLAZE_* variable, silently",
+    "why not caught: both paths printed the same output; nothing says which client answered",
+    "why easy: H2 says to fix one environment a series, which I did, with the variable in it",
+    "property: a measured path differs from the intended one with no trace in the output"
+   ],
+   "class": "silent path change by environment: a variable meant for one process changes which code another process runs, and the run's output does not say so",
+   "prevention": "the profile's build row carries which client served the request (thin or engine) and why, and the measurement how-to (H2) says to query it for every series; daemon-only switches are read from the daemon's config, not a variable every client inherits",
+   "workaround": "BLAZE_LAUNCH=1 on the command that starts the daemon only",
+   "state": "open",
+   "fix": ""
+  },
+  {
+   "id": "launch3-16",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+   "where": "crates/blaze-launch-host/src/tests.rs (the model launcher of the DST)",
+   "what": "The simulation's model launcher checked that a record names only declared slots with `slot < declared.max(u32::MAX)`, which is true of every slot. An edit that declared its slots before its records' references had assigned them passed the DST and failed the first real run (`names slot 8, and 8 are declared`).",
+   "cost": "a bug the DST exists to catch reached a real program; found only because the measurement checks output",
+   "cause": "an oracle condition I wrote to be permissive while the declaration rule was unsettled, and never tightened",
+   "whys": [
+    "why wrong: the oracle's bound could not fail",
+    "why possible: the model re-derived nothing from the records it was sent (it did not keep their bytes)",
+    "why not caught: no planted bug exercised that condition, so nothing showed it was vacuous",
+    "why easy: a control was written for each bug I thought of, not for each condition of the oracle",
+    "property: an oracle condition with no control that makes it fail"
+   ],
+   "class": "vacuous oracle condition: a check inside a simulation's oracle that no planted bug can trip",
+   "prevention": "every condition of a DST oracle has a planted-bug control that fails on exactly it (the invariants gate, scripts/src/bin/invariants.rs, lists conditions without a control); done here for this one (`the_oracle_catches_an_edit_that_declares_before_its_records_name`)",
+   "workaround": "the model keeps the records' bytes and checks each function place against the declared count",
+   "state": "fixed for this condition (5226c3d363); the gate's check is open",
+   "fix": "5226c3d363"
+  },
+  {
+   "id": "launch3-17",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+   "where": "serve/unit/run/launch.rs, serve/unit/compile.rs",
+   "what": "My first fix for a replayed record leaving a launched program on another build's code was to never replay a launched unit's record. That kept every no-op `run` out of the no-op lane (unit codegen and the launch link each run), and after other projects were built in the daemon a no-op run of hello walked the whole program again: 12 s.",
+   "cost": "the warm no-op was 32 ms where 15 was available; one 12 s no-op seen",
+   "cause": "the record's outputs name the launcher's file, the same bytes for every build, so the record could not say whose code the daemon held; I removed the replay instead of keying it",
+   "whys": [
+    "why wrong: a correctness fix by turning a cache off",
+    "why possible: the value under the key (a file) no longer identified the thing that mattered (the code the daemon holds)",
+    "why not caught: output checks passed; only timing showed it",
+    "why easy: `never` is one line, a key is a design",
+    "property: a cached answer whose validity depends on state the key does not name"
+   ],
+   "class": "cache turned off instead of keyed: a stale-answer bug fixed by never reusing, where the missing input belongs in the comparison",
+   "prevention": "rule keys-cover-every-input already says the fix is the key; a review rule for `never replay`/`always rebuild` branches: each names the input the key lacks and why it cannot be added",
+   "workaround": "",
+   "state": "fixed (5226c3d363): replay when the program's held build has the unit's whole record key",
+   "fix": "5226c3d363"
+  },
+  {
+   "id": "launch3-18",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+   "where": "the VM: first `run` of a new project in a warm daemon",
+   "what": "A warm daemon gives a new hello-world project nothing: 11.9 and 12.7 s against 11.2 s cold. 13,873 `codegen describe` spans (44.5 s of CPU) and `mir` 13.7 s are made again for the same standard library the daemon described for the project before.",
+   "cost": "every new project, every restart and every cold start pays about 12 s that is the same work each time",
+   "cause": "a describe is kept by the walk of one program in one front end's memory, not as a record by code identity",
+   "whys": [
+    "why slow: the describes are remade",
+    "why remade: they are keyed by a program's walk, not by what the function is",
+    "why not seen: the edit loop of one project never asks",
+    "why easy: the kept walk was built for the edit loop",
+    "property: work that is a function of content, kept under a key that is not"
+   ],
+   "class": "content-determined work kept under a session key: results that depend only on code identity stored where another project, a restart or a cold start cannot find them",
+   "prevention": "rule cache-by-code-id; the ledger row for cold and new-project time checks that a second project's first build makes no describe of std (a count from the profile, not a time)",
+   "workaround": "none",
+   "state": "open; sent to lanes content-keys-1112 and memstrat-1111 by the coordinator",
+   "fix": ""
+  },
+  {
+   "id": "launch3-19",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+   "where": "the daemon's edit build, between `lower workspace` and the binary's `unit names`",
+   "what": "In a body edit's build (26 to 36 ms of spans on the VM) 5 to 11 ms pass between `lower workspace` ending and `unit names` starting in which the workers' spans add to under 1 ms; no span names the stretch, `path_links` has no rows for the build, and it is the largest part of the edit.",
+   "cost": "the live edit is 30 ms where its named parts add to about 15; nobody can say from the profile what the rest is",
+   "cause": "not found: the time is on the daemon's loop thread, whose steps are not spans",
+   "whys": [
+    "why unknown: no span",
+    "why no span: the loop's own steps are counted only when one runs past 20 ms (`loop stalled`)",
+    "property: time on a thread the profile does not cover"
+   ],
+   "class": "unnamed time: a stretch of a build that no span, wait or critical-path row accounts for",
+   "prevention": "rule slow-is-p0-traced; a gate check that a build's named time (spans on its critical path) covers its wall time within a few percent",
+   "workaround": "none",
+   "state": "open; outside this lane's files (serve/job.rs)",
+   "fix": ""
+  },
+  {
+   "id": "launch3-20",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+   "where": "the VM: `cargo test -p blaze-engine --test revisions`, whole",
+   "what": "The whole revisions suite on the VM fails 6 of 24 for reasons that are the machine's or main's: /tmp is tmpfs and blaze refuses to place across it without sharing blocks (an_edit_after_a_restart, an_edit_after_a_kill), the suite's daemons run at once and one stalls under memory pressure from the others (a_touch_without_a_change), two `known` rows pass now and so fail, and build_then_run_then_build_are_no_ops walked for `a path outside the checkout ... or its watch changed`.",
+   "cost": "a lane cannot tell its own regression from the suite's standing failures without a second run of main",
+   "cause": "the suite assumes a reflink file system under TMPDIR and one daemon's worth of memory a test",
+   "whys": [
+    "why failing: environment, not code",
+    "why not known: no record of what the suite is at main's tip on an ix VM",
+    "property: a gate whose baseline on the machine lanes use is not recorded"
+   ],
+   "class": "unrecorded baseline: a suite whose failures at main's tip, on the machines lanes run it on, are not written down",
+   "prevention": "the ledger keeps the suite's result at main's tip on an ix VM (and the suite sets TMPDIR to a reflink file system or says it needs one in its first line of output)",
+   "workaround": "run the one case; read each failure's reason",
+   "state": "open",
+   "fix": ""
   }
  ]
 }
