@@ -489,8 +489,10 @@ mod tests {
         let homes = Homes::of(None, var(&[("HOME", "/u")]), none).unwrap();
         assert_eq!(homes.socket, Path::new("/u/.cache/blaze/v2.sock"));
         assert_eq!(homes.state, Path::new("/u/.cache/blaze/v2"));
-        let split = [("HOME", "/u"), ("XDG_RUNTIME_DIR", "/run/u"), ("XDG_CACHE_HOME", "/c")];
-        let homes = Homes::of(None, var(&split), none).unwrap();
+        // A constant, so the borrow is `'static` as `var` asks.
+        const SPLIT: &[(&str, &str)] =
+            &[("HOME", "/u"), ("XDG_RUNTIME_DIR", "/run/u"), ("XDG_CACHE_HOME", "/c")];
+        let homes = Homes::of(None, var(SPLIT), none).unwrap();
         assert_eq!(homes.socket, Path::new("/run/u/blaze/v2.sock"));
         assert_eq!(homes.state, Path::new("/c/blaze/v2"));
         let homes = Homes::of(None, var(&[("HOME", "/u"), ("BLAZE_HOME", "/b")]), none).unwrap();
