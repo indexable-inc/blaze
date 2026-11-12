@@ -4,7 +4,8 @@
 //! later.
 //!
 //! **Provider.** The simulation only ([`crate::hosted::SimHost::user`]): blaze-core has no
-//! effect that asks who the process runs as.
+//! effect that asks who the process runs as. Its drivers' one answer to where the home is
+//! is `blaze_core::home::user`, which that effect is to be made of.
 
 use core::fmt;
 

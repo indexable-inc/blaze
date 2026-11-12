@@ -46,7 +46,15 @@ the standard library is part of a compiler.
   (`crates/blaze-cargo/src/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
   still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.
 - **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>`, the machine's: every `BLAZE_HOME` reads
-  this one copy (`BLAZE_HOME` moves a daemon's settings and state, not the toolchain), found
+  this one copy (`BLAZE_HOME` moves a daemon's settings and state, not the toolchain).
+  `BLAZE_TOOLCHAINS=<dir>` names another directory in place of `~/.blaze/toolchains`
+  (`toolchain::own::toolchains`), for a machine whose home is small, read-only or not there;
+  the daemon keeps the one it was started with. `~` is the user's home as blaze finds it
+  everywhere (`blaze_core::home::user`): `HOME` when it is set and not empty, else the
+  system's record of the user (`getpwuid_r` of the effective uid; on Windows `USERPROFILE`,
+  then the profile directory), so a systemd unit, a CI runner or cron with no `HOME` finds
+  the same copy a shell does. With neither, blaze stops, saying what it tried and naming
+  `BLAZE_TOOLCHAINS`. It is found
   with nothing run (`crates/blaze-cargo/src/toolchain.rs`, `found`). rustup's directory is never
   read, not even when it has the same nightly: a toolchain found by its directory's name is
   trusted by name, whatever was installed there ([v2/plan/toolchain-c.md](v2/plan/design/toolchain-c.md),
