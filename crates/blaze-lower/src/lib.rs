@@ -976,7 +976,7 @@ fn lower_writes<T: blaze_query::Tree>(
                 cfg.extend([crates::run_profile_atom(units, dep.index)]);
             }
         }
-        let durability = if library[set_of[unit.pkg_id.as_str()]] {
+        let durability = if graph.roots[set_of[unit.pkg_id.as_str()]] == RootOf::Library {
             Durability::HIGH
         } else {
             Durability::MEDIUM
