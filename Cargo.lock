@@ -560,6 +560,8 @@ dependencies = [
  "blaze-item-hash",
  "blaze-items",
  "blaze-kernel",
+ "blaze-launch",
+ "blaze-launch-host",
  "blaze-lazy",
  "blaze-link",
  "blaze-lints",
@@ -1409,11 +1411,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-launch-host"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "blaze-codegen",
+ "blaze-format",
+ "blaze-hash",
+ "blaze-ids",
+ "blaze-items",
+ "blaze-launch",
+ "blaze-link",
+ "hegeltest",
+]
+
+[[package]]
 name = "blaze-launch-rt"
 version = "0.0.0"
 dependencies = [
  "blake3",
  "blaze-launch",
+ "crossbeam-channel",
+ "libc",
+]
+
+[[package]]
+name = "blaze-launcher"
+version = "0.0.0"
+dependencies = [
+ "blaze-launch",
+ "blaze-launch-rt",
  "crossbeam-channel",
  "libc",
 ]
