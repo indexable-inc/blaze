@@ -326,25 +326,8 @@ struct Applied {
 }
 
 /// The crate graph, source roots and files of `lower.units` in a new database.
-///
-/// For a test or a tool that holds no store: every crate is resolved from source in the write
-/// that adds it, and [`Lowered::serve_deps`] refuses the front end. A driver with a store (the
-/// daemon, always) lowers with [`lower_awaiting`].
 pub fn lower<T: blaze_query::Tree>(lower: Lower<'_, T>) -> Result<Lowered, LowerError> {
     lower_into(Db::new(), lower)
-}
-
-/// [`lower`] for a driver that asks its store for the records of every crate before anything
-/// reads one ([`Lowered::serve_deps`], with each unit's crate among `asked` once the unit is
-/// ready): the database awaits the crates added to it (`hir_def::deps::awaited`), so neither
-/// this lowering nor a later plan's ([`Lowered::relower`]) resolves a crate; the serve that
-/// asks about a crate reads it from its records, or gives it its first run from source when
-/// the store has none. A crate read before it was asked about stops its reader with an error
-/// naming the crate awaited.
-pub fn lower_awaiting<T: blaze_query::Tree>(lower: Lower<'_, T>) -> Result<Lowered, LowerError> {
-    let mut db = Db::new();
-    hir_def::deps::await_added(&mut db);
-    lower_into(db, lower)
 }
 
 /// What a front end keeps of every plan lowered into it, so that a plan is a view over one
@@ -1219,9 +1202,6 @@ fn lower_writes<T: blaze_query::Tree>(
     // After the crates there, which keep their places: the write is the list alone, and a
     // plan found whole writes none.
     base_db::add_crates(db, &all, Durability::MEDIUM);
-    // In a front end lowered awaiting ([`lower_awaiting`]) the crates made are awaited: this
-    // write's pass resolves none of them. Nothing is written for a plan found whole.
-    hir_def::deps::await_crates(db, &all);
     if first {
         // The first plan's graph is a change of the whole graph to every maintainer, as it
         // was when the list was set whole.
@@ -2255,45 +2235,18 @@ impl Lowered {
     /// the image away already, in that write, as it has of every served crate depending on it
     /// (`hir_def::deps`' implied write). An image that does not read is an error naming its
     /// crate. A write, as [`Lowered::ran`] is.
-    ///
-    /// `asked` is every crate the driver asks about now, eligible or not (each ready unit's
-    /// crate); `crates` those of them to fetch. `asked` and all they depend on are released
-    /// from the awaited set in the same write (`hir_def::deps::serve_asked`): the ones with
-    /// an image are never resolved, the others get their first run here. With an empty
-    /// `crates` it only releases, and writes nothing when none of `asked` was awaited.
-    ///
-    /// Only a front end lowered awaiting ([`lower_awaiting`]) is served: one from [`lower`]
-    /// resolved every crate when it was added, so serving it would be the path where a crate
-    /// with records is resolved first; it is refused by name.
     pub fn serve_deps(
         &mut self,
-        asked: &[Crate],
         crates: &[Crate],
         build: ContentId,
         // dyn: the driver's store, one call per crate per front end
         images: &dyn hir_def::deps::ImageStore,
         mode: hir_def::deps::Mode,
     ) -> Result<hir_def::deps::Served, LowerError> {
-        if !hir_def::deps::awaits_added(&self.db) {
-            // alloc: an error
-            return Err(LowerError::new(
-                "the dependencies' images are served into a front end that awaits no crate: \
-                 it was lowered with `blaze_lower::lower`, which resolves every crate from \
-                 source as it is added; a driver with a store lowers with \
-                 `blaze_lower::lower_awaiting`"
-                    .to_owned(),
-            ));
-        }
         let trigger = Trigger::named("the dependencies' images served");
         self.db
-            .batch(trigger, |db| hir_def::deps::serve_asked(db, asked, crates, build, images, mode))
+            .batch(trigger, |db| hir_def::deps::serve(db, crates, build, images, mode))
             .map_err(LowerError::new)
-    }
-
-    /// Whether any crate of the front end is awaited (`hir_def::deps::awaited`): a load.
-    /// While true, a serve of ready units has crates to release whether or not a key moved.
-    pub fn any_awaited(&self) -> bool {
-        hir_def::deps::any_awaited(&self.db)
     }
 
     /// The images of the crates `served` keyed and found none of, written to `images` from

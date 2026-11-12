@@ -22,8 +22,6 @@ use triomphe::Arc;
 
 use super::{Appended, Db, Lower, LowerError, Lowered, Ran, crates, files, lower};
 
-mod awaited;
-
 const HOST: &str = "x86_64-unknown-linux-gnu";
 const LIBRARY: &str = "/rustc/abc/library";
 const OUT_DIR: &str = "/w/target/debug/build/a-1/out";
