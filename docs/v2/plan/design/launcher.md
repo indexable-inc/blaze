@@ -1,7 +1,7 @@
 ---
 status: plan
-summary: "How a program runs under the `edit` goal (D18, D21) - a launcher in the program's own process maps code records from the store behind one slot word a function, appends and never overwrites, retires old bodies by per-thread epochs and a stack scan, takes an edit as one gated transaction, and runs many tests in one process as domains. Built - step 1, `crates/blaze-launch` (the slot table, the append-only area, retirement and the transaction as a sans-IO core with its simulation, and the patch protocol's schema), and step 2, `crates/blaze-launch-rt` (the drivers - one mapping of words, stubs, thunks and code on macOS MAP_JIT and a Linux memfd, gates and lazy stubs as machine code, a safepoint's report, the control thread over a Unix socket), without the scan of a thread from outside. Not built - everything else; step 3's exact plan and the order are at the end."
-date: 2026-11-11
+summary: "How a program runs under the `edit` goal (D18, D21) - a launcher in the program's own process places code records behind one slot word a function, appends and never overwrites, retires old bodies by per-thread epochs, takes an edit as one gated transaction, and is to run many tests in one process as domains. Built - steps 1 and 2 (`crates/blaze-launch`, `crates/blaze-launch-rt`), step 3 (tier 0 code that calls through slot words, the record, its placement, data, statics, thread-locals, unwind entries), step 4 behind `BLAZE_LAUNCH=1` (`blaze run` of a binary runs in `blaze-launcher`, unlinked; the daemon still compiles the whole program first), step 5 in a first version (one changed body applied to the running program, anything else a restart in place). Not built - the scan of a thread from outside, lazy compiles in the daemon, test binaries, backtrace names, x86-64 (compiled, never run), domains, promotion."
+date: 2026-11-12
 ---
 # The launcher: running a program under `edit`
 
@@ -251,9 +251,9 @@ moved; the daemon keeps `function -> tests` to find them. This replaces the arme
 | 1 | `crates/blaze-launch`: the core (table, area, batches, staged and gated commit) and `wire` | **built**: `src/tests/sim.rs` (the invariants and their planted bugs), `src/tests/wire.rs` | |
 | 2 | Drivers: map the area and table, write, publish, the control thread, the resolver, gates and thunks, the walk; Linux x86-64 and AArch64, macOS | **built** (`crates/blaze-launch-rt/src/tests.rs`): hand-made bodies called through slots, a lazy bind over a socket, a gated edit under a running thread, a batch held by a silent thread and freed when it ends, a page given back; a test that each macOS symbol resolves | |
 | 2b | The scan of a thread from outside (`thread_suspend` and `thread_get_state`; Linux's one real-time signal), so a thread that never reaches a safepoint does not hold every batch | a thread blocked in `read` while an edit lands: its batch is freed | |
-| 3 | Records as the launcher takes them: slot-word calls, entry thunks, the unwind entry and name in the record; the index and the unwind hooks | a panic unwinds through lazily bound and replaced bodies, with names | `blaze-link/src/lazy.rs`'s refusal of unwinding code |
-| 4 | `blaze run` under `edit` through the launcher: `Welcome`, `Need`, prefetch of the last run's set; eager check in the background | hello world and reth's node start; the first-edit and no-op timings quoted from spans | `blaze-lazy`'s stubs and wire; `blaze-inproc`'s code memory for runs |
-| 5 | Edits: the classifier, `Probe`, the gated `Edit`, restart in place | a DST of the daemon's side: an edit landing while another is in flight never binds code of an old input; the edit loop on reth and tempo | `blaze-live` (cell, pooled tables, 64 generations); patch room and the dev splice for `edit` builds; the Mach-O re-sign of a dev patch; fences |
+| 3 | Records as the launcher takes them: slot-word calls, entry thunks, the unwind entry and name in the record; the index and the unwind hooks | **built**, but for names in a backtrace: a panic unwinds through lazily bound and replaced bodies ("Step 3 as built") | `blaze-link/src/lazy.rs`'s refusal of unwinding code (not yet: see the end) |
+| 4 | `blaze run` under `edit` through the launcher: `Welcome`, `Need`, prefetch of the last run's set; eager check in the background | **built behind `BLAZE_LAUNCH=1`** for a binary, with the whole program still compiled first: hello world on macOS and Linux arm64 ("Step 4 as built"); reth not tried | `blaze-lazy`'s stubs and wire; `blaze-inproc`'s code memory for runs (not yet: see the end) |
+| 5 | Edits: the classifier, `Probe`, the gated `Edit`, restart in place | **first version built** (one changed body live, else restart in place; no `Probe`): the DST of the daemon's side, and a loop program edited 22 times in one process ("Step 5 as built"); reth and tempo not tried | `blaze-live` (cell, pooled tables, 64 generations); patch room and the dev splice for `edit` builds; the Mach-O re-sign of a dev patch; fences |
 | 6 | Domains: `DomainOff32`, images, thread-locals, std's thread start, the shims | each test of a real suite in a domain equals its own process's outcome | the fork server a test; `live/log.rs` |
 | 7 | Selection by marks and traces | a save reruns exactly the tests whose set changed (`blaze-testsel`'s oracle) | `blaze-testsel`'s reached-set path |
 | 8 | Promotion in band 3 and its retreat on an edit | tiers.md's DST | `blaze_stencil::tier`, `Mode::Tiered`, `Choice::then`, `Build::tier_up` |
@@ -328,94 +328,148 @@ entries replace it; the resolver has no unwind entry, so a panic cannot unwind t
 stub that is resolving; `Probe` and `Restart` end in `NotBuilt`; the launcher's waits are
 named in comments, not spans, because the launcher has no profile yet.
 
-## Step 3: the call sequence and the record (plan, not built)
+## Step 3 as built (2026-11-12, lane launch3-1111)
 
-### What tier 0 emits under `edit`
+### What tier 0 emits for the launcher
 
-For a call of a function of the program (a `Ref::Place` whose place is a function; not a
-system import):
+`Spec::slots` (`blaze-codegen/src/settings.rs`; in the settings, so in the key) is set by
+`plan::Mode::Launched` for every function of the program, whoever wrote it: members,
+dependencies and std all start as tier 0 code, each with a slot (`Choice::then` keeps the
+optimized spec promotion will land). Under it (`blaze_stencil::Target::slots`):
 
 | | x86-64 | AArch64 |
 |---|---|---|
-| call | `call qword ptr [rip + word]` (`ff 15 rel32`) | `adrp x16, word@page; ldr x16, [x16, word@pageoff]; blr x16` |
-| tail call | `jmp qword ptr [rip + word]` (`ff 25 rel32`) | the same with `br x16` |
-| the function's address (`func_addr`, a vtable or static's pointer to it) | `lea reg, [rip + thunk]` | `adrp reg, thunk@page; add reg, reg, thunk@pageoff` |
+| call | `call qword ptr [rip + word]` (`ff 15`, `X86GOTPCRel4`) | `adrp x16, word; ldr x16, [x16, lo12]; blr x16` (the GOT relocations) |
+| tail call | `jmp qword ptr [rip + word]` (`ff 25`) | the same into `x17`, then `br x17` |
+| a colocated function's address | `lea reg, [rip + thunk]` (`X86PCRel4`) | `adrp reg, thunk; add reg, reg, lo12` |
 
-`word` is the callee's slot word (`words + 8 * slot`), `thunk` its entry thunk; both are in
-the launcher's mapping, within reach of every body. The word is, exactly, the function's GOT
-entry: AArch64's sequence above is byte for byte what tier 0 emits today for a callee that is
-not colocated under `pic` (`blaze-stencil/src/arch/aarch64/glue.rs:476-479`: `load_name` into
-x16, `:641`, with `Aarch64AdrGotPage21` and `Aarch64Ld64GotLo12Nc`, then `blr x16`), and
-x86-64's is today's `mov r11, [rip + got]; call r11` (`arch/x64/inst.rs:432-433`,
-`load_ext_name` `:139`, `X86GOTPCRel4` `:149`) with the load folded into the call. So no new
-instruction selection is needed, only the choice of which path a callee takes and what its
-relocation means.
+No new relocation name was needed, and `colocate` (`hir-ty-codegen/v2/backend.rs`) is
+unchanged: the glue ignores `colocated` for a call under `slots` and takes a colocated
+function's address PC-relative. So a GOT relocation against a function is always a call
+(its slot word) and any other is its address (its entry thunk), and the launcher reads them
+apart by kind. Tests: `under_slots_a_call_loads_the_slot_word_and_an_address_is_the_thunk`
+(both instruction sets, blaze-stencil), `a_launched_programs_functions_all_start_as_tier_zero_through_slots`
+(blaze-codegen).
 
-On first call the word names the slot's stub. The stub (`blaze-launch-rt/src/arch.rs`) puts
-its own address in x16 (r11) and jumps to the head, which adds the launcher's context and
-jumps to the resolver. The resolver saves every argument register, calls `table::resolve`,
-which puts `Need { slot, thread }` on the control thread's queue and waits; the control
-thread says `Need` to the daemon once a slot; the daemon answers with `Edit { binds: [slot ->
-code(f, tier 0) by key], together: false }` (or `Refused { diagnostic }`); the control
-thread stages, places and commits it (one store to the word) and answers the stub; the
-resolver restores the registers and jumps *through the word*. All of that is built and
-tested but the daemon's side, which a test stands in for.
+### The record, and how each thing it names is resolved at install
 
-### The hooks, in order (none made yet)
+`blaze_launch::record`: one function's code or one static's value, position- and
+process-independent, in deterministic CBOR; its id is the BLAKE3 hash of its bytes
+(round-trip test `every_record_is_deterministic_cbor_and_reads_back`, with its control). It
+is derived by the daemon from the compiled function of `code(f, tier 0)`
+(`blaze-launch-host/src/record.rs`); a fixup names what it is against by *place*, and the
+bind gives each function place its slot and each static place its number, so a callee's body
+edit changes no caller's record.
 
-1. `blaze-stencil/src/lib.rs:53` `Target`: a field `slots: bool` ("a call of a function goes
-   through its slot word; a function's address is its entry thunk"), set where `counts` is
-   (`hir-ty-codegen/v2/backend.rs:1291`) from the unit's policy.
-2. `hir-ty-codegen/v2/backend.rs:951` `colocate`: under `slots`, a function callee
-   (`namespace` 0) is never colocated, own or not, so `call` takes the GOT path. Nothing in
-   `hir-ty-codegen/mod.rs` changes: `call_as` (`:11914`), `invoke` (`:15360`) and
-   `tail_call` (`:9832`) emit the same IR.
-3. `blaze-stencil/src/arch/x64/inst.rs:424-434` `call` and `:482` `return_call`: under
-   `slots`, a `Callee::Direct` that is not colocated emits `ff 15`/`ff 25` with
-   `X86GOTPCRel4` instead of the load into r11; `bound` (`:912-935`) takes the shorter form.
-   AArch64 (`glue.rs:467-482`, `:511`) is unchanged.
-4. A function's address: `blaze-stencil/src/code.rs:72` `Name` gets `Thunk { index }`;
-   under `slots`, `FuncAddr` (`arch/x64/inst.rs:200-211`) and `address`
-   (`arch/aarch64/glue.rs:671-704`) name it with the near, PC-relative form (`X86PCRel4`;
-   `adrp`/`add`), never the GOT; `hir-ty-codegen/v2/convert.rs:568` maps it to a new
-   `blaze_codegen::Target::Thunk(InstanceKey)` (`blaze-codegen/src/lib.rs:433`) and
-   `template::Ref::Thunk(u32)` (`template.rs:38`). A static's initial bytes that point at a
-   function (`Init::Bytes { relocs }`, `lib.rs:329`) name the thunk the same way.
-5. The record the launcher takes is the stored `Template` (`blaze-codegen/src/template.rs:72`,
-   written by `put_of`, `driver/later.rs:191`, keyed by `dev_template_key`, `driver.rs:418`)
-   plus, for each `Ref::Place` it names, that place's slot: `Bind` gains nothing; the daemon
-   sends a second list a bind, `refs: [slot]`, in `wire` (schema 2). The launcher's
-   `Records` (new, in blaze-launch-rt) reads the template from the store's directory, copies
-   its code and applies each relocation: a GOT kind against a function place is that slot's
-   word (`Place::word`); a PC-relative kind against `Ref::Thunk` is `Place::thunk`;
-   `Ref::Own` is the body itself; anything else against a function (`Call26`, `PcRel32`: a
-   direct call) is a refusal naming the record, since code built without `slots` must not
-   be placed. Statics wait for step 6 (until then a record that names a mutable static is
-   refused by name). It then hashes what it read against `bind.record`.
-6. The daemon's side of `Need`: `code(f, tier 0)` by key is `Later::compile_kept`
-   (`blaze-codegen/src/driver/later.rs:476`: the store's template, then the memo, then a
-   compile), which nothing in blaze-cargo calls today. `blaze_lazy::runner::Compiler`
-   (`blaze-lazy/src/runner.rs:57-70`) is the same shape and has no implementation; step 4
-   implements the launcher's server on `compile_kept` directly and blaze-lazy goes.
-7. `blaze-codegen/src/plan.rs:238` `Mode`: a variant `Launched` for a run under `edit`,
-   chosen in `blaze-cargo/src/serve/unit/codegen.rs:870-872` where `Live` is chosen today;
-   under it `plan.rs:492`'s `patchable` is true for every function, member or not, and
-   `driver.rs:2704-2707` `resolve` gives `Target::Function` for every callee. `Goal`
-   (`blaze-api/src/goal.rs:15`) still does not reach codegen: the mode does.
-
-Hooks 1 to 4 are in blaze-stencil and hir-ty-codegen, 5 in blaze-launch-rt and `wire`, 6 and
-7 in blaze-codegen's driver and blaze-cargo's serve, which other lanes are editing now; that
-is why this stopped at the plan.
-
-### What goes when it lands
-
-| Goes | Where | Why it can |
+| a fixup against | through the GOT | any other kind |
 |---|---|---|
-| blaze-lazy: the 16-byte entries, the shared resolver, the hook, its wire | `blaze-lazy/src/stub.rs`, `hook.rs:37`, `:73`, `wire.rs:50`, `runner.rs`, `fetch.rs`, `compile.rs` | the launcher's stub, resolver and `Need` are the same thing with a slot for a `LazyId`; nothing implements `runner::Compiler` or `compile::Source` today |
-| The lazy image and its placer | `blaze-link/src/lazy.rs` (`LazyPlacer` `:182`, the refusal of unwinding code `:359-364`) | nothing outside blaze-link calls it; the launcher places code |
-| The answer "no lazy runner serves this run" | `blaze-cargo/src/serve/unit/run/inproc.rs:835-836` | a `Need` is served |
-| The two-load slot stubs | `blaze-link/src/table.rs:51-121` (`X86_STUB`, `A64_STUB`, `write_stub`) for `edit` builds | a call loads its word itself; kept for `max`'s live images until step 5 |
-| `retire` and `collect` by fences for code memory | `blaze-inproc/src/lib.rs:515`, `:528` | only `lazy.rs:388/394` retires; the core's batches replace them |
+| a function | its slot word | its entry thunk |
+| a static, an outside symbol | a cell of the record's own pool, after its code, that holds the address | the address |
+| the record's own data | a pool cell | the datum's address |
+| a thread-local static | the pool's descriptor (Mach-O: a cell, then thunk, argument, zero; ELF: the descriptor pair), whose thunk is the launcher's | refused |
+| the code itself | a pool cell | the placed code |
 
-Kept until step 5: blaze-live's cell and tables (`slots.rs`, `slots/switch.rs`), the fences
-(`library/blaze_inproc_rt/src/fence.rs`, `runtime.rs:354`), patch room.
+- **Constants** (strings, vtables, promoted constants, a position's `Location` and its file
+  name): placed once a process by the datum's id in the data mapping (`sys::Data`, 4 GiB
+  reserved, never unmapped) and never freed, since the program may keep an address past the
+  body that named it.
+- **Statics**: defined by the daemon before the program starts (`Tell::Statics`: every
+  static's memory first, then each value, so statics may name one another), at one address
+  for the life of the process. Tier 0 code takes every data address from its GOT, which here
+  is the record's pool, so the data mapping may lie anywhere.
+- **Thread-locals**: a number a static; each thread keeps a table of its own copies off one
+  pthread key, a copy made on first touch (`blaze-launch-rt/src/tls.rs`). AArch64 only;
+  x86-64 is refused by name.
+- **Outside symbols**: a name the program itself defines (`#[no_mangle]`) is its function's
+  slot; any other is `dlsym` of the process, asked once, and a refusal naming it when no
+  library has it.
+- **Unwind information**: the record's CIE and FDE instructions made an `.eh_frame` entry
+  with absolute addresses, the personality routine its entry thunk, registered
+  (`__register_frame`) before a word names the body and taken back when the core frees it.
+  A panic unwinds through lazily bound and replaced bodies.
+- **Positions** are data of the record, so a record follows the lines of what it names: a
+  bound function below an edit in its file is bound again, compiled by no one.
+
+Records come over the socket (`Tell::Record`), not from a directory of the store: a record
+is a few hundred bytes the daemon has when it answers, and the launcher needs no reader of
+the store's packs. `wire` is schema 2 (`Start`, `Record`, `Statics`, `Unheld`, a bind's
+`refs`).
+
+Test of the whole of step 3 on a real machine:
+`tier_zero_code_runs_in_the_launcher_compiled_on_first_call_and_edited_while_it_runs`
+(blaze-stencil): real tier 0 code, compiled when its stub asks, placed, called through slot
+words, a thunk, a static, `labs`, a thread-local on two threads, a panic through placed code,
+a body edit under a calling thread, the old body freed. 20 of 20 runs on macOS arm64 and on
+Linux arm64 (where blaze-launch-rt's own tests ran for the first time: 8 of 8, 20 of 20).
+
+## Step 4 as built: `blaze run` under the launcher
+
+With `BLAZE_LAUNCH=1` in the daemon's environment a binary built for `edit` is not linked
+(`serve/unit/run/launch.rs`; the switch stays until what is listed under "not built" below
+is, when it becomes what `edit` means). The file at cargo's path is `blaze-launcher`'s
+bytes (858 KB on macOS, 944 KB on Linux, where the dev executable is 158 MB long) and a
+sidecar beside it (`hello.blaze-program`: the daemon's launch socket and the program's id),
+both placed by the program's first build only. `blaze run` execs the file as before; run by
+hand it works the same.
+
+The launcher (`crates/blaze-launcher`) connects, says `Hello`, and is told `Welcome` (the
+slots), the statics, the functions the runs before it called (one edit, before it starts),
+and `Start`; it runs the program's initializers (`.init_array`, `__mod_init_func`) and its
+`main(argc, argv)` on the process's first thread and ends through `exit`. The program's
+threads are started through the launcher's `pthread_create`, which tells the core of each.
+Checked by hand on macOS (`/private/tmp/blaze-proc-launch`): arguments, environment,
+`current_exe`, stdin from a pipe, exit status 7, a thread, `catch_unwind`, a panic (status
+101, `src/main.rs:4:17`), `abort` (134), SIGTERM (143).
+
+The daemon's side is `crates/blaze-launch-host` (sans-IO): slots by identity, what each
+launcher has bound, the prefetch. blaze-cargo owns the socket, an accept thread and a reader
+and a writer thread a launcher.
+
+**Not what the plan says, each stated:** the build still compiles every function before the
+program starts (`Build::run_with_statics`); a `Need` is answered from the build's functions,
+so "compiled on first call" is true of the launcher (a function has no code in the process
+until called) and not yet of the daemon (`Later::compile_kept` is still uncalled). The cold
+run is therefore no faster, and is slower than today's (below). A program this daemon did
+not build since it started is refused by name (`Unheld`): its unit's record replays and no
+code is held. Test binaries stay dev executables. `RUST_BACKTRACE` prints no frames: std's
+symbolizer does not know placed code (the launcher has each body's name, `Loaded::named`,
+and nothing asks it yet); a panic's message has its file, line and column.
+
+## Step 5 as built, first version: a body edit while the program runs
+
+Each build of a launched program is given to `Program::built`, which compares it with the
+build before and tells each running launcher (the table in `program.rs`): one changed body
+is an edit of the bound slots whose records changed, switched together; lines only is an
+ungated edit; an added function is a declared slot; a changed static, or two bodies changed
+at once, is `Restart` with the reason, and the launcher `execv`s itself in place (and ends
+the process, saying why, if it cannot: it never runs on). "One body" is the sound rule
+available without comparing signatures: a function's code hash takes its callees by their
+interface, so a changed signature changes its callers' code too. `Probe` is not built.
+
+Simulated (`blaze-launch-host/src/tests.rs`,
+`no_schedule_leaves_a_launcher_on_code_of_an_old_build`): builds landing while frames and
+needs are in flight; the oracle is that a launcher that carried out everything it was sent
+holds the newest build's record in every bound slot or was told to start again; two planted
+bugs.
+
+Not built: the scan of a thread from outside and the poll on a back edge, so a thread that
+calls no new function reports nothing and a replaced body's memory stays (sound, and a few
+hundred bytes an edit); retirement is exercised by the tests, and in a real program only
+at a stub.
+
+### Measured (2026-11-12, M-series Mac, hello world and a loop printing a function's value)
+
+@@TABLE@@
+
+### What goes, and why each thing that stays does
+
+Nothing was deleted: the launcher's path is behind `BLAZE_LAUNCH`, and each thing below is
+still on the path `edit` takes without it.
+
+| Stays | Until |
+|---|---|
+| Patch room and the dev splice for `edit` builds (`blaze-link/src/place.rs`) | the switch is the default: test binaries run under the launcher, a program replays after a daemon restart, x86-64 has run. Under the switch no file has patch room. |
+| blaze-inproc's host and code memory for dev runs (`serve/unit/run/inproc.rs`) | the same; test binaries are its last users then |
+| blaze-lazy's stubs, hook and wire; `blaze-link/src/lazy.rs` | nothing on either path runs them, so they can go now; left because `blaze-link`'s `stage.rs` and `native.rs` name `blaze_lazy::{Session, stub, hook}` in files another lane is editing, and `blaze_lazy::allow` is still what `run.rs` asks |
+| `blaze_stencil::tier`, `Mode::Tiered`, `Build::tier_up` | promotion (step 8). `Choice::then` is now what a launched function's optimized spec is kept in |
+| blaze-live, fences | step 5 for test binaries |

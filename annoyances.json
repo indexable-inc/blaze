@@ -726,6 +726,116 @@
    "cause": "my guess, unverified: the link inputs kept beside the database are four programs a process, and the tests of one process share them",
    "workaround": "`--test-threads=1`",
    "state": "open"
+  },
+  {
+   "id": "launch3-1",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+   "where": "blaze-launch-host's driver in blaze-cargo; hir-ty-codegen's `LinkInputs`",
+   "what": "`LinkInputs { base: None, tables: [] }` means two things: every table (none, when a build names none) and \"the same snapshot as `serial`, nothing changed\". A second link of one build gave the second, the launcher's driver read the first and wiped the program's span tables; the next first call stopped the program with `the build gave no span table of that anchor`.",
+   "cost": "one debugging round on the VM (two builds, three runs), found only because a project was deleted and made again at the same path",
+   "cause": "one field carries two cases; the doc on `LinkInputs` says only the first",
+   "workaround": "the driver asks `work.whole` and compares `serial` with the one it holds (serve/unit/run/launch.rs)",
+   "state": "open: give `LinkInputs` an enum (Same, Changed, Whole)"
+  },
+  {
+   "id": "launch3-2",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+   "where": "blaze-launch-host::program",
+   "what": "A caller's `CompiledFunction` is another object after its callee's body edit (its relocations name the callee's new key) while the caller's own key stays. A cache of records by slot, let go by \"its key moved\", kept the caller's record with the callee's old key: the next launcher's hello failed with `InstanceKey(..) is named by the program's code and is no instance of its build`.",
+   "cost": "one debugging round; and a launcher that could not start",
+   "cause": "an instance key names the function's own code and arguments, never what its places resolve to; I took the key for the function's whole identity",
+   "workaround": "the cache is keyed by the `Arc<CompiledFunction>` itself (`Arc::ptr_eq`)",
+   "state": "fixed in 87522b0eca"
+  },
+  {
+   "id": "launch3-3",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+   "where": "blaze-cargo daemon threads",
+   "what": "`tracing::error!(target: \"blaze\", ..)` from a thread of the daemon that is no job's is in no file a person reads: the launch driver's refusal of a launcher was nowhere (`serve.log` has the memory lines only), and the launcher said only `the daemon's socket ended: the daemon closed it`.",
+   "cost": "a rebuild to carry the reason to the launcher before the cause could be read",
+   "cause": "the daemon's own stderr and its tracing go to different places, and an error outside a build has no reader",
+   "workaround": "the driver tells the launcher why (`Tell::Unheld`) before it closes the socket",
+   "state": "open"
+  },
+  {
+   "id": "launch3-4",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+   "where": "blaze-launcher restart in place",
+   "what": "`std::env::current_exe()` on Linux reads `/proc/self/exe`, which is `<path> (deleted)` once a build placed a new file at the path: `execv` of it failed, and the first version then left the program running on the code the daemon had replaced.",
+   "cost": "found by the first restart on a real program; a stale program for the length of one test",
+   "cause": "the launcher's file was placed again by every build, and the restart's failure was returned, not fatal",
+   "workaround": "the path is read once at start; a restart that cannot exec ends the process, saying why; the launcher's file is placed by the first build only",
+   "state": "fixed in 87522b0eca"
+  },
+  {
+   "id": "launch3-5",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+   "where": "blaze-launch-host::program, the classifier",
+   "what": "A body edit of `fn main` changes the code hash of two functions: `main` and the C `main` shim the front end makes around it. \"One changed body applies live\" read it as two and restarted the program on every edit of `main`.",
+   "cost": "the first live edit of a real program restarted instead",
+   "cause": "the shim's code hash follows `fn main`'s body (it need not: it calls `lang_start` with `main`'s address)",
+   "workaround": "the entry's identity is not counted",
+   "state": "open: the shim's code hash should not move with `main`'s body"
+  },
+  {
+   "id": "launch3-6",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+   "where": "the lane's own VM runner",
+   "what": "`git merge-base HEAD origin/all-1111` fails in a worktree cut from a fetch that left the branch in FETCH_HEAD only; the sync script's left side of a pipe failed, shipped nothing, and the test ran on the tree before.",
+   "cost": "one test run read as a result of code that was not there",
+   "cause": "a pipeline's status is its last command's; the script had no `pipefail`",
+   "workaround": "the base is written out; errors of the sync are printed",
+   "state": "fixed (script only)"
+  },
+  {
+   "id": "launch3-7",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+   "where": "crates/blaze-engine/tests/revisions",
+   "what": "The real driver runs each action to its end (`real.rs:145`, the wait for the child) and has no step that keeps a program running across an edit, so \"a body edit while the program runs\" cannot be a revision test.",
+   "cost": "the live edit is shown by a script (the measurement) and by blaze-stencil's and blaze-launch-host's tests, not by the revision suite",
+   "cause": "the driver's steps are a build, a run or a test, each a whole process",
+   "workaround": "none",
+   "state": "open: a step that starts `run` and one that waits for a line of its output"
+  },
+  {
+   "id": "launch3-8",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+   "where": "hir-ty-codegen's fixtures",
+   "what": "`Target::for_fixtures()` is x86-64 Linux whatever the host, so no test of hir-ty-codegen can run the code it compiles: the test that runs tier 0 code in the launcher builds its functions as Cranelift IR in blaze-stencil, and the Rust front end is in it only through `blaze run`.",
+   "cost": "no crate-level test of front end to launcher; that path is checked by running programs",
+   "cause": "the fixtures' tests inspect code and never run it",
+   "workaround": "none",
+   "state": "open"
+  },
+  {
+   "id": "launch3-9",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+   "where": "ix VMs",
+   "what": "A VM made with `--memory 128` shows 4 GiB in `free` (it grows on demand), which reads as the wrong machine until `ix new --help` is read.",
+   "cost": "two commands",
+   "cause": "the ceiling is a cap, not what is plugged at boot",
+   "workaround": "none",
+   "state": "open"
+  },
+  {
+   "id": "launch3-10",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+   "where": "the daemon, a project deleted and made again at one path",
+   "what": "Once, after `rm -rf` of a project and writing it again at the same path with other sources while its daemon ran (and the daemon's home was being removed under it by the same script), `blaze run` built nothing and ran the old program: the source said `1` and the program printed `value 2`.",
+   "cost": "unknown: seen once, in a run whose home was in a bad state, and not tried again",
+   "cause": "unverified; the watcher lane's ground",
+   "workaround": "none",
+   "state": "open, unverified"
   }
  ]
 }
