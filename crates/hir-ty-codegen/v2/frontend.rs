@@ -106,6 +106,9 @@ pub struct HirFrontend<'db> {
     checks: Option<&'db dyn BodyChecks>, // dyn: never per instruction, as above
     /// Set when the build's job is cancelled or gives way to another task.
     stop: Option<&'db AtomicBool>,
+    /// Set while the daemon stops the build's tasks to give memory back
+    /// ([`Self::with_give_way`]): read with `stop`, before each function.
+    give_way: Option<&'db AtomicBool>,
     /// What the walk of a final binary found of its trait objects ([`super::devirt`]).
     pub(crate) devirt: super::devirt::State,
 }
@@ -543,6 +546,7 @@ impl<'db> HirFrontend<'db> {
             found: None,
             checks: None,
             stop: None,
+            give_way: None,
             devirt: Default::default(),
         }
     }
@@ -551,6 +555,15 @@ impl<'db> HirFrontend<'db> {
     /// job was cancelled, or the plane asked its task to give way. Checked or not.
     pub fn with_stop(mut self, stop: &'db AtomicBool) -> Self {
         self.stop = Some(stop);
+        self
+    }
+
+    /// The front end of a build that also stops before its next function while `give_way` is
+    /// set: the daemon is stopping the build's tasks to give memory back, and the task is
+    /// posted again once it has. Apart from [`Self::with_stop`]'s flag, which is the job's
+    /// cancel and is never cleared.
+    pub fn with_give_way(mut self, give_way: &'db AtomicBool) -> Self {
+        self.give_way = Some(give_way);
         self
     }
 
@@ -1192,6 +1205,7 @@ impl Frontend for HirFrontend<'_> {
 
     fn stopped(&self) -> bool {
         self.stop.is_some_and(|it| it.load(Ordering::Relaxed))
+            || self.give_way.is_some_and(|it| it.load(Ordering::Relaxed))
             || self.checks.is_some_and(|it| it.stopped())
     }
 

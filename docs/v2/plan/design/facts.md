@@ -142,6 +142,48 @@ machine-applicable fix for a private `&'static T` field every literal writes fro
 Not followed (silent): a table in a static filled at run time; that needs a removal analysis on
 the holding collection (slice 2).
 
+## What asking a fact costs, and the record that ends it
+
+2026-11-12, lane monowalk-1112. Read from the code and from lane reth's profile of tempo's cold
+build (eb3376ba8c on blaze d45e70ddc); the fix below is written and not yet compiled or measured.
+
+**What happened.** `SpendFacts` asks `facts_of(FactItem::Fn(callee))` for each direct callee of
+the body it optimizes. `fn_facts` answers from `walk::summary` of that function at its identity
+arguments, and a summary asks the summary of every instance its body can run, inside its own
+run: the callee's whole closure, depth first, on one query stack, so on one worker. Each summary
+read its instance's body from `dispatch::body_of`, the memo the interpreter uses, which keeps one
+monomorphized body an instance until the build lets every MIR go. For tempo's last unit that was
+one task alone for over 5 minutes, 4,197,786 MIR bodies let go by the release that followed, and
+`monomorphized` under `summary_in` as the top allocation site of the `mir` tag.
+
+**Now (written).** A summary reads its body through `dispatch::body_once`: the generic runtime
+body's memo (one a body), instantiated into a value the summary owns and drops. What a walk
+leaves held is then summaries and generic bodies, by code written, never bodies by instance
+(`hir-ty-pure` `tests::held`, with the memo as its control). The memo family stays for the
+interpreter, which runs one instance's body many times.
+
+**Next: the closure off the query stack.** The walk over a callee's closure becomes a keyed
+worklist on the pool (as the build's walk is, `blaze-codegen` `driver/worklist.rs`): an instance
+is an item, its visit summarizes its own body and sends on the instances it reaches that have no
+entry, and a second pass in dependency order joins callees' summaries into callers', with the
+existing fixpoint for a cycle. Its span carries `done` and `known`. The result is a function of
+the instances alone, so it is the same on any pool and any completion order, which its test
+shuffles. Not written.
+
+**The end state: a function's facts are a record.** `fn_facts` is per function item at its
+identity arguments, and its value follows from the function's code and the code it reaches and
+from nothing else: the definition of a value keyed by code identity (rule cache-by-code-id). So
+`Facts` is a record beside the function's MIR record (lane records-bodies), under the function's
+code identity. A unit that optimizes a body calling a dependency's function then reads that
+function's facts from its record and never summarizes its closure; only functions of the crate
+being built, and generics whose `Open` kinds an instance decides, are walked, each once, by the
+unit that owns them. What the record must hold: the three fact sets, and for each fact the
+identity a caller records in `relied`, which is already `hash(item key, fact tag)`. What it must
+not hold: a summary's witnesses and places, which are diagnostics and stay a query of the crate
+that reports them. Open with records-bodies: the key's form (the same as its MIR record's), and
+whether a generic function's `Open` kinds are stored as the list of bounds an instance must
+answer, so that an instance's facts are a join of records and never a walk.
+
 ## Slices
 
 1. **Written, unbuilt (2026-11-10).** `Facts`/`facts_of`/`license`; `SpendFacts` in MIR

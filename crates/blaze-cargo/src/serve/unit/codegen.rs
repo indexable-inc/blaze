@@ -1151,7 +1151,10 @@ pub(crate) fn generate<'db>(
     let frontend = frontend(reader, mounted, build_time)
         .with_policy(&policy)
         .with_image(image)
-        .with_stop(&job.input.cancelled);
+        .with_stop(&job.input.cancelled)
+        // Stopped for memory (lane memgive's `running tasks` rung): the walk ends before its
+        // next describe, and `compile::generate` posts the unit again.
+        .with_give_way(&job.gives_way);
     let frontend = match checks {
         Some(checks) => frontend.with_checks(checks),
         None => frontend,
@@ -1188,6 +1191,10 @@ pub(crate) fn generate<'db>(
             .verify_store(verify)
             .explain_misses(true)
             .keeping(&kept)
+            // Describes as store records (docs/v2/plan/design/store.md, "Describe records"):
+            // a function no kept walk holds is read from its record where it has one, and
+            // each describe made is among the build's puts.
+            .recording(&job.input.store)
             .run_with_statics(&asked, &roots.statics, &roots.check_roots(origin), &store)
     };
     match built {
@@ -1206,6 +1213,7 @@ pub(crate) fn generate<'db>(
                 each_build = work.each_build as u64,
                 described = walk.described as u64,
                 verified = walk.verified as u64,
+                found = walk.found as u64,
                 reached = walk.reached as u64,
                 visited = walk.visited as u64,
                 replaced = work.replaced as u64,
@@ -1213,6 +1221,12 @@ pub(crate) fn generate<'db>(
                 whole = u64::from(walk.whole.is_some()),
                 "edit work"
             );
+            // What the walk reached, for the plane's forecast of the units that depend on
+            // this one (lane memgive: a top crate reaches at least what its largest
+            // dependency did). A unit builds once a job: a second write has the same count.
+            if let Some(slot) = job.reached.get(unit) {
+                let _ = slot.set(walk.reached as u64);
+            }
             if let Some(slot) = job.counted.get(unit) {
                 // alloc: once per unit built, one entry per profile it used (none or one)
                 let _ = slot

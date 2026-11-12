@@ -1670,6 +1670,8 @@ struct Walking<'w, I, S> {
     counts: &'w kept::Counts,
     /// Which round of the walk, from 0 ([`Build::described`]).
     round: usize,
+    /// How far the round is, said on the walk's span while it runs.
+    progress: progress::Progress,
 }
 
 impl<I, S> Walking<'_, I, S> {
@@ -1779,6 +1781,8 @@ enum Planted {
     StaleBuilt,
     /// A walk kept by a front end that may close dyn facts is patched once it closes none.
     PatchesClosed,
+    /// What a describe sends on is not counted as known ([`progress`]): only the roots are.
+    UncountedSends,
 }
 
 /// How many of a walk's functions are reached each way: what [`rebind`] counted, and the span
@@ -2199,6 +2203,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             refused: SegQueue::new(),
             counts,
             round,
+            progress: progress::Progress::here(),
         };
         // alloc: none unless the check refuses
         let mut errors = Vec::new();
@@ -2222,15 +2227,22 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut passes = 0;
         let order = loop {
             {
-                let _span = tracing::info_span!(
+                let span = tracing::info_span!(
                     target: "blaze",
                     "codegen walk describe",
                     round,
                     pass = passes + 1,
-                )
-                .entered();
+                    done = tracing::field::Empty,
+                    known = tracing::field::Empty,
+                );
+                let _entered = span.enter();
                 walking.work.run(&|ask: &Ask<_, _>| self.visit(&walking, ask));
                 walking.hints.flush(self.frontend);
+                // The pass's own counts as it ends, and the walk's on the span above it.
+                let (done, known) = walking.progress.counts();
+                span.record("done", done);
+                span.record("known", known);
+                walking.progress.tell();
             }
             let order = Order::of(&walking.frontier, roots, static_roots, check);
             if walking.stopped.load(Ordering::Relaxed) {
@@ -2243,6 +2255,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                         // Deferred with its count: the check sends back no other.
                         let Some(counted) = entry.counted.get() else { continue };
                         let step = Step::place_past(entry.from.as_ref(), counted);
+                        walking.progress.known(1);
                         walking.work.push(Ask::Function(entry, step));
                     }
                 }
@@ -2318,6 +2331,8 @@ impl<'a, B: Prepare> Build<'a, B> {
                 }
             }
         }
+        // Past everything that can give way: a visit run again is counted once, as it ends.
+        walking.progress.done();
     }
 
     /// Sends on what `refs`, the references of a function or static at `step` asked for by
@@ -2410,6 +2425,11 @@ impl<'a, B: Prepare> Build<'a, B> {
             // clone: the walk's handle of the static, for the front end's hint
             sent_statics.push(entry.value.clone());
             walking.work.push(Ask::Static(entry, Step::place_static(from)));
+        }
+        // What a describe reached and sent; the roots (`from` is none) are counted whatever
+        // a control plants.
+        if from.is_none() || self.planted != Some(Planted::UncountedSends) {
+            walking.progress.known(sent.len() + sent_statics.len());
         }
         (sent, sent_statics)
     }
@@ -3190,6 +3210,9 @@ impl<'a, B: Prepare> Build<'a, B> {
                 // 2026-11-10 a 2 s walk's row said nothing of which walk it was.
                 function = tracing::field::Empty,
                 roots = roots.len(),
+                // How far the walk is, while it runs ([`progress`]): visits ended of items sent.
+                done = tracing::field::Empty,
+                known = tracing::field::Empty,
                 described = tracing::field::Empty,
                 verified = tracing::field::Empty,
                 found = tracing::field::Empty,
@@ -5302,6 +5325,7 @@ mod lists;
 mod near;
 pub use near::{Callee, Near};
 mod patch;
+mod progress;
 mod recursion;
 use recursion::Step;
 mod rows;
