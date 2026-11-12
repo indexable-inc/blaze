@@ -51,8 +51,12 @@
 //! finds them, which the engine checks are there for every object it loads. The engine
 //! resolves archives wherever they are on the line, so each file is on it once.
 
+mod shipped;
 #[cfg(test)]
 mod tests;
+
+pub use shipped::Glibc;
+pub(crate) use shipped::STUB;
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
@@ -82,6 +86,23 @@ pub struct Located {
     /// names it is matched against.
     pub name: String,
     pub kind: NativeKind,
+    /// The input's bytes when it is one blaze ships ([`shipped`]): it is no file, `path` is
+    /// its name alone, and the link takes these bytes. `None` for a file of the machine, read
+    /// at `path`.
+    pub bytes: Option<Arc<[u8]>>,
+}
+
+/// Where what is linked will run, which decides the one fact of an ELF executable that is
+/// the machine's and not the target's: its interpreter.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RunsOn {
+    /// On this machine: a build for the host with no `--target` (and every build script and
+    /// proc macro). Its interpreter is the loader blaze itself runs under, which is known to
+    /// be here, where the machine keeps its libc outside the ABI's directories (nix).
+    Here,
+    /// Wherever the target is: a build with `--target`. Its interpreter is the target ABI's
+    /// path, so the image's bytes are the same whatever machine links it.
+    Elsewhere,
 }
 
 /// The main thread's stack where the format says it: link.exe's default, which rustc keeps,
@@ -133,8 +154,9 @@ pub fn output(
     shared: Option<(String, Vec<String>)>,
     debug: Debug,
     incremental: bool,
+    runs: RunsOn,
 ) -> Result<Output, LinkError> {
-    output_with(&CACHE, &System, triple, shared, debug, incremental)
+    output_with(&System, triple, shared, debug, incremental, runs)
 }
 
 /// The native libraries of one crate and the directories that crate's own compile searches
@@ -171,12 +193,50 @@ pub fn locate(
     search: &[PathBuf],
     sysroot: &Path,
 ) -> Result<Vec<Located>, LinkError> {
-    let located = locate_with(&CACHE, &System, output, libs, search, sysroot)?;
-    output.rpaths = rpaths(Target::parse(&output.triple)?, output, sysroot)?;
+    let target = Target::parse(&output.triple)?;
+    let located = locate_any(&CACHE, &System, output, libs, search, sysroot)?;
+    output.rpaths = rpaths(target, output, sysroot)?;
     // The link arguments' after the runtimes', as rustc's link line has them.
     // clone: once per link, the rpaths the output owns
     output.rpaths.extend(output.link.rpaths.iter().cloned());
     Ok(located)
+}
+
+/// [`locate`]'s line: blaze's own inputs for a link of Rust alone ([`Target::ships`]), with
+/// `ask` asked nothing, else the machine's ([`locate_with`]) with what the image says of the
+/// machine ([`machine_facts`]).
+fn locate_any<A: Ask>(
+    cache: &Cache,
+    ask: &A,
+    output: &mut Output,
+    libs: &[CrateLibs<'_>],
+    search: &[PathBuf],
+    sysroot: &Path,
+) -> Result<Vec<Located>, LinkError> {
+    let target = Target::parse(&output.triple)?;
+    Ok(match target.ships(output, libs) {
+        // Rust alone: every input is blaze's, and the machine is asked nothing.
+        Ok(()) => shipped_line(cache, target, output, libs)?,
+        // Something of the machine's is linked, so the machine's C toolchain says where its
+        // files are, its libc and start objects among them: one libc per image.
+        Err(why) => {
+            let located = machine_facts(cache, ask, output)
+                .and_then(|()| locate_with(cache, ask, output, libs, search, sysroot));
+            // A library not found says so itself; any other failure is the toolchain's, and
+            // says why this link asked it.
+            located.map_err(|it| match it.refusal {
+                Some(_) => it,
+                None => LinkError {
+                    // alloc: error path
+                    what: format!(
+                        "{}, so it is linked with the machine's C toolchain for {}, and {}",
+                        why, output.triple, it.what
+                    ),
+                    ..it
+                },
+            })?
+        }
+    })
 }
 
 /// The release channel in the sanitizer runtimes' names, as rustc's `CFG_RELEASE_CHANNEL`
@@ -319,24 +379,29 @@ pub fn reactor(debug: Debug, incremental: bool) -> Result<Output, LinkError> {
 }
 
 fn reactor_with<A: Ask>(
-    cache: &Cache,
+    _cache: &Cache,
     ask: &A,
     debug: Debug,
     incremental: bool,
 ) -> Result<Output, LinkError> {
-    let mut output = output_with(cache, ask, Target::Wasip1.triple(), None, debug, incremental)?;
+    let mut output =
+        output_with(ask, Target::Wasip1.triple(), None, debug, incremental, RunsOn::Here)?;
     // alloc: once per link, the entry's name
     output.kind = OutputKind::Executable { entry: REACTOR_ENTRY.to_owned() };
     Ok(output)
 }
 
+/// Asks the machine nothing but, for [`RunsOn::Here`], the loader blaze runs under
+/// ([`Ask::loader`]): the interpreter is that or the ABI's, and the macOS SDK the image says it
+/// was built with is the one blaze's `libSystem.tbd` was checked against. A link that takes the
+/// machine's C toolchain says the machine's of both instead ([`machine_facts`]).
 fn output_with<A: Ask>(
-    cache: &Cache,
     ask: &A,
     triple: &str,
     shared: Option<(String, Vec<String>)>,
     debug: Debug,
     incremental: bool,
+    runs: RunsOn,
 ) -> Result<Output, LinkError> {
     let target = Target::parse(triple)?;
     let kind = match shared {
@@ -354,18 +419,20 @@ fn output_with<A: Ask>(
     };
     let executable = matches!(kind, OutputKind::Executable { .. });
     let interpreter = match target {
-        // clone: once per link, the path kept for the target
         Target::LinuxX86_64 | Target::LinuxAarch64 if executable => {
-            cache.found(ask, target, None)?.interpreter.clone()
+            let here = match runs {
+                RunsOn::Here => ask.loader()?,
+                RunsOn::Elsewhere => None,
+            };
+            // alloc: once per link, the interpreter's path
+            Some(here.unwrap_or_else(|| loader(target).1.to_owned()))
         }
         _ => None,
     };
     let platform = match target {
-        Target::MacOs => Some(Platform {
-            platform: MACOS,
-            minimum: minimum(ask)?,
-            sdk: cache.found(ask, target, None)?.sdk,
-        }),
+        Target::MacOs => {
+            Some(Platform { platform: MACOS, minimum: minimum(ask)?, sdk: shipped::MACOS_SDK })
+        }
         _ => None,
     };
     Ok(Output {
@@ -399,6 +466,94 @@ fn output_with<A: Ask>(
         rpaths: Vec::new(),
         link: crate::LinkArgs::default(),
     })
+}
+
+/// What an image linked with the machine's C toolchain says of it in place of
+/// [`output_with`]'s answers: the interpreter its libc is loaded by (the toolchain's own where
+/// its libc is outside the FHS directories), and the macOS SDK's version.
+fn machine_facts<A: Ask>(cache: &Cache, ask: &A, output: &mut Output) -> Result<(), LinkError> {
+    let target = Target::parse(&output.triple)?;
+    match target {
+        Target::LinuxX86_64 | Target::LinuxAarch64 if output.interpreter.is_some() => {
+            // clone: once per link, the path kept for the target
+            output.interpreter = cache.found(ask, target, None)?.interpreter.clone();
+        }
+        Target::MacOs => {
+            let sdk = cache.found(ask, target, None)?.sdk;
+            if let Some(platform) = &mut output.platform {
+                platform.sdk = sdk;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The link line of an image whose every native input blaze ships ([`Target::ships`]), in the
+/// machine's line's order: the start object, the libraries the crates ask for, each once, then
+/// those every image takes. No file is read and no program run: each input is bytes of blaze
+/// ([`Located::bytes`]), made once per process.
+fn shipped_line(
+    cache: &Cache,
+    target: Target,
+    output: &Output,
+    libs: &[CrateLibs<'_>],
+) -> Result<Vec<Located>, LinkError> {
+    let mut out: Vec<Located> = Vec::with_capacity(12);
+    let mut push = |file: &str, kind: NativeKind, bytes: Arc<[u8]>| {
+        // alloc: once per input of the line, its name
+        let name = format!("blaze:{}/{file}", output.triple);
+        if !out.iter().any(|it| it.name == name) {
+            out.push(Located { path: PathBuf::from(&name), name, kind, bytes: Some(bytes) });
+        }
+    };
+    let executable = matches!(output.kind, OutputKind::Executable { .. });
+    match target {
+        Target::LinuxX86_64 | Target::LinuxAarch64 => {
+            let release = Glibc::DEFAULT;
+            let arch = target.arch();
+            let start = match executable {
+                true => "start.o",
+                false => "start-shared.o",
+            };
+            let bytes = cache.shipped(arch, start, release, || {
+                shipped::start(arch, executable, release)
+            })?;
+            push(start, NativeKind::Object, bytes);
+            let asked = libs.iter().flat_map(|it| it.libs).map(|it| it.name.as_str());
+            // `gcc_s` and `c` as the machine's line ends, then the loader, which glibc's
+            // `libc.so` script names after `libc.so.6` (`__tls_get_addr` is its).
+            for name in asked.chain(["gcc_s", "c", "ld"]) {
+                let Some(soname) = target.glibc_soname(name) else {
+                    // alloc: error path
+                    return Err(fail(format!(
+                        "the native library `{name}` is not one blaze ships for {}",
+                        output.triple
+                    )));
+                };
+                let bytes = cache.shipped(arch, soname, release, || match name {
+                    "gcc_s" => Ok(shipped::libgcc_s()),
+                    _ => shipped::glibc(arch, soname, release),
+                })?;
+                push(soname, NativeKind::Shared { as_needed: true }, bytes);
+            }
+        }
+        Target::MacOs => {
+            push(
+                "libSystem.tbd",
+                NativeKind::Shared { as_needed: false },
+                cache.shipped(target.arch(), "libSystem.tbd", Glibc(0, 0), || {
+                    Ok(Arc::from(shipped::LIBSYSTEM))
+                })?,
+            );
+        }
+        // [`Target::ships`] says no for every other target.
+        _ => {
+            // alloc: error path
+            return Err(fail(format!("blaze ships no C library for {}", output.triple)));
+        }
+    }
+    Ok(out)
 }
 
 fn locate_with<A: Ask>(
@@ -628,6 +783,61 @@ impl Target {
         }
     }
 
+    /// The shared object of glibc (or GCC's unwinder) that `-l<name>` names, of those blaze
+    /// ships a stub of; `ld` is the loader.
+    fn glibc_soname(self, name: &str) -> Option<&'static str> {
+        Some(match name {
+            "c" => "libc.so.6",
+            "m" => "libm.so.6",
+            "pthread" => "libpthread.so.0",
+            "dl" => "libdl.so.2",
+            "rt" => "librt.so.1",
+            "util" => "libutil.so.1",
+            "resolv" => "libresolv.so.2",
+            "gcc_s" => "libgcc_s.so.1",
+            "ld" => loader(self).0,
+            _ => return None,
+        })
+    }
+
+    /// Whether every native input of a link is one blaze ships for the target
+    /// ([`shipped`]), so the link reads nothing of the machine: no sanitizer runtime, and
+    /// each library the crates ask for a plain `-l` of the target's C library (glibc's and
+    /// libgcc_s on Linux, libSystem under its names on macOS). That is a link of Rust alone.
+    /// Otherwise why not, naming the first input that is not: such a link takes the machine's
+    /// C toolchain for all of it, since an object compiled against the machine's libc and a
+    /// library found on the machine go with that libc, not with blaze's list of another
+    /// release (docs/linking.md, "Cross compilation").
+    fn ships(self, output: &Output, libs: &[CrateLibs<'_>]) -> Result<(), String> {
+        let named: fn(Target, &str) -> bool = match self {
+            Target::LinuxX86_64 | Target::LinuxAarch64 => {
+                |target, name| name != "ld" && target.glibc_soname(name).is_some()
+            }
+            Target::MacOs => |_, name| matches!(name, "System" | "c" | "m" | "pthread" | "dl"),
+            // alloc: error path
+            _ => return Err(format!("blaze ships no C library for {}", self.triple())),
+        };
+        if !output.sanitize.sanitizers.is_empty() {
+            // alloc: error path
+            return Err("a sanitizer's runtime is C".to_owned());
+        }
+        if !output.link.rpaths.is_empty() {
+            // alloc: error path
+            return Err("the link is given an rpath, which names the machine".to_owned());
+        }
+        for lib in libs.iter().flat_map(|it| it.libs) {
+            if lib.verbatim || lib.kind != NativeLibKind::Dylib || !named(self, &lib.name) {
+                // alloc: error path
+                return Err(format!(
+                    "this links the native library `{}`, which is not one blaze ships for {}",
+                    lib.name,
+                    self.triple()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Whether a library the crates ask for is provided by a Rust crate of the program on this
     /// target, and so never searched for: wasm64-blaze-wasip1 has no wasi-libc, and its C
     /// runtime is a crate of blaze's `library/`, which defines what the `libc` crate's
@@ -729,6 +939,48 @@ pub(crate) trait Ask {
     /// `program` run once with `args`: its standard error, where a C driver prints `-###`'s
     /// jobs, or why it failed.
     fn said(&self, program: &Path, args: &[String]) -> Result<String, String>;
+    /// The ELF interpreter this process runs under, read from its own image (no program is
+    /// run): the one loader known to be on this machine. `None` where there is none to read:
+    /// a statically linked blaze, or a host that is not Linux.
+    fn loader(&self) -> Result<Option<String>, LinkError>;
+}
+
+/// The `PT_INTERP` of the 64-bit little-endian ELF image `file`, read with three positioned
+/// reads; `None` for an image that has none.
+fn interpreter_of(file: &mut std::fs::File) -> std::io::Result<Option<String>> {
+    use std::io::{Seek as _, SeekFrom};
+    let mut header = [0u8; 64];
+    file.read_exact(&mut header)?;
+    if &header[..6] != b"\x7fELF\x02\x01" {
+        return Ok(None);
+    }
+    let word = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
+    let half = |bytes: &[u8]| u64::from(u16::from_le_bytes(bytes.try_into().unwrap_or([0; 2])));
+    let (offset, size, count) = (word(&header[32..40]), half(&header[54..56]), half(&header[56..58]));
+    if size < 56 || count > 512 {
+        return Ok(None);
+    }
+    for at in 0..count {
+        let mut entry = [0u8; 56];
+        file.seek(SeekFrom::Start(offset + at * size))?;
+        file.read_exact(&mut entry)?;
+        if u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]) != 3 {
+            continue;
+        }
+        let (at, len) = (word(&entry[8..16]), word(&entry[32..40]));
+        if len == 0 || len > 4096 {
+            return Ok(None);
+        }
+        // alloc: once per process, the interpreter's path
+        let mut path = vec![0u8; len as usize];
+        file.seek(SeekFrom::Start(at))?;
+        file.read_exact(&mut path)?;
+        while path.last() == Some(&0) {
+            path.pop();
+        }
+        return Ok(String::from_utf8(path).ok());
+    }
+    Ok(None)
 }
 
 /// The machine: its environment and its commands.
@@ -800,6 +1052,24 @@ impl Ask for System {
         // alloc: error path
         String::from_utf8(done.stderr).map_err(|_| "it printed what is not UTF-8".to_owned())
     }
+
+    fn loader(&self) -> Result<Option<String>, LinkError> {
+        if !cfg!(target_os = "linux") {
+            return Ok(None);
+        }
+        static OWN: std::sync::OnceLock<Result<Option<String>, String>> = std::sync::OnceLock::new();
+        // clone: once per link, the path kept for the process
+        OWN.get_or_init(|| {
+            let mut file = std::fs::File::open("/proc/self/exe")
+                // alloc: error path
+                .map_err(|error| format!("blaze's own image, /proc/self/exe: {error}"))?;
+            interpreter_of(&mut file)
+                // alloc: error path
+                .map_err(|error| format!("blaze's own image, /proc/self/exe: {error}"))
+        })
+        .clone()
+        .map_err(fail)
+    }
 }
 
 /// What a toolchain was found from: the target, each of [`Target::vars`] (an empty one is
@@ -847,6 +1117,8 @@ type Asked = Arc<Vec<(String, String)>>;
 pub(crate) struct Cache {
     found: Lock<Vec<(Key, Arc<Found>)>>,
     asked: Lock<Vec<(ContentId, u32, Asked)>>,
+    /// The inputs blaze ships, as made ([`shipped`]): by architecture, file and glibc release.
+    shipped: Lock<Vec<((Arch, &'static str, Glibc), Arc<[u8]>)>>,
 }
 
 impl Cache {
@@ -855,7 +1127,26 @@ impl Cache {
         Cache {
             found: Lock::new("link.toolchain.found", Vec::new()),
             asked: Lock::new("link.toolchain.asked", Vec::new()),
+            shipped: Lock::new("link.toolchain.shipped", Vec::new()),
         }
+    }
+
+    /// The shipped input `file` for `arch` at `release`: made once, then kept.
+    fn shipped(
+        &self,
+        arch: Arch,
+        file: &'static str,
+        release: Glibc,
+        make: impl FnOnce() -> Result<Arc<[u8]>, String>,
+    ) -> Result<Arc<[u8]>, LinkError> {
+        let key = (arch, file, release);
+        let mut kept = self.shipped.lock();
+        if let Some((_, bytes)) = kept.iter().find(|it| it.0 == key) {
+            return Ok(Arc::clone(bytes));
+        }
+        let bytes = make().map_err(fail)?;
+        kept.push((key, Arc::clone(&bytes)));
+        Ok(bytes)
     }
 
     /// What the PE archive, or the Mach-O object or archive for `arch`, at `path` (`name` on
@@ -1636,7 +1927,7 @@ impl Line<'_> {
             self.output.format == Format::MachO && matches!(kind, NativeKind::Shared { .. });
         // alloc: once per file of the line, the name the engine knows it by
         let name = path.to_string_lossy().into_owned();
-        self.out.push(Located { path, name, kind });
+        self.out.push(Located { path, name, kind, bytes: None });
         let at = self.out.len() - 1;
         if script {
             self.follow(at)?;

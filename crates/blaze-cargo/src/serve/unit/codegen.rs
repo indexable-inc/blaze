@@ -2121,7 +2121,15 @@ fn link_at(
         // A wasm module is linked whole and never slid or patched in place, and its debug info
         // is its name section: each expansion instantiates the module afresh.
         true => blaze_link::target::reactor(blaze_link::Debug::None, false),
-        false => blaze_link::target::output(triple(job, u), shared, debug, true),
+        false => {
+            // A unit with no platform of its own is built for this machine, to run here; one
+            // built for `--target` runs wherever that is ([`blaze_link::target::RunsOn`]).
+            let runs = match u.platform {
+                None => blaze_link::target::RunsOn::Here,
+                Some(_) => blaze_link::target::RunsOn::Elsewhere,
+            };
+            blaze_link::target::output(triple(job, u), shared, debug, true, runs)
+        }
     };
     let mut output = output.map_err(linker(LinkStep::Output))?;
     // Debug info goes beside the image unless the profile says `split-debuginfo = "off"`
@@ -2589,6 +2597,9 @@ pub(crate) fn function_rows(
     Ok((rows, keys(gone), keys(new)))
 }
 
+/// The domain an input blaze ships ([`blaze_link::target::Located::bytes`]) is named in.
+const SHIPPED_NATIVE: &str = "blaze v2 link shipped native input 1";
+
 /// [`link`]'s change of `linked` to what `generated` built, with the crates' `global_asm!`
 /// objects `assembled` and the native inputs `located`, laid out by `heat` where the image is
 /// laid out whole, and what was done to the image ([`Laid`]).
@@ -2652,6 +2663,12 @@ fn relink(
         )));
     }
     for it in located {
+        // An input blaze ships is its bytes, the same on every machine: hashed here, and no
+        // file the build read.
+        if let Some(bytes) = &it.bytes {
+            native_ids.push(ContentId::of(SHIPPED_NATIVE, bytes));
+            continue;
+        }
         let hash = blaze_usercode::trace::Inputs::file(&mut files, &it.path)
             .map_err(LinkCause::Native)?
             // alloc: error path
@@ -2675,6 +2692,11 @@ fn relink(
     for (order, it) in located.iter().enumerate() {
         let order = assembled.len() + order;
         if added_natives.binary_search(&native_ids[order]).is_ok() {
+            if let Some(bytes) = &it.bytes {
+                // clone: an `Arc`, the shipped input shared with the image
+                bytes_of.push((order, Arc::clone(bytes)));
+                continue;
+            }
             let bytes = std::fs::read(&it.path).map_err(|error| {
                 // alloc: error path
                 LinkCause::Native(blaze_usercode::inputs::Unreadable {

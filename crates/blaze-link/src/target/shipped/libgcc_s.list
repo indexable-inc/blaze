@@ -1,0 +1,22 @@
+# libgcc_s.so.1's unwinder, as GCC's libgcc/libgcc-std.ver versions it on x86-64 and AArch64
+# Linux: the interface Rust's `unwind` crate declares (library/unwind/src/libunwind.rs), written
+# by hand and held to a real libgcc_s.so.1 by `scripts --bin cross` (`check`). Names and versions
+# only; none of GCC's code.
+_Unwind_Backtrace GCC_3.3
+_Unwind_DeleteException GCC_3.0
+_Unwind_FindEnclosingFunction GCC_3.3
+_Unwind_Find_FDE GCC_3.0
+_Unwind_ForcedUnwind GCC_3.0
+_Unwind_GetCFA GCC_3.3
+_Unwind_GetDataRelBase GCC_3.0
+_Unwind_GetGR GCC_3.0
+_Unwind_GetIP GCC_3.0
+_Unwind_GetIPInfo GCC_4.2.0
+_Unwind_GetLanguageSpecificData GCC_3.0
+_Unwind_GetRegionStart GCC_3.0
+_Unwind_GetTextRelBase GCC_3.0
+_Unwind_RaiseException GCC_3.0
+_Unwind_Resume GCC_3.0
+_Unwind_Resume_or_Rethrow GCC_3.3
+_Unwind_SetGR GCC_3.0
+_Unwind_SetIP GCC_3.0
