@@ -138,7 +138,7 @@ not changed here, and not measured (no macOS run in this lane).
 - **A stage that costs the edit.** Measured 2026-11-12 on hello world (12,071 functions, 30
   one-line body edits, a Linux VM, tree a9325666d): `link patch` is 9.5 ms, of which
   `link stage: lists` 2.9 (each of the core's four lists is copied whole by
-  `Owned::splice`, and every function is scanned for a changed symbol), `apply the change`
+  `Owned::splice`, and where a symbol changed every function is scanned for it), `apply the change`
   2.0, `the writer's tables` 1.25 (`.eh_frame_hdr` is made whole: its patch asks for
   `Delta::same_regions`, which no edit that places new code keeps), `the writer's file` 0.8
   (the symbol table, made whole for the same reason) and `dev run commit` 1.2 beside it.
