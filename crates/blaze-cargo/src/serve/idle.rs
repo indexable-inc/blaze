@@ -14,8 +14,6 @@
 //! The invariant: [`Idle::look`] is true at most once between two looks that saw work, never
 //! while work is seen, and never before the daemon has been idle for [`AFTER`].
 
-#![blaze::sans_io]
-
 use std::time::Duration;
 
 /// How long the daemon has nothing to do before it gives its warm memory back: past the gap

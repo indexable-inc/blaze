@@ -25,6 +25,7 @@ mod fetch_url;
 pub(crate) mod flightrec;
 mod gc;
 mod heads;
+#[blaze::sans_io]
 mod idle;
 mod image;
 #[cfg(all(unix, feature = "native"))]
