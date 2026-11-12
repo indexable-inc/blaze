@@ -1,0 +1,11 @@
+{
+ "id": "edit4-11",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+ "where": "blaze-query: a database's first changed-set walk, in a test",
+ "what": "A test that writes a file and then asks `changed_since` for the first time gets every row named: the walk is of everything written since the database was made (`written=30`, `marked=2022` among 2,000 functions), a wide level, so the link inputs' counter said 2,008 bodies moved for a one-line edit. A daemon never sees it, since each build walks (`body check: changed set`, `written=4`, `marked=0`).",
+ "cost": "two test runs and a print of `ChangedSetWork` to tell it from a real dependence on the program",
+ "cause": "nothing says a host must walk once a build before it asks; a test that models an edit has to model the build's walk too",
+ "workaround": "the tests call `walk_changed_set` each step, as a build's check does",
+ "state": "open: `changed_since`'s docs could say that the first walk of a storage names what every write since its start reaches"
+}

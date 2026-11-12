@@ -158,12 +158,18 @@ impl NodeRow {
         [a.load(Ordering::Relaxed), b.load(Ordering::Relaxed)]
     }
 
-    /// Adds `summary`'s bits: a walk's, which racing walkers of a view agree on.
+    /// Adds `summary`'s bits: a walk's, which racing walkers of a view agree on. Whether it
+    /// held bits before and gained one.
     #[inline]
-    pub(crate) fn grow_summary(&self, summary: Summary) {
+    pub(crate) fn grow_summary(&self, summary: Summary) -> bool {
+        gained(self.add_summary(summary), summary)
+    }
+
+    /// Adds `summary`'s bits and gives the summary before.
+    #[inline]
+    pub(crate) fn add_summary(&self, summary: Summary) -> Summary {
         let [a, b] = &self.summary;
-        a.fetch_or(summary[0], Ordering::Relaxed);
-        b.fetch_or(summary[1], Ordering::Relaxed);
+        [a.fetch_or(summary[0], Ordering::Relaxed), b.fetch_or(summary[1], Ordering::Relaxed)]
     }
 
     #[inline(always)]
@@ -185,6 +191,14 @@ pub(crate) fn input_bits(node: u32) -> Summary {
         bits[(bit >> 6) as usize] |= 1 << (bit & 63);
     }
     bits
+}
+
+/// Whether a node whose summary was `old` and is now `old | new` or `new` gained a bit its
+/// readers may lack: it held bits before (a node never summarized has no reader yet: a reader
+/// takes its summary as it ends its run, after the node's first) and `new` has one more.
+#[inline(always)]
+pub(crate) fn gained(old: Summary, new: Summary) -> bool {
+    old != [0; 2] && (new[0] & !old[0]) | (new[1] & !old[1]) != 0
 }
 
 #[inline(always)]
@@ -431,6 +445,29 @@ impl Storage {
         (summary[0] & written[0]) | (summary[1] & written[1]) == 0
     }
 
+    /// Whether the row of node `node` (`row`), of durability `durability` and verified in
+    /// `verified`, whose last run made no untracked read, holds in this view with no look at
+    /// its edges: no input of its kind or above was written since, or none whose bits its
+    /// summary has; counted from the view it was verified in, or from the changed set's floor
+    /// where that is later and holds the row ([`super::frontier::floor`]); or the changed
+    /// set's walk of this view says it is unchanged ([`super::frontier::unreached`]).
+    #[inline]
+    pub(crate) fn holds(&self, node: u32, row: &NodeRow, durability: u8, verified: u32) -> bool {
+        if self.unchanged_since(durability, verified) || self.inputs_unchanged(row, verified) {
+            return true;
+        }
+        let floor = super::frontier::floor(self);
+        if floor > verified
+            && (self.unchanged_since(durability, floor) || self.inputs_unchanged(row, floor))
+            && super::frontier::floored(self, node)
+        {
+            return true;
+        }
+        // Or the changed set's walk of this view says so: it ended, or the row is outside
+        // its reach.
+        super::frontier::unreached(self, node)
+    }
+
     /// Node `node`: one check of its index for all it holds.
     ///
     /// # Panics
@@ -460,14 +497,22 @@ impl Storage {
     #[inline]
     pub(crate) fn set_summary(&self, node: u32, summary: Summary) {
         let [a, b] = &self.node(node).summary;
+        let old = [a.load(Ordering::Relaxed), b.load(Ordering::Relaxed)];
         a.store(summary[0], Ordering::Relaxed);
         b.store(summary[1], Ordering::Relaxed);
+        // A node that ran again and reads an input its readers' summaries lack: they are
+        // completed at the next view boundary ([`Storage::complete_summaries`]).
+        if gained(old, summary) {
+            self.frontier.grew(node);
+        }
     }
 
     /// Adds `summary`'s bits to `node`'s: a walk's, which racing walkers of a view agree on.
     #[inline]
     pub(crate) fn grow_summary(&self, node: u32, summary: Summary) {
-        self.node(node).grow_summary(summary);
+        if self.node(node).grow_summary(summary) {
+            self.frontier.grew(node);
+        }
     }
 
     /// The OR of the summaries of `edges`' nodes.
@@ -638,8 +683,13 @@ impl Storage {
         if durability.0 >= Durability::HIGH.0 {
             self.high_opened = self.opened;
         }
+        // The reaches of the view before are no view's now.
+        self.drop_reaches();
         // Before the edge array settles: the fold reads the spans runs replaced.
         self.fold_reverse();
+        // Before the write's mask is tested against any row: every reader's summary holds
+        // what its dependencies read now.
+        self.complete_summaries();
         self.settle();
         self.sweep();
         self.view
@@ -731,6 +781,8 @@ impl Storage {
     /// Passes every view stamp the storage holds through `restamp`, storing what it gives.
     fn restamp(&mut self, restamp: &mut Restamp<'_>) {
         self.view = restamp.apply(self.view);
+        let floor = self.frontier.floor.get_mut();
+        *floor = restamp.apply(*floor);
         for kind in &mut self.last_changed {
             *kind = restamp.apply(*kind);
         }

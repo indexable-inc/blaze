@@ -273,6 +273,16 @@ fn with_counters(ingredient: u32, f: impl FnOnce(&Counters)) {
     });
 }
 
+/// Counter `what` of `ingredient` now, summed over every thread, taken or not: for a test
+/// that counts one query's work without taking the process's counts from the tests beside it.
+#[cfg(test)]
+pub(crate) fn now(ingredient: u32, what: usize) -> u64 {
+    blocks()
+        .filter_map(|block| block.counters.get(ingredient as usize))
+        .map(|counters| counters.now[what].load(Ordering::Relaxed))
+        .sum()
+}
+
 /// What each ingredient's counts gained since the last take, summed over every thread, and the
 /// most reads one of its runs held since then, as `each(name, counts)`; an ingredient that
 /// gained nothing is left out. Process-wide: two databases' counts, and two overlapping

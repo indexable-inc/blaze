@@ -294,6 +294,9 @@ impl Steps for Real {
         // here, after the answer and with the front end exclusive, never at the next build's
         // first write (`Storage::pack_reverse`).
         blaze_query::db::Database::storage_mut(kept.lowered.served_db()).pack_reverse();
+        // And settled: what those runs said changed leaves the next walk's start
+        // (`Storage::settle_changed_set`).
+        blaze_query::db::Database::storage_mut(kept.lowered.served_db()).settle_changed_set();
         Ok(puts)
     }
 

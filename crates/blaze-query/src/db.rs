@@ -45,7 +45,7 @@ pub use capture::{
 pub use blaze_graph::par::{SMALL_ITEMS, SMALL_NS, Small};
 pub use census::{Blocker as DurabilityBlocker, Census as DurabilityCensus};
 pub use counts::{Counts, take as take_counts};
-pub use frontier::{Changed, ChangedSetWork, Unknown as ChangedUnknown};
+pub use frontier::{Changed, ChangedSetWork, Settled, Unknown as ChangedUnknown};
 pub use function::completed;
 pub use id::{AsId, FromId, FromIdIn, Id};
 pub use input::Setter;

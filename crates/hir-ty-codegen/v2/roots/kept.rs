@@ -24,6 +24,19 @@ pub(super) struct Kept {
     pub(super) statics: Box<[StaticId]>,
 }
 
+/// The functions `krate` keeps by name ([`kept`]), each as the instance a build roots
+/// ([`root_in`](crate::v2::frontend::root_in)), in the order found: once per crate and
+/// revision of it, so a build that lists its roots asks one memo a crate it links. Asked
+/// function by function, each root's generics were read again every build: 352
+/// `FunctionSignature::kept` verified for a one-line body edit of hello world (2026-11-12),
+/// a count of the names the program's crates keep.
+#[blaze_query::tracked(returns(ref))]
+pub(super) fn kept_roots(db: &Db, krate: Crate) -> Box<[crate::v2::HirInstance]> {
+    let functions = kept(db, krate).functions.iter();
+    // alloc: once a crate a revision, the memo's list
+    functions.map(|func| crate::v2::frontend::root_in(db, *func)).collect()
+}
+
 /// Once per crate and revision of it: the standard library's is found once a daemon.
 #[blaze_query::tracked(returns(ref))]
 pub(super) fn kept(db: &Db, krate: Crate) -> Kept {
