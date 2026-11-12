@@ -169,8 +169,12 @@ struct RecordRef<'a> {
 /// input's path, has each of them as its placeholder; a record that names bytes written so
 /// lists them ([`Record::ported`]); a record tied to its directories is under its key here
 /// ([`Places::here`]). A record of layout 12 is under a key of that domain, which no lookup
-/// of this one makes.
-const RECORD: &str = "blaze v2 cargo unit record 13";
+/// of this one makes. 14: a library built up to the crate boundary ([`cut_at_crates`]) is under
+/// a narrow key that holds its dependencies' interfaces in place of their code
+/// ([`blaze_lower::Narrowed::built`]), and its record lists of its codegen's inputs its own
+/// roots alone ([`owned_inputs`]): a record of layout 13 lists a dependency's functions with
+/// the code they had, so under such a key it would be found after one of them changed.
+const RECORD: &str = "blaze v2 cargo unit record 14";
 const OUTPUT: &str = "blaze v2 cargo output 1";
 
 /// The store's key of an output file's `bytes`: what a record names it by, and what a dev
@@ -359,8 +363,10 @@ fn identity(job: &Job, unit: usize) -> Option<ContentId> {
 
 /// What `unit`'s narrow record key ([`narrow_key`]) holds in place of its crate's whole
 /// identity: what a unit that only checks can observe ([`blaze_lower::Narrowed::checked`]),
-/// or what one that builds code can ([`blaze_lower::Narrowed::code`]: the code generator
-/// reads every body its walk reaches, in every crate). None, so the unit has its whole key
+/// what a library built up to the crate boundary can ([`blaze_lower::Narrowed::built`], for
+/// the units [`cut_at_crates`] names), or what any other unit that builds code can
+/// ([`blaze_lower::Narrowed::code`]: a program's code generator reads every body its walk
+/// reaches, in every crate, and links them). None, so the unit has its whole key
 /// alone, where the unit reads what a narrowed identity leaves out: comments, read by
 /// clippy's and blaze's lints (`// SAFETY:`, `// alloc:`) and by rustdoc and its doctests;
 /// and for a crate with no narrowed identity ([`blaze_lower::Lowered::narrowed`]).
@@ -374,10 +380,76 @@ fn narrow_identity(job: &Job, unit: usize) -> Result<Option<ContentId>, ApiError
     if reads_comments {
         return Ok(None);
     }
-    Ok(Some(match checks_only(job.input.kind, u) {
-        true => narrowed.checked,
+    if checks_only(job.input.kind, u) {
+        return Ok(Some(narrowed.checked));
+    }
+    Ok(Some(match cut_at_crates(job, unit, u)? && !keyed_deep(job) {
+        true => narrowed.built,
         false => narrowed.code,
     }))
+}
+
+/// Whether `unit`'s record holds nothing made from a body of another crate that the crate's
+/// interface leaves out, so its narrow key holds its dependencies by their interfaces
+/// ([`blaze_lower::Narrowed::built`]; docs/v2/plan/design/store.md, "Early cutoff between
+/// crates"). All of:
+///
+/// - it builds code and makes a library ([`Makes::Library`]): nothing is linked, and what it
+///   compiles is in the store by each function's own key. A program's unit links every
+///   function it reaches, so it holds them all by their code;
+/// - its profile's `opt-level` is 0 and its goal is tier 0 code: the MIR inliner then builds
+///   into a caller only what is `#[inline]` by its attributes, a body the interface holds
+///   whole. Optimized, it infers of a small leaf of another crate that it may be inlined, from
+///   that function's body (`hir_ty_mir`'s `cross_crate_inlinable`), which no interface holds.
+///
+/// What such a unit's record holds, each from its own code text and its dependencies'
+/// interfaces alone: its check's outcome (a check reads interfaces), its library file (its
+/// identity and its roots' keys: a function's key is of its own code, a callee a place its
+/// link fills) and of its codegen's inputs its roots ([`owned_inputs`]). By the unit and
+/// never by the request's variables, so a unit's record is one value under its whole key.
+fn cut_at_crates(job: &Job, unit: usize, u: &Unit) -> Result<bool, ApiError> {
+    if checks_only(job.input.kind, u) || u.profile.opt_level != "0" {
+        return Ok(false);
+    }
+    if !matches!(codegen::makes(u, codegen::asked(job, unit)), Ok(Makes::Library)) {
+        return Ok(false);
+    }
+    let goal = codegen::goal(job, unit)
+        .map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?; // alloc: error path
+    Ok(matches!(goal, blaze_api::Goal::Edit))
+}
+
+/// The variable of a request that plants the bug the cutoff's tests are held to
+/// (test-the-cause): set to `1`, a library's build is keyed by the code of the crates it
+/// depends on again, deeply, as it was until 2026-11-12, so a body edit below it moves its
+/// key. The revision case `a_body_edit_below_with_libraries_keyed_by_code` sets it and must
+/// then miss the bound `a_body_edit_makes_its_crate_and_nothing_above_it` holds. Never set in
+/// use: it is read of the request alone, and changes which key a record is under, never what
+/// the record holds.
+const KEYED_DEEP: &str = "BLAZE_UNIT_KEY_DEEP";
+
+/// Whether `job`'s request sets [`KEYED_DEEP`].
+fn keyed_deep(job: &Job) -> bool {
+    blaze_units::query::env_var(&job.input.config.invocation.env, KEYED_DEEP) == Some("1")
+}
+
+/// What a unit's record lists of its codegen's inputs ([`Made::inputs`]): every instance
+/// `built` reached with the code hash it was made from; for a library built up to the crate
+/// boundary (`cut`, [`cut_at_crates`]) its roots alone, the crate's own functions. The walk
+/// of such a library still reaches into the crates it depends on and finds their functions in
+/// the store, but each of those is listed by the unit of its own crate, or by the program
+/// that links it: listed here with the code it had, a record found again after a body below
+/// changed would say the old one (two answers of one function in
+/// [`blaze_api::Response::CodegenInputs`]).
+fn owned_inputs(built: &blaze_codegen::driver::Built, cut: bool) -> Vec<(ContentId, ContentId)> {
+    let listed = built.inputs.iter().map(|(key, code)| (key.0, code.0));
+    if !cut {
+        return listed.collect();
+    }
+    // alloc: once per library built, a key each root
+    let mut roots: Vec<ContentId> = built.roots.iter().map(|it| it.0).collect();
+    roots.sort_unstable();
+    listed.filter(|(key, _)| roots.binary_search(key).is_ok()).collect()
 }
 
 /// The identity a library's file names its crate by ([`crate_record`]): the narrowed one
@@ -396,7 +468,8 @@ fn named_identity(job: &Job, unit: usize) -> Result<Option<ContentId>, ApiError>
 /// Sound because everything a record holds but its diagnostics is made from what the narrow
 /// identity covers: the outputs are compiled from the code text (a comment no macro sees is
 /// in no token the compiler keeps, and positions are in the text's shape), and a unit that
-/// only checks reads of another crate what that crate's interface text holds. Its diagnostics
+/// only checks reads of another crate what that crate's interface text holds, as does a
+/// library built up to the crate boundary ([`cut_at_crates`]). Its diagnostics
 /// are not (they quote source lines), so only a record with none is under this key; and
 /// whether a unit has any is itself made from the code text, for a unit no lint of which
 /// reads comments ([`narrow_identity`]).
@@ -4065,8 +4138,7 @@ fn assemble(
                 said.items.push(Item::line(Level::Warning, what));
             }
             made.context = Some(context(generated.policy));
-            made.inputs =
-                generated.built.inputs.iter().map(|(key, code)| (key.0, code.0)).collect();
+            made.inputs = owned_inputs(generated.built, cut_at_crates(job, unit, u)?);
             // A test's output prints positions (a panic's `file:line:col`), which no code hash
             // has: a reformat that moves a `panic!` changes its message. Every span table of the
             // binary is in each test's selection, so such an edit runs its tests again.

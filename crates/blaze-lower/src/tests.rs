@@ -2576,6 +2576,17 @@ fn check_edit(lib: &'static [u8], comment: bool, body: bool) -> Result<(), Strin
     if (comment || body) != (bin_was.checked == bin_now.checked) {
         return said("the identity of the bin's check, which reads the lib's interface");
     }
+    // What a library built up to the crate boundary can observe: of its own crate its code,
+    // of a crate below it the interface. (Which units are keyed by it is blaze-cargo's
+    // `cut_at_crates`; the identity is worked out of every crate.)
+    if comment != (lib_was.built == lib_now.built) {
+        return said("the identity the lib's own build up to the crate boundary is under");
+    }
+    if (comment || body) != (bin_was.built == bin_now.built) {
+        return said(
+            "the identity a library over the lib is built under, which holds the lib's interface",
+        );
+    }
     Ok(())
 }
 
@@ -2624,6 +2635,80 @@ fn the_oracle_catches_a_program_keyed_by_its_dependencies_interfaces() {
     );
 }
 
+/// With a library's build keyed by its dependencies' code, a plain body's edit below it moves
+/// its key: the cutoff between crates is gone, and the oracle says where. The cause removed
+/// (test-the-cause): the same edit with the cutoff in passes the line before.
+#[test]
+fn the_oracle_catches_a_library_built_under_its_dependencies_code() {
+    assert_eq!(check_edit(LIB_BODY, false, true), Ok(()));
+    assert_eq!(
+        crate::code::planting(crate::code::Plant::Uncut, || check_edit(LIB_BODY, false, true)),
+        Err(format!(
+            "{}: the identity a library over the lib is built under, which holds the lib's interface",
+            String::from_utf8_lossy(LIB_BODY)
+        ))
+    );
+}
+
+/// The invariant: what a library's build up to the crate boundary is keyed by moves with
+/// every body of a crate below it that the build compiles a copy of or evaluates (a generic,
+/// an `#[inline]` function, a `const fn`, a default method, a constant's value, a macro's
+/// tokens), with a signature and with a line moved, and with nothing else of that crate: a
+/// plain function's body that keeps its lines leaves it as it was, and so does a comment. The
+/// lib's own build's key moves with each of them but the comment.
+#[test]
+fn a_library_built_over_a_crate_is_keyed_by_what_it_compiles_of_it() {
+    let built = |lib: &'static [u8]| {
+        let [(_, lib), (_, over)] = narrowed_over(lib);
+        (lib.built, over.built)
+    };
+    // (before, after, whether a library over the lib observes the edit)
+    let cases: [(&'static [u8], &'static [u8], bool); 9] = [
+        (LIB_PLAIN, LIB_BODY, false),
+        (LIB_PLAIN, LIB_SIGNATURE, true),
+        (LIB_PLAIN, LIB_LINE, true),
+        (
+            b"pub fn gen<T>(_t: T) -> u8 {\n    1\n}\n",
+            b"pub fn gen<T>(_t: T) -> u8 {\n    2\n}\n",
+            true,
+        ),
+        (
+            b"#[inline]\npub fn gen() -> u8 {\n    1\n}\n",
+            b"#[inline]\npub fn gen() -> u8 {\n    2\n}\n",
+            true,
+        ),
+        (
+            b"pub const fn gen() -> u8 {\n    1\n}\n",
+            b"pub const fn gen() -> u8 {\n    2\n}\n",
+            true,
+        ),
+        (
+            b"pub trait Gen {\n    fn gen(&self) -> u8 {\n        1\n    }\n}\npub fn gen() -> u8 {\n    1\n}\n",
+            b"pub trait Gen {\n    fn gen(&self) -> u8 {\n        2\n    }\n}\npub fn gen() -> u8 {\n    1\n}\n",
+            true,
+        ),
+        (
+            b"pub const N: u8 = 1;\npub fn gen() -> u8 {\n    1\n}\n",
+            b"pub const N: u8 = 2;\npub fn gen() -> u8 {\n    1\n}\n",
+            true,
+        ),
+        (
+            b"#[macro_export]\nmacro_rules! one {\n    () => {\n        1u8\n    };\n}\npub fn gen() -> u8 {\n    1\n}\n",
+            b"#[macro_export]\nmacro_rules! one {\n    () => {\n        2u8\n    };\n}\npub fn gen() -> u8 {\n    1\n}\n",
+            true,
+        ),
+    ];
+    for (before, after, observed) in cases {
+        let (lib_was, over_was) = built(before);
+        let (lib_now, over_now) = built(after);
+        let shown = String::from_utf8_lossy(after);
+        assert_ne!(lib_was, lib_now, "the lib's own build: {shown}");
+        assert_eq!(observed, over_was != over_now, "a library over the lib: {shown}");
+    }
+    let (lib_was, over_was) = built(LIB_PLAIN);
+    assert_eq!((lib_was, over_was), built(LIB_COMMENTED), "a comment moves neither");
+}
+
 /// What takes the cutoff away, each kept whole: a dependency that runs at compile time (a
 /// proc macro) is read by its code; a crate that names blaze's extensions, whose proofs read
 /// bodies across crates, gives and takes no interface.
@@ -2638,6 +2723,10 @@ fn a_crate_whose_bodies_a_check_may_read_gives_no_interface() {
     let [_, (_, inline)] = narrowed_over(b"#[inline]\npub fn gen() -> u8 {\n    1\n}\n");
     let [_, (_, inline_body)] = narrowed_over(b"#[inline]\npub fn gen() -> u8 {\n    2\n}\n");
     assert_ne!(inline.checked, inline_body.checked, "an `#[inline]` body");
+    // A library built over it is cut off, and not, by the same things.
+    assert_eq!(plain.built, body.built);
+    assert_ne!(pure.built, pure_body.built, "an effect is proved over the body");
+    assert_ne!(inline.built, inline_body.built, "an `#[inline]` body is compiled into its user");
 }
 
 /// The edited crate's own unit, directed: an edit of its root that moves no token and no

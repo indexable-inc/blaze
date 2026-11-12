@@ -1,0 +1,18 @@
+{
+ "id": "cutoff-1112-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane cutoff-1112",
+ "where": "docs/v2/plan/design/store.md, \"Content keys\"; crates/blaze-cargo/src/serve/unit/compile.rs",
+ "what": "The reason left for not cutting libraries off (\"it needs the walk to stop at the crate boundary first\") named the walk, which is another lane's code, where what stood in the way was one line of the record (`made.inputs` listing every instance the walk found). Read as written, the piece waited on a change to `blaze_codegen::driver`. As this lane reads the code (not yet run), the record's list is the only thing in a dev library's record made from a body below it.",
+ "cost": "the cutoff was left unbuilt for a lane; 54 units a body edit on reth",
+ "cause": "what a record holds and what the walk does were written as one thing",
+ "whys": [
+  "the record's fields are not listed anywhere with what each is made from",
+  "no test says a library's record is a function of its own code and its dependencies' interfaces"
+ ],
+ "class": "a blocker stated one level too high",
+ "prevention": "`cut_at_crates`' doc lists each field of such a record with what it is made from; the revision case `a_body_edit_makes_its_crate_and_nothing_above_it` with its control holds it",
+ "workaround": "none",
+ "fix": "record format 14 (`owned_inputs`), `Narrowed::built`",
+ "state": "written, not run"
+}

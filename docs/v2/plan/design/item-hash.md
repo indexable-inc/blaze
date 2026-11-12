@@ -449,7 +449,7 @@ rest is stated here as what remains.
 | signatures, generics and bounds, types' fields and layout attributes, visibility, re-exports, impls, attributes a check reads (`must_use`, `deprecated`) | every dependent | kept as text in the interface text |
 | exported macros' tokens | expansion in the dependent | kept as text |
 | bodies it instantiates, evaluates, inlines or types through: a type or const parameter (of the fn, its `impl`, its trait), `const`, `#[inline]`, `impl Trait`, `async`, a body that defines an item | check and codegen | kept as text (`blaze_lower::code::plain_body` refuses each) |
-| every other body | codegen only: its walk compiles or finds every instance it reaches, across crates | a unit that builds code is keyed by its dependencies' code text, deeply (`Narrowed::code`); only a unit that only checks is keyed by their interfaces (`Narrowed::checked`) |
+| every other body | a program's codegen and link: its walk compiles or finds every instance it reaches, across crates; an optimized library's inliner | a program's unit, and an optimized library's, is keyed by its dependencies' code text, deeply (`Narrowed::code`); a unit that only checks, and since 2026-11-12 a library built at `opt-level` 0, by their interfaces (`Narrowed::checked`, `Narrowed::built`: store.md, "Early cutoff between crates") |
 | cfg, features, edition, env, target, a build script's cfgs and `OUT_DIR` files | every dependent | the crate's settings (`Crate::content`) and files, in every identity |
 | what blaze's extensions prove over callee bodies (effects, contracts, `fn_info`'s code identity) | a check | a crate that names them, or depends on a workspace crate that does, takes and gives no interface |
 | a proc macro's, build script's or const macro crate's code | run by the dependent | its interface is its code |
@@ -474,8 +474,9 @@ keeps its text: it is an error, which a shape would hide.
 changed or removed at a line's end or after the last line; spaces before a line's end; blank
 lines at a file's end): no unit's key, in the edited crate itself or above it, so no unit, no
 codegen and no link runs. A plain body's edit that keeps its lines: no checking dependent's
-key. Any body edit: every unit that builds code above it, which then finds every function but
-the edited one in the store.
+key. A plain body's edit that keeps its lines: also no library built at `opt-level` 0 above it
+(2026-11-12, written, not yet run). Any body edit: every program above it, and every optimized
+library, which then finds every function but the edited one in the store.
 
 **What it does not, and why.**
 

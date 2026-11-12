@@ -1272,6 +1272,9 @@ pub(crate) enum Plant {
     /// A unit that builds code is keyed by the interfaces of the crates it depends on, not
     /// their code: a stale program ([`crate::Narrowed::code`]).
     Shallow,
+    /// A library's build is keyed by the code of the crates it depends on, not their
+    /// interfaces: no cutoff between crates ([`crate::Narrowed::built`]).
+    Uncut,
     /// A file's texts hold its bytes, comments and whitespace as they are: a unit keyed by
     /// them is made again by an edit that moves no token and no position, no cutoff.
     Bytes,

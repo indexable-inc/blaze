@@ -50,6 +50,8 @@ macro_rules! real {
 }
 
 real! {
+    a_body_edit_below_with_libraries_keyed_by_code
+    a_body_edit_makes_its_crate_and_nothing_above_it
     a_body_edit_reaches_a_running_program
     a_body_edit_remakes_one_function
     a_build_with_nothing_changed_writes_no_input_and_makes_no_unit
@@ -63,6 +65,7 @@ real! {
     a_comment_edit_remakes_nothing
     a_dependency_edit_reaches_only_what_uses_it
     a_feature_flip_follows_the_cfg
+    a_generic_body_edit_reaches_its_instance
     a_panic_under_the_launcher_names_its_frames
     a_renamed_function_keeps_its_code
     a_save_by_rename_is_read_whole

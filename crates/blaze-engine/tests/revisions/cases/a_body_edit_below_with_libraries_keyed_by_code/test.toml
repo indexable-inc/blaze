@@ -1,0 +1,20 @@
+about = "The control of `a_body_edit_makes_its_crate_and_nothing_above_it` (test-the-cause): with the planted bug `BLAZE_UNIT_KEY_DEEP=1` a library's build is keyed by the code of the crates below it again, so the same body edit of `a` moves the keys of `b` and `c` and all four units are made, missing the bound of two that case holds. The miss is listed as known: when it stops failing, the bound no longer rests on libraries being keyed by their dependencies' interfaces, and this case fails. The program is right either way: the variable changes which key a record is under, never what is built."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+env = { BLAZE_UNIT_KEY_DEEP = "1" }
+prints = "10 10\n"
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "22 10\n"
+redone = ["a::base"]
+max_units = 2
+max_records = 2
+
+[revision.known]
+max_units = "the control: the planted bug keys the libraries `b` and `c` by `a`'s code, so the body edit makes all four units (written 2026-11-12, lane cutoff-1112; not yet run)"
+max_records = "the control: as max_units, the records of `b` and `c` miss"

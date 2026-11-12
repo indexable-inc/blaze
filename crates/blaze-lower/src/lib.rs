@@ -1391,7 +1391,11 @@ impl Lowered {
             &self.const_macros,
             &mut self.narrowed,
         );
-        narrow.own.then_some(Narrowed { code: narrow.code, checked: narrow.checked })
+        narrow.own.then_some(Narrowed {
+            code: narrow.code,
+            checked: narrow.checked,
+            built: narrow.built,
+        })
     }
 
     /// The workspace sources a build keyed by code texts alone can vouch for
@@ -1705,7 +1709,7 @@ impl Lowered {
 
     /// What unit `unit`'s narrowed identity ([`Lowered::narrowed`]) holds of each crate of
     /// its closure, by the crate's name, sorted: what of the crate alone can be observed
-    /// ([`code::OwnNarrow`]) as one id, and where it is from (a library crate's from the
+    /// ([`code::OwnNarrow`]), its code text and its interface each an id, and where it is from (a library crate's from the
     /// store or a full parse, [`Lowered::library_narrows`]; one not given, which is then its
     /// whole text; a workspace crate's code text). For `blaze why`: a unit's record is looked
     /// up under its narrow key first, so a narrowed identity that moved while the whole one
@@ -1728,11 +1732,39 @@ impl Lowered {
                 };
                 // Where it is from is in the id, not the name: a crate narrowed in one build
                 // and not in the next is one part that changed.
-                let id =
-                    Hasher::new(IDENTITY_PART).part(from.as_bytes()).part(&own.kept()).finish();
-                // alloc: as above, a part's name
-                (format!("what its narrow key holds of the crate {}", at.named(db)), id)
+                let part = |held: &[u8]| {
+                    Hasher::new(IDENTITY_PART).part(from.as_bytes()).part(held).finish()
+                };
+                let named = at.named(db);
+                // Two parts a crate, as a narrow key holds one or the other of it: its code
+                // text (a program's build, and every unit of the crate itself), or its
+                // interface (a check, and a library's build that stops at the crate boundary:
+                // [`Narrowed::built`]). A body edit moves the first alone, so a library over
+                // it whose record missed is not told that the body is why. A crate with no
+                // code text of its own is one part, its whole text.
+                // alloc: as above, a part's name each
+                match (own.code, own.interface) {
+                    (Some(code), interface) => [
+                        Some((
+                            format!("the code text its narrow key holds of the crate {named} (a program's build, and the crate's own units)"),
+                            part(&code.0),
+                        )),
+                        Some((
+                            format!("the interface its narrow key holds of the crate {named} (a check, and a library's build)"),
+                            part(&interface.unwrap_or(code).0),
+                        )),
+                    ],
+                    (None, _) => [
+                        Some((
+                            format!("what its narrow key holds of the crate {named}"),
+                            part(&own.kept()),
+                        )),
+                        None,
+                    ],
+                }
             })
+            .flatten()
+            .flatten()
             .collect();
         parts.sort_unstable();
         parts.dedup();
@@ -2357,6 +2389,14 @@ pub struct Narrowed {
     /// For a unit that only checks. Equal to `code` wherever a check may read more: a crate
     /// that names blaze's extensions or reads files by path.
     pub checked: ContentId,
+    /// What a library's build that stops at the crate boundary can observe (store.md, "Early
+    /// cutoff between crates"): its own code text, and of each crate it depends on only its
+    /// interface, which holds whole every body a dependent compiles a copy of (a generic, an
+    /// `#[inline]` function, a default method, a `const fn`) and each other body as its shape.
+    /// For a unit that makes a library with no MIR inlining across crates, whose record names
+    /// no function of another crate (blaze-cargo's `narrow_identity` says which units those
+    /// are). Equal to `code` wherever `checked` is.
+    pub built: ContentId,
 }
 
 /// A crate's narrowed identities, as [`narrow_of`] keeps them.
@@ -2373,6 +2413,8 @@ struct Narrow {
     interface: ContentId,
     /// [`Narrowed::checked`].
     checked: ContentId,
+    /// [`Narrowed::built`].
+    built: ContentId,
     /// Whether it or a workspace crate it depends on names blaze's extensions.
     extends: bool,
 }
@@ -2380,6 +2422,7 @@ struct Narrow {
 const NARROW_CODE: &str = "blaze v2 cargo unit narrow code 2";
 const NARROW_INTERFACE: &str = "blaze v2 cargo unit narrow interface 2";
 const NARROW_CHECKED: &str = "blaze v2 cargo unit narrow checked 2";
+const NARROW_BUILT: &str = "blaze v2 cargo unit narrow built 1";
 
 /// [`Lowered::narrowed`] of `krate`, each crate of its closure worked out once into `known`,
 /// dependencies first, with a stack of its own; `whole` holds the whole identity
@@ -2424,7 +2467,10 @@ fn narrow_of(
         let Some(own_code) = own.code else {
             // A crate that keeps its whole text is its whole identity to everything.
             let id = whole[&at];
-            known.insert(at, Narrow { own: false, code: id, interface: id, checked: id, extends });
+            known.insert(
+                at,
+                Narrow { own: false, code: id, interface: id, checked: id, built: id, extends },
+            );
             continue;
         };
         // Of `own_text` and each dependency by `of`, with how cargo passes the root, which
@@ -2466,7 +2512,15 @@ fn narrow_of(
             true => code,
             false => folded(NARROW_CHECKED, own_code, |it| it.interface),
         };
-        known.insert(at, Narrow { own: true, code, interface, checked, extends });
+        // A library built up to the crate boundary reads of a dependency what a check does,
+        // and compiles of it only the bodies its interface holds whole: the same fold as
+        // `checked`, under its own domain, as the two are keys of two things. With the cutoff
+        // taken away (the planted control) it is the deep code identity again.
+        let built = match extends || own.reaches || code::planted(code::Plant::Uncut) {
+            true => code,
+            false => folded(NARROW_BUILT, own_code, |it| it.interface),
+        };
+        known.insert(at, Narrow { own: true, code, interface, checked, built, extends });
     }
     known[&krate]
 }
