@@ -573,7 +573,7 @@ fn an_expansion_in_a_module_gives_back_its_streams_tokens_and_reads_nothing() {
         library.expand(&db, &Env::default(), &[(0, given(&input))], &[], "/", &mut spent).unwrap();
     assert!(!spent.evaluated && spent.steps > 0 && spent.over.is_none(), "{spent:?}");
     assert!(
-        first.seen.is_empty() && first.unkeyable.is_none() && !first.asked,
+        first.seen.is_empty() && first.unkeyable.is_none() && first.asked.is_none(),
         "an echo read nothing"
     );
     // A fresh instance each time: the second run is the first again.

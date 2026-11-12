@@ -924,6 +924,37 @@ fn with_record_inputs<T>(
     then(&inputs)
 }
 
+/// The step a unit's record that is not kept is under in `blaze why`: the unit is made again
+/// in every build until the reason goes.
+pub(crate) const UNKEPT_STEP: &str = "unit record";
+
+/// That the record of unit `u`, just made, is not kept, and `why`: a row of the build's
+/// misses (and a warning), so the build that made it names the reason the next one will
+/// make it again for. Without it the next build's miss said only that its key was as it was.
+fn unkept(job: &Job, u: &Unit, why: String) -> blaze_kernel::Miss {
+    let item = span_unit(u);
+    tracing::warn!(
+        target: "blaze",
+        unit = %item,
+        why = %why,
+        "a unit's record is not kept: it is made again in every build"
+    );
+    blaze_kernel::Miss {
+        step: UNKEPT_STEP,
+        subject: unit_subject(job, u).unwrap_or_default(),
+        item,
+        // alloc: once per unit whose record is not kept
+        missed: blaze_kernel::Missed::Always(format!(
+            "its record is not kept, so every build makes it again: {why}"
+        )),
+        key: ContentId::default(),
+        kept: None,
+        parts: Vec::new(), // alloc: none
+        beyond: None,
+        via: None,
+    }
+}
+
 /// What a unit whose record the store does not keep is filed under past its record key: what
 /// a miss whose key is as it was is down to ([`blaze_kernel::Miss::beyond`]).
 const FILED_BEYOND: &str =
@@ -2626,9 +2657,6 @@ fn store(
         let _span = tracing::info_span!("unit expansion reads").entered();
         reads::Reads::of(reader.db(), krate)
     };
-    if let Err(why) = &read {
-        tracing::info!(unit, crate_name = %u.target.name, "unit record not kept: {why}");
-    }
     let Some(Linked::Made(making)) = phases.linked.take() else {
         // alloc: error path
         return Err(ApiError::new(
@@ -2918,6 +2946,19 @@ fn store(
         }
         _ => None,
     };
+    // A unit made whose record is not kept is made again in every build, and the next build's
+    // miss finds its key as it was: say so here, where the reason is known (rules 3 and 19).
+    if filing.is_none() && key.is_some() && !script::pure::built_nothing(job, unit) {
+        let why = match &read {
+            Err(why) => why.clone(), // clone: once per unit whose record is not kept
+            // alloc: as above
+            Ok(_) => format!(
+                "each of the {} slots of its record key holds other names of what its code read",
+                reads::SLOTS
+            ),
+        };
+        compiled.misses.push(unkept(job, u, why));
+    }
     if let Some(reads::Filing { key, slot }) = filing {
         let record = RecordRef {
             ok: compiled.ok,

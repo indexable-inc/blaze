@@ -262,7 +262,7 @@ fn spans_are_interned_and_answered_without_the_database_where_they_can_be() {
         .dispatch(&db, &request(Method::SpanRecoverProcMacroSpan, |w| w.usize(id)), &mut reply)
         .unwrap();
     assert_eq!(handle_of(&reply), handle);
-    assert!(!server.asked);
+    assert!(server.asked.is_none());
 }
 
 #[test]

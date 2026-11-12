@@ -885,7 +885,7 @@ impl Evaluated {
                 }
             };
             tracing::Span::current().record("ahead", true);
-            if ran.asked {
+            if ran.asked.is_some() {
                 // What it asked the database of a span was read outside this query, which so
                 // depends on nothing it read: run again in the next revision.
                 blaze_query::db::report_untracked_read(
@@ -1206,7 +1206,7 @@ impl Evaluated {
             .entered();
             self.run_on(db, calling, call, &other, &[], &this)?
         };
-        if again.asked || again.unkeyable.is_some() || again.statics.iter().any(|it| it.2) {
+        if again.asked.is_some() || again.unkeyable.is_some() || again.statics.iter().any(|it| it.2) {
             return Ok(Err(UNSHOWN));
         }
         // What the extra run did to the state says the crate's state too: from the settled
@@ -1429,8 +1429,8 @@ impl Evaluated {
         let unknown = |tree: tt::TopSubtree, why: &'static str| {
             done(tree, ExpansionReads::Unknown(why), state_use(verdict, false))
         };
-        if ran.asked {
-            return unknown(output, "it asked the database");
+        if let Some(asked) = ran.asked {
+            return unknown(output, asked.why());
         }
         // Kept only from the state its key says, left as it was: a hit then gives what a run
         // gives and leaves the session as the run would. Otherwise it is not kept.
