@@ -47,6 +47,10 @@ impl TraitItems {
 
     #[blaze_query::tracked(returns(ref))]
     pub fn query_with_diagnostics(db: &Db, tr: TraitId) -> (TraitItems, DefDiagnostics) {
+        // A crate whose items are read from pages: the record's, and no syntax is made.
+        if let Some(served) = crate::nameres::frozen::items::trait_items(db, tr) {
+            return served;
+        }
         let ItemLoc { container: module_id, id: ast_id } = *tr.lookup(db);
         let source = ast_id.to_view(db);
         if source.eq_token().is_some() {
@@ -127,6 +131,10 @@ impl ImplItems {
     #[blaze_query::tracked(returns(ref))]
     pub fn of(db: &Db, id: ImplId) -> (ImplItems, DefDiagnostics) {
         let _p = tracing::info_span!("impl_items_with_diagnostics_query").entered();
+        // A crate whose items are read from pages: the record's, and no syntax is made.
+        if let Some(served) = crate::nameres::frozen::items::impl_items(db, id) {
+            return served;
+        }
         let ItemLoc { container: module_id, id: ast_id } = *id.lookup(db);
 
         let collector =

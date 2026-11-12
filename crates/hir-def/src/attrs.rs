@@ -2118,6 +2118,10 @@ fn fields_docs_bytes(docs: &ArenaMap<LocalFieldId, Option<Box<Docs>>>) -> usize 
 impl AttrFlags {
     #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
     pub fn query(db: &Db, owner: AttrDefId) -> AttrFlags {
+        // A crate whose items are read from pages: the record's, and no outline is made.
+        if let Some(served) = crate::nameres::frozen::items::attr_flags(db, owner) {
+            return served;
+        }
         let mut column = |file: EditionedFileId, krate: Crate| file_attr_flags(db, file, krate);
         column_flags(db, owner, &mut column).unwrap_or_else(|| walked_flags(db, owner))
     }

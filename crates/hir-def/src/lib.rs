@@ -1845,6 +1845,10 @@ impl Complete {
 // return: macro call id and include file id
 #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
 pub fn include_macro_invoc(db: &Db, krate: Crate) -> Box<[(MacroCallId, EditionedFileId)]> {
+    // A crate whose items are read from pages: the record's list, and no scope is decoded.
+    if let Some(served) = crate::nameres::frozen::items::includes(db, krate) {
+        return served;
+    }
     blaze_mem::frame::current(|frame| {
         let mut found = Vec::new_in(frame);
         found.extend(
