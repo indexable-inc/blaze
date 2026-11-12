@@ -1827,15 +1827,15 @@ fn sparse_of(bytes: &[u8]) -> blaze_cas::Sparse {
 /// Off the answer's path, and no copy of a file (docs/v2/plan/design/debug-side-file.md,
 /// "The write after the answer"). Until 2026-11-11 this ran in the link and wrote the files
 /// itself: 72 ms of a 171 ms `unit link` on ripgrep, almost all of it two copies of the
-/// whole file. Why there were two: a file renamed into place is never written again (a
-/// program still running may hold it mapped), so to patch the few records an edit changed
-/// the last file was copied whole first, the only place its other bytes were; and the
-/// executable is at two paths (its own and cargo's copy of it), each of which a debugger
-/// looks beside, so the patched file was copied whole again. Neither is needed once the
-/// daemon holds the file's bytes with the image they describe ([`Linked::side`]): the
-/// update is [`blaze_link::DebugWrite::apply`] on those bytes, in memory, and each path is
-/// written new from them, once, by the loop (`blaze_cas::Store::place_made`: the runs that
-/// hold bytes into a file of holes, renamed onto the path).
+/// whole file. Then the daemon held the file's bytes beside the image and each path was
+/// written new from them: still the file's length an edit (27 ms of hello world's link: the
+/// whole file summed again for its CRC, copied once in memory and scanned for its runs, and
+/// 4.4 MB written at each path). Now what the link hands over is what its update wrote
+/// ([`Made::Patch`]: the changed functions' records, the header and the seal, a few
+/// kilobytes), which the loop writes into a clone of the file at each path
+/// (`blaze_cas::Store::place_patched`); the file's whole bytes are the linker's alone
+/// (`blaze_link::Image::debug_file_view`, shared, read only where a path does not hold the
+/// file the patch is over), and its CRC is kept by block (`blaze_link`'s `beside::crc`).
 ///
 /// Who reads the side file, and when: std's backtrace in the built program (as it panics),
 /// gdb and lldb (as someone debugs it), `blaze perf` (as it names a run's lines). No
@@ -1846,7 +1846,7 @@ fn sparse_of(bytes: &[u8]) -> blaze_cas::Sparse {
 /// stale and gdb refuses it by CRC; on macOS both refuse it by UUID and use symbols).
 ///
 /// What the link still pays is this span: the changed functions' rows encoded
-/// (`Image::debug_file`), one copy of the bytes in memory, and the scan for its runs.
+/// (`Image::debug_file`) and the blocks its writes touch summed (`summed`).
 fn debug_side(
     job: &Job,
     unit: usize,

@@ -86,6 +86,12 @@ since the last link".
    (`compile::linked_key`). The file a client runs is never written in place: clone,
    `pwrite` the ranges, rename. A patched clone is not synced; `Image::verify` refuses a
    torn file (`Refusal::Torn`) for whoever patches a file it did not just write.
+   Built for the edit path's place 2026-11-11 (`Store::place_patched`, `work::Made::Patch`):
+   the link hands the loop the ranges it wrote, and the loop, having looked that the path
+   still holds the file it placed there, clones that file beside it, writes the ranges and
+   renames it on. Before, the image's runs were read whole every link (`link runs`, 21 MB
+   for hello world) and written whole at each path. Each place asks for its file's
+   write-back as it ends and waits for none, so the next clone finds the file clean.
 8. Live: a dev executable's link is committed into the daemon's code memory
    (`Loaded::patch` -> `Image::commit_into`); the running program switches slots in one
    atomic store. New code never goes where old code was; a changed signature or layout is

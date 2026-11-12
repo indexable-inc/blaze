@@ -70,6 +70,9 @@ anchor. Otherwise (first write, full layout, rollback, a skipped update, records
 number the image's functions) every function is encoded, and `DebugWrite::all` says why. Still
 of the program each update: a count of the pieces, the symbol table compared by block. A patch
 names the build id of the file it is over (`DebugWrite::base`); `apply` refuses any other.
+The ELF seal (the CRC-32 of the whole file) is kept by 4 KiB block (`beside/crc.rs`: a tree
+of sums, CRC being linear), so a patch reads the blocks it wrote (`DebugWrite::summed`), not
+the file: summing 8.6 MB again was 19.5 ms of each edit's link until 2026-11-11.
 
 **Between the answer and the write** a debugger sees the previous side file: on ELF gdb refuses
 it by CRC and std reads it (the edited function's lines stale); on macOS both refuse it by UUID
@@ -84,20 +87,22 @@ whole to be patched, the only place its other bytes were; and the executable is 
 (its own and cargo's copy), each of which a debugger looks beside, so the patched file was
 copied whole again.
 
-Now the kept image holds the side file's bytes (`codegen::Linked::side`, counted by the kept
-images' budget). A link updates them in memory (`DebugWrite::apply`) and hands the loop the
-file as the runs that hold bytes (`codegen::SideFile`, the sections' room left as holes), one
-output a path, with the bundle's `Info.plist` on Mach-O. The loop places each as any output the
-build made (`Store::place_made`: a new file, renamed onto the path), and since no artifact
+The side file's bytes are held once, by the linker's model of it (`beside::Kept`), shared
+with whoever places the file (`Image::debug_file_view`); the daemon keeps no copy of its own
+(until 2026-11-11 `codegen::Linked::side` was a second one, copied whole a link). A link
+hands the loop what its update wrote (`work::Made::Patch`: the ranges, a few kilobytes) and
+the loop writes them into a clone of the file at each path (`Store::place_patched`), or the
+whole file as the runs that hold bytes where a path does not hold the file the patch is
+over (the first link, a file changed since), one output a path, with the bundle's
+`Info.plist` on Mach-O. Each is renamed onto its path as any output the build made, and since no artifact
 names them the build's answer does not wait ([clone-out.md](clone-out.md), "What the answer
 waits for"): a run of the daemon's own starts only once they are placed, a later link's files
 queue behind them, a failure is a loss said. No file on the disk is read or copied; each path
 is written once. They are in no record: a build that replays the record places none, as before.
 A link that changed nothing of the side file writes nothing. Spans: `link debug file` (now with
 `placed_bytes`), under it `link debug file: patch in memory` and `link debug file: its runs`;
-`link debug file: copy and patch` and `: copy beside` are gone. What it costs: the file's
-bytes in memory per kept image, one copy of them a link, and one copy a path on the loop as
-the placement's effects take them (as for the executable).
+`link debug file: copy and patch`, `: copy beside` and `: patch in memory` are gone. What it
+costs: the file's bytes in memory once per kept image, and the patch's bytes a path.
 
 ## One link for one program
 

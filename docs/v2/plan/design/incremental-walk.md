@@ -281,7 +281,7 @@ N functions, C changed or new, D their referrers, L functions and statics asked 
 | dedupe | O(C + D) hashes; O(N) when a class changes | a class's merge can cascade to its callers |
 | reach | O(C + D) lookups, plus one copy of the arrays | readers index it by place |
 | entries, delta, id | O(C + D) rows, O((C + D) log N) hashes | |
-| the `Built`'s lists | one copy a row (N) | readers outside this crate take `Vec`s |
+| the `Built`'s lists | O(C + D) rows written into the last `Built`, which its reader gave back (`Kept::give_back`; a compiled function is shared, never copied); one entry a row (N) where it was not given back or dedupe ran whole, and once after a whole build for its template entries | readers outside this crate take `Vec`s, so the lists are patched in place: an insert or a removal moves a list's tail (no allocation) |
 
 `Work` (in `Built::work`, and on the spans of `codegen walk` and `codegen finish`) counts
 each; `the_work_of_an_edit_is_the_same_among_a_hundred_functions_and_ten_thousand` holds
