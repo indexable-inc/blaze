@@ -1,0 +1,29 @@
+[package]
+name = "blaze-hub"
+description = "blaze's hub, step 1 (docs/v2/plan/design/hub.md): a lane (a named line of work: a base and the files that differ from it) kept in step between its machine and a warm one by content, as two sans-IO cores on an injected clock, the hub's job ledger with a count of every job that ran cold and why, and the one versioned schema they speak"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The deterministic CBOR every message is written in, and a `Vec<u8>` as one byte string.
+blaze-protocol.workspace = true
+# bstd: content ids and their hasher. This crate names `core`, `alloc` and bstd, never `std`.
+blaze-std.workspace = true
+# A file's content id (`FILE_DOMAIN`) and its `Mode`: a blob here is the VFS's file node.
+blaze-vfs.workspace = true
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+hegeltest.workspace = true
+
+[lints]
+workspace = true
