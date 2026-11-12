@@ -146,7 +146,7 @@ impl MemRoot {
         self.names(path)?;
         let mut hasher = Hasher::new(MEM_DIR_DOMAIN);
         let below = format!("{path}/"); // alloc: `MemTree` is the tree of tests and what-ifs, off every hot path
-        for (file, (id, mode, _)) in self.files.range::<str, _>(below.as_str()..) {
+        for (file, (id, mode, _)) in self.files.range::<str, _>((std::ops::Bound::Included(below.as_str()), std::ops::Bound::Unbounded)) {
             let Some(under) = file.strip_prefix(below.as_str()) else { break };
             hasher.part(under.as_bytes()).update(&mode.git().to_le_bytes()).id(id);
         }
