@@ -3088,8 +3088,19 @@ impl Op {
 mod tests {
     use super::*;
 
-    use cranelift_codegen::{ir::UserFuncName, isa::CallConv};
+    use cranelift_codegen::{
+        ir::{InstBuilder, UserFuncName},
+        isa::{CallConv, TargetFrontendConfig},
+    };
+    use target_lexicon::PointerWidth;
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+    /// What a module of 32-bit addresses is built for: these functions use no address.
+    const CONFIG: TargetFrontendConfig = TargetFrontendConfig {
+        default_call_conv: CallConv::SystemV,
+        pointer_width: PointerWidth::U32,
+        page_size_align_log2: 16,
+    };
 
     /// `fn(i32, i64) -> i64` of one block of `rounds` rounds, six values each, with a value
     /// of the block's start read at its end and an `i128` carried through.
@@ -3127,7 +3138,7 @@ mod tests {
         let mixed = b.ins().bxor(halves, l);
         let out = b.ins().iadd(mixed, kept);
         b.ins().return_(&[out]);
-        b.finalize();
+        b.finalize(CONFIG);
         func
     }
 
@@ -3180,7 +3191,7 @@ mod tests {
         let out = b.ins().iadd(scaled, more);
         b.ins().return_(&[out]);
         b.seal_all_blocks();
-        b.finalize();
+        b.finalize(CONFIG);
         func
     }
 
@@ -3214,7 +3225,7 @@ mod tests {
         b.def_var(x, tripled);
         b.ins().jump(last, &[]);
         b.seal_all_blocks();
-        b.finalize();
+        b.finalize(CONFIG);
         assert_eq!(func.layout.blocks().collect::<Vec<_>>(), [entry, last, first]);
         // `last` reads the value `first` made, not a parameter of its own.
         assert!(func.dfg.block_params(last).is_empty());
