@@ -585,7 +585,7 @@ def metered(side, args, daemon=None, sampler=None, command="build", meter=None):
     was = daemon.pid() if daemon else None
     if was:
         sampler.add(was)
-    cpu_before = memory.cpu_seconds(was) if was else None
+    cpu_before = memory.tree_cpu_seconds(was) if was else None
     if own:
         sampler.start()
     took, ran, used = memory.run(side.argv(command, *args), side.ws, side.env, 7200, sampler=sampler, meter=meter)
@@ -602,11 +602,12 @@ def metered(side, args, daemon=None, sampler=None, command="build", meter=None):
 
 
 def daemon_cpu(daemon, was, before):
-    """The CPU time the daemon used for a command that ran while `was` (its pid before, or
-    None) was the daemon and `before` its CPU time then, beyond what memory.run counted: all of
-    it for a daemon already running; for one the command started, nothing on Windows, whose job
-    counted it, and all of it elsewhere, where `wait4` counts only what it waited for. A daemon
-    that was there and is gone, or that cannot be read, stops the run: its time is not known."""
+    """The CPU time the daemon and everything it ran (memory.tree_cpu_seconds: build scripts,
+    proc macros, the linker) used for a command that ran while `was` (its pid before, or None)
+    was the daemon and `before` that time then, beyond what memory.run counted: all of it for a
+    daemon already running; for one the command started, nothing on Windows, whose job counted
+    it, and all of it elsewhere, where `wait4` counts only what it waited for. A daemon that was
+    there and is gone, or that cannot be read, stops the run: its time is not known."""
     if daemon is None:
         return 0.0
     now = daemon.pid()
@@ -614,7 +615,7 @@ def daemon_cpu(daemon, was, before):
         if was is not None:
             raise Failed(f"the daemon {was} ended during the build: its CPU time is not known")
         return 0.0
-    after = memory.cpu_seconds(now)
+    after = memory.tree_cpu_seconds(now)
     if after is None:
         raise Failed(f"the CPU time of the daemon {now} cannot be read")
     if now == was:
@@ -840,9 +841,17 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         """Every setup builds what plain cargo just built: its seconds by name."""
         return {setup.name: setup.build(build) for setup in setups}
 
-    def both():
+    def both(restarted=False):
+        """Blaze's build and cargo's, timed, measured and counted. `restarted`: blaze's build
+        started the daemon, which the meter is given before it is read, as `cold_blaze` does:
+        on macOS the daemon leaves the command's tree, and its work would go uncounted."""
         before = meter.settle()
         took, mine, used = metered(ours, [*build, JSON], daemon, meter=meter)
+        if restarted:
+            pid = daemon.pid()
+            if pid is None:
+                raise Failed(f"{name} {backend}: no daemon runs after the build that was to start it: its work cannot be counted")
+            meter.adopt(pid)
         counted = meter.since(before, meter.settle())
         reference, other, cargo_used = metered(theirs, build)
         builds[0] += 1
@@ -1035,12 +1044,17 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
     if restart := spec["edits"].get("body"):
         again = []
         for turn in range(runs):
-            ours.cargo("stop")
+            old = daemon.pid()
+            # `blaze stop` ends once the daemon wrote its image and hung up, and fails when it
+            # still answers after that.
+            _, stopped = ours.cargo("stop")
+            if stopped.returncode != 0:
+                raise Failed(f"{name} {backend}: `blaze stop` before the restart edit failed:\n{stopped.stderr[-3000:]}")
             write_edit(ws, restart, False)
-            *timed, said, counted = both()
+            *timed, said, counted = both(restarted=True)
+            if daemon.pid() == old:
+                raise Failed(f"{name} {backend}: the restart edit was built by the daemon {old} that was told to stop")
             again.append(row(*timed, said, counted, edit_link("restart", "edit", said)))
-            if pid := daemon.pid():
-                meter.adopt(pid)
             if turn == 0:
                 runs_right("restart")
             write_edit(ws, restart, True)

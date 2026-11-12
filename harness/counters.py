@@ -111,6 +111,9 @@ RUSAGE = {
     "user": 0,
     "system": 1,
     "footprint": 7,
+    # What its children used, once reaped.
+    "child_user": 10,
+    "child_system": 11,
     "lifetime_max_footprint": 28,
     "instructions": 29,
     "cycles": 30,
@@ -127,7 +130,7 @@ _timebase: list[float] = []
 
 def rusage(pid: int) -> dict[str, int] | None:
     """macOS: the counters of `pid`'s rusage_info_v4 by name (`RUSAGE`), its CPU time in
-    nanoseconds as `cpu_ns`; None when it is gone (a zombie, not yet reaped, still answers, with
+    nanoseconds as `cpu_ns` and with its reaped children's as `tree_cpu_ns`; None when it is gone (a zombie, not yet reaped, still answers, with
     the totals it exited with) or this is not macOS. The one reader of it: memory.py and
     abbench.py read it here."""
     if _libproc is None:
@@ -145,6 +148,7 @@ def rusage(pid: int) -> dict[str, int] | None:
         ctypes.CDLL("/usr/lib/libSystem.dylib").mach_timebase_info(ctypes.byref(tb))
         _timebase.append(tb.numer / tb.denom)
     got["cpu_ns"] = round((got["user"] + got["system"]) * _timebase[0])
+    got["tree_cpu_ns"] = got["cpu_ns"] + round((got["child_user"] + got["child_system"]) * _timebase[0])
     return got
 
 

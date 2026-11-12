@@ -122,6 +122,7 @@ if WINDOWS:
     _k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, _w.LPCWSTR]
     _k32.AssignProcessToJobObject.argtypes = [_w.HANDLE, _w.HANDLE]
     _k32.QueryInformationJobObject.argtypes = [_w.HANDLE, ctypes.c_int, ctypes.c_void_p, _w.DWORD, ctypes.c_void_p]
+    _k32.IsProcessInJob.argtypes = [_w.HANDLE, _w.HANDLE, ctypes.POINTER(_w.BOOL)]
     _k32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(_MemoryStatus)]
     _psapi.GetProcessMemoryInfo.argtypes = [_w.HANDLE, ctypes.POINTER(_MemoryCounters), _w.DWORD]
     # Undocumented, in ntdll since NT and what Process Explorer and Sysinternals' tools resume a
@@ -229,12 +230,28 @@ if WINDOWS:
                 raise _win_error("QueryInformationJobObject(JobObjectExtendedLimitInformation)")
             return round(info.PeakProcessMemoryUsed / 2**20), round(info.PeakJobMemoryUsed / 2**20)
 
-        def cpu_s(self):
-            """The CPU time, user and kernel, every process of the job has used so far."""
+        def _accounting(self):
             info = _Accounting()
             if not _k32.QueryInformationJobObject(self.handle, 1, ctypes.byref(info), ctypes.sizeof(info), None):
                 raise _win_error("QueryInformationJobObject(JobObjectBasicAccountingInformation)")
+            return info
+
+        def cpu_s(self):
+            """The CPU time, user and kernel, every process of the job has used so far, ended
+            ones included."""
+            info = self._accounting()
             return (info.TotalUserTime + info.TotalKernelTime) / 1e7
+
+        def active(self):
+            """How many processes of the job run now."""
+            return self._accounting().ActiveProcesses
+
+        def holds(self, handle):
+            """Whether the process of `handle` is in the job."""
+            inside = _w.BOOL()
+            if not _k32.IsProcessInJob(handle, self.handle, ctypes.byref(inside)):
+                raise _win_error("IsProcessInJob")
+            return bool(inside)
 
         def close(self):
             # No KILL_ON_JOB_CLOSE: a daemon started in the job lives on after it.
@@ -425,6 +442,43 @@ def cpu_seconds(pid):
     return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
 
 
+# Windows: the jobs `run` left a process running in (a daemon), each still open.
+_KEPT_JOBS = []
+
+
+def tree_cpu_seconds(pid):
+    """The CPU time, user and system, `pid` and every process it started have used, ended ones
+    included; None when it is gone or its tree's time cannot be read. On Linux and macOS that is
+    the process's own and its reaped children's (a daemon reaps what it runs: build scripts,
+    proc macros, the linker). On Windows, which keeps no such total of a process, it is the time
+    of the job `run` started `pid` in, whose processes are `pid`'s tree and the command that
+    started it: a `pid` that `run` did not start has none, and None."""
+    if WINDOWS:
+        handle = _opened(pid)
+        if handle is None:
+            return None
+        try:
+            for job in list(_KEPT_JOBS):
+                if not job.active():
+                    _KEPT_JOBS.remove(job)
+                    job.close()
+                elif job.holds(handle):
+                    return job.cpu_s()
+        finally:
+            _k32.CloseHandle(handle)
+        return None
+    if DARWIN:
+        got = counters.rusage(pid)
+        return got["tree_cpu_ns"] / 1e9 if got else None
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+    except (OSError, IndexError):
+        return None
+    # utime, stime, cutime, cstime (proc(5)).
+    return sum(int(f) for f in fields[11:15]) / os.sysconf("SC_CLK_TCK")
+
+
 def resident_mb(roots):
     """What the trees of `roots` hold now, summed, in megabytes."""
     pids = {p for root in roots if root for p in tree(root)}
@@ -529,7 +583,7 @@ def run(argv, cwd=None, env=None, timeout=None, sampler=None, text=True, stdin=s
     stopped until its counter is open, and the time is taken from when it was let go. `cpu_s`
     is the CPU time, user and system, of the command and of what it started and waited for (on
     Windows, everything it started, a daemon included, up to when it ended); a daemon already
-    running is not in it (`cpu_seconds` of its pid, before and after, is).
+    running is not in it (`tree_cpu_seconds` of its pid, before and after, is).
     On Windows the command runs in a job object (`Job`), whose peaks are exact: `peak_mb` is the
     job's, or the sampler's when more (a daemon started before, which `sampler` watches)."""
     own = sampler is None
@@ -557,7 +611,13 @@ def run(argv, cwd=None, env=None, timeout=None, sampler=None, text=True, stdin=s
                 child.wait()
                 largest, job_peak = job.peaks_mb()
                 cpu = job.cpu_s()
-                job.close()
+                if job.active():
+                    # What the command left running (a daemon) stays in the job, and so does
+                    # all it starts later: the job is kept to read their CPU time by
+                    # (`tree_cpu_seconds`).
+                    _KEPT_JOBS.append(job)
+                else:
+                    job.close()
             else:
                 if meter is not None:
                     # Exited and not reaped: macOS's totals of it are read now, the last time they can be.
