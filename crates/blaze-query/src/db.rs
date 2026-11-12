@@ -18,6 +18,7 @@ mod budget;
 mod capture;
 mod counts;
 mod dense;
+pub mod edit_work;
 mod frontier;
 mod function;
 mod id;

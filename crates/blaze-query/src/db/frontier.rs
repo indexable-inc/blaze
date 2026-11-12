@@ -720,6 +720,19 @@ fn walk(db: *const (), storage: &Storage) {
     walking.record("edges", work.edges);
     walking.record("changed", work.changed);
     walking.record("unwound", work.unwound);
+    // The walk's work, kept with the build it ran in (`blaze explain edit_work`): a walk
+    // that verified or reached more than the edit did shows here first.
+    tracing::info!(
+        target: "blaze",
+        stage = super::edit_work::CHANGED_SET,
+        written = work.written,
+        untracked = work.untracked,
+        visited = work.visited,
+        edges = work.edges,
+        changed = work.changed,
+        unwound = work.unwound,
+        "edit work"
+    );
 
     // The findings: this walk's after the kept ones, the oldest merged past the bounds. A
     // walk that found nothing leaves the kept log as it is.

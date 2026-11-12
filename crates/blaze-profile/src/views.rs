@@ -167,6 +167,7 @@ pub const VIEWS: &[View] = &[
     const { view("pool", &[ENDED_BUILD]) },
     const { view("kept", &[ENDED_BUILD, MANY]) },
     const { view("syscalls", &[ENDED_BUILD, THREAD, WITHIN, MIN_MS, MANY]) },
+    const { view("edit_work", &[BUILD, MANY]) },
 ];
 
 /// The view named `name`.

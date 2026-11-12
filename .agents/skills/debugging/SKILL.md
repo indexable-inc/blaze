@@ -193,6 +193,12 @@ Each query below is a named view (`blaze explain <name>`) unless it says otherwi
 - `blaze explain pool`: the store's buffer pool's and the worker pool's counters over the build.
 - `blaze explain kept`: what the build kept or lost as it ended and after its answer.
 - `blaze explain syscalls thread=loop`: what the loop thread blocked in.
+- `blaze explain edit_work`: what each stage of the build visited, asked of or made again
+  (`engine memos`, `changed set`, `body check`, `codegen walk`, `dependency image keys`,
+  `link`), a row a counter. After a one-function body edit every `total` is a small constant
+  whatever the workspace's size, but `link`'s `symbols` and `patchable` and the walk's
+  `copied`; a `whole` that is not 0 says a stage visited everything, and the stage's span
+  says why. It errors on a build that counted nothing.
 - A span's fields that have no column are in `spans.fields` as `key=value` text:
   `WHERE fields LIKE '%why=memory%'`.
 

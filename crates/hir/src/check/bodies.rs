@@ -705,6 +705,25 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
             listing.record("why", tracing::field::display(why));
         }
         drop(listing);
+        // What the plan holds and visits, kept with the build (`blaze explain edit_work`).
+        // Only a plan of every body says it: the others are no unit's check.
+        if keep.is_some() {
+            tracing::info!(
+                target: "blaze",
+                stage = blaze_query::db::edit_work::BODY_CHECK,
+                held_modules = u64::from(work.held_modules),
+                held_bodies = u64::from(work.held_bodies),
+                named_modules = u64::from(work.named_modules),
+                named_bodies = u64::from(work.named_bodies),
+                relisted = u64::from(work.relisted),
+                slots_modules = u64::from(work.slots_modules),
+                slots_bodies = u64::from(work.slots_bodies),
+                visited_modules = u64::from(work.visited_modules),
+                visited_bodies = u64::from(work.visited_bodies),
+                whole = u64::from(work.whole.is_some()),
+                "edit work"
+            );
+        }
         let Tables {
             modules,
             crate_ends,
