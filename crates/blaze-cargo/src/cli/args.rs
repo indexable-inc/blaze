@@ -96,12 +96,12 @@ impl Clap for Command {
                 GOAL,
             ],
             Command::Test => &[
-                GLOBAL, RUNNING, FUTURE, MESSAGE, PACKAGES, TARGETS, TEST_ONLY, FEATURES, JOBS,
-                KEEP_GOING, RELEASE, PROFILE, TARGET, REPORTS, MANIFEST, REFUSED, GOAL,
+                GLOBAL, RUNNING, FUTURE, MESSAGE, PACKAGES, TARGETS, TEST_ONLY, NO_TESTS, FEATURES,
+                JOBS, KEEP_GOING, RELEASE, PROFILE, TARGET, REPORTS, MANIFEST, REFUSED, GOAL,
             ],
             Command::Bench => &[
-                GLOBAL, RUNNING, MESSAGE, SILENT, PACKAGES, TARGETS, FEATURES, JOBS, KEEP_GOING,
-                PROFILE, TARGET, REPORTS, MANIFEST, REFUSED,
+                GLOBAL, RUNNING, MESSAGE, SILENT, PACKAGES, TARGETS, NO_TESTS, FEATURES, JOBS,
+                KEEP_GOING, PROFILE, TARGET, REPORTS, MANIFEST, REFUSED,
             ],
             Command::Doc => &[
                 GLOBAL,
@@ -348,6 +348,15 @@ const TEST_ONLY: &[Flag] = &[
     Flag::new("ub-schedules", None, Takes::Value, "K"),
 ];
 
+/// `--no-tests fail|pass` is blaze's, for `test` and `bench`: what a run that ran no test is.
+/// `fail` (the default) refuses it, naming the selection that matched nothing
+/// ([`super::test::refusal`]); `pass` is cargo's and libtest's behaviour, exit 0. The name and
+/// the values are cargo-nextest's.
+const NO_TESTS: &[Flag] = &[Flag {
+    possible: &["fail", "pass"],
+    ..Flag::new("no-tests", None, Takes::Value, "fail|pass")
+}];
+
 /// `--refused N|all` is blaze's: how many of the functions blaze could not compile a build's
 /// error names, the first `N` or every one ([`blaze_api::Cargo::refused`]).
 const REFUSED: &[Flag] = &[Flag::new("refused", None, Takes::Value, "N|all")];
@@ -389,6 +398,7 @@ fn blaze_only(flag: &Flag) -> bool {
                 | "ub"
                 | "ub-seed"
                 | "ub-schedules"
+                | "no-tests"
                 | "refused"
                 | "goal"
                 | "baselines"
@@ -611,6 +621,9 @@ pub struct Flags {
     /// `--keep-going` and `--no-fail-fast` are accepted and change nothing.
     pub fail_fast: bool,
     pub reached: bool,
+    /// `--no-tests pass`: a run that ran no test is a pass, as cargo and libtest have it.
+    /// Without it such a run is refused ([`super::test::refusal`]).
+    pub no_tests_pass: bool,
     /// `--ub`, or either of its values, which imply it.
     pub ub: bool,
     pub ub_seed: Option<u64>,
@@ -672,6 +685,8 @@ impl Flags {
             "fail-fast" => self.fail_fast = true,
             "no-fail-fast" | "keep-going" => {}
             "reached" => self.reached = true,
+            // `check_value` held it to `fail` and `pass` first.
+            "no-tests" => self.no_tests_pass = value.is_some_and(|it| it.eq_ignore_ascii_case("pass")),
             "ub" => self.ub = true,
             name @ ("unit-graph" | "timings") => self.reports.push(name),
             // `check_value` parsed them first.

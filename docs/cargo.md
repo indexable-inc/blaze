@@ -105,7 +105,9 @@ a build first needs it.
 (`crates/blaze-cargo/src/cli/args.rs`), with clap's errors and exit code 1 for a command line
 cargo would refuse. `-C DIRECTORY` (with `-Z unstable-options`) and the global flags before
 the command work as in cargo. `test` alone takes four flags of blaze's own (extensions,
-[below](#which-tests-run)): `--reached`, `--ub`, `--ub-seed N` and `--ub-schedules K`. `build`,
+[below](#which-tests-run)): `--reached`, `--ub`, `--ub-seed N` and `--ub-schedules K`; `test`
+and `bench` take `--no-tests fail|pass`
+([what a run of no test is](#a-run-that-ran-no-test-is-refused)). `build`,
 `check`, `run`, `test` and `bench` take `--refused N|all`: how many of the functions blaze could
 not compile a build's error names, the first `N` (16 without it) or every one. `build`,
 `run`, `test` and `check` take `--goal edit|max`: what the build waits for before it answers.
@@ -978,6 +980,38 @@ run them instead and send each result, which the client prints in libtest's form
   MIR evaluator under the checker of undefined behavior (`crates/hir-ty-ub`), compiling
   nothing; `--ub-seed N` and `--ub-schedules K` set its seed and how many thread schedules it
   tries. `--ub` with `--no-run` is refused.
+
+### A run that ran no test is refused
+
+A `test` or `bench` that built, in which nothing failed, and that ran no test exits 4
+(`NO_TESTS`, `crates/blaze-core/src/exit.rs`; cargo-nextest's code for the same end), where
+cargo and libtest print `test result: ok. 0 passed` and exit 0. The error names the selection
+and, when a name filter left every test out, the nearest tests that exist:
+
+```text
+error: no test ran: `blaze test adds_wrng` matched none of the 20 tests in 4 test executables
+note: the nearest that exist: tests::adds_wrong
+note: a run of no test is refused; `--no-tests pass` allows one, as cargo does
+blaze: tests failed selected=0 ran=0 passed=0 failed=0 ignored=0 measured=0 filtered_out=20 unreached=0 binaries=4 unbuilt=0 elapsed_ms=412 why="no test ran"
+```
+
+The rule is one function over the run's counts (`refusal` in
+`crates/blaze-cargo/src/cli/test.rs`), the same on a terminal, off one and for the daemon's
+runs. Not refused: `--no-run` and libtest's `--list` and `--help`, which are meant to run
+nothing; under `--reached` a run whose tests were selected and not reached, which is that
+flag's answer; and `--no-tests pass` (`fail` is the default), which is cargo's behaviour, for a
+script that runs one filter over many packages, or `--doc` over packages without doc tests,
+and expects 0 where nothing matched. A test executable without libtest's harness that prints
+no `test result` line is one test, its exit status the verdict.
+
+Every run that runs tests ends by saying its counts, so a pass says what it is a pass of: on a
+terminal `8 of 9 ran: 1 failed · 7 passed · 1 ignored · 0 filtered` ([terminal.md](terminal.md));
+off one a `blaze: tests ok|failed` line on stderr with `selected` (passed, failed, measured,
+ignored and unreached), `ran` (passed, failed and measured), each count, `binaries`, `unbuilt`
+and `elapsed_ms`; and with a JSON `--message-format` a `blaze-test-summary` line on stdout with
+the same fields, `ok` and `why` (`test_summary` in `crates/blaze-cargo/src/cli/json.rs`). Off
+a terminal each test executable's stdout comes through blaze, which writes it on unchanged and
+reads libtest's result lines from it.
 
 v1's test cache is gone with v1: `BLAZE_TESTS` (`affected`, `verify`, `all`),
 `BLAZE_TESTS_FROM`, its environment setting, `blaze test --why`, and the `tests-passed`,

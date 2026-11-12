@@ -28,6 +28,7 @@ mod encode;
 mod event;
 mod frame;
 mod screen;
+mod tally;
 pub mod text;
 
 pub use encode::encode;
@@ -37,3 +38,4 @@ pub use screen::{
     Caps, HANDFUL, OUTPUT_LINES, Options, PLAIN_EVERY_MS, Plant, QUIET_MS, SLOW_ITEM_MS,
     SLOW_TEST_MS, Screen, file_url, live, progress_fields, progress_line, unicode,
 };
+pub use tally::{Tally, tests_line};

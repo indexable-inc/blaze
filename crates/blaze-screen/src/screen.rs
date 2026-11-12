@@ -25,6 +25,7 @@ use blaze_protocol::now::{Now, Phase};
 use crate::{
     event::{BinaryEnd, Built, Command, Event, Test, Verdict, Why},
     frame::{Ended, Frame, Line, Mark, Progress, Role},
+    tally::Tally,
     text,
 };
 
@@ -150,8 +151,28 @@ struct Tests {
     /// The rerun command of each executable with a failure, once.
     reruns: Vec<String>,
     unbuilt: u32,
+    /// The tests the filter left out, summed over the executables ([`Test::Filtered`]).
+    filtered_out: u32,
+    /// The run was refused though no test failed ([`Test::Refused`]).
+    refused: bool,
     began_ms: Option<u64>,
     over: bool,
+}
+
+impl Tests {
+    /// The run's counts, as the summary says them.
+    fn tally(&self) -> Tally {
+        Tally {
+            binaries: self.binaries.len() as u32,
+            passed: self.passed,
+            failed: self.failed,
+            ignored: self.ignored,
+            measured: 0,
+            filtered_out: self.filtered_out,
+            unreached: 0,
+            unbuilt: self.unbuilt,
+        }
+    }
 }
 
 /// The screen of one command.
@@ -986,6 +1007,19 @@ impl Screen {
                     .with(Role::Plain, said);
                 self.above.push(line); // alloc: as above
             }
+            Test::Filtered { binary: _, tests } => {
+                self.tests.filtered_out = self.tests.filtered_out.saturating_add(tests);
+            }
+            Test::Refused { what, help } => {
+                self.tests.refused = true;
+                let line = Line::new()
+                    .with(Role::Failed, format!("{} ", self.glyph("✗", "x"))) // alloc: a refusal's, once
+                    .with(Role::Strong, what);
+                self.above.push(line); // alloc: as above
+                for text in help {
+                    self.above.push(Line::new().with(Role::Dim, format!("  {text}"))); // alloc: as above
+                }
+            }
             Test::Over => {
                 self.tests.over = true;
                 self.cleared = true;
@@ -1107,26 +1141,30 @@ impl Screen {
         rows
     }
 
-    /// `✓ 40 passed · 1 ignored · 3 binaries · 2.1s`, or what failed and how to rerun it.
+    /// `✓ 41 of 41 ran: 41 passed · 0 ignored · 0 filtered · 3 binaries · 2.1s`, or what
+    /// failed and how to rerun it. How many tests the selection held and how many of them ran
+    /// come first and are always said ([`Tally`]): `0 of 0 ran` with `312 filtered` is a run
+    /// that tested nothing, and reads as one. `filtered` is libtest's `filtered out`.
     fn test_summary(&self) -> Vec<Line> {
         let tests = &self.tests;
+        let tally = tests.tally();
         let dot = self.dot();
-        let failed = tests.failed > 0 || tests.unbuilt > 0;
+        let failed = tests.failed > 0 || tests.unbuilt > 0 || tests.refused;
         let mut line = Line::new();
         match failed {
             true => {
                 line.push(Role::Failed, format!("{} ", self.glyph("✗", "x"))); // alloc: the summary, once
+                line.push(Role::Plain, format!("{}: ", tally.ran_of())); // alloc: as above
                 line.push(Role::Strong, format!("{} failed", tests.failed)); // alloc: as above
                 line.push(Role::Plain, format!(" {dot} {} passed", tests.passed)); // alloc: as above
             }
             false => {
                 line.push(Role::Done, format!("{} ", self.glyph("✓", "ok"))); // alloc: as above
-                line.push(Role::Plain, format!("{} passed", tests.passed)); // alloc: as above
+                line.push(Role::Plain, format!("{}: {} passed", tally.ran_of(), tests.passed)); // alloc: as above
             }
         }
-        if tests.ignored > 0 {
-            line.push(Role::Dim, format!(" {dot} {} ignored", tests.ignored)); // alloc: as above
-        }
+        line.push(Role::Dim, format!(" {dot} {} ignored", tests.ignored)); // alloc: as above
+        line.push(Role::Dim, format!(" {dot} {} filtered", tests.filtered_out)); // alloc: as above
         if tests.unbuilt > 0 {
             line.push(Role::Failed, format!(" {dot} {} never built", tests.unbuilt)); // alloc: as above
         }
