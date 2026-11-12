@@ -173,18 +173,6 @@ pub(crate) struct Frame {
     pub(crate) head: u32,
     /// A query on this stack asked for this one: it heads a cycle.
     pub(crate) reentered: bool,
-    /// A run on this stack read a provisional row whose head this one is: it heads a cycle.
-    /// Where no query on this stack asked for it ([`Frame::reentered`]), the row was made by a
-    /// task that joined the cycle from outside (`function::hand_to`), and this run's own row is
-    /// seeded when it is first asked for here or as its round ends.
-    pub(crate) joined: bool,
-    /// The node of the head, in another task, of a cycle this run joined: it read that head's
-    /// lent value (`function::lend`), or a run of the cycle it heads on this stack did. 0 for
-    /// none.
-    pub(crate) remote: u32,
-    /// Its value is no round's of the cycle it joined: it read a value lent in place of one
-    /// the head's round holds, or a second head's.
-    pub(crate) unsettled: bool,
     /// An inner head of its cycle did not converge this round (on the outermost head).
     pub(crate) unconverged: bool,
     pub(crate) untracked: bool,
@@ -222,9 +210,6 @@ impl Frame {
             summary: [0; 2],
             head: NONE,
             reentered: false,
-            joined: false,
-            remote: 0,
-            unsettled: false,
             unconverged: false,
             untracked: false,
             unshareable: false,
@@ -1119,8 +1104,6 @@ impl Local {
         frame.summary = [0; 2];
         frame.untracked = false;
         frame.head = NONE;
-        frame.remote = 0;
-        frame.unsettled = false;
         // What its verify was handed (a cycle that met it) comes before its run's reads.
         frame.cycle.round = self.cycle_edges.len() as u32;
         let pending = frame.pending_start as usize;
@@ -1154,29 +1137,6 @@ impl Local {
             }
         }
         None
-    }
-
-    /// Whether the run or verify of `node` of `storage` is on this thread's stack below a
-    /// barrier that is not lifted: it is not this task's part of the stack ([`Local::find`]
-    /// says none), yet a wait for its flight from here would be a wait on the frames this very
-    /// stack holds.
-    pub(crate) fn below_barrier(&self, storage: *const Storage, node: u32) -> bool {
-        if node == 0 || self.bloom[bucket(node)] == 0 {
-            return false;
-        }
-        let mut walled = false;
-        for frame in self.frames.iter().rev() {
-            match frame.kind {
-                Kind::Barrier { lifted: false } => walled = true,
-                Kind::Barrier { lifted: true } => {}
-                Kind::Run | Kind::Verify => {
-                    if walled && frame.node == node && frame.storage == storage {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
     }
 
     /// The occurrence number of the next tracked struct of `identity_hash` the top run makes.
@@ -1292,9 +1252,6 @@ impl Frame {
             summary: [0; 2],
             head: NONE,
             reentered: false,
-            joined: false,
-            remote: 0,
-            unsettled: false,
             unconverged: false,
             untracked: false,
             unshareable: false,

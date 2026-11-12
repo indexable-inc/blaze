@@ -87,10 +87,6 @@ struct Node {
     /// The cycle check's visit mark, and the job whose wait reached it.
     mark: u32,
     via: u32,
-    /// The key entry whose flight `via` waits on, where that wait is what reached this job
-    /// (its claimer); [`NONE`] where `via` reached it by a wait for its end, a counter, or a
-    /// scope `via` has open.
-    via_key: u32,
 }
 
 const VACANT: Node = Node {
@@ -106,7 +102,6 @@ const VACANT: Node = Node {
     item_next: NONE,
     mark: 0,
     via: NONE,
-    via_key: NONE,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -131,10 +126,6 @@ pub(crate) struct Graph {
     epoch: u32,
     /// The cycle check's stack of waiting jobs to follow.
     dfs: Vec<u32>,
-    /// The key entry of the wait that closed the last cycle found (the last job's, which
-    /// reached the asker), [`NONE`] where it was no wait for a key's flight: as
-    /// [`Node::via_key`], for the asker.
-    closing_key: u32,
 
     // Per key flight.
     keys: HashMap<Key, u32, Global>, // alloc: a graph's key index, for the graph's life, longer than any task
@@ -279,7 +270,6 @@ impl Graph {
             jobs: Paged::new(VACANT),
             epoch: 0,
             dfs: Vec::with_capacity(64),
-            closing_key: NONE,
             keys: HashMap::with_capacity_in(jobs, Global), // alloc: a graph's key index, for the graph's life, longer than any task
             key_name: Vec::with_capacity(jobs),
             key_claimer: Vec::with_capacity(jobs),
@@ -758,19 +748,17 @@ impl Graph {
         stack: &mut Vec<u32>,
     ) -> Option<u32> {
         match target {
-            Target::Job(other) => self.visit(asker, from, other, NONE, NONE, stack),
+            Target::Job(other) => self.visit(asker, from, other, NONE, stack),
             // A run begun inside a scope of its claimer ends before the claimer waits on it.
             Target::Key(entry) => match self.key_claimer[entry as usize] {
                 NONE => None,
-                claimer => {
-                    self.visit(asker, from, claimer, self.key_scope[entry as usize], entry, stack)
-                }
+                claimer => self.visit(asker, from, claimer, self.key_scope[entry as usize], stack),
             },
             Target::Counter(counter) => {
                 let mut at = self.counters[counter as usize].head;
                 while at != NONE {
                     let next = self.jobs[at as usize].item_next;
-                    if let Some(found) = self.visit(asker, from, at, NONE, NONE, stack) {
+                    if let Some(found) = self.visit(asker, from, at, NONE, stack) {
                         return Some(found);
                     }
                     at = next;
@@ -785,7 +773,7 @@ impl Graph {
                     .filter(|(_, node)| node.life == Life::Live && node.home.member == member)
                     .map(|(j, _)| j as u32)
                     .collect();
-                jobs.into_iter().find_map(|job| self.visit(asker, from, job, NONE, NONE, stack))
+                jobs.into_iter().find_map(|job| self.visit(asker, from, job, NONE, stack))
             }
             Target::None => None,
         }
@@ -831,19 +819,16 @@ impl Graph {
     }
 
     /// Reaches `job`, through the scopes it has open inside `until` (exclusive; [`NONE`] for
-    /// all). `key` is the key entry whose flight `from` waits on where that wait is what
-    /// reached `job`, else [`NONE`].
+    /// all).
     fn visit(
         &mut self,
         asker: u32,
         from: u32,
         job: u32,
         until: u32,
-        key: u32,
         stack: &mut Vec<u32>,
     ) -> Option<u32> {
         if job == asker {
-            self.closing_key = key;
             return Some(from);
         }
         self.visit_scopes(job, until, stack);
@@ -853,7 +838,6 @@ impl Graph {
         }
         node.mark = self.epoch;
         node.via = from;
-        node.via_key = key;
         if node.wait != Target::None {
             stack.push(job);
         }
@@ -875,27 +859,17 @@ impl Graph {
         }
     }
 
-    /// The cycle `closes_cycle` found, from the asker: back from `from` along each job's `via`,
-    /// each job with the key whose flight its wait in the cycle is on, if it is one
-    /// ([`Cycle::keys`]).
+    /// The cycle `closes_cycle` found, from the asker: back from `from` along each job's `via`.
     fn cycle(&self, asker: u32, from: u32) -> Cycle {
         let mut jobs = Vec::with_capacity(4); // alloc: an error, off every hot path
-        let mut keys = Vec::with_capacity(4); // alloc: as above
-        let named = |entry: u32| (entry != NONE).then(|| self.key_name[entry as usize]);
         let mut at = from;
-        // The wait that reaches the job after `at` in the cycle: first the one that closed it.
-        let mut through = self.closing_key;
         while at != asker {
             jobs.push(JobId(at));
-            keys.push(named(through));
-            through = self.jobs[at as usize].via_key;
             at = self.jobs[at as usize].via;
         }
         jobs.push(JobId(asker));
-        keys.push(named(through));
         jobs.reverse();
-        keys.reverse();
-        Cycle { jobs, keys }
+        Cycle { jobs }
     }
 
     /// Whether no wait in the graph can end by what is in it: some job waits, and every live
@@ -1340,67 +1314,5 @@ mod stuck_tests {
         assert_eq!(graph.wait(waiter, On::Key(key(5))), Ok(Waited::Waiting));
         let mut waits = Vec::new();
         assert!(!graph.stuck(&mut waits, true));
-    }
-}
-
-#[cfg(test)]
-mod cycle_key_tests {
-    use super::*;
-
-    const POOL: u32 = 1 << 31;
-
-    fn key(n: u8) -> Key {
-        Key([n; 32])
-    }
-
-    fn job(graph: &mut Graph, n: u32, counter: Option<CounterId>) -> JobId {
-        graph.add(JobId(n), Home { member: POOL, local: n }, counter);
-        JobId(n)
-    }
-
-    /// A cycle whose every wait is a job's own wait for a key's flight names each job's key:
-    /// what an asker that can join such a cycle ([`crate::pump::Flights::joining`]) reads.
-    #[test]
-    fn a_cycle_of_waits_for_flights_names_each_jobs_key() {
-        let mut graph = Graph::new(8);
-        let jobs = [job(&mut graph, 0, None), job(&mut graph, 1, None), job(&mut graph, 2, None)];
-        for (n, &job) in jobs.iter().enumerate() {
-            assert!(graph.claim(key(n as u8), Some(job)));
-        }
-        assert_eq!(graph.wait(jobs[0], On::Key(key(1))), Ok(Waited::Waiting));
-        assert_eq!(graph.wait(jobs[1], On::Key(key(2))), Ok(Waited::Waiting));
-        let cycle = graph.wait(jobs[2], On::Key(key(0))).expect_err("job 2's wait closes the cycle");
-        assert_eq!(cycle.jobs, [jobs[2], jobs[0], jobs[1]]);
-        assert_eq!(cycle.keys, [Some(key(0)), Some(key(1)), Some(key(2))]);
-        // A job that asks for a key it runs itself: its own wait is the cycle.
-        let own = graph.wait(jobs[2], On::Key(key(2))).expect_err("job 2 runs key 2");
-        assert_eq!((own.jobs, own.keys), (vec![jobs[2]], vec![Some(key(2))]));
-    }
-
-    /// A cycle that goes on from a job through a scope it has open, or through a wait for a
-    /// job's end, names no key there: such a cycle is never one of flights alone, however the
-    /// rest of it waits.
-    #[test]
-    fn a_cycle_through_a_scope_or_a_jobs_end_names_no_key_there() {
-        let mut graph = Graph::new(8);
-        let owner = job(&mut graph, 0, None);
-        let other = job(&mut graph, 1, None);
-        assert!(graph.claim(key(0), Some(owner)));
-        assert!(graph.claim(key(1), Some(other)));
-        let scope = graph.counter(CounterId(0));
-        graph.open_scope(owner, scope);
-        let item = job(&mut graph, 2, Some(scope));
-        assert_eq!(graph.wait(item, On::Key(key(1))), Ok(Waited::Waiting));
-        let cycle = graph.wait(other, On::Key(key(0))).expect_err("through the owner's scope");
-        assert_eq!(cycle.jobs, [other, owner, item]);
-        assert_eq!(cycle.keys, [Some(key(0)), None, Some(key(1))]);
-
-        let mut graph = Graph::new(8);
-        let first = job(&mut graph, 0, None);
-        let second = job(&mut graph, 1, None);
-        assert!(graph.claim(key(0), Some(first)));
-        assert_eq!(graph.wait(first, On::Job(second)), Ok(Waited::Waiting));
-        let cycle = graph.wait(second, On::Key(key(0))).expect_err("through the first job's end");
-        assert_eq!((cycle.jobs, cycle.keys), (vec![second, first], vec![Some(key(0)), None]));
     }
 }
