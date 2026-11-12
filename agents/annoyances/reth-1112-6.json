@@ -1,0 +1,13 @@
+{
+ "id": "reth-1112-6",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "my own method: a daemon started inside a systemd-run unit",
+ "what": "The cold build ran as a `systemd-run` unit and its client started the daemon inside the unit's cgroup: when the unit's script ended systemd killed the daemon, so the next unit started a new one and timed a first build after a restart. A second time a client started while my daemon unit was not yet listening and spawned its own daemon, which waited 300 s on the first's lock.",
+ "cost": "one 17 minute cold build measured for nothing; ten minutes",
+ "cause": "the daemon is a child of whatever first asks for it",
+ "class": "a measurement of another state than the one named",
+ "prevention": "my scripts: the daemon is its own unit (`daemon.sh`, started first, the chain waits for its socket). For everyone: a how-to row",
+ "fix": "how-to added",
+ "state": "fixed in my scripts"
+}

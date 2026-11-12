@@ -1,0 +1,9 @@
+{
+ "id": "measure-a-real-project",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "task": "Measure a real project's edit loop on the build VM",
+ "do": "Run the daemon as its own systemd unit and wait for its socket before any client (`systemd-run --unit <lane>-d-<name> <script that execs `blaze serve` under the fixed env -i list>`), then the cold build and the series as other units you poll; never let a unit's client start the daemon (systemd kills it with the unit, and the next row is a restart). One binary copy and one home per tree measured (bin/<name>, home/<name>); `BLAZE_PROFILE_CAP_MB=4096` or reth's history is retired; reth needs `LIBCLANG_PATH` and `BINDGEN_EXTRA_CLANG_ARGS=\"-isystem <glibc.dev>/include -isystem <clang>/resource-root/include\"` from nix out-links. Read why from rows: `query_counts.written` (what a build wrote), `misses` by step and cause (`unit record` = made and not kept), `blaze explain unit_reads build=N` (which read moved under an equal key), events `a proc-macro crate's expanders loaded`. Find the cause on a three-crate fixture on the Mac (25 s cold, cargo-built blaze in the lane's own target directory) before spending a 13 minute cold build of reth on it; say the load average with every timing.",
+ "why": "lane reth-1112, 2026-11-12: three causes of reth's no-op floor were each reproduced on a fixture in under a minute once the row that named them existed.",
+ "state": "current"
+}
