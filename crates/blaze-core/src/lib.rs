@@ -247,6 +247,11 @@ impl fmt::Display for FileName {
     }
 }
 
+/// The most bytes one [`Effect::Prewarm`] asks the system to read ahead: what a program's last
+/// run held of its image is a few MiB to tens; a file held whole (one just written) is asked
+/// for up to this from its start, so no prewarm reads a large image from the disk whole.
+pub const PREWARM_MOST: u64 = 256 << 20;
+
 /// What an [`Effect::Clone`] whose source is a symbolic link fails with, after the source's
 /// name: a clone is made of a file, never through a link. Every driver says it the same, so an
 /// asker can tell this refusal (the name is something other than the file it made) from a file
@@ -488,6 +493,26 @@ pub enum Effect {
     Clone {
         from: FileName,
         to: FileName,
+        tag: Tag,
+    },
+    /// The parts of `like` that the system's page cache holds are asked to be read into the
+    /// cache of `file`, which holds the same bytes there (a clone of it, [`Effect::Clone`]):
+    /// a clone shares its source's blocks and none of its cached pages, so the first run of a
+    /// program from a clone of its last image read from the disk every page the last run had
+    /// in memory (measured 2026-11-11 on APFS, hello world's 158 MB dev image: 755 pages in 93
+    /// runs, 30 to 45 ms of the first `exec`, against 4 ms for the file it was cloned from;
+    /// asked for those ranges first, 7 ms). The read is the system's own read-ahead and is not
+    /// waited for: the completion, [`Done::Prewarmed`], says how many bytes were asked for, and
+    /// comes once they are asked. Which pages `like` holds is read as the effect is carried
+    /// out, so it is asked before `like`'s name is given to another file. At most
+    /// [`PREWARM_MOST`] bytes are asked for, from the file's start. macOS: `mincore` of a
+    /// mapping of `like`, then `F_RDADVISE` a run; Linux: `mincore`, then
+    /// `posix_fadvise(WILLNEED)` a run; Windows asks for nothing and says 0 bytes (no call that
+    /// says which ranges of another file the cache holds is used there). A file that is not
+    /// there fails.
+    Prewarm {
+        like: FileName,
+        file: FileName,
         tag: Tag,
     },
     /// `to` made another name of `from`, for outputs nothing writes in place.
@@ -808,6 +833,7 @@ impl Effect {
             | Effect::Private { tag, .. }
             | Effect::Times { tag, .. }
             | Effect::Clone { tag, .. }
+            | Effect::Prewarm { tag, .. }
             | Effect::Link { tag, .. }
             | Effect::Stat { tag, .. }
             | Effect::Lstat { tag, .. }
@@ -1132,6 +1158,10 @@ pub enum Done {
     /// Of an [`Effect::Times`].
     Timed,
     Cloned,
+    /// Of an [`Effect::Prewarm`]: the bytes of the file asked to be read ahead.
+    Prewarmed {
+        bytes: u64,
+    },
     Linked,
     Stat(Option<Meta>),
     Removed,

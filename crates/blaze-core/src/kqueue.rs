@@ -539,6 +539,7 @@ impl Kqueue {
             | Effect::Private { .. }
             | Effect::Times { .. }
             | Effect::Clone { .. }
+            | Effect::Prewarm { .. }
             | Effect::Link { .. }
             | Effect::Stat { .. }
             | Effect::Lstat { .. }

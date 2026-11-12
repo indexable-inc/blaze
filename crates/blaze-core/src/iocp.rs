@@ -914,6 +914,7 @@ impl Iocp {
             | Effect::ReadLink { .. }
             | Effect::Sync { .. }
             | Effect::WriteBack { .. }
+            | Effect::Prewarm { .. }
             | Effect::SyncDir { .. }
             | Effect::Truncate { .. }
             | Effect::Stat { .. }
