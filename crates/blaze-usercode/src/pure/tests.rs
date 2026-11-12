@@ -327,6 +327,18 @@ fn the_loaders_reads_before_main_are_passed_whole() {
     refused(&t("debug/build"), dir, "in the target directory");
     // A file under another package.
     refused("/root/m1/registry/q-0.2.0/Cargo.toml", found, "outside its package and OUT_DIR");
+    // What refuses says what it saw (2026-11-12: a sandbox library whose RUNPATH named one
+    // machine's build directory made every run's loader look there, and the refusal blamed
+    // the purity proof): a directory only looked at, or a name with nothing there, is a
+    // loader's search and is said so, the proof not blamed; a file read is the proof's to
+    // answer for. The control is that second half: the blame is still there for a real read.
+    let stray = "/root/trees/other/target/release/build/blaze-cargo/0123456789abcdef/out";
+    let looked = with(&[(stray, dir)]).unwrap_err();
+    assert!(looked.contains(stray) && looked.contains("looked at"), "{looked}");
+    assert!(looked.contains("RUNPATH") && !looked.contains("purity proof"), "{looked}");
+    assert!(!with(&[("/opt/lib/libc.so.6", missed)]).unwrap_err().contains("purity proof"));
+    let read = with(&[("/root/m1/registry/q-0.2.0/Cargo.toml", found)]).unwrap_err();
+    assert!(read.contains("read the file") && read.contains("purity proof"), "{read}");
     // A library found on the search path was loaded: an input no pure key covers.
     refused(&t("debug/deps/libgcc_s.so.1"), found, "its pure key does not cover");
     refused(&t("debug/libplugin.so"), found, "its pure key does not cover");

@@ -35,8 +35,8 @@ fn linux_interpose() {
     // compiler wrapper writes a RUNPATH of its own choosing (2026-11-12: its first entry was
     // this `OUT_DIR`, so every sandboxed process's loader looked for `libdl.so.2` and
     // `libc.so.6` there first: a traced read of one machine's build directory in every run,
-    // and a pure script's proof refused for it); `NIX_DONT_SET_RPATH` tells it to write none.
-    // With no RUNPATH the library may need only what every process has loaded already, which
+    // and a pure script's proof refused for it); it is told to write none (below: by which
+    // name it hears that). With no RUNPATH the library may need only what every process has loaded already, which
     // is the C library: so it is linked without `libdl` where the C library has `dlsym` and
     // `dladdr` itself (glibc 2.34 and later, musl), which `-z defs` proves at link time, and
     // with `libdl` only where that link fails (an older glibc, whose loader finds `libdl.so.2`

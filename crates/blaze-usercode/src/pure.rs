@@ -319,9 +319,26 @@ pub fn check(
             continue;
         }
         if !runtime(path, places) {
+            // A directory that was only looked at (or a name with nothing there) is what a
+            // loader's search of a library path leaves, and no code of the script's is shown
+            // to have asked for it: the proof is not what this refuses. A sandbox describes
+            // who made a call only for what it can't trace and for each program started
+            // (`crate::calls`), so the reader is not known here; the run's search path is.
+            let looked = hash.is_none_or(|it| it == crate::trace::DIRECTORY);
+            if looked {
+                // alloc: error path
+                let search: Vec<String> =
+                    places.search.iter().map(|it| it.display().to_string()).collect();
+                // alloc: error path
+                return Err(Error(format!(
+                    "the build script of `{script}` was proved pure, but a process of its run looked at {} (a directory, or a name with nothing there), outside its package and OUT_DIR and on no library search path blaze gave it ({}), and read no file there: the search of a loader for a library (a RUNPATH of the program or of a library loaded into it, the sandbox's own among them) rather than a read its proof denies; which program and call made it is not recorded for a read that is traced. Nothing is kept: its pure key does not cover that directory (keys-cover-every-input)",
+                    path.display(),
+                    search.join(":")
+                )));
+            }
             // alloc: error path
             return Err(bug(format!(
-                "read {}, outside its package and OUT_DIR, which its proof says it never does",
+                "read the file {}, outside its package and OUT_DIR, which its proof says it never does",
                 path.display()
             )));
         }
