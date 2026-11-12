@@ -45,15 +45,64 @@ impl Data {
     }
 }
 
+/// Where a content ID's parts go: [`Hasher`], or a [`Recorder`] that keeps the bytes. `part`
+/// and `id` are [`Hasher`]'s own, so both see one stream.
+pub trait Sink {
+    fn update(&mut self, bytes: &[u8]) -> &mut Self;
+
+    /// A length-prefixed part, as [`Hasher::part`].
+    fn part(&mut self, bytes: &[u8]) -> &mut Self {
+        self.update(&(bytes.len() as u64).to_le_bytes()).update(bytes)
+    }
+
+    fn id(&mut self, id: &ContentId) -> &mut Self {
+        self.update(&id.0)
+    }
+}
+
+impl Sink for Hasher {
+    fn update(&mut self, bytes: &[u8]) -> &mut Self {
+        Hasher::update(self, bytes)
+    }
+
+    fn part(&mut self, bytes: &[u8]) -> &mut Self {
+        Hasher::part(self, bytes)
+    }
+
+    fn id(&mut self, id: &ContentId) -> &mut Self {
+        Hasher::id(self, id)
+    }
+}
+
+/// The bytes a [`Hasher`] would be given, appended to a buffer: two functions whose
+/// [`code_into`] bytes are equal have one [`code_id`], and two whose bytes differ have two
+/// (but for a BLAKE3 collision). What code dedupe groups by, at the cost of a copy rather than
+/// a hash.
+pub struct Recorder<'a>(pub &'a mut Vec<u8>);
+
+impl Sink for Recorder<'_> {
+    fn update(&mut self, bytes: &[u8]) -> &mut Self {
+        self.0.extend_from_slice(bytes);
+        self
+    }
+}
+
 /// The content ID of what a compiled function does: its architecture, alignment, bytes,
 /// relocations, data, unwind information, lines, coverage and profile. Not its key, what it inlined or its side
 /// table: two functions with one code ID run the same instructions against the same
 /// addresses, unwind alike and show the same lines in a backtrace.
 pub fn code_id(function: &CompiledFunction) -> ContentId {
     let mut hasher = Hasher::new(CODE_DOMAIN);
+    code_into(&mut hasher, function);
+    hasher.finish()
+}
+
+/// What [`code_id`] hashes, into any [`Sink`]: the one definition of a function's code, so
+/// that what [`Recorder`] keeps is byte for byte what BLAKE3 is given.
+pub(crate) fn code_into<H: Sink>(hasher: &mut H, function: &CompiledFunction) {
     hasher.update(&[arch_tag(function.arch)]);
     hasher.update(&function.align.to_le_bytes()).part(&function.code);
-    relocs_into(&mut hasher, &function.relocs, target_into);
+    relocs_into(hasher, &function.relocs, target_into);
     hasher.update(&(function.data.len() as u64).to_le_bytes());
     for data in &function.data {
         hasher.id(&data.id);
@@ -71,24 +120,23 @@ pub fn code_id(function: &CompiledFunction) -> ContentId {
         }) => {
             hasher.update(&[1]).update(&code_align.to_le_bytes()).update(&data_align.to_le_bytes());
             hasher.update(&return_address.to_le_bytes()).part(cie).part(fde);
-            optional_target_into(&mut hasher, personality.as_ref());
-            optional_id_into(&mut hasher, lsda.as_ref())
+            optional_target_into(hasher, personality.as_ref());
+            optional_id_into(hasher, lsda.as_ref())
         }
         Some(Unwind::Windows { info, handler, lsda }) => {
             hasher.update(&[2]).part(info);
-            optional_target_into(&mut hasher, handler.as_ref());
-            optional_id_into(&mut hasher, lsda.as_ref())
+            optional_target_into(hasher, handler.as_ref());
+            optional_id_into(hasher, lsda.as_ref())
         }
     };
-    lines_into(&mut hasher, &function.lines);
-    covered_into(&mut hasher, function.coverage.as_ref());
-    profiled_into(&mut hasher, function.profile.as_ref());
-    hasher.finish()
+    lines_into(hasher, &function.lines);
+    covered_into(hasher, function.coverage.as_ref());
+    profiled_into(hasher, function.profile.as_ref());
 }
 
 /// A function's SanitizerCoverage arrays and PC table: two functions that count other blocks
 /// are other code.
-pub(crate) fn covered_into(hasher: &mut Hasher, covered: Option<&Covered>) {
+pub(crate) fn covered_into<H: Sink>(hasher: &mut H, covered: Option<&Covered>) {
     let Some(Covered { counters, flags, guards, pcs }) = covered else {
         hasher.update(&[0]);
         return;
@@ -102,7 +150,7 @@ pub(crate) fn covered_into(hasher: &mut Hasher, covered: Option<&Covered>) {
 
 /// What PGO made of a function: an instrumented one counts under its own name and record, and
 /// one built with a profile is other code than one built without.
-pub(crate) fn profiled_into(hasher: &mut Hasher, profiled: Option<&Profiled>) {
+pub(crate) fn profiled_into<H: Sink>(hasher: &mut H, profiled: Option<&Profiled>) {
     match profiled {
         None => hasher.update(&[0]),
         Some(Profiled::Counted(record)) => {
@@ -116,7 +164,7 @@ pub(crate) fn profiled_into(hasher: &mut Hasher, profiled: Option<&Profiled>) {
     };
 }
 
-fn optional_target_into<'h>(hasher: &'h mut Hasher, target: Option<&Target>) -> &'h mut Hasher {
+fn optional_target_into<'h, H: Sink>(hasher: &'h mut H, target: Option<&Target>) -> &'h mut H {
     match target {
         Some(target) => {
             hasher.update(&[1]);
@@ -127,14 +175,14 @@ fn optional_target_into<'h>(hasher: &'h mut Hasher, target: Option<&Target>) -> 
     }
 }
 
-fn optional_id_into<'h>(hasher: &'h mut Hasher, id: Option<&ContentId>) -> &'h mut Hasher {
+fn optional_id_into<'h, H: Sink>(hasher: &'h mut H, id: Option<&ContentId>) -> &'h mut H {
     match id {
         Some(id) => hasher.update(&[1]).id(id),
         None => hasher.update(&[0]),
     }
 }
 
-pub(crate) fn lines_into(hasher: &mut Hasher, lines: &[Line]) {
+pub(crate) fn lines_into<H: Sink>(hasher: &mut H, lines: &[Line]) {
     hasher.update(&(lines.len() as u64).to_le_bytes());
     for Line { at, span: SpanRef { anchor, index } } in lines {
         hasher.update(&at.to_le_bytes()).id(anchor).update(&index.to_le_bytes());
@@ -143,10 +191,10 @@ pub(crate) fn lines_into(hasher: &mut Hasher, lines: &[Line]) {
 
 /// A table as it is kept: its rows, each distinct target once, its wide addends. A table has
 /// one form for what it holds, so this is a function of its relocations.
-pub(crate) fn relocs_into<T>(
-    hasher: &mut Hasher,
+pub(crate) fn relocs_into<T, H: Sink>(
+    hasher: &mut H,
     relocs: &Relocs<T>,
-    mut target_into: impl FnMut(&mut Hasher, &T),
+    mut target_into: impl FnMut(&mut H, &T),
 ) {
     hasher.update(&(relocs.len() as u64).to_le_bytes());
     // 64 rows an update: BLAKE3 runs at its streaming rate on whole kilobytes.
@@ -168,7 +216,7 @@ pub(crate) fn relocs_into<T>(
 }
 
 /// A relocation target into `hasher`: a tag byte per kind, then what names it.
-pub fn target_into(hasher: &mut Hasher, target: &Target) {
+pub fn target_into<H: Sink>(hasher: &mut H, target: &Target) {
     match target {
         Target::Function(key) => hasher.update(&[0]).id(&key.0),
         Target::Direct(key) => hasher.update(&[1]).id(&key.0),
@@ -311,6 +359,42 @@ mod tests {
             lines: Vec::new(),
             coverage: None,
             profile: None,
+        }
+    }
+
+    /// What a [`Recorder`] keeps is byte for byte what [`code_id`] gives BLAKE3, so dedupe may
+    /// group by the bytes: hashed in the code domain, they are the code ID.
+    #[test]
+    fn a_recorded_code_is_what_its_code_id_hashes() {
+        let mut functions = vec![
+            function(&[0x90; 7], Vec::new()),
+            function(
+                &[0xe8, 0, 0, 0, 0],
+                vec![Relocation {
+                    at: 1,
+                    kind: RelocKind::PcRel32,
+                    target: Target::Direct(InstanceKey(ContentId([3; 32]))),
+                    addend: -4,
+                }],
+            ),
+        ];
+        functions[1].data.push(Data::new(8, vec![1; 8], Relocs::default()));
+        functions[1].lines.push(Line {
+            at: 2,
+            span: SpanRef { anchor: ContentId([4; 32]), index: 5 },
+        });
+        for target in every_target() {
+            functions.push(function(
+                &[0xcc; 9],
+                vec![Relocation { at: 1, kind: RelocKind::Abs64, target, addend: i64::MAX }],
+            ));
+        }
+        for function in &functions {
+            let mut bytes = Vec::new();
+            code_into(&mut Recorder(&mut bytes), function);
+            let mut hasher = Hasher::new(CODE_DOMAIN);
+            hasher.update(&bytes);
+            assert_eq!(hasher.finish(), code_id(function));
         }
     }
 
