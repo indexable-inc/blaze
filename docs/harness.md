@@ -603,8 +603,9 @@ shared by both):
   `blaze explain edit_work`. Every command runs under `env_clear` and a short list, in
   `/private/tmp` (never `/tmp`, a symlink), with `BLAZE_VERIFY_STORE=1`. At most 4 cases run at
   once (`BLAZE_REVISIONS_JOBS`): a daemon's store pool reserves a large address range. 21 cases
-  take about six minutes on an 18-core Mac, most of it the standard library built cold for each
-  home. It is for what only a kernel shows (the watcher's event order, `kill -9`, a program
+  take six to nine minutes on an 18-core Mac (371 s and 523 s, 2026-11-11), most of it the
+  standard library built cold for each home: too slow for the gate as it stands, which is why
+  the simulated driver is the primary one. It is for what only a kernel shows (the watcher's event order, `kill -9`, a program
   really run, a splice of a real image) and as the cross-check of the simulated driver.
 
       RUST_TEST_THREADS=6 cargo +nightly-<date> test --release -p blaze-engine --test revisions --no-fail-fast
@@ -629,7 +630,10 @@ then
 
 Each file is a package's root; a revision is a `revision` file a generated build script turns
 into `cargo::rustc-cfg`; `rpass` programs are built and not run (the corpus is untrusted data).
-The report groups failures by cause. It is not in the gate.
+The report groups failures by cause. It is not in the gate. On 2026-11-11 (all-1111 at
+6b5b794d0d): 180 files with revisions, 120 run, 53 pass, 67 fail (61 of them one refusal of the
+splice when a cfg swaps a function for its twin), 60 not run (25 have one revision, 35 use a
+directive or flag the importer has no place for); about 30 minutes.
 
 ## Adding a test
 

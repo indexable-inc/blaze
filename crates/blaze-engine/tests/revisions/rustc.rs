@@ -82,8 +82,10 @@ pub enum Imported {
 const RUSTC_ONLY: &[&str] = &["query-dep-graph", "incremental-ignore-spans", "incremental-verify-ich", "human-readable-cgu-names"];
 
 /// `flags` as compiletest splits them, sorted into: what the manifest says (`lib`, the opt
-/// level), what goes to `rustflags`, and the first the importer has no place for.
-fn flags(text: &str, lib: &mut bool, opt: &mut bool, pass: &mut Vec<String>) -> Result<(), String> {
+/// level, and `profile`'s lines: blaze takes `panic`, `overflow-checks`, `debug-assertions` and
+/// `opt-level` from the profile and refuses them in rustflags), what goes to `rustflags`, and
+/// the first the importer has no place for.
+fn flags(text: &str, lib: &mut bool, opt: &mut bool, pass: &mut Vec<String>, profile: &mut Vec<String>) -> Result<(), String> {
     let mut words = text.split_whitespace().peekable();
     while let Some(word) = words.next() {
         let mut joined = |flag: &str| -> String {
@@ -113,11 +115,12 @@ fn flags(text: &str, lib: &mut bool, opt: &mut bool, pass: &mut Vec<String>) -> 
             pass.push(joined("--cfg"));
         } else if word.starts_with("-C") {
             let value = joined("-C");
-            match value.split('=').next().unwrap_or("") {
-                "overflow-checks" | "debug-assertions" | "opt-level" | "panic" => {
-                    pass.push("-C".to_owned());
-                    pass.push(value);
-                }
+            let (name, set) = value.split_once('=').unwrap_or((value.as_str(), "yes"));
+            let on = matches!(set, "yes" | "on" | "true" | "y");
+            match name {
+                "overflow-checks" | "debug-assertions" => profile.push(format!("{name} = {on}")),
+                "opt-level" => profile.push(format!("opt-level = {set:?}").replace('"', "")),
+                "panic" => profile.push(format!("panic = {set:?}")),
                 other => return Err(format!("-C {other}")),
             }
         } else {
@@ -220,7 +223,7 @@ pub fn import(file: &Path, name: &str) -> Imported {
         return Imported::Skipped("no `//@ revisions:`".to_owned());
     };
     let revisions: Vec<String> = revisions.split_whitespace().map(str::to_owned).collect();
-    let (mut lib, mut opt, mut pass) = (false, false, Vec::new());
+    let (mut lib, mut opt, mut pass, mut profile) = (false, false, Vec::new(), Vec::new());
     let mut edition = "2015".to_owned();
     let mut aux: Vec<(String, bool)> = Vec::new();
     for (revision, directive, value) in &directives.all {
@@ -232,8 +235,20 @@ pub fn import(file: &Path, name: &str) -> Imported {
             "aux-build" => aux.push((value.clone(), false)), // clone: as above
             "proc-macro" => aux.push((value.clone(), true)), // clone: as above
             "compile-flags" if revision.is_none() => {
-                if let Err(flag) = flags(value, &mut lib, &mut opt, &mut pass) {
+                if let Err(flag) = flags(value, &mut lib, &mut opt, &mut pass, &mut profile) {
                     return unsupported(&format!("compile-flags: {flag}"));
+                }
+            }
+            // One revision's flags: only those that name rustc's own incremental machinery
+            // (and `-g`, which the dev profile has), which are no change of the build here.
+            "compile-flags" => {
+                let (mut lib, mut opt, mut pass, mut profile) = (false, false, Vec::new(), Vec::new());
+                let taken = flags(value, &mut lib, &mut opt, &mut pass, &mut profile);
+                if let Err(flag) = taken {
+                    return unsupported(&format!("a revision's compile-flags: {flag}"));
+                }
+                if lib || opt || !pass.is_empty() || !profile.is_empty() {
+                    return unsupported("a revision's compile-flags that change the build");
                 }
             }
             other if other.starts_with("only-") && !other.contains("aarch64") && !other.contains("apple") && !other.contains("macos") && !cfg!(target_arch = "x86_64") => {
@@ -282,9 +297,9 @@ pub fn import(file: &Path, name: &str) -> Imported {
         if let Some((_, other, _)) = aux_directives.all.iter().find(|it| !["revisions", "compile-flags", "no-prefer-dynamic", "edition", "ignore-backends"].contains(&it.1.as_str())) {
             return Imported::Skipped(format!("the importer has no place for `{other}` in an auxiliary file"));
         }
-        let (mut aux_lib, mut aux_opt, mut aux_pass) = (true, false, Vec::new());
+        let (mut aux_lib, mut aux_opt, mut aux_pass, mut aux_profile) = (true, false, Vec::new(), Vec::new());
         for value in aux_directives.values("compile-flags") {
-            if let Err(flag) = flags(value, &mut aux_lib, &mut aux_opt, &mut aux_pass) {
+            if let Err(flag) = flags(value, &mut aux_lib, &mut aux_opt, &mut aux_pass, &mut aux_profile) {
                 return Imported::Skipped(format!("the importer has no place for `compile-flags: {flag}` in an auxiliary file"));
             }
         }
@@ -304,7 +319,10 @@ pub fn import(file: &Path, name: &str) -> Imported {
         revision_files.push(format!("aux/{aux_name}/revision"));
     }
     if opt {
-        manifest.push_str("\n[profile.dev]\nopt-level = 3\n");
+        profile.push("opt-level = 3".to_owned());
+    }
+    if !profile.is_empty() {
+        manifest.push_str(&format!("\n[profile.dev]\n{}\n", profile.join("\n")));
     }
     manifest.push_str("\n[workspace]\n");
     files.push(Change { path: "Cargo.toml".to_owned(), bytes: Some(manifest.into_bytes()) });
@@ -407,7 +425,8 @@ pub fn corpus(dir: &Path, report: &Path, only: Option<&str>) {
     let mut lines: Vec<serde_json::Value> = Vec::new();
     for file in &all {
         let name = file.strip_prefix(dir).unwrap().to_string_lossy().into_owned();
-        if only.is_some_and(|it| !name.contains(it)) {
+        // `only`: parts of paths, with commas between.
+        if only.is_some_and(|it| !it.split(',').any(|part| name.contains(part))) {
             continue;
         }
         match import(file, &name) {
