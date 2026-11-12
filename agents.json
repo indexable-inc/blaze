@@ -1200,6 +1200,127 @@
    "workaround": "stopped it with its own binary",
    "fix": "`--version` prints both the launcher and the version it runs; `stop` names the daemon on the socket whatever built it",
    "state": "open"
+  },
+  {
+   "id": "mem2-11-b",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+   "where": "blaze: an edit's build",
+   "what": "A one-line body edit of hello-world allocates and frees about 95 MiB of the global heap: `CompiledFunction::clone` 27 MiB, the linker's `file::fill` 20, `Build::patch_lists` 13, `beside::DebugWrite::apply` 8, `codegen::debug_side` 7.5 (alloc_samples by site, eight edits). The warm loop is meant to allocate nothing there (docs/v2/plan/design/memory.md).",
+   "cost": "it is why mimalloc on base pages is 17% slower an edit (each build takes the freed pages again a 4 KiB fault at a time), so it is what keeps 1.0 GiB of huge-page slack on every Linux daemon; and it is edit time on any pages",
+   "cause": "the edit's link and the walk copy whole-program tables",
+   "workaround": "none",
+   "state": "mostly fixed on edit2-1111 (2026-11-11): the `Built`'s functions are shared and the `Built` is given back and written into (no clone, no `patch_lists` lists), a patch's place writes the patch (no `file::fill` of the file's runs), the side file is patched by the loop and held once; what is left, about 15 MiB an edit by the samples, is the ELF writer's tables made whole each stage, the store's encoding of the patch, and `Reach::patched`"
+  },
+  {
+   "id": "edit4-1",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+   "where": "the brief's numbers: memos verified a body edit",
+   "what": "The brief said a body edit of hello world still verifies about 21,000 memos, 13,593 of them `FunctionSignature::kept` and 1,051 `AttrFlags::query`. On the branch's base (all-1111 at e59419ab97, 30 edits on a Linux VM, `query_counts`) it was 6,937: `positions_stamp` 4,841, `FunctionSignature::kept` 356, `item_key` 277, `signature_of` 273, `TraitImpls::for_crate_and_trait` 240, then 20 to 28 each of some forty per-crate queries.",
+   "cost": "the plan started from a caller to find that the base no longer had",
+   "cause": "the numbers were of an earlier tree; nothing in the brief said which",
+   "workaround": "measured the base first (`/root/scripts/edits.py` on the VM: memos by query per edit)",
+   "state": "open: a brief's number should carry its commit (rule measure-the-exact-tree)"
+  },
+  {
+   "id": "edit4-2",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+   "where": "blaze-link: the kept tables of an ELF image",
+   "what": "Every kept table of the ELF writer (`.rela.dyn`, `.eh_frame_hdr`, the symbol table) was patched only when `Delta::same_regions` held, and it never holds for a body edit: new code goes into the patch region, whose size changes. So each was made whole on every edit of a real program, and `.rela.dyn`'s patch path, with its tests, ran only in tests, whose fixtures set `same_regions: true` by hand.",
+   "cost": "303 KB of `.rela.dyn` written an edit, and the tables' 1 to 2 MiB allocated; an hour to see that the patch path was never taken (the first slot design changed nothing measured)",
+   "cause": "the writer's tests build their `Delta` by hand and none comes from a stage of the core that places new code",
+   "workaround": "`Delta::same_places` for `.rela.dyn` (regions keep their places, sizes may change); found by printing the gate's inputs in `tests::patch::a_same_size_body_edit_writes_the_function_and_a_constant`",
+   "state": "fixed for `.rela.dyn` on edit4-1111 (17 KB an edit where it was 300 KB); open: `.eh_frame_hdr` and the symbol table are still made whole each edit, and no test drives the writer's patch paths from a real stage"
+  },
+  {
+   "id": "edit4-3",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+   "where": "blaze-link's tests: allocations counted, not bytes",
+   "what": "`tests::an_incremental_stage_allocates_a_constant_whatever_the_image_holds` holds a stage to 400 allocations and no bytes: a table made whole is one allocation of 360 KB and passes, while a `BTreeSet` given 4,098 slots (my first slot code, for a splice that kept its length) failed it.",
+   "cost": "it caught my bug and misses the one the lane is about (bytes an edit allocates grow with the image)",
+   "cause": "`blaze_alloc_count::Used` has `bytes` and `largest`; the test asserts only `allocations`",
+   "workaround": "none",
+   "state": "open: assert bytes at two image sizes too, once the lists and tables are deltas"
+  },
+  {
+   "id": "edit4-4",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+   "where": "the lane's VM: timings after the first measurement",
+   "what": "The same base binary measured 66 ms a body edit in its first run on the VM (07:16) and 260 to 370 ms in every run after (place 15 ms to 80-125, `memory purge` 5.6 ms to 96, CPU-bound spans 1.3 to 1.8 times longer), alone on the machine with fresh homes. `dd oflag=dsync` and file creates were as fast as before; `/proc/pressure/io` said 99% the whole time, with one idle daemon.",
+   "cost": "every end-to-end row after the first is of a slow machine: the before and after here are compared as pairs run back to back, and the edit-loop rows are not comparable with other lanes'",
+   "cause": "not found. The VM was made as the brief said, with no `--memory-commit` and no `--cpu` class; dmesg shows virtio-mem adding memory in 50 ms steps while two daemons ran; io pressure may be the daemons' io_uring waits counted as iowait",
+   "workaround": "A/B back to back (`/root/ab.sh`), spans of CPU-bound stages, counts and bytes in place of wall time",
+   "state": "open: a lane that measures edit loops needs a benchmark VM (`--memory-commit`, a `--cpu` class), and the brief should say so"
+  },
+  {
+   "id": "edit4-5",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+   "where": "blaze: the CPU samples of an edit",
+   "what": "`link patch` took 8.6 ms of every edit and the profile's sampler had 6 on-CPU samples in it over 30 edits: nothing said which step of a stage the time was in.",
+   "cost": "the fix was designed before the time was located (`.rela.dyn` turned out to be about 2 of the 8.6 ms)",
+   "cause": "a stage had one span; the sampler's rate is for long builds",
+   "workaround": "added a span a step (`link stage: apply the change`, `place`, `relocate`, `lists`, `the writer's tables`, `the writer's file`, `the ranges written`)",
+   "state": "fixed on edit4-1111 (the spans); what they say: `lists` 3.3 ms and `apply the change` 1.8 to 2.5 ms are each a pass over the image"
+  },
+  {
+   "id": "edit4-6",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+   "where": "blaze-link's tests under cargo",
+   "what": "`tests::patch::a_same_size_body_edit_writes_the_function_and_a_constant` failed on every run, on the base too: it allows one 4 KiB block of rounding between 20 and 200 functions, and three kept tables each round to a block (at 20 functions each is shorter than a block).",
+   "cost": "a failing counter in the area of the change had to be read to be told from a regression",
+   "cause": "the bound was written for one table",
+   "workaround": "none",
+   "state": "fixed on edit4-1111: a block for each of the three tables"
+  },
+  {
+   "id": "edit4-7",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+   "where": "blaze-codegen: the refinement of a patched walk",
+   "what": "`driver::tests::kept::a_walk_over_kept_describes_builds_what_a_fresh_walk_builds` failed in 4 of 20 runs: the driver asked only the patching build's front end whether it closes dyn facts, so a walk kept against closed facts was patched once an edit removed the program's one call through a `dyn`, and the build kept a removed function and its caller's direct call to it.",
+   "cost": "a real stale-code bug on the edit path sat behind a test known to fail",
+   "cause": "`Frontend::closes` was read of the build, not kept with the walk",
+   "workaround": "none",
+   "state": "fixed on edit4-1111 for that case (`Walked::closes`; the case pinned, with its control); the test still fails, 1 run of 30 where it was 4 of 20: see edit4-10"
+  },
+  {
+   "id": "edit4-8",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+   "where": "copying blaze's pinned LLVM between two ix VMs",
+   "what": "The third lane to meet it (records-6, edit2-3): 346 MB through the Mac took about 25 minutes, and a foreground wait is moved to the background after three.",
+   "cost": "25 minutes before the first build",
+   "cause": "as edit2-3",
+   "workaround": "started rustup and the clone beside it",
+   "state": "open, as edit2-3"
+  },
+  {
+   "id": "edit4-9",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+   "where": "blaze: `blaze stop`",
+   "what": "`blaze stop` returned and the daemon's process was still there seconds later (seen twice, with a 5 GiB daemon); a measurement started then ran beside it.",
+   "cost": "one A/B run measured with two daemons alive",
+   "cause": "as rev-3: stop answers before the process has exited",
+   "workaround": "wait for `pgrep` to be empty",
+   "state": "open, as rev-3"
+  },
+  {
+   "id": "edit4-10",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+   "where": "blaze-codegen: the refinement of a patched walk, a second case",
+   "what": "After edit4-7's fix `a_walk_over_kept_describes_builds_what_a_fresh_walk_builds` failed in 1 run of 30 with another case (four functions, the third and fourth of one code, a static the second names; `Edit::Body` of `main`, which gives `main` the body byte the second function has): `build 1: functions differs`, and it is the fresh build's `main` that is odd: its relocation rows are the second function's (`0, 0, 1, 2`) over its own targets, where the build over kept describes has `0, 1, 1, 2`, which is what `main` calls.",
+   "cost": "the test is not stable yet; half an hour to read the two sides",
+   "cause": "my reading, not verified: two functions with the same body byte and as many references get one compiled template in the test's model, whose rows say which places share a target, and which of the two made it differs between the fresh build and the patched one. If so it is the model's key (rule keys-cover-every-input), not the driver",
+   "workaround": "none",
+   "state": "open: pin the case (draws 4, 0, 0, 0, 0, 0, 3, 1, 2, false x5, one edit 0, 0, 0) and decide whether the template key or the driver is wrong"
   }
  ]
 }

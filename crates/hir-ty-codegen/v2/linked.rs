@@ -808,7 +808,9 @@ impl Kept {
     /// view the tables are of, and gives those whose encoding is another. Which owners those
     /// are is the engine's answer ([`positions`]' and `declaration_location`'s
     /// `changed_since`, the changed set walked from what was written): a link asks of the
-    /// bodies an edit moved, never of every body it watches. Until 2026-11-11 it asked a
+    /// bodies an edit moved, never of every body it watches. The engine may name more than
+    /// changed (a file whose rows are a wide level of its walk is named whole): such a body's
+    /// tables are encoded again and found the same, a cost of that file. Until 2026-11-11 it asked a
     /// stamp memo of each watched owner each link, 4,590 memos verified for a one-line edit
     /// of hello world. An owner none of whose tables is kept is no longer watched.
     fn verify(
