@@ -746,7 +746,7 @@ fn a_test_build_plans_the_standard_library_the_program_build_did() {
     let (shared, apart) = shared_std_plans_apart(&built, &tested);
     assert_eq!(shared, built.len(), "the tests' build has every std unit the program's has");
     assert!(shared > 0);
-    assert_eq!(apart, [], "a std unit both builds have is planned twice");
+    assert!(apart.is_empty(), "a std unit both builds have is planned twice: {apart:?}");
     let only_tested: Vec<&str> = tested
         .iter()
         .filter(|(key, _)| !built.iter().any(|(it, _)| it == key))
