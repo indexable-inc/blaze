@@ -12,6 +12,7 @@ import { resolve as resolvePath } from "node:path";
 import { packages, parseSpec } from "./packages.ts";
 import { nuon } from "./nuon.ts";
 import { installCapture, inTask, newTask, watchTasks, type Task } from "./tasks.ts";
+import { stopped } from "./patience.ts";
 import { req, daemonPresent, listen } from "./daemon.ts";
 import { install as installEffects, fsFor, rawsOf } from "./effects.ts";
 import { brief, shown } from "./shown.ts";
@@ -170,8 +171,10 @@ export class Repl {
 
   /** Start a cell as a task and return it at once; cells run concurrently, each with its own console capture.
    *  `call` is the agent's id for the tool call running it, when known. */
-  run(code: string, timeoutMs?: number, call: string | null = null): Task {
+  run(code: string, timeoutMs?: number, call: string | null = null, expect?: { expect_ms?: number; why?: string }): Task {
     const t = newTask(code, call);
+    t.expect_ms = expect?.expect_ms;
+    t.why = expect?.why;
     post(t);
     inTask(t, () => this.#run(t, code, timeoutMs)).then(({ ok, value, result }) => { t.finish(ok, value, result); post(t, true); });
     return t;
@@ -189,7 +192,7 @@ export class Repl {
       let timer: Timer | undefined;
       const value = await (timeoutMs === undefined ? fn(this.scope) : Promise.race([
         fn(this.scope),
-        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`cell timed out after ${timeoutMs}ms`)), timeoutMs); }),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(stopped(timeoutMs, t.expect_ms))), timeoutMs); }),
       ]).finally(() => clearTimeout(timer)));
       // A cell whose value is a component draws it (the person sees it under the cell); the agent is told it did.
       if (isElement(value)) {
