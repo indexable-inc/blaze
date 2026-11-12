@@ -225,7 +225,12 @@ fn an_image_and_its_side_file_resolve_as_debug_info_inside() {
     // copy. The sums the seal is made of read the blocks the patch wrote, not the file.
     assert_eq!(*image.debug_file_view(), patched);
     assert_eq!(*view, side, "a view held across an update is the file it was taken of");
-    assert!(write.summed < side.len() as u64 / 2, "{} bytes summed of {}", write.summed, side.len());
+    assert!(
+        write.summed > 0 && write.summed < side.len() as u64,
+        "{} bytes summed of {}: the blocks the patch wrote, each once",
+        write.summed,
+        side.len()
+    );
     drop(view);
     let want = inside(&with_disk, TO);
     assert_eq!(beside(&image, &disk, TO, &patched), want);

@@ -141,15 +141,30 @@ impl Sums {
     /// Takes a write of `bytes[at..at + len]`: `bytes` is the file after it, of the length
     /// the sums were made of. The blocks the range touches are read again, and each one's
     /// path to the root joined again.
+    #[cfg(test)]
     pub(super) fn wrote(&mut self, bytes: &[u8], at: u64, len: u64) {
+        self.wrote_all(bytes, &[(at, len)]);
+    }
+
+    /// Takes the writes of `bytes[at..at + len]` for each of `ranges`, in any order and
+    /// overlapping or not: `bytes` is the file after them, of the length the sums were made
+    /// of. Each block a range touches is read again once, however many ranges touch it, and
+    /// its path to the root joined again.
+    pub(super) fn wrote_all(&mut self, bytes: &[u8], ranges: &[(u64, u64)]) {
         assert_eq!(bytes.len(), self.len, "a file of another length is summed whole");
-        let end = (at + len).min(self.len as u64) as usize;
-        let at = at as usize;
-        if at >= end {
-            return;
-        }
         let pad = self.leaves * BLOCK - self.len;
-        for leaf in (at + pad) / BLOCK..=(end - 1 + pad) / BLOCK {
+        // alloc: once per patch sealed, the blocks its writes touch: a few
+        let mut touched: Vec<usize> = Vec::new();
+        for &(at, len) in ranges {
+            let end = (at + len).min(self.len as u64) as usize;
+            let at = at as usize;
+            if at < end {
+                touched.extend((at + pad) / BLOCK..=(end - 1 + pad) / BLOCK);
+            }
+        }
+        touched.sort_unstable();
+        touched.dedup();
+        for leaf in touched {
             let mut node = self.leaves + leaf;
             self.nodes[node] = self.leaf(bytes, leaf);
             while node > 1 {
@@ -239,5 +254,24 @@ mod tests {
         let (small, large) = (read_of(64 << 10), read_of(16 << 20));
         assert_eq!(small, large, "two blocks read, in a file of any length");
         assert_eq!(small, 2 * BLOCK as u64);
+    }
+
+    /// Ranges that touch one block read it once: ten writes in one block and one in another
+    /// are two blocks read, as the writes of a patch are (a record, its name, its rows).
+    #[test]
+    fn writes_in_one_block_read_it_once() {
+        let mut bytes = file(5, 20 * BLOCK);
+        let mut sums = Sums::of(&bytes);
+        let before = sums.read;
+        let mut ranges: Vec<(u64, u64)> = (0..10u64).map(|n| (3 * BLOCK as u64 + 100 * n, 8)).collect();
+        ranges.push((9 * BLOCK as u64 + 7, 3));
+        for &(at, len) in &ranges {
+            for byte in &mut bytes[at as usize..(at + len) as usize] {
+                *byte ^= 0x3c;
+            }
+        }
+        sums.wrote_all(&bytes, &ranges);
+        assert_eq!(sums.crc32(), crc32(&bytes));
+        assert_eq!(sums.read - before, 2 * BLOCK as u64);
     }
 }

@@ -328,23 +328,23 @@ fn an_edit_to_a_callee_relinks_its_unchanged_callers() {
     let key = |n: u8| InstanceKey(ContentId([n; 32]));
     let names = [(key(2), "call".to_string())];
     let (first, gone, new) =
-        function_rows(&[], &[calling(3, &[2]), calling(2, &[1]), calling(1, &[])], &names).unwrap();
+        function_rows(&[], &[std::sync::Arc::new(calling(3, &[2])), std::sync::Arc::new(calling(2, &[1])), std::sync::Arc::new(calling(1, &[]))], &names).unwrap();
     assert!(gone.is_empty());
     assert_eq!(new, [key(1), key(2), key(3)]);
 
     let (same, gone, new) =
-        function_rows(&first, &[calling(1, &[]), calling(2, &[1]), calling(3, &[2])], &names)
+        function_rows(&first, &[std::sync::Arc::new(calling(1, &[])), std::sync::Arc::new(calling(2, &[1])), std::sync::Arc::new(calling(3, &[2]))], &names)
             .unwrap();
     assert_eq!(same, first);
     assert!(gone.is_empty() && new.is_empty(), "linked again unchanged: {gone:?} {new:?}");
 
     let (_, gone, new) =
-        function_rows(&first, &[calling(3, &[2]), calling(2, &[4]), calling(4, &[])], &names)
+        function_rows(&first, &[std::sync::Arc::new(calling(3, &[2])), std::sync::Arc::new(calling(2, &[4])), std::sync::Arc::new(calling(4, &[]))], &names)
             .unwrap();
     assert_eq!(gone, [key(1), key(2)], "the old `log`, and `call` as it was filled against it");
     assert_eq!(new, [key(2), key(4)], "`call` filled against the new `log`, and the new `log`");
 
-    let twice = function_rows(&[], &[calling(2, &[1]), calling(2, &[4])], &names).unwrap_err();
+    let twice = function_rows(&[], &[std::sync::Arc::new(calling(2, &[1])), std::sync::Arc::new(calling(2, &[4]))], &names).unwrap_err();
     assert!(
         twice.contains("filled two ways")
             && twice.contains("`call`")
@@ -394,7 +394,6 @@ fn kept(path: &str, output: &blaze_link::Output) -> KeptImage {
         slotted: Vec::new(),
         assumed: Vec::new(),
         given: None,
-        side: None,
     };
     KeptImage { path: path.to_owned(), kept }
 }

@@ -229,7 +229,7 @@ fn built(program: &Program, before: Option<&Entries>) -> (Built, Entries) {
         inputs: keys().map(|key| (key, CodeHash(key.0))).collect(),
         identities: keys().map(|key| (key, key.0)).collect(),
         debug_names: keys().map(|key| (key, format!("f{:?}", key.0))).collect(),
-        functions,
+        functions: functions.into_iter().map(std::sync::Arc::new).collect(),
         statics,
         id: entries.id,
         delta,
@@ -479,7 +479,7 @@ fn a_body_edit_among_many_hashes_the_edit() {
 
         program.apply(Edit::Body(1));
         let (mut second, _) = built(&program, None);
-        let edited: Vec<CompiledFunction> = second.functions.clone(); // clone: the edited three
+        let edited = second.functions.clone(); // clone: the edited three, their reference counts
         second.functions = first.functions.iter().filter(|it| it.key.0.0[0] == 0xee).cloned().collect();
         second.functions.extend(edited);
         second.functions.sort_unstable_by_key(|it| it.key);

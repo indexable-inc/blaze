@@ -818,9 +818,7 @@ impl Kept {
         let read = match (&mut self.sums, wrote) {
             (Some(sums), Some(wrote)) if sums.len() == end => {
                 let had = sums.read;
-                for &(at, len) in wrote {
-                    sums.wrote(before, at, len);
-                }
+                sums.wrote_all(before, wrote);
                 sums.read - had
             }
             _ => {
