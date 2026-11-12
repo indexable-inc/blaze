@@ -13,6 +13,7 @@
 
 pub(crate) mod ids;
 mod part;
+pub mod port;
 #[cfg(test)]
 mod tests;
 

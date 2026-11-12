@@ -292,7 +292,7 @@ fn built(
 /// functions and statics are built, each one's code and what its places name, the symbols,
 /// the slots, the owners, what dedupe merged, what each root reaches, and a refused build's
 /// errors. What a build counts of its compiles and the store is not the walk's.
-fn difference(
+pub(super) fn difference(
     kept: &Result<Built, Vec<CodegenError>>,
     fresh: &Result<Built, Vec<CodegenError>>,
 ) -> Option<String> {

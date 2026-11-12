@@ -290,6 +290,51 @@ pub trait Frontend: Sync {
         self.describe(instance, requester).map(Some)
     }
 
+    /// The store key of the record of the describe of `instance` for `requester`
+    /// (docs/v2/plan/design/store.md, "Describe records"): made of the content of everything
+    /// that describe reads and of nothing of this front end's database or process, so
+    /// another database of the same sources, in this process or a later one, makes the same
+    /// key. `None` for a describe with no content identity the front end can make without
+    /// the describe itself (code an edit reaches, a body that names a file by the build's
+    /// name for it): the walk describes it. Asked once per function the walk has no kept
+    /// describe of, on every core at once, so it must cost far less than the describe. The
+    /// default is `None`: a front end that keeps no records.
+    fn record_key(&self, instance: &Self::Instance, requester: &Origin) -> Option<blaze_cas::Key> {
+        let _ = (instance, requester);
+        None
+    }
+
+    /// The describe of `instance` for `requester` as `bytes` hold it, which the store gave
+    /// under [`Self::record_key`] of the two: what [`Self::describe`] would give, its
+    /// instances made in this front end's database. `Err` says why the bytes do not read
+    /// here, and is the build's error naming the function and the key: the key says the
+    /// record is of this content, so a record that does not read is a key that leaves an
+    /// input out (rule 21), never a reason to describe again.
+    fn from_record(
+        &self,
+        instance: &Self::Instance,
+        requester: &Origin,
+        bytes: &[u8],
+    ) -> Result<Described<Self::Instance, Self::Static>, String> {
+        let _ = (instance, requester, bytes);
+        // alloc: an error, of a front end that keeps no records and is given one
+        Err("the front end keeps no describe records".to_owned())
+    }
+
+    /// `described`, the describe of `instance` for `requester` this front end just made, as
+    /// the record kept under [`Self::record_key`] of the two: every instance and static it
+    /// names written by content. `None` where some part has no such form; nothing is kept
+    /// then. Two databases of the same sources give the same bytes (rule 25).
+    fn to_record(
+        &self,
+        instance: &Self::Instance,
+        requester: &Origin,
+        described: &Described<Self::Instance, Self::Static>,
+    ) -> Option<Vec<u8>> {
+        let _ = (instance, requester, described);
+        None
+    }
+
     /// A number that is another after any write of an input a library's describe may read
     /// (a library's source, a frozen table); `None` for a front end that tells none, whose
     /// walk is then never patched. A kept walk is patched only while it is the same.

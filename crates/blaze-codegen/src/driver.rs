@@ -1633,6 +1633,13 @@ pub struct Build<'a, B: Prepare> {
     /// The bug planted in a patched build, for a control of the test that holds it to the
     /// whole one: none, but in that control.
     planted: Option<Planted>,
+    /// The store the walk asks for a function's describe before it asks the front end
+    /// ([`Build::recording`]); `None` for a build whose every describe is the front end's.
+    // dyn: one call a function the walk has no kept describe of, against a store lookup
+    records: Option<&'a dyn Records>,
+    /// The records of the describes the front end made in this build, pushed by whichever
+    /// core made each: taken as the build ends ([`records::sorted`]), into its puts.
+    recorded: SegQueue<Put>,
 }
 
 /// What the walk's worklist visits: a function or static the walk reached and has not
@@ -1896,7 +1903,21 @@ impl<'a, B: Prepare> Build<'a, B> {
             checks_shape: true,
             renames: true,
             planted: None,
+            records: None,
+            recorded: SegQueue::new(),
         }
+    }
+
+    /// Asks `records` for each function's describe before the front end, where the front end
+    /// has a content key for it ([`Frontend::record_key`]), and gives back, among the build's
+    /// puts, a record of each describe the front end made
+    /// (docs/v2/plan/design/store.md, "Describe records"). The walk reaches the same
+    /// functions either way; with it, a function another database of the same sources
+    /// described costs a store lookup and its record's decode in place of a describe.
+    // dyn: as the field's
+    pub fn recording(mut self, records: &'a dyn Records) -> Self {
+        self.records = Some(records);
+        self
     }
 
     /// Plants `bug` in this build's patch ([`Planted`]), for a control.
@@ -2062,10 +2083,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     return Err(why);
                 }
             },
-            None => {
-                counts.described();
-                self.frontend.describe(instance, requester)?
-            }
+            None => self.found_or_described(instance, requester, counts)?,
         };
         // alloc: once per describe, shared by the walk's node and the walk kept
         let now = Arc::new(now);
@@ -2074,6 +2092,61 @@ impl<'a, B: Prepare> Build<'a, B> {
             kept.keep(round, asked, now.clone());
         }
         Ok(now)
+    }
+
+    /// The describe of `instance` for `requester`, which no walk before this one kept: the
+    /// store's record of it where the build reads records ([`Build::recording`]) and the
+    /// front end has a content key for it ([`Frontend::record_key`]); else the front end's
+    /// describe, with its record pushed for the build's puts where the front end can write
+    /// one. A record that is there and does not read is the build's error, naming the
+    /// function and the key: never a reason to describe again.
+    fn found_or_described(
+        &self,
+        instance: &FrontInstance<B>,
+        requester: &Origin,
+        counts: &kept::Counts,
+    ) -> Result<Described<FrontInstance<B>, FrontStatic<B>>, CodegenError> {
+        let key = match self.records {
+            Some(_) => self.frontend.record_key(instance, requester),
+            None => None,
+        };
+        let (Some(records), Some(key)) = (self.records, key) else {
+            counts.described();
+            return self.frontend.describe(instance, requester);
+        };
+        let unread = |why: String| {
+            error(
+                InstanceKey(ContentId::default()),
+                ItemKey(ContentId::default()),
+                // alloc: an error
+                format!(
+                    "the record of the describe of `{}` under the store key {:x} does not read: \
+                     {why}",
+                    self.frontend.spell(instance),
+                    key.0
+                ),
+            )
+        };
+        let mut found = None;
+        let had = records
+            .read(&key, &mut |bytes| {
+                found = Some(self.frontend.from_record(instance, requester, bytes));
+            })
+            .map_err(unread)?;
+        match (had, found) {
+            (true, Some(read)) => {
+                counts.found();
+                read.map_err(unread)
+            }
+            _ => {
+                counts.described();
+                let now = self.frontend.describe(instance, requester)?;
+                if let Some(bytes) = self.frontend.to_record(instance, requester, &now) {
+                    self.recorded.push(Put { key, kind: records::KIND, bytes });
+                }
+                Ok(now)
+            }
+        }
     }
 
     fn static_node(
@@ -2824,6 +2897,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         let walk = Walk {
             described,
             verified,
+            found: counts.found_so_far(),
             reached: nodes.len(),
             dropped: 0,
             fresh,
@@ -3043,8 +3117,35 @@ impl<'a, B: Prepare> Build<'a, B> {
     }
 
     /// A whole build, or with `later` a lazy one whose entry is the roots at those places
-    /// ([`Build::run_later`]).
+    /// ([`Build::run_later`]): [`Self::run_built`], then the records of the describes its walk
+    /// made, added to its puts ([`Build::recording`]). A build that is refused puts nothing,
+    /// its records with the rest.
     fn run_as(
+        &mut self,
+        roots: &[(FrontInstance<B>, Origin)],
+        static_roots: &[FrontStatic<B>],
+        check: &[CheckRoot<FrontInstance<B>, FrontStatic<B>>],
+        later: Option<&[usize]>,
+        store: &impl Lookup,
+    ) -> Result<Built, Vec<CodegenError>> {
+        let built = self.run_built(roots, static_roots, check, later, store);
+        // alloc: per build, the records its describes made
+        let made: Vec<Put> = std::iter::from_fn(|| self.recorded.pop()).collect();
+        let mut built = built?;
+        if made.is_empty() {
+            return Ok(built);
+        }
+        // alloc: an error, once
+        let records = records::sorted(made).map_err(|why| vec![why])?;
+        // A record's key is of its own domain (the front end's schema of it), so none is a
+        // key of the build's other puts: the two sorted lists merge into one, by key.
+        built.puts.extend(records);
+        built.puts.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(built)
+    }
+
+    /// [`Self::run_as`], before the records of its describes are added to its puts.
+    fn run_built(
         &mut self,
         roots: &[(FrontInstance<B>, Origin)],
         static_roots: &[FrontStatic<B>],
@@ -3085,6 +3186,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 roots = roots.len(),
                 described = tracing::field::Empty,
                 verified = tracing::field::Empty,
+                found = tracing::field::Empty,
                 reached = tracing::field::Empty,
                 visited = tracing::field::Empty,
                 fresh = tracing::field::Empty,
@@ -3175,6 +3277,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             let walk = &walked.3;
             span.record("described", walk.described);
             span.record("verified", walk.verified);
+            span.record("found", walk.found);
             span.record("reached", walk.reached);
             span.record("visited", walk.visited);
             if let Some(fresh) = walk.fresh {
@@ -3185,8 +3288,8 @@ impl<'a, B: Prepare> Build<'a, B> {
                 span.record(
                     "function",
                     tracing::field::display(format_args!(
-                        "whole ({whole}): described {}, verified {}, reached {}",
-                        walk.described, walk.verified, walk.reached
+                        "whole ({whole}): described {}, found {}, verified {}, reached {}",
+                        walk.described, walk.found, walk.verified, walk.reached
                     )),
                 );
             }
@@ -5183,6 +5286,8 @@ mod frontier;
 use frontier::{Frontier, Order};
 mod kept;
 pub use kept::{Kept, Walk, Work};
+mod records;
+pub use records::Records;
 mod later;
 mod lists;
 mod near;

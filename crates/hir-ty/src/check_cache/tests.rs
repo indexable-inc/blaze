@@ -347,3 +347,103 @@ fn finding_a_record_allocates_nothing() {
         }
     });
 }
+
+/// What the port tests name an item by: its crate's name and its own, as a describe record
+/// names it by its item key (`blaze_items`, which hir-ty does not see).
+fn port_name(krate: &str, function: &str) -> port::Name {
+    ContentId::of("blaze v2 test ported item 1", format!("{krate}::{function}").as_bytes()).0
+}
+
+/// The functions the port tests' values name, by crate.
+const PORTED: [(&str, &str); 3] = [("dep", "area"), ("dep", "sum"), ("other", "o1")];
+
+/// The buffer of the port tests' values written in `db`: the generic arguments
+/// `[fn area, fn sum, fn o1]`, function items of two crates, and `area` as an id of its own.
+/// With the buffer, where each was written.
+fn ported(db: &Db) -> (Vec<u8>, u32, u32) {
+    use crate::next_solver::{GenericArg, GenericArgs, Ty};
+    use hir_def::CallableDefId;
+
+    let interner = DbInterner::new_no_crate(db);
+    let item = |(krate, name): (&str, &str)| {
+        let func = function(db, crate_named(db, krate), name);
+        let def = CallableDefId::FunctionId(func).into();
+        GenericArg::from(Ty::new_fn_def(interner, def, GenericArgs::default()))
+    };
+    let args = GenericArgs::new_from_slice(&PORTED.map(item));
+    let mut writer = port::Writer::new(db, interner);
+    let args = writer.args(args);
+    let area = writer.function(function(db, crate_named(db, "dep"), "area"));
+    let bytes = writer
+        .finish(&mut |item| {
+            let port::Item::Function(func) = item else {
+                return Err(format!("{item:?} is no function"));
+            };
+            let name = FunctionSignature::of(db, func).name.as_str().to_owned();
+            let (krate, _) = (PORTED.iter())
+                .find(|(krate, of)| *of == name && function(db, crate_named(db, krate), of) == func)
+                .ok_or_else(|| format!("`{name}` is none of the test's functions"))?;
+            Ok(port_name(krate, &name))
+        })
+        .unwrap();
+    (bytes, args, area)
+}
+
+/// The invariant: values ported in one database are the same bytes in another database of the
+/// same sources whose ids differ (no id of a database is in them), and read back there as
+/// that database's own values.
+#[test]
+fn ported_values_are_the_same_bytes_in_two_databases_and_read_back() {
+    let first = db_of(FIXTURE);
+    let (second, dep) = second();
+    let bits = |db: &Db, krate| function(db, krate, "area").as_id().as_u32();
+    assert_ne!(bits(&first, crate_named(&first, "dep")), bits(&second, dep), "the ids differ");
+
+    let (bytes, args, area) = ported(&first);
+    let (again, args_again, area_again) = ported(&second);
+    assert_eq!((args, area), (args_again, area_again), "written in one order");
+    assert_eq!(bytes, again, "an id of a database is in the bytes");
+
+    // Read in the second database, which never wrote them.
+    let (second, dep) = self::second();
+    let interner = DbInterner::new_no_crate(&second);
+    let aligned = Aligned::copy_from(&bytes);
+    let mut reader = port::Reader::open(&second, interner, &aligned, &mut |name| {
+        (PORTED.iter())
+            .find(|(krate, function)| port_name(krate, function) == *name)
+            .map(|(krate, name)| {
+                port::Item::Function(function(&second, crate_named(&second, krate), name))
+            })
+    })
+    .unwrap();
+    assert_eq!(reader.function(area).unwrap(), function(&second, dep, "area"));
+    let read = reader.args(args).unwrap();
+    // The same values written again from what was read are the same bytes: they are the
+    // second database's own.
+    let mut writer = port::Writer::new(&second, interner);
+    assert_eq!(writer.args(read), args);
+    let rewritten = writer.finish(&mut |item| match item {
+        port::Item::Function(func) => (PORTED.iter())
+            .find(|(krate, name)| function(&second, crate_named(&second, krate), name) == func)
+            .map(|(krate, name)| port_name(krate, name))
+            .ok_or_else(|| format!("{func:?} is none of the test's functions")),
+        other => Err(format!("{other:?} is no function")),
+    });
+    assert!(rewritten.is_ok(), "{rewritten:?}");
+}
+
+/// The control: a reader that has no item for a name refuses the buffer, and so does one
+/// that names another kind of item; neither panics.
+#[test]
+fn a_ported_buffer_naming_an_unknown_item_is_refused() {
+    let db = db_of(FIXTURE);
+    let (bytes, _, _) = ported(&db);
+    let aligned = Aligned::copy_from(&bytes);
+    let interner = DbInterner::new_no_crate(&db);
+    let unknown = port::Reader::open(&db, interner, &aligned, &mut |_| None);
+    assert!(unknown.is_err_and(|why| why.contains("has none of")));
+    let mut cut = bytes.clone();
+    cut.truncate(bytes.len() / 2);
+    let cut = Aligned::copy_from(&cut);
+    assert!(port::Reader::open(&db, interner, &cut, &mut |_| None).is_err());
+}

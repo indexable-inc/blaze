@@ -204,6 +204,9 @@ pub struct Walk {
     pub described: usize,
     /// Kept describes the front end said still hold: each cost its answer, never a describe.
     pub verified: usize,
+    /// Describes read from the store's records ([`super::records`]): each cost a lookup and
+    /// its record's decode, never a describe. Over every round.
+    pub found: usize,
     /// The functions of the walk's result.
     pub reached: usize,
     /// The functions of this program's last build that are not in this one's
@@ -281,6 +284,7 @@ pub struct Work {
 pub(super) struct Counts {
     pub(super) described: AtomicUsize,
     pub(super) verified: AtomicUsize,
+    pub(super) found: AtomicUsize,
 }
 
 impl Counts {
@@ -290,6 +294,14 @@ impl Counts {
 
     pub(super) fn verified(&self) {
         self.verified.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn found(&self) {
+        self.found.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn found_so_far(&self) -> usize {
+        self.found.load(Ordering::Relaxed)
     }
 
     pub(super) fn get(&self) -> (usize, usize) {

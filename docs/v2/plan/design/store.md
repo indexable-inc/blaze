@@ -278,6 +278,115 @@ calls any proc macro (until macros are given virtual paths); Windows (no roots t
 | no-op lane's answer | request + view, in memory | not a store record: stays |
 | daemon image | the database, by path | not content-keyed: stays, one checkout's |
 
+## Describe records
+
+2026-11-12, lane describes-1112. Written, not yet compiled or measured: every number here that
+is not quoted from another lane is a prediction, and the checks are listed at the end. Code:
+`crates/blaze-codegen/src/driver/records.rs` (the walk's side),
+`crates/hir-ty-codegen/v2/frontend/described.rs` (the key and the record),
+`crates/hir-ty/src/check_cache/port.rs` (types and ids by content).
+
+**What a describe is.** The code generator's walk asks the front end one question of each
+function instance it reaches (`Frontend::describe`, `HirFrontend::described`): what it is
+without compiling it. The answer (`blaze_codegen::backend::Described`) is its item's key, its
+code hashes (`code`, `template_code`, `built_in_code`), the digest of its arguments' facts, whose
+code it is (`origin`, `owner`), a few flags, its symbol and debug name, and its references in
+the order of its MIR, which are the places of its template and what the walk follows. From it
+the walk makes the function's instance key and its template's store key, so a template lookup
+needs the describe first.
+
+**What it reads.** The instance's MIR as its origin's units build it (for a body of the
+library: level 2, inlined, with the effect summaries of what it inlines), the signatures and
+layouts its arguments name, the impls its calls resolve to, and of the build: how each origin's
+units build bodies (`Units`: inlines, tells locals, names, the MIR options), whether the build
+links an image, whether it is build-time code, and for a body walked against them a program's
+dyn facts. For a body that calls `file!()`, what the build calls the file.
+
+**What was local.** The describe was `described_memo(db, HirInstance, Origin, Facing)`: a memo
+of one database, keyed by interned ids (a `FunctionId`, the row of its `GenericArgs`, a `Crate`
+in its environment), with its units named by their place in a list of the process
+(`Facing::units`, `UNITS`), and its value naming each callee as another `HirInstance`. The walk
+kept over it (`driver::Kept`) is by database nonce. So a new project's database, a restarted
+daemon and a second home had none: 14,233 describes for hello-world, 44.5 s of CPU (lane
+launch3-1111's profile), all of the standard library's.
+
+**The content key.** The rule of "Content keys" above, for one function:
+
+| part of the rule | here |
+|---|---|
+| the action | the code generator's code identity (`Toolchain::id`) as the key's producer, and the record's schema (its layout and the type codec's) |
+| the inputs' content | the toolchain whole (target, CPU, features); `Units` by content, never its place in `UNITS`; the image and build-time flags; what the units give *whoever asks* (the requester by what it is compiled as, never its package's name, so a second project of another name makes the same key); the instance: its body by its item's key (`blaze_items::item_key`), a closure by its owner and its place there, its arguments as types written by content |
+| each dependency by what is read of it | the image key (`hir_def::deps::Image::key`) of the crate the instance is worked out in, its home (`hir_ty_mir::mir::home`): that key is the content of the crate and, by its dependencies' keys, of every crate it loads |
+
+One image key is enough because of what a home is: `home.rs` shows that an instance worked out
+in its home reads only crates among the home's dependencies. That is checked where the key is
+made, never assumed: every item and crate the instance names must be the home's or one of its
+dependencies' (`described::Closure`), or it has no key. This is coarser than
+`fn_info(&f).code_id` (an edit anywhere in a crate rekeys every function of it) and is what can
+be made *before* the describe: the function's own code hash needs its MIR (`hir_ty_share::code`
+reads the spans of the lowered body), which is a third of what a describe costs. A crate read
+from an image is one no edit reaches, so the coarseness costs nothing there; the function's
+own code identity is the key to move to once it can be had without the body (a sealed crate's
+per-function identities as a record of the crate: lane sealed-1112).
+
+**Which describes have a key.** An instance whose home is read from an image, in the empty
+environment, with a policy, by the item lane's hashes, walked against no program's dyn facts:
+the standard library's own functions, a dependency's, and their generics over each other's
+types. Not: a workspace crate's function or a generic over its types (the database's memo, as
+before: an edit changes it), a body that names a file (described each build, and never written
+as a record, so its key is always a miss), a release build's bodies walked against the
+program's dyn facts, the C `main`, the allocator shim, an `asm!` function, statics.
+
+**The record.** `Kind::Query`, under `Key::of(schema, producer, [inputs])`: the `Described` with
+its origin as "the requester's" or its crate's own (the one rule, `compiled_for`), and each
+reference by content: a function as its body, arguments and home, a static as its item, an
+outside symbol by name. Types and ids go through the one codec a dependency's checked bodies
+use (`hir_ty::check_cache::ids`, `next_solver::persist`), with each item named by its item key
+in place of an index in one crate's table (`check_cache::port`). With each function it refers
+to, the record holds what the recursion limit reads of it (`Counted`): the walk asks that of a
+callee before describing it, and working it out runs `compiled_by_user`, which builds the
+callee's optimized body (2.7 s of the profile above). No database id is in the bytes.
+
+**The walk.** `Build::recording(store)`: for a function no kept walk holds, the driver asks the
+front end for the key, the store for the record (on whichever core visits it, under its own
+guard), and the front end to read it; only a miss is described, and the record of each describe
+made is among the build's puts. `Walk::found` counts the records read beside `described` and
+`verified` (the `codegen walk` span's `found`). A record that is there and does not read is the
+build's error naming the function and the key (rule no-fallback). Two describes of one key
+with other bytes refuse the build (rule 21). The frontier form (`Build::near`,
+launcher.md "The lazy path") goes through the same `Build::described`, so a launched
+program's first call of a library function reads records too: that is where the lazy path
+becomes cheap, with no change to it.
+
+**What stands in for the memo afterwards.** A describe read from a record was never run in
+this database, and three later asks would run it after all. Each is answered from what the
+database read (`described::Found`, by database, dropped at a write of a library's input):
+whether a kept describe still holds (`redescribe`: yes while the home's image key and what the
+build gives the requester are what they were when it was read), whether it is asked each build
+(no: a describe that names a file is never a record), and a callee's count.
+
+**Determinism.** The bytes hold item keys, crate keys, content IDs, text and a type table whose
+order is the order of the walk over the describe. One known hole, stated in `port.rs`: a `dyn`
+type's projections and auto traits are written in the writing database's id order, so two
+databases that numbered two auto traits the other way round make other bytes and other keys
+for an instance naming such a type: a miss (and two records of one describe), never a wrong
+hit. To close: write them sorted by item key in `next_solver::persist`.
+
+**Not built.** Statics' describes as records (each is a constant evaluation; hello-world has a
+few hundred); the function's own code identity as the key; a verify mode that describes a found
+record again and compares (`BLAZE_VERIFY_STORE` for describes); the `dyn` order above; a bound
+on `Found` other than its database's life.
+
+**Checks (none run yet).** `blaze-codegen` `driver::tests::recorded`: a second database
+describes only what has no record and builds what the fresh walk builds; the same walk with no
+store describes everything (the cause removed); a key that leaves the body out is caught by
+the same oracle (the planted bug); a record that does not read refuses the build; two records
+of one key. Still to write once the tree compiles: the record's round trip and "two databases,
+identical bytes" over a real database with a dependency read from an image (the fixture of
+`hir-ty`'s `check_cache::tests`, whose second database numbers its ids differently), and the
+five measurements of the lane's brief (second project, restart, second home, wall time, the
+edit loop).
+
 ## Cold start as a fetch: the standard library (F4)
 
 2026-11-11. A machine that has never built std spends its first build on it (10 to 12 s for

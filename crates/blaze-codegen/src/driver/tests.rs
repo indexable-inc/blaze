@@ -87,6 +87,9 @@ struct Program {
     /// What stands in for the front end's query engine, for the walk over kept describes
     /// (`tests/kept.rs`).
     engine: Engine,
+    /// The describes this front end keeps as records and reads back (`tests/recorded.rs`):
+    /// `None`, it keeps none ([`Frontend::record_key`]'s default).
+    shelf: Option<std::sync::Arc<recorded::Shelf>>,
 }
 
 /// The front end's query engine, as [`Frontend::redescribe`] needs it: a revision an edit, the
@@ -178,6 +181,7 @@ impl Default for Program {
             limits: HashMap::default(),
             dyn_sites: HashMap::default(),
             engine: Engine::default(),
+            shelf: None,
         }
     }
 }
@@ -445,6 +449,30 @@ impl Frontend for Program {
 
     fn spell(&self, id: &u32) -> String {
         format!("f{id}")
+    }
+
+    fn record_key(&self, id: &u32, requester: &Origin) -> Option<blaze_cas::Key> {
+        self.shelf.as_ref()?.key(self, *id, requester)
+    }
+
+    fn from_record(
+        &self,
+        _: &u32,
+        _: &Origin,
+        bytes: &[u8],
+    ) -> Result<Described<u32, u32>, String> {
+        let shelf = self.shelf.as_ref().ok_or("a record given to a front end with no shelf")?;
+        shelf.read(bytes)
+    }
+
+    fn to_record(
+        &self,
+        id: &u32,
+        requester: &Origin,
+        described: &Described<u32, u32>,
+    ) -> Option<Vec<u8>> {
+        let shelf = self.shelf.as_ref()?;
+        Some(shelf.write(self.record_key(id, requester)?, described))
     }
 
     /// The kept describe holds when it was made at or after the last change of what a
@@ -1832,6 +1860,7 @@ mod later;
 mod masks;
 mod near;
 mod pieces;
+mod recorded;
 mod stop;
 mod walk;
 

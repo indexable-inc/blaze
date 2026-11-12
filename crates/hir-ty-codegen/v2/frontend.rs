@@ -47,6 +47,8 @@ use crate::{
     Instance, InstanceDef, exported_linkage, exported_static, exported_symbol, fncache, linked_symbol,
 };
 
+mod described;
+
 /// The build's database, `Sync` and shared by reference by every task. Nothing here locks.
 pub struct Databases<'db> {
     db: &'db Db,
@@ -91,6 +93,13 @@ pub struct HirFrontend<'db> {
     units: Option<Arc<Units>>,
     /// Which of the units given in this process `units` is ([`give_units`]).
     units_id: Option<u32>,
+    /// What a describe's store record is keyed by of the build ([`described::Stage`]): the
+    /// toolchain and `units` by content. `None` for a front end made with no policy, whose
+    /// describes are no records.
+    stage: Option<described::Stage>,
+    /// What this database read from describe records ([`described::Found`]), set with
+    /// `stage`.
+    found: Option<Arc<described::Found>>,
     // dyn: `reached` once a batch of the walk, `stopped` once a function compiled (2 ns
     // against its 50 to 200 µs), never per instruction
     checks: Option<&'db dyn BodyChecks>, // dyn: never per instruction, as above
@@ -529,6 +538,8 @@ impl<'db> HirFrontend<'db> {
             image: false,
             units: None,
             units_id: None,
+            stage: None,
+            found: None,
             checks: None,
             stop: None,
             devirt: Default::default(),
@@ -554,6 +565,8 @@ impl<'db> HirFrontend<'db> {
     /// It leaves whether the build links a dependency image to [`Self::with_image`].
     pub fn with_policy(mut self, policy: &Policy) -> Self {
         let (id, units) = give_units(Units::of(self.databases.db, policy));
+        self.stage = Some(described::Stage::of(policy, &units));
+        self.found = Some(described::found_of(self.databases.db));
         (self.units, self.units_id) = (Some(units), Some(id));
         self
     }
@@ -1112,15 +1125,44 @@ impl Frontend for HirFrontend<'_> {
         requester: &Origin,
         was: &Described<HirInstance, HirStatic>,
     ) -> Result<Option<Described<HirInstance, HirStatic>>, CodegenError> {
-        self.with(|db| match self.memoed(db, instance, requester) {
-            Memoed::Described(Ok(now)) if now == was => Ok(None),
-            // clone: copied out of the database's memo, once per function whose describe changed
-            Memoed::Described(now) => now.clone().map(Some),
-            Memoed::NamesFiles => {
-                let now = self.described(db, instance, requester, self.devirt.world())?;
-                Ok((now != *was).then_some(now))
+        self.with(|db| {
+            // Read from its record in this database, under a key that is still its key: the
+            // record is the describe, and the memo was never run for it.
+            if self.found_holds(db, instance, requester) {
+                return Ok(None);
+            }
+            match self.memoed(db, instance, requester) {
+                Memoed::Described(Ok(now)) if now == was => Ok(None),
+                // clone: copied out of the database's memo, once per function whose describe changed
+                Memoed::Described(now) => now.clone().map(Some),
+                Memoed::NamesFiles => {
+                    let now = self.described(db, instance, requester, self.devirt.world())?;
+                    Ok((now != *was).then_some(now))
+                }
             }
         })
+    }
+
+    fn record_key(&self, instance: &HirInstance, requester: &Origin) -> Option<blaze_cas::Key> {
+        self.with(|db| self.record_key_in(db, instance, requester))
+    }
+
+    fn from_record(
+        &self,
+        instance: &HirInstance,
+        requester: &Origin,
+        bytes: &[u8],
+    ) -> Result<Described<HirInstance, HirStatic>, String> {
+        self.with(|db| self.from_record_in(db, instance, requester, bytes))
+    }
+
+    fn to_record(
+        &self,
+        instance: &HirInstance,
+        requester: &Origin,
+        described: &Described<HirInstance, HirStatic>,
+    ) -> Option<Vec<u8>> {
+        self.with(|db| self.to_record_in(db, instance, requester, described))
     }
 
     fn describe_static(
@@ -1153,8 +1195,11 @@ impl Frontend for HirFrontend<'_> {
     fn counted(&self, functions: &[(HirInstance, Origin)]) -> Vec<Counted> {
         self.with(|db| {
             // clone: the query's key by value, a few `Copy` ids in a `Clone`-only type
-            let counted = |(instance, _): &(HirInstance, Origin)| {
-                counted_memo(db, instance.clone(), ())
+            // What a record read in this database says of it, where one does: working it
+            // out reads the function's optimized body (`compiled_by_user`).
+            let counted = |(instance, _): &(HirInstance, Origin)| match self.found_counted(instance) {
+                Some(counted) => counted,
+                None => counted_memo(db, instance.clone(), ()),
             };
             // alloc: once per describe that reaches new functions, sized by them
             functions.iter().map(counted).collect()
@@ -1240,7 +1285,12 @@ impl Frontend for HirFrontend<'_> {
     /// database's memo. Whether a body names a file is the memo's own value, so a body that
     /// starts or stops naming one is a changed key, and the walk asks this again then.
     fn each_build(&self, instance: &HirInstance, requester: &Origin) -> bool {
-        self.with(|db| matches!(self.memoed(db, instance, requester), Memoed::NamesFiles))
+        // One read from its record names no file (such a describe is never a record), and
+        // asking the memo would run the describe the record stood in for.
+        self.with(|db| {
+            !self.found_holds(db, instance, requester)
+                && matches!(self.memoed(db, instance, requester), Memoed::NamesFiles)
+        })
     }
 
     /// A static whose value holds a file's name ([`MemoedStatic::NamesFiles`]), as

@@ -1192,6 +1192,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         let walk = Walk {
             described: redescribed + described,
             verified: asks.len() - redescribed + verified,
+            found: counts.found_so_far(),
             reached: nodes.len(),
             dropped: 0,
             fresh: None,
