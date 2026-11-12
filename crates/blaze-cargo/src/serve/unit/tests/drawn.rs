@@ -410,3 +410,80 @@ fn a_file_no_view_holds_is_drawn_from_the_text_its_record_keeps() {
     let refused = drawn::draw(&lost, &|_| None, &of, Drawing::default()).unwrap_err();
     assert!(refused.what.contains("target/out/gen.rs"), "{}", refused.what);
 }
+
+/// Each line of `code` (a source of the daemon's units) that reads how the job's client is
+/// shown diagnostics off the job's input, comments aside.
+fn reads_of_the_clients_drawing(code: &str) -> Vec<usize> {
+    let read = ["input.color", "input.short", "input.width", "input.refused"];
+    code.lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            let code = line.split("//").next().unwrap_or(line);
+            read.iter().any(|it| code.contains(it))
+        })
+        .map(|(at, _)| at + 1)
+        .collect()
+}
+
+fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        match path.is_dir() {
+            true => sources(&path, out),
+            false if path.extension().is_some_and(|it| it == "rs") => out.push(path),
+            false => {}
+        }
+    }
+}
+
+/// The guard of what this module holds: no code that makes a unit reads how the job's client
+/// is shown diagnostics. The one read of it is `compile::drawing`, whose `Drawing` is for
+/// `drawn::draw` and for a line said to the client as it is answered; a read anywhere else is
+/// how the width came to be in every record's key. Held by reading the units' sources, tests
+/// aside.
+#[test]
+fn no_unit_reads_how_its_client_is_shown_diagnostics_but_to_draw_them() {
+    let unit = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/serve");
+    let mut files = vec![unit.join("unit.rs")];
+    sources(&unit.join("unit"), &mut files);
+    assert!(files.len() > 20, "the units' sources are under {}", unit.display());
+    let mut found = Vec::new();
+    let mut the_one = 0;
+    for file in files {
+        let name = file.strip_prefix(&unit).unwrap().to_string_lossy().into_owned();
+        if name.ends_with("tests.rs") || name.contains("/tests/") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file).unwrap();
+        // `compile::drawing` is the one place: its four lines are not counted.
+        let (code, drawing) = match text.split_once("pub(super) fn drawing(job: &Job) -> Drawing {") {
+            Some((before, rest)) if name == "unit/compile.rs" => {
+                let (body, after) = rest.split_once("\n}\n").unwrap();
+                the_one += reads_of_the_clients_drawing(body).len();
+                // The lines of the body stay, emptied, so the lines after it keep their numbers.
+                (format!("{before}{}{after}", "\n".repeat(body.lines().count() + 1)), true)
+            }
+            _ => (text.clone(), false),
+        };
+        assert_eq!(drawing, name == "unit/compile.rs", "`compile::drawing` is in {name}");
+        for line in reads_of_the_clients_drawing(&code) {
+            found.push(format!("crates/blaze-cargo/src/serve/{name}:{line}"));
+        }
+    }
+    assert_eq!(the_one, 4, "`compile::drawing` reads the colour, the format, the width and `--refused`");
+    assert!(
+        found.is_empty(),
+        "these lines read how the job's client is shown diagnostics while a unit is made: what a \
+         unit says goes into its `drawn::Said` as what it says, and is drawn by `drawn::draw`; a \
+         line said as the client is answered takes `compile::drawing(job)`:\n{}",
+        found.join("\n")
+    );
+}
+
+#[test]
+fn the_oracle_catches_a_unit_that_reads_its_clients_width() {
+    let bad = "fn key(job: &Job) {\n    hasher.update(&job.input.width);\n}\n";
+    assert_eq!(reads_of_the_clients_drawing(bad), [2]);
+    let said = "// `job.input.width` is the client's\nlet it = drawing(job).width;\n";
+    assert_eq!(reads_of_the_clients_drawing(said), Vec::<usize>::new());
+}

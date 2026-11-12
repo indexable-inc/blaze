@@ -1610,7 +1610,7 @@ impl ScriptRun {
     }
 
     fn error(&mut self, what: String, out: &mut Vec<Response>) -> Option<bool> {
-        out.push(Response::Diagnostic(say::refused(what, self.of(), self.job.input.color)));
+        out.push(Response::Diagnostic(say::refused(what, self.of(), super::compile::drawing(&self.job).color)));
         self.state = State::Done;
         Some(false)
     }
@@ -1659,7 +1659,7 @@ impl ScriptRun {
             _ => Some(link_dirs.as_slice()),
         };
         let of = self.of();
-        let judged = judge(&start.unit, &start.env, &value, checked, of.as_ref(), job.input.color);
+        let judged = judge(&start.unit, &start.env, &value, checked, of.as_ref(), super::compile::drawing(&job).color);
         out.extend(judged.diagnostics.into_iter().map(Response::Diagnostic));
         if let Some(report) = judged.failure {
             out.push(Response::Report { unit: of, report });
