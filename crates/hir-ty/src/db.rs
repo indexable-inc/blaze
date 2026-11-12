@@ -1498,6 +1498,7 @@ pub mod kinds {
         SERVED_BODIES = 0x25e7, "ServedBodies";
         KEPT_CONSTS = 0x25e8, "KeptConsts";
         DIRECTORY_SLOT = 0x25e9, "DirectorySlot";
+        LIBRARY_IMPL_SLICES = 0x25ea, "LibraryImplSlices";
 
         // Interned ids.
         INTERNED_OPAQUE_TY = 0x25f0, "InternedOpaqueTyId";

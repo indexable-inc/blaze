@@ -1726,3 +1726,61 @@ fn the_oracle_catches_an_include_whose_file_is_not_kept() {
         "`lib` kept the map from before its included file gained `more`, and the oracle found no difference"
     );
 }
+
+/// The fields below `HIGH` that the rows of `db` read, as `Struct.field` with how many of
+/// each: what the durability census names.
+fn fields_below_high(db: &Db) -> Vec<(String, u64)> {
+    let census = blaze_query::db::Database::storage(db).durability_census();
+    census.blockers.iter().map(|it| (format!("{}.{}", it.ingredient, it.field), it.fields)).collect()
+}
+
+/// How many def maps (`crate_local_def_map`'s pairs) of kind below `HIGH` a row of `db` reads.
+fn def_maps_below_high(db: &Db) -> u64 {
+    fields_below_high(db)
+        .iter()
+        .filter(|(name, _)| name == "DefMapPair.def_map")
+        .map(|(_, fields)| *fields)
+        .sum()
+}
+
+const A_WORKSPACE_CRATE_OVER_A_LIBRARY: &str = r#"
+//- /main.rs crate:main deps:lib
+use lib::m::S;
+pub fn f() -> S { S }
+//- /lib.rs crate:lib KIND
+pub mod m;
+//- /m.rs
+pub struct S;
+pub fn g() {}
+"#;
+
+/// Asks `db` for the def map of each crate and the scopes of its modules.
+fn ask_every_def_map(db: &Db) {
+    for &krate in all_crates(db).iter() {
+        let map = crate_local_def_map(db, krate).def_map(db);
+        for (id, _) in map.modules(db) {
+            _ = map.module(db, id).scope(db).entries().count();
+        }
+    }
+}
+
+/// The invariant: a library crate's def map, and every row that reads it, is of kind `HIGH`: the
+/// table that finds its resolution is the libraries' own, apart from the workspace's
+/// (`publish::LibraryResolutions`), so the workspace crate's rows that read it read a `HIGH`
+/// field, and a workspace edit's walk has no row of the library to verify.
+#[test]
+fn a_library_crates_def_map_reads_nothing_below_high() {
+    let loaded = Loaded::new(&A_WORKSPACE_CRATE_OVER_A_LIBRARY.replace("KIND", "library new_source_root:library"));
+    ask_every_def_map(&loaded.db);
+    let fields = fields_below_high(&loaded.db);
+    assert_eq!(def_maps_below_high(&loaded.db), 0, "`main` reads `lib`'s def map below HIGH: {fields:?}");
+}
+
+/// The control: the same crate found through the workspace's table (a local crate, as every
+/// crate was found until 2026-11-12) has its def map below `HIGH`, and the count says so.
+#[test]
+fn the_oracle_catches_a_library_found_through_the_workspaces_table() {
+    let loaded = Loaded::new(&A_WORKSPACE_CRATE_OVER_A_LIBRARY.replace("KIND", "new_source_root:local"));
+    ask_every_def_map(&loaded.db);
+    assert_eq!(def_maps_below_high(&loaded.db), 1, "{:?}", fields_below_high(&loaded.db));
+}

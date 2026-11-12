@@ -618,7 +618,8 @@ impl Files {
             self.edit_root_files(&mut writer, db, root, |files| _ = files.alias_file(alias, of));
         }
         let file_root = file_root.source_root_id(&*db);
-        self.set_file_source_root_in(&mut writer, db, alias, file_root, Durability::MEDIUM);
+        let durability = root_durability(&writer, file_root);
+        self.set_file_source_root_in(&mut writer, db, alias, file_root, durability);
         let durability = file_durability(&writer, of);
         let text = self.text_input(of).map(|input| {
             // clone: a count of the bytes, which the alias shares
@@ -674,12 +675,13 @@ impl Files {
         edit: impl FnOnce(&mut SourceRoot),
     ) {
         let input = self.source_root(root);
+        let durability = root_durability(writer, root);
         let spare = writer.spare_root();
         let mut source_root =
-            input.set_source_root_field(db).with_durability(Durability::MEDIUM).to(spare);
+            input.set_source_root_field(db).with_durability(durability).to(spare);
         // clone: only for a set a reader still holds (copy on write)
         edit(Arc::make_mut(&mut source_root));
-        input.set_source_root_field(db).with_durability(Durability::MEDIUM).to(source_root);
+        input.set_source_root_field(db).with_durability(durability).to(source_root);
     }
 
     /// The text input of `file` while it has text.
@@ -1427,6 +1429,19 @@ fn file_durability(writer: &Writer, file: FileId) -> Durability {
     let is_library =
         root.and_then(|root| writer.root_contents.get(root)).is_some_and(|it| it.is_library);
     if is_library { Durability::HIGH } else { Durability::LOW }
+}
+
+/// The kind of what says which files a source root has and which root a file is in: `HIGH`
+/// for a library's root (the toolchain's crates, registry and git packages), whose file set
+/// moves only when a dependency does; `MEDIUM` for a local root, a workspace's structure. A
+/// library root's set stated `MEDIUM`, as every root's was until 2026-11-12, held each row
+/// that asked a library file for its root below `HIGH`
+/// (docs/v2/plan/design/restore.md, step b1).
+pub(crate) fn root_durability(writer: &Writer, root: SourceRootId) -> Durability {
+    match writer.root_contents.get(&root).is_some_and(|it| it.is_library) {
+        true => Durability::HIGH,
+        false => Durability::MEDIUM,
+    }
 }
 
 /// Puts in `root` the aliases of its files it lacks: a set given whole keeps the aliases a file
