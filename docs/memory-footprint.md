@@ -194,7 +194,7 @@ Built, each with before and after from the same script:
   the packed tier, and at a build's end (`blaze_query::db::reverse`). 267 to 106 MiB.
 - **mimalloc's huge pages are kept**, knowingly (`crates/blaze-engine/src/huge.rs` has the
   table): built with `no_thp` the daemon is 3,867 to 4,066 MiB and a body edit 3.5 s after the
-  last is 6% to 17% slower in four alternated pairs.
+  last is 5% to 22% slower in four alternated pairs (medians of 20 or 30).
 
 Together: 5,796 to 5,224 MiB resident (two runs each), with every edit-loop row within the
 runs' spread of the base's. With `no_thp` as well: 3,867 to 4,037 MiB.

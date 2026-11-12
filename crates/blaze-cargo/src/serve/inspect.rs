@@ -706,6 +706,7 @@ mod tests {
         let Answer::Refused(why) = inspector.answer(Asked { record: false, schema: SCHEMA + 1 }) else {
             panic!("a request of another schema was answered");
         };
-        assert!(why.contains("schema 2") && why.contains("answers schema 1"), "{why}");
+        let (asked, answers) = (format!("schema {}", SCHEMA + 1), format!("answers schema {SCHEMA}"));
+        assert!(why.contains(&asked) && why.contains(&answers), "{why}");
     }
 }
