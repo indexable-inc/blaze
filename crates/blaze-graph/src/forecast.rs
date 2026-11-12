@@ -126,7 +126,10 @@ impl Correction {
 
     /// `base`, the forecast admission's rules give a task of `kind`, corrected.
     pub fn corrected(&self, kind: TaskKind, base: u64) -> u64 {
-        self.scale(kind).apply(base)
+        // VARIANT: no correction is applied (test-the-cause for the cold build's stall: every
+        // work task was granted 66.1 GB, three filled the budget).
+        let _ = self.scale(kind);
+        base
     }
 
     /// A task of `kind` whose base forecast was `base` ended having held `peak` at most.
