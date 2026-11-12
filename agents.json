@@ -81,6 +81,15 @@
    "do": "Lanes only write: one worktree and branch each, small commits, pushed often; no VM, no cargo, no daemon. The main agent runs `python3 -I harness/v2/integrate.py '{\"branches\":[...],\"tests\":true}'`: it merges every branch into the integration worktree, builds once, and prints one table (edit loop beside Relax, stale answers, new project, restart, memory, disk, tests). Failures go back to the lane whose files they name. The script's paths are the Mac's today (integration worktree /Volumes/Projects/blaze-int-1112, Relax at /tmp/relax-src); moving it to the one build VM is open.",
    "why": "Rule fan-out-write-only as rewritten 2026-11-12: ten lanes each building in their own VM cost a cold build and hours each, and their numbers had to be redone on the combined tree anyway.",
    "state": "current"
+  },
+  {
+   "id": "H-cross-1",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane cross-1112",
+   "task": "Regenerate the symbol lists blaze-link ships (glibc by release, libSystem)",
+   "do": "glibc: put each release's sysdeps/unix/sysv/linux/{x86_64/64,aarch64}/*.abilist (older tags: .../nptl/, ports/...) under <dir>/<release>/<arch>/<lib>.abilist with <dir>/commits.json (release to tag commit, as crates/blaze-link/src/target/shipped/glibc-commits.json), then `blaze run -q -p scripts --bin cross -- '{\"command\": \"glibc-list\", \"abilists\": \"<dir>\", \"write\": true}'`. libSystem: on a Mac, `... '{\"command\": \"darwin-list\", \"sdk\": \"$(xcrun --sdk macosx --show-sdk-path)\", \"write\": true}'`, and set MACOS_SDK in target/shipped.rs to that SDK's version. Without `write` both compare and fail on a difference.",
+   "why": "The lists are bytes of the blaze binary and inputs of every link of Rust alone; a hand edit would not be reproducible. The files in the tree on 2026-11-12 were written by a Python prototype of the same algorithm, since a lane may not build: the first run of the Rust generator must show it writes the same bytes.",
+   "state": "current"
   }
  ],
  "annoyances": [
@@ -1220,6 +1229,42 @@
    "cause": "commit 2476469518 (2026-11-10) added the new row and left the old one; nothing checks a table for two rows with the same first cells",
    "workaround": "merged into one true row",
    "fix": "the docs check refuses a table with two rows whose first two cells are equal",
+   "state": "open"
+  },
+  {
+   "id": "A-cross-1",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane cross-1112",
+   "where": "docs/v2/plan/design/toolchain-c.md, \"Linux libc\"",
+   "what": "The plan says glibc 2.28 has every symbol std's Linux code links. A blaze-built hello world on aarch64 Linux (readelf --dyn-syms, 2026-11-12) imports fstat64, stat64, lstat64 and fstat at GLIBC_2.33: before 2.33 they are wrappers in libc_nonshared.a around __fxstat64 and its kin, not symbols of libc.so.6.",
+   "cost": "an hour designing around a default the plan called settled",
+   "cause": "the claim was reasoned from rustc's 2.17 floor, which holds only with libc_nonshared.a on the link line; nothing measured it",
+   "workaround": "the start object blaze-link ships carries the eight stat wrappers for a release before 2.33",
+   "fix": "the plan's sentence corrected in the same change; the row's check links std at the default release",
+   "state": "open"
+  },
+  {
+   "id": "A-cross-2",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane cross-1112",
+   "where": "the lane rule (write only) and scripts/",
+   "what": "A new script must be Rust (tools/python-allowed.txt takes no new file) and a lane may not run cargo or blaze on the Mac, so a generator of checked-in data cannot be run by the lane that writes it; the data was produced with a Python prototype kept outside the tree.",
+   "cost": "two implementations of two generators; the Rust ones are unrun",
+   "cause": "the two rules were written for different cases and meet at data generators",
+   "workaround": "a prototype, and a how-to row (H-cross-1) saying the Rust generator must be shown to write the same bytes",
+   "fix": "a lane may run `blaze run -p scripts --bin <name>` for a script that only reads and writes files, or the loop takes a script to run",
+   "state": "open"
+  },
+  {
+   "id": "A-cross-3",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane cross-1112",
+   "where": "lanebase-1112 /root/loop.sh",
+   "what": "A queued call printed nothing for over twenty minutes (twice); the first time the queue was held by a daemon that inherited the lock. A call's output is only shown when it ends, so a waiting caller cannot tell queued from building from hung.",
+   "cost": "about fifty minutes of waiting across two calls",
+   "cause": "one lock, no line saying who holds it or how many wait",
+   "workaround": "did the reading and data work meanwhile",
+   "fix": "the loop prints `waiting behind <branch> (<seconds> s)` every 30 s, unbuffered",
    "state": "open"
   }
  ]
