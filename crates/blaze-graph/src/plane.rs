@@ -2876,7 +2876,16 @@ impl<M: Memo> Plane<M> {
             let free_at_turn = at_turn.saturating_sub(self.charged());
             let held_besides = self.held.saturating_sub(self.granted);
             let by_grants = at_turn.saturating_sub(self.granted);
-            if memory <= by_grants {
+            // Nor is a task that asks the whole ceiling (one never measured, which runs
+            // alone) short of anything: no amount let go makes it fit beside a granted task,
+            // and with none granted it starts whatever the process holds. Counted short of all
+            // that is held besides, the first build of a second project let go of every other
+            // checkout's kept front end as its program's codegen waited for the units before
+            // it to end, and the next edit of the first project lowered anew (13 s where an
+            // edit takes 1 s; the daemon's log said "a task waits for 7.45 GiB", 2026-11-12).
+            // Memory that is short in fact is the pressure cap's and the ceiling guard's to
+            // answer, by a measure, where this is a guess.
+            if memory <= by_grants && memory < ceiling {
                 self.short = memory.saturating_sub(free_at_turn).min(held_besides);
             }
         }

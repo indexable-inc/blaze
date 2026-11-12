@@ -898,6 +898,32 @@ fn a_task_that_fits_the_budget_starts_alone_whatever_the_process_holds() {
     assert_eq!(runs(&built(&mut plane, 2)), [3]);
 }
 
+/// A task that asks the whole budget (one never measured, which runs alone) is short of
+/// nothing the process holds besides its grants: behind a granted task no amount let go
+/// starts it, and once nothing granted runs it starts whatever is held. So the driver lets
+/// go of no kept front end for it (a second project's first build let go of the first
+/// project's, whose next edit then lowered anew). A task of 7 in its place is short of 5
+/// (`a_task_that_fits_the_budget_starts_alone_whatever_the_process_holds`): letting go there
+/// does start it beside the grant.
+#[test]
+fn a_task_that_asks_the_whole_budget_is_short_of_nothing() {
+    let mut plane = Plane::new(PlaneConfig { budget: budget(10), ..config(1, 2) }).unwrap();
+    open(&mut plane, 1, 1, true);
+    plane.step(PlaneInput::Held { at_ns: 0, bytes: 4 }).unwrap();
+    assert_eq!(runs(&add(&mut plane, 1, vec![node(1, &[], Pool::Work, 1000, None, 2)])), [1]);
+    plane.step(PlaneInput::Held { at_ns: 0, bytes: 8 }).unwrap();
+    // 10 asked of 10, 2 granted: it cannot start beside the grant whatever is let go.
+    assert_eq!(
+        runs(&add(&mut plane, 1, vec![node(2, &[], Pool::Work, 100, None, 10)])),
+        Vec::<u32>::new()
+    );
+    assert!(plane.held_back());
+    assert_eq!(plane.short(), 0, "letting go of the 6 held besides would not start it");
+    let out = built(&mut plane, 1);
+    assert_eq!(runs(&out), [2], "nothing granted memory runs: it starts though 8 are held");
+    assert_eq!(plane.short(), 0);
+}
+
 /// A task the room between two turns of the machine's ledger holds back is short of nothing:
 /// the next turn starts it, so the driver lets go of no kept front end for it. Counted against
 /// the room it was short of all the process holds besides its grants, at every build.
