@@ -42,9 +42,12 @@ fn link(to: &str, output: Output, natives: Vec<Native<'_>>) -> Result<Vec<u8>, L
     Ok(contents(disk.file(to)))
 }
 
-/// `libtv.so`, linked by the linker itself: it exports the thread-local `imported`.
+/// `libtv.so`, linked by the linker itself: it exports the thread-local `imported` and
+/// `imported_here`, which gives its address as the library finds it, through a descriptor
+/// (a shared library's are kept).
 fn library() -> Arc<[u8]> {
-    let kind = OutputKind::Shared { name: "libtv.so".into(), exports: vec!["imported".into()] };
+    let exports = ["imported", "imported_here"].map(str::to_owned).to_vec();
+    let kind = OutputKind::Shared { name: "libtv.so".into(), exports };
     let tv: Arc<[u8]> = TV.into();
     let object =
         Native { id: id(101), name: "/x/tv.o", bytes: &tv, kind: NativeKind::Object, order: 0 };
@@ -195,7 +198,7 @@ fn an_executables_tls_descriptors_are_relaxed_and_it_reads_its_thread_locals() {
         status.code(),
         Some(0),
         "{}: {status}: bits 1 and 2 are `own`, 4 and 8 `zeroed`, 16 and 32 `imported`, 64 two \
-         thread-locals at one address",
+         thread-locals at one address, 128 `imported` at another address than its library finds it",
         program.display()
     );
 }

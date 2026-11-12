@@ -6,6 +6,7 @@
 //   gcc -c -O1 -fPIC -ffreestanding -fno-stack-protector -fno-asynchronous-unwind-tables \
 //       -mtls-dialect=desc -o main.o main.c
 extern __thread int imported;
+int *imported_here(void);
 __thread int own = 40;
 static __thread long zeroed;
 
@@ -32,5 +33,6 @@ void _start(void) {
     *imported_at() = 6;
     if (imported != 6) bad |= 32;
     if ((void *)own_at() == (void *)zeroed_at() || (void *)own_at() == (void *)imported_at()) bad |= 64;
+    if (imported_here() != imported_at()) bad |= 128;
     leave(bad);
 }
