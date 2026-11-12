@@ -1194,7 +1194,10 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
 #[blaze_query::tracked(returns(copy))]
 pub fn body_check_clean(db: &Db, def: DefWithBodyId, style_lints: bool) -> bool {
     #[cfg(test)]
-    tests::CHECKED.lock().push((db.nonce_and_revision().0, def));
+    {
+        tests::CHECKED.lock().push((db.nonce_and_revision().0, def));
+        tests::CHECKED_ON.lock().push((db.nonce_and_revision().0, std::thread::current().id()));
+    }
     super::check_body(db, def, style_lints).is_empty()
 }
 

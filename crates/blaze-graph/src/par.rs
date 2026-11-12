@@ -567,7 +567,7 @@ pub fn for_each_giving_way(
 }
 
 /// The most items a loop runs on its calling thread as a small loop ([`Small`]).
-pub const SMALL_ITEMS: usize = 8;
+pub const SMALL_ITEMS: usize = 32;
 
 /// A loop predicted to cost less than this, in nanoseconds, runs on its calling thread: a
 /// few milliseconds, under which a dispatch (a job pushed, a worker woken, the caller parked

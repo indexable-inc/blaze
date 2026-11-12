@@ -188,6 +188,9 @@ pub(crate) enum Plant {
     NamesEqualRows,
     /// The walk passes over a row whose value was evicted.
     SkipsEvictedRows,
+    /// The walk follows no reverse edge out of an input field that was written: the rows
+    /// that read what an edit wrote are never asked, so nothing the edit changed is found.
+    ForgetsReadersOfWritten,
 }
 
 /// The storage's part of the changed set.
@@ -274,6 +277,16 @@ impl Storage {
     #[cfg(test)]
     pub(crate) fn plant_in_changed_set(&mut self, plant: Plant) {
         self.frontier.plant = plant;
+    }
+
+    /// Plants [`Plant::ForgetsReadersOfWritten`] in this storage's changed set: for the
+    /// control of a host's test that an edit reaches what reads it (hir's body check), which
+    /// cannot name the engine's own plants. With the reverse edges out of a written input
+    /// dropped, every row is taken as unchanged after an edit, and the host's oracle, a build
+    /// from scratch, must say so. Never called outside a test.
+    #[doc(hidden)]
+    pub fn plant_forgotten_readers_of_written(&mut self) {
+        self.frontier.plant = Plant::ForgetsReadersOfWritten;
     }
 
     /// An input field's node was written (with `&mut`: its setter).
@@ -646,7 +659,12 @@ fn walk(db: *const (), storage: &Storage) {
         })
         .collect();
 
-    let mut changed: Vec<u32> = taken.written.clone(); // alloc: a walk's lists, what the edit reaches
+    // alloc: a walk's lists, what the edit reaches
+    let mut changed: Vec<u32> = match plant {
+        Plant::ForgetsReadersOfWritten => Vec::new(),
+        // clone: the written fields, a word each; `taken` keeps them should the walk unwind
+        _ => taken.written.clone(),
+    };
     let mut found: Vec<u32> = Vec::new(); // alloc: as above
     let mut suspects: Vec<u32> = Vec::new(); // alloc: as above
     for &node in &taken.untracked {
