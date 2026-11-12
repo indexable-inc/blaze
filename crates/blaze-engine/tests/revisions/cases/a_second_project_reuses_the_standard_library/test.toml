@@ -1,4 +1,4 @@
-about = "A second project, in another directory and of another name, built by a daemon that has built one: the standard library's units are the ones the first project's build left (2026-11-11: each of the 26 was made again, as every crate of the library held the asking workspace's root), so only the project's own unit is made, whatever the library's size."
+about = "A second project, in another directory and of another name, built by a daemon that has built one: the standard library's units are the ones the first project's build left (2026-11-11: each of the 26 was made again, as every crate of the library held the asking workspace's root), so only the project's own unit is made and only its `main` and the program's entry are compiled, whatever the library's size."
 drivers = ["real"]
 
 [[revision]]
@@ -9,6 +9,7 @@ prints = "one\n"
 steps = ["project two", "edit"]
 action = "run"
 prints = "two\n"
+redone = ["main", "two::main"]
 max_units = 1
 max_executed = 20000
 
