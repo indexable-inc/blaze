@@ -1298,9 +1298,11 @@ impl Screen {
                 line.push(Role::Strong, format!("{} failed", tests.failed)); // alloc: as above
                 line.push(Role::Plain, format!(" {dot} {} passed", tests.passed)); // alloc: as above
             }
-            // A run of no test passed nothing: never drawn as a pass.
+            // A run of no test passed nothing: it is a failure (the command refuses it), and
+            // is drawn as one.
             false if tests.passed == 0 => {
-                line.push(Role::Warned, format!("{} no test ran", self.glyph("⚠", "!"))); // alloc: as above
+                line.push(Role::Failed, format!("{} ", self.glyph("✗", "x"))); // alloc: as above
+                line.push(Role::Strong, "no test ran");
             }
             false => {
                 line.push(Role::Done, format!("{} ", self.glyph("✓", "ok"))); // alloc: as above

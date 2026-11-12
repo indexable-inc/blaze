@@ -697,6 +697,10 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
                 .collect(),
             unbuilt: u32::try_from(self.left).unwrap_or(u32::MAX),
             fixable: self.fixable,
+            // What the build added to blaze's state: the daemon does not say yet.
+            store_delta_bytes: None,
+            store_bytes: None,
+            volume_free_bytes: None,
             program,
             next,
             why_follows: why.is_some(),
@@ -732,6 +736,16 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
         self.out.flush()?;
         self.err.draw()
     }
+}
+
+/// A build at least this long ends with a pointer to `blaze slow`.
+const SLOW_BUILD: Duration = Duration::from_secs(30);
+
+/// rustc's closing lines, which the build's own last line replaces.
+fn summarizes(message: &str) -> bool {
+    message.starts_with("aborting due to")
+        || message.ends_with(" warning emitted")
+        || message.ends_with(" warnings emitted")
 }
 
 /// One cause of a build's why (`Rebuilt::summary`'s report of it), as the screen takes it:
