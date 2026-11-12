@@ -1764,6 +1764,8 @@ enum Planted {
     DeltaOmitsRemoved,
     /// A `Built` given back keeps the rows of the functions the build removed.
     StaleBuilt,
+    /// A walk kept by a front end that may close dyn facts is patched once it closes none.
+    PatchesClosed,
 }
 
 /// How many of a walk's functions are reached each way: what [`rebind`] counted, and the span

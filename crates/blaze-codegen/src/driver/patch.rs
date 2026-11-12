@@ -143,6 +143,8 @@ pub(super) struct Walked<I, S> {
     /// The front end's view ([`Frontend::view`]) from before the walk: what the next build
     /// asks the changed set since ([`Frontend::changed_since`]).
     ///
+    /// What it does not cover is in `closes`.
+    ///
     /// Why it is the whole key of what the walk holds of the front end (rule
     /// keys-cover-every-input). Every item's describe and count here are the front end's
     /// answers in this view or a later one with no write between. The front end's changed
@@ -157,6 +159,14 @@ pub(super) struct Walked<I, S> {
     nodes: Arc<Sorted<InstanceKey, super::FnNode<I, S>>>,
     statics: Sorted<StaticId, super::StaticNode<I, S>>,
     keep: Keep<I, S>,
+    /// Whether the front end that made the walk may close facts of the whole program
+    /// ([`Frontend::closes`]). Its describes are then against those facts, which are made
+    /// from a whole walk and are in no changed set: such a walk is never patched, by a front
+    /// end that closes none either (a program whose one call through a `dyn` an edit
+    /// removed, a profile that stops inlining). Until 2026-11-12 only the patching build's
+    /// front end was asked, and a build after such an edit kept a function the edit removed
+    /// and its caller's code direct to it.
+    closes: bool,
 }
 
 /// What a whole walk hands the build beside its result, for the walk to be kept
@@ -437,6 +447,9 @@ impl<'a, B: Prepare> Build<'a, B> {
             || walked.policy != policy
         {
             return Err("the kept walk is of other roots or another policy");
+        }
+        if walked.closes && self.planted != Some(Planted::PatchesClosed) {
+            return Err("the kept walk is of a front end that may close dyn facts, which its describes are against");
         }
         if walked.view != view {
             return Err("a durable input was written since the kept walk");
@@ -1368,6 +1381,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             nodes,
             statics,
             keep,
+            closes: self.frontend.closes(),
         };
         kept.keep_walk(program, walked);
     }

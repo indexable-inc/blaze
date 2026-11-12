@@ -62,8 +62,7 @@ pub struct LinkInputs {
     pub work: InputsWork,
 }
 
-/// What making a link's inputs did, counted: after an edit each count follows the edit, but
-/// `verified`, which follows the workspace's bodies the code names.
+/// What making a link's inputs did, counted: after an edit each count follows the edit.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct InputsWork {
     /// Items resolved to what has span tables.
@@ -73,8 +72,8 @@ pub struct InputsWork {
     pub scanned: usize,
     /// Functions and statics whose relocations and lines were read for the anchors they name.
     pub functions: usize,
-    /// Bodies and declarations whose positions were asked of the database again: those not
-    /// of library inputs alone, once a view.
+    /// Bodies and declarations whose kept tables were encoded again because the engine named
+    /// their positions as changed since the last link: the edit's, never the program's.
     pub verified: usize,
     /// Tables encoded, and their bytes.
     pub made: usize,
@@ -165,7 +164,7 @@ impl HirFrontend<'_> {
     /// while no library input was written, and a table is encoded only when its body's
     /// positions are other than they were.
     pub fn link_inputs(&self, built: &Built) -> Result<LinkInputs, CodegenError> {
-        self.with(|db| inputs(db, &self.hashes, built, false)).map_err(error)
+        self.with(|db| inputs(db, &self.hashes, built, Plant::None)).map_err(error)
     }
 
     /// Every span table `built`'s code names, by anchor, sorted, encoded: made whole, with
@@ -305,9 +304,14 @@ pub fn span_table_id(bytes: &[u8]) -> ContentId {
     ContentId::of(TABLE_DOMAIN, bytes)
 }
 
-/// How many programs' link inputs a process keeps ([`KEPT`]): the least recently linked goes
-/// when one more is made. Each holds hashes and counts, no table: about 300 bytes a function.
+/// How many programs' link inputs a process keeps of one database ([`KEPT`]): the least
+/// recently linked of that database goes when one more is made. Each holds hashes and counts,
+/// no table: about 300 bytes a function.
 const KEPT_LINKS: usize = 4;
+
+/// How many a process keeps in all: a daemon has one database; a test process has one a
+/// test, and those of a database nothing links any more go when this many are held.
+const KEPT_ALL: usize = 64;
 
 /// The link inputs kept, the last linked last.
 // alloc: none until a link, then a few programs' link inputs for the process's life
@@ -320,6 +324,21 @@ const NOTHING_KEPT: &str = "no link inputs are kept for this build or its base: 
                             of the program since the daemon started, or a link failed since";
 const LIBRARY_WRITTEN: &str = "a library input was written since the last link";
 const RENAMED: &str = "the build names a file otherwise than the last link did, or no longer";
+const UNNAMED: &str = "the query engine cannot name what changed since the last link";
+
+/// A bug planted in [`Kept::advance`], for the tests' controls.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(super) enum Plant {
+    #[default]
+    None,
+    /// The engine is not asked what changed: a body an edit moved keeps its old table
+    /// (`the_oracle_catches_a_moved_body_not_encoded_again`).
+    Unasked,
+    /// Every watched owner is taken as changed and its tables encoded again, as the link
+    /// did before it asked the engine's changed set: right tables, at a cost of the program
+    /// (`the_oracle_catches_a_link_that_asks_of_every_body`).
+    Sweeps,
+}
 
 /// What has span tables: a body, or a function's declaration.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -351,10 +370,9 @@ enum Namer {
     Static(ItemKey, ContentId),
 }
 
-/// An owner whose positions are asked of the database again each link: its stamp
-/// ([`stamp_of`]) as of the tables' encoding, and its tables the code names.
+/// An owner whose positions an edit can move: its tables the code names, encoded again when
+/// the engine names its positions as changed ([`Kept::verify`]).
 struct Watch {
-    stamp: u64,
     tables: Vec<(ContentId, Source)>,
 }
 
@@ -363,7 +381,7 @@ struct Watch {
 /// The invariant: `named` counts, for each anchor, the functions and statics of the build
 /// `built` that name it (`named_by`); `tables` holds exactly the anchors `named` holds, each
 /// with the id of its table as encoded in the view `view`; `watched` holds every owner of a
-/// table that is not of library inputs alone, with its stamp as of `view`.
+/// table kept that is not of library inputs alone, with those tables.
 struct Kept {
     database: base_db::Nonce,
     /// The tests' hashes ([`HashSource`]'s `ById`), whose anchors are others.
@@ -382,8 +400,8 @@ struct Kept {
     named: HashMap<ContentId, u32, Global>,
     tables: HashMap<ContentId, ContentId, Global>,
     watched: HashMap<Owner, Watch, Global>,
-    /// The owners seen durable ([`stamp_of`]) in `durable_view`: not asked again while it is
-    /// the view.
+    /// The owners seen durable ([`is_durable`]) in `durable_view`: no edit moves them while
+    /// it is the view.
     durable: HashSet<Owner, Global>,
     /// What the build calls each file a table names: the encodings hold the names, so a
     /// link that names one otherwise makes every table again.
@@ -431,12 +449,12 @@ fn by_id(hashes: &HashSource) -> bool {
     }
 }
 
-/// A count that is another each time `owner`'s positions are found again
-/// ([`positions_stamp`], [`declared_stamp`]), and whether they are of library inputs alone.
-fn stamp_of(db: &Db, owner: Owner) -> (u64, bool) {
+/// Whether `owner`'s positions, fetched in this view, are of library inputs alone: no write
+/// below a library's changes them.
+fn is_durable(db: &Db, owner: Owner) -> bool {
     match owner {
-        Owner::Body(it) => (positions_stamp(db, it), positions_stamp::durable(db, it)),
-        Owner::Declared(it) => (declared_stamp(db, it), declared_stamp::durable(db, it)),
+        Owner::Body(it) => positions::durable(db, it),
+        Owner::Declared(it) => crate::declaration_location::durable(db, it),
     }
 }
 
@@ -632,15 +650,13 @@ impl Kept {
                     watch.tables.push((anchor, source));
                 }
             } else if !self.durable.contains(&owner) {
-                match stamp_of(db, owner) {
-                    (_, true) => {
-                        self.durable.insert(owner);
-                    }
-                    (stamp, false) => {
-                        // alloc: per owner watched, its tables the code names, a few
-                        let tables = vec![(anchor, source)];
-                        self.watched.insert(owner, Watch { stamp, tables });
-                    }
+                // Its positions were fetched for the encoding, so the row is current.
+                if is_durable(db, owner) {
+                    self.durable.insert(owner);
+                } else {
+                    // alloc: per owner watched, its tables the code names, a few
+                    let tables = vec![(anchor, source)];
+                    self.watched.insert(owner, Watch { tables });
                 }
             }
             tables.push(Table { anchor, id, bytes });
@@ -696,15 +712,14 @@ impl Kept {
     /// Brings what is kept, of the build `self.built` in the view `self.view`, to `built` in
     /// the database's view now: the tables new or changed, and the anchors gone. `Ok(Err)`
     /// says why what is kept can't be brought there, and every table is to be made; what is
-    /// kept is then of no use. `plant` is the bug of
-    /// `the_oracle_catches_a_moved_body_not_encoded_again`: the watched owners are not asked.
+    /// kept is then of no use. `plant` is a control's bug ([`Plant`]).
     fn advance(
         &mut self,
         db: &Db,
         hashes: &HashSource,
         built: &Built,
         work: &mut InputsWork,
-        plant: bool,
+        plant: Plant,
     ) -> Result<Result<(Vec<Table>, Vec<ContentId>), &'static str>, String> {
         let (_, view) = db.nonce_and_revision();
         let durable_view = blaze_query::db::Database::storage(db).durable_view().as_u64();
@@ -751,6 +766,17 @@ impl Kept {
         for anchor in dropped {
             if !self.named.contains_key(&anchor) && self.tables.remove(&anchor).is_some() {
                 removed.push(anchor);
+                // A table gone is forgotten by its owner's watch, and an owner left with none
+                // is not watched: an owner whose item an edit removed has none.
+                let owner = self.sources.get(&anchor).map(|it| it.owner());
+                if let Some(owner) = owner
+                    && let Some(watch) = self.watched.get_mut(&owner)
+                {
+                    watch.tables.retain(|it| it.0 != anchor);
+                    if watch.tables.is_empty() {
+                        self.watched.remove(&owner);
+                    }
+                }
             }
         }
         removed.sort_unstable();
@@ -778,42 +804,55 @@ impl Kept {
         Ok(Ok((tables, removed)))
     }
 
-    /// Asks the database again for the positions of each watched owner, and encodes again
-    /// the kept tables of each whose positions were found again: those whose encoding is
-    /// another. An owner none of whose tables is kept is no longer watched, and not asked.
+    /// Encodes again the kept tables of each watched owner whose positions changed since the
+    /// view the tables are of, and gives those whose encoding is another. Which owners those
+    /// are is the engine's answer ([`positions`]' and `declaration_location`'s
+    /// `changed_since`, the changed set walked from what was written): a link asks of the
+    /// bodies an edit moved, never of every body it watches. The engine may name more than
+    /// changed (a file whose rows are a wide level of its walk is named whole): such a body's
+    /// tables are encoded again and found the same, a cost of that file. Until 2026-11-11 it asked a
+    /// stamp memo of each watched owner each link, 4,590 memos verified for a one-line edit
+    /// of hello world. An owner none of whose tables is kept is no longer watched.
     fn verify(
         &mut self,
         db: &Db,
         hashes: &HashSource,
         work: &mut InputsWork,
-        plant: bool,
+        plant: Plant,
     ) -> Result<Result<Vec<Table>, &'static str>, String> {
+        use blaze_query::db::{Changed, FromIdIn as _, View};
         // A file gone from the build has no name: its tables are of no use either.
         for (file, name) in &self.files {
             if hashes.file_name(db, *file).ok().as_ref() != Some(name) {
                 return Ok(Err(RENAMED));
             }
         }
-        // The tables gone are forgotten, and an owner left with none is not watched, before
-        // the database is asked: an owner whose item an edit removed has none, and its id is
-        // no longer one to ask about.
-        let tables = &self.tables;
-        self.watched.retain(|_, watch| {
-            watch.tables.retain(|it| tables.contains_key(&it.0));
-            !watch.tables.is_empty()
-        });
         // alloc: per link, the owners an edit moved, a few
         let mut moved: Vec<Owner> = Vec::new();
-        if !plant {
-            for (owner, watch) in self.watched.iter_mut() {
-                work.verified += 1;
-                let (now, _) = stamp_of(db, *owner);
-                if now != watch.stamp {
-                    watch.stamp = now;
-                    moved.push(*owner);
-                }
+        match plant {
+            Plant::Unasked => {}
+            Plant::Sweeps => moved.extend(self.watched.keys().copied()),
+            Plant::None => {
+                let since = View::from_u64(self.view);
+                let storage = blaze_query::db::Database::storage(db);
+                let (Changed::Keys(bodies), Changed::Keys(declared)) = (
+                    positions::changed_since(db, since),
+                    crate::declaration_location::changed_since(db, since),
+                ) else {
+                    return Ok(Err(UNNAMED));
+                };
+                // A key the engine names that is no owner's (an id of something an edit
+                // removed) is of no table kept: the delta took its namers.
+                let bodies = bodies
+                    .into_iter()
+                    .filter_map(|id| DefWithBodyId::from_id_in(storage, id).map(Owner::Body));
+                let declared = declared
+                    .into_iter()
+                    .filter_map(|id| FunctionId::from_id_in(storage, id).map(Owner::Declared));
+                moved.extend(bodies.chain(declared).filter(|it| self.watched.contains_key(it)));
             }
         }
+        work.verified += moved.len();
         // alloc: per link, the tables an edit changed, a few
         let mut changed = Vec::new();
         for owner in moved {
@@ -836,7 +875,7 @@ impl Kept {
 }
 
 /// [`HirFrontend::link_inputs`] over `db`.
-fn inputs(db: &Db, hashes: &HashSource, built: &Built, plant: bool) -> Result<LinkInputs, String> {
+fn inputs(db: &Db, hashes: &HashSource, built: &Built, plant: Plant) -> Result<LinkInputs, String> {
     let (database, _) = db.nonce_and_revision();
     let tests = by_id(hashes);
     let taken = {
@@ -878,7 +917,12 @@ fn inputs(db: &Db, hashes: &HashSource, built: &Built, plant: bool) -> Result<Li
         }
     };
     let mut all = KEPT.lock();
-    if all.len() >= KEPT_LINKS {
+    let same = |it: &Kept| it.database == kept.database;
+    if all.iter().filter(|it| same(it)).count() >= KEPT_LINKS {
+        let oldest = all.iter().position(same).expect("counted above");
+        all.remove(oldest);
+    }
+    if all.len() >= KEPT_ALL {
         all.remove(0);
     }
     all.push(kept);
@@ -905,26 +949,6 @@ pub fn span_tables_of(
     // alloc: per call, the tables as their reader takes them
     Ok(tables.into_iter().map(|it| (it.anchor, it.bytes)).collect())
 }
-
-/// A count that is another each time the positions of `owner` are found again
-/// ([`positions`] runs): its one input is that memo, so the database runs this only then,
-/// and a link that sees the count it kept knows the positions are the ones it encoded
-/// without reading them. The count itself means nothing and nothing is keyed by it.
-#[blaze_query::tracked(returns(copy))]
-fn positions_stamp(db: &Db, owner: DefWithBodyId) -> u64 {
-    let _ = positions(db, owner);
-    STAMP.fetch_add(1, Ordering::Relaxed)
-}
-
-/// [`positions_stamp`] of where `func` is declared.
-#[blaze_query::tracked(returns(copy))]
-fn declared_stamp(db: &Db, func: FunctionId) -> u64 {
-    let _ = crate::declaration_location(db, func);
-    STAMP.fetch_add(1, Ordering::Relaxed)
-}
-
-/// The next stamp.
-static STAMP: AtomicU64 = AtomicU64::new(1);
 
 /// A position: the file, its 1-based line and column, as `core::panic::Location` has them.
 pub(super) type Row = (base_db::FileId, u32, u32);

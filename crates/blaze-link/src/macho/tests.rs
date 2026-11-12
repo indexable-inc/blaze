@@ -1576,6 +1576,7 @@ fn delta<'a>(
         binds: &[],
         same_names,
         same_regions: true,
+        same_places: true,
         written,
         from,
     }

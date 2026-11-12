@@ -262,6 +262,9 @@ struct Program {
     /// gives it another key), whether the build has it, and whether its code names its
     /// patterns' table too (which changes what it is under the same key).
     bodies: Vec<(u8, bool, bool)>,
+    /// How many of the functions, the first, are in the crate's root file, which the edits
+    /// write; the others are in the file of a module `rest`, which no edit writes.
+    near: usize,
 }
 
 /// One step of a program's life.
@@ -280,16 +283,41 @@ enum Edit {
 
 impl Program {
     fn new(count: usize) -> Program {
-        Program { pad: 0, bodies: vec![(0, true, false); count] }
+        Program { pad: 0, bodies: vec![(0, true, false); count], near: count }
     }
 
-    fn text(&self) -> String {
-        let mut text = "\n".repeat(self.pad);
-        for (at, (edits, _, _)) in self.bodies.iter().enumerate() {
-            let body = "x + 1".to_owned() + &" + 1".repeat(*edits as usize);
+    /// `count` functions, the first `near` in the root file and the others in another.
+    fn split(count: usize, near: usize) -> Program {
+        Program { near, ..Program::new(count) }
+    }
+
+    fn functions(&self, of: std::ops::Range<usize>) -> String {
+        let mut text = String::new();
+        for at in of {
+            let body = "x + 1".to_owned() + &" + 1".repeat(self.bodies[at].0 as usize);
             text += &format!("pub fn f{at}(x: u32) -> u32 {{\n    {body}\n}}\n");
         }
         text
+    }
+
+    /// The root file's text: the file the edits write.
+    fn text(&self) -> String {
+        let mut text = "\n".repeat(self.pad) + &self.functions(0..self.near);
+        if self.near < self.bodies.len() {
+            text += "pub mod rest;\n";
+        }
+        text
+    }
+
+    /// The fixture of the program: its root file, and the other file where it has one.
+    fn fixture(&self) -> String {
+        match self.near < self.bodies.len() {
+            true => {
+                let rest = self.functions(self.near..self.bodies.len());
+                format!("//- /lib.rs\n{}//- /rest.rs\n{rest}", self.text())
+            }
+            false => self.text(),
+        }
     }
 
     fn apply(&mut self, edit: Edit) {
@@ -382,12 +410,16 @@ impl Program {
 
 /// `edits` applied to a program, each followed by a build and its link inputs; what the last
 /// link's inputs cost. `Err` names the first step after which the tables kept by applying
-/// each link's changes are not the tables made whole from the build. `plant` skips asking
-/// the database for the positions of the bodies kept.
-fn kept_is_whole(count: usize, edits: &[Edit], plant: bool) -> Result<InputsWork, String> {
-    let mut program = Program::new(count);
-    let fx = fixture::db(&program.text());
-    let file = fx.only_file();
+/// each link's changes are not the tables made whole from the build. `plant` is a control's
+/// bug ([`Plant`]).
+fn kept_is_whole(count: usize, edits: &[Edit], plant: Plant) -> Result<InputsWork, String> {
+    kept_is_whole_of(Program::new(count), edits, plant)
+}
+
+/// [`kept_is_whole`] of `program`.
+fn kept_is_whole_of(mut program: Program, edits: &[Edit], plant: Plant) -> Result<InputsWork, String> {
+    let fx = fixture::db(&program.fixture());
+    let file = fx.file(0);
     let mut db = fx.into_db();
     let file = file.file_id(&db);
     let hashes = || HashSource::Items(ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned()))));
@@ -401,6 +433,10 @@ fn kept_is_whole(count: usize, edits: &[Edit], plant: bool) -> Result<InputsWork
         program.apply(edit);
         db.set_file_text(file, &program.text());
         let frontend = HirFrontend::new(Databases::new(&db), hashes(), BuildTime::default());
+        // A build walks the engine's changed set before its link (its body check does), so
+        // each walk is of one build's writes: without it the first link's walk is of
+        // everything written since the database was made, a wide level that names every row.
+        blaze_query::db::plumbing::walk_changed_set(&db);
         let built = program.built(&db, &frontend.hashes, before.as_ref());
         let given = frontend.with(|db| inputs(db, &frontend.hashes, &built, plant))?;
         if given.serial != serial {
@@ -457,19 +493,19 @@ fn edit(tc: &hegel::TestCase) -> Edit {
 #[hegel::test]
 fn the_link_inputs_kept_are_the_tables_made_whole(tc: hegel::TestCase) {
     let edits: Vec<Edit> = tc.draw(gs::vecs(edit()).max_size(8));
-    if let Err(why) = kept_is_whole(4, &edits, false) {
+    if let Err(why) = kept_is_whole(4, &edits, Plant::None) {
         panic!("{why}");
     }
 }
 
 /// A control of [`the_link_inputs_kept_are_the_tables_made_whole`]: with a link that does
-/// not ask the database for the positions of the bodies it kept, a reformat leaves every
-/// table on its old lines, and the oracle says at which step.
+/// not ask the engine which bodies' positions changed, a reformat leaves every table on its
+/// old lines, and the oracle says at which step.
 #[test]
 fn the_oracle_catches_a_moved_body_not_encoded_again() {
     let edits = [Edit::Reformat];
-    kept_is_whole(4, &edits, false).unwrap();
-    let why = kept_is_whole(4, &edits, true).expect_err("the oracle missed tables left stale");
+    kept_is_whole(4, &edits, Plant::None).unwrap();
+    let why = kept_is_whole(4, &edits, Plant::Unasked).expect_err("the oracle missed tables left stale");
     assert!(why.contains("after step 1"), "{why}");
 }
 
@@ -477,26 +513,48 @@ fn the_oracle_catches_a_moved_body_not_encoded_again() {
 /// gone are said, so a link holds no table the code does not name.
 #[test]
 fn a_function_gone_takes_its_tables() {
-    kept_is_whole(4, &[Edit::Drop(2), Edit::Patterns(0), Edit::Add(2), Edit::Patterns(0)], false)
-        .unwrap();
+    let edits = [Edit::Drop(2), Edit::Patterns(0), Edit::Add(2), Edit::Patterns(0)];
+    kept_is_whole(4, &edits, Plant::None).unwrap();
+}
+
+/// The functions in the file the counter edits ([`Program::split`]): few enough that the
+/// engine's walk of the edit verifies each row the file's text reaches. A file whose rows
+/// are a wide level of that walk (64 rows) is named whole, its unchanged bodies with it, and
+/// the link then encodes that file's kept tables again and finds them the same: the file's
+/// cost, never the program's.
+const NEAR: usize = 8;
+
+/// What one body edit among `count` functions costs the link inputs, as the counter holds
+/// it: tables encoded, their bytes, functions read, and owners whose kept tables were encoded
+/// again. The edited function's file holds [`NEAR`] of the functions.
+fn body_edit_cost(count: usize, plant: Plant) -> (usize, usize, usize, usize) {
+    let work = kept_is_whole_of(Program::split(count, NEAR), &[Edit::Body(7)], plant).unwrap();
+    assert_eq!(work.whole, None, "{count} functions: the link before was kept");
+    assert_eq!((work.items, work.scanned), (0, 0), "{count} functions: no item is new");
+    assert_eq!(work.functions, 1, "{count} functions: one function has a new key");
+    (work.made, work.bytes, work.functions, work.verified)
 }
 
 /// The counter: after one body edit, the link inputs resolve no item, read the one function
-/// whose key is new and encode that body's tables, among 100 functions as among 2,000 (a
-/// fixture of 10,000 bodies takes minutes to lower). What still follows the program here is
-/// `verified`: every body of this fixture is the workspace's, so each is asked of the
-/// database again; a library's are not (`Kept::durable`), which no fixture crate is.
+/// whose key is new, encode that body's tables, and encode again the kept tables of the
+/// owners the engine names as moved, among 100 functions as among 2,000 (a fixture of 10,000
+/// bodies takes minutes to lower). Every body of this fixture is the workspace's and watched;
+/// none is asked of the database for being watched, and none of another file than the
+/// edit's is looked at.
 #[test]
 fn a_body_edit_among_many_makes_its_own_tables() {
-    let mut costs = Vec::new();
-    for count in [100, 2_000] {
-        let work = kept_is_whole(count, &[Edit::Body(7)], false).unwrap();
-        assert_eq!(work.whole, None, "{count} functions: the link before was kept");
-        assert_eq!((work.items, work.scanned), (0, 0), "{count} functions: no item is new");
-        assert_eq!(work.functions, 1, "{count} functions: one function has a new key");
-        assert!(work.made <= 2 && work.bytes <= 1024, "{count} functions: {work:?}");
-        assert_eq!(work.verified, 2 * count, "each body and declaration of the workspace");
-        costs.push((work.made, work.bytes, work.functions));
-    }
+    let costs = [100, 2_000].map(|count| body_edit_cost(count, Plant::None));
+    let (made, bytes, _, verified) = costs[0];
+    assert!(made <= 4 && bytes <= 2048 && verified <= 2, "100 functions: {:?}", costs[0]);
     assert_eq!(costs[0], costs[1], "the same work among 100 functions as among 2,000");
+}
+
+/// The control of [`a_body_edit_among_many_makes_its_own_tables`]: a link that takes every
+/// watched owner as moved (what it did while it asked a stamp of each) gives the right
+/// tables, and the counter says its work follows the program.
+#[test]
+fn the_oracle_catches_a_link_that_asks_of_every_body() {
+    let costs = [100, 2_000].map(|count| body_edit_cost(count, Plant::Sweeps));
+    assert_ne!(costs[0], costs[1], "a sweep of every watched owner was counted as the edit's");
+    assert!(costs[1].3 >= 2_000, "2,000 functions: {:?}", costs[1]);
 }

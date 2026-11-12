@@ -364,8 +364,9 @@ impl Order<'_> {
 /// What `krate` keeps by name, as roots.
 fn add_kept(db: &Db, krate: Crate, listed: &mut Listed) {
     let kept = kept::kept(db, krate);
-    for &func in &kept.functions {
-        listed.function(db, func);
+    for instance in kept::kept_roots(db, krate).iter() {
+        // clone: once a root, the list's own of the memo's instance
+        listed.instance(instance.clone());
     }
     for &value in &kept.statics {
         listed.static_(HirStatic(value));
