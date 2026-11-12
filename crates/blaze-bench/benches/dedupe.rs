@@ -8,6 +8,12 @@
 //!   later: [`RUN`] + 1 rounds. 1 in [`EXPORTED`] functions is exported and never folds. An
 //!   iteration copies the build and folds it; the copy is the same on both sides of a pair.
 //!
+//! - `dedupe/generic_chains_keeping`: the same, keeping the originals as a build kept by rows
+//!   does (`dedupe_keeping` with `Originals`);
+//! - `dedupe/long_chains`: the same functions in runs of [`LONG_RUN`]: [`LONG_RUN`] + 1 rounds;
+//! - `dedupe/floor/clone` and `dedupe/floor/code_ids`: what an iteration costs before any
+//!   fold, the copy of the build and one code ID a function, the least a fold can take.
+//!
 //! The fold is the only call into `blaze_codegen`, in [`fold`], so that the binary of a base
 //! whose `dedupe` takes other arguments is this file with that one line changed.
 
@@ -21,6 +27,7 @@ const BODIES: usize = 4096;
 const INSTANCES: usize = 8;
 const CLASSES: usize = 3;
 const RUN: usize = 8;
+const LONG_RUN: usize = 64;
 const EXPORTED: usize = 64;
 
 fn key(body: usize, instance: usize) -> InstanceKey {
@@ -30,12 +37,12 @@ fn key(body: usize, instance: usize) -> InstanceKey {
 
 /// Instance `instance` of `body`: 48 bytes of code saying its body and class, and a call to
 /// the same instance of the body before it unless it starts a run.
-fn function(body: usize, instance: usize) -> CompiledFunction {
+fn function(body: usize, instance: usize, run: usize) -> CompiledFunction {
     let class = (instance % CLASSES) as u8;
     let mut code = vec![0x90; 48];
     code[..4].copy_from_slice(&(body as u32).to_le_bytes());
     code[4] = class;
-    let relocs = match body % RUN {
+    let relocs = match body % run {
         0 => Vec::new(),
         _ => vec![Relocation {
             at: 8,
@@ -60,9 +67,9 @@ fn function(body: usize, instance: usize) -> CompiledFunction {
     }
 }
 
-fn build() -> Vec<CompiledFunction> {
+fn build(run: usize) -> Vec<CompiledFunction> {
     (0..BODIES)
-        .flat_map(|body| (0..INSTANCES).map(move |instance| function(body, instance)))
+        .flat_map(|body| (0..INSTANCES).map(move |instance| function(body, instance, run)))
         .collect()
 }
 
@@ -79,14 +86,58 @@ fn fold(functions: &mut Vec<CompiledFunction>) -> usize {
         .len()
 }
 
+/// [`fold`], keeping the originals.
+fn fold_keeping(functions: &mut Vec<CompiledFunction>) -> usize {
+    let mut originals = blaze_codegen::dedupe::Originals::default();
+    let merged = blaze_codegen::dedupe::dedupe_keeping(
+        functions,
+        &mut [],
+        |it| !exported(it),
+        Some(&mut originals),
+    )
+    .expect("a fixpoint")
+    .0
+    .merged
+    .len();
+    merged + originals.functions.len()
+}
+
 fn benchmarks() -> impl IntoBenchmarks {
-    [benchmark_fn("dedupe/generic_chains", |b| {
-        let functions = build();
-        b.iter(move || {
-            let mut functions = functions.clone();
-            fold(black_box(&mut functions))
-        })
-    })]
+    [
+        benchmark_fn("dedupe/generic_chains", |b| {
+            let functions = build(RUN);
+            b.iter(move || {
+                let mut functions = functions.clone();
+                fold(black_box(&mut functions))
+            })
+        }),
+        benchmark_fn("dedupe/generic_chains_keeping", |b| {
+            let functions = build(RUN);
+            b.iter(move || {
+                let mut functions = functions.clone();
+                fold_keeping(black_box(&mut functions))
+            })
+        }),
+        benchmark_fn("dedupe/long_chains", |b| {
+            let functions = build(LONG_RUN);
+            b.iter(move || {
+                let mut functions = functions.clone();
+                fold(black_box(&mut functions))
+            })
+        }),
+        benchmark_fn("dedupe/floor/clone", |b| {
+            let functions = build(RUN);
+            b.iter(move || black_box(functions.clone()).len())
+        }),
+        benchmark_fn("dedupe/floor/code_ids", |b| {
+            let functions = build(RUN);
+            b.iter(move || {
+                (functions.iter())
+                    .map(|it| blaze_codegen::content::code_id(black_box(it)).0[0] as usize)
+                    .sum::<usize>()
+            })
+        }),
+    ]
 }
 
 blaze_bench::main!(benchmarks());
