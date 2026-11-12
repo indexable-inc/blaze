@@ -144,6 +144,9 @@ pub struct Cx<'a, 'db> {
     levels: RefCell<Option<LevelMap<'a, 'db>>>,
     /// The lints that may fire anywhere in the crate, made the first time a pass asks.
     may_fire: OnceCell<LintSet>,
+    /// Every trait, by the names of its items, made the first time an error asks which traits
+    /// have an item of a name.
+    traits: OnceCell<crate::lower::unresolved_method_call::TraitIndex>,
     /// Made by [`Cx::probe`]: a query's context, which has of the build only what the query's
     /// key says.
     probing: bool,
@@ -176,6 +179,7 @@ impl<'a, 'db> Cx<'a, 'db> {
             effective: OnceCell::new(),
             levels: RefCell::new(None),
             may_fire: OnceCell::new(),
+            traits: OnceCell::new(),
             probing: false,
             beyond: Cell::new(false),
         }
@@ -333,6 +337,12 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// pass's lints at once, one AND per word.
     pub fn any_may_fire(&self, lints: &LintSet) -> bool {
         self.lints_that_may_fire().intersects(lints)
+    }
+
+    /// Every trait of every crate with, for each name, the traits that have an item of it:
+    /// walked once a check, the first time an error asks.
+    pub(crate) fn traits(&self) -> &crate::lower::unresolved_method_call::TraitIndex {
+        self.traits.get_or_init(|| crate::lower::unresolved_method_call::TraitIndex::new(self))
     }
 
     fn lints_that_may_fire(&self) -> &LintSet {
