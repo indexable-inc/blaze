@@ -1,0 +1,11 @@
+{
+ "id": "mem2-3",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+ "where": "blaze: `blaze debug inspect`, the memory section",
+ "what": "`memory.tags` is each tag's blaze-mem bytes only: on a daemon of 5.8 GiB resident they summed to 2.5 GiB, with nothing on the global heap (1.8 GiB live) or on what was freed and kept (1.9 GiB). The full split was only in a line of serve.log written every 30 s while the daemon works.",
+ "cost": "an hour before the first true table",
+ "cause": "the section predates the heap per tag",
+ "workaround": "none needed",
+ "state": "fixed on mem2-1111 (9137787c00: heap by holder with what its pages hold, regions, kept; schema 2)"
+}

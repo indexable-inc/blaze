@@ -1,0 +1,11 @@
+{
+ "id": "redit-12",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+ "where": "my own method: `pgrep -f`",
+ "what": "`pgrep -f \"rethru[n].sh\" | xargs kill` at the head of an `ix shell .. bash -c '..'` killed that shell itself, twice: the bracket keeps the pattern from matching its own text, but the same command line named `rethrun.sh` in plain further on. Everything after it did not run and printed nothing (mem2-2 again).",
+ "cost": "two commands that did nothing, five minutes",
+ "cause": "pattern matching on full command lines",
+ "workaround": "kill by the pid in the daemon's `serve.lock`",
+ "state": "fixed in my scripts"
+}

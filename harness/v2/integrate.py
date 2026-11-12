@@ -55,28 +55,20 @@ def merge() -> None:
             row(f"merge {b}", "ok " + git("rev-parse", "--short", f"origin/{b}").stdout.strip())
             continue
         bad = [l[3:] for l in git("status", "--porcelain").stdout.splitlines() if l[:2] in ("UU", "AA", "DU", "UD", "AU", "UA")]
-        if bad == ["annoyances.json"]:
-            # main renamed the file to agents.json; a lane that began earlier still adds rows to the old name
-            ours = json.loads((WT / "agents.json").read_text())
-            theirs = json.loads(git("show", f"origin/{b}:annoyances.json").stdout)
-            have = {x["id"] for x in ours["annoyances"]}
-            ours["annoyances"] += [x for x in theirs["annoyances"] if x["id"] not in have]
-            (WT / "agents.json").write_text(json.dumps(ours, indent=1, ensure_ascii=False) + "\n")
-            git("rm", "-q", "--cached", "annoyances.json")
-            (WT / "annoyances.json").unlink(missing_ok=True)
-            git("add", "agents.json")
+        if bad and set(bad) <= {"annoyances.json", "agents.json"}:
+            # main keeps one file per row under agents/; a lane that began earlier still appends to
+            # one of the old files: its rows become files and the old file stays deleted.
+            for old in bad:
+                theirs = git("show", f"origin/{b}:{old}").stdout
+                tmp = Path(f"/tmp/integrate-{b}-{old}")
+                tmp.write_text(theirs)
+                r2 = sh(["python3", "-I", "harness/v2/agents.py", json.dumps({"import": str(tmp), "lane": b})], cwd=WT)
+                assert r2.returncode == 0, r2.stderr
+                git("rm", "-q", "--cached", old)
+                (WT / old).unlink(missing_ok=True)
+            git("add", "agents")
             git("commit", "-q", "--no-edit")
-            row(f"merge {b}", "ok (annoyance rows moved into agents.json)")
-        elif bad == ["agents.json"]:
-            ours = json.loads(git("show", ":2:agents.json").stdout)
-            theirs = json.loads(git("show", ":3:agents.json").stdout)
-            for k in ("howto", "annoyances"):
-                have = {x["id"] for x in ours[k]}
-                ours[k] += [x for x in theirs.get(k, []) if x["id"] not in have]
-            (WT / "agents.json").write_text(json.dumps(ours, indent=1, ensure_ascii=False) + "\n")
-            git("add", "agents.json")
-            git("commit", "-q", "--no-edit")
-            row(f"merge {b}", "ok (agents.json rows joined)")
+            row(f"merge {b}", "ok (its rows written under agents/)")
         else:
             git("merge", "--abort")
             row(f"merge {b}", "CONFLICT, left out: " + ", ".join(bad)[:150])

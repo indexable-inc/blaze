@@ -1,0 +1,11 @@
+{
+ "id": "A13",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "blaze: ids",
+ "what": "Lanes branch from trees that lack docs/v2/plan/decisions.json, and its D-numbers collide with objective ids in the ledger (D21 is both a decision and an objective).",
+ "cost": "confusion in three lane reports",
+ "cause": "two id spaces with one prefix",
+ "workaround": "say `decision D21`",
+ "state": "open: rename one prefix"
+}

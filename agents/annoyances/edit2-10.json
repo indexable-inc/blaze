@@ -1,0 +1,11 @@
+{
+ "id": "edit2-10",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+ "where": "blaze-link: what a one-function edit writes",
+ "what": "`.rela.dyn` is rewritten almost whole by a one-function edit of hello world: 303 KB of a 442 KB table in two ranges (`link write` events), because a relocation added or removed moves every one after it. It is 95% of the patch (318 KB), of the store's record of it and of what each path's place writes.",
+ "cost": "about 0.3 MB written three times an edit, and the store's puts are 1.16 MB an edit",
+ "cause": "a table sorted and packed, with no slots that stay",
+ "workaround": "none",
+ "state": "open (the linker's relocations lane): relocations at fixed slots, a gone one left as `R_*_NONE`"
+}

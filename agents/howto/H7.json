@@ -1,0 +1,9 @@
+{
+ "id": "H7",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "task": "Change a file under `library/`",
+ "do": "Regenerate the digest in the same commit: uv run --frozen python harness/library.py digest '{}'.",
+ "why": "A stale library/DIGEST makes every fresh home fail to start.",
+ "state": "current"
+}

@@ -1,0 +1,11 @@
+{
+ "id": "diagkey-2",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane diagkey-1111",
+ "where": "crates/blaze-engine/tests/revisions (real driver)",
+ "what": "A revision's diagnostics cannot be held to a clean build's: the driver's `said` is the command's whole standard error (status lines with their times) with each message's `rendered` after it, and the clean build runs only when a check failed. \"What a build at width W shows from a record made at V is what a clean build at W shows\" is therefore checked with `says` texts typed by hand.",
+ "cost": "one property stated weaker than it is",
+ "cause": "`Observed` keeps no field of the diagnostics alone",
+ "workaround": "`says`, and the in-process test compares every byte",
+ "state": "open: an `Observed::diagnostics` (the `rendered` of each compiler-message) compared with the clean build's would state it"
+}

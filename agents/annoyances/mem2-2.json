@@ -1,0 +1,11 @@
+{
+ "id": "mem2-2",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+ "where": "the shell on a VM",
+ "what": "`pkill -f \"blaze-engine serve\"` inside `ix shell vm -- bash -c '...'` kills the bash that runs it, since its own command line holds the pattern; everything after it in the script silently does not run.",
+ "cost": "one measurement run that never started, found twenty minutes later",
+ "cause": "pattern matching on full command lines",
+ "workaround": "`pgrep -f \"engine serv[e]\" | xargs -r kill`",
+ "state": "open"
+}

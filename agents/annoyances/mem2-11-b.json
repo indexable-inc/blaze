@@ -1,0 +1,11 @@
+{
+ "id": "mem2-11-b",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+ "where": "blaze: an edit's build",
+ "what": "A one-line body edit of hello-world allocates and frees about 95 MiB of the global heap: `CompiledFunction::clone` 27 MiB, the linker's `file::fill` 20, `Build::patch_lists` 13, `beside::DebugWrite::apply` 8, `codegen::debug_side` 7.5 (alloc_samples by site, eight edits). The warm loop is meant to allocate nothing there (docs/v2/plan/design/memory.md).",
+ "cost": "it is why mimalloc on base pages is 17% slower an edit (each build takes the freed pages again a 4 KiB fault at a time), so it is what keeps 1.0 GiB of huge-page slack on every Linux daemon; and it is edit time on any pages",
+ "cause": "the edit's link and the walk copy whole-program tables",
+ "workaround": "none",
+ "state": "mostly fixed on edit2-1111 (2026-11-11): the `Built`'s functions are shared and the `Built` is given back and written into (no clone, no `patch_lists` lists), a patch's place writes the patch (no `file::fill` of the file's runs), the side file is patched by the loop and held once; what is left, about 15 MiB an edit by the samples, is the ELF writer's tables made whole each stage, the store's encoding of the patch, and `Reach::patched`"
+}

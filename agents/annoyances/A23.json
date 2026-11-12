@@ -1,0 +1,11 @@
+{
+ "id": "A23",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "the Mac",
+ "what": "The disk is nearly full (10 to 40 GB free) while each cargo target directory is 10 to 21 GB, so lanes cannot each have one and release builds have to be rationed.",
+ "cost": "limits how many lanes can verify their own work",
+ "cause": "one machine, many worktrees",
+ "workaround": "delete `debug/` and finished lanes' targets; build on VMs",
+ "state": "open"
+}

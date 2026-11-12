@@ -1,0 +1,11 @@
+{
+ "id": "real-3",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane real-1111",
+ "where": "the VM: bindgen",
+ "what": "nix's libclang has no default include path: bindgen failed with `'assert.h' file not found` until `BINDGEN_EXTRA_CLANG_ARGS` named glibc's and clang's include directories.",
+ "cost": "one failed build",
+ "cause": "an unwrapped libclang",
+ "workaround": "set it in the fixed environment",
+ "state": "open: belongs in the lane setup"
+}

@@ -1,0 +1,11 @@
+{
+ "id": "real-1",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane real-1111",
+ "where": "the VM: nix",
+ "what": "The nix store paths used for `m4`, libclang and glibc's headers were garbage-collected mid-session: the next cold builds of reth and tempo failed in gmp-mpfr-sys (`No usable m4`) and bindgen (`Unable to find libclang`).",
+ "cost": "two wasted 10-25 minute builds",
+ "cause": "fetched by the previous lane with no GC root",
+ "workaround": "`nix build ... --out-link /root/nixroots/<name>` so they are roots",
+ "state": "open: a lane's VM setup should make roots"
+}

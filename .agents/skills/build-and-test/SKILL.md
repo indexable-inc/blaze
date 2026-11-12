@@ -58,11 +58,11 @@ committing. A result you can't tie to a tree is not evidence.
 
 ## work-in-ix-vms (rule 34)
 
-There is one ix VM for all of blaze's work: `blaze-vm` (arm64, 128 cores, 256 GiB committed;
-`agents.json` row H12 has its layout and how to remake it). Builds, tests, benchmarks, real-project
-runs and experiments on Linux all run there: nobody makes another VM (`ix new`) for a lane, a
-measurement or a project. It holds the one tree at `/root/blaze` with a warm build; blaze is built
-only through `/root/loop.sh <branch> <command...>`, which takes a lock, checks out the branch,
+There is one ix VM for all of blaze's work: `blaze-vm` (arm64, 128 cores, 256 GiB committed; how-to
+`H12` under `agents/howto/` has its layout and how to remake it). Builds, tests, benchmarks,
+real-project runs and experiments on Linux all run there: nobody makes another VM (`ix new`) for a
+lane, a measurement or a project. It holds the one tree at `/root/blaze` with a warm build; blaze is
+built only through `/root/loop.sh <branch> <command...>`, which takes a lock, checks out the branch,
 builds once, installs to `/root/inst` and runs the command (ten minutes at most inside the lock); a
 lane's own state lives under `/root/wt/<lane>/` and long runs are systemd units it polls. Because
 every lane shares the machine, a timing names the load average it was taken under and compares base
@@ -102,17 +102,17 @@ a time).
 
 ## worktree-per-lane (rule 36)
 
-The default is one directory: the integration checkout on the Mac (`agents.json` row H12 names it),
-on the integration branch. Every lane edits there, within the paths its brief gives it, and does not
-run git: the main agent commits (one commit per lane's piece, crediting it), pushes, and has the one
-VM build and test the whole tree at once. A lane says when its piece is ready to be built and what
-test shows it; until then its half-written files must not break the build for the others (add new
-code beside the old and switch over last, or keep it behind a module that is not yet referenced).
-Two lanes never write the same file: the brief's paths say who owns what, and a lane that needs a
-line in another's file asks the main agent. A worktree (uniquely named, with its own branch) is for
-the cases the one directory cannot serve: two lanes that must rewrite the same file, a bisect or a
-causal test that needs a variant tree, a long-lived rewrite that cannot keep the tree building; the
-brief says which. Never `git stash`: it is one stack shared by every worktree.
+The default is one directory: the integration checkout on the Mac (how-to `H12` under
+`agents/howto/` names it), on the integration branch. Every lane edits there, within the paths its
+brief gives it, and does not run git: the main agent commits (one commit per lane's piece, crediting
+it), pushes, and has the one VM build and test the whole tree at once. A lane says when its piece is
+ready to be built and what test shows it; until then its half-written files must not break the build
+for the others (add new code beside the old and switch over last, or keep it behind a module that is
+not yet referenced). Two lanes never write the same file: the brief's paths say who owns what, and a
+lane that needs a line in another's file asks the main agent. A worktree (uniquely named, with its
+own branch) is for the cases the one directory cannot serve: two lanes that must rewrite the same
+file, a bisect or a causal test that needs a variant tree, a long-lived rewrite that cannot keep the
+tree building; the brief says which. Never `git stash`: it is one stack shared by every worktree.
 
 ## clean-up-lane (rule 39)
 

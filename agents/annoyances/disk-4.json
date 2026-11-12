@@ -1,0 +1,11 @@
+{
+ "id": "disk-4",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+ "where": "blaze-cargo's tests under cargo on macOS",
+ "what": "`cli::tests::every_command_suggested_is_one` fails (`serve` is in COMMANDS and is no command) and `serve::why::tests::a_changed_key_part_is_named_by_subject_and_survives_a_restore` expects a torn third record to be called `record 1` where the code says `record 2`. Both fail the same way on the untouched tip of all-1111 (65fafef399), run alone.",
+ "cost": "a baseline build of blaze-cargo's tests to tell them from this lane's changes",
+ "cause": "not looked for",
+ "workaround": "none",
+ "state": "open"
+}
