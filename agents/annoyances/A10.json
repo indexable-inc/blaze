@@ -1,0 +1,11 @@
+{
+ "id": "A10",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "blaze: bstd",
+ "what": "bstd uses blaze-only syntax, so no crate on it can be checked or tested with cargo; two new crates were unverifiable until one was ported to core and alloc.",
+ "cost": "two lanes' work unverified for hours",
+ "cause": "rule new-code-uses-bstd met rule cargo-builds-blaze",
+ "workaround": "decision D25",
+ "state": "open"
+}

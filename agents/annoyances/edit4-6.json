@@ -1,0 +1,11 @@
+{
+ "id": "edit4-6",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+ "where": "blaze-link's tests under cargo",
+ "what": "`tests::patch::a_same_size_body_edit_writes_the_function_and_a_constant` failed on every run, on the base too: it allows one 4 KiB block of rounding between 20 and 200 functions, and three kept tables each round to a block (at 20 functions each is shorter than a block).",
+ "cost": "a failing counter in the area of the change had to be read to be told from a regression",
+ "cause": "the bound was written for one table",
+ "workaround": "none",
+ "state": "fixed on edit4-1111: a block for each of the three tables"
+}

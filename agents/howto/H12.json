@@ -1,0 +1,9 @@
+{
+ "id": "H12",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "task": "Where work runs and where code is written",
+ "do": "One VM: `blaze-vm` (ix, arm64, 128 cores, 256 GiB committed, TTL 7 days from 2026-11-12; remake it with /tmp/blazevm.sh's steps: `ix new --name blaze-vm --no-shell --arch arm64 --cpus 128 --memory 256 --memory-commit --ttl 7d`, rustup + the pinned nightly, the pinned LLVM under /root/.blaze/native, `git clone` to /root/blaze, one release build, then /root/loop.sh and /root/lockwatch.sh). Build and run only through `ix shell blaze-vm --noninteractive -- /root/loop.sh <branch> <command...>`: one caller at a time, the branch checked out in /root/blaze, one incremental build, installed to /root/inst, the command run with BLAZE=/root/inst/blaze and BLAZE_HOME=/root/homes/<branch>, ten minutes at most; copy the binaries to /root/wt/<lane>/inst inside the call before measuring, keep projects and homes under /root/wt/<lane>/, start long runs as systemd units (export HOME=/root and PATH=/root/.cargo/bin:/run/current-system/sw/bin:$PATH in the unit's script) and poll them. One directory: lanes write in the integration checkout on the Mac (/Volumes/Projects/blaze-int-1112, branch int-1112), each in its own paths, without running git; the main agent commits, pushes and runs `harness/v2/integrate.py`. Timings name the load average and alternate base and new.",
+ "why": "Rules work-in-ix-vms, fan-out-write-only and worktree-per-lane as rewritten 2026-11-12: ten lane VMs and seventeen worktrees cost a cold build each and an hour of merging; a first shared queue on a 32-core VM (lanebase-1112) jammed for 22 minutes on a lock a daemon inherited, fixed in loop.sh (children start with the lock closed).",
+ "state": "current"
+}

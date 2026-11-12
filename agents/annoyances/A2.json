@@ -1,0 +1,11 @@
+{
+ "id": "A2",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "blaze: file watching",
+ "what": "A file replaced by rename (what `sed -i` and editors do) is sometimes read by the daemon as empty: the build fails with E0601 `main` not found and stays failed until the file is written again.",
+ "cost": "several wrong measurements and two lanes tripped by it",
+ "cause": "the daemon reads the path between the unlink and the create, or acts on the delete event alone",
+ "workaround": "overwrite bytes in place when scripting edits",
+ "state": "a lane is fixing it (edit-correct-1111)"
+}

@@ -1,0 +1,11 @@
+{
+ "id": "A22",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "my own method",
+ "what": "To free disk I deleted a worktree and a target directory that a background baseline test run was still using; the baseline was lost.",
+ "cost": "the classification of failing tests is still owed",
+ "cause": "acted on `du` without checking what was running",
+ "workaround": "list running tasks before deleting under /tmp",
+ "state": "open"
+}

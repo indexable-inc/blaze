@@ -1,0 +1,11 @@
+{
+ "id": "A4",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "my own method",
+ "what": "I timed twelve `blaze run` calls without checking exit status or output and reported 18 to 21 ms as a result; it could not be reproduced.",
+ "cost": "a wrong claim to Andrew, retracted 25 minutes later",
+ "cause": "timing harness that discards stdout and the return code",
+ "workaround": "every timing script asserts the expected output and counts failures",
+ "state": "fixed in the harness (/tmp/blaze-h2h2.py); rule claims-from-evidence already said so"
+}

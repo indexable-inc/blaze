@@ -1,0 +1,11 @@
+{
+ "id": "A11",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "blaze: tests",
+ "what": "`cargo test -p a -p b` stops at the first package that fails unless `--no-fail-fast` is given, and several Hegel tests draw a random seed, so one baseline run passed a test that failed one run in three.",
+ "cost": "two misattributed failures",
+ "cause": "defaults",
+ "workaround": "always `--no-fail-fast`; run a suspect test five times",
+ "state": "open: failing tests on main are still unclassified"
+}

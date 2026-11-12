@@ -1,0 +1,11 @@
+{
+ "id": "edit3-5",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+ "where": "blaze: synced bookkeeping beside an edit's build",
+ "what": "Three writes with a sync ran while an edit's build ran and its outputs were placed, on the same disk: the profile history flushed as each build started (104 to 174 ms of writes and `F_FULLFSYNC` from the build's first task), `blaze why`'s ledger was appended and synced as each build ended (7 ms), and on a volume under its floor (this Mac: 0.6% free) each build started an urgent collector run whose ledger was written as it ended (5 to 10 ms, 195 at worst). The placement beside them took 24 to 63 ms against 6 to 8 alone.",
+ "cost": "20 to 55 ms of an edit's answer, and most of its spread",
+ "cause": "each was written to be out of the answer's way on the loop, and none was on the loop; what they shared with the answer was the disk",
+ "workaround": "none needed",
+ "state": "fixed in ae5fcaa6c3 (held until the builds are quiet: `observe::Held`, `why::File::write_all`, the collector's `ledger_after_builds`)"
+}

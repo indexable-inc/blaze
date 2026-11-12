@@ -1,0 +1,13 @@
+{
+ "id": "repl-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane repl-clean-1112",
+ "where": "crates/harness/mcp/scripts/effects-smoke.ts (deleted in this lane); .github",
+ "what": "effects-smoke.ts answered the kernel in JSON frames (`[type u8][len u32][json]`), the protocol before deterministic CBOR, and nothing said it no longer matched. A grep of .github for `bun test` and `harness/mcp` finds nothing, so I believe no gate runs this package's tests or tsc (not checked beyond that grep).",
+ "cost": "twenty minutes working out whether it was mine to keep working",
+ "cause": "a check kept as a script someone runs by hand, and a test suite no gate runs",
+ "class": "a check outside the gate rots silently",
+ "prevention": "the smoke scripts are replaced by src/e2e.test.ts and src/tell.test.ts inside `bun test`; still missing: a gate step that runs `bun test` and `bunx tsc --noEmit` in crates/harness/mcp",
+ "fix": "add crates/harness/mcp's `bun test` and `tsc` to the merge gate",
+ "state": "open"
+}
