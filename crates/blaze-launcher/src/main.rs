@@ -89,29 +89,36 @@ fn sidecar(exe: &Path) -> Result<(PathBuf, ProgramId), String> {
     }
 }
 
-/// Starts the program again in place: this file, with this process's arguments and
-/// environment. Returns only when it could not, with why.
+/// The path this process was started from, read once at its start: a build places a new
+/// file at the path while the program runs, and the file this process maps is then one the
+/// system no longer names.
+static STARTED_FROM: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Starts the program again in place: the file at the path this process was started from,
+/// with this process's arguments and environment. It does not return: where the program
+/// cannot be started again the process ends, saying why, since what it would run on is code
+/// the daemon has replaced (rule `no-fallback`).
 fn restart(why: &str) -> String {
     let _ = writeln!(std::io::stderr().lock(), "blaze: restart needed: {why}");
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(error) => return format!("{why}; and this process's own path does not read: {error}"),
+    let Some(exe) = STARTED_FROM.get() else {
+        stop(101, "the program must start again, and the path it was started from was never read");
     };
     let c = |text: OsString| CString::new(text.into_vec()).ok();
     let Some(path) = c(exe.clone().into_os_string()) else {
-        return format!("{why}; and {} has a NUL in its path", exe.display());
+        stop(101, &format!("the program must start again, and {} has a NUL in its path", exe.display()));
     };
     // alloc: the arguments of the one `execv`
     let args: Option<Vec<CString>> = std::env::args_os().map(c).collect();
     let Some(args) = args else {
-        return format!("{why}; and an argument of this process has a NUL in it");
+        stop(101, "the program must start again, and an argument of this process has a NUL in it");
     };
     let mut argv: Vec<*const c_char> = args.iter().map(|it| it.as_ptr()).collect(); // alloc: as above
     argv.push(core::ptr::null());
     // SAFETY: `path` and every element of `argv` are C strings that live across the call,
     // and `argv` ends in a null. The environment is the process's own.
     unsafe { libc::execv(path.as_ptr(), argv.as_ptr()) };
-    format!("{why}; and starting {} again failed: {}", exe.display(), std::io::Error::last_os_error())
+    let failed = std::io::Error::last_os_error();
+    stop(101, &format!("the program must start again, and starting {} failed: {failed}", exe.display()))
 }
 
 unsafe extern "C" {
@@ -124,6 +131,8 @@ fn main() {
         Ok(exe) => exe,
         Err(why) => stop(CANNOT_RUN, &format!("this process's own path does not read: {why}")),
     };
+    // Kept for a restart in place; set once, here.
+    let _ = STARTED_FROM.set(exe.clone()); // clone: the path, once a process
     let (socket_path, program) = match sidecar(&exe) {
         Ok(found) => found,
         Err(why) => stop(CANNOT_RUN, &why),

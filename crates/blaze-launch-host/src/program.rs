@@ -32,7 +32,7 @@
 //!
 //! | what changed | the launcher is told |
 //! |---|---|
-//! | one function's body (every instance of one generic counts as one) | an edit: the bound slots whose records changed, switched together |
+//! | one function's body (every instance of one generic counts as one; the entry shim around `fn main` is not counted) | an edit: the bound slots whose records changed, switched together |
 //! | lines only (a comment above a function) | an edit of the bound functions whose positions moved, not gated: each means what it meant |
 //! | a function or static was added | its slot declared, or its static defined; it is bound when first called |
 //! | a function or static was removed | nothing: no code names it any more |
@@ -76,6 +76,8 @@ struct Spans {
     by_anchor: Option<HashMap<ContentId, Vec<u8>, Global>>,
     /// The symbols the newest build's functions and statics define, by name.
     symbols: Vec<(String, Named)>,
+    /// How the last build gave its tables, for a refusal.
+    given: String,
 }
 
 const SPANS_MAGIC: &[u8; 8] = b"BZSPANS1";
@@ -88,7 +90,12 @@ impl Positions for Spans {
     fn of(&self, span: &blaze_format::SpanRef) -> Result<(&str, Position), String> {
         let table = self.by_anchor.as_ref().and_then(|it| it.get(&span.anchor));
         let Some(bytes) = table else {
-            return Err("the build gave no span table of that anchor".to_owned()); // alloc: an error
+            // alloc: an error
+            return Err(format!(
+                "the build gave no span table of that anchor ({} tables are held; the last build gave {})",
+                self.by_anchor.as_ref().map_or(0, |it| it.len()),
+                self.given
+            ));
         };
         let bad = || "its span table does not read".to_owned(); // alloc: an error
         if bytes.get(..8) != Some(SPANS_MAGIC) {
@@ -178,8 +185,11 @@ pub struct Program {
     identities: Vec<ContentId>,
     image: Option<Image>,
     spans: Spans,
-    /// The records made of the newest build's functions so far, by slot.
-    made: HashMap<u32, Arc<Made>, Global>,
+    /// The records made so far, by slot, each with the compiled function it was made of: a
+    /// record is that function's for as long as the build holds that very function (a build
+    /// shares with the one before it every function nothing changed, and makes another of
+    /// one whose callee has another key) and no span table it read changed.
+    made: HashMap<u32, (Arc<CompiledFunction>, Arc<Made>), Global>,
     launchers: Vec<Launcher>,
     /// The slots a launcher's stub ever asked for, in the order they were first asked: what
     /// the next launcher is bound to before it starts (launcher.md, step 4: the prefetch of
@@ -292,9 +302,6 @@ impl Program {
 
     /// The record of `slot`'s function in the newest build, made once a build.
     fn record(&mut self, slot: u32) -> Result<Arc<Made>, Refusal> {
-        if let Some(made) = self.made.get(&slot) {
-            return Ok(Arc::clone(made));
-        }
         let Some(image) = &self.image else {
             return Err("no build of the program is held".to_owned()); // alloc: an error
         };
@@ -310,12 +317,18 @@ impl Program {
             // alloc: an error
             return Err(format!("slot {slot}'s function {key:?} has no code in the newest build"));
         };
+        let function = &image.functions[function];
+        if let Some((of, made)) = self.made.get(&slot)
+            && Arc::ptr_eq(of, function)
+        {
+            return Ok(Arc::clone(made));
+        }
         let name = match image.names.binary_search_by_key(&image.by_identity[at].1, |it| it.0) {
             Ok(at) => &image.names[at].1[..],
             Err(_) => "<unnamed>",
         };
-        let made = Arc::new(record::function(&image.functions[function], name, &self.spans)?);
-        self.made.insert(slot, Arc::clone(&made));
+        let made = Arc::new(record::function(function, name, &self.spans)?);
+        self.made.insert(slot, (Arc::clone(function), Arc::clone(&made)));
         Ok(made)
     }
 
@@ -539,6 +552,7 @@ impl Program {
                 for (anchor, bytes) in all {
                     map.insert(*anchor, bytes.clone()); // clone: the program's own copy of a table
                 }
+                self.spans.given = format!("every table, {} of them", all.len()); // alloc: once a build
                 self.spans.by_anchor = Some(map);
                 None
             }
@@ -553,6 +567,8 @@ impl Program {
                     map.remove(anchor);
                     changed.push(*anchor);
                 }
+                // alloc: once a build
+                self.spans.given = format!("{} changed tables and {} removed", tables.len(), removed.len());
                 changed.sort_unstable();
                 Some(changed)
             }
@@ -639,7 +655,6 @@ impl Program {
         let image = self.image.as_ref().expect("just set");
         let mut restart: Option<String> = None;
         let mut bodies: Vec<(CodeHash, CodeHash, ContentId)> = Vec::new(); // alloc: once a build
-        let mut changed_slots: Vec<u32> = Vec::new(); // alloc: once a build
         if let Some(before) = &before {
             if before.entry != image.entry {
                 restart = Some("the program's entry is another function".to_owned()); // alloc: once
@@ -648,11 +663,16 @@ impl Program {
                 let Ok(at) = before.by_identity.binary_search_by_key(identity, |it| it.0) else {
                     continue;
                 };
-                let (_, old_key, old_code) = before.by_identity[at];
-                if old_key != *key {
-                    changed_slots.push(self.slots[identity]);
-                }
-                if old_code != *code && !bodies.iter().any(|it| it.0 == old_code && it.1 == *code) {
+                let (_, _, old_code) = before.by_identity[at];
+                let _ = key;
+                // The entry (the C `main` the front end makes around the program's `fn
+                // main`) follows `fn main`'s code and has no body of its own to edit, and its
+                // one frame is the process's first: it is rebound with `fn main` and not
+                // counted as a second changed body.
+                let counted = *identity != image.entry
+                    && old_code != *code
+                    && !bodies.iter().any(|it| it.0 == old_code && it.1 == *code);
+                if counted {
                     bodies.push((old_code, *code, *identity));
                 }
             }
@@ -681,16 +701,14 @@ impl Program {
             }
         }
 
-        // The records of the build before are let go where they may differ: a function whose
-        // key moved, or one that read a span table that changed. With every table given
-        // anew, all of them.
-        changed_slots.sort_unstable();
+        // The records that read a span table that changed are let go (with every table given
+        // anew, all of them); one whose function is another now is made again when asked
+        // for (`record`).
         match &changed_anchors {
             None => self.made.clear(),
             Some(changed) => {
-                self.made.retain(|slot, made| {
-                    changed_slots.binary_search(slot).is_err()
-                        && !made.anchors.iter().any(|it| changed.binary_search(it).is_ok())
+                self.made.retain(|_, (_, made)| {
+                    !made.anchors.iter().any(|it| changed.binary_search(it).is_ok())
                 });
             }
         }
