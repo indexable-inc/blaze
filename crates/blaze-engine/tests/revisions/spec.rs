@@ -142,6 +142,10 @@ pub struct Expect {
     /// again (`blaze why`'s `unit` steps): a unit can miss its record and still compile
     /// nothing, when every function of it is a store hit, which `max_units` does not see.
     pub max_records: Option<u64>,
+    /// The most build scripts' runs that were not found kept, so that the script ran again
+    /// (`blaze why`'s `build script run` steps): a run whose result is what it was before
+    /// makes no unit again, which `max_units` and `max_records` do not see.
+    pub max_runs: Option<u64>,
     /// The most engine memos run, and proved unchanged without running.
     pub max_executed: Option<u64>,
     pub max_verified: Option<u64>,
@@ -170,6 +174,8 @@ pub struct Observed {
     pub units: Option<u64>,
     /// The units whose record missed ([`Expect::max_records`]).
     pub records: Option<u64>,
+    /// The build scripts' runs that missed ([`Expect::max_runs`]).
+    pub runs: Option<u64>,
     pub executed: Option<u64>,
     pub verified: Option<u64>,
     pub noop: Option<bool>,
@@ -301,9 +307,9 @@ fn step(word: &str, at: &str) -> Step {
 }
 
 /// Every key a revision's table may hold: another is a typo, and is refused.
-const KEYS: [&str; 22] = [
+const KEYS: [&str; 23] = [
     "action", "args", "env", "steps", "remove", "fails", "prints", "says", "redone", "redone_within", "redone_has", "reused",
-    "max_units", "max_records", "max_executed", "max_verified", "max_ms", "noop", "link", "bytes", "known", "about",
+    "max_units", "max_records", "max_runs", "max_executed", "max_verified", "max_ms", "noop", "link", "bytes", "known", "about",
 ];
 
 fn files(dir: &Path, under: &Path, into: &mut Vec<Change>) {
@@ -398,6 +404,7 @@ impl Test {
                     reused: texts(row, "reused", &at).unwrap_or_default(),
                     max_units: count(row, "max_units", &at),
                     max_records: count(row, "max_records", &at),
+                    max_runs: count(row, "max_runs", &at),
                     max_executed: count(row, "max_executed", &at),
                     max_verified: count(row, "max_verified", &at),
                     max_ms: count(row, "max_ms", &at),

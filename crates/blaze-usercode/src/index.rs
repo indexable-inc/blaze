@@ -503,7 +503,7 @@ fn keyed<I: Inputs>(
         let mut by_name = at;
         // alloc: once per check of a shape that walked the environment, a value each name it
         // also asked that is set (those the walk does not see, a few)
-        let mut named_values: Vec<Option<Vec<u8>>> = Vec::with_capacity(names as usize);
+        let mut named_values: Vec<Option<Vec<u8>>> = Vec::new();
         for _ in 0..names {
             let name = by_name.bytes_u64().map_err(short)?;
             let value = match name == &*all_name {

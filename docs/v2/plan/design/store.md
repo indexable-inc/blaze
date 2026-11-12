@@ -326,7 +326,7 @@ refuses on purpose: a variable outside the set that only a walking child reads (
 set must grow. Windows lends nothing, so a walk there is still all of it. Tests:
 `blaze_usercode::script::tests::a_walk_of_the_environment_is_keyed_by_the_walk_set_and_named_reads_alone`
 (control: the walk made whole again), `confine`'s and `sandbox::v2`'s; revision cases
-`a_variable_no_step_reads`, `a_variable_a_build_script_reads`, `a_build_script_that_wanted_a_variable`.
+`a_variable_no_step_reads`, `a_variable_a_step_reads`, `a_build_script_that_wanted_a_variable`.
 
 **The plan in a unit's key.** A unit's key takes of its `UnitPlan` what making it reads
 (`KeyedPlan`: every field but `metadata`, which nothing reads), how its program is run only
@@ -353,8 +353,8 @@ The split the rule asks for, not built: a check record keyed by FRONT_END and a
 CODEGEN; only a linking unit's by a `LINK` identity (blaze-link's closure). It needs the
 record's making moved out of blaze-cargo's closure or a file-level cut: `Cut` refuses to cut
 blaze-link today because `blaze-launch-host` is built from it and `serve/unit/*.rs` name it.
-The sandbox's identity is in a run's key through the launcher's content (`Place::code` is the
-script's; the launcher's is not keyed: also not built).
+Whether a build script run's key holds the sandbox's own code identity (the launcher and the
+interposers, which decide what a run can read) was not checked by this lane.
 
 ## Cold start as a fetch: the standard library (F4)
 

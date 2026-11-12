@@ -52,6 +52,7 @@ macro_rules! real {
 real! {
     a_body_edit_remakes_one_function
     a_broken_revision_fails_and_recovers
+    a_build_script_that_wanted_a_variable
     a_cfg_twin_chosen_by_a_build_script
     a_changed_const_remakes_its_two_readers
     a_changed_proc_macro_remakes_the_users_of_its_expansion
@@ -65,7 +66,10 @@ real! {
     a_second_project_reuses_the_standard_library
     a_signature_change_remakes_the_callers
     a_terminal_of_another_width_remakes_nothing
+    a_test_after_a_build_finds_the_librarys_record
     a_touch_without_a_change
+    a_variable_a_step_reads
+    a_variable_no_step_reads
     an_added_and_a_removed_function
     an_edit_after_a_kill
     an_edit_after_a_restart
@@ -74,6 +78,7 @@ real! {
     build_then_run_then_build_are_no_ops
     the_first_edit_after_a_cold_build_with_a_build_script_dependency
     the_first_test_after_a_run
+    the_packages_asked_for_are_in_no_units_key
     the_same_sources_in_another_directory_under_another_home
 }
 
