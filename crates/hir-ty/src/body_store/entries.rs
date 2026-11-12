@@ -11,9 +11,9 @@
 //! - **its identity** ([`reads::IDENTITY`], valued by the item store's
 //!   [`BodyFacts::identity`](super::BodyFacts::identity)): what the identity hashes beyond the
 //!   body's tokens (its owner's signature, what each id it names is, what each path resolves
-//!   to, its crate's inputs). No maintainer gives its delta yet, so a driver says it is always
-//!   dirty and counts it by name ([`BodyDelta::identities`], [`always_dirty`]): every entry is
-//!   then valued again at a carry, and only those whose identity is other bytes rerun;
+//!   to, its crate's inputs). [`Identities`] keeps item-hash's identity column from pin to pin
+//!   and gives its delta exactly ([`BodyDelta::identities`]); a driver with no delta says it is
+//!   always dirty and counts it by name ([`always_dirty`]);
 //! - **its facts**: one read per fact the run's trace names ([`reads::fact`], the fact's kind
 //!   as the read's kind, so a driver says each kind's difference apart), valued by the world
 //!   ([`BodyWorld::fact`]); a fact that is the body's own earlier step
@@ -527,6 +527,64 @@ pub fn always_dirty<G: Get + ?Sized>(
     delta: &BodyDelta,
 ) -> Result<Vec<(&'static str, usize)>, KernelError> {
     delta.dirty().map(|(kind, name)| Ok((name, session.readers_of(store, kind)?))).collect()
+}
+
+/// Item-hash's identity column of a pin's bodies, kept from one pin to the next: what gives
+/// [`BodyDelta::identities`] exactly, so no identity read is always dirty. Each body's
+/// identity is the item store's ([`BodyFacts::identity`](super::BodyFacts::identity), a
+/// memoized query: after an edit recomputed only where one of its parts changed), and the
+/// delta is every body whose identity is other bytes than at the last pin, is new, or is gone.
+///
+/// Still owed: a delta made from the parts' own deltas (the edited files' bodies, the
+/// readers of an item whose signature changed) without asking each body's identity.
+#[derive(Default)]
+pub struct Identities {
+    /// Each body by its key's bytes ([`key_of`]), with its identity at the last pin: none
+    /// where it had none.
+    kept: std::collections::BTreeMap<Vec<u8>, (BodyKey, Option<ContentId>)>,
+}
+
+impl Identities {
+    /// Keeps the identities of `keys`, the bodies of `world`'s pin, and gives the bodies whose
+    /// identity differs from the last pin's: other bytes, new, or gone (in key order). An
+    /// error names the body whose identity cannot be had.
+    pub fn delta<W: BodyWorld + ?Sized + 'static>(
+        &mut self,
+        world: &W,
+        keys: &[BodyKey],
+    ) -> Result<Vec<BodyKey>, String> {
+        let db = world.db();
+        // alloc: one pin's column, replacing the last
+        let mut now = std::collections::BTreeMap::new();
+        for key in keys {
+            let def = world.body(key)?;
+            let Some(identity) = with_store(db, |store| store.facts.identity(db, def)) else {
+                // alloc: error path
+                return Err(format!("{key:?}: the database has no item store installed"));
+            };
+            // alloc: one body's key
+            let mut bytes = Vec::new();
+            key_of::<W>(key, &mut bytes);
+            // clone: the key, kept with its identity
+            now.insert(bytes, (key.clone(), identity));
+        }
+        // alloc: the delta
+        let mut differs = Vec::new();
+        for (bytes, (key, identity)) in &now {
+            if self.kept.get(bytes).is_none_or(|(_, kept)| kept != identity) {
+                // clone: one body of the delta
+                differs.push(key.clone());
+            }
+        }
+        for (bytes, (key, _)) in &self.kept {
+            if !now.contains_key(bytes) {
+                // clone: one body of the delta
+                differs.push(key.clone());
+            }
+        }
+        self.kept = now;
+        Ok(differs)
+    }
 }
 
 /// A body the syntax of one file has: its item, what it is, the inline modules it is in from

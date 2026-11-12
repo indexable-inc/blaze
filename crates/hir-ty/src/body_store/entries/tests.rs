@@ -1,10 +1,12 @@
 //! Body entries carried through the kernel (end-state.md, order row 3): a two-crate program's
 //! bodies, each with its inference, MIR and borrow check entries in one session, carried
 //! across an edit of the leaf crate's file with the change set a driver gives (the file's text
-//! differs; the impls fact from the impls maintainer's last write; identities always dirty,
-//! counted). Each test counts the entries' runs and checks every entry against a fresh run
-//! (the oracle); the control drops the identity read from every trace and the oracle must
-//! catch the stale entry it leaves.
+//! differs; the impls fact from the impls maintainer's last write; identities from
+//! [`Identities`]' exact delta, or always dirty and counted). Each test counts the entries'
+//! runs and checks every entry against a fresh run (the oracle); one control drops the
+//! identity read from every trace, another leaves a changed identity out of the delta, and the
+//! oracle must catch the stale entry each leaves. A second session over the same store, with a
+//! new database, hits every entry.
 //!
 //! MIR and the borrow check are stand-ins here (hir-ty's tests link no MIR builder and no
 //! borrow checker): [`fake_mir`] reads the body's inference and offers it as its answer;
@@ -43,8 +45,8 @@ use std::alloc::Global;
 use syntax::{Edition, Extensions};
 
 use super::{
-    BodyDelta, BodyKey, BodyWorld, BorrowckEntry, DROPPED, IDENTITY_NAME, InferEntry, MirEntry,
-    RUNS, always_dirty, bodies, borrowck_schema, def_of, reads, register, run_infer,
+    BodyDelta, BodyKey, BodyWorld, BorrowckEntry, DROPPED, IDENTITY_NAME, Identities, InferEntry,
+    MirEntry, RUNS, always_dirty, bodies, borrowck_schema, def_of, reads, register, run_infer,
 };
 use crate::{
     InferenceResult,
@@ -509,9 +511,23 @@ fn differs(kept: &[(String, [Vec<u8>; 3])], fresh: &[(String, [Vec<u8>; 3])]) ->
     Ok(())
 }
 
-fn carried(edited: &str, dropped: Option<ReadKind>) -> Carried {
+/// Where a carry's change set has its identity reads' difference from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ids {
+    /// No delta: every identity read is always dirty.
+    Dirty,
+    /// [`Identities`]' exact delta.
+    Exact,
+    /// The planted bug of the delta's control: [`Identities`]' delta with every body of
+    /// `main.rs` left out, as a maintainer that said a changed identity unchanged would.
+    MainLeftOut,
+}
+
+fn carried(edited: &str, dropped: Option<ReadKind>, ids: Ids) -> Carried {
     let kernel = kernel();
     let mut tree = Tree::new();
+    let mut identities = Identities::default();
+    identities.delta(&tree, &tree.keys).expect("the first pin's identities");
     let mut store = Memory::default();
     let mut session = Session::new(&tree);
     DROPPED.with(|it| it.set(dropped));
@@ -531,11 +547,16 @@ fn carried(edited: &str, dropped: Option<ReadKind>) -> Carried {
         true => FILES.iter().map(|(_, krate)| (IMPLS, (*krate).to_owned())).collect(),
         false => Vec::new(),
     };
-    let delta = BodyDelta {
-        exact: vec![(ReadKind(IMPLS.kind.0), impls_differ)],
-        unknown: Vec::new(),
-        identities: None,
+    let identities = match ids {
+        Ids::Dirty => None,
+        Ids::Exact => Some(identities.delta(&tree, &tree.keys).expect("the identity delta")),
+        Ids::MainLeftOut => {
+            let mut differ = identities.delta(&tree, &tree.keys).expect("the identity delta");
+            differ.retain(|key| key.file.name != "main.rs");
+            Some(differ)
+        }
     };
+    let delta = BodyDelta { exact: vec![(ReadKind(IMPLS.kind.0), impls_differ)], unknown: Vec::new(), identities };
     delta.say::<Tree>(&mut changed);
     let dirty = always_dirty(&mut session, &store, &delta).unwrap();
     reset_runs();
@@ -547,22 +568,32 @@ fn carried(edited: &str, dropped: Option<ReadKind>) -> Carried {
     Carried { runs, dirty, fresh }
 }
 
-/// The floor of a leaf body edit: the edited body's three entries, and nothing else; its
-/// callers' entries are valued again (their identity is always dirty) and stay.
+/// The floor of a leaf body edit: the edited body's three entries, and nothing else. With
+/// item-hash's identity delta no read is always dirty: the callers' entries are not valued.
 #[test]
 fn a_leaf_body_edit_reruns_its_three_entries_and_no_callers() {
-    let leaf = carried(&LEAF.replace("{ 1 }", "{ 3 }"), None);
+    let leaf = carried(&LEAF.replace("{ 1 }", "{ 3 }"), None, Ids::Exact);
     assert_eq!(leaf.runs, [1, 1, 1, 0], "the edited body's inference, MIR and borrow check, once each");
-    assert_eq!(leaf.dirty, [(IDENTITY_NAME, 12)], "every entry reads its identity, which no delta gives yet");
+    assert!(leaf.dirty.is_empty(), "the identity delta is exact, nothing is always dirty: {:?}", leaf.dirty);
+    leaf.fresh.expect("every entry is what a fresh run gives");
+}
+
+/// The same edit with no identity delta: every entry's identity is always dirty, counted by
+/// name, and still only the edited body's three entries rerun.
+#[test]
+fn with_no_identity_delta_every_identity_read_is_always_dirty() {
+    let leaf = carried(&LEAF.replace("{ 1 }", "{ 3 }"), None, Ids::Dirty);
+    assert_eq!(leaf.runs, [1, 1, 1, 0]);
+    assert_eq!(leaf.dirty, [(IDENTITY_NAME, 12)], "every entry reads its identity");
     leaf.fresh.expect("every entry is what a fresh run gives");
 }
 
 /// The floor of a comment edit: no entry.
 #[test]
 fn a_comment_edit_reruns_no_entry() {
-    let comment = carried(&format!("// a comment\n{LEAF}"), None);
+    let comment = carried(&format!("// a comment\n{LEAF}"), None, Ids::Exact);
     assert_eq!(comment.runs, [0; Step::COUNT], "a comment changes no body's record");
-    assert_eq!(comment.dirty, [(IDENTITY_NAME, 12)]);
+    assert!(comment.dirty.is_empty(), "{:?}", comment.dirty);
     comment.fresh.expect("every entry is what a fresh run gives");
 }
 
@@ -570,7 +601,7 @@ fn a_comment_edit_reruns_no_entry() {
 /// caller's inference names the leaf, whose type is other now.
 #[test]
 fn a_signature_edit_reaches_the_caller_through_its_identity() {
-    let signature = carried(&LEAF.replace("leaf() -> u32", "leaf() -> u64"), None);
+    let signature = carried(&LEAF.replace("leaf() -> u32", "leaf() -> u64"), None, Ids::Exact);
     assert!(signature.runs[Step::Infer as usize] >= 2, "the leaf and its caller: {:?}", signature.runs);
     signature.fresh.expect("every entry is what a fresh run gives");
 }
@@ -580,7 +611,37 @@ fn a_signature_edit_reaches_the_caller_through_its_identity() {
 /// the stale one.
 #[test]
 fn the_oracle_catches_a_trace_that_drops_the_identity_read() {
-    let planted = carried(&LEAF.replace("leaf() -> u32", "leaf() -> u64"), Some(reads::IDENTITY));
+    let planted = carried(&LEAF.replace("leaf() -> u32", "leaf() -> u64"), Some(reads::IDENTITY), Ids::Dirty);
     assert_eq!(planted.dirty, [(IDENTITY_NAME, 0)], "no entry has an identity read to post");
     assert!(planted.fresh.is_err(), "a caller entry that read the leaf's signature stayed as it was");
+}
+
+/// The delta's control: a signature edit of the leaf changes the callers' identities, and a
+/// delta that says `main.rs`'s bodies' identities are unchanged leaves the caller's entries as
+/// they were; the oracle finds the stale one. (The same edit with the exact delta is
+/// [`a_signature_edit_reaches_the_caller_through_its_identity`].)
+#[test]
+fn the_oracle_catches_an_identity_delta_that_leaves_a_change_out() {
+    let planted = carried(&LEAF.replace("leaf() -> u32", "leaf() -> u64"), None, Ids::MainLeftOut);
+    assert!(planted.dirty.is_empty(), "{:?}", planted.dirty);
+    assert!(planted.fresh.is_err(), "the caller's inference, which names the leaf's type, stayed as it was");
+}
+
+/// A hit in a second session: a new database of the same files and a new session over the
+/// same store find every entry without running one, each the bytes the first session kept.
+#[test]
+fn a_second_session_with_a_new_database_hits_every_entry() {
+    let kernel = kernel();
+    let mut store = Memory::default();
+    let first = {
+        let tree = Tree::new();
+        let mut session = Session::new(&tree);
+        ask_all(&kernel, &mut session, &mut store, &tree)
+    };
+    let tree = Tree::new();
+    let mut session = Session::new(&tree);
+    reset_runs();
+    let second = ask_all(&kernel, &mut session, &mut store, &tree);
+    assert_eq!(runs(), [0; Step::COUNT], "no entry runs: each is the store's");
+    differs(&second, &first).expect("every entry is the first session's");
 }

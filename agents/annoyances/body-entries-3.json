@@ -1,0 +1,14 @@
+{
+ "id": "body-entries-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane body-entries round 2",
+ "where": "crates/hir-ty/src/body_store.rs (Store::lookup), crates/blaze-cargo/src/serve/unit/deps.rs",
+ "what": "Deleting the item store's blaze_record lookup for inference, MIR and borrow check means the driver must drive the kernel body entries, or cross-process hits of those steps stop; the driver is another lane's file, so the deletion cannot land in one write-only lane.",
+ "cost": "the query-side piece moved to the next round",
+ "cause": "the item store's public surface (install, flush, Flushed) is the driver's, and the kernel entries have no driver yet",
+ "class": "one concept with two homes until its last caller moves (one-concept-one-home)",
+ "prevention": "start a piece that moves a concept's home with the driver's lane in the same batch",
+ "workaround": "design written in /tmp/body-entries2/next.md",
+ "fix": "owed",
+ "state": "open"
+}

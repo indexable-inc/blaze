@@ -1,0 +1,14 @@
+{
+ "id": "carry-driver-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane carry-driver3",
+ "where": "crates/blaze-cargo/src/serve/job.rs (9659 lines), daemon.rs, image.rs, blaze-graph admission kinds",
+ "what": "Moving one loop step onto a work task meant finding, across a 9.6k-line job.rs, how a no-job task is posted (giving.rs), how its value lands (Jobs::did), how a worker writes the store (it cannot: puts go back to the loop), where task kinds live (blaze-graph, not plane.rs as the brief said) and how the image adds a section: the whole first half of the lane's context went on reading, and no code was written in the round.",
+ "cost": "a round with no code",
+ "cause": "no doc says how to add a daemon task kind end to end (kind, forecast, Does arm, Value arm, settle, store puts)",
+ "class": "a recurring recipe known only by reading its instances",
+ "prevention": "a how-to row: 'a new task of the daemon's plane' naming giving.rs::give_values as the template and the six places",
+ "workaround": "handover /tmp/carry-driver3/next.md lists the places",
+ "fix": "none yet",
+ "state": "open"
+}
