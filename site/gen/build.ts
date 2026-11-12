@@ -267,9 +267,10 @@ async function build() {
 	cpSync(path.join(root, 'static'), dist, { recursive: true });
 	// The code graph page, at <base>/graph, standalone (graph/README.md).
 	await buildGraphPage(dist);
-	// The installer, at <base>/install.sh, from site/; the worker also answers <base>/ with it for curl
-	// (`curl -fsSL https://ix.dev/blaze | sh`).
+	// The installers, at <base>/install.sh and <base>/install.ps1, from site/; the worker also
+	// answers <base>/ with install.sh for curl (`curl -fsSL https://ix.dev/blaze | sh`).
 	cpSync(path.join(root, 'install.sh'), path.join(dist, 'install.sh'));
+	cpSync(path.join(root, 'install.ps1'), path.join(dist, 'install.ps1'));
 
 	write(path.join(gen, 'site.cbor'), snap);
 	cpSync(path.join(modules, 'site.wasm'), path.join(gen, 'site.wasm'));

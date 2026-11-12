@@ -1,7 +1,7 @@
 name: release
 
 # A tag `v0.YYYYMMDD.N` (a dated version, .github/scripts/train_release.py) builds blaze for
-# Linux (x86_64, aarch64) and macOS (aarch64), puts every asset into the R2 bucket blaze-releases (where blaze fetches
+# Linux (x86_64, aarch64), macOS (aarch64) and Windows (x86-64), puts every asset into the R2 bucket blaze-releases (where blaze fetches
 # it from, .github/scripts/r2.py) and makes a GitHub release of that name: a `.tar.xz` and a `.tar.gz` per target (`blaze` a hard link to `blaze-engine`), a `.sha256` of each, SHA256SUMS and B3SUMS (a pin's fetch checks every list a release has, crates/blaze-engine/src/versions.rs),
 # the standard library's source `library-<digest>.tar.xz` (docs/toolchain.md), and the
 # notes (what docs/CHANGELOG.md's [Unreleased] gained and what was merged since the release before). The release is a prerelease, the canary channel's,
@@ -174,6 +174,87 @@ jobs:
       - if: failure()
         uses: ./.github/actions/daemon-log
 
+  build-windows:
+    name: x86_64-pc-windows-msvc
+    needs: notes
+    runs-on: windows-2025
+    timeout-minutes: 330
+    env:
+      NAME: blaze-v${{ needs.notes.outputs.version }}-x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+      # Bootstrap Windows with the pinned nightly until .github/blaze-version names a release
+      # that already has a Windows asset. This is only stage 0: build_release.py immediately uses
+      # it to make the shipped stage 1 with blaze, so no release binary is cargo's build.
+      - uses: ./.github/actions/toolchain
+        with:
+          llvm: build
+      - name: Windows stage 0
+        shell: pwsh
+        run: |
+          cargo build --locked -p blaze-engine --profile dist
+          New-Item -ItemType Directory "$env:RUNNER_TEMP\blaze-stage0" | Out-Null
+          Copy-Item target/dist/blaze-engine.exe "$env:RUNNER_TEMP\blaze-stage0\blaze-engine.exe"
+          Copy-Item target/dist/blaze-engine.exe "$env:RUNNER_TEMP\blaze-stage0\blaze.exe"
+          "$env:RUNNER_TEMP\blaze-stage0" >> $env:GITHUB_PATH
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.5'
+          enable-cache: false
+      - name: release identity
+        shell: pwsh
+        run: |
+          "BLAZE_GIT_SHA=$($env:GITHUB_SHA.Substring(0, 7))" >> $env:GITHUB_ENV
+          "BLAZE_GIT_DATE=$(git show -s --date=format-local:%Y-%m-%d --format=%cd HEAD)" >> $env:GITHUB_ENV
+          if ("${{ github.ref_type }}" -eq "tag") { "BLAZE_RELEASE=${{ github.ref_name }}" >> $env:GITHUB_ENV }
+      - name: blaze build -p blaze-engine --profile dist
+        shell: pwsh
+        run: |
+          uv run --frozen --no-dev python .github/scripts/build_release.py '{"target":"x86_64-pc-windows-msvc","out":"shipped","pgo":"off"}'
+      - name: blaze build -p blaze-explore-core --target wasm32-unknown-unknown
+        shell: pwsh
+        run: |
+          blaze build --release --locked -p blaze-explore-core --target wasm32-unknown-unknown
+          Copy-Item target/wasm32-unknown-unknown/release/blaze_explore_core.wasm shipped/explore-core.wasm
+          blaze stop
+      - name: ZIP archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory $env:NAME | Out-Null
+          Copy-Item LICENSE-APACHE,LICENSE-MIT,README.md,docs/CHANGELOG.md $env:NAME
+          Copy-Item shipped/* $env:NAME
+          Copy-Item "$env:NAME/blaze-engine.exe" "$env:NAME/blaze.exe"
+          $said = & "$env:NAME/blaze.exe" --version | Select-Object -First 1
+          if ($said -notmatch '^blaze ${{ needs.notes.outputs.version }} \([0-9a-f]{7}( [0-9]{4}-[0-9]{2}-[0-9]{2})?\)$') { throw "unexpected version: $said" }
+          Compress-Archive -Path $env:NAME -DestinationPath "$env:NAME.zip" -CompressionLevel Optimal
+          $hash = (Get-FileHash -Algorithm SHA256 "$env:NAME.zip").Hash.ToLowerInvariant()
+          "$hash  $env:NAME.zip" | Set-Content -Encoding ascii "$env:NAME.zip.sha256"
+      - name: installation, upgrade and recovery
+        shell: pwsh
+        run: |
+          $config = @{ archive = "$($env:NAME).zip"; version = "${{ needs.notes.outputs.version }}"; work = "$env:RUNNER_TEMP\install-e2e" }
+          $client = New-Object Net.WebClient
+          try {
+            $previous = $client.DownloadString("https://blaze-releases.ix.dev/channels/stable").Trim().TrimStart("v")
+            $previousAsset = "blaze-v$previous-x86_64-pc-windows-msvc.zip"
+            $client.DownloadFile("https://blaze-releases.ix.dev/v$previous/$previousAsset", "$env:RUNNER_TEMP\$previousAsset")
+            $config.previous_archive = "$env:RUNNER_TEMP\$previousAsset"
+            $config.previous_version = $previous
+          } catch {
+            Write-Output "No earlier Windows archive is available; this is the first Windows release."
+          } finally { $client.Dispose() }
+          $config = $config | ConvertTo-Json -Compress
+          pwsh -NoLogo -NoProfile -File harness/windows_install.ps1 $config
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.NAME }}
+          path: |
+            ${{ env.NAME }}.zip
+            ${{ env.NAME }}.zip.sha256
+          if-no-files-found: error
+      - if: failure()
+        uses: ./.github/actions/daemon-log
+
   # ix.dev/explore reads this release's profile schema (.github/scripts/explore_page.py): the
   # page deploys from indexable-inc/ix and refuses a daemon whose schema it does not read, so a
   # release ahead of it would show users only that refusal (0.20261105.1, schema 5, page 1).
@@ -192,7 +273,7 @@ jobs:
 
   publish:
     name: GitHub release
-    needs: [notes, build, explore-page]
+    needs: [notes, build, build-windows, explore-page]
     if: github.ref_type == 'tag'
     runs-on: [ix, arm64, ix-mode-cold]
     timeout-minutes: 10
@@ -254,7 +335,7 @@ jobs:
           EOF
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
             --title "blaze $GITHUB_REF_NAME" --notes-file out/notes.md \
-            out/blaze-*.tar.xz out/blaze-*.tar.xz.sha256 out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS out/B3SUMS out/library-*.tar.xz
+            out/blaze-*.tar.xz out/blaze-*.tar.xz.sha256 out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/blaze-*.zip out/blaze-*.zip.sha256 out/SHA256SUMS out/B3SUMS out/library-*.tar.xz
       # A canary: promote.yaml tests the archives just published and makes this same release
       # stable when they pass (docs/release.md). By dispatch, since a release this token
       # publishes starts no `release:` workflow. The canary pointer moves in `metadata`.

@@ -82,6 +82,10 @@ def on(*hosts):
 
 
 EVERYWHERE = on()
+# Windows-native compiler, linker, path and daemon regressions. Kept separate from DAEMON:
+# those cases are the proof that the v2 daemon and its transport work on Windows, so excluding
+# them because the old client used a Unix socket would make the missing support invisible.
+WINDOWS = on("windows-x86_64")
 # What builds with the v2 daemon (rebuild.py, storelib.py): its CLI speaks over a Unix socket, so
 # not Windows.
 DAEMON = on("linux", "macos")
@@ -89,6 +93,21 @@ KEYS = 3
 # (part in the full tier, arguments, environment, where it runs, in the fast tier: None or not).
 # The order is the order of each part's run. A harness in the fast tier needs a line in FAST.
 HARNESSES = [
+    # One Windows-native suite, with observable runs in dev (Cranelift) and release (LLVM):
+    # path spellings, MSVC imports and CRTs, restart/cache reuse and interrupted build recovery.
+    # Incremental histories stay in deterministic simulation. It fails by name when the Windows
+    # daemon/bootstrap prerequisite is absent;
+    # cargo is never a substitute.
+    (
+        "windows",
+        [
+            "v2/windows.py",
+            arg({"engine": {"kind": "v2", "blaze": BLAZE_CLI}, "out": ""}),
+        ],
+        {},
+        WINDOWS,
+        None,
+    ),
     # An edit gives the program a fresh build gives (rebuild.py): two programs of one workspace.
     ("core", ["programs.py"], {}, DAEMON, 1),
     ("core", ["unwinds.py"], {}, DAEMON, 1),

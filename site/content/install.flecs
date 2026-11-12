@@ -5,16 +5,17 @@ site {
     Nav: {"Install", 1}
     Icon: {"download"}
     (InGroup, nav.reference)
-    Description: {"Install blaze with one line on macOS on Apple silicon or Linux, or with Nix."}
+    Description: {"Install blaze with one line on Windows, macOS on Apple silicon or Linux, or with Nix."}
 
-    Lede lede("One line, on macOS on Apple silicon or Linux, with or without Rust installed:")
+    Lede lede("One line, on Windows, macOS on Apple silicon or Linux, with or without Rust installed:")
     Command curl("curl -fsSL https://ix.dev/blaze | sh")
+    Code powershell(lang: "powershell", text: "irm https://ix.dev/blaze/install.ps1 | iex")
     P then("Then, in a project of yours, `blaze run`. Change a function and run it again: the `Finished` line now says `[blaze]` (blaze's engine), which means blaze built it, not cargo. What to do next: [Usage](/usage).")
     Code first(lang: "bash", text: "blaze run")
 
     Section needs(title: "What you need") {
       Ul list {
-        Li platform("**macOS on Apple silicon, or Linux on x86-64 or ARM64.** Intel Macs are not supported, and neither is Windows yet ([platforms](https://github.com/indexable-inc/blaze/blob/main/docs/platforms.md#windows-x86-64-msvc)).")
+        Li platform("**Windows on x86-64, macOS on Apple silicon, or Linux on x86-64 or ARM64.** Intel Macs and 32-bit Windows are not supported.")
         Li glibc("**On Linux, glibc 2.34 or newer:** RHEL 9, Debian 12, Ubuntu 22.04 and anything newer. Alpine and other musl systems are not supported; the installer says so.")
         Li cc("**A C compiler for linking:** `gcc` or `cc` on Linux, Apple's command line tools on macOS (`xcode-select --install`).")
         Li container("**In a container, user namespaces.** Build scripts and proc macros run in a sandbox made of Linux namespaces, which Docker's default seccomp profile refuses: run the container with `--security-opt seccomp=unconfined`, or set `BLAZE_SANDBOX=off` to run them outside a sandbox, as cargo does.")
@@ -24,7 +25,7 @@ site {
     }
 
     Section installer(title: "What the installer does") {
-      P what("It downloads the build for your machine from the [releases](https://github.com/indexable-inc/blaze/releases), checks it against the published checksums, puts `blaze` and the programs it runs in `~/.cargo/bin`, and has blaze download its Rust. It asks nothing. Run it again to upgrade.")
+      P what("It downloads the build for your machine from the [releases](https://github.com/indexable-inc/blaze/releases), checks it against the published checksums, puts `blaze` and the programs it runs in the Cargo bin directory, and has blaze download its Rust. It asks nothing. Run it again to upgrade.")
       P versions("Releases are dated, `0.YYYYMMDD.N`. A canary is published whenever main has changed and main's build of it passes; a canary whose commit then passes main's unit tests on every platform and the heavy tests (building and testing bun, servo, cargo, zed and others, and beating cargo on them) becomes the stable release, which the installer installs. End the line with `| sh -s -- --channel canary` for the newest canary, or `| sh -s -- --version 0.YYYYMMDD.N` for a given release; `--help` says what else it takes.")
     }
 

@@ -1,0 +1,15 @@
+{
+ "id": "windows-regressions-1",
+ "date": "2026-11-12",
+ "who": "gpt-5 (Codex), main agent",
+ "where": "Windows contributor Python setup",
+ "what": "`py -I harness/v2/agents.py` selected Python 3.9 and failed on `str | None`; the documented `uv run --frozen` command then failed because `uv` is not installed.",
+ "cost": "Local agent how-to lookup and Python harness self-tests could not start.",
+ "cause": "The checkout does not provide or bootstrap the Python 3.13 and uv tools that its contributor commands require.",
+ "whys": "The scripts require Python 3.13; Windows resolves `py` to 3.9; no repository-local launcher installs the pinned interpreter; the documented command assumes uv is already present; therefore a fresh Windows checkout cannot run the agent or harness scripts.",
+ "class": "Contributor checks whose required interpreter and runner are assumed rather than bootstrapped.",
+ "prevention": "Provide one repository bootstrap entry point that installs the pinned uv and Python and runs typed scripts identically on every supported host; open.",
+ "workaround": "Implement with source inspection and run the checks after uv and Python 3.13 are available.",
+ "fix": "Not part of the Windows regression coverage change.",
+ "state": "open"
+}

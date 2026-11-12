@@ -70,6 +70,7 @@ HOSTS = {
     ("linux", "x86_64"): "x86_64-unknown-linux-gnu",
     ("linux", "aarch64"): "aarch64-unknown-linux-gnu",
     ("darwin", "arm64"): "aarch64-apple-darwin",
+    ("win32", "AMD64"): "x86_64-pc-windows-msvc",
 }
 TAIL_LINES = 80
 
@@ -303,8 +304,20 @@ async def check_binary(build: Build, binary: Path) -> list[str]:
         wrong += [
             f"{binary.name} loads {line.strip()}" for line in lines if NOT_LOADED["darwin"].search(line)
         ]
+    elif data[:2] == b"MZ":
+        shown = (
+            await run(
+                f"check {binary.name}", ["dumpbin", "/nologo", "/dependents", str(binary)],
+                secs=build.check_secs,
+            )
+        ).stdout
+        forbidden = re.compile(r"(?i)\b(?:vcruntime\d*|msvcp\d*|ucrtbase)\.dll\b")
+        wrong += [
+            f"{binary.name} loads the dynamic Visual C++ runtime {match.group(0)}"
+            for match in forbidden.finditer(shown)
+        ]
     else:
-        wrong.append(f"{binary.name} is neither ELF nor Mach-O")
+        wrong.append(f"{binary.name} is neither ELF, Mach-O nor PE")
     return wrong
 
 
@@ -342,11 +355,11 @@ async def main_async(build: Build) -> None:
     out.mkdir(parents=True, exist_ok=True)
     shipped: list[Path] = []
     for name in binaries():
-        path = built / name
+        path = built / f"{name}{'.exe' if sys.platform == 'win32' else ''}"
         if not path.is_file():
             raise Failed(f"build: `{' '.join(cmd)}` ended well and made no {path}")
-        shutil.copy2(path, out / name)
-        shipped.append(out / name)
+        shutil.copy2(path, out / path.name)
+        shipped.append(out / path.name)
     async with asyncio.TaskGroup() as group:
         checks = [group.create_task(check_binary(build, binary)) for binary in shipped]
     wrong = [item for task in checks for item in task.result()]
@@ -361,7 +374,7 @@ async def main_async(build: Build) -> None:
         f"{said.stdout.strip()}; each loads no libLLVM"
         + (
             ""
-            if sys.platform == "darwin"
+            if sys.platform in ("darwin", "win32")
             else f" or C++ runtime and asks for glibc {'.'.join(map(str, GLIBC))} or older"
         ),
         flush=True,

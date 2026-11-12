@@ -8,6 +8,12 @@ summary: Installing blaze: the install script, the release channels and what get
 curl -fsSL https://ix.dev/blaze | sh
 ```
 
+On Windows, from Windows PowerShell 5.1 or PowerShell 7:
+
+```powershell
+irm https://ix.dev/blaze/install.ps1 | iex
+```
+
 Then, in a project of yours:
 
 ```sh
@@ -20,9 +26,8 @@ changed. What to do next: [usage.md](usage.md).
 
 ## What you need
 
-- **macOS on Apple silicon, or Linux on x86-64 or ARM64.** Windows has no release build and
-  the installer refuses it; v2 has not been run there (v1's port:
-  [platforms.md](platforms.md#windows-x86-64-msvc)). Intel Macs are not supported.
+- **Windows on x86-64, macOS on Apple silicon, or Linux on x86-64 or ARM64.** Intel Macs and
+  32-bit Windows are not supported.
 - **On Linux, glibc 2.34 or newer**: RHEL 9, Debian 12, Ubuntu 22.04 and anything newer. Each
   is checked by installing there in a container with no Rust. Alpine and other musl systems are
   not supported; the installer says so.
@@ -59,7 +64,8 @@ The installer downloads the build for your machine from blaze's releases
 (`https://blaze-releases.ix.dev`, an R2 bucket at Cloudflare's edge, [release.md](release.md#where-the-bytes-are);
 the [GitHub releases](https://github.com/indexable-inc/blaze/releases) list the same ones with
 their notes), checks it against the checksums
-published with it, puts `blaze` and the programs it runs in `~/.cargo/bin`, and
+published with it, puts `blaze` and the programs it runs in `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin`
+on Windows), and
 runs `blaze toolchain` to download its Rust, a command v2's blaze does not have, so on v2 this
 step fails. It asks nothing. Run it again to upgrade, or run `blaze update`
 ([Updates](#updates)). Releases are dated, `0.YYYYMMDD.N`, and come in two channels
@@ -67,7 +73,8 @@ step fails. It asks nothing. Run it again to upgrade, or run `blaze update`
 (real projects on macOS and Linux), and **canary** is the newest release, published as soon as
 it is built and promoted to stable, unchanged, once it passes them. End the line with
 `| sh -s -- --channel canary` (or set `BLAZE_CHANNEL=canary`) for canary, or with
-`| sh -s -- --version 0.YYYYMMDD.N` for a given release;
+`| sh -s -- --version 0.YYYYMMDD.N` for a given release. On Windows, save `site/install.ps1`
+and pass `-Channel canary` or `-Version 0.YYYYMMDD.N`;
 `--no-toolchain` skips that download (v1 left it to the first build; v2's first build does not
 download it), and `--help` says what else it takes.
 Over a blaze from before 2026-10-28 it removes the programs with their old names and says so.
