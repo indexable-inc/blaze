@@ -433,6 +433,17 @@ fn the_keys_of_the_coercion_site_before_and_after_the_override() {
     eprintln!("app::shapes: {keys:?}; the same: {}", keys[0] == keys[1]);
     let keys = keys_of("an_impl_overriding_a_provided_method_changes_its_vtable", "app::all");
     eprintln!("app::all (the case that passes): {keys:?}; the same: {}", keys[0] == keys[1]);
+    // What of `shapes` differs: its relocations and data in each revision, and the names.
+    let test = Test::read(&spec::cases(), "an_override_beside_a_required_method_changes_the_vtable");
+    for index in 0..2 {
+        let text = text_at(&test, index);
+        let (mut db, file) = database(&fixture(&text));
+        db.set_file_text(file, &text);
+        let built = build(&db, &Memo::new(), &Kept::default(), blaze_store_check::Setting::OFF, false).expect("the revision builds");
+        let (instance, _) = built.debug_names.iter().find(|(_, it)| it == "app::shapes").expect("shapes");
+        let function = built.functions.iter().find(|it| it.key == *instance).expect("its code");
+        eprintln!("rev{}: relocs {:?}\n  data {:?}\n  names {:?}", index + 1, function.relocs, function.data, built.debug_names);
+    }
 }
 
 macro_rules! sim {
