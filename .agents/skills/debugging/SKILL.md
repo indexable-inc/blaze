@@ -291,6 +291,37 @@ WHERE a.hash IS DISTINCT FROM b.hash ORDER BY item, part
 - If the build never ends, `open` holds the spans every thread was inside at the last flush,
   and `blaze slow` reports a build whose daemon died.
 
+## Fixing the compiler without compiling the world again
+
+Everything stored is keyed by the code identity of what made it: `codegen` (every template),
+`front_end` (images, check outcomes, bodies, goals, expansions) and `record` (unit records, with
+the other two). Each is a hash of whole packages, worked out by blaze-engine's build script
+under cargo and under blaze alike, so a fix to one front-end file misses every image and record,
+and a cargo-built blaze has other identities than a blaze-built one of the same tree.
+
+- `blaze debug toolchain` prints one line of JSON with no daemon: `built` (this blaze's three),
+  `keyed` (what it keys by), `assumed`, and `as`, the value to give another blaze:
+  `{"as":"codegen=<hex>,front_end=<hex>,record=<hex>","assumed":false,"built":{...},"keyed":{...}}`.
+- `BLAZE_DEV_TOOLCHAIN_AS=<as>` in the environment of the rebuilt blaze (and so of the daemon
+  it starts) keys as that blaze did, part by part; a part left out keeps this blaze's own, so
+  what that part's code makes is made again. After a fix to the front end, assume `codegen`
+  alone: every template is reused, every image, check and record is made again, and nothing
+  stale is served. Assume a part whose code you changed only when you know which stored
+  values the change touched, and say so with the number.
+- It is loud and bounded: every build and check starts with one `warning:` naming what is
+  assumed; `--release`, `-r`, a `--profile` other than `dev` or `test`, `bench` and `--goal max`
+  are refused naming the argument; the store check (`BLAZE_VERIFY_STORE`) runs at a rate of at
+  least 0.05, so a stale template is an error naming the function. A command whose value
+  differs from its daemon's is refused naming both (`blaze stop`, then run it again).
+- Never quote a measurement from a build under it as a build's time: `blaze explain problems`
+  lists the warning.
+
+There is no `blaze debug evict` yet: the store never deletes or replaces a value (a second
+value under a key is a refusal), the daemon's database has no reverse edges, and unit records
+do not name the keys they were made from, so the dependents of an entry cannot be found.
+A stored value the fixed code would make otherwise is reached today only by leaving its part
+out of `BLAZE_DEV_TOOLCHAIN_AS`.
+
 ## Limits to keep in mind
 
 - A key's name is its `Debug` with each id the front end can name followed by its name

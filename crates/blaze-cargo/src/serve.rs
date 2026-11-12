@@ -19,6 +19,7 @@
 mod breakdown;
 pub mod ceiling;
 mod daemon;
+pub mod dev_toolchain;
 mod fetch;
 mod fetch_url;
 mod gc;

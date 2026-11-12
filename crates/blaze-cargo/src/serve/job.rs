@@ -3889,6 +3889,19 @@ impl<S: Steps> Jobs<S> {
         let Viewed { root_dir, root, config, encoded, key } =
             Self::viewed(&self.setup, &mut self.roots, w, &job.work, &opened, library);
         let request = request_id(&job.work);
+        // A blaze that keys as another toolchain (`BLAZE_DEV_TOOLCHAIN_AS`) says so before
+        // anything else of each build or check, and refuses one whose outputs may be shipped.
+        if request.is_some()
+            && let Some(dev) = super::dev_toolchain::dev()
+        {
+            let invocation = &config.invocation;
+            if let Some(refused) = dev.refuses(invocation.command.name(), &invocation.args) {
+                self.end(w, id, false, Some(ApiError::new(refused, None)));
+                return;
+            }
+            let warning = Diagnostic::warning(dev.said());
+            w.said.push(Said::Report(id, Response::Diagnostic(warning)));
+        }
         let config = Arc::new(config); // alloc: once per view, shared with its tasks
         // Any job of a checkout that walks drops the checkout's kept answer (it may place
         // other outputs); a build or a check that walks may become the next

@@ -45,7 +45,8 @@ const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live 
                            [--match TEXT] [--cores [LINES]] [--html FILE] [--trace FILE] \
                            | blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE] \
                            | blaze debug locks [--build N] [--top N] [--json] \
-                           | blaze debug edits KIND [--file PATH] [--fn NAME[:LINE]] [--runs N] [--json] [-- BUILD ARGS]";
+                           | blaze debug edits KIND [--file PATH] [--fn NAME[:LINE]] [--runs N] [--json] [-- BUILD ARGS] \
+                           | blaze debug toolchain";
 const EXPLAIN_USAGE: &str =
     "blaze explain RULE | PACKAGE [--json] | memory [BUILD] [limit=N] [--json] | VIEW [NAME=VALUE ...] [--json]";
 const MEMORY_USAGE: &str = "blaze explain memory [BUILD] [limit=N] [--json]";
@@ -137,11 +138,46 @@ pub fn debug(words: Vec<OsString>, color: bool) -> i32 {
         Some("time") => time(words.collect()),
         Some("gate") => gate(words.collect()),
         Some("locks") => locks(words.collect()),
+        Some("toolchain") => match words.next() {
+            None => toolchain(),
+            Some(word) => Err(Refusal::Usage(format!(
+                "blaze debug toolchain takes nothing, not `{}`",
+                word.to_string_lossy()
+            ))),
+        },
         // The edit loop as one command (`edits.rs`), which says its own usage and exit code.
         Some("edits") => return super::edits::main(words.collect(), color),
         _ => Err(Refusal::Usage(DEBUG_USAGE.to_owned())),
     };
     said(result, color)
+}
+
+/// `blaze debug toolchain`: the three code identities this blaze keys what it stores by, as
+/// one line of JSON, with no daemon: `built` as its build script worked them out, `keyed` as
+/// it keys (other than `built` only under `BLAZE_DEV_TOOLCHAIN_AS`, `assumed` then true), and
+/// `as`, the value of `BLAZE_DEV_TOOLCHAIN_AS` under which another blaze keys as this one does
+/// (`crate::serve::dev_toolchain`).
+fn toolchain() -> Result<(), Refusal> {
+    use crate::serve::dev_toolchain::{self, Codes};
+    let keyed = crate::serve::record_makers().map_err(Refusal::Failed)?;
+    let keyed =
+        Codes { codegen: keyed.codegen, front_end: keyed.front_end, record: keyed.record };
+    let dev = dev_toolchain::dev();
+    let built = dev.map_or(keyed, |it| it.built);
+    let codes = |it: Codes| {
+        let mut map = Map::new();
+        map.insert("codegen".to_owned(), Value::String(format!("{:x}", it.codegen)));
+        map.insert("front_end".to_owned(), Value::String(format!("{:x}", it.front_end)));
+        map.insert("record".to_owned(), Value::String(format!("{:x}", it.record)));
+        Value::Object(map)
+    };
+    let mut out = Map::new();
+    out.insert("as".to_owned(), Value::String(keyed.spelled()));
+    out.insert("assumed".to_owned(), Value::Bool(dev.is_some()));
+    out.insert("built".to_owned(), codes(built));
+    out.insert("keyed".to_owned(), codes(keyed));
+    println!("{}", Value::Object(out));
+    Ok(())
 }
 
 /// `blaze debug hot [--top N] [--last-build]`: the N keys (20) that took most time and each
