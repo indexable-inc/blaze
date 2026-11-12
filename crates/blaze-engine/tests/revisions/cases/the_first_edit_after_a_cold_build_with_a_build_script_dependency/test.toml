@@ -1,10 +1,25 @@
-about = "The first edit after a cold build, in a workspace with a library package whose build script leaves a file in OUT_DIR: the edit makes the one edited function again and no unit but its own, as the second edit does. The build script's crate is not keyed by what its own run left, so nothing asks the store for the standard library's images mid-life, and every crate keeps the module ids it was resolved with."
+about = "A no-op and then the first edit after a cold build, in a workspace with a library package whose build script leaves a file in OUT_DIR: the edit makes the one edited function again and no unit but its own, as the second edit does. The build script's crate is not keyed by what its own run left, so nothing asks the store for the standard library's images mid-life, and every crate keeps the module ids it was resolved with."
 drivers = ["real"]
 
 [[revision]]
 action = "run"
 args = ["-p", "app"]
 prints = "52 3\n"
+
+# A no-op after the cold build: nothing is made again, and its engine work is bounded.
+[[revision]]
+steps = []
+action = "run"
+args = ["-p", "app"]
+prints = "52 3\n"
+redone = []
+max_units = 0
+max_executed = 200
+max_verified = 2000
+
+[revision.known]
+"real: max_executed" = "the first request after a cold build runs about 680 engine memos for the first time (681 seen on 2026-11-12 at 9f913965cb: signature_syntax 142, AttrFlags::query 131, TypeAliasSignature::kept 121, VariantFields::kept 203, ConstSignature::kept 29, FunctionSignature::kept 22, module_indexes 24), whether it is a no-op or an edit; which stage asks them is not found yet (lane firstedit-1112)"
+"real: max_verified" = "and verified 91,875 cached results at 9f913965cb (FunctionSignature::kept 41,689, ImplItems::of 19,264, ConstSignature::kept 13,584): the cold build wrote Cargo.lock into the checkout, so this request's view differs from the build's and it is walked, not answered as the last one was. Not measured with the walk's reach (firstedit-1112): if it passes, remove this row"
 
 [[revision]]
 action = "run"
