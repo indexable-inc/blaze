@@ -244,6 +244,7 @@ impl Launches {
         // the next build to be made, never replayed.
         core.record = None;
         let (serial, given) = tables(core.spans)?;
+        let _span = tracing::info_span!(target: "blaze", "launch link: the program takes the build").entered();
         let told = match &given {
             Given::Whole(all) => core.program.built(built, entry, Tables::Whole(all)),
             Given::Changed { tables, removed } => {
@@ -464,12 +465,15 @@ pub(crate) fn link(
     let socket = launches.listen()?;
     let (file, key) = launches.launcher(&job.shared.launcher, path)?;
     let first = launches.programs.pin().get(&program_id(path)).is_none();
-    let record = super::super::compile::record_key(job, unit).map_err(|it| it.what)?;
+    let record = tracing::info_span!(target: "blaze", "launch link: the unit's record key")
+        .in_scope(|| super::super::compile::record_key(job, unit))
+        .map_err(|it| it.what)?;
     let told = launches.built(path, generated.built, "main", record, |held| {
         // What `LinkInputs` says, against the snapshot the program holds: the same snapshot
         // (nothing changed), a change of it, every table made anew (`work.whole`), or a
         // snapshot the program does not hold, when every table is asked for.
-        let side = generated.side()?;
+        let side = tracing::info_span!(target: "blaze", "launch link: the build's span tables")
+            .in_scope(|| generated.side())?;
         // clone (each below): tables into the program's own copy
         let changed = || Given::Changed {
             tables: side.tables.iter().map(|it| (it.anchor, it.bytes.clone())).collect(),

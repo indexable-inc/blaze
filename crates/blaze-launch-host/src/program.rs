@@ -157,6 +157,42 @@ struct Image {
     arch: Arch,
 }
 
+/// The build's instances by identity, each with its key and its code: `identities` (by key)
+/// and `codes` beside it, sorted by identity. An identity is a BLAKE3 hash, so the list is
+/// first dealt into 4096 runs by its leading twelve bits (in the order `ContentId` compares:
+/// its bytes) and each run of a few is sorted: a pass and a half over the list where a sort
+/// of twelve thousand 96-byte rows was a millisecond of every build.
+fn by_identity(identities: &[(InstanceKey, ContentId)], codes: &[CodeHash]) -> Vec<(ContentId, InstanceKey, CodeHash)> {
+    const RUNS: usize = 1 << 12;
+    let run = |identity: &ContentId| (usize::from(identity.0[0]) << 4) | usize::from(identity.0[1] >> 4);
+    // alloc (each below): once a build, let go at its end
+    let mut ends = vec![0u32; RUNS + 1];
+    for (_, identity) in identities {
+        ends[run(identity) + 1] += 1;
+    }
+    for at in 1..ends.len() {
+        ends[at] += ends[at - 1];
+    }
+    // Each run's next free place, then its end once every row is dealt.
+    let mut order = vec![0u32; identities.len()];
+    let mut next = ends[..RUNS].to_vec();
+    for (at, (_, identity)) in identities.iter().enumerate() {
+        let run = run(identity);
+        order[next[run] as usize] = at as u32;
+        next[run] += 1;
+    }
+    for run in 0..RUNS {
+        order[ends[run] as usize..ends[run + 1] as usize].sort_unstable_by_key(|at| identities[*at as usize].1);
+    }
+    order
+        .iter()
+        .map(|at| {
+            let (key, identity) = identities[*at as usize];
+            (identity, key, codes[*at as usize])
+        })
+        .collect()
+}
+
 /// One launcher.
 struct Launcher {
     conn: Conn,
@@ -661,15 +697,20 @@ impl Program {
         };
         let arch = first.arch;
         // alloc: the image's lists, once a build (each a copy of a list of the build's)
-        let mut by_identity: Vec<(ContentId, InstanceKey, CodeHash)> = Vec::with_capacity(built.identities.len());
-        for (key, identity) in &built.identities {
-            let code = match built.owners.binary_search_by_key(key, |it| it.0) {
-                Ok(at) => built.owners[at].2,
-                Err(_) => return Err(format!("{key:?} has an identity and no owner in its build")),
-            };
-            by_identity.push((*identity, *key, code));
+        // Each identity's code, in the identities' order: both lists are by key, so one pass
+        // over the two.
+        let mut codes: Vec<CodeHash> = Vec::with_capacity(built.identities.len());
+        let mut owner = 0;
+        for (key, _) in &built.identities {
+            while built.owners.get(owner).is_some_and(|it| it.0 < *key) {
+                owner += 1;
+            }
+            match built.owners.get(owner) {
+                Some(it) if it.0 == *key => codes.push(it.2),
+                _ => return Err(format!("{key:?} has an identity and no owner in its build")),
+            }
         }
-        by_identity.sort_unstable_by_key(|it| it.0);
+        let by_identity = by_identity(&built.identities, &codes);
         let Some(entry_key) = built.symbols.iter().find(|it| it.1 == entry).map(|it| it.0) else {
             return Err(format!("the build defines no `{entry}`: it is no program"));
         };
@@ -695,12 +736,26 @@ impl Program {
             }
             statics.push(((of.item, of.instance), record::of_static(of, &name, arch, &self.spans)?));
         }
+        // Nothing below refuses: the build before is taken, and the new one is the program's
+        // before this returns. A name the build before had under the same key is moved, not
+        // copied: a body edit changes one key of some twelve thousand.
+        let mut before = self.image.take();
+        let mut was = before.as_mut().map(|it| std::mem::take(&mut it.names)).unwrap_or_default().into_iter().peekable();
+        let mut names: Vec<(InstanceKey, String)> = Vec::with_capacity(built.debug_names.len());
+        for (key, name) in &built.debug_names {
+            while was.next_if(|it| it.0 < *key).is_some() {}
+            match was.next_if(|it| it.0 == *key && it.1 == *name) {
+                Some(kept) => names.push(kept),
+                None => names.push((*key, name.clone())), // clone: a name the build before had not
+            }
+        }
+        drop(was);
         let image = Image {
             functions: built.functions.clone(), // clone: a count a function
             merged: built.deduped.merged.iter().map(|(from, to)| (*from, *to)).collect(),
             identities: built.identities.clone(), // clone: the build's list, once a build
             by_identity,
-            names: built.debug_names.clone(), // clone: the build's names, once a build
+            names,
             statics,
             inits,
             entry: entry_identity,
@@ -710,7 +765,7 @@ impl Program {
         // What changed, against the build before.
         self.builds += 1;
         self.welcome = None;
-        let before = self.image.replace(image);
+        self.image = Some(image);
         let image = self.image.as_ref().expect("just set");
         let mut restart: Option<String> = None;
         let mut bodies: Vec<(CodeHash, CodeHash, ContentId)> = Vec::new(); // alloc: once a build
@@ -718,11 +773,16 @@ impl Program {
             if before.entry != image.entry {
                 restart = Some("the program's entry is another function".to_owned()); // alloc: once
             }
+            // Both by identity: one pass over the two.
+            let mut was = 0;
             for (identity, _, code) in &image.by_identity {
-                let Ok(at) = before.by_identity.binary_search_by_key(identity, |it| it.0) else {
+                while before.by_identity.get(was).is_some_and(|it| it.0 < *identity) {
+                    was += 1;
+                }
+                let Some((_, _, old_code)) = before.by_identity.get(was).copied().filter(|it| it.0 == *identity)
+                else {
                     continue;
                 };
-                let (_, _, old_code) = before.by_identity[at];
                 // The entry (the C `main` the front end makes around the program's `fn
                 // main`) follows `fn main`'s code and has no body of its own to edit, and its
                 // one frame is the process's first: it is rebound with `fn main` and not
