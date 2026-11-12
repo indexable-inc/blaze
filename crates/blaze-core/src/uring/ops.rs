@@ -283,6 +283,12 @@ impl Ops {
         self.hot.contains(id)
     }
 
+    /// How many operations are in flight: what the tests compare with their model.
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.hot.len()
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.hot.is_empty()
     }
