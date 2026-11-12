@@ -343,6 +343,8 @@ impl Real {
             // No build ran: nothing was made again, and no memo ran.
             (seen.redone, seen.executed, seen.verified) = (Some(Vec::new()), Some(0), Some(0));
             seen.records = Some(0);
+            // No build ran, so no unit was made, whether or not a `blaze-work` line said so.
+            seen.units = Some(seen.units.unwrap_or(0));
             seen.why = "answered as the last build was (the no-op lane)".to_owned();
             return seen;
         }
