@@ -147,9 +147,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     invariant:` or `/// The refinement:` on its test) and raise its level of evidence as needed:
     tested, simulated, model-checked, proved in Lean; `scripts/src/bin/invariants.rs` lists them and
     the gate holds each to its control. Skill: `testing`.
-54. **guard-the-cause**: When you find bad code or a bad decision, find why it was made and remove that
-    cause with a guard (a lint, a check in the gate, a rule or a skill's instruction), so it cannot
-    be written again; do this unasked. Skill: `changing-code`.
+54. **guard-the-cause**: For every issue or annoyance, however small, ask why until you reach the core
+    reason (about five whys), name the whole class of problem it belongs to, change the architecture
+    so that class cannot happen, and build that change, unasked; a guard (a lint, a gate check, a
+    rule) is the least, not the goal. Skill: `changing-code`.
 55. **own-the-language**: blaze owns its compiler and is its own first user: never design around what
     Rust lacks; when code would be clearer, safer or zero-cost with a language feature Rust has not
     stabilized or does not have (const generic expressions, for one), build it properly in blaze as
