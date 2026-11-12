@@ -943,16 +943,35 @@ impl DefMap {
         block: Option<BlockInfo>,
     ) -> DefMap {
         let mut modules = ModulesMap::new();
-        // `empty` runs only inside the queries that build a def map, and the root id goes only
-        // into the `DefMap` that query returns.
-        let root = ModuleIdLt::new(
-            db,
-            krate,
-            block.map(|it| it.block),
-            None,
-            Name::new_symbol_root(sym::__empty),
-        )
-        .to_static();
+        // The invariant: a crate has one root module id, whoever makes its `DefMap`.
+        //
+        // A crate's own `DefMap` (no block) takes the root `facts::queries::crate_root`
+        // makes, as the name resolution maintainer does and as `child_module` keys every
+        // other module by: a module's id is a function of its crate and its path, never of
+        // which query built the map. Until 2026-11-11 a `DefMap` decoded from a dependency
+        // image made its root here, a tracked struct of the decoding query and so another id
+        // than the maintainer's for the same crate: a crate that went from resolved to read
+        // from its image (its image stored by one build and served in the next) changed the
+        // id of every module it has, and with them of every item (a location is interned by
+        // its module), while the rows the build before made were still keyed by the old ones.
+        // Asked again, those rows ran against a `DefMap` that held none of their modules
+        // (reth, one edit after a cold build: `module .. vec of an item is not in its crate's
+        // def map`, `ModuleId not found in ModulesMap` with root Id(24250551) for a module
+        // whose root was Id(82944), both of `core`).
+        //
+        // A block's root is made here: `block_def_map` is the one query that builds a
+        // block's `DefMap`, and the id goes only into the map it returns.
+        let root = match &block {
+            None => facts::queries::crate_root(db, krate),
+            Some(block) => ModuleIdLt::new(
+                db,
+                krate,
+                Some(block.block),
+                None,
+                Name::new_symbol_root(sym::__empty),
+            )
+            .to_static(),
+        };
         modules.insert(root, module_data);
 
         DefMap {

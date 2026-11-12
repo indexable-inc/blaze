@@ -70,6 +70,7 @@ real! {
     an_impl_overriding_a_provided_method_changes_its_vtable
     an_unrelated_environment_variable
     build_then_run_then_build_are_no_ops
+    the_first_edit_after_a_cold_build_with_a_build_script_dependency
     the_first_test_after_a_run
 }
 

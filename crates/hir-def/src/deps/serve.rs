@@ -187,6 +187,9 @@ impl std::fmt::Display for Refused {
     }
 }
 
+/// The most crates of each kind a [`serve`]'s event names.
+const NAMED: usize = 12;
+
 /// What [`store`] did.
 #[derive(Debug, Default)]
 pub struct Stored {
@@ -293,6 +296,33 @@ pub fn serve(
     hits.sort_unstable_by_key(|krate| keys[krate]);
     if !changed {
         return Ok(Served { keys, hits, stale, build });
+    }
+    // What this serve changes of how each crate is read, named: a crate that gains an image
+    // is read from it from here on, and one that loses its image is resolved again. Either
+    // way every reader of the crate's def map runs again, so the write says which crates
+    // (rule 19). Bounded: the first [`NAMED`] of each, the rest counted.
+    {
+        let db = &*db;
+        let name = |krate: &Crate| krate.named(db).to_string(); // alloc: an event's names, at most `NAMED` a list
+        let list = |crates: &[Crate]| crates.iter().take(NAMED).map(name).collect::<Vec<_>>().join(", "); // alloc: as above
+        let gained: Vec<Crate> = (order.iter().map(|it| it.0))
+            .filter(|krate| served.contains_key(krate) && !before.contains_key(krate))
+            .collect(); // alloc: once per serve that changed what is served
+        let lost: Vec<Crate> = (order.iter().map(|it| it.0))
+            .filter(|krate| !served.contains_key(krate) && before.contains_key(krate))
+            .collect(); // alloc: as above
+        let again = order.len() - gained.len() - lost.len();
+        tracing::info!(
+            target: "blaze",
+            asked = order.len() as u64,
+            gained = gained.len() as u64,
+            lost = lost.len() as u64,
+            again = again as u64,
+            served = served.len() as u64,
+            gained_first = %list(&gained),
+            lost_first = %list(&lost),
+            "dependency images served: crates that gained an image are read from it, crates that lost theirs are resolved again"
+        );
     }
     frozen::set(db, maps);
     frozen::set_lang_items(db, lang_items);
