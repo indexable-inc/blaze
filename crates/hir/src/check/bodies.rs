@@ -840,6 +840,14 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
         }
     }
 
+    /// Whether `db` is, now, the database and the view the plan was made in: where a plan
+    /// that keeps runs ([`Plan::run_marked`] panics elsewhere). A plan that keeps nothing
+    /// runs in any. A plan made ahead of its run (a unit's, which its codegen is given
+    /// before its check starts) asks, and one made in a view gone by is made again.
+    pub fn made_in(&self, db: &Db) -> bool {
+        self.keep.is_none() || self.at == db.nonce_and_revision()
+    }
+
     /// The check's diagnostics, of each of its crates in their order: what
     /// [`check_module`](super::check_module) of each of their file modules gives, one after
     /// the other. A plan runs once.
