@@ -382,9 +382,9 @@ impl Program {
 
 /// `edits` applied to a program, each followed by a build and its link inputs; what the last
 /// link's inputs cost. `Err` names the first step after which the tables kept by applying
-/// each link's changes are not the tables made whole from the build. `plant` skips asking
-/// the database for the positions of the bodies kept.
-fn kept_is_whole(count: usize, edits: &[Edit], plant: bool) -> Result<InputsWork, String> {
+/// each link's changes are not the tables made whole from the build. `plant` is a control's
+/// bug ([`Plant`]).
+fn kept_is_whole(count: usize, edits: &[Edit], plant: Plant) -> Result<InputsWork, String> {
     let mut program = Program::new(count);
     let fx = fixture::db(&program.text());
     let file = fx.only_file();
@@ -457,19 +457,19 @@ fn edit(tc: &hegel::TestCase) -> Edit {
 #[hegel::test]
 fn the_link_inputs_kept_are_the_tables_made_whole(tc: hegel::TestCase) {
     let edits: Vec<Edit> = tc.draw(gs::vecs(edit()).max_size(8));
-    if let Err(why) = kept_is_whole(4, &edits, false) {
+    if let Err(why) = kept_is_whole(4, &edits, Plant::None) {
         panic!("{why}");
     }
 }
 
 /// A control of [`the_link_inputs_kept_are_the_tables_made_whole`]: with a link that does
-/// not ask the database for the positions of the bodies it kept, a reformat leaves every
-/// table on its old lines, and the oracle says at which step.
+/// not ask the engine which bodies' positions changed, a reformat leaves every table on its
+/// old lines, and the oracle says at which step.
 #[test]
 fn the_oracle_catches_a_moved_body_not_encoded_again() {
     let edits = [Edit::Reformat];
-    kept_is_whole(4, &edits, false).unwrap();
-    let why = kept_is_whole(4, &edits, true).expect_err("the oracle missed tables left stale");
+    kept_is_whole(4, &edits, Plant::None).unwrap();
+    let why = kept_is_whole(4, &edits, Plant::Unasked).expect_err("the oracle missed tables left stale");
     assert!(why.contains("after step 1"), "{why}");
 }
 
@@ -477,26 +477,40 @@ fn the_oracle_catches_a_moved_body_not_encoded_again() {
 /// gone are said, so a link holds no table the code does not name.
 #[test]
 fn a_function_gone_takes_its_tables() {
-    kept_is_whole(4, &[Edit::Drop(2), Edit::Patterns(0), Edit::Add(2), Edit::Patterns(0)], false)
-        .unwrap();
+    let edits = [Edit::Drop(2), Edit::Patterns(0), Edit::Add(2), Edit::Patterns(0)];
+    kept_is_whole(4, &edits, Plant::None).unwrap();
+}
+
+/// What one body edit among `count` functions costs the link inputs, as the counter holds
+/// it: tables encoded, their bytes, functions read, and owners whose kept tables were encoded
+/// again.
+fn body_edit_cost(count: usize, plant: Plant) -> (usize, usize, usize, usize) {
+    let work = kept_is_whole(count, &[Edit::Body(7)], plant).unwrap();
+    assert_eq!(work.whole, None, "{count} functions: the link before was kept");
+    assert_eq!((work.items, work.scanned), (0, 0), "{count} functions: no item is new");
+    assert_eq!(work.functions, 1, "{count} functions: one function has a new key");
+    (work.made, work.bytes, work.functions, work.verified)
 }
 
 /// The counter: after one body edit, the link inputs resolve no item, read the one function
-/// whose key is new and encode that body's tables, among 100 functions as among 2,000 (a
-/// fixture of 10,000 bodies takes minutes to lower). What still follows the program here is
-/// `verified`: every body of this fixture is the workspace's, so each is asked of the
-/// database again; a library's are not (`Kept::durable`), which no fixture crate is.
+/// whose key is new, encode that body's tables, and encode again the kept tables of the
+/// owners the engine names as moved, among 100 functions as among 2,000 (a fixture of 10,000
+/// bodies takes minutes to lower). Every body of this fixture is the workspace's and watched;
+/// none is asked of the database for being watched.
 #[test]
 fn a_body_edit_among_many_makes_its_own_tables() {
-    let mut costs = Vec::new();
-    for count in [100, 2_000] {
-        let work = kept_is_whole(count, &[Edit::Body(7)], false).unwrap();
-        assert_eq!(work.whole, None, "{count} functions: the link before was kept");
-        assert_eq!((work.items, work.scanned), (0, 0), "{count} functions: no item is new");
-        assert_eq!(work.functions, 1, "{count} functions: one function has a new key");
-        assert!(work.made <= 2 && work.bytes <= 1024, "{count} functions: {work:?}");
-        assert_eq!(work.verified, 2 * count, "each body and declaration of the workspace");
-        costs.push((work.made, work.bytes, work.functions));
-    }
+    let costs = [100, 2_000].map(|count| body_edit_cost(count, Plant::None));
+    let (made, bytes, _, verified) = costs[0];
+    assert!(made <= 4 && bytes <= 2048 && verified <= 2, "100 functions: {:?}", costs[0]);
     assert_eq!(costs[0], costs[1], "the same work among 100 functions as among 2,000");
+}
+
+/// The control of [`a_body_edit_among_many_makes_its_own_tables`]: a link that takes every
+/// watched owner as moved (what it did while it asked a stamp of each) gives the right
+/// tables, and the counter says its work follows the program.
+#[test]
+fn the_oracle_catches_a_link_that_asks_of_every_body() {
+    let costs = [100, 2_000].map(|count| body_edit_cost(count, Plant::Sweeps));
+    assert_ne!(costs[0], costs[1], "a sweep of every watched owner was counted as the edit's");
+    assert!(costs[1].3 >= 2_000, "2,000 functions: {:?}", costs[1]);
 }
