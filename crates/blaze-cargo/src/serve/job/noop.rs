@@ -258,9 +258,10 @@ pub(super) enum Unkept {
     /// Its last build looked at a path outside every view on the disk, the last one this:
     /// no watch vouches for it, so nothing says it is as it was.
     Looked(Option<PathBuf>),
-    /// An output of its last build is in no directory a watch can vouch for: right in the
-    /// build directory, under neither build directory, or named through a symlink.
-    Outputs,
+    /// This output of its last build, or this directory its outputs are in, is one no watch
+    /// can vouch for: an output right in the build directory or under neither build
+    /// directory, or a directory that is not there or is named through a symlink.
+    Outputs(PathBuf),
     /// Its builds read this off the disk where the daemon counts no look and asks no watch.
     Uncounted(&'static str),
 }
@@ -281,10 +282,11 @@ impl Unkept {
                 "a path outside the view which no watch covers, so each build looks at it on the disk"
                     .to_owned(),
             ),
-            Unkept::Outputs => Some(
-                "an output in no directory a watch can vouch for (right in the build directory, or named through a symlink)"
-                    .to_owned(),
-            ),
+            Unkept::Outputs(path) => Some(format!(
+                "{}, which no watch can vouch for (an output right in the build directory or outside it, or a \
+                 directory of outputs that is not there or is named through a symlink)",
+                path.display()
+            )),
             Unkept::Uncounted(what) => {
                 Some(format!("{what}, which each build reads off the disk and no watch covers"))
             }
@@ -312,9 +314,11 @@ impl fmt::Display for Unkept {
             Unkept::Looked(None) => f.write_str(
                 "its last build looked at a path outside every view on the disk, which no watch covers",
             ),
-            Unkept::Outputs => {
-                f.write_str("an output of its last build is in no directory a watch can vouch for")
-            }
+            Unkept::Outputs(path) => write!(
+                f,
+                "{} of its last build's outputs is one no watch can vouch for",
+                path.display()
+            ),
             Unkept::Uncounted(what) => {
                 write!(f, "its builds read {what} off the disk, which no watch covers")
             }

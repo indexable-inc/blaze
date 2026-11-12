@@ -1099,10 +1099,10 @@ answered. It is said again only while every input of that walk is as it was:
 | The checkout's files (sources, manifests, lock file, config in it) | the view's root, which the checkout's watcher commits before the request is seen |
 | Command, arguments, directory, the request's whole environment, config files outside the checkout, fetched sources and path dependencies, toolchain, blaze's version | the view's config, by its bytes |
 | Colors, width, `--refused`, `-v`, `--goal` | the request's own hash |
-| Paths outside the checkout a build script, proc macro or `include!` read | the watches outside views heard nothing since the kept walk began, and that walk looked at no such path on the disk |
+| Paths outside the checkout a build script, proc macro or `include!` read | the watches outside views heard nothing since the kept walk began, and that walk looked at no such path on the disk; a path named through symlinks (the macOS SDK's `libm.tbd`) is watched at each link and at the file they end at |
 | Path dependencies outside the checkout | each one's watch vouches for it; one named through a link, or a single file, is read again by every build |
 | A manifest above the checkout that is not there | looked at as the request is asked |
-| The outputs | each directory they are in has been watched since before the kept walk and heard nothing |
+| The outputs, the standard library's among them | each directory they are in (a profile's or a target's under the build directories, one build's under the daemon's `std` place) has been watched since before the kept walk and heard nothing; a `blaze run`'s launch writes none of them |
 | Layout profiles (`<target>/layout`) | watched when there, looked at when not |
 | Other jobs | none is under way |
 

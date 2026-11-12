@@ -2855,7 +2855,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 // `blaze run` of a dev executable: the programs are the steps' (review: the
                 // file it may write is the launch's, once per run).
                 Out::Pass(Arrived::Request { from, request: Request::Launch { program, pid } }) => {
-                    let (response, ok) = match self.steps.launch(&program, pid) {
+                    let placed = self.jobs.placed_key(&program);
+                    let (response, ok) = match self.steps.launch(&program, pid, placed) {
                         Ok(Some(env)) => (blaze_api::Response::Launched { live: true, env }, true),
                         // alloc: none, empty
                         Ok(None) => {

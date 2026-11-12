@@ -191,16 +191,41 @@ impl DevRuns {
     /// arena), which runs as linked. A dev executable this daemon neither linked nor replayed
     /// from a record ([`DevRuns::adopt`]) is an error naming it, never a run of its file that
     /// edits would not reach.
+    ///
+    /// `placed` is the content key of the output the daemon's builds placed at `path` and found
+    /// unchanged at their last look (`Jobs::placed_key`), or `None`. A dev executable whose
+    /// memory's file is that output is started from the file as it is: the launch writes
+    /// nothing, so the build after it places nothing and its outputs' watch hears nothing
+    /// (`file=placed` on the span). Any other is written from the memory first
+    /// (`file=written`, or `kept` for one this host wrote and nothing changed since).
     pub(crate) fn launch(
         &self,
         path: &str,
         pid: u32,
+        placed: Option<[u8; 32]>,
     ) -> Result<Option<Vec<(String, String)>>, String> {
-        let _span = tracing::info_span!(target: "blaze", "dev run launch", path, pid).entered();
+        let span = tracing::info_span!(
+            target: "blaze",
+            "dev run launch",
+            path,
+            pid,
+            file = tracing::field::Empty,
+        )
+        .entered();
         // clone: a count, once per launch, so no guard of the table is held while it writes
         let loaded = self.programs.pin().get(path).cloned();
         if let Some(loaded) = loaded {
-            return loaded.launch(path, pid).map(Some);
+            let (env, wrote) = loaded.launch(path, pid, placed)?;
+            span.record(
+                "file",
+                match wrote {
+                    host::Wrote::Placed => "placed",
+                    host::Wrote::Kept => "kept",
+                    host::Wrote::Cloned => "cloned",
+                    host::Wrote::Written => "written",
+                },
+            );
+            return Ok(Some(env));
         }
         let Some(format) = Format::host() else { return Ok(None) };
         if reserves(format, std::path::Path::new(path))? {
@@ -570,8 +595,11 @@ fn held(
 }
 
 /// The runs a `blaze run` started by process ID ([`Loaded::launch`]): each one's start, which
-/// the program is told has exited when its channel hangs up.
-type Launched = Arc<SharedMap<u32, Started>>;
+/// the program is told has exited when its channel hangs up, and when it was launched (for
+/// the `dev run attached` span). One whose start hook never attached is taken out when its
+/// start's wait ends ([`sessions_of`]), so an entry lives no longer than its process, or
+/// than the start's 60 s for a process that never attached.
+type Launched = Arc<SharedMap<u32, (Started, std::time::Instant)>>;
 
 /// What the thread that serves a program's runs holds of it: the program itself only weakly,
 /// so dropping the program ends the thread.
@@ -691,9 +719,16 @@ impl Loaded {
     /// What `blaze run` adds to the environment of process `pid`, which runs the executable at
     /// `path` once it execs it: the start hook's variable, which names this host's socket and
     /// a launch waiting for that process. The executable is written there first from the
-    /// memory when it is not the memory's file ([`Program::command`]). The run is the CLI's
-    /// process, outside any sandbox, as a `run` of a file is.
-    pub(crate) fn launch(&self, path: &str, pid: u32) -> Result<Vec<(String, String)>, String> {
+    /// memory when it is not the memory's file: the output of `placed`'s key that the build
+    /// placed there is, when that is the memory's file's key ([`Program::command_placed`]).
+    /// The run is the CLI's process, outside any sandbox, as a `run` of a file is. With what
+    /// was done of the file.
+    pub(crate) fn launch(
+        &self,
+        path: &str,
+        pid: u32,
+        placed: Option<[u8; 32]>,
+    ) -> Result<(Vec<(String, String)>, host::Wrote), String> {
         let command = Command {
             program: PathBuf::from(path),
             // alloc: none, empty: the CLI has the arguments, the environment and the directory
@@ -704,16 +739,18 @@ impl Loaded {
             sandbox: blaze_core::Sandbox::Off,
             memory: None,
         };
-        let (command, started) = self.command(command, false)?;
-        self.launched.pin().insert(pid, started);
-        command
+        let (command, started, wrote) =
+            self.program.command_placed(command, false, placed).map_err(|it| it.to_string())?;
+        self.launched.pin().insert(pid, (started, std::time::Instant::now()));
+        let env = command
             .env
             .into_iter()
             .map(|(name, value)| match (name.into_string(), value.into_string()) {
                 (Ok(name), Ok(value)) => Ok((name, value)),
                 _ => Err(format!("the start hook's variable for `{path}` is not UTF-8")),
             })
-            .collect()
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok((env, wrote))
     }
 
     /// The program, for a test queue that starts its binary's processes itself
@@ -745,6 +782,18 @@ fn sessions_of(
         match session {
             Ok(session) => {
                 let pid = session.pid;
+                // How long the program's start took from the daemon's side: from the launch
+                // answered to its start hook attached (the CLI's exec, the loader, and the
+                // handshake that lays the code memory over the image before `main`).
+                if let Some((_, at)) = served.launched.pin().get(&pid) {
+                    tracing::info_span!(
+                        target: "blaze",
+                        "dev run attached",
+                        pid,
+                        after_us = at.elapsed().as_micros() as u64,
+                    )
+                    .in_scope(|| {});
+                }
                 // clone: three counts and a weak one, once per run started
                 let (patch, failures, launched, program) = (
                     served.patch.clone(),
@@ -756,7 +805,7 @@ fn sessions_of(
                     .name("blaze dev run asks".to_owned())
                     .spawn(move || {
                         serve(session, &patch, &failures);
-                        let started = launched.pin().remove(&pid).copied();
+                        let started = launched.pin().remove(&pid).map(|(started, _)| *started);
                         if let (Some(started), Some(program)) = (started, program.upgrade()) {
                             program.exited(started);
                         }
@@ -765,7 +814,19 @@ fn sessions_of(
                     served.failures.push(format!("serving process {pid}'s asks: {error}"));
                 }
             }
-            Err(error) => served.failures.push(error.to_string()),
+            Err(error) => {
+                served.failures.push(error.to_string());
+                // The start that failed names no process: each launched run whose start
+                // ended unattached is forgotten, here and by the program.
+                if let Some(program) = served.program.upgrade() {
+                    let launched = served.launched.pin();
+                    for (pid, (started, _)) in launched.iter() {
+                        if program.forget_ended(*started) {
+                            launched.remove(pid);
+                        }
+                    }
+                }
+            }
         }
     }
 }

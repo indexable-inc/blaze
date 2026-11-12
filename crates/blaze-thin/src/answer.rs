@@ -54,6 +54,12 @@ impl Plain {
             // Shown only under `-v`, which is the engine's.
             Response::Unit(unit) if unit.verb == Verb::Fresh => Step::More,
             Response::Unit(_) => Step::HandOver("a unit is compiled"),
+            // What a build script's run said (its record's, for a script kept as for one
+            // run): the printer writes it only as a JSON message
+            // (`blaze_cargo::cli::print`), and a command line with `--message-format` is the
+            // engine's (`crate::route`). Every program's build has them: the standard
+            // library's own build scripts are units of its plan.
+            Response::BuildScript(_) => Step::More,
             Response::Built { profile, artifacts, .. } => {
                 if self.profile.is_some() {
                     return Step::HandOver("a second `Built`");
@@ -178,6 +184,24 @@ mod tests {
         assert_eq!(plain.take(Response::Done { ok: false }), Step::HandOver("the build failed"));
         assert!(matches!(plain.take(Response::Error(ApiError::new("no", None))), Step::HandOver(_)));
         assert!(matches!(plain.take(Response::Flushed { seq: 1 }), Step::HandOver(_)));
+        assert_eq!(plain.take(Response::Done { ok: true }), Step::Done);
+    }
+
+    /// The standard library's build scripts are units of every plan, so every answer has
+    /// their `BuildScript` responses: an answer with them is still plain (nothing is printed
+    /// of one outside JSON), or no build is ever answered here.
+    #[test]
+    fn what_a_build_script_said_is_plain() {
+        let mut plain = Plain::new();
+        let ran = blaze_api::BuildScriptRan {
+            env: vec![("STD_ENV_ARCH".to_owned(), "aarch64".to_owned())],
+            cfgs: vec!["backtrace_in_libstd".to_owned()],
+            out_dir: "/std/build/std/1f/out".to_owned(),
+            package_id: "path+file:///rustc/library/std#0.0.0".to_owned(),
+            linked_libs: Vec::new(),
+            linked_paths: Vec::new(),
+        };
+        assert_eq!(plain.take(Response::BuildScript(ran)), Step::More);
         assert_eq!(plain.take(Response::Done { ok: true }), Step::Done);
     }
 
