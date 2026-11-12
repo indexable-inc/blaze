@@ -63,8 +63,10 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
                 }
             }
         }
+        // The jail's own name is touched by the sync of its names a synced write ends with
+        // (`Effect::SyncDir`), which writes no file: `is_under` takes it.
         for (file, _) in &io.touched()[before..] {
-            if !file.is_under(jail.name()) || file == jail.name() {
+            if !file.is_under(jail.name()) {
                 return Err(format!("the path {raw:?} reached {file}, not beneath {}", jail.name()));
             }
         }
