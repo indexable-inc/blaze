@@ -1215,13 +1215,15 @@ fn run<F: Function>(
         // Before the run is looked at: what joined tasks handed it is its cycle's from here.
         adopt(storage, at, node);
         let mut done = ran(at);
-        if done.joined && done.head != NONE {
+        if done.joined {
             // It heads a cycle no query on this stack asked it for: a joined task made the
             // row it read. Its own row is seeded now, if this run did not ask for it either.
-            if header.verified.load(Ordering::Relaxed) & PROVISIONAL == 0 {
+            let seeded = header.verified.load(Ordering::Relaxed) & PROVISIONAL != 0;
+            if done.head != NONE && !seeded {
                 seed::<F>(db, storage, row, key);
             }
-            done.reentered = true;
+            // A seeded row holds its last round's value, as one a query here asked for does.
+            done.reentered |= seeded || done.head != NONE;
         }
         if done.remote != 0 && (done.head == NONE || done.head == at) {
             hand_to::<F>(db, storage, row, &done, at, word, new, key);
@@ -1594,9 +1596,9 @@ fn hand_to<F: Function>(
 ///
 /// Once a run, as it ends: every task that hands this head a row does so while this task is
 /// parked inside the run, and before the run it waits for ends ([`hand_to`]). A run that heads
-/// no cycle after all (no run here read a row of it: it was asked for by a task whose wait
-/// only looked like a dependency, a retry after a give-way) empties what it was handed, as
-/// made from a seed no round of it starts from.
+/// no cycle after all (no run here ever read a row of one: it was asked for by a task whose
+/// wait only looked like a dependency, a retry after a give-way) empties what it was handed,
+/// as made from a seed no round of it starts from.
 fn adopt(storage: &Storage, at: u32, node: u32) {
     if !storage.any_handed() {
         return;
@@ -1610,6 +1612,7 @@ fn adopt(storage: &Storage, at: u32, node: u32) {
         let frame = &local.frames[at as usize];
         frame.reentered || frame.joined
     });
+    let mut adopted = false;
     for member in handed {
         let Some(header) = member_header(storage, member) else { continue };
         if header.verified.load(Ordering::Acquire) & PROVISIONAL == 0
@@ -1621,6 +1624,7 @@ fn adopt(storage: &Storage, at: u32, node: u32) {
             reset_member(storage, member);
             continue;
         }
+        adopted = true;
         let meta = header.meta.load(Ordering::Relaxed);
         let read = header.edges.swap(0, Ordering::Relaxed);
         local::with(|local| {
@@ -1641,6 +1645,16 @@ fn adopt(storage: &Storage, at: u32, node: u32) {
         });
         storage.forget_edges(read);
         header.meta.store(meta & (DURABILITY | HEAD | STALE), Ordering::Relaxed);
+    }
+    if adopted {
+        // It heads the rows it took, whether or not this run read one of them: each was made
+        // from its seed, so its round ends as a head's does (seeded, recovered against that
+        // seed, its value's change told on), never as a run outside any cycle.
+        local::with(|local| {
+            let frame = &mut local.frames[at as usize];
+            frame.head = frame.head.min(at);
+            frame.joined = true;
+        });
     }
 }
 
