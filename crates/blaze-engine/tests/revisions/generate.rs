@@ -627,7 +627,10 @@ pub fn test(name: &str, parts: Parts, turns: &[Turn], drivers: &[&str]) -> Test 
         };
         let expect = Expect {
             prints: (request.action == Ask::Run).then(|| model.prints_with(request.loud)),
-            max_units: within.as_ref().map(|it| it.len() as u64),
+            // Units: none where nothing changed. An edit's units are not bounded here: a
+            // body edit of the library makes two (the library's and the program's, 2026-11-12),
+            // and so does a comment that moves lines.
+            max_units: (again || before == model).then_some(0),
             max_executed: again.then_some(2000),
             redone_within: within,
             ..Expect::default()
@@ -644,6 +647,62 @@ pub fn test(name: &str, parts: Parts, turns: &[Turn], drivers: &[&str]) -> Test 
         seeds: 1,
         revisions,
     }
+}
+
+/// A sequence written by hand, for a replay: turns apart by `;`, each of words. A word is an
+/// edit kind's name with the value it sets (`body=1`, `item`), a save (`by-rename`,
+/// `by-truncate`, `twice`), an event (`stop`, `kill`, `cancel=80`, `beside`, `build-first`),
+/// `event-last`, `width=80`, or of the request (`build-ask`, `check-ask`, `test-ask`,
+/// `release`, `loud-flag`, `short`). A first turn `parts up made mac` names the workspace's
+/// parts (none otherwise). `"parts made; scriptcfg; body=1 kill"`.
+pub fn parse(text: &str) -> (Parts, Vec<Turn>) {
+    let mut parts = Parts::LIBRARY;
+    let mut turns = Vec::new();
+    let every = Parts { up: true, made: true, mac: true };
+    for (index, words) in text.split(';').map(str::trim).enumerate() {
+        let mut words = words.split_whitespace().peekable();
+        if index == 0 && words.peek() == Some(&"parts") {
+            for part in words.skip(1) {
+                match part {
+                    "up" => parts.up = true,
+                    "made" => parts.made = true,
+                    "mac" => parts.mac = true,
+                    other => panic!("no part `{other}`: up, made, mac"),
+                }
+            }
+            continue;
+        }
+        let mut turn =
+            Turn { request: Request::RUN, edits: Vec::new(), save: Save::Write, event: Event::Nothing, event_last: false, width: None };
+        for word in words {
+            let (name, value) = word.split_once('=').unwrap_or((word, "0"));
+            let value: u64 = value.parse().unwrap_or_else(|_| panic!("`{word}`: the value is a number"));
+            match name {
+                "by-rename" => turn.save = Save::Rename,
+                "by-truncate" => turn.save = Save::Truncate,
+                "twice" => turn.save = Save::Twice,
+                "stop" => turn.event = Event::Stop,
+                "kill" => turn.event = Event::Kill,
+                "cancel" => turn.event = Event::Cancel(value),
+                "beside" => turn.event = Event::Beside,
+                "build-first" => turn.event = Event::Build,
+                "event-last" => turn.event_last = true,
+                "width" => turn.width = Some(value as u32),
+                "build-ask" => turn.request.action = Ask::Build,
+                "check-ask" => turn.request.action = Ask::Check,
+                "test-ask" => turn.request.action = Ask::Test,
+                "release" => turn.request.release = true,
+                "loud-flag" => turn.request.loud = true,
+                "short" => turn.request.short = true,
+                _ => match kinds(every, false).iter().find(|(kind, _)| *kind == name) {
+                    Some((_, make)) => turn.edits.push(make(value as u8)),
+                    None => panic!("no word `{name}` (generate.rs, `parse`)"),
+                },
+            }
+        }
+        turns.push(turn);
+    }
+    (parts, turns)
 }
 
 /// `test` written as a case directory (`base/`, `rev2/`.., `test.toml`) under `into`, as

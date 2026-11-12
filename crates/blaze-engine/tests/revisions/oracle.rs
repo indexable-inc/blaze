@@ -121,6 +121,16 @@ fn each_kind_once_builds_as_clean() {
     case(parts, &turns);
 }
 
+/// The sequence `BLAZE_ORACLE_REPLAY` writes out ([`generate::parse`]): a finding run again,
+/// or cut down by hand.
+#[test]
+#[ignore = "runs the sequence BLAZE_ORACLE_REPLAY names: docs/harness.md, \"The oracle\""]
+fn replay() {
+    let text = std::env::var("BLAZE_ORACLE_REPLAY").expect("BLAZE_ORACLE_REPLAY is a sequence, as `generate::parse` reads it");
+    let (parts, turns) = generate::parse(&text);
+    case(parts, &turns);
+}
+
 /// The alternations alone, no edit between: build, test, build, test, check, run, release,
 /// run, the feature on the command line and off, another width, another message format, each
 /// a second time. After its first occurrence a request is a no-op in units and runs few
