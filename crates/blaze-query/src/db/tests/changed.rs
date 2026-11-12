@@ -846,8 +846,9 @@ fn the_oracle_catches_a_walk_with_no_reach() {
     let small = a_first_edit_after_a_build(100, true, Plant::WalksWithNoReach);
     let large = a_first_edit_after_a_build(2000, true, Plant::WalksWithNoReach);
     assert_eq!((small.asked, small.marked, small.named), (1, 0, 1), "{small:?}");
-    assert!(small.verified >= 200, "{small:?}");
-    assert!(large.verified >= 4000, "{large:?}");
+    // Each row the top reads at least (those hold from the floor, their summaries narrow).
+    assert!(small.verified >= 100, "{small:?}");
+    assert!(large.verified >= 2000, "{large:?}");
 }
 
 /// Row 2 reads input 1 and row 1; row 1 reads row 0; row 0 reads input 0. Both inputs are
