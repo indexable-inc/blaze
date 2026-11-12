@@ -12,7 +12,7 @@ blaze has two release channels, made of the same releases:
   *prerelease*.
 - **stable** (the default): a canary that then passed the heavy tests, unchanged, and whose
   commit passed main's whole merge gate: its whole run green, with the unit tests on Linux
-  x86-64, Linux ARM64 and macOS. Promotion builds nothing: the archives users get on stable are the bytes that
+  x86-64, Linux ARM64, macOS and Windows x86-64. Promotion builds nothing: the archives users get on stable are the bytes that
   were tested as canary.
 
 ## Versions
@@ -102,7 +102,7 @@ availability, not for content.
 
 | key | what | `Cache-Control` |
 |---|---|---|
-| `v<version>/<asset>` | each asset of a release: `blaze-v<version>-<triple>.tar.gz` and its `.sha256`, `SHA256SUMS`, `B3SUMS`, `library-<digest>.tar.xz` | a year, `immutable` |
+| `v<version>/<asset>` | each asset of a release: Unix `.tar.xz`/`.tar.gz` archives and a Windows `.zip`, their `.sha256` files, `SHA256SUMS`, `B3SUMS`, and `library-<digest>.tar.xz` | a year, `immutable` |
 | `channels/<channel>` | the version `stable` or `canary` names, and a newline | 60 s |
 | `latest.json` | [above](#latestjson) (also at `https://ix.dev/blaze/latest.json`, through the site's worker) | 60 s |
 | `native/<name>` | a pinned native input's archive (`llvm.json`'s targets), its name ending in its sha256's first 16 hex digits | a year, `immutable` |
@@ -184,8 +184,9 @@ page lacks is refused by ix.dev/explore, so a release ahead of the page is not p
 request that changes `schema::VERSION` fails blaze.yaml's `scripts` job the same way: the page
 moves first, then blaze.
 
-Either way `release.yaml` builds the archives on the tag for macOS (Apple silicon) and Linux
-(x86-64, ARM64) and publishes them as a prerelease with `SHA256SUMS` (what install.sh checks) and `B3SUMS`; a
+Either way `release.yaml` builds the archives on the tag for macOS (Apple silicon), Linux
+(x86-64, ARM64) and Windows (x86-64), and publishes them as a prerelease with `SHA256SUMS`
+(what both installers check) and `B3SUMS`; a
 pinned release's fetch checks both, and a release from before `B3SUMS` (dated before 2026-10-31,
 when no release lacks it) by its `SHA256SUMS` alone; one dated later that lacks `B3SUMS` is
 refused ([cargo.md](cargo.md#pinning-a-release-of-blaze)). PGO is off for now (#870):

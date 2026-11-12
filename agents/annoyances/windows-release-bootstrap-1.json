@@ -1,0 +1,15 @@
+{
+ "id": "windows-release-bootstrap-1",
+ "date": "2026-11-12",
+ "who": "gpt-5 (Codex), main agent",
+ "where": ".github/workflows/release.yaml Windows release bootstrap",
+ "what": "The shared .github/actions/blaze action installs stage 0 through the Unix shell installer and its LLVM setup rejects Windows, so using it for the first Windows release is circular.",
+ "cost": "The first Windows archive job would fail before building anything and could never create the archive that the action would need on its next run.",
+ "cause": "Release bootstrap assumed every shipping platform already had an archive consumable by site/install.sh.",
+ "whys": "The action installs a released blaze; the released blaze has no Windows asset; the Unix installer refuses Windows; the action also has no Windows LLVM case; therefore adding Windows only to the release matrix cannot bootstrap the first native artifact.",
+ "class": "A new release platform depending on its own not-yet-existing release artifact.",
+ "prevention": "A new platform's recipe must name its stage-0 path separately and prove that the shipped stage is rebuilt by blaze; once a released Windows blaze is pinned, the shared action can take over.",
+ "workaround": "Build only stage 0 with the pinned nightly and pinned LLVM, then have that blaze build the release artifact.",
+ "fix": "release.yaml now makes a pinned-nightly Windows stage 0 and build_release.py uses it to produce and validate the shipped Windows stage.",
+ "state": "fixed"
+}

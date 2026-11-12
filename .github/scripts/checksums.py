@@ -2,7 +2,7 @@
 
     uv run --frozen python .github/scripts/checksums.py '{"dir": "out"}'
 
-Each file is `<hex>  <name>` a line, one per `blaze-*.tar.xz` and `blaze-*.tar.gz` in `dir`, in name order. BLAKE3 is
+Each file is `<hex>  <name>` a line, one per release archive in `dir`, in name order. BLAKE3 is
 the uv workspace's `blake3` (the BLAKE3 team's Rust crate through PyO3), the hash blaze checks a
 download against (crates/blaze-engine/src/versions.rs), so a runner needs no system package.
 Exits 1 naming the directory when it holds no archive.
@@ -26,9 +26,9 @@ class Checksums:
 def main() -> int:
     job = parse(Checksums, sys.argv[1] if len(sys.argv) > 1 else "{}", "checksums.py")
     root = Path(job.dir)
-    archives = sorted([*root.glob("blaze-*.tar.xz"), *root.glob("blaze-*.tar.gz")])
+    archives = sorted([*root.glob("blaze-*.tar.xz"), *root.glob("blaze-*.tar.gz"), *root.glob("blaze-*.zip")])
     if not archives:
-        print(f"checksums.py: no blaze-*.tar.xz or blaze-*.tar.gz in {root.resolve()}", file=sys.stderr)
+        print(f"checksums.py: no blaze release archives in {root.resolve()}", file=sys.stderr)
         return 1
     sha, b3 = [], []
     for archive in archives:

@@ -10,9 +10,9 @@ name: install
 on:
   push:
     branches: [main]
-    paths: ["site/install.sh", ".github/workflows/install.yaml"]
+    paths: ["site/install.sh", "site/install.ps1", "harness/windows_install.ps1", ".github/workflows/install.yaml"]
   pull_request:
-    paths: ["site/install.sh", ".github/workflows/install.yaml"]
+    paths: ["site/install.sh", "site/install.ps1", "harness/windows_install.ps1", ".github/workflows/install.yaml"]
   release:
     types: [published]
   schedule:
@@ -127,6 +127,46 @@ jobs:
           installs "${stable#v}" "blaze ${stable#v}" sh site/install.sh --no-toolchain --channel canary --version "$stable"
           if sh site/install.sh --channel nightly > out.txt 2>&1; then cat out.txt; exit 1; fi
           grep -F "blaze has no channel nightly." out.txt
+
+  windows-installer:
+    name: Windows PowerShell installers
+    if: github.event_name != 'pull_request'
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: released Windows archive
+        shell: pwsh
+        run: |
+          $client = New-Object Net.WebClient
+          try { $tag = $client.DownloadString("https://blaze-releases.ix.dev/channels/stable").Trim() } finally { $client.Dispose() }
+          $version = $tag.TrimStart("v")
+          $asset = "blaze-v$version-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest -UseBasicParsing "https://blaze-releases.ix.dev/v$version/$asset" -OutFile $asset
+          "ARCHIVE=$asset" >> $env:GITHUB_ENV
+          "VERSION=$version" >> $env:GITHUB_ENV
+      - name: lifecycle suite under PowerShell 5.1 and 7
+        shell: pwsh
+        run: |
+          $config = @{ archive = $env:ARCHIVE; version = $env:VERSION; work = "$env:RUNNER_TEMP\install-e2e" } | ConvertTo-Json -Compress
+          pwsh -NoLogo -NoProfile -File harness/windows_install.ps1 $config
+
+  windows-installer-syntax:
+    name: Windows installer syntax
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - shell: powershell
+        run: |
+          $errors = $null
+          [void][Management.Automation.Language.Parser]::ParseFile((Resolve-Path site/install.ps1), [ref]$null, [ref]$errors)
+          if ($errors.Count) { $errors | Out-String | Write-Error }
+      - shell: pwsh
+        run: |
+          $errors = $null
+          [void][Management.Automation.Language.Parser]::ParseFile((Resolve-Path site/install.ps1), [ref]$null, [ref]$errors)
+          if ($errors.Count) { $errors | Out-String | Write-Error }
 
   # This commit's build, as the release builds it: on the release's Ubuntu, so that it asks for
   # the glibc a release asks for, and with no PGO,
