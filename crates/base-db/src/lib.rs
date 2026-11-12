@@ -450,6 +450,9 @@ static VOUCHED: std::sync::LazyLock<
     blaze_core::lock::Lock::new("db.included.vouched", blaze_hash::HashMap::new_in(Global))
 });
 
+/// The generation of an answer blaze holds itself ([`IncludedFile::hold`]): no watch's.
+const HELD: u64 = u64::MAX;
+
 thread_local! {
     /// A planted bug, for a test's control: [`IncludedFile::content_now`] looks at the disk
     /// on every ask, as until 2026-11-12. Never set outside a test.
@@ -511,7 +514,7 @@ impl IncludedFile {
     pub fn content_now(path: &std::path::Path) -> ContentId {
         let kept = VOUCHED.lock().get(path).copied();
         if let Some((generation, id)) = kept
-            && blaze_vfs::outside::unchanged_since(path, generation)
+            && (generation == HELD || blaze_vfs::outside::unchanged_since(path, generation))
             && !LOOKS_EVERY_TIME.get()
         {
             return id;
@@ -526,6 +529,18 @@ impl IncludedFile {
         // alloc: once per included file, its path as the key of what was read of it
         VOUCHED.lock().insert(path.to_path_buf(), (generation, id));
         id
+    }
+
+    /// The file at `path` is one blaze holds the bytes of (a file a build script's run left
+    /// in its `OUT_DIR`, which blaze writes there itself from the run's kept result): its
+    /// content is `content` until it is held again, and the disk is not looked at for it
+    /// ([`IncludedFile::content_now`]). Without this each build looked at every such file a
+    /// crate includes (serde's `private.rs`, bindgen's `bindings.rs`: about 25 looks a build
+    /// of reth), their directory hearing blaze's own restore of them, so no watch vouched and
+    /// the build was never answered again without a walk.
+    pub fn hold(path: &std::path::Path, content: ContentId) {
+        // alloc: once per held file, its path as the key
+        VOUCHED.lock().insert(path.to_path_buf(), (HELD, content));
     }
 
     pub fn read<'db, Db: ?Sized + blaze_query::db::Database>(
