@@ -586,14 +586,14 @@ fn run_rustfmt(
     for (edition, files) in by_edition {
         if verbosity == Verbosity::Verbose {
             print!("rustfmt");
-            print!(" --edition {edition}");
+            print!(" --edition {}", edition.rust_syntax());
             fmt_args.iter().for_each(|f| print!(" {}", f));
             files.iter().for_each(|f| print!(" {}", f.display()));
             println!();
         }
 
         let mut args: Vec<String> = files.iter().map(|f| f.display().to_string()).collect();
-        args.extend(["--edition".to_owned(), edition.to_string()]);
+        args.extend(["--edition".to_owned(), edition.rust_syntax()]);
         args.extend(fmt_args.iter().cloned());
         let _quiet = (verbosity == Verbosity::Quiet)
             .then(StdoutToNull::new)

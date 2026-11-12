@@ -944,10 +944,18 @@ pub fn loaded_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
     let _p = tracing::info_span!(target: "blaze", "loaded_crates").entered();
     blaze_mem::frame::current(|frame| {
         let data = krate.data(db);
+        // blaze: a crate of a blaze edition loads its `std`, bstd, whatever its text says, as
+        // rustc loads the injected `std`: its paths say `std`, never the dependency's own
+        // name (docs/v2/plan/design/std.md, "The blaze edition: opting in";
+        // `hir_def::nameres::named` has the same rule for what a program links).
+        let edition_std = krate.blaze_edition(db).map(|_| span::BlazeEdition::STD);
         let mut unnamed = Vec::new_in(frame);
         unnamed.extend(data.dependencies.iter().filter(|dep| {
             let data = dep.crate_id.data(db);
-            !(dep.is_sysroot() || data.origin.is_lang() || dep.crate_id.loads_only_macros(db))
+            !(dep.is_sysroot()
+                || data.origin.is_lang()
+                || dep.crate_id.loads_only_macros(db)
+                || edition_std == Some(dep.name.symbol().as_str()))
         }));
         // Few files name a dependency, and a file's text tells which may without its tree. A
         // file `include!` puts among the items is one of the crate's as well: a root that is

@@ -15,6 +15,9 @@ panic?). The edition fixes both directions.
 edition = "blaze-2026.11"
 ```
 
+How the opt-in is read, what it changes today (the entry and `std`) and what `blaze new`
+writes: [std](std.md#the-blaze-edition-opting-in).
+
 A crate on an ordinary edition builds exactly as before (rule `superset-of-rust`). The edition is
 named after the release that introduced it and is cut rarely; it fixes its Rust syntax year (this
 one is Rust 2024 plus what is below) and is separate from which blaze a project pins.

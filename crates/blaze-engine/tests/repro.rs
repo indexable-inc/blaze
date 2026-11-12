@@ -806,3 +806,229 @@ fn bstd_the_wrong_call_does_not_compile() {
         assert!(out.stderr.contains("src/lib.rs"), "{fixture}: the error does not say where:\n{}", out.stderr);
     }
 }
+
+/// The manifest of a package named `name` on `edition`, with `dependencies` (lines of its
+/// table) and, for a blaze edition, bstd from this tree: a package of the edition names
+/// bstd by path until blaze ships it (docs/v2/plan/design/std.md, row S5d).
+fn edition_manifest(name: &str, edition: &str, dependencies: &str, workspace: bool) -> String {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let bstd = match edition.starts_with("blaze-") {
+        true => format!(
+            "bstd = {{ package = \"blaze-std\", path = {:?} }}\n",
+            root.join("crates/blaze-std").display().to_string()
+        ),
+        false => String::new(),
+    };
+    let workspace = if workspace { "\n[workspace]\n" } else { "" };
+    format!(
+        "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"{edition}\"\n\n[lib]\ndoctest = \
+         false\npath = \"src/lib.rs\"\n\n[dependencies]\n{bstd}{dependencies}{workspace}"
+    )
+}
+
+/// The same, for a package that is a program alone.
+fn edition_program(edition: &str, dependencies: &str) -> String {
+    edition_manifest("repro", edition, dependencies, true).replace("[lib]\ndoctest = false\npath = \"src/lib.rs\"\n\n", "")
+}
+
+/// The tree's lockfile, which has bstd's dependencies at the versions the tree builds.
+fn tree_lock() -> String {
+    fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock")).unwrap()
+}
+
+const HELLO_2024: &str = "fn main() {\n    println!(\"Hello, world!\");\n}\n";
+
+/// S5 (docs/v2/plan/design/std.md, "The blaze edition: opting in"), in a real process, which
+/// the exit status and standard error need: a hello world of the blaze edition, whose `main`
+/// takes `&Cx` and `Io` and writes through `Out`, builds, prints its line and exits 0; one
+/// that returns `Err` prints `error: <what>` on standard error, nothing on standard output,
+/// and exits non-zero.
+#[test]
+fn the_blaze_edition_hello_world_runs_and_an_err_fails_the_process() {
+    let case = Case::new("the_blaze_edition");
+    case.write("Cargo.toml", &edition_program("blaze-2026.11", ""));
+    case.write("Cargo.lock", &tree_lock());
+    assert_eq!(case.ok(&["run"]), "Hello, world!\n");
+    case.write(
+        "src/main.rs",
+        "fn main(cx: &Cx, io: Io) -> Result<(), Error> {\n    io.need_out()?.line(cx, \"before\")?;\n    \
+         Err(Error::new(\"no such luck\"))\n}\n",
+    );
+    let out = case.blaze_in("", &["run"]);
+    assert!(!out.ok, "a `main` that returned `Err` exited 0:\n{}", out.stderr);
+    assert_eq!(out.stdout, "before\n");
+    assert!(out.stderr.contains("error: no such luck"), "the error is not printed:\n{}", out.stderr);
+    // Each shorter entry the rule allows runs too: `io` alone, with a context of its own.
+    case.write(
+        "src/main.rs",
+        "fn main(io: Io) -> Result<(), Error> {\n    let cx = io.cx(std::entry::MAIN_BUDGET, 1 << 20)?;\n    \
+         io.need_out()?.line(&cx, \"io alone\")?;\n    Ok(())\n}\n",
+    );
+    assert_eq!(case.ok(&["run"]), "io alone\n");
+}
+
+/// Old code is untouched: the same package on Rust 2024, with `fn main()` and `println!`,
+/// builds and prints as before, in the same home that built the blaze edition's (so nothing
+/// made for one is served to the other); and nothing of Rust std's ambient authority is
+/// reachable through `std` in the edition: the same `println!` there does not resolve.
+#[test]
+fn the_blaze_edition_leaves_a_rust_edition_package_as_it_was() {
+    let case = Case::new("the_blaze_edition");
+    case.write("Cargo.toml", &edition_program("blaze-2026.11", ""));
+    case.write("Cargo.lock", &tree_lock());
+    assert_eq!(case.ok(&["run"]), "Hello, world!\n");
+    // The same package, opted out: Rust's `main`, Rust's `std`.
+    case.write("Cargo.toml", &edition_program("2024", ""));
+    case.write("src/main.rs", HELLO_2024);
+    assert_eq!(case.ok(&["run"]), "Hello, world!\n");
+    // And back, with the Rust source left in place: `println!` and `fn main()` with Rust's
+    // std are not the edition's.
+    case.write("Cargo.toml", &edition_program("blaze-2026.11", ""));
+    case.write("src/main.rs", "fn main() {\n    let _ = std::fs::read(\"/etc/hosts\");\n}\n");
+    let out = case.blaze_in("", &["build"]);
+    assert!(!out.ok, "`std::fs::read` resolved in the blaze edition:\n{}", out.stderr);
+    assert!(out.stderr.contains("read"), "the error does not name the path:\n{}", out.stderr);
+}
+
+/// Both directions of the boundary link and run: a program of the blaze edition calls a
+/// library of Rust 2024 (which uses Rust std's `Vec`, `String` and `format!` inside), and a
+/// program of Rust 2024 makes the roots itself (`bstd::entry::run`) and hands a capability
+/// to a library of the blaze edition.
+#[test]
+fn the_blaze_edition_and_rust_editions_depend_on_each_other() {
+    let case = Case::new("the_blaze_edition");
+    case.write("shelf/Cargo.toml", &edition_manifest("shelf", "blaze-2026.11", "", false));
+    case.write("Cargo.lock", &tree_lock());
+    // New on old.
+    case.write("Cargo.toml", &edition_program("blaze-2026.11", "old = { path = \"old\" }\n"));
+    case.write(
+        "src/main.rs",
+        "fn main(cx: &Cx, io: Io) -> Result<(), Error> {\n    let out = io.need_out()?;\n    \
+         match old::answer() {\n        42 => out.line(cx, \"forty-two\")?,\n        _ => \
+         out.line(cx, \"wrong\")?,\n    }\n    Ok(())\n}\n",
+    );
+    assert_eq!(case.ok(&["run"]), "forty-two\n");
+    // Old on new: the Rust program names bstd as `bstd`, as any crate.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    case.write(
+        "Cargo.toml",
+        &edition_program(
+            "2024",
+            &format!(
+                "shelf = {{ path = \"shelf\" }}\nbstd = {{ package = \"blaze-std\", path = {:?} }}\n",
+                root.join("crates/blaze-std").display().to_string()
+            ),
+        ),
+    );
+    case.write(
+        "src/main.rs",
+        "fn main() -> bstd::entry::Exit {\n    println!(\"from Rust's std\");\n    bstd::entry::run(|cx, io| \
+         -> Result<(), bstd::entry::Error> {\n        shelf::greet(cx, &io.need_out()?)?;\n        \
+         Ok(())\n    })\n}\n",
+    );
+    assert_eq!(case.ok(&["run"]), "from Rust's std\nHello from the shelf!\n");
+}
+
+/// A `main` the entry rule refuses is an error at `main` that names the rule
+/// (`entry-takes-roots`) and the parameter: in the blaze edition a parameter that is no
+/// root, and roots out of order; in a Rust edition any parameter, saying the edition it
+/// needs and the manifest line. The control is each test above: a `main` the rule accepts
+/// builds.
+#[test]
+fn the_blaze_edition_refuses_a_main_that_is_no_entry_by_name() {
+    let case = Case::new("the_blaze_edition");
+    case.write("Cargo.lock", &tree_lock());
+    let wrong: [(&str, &str, &[&str]); 3] = [
+        (
+            "blaze-2026.11",
+            "fn main(io: Io, cx: &Cx) {\n    let _ = (io, cx);\n}\n",
+            &["entry-takes-roots", "parameter 2", "`&Cx` after `Io`"],
+        ),
+        (
+            "blaze-2026.11",
+            "fn main(cx: &Cx, count: u32) {\n    let _ = (cx, count);\n}\n",
+            &["entry-takes-roots", "parameter 2", "not something the runtime makes"],
+        ),
+        (
+            "2024",
+            "fn main(count: u32) {\n    let _ = count;\n}\n",
+            &["entry-takes-roots", "needs the blaze edition", "edition = \"blaze-2026.11\""],
+        ),
+    ];
+    for (edition, source, names) in wrong {
+        case.write("Cargo.toml", &edition_program(edition, ""));
+        case.write("src/main.rs", source);
+        let out = case.blaze_in("", &["build"]);
+        assert!(!out.ok, "{edition}: `{source}` built:\n{}", out.stderr);
+        for name in names {
+            assert!(out.stderr.contains(name), "{edition}: the error does not say {name}:\n{}", out.stderr);
+        }
+        assert!(out.stderr.contains("src/main.rs"), "{edition}: the error does not say where:\n{}", out.stderr);
+    }
+    // An edition blaze does not know is refused by name, never read as some Rust edition.
+    case.write("Cargo.toml", &edition_program("blaze-2026.12", ""));
+    let out = case.blaze_in("", &["build"]);
+    assert!(!out.ok && out.stderr.contains("blaze-2026.12") && out.stderr.contains("blaze-2026.11"), "{}", out.stderr);
+}
+
+/// `blaze new` then `blaze run`, for both kinds: where bstd is named the package is of the
+/// blaze edition and its hello world runs on bstd; `--rust` is the plain package, which runs
+/// as it always did.
+#[test]
+fn blaze_new_then_run_works_for_the_blaze_edition_and_for_rust() {
+    let case = Case::new("blaze_new_then_run");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let bstd = root.join("crates/blaze-std").display().to_string();
+    case.ok_in("", &["new", "--vcs", "none", "--bstd", &bstd, "hello"]);
+    let manifest = fs::read_to_string(case.dir.join("hello/Cargo.toml")).unwrap();
+    assert!(manifest.contains("edition = \"blaze-2026.11\""), "{manifest}");
+    let source = fs::read_to_string(case.dir.join("hello/src/main.rs")).unwrap();
+    assert!(source.contains("fn main(cx: &Cx, io: Io) -> Result<(), Error>"), "{source}");
+    case.write("hello/Cargo.lock", &tree_lock());
+    assert_eq!(case.ok_in("hello", &["run"]).stdout, "Hello, world!\n");
+    case.ok_in("", &["new", "--vcs", "none", "--rust", "plain"]);
+    let manifest = fs::read_to_string(case.dir.join("plain/Cargo.toml")).unwrap();
+    assert!(manifest.contains("edition = \"2024\"") && !manifest.contains("bstd"), "{manifest}");
+    assert_eq!(fs::read_to_string(case.dir.join("plain/src/main.rs")).unwrap(), HELLO_2024);
+    assert_eq!(case.ok_in("plain", &["run"]).stdout, "Hello, world!\n");
+}
+
+/// `blaze::not_latest_edition` (docs/lints.md#not_latest_edition), through `blaze check`: a
+/// workspace package on a Rust edition is told exactly once; its path dependency that is no
+/// member of the workspace is not told; allowing the lint silences it; denying it fails the check
+/// naming the lint; a package of the blaze edition is told nothing. The workspace asks for
+/// the lint by name, since its default waits for `ready::EDITION_SHIPS`.
+#[test]
+fn a_package_not_on_the_latest_blaze_edition_is_told_once() {
+    const TOLD: &str = "not the latest blaze edition";
+    let case = Case::new("the_blaze_edition");
+    case.write("Cargo.lock", &tree_lock());
+    case.write("src/main.rs", "fn main() {\n    println!(\"{}\", old::answer());\n}\n");
+    let with = |level: &str| {
+        let lints = match level {
+            "" => String::new(),
+            level => format!("\n[workspace.metadata.blaze.lints]\nnot_latest_edition = \"{level}\"\n"),
+        };
+        // `old` is beneath the workspace's root, which would make it a member, told as one:
+        // excluded, it is a dependency by path that is not the workspace's own.
+        format!("{}exclude = [\"old\"]\n{lints}", edition_program("2024", "old = { path = \"old\" }\n"))
+    };
+    case.write("Cargo.toml", &with("warn"));
+    let out = case.ok_in("", &["check"]);
+    assert_eq!(out.stderr.matches(TOLD).count(), 1, "told once, and not for `old`:\n{}", out.stderr);
+    assert!(out.stderr.contains("package `repro`"), "{}", out.stderr);
+    assert!(out.stderr.contains("edition = \"blaze-2026.11\""), "{}", out.stderr);
+    case.write("Cargo.toml", &with("allow"));
+    let out = case.ok_in("", &["check"]);
+    assert_eq!(out.stderr.matches(TOLD).count(), 0, "{}", out.stderr);
+    case.write("Cargo.toml", &with("deny"));
+    let out = case.blaze_in("", &["check"]);
+    assert!(!out.ok, "the denied lint did not fail the check:\n{}", out.stderr);
+    assert!(out.stderr.contains("blaze::not_latest_edition") && out.stderr.contains(TOLD), "{}", out.stderr);
+    // The same workspace on the blaze edition, the lint still denied: nothing to tell.
+    let denied = "\n[workspace.metadata.blaze.lints]\nnot_latest_edition = \"deny\"\n";
+    case.write("Cargo.toml", &format!("{}{denied}", edition_program("blaze-2026.11", "")));
+    case.write("src/main.rs", "fn main(cx: &Cx, io: Io) -> Result<(), Error> {\n    io.need_out()?.line(cx, \"x\")?;\n    Ok(())\n}\n");
+    let out = case.ok_in("", &["check"]);
+    assert_eq!(out.stderr.matches(TOLD).count(), 0, "{}", out.stderr);
+}

@@ -73,10 +73,24 @@ fn deps<'db, 'f>(
     krate: Crate,
 ) -> FrameVec<'f, (Name, &'db BuiltDependency)> {
     let data = krate.data(db);
+    // blaze: in a crate of a blaze edition `std` names bstd (docs/v2/plan/design/std.md, "The
+    // blaze edition: opting in"): the dependency called `bstd` is known as `std`, and Rust's
+    // own `std` has no name in the crate. Everything after this table (the extern prelude,
+    // the injected `extern crate std`, the prelude's path) then reads bstd as the crate's
+    // std with no rule of its own. A crate of no blaze edition takes neither branch.
+    let blaze_edition = krate.blaze_edition(db);
     let mut deps = Vec::with_capacity_in(data.dependencies.len(), frame);
     for dep in &data.dependencies {
         tracing::debug!("crate dep {:?} -> {:?}", dep.name, dep.crate_id);
-        let name = dep.as_name();
+        let mut name = dep.as_name();
+        if blaze_edition.is_some() {
+            if matches!(dep.crate_id.data(db).origin, CrateOrigin::Lang(LangCrateOrigin::Std)) {
+                continue;
+            }
+            if name.as_str() == span::BlazeEdition::STD {
+                name = Name::new_symbol_root(sym::std);
+            }
+        }
         match deps.iter_mut().find(|(it, _)| *it == name) {
             Some(it) => it.1 = dep,
             None => deps.push((name, dep)),
@@ -139,6 +153,15 @@ pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData> {
         Some(AttrsOrCfgRef::CfgDisabled(_, attrs)) => attrs,
     };
     let mut crate_data = DefMapCrateData::new(krate_data.edition);
+    // blaze: a crate of a blaze edition makes every collection in an allocator it was handed
+    // (`Vec::new_in(cx.frame())`; docs/v2/plan/design/std.md, "Memory is explicit"), so the
+    // allocator API needs no `#![feature]` in it: entered as if written, as
+    // `#![blaze::simd]` enters its two, and nothing else of the crate changes.
+    if krate.blaze_edition(db).is_some() {
+        for feature in ["allocator_api", "allocator_ext"] {
+            crate_data.unstable_features.enable(Symbol::intern(feature));
+        }
+    }
     let mut is_proc_macro = krate_data.target_kind.is_proc_macro();
     // Process other crate-level attributes.
     for attr in &*attrs {
@@ -987,6 +1010,42 @@ fn inject_prelude<'db, S: Sink<'db>>(sink: &mut S) {
     if !sink.local_def_map().extern_prelude().any(|(name, _)| *name == krate) {
         let diagnostic = DefDiagnostic::prelude(root, krate, PreludeError::CrateNotFound);
         sink.apply(DeclOp::Diagnostic(diagnostic));
+        return;
+    }
+
+    // blaze: a crate of a blaze edition has its std's prelude of that edition
+    // (`bstd::prelude::blaze_2026_11`), by the absolute path, as Rust 2018 on has its own.
+    if let Some(blaze) = def_map.krate().blaze_edition(db)
+        && !def_map.data.no_std
+    {
+        let path = ModPath::from_segments(
+            PathKind::Abs,
+            [
+                krate,
+                Name::new_symbol_root(sym::prelude),
+                Name::new_symbol_root(Symbol::intern(blaze.prelude())),
+            ],
+        );
+        let (per_ns, _) = def_map.resolve_path(
+            sink.local_def_map(),
+            db,
+            def_map.root_module_id(),
+            &path,
+            BuiltinShadowMode::Other,
+            None,
+        );
+        match per_ns.types {
+            Some(Item { def: ModuleDefId::ModuleId(m), import, .. }) => {
+                sink.apply(DeclOp::Prelude {
+                    module: m,
+                    import: import.and_then(ImportOrExternCrate::use_),
+                });
+            }
+            _ => {
+                let diagnostic = DefDiagnostic::prelude(root, krate, PreludeError::NoPreludeModule);
+                sink.apply(DeclOp::Diagnostic(diagnostic));
+            }
+        }
         return;
     }
 

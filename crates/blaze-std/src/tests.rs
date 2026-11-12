@@ -18,6 +18,8 @@
 //!   flushed file forces no writeback, and no `_unsynced` call waits for the device.
 //! - [`explicit`]: each cost or guarantee an API used to pick is now its caller's: one
 //!   example test a change.
+//! - [`entry`]: a program's `main` run on the simulation: its line on standard output, its
+//!   status, its error said, a withheld `Out` absent.
 //! - [`env`]: `Env::only` never widens.
 //! - [`world`]: `Args`, `Host`, the trace and `spawn_concurrent`'s refusal under `Inline`, each
 //!   once.
@@ -64,6 +66,7 @@ mod contexts;
 mod crash;
 mod deadlines;
 mod durable;
+mod entry;
 mod env;
 mod eval;
 mod explicit;

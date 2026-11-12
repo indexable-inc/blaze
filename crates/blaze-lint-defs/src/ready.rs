@@ -41,6 +41,15 @@ pub const CAPABILITIES_FOR_BUILD_SCRIPTS: bool = false;
 /// crate not yet ported held at `warn` by its line in the lint's baseline.
 pub const BSTD_IN_TREE: bool = false;
 
+/// Whether a package of the latest blaze edition builds wherever this blaze runs: bstd ships
+/// with blaze and is given to every crate of the edition (docs/v2/plan/design/std.md, row
+/// S5d), so `edition = "blaze-2026.11"` is all a package writes. Today a package of the
+/// edition names bstd as a dependency by path, which only a checkout of blaze has. Turning
+/// this to `true` makes `blaze::not_latest_edition` warn by default, and is turned with
+/// `blaze_new::BSTD_SHIPS`, which makes the edition what `blaze new` writes: telling every
+/// package to move to an edition it cannot build on would be a nag, not help.
+pub const EDITION_SHIPS: bool = false;
+
 /// Each lint that has a switch here, by its name after `blaze::`, with the switch: what the
 /// table `[workspace.metadata.blaze.lints-when-ready]` reads ([`switch_of`]).
 pub const SWITCHES: &[(&str, bool)] = &[
@@ -48,6 +57,7 @@ pub const SWITCHES: &[(&str, bool)] = &[
     ("proc_macro_attribute", REFLECTION_REPLACES_MACROS),
     ("build_script_ambient", CAPABILITIES_FOR_BUILD_SCRIPTS),
     ("std_use", BSTD_IN_TREE),
+    ("not_latest_edition", EDITION_SHIPS),
 ];
 
 /// Whether what `blaze::{lint}` tells code to move to is in this blaze; `None` for a lint with

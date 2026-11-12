@@ -1121,6 +1121,8 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::build_script_ambient", ready::level(ready::CAPABILITIES_FOR_BUILD_SCRIPTS), "detects a build script of the workspace that reaches the file system, the environment, a process, the network or the clock through the standard library by itself, where a capability it is handed says what it can touch")
         .externally_loaded(),
+    l("blaze::not_latest_edition", ready::level(ready::EDITION_SHIPS), "detects a package of the workspace that has not opted into the latest blaze edition (a Rust edition, or an older blaze edition), once per package, naming the manifest line that opts in")
+        .externally_loaded(),
     // `allow` whatever `ready::BSTD_IN_TREE` says: a crate asks for it (`#![blaze::capabilities]`),
     // and a workspace does in its `lints-when-ready` table.
     l("blaze::std_use", Allow, "detects a use of an item of Rust's standard library that blaze's own standard library replaces or forbids (ambient authority, a hidden cost, a global-heap allocation, a renamed type), once per item per function, naming what is written instead")

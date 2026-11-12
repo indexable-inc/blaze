@@ -160,6 +160,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::proc_macro_attribute",
             "blaze::proc_macro_fn_like",
             "blaze::build_script_ambient",
+            "blaze::not_latest_edition",
             "blaze::std_use",
             "blaze::lossy_as",
             "blaze::global_state",

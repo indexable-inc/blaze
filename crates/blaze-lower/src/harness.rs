@@ -19,6 +19,20 @@ pub fn wasm_macro(unit: &Unit, plan: &UnitPlan) -> bool {
     plan.macro_wasm && unit.target.is_proc_macro() && !super::crates::is_test(unit, plan)
 }
 
+/// Whether `unit` is a program of a blaze edition (docs/v2/plan/design/std.md, "The blaze
+/// edition: opting in"): a binary or an example of a package whose `edition` is a blaze
+/// edition's, not built as a test. Its root has its entry appended (`hir_ty::entry::module`,
+/// the `main` that calls the crate's own with the roots it takes), so its crate's root is an
+/// alias of its own. A unit whose edition blaze does not know is none here: the lowering
+/// refuses it by name where it reads the edition.
+pub fn edition_program(unit: &Unit, plan: &UnitPlan) -> bool {
+    let program = unit.target.kind.iter().any(|it| it == "bin" || it == "example")
+        && unit.target.crate_types.iter().any(|it| it == "bin")
+        && !unit.is_std
+        && !super::crates::is_test(unit, plan);
+    program && matches!(span::BlazeEdition::from_manifest(&unit.target.edition), Ok(Some(_)))
+}
+
 /// What a crate's root is to be: the file on disk, then `after`, the module named `module`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Appended {

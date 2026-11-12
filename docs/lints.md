@@ -38,6 +38,7 @@ table to the levels the lints have:
 | `blaze::proc_macro_attribute` | `allow` | reflection over the item and a generic function | the same switch |
 | `blaze::proc_macro_fn_like` | `warn` | a `const fn` or a `const` block; a macro that parses a foreign syntax may stay | now: `const fn` is Rust's |
 | `blaze::build_script_ambient` | `allow` | a capability the script is handed (`Fs`, `Env`, `Process`, `Net`, `Clock`) | `CAPABILITIES_FOR_BUILD_SCRIPTS` is `true`: [blaze's standard library](v2/plan/design/std.md) is in the tree and a build script is handed its capabilities |
+| `blaze::not_latest_edition` | `allow` | `edition = "blaze-2026.11"` in the package's manifest | `EDITION_SHIPS` is `true`: bstd ships with blaze, so a package of [the edition](v2/plan/design/std.md#the-blaze-edition-opting-in) builds wherever blaze runs |
 | `blaze::std_use` | `allow` | what [bstd](v2/plan/design/std.md) has in place of each item of Rust's `std`, by [its table](#std_use) | never by default: a crate asks with `#![blaze::capabilities]`, and a workspace with a line of its `lints-when-ready` table, which holds once `BSTD_IN_TREE` is `true` |
 
 `edition = "warn"` (or `#![warn(blaze::edition)]`) turns the whole group on whatever the
@@ -371,6 +372,36 @@ relative links.
 (`struct NodeId(u32)`): one allocation, nodes next to each other, freed at once.
 
 **Allowing it.** `#[expect(blaze::boxed_recursive_node, reason = "..")]` on the type.
+
+## `not_latest_edition`
+
+A package of the workspace that has not opted into the latest blaze edition
+([std.md](v2/plan/design/std.md#the-blaze-edition-opting-in)): one on a Rust edition, or, once
+there is more than one, on an older blaze edition. One rule covers both.
+
+```
+warning: package `app` is on Rust edition 2024, not the latest blaze edition `blaze-2026.11`, under which `main` takes what it may touch (`fn main(cx: &Cx, io: Io)`) and `std` is bstd, blaze's capability-based standard library: set `edition = "blaze-2026.11"` in its Cargo.toml
+```
+
+**Once per package.** The finding is about the package, has no place in a source file, and is
+said by the package's library, or by a binary or an example of a package with no library. A
+test, a bench, a build script and a proc-macro crate never say it. It is stored with the
+crate's other diagnostics and drawn as they are: in `--message-format json` it is a
+`compiler-message` whose code is `blaze::not_latest_edition`.
+
+**Never for code that is not yours.** A dependency, a registry or git crate, vendored code
+outside the workspace and the standard library are not linted.
+
+**Default.** `allow` until `EDITION_SHIPS` (a package of the edition names bstd by path
+until blaze ships it, which only a checkout of blaze can do); `warn` from then on.
+
+**Allowing or denying it.** `not_latest_edition = "allow"` (or `"deny"`, for a CI that holds
+a workspace to the edition) under `[workspace.metadata.blaze.lints]`,
+`#![allow(blaze::not_latest_edition)]` at the crate root, or `-A`/`-D
+blaze::not_latest_edition` in `RUSTFLAGS`. blaze's own workspace allows it while cargo
+builds blaze (decision D25).
+
+**No fix.** `blaze fix --edition` is planned.
 
 ## `build_script_ambient`
 

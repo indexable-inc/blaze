@@ -142,6 +142,10 @@ impl DefMap {
                         // `#![blaze::arbitrary_ints]`, from `DefMap::arbitrary_ints`
                         // (docs/v2/plan/design/arbitrary-ints.md).
                         | "arbitrary_ints"
+                        // `#![blaze::edition = "2026.11"]`, the crate's blaze edition, read off
+                        // the root's tokens (`base_db::Crate::blaze_edition`,
+                        // docs/v2/plan/design/std.md, "The blaze edition: opting in").
+                        | "edition"
                         // `#![blaze::handles]`, from `DefMap::handles`, and the effect
                         // `#[blaze::norefcount]`, from `AttrFlags::NOREFCOUNT`
                         // (docs/v2/plan/design/edition.md, change 1).

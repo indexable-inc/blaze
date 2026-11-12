@@ -71,6 +71,7 @@ use crate::{
     mem::Mem,
     net::Net,
     opener::Opener,
+    out::{Out, Stream},
     power::Power,
     requests::Http,
     rng::Rng,
@@ -337,6 +338,10 @@ offers! {
     http,
     /// Streams the host carries for the program ([`Io::streams`]).
     streams,
+    /// Standard output ([`Io::out`]).
+    out,
+    /// Standard error ([`Io::err`]).
+    err,
 }
 
 impl Offers {
@@ -351,6 +356,8 @@ impl Offers {
         rng: true,
         mem: true,
         host: true,
+        out: true,
+        err: true,
         ..Offers::NONE
     };
 }
@@ -656,6 +663,45 @@ impl Io {
 
     pub fn need_mem(&self) -> Result<Mem, Missing> {
         self.mem().ok_or(Missing { capability: "mem" })
+    }
+
+    /// Standard output, if the host offers it.
+    pub fn out(&self) -> Option<Out> {
+        self.offered(|it| it.out).then(|| Out::new(self.clone(), Stream::Out))
+    }
+
+    /// Standard output, which `main` requires.
+    pub fn need_out(&self) -> Result<Out, Missing> {
+        self.out().ok_or(Missing { capability: "out" })
+    }
+
+    /// Standard error, if the host offers it: an [`Out`] of the other stream.
+    pub fn err(&self) -> Option<Out> {
+        self.offered(|it| it.err).then(|| Out::new(self.clone(), Stream::Err))
+    }
+
+    /// Standard error, which `main` requires.
+    pub fn need_err(&self) -> Result<Out, Missing> {
+        self.err().ok_or(Missing { capability: "err" })
+    }
+
+    /// `parts`, in order, on this world's `stream`, as one write: kept by the simulated host
+    /// ([`SimHost::out`], [`SimHost::err`]), or written to the process's by `rt`.
+    pub(crate) fn write_out(&self, stream: Stream, parts: &[&[u8]]) -> Result<(), String> {
+        let mut world = self.world.lock();
+        match world.hosted.as_deref_mut() {
+            Some(host) => {
+                let kept = match stream {
+                    Stream::Out => &mut host.out,
+                    Stream::Err => &mut host.err,
+                };
+                for part in parts {
+                    kept.extend_from_slice(part);
+                }
+                Ok(())
+            }
+            None => crate::rt::write_out(stream, parts),
+        }
     }
 
     /// Sockets, if the host offers them (a wasm worker does not).

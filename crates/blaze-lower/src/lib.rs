@@ -68,7 +68,7 @@ pub use self::answer::{SubRequest, SubResponse, answer};
 pub use self::code::{CodeText, code_identity, code_text_of, still_text, still_text_of};
 pub use self::crates::{lint_flags, local, target_data};
 pub use self::doctests::DoctestProgram;
-pub use self::harness::{Appended, macros_loaded, wasm_macro};
+pub use self::harness::{Appended, edition_program, macros_loaded, wasm_macro};
 
 /// What [`lower`] lowers.
 pub struct Lower<'a, T> {
@@ -828,7 +828,7 @@ fn lower_writes<T: blaze_query::Tree>(
             edition: crates::edition(unit, what)?,
             dependencies,
             origin: crates::origin(package, unit),
-            crate_attrs: Box::new([]),
+            crate_attrs: crates::blaze_edition_attrs(unit, what)?,
             target_kind: crates::target_kind(unit, plan, what)?,
             manifest_kind: crates::manifest_kind(unit, what)?,
             crate_types: crates::crate_types(unit, plan, what)?,
@@ -859,7 +859,10 @@ fn lower_writes<T: blaze_query::Tree>(
         // A crate whose root blaze appends a module to ([`Lowered::append_roots`]: a test's
         // harness, a wasm proc macro's list of macros and bridge glue) has a root of its own,
         // an alias of the file on disk, so no other crate of that file reads the module.
-        let aliased = (crates::is_test(unit, plan) && plan.harness) || wasm_macro(unit, plan);
+        // So has a program of a blaze edition, whose entry is appended ([`edition_program`]).
+        let aliased = (crates::is_test(unit, plan) && plan.harness)
+            || wasm_macro(unit, plan)
+            || edition_program(unit, plan);
         // Units cargo keeps apart for what the front end does not read (a profile's opt-level
         // or debuginfo, and which run of a run class they depend on) are one crate: two
         // crates of one key would name each other's items (`blaze_items::key::check_crate_keys`).
