@@ -792,6 +792,13 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
                         );
                         let _ = err.write_all(say::status("Left", &left, color).as_bytes());
                     }
+                    if fixed.others > 0 {
+                        let others = format!(
+                            "{} suggestion(s) are of packages the request did not ask for, which `--fix` does not edit: name one with `-p` to fix it",
+                            fixed.others
+                        );
+                        let _ = err.write_all(say::status("Left", &others, color).as_bytes());
+                    }
                     if fixed.errors == 0 { 0 } else { Exit::Failed.code() }
                 }
                 Err(what) => {

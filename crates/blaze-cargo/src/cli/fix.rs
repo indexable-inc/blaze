@@ -11,6 +11,14 @@
 //! that is outside the checkout (in a dependency or a macro's expansion of one), or that
 //! overlaps one made before it in the pass is left, and said as left. blaze reads no version
 //! control: a fix that makes a new error writes nothing.
+//!
+//! Only the packages the request asked for are fixed (`-p`, or the default members:
+//! [`blaze_api::UnitOf::primary`]). A package of the checkout that is checked because one of
+//! those depends on it (another member, a vendored crate) gives its diagnostics too, and its
+//! files are in the checkout, but nobody asked for it to be edited: its suggestions are
+//! counted apart ([`Found::others`]) and said. `check --fix -p blaze-std` made the suggestions
+//! of `blaze-sys` and of a vendored `quinn-proto` before this (2026-11-12), and wrote nothing
+//! because theirs did not compile.
 
 use std::{
     collections::BTreeSet,
@@ -55,6 +63,8 @@ pub struct Found {
     suggestions: Vec<Vec<Part>>,
     /// Each a suggestion that can't be made: not machine-applicable in part, or outside.
     left: usize,
+    /// Each a suggestion of a package the request did not ask for, which is not made.
+    others: usize,
     /// An error by its code, its first primary span's file and its message: its place moves
     /// as the fixes edit the file, so the bytes are not part of it.
     errors: BTreeSet<(Option<String>, String, String)>,
@@ -85,9 +95,15 @@ impl Found {
         if !self.wanted(diagnostic.code) {
             return;
         }
+        // A diagnostic of no unit is of the whole request, and has no span to edit.
+        let asked_for = diagnostic.unit.is_some_and(|it| it.primary);
         for child in diagnostic.children.iter() {
             let replaced = || child.spans.iter().filter(|it| it.replacement.is_some());
             if replaced().next().is_none() {
+                continue;
+            }
+            if !asked_for {
+                self.others += 1;
                 continue;
             }
             let whole = replaced().all(|it| {
@@ -186,6 +202,8 @@ pub struct Fixed {
     pub files: Vec<String>,
     /// The suggestions of the check of the fixed code: none made, as that check came after.
     pub left: usize,
+    /// The suggestions of packages the request did not ask for, as that check gave them.
+    pub others: usize,
     /// The last check's errors: those of the first that the fixes did not take away.
     pub errors: usize,
 }
@@ -251,7 +269,13 @@ pub fn run(found: Found, pinned: &Pinned, root: &Path) -> Result<Fixed, String> 
         }
     }
     let unmade: BTreeSet<&[Part]> = last.suggestions.iter().map(Vec::as_slice).collect();
-    Ok(Fixed { made: count, files, left: last.left + unmade.len(), errors: last.errors.len() })
+    Ok(Fixed {
+        made: count,
+        files,
+        left: last.left + unmade.len(),
+        others: last.others,
+        errors: last.errors.len(),
+    })
 }
 
 /// The check of `pinned`'s root with `ops` made, as a what-if: what `--fix` reads of it, the
@@ -286,6 +310,9 @@ fn checked(pinned: &Pinned, ops: &[Op], lints: &[String]) -> Result<Found, Strin
 #[cfg(test)]
 mod tests {
     use super::{Found, Part};
+    use blaze_api::{
+        Applicability, CrateType, Diagnostic, Level, Span, TargetKind, UnitOf, UnitTarget,
+    };
     use blaze_vfs::Op;
 
     fn part(file: &str, start: u32, end: u32, text: &str) -> Part {
@@ -306,6 +333,7 @@ mod tests {
                 vec![part("src/lib.rs", 9, 9, "f")],
             ],
             left: 0,
+            others: 0,
             errors: Default::default(),
         };
         let (ops, count) = found.ops();
@@ -342,6 +370,78 @@ mod tests {
                 && narrowed.wanted(Some("unused_imports"))
         );
         assert!(!narrowed.wanted(Some("clippy::needless_return")) && !narrowed.wanted(None));
+    }
+
+    /// A warning of unit `of` with one machine-applicable suggestion in `file`, as the daemon
+    /// sends it.
+    fn suggested(of: Option<UnitOf>, file: &str) -> Vec<u8> {
+        let span = Span {
+            file: file.to_owned(),
+            line: 1,
+            label: None,
+            column: 1,
+            primary: true,
+            byte_end: 3,
+            end_line: 1,
+            byte_start: 0,
+            end_column: 4,
+            replacement: Some("std".to_owned()),
+            applicability: Some(Applicability::MachineApplicable),
+        };
+        let child = Diagnostic {
+            level: Level::Help,
+            spans: vec![span],
+            ..Diagnostic::note("write it so".to_owned())
+        };
+        let warning = Diagnostic {
+            code: Some("clippy::disallowed_methods".to_owned()),
+            unit: of,
+            children: vec![child],
+            ..Diagnostic::warning("use of a disallowed method".to_owned())
+        };
+        blaze_protocol::cbor::to_vec(&warning).expect("a diagnostic encodes")
+    }
+
+    fn unit(package: &str, primary: bool) -> UnitOf {
+        UnitOf {
+            id: 0,
+            test: false,
+            doctest: false,
+            target: UnitTarget {
+                kind: TargetKind::Lib,
+                crate_types: vec![CrateType::Lib],
+                name: package.to_owned(),
+                src_path: format!("/w/crates/{package}/src/lib.rs"),
+                edition: "2024".to_owned(),
+                doc: true,
+                doctest: true,
+                test: true,
+            },
+            package_id: format!("path+file:///w/crates/{package}#0.0.0"),
+            manifest_path: format!("/w/crates/{package}/Cargo.toml"),
+            primary,
+        }
+    }
+
+    /// `check --fix -p blaze-std` edits blaze-std: the same suggestion in a package checked
+    /// only because blaze-std depends on it (another member, a vendored crate, both files of
+    /// the checkout) is counted and not made, and one of no unit has nothing to edit.
+    #[test]
+    fn only_a_package_the_request_asked_for_is_fixed() {
+        let mut found = Found::new(&[]);
+        let asked = suggested(Some(unit("blaze-std", true)), "crates/blaze-std/src/lib.rs");
+        let member = suggested(Some(unit("blaze-sys", false)), "crates/blaze-sys/src/lib.rs");
+        let vendored = suggested(Some(unit("quinn-proto", false)), "vendor/quinn-proto/src/lib.rs");
+        let whole = suggested(None, "crates/blaze-std/src/lib.rs");
+        for bytes in [&asked, &member, &vendored, &whole] {
+            found.add(&blaze_protocol::cbor::from_slice(bytes).expect("it decodes"));
+        }
+        assert_eq!(found.suggestions, [vec![part("crates/blaze-std/src/lib.rs", 0, 3, "std")]]);
+        assert_eq!((found.others, found.left), (3, 0));
+        // The cause removed: the member asked for too (`-p blaze-sys`) is fixed.
+        let member = suggested(Some(unit("blaze-sys", true)), "crates/blaze-sys/src/lib.rs");
+        found.add(&blaze_protocol::cbor::from_slice(&member).expect("it decodes"));
+        assert_eq!(found.suggestions.len(), 2);
     }
 
     #[test]

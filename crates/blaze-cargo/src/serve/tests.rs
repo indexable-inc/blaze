@@ -249,6 +249,7 @@ fn warning_of_app(message: &str) -> Diagnostic {
         target,
         package_id: "app".into(),
         manifest_path: "/w/Cargo.toml".into(),
+        primary: true,
     };
     Diagnostic {
         level: Level::Warning,

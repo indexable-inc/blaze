@@ -448,6 +448,7 @@ impl Gen {
             target: self.unit_target(),
             package_id: self.text(),
             manifest_path: self.text(),
+            primary: self.yes(),
         }
     }
 

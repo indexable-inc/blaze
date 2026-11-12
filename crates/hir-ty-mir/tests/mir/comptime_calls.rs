@@ -8,9 +8,7 @@ use hir_ty_mir::mir::{MirSpan, const_check::comptime::comptime_calls};
 
 use crate::function;
 
-const FACTS: &str = r#"
-//- minicore: sized, fn
-#[rustc_comptime]
+const FACTS: &str = r#"#[rustc_comptime]
 pub fn fact(x: usize) -> usize { x }
 #[rustc_intrinsic]
 #[rustc_comptime]
@@ -21,7 +19,8 @@ pub fn raw<T>() -> usize;
 #[track_caller]
 fn refused(src: &str, name: &str) -> Vec<String> {
     let src = format!("{FACTS}{src}");
-    let fx = fixture::db(&src);
+    // A span is in the file's text, which starts after the fixture's first line.
+    let fx = fixture::db(&format!("//- minicore: sized, fn\n{src}"));
     let _ = fx.only_file();
     let db = fx.into_db();
     blaze_query::db::attach(&db, || {

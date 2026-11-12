@@ -69,6 +69,7 @@ fn lib_of(name: &str) -> UnitOf {
         target: target("lib", name),
         test: false,
         doctest: false,
+        primary: true,
     }
 }
 

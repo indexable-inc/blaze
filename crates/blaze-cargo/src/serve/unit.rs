@@ -1621,6 +1621,7 @@ impl Job {
             doctest: matches!(unit.mode, Mode::Doctest),
             package_id: unit.pkg_id.clone(),
             manifest_path: package.manifest_path.clone(),
+            primary: self.units().is_primary(at),
             target: unit_target(unit)?,
         })
     }

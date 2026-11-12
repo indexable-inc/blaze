@@ -58,6 +58,7 @@ fn diagnostic() -> Diagnostic {
             target: target(),
             package_id: "path+file:///w#app@0.1.0".to_owned(),
             manifest_path: "/w/Cargo.toml".to_owned(),
+            primary: true,
         }),
         facts: vec![FactRead {
             key: QueryKey { kind: QueryKind(0x1000), input: ContentId([7; 32]) },
