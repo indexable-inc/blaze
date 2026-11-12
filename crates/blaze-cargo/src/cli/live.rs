@@ -1,54 +1,30 @@
-//! `blaze build`, `check` and `test` on a terminal: one live view of the build (and, for
-//! `test`, of its tests), built the way Elm builds a program. The models, their updates and
-//! their views are blaze-ui's sans-IO [`Board`] (fed each [`ResponseRef::Doing`]'s model of
-//! the build, [`blaze_protocol::now::Now`], and the keys pressed) and, for `test`, its
-//! [`TestView`] (`apply` is the update, fed [`Event`]s with the time injected; `render` is the
-//! view, into a ratatui buffer; `take_above` and `summary` are the effects, lines to print
-//! above the live region), drawn under the board's sections
-//! (docs/v2/plan/design/build-view.md, "The renderer"). This file is only the runtime around
-//! them, threads that do the IO and nothing else:
+//! `blaze test` on a terminal: its test executables run while the build goes on, each as soon
+//! as it is linked, and the screen (docs/terminal.md) shows both. The screen is blaze-screen's
+//! one core behind its driver ([`Show`]); this file is only the threads around it, which do
+//! IO and decide nothing of what is shown:
 //!
-//! - the caller's thread talks to the daemon and turns each response into a message for the
-//!   screen (and, for `test`, a [`Run::Ready`] for each test executable as it is linked,
-//!   [`Response::TestReady`]);
-//! - for `test`, the runner starts each test executable as soon as it is ready, a few at a
-//!   time, while the build goes on, and reads libtest's JSON into more [`Event`]s;
-//! - the screen owns the terminal, in raw mode so it reads keys (`e` expands the board,
-//!   Ctrl-C cancels as the signal does), in one of two [`Form`]s:
-//!   - [`Form::Full`], on a terminal at least [`FULL_COLUMNS`] by [`FULL_ROWS`] and unless
-//!     `BLAZE_UI=inline`: the alternate screen, so the scrollback keeps only what stays. What
-//!     the printer and the test view print (diagnostics, failures) is held while the view is
-//!     up, counted on its last row, and printed in order once it leaves, then the summary;
-//!   - [`Form::Inline`]: a few rows under the scrollback ([`Viewport::Inline`]), with what is
-//!     printed going above it as it comes, so the failures and the summary stay in the
-//!     scrollback and the live region is cleared.
+//! - the caller's thread talks to the daemon: each response is the printer's, which makes the
+//!   screen's events of it, and each test executable linked ([`Response::TestReady`]) is the
+//!   runner's;
+//! - the runner starts each test executable, a few at a time, reads libtest's JSON and says
+//!   each test as the screen's events ([`blaze_screen::Test`]);
+//! - the screen's thread owns the [`Show`]: it takes the events of both in the order they
+//!   came, and draws when one came or a timer of the region is due.
 //!
-//! Off a terminal (a pipe, CI, `--message-format json`, `-q`, `-v`, `BLAZE_UI=plain`) none of
-//! this runs: [`wanted`] says no and `cli::drive` prints its plain lines, the build's compact
-//! line among them ([`blaze_ui::board::Board::line`], from the printer). For `test` the exit
-//! code is cargo's either way: 0, the code of the first failing executable in cargo's order,
-//! under `--fail-fast`, else 101 when anything failed (the default runs every executable).
+//! An interrupt puts the terminal back from `show::watch_interrupts`'s thread; the test
+//! executables share the terminal's process group, so they get the signal too.
 //!
-//! Without blaze-cargo's `native` feature (the wasm seed, which has no terminal library) a run
-//! that would draw the view is refused, naming the feature ([`drive`]); the runtime around the
-//! terminal still builds and its tests still run.
+//! Off a terminal, or with libtest's own output asked for ([`PLAIN_ARGS`]), none of this
+//! runs: [`wanted`] says no and `cli::drive` runs the executables after the build, each
+//! writing for itself. The exit code is cargo's either way: 0, the code of the first failing
+//! executable in cargo's order under `--fail-fast`, else 101 when anything failed.
 //!
 //! [`Response::TestReady`]: blaze_api::Response::TestReady
-
-#![cfg_attr(
-    not(feature = "native"),
-    allow(
-        dead_code,
-        unused_imports,
-        reason = "without `native`, only `wanted` and the refusing `drive` are reached"
-    )
-)]
 
 use std::{
     alloc::Global,
     ffi::OsString,
-    io::{self, BufRead as _, BufReader, IsTerminal as _, Read as _, Write},
-    panic::{AssertUnwindSafe, catch_unwind},
+    io::{self, BufRead as _, BufReader, Read as _},
     path::PathBuf,
     process::{Child, Stdio},
     sync::Arc,
@@ -56,33 +32,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use blaze_api::{Artifact, ArtifactKind, Level, Request, ResponseRef, TargetKind};
+use blaze_api::{Artifact, ArtifactKind, Request, ResponseRef, TargetKind};
 use blaze_core::exit::Exit;
-use blaze_hash::HashSet;
-use blaze_protocol::now::Now;
-use blaze_ui::{
-    board::{Board, Form, INLINE_ROWS, Key},
-    test_view::{BinaryEnd, Event, Paint, TestView, Verdict, ansi, wrap},
-};
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use blaze_core::lock::Lock;
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::{Modifier, Style},
-    text::{Line, Span},
-};
-#[cfg(feature = "native")]
-use ratatui::{
-    Terminal, TerminalOptions, Viewport,
-    backend::CrosstermBackend,
-    crossterm::{
-        cursor,
-        event::{self as keys, KeyCode, KeyEventKind, KeyModifiers},
-        execute,
-        terminal::{self as tty, EnterAlternateScreen, LeaveAlternateScreen},
-    },
-};
+use blaze_hash::HashSet;
+use blaze_screen::{BinaryEnd, Caps, Event, Test, Verdict};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 
 use super::{
     Then,
@@ -92,30 +47,16 @@ use super::{
     print::{Printer, Shown},
     run::Exec,
     say,
+    show::{Show, Sink},
     test::{self, Kind},
 };
-use crate::serve::signals;
 
-/// How often the region is redrawn and the keys read: the spinner's frame.
-const TICK: Duration = Duration::from_millis(80);
-/// The rows the test view's own section gets: in the inline form all of them under the
-/// board's, in the full form at least these (or half the screen, the fewer) under the board.
-const REGION: u16 = 10;
-/// The smallest terminal the view is drawn on; a smaller one gets the plain lines.
-const COLUMNS: u16 = 40;
-const ROWS: u16 = 8;
-/// The smallest terminal the full form is drawn on; a smaller one gets the inline form.
-const FULL_COLUMNS: u16 = 80;
-const FULL_ROWS: u16 = 20;
-/// The most keys read in one tick: a paste or a held key is read over a few ticks, never in
-/// an open loop.
-const KEYS_A_TICK: usize = 64;
 /// How long a test executable's output is read after its process exited. Whatever it wrote
 /// is in the pipe by then, so only a process it started and left running, which inherited its
 /// stdout or stderr, holds the pipe open past this; the runner then stops reading and says so.
 const DRAIN: Duration = Duration::from_secs(2);
-/// libtest's arguments that change what it prints, which the view can't read: with any of
-/// them the run is plain.
+/// libtest's arguments that change what it prints, which the screen can't read: with any of
+/// them the executables write for themselves.
 const PLAIN_ARGS: [&str; 9] = [
     "--format",
     "--list",
@@ -128,103 +69,39 @@ const PLAIN_ARGS: [&str; 9] = [
     "--help",
 ];
 
-/// Whether the command draws its live view: `build`, `check` or `test`, whose stdout and
-/// stderr are terminals big enough, printed for a person (not JSON, `-q` or `-v`), not
-/// `BLAZE_UI=plain` or a dumb terminal, and not on CI ([`blaze_units::lock::ci_says`]), whose
-/// workers may hand it a pseudo-terminal whose log is read as text. A `test` also runs its tests
-/// (not `--no-run`, `--reached`, `--ub`) with libtest's own output left as the view reads it;
-/// a `check` makes no fixes and counts no baselines (`--fix`, `--baselines`), whose work after
-/// the build is the plain path's; neither is `blaze lock`'s.
-pub fn wanted(asked: &Invocation, shown: Shown) -> bool {
-    let plain_ui = std::env::var_os("BLAZE_UI").is_some_and(|it| it == "plain");
-    let dumb = std::env::var_os("TERM").is_some_and(|it| it == "dumb");
-    let command = asked.command();
-    if !matches!(command, Command::Build | Command::Check | Command::Test)
-        || asked.lock
-        || blaze_units::lock::ci_says(
-            std::env::var("CI").ok().as_deref(),
-            std::env::var("TF_BUILD").ok().as_deref(),
-        )
-        || shown.format.json()
-        || shown.quiet
-        || shown.verbose > 0
-        || plain_ui
-        || dumb
-        || !io::stdout().is_terminal()
-        || !io::stderr().is_terminal()
-    {
+/// Whether the command's tests are run under the screen: a `test` on a terminal the screen
+/// redraws (`caps`), printed for a person (not `-q` or `-v`), that runs its tests (not
+/// `--no-run`, `--reached`, `--ub`, `blaze lock`) with libtest's own output left as the screen
+/// reads it.
+pub fn wanted(asked: &Invocation, shown: Shown, caps: Caps) -> bool {
+    if asked.command() != Command::Test || asked.lock || !caps.live || shown.quiet || shown.verbose > 0 {
         return false;
     }
-    let own = match command {
-        Command::Test => {
-            let reads_args = asked.program.iter().all(|arg| {
-                let arg = arg.to_string_lossy();
-                !PLAIN_ARGS
-                    .iter()
-                    .any(|plain| arg == *plain || arg.starts_with(&format!("{plain}=")))
-            });
-            !asked.flags.no_run && !asked.flags.reached && !asked.flags.ub && reads_args
-        }
-        Command::Check => !asked.flags.fix && asked.flags.baselines.is_none(),
-        _ => true,
-    };
-    own && fits()
+    let reads_args = asked.program.iter().all(|arg| {
+        let arg = arg.to_string_lossy();
+        !PLAIN_ARGS.iter().any(|plain| arg == *plain || arg.starts_with(&format!("{plain}=")))
+    });
+    !asked.flags.no_run && !asked.flags.reached && !asked.flags.ub && reads_args
 }
 
-/// Whether the terminal is big enough for the view.
-#[cfg(feature = "native")]
-fn fits() -> bool {
-    tty::size().is_ok_and(|(columns, rows)| columns >= COLUMNS && rows >= ROWS)
-}
-
-/// Without `native` there is no terminal library to ask the size, and the view is what this run
-/// asks for whatever it is: [`drive`] refuses it, naming the feature.
-#[cfg(not(feature = "native"))]
-fn fits() -> bool {
-    true
-}
-
-/// The form the view takes on this terminal: full on one big enough unless `BLAZE_UI=inline`.
-#[cfg(feature = "native")]
-fn form() -> Form {
-    let inline = std::env::var_os("BLAZE_UI").is_some_and(|it| it == "inline");
-    let big =
-        tty::size().is_ok_and(|(columns, rows)| columns >= FULL_COLUMNS && rows >= FULL_ROWS);
-    match big && !inline {
-        true => Form::Full,
-        false => Form::Inline,
-    }
-}
-
-/// What a blaze built without blaze-cargo's `native` feature says when a run asks for the view.
-#[cfg(not(feature = "native"))]
-const NO_TUI: &str = "`blaze build`, `check` and `test` on a terminal draw a live view, and this blaze is built \
-                      without blaze-cargo's `native` feature (the seed profile, which has no terminal library); \
-                      `BLAZE_UI=plain` prints plain lines";
-
-/// [`NO_TUI`]: the run is refused before anything is built.
-#[cfg(not(feature = "native"))]
-pub fn drive<A: Api>(
-    _api: &mut A,
-    _asked: &Invocation,
-    _place: &Place,
-    _request: Request,
-    _shown: Shown,
-    _started: Instant,
-) -> io::Result<Then> {
-    Err(io::Error::other(NO_TUI))
-}
-
-/// What the screen is sent, in the order it happened, then its end.
+/// What the screen's thread is sent, in the order it happened, then its end.
 enum Msg {
-    /// For the test view (`test` only).
-    View(Event),
-    /// The build as it runs now, for the board.
-    Now(Now),
-    /// A burst of the printer's whole lines, as it wrote them: for `test` the test view's to
-    /// print, else printed above the region (inline) or held until the view leaves (full).
-    Said(String),
+    Event(Event),
+    /// A burst of events ended: the frame that is due is drawn.
+    Draw,
     Finish,
+}
+
+/// The screen as the other threads see it: its events go to the thread that owns it.
+impl Sink for Sender<Msg> {
+    fn take(&mut self, event: Event) {
+        let _ = self.send(Msg::Event(event));
+    }
+
+    fn draw(&mut self) -> io::Result<()> {
+        let _ = self.send(Msg::Draw);
+        Ok(())
+    }
 }
 
 /// What the runner is sent.
@@ -242,9 +119,40 @@ enum Run {
     BuildOver { ok: bool, artifacts: Vec<Artifact> },
 }
 
-/// The build (and for `test` its tests), drawn live: what `cli::drive` does for `build`,
-/// `check` and `test` on a terminal.
-#[cfg(feature = "native")]
+/// The screen's thread: each message an event for the screen or the end of a burst, a frame
+/// drawn after each burst and when a timer of the region is due.
+fn screen(mut show: Show<io::Stderr>, gets: &Receiver<Msg>, started: Instant) -> io::Result<()> {
+    loop {
+        let now = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // The region's timers turn over once a second; with none, the thread only waits.
+        let wait = show.next_deadline().map_or(1000, |at| at.saturating_sub(now).clamp(50, 1000));
+        // One message: whether it is the end.
+        let apply = |msg: Msg, show: &mut Show<io::Stderr>| match msg {
+            Msg::Event(event) => {
+                show.take(event);
+                false
+            }
+            Msg::Draw => false,
+            Msg::Finish => true,
+        };
+        let mut finish = match gets.recv_timeout(Duration::from_millis(wait)) {
+            Ok(msg) => apply(msg, &mut show),
+            Err(RecvTimeoutError::Disconnected) => true,
+            Err(RecvTimeoutError::Timeout) => false,
+        };
+        // A burst is one frame.
+        while let Ok(msg) = gets.try_recv() {
+            finish |= apply(msg, &mut show);
+        }
+        show.draw()?;
+        if finish {
+            return Ok(());
+        }
+    }
+}
+
+/// The build and its tests under the screen: what `cli::cargo` does for a `test` on a
+/// terminal.
 pub fn drive<A: Api>(
     api: &mut A,
     asked: &Invocation,
@@ -252,148 +160,48 @@ pub fn drive<A: Api>(
     request: Request,
     shown: Shown,
     started: Instant,
+    show: Show<io::Stderr>,
 ) -> io::Result<Then> {
-    let paint = if shown.color { Paint::Color } else { Paint::Plain };
-    let command = asked.command();
-    let testing = command == Command::Test;
-    let form = form();
-    let terminal = open(form, testing).map_err(|error| {
-        // alloc: the error the command ends with, once
-        io::Error::other(format!(
-            "the live view could not start on this terminal ({error}); `BLAZE_UI=plain` prints plain lines"
-        ))
-    })?;
-    // Ctrl-C, as the signal or as a key in raw mode, is a flag or a key the screen reads: it
-    // puts the terminal back, then ends the command. The test executables share the
-    // terminal's process group, so they get it too.
-    signals::catch();
-    let (to_screen, screen_gets) = unbounded::<Msg>();
-    // alloc: once a command
-    let board = Board::new(&format!("blaze {}", command.name()), paint);
-    // Made before its thread, so a thread that can't start drops it, which puts the terminal back.
-    let screen = Screen {
-        terminal,
-        form,
-        board,
-        view: testing.then(|| TestView::new(paint).under_board()),
-        paint,
-        said: Vec::new(), // alloc: one a command
-        held: Vec::new(), // alloc: one a command
-        broken: false,
-        restored: false,
-        started,
-    };
+    let (mut to_screen, screen_gets) = unbounded::<Msg>();
     let screen = thread::Builder::new()
-        .name("blaze live screen".into())
-        .spawn(move || screen.run(&screen_gets))?;
-    let (to_runner, runner) = match testing {
-        true => {
-            let (to_runner, runner_gets) = unbounded::<Run>();
-            let to_screen = to_screen.clone();
-            let for_runner = to_runner.clone();
-            // The workspace's member count comes with `Built`, after the first executables run,
-            // so "to rerun pass" always names the package: `-p calc --lib` reruns it in any
-            // workspace.
-            let cores = blaze_core::cores::get().map_err(io::Error::other)?;
-            let runner = Runner::new(asked, cores, to_screen, for_runner, true, shown.color);
-            let runner = thread::Builder::new()
-                .name("blaze test runner".into())
-                .spawn(move || runner.run(&runner_gets))?;
-            (Some(to_runner), Some(runner))
-        }
-        false => (None, None),
-    };
+        .name("blaze screen".into())
+        .spawn(move || screen(show, &screen_gets, started))?;
+    let (to_runner, runner_gets) = unbounded::<Run>();
+    // The workspace's member count comes with `Built`, after the first executables run, so a
+    // rerun always names the package: `-p calc --lib` reruns it in any workspace.
+    let cores = blaze_core::cores::get().map_err(io::Error::other)?;
+    let runner = Runner::new(asked, cores, to_screen.clone(), to_runner.clone(), true, shown.color);
+    let runner = thread::Builder::new()
+        .name("blaze test runner".into())
+        .spawn(move || runner.run(&runner_gets))?;
 
-    let (mut out, mut err) = (Above::new(to_screen.clone()), Above::new(to_screen.clone()));
-    let mut printer = Printer::new(shown, &place.root, &mut out, &mut err);
+    let mut out = io::stdout();
+    let mut for_printer = to_screen.clone();
+    let mut printer = Printer::new(shown, &place.root, &mut out, &mut for_printer);
     printer.place(std::env::var("HOME").ok(), super::observe::last_failure());
-    let mut failed_units: HashSet<u32, Global> = HashSet::default(); // alloc: one a command
     let mut unwritten = None;
-    // The test view's events; a build or check has none.
-    let view = |event: Event| {
-        if testing {
-            let _ = to_screen.send(Msg::View(event));
-        }
-    };
     let called = api.call(request, |response, more| {
         if let ResponseRef::Work(worked) = &response {
             super::client_rows::heard(worked.build_id, worked.misses);
             super::client_rows::summarized(worked.build_id, worked.why.as_deref());
         }
         let printed = match response {
-            // The board stands for cargo's `Compiling` lines.
-            ResponseRef::Unit(_) => Ok(()),
-            ResponseRef::UnitBegan(unit) => {
-                if testing {
-                    view(Event::UnitBegan {
-                        id: unit.id,
-                        label: unit_label(
-                            say::package_name(unit.package_id),
-                            unit.target.kind,
-                            unit.target.name,
-                            unit.test,
-                        ),
-                    });
-                }
-                Ok(())
-            }
-            ResponseRef::UnitEnded(unit) => {
-                view(Event::UnitEnded { id: unit.id });
-                printer.on(ResponseRef::UnitEnded(unit))
-            }
-            ResponseRef::Diagnostic(diagnostic) => {
-                if testing
-                    && diagnostic.level == Level::Error
-                    && let Some(unit) = &diagnostic.unit
-                    && failed_units.insert(unit.id)
-                {
-                    view(Event::UnitFailed { id: unit.id });
-                }
-                printer.on(ResponseRef::Diagnostic(diagnostic))
-            }
-            ResponseRef::Report { unit, report } => {
-                if testing
-                    && report.severity == blaze_api::Severity::Error
-                    && let Some(unit) = &unit
-                    && failed_units.insert(unit.id)
-                {
-                    view(Event::UnitFailed { id: unit.id });
-                }
-                printer.on(ResponseRef::Report { unit, report })
-            }
             ResponseRef::TestReady(artifact) => {
-                if let Some(to_runner) = &to_runner {
-                    let _ = to_runner.send(Run::Ready(artifact));
-                }
-                Ok(())
-            }
-            // What the build waits on and what its units are inside: the views draw it, so
-            // nothing is printed above them.
-            ResponseRef::Doing(doing) => {
-                if testing {
-                    view(Event::Doing {
-                        on: doing.on,
-                        busy: doing.busy,
-                        idle: doing.idle,
-                        running: doing.running,
-                        units: doing.units.into_iter().map(|it| (it.id, it.doing)).collect(), // alloc: once a second
-                    });
-                }
-                let _ = to_screen.send(Msg::Now(doing.now));
+                let _ = to_runner.send(Run::Ready(artifact));
                 Ok(())
             }
             response => printer.on(response),
         };
         let written = printed.and_then(|()| match more {
             true => Ok(()),
-            false => printer.flush(),
+            false => printer.draw(),
         });
         if let Err(error) = written {
             unwritten.get_or_insert(error);
         }
     });
     let ok = match called {
-        Ok(ok) => ok && !printer.refused(),
+        Ok(ok) => ok && !printer.refused() && printer.left_unchecked() == 0,
         Err(error) => {
             // alloc: the error a build ends with, once
             let what = match daemon::hung_up(&error).then(|| api.died()).flatten() {
@@ -406,483 +214,41 @@ pub fn drive<A: Api>(
                 }
                 None => error.to_string(),
             };
+            use std::io::Write as _;
             if let Err(error) = printer.err().write_all(say::error(&what, shown.color).as_bytes()) {
                 unwritten.get_or_insert(error);
             }
             false
         }
     };
-    // Nothing returns before the runner and the screen are told the build is over: the
-    // terminal is put back on every path.
-    if let Err(error) = printer.finish(ok, started.elapsed()) {
+    // Unless `--fail-fast`, the tests of every unit that built still run when another failed.
+    let tests = ok || !asked.flags.fail_fast;
+    let why = match ok {
+        true => super::why_recomputed(&mut printer, shown, true).unwrap_or(None),
+        false => None,
+    };
+    // Nothing returns before the runner and the screen are told the build is over.
+    if let Err(error) = printer.finish(ok, started.elapsed(), why, tests) {
         unwritten.get_or_insert(error);
     }
     let artifacts = printer.take_artifacts();
-    for it in printer.take_unbuilt() {
-        view(Event::Unbuilt { unit: it.unit, behind: it.behind, why: it.why });
-    }
+    let unbuilt = printer.take_unbuilt();
     drop(printer);
-    for flushed in [out.flush(), err.flush()] {
-        if let Err(error) = flushed {
-            unwritten.get_or_insert(error);
-        }
+    for it in unbuilt {
+        to_screen.take(Event::Test(Test::Unbuilt { unit: it.unit, behind: it.behind, why: it.why }));
     }
-    view(Event::BuildEnded { ok });
-    let code = match (to_runner, runner) {
-        (Some(to_runner), Some(runner)) => {
-            let _ = to_runner.send(Run::BuildOver { ok, artifacts });
-            drop(to_runner);
-            runner.join().unwrap_or(Exit::Failed.code())
-        }
-        _ if ok => 0,
-        _ => Exit::Failed.code(),
-    };
+    let _ = to_runner.send(Run::BuildOver { ok, artifacts });
+    drop(to_runner);
+    let code = runner.join().unwrap_or(Exit::Failed.code());
+    to_screen.take(Event::Test(Test::Over));
     let _ = to_screen.send(Msg::Finish);
     drop(to_screen);
-    let shown = screen
-        .join()
-        .map_err(|_| io::Error::other("the live view's screen thread panicked"))?;
+    let shown = screen.join().map_err(|_| io::Error::other("the screen's thread panicked"))?;
     shown?;
     if let Some(error) = unwritten {
         return Err(error);
     }
-    Ok(Then::Exit(code))
-}
-
-/// The terminal in raw mode, on stderr as cargo's own lines are: the alternate screen for
-/// [`Form::Full`], an inline region for [`Form::Inline`] tall enough for the board's inline
-/// rows and, for `test`, the test view's under them. What was entered before a step failed is
-/// left again: a view that can't start leaves the terminal as it found it.
-#[cfg(feature = "native")]
-fn open(form: Form, testing: bool) -> io::Result<Terminal<CrosstermBackend<io::Stderr>>> {
-    let (_, rows) = tty::size()?;
-    tty::enable_raw_mode().map_err(|error| io::Error::other(format!("raw mode: {error}")))?;
-    let opened = match form {
-        Form::Full => execute!(io::stderr(), EnterAlternateScreen)
-            .map_err(|error| io::Error::other(format!("the alternate screen: {error}")))
-            .and_then(|()| {
-                Terminal::with_options(
-                    CrosstermBackend::new(io::stderr()),
-                    TerminalOptions { viewport: Viewport::Fullscreen },
-                )
-            }),
-        Form::Inline => {
-            let wanted = INLINE_ROWS as u16 + if testing { REGION } else { 0 };
-            let height = wanted.min(rows.saturating_sub(4)).max(3);
-            Terminal::with_options(
-                CrosstermBackend::new(io::stderr()),
-                TerminalOptions { viewport: Viewport::Inline(height) },
-            )
-        }
-    };
-    if opened.is_err() {
-        if form == Form::Full {
-            let _ = execute!(io::stderr(), LeaveAlternateScreen);
-        }
-        let _ = tty::disable_raw_mode();
-    }
-    opened
-}
-
-/// `calc lib test`, `calc test it`, `calc build script`: a unit as the build row names it.
-fn unit_label(package: &str, kind: TargetKind, name: &str, test: bool) -> String {
-    // alloc: one label a unit
-    match kind {
-        TargetKind::Lib if test => format!("{package} lib test"),
-        TargetKind::Lib => format!("{package} lib"),
-        TargetKind::Bin => format!("{package} bin {name}"),
-        TargetKind::Test => format!("{package} test {name}"),
-        TargetKind::Bench => format!("{package} bench {name}"),
-        TargetKind::Example => format!("{package} example {name}"),
-        TargetKind::CustomBuild => format!("{package} build script"),
-    }
-}
-
-/// The printer's lines, sent to the screen whole: what it writes between flushes is a burst of
-/// whole lines, printed above the region.
-struct Above {
-    to: Sender<Msg>,
-    held: Vec<u8>,
-}
-
-impl Above {
-    fn new(to: Sender<Msg>) -> Above {
-        Above { to, held: Vec::new() } // alloc: one buffer a stream, for the command
-    }
-}
-
-impl Write for Above {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.held.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        if self.held.is_empty() {
-            return Ok(());
-        }
-        let text = String::from_utf8_lossy(&self.held).into_owned(); // alloc: one burst of lines
-        self.held.clear();
-        let _ = self.to.send(Msg::Said(text));
-        Ok(())
-    }
-}
-
-/// The runtime's screen: each message is a view's update, each tick the keys read and the
-/// views drawn, and what is printed goes above the region (inline) or is held until the view
-/// leaves (full).
-#[cfg(feature = "native")]
-struct Screen {
-    terminal: Terminal<CrosstermBackend<io::Stderr>>,
-    form: Form,
-    board: Board,
-    /// `test`'s own view, drawn under the board's sections.
-    view: Option<TestView>,
-    paint: Paint,
-    /// The printer's bursts not yet taken, for a run with no test view (which takes them).
-    said: Vec<String>,
-    /// In the full form, every line printed while the view is up: printed, in order, once it
-    /// leaves the alternate screen.
-    held: Vec<Line<'static>>,
-    /// Drawing panicked once (or the keys could not be read): the region is gone, the terminal
-    /// is put back, and what the views hand back is printed as plain lines from then on.
-    broken: bool,
-    /// The terminal is back as it was found: out of raw mode and the alternate screen.
-    restored: bool,
-    started: Instant,
-}
-
-#[cfg(feature = "native")]
-impl Screen {
-    fn run(mut self, gets: &Receiver<Msg>) -> io::Result<()> {
-        loop {
-            let mut finish = false;
-            match gets.recv_timeout(TICK) {
-                Ok(msg) => finish |= self.apply(msg),
-                Err(RecvTimeoutError::Disconnected) => finish = true,
-                Err(RecvTimeoutError::Timeout) => {}
-            }
-            // A burst is one redraw.
-            while let Ok(msg) = gets.try_recv() {
-                finish |= self.apply(msg);
-            }
-            if signals::signalled() {
-                self.interrupted(false);
-            }
-            if !self.broken
-                && let Err(error) = self.keys()
-            {
-                self.break_view(&format!("its keys could not be read: {error}"));
-            }
-            if let Some(view) = &mut self.view {
-                view.tick(self.started.elapsed());
-            }
-            self.frame();
-            if finish {
-                return self.finish();
-            }
-        }
-    }
-
-    /// One message: whether it is the end.
-    fn apply(&mut self, msg: Msg) -> bool {
-        let now = self.started.elapsed();
-        match msg {
-            Msg::View(event) => {
-                if let Some(view) = &mut self.view {
-                    view.apply(now, event);
-                }
-            }
-            Msg::Now(model) => self.board.take(model),
-            Msg::Said(text) => match &mut self.view {
-                Some(view) => view.apply(now, Event::Said(text)),
-                None => self.said.push(text),
-            },
-            Msg::Finish => return true,
-        }
-        false
-    }
-
-    /// The keys pressed since the last tick, [`KEYS_A_TICK`] at most, none waited for: raw mode
-    /// makes Ctrl-C a key, which cancels as the signal does; `e` expands the board.
-    fn keys(&mut self) -> io::Result<()> {
-        for _ in 0..KEYS_A_TICK {
-            if !keys::poll(Duration::ZERO)? {
-                return Ok(());
-            }
-            let keys::Event::Key(key) = keys::read()? else { continue };
-            if key.kind == KeyEventKind::Release {
-                continue;
-            }
-            let control = key.modifiers.contains(KeyModifiers::CONTROL);
-            match key.code {
-                KeyCode::Char('c' | 'C') if control => self.interrupted(true),
-                KeyCode::Char('e') if !control => self.board.key(Key::Expand),
-                _ => self.board.key(Key::Other),
-            }
-        }
-        Ok(())
-    }
-
-    /// What was printed since the last call, as lines `width` columns wide at most, in order.
-    fn take_above(&mut self, width: u16) -> Vec<Line<'static>> {
-        let mut lines = match &mut self.view {
-            Some(view) => view.take_above(width),
-            None => Vec::new(), // alloc: none until one is pushed
-        };
-        for text in std::mem::take(&mut self.said) {
-            for line in text.strip_suffix('\n').unwrap_or(text.as_str()).split('\n') {
-                lines.extend(wrap(ansi(line, self.paint), width as usize));
-            }
-        }
-        lines
-    }
-
-    /// One frame: what was printed above the region (inline) or held (full), the views
-    /// redrawn. A panic in drawing is said once and ends the region, not the run.
-    fn frame(&mut self) {
-        if self.broken {
-            let lines = self.take_above(width());
-            plain(&lines);
-            return;
-        }
-        let drawn = catch_unwind(AssertUnwindSafe(|| self.draw()));
-        let why = match drawn {
-            Ok(Ok(())) => return,
-            Ok(Err(error)) => error.to_string(),
-            Err(panic) => panic
-                .downcast_ref::<&str>()
-                .map(|it| (*it).to_owned())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "a panic with no message".to_owned()), // alloc: once, as the view breaks
-        };
-        self.break_view(&why);
-    }
-
-    fn draw(&mut self) -> io::Result<()> {
-        self.terminal.autoresize()?;
-        let width = self.terminal.size()?.width;
-        let lines = self.take_above(width);
-        match self.form {
-            Form::Full => self.held.extend(lines),
-            Form::Inline => above(&mut self.terminal, &lines)?,
-        }
-        let (form, board, view) = (self.form, &self.board, self.view.as_ref());
-        let held = self.held.len();
-        self.terminal.draw(|frame| {
-            let area = frame.area();
-            draw_into(form, board, view, held, area, frame.buffer_mut());
-        })?;
-        Ok(())
-    }
-
-    /// The region is gone for the rest of the run: the terminal put back, why said, and what
-    /// was held printed as plain lines.
-    fn break_view(&mut self, why: &str) {
-        self.broken = true;
-        if self.form == Form::Inline {
-            let _ = self.terminal.clear();
-        }
-        let _ = self.terminal.show_cursor();
-        self.leave();
-        // alloc: once, as the view breaks
-        let said =
-            format!("the live view stopped drawing: {why}; the rest is printed as plain lines");
-        eprint!("{}", say::error(&said, false));
-        plain(&std::mem::take(&mut self.held));
-    }
-
-    /// The run is over: what is left to print and the summary printed above the region (and in
-    /// the full form everything held, after the alternate screen is left), the region cleared,
-    /// the cursor after them, so the shell's prompt follows the summary.
-    fn finish(mut self) -> io::Result<()> {
-        let width = match self.broken {
-            true => width(),
-            false => self.terminal.size()?.width,
-        };
-        let lines = self.take_above(width);
-        // The board's summary first (the build's time, its slowest tasks, what failed), then
-        // the tests'.
-        let mut said = String::new(); // alloc: once, at the end
-        self.board.summary(&mut said);
-        // alloc: once, at the end
-        let mut summary: Vec<Line<'static>> = said.lines().map(|it| Line::from(it.to_owned())).collect();
-        if let Some(view) = &self.view {
-            summary.extend(view.summary(width));
-        }
-        if self.broken {
-            plain(&lines);
-            plain(&summary);
-            return Ok(());
-        }
-        match self.form {
-            Form::Inline => {
-                above(&mut self.terminal, &lines)?;
-                above(&mut self.terminal, &summary)?;
-                self.restore()
-            }
-            Form::Full => {
-                self.restore()?;
-                let mut held = std::mem::take(&mut self.held);
-                held.extend(lines);
-                held.extend(summary);
-                if let Err(error) = after(&held) {
-                    plain(&held);
-                    let said = format!(
-                        "the live view could not print what it held in color: {error}"
-                    ); // alloc: once, at the end
-                    eprint!("{}", say::warning(&said, false));
-                }
-                Ok(())
-            }
-        }
-    }
-
-    /// The region cleared (inline) or the alternate screen left (full), the cursor shown and
-    /// back where the region began, raw mode off.
-    fn restore(&mut self) -> io::Result<()> {
-        if self.form == Form::Inline {
-            self.terminal.clear()?;
-            let top = self.terminal.get_frame().area().y;
-            self.terminal.set_cursor_position((0, top))?;
-        }
-        self.terminal.show_cursor()?;
-        self.leave();
-        io::stderr().flush()
-    }
-
-    /// Out of the alternate screen and raw mode, once.
-    fn leave(&mut self) {
-        if self.restored {
-            return;
-        }
-        self.restored = true;
-        if self.form == Form::Full {
-            let _ = execute!(io::stderr(), LeaveAlternateScreen, cursor::Show);
-        }
-        let _ = tty::disable_raw_mode();
-    }
-
-    /// Ctrl-C, as the signal or (`key`) as the key raw mode made of it: the terminal put back,
-    /// what was held printed, the test executables sent the SIGINT the terminal would have
-    /// sent them, then the command ends as a shell's interrupted one does.
-    fn interrupted(&mut self, key: bool) -> ! {
-        if !self.broken {
-            let _ = self.restore();
-        }
-        plain(&std::mem::take(&mut self.held));
-        if key {
-            crate::raw::process::interrupt_own_group();
-        }
-        let _ = io::stderr().write_all(b"interrupted\n");
-        std::process::exit(blaze_core::exit::INTERRUPTED);
-    }
-}
-
-/// A screen dropped without its end (its thread never started, or it panicked outside
-/// drawing) still leaves the terminal as it found it.
-#[cfg(feature = "native")]
-impl Drop for Screen {
-    fn drop(&mut self) {
-        if !self.restored {
-            let _ = self.terminal.show_cursor();
-            self.leave();
-        }
-    }
-}
-
-/// The terminal's width, once the region is gone.
-#[cfg(feature = "native")]
-fn width() -> u16 {
-    tty::size().map_or(80, |(columns, _)| columns)
-}
-
-/// The views into `area`: the board's sections on top and, for `test`, the test view's under
-/// them; in the full form with lines held, a row at the bottom saying how many.
-fn draw_into(
-    form: Form,
-    board: &Board,
-    view: Option<&TestView>,
-    held: usize,
-    area: Rect,
-    buf: &mut Buffer,
-) {
-    let mut rest = area;
-    if form == Form::Full && held > 0 && area.height >= 2 {
-        rest.height -= 1;
-        let what = match held {
-            1 => " 1 line held, printed when the view closes".to_owned(), // alloc: a row
-            n => format!(" {n} lines held, printed when the view closes"), // alloc: a row
-        };
-        let row = Line::from(Span::styled(what, Style::new().add_modifier(Modifier::DIM)));
-        buf.set_line(area.x, area.bottom() - 1, &row, area.width);
-    }
-    let Some(view) = view else {
-        board.render(form, rest, buf);
-        return;
-    };
-    let tests = REGION.min(rest.height / 2);
-    let rows = board.height(form, rest.width).min(rest.height - tests);
-    let top = Rect { height: rows, ..rest };
-    let under = Rect { y: rest.y + rows, height: rest.height - rows, ..rest };
-    board.render(form, top, buf);
-    view.render(under, buf);
-}
-
-/// `lines` printed above the region, into the scrollback.
-#[cfg(feature = "native")]
-fn above(
-    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
-    lines: &[Line<'static>],
-) -> io::Result<()> {
-    // A chunk at most a screen's worth of rows, so no height overflows.
-    for chunk in lines.chunks(256) {
-        terminal.insert_before(chunk.len() as u16, |buf| {
-            let area = buf.area;
-            for (row, line) in chunk.iter().enumerate() {
-                let y = area.y.saturating_add(row as u16);
-                if y < area.bottom() {
-                    buf.set_line(area.x, y, line, area.width);
-                }
-            }
-        })?;
-    }
-    Ok(())
-}
-
-/// What the full form held, printed into the scrollback once the alternate screen is left:
-/// through a one-row inline region, so its colors are drawn as the inline form draws them.
-#[cfg(feature = "native")]
-fn after(lines: &[Line<'static>]) -> io::Result<()> {
-    if lines.is_empty() {
-        return Ok(());
-    }
-    let mut terminal = Terminal::with_options(
-        CrosstermBackend::new(io::stderr()),
-        TerminalOptions { viewport: Viewport::Inline(1) },
-    )?;
-    above(&mut terminal, lines)?;
-    terminal.clear()?;
-    let top = terminal.get_frame().area().y;
-    terminal.set_cursor_position((0, top))?;
-    terminal.show_cursor()?;
-    io::stderr().flush()
-}
-
-/// `lines` as text, once the region is gone (raw mode is off by then).
-#[cfg(feature = "native")]
-fn plain(lines: &[Line<'static>]) {
-    if lines.is_empty() {
-        return;
-    }
-    let mut text = String::new(); // alloc: once a frame after the view broke
-    for line in lines {
-        for span in &line.spans {
-            text.push_str(&span.content);
-        }
-        text.push('\n');
-    }
-    let _ = io::stderr().write_all(text.as_bytes());
+    Ok(Then::Exit(if ok { code } else { code.max(Exit::Failed.code()) }))
 }
 
 /// libtest's variable for how many threads it runs tests on.
@@ -1021,8 +387,13 @@ impl Runner {
         }
     }
 
-    fn say(&self, event: Event) {
-        let _ = self.to_screen.send(Msg::View(event));
+    fn say(&self, test: Test) {
+        let _ = self.to_screen.send(Msg::Event(Event::Test(test)));
+    }
+
+    /// Words of the runner's own, a line that stays.
+    fn warn(&self, what: &str) {
+        let _ = self.to_screen.send(Msg::Event(Event::Said(say::warning(what, self.color))));
     }
 
     fn run(mut self, gets: &Receiver<Run>) -> i32 {
@@ -1128,11 +499,11 @@ impl Runner {
         };
         let rerun = test::rerun(&artifact, kind, self.spec_flag);
         let binary = self.binaries.len() as u32;
-        self.say(Event::BinaryQueued { binary, label: label.clone(), order: order.clone(), rerun });
+        self.say(Test::Queued { binary, label: label.clone(), rerun });
         let json = artifact.harness && !doc;
         self.binaries.push(Binary { artifact, order, label, json, began: None });
         if self.stopping {
-            self.say(Event::BinaryEnded { binary, end: BinaryEnd::Stopped, output: String::new() });
+            self.say(Test::Ended { binary, end: BinaryEnd::Stopped, output: String::new() });
             return;
         }
         self.queued.push(binary);
@@ -1174,14 +545,14 @@ impl Runner {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let json = it.json;
         let name = it.label.clone();
-        self.say(Event::BinaryStarted { binary });
+        self.say(Test::Started { binary });
         let child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
                 let why =
                     format!("could not execute process {} (never executed): {error}", exec.shown());
                 let order = self.binaries[binary as usize].order.clone();
-                self.say(Event::BinaryEnded {
+                self.say(Test::Ended {
                     binary,
                     end: BinaryEnd::NeverRan { why },
                     output: String::new(),
@@ -1192,8 +563,8 @@ impl Runner {
         };
         self.binaries[binary as usize].began = Some(Instant::now());
         if !json {
-            self.say(Event::SuiteTotal { binary, tests: 1 });
-            self.say(Event::TestStarted { binary, name });
+            self.say(Test::Total { binary, tests: 1 });
+            self.say(Test::TestStarted { binary, name });
         }
         let mut child = child;
         let pid = child.id();
@@ -1227,7 +598,7 @@ impl Runner {
             let why =
                 format!("could not read the output of {} or wait for it: {error}", exec.shown());
             let order = self.binaries[binary as usize].order.clone();
-            self.say(Event::BinaryEnded {
+            self.say(Test::Ended {
                 binary,
                 end: BinaryEnd::NeverRan { why },
                 output: String::new(),
@@ -1255,8 +626,7 @@ impl Runner {
                      stderr close, which a process it started and left running can hold off",
                     running.pid
                 );
-                let _ =
-                    self.to_screen.send(Msg::View(Event::Said(say::warning(&what, self.color))));
+                self.warn(&what);
             }
         }
     }
@@ -1293,21 +663,21 @@ impl Runner {
                 running.pid,
                 self.drain.as_millis()
             );
-            let _ = self.to_screen.send(Msg::View(Event::Said(say::warning(&what, self.color))));
+            self.warn(&what);
         }
         let ended = running.child.wait().map(say::Ended::of);
         let it = &self.binaries[binary as usize];
         let took = it.began.map(|began| began.elapsed());
         let (order, json, name) = (it.order.clone(), it.json, it.label.clone());
         if running.killed {
-            self.say(Event::BinaryEnded { binary, end: BinaryEnd::Stopped, output });
+            self.say(Test::Ended { binary, end: BinaryEnd::Stopped, output });
             return;
         }
         let ended = match ended {
             Ok(ended) => ended,
             Err(error) => {
                 let why = format!("could not wait for {name}: {error}");
-                self.say(Event::BinaryEnded { binary, end: BinaryEnd::NeverRan { why }, output });
+                self.say(Test::Ended { binary, end: BinaryEnd::NeverRan { why }, output });
                 self.failed(order, None, binary);
                 return;
             }
@@ -1316,17 +686,23 @@ impl Runner {
         if !json {
             let verdict = if ok { Verdict::Passed } else { Verdict::Failed };
             // clone: the box and the binary's end both show it
-            self.say(Event::TestEnded { binary, name, verdict, took, output: output.clone() });
+            self.say(Test::TestEnded {
+                binary,
+                name,
+                verdict,
+                took_ms: took.map(|it| u64::try_from(it.as_millis()).unwrap_or(u64::MAX)),
+                output: output.clone(), // clone: one test's output, once it ended
+            });
         }
         if ok {
-            self.say(Event::BinaryEnded { binary, end: BinaryEnd::Passed, output });
+            self.say(Test::Ended { binary, end: BinaryEnd::Passed, output });
             return;
         }
         let code = match ended {
             say::Ended::Code(code) => Some(code),
             say::Ended::Signal(_) => None,
         };
-        self.say(Event::BinaryEnded {
+        self.say(Test::Ended {
             binary,
             end: BinaryEnd::Failed { status: say::ended(ended) },
             output,
@@ -1343,13 +719,13 @@ impl Runner {
         self.stopping = true;
         let label = &self.binaries[binary as usize].label;
         let why = format!("{label} failed; stopping the rest (`--fail-fast`; without it they run)");
-        self.say(Event::Stopping { why });
+        self.warn(&why);
         self.stop_all();
     }
 
     fn stop_all(&mut self) {
         for binary in std::mem::take(&mut self.queued) {
-            self.say(Event::BinaryEnded { binary, end: BinaryEnd::Stopped, output: String::new() });
+            self.say(Test::Ended { binary, end: BinaryEnd::Stopped, output: String::new() });
         }
         for running in &mut self.running {
             running.killed = true;
@@ -1399,7 +775,7 @@ fn read(
             let Ok(line) = line else { break };
             match json.then(|| said(binary, &line)).flatten() {
                 Some(event) => {
-                    let _ = to_screen.send(Msg::View(event));
+                    let _ = to_screen.send(Msg::Event(Event::Test(event)));
                 }
                 None if json && line.trim_start().starts_with('{') => {}
                 None => {
@@ -1425,7 +801,7 @@ fn read(
 
 /// One line of libtest's JSON as the view's event: a suite's start, a test's start, end or
 /// "running for over 60 seconds". Anything else is `None`.
-fn said(binary: u32, line: &str) -> Option<Event> {
+fn said(binary: u32, line: &str) -> Option<Test> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     let kind = value.get("type")?.as_str()?;
     let event = value.get("event")?.as_str()?;
@@ -1433,10 +809,9 @@ fn said(binary: u32, line: &str) -> Option<Event> {
     match (kind, event) {
         ("suite", "started") => {
             let tests = value.get("test_count").and_then(serde_json::Value::as_u64).unwrap_or(0);
-            Some(Event::SuiteTotal { binary, tests: u32::try_from(tests).unwrap_or(u32::MAX) })
+            Some(Test::Total { binary, tests: u32::try_from(tests).unwrap_or(u32::MAX) })
         }
-        ("test", "started") => Some(Event::TestStarted { binary, name: name()? }),
-        ("test", "timeout") => Some(Event::TestSlow { binary, name: name()? }),
+        ("test", "started") => Some(Test::TestStarted { binary, name: name()? }),
         ("test", "ok" | "failed" | "ignored") => {
             let verdict = match event {
                 "ok" => Verdict::Passed,
@@ -1455,7 +830,13 @@ fn said(binary: u32, line: &str) -> Option<Event> {
                 output.push_str(message);
                 output.push('\n');
             }
-            Some(Event::TestEnded { binary, name: name()?, verdict, took, output })
+            Some(Test::TestEnded {
+                binary,
+                name: name()?,
+                verdict,
+                took_ms: took.map(|it: Duration| u64::try_from(it.as_millis()).unwrap_or(u64::MAX)),
+                output,
+            })
         }
         _ => None,
     }
@@ -1465,7 +846,7 @@ fn said(binary: u32, line: &str) -> Option<Event> {
 mod tests {
     use std::time::Duration;
 
-    use blaze_ui::test_view::{BinaryEnd, Event, Verdict};
+    use blaze_screen::{BinaryEnd, Event, Test, Verdict};
     use crossbeam_channel::unbounded;
 
     use super::{Msg, Run, Runner, said};
@@ -1501,12 +882,12 @@ mod tests {
         let events: Vec<Event> = screen_gets
             .try_iter()
             .filter_map(|msg| match msg {
-                Msg::View(event) => Some(event),
-                Msg::Now(_) | Msg::Said(_) | Msg::Finish => None,
+                Msg::Event(event) => Some(event),
+                Msg::Draw | Msg::Finish => None,
             })
             .collect();
         let output = events.iter().find_map(|event| match event {
-            Event::BinaryEnded { end: BinaryEnd::Passed, output, .. } => Some(output.clone()),
+            Event::Test(Test::Ended { end: BinaryEnd::Passed, output, .. }) => Some(output.clone()),
             _ => None,
         });
         // The process left running is ended here, whatever the runner did.
@@ -1522,16 +903,16 @@ mod tests {
     #[test]
     fn libtest_json_becomes_the_views_events() {
         let started = said(3, r#"{ "type": "suite", "event": "started", "test_count": 2 }"#);
-        assert!(matches!(started, Some(Event::SuiteTotal { binary: 3, tests: 2 })));
+        assert!(matches!(started, Some(Test::Total { binary: 3, tests: 2 })));
         let failed = said(
             3,
             r#"{ "type": "test", "name": "a::b", "event": "failed", "exec_time": 0.25, "stdout": "boom\n" }"#,
         );
-        let Some(Event::TestEnded { name, verdict, took, output, .. }) = failed else {
+        let Some(Test::TestEnded { name, verdict, took_ms, output, .. }) = failed else {
             panic!("{failed:?}")
         };
         assert_eq!((name.as_str(), verdict, output.as_str()), ("a::b", Verdict::Failed, "boom\n"));
-        assert_eq!(took, Some(std::time::Duration::from_millis(250)));
+        assert_eq!(took_ms, Some(250));
         assert!(said(3, r#"{ "type": "suite", "event": "ok", "passed": 2 }"#).is_none());
         assert!(said(3, "running 2 tests").is_none());
     }

@@ -265,7 +265,34 @@ mod unix {
         if daemon.held() != 0 {
             return Ok(handed(daemon));
         }
-        let said = plain.said(asked.quiet, color, started.elapsed());
+        // What the answer shows is the screen's (docs/terminal.md), as the engine shows it.
+        let mut detected = blaze_report::terminal::detect(&config, var, terminal, width.map(|it| it as u16));
+        detected.caps.color = color;
+        let live = blaze_screen::live(var, terminal);
+        let caps = match (live, place::stderr_size()) {
+            (true, Some((cols, rows))) => {
+                blaze_screen::Caps { live, cols, rows, unicode: blaze_screen::unicode(var) }
+            }
+            _ => blaze_screen::Caps::PIPE,
+        };
+        let paint = match caps.live {
+            true => blaze_screen::Paint { live: true, terminal: detected },
+            false => blaze_screen::Paint {
+                live: false,
+                terminal: blaze_report::terminal::Terminal {
+                    caps: blaze_report::Caps { links: false, ..detected.caps },
+                    ..blaze_report::terminal::Terminal::PIPE
+                },
+            },
+        };
+        let options = blaze_screen::Options {
+            quiet: asked.quiet,
+            ..blaze_screen::Options::of(match asked.command {
+                Command::Build => blaze_screen::Command::Build,
+                Command::Run => blaze_screen::Command::Run,
+            })
+        };
+        let said = plain.said(options, caps, &paint, started.elapsed());
         if asked.command == Command::Build {
             return Ok(wrote(&said));
         }
@@ -294,10 +321,6 @@ mod unix {
         let (launch_env, live) = launched.ok_or("the daemon answered the launch with no `Launched`")?;
         if live {
             exec.env.extend(launch_env);
-        }
-        let mut said = said;
-        if !asked.quiet {
-            said.push_str(&exec.running(color));
         }
         let _ = std::io::stderr().write_all(said.as_bytes());
         let _ = std::io::stderr().flush();

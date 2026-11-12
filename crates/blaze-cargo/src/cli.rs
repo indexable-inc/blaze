@@ -58,6 +58,7 @@ pub mod replace;
 pub mod resume;
 pub mod run;
 pub mod say;
+pub mod show;
 pub mod terminal;
 pub mod test;
 #[cfg(feature = "native")]
@@ -136,25 +137,29 @@ Options:
 Every command takes cargo's flags; `blaze help <COMMAND>` lists them.
 ";
 
-/// After a build's `Finished`: why it recomputed what it did, as the daemon sums it up
-/// (`observe::recomputed`, docs/v2/plan/design/why.md), on the printer's streams. A build that
-/// recomputed nothing says nothing; a summary the daemon could not give is said as a
-/// warning, and the command's own outcome stands.
+/// Why the build recomputed what it did, as the daemon sums it up (`observe::recomputed`,
+/// docs/v2/plan/design/why.md): what the build's last line says the cause and the functions
+/// from. A build that recomputed nothing has none; a summary the daemon could not give is
+/// said as a warning, and the command's own outcome stands. None under `-q`, which says
+/// nothing of a build that passed.
 ///
 /// `ask`: whether a summary the build's own answer did not carry is asked of the daemon, which
 /// waits for its history thread to have explained the build. A `run` does not ask: its program
 /// starts as soon as its image is built, and `blaze why` has the reasons.
-fn said_recomputed<O: Write, E: Write>(
-    printer: &mut Printer<'_, O, E>,
+fn why_recomputed<O: Write, S: show::Sink>(
+    printer: &mut Printer<'_, O, S>,
     shown: Shown,
     ask: bool,
-) -> io::Result<()> {
+) -> io::Result<Option<Vec<blaze_api::Report>>> {
     if shown.quiet {
-        return Ok(());
+        return Ok(None);
     }
     match observe::recomputed(ask) {
-        Ok(summary) => printer.recomputed(summary),
-        Err(why) => printer.err().write_all(say::warning(&why, shown.color).as_bytes()),
+        Ok(summary) => Ok(Some(summary)),
+        Err(why) => {
+            printer.err().write_all(say::warning(&why, shown.color).as_bytes())?;
+            Ok(None)
+        }
     }
 }
 
@@ -719,10 +724,40 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
         fixing,
         terminal,
     };
-    // On a terminal, `build`, `check` and `test` draw the live view, whose screen thread
-    // writes stderr: the locks below are taken only off that path.
-    if live::wanted(asked, shown) {
-        let then = live::drive(&mut client, asked, &place, request, shown, started);
+    // What the command shows goes through one screen (docs/terminal.md): on a terminal a
+    // region redrawn while the build runs, elsewhere lines that stay.
+    let var = |name: &str| std::env::var(name).ok();
+    let caps = match format.json() {
+        // The JSON messages are stdout's, a line each: nothing is redrawn around them.
+        true => blaze_screen::Caps::PIPE,
+        false => show::caps(io::stderr().is_terminal(), var),
+    };
+    let options = blaze_screen::Options {
+        command: match asked.command() {
+            Command::Build => blaze_screen::Command::Build,
+            Command::Check => blaze_screen::Command::Check,
+            Command::Run => blaze_screen::Command::Run,
+            Command::Test => blaze_screen::Command::Test,
+            _ => blaze_screen::Command::Other,
+        },
+        quiet: shown.quiet,
+        verbose: shown.verbose > 0,
+        root: Some(place.root.to_string_lossy().into_owned()),
+        notify_after_ms: terminal
+            .notifier
+            .is_some()
+            .then(|| terminal.notify_after_secs.saturating_mul(1000)),
+    };
+    let mut screen = show::Show::new(options, caps, terminal, started, io::stderr());
+    if caps.live
+        && let Err(error) = show::watch_interrupts(screen.paint())
+    {
+        return refused(&format!("the screen's interrupt watcher could not start: {error}"), color);
+    }
+    // On a terminal `test` runs its executables while the build goes on, each speaking from
+    // the runner's thread: the screen is owned by a thread of its own there.
+    if live::wanted(asked, shown, caps) {
+        let then = live::drive(&mut client, asked, &place, request, shown, started, screen);
         // The seed's one-shot engine stops here, writing its image; a daemon's connection just closes.
         let closed = client.close();
         sent_client_rows(&mut io::stderr().lock(), color, true);
@@ -737,7 +772,7 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
             Err(error) => refused(&error.to_string(), color),
         };
     }
-    let (mut out, mut err) = (io::stdout().lock(), io::stderr().lock());
+    let mut out = io::stdout().lock();
     let then = drive(
         &mut client,
         asked,
@@ -746,9 +781,12 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
         shown,
         started,
         &mut out,
-        &mut err,
+        &mut screen,
         &mut test::Spawned,
     );
+    // Nothing live is on the terminal from here: what follows writes stderr itself.
+    drop(screen);
+    let mut err = io::stderr().lock();
     // The seed's one-shot engine stops here, writing its image; a daemon's connection just closes.
     let closed = client.close();
     // A `run` about to become its program hands its rows to the daemon and does not wait for
@@ -844,7 +882,7 @@ pub enum Then {
     clippy::too_many_arguments,
     reason = "the command, where it runs, how it speaks and what it speaks to"
 )]
-pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
+pub fn drive<A: Api, O: Write, S: show::Sink, P: Programs>(
     api: &mut A,
     asked: &Invocation,
     place: &Place,
@@ -852,7 +890,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
     shown: Shown,
     started: Instant,
     out: &mut O,
-    err: &mut E,
+    err: &mut S,
     programs: &mut P,
 ) -> io::Result<Then> {
     let mut printer = Printer::new(shown, &place.root, out, err);
@@ -913,7 +951,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
         // a line never waits on the daemon's next.
         let written = printed.and_then(|()| match more {
             true => Ok(()),
-            false => printer.flush(),
+            false => printer.draw(),
         });
         if let Err(error) = written {
             unwritten.get_or_insert(error);
@@ -968,15 +1006,18 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
         (Command::Doc, true) => match docs.finish() {
             Ok(documented) => Some(documented),
             Err(what) => {
-                printer.finish(false, started.elapsed())?;
+                printer.finish(false, started.elapsed(), None, false)?;
                 printer.err().write_all(say::error(&what, shown.color).as_bytes())?;
                 return Ok(Then::Exit(Exit::Failed.code()));
             }
         },
         _ => None,
     };
-    printer.finish(ok, started.elapsed())?;
-    said_recomputed(&mut printer, shown, asked.command() != Command::Run)?;
+    let why = match ok {
+        true => why_recomputed(&mut printer, shown, asked.command() != Command::Run)?,
+        false => None,
+    };
+    printer.finish(ok, started.elapsed(), why, false)?;
     // A check that failed on its findings still has its suggestions made: a deny lint's
     // finding is an error, and its fix takes it away.
     if let Some(found) = found
@@ -1032,7 +1073,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
         }
         Command::Doc => {
             if let Some(documented) = &documented {
-                doc::done(documented, asked.flags.open, shown.quiet, shown.color, printer.err())?;
+                doc::done(documented, asked.flags.open, shown.quiet, shown.color, &mut printer.err())?;
             }
             Ok(Then::Exit(0))
         }
@@ -1044,13 +1085,14 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
             });
             match exec {
                 Ok(exec) => {
-                    if !shown.quiet {
-                        printer.err().write_all(
-                            say::status("Running", &exec.shown_at(shown.verbose), shown.color)
-                                .as_bytes(),
-                        )?;
+                    // The program's command line is said only when asked for (`-v`): its
+                    // output is what a `run` is for.
+                    if shown.verbose > 0 && !shown.quiet {
+                        let line = format!("  running {}\n", exec.shown_at(shown.verbose)); // alloc: `-v`, once
+                        printer.err().write_all(line.as_bytes())?;
                     }
-                    printer.err().flush()?;
+                    // The build is over: nothing of it is left live when the program starts.
+                    printer.clear()?;
                     Ok(Then::Exec(exec))
                 }
                 Err(what) => {
@@ -1060,13 +1102,22 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
             }
         }
         Command::Test | Command::Bench if in_daemon(asked) => {
-            let (out, err) = printer.streams();
-            let passed = test::reached(&results, speaking, out, err)?;
+            let (out, mut err) = printer.streams();
+            let passed = test::reached(&results, speaking, out, &mut err)?;
             Ok(Then::Exit(if passed && ok { 0 } else { Exit::Failed.code() }))
         }
         Command::Test | Command::Bench => {
-            let code =
-                test::run(asked, &artifacts, &unbuilt, members, speaking, printer.err(), programs)?;
+            // The test executables write for themselves from here.
+            printer.clear()?;
+            let code = test::run(
+                asked,
+                &artifacts,
+                &unbuilt,
+                members,
+                speaking,
+                &mut printer.err(),
+                programs,
+            )?;
             Ok(Then::Exit(if ok { code } else { code.max(Exit::Failed.code()) }))
         }
     }

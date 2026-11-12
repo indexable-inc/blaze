@@ -28,6 +28,8 @@ blaze-format.workspace = true
 blaze-ids.workspace = true
 # `[terminal]` of blaze's `config.toml`.
 blaze-report.workspace = true
+# What an answer shows: the screen's one core, the engine's too (docs/terminal.md).
+blaze-screen.workspace = true
 
 # The program's alone (`main.rs`), which is Unix's: the library (what blaze-cargo and
 # blaze-engine take from here) links none of these, so the wasm seed builds none of them.

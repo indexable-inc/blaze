@@ -399,6 +399,7 @@ blaze-explore = { path = "crates/blaze-explore" }
 blaze-explore-core = { path = "crates/blaze-explore-core" }
 blaze-protocol = { path = "crates/blaze-protocol" }
 blaze-report = { path = "crates/blaze-report" }
+blaze-screen = { path = "crates/blaze-screen" }
 blaze-script = { path = "crates/blaze-script" }
 blaze-serde = { path = "crates/blaze-serde" }
 blaze-serde-derive = { path = "crates/blaze-serde-derive" }
@@ -619,9 +620,6 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 ] }
 triomphe = { version = "0.1.17", default-features = false, features = ["std"] }
 unicode-width = "0.2.3"
-# `blaze test`'s live view on a terminal (blaze_ui::test_view, drawn by blaze-cargo's
-# cli/live.rs): an inline viewport, never the alternate screen. Each crate turns on what it uses.
-ratatui = { version = "0.30.2", default-features = false }
 url = "2.5.8"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
