@@ -54,6 +54,41 @@ pub fn pages_key(filed: ContentId) -> ContentId {
     hasher.finish()
 }
 
+/// The domain of the key a crate's item pages are kept under ([`items_key`]).
+pub const ITEMS_DOMAIN: &str = "blaze v2 item pages";
+
+/// Where the item pages (`frozen::items`) of the crate whose image is filed under `filed`
+/// are: as [`pages_key`], with the domain of the item keys its entries are found by.
+pub fn items_key(filed: ContentId) -> ContentId {
+    let mut hasher = Hasher::new(ITEMS_DOMAIN);
+    hasher
+        .id(&filed)
+        .update(&frozen::items::LAYOUT.to_le_bytes())
+        .part(frozen::ENCODING.as_bytes())
+        .part(super::signatures::key_domain().as_bytes());
+    hasher.finish()
+}
+
+/// Every key a crate's front-end records are kept under that is made from the key its image
+/// is filed under (`filed`, [`Image::key`]): the image itself, then each record kind of this
+/// crate keyed over it. The one list of them: what pins a crate's front end against the
+/// store's collector and what a pack of a crate carries is taken from here, so a record kind
+/// added here is pinned and exported, and one written by [`store`] and left out is found by
+/// `tests::every_key_store_writes_is_a_front_key_or_a_filing_key` (a record written and not
+/// pinned is collected). A lane that adds a record kind keyed over `filed` in this crate adds
+/// its key here; one in a crate above this one adds it where that crate's keys are joined to
+/// these (blaze-cargo's `serve::collect::front_keys`).
+pub fn front_keys(filed: ContentId) -> impl Iterator<Item = ContentId> {
+    [filed, pages_key(filed), items_key(filed)].into_iter()
+}
+
+/// Every key the read-filing records of the crate whose own key is `key` may be under: the
+/// slots a crate with reads is found through ([`super::slot`]), each that may be filled. A
+/// slot that holds nothing names no record.
+pub fn filing_keys(key: ContentId) -> impl Iterator<Item = ContentId> {
+    (0..super::SLOTS).map(move |n| super::slot(key, n))
+}
+
 /// Where images are kept, and the threads that read and write them: what the driver adapts the
 /// store or the global cache and its pool to. Every method is called from those threads.
 pub trait ImageStore: Sync {
@@ -205,6 +240,22 @@ pub enum Refused {
     Encode { part: Part, why: String },
 }
 
+impl Refused {
+    /// The refusal's kind, one word a variant: what a count of refusals groups by.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Refused::SessionMacros => "session macros",
+            Refused::ProcMacro { .. } => "proc macro reads unknown",
+            Refused::OutsideSourceRoot { .. } => "outside source root",
+            Refused::ModuleFileMissing { .. } => "module file missing",
+            Refused::KeyMoved { .. } => "key moved",
+            Refused::MachinePath { .. } => "machine path",
+            Refused::Reads { .. } => "reads",
+            Refused::Encode { .. } => "encode",
+        }
+    }
+}
+
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -252,6 +303,10 @@ pub struct Stored {
     /// value made from the crate as this database resolved it is filed by
     /// (`blaze_diagnostics::cache`).
     pub filed: HashMap<Crate, ContentId, Global>,
+    /// The record families ([`super::found::family`]) written of each crate of `written`:
+    /// its image, and with pages on its def map pages and item pages. What a found record
+    /// of the crate says it has; the impl tables are another store's to add.
+    pub families: u32,
 }
 
 /// Reads each of `crates` that is [`eligible`] (and its dependencies) from the image `images`
@@ -361,6 +416,7 @@ fn serve_released(
     // def map part, which pages are not), and only where the store keeps them so.
     let paging = mode == Mode::Serve && images.paged();
     let mut paged = pages::all(&*db);
+    let mut item_paged = frozen::items::all(&*db);
     // alloc: setup, as above
     let mut stale = Vec::new();
     // Whether what the database was given changes: an image served, or one served before
@@ -379,6 +435,7 @@ fn serve_released(
         had |= maps.remove(&krate).is_some();
         had |= lang_items.remove(&krate).is_some();
         had |= paged.remove(&krate).is_some();
+        had |= item_paged.remove(&krate).is_some();
         changed |= had;
         known |= had;
         let (bytes, parts, filed) = match found? {
@@ -405,6 +462,23 @@ fn serve_released(
             })?;
             if let Some(source) = found {
                 paged.insert(krate, Paged { key, source });
+                // Its items too, where the store has their pages (`frozen::items`): only for
+                // a crate whose def map is read from pages, whose modules the items name.
+                let key = items_key(filed);
+                let found = images.pages(&key).map_err(|why| {
+                    // alloc: error text
+                    format!("reading the item pages of crate {} (key {key:?}): {why}", krate.named(db))
+                })?;
+                let Some(source) = found else {
+                    // An image and def map pages with no item pages (a store written before
+                    // item pages were): a miss, never a crate left on its syntax for good.
+                    // It is resolved once, and [`store`] writes every family of it.
+                    maps.remove(&krate);
+                    lang_items.remove(&krate);
+                    paged.remove(&krate);
+                    continue;
+                };
+                item_paged.insert(krate, Paged { key, source });
             }
         }
         served.insert(krate, Image { base, key: filed, bytes, parts, mode });
@@ -447,6 +521,9 @@ fn serve_released(
     frozen::set_lang_items(db, lang_items);
     if paging || !paged.is_empty() || !pages::all(&*db).is_empty() {
         pages::set(db, paged);
+    }
+    if !item_paged.is_empty() || !frozen::items::all(&*db).is_empty() {
+        frozen::items::set(db, item_paged);
     }
     set_images(db, served);
     // A served crate's modules are the decoded map's, not the ones its dependents were
@@ -628,16 +705,22 @@ fn withdraw(db: &mut Db, gone: &[Crate]) {
     let mut lang_items = copied(FrozenLangItems::try_get(&*db).map(|it| it.maps(&*db)));
     let mut paged = pages::all(&*db);
     let mut paged_gone = false;
+    let mut item_paged = frozen::items::all(&*db);
+    let mut items_gone = false;
     for krate in gone {
         images.remove(krate);
         maps.remove(krate);
         lang_items.remove(krate);
         paged_gone |= paged.remove(krate).is_some();
+        items_gone |= item_paged.remove(krate).is_some();
     }
     frozen::set(db, maps);
     frozen::set_lang_items(db, lang_items);
     if paged_gone {
         pages::set(db, paged);
+    }
+    if items_gone {
+        frozen::items::set(db, item_paged);
     }
     set_images(db, images);
     db.note_crates_changed();
@@ -646,6 +729,9 @@ fn withdraw(db: &mut Db, gone: &[Crate]) {
 fn set_images(db: &mut Db, images: HashMap<Crate, Image, Global>) {
     use blaze_query::db::{Durability, Setter};
     // alloc: setup: the one input value, once per session
+    // clone: the handle of the map set before, to tell which crates' images move
+    let was = DepImages::try_get(&*db).map(|it| it.images(&*db).clone());
+    super::given::give_changed::<super::ImageSlot, Image>(db, was.as_deref(), &images);
     let images = Arc::new(images);
     match DepImages::try_get(&*db) {
         Some(it) => {
@@ -692,6 +778,11 @@ pub fn store(db: &Db, served: &Served, images: &dyn ImageStore) -> Result<Stored
         _ = made[at].set(made_now);
     });
     let mut stored = Stored::default();
+    stored.families = super::found::family::IMAGE
+        | match images.paged() {
+            true => super::found::family::DEF_MAP_PAGES | super::found::family::ITEM_PAGES,
+            false => 0,
+        };
     for (&(krate, _), made) in order.iter().zip(made) {
         let made = made.into_inner().unwrap_or_else(|| {
             panic!("`ImageStore::for_each` did not run the task of crate {}", krate.named(db))
@@ -701,7 +792,19 @@ pub fn store(db: &Db, served: &Served, images: &dyn ImageStore) -> Result<Stored
                 stored.written.push(krate);
                 stored.filed.insert(krate, filed);
             }
-            Err(why) => stored.refused.push((krate, why)),
+            Err(why) => {
+                // Said, a crate each: a crate with no image is resolved again by every daemon
+                // that starts (reth's first build after a restart resolved 827 crates and
+                // read 291 from images, and nothing in its profile said why of the rest).
+                tracing::info!(
+                    target: "blaze",
+                    krate = %krate.named(db),
+                    kind = why.kind(),
+                    why = %why,
+                    "a crate's image is not written: every daemon that starts resolves the crate again"
+                );
+                stored.refused.push((krate, why));
+            }
         }
     }
     if images.paged() {
@@ -759,6 +862,18 @@ fn make(
     })?;
     if let Some(paged) = paged {
         keep_pages(db, krate, filed, paged, images)?;
+        // Its item pages, from the answers this database has of the crate it resolved; never
+        // written for a crate read from an image (`store_missing_pages`), whose items it
+        // would lower from syntax to write.
+        let key = items_key(filed);
+        let items = frozen::items::encode(db, krate).map_err(|why| {
+            // alloc: error text
+            format!("the items of crate {} do not write as pages: {why}", krate.named(db))
+        })?;
+        images.put(key, items).map_err(|why| {
+            // alloc: error text
+            format!("keeping the item pages of crate {} (key {key:?}): {why}", krate.named(db))
+        })?;
     }
     Ok(Ok(filed))
 }

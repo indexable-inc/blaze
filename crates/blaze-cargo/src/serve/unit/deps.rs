@@ -94,19 +94,49 @@ pub(crate) fn ready(job: &Job, waits: &graph::Waits) -> Vec<u32> {
 /// Called with the front end exclusive (no task reads it), in every job, freshly lowered or
 /// kept: once for the units ready when it is lowered, and once per batch of runs and proc
 /// macros applied, with the units they made ready and those a loaded macro reaches.
+///
+/// The invariant: when this returns, no crate at or below a ready unit's crate is awaited
+/// (`hir_def::deps::awaited`), whatever `units` holds. A unit is built once `waits` has it
+/// ready, and its build reads its crate and everything below, so the serve is where a ready
+/// unit's crates are released, and it asks about them itself ([`asked`]) rather than leave
+/// each caller to list them: `waits` is a parameter, so no serve can be written without it.
+/// It then checks what it promised ([`blocked_ready`]): a ready unit still blocked is an
+/// error naming the unit and the crate it waits for, at the write, never a reader's
+/// `Unmaintained` later.
 pub(crate) fn serve(
     lowered: &mut Lowered,
     job: &Job,
+    waits: &graph::Waits,
     units: &[u32],
     session: &mut Session,
     kept: &mut Option<Kept>,
 ) -> Result<(), ApiError> {
     let mode = mode_in(&mut session.env, &job.input.config.invocation.env)?;
     let build = front_end()?;
+    let ready = || {
+        (0..job.graph.len() as u32)
+            .filter(|&unit| waits.ready(unit))
+            .filter_map(|unit| Some((unit, job.crates.krate(unit as usize)?)))
+    };
     // alloc: once per serve, one entry per unit's crate
-    let crates: Vec<Crate> =
+    let written: Vec<Crate> =
         units.iter().filter_map(|&unit| job.crates.krate(unit as usize)).collect();
-    let Some(served) = images(lowered, &crates, build, session, mode)? else { return Ok(()) };
+    let crates = asked(lowered, &written, ready().map(|(_, krate)| krate));
+    let served = images(lowered, &crates, build, session, mode)?;
+    if let Some((unit, krate, awaited)) = blocked_ready(lowered, ready()) {
+        let db = lowered.db();
+        // alloc: an error, once
+        return Err(ApiError::new(
+            format!(
+                "{} is ready to build and its crate `{}` still waits for the records of crate `{}`                  ({awaited:?}) after the serve that asked about every ready unit:                  `hir_def::deps::awaited::release` left a crate awaited below one it was asked about",
+                lowered.what(unit as usize),
+                krate.named(db),
+                awaited.named(db),
+            ),
+            None,
+        ));
+    }
+    let Some(served) = served else { return Ok(()) };
     match kept {
         Some(kept) => kept.add(served),
         None => *kept = Some(Kept { served, mode }),
@@ -134,6 +164,50 @@ pub(crate) fn serve(
     hir_ty::consteval::deps::set(lowered.served_db(), adapter, consts, mode);
     stamp(lowered, build, session);
     Ok(())
+}
+
+/// What a serve asks the store about: `written`, the crates of the units its batch made
+/// ready or reached, and every crate of `ready` (each ready unit's crate) that is blocked
+/// (`hir_def::deps::awaited::blocked`: it or a crate below it is awaited), sorted, each once.
+/// `written` alone when nothing is awaited: one load.
+///
+/// The invariant it gives [`serve`]: a release of what it returns leaves no crate of `ready`
+/// blocked. Asking about `written` alone (the rule until 2026-11-12) leaves blocked every
+/// ready unit the batch did not list; the smoke's edition step on tree 3a3fde543b stopped
+/// nine units with `no maintained resolution for crate libc .. it waits for the records of
+/// crate libc`. Which write left `libc` awaited there is not known (no trace was taken):
+/// this rule does not depend on knowing it.
+pub(crate) fn asked(
+    lowered: &Lowered,
+    written: &[Crate],
+    ready: impl Iterator<Item = Crate>,
+) -> Vec<Crate> {
+    let mut asked = written.to_vec(); // alloc: once per serve
+    if !lowered.any_awaited() {
+        return asked;
+    }
+    let blocked = hir_def::deps::awaited::blocked(lowered.db());
+    asked.extend(ready.filter(|krate| blocked.contains(krate)));
+    asked.sort_unstable();
+    asked.dedup();
+    asked
+}
+
+/// The first of `ready` (each ready unit with its crate) whose crate is blocked, with the
+/// awaited crate that blocks it: what [`serve`] checks it left none of. One load when nothing
+/// is awaited.
+pub(crate) fn blocked_ready(
+    lowered: &Lowered,
+    ready: impl Iterator<Item = (u32, Crate)>,
+) -> Option<(u32, Crate, Crate)> {
+    if !lowered.any_awaited() {
+        return None;
+    }
+    let db = lowered.db();
+    let blocked = hir_def::deps::awaited::blocked(db);
+    ready
+        .filter(|(_, krate)| blocked.contains(krate))
+        .find_map(|(unit, krate)| Some((unit, krate, hir_def::deps::awaited::blocker(db, krate)?)))
 }
 
 /// What a [`serve`] that served images leaves: what this serve wrote (images, lang items, check
@@ -231,13 +305,34 @@ pub(crate) fn images(
         return Ok(None);
     }
     moved.sort_unstable();
-    let served = match lowered.serve_deps(crates, &moved, build, &*session.images, mode) {
+    // The images and, of each crate read from one, its impl tables
+    // (`hir_ty::method_resolution::frozen`), in one write: the pass that first sees a crate
+    // read from its image finds its impls served too, and keys none of them.
+    let images = &*session.images;
+    let trigger = base_db::Trigger::named("the dependencies' images and impl tables served");
+    let served = lowered.batch(trigger, |lowered| {
+        // The crates no maintainer was shown before this write.
+        let unseen = hir_def::deps::awaited::blocked(lowered.db());
+        let served = lowered
+            .serve_deps(crates, &moved, build, images, mode)
+            .map_err(super::lower_error)?;
+        let tabled =
+            hir_ty::method_resolution::frozen::serve(lowered.served_db(), &served, images, mode)
+                .map_err(|why| ApiError::new(why, None))?;
+        if tabled.iter().any(|it| !unseen.contains(it)) {
+            // A crate the impls maintainer held came to be read from tables, or stopped: it
+            // drops or makes that crate's state in a pass over the whole graph.
+            lowered.served_db().note_crates_changed();
+        }
+        Ok::<_, ApiError>(served)
+    });
+    let served = match served {
         Ok(served) => served,
         Err(error) => {
             // The walk keyed crates `keyed` does not hold: nothing of it is kept, so the next
             // serve walks them again and finds them moved (rule 21).
             session.walked.forget();
-            return Err(super::lower_error(error));
+            return Err(error);
         }
     };
     debug_assert!(session.images.take_puts().is_empty(), "serving puts nothing");
@@ -647,7 +742,9 @@ pub(crate) fn store(
         Some((*krate, cache::image_key(db, *krate)?))
     });
     let wrote = stored.iter().flat_map(|stored| &stored.filed).map(|(krate, filed)| (*krate, *filed));
-    for (krate, filed) in found.chain(wrote) {
+    // alloc: once per front end stored, one per crate imaged
+    let imaged: Vec<(Crate, ContentId)> = found.chain(wrote).collect();
+    for &(krate, filed) in &imaged {
         let name = match &krate.data(db).origin {
             base_db::CrateOrigin::Lang(_) => crate::serve::collect::TOOLCHAIN,
             base_db::CrateOrigin::Local { name: Some(name), .. }
@@ -658,8 +755,14 @@ pub(crate) fn store(
             }
             _ => continue,
         };
-        let keys = [blaze_cas::Key(filed), blaze_cas::Key(hir_def::deps::pages_key(filed))];
-        crate::serve::collect::keep(name, keys.into_iter());
+        // The crate's front-end records, from the one list of their keys, and the
+        // read-filing records its image is found through (a slot that holds nothing names
+        // no record, and a pin of it keeps nothing).
+        let slots = kept
+            .and_then(|kept| kept.served.keys.get(&krate))
+            .into_iter()
+            .flat_map(|key| crate::serve::collect::filing_keys(*key));
+        crate::serve::collect::keep(name, crate::serve::collect::front_keys(filed).chain(slots));
     }
     // Each stage's puts taken as it ends, so each says what it is in an error ([`KeptPut`]).
     let mut puts = Vec::new(); // alloc: once per front end stored, one per value put
@@ -685,6 +788,21 @@ pub(crate) fn store(
             images.take_puts().into_iter().map(|put| KeptPut { put, what: Arc::clone(&what) }),
         );
     };
+    // Each imaged crate's impl tables (`hir_ty::method_resolution::frozen`), beside its
+    // image: the next front end reads the crate's impls from them and keys none. A crate
+    // read from tables already writes nothing. One whose tables do not encode has none kept,
+    // and every front end maintains its impls from its def map: said here, naming it.
+    let untabled = hir_ty::method_resolution::frozen::store(db, &imaged, images)
+        .map_err(|why| ApiError::new(why, Some(root.to_owned())))?; // alloc: error path
+    for (krate, why) in &untabled {
+        tracing::warn!(
+            target: "blaze",
+            krate = %krate.named(db),
+            why = %why,
+            "a dependency crate's impl tables do not encode: none are kept, and each front end makes them from its def map"
+        );
+    }
+    stage("the impl tables of a dependency crate");
     let checked: Vec<cache::Checked<'_>> = later
         .iter()
         .filter_map(|it| {

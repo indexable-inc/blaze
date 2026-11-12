@@ -80,13 +80,13 @@ const HEADER: usize = 56;
 /// Bytes of a module's row.
 const ROW: usize = 24;
 /// Bytes of a name table's slot.
-const SLOT: usize = 16;
+pub(super) const SLOT: usize = 16;
 /// The slots a lookup reads at once: a name is in the first of them unless that many names
 /// before it share its slot.
-const WINDOW: u32 = 4;
+pub(super) const WINDOW: u32 = 4;
 
 /// FNV-1a over `bytes`: the same in every process, which a hash of an interned id is not.
-const fn fnv(bytes: &[u8]) -> u64 {
+pub(super) const fn fnv(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     let mut at = 0;
     while at < bytes.len() {
@@ -146,7 +146,7 @@ impl PageSource for Whole {
 
 /// `read` of the `len` bytes of `source` at `at`.
 // dyn: the crate's one source
-fn read<T>(
+pub(super) fn read<T>(
     source: &dyn PageSource,
     at: u32,
     len: u32,
@@ -166,11 +166,11 @@ fn read<T>(
     out.unwrap_or_else(|| Err(format!("nothing read at {at}")))
 }
 
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
+pub(super) fn u32_at(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
 }
 
-fn u64_at(bytes: &[u8], at: usize) -> u64 {
+pub(super) fn u64_at(bytes: &[u8], at: usize) -> u64 {
     u64::from(u32_at(bytes, at)) | u64::from(u32_at(bytes, at + 4)) << 32
 }
 
@@ -275,21 +275,21 @@ impl Row {
 
 /// A name table's slot: the name's hash (0: empty) and where its entry is.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Slot {
-    hash: u64,
-    at: u32,
-    len: u32,
+pub(super) struct Slot {
+    pub(super) hash: u64,
+    pub(super) at: u32,
+    pub(super) len: u32,
 }
 
 impl Slot {
-    fn parse(bytes: &[u8]) -> Slot {
+    pub(super) fn parse(bytes: &[u8]) -> Slot {
         Slot { hash: u64_at(bytes, 0), at: u32_at(bytes, 8), len: u32_at(bytes, 12) }
     }
 }
 
 /// The slots of a table of `entries` (each a name's hash and where its entry is), as bytes:
 /// twice as many slots as names, each name in the first empty slot from its hash's.
-fn table_of(entries: &[(u64, (u32, u32))]) -> (u32, Vec<u8>) {
+pub(super) fn table_of(entries: &[(u64, (u32, u32))]) -> (u32, Vec<u8>) {
     if entries.is_empty() {
         // alloc: none, an empty list
         return (0, Vec::new());
@@ -344,7 +344,8 @@ impl std::fmt::Debug for Paged {
     }
 }
 
-/// The crates whose `DefMap` is read from pages, set by whoever has the records.
+/// The crates whose `DefMap` is read from pages, set by whoever has the records: read
+/// outside queries alone ([`all`]). A query reads its crate's own ([`PagesSlot`], [`paged`]).
 #[blaze_query::input(singleton, debug)]
 pub struct PagedDefMaps {
     #[returns(ref)]
@@ -354,6 +355,9 @@ pub struct PagedDefMaps {
 /// Has name resolution read each crate of `maps` from its pages.
 pub fn set(db: &mut Db, maps: HashMap<Crate, Paged, Global>) {
     use blaze_query::db::{Durability, Setter};
+    // clone: the handle of the map set before, to tell which crates' pages move
+    let was = PagedDefMaps::try_get(&*db).map(|it| it.maps(&*db).clone());
+    crate::deps::given::give_changed::<PagesSlot, Paged>(db, was.as_deref(), &maps);
     // alloc: once per serve that changes which crates are read from pages
     let maps = Arc::new(maps);
     match PagedDefMaps::try_get(db) {
@@ -377,8 +381,11 @@ pub fn all(db: &Db) -> HashMap<Crate, Paged, Global> {
 #[blaze_query::tracked(returns(as_ref))]
 pub(super) fn paged(db: &Db, krate: Crate) -> Option<Paged> {
     // clone: a count of the source and a key
-    PagedDefMaps::try_get(db)?.maps(db).get(&krate).cloned()
+    krate.given::<PagesSlot, Paged>(db).cloned()
 }
+
+/// The kind of a crate's slot holding its entry of [`PagedDefMaps`].
+pub struct PagesSlot;
 
 /// Whether `krate` is read from pages.
 pub fn is_paged(db: &Db, krate: Crate) -> bool {
@@ -447,6 +454,8 @@ fn closure_of(db: &Db, krate: Crate) -> Vec<Crate> {
 /// they name.
 #[blaze_query::tracked(returns(ref))]
 fn head(db: &Db, krate: Crate) -> Head {
+    // The value is the record's, found by content: told to the engine (`row::STORED`).
+    blaze_query::db::report_stored_read(db);
     let Some(paged) = paged(db, krate) else {
         // alloc: error path
         Unreadable::of(db, krate, KIND, "the crate has no pages".to_owned()).throw()
@@ -459,7 +468,7 @@ fn head(db: &Db, krate: Crate) -> Head {
 
 /// A reader of the segment `bytes` of the pages of `krate`, whose files are `files` and
 /// whose modules are `own`.
-fn segment<'a>(
+pub(super) fn segment<'a>(
     db: &'a Db,
     krate: Crate,
     files: &'a [FileId],
@@ -643,6 +652,8 @@ fn look_up(db: &Db, krate: Crate, module: usize, name: &Name) -> R<PerNs> {
 /// row and not the `DefMap` (`ModuleData::name_in_scope`).
 #[blaze_query::tracked(returns(copy))]
 fn name_memo(db: &Db, paged: PagedScope, name: Name) -> PerNs {
+    // The value is the record's, found by content: told to the engine (`row::STORED`).
+    blaze_query::db::report_stored_read(db);
     name_now(db, blaze_query::db::AsId::as_id(&paged), &name)
 }
 
@@ -654,6 +665,8 @@ pub(in crate::nameres) fn name(db: &Db, paged: blaze_query::db::Id, name: Name) 
 /// looked up never asks for this.
 #[blaze_query::tracked(returns(ref))]
 fn scope_memo(db: &Db, paged: PagedScope) -> ItemScope {
+    // The value is the record's, found by content: told to the engine (`row::STORED`).
+    blaze_query::db::report_stored_read(db);
     let (krate, module) = (paged.krate(db), paged.module(db) as usize);
     let scope = source_of(db, krate).and_then(|(source, head)| {
         let row = head.rows.get(module).ok_or("a module the pages have no row of")?;
@@ -680,6 +693,8 @@ pub(in crate::nameres) fn scope(db: &Db, paged: blaze_query::db::Id) -> &ItemSco
 
 #[blaze_query::tracked(returns(ref))]
 fn legacy_macro_memo(db: &Db, paged: PagedScope, name: Name) -> Option<Box<[MacroId]>> {
+    // The value is the record's, found by content: told to the engine (`row::STORED`).
+    blaze_query::db::report_stored_read(db);
     // alloc: the memo's value, once per name looked up
     scope_memo(db, paged).get_legacy_macro(&name).map(Box::from)
 }
@@ -694,6 +709,8 @@ pub(in crate::nameres) fn legacy_macro(
 
 #[blaze_query::tracked(returns(ref))]
 fn traits_memo(db: &Db, paged: PagedScope) -> Box<[TraitId]> {
+    // The value is the record's, found by content: told to the engine (`row::STORED`).
+    blaze_query::db::report_stored_read(db);
     // alloc: the memo's value, once per module scope
     scope_memo(db, paged).traits().collect()
 }
@@ -721,6 +738,8 @@ pub(in crate::nameres) fn children(
 /// The records of a crate read from pages: its tail, decoded when first asked for.
 #[blaze_query::tracked(returns(ref))]
 fn tail(db: &Db, krate: Crate) -> OwnedRecords {
+    // The value is the record's, found by content: told to the engine (`row::STORED`).
+    blaze_query::db::report_stored_read(db);
     let records = source_of(db, krate).and_then(|(source, head)| {
         read(source, head.tail.0, head.tail.1, |bytes| {
             let mut dec = segment(db, krate, &head.files, &head.own, bytes);
@@ -748,7 +767,7 @@ pub fn encode(db: &Db, krate: Crate) -> R<Vec<u8>> {
 }
 
 /// Writes one segment into `body`, and returns where it is there.
-fn write_segment(
+pub(super) fn write_segment(
     enc: &mut Enc<'_>,
     body: &mut Vec<u8>,
     write: impl FnOnce(&mut Enc<'_>) -> R,

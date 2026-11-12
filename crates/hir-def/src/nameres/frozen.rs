@@ -74,7 +74,9 @@ use crate::{
     visibility::Visibility,
 };
 
+pub mod items;
 pub mod pages;
+pub mod segments;
 
 type R<T = ()> = Result<T, String>;
 
@@ -105,7 +107,8 @@ pub struct Frozen {
     pub mode: Mode,
 }
 
-/// The crates whose `DefMap` is frozen, set by whoever has the bytes.
+/// The crates whose `DefMap` is frozen, set by whoever has the bytes: read outside queries
+/// alone. A query reads its crate's own ([`DefMapSlot`], `crate::deps::given`).
 #[blaze_query::input(singleton, debug)]
 pub struct FrozenDefMaps {
     #[returns(ref)]
@@ -115,6 +118,9 @@ pub struct FrozenDefMaps {
 /// Has name resolution use `maps`.
 pub fn set(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
     use blaze_query::db::{Durability, Setter};
+    // clone: the handle of the map set before, to tell which crates' bytes move
+    let was = FrozenDefMaps::try_get(&*db).map(|it| it.maps(&*db).clone());
+    crate::deps::given::give_changed::<DefMapSlot, Frozen>(db, was.as_deref(), &maps);
     // alloc: Check/Verify only, which record differences; never when serving
     let maps = Arc::new(maps);
     match FrozenDefMaps::try_get(db) {
@@ -126,6 +132,12 @@ pub fn set(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
         }
     }
 }
+
+/// The kind of a crate's slot holding its entry of [`FrozenDefMaps`].
+pub struct DefMapSlot;
+
+/// The kind of a crate's slot holding its entry of [`FrozenLangItems`].
+pub struct LangItemsSlot;
 
 /// Each difference found, by the crate and the kind of what was frozen: a crate's `DefMap`
 /// is resolved again when an `include!` loads a file, and only the last one is the crate's.
@@ -223,7 +235,7 @@ pub fn check_frozen(
 #[blaze_query::tracked(returns(as_ref))]
 fn frozen_def_map(db: &Db, krate: Crate) -> Option<Frozen> {
     // clone: a count of the image the bytes are in, or of their own buffer
-    FrozenDefMaps::try_get(db)?.maps(db).get(&krate).cloned()
+    krate.given::<DefMapSlot, Frozen>(db).cloned()
 }
 
 /// What [`super::crate_local_def_map`] serves for `krate` instead of resolving it, when its
@@ -234,12 +246,17 @@ pub(super) fn served(db: &Db, krate: Crate) -> Option<(DefMap, LocalDefMap)> {
     // was given those as well (the image's part, for the image's other readers), are not
     // decoded. One path a crate, said by what it was given ([`pages::set`]).
     if pages::is_paged(db, krate) {
+        // The value is the record's, found by content: told to the engine (`row::STORED`).
+        blaze_query::db::report_stored_read(db);
         return Some(pages::served(db, krate));
     }
     let frozen = frozen_def_map(db, krate)?;
     if frozen.mode == Mode::Check {
         return None;
     }
+    // As above: read from the image, in `Mode::Serve` and `Mode::Verify` alike (neither
+    // resolves the crate; `Mode::Check` does, and its row's reads are its own).
+    blaze_query::db::report_stored_read(db);
     let (def_map, local) = match decode(db, krate, &frozen.bytes) {
         Ok(it) => it,
         Err(why) => Unreadable::of(db, krate, "def map", why).throw(),
@@ -285,7 +302,8 @@ pub fn unreadable(db: &Db, krate: Crate, bytes: &[u8]) -> Option<String> {
     dec.files().err()
 }
 
-/// The crates whose lang items are frozen, set by whoever has the bytes.
+/// The crates whose lang items are frozen, set by whoever has the bytes: read outside
+/// queries alone. A query reads its crate's own ([`LangItemsSlot`]).
 #[blaze_query::input(singleton, debug)]
 pub struct FrozenLangItems {
     #[returns(ref)]
@@ -295,6 +313,9 @@ pub struct FrozenLangItems {
 /// Has finding the lang items of a crate use `maps`.
 pub fn set_lang_items(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
     use blaze_query::db::{Durability, Setter};
+    // clone: the handle of the map set before, to tell which crates' bytes move
+    let was = FrozenLangItems::try_get(&*db).map(|it| it.maps(&*db).clone());
+    crate::deps::given::give_changed::<LangItemsSlot, Frozen>(db, was.as_deref(), &maps);
     // alloc: once per load of the frozen bytes
     let maps = Arc::new(maps);
     match FrozenLangItems::try_get(db) {
@@ -311,13 +332,15 @@ pub fn set_lang_items(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
 #[blaze_query::tracked(returns(as_ref))]
 fn frozen_lang_items(db: &Db, krate: Crate) -> Option<Frozen> {
     // clone: a count of the image the bytes are in, or of their own buffer
-    FrozenLangItems::try_get(db)?.maps(db).get(&krate).cloned()
+    krate.given::<LangItemsSlot, Frozen>(db).cloned()
 }
 
 /// What [`crate_lang_items`](crate::lang_item::crate_lang_items) reads for `krate` instead of
 /// finding them, when they are frozen.
 pub(crate) fn served_lang_items(db: &Db, krate: Crate) -> Option<Option<Box<LangItems>>> {
     let frozen = frozen_lang_items(db, krate).filter(|it| it.mode != Mode::Check)?;
+    // The value is the record's, found by content: told to the engine (`row::STORED`).
+    blaze_query::db::report_stored_read(db);
     let read = || {
         let mut dec = Dec::new_checked(db, krate, &frozen.bytes)?;
         let items = dec.option(|dec| {

@@ -310,3 +310,115 @@ fn the_print_of_a_meaning_tells_two_apart() {
     assert_ne!(print(&db, lib, shown), print(&db, lib, e));
     assert_eq!(print(&db, lib, PerNs::none()), print(&db, lib, PerNs::none()));
 }
+
+/// What reading the pages of `lib` runs after `main`, a crate beside it, was given other
+/// pages; and what reading `main`'s runs then.
+fn runs_after_another_crates_gift() -> (Vec<String>, Vec<String>) {
+    use crate::test_db::TestDBExt;
+    let pages = written(FIXTURE, &["lib", "main"]);
+    let mut db = paged(FIXTURE, &sources(&pages));
+    let (lib, main) = (crate_named(&db, "lib"), crate_named(&db, "main"));
+    assert!(super::paged(&db, lib).is_some() && super::paged(&db, main).is_some());
+    let mut maps = super::all(&db);
+    maps.get_mut(&main).unwrap().key = ContentId([9; 32]);
+    set(&mut db, maps);
+    let of_lib = db.executed_in_read_order(|| _ = super::paged(&db, lib));
+    let of_main = db.executed_in_read_order(|| _ = super::paged(&db, main));
+    assert_eq!(super::paged(&db, main).as_ref().map(|it| it.key), Some(ContentId([9; 32])));
+    assert_eq!(super::paged(&db, lib).as_ref().map(|it| it.key), Some(ContentId([1; 32])));
+    (of_lib, of_main)
+}
+
+/// The invariant: what a crate is read from is the crate's own slot (`deps::given`), so pages
+/// given to one crate run no row of another crate; the crate given them runs its own again.
+#[test]
+fn pages_given_to_one_crate_run_no_row_of_another() {
+    let (of_lib, of_main) = runs_after_another_crates_gift();
+    assert_eq!(of_lib, Vec::<String>::new(), "`lib` was given nothing");
+    assert_eq!(of_main.len(), 1, "`main`'s reader runs once: {of_main:?}");
+}
+
+/// The control: every crate given its entry again at each set, as one map of every crate
+/// did to its readers, runs `lib`'s reader too.
+#[test]
+fn the_oracle_catches_a_gift_to_every_crate() {
+    crate::deps::given::GIVES_EVERY_CRATE.set(true);
+    let (of_lib, _) = runs_after_another_crates_gift();
+    crate::deps::given::GIVES_EVERY_CRATE.set(false);
+    assert_eq!(of_lib.len(), 1, "the planted bug writes `lib`'s slot: {of_lib:?}");
+}
+
+/// What a random edit appends to `main.rs`: items, uses of `lib`'s names (one a glob, one
+/// through a module of its own) and a use of a name `lib` does not have.
+const EDITS: [&str; 6] = [
+    "pub fn added_N() {}\n",
+    "pub use lib::E as Renamed_N;\n",
+    "mod more_N { pub use lib::*; pub struct Own; }\n",
+    "pub struct Holds_N(lib::Shown);\n",
+    "use lib::Shown as _;\n",
+    "use lib::no_such_name_N;\n",
+];
+
+/// The text of `main.rs` in [`FIXTURE`].
+fn main_text() -> &'static str {
+    let from = FIXTURE.find("#[macro_use]").expect("`main.rs` starts with `#[macro_use]`");
+    let to = FIXTURE.find("//- /inner.rs").expect("`inner.rs` follows `main.rs`");
+    &FIXTURE[from..to]
+}
+
+/// Edits `main.rs` alike in a database that resolves `lib` from source and in one that
+/// reads it from `pages`, `edits` times as `draw` picks (an index into [`EDITS`]), and
+/// holds the two to [`agree`] on `lib` and `main` after each edit: the first disagreement.
+fn agree_under_edits(
+    pages: Vec<u8>,
+    edits: usize,
+    mut draw: impl FnMut() -> usize,
+) -> Result<(), String> {
+    let mut resolved = fixture::db(FIXTURE).into_db();
+    let mut read = paged(FIXTURE, &[("lib", Counting::new(pages))]);
+    agree(&resolved, &read, &["lib", "main"])?;
+    let mut text = main_text().to_owned();
+    for step in 0..edits {
+        text.push_str(&EDITS[draw() % EDITS.len()].replace('N', &step.to_string()));
+        for db in [&mut resolved, &mut read] {
+            let root = crate_named(db, "main").data(db).root_file_id;
+            db.set_file_text(root, &text);
+        }
+        let lib = crate_named(&read, "lib");
+        if super::paged(&read, lib).is_none() {
+            return Err(format!("step {step}: an edit of `main` took `lib`'s pages away"));
+        }
+        agree(&resolved, &read, &["lib", "main"]).map_err(|why| format!("step {step}: {why}"))?;
+    }
+    Ok(())
+}
+
+/// The refinement: a database that reads `lib` from its pages answers every def map query
+/// of `lib` and of `main`, which names it, as one that resolved `lib` from source, after
+/// each of a run of random edits of `main`; and `lib` stays read from its pages throughout.
+#[hegel::test]
+fn a_crate_read_from_pages_answers_as_the_one_resolved_under_edits_above_it(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let pages = written(FIXTURE, &["lib"]).remove(0).1;
+    let edits: usize = tc.draw(gs::integers().max_value(6));
+    let said = agree_under_edits(pages, edits, || tc.draw(gs::integers().max_value(EDITS.len() - 1)));
+    assert_eq!(said, Ok(()));
+}
+
+/// The control: the same run over pages whose name tables leave `Shown` out is caught, at
+/// the first comparison or at an edit that names it.
+#[test]
+fn the_oracle_catches_a_name_left_out_under_edits() {
+    let resolved = fixture::db(FIXTURE).into_db();
+    let lib = crate_named(&resolved, "lib");
+    let pair = crate_local_def_map(&resolved, lib);
+    let planted =
+        encode_maps(&resolved, lib, pair.def_map(&resolved), pair.local(&resolved), Some("Shown"))
+            .unwrap();
+    let mut at = 0;
+    let said = agree_under_edits(planted, EDITS.len(), || {
+        at += 1;
+        at - 1
+    });
+    assert!(said.is_err(), "pages without `Shown` answered as the resolved crate");
+}

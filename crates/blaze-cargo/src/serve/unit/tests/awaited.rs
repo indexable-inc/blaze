@@ -71,3 +71,74 @@ fn a_dependency_with_records_is_never_resolved_by_the_daemon_that_finds_them() {
     assert_eq!(root_values(&next, d), ["slow"]);
     assert_eq!(resolved(&mut next, d), 0, "name resolution never ran `d`");
 }
+
+/// Whether a read of `krate`'s resolution is stopped with `Unmaintained` naming a crate it
+/// waits for.
+fn stopped_as_awaited(lowered: &blaze_lower::Lowered, krate: base_db::Crate) -> bool {
+    let read = std::panic::AssertUnwindSafe(|| root_values(lowered, krate));
+    match hir_def::nameres::Unmaintained::catch(read) {
+        Ok(_) => false,
+        Err(stopped) => stopped.awaited.is_some(),
+    }
+}
+
+/// The invariant: after a serve, no crate at or below a ready unit's crate is awaited,
+/// whatever units the serve's batch listed. `d`'s unit becomes ready when its script's run
+/// is applied; a serve whose batch lists no unit still asks about `d`, because the asking
+/// rule ([`deps::asked`]) takes every ready unit whose crate is blocked, and `d` is released
+/// in that serve's write, before anything builds it: its names read, resolved once.
+/// [`deps::blocked_ready`], the check `deps::serve` ends with, finds nothing left.
+#[test]
+fn a_crate_awaited_under_a_ready_unit_is_released_by_the_next_serve_whatever_it_lists() {
+    let mut sim = blaze_core::sim::Sim::new(1, blaze_core::sim::Faults::default());
+    let store = deps::tests::opened(&mut sim);
+    let reader = store.reader();
+    let macros = deps::tests::no_macros();
+    let build = ContentId::of("blaze v2 cargo test build", b"awaited under a ready unit");
+    let mode = hir_def::deps::Mode::Serve;
+
+    let mut front = script_cfg_front();
+    front.served_db().keep_maintained(true);
+    let d = front.krate(2).unwrap();
+    // The run applied: `d`'s unit is ready, and `d` is awaited still.
+    front.ran(1, &d_ran(&[])).unwrap();
+    assert!(hir_def::deps::is_awaited(front.db(), d));
+    assert_eq!(deps::blocked_ready(&front, [(2, d)].into_iter()), Some((2, d, d)));
+
+    // A batch that lists no unit: the rule asks about `d` all the same.
+    let asked = deps::asked(&front, &[], [d].into_iter());
+    assert_eq!(asked, [d], "a ready unit's blocked crate is asked about");
+    let mut session = deps::session(&front, &reader, &macros, &[]).unwrap();
+    deps::images(&mut front, &asked, build, &mut session, mode).unwrap();
+    assert!(!hir_def::deps::is_awaited(front.db(), d), "released by the serve");
+    assert_eq!(deps::blocked_ready(&front, [(2, d)].into_iter()), None);
+    assert!(!stopped_as_awaited(&front, d));
+    assert_eq!(root_values(&front, d), ["slow"]);
+    assert_eq!(resolved(&mut front, d), 1, "resolved once, in the serve's write");
+    // Nothing awaited: the rule adds nothing and costs a load.
+    assert_eq!(deps::asked(&front, &[], [d].into_iter()), Vec::new());
+}
+
+/// The control: the asking rule before (a serve asks about the units its batch listed, and
+/// nothing else) leaves `d` awaited under its ready unit, the check names it, and the unit's
+/// build is stopped with `Unmaintained` naming the crate it waits for: the smoke's failure
+/// (`no maintained resolution for crate libc .. it waits for the records of crate libc`).
+#[test]
+fn the_control_a_serve_of_only_the_units_listed_leaves_a_ready_unit_unmaintained() {
+    let mut sim = blaze_core::sim::Sim::new(1, blaze_core::sim::Faults::default());
+    let store = deps::tests::opened(&mut sim);
+    let reader = store.reader();
+    let macros = deps::tests::no_macros();
+    let build = ContentId::of("blaze v2 cargo test build", b"awaited under a ready unit");
+    let mode = hir_def::deps::Mode::Serve;
+
+    let mut front = script_cfg_front();
+    let d = front.krate(2).unwrap();
+    front.ran(1, &d_ran(&[])).unwrap();
+    let mut session = deps::session(&front, &reader, &macros, &[]).unwrap();
+    // The old rule: the batch's units alone, here none.
+    deps::images(&mut front, &[], build, &mut session, mode).unwrap();
+    assert!(hir_def::deps::is_awaited(front.db(), d), "never asked about");
+    assert_eq!(deps::blocked_ready(&front, [(2, d)].into_iter()), Some((2, d, d)));
+    assert!(stopped_as_awaited(&front, d), "its build is stopped, naming what it waits for");
+}

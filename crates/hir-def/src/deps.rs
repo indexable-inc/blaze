@@ -30,6 +30,8 @@ mod key;
 mod reads;
 mod serve;
 pub(crate) mod signatures;
+pub mod given;
+pub mod found;
 #[cfg(test)]
 mod tests;
 
@@ -43,11 +45,15 @@ pub use crate::deps::signatures::{BODY_KEY_DOMAIN, IdKind, PortableId, PortableI
 pub use crate::deps::{
     filed::{checked_reads, closure_expansion_reads, file_by_reads, find_by_reads, outside_reads},
     image::{Held, IMAGE_SCHEMA, ImageBuf, ImageError, ImageRef, Part, PartBytes, write_image},
-    key::{KEY_DOMAIN, KeyInputs, KeyWalk, PRODUCER, absolute, eligible, key_inputs, keys},
+    key::{
+        Ineligible, KEY_DOMAIN, KeyInputs, KeyWalk, PRODUCER, PlanBase, absolute, eligible,
+        key_inputs, keys, why_not_eligible,
+    },
     reads::{READS_DOMAIN, Reads, SLOTS, image_key, slot},
     awaited::{any_awaited, await_added, await_crates, awaits_added, is_awaited, release},
     serve::{
-        ImageStore, PAGES_DOMAIN, ReadThrough, Refused, Served, Stored, pages_key, serve,
+        ImageStore, ITEMS_DOMAIN, PAGES_DOMAIN, ReadThrough, Refused, Served, Stored,
+        filing_keys, front_keys, items_key, pages_key, serve,
         serve_asked, store,
     },
 };
@@ -118,7 +124,9 @@ impl std::fmt::Debug for Image {
     }
 }
 
-/// The images of the crates a database reads from them, set by [`serve`].
+/// The images of the crates a database reads from them, set by [`serve`]: read outside
+/// queries alone (the serves, the withdrawals). A query reads its crate's own
+/// ([`ImageSlot`], [`image_of`]).
 #[blaze_query::input(singleton, debug)]
 pub struct DepImages {
     #[returns(ref)]
@@ -127,11 +135,17 @@ pub struct DepImages {
 
 /// The image `krate` is read from, if it is: what every reader of one crate's image goes
 /// through, so a [`serve`] that leaves the crate's image as it was re-runs none of its queries.
+///
+/// Reads the crate's own slot ([`ImageSlot`]), never [`DepImages`]: a serve of another crate
+/// writes nothing this read.
 #[blaze_query::tracked(returns(ref))]
 pub fn image_of(db: &Db, krate: Crate) -> Option<Image> {
-    // clone: two buffer handles and a few words, once per crate per serve that changes the set
-    DepImages::try_get(db)?.images(db).get(&krate).cloned()
+    // clone: two buffer handles and a few words, once per crate per serve that changes its image
+    krate.given::<ImageSlot, Image>(db).cloned()
 }
+
+/// The kind of a crate's slot holding its entry of [`DepImages`] ([`given`]).
+pub struct ImageSlot;
 
 /// The image `krate` is read from, if it is.
 pub(crate) fn image(db: &Db, krate: Crate) -> Option<ImageRef<'_>> {

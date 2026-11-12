@@ -11,6 +11,7 @@ mod batch;
 mod cost;
 mod given_macros;
 mod random;
+mod tables;
 
 use std::fmt::Write as _;
 

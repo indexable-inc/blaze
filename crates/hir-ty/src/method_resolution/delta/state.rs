@@ -304,6 +304,7 @@ pub(crate) fn prepare(db: &mut Db, state: &mut State, written: &Written<'_>) {
     let crates = base_db::all_crates(&*db);
     if written.crates {
         drop_gone(state, &crates);
+        drop_served(&*db, state);
     }
     let blocked = hir_def::deps::awaited::blocked(&*db);
     let mut slots = std::mem::take(&mut state.scratch.slots);
@@ -900,6 +901,23 @@ fn drop_gone(state: &mut State, crates: &[Crate]) {
     let live: HashSet<Crate, Global> = crates.iter().copied().collect();
     let gone: Vec<Crate> = state.crates.keys().copied().filter(|it| !live.contains(it)).collect(); // alloc: as above
     for krate in gone {
+        let Some(crate_state) = state.crates.remove(&krate) else { continue };
+        for imp in crate_state.impls.keys() {
+            forget_reads(state, *imp);
+            state.owner.remove(imp);
+        }
+    }
+}
+
+/// Drops the state of every crate whose impls are now read from frozen tables
+/// ([`frozen::served`]), with its impls' read sets: a crate maintained before that a serve gave
+/// tables (`frozen::serve`, in a write that changes the crate graph whole) is passed over from
+/// here on, and what was held of it would never be read or dropped.
+fn drop_served(db: &Db, state: &mut State) {
+    // alloc: a crate graph change, once; none when no maintained crate came to be served
+    let served: Vec<Crate> =
+        state.crates.keys().copied().filter(|&it| frozen::served(db, it)).collect();
+    for krate in served {
         let Some(crate_state) = state.crates.remove(&krate) else { continue };
         for imp in crate_state.impls.keys() {
             forget_reads(state, *imp);

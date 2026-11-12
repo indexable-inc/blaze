@@ -74,6 +74,21 @@ inventory::submit! {
     base_db::Maintainer { order: 100, name: NAME, reads: read_step, apply: apply_step }
 }
 
+/// Whether the impls of a crate are read from records of their own, by whoever keeps them (the
+/// impls maintainer's crate registers its `frozen::served`): name resolution then hands no
+/// delta of that crate when its def map is served ([`served_delta`] walks every scope of the
+/// crate to make one, which nothing would read). Reads inputs alone: an apply asks it too.
+pub struct ImplsServed(pub fn(&Db, Crate) -> bool);
+
+inventory::collect!(ImplsServed);
+
+/// Whether a served crate owes the impls maintainer its decoded map's items after `written`:
+/// the crate graph reached it, and no [`ImplsServed`] says its impls are records.
+fn owes_served_delta(db: &Db, written: &Written<'_>, krate: Crate) -> bool {
+    written.crate_graph_reaches(krate)
+        && !inventory::iter::<ImplsServed>().any(|it| (it.0)(db, krate))
+}
+
 /// What the last write changed of each maintained crate's resolution, in dependency order:
 /// what the impls maintainer (`200`) reads. Cleared at the start of each write. A crate whose
 /// def map the frozen image serves is in it too, as [`served_delta`] gives it: the impls
@@ -437,7 +452,7 @@ impl CrateRun {
 fn read_crate(db: &Db, written: &Written<'_>, run: &mut CrateRun) {
     if run.served {
         // Read here, not in the apply: the decoded map is a query the apply may not run.
-        if written.crate_graph_reaches(run.krate) {
+        if owes_served_delta(db, written, run.krate) {
             run.served_delta = Some(served_delta(db, run.krate));
         }
         return;
@@ -523,7 +538,7 @@ fn finish_crate(
         if old.is_some() {
             publish::enter(db, krate, None);
         }
-        if written.crate_graph_reaches(krate) {
+        if owes_served_delta(&*db, written, krate) {
             let delta = run_served.unwrap_or_else(|| {
                 panic!("nameres delta: crate {krate:?}'s served delta was not read")
             });

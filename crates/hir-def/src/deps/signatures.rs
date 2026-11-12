@@ -19,7 +19,7 @@
 
 mod codes;
 mod ids;
-mod key;
+pub(crate) mod key;
 pub(crate) mod table;
 
 pub use self::ids::{BODY_KEY_DOMAIN, IdKind, PortableId, PortableIds, body_key};
@@ -110,6 +110,12 @@ pub(crate) const SCHEMA: SchemaHash = blaze_format::schema_of(&[
     SchemaPart::Str(key::KEY_DOMAIN),
     SchemaPart::Str(frozen::ENCODING),
 ]);
+
+/// The domain of an item's key ([`key::Key`]): what a record whose entries are found by such
+/// keys names in its own key (`deps::items_key`).
+pub(crate) fn key_domain() -> &'static str {
+    key::KEY_DOMAIN
+}
 
 /// The schema of one record's buffer.
 const RECORD_SCHEMA: SchemaHash = blaze_format::schema_of(&[
@@ -485,12 +491,14 @@ fn served<S: Sig>(db: &Db, item: Item, live: impl FnOnce(Crate) -> R<Vec<u8>>) -
     let value = read::<S>(db, krate, what, image.bytes(), stored)
         .unwrap_or_else(|why| corrupt(db, krate, item, &why));
     match image.mode() {
-        Mode::Serve => {}
+        // The value is the record's, found by content: told to the engine (`row::STORED`).
+        Mode::Serve => blaze_query::db::report_stored_read(db),
         Mode::Check => {
             let written = live(krate);
             compare(db, krate, item, "the signature lowered from syntax", written, stored);
         }
         Mode::Verify => {
+            blaze_query::db::report_stored_read(db);
             let written = record::<S>(db, krate, what, S::of(&value));
             compare(db, krate, item, "what was read of it", written, stored);
         }

@@ -839,10 +839,19 @@ impl std::fmt::Display for Unmaintained {
         if let Some((awaited, name)) = &self.awaited {
             f.write_str(": it waits for the records of crate ")?;
             write_crate(f, *awaited, name.as_deref())?;
-            return f.write_str(
+            f.write_str(
                 ", which the driver has not asked the store for yet (`hir_def::deps::serve_asked` \
                  releases a crate it is asked about; nothing may read a crate before that)",
-            );
+            )?;
+            // Who read it, where that is known: a maintainer's pass over another crate. With
+            // none named, a reader outside a pass did (a unit's build, a harness).
+            return match &self.asking {
+                Some((asking, name)) => {
+                    f.write_str("; read while maintaining crate ")?;
+                    write_crate(f, *asking, name.as_deref())
+                }
+                None => f.write_str("; read outside a maintainer's pass"),
+            };
         }
         match &self.asking {
             Some((asking, name)) => {
