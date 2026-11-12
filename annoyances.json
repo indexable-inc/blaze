@@ -325,7 +325,7 @@
    "date": "2026-11-11",
    "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
    "where": "the tests of all-1111 under cargo, before this lane's changes",
-   "what": "Eight tests fail on the untouched tip of all-1111 (e453ac295a), run in a worktree and a target directory of their own. blaze-codegen: `driver::tests::kept::a_walk_over_kept_describes_builds_what_a_fresh_walk_builds`, the refinement that an edit's `Built` is a fresh build's (`build 1: debug_names differs`: after a function is removed the patched walk still holds it; reproduce with `AXicbYqxDQBACAL/8lZ27r+sJNqQSMEBoZ6UyGKwDWs3wL6Bki+Dv/8GLHwAwg==`). blaze-link: `digest::tests::a_digest_kept_by_updates_is_the_files` (`2 nodes kept, 1 in the file's digest: not canonical`) and `tests::patch::a_same_size_body_edit_writes_the_function_and_a_constant` (`what an edit writes grows with the program`). blaze-cas: `a_changed_byte_in_the_zeros_ending_a_commit_stops_the_store_naming_its_pack`, `a_pack_whose_header_names_another_unit_stops_the_store`, `block_checks::the_oracle_catches_a_head_written_before_its_syncs`, `the_oracle_catches_a_put_reported_durable_that_no_sync_made_so`, `place_crash::the_oracle_catches_a_derived_file_accepted_as_a_crash_left_it`.",
+   "what": "Eight tests fail on the untouched tip of all-1111 (e453ac295a), run in a worktree and a target directory of their own. blaze-codegen: `driver::tests::kept::a_walk_over_kept_describes_builds_what_a_fresh_walk_builds`, the refinement that an edit's `Built` is a fresh build's (`build 1: debug_names differs`: after a function is removed the patched walk still holds it; reproduce with `AXicbYqxDQBACAL/8lZ27r+sJNqQSMEBoZ6UyGKwDWs3wL6Bki+Dv/8GLHwAwg==`). blaze-link: `digest::tests::a_digest_kept_by_updates_is_the_files` (`2 nodes kept, 1 in the file's digest: not canonical`) and `tests::patch::a_same_size_body_edit_writes_the_function_and_a_constant` (`what an edit writes grows with the program`). blaze-cas: `a_changed_byte_in_the_zeros_ending_a_commit_stops_the_store_naming_its_pack`, `a_pack_whose_header_names_another_unit_stops_the_store`, `block_checks::the_oracle_catches_a_head_written_before_its_syncs`, `the_oracle_catches_a_put_reported_durable_that_no_sync_made_so`, `place_crash::the_oracle_catches_a_derived_file_accepted_as_a_crash_left_it`. The codegen one is found by hegel's random draws: it failed in two of three runs of the suite and passed in the third.",
    "cost": "an hour: a baseline worktree, a second target directory and three test runs to tell them from this lane's changes; and the tree's own promise that an edit builds what a clean build builds is not held by its test",
    "cause": "not looked for; the codegen one came with or after the edit-work-1111 merge (the test file's last change), the store's with the pool",
    "workaround": "ran the same suites on the base and compared the lists: the same eight fail there, and this lane's new tests pass",
@@ -407,6 +407,17 @@
    "cause": "one VM for building and measuring, and nothing that refuses to measure while a build runs",
    "workaround": "waited for `pgrep cargo` to be empty before each measurement",
    "state": "open: the measuring script could refuse when the machine is busy"
+  },
+  {
+   "id": "edit2-13",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+   "where": "hir-ty-codegen's tests under cargo",
+   "what": "`v2::linked::tests::a_body_edit_among_many_makes_its_own_tables` fails every time the module's tests run side by side (`2000 functions: the link before was kept`: `no link inputs are kept for this build or its base`), on the untouched tip of all-1111 (e453ac295a) and on this lane alike, three runs of three each, and passes with `--test-threads=1`.",
+   "cost": "a base build of hir-ty-codegen's tests (ten minutes) to tell it from this lane's change to `linked`",
+   "cause": "my guess, unverified: the link inputs kept beside the database are four programs a process, and the tests of one process share them",
+   "workaround": "`--test-threads=1`",
+   "state": "open"
   }
  ]
 }
