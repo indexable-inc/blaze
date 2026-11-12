@@ -275,6 +275,105 @@
    "cause": "the delay is one process-wide option read at each free and at each purge",
    "workaround": "purge at once, as before",
    "state": "open: why a rested edit is slower on pages kept warm is not known"
+  },
+  {
+   "id": "records-1",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-1111",
+   "where": "the measuring binaries from a cargo build",
+   "what": "`target/release/blaze` is blaze-engine's second binary, not the thin client (`blaze-thin`). A bin directory made of `blaze` and `blaze-engine` copied from `target/release` runs the cold build with one daemon and every edit with another: the client sees a daemon of another binary, stops it and starts its own, and the script then fails on the first daemon's pid.",
+   "cost": "three measurement runs, about 25 minutes",
+   "cause": "two binaries named blaze in one directory; the measuring script's header does not say which is which",
+   "workaround": "copy `target/release/blaze-thin` as `blaze`",
+   "state": "open: the script should check that `blaze` is the thin client"
+  },
+  {
+   "id": "records-2",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-1111",
+   "where": "git on the Mac",
+   "what": "`git diff | ssh ... git apply` sent nothing appliable: the Mac's git has an external diff (difftastic) configured, so `git diff` prints a side-by-side view, and `git apply` says only \"No valid patches in input\".",
+   "cost": "ten minutes",
+   "cause": "a display setting applies to a pipe",
+   "workaround": "`git diff --no-ext-diff`",
+   "state": "open"
+  },
+  {
+   "id": "records-3",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-1111",
+   "where": "the task's premise: an image served saves memory",
+   "what": "The brief took the dependency images as the mechanism that would make a restarted or warm daemon small. Measured, a restarted daemon is larger than a cold one (6,081 MB against 5,143 MB resident on hello-world): each image is decoded into the same heap values, after the crate was resolved from source anyway (F2), and the first edit after the restart makes 109,000 bodies and 60,000 MIR bodies again (R7).",
+   "cost": "the first plan (serve the images sooner and the memory follows) would have bought seconds and no megabyte",
+   "cause": "nothing measured the restarted daemon's memory before; measure.py had no restart row",
+   "workaround": "measure.py has restart rows now (first no-op, first edit, memory after)",
+   "state": "the rows are in /tmp/records-1111/measure.py; the script is not in the tree (open)"
+  },
+  {
+   "id": "records-4",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-1111",
+   "where": "blaze-query: letting go of values",
+   "what": "Letting go of the unread values of every durable row at a build's end (every function, not only `lru` ones; sound through the `keep` path) freed 110 MiB of live heap and not one MB of resident memory, and made each build's end 15 ms longer (`unread values` 1.1 ms to 16.4 ms median, a walk of 2.3 million rows). Built, measured, taken out.",
+   "cost": "two hours",
+   "cause": "freed blocks share mimalloc pages with live ones, so nothing goes back (docs/memory-footprint.md says so of codegen; it holds for query values too); the query storage line in serve.log counts live bytes, which is not what the daemon weighs",
+   "workaround": "only whole arrays, regions and pool pages can go back; values have to be records in pool pages to count",
+   "state": "recorded in restore.md; the patch is /tmp/records-1111/tried-durable-value-eviction.patch on the Mac"
+  },
+  {
+   "id": "records-5",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-1111",
+   "where": "blaze-query's tests under cargo",
+   "what": "`db::provenance::name_tests::an_id_in_a_key_reads_with_its_name_and_keeps_its_id` fails when the suite runs whole, on the untouched tip of all-1111 (e453ac295a) too (`NamedForTheLogTest(Id(3) = serde v1.0.3` where it expects no name): another test's names are in the process-wide table it reads.",
+   "cost": "a look at each run's one failure",
+   "cause": "a test reading process-wide state another test writes; not looked into further",
+   "workaround": "none",
+   "state": "open"
+  },
+  {
+   "id": "records-6",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-1111",
+   "where": "ix: copying between two VMs",
+   "what": "`ix shell a -- tar -c | ix shell b -- tar -x` moved 346 MB of LLVM in about 20 minutes.",
+   "cost": "20 minutes before the first build",
+   "cause": "two interactive shells through the Mac",
+   "workaround": "started the clone and rustup beside it",
+   "state": "open: the pinned LLVM should be fetched by its hash on the VM itself"
+  },
+  {
+   "id": "records-7",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-1111",
+   "where": "the task's premise: a library's rows are durable",
+   "what": "The brief and blaze-query's docs say library inputs are `HIGH` and a durable row is current without walking its edges. On hello-world 181,865 of 2,105,574 rows are at `HIGH`; 1,906,504 are at `MEDIUM`, because std's rows read inputs of kind `MEDIUM` (the maintainers' `Resolutions` and `ImplSlices`, the crate graph after a change, files' source roots, crate attributes). The first version of shedding durable readers from the reverse index took 64,000 of 2.9 million readers.",
+   "cost": "one build and measurement that bought nothing, an hour",
+   "cause": "nothing reported rows by kind; a row's kind is the lowest it read, and one shared table of kind `MEDIUM` lowers every reader",
+   "workaround": "the pack's span says rows_low, rows_medium, rows_high now; the shed is from `MEDIUM`",
+   "state": "open: a library crate's published tables should be inputs of their own at `HIGH` (restore.md, step 2)"
+  },
+  {
+   "id": "records-8",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-1111",
+   "where": "blaze: the build after a cold build",
+   "what": "The second build after a cold one folds 1.5 million runs into the reverse index at its first view boundary, 390 to 540 ms on the edit's path (`reverse edges fold`, runs=1498483): the runs are the cold build's store of its dependencies' signatures (`store kept front end`), made after the answer and left for whoever opens the next view.",
+   "cost": "about half a second of the second edit, on every binary measured, the base included",
+   "cause": "edges are folded at a view boundary, and the last runs of a build have no boundary after them",
+   "workaround": "none; while the index is shed the fold skips durable rows (150 ms for the same runs)",
+   "state": "open: the task that stores the kept front end should fold what it ran (a fold with `&mut` at its end)"
+  },
+  {
+   "id": "records-9",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-1111",
+   "where": "blaze: a daemon's start",
+   "what": "Before a started daemon listens it syncs the profile history (`profile fsync`), and that one sync took 0.13 to 1.34 s across runs of the same binaries on one VM. The first request after a restart was 3.9, 3.9, 4.1 s on the base and 5.1, 5.2, 4.4 s on this lane's binary with requests of 3.38 and 3.48 s: the row moves by more than the change under test.",
+   "cost": "three extra runs of each binary, and a restart row that still cannot be compared",
+   "cause": "a sync of telemetry on the path to the first answer (restore.md already counts 0.72 s of it on the Mac)",
+   "workaround": "read the request's own span (`request: read to reply`) and not the client's wall time",
+   "state": "open: the profile history should not be synced before the daemon listens"
   }
  ]
 }

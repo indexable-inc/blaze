@@ -60,12 +60,117 @@ a reboot, takes about as long as the same answer from a warm daemon, plus a few 
 
   The budgets are `harness/v2/budgets.py`'s `restart-first-answer-clean` and
   `restart-first-answer-kill9`.
-- **Still not restored: the front end itself.** The kept front end (`KeptLowered`: the dense
-  `base_db` database with its def maps, inference and MIR of the members) lives in memory
-  only. A restarted daemon lowers the workspace again and resolves its members again, reading
-  dependencies from their images. Restoring it needs the front end's memos in the image as
-  `Persist` values, the work [query-unify](../../plan.md) names.
+- **Still not restored: the front end itself.** The design is the next section; what it
+  replaces is the plan to put the front end's memos in the image as `Persist` values.
 
+## A dependency's front end is records (2026-11-11, lane records-1111; D5, D21)
+
+One change for three gaps: the daemon's memory, the first request after a restart, and a
+machine that never built std. A crate that does not change while the workspace is edited (std,
+a registry dependency) has its front end in the store as records, read in place through the
+pool when asked; only the workspace's own crates are heap memos.
+
+**Measured** (hello-world, Linux aarch64, 32 cores, cargo-built `e453ac295a`, fresh home,
+cold build, five edits, idle; `measure.py` with its restart rows):
+
+| | resident | of it |
+|---|---|---|
+| after a cold build and five edits | 5,143 MB | regions 1,660, heap live 1,426, freed and kept 2,041 |
+| after a restart, a no-op and two edits | 6,081 MB | regions 1,645, heap live 2,080, freed and kept 2,334 |
+
+The first no-op after a restart is 3.9 s (`lower workspace` 2.6 s, of it `maintain` 2.45 s:
+F2, R8) and the first edit 9.3 s (`codegen walk describe` 5.4 s: R7). So an image served today
+saves no memory: it is decoded into the same heap values, after the crate was resolved from
+source anyway. And a value let go from the heap gives nothing back: letting go of every
+durable row's unread value (tried, taken out) freed 110 MiB live and 0 MB resident, for 15 ms
+a build's end. Only what is a whole array, a region or a pool page leaves; that is why the
+values have to be records and not smaller heap.
+
+**Keys.** A record is found by content alone: the crate's source and manifest content
+hashes, its cfg and features, the *content* hashes of its dependencies' records of the kinds
+it reads (never their keys, so a dependency that changes and yields equal records stops
+there), and the code identity of the stage that makes the kind (name resolution, signatures,
+bodies: each its own, from `blaze_codegen_code`, the same in a cargo-built blaze). No path, no
+directory. `deps::key` is this but for two things to change: it hashes each dependency's key,
+and one identity for the whole front end.
+
+**Kinds**, a crate each, largest first, and where each is today:
+
+| Kind | Held live now | Today |
+|---|---|---|
+| the rows' graph (edges 108, readers 106, nodes 105 MiB) | 320 MiB | readers: not held for a library's rows (built, below); edges: step 2 |
+| def map, lang items, name resolution's state | about 470 MiB | a record (`nameres::frozen`), decoded to heap; the maintainer keeps state for a served crate's readers |
+| syntax, item trees, macro expansions | about 550 MiB | library trees in the daemon image; expansions heap only |
+| signatures | about 110 MiB | a record read in place an item (`deps::signatures`), then memoized on the heap |
+| bodies, inference, MIR | let go at a build's end | records by body key (the item store) |
+| impls and method resolution's tables | with nameres | none |
+
+**The engine.** A crate with records is *sealed*: one input of kind `HIGH` a crate, whose
+value is the content hash of its records. A query keyed in a sealed crate is answered by a
+reader (`Persist::Ref` into a page the task pins), not by a run: no value on the heap, no
+edges, and its node is read as that one leaf. Next after the readers below, the same for a
+library row's forward edges: it verifies by its input summary alone, and a durable write that
+meets the summary runs it again; then the reader functions, kind by kind.
+
+**Built: a library's rows are not kept as readers** (`blaze_query::db::frontier`, "Durable
+readers"). A row that read nothing below kind `MEDIUM` is left out of the reverse index when
+the host packs it at a build's end, once two packs in a row saw no durable write between
+them (twice as many after each shed a durable write ended); a durable write makes the index
+again from the rows before its view's walk. Measured on the same script: the index 102.5 to
+12.9 MiB live (25.5 million readers to 1.09 million; the query storage 849.6 to 778.0 MiB);
+the daemon's resident size the same within the runs' spread (5,502 against 5,493 MB after
+the rows), so it is live memory the next step can give back, not footprint yet. The pack
+that sheds is 103 to 116 ms (40 ms whole), after the answer; no row of the edit loop moved
+past the runs' spread (the table). Tests: the changed set's simulation with inputs of each kind
+and packs among its steps, its control `the_oracle_catches_a_durable_write_over_an_index_left_shed`,
+`a_pack_sheds_the_durable_readers_and_a_durable_write_makes_the_index_again`, and the core's
+`a_shedding_pack_keeps_every_reader_it_was_not_told_to_shed` with its control.
+
+| Row (median, ms) | base, two runs | with the shed |
+|---|---|---|
+| no-op build | 11.6, 12.6 | 11.5 |
+| no-op run | 13.4, 14.0 | 15.1 |
+| body edit + run (25th percentile) | 130.5, 138.8 | 133.9 |
+| comment edit + run | 20.5, 38.4 | 24.3 |
+| body edit after 3.5 s idle | 153.8, 155.5 | 162.1 |
+| body edit after 8 s idle | 148.0, 180.0 | 163.4 |
+| resident after the rows, MB | 5,493, 5,585 | 5,502 |
+| first no-op after a restart, s (three runs each) | 3.9, 3.9, 4.1 | 5.1, 5.2, 4.4 |
+| first edit after a restart, s | 9.3, 11.2, 9.5 | 9.4, 9.3, 9.7 |
+| resident after the restart's builds, MB | 6,081, 5,975, 6,020 | 6,013, 5,898, 5,946 |
+
+The restart's first no-op is not explained: its request is 3.38 s on the base and 3.48 s with
+the shed, and the rest is before the daemon listens, where one `profile fsync` took 0.13 to
+1.34 s on both binaries. Until that is off the start's path the row cannot be compared.
+
+
+**Found: a library's rows are not at `HIGH`.** Of hello-world's 2,105,574 rows 181,865 are at
+`HIGH`, 1,906,504 at `MEDIUM` and 17,205 at `LOW` (the pack's span says it): std's rows read
+the maintainers' published tables (`Resolutions`, `ImplSlices`), the crate graph and their
+files' source roots, all `MEDIUM`. So "a durable row is current with one compare" holds only
+until any of those is written, and a sealed crate's leaf has to be an input of its own at
+`HIGH`, apart from the workspace's tables. That is the first thing step 2 changes.
+
+**The pool.** What is hot is resident; the rest is evicted under `Tag::Pool`'s budget, by
+reload cost a byte, then recency, and the pages go back (`Store::evict_pool`, called by the
+idle give-back and the ceiling guard; it has no caller yet). A miss is a page read. A record
+that is missing or of an older layout is a named miss, `records of <crate>, <kind>, layout
+<n>: made again from source`, never an empty answer.
+
+**Restart** reads nothing eagerly. The lowering's batch asks the store before any crate is
+resolved (F2) and writes no input after a result exists (the restart-then-edit build wrote
+4,722 inputs over 551,000 rows, and ran 2.29 million queries); a describe is a record (R7);
+the no-op's answer is kept (F3). **A new machine** fetches the same records by key from the
+global cache (F4); nothing else differs.
+
+**Order**, each step with before and after from `measure.py`, a round trip, and no edit-loop
+row over 10% slower: (1) the graph's readers (built: above); (2) a sealed crate's leaf at
+`HIGH`, then the graph's edges; (3) def
+maps read in place and name resolution's state dropped for a sealed crate; (4) F2 and R8, then
+R7; (5) `evict_pool` wired. Milestones: under 1 GB, then 500 MB; the first request after a
+restart under 1 s, then 300 ms. The largest single part is none of the kinds: 2,041 MB freed
+and kept by the allocator (transparent huge pages 1,134, sparse pages 293), which records
+take down only by taking the churn off the heap.
 
 ## A second kind of target, and where a restart's time goes (2026-11-11, lane share-front-1111)
 
