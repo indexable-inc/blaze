@@ -25,7 +25,7 @@
 
 use std::path::Path;
 
-use blaze_api::{ApiError, Level};
+use blaze_api::ApiError;
 use blaze_cas::Key;
 use blaze_core::lock::Lock;
 use blaze_doc::doctest::{self as doc, Built, Program, Verdict};
@@ -725,7 +725,7 @@ pub(super) fn link(
         used.dedup();
         let _ = slot.set(used);
     }
-    if making.diagnostics.iter().any(|it| it.level == Level::Error) {
+    if making.said.failed() {
         making.ok = false;
     }
     phases.linked = Some(Linked::Made(Box::new(making)));
