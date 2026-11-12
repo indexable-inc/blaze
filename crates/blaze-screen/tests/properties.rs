@@ -131,6 +131,9 @@ fn plan(draws: &mut impl Draws) -> Plan {
                     (0..1 + draws.below(4)).map(|_| name(draws, u32::from(cols) * 2)).collect();
                 Step::Event(Event::Said(lines.join("\n") + "\n"))
             }
+            6 if draws.below(3) == 0 => {
+                Step::Event(Event::Waits((draws.below(3) != 0).then(|| name(draws, 300))))
+            }
             6 => Step::Event(Event::Diagnosed { error: draws.below(2) == 0, unit: Some(name(draws, 20)) }),
             7 => Step::Event(Event::Resized {
                 cols: 4 + draws.below(220) as u16,
@@ -287,8 +290,10 @@ fn on_a_terminal(plan: &Plan, plant: Plant) -> Result<(), String> {
             }
             continue;
         }
-        let want: Vec<&str> = stay.iter().chain(&region).map(String::as_str).collect();
-        if vt.held() != want {
+        let want: Vec<&str> = stay.iter().chain(&region).map(|it| it.trim_end()).collect();
+        // A blank line that stays at the very end is not told from a row erased.
+        let want = &want[..want.iter().rposition(|it| !it.is_empty()).map_or(0, |at| at + 1)];
+        if vt.held().iter().map(|it| it.trim_end()).ne(want.iter().copied()) {
             return Err(format!(
                 "step {at}: the terminal ({cols} by {rows}) holds {:#?}\nand should hold {want:#?}",
                 vt.held()
@@ -424,6 +429,7 @@ fn an_interrupt_puts_the_terminal_back() {
     encode(&Frame::restore(rows), &terminal, &mut bytes);
     vt.write(&bytes);
     assert_eq!(vt.held(), ["warning: unused"]);
+    assert_eq!(vt.shown(), "warning: unused");
     assert!(!vt.cursor_hidden);
     assert_eq!(vt.progress(), Some("0;0"));
 }

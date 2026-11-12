@@ -171,6 +171,8 @@ pub struct Screen {
     failed: Vec<String>,
     built: Option<Built>,
     built_at: u64,
+    /// What the whole build waits on now ([`Event::Waits`]).
+    waits: Option<String>,
     /// The build's last line was said.
     ended: bool,
     /// Nothing live is left.
@@ -202,6 +204,7 @@ impl Screen {
             failed: Vec::new(), // alloc: none until a unit fails
             built: None,
             built_at: 0,
+            waits: None,
             ended: false,
             cleared: false,
             tests: Tests::default(),
@@ -309,6 +312,7 @@ impl Screen {
                     self.end_build(&whys);
                 }
             }
+            Event::Waits(waits) => self.waits = waits,
             Event::Test(test) => self.test(test),
             Event::Clear => self.cleared = true,
         }
@@ -480,7 +484,7 @@ impl Screen {
                 }), // alloc: as above
             }
         }
-        let room = most.saturating_sub(1);
+        let room = most.saturating_sub(1 + usize::from(self.waits.is_some()));
         // Ready with no worker inside: said with why, when that is cores or memory.
         let held = now.memory.held_back;
         let idle = now.workers.saturating_sub(now.busy.len() as u32);
@@ -549,8 +553,15 @@ impl Screen {
         if let Some(starved) = starved {
             rows.push(Line::new().with(Role::Waiting, format!(" {} {starved}", self.glyph("◦", ".")))); // alloc: as above
         }
+        rows.extend(self.waits_row());
         rows.push(self.status_row(now, since));
         rows
+    }
+
+    /// ` ◦ paused: daemon at 71.6 of 63.2 GiB, waiting on 1 task: calc lib test`.
+    fn waits_row(&self) -> Option<Line> {
+        let waits = self.waits.as_ref()?;
+        Some(Line::new().with(Role::Warned, format!(" {} paused: {waits}", self.glyph("◦", ".")))) // alloc: a row, a frame
     }
 
     /// ` building  ━━━━━━────────  32/147 · 3 running · 5.0s`, and what is off after it.
@@ -566,9 +577,11 @@ impl Screen {
         };
         row.push(Role::Strong, format!(" {word}")); // alloc: the status row, a frame
         let tally = now.tally;
+        let quiet = now.quiet_ms + since;
         if tally.total > 0 {
             let bar = (cols / 4).clamp(8, 24);
-            if cols >= 50 {
+            // A bar that has not moved for a while makes room for what says so.
+            if cols >= 50 && quiet < QUIET_MS {
                 let filled = (u64::from(tally.done) * bar as u64 / u64::from(tally.total)) as usize;
                 let (full, rest) = (self.glyph("━", "#"), self.glyph("─", "-"));
                 row.push(Role::Done, format!("  {}", full.repeat(filled))); // alloc: as above
@@ -583,6 +596,12 @@ impl Screen {
             }
         }
         row.push(Role::Dim, format!(" {} {}", self.dot(), text::timer(self.now_ms))); // alloc: as above
+        if quiet >= QUIET_MS {
+            row.push(
+                Role::Warned,
+                format!(" {} nothing finished for {}", self.glyph("⚠", "!"), text::timer(quiet)),
+            ); // alloc: as above
+        }
         // What the build waits on when no unit runs: a download, its plan, its inputs.
         if let Some(download) = now.downloads.first() {
             let total = download.total.map_or(String::new(), |it| format!(" of {} MB", it / 1_000_000)); // alloc: as above
@@ -607,13 +626,6 @@ impl Screen {
                     text::gb(now.memory.held),
                     text::gb(now.memory.limit)
                 ),
-            ); // alloc: as above
-        }
-        let quiet = now.quiet_ms + since;
-        if quiet >= QUIET_MS {
-            row.push(
-                Role::Warned,
-                format!(" {} nothing finished for {}", self.glyph("⚠", "!"), text::timer(quiet)),
             ); // alloc: as above
         }
         if let Some(stall) = &now.stall {
@@ -1021,7 +1033,7 @@ impl Screen {
             tests.binaries.iter().filter(|it| it.started && !it.ended).collect(); // alloc: a frame's rows
         let name_col =
             running.iter().map(|it| text::width(&it.label)).max().unwrap_or(0).min((cols / 3).max(12));
-        let room = self.most_rows().saturating_sub(1);
+        let room = self.most_rows().saturating_sub(1 + usize::from(self.waits.is_some()));
         let shown = match running.len() > room {
             true => room.saturating_sub(1),
             false => running.len(),
@@ -1091,6 +1103,10 @@ impl Screen {
             ); // alloc: as above
         }
         row.push(Role::Dim, format!(" {dot} {}", text::timer(self.now_ms))); // alloc: as above
+        // The build, while it still runs under the tests, waits on memory: said here too.
+        if self.built.is_none() {
+            rows.extend(self.waits_row());
+        }
         rows.push(row); // alloc: as above
         rows
     }
@@ -1244,7 +1260,15 @@ pub fn file_url(path: &str) -> String {
 fn marks(line: &str, root: Option<&str>) -> Vec<Mark> {
     let mut found = Vec::new(); // alloc: none unless the line has a link
     if let Some(at) = line.find("--> ") {
-        let from = at + 4;
+        // The arrow is drawn in a colour of its own: the place is after the sequence that
+        // ends it.
+        let mut from = at + 4;
+        while line[from..].starts_with("\x1b[") {
+            match line[from..].find('m') {
+                Some(end) => from += end + 1,
+                None => break,
+            }
+        }
         let rest = &line[from..];
         let end = rest.find([' ', '\x1b', '\t']).unwrap_or(rest.len());
         let place = &rest[..end];

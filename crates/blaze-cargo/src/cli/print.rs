@@ -537,6 +537,25 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
         {
             return Ok(());
         }
+        // A pause of the whole build and its end (blaze-graph's `pressure`: memory is short) is
+        // what the build waits on now: on a terminal the region's to show while it lasts, never
+        // a line a pause in the scrollback.
+        if diagnostic.unit.is_none()
+            && diagnostic.level == Level::Note
+            && self.shown.live
+            && self.shown.verbose == 0
+        {
+            let waits = match diagnostic.message.strip_prefix("build paused: ") {
+                Some(why) => Some(Some(why.to_owned())), // alloc: a pause, once
+                None if diagnostic.message.starts_with("build resumed") => Some(None),
+                None => None,
+            };
+            if let Some(waits) = waits {
+                self.flush()?;
+                self.err.take(Event::Waits(waits));
+                return Ok(());
+            }
+        }
         let renders = self.shown.format.renders();
         if let Format::Json { ansi, render_diagnostics: false, .. } = self.shown.format
             && let Some(unit) = diagnostic.unit
@@ -675,7 +694,8 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
         self.err.take(Event::Built(built));
         if let Some(why) = why {
             // alloc: a cause each, once a build
-            self.err.take(Event::Why(why.iter().map(why_of).collect()));
+            let root = self.root.clone(); // clone: once a build
+            self.err.take(Event::Why(why.iter().map(|it| why_of(it, &root)).collect()));
             // The reports whole, as `blaze why` prints them.
             if self.shown.verbose > 0 && !self.shown.quiet {
                 for report in why {
@@ -702,15 +722,16 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
     }
 }
 
-/// A report's text in plain words.
-fn plain(text: &blaze_api::Text) -> String {
+/// A report's text in plain words, its paths shown from the checkout (`root`).
+fn plain(text: &blaze_api::Text, root: &str) -> String {
     use blaze_report::Span;
     let mut out = String::new(); // alloc: once a cause, at a build's end
     for span in &text.0 {
         match span {
-            Span::Plain(it) | Span::Code(it) | Span::Path(it) | Span::Version(it) | Span::Var(it) => {
-                out.push_str(it);
-            }
+            Span::Path(it) => out.push_str(
+                it.strip_prefix(root).map_or(it.as_str(), |below| below.trim_start_matches('/')),
+            ),
+            Span::Plain(it) | Span::Code(it) | Span::Version(it) | Span::Var(it) => out.push_str(it),
             Span::Hash(it) => out.push_str(it.get(..8).unwrap_or(it)),
             Span::Package { name, version } => {
                 out.push_str(name);
@@ -731,12 +752,12 @@ fn plain(text: &blaze_api::Text) -> String {
 /// the cause's own words (`src/main.rs changed`, what follows `because` in its headline), the
 /// functions compiled again for it (its `codegen` facts), and whether it is work that should
 /// not have been done (said as a warning).
-fn why_of(report: &Report) -> Why {
-    let headline = plain(&report.headline);
+fn why_of(report: &Report, root: &str) -> Why {
+    let headline = plain(&report.headline, root);
     let cause = headline.split_once(" because ").map_or("", |it| it.1).to_owned(); // alloc: once a cause
     let mut functions: Vec<String> = Vec::new(); // alloc: as above
     for fact in &report.facts {
-        let text = plain(&fact.text);
+        let text = plain(&fact.text, root);
         let Some((step, names)) = text.split_once(": ") else { continue };
         if !step.starts_with("codegen") {
             continue;

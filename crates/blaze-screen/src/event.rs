@@ -40,6 +40,10 @@ pub enum Event {
     /// Whole lines that stay, as they were drawn for this client: a diagnostic, a report, a
     /// test executable's own words. Ends with a newline.
     Said(String),
+    /// What the whole build waits on now, in the daemon's words (`daemon at 71.6 of 63.2 GiB,
+    /// waiting on 1 task: calc lib test`), or none once it goes on: memory, when memory is why
+    /// nothing moves. The region's to show; it is no line of the scrollback.
+    Waits(Option<String>),
     /// A diagnostic was said (in a [`Event::Said`]): counted for the build's last line.
     Diagnosed { error: bool, unit: Option<String> },
     /// The build is over.

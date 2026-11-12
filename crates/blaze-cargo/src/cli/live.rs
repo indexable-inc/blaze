@@ -439,7 +439,7 @@ impl Runner {
         };
         let rerun = test::rerun(&artifact, kind, self.spec_flag);
         let binary = self.binaries.len() as u32;
-        self.say(Test::Queued { binary, label: label.clone(), rerun });
+        self.say(Test::Queued { binary, label: label.clone(), rerun: format!("blaze test {rerun}") }); // alloc: once a test executable
         let json = artifact.harness && !doc;
         self.binaries.push(Binary { artifact, order, label, json, began: None });
         if self.stopping {

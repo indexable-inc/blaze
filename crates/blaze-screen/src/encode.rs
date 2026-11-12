@@ -3,8 +3,10 @@
 //! would write without a terminal.
 //!
 //! On a terminal a frame is one synchronized update (mode 2026, which a terminal that does
-//! not know it ignores): the cursor up over the last region, the screen erased from there,
-//! the lines that stay, the new region. Off one it is the lines that stay and nothing else:
+//! not know it ignores): the cursor up over the last region, each of its rows erased (a row
+//! at a time, EL: erasing to the end of the screen, ED, from the top-left corner is a clear
+//! of the whole screen to tmux, which then pushes what was on it into its history, a copy of
+//! the region a frame), the cursor up again, the lines that stay, the new region. Off one it is the lines that stay and nothing else:
 //! no cursor movement, no colour unless it was asked for by name, no link, no progress.
 
 use alloc::string::String;
@@ -94,7 +96,11 @@ pub fn encode(frame: &Frame, terminal: &Terminal, out: &mut String) {
     out.push_str("\x1b[?2026h");
     if frame.erase > 0 {
         // Writing to a String cannot fail.
-        let _ = write!(out, "\r\x1b[{}A\x1b[J", frame.erase);
+        let _ = write!(out, "\r\x1b[{}A", frame.erase);
+        for _ in 0..frame.erase {
+            out.push_str("\x1b[2K\n");
+        }
+        let _ = write!(out, "\x1b[{}A", frame.erase);
     }
     match frame.hide_cursor {
         Some(true) => out.push_str("\x1b[?25l"),
