@@ -516,20 +516,27 @@ impl IncludedFile {
     pub fn content_now(path: &std::path::Path) -> ContentId {
         let kept = VOUCHED.lock().get(path).copied();
         if let Some((generation, id)) = kept
-            && (generation == HELD || blaze_vfs::outside::unchanged_since(path, generation))
+            && (generation == HELD || blaze_vfs::outside::name_unchanged_since(path, generation))
             && !LOOKS_EVERY_TIME.get()
         {
             return id;
         }
         let generation = blaze_vfs::outside::generation();
-        if kept.is_none()
-            && let Some(dir) = path.parent()
-        {
-            blaze_vfs::outside::want(dir);
+        // A watch is asked by a path's own bytes and hears nothing of where a link leads:
+        // only a file whose name has no link in it (the file itself, when it is there, and
+        // its directory) is kept; any other is looked at each time.
+        let plain = match std::fs::canonicalize(path) {
+            Ok(it) => it == path,
+            Err(_) => path.parent().is_some_and(|dir| std::fs::canonicalize(dir).is_ok_and(|it| it == dir)),
+        };
+        if plain && kept.is_none() {
+            blaze_vfs::outside::watch_name(path);
         }
         let id = IncludedFile::content_of(IncludedFile::read_now(path).as_deref());
-        // alloc: once per included file, its path as the key of what was read of it
-        VOUCHED.lock().insert(path.to_path_buf(), (generation, id));
+        if plain {
+            // alloc: once per included file, its path as the key of what was read of it
+            VOUCHED.lock().insert(path.to_path_buf(), (generation, id));
+        }
         id
     }
 

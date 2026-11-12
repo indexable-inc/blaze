@@ -113,7 +113,28 @@ impl Stamp {
 pub struct Files {
     stamped: Sharded<[u8; 32]>,
     vouched: Sharded<Vouched>,
+    /// What [`Files::entry`] last said of a path whose directory has no link in its name,
+    /// with the generation read before it looked: vouched for while the watches heard
+    /// nothing under a directory at or above it since.
+    entries: blaze_core::lock::Lock<
+        blaze_hash::HashMap<PathBuf, (u64, Entry), std::alloc::Global>,
+    >,
     dirs: &'static Dirs,
+}
+
+thread_local! {
+    /// A planted bug, for a test's control: a path missing a part before its last has no
+    /// names ([`names`]), so it is looked at every time, as until 2026-11-12. Never set
+    /// outside a test.
+    #[doc(hidden)]
+    pub static MISSING_PARENT_IS_UNVOUCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// A planted bug, for a test's control: [`Files::entry`] looks at the disk on every ask,
+    /// as until 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static ENTRY_LOOKS_EVERY_TIME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A path's last answer, under a sequence lock: written on a miss (rare, and a writer that
@@ -123,7 +144,7 @@ struct Vouched {
     /// One for each name the answer rests on ([`names`]): all must have heard nothing. `None`
     /// for a path with `..` in it, one whose links don't resolve, or one a name of
     /// which no watched directory covers: each of its checks looks at the disk.
-    covers: Option<Box<[Cover<'static>]>>,
+    names: Option<Box<[PathBuf]>>,
     sequence: AtomicU64,
     generation: AtomicU64,
     present: AtomicBool,
@@ -188,9 +209,9 @@ const MOST_LINKS: usize = 40;
 /// `usr/lib/libm.tbd` one to `libSystem.tbd`), each link where it is and the file they end at.
 /// A link pointed elsewhere is a change in the link's own directory, and the file changed is
 /// one in its own: with a watch over each, nothing the answer depends on moves unheard. A
-/// missing path's last part is the name that would be made. `None` for a path that is not
-/// absolute, has `..` in it, has more than [`MOST_LINKS`] links, or of which a part
-/// before the last is missing or unreadable. Cold: on a miss only.
+/// missing path's name is the first part of it that is not there: the name that would be made.
+/// `None` for a path that is not absolute, has `..` in it, has more than [`MOST_LINKS`]
+/// links, or of which a part before the last is unreadable. Cold: on a miss only.
 fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
     use std::path::Component;
     let mut parts = path.components();
@@ -235,7 +256,16 @@ fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
                 }
             }
             Ok(_) => at = name,
-            // The name that would be made, for a path that is not there.
+            // The name that would be made, for a path that is not there: its last part, or
+            // the first part of it that is missing (nothing below a name that is not there
+            // is, until that name is made, which its directory hears). Until 2026-11-12 a
+            // path missing a part before its last was never vouched for: a tool that asks of
+            // `src/lib.rs`, `src/main.rs` and `src/bin` in each package of a workspace, some
+            // with no `src`, was looked at on the disk for each, in every build.
+            Err(error) if missing(&error) && answer.is_none() && !MISSING_PARENT_IS_UNVOUCHED.get() => {
+                at = name;
+                break;
+            }
             Err(error) if missing(&error) && left.is_empty() && answer.is_none() => at = name,
             Err(_) => return None,
         }
@@ -251,7 +281,15 @@ impl Files {
 
     /// A table whose answers are vouched for by `dirs`' watches.
     pub fn watched_by(dirs: &'static Dirs) -> Files {
-        Files { stamped: Sharded::new(), vouched: Sharded::new(), dirs }
+        Files {
+            stamped: Sharded::new(),
+            vouched: Sharded::new(),
+            entries: blaze_core::lock::Lock::new(
+                "usercode.inputs.entries",
+                blaze_hash::HashMap::new_in(std::alloc::Global),
+            ),
+            dirs,
+        }
     }
 
     /// The one table of the process.
@@ -292,9 +330,9 @@ impl Files {
         let found = self.vouched.find(&id).map(|it| self.vouched.get(it));
         let known = found.filter(|it| *it.path == *path.as_os_str());
         if let Some(known) = known
-            && let Some(covers) = &known.covers
+            && let Some(names) = &known.names
             && let Some((generation, answer)) = known.read()
-            && covers.iter().all(|cover| cover.unchanged_since(generation))
+            && names.iter().all(|name| self.dirs.name_unchanged_since(name, generation))
         {
             return Ok(answer);
         }
@@ -304,6 +342,7 @@ impl Files {
         // (`blaze_vfs::outside::looks`).
         blaze_vfs::outside::looked(path);
         let (answer, settled) = self.look(path)?;
+        blaze_vfs::outside::looked_file(path, answer);
         if settled {
             match (known, found) {
                 (Some(known), _) => known.write(generation, answer),
@@ -319,18 +358,17 @@ impl Files {
     fn vouch(&self, id: ContentId, path: &Path, generation: u64, answer: Option<[u8; 32]>) {
         // Every name the answer rests on has its directory wanted, and all are covered or the
         // answer is not vouched for.
-        let covers = names(path, answer).and_then(|names| {
+        // Every name the answer rests on is asked of by name ([`Dirs::watch_name`]): what
+        // is written elsewhere under its directory does not move it.
+        let names = names(path, answer).map(|names| {
             for name in &names {
-                if let Some(parent) = name.parent() {
-                    self.dirs.want(parent);
-                }
+                self.dirs.watch_name(name);
             }
-            // alloc: once per path, on its first miss
-            names.iter().map(|name| self.dirs.cover(name)).collect::<Option<Box<[_]>>>()
+            names.into_boxed_slice()
         });
         let at = self.vouched.intern(id, || Vouched {
             path: path.as_os_str().into(), // alloc: once per path, on its first miss
-            covers,
+            names,
             sequence: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             present: AtomicBool::new(false),
@@ -390,7 +428,43 @@ impl Files {
         if path.file_name().is_some_and(|it| it.to_str().is_none()) {
             return Err(refused("its name is not UTF-8, which no view holds"));
         }
-        // Looked at on the disk every time: no watch vouches for an entry.
+        // The invariant: the disk is looked at only while no watch vouches for the answer
+        // kept. An entry is the path itself, a link not followed, so its answer rests on the
+        // names of its directory alone: kept when that directory's name has no link in it
+        // (it is its own canonical name, the form a watch is asked in), with the generation
+        // read before the look. Until 2026-11-12 every ask looked: a link's native inputs
+        // (glibc's `crt*.o` and `lib*.so`, ten each a build) kept every build on NixOS from
+        // being answered again without a walk.
+        let kept = self.entries.lock().get(path).copied();
+        if let Some((generation, entry)) = kept
+            && self.dirs.name_unchanged_since(path, generation)
+            && !ENTRY_LOOKS_EVERY_TIME.get()
+        {
+            return Ok(entry);
+        }
+        let generation = self.dirs.generation();
+        let plain = path.parent().is_some_and(|dir| {
+            let canonical = std::fs::canonicalize(dir).is_ok_and(|it| it == dir);
+            if canonical && kept.is_none() {
+                self.dirs.watch_name(path);
+            }
+            canonical
+        });
+        let entry = self.entry_now(path)?;
+        if plain {
+            // alloc: once per path asked of, its name as the key of what was said of it
+            self.entries.lock().insert(path.to_path_buf(), (generation, entry));
+        }
+        Ok(entry)
+    }
+
+    /// [`Files::entry`] of the disk now: a look, counted.
+    fn entry_now(&self, path: &Path) -> Result<Entry, Unreadable> {
+        // alloc: error path
+        let refused = |error: &str| Unreadable { path: path.to_owned(), error: error.to_owned() };
+        // alloc: error path
+        let unreadable =
+            |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
         blaze_vfs::outside::looked(path);
         let meta = match std::fs::symlink_metadata(path) {
             Ok(meta) => meta,
@@ -905,7 +979,7 @@ mod tests {
         let roundabout = dir.join("sub").join("..").join("a");
         assert_eq!(now.file(&roundabout).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
         let id = Files::path_id(&roundabout);
-        assert!(files.vouched.get(files.vouched.find(&id).unwrap()).covers.is_none());
+        assert!(files.vouched.get(files.vouched.find(&id).unwrap()).names.is_none());
         assert_eq!(dirs.len(), 1);
         _ = std::fs::remove_dir_all(&made);
     }
@@ -946,7 +1020,12 @@ mod tests {
         );
         assert_eq!(names(&dir.join("sdks/real/lib/system"), hash), Some(vec![dir.join("sdks/real/lib/system")]));
         assert_eq!(names(&dir.join("sdks/named/lib/gone"), None), Some(vec![dir.join("sdks/named"), dir.join("sdks/real/lib/gone")]));
-        assert_eq!(names(&dir.join("sdks/gone/lib/m"), None), None, "a part before the last is missing");
+        // The invariant: a path missing a part before its last rests on that part's name.
+        assert_eq!(names(&dir.join("sdks/gone/lib/m"), None), Some(vec![dir.join("sdks/gone")]));
+        // The control: as until 2026-11-12, such a path is vouched for by nothing.
+        MISSING_PARENT_IS_UNVOUCHED.set(true);
+        assert_eq!(names(&dir.join("sdks/gone/lib/m"), None), None, "planted");
+        MISSING_PARENT_IS_UNVOUCHED.set(false);
         // A `.` names nothing (`Path::components` drops it); a `..` may cross a link, and is
         // not resolved here.
         assert_eq!(names(&dir.join("sdks/./real/lib/system"), hash), Some(vec![dir.join("sdks/real/lib/system")]));
@@ -960,7 +1039,7 @@ mod tests {
         let path = dir.join("sdks/named/lib/m");
         assert_eq!(files.file(&path).unwrap(), hash);
         let vouched = files.vouched.get(files.vouched.find(&Files::path_id(&path)).unwrap());
-        assert_eq!(vouched.covers.as_ref().map(|it| it.len()), Some(3));
+        assert_eq!(vouched.names.as_ref().map(|it| it.len()), Some(3));
         let wanted: Vec<&Path> = (0..dirs.len()).map(|at| dirs.dir(at).path()).collect();
         assert!(wanted.contains(&dir.join("sdks").as_path()), "{wanted:?}");
         _ = std::fs::remove_dir_all(&made);
@@ -997,7 +1076,7 @@ mod tests {
         let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
         let vouched = Vouched {
             path: OsStr::new("/nowhere/a").into(),
-            covers: dirs.cover(Path::new("/nowhere/a")).map(|it| vec![it].into()),
+            names: Some(vec![PathBuf::from("/nowhere/a")].into()),
             sequence: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             present: AtomicBool::new(false),
