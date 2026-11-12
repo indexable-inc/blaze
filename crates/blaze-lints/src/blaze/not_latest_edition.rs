@@ -71,7 +71,9 @@ pub(super) fn check(cx: &mut Cx<'_, '_>) {
     }
     let message = message(package, &on);
     let root = cx.root();
-    cx.blaze(LINT, root, MultiSpan::default(), message);
+    cx.blaze(LINT, root, MultiSpan::default(), message)
+        .help(LINT.help())
+        .help(format!("for further information visit {}", LINT.docs_url()));
 }
 
 #[cfg(test)]
@@ -128,7 +130,8 @@ mod tests {
         let out = lint(&package("crate:app", source), &flags("--deny=blaze::not_latest_edition"));
         assert_eq!(told(&out), 1, "{out}");
         assert!(out.contains("error: package `app`"), "{out}");
-        assert!(out.contains("blaze::not_latest_edition"), "the error names the lint:\n{out}");
+        // The level's note names the lint as the command line spells it, with dashes.
+        assert!(out.contains("-D blaze::not-latest-edition"), "the error names the lint:\n{out}");
     }
 
     /// With no level set it is told exactly when a package of the edition builds wherever

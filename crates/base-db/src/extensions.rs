@@ -210,7 +210,12 @@ mod tests {
             ("fn main() {}\n", SaidBlazeEdition::None),
             ("#![no_std]\n#![blaze::uniq]\nfn main() {}\n", SaidBlazeEdition::None),
             ("#![blaze::edition = \"2026.11\"]\nfn main() {}\n", is.clone()),
-            ("//! docs\n#![allow(x)]\n#![blaze :: edition = \"2026.11\"]", is.clone()),
+            // After another attribute, and with its path's tokens apart: two cases, so a
+            // failure says which the reader does not take.
+            ("#![allow(x)]\n#![blaze::edition = \"2026.11\"]", is.clone()),
+            ("#![blaze :: edition = \"2026.11\"]\n", is.clone()),
+            // After a comment that is not a doc comment.
+            ("// a comment\n#![blaze::edition = \"2026.11\"]\nfn f() {}\n", is.clone()),
             ("#![blaze::edition = \"2026.11\"]\n#![blaze::edition = \"2026.11\"]", is.clone()),
             ("#![blaze::edition = \"2026.12\"]", unknown("\"2026.12\"")),
             ("#![blaze::edition = \"blaze-2026.11\"]", unknown("\"blaze-2026.11\"")),
