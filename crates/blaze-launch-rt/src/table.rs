@@ -77,6 +77,8 @@ pub struct Shared {
     area: Range<usize>,
     /// The address of the stub region.
     stubs: usize,
+    /// The address of slot 0's entry thunk.
+    thunks: usize,
     inbox: Sender<Event>,
 }
 
@@ -86,13 +88,14 @@ thread_local! {
 }
 
 impl Shared {
-    /// `table` is the address of `slots` words and `stubs` that of the stub region's head,
-    /// both in a `sys::Code` mapping (which is never unmapped); `area` is the code area's
-    /// addresses.
+    /// `table` is the address of `slots` words, `stubs` that of the stub region's head and
+    /// `thunks` that of slot 0's entry thunk, all in a `sys::Code` mapping (which is never
+    /// unmapped); `area` is the code area's addresses.
     pub(crate) fn new(
         slots: u32,
         table: usize,
         stubs: usize,
+        thunks: usize,
         area: Range<usize>,
         inbox: Sender<Event>,
     ) -> Shared {
@@ -104,6 +107,7 @@ impl Shared {
             threads: AtomicU64::new(0),
             area,
             stubs,
+            thunks,
             inbox,
         }
     }
@@ -126,6 +130,12 @@ impl Shared {
         // writable at this address, or not on this thread).
         let word = unsafe { AtomicUsize::from_ptr(word) };
         Some(word.load(Ordering::Acquire))
+    }
+
+    /// The address of `slot`'s entry thunk: the function's address, as a `fn` pointer holds
+    /// it. Code is there once the slot is declared. `None` past the table's end.
+    pub fn thunk(&self, slot: Slot) -> Option<usize> {
+        (slot.0 < self.slots).then(|| self.thunks + slot.0 as usize * arch::THUNK)
     }
 
     /// The address of `slot`'s stub.

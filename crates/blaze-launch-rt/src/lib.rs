@@ -43,5 +43,5 @@ pub mod table;
 mod tests;
 
 pub use control::{ControlError, run};
-pub use drive::{Config, Driver, EditError, Error, Records};
+pub use drive::{Config, Driver, EditError, Error, Place, REACH, Records};
 pub use table::{Birth, Bound, Event, Mutator, Shared, Told};

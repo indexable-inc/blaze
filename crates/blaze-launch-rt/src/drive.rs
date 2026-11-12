@@ -21,8 +21,8 @@
 //! # One mapping
 //!
 //! ```text
-//! | slot words, 8 bytes each | stub head, stubs | (to a page) | the code area ...
-//! 0                          stubs               area
+//! | slot words, 8 bytes each | stub head, stubs | entry thunks | (to a page) | the code area ...
+//! 0                          stubs               thunks                       area
 //! ```
 //!
 //! A call loads its word relative to itself (`call [rip + word]`; `adrp`, `ldr`), so every
@@ -42,7 +42,7 @@ use blaze_launch::{
 };
 use crossbeam_channel::Receiver;
 
-use crate::arch::{self, GATE_ALIGN, GATE_ENTRY, GATE_HEAD, OutOfReach, STUB, STUB_HEAD};
+use crate::arch::{self, GATE_ALIGN, GATE_ENTRY, GATE_HEAD, OutOfReach, STUB, STUB_HEAD, THUNK};
 use crate::sys::{self, Code, SysError};
 use crate::table::{Event, Shared, Told};
 
@@ -54,10 +54,34 @@ pub trait Records {
     /// initial image is.
     fn open(&mut self, store: &str, statics: u64) -> Result<(), String>;
 
-    /// Clears `into` and fills it with the code of `bind` as it must be at address `at`:
-    /// exactly `bind.len` bytes, its fixups applied, checked against `bind.record`. A refusal
-    /// says which record and why.
-    fn code(&mut self, bind: &wire::Bind, at: u64, into: &mut Vec<u8>) -> Result<(), String>;
+    /// Clears `into` and fills it with the code of `bind` as it must be at `place`: exactly
+    /// `bind.len` bytes, its fixups applied, checked against `bind.record`. A refusal says
+    /// which record and why.
+    fn code(&mut self, bind: &wire::Bind, place: Place, into: &mut Vec<u8>)
+    -> Result<(), String>;
+}
+
+/// Where a bind's code goes, and the addresses its fixups name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Place {
+    /// The address of the code's first byte.
+    pub at: u64,
+    /// The address of slot 0's word.
+    pub words: u64,
+    /// The address of slot 0's entry thunk.
+    pub thunks: u64,
+}
+
+impl Place {
+    /// The address of `slot`'s word: what a call of the function loads.
+    pub fn word(&self, slot: Slot) -> u64 {
+        self.words + u64::from(slot.0) * 8
+    }
+
+    /// The address of `slot`'s entry thunk: what the function's address is.
+    pub fn thunk(&self, slot: Slot) -> u64 {
+        self.thunks + u64::from(slot.0) * THUNK as u64
+    }
 }
 
 /// What a launcher is made for.
@@ -70,9 +94,9 @@ pub struct Config {
 }
 
 impl Config {
-    /// What the launcher of a program uses: a million slots (8 MiB of words and 8 or 16 MiB
-    /// of stubs, each touched when its slot is declared) and the rest of [`REACH`] as area.
-    pub const PROGRAM: Config = Config { slots: 1 << 20, area: REACH - (32 << 20) };
+    /// What the launcher of a program uses: a million slots (24 to 40 bytes each of word,
+    /// stub and thunk, touched when the slot is declared) and the rest of [`REACH`] as area.
+    pub const PROGRAM: Config = Config { slots: 1 << 20, area: REACH - (64 << 20) };
 }
 
 /// The most bytes a launcher's mapping has: what a call on x86-64 reaches from its end to
@@ -168,6 +192,8 @@ pub struct Driver {
     code: Code,
     /// The offset in the mapping of the stub region's head.
     stubs: usize,
+    /// The offset in the mapping of slot 0's entry thunk.
+    thunks: usize,
     /// The offset in the mapping of the code area's offset 0.
     area: usize,
     shared: Arc<Shared>,
@@ -200,7 +226,8 @@ impl Driver {
         )?;
         let slots = config.slots as usize;
         let stubs = (slots * 8).next_multiple_of(16);
-        let area = (stubs + STUB_HEAD + slots * STUB).next_multiple_of(page);
+        let thunks = stubs + STUB_HEAD + slots * STUB;
+        let area = (thunks + slots * THUNK).next_multiple_of(page);
         let whole = area as u64 + config.area;
         if whole > REACH {
             return Err(Error::Reach(OutOfReach {
@@ -216,6 +243,7 @@ impl Driver {
             config.slots,
             base,
             base + stubs,
+            base + thunks,
             base + area..base + whole as usize,
             send,
         ));
@@ -229,6 +257,7 @@ impl Driver {
             core,
             code,
             stubs,
+            thunks,
             area,
             shared,
             inbox,
@@ -280,8 +309,8 @@ impl Driver {
         }
     }
 
-    /// Declares `count` more slots, each on its stub: writes the stubs' code, then stores
-    /// each word.
+    /// Declares `count` more slots, each on its stub: writes the stubs' and the entry
+    /// thunks' code, then stores each word.
     pub fn declare(&mut self, count: u32) -> Result<Slot, Error> {
         self.out.clear();
         let first = self.core.declare(count, &mut self.out)?;
@@ -291,6 +320,17 @@ impl Driver {
             self.scratch.extend_from_slice(&arch::stub(slot).map_err(Error::Reach)?);
         }
         let at = self.stubs + STUB_HEAD + first.0 as usize * STUB;
+        self.code.write(at, &self.scratch)?;
+        // Their entry thunks, which no code names until a record that takes the function's
+        // address is placed; that is after this.
+        self.scratch.clear();
+        let base = self.code.base();
+        for slot in first.0..first.0 + count {
+            let at = (base + self.thunks + slot as usize * THUNK) as u64;
+            let word = (base + slot as usize * 8) as u64;
+            self.scratch.extend_from_slice(&arch::thunk(at, word).map_err(Error::Reach)?);
+        }
+        let at = self.thunks + first.0 as usize * THUNK;
         self.code.write(at, &self.scratch)?;
         self.switch("declare")?;
         Ok(first)
@@ -346,14 +386,17 @@ impl Driver {
         records: &mut dyn Records,
     ) -> Result<(), Error> {
         let base = self.base() as u64;
+        let words = self.code.base() as u64;
+        let thunks = (self.code.base() + self.thunks) as u64;
         for index in 0..self.out.len() {
             match self.out[index] {
                 Write::Place { bind, range } => {
                     let bind = &binds[bind as usize];
                     let slot = bind.slot;
+                    let place = Place { at: base + range.at, words, thunks };
                     self.scratch.clear();
                     records
-                        .code(bind, base + range.at, &mut self.scratch)
+                        .code(bind, place, &mut self.scratch)
                         .map_err(|why| Error::Record { txn, slot, why })?;
                     let got = self.scratch.len() as u64;
                     if got != range.len {

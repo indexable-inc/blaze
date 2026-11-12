@@ -20,7 +20,7 @@ use blaze_launch::wire::{self, Ask, List, ProgramId, RecordId, Tell};
 use blaze_launch::{CodeId, Frame, FrameKind, Slot, Target, Thread, Tier, Txn};
 
 use crate::sys::{self, Code};
-use crate::{Config, Driver, EditError, Error, Records, Shared, arch};
+use crate::{Config, Driver, EditError, Error, Place, Records, Shared, arch};
 
 /// How long a test waits for another thread before it fails, naming what it waited for.
 const PATIENCE: Duration = Duration::from_secs(30);
@@ -87,7 +87,12 @@ impl Records for Table {
         Ok(())
     }
 
-    fn code(&mut self, bind: &wire::Bind, _at: u64, into: &mut Vec<u8>) -> Result<(), String> {
+    fn code(
+        &mut self,
+        bind: &wire::Bind,
+        _place: Place,
+        into: &mut Vec<u8>,
+    ) -> Result<(), String> {
         into.clear();
         match self.code.get(&bind.record.0) {
             Some(code) => {
@@ -319,6 +324,23 @@ fn a_gate_entry_runs_the_old_body_until_its_flag_is_set_and_the_new_one_after() 
 
     assert!(code.write(page - 4, &[0; 8]).is_err(), "a write past the mapping's end");
     assert!(code.store(4, 1).is_err(), "a store that is not aligned");
+}
+
+#[test]
+fn a_functions_address_is_its_entry_thunk_which_follows_the_slot() {
+    let mut records = Table::default();
+    let mut driver = driver(4);
+    let shared = driver.shared();
+    assert_eq!(driver.declare(2), Ok(Slot(0)));
+    let first = [records.bind(1, returns(1), 16)];
+    driver.edit(Txn(1), &first, false, &mut records).expect("bound");
+    // What a `fn` pointer to slot 1's function holds.
+    let pointer = shared.thunk(Slot(1)).expect("a slot of the table");
+    assert_ne!(Some(pointer), shared.target(Slot(1)), "a pointer never names a body");
+    assert_eq!(call_at(pointer), 1);
+    let second = [records.bind(1, returns(2), 16)];
+    driver.edit(Txn(2), &second, false, &mut records).expect("replaced");
+    assert_eq!(call_at(pointer), 2, "the same pointer runs the new body");
 }
 
 #[test]

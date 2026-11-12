@@ -2,6 +2,12 @@
 //! reach. Byte templates, made here and written by the control thread; nothing in this module
 //! touches memory.
 //!
+//! # An entry thunk (launcher.md, section 1)
+//!
+//! One a slot, at a fixed place: the call every caller makes (load the word, jump), written
+//! once. It is what a function's address is, so a `fn` pointer never names a body and a
+//! call through one runs whatever the slot is bound to when it is made.
+//!
 //! # A gate (launcher.md, section 4)
 //!
 //! ```text
@@ -37,6 +43,12 @@ pub const STUB: usize = 8;
 /// The bytes of one stub.
 #[cfg(target_arch = "x86_64")]
 pub const STUB: usize = 16;
+/// The bytes of one entry thunk.
+#[cfg(target_arch = "aarch64")]
+pub const THUNK: usize = 16;
+/// The bytes of one entry thunk.
+#[cfg(target_arch = "x86_64")]
+pub const THUNK: usize = 8;
 
 /// A branch or a load the instruction set cannot encode from `from` to `to`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -72,6 +84,17 @@ mod encode {
     /// `cbnz x<reg>, <this instruction + delta>`.
     pub(super) const fn cbnz(reg: u32, delta: i64) -> u32 {
         0xb500_0000 | ((((delta >> 2) as u32) & 0x7_ffff) << 5) | reg
+    }
+
+    /// `adrp x<reg>, <the page of to>` at `at`: the pages are within 4 GiB.
+    pub(super) const fn adrp(reg: u32, at: u64, to: u64) -> u32 {
+        let pages = ((to >> 12) as i64 - (at >> 12) as i64) as u32;
+        0x9000_0000 | ((pages & 3) << 29) | (((pages >> 2) & 0x7_ffff) << 5) | reg
+    }
+
+    /// `ldr x<reg>, [x<base>, #offset]`: `offset` is a multiple of 8 below 32768.
+    pub(super) const fn ldr_offset(reg: u32, base: u32, offset: u64) -> u32 {
+        0xf940_0000 | (((offset >> 3) as u32) << 10) | (base << 5) | reg
     }
 
     /// `b <this instruction + delta>`: `delta` is a multiple of 4 within 128 MiB.
@@ -128,6 +151,38 @@ pub fn gate_entry(at: u64, flag: u64, old: u64, new: u64) -> Result<[u8; 40], Ou
     bytes[16..22].copy_from_slice(&[0xff, 0x25, 10, 0, 0, 0]);
     bytes[24..32].copy_from_slice(&old.to_le_bytes());
     bytes[32..40].copy_from_slice(&new.to_le_bytes());
+    Ok(bytes)
+}
+
+/// The entry thunk at address `at` of the slot whose word is at `word`:
+/// `adrp x16, word; ldr x16, [x16, word's offset in its page]; br x16`.
+#[cfg(target_arch = "aarch64")]
+pub fn thunk(at: u64, word: u64) -> Result<[u8; THUNK], OutOfReach> {
+    use encode::{BR_X16, adrp, ldr_offset};
+
+    let pages = (word >> 12) as i64 - (at >> 12) as i64;
+    if word % 8 != 0 || !(-(1 << 20)..(1 << 20)).contains(&pages) {
+        return Err(OutOfReach { what: "an entry thunk's load of its word", from: at, to: word });
+    }
+    let code = [adrp(16, at, word), ldr_offset(16, 16, word & 0xfff), BR_X16, 0];
+    let mut bytes = [0; THUNK];
+    for (index, instruction) in code.iter().enumerate() {
+        bytes[index * 4..index * 4 + 4].copy_from_slice(&instruction.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+/// The entry thunk at address `at` of the slot whose word is at `word`:
+/// `jmp qword ptr [rip + word]`.
+#[cfg(target_arch = "x86_64")]
+pub fn thunk(at: u64, word: u64) -> Result<[u8; THUNK], OutOfReach> {
+    // The jump is 6 bytes long, and its displacement counts from its end.
+    let Ok(to) = i32::try_from(word.wrapping_sub(at + 6) as i64) else {
+        return Err(OutOfReach { what: "an entry thunk's load of its word", from: at, to: word });
+    };
+    let mut bytes = [0xcc; THUNK];
+    bytes[0..2].copy_from_slice(&[0xff, 0x25]);
+    bytes[2..6].copy_from_slice(&to.to_le_bytes());
     Ok(bytes)
 }
 
