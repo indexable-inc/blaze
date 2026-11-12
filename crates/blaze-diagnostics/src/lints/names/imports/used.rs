@@ -1107,7 +1107,7 @@ impl<'f, 'db> Uses<'f, 'db> {
     /// records the use of. Syntax has no path there, so the walk of paths never met it, and the
     /// glob a `match` alone used was called unused (blaze-report's `palette.rs`, 2026-11-12).
     fn ident_pat(&mut self, cx: &Cx<'_, 'db>, pat: ast::IdentPat<'db>) {
-        let Some(name) = pat.name() else { return };
+        let Some(name) = ast::HasName::name(&pat) else { return };
         // A fresh binding resolves to no item: nothing is used.
         let Some(def) = cx.vsema.resolve_bind_pat_to_const(pat) else { return };
         let Some(scope) = cx.vsema.scope(pat.syntax()) else { return };
