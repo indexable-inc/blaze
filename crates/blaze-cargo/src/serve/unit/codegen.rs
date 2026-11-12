@@ -885,6 +885,20 @@ pub(crate) struct Parts {
     pub(crate) image: bool,
     /// Whether its unit's code runs at build time: what the link's front end is made with.
     pub(crate) build_time: BuildTime,
+    /// What the walks over the front end keep, which made `built`: where `built` goes back
+    /// once the link is done with it ([`Drop`]).
+    kept: Arc<blaze_codegen::driver::Kept<HirInstance, hir_ty_codegen::v2::HirStatic>>,
+}
+
+/// The `Built` goes back to the driver that made it, whatever became of its link
+/// (`blaze_codegen::driver::Kept::give_back`): the next build of the program writes the
+/// rows an edit changed into its lists, where making them again is a copy a row of the
+/// program (16.7 ms of a one-function edit of hello world), and freeing them here was
+/// 10 ms more of the link's task. Nothing is copied to give it back.
+impl Drop for Parts {
+    fn drop(&mut self) {
+        self.kept.give_back(std::mem::take(&mut self.built));
+    }
 }
 
 impl Parts {
@@ -1200,7 +1214,7 @@ pub(crate) fn generate<'db>(
                 let _ = slot
                     .set(built.stats.profiles.iter().map(|(id, counts)| (*id, *counts)).collect());
             }
-            Ok(Ok(Parts { built, roots, policy, image, build_time }))
+            Ok(Ok(Parts { built, roots, policy, image, build_time, kept }))
         }
         Err(errors) => {
             if let Some(put) = profile {
@@ -2528,7 +2542,7 @@ fn filled_id(function: &blaze_codegen::CompiledFunction) -> ContentId {
 /// its entry in `debug_names` ([`Built::debug_names`]).
 pub(crate) fn function_rows(
     old: &[FunctionRow],
-    functions: &[blaze_codegen::CompiledFunction],
+    functions: &[Arc<blaze_codegen::CompiledFunction>],
     debug_names: &[(InstanceKey, String)],
 ) -> Result<(Vec<FunctionRow>, Vec<InstanceKey>, Vec<InstanceKey>), String> {
     let span = tracing::info_span!(
@@ -3062,7 +3076,7 @@ fn lists<'a>(
     Ok((
         debug_names,
         cold,
-        added.iter().map(|key| functions.need(key)).collect::<Result<_, _>>()?,
+        added.iter().map(|key| functions.need(key).map(|it| &**it)).collect::<Result<_, _>>()?,
         new_statics.iter().map(|id| statics.need(id)).collect::<Result<_, _>>()?,
     ))
 }

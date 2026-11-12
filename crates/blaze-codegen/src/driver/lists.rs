@@ -26,9 +26,17 @@
 //! as made.
 //!
 //! The lists a `Built` gives are contiguous `Vec`s, which its readers outside this crate
-//! index and slice: they are made from the rows each build, one copy an entry (a compiled
-//! function's bytes among them). That copy is linear in the program; what is hashed, looked
-//! up or compared is not.
+//! index and slice. A reader done with a `Built` gives it back ([`Kept::give_back`]), and
+//! the next build of the program writes into its lists the rows it changed
+//! ([`Lists::write_function`], [`Lists::write_static`]): a search and a replace, an insert
+//! or a removal a list, so an edit's `Built` costs the edit's rows. A compiled function is
+//! shared between its row and the `Built` (a reference count), never copied. Where no
+//! `Built` was given back, or dedupe ran whole, the lists are made from the rows, one
+//! entry a row, and [`Work::copied`] says so. Until 2026-11-11 every build made them so and
+//! copied each function's bytes: 16.7 ms and 40 MiB of a one-function edit of hello world
+//! (12,141 rows), and 10 ms more to free them after the link.
+//!
+//! [`Kept::give_back`]: super::kept::Kept::give_back
 
 use std::{
     alloc::Global,
@@ -119,12 +127,32 @@ pub(super) struct Lists {
     /// Each kept candidate by its code ID: no two share one, or dedupe would have merged
     /// them.
     ids: HashMap<ContentId, InstanceKey>,
-    reach: Reach,
+    reach: Arc<Reach>,
     /// How many functions and statics are of each item.
     // BTreeMap: `Built::items` is its keys, in order.
     items: BTreeMap<ItemKey, u32>,
     sets: Sets,
     id: BuiltId,
+    /// The items that came into or went out of `items` since the last `Built` was given,
+    /// each as often as it did.
+    items_moved: Vec<ItemKey>,
+    /// The `Built` these lists last gave, once its reader gave it back
+    /// ([`Kept::give_back`](super::kept::Kept::give_back)): what the next build writes its
+    /// changed rows into.
+    given: Option<Box<Built>>,
+}
+
+/// Sets the entry of `key` in `list`, which is sorted by `key_of` with each key once, to
+/// `value`: replaced or put in its place, or taken out for `None`.
+fn set<T, K: Ord>(list: &mut Vec<T>, key: &K, key_of: impl Fn(&T) -> K, value: Option<T>) {
+    match (list.binary_search_by(|it| key_of(it).cmp(key)), value) {
+        (Ok(at), Some(value)) => list[at] = value,
+        (Ok(at), None) => {
+            list.remove(at);
+        }
+        (Err(at), Some(value)) => list.insert(at, value),
+        (Err(_), None) => {}
+    }
 }
 
 /// What became of a build that patched its lists ([`Build::patch_lists`]).
@@ -170,16 +198,19 @@ impl Lists {
             bytes: 0,
             involved: blaze_hash::HashSet::new_in(Global),
             ids: HashMap::with_capacity(codes.len()),
-            reach: built.reach.clone(), // clone: the graph the next build patches
+            reach: built.reach.clone(), // clone: a reference count
             items: BTreeMap::new(),
             sets: last.sets.clone(), // clone: the sets the next build moves
             id: last.id,
+            items_moved: Vec::new(), // alloc: none until an item moves
+            given: None,
         };
         lists.set_deduped(&built.deduped);
         let post = |key: &InstanceKey| {
             let at = built.functions.binary_search_by_key(key, |it| it.key).ok()?;
             Some(&built.functions[at])
         };
+
         let original = |key: &InstanceKey| {
             let at = originals.functions.binary_search_by_key(key, |it| it.key).ok()?;
             Some(&originals.functions[at])
@@ -189,9 +220,13 @@ impl Lists {
         let mut rows = Vec::with_capacity(nodes.len());
         for (at, (key, node)) in nodes.iter().enumerate() {
             let (kept, before) = (post(key), original(key));
-            // clone: per build kept by row, each function as it was made
-            let Some(made) = before.or(kept).map(|it| Arc::new(it.clone())) else {
-                return Err(last);
+            // A function dedupe changed is kept as it was made too; any other is the
+            // `Built`'s own, shared.
+            let made = match (before, kept) {
+                // clone: per build kept by row, each function dedupe changed, as made
+                (Some(before), _) => Arc::new(before.clone()),
+                (None, Some(kept)) => kept.clone(), // clone: a reference count
+                (None, None) => return Err(last),
             };
             let code_id = codes.binary_search_by_key(key, |it| it.0).ok().map(|at| codes[at].1);
             let candidate = kept.is_some_and(|it| dedupe::candidate(it, mergeable(key)));
@@ -216,11 +251,7 @@ impl Lists {
                 made_as: crate::Made { backend: node.spec.backend, origin: node.least_origin },
                 identity: node.subject(),
                 version: built.versions[at].clone(), // clone: per build kept by row
-                kept: kept.map(|it| match before {
-                    // clone: a function dedupe renamed, as it left it
-                    Some(_) => Arc::new(it.clone()),
-                    None => made.clone(), // clone: a reference count
-                }),
+                kept: kept.cloned(), // clone: a reference count
                 digest: digests::function_digest(node.unit.instance.code, &made.inlined),
                 made,
                 code_id,
@@ -297,6 +328,78 @@ impl Lists {
         if *held == 0 {
             self.items.remove(&item);
         }
+        // An item's first function or static, or its last: `Built::items` may be another
+        // list (a row made again takes its item out and puts it back).
+        if self.items.get(&item).is_none_or(|held| add && *held == 1) {
+            self.items_moved.push(item);
+        }
+    }
+
+    /// Whether these are the rows of `built`: it is the `Built` they last gave, by its ID.
+    pub(super) fn gave(&self, built: &Built) -> bool {
+        built.id == self.id
+    }
+
+    /// Takes back `built`, which these lists gave ([`Lists::gave`]).
+    pub(super) fn take_back(&mut self, built: Built) {
+        // alloc: once per build whose `Built` is given back, moved out of its reader's way
+        self.given = Some(Box::new(built));
+    }
+
+    /// Writes the row of the function `key` into `built`'s lists as it is now: every entry
+    /// of it set, or taken out where the row is gone (or says it has none of that entry).
+    fn write_function(&self, built: &mut Built, key: &InstanceKey) {
+        let row = self.functions.get(key);
+        // `versions` is by `inputs`' places.
+        match (built.inputs.binary_search_by_key(key, |it| it.0), row) {
+            (Ok(at), Some(row)) => {
+                built.inputs[at] = (*key, row.code);
+                built.versions[at] = row.version.clone(); // clone: a written row's
+            }
+            (Ok(at), None) => {
+                built.inputs.remove(at);
+                built.versions.remove(at);
+            }
+            (Err(at), Some(row)) => {
+                built.inputs.insert(at, (*key, row.code));
+                built.versions.insert(at, row.version.clone()); // clone: a written row's
+            }
+            (Err(_), None) => {}
+        }
+        // clone: a written row's name
+        set(&mut built.debug_names, key, |it| it.0, row.map(|row| (*key, row.name.clone())));
+        set(&mut built.digests.debug_names, key, |it| it.0, row.map(|row| (*key, row.name_digest)));
+        let symbol = row.and_then(|row| row.symbol.as_ref());
+        // clone: a written row's symbol
+        set(&mut built.symbols, key, |it| it.0, symbol.map(|(name, linkage)| (*key, name.clone(), *linkage)));
+        let flag = |list: &mut Vec<InstanceKey>, on: bool| set(list, key, |it| *it, on.then_some(*key));
+        flag(&mut built.patchable, row.is_some_and(|it| it.slotted));
+        flag(&mut built.tiered, row.is_some_and(|it| it.tiered));
+        flag(&mut built.editable, row.is_some_and(|it| it.editable));
+        flag(&mut built.cold, row.is_some_and(|it| it.cold));
+        set(&mut built.owners, key, |it| it.0, row.map(|row| (*key, row.owner, row.code)));
+        set(&mut built.made, key, |it| it.0, row.map(|row| (*key, row.made_as)));
+        set(&mut built.identities, key, |it| it.0, row.map(|row| (*key, row.identity)));
+        let kept = row.and_then(|row| row.kept.as_ref());
+        // clone: a reference count
+        set(&mut built.functions, key, |it| it.key, kept.cloned());
+        let digest = row.filter(|row| row.kept.is_some()).map(|row| (*key, row.digest));
+        set(&mut built.digests.functions, key, |it| it.0, digest);
+        set(&mut built.kernel, key, |it| it.instance, row.and_then(|row| row.kernel));
+    }
+
+    /// Writes the row of the static `id` into `built`'s lists as it is now, as
+    /// [`Lists::write_function`] does a function's.
+    fn write_static(&self, built: &mut Built, id: &StaticId) {
+        let row = self.statics.get(id);
+        // clone: a written static's definition
+        set(&mut built.statics, id, |it| (it.item, it.instance), row.map(|row| (*row.kept).clone()));
+        set(&mut built.digests.statics, id, |it| it.0, row.map(|row| (*id, row.digest)));
+        set(&mut built.static_owners, id, |it| (it.0, it.1), row.map(|row| (id.0, id.1, row.owner)));
+        let symbol = row.and_then(|row| row.symbol.as_ref());
+        // clone: a written static's symbol
+        let symbol = symbol.map(|(name, linkage)| (id.0, id.1, name.clone(), *linkage));
+        set(&mut built.static_symbols, id, |it| (it.0, it.1), symbol);
     }
 
     /// Takes the code ID of the row of `key` out of [`Self::ids`], where it is the one
@@ -506,6 +609,10 @@ impl<'a, B: Prepare> Build<'a, B> {
         };
         let hashed = lists.sets.hashed();
         let base = lists.id;
+        // The `Built` of the base, where its reader gave it back: taken whatever comes of
+        // this build, since a `Built` is of one ID.
+        let given = lists.given.take();
+        lists.items_moved.clear();
         let mut changes: Changes<InstanceKey> = Changes::default();
         let mut static_changes: Changes<StaticId> = Changes::default();
         // Whether a touched function is in a class dedupe merged, or is equal to a kept
@@ -780,7 +887,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             &reach_functions,
             &reach_statics,
         ) {
-            Ok(reach) => reach,
+            Ok(reach) => Arc::new(reach), // alloc: per build, the graph its `Built` shares
             Err(which) => {
                 let none = (InstanceKey(ContentId::default()), ItemKey(ContentId::default()));
                 // alloc: an error
@@ -794,7 +901,95 @@ impl<'a, B: Prepare> Build<'a, B> {
         };
         work.reach = reach_functions.len() + reach_statics.len();
 
-        // The `Built`: its contiguous lists, an entry copied a row.
+        // The `Built`. Where the base's was given back and no row but the touched ones
+        // changed (dedupe did not run whole), it is that one with the changed rows written
+        // into its lists: the rows this build removed and made again, and those the build
+        // before made again, whose template entries were that build's own and are the
+        // rows' now. A whole build's entries are all its own, so they are made again from
+        // the rows, once. The planted bug of a control leaves the rows the build removed.
+        let count = lists.functions.len();
+        let recycled = match (whole, given) {
+            (false, Some(mut built)) if built.id == base => {
+                // alloc: per build, the keys of the rows it writes: the edit's
+                let mut keys: Vec<InstanceKey> = Vec::with_capacity(
+                    touched.removed.len() + remade.len() + built.delta.functions.added.len(),
+                );
+                if self.planted != Some(Planted::StaleBuilt) {
+                    keys.extend(touched.removed.iter().copied());
+                }
+                keys.extend(remade.iter().map(|it| it.0));
+                keys.extend(built.delta.functions.added.iter().copied());
+                keys.extend(built.delta.functions.changed.iter().copied());
+                keys.sort_unstable();
+                keys.dedup();
+                if !built.work.patched {
+                    built.kernel.clear();
+                    built.kernel.extend(lists.functions.values().filter_map(|row| row.kernel));
+                    work.copied += count;
+                }
+                for key in &keys {
+                    lists.write_function(&mut built, key);
+                }
+                // alloc: per build, the statics it writes: the edit's
+                let mut ids: Vec<StaticId> =
+                    Vec::with_capacity(touched.removed_statics.len() + remade_statics.len());
+                ids.extend(touched.removed_statics.iter().copied());
+                ids.extend(remade_statics.iter().map(|it| it.0));
+                ids.sort_unstable();
+                ids.dedup();
+                for id in &ids {
+                    lists.write_static(&mut built, id);
+                }
+                for item in &lists.items_moved {
+                    let held = lists.items.contains_key(item).then_some(*item);
+                    set(&mut built.items, item, |it| *it, held);
+                }
+                if built.roots != roots {
+                    built.roots = roots.to_vec(); // clone: its roots' keys, where they moved
+                }
+                built.reach = lists.reach.clone(); // clone: a reference count
+                work.copied += keys.len() + ids.len();
+                Some(built)
+            }
+            _ => None,
+        };
+        let mut built = match recycled {
+            Some(built) => built,
+            None => {
+                work.copied = count + lists.statics.len();
+                // alloc: once per build, its `Built` moved out of the way of the lists
+                Box::new(lists.built_whole(roots))
+            }
+        };
+        // The touched functions' kernel entries are this build's, taken or made.
+        for entry in &kernel {
+            let at = built.kernel.partition_point(|it| it.instance < entry.instance);
+            match built.kernel.get_mut(at).filter(|it| it.instance == entry.instance) {
+                Some(held) => *held = *entry,
+                None => built.kernel.insert(at, *entry),
+            }
+        }
+        work.patched = true;
+        stats.instances = count;
+        stats.statics = lists.statics.len();
+        (built.puts, built.stats, built.memo_used, built.misses) = (puts, stats, used, misses);
+        built.id = lists.id;
+        built.delta = Delta { base: Some(base), functions: changes, statics: static_changes, fresh: None };
+        walk.dropped = built.delta.functions.removed.len();
+        (built.walk, built.work) = (walk, work);
+        finishing.record("replaced", work.replaced);
+        finishing.record("hashed", work.hashed);
+        finishing.record("copied", work.copied);
+        Patch::Built(built, lists)
+    }
+}
+
+impl Lists {
+    /// The lists of a `Built` made from the rows, an entry a row: what a build gives whose
+    /// base's `Built` was not given back ([`Lists::take_back`]), or whose dedupe ran whole.
+    /// Its counts, its ID and its delta are the build's to set.
+    fn built_whole(&self, roots: &[InstanceKey]) -> Built {
+        let lists = self;
         let count = lists.functions.len();
         let mut built = Built {
             roots: roots.to_vec(), // clone: per build, its roots' keys
@@ -840,8 +1035,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             built.identities.push((key, row.identity));
             built.versions.push(row.version.clone()); // clone: the view's copy
             if let Some(kept) = &row.kept {
-                // clone: the view's copy of a compiled function, its readers' contiguous list
-                built.functions.push((**kept).clone());
+                built.functions.push(kept.clone()); // clone: a reference count
                 built.digests.functions.push((key, row.digest));
             }
             built.kernel.extend(row.kernel);
@@ -854,31 +1048,10 @@ impl<'a, B: Prepare> Build<'a, B> {
                 built.static_symbols.push((id.0, id.1, symbol.clone(), *linkage)); // clone: the view's copy
             }
         }
-        // The touched functions' kernel entries are this build's, taken or made.
-        for entry in &kernel {
-            let at = built.kernel.partition_point(|it| it.instance < entry.instance);
-            match built.kernel.get_mut(at).filter(|it| it.instance == entry.instance) {
-                Some(held) => *held = *entry,
-                None => built.kernel.insert(at, *entry),
-            }
-        }
         built.items = lists.items.keys().copied().collect(); // alloc: per build, its items
-        built.reach = lists.reach.clone(); // clone: the view's copy of the graph
+        built.reach = lists.reach.clone(); // clone: a reference count
         // clone: the view's copy of what dedupe merged
         built.deduped = Deduped { merged: lists.merged.clone(), rounds: lists.rounds, bytes: lists.bytes };
-        work.copied = count + lists.statics.len();
-        work.patched = true;
-        stats.instances = count;
-        stats.statics = lists.statics.len();
-        (built.puts, built.stats, built.memo_used, built.misses) = (puts, stats, used, misses);
-        built.id = lists.id;
-        built.delta = Delta { base: Some(base), functions: changes, statics: static_changes, fresh: None };
-        walk.dropped = built.delta.functions.removed.len();
-        (built.walk, built.work) = (walk, work);
-        finishing.record("replaced", work.replaced);
-        finishing.record("hashed", work.hashed);
-        finishing.record("copied", work.copied);
-        // alloc: once per build, its `Built` moved out of the way of the lists
-        Patch::Built(Box::new(built), lists)
+        built
     }
 }
