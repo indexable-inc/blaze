@@ -1,0 +1,11 @@
+{
+ "id": "diagkey-8",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane diagkey-1111",
+ "where": "the base's blaze (3a58d0cbae) under the revisions' real driver",
+ "what": "`blaze why --all` of the builds of a revision case run on the base's blaze listed `BUG: a blaze bug: `settling` what a build left for the store was not kept after its answer was sent` (from `Jobs::lose` under `placing_failed`), once or twice a build. Seen in the failure output of the control run; a passing case prints nothing, so whether the lane's build says it too was not looked at.",
+ "cost": "none to this lane",
+ "cause": "not looked at",
+ "workaround": "none",
+ "state": "open"
+}

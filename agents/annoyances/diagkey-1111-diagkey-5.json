@@ -1,0 +1,11 @@
+{
+ "id": "diagkey-1111-diagkey-5",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane diagkey-1111",
+ "where": "the no-op lane on an ix VM",
+ "what": "On the lane's VM the no-op lane keeps no answer after most walks: each one looks at `/nix/store/...-glibc-.../lib/crtn.o` on the disk, and `blaze why --all` of the next build says `1 no-op answer: /nix/store/.../crtn.o, which no watch covers, so each build looks at it on the disk changed`. Seen on the base's blaze (its third build of an unchanged hello world) and on the lane's alike. A build with nothing changed is a walk there (0.06 to 0.5 s for hello world).",
+ "cost": "the lane's answer to a client shown diagnostics another way could be seen only in its simulation (`serve/job/noop/tests.rs`), not with a real daemon; and every `blaze why --all` of the after-measurement has that row",
+ "cause": "the linker's startup objects are under /nix/store, outside every watch",
+ "workaround": "none",
+ "state": "open"
+}
