@@ -39,13 +39,13 @@ struct Said {
 impl Shell for Said {
     fn status(&mut self, word: &str, rest: &str) {
         if !self.quiet {
-            eprint!("{}", say::status(word, rest, self.color));
+            blaze_report::err!("{}", say::status(word, rest, self.color));
         }
     }
 
     fn warn(&mut self, text: &str) {
         if !self.quiet {
-            eprint!("{}", say::warning(text, self.color));
+            blaze_report::err!("{}", say::warning(text, self.color));
         }
     }
 
@@ -53,12 +53,12 @@ impl Shell for Said {
         if !self.quiet {
             let mut out = String::with_capacity(text.len() + 24); // alloc: a note, said once
             say::note_into(&mut out, text, self.color);
-            eprint!("{out}");
+            blaze_report::err!("{out}");
         }
     }
 
     fn line(&mut self, text: &str) {
-        eprintln!("{text}");
+        blaze_report::errln!("{text}");
     }
 }
 
@@ -209,7 +209,7 @@ pub fn main(init: bool, words: Vec<OsString>, color: bool) -> i32 {
         Err(code) => return code,
     };
     let said_usage = || {
-        eprintln!("\nUsage: {usage}\n\nFor more information, try '--help'.");
+        blaze_report::errln!("\nUsage: {usage}\n\nFor more information, try '--help'.");
         Exit::Usage.code()
     };
     let asked = match asked(init, &read) {
@@ -221,15 +221,15 @@ pub fn main(init: bool, words: Vec<OsString>, color: bool) -> i32 {
                 invalid.flag,
                 invalid.possible.join(", ")
             );
-            eprint!("{}", say::error(&what, color));
+            blaze_report::err!("{}", say::error(&what, color));
             if let Some(similar) = similar(&invalid.value, invalid.possible) {
-                eprintln!("\n  tip: a similar value exists: '{similar}'");
+                blaze_report::errln!("\n  tip: a similar value exists: '{similar}'");
             }
             return said_usage();
         }
         Err(()) => {
             let what = "the following required arguments were not provided:\n  <PATH>";
-            eprint!("{}", say::error(what, color));
+            blaze_report::err!("{}", say::error(what, color));
             return said_usage();
         }
     };
@@ -237,7 +237,7 @@ pub fn main(init: bool, words: Vec<OsString>, color: bool) -> i32 {
         Ok(cwd) => cwd,
         Err(error) => {
             let what = format!("blaze {name}: the current directory: {error}");
-            eprint!("{}", say::error(&what, color));
+            blaze_report::err!("{}", say::error(&what, color));
             return Exit::Failed.code();
         }
     };
@@ -390,7 +390,7 @@ mod tests {
                 format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n"),
             );
             let source = std::fs::read_to_string(cwd.join(name).join("src/main.rs")).unwrap();
-            assert_eq!(source, "fn main() {\n    println!(\"Hello, world!\");\n}\n");
+            assert_eq!(source, "fn main() {\n    blaze_report::outln!(\"Hello, world!\");\n}\n");
         }
         let refused =
             asked(false, &read(&["--rust", "--edition", "blaze-2026.11", "x"])).unwrap().unwrap_err();

@@ -206,7 +206,7 @@ pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
     let (began, words) = match blaze_thin::handover::Began::take(words) {
         Ok(taken) => taken,
         Err(what) => {
-            eprint!("{}", say::error(&what, auto_color()));
+            blaze_report::err!("{}", say::error(&what, auto_color()));
             return ended(Exit::Usage.code());
         }
     };
@@ -234,7 +234,7 @@ pub fn main(args: impl Iterator<Item = OsString>) -> ExitCode {
         return crate::serve::main(words.into_iter().skip(1));
         #[cfg(not(feature = "native"))]
         {
-            eprint!("{}", say::error(&format!("blaze serve: {}", daemon::NO_DAEMON), auto_color()));
+            blaze_report::err!("{}", say::error(&format!("blaze serve: {}", daemon::NO_DAEMON), auto_color()));
             return ended(Exit::Failed.code());
         }
     }
@@ -254,12 +254,12 @@ fn cores() -> Result<(), i32> {
     let cores = match blaze_core::cores::get() {
         Ok(cores) => cores,
         Err(why) => {
-            eprint!("{}", say::error(&why.to_string(), auto_color()));
+            blaze_report::err!("{}", say::error(&why.to_string(), auto_color()));
             return Err(Exit::Usage.code());
         }
     };
     if let Err(why) = blaze_core::cores::lower(&cores) {
-        eprint!("{}", say::warning(&why.to_string(), auto_color()));
+        blaze_report::err!("{}", say::warning(&why.to_string(), auto_color()));
     }
     Ok(())
 }
@@ -418,14 +418,14 @@ fn command_began(words: Vec<OsString>, began: Option<blaze_thin::handover::Began
     let asked = match parsed {
         Ok(asked) => asked,
         Err(usage) => {
-            eprint!("{}", args::refusal(&usage, auto_color()));
+            blaze_report::err!("{}", args::refusal(&usage, auto_color()));
             return Exit::Usage.code();
         }
     };
     let said = |result: anyhow::Result<i32>| match result {
         Ok(code) => code,
         Err(error) => {
-            eprint!("{}", say::error(&format!("{error:#}"), auto_color()));
+            blaze_report::err!("{}", say::error(&format!("{error:#}"), auto_color()));
             Exit::Failed.code()
         }
     };
@@ -442,25 +442,25 @@ fn command_began(words: Vec<OsString>, began: Option<blaze_thin::handover::Began
             "`blaze {}` hands over a build or a run the thin `blaze` began, and what follows it is neither",
             blaze_thin::handover::WORD
         );
-        eprint!("{}", say::error(&what, auto_color()));
+        blaze_report::err!("{}", say::error(&what, auto_color()));
         return Exit::Usage.code();
     }
     match asked {
         Asked::Help(None) => {
-            print!("{HELP}");
+            blaze_report::out!("{HELP}");
             0
         }
         Asked::Help(Some(command)) => {
-            print!("{}", args::help(command));
+            blaze_report::out!("{}", args::help(command));
             0
         }
         Asked::Version => {
             // The release line, then which binary this is (`which.rs`).
-            print!("{}", which::version());
+            blaze_report::out!("{}", which::version());
             0
         }
         Asked::Unknown(name) => {
-            eprint!("{}", say::error(&no_such_command(&name), auto_color()));
+            blaze_report::err!("{}", say::error(&no_such_command(&name), auto_color()));
             Exit::Failed.code()
         }
         Asked::Stop => said(daemon::stop(&mut io::stderr().lock(), auto_color())),
@@ -472,7 +472,7 @@ fn command_began(words: Vec<OsString>, began: Option<blaze_thin::handover::Began
                 json,
             )),
             Err(what) => {
-                eprint!("{}", say::error(&what, auto_color()));
+                blaze_report::err!("{}", say::error(&what, auto_color()));
                 Exit::Usage.code()
             }
         },
@@ -480,7 +480,7 @@ fn command_began(words: Vec<OsString>, began: Option<blaze_thin::handover::Began
             let json = match json_flag("toolchain", words) {
                 Ok(json) => json,
                 Err(what) => {
-                    eprint!("{}", say::error(&what, auto_color()));
+                    blaze_report::err!("{}", say::error(&what, auto_color()));
                     return Exit::Usage.code();
                 }
             };
@@ -489,11 +489,11 @@ fn command_began(words: Vec<OsString>, began: Option<blaze_thin::handover::Began
                 false => Ok(format!("{chosen}\n")),
             }) {
                 Ok(text) => {
-                    print!("{text}");
+                    blaze_report::out!("{text}");
                     0
                 }
                 Err(what) => {
-                    eprint!("{}", say::error(&what, auto_color()));
+                    blaze_report::err!("{}", say::error(&what, auto_color()));
                     Exit::Failed.code()
                 }
             }
@@ -542,7 +542,7 @@ fn fmt(words: Vec<OsString>) -> i32 {
             Err(word) => {
                 let what =
                     format!("blaze fmt: the argument {} is not UTF-8", word.to_string_lossy());
-                eprint!("{}", say::error(&what, auto_color()));
+                blaze_report::err!("{}", say::error(&what, auto_color()));
                 return Exit::Usage.code();
             }
         }
@@ -631,7 +631,7 @@ fn prepared_cargo(asked: &Invocation, color: bool) -> Result<(Place, Cargo), Str
 fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 {
     let started = Instant::now();
     let refused = |what: &str, color: bool| {
-        eprint!("{}", say::error(what, color));
+        blaze_report::err!("{}", say::error(what, color));
         Exit::Failed.code()
     };
     // cargo's `cli::main`, then `GlobalContext::configure`, before the shell has its color.
@@ -641,7 +641,7 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
             return refused(what, auto_color());
         }
         if let Err(error) = std::env::set_current_dir(directory) {
-            eprint!(
+            blaze_report::err!(
                 "{}",
                 run::caused(
                     "could not change to requested directory",
@@ -883,11 +883,11 @@ fn replaced(place: &Place, pairs: &[String], color: bool) -> i32 {
                 files.len(),
                 files.join(", ")
             );
-            eprint!("{}", say::status("Replaced", &rest, color));
+            blaze_report::err!("{}", say::status("Replaced", &rest, color));
             0
         }
         Err(what) => {
-            eprint!("{}", say::error(&what, color));
+            blaze_report::err!("{}", say::error(&what, color));
             Exit::Failed.code()
         }
     }

@@ -25,7 +25,7 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
     match reach(words, color) {
         Ok(()) => 0,
         Err((what, code)) => {
-            eprint!("{}", say::error(&what, color));
+            blaze_report::err!("{}", say::error(&what, color));
             code
         }
     }
@@ -97,7 +97,7 @@ fn reach(words: Vec<OsString>, color: bool) -> Result<(), (String, i32)> {
         }
         false => lines(reached.as_ref(), now),
     };
-    print!("{text}");
+    blaze_report::out!("{text}");
     Ok(())
 }
 

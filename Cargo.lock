@@ -899,6 +899,7 @@ dependencies = [
  "blaze-mem",
  "blaze-query",
  "blaze-registry",
+ "blaze-report",
  "blaze-sha256",
  "blaze-thin",
  "blaze-units",

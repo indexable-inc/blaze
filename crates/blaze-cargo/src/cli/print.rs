@@ -157,6 +157,8 @@ pub struct Printer<'a, O: Write, S: Sink> {
     sources: json::Sources,
     /// The packages a status line was printed for: a bit for each package's index.
     packages: Vec<u64>,
+    /// Warnings of packages outside the checkout, counted and not drawn.
+    outside: u32,
     /// Warnings said that a fix exists for (`check --fix` makes them); 0 while fixing.
     fixable: u32,
     /// The first unit that said an error, as the build's last line names it, and its
@@ -207,6 +209,7 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
             packages: Vec::with_capacity(PACKAGES.div_ceil(64) * 16),
             failed: None,
             fixable: 0,
+            outside: 0,
             printed: HashedSet::with_capacity_in(DIAGNOSTICS, Global),
             built: None,
             work: None,
@@ -567,6 +570,18 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
             json::compiler_message(&mut self.line, unit, diagnostic, ansi, &mut self.sources);
             self.line.push('\n');
         }
+        // A warning of a package that is not the checkout's own (a registry or git package, a
+        // path dependency outside the workspace's root) is not the reader's to fix here: it is
+        // counted for the build's last line and not drawn, on every build it would otherwise
+        // repeat on. `-v` draws each; JSON carried it above; an error is always drawn.
+        if diagnostic.level == Level::Warning
+            && self.shown.verbose == 0
+            && let Some(unit) = diagnostic.unit
+            && !inside(unit.package_id, &self.root)
+        {
+            self.outside = self.outside.saturating_add(1);
+            return Ok(());
+        }
         // A diagnostic of no unit (a warning of the whole job) has no `compiler-message` to
         // carry it, so its text goes to stderr in every format, as cargo writes its own warnings
         // under `--message-format=json`; where the format renders, it is written there once.
@@ -697,6 +712,7 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
                 .collect(),
             unbuilt: u32::try_from(self.left).unwrap_or(u32::MAX),
             fixable: self.fixable,
+            dependency_warnings: self.outside,
             // What the build added to blaze's state: the daemon does not say yet.
             store_delta_bytes: None,
             store_bytes: None,
@@ -736,6 +752,15 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
         self.out.flush()?;
         self.err.draw()
     }
+}
+
+/// Whether the package `package_id` names (cargo's id: `path+file:///w/foo#0.1.0`,
+/// `registry+https://..#serde@1.0.0`) is the checkout's own: a path package at or under `root`.
+fn inside(package_id: &str, root: &str) -> bool {
+    let Some(path) = package_id.strip_prefix("path+file://") else { return false };
+    let path = path.split_once('#').map_or(path, |it| it.0);
+    let root = root.trim_end_matches('/');
+    path.strip_prefix(root).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// A build at least this long ends with a pointer to `blaze slow`.

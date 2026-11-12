@@ -272,10 +272,10 @@ fn say_started(log: &Path, pid: u32) {
     match tail(log) {
         Ok(bytes) => {
             for said in start_said(&String::from_utf8_lossy(&bytes), pid) {
-                eprintln!("blaze: the daemon it started (pid {pid}) {said}");
+                blaze_report::errln!("blaze: the daemon it started (pid {pid}) {said}");
             }
         }
-        Err(error) => eprintln!(
+        Err(error) => blaze_report::errln!(
             "blaze: how the daemon it started (pid {pid}) started is unread: {}: {error}",
             log.display()
         ),
@@ -415,7 +415,7 @@ fn this_build(mut client: Client, socket: &Path) -> anyhow::Result<Option<Client
             named(&ours)
         );
     }
-    eprintln!(
+    blaze_report::errln!(
         "blaze: the daemon at {} (pid {pid}) is another build of blaze ({}), not this one ({}): stopping it and \
          starting this one",
         socket.display(),
@@ -476,13 +476,13 @@ fn say_start(socket: &Path, refused: &ClientError) -> anyhow::Result<()> {
                 blaze_api::units::main_file(&place).display()
             );
         }
-        Installed::Elsewhere(theirs) => eprintln!(
+        Installed::Elsewhere(theirs) => blaze_report::errln!(
             "blaze: starting the daemon for {}: the installed units serve {} (`blaze daemon install` with this \
              environment serves this one)",
             socket.display(),
             theirs.display()
         ),
-        Installed::No => eprintln!(
+        Installed::No => blaze_report::errln!(
             "blaze: starting the daemon (no socket activation is installed: `blaze daemon install` has the system \
              start it on demand)"
         ),
@@ -675,8 +675,8 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
         Err(error) => Some(error),
     };
     match &refused {
-        Some(refused) => eprintln!("blaze: starting the daemon ({refused})"),
-        None => eprintln!("blaze: starting the daemon"),
+        Some(refused) => blaze_report::errln!("blaze: starting the daemon ({refused})"),
+        None => blaze_report::errln!("blaze: starting the daemon"),
     }
     let (log, mut child) = started()?;
     let pid = child.id();

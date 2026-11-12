@@ -35,7 +35,7 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
     match run(words) {
         Ok(()) => 0,
         Err((code, what)) => {
-            eprint!("{}", say::error(&what, color));
+            blaze_report::err!("{}", say::error(&what, color));
             code
         }
     }
@@ -167,7 +167,7 @@ fn record(words: &[String]) -> Result<(), Refused> {
         .map_err(|why| failed(format!("recording {}: {why}", files[0].display())))?;
     let dir = history_dir()?;
     rows::write(&dir, &row, &functions).map_err(failed)?;
-    println!(
+    blaze_report::outln!(
         "recorded run {}: {}, {} rep{}, {} samples ({} in code no map names), {} function rows",
         row.run,
         row.target,
@@ -178,10 +178,10 @@ fn record(words: &[String]) -> Result<(), Refused> {
         functions.len()
     );
     for gap in row.gaps.iter().flat_map(|it| it.split("; ")) {
-        println!("  gap: {gap}");
+        blaze_report::outln!("  gap: {gap}");
     }
     if !perf.is_dir() {
-        println!(
+        blaze_report::outln!(
             "  {} does not exist: links write code maps only while it does; make it and build again to name functions \
              by identity",
             perf.display()
@@ -200,19 +200,19 @@ fn runs(words: &[String]) -> Result<(), Refused> {
     if json {
         let text =
             serde_json::to_string_pretty(&runs).map_err(|error| failed(error.to_string()))?;
-        println!("{text}");
+        blaze_report::outln!("{text}");
         return Ok(());
     }
     if runs.is_empty() {
-        println!("no runs recorded: `blaze perf record FILE.ixprof...` records one");
+        blaze_report::outln!("no runs recorded: `blaze perf record FILE.ixprof...` records one");
         return Ok(());
     }
-    println!(
+    blaze_report::outln!(
         "{:<16}  {:>19}  {:>4}  {:>9}  {:<12}  target",
         "run", "started (unix s)", "reps", "samples", "tree"
     );
     for it in &runs {
-        println!(
+        blaze_report::outln!(
             "{:<16}  {:>19}  {:>4}  {:>9}  {:<12}  {}{}",
             it.run,
             it.started_unix_ns / 1_000_000_000,
@@ -265,9 +265,9 @@ fn compare(words: &[String]) -> Result<(), Refused> {
     if json {
         let text =
             serde_json::to_string_pretty(&diff).map_err(|error| failed(error.to_string()))?;
-        println!("{text}");
+        blaze_report::outln!("{text}");
     } else {
-        print!("{}", diff::render(&diff, all));
+        blaze_report::out!("{}", diff::render(&diff, all));
     }
     Ok(())
 }

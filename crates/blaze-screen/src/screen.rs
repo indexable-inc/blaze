@@ -923,6 +923,15 @@ impl Screen {
                 text::count(u64::from(self.warnings), "warning", "warnings"),
             );
         }
+        if built.dependency_warnings > 0 {
+            line.push(
+                Role::Dim,
+                format!(
+                    " {dot} {} in dependencies",
+                    text::count(u64::from(built.dependency_warnings), "warning", "warnings")
+                ),
+            ); // alloc: as above
+        }
         if let Some(next) = &built.next {
             line.push(Role::Dim, format!(" {dot} ")); // alloc: as above
             line.push(Role::Command, next.clone()); // clone: as above
@@ -1056,6 +1065,9 @@ impl Screen {
             "blaze: ok built={} cached={} warnings={} elapsed_ms={took}",
             built.compiled, built.cached, self.warnings
         ); // alloc: the build's line, once
+        if built.dependency_warnings > 0 {
+            line.push_str(&format!(" dependency_warnings={}", built.dependency_warnings)); // alloc: as above
+        }
         if let Some(tier) = &built.tier {
             line.push_str(&format!(" tier={}", text::value(tier))); // alloc: as above
         }

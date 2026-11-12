@@ -62,6 +62,8 @@ fn quiet_keys() {
     #[cfg(unix)]
     if let Some(saved) = crate::raw::system::stderr_echo_off() {
         let _ = ECHOED.set(saved);
+        // A command ended because its stdout's reader is gone still gives the echo back.
+        blaze_report::out::before_end(echo_keys);
     }
 }
 

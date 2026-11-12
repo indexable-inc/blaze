@@ -83,7 +83,7 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
         match word.to_str() {
             Some("--json") => json = true,
             _ => {
-                eprint!(
+                blaze_report::err!(
                     "{}",
                     say::error(&format!("{USAGE}, not `{}`", word.to_string_lossy()), color)
                 );
@@ -94,7 +94,7 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
     let state = match crate::serve::state() {
         Ok(state) => state,
         Err(error) => {
-            eprint!("{}", say::error(&format!("`blaze doctor`: {error:#}"), color));
+            blaze_report::err!("{}", say::error(&format!("`blaze doctor`: {error:#}"), color));
             return Exit::Failed.code();
         }
     };
@@ -109,7 +109,7 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
                 line
             }
             Err(error) => {
-                eprint!(
+                blaze_report::err!(
                     "{}",
                     say::error(&format!("`blaze doctor`'s report as JSON: {error}"), color)
                 );
@@ -118,7 +118,7 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
         },
         false => text(&report),
     };
-    print!("{said}");
+    blaze_report::out!("{said}");
     match report.ok {
         true => 0,
         false => Exit::Failed.code(),

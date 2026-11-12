@@ -83,6 +83,9 @@ pub struct Built {
     pub next: Option<String>,
     /// Warnings a fix exists for, which `blaze check --fix` makes.
     pub fixable: u32,
+    /// Warnings of packages that are not the checkout's own (a registry package, a path
+    /// dependency outside the workspace): counted, not drawn, and never among `fixable`.
+    pub dependency_warnings: u32,
     /// The bytes this build added to blaze's state (store, build directory, image) and the
     /// total, as the daemon counts what it wrote (never a walk of the home); and the free
     /// space of the volume they are on.

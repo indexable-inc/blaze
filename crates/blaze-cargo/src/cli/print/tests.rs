@@ -640,3 +640,25 @@ fn a_units_report_names_what_it_blocks() {
     let line = out.lines().find(|it| it.starts_with("{\"reason\":\"blaze-report\"")).expect(&out);
     assert!(line.contains("\"all\":[\"app\",\"cli\"]") && line.contains("\"count\":2"), "{line}");
 }
+
+/// A warning of a package that is not the checkout's own (a path dependency outside the
+/// workspace's root, a registry package) is counted on the build's line and not drawn; `-v`
+/// draws it; and it is never among the warnings `check --fix` is hinted for.
+#[test]
+fn a_warning_of_a_package_outside_the_checkout_is_counted_and_not_drawn() {
+    let outside =
+        UnitOf { package_id: "path+file:///elsewhere/bstd#0.1.0".to_owned(), ..lib_of("bar") };
+    let responses = [
+        Response::Diagnostic(diagnostic(Level::Warning, "unused variable: `x`", UNUSED, Some(outside))),
+        built(),
+        Response::Done { ok: true },
+    ];
+    let (_, err) = printed(Shown::default(), &responses, true);
+    assert_eq!(err, "blaze: ok built=0 cached=0 warnings=0 elapsed_ms=0 dependency_warnings=1\n");
+    let (_, verbose) = printed(Shown { verbose: 1, ..Shown::default() }, &responses, true);
+    assert!(verbose.contains(UNUSED), "{verbose}");
+    assert!(inside("path+file:///w/foo#0.1.0", "/w"));
+    assert!(inside("path+file:///w#0.1.0", "/w/"));
+    assert!(!inside("path+file:///work/foo#0.1.0", "/w"));
+    assert!(!inside("registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0", "/w"));
+}

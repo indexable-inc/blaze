@@ -1,0 +1,43 @@
+# std's `println!`, `print!`, `eprintln!` and `eprint!` left, a crate a line: each panics when its
+# stream's reader is gone. A command's path writes with `blaze_report::outln!` and its kin
+# (`blaze_report::out`). `tests/prints.rs` holds each crate to its number: it only goes down.
+blaze-alloc-count 1
+blaze-bench 4
+blaze-cargo 100
+blaze-ci 7
+blaze-client 3
+blaze-codegen-code 9
+blaze-core 8
+blaze-diagnostics 1
+blaze-doc 2
+blaze-explore 10
+blaze-fmt 42
+blaze-gc 1
+blaze-global 1
+blaze-graph 5
+blaze-hash 5
+blaze-inproc 3
+blaze-lazy 1
+blaze-link 1
+blaze-lints 17
+blaze-macro-eval 2
+blaze-mem 1
+blaze-metadata 1
+blaze-new 1
+blaze-profile 4
+blaze-registry 13
+blaze-resolve 1
+blaze-script 3
+blaze-seed-run 5
+blaze-usercode 11
+blaze-v2-proof 11
+blaze-vfs 1
+hir-def 4
+hir-ty 5
+hir-ty-borrowck 11
+hir-ty-mir 3
+ix-prof 10
+proc-macro-api 1
+stdx 4
+syntax 3
+test-utils 8

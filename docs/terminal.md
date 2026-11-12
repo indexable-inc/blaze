@@ -149,6 +149,16 @@ blaze: ok built=1 cached=31 warnings=0 elapsed_ms=703 tier="tier 0 · 0% optimiz
 blaze: failed errors=1 warnings=0 unbuilt=0 elapsed_ms=15 unit="hello (bin)" next="blaze explain hello"
 ```
 
+A warning of a package that is not the checkout's own (a registry or git package, a path
+dependency outside the workspace's root) is not drawn, on a terminal or off one: it is counted
+(`· 36 warnings in dependencies`, `dependency_warnings=36`), `-v` draws each, JSON carries
+each, and none is among the warnings `blaze check --fix` is hinted for.
+
+Everything a command writes to stdout and stderr outside the screen goes through one writer
+(`blaze_report::out`: `outln!`, `out!`, `errln!`, `err!`). A reader that closes the pipe
+(`blaze --version | head -1`) ends the command quietly with status 141, where std's `println!`
+panics; `crates/blaze-report/tests/prints.txt` counts std's macros left, a crate a row.
+
 `progress` every 10 s of a build under way, never sooner; the diagnostics as before; one `ok`
 or `failed` line always (and `blaze: hint fixable=2 run="blaze check --fix"` when warnings
 have a fix), `key=value` with a value quoted when it is not one word. No start

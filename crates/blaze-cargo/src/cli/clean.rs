@@ -125,7 +125,7 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
         return super::cache::main(&asked, color);
     }
     let refused = |what: &str, code: i32| {
-        eprint!("{}", say::error(what, color));
+        blaze_report::err!("{}", say::error(what, color));
         code
     };
     let asked = match parse(words) {
@@ -189,7 +189,7 @@ fn workspace(asked: &Asked, color: bool) -> Result<(), String> {
     for dir in &dirs {
         removed.add(remove(dir, &at)?);
     }
-    eprint!("{}", removed.said(asked.dry_run, color));
+    blaze_report::err!("{}", removed.said(asked.dry_run, color));
     Ok(())
 }
 
@@ -209,7 +209,7 @@ fn all(dry_run: bool, color: bool) -> Result<(), String> {
             Err(why) => _ = writeln!(refused, "  {why}"),
         }
     }
-    eprint!("{}", removed.said(dry_run, color));
+    blaze_report::err!("{}", removed.said(dry_run, color));
     match refused.is_empty() {
         true => Ok(()),
         false => Err(format!("blaze clean --all left some directories:\n{refused}")),
@@ -249,7 +249,7 @@ fn list() -> Result<(), String> {
             dir.display()
         );
     }
-    print!("{out}");
+    blaze_report::out!("{out}");
     Ok(())
 }
 
@@ -527,7 +527,7 @@ fn remove(dir: &Path, at: &Removing<'_>) -> Result<Tally, String> {
         None => {
             // What an earlier clean of it left, killed mid-removal (review N6).
             for why in sweep_leftovers(parent, &name) {
-                eprintln!("blaze clean: {why}");
+                blaze_report::errln!("blaze clean: {why}");
             }
             // Beside it, on its own file system: the rename is atomic, and nothing else is named so.
             let to = parent.join(format!(".{name}{REMOVING}{}-{now:020}", std::process::id()));

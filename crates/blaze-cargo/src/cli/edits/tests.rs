@@ -11,7 +11,7 @@ fn search<T: Copy>(of: [T; 2]) -> T { of[0] }
 
 fn main() {
     let found = search([1, 2]);
-    println!(\"{found}\");
+    blaze_report::outln!(\"{found}\");
 }
 ";
 

@@ -36,7 +36,7 @@ const USAGE_TEXT: &str = "blaze gc [--dry-run | --kept] | blaze gc --last | blaz
 /// `blaze cache`, with the words after it.
 pub fn main(words: &[OsString], color: bool) -> i32 {
     let refused = |what: &str, code: i32| {
-        eprint!("{}", say::error(what, color));
+        blaze_report::err!("{}", say::error(what, color));
         code
     };
     let words: Option<Vec<&str>> = words.iter().map(|it| it.to_str()).collect();
@@ -56,7 +56,7 @@ pub fn main(words: &[OsString], color: bool) -> i32 {
     };
     match done {
         Ok(out) => {
-            print!("{out}");
+            blaze_report::out!("{out}");
             0
         }
         Err(what) => refused(&what, Exit::Failed.code()),

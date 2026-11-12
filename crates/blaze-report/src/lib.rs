@@ -46,6 +46,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod out;
 pub mod palette;
 mod render;
 pub mod rules;

@@ -93,8 +93,8 @@ pub fn warn_if_other(color: bool) {
     })();
     match asked {
         Ok(None) => {}
-        Ok(Some(line)) => eprint!("{}", super::say::warning(&line, color)),
-        Err(error) => eprint!(
+        Ok(Some(line)) => blaze_report::err!("{}", super::say::warning(&line, color)),
+        Err(error) => blaze_report::err!(
             "{}",
             super::say::warning(&format!("which blaze the daemon is was not learned: {error:#}"), color)
         ),
