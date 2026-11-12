@@ -1356,10 +1356,44 @@ fn request_id(work: &Work) -> Option<ContentId> {
         Work::Check(targets) => ("check", targets),
         _ => return None,
     };
+    // How its client is shown diagnostics is no part of it ([`drawn_id`]).
+    // clone: the request's targets less how they are drawn, once a build or check
+    let mut undrawn_targets = targets.clone();
+    if let Some(cargo) = &mut undrawn_targets.cargo {
+        (cargo.color, cargo.width, cargo.refused) = (false, None, None);
+        cargo.args = undrawn(&cargo.args);
+    }
     // alloc: the request's encoding, once a build or check
-    let encoded = blaze_protocol::cbor::to_vec(targets)
+    let encoded = blaze_protocol::cbor::to_vec(&undrawn_targets)
         .expect("a request's targets are plain data, which CBOR encodes");
     Some(Hasher::new("blaze v2 serve no-op request").part(word.as_bytes()).part(&encoded).finish())
+}
+
+/// The hash of how `work`'s client is shown diagnostics ([`Inputs::drawn`]): whether in
+/// colour, their width, how many refused functions are named, and each word of its command
+/// line that says only that ([`DRAWN_FLAGS`]: `--message-format`, `--color`).
+fn drawn_id(work: &Work) -> ContentId {
+    let mut hasher = Hasher::new("blaze v2 serve no-op drawn");
+    let Some(cargo) = targets_of(work).and_then(|it| it.cargo.as_ref()) else {
+        return hasher.finish();
+    };
+    hasher.update(&[u8::from(cargo.color)]);
+    hasher.update(&cargo.width.map_or(0, |it| u64::from(it) + 1).to_le_bytes());
+    hasher.update(&cargo.refused.map_or(0, |it| u64::from(it) + 1).to_le_bytes());
+    let kept = undrawn(&cargo.args);
+    let mut kept = kept.iter().peekable();
+    for arg in &cargo.args {
+        // The words `undrawn` left out, in order: every word it kept is met in order too.
+        match kept.peek() {
+            Some(next) if *next == arg => {
+                kept.next();
+            }
+            _ => {
+                hasher.part(arg.as_bytes());
+            }
+        }
+    }
+    hasher.finish()
 }
 
 /// The hash of a view's config, by its encoding ([`Inputs::config_id`]).
@@ -3958,7 +3992,7 @@ impl<S: Steps> Jobs<S> {
         };
         let Viewed { root_dir, root, config, encoded, key } =
             Self::viewed(&self.setup, &mut self.roots, w, &job.work, &opened, library);
-        let request = request_id(&job.work);
+        let (request, drawn) = (request_id(&job.work), drawn_id(&job.work));
         // A blaze that keys as another toolchain (`BLAZE_DEV_TOOLCHAIN_AS`) says so before
         // anything else of each build or check, and refuses one whose outputs may be shipped.
         if request.is_some()
@@ -3989,6 +4023,7 @@ impl<S: Steps> Jobs<S> {
                     config_id: config_id(&encoded),
                     config: Arc::clone(&config), // clone: a refcount, once per view
                     request,
+                    drawn,
                 };
                 self.record_answer(id, at, key, inputs);
                 // A walk that may be kept holds its view's files, opened here in constant
@@ -4077,6 +4112,7 @@ impl<S: Steps> Jobs<S> {
             config_id: config_id(&encoded),
             config: Arc::new(config), // alloc: once a request, kept with a walk's recording
             request,
+            drawn: drawn_id(work),
         };
         drop(keying);
         // The files that differ from the kept answer's view, where the root is another.

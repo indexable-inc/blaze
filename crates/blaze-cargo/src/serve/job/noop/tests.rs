@@ -121,13 +121,14 @@ impl World {
     }
 
     /// What the build's outputs are made from: every input a build reads, and none it does
-    /// not (`shlvl`; the source's comment, for a unit keyed by code text).
+    /// not (`shlvl`; the source's comment, for a unit keyed by code text; how the client is
+    /// shown diagnostics, `color`).
     fn made_from(&self) -> String {
         let listed = if self.lists { self.listed } else { 0 };
         // A lint that reads comments reads this one.
         let read = if self.narrow { 0 } else { self.comment };
         format!(
-            "source {} read {read} input {} lock {} header {} listed {listed} cc {} features {} release {} color {} dep {} layout {}",
+            "source {} read {read} input {} lock {} header {} listed {listed} cc {} features {} release {} dep {} layout {}",
             self.source,
             self.held_comment,
             self.lock,
@@ -135,20 +136,24 @@ impl World {
             self.cc,
             self.features,
             self.release,
-            self.color,
             self.dep,
             self.layout,
         )
     }
 
     /// What a walk of every unit says of this state, with nothing to make: what its outputs
-    /// are made from and, when it warns, the source's line as it is now, comment and all,
-    /// under the file's name.
+    /// are made from and, when it warns, its warning ([`World::warning`]).
     fn answer(&self) -> String {
         match self.warns {
-            true => format!("{}\n --> {SOURCE} | code // {}", self.made_from(), self.comment),
+            true => format!("{}\n{}", self.made_from(), self.warning()),
             false => self.made_from(),
         }
+    }
+
+    /// The build's warning as its client is shown it: the source's line as it is now, comment
+    /// and all, under the file's name, drawn in the client's colour.
+    fn warning(&self) -> String {
+        format!(" --> {SOURCE} | code // {} color {}", self.comment, self.color)
     }
 
     /// The checkout's files as a view holds them: what its root is of.
@@ -322,9 +327,16 @@ fn said(text: &str) -> Response {
     })
 }
 
+/// What a build says of what its outputs are made from: no diagnostic, and drawn for no
+/// client.
+fn built(text: &str) -> Response {
+    Response::Built { members: 1, profile: text.to_owned(), artifacts: Vec::new() }
+}
+
 fn text_of(responses: &[Response]) -> String {
     let texts = responses.iter().map(|it| match it {
         Response::Diagnostic(diagnostic) => diagnostic.rendered.as_str(),
+        Response::Built { profile, .. } => profile.as_str(),
         _ => "a response the model never says",
     });
     texts.collect::<Vec<_>>().join("\n")
@@ -415,7 +427,8 @@ impl Daemon {
             view: id(&format!("view {:?}", world.files())),
             config: Arc::new(config),
             config_id,
-            request: id(&format!("request {}", world.color)),
+            request: id("request"),
+            drawn: id(&format!("drawn {}", world.color)),
         }
     }
 
@@ -541,7 +554,7 @@ impl Daemon {
         if world.lists {
             self.looks += 1;
         }
-        let (answer, made_from) = (world.answer(), world.made_from());
+        let made_from = world.made_from();
         let profile = usize::from(world.release);
         // The build script: run again when its traced input moved, which makes something;
         // else reused, its `OUT_DIR` written again only when it is not in place as this
@@ -571,8 +584,14 @@ impl Daemon {
         }
         if let Some(mut recording) = recording {
             // A build that makes something says so, which one with nothing to do does not.
-            let text = if made_nothing { answer } else { format!("{answer}\nCompiling") };
-            recording.hear(&said(&text));
+            // What its outputs are made from is said to every client alike; its warning is a
+            // diagnostic, drawn for this one.
+            let state = world.made_from();
+            let state = if made_nothing { state } else { format!("{state}\nCompiling") };
+            recording.hear(&built(&state));
+            if world.warns {
+                recording.hear(&said(&world.warning()));
+            }
             self.last = recording.end(Walk {
                 passed: true,
                 made_nothing,
@@ -767,7 +786,24 @@ fn the_oracle_catches_a_lane_that_ignores_the_features_and_the_profile() {
 #[test]
 fn the_oracle_catches_a_lane_that_ignores_how_the_request_is_rendered() {
     let ops = kept_then(&[Op::Edit(Input::Color), BUILD]);
-    assert!(caught(plain(), &ops, Bug::Lane(Plant::IgnoresRequest)).contains("said again"));
+    let warns = World { warns: true, ..plain() };
+    assert!(caught(warns, &ops, Bug::Lane(Plant::IgnoresRequest)).contains("said again"));
+}
+
+/// How a client is shown diagnostics is no input of what is built, and of an answer only its
+/// diagnostics are drawn with it: a build that said none is answered again for a client
+/// shown them another way (a terminal of another width, in colour), and one that warned
+/// walks, which draws its warning for that client.
+#[test]
+fn an_answer_with_no_diagnostic_is_said_again_to_a_client_shown_them_another_way() {
+    let ops = kept_then(&[Op::Edit(Input::Color), BUILD, Op::Edit(Input::Color), BUILD]);
+    let same = kept_then(&[BUILD, BUILD]);
+    let quiet = runs(plain(), &ops, None).unwrap();
+    assert_eq!(quiet, runs(plain(), &same, None).unwrap(), "every build after the kept one");
+    assert_eq!(quiet, 3);
+    let warns = World { warns: true, ..plain() };
+    assert_eq!(runs(warns.clone(), &same, None).unwrap(), 3);
+    assert_eq!(runs(warns, &ops, None).unwrap(), 1, "each one draws the warning again");
 }
 
 #[test]
@@ -889,7 +925,7 @@ fn a_refusal_names_the_input() {
     now.source = 1;
     now.cc = 0;
     now.color = true;
-    assert_eq!(daemon.inputs(&was).moved(&daemon.inputs(&now)), Some(Moved::Rendering));
+    assert_eq!(daemon.inputs(&was).moved(&daemon.inputs(&now)), Some(Moved::Drawing));
     now.color = false;
     now.release = true;
     assert_eq!(daemon.inputs(&was).moved(&daemon.inputs(&now)), Some(Moved::Args));
