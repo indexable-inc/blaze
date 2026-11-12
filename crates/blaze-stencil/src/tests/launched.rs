@@ -523,11 +523,14 @@ fn tier_zero_code_runs_in_the_launcher_compiled_on_first_call_and_edited_while_i
         let stop = Arc::clone(&stop);
         move || -> Result<(u64, u64), String> {
             let me = birth.begin();
-            let (mut old, mut new) = (0u64, 0u64);
+            // `twice` calls `leaf` twice: both old (12), the edit landing between them
+            // (6 + 105, at most once), or both new (210); never old after new.
+            let (mut old, mut straddled, mut new) = (0u64, 0u64, 0u64);
             while !stop.load(Ordering::Relaxed) || new < 3 {
                 match twice(5) {
-                    12 if new == 0 => old += 1,
-                    12 => return Err("the old body ran after the new one".to_owned()),
+                    12 if straddled + new == 0 => old += 1,
+                    111 if straddled + new == 0 => straddled += 1,
+                    12 | 111 => return Err("the old body ran after the new one".to_owned()),
                     210 => new += 1,
                     other => return Err(format!("twice(5) was {other}")),
                 }
@@ -538,7 +541,7 @@ fn tier_zero_code_runs_in_the_launcher_compiled_on_first_call_and_edited_while_i
     });
     leaf_k.store(100, Ordering::SeqCst);
     let end = std::time::Instant::now() + PATIENCE;
-    while twice(5) != 210 {
+    while unary(LEAF)(5) != 105 {
         assert!(std::time::Instant::now() < end, "the edit did not land within {PATIENCE:?}");
         std::thread::yield_now();
     }
