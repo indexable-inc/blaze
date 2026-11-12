@@ -13,7 +13,7 @@ use blaze_format::Aligned;
 use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher};
 use blaze_query::QueryKind;
-use blaze_query::db::{Durability, Setter};
+use blaze_query::db::{Database as _, Durability, SealNotWhole, Setter};
 use hir_def::{
     AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, ImplId, StaticId, StructId,
     TraitId, TypeAliasId, UnionId,
@@ -995,4 +995,63 @@ fn a_step_the_store_refuses_keeps_no_other_step_out() {
     key.value(&value);
     let at = record::answer_at(Step::Infer, &key.finish());
     assert!(store.get(&at).unwrap().is_some(), "the other step's answer is kept");
+}
+
+/// `main`'s bodies inferred in a fresh database over a store that holds them all, under
+/// `mode`, with the hits of `left_out` not told to the engine (the planted bug): what the
+/// engine then says of `main`'s seal group, whose rows the inferences are
+/// (`Storage::seal_group_whole`).
+fn mains_group_after_hits(mode: Mode, left_out: Option<Step>) -> Result<(), SealNotWhole> {
+    let (memory, defs, _) = stored(Mode::Serve);
+    let mut fresh = session(second(FIXTURE), &memory, &defs, None, mode);
+    super::UNREPORTED.with(|it| it.set(left_out));
+    reset_ran();
+    for name in BODIES {
+        let def = function(&fresh.db, name);
+        let _ = InferenceResult::of(&fresh.db, def);
+    }
+    super::UNREPORTED.with(|it| it.set(None));
+    let hits = only(Step::Infer, StepCounts { hits: BODIES.len() as u64, ..StepCounts::default() });
+    assert_eq!(fresh.installed.steps(), hits, "every body's inference was found in the store");
+    let group = crate_named(&fresh.db, "main")
+        .seal_group_of(&fresh.db)
+        .expect("a crate is given its seal group as it is made");
+    fresh.db.storage_mut().seal_group_whole(group)
+}
+
+/// The invariant: a row whose value the item store answered is told to the engine as such,
+/// each one, so a list of what its crate's rows read is never taken for every read their
+/// values rest on: after every body of `main` is found in the store, `main`'s group is not
+/// whole, by exactly as many rows as there were hits, none emptied and none untracked. What
+/// those rows did read is their record's key: the body's identity and each fact of its
+/// shape, worked out in the hit (`Store::answer_key_now`), which is what a unit's read parts
+/// take of them.
+#[test]
+fn every_row_answered_from_the_store_is_told_to_the_engine() {
+    assert_eq!(
+        mains_group_after_hits(Mode::Serve, None),
+        Err(SealNotWhole { stored: BODIES.len() as u64, emptied: 0, untracked: 0 })
+    );
+    assert_eq!(ran(), 0, "none was inferred");
+}
+
+/// Under `Mode::Verify` a hit runs the step as well, in its own query and by its own reads:
+/// no row is told as answered from the store, and the group is whole.
+#[test]
+fn a_verified_hit_ran_by_its_own_reads_and_is_not_told() {
+    assert_eq!(mains_group_after_hits(Mode::Verify, None), Ok(()));
+    assert_eq!(ran(), BODIES.len() as u32, "each was inferred as well");
+}
+
+/// The control (test-the-cause): with the hit site's report left out for the step, the
+/// same hits leave `main`'s group reading as whole, which is the wrong answer the count of
+/// `every_row_answered_from_the_store_is_told_to_the_engine` fails on; left out for another
+/// step, which made no hit here, nothing changes.
+#[test]
+fn the_count_catches_a_hit_site_that_does_not_tell_the_engine() {
+    assert_eq!(mains_group_after_hits(Mode::Serve, Some(Step::Infer)), Ok(()));
+    assert_eq!(
+        mains_group_after_hits(Mode::Serve, Some(Step::Mir)),
+        Err(SealNotWhole { stored: BODIES.len() as u64, emptied: 0, untracked: 0 })
+    );
 }

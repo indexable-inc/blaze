@@ -5,8 +5,10 @@
 //! - The crate ([`crate_inputs`]): its root file's path, edition, origin, crate attributes,
 //!   target kind and crate types, the directory its proc macros run in, version, display name,
 //!   potential cfg, cfg (features are cfg), env, and the workspace's target, toolchain and
-//!   const-eval budget ([`base_db::CrateWorkspaceData::content`]); each dependency as its key,
-//!   its name and whether it is a prelude, sysroot or private dependency. Each of
+//!   const-eval budget ([`base_db::CrateWorkspaceData::content`]); each dependency as its
+//!   surface where the lowering gave it one ([`super::given::surface`]: what a front end
+//!   above may read of it and of the crates below it), else as its key; its name and whether
+//!   it is a prelude, sysroot or private dependency. Each of
 //!   [`base_db::BuiltCrateData`]'s and [`ExtraCrateData`]'s fields is named where it is hashed,
 //!   so a field added to either does not build until the key covers it. One is named and left
 //!   out on purpose: `manifest_kind`, the kind of the manifest target a `--test` crate is built
@@ -63,8 +65,9 @@ use crate::{
     nameres::frozen,
 };
 
-/// The domain of an image key.
-pub const KEY_DOMAIN: &str = "blaze v2 dependency image key 6";
+/// The domain of an image key. 7: a dependency enters by its surface where the lowering gave
+/// it one ([`super::given::surface`]), in place of its key.
+pub const KEY_DOMAIN: &str = "blaze v2 dependency image key 7";
 
 /// What makes the images: the version of each encoding in them, so an image of another
 /// encoding is never found.
@@ -132,10 +135,24 @@ pub(crate) fn image_key(db: &Db, krate: Crate, build: ContentId) -> Option<Conte
     let mut deps = Vec::with_capacity(data.dependencies.len());
     // Every dependency is asked, eligible or not: a dependency that becomes eligible, or
     // stops being, is a read of this key.
+    //
+    // What the key holds of a dependency is its surface where the lowering gave it one
+    // ([`super::given::surface`], a tracked read of the dependency's own slot): the digest of
+    // everything this crate's front end may read of it and of the crates below it (its
+    // tokens outside the bodies no other crate's front end reads, its macros' definitions
+    // with where they are, its settings, its `OUT_DIR` files; a crate that runs at compile
+    // time, a proc macro, by its code). A body edit or a moved line in the dependency then
+    // leaves this key as it was: the dependency's key moved, this run was asked again, and
+    // it gives the key it gave before, so nothing above runs (docs/v2/plan/design/store.md,
+    // "Early cutoff between crates"). A dependency with no surface (a front end no driver
+    // lowered: this crate's own tests) enters by its key, which covers its every byte.
     for dep in &data.dependencies {
         let key = image_key(db, dep.crate_id, build);
         eligible &= key.is_some();
-        deps.push(key.unwrap_or_default());
+        deps.push(match super::given::surface(db, dep.crate_id) {
+            Some(surface) => surface,
+            None => key.unwrap_or_default(),
+        });
     }
     eligible.then(|| key(db, krate, build, &deps))
 }
@@ -610,6 +627,129 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         at = start + 1;
     }
     None
+}
+
+/// Why a crate has no image key ([`why_not_eligible`]): the rule of [`eligible`] that
+/// refused it and the crate the rule was met at.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ineligible {
+    /// The crate is a workspace member.
+    Local,
+    /// The crate is a proc-macro crate whose library's content ID is not known.
+    LibraryNotKnown,
+    /// A crate it depends on, directly or through others, is `on`, a workspace member.
+    AboveLocal { on: Crate },
+    /// A crate it depends on, directly or through others, is `on`, a proc-macro crate whose
+    /// library's content ID is not known.
+    AboveLibraryNotKnown { on: Crate },
+}
+
+impl Ineligible {
+    /// The reason's kind, for a count by kind: one word, the same for every crate.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Ineligible::Local => "workspace member",
+            Ineligible::LibraryNotKnown => "proc macro library not known",
+            Ineligible::AboveLocal { .. } => "above a workspace member",
+            Ineligible::AboveLibraryNotKnown { .. } => "above a proc macro whose library is not known",
+        }
+    }
+
+    /// The crate the rule was met at, when it is not the crate asked about.
+    pub fn on(self) -> Option<Crate> {
+        match self {
+            Ineligible::Local | Ineligible::LibraryNotKnown => None,
+            Ineligible::AboveLocal { on } | Ineligible::AboveLibraryNotKnown { on } => Some(on),
+        }
+    }
+}
+
+/// Why `krate` is not [`eligible`], or `None` when it is: its own reason first, else that of
+/// the first dependency, in the crate's order and depth first, that has one. The same walk as
+/// [`eligible`], so `why_not_eligible(db, k).is_none() == eligible(db, k)` (tested), kept
+/// apart from it so the serve's hot path carries no reason. For the driver's report of the
+/// crates it did not ask an image for: on reth's restart 318 of about 1,100 crates were
+/// asked and nothing said why the rest were not (lane reth-1112, build 43).
+pub fn why_not_eligible(db: &Db, krate: Crate) -> Option<Ineligible> {
+    fn of(
+        db: &Db,
+        krate: Crate,
+        memo: &mut HashMap<Crate, Option<Ineligible>, Global>,
+    ) -> Option<Ineligible> {
+        if let Some(&known) = memo.get(&krate) {
+            return known;
+        }
+        let data = krate.data(db);
+        let mut why = if data.origin.is_local() {
+            Some(Ineligible::Local)
+        } else if !libraries_known(db, krate) {
+            Some(Ineligible::LibraryNotKnown)
+        } else {
+            None
+        };
+        for dep in &data.dependencies {
+            let below = of(db, dep.crate_id, memo);
+            if why.is_none() {
+                why = below.map(|below| match below {
+                    Ineligible::Local => Ineligible::AboveLocal { on: dep.crate_id },
+                    Ineligible::LibraryNotKnown => {
+                        Ineligible::AboveLibraryNotKnown { on: dep.crate_id }
+                    }
+                    above @ (Ineligible::AboveLocal { .. }
+                    | Ineligible::AboveLibraryNotKnown { .. }) => above,
+                });
+            }
+        }
+        memo.insert(krate, why);
+        why
+    }
+    of(db, krate, &mut HashMap::new_in(Global))
+}
+
+/// The markers of a key ([`Base`]) for a crate that is in no database yet: what a lowering
+/// writes a crate's plan key with (`blaze_lower`'s `found`), so a plan key and an image key
+/// write one path one way and neither holds a path of the machine.
+pub struct PlanBase(Base);
+
+impl PlanBase {
+    /// Of a crate whose package directory is `dir`, whose `OUT_DIR` is `out`, and whose
+    /// variables' values are `values`: as [`Base::of`] makes one of the crate once it is in a
+    /// database with `CARGO_MANIFEST_DIR = dir`, `OUT_DIR = out` and those variables.
+    pub fn new<'v>(dir: Option<&str>, out: Option<&str>, values: impl Iterator<Item = &'v str>) -> PlanBase {
+        let trimmed = |it: &str| -> Option<String> {
+            let it = it.trim_end_matches(['/', '\\']);
+            // alloc: setup: once per crate per lowering
+            (!it.is_empty()).then(|| it.to_owned())
+        };
+        // alloc: setup, as above
+        let mut base = Base { dir: dir.and_then(trimmed), out: out.and_then(trimmed), others: Vec::new() };
+        for value in values {
+            if base.marked(value.as_bytes()).is_none() && absolute(value) {
+                base.others.push(value.to_owned()); // alloc: setup, as above
+            }
+        }
+        base.others.sort_unstable();
+        base.others.dedup();
+        PlanBase(base)
+    }
+
+    /// Hashes a path with the package directory and `OUT_DIR` in it written as their markers.
+    pub fn path(&self, hasher: &mut Hasher, path: &str) {
+        self.0.part(hasher, path);
+    }
+
+    /// Hashes a variable's value: as [`PlanBase::path`], or as the one marker of any other
+    /// absolute path.
+    pub fn value(&self, hasher: &mut Hasher, value: &str) {
+        self.0.value(hasher, value);
+    }
+
+    /// Whether `text`, written with the markers, still holds an absolute path: one the key
+    /// would carry as it is on this machine.
+    pub fn holds_machine_path(&self, text: &str) -> bool {
+        let portable = self.0.portable(text);
+        std::str::from_utf8(&portable).is_ok_and(absolute)
+    }
 }
 
 #[cfg(test)]

@@ -1984,6 +1984,9 @@ fn filed_under<'g>(
         let first = failed.take();
         failed.set(first.or(Some((*key, error))));
     };
+    // Lane packs-1112: what is fetched on a miss goes to the daemon's own store, so nothing
+    // is asked on behalf of the shared std store.
+    let _reading = crate::serve::packs::reading(std);
     let at = reads::find(
         base,
         &job.input.config.invocation.env,
@@ -1991,6 +1994,14 @@ fn filed_under<'g>(
         |env, shape| job.input.macros.keeps().reads_now(env, shape),
         |path| base_db::IncludedFile::content_now(std::path::Path::new(path)),
         |slot| match store.get(guard, slot) {
+            // Lane packs-1112: a slot not kept is asked of the packs, then read again.
+            Ok(None) if crate::serve::packs::missed(slot) => match store.get(guard, slot) {
+                Ok(it) => it.map(|it| it.bytes),
+                Err(error) => {
+                    fail(slot, error);
+                    None
+                }
+            },
             Ok(it) => it.map(|it| it.bytes),
             Err(error) => {
                 fail(slot, error);
@@ -2040,14 +2051,24 @@ fn found<'g>(
     guard: &'g blaze_cas::Guard,
     key: &Key,
 ) -> Result<Option<(blaze_cas::Entry<'g>, usize)>, blaze_cas::Corrupt> {
-    let Some(entry) = store.get(guard, key)? else { return Ok(None) };
+    // Lane packs-1112: a record not kept is asked of the packs, then read again; so is each
+    // output it names (`has`, below).
+    let entry = match store.get(guard, key)? {
+        Some(entry) => entry,
+        None if crate::serve::packs::missed(key) => match store.get(guard, key)? {
+            Some(entry) => entry,
+            None => return Ok(None),
+        },
+        None => return Ok(None),
+    };
     let mut disk = blaze_usercode::inputs::Disk::new(Vec::new());
     let mut on_disk = machine_file(&mut disk);
     let mut file = |path: &std::path::Path| {
         let real = places.real(path.as_os_str().as_encoded_bytes()).ok()?;
         on_disk(std::path::Path::new(std::str::from_utf8(&real).ok()?))
     };
-    let body = header::check(entry.bytes, |key| store.has(guard, key), &mut file);
+    let has = |key: &Key| store.has(guard, key) || crate::serve::packs::missed(key);
+    let body = header::check(entry.bytes, has, &mut file);
     Ok(body.map(|body| (entry, body)))
 }
 
@@ -2169,6 +2190,25 @@ fn kept(job: &Job, unit: usize) -> Result<Option<Kept>, ApiError> {
         }
     }
     Ok(None)
+}
+
+/// Lane packs-1112: every unit's record keys and the first slot under each, for the packs'
+/// one batched ask of the peers (`crate::serve::packs::asked`): made by the first unit of a
+/// job that misses its record, empty for the units after it (what was asked is remembered
+/// there by key).
+fn pack_keys(job: &Job) -> Vec<Key> {
+    if !crate::serve::packs::first_ask_of(std::ptr::from_ref(job) as usize) {
+        return Vec::new(); // alloc: empty, allocates nothing
+    }
+    let mut keys = Vec::new(); // alloc: once a job that missed a record with packs configured
+    for unit in 0..job.graph.len() {
+        let Ok(bases) = record_keys(job, unit) else { continue };
+        for base in bases.into_iter().flatten() {
+            keys.push(base);
+            keys.push(reads::slot(base, 0));
+        }
+    }
+    keys
 }
 
 /// The record of a standard library unit, and of bstd, with the slot of what it read and
@@ -2615,6 +2655,16 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
         let _span = tracing::info_span!("unit record lookup").entered();
         kept(job, unit)?
     };
+    // Lane packs-1112, the miss hook: the unit's record is not in the store, and before the
+    // unit is built the packs and peers the settings name are asked for each key the lookup
+    // misses (`crate::serve::packs`); what they have is checked, put, and found by the same
+    // lookup run again. Nothing is asked when no settings name a source.
+    let kept = match kept {
+        None if crate::serve::packs::configured() => {
+            crate::serve::packs::asked(&pack_keys(job), || self::kept(job, unit))?
+        }
+        other => other,
+    };
     // A launcher's program is replayed only where the daemon holds the code of the very
     // build its record is of; else it is built ([`super::run::launch::not_replayed`]).
     let kept = match kept {
@@ -2984,8 +3034,9 @@ fn generate(
         let generated = codegen::generate(job, reader, unit, krate, &makes, &job.mounted, checks);
         (makes, generated)
     });
-    // Its build may have stopped for the cancel, with an error that is not the unit's.
-    if job.cancelled() {
+    // Its build may have stopped for the cancel, or to give memory back (`Job::gives_way`,
+    // set until the release it is for has run), with an error that is not the unit's.
+    if job.cancelled() || job.gives_way.load(std::sync::atomic::Ordering::Acquire) {
         return Err(Failed::Again);
     }
     lock(slot).generated = Some(generated);

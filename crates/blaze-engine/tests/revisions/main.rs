@@ -65,12 +65,15 @@ real! {
     a_changed_trait_impl_remakes_what_resolves_to_it
     a_cold_build_without_lock_files_then_a_build_writes_nothing
     a_comment_edit_remakes_nothing
+    a_copied_store_in_a_new_home_resolves_nothing
     a_dependency_edit_reaches_only_what_uses_it
     a_feature_flip_follows_the_cfg
     a_generic_body_edit_reaches_its_instance
     a_line_added_below_makes_nothing_above_it
     a_panic_under_the_launcher_names_its_frames
     a_renamed_function_keeps_its_code
+    a_restart_then_an_edit_in_one_crate_resolves_that_crate_only
+    a_restart_with_nothing_changed_resolves_nothing
     a_save_by_rename_is_read_whole
     a_save_is_built_before_it_is_asked_for
     a_second_project_reuses_the_standard_library

@@ -210,7 +210,14 @@ impl Store {
     fn lookup<'db>(&self, interner: DbInterner<'db>, goal: Goal<'db>) -> Option<Found> {
         let (answer, reads) =
             blaze_query::db::capture_reads(interner.db, || self.find(interner, goal));
-        Some(Found { answer: answer?, reads })
+        let answer = answer?;
+        // A goal's answer taken from the store, in the query that asked it: that query's own
+        // reads are then the answer's key (the facts checked above), not the reads of solving
+        // the goal. Told to the engine after the capture, so it marks the query's own run and
+        // not the capture's (`report_stored_read`; the item store's hit site is
+        // `body_store::Store::lookup`).
+        blaze_query::db::report_stored_read(interner.db);
+        Some(Found { answer, reads })
     }
 
     fn find<'db>(&self, interner: DbInterner<'db>, goal: Goal<'db>) -> Option<Answer> {

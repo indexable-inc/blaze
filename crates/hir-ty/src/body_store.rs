@@ -55,6 +55,7 @@ pub(crate) use infer::inference;
 #[cfg(test)]
 use infer::lookup_inference;
 pub(crate) use mir::built as built_mir;
+pub(crate) use mir::{NONE as NO_PLACE, in_body, kind_code};
 pub use mir::location_literals;
 pub use value::step_value;
 
@@ -107,6 +108,24 @@ fn what(step: Step) -> &'static str {
         Step::Mir => "MIR",
         Step::Borrowck => "borrow check",
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The planted bug of the hit report's test: the step whose hits are not told to the
+    /// engine ([`Store::lookup`]), as a hit site left out would be.
+    pub(crate) static UNREPORTED: Cell<Option<Step>> = const { Cell::new(None) };
+}
+
+/// Whether a test planted `step` as [`UNREPORTED`]: never, outside a test.
+#[cfg(test)]
+fn unreported(step: Step) -> bool {
+    UNREPORTED.with(|it| it.get() == Some(step))
+}
+
+#[cfg(not(test))]
+fn unreported(_step: Step) -> bool {
+    false
 }
 
 /// What [`lookup`] found of a body's step.
@@ -188,7 +207,21 @@ impl Store {
                 match record::open_answer(found.bytes(), &answer_key)
                     .and_then(|body| decode(&*self.facts, body))
                 {
-                    Ok(value) => Lookup::Hit { value, verify: self.mode == Mode::Verify },
+                    Ok(value) => {
+                        let verify = self.mode == Mode::Verify;
+                        // The one hit site of the three steps. The running query's value is
+                        // the record's, found by a key that stands for the reads of the run
+                        // that made it: the row is told so (`report_stored_read`), and a list
+                        // of what its crate's rows read (`Storage::seal_group_whole`, a
+                        // unit's read parts) knows this row's own reads are the key's (the
+                        // identity and each fact of the shape, read just above), not the
+                        // step's. Under `Mode::Verify` the step runs as well, in this
+                        // query, by its own reads: nothing to tell.
+                        if !verify && !unreported(step) {
+                            blaze_query::db::report_stored_read(db);
+                        }
+                        Lookup::Hit { value, verify }
+                    }
                     Err(why) => {
                         self.fail(format_args!(
                             "the stored {} of {def:?} (answer {answer_key:x}): {why}",

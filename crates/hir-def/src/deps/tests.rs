@@ -248,6 +248,14 @@ fn only_crates_outside_the_workspace_are_eligible() {
     assert!(eligible(&db, crate_named(&db, "lib")));
     assert!(eligible(&db, crate_named(&db, "core")));
     assert!(!eligible(&db, crate_named(&db, "main")));
+    // The reason is the rule `eligible` refused by, for every crate: none exactly when
+    // eligible.
+    for krate in all(&db) {
+        assert_eq!(super::why_not_eligible(&db, krate).is_none(), eligible(&db, krate), "{}", krate.named(&db));
+    }
+    let why = super::why_not_eligible(&db, crate_named(&db, "main"));
+    assert_eq!(why, Some(super::Ineligible::Local));
+    assert_eq!(why.map(super::Ineligible::kind), Some("workspace member"));
     let keys = keys(&db, &all(&db), BUILD);
     assert_eq!(names(&db, &keys.keys().copied().collect::<Vec<_>>()), ["core", "lib"]);
 }
@@ -329,6 +337,13 @@ fn a_library_on_a_member_is_not_eligible() {
     )
     .into_db();
     assert!(!eligible(&db, crate_named(&db, "lib")));
+    let member = crate_named(&db, "member");
+    assert_eq!(
+        super::why_not_eligible(&db, crate_named(&db, "lib")),
+        Some(super::Ineligible::AboveLocal { on: member }),
+        "the reason names the member it is above"
+    );
+    assert_eq!(super::why_not_eligible(&db, member), Some(super::Ineligible::Local));
 }
 
 fn key_of(fixture: &str, name: &str, build: ContentId) -> ContentId {
@@ -427,6 +442,64 @@ fn every_dependency_is_stored_and_served() {
     let again = store(&db, &served, &memory).unwrap();
     assert_eq!((again.written.len(), again.refused.len()), (0, 0));
     assert_eq!(frozen::differences(), Vec::<String>::new());
+}
+
+/// Every key `store` wrote into `memory` for the crates of `served` and `stored` that is
+/// neither one of a written crate's front keys ([`front_keys`] of the key its image is filed
+/// under) nor one of a keyed crate's filing keys ([`filing_keys`] of its own key).
+fn keys_outside_the_lists(memory: &Memory, served: &Served, stored: &Stored) -> Vec<ContentId> {
+    let mut listed: std::collections::BTreeSet<ContentId> = std::collections::BTreeSet::new();
+    for filed in stored.filed.values() {
+        listed.extend(front_keys(*filed));
+    }
+    for key in served.keys.values() {
+        listed.extend(filing_keys(*key));
+    }
+    let mut outside: Vec<ContentId> =
+        memory.images.lock().keys().copied().filter(|key| !listed.contains(key)).collect();
+    outside.sort_unstable();
+    outside
+}
+
+/// The invariant: every record `store` writes for a crate is under a key the lists give
+/// ([`front_keys`], [`filing_keys`]), with reads and without: what pins a crate's front end
+/// and what a pack of it carries are taken from those lists, so a record kind written and
+/// left out of them would be collected under a pinned crate and missing from its pack.
+#[test]
+fn every_key_store_writes_is_a_front_key_or_a_filing_key() {
+    let _turn = TURN.lock();
+    VALUE.store(0, SeqCst);
+    for mut db in [fixture::db(FIXTURE).into_db(), reading_db()] {
+        let memory = Memory::default();
+        let crates = all(&db);
+        let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+        let stored = store(&db, &served, &memory).unwrap();
+        assert!(!stored.written.is_empty(), "the fixture stores no crate: the test tests nothing");
+        assert_eq!(keys_outside_the_lists(&memory, &served, &stored), Vec::new());
+    }
+}
+
+/// The control: a record kind `store` writes that the list leaves out is found. Here the
+/// list is the real one less the def map pages' key, as a lane that added pages and forgot
+/// the list would have left it.
+#[test]
+fn the_oracle_catches_a_key_store_writes_that_the_list_leaves_out() {
+    let _turn = TURN.lock();
+    let mut db = fixture::db(FIXTURE).into_db();
+    let memory = Memory::default();
+    let crates = all(&db);
+    let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    let stored = store(&db, &served, &memory).unwrap();
+    let mut listed: std::collections::BTreeSet<ContentId> = std::collections::BTreeSet::new();
+    for filed in stored.filed.values() {
+        listed.extend(front_keys(*filed).filter(|key| *key != pages_key(*filed)));
+    }
+    for key in served.keys.values() {
+        listed.extend(filing_keys(*key));
+    }
+    let outside = memory.images.lock().keys().filter(|key| !listed.contains(*key)).count();
+    assert!(outside >= 1, "no key of def map pages was found outside the shortened list");
+    assert!(outside <= stored.written.len(), "{outside} keys outside it: more than a crate's pages each");
 }
 
 /// The key `store` says each image is filed under is the one `serve` then gives it, with reads
@@ -1927,4 +2000,35 @@ fn a_frozen_def_map_read_against_a_moved_file_stops_the_query_with_an_error_nami
         text.contains("`lib`") && text.contains("deep.rs") && text.contains("refused"),
         "{text}"
     );
+}
+
+/// The invariant: a dependency enters the key of a crate above it by its surface where the
+/// lowering gave it one ([`super::given::set_surface`]), so an edit of the dependency that
+/// leaves its surface as it was moves the dependency's own key and not the key above, and a
+/// surface that moved moves the key above. The control, first (the cause removed): with no
+/// surface given the same kind of edit moves both, the dependency then entering by its key.
+#[test]
+fn a_dependency_enters_the_key_above_it_by_its_surface_where_it_was_given_one() {
+    let text = chain(2);
+    let fixture = fixture::db(&text);
+    let inner = fixture.file_at("/lib1.rs").file_id(fixture.db());
+    let mut db = fixture.into_db();
+    let (above, below) = (crate_named(&db, "lib0"), crate_named(&db, "lib1"));
+    let key = |db: &TestDB, krate: Crate| keys(db, &[krate], BUILD)[&krate];
+
+    let (was_above, was_below) = (key(&db, above), key(&db, below));
+    db.set_file_text(inner, "pub fn f1() { let _ = 1; }\n");
+    assert_ne!(key(&db, below), was_below, "a crate's own key covers its bytes");
+    assert_ne!(key(&db, above), was_above, "with no surface given, the key above covers them too");
+
+    let surface = ContentId([3; 32]);
+    super::given::set_surface(&mut db, below, surface, blaze_query::db::Durability::LOW);
+    assert_eq!(super::given::surface(&db, below), Some(surface));
+    let (with_above, with_below) = (key(&db, above), key(&db, below));
+    db.set_file_text(inner, "pub fn f1() { let _ = 2; }\n");
+    assert_ne!(key(&db, below), with_below, "its own key still covers its bytes");
+    assert_eq!(key(&db, above), with_above, "the key above holds the surface, which stands");
+
+    super::given::set_surface(&mut db, below, ContentId([4; 32]), blaze_query::db::Durability::LOW);
+    assert_ne!(key(&db, above), with_above, "a surface that moved moves the key above");
 }
