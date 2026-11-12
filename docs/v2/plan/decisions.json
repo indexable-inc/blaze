@@ -200,6 +200,14 @@
    "why": "bstd uses blaze-only syntax and features (core::reflect, blaze_comptime, for const), so rustc rejects it and a crate on it cannot be checked or tested with cargo; blaze-hub and blaze-launch were written on bstd and could not be verified. Andrew, 2026-11-11: \"your decision is fine\".",
    "recommended": "Yes, as an interim; the alternative was to block new crates on making bstd build under rustc.",
    "state": "in force; blaze-launch is being ported, blaze-hub is next"
+  },
+  {
+   "id": "D26",
+   "date": "2026-11-11",
+   "decision": "State of the art first: design the end state and build it directly, its independent pieces in parallel lanes, then prove it on tempo and reth and in the head-to-head; rule sota-first, and rule agents-are-a-cost no longer caps lanes at four.",
+   "why": "Andrew, 2026-11-11: \"don't do things incrementally, go for SOTA right away and do things in parallel, and then try to get tempo to work\".",
+   "recommended": "Yes.",
+   "state": "done: rules changed; a lane on tempo and reth started"
   }
  ]
 }

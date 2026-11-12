@@ -111,10 +111,13 @@ See [docs/v2/plan/design/tasks.md](../../../docs/v2/plan/design/tasks.md).
 
 ## agents-are-a-cost (rule 48)
 
-An agent costs its whole context, and its report loses detail both ways. The coordinator does small
-pieces, reads and deletions itself. Start a worker only for a piece that is independent of the
-others and large enough to pay for its brief; four workers at once is a lot. Never start a fleet to
-read or summarise.
+An agent costs its whole context, and its report loses detail both ways, so the coordinator does
+small pieces, reads and deletions itself and never starts a fleet to read or summarise. But work
+that splits into independent, large pieces is done in parallel, all of it at once (`sota-first`):
+one lane per piece, each with its own worktree and a brief that states its outcome and check, as
+many as the work has independent pieces and the machines can build. What bounds the number is
+independence (two lanes in one file cost more than they save) and the coordinator's ability to merge
+and verify what comes back, not a fixed count.
 
 See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
 

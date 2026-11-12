@@ -127,8 +127,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 47. **every-agent-has-a-task**: Every agent is started on one task (an objective id or a named piece of
     one) that says its outcome and its check; people follow tasks, not agents. Skill:
     `build-and-test`.
-48. **agents-are-a-cost**: Use the fewest agents that do the work: a worker only for a piece that is
-    independent and large enough to pay for its context; four is a lot. Skill: `build-and-test`.
+48. **agents-are-a-cost**: Run every independent, large piece of the work at once, each in its own lane;
+    never an agent for a piece that is small, dependent on another, or only reading. Skill:
+    `build-and-test`.
 49. **docs-stay-small**: Keep docs few and short: the plan, the ledger, the bounds and one spec per
     unbuilt design; no lane notes, pass reports or indexes; delete a doc when it stops being true or
     needed. Skill: `docs-and-scripts`.
@@ -172,6 +173,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 61. **claims-from-evidence**: State as fact only what a tool call in this session showed (a query's
     rows, a command's output, the code read); anything else is said as a guess or as not measured,
     never as a cause, a number or a status. Skill: `debugging`.
+62. **sota-first**: Go for the state of the art right away: design the end state and build it directly,
+    all its independent pieces in parallel, not a step-by-step climb through halfway versions; then
+    prove it on the real targets. Skill: `changing-code`.
 
 ## Code Review Rules
 

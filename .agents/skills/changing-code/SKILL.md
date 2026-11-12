@@ -105,4 +105,19 @@ wrong one (`best-long-term-design`); if it is large, say so, start it, and give 
 in the change what the unease was and what cause was removed, so the next reader does not rediscover
 it.
 
+## sota-first (rule 62)
+
+When something is behind the state of the art, do not improve it a notch at a time. Work out what
+the best known design is (read the competitor's code, the literature, the profile), decide the end
+state, and build that end state directly: split it into its independent pieces and run them at once
+in parallel lanes (`agents-are-a-cost`), merge them into one tree, verify, measure. An intermediate
+version is built only where the end state cannot be reached without it or where it is itself the
+measurement that decides the design; it is never the plan. Incremental polishing of a design that is
+known to be the wrong shape is waste: replace the shape. Then prove the result where it counts, in
+this order: the real target projects build and pass their own tests under blaze (tempoxyz/tempo and
+paradigmxyz/reth first, `verify-on-real-projects`), and the head-to-head against the best competitor
+on the same machine is won on every row (`incremental-first` says which rows come first). A change
+is not finished at "the micro-benchmark improved"; it is finished when the real targets work and the
+comparison is won, or when what still blocks that is written down with its evidence.
+
 <!-- End of the generated rules. Hand-written notes follow. -->
