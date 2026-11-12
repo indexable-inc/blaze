@@ -878,7 +878,7 @@ fn is_local_trait(cx: &Cx<'_, '_>, trait_: hir::Trait) -> bool {
 fn has_impls(cx: &Cx<'_, '_>, trait_: hir::Trait) -> bool {
     let id = hir_def::TraitId::from(trait_);
     let module = hir_def::ModuleId::from(trait_.module(cx.db));
-    sees(TraitImpls::for_crate(cx.db, cx.krate.into()), id)
+    sees(TraitImpls::for_crate_and_trait(cx.db, cx.krate.into(), id), id)
         || module
             .block(cx.db)
             .and_then(|it| TraitImpls::for_block(cx.db, it))

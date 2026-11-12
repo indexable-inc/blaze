@@ -2299,14 +2299,21 @@ impl<'db> Interner for DbInterner<'db> {
             // This is only for diagnostics and normally ty vars should be handled by the callers.
             TyKind::Infer(InferTy::TyVar(_)) => {
                 let mut seen: smallvec::SmallVec<[AnyImplId; 8]> = smallvec::SmallVec::new();
-                TraitImpls::for_each_crate_and_block(self.db, krate, trait_block, &mut |impls| {
+                // The blocks' tables, then each loaded crate's table of this trait alone (as
+                // `TraitImpls::for_each_crate_and_block` orders them): never a crate's whole
+                // table, which for a crate read from impl table pages is the whole record.
+                let mut visit = |impls: &TraitImpls<'_>| {
                     impls.for_trait_non_blanket(trait_def_id.0, |run| match run {
                         Either::Left(run) => seen.extend(run.iter().map(|&it| AnyImplId::from(it))),
                         Either::Right(run) => {
                             seen.extend(run.iter().map(|&it| AnyImplId::from(it)))
                         }
                     });
-                });
+                };
+                TraitImpls::for_each_block(self.db, trait_block, &mut visit);
+                for &dep in crate::method_resolution::loaded_crates(self.db, krate) {
+                    visit(TraitImpls::for_crate_and_trait(self.db, dep, trait_def_id.0));
+                }
                 // The impls of a block are among those of its crate as well as its own.
                 let mut visited: smallvec::SmallVec<[AnyImplId; 8]> = smallvec::SmallVec::new();
                 for impl_ in seen {

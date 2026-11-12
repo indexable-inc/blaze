@@ -3054,7 +3054,8 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                         };
 
                         for &impl_ in
-                            TraitImpls::for_crate(self.db, self.krate).blanket_impls(trait_)
+                            TraitImpls::for_crate_and_trait(self.db, self.krate, trait_)
+                                .blanket_impls(trait_)
                         {
                             if impl_ == def {
                                 continue;

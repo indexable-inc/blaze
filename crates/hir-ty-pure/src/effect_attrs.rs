@@ -730,7 +730,13 @@ pub fn crate_rows(db: &Db, krate: Crate) -> CrateRows {
             At::Methods(ty, names) => {
                 if let Some(ModuleDefId::AdtId(adt)) = item(db, root, ty, true) {
                     let self_ty = SimplifiedType::Adt(SolverDefId::AdtId(adt));
-                    for &imp in InherentImpls::for_crate(db, krate).for_self_ty(&self_ty) {
+                    // The type's inherent impls alone, not the crate's whole table.
+                    let impls = InherentImpls::in_crate_for_self_ty(
+                        db,
+                        krate,
+                        hir_ty::method_resolution::SelfTyKey(self_ty),
+                    );
+                    for &imp in impls {
                         for (method, assoc) in imp.impl_items(db).items.iter() {
                             if let hir_def::AssocItemId::FunctionId(func) = *assoc
                                 && names.contains(&method.symbol().as_str())

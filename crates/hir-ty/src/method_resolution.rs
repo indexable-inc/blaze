@@ -2189,6 +2189,27 @@ impl<'db> InherentImpls<'db> {
         self.self_tys.self_tys.iter().enumerate().map(|(i, self_ty)| (self_ty, self.impls.run(i)))
     }
 
+    /// The inherent impls for `self_ty` of `block` and the blocks around it, then of `krate`,
+    /// each run given to `for_each`: what [`Self::for_each_crate_and_block`] gives a caller
+    /// that asks every table for one type, through the readers of one type, so a crate read
+    /// from impl table pages reads the type's entry and not its whole table.
+    pub fn for_self_ty_in_crate_and_block(
+        db: &'db Db,
+        krate: Crate,
+        block: Option<BlockIdLt<'db>>,
+        self_ty: &SimplifiedType<'db>,
+        for_each: &mut impl FnMut(&[ImplId]),
+    ) {
+        let blocks = std::iter::successors(block, |block| block.module(db).block(db));
+        for block in blocks {
+            let found = Self::in_block_for_self_ty(db, block, SelfTyKey(*self_ty));
+            if !found.is_empty() {
+                for_each(found);
+            }
+        }
+        for_each(Self::in_crate_for_self_ty(db, krate, SelfTyKey(*self_ty)));
+    }
+
     pub fn for_each_crate_and_block(
         db: &'db Db,
         krate: Crate,
@@ -2581,6 +2602,24 @@ impl<'db> TraitImpls<'db> {
             frozen::blanket(db, krate, trait_, |it| builder.push_blanket(t, it));
             builder.finish()
         })
+    }
+
+    /// The blanket impls of `trait_` in `krate` alone, each given to `each` in the order they
+    /// were found: the trait's entry of a crate read from impl table pages, the trait's
+    /// table ([`Self::for_crate_and_trait`]) of one that is not. Never the crate's whole table.
+    pub fn each_blanket_in_crate(
+        db: &'db Db,
+        krate: Crate,
+        trait_: TraitId,
+        mut each: impl FnMut(ImplId),
+    ) {
+        if frozen::served(db, krate) {
+            frozen::blanket(db, krate, trait_, each);
+            return;
+        }
+        for &it in Self::for_crate_and_trait(db, krate, trait_).blanket_impls(trait_) {
+            each(it);
+        }
     }
 
     fn collect_def_map(db: &'db Db, frame: &Frame, def_map: &DefMap) -> Self {

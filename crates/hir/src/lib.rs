@@ -4060,11 +4060,12 @@ impl Impl {
             extend_with_impls(Either::Left(impls))
         });
         if let Some(module) = method_resolution::simplified_type_module(db, &simplified_ty) {
-            InherentImpls::for_each_crate_and_block(
+            InherentImpls::for_self_ty_in_crate_and_block(
                 db,
                 module.krate(db),
                 module.block(db),
-                &mut |impls| extend_with_impls(Either::Left(impls.for_self_ty(&simplified_ty))),
+                &simplified_ty,
+                &mut |impls| extend_with_impls(Either::Left(impls)),
             );
             std::iter::successors(module.block(db), |block| block.module(db).block(db))
                 .filter_map(|block| TraitImpls::for_block(db, block))
@@ -4091,7 +4092,7 @@ impl Impl {
             });
         };
         for &seen in method_resolution::loaded_crates(db, krate.id) {
-            handle_impls(TraitImpls::for_crate(db, seen));
+            handle_impls(TraitImpls::for_crate_and_trait(db, seen, trait_.id));
         }
         if let Some(block) = module.block(db)
             && let Some(impls) = TraitImpls::for_block(db, block)
@@ -5709,12 +5710,13 @@ impl<'db> Type<'db> {
         );
 
         if let Some(module) = method_resolution::simplified_type_module(db, &simplified_type) {
-            InherentImpls::for_each_crate_and_block(
+            InherentImpls::for_self_ty_in_crate_and_block(
                 db,
                 module.krate(db),
                 module.block(db),
+                &simplified_type,
                 &mut |impls| {
-                    handle_impls(impls.for_self_ty(&simplified_type));
+                    handle_impls(impls);
                 },
             );
         }

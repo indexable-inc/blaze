@@ -452,7 +452,9 @@ pub fn overlapping_impl(db: &Db, impl_: ImplId) -> Option<AnyImplId> {
                 found = Some(other);
             }
         };
-        for table in TraitImpls::for_crate_and_deps(db, krate) {
+        // Each loaded crate's table of this trait alone, in `for_crate_and_deps`' order.
+        for &dep in loaded_crates(db, krate) {
+            let table = TraitImpls::for_crate_and_trait(db, dep, trait_);
             table.for_trait(trait_, |run| match run {
                 Either::Left(impls) => impls.iter().for_each(|&it| candidate(it.into())),
                 Either::Right(derives) => derives.iter().for_each(|&it| candidate(it.into())),
