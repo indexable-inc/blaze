@@ -125,8 +125,12 @@ struct Engine {
     unnamed: bool,
     /// The planted bug of a control: no function is said to be asked each build.
     forgets_each_build: bool,
-    /// The engine names no changed set ([`Changed::Unknown`]): everything held is asked.
+    /// The front end tells no view ([`Frontend::view`] is `None`), so it names no changed
+    /// set and, by that, every function and static held is asked each build.
     names_no_set: bool,
+    /// The front end tells a view and cannot name what changed since it
+    /// ([`Changed::Unknown`]): the build is refused.
+    loses_its_set: bool,
 }
 
 impl Default for Engine {
@@ -149,6 +153,7 @@ impl Default for Engine {
             unnamed: false,
             forgets_each_build: false,
             names_no_set: false,
+            loses_its_set: false,
         }
     }
 }
@@ -466,7 +471,7 @@ impl Frontend for Program {
     }
 
     fn view(&self) -> Option<u64> {
-        Some(self.engine.revision)
+        (!self.engine.names_no_set).then_some(self.engine.revision)
     }
 
     /// Exactly what an edit since `view` changed ([`Program::touch`] and its like): each
@@ -474,8 +479,8 @@ impl Frontend for Program {
     /// static, by number.
     fn changed_since(&self, view: u64) -> Changed<u32, u32> {
         let engine = &self.engine;
-        if engine.names_no_set {
-            return Changed::Unknown("the test's engine names no changed set".to_owned());
+        if engine.loses_its_set {
+            return Changed::Unknown("the test's engine lost its changed set".to_owned());
         }
         let since = |changed: &HashMap<u32, u64>| {
             let mut ids: Vec<u32> =

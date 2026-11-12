@@ -32,8 +32,11 @@
 //! (`changed_since` of [`body_check_clean`], [`module_check_clean`], [`module_bodies`]), those
 //! that were not clean, and the bodies new in a module listed again. Every other body's and
 //! module's answer is the kept one, clean, with no task and no fetch, so the check costs the
-//! edit and the modules it touches, not the crate ([`Work`]). Where the engine cannot name the
-//! set, or nothing is kept, the plan is whole and says why ([`Whole`]).
+//! edit and the modules it touches, not the crate ([`Work`]). Where nothing is kept (the first
+//! check of its key) or a crate's file modules changed, the plan is whole and says why
+//! ([`Whole`]). Where a check is kept and the engine cannot name what changed since it, there
+//! is no plan: that is an error naming the crates and the engine's reason ([`NoChangedSet`]),
+//! never a sweep of every body in its place (rule no-fallback).
 
 use std::{
     fmt, mem, ptr,
@@ -120,8 +123,6 @@ pub enum Whole {
     /// Nothing is kept for this database, these crates and these style lints: the first plan
     /// of them in this process, or another plan of them has not run yet.
     NothingKept,
-    /// The engine cannot name what changed since the kept check's view.
-    Unknown(ChangedUnknown),
     /// The file modules of this crate changed: every position the kept check holds is of the
     /// list before.
     Modules(Crate),
@@ -134,10 +135,52 @@ impl fmt::Display for Whole {
             Whole::NothingKept => {
                 f.write_str("nothing is kept for this database, these crates and style lints")
             }
-            Whole::Unknown(why) => write!(f, "the engine cannot name what changed: {why}"),
             Whole::Modules(krate) => write!(f, "the file modules of {krate:?} changed"),
         }
     }
+}
+
+/// Why no plan of every body could be made from the check kept of its crates: the query
+/// engine could not name what changed since that check. A plan that swept every body in its
+/// place would be right and cost the crate on every edit with nothing saying so, so this is
+/// the plan's error (rule no-fallback); [`Plan::of_every_body`] panics with it, which fails
+/// the unit whose check it is and names it (rule panics-fail-one-job). The kept check is put
+/// back first, as it was.
+///
+/// What can cause it, each a bug of its caller and none an edit's: a plan made inside a
+/// query while the engine's walk of the changed set is due (a walk starts only outside one),
+/// or a kept view that is after the database's (a view counter set back).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoChangedSet {
+    pub crates: Vec<Crate>,
+    pub style_lints: bool,
+    /// The view the kept check ran in, which the engine was asked from.
+    pub since: View,
+    pub why: ChangedUnknown,
+}
+
+impl fmt::Display for NoChangedSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the check of every body of {:?} (style lints: {}) holds a kept check of view {} \
+             and the query engine cannot name what changed since it: {}. A plan from a kept \
+             check starts from the engine's changed set and has no sweep of every body to \
+             take its place (hir::check::bodies, rule no-fallback)",
+            self.crates,
+            self.style_lints,
+            self.since.as_u64(),
+            self.why
+        )
+    }
+}
+
+/// Why [`changes`] gives no patch of a kept check.
+enum Unpatched {
+    /// The plan is whole, by design, and says this.
+    Whole(Whole),
+    /// The engine cannot name the changed set: the plan's error.
+    Unknown(ChangedUnknown),
 }
 
 /// What a plan holds and what it visits: on the spans `body check plan` and `body check
@@ -296,17 +339,18 @@ struct Patch<'db> {
 
 /// What a plan from `kept` visits: the modules and bodies the engine names as changed since
 /// the kept view, those that were not clean, and the bodies new in a module whose list
-/// changed. `Err` where the engine cannot say or a crate's file modules changed.
-fn changes<'db>(db: &'db Db, of: &Of, kept: &Kept) -> Result<Patch<'db>, Whole> {
+/// changed. `Err` where a crate's file modules changed (a whole plan) or the engine cannot
+/// say (no plan).
+fn changes<'db>(db: &'db Db, of: &Of, kept: &Kept) -> Result<Patch<'db>, Unpatched> {
     let since = kept.view;
     let keys = |changed: Changed<Id>| match changed {
         Changed::Keys(ids) => Ok(ids),
-        Changed::Unknown(why) => Err(Whole::Unknown(why)),
+        Changed::Unknown(why) => Err(Unpatched::Unknown(why)),
     };
     let crates = keys(crate_file_modules::changed_since(db, since))?;
     for &krate in &of.crates {
         if crates.binary_search(&AsId::as_id(&krate.id)).is_ok() {
-            return Err(Whole::Modules(krate));
+            return Err(Unpatched::Whole(Whole::Modules(krate)));
         }
     }
     // alloc: once a plan, a word per module or body the edit touched or that was not clean
@@ -481,6 +525,12 @@ impl Plan<'static, fn(DefWithBody) -> bool> {
     /// The diagnostics are those of a plan that keeps nothing: a memo or a kept answer says
     /// only that a check gave none, and a body or module that gave any is checked by its task
     /// as before. It runs with the `style_lints` it was made with, in the view it was made in.
+    ///
+    /// # Panics
+    ///
+    /// With [`NoChangedSet`]'s text, when a check is kept of these crates and the query
+    /// engine cannot name what changed since it: there is no sweep of every body in the
+    /// changed set's place.
     pub fn of_every_body(
         db: &Db,
         crates: &[Crate],
@@ -563,9 +613,27 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
             None => Err(Whole::KeepsNothing),
             Some(of) => match take_kept(of) {
                 None => Err(Whole::NothingKept),
-                // A kept check the engine cannot patch is dropped here: the whole plan's run
-                // keeps the next.
-                Some(kept) => changes(db, of, &kept).map(|patch| (kept, patch)),
+                Some(kept) => match changes(db, of, &kept) {
+                    Ok(patch) => Ok((kept, patch)),
+                    // A kept check whose crate's file modules changed is dropped here: the
+                    // whole plan's run keeps the next.
+                    Err(Unpatched::Whole(why)) => Err(why),
+                    // No changed set: no plan. The kept check goes back as it was, so the
+                    // error is the same until its cause is removed, never a whole plan the
+                    // second time.
+                    Err(Unpatched::Unknown(why)) => {
+                        let refused = NoChangedSet {
+                            // clone: the error's, once
+                            crates: of.crates.clone(),
+                            style_lints: of.style_lints,
+                            since: kept.view,
+                            why,
+                        };
+                        // clone: the error path, once
+                        put_kept(of.clone(), kept);
+                        panic!("{refused}");
+                    }
+                },
             },
         };
         let (tables, work, last) = match from_kept {
