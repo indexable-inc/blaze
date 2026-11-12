@@ -5404,7 +5404,11 @@ impl<S: Steps> Jobs<S> {
         match std::mem::replace(&mut job.stage, Stage::Over) {
             Stage::Library(at) if at == node => {
                 if self.library.is_some() {
-                    self.prepare(w, id);
+                    // A request that came before this daemon had looked at the library is
+                    // checked against its certificate now, before its view is opened.
+                    if !self.certify_late(w, id) {
+                        self.prepare(w, id);
+                    }
                 } else {
                     // alloc: an error, once
                     let error = self.library_failed.clone().unwrap_or_else(|| {

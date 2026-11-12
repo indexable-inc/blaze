@@ -178,14 +178,16 @@ Closed by certificate5:
 
 What the wiring does not do yet (each a known gap, in the order to close them):
 
-1. **A daemon's first request is not checked**: the config names where the standard library
-   is mounted (`/rustc/<commit>/library`) and holds each mount by content id; `Jobs::library`
-   is set by that daemon's first task (`Does::Library`: a stat walk of the library's
-   directory, its fingerprint, compared with the mounts the VFS's heads restored). Needed:
-   the library a read of the certificate (its fingerprint, valued off the loop once a daemon's
-   life before the first check) with the base made of the restored mounts; or the walk done as
-   the daemon starts. Derived from the tool alone is not complete: `BLAZE_LIBRARY`-style
-   overrides and a checkout's `library/` change under one binary.
+1. **Closed by certificate6 (uncompiled when written), short of the bar: a daemon's first
+   request is checked, as a job of one task.** The base still names where the library is
+   mounted and holds it by content. A request that comes before this daemon has looked at
+   the library (and whose store restored a library mount) becomes a job whose first stage
+   is that look (`Does::Library`: off the loop, once a daemon's life, the `std library`
+   span); when it is in, the request is checked (`Jobs::certify_late`, `Stage::Certify`)
+   before any view is opened or plan made, and a hit ends the job with what the certificate
+   says. So the first request after a restart hits with 1 job and 1 task, not 0: the plane
+   runs a task only for a job. To reach 0: a request of the plane that is the daemon's own
+   (a task with no job), run as the daemon starts; the same piece gap 2 needs.
 2. **Outputs are hashed on the loop** where no stamp vouches (`Effect::ReadAll`, then the
    hash, in the span `request certificate: hash an output no stamp vouches for`): every
    output at a daemon's first check, and each output a build wrote less than two seconds
@@ -226,6 +228,25 @@ What the wiring does not do yet (each a known gap, in the order to close them):
 8. Under `-v` the notes of what the store served a build (`noted`) are diagnostics of one
    build, kept in `said`: a second build of the same reads may be refused as two answers.
 9. The daemon-level simulation test and the revision cases (not written).
+
+**What a check costs in outside reads (rule 67), and the gap that makes it O(1).** A
+certificate names, beside the one node and the variables, R = |the union over the build's
+build-script units of (files + listings + trees in the unit's record)| outside reads: units x
+reads a unit, each path once (not measured on reth: a guess is hundreds for pure-Rust
+scripts, low thousands where `cc` reads system headers). At a warm check each is one probe of
+`blaze_usercode::inputs::Files` (the path's entry, three atomic loads, a generation compare
+with the watcher a name it rests on): no stat, no hash, but O(R), on the loop, with a span a
+read today (`outside_now`); a read no watch vouches for is a stat, and a whole-file hash
+where no stamp is kept (every one after a restart). Next gap, not built: **one covering
+digest of the outside set**. Kept beside the evidence (local, never a condition): the
+digest of the sorted (name, value) pairs of the list the last hit or write valued, the
+watcher's generation read before they were valued, and the names they rest on. While
+`Dirs::name_unchanged_since` holds for the set the check compares one digest: O(1). It
+needs: (a) in `blaze-vfs::outside::Dirs` a watch SET with one generation (a counter bumped
+by an event on any member), so the test is one load, not R; (b) in `inputs::Files` a call
+that values a path and returns the names it rests on, or says it is not vouched, without
+looking; (c) the unvouched rest valued by the pool task of gap 2, never on the loop; (d) the
+per-read spans replaced by one span with a count.
 
 An output's content is the store key of its bytes (`Placement.key`): `output_key(bytes)` for a
 file hashed whole, `linked_key(root)` for one blaze's linker made (the root of

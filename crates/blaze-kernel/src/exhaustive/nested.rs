@@ -19,7 +19,8 @@
 //! carries meet with no get between. [`Over`] is there for the carry: `Over(0)` reads a fact
 //! and a [`Mid`], and `Over(1)` reads `Over(0)`, so a value with a reader of its own reads
 //! both the world and a value two steps above a fact, which is where repairing a parent
-//! before its child shows.
+//! before its child shows; and its value says nothing of its fact, so a repair that comes to
+//! the same bytes (the cutoff) is common in scope.
 //!
 //! The bound: `15^4 = 50,625` sequences from each of two starts, each prefix checked: an empty
 //! store, and a store in which a session that is gone kept every value at the first world (so
@@ -136,7 +137,10 @@ impl Compute for Top {
     }
 }
 
-/// `Over(0)` reads fact 0 and `Mid(1)`; any other reads `Over(0)`.
+/// `Over(0)` reads fact 0 and `Mid(1)`, and says nothing of the fact: whenever fact 0 changes
+/// it is looked up again and comes to the same bytes unless `Mid(1)` changed, which is the
+/// carry's cutoff, met in three steps (a get, a change of fact 0, a get). Any other input
+/// reads `Over(0)`.
 impl Compute for Over {
     type World = Facts;
 
@@ -147,7 +151,8 @@ impl Compute for Over {
             out.extend(ctx.step::<Over>(&0)?);
             return Ok(out);
         }
-        let mut out = vec![ctx.get::<At>(&0)?.unwrap_or(ABSENT)];
+        ctx.get::<At>(&0)?;
+        let mut out = vec![0];
         out.extend(ctx.step::<Mid>(&1)?);
         Ok(out)
     }
@@ -198,7 +203,7 @@ fn over(facts: &World3, input: u8) -> Vec<u8> {
     if input != 0 {
         return [vec![input], over(facts, 0)].concat();
     }
-    [vec![facts[0].unwrap_or(ABSENT)], mid(facts, 1)].concat()
+    [vec![0], mid(facts, 1)].concat()
 }
 
 fn kernel() -> Kernel<Facts> {
@@ -472,7 +477,7 @@ fn every_nested_sequence_in_scope_gives_what_a_fresh_run_gives() {
             carried.seeded > 100 && carried.repaired > 100 && carried.gone > 100,
             "{carried:?}"
         );
-        assert!(carried.changed > 0 && carried.cut > 0, "{carried:?}");
+        assert!(carried.changed > 100 && carried.cut > 100, "{carried:?}");
     }
 }
 

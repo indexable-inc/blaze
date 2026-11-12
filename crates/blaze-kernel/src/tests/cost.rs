@@ -518,6 +518,7 @@ fn a_change_that_leaves_a_value_the_same_stops_at_its_entry() {
     let mut built = built();
     let changed = built.set(37, 9);
     let (carried, cost) = built.carry(&changed);
+    println!("cutoff carry: {carried:?} {cost:?}");
     assert_eq!(carried, Carried { seeded: 1, repaired: 1, cut: 1, ..NOTHING });
     assert_eq!(cost.valued, 2, "{cost:?}");
     assert!(cost.gets <= 12 && cost.probes <= 8, "one leaf's lookup, run and keep: {cost:?}");
@@ -539,11 +540,13 @@ fn a_change_costs_the_path_from_its_entry_to_the_top() {
     let mut built = built();
     let changed = built.set(37, 12);
     let (carried, cost) = built.carry(&changed);
+    println!("path carry: {carried:?} {cost:?}");
     assert_eq!(carried, Carried { seeded: 1, repaired: 2, changed: 2, gone: 1, ..NOTHING });
     assert_eq!(cost.valued, 2, "{cost:?}");
     assert!(cost.gets <= 48 && cost.probes <= 8, "a leaf and a group of 16: {cost:?}");
     assert_eq!(built.session.len(), 255);
     let (hit, value, cost) = built.whole();
+    println!("path get of the top: {cost:?}");
     assert!(!hit, "the whole reads a group whose value changed");
     assert_eq!(value, built.fresh());
     assert_eq!(cost.valued, 0, "{cost:?}");
@@ -566,6 +569,7 @@ fn a_kind_with_no_exact_difference_looks_up_every_entry_that_read_it() {
     let (carried, cost) = built.carry(&changed);
     let expected =
         Carried { seeded: 240, repaired: 241, changed: 2, cut: 239, gone: 1, ..NOTHING };
+    println!("everything carry: {carried:?} {cost:?}");
     assert_eq!(carried, expected);
     assert!(cost.valued >= 240, "{cost:?}");
     let (_, value, _) = built.whole();

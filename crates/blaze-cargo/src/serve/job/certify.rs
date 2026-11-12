@@ -449,6 +449,8 @@ impl<S: Steps> Jobs<S> {
         idle: bool,
     ) -> Option<(Option<Opened>, Work, Option<(String, ContentId)>)> {
         self.refused = None;
+        // A job that waited for the library and ended otherwise left its id here.
+        self.certify.late.retain(|it| *it != id);
         let (Some(opened), Some(request)) = (view.as_ref(), request_id(&work)) else {
             return Some((view, work, None));
         };
