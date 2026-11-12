@@ -1152,6 +1152,54 @@
    "cause": "my guess, unverified: the link inputs kept beside the database are four programs a process, and the tests of one process share them",
    "workaround": "`--test-threads=1`",
    "state": "open"
+  },
+  {
+   "id": "A34",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+   "where": "unit keys (crates/blaze-cargo/src/serve/unit/compile.rs:1218-1228)",
+   "what": "A build from a terminal of another width, or piped, recompiles every unit: `note: recomputed 28 steps because the diagnostics' width changed`; the owner saw `blaze run` alternate between 0.09 s and 4.92 s on hello-world.",
+   "cost": "5 s per run for the owner, and confusion; my piped check runs caused some of it",
+   "cause": "colour, short diagnostics and the diagnostics' width are parts of a unit's key because the record holds rendered text",
+   "workaround": "none",
+   "fix": "store diagnostics as data, render when the answer is written (lane diagkey-1111)",
+   "state": "open"
+  },
+  {
+   "id": "A35",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+   "where": "installing a new blaze over an old one",
+   "what": "The new daemon refused the existing home: `the store cannot go on: .../v2/store/head: it is of store format 3, not 4: remove the directory to start a new store there`; the client only said the daemon ended with exit code 1 `USAGE: its command line was refused`.",
+   "cost": "three failed runs; a 209 GB state directory moved aside by hand",
+   "cause": "the store format was bumped with no migration, and the client's message names the wrong reason",
+   "workaround": "renamed ~/.cache/blaze/v2 aside",
+   "fix": "the client prints the daemon's own last error; a format bump says in one line what to run, and old stores are collected",
+   "state": "open"
+  },
+  {
+   "id": "A36",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+   "where": "`blaze stop` of release 0.20261105.4",
+   "what": "`stop` held the terminal 60 s and then errored: `the daemon still holds the connection 60000 ms after it said it was writing the daemon image .../v2/db/image (25962 MiB)`; the daemon was at 16.5 GB resident and ended later on its own.",
+   "cost": "about two minutes",
+   "cause": "a 26 GB image written whole at stop",
+   "workaround": "waited for the pid to end",
+   "fix": "an image written incrementally, never at stop",
+   "state": "open"
+  },
+  {
+   "id": "A37",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+   "where": "~/.cargo/bin/blaze",
+   "what": "The installed `blaze` was a version launcher (771 KB) that ran ~/.blaze/versions/<pin>/blaze; `blaze --version` of it printed the launcher's release (0.20261028.7) while the daemon running was 0.20261105.4, so I reported the wrong installed version, and the old launcher's `blaze stop` said `daemon: not running` while that daemon held the socket.",
+   "cost": "a wrong statement to the owner; ten minutes",
+   "cause": "two binaries with one name and different versions; `stop` looked at a different daemon than the one on the socket",
+   "workaround": "stopped it with its own binary",
+   "fix": "`--version` prints both the launcher and the version it runs; `stop` names the daemon on the socket whatever built it",
+   "state": "open"
   }
  ]
 }
