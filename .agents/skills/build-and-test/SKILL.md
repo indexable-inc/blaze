@@ -77,28 +77,28 @@ See [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#wor
 
 ## fan-out-write-only (rule 35)
 
-There is one integration tree (branch `int-<date>`, main plus every lane's pushed branch) and one
-build VM that holds it with a warm build, so a merge costs an incremental build, not a cold one. A
-lane has its paths in the one integration directory and nothing else (`worktree-per-lane` says when
-a worktree is right instead): it reads and writes code and tests there and never makes a VM
-(`work-in-ix-vms`: there is one, `blaze-vm`), runs cargo or blaze on its own, or starts a daemon of
-its own; it says plainly what it has not run. A lane that must see its code run asks the one queue:
-`ix shell blaze-vm --noninteractive -- /root/loop.sh <branch> <command...>` builds the pushed branch
-in the one tree and runs the command with that binary. The main agent runs the integration loop
-(`harness/v2/integrate.py`, one JSON value naming the branches): fetch, merge each branch (a branch
-that conflicts is left out and named), one build, then every check at once on that one binary: the
-edit-loop table beside the reference, the stale-answer run, new project, restart, memory, disk, the
-revision tests and the unit tests of the crates touched. One table comes out, tied to the tree's
-commit. A build error or failed check goes back to the lane whose files it names, with the tree, the
-command and the output; the lane fixes and pushes, and the loop runs again. A lane that needs to see
-something at run time asks for it as a check added to the loop (a script, a test, a span query), or
-is given the loop's built binary and its own `BLAZE_HOME` on the build VM to run read-only
-experiments; it does not build its own copy. What only one lane's change can show (a causal claim,
-`test-the-cause`) is run by the main agent as a patch on the tree. Landing: main takes the
-integration tree, or a branch of it, when the table and the tests are clean on that exact commit.
-Exceptions are named in the lane's brief with the reason: work that cannot share the VM (a benchmark
-that needs quiet cores gets a VM of its own; a macOS-only fact is measured on the Mac, one build at
-a time).
+A lane is a writer. It edits its own files in the one integration directory (`worktree-per-lane`),
+and that is all it does: it does not run cargo or blaze, does not call the build VM
+(`work-in-ix-vms`), does not start a daemon, does not poll or wait on anything, and does not run
+git; it says plainly that its code has not been compiled, lists the tests it wrote and what each
+should show, and stops or goes on writing the next piece. Waiting is the waste this rule removes:
+thirty-eight shells of lanes each waiting on its own build of its own branch is thirty-eight agents
+not writing, and their separate results had to be redone on the combined tree anyway. The main agent
+runs rounds: when the lanes say their pieces are ready (or on its own clock while they keep
+writing), it commits what is in the directory (one commit per lane's files, crediting it), pushes,
+and has the one VM build the whole tree once and run everything at once (`harness/v2/integrate.py`:
+the edit-loop table beside the reference, the stale-answer run, new project, restart, memory, disk,
+the revision tests, the unit tests of the crates touched, each test a lane named); it then sends
+every compile error and failed check to the lane whose file it names, with the tree's commit, the
+command and the output, and the lanes fix by writing; the next round follows. A lane writes so that
+a round can run: new code beside the old until it is switched over, nothing half-applied across
+files it does not own, each piece with its test. What a lane needs to see at run time (a profile's
+rows, what a command prints, whether a guess is right) it asks for as a line in its report: the main
+agent runs it in the next round and sends the answer. The exceptions are named in a lane's brief
+with the reason, and are few: one lane measuring a real project that takes minutes per run (it
+measures; it does not hold others up), and tools that need no build at all (a Python or TypeScript
+check that takes seconds). Landing: main takes the integration tree, or a part of it, when a round
+is clean on that exact commit.
 
 ## worktree-per-lane (rule 36)
 
