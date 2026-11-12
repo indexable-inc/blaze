@@ -121,6 +121,9 @@ export const allTasks = (): Task[] => [...registry.values()];
 /** How many tasks this kernel has run: their ids are t1 to this. */
 export const taskCount = (): number => seq;
 
+/** Run fn as the kernel's own, in no cell: what it starts (the type checker's process) is no cell's to be stopped with. */
+export const outsideTask = <T>(fn: () => T): T => als.exit(fn);
+
 /** Run fn with console output routed to the task's logs. */
 export const inTask = <T>(t: Task, fn: () => T): T => als.run(t, fn);
 

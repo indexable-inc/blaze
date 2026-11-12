@@ -13,7 +13,7 @@
 // A step records its kind, its words while running (`doing`) and once done (`done`), what it touched (`target`), how it
 // went (`ok`, `detail` such as "exit 0" or "5 results", `ms`) and, for steps whose result is data (a search, a query, a
 // command's output), that result as the app shows it (shown.ts). A step taken inside another (the fetch googleSearch
-// makes, the Bun.spawn of sh's local fallback) is not recorded again; code outside any cell (the MCP server itself)
+// makes, the Bun.spawn of a local sh) is not recorded again; code outside any cell (the kernel itself)
 // records nothing.
 //
 // What is not recorded, so a card never claims it is complete: node:child_process, Bun.$, sockets and WebSockets

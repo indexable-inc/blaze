@@ -3,7 +3,7 @@
 // of deterministic CBOR (serve.ts, which a CLI or the app can speak). What a reply says (time against the estimate,
 // backgrounding, a refusal, a stop's report, notices that waited) is decided here and in the pure modules it calls
 // (patience.ts, stop.ts, disclose.ts, notices.ts), never in an adapter.
-import { stopTask } from "./cancel.ts";
+import { Stopped, stopTask } from "./cancel.ts";
 import { setRunner } from "./cells.ts";
 import { presentLogs } from "./disclose.ts";
 import { cellOf, cellStack } from "./evaluator.ts";
@@ -57,6 +57,15 @@ export function parseCall(v: unknown): Call | string {
   return o as Call;
 }
 
+/** What a tool with one input record means (the MCP `ts` tool): `cancel` names a cell to stop, else `code` is a cell to run. */
+export function toolCall(input: { code?: string; cancel?: string; yield_ms?: number; timeout_ms?: number; expect_ms?: number; why?: string }, call: string | null): Call | string {
+  const { code, cancel, ...rest } = input;
+  if (cancel !== undefined && code !== undefined) return "give `code` to run a cell or `cancel` to stop one, not both";
+  if (cancel !== undefined) return { op: "cancel", task: cancel };
+  if (code === undefined) return "give `code`, the TypeScript to run (or `cancel`, the id of a cell to stop)";
+  return { op: "run", code, ...rest, call };
+}
+
 /** Which cells an error nobody awaited belongs to, from most to least certain: the cell whose code its stack passes
  *  through; the cell whose context raised it; the only cell running; every cell running; the last cell that ran. */
 export function blame(e: unknown, context: Task | undefined, tasks: readonly Task[]): { tasks: Task[]; sure: boolean } {
@@ -87,6 +96,8 @@ export class Kernel {
   /** An error nobody awaited (a rejection, a timer's throw) is the cell's that caused it: a line in its logs, and a
    *  notice to the agent when no reply of that cell is still to come. With no cell to give it to, the next reply says it. */
   unawaited(e: unknown, what: "an unawaited promise rejected" | "a callback threw"): void {
+    // A stop rejects every wait of its cell: the ones nobody was awaiting are the stop, not news.
+    if (e instanceof Stopped) return;
     const { tasks, sure } = blame(e, currentTask(), allTasks());
     const text = cellStack(e);
     if (!tasks.length) { this.notes.push(`[kernel] ${what} before any cell ran: ${text}`); return; }
@@ -98,14 +109,15 @@ export class Kernel {
     }
   }
 
-  async handle(call: Call): Promise<Answer> {
-    const bad = parseCall(call);
-    if (typeof bad === "string") return { text: bad, error: true };
+  /** Answer a request. A string is a request already found wanting (`toolCall`): it is answered as the error it is. */
+  async handle(call: Call | string): Promise<Answer> {
+    const bad = typeof call === "string" ? call : parseCall(call);
+    if (typeof bad === "string" || typeof call === "string") return { text: String(bad), error: true };
     if (call.op === "describe") return { text: description(), error: false };
     notices.callBegan();
     try {
       const a = call.op === "cancel" ? await this.#cancel(call.task) : await this.#run(call);
-      return { ...a, text: this.#carry(a.text) };
+      return { ...a, text: this.#carry(a.text, a.task) };
     } catch (e) {
       return { text: this.#carry(e instanceof Error ? e.message : String(e)), error: true };
     } finally {
@@ -114,8 +126,9 @@ export class Kernel {
   }
 
   /** A reply carries what waited to be said: the kernel's notes first, then notices of other cells. */
-  #carry(text: string): string {
-    const waiting = notices.callEnds();
+  #carry(text: string, about?: string): string {
+    // The end of the cell this reply is about is the reply itself.
+    const waiting = notices.callEnds().filter((n) => !(n.end && n.task === about));
     const head = this.notes.splice(0);
     const tail = waiting.length ? `\n\n# While you were away:\n${noticeText(waiting)}` : "";
     return `${head.length ? `${head.join("\n")}\n` : ""}${text}${tail}`;

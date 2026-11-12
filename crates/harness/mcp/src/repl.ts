@@ -58,11 +58,13 @@ export class Repl {
     void t.done.then(() => watchdog()?.disarm(t.id));
     const cell = inTask(t, () => this.#exec(t));
     t.settled = cell.then(() => {}, () => {});
-    const timer = o.limit_ms === undefined ? undefined : setTimeout(() => void stopTask(t, overLimit(o.limit_ms!, t.expect_ms).why).catch(() => {}), o.limit_ms);
+    let late = false;
+    const timer = o.limit_ms === undefined ? undefined : setTimeout(() => { late = true; void stopTask(t, overLimit(o.limit_ms!, t.expect_ms).why).catch(() => {}); }, o.limit_ms);
     // What showing the value throws (a component's first render) is the cell's error too.
     void abortable(cell, t.controller.signal).then((value) => inTask(t, () => this.#finish(t, value))).catch(async (e) => {
       if (!t.stopping) return t.finish("error", e, this.#failure(e));
-      const advice = o.limit_ms === undefined ? null : overLimit(o.limit_ms, t.expect_ms).advice;
+      // Only a cell its limit stopped is told it was slow; one that was cancelled was somebody's choice.
+      const advice = late ? overLimit(o.limit_ms!, t.expect_ms).advice : null;
       t.finish("stopped", e, [await t.stopping, advice].filter(Boolean).join("\n"));
     }).finally(() => clearTimeout(timer));
     return t;

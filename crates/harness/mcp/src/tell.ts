@@ -36,9 +36,9 @@ export async function pump(): Promise<void> {
   }
 }
 
-export function tellAgent(t: Task, text: string, o: { tag?: string; urgent?: boolean } = {}) {
+export function tellAgent(t: Task, text: string, o: { tag?: string; urgent?: boolean; end?: boolean } = {}) {
   t.log(`[${o.tag ?? "ask"}] ${text}`);
-  const n: Notice = { task: t.id, text, urgent: o.urgent ?? false };
+  const n: Notice = { task: t.id, text, urgent: o.urgent ?? false, ...(o.end ? { end: true } : {}) };
   notices.add(n, Date.now());
   void pump();
 }

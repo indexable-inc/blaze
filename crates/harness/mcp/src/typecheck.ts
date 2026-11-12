@@ -20,7 +20,9 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { API } from "typescript/unstable/async";
+import { clip } from "./disclose.ts";
 import { missingName } from "./help.ts";
+import { outsideTask } from "./tasks.ts";
 
 /** This package's folder: its node_modules has TypeScript and Bun's types. */
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -37,6 +39,8 @@ const HIDDEN = /^(?:__|\$\$)/;
 export type Admitted = { settle(bound: readonly string[]): void };
 
 export interface Checker {
+  /** Start the checker's process and load the globals' types, so the first cell does not wait for them. */
+  warm(): Promise<void>;
   /**
    * Check `source`, which binds `names` when it runs (evaluator.ts). `{ refusal }`: why it may not run (its type errors,
    * at its lines). Else its names are typed for later cells at once, since a cell still running already shares them;
@@ -86,7 +90,7 @@ export function refusal(errors: readonly { line: number; text: string }[], known
   const lines = errors.slice(0, SHOWN).map((e) => {
     const missing = missingName(e.text);
     const at = missing ? known.find((k) => k === missing || k.endsWith(`.${missing}`)) ?? /Did you mean '([\w$]+)'/.exec(e.text)?.[1] : undefined;
-    return `  line ${e.line}: ${e.text}${at && known.includes(at) ? ` (help('${at}'))` : ""}`;
+    return `  line ${e.line}: ${clip(e.text, 400)}${at && known.includes(at) ? ` (help('${at}'))` : ""}`;
   });
   const more = errors.length > SHOWN ? `\n  … and ${errors.length - SHOWN} more` : "";
   return `Not run: the cell has ${errors.length === 1 ? "a type error" : `${errors.length} type errors`}. Nothing of it ran.\n${lines.join("\n")}${more}\nhelp('name') shows a call's real signature.`;
@@ -119,13 +123,15 @@ export class TypeChecker implements Checker {
 
   /** One at a time, in order: the process has one view of the files. */
   #run<T>(work: () => Promise<T>): Promise<T> {
-    const result = this.#queue.then(work);
+    const result = this.#queue.then(() => outsideTask(work));
     this.#queue = result.catch(() => undefined);
     return result;
   }
 
   #start(): Promise<API> {
-    return (this.#api ??= import("typescript/unstable/async").then(({ API }) => { this.#opened = false; return new API({ cwd: this.dir }); }));
+    // The checker's process is the kernel's: started in no cell's context, so stopping the cell that happened to need it
+    // first does not kill it (cancel.ts kills what a cell starts).
+    return (this.#api ??= outsideTask(() => import("typescript/unstable/async").then(({ API }) => { this.#opened = false; return new API({ cwd: this.dir }); })));
   }
 
   async #stop(): Promise<void> {
@@ -145,6 +151,10 @@ export class TypeChecker implements Checker {
       else (imports.get(cell) ?? imports.set(cell, []).get(cell)!).push(kind === "type" ? `type ${name}` : name);
     }
     return [...[...imports].map(([cell, names]) => `import { ${names.join(", ")} } from "./${cell}.ts";`), ...lets].map((l) => `${l} `).join("");
+  }
+
+  warm(): Promise<void> {
+    return this.#run(async () => { await this.#check("void [glob, rg, sh, fetch, Bun.file];"); });
   }
 
   admit(source: string, names: readonly string[]): Promise<{ refusal: string } | Admitted> {

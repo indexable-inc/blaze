@@ -1,5 +1,5 @@
-// How functions reach the person behind the agent. The MCP server installs a real implementation
-// (MCP elicitation); without one, confirm() returns false and callers fall back to an error message.
+// How functions reach the person behind the agent. The MCP adapter installs an implementation (MCP elicitation);
+// without one, confirm() is false and the caller's error says the person could not be asked.
 
 export type Confirm = (message: string) => Promise<boolean>;
 let impl: Confirm | undefined;

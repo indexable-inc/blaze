@@ -55,14 +55,14 @@ test("time is told: a refusal of a long run without a reason, the estimate in th
   const refused = await ts({ code: "1", expect_ms: 20 * 60_000 });
   expect(refused.error).toBe(true);
   expect(refused.text).toStartWith("Not run: you expect this cell to take 20m00s");
-  expect((await ts({ code: "await Bun.sleep(300); 'slow'", expect_ms: 100 })).text).toMatch(/done 0\.3\ds · expected 0\.10s · 3\.\d× over\]/);
+  expect((await ts({ code: "await Bun.sleep(150); 'slow'", expect_ms: 50 })).text).toMatch(/done 0\.1\ds · expected 0\.05s · 3\.\d× over\]/);
 });
 
 test("a cell past its limit is stopped for real: its sleep ends, the process it started is killed, the reply says so", async () => {
-  const r = await ts({ code: "const child = Bun.spawn(['sh', '-c', 'sleep 30 & sleep 30']); await Bun.sleep(30_000); 'never'", expect_ms: 100, timeout_ms: 400 });
+  const r = await ts({ code: "const child = Bun.spawn(['sh', '-c', 'sleep 30 & sleep 30']); await Bun.sleep(30_000); 'never'", expect_ms: 100, timeout_ms: 250 });
   expect(r.error).toBe(true);
-  expect(r.text).toMatch(/^\[t\d+ stopped 0\.[4-9]\ds/);
-  expect(r.text).toContain("it passed its limit of 0.40s");
+  expect(r.text).toMatch(/^\[t\d+ stopped 0\.[2-9]\ds/);
+  expect(r.text).toContain("it passed its limit of 0.25s");
   expect(r.text).toMatch(/Killed: pid \d+ \(sh -c sleep 30 & sleep 30\)/);
   expect(r.text).toContain("suspiciously slow");
   // The whole process group is gone, the grandchild too.
@@ -90,7 +90,7 @@ test("code that ignores its signal is named, and the notice of a backgrounded ce
   expect(stopped.text).toContain("it ignores its signal");
   const quick = await ts({ code: "await Bun.sleep(150); 'bg done'", yield_ms: 20 });
   const quickId = /^\[(t\d+) running/.exec(quick.text)![1]!;
-  await Bun.sleep(400);
+  await Bun.sleep(250);
   const next = await ts({ code: "1" });
   expect(next.text).toContain("# While you were away:");
   expect(next.text).toContain(`[${quickId} done `);

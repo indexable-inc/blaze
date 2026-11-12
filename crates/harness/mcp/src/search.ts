@@ -10,7 +10,7 @@ import type { Stats } from "node:fs";
 import { lstat, readdir, stat } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { effect, quiet } from "./effects.ts";
-import { oneLine } from "./disclose.ts";
+import { clip, oneLine } from "./disclose.ts";
 import { table } from "./table.ts";
 
 /** Where a match is: UTF-16 offsets into `text`, which is the whole line (several lines for a multiline match). */
@@ -225,7 +225,6 @@ function optionsOf<T extends object>(name: keyof typeof OPTIONS, value: T | unde
   return value;
 }
 
-const clip = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
 /** A path as short as the working directory allows. */
 const rel = (path: string) => {
   const inside = relative(process.cwd(), path);

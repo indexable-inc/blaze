@@ -14,7 +14,8 @@ export const HOLD_MS = 60_000;
 /** How often a busy agent is asked again whether its turn has ended. */
 export const POLL_MS = 2_000;
 
-export type Notice = { task: string; text: string; urgent: boolean };
+/** `end`: it says its task ended (a reply about that task says so itself). */
+export type Notice = { task: string; text: string; urgent: boolean; end?: boolean };
 export type Due =
   /** Send these now, as one message. */
   | { send: Notice[] }
@@ -37,7 +38,7 @@ export class Notices {
     return this.#take();
   }
   #take(): Notice[] {
-    const out = this.#queue.map(({ task, text, urgent }) => ({ task, text, urgent }));
+    const out = this.#queue.map(({ at: _at, ...n }) => n);
     this.#queue = [];
     return out;
   }

@@ -2,14 +2,28 @@
 // process behind; the API refuses a bad request by field; an error nobody awaited is given to the right cell.
 import { afterAll, expect, test } from "bun:test";
 import { functions } from "./functions/index.ts";
-import { Kernel, blame, parseCall } from "./kernel.ts";
+import { Kernel, blame, parseCall, toolCall } from "./kernel.ts";
 import { stopText } from "./stop.ts";
 import { getTask, newTask } from "./tasks.ts";
 
 const pids: number[] = [];
 let aborted = 0;
 const server = Bun.serve({ port: 0, fetch: (req) => new Promise<Response>(() => { req.signal.addEventListener("abort", () => aborted++); }) });
-const kernel = new Kernel({ ...functions, pids, hang: `http://127.0.0.1:${server.port}/` });
+
+/** Each wait a cell can be in, as a cell that enters it and never leaves by itself; `mine` collects the pids it starts. */
+const WAITS: [string, string][] = [
+  ["a sleep", "await Bun.sleep(60_000)"],
+  ["a fetch", "await fetch(hang)"],
+  ["a process", "const p = sh('sleep 61'); await p.started_on; mine.push(p.pid); await p"],
+  ["a $ command", "await $`sleep 62`"],
+  ["a followed command", "await follow(['sh', '-c', 'sleep 63'])"],
+  ["a process with children of its own", "const p = Bun.spawn(['sh', '-c', 'sleep 64 & sleep 64']); mine.push(p.pid); await p.exited"],
+  ["parallel work", "await pmap([1, 2, 3], () => Bun.sleep(60_000))"],
+  ["a question to the person", "await ask('Go on?', { options: ['Yes', 'No'] })"],
+  ["a loop that checks its signal", "for (;;) { signal().throwIfAborted(); await new Promise((r) => setTimeout(r, 5)) }"],
+];
+const started: number[][] = WAITS.map(() => []);
+const kernel = new Kernel({ ...functions, pids, started, hang: `http://127.0.0.1:${server.port}/` });
 afterAll(() => server.stop(true));
 
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
@@ -17,47 +31,37 @@ const group = (pid: number) => Bun.spawnSync(["ps", "-o", "pid=", "-g", String(p
 
 /** Run `code`, let it reach its wait, cancel it: the cancel's reply and how long the stop took. */
 async function cancelled(code: string) {
-  const bg = await kernel.handle({ op: "run", code, yield_ms: 70 });
+  const bg = await kernel.handle({ op: "run", code, yield_ms: 100 });
   expect(bg.status, code).toBe("running");
   const at = performance.now();
   const stop = await kernel.handle({ op: "cancel", task: bg.task! });
   return { id: bg.task!, text: stop.text, ms: performance.now() - at, task: getTask(bg.task!) };
 }
 
-const WAITS: [string, string][] = [
-  ["a sleep", "await Bun.sleep(60_000)"],
-  ["a fetch", "await fetch(hang)"],
-  ["a process", "const p = sh('sleep 61'); await p.started_on; pids.push(p.pid); await p"],
-  ["a $ command", "await $`sleep 62`"],
-  ["a followed command", "await follow(['sh', '-c', 'echo $$ > /dev/null; sleep 63'])"],
-  ["a process with children of its own", "const p = Bun.spawn(['sh', '-c', 'sleep 64 & sleep 64']); pids.push(p.pid); await p.exited"],
-  ["parallel work", "await pmap([1, 2, 3], () => Bun.sleep(60_000))"],
-  ["a question to the person", "await ask('Go on?', { options: ['Yes', 'No'] })"],
-  ["a loop that checks its signal", "for (;;) { signal().throwIfAborted(); await new Promise((r) => setTimeout(r, 5)) }"],
-];
-
-for (const [what, code] of WAITS) {
-  test(`cancelled in ${what}: the cell stops at once and nothing of it is left`, async () => {
-    const before = pids.length;
-    const r = await cancelled(code);
-    expect(r.task.status).toBe("stopped");
-    expect(r.text).toContain(`${r.id} stopped: cancelled.`);
-    expect(r.text).not.toContain("ignores its signal");
-    expect(r.task.owned.size).toBe(0);
+test("cancelled in any kind of wait, a cell stops at once and nothing of it is left", async () => {
+  // All at once: they are separate cells of one kernel, as an agent's are.
+  const results = await Promise.all(WAITS.map(([, code], i) => cancelled(`{ const mine = started[${i}]!; ${code} }`)));
+  for (const [i, r] of results.entries()) {
+    const what = WAITS[i]![0];
+    expect(r.task.status, what).toBe("stopped");
+    expect(r.text, what).toContain(`${r.id} stopped: cancelled.`);
+    expect(r.text, what).not.toContain("ignores its signal");
+    expect(r.task.owned.size, what).toBe(0);
     // Nothing waits out a grace period: what a cell waits in ends with its signal.
-    expect(r.ms).toBeLessThan(1000);
-    for (const pid of pids.slice(before)) {
-      expect(alive(pid), `pid ${pid}`).toBe(false);
-      expect(group(pid), `the process group of ${pid}`).toBe("");
-      expect(r.text).toContain("Killed: ");
+    expect(r.ms, what).toBeLessThan(1000);
+    for (const pid of started[i]!) {
+      expect(alive(pid), `${what}: pid ${pid}`).toBe(false);
+      expect(group(pid), `${what}: the process group of ${pid}`).toBe("");
+      expect(r.text, what).toContain("Killed: ");
     }
-  });
-}
+  }
+  expect(started.flat().length).toBe(2);
+});
 
 test("a cancelled fetch is dropped at the server, not just no longer awaited", () => expect(aborted).toBeGreaterThan(0));
 
 test("waiting on a cell is cancelled without stopping the cell waited on; a cell cannot cancel itself", async () => {
-  const slow = await kernel.handle({ op: "run", code: "await Bun.sleep(700); 'slow done'", yield_ms: 20 });
+  const slow = await kernel.handle({ op: "run", code: "await Bun.sleep(300); 'slow done'", yield_ms: 20 });
   const waiter = await cancelled(`await wait('${slow.task}')`);
   expect(waiter.task.status).toBe("stopped");
   expect(getTask(slow.task!).status).toBe("running");
@@ -93,6 +97,10 @@ test("a request is refused by field, in the API, before anything runs", async ()
   expect(parseCall({ op: "run", code: "1", expect_ms: "soon" })).toBe("run.expect_ms is string, and must be a number");
   expect(parseCall({ op: "launch" })).toContain('unknown op "launch"');
   expect(parseCall(null)).toBe("a request is a record with an `op`");
+  expect(toolCall({ code: "1", expect_ms: 5 }, "toolu_1")).toEqual({ op: "run", code: "1", expect_ms: 5, call: "toolu_1" });
+  expect(toolCall({ cancel: "t3" }, null)).toEqual({ op: "cancel", task: "t3" });
+  expect(await kernel.handle(toolCall({ code: "1", cancel: "t3" }, null))).toEqual({ text: "give `code` to run a cell or `cancel` to stop one, not both", error: true });
+  expect(toolCall({}, null)).toContain("give `code`");
   expect(await kernel.handle({ op: "cancel", task: "t9999" })).toMatchObject({ error: true, text: expect.stringContaining("no task t9999") });
 });
 
@@ -116,8 +124,8 @@ test("a cell that never awaits cannot be stopped from inside: past its limit the
   const { replay } = await import("./journal.ts");
   const journal = join(mkdtempSync(join(tmpdir(), "watchdog-")), "s1.log");
   const script = `import { start } from ${JSON.stringify(join(import.meta.dir, "start.ts"))};
-    const k = start({ journal: ${JSON.stringify(journal)}, watchdog_ms: 300, typecheck: false });
-    await k.handle({ op: "run", code: "await Bun.sleep(300); 1 + 1" });
+    const k = start({ journal: ${JSON.stringify(journal)}, watchdog_ms: 200, typecheck: false });
+    await k.handle({ op: "run", code: "await Bun.sleep(150); 1 + 1" });
     await k.handle({ op: "run", code: "for (;;) {}", timeout_ms: 100 });`;
   const kernelProcess = Bun.spawn([process.execPath, "-e", script], { stdout: "ignore", stderr: "ignore", env: { ...process.env } });
   const at = performance.now();

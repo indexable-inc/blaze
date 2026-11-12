@@ -4,7 +4,12 @@ import { afterAll, expect, test } from "bun:test";
 import { join } from "node:path";
 import { prepare } from "./evaluator.ts";
 import { docs, functions } from "./functions/index.ts";
+import { install } from "./effects.ts";
+import { inTask, newTask } from "./tasks.ts";
 import { TypeChecker, preludeText, type Admitted } from "./typecheck.ts";
+
+// As in a kernel: a process started in a cell is the cell's (effects.ts).
+install();
 
 /** A warm check must stay under this for cells to be checked every time (measured 5 to 15 ms, 2026-11-12). */
 const CHECK_WARM_MS = 100;
@@ -17,6 +22,15 @@ const names = (code: string) => prepare(new Bun.Transpiler({ loader: "ts" }).tra
 /** Admit a cell and settle it as having bound everything it declares (it ran to its end). */
 const ran = async (code: string) => { const a = await checker.admit(code, names(code)); if ("refusal" in a) throw new Error(a.refusal); a.settle(names(code)); };
 const refused = async (code: string) => { const a = await checker.admit(code, names(code)); return "refusal" in a ? a.refusal : null; };
+
+test("the checker's process is the kernel's: the cell that first needs it does not own it, so stopping that cell does not kill it", async () => {
+  const fresh = new TypeChecker(globals);
+  const t = newTask("1");
+  expect(await inTask(t, () => fresh.admit("const one = 1", ["one"]))).toHaveProperty("settle");
+  expect([...t.owned].map((o) => o.what)).toEqual([]);
+  t.finish("done", 1, "1");
+  await fresh.close();
+});
 
 test("the globals are declared with their real types; plumbing is not a name", () => {
   const text = preludeText(globals);

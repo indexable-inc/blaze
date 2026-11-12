@@ -29,6 +29,6 @@ export function watch(t: Task, sessionMs: () => number) {
     clearTimeout(timer);
     const { time, advice } = told({ elapsed_ms: t.elapsed_ms, expect_ms: t.expect_ms, running: false, session_ms: sessionMs() });
     const more = t.result.length > RESULT ? `\n# … ${t.result.length - RESULT} more characters: task('${t.id}').result` : "";
-    tellAgent(t, `[${t.id} ${t.status} ${time}]${advice ? `\n${advice}` : ""}\n${clip(t.result, RESULT)}${more}`, { tag: "time" });
+    tellAgent(t, `[${t.id} ${t.status} ${time}]${advice ? `\n${advice}` : ""}\n${clip(t.result, RESULT)}${more}`, { tag: "time", end: true });
   });
 }

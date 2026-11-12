@@ -33,6 +33,7 @@ export function start(o: StartOptions = {}): Kernel {
   if (check) {
     const here = dirname(fileURLToPath(import.meta.url));
     kernel.repl.checker = new TypeChecker({ module: join(here, "functions", "index.ts"), typed, untyped: Object.keys(kernel.repl.scope.globals), known: Object.keys(docs) });
+    void kernel.repl.checker.warm();
   }
 
   const journal = o.journal === undefined ? journalPath() : o.journal;

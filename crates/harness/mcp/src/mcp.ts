@@ -5,6 +5,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { setConfirm } from "./host.ts";
+import { toolCall } from "./kernel.ts";
 import { start } from "./start.ts";
 
 const kernel = start();
@@ -27,12 +28,12 @@ server.registerTool(
       why: z.string().optional().describe("for a cell expected to take over 5 minutes: one sentence saying what it tells you that nothing faster can"),
     },
   },
-  async ({ code, cancel, ...rest }, extra) => {
+  async (input, extra) => {
     // The agent names the tool call in the request's _meta (Claude as `claudecode/toolUseId`, Codex as `callId`, the
     // same id its app-server gives the mcpToolCall item); the cell carries it so the app draws the cell as that call.
     const meta = extra._meta ?? {};
     const call = [meta["claudecode/toolUseId"], meta["callId"]].find((c): c is string => typeof c === "string" && c !== "") ?? null;
-    const a = cancel !== undefined ? await kernel.handle({ op: "cancel", task: cancel }) : await kernel.handle({ op: "run", code: code ?? "", ...rest, call });
+    const a = await kernel.handle(toolCall(input, call));
     return { content: [{ type: "text", text: a.text }], isError: a.error };
   },
 );
