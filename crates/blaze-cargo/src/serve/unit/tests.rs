@@ -1184,6 +1184,45 @@ fn a_build_scripts_record_is_keyed_alike_under_every_goal() {
     );
 }
 
+/// The invariant: a record's key holds of the job's kind only what making a unit reads of it,
+/// whether the job checks. So a library built by `blaze build` is keyed as `blaze test` and
+/// `blaze run` key it (build, then test, then build: its record is found each time), and a
+/// check, which makes no code, is still apart. The control: each kind its own byte again
+/// ([`compile::PLANTED_KIND`]), a test keys the library apart from a build.
+#[test]
+fn a_build_a_test_and_a_run_key_a_library_alike() {
+    use crate::serve::work::JobKind;
+    let lib = unit("p", target("p", "lib", "/w/p/src/lib.rs"), Mode::Build, &[]);
+    let alike = || {
+        let built = compile::keyed_kind(JobKind::Build, &lib);
+        [JobKind::Test, JobKind::Run].iter().all(|kind| compile::keyed_kind(*kind, &lib) == built)
+    };
+    assert!(alike(), "a test or a run keys a library apart from a build, which makes the same record");
+    assert_ne!(compile::keyed_kind(JobKind::Check, &lib), compile::keyed_kind(JobKind::Test, &lib));
+    compile::PLANTED_KIND.set(true);
+    let planted = alike();
+    compile::PLANTED_KIND.set(false);
+    assert!(!planted, "with each kind its own byte a test must key apart: the test would pass without the change");
+}
+
+/// The invariant: how a program is run is in the key of a unit that makes one, whose record
+/// keeps it, and in no other unit's: a library's key holds nothing of the build's native
+/// directories or of what a build script set for a run. The control is the binary, whose key
+/// part is the environment itself.
+#[test]
+fn only_a_unit_that_makes_a_program_is_keyed_by_how_it_is_run() {
+    let runs = super::artifact::Runs {
+        runner: Vec::new(),
+        env: vec![("LD_LIBRARY_PATH".to_owned(), "/w/target/debug/build/z-1/out".to_owned())],
+    };
+    let lib = unit("p", target("p", "lib", "/w/p/src/lib.rs"), Mode::Build, &[]);
+    let lib_plan = plan("-1", &["/w/target/debug/deps/libp-1.rlib"]);
+    assert!(compile::keyed_run_env(&lib, &lib_plan, &runs).is_empty());
+    let bin = unit("p", target("p", "bin", "/w/p/src/main.rs"), Mode::Build, &[]);
+    let bin_plan = plan("-2", &["/w/target/debug/deps/p-2"]);
+    assert_eq!(compile::keyed_run_env(&bin, &bin_plan, &runs), runs.env.as_slice());
+}
+
 const MACROS: &[u8] = b"extern crate proc_macro;\nuse proc_macro::TokenStream;\n\n\
 #[proc_macro]\npub fn shout(input: TokenStream) -> TokenStream { input }\n\n\
 #[proc_macro_attribute]\npub fn tag(_: TokenStream, item: TokenStream) -> TokenStream { item }\n";
