@@ -473,6 +473,105 @@
    "cause": "not known when written; the lane's report says what the tree before the merge does",
    "workaround": "none",
    "state": "open"
+  },
+  {
+   "id": "redit-1",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+   "where": "blaze: the profile history's cap",
+   "what": "After a cold build of reth and one edit, `blaze debug sql` listed builds 1 and 3 once; the next command (`blaze explain writes`, `explain problems`) said `0 rows` and `this history has no build`. Every file of both builds was gone from `profile/`: only seven idle flushes (`0-00000218` to `0-00000224`) were left. The cap is 256 MiB since today and a reth build's history is larger, so the first idle flush after the build retired the build that had just ended, the one being asked about.",
+   "cost": "the first reproduction's evidence (11 minutes of builds) could not be queried; rerun with the cap raised",
+   "cause": "the cap keeps `the newest flush's builds`, and the newest flush after a build is an idle one of no build; nothing was said in `serve.log`",
+   "workaround": "`BLAZE_PROFILE_CAP_MB=65536` in the daemon's environment",
+   "state": "open: the newest build (not the newest flush's) should never be retired, and `explain problems` should say the history was capped, not that there is no build"
+  },
+  {
+   "id": "redit-2",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+   "where": "blaze: `included files read again`",
+   "what": "The span said `files=2 moved=1` and the write it made woke `core`, `std` and `gimli`'s name resolution, with nothing naming the file or what was read of it before.",
+   "cost": "an instrumented build to learn it was `OUT_DIR/private.rs` of thiserror, read as `No such file` before its build script ran",
+   "cause": "a write that names a count, not the thing (rule 19)",
+   "workaround": "none needed",
+   "state": "fixed on redit-1111 (3a569448e4: an event a moved file with its path, what was read and what is read now)"
+  },
+  {
+   "id": "redit-3",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+   "where": "blaze: `hir_def::deps::serve`",
+   "what": "A serve that turns crates from resolved to read from images (22 of the standard library's in a small project's first edit) said nothing: no span field, no event, no line of `blaze why` names the crates or that their key did or did not move.",
+   "cost": "two instrumented builds before the cause of reth's panics could be stated",
+   "cause": "the serve's writes are three whole-map inputs; which crates changed is not recorded",
+   "workaround": "none needed",
+   "state": "fixed on redit-1111 (a6c36805a9, cf4bfe2bf8: events naming the crates that gained or lost an image, and each crate whose key moved with both keys)"
+  },
+  {
+   "id": "redit-4",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+   "where": "blaze: `blaze why` after the first edit",
+   "what": "For 198 of the 249 units reth's first edit computed again `blaze why` said `the reason could not be worked out: its crate's identity was not worked out since the front end's last write`, and for 4 `this build computed it 2 times under different keys` (serde's and serde_core's build scripts, built for two profiles).",
+   "cost": "the tool meant to say why gave a reason for 6 units of 249",
+   "cause": "identities are cleared by every write and made again only for units that miss; two units of one package and target kind are told apart by less than their keys",
+   "workaround": "read `key_parts` and the spans by hand",
+   "state": "open"
+  },
+  {
+   "id": "redit-5",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+   "where": "blaze: name resolution, `include_readers`",
+   "what": "A write of any one file read by `include_str!`, `include_bytes!` or an `include!` outside the VFS wakes every module group of every crate that expanded any such macro: `core`'s root (110 ms), `gimli` (610 ms), `std`, for a write of thiserror's `private.rs`.",
+   "cost": "0.8 s of the first edit of a small project before this lane's fix removed the write; any real edit of an included file still pays it",
+   "cause": "`Written::included` is not narrowed by which crate read the file, though `Files::included_by` holds it",
+   "workaround": "none",
+   "state": "open"
+  },
+  {
+   "id": "redit-6",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+   "where": "blaze: crates are resolved before their build scripts have run",
+   "what": "The name resolution maintainer ends every write, so a crate the plan gives an `OUT_DIR` is resolved when the front end is lowered, before its build script ran: its `include!(concat!(env!(\"OUT_DIR\"), ..))` reads the disk, finds no file and keeps that as an input; its cfgs are the plan's, not the script's. Each run applied then resolves the crate and its dependents again (reth's cold build: 12,768 `nameres crate` spans, 320 s of CPU, for about 900 crates), and rows made in between are keyed by modules a cfg later takes away.",
+   "cost": "cold-build time; and the dead rows the changed-set walk contains with `UNWOUND_MOST`",
+   "cause": "readiness is the job graph's (`waits.ready`), and the maintainer does not ask it",
+   "workaround": "this lane settled the stale file reads when a run is applied (a344fdd9fc); the eager resolve itself stands",
+   "state": "open: resolve a crate when its unit is ready, not at every write"
+  },
+  {
+   "id": "redit-7",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+   "where": "reth under blaze",
+   "what": "`reth-node-ethereum` does not compile at all-1111 (1474ed0ab0): `cannot find type _0 in this scope` in a `tokio::select!` of `snap/run.rs:338` and three E0310 at `node.rs:340`. Every measurement of `-p reth-node-ethereum` is of a build that failed, which `blaze debug edits` refuses.",
+   "cost": "the edit loop had to be measured on its 30 workspace dependencies",
+   "cause": "two front-end bugs, not this lane's",
+   "workaround": "`-p` each workspace dependency of reth-node-ethereum",
+   "state": "open (the real-projects lane)"
+  },
+  {
+   "id": "redit-8",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+   "where": "my own method: `/root/bin/latest`",
+   "what": "The run scripts read the blaze to use from one file, `/root/bin/latest`, at each step: installing a newer blaze while a cold-build-then-edit chain ran would have run the edit under another binary and home. Caught before it happened.",
+   "cost": "none; one check",
+   "cause": "a shared mutable pointer between a build lane and a measuring chain",
+   "workaround": "pinned `latest` until the chain ended; a chain should take its binary as an argument",
+   "state": "fixed in my scripts"
+  },
+  {
+   "id": "redit-9",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+   "where": "blaze: tests under cargo on Linux",
+   "what": "base-db's `extensions::tests::the_extensions_are_read_off_the_leading_inner_attributes` and `budget_tests::a_changed_file_costs_a_constant`, and blaze-lower's `code::tests::what_could_read_another_file_is_not_alone` and `tests::readers_of_two_run_classes_keep_their_keys_apart_by_the_runs_identities` fail on this lane's tree, and the same four fail on the untouched tip (1474ed0ab0), run there in a worktree and target directory of its own.",
+   "cost": "a baseline worktree and build to tell them from the lane's changes",
+   "cause": "tests that landed unrun, as rev-1 and real-5 say",
+   "workaround": "a detached worktree of 1474ed0ab0 with its own target directory",
+   "state": "open"
   }
  ]
 }
