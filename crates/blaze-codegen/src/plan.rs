@@ -589,8 +589,9 @@ mod tests {
     /// same two whichever goal a build first asked with.
     #[test]
     fn the_two_tiers_of_a_function_are_two_store_keys() {
-        use crate::Instance;
         use blaze_items::CodeHash;
+
+        use crate::Instance;
         let key = |level: OptLevel| {
             let choice = policy(level, Mode::Output).choose(&member(), None).unwrap();
             let instance = Instance {
