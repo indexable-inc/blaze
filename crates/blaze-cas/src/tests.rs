@@ -11,6 +11,7 @@ use crate::read::Found;
 mod block_checks;
 mod collect;
 mod model_check;
+mod place_copy;
 mod place_crash;
 mod place_made;
 mod place_race;
@@ -2335,20 +2336,6 @@ fn a_clone_placed_where_a_program_starts_is_prewarmed_before_its_rename() {
     assert_eq!(asked(&unstarted), ["clone", "rename"]);
 }
 
-#[test]
-fn where_blocks_cannot_be_shared_a_place_fails_and_copies_nothing() {
-    let mut sim = Sim::new(10, Faults { no_clone: true, ..Faults::default() });
-    let mut store = open(&mut sim, "store");
-    store.put(key(1), Kind::Query, &noise(EXTERNAL_FROM, 100)).unwrap();
-    flush(&mut sim, &mut store);
-    let mut effects = Vec::new();
-    store.place(&key(1), name("out/q"), &mut effects).unwrap();
-    drive(&mut sim, &mut store, &mut effects);
-    let placed = store.placed();
-    assert!(matches!(&placed[0].result, Err(why) if why.contains("does not copy")), "{placed:?}");
-    assert!(!sim.exists(&name("out/q")));
-}
-
 /// The first places of an output are its bytes written where they go, while the store's own
 /// whole file of it is written, sealed and written back beside them: none waits for that
 /// file, and none is a clone of a file just written. Once it is written back, a place is a
@@ -2755,26 +2742,6 @@ fn a_place_held_for_the_look_is_refused_when_the_store_breaks_meanwhile() {
     drive(&mut sim, &mut store, &mut effects);
     assert_eq!(store.placed(), Vec::new(), "nothing is placed after the refusal");
     assert!(!sim.exists(&name("two/build/a")));
-}
-
-#[test]
-fn where_an_output_cannot_be_cloned_its_place_fails_and_copies_nothing() {
-    let mut sim = Sim::new(12, Faults { no_clone: true, ..Faults::default() });
-    let mut store = open(&mut sim, "store");
-    store.put(key(1), Kind::Output, &noise(CHUNK_FROM as usize, 120)).unwrap();
-    flush(&mut sim, &mut store);
-    let mut effects = Vec::new();
-    // Its first place is its bytes written where they go, which shares no block.
-    store.place(&key(1), name("out/a"), &mut effects).unwrap();
-    drive(&mut sim, &mut store, &mut effects);
-    assert_eq!(store.placed()[0].result, Ok(()));
-    // The next is a clone of the store's whole file of it: refused, and nothing copies.
-    store.place(&key(1), name("out/b"), &mut effects).unwrap();
-    drive(&mut sim, &mut store, &mut effects);
-    let placed = store.placed();
-    assert!(matches!(&placed[0].result, Err(why) if why.contains("does not copy")), "{placed:?}");
-    assert_eq!(placed[0].bytes, PlacedBytes::default());
-    assert!(!sim.exists(&name("out/b")));
 }
 
 #[test]
