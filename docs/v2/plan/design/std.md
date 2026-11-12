@@ -1063,9 +1063,22 @@ map 1) and never within the room; a content map equals the distinct values by id
 inserts and removes; a claimed id that is not the value's is refused and stores nothing; keys
 picked to collide under a known hasher spread under a key.
 
-Measured (`collections_cost`, COST_ROWS):
+Cost rows are printed by `cargo test --release -p blaze-hash --lib collections_cost -- --ignored
+--nocapture` (insert, hash and lookup, and iteration of a million `u32` ids for `IndexMap`, the
+`indexmap` crate and `HashMap`; lookup of a million 32-byte hashes for `ByHash` and
+`HashMap<[u8; 32]>`). Not measured yet: no run of it has printed (2026-11-12); the numbers go
+here with the commit and the machine's load when one has.
 
-Moving blaze's own code off the `indexmap` crate: MOVE_ROWS
+Moving blaze's own code off the `indexmap` crate: nothing has moved yet, and `.clippy.toml` does
+not ban it yet. Its uses are 53 files of 14 crates, nearly all through `base_db::FxIndexMap` and
+`FxIndexSet` (hir-def 18 files, hir-ty 9, blaze-diagnostics 6, blaze-lints 5, base-db 4, ix-prof
+and blaze-engine 2, and one each in span, hir-ty-charon, hir-lint-levels, hir-expand, blaze-query,
+blaze-profile, blaze-explore-core). What a move has to settle first, since these are the front
+end's own tables: equality (`indexmap`'s ignores order, `OrderMap`'s does not, and `FileSet` and
+query values derive `PartialEq` over one); the entry API and serde, which `OrderMap` does not
+have yet; and `blaze_query`'s `container_values!` for it. The ban goes in with the port of
+`base_db`'s two aliases, as one batch (rule whole-ports), with its baseline. Decision D25 is not
+what holds it: `blaze-hash` builds under cargo.
 
 ### Contracts
 
