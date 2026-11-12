@@ -331,8 +331,9 @@ enum Pending {
     Verify(u64),
 }
 
-/// The invariant: a stamp the column saves for a file is the stamp of the file whose bytes the
-/// head holds there, so a path whose stamp is the saved one need not be read ([`Look::Same`])
+/// What a saved stamp promises: the stamp the column saves for a file is that of the file
+/// whose bytes the head holds there, so a path whose stamp is the saved one need not be
+/// read ([`Look::Same`])
 /// and a name with a gone file's stamp is that file, taken from the head ([`Look::Moved`]).
 /// A read by name is not tied to the stamp taken before it: the name can be renamed away
 /// (the read then finds nothing, which [`Effect::ReadAll`] gives as empty), replaced, or
