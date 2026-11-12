@@ -536,6 +536,7 @@ static LAST_LOOK: Lock<PathBuf> = Lock::new("vfs.outside.last_look", PathBuf::ne
 /// `include!` read), blaze-lints' `profile::load` (a lint profile) and the daemon's pinned
 /// native layouts. While looks are named ([`name_looks`]) the path is kept for
 /// [`last_look`].
+#[track_caller]
 pub fn looked(path: &Path) {
     LOOKS.fetch_add(1, Ordering::Relaxed);
     if NAMING.load(Ordering::Relaxed) {
@@ -543,11 +544,12 @@ pub fn looked(path: &Path) {
         last.clear();
         last.push(path); // alloc: grows to the longest path looked at, then is used again
         drop(last);
+        let by = std::panic::Location::caller();
         let mut named = NAMED_LOOKS.lock();
         match named.iter().position(|it| it.0 == path) {
             Some(at) => named[at].1 += 1,
             // alloc: at most `LOOKS_NAMED` paths a stretch of naming
-            None if named.len() < LOOKS_NAMED => named.push((path.to_path_buf(), 1)),
+            None if named.len() < LOOKS_NAMED => named.push((path.to_path_buf(), 1, by)),
             None => {}
         }
     }
@@ -558,13 +560,13 @@ pub const LOOKS_NAMED: usize = 16;
 
 /// The first [`LOOKS_NAMED`] distinct paths looked at while looks were named, each with how
 /// many times.
-static NAMED_LOOKS: Lock<Vec<(PathBuf, u32)>> = Lock::new("vfs.outside.named_looks", Vec::new());
+static NAMED_LOOKS: Lock<Vec<(PathBuf, u32, &'static std::panic::Location<'static>)>> = Lock::new("vfs.outside.named_looks", Vec::new());
 
 /// The distinct paths looked at since the last call while looks were named (the first
 /// [`LOOKS_NAMED`] of them), each with how many times, and forgets them: for whoever says
 /// why a build was not answered again, which the last look alone does not (one path named
 /// where a build looked at many kinds).
-pub fn take_named_looks() -> Vec<(PathBuf, u32)> {
+pub fn take_named_looks() -> Vec<(PathBuf, u32, &'static std::panic::Location<'static>)> {
     std::mem::take(&mut *NAMED_LOOKS.lock())
 }
 

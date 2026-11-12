@@ -4421,8 +4421,8 @@ impl<S: Steps> Jobs<S> {
             let paths: Vec<String> =
                 looked
                     .iter()
-                    .map(|(path, times)| {
-                        format!("{} ({times}: {})", path.display(), blaze_vfs::outside::why_looked(path))
+                    .map(|(path, times, by)| {
+                        format!("{} ({times} by {by}: {})", path.display(), blaze_vfs::outside::why_looked(path))
                     })
                     .collect();
             tracing::info!(
