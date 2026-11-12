@@ -409,13 +409,18 @@ pub struct Finished<'a> {
     pub took_ms: u64,
     /// `None` for a request that sent no work report (a failed load, `doc`).
     pub work: Option<Work>,
+    /// The one program the build placed, where it placed exactly one: its path, whole.
+    pub program: Option<&'a str>,
+    /// What that program takes on disk, in bytes.
+    pub size_bytes: Option<u64>,
 }
 
 /// `build-finished`, without its newline: cargo's `reason` and `success` first, then blaze's
 /// own fields, each always present (`null` where unknown), so a reader's shape never varies:
 /// `{"reason":"build-finished","success":true,"profile":"dev","served":"daemon","took_ms":812,
 /// "build_id":7,"units":{"built":2,"replayed":40},"links":{"first":0,"spliced":1,"unchanged":0,
-/// "full":0}}`. docs/cargo.md names each field.
+/// "full":0},"program":"/w/target/debug/app","size_bytes":4123456}`. docs/cargo.md names each
+/// field.
 pub fn build_finished(out: &mut String, finished: &Finished<'_>) {
     out.push_str(r#"{"reason":"build-finished","success":"#);
     boolean(out, finished.success);
@@ -444,10 +449,18 @@ pub fn build_finished(out: &mut String, finished: &Finished<'_>) {
             num(out, work.unchanged);
             out.push_str(r#","full":"#);
             num(out, work.full);
-            out.push_str("}}");
+            out.push('}');
         }
-        None => out.push_str(r#","units":null,"links":null}"#),
+        None => out.push_str(r#","units":null,"links":null"#),
     }
+    out.push_str(r#","program":"#);
+    opt(out, finished.program);
+    out.push_str(r#","size_bytes":"#);
+    match finished.size_bytes {
+        Some(bytes) => num(out, bytes),
+        None => out.push_str("null"),
+    }
+    out.push('}');
 }
 
 /// The name of the profile a `Finished` text names (`` `dev` profile [unoptimized + debuginfo]

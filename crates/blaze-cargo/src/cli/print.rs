@@ -678,8 +678,10 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
             .as_ref()
             .and_then(|built| blaze_thin::answer::placed(&built.artifacts))
             .map(str::to_owned); // alloc: a path, once a build
+        let size_bytes = program.as_deref().and_then(blaze_thin::answer::on_disk);
+        let said_program = program.clone(); // clone: a path, once a build
         let built = blaze_screen::Built {
-            size_bytes: program.as_deref().and_then(blaze_thin::answer::on_disk),
+            size_bytes,
             ok,
             compiled: work.map_or(0, |it| it.built),
             cached: work.map_or(0, |it| it.replayed),
@@ -720,6 +722,8 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
                 served: json::Served::HERE,
                 took_ms: u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
                 work: self.work,
+                program: said_program.as_deref(),
+                size_bytes,
             };
             json::build_finished(&mut self.line, &finished);
             self.line.push('\n');

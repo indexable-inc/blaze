@@ -174,7 +174,7 @@ program or the tests print. cargo's has only `success`; blaze's carries what a t
 otherwise read from the build's last line on stderr and the daemon's log, each field always present,
 `null` where there is nothing to say:
 
-    {"reason":"build-finished","success":true,"profile":"dev","served":"daemon","took_ms":812,"build_id":7,"units":{"built":2,"replayed":40},"links":{"first":0,"spliced":1,"unchanged":0,"full":0}}
+    {"reason":"build-finished","success":true,"profile":"dev","served":"daemon","took_ms":812,"build_id":7,"units":{"built":2,"replayed":40},"links":{"first":0,"spliced":1,"unchanged":0,"full":0},"program":"/w/target/debug/app","size_bytes":4123456}
 
 - `success`: as cargo's.
 - `profile`: the profile's name, `null` when the build placed nothing (it failed first).

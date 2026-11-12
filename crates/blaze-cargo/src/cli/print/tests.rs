@@ -126,6 +126,8 @@ fn finished_line(profile: Option<&str>, work: Option<json::Work>) -> String {
         served: json::Served::HERE,
         took_ms: 1234,
         work,
+        program: None,
+        size_bytes: None,
     };
     json::build_finished(&mut out, &finished);
     out
