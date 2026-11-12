@@ -5,7 +5,7 @@ import { description } from "../help.ts";
 import { Repl } from "../repl.ts";
 import { docs, functions, help } from "./index.ts";
 
-/** Bytes of the tool description every conversation pays for. Before help() it was 25,354 (2026-11-12). */
+/** Bytes of the tool description every conversation pays for. Before help() it was 25,230 (measured through MCP, 2026-11-12); it is 1,471 now. */
 const DESCRIPTION_BUDGET = 2048;
 
 /** What a cell really has in scope: the functions and what the kernel installs beside them (the UI's). */
