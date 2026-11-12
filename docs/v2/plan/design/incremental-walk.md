@@ -183,7 +183,10 @@ requests that build, and never beside a request's job.
 
 **Small loops run here.** A loop of at most 32 items predicted under 2 ms from its own
 site's small runs (`blaze_graph::par::Small`) runs on its calling thread with no job
-submitted: the changed-set walk's levels, the body check's tasks, the codegen walk's asks.
+submitted: the body check's tasks, the codegen walk's asks. The changed-set walk's levels
+keep their own bound (under 64 rows on the walker's thread): a level's rows read each
+other, and at 32 a level of about 55 rows went to the pool and its jobs waited on each
+other without end (a hello-world body edit hung in `names`, 2026-11-11).
 A unit's phases are still plane tasks, each a dispatch: the edit's chain is one thread
 within a stage, not yet across them.
 

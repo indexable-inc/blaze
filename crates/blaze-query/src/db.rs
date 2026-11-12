@@ -898,8 +898,10 @@ pub fn par_for_each(count: usize, task: impl Fn(usize) + Sync) {
 /// costs less than its dispatch ([`blaze_graph::par::Small`]: at most
 /// [`blaze_graph::par::SMALL_ITEMS`] tasks, predicted under a few milliseconds from this
 /// site's own small runs): no job is submitted, so nothing is stolen, no worker is woken and
-/// the caller does not park. What an edit's own chain goes through: the changed-set walk's
-/// levels, the body check's tasks, the codegen walk's asks, each one to a few items.
+/// the caller does not park. What an edit's own chain goes through: the body check's tasks
+/// and the codegen walk's asks, each one to a few items that do not wait on each other. (The
+/// changed-set walk's levels keep their own bound, `frontier::PAR_AT`: a level's rows read
+/// each other, and are verified on the walker's thread below it.)
 ///
 /// Why a task may run as a call here, where [`par_for_each`] runs each in a job. On the pool
 /// a task that asks for a key this caller runs gives way and is run again here, on this
