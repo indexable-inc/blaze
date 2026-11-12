@@ -136,8 +136,27 @@ impl ProcessEnv {
 }
 
 /// The variable `key` of the process the build is for.
+///
+/// Read through a memo a variable ([`process_var`]), never the map itself: a query that
+/// reads one variable reads that variable's row, whose value is the same when another
+/// variable changes, so the change stops there. Until 2026-11-11 every reader read
+/// [`ProcessEnv`]'s one field of all the variables, and a request whose environment differed
+/// in any variable, read by nothing, had every reader of any variable (each `env!` and
+/// `option_env!` expansion, and all that reads those) verified or run again.
 pub fn process_env_var(db: &Db, key: &str) -> Option<String> {
-    ProcessEnv::try_get(db)?.vars(db).get(key)
+    // clone: the variable's value, as its caller takes it
+    process_var(db, intern::Symbol::intern(key), ()).clone()
+}
+
+/// The process's variable `name` ([`ProcessEnv`]): the one reader of the map of all of them.
+/// Its key covers what it reads (rule keys-cover-every-input): the name is its argument and
+/// the map its one tracked read, so it runs again whenever any variable is written and
+/// gives the same value, to the same readers, unless `name`'s own changed.
+// The `()`: a key of one argument must be an ID of the database, and a name is none; two
+// arguments are interned together.
+#[blaze_query::tracked(returns(ref))]
+fn process_var(db: &Db, name: intern::Symbol, _interned: ()) -> Option<String> {
+    ProcessEnv::try_get(db)?.vars(db).get(name.as_str())
 }
 
 /// What of the process's variables the database's crates read: each `env!` or `option_env!`

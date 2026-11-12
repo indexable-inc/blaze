@@ -37,7 +37,7 @@
 //! edit removed): a pull would never run it. So a verification that unwinds for any reason
 //! but the caller's own (a write pending, its fuel) is contained: the engine's guard puts the
 //! row's word back, the walk counts it, names it as changed and goes on, and does not ask it
-//! again until something else brought it up to date ([`Walked::unwound`]).
+//! again until something else brought it up to date ([`Walked::apart`]).
 //!
 //! Persistence: none. The storage is memory (a restart makes another storage), and the index
 //! is made from the rows' own edges: empty with an empty storage, it holds the invariant from
@@ -78,13 +78,75 @@ struct Found {
     nodes: Vec<u32>,
 }
 
-/// The most nodes the walks' findings keep, and the most walks: past either the oldest go,
-/// and a host that asks from before them is told so ([`Unknown::Before`]).
+/// The most walks' findings kept apart, and the most nodes they hold before the oldest are
+/// merged ([`merge_oldest`]): past either, the oldest findings become one, of the newest view
+/// among them. Nothing is dropped, so a host that asks from any earlier view is answered
+/// (there is no "before the log": a host with nothing to start from would have to take
+/// everything it holds as changed, which is the sweep the changed set replaces).
 const LOG_NODES: usize = 1 << 20;
 const LOG_WALKS: usize = 256;
 
-/// The rows one level of a walk verifies before it hands them to the pool.
-const PAR_AT: usize = 64;
+/// Merges the oldest findings of `log` where it is over its bounds: more than [`LOG_WALKS`]
+/// walks (the older half becomes one), or more nodes than [`LOG_NODES`] and twice what its
+/// oldest finding holds (all become one). The merged finding holds each node once and is of
+/// the newest view merged.
+///
+/// Why an answer stays right: [`changed_ids_since`] names the nodes of every finding whose
+/// view is after the one asked from. A finding merged into one of a later view is named
+/// whenever it was before (its own view is no later than the merged one), and to a host that
+/// asks from between the two it is named where it was not: a name too many, which
+/// [`Changed::Keys`] allows and costs the host one ask of a row that is up to date.
+///
+/// Cost: the node bound is at least twice the oldest finding, so the findings merged into it
+/// hold as many nodes as it does: each node is copied a number of times logarithmic in the
+/// log's size, never once a walk. Memory: each node once in the oldest finding, so at most 4
+/// bytes a node of the storage beside [`LOG_NODES`] of newer ones.
+fn merge_oldest(log: &mut Vec<Arc<Found>>) {
+    let nodes: usize = log.iter().map(|it| it.nodes.len()).sum();
+    let most = LOG_NODES.max(log.first().map_or(0, |it| 2 * it.nodes.len()));
+    let merged = if nodes > most {
+        log.len()
+    } else if log.len() > LOG_WALKS {
+        log.len() - LOG_WALKS / 2
+    } else {
+        return;
+    };
+    if merged < 2 {
+        return;
+    }
+    let at = log[merged - 1].at;
+    let mut all: Vec<u32> = Vec::new(); // alloc: the merged finding, each changed node once
+    for found in log.drain(..merged) {
+        all.extend_from_slice(&found.nodes);
+    }
+    all.sort_unstable();
+    all.dedup();
+    all.shrink_to_fit();
+    log.insert(0, Arc::new(Found { at, nodes: all })); // alloc: as above
+}
+
+/// The rows of one level past which a walk stops verifying and marks: a level of fewer is
+/// verified on the walker's thread, one row after the other, with early cutoff; from the
+/// first level of this many on, every row the walk reaches is set apart unverified
+/// ([`Walked::apart`]), named as changed, and its readers reached in turn.
+///
+/// Why a wide level is marked and not verified. Verifying a row pulls what it reads, and
+/// the rows of one level read each other and the rows the walk has yet to reach. Until
+/// 2026-11-11 a wide level was handed to the pool a job a row: each job waited on runs
+/// other jobs of the level held, gave way and asked again, and the walk also ran again
+/// every evicted row it reached, asked for or not. After a change the whole program reads
+/// (measured: a first `blaze test` after `run`, `changed set` 465 s, 108,508 waits of
+/// 23,548 thread-seconds, 84,075 bodies run again) sixteen cores spent eight minutes
+/// waiting on each other. A change that reaches a wide level is broad, and a broad change
+/// gains little from the walk's cutoff: so the walk follows the reverse edges only (loads,
+/// no query run, no wait, nothing given way to) and leaves each marked row to whoever asks
+/// for it, verified then as any pull verifies, by the hosts' own tasks on all cores. A row
+/// nothing asks for is never run.
+///
+/// What stays true: a row the walk did not reach is unchanged ([`clean`]); a marked row is
+/// never taken as clean; every row whose value changed is named, with marked rows named
+/// too, which may be unchanged (a name too many costs its host one ask).
+const WIDE: usize = 64;
 
 /// What the walks keep between them. Its vectors are taken out by the walker (the holder of
 /// the walk's flight) and put back, so the lock is held for moves only.
@@ -92,17 +154,17 @@ const PAR_AT: usize = 64;
 struct Walked {
     /// The view the last walk ended in.
     done: u64,
-    /// [`changed_since`] answers a view at or after this.
-    floor: u64,
     log: Arc<Vec<Arc<Found>>>,
     /// The field nodes written since the last walk.
     written: Vec<u32>,
     /// The rows whose last run made an untracked read, sorted.
     untracked: Vec<u32>,
-    /// Rows whose verification by a walk unwound, each with its `verified` word then: not
+    /// Rows a walk set apart: those of a wide level and past it, marked unverified
+    /// ([`WIDE`]), and those whose verification unwound; each with its `verified` word then,
+    /// sorted by node, each node once. Not
     /// asked again by a walk while the word stands, named as changed whenever reached, and
     /// never taken as clean ([`clean`]). Replaced whole by a walk that ended.
-    unwound: Arc<Vec<(u32, u32)>>,
+    apart: Arc<Vec<(u32, u32)>>,
     work: ChangedSetWork,
 }
 
@@ -125,6 +187,9 @@ pub struct ChangedSetWork {
     pub changed: u64,
     /// Verifications that unwound and were contained.
     pub unwound: u64,
+    /// Rows marked unverified: those of the first wide level ([`WIDE`] rows) and every row
+    /// reached past it. 0 for an edit whose every level is narrow.
+    pub marked: u64,
 }
 
 /// A bug planted in the walk or its feeds, for the simulation's controls: each is one
@@ -144,6 +209,10 @@ pub(crate) enum Plant {
     NamesEqualRows,
     /// The walk passes over a row whose value was evicted.
     SkipsEvictedRows,
+    /// The walk follows no reverse edge: neither the readers of an input field that was
+    /// written nor those of a row a pull ran and found changed are asked, so nothing the
+    /// walk alone would find is found.
+    ForgetsReadersOfWritten,
 }
 
 /// The storage's part of the changed set.
@@ -158,7 +227,7 @@ pub(crate) struct Frontier {
     /// The view the last walk ended in ([`Storage::view`]'s number), 0 before any: while it
     /// is the storage's view, a row not verified in it is unchanged ([`clean`]).
     clean_at: AtomicU64,
-    /// How many rows [`Walked::unwound`] holds.
+    /// How many rows [`Walked::apart`] holds.
     unwound: AtomicU32,
     plant: Plant,
 }
@@ -230,6 +299,16 @@ impl Storage {
     #[cfg(test)]
     pub(crate) fn plant_in_changed_set(&mut self, plant: Plant) {
         self.frontier.plant = plant;
+    }
+
+    /// Plants [`Plant::ForgetsReadersOfWritten`] in this storage's changed set: for the
+    /// control of a host's test that an edit reaches what reads it (hir's body check), which
+    /// cannot name the engine's own plants. With every reverse edge dropped, a row no pull
+    /// ran is taken as unchanged after an edit, and the host's oracle, a build from scratch,
+    /// must say so. Never called outside a test.
+    #[doc(hidden)]
+    pub fn plant_forgotten_readers_of_written(&mut self) {
+        self.frontier.plant = Plant::ForgetsReadersOfWritten;
     }
 
     /// An input field's node was written (with `&mut`: its setter).
@@ -334,9 +413,6 @@ pub enum Changed<K> {
 /// changed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Unknown {
-    /// The view asked from is before what the walks' findings keep (they keep the last
-    /// [`LOG_WALKS`] walks and [`LOG_NODES`] nodes): `floor` is the earliest view they answer.
-    Before { floor: View },
     /// The view asked from is not one of this storage's: it is after its current view.
     NotAView { view: View },
     /// Asked from inside a query while a walk is due: a walk is started only from outside
@@ -347,11 +423,6 @@ pub enum Unknown {
 impl std::fmt::Display for Unknown {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Unknown::Before { floor } => write!(
-                f,
-                "the view asked from is before view {}, the earliest the changed sets kept answer",
-                floor.as_u64()
-            ),
             Unknown::NotAView { view } => {
                 write!(f, "the view asked from is after the storage's view {}", view.as_u64())
             }
@@ -396,15 +467,9 @@ pub fn changed_ids_since<F: Function>(db: &F::Db, since: View) -> Changed<Id> {
         bring_to_date(std::ptr::from_ref(db).cast(), storage);
     }
     let index = F::ingredient().index();
-    let (log, floor) = {
-        let walked = storage.frontier.walked.lock();
-        (Arc::clone(&walked.log), walked.floor) // clone: a count, no allocation under the lock
-    };
+    let log = Arc::clone(&storage.frontier.walked.lock().log); // clone: a count, no allocation under the lock
     if since > storage.view() {
         return Changed::Unknown(Unknown::NotAView { view: storage.view() });
-    }
-    if since.as_u64() < floor {
-        return Changed::Unknown(Unknown::Before { floor: View(floor) });
     }
     let from = log.partition_point(|found| found.at <= since.as_u64());
     let mut ids: Vec<u32> = Vec::new(); // alloc: the caller's answer, the changed keys
@@ -575,7 +640,7 @@ fn walk(db: *const (), storage: &Storage) {
             written: std::mem::take(&mut walked.written),
             untracked: std::mem::take(&mut walked.untracked),
         };
-        (taken, Arc::clone(&walked.unwound)) // clone: a count
+        (taken, Arc::clone(&walked.apart)) // clone: a count
     };
     // Named, with what it did: the size of the changed set, the rows visited and the edges
     // walked for this edit (rule 16).
@@ -589,6 +654,7 @@ fn walk(db: *const (), storage: &Storage) {
         edges = tracing::field::Empty,
         changed = tracing::field::Empty,
         unwound = tracing::field::Empty,
+        marked = tracing::field::Empty,
     );
     let _entered = walking.enter();
     let mut plan = Plan::new();
@@ -605,7 +671,8 @@ fn walk(db: *const (), storage: &Storage) {
         row_of(storage, node)
             .is_some_and(|(header, _, _)| header.meta.load(Ordering::Relaxed) & UNTRACKED != 0)
     });
-    // A row whose verification unwound stands apart while its word does.
+    // A row set apart (marked past a wide level, or its verification unwound) stands apart
+    // while its word does: a pull that brought it up to date since took it out.
     // alloc: the rows set apart, none in a build whose every row verifies
     let mut unwound: Vec<(u32, u32)> = apart
         .iter()
@@ -616,7 +683,12 @@ fn walk(db: *const (), storage: &Storage) {
         })
         .collect();
 
-    let mut changed: Vec<u32> = taken.written.clone(); // alloc: a walk's lists, what the edit reaches
+    // alloc: a walk's lists, what the edit reaches
+    let mut changed: Vec<u32> = match plant {
+        Plant::ForgetsReadersOfWritten => Vec::new(),
+        // clone: the written fields, a word each; `taken` keeps them should the walk unwind
+        _ => taken.written.clone(),
+    };
     let mut found: Vec<u32> = Vec::new(); // alloc: as above
     let mut suspects: Vec<u32> = Vec::new(); // alloc: as above
     for &node in &taken.untracked {
@@ -625,6 +697,11 @@ fn walk(db: *const (), storage: &Storage) {
             work.untracked += 1;
         }
     }
+    // The rows set apart, by node: those kept from the walks before and this walk's.
+    let mut apart_now = Seen::with_hasher(blaze_hash::FixedState);
+    apart_now.extend(unwound.iter().map(|it| it.0)); // alloc: as above
+    // Whether a wide level was met: from it on the walk marks and verifies nothing.
+    let mut broad = false;
     let mut first = true;
     loop {
         // What said it changed, by this walk's verifications or by any pull since the last.
@@ -635,6 +712,9 @@ fn walk(db: *const (), storage: &Storage) {
             }
         }
         first = false;
+        if plant == Plant::ForgetsReadersOfWritten {
+            changed.clear();
+        }
         plan.suspects(&frontier.reverse, &mut changed, &mut suspects);
         if suspects.is_empty() {
             if frontier.changed.is_empty() || plant == Plant::StopsAtChangedReader {
@@ -644,7 +724,7 @@ fn walk(db: *const (), storage: &Storage) {
         }
         // A row set apart is not verified again: it is named, and its readers are asked.
         suspects.retain(|&node| {
-            let apart = unwound.iter().any(|&(it, _)| it == node);
+            let apart = apart_now.contains(&node);
             if apart {
                 changed.push(node);
                 found.push(node);
@@ -652,15 +732,36 @@ fn walk(db: *const (), storage: &Storage) {
             !apart
         });
         let db = Db(db);
+        // A wide level, and every level after it: marked, not verified ([`WIDE`]). A row
+        // never made or emptied has nothing to mark; one up to date in this view said so
+        // if it changed.
+        broad |= suspects.len() >= WIDE;
+        if broad {
+            let view_bits = storage.view_bits();
+            for &node in &suspects {
+                let Some((header, _, _)) = row_of(storage, node) else { continue };
+                let word = header.verified.load(Ordering::Acquire);
+                if word & (VIEW_MASK | RUNNING | PROVISIONAL) == 0 {
+                    continue;
+                }
+                if word & (RUNNING | PROVISIONAL) == 0 && word & VIEW_MASK == view_bits {
+                    continue;
+                }
+                changed.push(node);
+                found.push(node);
+                if apart_now.insert(node) {
+                    unwound.push((node, word)); // alloc: as above
+                }
+                work.marked += 1;
+            }
+            suspects.clear();
+            continue;
+        }
         let seen: Vec<AtomicU8> = suspects.iter().map(|_| AtomicU8::new(0)).collect(); // alloc: as above
         let one = |at: usize| {
             seen[at].store(verify(db, storage, suspects[at], plant) as u8, Ordering::Relaxed);
         };
-        if suspects.len() < PAR_AT {
-            (0..suspects.len()).for_each(one);
-        } else {
-            super::par_for_each(suspects.len(), one);
-        }
+        (0..suspects.len()).for_each(one);
         for (at, &node) in suspects.iter().enumerate() {
             let seen = seen[at].load(Ordering::Relaxed);
             if seen == Seen1::Unsure as u8 || seen == Seen1::Unwound as u8 {
@@ -669,7 +770,9 @@ fn walk(db: *const (), storage: &Storage) {
             }
             if seen == Seen1::Unwound as u8 {
                 work.unwound += 1;
-                if let Some((header, _, _)) = row_of(storage, node) {
+                if let Some((header, _, _)) = row_of(storage, node)
+                    && apart_now.insert(node)
+                {
                     unwound.push((node, header.verified.load(Ordering::Acquire))); // alloc: as above
                 }
             }
@@ -694,32 +797,41 @@ fn walk(db: *const (), storage: &Storage) {
     walking.record("edges", work.edges);
     walking.record("changed", work.changed);
     walking.record("unwound", work.unwound);
+    walking.record("marked", work.marked);
+    // The walk's work, kept with the build it ran in (`blaze explain edit_work`): a walk
+    // that verified or reached more than the edit did shows here first.
+    tracing::info!(
+        target: "blaze",
+        stage = super::edit_work::CHANGED_SET,
+        written = work.written,
+        untracked = work.untracked,
+        visited = work.visited,
+        edges = work.edges,
+        changed = work.changed,
+        unwound = work.unwound,
+        marked = work.marked,
+        "edit work"
+    );
 
-    // The findings: this walk's after the kept ones, the oldest dropped past the bounds.
+    // The findings: this walk's after the kept ones, the oldest merged past the bounds. A
+    // walk that found nothing leaves the kept log as it is.
     let kept = Arc::clone(&frontier.walked.lock().log); // clone: a count
-    let mut floor = None;
-    let mut log: Vec<Arc<Found>> = kept.iter().cloned().collect(); // alloc: the log's list, at most `LOG_WALKS` pointers
-    if !found.is_empty() {
+    let log = if found.is_empty() {
+        kept
+    } else {
+        let mut log: Vec<Arc<Found>> = kept.iter().cloned().collect(); // alloc: the log's list, at most `LOG_WALKS` pointers
         log.push(Arc::new(Found { at: view, nodes: found })); // alloc: a walk's findings
-    }
-    let mut nodes: usize = log.iter().map(|it| it.nodes.len()).sum();
-    let mut drop_to = 0;
-    while log.len() - drop_to > LOG_WALKS || (nodes > LOG_NODES && drop_to < log.len()) {
-        nodes -= log[drop_to].nodes.len();
-        floor = Some(log[drop_to].at);
-        drop_to += 1;
-    }
-    log.drain(..drop_to);
-    let log = Arc::new(log); // alloc: as above
-    let apart = unwound.len() as u32;
+        merge_oldest(&mut log);
+        Arc::new(log) // alloc: as above
+    };
+    // Sorted by node, each once ([`set_apart`] searches it).
+    unwound.sort_unstable_by_key(|it| it.0);
+    let apart = u32::try_from(unwound.len()).unwrap_or(u32::MAX);
     let unwound = Arc::new(unwound); // alloc: as above
     taken.written.clear();
     let mut walked = frontier.walked.lock();
     walked.log = log;
-    walked.unwound = unwound;
-    if let Some(floor) = floor {
-        walked.floor = walked.floor.max(floor);
-    }
+    walked.apart = unwound;
     walked.done = view;
     walked.work = work;
     drop(walked);
@@ -753,8 +865,8 @@ pub(crate) fn clean(storage: &Storage, header: &Header, node: u32) -> bool {
 
 #[cold]
 fn set_apart(frontier: &Frontier, node: u32) -> bool {
-    let apart = Arc::clone(&frontier.walked.lock().unwound); // clone: a count
-    apart.iter().any(|&(it, _)| it == node)
+    let apart = Arc::clone(&frontier.walked.lock().apart); // clone: a count
+    apart.binary_search_by_key(&node, |it| it.0).is_ok()
 }
 
 /// Walks the changed set of this view if a walk is due: what a host calls once after its
@@ -770,3 +882,77 @@ pub fn walk_changed_set<D: Database>(db: &D) -> ChangedSetWork {
     storage.changed_set_work()
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn found(at: u64, nodes: &[u32]) -> Arc<Found> {
+        Arc::new(Found { at, nodes: nodes.to_vec() })
+    }
+
+    /// The nodes the log names to a host that asks from view `since`, each once, in order:
+    /// what [`changed_ids_since`] reads of it.
+    fn named(log: &[Arc<Found>], since: u64) -> Vec<u32> {
+        let from = log.partition_point(|it| it.at <= since);
+        let mut nodes: Vec<u32> = log[from..].iter().flat_map(|it| it.nodes.iter().copied()).collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes
+    }
+
+    /// The invariant: merging the log's oldest findings loses no name. A host that asks from
+    /// any view, the views before the merged findings too, is named every node it was named
+    /// before the merge (it may be named more), so no host is ever told the log cannot
+    /// answer and left to sweep everything it holds.
+    #[test]
+    fn a_merged_log_names_every_node_it_named_before_from_every_view() {
+        // More walks than the log keeps apart, each of two nodes, one shared with the next.
+        let walks = LOG_WALKS as u64 + 40;
+        let whole: Vec<Arc<Found>> =
+            (1..=walks).map(|at| found(at * 3, &[at as u32, at as u32 + 1])).collect();
+        let mut merged = whole.clone();
+        merge_oldest(&mut merged);
+        assert!(merged.len() <= LOG_WALKS, "{} findings kept apart", merged.len());
+        assert!(merged.windows(2).all(|it| it[0].at < it[1].at), "the log stays in view order");
+        assert!(merged[0].nodes.windows(2).all(|it| it[0] < it[1]), "a merged finding holds each node once");
+        for since in 0..=walks * 3 + 1 {
+            let (before, after) = (named(&whole, since), named(&merged, since));
+            assert!(
+                before.iter().all(|node| after.binary_search(node).is_ok()),
+                "asked from view {since}: the merged log names {after:?}, the whole one {before:?}"
+            );
+        }
+        // At and after the merged finding's view the answer is the same: nothing more is named.
+        let at = merged[0].at;
+        assert_eq!(named(&whole, at), named(&merged, at));
+    }
+
+    /// The control of [`a_merged_log_names_every_node_it_named_before_from_every_view`]: a
+    /// log that drops its oldest findings (what the merge replaced) names less to a host that
+    /// asks from before them, and the oracle says so.
+    #[test]
+    fn the_oracle_catches_a_log_that_drops_its_oldest_findings() {
+        let walks = LOG_WALKS as u64 + 40;
+        let whole: Vec<Arc<Found>> =
+            (1..=walks).map(|at| found(at * 3, &[at as u32, at as u32 + 1])).collect();
+        let dropped = &whole[40..];
+        let (before, after) = (named(&whole, 0), named(dropped, 0));
+        assert!(before.iter().any(|node| after.binary_search(node).is_err()));
+    }
+
+    /// The node bound merges every finding into one, and then only once the newer findings
+    /// hold as many nodes as it does: a walk never copies the whole log.
+    #[test]
+    fn the_node_bound_merges_only_when_the_newer_findings_match_the_oldest() {
+        let big: Vec<u32> = (0..LOG_NODES as u32 + 10).collect();
+        // The oldest holds a quarter: the bound is `LOG_NODES`, which the two pass together.
+        let mut log = vec![found(1, &big[..LOG_NODES / 4]), found(2, &big[LOG_NODES / 4..])];
+        merge_oldest(&mut log);
+        assert_eq!(log.len(), 1, "past the node bound the findings are one");
+        assert_eq!((log[0].at, log[0].nodes.len()), (2, big.len()));
+        log.push(found(3, &[7, 8, 9]));
+        merge_oldest(&mut log);
+        assert_eq!(log.len(), 2, "a small finding after a large one is kept apart");
+    }
+}

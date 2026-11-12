@@ -228,7 +228,10 @@ mod tests {
         }
         assert_eq!(readers(&reverse, 7), (100..10_100).collect::<Vec<u32>>());
         assert_eq!(readers(&reverse, 9_999), Vec::<u32>::new());
-        assert_eq!(reverse.held(), 20_000);
+        // Every thirteenth reader's second add is of node 7 again, the node's newest reader:
+        // a repeat, not kept.
+        let repeats = (0..10_000u32).filter(|reader| reader % 13 == 7).count() as u64;
+        assert_eq!(reverse.held(), 20_000 - repeats);
         // 4 to 8 bytes a reader, and a head a node.
         assert!(reverse.bytes() <= 20_000 * 8 + 14 * 4 + 4096 * 8, "{}", reverse.bytes());
     }

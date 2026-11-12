@@ -3095,10 +3095,30 @@ impl<'a, B: Prepare> Build<'a, B> {
                 owners = tracing::field::Empty,
             );
             let _entered = span.enter();
+            // Set where the front end tells a view and cannot name what changed since it:
+            // the build's error, never a walk that asks of everything in the set's place.
+            let mut no_changed_set: Option<String> = None;
             let patched = match later {
-                None => self.patched(program_walk, roots, static_roots, check, policy_id, view),
+                None => self.patched(
+                    program_walk,
+                    roots,
+                    static_roots,
+                    check,
+                    policy_id,
+                    view,
+                    &mut no_changed_set,
+                ),
                 Some(_) => Err("a lazy build's walk order is not kept"),
             };
+            if let Some(why) = no_changed_set {
+                // The lists go back as the walk did: the refusal changes nothing kept, so
+                // the build after its cause is removed patches both.
+                if let (Some(kept), Some(lists)) = (self.kept, lists.take()) {
+                    kept.keep_lists(program_walk, lists);
+                }
+                // alloc: an error, once
+                return Err(vec![no_changed_set_error(&why)]);
+            }
             let walked = match patched {
                 Ok(patch::Patched { nodes, statics, roots, walk, keep, touched, work }) => {
                     span.record("asked", work.asked);
@@ -5118,6 +5138,29 @@ fn stopped() -> CodegenError {
         none.0,
         none.1,
         "stopped: a body the build compiles failed its check, or its job was cancelled or gave way",
+    )
+}
+
+/// The error of a build whose front end tells a view ([`Frontend::view`]) and could not name
+/// what changed since the view its program's kept walk was made in
+/// ([`Frontend::changed_since`] gave [`Changed::Unknown`]): of no instance, so its keys are
+/// empty. The walk kept of the program starts from that set; asking of every function it
+/// holds in the set's place is the sweep the set replaced, so the build stops and says why
+/// (rule no-fallback).
+///
+/// [`Changed::Unknown`]: crate::backend::Changed::Unknown
+fn no_changed_set_error(why: &str) -> CodegenError {
+    let none = (InstanceKey(ContentId::default()), ItemKey(ContentId::default()));
+    error(
+        none.0,
+        none.1,
+        // alloc: an error
+        format!(
+            "the codegen walk kept of this program starts from the front end's changed set, \
+             and the front end could not name what changed since the kept walk's view: {why}. \
+             There is no walk that asks of every function in its place (blaze-codegen's \
+             driver, rule no-fallback)"
+        ),
     )
 }
 
