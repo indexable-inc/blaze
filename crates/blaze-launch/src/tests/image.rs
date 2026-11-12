@@ -5,7 +5,7 @@
 use hegel::TestCase;
 use hegel::generators as gs;
 
-use crate::image::{Base, Bases, Image, Input, StaticAt, VERSION, lay};
+use crate::image::{Base, Bases, Image, Input, LONGEST, StaticAt, VERSION, Why, lay};
 use crate::record::{Datum, Fixup, Kind, Place, Record, To, Unwind, What};
 use crate::wire::{Arch, Bind, List, Os, RecordId, StaticDef};
 use crate::{CodeId, Slot, Tier};
@@ -300,8 +300,9 @@ fn what_is_no_image_of_this_layout_is_refused_by_name() {
     longer.push(0);
     let why = Image::decode(&longer).unwrap_err().to_string();
     assert!(why.contains("1 bytes after the image"), "{why}");
-    let why = Image::decode(b"not an image at all").unwrap_err().to_string();
-    assert!(why.contains("no image of placed code"), "{why}");
+    let refused = Image::decode(b"not an image at all").unwrap_err();
+    assert_eq!(refused.why, Why::Layout);
+    assert!(refused.what.contains("no image of placed code"), "{refused}");
 }
 
 /// A function that reaches a datum relative to itself, with no word between, cannot be
@@ -341,6 +342,63 @@ fn code_relative_to_what_is_outside_the_mapping_has_no_image() {
         inits: &[],
     };
     let records = |of: &RecordId| (*of == id(1)).then_some(record);
-    let why = lay(&input, &records, &Bases::NONE).unwrap_err().to_string();
-    assert!(why.contains("app::near"), "{why}");
+    let refused = lay(&input, &records, &Bases::NONE).unwrap_err();
+    assert_eq!(refused.why, Why::Relative);
+    assert!(refused.what.contains("app::near"), "{refused}");
+}
+
+/// A program of one static `record` and no function, for a launcher of `arch`.
+fn of_one_static(arch: Arch, record: Record<'static>) -> Result<Image, crate::image::ImageError> {
+    let statics = leak(vec![StaticDef { number: 0, record: id(1), refs: List::of(&[]) }]);
+    let input =
+        Input { arch, os: Os::Linux, page: 4096, slots: 1, statics, binds: &[], entry: Slot(0), inits: &[] };
+    let records = |of: &RecordId| (*of == id(1)).then_some(record);
+    lay(&input, &records, &Bases::NONE)
+}
+
+fn zeroes(arch: Arch, align: u32, size: u64, thread_local: bool, name: &'static str) -> Record<'static> {
+    Record {
+        arch,
+        what: What::Static { mutable: true, thread_local },
+        align,
+        size,
+        bytes: &[],
+        fixups: List::of(&[]),
+        places: List::of(&[]),
+        data: List::of(&[]),
+        unwind: None,
+        name,
+    }
+}
+
+/// Each case in which a program has no image is refused by its name, naming what of the
+/// program: a static aligned past a page, a thread-local where the launcher has none, more
+/// bytes than a message carries. (Code relative to data is the test above; bytes that are
+/// no image, [`what_is_no_image_of_this_layout_is_refused_by_name`].)
+#[test]
+fn each_case_of_no_image_is_refused_by_its_name() {
+    let refused = of_one_static(Arch::X86_64, zeroes(Arch::X86_64, 8192, 8, false, "app::WIDE")).unwrap_err();
+    assert_eq!((refused.why, refused.why.name()), (Why::Alignment, "aligned past a page"));
+    assert!(refused.what.contains("app::WIDE"), "{refused}");
+    let refused = of_one_static(Arch::X86_64, zeroes(Arch::X86_64, 8, 8, true, "app::LOCAL")).unwrap_err();
+    assert_eq!(refused.why, Why::ThreadLocal);
+    assert!(refused.what.contains("app::LOCAL"), "{refused}");
+    let refused =
+        of_one_static(Arch::X86_64, zeroes(Arch::X86_64, 8, LONGEST as u64 + 1, false, "app::LONG")).unwrap_err();
+    assert_eq!(refused.why, Why::Long);
+    // And a static a page wide, of a page: an image.
+    assert!(of_one_static(Arch::X86_64, zeroes(Arch::X86_64, 4096, 4096, false, "app::PAGE")).is_ok());
+    // A record that was not given is no case of the program's: the input's fault.
+    let input = Input {
+        arch: Arch::X86_64,
+        os: Os::Linux,
+        page: 4096,
+        slots: 1,
+        statics: leak(vec![StaticDef { number: 0, record: id(9), refs: List::of(&[]) }]),
+        binds: &[],
+        entry: Slot(0),
+        inits: &[],
+    };
+    let none = |_: &RecordId| -> Option<Record<'static>> { None };
+    assert_eq!(lay(&input, &none, &Bases::NONE).unwrap_err().why, Why::Input);
 }

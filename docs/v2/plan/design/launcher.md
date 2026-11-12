@@ -621,10 +621,17 @@ what the daemon sends. So the daemon does it once and keeps the outcome, an **im
   outside symbol once, adds each mapping's address to the listed words, copies the code
   with one write and one barrier, registers the unwind entries, and commits as an edit of
   every body does.
-- **When there is none.** A static or datum aligned past a page, a thread-local on x86-64,
-  code relative to data, or an image past a frame's 16 MiB: the launchers of that answer
-  are sent the records, and the daemon's log says why (`Program::unimaged`). This is the
-  one place two routes lead to one state; it is in the log because the second is slower.
+- **When there is none.** Four named cases (`image::Why`): a static or datum aligned past
+  a page, a thread-local where the launcher has none (x86-64), code relative to data, and
+  more than 12 MiB of code and data. The launchers of that answer are then sent the
+  records: a second, named way to the one state, which the refinement test holds to be
+  one state (an image rebased is the records placed). It is never quiet: the daemon says
+  it at every such start as a warn event that names the program and the case and carries
+  the program's counts of starts from an image and from records (`Program::starts`), and
+  the program's next build says it as a note (`launch::Linked::from_records`). Each case
+  has a test that it is refused by its name; the host's test and the timing script fail
+  when a small program or hello world is started from records. Not yet: a row of
+  `blaze why` and a counter of the profile, which are in files of other lanes.
 
 Held to: `blaze-launch` `tests/image.rs` (the refinement: an image rebased to a process's
 addresses is byte for byte what placing the same records there gives; a control that
@@ -642,7 +649,7 @@ three copies of it (the reader's buffer, the frame, the area and data), one `dls
 outside symbol, one `__register_frame` a body. If the socket's copies show, the image goes
 by descriptor (a sealed memfd on Linux, passed with the message) and is copied once.
 
-## More than one changed body, and a changed signature (design; not built)
+## More than one changed body, and a changed signature (written 2026-11-12; not yet compiled or run)
 
 Today one changed body is applied to a running program and anything else starts it again
 (`blaze-launch-host`, `Program::built`). What it takes to apply more, and one shortcut
@@ -665,8 +672,15 @@ layouts, generics by their arguments. It is a fact of the front end's describe
 beside `identity`. The host then keys a slot by `subject` and that id where it keys it by
 `subject` now, and the classifier's rule "more than one body" becomes "a body whose slot
 identity is the same": every such body is rebound, together when there are several.
-`Described` and its makers are other lanes' files; this lane's part is the host's table
-and its simulation, written once the field exists.
+The field exists (`Described::abi`, lane describes-1112, carried to `Built::abis` by key;
+it hashes the convention, variadic, `#[track_caller]` and each type of the signature by
+its identity, which is its layout and interface through every reference and pointer). The
+host keys a slot by it (`blaze-launch-host`, `slot_identities`): a build that tells ABIs
+has its changed bodies rebound together and a changed signature is another slot; a build
+that tells none keeps today's rule, one body or a restart. Held by
+`a_changed_signature_is_another_slot_and_changed_bodies_are_one_edit` and its control (a
+slot kept across a changed signature). Not covered: the entry's own signature (a restart,
+as before) and a static of another type (a restart, as before).
 
 **The shortcut that is not sound.** A function's code hash takes its callees by their
 interface, so it is tempting to read the fingerprint off the hashes: "a changed body whose

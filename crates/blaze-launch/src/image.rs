@@ -207,20 +207,68 @@ pub struct Input<'a> {
 /// Each record an [`Input`] names, decoded, by id: `None` for one that was not given.
 pub type Records<'r> = dyn Fn(&RecordId) -> Option<Record<'r>> + 'r;
 
-/// Why there is no image, or why bytes are not one.
+/// The cases in which there is no image, each by name. The first four are a program's: its
+/// launchers are then sent its records, and the daemon says which case and of what
+/// (`blaze-launch-host`). The last two are a fault: of whoever made the input, or of bytes
+/// that are no image.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Why {
+    /// A static or a datum aligned past a page: the data's first byte is aligned to a page
+    /// and no more, so its offset is not an aligned address in every process.
+    Alignment,
+    /// A thread-local static on an instruction set the launcher has none on yet.
+    ThreadLocal,
+    /// Code that reaches a static, a datum or an outside symbol relative to itself, with no
+    /// word between: it cannot be moved apart from what it reaches.
+    Relative,
+    /// More bytes than one message carries ([`LONGEST`]).
+    Long,
+    /// What the image was to be made of does not hold together: a record that was not
+    /// given, a number past what is declared, a record that does not place.
+    Input,
+    /// Bytes that are no image of this layout.
+    Layout,
+}
+
+impl Why {
+    /// The case's name, as a person and a count are given it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Why::Alignment => "aligned past a page",
+            Why::ThreadLocal => "a thread-local here",
+            Why::Relative => "code relative to data",
+            Why::Long => "longer than a message",
+            Why::Input => "records that do not hold together",
+            Why::Layout => "no image of this layout",
+        }
+    }
+}
+
+/// The most bytes of code and data an image holds: under a frame's 16 MiB with room for
+/// its tables.
+pub const LONGEST: usize = 12 << 20;
+
+/// Why there is no image, or why bytes are not one: the case, and what of.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct ImageError(pub String);
+pub struct ImageError {
+    pub why: Why,
+    pub what: String,
+}
 
 impl core::fmt::Display for ImageError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.what)
     }
 }
 
 impl core::error::Error for ImageError {}
 
 fn no(what: String) -> ImageError {
-    ImageError(what)
+    ImageError { why: Why::Input, what }
+}
+
+fn because(why: Why, what: String) -> ImageError {
+    ImageError { why, what }
 }
 
 /// What a place of a record is, for a fix.
@@ -247,11 +295,14 @@ impl Layer<'_, '_> {
         if !align.is_power_of_two() || align > self.input.page {
             // The data's first byte is aligned to a page and no more: an offset aligned
             // past it is not an aligned address in every process.
-            return Err(no(format!(
-                "`{of}` is aligned to {align} bytes, past a page ({}): its address in one process is not \
-                 aligned in another",
-                self.input.page
-            )));
+            return Err(because(
+                Why::Alignment,
+                format!(
+                    "`{of}` is aligned to {align} bytes, past a page ({}): its address in one process is not \
+                     aligned in another",
+                    self.input.page
+                ),
+            ));
         }
         let at = (self.image.data.len() as u64).next_multiple_of(align);
         let Ok(end) = usize::try_from(at + size.max(1)) else {
@@ -407,10 +458,13 @@ impl Layer<'_, '_> {
                 false => StaticAt::Data(self.reserve(record.size, u64::from(record.align), record.name)?),
                 true => {
                     if self.input.arch != Arch::Aarch64 {
-                        return Err(no(format!(
-                            "`{}` is a thread-local static, and the launcher has no thread-locals on {:?} yet",
-                            record.name, self.input.arch
-                        )));
+                        return Err(because(
+                            Why::ThreadLocal,
+                            format!(
+                                "`{}` is a thread-local static, and the launcher has no thread-locals on {:?} yet",
+                                record.name, self.input.arch
+                            ),
+                        ));
                     }
                     self.image.tls.push(TlsVar {
                         size: record.size,
@@ -477,16 +531,10 @@ impl Layer<'_, '_> {
             let address = self.bases.code + self.image.geometry.area + at;
             let (bounds, classes) = self.bounds(&record, bind.refs)?;
             let addresses = self.data_of(&record, &bounds, &classes)?;
-            let mut scratch = core::mem::take(&mut self.scratch);
-            let placed = place::place(&record, &pool, address, &bounds, &addresses, &mut scratch)
-                .map_err(|why| no(format!("`{}`: {why}", record.name)));
-            if placed.is_ok() {
-                self.image.area[at as usize..end].copy_from_slice(&scratch);
-            }
-            self.scratch = scratch;
-            placed?;
+            // Which of its words are addresses, before it is placed: code that cannot be moved
+            // is refused as that, not as a fixup past its reach against addresses of no process.
             let mut refused = None;
-            let fixes = &mut self.image.fixes;
+            let mut fixes = Vec::new();
             place::absolutes(&record, &pool, |offset, abs| {
                 let base = match abs {
                     Abs::Own => Ok(Base::Code),
@@ -503,10 +551,19 @@ impl Layer<'_, '_> {
                     Err(why) => refused = Some(why),
                 }
             })
-            .map_err(|why| no(format!("`{}`: {why}", record.name)))?;
+            .map_err(|why| because(Why::Relative, format!("`{}`: {why}", record.name)))?;
             if let Some(why) = refused {
                 return Err(why);
             }
+            let mut scratch = core::mem::take(&mut self.scratch);
+            let placed = place::place(&record, &pool, address, &bounds, &addresses, &mut scratch)
+                .map_err(|why| no(format!("`{}`: {why}", record.name)));
+            if placed.is_ok() {
+                self.image.area[at as usize..end].copy_from_slice(&scratch);
+            }
+            self.scratch = scratch;
+            placed?;
+            self.image.fixes.append(&mut fixes);
             let frame = match &record.unwind {
                 None => None,
                 Some(unwind) => {
@@ -607,6 +664,13 @@ pub fn lay<'r>(input: &Input<'_>, records: &Records<'r>, bases: &Bases<'_>) -> R
         if !matches!(layer.image.statics.get(*number as usize), Some(Some(StaticAt::Data(_)))) {
             return Err(no(format!("static {number} is an initializer and has no address")));
         }
+    }
+    let bytes = layer.image.area.len() + layer.image.data.len();
+    if bytes > LONGEST {
+        return Err(because(
+            Why::Long,
+            format!("{bytes} bytes of code and data, more than the {LONGEST} one message carries"),
+        ));
     }
     Ok(layer.image)
 }
@@ -801,6 +865,10 @@ impl Image {
     /// Reads an image's bytes, all of them, and checks every offset in its tables against
     /// the bytes it is an offset into: nothing read from a decoded image is out of range.
     pub fn decode(bytes: &[u8]) -> Result<Image, ImageError> {
+        Image::read(bytes).map_err(|refused| because(Why::Layout, refused.what))
+    }
+
+    fn read(bytes: &[u8]) -> Result<Image, ImageError> {
         let mut from = In { bytes, at: 0 };
         if from.take(8, "its magic")? != MAGIC {
             return Err(no(String::from("the bytes are no image of placed code (their first 8 are not `blazeimg`)")));

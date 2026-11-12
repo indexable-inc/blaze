@@ -51,7 +51,7 @@ use std::sync::Arc;
 use blaze_codegen::driver::Built;
 use blaze_codegen::{Arch, CompiledFunction, InstanceKey, StaticId};
 use blaze_hash::HashMap;
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, Hasher};
 use blaze_items::CodeHash;
 use blaze_launch::image as placed;
 use blaze_launch::record::Record;
@@ -195,6 +195,39 @@ fn by_identity(identities: &[(InstanceKey, ContentId)], codes: &[CodeHash]) -> V
         .collect()
 }
 
+/// What a slot is keyed by, for each instance of a build: what the function is across edits
+/// of its body (`identities`, by key) together with what a caller's code assumes of it
+/// beyond its address (`abis`, by key: `blaze_codegen::backend::Described::abi`). A slot is
+/// a path and an ABI (launcher.md, section 1): a function whose signature changes is another
+/// slot, so the body of the old signature stays where the frames of its old callers call
+/// it, and every caller, whose code changed with the signature, names the new one. An
+/// instance the build gives no ABI of (a folded group's entry; a front end that tells none)
+/// is keyed by what it is alone.
+fn slot_identities(
+    identities: &[(InstanceKey, ContentId)],
+    abis: &[(InstanceKey, ContentId)],
+    plant: Plant,
+) -> Vec<(InstanceKey, ContentId)> {
+    let mut at = 0;
+    identities
+        .iter()
+        .map(|(key, identity)| {
+            // Both by key: one pass over the two.
+            while abis.get(at).is_some_and(|it| it.0 < *key) {
+                at += 1;
+            }
+            match abis.get(at) {
+                Some((of, abi)) if of == key && plant != Plant::SlotAcrossAbi => {
+                    let mut hasher = Hasher::new("blaze v2 launch slot 1");
+                    hasher.id(identity).id(abi);
+                    (*key, hasher.finish())
+                }
+                _ => (*key, *identity),
+            }
+        })
+        .collect() // alloc: the image's list, once a build
+}
+
 /// One launcher.
 struct Launcher {
     conn: Conn,
@@ -240,8 +273,9 @@ enum Start {
     Unasked,
     /// The frame of the `Tell::Image`.
     Image(Vec<u8>),
-    /// There is none, and why: every launcher of this answer is sent the frames.
-    Frames,
+    /// There is none, and why (the case's name, then what of the program): every launcher
+    /// of this answer is sent the frames.
+    Frames(String),
 }
 
 /// Why the program cannot serve a launcher.
@@ -278,6 +312,13 @@ pub struct Program {
     /// Why the last answer has no image of placed code, until the driver takes it to say
     /// ([`Program::unimaged`]).
     unimaged: Option<String>,
+    /// How many launchers were started from an image, and how many from records where an
+    /// answer was kept and had no image: a program that never gets one is seen by the second.
+    image_starts: u64,
+    record_starts: u64,
+    /// Why launchers of the build before were started from records, until the driver takes
+    /// it for the next build's note ([`Program::from_records`]).
+    from_records: Option<String>,
     /// The last transaction's number, over every launcher.
     txn: u64,
     /// The last message's id.
@@ -299,6 +340,9 @@ pub(crate) enum Plant {
     DeclareFirst,
     /// An image of a start leaves out the last body its frames bind.
     ShortImage,
+    /// A slot is keyed by what its function is alone, not also by its ABI: a function whose
+    /// signature changed keeps its slot.
+    SlotAcrossAbi,
 }
 
 impl Default for Program {
@@ -332,6 +376,9 @@ impl Program {
             builds: 0,
             welcome: None,
             unimaged: None,
+            image_starts: 0,
+            record_starts: 0,
+            from_records: None,
             txn: 0,
             said: 0,
             plant: Plant::None,
@@ -343,6 +390,18 @@ impl Program {
     /// start and slower, so the driver says it where a person reads what was slow.
     pub fn unimaged(&mut self) -> Option<String> {
         self.unimaged.take()
+    }
+
+    /// How many launchers this program started from an image of placed code, and how many
+    /// from records where it could have been an image and was not.
+    pub fn starts(&self) -> (u64, u64) {
+        (self.image_starts, self.record_starts)
+    }
+
+    /// Why this program's launchers were last started from records, not an image, taken: for
+    /// the note of its next build, which a person reads.
+    pub fn from_records(&mut self) -> Option<String> {
+        self.from_records.take()
     }
 
     /// `kept`'s start as one message: the image of what its frames place, for a launcher of
@@ -419,11 +478,14 @@ impl Program {
             entry: Slot(kept.entry),
             inits: &inits,
         };
-        let image = placed::lay(&input, &records, &placed::Bases::NONE).map_err(|why| why.to_string())?;
+        // The case's name first: what a count and a person tell the cases apart by.
+        let image = placed::lay(&input, &records, &placed::Bases::NONE)
+            .map_err(|refused| format!("{}: {}", refused.why.name(), refused.what))?;
         let mut bytes = Vec::new();
         image.encode(&mut bytes);
         let mut frame = Vec::new();
-        self.frame(&Tell::Image { bytes: &bytes }, &mut frame)?;
+        self.frame(&Tell::Image { bytes: &bytes }, &mut frame)
+            .map_err(|why| format!("{}: {why}", placed::Why::Long.name()))?;
         Ok(frame)
     }
 
@@ -660,15 +722,23 @@ impl Program {
                     if let Start::Unasked = kept.start {
                         kept.start = match self.start_image(arch, &kept) {
                             Ok(frame) => Start::Image(frame),
-                            Err(why) => {
-                                self.unimaged = Some(why);
-                                Start::Frames
-                            }
+                            Err(why) => Start::Frames(why),
                         };
                     }
                     match &kept.start {
-                        Start::Image(frame) => out.extend_from_slice(frame),
-                        Start::Frames | Start::Unasked => out.extend_from_slice(&kept.frames),
+                        Start::Image(frame) => {
+                            out.extend_from_slice(frame);
+                            self.image_starts += 1;
+                        }
+                        // Said each time: a program that is never started from an image is
+                        // slow at every start, not once.
+                        Start::Frames(why) => {
+                            out.extend_from_slice(&kept.frames);
+                            self.record_starts += 1;
+                            self.unimaged = Some(why.clone()); // clone: the reason, a start
+                            self.from_records = Some(why.clone()); // clone: as above
+                        }
+                        Start::Unasked => out.extend_from_slice(&kept.frames),
                     }
                     let launcher = &mut self.launchers[at];
                     launcher.declared = kept.declared;
@@ -836,11 +906,13 @@ impl Program {
         };
         let arch = first.arch;
         // alloc: the image's lists, once a build (each a copy of a list of the build's)
+        // What each instance's slot is keyed by: what it is, and its ABI.
+        let slotted = slot_identities(&built.identities, &built.abis, self.plant);
         // Each identity's code, in the identities' order: both lists are by key, so one pass
         // over the two.
-        let mut codes: Vec<CodeHash> = Vec::with_capacity(built.identities.len());
+        let mut codes: Vec<CodeHash> = Vec::with_capacity(slotted.len());
         let mut owner = 0;
-        for (key, _) in &built.identities {
+        for (key, _) in &slotted {
             while built.owners.get(owner).is_some_and(|it| it.0 < *key) {
                 owner += 1;
             }
@@ -849,14 +921,14 @@ impl Program {
                 _ => return Err(format!("{key:?} has an identity and no owner in its build")),
             }
         }
-        let by_identity = by_identity(&built.identities, &codes);
+        let by_identity = by_identity(&slotted, &codes);
         let Some(entry_key) = built.symbols.iter().find(|it| it.1 == entry).map(|it| it.0) else {
             return Err(format!("the build defines no `{entry}`: it is no program"));
         };
         let entry_identity = built
             .identities
             .binary_search_by_key(&entry_key, |it| it.0)
-            .map(|at| built.identities[at].1)
+            .map(|at| slotted[at].1)
             .map_err(|_| format!("the build's `{entry}` has no identity"))?;
         let mut statics = Vec::with_capacity(built.statics.len());
         let mut inits = Vec::new();
@@ -892,7 +964,7 @@ impl Program {
         let image = Image {
             functions: built.functions.clone(), // clone: a count a function
             merged: built.deduped.merged.iter().map(|(from, to)| (*from, *to)).collect(),
-            identities: built.identities.clone(), // clone: the build's list, once a build
+            identities: slotted,
             by_identity,
             names,
             statics,
@@ -940,7 +1012,10 @@ impl Program {
                     restart = Some(format!("the static {id:?} has another value or type")); // alloc: once
                 }
             }
-            if bodies.len() > 1 && self.plant != Plant::NoRestart {
+            // With the front end's ABI of each function a slot is keyed by it, so each of
+            // these bodies has the signature it had and all are rebound together below. A
+            // build that tells no ABI cannot say so, and more than one body starts again.
+            if bodies.len() > 1 && built.abis.is_empty() && self.plant != Plant::NoRestart {
                 let name = |identity: &ContentId| {
                     let at = image.by_identity.binary_search_by_key(identity, |it| it.0).ok()?;
                     let key = image.by_identity[at].1;
@@ -949,8 +1024,9 @@ impl Program {
                 };
                 let named: Vec<String> = bodies.iter().take(3).filter_map(|it| name(&it.2)).collect();
                 restart = Some(format!(
-                    "{} functions' bodies changed together ({}{}): a changed signature cannot yet be told from \
-                     body edits, so only one changed body is applied to a running program",
+                    "{} functions' bodies changed together ({}{}) in a build that tells no function's ABI: a \
+                     changed signature cannot be told from body edits, so only one changed body is applied to a \
+                     running program",
                     bodies.len(),
                     named.join(", "),
                     if bodies.len() > named.len() { ", .." } else { "" },

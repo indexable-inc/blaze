@@ -217,7 +217,7 @@ impl Launches {
         entry: &str,
         record: Option<blaze_cas::Key>,
         tables: impl FnOnce(Option<u64>) -> Result<(u64, Given), String>,
-    ) -> Result<Vec<Told>, String> {
+    ) -> Result<(Vec<Told>, Option<String>), String> {
         let id = program_id(path);
         // clone: a count, once per build
         let held = self.programs.pin().get(&id).cloned();
@@ -243,6 +243,9 @@ impl Launches {
         // Until this build is the core's, no record is the core's: a failure below leaves
         // the next build to be made, never replayed.
         core.record = None;
+        // Why the launchers of the build before were started from records, for this
+        // build's note.
+        let from_records = core.program.from_records();
         let (serial, given) = tables(core.spans)?;
         let _span = tracing::info_span!(target: "blaze", "launch link: the program takes the build").entered();
         let told = match &given {
@@ -266,7 +269,7 @@ impl Launches {
             }
             what.push(said);
         }
-        Ok(what)
+        Ok((what, from_records))
     }
 }
 
@@ -401,10 +404,13 @@ fn serve(conn: Conn, mut socket: UnixStream, programs: &SharedMap<[u8; 32], Arc<
             // A start that could not be made one message is the same start, slower: said
             // where what was slow is read.
             if let Some(why) = core.program.unimaged() {
+                let (from_image, from_records) = core.program.starts();
                 tracing::warn!(
                     target: "blaze",
-                    "{}: its launchers are sent its start as records, not as an image of placed code: {why}",
-                    held.path
+                    program = %held.path,
+                    from_image,
+                    from_records,
+                    "this program is started from records, not an image of placed code: {why}"
                 );
             }
             said
@@ -452,6 +458,9 @@ pub(crate) struct Linked {
     /// The sidecar's text, the same beside every path.
     pub(crate) sidecar: Vec<u8>,
     pub(crate) told: Vec<Told>,
+    /// Why the program's launchers were started from records and not an image of placed
+    /// code since its last build, when they were: the build says so.
+    pub(crate) from_records: Option<String>,
     /// Whether this is the program's first build in this daemon.
     pub(crate) first: bool,
 }
@@ -478,7 +487,7 @@ pub(crate) fn link(
     let record = tracing::info_span!(target: "blaze", "launch link: the unit's record key")
         .in_scope(|| super::super::compile::record_key(job, unit))
         .map_err(|it| it.what)?;
-    let told = launches.built(path, generated.built, "main", record, |held| {
+    let (told, from_records) = launches.built(path, generated.built, "main", record, |held| {
         // What `LinkInputs` says, against the snapshot the program holds: the same snapshot
         // (nothing changed), a change of it, every table made anew (`work.whole`), or a
         // snapshot the program does not hold, when every table is asked for.
@@ -511,5 +520,5 @@ pub(crate) fn link(
         let _ = write!(sidecar, "{byte:02x}");
     }
     sidecar.push('\n');
-    Ok(Linked { file, key, sidecar: sidecar.into_bytes(), told, first })
+    Ok(Linked { file, key, sidecar: sidecar.into_bytes(), told, from_records, first })
 }

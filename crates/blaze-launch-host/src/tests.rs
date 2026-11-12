@@ -42,6 +42,9 @@ fn id(domain: u8, a: u64, b: u64) -> ContentId {
 struct Source {
     bodies: Vec<u64>,
     statics: Vec<u64>,
+    /// Each function's signature version, when the build tells every function's ABI: empty
+    /// for a build that tells none.
+    sigs: Vec<u64>,
 }
 
 /// A function's key: its body's version is in it, as a code hash is in an instance's key.
@@ -126,10 +129,18 @@ fn build(source: &Source, kept: &[Arc<CompiledFunction>]) -> Built {
         })
         .collect();
     statics.sort_by_key(|it| (it.item, it.instance));
+    let mut abis: Vec<(InstanceKey, ContentId)> = source
+        .sigs
+        .iter()
+        .enumerate()
+        .map(|(at, sig)| (key(at, source.bodies[at]), id(5, at as u64, *sig)))
+        .collect();
+    abis.sort_by_key(|it| it.0);
     Built {
         functions,
         statics,
         identities,
+        abis,
         owners,
         debug_names: names,
         symbols: vec![(key(0, source.bodies[0]), "main".to_owned(), Linkage::Strong)],
@@ -285,7 +296,7 @@ fn op(tc: &TestCase) -> Op {
 fn run(ops: &[Op], plant: Plant) -> Result<(), String> {
     let mut program = Program::new();
     program.plant = plant;
-    let mut source = Source { bodies: vec![1, 1, 1], statics: vec![7, 7] };
+    let mut source = Source { bodies: vec![1, 1, 1], statics: vec![7, 7], sigs: Vec::new() };
     let mut version = 1u64;
     let mut kept: Vec<Arc<CompiledFunction>> = Vec::new();
     let mut launchers: Vec<Launcher> = Vec::new();
@@ -490,7 +501,7 @@ fn the_oracle_catches_an_edit_that_declares_before_its_records_name() {
 fn a_build_is_an_edit_a_declaration_or_a_restart() {
     let told = |edit: Op| -> Vec<Told> {
         let mut program = Program::new();
-        let mut source = Source { bodies: vec![1, 1, 1], statics: vec![7, 7] };
+        let mut source = Source { bodies: vec![1, 1, 1], statics: vec![7, 7], sigs: Vec::new() };
         let built = build(&source, &[]);
         let kept = built.functions.clone(); // clone: counts, in a test
         program.built(&built, "main", Tables::Whole(&[])).expect("the first build");
@@ -647,7 +658,7 @@ fn a_record_names_callees_by_place_and_carries_its_positions_as_data() {
 fn framed_and_imaged(plant: Plant) -> (Launcher, Launcher, Option<String>) {
     let mut program = Program::new();
     program.plant = plant;
-    let source = Source { bodies: vec![1, 1, 1], statics: vec![7, 7] };
+    let source = Source { bodies: vec![1, 1, 1], statics: vec![7, 7], sigs: Vec::new() };
     program.built(&build(&source, &[]), "main", Tables::Whole(&[])).expect("built");
     let connect = |program: &mut Program, conn: u64| {
         program.connected(Conn(conn));
@@ -709,6 +720,8 @@ fn framed_and_imaged(plant: Plant) -> (Launcher, Launcher, Option<String>) {
 #[test]
 fn a_second_launcher_of_an_answer_starts_from_an_image_and_is_bound_as_the_first() {
     let (framed, imaged, unimaged) = framed_and_imaged(Plant::None);
+    // A small real program gets an image: were it started from records, that is this
+    // check's failure, never a slow start nobody sees.
     assert_eq!(unimaged, None, "the program's start has an image");
     assert!(imaged.started);
     assert_eq!(imaged.declared, framed.declared);
@@ -722,4 +735,128 @@ fn the_oracle_catches_an_image_that_binds_less_than_the_frames() {
     let (framed, imaged, unimaged) = framed_and_imaged(Plant::ShortImage);
     assert_eq!(unimaged, None);
     assert_ne!(imaged.bound, framed.bound);
+}
+
+/// A launcher that says hello to `program` as connection `conn`.
+fn hello(program: &mut Program, conn: u64) -> Launcher {
+    program.connected(Conn(conn));
+    let mut launcher = Launcher { conn, ..Launcher::default() };
+    launcher.say(&Ask::Hello {
+        program: ProgramId([0; 32]),
+        pid: 1,
+        arch: wire::Arch::Aarch64,
+        os: wire::Os::Linux,
+        page: 4096,
+    });
+    launcher
+}
+
+/// The daemon hears everything `launcher` said and it reads everything it was sent, until
+/// neither has more.
+fn settled(program: &mut Program, launcher: &mut Launcher) {
+    loop {
+        let mut moved = launcher.step();
+        if let Some(message) = launcher.outbound.pop_front() {
+            let mut out = Vec::new();
+            program.said(Conn(launcher.conn), &message, &mut out).expect("heard");
+            launcher.inbound.extend(out);
+            moved = true;
+        }
+        if !moved {
+            break;
+        }
+    }
+}
+
+/// What a running launcher holds after two edits of a program whose build tells each
+/// function's ABI (`main` calls `f1`, which calls `f2`; the launcher has run all three):
+/// first the bodies of `f1` and `f2` change together, then `f2`'s signature changes, and
+/// with it its body and the body of `f1`, its caller.
+struct Edited {
+    /// Whether either build told the launcher to start again.
+    restarted: bool,
+    /// Whether the first build's edit switched its bodies together, and how many it bound.
+    first: Option<(usize, bool)>,
+    /// The record in `f2`'s slot before the signature changed and after.
+    before: Option<RecordId>,
+    after: Option<RecordId>,
+    /// How many slots it had declared before the signature changed and after.
+    declared: (u32, u32),
+    /// Whether `f1`'s slot holds the newest build's record at the end.
+    caller_is_newest: bool,
+}
+
+fn edited(plant: Plant) -> Edited {
+    let mut program = Program::new();
+    program.plant = plant;
+    let mut source = Source { bodies: vec![1, 1, 1], statics: vec![7, 7], sigs: vec![1, 1, 1] };
+    program.built(&build(&source, &[]), "main", Tables::Whole(&[])).expect("built");
+    let mut launcher = hello(&mut program, 1);
+    settled(&mut program, &mut launcher);
+    // Each call binds a slot and names the next function, which is given the next slot.
+    for slot in [0, 1, 2] {
+        assert!(slot < launcher.declared, "slot {slot} is declared by the time it is called");
+        launcher.waiting.push(slot);
+        launcher.say(&Ask::Need { slot: Slot(slot), thread: Thread(1) });
+        settled(&mut program, &mut launcher);
+    }
+    assert!(launcher.waiting.is_empty() && launcher.bound[..3].iter().all(Option::is_some));
+    let mut restarted = false;
+    let mut land = |program: &mut Program, source: &Source, launcher: &mut Launcher| {
+        let told = program.built(&build(source, &[]), "main", Tables::Whole(&[])).expect("built");
+        let mut what = None;
+        for (_, frames, said) in told {
+            launcher.inbound.extend(frames);
+            match said {
+                Told::Restart { .. } => restarted = true,
+                Told::Edit { binds, together } => what = Some((binds, together)),
+                Told::Nothing => {}
+            }
+        }
+        settled(program, launcher);
+        what
+    };
+    // Two bodies, no signature.
+    (source.bodies[1], source.bodies[2]) = (2, 2);
+    let first = land(&mut program, &source, &mut launcher);
+    let (before, declared_before) = (launcher.bound[2], launcher.declared);
+    // A signature, with its body and its caller's.
+    (source.sigs[2], source.bodies[1], source.bodies[2]) = (2, 3, 3);
+    land(&mut program, &source, &mut launcher);
+    let caller_is_newest = launcher.bound[1].is_some() && program.newest(1) == launcher.bound[1];
+    Edited {
+        restarted: restarted || launcher.restarted,
+        first,
+        before,
+        after: launcher.bound[2],
+        declared: (declared_before, launcher.declared),
+        caller_is_newest,
+    }
+}
+
+/// The invariant: a slot holds bodies of one ABI. Where the build tells each function's ABI,
+/// bodies that change together are one edit of a running program, switched together, and a
+/// function whose signature changes is another slot: the slot of the old signature keeps
+/// the body the frames of its old callers call, the caller is rebound to code that names
+/// the new slot, and the program is not started again for either.
+#[test]
+fn a_changed_signature_is_another_slot_and_changed_bodies_are_one_edit() {
+    let edited = edited(Plant::None);
+    assert!(!edited.restarted, "neither edit starts the program again");
+    assert!(matches!(edited.first, Some((binds, true)) if binds >= 2), "{:?}", edited.first);
+    assert!(edited.before.is_some());
+    assert_eq!(edited.after, edited.before, "the old signature's slot keeps its body");
+    assert_eq!(edited.declared.1, edited.declared.0 + 1, "the new signature is one more slot");
+    assert!(edited.caller_is_newest, "the caller runs the code that names the new slot");
+}
+
+/// A control of [`a_changed_signature_is_another_slot_and_changed_bodies_are_one_edit`]: a
+/// slot keyed by what its function is alone is given the body of the new signature, which
+/// the frames of its old callers then call.
+#[test]
+fn the_oracle_catches_a_slot_kept_across_a_changed_signature() {
+    let edited = edited(Plant::SlotAcrossAbi);
+    assert!(edited.before.is_some());
+    assert_ne!(edited.after, edited.before);
+    assert_eq!(edited.declared.1, edited.declared.0);
 }
