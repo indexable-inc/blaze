@@ -214,7 +214,7 @@ mod unix {
         blaze_thin::answer::show_with(blaze_thin::answer::Shown {
             options: blaze_screen::Options {
                 cwd: place.cwd.to_str().map(str::to_owned),
-                home: var("HOME"),
+                home: blaze_core::home::user().ok().and_then(|it| it.into_os_string().into_string().ok()),
                 quiet: asked.quiet,
                 ..blaze_screen::Options::of(match asked.command {
                     blaze_thin::route::Command::Build => blaze_screen::Command::Build,
