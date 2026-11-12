@@ -85,6 +85,9 @@ pub const STARTED_WITH: &[&str] = &[
     // The toolchain the process keys as (`serve::dev_toolchain`, handed over as the program
     // starts): a daemon's kept front ends and memos are keyed by no toolchain.
     super::dev_toolchain::VAR,
+    // Where blaze's toolchains are kept (`toolchain::own::toolchains`, found once and fixed
+    // for the process: `toolchain::FOUND`).
+    crate::toolchain::own::VAR,
 ];
 
 /// The value of `name` in an environment, as text: `None` unset, a value that is not UTF-8

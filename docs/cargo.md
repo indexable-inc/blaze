@@ -1415,7 +1415,8 @@ whichever command started it; to change one there, run `blaze stop` first):
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `BLAZE_HOME` | the daemon's socket and state directory, and blaze's toolchains and releases ([Files](#files), [Install](#install)) | see there |
+| `BLAZE_HOME` | the daemon's socket and state directory, and blaze's releases and settings; not its toolchains ([Files](#files), [Install](#install)) | see there |
+| `BLAZE_TOOLCHAINS` | the directory blaze keeps the Rust it builds with in, shared by every `BLAZE_HOME` ([toolchain.md](toolchain.md)) | `.blaze/toolchains` in the user's home (`HOME`, else the system's record of the user) |
 | `BLAZE_RUST_DIST` | where the pinned nightly's components come from: a URL, or a directory of them ([Install](#install)) | rust-lang's dist server, at the pinned date |
 | `BLAZE_RELEASES` | a mirror of blaze's releases ([below](#pinning-a-release-of-blaze)) | `https://blaze-releases.ix.dev` |
 | `BLAZE_API_TOKEN` | the bearer token `blaze serve --http` requires ([Files](#files)) | none: `--http` refuses to start |

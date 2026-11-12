@@ -57,15 +57,23 @@ pub fn stamp(path: &Path) -> Result<Option<Stamp>, ()> {
 pub const KEPT: &str = "blaze pin lookup 1";
 
 /// blaze's home, where what it installs and what its user says live: `$BLAZE_HOME`, else
-/// `.blaze` in the user's home. The rule of `blaze_manifest::user_config::home`, which this
+/// `.blaze` in the user's home ([`blaze_core::home::decide`] of `var` and `record`, the
+/// system's record of the user, asked only when no variable answers: a driver passes
+/// [`blaze_core::home::record`]). The rule of `blaze_manifest::user_config::home`, which this
 /// crate does not link (it brings cargo's manifest schema); blaze-engine's tests hold the two
 /// to one answer.
-pub fn home(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+///
+/// # Errors
+///
+/// [`blaze_core::home::NoHome`] when `BLAZE_HOME` is unset and the user has no home.
+pub fn home(
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+    record: impl FnOnce() -> Result<PathBuf, blaze_core::home::NoRecord>,
+) -> Result<PathBuf, blaze_core::home::NoHome> {
     if let Some(home) = var("BLAZE_HOME").filter(|it| !it.is_empty()) {
-        return Some(PathBuf::from(home));
+        return Ok(PathBuf::from(home));
     }
-    let user = var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).filter(|it| !it.is_empty())?;
-    Some(PathBuf::from(user).join(".blaze"))
+    Ok(blaze_core::home::decide(&var, record)?.join(".blaze"))
 }
 
 /// Where the lookup from `start` is kept under blaze's `home`: `pins/<hash of start>`. None

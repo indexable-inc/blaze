@@ -1004,7 +1004,8 @@ impl Protected {
                 format!("{what} {} against the current directory: {error}", path.display())
             })
         };
-        let home = std::env::home_dir().map(|it| absolute("$HOME", it)).transpose()?;
+        // The user's home ([`blaze_core::home::user`]); a user with none has none to protect.
+        let home = blaze_core::home::user().ok().map(|it| absolute("$HOME", it)).transpose()?;
         let set =
             |name: &str| std::env::var_os(name).filter(|it| !it.is_empty()).map(PathBuf::from);
         // A default home that cannot be searched (`HOME` another user's, `EACCES`): nothing in

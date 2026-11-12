@@ -145,8 +145,8 @@ mod unix {
         if let Some(why) = route::env(std::env::vars_os().map(|(name, _)| name)) {
             return Err(why.to_string());
         }
-        let home = pin::home(|name| std::env::var_os(name))
-            .ok_or("no BLAZE_HOME or HOME says where blaze's home is")?;
+        let home = pin::home(|name| std::env::var_os(name), blaze_core::home::record)
+            .map_err(|why| format!("no BLAZE_HOME says where blaze's home is, and {why}"))?;
         // As the launcher reads it, unresolved: the kept lookup is named by it.
         let cwd = std::env::current_dir().map_err(|error| format!("the current directory: {error}"))?;
         let found = pin::here(&home, &cwd, VERSION).map_err(|unsure| match unsure {
@@ -200,7 +200,7 @@ mod unix {
         };
         let request = request::request(&asked, sent);
 
-        let homes = Homes::of(None, |name| std::env::var_os(name))?;
+        let homes = Homes::of(None, |name| std::env::var_os(name), blaze_core::home::record)?;
         let engine = Engine::beside()?;
         // No daemon: the engine starts one, saying so, as it always has.
         let stream = UnixStream::connect(&homes.socket)

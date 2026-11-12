@@ -1,0 +1,12 @@
+{
+ "id": "home-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane home-1112",
+ "where": "blaze's own crates: where cargo's home is, and HOME in a request's captured environment",
+ "what": "While porting the home directory I found `CARGO_HOME`, else `.cargo` in `HOME` written out in six places: blaze-manifest config/mod.rs `cargo_home`, blaze-registry lib.rs `cargo_home`, blaze-client place.rs `cargo_home`, blaze-thin main.rs `cargo_home`, blaze-units load/invocation.rs and blaze-codegen-code lib.rs. The last four read `HOME` from a request's captured environment (a keyed input) and give nothing when it is unset; blaze-thin pin.rs `home` also repeats `blaze_manifest::user_config::home` because the thin blaze does not link blaze-manifest. `scripts/src/bin/lean_gate.rs` reads `HOME` with `unwrap_or_default()`.",
+ "cost": "none measured; a build in a unit with no `HOME` and no `CARGO_HOME` will find no cargo home in those four",
+ "cause": "the same as home-1, for cargo's home; asking the user database there would add an input the keys do not cover, so the client has to put the answer in the request",
+ "workaround": "set `HOME` or `CARGO_HOME`",
+ "fix": "one `cargo_home(var, record)` beside `blaze_core::home`, the client resolving it once into the request it sends; blaze's-home rule moved where blaze-thin can link it",
+ "state": "open"
+}

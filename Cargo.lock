@@ -1036,6 +1036,7 @@ version = "0.0.0"
 dependencies = [
  "annotate-snippets",
  "anyhow",
+ "blaze-core",
  "blaze-manifest",
  "blaze-serde",
  "diff",
@@ -1116,6 +1117,7 @@ dependencies = [
 name = "blaze-gc"
 version = "0.0.0"
 dependencies = [
+ "blaze-core",
  "blaze-hash",
  "blaze-ids",
  "blaze-serde",
@@ -1643,6 +1645,7 @@ version = "0.0.0"
 dependencies = [
  "annotate-snippets",
  "anyhow",
+ "blaze-core",
  "blaze-hash",
  "blaze-ids",
  "blaze-resolve",
@@ -1932,6 +1935,7 @@ dependencies = [
 name = "blaze-script"
 version = "0.0.0"
 dependencies = [
+ "blaze-core",
  "regex",
  "serde_json",
  "toml",

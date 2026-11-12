@@ -59,8 +59,9 @@ pub(crate) const RUN_AS_DEFAULT: &str = "BLAZE_RUN_AS_DEFAULT";
 /// What blaze's updates can't do, naming the file or the setting.
 #[derive(Debug)]
 pub(crate) enum UpdateError {
-    /// No home directory, where blaze keeps its releases and its update state.
-    NoHome,
+    /// No home directory, where blaze keeps its releases and its update state, and what was
+    /// tried to find one.
+    NoHome(blaze_core::home::NoHome),
     /// A file that is there and can't be read.
     Unread { file: PathBuf, error: std::io::Error },
     /// `config.toml` that can't be read, is not TOML, or sets `[update]` to what it doesn't take.
@@ -74,9 +75,10 @@ pub(crate) enum UpdateError {
 impl std::fmt::Display for UpdateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UpdateError::NoHome => f.write_str(
+            UpdateError::NoHome(why) => write!(
+                f,
                 "blaze keeps its releases and its update state in .blaze in your home directory, and \
-                 there is none (`BLAZE_HOME` names where)",
+                 {why} (`BLAZE_HOME` names another place)"
             ),
             UpdateError::Unread { file, error } => write!(f, "reading {}: {error}", file.display()),
             UpdateError::Config(error) => std::fmt::Display::fmt(error, f),
@@ -99,7 +101,7 @@ impl std::error::Error for UpdateError {}
 
 /// blaze's home: where `versions/` and `config.toml` are.
 fn home() -> Result<PathBuf, UpdateError> {
-    user_config::home().ok_or(UpdateError::NoHome)
+    user_config::home().map_err(UpdateError::NoHome)
 }
 
 fn state_file(home: &Path) -> PathBuf {
