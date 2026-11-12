@@ -1,0 +1,13 @@
+{
+ "id": "reth-1112-20",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "blaze: a module scope's listing order (hir-def item_scope)",
+ "what": "A scope's namespaces list their names in the order imports happened to resolve; a crate collected again lists the same names in another order. `Column`'s `==` compared in order, so such a scope was a changed input (hello-world second run: 15 scopes set again, each `same entries in another order`; reth first build after cold: 88).",
+ "cost": "every reader of those modules verified again (569 k verifications on a hello-world's second run)",
+ "cause": "`Column` replaced an `IndexMap`, whose equality ignores order, and compared its entries as a slice",
+ "class": "output that depends on resolution order (rule deterministic-output), surfaced as a false change",
+ "prevention": "built: `Column`'s equality is order-free, with a control (`ORDER_IS_COMPARED`) in `scopes_are_equal_by_their_columns`. NOT built: a deterministic listing order; `entries()`, `types()`, `values()` and glob expansion still observe resolution order, and whether any diagnostic or symbol order follows it is unaudited",
+ "fix": "db8b4612e9 on int-1112 (the equality); the order itself is open for whoever owns name resolution",
+ "state": "open: the false change fixed, the order not"
+}

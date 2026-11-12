@@ -1,0 +1,13 @@
+{
+ "id": "reth-1112-21",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "blaze: dependency images (hir-def deps::serve::store)",
+ "what": "`store` returned every refusal with its reason in `Stored.refused`, and nothing read the field: why a crate has no image was recorded nowhere. On reth's restart build 827 crate names were resolved from source and 291 read from images; the profile could not say why.",
+ "cost": "an hour of three lanes asking the same question of a profile that could not answer",
+ "cause": "a result returned to a caller that drops it",
+ "class": "a silent refusal (rule no-fallback: failures are loud)",
+ "prevention": "built: one event a refusal (`a crate's image is not written`, krate, kind, why) and `Refused::kind()`. First rows, a hello-world: 80 crates, all `encode` (the def map holds a path below the daemon's home). A records lane wrote the serve-side reason a crate is not asked (`why_not_eligible`)",
+ "fix": "db8b4612e9 on int-1112",
+ "state": "fixed (the event); the 80 refusals themselves are the records lanes'"
+}
