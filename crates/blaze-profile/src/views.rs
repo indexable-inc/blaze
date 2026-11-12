@@ -137,6 +137,8 @@ pub const VIEWS: &[View] = &[
     const { view("memory_timeline", &[BUILD]) },
     const { view("memory_peak_tasks", &[BUILD, LIMIT]) },
     const { view("memory_at_peak", &[BUILD]) },
+    const { view("memory_held", &[BUILD, LIMIT]) },
+    const { view("memory_held_now", &[LIMIT]) },
     const { view("memory_sites", &[BUILD, LIMIT]) },
     const { view("admission_waits", &[BUILD, LIMIT]) },
     const { view("busiest_threads", &[BUILD, LIMIT]) },

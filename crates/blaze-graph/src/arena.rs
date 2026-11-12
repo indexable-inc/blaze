@@ -217,14 +217,15 @@ fn add(local: &Local, bytes: i64) {
 /// atomic adds are in [`flush`], [`fold`], [`churn`] and [`charge`], once per [`BATCH`] (or
 /// [`ACCOUNT_BATCH`], [`CHURN_BATCH`]) bytes, and the heap sample in [`sample`], once per
 /// [`SAMPLE_EVERY`] bytes allocated. `holder` is the tag whose task allocated the bytes
-/// ([`Holders`]).
+/// ([`Holders`]). `ptr` is the block made or grown, read only where the allocation is the
+/// thread's sample ([`sampled`]); null for a free.
 ///
 /// [`LOCAL`]'s other reader, not inlined for the same reason as [`with_local`], and reading it
 /// itself so that `holder` and `delta` arrive in registers: through `with_local`'s closure they
 /// went by its captures on the stack, and the holder's slot was loaded only once its byte came
 /// back from the store (a third of a small block's pair in a task, lane checkheap's profile).
 #[inline(never)]
-fn count(holder: Option<Tag>, delta: i64) {
+fn count(holder: Option<Tag>, delta: i64, ptr: *mut u8) {
     LOCAL.with(|local| {
         local.net.set(local.net.get().wrapping_add(delta));
         let account = local.account.get();
@@ -255,7 +256,7 @@ fn count(holder: Option<Tag>, delta: i64) {
             if left > 0 {
                 local.sample_left.set(left);
             } else {
-                sample(local, holder, delta as u64, left);
+                sample(local, holder, delta as u64, left, ptr);
             }
         }
         let batch = local.batch.get().unsigned_abs();
@@ -284,6 +285,8 @@ fn churn(local: &Local, at: usize) {
     blaze_mem::tag::heap_churned(holder_of(at), allocated, freed);
 }
 
+pub mod sampled;
+
 /// How many bytes a thread allocates between two heap samples: each sample stands for this
 /// many (a block past it, for as many times it as it spans), so the bytes allocated at a call
 /// site are its samples' weights summed, within a sample's. 4 MiB: a build that churns a GiB a
@@ -302,6 +305,8 @@ pub struct HeapSampled {
     /// The bytes allocated on its thread this sample stands for: [`SAMPLE_EVERY`] times the
     /// samples it is (more than one for a block past it).
     pub weight: u64,
+    /// The block's address: what [`sampled::put`] keeps its sample under while it is held.
+    pub block: usize,
 }
 
 /// The heap sampler, set once ([`sample_heap_with`]).
@@ -320,7 +325,7 @@ pub fn sample_heap_with(sampler: fn(HeapSampled)) {
 /// strides as it crossed.
 #[cold]
 #[inline(never)]
-fn sample(local: &Local, holder: Option<Tag>, bytes: u64, left: i64) {
+fn sample(local: &Local, holder: Option<Tag>, bytes: u64, left: i64, ptr: *mut u8) {
     // `left` is above -(isize::MAX), so this is at least 1 and fits.
     let strides = left.unsigned_abs() / SAMPLE_EVERY as u64 + 1;
     local.sample_left.set(left + (strides * SAMPLE_EVERY as u64) as i64);
@@ -328,7 +333,7 @@ fn sample(local: &Local, holder: Option<Tag>, bytes: u64, left: i64) {
     if local.sampling.replace(true) {
         return;
     }
-    sampler(HeapSampled { holder, bytes, weight: strides * SAMPLE_EVERY as u64 });
+    sampler(HeapSampled { holder, bytes, weight: strides * SAMPLE_EVERY as u64, block: ptr.addr() });
     local.sampling.set(false);
 }
 
@@ -381,7 +386,7 @@ mod global {
 
     use blaze_mem::Tag;
 
-    use super::{Counting, Locals, count, count_shared, signed};
+    use super::{Counting, Locals, count, count_shared, sampled, signed};
 
     /// What [`Counting`] asks of the allocator under it to name the holder of a block: the
     /// blaze-mem tag whose task allocated it, kept apart so that a free, on any thread, finds
@@ -508,7 +513,7 @@ mod global {
                 }
             };
             if !ptr.is_null() {
-                count(holder, signed(layout.size()));
+                count(holder, signed(layout.size()), ptr);
             }
             ptr
         }
@@ -545,9 +550,11 @@ mod global {
             // SAFETY: the caller says `ptr` was allocated by this allocator with `layout`, so
             // it is live until the `dealloc` below.
             let holder = unsafe { self.holder(ptr) };
+            // Before the block goes back: once it has, another thread may be handed its address.
+            sampled::freed(ptr);
             // SAFETY: the caller says `ptr` was allocated by this allocator with `layout`.
             unsafe { self.0.dealloc(ptr, layout) };
-            count(holder, -signed(layout.size()));
+            count(holder, -signed(layout.size()), std::ptr::null_mut());
         }
 
         /// A block that moves goes to the running task's tag, as a new one would: a buffer
@@ -556,16 +563,18 @@ mod global {
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             // SAFETY: the caller says `ptr` is a live block of this allocator.
             let was = unsafe { self.holder(ptr) };
+            let lifted = sampled::lift(ptr);
             // SAFETY: the caller upholds `realloc`'s contract for `ptr`, `layout` and `new_size`.
             let new = unsafe { self.0.realloc_for(Self::running(), ptr, layout, new_size) };
+            sampled::land(lifted, ptr, new);
             if !new.is_null() {
                 // SAFETY: `new` is the live block the realloc gave.
                 let now = unsafe { self.holder(new) };
                 match now == was {
-                    true => count(was, signed(new_size) - signed(layout.size())),
+                    true => count(was, signed(new_size) - signed(layout.size()), new),
                     false => {
-                        count(was, -signed(layout.size()));
-                        count(now, signed(new_size));
+                        count(was, -signed(layout.size()), std::ptr::null_mut());
+                        count(now, signed(new_size), new);
                     }
                 }
             }
@@ -603,7 +612,7 @@ mod global {
             };
             if !ptr.is_null() {
                 // SAFETY: the live block just made.
-                count(holder, signed(unsafe { self.0.usable(ptr) }));
+                count(holder, signed(unsafe { self.0.usable(ptr) }), ptr);
             }
             ptr
         }
@@ -620,9 +629,10 @@ mod global {
             let (holder, bytes) = unsafe {
                 (self.holder(ptr), usable.unwrap_or_else(|| self.0.usable(ptr)))
             };
+            sampled::freed(ptr);
             // SAFETY: as above, freed once.
             unsafe { self.0.free(ptr) };
-            tally(locals, holder, -signed(bytes));
+            tally(locals, holder, -signed(bytes), std::ptr::null_mut());
         }
 
         /// `realloc` of `ptr`, a live block of `A`, to `new_size` bytes: one that moves goes
@@ -640,16 +650,18 @@ mod global {
                 Locals::Live => Self::running(),
                 Locals::Gone => None,
             };
+            let lifted = sampled::lift(ptr);
             // SAFETY: as above; `realloc(p, 0)` keeps a block, as `malloc(0)` makes one.
             let new = unsafe { self.0.realloc_in(into, ptr, new_size.max(1)) };
+            sampled::land(lifted, ptr, new);
             if !new.is_null() {
                 // SAFETY: `new` is the live block the realloc gave.
                 let (now, bytes) = unsafe { (self.holder(new), self.0.usable(new)) };
                 match now == was {
-                    true => tally(locals, was, signed(bytes) - signed(old)),
+                    true => tally(locals, was, signed(bytes) - signed(old), new),
                     false => {
-                        tally(locals, was, -signed(old));
-                        tally(locals, now, signed(bytes));
+                        tally(locals, was, -signed(old), std::ptr::null_mut());
+                        tally(locals, now, signed(bytes), new);
                     }
                 }
             }
@@ -659,9 +671,9 @@ mod global {
 
     /// Counts `delta` bytes of `holder`'s where `locals` says.
     #[inline(always)]
-    fn tally(locals: Locals, holder: Option<Tag>, delta: i64) {
+    fn tally(locals: Locals, holder: Option<Tag>, delta: i64, ptr: *mut u8) {
         match locals {
-            Locals::Live => count(holder, delta),
+            Locals::Live => count(holder, delta, ptr),
             Locals::Gone => count_shared(holder, delta),
         }
     }

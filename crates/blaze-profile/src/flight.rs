@@ -4173,15 +4173,32 @@ pub struct Read {
     last_switch: Option<(u64, usize)>,
 }
 
+/// The rows of room each table of a [`Read`] keeps across [`Read::clear`]: what a flush of an
+/// idle or lightly working daemon reads. A burst's flush (half a million rows, some hundred
+/// bytes each) grows them again, a few doublings a flush; kept at their most they were what
+/// the daemon held for good after one cold build (2026-11-11, lane mem2-1111: 208 MiB of
+/// `decode`'s blocks on an idle hello-world daemon's heap).
+const READ_KEPT: usize = 1 << 14;
+
+/// Empties `rows`, keeping room for [`READ_KEPT`] of them at most.
+fn let_go<T>(rows: &mut Vec<T>) {
+    rows.clear();
+    if rows.capacity() > READ_KEPT {
+        rows.shrink_to(READ_KEPT);
+    }
+}
+
 impl Read {
     pub fn clear(&mut self) {
-        self.spans.clear();
-        self.counters.clear();
-        self.switches.clear();
-        self.events.clear();
-        self.fields.clear();
-        self.folds.clear();
-        self.ends.clear();
+        let_go(&mut self.spans);
+        let_go(&mut self.counters);
+        let_go(&mut self.switches);
+        let_go(&mut self.events);
+        let_go(&mut self.fields);
+        let_go(&mut self.folds);
+        let_go(&mut self.ends);
+        let_go(&mut self.scratch);
+        let_go(&mut self.waiting);
         self.skipped = 0;
     }
 

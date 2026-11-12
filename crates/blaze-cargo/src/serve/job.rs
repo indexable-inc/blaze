@@ -3353,6 +3353,9 @@ pub struct Jobs<S: Steps> {
     roots: Roots<S>,
     /// Views of plans replaced in `roots`, closed once no job reads them.
     retired: Vec<ViewId>,
+    /// A plan was made since the plan's database was last collected (`Jobs::expire`'s end):
+    /// the values the plan before it held alone are let go of at the next turn.
+    planned: bool,
     /// What a run of user code says, a buffer reused by each of its calls.
     out: Vec<Response>,
     /// The tasks a write held, a buffer reused by each [`Jobs::apply_writes`].
@@ -3492,6 +3495,7 @@ impl<S: Steps> Jobs<S> {
             erring: HashMap::new_in(Global),
             roots: Roots::new(),
             retired: Vec::new(), // alloc: none until a plan is replaced
+            planned: false,
             out: Vec::new(),     // alloc: none until user code says something, then reused
             posts: Vec::new(),   // alloc: none until a write holds a task, then reused
             over: Vec::new(),    // alloc: none until a job ends, then reused
@@ -4477,6 +4481,45 @@ impl<S: Steps> Jobs<S> {
         self.let_go(LetGo::Short(short));
     }
 
+    /// What each kept front end's query storage holds, by ingredient, a line a front end in
+    /// the daemon's log: the idle daemon's answer to "what holds the memory" (rule
+    /// ask-the-profile-first). A walk of every function's rows made, sound beside readers
+    /// (`blaze_query::db::Storage::memory_usage`), so only where nothing waits on it: as the
+    /// daemon gives its warm memory back ([`super::idle`]).
+    pub fn say_what_the_kept_front_ends_hold(&self) {
+        use std::fmt::Write as _;
+        const SHOWN: usize = 48;
+        let mib = |bytes: u64| bytes as f64 / f64::from(1u32 << 20);
+        for (root, &id) in self.roots.ids.iter() {
+            let Some(db) = self.roots.fronts[id as usize].as_ref().and_then(KeptDb::db) else {
+                continue;
+            };
+            let _span = tracing::info_span!(target: "blaze", "idle: what the kept front end holds").entered();
+            let mut usage = Vec::new(); // alloc: an idle daemon's report, an entry an ingredient
+            blaze_query::db::Database::storage(db).memory_usage(&mut usage);
+            usage.sort_by(|a, b| b.held().cmp(&a.held()).then(a.name.cmp(b.name)));
+            let total: u64 = usage.iter().map(blaze_query::db::MemoryUsage::held).sum();
+            let mut said = String::new(); // alloc: as above, one line
+            for it in usage.iter().take(SHOWN) {
+                let _ = write!(
+                    said,
+                    "; {} {:.1} (rows {:.1}, values {:.1}; {} rows made, {} used)",
+                    it.name,
+                    mib(it.held()),
+                    mib(it.row_bytes),
+                    mib(it.value_bytes),
+                    it.rows,
+                    it.used,
+                );
+            }
+            crate::serve::said::logged!(INFO,
+                "blaze serve: idle: the kept front end of {root} holds {:.1} MiB of query storage in {} ingredients, in MiB{said}",
+                mib(total),
+                usage.len(),
+            );
+        }
+    }
+
     /// The system says memory is short (docs/memory-budget.md section 7, "Pressure"): as at
     /// the soft ceiling, every kept front end is let go and each build's front end is asked for
     /// a release now ([`Writer::pressed`]), whatever this daemon's own budget says.
@@ -5224,6 +5267,7 @@ impl<S: Steps> Jobs<S> {
                 // alloc: once per plan that differs from the last, shared by the job's tasks
                 let units = same.unwrap_or_else(|| Arc::new(units));
                 let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+                self.planned = true;
                 if let Some(root) = prep.root
                     && reuses_plans(&job.work)
                 {
@@ -8230,6 +8274,23 @@ impl<S: Steps> Jobs<S> {
                 }
                 read
             });
+        }
+        // A plan was made: what the plan before it held alone of the plan's database (each
+        // plan's values, 24 MiB of them a plan of blaze) is let go of now. Until this the
+        // database was collected only between requests (`Daemon::between`), so a build that
+        // planned again as each build script ended kept every plan it had made: 914 segments
+        // of 4 MiB, 3.76 GiB of the query tag's heap, sixteen minutes into a cold build of
+        // blaze (lane mem-1111, 2026-11-11; `held_samples`, allocated in `plan`). The
+        // collection is the one `between` runs, with the same root: it keeps what an open view
+        // or the root reaches, and frees a memo only once a grace after its unlinking passed.
+        if std::mem::take(&mut self.planned) {
+            let _span = tracing::info_span!(
+                target: "blaze",
+                "plan made: collect the plan's database",
+                retired = self.retired.len()
+            )
+            .entered();
+            w.db.collect(&[w.steps.plan_key()], w.effects);
         }
     }
 

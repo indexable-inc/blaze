@@ -161,6 +161,56 @@ Not built: moving global-heap call sites onto frames, and the per-task budget on
 bytes. Both need `blaze explain memory`'s call sites and task churn from a build of this tree to
 choose the sites and the budget.
 
+### A small project's daemon (2026-11-11, lane mem2-1111)
+
+Measured on hello-world, Linux aarch64 in an ix VM (32 cores), a cargo-built blaze of branch
+`mem2-1111`, a fresh `BLAZE_HOME`, after a cold build, five body edits and nine idle seconds;
+the daemon was 5,745 to 5,798 MiB resident on `all-1111` (`65fafef399`). Where it was
+(`blaze debug inspect`'s memory section, `blaze explain memory_held_now`, and the daemon's
+`idle:` line, all of this lane):
+
+| What | MiB | Needed for an edit of the user's crate |
+|---|---|---|
+| blaze-mem's regions: query 650 to 1,150, chunks 295, frames 278, nameres 237, link 174, intern 113, vfs 77, pool 67 | 1,920 to 2,300 | the frames no; of the rest what the edit reads, a small part |
+| the global heap's live blocks, 522 query ingredients and the maintainers' state among them | 1,790 | as above |
+| mimalloc's arenas resident past its pages: transparent huge pages | 1,010 | no: freed, or never used |
+| mimalloc's pages past their live blocks (2,437 committed for 1,792 live; 309 in pages under a quarter used) | 645 | no: free blocks on pages a live block pins |
+| the binary's and the store's file pages | 340 | reclaimable |
+
+The query storage itself was 1,031 MiB: the dependency graph 480 (reverse edges 267, edges 108,
+nodes 105; 25.5 million edges over 2.3 million nodes), then values (`Body::of` 51,
+`FunctionSignature::kept` 44, the rest under 20 each). On the heap the two largest call
+sites were the reverse edges' lists and the flight recorder's read buffers (208).
+
+Built, each with before and after from the same script:
+
+- **An idle daemon gives its warm memory back** (`crates/blaze-cargo/src/serve/idle.rs`): two
+  seconds with no build and no task, once a stretch, the loop asks each worker's frame shelf
+  back as it parks (`blaze_mem::frame::ask_spare_trim`; nothing called `trim_spare` before) and
+  a purge on the purger's thread. Frames 278 to 4 MiB.
+- **The flight recorder's read buffers** keep room for 16,384 rows a table between flushes, not
+  the largest flush's. The heap outside any task 336 to 130 MiB.
+- **The reverse edges are packed** at 4 bytes a reader once the lists hold as many readers as
+  the packed tier, and at a build's end (`blaze_query::db::reverse`). 267 to 106 MiB.
+- **mimalloc's huge pages are kept**, knowingly (`crates/blaze-engine/src/huge.rs` has the
+  table): built with `no_thp` the daemon is 3,867 to 4,066 MiB and a body edit 3.5 s after the
+  last is 5% to 22% slower in four alternated pairs (medians of 20 or 30).
+
+Together: 5,796 to 5,224 MiB resident (two runs each), with every edit-loop row within the
+runs' spread of the base's. With `no_thp` as well: 3,867 to 4,037 MiB.
+
+Tried and taken out: keeping freed pages for the next edit's build (mimalloc's purge delay and
+no give-back at a build's end while the daemon is small). An edit 3.5 s after the last was 28%
+slower with it, for a reason not found, and a forced purge left 1.1 to 1.5 GiB unreturned.
+
+Not done, by size: the 3.2 GiB that is live. It is the dependencies' front end (the query
+graph and values, name resolution's and method resolution's state, syntax blocks, the
+interners) and the linked program's tables, held for as long as the daemon lives; step 4 is
+what takes it down, and nothing of step 4 was built by this lane. An edit's build also
+allocates and frees 95 MiB of the global heap (`CompiledFunction::clone` 27, the linker's
+`file::fill` 20, `patch_lists` 13, the debug side 15), which is what makes huge pages worth
+17% of an edit; with that gone, `no_thp` is 1.0 GiB for nothing.
+
 ### 4. Outputs as records in the store's buffer pool
 
 Design: [v2/plan/design/store-pool.md](v2/plan/design/store-pool.md).

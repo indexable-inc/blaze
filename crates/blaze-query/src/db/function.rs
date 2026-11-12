@@ -47,7 +47,7 @@ use super::{
     provenance::Cause,
     row::{
         self, CYCLE, DURABILITY, HASHED, HEAD, Header, PROVISIONAL, Pages, RUNNING, Row, STALE,
-        UNTRACKED, VALUE, VIEW_MASK, row_at, span,
+        UNTRACKED, VALUE, VIEW_MASK, span,
     },
     storage::{
         ALL, Durability, FIELD, Relocate, Restamp, Storage, Summary, Table, color, key_parts,
@@ -157,7 +157,7 @@ impl<F: Function> Table for FnTable<F> {
     }
 }
 
-type RowOf<F> = Row<<F as Function>::Value>;
+type RowOf<'a, F> = Row<'a, <F as Function>::Value>;
 
 impl Vtable {
     pub const fn function<F: Function>() -> Vtable {
@@ -166,7 +166,7 @@ impl Vtable {
             file: F::FILE,
             kind: Kind::Function,
             fields: &[],
-            row_size: size_of::<RowOf<F>>(),
+            row_size: RowOf::<F>::SIZE,
             ids_of: None,
             made: None,
             memory: memory::<F>,
@@ -219,9 +219,9 @@ pub fn fetch<'db, F: Function>(db: &'db F::Db, key: F::Key) -> &'db F::Value {
         let page = unsafe { &*dir.add(id.page()) }.load(Ordering::Acquire);
         if let Some(page) = NonNull::new(page) {
             // SAFETY: the page was made for this function's rows, `id.slot() < PAGE_LEN`.
-            let row = unsafe { row_at::<RowOf<F>>(page, id.slot()) };
+            let row = unsafe { RowOf::<F>::at(page, id.slot()) };
             if u64::from(row.header.verified.load(Ordering::Acquire)) == clock {
-                read(storage, &row.header);
+                read(storage, row.header);
                 // SAFETY: `verified == view | VALUE`, loaded with acquire: the value is
                 // published in this view and no writer may start in it (`row`'s rule 2).
                 return unsafe { row.value() };
@@ -250,7 +250,7 @@ pub fn durable<F: Function>(db: &F::Db, key: F::Key) -> bool {
     let page = unsafe { &*dir.add(id.page()) }.load(Ordering::Acquire);
     let Some(page) = NonNull::new(page) else { return false };
     // SAFETY: the page was made for this function's rows, `id.slot() < PAGE_LEN`.
-    let row = unsafe { row_at::<RowOf<F>>(page, id.slot()) };
+    let row = unsafe { RowOf::<F>::at(page, id.slot()) };
     u64::from(row.header.verified.load(Ordering::Acquire)) == storage.clock()
         && row.header.meta.load(Ordering::Relaxed) & UNTRACKED == 0
         && row.header.durability() >= Durability::HIGH.0
@@ -383,12 +383,12 @@ fn fetch_cold<'db, F: Function>(db: &'db F::Db, key: F::Key) -> &'db F::Value {
     let (row, index) = row_or_make::<F>(storage, key.as_id());
     match refresh::<F>(db, storage, index, row, key, true) {
         State::Current => {
-            read(storage, &row.header);
+            read(storage, row.header);
             // SAFETY: `refresh` saw `verified == view | VALUE` with acquire (rule 2).
             unsafe { row.value() }
         }
         State::Provisional(head) => {
-            read_provisional(storage, &row.header, head);
+            read_provisional(storage, row.header, head);
             // SAFETY: a provisional row of this task's own cycle, between its writes (rule 4).
             unsafe { row.value() }
         }
@@ -405,15 +405,15 @@ fn fetch_cold<'db, F: Function>(db: &'db F::Db, key: F::Key) -> &'db F::Value {
 /// made, past [`Id::MAX_U32`]), forged or decoded unchecked. Its row would sit in a page no
 /// sweep or drop can name. The unwind is typed ([`super::NeverGiven`]) and fails the asking
 /// job alone.
-fn row_or_make<F: Function>(storage: &Storage, id: Id) -> (&RowOf<F>, u32) {
+fn row_or_make<F: Function>(storage: &Storage, id: Id) -> (RowOf<'_, F>, u32) {
     let (table, index) = storage.table_or_make::<FnTable<F>>(F::ingredient());
     if storage.owner(id).is_none() {
         super::never_given(storage, index, id);
     }
-    let (size, align) = row::layout::<RowOf<F>>();
+    let (size, align) = (RowOf::<F>::SIZE, RowOf::<F>::ALIGN);
     let page = table.pages.page_or_make(id.page(), &storage.heap, size, align);
     // SAFETY: the page was made for `RowOf<F>` rows; `id.slot() < PAGE_LEN`.
-    (unsafe { row_at::<RowOf<F>>(page, id.slot()) }, index)
+    (unsafe { RowOf::<F>::at(page, id.slot()) }, index)
 }
 
 /// Brings `row` up to this view: with its value when `value`. Returns how the caller may read
@@ -422,12 +422,12 @@ fn refresh<F: Function>(
     db: &F::Db,
     storage: &Storage,
     index: u32,
-    row: &RowOf<F>,
+    row: RowOf<'_, F>,
     key: F::Key,
     value: bool,
 ) -> State {
     let id = key.as_id();
-    let header = &row.header;
+    let header = row.header;
     let mut rounds = 0;
     loop {
         if storage.stopped() {
@@ -612,11 +612,11 @@ fn claimed<F: Function>(
     db: *const (),
     storage: &Storage,
     index: u32,
-    row: &RowOf<F>,
+    row: RowOf<'_, F>,
     key: F::Key,
     value: bool,
 ) -> Option<u32> {
-    let header = &row.header;
+    let header = row.header;
     let view = storage.view_bits();
     let word = header.verified.load(Ordering::Acquire);
     let meta = header.meta.load(Ordering::Relaxed);
@@ -1000,14 +1000,14 @@ fn run<F: Function>(
     db: *const (),
     storage: &Storage,
     index: u32,
-    row: &RowOf<F>,
+    row: RowOf<'_, F>,
     key: F::Key,
     frame: Option<u32>,
     keep: bool,
 ) {
     // SAFETY: as in `verify_edge`: `db` is this storage's `&F::Db`.
     let db = unsafe { &*db.cast::<F::Db>() };
-    let header = &row.header;
+    let header = row.header;
     let id = key.as_id();
     let node = node_of(storage, index, id, header);
     let mut word = header.verified.load(Ordering::Acquire);
@@ -1110,7 +1110,7 @@ fn summarize(storage: &Storage, node: u32, at: u32, untracked: bool) {
 /// A run outside any cycle: backdate, write, publish.
 fn finish<F: Function>(
     storage: &Storage,
-    row: &RowOf<F>,
+    row: RowOf<'_, F>,
     id: Id,
     done: &Ran,
     at: u32,
@@ -1118,7 +1118,7 @@ fn finish<F: Function>(
     new: F::Value,
     keep: bool,
 ) {
-    let header = &row.header;
+    let header = row.header;
     let view = storage.view_bits();
     let old_meta = header.meta.load(Ordering::Relaxed);
     let old_durability = old_meta & DURABILITY;
@@ -1206,14 +1206,14 @@ fn drop_orphans(storage: &Storage, from: u32, head: u32) {
 fn participate<F: Function>(
     db: &F::Db,
     storage: &Storage,
-    row: &RowOf<F>,
+    row: RowOf<'_, F>,
     done: &Ran,
     at: u32,
     word: u32,
     new: F::Value,
     key: F::Key,
 ) {
-    let header = &row.header;
+    let header = row.header;
     let id = key.as_id();
     let head = local::with(|local| local.frames[done.head as usize].node);
     let value = match (F::CYCLE, done.reentered) {
@@ -1295,13 +1295,13 @@ fn heads_of(storage: &Storage, from: u32, id: Id) -> Vec<Id> {
 fn head_round<F: Function>(
     db: &F::Db,
     storage: &Storage,
-    row: &RowOf<F>,
+    row: RowOf<'_, F>,
     done: &Ran,
     at: u32,
     new: F::Value,
     key: F::Key,
 ) -> bool {
-    let header = &row.header;
+    let header = row.header;
     let id = key.as_id();
     // SAFETY: the head's provisional value, this task's own, read by no frame now (rule 4).
     let last = unsafe { row.value() };
@@ -1621,11 +1621,11 @@ fn store_cycle_edges(storage: &Storage, header: &Header, at: u32) -> Converged {
 fn reenter<'db, F: Function>(
     db: &'db F::Db,
     storage: &Storage,
-    row: &'db RowOf<F>,
+    row: RowOf<'db, F>,
     at: u32,
     key: F::Key,
 ) -> &'db F::Value {
-    let header = &row.header;
+    let header = row.header;
     let id = key.as_id();
     if F::CYCLE == CycleKind::Panic {
         let stack = local::with(|local| {
@@ -1702,7 +1702,7 @@ fn gained<F: Function>(table: &FnTable<F>, id: Id) {
 ///
 /// As for [`Row::put`].
 #[inline]
-unsafe fn put<F: Function>(table: &FnTable<F>, row: &RowOf<F>, value: F::Value) {
+unsafe fn put<F: Function>(table: &FnTable<F>, row: RowOf<'_, F>, value: F::Value) {
     if F::BUDGETED {
         table.bytes.fetch_add(weigh::<F>(&value), Ordering::Relaxed);
     }
@@ -1716,7 +1716,7 @@ unsafe fn put<F: Function>(table: &FnTable<F>, row: &RowOf<F>, value: F::Value) 
 ///
 /// As for [`Row::drop_value`].
 #[inline]
-unsafe fn drop_value<F: Function>(table: &FnTable<F>, row: &RowOf<F>) -> u64 {
+unsafe fn drop_value<F: Function>(table: &FnTable<F>, row: RowOf<'_, F>) -> u64 {
     let bytes = if F::BUDGETED {
         // SAFETY: the caller's contract: the row holds a value no one else reads or writes.
         let bytes = weigh::<F>(unsafe { row.value() });
@@ -1733,7 +1733,14 @@ unsafe fn drop_value<F: Function>(table: &FnTable<F>, row: &RowOf<F>) -> u64 {
 /// What `value` weighs, as the table counts it.
 #[inline]
 fn weigh<F: Function>(value: &F::Value) -> i64 {
-    i64::try_from(F::weigh(value)).unwrap_or(i64::MAX)
+    i64::try_from(weighed::<F>(value)).unwrap_or(i64::MAX)
+}
+
+/// What `value` holds beside its row: what [`Function::weigh`] counts, and its own bytes
+/// where the row keeps it out of line ([`Row::FAR`]).
+#[inline]
+fn weighed<F: Function>(value: &F::Value) -> usize {
+    F::weigh(value).saturating_add(RowOf::<F>::FAR_BYTES)
 }
 
 fn table_of<F: Function>(storage: &Storage) -> &FnTable<F> {
@@ -1745,8 +1752,8 @@ fn table_of<F: Function>(storage: &Storage) -> &FnTable<F> {
 /// [`Vtable::reset`] of `F`: empties row `id`, never verified by its edges again.
 unsafe fn reset_row<F: Function>(storage: &Storage, index: u32, id: Id) {
     let Some(table) = storage.table::<FnTable<F>>(index) else { return };
-    let Some(row) = table.pages.row::<RowOf<F>>(id) else { return };
-    let header = &row.header;
+    let Some(row) = RowOf::<F>::of(&table.pages, id) else { return };
+    let header = row.header;
     let word = header.verified.load(Ordering::Relaxed);
     debug_assert!(
         word & VALUE == 0 || word & PROVISIONAL != 0,
@@ -1773,13 +1780,13 @@ unsafe fn reset_row<F: Function>(storage: &Storage, index: u32, id: Id) {
 fn rows<'t, F: Function>(
     storage: &Storage,
     table: &'t FnTable<F>,
-) -> impl Iterator<Item = (Id, &'t RowOf<F>)> {
+) -> impl Iterator<Item = (Id, RowOf<'t, F>)> {
     let pages: Vec<(usize, NonNull<u8>)> = table.pages.made(storage.pages_made()).collect(); // alloc: a sweep's or drop's page list
     pages.into_iter().flat_map(|(page, at)| {
         (0..PAGE_LEN).map(move |slot| {
             // SAFETY: a page made for `RowOf<F>` rows, `slot < PAGE_LEN`; it lives as long as
             // the storage's heap, which outlives the table `'t` borrows.
-            (Id::at(page, slot), unsafe { row_at::<RowOf<F>>(at, slot) })
+            (Id::at(page, slot), unsafe { RowOf::<F>::at(at, slot) })
         })
     })
 }
@@ -1788,8 +1795,8 @@ fn rows<'t, F: Function>(
 /// computes it again, its hash: hashed here, once per eviction, never on a run that keeps it,
 /// and never for `NO_EQ`, whose every run is a change. Returns what the value weighed, or
 /// `None` when the row held no final value.
-fn evict<F: Function>(table: &FnTable<F>, row: &RowOf<F>) -> Option<u64> {
-    let header = &row.header;
+fn evict<F: Function>(table: &FnTable<F>, row: RowOf<'_, F>) -> Option<u64> {
+    let header = row.header;
     let word = header.verified.load(Ordering::Relaxed);
     if word & VALUE == 0 || word & PROVISIONAL != 0 {
         return None;
@@ -1815,7 +1822,7 @@ pub fn evict_values<F: Function>(db: &mut F::Db) -> usize {
 fn evict_table<F: Function>(storage: &mut Storage, index: u32) -> usize {
     let Some(table) = storage.table::<FnTable<F>>(index) else { return 0 };
     let evicted =
-        rows::<F>(storage, table).filter(|(_, row)| evict::<F>(table, row).is_some()).count();
+        rows::<F>(storage, table).filter(|(_, row)| evict::<F>(table, *row).is_some()).count();
     table.values.fetch_sub(evicted, Ordering::Relaxed);
     counts::add(index, counts::DROPPED, evicted as u64);
     evicted
@@ -1856,8 +1863,8 @@ pub fn evict_values_of<F: Function>(db: &mut F::Db, keys: &[F::Key]) -> usize {
     let Some(table) = storage.table::<FnTable<F>>(F::ingredient().index()) else { return 0 };
     let evicted = keys
         .iter()
-        .filter_map(|key| table.pages.row::<RowOf<F>>(key.as_id()))
-        .filter(|row| evict::<F>(table, row).is_some())
+        .filter_map(|key| RowOf::<F>::of(&table.pages, key.as_id()))
+        .filter(|row| evict::<F>(table, *row).is_some())
         .count();
     table.values.fetch_sub(evicted, Ordering::Relaxed);
     counts::add(F::ingredient().index(), counts::DROPPED, evicted as u64);
@@ -1884,9 +1891,7 @@ fn cut_to_held<F: Function>(table: &FnTable<F>, keys: &mut Vec<u32>) {
     keys.sort_unstable();
     keys.dedup();
     keys.retain(|&key| {
-        table
-            .pages
-            .row::<RowOf<F>>(Id::from_u32(key))
+        RowOf::<F>::of(&table.pages, Id::from_u32(key))
             .is_some_and(|row| row.header.verified.load(Ordering::Relaxed) & VALUE != 0)
     });
 }
@@ -1902,14 +1907,14 @@ fn held_values<F: Function>(storage: &Storage, index: u32, out: &mut Vec<Held>) 
     cut_to_held(table, &mut held);
     let mut sum: u64 = 0;
     for &key in held.iter() {
-        let Some(row) = table.pages.row::<RowOf<F>>(Id::from_u32(key)) else { continue };
+        let Some(row) = RowOf::<F>::of(&table.pages, Id::from_u32(key)) else { continue };
         let word = row.header.verified.load(Ordering::Relaxed);
         if word & PROVISIONAL != 0 {
             continue;
         }
         // SAFETY: with `&mut` of the storage (the view boundary) no reference to the value
         // lives (rule 3), and it is whole (`VALUE`, not provisional).
-        let bytes = F::weigh(unsafe { row.value() }) as u64;
+        let bytes = weighed::<F>(unsafe { row.value() }) as u64;
         sum += bytes;
         // alloc: the pass's values, once per eighth of the tag's budget made
         out.push(Held { view: word & VIEW_MASK, ingredient: index, key, bytes });
@@ -1936,7 +1941,7 @@ fn evict_held<F: Function>(storage: &Storage, index: u32, gone: &[Held]) -> (usi
             .entered();
     let Some(table) = storage.table::<FnTable<F>>(index) else { return (0, 0) };
     let one = |table: &FnTable<F>, value: &Held| {
-        table.pages.row::<RowOf<F>>(Id::from_u32(value.key)).and_then(|row| evict::<F>(table, row))
+        RowOf::<F>::of(&table.pages, Id::from_u32(value.key)).and_then(|row| evict::<F>(table, row))
     };
     let (evicted, freed) = if gone.len() < PAR_EVICT {
         gone.iter().filter_map(|value| one(table, value)).fold((0, 0), |(n, b), it| (n + 1, b + it))
@@ -1965,7 +1970,7 @@ fn evict_held<F: Function>(storage: &Storage, index: u32, gone: &[Held]) -> (usi
 fn restamp<F: Function>(storage: &Storage, index: u32, restamp: &mut Restamp<'_>) {
     let Some(table) = storage.table::<FnTable<F>>(index) else { return };
     for (_, row) in rows::<F>(storage, table) {
-        let header = &row.header;
+        let header = row.header;
         let word = header.verified.load(Ordering::Relaxed);
         debug_assert!(word & (RUNNING | PROVISIONAL) == 0, "a row running across a `&mut`");
         let verified = restamp.apply(word & VIEW_MASK);
@@ -1980,13 +1985,20 @@ fn restamp<F: Function>(storage: &Storage, index: u32, restamp: &mut Restamp<'_>
 /// Two loads a table, no row read.
 fn memory<F: Function>(storage: &Storage, index: u32) -> MemoryUsage {
     let (made, weighed) = storage.table::<FnTable<F>>(index).map_or((0, 0), |table| {
-        (table.pages.count(), u64::try_from(table.bytes.load(Ordering::Relaxed)).unwrap_or(0))
+        let weighed = u64::try_from(table.bytes.load(Ordering::Relaxed)).unwrap_or(0);
+        // A function not kept by bytes weighs nothing; its values kept out of line are their
+        // own bytes each all the same.
+        let far = match F::BUDGETED {
+            true => 0,
+            false => (table.values.load(Ordering::Relaxed) * RowOf::<F>::FAR_BYTES) as u64,
+        };
+        (table.pages.count(), weighed + far)
     });
     MemoryUsage {
         name: F::NAME,
         rows: (made * PAGE_LEN) as u64,
         used: 0,
-        row_bytes: (made * PAGE_LEN * size_of::<RowOf<F>>()) as u64,
+        row_bytes: (made * PAGE_LEN * RowOf::<F>::SIZE) as u64,
         // A budgeted function's values say what they hold beside themselves ([`Function::weigh`]).
         value_bytes: weighed,
     }
@@ -2004,7 +2016,7 @@ fn used<F: Function>(storage: &Storage, index: u32) -> u64 {
             .filter(|&slot| {
                 // SAFETY: a page made for `RowOf<F>` rows, `slot < PAGE_LEN`, read while the
                 // storage `storage` borrows lives.
-                let header = unsafe { row::header_at(at, slot, size_of::<RowOf<F>>()) };
+                let header = unsafe { row::header_at(at, slot, RowOf::<F>::SIZE) };
                 header.node.load(Ordering::Relaxed) != 0
             })
             .count() as u64

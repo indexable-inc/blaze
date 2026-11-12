@@ -99,7 +99,9 @@ pub struct MemoryUsage {
     /// The bytes of every row made, a value kept in place in its row included.
     pub row_bytes: u64,
     /// What values hold beside their rows: a budgeted (`lru`) function's weight, what its
-    /// `weigh` counts; 0 for anything else, whose values' own heap is not counted.
+    /// `weigh` counts, and for any function whose values are kept out of line (past
+    /// `row::INLINE_MOST` bytes) each value's own bytes; what else a value owns on the heap
+    /// is not counted.
     pub value_bytes: u64,
 }
 

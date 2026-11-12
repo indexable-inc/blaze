@@ -343,6 +343,7 @@ fn make(tag: Tag) -> Option<*mut mi_heap_t> {
             blaze_mem::tag::heap_by_tag();
             blaze_mem::tag::heap_committed_by(committed);
             blaze_mem::tag::heap_gives_back_by(settle);
+            blaze_mem::tag::heap_pages_by(pages);
             Some(made)
         }
         Err(theirs) => {
@@ -400,6 +401,90 @@ fn committed() -> u64 {
         );
     }
     current as u64
+}
+
+/// mimalloc 3's `mi_heap_area_t` (include/mimalloc.h): one page of a heap, as
+/// `mi_heap_visit_blocks` hands it to its visitor. libmimalloc-sys names mimalloc 2's, two
+/// fields shorter.
+#[repr(C)]
+struct Area {
+    blocks: *mut c_void,
+    reserved: usize,
+    /// The page's capacity times its block size.
+    committed: usize,
+    /// Live blocks.
+    used: usize,
+    block_size: usize,
+    full_block_size: usize,
+    reserved1: *mut c_void,
+}
+
+unsafe extern "C" {
+    /// Calls `visitor` once a page of `heap` (`visit_blocks` false), whichever thread's theap
+    /// has it, by a walk of the heap's page bitmaps in every arena; null is the main heap.
+    /// mimalloc takes no lock for it: it reads each page's header as the page's owner writes
+    /// it, and a page freed meanwhile reads as it was or, once purged, as zeroes (a release
+    /// build's purge is `madvise`, never a protection change).
+    fn mi_heap_visit_blocks(
+        heap: *mut mi_heap_t,
+        visit_blocks: bool,
+        visitor: unsafe extern "C" fn(
+            *const mi_heap_t,
+            *const Area,
+            *mut c_void,
+            usize,
+            *mut c_void,
+        ) -> bool,
+        arg: *mut c_void,
+    ) -> bool;
+}
+
+/// Adds one page to the [`blaze_mem::tag::HeapPages`] `arg` points at.
+unsafe extern "C" fn count_page(
+    _: *const mi_heap_t,
+    area: *const Area,
+    _: *mut c_void,
+    _: usize,
+    arg: *mut c_void,
+) -> bool {
+    // SAFETY: `arg` is the `HeapPages` `pages` passed, its alone for the walk, and `area` a
+    // record on mimalloc's stack for this call.
+    let (into, area) = unsafe { (&mut *arg.cast::<blaze_mem::tag::HeapPages>(), &*area) };
+    let committed = area.committed as u64;
+    // A header read mid-write may say more blocks than the page has: held to the page.
+    let used = (area.used as u64).saturating_mul(area.full_block_size as u64).min(committed);
+    into.pages += 1;
+    into.committed += committed;
+    into.used += used;
+    if used == 0 {
+        into.empty += committed;
+    } else if used < committed / 4 {
+        into.sparse += committed;
+    }
+    true
+}
+
+/// What each tag's heap holds in its pages, then the main heap's ([`blaze_mem::tag::heap_pages`]):
+/// a walk of mimalloc's page bitmaps, a header a page, with other threads allocating. It
+/// allocates nothing. Blocks past mimalloc's arenas (each mapped alone, 512 MiB and up in
+/// one) are in no page here.
+fn pages(into: &mut [blaze_mem::tag::HeapPages; Tag::COUNT + 1]) {
+    for (tag, into) in Tag::ALL.into_iter().zip(into.iter_mut()) {
+        let heap = HEAPS[tag.index()].load(Ordering::Acquire);
+        if !heap.is_null() {
+            // SAFETY: a heap of ours, never deleted; the visitor reads its two arguments.
+            unsafe { mi_heap_visit_blocks(heap, false, count_page, ptr::from_mut(into).cast()) };
+        }
+    }
+    // SAFETY: null names the main heap; as above.
+    unsafe {
+        mi_heap_visit_blocks(
+            ptr::null_mut(),
+            false,
+            count_page,
+            ptr::from_mut(&mut into[Tag::COUNT]).cast(),
+        );
+    }
 }
 
 /// mimalloc could make no heap for a tag: said before the allocation fails, since the failure
@@ -656,6 +741,47 @@ mod tests {
                 BLOCK * BLOCKS,
             );
         });
+    }
+
+    /// The page walk names a tag's blocks where they are: blocks made for a tag show in its
+    /// pages as committed and used bytes of at least their sizes, and once they are freed and
+    /// the thread collected, the tag's used bytes fall by them. On a tag no other test of this
+    /// binary allocates for, on one thread. The cause, by removing it: a walk that read
+    /// another field for `used` (mimalloc 2's `mi_heap_area_t` has no `full_block_size`)
+    /// fails the first bound.
+    #[test]
+    fn the_page_walk_counts_a_tags_live_blocks_and_sees_them_go() {
+        const BLOCK: usize = 1 << 10;
+        const BLOCKS: usize = 4 << 10; // 4 MiB
+        let of = |tag: Tag| {
+            let mut all = [blaze_mem::tag::HeapPages::default(); Tag::COUNT + 1];
+            pages(&mut all);
+            all[tag.index()]
+        };
+        std::thread::spawn(move || {
+            let before = of(Tag::Fuzz);
+            let blocks: Vec<Sent> = (0..BLOCKS)
+                .map(|_| {
+                    // SAFETY: a valid layout; each block is freed below, once, with it.
+                    let block = unsafe { Heaps.alloc_for(Tag::Fuzz, layout(BLOCK), false) };
+                    assert!(!block.is_null());
+                    Sent(block, ptr::null_mut())
+                })
+                .collect();
+            let held = of(Tag::Fuzz);
+            let made = (BLOCK * BLOCKS) as u64;
+            assert!(held.used >= before.used + made, "{before:?} then {held:?}");
+            assert!(held.committed >= held.used && held.pages > before.pages, "{held:?}");
+            for block in blocks {
+                // SAFETY: a live block made above with this layout, freed once.
+                unsafe { Heaps.dealloc(block.0, layout(BLOCK)) };
+            }
+            give_back_here(blaze_mem::tag::heap_give_backs());
+            let after = of(Tag::Fuzz);
+            assert!(after.used + made <= held.used, "{held:?} then {after:?}");
+        })
+        .join()
+        .expect("the walking thread");
     }
 
     /// [`PURGE_DELAY`] is the option `purge_at_once` means: it reads mimalloc's default for

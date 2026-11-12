@@ -727,6 +727,8 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// When the daemon past its limit's line last asked for the heaps' free pages back
     /// ([`GIVE_BACK_EVERY`]), on the driver's clock.
     given_back: Duration,
+    /// Whether this stretch with nothing to do gave its warm memory back ([`super::idle`]).
+    idle: super::idle::Idle,
     /// Whether the system's memory pressure is watched ([`PRESSURE`]): from the start until its
     /// watch fails (no source here) or is undone at the stop.
     pressure_watched: bool,
@@ -1756,6 +1758,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             builds: Vec::new(), // alloc: none until a build is looked at
             memory_logged: Duration::ZERO,
             given_back: Duration::ZERO,
+            idle: super::idle::Idle::default(),
             pressure_watched: true,
             paused_checked: Duration::ZERO,
             gc: None,
@@ -2620,6 +2623,16 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 self.given_back = now;
                 crate::raw::memory::purger().ask();
             }
+        }
+        // Nothing to do for a while: the warm memory each thread keeps for its next task goes
+        // back, once a stretch, on the purger's thread and the workers' own as they park
+        // ([`super::idle`]).
+        let working = self.jobs.build_under_way() != 0 || self.plane.running() != 0;
+        if self.idle.look(now, working) {
+            tracing::info!(target: "blaze", "idle: the daemon gives its warm memory back");
+            blaze_mem::frame::ask_spare_trim();
+            crate::raw::memory::purger().ask();
+            self.jobs.say_what_the_kept_front_ends_hold();
         }
         blaze_profile::plot(Plot::AllocatorPurgedBytes, crate::raw::memory::purged_bytes());
         blaze_profile::plot(Plot::CommittedBytes, memory.committed);

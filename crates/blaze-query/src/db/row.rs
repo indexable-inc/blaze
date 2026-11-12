@@ -115,14 +115,89 @@ pub(crate) mod span {
     }
 }
 
-/// One function's memo of one key.
-#[repr(C)]
-pub(crate) struct Row<V> {
-    pub(crate) header: Header,
-    value: UnsafeCell<MaybeUninit<V>>,
+/// The largest value a row keeps in place. A larger one is kept on the global heap and the row
+/// holds its address: a row is as long as its value whether it holds one or not, so a function
+/// whose values are large and let go (every MIR, at each release: 588 bytes a row of
+/// `monomorphized_runtime_mir_body_query`, 3.37 GiB of its 5.73 million rows after their
+/// values had gone, lane mem-1111, 2026-11-11) or whose pages are sparsely used (a page is
+/// 1024 rows whatever ran) kept the bytes for good. Out of line, a value's bytes go back as
+/// it is dropped, and the row is 40 bytes. At most this, a value costs no second load on a hit.
+pub(crate) const INLINE_MOST: usize = 128;
+
+/// One function's memo of one key: a handle to its row in a page, a [`Header`] and then the
+/// value's place, which holds the value itself ([`INLINE_MOST`] bytes at most) or the address
+/// of its own block of the global heap ([`Row::FAR`]).
+///
+/// The invariant: a row whose `verified` has [`VALUE`] holds, in its place, a whole `V` or the
+/// address of a live block made by [`Row::put`] holding a whole `V`, and whoever may read or
+/// write the value by the module's rules may read or write the place and that block; a row
+/// without [`VALUE`] owns no block.
+pub(crate) struct Row<'a, V> {
+    pub(crate) header: &'a Header,
+    /// The row's first byte, with its page's provenance: the place is past the header.
+    at: NonNull<u8>,
+    value: std::marker::PhantomData<&'a V>,
 }
 
-impl<V> Row<V> {
+impl<V> Clone for Row<'_, V> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<V> Copy for Row<'_, V> {}
+
+impl<'a, V> Row<'a, V> {
+    /// Whether the value is kept out of line.
+    pub(crate) const FAR: bool = size_of::<V>() > INLINE_MOST;
+    const PLACE_SIZE: usize = if Self::FAR { size_of::<*mut V>() } else { size_of::<V>() };
+    const PLACE_ALIGN: usize = if Self::FAR { align_of::<*mut V>() } else { align_of::<V>() };
+    /// Where the place starts in the row.
+    const PLACE_AT: usize = size_of::<Header>().next_multiple_of(Self::PLACE_ALIGN);
+    /// A row's alignment, and its bytes: what its page is made of ([`Pages::page_or_make`]).
+    pub(crate) const ALIGN: usize = if Self::PLACE_ALIGN > align_of::<Header>() {
+        Self::PLACE_ALIGN
+    } else {
+        align_of::<Header>()
+    };
+    pub(crate) const SIZE: usize =
+        (Self::PLACE_AT + Self::PLACE_SIZE).next_multiple_of(Self::ALIGN);
+    /// What a value holds on the global heap for being out of line.
+    pub(crate) const FAR_BYTES: usize = if Self::FAR { size_of::<V>() } else { 0 };
+
+    /// Row `slot` of a page made for this function's rows.
+    ///
+    /// # Safety
+    ///
+    /// `page` was made by [`Pages::page_or_make`] with rows of [`Row::SIZE`] bytes aligned to
+    /// [`Row::ALIGN`], `slot < PAGE_LEN`, and `'a` does not outlive the storage that owns it.
+    #[inline(always)]
+    pub(crate) unsafe fn at(page: NonNull<u8>, slot: usize) -> Row<'a, V> {
+        debug_assert!(slot < PAGE_LEN);
+        // SAFETY: the caller's contract: the row is inside the page and aligned; its header is
+        // all atomics, valid zero or as a writer stored it, and lives as long as the storage.
+        let at = unsafe { page.add(slot * Self::SIZE) };
+        // SAFETY: as above.
+        Row { header: unsafe { at.cast::<Header>().as_ref() }, at, value: std::marker::PhantomData }
+    }
+
+    /// The row of `id` in `pages`, this function's, if its page was made.
+    #[inline]
+    pub(crate) fn of(pages: &'a Pages, id: Id) -> Option<Row<'a, V>> {
+        let page = NonNull::new(pages.page(id.page()))?;
+        // SAFETY: every caller of one function's `Pages` names its `V`, so the page was made
+        // for these rows; `id.slot() < PAGE_LEN`; the page lives as long as the storage's
+        // heap, which outlives `pages` (the storage drops both together).
+        Some(unsafe { Row::at(page, id.slot()) })
+    }
+
+    /// The value's place: the value, or where its address is.
+    #[inline(always)]
+    fn place(self) -> *mut u8 {
+        // SAFETY: inside the row (`PLACE_AT + PLACE_SIZE <= SIZE`), which is inside its page.
+        unsafe { self.at.as_ptr().add(Self::PLACE_AT) }
+    }
+
     /// The value. The caller saw [`VALUE`] in `verified` with acquire in this view (rule 2),
     /// or is the flight holder of the row (rule 1), or reads a provisional value of its own
     /// cycle (rule 4).
@@ -131,10 +206,17 @@ impl<V> Row<V> {
     ///
     /// As above: the value is initialized and no write of it runs.
     #[inline(always)]
-    pub(crate) unsafe fn value(&self) -> &V {
-        // SAFETY: the caller's contract: initialized, and not written while the reference
-        // lives (rules 1 to 4 of the module).
-        unsafe { (*self.value.get()).assume_init_ref() }
+    pub(crate) unsafe fn value(self) -> &'a V {
+        let place = self.place();
+        // SAFETY: the caller's contract: the place is initialized and not written while the
+        // reference lives (rules 1 to 4 of the module); a far value's block is live and whole
+        // for as long (the invariant: only `drop_value` frees it, a write).
+        unsafe {
+            match Self::FAR {
+                true => &**place.cast::<*mut V>(),
+                false => &*place.cast::<V>(),
+            }
+        }
     }
 
     /// Writes `value` into a row that holds none.
@@ -143,9 +225,17 @@ impl<V> Row<V> {
     ///
     /// The caller holds the row's flight with [`RUNNING`] set, or a provisional row of its own
     /// cycle between rounds, or `&mut` of the storage; the row holds no value.
-    pub(crate) unsafe fn put(&self, value: V) {
-        // SAFETY: the caller is the row's one writer and no reader reads it (rules 1, 4).
-        unsafe { (*self.value.get()).write(value) };
+    pub(crate) unsafe fn put(self, value: V) {
+        let place = self.place();
+        // SAFETY: the caller is the row's one writer and no reader reads it (rules 1, 4); the
+        // place is the row's own, aligned for what is written.
+        unsafe {
+            match Self::FAR {
+                // alloc: a value past `INLINE_MOST`, its own block until the row drops it
+                true => place.cast::<*mut V>().write(Box::into_raw(Box::new(value))),
+                false => place.cast::<V>().write(value),
+            }
+        }
     }
 
     /// Drops the value the row holds.
@@ -154,9 +244,16 @@ impl<V> Row<V> {
     ///
     /// As for [`Row::put`], and the row holds a value, which no live reference reads (rule 3,
     /// or rule 4 for a provisional one).
-    pub(crate) unsafe fn drop_value(&self) {
-        // SAFETY: the caller's contract: initialized, written by nobody else, read by nobody.
-        unsafe { (*self.value.get()).assume_init_drop() };
+    pub(crate) unsafe fn drop_value(self) {
+        let place = self.place();
+        // SAFETY: the caller's contract: initialized, written by nobody else, read by nobody;
+        // a far value's address is the block `put` made, freed once, here.
+        unsafe {
+            match Self::FAR {
+                true => drop(Box::from_raw(place.cast::<*mut V>().read())),
+                false => place.cast::<V>().drop_in_place(),
+            }
+        }
     }
 }
 
@@ -252,18 +349,6 @@ impl Pages {
     }
 }
 
-/// Row `slot` of type `R` in a page made for `R`.
-///
-/// # Safety
-///
-/// `page` was made by [`Pages::page_or_make`] with `size_of::<R>()` rows, and `slot < PAGE_LEN`.
-#[inline(always)]
-pub(crate) unsafe fn row_at<'a, R>(page: NonNull<u8>, slot: usize) -> &'a R {
-    debug_assert!(slot < PAGE_LEN);
-    // SAFETY: the caller's contract, as in `Pages::row`.
-    unsafe { &*page.as_ptr().add(slot * size_of::<R>()).cast::<R>() }
-}
-
 /// What a page of rows of type `R` occupies, and its alignment.
 pub(crate) const fn layout<R>() -> (usize, usize) {
     (size_of::<R>(), align_of::<R>())
@@ -286,3 +371,72 @@ pub(crate) unsafe fn header_at<'a>(page: NonNull<u8>, slot: usize, size: usize) 
 
 /// A column of one `AtomicU32` per ID page: the ingredient owning it (0 for none).
 pub(crate) type Owners = Whole<AtomicU32, MAX_PAGES>;
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    /// A value that counts its drops, `N` words long.
+    struct Counted<const N: usize>([u64; N]);
+
+    impl<const N: usize> Drop for Counted<N> {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The invariant: a row holds its value in place up to [`INLINE_MOST`] bytes and past it
+    /// the address of the value's own block, which `drop_value` frees with the value; either
+    /// way the row reads back what was put, its neighbours untouched, and a row is no longer
+    /// than its header and its place.
+    #[test]
+    fn a_large_value_is_kept_out_of_line_and_a_small_one_in_place() {
+        type Near<'a> = Row<'a, Counted<2>>;
+        type Far<'a> = Row<'a, Counted<64>>;
+        assert!(!Near::FAR && Far::FAR);
+        assert_eq!(Near::SIZE, size_of::<Header>() + 16);
+        assert_eq!(Far::SIZE, size_of::<Header>() + size_of::<usize>());
+        assert_eq!((Far::FAR_BYTES, Near::FAR_BYTES), (512, 0));
+        assert!(!Row::<[u8; INLINE_MOST]>::FAR, "a value of the bound stays in place");
+        assert_eq!(Row::<u128>::SIZE, 48);
+        assert_eq!(Row::<()>::SIZE, size_of::<Header>());
+
+        // A page of three rows of each, zeroes as `Pages::page_or_make` makes it.
+        let mut near_page = [0u64; 3 * 6]; // 3 rows of 48 bytes
+        let mut far_page = [0u64; 3 * 5]; // 3 rows of 40 bytes
+        let near_at = NonNull::from(&mut near_page).cast::<u8>();
+        let far_at = NonNull::from(&mut far_page).cast::<u8>();
+        let before = DROPS.load(Ordering::Relaxed);
+        for slot in 0..3 {
+            // SAFETY: pages of three rows of the rows' sizes, 8-aligned; the test is the only
+            // reader and writer, and no row holds a value yet.
+            unsafe {
+                Near::at(near_at, slot).put(Counted([slot as u64, 7]));
+                Far::at(far_at, slot).put(Counted([slot as u64 + 100; 64]));
+            }
+        }
+        for slot in 0..3 {
+            // SAFETY: each row holds the value put above, which nothing writes.
+            unsafe {
+                assert_eq!(Near::at(near_at, slot).value().0, [slot as u64, 7]);
+                assert_eq!(Far::at(far_at, slot).value().0, [slot as u64 + 100; 64]);
+                // The header before each place was not written over.
+                assert_eq!(Far::at(far_at, slot).header.node.load(Ordering::Relaxed), 0);
+                assert_eq!(Near::at(near_at, slot).header.extra.load(Ordering::Relaxed), 0);
+            }
+        }
+        assert_eq!(DROPS.load(Ordering::Relaxed), before, "a read drops nothing");
+        for slot in 0..3 {
+            // SAFETY: each row holds a value no reference reads; dropped once.
+            unsafe {
+                Near::at(near_at, slot).drop_value();
+                Far::at(far_at, slot).drop_value();
+            }
+        }
+        assert_eq!(DROPS.load(Ordering::Relaxed), before + 6, "each value dropped once");
+    }
+}

@@ -660,6 +660,39 @@ pub const ALLOC_SAMPLES: Table = Table {
     ],
 };
 
+/// The sampled allocations still held at a reading (`crate::heap::held`): what the global heap
+/// keeps, by call site. `alloc_samples`' columns, then the reading's time.
+pub const HELD_SAMPLES: Table = Table {
+    name: "held_samples",
+    doc: "one row a sampled allocation of the daemon's global heap that nobody had freed at a reading (one reading a minute): summed by `site` within one `read_ns`, the bytes the heap held then of what was allocated there",
+    columns: &[
+        opt("build_id", Type::U64, "the build its block was allocated in; null outside any build"),
+        PROCESS,
+        col("thread", Type::U32, "the thread that allocated its block"),
+        col("t_ns", Type::I64, "when its block was allocated"),
+        col(
+            "bytes",
+            Type::U64,
+            "the bytes of allocation the sample stands for (`alloc_samples.bytes`): summed by `site` within one reading, the bytes held of what was allocated there, within a sample's",
+        ),
+        col("stack", Type::Stack, "the call stack that allocated it, outermost first"),
+        opt("span_id", Type::U64, "the innermost span its thread was inside as it allocated"),
+        STACK_PCS,
+        opt(
+            "tag",
+            Type::Dict,
+            "the blaze-mem tag of the task that made the block; null for one made outside any task",
+        ),
+        col("block_bytes", Type::U64, "the sampled block's own bytes as it was sampled"),
+        opt(
+            "site",
+            Type::Utf8,
+            "the call site, as `alloc_samples.site`",
+        ),
+        col("read_ns", Type::I64, "the reading it is a row of: every row of one reading has the same"),
+    ],
+};
+
 /// One row a code image (the executable, a shared library) holding an address a flush's
 /// samples wrote in `stack_pcs`, once a process: what names those addresses after the process
 /// is gone.
@@ -1319,7 +1352,7 @@ pub const TEST_RUNS: Table = Table {
 };
 
 /// Every table the history and the live feed hold.
-pub const TABLES: [&Table; 29] = [
+pub const TABLES: [&Table; 30] = [
     &SPANS,
     &COUNTERS,
     &EVENTS,
@@ -1349,6 +1382,7 @@ pub const TABLES: [&Table; 29] = [
     &TEST_RUNS,
     &IMAGES,
     &KEY_PARTS,
+    &HELD_SAMPLES,
 ];
 
 /// The tables that are results, made on request and not kept.

@@ -53,10 +53,11 @@ const EXPLAIN_USAGE: &str =
 const MEMORY_USAGE: &str = "blaze explain memory [BUILD] [limit=N] [--json]";
 
 /// The parts of `blaze explain memory`, each a view of `sql/examples.sql`, with its heading.
-const MEMORY_PARTS: [(&str, &str, &str); 4] = [
+const MEMORY_PARTS: [(&str, &str, &str); 5] = [
     ("timeline", "memory_timeline", "the memory, minute by minute"),
     ("peak_tasks", "memory_peak_tasks", "the tasks that held the most at once"),
     ("at_peak", "memory_at_peak", "the memory by area at the footprint's peak"),
+    ("held", "memory_held", "what the global heap held at the footprint's peak, by call site"),
     ("sites", "memory_sites", "what churns the global heap, by call site"),
 ];
 const WHY_USAGE: &str = "blaze why [ITEM] [--all] [--unexplained] [--json]";

@@ -494,6 +494,28 @@ const KEPT_WALKS: usize = 8;
 static KEPT: Lock<Vec<(base_db::Nonce, Facing, Arc<Kept<HirInstance, HirStatic>>)>> =
     Lock::new("codegen.frontend.kept", Vec::new());
 
+/// Lets go of every kept walk ([`HirFrontend::kept`]): each function's describe, each
+/// program's last walk and lists, of every database and configuration. How many describes
+/// went. They are kept only so the next build's walk asks the front end less; on the global
+/// heap, under no budget, they were what a cold build of blaze held most of codegen's heap
+/// for (13.11 GiB with one task running; the held samples' spans were `codegen reach`,
+/// `codegen resolve`, `codegen delta` and `codegen templates`, each as old as the build: lane
+/// mem-1111, 2026-11-11). A walk in flight keeps its own until it ends; the next walk over
+/// each database begins with nothing kept and says why ([`Fresh::LetGo`]), its describes
+/// verified by the query database where they are memos ([`described_memo`]).
+///
+/// [`Fresh::LetGo`]: blaze_codegen::driver::Fresh::LetGo
+pub fn let_go_kept_walks() -> usize {
+    let mut kept = KEPT.lock();
+    let mut describes = 0;
+    for (_, _, walks) in kept.iter_mut() {
+        describes += walks.len();
+        // alloc: an empty table, once a database and configuration a release
+        *walks = Arc::new(Kept::after_let_go());
+    }
+    describes
+}
+
 const NO_POLICY: &str = "the front end was made with no policy (`HirFrontend::with_policy`), so \
                          it can't tell how the instance's units build its MIR";
 

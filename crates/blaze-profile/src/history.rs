@@ -205,6 +205,11 @@ pub const IDLE_EVERY: Duration = Duration::from_secs(60);
 /// seconds stopped it (profrows).
 pub const DRAIN: Duration = Duration::from_millis(50);
 
+/// How often a flush reads the sampled blocks still held into `held_samples`
+/// ([`crate::heap::held`]): each reading is a row a held sample, one per 4 MiB held, so a
+/// minute keeps an hour's build of 60 GiB to about a million rows.
+pub const HELD_EVERY: Duration = Duration::from_secs(60);
+
 /// Rows drained that make the history flush before [`EVERY`] is up ([`History::full`]): about
 /// four row groups, so a busy build's rows are written as they come, not held for seconds.
 pub const FLUSH_ROWS: usize = 1 << 19;
@@ -434,6 +439,8 @@ pub struct Flushed {
     pub samples: usize,
     /// Heap samples ([`crate::heap`]): `alloc_samples` rows.
     pub alloc_samples: usize,
+    /// Samples still held at this flush's reading, if it made one: `held_samples` rows.
+    pub held_samples: usize,
     pub switches: usize,
     pub events: usize,
     /// Rows of `event_fields`: the fields of the events written.
@@ -865,6 +872,10 @@ pub struct History {
     /// The heap samples read so far ([`crate::heap::since`]), and a flush's new ones.
     heap_sampled: u64,
     heap_samples: Vec<crate::heap::HeapSample>,
+    /// A reading's samples still held ([`crate::heap::held`]), and when the last was written:
+    /// one reading every [`HELD_EVERY`].
+    held_samples: Vec<crate::heap::HeapSample>,
+    held_read: Option<Instant>,
     /// The code images the samples' addresses are in that this history wrote rows of.
     images: symbols::ImagesWritten,
     /// [`identity::binary`], once a history: every build of this process ran it.
@@ -1006,6 +1017,9 @@ impl History {
             heap_sampled: 0,
             // alloc: once a history
             heap_samples: Vec::new(),
+            // alloc: once a history
+            held_samples: Vec::new(),
+            held_read: None,
             images: symbols::ImagesWritten::new(),
             blaze,
             unidentified: None,
@@ -1507,12 +1521,23 @@ impl History {
         let heap_skipped = crate::heap::since(&mut self.heap_sampled, &mut self.heap_samples);
         let alloc_samples =
             [self.alloc_samples_batch().map_err(arrow_error(&schema::ALLOC_SAMPLES))?];
+        // What the heap holds, by call site: a reading of the sampled blocks nobody freed,
+        // once every `HELD_EVERY` (each reading is every held sample again, so not each flush).
+        self.held_samples.clear();
+        if self.held_read.is_none_or(|read| read.elapsed() >= HELD_EVERY) {
+            self.held_read = Some(Instant::now());
+            crate::heap::held(&mut self.held_samples);
+        }
+        let held_samples =
+            [self.held_samples_batch().map_err(arrow_error(&schema::HELD_SAMPLES))?];
         // The images the samples' and this process's panics' addresses are in, and each
         // recovered crash's executable, of its own process.
         let seen_ns = clock::mono_ns();
         let stacks = self.samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]);
         let stacks =
             stacks.chain(self.heap_samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]));
+        let stacks =
+            stacks.chain(self.held_samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]));
         let stacks = stacks.chain(self.raised.iter().map(panics::Raised::pcs));
         let mut images = vec![
             self.images
@@ -1549,6 +1574,7 @@ impl History {
             builds: rows(&builds),
             samples: rows(&samples),
             alloc_samples: rows(&alloc_samples),
+            held_samples: rows(&held_samples),
             switches: rows(&switches),
             events: rows(&events),
             event_fields: rows(&event_fields),
@@ -1580,12 +1606,13 @@ impl History {
         let build = named;
         flushed.build = build;
         self.core.files_mut().named(build);
-        let tables: [(&'static Table, &[RecordBatch]); 21] = [
+        let tables: [(&'static Table, &[RecordBatch]); 22] = [
             (&schema::SPANS, &spans),
             (&schema::COUNTERS, &counters),
             (&schema::BUILDS, &builds),
             (&schema::SAMPLES, &samples),
             (&schema::ALLOC_SAMPLES, &alloc_samples),
+            (&schema::HELD_SAMPLES, &held_samples),
             (&schema::SWITCHES, &switches),
             (&schema::EVENTS, &events),
             (&schema::ERRORS, &errors),
@@ -1825,6 +1852,20 @@ impl History {
             (Instant::now(), clock::mono_ns()),
             self.process,
         )
+    }
+}
+
+impl History {
+    /// The `held_samples` rows of this flush's reading of the samples still held, none where
+    /// it made no reading.
+    fn held_samples_batch(&self) -> Result<RecordBatch, ArrowError> {
+        if self.held_samples.is_empty() {
+            return Ok(RecordBatch::new_empty(batches::schema_of(&schema::HELD_SAMPLES)));
+        }
+        let frames =
+            symbols::frames(self.held_samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]));
+        let now = clock::mono_ns();
+        batches::held_samples(&self.held_samples, &frames, (Instant::now(), now), now, self.process)
     }
 }
 

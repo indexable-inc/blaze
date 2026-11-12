@@ -401,6 +401,54 @@ SELECT replace(area, ' bytes', ''), 'process', round(mem / 1073741824, 2), NULL,
 FROM process
 ORDER BY kind DESC, held_gib DESC NULLS LAST, area
 
+-- name: memory_held
+-- says: what a build's global heap held, by call site (`held_samples`: the sampled blocks nobody had freed): the daemon's last reading at or before the build's footprint peaked (its first, where none was that early), each site's bytes held (its samples' weights summed, within a sample's), its share, the tags of the tasks that allocated there, its samples and their mean block size, and how long ago the oldest was allocated, most first
+WITH peak AS (
+    SELECT process, arg_max(t_ns, value) AS t_ns FROM counters
+    WHERE build_id = $build AND name = 'footprint bytes' GROUP BY process
+    ORDER BY max(value) DESC LIMIT 1
+),
+reading AS (
+    SELECT coalesce(max(read_ns) FILTER (WHERE read_ns <= (SELECT t_ns FROM peak)), min(read_ns)) AS read_ns
+    FROM held_samples
+    WHERE process = (SELECT process FROM peak)
+),
+s AS (SELECT * FROM held_samples WHERE read_ns = (SELECT read_ns FROM reading))
+SELECT
+    coalesce(site, '(in the allocator)') AS site,
+    round(sum(bytes) / 1073741824, 2) AS held_gib,
+    round(100.0 * sum(bytes) / (SELECT sum(bytes) FROM s), 1) AS pct,
+    string_agg(DISTINCT coalesce(tag, 'outside'), ', ' ORDER BY coalesce(tag, 'outside')) AS tags,
+    count(*) AS samples,
+    CAST(avg(block_bytes) AS BIGINT) AS mean_block_bytes,
+    round((max(read_ns) - min(t_ns)) / 60e9, 1) AS oldest_min
+FROM s
+GROUP BY site
+ORDER BY held_gib DESC, site
+LIMIT $limit
+
+-- name: memory_held_now
+-- says: what the global heap holds now, by call site (`held_samples`: the sampled blocks nobody has freed), from the newest reading of the newest daemon that has one (a reading a minute, so an idle daemon's is of its idle heap): each site's bytes held, its share, the tags of the tasks that allocated there, its samples and their mean block size, and how long ago the oldest was allocated, most first
+WITH reading AS (
+    SELECT process, read_ns FROM held_samples ORDER BY read_ns DESC LIMIT 1
+),
+s AS (
+    SELECT * FROM held_samples
+    WHERE read_ns = (SELECT read_ns FROM reading) AND process = (SELECT process FROM reading)
+)
+SELECT
+    coalesce(site, '(in the allocator)') AS site,
+    round(sum(bytes) / 1048576, 0) AS held_mib,
+    round(100.0 * sum(bytes) / (SELECT sum(bytes) FROM s), 1) AS pct,
+    string_agg(DISTINCT coalesce(tag, 'outside'), ', ' ORDER BY coalesce(tag, 'outside')) AS tags,
+    count(*) AS samples,
+    CAST(avg(block_bytes) AS BIGINT) AS mean_block_bytes,
+    round((max(read_ns) - min(t_ns)) / 60e9, 1) AS oldest_min
+FROM s
+GROUP BY site
+ORDER BY held_mib DESC, site
+LIMIT $limit
+
 -- name: memory_sites
 -- says: what churns a build's global heap, by call site (`alloc_samples`, `blaze explain memory`): each site's bytes allocated (its samples' weights summed, within a sample's), its share of the build's, the tags of the tasks that allocated there, its samples and their mean block size, most first
 WITH s AS (SELECT * FROM alloc_samples WHERE build_id = $build)

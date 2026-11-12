@@ -592,6 +592,33 @@ over before a flush read it is counted in the flush's skipped rows.
 | block_bytes | u64 | the sampled block's own bytes |
 | site | utf8? | the innermost frame of `stack` outside the allocator and the collections that call it (`alloc::`, `core::`, `std::`, `hashbrown::`, ...) |
 
+### `held_samples`: the sampled allocations nobody has freed, a reading a minute
+
+`alloc_samples` says what was allocated, which is the churn. What the heap holds is the blocks
+nobody freed: each sampled block is kept by the allocator under its address with its sample
+(`blaze_graph::arena::sampled`), taken out as the block is freed and moved with a block that
+moves, and once a minute (`blaze_profile::history::HELD_EVERY`) a flush writes every sample
+still there as one reading. Summed by `site` within one `read_ns`, the samples' `bytes` are
+what the heap held then of what was allocated there, within a sample's: the answer to "what
+keeps the global heap", by function (`blaze explain memory`, `memory_held`). A free costs one
+load, and the eight of the block's bucket; a bucket that is full loses the sample, which only
+lowers a site.
+
+| column | type | |
+|---|---|---|
+| build_id | u64? | the build its block was allocated in, or null |
+| process | u32 | the process id |
+| thread | u32 | the thread that allocated its block |
+| t_ns | i64 | when its block was allocated |
+| bytes | u64 | the bytes of allocation the sample stands for, as `alloc_samples.bytes` |
+| stack | stack | the call stack that allocated it, outermost first |
+| span_id | u64? | the innermost span its thread was inside as it allocated |
+| stack_pcs | pcs? | as in `samples` |
+| tag | dict? | the blaze-mem tag of the task that made the block; null outside any task |
+| block_bytes | u64 | the sampled block's own bytes as it was sampled |
+| site | utf8? | the call site, as `alloc_samples.site` |
+| read_ns | i64 | the reading it is a row of |
+
 ### `heap_by_owner`: the live heap at the end of a build, by what holds it
 
 | column | type | |
