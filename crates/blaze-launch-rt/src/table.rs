@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use blaze_launch::{Frame, FrameKind, Slot, Thread};
-use crossbeam_channel::Sender;
+use crossbeam_queue::SegQueue;
 
 use crate::{arch, sys};
 
@@ -39,7 +39,7 @@ pub enum Told {
 pub enum Event {
     Thread(Told),
     /// A stub fired: `thread` waits on `reply` for `slot`'s code.
-    Need { slot: Slot, thread: Thread, reply: Sender<Bound> },
+    Need { slot: Slot, thread: Thread, reply: Arc<sys::Handoff<Bound>> },
     /// One frame's item from the daemon.
     Frame(Vec<u8>),
     /// The daemon's socket ended, and why.
@@ -79,7 +79,12 @@ pub struct Shared {
     stubs: usize,
     /// The address of slot 0's entry thunk.
     thunks: usize,
-    inbox: Sender<Event>,
+    /// What threads say to the control thread, in the order they said it, and the bell that
+    /// wakes it. A queue and a pthread condition variable, not a channel: a program thread
+    /// says things here at any point of its life, its end included (`sys::Handoff` says
+    /// why that rules a channel out).
+    queue: SegQueue<Event>,
+    bell: sys::Handoff<()>,
     /// The process the launcher was made in: a forked child of it has these words and no
     /// control thread.
     pid: u32,
@@ -100,7 +105,6 @@ impl Shared {
         stubs: usize,
         thunks: usize,
         area: Range<usize>,
-        inbox: Sender<Event>,
     ) -> Shared {
         Shared {
             table,
@@ -111,7 +115,8 @@ impl Shared {
             area,
             stubs,
             thunks,
-            inbox,
+            queue: SegQueue::new(),
+            bell: sys::Handoff::new(),
             pid: std::process::id(),
         }
     }
@@ -152,10 +157,28 @@ impl Shared {
         self.epoch.load(Ordering::SeqCst)
     }
 
-    /// Puts `event` on the control thread's queue. The queue is gone only when the `Driver`
-    /// is, and with it the table: there is then no one to tell and nothing to keep right.
+    /// Puts `event` on the control thread's queue and rings its bell.
     pub(crate) fn send(&self, event: Event) {
-        drop(self.inbox.send(event));
+        self.queue.push(event);
+        self.bell.put(());
+    }
+
+    /// The next event, when one is there.
+    pub(crate) fn next(&self) -> Option<Event> {
+        self.queue.pop()
+    }
+
+    /// Waits for the next event: the control thread's one wait while it has nothing to do.
+    pub(crate) fn wait(&self) -> Event {
+        loop {
+            if let Some(event) = self.queue.pop() {
+                return event;
+            }
+            // The wait: for a thread to say something (a report, a stub's need, a frame of
+            // the daemon's, the word to stop). It has no bound: an idle launcher waits as
+            // long as its program runs.
+            self.bell.take();
+        }
     }
 
     /// Tells the control thread to return from its loop.
@@ -247,7 +270,9 @@ impl Mutator {
 
 impl Drop for Mutator {
     fn drop(&mut self) {
-        CURRENT.with(|it| it.set(0));
+        // This may run in a destructor of the dying thread, after its thread-locals are
+        // gone: nothing here may need one (`sys::Handoff`).
+        let _ = CURRENT.try_with(|it| it.set(0));
         self.shared.send(Event::Thread(Told::Ended { thread: self.thread }));
     }
 }
@@ -329,14 +354,19 @@ pub(crate) extern "C" fn resolve(stub: usize, context: *const c_void) -> *const 
             libc::_exit(127)
         }
     }
-    let (reply, bound) = crossbeam_channel::bounded(1);
-    let thread = Thread(CURRENT.with(Cell::get));
-    shared.send(Event::Need { slot: Slot(slot as u32), thread, reply });
+    // Nothing below may need a thread-local of the launcher's: a stub can fire while its
+    // thread is ending, after they are gone (`sys::Handoff`).
+    let reply = Arc::new(sys::Handoff::new());
+    let thread = Thread(CURRENT.try_with(Cell::get).unwrap_or(0));
+    shared.send(Event::Need { slot: Slot(slot as u32), thread, reply: Arc::clone(&reply) });
     // The wait: this thread, for the control thread's answer about `slot`. It has no clock:
     // it ends when the daemon answers the need (code, or a refusal) or its socket closes,
     // each of which the control thread turns into an answer here.
-    match bound.recv() {
-        Ok(Bound::Code) => {
+    // The wait: this thread, for the control thread's answer about `slot`. It has no clock:
+    // it ends when the daemon answers the need (code, or a refusal) or its socket closes,
+    // each of which the control thread turns into an answer here.
+    match reply.take() {
+        Bound::Code => {
             // The resolver's exit is a safepoint (launcher.md, section 1): a thread that
             // began as a mutator reports its stack here while a batch waits.
             if thread.0 != 0 && shared.waiting.load(Ordering::Relaxed) != 0 {
@@ -348,9 +378,8 @@ pub(crate) extern "C" fn resolve(stub: usize, context: *const c_void) -> *const 
             }
             word as *const usize
         }
-        Ok(Bound::Refused(diagnostic)) => stop(slot, &diagnostic),
-        Ok(Bound::Lost(why)) => stop(slot, &why),
-        Err(_) => stop(slot, "the launcher's control thread is gone"),
+        Bound::Refused(diagnostic) => stop(slot, &diagnostic),
+        Bound::Lost(why) => stop(slot, &why),
     }
 }
 

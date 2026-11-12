@@ -517,3 +517,89 @@ impl Data {
         Ok(())
     }
 }
+
+/// One value handed from a thread to another that waits for it, with nothing of the Rust
+/// runtime under it: a pthread mutex and condition variable.
+///
+/// Why not a channel or `std::sync`: a program thread waits here (a stub's wait for its
+/// code) and says things to the control thread at any point of its life, its end included,
+/// where the launcher's own thread-locals for that thread may be gone. A channel finds a
+/// waiting receiver through the sender's thread id, which lives in a thread-local, and
+/// `std::thread::current()` panics once that is destroyed (found on Linux: a function
+/// first called while a thread was ending aborted the program). pthread's primitives need
+/// no thread-local.
+pub struct Handoff<T> {
+    lock: core::cell::UnsafeCell<libc::pthread_mutex_t>,
+    cond: core::cell::UnsafeCell<libc::pthread_cond_t>,
+    /// Read and written only with `lock` held.
+    value: core::cell::UnsafeCell<Option<T>>,
+}
+
+// SAFETY: `value` is touched only under the pthread mutex, which makes a `Handoff<T>` a
+// lock around an `Option<T>`: shared between threads when `T` may be sent between them.
+unsafe impl<T: Send> Send for Handoff<T> {}
+// SAFETY: as above.
+unsafe impl<T: Send> Sync for Handoff<T> {}
+
+impl<T> Handoff<T> {
+    /// Empty. A `Handoff` must not be moved once a thread uses it (pthread's objects are
+    /// tied to their address): every user keeps it behind an `Arc` or in a value that stays.
+    pub const fn new() -> Handoff<T> {
+        Handoff {
+            lock: core::cell::UnsafeCell::new(libc::PTHREAD_MUTEX_INITIALIZER),
+            cond: core::cell::UnsafeCell::new(libc::PTHREAD_COND_INITIALIZER),
+            value: core::cell::UnsafeCell::new(None),
+        }
+    }
+
+    /// Runs `with` on the value, with the mutex held.
+    fn locked<R>(&self, with: impl FnOnce(&mut Option<T>) -> R) -> R {
+        // SAFETY: the mutex was statically initialized and is at a fixed address (`new`'s
+        // contract); locking it is sound from any thread.
+        unsafe { libc::pthread_mutex_lock(self.lock.get()) };
+        // SAFETY: the mutex is held, so this thread alone touches `value`.
+        let result = with(unsafe { &mut *self.value.get() });
+        // SAFETY: held by this thread, locked above.
+        unsafe { libc::pthread_mutex_unlock(self.lock.get()) };
+        result
+    }
+
+    /// Hands `value` over, replacing one not yet taken, and wakes a thread that waits.
+    pub fn put(&self, value: T) {
+        self.locked(|held| *held = Some(value));
+        // SAFETY: a statically initialized condition variable at a fixed address.
+        unsafe { libc::pthread_cond_signal(self.cond.get()) };
+    }
+
+    /// Waits for a value and takes it. The wait has no clock: it ends when another thread
+    /// calls [`Handoff::put`], which every user arranges (the control thread answers every
+    /// stub, with code or with why none can come).
+    pub fn take(&self) -> T {
+        // SAFETY: as `locked`.
+        unsafe { libc::pthread_mutex_lock(self.lock.get()) };
+        loop {
+            // SAFETY: the mutex is held.
+            if let Some(value) = unsafe { (*self.value.get()).take() } {
+                // SAFETY: held by this thread.
+                unsafe { libc::pthread_mutex_unlock(self.lock.get()) };
+                return value;
+            }
+            // SAFETY: the mutex is held by this thread, as `pthread_cond_wait` asks; it
+            // comes back with it held. A spurious return loops.
+            unsafe { libc::pthread_cond_wait(self.cond.get(), self.lock.get()) };
+        }
+    }
+}
+
+impl<T> core::fmt::Debug for Handoff<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // What it holds is behind its mutex: not read for a debug line.
+        f.write_str("Handoff")
+    }
+}
+
+impl<T> Default for Handoff<T> {
+    fn default() -> Handoff<T> {
+        Handoff::new()
+    }
+}

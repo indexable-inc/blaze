@@ -127,7 +127,7 @@ struct Control<'a> {
     socket: UnixStream,
     records: &'a mut dyn Records,
     /// By slot: the threads waiting in its stub, for which one `Need` was said.
-    needs: Vec<(Slot, Vec<Sender<Bound>>)>,
+    needs: Vec<(Slot, Vec<std::sync::Arc<sys::Handoff<Bound>>>)>,
     /// The id of the last message this side began.
     said: u64,
     /// The first failure: no code can come any more.
@@ -290,7 +290,7 @@ impl Control<'_> {
             for waiter in waiters {
                 // A waiter is a thread blocked on this answer; were it gone, there is no one
                 // to tell.
-                drop(waiter.send(Bound::Lost(why.to_owned())));
+                waiter.put(Bound::Lost(why.to_owned()));
             }
         }
     }
@@ -312,15 +312,15 @@ impl Control<'_> {
         &mut self,
         slot: Slot,
         thread: Thread,
-        reply: Sender<Bound>,
+        reply: std::sync::Arc<sys::Handoff<Bound>>,
     ) -> Result<(), ControlError> {
         if let Some(lost) = &self.lost {
-            drop(reply.send(Bound::Lost(lost.to_string())));
+            reply.put(Bound::Lost(lost.to_string()));
             return Ok(());
         }
         // Bound since the thread loaded the word: it calls through the word again.
         if matches!(self.driver.target(slot), Ok(Target::Body(_) | Target::Gate { .. })) {
-            drop(reply.send(Bound::Code));
+            reply.put(Bound::Code);
             return Ok(());
         }
         match self.needs.iter_mut().find(|(waited, _)| *waited == slot) {
@@ -398,7 +398,7 @@ impl Control<'_> {
                     return Err(ControlError::Unasked { slot });
                 };
                 for waiter in self.needs.swap_remove(at).1 {
-                    drop(waiter.send(Bound::Refused(diagnostic.to_owned())));
+                    waiter.put(Bound::Refused(diagnostic.to_owned()));
                 }
             }
             Tell::Unheld { why } => return Err(ControlError::Unheld { why: why.to_owned() }),
@@ -428,7 +428,7 @@ impl Control<'_> {
                 return true;
             }
             for waiter in waiters {
-                drop(waiter.send(Bound::Code));
+                waiter.put(Bound::Code);
             }
             false
         });
@@ -464,7 +464,7 @@ impl Control<'_> {
                 }
                 Event::Need { reply, .. } => {
                     let why = "the launcher's control thread was stopped";
-                    drop(reply.send(Bound::Lost(why.to_owned())));
+                    reply.put(Bound::Lost(why.to_owned()));
                 }
                 Event::Frame(_) | Event::Closed(_) | Event::Stop => {}
             }

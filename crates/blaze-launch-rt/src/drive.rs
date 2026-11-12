@@ -40,7 +40,6 @@ use blaze_launch::wire;
 use blaze_launch::{
     Committed, Edit, Frame, KEPT, Kept, Launch, Placed, Slot, Target, Txn, Write,
 };
-use crossbeam_channel::Receiver;
 
 use crate::arch::{self, GATE_ALIGN, GATE_ENTRY, GATE_HEAD, OutOfReach, STUB, STUB_HEAD, THUNK};
 use crate::sys::{self, Code, SysError};
@@ -226,7 +225,6 @@ pub struct Driver {
     /// The offset in the mapping of the code area's offset 0.
     area: usize,
     shared: Arc<Shared>,
-    inbox: Receiver<Event>,
     /// The writes of the core's last call.
     out: Vec<Write, Kept>,
     /// The staged edit's binds, as the core takes them.
@@ -267,14 +265,12 @@ impl Driver {
         }
         let mut code = Code::map(whole as usize)?;
         let base = code.base();
-        let (send, inbox) = crossbeam_channel::unbounded();
         let shared = Arc::new(Shared::new(
             config.slots,
             base,
             base + stubs,
             base + thunks,
             base + area..base + whole as usize,
-            send,
         ));
         // The stubs hand this pointer to `table::resolve` for as long as the process runs
         // code: one count of the `Arc` is leaked for it, so it never dangles, whatever
@@ -289,7 +285,6 @@ impl Driver {
             thunks,
             area,
             shared,
-            inbox,
             out: Vec::new_in(KEPT),
             binds: Vec::new(),
             scratch: Vec::new(),
@@ -510,16 +505,13 @@ impl Driver {
 
     /// The next event, when one is there.
     pub fn ready(&self) -> Option<Event> {
-        self.inbox.try_recv().ok()
+        self.shared.next()
     }
 
-    /// The next event: the control thread's one wait while it has nothing to do, for a
-    /// thread's report, a stub's need, a frame from the daemon or the word to stop. It has
-    /// no bound: an idle launcher waits as long as its program runs. The queue cannot
-    /// disconnect while `self` lives (its `Shared` holds a sender); were it to, that is the
-    /// word to stop.
+    /// The next event: the control thread's one wait while it has nothing to do
+    /// (`Shared::wait`).
     pub fn wait(&self) -> Event {
-        self.inbox.recv().unwrap_or(Event::Stop)
+        self.shared.wait()
     }
 
     /// Frees every batch every thread cleared, and gives how many. Every birth announced
