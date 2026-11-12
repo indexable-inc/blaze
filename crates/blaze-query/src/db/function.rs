@@ -13,29 +13,19 @@
 //!   `changed` kept) when it equals the old one (`==`, or the 64-bit hash once evicted), or the
 //!   row was verified in this view without its value; never at a lower durability, never in a
 //!   cycle.
-//! - **Cycles** resolve on one task: the one whose stack holds the head. Heads are stack
-//!   positions; a frame's `head` is the lowest it depends on, so nested cycles merge into the
-//!   outermost head, which iterates.
-//! - **A cycle across tasks** is a wait that would close a cycle of tasks. Where every task of
-//!   it is parked in an ask for a row ([`in_flight`]), the asker joins instead of waiting
-//!   ([`State::Joined`]): the row it asked for runs in a task that waits on it, so that row is
-//!   the head, in that task; the asker reads the head's fallback or initial value, lent by the
-//!   storage ([`lend`]), and the rows it holds end provisional, members of that head's cycle,
-//!   handed to the head's task with what they read ([`hand_to`]). That task wakes as the run
-//!   it waited for ends, reads the row as its own cycle's, takes what was handed as its round
-//!   ends ([`adopt`]) and iterates: one task runs each member once a round, and nothing
-//!   unwinds. A cycle through anything else (a loop's scope, a slot, a query with no cycle
-//!   handling asked for) gives way as before (`Cancelled::WouldWaitOnItself`): its asker
-//!   unwinds and meets the cycle on its own stack, or its loop's caller's, when it runs again.
+//! - **Cycles** resolve on the task that meets them (a cycle across tasks is a wait that would
+//!   close a cycle of tasks: one gives way, `Cancelled::WouldWaitOnItself`, and meets the cycle
+//!   on its own stack when it runs again). Heads are stack positions; a frame's `head` is the
+//!   lowest it depends on, so nested cycles merge into the outermost head, which iterates.
 //!   A read of a provisional row records no edge ([`read_provisional`]); each run of the cycle
 //!   hands its other reads on to its reader in read order, and so to the head ([`hand_over`]);
 //!   the converged head stores them all, over every round, as its edges, and each member's one
 //!   edge is its head ([`finalize`]). So a later view verifies a final cycle as any row: when
 //!   nothing it read changed the whole cycle is reused, else it runs again from its head. A
 //!   provisional row (a round not yet converged) is never verified, and only the task whose
-//!   stack holds its head reads it, runs it again or writes it again ([`headed_here`]): any
-//!   other task waits for the head's flight, also one that finds the flight of a stale inner
-//!   head free between two rounds, or joins as above, lent a value in the row's place.
+//!   stack holds its head reads, runs or writes it ([`headed_here`]): any other task waits for
+//!   the head's flight, also one that finds the flight of a stale inner head free between two
+//!   rounds.
 
 use std::{
     cell::Cell,
@@ -44,7 +34,6 @@ use std::{
     sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 
-use blaze_graph::pump::Refused;
 use blaze_mem::Tag;
 use crossbeam_queue::SegQueue;
 
@@ -57,8 +46,8 @@ use super::{
     local::{self, Frame, Kind as FrameKind, Member, NONE, Pending},
     provenance::Cause,
     row::{
-        self, CYCLE, DURABILITY, HASHED, HEAD, Header, PROVISIONAL, Pages, REPLAYED, RUNNING, Row,
-        STALE, UNSETTLED, UNTRACKED, UNTRACKED_HANDED, VALUE, VIEW_MASK, row_at, span,
+        self, CYCLE, DURABILITY, HASHED, HEAD, Header, PROVISIONAL, Pages, RUNNING, Row, STALE,
+        UNTRACKED, VALUE, VIEW_MASK, row_at, span,
     },
     storage::{
         ALL, Durability, FIELD, Relocate, Restamp, Storage, Summary, Table, color, key_parts,
@@ -373,13 +362,6 @@ enum State {
     /// Proved unchanged assuming the verify at this stack index is: the caller's verify
     /// depends on that one too.
     Assumed,
-    /// Waiting for it would close a cycle of tasks, each parked in an ask for a row
-    /// ([`in_flight`]): the row runs in a task that waits on this one (it is the head, of node
-    /// `head`), or it is a provisional row of the cycle headed by node `head` in such a task.
-    /// This task joins that cycle: a fetch is lent the row's fallback or initial value
-    /// ([`lend`]), and to a verify the edge counts as changed. `exact`: the row is the head and
-    /// not yet provisional, so the value lent is the one its first round starts from.
-    Joined { head: u32, exact: bool },
 }
 
 /// What verifying a dependency for a reader's edge found.
@@ -411,7 +393,6 @@ fn fetch_cold<'db, F: Function>(db: &'db F::Db, key: F::Key) -> &'db F::Value {
             unsafe { row.value() }
         }
         State::OnStack(at) => reenter::<F>(db, storage, row, at, key),
-        State::Joined { head, exact } => lend::<F>(db, storage, row, key, head, exact),
         State::Assumed => unreachable!("a fetch is never proved on an assumption"),
     }
 }
@@ -436,7 +417,7 @@ fn row_or_make<F: Function>(storage: &Storage, id: Id) -> (&RowOf<F>, u32) {
 }
 
 /// Brings `row` up to this view: with its value when `value`. Returns how the caller may read
-/// it; without `value`, `Provisional`, `OnStack` and `Joined` mean its edge counts as changed.
+/// it; without `value`, `Provisional` and `OnStack` mean its edge counts as changed.
 fn refresh<F: Function>(
     db: &F::Db,
     storage: &Storage,
@@ -490,10 +471,6 @@ fn refresh<F: Function>(
             let head = header.extra.load(Ordering::Relaxed) as u32;
             match local::with(|local| local.find(storage, head)) {
                 Some(at) if header.meta.load(Ordering::Relaxed) & STALE == 0 => {
-                    // The run at `at` heads the cycle this row is in, whoever made the row: a
-                    // run above it on this stack, or a task that joined from outside
-                    // ([`hand_to`]), which no re-entry here told it of.
-                    local::with(|local| local.frames[at as usize].joined = true);
                     return State::Provisional(at);
                 }
                 Some(_) => {}
@@ -501,20 +478,7 @@ fn refresh<F: Function>(
                 // its word and of its head: no head to wait for; the next round reads both anew.
                 None if head == 0 => continue,
                 None => {
-                    // The head runs on this very stack, below the barrier of a wait this
-                    // verify is inside (the changed set's walk, which verifies from an empty
-                    // stack): a joined task made the row for it while it was parked here. A
-                    // wait for the head would be a wait on this stack's own frames; to the
-                    // verify the edge counts as changed, and the head's run meets the row once
-                    // the barrier is gone.
-                    if !value && local::with(|local| local.below_barrier(storage, head)) {
-                        return State::Joined { head, exact: false };
-                    }
-                    let asked = Member { ingredient: index, id: id.as_u32() };
-                    let join = may_join::<F>(storage, value);
-                    if wait_for(storage, head, asked, join) == Flown::Joins {
-                        return State::Joined { head, exact: false };
-                    }
+                    wait_for(storage, head);
                     continue;
                 }
             }
@@ -537,26 +501,10 @@ fn refresh<F: Function>(
         }
         let db_ptr = std::ptr::from_ref(db).cast::<()>();
         let mut assumed = None;
-        // A stale head of this task's own cycle runs here or not at all: its flight is free
-        // but for a task that lets go of it at once ([`claimed`]), so no wait for it is a
-        // cycle's to join.
-        let join = word & PROVISIONAL == 0 && may_join::<F>(storage, value);
-        let flown = in_flight(storage, index, id, join, || {
+        in_flight(storage, index, id, || {
             assumed = claimed::<F>(db_ptr, storage, index, row, key, value);
             complete_one();
         });
-        if flown == Flown::Joins {
-            // The row runs, or is verified, in a task parked inside that run: it made the
-            // row's node before it could wait.
-            let head = header.node.load(Ordering::Acquire);
-            assert!(
-                head != 0,
-                "{}({id:?}) runs in a task that waits inside it, and has no node",
-                F::NAME
-            );
-            let exact = header.verified.load(Ordering::Acquire) & PROVISIONAL == 0;
-            return State::Joined { head, exact };
-        }
         if let Some(head) = assumed {
             local::with(|local| depend_on(local, head));
             return State::Assumed;
@@ -629,134 +577,32 @@ pub fn completed() -> u64 {
     COMPLETED.iter().map(|it| it.0.load(Ordering::Relaxed)).sum()
 }
 
-/// What an ask for a row's flight came to ([`in_flight`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Flown {
-    /// This task held the flight and ran, or waited for the task that held it: either way the
-    /// caller looks at the row again.
-    Ended,
-    /// Waiting would have closed a cycle of tasks, each parked in an ask for a row, and the
-    /// caller said it may join one: nothing waited and nothing unwinds. Every other task of the
-    /// cycle stays parked until a run this task holds ends, and looks at its row again then.
-    Joins,
-}
-
-/// Runs `run` holding the flight of row `id` of `index`, or waits for whoever holds it. A wait
-/// that would close a cycle of tasks ends as [`Flown::Joins`] where the cycle is of asks for
-/// rows alone and `join`; every other one gives way.
-///
-/// The bound (rule 18): the wait is for a run that ends, checked against every other wait
-/// before it begins, and a join is no wait at all.
-fn in_flight(storage: &Storage, index: u32, id: Id, join: bool, run: impl FnOnce()) -> Flown {
+/// Runs `run` holding the flight of row `id` of `index`, or waits for whoever holds it.
+fn in_flight(storage: &Storage, index: u32, id: Id, run: impl FnOnce()) {
     #[cfg(test)]
     if let Some(stop) = probe::BEFORE_FLIGHT.with(Cell::get) {
         stop(index, id);
     }
-    #[cfg(test)]
-    let join = join && !probe::GIVES_WAY_FOR_A_CYCLE.with(Cell::get);
     let barrier = local::barrier();
     let awaited = |it: &mut String| {
         use std::fmt::Write as _;
         _ = write!(it, "{:?}", DatabaseKeyIndex::new(index, id));
     };
-    let got = storage.rows.get_or_join_named(Storage::flight(index, id), join, awaited, || {
+    let got = storage.flights.get_or_run_named(Storage::flight(index, id), awaited, || {
         let _lifted = barrier.lift();
         run();
         Ok(())
     });
     drop(barrier);
-    match got {
-        Ok(()) => Flown::Ended,
-        Err(Refused::Cycle) => Flown::Joins,
-        Err(Refused::GaveWay) => {
-            Cancelled::WouldWaitOnItself { asked: Some(DatabaseKeyIndex::new(index, id)) }.throw()
-        }
+    if got.is_err() {
+        Cancelled::WouldWaitOnItself { asked: Some(DatabaseKeyIndex::new(index, id)) }.throw();
     }
 }
 
-/// Whether the task asking here for a row of `F` may join a cycle its wait would close
-/// ([`Flown::Joins`]). A verify may: the edge counts as changed, and its row runs. A fetch may
-/// where `F` has a value to lend in the row's place ([`lend`]) and the asker is a run of this
-/// storage, which ends a member of the cycle ([`hand_to`]); a fetch of a query with no cycle
-/// handling, or from no run, has nothing to go on with and gives way.
-fn may_join<F: Function>(storage: &Storage, value: bool) -> bool {
-    !value
-        || (F::CYCLE != CycleKind::Panic
-            && local::with(|local| local.recording(storage).is_some()))
-}
-
-/// Waits until the cycle headed by `head` (another task's), which the provisional row `asked`
-/// names as its head, has ended; [`Flown::Joins`] when that wait would close a cycle and
-/// `join`.
-///
-/// A provisional row is its head's task's for as long as that task runs the head, and that
-/// task holds the head's flight all that while: through every round, and while it is parked
-/// with tasks joined to its cycle. So a task that finds the head's flight free, and holds it
-/// here, knows no task runs the head: a row that still names it was left by a cycle that is
-/// gone (a joined task handed it to a head whose task had given way meanwhile, or was woken to
-/// fail), and no round will take it. It is emptied here, with every row still handed to that
-/// head, and whoever asks next runs it anew. Holding the head's flight, this task is the only
-/// one that does so.
-fn wait_for(storage: &Storage, head: u32, asked: Member, join: bool) -> Flown {
+/// Waits until the cycle headed by `head` (another task's) has ended.
+fn wait_for(storage: &Storage, head: u32) {
     let (index, id, _) = key_parts(storage.key_of(head));
-    in_flight(storage, index, id, join, || {
-        reset_handed(storage, head);
-        if member_header(storage, asked).is_some_and(|it| {
-            it.verified.load(Ordering::Acquire) & PROVISIONAL != 0
-                && it.extra.load(Ordering::Relaxed) as u32 == head
-        }) {
-            reset_member(storage, asked);
-        }
-    })
-}
-
-/// A fetch of a row this task joined a cycle through ([`State::Joined`]): the row's fallback or
-/// initial value, lent by the storage for the view ([`Storage::lend`]), never the row's own,
-/// which is its head's task's (`row`'s rule 4). The asking run joins the cycle headed by node
-/// `head` in that task: it records no edge, as for a read of a provisional row of its own
-/// cycle ([`read_provisional`]), and ends a member of that cycle ([`hand_to`]).
-///
-/// With `exact` (or a fallback, which is every round's value) the value lent is the one the
-/// head's round holds, so the asking run's value is that round's, as if the head's task had
-/// run it. Otherwise it stands in for a later round's value (the head's, or a member's), and
-/// the asking run says so ([`local::Frame::unsettled`]): the head's task then runs at least one
-/// more round, in which it runs every member itself.
-fn lend<'db, F: Function>(
-    db: &'db F::Db,
-    storage: &'db Storage,
-    row: &RowOf<F>,
-    key: F::Key,
-    head: u32,
-    exact: bool,
-) -> &'db F::Value {
-    let id = key.as_id();
-    let (value, exact) = match F::CYCLE {
-        CycleKind::Result => (blaze_mem::frame::task(F::TAG, |_| F::cycle_result(db, id, key)), true),
-        CycleKind::Fixpoint => {
-            (blaze_mem::frame::task(F::TAG, |_| F::cycle_initial(db, id, key)), exact)
-        }
-        CycleKind::Panic => {
-            unreachable!("{}({id:?}) has no value to lend: its asker gives way", F::NAME)
-        }
-    };
-    let header = &row.header;
-    local::with(|local| {
-        let changed = header.changed.load(Ordering::Relaxed);
-        if let Some(frame) = local.recording(storage) {
-            frame.durability = frame.durability.min(header.durability());
-            frame.changed = frame.changed.max(changed);
-            if frame.remote == 0 {
-                frame.remote = head;
-            } else if frame.remote != head {
-                // A second head, in another task: this run's rows go to the first, which
-                // must not end its round on a value made from the second's seed.
-                frame.unsettled = true;
-            }
-            frame.unsettled |= !exact;
-            frame.unshareable = true;
-        }
-    });
-    storage.lend(value)
+    in_flight(storage, index, id, || {});
 }
 
 /// The flight holder's part of [`refresh`]: verify the row's edges with its dependencies run
@@ -843,9 +689,6 @@ fn claimed<F: Function>(
     guard.armed = false;
     drop(guard);
     if changed.is_none() && !reentered {
-        // Proved unchanged, it heads no cycle: a row a joined task handed it meanwhile was made
-        // from a seed no round of it starts from.
-        reset_handed(storage, node);
         if head < at {
             debug_assert!(!value, "a fetch's verify never depends on one below it");
             let rows = u64::from(storage.nodes_made());
@@ -914,10 +757,6 @@ pub(crate) mod probe {
         pub(crate) static BEFORE_FLIGHT: Cell<Option<fn(u32, Id)>> = const { Cell::new(None) };
         /// The planted bug: this thread runs a stale head of a cycle that is another task's.
         pub(crate) static FOREIGN_STALE_RUNS: Cell<bool> = const { Cell::new(false) };
-        /// The planted bug: this thread gives way where its wait would close a cycle it could
-        /// join, as every task did before a join (`tests/joined.rs`): it unwinds, and the rows
-        /// it was running run again in the head's task.
-        pub(crate) static GIVES_WAY_FOR_A_CYCLE: Cell<bool> = const { Cell::new(false) };
     }
 }
 
@@ -1033,8 +872,7 @@ unsafe fn verify_edge<F: Function>(db: *const (), storage: &Storage, id: Id) -> 
     match refresh::<F>(db, storage, index, row, key, false) {
         State::Current => Verified::Current,
         State::Assumed => Verified::Assumed,
-        // A row this task joined a cycle through counts as changed to a verify ([`State::Joined`]).
-        State::Provisional(_) | State::OnStack(_) | State::Joined { .. } => Verified::Changed,
+        State::Provisional(_) | State::OnStack(_) => Verified::Changed,
     }
 }
 
@@ -1042,9 +880,6 @@ unsafe fn verify_edge<F: Function>(db: *const (), storage: &Storage, id: Id) -> 
 struct Ran {
     head: u32,
     reentered: bool,
-    joined: bool,
-    remote: u32,
-    unsettled: bool,
     unconverged: bool,
     untracked: bool,
     durability: u8,
@@ -1061,9 +896,6 @@ fn ran(at: u32) -> Ran {
         Ran {
             head: frame.head,
             reentered: frame.reentered,
-            joined: frame.joined,
-            remote: frame.remote,
-            unsettled: frame.unsettled,
             unconverged: frame.unconverged,
             untracked: frame.untracked,
             durability: frame.durability,
@@ -1101,8 +933,6 @@ impl Drop for Running<'_> {
             local.cycle_edges.truncate(cycle);
             members
         });
-        // The rows joined tasks handed it go as its own cycle's do: no round takes them now.
-        reset_handed(self.storage, self.header.node.load(Ordering::Relaxed));
         empty_members(self.storage, members);
         if self.header.verified.load(Ordering::Relaxed) & PROVISIONAL != 0 {
             if let Some(reset) = ingredient::vtable(self.index).and_then(|it| it.reset) {
@@ -1137,9 +967,7 @@ fn empty_members(storage: &Storage, from: u32) {
 fn reset_member(storage: &Storage, member: Member) {
     let id = Id::from_u32(member.id);
     if let Some(reset) = ingredient::vtable(member.ingredient).and_then(|it| it.reset) {
-        // SAFETY: a member is a provisional row of this task's cycle: one it made, or one a
-        // joined task handed it and reads no more (rule 4); or a row left naming a head no task
-        // runs, emptied by the one task that holds that head's flight ([`wait_for`]).
+        // SAFETY: a member is a provisional row this task's cycle made (rule 4).
         unsafe { reset(storage, member.ingredient, id) };
     }
 }
@@ -1213,23 +1041,7 @@ fn run<F: Function>(
         // (rules 20 and 25), and nothing inside a query formats with none attached.
         let new = blaze_mem::frame::task(F::TAG, |_| super::attach(db, || F::execute(db, key)));
         crate::ran_one();
-        // Before the run is looked at: what joined tasks handed it is its cycle's from here.
-        adopt(storage, at, node);
-        let mut done = ran(at);
-        if done.joined {
-            // It heads a cycle no query on this stack asked it for: a joined task made the
-            // row it read. Its own row is seeded now, if this run did not ask for it either.
-            let seeded = header.verified.load(Ordering::Relaxed) & PROVISIONAL != 0;
-            if done.head != NONE && !seeded {
-                seed::<F>(db, storage, row, key);
-            }
-            // A seeded row holds its last round's value, as one a query here asked for does.
-            done.reentered |= seeded || done.head != NONE;
-        }
-        if done.remote != 0 && (done.head == NONE || done.head == at) {
-            hand_to::<F>(db, storage, row, &done, at, word, new, key);
-            break;
-        }
+        let done = ran(at);
         if done.head == NONE {
             finish::<F>(storage, row, id, &done, at, word, new, keep);
             break;
@@ -1403,20 +1215,7 @@ fn participate<F: Function>(
 ) {
     let header = &row.header;
     let id = key.as_id();
-    let head = local::with(|local| {
-        let frame = &mut local.frames[done.head as usize];
-        // What it joined in another task, its head on this stack joined: that head ends a
-        // member of the cycle there ([`hand_to`]), with every row of its own.
-        if done.remote != 0 {
-            if frame.remote == 0 {
-                frame.remote = done.remote;
-            } else if frame.remote != done.remote {
-                frame.unsettled = true;
-            }
-        }
-        frame.unsettled |= done.unsettled;
-        frame.node
-    });
+    let head = local::with(|local| local.frames[done.head as usize].node);
     let value = match (F::CYCLE, done.reentered) {
         (CycleKind::Result, _) => blaze_mem::frame::task(F::TAG, |_| F::cycle_result(db, id, key)),
         (CycleKind::Fixpoint, true) => {
@@ -1475,206 +1274,6 @@ fn participate<F: Function>(
     });
     // Release: other tasks see `PROVISIONAL` and the head to wait for, never the value.
     header.verified.store((word & VIEW_MASK) | VALUE | PROVISIONAL, Ordering::Release);
-}
-
-/// A run that joined a cycle headed in another task (node `done.remote`: it read that head's
-/// lent value, [`lend`], or a run of the cycle it heads on this stack did) and depends on no
-/// head below it here: it ends a member of that cycle, provisional, and is handed to the head's
-/// task with what it read outside the cycle ([`Storage::hand`]), as [`participate`] hands a
-/// member on to a head on its own stack. A run that headed a cycle of its own here merges it
-/// into that one, as an inner head does: every row of its cycle is handed too.
-///
-/// The row is written once, here, by the task that holds its flight with `RUNNING` set (`row`'s
-/// rule 1), and is the head's task's from the store of its word on: this task reads it no more
-/// (a run below that asks for it joins in turn and is lent a value, or waits for the head).
-/// The head's task is parked in an ask for a row until a run this task holds ends
-/// ([`Flown::Joins`]), which is after this, so it finds the row handed when it looks.
-///
-/// What goes with the row, for [`adopt`]: its reads outside the cycle as its edges (a
-/// provisional row holds none otherwise), and in its `meta` its durability and whether it made
-/// an untracked read, replayed captured reads, or is not settled (its value came from a value
-/// lent in place of a later round's, or an inner head of its own did not converge).
-fn hand_to<F: Function>(
-    db: &F::Db,
-    storage: &Storage,
-    row: &RowOf<F>,
-    done: &Ran,
-    at: u32,
-    word: u32,
-    new: F::Value,
-    key: F::Key,
-) {
-    let header = &row.header;
-    let id = key.as_id();
-    let index = F::ingredient().index();
-    let head = done.remote;
-    let mut unsettled = done.unsettled || done.unconverged;
-    let value = match (F::CYCLE, done.reentered) {
-        (CycleKind::Result, _) => blaze_mem::frame::task(F::TAG, |_| F::cycle_result(db, id, key)),
-        (CycleKind::Fixpoint, true) => {
-            let heads = heads_of(storage, done.members, id);
-            let cycle = Cycle { heads: &heads, id, iteration: done.round };
-            // SAFETY: the row's provisional value, this task's own (rule 4): it heads a cycle
-            // on this stack until it is handed below.
-            let last = unsafe { row.value() };
-            let value =
-                blaze_mem::frame::task(F::TAG, |_| F::cycle_recover(db, &cycle, last, new, key));
-            unsettled |= !F::equal(last, &value);
-            value
-        }
-        (CycleKind::Fixpoint | CycleKind::Panic, _) => new,
-    };
-    let table = table_of::<F>(storage);
-    if header.verified.load(Ordering::Relaxed) & VALUE != 0 {
-        // SAFETY: the flight holder with `RUNNING` set replaces a value of an earlier view or
-        // its own provisional one, which no frame reads any more (rules 1, 4).
-        unsafe { drop_value(table, row) };
-    } else {
-        gained(table, id);
-    }
-    // SAFETY: as above, the row holds no value now.
-    unsafe { put(table, row, value) };
-    // What it read outside the cycle: what it gathered as a head (its earlier rounds', its
-    // members', what it took from joined tasks), then this run's own.
-    let (reads, durability, untracked, replayed, note) = local::with(|local| {
-        let (_, note) = local.note_peak(at as usize);
-        let frame = &local.frames[at as usize];
-        let (start, gathered) = (frame.edges_start as usize, frame.cycle.start as usize);
-        let durability = frame.durability.min(frame.cycle.durability);
-        let untracked = frame.untracked | frame.cycle.untracked;
-        let replayed = or(frame.summary, frame.cycle.summary) != [0; 2];
-        local.dedup_from(start);
-        let gathered = gathered.min(local.cycle_edges.len());
-        let mut reads = Vec::with_capacity(local.cycle_edges.len() - gathered + local.edges.len() - start); // alloc: a joined run's reads, handed to its head once
-        reads.extend_from_slice(&local.cycle_edges[gathered..]);
-        reads.extend_from_slice(&local.edges[start..]);
-        local.cycle_edges.truncate(gathered);
-        (reads, durability, untracked, replayed, note)
-    });
-    super::noted(storage, note);
-    let span = storage.push_edges(&reads, (index, id));
-    storage.forget_edges(header.edges.swap(span, Ordering::Relaxed));
-    storage.set_summary(done.node, ALL);
-    header.changed.store(done.changed, Ordering::Relaxed);
-    let durability =
-        if untracked { 0 } else { u32::from(durability.min(Durability::HIGH.0)) };
-    let bit = |set: bool, bit: u32| if set { bit } else { 0 };
-    let meta = durability
-        | bit(done.reentered, HEAD)
-        | bit(untracked, UNTRACKED_HANDED)
-        | bit(replayed, REPLAYED)
-        | bit(unsettled, UNSETTLED);
-    header.meta.store(meta, Ordering::Relaxed);
-    header.extra.store(u64::from(head), Ordering::Relaxed);
-    // The rows of the cycle it headed here (and those joined tasks handed it) are that head's
-    // now, as an inner head's are its outer head's. A row of a head below on this stack (one a
-    // verify met while this run was on it) stays, for that head.
-    let own = done.node;
-    let members = local::with(|local| local.members.split_off(done.members as usize)); // alloc: a joined head's merge, once
-    for member in members {
-        let Some(it) = member_header(storage, member) else { continue };
-        if it.verified.load(Ordering::Relaxed) & PROVISIONAL == 0 {
-            continue;
-        }
-        if it.extra.load(Ordering::Relaxed) as u32 == own {
-            it.extra.store(u64::from(head), Ordering::Relaxed);
-            storage.hand(head, member);
-        } else {
-            local::with(|local| local.members.push(member));
-        }
-    }
-    // Release: other tasks see `PROVISIONAL` and the head to wait for, never the value; the
-    // head's task, the value and what goes with it.
-    header.verified.store((word & VIEW_MASK) | VALUE | PROVISIONAL, Ordering::Release);
-    storage.hand(head, Member { ingredient: index, id: id.as_u32() });
-}
-
-/// Takes the rows joined tasks handed the run at `at` (the top frame, of node `node`) into the
-/// cycle it heads ([`hand_to`]): each becomes a member on this stack, as if a run here had made
-/// it ([`participate`]), and its reads outside the cycle go into the head's gathering, after
-/// its earlier rounds' and this round's (as a run met only by a verify hands its own,
-/// [`give_head`]). A row handed not settled keeps this round from being the head's last.
-///
-/// Once a run, as it ends: every task that hands this head a row does so while this task is
-/// parked inside the run, and before the run it waits for ends ([`hand_to`]). A run that heads
-/// no cycle after all (no run here ever read a row of one: it was asked for by a task whose
-/// wait only looked like a dependency, a retry after a give-way) empties what it was handed,
-/// as made from a seed no round of it starts from.
-fn adopt(storage: &Storage, at: u32, node: u32) {
-    if !storage.any_handed() {
-        return;
-    }
-    let mut handed = Vec::new(); // alloc: none unless a joined task handed this run a row
-    storage.take_handed(node, &mut handed);
-    if handed.is_empty() {
-        return;
-    }
-    let heads = local::with(|local| {
-        let frame = &local.frames[at as usize];
-        frame.reentered || frame.joined
-    });
-    let mut adopted = false;
-    for member in handed {
-        let Some(header) = member_header(storage, member) else { continue };
-        if header.verified.load(Ordering::Acquire) & PROVISIONAL == 0
-            || header.extra.load(Ordering::Relaxed) as u32 != node
-        {
-            continue;
-        }
-        if !heads {
-            reset_member(storage, member);
-            continue;
-        }
-        adopted = true;
-        let meta = header.meta.load(Ordering::Relaxed);
-        let read = header.edges.swap(0, Ordering::Relaxed);
-        local::with(|local| {
-            debug_assert_eq!(at as usize + 1, local.frames.len(), "a head adopts as the top frame");
-            for edge in span::start(read)..span::start(read) + span::len(read) {
-                // alloc: none once warm: the cycle reads grow to their high-water mark once per thread
-                local.cycle_edges.push(storage.edge(edge));
-            }
-            let frame = &mut local.frames[at as usize];
-            frame.cycle.durability = frame.cycle.durability.min((meta & DURABILITY) as u8);
-            frame.cycle.untracked |= meta & UNTRACKED_HANDED != 0;
-            if meta & REPLAYED != 0 {
-                frame.cycle.summary = ALL;
-            }
-            frame.unconverged |= meta & UNSETTLED != 0;
-            // alloc: none once warm: the member list grows to its high-water mark once per thread
-            local.members.push(member);
-        });
-        storage.forget_edges(read);
-        header.meta.store(meta & (DURABILITY | HEAD | STALE), Ordering::Relaxed);
-    }
-    if adopted {
-        // It heads the rows it took, whether or not this run read one of them: each was made
-        // from its seed, so its round ends as a head's does (seeded, recovered against that
-        // seed, its value's change told on), never as a run outside any cycle.
-        local::with(|local| {
-            let frame = &mut local.frames[at as usize];
-            frame.head = frame.head.min(at);
-            frame.joined = true;
-        });
-    }
-}
-
-/// Empties the rows joined tasks handed the head of node `node` ([`hand_to`]), which heads no
-/// cycle that takes them: its run unwinds, or its verify proved it unchanged.
-fn reset_handed(storage: &Storage, node: u32) {
-    if !storage.any_handed() {
-        return;
-    }
-    let mut handed = Vec::new(); // alloc: none unless a joined task handed this head a row
-    storage.take_handed(node, &mut handed);
-    for member in handed {
-        if member_header(storage, member).is_some_and(|it| {
-            it.verified.load(Ordering::Acquire) & PROVISIONAL != 0
-                && it.extra.load(Ordering::Relaxed) as u32 == node
-        }) {
-            reset_member(storage, member);
-        }
-    }
 }
 
 /// The IDs of the heads of a cycle: `id` and every head member from `from`.
@@ -1773,8 +1372,6 @@ fn head_round<F: Function>(
         let start = frame.edges_start as usize;
         frame.round = round;
         frame.head = NONE;
-        frame.remote = 0;
-        frame.unsettled = false;
         frame.unconverged = false;
         frame.untracked = false;
         frame.durability = u8::MAX;
@@ -2053,49 +1650,39 @@ fn reenter<'db, F: Function>(
         let again =
             local::with(|local| std::mem::replace(&mut local.frames[at as usize].reentered, true));
         assert!(!again, "the cycle recovery of {}({id:?}) asked for {} itself", F::NAME, F::NAME);
-        seed::<F>(db, storage, row, key);
+        if word & RUNNING == 0
+            && header
+                .verified
+                .compare_exchange(word, word | RUNNING, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            panic!("{}({id:?}) changed while this task held its flight", F::NAME);
+        }
+        let initial = match F::CYCLE {
+            CycleKind::Result => blaze_mem::frame::task(F::TAG, |_| F::cycle_result(db, id, key)),
+            _ => blaze_mem::frame::task(F::TAG, |_| F::cycle_initial(db, id, key)),
+        };
+        let table = table_of::<F>(storage);
+        if word & VALUE != 0 {
+            // SAFETY: the flight holder (this task's frame at `at`), `RUNNING` set, drops a
+            // value of an earlier view: a cycle's values are never backdated (rules 1, 3).
+            unsafe { drop_value(table, row) };
+        } else {
+            gained(table, id);
+        }
+        // SAFETY: this task holds the row's flight with `RUNNING` set, and it holds no value.
+        unsafe { put(table, row, initial) };
+        header.meta.store(header.meta.load(Ordering::Relaxed) | HEAD, Ordering::Relaxed);
+        header.extra.store(u64::from(header.node.load(Ordering::Relaxed)), Ordering::Relaxed);
+        header
+            .verified
+            .store((word & VIEW_MASK) | VALUE | RUNNING | PROVISIONAL, Ordering::Release);
     } else {
         local::with(|local| local.frames[at as usize].reentered = true);
     }
     read_provisional(storage, header, at);
     // SAFETY: the provisional value of this task's own cycle, between its writes (rule 4).
     unsafe { row.value() }
-}
-
-/// Makes the row of `key`, which this task runs or verifies holding its flight, the head of a
-/// cycle: its fallback or initial value, provisional, its head itself. Once a run that heads a
-/// cycle: where a query on this stack first asks for it ([`reenter`]), or as its round ends
-/// where only joined tasks did ([`lend`], which lent them this same value).
-fn seed<F: Function>(db: &F::Db, storage: &Storage, row: &RowOf<F>, key: F::Key) {
-    let header = &row.header;
-    let id = key.as_id();
-    let word = header.verified.load(Ordering::Acquire);
-    if word & RUNNING == 0
-        && header
-            .verified
-            .compare_exchange(word, word | RUNNING, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-    {
-        panic!("{}({id:?}) changed while this task held its flight", F::NAME);
-    }
-    let initial = match F::CYCLE {
-        CycleKind::Result => blaze_mem::frame::task(F::TAG, |_| F::cycle_result(db, id, key)),
-        CycleKind::Fixpoint => blaze_mem::frame::task(F::TAG, |_| F::cycle_initial(db, id, key)),
-        CycleKind::Panic => unreachable!("{} heads a cycle with no cycle handling", F::NAME),
-    };
-    let table = table_of::<F>(storage);
-    if word & VALUE != 0 {
-        // SAFETY: the flight holder (this task's frame of the row), `RUNNING` set, drops a
-        // value of an earlier view: a cycle's values are never backdated (rules 1, 3).
-        unsafe { drop_value(table, row) };
-    } else {
-        gained(table, id);
-    }
-    // SAFETY: this task holds the row's flight with `RUNNING` set, and it holds no value.
-    unsafe { put(table, row, initial) };
-    header.meta.store(header.meta.load(Ordering::Relaxed) | HEAD, Ordering::Relaxed);
-    header.extra.store(u64::from(header.node.load(Ordering::Relaxed)), Ordering::Relaxed);
-    header.verified.store((word & VIEW_MASK) | VALUE | RUNNING | PROVISIONAL, Ordering::Release);
 }
 
 /// Counts a value `id`'s row took where it held none, and for a function kept by bytes, notes

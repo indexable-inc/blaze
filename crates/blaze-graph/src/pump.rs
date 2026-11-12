@@ -1,10 +1,8 @@
 //! The rule for a wait inside a task (#1301, docs/v2/plan.md "Issues this lane takes in"): a
 //! task that waits for what another task makes holds no thread while it waits, and a wait that
-//! would close a cycle is refused at once. The task that asked then joins the cycle, where
-//! every wait of it is one whose asker can ([`Flights::joining`], [`Refused::Cycle`]: it goes
-//! on running and nothing unwinds), or else gives way with [`Cancelled`]: it unwinds, releases
-//! what it holds and is posted again. No wait can deadlock: every wait is checked against
-//! every other before it begins.
+//! would close a cycle gives way at once with [`Cancelled`], so the task that asked unwinds,
+//! releases what it holds and is posted again. No wait can deadlock: every wait is checked
+//! against every other before it begins.
 //!
 //! Every task is a job of the scheduler ([`crate::sched`]): a pool's job on its fiber, or a
 //! thread on no fiber, which is one job for its life. Who waits for whom is the scheduler's one
@@ -127,8 +125,7 @@ pub fn give_way() -> Cancelled {
 /// no thread, and gets its value. Not a memo: once a run ends its entry goes; the caller keeps
 /// values.
 ///
-/// Who gives way: the asker whose wait would close the cycle, at once, and nobody else (unless
-/// it joins the cycle instead: [`Flights::joining`]). When a
+/// Who gives way: the asker whose wait would close the cycle, at once, and nobody else. When a
 /// run ends cancelled (its task gave way, or it panicked) no partial value is given: each of
 /// its waiters asks again, the first to ask runs the key itself and the others wait for it,
 /// each wait checked again. A waiter gives way only for a cycle its own new wait would close,
@@ -150,27 +147,7 @@ pub fn give_way() -> Cancelled {
 /// warm.
 pub struct Flights<V> {
     runs: Runs<V>,
-    /// The class of its runs' flights in the scheduler ([`Flights::joining`]): 0 for none.
-    class: u64,
 }
-
-/// Why an ask ([`Flights::get_or_join_named`]) got no value.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Refused {
-    /// The asker gave way (its wait would have closed a cycle it cannot join), or the run was
-    /// cancelled: as [`Cancelled`] from [`Flights::get_or_run`]. The give-way is counted and
-    /// remembered ([`gave_way`], `sched::before_claim`).
-    GaveWay,
-    /// The wait would have closed a cycle whose every wait is a task's own wait for a run of
-    /// these flights ([`Flights::joining`]): each task of it is parked in an ask of these
-    /// flights, and stays so until a run this asker holds ends. Nothing waited, nothing was
-    /// counted or remembered, and the asker runs on: it is its caller's to join the cycle, by
-    /// leaving what it asked for to the task that runs it.
-    Cycle,
-}
-
-/// The next class of [`Flights::joining`], from 1: 0 is no class.
-static CLASSES: AtomicU64 = AtomicU64::new(1);
 
 impl<V: Clone + Send + Sync + 'static> Default for Flights<V> {
     fn default() -> Flights<V> {
@@ -180,21 +157,7 @@ impl<V: Clone + Send + Sync + 'static> Default for Flights<V> {
 
 impl<V: Clone + Send + Sync + 'static> Flights<V> {
     pub fn new() -> Flights<V> {
-        Flights { runs: Runs::new(LEAST), class: 0 }
-    }
-
-    /// Flights whose askers may join a cycle of waits instead of giving way
-    /// ([`Flights::get_or_join_named`]): each run's flight in the scheduler carries a class of
-    /// these flights' own, so a refused wait can tell a cycle made only of waits for their runs
-    /// from one that passes through anything else (a scope, a job's end, a counter, another
-    /// table's run, a retry's wait after a give-way).
-    ///
-    /// What the caller promises of every ask of these flights, joined or not: a task parked in
-    /// one looks again at what it asked for once the wait ends, and takes nothing of it for
-    /// granted. That is what lets the asker that closes a cycle go on: every other task of the
-    /// cycle is parked in such an ask until a run the asker holds ends.
-    pub fn joining() -> Flights<V> {
-        Flights { runs: Runs::new(LEAST), class: CLASSES.fetch_add(1, Ordering::Relaxed) }
+        Flights { runs: Runs::new(LEAST) }
     }
 
     /// The value of `key`: run here by `run` when no one is running it, or waited for.
@@ -221,38 +184,9 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
     pub fn get_or_run_named(
         &self,
         key: Key,
-        named: impl FnMut(&mut String),
-        run: impl FnOnce() -> Result<V, Cancelled>,
-    ) -> Result<V, Cancelled> {
-        self.get_or_join_named(key, false, named, run).map_err(|refused| match refused {
-            Refused::GaveWay => Cancelled,
-            Refused::Cycle => unreachable!(
-                "an ask of key {} that joins no cycle was refused as one that may",
-                hex(&key)
-            ),
-        })
-    }
-
-    /// [`Flights::get_or_run_named`] for flights made [`Flights::joining`]: when the wait would
-    /// close a cycle whose every wait is for a run of these flights, and `join`, nothing gives
-    /// way: the ask ends with [`Refused::Cycle`], and the caller goes on with what it holds.
-    /// Without `join`, or for any other cycle, as [`Flights::get_or_run_named`].
-    ///
-    /// # Errors
-    ///
-    /// [`Refused`], which says which.
-    ///
-    /// # Panics
-    ///
-    /// As [`Flights::get_or_run`].
-    pub fn get_or_join_named(
-        &self,
-        key: Key,
-        join: bool,
         mut named: impl FnMut(&mut String),
         run: impl FnOnce() -> Result<V, Cancelled>,
-    ) -> Result<V, Refused> {
-        let class = self.class;
+    ) -> Result<V, Cancelled> {
         sched::miss();
         if let Err(stuck) = sched::before_claim() {
             // alloc: the panic's message, once
@@ -268,7 +202,7 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
                 me,
                 sched::innermost_scope(),
                 &waiter,
-                &mut |runner: u64, scope: Option<CounterId>| claim_flight_of(class, runner, scope),
+                &mut claim_flight,
             ) {
                 Asked::Run(claim) => break claim,
                 Asked::Itself => {
@@ -284,18 +218,17 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
                 Waiting::begin(crate::wait::WaitKind::Key, &mut named, || {
                     crate::wait::Owner::Job(observed(runner))
                 });
-            let joined = (join && class != 0).then_some(class);
-            let got = wait(&waiter, key, flight_of(number, class), joined, &mut named);
+            let got = wait(&waiter, key, flight(number), &mut named);
             drop(waiting);
             drop(left);
             if let Some(value) = got? {
                 return Ok(value);
             }
         };
-        let mut ending = Ending { runs: &self.runs, class, claim, ended: false };
+        let mut ending = Ending { runs: &self.runs, claim, ended: false };
         let result = run();
         ending.end(result.as_ref().ok());
-        result.map_err(|Cancelled| Refused::GaveWay)
+        result
     }
 
     /// As [`Flights::get_or_run`], but never waits: `None`, running nothing, when another task
@@ -316,7 +249,7 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
                     )
                 }
             };
-        let mut ending = Ending { runs: &self.runs, class: self.class, claim, ended: false };
+        let mut ending = Ending { runs: &self.runs, claim, ended: false };
         let result = run();
         ending.end(result.as_ref().ok());
         Some(result)
@@ -354,7 +287,7 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
             Idle::Itself => return Err(NotHeld::ByThisTask),
         };
         Ok(Held {
-            run: Ending { runs: &self.runs, class: self.class, claim, ended: false },
+            run: Ending { runs: &self.runs, claim, ended: false },
             _span: Waiting::holding(&mut named, me),
         })
     }
@@ -371,19 +304,11 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
     }
 }
 
-/// [`claim_flight_of`] for flights of no class: the tests' table of the design before this
-/// one ([`sharded`]) has none.
-#[cfg(all(test, not(blaze_check)))]
+/// Claims a new flight in the scheduler for task `runner`'s run, begun inside `scope`, as its
+/// first waiter links itself: the flight's number.
 fn claim_flight(runner: u64, scope: Option<CounterId>) -> u64 {
-    claim_flight_of(0, runner, scope)
-}
-
-/// Claims a new flight in the scheduler for task `runner`'s run of flights of class `class`
-/// ([`Flights::joining`]; 0 for none), begun inside `scope`, as its first waiter links itself:
-/// the flight's number.
-fn claim_flight_of(class: u64, runner: u64, scope: Option<CounterId>) -> u64 {
     let number = FLIGHTS.fetch_add(1, Ordering::Relaxed);
-    let claimed = sched::claim_for(flight_of(number, class), job(runner), scope);
+    let claimed = sched::claim_for(flight(number), job(runner), scope);
     assert!(claimed, "flight {number} of a run by task {runner:#x} is new");
     number
 }
@@ -392,48 +317,20 @@ fn claim_flight_of(class: u64, runner: u64, scope: Option<CounterId>) -> u64 {
 /// starts while the last one's waiters are being woken never finds its flight taken.
 static FLIGHTS: AtomicU64 = AtomicU64::new(1);
 
-/// The tag in the last 16 bytes of every flight key: no content hash's.
-const FLIGHT_TAG: &[u8; 16] = b"pump run flight.";
+/// The tag in the last 24 bytes of every flight key: no content hash's.
+const FLIGHT_TAG: &[u8; 24] = b"a run's flight, of pump.";
 
-/// [`flight_of`] for flights of no class, as [`claim_flight`].
-#[cfg(all(test, not(blaze_check)))]
+/// The scheduler's key of flight `number`: no content hash's.
 fn flight(number: u64) -> Key {
-    flight_of(number, 0)
-}
-
-/// The scheduler's key of flight `number` of a run of flights of class `class`
-/// ([`Flights::joining`]; 0 for none): its number, its class, the tag.
-fn flight_of(number: u64, class: u64) -> Key {
     let mut key = [0u8; 32];
     key[..8].copy_from_slice(&number.to_le_bytes());
-    key[8..16].copy_from_slice(&class.to_le_bytes());
-    key[16..].copy_from_slice(FLIGHT_TAG);
+    key[8..].copy_from_slice(FLIGHT_TAG);
     Key(key)
 }
 
-/// Whether `key` is a run's flight ([`flight_of`]), which only that run's end may end.
+/// Whether `key` is a run's flight ([`flight`]), which only that run's end may end.
 pub(crate) fn is_flight(key: &Key) -> bool {
-    key.0[16..] == *FLIGHT_TAG
-}
-
-/// The class of the flights `key` is a run's flight of, 0 for a key that is no run's flight or
-/// one of no class.
-fn flight_class(key: &Key) -> u64 {
-    if !is_flight(key) {
-        return 0;
-    }
-    let mut class = [0u8; 8];
-    class.copy_from_slice(&key.0[8..16]);
-    u64::from_le_bytes(class)
-}
-
-/// Whether every wait of `cycle` is a job's own wait for a run of the flights of class `class`:
-/// the cycle an asker of those flights may join ([`Refused::Cycle`]). A cycle that goes on
-/// through a scope, a job's end or a counter anywhere ([`sched::Cycle::keys`]) is not one, nor
-/// one through a run of other flights.
-fn joins(cycle: &sched::Cycle, class: u64) -> bool {
-    class != 0
-        && cycle.keys.iter().all(|key| key.as_ref().is_some_and(|key| flight_class(key) == class))
+    key.0[8..] == *FLIGHT_TAG
 }
 
 /// Keeps a linked [`Waiter`] in place until its run is done with it: dropped before the run
@@ -455,8 +352,6 @@ impl<V> Drop for Left<'_, V> {
 /// its waiters.
 struct Ending<'a, V: Clone + Send + Sync + 'static> {
     runs: &'a Runs<V>,
-    /// The class of its flights ([`Flights::joining`]): its flight's key has it.
-    class: u64,
     claim: Claim<'a>,
     ended: bool,
 }
@@ -465,7 +360,7 @@ impl<V: Clone + Send + Sync + 'static> Ending<'_, V> {
     fn end(&mut self, value: Option<&V>) {
         self.ended = true;
         if let Some(number) = self.runs.end(&self.claim, value) {
-            sched::key_done(flight_of(number, self.class));
+            sched::key_done(flight(number));
         }
     }
 }
@@ -604,32 +499,25 @@ impl Drop for Waiting {
 }
 
 /// Waits for the run of `key` (which the caller names by `named`) `waiter` is linked into,
-/// suspending this task on the run's `flight`: its value, `None` when it was cancelled. When
-/// the wait would close a cycle: [`Refused::Cycle`] where the asker joins cycles of the flights
-/// of class `class` and this is one ([`joins`]), nothing counted or remembered; else
-/// [`Refused::GaveWay`], which the scheduler remembers for this task's next ask
-/// (`sched::gave_way_on`).
+/// suspending this task on the run's `flight`: its value, `None` when it was cancelled, or
+/// `Cancelled` when the wait would close a cycle, which the scheduler remembers for this task's
+/// next ask (`sched::gave_way_on`).
 /// The runner writes every waiter's end before it ends the flight, so once the wait is over the
 /// end is there.
 fn wait<V>(
     waiter: &Waiter<V>,
     key: Key,
     flight: Key,
-    class: Option<u64>,
     named: &mut impl FnMut(&mut String),
-) -> Result<Option<V>, Refused> {
+) -> Result<Option<V>, Cancelled> {
     if waiter.is_running()
         && let Err(cycle) = sched::wait(Wait::Key(flight))
     {
-        if class.is_some_and(|class| joins(&cycle, class)) {
-            return Err(Refused::Cycle);
-        }
         // alloc: a give-way's record, rare: what the caller names the key, for the bound's error
         let mut asked = String::new();
         named(&mut asked);
         sched::gave_way_on(key, asked.into_boxed_str(), flight, &cycle);
-        _ = give_way();
-        return Err(Refused::GaveWay);
+        return Err(give_way());
     }
     Ok(waiter.ended().unwrap_or_else(|| {
         unreachable!(
@@ -662,7 +550,7 @@ mod tests {
     use blaze_ids::rng::SplitMix64 as Rng;
     use crossbeam_channel::unbounded;
 
-    use super::{Flights, LEAST, Refused};
+    use super::{Flights, LEAST};
     use crate::{
         Cancelled, Key,
         pool::Pool,
@@ -818,88 +706,6 @@ mod tests {
         assert_eq!(name, cancelled);
         assert_eq!(again, Ok(value_of(cancelled)));
         assert_eq!(flights.running(), 0);
-    }
-
-    /// Two threads that ask for each other's keys on flights whose askers join: each holds its
-    /// own run when it asks. The one whose wait would close the cycle is refused it
-    /// ([`Refused::Cycle`]) and goes on to end its run; the other's wait ends with that run's
-    /// value. Neither gives way, and each key ran once.
-    #[test]
-    fn an_asker_that_joins_is_refused_its_cycle_and_nothing_gives_way() {
-        let flights = Flights::<u32>::joining();
-        let barrier = Barrier::new(2);
-        let runs = AtomicUsize::new(0);
-        let ask = |mine: u32, theirs: u32| {
-            let (flights, barrier, runs) = (&flights, &barrier, &runs);
-            move || {
-                let gave_way = super::gave_way();
-                let got = flights.get_or_join_named(key(mine), true, |_: &mut String| {}, || {
-                    runs.fetch_add(1, Ordering::SeqCst);
-                    barrier.wait();
-                    let other = flights.get_or_join_named(
-                        key(theirs),
-                        true,
-                        |_: &mut String| {},
-                        || panic!("ran a key the other thread runs"),
-                    );
-                    match other {
-                        // It waited for the other's run, which the other ended refused.
-                        Ok(value) => Ok(value + 1),
-                        // Its wait would have closed the cycle: it goes on, holding its run.
-                        Err(Refused::Cycle) => Ok(mine * 10),
-                        Err(Refused::GaveWay) => Err(Cancelled),
-                    }
-                });
-                (got, super::gave_way() - gave_way)
-            }
-        };
-        let (a, b) = std::thread::scope(|scope| {
-            let (a, b) = (scope.spawn(ask(1, 2)), scope.spawn(ask(2, 1)));
-            (a.join().unwrap(), b.join().unwrap())
-        });
-        assert!(
-            (a.0, b.0) == (Ok(10), Ok(11)) || (a.0, b.0) == (Ok(21), Ok(20)),
-            "one joined and one waited for it: {a:?} {b:?}"
-        );
-        assert_eq!((a.1, b.1), (0, 0), "nothing gave way");
-        assert_eq!(runs.load(Ordering::SeqCst), 2);
-        assert_eq!(flights.running(), 0);
-    }
-
-    /// A cycle through a run of other flights is not one an asker joins: the task parked in
-    /// that run's ask promised nothing of how it goes on. One of the two gives way, as before,
-    /// and the other runs the key given up.
-    #[test]
-    fn a_cycle_through_a_run_of_other_flights_is_given_way_to_never_joined() {
-        let joining = Flights::<u32>::joining();
-        let plain = Flights::<u32>::new();
-        let barrier = Barrier::new(2);
-        let (a, b) = std::thread::scope(|scope| {
-            let a = scope.spawn(|| {
-                joining.get_or_join_named(key(1), true, |_: &mut String| {}, || {
-                    barrier.wait();
-                    plain.get_or_run(key(2), || Ok(0)).map(|it| it + 1)
-                })
-            });
-            let b = scope.spawn(|| {
-                plain.get_or_run(key(2), || {
-                    barrier.wait();
-                    match joining.get_or_join_named(key(1), true, |_: &mut String| {}, || Ok(0)) {
-                        Ok(value) => Ok(value + 1),
-                        Err(Refused::GaveWay) => Err(Cancelled),
-                        Err(Refused::Cycle) => {
-                            panic!("joined a cycle through a run of flights whose askers do not")
-                        }
-                    }
-                })
-            });
-            (a.join().unwrap(), b.join().unwrap())
-        });
-        assert!(
-            (a, b) == (Err(Refused::GaveWay), Ok(1)) || (a, b) == (Ok(1), Err(Cancelled)),
-            "one gave way and the other ran the key given up: {a:?} {b:?}"
-        );
-        assert_eq!((joining.running(), plain.running()), (0, 0));
     }
 
     /// Key 1 run on one thread while another waits for it: what each allocates the last of

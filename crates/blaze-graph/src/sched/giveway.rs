@@ -1,11 +1,6 @@
-//! Fairness after a give-way. A job whose wait for a key's run would have closed a cycle it
-//! cannot join gives way ([`crate::Cancelled`]): it unwinds and lets go of the runs it held,
-//! which wakes the job that waited for them. (A cycle whose every wait is a job's own wait for
-//! a run of flights whose askers join, [`crate::pump::Flights::joining`], is not given way to:
-//! the asker is refused it, [`crate::pump::Refused::Cycle`], and runs on, and none of this
-//! applies. The query engine's rows are such flights; what still gives way is a cycle through a
-//! scope, a job's end, a counter or a run of any other flights, and an asker that cannot go on
-//! without the value it asked for.) Its caller may ask again at once, in a loop. Asked again before the job
+//! Fairness after a give-way. A job whose wait for a key's run would have closed a cycle gives
+//! way ([`crate::Cancelled`]): it unwinds and lets go of the runs it held, which wakes the job
+//! that waited for them. Its caller may ask again at once, in a loop. Asked again before the job
 //! it gave way to has run (on one worker, or on any pool whose workers are all busy, that job is
 //! runnable but not running), it claims back what it let go of and waits for the other's run
 //! again; the other, resumed, asks for what this one holds, its wait closes the cycle, and it
@@ -16,11 +11,10 @@
 //! ([`crate::pump::Flights::get_or_run`]) first waits for that run to end
 //! (`sched::before_claim`). Salsa keeps the same order for a claim given up in a cycle: it
 //! transfers the claim to the query it gave way to (`ClaimGuard::transfer`,
-//! `SyncOwner::Transferred`), so no other thread can take it until that query completes. A
-//! give-way transfers nothing: the job that gave way takes nothing until the run it gave way to
-//! has ended, which is the same guarantee for every caller, whether it asks again at once, after
-//! a scope (as [`crate::par`] does), or never. (The transfer itself is what a join is: the
-//! query engine's asker that joins a cycle leaves the rows it ran to the cycle's head.)
+//! `SyncOwner::Transferred`), so no other thread can take it until that query completes. Here
+//! nothing is transferred: the job that gave way takes nothing until the run it gave way to has
+//! ended, which is the same guarantee for every caller, whether it asks again at once, after a
+//! scope (as [`crate::par`] does), or never.
 //!
 //! When that wait would itself close a cycle (the run it gave way to waits, through others, on
 //! what this job still holds), only this job can move, so it goes on and claims as it did

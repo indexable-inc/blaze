@@ -253,16 +253,11 @@ pub enum Yielded {
 
 /// A wait refused because it closes a cycle of waits: `jobs[0]` asked to wait, each job waits
 /// for the next (its job, its key's claimer, one of its counter's jobs) and the last for the
-/// first. The asking job goes on running, and either joins the cycle (where every wait of it is
-/// for a flight whose askers can: [`crate::pump::Flights::joining`]) or gives way (unwinds,
-/// releases, is posted again); nothing in the scheduler changed.
+/// first. The asking job goes on running and must give way (unwind, release, be posted again);
+/// nothing in the scheduler changed.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error, off every hot path
 pub struct Cycle {
     pub jobs: Vec<JobId>,
-    /// For each job of `jobs`, the key whose flight its wait in the cycle is on (for `jobs[0]`,
-    /// the wait it asked for): `None` where the cycle goes on from the job through its end, a
-    /// counter, or a scope it has open, none of which is its own wait for a key.
-    pub keys: Vec<Option<Key>>,
 }
 
 /// No wait could ever end: every pool's workers idle with nothing queued, no driver running,
