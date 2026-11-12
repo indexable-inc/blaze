@@ -1,0 +1,11 @@
+{
+ "id": "A14",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "ix",
+ "what": "Three VMs lost their root disk mid-build (a revoked live migration fenced the writer); one held the only stage-2 compiler.",
+ "cost": "about six hours of builds",
+ "cause": "ix #8241, #8247",
+ "workaround": "copy artifacts off a VM as soon as they exist",
+ "state": "fixed in ix (#8246, #8254, #8255)"
+}

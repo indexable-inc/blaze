@@ -16,6 +16,7 @@ use std::{fmt, panic::UnwindSafe};
 
 mod budget;
 mod capture;
+mod census;
 mod counts;
 mod dense;
 pub mod edit_work;
@@ -42,6 +43,7 @@ pub use capture::{
     Read, ReadKind, Reads, capture_reads, for_span_text, replay_reads, unshareable_reads,
 };
 pub use blaze_graph::par::{SMALL_ITEMS, SMALL_NS, Small};
+pub use census::{Blocker as DurabilityBlocker, Census as DurabilityCensus};
 pub use counts::{Counts, take as take_counts};
 pub use frontier::{Changed, ChangedSetWork, Unknown as ChangedUnknown};
 pub use function::completed;

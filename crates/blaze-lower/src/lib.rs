@@ -1331,11 +1331,11 @@ impl Lowered {
             }),
             (false, _) if set.is_library => parts.push(IdentityPart::Files {
                 what: "its source files (a library's, taken as one)",
-                content: root.content(db),
+                content: base_db::crate_root_content(db, krate),
             }),
             (false, _) if unpathed => parts.push(IdentityPart::Files {
                 what: "the files of its source root (one of which has no path)",
-                content: root.content(db),
+                content: base_db::crate_root_content(db, krate),
             }),
             (false, _) => {
                 let named = files.len().min(FILES_NAMED);
@@ -1460,25 +1460,44 @@ impl Lowered {
     ) -> Result<(), LowerError> {
         let out_dir = &ran.out_dir;
         let mut loaded = Vec::with_capacity(ran.files.len());
+        // Each file with the bytes the run left, for the reads of it made before the run.
+        let mut left: Vec<(String, std::sync::Arc<[u8]>)> = Vec::with_capacity(ran.files.len()); // alloc: once per apply, a file the run left each
         for (path, bytes) in &ran.files {
             let id = ContentId::of(blaze_vfs::FILE_DOMAIN, bytes);
-            let bytes = blaze_vfs::Bytes::from(std::sync::Arc::<[u8]>::from(bytes.as_slice()));
-            loaded.push(files::Loaded { path: format!("{out_dir}/{path}"), id, bytes });
+            let shared = std::sync::Arc::<[u8]>::from(bytes.as_slice());
+            let at = format!("{out_dir}/{path}");
+            left.push((at.clone(), std::sync::Arc::clone(&shared))); // clone: a count and the path, once per file per apply
+            loaded.push(files::Loaded { path: at, id, bytes: blaze_vfs::Bytes::from(shared) });
         }
 
         let db = &mut self.db;
         let change = set_files(db, out_dir, &[], lowering.set, crates.sets, &loaded)?;
         note(&mut self.paths, db, lowering.set, &change);
+        // A crate given this `OUT_DIR` by the plan is resolved before the run is applied (the
+        // name resolution maintainer ends every write), and its `include!` of a file the run
+        // had not left yet read the disk and kept "no such file" as an input
+        // ([`base_db::Files::included_file`]). The run's files are final here: each such
+        // read is set to the bytes the run left, in this write, so its readers run again now
+        // and the read is what the disk holds. Left as it was, the next build's
+        // [`Lowered::refresh`] found each of them moved on disk and wrote them then: reth's
+        // first edit after a cold build wrote 11 (serde's, thiserror's, snap's, bindgen's ..),
+        // each write waking every module of every crate that expands an `include!`.
+        let mut settled = false;
+        for (path, bytes) in left {
+            let path = abs(&path)?;
+            settled |= db.settle_included_file(&path, bytes);
+        }
         // Whether the run changed anything the front end reads: a file of its `OUT_DIR`, or
         // below a dependent's cfg or env. A run applied again with what it gave before (a
         // script blaze ran again whose outputs are byte for byte the last run's) writes
         // nothing, so the identities made of the database stay: until 2026-11-10 every
         // applied run dropped them, and each unit's was made again in every build.
-        let mut changed = !(change.set.is_empty()
-            && change.added.is_empty()
-            && change.removed.is_empty()
-            && change.no_text.is_empty()
-            && change.roots.is_empty());
+        let mut changed = settled
+            || !(change.set.is_empty()
+                && change.added.is_empty()
+                && change.removed.is_empty()
+                && change.no_text.is_empty()
+                && change.roots.is_empty());
         let class = lowering.class;
         // Each crate once: units of one crate depend on runs of the same classes.
         let mut written: Vec<Crate> = Vec::with_capacity(lowering.dependents.len()); // alloc: once per apply, a handful

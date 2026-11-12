@@ -83,7 +83,6 @@ const INTERFACE_TEXT: &str = "blaze v2 file interface text 2";
 /// 2: the crate's settings and its files' paths as a portable key writes them
 /// ([`ported_crate`], [`base_db::Files::ported`]).
 const OWN_NARROW: &str = "blaze v2 crate own narrow 2";
-const PORTED_FILES: &str = "blaze v2 crate ported files 1";
 
 /// `krate`'s settings as a portable key holds them ([`Crate::ported_content`]), each crate it
 /// depends on by its own: the database's memo, so a crate's is made once and made again only
@@ -95,33 +94,12 @@ pub(crate) fn ported_crate(db: &Db, krate: Crate) -> ContentId {
     krate.ported_content(db, &|dep| ported_crate(db, dep))
 }
 
-/// The files of `krate`'s source root as a portable key holds them: what
-/// [`base_db::SourceRoot::content`] is of (whether it is a library's, and each file's path
-/// and content ID), each path as [`base_db::Files::ported`] writes it and in that order. A
-/// file with no path on disk is its own name, as the source root has it.
-#[blaze_query::tracked(returns(copy))]
+/// The files of `krate`'s source root that the crate is made from, as a portable key holds
+/// them ([`base_db::crate_root_ported`]): exactly the files [`base_db::crate_root_content`]
+/// selects (never another crate's `OUT_DIR`), each path as [`base_db::Files::ported`] writes
+/// it.
 pub(crate) fn ported_files(db: &Db, krate: Crate) -> ContentId {
-    let root_file = krate.data(db).root_file_id;
-    let root = db.source_root(db.file_source_root(root_file).source_root_id(db));
-    let set = root.source_root_ref(db);
-    // alloc: once per crate whose source root's files moved, a file each
-    let mut files: Vec<(Vec<u8>, ContentId)> = set
-        .iter()
-        .map(|file| {
-            let path = match set.path_for_file(&file) {
-                Some(path) => path.to_string(), // alloc: as above
-                None => String::new(),          // alloc: none
-            };
-            (db.files().ported(path.as_bytes()).into_owned(), db.file_content(file))
-        })
-        .collect();
-    files.sort_unstable();
-    let mut hasher = Hasher::new(PORTED_FILES);
-    hasher.update(&[u8::from(set.is_library)]).update(&(files.len() as u64).to_le_bytes());
-    for (path, content) in &files {
-        hasher.part(path).id(content);
-    }
-    hasher.finish()
+    base_db::crate_root_ported(db, krate)
 }
 
 /// What of a file its crate's code can observe ([`code_text`]).
@@ -421,7 +399,7 @@ fn own_code(db: &Db, krate: Crate) -> ContentId {
     let mut hasher = Hasher::new(OWN_CODE);
     hasher.id(&krate.content(db));
     let whole = |hasher: &mut Hasher| {
-        hasher.update(&[0]).id(&db.file_content(root_file)).id(&root.content(db));
+        hasher.update(&[0]).id(&db.file_content(root_file)).id(&base_db::crate_root_content(db, krate));
         hasher.finish()
     };
     let set = root.source_root_ref(db);
@@ -539,7 +517,6 @@ const LIBRARY_KEY: &str = "blaze v2 library crate narrow 1";
 /// on: its own narrowed identity reads none of them.
 pub(crate) fn library_key(db: &Db, krate: Crate, front_end: &ContentId) -> ContentId {
     let data = krate.data(db);
-    let root = db.file_source_root(data.root_file_id).source_root_id(db);
     let mut hasher = Hasher::new(LIBRARY_KEY);
     hasher.id(front_end);
     for domain in [CODE_TEXT, INTERFACE_TEXT, OWN_NARROW] {
@@ -548,7 +525,7 @@ pub(crate) fn library_key(db: &Db, krate: Crate, front_end: &ContentId) -> Conte
     hasher
         .id(&krate.content(db))
         .id(&db.file_text(data.root_file_id).content(db))
-        .id(&db.source_root(root).content(db));
+        .id(&base_db::crate_root_content(db, krate));
     hasher.finish()
 }
 

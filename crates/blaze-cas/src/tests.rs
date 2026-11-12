@@ -1779,8 +1779,15 @@ fn a_pack_a_batch_waiting_on_its_maps_moves_records_into_is_not_retired() {
     flush(&mut sim, &mut store);
     settle(&mut sim, &mut store);
     settle(&mut sim, &mut store);
-    let settled = settle(&mut sim, &mut store);
-    assert_eq!(settled.demoted, 12, "{settled:?}");
+    // A step with room for eleven of the twelve moves, so none for the pack's rewrite: a
+    // whole settle would retire pack 0 as it leaves it dead, the pack its unit appends to or
+    // not.
+    assert!(store.end_period());
+    let mut effects = Vec::new();
+    let most: u64 = keys[..12].iter().map(|&n| value(n).len() as u64).sum();
+    let settled = store.settle_step(most - 1, &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    assert_eq!((settled.demoted, settled.retired, settled.more), (11, 0, true), "{settled:?}");
     for &n in &keys[12..] {
         store.put(key(n), Kind::Code, &value(n)).unwrap();
     }
@@ -1891,7 +1898,7 @@ fn a_crash_at_any_point_loses_nothing_durable_and_serves_nothing_torn() {
 fn the_oracle_catches_a_put_reported_durable_that_no_sync_made_so() {
     let (seed, why) = block_checks::head_before_syncs_caught();
     assert!(
-        why.contains("did not open") && why.contains("its head names"),
+        why.contains("did not open") && block_checks::names_what_is_not_there(&why),
         "seed {seed}: caught, but not as a head naming what is not durable: {why}"
     );
 }
@@ -1968,7 +1975,7 @@ fn a_store_of_the_format_before_block_checks_is_refused_naming_both() {
     store.put(key(1), Kind::Code, &[1]).unwrap();
     flush(&mut sim, &mut store);
     drop(store);
-    assert_eq!(FORMAT, 4);
+    assert_eq!((FORMAT_READ, FORMAT), (4, 5));
     let head = name("store/head");
     let mut bytes = sim.contents(&head);
     assert_eq!(bytes[8..12], FORMAT.to_le_bytes());
@@ -1980,7 +1987,113 @@ fn a_store_of_the_format_before_block_checks_is_refused_naming_both() {
     assert!(!store.ready());
     let broken = store.broken().unwrap();
     assert_eq!(broken.file, head);
-    assert!(broken.what.contains("store format 3, not 4"), "{broken}");
+    assert!(broken.what.contains("store format 3, not 5"), "{broken}");
+}
+
+/// Format 5 added a head's whole files to remove. A store of format 4 (its head and its
+/// index table) is read as it is, and the next head written over it is of format 5.
+#[test]
+fn a_store_of_format_4_is_read_and_goes_on_as_format_5() {
+    let mut sim = Sim::new(8, quiet());
+    let mut store = open(&mut sim, "store");
+    let count = INDEX_AFTER as u64 + 4;
+    for n in 0..count {
+        store.put(key(n), Kind::Code, &text(n, 300)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    let slot = store.tiers[0].head.index.expect("past `INDEX_AFTER` records an index is written").slot;
+    drop(store);
+    // The store as a blaze of format 4 left it: the index's stamp, its check in the head, and
+    // the head's stamp and check.
+    let (head, index) = (name("store/head"), name(&format!("store/index-{slot}")));
+    let mut table = sim.contents(&index);
+    assert_eq!(table[8..12], FORMAT.to_le_bytes());
+    table[8..12].copy_from_slice(&4u32.to_le_bytes());
+    sim.change(&index, &table);
+    let mut written = Head::decode(&sim.contents(&head)).unwrap();
+    written.index.as_mut().unwrap().check = crc::crc32c(&table);
+    let mut bytes = written.encode();
+    bytes[8..12].copy_from_slice(&4u32.to_le_bytes());
+    let body = bytes.len() - 4;
+    let check = crc::crc32c(&bytes[..body]);
+    bytes[body..].copy_from_slice(&check.to_le_bytes());
+    sim.change(&head, &bytes);
+    let mut store = open(&mut sim, "store");
+    for n in 0..count {
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), text(n, 300), "{n}");
+    }
+    store.put(key(count), Kind::Code, &text(count, 300)).unwrap();
+    flush(&mut sim, &mut store);
+    assert_eq!(sim.contents(&head)[8..12], 5u32.to_le_bytes(), "the next head is of format 5");
+    drop(store);
+    let store = open(&mut sim, "store");
+    for n in 0..=count {
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), text(n, 300), "{n} after a reopen");
+    }
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+/// A hot value long enough for a file of its own, unread for two periods, goes cold as a
+/// record does: into a pack, compressed, and its file is removed once the head that lists it
+/// removed is durable. A second key of the same bytes keeps the file until it is moved too.
+/// Put again after, the value is a file again; and a file a crash left listed as removed goes
+/// at the next open.
+#[test]
+fn a_whole_file_unread_for_two_periods_goes_cold_into_a_pack_and_its_file_goes() {
+    let mut sim = Sim::new(9, quiet());
+    let mut store = open(&mut sim, "store");
+    let big = text(1, EXTERNAL_FROM + 4096);
+    let file = name(&format!("store/{}", disk::external_file(&content_of(&big))));
+    store.put(key(1), Kind::Query, &big).unwrap();
+    store.put(key(2), Kind::Query, &big).unwrap();
+    flush(&mut sim, &mut store);
+    assert_eq!(form_of(&store, &key(1)), Form::External);
+    assert!(sim.exists(&file));
+    settle(&mut sim, &mut store);
+    settle(&mut sim, &mut store);
+    // Key 2 is read in this period: only key 1 moves, and the file stays for key 2.
+    assert_eq!(bytes_of(&store, &key(2)).unwrap(), big);
+    let settled = settle(&mut sim, &mut store);
+    assert_eq!(settled.demoted, 1, "{settled:?}");
+    assert_eq!(form_of(&store, &key(1)), Form::Zstd);
+    assert_eq!(form_of(&store, &key(2)), Form::External);
+    assert!(sim.exists(&file), "a key still names the file");
+    settle(&mut sim, &mut store);
+    let settled = settle(&mut sim, &mut store);
+    assert_eq!(settled.demoted, 1, "{settled:?}");
+    assert!(!sim.exists(&file), "no key names the file: it is removed with the head that says so");
+    assert!(store.tiers[0].externals.is_empty() && store.tiers[0].removing.is_empty());
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), big);
+    assert_eq!(bytes_of(&store, &key(2)).unwrap(), big);
+    // The same bytes under a third key: a file of its own again, written after the removal.
+    store.put(key(3), Kind::Query, &big).unwrap();
+    flush(&mut sim, &mut store);
+    assert_eq!(form_of(&store, &key(3)), Form::External);
+    assert!(sim.exists(&file));
+    assert_eq!(store.verify(None), Vec::new());
+    drop(store);
+    // A head that lists the file removed, and the file still there (a crash before its
+    // removal): the open removes it, and reads every value.
+    let head = name("store/head");
+    let mut written = Head::decode(&sim.contents(&head)).unwrap();
+    assert_eq!(written.externals.len(), 1);
+    let mut store = open(&mut sim, "store");
+    settle(&mut sim, &mut store);
+    settle(&mut sim, &mut store);
+    assert_eq!(settle(&mut sim, &mut store).demoted, 1);
+    assert!(!sim.exists(&file));
+    flush(&mut sim, &mut store);
+    drop(store);
+    written = Head::decode(&sim.contents(&head)).unwrap();
+    let listed: Vec<u64> = written.externals.iter().map(|it| it.len).collect();
+    assert!(listed.iter().all(|&len| len == disk::EXTERNAL_REMOVED), "{listed:?}");
+    sim.change(&file, &big);
+    let store = open(&mut sim, "store");
+    assert!(!sim.exists(&file), "the open removes what its head lists as removed");
+    for n in 1..=3 {
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), big, "{n}");
+    }
+    assert_eq!(store.verify(None), Vec::new());
 }
 
 #[test]
@@ -2139,6 +2252,69 @@ fn a_large_value_is_a_file_of_its_own_placed_by_sharing_blocks() {
     drop(store);
     let store = open(&mut sim, "store");
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), big);
+}
+
+/// The invariant: a clone placed at a path a program is started from ([`Store::starts`]) is
+/// asked to hold what the system holds of the path's file ([`Effect::Prewarm`], from the path
+/// to the staged clone) after it is cloned, and renamed onto the path only as that completed,
+/// since after the rename the path names the clone; where no file is at the path yet the
+/// place still ends well; and a path nothing is started from is asked for no prewarm. The
+/// control is the last: the same place with the path not said started renames with none.
+#[test]
+fn a_clone_placed_where_a_program_starts_is_prewarmed_before_its_rename() {
+    let mut sim = Sim::new(9, quiet());
+    let mut store = open(&mut sim, "store");
+    let big = noise(EXTERNAL_FROM + 10, 90);
+    store.put(key(1), Kind::Image, &big).unwrap();
+    flush(&mut sim, &mut store);
+    // What the store asks for the path, in order, each with the completion it was asked
+    // under (`None`: as the place was asked).
+    fn placed_logged(sim: &mut Sim, store: &mut Store, to: &str) -> Vec<(String, Option<String>)> {
+        let to = name(to);
+        let mut effects = Vec::new();
+        let tag = store.place(&key(1), to.clone(), &mut effects).unwrap();
+        let said = |effect: &Effect| match effect {
+            Effect::Clone { .. } => Some("clone".to_owned()),
+            Effect::Prewarm { like, file, .. } => {
+                Some(format!("prewarm {like} into {}", if *file == to { "the path" } else { "its clone" }))
+            }
+            Effect::RenameUnsynced { to: onto, .. } if *onto == to => Some("rename".to_owned()),
+            _ => None,
+        };
+        let mut log: Vec<(String, Option<String>)> =
+            effects.iter().filter_map(&said).map(|it| (it, None)).collect();
+        run_until_idle(sim, &mut effects, |completion, effects| {
+            if store.owns(completion.tag) {
+                let under = format!("{:?}", completion.done);
+                let before = effects.len();
+                store.complete(completion, effects);
+                log.extend(effects[before..].iter().filter_map(&said).map(|it| (it, Some(under.clone()))));
+            }
+        })
+        .expect("the effects end");
+        let placed = store.placed();
+        assert!(placed.iter().any(|it| it.tag == tag && it.result == Ok(())), "{placed:?}");
+        log
+    }
+    let asked = |log: &[(String, Option<String>)]| log.iter().map(|it| it.0.clone()).collect::<Vec<_>>();
+
+    // No file at the path yet: prewarmed all the same (of nothing), and placed.
+    store.starts(&name("target/app"), true);
+    let first = placed_logged(&mut sim, &mut store, "target/app");
+    assert_eq!(asked(&first), ["clone", "prewarm target/app into its clone", "rename"]);
+    assert_eq!(sim.contents(&name("target/app")), big);
+    // Over the file there: the prewarm is asked as the clone completed, the rename as the
+    // prewarm did.
+    let again = placed_logged(&mut sim, &mut store, "target/app");
+    assert_eq!(asked(&again), ["clone", "prewarm target/app into its clone", "rename"]);
+    assert_eq!(again[1].1.as_deref(), Some("Cloned"), "{again:?}");
+    assert!(again[2].1.as_deref().is_some_and(|it| it.starts_with("Prewarmed")), "{again:?}");
+    // The control: a path nothing is started from, and the same path once it is said so.
+    let other = placed_logged(&mut sim, &mut store, "target/app.debug");
+    assert_eq!(asked(&other), ["clone", "rename"]);
+    store.starts(&name("target/app"), false);
+    let unstarted = placed_logged(&mut sim, &mut store, "target/app");
+    assert_eq!(asked(&unstarted), ["clone", "rename"]);
 }
 
 #[test]
@@ -3364,6 +3540,203 @@ fn what_is_unread_for_two_periods_goes_cold_and_what_is_read_stays_hot() {
         assert_eq!(bytes_of(&store, &key(n)).unwrap(), text(n, 8 << 10), "{n}");
     }
     assert_eq!(form_of(&store, &key(4)), Form::Zstd);
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+/// Ends a period and makes its moves in steps of at most `most` bytes each, a commit after
+/// each, as the daemon's loop does between requests: what all the steps did, summed.
+fn settle_in_steps(sim: &mut Sim, store: &mut Store, most: u64) -> Settled {
+    let mut all = Settled::default();
+    if !store.end_period() {
+        all.more = true;
+        return all;
+    }
+    // Bounded: a plan lists each record once, and a step moves at least one.
+    for _ in 0..100_000 {
+        let mut effects = Vec::new();
+        let settled = store.settle_step(most, &mut effects);
+        drive(sim, store, &mut effects);
+        all.demoted += settled.demoted;
+        all.promoted += settled.promoted;
+        all.retired += settled.retired;
+        if !settled.more {
+            assert!(!store.settling(), "a step that says no more left a plan");
+            return all;
+        }
+    }
+    panic!("the steps of one period's plan did not end: {all:?}");
+}
+
+/// The daemon's settle: a period's end plans, steps of a bounded number of bytes move. Small
+/// steps move what one whole settle moves, a record read between two steps stays hot though
+/// the plan listed it, and a store of one pack gives its dead bytes back: the pack its unit
+/// appends to is rewritten and removed with its dictionary moved on, where it used to stay for
+/// good (a home's `pack-000000`).
+#[test]
+fn a_period_s_moves_made_in_steps_are_a_settle_s_and_one_pack_gives_its_dead_bytes_back() {
+    let mut sim = Sim::new(34, quiet());
+    let mut store = open(&mut sim, "store");
+    let count = cold::TRAIN_VALUES as u64 + 40;
+    let value = |n: u64| text(n, 6 << 10);
+    for n in 0..count {
+        store.put(key(n), Kind::Code, &value(n)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    assert_eq!(settle_in_steps(&mut sim, &mut store, 4 << 10), Settled::default());
+    assert_eq!(settle_in_steps(&mut sim, &mut store, 4 << 10), Settled::default());
+    // The third period's end lists every record; its first step moves one, then key 7 is read.
+    assert!(store.end_period());
+    let mut effects = Vec::new();
+    let first = store.settle_step(1, &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    assert_eq!((first.demoted, first.more), (1, true), "{first:?}");
+    assert_eq!(bytes_of(&store, &key(7)).unwrap(), value(7));
+    let mut demoted = first.demoted;
+    let mut retired = 0;
+    for _ in 0..100_000 {
+        let mut effects = Vec::new();
+        // Each step's commit ends its pack on a block, so few steps: little padding.
+        let settled = store.settle_step(200 << 10, &mut effects);
+        drive(&mut sim, &mut store, &mut effects);
+        demoted += settled.demoted;
+        retired += settled.retired;
+        if !settled.more {
+            break;
+        }
+    }
+    assert!(!store.settling());
+    assert_eq!(form_of(&store, &key(7)), Form::Raw, "read after its period ended: it stays hot");
+    assert_eq!(demoted, count - 1, "every other record moved cold");
+    assert_eq!(store.tiers[0].dictionaries.len(), 1, "the kind's dictionary was trained");
+    // What the steps left dead is given back: the first pack goes, though its unit appended to
+    // it and it held the dictionary.
+    let rest = settle_in_steps(&mut sim, &mut store, 16 << 10);
+    assert!(retired + rest.retired >= 1, "{rest:?}");
+    assert!(store.tiers[0].packs[0].removed, "the first pack is removed");
+    assert!(!sim.exists(&name("store/pack-000000")), "its file is gone");
+    assert_ne!(store.tiers[0].dictionaries[0].pack, 0, "the dictionary moved on with the rest");
+    let live: u64 = store.tiers[0].packs.iter().filter(|it| !it.removed).map(|it| it.committed).sum();
+    assert!(live < count * (6 << 10) / 2, "{live} bytes of packs hold {count} values of 6 KiB");
+    for n in 0..count {
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), value(n), "{n}");
+    }
+    assert_eq!(store.verify(None), Vec::new());
+    flush(&mut sim, &mut store);
+    drop(store);
+    let store = open(&mut sim, "store");
+    for n in 0..count {
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), value(n), "{n} after a reopen");
+    }
+    assert_eq!(form_of(&store, &key(8)), Form::Zstd);
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+/// The daemon's settle with the compression on another thread: the store's thread reads a
+/// batch of values out ([`Store::settle_take`]), any thread compresses it
+/// ([`ColdBatch::compress`]), and the store writes it back ([`Store::settle_put`]). A value
+/// read, and one put again, while its batch was out stay as they are; the rest are what a
+/// whole settle makes them, byte for byte.
+#[test]
+fn values_compressed_on_another_thread_move_cold_as_a_settle_moves_them() {
+    let value = |n: u64| if n == 9 { text(n, cold::LONG_FROM + 100) } else { text(n, 9 << 10) };
+    // What a whole settle stores for each key.
+    let mut sim = Sim::new(35, quiet());
+    let mut whole = open(&mut sim, "whole");
+    let mut store = open(&mut sim, "store");
+    for n in 0..12 {
+        whole.put(key(n), Kind::Code, &value(n)).unwrap();
+        store.put(key(n), Kind::Code, &value(n)).unwrap();
+    }
+    flush(&mut sim, &mut whole);
+    flush(&mut sim, &mut store);
+    settle(&mut sim, &mut whole);
+    settle(&mut sim, &mut whole);
+    assert_eq!(settle(&mut sim, &mut whole).demoted, 12);
+    assert_eq!(settle_in_steps(&mut sim, &mut store, 1), Settled::default());
+    assert_eq!(settle_in_steps(&mut sim, &mut store, 1), Settled::default());
+    assert!(store.end_period());
+    let mut moved = 0;
+    let mut batches = 0;
+    while let Some(mut batch) = store.settle_take(40 << 10) {
+        batches += 1;
+        assert!(batch.bytes() <= (40 << 10).max(value(9).len() as u64), "{}", batch.bytes());
+        // Compressed where the store is not: the batch is all the work needs.
+        let batch = std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    batch.compress();
+                    batch
+                })
+                .join()
+                .unwrap()
+        });
+        if batches == 1 {
+            // Key 0 is in the first batch (the plan is in the packs' order): read while the
+            // batch was out, it stays hot.
+            assert_eq!(bytes_of(&store, &key(0)).unwrap(), value(0));
+        }
+        moved += store.settle_put(batch);
+        assert!(batches < 100, "the plan's batches did not end");
+    }
+    assert!(batches >= 3, "{batches} batches of at most 40 KiB for 12 values");
+    assert_eq!(moved, 11, "every value but the one read");
+    let mut effects = Vec::new();
+    let rest = store.settle_step(1 << 20, &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    assert!(!rest.more && !store.settling(), "{rest:?}");
+    flush(&mut sim, &mut store);
+    assert_eq!(form_of(&store, &key(0)), Form::Raw);
+    for n in 1..12 {
+        assert_eq!(form_of(&store, &key(n)), Form::Zstd, "{n}");
+        let (ours, theirs) = (store.found_of(&key(n)), whole.found_of(&key(n)));
+        let ours = store.look().record(ours, &key(n)).unwrap();
+        let theirs = whole.look().record(theirs, &key(n)).unwrap();
+        assert_eq!(ours.1, theirs.1, "{n}: the stored bytes are a whole settle's");
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), value(n), "{n}");
+    }
+    assert_eq!(store.verify(None), Vec::new());
+    drop(store);
+    let store = open(&mut sim, "store");
+    for n in 0..12 {
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), value(n), "{n} after a reopen");
+    }
+}
+
+/// A kind with no dictionary and enough values planned for a training: its batch takes
+/// them at once, trains the dictionary where it is compressed, and the store keeps it as the
+/// kind's when the batch comes back. Short values move with it too, and all read back after a
+/// reopen, which reads the dictionary from the pack the head names.
+#[test]
+fn a_batch_trains_its_kind_s_dictionary_where_it_is_compressed() {
+    let mut sim = Sim::new(36, quiet());
+    let mut store = open(&mut sim, "store");
+    let count = cold::TRAIN_VALUES as u64 + 30;
+    let value = |n: u64| text(n, if n % 2 == 0 { 900 } else { 5 << 10 });
+    for n in 0..count {
+        store.put(key(n), Kind::Query, &value(n)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    assert_eq!(settle_in_steps(&mut sim, &mut store, 1), Settled::default());
+    assert_eq!(settle_in_steps(&mut sim, &mut store, 1), Settled::default());
+    assert!(store.end_period());
+    let mut batch = store.settle_take(1).expect("the plan lists every value");
+    assert_eq!(batch.len() as u64, count, "a batch that trains takes what a training needs");
+    batch.compress();
+    assert!(batch.trained());
+    assert_eq!(store.settle_put(batch), count);
+    assert!(store.settle_take(1).is_none());
+    let mut effects = Vec::new();
+    store.settle_step(1 << 20, &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    flush(&mut sim, &mut store);
+    assert_eq!(store.tiers[0].dictionaries.len(), 1);
+    assert_eq!(store.problems(), &[] as &[String]);
+    drop(store);
+    let store = open(&mut sim, "store");
+    for n in 0..count {
+        assert_eq!(form_of(&store, &key(n)), Form::Zstd, "{n}");
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), value(n), "{n}");
+    }
     assert_eq!(store.verify(None), Vec::new());
 }
 

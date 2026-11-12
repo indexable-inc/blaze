@@ -201,6 +201,16 @@ impl Sparse {
 /// the path's own file and of no file of the store's; what it can force out is what that
 /// file had written since its write-back, which every place asks for as it ends
 /// ([`crate::Store::runs_step`]) and no place waits for: the last patch's ranges at most.
+///
+/// A clone shares its source's blocks and none of the pages the system holds of it in
+/// memory, so the program's next start would read from the disk every page its last run had
+/// in memory (measured 2026-11-11 on APFS, hello world's dev image: 30 to 45 ms of the first
+/// `exec` after each edit, against 4 ms for the file before it). So as the clone is made the
+/// system is asked to read into it what it holds of the path's file ([`Effect::Prewarm`],
+/// [`Step::Warm`]), beside the cut and the writes. The rename is asked only once that
+/// completed: which pages the path's file holds is read as the effect is carried out, and
+/// after the rename the path names the clone. `tests::the_rename_waits_for_the_prewarm`
+/// holds that order, with the rename asked first as its planted bug.
 pub(crate) struct Writing {
     pub(crate) to: FileName,
     /// The hidden name beside `to` it is made under ([`crate::Store::staging_name`]).
@@ -208,16 +218,28 @@ pub(crate) struct Writing {
     pub(crate) len: u64,
     /// Whether it starts from a clone of the path's own file ([`Content::Over`]).
     pub(crate) over: bool,
+    /// Whether that clone is prewarmed ([`Step::Warm`]): for a file a program is started
+    /// from. Any other (a debug file beside it) is read by nothing as the build ends, and a
+    /// prewarm of it would read from the disk, each edit, whatever of it the system held.
+    pub(crate) warm: bool,
     /// The runs, until the cut is made and they go to their writes.
     runs: Vec<(u64, Vec<u8>)>,
     /// The writes still in flight, and the first that failed.
     left: u32,
     failed: Option<String>,
+    /// The cut is made and its runs are at their writes (or it has none).
+    cut: bool,
+    /// The prewarm of the clone is in flight ([`Step::Warm`]), with its span.
+    warming: Option<tracing::Span>,
     /// The bytes its runs wrote.
     wrote: u64,
     /// The step in flight, open from its effects asked to the last of their completions
     /// (slow-is-p0-traced): never entered, as the place's own span is not.
     span: tracing::Span,
+    /// The planted bug of `tests::the_rename_waits_for_the_prewarm`: the rename is asked as
+    /// the writes end, whatever the prewarm.
+    #[cfg(test)]
+    pub(crate) plant_rename_before_warm: bool,
     /// The planted bug of `tests::place_made`, and how far it got.
     #[cfg(test)]
     plant: Option<Plant>,
@@ -249,6 +271,8 @@ pub(crate) enum Step {
     Cut,
     /// One run written.
     Write,
+    /// The clone's cache asked to hold what the path's file's does ([`Effect::Prewarm`]).
+    Warm,
     /// The staged file renamed onto the path.
     Rename,
 }
@@ -289,11 +313,16 @@ impl Writing {
             temp,
             len,
             over,
+            warm: over,
             runs,
             left: 0,
             failed: None,
+            cut: false,
+            warming: None,
             wrote: 0,
             span,
+            #[cfg(test)]
+            plant_rename_before_warm: false,
             #[cfg(test)]
             plant: None,
             #[cfg(test)]
@@ -323,6 +352,15 @@ impl Writing {
                 Next::Going
             }
             (Step::Clear, Done::Removed) | (Step::Clone, Done::Cloned) => {
+                if step == Step::Clone && self.warm {
+                    // What the system holds in memory of the path's file, asked for in the
+                    // clone: beside the cut and the writes, and before the rename.
+                    // clone: the effect owns the names; once per place
+                    let (like, file) = (self.to.clone(), self.temp.clone());
+                    self.warming =
+                        Some(step_span(&self.to, "read ahead what its last file held in memory", 0));
+                    effects.push(Effect::Prewarm { like, file, tag: ask(Step::Warm) });
+                }
                 // The file of holes: made at its length, so what no run writes reads as zeros
                 // and takes no block. A clone is cut to the length the same way.
                 // clone: the effect owns the name; once per place
@@ -330,6 +368,22 @@ impl Writing {
                 self.span = step_span(&self.to, "cut it to its length", 0);
                 effects.push(Effect::Truncate { file, len: self.len, tag: ask(Step::Cut) });
                 Next::Going
+            }
+            (Step::Warm, done) => {
+                if let Some(span) = self.warming.take()
+                    && let Done::Prewarmed { bytes } = done
+                {
+                    span.record("bytes", *bytes);
+                }
+                if !matches!(done, Done::Prewarmed { .. }) && self.failed.is_none() {
+                    // alloc: an error, once per place that fails
+                    self.failed = Some(format!(
+                        "asking the system to read ahead what it holds of {}: {}",
+                        self.to,
+                        crate::describe(done)
+                    ));
+                }
+                self.join(ask, effects)
             }
             // alloc: an error, once per place that fails
             (Step::Clone, done) => Next::Failed(format!(
@@ -339,9 +393,10 @@ impl Writing {
                 crate::describe(done)
             )),
             (Step::Cut, Done::Truncated) => {
+                self.cut = true;
                 let runs = std::mem::take(&mut self.runs);
                 if runs.is_empty() {
-                    return self.commit(ask, effects);
+                    return self.join(ask, effects);
                 }
                 self.left = runs.len() as u32;
                 let bytes = runs.iter().map(|it| it.1.len() as u64).sum();
@@ -360,16 +415,11 @@ impl Writing {
                 let well = matches!(done, Done::Written)
                     || (cfg!(test) && matches!(done, Done::WrittenBack | Done::Cloned));
                 if !well && self.failed.is_none() {
-                    self.failed = Some(crate::describe(done));
-                }
-                if self.left > 0 {
-                    return Next::Going;
-                }
-                match self.failed.take() {
-                    None => self.commit(ask, effects),
                     // alloc: an error, once per place that fails
-                    Some(why) => Next::Failed(format!("writing its runs into {}: {why}", self.temp)),
+                    self.failed =
+                        Some(format!("writing its runs into {}: {}", self.temp, crate::describe(done)));
                 }
+                self.join(ask, effects)
             }
             (Step::Rename, Done::Renamed) => Next::Done(self.wrote),
             // alloc: an error, once per place that fails
@@ -391,6 +441,23 @@ impl Writing {
                 self.temp,
                 crate::describe(done)
             )),
+        }
+    }
+
+    /// The rename, once the cut is made, every write has ended and the prewarm has (it reads
+    /// what the path's file holds, which the rename would replace); or the first failure of
+    /// them, once all have ended.
+    fn join(&mut self, ask: impl FnMut(Step) -> Tag, effects: &mut Vec<Effect>) -> Next {
+        #[cfg(test)]
+        let warming = self.warming.is_some() && !self.plant_rename_before_warm;
+        #[cfg(not(test))]
+        let warming = self.warming.is_some();
+        if !self.cut || self.left > 0 || warming {
+            return Next::Going;
+        }
+        match self.failed.take() {
+            None => self.commit(ask, effects),
+            Some(why) => Next::Failed(why),
         }
     }
 
@@ -452,9 +519,10 @@ pub(crate) enum Content {
     /// the path ([`Writing`]). `how`: `write runs`.
     Sparse(Sparse),
     /// The path's own file with these runs written over it, cut to the length: a clone of
-    /// it under a staged name, written and renamed onto the path ([`Writing`]). `how`:
-    /// `patch`.
-    Over(Sparse),
+    /// it under a staged name, written and renamed onto the path ([`Writing`]); `started`
+    /// when a program is started from the path, whose clone is then prewarmed
+    /// ([`Writing::warm`]). `how`: `patch`.
+    Over { file: Sparse, started: bool },
     /// `from`'s, `len` bytes that hash to `content`: cloned under a staged name and renamed
     /// onto the path. `of`, the whole file of the store's it is, counted as cloned until the
     /// clone ends. `how`: `clone`.
@@ -471,7 +539,7 @@ impl Content {
         match self {
             Content::Bytes(_) => "write",
             Content::Sparse(_) => "write runs",
-            Content::Over(_) => "patch",
+            Content::Over { .. } => "patch",
             Content::File { .. } => "clone",
             Content::Patch { .. } => "derive",
         }
@@ -494,4 +562,140 @@ pub(crate) struct Patching {
     pub(crate) wrote: u64,
     /// Bytes written into the store that this place is the first to report.
     pub(crate) written: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_core::IoError;
+
+    use super::*;
+
+    /// What a [`Writing`] asked and was told, in order.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Event {
+        Asked(Step),
+        Told(Step),
+    }
+
+    /// The step an effect of a [`Writing`] is.
+    fn step_of(effect: &Effect) -> Step {
+        match effect {
+            Effect::Remove { .. } => Step::Clear,
+            Effect::Clone { .. } => Step::Clone,
+            Effect::Truncate { .. } => Step::Cut,
+            Effect::WriteAt { .. } => Step::Write,
+            Effect::Prewarm { .. } => Step::Warm,
+            Effect::RenameUnsynced { .. } => Step::Rename,
+            other => panic!("no step of a writing: {other:?}"),
+        }
+    }
+
+    /// A patch of two runs driven to its end, the completions of what is in flight at once
+    /// given in the order `warm_first` says (the prewarm before the writes, or after), the
+    /// prewarm answered as done or (`warmed` false) as failed: every event, and how it ended.
+    fn driven(over: bool, warm_first: bool, warmed: bool, plant: bool) -> (Vec<Event>, Result<u64, String>) {
+        let name = |it: &str| FileName::new(it).unwrap();
+        let file = Sparse { len: 64, runs: vec![(0, vec![1; 8]), (32, vec![2; 8])] };
+        let (mut writing, clear) = Writing::begin(name("out/a"), name("out/.a.placing"), file, over, Tag(1));
+        writing.plant_rename_before_warm = plant;
+        let mut events = vec![Event::Asked(step_of(&clear))];
+        let mut flying = vec![Step::Clear];
+        // Bounded: each turn completes one step in flight, and a writing asks a bounded
+        // number of them.
+        for _ in 0..32 {
+            // The next completion: the prewarm first or last of what is in flight, as asked.
+            let at = match flying.iter().position(|it| *it == Step::Warm) {
+                Some(at) if warm_first || flying.len() == 1 => at,
+                Some(at) => (at + 1) % flying.len(),
+                None => 0,
+            };
+            let step = flying.remove(at);
+            let done = match step {
+                Step::Clear => Done::Removed,
+                Step::Clone => Done::Cloned,
+                Step::Cut => Done::Truncated,
+                Step::Write => Done::Written,
+                Step::Warm if warmed => Done::Prewarmed { bytes: 48 },
+                Step::Warm => Done::Failed(IoError("no such file".to_owned())),
+                Step::Rename => Done::Renamed,
+            };
+            events.push(Event::Told(step));
+            let mut effects = Vec::new();
+            match writing.step(step, &done, |_| Tag(2), &mut effects) {
+                Next::Going => {}
+                Next::Done(wrote) => return (events, Ok(wrote)),
+                Next::Failed(why) => return (events, Err(why)),
+            }
+            for effect in &effects {
+                events.push(Event::Asked(step_of(effect)));
+                flying.push(step_of(effect));
+            }
+            assert!(!flying.is_empty(), "nothing in flight and no end: {events:?}");
+        }
+        panic!("a writing that does not end: {events:?}");
+    }
+
+    /// The oracle: why the events break the prewarm's order, if they do. The rename is asked
+    /// before the prewarm was told (the prewarm would then read what the clone itself holds,
+    /// the path naming it by then), or a prewarm is asked of a file that is no clone.
+    fn out_of_order(events: &[Event], over: bool) -> Option<String> {
+        let at = |event: Event| events.iter().position(|it| *it == event);
+        let (asked, told) = (at(Event::Asked(Step::Warm)), at(Event::Told(Step::Warm)));
+        let renamed = at(Event::Asked(Step::Rename));
+        match (over, asked, told, renamed) {
+            (false, Some(_), ..) => Some("a file of holes, which is no clone, was prewarmed".to_owned()),
+            (true, None, ..) => Some("the clone was not prewarmed".to_owned()),
+            (true, Some(_), None, Some(_)) => Some("the rename was asked and the prewarm never told".to_owned()),
+            (true, Some(_), Some(told), Some(renamed)) if renamed < told => {
+                Some(format!("the rename was asked (event {renamed}) before the prewarm was told (event {told})"))
+            }
+            _ => None,
+        }
+    }
+
+    /// The invariant: a patch's rename onto its path is asked only once the prewarm of its
+    /// clone was told, whichever of the prewarm and the writes ends first, since the prewarm
+    /// reads what the system holds of the path's file, which the rename replaces; a file of
+    /// holes asks for no prewarm; and a prewarm that failed fails the place, naming the path,
+    /// once the writes ended, with no rename asked. The control: with the rename asked as the
+    /// writes end (the planted bug), the oracle names the order.
+    #[test]
+    fn the_rename_waits_for_the_prewarm() {
+        for warm_first in [true, false] {
+            let (events, ended) = driven(true, warm_first, true, false);
+            assert_eq!(ended, Ok(16), "{events:?}");
+            assert_eq!(out_of_order(&events, true), None, "{events:?}");
+            assert_eq!(events.last(), Some(&Event::Told(Step::Rename)));
+        }
+        let (events, ended) = driven(false, true, true, false);
+        assert_eq!(ended, Ok(16), "{events:?}");
+        assert_eq!(out_of_order(&events, false), None, "{events:?}");
+        assert!(!events.contains(&Event::Asked(Step::Clone)), "{events:?}");
+        // A patch of a file no program is started from is a clone with no prewarm.
+        let name = |it: &str| FileName::new(it).unwrap();
+        let file = Sparse { len: 8, runs: Vec::new() };
+        let (mut cold, _) = Writing::begin(name("out/a.debug"), name("out/.a.placing"), file, true, Tag(1));
+        cold.warm = false;
+        let mut effects = Vec::new();
+        assert!(matches!(cold.step(Step::Clear, &Done::Removed, |_| Tag(2), &mut effects), Next::Going));
+        assert!(matches!(cold.step(Step::Clone, &Done::Cloned, |_| Tag(2), &mut effects), Next::Going));
+        assert!(matches!(cold.step(Step::Cut, &Done::Truncated, |_| Tag(2), &mut effects), Next::Going));
+        let asked: Vec<Step> = effects.iter().map(step_of).collect();
+        assert_eq!(asked, [Step::Clone, Step::Cut, Step::Rename]);
+
+        for warm_first in [true, false] {
+            let (events, ended) = driven(true, warm_first, false, false);
+            let why = ended.expect_err("a prewarm that failed fails the place");
+            assert!(why.contains("out/a") && why.contains("no such file"), "{why}");
+            assert!(!events.contains(&Event::Asked(Step::Rename)), "{events:?}");
+            let writes = events.iter().filter(|it| **it == Event::Told(Step::Write)).count();
+            assert_eq!(writes, 2, "the place fails once its writes ended: {events:?}");
+        }
+
+        // The planted bug, with the prewarm told last: the rename is asked, and the place
+        // ends, with the prewarm still in flight.
+        let (events, _) = driven(true, false, true, true);
+        let why = out_of_order(&events, true).expect("the oracle missed the rename asked first");
+        assert!(why.contains("the rename was asked and the prewarm never told"), "{why}");
+    }
 }

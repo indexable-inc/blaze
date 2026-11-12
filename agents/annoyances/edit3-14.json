@@ -1,0 +1,11 @@
+{
+ "id": "edit3-14",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+ "where": "blaze: a stale run after an edit (the watch's barrier)",
+ "what": "Once in about 700 edit-then-run commands of this lane's build, the run printed the program of before the edit. The profile of that daemon (pid 63947): the command's request waited 87.8 ms for the watches, then build 275 ran as a walk with 0 misses in 4.5 ms and the old executable was started; the next command's request, 16 ms later, waited 7990.9 ms for the watches and then built both edits (build 277, 1 miss); two more requests waited 712.9 and 1081.2 ms within 20 s. It was the first edit after the daemon had been idle about 50 s, with other lanes' builds and a `zstd -19 -r` running (load average 40). In about 400 edits after it, each held to its number, none was stale, on this lane's build or the base's.",
+ "cost": "one wrong run, found only because this lane's script checks each run's number (edit3-6)",
+ "cause": "not found. This lane changed nothing in the watcher or in `heads.rs`; what it changed that the watch's completions pass through is the kqueue driver's poll (a waker's flag read after the drain), which loses no completion as far as its test and its reading go. My guess, unverified: the flush's cookie was heard before the file's own event under that load; the check is the watcher's log of that turn, which the profile does not hold",
+ "workaround": "none",
+ "state": "open, for the lane that owns `crates/blaze-vfs/src/watch.rs`: a flush told with a change of the same stream still unheard is the failure to look for; the rows are in `/private/tmp/blaze-home-edit3/v2/profile` while that home is kept"
+}

@@ -128,6 +128,9 @@ pub(crate) struct Shared {
     /// The dev executables in the daemon's code memory, by path, which a `run` starts from
     /// and each link patches (docs/v2/plan/design/compile-time.md).
     pub(crate) dev_runs: run::inproc::DevRuns,
+    /// The programs blaze's launcher runs, and the socket their launchers connect to
+    /// (docs/v2/plan/design/launcher.md).
+    pub(crate) launches: run::launch::Launches,
 }
 
 impl Real {
@@ -149,6 +152,7 @@ impl Real {
             }),
             selectors: test::image::Selectors::default(),
             dev_runs: run::inproc::DevRuns::new(paths.state.join("inproc")),
+            launches: run::launch::Launches::new(paths.state.join("launch")),
         };
         let native = blaze_manifest::user_config::home().map(|it| it.join(crate::serve::native::NATIVE));
         Ok(Real {

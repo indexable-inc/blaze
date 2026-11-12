@@ -224,6 +224,14 @@
    "why": "Andrew, 2026-11-11: the comparison in the film should be \"to the existing system\" and \"data driven\"; \"more comparisons\".",
    "recommended": "Yes, as a second narrow exception beside D6.",
    "state": "in force; first numbers measured on hello-world"
+  },
+  {
+   "id": "D29",
+   "date": "2026-11-12",
+   "decision": "The daemon stays, as a bounded cache over content-keyed store records read through the store's pool (crates/blaze-cas/src/pool): warm in memory are the workspace's memos and the pool pages read since the sweep last came by, a sealed dependency is its interface records and the code the program reaches, and the idle footprint is held to a budget that grows with the workspace, not with its dependencies. The allocator's kept memory is fixed apart from that. Not a process a run, as Relax is.",
+   "why": "Andrew, 2026-11-12, as the main agent relayed it to lane memstrat-1111: \"ok do everything SOTA\", agreeing the daemon stays. The head-to-head (docs/v2/plan/design/restore.md, \"Memory: a bounded cache over records\"): Relax runs an edit in 87 to 212 MB with no process between runs, but its no-op is 52 ms where the daemon's is 12, it is incremental a crate, and its memory grows with the project.",
+   "recommended": "Yes.",
+   "state": "steps a and c built on memstrat-1111; b and d not built"
   }
  ]
 }

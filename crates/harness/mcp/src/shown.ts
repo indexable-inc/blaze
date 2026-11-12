@@ -1,6 +1,7 @@
 // A value as the app shows it: the typed shape the chat's tool card draws (a table as a grid, a record as key/value
 // rows, text as text), next to the NUON text the model reads, which stays as it is. Bounded: at most MAX_ROWS rows,
 // MAX_CELL chars a cell and about `budget` bytes in all; `total` always says how many rows there were.
+import { clip } from "./disclose.ts";
 import { nuon } from "./nuon.ts";
 
 /** One cell: a scalar, or a nested value written as NUON (its column then says `nested`). */
@@ -33,7 +34,6 @@ const MAX_CELL = 400;
 
 const isRecord = (v: unknown): v is Record<string, unknown> =>
   typeof v === "object" && v !== null && !Array.isArray(v) && !(v instanceof Date) && !(v instanceof Map) && !(v instanceof Set) && !(v instanceof Error) && !ArrayBuffer.isView(v);
-const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 
 function cell(v: unknown): [Cell, ColType] {
   if (v === null || v === undefined) return [null, "null"];

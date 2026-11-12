@@ -24,6 +24,7 @@ use super::{
 use crate::serve::work::{RunPuts, Runs};
 
 pub(crate) mod inproc;
+pub(crate) mod launch;
 #[cfg(test)]
 mod tests;
 
@@ -82,6 +83,8 @@ pub(crate) fn launch_of(
     match allows_live(profile, policy) {
         Ok(()) => match (policy.mode, not_in_process) {
             (BuildMode::Live, _) => Ok(Launch::InProcess),
+            // A launcher's program starts as a file: the file is the launcher.
+            (BuildMode::Launched, _) => Ok(Launch::File),
             (_, Some(why)) => Err(format!(
                 "`{target}` runs under profile `{profile}`, so on the daemon's code memory, and can't: {why}. \
                  {NOT_IN_PROCESS}"

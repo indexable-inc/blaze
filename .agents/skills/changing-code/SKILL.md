@@ -72,7 +72,21 @@ instruction that says what to do instead, or a change to the interface so the mi
 expressed. The fix is not done until the guard exists and has been run over the whole tree. Do it
 proactively: you do not wait to be asked, and you say in your report what the cause was and what now
 guards it. A guard that only describes the one instance you found is not one; state the general rule
-it enforces.
+it enforces. Do it for small things as much as large: a command that needed a flag you forgot, a
+test that passed while running nothing, a number that had to be retracted, a file that two lanes
+both edited. The method is five whys, written down: why did it happen; why was that possible; why
+did nothing catch it; why was the easy path the wrong one; why does the system have that shape. Stop
+when the answer is a property of the design rather than an event (`the test filter matched nothing`
+is an event; `a run that executes zero checks reports success` is a property). Then name the class
+(every instance that property allows, not the one you met), and choose the strongest prevention you
+can build, in this order: make it unrepresentable (a type, an interface, a single home, a key that
+covers the input, a tool whose only mode is the right one); make it impossible to miss (the wrong
+thing fails loudly, at once, naming itself); catch it mechanically (a lint with a fix, a gate check,
+a simulation invariant); and only last, tell people (a rule, a skill line, a how-to row). Then solve
+it: build the prevention in the same change or the next, run it over the whole tree, and land it; do
+not stop at the write-up. Record the chain in the annoyance's row under `agents/annoyances/`
+(`whys`, `class`, `prevention`), so the next agent sees the class, not the anecdote. When several
+rows share a class, that class is the work: one architectural change, not one patch per row.
 
 See [docs/contributing.md#what-a-change-needs](../../../docs/contributing.md#what-a-change-needs).
 
@@ -122,22 +136,28 @@ comparison is won, or when what still blocks that is written down with its evide
 
 ## agents-json (rule 63)
 
-`agents.json` has two lists. `howto` is the right way to do a recurring task here (build blaze, time
-it, replace a running binary, run a lane, run the tests): `id`, `date`, `who`, `task`, `do` (the
-exact command or a short recipe), `why`, `state` (current, or superseded by another row). Before a
-task, look for its row and follow it; when you find a better way, or learn one the hard way, add or
-supersede the row in the change you are making. `annoyances` is whatever slowed, surprised or
-annoyed you, however slightly (a tool's quirk, a trap in the tree, a missing command, your own
-repeated mistake): `id`, `date`, `who` (the model id and name and whether you are the main agent or
-a lane, or the person's name), `where` (the tool or the part of blaze), `what` happened in one or
-two sentences with the exact command or message, `cost` (time, a wrong claim, lost work, context),
-`cause` if known, `workaround`, `fix` (what would remove the cause, if you can say), and `state`
-(open, accepted, or fixed with the commit). Add the row at the moment it happens, without waiting to
-be asked and without judging whether it is important: a `sed -i` that behaves differently on this
-machine counts, so does a command that printed a thousand lines. Do not tidy an annoyance into a
-lesson; say what happened. A lane adds its rows on its own branch and names them in its report. What
-must always hold is a rule (tools/agents/rules.ts), not a row; a how-to that keeps being broken, or
-an annoyance that recurs, becomes a rule or a guard (`guard-the-cause`, `unease-is-work`). Rows are
-never deleted: set their state.
+`agents/howto/<name>.json` is the right way to do a recurring task here (build blaze, time it,
+replace a running binary, where work runs): `id`, `date`, `who`, `task`, `do` (the exact command or
+a short recipe), `why`, `state` (current, or superseded by another row). They are few: read all of
+them before starting (`python3 -I harness/v2/agents.py '{"howto": true}'`) and do the task their
+way; when you find a better way, add a row under a new name and set the old one's state.
+`agents/annoyances/<lane>-<n>.json` is whatever slowed, surprised or annoyed you, however slightly
+(a tool's quirk, a trap in the tree, a missing command, your own repeated mistake): `id`, `date`,
+`who` (the model id and name and whether you are the main agent or a lane, or the person's name),
+`where` (the tool or the part of blaze), `what` happened in one or two sentences with the exact
+command or message, `cost`, `cause` if known, `whys` (the chain down to a property of the design:
+`guard-the-cause`), `class` (the whole kind of problem that property allows), `prevention` (the
+architectural change that makes the class impossible, and its state), `workaround`, `fix`, and
+`state` (open, accepted, or fixed with the commit). There are hundreds, so never read them all:
+before working in an area, search it (`'{"find": "watcher flush"}'` prints one line per row;
+`"full": true` or `'{"show": "<id>"}'` the whole row; `'{"classes": true}'` the open classes). Add a
+row the moment it happens, without waiting to be asked and without judging whether it is important:
+`'{"add": {"kind": "annoyance", "lane": "<your lane>", "row": {...}}}'` picks the next free number
+and prints the id. A row's id is its file name, so two lanes never take one id and adding a row
+never conflicts with anyone's; a row is never overwritten or deleted: set its state. Do not tidy an
+annoyance into a lesson; say what happened. What must always hold is a rule (tools/agents/rules.ts),
+not a row; a how-to that keeps being broken, or a class with several rows, becomes a rule or an
+architectural change (`guard-the-cause`, `unease-is-work`). `'{"check": true}'` holds the files to
+their fields.
 
 <!-- End of the generated rules. Hand-written notes follow. -->

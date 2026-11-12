@@ -1036,6 +1036,10 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             fs::sync_dir(path)?;
             Ok(Done::Synced)
         }),
+        Effect::Barrier { file, .. } => at(root, &file, |path| {
+            fs::barrier(path)?;
+            Ok(Done::Ordered)
+        }),
         // Waited for on this thread; the asker waits for nothing, and nothing is durable.
         Effect::WriteBack { file, .. } => at(root, &file, |path| {
             fs::write_back(path)?;
@@ -1085,6 +1089,10 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         Effect::Clone { from, to, .. } => at(root, &from, |from| {
             at(root, &to, |to| fs::clone(from, to))?;
             Ok(Done::Cloned)
+        }),
+        Effect::Prewarm { like, file, .. } => at(root, &like, |like| {
+            let bytes = at(root, &file, |file| fs::prewarm(like, file, crate::PREWARM_MOST))?;
+            Ok(Done::Prewarmed { bytes })
         }),
         Effect::Link { from, to, .. } => at(root, &from, |from| {
             at(root, &to, |to| fs::link(from, to))?;

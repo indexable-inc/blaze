@@ -1,0 +1,12 @@
+{
+ "id": "disk2-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+ "where": "crates/blaze-sys/src/macos.rs:87, crates/blaze-core/src/fs.rs",
+ "what": "The brief said the tree used `F_BARRIERFSYNC` for `Durable::Started` and the journal's barrier. No code called it: the only mention was the description string of `fcntl` in blaze-sys's symbol table. Every `Effect::Sync` on macOS was `F_FULLFSYNC` and `Effect::WriteBack` plain `fsync`.",
+ "cost": "a survey before the design; the brief's fact had to be dropped",
+ "cause": "a description of intent read as a description of code",
+ "workaround": "read every call site",
+ "fix": "`Effect::Barrier` is the call now (blaze-core); the store's commit uses it",
+ "state": "fixed on disk2-1111 for the store's commit; open for the profile history, the image, the linker and blaze-gc's direct syncs"
+}

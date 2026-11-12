@@ -868,7 +868,11 @@ pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Pol
     };
     // A dev executable runs on the daemon's code memory and takes edits while it runs: its
     // members' functions are reached through slots ([`super::run::inproc::runs_in_process`]).
-    if super::run::inproc::runs_in_process(job, unit, &policy)? {
+    // A launcher's program is not linked at all: every function is reached through its
+    // slot word, in the launcher's process ([`super::run::launch::launched`]).
+    if super::run::launch::launched(job, unit, &policy)? {
+        policy.mode = BuildMode::Launched;
+    } else if super::run::inproc::runs_in_process(job, unit, &policy)? {
         policy.mode = BuildMode::Live;
     }
     Ok(policy)
@@ -2076,6 +2080,9 @@ fn link_at(
 ) -> Result<LinkMade, LinkCause> {
     let u = job.unit(unit).map_err(|it| it.what)?;
     let built = generated.built;
+    if generated.policy.mode == BuildMode::Launched {
+        return launched(job, unit, path, generated).map_err(LinkCause::Given);
+    }
     let debug = match generated.policy.profile.debuginfo {
         DebugInfo::None => blaze_link::Debug::None,
         _ => blaze_link::Debug::Lines,
@@ -2364,6 +2371,64 @@ fn link_at(
         tiers,
         restart,
         whole: whole.map(|it| it.1),
+    })
+}
+
+/// A launcher program's link ([`super::run::launch::link`]): the file at `path` is blaze's
+/// launcher, a sidecar beside it (and beside the copy a run starts it from) names the program,
+/// and the launchers running the program were told of this build. Nothing is laid out, so
+/// there is no image to keep, no patch room and no debug side file.
+fn launched(
+    job: &Job,
+    unit: usize,
+    path: &str,
+    generated: &Generated<'_>,
+) -> Result<LinkMade, String> {
+    use blaze_launch_host::Told;
+    let linked = super::run::launch::link(job, path, generated)?;
+    let whole = |bytes: &[u8]| blaze_cas::Sparse {
+        len: bytes.len() as u64,
+        runs: vec![(0, bytes.to_vec())], // alloc: the file's one run, once a link
+    };
+    let plan = job.plan(unit).map_err(|it| it.what)?;
+    let sidecar = Arc::new(Made::Whole(whole(&linked.sidecar)));
+    let key = blaze_cas::Key(ContentId::of("blaze v2 serve launch sidecar", &linked.sidecar));
+    // The file and its sidecar are the same bytes at every build of the program: placed by
+    // its first, and left as they are by every later one, so a running launcher's file is
+    // never replaced under it and a build that changed a body writes no file at all.
+    // alloc: the sidecar's paths, once a program
+    let side = match linked.first {
+        true => std::iter::once(path)
+            .chain(super::artifact::uplifted(path, plan))
+            .map(|it| SideFile {
+                path: super::run::launch::sidecar_of(it),
+                key,
+                file: Arc::clone(&sidecar),
+            })
+            .collect(),
+        false => Vec::new(), // alloc: none, empty
+    };
+    let restart = linked.told.iter().find_map(|it| match it {
+        Told::Restart { why } => Some(why.clone()), // clone: the reason, into the build's answer
+        Told::Nothing | Told::Edit { .. } => None,
+    });
+    let edited = linked.told.iter().any(|it| matches!(it, Told::Edit { .. }));
+    let how = match (linked.first, edited || restart.is_some()) {
+        (true, _) => Linking::First,
+        (false, true) => Linking::Spliced,
+        (false, false) => Linking::Unchanged,
+    };
+    let tiers = tiers(job, unit, generated.built, generated.policy.toolchain.arch)?;
+    Ok(LinkMade {
+        made: linked.first.then(|| Made::Whole(whole(&linked.file))),
+        written: Written::Bytes(linked.file),
+        side,
+        read: Vec::new(), // alloc: none, empty
+        table: None,
+        how,
+        tiers,
+        restart,
+        whole: None,
     })
 }
 

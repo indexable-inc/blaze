@@ -170,7 +170,9 @@ impl World {
     /// What the store asks the driver for now, held to the rule while only made places were
     /// asked since it opened: no clone but of a path's own file to a name beside it (a
     /// patch's), no write-back but of a path's own file (asked as its place ends, waited for
-    /// by nothing), and no write or rename that waits for a sync.
+    /// by nothing), no prewarm but of a clone beside a path from that path's own file (a
+    /// patch's: what reads no file of the store's and writes nothing), and no write or rename
+    /// that waits for a sync.
     fn asks(&self) -> Result<(), String> {
         if self.cold {
             return Ok(());
@@ -180,6 +182,8 @@ impl World {
             let what = match effect {
                 Effect::Clone { from, to, .. } if own(from) && !to.is_under(&name("store")) => continue,
                 Effect::WriteBack { file, .. } if own(file) => continue,
+                Effect::Prewarm { like, file, .. } if own(like) && !file.is_under(&name("store")) => continue,
+                Effect::Prewarm { .. } => "a prewarm from a file that is no path's own",
                 Effect::Clone { .. } => "a clone",
                 Effect::WriteBack { .. } => "a write-back",
                 Effect::Sync { .. } => "a sync",
@@ -434,7 +438,10 @@ impl World {
                 let Some(base) = self.holds[n].clone() else { return Ok(()) };
                 let mut rng = Rng::new(seed);
                 let len = (base.len() as u64 + u64::from(grow)).saturating_sub(100).max(1);
-                let count = rng.below(4);
+                // No more runs than bytes: each run has a byte of room of its own, so no two
+                // begin at one offset (a file of 1 byte drew two runs at 0, which is no file,
+                // and the case failed in the place's own check before it tested anything).
+                let count = rng.below(4).min(len);
                 let room = len / count.max(1);
                 let runs: Vec<(u64, Vec<u8>)> = (0..count)
                     .map(|k| {
@@ -457,7 +464,7 @@ impl World {
                     store.unplace_made(&before, &mut self.effects);
                 }
                 self.allowed += self.dirty[n];
-                let tag = store.place_patched(path(n), file, &mut self.effects);
+                let tag = store.place_patched(path(n), file, n % 2 == 0, &mut self.effects);
                 let value = self.values.len();
                 self.values.push(Value { bytes, key: None });
                 let reports = Some((wrote, len.saturating_sub(wrote)));
@@ -719,7 +726,7 @@ fn a_patched_outputs_place_writes_its_patch_whatever_the_files_length() {
             }
             for to in &paths {
                 // clone: each path's writes own their runs.
-                store.place_patched(to.clone(), patch.clone(), &mut effects);
+                store.place_patched(to.clone(), patch.clone(), true, &mut effects);
             }
             drive(&mut sim, &mut store, &mut effects);
             let placed = store.placed();
@@ -774,7 +781,7 @@ fn a_patch_of_a_path_with_no_file_fails_naming_it() {
     let mut store = open(&mut sim, "store");
     let mut effects = Vec::new();
     let patch = Sparse { len: 100, runs: vec![(10, vec![1; 20])] };
-    store.place_patched(name("one/build/app"), patch, &mut effects);
+    store.place_patched(name("one/build/app"), patch, true, &mut effects);
     drive(&mut sim, &mut store, &mut effects);
     let placed = store.placed();
     let why = placed[0].result.clone().unwrap_err();

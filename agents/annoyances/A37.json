@@ -1,0 +1,12 @@
+{
+ "id": "A37",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "~/.cargo/bin/blaze",
+ "what": "The installed `blaze` was a version launcher (771 KB) that ran ~/.blaze/versions/<pin>/blaze; `blaze --version` of it printed the launcher's release (0.20261028.7) while the daemon running was 0.20261105.4, so I reported the wrong installed version, and the old launcher's `blaze stop` said `daemon: not running` while that daemon held the socket.",
+ "cost": "a wrong statement to the owner; ten minutes",
+ "cause": "two binaries with one name and different versions; `stop` looked at a different daemon than the one on the socket",
+ "workaround": "stopped it with its own binary",
+ "fix": "`--version` prints both the launcher and the version it runs; `stop` names the daemon on the socket whatever built it",
+ "state": "open"
+}

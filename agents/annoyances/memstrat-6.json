@@ -1,0 +1,11 @@
+{
+ "id": "memstrat-6",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+ "where": "my own method: held samples",
+ "what": "I read `held_samples` at its latest read time as the idle daemon's heap and wrote in a commit message that an idle daemon held 144 MiB of span blocks. The latest read was not an idle moment; `blaze debug inspect` before and after the change showed the profile holder 64 to 76 MiB before and 58 after, and `outside` unchanged at 135.",
+ "cost": "a wrong number in a commit message (the commit was dropped with its change)",
+ "cause": "a table's rows taken for a moment they were not sampled at",
+ "workaround": "compare `blaze debug inspect`'s heap by holder before and after",
+ "state": "open: held_samples could say what each read was taken for (a build's end, idle, asked)"
+}

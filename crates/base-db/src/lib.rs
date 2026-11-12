@@ -786,6 +786,132 @@ pub fn source_root_crates(db: &Db, id: SourceRootId) -> &[Crate] {
     source_root_crates(db, db.source_root(id))
 }
 
+/// The domain of [`crate_root_content`] for a crate whose source root holds another crate's
+/// `OUT_DIR`.
+pub const OWN_ROOT_DOMAIN: &str = "blaze v2 source root content without other crates' OUT_DIRs 1";
+
+/// The `OUT_DIR`s of the other crates of `krate`'s source root, sorted, each without a
+/// trailing separator: the directories of that root whose files `krate` is not made from.
+///
+/// A build script's run is applied by putting the files it left in `OUT_DIR` into its
+/// package's source root (`blaze_lower::Lowered::ran`), where the crates given that `OUT_DIR`
+/// (the package's library and binaries) `include!` them. The build script's own crate
+/// (`build.rs`) is of the same source root and is given no `OUT_DIR`: those files are what
+/// its run makes, never what it is made from. Decided by the crates' env, which the plan
+/// sets before any run, so it is the same before a run is applied and after.
+#[blaze_query::tracked(returns(deref))]
+pub fn other_out_dirs(db: &Db, krate: Crate) -> Box<[String]> {
+    let out = |krate: Crate| -> Option<String> {
+        let dir = krate.env(db).get("OUT_DIR")?;
+        let dir = dir.trim_end_matches(['/', '\\']);
+        (!dir.is_empty()).then(|| dir.to_owned()) // alloc: the memo's value, a directory a crate of the root
+    };
+    let own = out(krate);
+    let root = db.file_source_root(krate.data(db).root_file_id).source_root_id(db);
+    // alloc: the memo's value, once per crate
+    let mut dirs: Vec<String> = source_root_crates(db, root)
+        .iter()
+        .filter_map(|&other| out(other))
+        .filter(|dir| Some(dir) != own.as_ref())
+        .collect();
+    dirs.sort_unstable();
+    dirs.dedup();
+    dirs.into_boxed_slice()
+}
+
+/// Whether `path` is a file below one of `dirs` ([`other_out_dirs`]).
+pub fn below_any(path: &str, dirs: &[String]) -> bool {
+    dirs.iter().any(|dir| {
+        path.strip_prefix(dir.as_str()).is_some_and(|rest| rest.starts_with(['/', '\\']))
+    })
+}
+
+/// The content of `krate`'s source root as `krate` is made from it: what a key or an identity
+/// of the crate holds for "every file of its source root".
+///
+/// The invariant: it does not change when a build script's run is applied for a crate the
+/// run's `OUT_DIR` was not given to.
+///
+/// The root's own content ID ([`SourceRootInput::content`]) for a crate whose root holds no
+/// other crate's `OUT_DIR` (every crate but a build script's, and those of a package whose
+/// script is not run for them). For a crate whose root does ([`other_out_dirs`]): each
+/// other file's path and content, sorted by path. Until 2026-11-11 every key took the
+/// root's content whole, so a library package's build script was keyed by the files its own
+/// run left: its unit identity and its image key moved once it had run, and the first build
+/// after a cold one compiled each such script again, asked the store for its image and its
+/// dependencies', and so read the standard library from images it had resolved a build
+/// before (docs/v2/plan/design/first-edit.md).
+///
+/// Why leaving them out covers every input (rule 21). A crate reads a file of its source
+/// root by a path its source or its env gives it. `OUT_DIR` is a directory of the build
+/// directory named by a hash of the build's own plan; the crate's env does not hold it
+/// (that is what [`other_out_dirs`] selects by) and its source cannot name it before the
+/// plan that hashes that source exists.
+#[blaze_query::tracked(returns(copy))]
+pub fn crate_root_content(db: &Db, krate: Crate) -> ContentId {
+    let root = db.source_root(db.file_source_root(krate.data(db).root_file_id).source_root_id(db));
+    let others = other_out_dirs(db, krate);
+    if others.is_empty() {
+        return root.content(db);
+    }
+    let set = root.source_root_ref(db);
+    blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
+        let mut files = Vec::new_in(frame);
+        for file in set.iter() {
+            // A file with no path on disk is under no directory.
+            let path = set.path_for_file(&file);
+            if path.and_then(|it| it.as_path()).is_some_and(|it| below_any(it.as_str(), others)) {
+                continue;
+            }
+            // alloc: a path's text, once per file of a build script's package per write of it
+            files.push((path.map(|it| it.to_string()).unwrap_or_default(), db.file_content(file)));
+        }
+        files.sort_unstable();
+        let mut hasher = Hasher::new(OWN_ROOT_DOMAIN);
+        hasher.update(&[u8::from(set.is_library)]).update(&(files.len() as u64).to_le_bytes());
+        for (path, content) in &files {
+            hasher.part(path.as_bytes()).id(content);
+        }
+        hasher.finish()
+    })
+}
+
+/// The domain of [`crate_root_ported`].
+const PORTED_ROOT_DOMAIN: &str = "blaze v2 crate ported files 1";
+
+/// [`crate_root_content`] for a key that must not say where the checkout is: the same files
+/// (every file of `krate`'s source root but those under another crate's `OUT_DIR`,
+/// [`other_out_dirs`], the one selection both make), each as its path written by
+/// [`Files::ported`] and its content ID, sorted by that path. A file with no path on disk is
+/// under no directory and has the empty path, as there.
+///
+/// The invariants: [`crate_root_content`]'s (a run applied for another crate leaves it), and
+/// the same files in another checkout, whose paths differ only in where the build's
+/// directories are, give the same ID.
+#[blaze_query::tracked(returns(copy))]
+pub fn crate_root_ported(db: &Db, krate: Crate) -> ContentId {
+    let root = db.source_root(db.file_source_root(krate.data(db).root_file_id).source_root_id(db));
+    let others = other_out_dirs(db, krate);
+    let set = root.source_root_ref(db);
+    // alloc: once per crate whose source root's files moved, a file each
+    let mut files: Vec<(Vec<u8>, ContentId)> = Vec::new();
+    for file in set.iter() {
+        let path = set.path_for_file(&file);
+        if path.and_then(|it| it.as_path()).is_some_and(|it| below_any(it.as_str(), others)) {
+            continue;
+        }
+        let path = path.map(|it| it.to_string()).unwrap_or_default(); // alloc: as above
+        files.push((db.files().ported(path.as_bytes()).into_owned(), db.file_content(file)));
+    }
+    files.sort_unstable();
+    let mut hasher = Hasher::new(PORTED_ROOT_DOMAIN);
+    hasher.update(&[u8::from(set.is_library)]).update(&(files.len() as u64).to_le_bytes());
+    for (path, content) in &files {
+        hasher.part(path).id(content);
+    }
+    hasher.finish()
+}
+
 pub fn relevant_crates(db: &Db, file_id: FileId) -> &[Crate] {
     source_root_crates(db, db.file_source_root(file_id).source_root_id(db))
 }

@@ -6835,6 +6835,8 @@ impl<S: Steps> Jobs<S> {
             self.placing_failed(id, path, error);
             return;
         };
+        // An executable is started from its path: a clone placed there is prewarmed.
+        w.store.starts(&file, executable);
         match w.store.place(&key, file, w.effects) {
             Some(tag) => {
                 self.placing.insert(tag, Placing { job: id, path, key, executable });
@@ -6936,8 +6938,10 @@ impl<S: Steps> Jobs<S> {
         let tag = match (made, over) {
             // clone: the patch's runs, which the path's writes own (an effect owns its
             // bytes); once per path, the edit's bytes
+            // An executable is started from its path: its clone is prewarmed. A debug file
+            // is not.
             (Made::Patch { file: patch, .. }, true) => {
-                w.store.place_patched(file, patch.clone(), w.effects)
+                w.store.place_patched(file, patch.clone(), executable, w.effects)
             }
             (Made::Patch { whole, .. }, false) => {
                 let span = tracing::info_span!(

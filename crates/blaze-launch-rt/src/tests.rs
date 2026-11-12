@@ -67,7 +67,7 @@ struct Table {
 
 impl Table {
     /// Adds `code` as a record, and gives the bind of `slot` to it.
-    fn bind(&mut self, slot: u32, code: Vec<u8>, align: u32) -> wire::Bind {
+    fn bind(&mut self, slot: u32, code: Vec<u8>, align: u32) -> wire::Bind<'static> {
         let id = [self.code.len() as u8 + 1; 32];
         let len = code.len() as u64;
         self.code.insert(id, code);
@@ -78,18 +78,36 @@ impl Table {
             tier: Tier::Zero,
             len,
             align,
+            refs: List::of(&[]),
         }
     }
 }
 
 impl Records for Table {
-    fn open(&mut self, _store: &str, _statics: u64) -> Result<(), String> {
+    fn record(&mut self, id: RecordId, bytes: &[u8]) -> Result<(), String> {
+        self.code.insert(id.0, bytes.to_vec());
         Ok(())
+    }
+
+    fn statics(&mut self, _defs: &[wire::StaticDef<'_>], _place: Place) -> Result<(), String> {
+        Err("a table of code has no statics".to_owned())
+    }
+
+    fn placed(&mut self, _at: u64, _len: u64) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn forget(&mut self, _at: u64) {}
+
+    fn release(&mut self) {}
+
+    fn static_at(&self, _number: u32) -> Option<usize> {
+        None
     }
 
     fn code(
         &mut self,
-        bind: &wire::Bind,
+        bind: &wire::Bind<'_>,
         _place: Place,
         into: &mut Vec<u8>,
     ) -> Result<(), String> {
@@ -245,7 +263,7 @@ fn two_bodies_run_through_their_slots_and_one_is_replaced_under_a_caller_then_fr
     // body stays.
     until("the caller's rounds on the new body", || caller.past_new(3));
     me.safepoint();
-    assert_eq!(driver.settle(), Ok(0), "freed with a thread that has not reported");
+    assert_eq!(driver.settle(&mut records), Ok(0), "freed with a thread that has not reported");
     assert_eq!(driver.waiting(), 1);
 
     // The silent thread ends: now every thread alive at the unlink has cleared it.
@@ -253,7 +271,7 @@ fn two_bodies_run_through_their_slots_and_one_is_replaced_under_a_caller_then_fr
     let mut freed = 0;
     until("the replaced body's batch to be freed", || {
         me.safepoint();
-        freed += driver.settle().expect("settled");
+        freed += driver.settle(&mut records).expect("settled");
         driver.waiting() == 0
     });
     assert_eq!(freed, 1);
@@ -299,7 +317,7 @@ fn an_edit_of_two_functions_switches_them_together_under_a_caller() {
     let mut freed = 0;
     until("both batches to be freed", || {
         me.safepoint();
-        freed += driver.settle().expect("settled");
+        freed += driver.settle(&mut records).expect("settled");
         driver.waiting() == 0
     });
     assert_eq!(freed, 2);
@@ -363,7 +381,7 @@ fn a_page_whose_bodies_are_all_freed_is_given_back() {
     let third = [records.bind(0, returns(8), 16)];
     driver.edit(Txn(3), &third, false, &mut records).expect("replaced");
     assert_eq!(driver.decommitted(), 0);
-    assert_eq!(driver.settle(), Ok(1));
+    assert_eq!(driver.settle(&mut records), Ok(1));
     assert_eq!(driver.decommitted(), page as u64);
     assert_eq!((call(&shared, 0), call(&shared, 1)), (8, 6));
 }
@@ -429,9 +447,12 @@ fn a_stub_asks_the_daemon_and_its_caller_resumes_in_the_code_it_sent() {
 
     let driver = driver(8);
     let shared = driver.shared();
+    let (ready, entry) = crossbeam_channel::bounded(1);
     let control = std::thread::spawn(move || {
         let mut records = records;
-        crate::run(driver, ours, ProgramId([7; 32]), &mut records)
+        let stay = |why: &str| format!("a test's launcher does not restart: {why}");
+        let served = crate::run(driver, ours, ProgramId([7; 32]), &mut records, ready, stay);
+        (served, records)
     });
 
     let item = next_frame(&mut daemon);
@@ -443,10 +464,14 @@ fn a_stub_asks_the_daemon_and_its_caller_resumes_in_the_code_it_sent() {
         "{hello:?}"
     );
     assert_eq!(id, 1);
-    tell(&mut daemon, 1, &Tell::Welcome { slots: 2, store: "", statics: 0 });
+    tell(&mut daemon, 1, &Tell::Welcome { slots: 2 });
+    tell(&mut daemon, 2, &Tell::Start { entry: Slot(1), inits: List::of(&[]) });
     // Nothing calls a slot before it is declared: the program's first call comes after the
-    // launcher took the daemon's welcome.
-    until("the launcher to declare slot 0", || shared.target(Slot(0)) != Some(0));
+    // launcher took the daemon's welcome and its word to start, which is when its main
+    // thread is given the address of the entry, the entry slot's thunk.
+    let start = crate::Start { entry: shared.thunk(Slot(1)).expect("a slot"), inits: Vec::new() };
+    assert_eq!(entry.recv_timeout(PATIENCE), Ok(Ok(start)));
+    assert_ne!(shared.target(Slot(0)), Some(0));
 
     // A thread calls slot 0, which has no code: its stub fires and the thread waits.
     let (results, result) = crossbeam_channel::bounded::<u32>(2);
@@ -492,9 +517,9 @@ fn a_stub_asks_the_daemon_and_its_caller_resumes_in_the_code_it_sent() {
     // Stopped, the control thread gives the driver back; the caller has ended, so the body
     // the second edit replaced is free.
     shared.stop();
-    let (mut driver, served) = control.join().expect("the control thread ended");
+    let ((mut driver, served), mut records) = control.join().expect("the control thread ended");
     assert_eq!(served, Ok(()));
-    driver.settle().expect("settled");
+    driver.settle(&mut records).expect("settled");
     assert_eq!(driver.waiting(), 0);
     assert_eq!(call(&shared, 0), 2);
 }

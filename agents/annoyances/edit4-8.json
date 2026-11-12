@@ -1,0 +1,11 @@
+{
+ "id": "edit4-8",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+ "where": "copying blaze's pinned LLVM between two ix VMs",
+ "what": "The third lane to meet it (records-6, edit2-3): 346 MB through the Mac took about 25 minutes, and a foreground wait is moved to the background after three.",
+ "cost": "25 minutes before the first build",
+ "cause": "as edit2-3",
+ "workaround": "started rustup and the clone beside it",
+ "state": "open, as edit2-3"
+}

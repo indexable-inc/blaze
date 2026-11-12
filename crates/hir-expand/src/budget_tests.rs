@@ -213,7 +213,7 @@ fn a_lone_group_expansion_ends_in_no_semicolon() {
         lone.view().token_trees(),
     );
     blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
-        assert!(crate::without_last_semicolon(frame, lone.view()).is_none(), "ends in `}`");
+        assert!(crate::without_last_semicolon(frame, lone.view()).is_none(), "ends in `}}`");
         assert!(crate::without_last_semicolon(frame, bare.view()).is_some(), "ends in `;`");
     });
 }

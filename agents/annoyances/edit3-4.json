@@ -1,0 +1,11 @@
+{
+ "id": "edit3-4",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+ "where": "macOS: the watch's flush (FSEvents cookie)",
+ "what": "`the request waits for the watches to hear every change made before it` is 0.7 to 12 ms on an idle machine (223 requests: min 0.7, p25 2.3, median 6.2, p75 11.5), whatever the edit: the cookie file's event comes back through fseventsd that late. The loop is idle in `kevent` the whole time.",
+ "cost": "6 ms median, 12 ms at worst, of every request that reads a checkout, no-ops included",
+ "cause": "my guess, unverified: the kernel hands fseventsd its events in batches up to 10 ms apart (the wait looks uniform between 1 and 12 ms); the check is the distribution of the wait against the time since the last event",
+ "workaround": "none",
+ "state": "open: start the job on the view as it is while the flush is in flight, hold its replies until the flush is told, and run it again if the head moved meanwhile; the wait is then beside the build, not before it. Not built in this lane (the job's cancel and a second run under one request need care in `job.rs`)"
+}

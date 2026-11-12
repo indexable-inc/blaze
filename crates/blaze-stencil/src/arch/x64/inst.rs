@@ -206,7 +206,14 @@ pub fn inst(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
             };
             let ext = &func.dfg.ext_funcs[func_ref];
             let name = cx.name(&ext.name).map_err(blame(inst))?;
-            load_ext_name(cx, RAX, name, 0, ext.colocated).map_err(blame(inst))?;
+            if cx.target.slots && ext.colocated {
+                // The function's entry thunk, which the launcher keeps within reach of every
+                // body: never the GOT, which under `Target::slots` holds its slot word.
+                let field = asm::rip(cx.buf, None, true, &[0x8d], RAX);
+                cx.buf.reloc(field, Reloc::X86PCRel4, name, -4);
+            } else {
+                load_ext_name(cx, RAX, name, 0, ext.colocated).map_err(blame(inst))?;
+            }
             asm::store(cx.buf, slot(dst), RAX);
             Ok(())
         }
@@ -425,7 +432,13 @@ fn call(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
         Callee::Direct(func_ref) => {
             let ext = &func.dfg.ext_funcs[func_ref];
             let name = cx.name(&ext.name).map_err(blame(inst))?;
-            if ext.colocated {
+            if cx.target.slots && cx.target.pic {
+                // `call qword ptr [rip + word]`: the callee's slot word is its GOT entry, and
+                // the load and the call are one instruction, so no register ever holds a
+                // body's address (docs/v2/plan/design/launcher.md, "Step 3").
+                let field = asm::rip(cx.buf, None, false, &[0xff], 2);
+                cx.buf.reloc(field, Reloc::X86GOTPCRel4, name, -4);
+            } else if ext.colocated && !cx.target.slots {
                 let field = asm::call_rel32(cx.buf);
                 cx.buf.reloc(field, Reloc::X86CallPCRel4, name, -4);
             } else {
@@ -462,6 +475,16 @@ fn call(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
         Ok(())
     })
     .map_err(blame(inst))
+}
+
+/// How a return call leaves.
+enum Jump {
+    /// `jmp rel32` to a colocated callee.
+    Near(Name),
+    /// `jmp [rip + word]`, under `Target::slots`.
+    Word(Name),
+    /// `jmp r11`, the callee's address loaded before the arguments were placed.
+    R11,
 }
 
 /// `return_call` and `return_call_indirect` (the frame's layout checked each), as Cranelift's
@@ -529,14 +552,18 @@ fn return_call(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
         Callee::Direct(func_ref) => {
             let ext = &func.dfg.ext_funcs[func_ref];
             let name = cx.name(&ext.name).map_err(blame(inst))?;
-            if !ext.colocated {
+            if cx.target.slots && cx.target.pic {
+                Jump::Word(name)
+            } else if ext.colocated && !cx.target.slots {
+                Jump::Near(name)
+            } else {
                 load_ext_name(cx, R11, name, 0, false).map_err(blame(inst))?;
+                Jump::R11
             }
-            ext.colocated.then_some(name)
         }
         Callee::Indirect(value) => {
             to_gpr(cx, inst, R11, value, None)?;
-            None
+            Jump::R11
         }
     };
 
@@ -569,11 +596,16 @@ fn return_call(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
         asm::alu_imm32(cx.buf, ADD, RSP, shrink as i32);
     }
     match near {
-        Some(name) => {
+        Jump::Near(name) => {
             let field = asm::jmp_rel32(cx.buf);
             cx.buf.reloc(field, Reloc::X86CallPCRel4, name, -4);
         }
-        None => asm::jmp_reg(cx.buf, R11),
+        // `jmp qword ptr [rip + word]`: through the callee's slot word, in one instruction.
+        Jump::Word(name) => {
+            let field = asm::rip(cx.buf, None, false, &[0xff], 4);
+            cx.buf.reloc(field, Reloc::X86GOTPCRel4, name, -4);
+        }
+        Jump::R11 => asm::jmp_reg(cx.buf, R11),
     }
     cx.side.rule(cx.buf.len(), crate::code::Rule::RestoreState);
     Ok(())

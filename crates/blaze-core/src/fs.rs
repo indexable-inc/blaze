@@ -283,6 +283,40 @@ pub(crate) fn sync(path: &Path) -> io::Result<()> {
     return OpenOptions::new().append(true).create(true).open(path)?.sync_all();
 }
 
+/// [`crate::Effect::Barrier`] on Linux: `fdatasync`, the cheapest call there that orders a
+/// file's bytes before later writes (it is durable too: Linux has no barrier without the
+/// drive's flush).
+#[cfg(target_os = "linux")]
+pub(crate) fn barrier(path: &Path) -> io::Result<()> {
+    linux::barrier(path)
+}
+
+/// [`crate::Effect::Barrier`] on Apple's systems: `fcntl(F_BARRIERFSYNC)` (85, in
+/// `<sys/fcntl.h>`: "fsync + issue barrier to drive"), which writes the file out and orders
+/// it before later writes with no flush of the drive's cache. `F_FULLFSYNC` waits for that
+/// flush, tens of milliseconds a call on Apple's own drives; the barrier is the call their
+/// file systems make for their own journals. A file system that has no barrier fails the
+/// call, and the effect with it, naming the file: nothing else is tried in its place.
+#[cfg(target_vendor = "apple")]
+#[expect(unsafe_code, reason = "fcntl(F_BARRIERFSYNC), the one call that orders a file's bytes without the drive's flush")]
+pub(crate) fn barrier(path: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let file = OpenOptions::new().append(true).create(true).open(path)?;
+    // SAFETY: an open descriptor, and a command that takes no argument.
+    match unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } {
+        -1 => Err(io::Error::last_os_error()),
+        _ => Ok(()),
+    }
+}
+
+/// [`crate::Effect::Barrier`] where the system has neither a barrier nor Linux's calls: the
+/// file's data synced, which orders it (and is durable).
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+pub(crate) fn barrier(path: &Path) -> io::Result<()> {
+    // durable: the effect is the ordering its caller asked for; this system's one call for it waits for the device.
+    OpenOptions::new().append(true).create(true).open(path)?.sync_data()
+}
+
 /// [`crate::Effect::WriteBack`]: the data of the file at `path` that is only in memory written
 /// to its device, waited for here (on a driver's thread; the effect's asker waits for
 /// nothing). Opened to read, so a file sealed read-only is written back too. Nothing of the
@@ -312,6 +346,108 @@ pub(crate) fn write_back(path: &Path) -> io::Result<()> {
 #[cfg(not(unix))]
 pub(crate) fn write_back(path: &Path) -> io::Result<()> {
     OpenOptions::new().write(true).open(path)?.sync_data()
+}
+
+/// [`crate::Effect::Prewarm`]: the parts of `like` the page cache holds asked to be read into
+/// `file`'s cache, up to `most` bytes from the start; the bytes asked for. `like` is mapped to
+/// be asked about (`mincore`), never read through the mapping, and each run of pages it holds
+/// is handed to the system's read-ahead for `file` (`F_RDADVISE` on Apple's systems,
+/// `posix_fadvise(POSIX_FADV_WILLNEED)` on Linux), which returns once the read is begun.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[expect(unsafe_code, reason = "mmap, mincore and the read-ahead call, which std does not wrap")]
+pub(crate) fn prewarm(like: &Path, file: &Path, most: u64) -> io::Result<u64> {
+    use std::os::fd::AsRawFd as _;
+    let file = File::open(file)?;
+    // A `like` that is not there (the first file placed at a path) holds nothing in memory.
+    let like = match File::open(like) {
+        Ok(like) => like,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    // What both hold: a range past either's end is no page of `like` to ask about or no byte
+    // of `file` to read.
+    let len = like.metadata()?.len().min(file.metadata()?.len());
+    let Ok(len) = usize::try_from(len) else {
+        return Err(io::Error::other("a file longer than this machine's address space"));
+    };
+    if len == 0 {
+        return Ok(0);
+    }
+    // SAFETY: `sysconf` reads a constant of the system.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let Ok(page) = usize::try_from(page) else { return Err(io::Error::last_os_error()) };
+    // SAFETY: a new read-only mapping of an open file at an address the kernel picks; nothing
+    // is read or written through it, and it is unmapped below before this returns.
+    let at = unsafe {
+        libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, like.as_raw_fd(), 0)
+    };
+    if at == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    // alloc: a byte a page of the file, once a prewarm (10 KiB for 158 MB of 16 KiB pages)
+    let mut held = vec![0u8; len.div_ceil(page)];
+    // SAFETY: `at` maps `len` bytes, and `held` has a byte for each page of them, which is
+    // what `mincore` writes.
+    let asked = unsafe { libc::mincore(at, len, held.as_mut_ptr().cast()) };
+    let asked = match asked {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    };
+    // SAFETY: the mapping made above, whole, used by nothing after this.
+    unsafe { libc::munmap(at, len) };
+    asked?;
+    // Each run of pages the cache holds, asked for in `file`. Bounded: one turn a page.
+    let (mut bytes, mut next) = (0u64, 0usize);
+    while next < held.len() && bytes < most {
+        if held[next] & 1 == 0 {
+            next += 1;
+            continue;
+        }
+        let first = next;
+        while next < held.len() && held[next] & 1 != 0 {
+            next += 1;
+        }
+        let (from, to) = (first * page, (next * page).min(len));
+        // One call takes a count that fits its integer, and no more than is left of `most`.
+        let run = ((to - from) as u64).min(most - bytes).min(1 << 30);
+        read_ahead(file.as_raw_fd(), from as u64, run)?;
+        bytes += run;
+    }
+    Ok(bytes)
+}
+
+/// The system's read-ahead asked for `len` bytes of `fd` at `at`: begun, not waited for.
+#[cfg(target_vendor = "apple")]
+#[expect(unsafe_code, reason = "fcntl(F_RDADVISE), the read-ahead call of Apple's systems")]
+fn read_ahead(fd: std::os::fd::RawFd, at: u64, len: u64) -> io::Result<()> {
+    let advice = libc::radvisory { ra_offset: at as libc::off_t, ra_count: len as libc::c_int };
+    // SAFETY: an open descriptor and a `radvisory` that outlives the call, which reads it.
+    match unsafe { libc::fcntl(fd, libc::F_RDADVISE, &raw const advice) } {
+        -1 => Err(io::Error::last_os_error()),
+        _ => Ok(()),
+    }
+}
+
+/// The system's read-ahead asked for `len` bytes of `fd` at `at`: begun, not waited for.
+#[cfg(target_os = "linux")]
+#[expect(unsafe_code, reason = "posix_fadvise, the read-ahead call")]
+fn read_ahead(fd: std::os::fd::RawFd, at: u64, len: u64) -> io::Result<()> {
+    // SAFETY: an open descriptor; the call takes no pointer.
+    match unsafe { libc::posix_fadvise(fd, at as libc::off_t, len as libc::off_t, libc::POSIX_FADV_WILLNEED) } {
+        0 => Ok(()),
+        // It returns the error, and sets no `errno`.
+        code => Err(io::Error::from_raw_os_error(code)),
+    }
+}
+
+/// [`crate::Effect::Prewarm`] where no call that says which ranges of a file the cache holds
+/// is used (Windows, the other Unixes): nothing is asked for, and the completion says 0 bytes.
+/// Both files are opened, so one that is not there fails as elsewhere.
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+pub(crate) fn prewarm(like: &Path, file: &Path, most: u64) -> io::Result<u64> {
+    let _ = (most, like);
+    std::fs::File::open(file)?;
+    Ok(0)
 }
 
 /// [`crate::Effect::SyncDir`]: the names in the directory at `path` made durable.
@@ -1062,6 +1198,32 @@ mod tests {
         assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o644);
         seal(&target, 0o444).unwrap();
         assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o444);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// [`prewarm`] asks for what the cache holds of `like`, and no more than `most`: a file
+    /// just written is held whole, so all of it is asked for in the other; a `most` under its
+    /// length is all that is asked for; a file that holds nothing in memory to learn from (it
+    /// is empty, or is not there) asks for nothing; and a file to read ahead in that is not
+    /// there fails.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn a_prewarm_asks_for_what_the_cache_holds_up_to_its_most() {
+        let root = dir("prewarm");
+        let (like, file) = (root.join("like"), root.join("file"));
+        let bytes: Vec<u8> = (0..1u32 << 20).map(|n| (n % 251) as u8).collect();
+        std::fs::write(&like, &bytes).unwrap();
+        std::fs::write(&file, &bytes).unwrap();
+        assert_eq!(prewarm(&like, &file, u64::MAX).unwrap(), bytes.len() as u64);
+        assert_eq!(prewarm(&like, &file, 4096).unwrap(), 4096);
+        // What both hold: a shorter `file` is asked for no more than its length.
+        std::fs::write(&file, &bytes[..12345]).unwrap();
+        assert_eq!(prewarm(&like, &file, u64::MAX).unwrap(), 12345);
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(prewarm(&like, &file, u64::MAX).unwrap(), 0);
+        // A `like` that is not there holds nothing; a `file` that is not there fails.
+        assert_eq!(prewarm(&root.join("none"), &file, u64::MAX).unwrap(), 0);
+        assert!(prewarm(&like, &root.join("none"), u64::MAX).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 

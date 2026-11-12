@@ -111,6 +111,10 @@ struct Notify {
     /// Whether a hand-back since the driver last drained the channels has fired the trigger:
     /// a batch of them costs one `kevent`, not one each.
     woke: Wake,
+    /// A [`crate::Waker`] asked the wait to end ([`Driver::waker`]): set before the trigger is
+    /// fired, read by the polling thread after it drained and before it waits, so a wake asked
+    /// while another hand-back's trigger is pending is not lost with that trigger.
+    asked: std::sync::atomic::AtomicBool,
     /// What the file threads allocated doing their effects and handing them back.
     #[cfg(test)]
     file_allocations: std::sync::atomic::AtomicU64,
@@ -156,6 +160,18 @@ impl Notify {
             self.triggers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             _ = self.change(TRIGGER as usize, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER, 0, TRIGGER);
         }
+    }
+}
+
+/// The kqueue's [`crate::Waker`]: `asked` is set first, then the trigger fired unless one is
+/// pending. The polling thread drains (clearing `woke`), then reads `asked`, then waits: a wake
+/// that found `woke` set was made before that drain, so the read after it sees `asked`; one that
+/// found it clear fired the trigger, which ends the wait, and the next turn of the poll reads
+/// `asked`.
+impl crate::Wake for Notify {
+    fn wake(&self) {
+        self.asked.store(true, std::sync::atomic::Ordering::SeqCst);
+        Notify::wake(self);
     }
 }
 
@@ -381,6 +397,7 @@ impl Kqueue {
             files: files_done,
             watched: watched_done,
             woke: Wake::new(),
+            asked: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             file_allocations: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -509,6 +526,7 @@ impl Kqueue {
             | Effect::ReadLink { .. }
             | Effect::Append { .. }
             | Effect::Sync { .. }
+            | Effect::Barrier { .. }
             | Effect::WriteBack { .. }
             | Effect::SyncDir { .. }
             | Effect::Truncate { .. }
@@ -522,6 +540,7 @@ impl Kqueue {
             | Effect::Private { .. }
             | Effect::Times { .. }
             | Effect::Clone { .. }
+            | Effect::Prewarm { .. }
             | Effect::Link { .. }
             | Effect::Stat { .. }
             | Effect::Lstat { .. }
@@ -1358,7 +1377,10 @@ impl Driver for Kqueue {
         let clock = Monotonic::since(self.start);
         loop {
             self.take(out);
-            if out.len() > before || self.in_flight == 0 {
+            // A waker's ask ends the poll with what there is, which may be nothing: what it
+            // woke the loop for is in a queue of the caller's own.
+            let asked = self.notify.asked.swap(false, std::sync::atomic::Ordering::SeqCst);
+            if out.len() > before || self.in_flight == 0 || asked {
                 // Changes asked for are made now, not once nothing else is ready.
                 if !self.changes.is_empty() {
                     self.wait(Some(Deadline::PASSED));
@@ -1394,6 +1416,11 @@ impl Driver for Kqueue {
 
     fn now(&self) -> Duration {
         self.start.elapsed()
+    }
+
+    fn waker(&self) -> Option<crate::Waker> {
+        // clone: a handle to the kqueue's notify, once per waker asked for
+        Some(crate::Waker::new(Arc::clone(&self.notify) as Arc<dyn crate::Wake>))
     }
 }
 
@@ -1550,6 +1577,43 @@ mod tests {
             Done::Exited(exit) => exit,
             other => panic!("{other:?}"),
         }
+    }
+
+    /// The waker's claim ([`Driver::waker`]): a wake from another thread ends a poll that no
+    /// completion ends, long before its deadline, with nothing in `out`; a wake made before the
+    /// poll ends that poll at once; and one wake ends one poll, not the one after. The control:
+    /// with no wake the same poll runs to its deadline.
+    #[test]
+    fn a_waker_ends_a_poll_no_completion_ends() {
+        let root = dir("waker");
+        let mut driver = Kqueue::new(&root, 1).unwrap();
+        // A timer far off keeps an effect in flight, so the poll waits.
+        driver.submit(&mut vec![Effect::Timer { after: Duration::from_secs(600), tag: Tag(1) }]);
+        let waker = driver.waker().expect("the kqueue driver has a waker");
+        let mut out = Vec::new();
+        let far = |driver: &Kqueue| Deadline::after(driver.now(), Duration::from_secs(20));
+        // Made before the poll: the poll does not wait.
+        waker.wake();
+        let began = Instant::now();
+        assert_eq!(driver.poll(&mut out, far(&driver)), 0);
+        assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
+        // Made while it waits, from another thread.
+        let other = waker.clone();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            other.wake();
+        });
+        let began = Instant::now();
+        assert_eq!(driver.poll(&mut out, far(&driver)), 0);
+        let took = began.elapsed();
+        assert!(took >= Duration::from_millis(40) && took < Duration::from_secs(5), "{took:?}");
+        thread.join().unwrap();
+        // The control: no wake is left over, so this poll runs to its deadline.
+        let began = Instant::now();
+        let near = Deadline::after(driver.now(), Duration::from_millis(60));
+        assert_eq!(driver.poll(&mut out, near), 0);
+        assert!(began.elapsed() >= Duration::from_millis(55), "{:?}", began.elapsed());
+        assert!(out.is_empty(), "{out:?}");
     }
 
     #[test]
@@ -1779,7 +1843,8 @@ mod tests {
         driver.submit(&mut vec![Effect::Pressure { tag: Tag(1) }]);
         let mut out = Vec::new();
         // The registration is made with this wait; a refusal comes back as its event.
-        driver.poll(&mut out, Duration::from_millis(20));
+        let until = Deadline::after(driver.now(), Duration::from_millis(20));
+        driver.poll(&mut out, until);
         assert!(
             out.iter().all(|it| matches!(it.done, Done::Pressed { .. })),
             "the kernel refused a knote of EVFILT_MEMORYSTATUS (-14), the filter of \

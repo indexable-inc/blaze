@@ -49,6 +49,7 @@ pub mod observe;
 #[cfg(not(feature = "native"))]
 pub(crate) mod once;
 mod plane;
+mod settle;
 mod pulse;
 pub(crate) mod said;
 pub mod settings;
@@ -1268,9 +1269,11 @@ pub(crate) fn engine(
     }
     let steps = Arc::new(unit::Real::new(&paths, sources).map_err(|why| anyhow::anyhow!(why))?);
     let scratch = paths.state.join("spawn");
-    let runner = plane::Runner::Threads(plane::Threads::new(options.io, options.threads));
     let driver = blaze_core::native(std::path::Path::new("/"), threads)
         .context("starting this machine's native driver (io_uring, kqueue or IOCP)")?;
+    // A plane task's end ends the loop's wait in this driver, where it has a waker.
+    let wake = blaze_core::Driver::waker(&driver);
+    let runner = plane::Runner::Threads(plane::Threads::new(options.io, options.threads, wake));
     let driver = driver
         .confined(confine)
         .scratch(&scratch)
@@ -1394,6 +1397,7 @@ fn begin(
         .map_err(|why| anyhow::anyhow!(why))?;
     if settings.auto {
         daemon.collect(gc::Gc::new(gc::areas(&root, &machine()?), &state()?, settings.levels));
+        daemon.settle(settle::Settles::new(settle::Compress::Pool));
     } else {
         eprintln!(
             "{who}: {} sets \"auto\": false: the daemon collects nothing on its own (`blaze cache gc` still does when run)",

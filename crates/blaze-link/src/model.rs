@@ -1064,6 +1064,10 @@ pub(crate) struct Delta<'a> {
     /// No region moved or changed size, but for the writer's own synthetic regions, whose
     /// size it makes.
     pub same_regions: bool,
+    /// No region moved or changed its room; any may hold more or less than it did. What a
+    /// table needs whose entries are of addresses alone (`.rela.dyn`): an edit that puts new
+    /// code and data in the patch regions changes their sizes and no address.
+    pub same_places: bool,
     /// Address ranges of the regions the core wrote since the last link, by address, none
     /// overlapping. In the [`Placed`] that [`Writer::file`] sees, they include the blocks of
     /// the synthetic regions that differ from the last link's.

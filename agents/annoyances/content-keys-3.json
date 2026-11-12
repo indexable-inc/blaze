@@ -1,0 +1,11 @@
+{
+ "id": "content-keys-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane content-keys-1112",
+ "where": "the VM (lanebase-1112)",
+ "what": "`bc` is not installed and `BLAZE_DUCKDB` is not set in a loop command's environment, so a script's timings printed empty and the cross-home `key_parts` query did not run.",
+ "cost": "one more turn of the queue for the timings",
+ "cause": "not looked at",
+ "workaround": "shell arithmetic on `date +%s%N`; `blaze debug sql` inside one home",
+ "state": "open"
+}

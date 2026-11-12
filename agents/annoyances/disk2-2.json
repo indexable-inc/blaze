@@ -1,0 +1,12 @@
+{
+ "id": "disk2-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+ "where": "crates/blaze-cas/src/lib.rs `Store::settle`",
+ "what": "The store's cold tier (zstd with a dictionary per kind, promotion, retiring half-dead packs) was built and tested and had no caller outside tests: no daemon ever settled, so every home's store was all raw.",
+ "cost": "an hour to find that the machinery existed and was off",
+ "cause": "the daemon's half was never written",
+ "workaround": "wired it (serve/settle.rs)",
+ "fix": "a gate check that a `pub fn` of a core has a caller outside its tests",
+ "state": "fixed on disk2-1111"
+}

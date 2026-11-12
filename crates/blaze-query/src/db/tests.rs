@@ -1748,6 +1748,25 @@ impl Input for Config {
     }
 }
 
+query!(AsksConfig, u64, |db, _key| u64::from(input_singleton::<Config>(db.storage()).is_some()));
+
+/// The invariant: a singleton's absence is a tracked read. A row that asked for a singleton
+/// nobody had made runs again when it is made, and not for a write of anything else: no
+/// reader has to report the absence as an untracked read (which would run it in every view).
+#[test]
+fn a_singletons_absence_is_a_tracked_read() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 0, 5);
+    assert_eq!(*get::<AsksConfig>(&db, cell), 0);
+    // Another write: the row is verified, not run.
+    cell.set_a(&mut db, 1);
+    assert_eq!(*get::<AsksConfig>(&db, cell), 0);
+    assert_eq!(db.runs("AsksConfig"), 1, "a write of another input ran a row that read only the absence");
+    input_new_singleton::<Config, 1>(db.storage_mut(), (3,), [Durability::HIGH]);
+    assert_eq!(*get::<AsksConfig>(&db, cell), 1, "the row kept the absence it read after the singleton was made");
+    assert_eq!(db.runs("AsksConfig"), 2);
+}
+
 #[test]
 fn a_singleton_is_made_once() {
     let mut db = TestDb::new();

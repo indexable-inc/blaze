@@ -445,3 +445,75 @@ pub fn frame_pointer() -> usize {
     };
     at
 }
+
+/// Memory the program's data lives in: the constants its code refers to and its statics.
+/// Address space reserved once and handed out from its end, as the code area is; readable
+/// and writable by every thread, never executable.
+///
+/// The invariant every `unsafe` block of it rests on, kept by its owner (the records, which
+/// the control thread owns): **a range is written only between [`Data::reserve`] handing it
+/// out and the first store of a word or a pool cell that names it**, so no program thread
+/// can be reading it; after that it is the program's own memory, as a linked image's data
+/// is. A range is never handed out twice and the mapping is never unmapped (no `Drop`): the
+/// program may keep an address into it for as long as it runs.
+pub struct Data {
+    base: NonNull<u8>,
+    len: usize,
+    /// The offset the next range begins at or after.
+    end: usize,
+}
+
+// SAFETY: a `Data` is the sole owner of its mapping, and nothing in it is tied to a thread.
+unsafe impl Send for Data {}
+
+impl Data {
+    /// Reserves `len` bytes. Nothing is committed until written.
+    pub fn map(len: usize) -> Result<Data, SysError> {
+        #[cfg(target_os = "linux")]
+        let flags = libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE;
+        #[cfg(target_os = "macos")]
+        let flags = libc::MAP_PRIVATE | libc::MAP_ANON;
+        let protection = libc::PROT_READ | libc::PROT_WRITE;
+        // SAFETY: an anonymous mapping at no fixed address; the result is checked.
+        let at = unsafe { libc::mmap(ptr::null_mut(), len, protection, flags, -1, 0) };
+        if at == libc::MAP_FAILED {
+            return Err(failed("mmap(the program's data)", 0, len));
+        }
+        match NonNull::new(at.cast::<u8>()) {
+            Some(base) => Ok(Data { base, len, end: 0 }),
+            None => Err(SysError { call: "mmap(the program's data)", errno: 0, at: 0, len }),
+        }
+    }
+
+    /// Hands out `size` bytes aligned to `align` (a power of two), zeroed, and gives their
+    /// address. ENOMEM when the reservation has no room: the program is started again.
+    pub fn reserve(&mut self, size: usize, align: usize) -> Result<usize, SysError> {
+        let full = SysError { call: "reserving the program's data", errno: libc::ENOMEM, at: self.end, len: size };
+        // The base is page aligned, so an aligned offset is an aligned address up to a page;
+        // a larger alignment is taken of the address itself.
+        let base = self.base.as_ptr() as usize;
+        let at = (base + self.end).checked_next_multiple_of(align.max(1)).ok_or(full)? - base;
+        let end = at.checked_add(size.max(1)).filter(|end| *end <= self.len).ok_or(full)?;
+        self.end = end;
+        Ok(base + at)
+    }
+
+    /// Copies `bytes` to `address`, a range [`Data::reserve`] handed out that nothing the
+    /// program can reach names yet (the type's invariant).
+    pub fn fill(&mut self, address: usize, bytes: &[u8]) -> Result<(), SysError> {
+        let base = self.base.as_ptr() as usize;
+        let inside = address
+            .checked_sub(base)
+            .and_then(|at| at.checked_add(bytes.len()))
+            .is_some_and(|end| end <= self.end);
+        if !inside {
+            return Err(SysError { call: "filling the program's data", errno: libc::EFAULT, at: address, len: bytes.len() });
+        }
+        // SAFETY: `address..address + bytes.len()` is inside what `reserve` handed out
+        // (checked above), in a mapping that is readable, writable and never unmapped;
+        // `bytes` is a live slice that cannot overlap it (the mapping is never borrowed as a
+        // slice); no thread reads the range yet (the type's invariant).
+        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len()) };
+        Ok(())
+    }
+}

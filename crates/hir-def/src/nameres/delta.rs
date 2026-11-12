@@ -101,6 +101,12 @@ pub struct CrateDelta {
     /// headers and signatures may differ with no binding changed.
     pub touched: Vec<ModuleDefId>,
     pub touched_impls: Vec<ImplId>,
+    /// The modules whose scope the write set: a module made (one a macro wrote once its crate
+    /// was given its procedural macros, with no round-0 log changed) and one whose scope
+    /// changed in any list. A body that may hold an impl (a `const`, named or not, a function,
+    /// a static) can come or go with no name bound anew, so neither `bindings` nor `touched`
+    /// lists it.
+    pub scopes: Vec<ModuleId>,
 }
 
 /// The maintainer's reads, two steps per layer of the crate graph (each crate one past its
@@ -802,6 +808,8 @@ struct Scoped {
     old_items: Items,
     /// The groups whose items the impls maintainer is handed, now.
     emit: Vec<ModuleId>,
+    /// The modules whose scope this step set ([`CrateDelta::scopes`]).
+    scopes: Vec<ModuleId>,
     changed: Vec<Changed>,
     /// The region in group order and what its run read, when one ran.
     ran: Option<(Vec<ModuleId>, Vec<Read>)>,
@@ -834,6 +842,7 @@ fn publish_scopes(
     let proc_macro = attrs.proc_macro;
     let root = cs.root;
     let mut old_items = Items::default();
+    let mut scopes = Vec::new(); // alloc: the modules whose scope the write set, once per write that sets one
     let mut changed = Vec::new(); // alloc: empty, allocates nothing without a run
     let mut order = Vec::new(); // alloc: as above
     let mut ran_reads = None;
@@ -870,8 +879,11 @@ fn publish_scopes(
                 scope.censor_non_proc_macros(krate);
             }
             let mut slot = cs.inputs.get(&module).copied();
-            work.slices +=
-                u64::from(publish::set_scope(db, krate, &mut slot, module, scope, children));
+            let set = publish::set_scope(db, krate, &mut slot, module, scope, children);
+            work.slices += u64::from(set);
+            if set {
+                scopes.push(module);
+            }
             let input = slot.expect("nameres delta: `set_scope` makes the input");
             cs.inputs.insert(module, input);
             if !censored {
@@ -936,7 +948,9 @@ fn publish_scopes(
     let mut emit: Vec<ModuleId> = order;
     for (group, places) in &delta.direct {
         if !region.contains(group) {
-            apply_direct(db, &cs, *group, places, &mut old_items, &mut work);
+            if apply_direct(db, &cs, *group, places, &mut old_items, &mut work) {
+                scopes.push(*group);
+            }
             emit.push(*group);
         }
     }
@@ -951,6 +965,7 @@ fn publish_scopes(
         proc_macro,
         old_items,
         emit,
+        scopes,
         changed,
         ran: ran_reads,
         rows_changed,
@@ -1056,7 +1071,7 @@ fn read_records(db: &Db, _: &Written<'_>, scoped: &mut Scoped) {
 /// of it for the impls maintainer.
 fn finish_records(db: &mut Db, state: &mut State, scoped: Scoped) -> CrateDelta {
     let Scoped {
-        krate, mut cs, delta, cold, old_items, emit, changed, mut work, assembled, ..
+        krate, mut cs, delta, cold, old_items, emit, scopes, changed, mut work, assembled, ..
     } = scoped;
     carry_maintaining();
     let _maintaining = Maintaining { before: replace_maintaining(Some(krate)) };
@@ -1070,6 +1085,7 @@ fn finish_records(db: &mut Db, state: &mut State, scoped: Scoped) -> CrateDelta 
     let mut crate_delta =
         touched_only(db, krate, &cs, &delta).unwrap_or_else(|| empty_delta(krate));
     crate_delta.fresh = cold;
+    crate_delta.scopes = scopes;
     let mut new_items = Items::default();
     for group in &emit {
         let pos = cs.group_pos.get(group).expect("nameres delta: every group has a position");
@@ -1090,7 +1106,8 @@ fn finish_records(db: &mut Db, state: &mut State, scoped: Scoped) -> CrateDelta 
 
 /// Puts a group's name-free inserts (`places` in its new log) into its module's published
 /// scope, where a run would put them: a round-0 op of a list is replayed before any expansion
-/// adds to it, so its index is the number of the same ops before it in the log.
+/// adds to it, so its index is the number of the same ops before it in the log. Whether the
+/// scope was set.
 fn apply_direct(
     db: &mut Db,
     cs: &CrateState,
@@ -1098,7 +1115,7 @@ fn apply_direct(
     places: &[u32],
     old_items: &mut Items,
     work: &mut Work,
-) {
+) -> bool {
     let input = *cs
         .inputs
         .get(&group)
@@ -1136,7 +1153,9 @@ fn apply_direct(
             _ => {}
         }
     }
-    work.slices += u64::from(publish::set_scope_alone(db, input, scope));
+    let set = publish::set_scope_alone(db, input, scope);
+    work.slices += u64::from(set);
+    set
 }
 
 /// `scope` with `imp` at `at` of its impls, its bits as `define_impl` in order makes them.
@@ -1283,6 +1302,7 @@ fn empty_delta(krate: Crate) -> CrateDelta {
         bindings: Vec::new(),      // alloc: as above
         touched: Vec::new(),       // alloc: as above
         touched_impls: Vec::new(), // alloc: as above
+        scopes: Vec::new(),        // alloc: as above
     }
 }
 

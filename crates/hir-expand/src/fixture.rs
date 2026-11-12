@@ -899,7 +899,7 @@ fn test_proc_macro(
     ProcMacro { name: Symbol::intern(name), kind, expander, disabled: false }
 }
 
-fn default_test_proc_macros() -> [(String, ProcMacro); 11] {
+fn default_test_proc_macros() -> [(String, ProcMacro); 12] {
     [
         (
             r#"
@@ -952,6 +952,16 @@ pub fn mirror(input: TokenStream) -> TokenStream {
 "#
             .into(),
             test_proc_macro("mirror", ProcMacroKind::Bang, sync::Arc::new(MirrorProcMacroExpander)),
+        ),
+        (
+            r#"
+#[proc_macro]
+pub fn pass(input: TokenStream) -> TokenStream {
+    input
+}
+"#
+            .into(),
+            test_proc_macro("pass", ProcMacroKind::Bang, sync::Arc::new(IdentityProcMacroExpander)),
         ),
         (
             r#"

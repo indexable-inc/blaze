@@ -32,7 +32,7 @@ use crate::{CodeId, Slot, Thread, Tier, Txn};
 /// The version of the schema of every body. A reader of another refuses the message by name
 /// rather than guess at its fields; a launcher and a daemon of two schemas restart the
 /// program (launcher.md, section 4).
-pub const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 2;
 
 /// The longest item a frame carries, as blaze-protocol's.
 pub const LONGEST_FRAME: u32 = 16 << 20;
@@ -113,10 +113,10 @@ pub enum Os {
 }
 
 /// One function's new code in a [`Tell::Edit`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Bind {
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Bind<'a> {
     pub slot: Slot,
-    /// The record to read from the store.
+    /// The function's code record ([`crate::record`]), which a [`Tell::Record`] gave before.
     pub record: RecordId,
     /// The function's code identity: what a test's result is keyed by.
     pub code: CodeId,
@@ -125,12 +125,30 @@ pub struct Bind {
     pub len: u64,
     /// Its alignment: a power of two.
     pub align: u32,
+    /// What each function and static the record names is in this process, in the order of
+    /// the record's places ([`crate::record::Place`]): a function's slot, a static's number
+    /// (a [`StaticDef::number`] of this or an earlier message). A place that is an outside
+    /// symbol takes none: the record names it.
+    pub refs: List<'a, u32>,
 }
 
-/// What a list of a message holds: an item written and read as one CBOR item.
-pub trait Listed: Copy + PartialEq + fmt::Debug {
+/// One static's definition in a [`Tell::Statics`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct StaticDef<'a> {
+    /// The static's number in this process, which a [`Bind::refs`] or another static's
+    /// `refs` names it by: given out by the daemon, each once.
+    pub number: u32,
+    /// The static's record ([`crate::record`]), which a [`Tell::Record`] gave before.
+    pub record: RecordId,
+    /// As [`Bind::refs`], for the places of the static's record.
+    pub refs: List<'a, u32>,
+}
+
+/// What a list of a message holds: an item written and read as one CBOR item, which may
+/// borrow from the frame it is read out of.
+pub trait Listed<'a>: Copy + PartialEq + fmt::Debug {
     fn write<A: Allocator>(&self, to: &mut Writer<'_, A>);
-    fn read(from: &mut Reader<'_>) -> Result<Self, WireError>;
+    fn read(from: &mut Reader<'a>) -> Result<Self, WireError>;
 }
 
 /// A list in a message: a slice, for the side that writes it, or the items where they lie
@@ -147,7 +165,7 @@ enum Repr<'a, T> {
     Wire { items: &'a [u8], count: usize },
 }
 
-impl<'a, T: Listed> List<'a, T> {
+impl<'a, T: Listed<'a>> List<'a, T> {
     pub const fn of(items: &'a [T]) -> List<'a, T> {
         List { repr: Repr::Slice(items) }
     }
@@ -172,14 +190,14 @@ impl<'a, T: Listed> List<'a, T> {
         }
     }
 
-    fn write<A: Allocator>(&self, to: &mut Writer<'_, A>) {
+    pub(crate) fn write<A: Allocator>(&self, to: &mut Writer<'_, A>) {
         to.array(self.len());
         for item in self.iter() {
             item.write(to);
         }
     }
 
-    fn read(from: &mut Reader<'a>) -> Result<List<'a, T>, WireError> {
+    pub(crate) fn read(from: &mut Reader<'a>) -> Result<List<'a, T>, WireError> {
         let count = from.array()?;
         let start = from.at();
         for _ in 0..count {
@@ -189,13 +207,13 @@ impl<'a, T: Listed> List<'a, T> {
     }
 }
 
-impl<T: Listed> PartialEq for List<'_, T> {
+impl<'a, T: Listed<'a>> PartialEq for List<'a, T> {
     fn eq(&self, other: &Self) -> bool {
         self.len() == other.len() && self.iter().zip(other.iter()).all(|(a, b)| a == b)
     }
 }
 
-impl<T: Listed> fmt::Debug for List<'_, T> {
+impl<'a, T: Listed<'a>> fmt::Debug for List<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
@@ -207,7 +225,7 @@ pub enum ListIter<'a, T> {
     Wire { from: Reader<'a>, left: usize },
 }
 
-impl<T: Listed> Iterator for ListIter<'_, T> {
+impl<'a, T: Listed<'a>> Iterator for ListIter<'a, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<T> {
@@ -224,7 +242,7 @@ impl<T: Listed> Iterator for ListIter<'_, T> {
     }
 }
 
-impl Listed for Slot {
+impl Listed<'_> for Slot {
     fn write<A: Allocator>(&self, to: &mut Writer<'_, A>) {
         to.uint(u64::from(self.0));
     }
@@ -234,13 +252,48 @@ impl Listed for Slot {
     }
 }
 
-impl Listed for Bind {
+impl Listed<'_> for u32 {
     fn write<A: Allocator>(&self, to: &mut Writer<'_, A>) {
-        to.map(6);
+        to.uint(u64::from(*self));
+    }
+
+    fn read(from: &mut Reader<'_>) -> Result<u32, WireError> {
+        from.uint32("a slot or a static's number past 32 bits")
+    }
+}
+
+impl<'a> Listed<'a> for StaticDef<'a> {
+    fn write<A: Allocator>(&self, to: &mut Writer<'_, A>) {
+        to.map(3);
+        to.text("refs");
+        self.refs.write(to);
+        to.text("number");
+        to.uint(u64::from(self.number));
+        to.text("record");
+        to.bytes(&self.record.0);
+    }
+
+    fn read(from: &mut Reader<'a>) -> Result<StaticDef<'a>, WireError> {
+        from.map(3, "a static's definition, a map of 3")?;
+        from.key("refs")?;
+        let refs = List::read(from)?;
+        from.key("number")?;
+        let number = from.uint32("a static's number past 32 bits")?;
+        from.key("record")?;
+        let record = RecordId(id(from, "a record id is 32 bytes")?);
+        Ok(StaticDef { number, record, refs })
+    }
+}
+
+impl<'a> Listed<'a> for Bind<'a> {
+    fn write<A: Allocator>(&self, to: &mut Writer<'_, A>) {
+        to.map(7);
         to.text("len");
         to.uint(self.len);
         to.text("code");
         to.bytes(&self.code.0);
+        to.text("refs");
+        self.refs.write(to);
         to.text("slot");
         self.slot.write(to);
         to.text("tier");
@@ -251,12 +304,14 @@ impl Listed for Bind {
         to.bytes(&self.record.0);
     }
 
-    fn read(from: &mut Reader<'_>) -> Result<Bind, WireError> {
-        from.map(6, "a bind, a map of 6")?;
+    fn read(from: &mut Reader<'a>) -> Result<Bind<'a>, WireError> {
+        from.map(7, "a bind, a map of 7")?;
         from.key("len")?;
         let len = from.uint()?;
         from.key("code")?;
         let code = CodeId(id(from, "a code id is 32 bytes")?);
+        from.key("refs")?;
+        let refs = List::read(from)?;
         from.key("slot")?;
         let slot = Slot::read(from)?;
         from.key("tier")?;
@@ -265,7 +320,7 @@ impl Listed for Bind {
         let align = from.uint32("an alignment past 32 bits")?;
         from.key("record")?;
         let record = RecordId(id(from, "a record id is 32 bytes")?);
-        Ok(Bind { slot, record, code, tier, len, align })
+        Ok(Bind { slot, record, code, tier, len, align, refs })
     }
 }
 
@@ -297,12 +352,27 @@ pub enum Ask<'a> {
 /// What the daemon says to the launcher.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Tell<'a> {
-    /// The answer to [`Ask::Hello`]: how many slots the program has, where the store is (a
-    /// directory the launcher may only read), and the length of the statics' initial image.
-    Welcome { slots: u32, store: &'a str, statics: u64 },
+    /// The answer to [`Ask::Hello`]: how many slots the program has. The launcher declares
+    /// them; nothing runs yet.
+    Welcome { slots: u32 },
+    /// Run the program: its statics are defined. `inits` are the statics of its initializer
+    /// sections (`.init_array`, `__mod_init_func`), by number, each holding the address of a
+    /// function the launcher calls first, in this order, as the system's loader would; then
+    /// it calls `entry`, the slot of the C `main`.
+    Start { entry: Slot, inits: List<'a, u32> },
+    /// The bytes of a record ([`crate::record`]) that a later [`Bind`] or [`StaticDef`] names
+    /// by `id`, their content id: the launcher keeps them until a message uses them. Records
+    /// come over the socket, not from a directory of the store: a record is a few hundred
+    /// bytes the daemon has in memory when it answers, and the launcher needs no reader of
+    /// the store's packs.
+    Record { id: RecordId, bytes: &'a [u8] },
+    /// Define these statics: each gets its memory (all of them first, so they may point at
+    /// one another), then its initial value. A static is defined once a process, before the
+    /// first record that names it is bound.
+    Statics { defs: List<'a, StaticDef<'a>> },
     /// Bind these bodies in one transaction, after declaring `declare` more slots. `together`
     /// is false when each body means what the one it replaces did (a first call, a promotion).
-    Edit { txn: Txn, binds: List<'a, Bind>, declare: u32, together: bool },
+    Edit { txn: Txn, binds: List<'a, Bind<'a>>, declare: u32, together: bool },
     /// The function of `slot` does not compile: the program stops with `diagnostic`.
     Refused { slot: Slot, diagnostic: &'a str },
     /// Which of these slots' bodies does a thread have a frame in? Asked before an edit that
@@ -311,6 +381,9 @@ pub enum Tell<'a> {
     /// The edit `txn` cannot be applied to the running program, for `why`: start again in
     /// place. Its code is ready.
     Restart { txn: Txn, why: &'a str },
+    /// The answer to an [`Ask::Hello`] for a program this daemon holds no code of, and why:
+    /// the launcher stops, naming it.
+    Unheld { why: &'a str },
 }
 
 impl<'a> Ask<'a> {
@@ -477,14 +550,29 @@ impl<'a> Tell<'a> {
     /// leaves `out` as it was.
     pub fn encode<A: Allocator>(&self, id: u64, out: &mut Vec<u8, A>) -> Result<(), WireError> {
         frame(id, out, |to| match *self {
-            Tell::Welcome { slots, store, statics } => {
-                variant(to, "Welcome", 3);
+            Tell::Welcome { slots } => {
+                variant(to, "Welcome", 1);
                 to.text("slots");
                 to.uint(u64::from(slots));
-                to.text("store");
-                to.text(store);
-                to.text("statics");
-                to.uint(statics);
+            }
+            Tell::Start { entry, inits } => {
+                variant(to, "Start", 2);
+                to.text("entry");
+                entry.write(to);
+                to.text("inits");
+                inits.write(to);
+            }
+            Tell::Record { id, bytes } => {
+                variant(to, "Record", 2);
+                to.text("id");
+                to.bytes(&id.0);
+                to.text("bytes");
+                to.bytes(bytes);
+            }
+            Tell::Statics { defs } => {
+                variant(to, "Statics", 1);
+                to.text("defs");
+                defs.write(to);
             }
             Tell::Edit { txn, binds, declare, together } => {
                 variant(to, "Edit", 4);
@@ -518,6 +606,11 @@ impl<'a> Tell<'a> {
                 to.text("why");
                 to.text(why);
             }
+            Tell::Unheld { why } => {
+                variant(to, "Unheld", 1);
+                to.text("why");
+                to.text(why);
+            }
         })
     }
 
@@ -528,14 +621,31 @@ impl<'a> Tell<'a> {
         let named = from.at();
         let tell = match from.text()? {
             "Welcome" => {
-                from.map(3, "Welcome, a map of 3")?;
+                from.map(1, "Welcome, a map of 1")?;
                 from.key("slots")?;
                 let slots = from.uint32("a slot count past 32 bits")?;
-                from.key("store")?;
-                let store = from.text()?;
-                from.key("statics")?;
-                let statics = from.uint()?;
-                Tell::Welcome { slots, store, statics }
+                Tell::Welcome { slots }
+            }
+            "Start" => {
+                from.map(2, "Start, a map of 2")?;
+                from.key("entry")?;
+                let entry = Slot::read(&mut from)?;
+                from.key("inits")?;
+                let inits = List::read(&mut from)?;
+                Tell::Start { entry, inits }
+            }
+            "Record" => {
+                from.map(2, "Record, a map of 2")?;
+                from.key("id")?;
+                let id = RecordId(id32(&mut from, "a record id is 32 bytes")?);
+                from.key("bytes")?;
+                let bytes = from.bytes()?;
+                Tell::Record { id, bytes }
+            }
+            "Statics" => {
+                from.map(1, "Statics, a map of 1")?;
+                from.key("defs")?;
+                Tell::Statics { defs: List::read(&mut from)? }
             }
             "Edit" => {
                 from.map(4, "Edit, a map of 4")?;
@@ -572,6 +682,11 @@ impl<'a> Tell<'a> {
                 from.key("why")?;
                 let why = from.text()?;
                 Tell::Restart { txn, why }
+            }
+            "Unheld" => {
+                from.map(1, "Unheld, a map of 1")?;
+                from.key("why")?;
+                Tell::Unheld { why: from.text()? }
             }
             _ => return Err(WireError::Variant { at: named }),
         };

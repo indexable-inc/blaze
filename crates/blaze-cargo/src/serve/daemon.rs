@@ -215,6 +215,16 @@ const GIVE_BACK_EVERY: Duration = Duration::from_secs(1);
 /// ([`blaze_graph::arena::kept_of`]) get a purge whatever the footprint: one in 4. Freed pages
 /// kept past it are memory admission cannot grant and the ceiling counts.
 const KEPT_HIGH_WATER: u64 = 4;
+/// Which of the stores' pool pages a give-back takes ([`Daemon::give_pools_back`]).
+#[derive(Clone, Copy, Debug)]
+enum PoolGive {
+    /// What nothing read again since the sweep last came by (`Store::trim_pool`): an idle
+    /// daemon's, each [`super::idle::POOL_AFTER`] of a stretch of idleness.
+    Unread,
+    /// Every page no task pins (`Store::evict_pool`): a daemon past its limit's line or told
+    /// of memory pressure by the system, before it holds work back.
+    Unpinned,
+}
 /// How often, at most, the daemon looks for builds held back for memory to tell their clients
 /// ([`Jobs::tell_paused`]): a quarter of the second a build waits before it is told.
 const PAUSED_EVERY: Duration = Duration::from_millis(250);
@@ -567,14 +577,26 @@ enum Stopping {
     Over,
 }
 
+/// How often the loop turns while thread tasks run whose ends wake it ([`Woken::PlaneWakes`]):
+/// each turn's plane step reads what the running tasks hold (`Plane::measure`), which memory
+/// admission decides on, so one long task is still read this often. No task's end waits for it.
+const MEASURES_EVERY: Duration = Duration::from_millis(10);
+
 /// What ends the loop's wait for its driver between turns, besides the driver's own completions
 /// (a client's connection or request, a file, a child, a watch): the timer the loop set, and
 /// why. Named by the wait's span, so the loop's time between turns says what it waited on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Woken {
-    /// Thread tasks run: their ends come back on the plane's channel, which the loop reads
-    /// each turn, so it waits at most a millisecond.
+    /// Thread tasks run on a driver with no waker ([`blaze_core::Driver::waker`]): their ends
+    /// come back on the plane's channel, which the loop reads each turn, so it waits at most a
+    /// millisecond.
     PlaneTasks,
+    /// Thread tasks run, and each one's end ends the driver's wait (`plane::Back`): the loop
+    /// waits for that or the driver's io, and turns at least every [`MEASURES_EVERY`] to read
+    /// what the running tasks hold. Until 2026-11-11
+    /// every driver's loop read the ends every millisecond: each step of an edit that the loop
+    /// hands on waited up to one, 257 kept units' wind-ups of hello world about 10 ms in all.
+    PlaneWakes,
     /// Nothing runs: the idle tick.
     Idle,
     /// An intent's deadline in the session.
@@ -592,6 +614,9 @@ impl Woken {
         match self {
             Woken::PlaneTasks => WaitOn::Channel(
                 "daemon loop: a plane task's end (read every 1 ms) or the driver's io",
+            ),
+            Woken::PlaneWakes => WaitOn::Channel(
+                "daemon loop: a plane task's end, which wakes it, or the driver's io, or its 10 ms look at the running tasks' memory",
             ),
             Woken::Idle => WaitOn::Io(
                 "daemon loop: a client's connection or request, a file, a child or a watch, or the 50 ms idle tick",
@@ -729,6 +754,9 @@ pub struct Daemon<D: Driver, S: Steps> {
     given_back: Duration,
     /// Whether this stretch with nothing to do gave its warm memory back ([`super::idle`]).
     idle: super::idle::Idle,
+    /// When this stretch with nothing to do last gave the stores' pool pages back: again
+    /// each [`super::idle::POOL_AFTER`] of it.
+    pool_idle: super::idle::Idle,
     /// Whether the system's memory pressure is watched ([`PRESSURE`]): from the start until its
     /// watch fails (no source here) or is undone at the stop.
     pressure_watched: bool,
@@ -738,6 +766,9 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// The collector of what blaze keeps on disk ([`super::gc`]): `blaze serve`'s daemon's
     /// alone ([`Daemon::collect`]), as a test's daemons share no disk of their own.
     gc: Option<super::gc::Gc>,
+    /// The store's cold moves between requests ([`super::settle`]): `None` for a daemon that
+    /// makes none (a one-shot build, most tests).
+    settles: Option<super::settle::Settles>,
     /// `blaze fetch-url`'s requests, each fetched on a thread of its own.
     fetch_urls: super::fetch_url::FetchUrls,
     /// Builds that failed for want of space, their finish held under the collector's hold id
@@ -1759,15 +1790,22 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             memory_logged: Duration::ZERO,
             given_back: Duration::ZERO,
             idle: super::idle::Idle::default(),
+            pool_idle: super::idle::Idle::every(super::idle::POOL_AFTER),
             pressure_watched: true,
             paused_checked: Duration::ZERO,
             gc: None,
+            settles: None,
             fetch_urls: super::fetch_url::FetchUrls::new(),
             held: Vec::new(), // alloc: none until a build runs out of space
         })
     }
 
     /// Collects what blaze keeps on disk with `gc`, in the background of its turns.
+    /// Moves what its store leaves unread cold, between requests ([`super::settle`]).
+    pub fn settle(&mut self, settles: super::settle::Settles) {
+        self.settles = Some(settles);
+    }
+
     pub fn collect(&mut self, gc: super::gc::Gc) {
         self.gc = Some(gc);
     }
@@ -2069,6 +2107,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let now = self.driver.now();
         let mut wait = if !self.effects.is_empty() || self.plane.ready() {
             (Deadline::PASSED, Woken::Idle)
+        } else if self.plane.running() > 0 && self.plane.wakes() {
+            (Deadline::after(now, MEASURES_EVERY), Woken::PlaneWakes)
         } else if self.plane.running() > 0 {
             (Deadline::after(now, Duration::from_millis(1)), Woken::PlaneTasks)
         } else {
@@ -2088,6 +2128,14 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // A job's wait for the store to make its puts durable has a deadline of its own.
         sooner(self.jobs.next_deadline().map(Deadline::at), Woken::Durable);
         sooner(self.observe.wait(now).map(|it| Deadline::after(now, it)), Woken::Observe);
+        if let Some(settles) = &self.settles {
+            // A batch out comes back over a channel no driver wakes for, and a plan under way
+            // takes a step a turn while the daemon is between requests.
+            if settles.out() || (self.store.settling() && self.quiet_between_requests()) {
+                sooner(Some(Deadline::after(now, Duration::from_millis(1))), Woken::Idle);
+            }
+            sooner(settles.policy.next().map(Deadline::at), Woken::Idle);
+        }
         self.submit();
         let mut done = std::mem::take(&mut self.done);
         let (until, woken) = wait;
@@ -2197,6 +2245,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             self.images.step(parts, idle);
         }
         self.between();
+        self.settle_turn();
         // A stalled job's leases end once its tasks let go of it.
         self.jobs.release_leases();
         let fetched = self.fetch_urls.take_answers();
@@ -2507,6 +2556,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 if now.saturating_sub(self.given_back) >= GIVE_BACK_EVERY {
                     self.given_back = now;
                     crate::raw::memory::purger().ask();
+                    self.give_pools_back(PoolGive::Unpinned);
                 }
             }
             Done::Unwatched => self.pressure_watched = false,
@@ -2592,6 +2642,20 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.said(said);
     }
 
+    /// The stores' buffer pools give pages back to the kernel, on the loop (which alone
+    /// writes the stores): `what` says which. Records are immutable, so nothing is written
+    /// and a page given back is a read when it is next asked for
+    /// (docs/v2/plan/design/restore.md, "Memory: a bounded cache over records").
+    fn give_pools_back(&mut self, what: PoolGive) {
+        let freed = match what {
+            PoolGive::Unread => self.store.trim_pool() + self.std.trim_pool(),
+            PoolGive::Unpinned => self.store.evict_pool(u64::MAX) + self.std.evict_pool(u64::MAX),
+        };
+        if freed != 0 {
+            tracing::info!(target: "blaze", freed, ?what, "the stores' pools gave pages back");
+        }
+    }
+
     /// The plane's and the memory's plots, at most once each [`PLOT_EVERY`] of the driver's
     /// clock, and the memory's breakdown by area once each [`super::breakdown::EVERY`]: each
     /// row of the build under way ([`Jobs::build_under_way`]), 0 while none is.
@@ -2622,6 +2686,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             {
                 self.given_back = now;
                 crate::raw::memory::purger().ask();
+                if pressure.squeezed() {
+                    self.give_pools_back(PoolGive::Unpinned);
+                }
             }
         }
         // Nothing to do for a while: the warm memory each thread keeps for its next task goes
@@ -2633,6 +2700,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             blaze_mem::frame::ask_spare_trim();
             crate::raw::memory::purger().ask();
             self.jobs.say_what_the_kept_front_ends_hold();
+        }
+        // Longer still: the stores' pools give back the pages nothing read again.
+        if self.pool_idle.look(now, working) {
+            self.give_pools_back(PoolGive::Unread);
         }
         blaze_profile::plot(Plot::AllocatorPurgedBytes, crate::raw::memory::purged_bytes());
         blaze_profile::plot(Plot::CommittedBytes, memory.committed);
@@ -3161,6 +3232,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         if self.jobs.ended {
             self.jobs.ended = false;
+            if let Some(settles) = &mut self.settles {
+                settles.policy.build_ended();
+            }
             let _span = tracing::info_span!(
                 target: "blaze",
                 "between requests: collect",
@@ -3223,6 +3297,99 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             self.settling = false;
             if let Err(error) = settled {
                 self.fail(Failed::Settle(error));
+            }
+        }
+    }
+
+    /// The store's cold moves, one step a turn ([`super::settle`]): a batch that came back
+    /// compressed is put, whatever the daemon is doing (it is a copy into the store's segment);
+    /// between requests, the next batch is taken out for a worker, or what follows the cold
+    /// moves is stepped, or a period ends. Nothing here waits for zstd or for a sync.
+    fn settle_turn(&mut self) {
+        use super::settle::{FLUSH_EVERY, STEP_MOST, TAKE_MOST};
+        if self.stopping.is_some() || !self.store.ready() || self.store.broken().is_some() {
+            return;
+        }
+        let quiet = self.quiet_between_requests();
+        let Some(settles) = &mut self.settles else { return };
+        // A commit in flight holds a batch back until its head is written: the store makes
+        // its moves between commits.
+        if !self.store.committing()
+            && let Some(batch) = settles.back()
+        {
+            let bytes = batch.bytes();
+            let span = tracing::info_span!(
+                target: "blaze",
+                "store cold put",
+                kind = batch.kind(),
+                values = batch.len(),
+                bytes,
+                moved = tracing::field::Empty,
+            )
+            .entered();
+            let moved = self.store.settle_put(batch);
+            span.record("moved", moved);
+            settles.unflushed += bytes;
+        }
+        if !self.jobs.idle()
+            || self.jobs.storing() > 0
+            || self.jobs.placing_after() != 0
+            || !quiet
+            // The settle's image is being written: the two do not share the disk.
+            || self.settling
+            || settles.out()
+        {
+            return;
+        }
+        if self.store.settling() {
+            if self.store.committing() {
+                return;
+            }
+            let taken = {
+                let _span = tracing::info_span!(target: "blaze", "store cold take").entered();
+                self.store.settle_take(TAKE_MOST)
+            };
+            match taken {
+                Some(batch) => settles.compress(batch),
+                None => {
+                    let span = tracing::info_span!(
+                        target: "blaze",
+                        "store settle step",
+                        promoted = tracing::field::Empty,
+                        retired = tracing::field::Empty,
+                        more = tracing::field::Empty,
+                    )
+                    .entered();
+                    let settled = self.store.settle_step(STEP_MOST, &mut self.effects);
+                    span.record("promoted", settled.promoted);
+                    span.record("retired", settled.retired);
+                    span.record("more", settled.more);
+                }
+            }
+            if settles.unflushed >= FLUSH_EVERY {
+                settles.unflushed = 0;
+                self.store.flush(&mut self.effects);
+            }
+            return;
+        }
+        // The plan is done: what its batches moved is committed.
+        if settles.unflushed > 0 {
+            settles.unflushed = 0;
+            self.store.flush(&mut self.effects);
+            return;
+        }
+        let now = self.driver.now();
+        if settles.policy.due(now) {
+            let span = tracing::info_span!(
+                target: "blaze",
+                "store period ends",
+                ended = tracing::field::Empty,
+            )
+            .entered();
+            let ended = self.store.end_period();
+            span.record("ended", ended);
+            if ended {
+                settles.policy.ended(now);
             }
         }
     }

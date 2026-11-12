@@ -80,7 +80,7 @@ mod words;
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
-use std::{collections::VecDeque, fmt, sync::Arc};
+use std::{borrow::Cow, collections::VecDeque, fmt, sync::Arc};
 
 use blaze_core::{Cache, Completion, Done, Durable, Effect, FileName, Mapping, Tag};
 use blaze_format::{SchemaHash, tiers::BufferColumns};
@@ -115,10 +115,17 @@ pub use crate::segment::Writer;
 use crate::segment::{COPY, Chunk, ChunkRef, FRAME, Own, Segment};
 use crate::table::{Held, Table};
 
-/// The format of everything in a store's directory. A store of another refuses to open, naming
-/// both; nothing reads it as this one, and there is no migration: the store is rebuilt from
-/// what made it. Format 4 added each pack's block checks ([`checks`], `checks-<n>`).
-pub(crate) const FORMAT: u32 = 4;
+/// The format of everything in a store's directory, as it is written. A store older than
+/// [`FORMAT_READ`] or newer than this refuses to open, naming both; nothing reads it as this
+/// one, and there is no migration: the store is rebuilt from what made it. Format 4 added each
+/// pack's block checks ([`checks`], `checks-<n>`). Format 5 added a head's whole files to
+/// remove ([`disk::EXTERNAL_REMOVED`]: a hot value's file of its own, let go once a settle
+/// moved the value cold into a pack); a head and an index of format 4 are read as they are,
+/// and what is written next is of format 5, which a blaze of format 4 refuses by name.
+pub(crate) const FORMAT: u32 = 5;
+
+/// The oldest format read ([`FORMAT`]).
+pub(crate) const FORMAT_READ: u32 = 4;
 
 /// A pack is closed for appends once it is this long; a record longer than that has a pack of
 /// its own.
@@ -127,9 +134,10 @@ const PACK_MOST: u64 = 1 << 30;
 #[cfg(test)]
 const PACK_MOST: u64 = 256 << 10;
 
-/// A value shorter than this stays as it is: compressing it saves less than its index slot
-/// costs. A cold kind's value is the exception once its kind has a dictionary: values of one
-/// kind share most of their bytes, which the dictionary takes out of even a short one.
+/// A value shorter than this stays as it is while its kind has no dictionary: compressed
+/// alone it saves less than its index slot costs. Once its kind has one it is moved cold as
+/// any other: values of one kind share most of their bytes, which the dictionary takes out of
+/// even a short one.
 const DEMOTE_FROM: u64 = 4 << 10;
 
 /// One [`Store::settle`] moves or copies at most this many bytes, so it stays a short step.
@@ -915,6 +923,9 @@ pub struct Store {
     commit: Option<Commit>,
     /// A flush asked for while a commit was in flight.
     flush_wanted: bool,
+    /// A commit that waits for the removal of a whole file it would write again
+    /// ([`Tier::removing`]): begun when that removal answers.
+    commit_deferred: bool,
     /// Steps of a commit that have answered (a truncate, a write, a sync, the head), ever:
     /// [`Store::commit_steps`].
     commit_steps: u64,
@@ -942,6 +953,10 @@ pub struct Store {
     /// The outputs being written from the runs their maker holds ([`Content::Sparse`],
     /// [`Store::place_made`]), by the tag their place was asked with.
     writing: HashMap<Tag, publish::Writing, Global>, // alloc: the store's own table, for its life
+    /// The paths a program is started from ([`Store::starts`]): a clone renamed onto one is
+    /// first asked to hold in memory what the system holds of the path's file
+    /// ([`Effect::Prewarm`]), whichever way it is placed.
+    started: HashSet<FileName, Global>, // alloc: the store's own table, a name an executable placed
     /// The whole files of outputs placed by cloning ([`CLONE_FROM`]), by content.
     files: ByHash<ContentId, PlacedFile, Global>, // alloc: the store's own table, for its life
     /// The whole files that are derived values' ([`Kind::Derived`]), each by its key's hash
@@ -974,6 +989,9 @@ pub struct Store {
     /// How many times the own tier's read flags have rotated since its rows were last
     /// numbered afresh: a record is unread for two periods only once there have been two.
     periods: u32,
+    /// What the last period's end ([`Store::end_period`]) planned and no
+    /// [`Store::settle_step`] has made yet.
+    moves: Option<Moves>,
     /// The encodings of each schema whose values it keeps in columns.
     columns: Arc<Encodings>,
     /// The other writers of its directory's shared one ([`Store::open_shared`]).
@@ -1300,6 +1318,235 @@ pub struct Settled {
     pub more: bool,
 }
 
+/// The moves between tiers a period's end planned ([`Store::plan_moves`]), and how far they
+/// are made.
+struct Moves {
+    /// To move colder, by kind and then by place; `demoted` of them are done. Each with its
+    /// row as the plan found it, which only the settle that made the plan may use: a step
+    /// comes after commits, and an index swap between two numbers the rows afresh.
+    demote: Vec<(Key, Loc, Row)>,
+    demoted: usize,
+    /// To move hot, by place; `promoted` of them are done.
+    promote: Vec<(Key, Loc, Row)>,
+    promoted: usize,
+}
+
+/// How much one call may move ([`Store::work_moves`], [`Store::settle_take`]) and how much it
+/// has.
+struct Budget {
+    most: u64,
+    /// Of `most`, what short cold records may take.
+    short_most: u64,
+    spent: u64,
+    spent_short: u64,
+    /// Short records were passed by for their share: more to do at the next period's end.
+    more_short: bool,
+}
+
+/// Values of one kind a settle moves cold, named and waiting to be read and compressed:
+/// [`ColdBatch::compress`] is the work, which reads each value as any reader of the store
+/// does (no lock, through the pool) and runs on any thread; the store takes the batch back
+/// with [`Store::settle_put`]. The thread that owns the store reads, hashes and compresses
+/// nothing of it.
+pub struct ColdBatch {
+    kind: Kind,
+    reader: Reader,
+    encodings: Arc<Encodings>,
+    /// The kind's dictionary and its number in the store, for the values under
+    /// [`cold::LONG_FROM`].
+    dictionary: Option<(u32, Arc<cold::Prepared>)>,
+    /// The kind has no dictionary and wants one: [`ColdBatch::compress`] trains one on the
+    /// batch's values where they are enough ([`cold::TRAIN_VALUES`], [`cold::TRAIN_BYTES`]).
+    train: bool,
+    /// The dictionary it trained, which its values under [`cold::LONG_FROM`] are compressed
+    /// with: the store keeps it as the kind's when it takes the batch back.
+    trained: Option<Arc<cold::Prepared>>,
+    items: Vec<ColdItem>,
+    /// The bytes of its values, uncompressed, as their records say.
+    bytes: u64,
+    /// What it could not move and why, for the store's problems.
+    problems: Vec<String>,
+}
+
+struct ColdItem {
+    key: Key,
+    /// Where the record was when the batch was taken: the move is made only if it still is.
+    loc: Loc,
+    row: Row,
+    state: Cold,
+}
+
+/// What [`ColdBatch::compress`] made of one value.
+enum Cold {
+    /// Not looked at yet.
+    Taken,
+    /// Left as it is: its record moved meanwhile, it could not be read (said in the batch's
+    /// problems), or it is short and its kind has no dictionary.
+    Left,
+    /// Moving it colder saves too little: not tried again.
+    Tried,
+    /// zstd refused it: the store stops.
+    Refused(String),
+    /// The record to write in its place. `dictionary`: compressed with the batch's.
+    Stored { content: ContentId, form: Form, dictionary: bool, payload: Vec<u8> },
+}
+
+/// The values a batch that trains may hold, whatever the step's budget: a training needs
+/// [`cold::TRAIN_BYTES`] of values at once.
+const TRAIN_TAKE: u64 = 8 << 20;
+
+impl ColdBatch {
+    /// The bytes of its values, uncompressed.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// How many values it holds.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Whether it holds no value (never, of a batch the store gave).
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// The name of the kind its values are of.
+    pub fn kind(&self) -> &'static str {
+        self.kind.name()
+    }
+
+    /// Whether it trained its kind's dictionary ([`ColdBatch::compress`]).
+    pub fn trained(&self) -> bool {
+        self.trained.is_some()
+    }
+
+    /// Reads every value (verified against its hash, as a move reads it), trains the kind's
+    /// dictionary where it has none and the values are enough, and compresses each: packed
+    /// columns for a value of a schema with encodings, zstd with the dictionary, or, for a
+    /// long value, zstd with long-distance matching on zstd's own threads
+    /// ([`cold::compress_long`]). Deterministic: the bytes depend on the values and the
+    /// dictionary alone.
+    pub fn compress(&mut self) {
+        let guard = enter();
+        let look = Look::new(&self.reader.shared, Held::task(&guard));
+        // alloc: once per batch (a worker's), each value as it is read: in place for a raw record
+        let mut values = Vec::with_capacity(self.items.len());
+        for item in &self.items {
+            values.push(match movable_in(look, &item.key, item.loc) {
+                Ok(value) => value,
+                Err(why) => {
+                    self.problems.push(why);
+                    None
+                }
+            });
+        }
+        if self.train && self.dictionary.is_none() {
+            // Distinct raw values under `LONG_FROM`, as a put samples them.
+            let mut seen = ByHashSet::new_in(Global); // alloc: once per training batch
+            // alloc: once per training batch, the samples as slices for zstd
+            let mut samples: Vec<&[u8]> = Vec::new();
+            let mut bytes = 0u64;
+            for (item, value) in self.items.iter().zip(&values) {
+                let Some((content, value)) = value else { continue };
+                if item.loc.form != Form::Raw
+                    || value.len() >= cold::LONG_FROM
+                    || samples.len() >= cold::SAMPLES_MOST
+                    || bytes + value.len() as u64 > cold::SAMPLE_BYTES_MOST
+                    || !seen.insert(*content)
+                {
+                    continue;
+                }
+                bytes += value.len() as u64;
+                samples.push(&**value);
+            }
+            if samples.len() >= cold::TRAIN_VALUES && bytes >= cold::TRAIN_BYTES {
+                match cold::train(&samples).and_then(cold::Prepared::new) {
+                    // alloc: once per dictionary trained
+                    Ok(prepared) => self.trained = Some(Arc::new(prepared)),
+                    // alloc: a problem reported
+                    Err(why) => self.problems.push(format!(
+                        "the {} values under {DEMOTE_FROM} bytes stay raw: no dictionary was trained on {} of them: {why}",
+                        self.kind.name(),
+                        samples.len()
+                    )),
+                }
+            }
+        }
+        let dictionary =
+            self.dictionary.as_ref().map(|(_, it)| &**it).or(self.trained.as_deref());
+        let mut short = cold::Batch::new(dictionary);
+        for (item, value) in self.items.iter_mut().zip(values) {
+            let Some((content, value)) = value else {
+                item.state = Cold::Left;
+                continue;
+            };
+            let loc = item.loc;
+            item.state = if let Some(columns) = encodings_of(&self.encodings, &value) {
+                match colder_columns(columns, loc, &value) {
+                    Ok(Some((form, payload))) => {
+                        Cold::Stored { content, form, dictionary: false, payload }
+                    }
+                    Ok(None) => Cold::Tried,
+                    Err(why) => {
+                        // alloc: a problem reported, an encoding that failed
+                        self.problems.push(format!("{:x} is not moved colder: {why}", item.key.0));
+                        Cold::Tried
+                    }
+                }
+            } else if loc.raw < DEMOTE_FROM && dictionary.is_none() {
+                // Compressed alone it saves too little, and marked tried it would never move
+                // once a dictionary is trained.
+                Cold::Left
+            } else {
+                let long = value.len() >= cold::LONG_FROM;
+                let stored = match (long, &mut short) {
+                    (true, _) => cold::compress_long(&value),
+                    (false, Ok(short)) => short.compress(&value),
+                    // clone: the error, once per value of a batch zstd would not start for
+                    (false, Err(why)) => Err(why.clone()),
+                };
+                match stored {
+                    Err(why) => Cold::Refused(why),
+                    Ok(stored) if stored.len() as u64 + loc.raw / 8 > loc.raw => Cold::Tried,
+                    Ok(payload) => Cold::Stored {
+                        content,
+                        form: Form::Zstd,
+                        dictionary: !long && dictionary.is_some(),
+                        payload,
+                    },
+                }
+            };
+        }
+    }
+}
+
+/// The bytes of the record of `key` at `loc`, verified, as a move reads them: `None` when the
+/// key's record is no longer there, `Err` with why when it cannot be moved.
+fn movable_in<'a>(
+    look: Look<'a>,
+    key: &Key,
+    loc: Loc,
+) -> Result<Option<(ContentId, Cow<'a, [u8]>)>, String> {
+    let found = match look.find(key) {
+        Some(Ok(found)) if found.place == Place::Pack(loc) => found,
+        // alloc: a problem reported
+        Some(Err(corrupt)) => return Err(format!("not moved between tiers: {corrupt}")),
+        _ => return Ok(None),
+    };
+    match look.value(found, key, Use::Move) {
+        // `replace` counts the old record's bytes dead by `loc`, which came from an index
+        // slot nothing checked: it must be the record that was read.
+        Ok((header, _)) if header.stored != loc.stored || header.raw != loc.raw => {
+            // alloc: a problem reported
+            Err(format!("{:x} is not moved: its record is not the one its index names", key.0))
+        }
+        Ok((header, bytes)) => Ok(Some((header.content, bytes))),
+        // alloc: a problem reported
+        Err(corrupt) => Err(format!("not moved between tiers: {corrupt}")),
+    }
+}
+
 /// Why a record's bytes are wanted, which decides whether its check is remembered and
 /// whether it counts as read.
 #[derive(Clone, Copy)]
@@ -1383,6 +1630,11 @@ enum Op {
     RemovePack {
         pack: usize,
     },
+    /// A whole file no key names, removed once a durable head lists it as removed.
+    RemoveExternal {
+        content: ContentId,
+        file: FileName,
+    },
     /// `staged`'s name removed (a clone an earlier run of this store left there under the same
     /// tag) so `from` can be cloned there, to be renamed onto `to`; `of`, the content of the
     /// whole file of [`PlacedFile`] it clones.
@@ -1401,6 +1653,15 @@ enum Op {
         to: FileName,
         staged: Option<Staged>,
         of: Option<Source>,
+        bytes: PlacedBytes,
+    },
+    /// `staged`'s clone, of a path a program is started from ([`Store::starts`]), asked to
+    /// hold in memory what the system holds of `to`'s file ([`Effect::Prewarm`]), before it is
+    /// renamed onto `to`: after the rename `to` names the clone.
+    Warm {
+        asked: Tag,
+        to: FileName,
+        staged: Staged,
         bytes: PlacedBytes,
     },
     /// `staged`'s clone renamed onto `to`.
@@ -1471,6 +1732,11 @@ enum Op {
     },
     /// One of the ranges of the output place `asked` derives written, or its length set.
     PatchWrite {
+        asked: Tag,
+    },
+    /// The clone the output place `asked` derives, of a path a program is started from, asked
+    /// to hold in memory what the system holds of its path's file, as [`Op::Warm`].
+    PatchWarm {
         asked: Tag,
     },
     /// The output place `asked` derives renamed from its staged name onto its path.
@@ -1556,6 +1822,10 @@ struct Tier {
     /// The delta an index swap left, while a writer may still put into it.
     prev: Option<Arc<Table<Spot>>>,
     externals: ByHash<ContentId, External, Global>, // alloc: the store's own table, for its life
+    /// Whole files the head on disk lists as removed whose removal has not answered: a commit
+    /// that would write one of them again waits for it ([`Store::start_commit`]), so no write
+    /// of a name meets the removal of the same name.
+    removing: Vec<ContentId>,
     /// By number, which a compressed record names.
     dictionaries: Vec<Dictionary>,
     /// Each unit's crate version by its number less one, and the number of each.
@@ -1582,6 +1852,8 @@ impl Tier {
             delta: Arc::new(Table::new(DELTA_FIRST, FLAGS)),
             prev: None,
             externals: ByHash::new_in(Global), // alloc: the store's own table, for its life
+            // alloc: empty, allocates nothing
+            removing: Vec::new(),
             // alloc: empty, allocates nothing
             dictionaries: Vec::new(),
             // alloc: empty, allocates nothing
@@ -1709,6 +1981,15 @@ struct External {
     /// Held until it is written and mapped.
     memory: Option<Vec<u8>>,
     committed: bool,
+    /// The keys whose record names this file, as far as is known: counted when a period ends
+    /// ([`Store::tier_moves`]), one more for each record drained since, one less for each a
+    /// settle moved cold into a pack. It may be too many (a record counted in its segment and
+    /// again as it is drained), never too few: at none, no key reads the file.
+    keys: u32,
+    /// No key names it any more ([`Store::external_replaced`]): the next head lists it as
+    /// removed ([`disk::EXTERNAL_REMOVED`]) and the file is removed once that head is durable.
+    /// A record of its content drained before then takes it back.
+    dropped: bool,
 }
 
 struct Dictionary {
@@ -1771,6 +2052,8 @@ struct Commit {
     /// The writes of each of `packs` not yet answered: its sync is asked after its last.
     writes: Vec<u32>,
     externals: Vec<ContentId>,
+    /// The whole files its head lists as removed for the first time: removed once it is durable.
+    dropped: Vec<ContentId>,
     /// The slot of the index table it wrote, and the last batch that table holds.
     index: Option<(u8, u64)>,
     head: Head,
@@ -1944,6 +2227,7 @@ impl Store {
             place_spans: HashMap::new_in(Global), // alloc: the store's own table, for its life
             patching: HashMap::new_in(Global), // alloc: the store's own table, for its life
             writing: HashMap::new_in(Global), // alloc: the store's own table, for its life
+            started: HashSet::new_in(Global), // alloc: the store's own table, for its life
             files: ByHash::new_in(Global), // alloc: the store's own table, for its life
             derived: ByHash::new_in(Global), // alloc: the store's own table, for its life
             derive_depth: 0,
@@ -1956,6 +2240,8 @@ impl Store {
             new_keys: None,
             epoch: 0,
             periods: 0,
+            moves: None,
+            commit_deferred: false,
             columns,
             peers,
             staging,
@@ -2145,6 +2431,28 @@ impl Store {
         self.hot.evict(bytes).map_or(0, |swept| swept.freed)
     }
 
+    /// Its pool's pages that nothing read again since the sweep last came by, given back to
+    /// the kernel: one lap, so what the last builds read more than once stays for the next
+    /// edit and a pool nothing reads is gone after two. What an idle daemon asks, once a
+    /// stretch of idleness, where [`Store::evict_pool`] is what a daemon short of memory asks.
+    /// The bytes given back. The pins of tasks that have ended are let go first.
+    ///
+    /// On a store whose misses are pumped nothing loads a page again but its opening, so it
+    /// gives none back: 0.
+    pub fn trim_pool(&mut self) -> u64 {
+        self.tidy();
+        if self.hot.pumped() {
+            return 0;
+        }
+        // As `evict_pool` does: the pins of every task that has ended go back as its grace
+        // passes, and those of running tasks stay.
+        let old = self.shared.fresh_owned();
+        self.limbo.retire(old);
+        self.limbo.collect();
+        self.shared.pins_let_go();
+        self.hot.trim().map_or(0, |swept| swept.freed)
+    }
+
     /// Its pool's pages now, from one walk of their state words: bytes loaded, bytes of them
     /// pinned, and bytes a sweep could give back. `None` when it has no pool.
     pub fn pool_census(&self) -> Option<PoolCensus> {
@@ -2251,9 +2559,9 @@ impl Store {
     /// colder: a value of a schema it was given encodings for ([`Store::encode_columns`]) goes
     /// from hot to warm columns (or straight to cold where warm saves too little) and from warm
     /// to cold columns; any other goes from raw or LZ4 to zstd. A record read in two periods
-    /// running moves hot. The daemon
-    /// calls it when idle, never on the way of a get or a put, and it moves a bounded number of
-    /// bytes a call.
+    /// running moves hot. It moves a bounded number of bytes a call ([`SETTLE_MOST`]), which
+    /// is still far more than a caller with someone waiting can afford: the daemon's loop ends
+    /// its periods with [`Store::end_period`] and moves in [`Store::settle_step`]s.
     pub fn settle(&mut self, effects: &mut Vec<Effect>) -> Settled {
         assert!(self.tiers[0].opened, "a settle of a store that is not open");
         self.tidy();
@@ -2265,133 +2573,150 @@ impl Store {
             settled.more = true;
             return settled;
         }
-        let mut spent: u64 = 0;
-        // What short cold records took of `spent`, and whether some were left for the next.
-        let (mut spent_short, mut more_short) = (0u64, false);
-        let encodings = Arc::clone(&self.columns);
-        let (mut demote, mut promote) = self.tier_moves();
+        // What an earlier period's steps left is planned again from this period's flags.
+        self.moves = None;
+        let mut moves = self.plan_moves();
+        let settled = self.work_moves(&mut moves, SETTLE_MOST, SHORT_MOST, false);
+        self.rotate_period();
+        self.start_commit(effects);
+        settled
+    }
+
+    /// Ends a period of reading and plans what its end moves ([`Store::settle`]'s rule), moving
+    /// nothing: [`Store::settle_step`] does the moves, a bounded number of bytes a call.
+    /// `false`, and no period ended, while the store cannot plan (it is broken, or a commit, an
+    /// index swap or its fold is in flight): ask again later. What an earlier period's steps
+    /// had not reached is planned again, by this period's flags.
+    pub fn end_period(&mut self) -> bool {
+        assert!(self.tiers[0].opened, "a period ended of a store that is not open");
+        self.tidy();
+        if self.broken.is_some()
+            || self.commit.is_some()
+            || self.index_mapping
+            || self.migrating.is_some()
+        {
+            return false;
+        }
+        let moves = self.plan_moves();
+        self.rotate_period();
+        self.moves = Some(moves);
+        true
+    }
+
+    /// Whether a period's end left moves a [`Store::settle_step`] has not made.
+    pub fn settling(&self) -> bool {
+        self.moves.is_some()
+    }
+
+    /// One step of the moves the last [`Store::end_period`] planned: at most `most` bytes of
+    /// values moved (one value, however long, when nothing was moved yet), then a commit of
+    /// what moved. `more` while the plan has moves left, or the step could not run (a commit
+    /// in flight): call again. A record read since the period ended is left where it is.
+    ///
+    /// A step compresses on the caller's thread: about `most` bytes at zstd's level 6, so a
+    /// caller that must answer within a bound chooses `most` by it.
+    pub fn settle_step(&mut self, most: u64, effects: &mut Vec<Effect>) -> Settled {
+        assert!(self.tiers[0].opened, "a settle of a store that is not open");
+        self.tidy();
+        let mut settled = Settled::default();
+        if self.broken.is_some() {
+            self.moves = None;
+            return settled;
+        }
+        let Some(mut moves) = self.moves.take() else { return settled };
+        if self.commit.is_some() || self.index_mapping || self.migrating.is_some() {
+            self.moves = Some(moves);
+            settled.more = true;
+            return settled;
+        }
+        // An index swap since the plan numbered the rows afresh. The plan stands: a step
+        // finds each record by its key again and never by the plan's row.
+        let settled = self.work_moves(&mut moves, most, u64::MAX, true);
+        if settled.more && self.broken.is_none() {
+            self.moves = Some(moves);
+        }
+        if settled.demoted + settled.promoted + settled.retired > 0 {
+            self.start_commit(effects);
+        }
+        settled
+    }
+
+    /// The moves the period ending now asks for, in the order they are made.
+    fn plan_moves(&mut self) -> Moves {
+        let (mut demote, mut promote, named) = self.tier_moves();
+        for (content, external) in &mut self.tiers[0].externals {
+            external.keys = named.get(content).copied().unwrap_or(0);
+        }
         radix::sort_by_key(&mut demote, |(_, loc, _)| {
             (u128::from(loc.kind.code()) << 96) | radix::pack_64(u64::from(loc.pack), loc.offset)
         });
         radix::sort_by_key(&mut promote, |(_, loc, _)| {
             radix::pack_64(u64::from(loc.pack), loc.offset)
         });
-        'kinds: for group in demote.chunk_by(|a, b| a.1.kind == b.1.kind) {
-            let kind = group[0].1.kind;
-            if self.dictionary_of(kind).is_none() {
-                // Long records are not sampled, as `put` does not sample them: a few would fill the
-                // samples with too few values and give the kind up.
-                let long = cold::LONG_FROM as u64;
-                for &(_, loc, _) in
-                    group.iter().filter(|(_, loc, _)| loc.form == Form::Raw && loc.raw < long)
-                {
-                    // The samples are full (and trained, or gave up) or the kind gave up: a
-                    // copy would be kept as no sample.
-                    if !self.training[kind.code() as usize].wants_samples() {
-                        break;
-                    }
-                    let pack = &self.tiers[0].packs[loc.pack as usize];
-                    let payload = loc.offset.checked_add(RECORD_HEADER);
-                    let look = Look::new(&self.shared, Held::writer(&*self.shared));
-                    let Some(raw) = payload.and_then(|at| pack.bytes(look, at, loc.raw)) else {
-                        continue;
-                    };
-                    // A record met by an earlier settle, or put while the store is open, is
-                    // sampled already: a settle that meets it again adds nothing.
-                    let content = content_of(raw);
-                    if self.training[kind.code() as usize].sampled.contains(&content) {
-                        continue;
-                    }
-                    // alloc: a settle (idle), a value not sampled yet, until a dictionary is trained; `sample` keeps a copy and may append to the pack this borrows
-                    let bytes = raw.to_vec();
-                    self.sample(kind, content, &bytes);
-                    if self.dictionary_of(kind).is_some() {
-                        break;
-                    }
-                }
-            }
-            let number = self.dictionary_of(kind);
-            let dictionary = number.map(|number| {
-                self.tiers[0].dictionaries[number as usize]
-                    .bytes
-                    // clone: an `Arc`, once per kind a settle (idle), held while it appends
-                    .clone()
-                    .expect("a dictionary of its own is held")
-            });
-            let mut batch = match cold::Batch::new(dictionary.as_deref()) {
-                Ok(batch) => batch,
-                Err(why) => {
-                    self.cannot_compress(kind, &why);
-                    return settled;
-                }
-            };
-            for &(key, loc, row) in group {
-                let short = loc.raw < DEMOTE_FROM;
-                // A short cold record is listed while its kind has no dictionary only to be
-                // sampled (`tier_moves`). It is not moved yet: without the dictionary it saves
-                // too little, and would be marked tried and never moved once one is trained.
-                if short && number.is_none() {
-                    continue;
-                }
-                // A short record costs a record's work: counted as `DEMOTE_FROM` bytes, so a
-                // settle of many short records stays a short step too. They have at most
-                // `SHORT_MOST` of a settle, so a backlog of them leaves the rest of the step to
-                // longer records, promotion and retiring.
-                let cost = loc.raw.max(DEMOTE_FROM);
-                if short && spent_short.saturating_add(cost) > SHORT_MOST {
-                    more_short = true;
-                    continue;
-                }
-                if spent > 0 && spent.saturating_add(cost) > SETTLE_MOST {
-                    settled.more = true;
-                    break 'kinds;
-                }
-                let Some((content, bytes)) = self.movable(key, loc) else { continue };
-                spent += cost;
-                if short {
-                    spent_short += cost;
-                }
-                if let Some(columns) = encodings_of(&encodings, &bytes) {
-                    match colder_columns(columns, loc, &bytes) {
-                        Ok(Some((form, payload))) => {
-                            self.replace(key, loc, form, 0, content, &payload);
-                            settled.demoted += 1;
-                        }
-                        Ok(None) => self.set_flag(row, Flag::Tried),
-                        Err(why) => {
-                            // alloc: a problem reported, an encoding that failed
-                            self.problems.push(format!("{:x} is not moved colder: {why}", key.0));
-                            self.set_flag(row, Flag::Tried);
-                        }
-                    }
-                    continue;
-                }
-                let long = bytes.len() >= cold::LONG_FROM;
-                let stored =
-                    if long { cold::compress_long(&bytes) } else { batch.compress(&bytes) };
-                let stored = match stored {
-                    Ok(stored) => stored,
-                    Err(why) => {
-                        self.cannot_compress(kind, &why);
-                        return settled;
-                    }
-                };
-                if stored.len() as u64 + loc.raw / 8 > loc.raw {
-                    self.set_flag(row, Flag::Tried);
-                    continue;
-                }
-                let dictionary = if long { NO_DICTIONARY } else { number.unwrap_or(NO_DICTIONARY) };
-                self.replace(key, loc, Form::Zstd, dictionary, content, &stored);
-                settled.demoted += 1;
-            }
+        Moves { demote, demoted: 0, promote, promoted: 0 }
+    }
+
+    /// The period of reading ended: this period's flags are the period before's.
+    fn rotate_period(&mut self) {
+        let own = &self.tiers[0];
+        if let Some(index) = &own.index {
+            index.bits.rotate();
         }
-        for (key, loc, row) in promote {
-            if settled.more || (spent > 0 && spent.saturating_add(loc.raw) > SETTLE_MOST) {
+        own.delta.rotate(Flag::Read as usize, Flag::ReadBefore as usize);
+        own.delta.rotate(Flag::New as usize, Flag::NewBefore as usize);
+        self.periods = self.periods.saturating_add(1);
+    }
+
+    /// Whether the record of `key` at `loc` was read since the period ended whose plan
+    /// listed it (a step's question: the flags rotated before its plan's moves began).
+    fn read_since(&self, key: &Key, loc: Loc) -> bool {
+        match self.look().find(key) {
+            Some(Ok(found)) if found.place == Place::Pack(loc) => found.at.get(Flag::Read),
+            _ => false,
+        }
+    }
+
+    /// Makes the moves of `moves` from where the last call left them: at most `most` bytes of
+    /// values (the first whatever its length), of which short cold records get `short_most`.
+    /// `stepped`: the plan's period ended before this call (a [`Store::settle_step`]), so a
+    /// record read since stays, and a row is its key's row now, not the plan's.
+    fn work_moves(
+        &mut self,
+        moves: &mut Moves,
+        most: u64,
+        short_most: u64,
+        stepped: bool,
+    ) -> Settled {
+        let mut settled = Settled::default();
+        let mut budget = Budget { most, short_most, spent: 0, spent_short: 0, more_short: false };
+        loop {
+            let (batch, more) = self.take_cold(moves, &mut budget, stepped, false);
+            if let Some(mut batch) = batch {
+                batch.compress();
+                settled.demoted += self.put_cold(batch, stepped);
+            }
+            if self.broken.is_some() {
+                return settled;
+            }
+            if more {
                 settled.more = true;
                 break;
             }
+            if moves.demoted >= moves.demote.len() {
+                break;
+            }
+        }
+        let spent = &mut budget.spent;
+        let more_short = budget.more_short;
+        while moves.promoted < moves.promote.len() {
+            let (key, loc, _) = moves.promote[moves.promoted];
+            if settled.more || (*spent > 0 && spent.saturating_add(loc.raw) > most) {
+                settled.more = true;
+                break;
+            }
+            moves.promoted += 1;
             let Some((content, bytes)) = self.movable(key, loc) else { continue };
-            spent += loc.raw;
+            *spent += loc.raw;
             match (loc.kind == Kind::Output).then(|| cold::lz4(&bytes)).flatten() {
                 Some(stored) => self.replace(key, loc, Form::Lz4, 0, content, &stored),
                 None => self.replace(key, loc, Form::Raw, 0, content, &bytes),
@@ -2404,54 +2729,361 @@ impl Store {
             }
             let Some(live) = self.live_records(at) else { continue };
             let bytes: u64 = live.iter().map(|(header, _)| header.span()).sum();
-            if spent > 0 && spent + bytes > SETTLE_MOST {
+            if *spent > 0 && *spent + bytes > most {
                 settled.more = true;
                 break;
             }
-            spent += bytes;
+            *spent += bytes;
             let unit = Unit(self.tiers[0].packs[at].unit);
+            // Before anything of it is written again: what is copied on, and the dictionaries
+            // it holds, go to a pack that stays (`writable_pack` passes a retiring one by).
+            self.tiers[0].packs[at].retiring = true;
             for (header, payload) in live {
                 self.rehome(unit, header, &payload);
             }
-            self.tiers[0].packs[at].retiring = true;
+            self.move_dictionaries(at);
             settled.retired += 1;
         }
         // Short records left by their share are more to do, said only now: `settled.more` set
         // earlier would stop promotion and retiring in this settle.
         settled.more |= more_short;
-        let own = &self.tiers[0];
-        if let Some(index) = &own.index {
-            index.bits.rotate();
-        }
-        own.delta.rotate(Flag::Read as usize, Flag::ReadBefore as usize);
-        own.delta.rotate(Flag::New as usize, Flag::NewBefore as usize);
-        self.periods = self.periods.saturating_add(1);
-        self.start_commit(effects);
         settled
+    }
+
+    /// The next values of one kind the plan moves cold, named for a batch
+    /// ([`ColdBatch::compress`] reads and compresses them, on any thread), as far as `budget`
+    /// allows; and whether the budget stopped it with moves of the plan left. `worker`: the
+    /// batch goes to another thread ([`Store::settle_take`]), so nothing is read here and the
+    /// kind's dictionary is trained by the batch; else the samples its kind's training wants
+    /// are read here, as a put samples.
+    fn take_cold(
+        &mut self,
+        moves: &mut Moves,
+        budget: &mut Budget,
+        stepped: bool,
+        worker: bool,
+    ) -> (Option<ColdBatch>, bool) {
+        if moves.demoted >= moves.demote.len() {
+            return (None, false);
+        }
+        let from = moves.demoted;
+        let kind = moves.demote[from].1.kind;
+        let to =
+            from + moves.demote[from..].iter().take_while(|(_, loc, _)| loc.kind == kind).count();
+        if !worker && self.dictionary_of(kind).is_none() {
+            // Long records are not sampled, as `put` does not sample them: a few would fill the
+            // samples with too few values and give the kind up.
+            let long = cold::LONG_FROM as u64;
+            for at in from..to {
+                let (_, loc, _) = moves.demote[at];
+                if loc.form != Form::Raw || loc.raw >= long {
+                    continue;
+                }
+                // The samples are full (and trained, or gave up) or the kind gave up: a
+                // copy would be kept as no sample.
+                if !self.training[kind.code() as usize].wants_samples() {
+                    break;
+                }
+                let pack = &self.tiers[0].packs[loc.pack as usize];
+                let payload = loc.offset.checked_add(RECORD_HEADER);
+                let look = Look::new(&self.shared, Held::writer(&*self.shared));
+                let Some(raw) = payload.and_then(|at| pack.bytes(look, at, loc.raw)) else {
+                    continue;
+                };
+                // A record met by an earlier settle, or put while the store is open, is
+                // sampled already: a settle that meets it again adds nothing.
+                let content = content_of(raw);
+                if self.training[kind.code() as usize].sampled.contains(&content) {
+                    continue;
+                }
+                // alloc: a settle (idle), a value not sampled yet, until a dictionary is trained; `sample` keeps a copy and may append to the pack this borrows
+                let bytes = raw.to_vec();
+                self.sample(kind, content, &bytes);
+                if self.dictionary_of(kind).is_some() {
+                    break;
+                }
+            }
+        }
+        let number = self.dictionary_of(kind);
+        let dictionary = number.map(|number| {
+            let bytes = self.tiers[0].dictionaries[number as usize]
+                .bytes
+                // clone: an `Arc`, once per batch of a settle (idle), held while it compresses
+                .clone()
+                .expect("a dictionary of its own is held");
+            (number, bytes)
+        });
+        // A batch trains where the plan lists enough of the kind's values for a training:
+        // it then takes them at once, whatever the step's budget.
+        let train = worker
+            && number.is_none()
+            && self.training[kind.code() as usize].wants_samples()
+            && moves.demote[from..to]
+                .iter()
+                .filter(|(_, loc, _)| loc.form == Form::Raw && loc.raw < cold::LONG_FROM as u64)
+                .take(cold::TRAIN_VALUES)
+                .count()
+                == cold::TRAIN_VALUES;
+        let most = if train { budget.most.max(TRAIN_TAKE) } else { budget.most };
+        let mut batch = ColdBatch {
+            kind,
+            reader: self.reader(),
+            encodings: Arc::clone(&self.columns),
+            dictionary,
+            train,
+            trained: None,
+            // alloc: once per batch of a settle (idle), the values it names
+            items: Vec::new(),
+            bytes: 0,
+            // alloc: empty, allocates nothing
+            problems: Vec::new(),
+        };
+        let mut more = false;
+        for at in from..to {
+            let (key, loc, row) = moves.demote[at];
+            let short = loc.raw < DEMOTE_FROM;
+            // A short record is listed while its kind has no dictionary only to be sampled
+            // (`tier_moves`). It is not moved yet: without the dictionary it saves too
+            // little, and would be marked tried and never moved once one is trained. A batch
+            // that trains takes it, as a sample, and moves it if a dictionary comes of it.
+            if short && number.is_none() && !train {
+                moves.demoted = at + 1;
+                continue;
+            }
+            // A short record costs a record's work: counted as `DEMOTE_FROM` bytes, so a
+            // settle of many short records stays a short step too. They have at most
+            // `short_most` of a settle, so a backlog of them leaves the rest of the step to
+            // longer records, promotion and retiring.
+            let cost = loc.raw.max(DEMOTE_FROM);
+            if short && budget.spent_short.saturating_add(cost) > budget.short_most {
+                budget.more_short = true;
+                moves.demoted = at + 1;
+                continue;
+            }
+            if budget.spent > 0 && budget.spent.saturating_add(cost) > most {
+                more = true;
+                moves.demoted = at;
+                break;
+            }
+            moves.demoted = at + 1;
+            if stepped && self.read_since(&key, loc) {
+                continue;
+            }
+            budget.spent += cost;
+            if short {
+                budget.spent_short += cost;
+            }
+            batch.bytes += loc.raw;
+            batch.items.push(ColdItem { key, loc, row, state: Cold::Taken });
+        }
+        ((!batch.items.is_empty()).then_some(batch), more)
+    }
+
+    /// The values of `batch`, compressed ([`ColdBatch::compress`]), written in place of their
+    /// records: how many moved. The dictionary the batch trained is kept first, as the kind's.
+    /// A value whose record is no longer where the batch read it (a settle or a retire moved
+    /// it meanwhile), or, `stepped`, that was read since its period ended, stays as it is; one
+    /// that saved too little is not tried again. zstd refusing a value stops the store.
+    fn put_cold(&mut self, batch: ColdBatch, stepped: bool) -> u64 {
+        let mut demoted = 0;
+        let ColdBatch { kind, dictionary, trained, items, mut problems, .. } = batch;
+        self.problems.append(&mut problems);
+        // The number the batch's dictionary has in the store; `None` for none, or for one
+        // trained that came second (another batch's was kept meanwhile): what it compressed
+        // stays as it is, to be moved with the kind's dictionary at a later period's end.
+        let number = match (dictionary, trained) {
+            (Some((number, _)), _) => Some(number),
+            (None, Some(prepared)) if self.dictionary_of(kind).is_none() => {
+                Some(self.keep_dictionary(kind, prepared))
+            }
+            (None, _) => None,
+        };
+        for item in items {
+            let ColdItem { key, loc, row, state } = item;
+            let here = |store: &Store| {
+                matches!(
+                    store.look().find(&key),
+                    Some(Ok(found)) if found.place == Place::Pack(loc)
+                )
+            };
+            match state {
+                Cold::Left => {}
+                Cold::Taken => {
+                    self.cannot_compress(kind, "a batch was given back before it was compressed");
+                    return demoted;
+                }
+                Cold::Refused(why) => {
+                    self.cannot_compress(kind, &why);
+                    return demoted;
+                }
+                Cold::Tried => {
+                    if here(self) {
+                        self.set_tried(key, loc, row, stepped);
+                    }
+                }
+                Cold::Stored { content, form, dictionary, payload } => {
+                    if (dictionary && number.is_none())
+                        || !here(self)
+                        || (stepped && self.read_since(&key, loc))
+                    {
+                        continue;
+                    }
+                    let named = match (form, dictionary, number) {
+                        (Form::Zstd, true, Some(number)) => number,
+                        (Form::Zstd, ..) => NO_DICTIONARY,
+                        _ => 0,
+                    };
+                    self.replace(key, loc, form, named, content, &payload);
+                    if loc.form == Form::External {
+                        self.external_replaced(&content);
+                    }
+                    demoted += 1;
+                }
+            }
+        }
+        demoted
+    }
+
+    /// The next values the last [`Store::end_period`] planned to move cold, named for a
+    /// batch: at most `most` bytes of them (one value, however long; a batch that trains its
+    /// kind's dictionary takes what a training needs). The caller has them read and
+    /// compressed wherever it likes ([`ColdBatch::compress`]: a worker, so the thread that
+    /// owns the store waits for no read, hash or zstd) and hands them back to
+    /// [`Store::settle_put`]. `None` once the plan has no more to move cold, or while the
+    /// store cannot move (a commit in flight): [`Store::settle_step`] then makes what is left
+    /// of the plan.
+    pub fn settle_take(&mut self, most: u64) -> Option<ColdBatch> {
+        assert!(self.tiers[0].opened, "a settle of a store that is not open");
+        self.tidy();
+        if self.broken.is_some() {
+            self.moves = None;
+            return None;
+        }
+        if self.commit.is_some() || self.index_mapping || self.migrating.is_some() {
+            return None;
+        }
+        let mut moves = self.moves.take()?;
+        let mut budget =
+            Budget { most, short_most: u64::MAX, spent: 0, spent_short: 0, more_short: false };
+        let mut batch = None;
+        // A kind whose values were all passed by gives no batch: the next kind's is taken,
+        // while the budget lasts.
+        while batch.is_none() && moves.demoted < moves.demote.len() {
+            let (taken, more) = self.take_cold(&mut moves, &mut budget, true, true);
+            batch = taken;
+            if more {
+                break;
+            }
+        }
+        self.moves = Some(moves);
+        batch
+    }
+
+    /// A batch [`Store::settle_take`] gave, compressed, written in place of its values'
+    /// records ([`Store::put_cold`]): how many moved. Nothing is committed: the caller
+    /// flushes ([`Store::flush`]) once enough has moved, or the plan is done.
+    pub fn settle_put(&mut self, batch: ColdBatch) -> u64 {
+        assert!(self.tiers[0].opened, "a settle of a store that is not open");
+        self.tidy();
+        if self.broken.is_some() {
+            return 0;
+        }
+        self.put_cold(batch, true)
+    }
+
+    /// A key that named the whole file of `content` now finds its value in a pack: one key
+    /// fewer names the file, and at none it is dropped. The next head lists it as removed, and
+    /// the file goes once that head is durable ([`Store::finish_commit`]).
+    fn external_replaced(&mut self, content: &ContentId) {
+        if let Some(external) = self.tiers[0].externals.get_mut(content) {
+            external.keys = external.keys.saturating_sub(1);
+            if external.keys == 0 && external.committed {
+                external.dropped = true;
+            }
+        }
+    }
+
+    /// A record whose move colder saved too little is not tried again: by its row as the plan
+    /// had it, or, in a step (an index swap between steps numbers rows afresh), by the row its
+    /// key has now.
+    fn set_tried(&self, key: Key, loc: Loc, row: Row, stepped: bool) {
+        if !stepped {
+            return self.set_flag(row, Flag::Tried);
+        }
+        if let Some(Ok(found)) = self.look().find(&key)
+            && found.place == Place::Pack(loc)
+        {
+            found.at.set(Flag::Tried);
+        }
+    }
+
+    /// Writes the dictionaries the own pack `at` holds again, into a pack that stays, and
+    /// names them there: the pack is retiring, and the head that names it removed names each
+    /// dictionary's new place, written by the same commit before that head.
+    fn move_dictionaries(&mut self, at: usize) {
+        for number in 0..self.tiers[0].dictionaries.len() {
+            let dictionary = &self.tiers[0].dictionaries[number];
+            if dictionary.pack as usize != at {
+                continue;
+            }
+            // clone: an `Arc`, once per dictionary of a pack retired (idle)
+            let Ok(prepared) = dictionary.bytes.clone() else {
+                unreachable!("`retirable` leaves a pack holding a dictionary that did not load")
+            };
+            let kind = dictionary.kind;
+            let bytes = prepared.bytes();
+            let header = RecordHeader {
+                kind,
+                form: Form::Dictionary,
+                dictionary: 0,
+                stored: bytes.len() as u64,
+                raw: bytes.len() as u64,
+                key: Key(ContentId::of(DICTIONARY_DOMAIN, bytes)),
+                content: content_of(bytes),
+            };
+            let loc = self.append_record(Unit::SHARED, header, bytes);
+            let dictionary = &mut self.tiers[0].dictionaries[number];
+            dictionary.pack = loc.pack;
+            dictionary.offset = loc.offset;
+        }
     }
 
     /// The own tier's records in its packs to move cold and to move hot, as of the period
     /// ending now. A record still in a segment is new, and stays.
-    fn tier_moves(&self) -> (Vec<(Key, Loc, Row)>, Vec<(Key, Loc, Row)>) {
+    #[expect(clippy::type_complexity, reason = "the two lists of moves and the count of each whole file's keys, taken apart by its one caller")]
+    fn tier_moves(
+        &self,
+    ) -> (Vec<(Key, Loc, Row)>, Vec<(Key, Loc, Row)>, ByHash<ContentId, u32, Global>) {
         let own = &self.tiers[0];
         // alloc: once a settle (idle, never on the way of a get or a put); empty unless a slot is not whole
         let mut bad = Vec::new();
         let rows = self.look().rows(0, &mut bad);
         // alloc: once a settle (idle), the records it moves, sorted after
         let (mut demote, mut promote) = (Vec::new(), Vec::new());
-        // By kind code: whether a short record of the kind is listed. A cold kind's is, to be
-        // moved colder once the kind has a dictionary and, before, to be sampled while its
-        // training wants samples (after a reopen, the only way its records already kept are).
+        // By kind code: whether a short record of the kind is listed: to be moved colder once
+        // the kind has a dictionary and, before, to be sampled while its training wants
+        // samples (after a reopen, the only way its records already kept are). Every kind's
+        // is: most records of a hot kind are short too (a function's code, a small query
+        // result: 23 of hello-world's 26 MiB of them), and a dictionary takes four fifths of
+        // each.
         let short_listed: [bool; Kind::ALL.len()] = std::array::from_fn(|code| {
             Kind::from_code(code as u8).is_some_and(|kind| {
-                kind.cold()
-                    && (self.dictionary_of(kind).is_some() || self.training[code].wants_samples())
+                self.dictionary_of(kind).is_some() || self.training[code].wants_samples()
             })
         });
+        // alloc: once a settle (idle), a count for each whole file a record names: a few
+        let mut named: ByHash<ContentId, u32, Global> = ByHash::new_in(Global);
         for (key, found) in rows {
+            if found.place.form() == Form::External
+                && let Ok((header, _)) = self.look().record(found, &key)
+            {
+                *named.entry(header.content).or_insert(0) += 1;
+            }
             let Place::Pack(loc) = found.place else { continue };
             let Some(pack) = own.packs.get(loc.pack as usize) else { continue };
-            // A short record goes colder only as `short_listed` says, and never comes back hot.
+            // A short record goes colder only as `short_listed` says. One of a cold kind never
+            // comes back hot (its kind is read rarely, by its nature); one of a hot kind does,
+            // as a long one does.
             let short = loc.raw < DEMOTE_FROM;
             if pack.removed || pack.retiring || (short && !short_listed[loc.kind.code() as usize]) {
                 continue;
@@ -2459,8 +3091,12 @@ impl Store {
             let flag = |flag| found.at.get(flag);
             let (read, before) = (flag(Flag::Read), flag(Flag::ReadBefore));
             match loc.form {
-                Form::Raw | Form::Lz4 | Form::Warm
-                    if self.periods >= 2
+                // A file of its own goes cold as a record does: into a pack, compressed, and
+                // its file is let go ([`Store::external_replaced`]). Machine code stays a file,
+                // which its loader maps ([`Kind::Machine`]).
+                Form::Raw | Form::Lz4 | Form::Warm | Form::External
+                    if (loc.form != Form::External || loc.kind != Kind::Machine)
+                        && self.periods >= 2
                         && !read
                         && !before
                         && !flag(Flag::New)
@@ -2469,13 +3105,15 @@ impl Store {
                 {
                     demote.push((key, loc, found.at.row()));
                 }
-                Form::Zstd | Form::Warm | Form::ColdColumns if read && before && !short => {
+                Form::Zstd | Form::Warm | Form::ColdColumns
+                    if read && before && (!short || !loc.kind.cold()) =>
+                {
                     promote.push((key, loc, found.at.row()));
                 }
                 _ => {}
             }
         }
-        (demote, promote)
+        (demote, promote, named)
     }
 
     /// Sets a flag of an own record by its row: rows hold while the store swaps no table, as
@@ -2494,29 +3132,10 @@ impl Store {
 
     /// The bytes of the record of `key` at `loc`, verified, or `None` with why in the problems.
     fn movable(&mut self, key: Key, loc: Loc) -> Option<(ContentId, Vec<u8>)> {
-        let look = self.look();
-        let value = match look.find(&key) {
-            Some(Ok(found)) if found.place == Place::Pack(loc) => look
-                .value(found, &key, Use::Move)
-                .map(|(header, bytes)| (header, bytes.into_owned())),
-            Some(Err(corrupt)) => Err(corrupt),
-            _ => return None,
-        };
-        match value {
-            // `replace` counts the old record's bytes dead by `loc`, which came from an index
-            // slot nothing checked: it must be the record that was read.
-            Ok((header, _)) if header.stored != loc.stored || header.raw != loc.raw => {
-                // alloc: a problem reported
-                self.problems.push(format!(
-                    "{:x} is not moved: its record is not the one its index names",
-                    key.0
-                ));
-                None
-            }
-            Ok((header, bytes)) => Some((header.content, bytes)),
-            Err(corrupt) => {
-                // alloc: a problem reported
-                self.problems.push(format!("not moved between tiers: {corrupt}"));
+        match movable_in(self.look(), &key, loc) {
+            Ok(value) => value.map(|(content, bytes)| (content, bytes.into_owned())),
+            Err(why) => {
+                self.problems.push(why);
                 None
             }
         }
@@ -2567,9 +3186,13 @@ impl Store {
         delta.set_flag(row, Flag::New as usize);
     }
 
-    /// The own packs that are at least half dead bytes, wholly committed, not the one their
-    /// kind appends to, holding no dictionary, and no pack a batch whose moves wait moves
-    /// records into. Maps answer in any order (a driver answers each as it ends; the sim
+    /// The own packs that are at least half dead bytes, wholly committed (nothing drained
+    /// waits in them for a commit), holding no dictionary that did not load (one that loaded
+    /// is written again where the live records go, [`Store::move_dictionaries`]), and no pack
+    /// a batch whose moves wait moves records into. The pack its unit appends to is one of
+    /// them: what is copied out of it, and every later append, goes to a new pack
+    /// ([`Store::writable_pack`]), so a store of one pack gives its dead bytes back too. Maps answer in any order (a driver
+    /// answers each as it ends; the sim
     /// shuffles what is due), so such a pack can be mapped while its batch waits on another
     /// file's map: its records are not yet what their keys find, so `live_records` would
     /// leave them out, and the batch would then point their keys into the removed pack.
@@ -2590,9 +3213,10 @@ impl Store {
                     && pack.usable == pack.committed
                     && pack.committed > PACK_HEADER
                     && pack.dead * 2 >= pack.committed - PACK_HEADER
-                    && own.packs.iter().rposition(|it| it.unit == pack.unit && !it.removed)
-                        != Some(at)
-                    && !own.dictionaries.iter().any(|it| it.pack as usize == at)
+                    && !own
+                        .dictionaries
+                        .iter()
+                        .any(|it| it.pack as usize == at && it.bytes.is_err())
             })
             // alloc: once a settle (idle), the packs it may rewrite, which it appends to as it goes
             .collect()
@@ -2916,7 +3540,18 @@ impl Store {
     /// program may be running is never written, and what is written is the patch, whatever
     /// the file's length. Nothing of the store is read, cloned or waited for. A `to` that is
     /// not there, or on a volume that shares no blocks, fails the place, naming it.
-    pub fn place_patched(&mut self, to: FileName, file: Sparse, effects: &mut Vec<Effect>) -> Tag {
+    ///
+    /// `started` says a program is started from `to` (an executable): its clone is then asked
+    /// to hold in memory what the system holds of `to`'s file ([`Effect::Prewarm`],
+    /// `publish::Writing`), so the program's next start reads from memory what its last run
+    /// did. A file nothing starts from (a debug file) is not.
+    pub fn place_patched(
+        &mut self,
+        to: FileName,
+        file: Sparse,
+        started: bool,
+        effects: &mut Vec<Effect>,
+    ) -> Tag {
         assert!(
             !self.tiers.iter().any(|tier| to.is_under(&tier.dir)),
             "{to} is in the store: values are placed outside it"
@@ -2934,7 +3569,8 @@ impl Store {
             waits = tracing::field::Empty,
         );
         self.place_spans.insert(tag, span);
-        self.publish(tag, to, Content::Over(file), Durable::No, 0, effects);
+        self.starts(&to, started);
+        self.publish(tag, to, Content::Over { file, started }, Durable::No, 0, effects);
         tag
     }
 
@@ -3060,7 +3696,7 @@ impl Store {
                 Content::File { of: None, .. }
                 | Content::Bytes(_)
                 | Content::Sparse(_)
-                | Content::Over(_) => {}
+                | Content::Over { .. } => {}
             }
             // alloc: an error, once per place refused
             let why = format!(
@@ -3076,7 +3712,10 @@ impl Store {
                 bytes: PlacedBytes::default(),
             });
         }
-        let over = matches!(content, Content::Over(_));
+        let over = match &content {
+            Content::Over { started, .. } => Some(*started),
+            _ => None,
+        };
         match content {
             Content::Bytes(bytes) => {
                 let placed = PlacedBytes { cloned: 0, written, copied: bytes.len() as u64 };
@@ -3088,7 +3727,7 @@ impl Store {
                 let op = Op::Place { asked, to, staged: None, of: None, bytes: placed };
                 self.tags.ops.insert(asked, op);
             }
-            Content::Sparse(file) | Content::Over(file) => {
+            Content::Sparse(file) | Content::Over { file, .. } => {
                 if let Err(why) = file.check() {
                     // alloc: an error, once per place refused
                     let why = format!("{to} was to be written from runs that are no file: {why}");
@@ -3114,7 +3753,9 @@ impl Store {
                     ),
                     _ => (temp, None),
                 };
-                let (writing, clear) = publish::Writing::begin(to, temp, file, over, asked);
+                let (mut writing, clear) =
+                    publish::Writing::begin(to, temp, file, over.is_some(), asked);
+                writing.warm = over == Some(true);
                 #[cfg(test)]
                 let writing = writing.planted_with(plant);
                 self.writing.insert(asked, writing);
@@ -3201,6 +3842,14 @@ impl Store {
                     return;
                 }
                 match patching.failed.take() {
+                    // A program is started from the path: the clone is first asked to hold
+                    // in memory what the system holds of the path's file ([`Op::Warm`]).
+                    None if self.started.contains(&patching.to) => {
+                        // clone: the effect owns the names; once per place
+                        let (like, file) = (patching.to.clone(), patching.temp.clone());
+                        let tag = self.tags.ask(Op::PatchWarm { asked });
+                        effects.push(Effect::Prewarm { like, file, tag });
+                    }
                     None => {
                         // clone: the effect owns the names; once per place
                         let (from, to) = (patching.temp.clone(), patching.to.clone());
@@ -3211,6 +3860,26 @@ impl Store {
                     Some(why) => {
                         // alloc: an error, once per place that fails
                         let why = format!("writing its ranges into its base's clone: {why}");
+                        self.patch_failed(asked, &why, effects)
+                    }
+                }
+            }
+            Op::PatchWarm { asked } => {
+                let Some(patching) = self.patching.get(&asked) else { return };
+                match done {
+                    Done::Prewarmed { .. } => {
+                        // clone: the effect owns the names; once per place
+                        let (from, to) = (patching.temp.clone(), patching.to.clone());
+                        let tag = self.tags.ask(Op::PatchRename { asked });
+                        // Not synced: the path holds its old file or the new one, whole.
+                        effects.push(publish::rename(from, to, Durable::No, tag));
+                    }
+                    done => {
+                        // alloc: an error, once per place that fails
+                        let why = format!(
+                            "asking the system to read ahead what it holds of its path's file: {}",
+                            describe(&done)
+                        );
                         self.patch_failed(asked, &why, effects)
                     }
                 }
@@ -3707,6 +4376,40 @@ impl Store {
         let staged = Staged { temp, content };
         self.tags.ops.insert(asked, Op::Clear { asked, from, to, staged, of, bytes });
         clear
+    }
+
+    /// `staged`'s clone, whole under its own name, renamed onto `to`: it replaces whatever is
+    /// there in one step, a concurrent place's clone of the same bytes too. Not synced: the
+    /// path holds its old file or the clone, whole, and a crash that undoes the rename leaves
+    /// the old one, placed again by the build that finds it.
+    fn commit_staged(
+        &mut self,
+        asked: Tag,
+        to: FileName,
+        staged: Staged,
+        bytes: PlacedBytes,
+        effects: &mut Vec<Effect>,
+    ) {
+        // clone: the effect and the op each own the names; once per place
+        let (from, into) = (staged.temp.clone(), to.clone());
+        let tag = self.tags.ask(Op::Commit { asked, to, staged, bytes });
+        effects.push(publish::rename(from, into, Durable::No, tag));
+    }
+
+    /// Says whether a program is started from `to` (an executable a `run` or a person
+    /// starts): every clone placed there from now on is then asked, before its rename, to
+    /// hold in memory what the system holds of the file at `to` ([`Effect::Prewarm`]), so the
+    /// program's next start reads from memory what its last run did, where a clone alone
+    /// shares no cached page (30 to 45 ms of the first `exec` of hello world's image on
+    /// APFS). A file nothing starts from (a debug file) is not asked, which would read from
+    /// the disk, each place, whatever of it the system held.
+    pub fn starts(&mut self, to: &FileName, started: bool) {
+        match started {
+            // clone: the store's own copy of the name, once a path
+            true if !self.started.contains(to) => _ = self.started.insert(to.clone()),
+            true => {}
+            false => _ = self.started.remove(to),
+        }
     }
 
     /// The hidden name beside `to` that the place `asked` clones into before it renames it onto
@@ -4621,14 +5324,18 @@ impl Store {
                     // The clone is whole under its own name: renamed onto `to`, it replaces
                     // whatever is there in one step, a concurrent place's clone of the same
                     // bytes too. (Under the planted bug the clone was made at `to` itself.)
-                    (Done::Cloned, _, Some(staged)) if !(cfg!(test) && staged.temp == to) => {
+                    // A program is started from `to`: the clone is first asked to hold in
+                    // memory what the system holds of `to`'s file, which the rename replaces.
+                    (Done::Cloned, _, Some(staged))
+                        if !(cfg!(test) && staged.temp == to) && self.started.contains(&to) =>
+                    {
                         // clone: the effect and the op each own the names; once per place
-                        let (from, into) = (staged.temp.clone(), to.clone());
-                        let tag = self.tags.ask(Op::Commit { asked, to, staged, bytes });
-                        // Not synced: the path holds its old file or the clone, whole, and
-                        // a crash that undoes the rename leaves the old one, placed again by
-                        // the build that finds it.
-                        effects.push(publish::rename(from, into, Durable::No, tag));
+                        let (like, file) = (to.clone(), staged.temp.clone());
+                        let tag = self.tags.ask(Op::Warm { asked, to, staged, bytes });
+                        effects.push(Effect::Prewarm { like, file, tag });
+                    }
+                    (Done::Cloned, _, Some(staged)) if !(cfg!(test) && staged.temp == to) => {
+                        self.commit_staged(asked, to, staged, bytes, effects);
                     }
                     (Done::Cloned | Done::Written, _, _) => {
                         self.answer(Placed { tag: asked, to, result: Ok(()), bytes })
@@ -4666,6 +5373,20 @@ impl Store {
                     }
                 }
             }
+            Op::Warm { asked, to, staged, bytes } => match done {
+                Done::Prewarmed { .. } => self.commit_staged(asked, to, staged, bytes, effects),
+                done => {
+                    // clone: the effect and the op each own the name; once per place that fails
+                    let tag = self.tags.ask(Op::Discard { file: staged.temp.clone() });
+                    effects.push(Effect::Remove { file: staged.temp, tag });
+                    // alloc: an error, once per place that fails
+                    let result = Err(format!(
+                        "asking the system to read ahead what it holds of {to}: {}",
+                        describe(&done)
+                    ));
+                    self.answer(Placed { tag: asked, to, result, bytes: PlacedBytes::default() });
+                }
+            },
             Op::Recheck { content, waiter, why } => {
                 self.rechecked(content, waiter, &why, &done, effects)
             }
@@ -4760,6 +5481,7 @@ impl Store {
             op @ (Op::PatchClear { .. }
             | Op::PatchClone { .. }
             | Op::PatchWrite { .. }
+            | Op::PatchWarm { .. }
             | Op::PatchRename { .. }) => {
                 self.patch_step(op, done, effects);
             }
@@ -4786,6 +5508,24 @@ impl Store {
                         "{file} was left behind (it is removed at the next open): {}",
                         describe(&done)
                     ));
+                }
+            }
+            Op::RemoveExternal { content, file } => {
+                // Answered, removed or not: a commit that waited to write the name again goes
+                // on. One left behind is no longer listed, so nothing removes it later.
+                self.tiers[0].removing.retain(|it| *it != content);
+                if !matches!(done, Done::Removed) {
+                    // alloc: a problem reported
+                    self.problems.push(format!(
+                        "{file}, a whole file no key names, was left behind: {}",
+                        describe(&done)
+                    ));
+                }
+                if std::mem::take(&mut self.commit_deferred)
+                    && self.commit.is_none()
+                    && self.broken.is_none()
+                {
+                    self.start_commit(effects);
                 }
             }
             Op::RemoveChecks { pack } => {
@@ -4837,7 +5577,10 @@ impl Store {
     /// The own pack of `kind` a record of `span` bytes goes into, made if none has room.
     fn writable_pack(&mut self, unit: Unit, span: u64) -> usize {
         let own = &mut self.tiers[0];
-        if let Some(at) = own.packs.iter().rposition(|it| it.unit == unit.0 && !it.removed) {
+        // A retiring pack takes no more: the next head names it removed.
+        if let Some(at) =
+            own.packs.iter().rposition(|it| it.unit == unit.0 && !it.removed && !it.retiring)
+        {
             let pack = &own.packs[at];
             if pack.end == PACK_HEADER || pack.end + span <= PACK_MOST {
                 return at;
@@ -4982,14 +5725,21 @@ impl Store {
         let loc = if header.form == Form::External && header.stored > 0 {
             let own = &mut self.tiers[0];
             let file = own.file(&disk::external_file(&header.content));
-            own.externals.entry(header.content).or_insert_with(|| External {
+            let external = own.externals.entry(header.content).or_insert_with(|| External {
                 len: header.raw,
                 file,
                 mapping: None,
                 // alloc: a value of `EXTERNAL_FROM` bytes or more, held past its segment's chunk until its own file is written and mapped
                 memory: Some(payload.to_vec()),
                 committed: false,
+                keys: 0,
+                dropped: false,
             });
+            // One more key names the file. One a settle had dropped is still there (it goes
+            // only once a head that lists it removed is durable, and no drain runs while a
+            // commit is in flight): it is taken back.
+            external.keys = external.keys.saturating_add(1);
+            external.dropped = false;
             self.append_record(Unit(unit), RecordHeader { stored: 0, ..header }, &[])
         } else {
             self.append_record(Unit(unit), header, payload)
@@ -5465,6 +6215,31 @@ impl Store {
         ));
     }
 
+    /// `prepared` kept as the dictionary of `kind`: written into a pack, listed by the next
+    /// head, and what the kind's values are compressed with from now on. Its number.
+    fn keep_dictionary(&mut self, kind: Kind, prepared: Arc<cold::Prepared>) -> u32 {
+        self.training[kind.code() as usize] = Training::default();
+        let dictionary = prepared.bytes();
+        let header = RecordHeader {
+            kind,
+            form: Form::Dictionary,
+            dictionary: 0,
+            stored: dictionary.len() as u64,
+            raw: dictionary.len() as u64,
+            key: Key(ContentId::of(DICTIONARY_DOMAIN, dictionary)),
+            content: content_of(dictionary),
+        };
+        let loc = self.append_record(Unit::SHARED, header, dictionary);
+        self.tiers[0].dictionaries.push(Dictionary {
+            kind,
+            pack: loc.pack,
+            offset: loc.offset,
+            bytes: Ok(prepared),
+        });
+        self.publish_view();
+        (self.tiers[0].dictionaries.len() - 1) as u32
+    }
+
     fn train(&mut self, kind: Kind) {
         let trained = {
             let samples: Vec<&[u8]> =
@@ -5481,26 +6256,8 @@ impl Store {
         let training = &mut self.training[kind.code() as usize];
         match trained {
             Ok(prepared) => {
-                *training = Training::default();
-                let dictionary = prepared.bytes();
-                let header = RecordHeader {
-                    kind,
-                    form: Form::Dictionary,
-                    dictionary: 0,
-                    stored: dictionary.len() as u64,
-                    raw: dictionary.len() as u64,
-                    key: Key(ContentId::of(DICTIONARY_DOMAIN, dictionary)),
-                    content: content_of(dictionary),
-                };
-                let loc = self.append_record(Unit::SHARED, header, dictionary);
-                self.tiers[0].dictionaries.push(Dictionary {
-                    kind,
-                    pack: loc.pack,
-                    offset: loc.offset,
-                    // alloc: once per dictionary trained
-                    bytes: Ok(Arc::new(prepared)),
-                });
-                self.publish_view();
+                // alloc: once per dictionary trained
+                self.keep_dictionary(kind, Arc::new(prepared));
             }
             // Full samples get no more to train on twice as many: it cannot be tried again.
             Err(why) if training.full() => self.give_up_training(kind, &why),
@@ -5559,9 +6316,19 @@ impl Store {
             // alloc: once per commit, the files it writes, sorted, held in the `Commit`
             own.externals.iter().filter(|(_, it)| !it.committed).map(|(it, _)| *it).collect();
         externals.sort_unstable();
+        // A whole file removed and put again: its write waits for its removal's answer, so
+        // the two never meet on one name. The removal's answer begins this commit.
+        if externals.iter().any(|it| own.removing.contains(it)) {
+            self.commit_deferred = true;
+            return;
+        }
+        let mut dropped: Vec<ContentId> =
+            // alloc: once per commit, the files its head lists as removed, held in the `Commit`
+            own.externals.iter().filter(|(_, it)| it.dropped).map(|(it, _)| *it).collect();
+        dropped.sort_unstable();
         let compact =
             !self.index_mapping && self.migrating.is_none() && own.delta.len() >= INDEX_AFTER;
-        if packs.is_empty() && externals.is_empty() && !compact {
+        if packs.is_empty() && externals.is_empty() && !compact && dropped.is_empty() {
             // Nothing to write and no commit in flight: every record drained is in what a
             // commit wrote already, and a put that wrote none (it lost its key to another
             // writer's put of the same bytes, or panicked before it wrote) has nothing to make
@@ -5574,10 +6341,20 @@ impl Store {
             }
             return;
         }
+        // A file dropped, and one whose removal has not answered, are listed as removed: a
+        // reopen after a crash removes what this run did not.
         let mut all_externals: Vec<ExternalRef> = own
             .externals
             .iter()
-            .map(|(content, it)| ExternalRef { content: *content, len: it.len })
+            .map(|(content, it)| ExternalRef {
+                content: *content,
+                len: if it.dropped { disk::EXTERNAL_REMOVED } else { it.len },
+            })
+            .chain(
+                own.removing
+                    .iter()
+                    .map(|content| ExternalRef { content: *content, len: disk::EXTERNAL_REMOVED }),
+            )
             // alloc: once per commit, the head it writes
             .collect();
         all_externals.sort_unstable_by_key(|it| it.content);
@@ -5675,6 +6452,7 @@ impl Store {
             // alloc: once per commit, a count for each pack
             writes: vec![0; written],
             externals,
+            dropped,
             index,
             head,
             batch,
@@ -5807,7 +6585,11 @@ impl Store {
                 if commit.failed.is_none() && last {
                     let tag = self.tags.ask(sync_op(Op::Sync { pack: *pack }, waited));
                     // clone: the effect owns its file name; once per pack a commit
-                    effects.push(Effect::Sync { file: own.packs[*pack].file.clone(), tag }); // durable: the store's commit: a pack's appended bytes are on disk before the head names them
+                    // Ordered before the head, which is all the head needs of them: the head's
+                    // own write is the commit's one wait for the drive, and its flush takes
+                    // these bytes with it (`Effect::Barrier`). A sync here was a second and a
+                    // third flush of the drive's cache a commit, for the same guarantee.
+                    effects.push(Effect::Barrier { file: own.packs[*pack].file.clone(), tag });
                     commit.steps += usize::from(waited);
                     if !waited {
                         // The planted commit waits for no sync: its checks follow the write.
@@ -5826,7 +6608,7 @@ impl Store {
             // short, goes first), written, synced. In a chain behind the pack rather than beside
             // it, so the store model's search over a commit's orders stays within its bound
             // (docs/v2/plan/design/store-pool.md, lane 4b).
-            (Op::Sync { pack }, Done::Synced) => {
+            (Op::Sync { pack }, Done::Ordered) => {
                 if commit.failed.is_none() {
                     let tag = self.tags.ask(Op::TruncateChecks { pack: *pack });
                     effects.push(Effect::Truncate {
@@ -5856,12 +6638,12 @@ impl Store {
                 if commit.failed.is_none() {
                     let tag = self.tags.ask(sync_op(Op::SyncChecks { pack: *pack }, waited));
                     let file = own.file(&disk::checks_file(*pack));
-                    // durable: the store's commit: a pack's checks are on disk before the head names its new length
-                    effects.push(Effect::Sync { file, tag });
+                    // Ordered before the head, as the pack's bytes are.
+                    effects.push(Effect::Barrier { file, tag });
                     commit.steps += usize::from(waited);
                 }
             }
-            (Op::SyncChecks { .. }, Done::Synced)
+            (Op::SyncChecks { .. }, Done::Ordered)
             | (Op::WriteExternal { .. } | Op::WriteIndex, Done::Written) => {}
             (Op::WriteHead, Done::Written) => return self.finish_commit(effects),
             (op, done) => {
@@ -6031,6 +6813,25 @@ impl Store {
                 self.hot.pack_removed(0, at);
             }
         }
+        // The head that lists them removed is durable: the files go, and no view holds them
+        // from the next publish on. A reader of an older view reads its mapping, which lives
+        // while that view does.
+        let mut gone = false;
+        for content in &commit.dropped {
+            let own = &mut self.tiers[0];
+            if !own.externals.get(content).is_some_and(|it| it.dropped) {
+                continue;
+            }
+            let external = own.externals.remove(content).expect("found above");
+            own.removing.push(*content);
+            // clone: the op and the effect each own the name; once per whole file removed
+            let tag = self.tags.ask(Op::RemoveExternal { content: *content, file: external.file.clone() });
+            effects.push(Effect::Remove { file: external.file, tag });
+            gone = true;
+        }
+        if gone {
+            self.publish_view();
+        }
         let mut batch = commit.batch;
         for content in &commit.externals {
             let external =
@@ -6192,6 +6993,7 @@ impl Store {
         let externals: ByHash<ContentId, External, Global> = head // alloc: the store's own table, for its life
             .externals
             .iter()
+            .filter(|it| it.len != disk::EXTERNAL_REMOVED)
             .map(|it| {
                 (
                     it.content,
@@ -6201,10 +7003,22 @@ impl Store {
                         mapping: None,
                         memory: None,
                         committed: true,
+                        // Counted when the first period ends; until then nothing drops it.
+                        keys: u32::MAX,
+                        dropped: false,
                     },
                 )
             })
             // alloc: opening, once per tier
+            .collect();
+        // The whole files the head lists as removed: an earlier run's removal may not have
+        // been made (a crash after the head). Only the store's own are its to remove.
+        let removed_files: Vec<(ContentId, FileName)> = head
+            .externals
+            .iter()
+            .filter(|it| it.len == disk::EXTERNAL_REMOVED)
+            .map(|it| (it.content, tier.file(&disk::external_file(&it.content))))
+            // alloc: opening, once per tier; empty but after a settle let a whole file go
             .collect();
         // alloc: opening, once per tier, the mappings it asks for
         let mut maps = Vec::new();
@@ -6257,6 +7071,12 @@ impl Store {
         if at == 0 {
             for pack in removed {
                 self.remove_pack(pack, effects);
+            }
+            for (content, file) in removed_files {
+                self.tiers[0].removing.push(content);
+                // clone: the op and the effect each own the name; once per whole file removed
+                let tag = self.tags.ask(Op::RemoveExternal { content, file: file.clone() });
+                effects.push(Effect::Remove { file, tag });
             }
         }
         if self.tiers[at].waiting == 0 {

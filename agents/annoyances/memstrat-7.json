@@ -1,0 +1,11 @@
+{
+ "id": "memstrat-7",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+ "where": "mimalloc: purge delay",
+ "what": "Built and measured, not kept: mimalloc on base pages with a purge delay of an hour (freed pages kept for the next edit, given back by the idle purge). The idle daemon was 300 MB larger (4,442 against 4,143 to 4,159 MB) and no row was faster: no-op build 21.9 ms against 12.2 to 13.1, comment edit 29.3 against 22.6 to 23.7, body edit 106.5 against 109.7 to 111.0. The same direction as mem2-13.",
+ "cost": "one build and one run, about 15 minutes",
+ "cause": "not looked into",
+ "workaround": "purge at once stays",
+ "state": "accepted: a second lane found the same; do not try it a third time without a reason from the profile"
+}

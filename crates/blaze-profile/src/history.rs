@@ -192,7 +192,8 @@ pub const EVERY: Duration = Duration::from_secs(5);
 /// of Parquet footer whatever it holds, so an idle daemon's flush every [`EVERY`] wrote 48 KiB
 /// for a few hundred rows of its own heartbeat, 0.6 MB a minute (2026-11-11, samples aside).
 /// Nothing is lost by the wait and no reader sees it: a reader asks for a flush before it
-/// reads, a build's start and end each flush, [`FLUSH_ROWS`] drained flush at once, and the
+/// reads, a build's start and answer each ask for a flush (made once the builds are quiet, the
+/// daemon's `serve::observe::Held`), [`FLUSH_ROWS`] drained flush at once, and the
 /// rows of a daemon that dies meanwhile are in its rings (an idle thread writes far fewer
 /// than a ring holds in this time), which the next history reads back.
 pub const IDLE_EVERY: Duration = Duration::from_secs(60);

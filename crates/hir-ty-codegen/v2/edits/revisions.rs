@@ -32,6 +32,9 @@
 
 #[path = "../../../blaze-engine/tests/revisions/check.rs"]
 mod check;
+#[allow(dead_code, reason = "the real driver's parts of the generator (the workspace beside the library, the widths) are not this driver's")]
+#[path = "../../../blaze-engine/tests/revisions/generate.rs"]
+mod generate;
 #[path = "../../../blaze-engine/tests/revisions/spec.rs"]
 mod spec;
 
@@ -106,9 +109,13 @@ impl State {
     /// A build of the database as it is, its puts kept. A panic is caught and counted: the
     /// daemon catches a job's too, and none is allowed.
     fn build(&mut self) -> Result<Built, String> {
-        let built = catch_unwind(AssertUnwindSafe(|| {
-            build(&self.db, &self.memo, &self.store, blaze_store_check::Setting::ALL, self.heap_to_stack)
-        }));
+        // `BLAZE_REVISIONS_STORE_CHECK=off`: a stale hit does not stop the build, so the
+        // oracle says everything that came of it (which bytes, relocations, data or lines).
+        let check = match std::env::var("BLAZE_REVISIONS_STORE_CHECK").as_deref() {
+            Ok("off") => blaze_store_check::Setting::OFF,
+            _ => blaze_store_check::Setting::ALL,
+        };
+        let built = catch_unwind(AssertUnwindSafe(|| build(&self.db, &self.memo, &self.store, check, self.heap_to_stack)));
         match built {
             Ok(built) => built,
             Err(payload) => {
@@ -215,6 +222,33 @@ fn one(test: &Test, seed: u64) -> (Vec<Row>, Vec<String>) {
                         text = new;
                     }
                 }
+                Step::EditTwice => {
+                    let new = text_at(test, index);
+                    if new != text {
+                        // Two saves and no build between: the database is set twice.
+                        let first = spec::first_save("src/lib.rs", new.as_bytes()).expect("a `.rs` file has two saves");
+                        state.db.set_file_text(state.file, std::str::from_utf8(&first).expect("UTF-8"));
+                        state.db.set_file_text(state.file, &new);
+                        state.log.push("the edit, saved twice".to_owned());
+                        text = new;
+                    }
+                }
+                Step::Cancel(_) => {
+                    // Where a build is cut is the daemon's to say; here it runs whole and
+                    // what it made is dropped: the database's rows stay, the store's do not.
+                    state.log.push("a build whose records are dropped".to_owned());
+                    let _ = state.build();
+                }
+                Step::Beside(_) => {
+                    // A second checkout: a database and a memo of its own over the one store.
+                    state.log.push("a second database of the same text, built over the same store".to_owned());
+                    let (mut other, other_file) = database(&fixture(&text));
+                    other.set_file_text(other_file, &text);
+                    let built = build(&other, &Memo::new(), &state.store, blaze_store_check::Setting::ALL, state.heap_to_stack);
+                    if let Ok(built) = built {
+                        state.store.0.extend(built.puts.into_iter().map(|it| (it.key, it.bytes)));
+                    }
+                }
                 Step::Stop | Step::Kill => {
                     state.log.push("a restart".to_owned());
                     state.restart(&text);
@@ -223,6 +257,10 @@ fn one(test: &Test, seed: u64) -> (Vec<Row>, Vec<String>) {
                     state.log.push("the same text set again".to_owned());
                     state.db.set_file_text(state.file, &text);
                 }
+                Step::Wait(_) => panic!(
+                    "{}: the step `wait` is the real driver's: the simulation's database does nothing of its own accord",
+                    test.name
+                ),
                 Step::Project(name) => panic!(
                     "{}: the step `project {name}` is the real driver's: the simulation has one project and one database",
                     test.name
@@ -306,6 +344,116 @@ fn run(name: &str) {
     }
 }
 
+/// The oracle's case of `turns` under this driver (seed 0: every draw is the sequence's
+/// own, which Hegel shrinks). A failure is written as a case under `BLAZE_ORACLE_OUT` (the
+/// system's temporary directory otherwise) before it is reported.
+fn oracle(turns: &[generate::Turn]) {
+    let parts = generate::Parts::LIBRARY;
+    let test = generate::test(&generate::name(parts, turns), parts, turns, &["sim"]);
+    let (rows, log) = one(&test, 0);
+    let mut note = format!("the sequence: {turns:#?}\nwhat the driver did:\n  {}\n", log.join("\n  "));
+    if rows.iter().any(|row| !row.failed.is_empty()) {
+        let out = std::env::var_os("BLAZE_ORACLE_OUT")
+            .map_or_else(|| std::env::temp_dir().join("blaze-oracle"), std::path::PathBuf::from);
+        generate::write_case(&test, &out);
+        note.push_str(&format!("written as the case {}\n", out.join(&test.name).display()));
+    }
+    check::verdict(&test, "sim seed 0", &rows, &note);
+}
+
+/// The oracle (docs/harness.md): after any drawn sequence of edits of the library, saves,
+/// restarts, second databases and dropped builds, the incremental build's records are a
+/// clean build's, nothing panics, and a turn makes no function its edit does not reach.
+/// `HEGEL_TEST_CASES=<n>` runs it longer.
+#[test]
+fn any_turn_sequence_builds_as_clean() {
+    super::run_cases(40, |tc| {
+        let mut draw = |n: u64| tc.draw(hegel::generators::integers::<u64>().max_value(n - 1));
+        let turns = generate::turns(&mut draw, generate::Parts::LIBRARY, true, 6);
+        oracle(&turns);
+    });
+}
+
+/// The control: a store that answers a key with the bytes of another build is caught. The
+/// planted bug is a store entry kept from before an edit under the key the edit's function
+/// has after it, so the hit is stale.
+#[test]
+fn the_oracle_catches_a_stale_store_entry() {
+    use generate::{Edit, Event, Save, Turn};
+    let turn = |edit| Turn { request: generate::Request::RUN, edits: vec![edit], save: Save::Write, event: Event::Nothing, event_last: false, width: None };
+    let parts = generate::Parts::LIBRARY;
+    let test = generate::test("control", parts, &[turn(Edit::Body(1))], &["sim"]);
+    let texts = [text_at(&test, 0), text_at(&test, 1)];
+    let builds: Vec<Built> = texts
+        .iter()
+        .map(|text| {
+            let (mut db, file) = database(&fixture(text));
+            db.set_file_text(file, text);
+            build(&db, &Memo::new(), &Kept::default(), blaze_store_check::Setting::OFF, false).expect("the control's text builds")
+        })
+        .collect();
+    // `shown`'s record of before the edit, under the key it has after it.
+    let key_of = |built: &Built| {
+        let (instance, _) = built.debug_names.iter().find(|(_, name)| name == "app::shown").expect("app::shown is built");
+        built.kernel.iter().find(|entry| entry.instance == *instance).expect("its kernel entry").key
+    };
+    let (old, new) = (key_of(&builds[0]), key_of(&builds[1]));
+    assert_ne!(old, new, "the edit changes `shown`'s key");
+    let stale = builds[0].puts.iter().find(|it| it.key == old).expect("the first build put it").bytes.clone(); // clone: planted
+    let mut store = Kept::default();
+    store.0.insert(new, stale);
+    let (mut db, file) = database(&fixture(&texts[1]));
+    db.set_file_text(file, &texts[1]);
+    let planted = build(&db, &Memo::new(), &store, blaze_store_check::Setting::OFF, false).expect("a build over the planted store");
+    let (planted_trace, planted_rows) = traced(&planted, &store);
+    let (clean_trace, clean_rows) = traced(&builds[1], &Kept::default());
+    let found = verdict(&Trace::default(), (&planted, &planted_trace, &planted_rows), (&builds[1], &clean_trace, &clean_rows));
+    assert!(!found.is_empty(), "the oracle found nothing in a build that took `shown` of before the edit from the store");
+}
+
+/// The key `name`'s kernel entry has in a clean build of each revision of `case`, the last
+/// revision built first: each in a database of its own, so a key two revisions share is
+/// shared by what the key is made of, not by anything one build left for the next. Run
+/// alone, it is one process.
+fn keys_of(case: &str, name: &str) -> Vec<blaze_cas::Key> {
+    let test = Test::read(&spec::cases(), case);
+    let mut keys: Vec<blaze_cas::Key> = (0..test.revisions.len())
+        .rev()
+        .map(|index| {
+            let text = text_at(&test, index);
+            let (mut db, file) = database(&fixture(&text));
+            db.set_file_text(file, &text);
+            let built = build(&db, &Memo::new(), &Kept::default(), blaze_store_check::Setting::OFF, false).expect("the revision builds");
+            let (instance, _) = built.debug_names.iter().find(|(_, it)| it == name).unwrap_or_else(|| panic!("no `{name}` is built"));
+            built.kernel.iter().find(|entry| entry.instance == *instance).expect("its kernel entry").key
+        })
+        .collect();
+    keys.reverse();
+    keys
+}
+
+/// What the oracle's first finding is of: whether `shapes`, which coerces `&B` to
+/// `&dyn Shape`, has one key before and after `B` overrides the provided `sides`.
+#[test]
+#[ignore = "a diagnosis: prints the keys"]
+fn the_keys_of_the_coercion_site_before_and_after_the_override() {
+    let keys = keys_of("an_override_beside_a_required_method_changes_the_vtable", "app::shapes");
+    eprintln!("app::shapes: {keys:?}; the same: {}", keys[0] == keys[1]);
+    let keys = keys_of("an_impl_overriding_a_provided_method_changes_its_vtable", "app::all");
+    eprintln!("app::all (the case that passes): {keys:?}; the same: {}", keys[0] == keys[1]);
+    // What of `shapes` differs: its relocations and data in each revision, and the names.
+    let test = Test::read(&spec::cases(), "an_override_beside_a_required_method_changes_the_vtable");
+    for index in 0..2 {
+        let text = text_at(&test, index);
+        let (mut db, file) = database(&fixture(&text));
+        db.set_file_text(file, &text);
+        let built = build(&db, &Memo::new(), &Kept::default(), blaze_store_check::Setting::OFF, false).expect("the revision builds");
+        let (instance, _) = built.debug_names.iter().find(|(_, it)| it == "app::shapes").expect("shapes");
+        let function = built.functions.iter().find(|it| it.key == *instance).expect("its code");
+        eprintln!("rev{}: relocs {:?}\n  data {:?}\n  names {:?}", index + 1, function.relocs, function.data, built.debug_names);
+    }
+}
+
 macro_rules! sim {
     ($($name:ident)*) => {
         $(
@@ -332,6 +480,7 @@ sim! {
     an_edit_after_a_kill
     an_edit_after_a_restart
     an_impl_overriding_a_provided_method_changes_its_vtable
+    an_override_beside_a_required_method_changes_the_vtable
 }
 
 /// Every case that names `sim` runs here: one no list holds would never run.

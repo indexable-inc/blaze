@@ -560,6 +560,8 @@ dependencies = [
  "blaze-item-hash",
  "blaze-items",
  "blaze-kernel",
+ "blaze-launch",
+ "blaze-launch-host",
  "blaze-lazy",
  "blaze-link",
  "blaze-lints",
@@ -911,6 +913,7 @@ dependencies = [
  "blaze-vfs",
  "cfg",
  "flate2",
+ "hegeltest",
  "hir",
  "hir-ty-codegen",
  "intern",
@@ -1409,10 +1412,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-launch-host"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "blaze-codegen",
+ "blaze-format",
+ "blaze-hash",
+ "blaze-ids",
+ "blaze-items",
+ "blaze-launch",
+ "blaze-link",
+ "hegeltest",
+]
+
+[[package]]
 name = "blaze-launch-rt"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "blaze-launch",
+ "crossbeam-channel",
+ "libc",
+]
+
+[[package]]
+name = "blaze-launcher"
+version = "0.0.0"
+dependencies = [
+ "blaze-launch",
+ "blaze-launch-rt",
  "crossbeam-channel",
  "libc",
 ]
@@ -2014,6 +2043,7 @@ name = "blaze-stencil"
 version = "0.0.0"
 dependencies = [
  "base-db",
+ "blake3",
  "blaze-alloc-count",
  "blaze-bytes",
  "blaze-codegen",
@@ -2021,6 +2051,8 @@ dependencies = [
  "blaze-format",
  "blaze-ids",
  "blaze-inproc",
+ "blaze-launch",
+ "blaze-launch-rt",
  "blaze-lower",
  "blaze-macro-eval",
  "blaze-mem",
@@ -2033,6 +2065,7 @@ dependencies = [
  "cranelift-frontend",
  "cranelift-interpreter",
  "cranelift-reader",
+ "crossbeam-channel",
  "gimli",
  "hir-ty-codegen",
  "libc",

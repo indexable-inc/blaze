@@ -638,6 +638,59 @@ The report groups failures by cause. It is not in the gate. On 2026-11-11 (all-1
 splice when a cfg swaps a function for its twin), 60 not run (25 have one revision, 35 use a
 directive or flag the importer has no place for); about 30 minutes.
 
+## The oracle
+
+One property over the revision tests' two drivers: after any sequence of edits, saves, builds,
+restarts and kills, what an incremental build gives is what a clean build of the same sources
+gives, the work is bounded by what the step changed, and nothing panicked, was contained or was
+recomputed for no recorded reason. The sequences are drawn, not listed
+(`crates/blaze-engine/tests/revisions/generate.rs`): Hegel draws a workspace (the package `app`,
+a `#![no_std]` library with a struct, a trait with a provided method and two impls, a call
+through `dyn`, a generic, a `macro_rules!`-made module, a `cfg` pair and a feature pair, and a
+`main.rs`; and, each drawn, `up` with a generic `app` instantiates, `vendor/made` with a build
+script that reads two files, writes `OUT_DIR` for an `include!` and sets a `cfg`, and the proc
+macro `mac`) and one to five turns. A turn is up to two edits (a body, a signature, a layout, a
+trait impl, an override, the only `dyn` call, an item added or removed, a rename, a `cfg`, a
+feature, the build script, its input, its `cfg` file, the proc macro, a comment, an indent,
+lines moved; a value set again is a no-op and an earlier one a take-back), how they are saved (in
+place, by rename, truncate then write, twice), and an event before or after the save (`blaze
+stop`, `kill -9`, a build interrupted some milliseconds in, the same sources built in a second
+checkout by the same daemon, a build of its own, a terminal of another width). The generator
+makes each sequence a revision test, so both drivers run it as they run a case, and it states
+what each build must print (the model computes it) and what it may make again (nothing for a
+turn that changes nothing or only comments and layout; the one function for a body).
+
+    cargo +nightly-<date> test --release -p hir-ty-codegen --lib -- edits::revisions::any_turn_sequence
+    BLAZE_ORACLE_CASES=200 cargo +nightly-<date> test --release -p blaze-engine --test revisions -- --ignored oracle::any_turn_sequence --nocapture
+
+- **Simulated** (`any_turn_sequence_builds_as_clean` in `v2/edits/revisions.rs`): the library
+  alone, 40 sequences in about 45 s in the suite, `HEGEL_TEST_CASES=<n>` for more. A stop or a
+  kill is a new database and memo over the kept store; a second checkout is a second database
+  over the same store; an interrupted build is a build whose records are dropped. Its control
+  plants a stale store entry (`the_oracle_catches_a_stale_store_entry`).
+  `BLAZE_REVISIONS_STORE_CHECK=off` lets a stale hit through so the oracle lists what came of it.
+- **Real** (`oracle.rs`, ignored tests: minutes of builds a sequence): the whole workspace under
+  a real daemon. `BLAZE_ORACLE_CASES`, `BLAZE_ORACLE_TURNS`, `BLAZE_ORACLE_SEED`;
+  `BLAZE_ORACLE_SKIP=<names>` leaves out edit kinds (`body`, `scriptcfg`..), events (`kill`,
+  `cancel`..) and parts (`mac-part`..) with a known failure while the rest run;
+  `BLAZE_ORACLE_CLEAN=when-wrong` builds a revision from nothing only when its incremental build
+  failed a check (the model's `prints` still catches a stale program). `each_kind_once_builds_as_clean`
+  is the smoke run; `the_oracle_catches_a_build_of_the_sources_before` the control.
+
+What needs the real daemon, and why: the build script and the proc macro (they run sandboxed
+processes and wasm, which the simulated pipeline has no seam for), features and the manifest
+(cargo's resolution is the daemon's lowering), the watcher's view of a save, `kill -9`, an
+interrupted request, two checkouts in one process, diagnostics replayed for another terminal,
+and the program run. A crash that tears unsynced writes is neither driver's: the real kernel
+does not tear on `kill -9`, and the simulation has no daemon. The store's and the image's own
+simulation tests hold that below the daemon (`blaze-query/src/tests/restore.rs`,
+`blaze-cargo/src/serve/tests.rs`).
+
+A failure prints the sequence, Hegel shrinks it, and each failing sequence is written as a case
+directory under `BLAZE_ORACLE_OUT` (the last written is the smallest). To keep it: move the
+directory into `cases/` under a name that says the property, list it in `sim!` or `real!`, and
+give the failing check a `known` row naming its cause until it is fixed.
+
 ## Adding a test
 
 A bug found in a real crate is proven fixed by that crate's own tests passing under blaze
@@ -679,8 +732,7 @@ for each platform, each on a machine of its own kind.
 
 | Workflow | Event | What runs | Wall time |
 |---|---|---|---|
-| `blaze.yaml` (`gate`) | pull request | on Linux AArch64, on a 64-vCPU ix runner ([ix runners](#ix-runners)): blaze builds blaze (`blaze build`) and tests it (`harness/unittests.py`, `blaze test`, only the tests the change reached), from the newest release and the store main pushed to blaze's remote; on Linux AArch64 (ix), `blaze check --workspace --message-format short` and then the same with `--all-targets` (every crate's test targets type-check) with the release `.github/blaze-version` names and the pinned LLVM, then astlog's rules over the crates and tools (`tools/astlog/scan.py`, [its README](../tools/astlog/README.md#rules-in-blaze)) (`workspace-check`, from main's last green run's snapshot); on Linux AArch64, the lint baselines, `blaze check --workspace --target aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines` with the blaze the tree builds there (as the build job does, from main's warm store), not the release, so the counts are of the lints the tree defines (`lint-baselines`, [cargo.md](cargo.md#lints)); `harness/imports.py`, `rustcsites` (`scripts/src/bin/rustcsites.rs`), actionlint over `.github/workflows` | 49 min on a store the release has not compiled into |
-| `blaze.yaml` (`gate`) | pull request | on Linux AArch64, on a 64-vCPU ix runner ([ix runners](#ix-runners)): blaze builds blaze (`blaze build`) and tests it (`harness/unittests.py`: `blaze test --workspace`, every test of every crate, held to `harness/known-failures.toml`), from the newest release and the store main pushed to blaze's remote; on Linux AArch64 (ix), `blaze check --workspace --message-format short` with the release `.github/blaze-version` names and the pinned LLVM, then astlog's rules over the crates and tools (`tools/astlog/scan.py`, [its README](../tools/astlog/README.md#rules-in-blaze)) (`workspace-check`, from main's last green run's snapshot); on Linux AArch64, the lint baselines, `blaze check --workspace --target aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines` with the blaze the tree builds there (as the build job does, from main's warm store), not the release, so the counts are of the lints the tree defines (`lint-baselines`, [cargo.md](cargo.md#lints)); `harness/imports.py`, `rustcsites` (`scripts/src/bin/rustcsites.rs`), actionlint over `.github/workflows` | 49 min on a store the release has not compiled into |
+| `blaze.yaml` (`gate`) | pull request | on Linux AArch64, on a 64-vCPU ix runner ([ix runners](#ix-runners)): blaze builds blaze (`blaze build`) and tests it (`harness/unittests.py`: `blaze test --workspace`, every test of every crate, held to `harness/known-failures.toml`), from the newest release and the store main pushed to blaze's remote; on Linux AArch64 (ix), `blaze check --workspace --message-format short` and then the same with `--all-targets` (every crate's test targets type-check) with the release `.github/blaze-version` names and the pinned LLVM, then astlog's rules over the crates and tools (`tools/astlog/scan.py`, [its README](../tools/astlog/README.md#rules-in-blaze)) (`workspace-check`, from main's last green run's snapshot); on Linux AArch64, the lint baselines, `blaze check --workspace --target aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines` with the blaze the tree builds there (as the build job does, from main's warm store), not the release, so the counts are of the lints the tree defines (`lint-baselines`, [cargo.md](cargo.md#lints)); `harness/imports.py`, `rustcsites` (`scripts/src/bin/rustcsites.rs`), actionlint over `.github/workflows` | 49 min on a store the release has not compiled into |
 | `blaze.yaml` (`warm`) | push to main | the same on Linux AArch64 (ix) and macOS, every test, then a push of the store for the runs after it, and `linux x64 (cross-compiled, not run)`, blaze cross-compiled for x86-64 and not run ([ix runners](#ix-runners); TODO(x86-64): no x86-64 tests). Its `linux arm64 / build` passing is what cuts a canary (`canary.yaml`); the whole run green, unit tests on every platform, is what stable needs besides the promotion gate ([release.md](release.md)). And on Linux AArch64 the std cases of the smoke corpus (`harness/smoke.py`, [release.md](release.md#the-smoke-corpus): `blaze run` and `blaze test`, dev and `--release`) with the blaze blaze built, 17 to 30 min until [#899](https://github.com/indexable-inc/blaze/issues/899) (74 s with rustc's) | |
 | `blaze-platform.yaml` (`profile-gate`) | with each platform's build, but Windows | the profile's gate (`blaze debug gate`, [profiling.md](profiling.md#the-gate-what-a-profile-must-hold)) over the history the build's self-build wrote, with the blaze it made, held to `harness/profile-gate-known.toml`, and each fixture of `crates/blaze-profile/fixtures/gate/` failing its own check (`harness/profile_gate.py`); then `harness/v2/budgets.py`'s smoke with the same blaze ([The v2 proof](#the-v2-proof)), which holds [the smoke's guards](#the-smokes-guards) and uploads its result as `budgets-smoke-<platform>` for the `ci` job; uploads the build's per-build summary as `profile-summary-<platform>-<runner>-<commit>-<tree>-<blaze>`. No secret | a few min |
 | `profile-nightly.yaml` | nightly, by hand | `slower_between_commits` over main's last 10 summaries of one runner class, the newest against the rest (`harness/profile_trend.py`); fails naming each span 1.25 times and 50 ms slower or more | 5 min |

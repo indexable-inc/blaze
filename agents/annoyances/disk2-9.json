@@ -1,0 +1,12 @@
+{
+ "id": "disk2-9",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+ "where": "a home's store copied into another home",
+ "what": "A first run in an empty home with another home's whole store copied in, same binary, took as long as with none (13.0 s against 13.1 s on main, ix arm64): no record was reused, because unit keys hold the machine directory, the launcher's path and the terminal's width (docs/remote-cache.md, Packs, lists each).",
+ "cost": "the pack work stops here until the keys are fixed",
+ "cause": "keys that carry paths",
+ "workaround": "none",
+ "fix": "the rows of that table",
+ "state": "open"
+}

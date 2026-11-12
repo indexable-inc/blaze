@@ -1,0 +1,12 @@
+{
+ "id": "disk2-5",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+ "where": "git diff in the Mac's checkout",
+ "what": "`git diff HEAD > patch` wrote difftastic's display, not a patch (an external diff tool is configured), so `git apply` in the VM said `No valid patches in input` three times.",
+ "cost": "fifteen minutes",
+ "cause": "`diff.external` applies to plain `git diff`",
+ "workaround": "`git diff --no-ext-diff`",
+ "fix": "lane briefs that ship a working tree to a VM say `--no-ext-diff`",
+ "state": "open"
+}

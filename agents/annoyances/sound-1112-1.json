@@ -1,0 +1,17 @@
+{
+ "id": "sound-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane sound-1112",
+ "where": "blaze: the identity of a function that coerces to `dyn` (hir-ty-identity, `vtable` in facts.rs) against the vtable the code generator gives it as data",
+ "what": "The oracle (crates/hir-ty-codegen/v2/edits/revisions.rs, `any_turn_sequence_builds_as_clean`) on its first run, 40 sequences, shrank a failure to one turn: an impl that has the trait`s required method is given its own copy of a provided one. `app::shapes` (`by_dyn(&A) ^ by_dyn(&B)`) keeps its kernel key c585c7ccc358, in a clean build of each revision in a database of its own, and its record differs: the vtable of `B` it holds as data names its slots by instance key (before: `sides` 418cb86c8ef4, the same instance `A`s slot has, `area` 641d00bf623a; after: 7fbf4557068a and 31cdc9d8da77), the data id moves (f0b246844056 to ec4a616d212e) and the relocation to it. Code and lines equal. With the store check on the build stops (`BLAZE_VERIFY_STORE: the store`s value of app::shapes ... is not what computing it again gives`); with it off the stale record is taken and the old vtable linked. The existing case an_impl_overriding_a_provided_method_changes_its_vtable passes with one key too (735b7f2d7e0b both revisions), so there the bytes are equal: what differs here is a second impl sharing the provided method`s instance and a required method whose instance key moves when the override is put above it.",
+ "cost": "a wrong program when the store check does not sample the hit; found in 45 s of the oracle",
+ "cause": "not found: either `vtable` is not reached for this coercion or what it hashes of a slot (`name(method, args)`) is not what the data names (an instance key that two impls share for a provided method, and that moves with the method`s place in its impl)",
+ "whys": [
+  "the record holds the vtable`s bytes and slot targets, the key holds names",
+  "the key and the record are written by two walks of the same body that nothing holds to each other for function data (relocs_hashed.rs does it for constants and statics only)"
+ ],
+ "class": "a key and its value derived by two code paths",
+ "prevention": "one walk yields both the record`s references and the key`s parts (the key is a hash of the references the emitter actually wrote), or a test like relocs_hashed for function data; until then the oracle`s case an_override_beside_a_required_method_changes_the_vtable holds it, known under sim",
+ "workaround": "none; BLAZE_VERIFY_STORE=1 turns the wrong program into a stopped build",
+ "state": "open, for the lane that owns hir-ty-identity: the case replays in 0.5 s (`cargo test -p hir-ty-codegen --lib -- an_override_beside`), `the_keys_of_the_coercion_site_before_and_after_the_override --ignored --nocapture` prints both revisions` relocations and data"
+}

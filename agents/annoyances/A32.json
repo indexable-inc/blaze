@@ -1,0 +1,11 @@
+{
+ "id": "A32",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "ix",
+ "what": "`ix rm` of old failed VMs is refused (`automation deletes are paused in this region by migration`, `protected streams disk`) after deleting those still on a node; the message does not say that the switch has never been turned on or that an operator must do it.",
+ "cost": "a half-finished cleanup and a round trip to the ix session to learn why",
+ "cause": "the region's reaper switch is still in its initial `Paused` state",
+ "workaround": "none for an agent",
+ "state": "open: needs Andrew (`ix-admin vm reaper`)"
+}

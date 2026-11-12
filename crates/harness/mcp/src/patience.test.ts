@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { ASSUMED_MS, LONG_MS, NOTICES, gate, limit, noticeAt, span, stopped, told } from "./patience.ts";
+import { ASSUMED_MS, LONG_MS, NOTICES, gate, limit, noticeAt, overLimit, span, told, waited } from "./patience.ts";
 
 test("a duration reads as a person would say it", () => {
   expect(span(120)).toBe("0.12s");
@@ -54,12 +54,28 @@ test("the session's waiting is said once it is worth saying", () => {
 });
 
 test("a stopped cell is told it was suspiciously slow, not just that it timed out", () => {
-  expect(stopped(40_000, 10_000)).toContain("suspiciously slow");
-  expect(stopped(5_000, undefined)).toBe("cell stopped at its limit of 5.00s");
+  expect(overLimit(40_000, 10_000).advice).toContain("suspiciously slow");
+  expect(overLimit(5_000, undefined)).toEqual({ why: "it passed its limit of 5.00s", advice: null });
 });
 
 test("a backgrounded cell speaks up at 2×, 4×, 8× and 16× its estimate, then stays quiet", () => {
   expect([0, 1, 2, 3].map((n) => noticeAt(10_000, n))).toEqual([20_000, 40_000, 80_000, 160_000]);
   expect(noticeAt(10_000, NOTICES)).toBeUndefined();
   expect([0, 1].map((n) => noticeAt(undefined, n))).toEqual([120_000, 480_000]);
+});
+
+test("the session's waited time counts overlapping cells once", () => {
+  expect(waited([])).toBe(0);
+  expect(waited([[0, 10], [5, 20], [30, 40]])).toBe(30);
+  expect(waited([[5, 6], [0, 100]])).toBe(100);
+  // Never more than the wall time from the first start to the last end, never less than the longest cell.
+  for (let seed = 1; seed <= 200; seed++) {
+    let x = seed;
+    const next = () => (x = (x * 48271) % 2147483647) % 1000;
+    const cells = Array.from({ length: 1 + (seed % 7) }, () => { const a = next(); return [a, a + next()] as const; });
+    const w = waited(cells);
+    expect(w).toBeLessThanOrEqual(Math.max(...cells.map((c) => c[1])) - Math.min(...cells.map((c) => c[0])));
+    expect(w).toBeGreaterThanOrEqual(Math.max(...cells.map((c) => c[1] - c[0])));
+    expect(w).toBeLessThanOrEqual(cells.reduce((n, c) => n + c[1] - c[0], 0));
+  }
 });

@@ -115,6 +115,10 @@ fn script(driver: &mut impl Driver) -> BTreeMap<u64, String> {
             29 => Effect::WriteBack { file: name("store/a/moved"), tag: Tag(30) },
             30 => Effect::WriteBack { file: name("missing"), tag: Tag(31) },
             31 => Effect::SyncDir { dir: name("store/a"), tag: Tag(32) },
+            // A barrier of a file that is there, and of one it makes (as a sync makes it).
+            32 => Effect::Barrier { file: name("store/a/moved"), tag: Tag(33) },
+            33 => Effect::Barrier { file: name("store/a/ordered"), tag: Tag(34) },
+            34 => Effect::Stat { file: name("store/a/ordered"), tag: Tag(35) },
             _ => return,
         };
         effects.push(next);
@@ -160,6 +164,9 @@ fn every_driver_ends_the_script_the_same() {
     assert_eq!(simulated[&30], format!("{:?}", Done::WrittenBack));
     assert_eq!(simulated[&31], "failed");
     assert_eq!(simulated[&32], format!("{:?}", Done::Synced));
+    assert_eq!(simulated[&33], format!("{:?}", Done::Ordered));
+    assert_eq!(simulated[&34], format!("{:?}", Done::Ordered));
+    assert_eq!(simulated[&35], "stat 0 bytes", "a barrier makes the file it orders");
     #[cfg(target_os = "linux")]
     {
         let root = dir("uring");

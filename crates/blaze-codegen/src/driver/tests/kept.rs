@@ -617,6 +617,49 @@ fn a_walk_over_kept_describes_builds_what_a_fresh_walk_builds(tc: hegel::TestCas
 
 const WHOLE: Run = Run { live: false, static_root: false, check: None };
 
+/// Five functions, each calling some after it, the second's call through a `dyn` made
+/// direct to the fifth: the program of the case the refinement's search found on 2026-11-11
+/// (`AXicbYqxDQBACAL/8lZ27r+sJNqQSMEBoZ6UyGKwDWs3wL6Bki+Dv/8GLHwAwg==`, two runs of three).
+fn with_one_dyn_site() -> Program {
+    let mut program = Program::default();
+    let calls: [&[u32]; 5] = [&[2, 3, 4, 5], &[3, 4], &[4, 5], &[5], &[]];
+    for (id, calls) in (1..).zip(calls) {
+        program.function(id, 0x10 + id as u8, calls);
+        program.bodies.insert(id, (id % 3, false));
+    }
+    program.functions.get_mut(&1).expect("just made").symbol = Some("main".to_owned());
+    for id in 2..=5 {
+        let function = program.functions.get_mut(&id).expect("just made");
+        (function.foreign, function.over_editable) = (true, true);
+    }
+    program.dyn_sites.insert(2, 5);
+    program
+}
+
+/// The refinement's case pinned: the fifth function is removed, and with it the program's one
+/// call through a `dyn`, so the build after the edit closes no dyn facts where the build
+/// before it did. The kept walk's describes are against the closed facts (the second
+/// function's code calls the fifth direct), which no changed set names: the build walks
+/// whole, and builds what a fresh walk builds.
+#[test]
+fn a_walk_kept_against_closed_dyn_facts_is_not_patched_by_a_build_that_closes_none() {
+    // `Edit::RemoveFunction` of the fifth of five.
+    let edits = [(Edit::RemoveFunction, (4, 0))];
+    assert_eq!(first_difference(with_one_dyn_site(), WHOLE, &edits, None), None);
+}
+
+/// The control of the refinement for a walk kept against closed dyn facts: a driver that
+/// asks only the patching build's front end whether it closes any patches that walk, keeps
+/// the removed function and its caller's direct call, and the oracle says so.
+#[test]
+fn the_oracle_catches_a_walk_kept_against_closed_dyn_facts_patched() {
+    let edits = [(Edit::RemoveFunction, (4, 0))];
+    let plant = Some(Plant::Patch(Planted::PatchesClosed));
+    let found = first_difference(with_one_dyn_site(), WHOLE, &edits, plant)
+        .expect("the planted bug was not found");
+    assert!(found.starts_with("build 1: "), "{found}");
+}
+
 /// The control of the refinement for a changed function: an edit of 4's body gives it a new
 /// key, which its caller's places name. A driver that takes its kept describe without asking
 /// the front end builds 4 under its old key, and the oracle says so; the driver that asks

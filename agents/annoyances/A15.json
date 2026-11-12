@@ -1,0 +1,11 @@
+{
+ "id": "A15",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "ix",
+ "what": "Copying a 790 MB binary out of a VM through `ix shell` ran at about 0.5 MB/s and hit the 600 s tool limit; the binary is mostly zero padding.",
+ "cost": "30 minutes",
+ "cause": "no file-copy command; the patch room makes binaries large",
+ "workaround": "`zstd -3` on the VM side first (160 MB)",
+ "state": "open: an `ix cp`"
+}

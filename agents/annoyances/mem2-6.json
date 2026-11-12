@@ -1,0 +1,11 @@
+{
+ "id": "mem2-6",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+ "where": "blaze-engine: mimalloc and transparent huge pages",
+ "what": "`huge.rs` set `mi_option_large_os_pages` from BLAZE_HUGE_PAGES to choose whether mimalloc is on transparent huge pages. In mimalloc 3 that option is hugetlb only; `MADV_HUGEPAGE` is under `allow_thp`, on by default, and the first arena is mapped before `main`. So BLAZE_HUGE_PAGES never decided it, `BLAZE_HUGE_PAGES=off` left mimalloc's arenas on huge pages only because the kernel-wide opt-out covers unadvised memory, and the comment's measurement was of something else.",
+ "cost": "one wrong build and measurement, and a wrong belief about what the setting does",
+ "cause": "an option's name carried over from mimalloc 2; nothing checked the mapping's flags",
+ "workaround": "libmimalloc-sys's `no_thp` feature is the one switch (build time); measured, it is 1.7 GiB less resident and a body edit 17% slower, so it is not set",
+ "state": "the module's docs are true on mem2-1111 (0d7549c6e0); the choice itself is open to anyone who measures bare metal"
+}

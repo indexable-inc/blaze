@@ -1,0 +1,11 @@
+{
+ "id": "A31",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "blaze: run",
+ "what": "Every `blaze run` cloned the 158 MB executable and then rewrote it (the build's placement and the dev host's table each took the other's file for a changed one), about 160 ms per run, and the write made the next build walk.",
+ "cost": "the whole no-op run gap against Relax",
+ "cause": "two owners of one output file",
+ "workaround": "none",
+ "state": "fixed on all-1111 (9c6bba8f90)"
+}

@@ -1521,7 +1521,7 @@ impl Walk<'_, '_> {
                 made
             }
         };
-        db.set_crate_attr_files(input, false, Some(Durability::MEDIUM));
+        db.set_crate_attr_files(input, false, Some(graph_durability(&krate.basic.origin)));
         self.all.insert(input);
         self.visited.insert(source, input);
         self.done[at] = Some((input, changed));
@@ -1539,7 +1539,7 @@ impl Walk<'_, '_> {
         deps: &[Crate],
         deps_changed: u64,
     ) -> u64 {
-        let durability = Durability::MEDIUM;
+        let durability = graph_durability(&krate.basic.origin);
         let mut set = false;
         if !same_data(&krate.basic, deps, old.data(db)) {
             old.set_data_field(db).with_durability(durability).to(built_data(krate, deps));
@@ -1604,7 +1604,7 @@ impl Walk<'_, '_> {
         );
         let input = Crate::new(
             &*db,
-            Durability::MEDIUM,
+            graph_durability(&krate.basic.origin),
             data,
             // clone: a new crate's fields (setup).
             krate.extra.clone(),
@@ -1618,6 +1618,19 @@ impl Walk<'_, '_> {
         );
         let changed = self.crates.note(input, root, true);
         (input, changed)
+    }
+}
+
+/// The kind of a crate's inputs when a [`CrateGraphBuilder`] makes it: `HIGH` for a library's
+/// (the toolchain's crates, registry and git dependencies), as blaze-lower states them
+/// ([`Crate::create`]), so [`crate::crate_durability`] of such a crate reads nothing below
+/// `HIGH`; `MEDIUM` for a workspace crate's, its structure.
+fn graph_durability(origin: &CrateOrigin) -> Durability {
+    match origin {
+        CrateOrigin::Local { .. } => Durability::MEDIUM,
+        CrateOrigin::Library { .. } | CrateOrigin::Lang(_) | CrateOrigin::Rustc { .. } => {
+            Durability::HIGH
+        }
     }
 }
 

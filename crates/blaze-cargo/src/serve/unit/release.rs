@@ -368,6 +368,14 @@ impl Release<Crate> {
         if ended {
             db.storage_mut().pack_reverse();
         }
+        // Asked for by name (a diagnostic, a walk of every row): which rows are of which kind
+        // and the fields that hold a library's rows below `HIGH`, into the daemon's log.
+        if ended && std::env::var_os("BLAZE_DURABILITY_CENSUS").is_some() {
+            crate::serve::said::logged!(INFO,
+                "blaze serve: durability census: {}",
+                db.storage().durability_census()
+            );
+        }
         // What was let go goes back to the system now, not when mimalloc's purge delay and the
         // next page taken get to it: this thread's heaps and every freed page at once, each
         // other thread's heaps as it next allocates or idles (memcap5).

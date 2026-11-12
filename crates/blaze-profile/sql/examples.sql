@@ -891,7 +891,7 @@ ORDER BY image, generation, summed_by, code_bytes DESC, what
 WITH picked AS (
     SELECT build_id AS picked_build, started_ns AS t0
     FROM builds
-    WHERE CASE WHEN $build IS NULL THEN build_id > (SELECT max(build_id) FROM builds) - $builds ELSE build_id = $build END
+    WHERE CASE WHEN $build IS NULL THEN build_id + $builds > (SELECT max(build_id) FROM builds) ELSE build_id = $build END
 ), said AS (
     SELECT build_id AS tagged, t_ns AS said_ns, CAST(level AS VARCHAR) AS severity,
         CAST(target AS VARCHAR) || ' ' || CAST(name AS VARCHAR) AS source,

@@ -11,8 +11,10 @@ end's, the code generator's and blaze-cargo's code identities, `serve::RecordMak
 crates/blaze-cargo, never the executable's bytes), shared by every daemon of the machine
 (`<machine>/std/<makers>`). The collector, `crates/blaze-gc`, removes what is no
 longer used of the first and the last, so a machine that builds many checkouts does not fill its
-disk. The daemon's state (its store, image and journal) is never listed, so never a candidate;
-eviction inside a store is not done yet ([v2-store.md](v2/plan/design/store.md)).
+disk. The daemon's state (its store, image and journal) is counted against the home's budget and
+its store is collected record by record, by the design in
+[The store's budget and collector](#the-stores-budget-and-collector) (designed 2026-11-12, lane
+storegc-1112; until it is built the store only grows and nothing of `<root>/v2` is listed).
 
 It is automatic: nobody needs `blaze clean` or `blaze cache gc` to keep a disk from filling.
 The daemon measures each area's volume and collects more, and sooner, the closer free space
@@ -316,8 +318,10 @@ skip it and `blaze clean` knows it as a build dir: only into one blaze made just
 `<root>/build`, never into a directory of the user's.
 
 The collector's ledger, `<state>/gc-ledger.json`, keeps when its last run ended (so the periodic
-deadline survives a restart) and its last 16 runs' reports. An asked or urgent run's is written
-as it ends, a paced slice's at most once a minute. A ledger that does not read is logged
+deadline survives a restart) and its last 16 runs' reports. An asked run's is written as it
+ends, as is an urgent run's with no build under way; an urgent run's that ended beside a build
+is written once no build has been under way for a second (never beside the build's outputs),
+a paced slice's at most once a minute. A ledger that does not read is logged
 and begun afresh, never silently.
 
 ## Commands
@@ -361,12 +365,100 @@ and begun afresh, never silently.
   cannot remove is named.
   `--all` tries every dir and names each it left.
 
+## The store's budget and collector
+
+Designed 2026-11-12 (lane storegc-1112), not built: each paragraph is what the code is to do.
+
+**Budget.** One number per area (a home, `<root>`; the machine's directory), the tightest of
+three, each set in that area's `gc.json`: an absolute size (`budget_gib`, 64), a share of the
+volume (`share_percent`, 25; it was 50), and what leaves the floor free (held + free − floor,
+the `floor_*` levels above). The absolute size is what a person reads and raises; the share
+keeps a small CI disk from being filled; the floor is what makes room when other things fill
+the disk. Held is every byte under the area: build dirs, trash, and `v2` (the store's packs,
+checks, index and whole files, the image, the journal, the rest as `other`). The pacer's share
+pressure is this budget's: 0 at 80% of it, full at 100%.
+
+**Collectable.** A record of the store whose last use is older than the grace, least recently
+used first. Use is kept per pack, as the period a record of it was last read or written (a
+stamp in the head, head format 6; a head of format 5 is read with every pack stamped at the
+open), and per record in the flags the cold tier keeps (`Read`, `ReadBefore`, `New`,
+`NewBefore`), which every hit sets, `has` included. Never collected, the roots: (1) a record
+with one of those four flags set: a period ends only between requests, so every key a running
+or queued build found or put is flagged until it ends, and two periods after; (2) a record a
+pin names; (3) what a kept record names inside the store (a chunked output's chunks, a derived
+value's base, a compressed record's dictionary); (4) a record whose pages a reader pins
+(`Pinned`, a kept front end's images): its key may go, its pack's pages and file stay until the
+pin does; (5) the key last placed at each path of a leased build dir (`Jobs.paths.placed`),
+which a patch is based on. A launched program holds nothing of the store: its files are clones
+and its code is copied.
+
+**Kept set.** A pin is a record of the store (`Kind::Pin`: a name, why, when, the keys). The
+daemon writes two unasked: `toolchain` (the std records it copies in from the shared std store,
+whose own directory its lease keeps) and `bstd`. `blaze gc --kept` lists each pin, its bytes
+and why, then what else is rooted and by what. `blaze clean` is this project's build dir and the
+records only its members made; `blaze clean --unkept` everything but the kept set and the roots;
+`blaze clean --everything` stops the daemon and trashes the home's state whole.
+
+**Forgetting a key.** By generations, not tombstones: the store's tables stay append-only. The
+least recently used pack is retired as a settle retires a half-dead one: its rooted records are
+copied on into the pack being written, and the head that makes the copies durable names the
+pack removed. A key that points into a pack its view names removed finds nothing, in memory
+and after a reopen, and the next index table leaves it out. So forgetting N cold records costs
+one unlink, copying costs what is kept, and the one commit point is the head, which is already
+crash-tested. A tombstone per key would need a second durable structure and a compaction to get
+the bytes back. A reader that found the record first reads it: the pack's pages are retired
+only after a view without it is published, its grace has passed and no pin holds them (the
+pool's `pack_removed`), and the file is unlinked then, not at the head.
+
+**Crash safety.** The copies and their checks are behind a barrier before the head; the head is
+one whole write; files are removed after it is durable, and an open removes those a head names
+removed. A crash before the head leaves the old store (the copies are cut off as an unnamed
+tail); after it, the new. No head names a record whose bytes are in a pack it names removed.
+
+**Pacing.** The collector core (`blaze_cas::collect`, sans-IO, on the daemon's clock) only
+plans; reading, hashing and compressing run on a worker through a `Reader`, as the cold tier's
+batches do, in the pacer's class (`Background` below half pressure, `Normal` above). The
+period-end walk goes the same way (a worker scans the rows and rotates the flags; the loop takes
+the plan back), so its cost on the loop no longer grows with the store. On the loop a step
+hands a batch out or copies at most 256 KiB into the store's segment: 1 ms is its bound, each a
+span (`store gc plan`, `scan`, `copy`, `retire`, `unlink`) and a counter of steps past it. While
+a request is open the collector starts no commit: its copies ride the build's own commits; idle,
+it commits at most 1 MiB at a time, the one wait a request can meet (the rest of that commit).
+A slice's bytes and gap scale with pressure as above. When everything left is rooted and the
+area is still over, it stops, removes nothing, and reports `OverBudget` with the largest
+keepers and what keeps each.
+
+**Other formats.** A store whose head is of a format this binary does not read is renamed to
+`v2/store.format-<n>` at start (today the daemon's start fails on it), and an image of another
+layout is named as stale; each is trashed once nothing wrote it or leased it for a day.
+
+**What a person sees.** Every build's end carries the data (`store_bytes`,
+`store_delta_bytes`, `held_bytes`, `budget_bytes`, `collectable_bytes`, the volume's free
+bytes). A line is printed only at 85% of the budget or more, or when the volume is below its
+comfortable level, at most once in 6 hours for a home (once an hour when over), naming
+`blaze gc --budget <size>` and `blaze clean --unkept`. No prompt, during a build or after it:
+keys typed ahead for the next command would answer it, `blaze run` has handed the terminal to
+the program, an agent on a pty would hang or answer by accident, and nothing waits on the
+answer since the collector is already at work. At 100% the build proceeds and the line says
+what is kept; a build fails only when a write fails for want of space, with `NoSpace` naming
+the volume, the budget and both commands.
+
 ## Not done yet
 
 - Eviction inside a store (`crates/blaze-cas` units and packs, least recently used): it needs the
-  store to drop units from its index before their packs go; settling already retires half-dead
-  packs. What it costs today (measured 2026-11-11, lane disk-1111): the daemon's store
-  (`<root>/v2/store`) only grows. Hello-world's after a cold build and five edits is 174 MB:
+  store to drop keys from its tables before their packs go. Not built, so nothing in a store is
+  ever forgotten; what is built (2026-11-12, lane disk2-1111) is that it no longer keeps what it
+  holds raw: between requests the daemon ends the store's reading periods and moves what went
+  unread for two of them cold (`crates/blaze-cargo/src/serve/settle.rs`: zstd with a dictionary
+  per kind, on a worker; a value in a file of its own goes into a pack and its file is removed;
+  a pack left half dead is rewritten, the one its unit appends to as well). Hello-world's store
+  after a cold build and ten edits went from 184.3 MB to 33.9 MB (ix arm64, xfs), with the body
+  edit's median unchanged (79.3 ms before, 76.9 ms after, n=4 each). The design for forgetting:
+  packs as the unit of eviction, as a log-structured cache evicts regions: the oldest pack is
+  retired with only its records read in the last two periods (and every pinned key's) copied on,
+  the rest forgotten by a head that no longer lists them; a store of another format or of makers
+  no installed blaze has is a directory the collector trashes whole. What it cost before
+  (measured 2026-11-11, lane disk-1111): the daemon's store (`<root>/v2/store`) only grew. Hello-world's after a cold build and five edits is 174 MB:
   six whole files of front-end records (`Query`, kept as files of their own: 85.7 MB, the
   largest 51.6 MB), one whole `Derived` file (21.1 MB) and a pack of 93 MB (`Query` 43.5 MB in
   13,304 records, `Code` 26.3 MB in 12,207 of which 6.5 MB repeat another record's content,

@@ -1,0 +1,11 @@
+{
+ "id": "real-9",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane real-1111",
+ "where": "blaze: edit loop on reth",
+ "what": "After a cold build of reth-node-ethereum's closure in a copy of reth, one edit of `snap/run.rs` and a build on b0a935736e panicked in dozens of units: `deps/signatures/key.rs:166: module ... vec of an item is not in its crate's def map` and `nameres.rs:1074 ModuleId not found in ModulesMap`. The same loop on a small tokio fixture is fine.",
+ "cost": "stopped the reduction of two reth errors by editing, and the incremental measurements",
+ "cause": "not known when written; the lane's report says what the tree before the merge does",
+ "workaround": "none",
+ "state": "open"
+}

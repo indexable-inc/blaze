@@ -341,8 +341,9 @@ pub struct Ended {
 /// What the loop gives the `blaze-history` thread: a build as it starts, and as it ends, and
 /// a reader's ask for a flush.
 enum ToHistory {
-    /// Its row with outcome running and no end, written at once: the row a build has if its
-    /// daemon dies before it ends ([`history::writes`]).
+    /// Its row with outcome running and no end: the row a build has if its daemon dies
+    /// before it ends ([`history::writes`]). Written by the next flush made, which for a
+    /// build still running comes [`STARTED_FLUSH_AFTER`] after its start ([`Held`]).
     Started(BuildRow),
     /// Its misses explained and told at once (`blaze why` is answered from them), and its
     /// rows kept by the thread ([`Noted`]), given to no flush: the build's answer may still be
@@ -372,7 +373,7 @@ enum ToHistory {
     /// to the explorer's thread that waits for it ([`explorer_flush`]).
     FlushFor(Sender<Result<u64, String>>),
     /// What the client of a build sent as it ended ([`blaze_api::Request::ClientRows`]),
-    /// written at once. Its request was answered as this was sent ([`Observe::client_rows`]):
+    /// written by the next flush made ([`Held`]). Its request was answered as this was sent ([`Observe::client_rows`]):
     /// no client waits for a write, and one that fails is the history's failure, said in
     /// `blaze status` as any flush's is.
     Client(history::ClientRows),
@@ -806,9 +807,15 @@ fn keep(
     let mut written_at = Instant::now();
     // The builds that ended and whose answer has not been said, oldest first ([`Noted`]).
     let mut noted: Vec<Noted> = Vec::new(); // alloc: none until a build ends
+    // The flushes no reader waits for, held while builds come ([`Held`]).
+    let mut held = Held::default();
+    // The records of builds explained and not yet appended to `blaze why`'s ledger, oldest
+    // first: written with the next flush made ([`File::write_all`]), never as a build ends.
+    let mut unwritten: Vec<(u64, Vec<u8>)> = Vec::new(); // alloc: none until a build ends
     loop {
         doing.set(Step::Waiting, 0);
         let due = history::EVERY.saturating_sub(flushed_at.elapsed());
+        let due = held.due_in(Instant::now()).map_or(due, |it| it.min(due));
         let next = crossbeam_channel::select! {
             recv(rows) -> it => it.map_err(|_| RecvTimeoutError::Disconnected),
             recv(history.full()) -> _ => {
@@ -820,15 +827,19 @@ fn keep(
                 tell_failed(&mut history, failed);
                 flushed_at = Instant::now();
                 written_at = flushed_at;
+                held.flushed();
                 continue;
             }
             default(due) => Err(RecvTimeoutError::Timeout),
         };
+        // The timer's turn, or a held flush's: either flushes now.
+        let timed = matches!(next, Err(RecvTimeoutError::Timeout));
         // The timer, with no build running, none whose row or answer waits, and a write
         // within the last minute: nothing a flush now would write but the daemon's own
         // heartbeat, a file a table for a few hundred rows. Held for the next flush anything
         // asks for, at most `history::IDLE_EVERY`.
-        if matches!(next, Err(RecvTimeoutError::Timeout))
+        if timed
+            && !held.owes()
             && noted.is_empty()
             && history.quiet()
             && written_at.elapsed() < history::IDLE_EVERY
@@ -854,14 +865,26 @@ fn keep(
             let mut next = Some(next);
             // Bounded: `MOST_BATCH` turns at most.
             while let Some(taken) = next.take() {
-                take(taken, &mut history, why, &mut noted, failed, told, doing, &mut batch);
+                take(taken, &mut history, why, &mut noted, &mut unwritten, failed, told, doing, &mut batch);
                 batch.taken += 1;
                 if batch.last || batch.taken == MOST_BATCH {
                     break;
                 }
                 next = rows.try_recv().ok().map(Ok);
             }
-            let Some(build) = batch.flush else { return (Ok(()), batch.last) };
+            // A flush no reader waits for, asked by a build's start, its answer or what
+            // follows it, is held while builds come ([`Held`]): it is made by the timer's turn
+            // that finds it due, or with the next flush a reader or the thread's end asks.
+            let waited_for = !batch.asked.is_empty() || !batch.asked_for.is_empty() || batch.last;
+            let now = Instant::now();
+            // Past its bound, what is held is flushed with this batch whatever it asks.
+            let overdue = held.due_in(now).is_some_and(|it| it.is_zero());
+            if !(timed || waited_for || overdue) {
+                held.note(batch.started, batch.flush, now);
+                return (Ok(()), false);
+            }
+            let Some(build) = held.take(batch.flush) else { return (Ok(()), batch.last) };
+            write_why(why, &mut unwritten, failed);
             let flushed = history.flush(build);
             let seq = || match &flushed {
                 Ok(it) => Ok(it.seq),
@@ -889,6 +912,16 @@ fn keep(
     }
 }
 
+/// The records of the builds explained since `blaze why`'s ledger was last written, appended
+/// together ([`File::write_all`]); a failure is logged and told to the daemon, as a flush's.
+fn write_why(why: &mut File, unwritten: &mut Vec<(u64, Vec<u8>)>, failed: &Sender<String>) {
+    if let Err(error) = why.write_all(unwritten) {
+        tracing::error!("{error}");
+        _ = failed.send(error);
+    }
+    unwritten.clear();
+}
+
 /// The most messages of the loop's that one flush of the history's thread covers ([`keep`]).
 const MOST_BATCH: u32 = 256;
 
@@ -906,6 +939,95 @@ struct Batch {
     taken: u32,
     /// The daemon hung up: this flush is the thread's last.
     last: bool,
+    /// A build started ([`ToHistory::Started`]): its row waits for a flush, and asks for none
+    /// of its own at once ([`Held`]).
+    started: bool,
+}
+
+/// How long after a build starts its row is flushed if nothing flushed it sooner: a build
+/// still running by then is one a daemon that dies leaves a row of (`history::writes`). An
+/// edit's build ends well inside it, and its own flush, after its answer, writes the row.
+/// Until 2026-11-11 a build's start flushed at once: several files written and synced on the
+/// disk the build's outputs go to, begun as the build began and still under way as they were
+/// placed (measured on APFS, hello world's body edit: the flush 104 to 174 ms from the
+/// build's first task, its outputs' placement 24 to 63 ms beside it against 6 ms alone).
+const STARTED_FLUSH_AFTER: Duration = Duration::from_millis(500);
+
+/// How long the history's thread waits, after the last build's start or answer, before it
+/// makes a flush no reader waits for: the next edit's build, tens of milliseconds behind the
+/// last one's answer in an edit loop, then shares the disk with no flush of the last one's
+/// profile. A flush held is made at the latest [`history::EVERY`] after it was first owed.
+const FLUSH_QUIET: Duration = Duration::from_millis(300);
+
+/// The flushes of the history that no reader waits for, held back while builds come: a
+/// build's start, its answer, its run log and its client's rows each ask for one, and each is
+/// seconds of writes and syncs at worst on the disk builds place their outputs on. A flush a
+/// reader asks for (`blaze why`, `blaze debug sql`), the timer's and the thread's last are
+/// made at once and take what is held with them, so no reader sees the wait.
+///
+/// The bound (rule 18): a flush owed is made [`FLUSH_QUIET`] after the last message that asked
+/// for one or said a build started, and no later than [`history::EVERY`] after it was first
+/// owed; a started build's row no later than [`STARTED_FLUSH_AFTER`] after its start.
+#[derive(Default)]
+struct Held {
+    /// The flush owed, as [`Batch::flush`] has it, and since when.
+    owed: Option<(Option<u64>, Instant)>,
+    /// When the builds have been quiet long enough for it.
+    quiet_at: Option<Instant>,
+    /// When a started build's row is flushed for itself.
+    started_at: Option<Instant>,
+}
+
+impl Held {
+    /// A batch that no reader waits for was taken at `now`: `started` when a build started
+    /// in it, `flush` what it asked to be flushed.
+    fn note(&mut self, started: bool, flush: Option<Option<u64>>, now: Instant) {
+        if started && self.started_at.is_none() {
+            self.started_at = Some(now + STARTED_FLUSH_AFTER);
+        }
+        if let Some(build) = flush {
+            let (owed, since) = self.owed.unwrap_or((None, now));
+            self.owed = Some((owed.max(build), since));
+        }
+        if self.owed.is_some() && (started || flush.is_some()) {
+            self.quiet_at = Some(now + FLUSH_QUIET);
+        }
+    }
+
+    /// Whether a flush is held.
+    fn owes(&self) -> bool {
+        self.owed.is_some() || self.started_at.is_some()
+    }
+
+    /// How long from `now` until what is held is due; `None` with nothing held.
+    fn due_in(&self, now: Instant) -> Option<Duration> {
+        let owed = self.owed.map(|(_, since)| {
+            let latest = since + history::EVERY;
+            self.quiet_at.map_or(latest, |quiet| quiet.min(latest))
+        });
+        let at = match (owed, self.started_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        at.map(|at| at.saturating_duration_since(now))
+    }
+
+    /// The flush to make now, of what is held and what the turn asks (`flush`), and nothing
+    /// held after it; `None` when neither asks for one.
+    fn take(&mut self, flush: Option<Option<u64>>) -> Option<Option<u64>> {
+        let owed = self.owed.take().map(|it| it.0);
+        let started = self.started_at.take().is_some();
+        self.quiet_at = None;
+        match (owed, flush) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b).or(started.then_some(None)),
+        }
+    }
+
+    /// A flush was made that wrote every row given: nothing is held.
+    fn flushed(&mut self) {
+        *self = Held::default();
+    }
 }
 
 impl Batch {
@@ -924,6 +1046,7 @@ fn take(
     history: &mut History,
     why: &mut File,
     noted: &mut Vec<Noted>,
+    unwritten: &mut Vec<(u64, Vec<u8>)>,
     failed: &Sender<String>,
     told: &Sender<Told>,
     doing: &Doing,
@@ -943,7 +1066,9 @@ fn take(
         Ok(ToHistory::Started(row)) => {
             doing.set(Step::Flushing, row.build_id);
             history.build_started(row);
-            batch.flush(None);
+            // No flush of its own at once: the build's outputs are about to be placed on the
+            // disk a flush writes and syncs ([`Held`], [`STARTED_FLUSH_AFTER`]).
+            batch.started = true;
         }
         Ok(ToHistory::Ran(rows)) => {
             doing.set(Step::Flushing, rows.first().map_or(0, |it| it.build_id));
@@ -977,11 +1102,9 @@ fn take(
             // Sent before the record is durable: an answer may name a build whose record a
             // crash then loses (docs/v2/plan/design/why.md, "Answered before durable").
             _ = told.send(Told::Explained { answer, dropped: why.dropped() });
-            doing.set(Step::Appending, build);
-            if let Err(error) = why.write(build, &record) {
-                tracing::error!("{error}");
-                _ = failed.send(error);
-            }
+            // Its record is appended with the next flush made (`keep`, [`write_why`]): the
+            // append is synced, on the disk the build's outputs are being placed on now.
+            unwritten.push((build, record)); // alloc: once a build
             if row.commit.is_none() {
                 row.commit = commit_of(Path::new(&row.workspace));
             }
@@ -1027,6 +1150,7 @@ fn take(
         }
         Err(RecvTimeoutError::Disconnected) => {
             doing.set(Step::Closing, 0);
+            write_why(why, unwritten, failed);
             if let Err(error) = why.close() {
                 tracing::error!("{error}");
                 _ = failed.send(error);
@@ -1920,6 +2044,51 @@ mod tests {
         drop(sent);
         keeper.join().unwrap();
         assert_eq!(failed.try_recv().ok(), None);
+    }
+
+    /// The invariant of [`Held`]: a flush no reader waits for is due [`FLUSH_QUIET`] after the
+    /// last build's start or answer, never later than [`history::EVERY`] after it was first
+    /// owed, and a started build's row [`STARTED_FLUSH_AFTER`] after its start at the latest;
+    /// nothing is due while nothing is held; and a flush made takes all that is held, the
+    /// highest build with it. The control: the history as it was until 2026-11-11 flushed at
+    /// each start and answer, which is `due_in` of zero at each, and none is.
+    #[test]
+    fn a_flush_no_reader_waits_for_is_held_while_builds_come() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut held = Held::default();
+        assert_eq!(held.due_in(t0), None);
+        assert!(!held.owes());
+        // A build starts: its row alone is due after `STARTED_FLUSH_AFTER`, not now.
+        held.note(true, None, at(0));
+        assert_eq!(held.due_in(at(0)), Some(STARTED_FLUSH_AFTER));
+        // It is answered 40 ms later: the flush is owed, due once the builds are quiet.
+        held.note(false, Some(Some(7)), at(40));
+        assert_eq!(held.due_in(at(40)), Some(FLUSH_QUIET));
+        // The next edit's build starts 60 ms later and is answered: the quiet begins again.
+        held.note(true, None, at(100));
+        assert_eq!(held.due_in(at(100)), Some(FLUSH_QUIET));
+        held.note(false, Some(Some(8)), at(140));
+        assert_eq!(held.due_in(at(140)), Some(FLUSH_QUIET));
+        assert_eq!(held.due_in(at(140) + FLUSH_QUIET), Some(Duration::ZERO));
+        // Builds that keep coming do not hold it past `EVERY` from when it was first owed.
+        let mut ms = 140;
+        while Duration::from_millis(ms) < history::EVERY {
+            ms += 100;
+            held.note(true, Some(Some(9)), at(ms));
+        }
+        let first_owed = at(40);
+        let due = held.due_in(at(ms)).expect("a flush is held");
+        assert!(at(ms) + due <= first_owed + history::EVERY, "{due:?}");
+        // The flush made takes all of it, the highest build's rows merged.
+        assert_eq!(held.take(Some(None)), Some(Some(9)));
+        assert_eq!(held.due_in(at(ms)), None);
+        assert_eq!(held.take(None), None);
+        // A start alone, then the timer's turn: its row is flushed, of no build's end.
+        held.note(true, None, at(0));
+        assert!(held.owes());
+        assert_eq!(held.take(None), Some(None));
+        assert!(!held.owes());
     }
 
     /// The planted bug: the history as it was until 2026-11-11, a build's row in a file as

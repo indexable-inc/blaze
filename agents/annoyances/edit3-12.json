@@ -1,0 +1,11 @@
+{
+ "id": "edit3-12",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+ "where": "the thin blaze: builds it answers have no client rows",
+ "what": "A build the thin blaze answers has the daemon's rows alone in the profile: `builds.client_started_ns` and `client_ended_ns` are null, so the time from the command's start to the request and from the answer to the program is in no row. With an edit's build now answered by the thin blaze, that is every edit.",
+ "cost": "the split in this lane's report took wall-clock stamps around the command and the daemon's `started_unix_ns`",
+ "cause": "the thin blaze links no flight recorder, by design, and `ClientRows` takes Arrow tables",
+ "workaround": "stamp the command from outside, as `one.py` does",
+ "state": "open: the launch request could carry the command's start, for the daemon to write the two times"
+}

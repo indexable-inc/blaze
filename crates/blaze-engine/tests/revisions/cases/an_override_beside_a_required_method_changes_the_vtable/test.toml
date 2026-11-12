@@ -1,0 +1,16 @@
+about = "An impl that has the trait's required method is given its own copy of a provided one, three lines above the function that coerces to the `dyn`: found by the oracle (2026-11-12) as its smallest sequence, one turn."
+drivers = ["sim"]
+seeds = 1
+
+[[revision]]
+steps = ["edit"]
+action = "run"
+prints = "160 300 0 0 0\n"
+
+[[revision]]
+steps = ["edit"]
+action = "run"
+prints = "164 300 0 0 0\n"
+
+[revision.known]
+"sim: outcome" = "`app::shapes` has one kernel key (c585c7ccc358) before and after the override, in a clean build of each revision in a database of its own, and other bytes: the vtable of `B` it holds as data names its slots' functions by instance (before: `sides` is 418cb86c8ef4, the one instance `A`'s slot has too, and `area` 641d00bf623a; after: 7fbf4557068a and 31cdc9d8da77), the data's id moves with them (f0b246844056 to ec4a616d212e) and `shapes`' relocation to it; code and lines are equal. The store check stops the build; without it the old vtable is linked. The identity of a function that coerces to `dyn` does not cover the instances its vtable's slots name (rule keys-cover-every-input; hir-ty-identity's `vtable`, facts.rs; row sound-1112-1)"

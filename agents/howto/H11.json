@@ -1,0 +1,9 @@
+{
+ "id": "H11",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane content-keys-1112",
+ "task": "Put a path (or a string that may hold one) into a unit's record key or its record",
+ "do": "Never as it is. A key part goes through `hash_cbor` with the build's `Places` (crates/blaze-cargo/src/serve/unit/portable.rs), which writes every string of the encoded value against the build's directories (workspace, build directory, shared std directory, tools, launcher); a path the front end's identity holds goes through `db.files().ported(..)` (base-db `Port`). A record's body is written the same way and read back with `decoded`; a native input's path with `Places::text`/`real`. An output that is text naming paths (a dep-info file) is listed in `Record::ported`. What still holds a directory after that is found by `Places::tied` and the record is filed under `Places::here(key)`: do not work around the scan.",
+ "why": "Rule keys-cover-every-input, the other way: a key that says where a checkout is misses in every other directory, home and machine. Measured 2026-11-12, hello world on Linux: the same sources in another directory, home and machine directory with the first home's store copied in missed 28 unit records before and 0 after (`blaze why --all`: everything was reused).",
+ "state": "current"
+}

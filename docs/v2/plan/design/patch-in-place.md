@@ -15,7 +15,7 @@ numbers after it are the main lane's to measure.
 
 | Step | Span | Cost after a one-function edit |
 |---|---|---|
-| Span tables the code names | `link inputs` | the functions the delta lists are read for their anchors; the workspace's named bodies are each one memo verification (`verified`); the tables whose positions moved are encoded (`made`). A library's bodies are not asked. One call a file the tables name, to check its name. |
+| Span tables the code names | `link inputs` | the functions the delta lists are read for their anchors; the bodies whose positions the engine's changed set names since the last link have their kept tables encoded again (`verified`, `made`). No body is asked for being watched. One call a file the tables name, to check its name. |
 | Native inputs | `link delta` | one `stat` a library, as before |
 | Function, static and span rows | `link delta` (`rows`, `hashed`) | the delta's functions hashed (`filled_id`); a search of the build's sorted lists for each |
 | The link's id | `link delta` | a leaf and about `log2(n)` nodes for each changed row (`blaze_ids::keyed`) |
@@ -48,11 +48,15 @@ since the last link".
 1. **Link inputs are kept beside the database** (`crates/hir-ty-codegen/v2/linked.rs`,
    `Kept`): per program, found by `Built::id` or `Built::delta.base`, four programs a
    process. Kept: which anchors each function and static names, a count of namers per
-   anchor, each anchor's owner, the id of each table's encoding, and a stamp per owner that
-   is not durable. No table's bytes are kept. A link applies the delta's functions and
-   statics to the counts, encodes the tables named anew, and asks the database again only
-   for the watched owners (`positions_stamp`, `declared_stamp`: memos whose one input is
-   the positions, so they run only when those are found again). `LinkInputs` is a change of
+   anchor, each anchor's owner, the id of each table's encoding, and the kept tables of each
+   owner that is not durable (`watched`). No table's bytes are kept. A link applies the
+   delta's functions and statics to the counts, encodes the tables named anew, and encodes
+   again the kept tables of the watched owners the engine names as changed since the view
+   the tables are of (`positions::changed_since`, `declaration_location::changed_since`:
+   the changed set, walked from what was written). Until 2026-11-11 it asked a stamp memo
+   of every watched owner each link (`positions_stamp`): 4,841 memos verified and 1.9 ms
+   for a one-line edit of hello world, since std's bodies read `MEDIUM` inputs and are
+   watched; now 0 and 0.17 ms (`link inputs`, 30 edits each). `LinkInputs` is a change of
    a snapshot (`serial`, `base`, `tables`, `removed`); a consumer that holds neither asks
    for every table (`HirFrontend::span_tables`).
 2. **File names** are the job's, not the database's, and are in the encodings. The kept
@@ -96,6 +100,32 @@ since the last link".
    (`Loaded::patch` -> `Image::commit_into`); the running program switches slots in one
    atomic store. New code never goes where old code was; a changed signature or layout is
    a restart with the reason (`changed_assumptions`).
+
+## `.rela.dyn` by slot (ELF, 2026-11-11)
+
+A one-function edit takes the old body's constants out of the slid addresses in one place
+and puts the new body's in at another (the patch room). In a table packed in address order
+every entry between the two moves: 303 KB of hello world's 442 KB `.rela.dyn` was written
+each edit, 95% of the patch, of the store's record of it and of each place's writes.
+
+A kept table (`elf/dynamic.rs`, `KeptRela`) now holds each slid address's `RELATIVE` entry
+in a slot that stays its own: an address gone leaves its slot zeroed (`R_*_NONE` at offset
+0), an address added takes the lowest empty slot or one more at the run's end, and the
+binds' and GOT cells' entries follow the run. `DT_RELACOUNT` is the slots before the first
+empty one, so what it counts is all `RELATIVE`; a `RELATIVE` past it and an `R_*_NONE` are
+taken by the general path of glibc's and musl's loaders (`elf_machine_rela`, `do_relocs`).
+Only an output a dynamic loader relocates is kept so (a shared library, or an executable
+with an interpreter). A table made whole (a first link, a link from scratch, a delta of
+another synthesis, a run whose empty slots outgrow the region's room) is in address order
+with no empty slot, as before. So a patched file's `.rela.dyn` is a history's, not the clean
+link's bytes; what a loader applies of it is the same set of entries
+(`elf/tests.rs`, `relinks_as_loaded`).
+
+Mach-O needs none of this on a platform with chained fixups (macOS 12 on,
+`macho/chained.rs`): a slid slot holds its target and the distance to the next slot of its
+16 KiB page, so a changed slot rewrites its 8 bytes and its predecessor's. A platform
+without them keeps the rebase opcodes, which `linkedit::rebases` makes whole each link:
+not changed here, and not measured (no macOS run in this lane).
 
 ## Not built, and why
 
@@ -231,7 +261,8 @@ not run).
 - `crates/hir-ty-codegen/v2/linked/tests.rs`: the refinement
   `the_link_inputs_kept_are_the_tables_made_whole` (reformat, body edit, function gone or
   back, another table named), control `the_oracle_catches_a_moved_body_not_encoded_again`,
-  counter `a_body_edit_among_many_makes_its_own_tables`.
+  counter `a_body_edit_among_many_makes_its_own_tables` (100 and 2,000 functions) and its
+  control `the_oracle_catches_a_link_that_asks_of_every_body`.
 - `crates/blaze-cargo/src/serve/unit/codegen/kept/tests.rs`: the refinement
   `the_rows_kept_by_deltas_are_the_rows_made_whole` (rows, span tables, id and the lists of
   what changed against rows made whole), controls
@@ -241,3 +272,7 @@ not run).
   (100 and 10,000 functions).
 - `crates/blaze-link/src/tests/patch.rs` and `digest.rs`: the file's patch and digest, as
   before (`a_patched_file_behaves_as_a_fresh_link` and its controls).
+- `crates/blaze-link/src/elf/tests.rs`: `.rela.dyn` by slot,
+  `a_relink_from_another_synthesis_is_built_and_one_of_another_length_takes_a_slot`, the
+  counter `an_edit_that_moves_slid_addresses_writes_their_entries_alone` (1,000 and 16,000
+  functions) and its control `the_oracle_catches_a_table_made_whole_for_an_address_moved`.

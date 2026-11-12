@@ -1,6 +1,6 @@
 // Time as words the agent reads. A model does not feel a wait: a cell that blocks for three hours returns, from its
 // side, right after it began. So every duration is said in the reply, against what the agent expected, and a long run
-// has to be argued for before it starts. Pure functions over numbers (no clock, no IO): mcp.ts and tasks.ts feed them.
+// has to be argued for before it starts. Pure functions over numbers (no clock, no IO): kernel.ts feeds them.
 
 /** A cell with no estimate is taken to be this quick: the wait one call covers before a cell is backgrounded. */
 export const ASSUMED_MS = 30_000;
@@ -67,11 +67,28 @@ export function told(o: { elapsed_ms: number; expect_ms?: number; running: boole
   };
 }
 
-/** What the cell is told when its limit stops it. */
-export function stopped(limit_ms: number, expect_ms: number | undefined): string {
+/** A cell stopped by its limit: why, as stop.ts words it, and what to do next when the limit came from an estimate. */
+export function overLimit(limit_ms: number, expect_ms: number | undefined): { why: string; advice: string | null } {
   return expect_ms === undefined
-    ? `cell stopped at its limit of ${span(limit_ms)}`
-    : `cell stopped after ${span(limit_ms)}: you expected ${span(expect_ms)}, so this is suspiciously slow. Processes it started may still be running (objects({ live: true })). Find out what was slow before trying again; do not rerun it with a longer limit unchanged.`;
+    ? { why: `it passed its limit of ${span(limit_ms)}`, advice: null }
+    : {
+      why: `it passed its limit of ${span(limit_ms)}, and you expected ${span(expect_ms)}`,
+      advice: "That is suspiciously slow. Find out what was slow before trying again; do not rerun it with a longer limit unchanged.",
+    };
+}
+
+/**
+ * The time the session has spent with at least one cell running: the union of the cells' intervals `[start, end]`, so
+ * two cells that overlap count once.
+ */
+export function waited(intervals: readonly (readonly [number, number])[]): number {
+  let ms = 0, until = -Infinity;
+  for (const [from, to] of [...intervals].sort((a, b) => a[0] - b[0])) {
+    if (to <= until) continue;
+    ms += to - Math.max(from, until);
+    until = to;
+  }
+  return ms;
 }
 
 /** The most notices one backgrounded cell sends while it runs (its end is one more). */

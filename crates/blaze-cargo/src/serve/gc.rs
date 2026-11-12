@@ -56,6 +56,14 @@ const MEASURE_IDLE_NS: u64 = 30_000_000_000;
 /// How often at most the ledger is written for a paced run; an asked or urgent run's is
 /// written as it ends.
 const LEDGER_EVERY_NS: u64 = 60_000_000_000;
+/// How long no build has been under way before the ledger of an urgent run that ended beside
+/// one is written. An urgent run starts as a build starts on a volume under its floor, and
+/// on such a volume every build starts one; its ledger was written as it ended, a synced
+/// write inside the build's request, on the disk its outputs are placed on (measured
+/// 2026-11-11 on a Mac with 0.6% of its volume free: 5 to 10 ms beside each edit's build, 195
+/// at worst). What a crash meanwhile loses is the last run's record, as between two paced
+/// runs' writes.
+const LEDGER_AFTER_BUILDS_NS: u64 = 1_000_000_000;
 
 /// What a background job hands back to the loop.
 enum Back {
@@ -78,6 +86,11 @@ pub struct Gc {
     unwritten: Option<Ledger>,
     /// A paced run ended whose ledger is not written yet, and when the last one was.
     ledger_due: bool,
+    /// An urgent run ended while a build was under way: its ledger is written once no build
+    /// has been under way for [`LEDGER_AFTER_BUILDS_NS`] ([`Gc::turn`]), never beside the
+    /// build's own outputs. `idle_since_ns` is when the builds last ended.
+    ledger_after_builds: bool,
+    idle_since_ns: u64,
     written_ns: u64,
     /// Why the ledger did not read as the daemon started, or the last write failed: kept for
     /// status, and the ledger begun afresh only after it is said.
@@ -152,6 +165,8 @@ impl Gc {
             writing: false,
             unwritten: None,
             ledger_due: false,
+            ledger_after_builds: false,
+            idle_since_ns: 0,
             written_ns: 0,
             problem,
             heads: Vec::new(), // alloc: none until a checkout is watched
@@ -380,7 +395,14 @@ impl Gc {
         }
         let due = self.collector.next_deadline().is_some_and(|at| now >= at);
         let ledger_due = self.ledger_due && now.saturating_sub(self.written_ns) >= LEDGER_EVERY_NS;
+        if idle && !self.idle {
+            self.idle_since_ns = now;
+        }
+        let after_builds = self.ledger_after_builds
+            && idle
+            && now.saturating_sub(self.idle_since_ns) >= LEDGER_AFTER_BUILDS_NS;
         if !answered
+            && !after_builds
             && !measured
             && !due
             && !ledger_due
@@ -434,11 +456,19 @@ impl Gc {
                         if report.why == Trigger::Asked {
                             self.answer_askers(&report);
                         }
-                        if matches!(report.why, Trigger::Asked | Trigger::Urgent) {
-                            self.ledger_due = false;
-                            self.write(self.collector.ledger());
-                        } else {
-                            self.ledger_due = true;
+                        match report.why {
+                            // Someone waits for it, or no build's outputs share the disk.
+                            Trigger::Asked => {
+                                self.ledger_due = false;
+                                self.write(self.collector.ledger());
+                            }
+                            Trigger::Urgent if idle => {
+                                self.ledger_due = false;
+                                self.write(self.collector.ledger());
+                            }
+                            // Beside a build: once the builds have ended.
+                            Trigger::Urgent => self.ledger_after_builds = true,
+                            _ => self.ledger_due = true,
                         }
                     }
                     decision => self.submit(decision, uses),
@@ -449,8 +479,10 @@ impl Gc {
             }
             self.measure(blaze_gc::record::now_ns());
         }
-        if self.ledger_due && now.saturating_sub(self.written_ns) >= LEDGER_EVERY_NS {
+        let paced = self.ledger_due && now.saturating_sub(self.written_ns) >= LEDGER_EVERY_NS;
+        if paced || after_builds {
             self.ledger_due = false;
+            self.ledger_after_builds = false;
             self.write(self.collector.ledger());
         }
     }
