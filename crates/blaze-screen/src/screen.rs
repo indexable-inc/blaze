@@ -24,7 +24,7 @@ use blaze_protocol::now::{Now, Phase};
 use blaze_report::Text;
 
 use crate::{
-    event::{BinaryEnd, Built, Command, Event, Test, Verdict, Why},
+    event::{BinaryEnd, Built, Command, Event, Ran, Test, Verdict, Why},
     frame::{Ended, Frame, Line, Mark, Progress, Role},
     text,
 };
@@ -60,11 +60,25 @@ pub struct Options {
     /// inside it, else from the second as `~/..` ([`text::shown_path`]).
     pub cwd: Option<String>,
     pub home: Option<String>,
+    /// A program that ended well is given a footer when it ran at least this long; 0 is
+    /// always. One that did not end well always has one.
+    pub footer_after_ms: u64,
 }
+
+/// [`Options::footer_after_ms`] unless set: a run of a second or more.
+pub const FOOTER_AFTER_MS: u64 = 1000;
 
 impl Options {
     pub fn of(command: Command) -> Options {
-        Options { command, quiet: false, verbose: false, root: None, cwd: None, home: None }
+        Options {
+            command,
+            quiet: false,
+            verbose: false,
+            root: None,
+            cwd: None,
+            home: None,
+            footer_after_ms: FOOTER_AFTER_MS,
+        }
     }
 }
 
@@ -189,6 +203,8 @@ pub struct Screen {
     hidden: bool,
     progress: Progress,
     notify: Option<Ended>,
+    /// The next frame starts on a line of its own ([`Frame::fresh_line`]).
+    fresh: bool,
     plain_at: u64,
     dirty: bool,
     plant: Plant,
@@ -218,6 +234,7 @@ impl Screen {
             hidden: false,
             progress: Progress::Clear,
             notify: None,
+            fresh: false,
             plain_at: 0,
             dirty: false,
             plant: Plant::None,
@@ -317,6 +334,7 @@ impl Screen {
             }
             Event::Waits(waits) => self.waits = waits,
             Event::Test(test) => self.test(test),
+            Event::Ran(ran) => self.ran(&ran),
             Event::Clear => self.cleared = true,
         }
     }
@@ -336,6 +354,9 @@ impl Screen {
             frame.progress = Some(progress);
         }
         frame.ended = self.notify.take();
+        if core::mem::take(&mut self.fresh) && self.caps.live && !above.is_empty() {
+            frame.fresh_line = Some(self.caps.cols);
+        }
         let hide = !region.is_empty();
         if hide != self.hidden {
             self.hidden = hide;
@@ -362,6 +383,49 @@ impl Screen {
         frame.above = above;
         frame.region = region;
         Some(frame)
+    }
+
+    /// The program a `run` started ended: its footer, on a terminal only (a pipe's reader has
+    /// the exit status and asked for nothing more). Always when it did not end well; when it
+    /// did, only for a run of [`Options::footer_after_ms`] or more, or `--stats`. A panic's
+    /// words are the program's own and are not said again.
+    fn ran(&mut self, ran: &Ran) {
+        let well = ran.code == Some(0) && ran.signal.is_none();
+        let shown = !well || ran.stats || ran.wall_ms >= self.opts.footer_after_ms;
+        if !self.caps.live || self.opts.quiet || !shown {
+            return;
+        }
+        let dot = self.dot();
+        let mut line = Line::new();
+        match (&ran.signal, ran.code) {
+            (Some(signal), _) => {
+                line.push(Role::Failed, format!("{} ", self.glyph("✗", "x"))); // alloc: the footer, once
+                line.push(Role::Strong, format!("killed by {signal}")); // alloc: as above
+                if ran.core_dumped {
+                    line.push(Role::Dim, " (core dumped)");
+                }
+            }
+            (None, Some(0)) => line.push(Role::Dim, format!("{} exit 0", self.glyph("✓", "ok"))), // alloc: as above
+            (None, Some(code)) => {
+                line.push(Role::Failed, format!("{} ", self.glyph("✗", "x"))); // alloc: as above
+                line.push(Role::Strong, format!("exit {code}")); // alloc: as above
+            }
+            (None, None) => line.push(Role::Dim, "ended"),
+        }
+        line.push(Role::Dim, format!(" {dot} {}", text::time(ran.wall_ms))); // alloc: as above
+        if let Some(peak) = ran.peak_bytes {
+            line.push(Role::Dim, format!(" {dot} peak {}", text::size(peak))); // alloc: as above
+        }
+        if ran.stats
+            && let (Some(user), Some(sys)) = (ran.cpu_user_ms, ran.cpu_sys_ms)
+        {
+            line.push(
+                Role::Dim,
+                format!(" {dot} cpu {} user, {} system", text::time(user), text::time(sys)),
+            ); // alloc: as above
+        }
+        self.fresh = ran.mid_line;
+        self.above.push(line); // alloc: as above
     }
 
     /// `text` as words alone, its paths shown from the checkout: a field of a pipe's line,

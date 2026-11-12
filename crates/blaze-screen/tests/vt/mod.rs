@@ -154,6 +154,10 @@ impl Vt {
                             match (last, params.as_str()) {
                                 ('A', n) => self.up(n.parse().unwrap_or(1)),
                                 ('K', "2") => self.screen[self.row] = (String::new(), false),
+                                ('K', "" | "0") => {
+                                    let kept: String = self.screen[self.row].0.chars().take(self.col).collect();
+                                    self.screen[self.row] = (kept, false);
+                                }
                                 ('m', _) => {}
                                 ('h', "?25") => self.cursor_hidden = false,
                                 ('l', "?25") => self.cursor_hidden = true,

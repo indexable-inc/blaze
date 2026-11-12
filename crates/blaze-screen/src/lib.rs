@@ -31,9 +31,9 @@ mod screen;
 pub mod text;
 
 pub use encode::encode;
-pub use event::{BinaryEnd, Built, Command, Event, Link, Stamped, Test, Verdict, Why};
+pub use event::{BinaryEnd, Built, Command, Event, Link, Ran, Stamped, Test, Verdict, Why};
 pub use frame::{Ended, Frame, Line, Mark, Progress, Role, Span};
 pub use screen::{
-    Caps, HANDFUL, OUTPUT_LINES, Options, PLAIN_EVERY_MS, Plant, QUIET_MS, SLOW_ITEM_MS,
+    Caps, FOOTER_AFTER_MS, HANDFUL, OUTPUT_LINES, Options, PLAIN_EVERY_MS, Plant, QUIET_MS, SLOW_ITEM_MS,
     SLOW_TEST_MS, Screen, file_url, live, progress_fields, progress_line, unicode,
 };

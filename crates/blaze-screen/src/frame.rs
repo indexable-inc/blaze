@@ -166,6 +166,11 @@ pub struct Frame {
     /// The rows of the live region drawn last, as the terminal holds them at its width now:
     /// erased first.
     pub erase: u16,
+    /// The cursor may be in the middle of a line someone else wrote: before anything of this
+    /// frame, a mark and a line's worth of blanks are written (the terminal's columns, given
+    /// here), which leave the cursor at the start of a line of its own whether or not it was
+    /// (what a shell does before its prompt).
+    pub fresh_line: Option<u16>,
     /// Lines that stay, appended to the scrollback.
     pub above: Vec<Line>,
     /// The live region, redrawn under them; empty when nothing is live.

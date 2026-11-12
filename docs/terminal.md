@@ -112,6 +112,31 @@ dark. The 24-bit values meet WCAG AA (4.5 or more) against black, `#1c1c1c`, `#1
 success and failure, and running and waiting, are a few ΔE apart: hue does not tell them
 apart, their glyph and word do, and failure is bold. A command is underlined at every depth.
 
+## After a `run`
+
+The program a `run` becomes is attached to the terminal itself, with no pipe or pty between:
+a program that sees no terminal behaves differently, so stdout and stderr are not told apart.
+When whoever started it waits for it and says how it ended (`Event::Ran`: its code or its
+signal, wall time, the processor's time, peak memory), a terminal gets one dim footer:
+
+```text
+✗ exit 3 · 40ms
+✗ killed by SIGSEGV (core dumped) · 40ms
+✓ exit 0 · 2.10s · peak 14.2 MB
+✓ exit 0 · 12ms · peak 14.2 MB · cpu 9ms user, 2ms system      (--stats)
+```
+
+Always when it did not end well; after a clean exit only for a run of a second or more
+(`Options::footer_after_ms`; 0 is always) or `--stats`. A panic's words are the program's own
+and are not repeated. The footer starts on a line of its own when the program may have left
+the cursor mid-line (a mark and a line of blanks first, as a shell does before its prompt). A
+pipe gets nothing added. Built: the event, the footer and its tests. Not built: today `run`
+becomes the program (`exec`), so nobody waits for it and no `Ran` is ever sent; the launcher
+(or `cli/run.rs` and the thin `blaze`) has to start it as a child, wait with `wait4` (macOS:
+`proc_pid_rusage` for the footprint), restore the terminal modes it saved, exit with the
+program's code (128 plus the signal's number for a signal) and send the event; `--stats` and
+the setting are theirs to read.
+
 ## Off a terminal
 
 A pipe, a file, CI, `TERM=dumb`, `BLAZE_UI=plain`, `--message-format json`. An agent needs to

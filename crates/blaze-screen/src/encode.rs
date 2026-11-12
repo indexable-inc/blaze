@@ -120,6 +120,15 @@ pub fn encode(frame: &Frame, terminal: &Terminal, out: &mut String) {
             }
             let _ = write!(out, "\x1b[{}A", frame.erase);
         }
+        if let Some(cols) = frame.fresh_line.filter(|cols| *cols > 1) {
+            // A mark, blanks to the line's end and one more column's worth of wrap, then back
+            // to the first column and that line erased: at the start of a line this leaves
+            // nothing; in the middle of one the mark stays at its end and the cursor is on
+            // the next.
+            out.push('%');
+            out.extend(core::iter::repeat_n(' ', usize::from(cols) - 1));
+            out.push_str("\r\x1b[K");
+        }
         match frame.hide_cursor {
             Some(true) => out.push_str("\x1b[?25l"),
             Some(false) => out.push_str("\x1b[?25h"),

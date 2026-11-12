@@ -459,3 +459,49 @@ fn only_a_long_build_ends_with_a_notification() {
     assert!(!notified(5));
     assert!(notified(11_000));
 }
+
+/// What the terminal shows after a program `blaze run` started wrote `before` and ended as
+/// `ran`.
+fn footer(before: &str, ran: blaze_screen::Ran) -> String {
+    let caps = Caps { live: true, cols: 40, rows: 10, unicode: true };
+    let mut screen = Screen::new(Options::of(Command::Run), caps);
+    let mut vt = vt::Vt::new(40, 10);
+    vt.write(before);
+    screen.take(Event::Ran(ran));
+    if let Some(frame) = screen.frame() {
+        let mut bytes = String::new();
+        encode(&frame, &terminal(), &mut bytes);
+        vt.write(&bytes);
+    }
+    vt.shown()
+}
+
+/// The footer of a `run`: nothing after a quick clean run; the time and the peak after a long
+/// one; the code or the signal always; and on a line of its own when the program left the
+/// cursor in the middle of one.
+#[test]
+fn a_run_ends_with_a_footer_only_when_it_has_something_to_say() {
+    use blaze_screen::Ran;
+    let clean = |wall_ms| Ran { code: Some(0), wall_ms, peak_bytes: Some(14_200_000), ..Ran::default() };
+    assert_eq!(footer("hello 3\n", clean(12)), "hello 3");
+    assert_eq!(footer("hello 3\n", clean(2100)), "hello 3\n✓ exit 0 · 2.10s · peak 14.2 MB");
+    assert_eq!(
+        footer("hello 3\n", Ran { stats: true, cpu_user_ms: Some(9), cpu_sys_ms: Some(2), ..clean(12) }),
+        "hello 3\n✓ exit 0 · 12ms · peak 14.2 MB · cpu 9ms user, 2ms system"
+    );
+    assert_eq!(footer("", Ran { code: Some(3), wall_ms: 40, ..Ran::default() }), "✗ exit 3 · 40ms");
+    assert_eq!(
+        footer("", Ran { signal: Some("SIGSEGV".to_owned()), core_dumped: true, wall_ms: 40, ..Ran::default() }),
+        "✗ killed by SIGSEGV (core dumped) · 40ms"
+    );
+    // The program's last line has no end: the footer does not run on from it.
+    assert_eq!(
+        footer("no newline", Ran { code: Some(3), wall_ms: 40, mid_line: true, ..Ran::default() }),
+        "no newline%\n✗ exit 3 · 40ms"
+    );
+    // At the start of a line the same bytes leave nothing.
+    assert_eq!(
+        footer("a line\n", Ran { code: Some(3), wall_ms: 40, mid_line: true, ..Ran::default() }),
+        "a line\n✗ exit 3 · 40ms"
+    );
+}

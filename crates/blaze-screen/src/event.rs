@@ -52,6 +52,8 @@ pub enum Event {
     /// Why the build made again what it did, a cause each: said after [`Event::Built`].
     Why(Vec<Why>),
     Test(Test),
+    /// The program a `run` started has ended: what a footer says of it, on a terminal.
+    Ran(Ran),
     /// What follows owns the terminal (the program a `run` becomes): nothing live is left on
     /// it after the next frame.
     Clear,
@@ -85,6 +87,28 @@ pub struct Built {
     pub why_follows: bool,
     /// Tests run after it (`test`): the region stays for them.
     pub tests_follow: bool,
+}
+
+/// How a program a `run` started ended, as whoever waited for it measured (`wait4`'s status
+/// and `rusage`; on macOS its footprint).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+#[serde(default)]
+pub struct Ran {
+    /// Its exit code; none when a signal ended it.
+    pub code: Option<i32>,
+    /// The signal that ended it, by name: `SIGSEGV`.
+    pub signal: Option<String>,
+    pub core_dumped: bool,
+    pub wall_ms: u64,
+    pub cpu_user_ms: Option<u64>,
+    pub cpu_sys_ms: Option<u64>,
+    /// Its peak memory, in bytes: its footprint where the system counts one.
+    pub peak_bytes: Option<u64>,
+    /// `--stats`: the footer is shown whatever the run, with the processor's time.
+    pub stats: bool,
+    /// The program may have left the cursor in the middle of a line (its last byte was no
+    /// newline, or nobody saw its bytes): the footer starts on a line of its own.
+    pub mid_line: bool,
 }
 
 /// One image the build linked.

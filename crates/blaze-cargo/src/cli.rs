@@ -746,6 +746,7 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
         root: Some(place.root.to_string_lossy().into_owned()),
         cwd: Some(place.cwd.to_string_lossy().into_owned()),
         home: std::env::var("HOME").ok(),
+        footer_after_ms: blaze_screen::FOOTER_AFTER_MS,
     };
     let screen = show::Show::new(options, caps, terminal, started, io::stderr());
     let mut out = io::stdout().lock();
