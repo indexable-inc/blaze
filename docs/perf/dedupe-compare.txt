@@ -1,0 +1,36 @@
+## vs upstream seed 1
+dedupe/generic_chains                              [  86.2 ms ...  49.8 ms ]     -42.23%*
+dedupe/generic_chains_keeping                      [ 149.4 ms ...  48.7 ms ]     -67.39%*
+dedupe/long_chains                                 [ 330.9 ms ...  31.5 ms ]     -90.47%*
+dedupe/floor/clone                                 [   4.9 ms ...   4.9 ms ]      +0.34%
+dedupe/floor/code_ids                              [  11.9 ms ...  11.7 ms ]      -2.14%*
+## vs upstream seed 2
+dedupe/generic_chains                              [  95.6 ms ...  55.3 ms ]     -42.10%*
+dedupe/generic_chains_keeping                      [ 152.8 ms ...  53.1 ms ]     -65.25%*
+dedupe/long_chains                                 [ 355.2 ms ...  34.4 ms ]     -90.31%*
+dedupe/floor/clone                                 [   4.9 ms ...   4.8 ms ]      -0.74%
+dedupe/floor/code_ids                              [  12.6 ms ...  12.2 ms ]      -3.12%*
+## vs upstream seed 3
+dedupe/generic_chains                              [  90.1 ms ...  52.4 ms ]     -41.83%*
+dedupe/generic_chains_keeping                      [ 148.0 ms ...  50.9 ms ]     -65.62%*
+dedupe/long_chains                                 [ 325.2 ms ...  30.2 ms ]     -90.72%*
+dedupe/floor/clone                                 [   4.4 ms ...   4.5 ms ]      +0.25%
+dedupe/floor/code_ids                              [  12.1 ms ...  11.6 ms ]      -4.44%*
+## vs previous seed 1
+dedupe/generic_chains                              [  62.9 ms ...  49.8 ms ]     -20.82%*
+dedupe/generic_chains_keeping                      [  99.6 ms ...  50.9 ms ]     -48.91%*
+dedupe/long_chains                                 [  54.0 ms ...  30.5 ms ]     -43.49%*
+dedupe/floor/clone                                 [   4.6 ms ...   4.7 ms ]      +1.61%*
+dedupe/floor/code_ids                              [  11.5 ms ...  12.1 ms ]      +5.23%*
+## vs previous seed 2
+dedupe/generic_chains                              [  63.3 ms ...  50.1 ms ]     -20.76%*
+dedupe/generic_chains_keeping                      [  99.6 ms ...  50.8 ms ]     -48.99%*
+dedupe/long_chains                                 [  51.6 ms ...  29.0 ms ]     -43.86%*
+dedupe/floor/clone                                 [   4.2 ms ...   4.2 ms ]      +0.47%
+dedupe/floor/code_ids                              [  11.5 ms ...  11.8 ms ]      +2.83%*
+## vs previous seed 3
+dedupe/generic_chains                              [  62.2 ms ...  49.9 ms ]     -19.84%*
+dedupe/generic_chains_keeping                      [  96.1 ms ...  47.8 ms ]     -50.27%*
+dedupe/long_chains                                 [  54.4 ms ...  30.1 ms ]     -44.72%*
+dedupe/floor/clone                                 [   4.4 ms ...   4.3 ms ]      -2.47%*
+dedupe/floor/code_ids                              [  11.2 ms ...  11.4 ms ]      +1.87%*

@@ -1,178 +1,236 @@
 # PERF: `perf/speedup`
 
-What this branch makes faster, by how much, how it was measured, and what it could not measure.
-Everything here was run on the machine described below; nothing is projected.
+What this branch makes faster, by how much, how it was measured, and what it could not
+measure. Everything here was run on the machine described below; nothing is projected.
 
-## Summary
+## Results
 
-| Benchmark (`crates/blaze-bench/benches/dedupe.rs`) | base | this branch | change, paired | speedup |
-|---|---:|---:|---:|---:|
-| `dedupe/generic_chains` (32,768 functions, 9 rounds) | 91–102 ms | 67–71 ms | −27% to −30% | **1.4×** |
-| `dedupe/generic_chains_keeping` (same, with `Originals`) | 146–163 ms | 103–116 ms | −29% to −33% | **1.4×** |
-| `dedupe/long_chains` (32,768 functions, 65 rounds) | 344–367 ms | 56–67 ms | −82% to −84% | **5.5–6.2×** |
-| `dedupe/floor/clone` (control: unchanged code) | 4.7–5.8 ms | 4.7–5.8 ms | −1.4% to +1.0% | 1.0× |
-| `dedupe/floor/code_ids` (control: unchanged code) | 12.0–15.0 ms | 11.6–14.3 ms | −3.7% to −5.1% | ~1.0× |
+![blaze code dedupe benchmark](docs/perf/dedupe-bench.svg)
 
-Ranges are over three paired runs (seeds 1, 2, 3). Each number is the runner's **mean** time
-per iteration. The runner reports mean, min, max and stddev, not a median (see Methodology).
-The two `floor` rows run code this branch does not touch. Their up-to-5% "significant"
-differences are the noise floor on this machine: a change under about 5% here is not one.
+Paired runs of blaze-bench's `dedupe` benchmarks (`crates/blaze-bench/benches/dedupe.rs`).
+The numbers are means per iteration, in ms. The range in brackets is the spread of the three
+per-seed means (seeds 1, 2 and 3), and the speedup is upstream's mean over this branch's.
 
-**This is not a 500× faster blaze.** It is a 1.4× to 6× faster code-dedupe pass (identical code
-folding), one stage of blaze's codegen. It is not end-to-end edit-loop time; that was not
-measurable here (see Limits).
+| Scenario | upstream `main` @615873fa | v1 (worklist, a252634) | v2 (this) | v2 vs upstream | v2 vs v1 |
+|---|---:|---:|---:|---:|---:|
+| `generic_chains` (32,768 functions, 9 rounds) | 90.6 (86.2–95.6) | 62.8 (62.2–63.3) | 52.5 (49.8–55.3) | **1.7×** (−42%) | 1.26× (−20%) |
+| `generic_chains_keeping` (the same, with `Originals`) | 150.1 (148.0–152.8) | 98.4 (96.1–99.6) | 50.9 (48.7–53.1) | **2.9×** (−65% to −67%) | 2.0× (−49% to −50%) |
+| `long_chains` (32,768 functions, 65 rounds) | 337.1 (325.2–355.2) | 53.3 (51.6–54.4) | 32.0 (30.2–34.4) | **10.5×** (−90% to −91%) | 1.8× (−43% to −45%) |
+| `floor/clone` (control) | 4.4–4.9 | 4.2–4.6 | 4.2–4.9 | 1.0× (−0.7% to +0.3%) | — |
+| `floor/code_ids` (control) | 11.9–12.6 | 11.2–11.5 | 11.4–12.2 | ~1.0× (−4.4% to −2.1%) | — |
+
+How the columns were measured:
+
+- The upstream and v2 columns come from `compare` runs of v2 against upstream.
+- The v1 column comes from `compare` runs of v2 against v1. The v2-against-v1 means for the
+  three scenarios were 49.8–50.1, 47.8–50.9 and 29.0–30.5 ms.
+- Every scenario difference is significant (|z| ≥ 2.6).
+
+What the control rows show:
+
+- The floors never call dedupe. `floor/code_ids` calls `content::code_id`, which v2 rewrote
+  as a call to the generic `code_into` (the BLAKE3 output is unchanged and tested). It moved
+  −4.4% to +5.2% across all runs.
+- `floor/clone` moved −2.5% to +1.6%.
+- So a difference under about 5% is noise on this machine.
+
+Raw runner output is kept in two files:
+
+- [docs/perf/dedupe-compare.txt](docs/perf/dedupe-compare.txt), the paired runs;
+- [docs/perf/dedupe-solo.txt](docs/perf/dedupe-solo.txt), unpaired runs with min, mean, max
+  and stddev.
+
+The unpaired runs, in ms (min … mean … max):
+
+| | upstream | v1 | v2 |
+|---|---|---|---|
+| `generic_chains` | 72.7 … 78.4 … 230.6 (σ 11.0) | 47.3 … 54.8 … 78.5 (σ 3.9) | 36.5 … 43.8 … 207.9 (σ 9.2) |
+| `generic_chains_keeping` | 118.9 … 137.8 … 175.3 (σ 10.2) | 74.4 … 93.3 … 152.9 (σ 9.4) | 34.1 … 42.6 … 235.6 (σ 10.9) |
+| `long_chains` | 315.6 … 327.2 … 393.9 (σ 13.5) | 40.3 … 46.8 … 65.6 (σ 3.6) | 20.9 … 25.0 … 128.2 (σ 5.3) |
+
+**This is not a 20× (or 500×) faster blaze.** It is a 1.7× to 10.5× faster code-dedupe pass
+(identical code folding), one stage of blaze's codegen. End-to-end rebuild times were not
+measured (see Limits).
+
+### Why the benchmarks stop short of 20×
+
+- **`generic_chains`: 20× is out of reach by construction.**
+  - 20× would be 4.5 ms per iteration. Each iteration first copies the 32,768-function build
+    and then drops it. That alone is `floor/clone`, 4.2–4.9 ms, before any folding.
+  - Instrumented, the fold itself now takes about 28 ms of v2's ~40 ms unpaired iteration.
+    That ~28 ms is spent on:
+    - writing every candidate's code bytes once (~6 ms);
+    - ~16k renames and re-writes of the renamed functions' code (~8 ms);
+    - grouping (~5 ms);
+    - building the answer's `BTreeMap` of 20k merges (~4 ms);
+    - taking out the merged functions and putting the rest in key order (~3 ms).
+  - All of that is work the driver needs: the answer, the renamed functions and their order
+    are its output.
+- **`generic_chains_keeping` is bounded the same way.** It additionally keeps a copy of each
+  renamed function.
+- **`long_chains` is 10.5×.** 20× would be 16.9 ms. Its 65 rounds each rename a few hundred
+  functions, a few milliseconds of renaming in all. On top of that comes the same one-off cost
+  of writing the 32,768 codes, the merge map and the final order as above.
+- **Not done:**
+  - Parallel threads. A threaded version (v2 before the byte grouping) cut the BLAKE3 time
+    but cost thread starts every round. With no BLAKE3 left in the rounds, threads would save
+    at most the ~6 ms first write.
+  - blaze's own pool, the sanctioned way to run work in parallel here. It cannot start on
+    this kernel (below).
 
 ## What changed
 
-### 1. `blaze_codegen::dedupe::dedupe_keeping`: rounds look only at what changed
+### v2: group by the code's bytes, not its BLAKE3 (`content.rs`, `dedupe.rs`)
 
-Identical code folding repeats until nothing merges. When `Vec<u32>::push` and
-`Vec<i32>::push` fold, their callers can become equal one round later, and so on up a chain.
-The old implementation made a full pass over the whole build in **every** round:
+Code IDs were only ever compared inside dedupe, never stored. So the rounds no longer hash them
+at all:
 
-- it grouped every candidate's code ID in a fresh `HashMap<ContentId, Vec<InstanceKey>>`;
-- it ran `functions.retain(..)` over every function;
-- it called `rename` on every function, each one probing the round's merge map.
+- **One definition of a function's code.**
+  - `content::code_into` writes a function's code into any `Sink`. That is either `Hasher`
+    (BLAKE3, as before) or `Recorder`, which keeps the bytes.
+  - `code_id` is now `code_into` into a `Hasher` in `CODE_DOMAIN`, and its output is
+    unchanged.
+  - `a_recorded_code_is_what_its_code_id_hashes` checks that the recorded bytes, hashed in
+    `CODE_DOMAIN`, *are* the code ID: for plain code, relocations, data, lines and every kind
+    of relocation target.
+- **Grouping by bytes.**
+  - Dedupe keeps each candidate's bytes in one buffer, with a foldhash of them.
+  - A round groups by that fast hash, and tells apart two codes that share it by comparing
+    their bytes.
+  - Equal bytes mean equal code IDs, so the groups are exactly the old ones. A fast-hash
+    collision costs a compare, never a wrong merge.
+- **Holders by hash.** Holders are kept by fast hash, and a second code under the same hash is
+  kept apart from the first.
+- **Fewer and smaller lookups.**
+  - Maps keyed by hashes use `ByHash`, which reads a key's first word and hashes nothing.
+  - Keys are copied out of the 450-byte functions for grouping.
+  - Each position's key position is precomputed instead of looked up.
+- **Cheaper ending.**
+  - Merged functions leave through one `extract_if`.
+  - The remaining functions and the originals are put in key order by an in-place permutation
+    (each function moved once).
+  - The answer's `BTreeMap` is built from a sorted run.
 
-A build whose folds chain `n` deep therefore cost `n` passes over all `N` functions: O(n·N).
+### v1: rounds look only at what the last round changed (`dedupe.rs`)
 
-The new implementation does the same work only where something changed:
+The upstream code made a full pass over the build every round. That meant regrouping every
+candidate's code ID, a `retain` over every function, and `rename` on every function, so a fold
+chain `n` deep cost `n` passes over all `N` functions.
 
-- **Grouping only fresh IDs.** After a round, every group of equal code IDs has exactly one
-  member left (its *holder*). So a new group must contain at least one function whose ID
-  changed last round. A round groups only those IDs, each with its holder. The grouping is a
-  sort of `(ID, key, position)` tuples, with no map of `Vec`s.
-- **An index of callers.** Who names each function (relocations, data relocations, unwind
-  personality or handler, exactly where `names_any` looks) is indexed once. Each function has
-  a linked list of caller positions in one arena. When `B` merges into `A`, `B`'s list is
-  spliced onto `A`'s in O(1), because those callers name `A` once renamed. A round renames
-  only the callers of what it merged, and does so in build order.
-- **Positions instead of key maps.** Code IDs live in a `Vec` by position. Merged functions
-  are flagged and leave once, at the end, instead of a `retain` per round. The kept map is
-  resolved once at the end instead of being rewritten every round.
-- **A cheaper final sort.** The old code called `sort_by_key` on `Vec<CompiledFunction>`,
-  whose elements are a few hundred bytes each and get swapped around by the sort. The new
-  code sorts `(key, position)` pairs and moves each function once. This is the same order a
-  stable sort gives. `Originals::functions` is sorted the same way.
+v1 changed this:
 
-A round now costs O(merged + renamed), and the whole fold costs O(N + total renames). That is
-why the gain grows with chain depth: 1.4× at 9 rounds and about 6× at 65 rounds.
+- **Grouping only what changed.** After a round, each code has exactly one holder, so a round
+  groups only the codes that changed, each with its holders.
+- **An index of callers.** Who names each function is indexed once. A merge hands the merged
+  function's caller list to the function kept, as an O(1) splice. A round then renames only
+  the callers of what it merged, in build order.
 
-**Same answer, checked.** The old implementation is kept verbatim as `tests::reference`. The
-new test `the_worklist_agrees_with_a_pass_over_every_function` runs both on 3,000 random builds,
-each with and without `Originals`. The builds include calls, address-taken functions, vtables,
-data naming earlier data, personalities, unmergeable and covered functions, statics, duplicate
-keys, and data that is refused (`DataOrder`). The test requires these to be equal:
+### Benchmarks (`crates/blaze-bench`)
 
-- the `Deduped` result (merges, rounds, bytes) and the renamed statics;
+- `benches/store.rs` compiles again: `Handle::put` now takes `&[u8]`.
+- `benches/dedupe.rs` adds four benchmarks:
+  - `generic_chains_keeping`, the driver's kept-rows path;
+  - `long_chains`, which runs 65 rounds;
+  - `floor/clone` and `floor/code_ids`, the two controls.
+
+## Correctness
+
+The upstream implementation is kept verbatim as `dedupe::tests::reference`, and each v2 run is
+compared against it. Every comparison requires these to be equal:
+
+- the merges, rounds and bytes;
 - the functions and statics;
 - the originals;
-- the error, and *which* error comes first.
+- the error, and which error comes first.
 
-On every successful run it also checks that no function still names a merged key.
+On success, it also checks that no function names a merged key.
 
-`callers_taken_over_twice_follow_a_later_merge` covers a function that is kept for two merged
-functions and then merged itself. Four deliberate bugs were planted, one at a time, to check
-the tests catch them, and each one made the tests fail:
+The tests that make these comparisons:
 
-- dropping the holder from a group;
+- **`the_worklist_agrees_with_a_pass_over_every_function`:** 3,000 random builds, with and
+  without `Originals`. The builds include calls, address-taken functions, vtables, data naming
+  data, personalities, unmergeable and covered functions, statics, duplicate keys and refused
+  data order.
+- **`codes_sharing_a_hash_are_told_apart_by_their_bytes`:** the same 3,000 builds with the
+  fast hash masked to 0, 1 and 3 bits, so most codes collide.
+- **`a_large_build_agrees_with_a_pass_over_every_function`:** a 32,768-function build shaped
+  like the benchmark's, with and without `Originals`.
+- **`callers_taken_over_twice_follow_a_later_merge`.**
+
+Deliberately planted bugs were each caught by these tests:
+
+- dropping a holder from a group;
 - renaming in reverse order;
-- a stale list tail after a splice;
-- ignoring duplicate keys.
+- a stale caller-list tail;
+- ignoring duplicate keys;
+- not splitting colliding codes;
+- not promoting a second holder.
 
-### 2. `blaze-bench`: the store bench compiles again, and dedupe has more scenarios
+`cargo +nightly-2026-10-27 test -p blaze-codegen --lib` on this branch: 180 pass and 133 fail.
 
-- `benches/store.rs` no longer compiled on `main`: `Handle::put` now takes `&[u8]`.
-- `benches/dedupe.rs` gains three things:
-  - `generic_chains_keeping`: the driver's kept-rows path, with `Originals`.
-  - `long_chains`: runs of 64, so 65 rounds.
-  - Two floors: copying the build, and hashing one code ID per function. These bound what any
-    fold can cost: about 18 ms of the 67–71 ms that `generic_chains` now takes.
+- Upstream gives 176 pass and 132 fail. The difference is the 4 new tests, plus
+  `driver::tests::walk::the_oracle_catches_a_walk…`, which also fails on upstream when run
+  alone.
+- Every failure is blaze's thread pool refusing to start: "registering its wait region:
+  Invalid argument … **blaze needs Linux 7.3 or later, and this is Linux 6.12.113+**". The 3
+  exceptions are flight tests whose threads died of that same error.
+- Those failing tests include the codegen driver's own dedupe tests and `blaze-link`'s ICF
+  tests. **They were not exercised here** and should be run on Linux 7.3+ or macOS before
+  this lands.
+- `blaze-link` and `blaze-premap`, which use the changed `content` helpers, build. `blaze
+  check` (blaze's own lints) was not run.
 
 ## Methodology
 
 - **Machine:**
-  - CPU: an 8-vCPU Intel Xeon VM (cloud, shared; no SMT), with 16 GB RAM of which about 3.7 GB
-    was free.
+  - CPU: an 8-vCPU Intel Xeon VM (cloud, shared; no SMT). 16 GB RAM.
   - OS: Linux 6.12.113 (Debian 13).
-  - Not isolated: other services ran on the box, which is why the noise floor is about 5%.
-- **Toolchain:** `nightly-2026-10-27` (`rustc 1.101.0-nightly (16d1ffac1 2026-10-26)`), the one
-  pinned in `harness/toolchain`. Both sides use `cargo bench`, the workspace's `release` profile
-  and the same bench source.
-- **Base:** `main` at `615873fa`, in a separate worktree, with this branch's
-  `benches/dedupe.rs` and `benches/store.rs` copied in. The two binaries therefore differ only
-  in `blaze-codegen`.
-- **Paired runs:** `dedupe_new compare dedupe_old -t 20 -o --seed {1,2,3}`. This is
-  blaze-bench's own paired runner:
-  - Both binaries run as workers, and samples are taken in turns, in a seeded random order.
-  - The statistic is the mean per-iteration difference, significant at |z| ≥ 2.6 (99%).
+  - Not isolated: other services ran on the box.
+- **Toolchain:** `nightly-2026-10-27` (`rustc 1.101.0-nightly (16d1ffac1 2026-10-26)`), pinned
+  in `harness/toolchain`, with the workspace's `release` profile.
+- **Binaries:** each side is the `dedupe` bench binary built from its own tree, all with this
+  branch's bench source.
+  - Upstream is `main` at `615873fa` with `benches/` copied in.
+  - v1 is commit `a2526342`.
+- **Statistic:** blaze-bench's paired runner.
+  - The two binaries run as workers whose samples are taken in turns, in a seeded random
+    order.
+  - It reports each side's mean and the mean paired difference, significant at |z| ≥ 2.6.
   - `-o` drops pairs outside Tukey's fences.
-  - `*` in the raw output means significant.
-- **Solo runs, for absolute numbers** (`solo -t 20`, min … mean … max, stddev). A noisy VM, so
-  the means are higher than the mins:
+  - It reports means, not medians.
 
-  | | base | this branch |
-  |---|---|---|
-  | `generic_chains` | 70.6 … 80.4 … 219.6 ms (σ 16.4) | 44.1 … 50.4 … 138.3 ms (σ 7.0) |
-  | `generic_chains_keeping` | 111.4 … 138.3 … 191.4 ms (σ 10.4) | 65.3 … 88.9 … 179.5 ms (σ 17.3) |
-  | `long_chains` | 293.3 … 328.6 … 461.0 ms (σ 34.8) | 42.4 … 48.4 … 157.9 ms (σ 8.2) |
+To reproduce:
 
-- **Profiling:** there is no `perf` or valgrind on this box, and neither is installable. So
-  the phases were timed with temporary `Instant` probes. They are not committed. Before this
-  change, about 75 ms of `generic_chains` broke down as:
-  - setup (code IDs): ~20 ms;
-  - grouping: 11–20 ms;
-  - the rename pass over everything: 20–30 ms;
-  - the final sort: 7–10 ms.
+```sh
+rustup toolchain install nightly-2026-10-27 --profile minimal
+git clone https://github.com/shubhxho/blaze && cd blaze && git checkout perf/speedup
+git worktree add ../blaze-upstream 615873fa
+cp crates/blaze-bench/benches/*.rs ../blaze-upstream/crates/blaze-bench/benches/
+(cd ../blaze-upstream && cargo +nightly-2026-10-27 bench -p blaze-bench --bench dedupe --no-run)
+cargo +nightly-2026-10-27 bench -p blaze-bench --bench dedupe --no-run
+NEW=$(ls -t target/release/build/blaze-bench/*/out/dedupe-* | head -1)
+OLD=$(ls -t ../blaze-upstream/target/release/build/blaze-bench/*/out/dedupe-* | head -1)
+for seed in 1 2 3; do "$NEW" compare "$OLD" -t 20 -o --seed $seed; done
+"$NEW" solo -t 20    # unpaired: min ... mean ... max, stddev
+python3 docs/perf/chart.py   # redraws the chart from docs/perf/dedupe-compare.txt
+```
 
-  After it, the remaining cost is mostly BLAKE3. That is ~13 ms of first code IDs plus ~9 ms
-  of re-hashing 16k renamed functions, and both are needed for correctness.
+(The bench binaries land under `target/release/build/blaze-bench/<hash>/out/` with this
+cargo; on older cargo, look under `target/release/deps/`.)
 
-## Tests run
+## Limits
 
-- `cargo +nightly-2026-10-27 test -p blaze-codegen --lib dedupe::tests`: 14 of 14 pass,
-  including the 2 new tests.
-- `cargo +nightly-2026-10-27 test -p blaze-codegen --lib`, the whole crate:
-  - **This branch:** 177 pass and 133 fail.
-  - **Base:** 176 pass and 132 fail. The failure lists are identical apart from one test,
-    `driver::tests::walk::the_oracle_catches_a_walk_in_the_order_its_describes_ran`. It fails
-    on the base too when run alone (3 of 3 runs), so the base's one pass was a fluke.
-  - **Cause of the failures:** 138 of the panics are blaze's thread pool refusing to start
-    ("a thread's wait ring: registering its wait region: Invalid argument … **blaze needs
-    Linux 7.3 or later, and this is Linux 6.12.113+**"). The other 3 are flight tests whose
-    threads died of that same pool error.
-- The same kernel limit makes these fail on base and branch alike:
-  - `blaze-link`'s ICF tests (`tests::icf::*`);
-  - the codegen driver's dedupe tests (`driver::tests::kept::…dedupe…`,
-    `driver::tests::pieces::…dedupe…`).
-
-  **Those integration tests were not exercised by this change.** Its correctness rests on
-  the reference-equivalence test above. They should be run on a Linux ≥ 7.3 or macOS machine
-  before this lands.
-- blaze's own lints (`blaze check`) were not run, because they need a blaze binary, which
-  needs Linux ≥ 7.3. The new code follows the house rules it could see: hashers are chosen
-  with `blaze_hash`, and allocations carry `// alloc:` comments.
-
-## Limits: why not 500×
-
-- **blaze could not run end to end here.** Its runtime needs Linux 7.3+ (the io_uring-based
-  wait ring in `blaze-core`, by design with no fallback). Building `blaze-engine` itself was not
-  attempted: it links the pinned static LLVM, and the box had about 3.7 GB of memory free. So the README's
-  edit-then-build numbers (ripgrep 56 ms, helix 116 ms, bun 451 ms) were not reproduced, and
-  this branch makes **no claim** about them.
-- **Dedupe is one stage of a build.** How much of an edit's time it takes depends on the
-  project. The `codegen dedupe` span in a profile shows it (`docs/v2/plan/design/icf.md`,
-  "Measuring"). Making a stage that is X% of an edit 6× faster saves at most X% of that edit.
-- **The rest of blaze is already tuned.** The query database's warm hit is about 5 ns
-  (`db/hit/*`), and verifying an edge is about 2–5 ns. Hashing is BLAKE3 with cached domain
-  keys. Release binaries ship with thin LTO, `codegen-units = 1` and PGO (`profile.dist`,
-  `tools/pgo/`). There is no 500× left in any of these.
-- **The headline numbers are already near their floor.** An edit takes tens to hundreds of
-  milliseconds against cargo's seconds, and much of what remains is compiling the edited
-  functions (Cranelift or LLVM), linking and writing the image. 500× faster than 56 ms is
-  0.1 ms, less than a single process start or `fsync`.
-- **What would move the edit loop further** (not done here):
-  - parallelising the code-ID hashing on blaze's own pool, which is about 22 ms of the 67 ms
-    left in `generic_chains`;
-  - a profile of real edits on a Linux 7.3+ or macOS machine, to find the stage that
-    dominates there.
+- **End-to-end rebuild times were not measured.** blaze's runtime needs Linux 7.3+ (the
+  io_uring-based wait ring in `blaze-core`, with no fallback by design), and this box runs
+  6.12. So the README's edit-then-build numbers (ripgrep 56 ms, helix 116 ms, bun 451 ms) were
+  not reproduced, and this branch makes **no claim** about them. Building `blaze-engine` was
+  not attempted either: it links the pinned static LLVM, and the box had a few GB of memory
+  free.
+- **Dedupe is one stage of a build.** How much of an edit's time it takes is the
+  `codegen dedupe` span in a profile (`docs/v2/plan/design/icf.md`, "Measuring"). Making a
+  stage that is X% of an edit 10× faster saves at most X% of that edit.
+- **The rest is already tuned.** The query database's warm hit is about 5 ns. Hashing is
+  BLAKE3 with cached domain keys. Release binaries ship with thin LTO,
+  `codegen-units = 1` and PGO.
+- **500× is not physically on offer.** An edit already takes tens to hundreds of
+  milliseconds; 500× faster than 56 ms is 0.1 ms, less than one process start.
