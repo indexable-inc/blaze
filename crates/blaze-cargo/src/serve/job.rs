@@ -1124,7 +1124,7 @@ pub fn invocation(
         // clone: cargo's own invocation, owned by the config, once per job
         return Invocation {
             command,
-            args: cargo.args.clone(),   // clone: once per job
+            args: undrawn(&cargo.args), // alloc: once per job
             root: cargo.root.clone(),   // clone: once per job
             cwd: cargo.cwd.clone(),     // clone: once per job
             env: cargo.env.clone(),     // clone: once per job
@@ -1183,12 +1183,50 @@ fn said_once(said: &mut HashSet<ContentId, Global>, diagnostic: &blaze_api::Diag
         ))
 }
 
+/// The flags of cargo's command line that say only how its client is shown the build, each
+/// with a value: no input of the plan or of anything built. The daemon reads how diagnostics
+/// are drawn from the request itself ([`short`], [`blaze_api::Cargo::color`]).
+const DRAWN_FLAGS: [&str; 2] = ["--message-format", "--color"];
+
+/// cargo's `args` without [`DRAWN_FLAGS`] and their values, as a view's config holds them
+/// ([`invocation`]): the config is what the checkout's plan is keyed by ([`Viewed::key`]) and
+/// what its units are loaded from, so a build asked for with `--message-format short` or
+/// `--color always` plans what one without them does, from the same plan. What follows `--`
+/// is the program's or the test binary's, and is kept as it is.
+pub(crate) fn undrawn(args: &[String]) -> Vec<String> {
+    let mut kept = Vec::with_capacity(args.len()); // alloc: the config's own arguments, once per job
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            kept.push(arg.clone()); // clone: the config's own, once per job
+            kept.extend(args.cloned());
+            break;
+        }
+        if DRAWN_FLAGS.contains(&arg.as_str()) {
+            // Its value is the next word.
+            args.next();
+            continue;
+        }
+        let valued = DRAWN_FLAGS
+            .iter()
+            .any(|flag| arg.strip_prefix(flag).is_some_and(|rest| rest.starts_with('=')));
+        if !valued {
+            kept.push(arg.clone()); // clone: the config's own, once per job
+        }
+    }
+    kept
+}
+
 /// Whether cargo's `args` ask for diagnostics a line each (`--message-format=short` or
-/// `json-diagnostic-short`), read as cargo reads each `--message-format`.
+/// `json-diagnostic-short`), read as cargo reads each `--message-format`. Of the request's
+/// own arguments: a view's config holds none of them ([`undrawn`]).
 fn short(args: &[String]) -> Result<bool, String> {
     let mut values = Vec::new(); // alloc: none unless a `--message-format` is given
     let mut args = args.iter();
     while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
         if let Some(value) = arg.strip_prefix("--message-format=") {
             values.push(value.to_owned()); // alloc: once per `--message-format`, once per job
         } else if arg == "--message-format" {
@@ -5379,7 +5417,13 @@ impl<S: Steps> Jobs<S> {
             self.end(w, id, true, None);
             return;
         }
-        let short = match short(&prep.config.invocation.args) {
+        let asked_args = self
+            .jobs
+            .get(key_of(id))
+            .and_then(|job| targets_of(&job.work))
+            .and_then(|it| it.cargo.as_ref())
+            .map_or(&[][..], |cargo| cargo.args.as_slice());
+        let short = match short(asked_args) {
             Ok(short) => short,
             Err(why) => {
                 self.end(

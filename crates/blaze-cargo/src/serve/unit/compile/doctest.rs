@@ -33,8 +33,9 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_lower::{Appended, DoctestProgram, LowerError, Lowered};
 
 use super::{
-    Does, Failed, Image, ImageRecord, Job, Linked, Making, Phases, Put, UnitReader, Written,
-    artifact, codegen, header, lock, reads, say, span_unit,
+    Does, Failed, Image, ImageRecord, Item, Job, Linked, Making, Phases, Put, Said, UnitReader,
+    Written,
+    artifact, codegen, header, lock, reads, span_unit,
 };
 use crate::serve::{unit::codegen::Makes, work::Linking as How};
 
@@ -532,8 +533,6 @@ pub(super) fn link(
 ) -> Result<(), Failed> {
     let u = job.unit(unit)?;
     let plan = job.plan(unit)?;
-    let unit_of = job.unit_of(unit)?;
-    let color = job.input.color;
     let Some(Generated { mut verdicts, mut examples, runner }) = phases.doctests.take() else {
         // alloc: error path
         let what = format!("{} is linked before its examples are built", span_unit(u));
@@ -550,7 +549,7 @@ pub(super) fn link(
     };
     let mut making = Making {
         // alloc: none until a refusal
-        diagnostics: Vec::new(),
+        said: Said::default(),
         ok: true,
         open: false,
         why: None,
@@ -570,7 +569,7 @@ pub(super) fn link(
     let runner = match runner {
         Ok(it) => it,
         Err(why) => {
-            making.diagnostics.push(say::refused(why, Some(unit_of), color));
+            making.said.items.push(Item::refused(why));
             making.ok = false;
             making.nothing = true;
             phases.linked = Some(Linked::Made(Box::new(making)));
@@ -678,7 +677,7 @@ pub(super) fn link(
                         Some(Verdict::Failed(format!("blaze can't link the example: {failed}")))
                 }
                 None => {
-                    making.diagnostics.push(say::refused(failed.to_string(), Some(unit_of), color));
+                    making.said.items.push(Item::refused(failed.to_string()));
                     making.ok = false;
                     making.nothing = true;
                     making.files.clear();

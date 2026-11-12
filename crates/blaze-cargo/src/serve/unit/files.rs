@@ -124,16 +124,21 @@ impl Mounted {
         diags: &[blaze_diagnostics::Diag],
     ) {
         for name in sources.unread(diags) {
-            if blaze_diagnostics::emit::names_text(name) {
-                sources.add(name, None);
-                continue;
-            }
-            let text = match self.read(&self.absolute(name)) {
-                Ok(Some((_, _, bytes))) => String::from_utf8(bytes.to_vec()).ok(),
-                Ok(None) | Err(_) => None,
-            };
-            sources.add(name, text);
+            sources.add(name, self.text(name));
         }
+    }
+
+    /// The text of the view's file the diagnostics name `name`; none for a name of a text
+    /// that is not the file at its path ([`blaze_diagnostics::emit::names_text`]), a file no
+    /// mount holds, bytes that fail their check or are not UTF-8. What a diagnostic's lines
+    /// are drawn from (`drawn::draw`).
+    pub(crate) fn text(&self, name: &str) -> Option<String> {
+        if blaze_diagnostics::emit::names_text(name) {
+            return None;
+        }
+        let (_, _, bytes) = self.read(&self.absolute(name)).ok()??;
+        // alloc: a file's text, once per file a unit's diagnostics point into
+        String::from_utf8(bytes.to_vec()).ok()
     }
 }
 
