@@ -1,0 +1,12 @@
+{
+ "id": "bstd-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-builds-1112",
+ "where": "/root/loop.sh on lanebase-1112",
+ "what": "The queue is one flock with no bound on how long a holder keeps it: `loop.sh content-keys-1112 /root/wt/content-keys-1112/exp1.sh` held it for over 15 minutes (ps etimes 925 s) with three lanes queued behind it; my `check --fix` call waited behind it, and each waiting call was moved to the background by the tool after 180 s with no output.",
+ "cost": "about twenty minutes of waiting, twice",
+ "cause": "experiments run inside the lock; the brief says to keep each call short but nothing holds a call to it",
+ "workaround": "wrote docs and agents.json rows while waiting",
+ "fix": "loop.sh prints who holds the lock and for how long while it waits, and runs the command under `timeout` (ten minutes) so a long run has to be a unit outside the lock",
+ "state": "open"
+}

@@ -1,0 +1,12 @@
+{
+ "id": "bstd-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-builds-1112",
+ "where": "/root/loop.sh on lanebase-1112",
+ "what": "Every call of `/root/loop.sh` by any lane kills the daemon of `/root/inst/blaze-engine` and replaces `/root/inst/blaze`, and checks another branch out in `/root/blaze`, so a run longer than one call (a `blaze test -p blaze-std` of three minutes started as a systemd unit) cannot use `/root/inst` or `/root/blaze`.",
+ "cost": "twenty minutes writing a wrapper (prep.sh) before the first run",
+ "cause": "one install directory and one checkout for every lane",
+ "workaround": "inside my loop call: copy `/root/inst/blaze{,-engine}` to `/root/inst-bstd/`, `git worktree add --detach /root/wt/<branch>`, and start the unit on those",
+ "fix": "loop.sh installs to `/root/inst/<branch>/` and keeps `/root/wt/<branch>` at the tip itself, and takes `--unit <name>` to start the command as a systemd unit and print how to poll it",
+ "state": "open"
+}

@@ -188,6 +188,7 @@ pub struct UnitOfRef<'a> {
     pub doctest: bool,
     pub package_id: &'a str,
     pub manifest_path: &'a str,
+    pub primary: bool,
 }
 
 /// [`UnitStarted`], read where it lies.
@@ -405,6 +406,7 @@ impl UnitOfRef<'_> {
             target: self.target.into_owned(),
             package_id: owned(self.package_id),
             manifest_path: owned(self.manifest_path),
+            primary: self.primary,
         }
     }
 }

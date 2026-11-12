@@ -249,6 +249,7 @@ fn a_compiler_message_as_cargo_writes_it_again() {
         target: bin_target(&root),
         test: false,
         doctest: false,
+        primary: true,
     };
     let rendered = "\u{1b}[1m\u{1b}[33mwarning\u{1b}[0m: unused variable: `x`\n\n";
     let mut sources = Sources::new(std::path::Path::new(&root));
@@ -301,6 +302,7 @@ fn a_compiler_message_in_color_is_rustcs_as_it_wrote_it() {
         target: bin_target(&root),
         test: false,
         doctest: false,
+        primary: true,
     };
     let rendered = "\u{1b}[33mwarning\u{1b}[0m\n";
     let mut sources = Sources::new(std::path::Path::new(&root));
@@ -378,6 +380,7 @@ fn a_compiler_message_warm_allocates_nothing() {
         target: bin_target(&root),
         test: false,
         doctest: false,
+        primary: true,
     });
     let diagnostic = sent(&unused("\u{1b}[33mwarning\u{1b}[0m: unused variable: `x`\n"));
     let (unit, diagnostic): (UnitOfRef<'_>, DiagnosticRef<'_>) = (lent(&unit), lent(&diagnostic));

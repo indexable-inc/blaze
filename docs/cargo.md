@@ -1585,7 +1585,9 @@ its check, with `--cfg clippy` and the `clippy.toml` clippy's search finds; a re
 checked, not linted. `--fix` makes every machine-applicable suggestion of the check (with
 `--lint NAME`, given any number of times, only those of the lints named), checks the result
 again up to four times, and writes the files only when no check of it has an error the first
-did not; `--fix` checks every target when none is named.
+did not; `--fix` checks every target when none is named. It edits only the packages the request
+asked for (`-p`, or the default members): a member or a vendored crate that is checked because
+one of those depends on it keeps its files, and the count of its suggestions is said.
 
 Once every unit ends, `blaze check` lints each workspace package's items over every
 configuration it checked (the lib, the lib as a test, each bin, test, bench and example):

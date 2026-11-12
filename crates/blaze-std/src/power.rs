@@ -54,6 +54,9 @@ pub struct Power {
 }
 
 impl Power {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn new(io: Io) -> Power {
         Power { io }
     }

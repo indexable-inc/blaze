@@ -1,0 +1,12 @@
+{
+ "id": "bstd-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-builds-1112",
+ "where": "my own command on lanebase-1112",
+ "what": "To see a failing assertion I ran `flock /root/loop.lock bash -c 'cargo test ...'` in `/root/blaze` myself, not through loop.sh: the checkout was another lane's (3d1f288eb), my test did not exist there, and the command printed nothing.",
+ "cost": "one wasted call and a cargo test build of another lane's tree in the shared target",
+ "cause": "the lock does not say whose tree is checked out; only loop.sh checks the branch out",
+ "workaround": "always `/root/loop.sh <branch> ...`",
+ "fix": "none needed beyond bstd-1's fix; the how-to row says it",
+ "state": "open"
+}

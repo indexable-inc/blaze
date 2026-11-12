@@ -73,7 +73,7 @@
 //! |---|---|---|
 //! | [`mem`] | allocators by lifetime | blaze-mem |
 //! | [`bytes`], [`text`] | held bytes and UTF-8 text, lent and never copied | blaze-bytes |
-//! | [`map`], [`set`], [`hash`] | the one hash map and set, the identity and content hashers | blaze-hash |
+//! | [`map`], [`set`], [`hash`] | one map and set per need (hashed, by hash, by content, insertion-ordered, sorted, keyed, shared), and their hashers | blaze-hash, blaze-hashcons, `alloc` |
 //! | [`id`] | content ids, dense indices, the interner | blaze-ids |
 //! | [`sync`], [`cell`] | `Shared`, named locks, `Atomic`, token cells, the spin, reclamation | std, blaze-core, blaze-spin, blaze-reclaim |
 //! | [`own`] | ownership properties derived by reflection (`Acyclic`), `Shared` and `Shares` | new |
@@ -116,6 +116,7 @@
     generic_atomic,
     marker_trait_attr,
     register_tool,
+    rustc_attrs,
     type_info,
     unsize
 )]
@@ -124,7 +125,8 @@
     reason = "`core_intrinsics` for the one reflection intrinsic `own::raw` asks directly \
               (`type_id_vtable`, of an unsized type); `atomic_internals` for the bound of \
               `Atomic<T>` (`AtomicPrimitive`), which `own`'s one `Owns` impl for every atomic \
-              has to name"
+              has to name; `rustc_attrs` for `#[rustc_comptime]` on `own`'s walk, which calls \
+              reflection's compile-time-only functions and so is compile-time-only itself"
 )]
 #![register_tool(blaze)]
 
@@ -241,17 +243,35 @@ pub mod text {
     pub use blaze_bytes::{Text, text_of};
 }
 
-/// The one hash map: hashbrown's, on foldhash with one fixed seed, in the allocator its type
-/// names; shared between threads, papaya's lock-free map (blaze-hash).
+/// The maps, one per need (docs/v2/plan/design/std.md, "Collections"); every one is made with
+/// `new_in(alloc)` or `with_capacity_in(n, alloc)`, and none has a `new()`.
+///
+/// | need | type |
+/// |---|---|
+/// | ordinary keys | [`map::HashMap`] |
+/// | keys that are hashes already | [`map::ByHash`] |
+/// | values stored once, found by their content | [`map::ContentMap`] (one owner), [`id::Sharded`] (shared, dense indices) |
+/// | iteration in insertion order, lookup by position | [`map::IndexMap`] |
+/// | sorted keys, ranges | [`map::SortedMap`] |
+/// | dense ids with a generation | [`mem::Slab`] and [`mem::Handle`] |
+/// | keys an attacker may pick | [`map::KeyedMap`], made with a [`hash::SipKey`] |
+/// | shared between threads | [`map::SharedMap`], [`map::SharedByHash`] |
 pub mod map {
+    /// Sorted by key, with range queries: `alloc`'s B-tree, which takes its allocator on this
+    /// nightly (`SortedMap::new_in(alloc)`).
+    pub use alloc::collections::BTreeMap as SortedMap;
     pub use blaze_hash::{
-        ByHash, Equivalent, HashMap as Map, Operation, SharedByHash, SharedMap, hash_map::Entry,
+        ByHash, Equivalent, HashMap, IndexMap, KeyedMap, Operation, OrderMap, SharedByHash,
+        SharedMap, hash_map::Entry,
     };
+    pub use blaze_hashcons::{Consed as Content, ContentMap, Mismatch, content_of};
 }
 
-/// The one hash set, as [`map`] (blaze-hash).
+/// The sets, as [`map`].
 pub mod set {
-    pub use blaze_hash::{ByHashSet, HashSet as Set, SharedSet};
+    /// Sorted, with range queries: `alloc`'s B-tree set, in a named allocator.
+    pub use alloc::collections::BTreeSet as SortedSet;
+    pub use blaze_hash::{ByHashSet, HashSet, IndexSet, KeyedSet, OrderSet, SharedSet};
 }
 
 /// The hashers behind [`map`] and [`set`]: the fixed seed, the identity hasher for keys that are
@@ -406,6 +426,10 @@ impl core::error::Error for Stopped {}
 /// Consumes a linear value that has no fields left to move out (a fieldless marker such as
 /// [`fs::ReadWrite`]): the one way such a value ends, besides its type's own consuming calls.
 #[blaze::consumes]
+#[blaze::pure]
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn consume<#[blaze::linear] T>(_: T) {}
 
 /// A safeguard a test turns off to prove its oracle sees the bug (skill `testing`, planted-bug

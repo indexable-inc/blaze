@@ -42,6 +42,9 @@ pub struct Automation {
 }
 
 impl Automation {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn new(io: Io) -> Automation {
         Automation { io, allowed: Allowed::Any }
     }

@@ -24,6 +24,8 @@ blaze-bytes.workspace = true
 blaze-check.workspace = true
 blaze-format.workspace = true
 blaze-hash.workspace = true
+# `map::ContentMap`: values stored once, by content.
+blaze-hashcons.workspace = true
 # The sans-IO cores only: its `tokio` feature (the drivers) stays off.
 blaze-http.workspace = true
 # A request's method, as blaze-http's h1 request writer takes it (`requests::Http::over`).

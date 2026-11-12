@@ -71,6 +71,10 @@ impl fmt::Display for Refused {
 }
 
 impl From<Stopped> for Refused {
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn from(stopped: Stopped) -> Refused {
         Refused::Stopped(stopped)
     }
@@ -130,6 +134,7 @@ impl SimHost {
     /// A quiet host: a terminal of 80 by 24, the user `sim`, the locale of
     /// [`Locale::simulated`], a full battery, and nothing else (no keys, anchors, processes,
     /// windows, devices or names).
+    #[blaze::nonblocking]
     pub fn new() -> SimHost {
         SimHost {
             term: SimTerm::new(),
@@ -163,6 +168,7 @@ impl SimHost {
 }
 
 impl Default for SimHost {
+    #[blaze::nonblocking]
     fn default() -> SimHost {
         SimHost::new()
     }

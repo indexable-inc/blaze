@@ -21,6 +21,8 @@ serde.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+# What `IndexMap` replaces: the other side of `collections_cost`'s rows.
+indexmap.workspace = true
 hegeltest.workspace = true
 
 [lints]

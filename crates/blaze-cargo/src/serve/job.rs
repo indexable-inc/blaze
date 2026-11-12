@@ -8733,6 +8733,7 @@ fn unit_of(units: &Units, at: usize) -> Option<UnitOf> {
         doctest: matches!(unit.mode, UnitMode::Doctest),
         package_id: unit.pkg_id.clone(), // clone: the report owns it, once per unit
         manifest_path: package.manifest_path.clone(), // clone: the report owns it, once per unit
+        primary: units.is_primary(at),
         target: super::unit::unit_target(unit).ok()?,
     })
 }

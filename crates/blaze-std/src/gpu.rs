@@ -16,6 +16,10 @@ impl Gpu {
     /// What `Io::gpu` gives: a device on a native macOS world (whose media engine the hardware
     /// encoder runs on); none in the simulation, which has no device, nor on other targets
     /// until their providers exist.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn offered(native: bool) -> Option<Gpu> {
         if native && cfg!(target_os = "macos") { Some(Gpu { _private: () }) } else { None }
     }

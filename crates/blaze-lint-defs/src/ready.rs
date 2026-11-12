@@ -29,8 +29,11 @@ pub const CAPABILITIES_FOR_BUILD_SCRIPTS: bool = false;
 
 /// Whether blaze's capability standard library (bstd, `crates/blaze-std`,
 /// docs/v2/plan/design/std.md) is in the tree, compiles on a stage-1 blaze and has an API the
-/// workspace can port to: steps S1 and S2 of that plan. Today `crates/blaze-std` is in the tree,
-/// but it is not yet built on a stage-1 blaze nor an API the workspace ports to. Turning this to `true` makes `blaze::std_use` warn in every crate of a
+/// workspace can port to: steps S1 and S2 of that plan. Today `crates/blaze-std` is in the tree
+/// and builds, and its tests run, under a blaze built from this tree (`blaze build -p blaze-std`,
+/// `blaze test -p blaze-std`; arm64 Linux, 2026-11-12), but it is not an API the workspace can
+/// port to: cargo still builds blaze's crates, and rustc refuses bstd's blaze-only syntax
+/// (decision D25 of docs/v2/plan/decisions.json). Turning this to `true` makes `blaze::std_use` warn in every crate of a
 /// workspace whose `lints-when-ready` table has `std_use = "warn"`, and its findings name what to
 /// write as something to do now. The lint's own default stays `allow`: another workspace's
 /// crates ask for it with `#![blaze::capabilities]`. blaze's own workspace does not wait: its

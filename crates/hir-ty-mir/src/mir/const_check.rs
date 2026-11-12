@@ -16,6 +16,7 @@
 //! `message` are rustc's.
 
 mod calls;
+pub mod comptime;
 mod qualifs;
 mod stability;
 
@@ -699,12 +700,12 @@ fn not_const_checked(db: &Db, func: FunctionId) -> bool {
 /// otherwise callable only when it is declared `const`, as the nightly declares the others const
 /// eval runs (`atomic_load` and the rest of the atomics, `transmute`, ..).
 ///
-/// A comptime function called from a `const fn` is accepted too, where rustc may refuse it: this
-/// check reports only what rustc reports.
+/// Where a comptime function may be called is not this check's: a `const fn` may not call one
+/// outside a `const { .. }` block, which [`comptime::comptime_calls`] reports, of every function.
 fn is_const_callable(db: &Db, func: FunctionId) -> bool {
     FunctionSignature::of(db, func).is_const()
         || of_a_trait(db, func)
-        || hir_def::attrs::AttrFlags::has_word(db, func.into(), "rustc_comptime")
+        || comptime::is_comptime(db, func)
 }
 
 /// How rustc's message names the function called: `function`, `method` or `associated

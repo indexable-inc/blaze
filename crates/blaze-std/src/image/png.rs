@@ -168,6 +168,7 @@ fn idat_count(bytes: &[u8], from: usize, color: Color) -> Result<usize, ImageErr
     Ok(idats)
 }
 
+#[blaze::pure]
 pub(crate) fn decode<A: Allocator>(bytes: &[u8], alloc: A, limits: Limits) -> Result<Image<A>, ImageError> {
     if bytes.get(..8) != Some(&SIGNATURE[..]) {
         return Err(ImageError::NotPng);
@@ -337,6 +338,8 @@ fn chunk<A: Allocator>(out: &mut Vec<u8, A>, name: ChunkName, data: &[u8]) {
     out.extend_from_slice(&sum.finish().to_be_bytes());
 }
 
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn encode<A: Allocator + Clone, B: Allocator>(image: &Image<B>, alloc: A) -> Result<Vec<u8, A>, ImageError> {
     let (width, height) = (image.width(), image.height());
     let stride = image.stride();

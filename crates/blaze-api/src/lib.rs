@@ -105,8 +105,9 @@ use serde::{Deserialize, Serialize};
 /// [`Targets::goal`] and [`Worked::tiers`], the build goal ([`Goal`]) and how much of the code
 /// a build linked is optimized. 51: [`Worked::storage`] ([`Storage`]: what the daemon's store
 /// and its home hold against their budget, on every build's end) and `unkept` of
-/// [`Request::Gc`].
-pub const SCHEMA: u32 = 51;
+/// [`Request::Gc`]. 52: [`UnitOf::primary`], by which `check --fix` edits only the packages the
+/// request asked for.
+pub const SCHEMA: u32 = 52;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -1065,6 +1066,11 @@ pub struct UnitOf {
     pub doctest: bool,
     pub package_id: String,
     pub manifest_path: String,
+    /// The unit's package is one the request asked for (cargo's `is_primary_package`), not
+    /// one built or checked only because such a package depends on it. `check --fix` edits
+    /// the files of these alone: a dependency in the checkout (another member, a vendored
+    /// crate) is checked, and its diagnostics shown, but it is not what was asked to be fixed.
+    pub primary: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]

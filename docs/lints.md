@@ -1553,7 +1553,7 @@ which lints report the row in this one's place where they are on:
 | `std::sync::{Condvar, Barrier}` | ambient authority | `Signal` of `bstd::sync`, or a scope's `join(cx)` | no |  |
 | `std::sync::{Once, OnceState}` | ambient authority | `Once<T>` of `bstd::sync`, a value to own and pass, never in a `static` | no |  |
 | `std::hash::{RandomState, DefaultHasher}` | ambient authority | `bstd::hash::FixedState`, the one fixed seed; under keys an attacker picks, `SipKey` from an `Rng` | no | `blaze::default_hasher` |
-| `std::collections::{HashMap, HashSet}` | ambient authority | `bstd::map::Map` and `bstd::set::Set`, made with `new_in(alloc)` | no | `blaze::default_hasher`, `blaze::implicit_allocator` |
+| `std::collections::{HashMap, HashSet}` | ambient authority | `bstd::map::HashMap` and `bstd::set::HashSet`, made with `new_in(alloc)` | no | `blaze::default_hasher`, `blaze::implicit_allocator` |
 | `std::random`'s functions | ambient authority | take an `Rng` (`rng.next_u64()`, `rng.fill(..)`), which is seeded in a simulation | no |  |
 | `std::sync::{Arc}` | renamed | `bstd::sync::Shared` | yes |  |
 | `std::rc::{Rc}` | renamed | `bstd::sync::LocalShared` | yes |  |

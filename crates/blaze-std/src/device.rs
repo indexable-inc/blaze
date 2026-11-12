@@ -148,6 +148,9 @@ pub struct Camera {
 }
 
 impl Camera {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn new(io: Io) -> Camera {
         Camera { io, allowed: Allowed::Any }
     }
@@ -178,6 +181,9 @@ pub struct Screen {
 }
 
 impl Screen {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn new(io: Io) -> Screen {
         Screen { io, allowed: Allowed::Any }
     }
@@ -229,6 +235,9 @@ pub enum Precision {
 
 impl Precision {
     /// `position` as this precision lets it be known.
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn round(self, position: Position) -> Position {
         let grain = match self {
             Precision::Exact => return position,
@@ -248,6 +257,9 @@ pub struct Location {
 }
 
 impl Location {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn new(io: Io) -> Location {
         Location { io, precision: Precision::Exact }
     }
@@ -256,11 +268,14 @@ impl Location {
     pub fn coarser(&self, precision: Precision) -> Location {
         let precision = match self.io.plant() {
             Plant::OnlyWidens => precision,
-            _ => self.precision.max(precision),
+            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned => self.precision.max(precision),
         };
         Location { io: self.io.clone(), precision }
     }
 
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn precision(&self) -> Precision {
         self.precision
     }
@@ -281,6 +296,9 @@ pub struct Bluetooth {
 }
 
 impl Bluetooth {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn new(io: Io) -> Bluetooth {
         Bluetooth { io, devices: Allowed::Any, services: Allowed::Any }
     }
@@ -395,6 +413,9 @@ pub struct Clipboard {
 }
 
 impl Clipboard {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn new(io: Io) -> Clipboard {
         Clipboard { io, reads: true, writes: true }
     }
@@ -449,6 +470,9 @@ pub struct Notify {
 }
 
 impl Notify {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn new(io: Io) -> Notify {
         Notify { io }
     }
