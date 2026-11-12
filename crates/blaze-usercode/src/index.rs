@@ -46,11 +46,20 @@ impl Shape {
         frame::task(Tag::Usercode, |frame| {
             let env = trace::sorted_in(&traced.env, frame);
             let all = env.iter().any(|it| it.0 == ALL_ENV_NAME);
-            // The variables a run that read them all saw are any the environment has then;
-            // what it asked for by name and was not there is named still.
+            // The variables a run that walked its environment saw are any the walk has then;
+            // what it asked for by name and was not there is named still, and so is what it
+            // asked for by name that a walk of a lent environment does not see
+            // ([`crate::confine::walk_sees`]): the walk does not give that one's value again.
+            // For a run given its whole environment that keeps a name the walk also has, read
+            // once by [`Shape::values`] and by a check's key.
             let env = env
                 .iter()
-                .filter(|(name, value)| !all || name == ALL_ENV_NAME || value.is_none())
+                .filter(|(name, value)| {
+                    !all
+                        || name == ALL_ENV_NAME
+                        || value.is_none()
+                        || !crate::confine::walk_sees(name)
+                })
                 .map(|it| it.0.clone()) // clone: the names the shape keeps
                 .collect(); // alloc: the shape the caller keeps
             Shape {
@@ -95,6 +104,7 @@ impl Shape {
                 None => traced.files.push((path.clone(), None)), // clone: the Traced the caller keeps
             }
         }
+        let whole = self.env.iter().any(|name| name == ALL_ENV_NAME);
         for name in &self.env {
             if name == ALL_ENV_NAME {
                 let all = inputs.env_all();
@@ -104,7 +114,15 @@ impl Shape {
                     .env
                     .extend(all.iter().map(|(name, value)| (name.clone(), Some(value.clone()))));
             } else {
-                traced.env.push((name.clone(), inputs.env(name).map(OsStr::to_owned))); // clone: kept, as above
+                // A name the walk has is the walk's entry, once, as the run's trace had it.
+                let walked = whole
+                    && inputs
+                        .env_all()
+                        .binary_search_by(|it| it.0.as_os_str().cmp(name.as_os_str()))
+                        .is_ok();
+                if !walked {
+                    traced.env.push((name.clone(), inputs.env(name).map(OsStr::to_owned))); // clone: kept, as above
+                }
             }
         }
         traced.untraceable = self.untraceable.clone(); // clone: kept, as above
@@ -480,6 +498,23 @@ fn keyed<I: Inputs>(
         whole |= asked.bytes_u64().map_err(short)? == &*all_name;
     }
     if whole {
+        // What each name asked has by name, read before the walk is lent: a name the walk of
+        // a lent environment does not see is keyed by this value, never as not set.
+        let mut by_name = at;
+        // alloc: once per check of a shape that walked the environment, a value each name it
+        // also asked that is set (those the walk does not see, a few)
+        let mut named_values: Vec<Option<Vec<u8>>> = Vec::with_capacity(names as usize);
+        for _ in 0..names {
+            let name = by_name.bytes_u64().map_err(short)?;
+            let value = match name == &*all_name {
+                true => None,
+                false => inputs
+                    .env(&trace::os_in(name).map_err(bad)?)
+                    .map(|it| trace::os_bytes(it).into_owned()), // alloc: as above
+            };
+            named_values.push(value);
+        }
+        let mut named_values = named_values.into_iter();
         let all = inputs.env_all();
         let hex = trace::names_hex(all);
         let hex =
@@ -488,6 +523,7 @@ fn keyed<I: Inputs>(
         for _ in 0..names {
             let name = at.bytes_u64().map_err(short)?;
             let named = trace::os_in(name).map_err(bad)?;
+            let by_name_value = named_values.next().flatten();
             while let Some((set, value)) = all.next_if(|it| it.0.as_os_str() < &*named) {
                 keyer.env(&trace::os_bytes(set), Some(&*trace::os_bytes(value)));
             }
@@ -496,8 +532,9 @@ fn keyed<I: Inputs>(
             } else if let Some((_, value)) = all.next_if(|it| it.0.as_os_str() == &*named) {
                 keyer.env(name, Some(&*trace::os_bytes(value)));
             } else {
-                // What the whole environment has not is not set.
-                keyer.env(name, None);
+                // What the walk has not is what a read of its name finds: not set, or, in a
+                // lent environment, the value of a variable outside the walk set.
+                keyer.env(name, by_name_value.as_deref());
             }
         }
         for (set, value) in all {

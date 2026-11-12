@@ -1472,9 +1472,14 @@ struct Viewed {
     /// The checkout `root_dir` is in [`Jobs::roots`]; none for an agent's view.
     root: Option<u32>,
     config: BuildConfig,
-    /// `config`, encoded.
+    /// `config`, encoded: whole, the request's every variable in it. What the no-op lane
+    /// compares ([`config_id`]): an answer said again stands for every step of the build, a
+    /// build script's reads among them, which no plan names.
     encoded: Vec<u8>,
-    /// The view's root and its config as one: what [`LastPlan::key`] is matched by.
+    /// `config` as the plan reads it ([`BuildConfig::planned`]): what the view is opened
+    /// with.
+    planned: Vec<u8>,
+    /// The view's root and `planned` as one: what [`LastPlan::key`] is matched by.
     key: ContentId,
 }
 
@@ -3968,9 +3973,13 @@ impl<S: Steps> Jobs<S> {
             blaze: crate::release::get().version.to_owned(), // alloc: the config owns it, once per view
         };
         let encoded = config.encode();
+        // The plan's key and its view's configuration hold, of the request's environment,
+        // what the load reads alone ([`BuildConfig::planned`]): another pane's variables are
+        // the same plan in the same view.
+        let planned = config.planned();
         let key =
-            Hasher::new("blaze v2 serve last plan").id(&opened.view.root).part(&encoded).finish();
-        Viewed { root_dir, root, config, encoded, key }
+            Hasher::new("blaze v2 serve last plan").id(&opened.view.root).part(&planned).finish();
+        Viewed { root_dir, root, config, encoded, planned, key }
     }
 
     /// The view opened in the database with its build configuration as the mounts are now, or
@@ -3990,7 +3999,7 @@ impl<S: Steps> Jobs<S> {
             self.end(w, id, false, Some(error));
             return;
         };
-        let Viewed { root_dir, root, config, encoded, key } =
+        let Viewed { root_dir, root, config, encoded, planned, key } =
             Self::viewed(&self.setup, &mut self.roots, w, &job.work, &opened, library);
         let (request, drawn) = (request_id(&job.work), drawn_id(&job.work));
         // A blaze that keys as another toolchain (`BLAZE_DEV_TOOLCHAIN_AS`) says so before
@@ -4072,7 +4081,7 @@ impl<S: Steps> Jobs<S> {
             self.plan(w, id, prep);
             return;
         }
-        let queries = w.db.open_with(opened.view, &encoded);
+        let queries = w.db.open_with(opened.view, &planned);
         job.queries.push(queries);
         self.plan(w, id, Prep { opened, root_dir, root, config, key, queries, asked, last: None });
     }
