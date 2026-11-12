@@ -804,6 +804,10 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
             Some("perf") => return Ok(Asked::Perf(words.collect())),
             Some("clean") => return Ok(Asked::Clean(words.collect())),
             Some("cache") => return Ok(Asked::Cache(words.collect())),
+            // `blaze store verify` is the same command's (`cli::cache`).
+            Some("store") => {
+                return Ok(Asked::Cache(std::iter::once("store".into()).chain(words).collect()));
+            }
             // `blaze gc ...` is `blaze cache gc ...`.
             Some("gc") => {
                 return Ok(Asked::Cache(std::iter::once("gc".into()).chain(words).collect()));

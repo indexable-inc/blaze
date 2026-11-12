@@ -12,6 +12,7 @@ mod block_checks;
 mod collect;
 mod model_check;
 mod place_copy;
+mod place_whole;
 mod place_crash;
 mod place_made;
 mod place_race;
@@ -2490,8 +2491,12 @@ fn the_first_place_after_an_open_looks_at_and_seals_the_placed_file_without_foll
     );
 }
 
+/// A whole file of the store an earlier run left that is not what its name says (other
+/// bytes, or another length): the place that would clone it is refused, naming the file,
+/// what it holds and the command that repairs it; the file is left as it is and nothing is
+/// placed another way (rule no-fallback).
 #[test]
-fn a_placed_file_with_other_bytes_is_written_again_before_it_is_cloned() {
+fn a_placed_file_with_other_bytes_refuses_its_place_naming_the_repair() {
     for (seed, shorter) in [(14, false), (15, true)] {
         let mut sim = Sim::new(seed, quiet());
         let (store, out, file) = placed_once(&mut sim, seed * 10);
@@ -2504,12 +2509,21 @@ fn a_placed_file_with_other_bytes_is_written_again_before_it_is_cloned() {
         sim.change(&file, &other);
         let mut store = open(&mut sim, "store");
         let placed = place_one(&mut sim, &mut store, "two/build/a");
+        let why = placed.result.expect_err("a place from a whole file with other bytes is refused");
+        let said = if shorter { "bytes, not the" } else { "not of its name" };
+        assert!(why.contains(&file.to_string()) && why.contains(said), "{why}");
+        assert!(why.contains("`blaze store verify`"), "{why}");
+        assert_eq!(placed.bytes, PlacedBytes::default());
+        assert_eq!(sim.contents(&file), other, "the file is left as it was found");
+        assert!(!sim.exists(&name("two/build/a")), "nothing was placed another way");
+        assert!(store.problems().iter().any(|it| it.contains(said)), "{:?}", store.problems());
+        // What `blaze store verify` does: the wrong file removed. The next place writes it.
+        sim.delete(&file);
+        let placed = place_one(&mut sim, &mut store, "two/build/a");
         assert_eq!(placed.result, Ok(()));
         assert_eq!(placed.bytes.written, out.len() as u64, "written again");
         assert_eq!(sim.contents(&file), out);
         assert_eq!(sim.contents(&name("two/build/a")), out);
-        let why = if shorter { "bytes, not the" } else { "not of its name" };
-        assert!(store.problems().iter().any(|it| it.contains(why)), "{:?}", store.problems());
     }
 }
 
@@ -2536,8 +2550,8 @@ fn a_placed_file_removed_outside_the_daemon_refuses_its_place_and_the_next_write
     assert_eq!(sim.contents(&name("two/build/a")), out);
 }
 
-/// The same of a whole file swapped for a symbolic link: refused, never cloned through, the
-/// link removed, and the next place writes a file again.
+/// The same of a whole file swapped for a symbolic link: refused, never cloned through, and
+/// left for `blaze store verify`.
 #[test]
 fn a_placed_file_swapped_for_a_symbolic_link_refuses_its_place_and_is_never_cloned_through() {
     let mut sim = Sim::new(18, quiet());
@@ -2548,12 +2562,9 @@ fn a_placed_file_swapped_for_a_symbolic_link_refuses_its_place_and_is_never_clon
     let why = placed.result.expect_err("a place whose file is a link is refused");
     assert!(why.contains(blaze_core::CLONE_THROUGH_A_LINK), "{why}");
     assert!(why.contains("is no regular file"), "{why}");
+    assert!(why.contains("`blaze store verify`"), "{why}");
     assert!(!sim.exists(&name("two/build/a")), "not cloned through the link");
-    let placed = place_one(&mut sim, &mut store, "two/build/a");
-    assert_eq!(placed.result, Ok(()));
-    assert_eq!(placed.bytes.written, out.len() as u64, "written again by the next place");
-    assert_eq!(sim.contents(&name("two/build/a")), out);
-    assert_eq!(sim.mode(&file), Some(PLACED_MODE), "a file again, read-only");
+    assert_eq!(sim.contents(&name("elsewhere/a")), out, "what the link names is untouched");
 }
 
 #[test]

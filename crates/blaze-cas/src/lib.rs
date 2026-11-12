@@ -171,6 +171,11 @@ const CLONE_FROM: u64 = 16 << 10;
 /// ([`Kind::Derived`]): a file so named is never taken from an earlier run.
 const DERIVED_SUFFIX: &str = ".derived";
 
+/// What the name of a whole file ends with while this run writes it, after its content: a
+/// crash leaves bytes only under such a name, never under the content's own, and the next
+/// open sweeps it with the other leftovers of `placed/`.
+const WRITING_SUFFIX: &str = ".writing";
+
 /// The mode of a whole file kept to be cloned ([`CLONE_FROM`]): no one writes it, so a build
 /// dir's clone, which shares its blocks copy-on-write, is the only thing a program can change.
 const PLACED_MODE: u32 = 0o444;
@@ -775,6 +780,14 @@ enum PlacedFile {
         after: Vec<Waiter>,
         owed: u64,
     },
+    /// Written under its writing name ([`Store::placed_file`]), sealed and written back:
+    /// being renamed to its own name, the one step that makes it a file a later run takes.
+    /// `doomed`, let go of meanwhile.
+    Naming {
+        waiting: Vec<Waiter>,
+        written: u64,
+        doomed: bool,
+    },
     /// Being removed; what waits is written afresh once it is gone.
     Removing(Vec<Waiter>),
 }
@@ -785,6 +798,10 @@ enum PlacedFile {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PlacePlant {
     None,
+    /// The store's whole file of an output is written under the content's own name, in place,
+    /// as before 2026-11-12: a crash then leaves any part of it under that name
+    /// (`tests::place_whole`).
+    WritesInPlace,
     /// A value kept as a file of its own is placed as another name of that file (a hard
     /// link), and a patched place then writes its runs through the name: into the store's
     /// own file (`tests::place_copy`).
@@ -868,6 +885,12 @@ impl fmt::Display for NoBase {
         }
     }
 }
+
+/// What a refusal over a whole file of the store that is not what its name says ends with:
+/// the command that checks those files and removes the wrong ones (`blaze store verify`,
+/// crates/blaze-cargo/src/cli/cache.rs), after which the next build writes them again. The
+/// store itself writes none again on its own (rule no-fallback).
+pub const VERIFY_PLACED: &str = "stop the daemon (`blaze stop`) and run `blaze store verify`: it checks the store's placed files against their names and removes the ones that are wrong, and the next build writes them again";
 
 /// How the bytes of an output get to the path it is placed at: one way for a store, decided
 /// once as it opens by trying a clone inside its own directory ([`Store::ask_shares`]), said
@@ -1044,6 +1067,10 @@ pub struct Store {
     /// What the last period's end ([`Store::end_period`]) planned and no
     /// [`Store::settle_step`] has made yet.
     moves: Option<Moves>,
+    /// The whole files this run is writing that are still under their writing names
+    /// ([`Store::placed_file`]), by content: each takes its own name by one rename, once its
+    /// bytes are written back, so a crash leaves a whole file under a content's name or none.
+    staged_files: ByHashSet<ContentId, Global>, // alloc: the store's own table, for its life
     /// How an output's bytes get to a path, decided once as the store opens, before its look
     /// through `placed/` and so before any place ([`PlaceBy`], [`Store::ask_shares`]).
     place_by: Option<PlaceBy>,
@@ -1139,6 +1166,22 @@ impl Reader {
     /// Whether it has a value of `key`, unverified: for planning, never for use.
     pub fn has(&self, guard: &Guard, key: &Key) -> bool {
         self.look(guard).has(key)
+    }
+
+    /// The `len` bytes at `at` of the value of `key`, valid while `guard`'s task runs: what
+    /// a reader of a few bytes of a large value asks (a name's entry of a crate's def map
+    /// pages), so that only the pages those bytes are on are loaded and pinned. A value that
+    /// a [`Reader::get`] verified once and that is a raw record of a pack is read so; any
+    /// other is read whole first, as [`Reader::get`] reads it. `None` when the store has no
+    /// value of `key`; a part past the value's end is an error naming it.
+    pub fn part<'g>(
+        &'g self,
+        guard: &'g Guard,
+        key: &Key,
+        at: u64,
+        len: u64,
+    ) -> Result<Option<&'g [u8]>, Corrupt> {
+        self.look(guard).part(key, at, len)
     }
 
     /// A hint that the values of `keys` are about to be read: the pages of the store's pool
@@ -1854,6 +1897,11 @@ enum Op {
     Unplace {
         content: ContentId,
     },
+    /// The whole file of `content` renamed from its writing name to its own
+    /// ([`PlacedFile::Naming`]).
+    NameFile {
+        content: ContentId,
+    },
     /// A fetch of `key`, whose value is kept only once `admit` takes it ([`Store::fetch`]).
     Fetch {
         key: Key,
@@ -2330,6 +2378,7 @@ impl Store {
             new_keys: None,
             epoch: 0,
             periods: 0,
+            staged_files: ByHashSet::new_in(Global), // alloc: the store's own table, for its life
             place_by: None,
             held_asks: Vec::new(), // alloc: empty, allocates nothing
             overs: HashMap::new_in(Global), // alloc: the store's own table, for its life
@@ -4123,7 +4172,9 @@ impl Store {
             Some(PlacedFile::There { cloning, doomed, .. }) if *cloning > 0 => *doomed = true,
             Some(PlacedFile::There { .. }) | None => self.remove_file(content, Vec::new(), effects), // alloc: empty, allocates nothing
             // Its write-back is in flight: it goes once that ended, unless wanted by then.
-            Some(PlacedFile::Flushing { doomed, .. }) => *doomed = true,
+            Some(PlacedFile::Flushing { doomed, .. } | PlacedFile::Naming { doomed, .. }) => {
+                *doomed = true;
+            }
             // Wanted again, or going already.
             Some(_) => {}
         }
@@ -4395,6 +4446,12 @@ impl Store {
         match self.derived.contains_key(content) {
             // alloc: a file name for an effect, which owns it; once per place
             true => self.tiers[0].file(&format!("placed/{content:x}{DERIVED_SUFFIX}")),
+            // Being written by this run: under a name no later run takes for a whole file
+            // (the open sweeps it), until the rename that gives it its own.
+            // alloc: a file name for an effect, which owns it; once per step of a file made
+            false if self.staged_files.contains(content) => {
+                self.tiers[0].file(&format!("placed/{content:x}{WRITING_SUFFIX}"))
+            }
             // alloc: a file name for an effect, which owns it; once per place
             false => self.tiers[0].file(&format!("placed/{content:x}")),
         }
@@ -4434,7 +4491,10 @@ impl Store {
                 At::There(file.clone(), std::mem::take(owed))
             }
             Some(
-                PlacedFile::Writing(_) | PlacedFile::Sealing { .. } | PlacedFile::Flushing { .. },
+                PlacedFile::Writing(_)
+                | PlacedFile::Sealing { .. }
+                | PlacedFile::Flushing { .. }
+                | PlacedFile::Naming { .. },
             ) => At::Busy { writing: true },
             Some(_) => At::Busy { writing: false },
             None => At::Unseen,
@@ -4481,7 +4541,10 @@ impl Store {
         }
         match self.files.get_mut(&content) {
             Some(PlacedFile::There { after, .. }) => after.push(waiter),
-            Some(PlacedFile::Flushing { waiting, doomed, .. }) => {
+            Some(
+                PlacedFile::Flushing { waiting, doomed, .. }
+                | PlacedFile::Naming { waiting, doomed, .. },
+            ) => {
                 *doomed = false;
                 waiting.push(waiter);
             }
@@ -4726,11 +4789,11 @@ impl Store {
     }
 
     /// A clone from the whole file of `content` failed with `why`: the place is refused, naming
-    /// the file and what was found of it. When the file is gone (removed outside the daemon) or
-    /// no regular file (a symbolic link, a FIFO), what is under its name is removed, so the
-    /// next build's place writes it afresh from the value's bytes; this place is not made
-    /// another way and not tried again (rule no-fallback: a failed build is better than one
-    /// that quietly tried again). Until 2026-11-12 the file was written again and the place
+    /// the file and what was found of it, and is not made another way or tried again (rule
+    /// no-fallback: a failed build is better than one that quietly tried again). A file that
+    /// is gone (removed outside the daemon) is forgotten, so the next build's place writes it
+    /// afresh; what is no regular file (a symbolic link, a FIFO) is left for `blaze store
+    /// verify` ([`VERIFY_PLACED`]). Until 2026-11-12 the file was written again and the place
     /// made from it, once.
     fn rechecked(
         &mut self,
@@ -4747,16 +4810,17 @@ impl Store {
             // alloc: one waiter refused, its error naming the file it cloned
             return self.refuse_waiting(vec![waiter], &format!("cloning {file}: {why}"));
         }
-        let found = match link {
-            true => "what is under its name is no regular file (put there after the store wrote it)",
-            false => "it is not there (removed outside the daemon)",
-        };
+        if link {
+            // alloc: a problem reported, and the place's error
+            let what = format!(
+                "cloning {file}, the store's whole file of an output: {why}: what is under its name is no regular file (put there after the store wrote it). The place is not made another way: {VERIFY_PLACED}"
+            );
+            self.placed_problem(what.clone()); // clone: the problem kept and the place's error
+            return self.refuse_waiting(vec![waiter], &what);
+        }
         // alloc: a problem reported, and the place's error
         let what = format!(
-            "cloning {file}, the store's whole file of an output: {why}: {found}. The place is \
-             not made another way. What is under the name is removed, and the next build \
-             writes the file again from the value's bytes: run the build again (no command \
-             verifies or rebuilds the store's placed files on its own)"
+            "cloning {file}, the store's whole file of an output: {why}: it is not there (removed outside the daemon). The place is not made another way; the store has forgotten the file, and the next build writes it again from the value's bytes: run the build again"
         );
         self.placed_problem(what.clone()); // clone: the problem kept and the place's error
         self.refuse_waiting(vec![waiter], &what);
@@ -4773,6 +4837,8 @@ impl Store {
         // Not there to be cloned from, so not a file whose write-back anything waits for.
         self.shared.settled(&content);
         let file = self.placed_file(&content);
+        // Whatever name it had: the next one made begins under its writing name again.
+        self.staged_files.remove(&content);
         self.files.insert(content, PlacedFile::Removing(waiting));
         let tag = self.tags.ask(Op::Unplace { content });
         effects.push(Effect::Remove { file, tag });
@@ -4822,13 +4888,22 @@ impl Store {
                     let written = std::mem::take(&mut written);
                     self.publish(asked, to, copy, Durable::No, written, effects);
                 }
+                // Written under its writing name: it takes the content's name by a rename
+                // only once it is sealed and written back, so no crash leaves other bytes
+                // under that name. (The planted bug writes it in place.)
+                #[cfg(test)]
+                let in_place = self.plant == PlacePlant::WritesInPlace;
+                #[cfg(not(test))]
+                let in_place = false;
+                if !in_place {
+                    self.staged_files.insert(content);
+                }
                 let file = self.placed_file(&content);
                 self.shared.unflushed(content);
                 self.files.insert(content, PlacedFile::Writing(waiting));
                 let tag = self.tags.ask(Op::MakeFile { content, written });
-                // Not synced: the file is derived data, renamed to its name whole, and one
-                // an earlier run left is hashed against its name before it is cloned from.
-                // Its write-back is begun once it is sealed ([`Store::flush_file`]).
+                // Not synced: its write-back is begun once it is sealed
+                // ([`Store::flush_file`]), and its rename follows that.
                 effects.push(publish::write(file, bytes, Durable::Started, tag));
             }
             Err(why) => self.refuse_waiting(waiting, &why),
@@ -5252,7 +5327,8 @@ impl Store {
             | Op::MakeFile { content, .. }
             | Op::Seal { content }
             | Op::WriteBack { content }
-            | Op::Unplace { content } => content,
+            | Op::Unplace { content }
+            | Op::NameFile { content } => content,
             _ => unreachable!("not a step of a placed file"),
         };
         let Some(state) = self.files.remove(&content) else { return };
@@ -5285,14 +5361,15 @@ impl Store {
             }
             (Op::Probe { .. }, PlacedFile::Probing(waiting), Done::Stat(Some(meta))) => {
                 // A write this run saw end is whole, so this is what a crash left of one (it
-                // was not synced) or a file blaze did not write. It goes before it is written
-                // again: a rename over a read-only file is refused on Windows.
-                // alloc: a problem reported
-                self.placed_problem(format!(
-                    "{file} is {} bytes, not the {} of the value it is named for, and is written again",
+                // was not synced) or a file blaze did not write. The places that would clone
+                // it are refused, naming it; nothing writes it again on its own.
+                // alloc: a problem reported, and the places' error
+                let why = format!(
+                    "{file}, the store's whole file of an output, is {} bytes, not the {} of the value it is named for (what a crash left of it, or a file changed outside the daemon): {VERIFY_PLACED}",
                     meta.len, waiting[0].raw
-                ));
-                self.remove_file(content, waiting, effects);
+                );
+                self.placed_problem(why.clone()); // clone: the problem kept and the places' error
+                self.refuse_waiting(waiting, &why);
             }
             (Op::Probe { .. }, PlacedFile::Probing(waiting), Done::Stat(None)) => {
                 self.make_file(content, waiting, effects);
@@ -5305,11 +5382,12 @@ impl Store {
                 if found == content {
                     self.seal(content, waiting, 0, effects);
                 } else {
-                    // alloc: a problem reported
-                    self.placed_problem(format!(
-                        "{file} holds bytes of {found:x}, not of its name, and is written again"
-                    ));
-                    self.remove_file(content, waiting, effects);
+                    // alloc: a problem reported, and the places' error
+                    let why = format!(
+                        "{file}, the store's whole file of an output, holds bytes of {found:x}, not of its name (what a crash left of it, or a file changed outside the daemon): {VERIFY_PLACED}"
+                    );
+                    self.placed_problem(why.clone()); // clone: the problem kept and the places' error
+                    self.refuse_waiting(waiting, &why);
                 }
             }
             (Op::MakeFile { written, .. }, PlacedFile::Writing(waiting), Done::Written) => {
@@ -5328,6 +5406,16 @@ impl Store {
                 // The witness: only this completion, of this file's write-back, makes the
                 // file one a clone is asked of ([`publish::Written::flushed`]).
                 match file.flushed(&done) {
+                    // Clean, and still under its writing name: the rename that gives it
+                    // its own, after which it may be cloned.
+                    Ok(_) if self.staged_files.contains(&content) => {
+                        let from = self.placed_file(&content);
+                        self.staged_files.remove(&content);
+                        let to = self.placed_file(&content);
+                        let tag = self.tags.ask(Op::NameFile { content });
+                        effects.push(publish::rename(from, to, Durable::No, tag));
+                        self.files.insert(content, PlacedFile::Naming { waiting, written, doomed });
+                    }
                     // The file is clean, and may be cloned.
                     Ok(file) => self.there(content, &file, waiting, written, doomed, effects),
                     Err(file) => {
@@ -5392,6 +5480,25 @@ impl Store {
                 // alloc: an error, once per place that fails
                 let why = format!("{file}: {}", describe(&done));
                 self.refuse_waiting(waiting, &why);
+            }
+            (Op::NameFile { .. }, PlacedFile::Naming { waiting, written, doomed }, Done::Renamed) => {
+                // Written back before the rename, and nothing written to it since.
+                let file = Flushed::synced(file);
+                self.there(content, &file, waiting, written, doomed, effects);
+            }
+            (Op::NameFile { .. }, PlacedFile::Naming { waiting, .. }, done) => {
+                self.shared.settled(&content);
+                // alloc: an error, once per place that fails
+                let why = format!(
+                    "renaming the store's whole file of an output to {file}: {}",
+                    describe(&done)
+                );
+                self.refuse_waiting(waiting, &why);
+                // What is left under the writing name goes; the next place writes it again.
+                let left = self.tiers[0].file(&format!("placed/{content:x}{WRITING_SUFFIX}"));
+                // clone: the op and the effect each own the name; once per rename that fails
+                let tag = self.tags.ask(Op::Discard { file: left.clone() });
+                effects.push(Effect::Remove { file: left, tag });
             }
             (_, state, _) => _ = self.files.insert(content, state),
         }
@@ -5752,7 +5859,8 @@ impl Store {
             | Op::MakeFile { .. }
             | Op::Seal { .. }
             | Op::WriteBack { .. }
-            | Op::Unplace { .. }) => {
+            | Op::Unplace { .. }
+            | Op::NameFile { .. }) => {
                 self.file_step(op, done, effects);
             }
             op @ (Op::PatchClear { .. }

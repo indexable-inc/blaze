@@ -9,6 +9,12 @@
 //! The daemon's store is collected by the daemon alone, which holds it: with none running,
 //! the build dirs are collected here and the store is said to be left.
 //!
+//! `blaze store verify [--dry-run]` checks the whole files the store keeps to place outputs by
+//! cloning (`<root>/v2/store/placed/<content>`) against their names and removes the ones that
+//! are wrong: what the store names when it refuses a place over such a file
+//! (`blaze_cas::VERIFY_PLACED`). It runs with no daemon on the home (the daemon holds those
+//! files in memory as it found them); the next build writes what was removed again.
+//!
 //! The CLI knows no daemon's live heads, so it keeps more than the daemon would: every build
 //! dir whose checkout still exists counts as a head's. Everything else holds as in the daemon:
 //! a dir anyone uses holds its lease, and the collector renames a dir only once it takes that
@@ -25,7 +31,7 @@ use blaze_gc::{Collector, Config, Inventory};
 
 use super::say;
 
-const USAGE_TEXT: &str = "blaze gc [--dry-run | --kept] | blaze gc --last | blaze gc --budget <size> (64G, 512M) | blaze clean --unkept";
+const USAGE_TEXT: &str = "blaze gc [--dry-run | --kept] | blaze gc --last | blaze gc --budget <size> (64G, 512M) | blaze clean --unkept | blaze store verify [--dry-run]";
 
 /// `blaze cache`, with the words after it.
 pub fn main(words: &[OsString], color: bool) -> i32 {
@@ -40,6 +46,8 @@ pub fn main(words: &[OsString], color: bool) -> i32 {
         Some(["gc", "--unkept"]) => collect(false, true),
         Some(["gc", "--unkept", "--dry-run" | "-n"]) => collect(true, true),
         Some(["gc", "--last"]) => last_runs(),
+        Some(["store", "verify"]) => verify(false),
+        Some(["store", "verify", "--dry-run" | "-n"]) => verify(true),
         Some(["gc", "--budget", size]) => budget(size).and_then(|mut said| {
             said.push_str(&collect(true, false)?);
             Ok(said)
@@ -121,6 +129,107 @@ fn budget(size: &str) -> Result<String, String> {
         levels.share_percent,
         path.display(),
     ))
+}
+
+/// What a whole file under `placed/` is, by its name and its bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PlacedIs {
+    /// Named for its content, and its bytes hash to the name.
+    Right,
+    /// Named for a content its bytes do not hash to, or no regular file under such a name (a
+    /// symbolic link, a directory): what a crash left of a write that was never synced, or
+    /// something changed outside the daemon. Removed.
+    Wrong,
+    /// A derived value's (`<key>.derived`): the store never takes one from an earlier run and
+    /// makes it again itself as it opens. Left.
+    Derived,
+    /// Any other name (a staged file of a place in flight when a daemon died): the store's own
+    /// open sweeps those. Left.
+    Other,
+}
+
+/// What `name` under `placed/` is, read through `path`.
+fn placed_is(path: &Path, name: &str) -> Result<PlacedIs, String> {
+    if name.ends_with(".derived") {
+        return Ok(PlacedIs::Derived);
+    }
+    if name.len() != 64 || !name.bytes().all(|it| it.is_ascii_hexdigit()) {
+        return Ok(PlacedIs::Other);
+    }
+    let meta = std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if !meta.is_file() {
+        return Ok(PlacedIs::Wrong);
+    }
+    let bytes = std::fs::read(path).map_err(|error| format!("reading {}: {error}", path.display()))?;
+    Ok(match format!("{:x}", blaze_cas::content_of(&bytes)) == name {
+        true => PlacedIs::Right,
+        false => PlacedIs::Wrong,
+    })
+}
+
+/// The whole files under `placed` checked against their names; the wrong ones removed unless
+/// `dry_run`. What it found, as it prints.
+fn verify_placed(placed: &Path, dry_run: bool) -> Result<String, String> {
+    let entries = match std::fs::read_dir(placed) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(format!("{} is not there: the store keeps no placed file\n", placed.display()));
+        }
+        Err(error) => return Err(format!("{}: {error}", placed.display())),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("{}: {error}", placed.display()))?;
+        match entry.file_name().into_string() {
+            Ok(name) => names.push(name),
+            Err(name) => return Err(format!("{}: a name that is not UTF-8: {name:?}", placed.display())),
+        }
+    }
+    names.sort_unstable();
+    let mut out = String::new();
+    let (mut right, mut wrong, mut left) = (0u64, 0u64, 0u64);
+    for name in names {
+        let path = placed.join(&name);
+        match placed_is(&path, &name)? {
+            PlacedIs::Right => right += 1,
+            PlacedIs::Derived | PlacedIs::Other => left += 1,
+            PlacedIs::Wrong => {
+                wrong += 1;
+                match dry_run {
+                    true => out.push_str(&format!("{} is not what its name says: it would be removed\n", path.display())),
+                    false => {
+                        let removed = match std::fs::symlink_metadata(&path) {
+                            Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&path),
+                            _ => std::fs::remove_file(&path),
+                        };
+                        removed.map_err(|error| format!("removing {}: {error}", path.display()))?;
+                        out.push_str(&format!("{} was not what its name says: removed\n", path.display()));
+                    }
+                }
+            }
+        }
+    }
+    out.push_str(&format!(
+        "{}: {right} placed files are what their names say, {wrong} were not and {}, {left} are the store's to make or sweep as it opens; the next build writes again what it needs\n",
+        placed.display(),
+        if dry_run { "would be removed" } else { "are removed" },
+    ));
+    Ok(out)
+}
+
+/// `blaze store verify`: [`verify_placed`] of this home's store, with no daemon on it.
+fn verify(dry_run: bool) -> Result<String, String> {
+    match super::daemon::connect(super::daemon::Start::Never) {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return Err(
+                "a daemon is running on this home and holds the store's placed files as it found them: `blaze stop`, then `blaze store verify`".to_owned(),
+            );
+        }
+        Err(error) => return Err(format!("{error:#}")),
+    }
+    let state = crate::serve::state().map_err(|error| format!("{error:#}"))?;
+    verify_placed(&state.join("store").join("placed"), dry_run)
 }
 
 /// What is said of the store when no daemon holds the home: only its daemon collects it.
@@ -224,4 +333,39 @@ fn last_runs() -> Result<String, String> {
         out.push_str(&format!("{report}\n"));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `blaze store verify`'s rule: a placed file whose bytes hash to its name stays; one
+    /// whose bytes do not, and a symbolic link under such a name, are removed (and only said
+    /// under `--dry-run`); a derived value's file and any other name are left.
+    #[test]
+    fn verify_removes_the_placed_files_that_are_not_what_their_names_say() {
+        let dir = std::env::temp_dir().join(format!("blaze-store-verify-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let name_of = |bytes: &[u8]| format!("{:x}", blaze_cas::content_of(bytes));
+        let (good, torn, linked) = (b"a whole output".to_vec(), b"another output".to_vec(), b"a third".to_vec());
+        std::fs::write(dir.join(name_of(&good)), &good).unwrap();
+        std::fs::write(dir.join(name_of(&torn)), &torn[..5]).unwrap();
+        std::fs::write(dir.join("elsewhere"), &linked).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join(name_of(&linked))).unwrap();
+        std::fs::write(dir.join(format!("{}.derived", name_of(b"k"))), b"made again").unwrap();
+        let said = verify_placed(&dir, true).unwrap();
+        assert!(said.contains("would be removed"), "{said}");
+        assert!(dir.join(name_of(&torn)).exists(), "a dry run removes nothing");
+        let said = verify_placed(&dir, false).unwrap();
+        assert!(dir.join(name_of(&good)).exists(), "{said}");
+        assert!(!dir.join(name_of(&torn)).exists(), "{said}");
+        assert!(std::fs::symlink_metadata(dir.join(name_of(&linked))).is_err(), "{said}");
+        assert_eq!(std::fs::read(dir.join("elsewhere")).unwrap(), linked, "what a link named is untouched");
+        assert!(dir.join(format!("{}.derived", name_of(b"k"))).exists(), "{said}");
+        assert!(said.contains("1 placed files are what their names say"), "{said}");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(verify_placed(&dir, false).unwrap().contains("is not there"));
+    }
 }

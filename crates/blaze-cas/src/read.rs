@@ -1237,6 +1237,67 @@ impl<'a> Look<'a> {
         self.read(found?, key).map(Some)
     }
 
+    /// The `len` bytes at `at` of the value of `key`, read in place: for a reader of a few
+    /// bytes of a large value (`hir_def`'s def map pages: one name's entry of a crate's
+    /// record), which must not load the rest. `None` when the store has no value of `key`.
+    ///
+    /// A raw record of a pack that a [`Look::get`] verified against its content hash once
+    /// (its opener's) is read through the pool a part at a time: its header, to check the
+    /// record is of `key`, and the pages the part is on. The pool checks every block it
+    /// reads against its file's checks before a page is loaded (`pool::loads`), so the part
+    /// is the bytes that were hashed. Any other value (not verified yet, compressed, kept in
+    /// chunks or as a file of its own, still in its writer's segment) is read whole as
+    /// [`Look::get`] reads it, and the part is of that. A part past the value's end is an
+    /// error naming the key: never bytes of the record after it.
+    pub(crate) fn part(self, key: &Key, at: u64, len: u64) -> Result<Option<&'a [u8]>, Corrupt> {
+        let Some(found) = self.find(key) else { return Ok(None) };
+        let found = found?;
+        let corrupt = |what: String| Corrupt { key: *key, pack: self.file_of(found), what };
+        let end = at.checked_add(len);
+        if let Place::Pack(loc) = found.place
+            && loc.form == Form::Raw
+            && found.at.verified()
+        {
+            if end.is_none_or(|end| end > loc.raw) {
+                // alloc: the error's message
+                return Err(corrupt(format!("bytes {at}+{len} were asked of its {} bytes", loc.raw)));
+            }
+            let read = |from: u64, len: u64| {
+                self.pack_bytes(found, loc, from, len).map_err(|why| {
+                    // alloc: the error's message
+                    corrupt(match why {
+                        None => format!("its record at {} runs past the pack", loc.offset),
+                        Some(why) => {
+                            format!("its record at {} could not be read: {why}", loc.offset)
+                        }
+                    })
+                })
+            };
+            let header = RecordHeader::decode(read(loc.offset, RECORD_HEADER)?)
+                // alloc: the error's message
+                .map_err(|what| corrupt(format!("the record at {}: {what}", loc.offset)))?;
+            if header.key != *key {
+                // alloc: the error's message
+                return Err(corrupt(format!("the record at {} is of another key", loc.offset)));
+            }
+            let bytes = read(loc.offset + RECORD_HEADER + at, len)?;
+            self.was_read(found);
+            return Ok(Some(bytes));
+        }
+        let entry = self.read(found, key)?;
+        let part = end
+            .and_then(|end| Some((usize::try_from(at).ok()?, usize::try_from(end).ok()?)))
+            .and_then(|(at, end)| entry.bytes.get(at..end));
+        match part {
+            Some(part) => Ok(Some(part)),
+            // alloc: the error's message
+            None => Err(corrupt(format!(
+                "bytes {at}+{len} were asked of its {} bytes",
+                entry.bytes.len()
+            ))),
+        }
+    }
+
     /// [`Look::get`] and the directory the value is in: its own tier's, or a tier behind it.
     pub(crate) fn get_from(self, key: &Key) -> Result<Option<(Origin, Entry<'a>)>, Corrupt> {
         let Some(found) = self.find(key) else { return Ok(None) };

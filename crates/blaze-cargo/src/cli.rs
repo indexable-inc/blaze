@@ -320,6 +320,7 @@ const COMMANDS: &[&str] = &[
     "clean",
     "cache",
     "gc",
+    "store",
     "fmt",
     "new",
     "init",
