@@ -1,0 +1,19 @@
+{
+ "id": "onefront-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane onefront-1112",
+ "where": "crates/base-db/src/maintain.rs (`Written::crates`, `Note::Crates`)",
+ "what": "A change of the crate graph was one bool: adding one crate (a `cfg(test)` twin) was indistinguishable from changing every crate, so name resolution ran every crate from empty and the impls maintainer swept every crate.",
+ "cost": "the reason a switch of request cost a whole lowering even where the crates were kept; an hour to find every reader of the bool before a field could be added",
+ "cause": "the note was made when a database held one plan, so a graph change was always the whole graph",
+ "whys": [
+  "a maintainer reads `written.crates` to decide whether its state stands",
+  "the write methods note `Crates` whenever the graph's content ID moves",
+  "the content ID is of the whole list, so it cannot say which crate"
+ ],
+ "class": "a delta said as a flag",
+ "prevention": "`Written::crates_added` names crates added; `Crate::create_added` and `base_db::add_crates` are the only way blaze-lower adds a crate; base-db's test `a_crate_added_beside_the_graph_names_itself_and_not_the_graph` holds the note",
+ "workaround": "none",
+ "fix": "written in this lane (not yet built)",
+ "state": "open until the round's build and tests pass"
+}

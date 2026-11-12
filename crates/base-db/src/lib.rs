@@ -755,6 +755,44 @@ pub fn set_all_crates_with_durability(
     })
 }
 
+/// Puts `added`, crates just made with [`Crate::create_added`], into the crate graph after the
+/// crates there, in the order given (each after the crates it depends on). The crates there
+/// keep their places and nothing of them is written: the write is the list and its content ID,
+/// and what it notes is what the creates noted, the crates added
+/// ([`Written::crates_added`]), never a change of the whole graph. Nothing is written for an
+/// empty `added`.
+///
+/// # Panics
+///
+/// When a crate of `added` is in the graph already: it was not made by this write, and its
+/// maintained state would be taken for a first run's.
+pub fn add_crates(db: &mut Db, added: &[Crate], durability: Durability) {
+    if added.is_empty() {
+        return;
+    }
+    let was = all_crates(db);
+    if let Some(twice) = added.iter().find(|it| was.contains(it)) {
+        panic!(
+            "`base_db::add_crates`: the crate {} is in the crate graph already",
+            twice.named(&*db)
+        );
+    }
+    // alloc: the crate graph's list, once per plan that adds crates.
+    let crates: std::sync::Arc<[Crate]> = was.iter().chain(added).copied().collect();
+    db.write("base_db::add_crates", |db| {
+        let content = InputId(crate_graph_content(&*db, &crates));
+        match AllCrates::try_get(&*db) {
+            Some(all) => {
+                all.set_crates(db).with_durability(durability).to(crates);
+                all.set_content(db).with_durability(durability).to(content);
+            }
+            None => {
+                _ = AllCrates::new(db, durability, crates, content);
+            }
+        }
+    })
+}
+
 /// Returns the crates in topological order.
 ///
 /// **Warning**: do not use this query in `hir-*` crates! It kills incrementality across crate metadata modifications.

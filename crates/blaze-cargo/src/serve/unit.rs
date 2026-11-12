@@ -382,12 +382,53 @@ impl Steps for Real {
                 // A front end kept and moved to the view keeps what it was served, until a serve of
                 // this job finds a crate's key moved: moving reads again only the view's files, and
                 // the runs and proc macros applied again are served after as in a fresh job.
+                //
+                // A request of another plan (`test` after `build`, `--release`, another feature
+                // set) is lowered into the same front end: its units are a view over the crate
+                // graph the front end keeps (`Lowered::relower`), each crate found or made
+                // beside the others, so the switch costs the crates the plan adds and a plan
+                // seen before costs nothing. Until 2026-11-12 the plan's units were the front
+                // end's identity (`unkept`), and every switch lowered the workspace again, the
+                // standard library included (hello-world: 4.5 s a switch, 820,026 queries).
                 let (mut lowered, session, seeded) = match kept {
-                    Some(KeptLowered { session, mut lowered, seeds, .. }) => {
-                        match lowered.refresh(lower(), |db| seed(db, &seeds)).map_err(failed)? {
-                            true => (lowered.into_inner(), Some(session), seeds),
-                            false => {
-                                let why = "the view moves the workspace's root or what its root manifest sets, which every crate is made with, or whether a crate of the macro host links proc_macro, which its cfg is made with";
+                    Some(KeptLowered { session, mut lowered, seeds, units: kept_units, .. }) => {
+                        let same_plan =
+                            Arc::ptr_eq(&kept_units, &input.units) || kept_units == input.units;
+                        // Why the front end can't take this request, when it can't.
+                        let moved: Option<String> =
+                            match lowered.refresh(lower(), |db| seed(db, &seeds)).map_err(failed)? {
+                                // alloc: a reason, once per front end let go
+                                false => Some("the view moves the workspace's root or what its root manifest sets, which every crate is made with, or whether a crate of the macro host links proc_macro, which its cfg is made with".to_owned()),
+                                true if same_plan => None,
+                                true => {
+                                    let span = tracing::info_span!(
+                                        target: "blaze",
+                                        "plan lowered into the kept front end",
+                                        checkout = input.config.invocation.root.as_str(),
+                                        crates_made = tracing::field::Empty,
+                                        roots_made = tracing::field::Empty,
+                                        dirs_read = tracing::field::Empty,
+                                    );
+                                    // clone: the span's handle, so what the plan made is written in it
+                                    let _span = span.clone().entered();
+                                    match lowered.relower(lower()).map_err(failed)? {
+                                        blaze_lower::Relowered::Into(placed) => {
+                                            span.record("crates_made", placed.crates_made as u64);
+                                            span.record("roots_made", placed.roots_made as u64);
+                                            span.record("dirs_read", placed.dirs_read as u64);
+                                            None
+                                        }
+                                        // alloc: a reason, once per front end let go
+                                        blaze_lower::Relowered::Anew(why) => Some(format!(
+                                            "the request's plan can't be lowered beside the plans it holds: {why}"
+                                        )),
+                                    }
+                                }
+                            };
+                        match moved {
+                            None => (lowered.into_inner(), Some(session), seeds),
+                            Some(why) => {
+                                let why = why.as_str();
                                 let checkout = input.config.invocation.root.as_str();
                                 {
                                     let variable = "";
@@ -516,15 +557,25 @@ impl Steps for Real {
 /// its inputs that moved, with the variable when that part is one the front end read of the
 /// environment ([`env_moved`]); `None` when it does. `retractions` is the epoch read now
 /// ([`proc_macro_api::kept::Keeping::retractions_now`]).
+///
+/// The request's plan is no part of it: a plan is a view over the front end's crate graph,
+/// lowered into it ([`blaze_lower::Lowered::relower`]). The control of that is
+/// [`PLAN_IS_IDENTITY`].
 fn unkept(
     kept: &KeptLowered,
     input: &JobInput,
     retractions: u64,
 ) -> Option<(String, Option<EnvMoved>)> {
-    if !Arc::ptr_eq(&kept.units, &input.units) && kept.units != input.units {
+    if plan_is_identity(input)
+        && !Arc::ptr_eq(&kept.units, &input.units)
+        && kept.units != input.units
+    {
         // alloc: a reason, once per front end let go
         return Some((
-            format!("the plan's units moved ({})", units_differ(&kept.units, &input.units)),
+            format!(
+                "the plan's units moved ({}), and `{PLAN_IS_IDENTITY}=1` makes the plan the front end's identity",
+                units_differ(&kept.units, &input.units)
+            ),
             None,
         ));
     }
@@ -553,6 +604,19 @@ fn unkept(
         ));
     }
     None
+}
+
+/// The variable of a request that plants the bug the kept front end's tests are held to
+/// (test-the-cause): set to `1`, the plan's units are the front end's identity again, as they
+/// were until 2026-11-12, so a request of another plan lets the front end go and lowers the
+/// workspace anew. The revision case `a_switch_of_request_with_the_plan_as_identity` sets it
+/// and must then miss the bounds `switches_of_request_are_no_ops` holds. Never set in use: it
+/// is read of the request alone, and changes what is kept, never what is built.
+const PLAN_IS_IDENTITY: &str = "BLAZE_FRONT_END_PER_PLAN";
+
+/// Whether `input`'s request sets [`PLAN_IS_IDENTITY`].
+fn plan_is_identity(input: &JobInput) -> bool {
+    blaze_units::query::env_var(&input.config.invocation.env, PLAN_IS_IDENTITY) == Some("1")
 }
 
 /// The first variable a kept front end read whose value `now`, a request's environment, has

@@ -1482,9 +1482,43 @@ struct Viewed {
 /// view and its units, the plan neither asked nor verified again.
 struct LastPlan {
     key: ContentId,
+    /// The request's shape: its config ([`config_id`]), whatever view it was planned on. A
+    /// checkout keeps one plan a shape ([`keep_plan`]).
+    shape: ContentId,
     queries: ViewId,
     units: Arc<Units>,
     lock: Option<LockWrite>,
+}
+
+/// The most plans a checkout keeps ([`Roots::plans`]): the request shapes a person alternates
+/// between (`build`, `test`, `check`, `run`, each in two profiles). A count, not a footprint:
+/// a kept plan is its units, already shared with the job that planned them, and an open view
+/// of the planning database.
+const PLANS_KEPT: usize = 8;
+
+/// Keeps `plan` as its checkout's plan of its shape, the most recently used: the plan `kept`
+/// had of that shape goes, and past [`PLANS_KEPT`] the ones least recently used go. Returns
+/// those let go, whose views the caller retires. Never "the last one wins": `build`, `test`,
+/// `build` finds the first `build`'s plan again.
+fn keep_plan(kept: &mut Vec<LastPlan>, plan: LastPlan) -> Vec<LastPlan> {
+    let mut gone = Vec::new(); // alloc: none unless a plan is let go
+    if let Some(at) = kept.iter().position(|it| it.shape == plan.shape) {
+        gone.push(kept.remove(at));
+    }
+    kept.push(plan);
+    while kept.len() > PLANS_KEPT {
+        gone.push(kept.remove(0));
+    }
+    gone
+}
+
+/// The plan of `key` among `kept` made the most recently used ([`keep_plan`] lets go of the
+/// least), when there is one.
+fn use_plan(kept: &mut Vec<LastPlan>, key: ContentId) {
+    if let Some(at) = kept.iter().position(|it| it.key == key) {
+        let plan = kept.remove(at);
+        kept.push(plan);
+    }
 }
 
 /// Each unit's outputs as ids of [`Paths`]: unit `at`'s are `ids[starts[at]..starts[at + 1]]`.
@@ -1719,8 +1753,9 @@ impl<S: Steps> Paths<S> {
 /// The checkouts later builds are of again ([`lasting`]), interned once by root directory.
 struct Roots<S: Steps> {
     ids: HashMap<Box<str>, u32, Global>,
-    /// The last plan of each.
-    plans: Vec<Option<LastPlan>>,
+    /// The plans of each, one a request shape ([`keep_plan`]), the most recently used last:
+    /// a request of a shape asked before finds its plan, whatever was asked between.
+    plans: Vec<Vec<LastPlan>>,
     /// The front end of each one's last build, for its next job to lower into
     /// ([`Steps::lower`]).
     fronts: Vec<Option<S::KeptFront>>,
@@ -1774,7 +1809,7 @@ impl<S: Steps> Roots<S> {
         }
         let id = u32::try_from(self.plans.len()).expect("under 2^32 checkouts");
         self.ids.insert(root_dir.into(), id);
-        self.plans.push(None);
+        self.plans.push(Vec::new()); // alloc: none
         self.fronts.push(None);
         self.storing.push(0);
         self.outputs.push(None);
@@ -4061,9 +4096,12 @@ impl<S: Steps> Jobs<S> {
         }
         // clone: a path, once a view
         job.checkout = root.map(|at| (at, root_dir.clone()));
+        if let Some(at) = root {
+            use_plan(&mut self.roots.plans[at as usize], key);
+        }
         if reuses_plans(&job.work)
             && let Some(at) = root
-            && let Some(Some(last)) = self.roots.plans.get(at as usize)
+            && let Some(last) = self.roots.plans[at as usize].last()
             && last.key == key
         {
             job.borrowed.push(last.queries);
@@ -4268,10 +4306,9 @@ impl<S: Steps> Jobs<S> {
     fn record_answer(&mut self, id: JobId, root: u32, key: ContentId, inputs: Inputs) {
         self.recordings.retain(|it| it.job != id);
         let (generation, looks) = (blaze_vfs::outside::generation(), blaze_vfs::outside::looks());
-        let found = match self.roots.plans.get(root as usize) {
-            Some(Some(last)) if last.key == key && last.lock.is_none() => {
-                recorded_dirs(&last.units, &self.setup.std)
-            }
+        let planned = self.roots.plans.get(root as usize).and_then(|kept| kept.iter().find(|it| it.key == key));
+        let found = match planned {
+            Some(last) if last.lock.is_none() => recorded_dirs(&last.units, &self.setup.std),
             _ => Err(Unkept::Planned),
         };
         match found {
@@ -5341,7 +5378,13 @@ impl<S: Steps> Jobs<S> {
                 // The same units are the same `Arc`: compared here, once a plan, in a span
                 // that says how it went.
                 let same = prep.root.and_then(|root| {
-                    let last = self.roots.plans[root as usize].as_ref()?;
+                    // Any plan the checkout keeps, the most recently used first: a request
+                    // of a shape asked before (`build` after `test`) gets the units it had,
+                    // and with them what is kept by their identity.
+                    let kept = &self.roots.plans[root as usize];
+                    if kept.is_empty() {
+                        return None;
+                    }
                     let _span = tracing::info_span!(
                         target: "blaze",
                         "loop: the plan compared with the checkout's last",
@@ -5349,12 +5392,13 @@ impl<S: Steps> Jobs<S> {
                         same = tracing::field::Empty,
                     )
                     .entered();
+                    let found = || kept.iter().rev().find(|last| *last.units == units);
                     #[cfg(test)]
-                    let same = !PLANT_PLAN_ANEW.get() && *last.units == units;
+                    let same = if PLANT_PLAN_ANEW.get() { None } else { found() };
                     #[cfg(not(test))]
-                    let same = *last.units == units;
-                    _span.record("same", same);
-                    same.then(|| Arc::clone(&last.units)) // clone: a refcount, once per plan
+                    let same = found();
+                    _span.record("same", same.is_some());
+                    same.map(|last| Arc::clone(&last.units)) // clone: a refcount, once per plan
                 });
                 // alloc: once per plan that differs from the last, shared by the job's tasks
                 let units = same.unwrap_or_else(|| Arc::new(units));
@@ -5368,14 +5412,18 @@ impl<S: Steps> Jobs<S> {
                     // clone: a refcount and the lock's text, once per plan
                     let last = LastPlan {
                         key: prep.key,
+                        shape: config_id(&prep.config.encode()),
                         queries: prep.queries,
                         units: units.clone(),
                         lock: lock.clone(),
                     };
-                    if let Some(old) = self.roots.plans[root as usize].replace(last)
-                        && old.queries != prep.queries
-                    {
-                        self.retired.push(old.queries);
+                    // The plan this one replaces is its own shape's (the same request on an
+                    // older view), or the least recently used past the bound: never the plan
+                    // of another request, which that request finds again.
+                    for old in keep_plan(&mut self.roots.plans[root as usize], last) {
+                        if old.queries != prep.queries {
+                            self.retired.push(old.queries);
+                        }
                     }
                 }
                 self.ready(w, id, prep, units, lock);

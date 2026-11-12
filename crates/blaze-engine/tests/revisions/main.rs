@@ -67,6 +67,7 @@ real! {
     a_save_is_built_before_it_is_asked_for
     a_second_project_reuses_the_standard_library
     a_signature_change_remakes_the_callers
+    a_switch_of_request_with_the_plan_as_identity
     a_terminal_of_another_width_remakes_nothing
     a_touch_without_a_change
     an_added_and_a_removed_function
@@ -75,6 +76,7 @@ real! {
     an_impl_overriding_a_provided_method_changes_its_vtable
     an_unrelated_environment_variable
     build_then_run_then_build_are_no_ops
+    switches_of_request_are_no_ops
     the_first_edit_after_a_cold_build_with_a_build_script_dependency
     the_first_test_after_a_run
     the_same_sources_in_another_directory_under_another_home

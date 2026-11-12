@@ -915,7 +915,41 @@ impl Crate {
         env: Env,
         durability: Durability,
     ) -> Crate {
-        db.write("Crate::create", |db| {
+        Crate::create_noting(db, "Crate::create", data, extra, workspace, cfg, env, durability, false)
+    }
+
+    /// [`Crate::create`] for a crate that is put into the graph beside the crates there
+    /// ([`crate::add_crates`]), noted as that crate added ([`crate::Written::crates_added`]) and
+    /// not as a change of the whole graph: no crate there depends on it or was made from it, so
+    /// what the maintainers hold of every other crate stands. What a plan lowered into a front
+    /// end that holds other plans' crates makes its own with.
+    pub fn create_added(
+        db: &mut Db,
+        data: BuiltCrateData,
+        extra: ExtraCrateData,
+        workspace: Arc<CrateWorkspaceData>,
+        cfg: CfgOptions,
+        env: Env,
+        durability: Durability,
+    ) -> Crate {
+        Crate::create_noting(db, "Crate::create_added", data, extra, workspace, cfg, env, durability, true)
+    }
+
+    /// [`Crate::create`] as the write method `write`, noted as one crate added (`added`) or as
+    /// a change of the graph.
+    #[allow(clippy::too_many_arguments, reason = "a crate's fields, as `Crate::create` takes them")]
+    fn create_noting(
+        db: &mut Db,
+        write: &'static str,
+        data: BuiltCrateData,
+        extra: ExtraCrateData,
+        workspace: Arc<CrateWorkspaceData>,
+        cfg: CfgOptions,
+        env: Env,
+        durability: Durability,
+        added: bool,
+    ) -> Crate {
+        db.write(write, |db| {
             let root = root_path(&*db, data.root_file_id);
             let lints = LintOptions::default();
             let content =
@@ -923,8 +957,12 @@ impl Crate {
             let krate =
                 Crate::new(&*db, durability, data, extra, workspace, cfg, env, InputId(content));
             db.crates_map().lock().note(krate, root, true);
+            // Not in the graph yet, so this moves no graph content and notes nothing of it.
             db.set_crate_attr_files(krate, false, Some(durability));
-            db.note(Note::Crates);
+            db.note(match added {
+                true => Note::CrateAdded(krate),
+                false => Note::Crates,
+            });
             krate
         })
     }

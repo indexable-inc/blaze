@@ -693,30 +693,85 @@ crates are now found in tables of their own at `HIGH` (`LibraryResolutions`,
 `LibraryImplSlices`), and a library root's file set and its files' roots are `HIGH`. The
 numbers are in the lane's report with the binaries they are of.
 
-**One front end a checkout (F1, above): not built, and it comes before the rest of this
-section.** Measured by the owner on hello-world: `build`, then `test`, then `build` costs
-about 4.5 s at each switch (`lower workspace` 3.6 s, `maintain` 2.7 s, 820,026 queries run,
-5,087 inputs written), because `unkept` lets the front end go when the plan's units differ.
-The invariant to build to: *a request's units are a view over one crate graph a checkout; a
-switch of goal writes no input of a crate both plans hold, and runs a number of queries
-bounded by the crates the new plan adds.* What `blaze_lower::lower_writes` makes a plan and
-has to find-or-make in the kept `Lowered` instead:
+**One front end a checkout (F1, above): written 2026-11-12 by lane onefront-1112, not yet
+built or run (the lane writes only; the round runner's results decide).** Measured by the owner
+on hello-world before it: `build`, then `test`, then `build` cost about 4.5 s at each switch
+(`lower workspace` 3.6 s, `maintain` 2.7 s, 820,026 queries run, 5,087 inputs written), because
+`unkept` let the front end go when the plan's units differed.
 
-| Made per plan now | Kept across plans by |
+The invariant: *a request's units are a view over one crate graph a checkout; a source root, a
+directory read and a crate are each made once a front end, found again by what they are by
+every plan that names them, and never unmade because another plan arrived; so a plan lowered
+before writes no input, and a new plan writes the crates it adds and their files alone.*
+
+How it is held:
+
+- `blaze_lower::Lowered::relower` lowers another plan into the kept front end: `lower_writes`
+  finds or makes each thing in `Graph`, which the `Lowered` keeps (table below), and gives a
+  new `Crates` (the plan's view). `Relowered::Into(Placed)` says what it made; nothing, for a
+  plan seen before. `serve/unit.rs` calls it when the request's units are not the kept ones;
+  `unkept` no longer compares units.
+- A crate made is noted as that crate added (`base_db::Crate::create_added`,
+  `base_db::add_crates`, `Written::crates_added`), not as a change of the whole graph, so name
+  resolution runs the added crate and no crate that was there (`delta::unreached`), and a file
+  set that changed (the twin's alias in its package's root, a new package's root) reaches a
+  library crate only when it is that crate's own root (`delta::files_reach`).
+- The daemon keeps a checkout's plans by request shape (`Roots::plans`, `keep_plan`, at most
+  `PLANS_KEPT`, the least recently used let go), so `build`, `test`, `build` finds the first
+  plan and its `Arc<Units>` again.
+
+What a crate instance shares with its sibling (the plain crate and its `cfg(test)` twin, a
+crate under two feature sets or two profiles), read from the code:
+
+| Shared | Why |
 |---|---|
-| source root ids, `0..sets` in the plan's order of package sets, and `other` | the load's directory (std's root, each package's) |
-| `LibraryRoots`, `LocalRoots` (`::new`, a second call panics) | set when a root is added |
-| `made`: a `Crate` a distinct (root file, data, cfg, env, runs, spelling) | the same tuple, with runs by run class unit id, not unit index; `Crate::create` only on a miss |
-| `all_crates` (set to the plan's) | the union; a plan's own list in `Lowered` (`Crates::units`), which every `job.crates.krate(unit)` already goes through |
-| `Lowered::{applied, class_runs, identities, narrowed, appended}` by unit index | by run class unit id and by `Crate` |
-| `ProcMacros::give(NotYetBuilt)` for every proc-macro crate | only for a crate made by this plan |
-| const macros' crates, macro hosts, doctests' crates | find-or-make by their file and content |
+| the source root, its file set and every file's text | a package's files are read once into one root (`Graph::set_of` by package id) |
+| each file's parse (`EditionedFileId::parse`) | keyed by file and edition, not by crate: both instances of one edition read one tree |
+| the dependencies' crates, with everything resolved, inferred and compiled of them | a dependency made of the same data, cfg, env and spelling is one `Crate` (`Made`), so `core`, `std` and every dependency whose features and profile inputs are the same are found, not made |
+| the workspace data (target, toolchain, const-eval budget) | one `Arc` a triple (`Graph::workspaces`) |
+| a build script's run and its `OUT_DIR` files | a run is applied by run class to each crate that depends on it (`Lowered::applied`, by the class's `OUT_DIR`) |
+
+| Not shared | Why |
+|---|---|
+| the root file of a crate blaze appends a module to (a test's harness) | its own alias of the file on disk (`Db::alias`), so its text is the file's and the harness |
+| the item tree as a crate sees it, the def map, and everything keyed by `Crate` above them (scopes, signatures, inference, MIR) | cfg decides which items exist; these are per crate today, with no sharing of the items both instances keep. Sharing them by content (an item whose tokens and enclosing cfgs are the same) is the item store's by body key for inference and MIR; the def map is not shared |
+| the unit's code and its record | keyed by the unit |
+
+So the first `test` after a `build` still resolves and checks the twin crate whole (bounded by
+that crate, not by the workspace or std); every later switch is found.
+
+What is not built: the no-op lane's kept answer is still one a checkout and dropped by any
+walk (`Roots::answers`, with `walked` and `stills`); `Roots::sized` and `Roots::outputs` are
+still one a checkout by the units' pointer (they now hit again when a plan's `Arc<Units>` is
+found by `keep_plan`, but hold one plan); the build-ahead's `Checkout.last`. Three plans are
+lowered anew, by name, not into the front end (`Relowered::Anew`): one with const macros (their
+crates are made by `const_macros::make` into the plan, not the graph), one whose workspace
+root differs, and one that makes a directory of its own inside a directory read whole (a
+package nested in another that was read first).
+
+What `blaze_lower::lower_writes` made a plan, and where each is kept now:
+
+| Made per plan before | Kept across plans by |
+|---|---|
+| source root ids, `0..sets` in the plan's order of package sets, and `other` | `Graph::roots`, `set_of` (package id), `std_set`, `other`; a later plan's new packages take the next ids; a doctest example's root is taken from the same list |
+| `LibraryRoots`, `LocalRoots` | made by the first plan, set again only when a plan adds a root |
+| `made`: a `Crate` a distinct (root file, data, cfg, env, runs, spelling) | `Graph::made`, the same tuple; the runs are in `extra.build_script_runs` by the class's unit id, never a unit index; `Crate::create_added` only on a miss |
+| `all_crates` (set to the plan's) | the union: `base_db::add_crates` appends what a plan made; a plan's own list is `Crates::units` |
+| `Lowered::applied` by run class index | by `Crate` and the class's `OUT_DIR`; `class_runs` and `appended` are per job and cleared |
+| `ProcMacros::give(NotYetBuilt)` for every proc-macro crate | only for a crate this plan made |
+| `PrimaryCrates` (set to the plan's) | the plan's crates as the plan says; a crate the plan does not name stays as it was |
+| spellings and `name_sources` | `Graph::spelled`; made again only when a crate was made |
+| const macros' crates | not kept: such a plan is lowered anew (`Relowered::Anew`) |
+| doctests' crates, by unit index | by the unit of the current plan that has their crate (`OfUnit::unit`, remapped by `relower`) |
 | `KeptLowered::{units, session}` compared whole (`unkept`) | `units` no longer compared; the session's keys by `Crate` stay |
 
-and below it: a crate added to the graph (`Written::crates`) must give the name-resolution
-and impls maintainers a job for the added crates alone (`delta::unreached` returns false for
-every crate when `written.crates` is set), so the write names the crates it added. Its
-checks: a revision case `build, test, build, test, run, check` whose every switch after the
-first of each goal runs no query of a crate both plans hold (the engine's `Counts::executed`
-by crate) and writes no shared input, at two sizes of the dependency; the control makes the
-units part of the kept front end's identity again (`unkept`'s first test put back).
+Its checks: `blaze-lower`'s `a_plan_lowered_again_is_found_whole_and_writes_nothing` (A, B,
+A, B, A: the database's view, its maintainers' passes and each unit's crate stand) with its
+control `the_control_a_plan_that_is_the_front_ends_identity_makes_its_crates_again`;
+`base-db`'s `a_crate_added_beside_the_graph_names_itself_and_not_the_graph`; the revision case
+`switches_of_request_are_no_ops` (build, test, build, test, run, check, release build, dev
+build, and each again: after its first occurrence a request makes no unit and runs at most
+2,000 engine memos) with its control `a_switch_of_request_with_the_plan_as_identity`
+(`BLAZE_FRONT_END_PER_PLAN=1` puts `unkept`'s units test back; its miss is listed as known, so
+it fails when the bound stops resting on this); and `harness/v2/goal_switch.py`, the owner's
+sequence timed, each `test` held to having run.

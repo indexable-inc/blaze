@@ -1070,6 +1070,131 @@ fn a_native_unit_lowers_the_same_beside_a_wasm_one() {
     }
 }
 
+/// [`units`] without the library's test: the plan of a `build`, where [`units`] is a `test`'s.
+fn build_units() -> Units {
+    let mut units = units();
+    assert_eq!(units.graph.units.len(), LIB_TEST + 1, "the test's unit is the last");
+    units.graph.units.pop();
+    units.plans.pop();
+    units.graph.roots = vec![BIN];
+    units
+}
+
+/// `plan` lowered into `built`'s front end at the view it was lowered at, as the daemon does
+/// for a request of another plan: moved to the view (which did not move), then the plan.
+fn relowered(built: &mut Built, plan: &Units) -> crate::Relowered {
+    let tree = MemTree::default();
+    let root = view(&tree);
+    let config = config(root, library(&tree));
+    let lower = || Lower { units: plan, config: &config, files: &tree, root, host_cpu: None };
+    assert_eq!(built.lowered.refresh(lower(), |_| Ok(())), Ok(true), "the view did not move");
+    built.lowered.relower(lower()).unwrap()
+}
+
+/// What a plan lowered again must leave as it was: the database's view (no input written),
+/// its maintainers' passes, and the crate graph.
+fn written(built: &Built) -> (blaze_query::db::View, u64, ContentId) {
+    let db = built.lowered.db();
+    (db.nonce_and_revision().1, db.maintain_passes(), base_db::all_crates_content(db))
+}
+
+/// The invariant ([`crate::Graph`]): a request's units are a view over the one crate graph a
+/// front end keeps. Lowering plan A (`build`), then B (`test`: A's units and the library's
+/// `cfg(test)` twin), then A, then B: B makes one crate, the twin, beside A's, each of A's
+/// units keeps its crate, and from then on each plan is found whole: no crate made, no
+/// directory read, no input written (the database's view stands), no maintainer's pass, and
+/// each unit has the crate it had the first time. A build script's run applied under A is
+/// still applied when A is back.
+///
+/// Its control is [`the_control_a_plan_that_is_the_front_ends_identity_makes_its_crates_again`].
+#[test]
+fn a_plan_lowered_again_is_found_whole_and_writes_nothing() {
+    let (build, test) = (build_units(), units());
+    let mut built = lowered(&build).unwrap();
+    built.lowered.ran(RUN, &gen_ran(OUT_DIR, "made")).unwrap();
+    let of_build: Vec<Crate> =
+        [CORE, BUILD_SCRIPT, LIB, MACRO, BIN].iter().map(|&unit| krate(&built, unit)).collect();
+    let ran_cfg = |built: &Built| {
+        let db = built.lowered.db();
+        of_build[2].cfg_options(db).check_atom(&flag("made"))
+    };
+    assert!(ran_cfg(&built), "the run's cfg is the library's");
+    let crates_of_build = base_db::all_crates(built.lowered.db()).len();
+
+    // B: the twin is made beside the crates there, which stay.
+    let first_test = relowered(&mut built, &test);
+    assert_eq!(
+        first_test,
+        crate::Relowered::Into(crate::Placed { crates_made: 1, roots_made: 0, dirs_read: 0 }),
+        "the `cfg(test)` twin, of a package and a directory the front end has"
+    );
+    let twin = krate(&built, LIB_TEST);
+    assert!(!of_build.contains(&twin), "the twin is a crate of its own");
+    for (at, &unit) in [CORE, BUILD_SCRIPT, LIB, MACRO, BIN].iter().enumerate() {
+        assert_eq!(krate(&built, unit), of_build[at], "unit {unit} keeps its crate");
+    }
+    let all = base_db::all_crates(built.lowered.db());
+    assert_eq!(all.len(), crates_of_build + 1);
+    assert_eq!(all.last(), Some(&twin), "added after the crates that were there");
+    assert!(ran_cfg(&built), "the run applied to the library under `build` stays applied");
+
+    // A again, B again, A again: each found whole, nothing written.
+    let before = written(&built);
+    for (plan, name) in [(&build, "build"), (&test, "test"), (&build, "build")] {
+        let again = relowered(&mut built, plan);
+        assert_eq!(
+            again,
+            crate::Relowered::Into(crate::Placed::default()),
+            "`{name}` again makes nothing"
+        );
+        assert_eq!(written(&built), before, "`{name}` again writes no input and runs no pass");
+        for (at, &unit) in [CORE, BUILD_SCRIPT, LIB, MACRO, BIN].iter().enumerate() {
+            assert_eq!(krate(&built, unit), of_build[at], "`{name}` again: unit {unit}");
+        }
+        if name == "test" {
+            assert_eq!(krate(&built, LIB_TEST), twin, "the twin is found again");
+        } else {
+            assert_eq!(built.lowered.krate(LIB_TEST), None, "`build` has no such unit");
+        }
+        assert!(ran_cfg(&built), "`{name}` again: the run stays applied");
+    }
+}
+
+/// The control of [`a_plan_lowered_again_is_found_whole_and_writes_nothing`]: with the plan
+/// made the identity of what is lowered again (the planted bug: no crate of an earlier plan
+/// is found), `build` after `test` makes each of its crates anew and writes them, which that
+/// test's assertions refuse.
+#[test]
+fn the_control_a_plan_that_is_the_front_ends_identity_makes_its_crates_again() {
+    let (build, test) = (build_units(), units());
+    let mut built = lowered(&build).unwrap();
+    assert!(matches!(relowered(&mut built, &test), crate::Relowered::Into(_)));
+    let before = written(&built);
+    crate::PLAN_IS_IDENTITY.set(true);
+    let again = relowered(&mut built, &build);
+    crate::PLAN_IS_IDENTITY.set(false);
+    let crate::Relowered::Into(placed) = again else { panic!("not lowered into: {again:?}") };
+    assert!(placed.crates_made >= 5, "every crate of `build` is made again: {placed:?}");
+    assert_ne!(written(&built), before, "and written: the oracle of the test above sees it");
+}
+
+/// A plan the front end can't take beside what it holds is refused by name, never lowered
+/// half: here a plan whose build writes into a directory the front end read as source.
+#[test]
+fn a_plan_whose_build_writes_where_the_front_end_read_is_lowered_anew() {
+    let build = build_units();
+    let mut built = lowered(&build).unwrap();
+    let mut moved = build_units();
+    // `a/src` was read whole with package `a`; this plan's build directory is in it.
+    moved.build_dir = "/w/a/src".to_owned(); // alloc: test input
+    match relowered(&mut built, &moved) {
+        crate::Relowered::Anew(why) => {
+            assert!(why.contains("/w/a/src") && why.contains("/w/a"), "names both: {why}");
+        }
+        other => panic!("lowered into: {other:?}"),
+    }
+}
+
 #[test]
 fn lowering_twice_gives_equal_crates() {
     let units = units();

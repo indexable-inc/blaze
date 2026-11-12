@@ -208,8 +208,11 @@ pub(super) fn forgets_included() -> bool {
 /// The invariant: a crate with no job is one whose job would read no log again, wake no
 /// group, run no region and publish nothing ([`read_crate`] and [`finish_crate`] with an
 /// empty delta put its state back and hand [`LastWrite`] nothing). That holds when
-/// - the write changed no crate graph, cfg or env, no file set and no source root (any of
-///   those walks every crate's round-0 tree), and gave this crate no proc macros;
+/// - the write changed no crate graph, cfg or env (any of those walks every crate's round-0
+///   tree), did not add this crate to the graph ([`Written::crates_added`]: a crate added is
+///   run, and no crate that was there depends on it, so it reaches none of them), and gave
+///   this crate no proc macros;
+/// - the write changed no file set or source root this crate can read ([`files_reach`]);
 /// - no crate it depends on, directly or through others, is reached by the write: a crate
 ///   reads names only of crates it depends on, so nothing an earlier crate's job changed is
 ///   a key it read, and its root's log, which alone reads other crates' roots, is as it was;
@@ -219,10 +222,8 @@ pub(super) fn forgets_included() -> bool {
 /// A crate reached is noted ([`state::Pass::reached`]) whether or not its job then changes
 /// anything, so every crate above a written one has its job, as before.
 fn unreached(db: &Db, krate: Crate, state: &State, written: &Written<'_>) -> bool {
-    if written.crates
-        || !written.added.is_empty()
-        || !written.removed.is_empty()
-        || !written.roots.is_empty()
+    if written.crate_graph_reaches(krate)
+        || files_reach(db, krate, written)
         || written.proc_macros.binary_search(&krate).is_ok()
     {
         return false;
@@ -240,6 +241,43 @@ fn unreached(db: &Db, krate: Crate, state: &State, written: &Written<'_>) -> boo
         (false, Some(cs)) => !cs.reads_written(written),
         _ => false,
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: a file set or a source root changed by the write reaches no
+    /// crate but through the files it names, so a crate whose own source root gained a file
+    /// (a `mod` probe that now hits) has no job.
+    pub(in crate::nameres) static ROOTS_REACH_NO_CRATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a file set or a source root `written` changed (a file added to one or taken from
+/// it) may change what `krate`'s round-0 tree reads: a `mod` probe that now hits or no longer
+/// does.
+///
+/// The invariant: a module's file is probed in the source root of the file that declares it,
+/// from the crate's root file down, so a crate reads the file set of its root file's source
+/// root and no other's. A library crate (its root is a library's: the standard library's, a
+/// registry or git package's, each package its own root) is therefore reached only when that
+/// root is among `written.roots`: a plan lowered into the front end beside another's (a
+/// `cfg(test)` twin's alias in its package's root, a dev-dependency's new root) leaves every
+/// library crate of the other roots without a job. A local crate is taken as reached by any
+/// such change: a workspace's packages may nest, and what its `include!`s probed outside its
+/// root is not kept by root. A change that names no root (none does today) reaches every
+/// crate.
+fn files_reach(db: &Db, krate: Crate, written: &Written<'_>) -> bool {
+    if written.added.is_empty() && written.removed.is_empty() && written.roots.is_empty() {
+        return false;
+    }
+    #[cfg(test)]
+    if ROOTS_REACH_NO_CRATE.get() {
+        return false;
+    }
+    if written.roots.is_empty() {
+        return true;
+    }
+    let root = db.file_source_root(krate.data(db).root_file_id).source_root_id(db);
+    written.roots.binary_search(&root).is_ok() || !db.source_root(root).source_root_ref(db).is_library
 }
 
 /// The maintainer's apply: each crate of the step's layer publishes what its job ran, in
@@ -376,7 +414,7 @@ impl CrateRun {
 fn read_crate(db: &Db, written: &Written<'_>, run: &mut CrateRun) {
     if run.served {
         // Read here, not in the apply: the decoded map is a query the apply may not run.
-        if written.crates {
+        if written.crate_graph_reaches(run.krate) {
             run.served_delta = Some(served_delta(db, run.krate));
         }
         return;
@@ -392,7 +430,7 @@ fn read_crate(db: &Db, written: &Written<'_>, run: &mut CrateRun) {
     let _maintaining = Maintaining { before: replace_maintaining(Some(krate)) };
     let root = queries::crate_root(db, krate);
     let (cold, mut cs) = match run.old.take() {
-        Some(it) if !written.crates && it.root == root => (false, it),
+        Some(it) if !written.crate_graph_reaches(krate) && it.root == root => (false, it),
         old => (true, CrateState::cold(root, old)),
     };
     let work = &mut run.work;
@@ -462,7 +500,7 @@ fn finish_crate(
         if old.is_some() {
             publish::enter(db, krate, None);
         }
-        if written.crates {
+        if written.crate_graph_reaches(krate) {
             let delta = run_served.unwrap_or_else(|| {
                 panic!("nameres delta: crate {krate:?}'s served delta was not read")
             });
@@ -1197,6 +1235,7 @@ fn cold(
         removed: &[],
         roots: &[],
         crates: true,
+        crates_added: &[],
         included: &[],
         proc_macros: &[],
     };
