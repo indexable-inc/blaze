@@ -650,7 +650,7 @@ pub(super) fn link(
             // clone: once per image unchanged, its few native inputs
             making.natives.extend(found.natives.iter().cloned());
             // alloc: once per image unchanged
-            making.links.push((it.path.clone(), How::Unchanged));
+            making.links.push((it.path.clone(), How::Unchanged, None));
             making.files.push((it.path.clone(), Written::Kept(found.output), true)); // clone: as above
             continue;
         }
@@ -667,7 +667,7 @@ pub(super) fn link(
                 }
                 making.natives.extend(linked.read);
                 // alloc: once per image linked
-                making.links.push((it.path.clone(), linked.how));
+                making.links.push((it.path.clone(), linked.how, linked.tiers));
                 making.files.push((it.path.clone(), linked.written, true)); // clone: as above
                 making.side_files.extend(linked.side);
             }
