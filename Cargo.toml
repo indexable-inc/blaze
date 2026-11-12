@@ -410,6 +410,7 @@ blaze-api = { path = "crates/blaze-api" }
 # The daemon's clients with no process launch (docs/client.md): the library, its C ABI and its
 # Node-API addon.
 blaze-client = { path = "crates/blaze-client" }
+blaze-thin = { path = "crates/blaze-thin" }
 blaze-client-c = { path = "crates/blaze-client-c" }
 blaze-napi = { path = "crates/blaze-napi" }
 blaze-cas = { path = "crates/blaze-cas" }
