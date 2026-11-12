@@ -479,6 +479,32 @@ fn problems_of(build: Option<u64>) -> Result<Vec<slow::Problem>, String> {
         .map_err(|error| error.to_string())
 }
 
+/// Where the summary of what a build recomputed comes from ([`recomputed`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SummaryFrom {
+    /// There is none to say: no build was heard, it recomputed nothing, or the summary is not
+    /// in the build's answer and is not to be asked for.
+    Nowhere,
+    /// The build's own answer carried it.
+    Answer,
+    /// The daemon is asked, which waits for its history thread to have explained the build.
+    Daemon,
+}
+
+/// [`SummaryFrom`] of build `build` (0 for none heard), which recomputed `misses` steps, whose
+/// answer `carried` its summary or not, for a command that asks the daemon (`ask`) or does not
+/// (a `run`: its program starts as soon as its image is built, and waits for no explanation).
+fn summary_from(build: u64, misses: u64, carried: bool, ask: bool) -> SummaryFrom {
+    if build == 0 || misses == 0 || !cfg!(feature = "native") {
+        return SummaryFrom::Nowhere;
+    }
+    match (carried, ask) {
+        (true, _) => SummaryFrom::Answer,
+        (false, true) => SummaryFrom::Daemon,
+        (false, false) => SummaryFrom::Nowhere,
+    }
+}
+
 /// Why the build this process asked for recomputed what it did, as the daemon sums it up once
 /// the build has ended (`Rebuilt::summary`, docs/v2/plan/design/why.md): a report a root
 /// cause. None when this process heard of no build, in the seed (whose engine is this
@@ -488,22 +514,28 @@ fn problems_of(build: Option<u64>) -> Result<Vec<slow::Problem>, String> {
 /// nothing again (`Worked::misses` of 0): its summary is of those misses, so it is empty, and
 /// a no-op build makes no second round trip and waits for no history thread. The daemon's
 /// error otherwise.
-pub(super) fn recomputed() -> Result<Vec<blaze_api::Report>, String> {
+///
+/// `ask` false: only what the build's own answer said; the daemon is asked nothing, so nothing
+/// waits for its history thread (a `run`, whose program is about to start).
+pub(super) fn recomputed(ask: bool) -> Result<Vec<blaze_api::Report>, String> {
     let build = super::client_rows::build();
-    if build == 0 || super::client_rows::misses() == 0 || !cfg!(feature = "native") {
-        return Ok(Vec::new());
-    }
-    // The build's own answer said it, when the daemon had explained the build by then: no
-    // second request.
-    if let Some(summary) = super::client_rows::summary(build) {
-        tracing::info_span!(
-            target: "blaze",
-            "client: why the build recomputed, from its answer",
-            build,
-            reports = summary.len(),
-        )
-        .in_scope(|| {});
-        return Ok(summary);
+    let carried = super::client_rows::summary(build);
+    match summary_from(build, super::client_rows::misses(), carried.is_some(), ask) {
+        SummaryFrom::Nowhere => return Ok(Vec::new()),
+        // The build's own answer said it, when the daemon had explained the build by then: no
+        // second request.
+        SummaryFrom::Answer => {
+            let summary = carried.unwrap_or_default();
+            tracing::info_span!(
+                target: "blaze",
+                "client: why the build recomputed, from its answer",
+                build,
+                reports = summary.len(),
+            )
+            .in_scope(|| {});
+            return Ok(summary);
+        }
+        SummaryFrom::Daemon => {}
     }
     let _span =
         tracing::info_span!(target: "blaze", "client: ask why the build recomputed", build)
@@ -707,6 +739,21 @@ pub(super) fn ask(
         true => Ok(()),
         false => Err("no daemon is running: a build, or `blaze serve`, starts one".to_owned()),
     }
+}
+
+/// `request` handed to the daemon that is running, its answer not waited for: for a command
+/// about to become another program (`run`'s client rows). The daemon takes a request as it
+/// reads it, whether or not its connection is still there when it answers. No daemon running
+/// is an error, as [`ask`]'s.
+pub(super) fn tell(request: Request) -> Result<(), String> {
+    let mut client = match daemon::connect(Start::Never) {
+        Ok(Some(client)) => client,
+        Ok(None) => {
+            return Err("no daemon is running: a build, or `blaze serve`, starts one".to_owned());
+        }
+        Err(error) => return Err(format!("{error:#}")),
+    };
+    client.send(request).map(|_| ()).map_err(|error| error.to_string())
 }
 
 /// [`ask`], where no daemon running (under [`Start::Never`]) is not an error: whether one
@@ -1447,6 +1494,22 @@ mod tests {
     use arrow_array::{ArrayRef, DictionaryArray, Float64Array, Int64Array, StringArray};
 
     use super::*;
+
+    /// The invariant: a `run` waits for nothing between its build's answer and its program.
+    /// Where the answer does not carry why the build recomputed, a `run` says nothing of it
+    /// and asks nothing; a build asks. The control is the build's row: with `ask` the daemon
+    /// is the source, so the `run`'s `Nowhere` is the flag's doing.
+    #[test]
+    fn a_run_asks_the_daemon_for_no_summary_of_its_build() {
+        assert_eq!(summary_from(7, 3, false, false), SummaryFrom::Nowhere);
+        assert_eq!(summary_from(7, 0, true, true), SummaryFrom::Nowhere);
+        assert_eq!(summary_from(0, 3, true, true), SummaryFrom::Nowhere);
+        if cfg!(feature = "native") {
+            assert_eq!(summary_from(7, 3, false, true), SummaryFrom::Daemon);
+            assert_eq!(summary_from(7, 3, true, false), SummaryFrom::Answer);
+            assert_eq!(summary_from(7, 3, true, true), SummaryFrom::Answer);
+        }
+    }
 
     fn batch() -> RecordBatch {
         let names: DictionaryArray<types::Int32Type> =
