@@ -120,18 +120,24 @@ on the same machine is won on every row (`incremental-first` says which rows com
 is not finished at "the micro-benchmark improved"; it is finished when the real targets work and the
 comparison is won, or when what still blocks that is written down with its evidence.
 
-## record-annoyances (rule 63)
+## agents-json (rule 63)
 
-`annoyances.json` is one list of rows: `id`, `date`, `who` (the model id and name and whether you
-are the main agent or a lane, or the person's name), `where` (the tool or the part of blaze), `what`
-happened in one or two sentences with the exact command or message, `cost` (time, a wrong claim,
-lost work, context), `cause` if known, `workaround`, and `state` (open, accepted, or fixed with the
-commit). Add the row at the moment it happens, in the change you are making, without waiting to be
-asked and without judging whether it is important: a `sed -i` that behaves differently on this
-machine counts, so does a command that printed a thousand lines, so does a mistake of your own
-method. Do not tidy it into a lesson; say what happened. A lane adds its rows to its own branch and
-names them in its report. The list is the input to `guard-the-cause` and `unease-is-work`: read it
-before starting work in an area, and when you fix a cause set the row's state rather than deleting
-it.
+`agents.json` has two lists. `howto` is the right way to do a recurring task here (build blaze, time
+it, replace a running binary, run a lane, run the tests): `id`, `date`, `who`, `task`, `do` (the
+exact command or a short recipe), `why`, `state` (current, or superseded by another row). Before a
+task, look for its row and follow it; when you find a better way, or learn one the hard way, add or
+supersede the row in the change you are making. `annoyances` is whatever slowed, surprised or
+annoyed you, however slightly (a tool's quirk, a trap in the tree, a missing command, your own
+repeated mistake): `id`, `date`, `who` (the model id and name and whether you are the main agent or
+a lane, or the person's name), `where` (the tool or the part of blaze), `what` happened in one or
+two sentences with the exact command or message, `cost` (time, a wrong claim, lost work, context),
+`cause` if known, `workaround`, `fix` (what would remove the cause, if you can say), and `state`
+(open, accepted, or fixed with the commit). Add the row at the moment it happens, without waiting to
+be asked and without judging whether it is important: a `sed -i` that behaves differently on this
+machine counts, so does a command that printed a thousand lines. Do not tidy an annoyance into a
+lesson; say what happened. A lane adds its rows on its own branch and names them in its report. What
+must always hold is a rule (tools/agents/rules.ts), not a row; a how-to that keeps being broken, or
+an annoyance that recurs, becomes a rule or a guard (`guard-the-cause`, `unease-is-work`). Rows are
+never deleted: set their state.
 
 <!-- End of the generated rules. Hand-written notes follow. -->

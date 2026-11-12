@@ -176,10 +176,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 62. **sota-first**: Go for the state of the art right away: design the end state and build it directly,
     all its independent pieces in parallel, not a step-by-step climb through halfway versions; then
     prove it on the real targets. Skill: `changing-code`.
-63. **record-annoyances**: Whatever slows, surprises or annoys you while working, however slightly (a
-    tool's quirk, a trap in the tree, a missing command, your own repeated mistake), gets a row in
-    `annoyances.json` (at the top of the repository) when it happens, with who you are. Skill:
-    `changing-code`.
+63. **agents-json**: `agents.json` (at the top of the repository) is what agents here have learned: read
+    it before starting, do a task the way its `howto` says, and add to it as you work, with who you
+    are: an `annoyances` row for whatever slows, surprises or annoys you, however slightly, and a
+    `howto` row when you find the right way to do something. Skill: `changing-code`.
 64. **simulate-first**: A test of anything stateful, incremental, concurrent or durable runs in the
     deterministic simulation by default, in process, under many seeds; a real process, daemon or
     kernel is used only for what the simulation cannot model, and a part that cannot run under
