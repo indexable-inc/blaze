@@ -115,10 +115,17 @@ pub use crate::segment::Writer;
 use crate::segment::{COPY, Chunk, ChunkRef, FRAME, Own, Segment};
 use crate::table::{Held, Table};
 
-/// The format of everything in a store's directory. A store of another refuses to open, naming
-/// both; nothing reads it as this one, and there is no migration: the store is rebuilt from
-/// what made it. Format 4 added each pack's block checks ([`checks`], `checks-<n>`).
-pub(crate) const FORMAT: u32 = 4;
+/// The format of everything in a store's directory, as it is written. A store older than
+/// [`FORMAT_READ`] or newer than this refuses to open, naming both; nothing reads it as this
+/// one, and there is no migration: the store is rebuilt from what made it. Format 4 added each
+/// pack's block checks ([`checks`], `checks-<n>`). Format 5 added a head's whole files to
+/// remove ([`disk::EXTERNAL_REMOVED`]: a hot value's file of its own, let go once a settle
+/// moved the value cold into a pack); a head and an index of format 4 are read as they are,
+/// and what is written next is of format 5, which a blaze of format 4 refuses by name.
+pub(crate) const FORMAT: u32 = 5;
+
+/// The oldest format read ([`FORMAT`]).
+pub(crate) const FORMAT_READ: u32 = 4;
 
 /// A pack is closed for appends once it is this long; a record longer than that has a pack of
 /// its own.
@@ -915,6 +922,9 @@ pub struct Store {
     commit: Option<Commit>,
     /// A flush asked for while a commit was in flight.
     flush_wanted: bool,
+    /// A commit that waits for the removal of a whole file it would write again
+    /// ([`Tier::removing`]): begun when that removal answers.
+    commit_deferred: bool,
     /// Steps of a commit that have answered (a truncate, a write, a sync, the head), ever:
     /// [`Store::commit_steps`].
     commit_steps: u64,
@@ -1399,6 +1409,11 @@ enum Op {
     RemovePack {
         pack: usize,
     },
+    /// A whole file no key names, removed once a durable head lists it as removed.
+    RemoveExternal {
+        content: ContentId,
+        file: FileName,
+    },
     /// `staged`'s name removed (a clone an earlier run of this store left there under the same
     /// tag) so `from` can be cloned there, to be renamed onto `to`; `of`, the content of the
     /// whole file of [`PlacedFile`] it clones.
@@ -1572,6 +1587,10 @@ struct Tier {
     /// The delta an index swap left, while a writer may still put into it.
     prev: Option<Arc<Table<Spot>>>,
     externals: ByHash<ContentId, External, Global>, // alloc: the store's own table, for its life
+    /// Whole files the head on disk lists as removed whose removal has not answered: a commit
+    /// that would write one of them again waits for it ([`Store::start_commit`]), so no write
+    /// of a name meets the removal of the same name.
+    removing: Vec<ContentId>,
     /// By number, which a compressed record names.
     dictionaries: Vec<Dictionary>,
     /// Each unit's crate version by its number less one, and the number of each.
@@ -1598,6 +1617,8 @@ impl Tier {
             delta: Arc::new(Table::new(DELTA_FIRST, FLAGS)),
             prev: None,
             externals: ByHash::new_in(Global), // alloc: the store's own table, for its life
+            // alloc: empty, allocates nothing
+            removing: Vec::new(),
             // alloc: empty, allocates nothing
             dictionaries: Vec::new(),
             // alloc: empty, allocates nothing
@@ -1725,6 +1746,15 @@ struct External {
     /// Held until it is written and mapped.
     memory: Option<Vec<u8>>,
     committed: bool,
+    /// The keys whose record names this file, as far as is known: counted when a period ends
+    /// ([`Store::tier_moves`]), one more for each record drained since, one less for each a
+    /// settle moved cold into a pack. It may be too many (a record counted in its segment and
+    /// again as it is drained), never too few: at none, no key reads the file.
+    keys: u32,
+    /// No key names it any more ([`Store::external_replaced`]): the next head lists it as
+    /// removed ([`disk::EXTERNAL_REMOVED`]) and the file is removed once that head is durable.
+    /// A record of its content drained before then takes it back.
+    dropped: bool,
 }
 
 struct Dictionary {
@@ -1787,6 +1817,8 @@ struct Commit {
     /// The writes of each of `packs` not yet answered: its sync is asked after its last.
     writes: Vec<u32>,
     externals: Vec<ContentId>,
+    /// The whole files its head lists as removed for the first time: removed once it is durable.
+    dropped: Vec<ContentId>,
     /// The slot of the index table it wrote, and the last batch that table holds.
     index: Option<(u8, u64)>,
     head: Head,
@@ -1973,6 +2005,7 @@ impl Store {
             epoch: 0,
             periods: 0,
             moves: None,
+            commit_deferred: false,
             columns,
             peers,
             staging,
@@ -2352,7 +2385,10 @@ impl Store {
 
     /// The moves the period ending now asks for, in the order they are made.
     fn plan_moves(&mut self) -> Moves {
-        let (mut demote, mut promote) = self.tier_moves();
+        let (mut demote, mut promote, named) = self.tier_moves();
+        for (content, external) in &mut self.tiers[0].externals {
+            external.keys = named.get(content).copied().unwrap_or(0);
+        }
         radix::sort_by_key(&mut demote, |(_, loc, _)| {
             (u128::from(loc.kind.code()) << 96) | radix::pack_64(u64::from(loc.pack), loc.offset)
         });
@@ -2517,6 +2553,9 @@ impl Store {
                 }
                 let dictionary = if long { NO_DICTIONARY } else { number.unwrap_or(NO_DICTIONARY) };
                 self.replace(key, loc, Form::Zstd, dictionary, content, &stored);
+                if loc.form == Form::External {
+                    self.external_replaced(&content);
+                }
                 settled.demoted += 1;
             }
         }
@@ -2560,6 +2599,18 @@ impl Store {
         // earlier would stop promotion and retiring in this settle.
         settled.more |= more_short;
         settled
+    }
+
+    /// A key that named the whole file of `content` now finds its value in a pack: one key
+    /// fewer names the file, and at none it is dropped. The next head lists it as removed, and
+    /// the file goes once that head is durable ([`Store::finish_commit`]).
+    fn external_replaced(&mut self, content: &ContentId) {
+        if let Some(external) = self.tiers[0].externals.get_mut(content) {
+            external.keys = external.keys.saturating_sub(1);
+            if external.keys == 0 && external.committed {
+                external.dropped = true;
+            }
+        }
     }
 
     /// A record whose move colder saved too little is not tried again: by its row as the plan
@@ -2609,7 +2660,10 @@ impl Store {
 
     /// The own tier's records in its packs to move cold and to move hot, as of the period
     /// ending now. A record still in a segment is new, and stays.
-    fn tier_moves(&self) -> (Vec<(Key, Loc, Row)>, Vec<(Key, Loc, Row)>) {
+    #[expect(clippy::type_complexity, reason = "the two lists of moves and the count of each whole file's keys, taken apart by its one caller")]
+    fn tier_moves(
+        &self,
+    ) -> (Vec<(Key, Loc, Row)>, Vec<(Key, Loc, Row)>, ByHash<ContentId, u32, Global>) {
         let own = &self.tiers[0];
         // alloc: once a settle (idle, never on the way of a get or a put); empty unless a slot is not whole
         let mut bad = Vec::new();
@@ -2625,7 +2679,14 @@ impl Store {
                     && (self.dictionary_of(kind).is_some() || self.training[code].wants_samples())
             })
         });
+        // alloc: once a settle (idle), a count for each whole file a record names: a few
+        let mut named: ByHash<ContentId, u32, Global> = ByHash::new_in(Global);
         for (key, found) in rows {
+            if found.place.form() == Form::External
+                && let Ok((header, _)) = self.look().record(found, &key)
+            {
+                *named.entry(header.content).or_insert(0) += 1;
+            }
             let Place::Pack(loc) = found.place else { continue };
             let Some(pack) = own.packs.get(loc.pack as usize) else { continue };
             // A short record goes colder only as `short_listed` says, and never comes back hot.
@@ -2636,8 +2697,12 @@ impl Store {
             let flag = |flag| found.at.get(flag);
             let (read, before) = (flag(Flag::Read), flag(Flag::ReadBefore));
             match loc.form {
-                Form::Raw | Form::Lz4 | Form::Warm
-                    if self.periods >= 2
+                // A file of its own goes cold as a record does: into a pack, compressed, and
+                // its file is let go ([`Store::external_replaced`]). Machine code stays a file,
+                // which its loader maps ([`Kind::Machine`]).
+                Form::Raw | Form::Lz4 | Form::Warm | Form::External
+                    if (loc.form != Form::External || loc.kind != Kind::Machine)
+                        && self.periods >= 2
                         && !read
                         && !before
                         && !flag(Flag::New)
@@ -2652,7 +2717,7 @@ impl Store {
                 _ => {}
             }
         }
-        (demote, promote)
+        (demote, promote, named)
     }
 
     /// Sets a flag of an own record by its row: rows hold while the store swaps no table, as
@@ -4970,6 +5035,24 @@ impl Store {
                     ));
                 }
             }
+            Op::RemoveExternal { content, file } => {
+                // Answered, removed or not: a commit that waited to write the name again goes
+                // on. One left behind is no longer listed, so nothing removes it later.
+                self.tiers[0].removing.retain(|it| *it != content);
+                if !matches!(done, Done::Removed) {
+                    // alloc: a problem reported
+                    self.problems.push(format!(
+                        "{file}, a whole file no key names, was left behind: {}",
+                        describe(&done)
+                    ));
+                }
+                if std::mem::take(&mut self.commit_deferred)
+                    && self.commit.is_none()
+                    && self.broken.is_none()
+                {
+                    self.start_commit(effects);
+                }
+            }
             Op::RemoveChecks { pack } => {
                 if !matches!(done, Done::Removed) {
                     let file = self.tiers[0].file(&disk::checks_file(pack));
@@ -5167,14 +5250,21 @@ impl Store {
         let loc = if header.form == Form::External && header.stored > 0 {
             let own = &mut self.tiers[0];
             let file = own.file(&disk::external_file(&header.content));
-            own.externals.entry(header.content).or_insert_with(|| External {
+            let external = own.externals.entry(header.content).or_insert_with(|| External {
                 len: header.raw,
                 file,
                 mapping: None,
                 // alloc: a value of `EXTERNAL_FROM` bytes or more, held past its segment's chunk until its own file is written and mapped
                 memory: Some(payload.to_vec()),
                 committed: false,
+                keys: 0,
+                dropped: false,
             });
+            // One more key names the file. One a settle had dropped is still there (it goes
+            // only once a head that lists it removed is durable, and no drain runs while a
+            // commit is in flight): it is taken back.
+            external.keys = external.keys.saturating_add(1);
+            external.dropped = false;
             self.append_record(Unit(unit), RecordHeader { stored: 0, ..header }, &[])
         } else {
             self.append_record(Unit(unit), header, payload)
@@ -5744,9 +5834,19 @@ impl Store {
             // alloc: once per commit, the files it writes, sorted, held in the `Commit`
             own.externals.iter().filter(|(_, it)| !it.committed).map(|(it, _)| *it).collect();
         externals.sort_unstable();
+        // A whole file removed and put again: its write waits for its removal's answer, so
+        // the two never meet on one name. The removal's answer begins this commit.
+        if externals.iter().any(|it| own.removing.contains(it)) {
+            self.commit_deferred = true;
+            return;
+        }
+        let mut dropped: Vec<ContentId> =
+            // alloc: once per commit, the files its head lists as removed, held in the `Commit`
+            own.externals.iter().filter(|(_, it)| it.dropped).map(|(it, _)| *it).collect();
+        dropped.sort_unstable();
         let compact =
             !self.index_mapping && self.migrating.is_none() && own.delta.len() >= INDEX_AFTER;
-        if packs.is_empty() && externals.is_empty() && !compact {
+        if packs.is_empty() && externals.is_empty() && !compact && dropped.is_empty() {
             // Nothing to write and no commit in flight: every record drained is in what a
             // commit wrote already, and a put that wrote none (it lost its key to another
             // writer's put of the same bytes, or panicked before it wrote) has nothing to make
@@ -5759,10 +5859,20 @@ impl Store {
             }
             return;
         }
+        // A file dropped, and one whose removal has not answered, are listed as removed: a
+        // reopen after a crash removes what this run did not.
         let mut all_externals: Vec<ExternalRef> = own
             .externals
             .iter()
-            .map(|(content, it)| ExternalRef { content: *content, len: it.len })
+            .map(|(content, it)| ExternalRef {
+                content: *content,
+                len: if it.dropped { disk::EXTERNAL_REMOVED } else { it.len },
+            })
+            .chain(
+                own.removing
+                    .iter()
+                    .map(|content| ExternalRef { content: *content, len: disk::EXTERNAL_REMOVED }),
+            )
             // alloc: once per commit, the head it writes
             .collect();
         all_externals.sort_unstable_by_key(|it| it.content);
@@ -5860,6 +5970,7 @@ impl Store {
             // alloc: once per commit, a count for each pack
             writes: vec![0; written],
             externals,
+            dropped,
             index,
             head,
             batch,
@@ -6216,6 +6327,25 @@ impl Store {
                 self.hot.pack_removed(0, at);
             }
         }
+        // The head that lists them removed is durable: the files go, and no view holds them
+        // from the next publish on. A reader of an older view reads its mapping, which lives
+        // while that view does.
+        let mut gone = false;
+        for content in &commit.dropped {
+            let own = &mut self.tiers[0];
+            if !own.externals.get(content).is_some_and(|it| it.dropped) {
+                continue;
+            }
+            let external = own.externals.remove(content).expect("found above");
+            own.removing.push(*content);
+            // clone: the op and the effect each own the name; once per whole file removed
+            let tag = self.tags.ask(Op::RemoveExternal { content: *content, file: external.file.clone() });
+            effects.push(Effect::Remove { file: external.file, tag });
+            gone = true;
+        }
+        if gone {
+            self.publish_view();
+        }
         let mut batch = commit.batch;
         for content in &commit.externals {
             let external =
@@ -6377,6 +6507,7 @@ impl Store {
         let externals: ByHash<ContentId, External, Global> = head // alloc: the store's own table, for its life
             .externals
             .iter()
+            .filter(|it| it.len != disk::EXTERNAL_REMOVED)
             .map(|it| {
                 (
                     it.content,
@@ -6386,10 +6517,22 @@ impl Store {
                         mapping: None,
                         memory: None,
                         committed: true,
+                        // Counted when the first period ends; until then nothing drops it.
+                        keys: u32::MAX,
+                        dropped: false,
                     },
                 )
             })
             // alloc: opening, once per tier
+            .collect();
+        // The whole files the head lists as removed: an earlier run's removal may not have
+        // been made (a crash after the head). Only the store's own are its to remove.
+        let removed_files: Vec<(ContentId, FileName)> = head
+            .externals
+            .iter()
+            .filter(|it| it.len == disk::EXTERNAL_REMOVED)
+            .map(|it| (it.content, tier.file(&disk::external_file(&it.content))))
+            // alloc: opening, once per tier; empty but after a settle let a whole file go
             .collect();
         // alloc: opening, once per tier, the mappings it asks for
         let mut maps = Vec::new();
@@ -6442,6 +6585,12 @@ impl Store {
         if at == 0 {
             for pack in removed {
                 self.remove_pack(pack, effects);
+            }
+            for (content, file) in removed_files {
+                self.tiers[0].removing.push(content);
+                // clone: the op and the effect each own the name; once per whole file removed
+                let tag = self.tags.ask(Op::RemoveExternal { content, file: file.clone() });
+                effects.push(Effect::Remove { file, tag });
             }
         }
         if self.tiers[at].waiting == 0 {

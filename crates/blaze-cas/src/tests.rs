@@ -1975,7 +1975,7 @@ fn a_store_of_the_format_before_block_checks_is_refused_naming_both() {
     store.put(key(1), Kind::Code, &[1]).unwrap();
     flush(&mut sim, &mut store);
     drop(store);
-    assert_eq!(FORMAT, 4);
+    assert_eq!((FORMAT_READ, FORMAT), (4, 5));
     let head = name("store/head");
     let mut bytes = sim.contents(&head);
     assert_eq!(bytes[8..12], FORMAT.to_le_bytes());
@@ -1987,7 +1987,113 @@ fn a_store_of_the_format_before_block_checks_is_refused_naming_both() {
     assert!(!store.ready());
     let broken = store.broken().unwrap();
     assert_eq!(broken.file, head);
-    assert!(broken.what.contains("store format 3, not 4"), "{broken}");
+    assert!(broken.what.contains("store format 3, not 5"), "{broken}");
+}
+
+/// Format 5 added a head's whole files to remove. A store of format 4 (its head and its
+/// index table) is read as it is, and the next head written over it is of format 5.
+#[test]
+fn a_store_of_format_4_is_read_and_goes_on_as_format_5() {
+    let mut sim = Sim::new(8, quiet());
+    let mut store = open(&mut sim, "store");
+    let count = INDEX_AFTER as u64 + 4;
+    for n in 0..count {
+        store.put(key(n), Kind::Code, &text(n, 300)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    let slot = store.tiers[0].head.index.expect("past `INDEX_AFTER` records an index is written").slot;
+    drop(store);
+    // The store as a blaze of format 4 left it: the index's stamp, its check in the head, and
+    // the head's stamp and check.
+    let (head, index) = (name("store/head"), name(&format!("store/index-{slot}")));
+    let mut table = sim.contents(&index);
+    assert_eq!(table[8..12], FORMAT.to_le_bytes());
+    table[8..12].copy_from_slice(&4u32.to_le_bytes());
+    sim.change(&index, &table);
+    let mut written = Head::decode(&sim.contents(&head)).unwrap();
+    written.index.as_mut().unwrap().check = crc::crc32c(&table);
+    let mut bytes = written.encode();
+    bytes[8..12].copy_from_slice(&4u32.to_le_bytes());
+    let body = bytes.len() - 4;
+    let check = crc::crc32c(&bytes[..body]);
+    bytes[body..].copy_from_slice(&check.to_le_bytes());
+    sim.change(&head, &bytes);
+    let mut store = open(&mut sim, "store");
+    for n in 0..count {
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), text(n, 300), "{n}");
+    }
+    store.put(key(count), Kind::Code, &text(count, 300)).unwrap();
+    flush(&mut sim, &mut store);
+    assert_eq!(sim.contents(&head)[8..12], 5u32.to_le_bytes(), "the next head is of format 5");
+    drop(store);
+    let store = open(&mut sim, "store");
+    for n in 0..=count {
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), text(n, 300), "{n} after a reopen");
+    }
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+/// A hot value long enough for a file of its own, unread for two periods, goes cold as a
+/// record does: into a pack, compressed, and its file is removed once the head that lists it
+/// removed is durable. A second key of the same bytes keeps the file until it is moved too.
+/// Put again after, the value is a file again; and a file a crash left listed as removed goes
+/// at the next open.
+#[test]
+fn a_whole_file_unread_for_two_periods_goes_cold_into_a_pack_and_its_file_goes() {
+    let mut sim = Sim::new(9, quiet());
+    let mut store = open(&mut sim, "store");
+    let big = text(1, EXTERNAL_FROM + 4096);
+    let file = name(&format!("store/{}", disk::external_file(&content_of(&big))));
+    store.put(key(1), Kind::Query, &big).unwrap();
+    store.put(key(2), Kind::Query, &big).unwrap();
+    flush(&mut sim, &mut store);
+    assert_eq!(form_of(&store, &key(1)), Form::External);
+    assert!(sim.exists(&file));
+    settle(&mut sim, &mut store);
+    settle(&mut sim, &mut store);
+    // Key 2 is read in this period: only key 1 moves, and the file stays for key 2.
+    assert_eq!(bytes_of(&store, &key(2)).unwrap(), big);
+    let settled = settle(&mut sim, &mut store);
+    assert_eq!(settled.demoted, 1, "{settled:?}");
+    assert_eq!(form_of(&store, &key(1)), Form::Zstd);
+    assert_eq!(form_of(&store, &key(2)), Form::External);
+    assert!(sim.exists(&file), "a key still names the file");
+    settle(&mut sim, &mut store);
+    let settled = settle(&mut sim, &mut store);
+    assert_eq!(settled.demoted, 1, "{settled:?}");
+    assert!(!sim.exists(&file), "no key names the file: it is removed with the head that says so");
+    assert!(store.tiers[0].externals.is_empty() && store.tiers[0].removing.is_empty());
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), big);
+    assert_eq!(bytes_of(&store, &key(2)).unwrap(), big);
+    // The same bytes under a third key: a file of its own again, written after the removal.
+    store.put(key(3), Kind::Query, &big).unwrap();
+    flush(&mut sim, &mut store);
+    assert_eq!(form_of(&store, &key(3)), Form::External);
+    assert!(sim.exists(&file));
+    assert_eq!(store.verify(None), Vec::new());
+    drop(store);
+    // A head that lists the file removed, and the file still there (a crash before its
+    // removal): the open removes it, and reads every value.
+    let head = name("store/head");
+    let mut written = Head::decode(&sim.contents(&head)).unwrap();
+    assert_eq!(written.externals.len(), 1);
+    let mut store = open(&mut sim, "store");
+    settle(&mut sim, &mut store);
+    settle(&mut sim, &mut store);
+    assert_eq!(settle(&mut sim, &mut store).demoted, 1);
+    assert!(!sim.exists(&file));
+    flush(&mut sim, &mut store);
+    drop(store);
+    written = Head::decode(&sim.contents(&head)).unwrap();
+    let listed: Vec<u64> = written.externals.iter().map(|it| it.len).collect();
+    assert!(listed.iter().all(|&len| len == disk::EXTERNAL_REMOVED), "{listed:?}");
+    sim.change(&file, &big);
+    let store = open(&mut sim, "store");
+    assert!(!sim.exists(&file), "the open removes what its head lists as removed");
+    for n in 1..=3 {
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), big, "{n}");
+    }
+    assert_eq!(store.verify(None), Vec::new());
 }
 
 #[test]
