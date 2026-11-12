@@ -1488,7 +1488,7 @@ mod tests {
         let mut state = State::new();
         let class = state.class_id(&Class::Text);
         let target = Symbols::join(1, 0);
-        let pieces: Vec<PieceId> = (0..4u32)
+        let pieces: Vec<PieceId> = (0..4usize)
             .map(|n| state.add(&piece(Symbols::join(2, n), class, &[fixup(target, None)])))
             .collect();
         let cells = pieces[0];
