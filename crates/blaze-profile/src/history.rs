@@ -486,6 +486,12 @@ pub struct Flushed {
 
 #[derive(Debug)]
 pub enum HistoryError {
+    /// A flush panicked, saying `what`: the rows it had read are dropped, and the history
+    /// goes on with the next flush ([`History::flush_contained`]).
+    Panicked {
+        what: String,
+        rows: usize,
+    },
     Io {
         path: PathBuf,
         doing: &'static str,
@@ -577,6 +583,10 @@ impl fmt::Display for CompactError {
 impl fmt::Display for HistoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            HistoryError::Panicked { what, rows } => write!(
+                f,
+                "the profile history: a flush panicked ({what}): the {rows} rows it had read are not written,                  and the history goes on from the next flush"
+            ),
             HistoryError::Io { path, doing, error } => {
                 write!(f, "the profile history: {doing} {}: {error}", path.display())
             }
@@ -648,7 +658,7 @@ impl std::error::Error for HistoryError {
             | HistoryError::Unclassified { .. }
             | HistoryError::Unplaced { .. } => None,
             HistoryError::Postmortem(error) => Some(error),
-            HistoryError::Client { .. } => None,
+            HistoryError::Client { .. } | HistoryError::Panicked { .. } => None,
         }
     }
 }
@@ -1268,6 +1278,32 @@ impl History {
     /// file that could not be written, whose rows of the rings are lost and whose other rows
     /// the next flush writes; a merge; the cap; a reap; a dead daemon's rows) is said through
     /// [`History::take_failed`].
+    /// [`History::flush`], a panic of it contained (rule panics-fail-one-job): the rows it
+    /// had read are dropped, so the next flush does not meet them again, the panic is the
+    /// error, and the history's thread goes on. Until 2026-11-12 one flush's panic (arrow's
+    /// `byte array offset overflow`, twice on a machine short of memory: reth's and tempo's
+    /// cold builds) ended the thread: no build after it was written, and every `blaze why`
+    /// and `blaze debug sql` of that daemon read a history that stopped there.
+    pub fn flush_contained(&mut self, build: Option<u64>) -> Result<Flushed, HistoryError> {
+        let flushed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.flush(build)));
+        match flushed {
+            Ok(flushed) => flushed,
+            Err(panic) => {
+                let what = match panic.downcast_ref::<&str>() {
+                    Some(it) => (*it).to_owned(), // alloc: error path
+                    None => match panic.downcast_ref::<String>() {
+                        Some(it) => it.clone(), // clone: error path
+                        None => "a payload that is no text".to_owned(), // alloc: error path
+                    },
+                };
+                let rows = self.read.rows();
+                self.read.clear();
+                self.clean = false;
+                Err(HistoryError::Panicked { what, rows })
+            }
+        }
+    }
+
     pub fn flush(&mut self, build: Option<u64>) -> Result<Flushed, HistoryError> {
         // The record cost of the history itself: encoding and writing a flush's Parquet had no
         // span, so a slow flush read as uncovered time on the history's thread.

@@ -1,0 +1,13 @@
+{
+ "id": "reth-1112-9",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "blaze-query, base-db, blaze-lower, hir-expand tests under cargo on macOS",
+ "what": "On this lane's tree and, by redit-9, on the untouched tip: base-db's `a_changed_file_costs_a_constant` and `the_extensions_are_read_off_the_leading_inner_attributes`, blaze-lower's `what_could_read_another_file_is_not_alone` and `readers_of_two_run_classes_keep_their_keys_apart_by_the_runs_identities`, and blaze-query's `an_id_in_a_key_reads_with_its_name_and_keeps_its_id` (it expects `NamedForTheLogTest(Id(3)` unchanged and gets a name appended) fail; hir-expand's lib tests did not compile (`\"ends in `}`\"` is an unmatched brace in a format string), fixed in 6fd7961cf9.",
+ "cost": "each lane sorts its own failures from these by hand",
+ "cause": "tests that do not run in the gate",
+ "class": "tests nobody runs",
+ "prevention": "none built",
+ "fix": "run every crate's lib tests in the round runner and fix or delete these five",
+ "state": "open"
+}

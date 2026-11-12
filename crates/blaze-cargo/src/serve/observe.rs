@@ -820,7 +820,7 @@ fn keep(
             recv(rows) -> it => it.map_err(|_| RecvTimeoutError::Disconnected),
             recv(history.full()) -> _ => {
                 doing.set(Step::FlushingFull, 0);
-                if let Err(error) = blaze_mem::frame::task(blaze_mem::Tag::Profile, |_| history.flush(None)) {
+                if let Err(error) = blaze_mem::frame::task(blaze_mem::Tag::Profile, |_| history.flush_contained(None)) {
                     tracing::error!("{error}");
                     _ = failed.send(error.to_string());  // alloc: error path, a flush that failed
                 }
@@ -885,7 +885,7 @@ fn keep(
             }
             let Some(build) = held.take(batch.flush) else { return (Ok(()), batch.last) };
             write_why(why, &mut unwritten, failed);
-            let flushed = history.flush(build);
+            let flushed = history.flush_contained(build);
             let seq = || match &flushed {
                 Ok(it) => Ok(it.seq),
                 // alloc: error path, a flush that failed

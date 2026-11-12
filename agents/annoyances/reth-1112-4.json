@@ -1,0 +1,20 @@
+{
+ "id": "reth-1112-4",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "blaze: the first build after a cold one, with proc macros",
+ "what": "A proc-macro crate the store has never seen has the verdict Unseen for the whole of the first build that runs it, so every one of its expansions reports its reads unknown and every unit that calls it is not kept (`unit record`: `its macro keeps a session that does not settle ..`). The next build makes them all again: 2 units on a three-crate fixture, 217 and 218 units of reth (203 s and 410 s under load).",
+ "cost": "every `first edit after a cold build` number on a project with proc macros includes it; on reth it is the whole of the first warm request",
+ "cause": "the verdict is read once at load and learned only as the build's expansions run",
+ "whys": [
+  "why remade: their records were not kept in the cold build",
+  "why: reads unknown under verdict Unseen",
+  "why Unseen: the store learns a crate's verdict from the first build that runs it",
+  "why not applied: a record is filed as its unit ends, before the build's end knows the verdict",
+  "property: what a record's validity rests on (the crate settles) becomes known after the record is due"
+ ],
+ "class": "a fact learned by a build that the build's own outputs needed: outputs made before it are dropped instead of filed once it is known",
+ "prevention": "none built. The fix: file such records after the answer, once the build's end knows the verdict (re-checking each call from either state, as `same_from_either_state` does for a crate that settles), or key the record by the verdict as a read so the next build's lookup finds it",
+ "fix": "see prevention",
+ "state": "open"
+}

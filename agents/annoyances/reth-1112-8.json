@@ -1,0 +1,13 @@
+{
+ "id": "reth-1112-8",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "blaze: `blaze explain problems`, `events_wide` on reth",
+ "what": "`blaze explain problems build=7` and any query over `events_wide` on reth's history die in DuckDB (`Out of Memory Error .. 3.7 GiB/3.7 GiB used`); the same rows read through `events` joined to `event_values` for one message answer in seconds. redit-14 saw it for `blaze why`.",
+ "cost": "each why question on reth needs a hand-written query",
+ "cause": "`events_wide` pivots every event's fields before the filter",
+ "class": "a view that is the size of the history, not of the answer",
+ "prevention": "none built",
+ "fix": "filter by build and level before the pivot in `problems`; raise or lift the client's memory limit",
+ "state": "open"
+}

@@ -1736,7 +1736,18 @@ impl Lowered {
             .collect();
         parts.sort_unstable();
         parts.dedup();
-        parts
+        // Two crates of one name (two versions, or one built for the host and for macros)
+        // are one part, of both: a part's name is said once in a key.
+        let mut merged: Vec<(String, ContentId)> = Vec::with_capacity(parts.len()); // alloc: as above
+        for (name, id) in parts {
+            match merged.last_mut() {
+                Some((last, held)) if *last == name => {
+                    *held = Hasher::new(IDENTITY_PART).id(held).id(&id).finish();
+                }
+                _ => merged.push((name, id)),
+            }
+        }
+        merged
     }
 
     /// The first variable of the process that a crate of the front end read through `env!` or
