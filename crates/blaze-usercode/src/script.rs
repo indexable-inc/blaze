@@ -375,7 +375,8 @@ pub fn cargo_rule(
     exit: &Exit,
 ) -> Result<CargoRule, Error> {
     let cx = output::Context::of(unit, inherited);
-    blaze_build_script::watched_in(&exit.stdout, &cx, &unit.package.manifest_dir).map(CargoRule::of)
+    blaze_build_script::watched_in(&exit.stdout, &cx, &unit.package.manifest_dir)
+        .map(|watched| CargoRule::of_package(watched, &unit.package.manifest_dir))
 }
 
 /// What the script whose root source file is `root` would have been as a run, when its source
