@@ -319,12 +319,7 @@ fn program_name(db: &Db, kind: RootKind, krate: Crate) -> Box<str> {
     format!("{what} of crate `{}`", krate.named(db)).into_boxed_str()
 }
 
-fn refused_of(
-    db: &Db,
-    krate: Crate,
-    kind: RootKind,
-    what: impl std::fmt::Display,
-) -> CodegenError {
+fn refused_of(db: &Db, krate: Crate, kind: RootKind, what: impl std::fmt::Display) -> CodegenError {
     CodegenError {
         unit: InstanceKey(ContentId::default()),
         item: ItemKey(ContentId::default()),

@@ -731,6 +731,7 @@ dependencies = [
  "blaze-serde",
  "blaze-store-check",
  "crossbeam-channel",
+ "crossbeam-queue",
  "hashbrown 0.17.1",
  "hegeltest",
  "serde",

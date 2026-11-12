@@ -232,7 +232,7 @@ pub struct Work {
     pub patched: bool,
 }
 
-/// A walk's counts while its levels describe on all cores.
+/// A walk's counts while its describes run on all cores.
 #[derive(Default)]
 pub(super) struct Counts {
     pub(super) described: AtomicUsize,

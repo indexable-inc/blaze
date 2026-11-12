@@ -91,7 +91,7 @@ pub struct HirFrontend<'db> {
     units: Option<Arc<Units>>,
     /// Which of the units given in this process `units` is ([`give_units`]).
     units_id: Option<u32>,
-    // dyn: `reached` once a level of the walk, `stopped` once a function compiled (2 ns
+    // dyn: `reached` once a batch of the walk, `stopped` once a function compiled (2 ns
     // against its 50 to 200 µs), never per instruction
     checks: Option<&'db dyn BodyChecks>, // dyn: never per instruction, as above
     /// Set when the build's job is cancelled or gives way to another task.
@@ -521,7 +521,7 @@ impl<'db> HirFrontend<'db> {
     }
 
     /// The front end of a build whose unit's bodies `checks` checks beside it.
-    // dyn: called once a level of the walk, never per instance
+    // dyn: called once a batch of what the walk reaches, never per instance
     pub fn with_checks(mut self, checks: &'db dyn BodyChecks) -> Self {
         self.checks = Some(checks);
         self
@@ -754,8 +754,8 @@ impl<'db> HirFrontend<'db> {
     ) -> Result<Described<HirInstance, HirStatic>, CodegenError> {
         // One span a describe, named for its function once described, opened where the work
         // is: a describe the database's memo answers opens none, so the spans of a walk are
-        // the functions whose describe ran. A level's describes run as a few long pool jobs
-        // (`par::split`), and a job of 149 s in a self-build said only `par::map` (spans37).
+        // the functions whose describe ran. A walk's describes run as a few long pool jobs
+        // (its worklist's), and a job of 149 s in a self-build said only `par::map` (spans37).
         let span = tracing::info_span!(
             target: "blaze",
             "codegen describe",
@@ -1117,7 +1117,7 @@ impl Frontend for HirFrontend<'_> {
         let bodies: Vec<DefWithBodyId> = self.with(|db| {
             (functions.iter().filter_map(|(instance, _)| body_of(db, instance)))
                 .chain(statics.iter().map(|it| DefWithBodyId::StaticId(it.0)))
-                // alloc: once a level of the walk, sized by it
+                // alloc: once a batch of what the walk reaches, sized by it
                 .collect()
         });
         checks.reached(&bodies);
@@ -1134,7 +1134,7 @@ impl Frontend for HirFrontend<'_> {
             let counted = |(instance, _): &(HirInstance, Origin)| {
                 counted_memo(db, instance.clone(), ())
             };
-            // alloc: once a level of the walk, sized by it
+            // alloc: once per describe that reaches new functions, sized by them
             functions.iter().map(counted).collect()
         })
     }
