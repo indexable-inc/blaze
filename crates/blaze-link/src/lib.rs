@@ -623,10 +623,15 @@ impl Image {
         }
         // O(image), so it has a span of its own that says which list it is run for: a stage
         // that compacts every link is a link that costs the image and not the change.
-        if let Some((list, garbage, live)) = new.compaction_of() {
+        // The loader's lists are compacted alone, a pass over the pieces: every list at once
+        // only where another is mostly garbage. Bounded: each pass leaves its lists with none.
+        while let Some((list, garbage, live)) = new.compaction_of() {
             let _span =
                 tracing::info_span!(target: "blaze", "link compact", list, garbage, live).entered();
-            new.compact();
+            match list {
+                "rebase" | "binds" => new.compact_loader(),
+                _ => new.compact(),
+            }
         }
         self.arena.reset();
         let arena = &self.arena;
