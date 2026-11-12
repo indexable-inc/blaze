@@ -2068,6 +2068,18 @@ fn names(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> Re
         let _span = tracing::info_span!("unit record lookup").entered();
         kept(job, unit)?
     };
+    // A launcher's program is built, never replayed: its record names the launcher's file
+    // alone, and the program's core must hold this build's code
+    // ([`super::run::launch::never_replayed`]).
+    let kept = match kept {
+        Some(kept)
+            if super::run::launch::never_replayed(job, unit, &kept.record.outputs)
+                .map_err(|what| ApiError::new(what, None))? =>
+        {
+            None
+        }
+        other => other,
+    };
     if kept.is_none() {
         let miss = missed(job, reader, unit);
         lock(slot).misses.push(miss);

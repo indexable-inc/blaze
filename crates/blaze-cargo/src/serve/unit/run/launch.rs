@@ -13,10 +13,14 @@
 //! under one named lock a program; frames are queued to a launcher's writer under that lock,
 //! so a launcher is written what the core decided, in the order it decided it.
 //!
-//! Not built, each a refusal by name and never a quiet path: a program this daemon did not
-//! build since it started (its record replays, and no code of it is held: the launcher stops
-//! and says so); test binaries, which stay dev executables; the eager background check
-//! (launcher.md, section 4): a build is whole before its program can start.
+//! A launched program's unit is built by every build that reaches it, never replayed from
+//! its record ([`never_replayed`]), so the core holds the code of exactly the build that
+//! answered. A launcher started by hand against a daemon that holds none of it (a file from
+//! before the daemon restarted, and no build since) stops and says so.
+//!
+//! Not built, each a refusal by name and never a quiet path: test binaries, which stay dev
+//! executables; the eager background check (launcher.md, section 4): a build is whole before
+//! its program can start.
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -62,6 +66,35 @@ pub(crate) fn launched(job: &Job, unit: usize, policy: &Policy) -> Result<bool, 
         return Ok(false);
     }
     Ok(codegen::triple(job, u) == job.input.config.host)
+}
+
+/// Whether `unit`, whose kept record names `outputs` (path, key, whether it is executable),
+/// is a launcher's program, whose record is never replayed: the unit is built, so that the
+/// program's core holds the code of exactly this build before a launcher asks for it.
+///
+/// A record says which file a build made, and a launched program's file is the launcher's,
+/// the same bytes for every build of it: replaying a record would leave the core on the
+/// code of whatever build it was last given (a source edited and then put back replays the
+/// first build's record while the core holds the second's, and the program ran the second's:
+/// found by the measurement's check of its output, 2026-11-12), or on none after the daemon
+/// restarted. What the build costs is its codegen's walk over what is kept; nothing is
+/// compiled again. `false` with [`VAR`] off, for a unit that makes no program, and for one
+/// built any other way.
+pub(crate) fn never_replayed(
+    job: &Job,
+    unit: usize,
+    outputs: &[(String, blaze_cas::Key, bool)],
+) -> Result<bool, String> {
+    if !on() || !outputs.iter().any(|it| it.2) {
+        return Ok(false);
+    }
+    let policy = codegen::toolchain(job, unit).and_then(|it| codegen::policy(job, unit, it))?;
+    if policy.mode != blaze_codegen::plan::Mode::Launched {
+        return Ok(false);
+    }
+    let plan = job.plan(unit).map_err(|it| it.what)?;
+    let made = super::super::artifact::made(plan);
+    Ok(outputs.iter().any(|(path, _, executable)| *executable && made.contains(&path.as_str())))
 }
 
 /// One program this daemon built for a launcher, and the launchers running it.
