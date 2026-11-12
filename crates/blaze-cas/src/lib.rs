@@ -4238,9 +4238,9 @@ impl Store {
     /// its own directory: the leftovers of an earlier try removed (steps 0 and 1), an empty
     /// file made (2), cloned (3), and both removed. A clone that is made: by cloning. One
     /// the file system refuses because it cannot share blocks: by copying. Anything else
-    /// that fails is asked again, and breaks the store naming the file after
-    /// [`FAILURES_MOST`] tries: the store does not guess. The look through `placed/` is asked
-    /// once this is decided, so no place is made before.
+    /// that fails stops the store at once, naming the file and the error: one attempt, no
+    /// second try and no method guessed. The look through `placed/` is asked once this is
+    /// decided, so no place is made before.
     fn ask_shares(&mut self, step: u8, effects: &mut Vec<Effect>) {
         let (file, clone) = self.shares_files();
         let tag = self.tags.ask(Op::Shares(step));
@@ -4263,15 +4263,24 @@ impl Store {
             (0 | 1, Done::Removed) | (2, Done::Written) => return self.ask_shares(step + 1, effects),
             (3, Done::Cloned) => PlaceBy::Clone,
             (3, Done::Failed(error)) if error.0.contains("cannot share blocks") => PlaceBy::Copy,
+            // One attempt, never asked again: anything but a clone made, or a clone refused
+            // for blocks that cannot be shared, stops the store, naming the file and what
+            // the system said (rule no-fallback: no quiet second try, no method guessed).
             _ => {
-                // clone: the error that breaks the store
-                if self.retry(&file, done) {
-                    self.ask_shares(0, effects);
-                }
-                return;
+                let what = match step {
+                    0 | 1 => "removing what an earlier try left",
+                    2 => "making its file",
+                    _ => "cloning it",
+                };
+                // alloc: the error that breaks the store
+                let why = format!(
+                    "trying one clone in the store's directory, to decide how outputs are placed: {what}: {}",
+                    describe(done)
+                );
+                let file = if step == 0 || step == 3 { clone } else { file };
+                return self.fail(file, why);
             }
         };
-        self.failures = 0;
         self.place_by = Some(by);
         tracing::info!(target: "blaze", dir = %self.tiers[0].dir, "{}", by.said());
         for file in [file, clone] {
