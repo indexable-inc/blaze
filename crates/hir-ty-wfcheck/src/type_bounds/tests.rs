@@ -18,8 +18,13 @@ pub struct W<'a>(pub &'a u8);
 /// The errors of every item of `source`: code, where (`assoc type`, `opaque`, `output`, or
 /// the site as debug-printed) and message.
 fn errors(source: &str) -> Vec<(&'static str, String, String)> {
+    errors_with("sized, copy, clone", source)
+}
+
+/// [`errors`] of `source` over the parts `minicore` of the core library.
+fn errors_with(minicore: &str, source: &str) -> Vec<(&'static str, String, String)> {
     let fx = fixture::db(&format!(
-        "//- minicore: sized, copy, clone\n//- /main.rs edition:2024\n{PRELUDE}{source}"
+        "//- minicore: {minicore}\n//- /main.rs edition:2024\n{PRELUDE}{source}"
     ));
     let db = fx.into_db();
     let mut out = Vec::new();
@@ -288,6 +293,52 @@ fn rpitit_types_satisfy_the_trait_s_bounds() {
             &[("E0477", "opaque")],
         ),
     ]);
+}
+
+/// `Ext<F>` is `Send` only for an `F: 'static`, and the trait's `impl Sized + Send` is given
+/// an `Ext` of a closure, so proving the bound asks the closure to outlive `'static`.
+const CLOSURE_PRELUDE: &str = "
+pub struct Ext<F>(pub core::marker::PhantomData<*const F>);
+unsafe impl<F: 'static> Send for Ext<F> {}
+pub fn ext<F>(_: &F) -> Ext<F> { Ext(core::marker::PhantomData) }
+pub trait Mk { fn mk(self) -> impl Sized + Send; }
+";
+
+/// The errors of `impl<T> Mk for Wrap<T>` whose `mk` has the body `body`.
+fn closure_errors(body: &str) -> Vec<(&'static str, String)> {
+    let source = format!(
+        "{CLOSURE_PRELUDE}impl<T> Mk for Wrap<T> {{ fn mk(self) -> impl Sized {{ {body} }} }}"
+    );
+    errors_with("sized, copy, clone, send, phantom_data, fn", &source)
+        .into_iter()
+        .map(|(code, site, _)| (code, site))
+        .collect()
+}
+
+/// The invariant: a closure outlives a region when what it captures does, whatever the type
+/// parameters of the function that writes it (rustc's outlives components; the pinned rustc
+/// accepts the first program and reports E0310 of `T` at the `impl Sized` of the second).
+/// reth-node-ethereum's `launch_add_ons` gives `impl<F: 'static> EngineApiBuilder for
+/// EngineApiExt<B, F>` a closure in an impl of seven type parameters, three of them with no
+/// `'static` bound: E0310 of each.
+#[test]
+fn a_closure_outlives_as_its_captures_do() {
+    assert_eq!(closure_errors("ext(&(move || ()))"), [], "a closure that captures nothing");
+    assert_eq!(
+        closure_errors("let t = self.0; ext(&(move || { let _ = &t; }))"),
+        [("E0310", "opaque".to_owned())],
+        "a closure that captures a `T`"
+    );
+}
+
+/// The control of the invariant above: with a closure's components those of every argument
+/// of its type, the closure that captures nothing needs `T: 'static` too.
+#[test]
+fn the_oracle_catches_a_closure_that_outlives_as_its_arguments_do() {
+    crate::outlives::CLOSURES_OUTLIVE_AS_THEIR_ARGUMENTS.set(true);
+    let found = closure_errors("ext(&(move || ()))");
+    crate::outlives::CLOSURES_OUTLIVE_AS_THEIR_ARGUMENTS.set(false);
+    assert_eq!(found, [("E0310", "opaque".to_owned())]);
 }
 
 /// Callers that rely on the bounds, and the review's control cases, have no error
