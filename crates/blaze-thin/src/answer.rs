@@ -1,0 +1,214 @@
+//! What the daemon answers a build with, as the thin `blaze` takes it: the answer of a build
+//! that had nothing to say ([`Plain`]), which it prints itself, or the first response that is
+//! not such an answer's, at which it hands the whole answer to the engine before it has
+//! written a byte ([`Step::HandOver`]).
+//!
+//! A plain answer is every unit fresh, the build's outputs, its work with nothing computed
+//! again, and a `Done` that is ok. What it prints is then exactly what blaze's CLI prints of
+//! it (`blaze_cargo::cli::print`): a `link:` line an image, `Finished`, and for a `run` its
+//! `Running` line. A diagnostic, a unit compiled, a report, a fetch, an error, a build that
+//! recomputed anything: each is the engine's printer's, which says more than this could
+//! without being that printer a second time.
+//!
+//! A sans-IO core: responses in, a decision and the text out.
+
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use blaze_api::{Artifact, Linked, Response, TargetKind, Tiers, Verb};
+
+use crate::say;
+
+/// What taking a response came to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Step {
+    /// Nothing to say of it; the answer goes on.
+    More,
+    /// The answer ended ok, and all of it was plain.
+    Done,
+    /// The response is not a plain answer's: the engine prints the answer, this one in it.
+    HandOver(&'static str),
+}
+
+/// A build's answer so far, every response of it plain.
+#[derive(Debug, Default)]
+pub struct Plain {
+    /// The profile of [`Response::Built`], which `Finished` names; `None` until it came.
+    profile: Option<String>,
+    artifacts: Vec<Artifact>,
+    links: Vec<Linked>,
+    tiers: Option<Tiers>,
+}
+
+impl Plain {
+    pub fn new() -> Plain {
+        Plain::default()
+    }
+
+    /// Takes the answer's next response.
+    pub fn take(&mut self, response: Response) -> Step {
+        match response {
+            // Shown only under `-v`, which is the engine's.
+            Response::Unit(unit) if unit.verb == Verb::Fresh => Step::More,
+            Response::Unit(_) => Step::HandOver("a unit is compiled"),
+            Response::Built { profile, artifacts, .. } => {
+                if self.profile.is_some() {
+                    return Step::HandOver("a second `Built`");
+                }
+                self.profile = Some(profile);
+                self.artifacts = artifacts;
+                Step::More
+            }
+            Response::Work(worked) => {
+                // What it computed again is said after `Finished`, as reports.
+                if worked.misses != 0 || worked.why.as_ref().is_some_and(|it| !it.is_empty()) {
+                    return Step::HandOver("the build computed something again");
+                }
+                self.links = worked.links;
+                self.tiers = worked.tiers;
+                Step::More
+            }
+            Response::Done { ok: true } => Step::Done,
+            Response::Done { ok: false } => Step::HandOver("the build failed"),
+            _ => Step::HandOver("a response the engine's printer says"),
+        }
+    }
+
+    /// What blaze's CLI writes to stderr of this answer, the build over `took` after the
+    /// command began: one `link:` line an image the build linked (in every format, under `-q`
+    /// too), then `Finished` unless `quiet` or the build placed nothing.
+    pub fn said(&self, quiet: bool, color: bool, took: Duration) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(160); // alloc: once a command, what it prints
+        for link in &self.links {
+            // Writing to a String cannot fail. `blaze_ui::api::link_lines`'s line.
+            let _ = writeln!(out, "link: {} ({})", link.path, link.how);
+        }
+        if let (Some(profile), false) = (&self.profile, quiet) {
+            say::status_word(&mut out, "Finished", color);
+            say::finished_into(&mut out, profile, took);
+            if let Some(tiers) = &self.tiers {
+                out.push_str(" (");
+                out.push_str(&tiers.line());
+                out.push(')');
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The one program a plain `run` (no `--bin`, no `--example`) runs of what was built:
+    /// the only artifact that runs, with its executable and no runner. `None` where cargo
+    /// would refuse (none, several, a library example) or a runner starts it: the engine
+    /// says which (`blaze_cargo::cli::run::pick`).
+    pub fn program(&self) -> Option<&Artifact> {
+        let mut runnable = self.artifacts.iter().filter(|it| {
+            !it.profile.test && matches!(it.target.kind, TargetKind::Bin | TargetKind::Example)
+        });
+        let one = runnable.next()?;
+        if runnable.next().is_some() || !one.runner.is_empty() {
+            return None;
+        }
+        one.executable.as_ref().map(|_| one)
+    }
+}
+
+/// The executable as cargo runs it from `cwd`: below it, relative, and `./foo` for one in it.
+pub fn shown_exe(path: &Path, cwd: &Path) -> PathBuf {
+    match path.strip_prefix(cwd) {
+        Ok(relative) if relative.file_name() == Some(relative.as_os_str()) => {
+            Path::new(".").join(relative)
+        }
+        Ok(relative) => relative.to_owned(),
+        Err(_) => path.to_owned(),
+    }
+}
+
+/// The program a `run` becomes.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Exec {
+    pub program: PathBuf,
+    pub args: Vec<OsString>,
+    /// What cargo sets, over the command's own environment.
+    pub env: Vec<(String, String)>,
+    pub cwd: PathBuf,
+}
+
+impl Exec {
+    /// `executable` (an artifact's, with no runner), run from `cwd` with `args` and the
+    /// variables cargo sets for it (`env`).
+    pub fn of(executable: &str, env: &[(String, String)], args: &[OsString], cwd: &Path) -> Exec {
+        Exec {
+            program: shown_exe(Path::new(executable), cwd),
+            args: args.to_vec(), // clone: the program's arguments, once a run
+            env: env.to_vec(),   // clone: cargo's variables for it, once a run
+            cwd: cwd.to_owned(),
+        }
+    }
+
+    /// cargo's `Running` line of it, with its newline: the command line in backquotes, every
+    /// argument as it is. Only for arguments that are shown unquoted ([`say::plain`]), which
+    /// the route holds a `run` that prints this to.
+    pub fn running(&self, color: bool) -> String {
+        let mut out = String::with_capacity(64); // alloc: once a run, its line
+        say::status_word(&mut out, "Running", color);
+        out.push('`');
+        out.push_str(&self.program.to_string_lossy());
+        for arg in &self.args {
+            out.push(' ');
+            out.push_str(&arg.to_string_lossy());
+        }
+        out.push_str("`\n");
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_api::{ApiError, LinkHow};
+
+    use super::*;
+
+    #[test]
+    fn a_response_that_is_not_a_plain_answers_hands_over() {
+        let mut plain = Plain::new();
+        assert_eq!(plain.take(Response::Done { ok: false }), Step::HandOver("the build failed"));
+        assert!(matches!(plain.take(Response::Error(ApiError::new("no", None))), Step::HandOver(_)));
+        assert!(matches!(plain.take(Response::Flushed { seq: 1 }), Step::HandOver(_)));
+        assert_eq!(plain.take(Response::Done { ok: true }), Step::Done);
+    }
+
+    #[test]
+    fn a_plain_answer_prints_its_links_and_finished() {
+        let mut plain = Plain::new();
+        let built = Response::Built {
+            members: 1,
+            profile: "`dev` profile [unoptimized + debuginfo]".to_owned(),
+            artifacts: Vec::new(),
+        };
+        assert_eq!(plain.take(built), Step::More);
+        plain.links = vec![Linked { how: LinkHow::Unchanged, path: "/w/target/debug/a".to_owned() }];
+        let took = Duration::from_millis(10);
+        assert_eq!(
+            plain.said(false, false, took),
+            "link: /w/target/debug/a (unchanged)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.01s\n"
+        );
+        assert_eq!(plain.said(true, false, took), "link: /w/target/debug/a (unchanged)\n");
+        assert_eq!(plain.program(), None);
+        let again = Response::Built { members: 1, profile: String::new(), artifacts: Vec::new() };
+        assert!(matches!(plain.take(again), Step::HandOver(_)));
+    }
+
+    #[test]
+    fn the_program_is_shown_from_the_commands_directory() {
+        let cwd = Path::new("/w");
+        let exec = Exec::of("/w/target/debug/app", &[], &[OsString::from("--n=1")], cwd);
+        assert_eq!(exec.program, Path::new("target/debug/app"));
+        assert_eq!(exec.running(false), "     Running `target/debug/app --n=1`\n");
+        assert_eq!(shown_exe(Path::new("/w/app"), cwd), Path::new("./app"));
+        assert_eq!(shown_exe(Path::new("/x/app"), cwd), Path::new("/x/app"));
+    }
+}

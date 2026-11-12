@@ -209,6 +209,16 @@ impl Client {
         Client::over(Link::Local(local))
     }
 
+    /// [`Client::local`], its next request sent under `id`: for a [`Local`] that stands for a
+    /// connection another program began (blaze-cargo's `cli::resume`, the thin `blaze`'s
+    /// handover), whose answer carries the id that program sent its request under.
+    // dyn: as `Link::Local`.
+    pub fn local_from(local: Box<dyn Local>, id: u64) -> Client {
+        let mut client = Client::over(Link::Local(local));
+        client.next_id = id;
+        client
+    }
+
     /// Ends the connection: a [`Local`] daemon is stopped, its state made durable, and how that
     /// went is the result; a socket's is only hung up.
     pub fn close(mut self) -> Result<(), ClientError> {

@@ -1,0 +1,43 @@
+[package]
+name = "blaze-thin"
+description = "The thin `blaze`: the small program installed as `blaze`, which answers a build or a run that had nothing to do in one round trip on the daemon's socket and hands every other command line, whole, to the engine (`blaze-engine`) beside it (docs/client.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# Installed as `blaze`, beside `blaze-engine` (docs/client.md, "The thin blaze"). In a build
+# directory it keeps its own name: `blaze` there is blaze-engine's second binary.
+[[bin]]
+name = "blaze-thin"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+# The one schema and its frames: the requests this sends are the CLI's, byte for byte.
+blaze-api.workspace = true
+# The name of the file a pin's lookup is kept in (`pin.rs`).
+blaze-format.workspace = true
+blaze-ids.workspace = true
+# `[terminal]` of blaze's `config.toml`.
+blaze-report.workspace = true
+
+# The program's alone (`main.rs`), which is Unix's: the library (what blaze-cargo and
+# blaze-engine take from here) links none of these, so the wasm seed builds none of them.
+[target.'cfg(unix)'.dependencies]
+# Where the daemon listens, the checkout, the config files outside it, the environment.
+blaze-client.workspace = true
+# The one deadline wait.
+blaze-core.workspace = true
+libc.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -111,7 +111,11 @@ fn began_ns() -> i64 {
 /// Sends what this process recorded to the daemon as build `BUILD`'s client rows, and then,
 /// with `BLAZE_PROFILE` naming a directory, writes the build's trace there as `trace.json`.
 /// Nothing when no build was heard, or in the seed. An error names the step and the build.
-pub fn send() -> Result<Option<PathBuf>, String> {
+///
+/// `wait` false (a `run` about to become its program): the rows are handed to the daemon and
+/// its answer is not waited for ([`observe::tell`]), unless `BLAZE_PROFILE` is set, whose
+/// trace is read back from the history the rows must be in by then.
+pub fn send(wait: bool) -> Result<Option<PathBuf>, String> {
     let build = BUILD.load(Ordering::Relaxed);
     // The seed runs its engine in this process (`serve::once`): its history already records
     // this process, and a second connection would start a second engine.
@@ -119,9 +123,13 @@ pub fn send() -> Result<Option<PathBuf>, String> {
         return Ok(None);
     }
     let request = rows(build)?;
-    observe::ask(request, Start::Never, |_| Ok(()))
-        .map_err(|why| format!("sending build {build}'s client rows to the daemon: {why}"))?;
-    let Some(dir) = std::env::var_os(PROFILE).filter(|it| !it.is_empty()) else { return Ok(None) };
+    let dir = std::env::var_os(PROFILE).filter(|it| !it.is_empty());
+    let sent = match wait || dir.is_some() {
+        true => observe::ask(request, Start::Never, |_| Ok(())),
+        false => observe::tell(request),
+    };
+    sent.map_err(|why| format!("sending build {build}'s client rows to the daemon: {why}"))?;
+    let Some(dir) = dir else { return Ok(None) };
     export(build, Path::new(&dir)).map(Some)
 }
 
