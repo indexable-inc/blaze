@@ -520,14 +520,24 @@ impl IncludedFile {
             return id;
         }
         let generation = blaze_vfs::outside::generation();
-        if kept.is_none()
+        // A watch is asked by a path's own bytes and hears nothing of where a link leads:
+        // only a file whose name has no link in it (the file itself, when it is there, and
+        // its directory) is kept; any other is looked at each time.
+        let plain = match std::fs::canonicalize(path) {
+            Ok(it) => it == path,
+            Err(_) => path.parent().is_some_and(|dir| std::fs::canonicalize(dir).is_ok_and(|it| it == dir)),
+        };
+        if plain
+            && kept.is_none()
             && let Some(dir) = path.parent()
         {
             blaze_vfs::outside::want(dir);
         }
         let id = IncludedFile::content_of(IncludedFile::read_now(path).as_deref());
-        // alloc: once per included file, its path as the key of what was read of it
-        VOUCHED.lock().insert(path.to_path_buf(), (generation, id));
+        if plain {
+            // alloc: once per included file, its path as the key of what was read of it
+            VOUCHED.lock().insert(path.to_path_buf(), (generation, id));
+        }
         id
     }
 

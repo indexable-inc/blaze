@@ -113,7 +113,20 @@ impl Stamp {
 pub struct Files {
     stamped: Sharded<[u8; 32]>,
     vouched: Sharded<Vouched>,
+    /// What [`Files::entry`] last said of a path whose directory has no link in its name,
+    /// with the generation read before it looked: vouched for while the watches heard
+    /// nothing under a directory at or above it since.
+    entries: blaze_core::lock::Lock<
+        blaze_hash::HashMap<PathBuf, (u64, Entry), std::alloc::Global>,
+    >,
     dirs: &'static Dirs,
+}
+
+thread_local! {
+    /// A planted bug, for a test's control: [`Files::entry`] looks at the disk on every ask,
+    /// as until 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static ENTRY_LOOKS_EVERY_TIME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A path's last answer, under a sequence lock: written on a miss (rare, and a writer that
@@ -251,7 +264,15 @@ impl Files {
 
     /// A table whose answers are vouched for by `dirs`' watches.
     pub fn watched_by(dirs: &'static Dirs) -> Files {
-        Files { stamped: Sharded::new(), vouched: Sharded::new(), dirs }
+        Files {
+            stamped: Sharded::new(),
+            vouched: Sharded::new(),
+            entries: blaze_core::lock::Lock::new(
+                "usercode.inputs.entries",
+                blaze_hash::HashMap::new_in(std::alloc::Global),
+            ),
+            dirs,
+        }
     }
 
     /// The one table of the process.
@@ -390,7 +411,43 @@ impl Files {
         if path.file_name().is_some_and(|it| it.to_str().is_none()) {
             return Err(refused("its name is not UTF-8, which no view holds"));
         }
-        // Looked at on the disk every time: no watch vouches for an entry.
+        // The invariant: the disk is looked at only while no watch vouches for the answer
+        // kept. An entry is the path itself, a link not followed, so its answer rests on the
+        // names of its directory alone: kept when that directory's name has no link in it
+        // (it is its own canonical name, the form a watch is asked in), with the generation
+        // read before the look. Until 2026-11-12 every ask looked: a link's native inputs
+        // (glibc's `crt*.o` and `lib*.so`, ten each a build) kept every build on NixOS from
+        // being answered again without a walk.
+        let kept = self.entries.lock().get(path).copied();
+        if let Some((generation, entry)) = kept
+            && self.dirs.unchanged_since(path, generation)
+            && !ENTRY_LOOKS_EVERY_TIME.get()
+        {
+            return Ok(entry);
+        }
+        let generation = self.dirs.generation();
+        let plain = path.parent().is_some_and(|dir| {
+            let canonical = std::fs::canonicalize(dir).is_ok_and(|it| it == dir);
+            if canonical && kept.is_none() {
+                self.dirs.want(dir);
+            }
+            canonical
+        });
+        let entry = self.entry_now(path)?;
+        if plain {
+            // alloc: once per path asked of, its name as the key of what was said of it
+            self.entries.lock().insert(path.to_path_buf(), (generation, entry));
+        }
+        Ok(entry)
+    }
+
+    /// [`Files::entry`] of the disk now: a look, counted.
+    fn entry_now(&self, path: &Path) -> Result<Entry, Unreadable> {
+        // alloc: error path
+        let refused = |error: &str| Unreadable { path: path.to_owned(), error: error.to_owned() };
+        // alloc: error path
+        let unreadable =
+            |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
         blaze_vfs::outside::looked(path);
         let meta = match std::fs::symlink_metadata(path) {
             Ok(meta) => meta,
