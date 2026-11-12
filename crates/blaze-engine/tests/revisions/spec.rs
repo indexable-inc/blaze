@@ -220,6 +220,10 @@ impl Step {
             Step::Do(action) => action.word().to_owned(),
             Step::Project(name) => format!("project {name}"),
             Step::Home(name) => format!("home {name}"),
+            Step::Start => "start".to_owned(),
+            Step::Await { within_ms, text } => format!("await {within_ms} {text}"),
+            Step::Count { times, text } => format!("count {times} {text}"),
+            Step::End => "end".to_owned(),
         }
     }
 }
