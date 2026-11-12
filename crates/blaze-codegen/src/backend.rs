@@ -111,6 +111,18 @@ pub struct Described<I, S> {
     /// key, which instance of the item it is (a closure by its place in its owner's body, a
     /// shim by its kind) and its type arguments. An edit of its body keeps it.
     pub identity: ContentId,
+    /// What a caller's code assumes of it beyond its address: its calling convention, whether
+    /// it is variadic, and for each argument and its result the identity of the type, which
+    /// holds the layout of the type and of every type it names, behind references and
+    /// pointers too (a `&Foo` argument is read at `Foo`'s offsets), a closure by its
+    /// captures' types and a `dyn` by its trait's interface (its vtable's shape). How each
+    /// value is passed is the backend's function of the target and those layouts, so equal
+    /// ones pass alike. Two functions with one `abi` can be called by each other's callers.
+    /// An edit of its body keeps it, as it keeps `identity`; an edit of its signature, or of
+    /// the layout of a type its signature names, changes it and keeps `identity`
+    /// (docs/v2/plan/design/launcher.md, "More than one changed body, and a changed
+    /// signature": a running program's slot is `identity` and this).
+    pub abi: ContentId,
     /// Its code as it runs, test selection's `Bound`: its code hash, its item's
     /// `blaze_items::bound_hash` (which function each ref of its body binds to) and its type
     /// arguments. `Err` names why its item's could not be hashed; only a test binary's table

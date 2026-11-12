@@ -71,7 +71,7 @@ impl Shelf {
             function.identity_of,
             function.anchors,
             (function.foreign, function.over_editable),
-            program.devirtualized(id),
+            (program.devirtualized(id), program.abi(id)),
         );
         key.part(rest.as_bytes());
         Some(Key(key.finish()))

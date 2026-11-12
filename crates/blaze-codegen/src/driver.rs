@@ -241,6 +241,12 @@ pub struct Built {
     /// its members' identities: what a profile of an earlier build names it by
     /// (docs/v2/plan/design/code-layout.md).
     pub identities: Vec<(InstanceKey, ContentId)>,
+    /// Every instance the walk reached by key, with what a caller's code assumes of it
+    /// beyond its address ([`Described::abi`]): with [`Self::identities`], what a running
+    /// program's slot of it is keyed by. Whole in every `Built`; [`Delta`] does not name a
+    /// function whose `abi` alone changed (its key and code are what they were), so a reader
+    /// that applies deltas reads this list whole.
+    pub abis: Vec<(InstanceKey, ContentId)>,
     /// The instances the front end inferred cold ([`Described::cold`]), by key: a full link
     /// puts them after every other function.
     pub cold: Vec<InstanceKey>,
@@ -3549,6 +3555,8 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut identities: Vec<(InstanceKey, ContentId)> =
             nodes.iter().map(|(key, node)| (*key, node.subject())).collect();
         identities.append(&mut out.folded);
+        // alloc: per build, what it gives a running program's slots
+        let abis = nodes.iter().map(|(key, node)| (*key, node.described.abi)).collect();
         // alloc: per build, what it gives the linker
         let cold = nodes.iter().filter(|it| it.1.described.cold).map(|it| *it.0).collect();
         let made = nodes
@@ -3620,6 +3628,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             digests: pieces,
             memo_used: used,
             identities,
+            abis,
             cold,
             made,
             kernel,

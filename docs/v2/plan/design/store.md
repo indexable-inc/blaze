@@ -347,6 +347,15 @@ to, the record holds what the recursion limit reads of it (`Counted`): the walk 
 callee before describing it, and working it out runs `compiled_by_user`, which builds the
 callee's optimized body (2.7 s of the profile above). No database id is in the bytes.
 
+`Described::abi` (2026-11-12, for the launcher lane; launcher.md, "More than one changed body,
+and a changed signature") is a fact of the describe like any other, so it is a field of the
+record and nothing beside it: what a caller's code assumes of the function beyond its address
+(its convention, whether it is variadic or takes its caller's location, and the identity of
+each argument's and the result's type, which holds every layout the signature names behind
+references too, with the interface of each trait a `dyn` in it names;
+`hir-ty-codegen/v2/frontend/abi.rs`). The walk carries it to `Built::abis`, by key, beside
+`identities`.
+
 **The walk.** `Build::recording(store)`: for a function no kept walk holds, the driver asks the
 front end for the key, the store for the record (on whichever core visits it, under its own
 guard), and the front end to read it; only a miss is described, and the record of each describe

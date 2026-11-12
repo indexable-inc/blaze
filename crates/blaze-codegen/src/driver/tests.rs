@@ -53,6 +53,14 @@ struct Function {
     /// One of its type arguments names a workspace type, closure or item
     /// ([`Described::over_editable`]); read only when it is not editable.
     over_editable: bool,
+    /// Its signature, as a byte: what its callers' code is compiled against, so in their code
+    /// and in its own [`Described::abi`]. 0 unless a test says, and then in no hash.
+    signature: u8,
+    /// The types its signature names, behind a reference or not: each one's layout is in
+    /// its [`Described::abi`] and, unless it also reads it, in no code.
+    names_layouts: Vec<u32>,
+    /// The types whose layout its body reads: each one's layout is in its code.
+    reads_layouts: Vec<u32>,
 }
 
 struct Program {
@@ -90,6 +98,10 @@ struct Program {
     /// The describes this front end keeps as records and reads back (`tests/recorded.rs`):
     /// `None`, it keeps none ([`Frontend::record_key`]'s default).
     shelf: Option<std::sync::Arc<recorded::Shelf>>,
+    /// The version of each type's layout, 0 unless set: what a function whose signature
+    /// names the type hands its callers ([`Described::abi`]) and one whose body reads it
+    /// compiles against.
+    layouts: HashMap<u32, u8>,
 }
 
 /// The front end's query engine, as [`Frontend::redescribe`] needs it: a revision an edit, the
@@ -182,6 +194,7 @@ impl Default for Program {
             dyn_sites: HashMap::default(),
             engine: Engine::default(),
             shelf: None,
+            layouts: HashMap::default(),
         }
     }
 }
@@ -196,7 +209,19 @@ impl Program {
         if function.code_of.is_none() {
             for callee in &function.calls {
                 code.update(&callee.to_le_bytes());
+                // A callee by its interface: its signature, where a test gave it one.
+                match self.functions.get(callee).map(|it| it.signature) {
+                    Some(signature) if signature != 0 => code.update(&[0xA5, signature]),
+                    _ => &mut code,
+                };
             }
+        }
+        if function.signature != 0 {
+            code.update(&[0x5A, function.signature]);
+        }
+        for layout in &function.reads_layouts {
+            code.update(&layout.to_le_bytes())
+                .update(&[0xC3, self.layouts.get(layout).copied().unwrap_or(0)]);
         }
         CodeHash(code.finish())
     }
@@ -273,8 +298,22 @@ impl Program {
             crates: self.crates.clone(),
             limits: self.limits.clone(),
             dyn_sites: self.dyn_sites.clone(),
+            layouts: self.layouts.clone(),
             ..Program::default()
         }
+    }
+
+    /// What callers of `id` assume of it: its signature and the version of each layout its
+    /// signature names, never its body or what it calls.
+    fn abi(&self, id: u32) -> ContentId {
+        let function = &self.functions[&id];
+        let mut abi = Hasher::new("blaze v2 test abi 1");
+        abi.update(&[function.signature]);
+        for layout in &function.names_layouts {
+            abi.update(&layout.to_le_bytes())
+                .update(&[self.layouts.get(layout).copied().unwrap_or(0)]);
+        }
+        abi.finish()
     }
 
     fn function(&mut self, id: u32, body: u8, calls: &[u32]) -> &mut Function {
@@ -293,6 +332,9 @@ impl Program {
             anchors: None,
             foreign: false,
             over_editable: false,
+            signature: 0,
+            names_layouts: Vec::new(),
+            reads_layouts: Vec::new(),
         };
         self.functions.insert(id, function);
         self.functions.get_mut(&id).unwrap()
@@ -367,6 +409,9 @@ impl Frontend for Program {
                 "blaze v2 test identity 1",
                 &function.identity_of.unwrap_or(*id).to_le_bytes(),
             ),
+            // What its callers assume of it: its own signature byte and each layout its
+            // signature names, by the layout's version.
+            abi: self.abi(*id),
             bound: Ok(code.0),
             item: item(*id),
             code,
@@ -1859,6 +1904,7 @@ mod kept;
 mod later;
 mod masks;
 mod near;
+mod abis;
 mod pieces;
 mod recorded;
 mod stop;

@@ -47,6 +47,7 @@ use crate::{
     Instance, InstanceDef, exported_linkage, exported_static, exported_symbol, fncache, linked_symbol,
 };
 
+mod abi;
 mod described;
 
 /// The build's database, `Sync` and shared by reference by every task. Nothing here locks.
@@ -856,6 +857,7 @@ impl<'db> HirFrontend<'db> {
             false => plain,
         };
         let identity = identity(db, &instance.0, item, plain);
+        let abi = abi::abi_of(db, hashes, &instance.0, plain).map_err(fail)?;
         let bound = bound(db, &instance.0, code, plain);
         let cold = cold_of(db, &instance.0);
         // Always the origin's profile, which keys it (rule 21). Pinning the setting of one
@@ -901,6 +903,7 @@ impl<'db> HirFrontend<'db> {
             built_in,
             owner,
             identity,
+            abi,
             bound,
             cold,
         })

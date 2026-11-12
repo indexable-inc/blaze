@@ -341,6 +341,7 @@ pub(super) fn difference(
     same!(versions);
     same!(digests);
     same!(identities);
+    same!(abis);
     same!(cold);
     same!(made);
     same!(walked);

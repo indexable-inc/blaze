@@ -570,6 +570,7 @@ impl<'db> HirFrontend<'db> {
             name,
             owner,
             identity,
+            abi,
             bound,
             cold,
         } = described;
@@ -579,6 +580,7 @@ impl<'db> HirFrontend<'db> {
         put_id(&mut out, &built_in_code.0);
         put_id(&mut out, args);
         put_id(&mut out, identity);
+        put_id(&mut out, abi);
         match anchors {
             Some(anchors) => {
                 out.put_u8(1);
@@ -677,6 +679,7 @@ impl<'db> HirFrontend<'db> {
         let built_in_code = CodeHash(get_id(&mut bytes)?);
         let args = get_id(&mut bytes)?;
         let identity = get_id(&mut bytes)?;
+        let abi = get_id(&mut bytes)?;
         let anchors = match flag(bytes.u8()?)? {
             true => {
                 let mut anchors = [ContentId::default(); blaze_codegen::template::OWN_TABLES];
@@ -754,6 +757,7 @@ impl<'db> HirFrontend<'db> {
             name,
             owner: if flags & 32 != 0 { Owner::Workspace } else { Owner::Dependency },
             identity,
+            abi,
             bound,
             cold: flags & 4 != 0,
         })
