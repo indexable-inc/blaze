@@ -83,6 +83,9 @@ class Run:
     body_edits: int = 5
     comment_edits: int = 5
     settle_seconds: int = 8
+    # Between two turns: an edit made while the daemon still works on the last (what it does
+    # after an answer) waits for it, and is no measure of an edit.
+    pause_seconds: float = 1.5
     # Keep the daemon running (and the home as it is while it runs) instead of stopping it.
     stop: bool = True
 
@@ -310,14 +313,20 @@ def read_value(value: Value) -> bytes:
         return f.read(value.length)
 
 
-def walk(root: str, top: str = "") -> list[tuple[str, str, os.stat_result]]:
-    """Every regular file under `root`: (path, path from `root` with `top` before it, its stat)."""
+def walk(root: str, top: str = "", running: bool = False) -> list[tuple[str, str, os.stat_result]]:
+    """Every regular file under `root`: (path, path from `root` with `top` before it, its stat).
+    `running`: a daemon is writing there, so a file listed may be gone when it is looked at."""
     out = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames.sort()
         for name in sorted(filenames):
             path = os.path.join(dirpath, name)
-            st = os.lstat(path)
+            try:
+                st = os.lstat(path)
+            except FileNotFoundError:
+                if running:
+                    continue
+                raise
             if not os.path.isfile(path) or os.path.islink(path):
                 continue
             rel = os.path.relpath(path, root)
@@ -552,6 +561,7 @@ def session(it: Run) -> dict:
             bad += 1
             print(f"{SCRIPT}: {what}: exit {done.returncode}\n{done.stdout[-600:]}\n{done.stderr[-1200:]}")
         rows.append({"what": what, "seconds": seconds, "ok": ok})
+        time.sleep(it.pause_seconds)
 
     def edit(pattern: str, replacement: str) -> None:
         with open(main) as f:
@@ -569,7 +579,8 @@ def session(it: Run) -> dict:
     snapshots = {"after the build": quick(home, xdg)}
     for i in range(1, it.body_edits + 1):
         edit(r"\+ \d+\)", f"+ {400 + i})")
-        turn("body edit", 455 + i)
+        # The first edit after a cold build does work no later one does: a row of its own.
+        turn("first body edit" if i == 1 else "body edit", 455 + i)
     last = 455 + it.body_edits if it.body_edits else 155
     snapshots["after the body edits"] = quick(home, xdg)
     for i in range(1, it.comment_edits + 1):
@@ -578,14 +589,21 @@ def session(it: Run) -> dict:
     time.sleep(it.settle_seconds)
     snapshots["after the comment edits, settled"] = quick(home, xdg)
     if it.stop:
+        pids = daemons(home)
         start = time.monotonic()
         done = subprocess.run([blaze, "stop"], cwd=project, env=env, capture_output=True, text=True)
         rows.append({"what": "stop", "seconds": time.monotonic() - start, "ok": done.returncode == 0})
         if done.returncode:
             bad += 1
             print(f"{SCRIPT}: stop: exit {done.returncode}\n{done.stdout[-600:]}\n{done.stderr[-600:]}")
-        # `stop` answers before the daemon's process has gone (agents.json rev-3).
-        time.sleep(3)
+        # `stop` answers before the daemon's process has gone (agents.json rev-3): the bytes
+        # are read once it has, so nothing is still being written or removed.
+        gone = time.monotonic() + 120
+        while any(alive(pid) for pid in pids):
+            if time.monotonic() > gone:
+                fail(SCRIPT, f"the daemon (pid {pids}) is still there 120 s after `blaze stop` answered")
+            time.sleep(0.1)
+        rows.append({"what": "stop to exit", "seconds": time.monotonic() - start, "ok": True})
         snapshots["after stop"] = quick(home, xdg)
     medians = {
         what: {
@@ -611,12 +629,30 @@ def session(it: Run) -> dict:
     }
 
 
+def daemons(home: str) -> list[int]:
+    """The pids of the daemons of `home`: each has a flight recorder's mapping named for it."""
+    profile = os.path.join(home, "v2", "profile")
+    found = [re.fullmatch(r"flight-(\d+)\.map", name) for name in os.listdir(profile)]
+    pids = [int(it.group(1)) for it in found if it]
+    if not pids:
+        fail(SCRIPT, f"no daemon's flight recorder is in {profile}: which process to wait for is not known")
+    return pids
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 def quick(home: str, xdg: str) -> dict[str, int]:
     """Bytes of blocks by top directory, each inode once (as `du` says them: clones counted twice)."""
     out: dict[str, int] = {}
     seen: set[tuple[int, int]] = set()
     for root, top in ((home, ""), (os.path.join(xdg, "blaze"), "machine")):
-        for path, rel, st in walk(root, top):
+        for path, rel, st in walk(root, top, running=True):
             if (st.st_dev, st.st_ino) in seen:
                 continue
             seen.add((st.st_dev, st.st_ino))

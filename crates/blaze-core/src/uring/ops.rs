@@ -113,6 +113,9 @@ pub(super) const STOPPING: u8 = 1 << 1;
 /// that bypasses the page cache, and the open of its file ([`POSITIONAL`]): asked for by its
 /// effect ([`crate::Cache::Bypassed`]), never chosen by the driver.
 pub(super) const DIRECT: u8 = 1 << 2;
+/// A [`Kind::Sync`] of the file's data alone ([`crate::Effect::Barrier`]: `IORING_FSYNC_DATASYNC`,
+/// `fdatasync`), told as [`crate::Done::Ordered`] (the bit [`DIRECT`] is).
+pub(super) const DATA: u8 = 1 << 2;
 /// The output pipe read is the spawn's standard error.
 pub(super) const STDERR: u8 = 1 << 3;
 /// Its names are in the second of [`Paths`]' arenas.

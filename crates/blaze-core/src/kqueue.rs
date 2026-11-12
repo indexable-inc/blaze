@@ -526,6 +526,7 @@ impl Kqueue {
             | Effect::ReadLink { .. }
             | Effect::Append { .. }
             | Effect::Sync { .. }
+            | Effect::Barrier { .. }
             | Effect::WriteBack { .. }
             | Effect::SyncDir { .. }
             | Effect::Truncate { .. }

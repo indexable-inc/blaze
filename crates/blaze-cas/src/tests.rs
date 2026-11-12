@@ -1898,7 +1898,7 @@ fn a_crash_at_any_point_loses_nothing_durable_and_serves_nothing_torn() {
 fn the_oracle_catches_a_put_reported_durable_that_no_sync_made_so() {
     let (seed, why) = block_checks::head_before_syncs_caught();
     assert!(
-        why.contains("did not open") && why.contains("its head names"),
+        why.contains("did not open") && block_checks::names_what_is_not_there(&why),
         "seed {seed}: caught, but not as a head naming what is not durable: {why}"
     );
 }
@@ -3700,6 +3700,44 @@ fn values_compressed_on_another_thread_move_cold_as_a_settle_moves_them() {
     for n in 0..12 {
         assert_eq!(bytes_of(&store, &key(n)).unwrap(), value(n), "{n} after a reopen");
     }
+}
+
+/// A kind with no dictionary and enough values planned for a training: its batch takes
+/// them at once, trains the dictionary where it is compressed, and the store keeps it as the
+/// kind's when the batch comes back. Short values move with it too, and all read back after a
+/// reopen, which reads the dictionary from the pack the head names.
+#[test]
+fn a_batch_trains_its_kind_s_dictionary_where_it_is_compressed() {
+    let mut sim = Sim::new(36, quiet());
+    let mut store = open(&mut sim, "store");
+    let count = cold::TRAIN_VALUES as u64 + 30;
+    let value = |n: u64| text(n, if n % 2 == 0 { 900 } else { 5 << 10 });
+    for n in 0..count {
+        store.put(key(n), Kind::Query, &value(n)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    assert_eq!(settle_in_steps(&mut sim, &mut store, 1), Settled::default());
+    assert_eq!(settle_in_steps(&mut sim, &mut store, 1), Settled::default());
+    assert!(store.end_period());
+    let mut batch = store.settle_take(1).expect("the plan lists every value");
+    assert_eq!(batch.len() as u64, count, "a batch that trains takes what a training needs");
+    batch.compress();
+    assert!(batch.trained());
+    assert_eq!(store.settle_put(batch), count);
+    assert!(store.settle_take(1).is_none());
+    let mut effects = Vec::new();
+    store.settle_step(1 << 20, &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    flush(&mut sim, &mut store);
+    assert_eq!(store.tiers[0].dictionaries.len(), 1);
+    assert_eq!(store.problems(), &[] as &[String]);
+    drop(store);
+    let store = open(&mut sim, "store");
+    for n in 0..count {
+        assert_eq!(form_of(&store, &key(n)), Form::Zstd, "{n}");
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), value(n), "{n}");
+    }
+    assert_eq!(store.verify(None), Vec::new());
 }
 
 #[test]

@@ -49,6 +49,7 @@ pub mod observe;
 #[cfg(not(feature = "native"))]
 pub(crate) mod once;
 mod plane;
+mod settle;
 mod pulse;
 pub(crate) mod said;
 pub mod settings;
@@ -1396,6 +1397,7 @@ fn begin(
         .map_err(|why| anyhow::anyhow!(why))?;
     if settings.auto {
         daemon.collect(gc::Gc::new(gc::areas(&root, &machine()?), &state()?, settings.levels));
+        daemon.settle(settle::Settles::new(settle::Compress::Pool));
     } else {
         eprintln!(
             "{who}: {} sets \"auto\": false: the daemon collects nothing on its own (`blaze cache gc` still does when run)",

@@ -283,6 +283,40 @@ pub(crate) fn sync(path: &Path) -> io::Result<()> {
     return OpenOptions::new().append(true).create(true).open(path)?.sync_all();
 }
 
+/// [`crate::Effect::Barrier`] on Linux: `fdatasync`, the cheapest call there that orders a
+/// file's bytes before later writes (it is durable too: Linux has no barrier without the
+/// drive's flush).
+#[cfg(target_os = "linux")]
+pub(crate) fn barrier(path: &Path) -> io::Result<()> {
+    linux::barrier(path)
+}
+
+/// [`crate::Effect::Barrier`] on Apple's systems: `fcntl(F_BARRIERFSYNC)` (85, in
+/// `<sys/fcntl.h>`: "fsync + issue barrier to drive"), which writes the file out and orders
+/// it before later writes with no flush of the drive's cache. `F_FULLFSYNC` waits for that
+/// flush, tens of milliseconds a call on Apple's own drives; the barrier is the call their
+/// file systems make for their own journals. A file system that has no barrier fails the
+/// call, and the effect with it, naming the file: nothing else is tried in its place.
+#[cfg(target_vendor = "apple")]
+#[expect(unsafe_code, reason = "fcntl(F_BARRIERFSYNC), the one call that orders a file's bytes without the drive's flush")]
+pub(crate) fn barrier(path: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let file = OpenOptions::new().append(true).create(true).open(path)?;
+    // SAFETY: an open descriptor, and a command that takes no argument.
+    match unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } {
+        -1 => Err(io::Error::last_os_error()),
+        _ => Ok(()),
+    }
+}
+
+/// [`crate::Effect::Barrier`] where the system has neither a barrier nor Linux's calls: the
+/// file's data synced, which orders it (and is durable).
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+pub(crate) fn barrier(path: &Path) -> io::Result<()> {
+    // durable: the effect is the ordering its caller asked for; this system's one call for it waits for the device.
+    OpenOptions::new().append(true).create(true).open(path)?.sync_data()
+}
+
 /// [`crate::Effect::WriteBack`]: the data of the file at `path` that is only in memory written
 /// to its device, waited for here (on a driver's thread; the effect's asker waits for
 /// nothing). Opened to read, so a file sealed read-only is written back too. Nothing of the

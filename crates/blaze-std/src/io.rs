@@ -1147,6 +1147,7 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
         | Effect::Map { file, .. } => named(file, false),
         Effect::Append { file, .. }
         | Effect::Sync { file, .. }
+        | Effect::Barrier { file, .. }
         | Effect::WriteBack { file, .. }
         | Effect::Truncate { file, .. }
         | Effect::Write { file, .. }

@@ -259,6 +259,13 @@ pub(super) fn head_before_syncs_caught() -> (u64, String) {
     caught.expect("the oracle missed the planted head written before its syncs")
 }
 
+/// Whether a store that did not open says its head names bytes that are not on the disk:
+/// said by the open's own scan ("its head names ..."), or, since packs are read through the
+/// pool, by the pool's load of the pack, which got fewer bytes than the head commits.
+pub(super) fn names_what_is_not_there(why: &str) -> bool {
+    why.contains("its head names") || (why.contains(" bytes of the ") && why.contains(" committed there"))
+}
+
 /// The planted-bug control (bug 7): with the head written before the syncs of its packs and
 /// their checks complete, the directed case fails under some seed's crash, and fails as that
 /// bug does: the store does not open, because its head names bytes of a pack, or checks of
@@ -267,7 +274,7 @@ pub(super) fn head_before_syncs_caught() -> (u64, String) {
 fn the_oracle_catches_a_head_written_before_its_syncs() {
     let (seed, why) = head_before_syncs_caught();
     assert!(
-        why.contains("did not open") && why.contains("its head names"),
+        why.contains("did not open") && names_what_is_not_there(&why),
         "seed {seed}: caught, but not as a head naming what is not durable: {why}"
     );
 }

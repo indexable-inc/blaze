@@ -83,6 +83,9 @@ use crate::{
 /// `IORING_OP_NOP`: completes with 0 and does nothing, where a chain's sync is left out.
 const OP_NOP: u8 = 0;
 const OP_FSYNC: u8 = 3;
+/// `fsync_flags` of an `IORING_OP_FSYNC`: the file's data and what a read of it needs (its
+/// length), as `fdatasync` ([`crate::Effect::Barrier`]).
+const IORING_FSYNC_DATASYNC: u32 = 1;
 const OP_POLL_ADD: u8 = 6;
 const OP_ACCEPT: u8 = 13;
 const OP_ASYNC_CANCEL: u8 = 14;
@@ -2553,6 +2556,14 @@ impl Driver for Uring {
                         ops::NO_BYTES,
                         Cold::EMPTY,
                     );
+                    None
+                }),
+                // The same request with `IORING_FSYNC_DATASYNC`: Linux's cheapest ordering.
+                Effect::Barrier { file, .. } => self.file(&file, true).map(|file| {
+                    let file = self.hold(file);
+                    let mut hot = Hot::new(tag, Kind::Sync, file.to_bits());
+                    hot.flags |= ops::DATA;
+                    self.start(hot, ops::NO_BYTES, Cold::EMPTY);
                     None
                 }),
                 // No io_uring op cuts a file below Linux 6.9 (`IORING_OP_FTRUNCATE`): one open
