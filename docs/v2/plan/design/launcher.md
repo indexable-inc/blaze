@@ -451,8 +451,9 @@ control thread; `Command`'s children run, since nothing they call before `exec` 
   message has its file, line and column.
 - The launcher's file is not an input of the unit's record: a new blaze with another
   launcher places it only for a program it builds first.
-- x86-64: the call sequences and the placement are tested as bytes; nothing of the launcher
-  has run there, and thread-locals are refused by name.
+- x86-64: the call sequences and the placement are tested as bytes and the launcher's
+  crates compile for x86-64 Linux (`cargo check`); nothing of the launcher has run there,
+  and thread-locals are refused by name.
 
 ## Step 5 as built, first version: a body edit while the program runs
 
