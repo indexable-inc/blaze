@@ -250,8 +250,7 @@ pub fn o() {}
 
         // A release of the top takes everything below it, in one write.
         await_crates(&mut db, &[main]);
-        let released = release(&mut db, &[main]);
-        assert_eq!(names(&db, released), ["lib1", "main"]);
+        assert_eq!(names(&db, release(&mut db, &[main])), ["lib1", "main"]);
         assert!(!any_awaited(&db) && blocked(&db).is_empty());
         assert_ne!(db.nonce_and_revision().1, view, "the release is a write");
         let view = db.nonce_and_revision().1;
