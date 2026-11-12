@@ -193,6 +193,11 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 65. **granular-caching**: Every cache is keyed per item (a function, a type, an impl, a name), by that
     item's own content and exactly what it read; a key at crate level is not acceptable, and a crate
     is only a container entries are packed in. Skill: `compiler-correctness`.
+66. **end-state-not-hill-climb**: Work toward the designed end state, never by climbing from fix to fix:
+    when an area needs a second fix for the same symptom, stop patching, write the end-state design
+    from first principles (with how the best existing systems do it), have it reviewed by someone
+    outside the work, and rebuild that part; a fast path bolted onto a slow default is the sign.
+    Skill: `changing-code`.
 
 ## Code Review Rules
 
