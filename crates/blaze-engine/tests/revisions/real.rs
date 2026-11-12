@@ -84,6 +84,8 @@ struct Real {
     dir: PathBuf,
     home: PathBuf,
     cache: PathBuf,
+    /// Every checkout a `project` step made beside the first, each set aside with it.
+    others: Vec<PathBuf>,
     /// How much of the daemon's log was read for panics.
     log_read: u64,
     /// Whether a failure leaves the root in place, for its logs.
@@ -113,7 +115,7 @@ impl Real {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("test"), &test.name).unwrap();
         let blaze = std::env::var_os("BLAZE_REVISIONS_BLAZE").map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_blaze")), PathBuf::from);
-        Real { blaze, dir: root.join("w"), home: root.join("h"), cache: root.join("c"), root, log_read: 0, keep: true }
+        Real { blaze, dir: root.join("w"), home: root.join("h"), cache: root.join("c"), others: Vec::new(), root, log_read: 0, keep: true }
     }
 
     fn blaze(&self, args: &[&str], env: &BTreeMap<String, String>) -> Out {
@@ -346,6 +348,7 @@ impl Real {
                 let file = fs::File::options().write(true).open(self.dir.join(path)).unwrap_or_else(|error| panic!("touch {path}: {error}"));
                 file.set_modified(SystemTime::now()).unwrap();
             }
+            Step::Project(name) => self.enter(Some(name)),
             Step::Do(action) => {
                 // The revision's own arguments: a request that differs in them is another
                 // request to the no-op lane.
@@ -357,10 +360,26 @@ impl Real {
         }
     }
 
-    /// The homes and the checkout set aside under `as_`, so the next build starts from
+    /// Commands run in the checkout of the project `name` from here on (`project NAME`), or
+    /// in the first (`None`): a directory beside the first, under the same home and daemon.
+    fn enter(&mut self, name: Option<&str>) {
+        let dir = self.root.join(match name {
+            // Never the first checkout's, the homes' or the scratch directory's name.
+            Some(name) => format!("p-{name}"),
+            None => "w".to_owned(),
+        });
+        if name.is_some() && !self.others.contains(&dir) {
+            self.others.push(dir.clone()); // clone: a path, once a project
+        }
+        fs::create_dir_all(&dir).unwrap();
+        self.dir = dir;
+    }
+
+    /// The homes and every checkout set aside under `as_`, so the next build starts from
     /// nothing at the same paths.
     fn set_aside(&mut self, as_: &str) {
-        for dir in [&self.dir, &self.home, &self.cache] {
+        let first = self.root.join("w");
+        for dir in [&first, &self.home, &self.cache].into_iter().chain(&self.others) {
             if dir.exists() {
                 let aside = dir.with_extension(as_);
                 let _ = fs::remove_dir_all(&aside);
@@ -430,7 +449,8 @@ pub fn rows(test: &Test, clean_when: Clean) -> (Vec<Row>, String) {
             // clone: one clean build's outcome, read by a second revision
             Some((_, clean)) => clean.clone(),
             None => {
-                fs::create_dir_all(&real.dir).unwrap();
+                // In its project's checkout, at the path the incremental build had it.
+                real.enter(test.project_at(index).1);
                 let files: Vec<Change> =
                     test.files_at(index).into_iter().map(|(path, bytes)| Change { path, bytes: Some(bytes) }).collect();
                 real.write(&files, &Step::Edit);

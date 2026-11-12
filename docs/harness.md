@@ -567,8 +567,10 @@ A case is `crates/blaze-engine/tests/revisions/cases/<name>/`: `base/` (the proj
     known = { "real: max_executed" = "why it fails today" }
 
 Steps: `edit`, `edit by rename` (written beside and renamed over), `edit by truncate then write`,
-`stop` (`blaze stop`), `kill` (`kill -9` of the daemon), `touch PATH`, and `check`, `build`, `run`,
-`test` (a command that only has to succeed). Expectations: `fails` (the action fails saying
+`stop` (`blaze stop`), `kill` (`kill -9` of the daemon), `touch PATH`, `project NAME` (from here
+on the commands run in a second checkout beside the first, served by the same daemon; the
+revision's overlay is that project's files whole; the real driver only), and `check`, `build`,
+`run`, `test` (a command that only has to succeed). Expectations: `fails` (the action fails saying
 this), `prints`, `says`, `redone` (exactly), `redone_has`, `reused`, `max_units`, `max_executed`,
 `max_verified`, `max_ms`, `noop` (answered as the last build was, with no walk), `link` (`first`,
 `spliced`, `unchanged`, `full`, `none`), `bytes` (the linked bytes equal a clean build's), `env`

@@ -1,0 +1,22 @@
+about = "A second project, in another directory and of another name, built by a daemon that has built one: the standard library's units are the ones the first project's build left (2026-11-11: each of the 26 was made again, as every crate of the library held the asking workspace's root), so only the project's own unit is made, whatever the library's size."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "one\n"
+
+[[revision]]
+steps = ["project two", "edit"]
+action = "run"
+prints = "two\n"
+max_units = 1
+max_executed = 20000
+
+[revision.known]
+max_executed = "each checkout has a front end's database of its own (F1, docs/v2/plan/design/restore.md): the second project's first build runs about 2.3 million engine memos, the library's name resolution, impls and describes again, though it makes no unit of the library (2026-11-11)"
+
+[[revision]]
+steps = []
+action = "run"
+prints = "two\n"
+max_units = 0

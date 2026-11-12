@@ -92,6 +92,11 @@ pub enum Step {
     Touch(String),
     /// A command whose outcome only has to be success: `build`, `run`, `check`, `test`.
     Do(Action),
+    /// From here on the commands run in another checkout, of this name, beside the first:
+    /// a second project, served by the same daemon. The revision's files are that project's
+    /// whole, and the revisions after it change that project. Only the real driver has two
+    /// checkouts.
+    Project(String),
 }
 
 /// What must come of a revision's action. Every list is of function paths as `blaze why`
@@ -190,10 +195,17 @@ fn step(word: &str, at: &str) -> Step {
         "kill" => Step::Kill,
         _ => match word.split_once(' ') {
             Some(("touch", path)) => Step::Touch(path.to_owned()),
+            Some(("project", name)) => {
+                assert!(
+                    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                    "{at}: `project NAME` names a directory beside the first checkout, by letters, digits and `_`, not `{name}`"
+                );
+                Step::Project(name.to_owned())
+            }
             _ => Step::Do(Action::of(word).unwrap_or_else(|| {
                 panic!(
                     "{at}: no step `{word}`: `edit`, `edit by rename`, `edit by truncate then write`, `stop`, \
-                     `kill`, `touch PATH`, `check`, `build`, `run`, `test`"
+                     `kill`, `touch PATH`, `project NAME`, `check`, `build`, `run`, `test`"
                 )
             })),
         },
@@ -310,10 +322,27 @@ impl Test {
         Test { name: name.to_owned(), about, drivers, seeds: count(&table, "seeds", &at).unwrap_or(8), revisions }
     }
 
-    /// The project's files as they are after revision `upto` (an index), by path.
+    /// The revision that began the project revision `upto` (an index) is of, and the
+    /// project's name: the last at or before it with a [`Step::Project`], or the first
+    /// revision and no name (the first checkout).
+    pub fn project_at(&self, upto: usize) -> (usize, Option<&str>) {
+        for (index, revision) in self.revisions[..=upto].iter().enumerate().rev() {
+            let named = revision.steps.iter().rev().find_map(|it| match it {
+                Step::Project(name) => Some(name.as_str()),
+                _ => None,
+            });
+            if named.is_some() {
+                return (index, named);
+            }
+        }
+        (0, None)
+    }
+
+    /// The files of revision `upto`'s project as they are after it (an index), by path.
     pub fn files_at(&self, upto: usize) -> BTreeMap<String, Vec<u8>> {
         let mut files = BTreeMap::new();
-        for revision in &self.revisions[..=upto] {
+        let (began, _) = self.project_at(upto);
+        for revision in &self.revisions[began..=upto] {
             for change in &revision.changes {
                 match &change.bytes {
                     // clone: the test's bytes, into the state asked for
