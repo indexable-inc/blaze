@@ -40,6 +40,7 @@ pub(crate) struct Budget {
 
 impl Budget {
     /// A budget of `limit` bytes inside `outer`.
+    #[blaze::nonblocking]
     pub(crate) fn new(limit: u64, outer: Option<Arc<Budget>>) -> Arc<Budget> {
         // alloc: once per limit set.
         Arc::new(Budget { limit, used: AtomicU64::new(0), outer })
@@ -49,7 +50,7 @@ impl Budget {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     fn take_here(&self, bytes: u64) -> Result<(), Over> {
-        let took = self.used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+        let took = self.used.try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
             used.checked_add(bytes).filter(|after| *after <= self.limit)
         });
         match took {
@@ -81,6 +82,7 @@ impl Budget {
     }
 
     /// `bytes` taken before and not used after all, given back here and to each it is inside.
+    #[blaze::nopanic]
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub(crate) fn give_back(&self, bytes: u64) {
@@ -106,6 +108,7 @@ impl Budget {
     }
 
     /// That this budget has no room for `asked` bytes, as it stands.
+    #[blaze::noalloc]
     pub(crate) fn over(&self, asked: u64) -> Over {
         Over { limit: self.limit, used: self.used.load(Ordering::Acquire), asked }
     }

@@ -77,6 +77,7 @@ impl NameChange {
 }
 
 /// The directory `name` is in: everything before its last `/`, or the root's empty name.
+#[blaze::noalloc]
 pub(crate) fn dir_of(name: &FileName) -> &str {
     match name.as_str().rsplit_once('/') {
         Some((dir, _)) => dir,
@@ -106,7 +107,8 @@ pub(crate) struct Disk {
 }
 
 impl Disk {
-    pub(crate) fn new(seed: u64) -> Disk {
+    #[blaze::nonblocking]
+pub(crate) fn new(seed: u64) -> Disk {
         Disk {
             counts: DiskCounts::default(),
             // alloc: none until a file is written.
@@ -123,11 +125,13 @@ impl Disk {
         }
     }
 
-    pub(crate) fn counts(&self) -> DiskCounts {
+    #[blaze::nopanic]
+pub(crate) fn counts(&self) -> DiskCounts {
         self.counts
     }
 
     /// A caller waited for the device: a flush or a name sync it did not return before.
+    #[blaze::noalloc]
     pub(crate) fn waited(&mut self) {
         self.counts.device_waits += 1;
     }
@@ -225,11 +229,12 @@ impl Disk {
                 self.made(sim, *tag, to);
             }
             Effect::Link { to, tag, .. } => self.made(sim, *tag, to),
-            _ => {}
+            Effect::ReadInto { .. } | Effect::WriteFrom { .. } | Effect::ReadLink { .. } | Effect::SyncDir { .. } | Effect::WriteUnsynced { .. } | Effect::List { .. } | Effect::RenameUnsynced { .. } | Effect::Mode { .. } | Effect::Seal { .. } | Effect::Private { .. } | Effect::Times { .. } | Effect::Stat { .. } | Effect::Lstat { .. } | Effect::Lock { .. } | Effect::Unlock { .. } | Effect::Watch { .. } | Effect::Journal { .. } | Effect::Unwatch { .. } | Effect::Stamp { .. } | Effect::Entries { .. } | Effect::Flush { .. } | Effect::Timer { .. } | Effect::Map { .. } | Effect::Spawn { .. } | Effect::Kill { .. } | Effect::Listen { .. } | Effect::Unlisten { .. } | Effect::Connect { .. } | Effect::Recv { .. } | Effect::Send { .. } | Effect::Hangup { .. } | Effect::Pressure { .. } | Effect::Bind { .. } | Effect::SendTo { .. } | Effect::RecvFrom { .. } | Effect::Unbind { .. } | Effect::ReadStdin { .. } | Effect::WriteOut { .. } | Effect::Now { .. } | Effect::Random { .. } | Effect::MakeDir { .. } | Effect::RemoveDir { .. } => {}
         }
     }
 
     /// `completion` was polled, for its waiter or for none.
+    #[blaze::nonblocking]
     pub(crate) fn completed(&mut self, completion: &Completion) {
         let tag = completion.tag;
         if let Some(at) = self.naming.iter().position(|(it, _)| *it == tag) {
@@ -259,6 +264,7 @@ impl Disk {
 
     /// The names of the directory `dir` synced: every change in it, and every change before
     /// the last of those, is durable.
+    #[blaze::nonblocking]
     pub(crate) fn sync_names(&mut self, dir: &str) {
         self.counts.name_syncs += 1;
         if let Some(last) = self.names.iter().rposition(|change| dir_of(change.name()) == dir) {

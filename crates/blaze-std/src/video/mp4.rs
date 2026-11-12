@@ -105,6 +105,7 @@ pub struct Muxer<A: Allocator + Clone> {
 
 impl<A: Allocator + Clone> Muxer<A> {
     /// A muxer of `track` laid out as `layout`, every buffer in `alloc`.
+    #[blaze::pure]
     pub fn new(track: &Track<'_>, layout: Layout, alloc: A) -> Result<Muxer<A>, MuxError> {
         let width = u16::try_from(track.width)
             .ok()
@@ -147,6 +148,7 @@ impl<A: Allocator + Clone> Muxer<A> {
 
     /// The next packet, in decode order: the first a key frame, decode times rising, no
     /// presentation before the first packet's, presentation never before decode.
+    #[blaze::noalloc]
     pub fn push<B: Allocator>(&mut self, packet: &Packet<B>) -> Result<(), MuxError> {
         let n = self.count;
         if packet.timescale != self.timescale {
@@ -205,6 +207,7 @@ impl<A: Allocator + Clone> Muxer<A> {
 
     /// The bytes ready so far, to be written after those taken before. Progressive: none until
     /// [`Muxer::finish`].
+    #[blaze::pure]
     pub fn bytes(&mut self) -> Vec<u8, A> {
         let ready = core::mem::replace(&mut self.out, Vec::new_in(self.alloc.clone()));
         self.taken += ready.len() as u64;
@@ -212,6 +215,7 @@ impl<A: Allocator + Clone> Muxer<A> {
     }
 
     /// The rest of the bytes: the whole file (progressive) or the last fragment.
+    #[blaze::pure]
     pub fn finish(mut self) -> Result<Vec<u8, A>, MuxError> {
         if self.count == 0 {
             return Err(MuxError::Empty);

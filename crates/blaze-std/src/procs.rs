@@ -93,7 +93,8 @@ pub struct Procs {
 }
 
 impl Procs {
-    pub(crate) fn new(io: Io) -> Procs {
+    #[blaze::nopanic]
+pub(crate) fn new(io: Io) -> Procs {
         Procs { io, allowed: Allowed::Any }
     }
 

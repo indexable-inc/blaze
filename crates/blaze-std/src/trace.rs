@@ -35,12 +35,14 @@ pub struct Trace {
 }
 
 impl Trace {
-    pub(crate) fn new(most: usize) -> Trace {
+    #[blaze::pure]
+pub(crate) fn new(most: usize) -> Trace {
         // alloc: the world's recorder, grown up to `most`.
         Trace { records: Vec::new(), dropped: 0, most }
     }
 
-    pub(crate) fn push(&mut self, record: Record) {
+    #[blaze::pure]
+pub(crate) fn push(&mut self, record: Record) {
         if self.records.len() < self.most {
             self.records.push(record);
         } else {
@@ -49,11 +51,13 @@ impl Trace {
     }
 
     /// The records kept, in the order they were made.
+    #[blaze::pure]
     pub fn records(&self) -> &[Record] {
         &self.records
     }
 
     /// How many records came after the recorder was full.
+    #[blaze::pure]
     pub fn dropped(&self) -> u64 {
         self.dropped
     }

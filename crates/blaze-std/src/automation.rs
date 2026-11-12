@@ -42,7 +42,8 @@ pub struct Automation {
 }
 
 impl Automation {
-    pub(crate) fn new(io: Io) -> Automation {
+    #[blaze::nopanic]
+pub(crate) fn new(io: Io) -> Automation {
         Automation { io, allowed: Allowed::Any }
     }
 

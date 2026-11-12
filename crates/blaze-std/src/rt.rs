@@ -17,18 +17,20 @@
 
 extern crate std;
 
-pub use std::{
+pub(crate) use std::{
     panic::{catch_unwind, resume_unwind},
     path::Path as RootPath,
     sync::{LazyLock, OnceLock},
 };
 
 /// The process's id.
+#[blaze::nopanic]
 pub(crate) fn process_id() -> u32 {
     std::process::id()
 }
 
 /// Ends the process with `status`.
+#[blaze::pure]
 pub(crate) fn exit(status: i32) -> ! {
     std::process::exit(status)
 }

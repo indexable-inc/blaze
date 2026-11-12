@@ -408,6 +408,7 @@ impl core::error::Error for Stopped {}
 /// Consumes a linear value that has no fields left to move out (a fieldless marker such as
 /// [`fs::ReadWrite`]): the one way such a value ends, besides its type's own consuming calls.
 #[blaze::consumes]
+#[blaze::pure]
 pub(crate) fn consume<#[blaze::linear] T>(_: T) {}
 
 /// A safeguard a test turns off to prove its oracle sees the bug (skill `testing`, planted-bug

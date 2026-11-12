@@ -50,6 +50,7 @@ impl fmt::Display for NameError {
 impl core::error::Error for NameError {}
 
 /// Why `raw` is no name, if it is not: the one rule of every typed name here.
+#[blaze::pure]
 pub const fn refused(raw: &str) -> Option<NameWhy> {
     let bytes = raw.as_bytes();
     if bytes.is_empty() {

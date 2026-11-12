@@ -95,7 +95,7 @@ impl Cx {
     pub fn until(&self, deadline: Deadline) -> Cx {
         let deadline = match self.plant {
             Plant::UntilWidens => deadline,
-            _ => self.deadline.min(deadline),
+            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned => self.deadline.min(deadline),
         };
         Cx { deadline, ..self.child() }
     }
@@ -146,20 +146,24 @@ impl Cx {
     }
 
     /// The task's frame, for `Vec::new_in(cx.frame())`: freed when the task ends.
+    #[blaze::nopanic]
     pub fn frame(&self) -> &Frame {
         &self.frame
     }
 
     /// Empty bytes in the task's frame, named by the span when they run out of room.
+    #[blaze::nopanic]
     pub fn bytes(&self) -> Bytes<'_> {
         Bytes::new_in(&self.frame, self.span)
     }
 
-    pub(crate) fn plant(&self) -> Plant {
+    #[blaze::nopanic]
+pub(crate) fn plant(&self) -> Plant {
         self.plant
     }
 
     /// The world it came from.
+    #[blaze::nopanic]
     pub(crate) fn io(&self) -> &Io {
         &self.world
     }
@@ -197,7 +201,7 @@ impl Cx {
     pub(crate) fn wait(&self, io: &Io, tag: Tag, ends: Ends) -> Result<Done, Stopped> {
         let deadline = match self.plant {
             Plant::WaitIgnoresDeadline => Deadline::NEVER,
-            _ => self.deadline,
+            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned => self.deadline,
         };
         let mut idle = 0;
         loop {
@@ -242,7 +246,7 @@ impl Cx {
     pub(crate) fn wait_for<T>(&self, io: &Io, mut ready: impl FnMut() -> Option<T>) -> Result<T, Stopped> {
         let deadline = match self.plant {
             Plant::WaitIgnoresDeadline => Deadline::NEVER,
-            _ => self.deadline,
+            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned => self.deadline,
         };
         let mut idle = 0;
         loop {
@@ -266,6 +270,7 @@ impl Cx {
     }
 
     /// Whether this context stopped already at `now`: then a call asks nothing of the driver.
+    #[blaze::noalloc]
     pub(crate) fn stopped_by(&self, now: core::time::Duration) -> Result<(), Stopped> {
         if self.plant != Plant::WaitIgnoresCancel {
             self.check()?;
@@ -290,6 +295,7 @@ impl Cx {
 
     /// Cancels the scope this context's cancellation is: every context sharing it, and every
     /// scope inside it.
+    #[blaze::noalloc]
     pub(crate) fn cancel(&self) {
         self.cancel.set.store(true, Ordering::Release);
     }

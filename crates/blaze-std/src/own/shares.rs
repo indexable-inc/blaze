@@ -44,6 +44,7 @@ impl<#[blaze::linear] T: Acyclic, K, const D: usize> Shares<T, K, D, D> {
     /// All `D` parts of `value`, of the kind of `token`, which is used up: a kind has one
     /// value.
     #[blaze::consumes]
+    #[blaze::pure]
     pub fn new(token: Token<K>, value: T) -> Shares<T, K, D, D>
     where
         const { D >= 1 },
@@ -58,6 +59,7 @@ impl<#[blaze::linear] T: Acyclic, K, const D: usize> Shares<T, K, D, D> {
 impl<#[blaze::linear] T, K, const N: usize, const D: usize> Shares<T, K, N, D> {
     /// These `N` parts as `A` and `B` of them.
     #[blaze::consumes]
+    #[blaze::pure]
     pub fn split<const A: usize, const B: usize>(self) -> (Shares<T, K, A, D>, Shares<T, K, B, D>)
     where
         const { A >= 1 && B >= 1 && A + B == N },
@@ -71,6 +73,7 @@ impl<#[blaze::linear] T, K, const N: usize, const D: usize> Shares<T, K, N, D> {
 
     /// These `N` parts and `other`'s `M`, as one handle of `N + M`.
     #[blaze::consumes]
+    #[blaze::pure]
     pub fn join<const M: usize>(self, other: Shares<T, K, M, D>) -> Shares<T, K, { N + M }, D> {
         // Both handles end here, taken apart: a `Shares` has no destructor, and its parts
         // go into the handle returned. One kind is one allocation (the module's doc), so
@@ -82,6 +85,7 @@ impl<#[blaze::linear] T, K, const N: usize, const D: usize> Shares<T, K, N, D> {
 
     /// The value, from the handle that holds every part.
     #[blaze::consumes]
+    #[blaze::pure]
     pub fn whole(self) -> T
     where
         const { N == D },
@@ -93,6 +97,7 @@ impl<#[blaze::linear] T, K, const N: usize, const D: usize> Shares<T, K, N, D> {
     }
 
     /// The value, uniquely, through the handle that holds every part.
+    #[blaze::pure]
     pub fn get_mut(&mut self) -> &mut T
     where
         const { N == D },
@@ -106,7 +111,8 @@ impl<#[blaze::linear] T, K, const N: usize, const D: usize> Shares<T, K, N, D> {
 impl<#[blaze::linear] T, K, const N: usize, const D: usize> Deref for Shares<T, K, N, D> {
     type Target = T;
 
-    fn deref(&self) -> &T {
+    #[blaze::pure]
+fn deref(&self) -> &T {
         // SAFETY: the value is freed only by `whole`, which takes every part by value; this
         // part exists, so that has not happened, and it cannot while the borrow of `self`
         // lives. Writes go through `get_mut`, which needs every part too.

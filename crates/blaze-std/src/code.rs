@@ -50,7 +50,8 @@ pub struct Module {
 }
 
 impl Module {
-    pub fn name(&self) -> &ModuleName {
+    #[blaze::nopanic]
+pub fn name(&self) -> &ModuleName {
         &self.name
     }
 }
@@ -63,7 +64,8 @@ pub struct Code {
 }
 
 impl Code {
-    pub(crate) fn new(io: Io) -> Code {
+    #[blaze::nopanic]
+pub(crate) fn new(io: Io) -> Code {
         Code { io, allowed: Allowed::Any }
     }
 

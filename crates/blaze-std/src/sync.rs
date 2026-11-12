@@ -58,11 +58,13 @@ pub struct Lock<T>(blaze_core::lock::Lock<T>);
 
 impl<T> Lock<T> {
     /// A lock named `name` over `value`.
+    #[blaze::pure]
     pub const fn new(name: &'static str, value: T) -> Lock<T> {
         Lock(blaze_core::lock::Lock::new(name, value))
     }
 
     /// The lock's name: the span its waits open.
+    #[blaze::nopanic]
     pub fn name(&self) -> &'static str {
         self.0.name()
     }
@@ -92,11 +94,13 @@ impl<T> Lock<T> {
     }
 
     /// The value, through the only reference to the lock: no wait.
+    #[blaze::nopanic]
     pub fn get_mut(&mut self) -> &mut T {
         self.0.get_mut()
     }
 
     /// The value, the lock consumed.
+    #[blaze::nonblocking]
     pub fn into_inner(self) -> T {
         self.0.into_inner()
     }

@@ -40,7 +40,8 @@ pub struct Opener {
 }
 
 impl Opener {
-    pub(crate) fn new(io: Io) -> Opener {
+    #[blaze::nopanic]
+pub(crate) fn new(io: Io) -> Opener {
         Opener { io, allowed: Allowed::Any }
     }
 

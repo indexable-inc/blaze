@@ -15,12 +15,14 @@ pub(crate) enum Allowed<T> {
 
 impl<T: Clone + PartialEq> Allowed<T> {
     /// Nothing at all.
+    #[blaze::pure]
     pub(crate) fn nothing() -> Allowed<T> {
         // alloc: once per capability that reaches nothing, an empty list's count.
         Allowed::Only(Arc::from(Vec::new()))
     }
 
-    pub(crate) fn allows(&self, thing: &T) -> bool {
+    #[blaze::nopanic]
+pub(crate) fn allows(&self, thing: &T) -> bool {
         match self {
             Allowed::Any => true,
             Allowed::Only(only) => only.contains(thing),
@@ -28,12 +30,14 @@ impl<T: Clone + PartialEq> Allowed<T> {
     }
 
     /// Whether it was never narrowed.
+    #[blaze::nopanic]
     pub(crate) fn whole(&self) -> bool {
         matches!(self, Allowed::Any)
     }
 
     /// Only those of `things` this allows already. Under [`Plant::OnlyWidens`] it is `things`
     /// as given, allowed before or not: the planted bug of the narrowing tests.
+    #[blaze::nonblocking]
     pub(crate) fn only(&self, things: &[T], plant: Plant) -> Allowed<T> {
         let kept = things.iter().filter(|thing| plant == Plant::OnlyWidens || self.allows(thing));
         // alloc: once per narrowing, the things kept.
@@ -41,6 +45,7 @@ impl<T: Clone + PartialEq> Allowed<T> {
     }
 
     /// Only `thing`, if this allows it already.
+    #[blaze::nonblocking]
     pub(crate) fn one(&self, thing: &T, plant: Plant) -> Allowed<T> {
         self.only(core::slice::from_ref(thing), plant)
     }

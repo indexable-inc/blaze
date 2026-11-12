@@ -38,6 +38,7 @@ impl Color {
     pub const ALL: [Color; 4] = [Color::Grey, Color::GreyAlpha, Color::Rgb, Color::Rgba];
 
     /// Samples a pixel.
+    #[blaze::pure]
     pub const fn channels(self) -> u32 {
         match self {
             Color::Grey => 1,
@@ -59,6 +60,7 @@ impl Depth {
     pub const ALL: [Depth; 2] = [Depth::Eight, Depth::Sixteen];
 
     /// Bytes a sample.
+    #[blaze::pure]
     pub const fn bytes(self) -> u32 {
         match self {
             Depth::Eight => 1,
@@ -68,6 +70,7 @@ impl Depth {
 }
 
 /// Bytes a row of `width` pixels of `color` at `depth` takes, if it fits a `usize`.
+#[blaze::pure]
 pub fn row_bytes(width: u32, color: Color, depth: Depth) -> Option<usize> {
     let bytes = u64::from(width) * u64::from(color.channels()) * u64::from(depth.bytes());
     usize::try_from(bytes).ok()
@@ -86,6 +89,7 @@ pub struct Image<A: Allocator> {
 impl<A: Allocator> Image<A> {
     /// An image of `pixels`, which must be exactly `height` rows of [`row_bytes`]; the width and
     /// the height are each in `1..=`[`MAX_SIDE`].
+    #[blaze::pure]
     pub fn new(width: u32, height: u32, color: Color, depth: Depth, pixels: Vec<u8, A>) -> Result<Image<A>, ImageError> {
         if !(1..=MAX_SIDE).contains(&width) {
             return Err(ImageError::Header { field: "width", value: width });
@@ -101,38 +105,46 @@ impl<A: Allocator> Image<A> {
         Ok(Image { width, height, color, depth, pixels })
     }
 
-    pub fn width(&self) -> u32 {
+    #[blaze::nopanic]
+pub fn width(&self) -> u32 {
         self.width
     }
 
-    pub fn height(&self) -> u32 {
+    #[blaze::nopanic]
+pub fn height(&self) -> u32 {
         self.height
     }
 
-    pub fn color(&self) -> Color {
+    #[blaze::nopanic]
+pub fn color(&self) -> Color {
         self.color
     }
 
-    pub fn depth(&self) -> Depth {
+    #[blaze::nopanic]
+pub fn depth(&self) -> Depth {
         self.depth
     }
 
     /// Bytes a row.
+    #[blaze::noalloc]
     pub fn stride(&self) -> usize {
         self.pixels.len() / self.height as usize
     }
 
-    pub fn pixels(&self) -> &[u8] {
+    #[blaze::nopanic]
+pub fn pixels(&self) -> &[u8] {
         &self.pixels
     }
 
-    pub fn into_pixels(self) -> Vec<u8, A> {
+    #[blaze::pure]
+pub fn into_pixels(self) -> Vec<u8, A> {
         self.pixels
     }
 }
 
 impl<A: Allocator, B: Allocator> PartialEq<Image<B>> for Image<A> {
-    fn eq(&self, other: &Image<B>) -> bool {
+    #[blaze::nopanic]
+fn eq(&self, other: &Image<B>) -> bool {
         self.width == other.width
             && self.height == other.height
             && self.color == other.color
@@ -165,6 +177,7 @@ impl Limits {
 /// The bytes [`decode`] asks of its allocator for an image of this size and kind: every row
 /// with its filter byte, and one byte more (the inflater's proof that the stream ends where
 /// the header says).
+#[blaze::pure]
 pub fn decode_bytes(width: u32, height: u32, color: Color, depth: Depth) -> u64 {
     let stride = u64::from(width) * u64::from(color.channels()) * u64::from(depth.bytes());
     u64::from(height).saturating_mul(stride.saturating_add(1)).saturating_add(1)
@@ -172,11 +185,13 @@ pub fn decode_bytes(width: u32, height: u32, color: Color, depth: Depth) -> u64 
 
 /// A PNG's pixels, in `alloc`. Width, height and bytes are checked against `limits` before
 /// anything is allocated; any input ends in an image or an [`ImageError`], never a panic.
+#[blaze::pure]
 pub fn decode<A: Allocator>(bytes: &[u8], alloc: A, limits: Limits) -> Result<Image<A>, ImageError> {
     png::decode(bytes, alloc, limits)
 }
 
 /// `image` as a PNG, in `alloc`. The same image always gives the same bytes.
+#[blaze::noalloc]
 pub fn encode<A: Allocator + Clone, B: Allocator>(image: &Image<B>, alloc: A) -> Result<Vec<u8, A>, ImageError> {
     png::encode(image, alloc)
 }

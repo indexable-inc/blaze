@@ -81,7 +81,8 @@ pub struct Window {
 }
 
 impl Window {
-    pub(crate) fn new(io: Io) -> Window {
+    #[blaze::nopanic]
+pub(crate) fn new(io: Io) -> Window {
         Window { io, allowed: Allowed::Any }
     }
 

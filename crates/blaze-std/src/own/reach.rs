@@ -166,6 +166,7 @@ impl Reason {
     }
 
     /// The refusal's text.
+    #[blaze::pure]
     pub const fn as_str(&self) -> &str {
         let len = if self.len == NONE {
             // Cut short: the bytes up to the dots, which follow the last whole piece.
@@ -348,12 +349,13 @@ const fn unseen(shape: Shape) -> &'static str {
     match shape {
         Shape::Pointer => ", a raw pointer, which reflection does not see through",
         Shape::Dyn => ", whose hidden type reflection does not see",
-        _ => ", which reflection does not see into (a union, a closure or a foreign type)",
+        Shape::Leaf | Shape::Parts | Shape::Elements | Shape::Borrow | Shape::Unseen => ", which reflection does not see into (a union, a closure or a foreign type)",
     }
 }
 
 /// The answer to `ask` about the type `start`.
 #[rustc_comptime]
+#[blaze::noalloc]
 pub fn walk(start: TypeId, ask: &Ask) -> Verdict {
     let mut walk = Walk::new(start);
     let mut at = 0;
@@ -439,11 +441,10 @@ fn visit(walk: &mut Walk, at: usize, start: TypeId, ask: &Ask) -> Option<Reason>
                 None
             }
             Shape::Borrow => {
-                if borrowed {
-                    if let Some(inner) = raw::inner(ty) {
+                if borrowed
+                    && let Some(inner) = raw::inner(ty) {
                         walk.add(inner, cell, at, Step::Inside);
                     }
-                }
                 None
             }
             Shape::Pointer | Shape::Dyn | Shape::Unseen => {
@@ -463,11 +464,10 @@ fn visit(walk: &mut Walk, at: usize, start: TypeId, ask: &Ask) -> Option<Reason>
                     // Its trait answers for whatever is inside, and nothing can put a pointer
                     // back into it later: it is outside every cell. Not asked of the type the
                     // walk started at, which is the type being decided.
-                    if let Some(vouch) = ask.vouch {
-                        if raw::implements(ty, vouch) {
+                    if let Some(vouch) = ask.vouch
+                        && raw::implements(ty, vouch) {
                             return None;
                         }
-                    }
                 }
                 if !ask.unseen_refuses {
                     return None;

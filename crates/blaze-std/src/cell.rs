@@ -54,6 +54,7 @@ pub struct Token<K> {
 
 impl Token<()> {
     /// Calls `f` with the one token of a fresh kind, and returns what it returns.
+    #[blaze::pure]
     pub fn scope<R>(f: impl for<'id> FnOnce(Token<Brand<'id>>) -> R) -> R {
         f(Token { kind: PhantomData })
     }
@@ -72,17 +73,20 @@ pub struct TokenCell<T: ?Sized, K> {
 }
 
 impl<T, K> TokenCell<T, K> {
-    pub const fn new(value: T) -> TokenCell<T, K> {
+    #[blaze::pure]
+pub const fn new(value: T) -> TokenCell<T, K> {
         TokenCell { kind: PhantomData, value: RawCell::new(value) }
     }
 
-    pub fn into_inner(self) -> T {
+    #[blaze::pure]
+pub fn into_inner(self) -> T {
         self.value.into_inner()
     }
 }
 
 impl<T: ?Sized, K> TokenCell<T, K> {
     /// The value, read while `token` is lent shared.
+    #[blaze::nopanic]
     pub fn get<'a>(&'a self, token: &'a Token<K>) -> &'a T {
         let _ = token;
         // SAFETY: a `&mut T` into a cell of kind `K` exists only as `get_mut`'s result, which
@@ -96,6 +100,7 @@ impl<T: ?Sized, K> TokenCell<T, K> {
 
     /// The value, written while `token` is lent unique: no other cell of the kind can be read
     /// or written until the result is gone.
+    #[blaze::nopanic]
     pub fn get_mut<'a>(&'a self, token: &'a mut Token<K>) -> &'a mut T {
         let _ = token;
         // SAFETY: every reference into a cell of kind `K` made through a token (`get`,
@@ -108,6 +113,7 @@ impl<T: ?Sized, K> TokenCell<T, K> {
     }
 
     /// The value, written through unique access to the cell itself: no token needed.
+    #[blaze::pure]
     pub fn value_mut(&mut self) -> &mut T {
         self.value.get_mut()
     }

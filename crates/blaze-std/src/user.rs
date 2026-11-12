@@ -30,6 +30,7 @@ pub struct UserFacts {
 impl UserFacts {
     /// The simulation's unless a test says otherwise: `sim`, user and group 1000, at
     /// `home/sim`.
+    #[blaze::nonblocking]
     pub fn simulated() -> UserFacts {
         UserFacts {
             name: UserName::new("sim").expect("sim is a name"),
@@ -48,19 +49,23 @@ pub struct User {
 }
 
 impl User {
-    pub(crate) fn new(io: Io, facts: UserFacts) -> User {
+    #[blaze::nopanic]
+pub(crate) fn new(io: Io, facts: UserFacts) -> User {
         User { io, facts }
     }
 
-    pub fn name(&self) -> &UserName {
+    #[blaze::nopanic]
+pub fn name(&self) -> &UserName {
         &self.facts.name
     }
 
-    pub fn uid(&self) -> u32 {
+    #[blaze::nopanic]
+pub fn uid(&self) -> u32 {
         self.facts.uid
     }
 
-    pub fn gid(&self) -> u32 {
+    #[blaze::nopanic]
+pub fn gid(&self) -> u32 {
         self.facts.gid
     }
 

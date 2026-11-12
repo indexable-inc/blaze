@@ -54,7 +54,8 @@ pub struct Power {
 }
 
 impl Power {
-    pub(crate) fn new(io: Io) -> Power {
+    #[blaze::nopanic]
+pub(crate) fn new(io: Io) -> Power {
         Power { io }
     }
 

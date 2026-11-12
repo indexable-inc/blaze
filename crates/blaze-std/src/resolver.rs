@@ -30,7 +30,8 @@ pub struct Resolver {
 }
 
 impl Resolver {
-    pub(crate) fn new(io: Io, reach: net::Allowed) -> Resolver {
+    #[blaze::nopanic]
+pub(crate) fn new(io: Io, reach: net::Allowed) -> Resolver {
         Resolver { io, reach, allowed: Allowed::Any }
     }
 

@@ -72,6 +72,7 @@ pub struct SimAudio {
 
 impl SimAudio {
     /// No device, nothing played, nothing to hear.
+    #[blaze::nonblocking]
     pub fn new() -> SimAudio {
         // alloc: none, the simulated devices' empty tables.
         SimAudio { outputs: Vec::new(), inputs: Vec::new(), played: Vec::new(), heard: VecDeque::new() }
@@ -79,7 +80,8 @@ impl SimAudio {
 }
 
 impl Default for SimAudio {
-    fn default() -> SimAudio {
+    #[blaze::nonblocking]
+fn default() -> SimAudio {
         SimAudio::new()
     }
 }
@@ -114,7 +116,8 @@ pub struct Audio {
 }
 
 impl Audio {
-    pub(crate) fn new(io: Io) -> Audio {
+    #[blaze::nopanic]
+pub(crate) fn new(io: Io) -> Audio {
         Audio { io }
     }
 

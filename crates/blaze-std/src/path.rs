@@ -91,6 +91,7 @@ const fn refused(raw: &str, parent: bool) -> Option<PathWhy> {
 
 /// [`Path::new`]'s check, as a compile-time panic: what [`crate::path!`] evaluates in a
 /// `const`.
+#[blaze::pure]
 pub const fn check_literal(raw: &str) {
     if let Some(why) = refused(raw, false) {
         panic!("{}", why.says());
@@ -108,7 +109,8 @@ macro_rules! path {
 }
 
 impl Path {
-    pub fn new(raw: &str) -> Result<Path, PathError> {
+    #[blaze::pure]
+pub fn new(raw: &str) -> Result<Path, PathError> {
         if let Some(why) = refused(raw, false) {
             // alloc: an error's message.
             return Err(PathError { path: raw.to_owned(), why });
@@ -129,22 +131,26 @@ impl Path {
         }
     }
 
-    pub fn as_str(&self) -> &str {
+    #[blaze::nopanic]
+pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
 
     /// `self` then `more`: two paths beneath a directory make one beneath it.
+    #[blaze::nonblocking]
     pub fn join(&self, more: &Path) -> Path {
         // alloc: once per path joined.
         let joined = format!("{}/{}", self.as_str(), more.as_str());
         Path(FileName::new(&joined).expect("two paths joined are a path"))
     }
 
-    pub(crate) fn name(&self) -> &FileName {
+    #[blaze::nopanic]
+pub(crate) fn name(&self) -> &FileName {
         &self.0
     }
 
-    pub(crate) fn of(name: FileName) -> Path {
+    #[blaze::nopanic]
+pub(crate) fn of(name: FileName) -> Path {
         Path(name)
     }
 }
@@ -164,7 +170,8 @@ impl fmt::Debug for Path {
 impl TryFrom<&str> for Path {
     type Error = PathError;
 
-    fn try_from(raw: &str) -> Result<Path, PathError> {
+    #[blaze::pure]
+fn try_from(raw: &str) -> Result<Path, PathError> {
         Path::new(raw)
     }
 }

@@ -72,6 +72,7 @@ fn is_scheme(raw: &str) -> bool {
 
 impl Scheme {
     /// `raw`, checked and put in lower case.
+    #[blaze::pure]
     pub fn new(raw: &str) -> Result<Scheme, UrlError> {
         if !is_scheme(raw) {
             // alloc: an error's message.
@@ -82,22 +83,26 @@ impl Scheme {
     }
 
     /// `http`.
+    #[blaze::pure]
     pub fn http() -> Scheme {
         // alloc: once per name, its text.
         Scheme(Arc::from("http"))
     }
 
     /// `https`.
+    #[blaze::pure]
     pub fn https() -> Scheme {
         // alloc: once per name, its text.
         Scheme(Arc::from("https"))
     }
 
-    pub fn as_str(&self) -> &str {
+    #[blaze::nopanic]
+pub fn as_str(&self) -> &str {
         &self.0
     }
 
     /// The port a URL of this scheme means when it names none: 80 for `http`, 443 for `https`.
+    #[blaze::nopanic]
     pub fn default_port(&self) -> Option<u16> {
         match self.as_str() {
             "http" => Some(80),
@@ -127,15 +132,18 @@ pub struct Origin {
 }
 
 impl Origin {
-    pub fn new(scheme: Scheme, at: HostPort) -> Origin {
+    #[blaze::nopanic]
+pub fn new(scheme: Scheme, at: HostPort) -> Origin {
         Origin { scheme, at }
     }
 
-    pub fn scheme(&self) -> &Scheme {
+    #[blaze::nopanic]
+pub fn scheme(&self) -> &Scheme {
         &self.scheme
     }
 
-    pub fn at(&self) -> &HostPort {
+    #[blaze::nopanic]
+pub fn at(&self) -> &HostPort {
         &self.at
     }
 }
@@ -160,6 +168,7 @@ pub struct Url {
 
 impl Url {
     /// `raw`, checked: `https://api.stripe.com/v1/charges?limit=3`, `mailto:a@b.example`.
+    #[blaze::nonblocking]
     pub fn parse(raw: &str) -> Result<Url, UrlError> {
         // alloc: an error's message.
         let refuse = |why| UrlError { url: raw.to_owned(), why };
@@ -211,20 +220,24 @@ impl Url {
         Ok(Url { raw: Arc::from(raw), scheme, origin, target })
     }
 
-    pub fn as_str(&self) -> &str {
+    #[blaze::nopanic]
+pub fn as_str(&self) -> &str {
         &self.raw
     }
 
-    pub fn scheme(&self) -> &Scheme {
+    #[blaze::nopanic]
+pub fn scheme(&self) -> &Scheme {
         &self.scheme
     }
 
     /// Whom it is asked of, when it has an authority.
+    #[blaze::nopanic]
     pub fn origin(&self) -> Option<&Origin> {
         self.origin.as_ref()
     }
 
     /// Its path and query, `/` when it has none.
+    #[blaze::nopanic]
     pub fn target(&self) -> &str {
         &self.target
     }
@@ -245,7 +258,8 @@ impl fmt::Debug for Url {
 impl TryFrom<&str> for Url {
     type Error = UrlError;
 
-    fn try_from(raw: &str) -> Result<Url, UrlError> {
+    #[blaze::nonblocking]
+fn try_from(raw: &str) -> Result<Url, UrlError> {
         Url::parse(raw)
     }
 }

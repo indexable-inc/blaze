@@ -88,6 +88,7 @@ impl Streams {
     }
 
     /// Streams whose peer is `handler`: each send is answered by what it adds.
+    #[blaze::pure]
     pub fn handler(
         handler: impl Fn(&Cx, &Origin, &[u8], &mut Bytes<'_>) -> Result<(), Stopped> + Send + Sync + 'static,
     ) -> Streams {
@@ -148,7 +149,8 @@ pub struct Stream {
 }
 
 impl Stream {
-    pub fn origin(&self) -> &Origin {
+    #[blaze::nopanic]
+pub fn origin(&self) -> &Origin {
         &self.origin
     }
 

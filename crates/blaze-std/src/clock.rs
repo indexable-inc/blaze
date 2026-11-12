@@ -15,6 +15,7 @@ pub struct Instant(Duration);
 
 impl Instant {
     /// Time since the driver began.
+    #[blaze::pure]
     #[blaze::nopanic]
     #[blaze::noalloc]
     #[blaze::nonblocking]
@@ -26,6 +27,7 @@ impl Instant {
     /// once zero then, unsaid).
     ///
     /// The contract: it answers exactly when `earlier` is not the later one.
+    #[blaze::pure]
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub fn since(self, earlier: Instant) -> (r: Option<Duration>)
@@ -35,6 +37,7 @@ impl Instant {
     }
 
     /// The deadline at this moment.
+    #[blaze::pure]
     pub fn deadline(self) -> Deadline {
         Deadline::at(self.0)
     }
@@ -68,13 +71,15 @@ impl core::fmt::Display for SleepError {
 impl core::error::Error for SleepError {}
 
 impl From<Stopped> for SleepError {
-    fn from(stopped: Stopped) -> SleepError {
+    #[blaze::pure]
+fn from(stopped: Stopped) -> SleepError {
         SleepError::Stopped(stopped)
     }
 }
 
 impl Clock {
-    pub(crate) fn new(io: Io) -> Clock {
+    #[blaze::nopanic]
+pub(crate) fn new(io: Io) -> Clock {
         Clock { io }
     }
 

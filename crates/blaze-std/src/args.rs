@@ -11,24 +11,29 @@ pub struct Args {
 }
 
 impl Args {
-    pub(crate) fn new(args: Arc<[String]>) -> Args {
+    #[blaze::nopanic]
+pub(crate) fn new(args: Arc<[String]>) -> Args {
         Args { args }
     }
 
     /// The argument at `at`, 0 being the program's name.
+    #[blaze::nopanic]
     pub fn get(&self, at: usize) -> Option<&str> {
         self.args.get(at).map(String::as_str)
     }
 
-    pub fn len(&self) -> usize {
+    #[blaze::nopanic]
+pub fn len(&self) -> usize {
         self.args.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    #[blaze::nopanic]
+pub fn is_empty(&self) -> bool {
         self.args.is_empty()
     }
 
     /// Each argument, in order.
+    #[blaze::nopanic]
     pub fn each(&self) -> impl Iterator<Item = &str> {
         self.args.iter().map(String::as_str)
     }
