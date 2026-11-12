@@ -51,7 +51,7 @@ anyhow.workspace = true
 hir-ty-codegen.workspace = true
 blaze-graph.workspace = true
 # mimalloc, a heap per blaze-mem tag (`heaps.rs`), on the huge pages `blaze-mem` chose (`huge.rs`).
-libmimalloc-sys = { workspace = true, optional = true, features = ["extended"] }
+libmimalloc-sys = { workspace = true, optional = true, features = ["extended", "no_thp"] }
 blaze-mem.workspace = true
 # Reported bugs leave the binary's exit status alone (`program.rs`): its daemon says them.
 stdx.workspace = true

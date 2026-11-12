@@ -13,9 +13,13 @@
 #![allow(unsafe_code, reason = "sets one mimalloc option word")]
 
 /// Sets every one of mimalloc's huge page options, so neither mimalloc's defaults nor its
-/// `MIMALLOC_*` variables decide: arenas on base pages (never `MADV_HUGEPAGE`), and no
-/// hugetlb pages reserved at start (`reserve_huge_os_pages`), which belong to blaze-mem's pool
-/// alone. Called once, before the first query.
+/// `MIMALLOC_*` variables decide: no arena on hugetlb pages (`allow_large_os_pages`), and none
+/// reserved at start (`reserve_huge_os_pages`), which belong to blaze-mem's pool alone.
+/// Called once, before the first query. Transparent huge pages are not an option's to refuse:
+/// mimalloc 3 advises every arena it commits `MADV_HUGEPAGE` unless it is compiled without
+/// (`allow_thp` set to 0 at run time comes after the first arena, mapped before `main`, and
+/// set from the environment has mimalloc turn huge pages off for the whole process, regions
+/// included), so libmimalloc-sys is built with `no_thp` (the workspace's Cargo.toml).
 pub(crate) fn base_pages_for_mimalloc() {
     // SAFETY: each sets an option word mimalloc reads when it next maps an arena; mimalloc
     // documents options as settable from any thread at any time.
