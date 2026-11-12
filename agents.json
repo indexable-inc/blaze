@@ -90,6 +90,15 @@
    "do": "Push a `drawn::Item` onto the unit's `Said` (crates/blaze-cargo/src/serve/unit/drawn.rs): what it says, never text. `drawn::draw` is the one place a unit's diagnostics become text, for the job's client (`Drawing`: colour, width, short, `--refused`), from the record. Never read `job.input.color`, `.width`, `.short` or `.refused` while making a unit, and never put one in a key.",
    "why": "Rule keys-cover-every-input, the other way: a key holds only what its value is made from. Width in the record's key recompiled all 28 units of hello world from a pane of another width (2026-11-11).",
    "state": "current"
+  },
+  {
+   "id": "H11",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane content-keys-1112",
+   "task": "Put a path (or a string that may hold one) into a unit's record key or its record",
+   "do": "Never as it is. A key part goes through `hash_cbor` with the build's `Places` (crates/blaze-cargo/src/serve/unit/portable.rs), which writes every string of the encoded value against the build's directories (workspace, build directory, shared std directory, tools, launcher); a path the front end's identity holds goes through `db.files().ported(..)` (base-db `Port`). A record's body is written the same way and read back with `decoded`; a native input's path with `Places::text`/`real`. An output that is text naming paths (a dep-info file) is listed in `Record::ported`. What still holds a directory after that is found by `Places::tied` and the record is filed under `Places::here(key)`: do not work around the scan.",
+   "why": "Rule keys-cover-every-input, the other way: a key that says where a checkout is misses in every other directory, home and machine. Measured 2026-11-12, hello world on Linux: the same sources in another directory, home and machine directory with the first home's store copied in missed 28 unit records before and 0 after (`blaze why --all`: everything was reused).",
+   "state": "current"
   }
  ],
  "annoyances": [
@@ -1382,6 +1391,41 @@
    "cost": "none to this lane",
    "cause": "not looked at",
    "workaround": "none",
+   "state": "open"
+  },
+  {
+   "id": "content-keys-1",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane content-keys-1112",
+   "where": "`/root/loop.sh` on lanebase-1112",
+   "what": "The first call waited 22 minutes and never held the lock: a daemon started by an earlier caller's command had inherited the lock's descriptor. Its output, piped to `tail`, showed nothing meanwhile, so a queue and a stuck lock looked the same.",
+   "cost": "22 minutes with no measurement; the baseline of this lane was never taken on its own tree before the change",
+   "cause": "the lock's descriptor was open in the children of the loop",
+   "workaround": "none from a lane; the coordinator ended the call",
+   "fix": "done by the coordinator: children start with the lock closed, a watchdog ends a stray holder",
+   "state": "fixed in /root/loop.sh on the VM (not in the tree)"
+  },
+  {
+   "id": "content-keys-2",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane content-keys-1112",
+   "where": "paths in keys, across the tree",
+   "what": "Three mechanisms write a path against what it is under, each its own: blaze-usercode's roots (`Roots::port`, six roles, reversible), hir-def's image key markers (`Base`: `\\0PKG`, `\\0OUT_DIR`, `\\0ABSOLUTE`, with `held_by`), and blaze-diagnostics' check outcome markers. Unit records had none and held absolute paths in the unit, the plan, the run environment, the crate's content, its source root's content and the root's spelling. This lane put unit records on the roots; the image key's markers are still a second home.",
+   "cost": "an hour to find which one a unit key should use",
+   "cause": "each kind of record was made portable by the lane that needed it",
+   "workaround": "none",
+   "fix": "move `Base` onto roots (one-concept-one-home), then ban a path's `as_str().as_bytes()` into a `Hasher` outside base-db's content IDs with a lint",
+   "state": "open"
+  },
+  {
+   "id": "content-keys-3",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane content-keys-1112",
+   "where": "the VM (lanebase-1112)",
+   "what": "`bc` is not installed and `BLAZE_DUCKDB` is not set in a loop command's environment, so a script's timings printed empty and the cross-home `key_parts` query did not run.",
+   "cost": "one more turn of the queue for the timings",
+   "cause": "not looked at",
+   "workaround": "shell arithmetic on `date +%s%N`; `blaze debug sql` inside one home",
    "state": "open"
   }
  ]
