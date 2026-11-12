@@ -652,7 +652,9 @@ recomputed for no recorded reason. The sequences are drawn, not listed
 (`crates/blaze-engine/tests/revisions/generate.rs`): Hegel draws a workspace (the package `app`,
 a `#![no_std]` library with a struct, a trait with a provided method and two impls, a call
 through `dyn`, a generic, a `macro_rules!`-made module, a `cfg` pair and a feature pair, and a
-`main.rs`; and, each drawn, `up` with a generic `app` instantiates, `vendor/made` with a build
+`main.rs`; and, each drawn, `up` with a generic `app` instantiates, `mid`, a library built over
+`up` whose text never changes while `up`'s bodies, lines, a signature and a method it selects do
+(early cutoff between crates: a record of `mid` found across an edit below it), `vendor/made` with a build
 script that reads two files, writes `OUT_DIR` for an `include!` and sets a `cfg`, and the proc
 macro `mac`) and one to five turns. A turn is up to two edits (a body, a signature, a layout, a
 trait impl, an override, the only `dyn` call, an item added or removed, a rename, a `cfg`, a
@@ -678,7 +680,8 @@ turn that changes nothing or only comments and layout; the one function for a bo
   a real daemon. `BLAZE_ORACLE_CASES`, `BLAZE_ORACLE_TURNS`, `BLAZE_ORACLE_SEED`,
   `BLAZE_ORACLE_MINUTES` (both drivers: no sequence starts after that long; give it with a large
   case count), `BLAZE_ORACLE_REPLAY="parts made; scriptcfg; body=1 kill"` with the test `oracle::replay`
-  (a sequence written by hand, `generate::parse`);
+  (a sequence written by hand, `generate::parse`), `BLAZE_ORACLE_ENV=NAME=VALUE,..` (variables of
+  every command of the sequence: the driver clears its own environment);
   `BLAZE_ORACLE_SKIP=<names>` leaves out edit kinds (`body`, `scriptcfg`..), events (`kill`,
   `cancel`..) and parts (`mac-part`..) with a known failure while the rest run;
   `BLAZE_ORACLE_CLEAN=when-wrong` builds a revision from nothing only when its incremental build
