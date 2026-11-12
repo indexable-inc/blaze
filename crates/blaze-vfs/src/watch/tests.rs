@@ -1196,6 +1196,131 @@ fn the_oracle_catches_a_request_that_builds_what_the_disk_never_had() {
     }
 }
 
+/// The same on this machine's own kernel and journal (FSEvents on macOS, fanotify on Linux),
+/// through the driver the daemon runs: `src/main.rs` is replaced by a rename 500 times, the
+/// rename held back in two rounds of three until the watcher has stamped the temporary file
+/// and asked for its read, so that its look falls across the rename, and a request follows
+/// each at once (a flush
+/// of the watch, then everything told looked at, as the daemon holds a request). No commit
+/// may hold `src/main.rs` as anything but the version before or the new one, and the request
+/// must see the new one.
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn a_file_replaced_by_renames_500_times_on_this_kernel_is_always_one_of_its_versions() {
+    use std::time::Instant;
+
+    use blaze_core::wait::Deadline;
+
+    const FLUSHES: u64 = TAGS + (1 << 33);
+    let root = std::env::temp_dir().join(format!("blaze-vfs-renames-{}", std::process::id()));
+    _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("ws/src")).unwrap();
+    std::fs::create_dir_all(root.join("state")).unwrap();
+    let main = root.join("ws/src/main.rs");
+    std::fs::write(&main, "fn main() { v0() }").unwrap();
+
+    let mut driver = blaze_core::native(&root, 2).unwrap();
+    let mut vfs = Vfs::recover(name("state/journal"), 0, &[]).0;
+    let mut watcher = Watcher::new("disk", name("ws"), TAGS);
+    let mut effects = Vec::new();
+    watcher.start(&vfs, &mut effects);
+    let read = |vfs: &Vfs| -> Option<Vec<u8>> {
+        let root = vfs.root(vfs.head("disk")?).expect("a head's root");
+        let (node, _) = vfs.tree.entry(root, MAIN)?;
+        Some(vfs.tree.bytes(node).expect("not corrupt").expect("a file").to_vec())
+    };
+    // One turn of the driver: what was asked is handed on, what is done within `wait` is
+    // taken in. `allowed` is what `src/main.rs` may be in a commit made now. Returns the
+    // flush told, if one was.
+    let mut done = Vec::new();
+    let mut turn = |driver: &mut blaze_core::Native,
+                    vfs: &mut Vfs,
+                    watcher: &mut Watcher,
+                    effects: &mut Vec<Effect>,
+                    wait: Duration,
+                    allowed: [&str; 2],
+                    round: u64|
+     -> (Option<u64>, bool) {
+        driver.submit(effects);
+        driver.poll(&mut done, Deadline::after(driver.now(), wait));
+        let (mut flushed, mut scanned) = (None, false);
+        for completion in done.drain(..) {
+            if vfs.owns(completion.tag) {
+                vfs.complete(completion, effects);
+            } else if watcher.owns(completion.tag) {
+                for out in watcher.complete(vfs, completion, effects) {
+                    match out {
+                        Watched::Committed(_) => {
+                            let bytes = read(vfs).expect("src/main.rs is never deleted");
+                            assert!(
+                                allowed.iter().any(|it| it.as_bytes() == bytes),
+                                "round {round}: a commit held src/main.rs as {:?}, which is neither {allowed:?}",
+                                String::from_utf8_lossy(&bytes)
+                            );
+                        }
+                        Watched::Scanned => scanned = true,
+                        Watched::Lost { .. } => {}
+                        other => panic!("round {round}: {other:?}"),
+                    }
+                }
+            } else {
+                assert_eq!(completion.done, Done::Flushed, "round {round}: {completion:?}");
+                flushed = Some(completion.tag.0);
+            }
+        }
+        (flushed, scanned)
+    };
+    // Bounded: a wait that does not end fails naming what it waited for.
+    let within = |began: Instant, what: &str| {
+        assert!(began.elapsed() < Duration::from_secs(60), "60 s and still waiting for {what}");
+    };
+    let began = Instant::now();
+    let mut scanned = false;
+    while !(scanned && watcher.idle()) {
+        within(began, "the start's sweep");
+        let wait = Duration::from_millis(20);
+        scanned |= turn(&mut driver, &mut vfs, &mut watcher, &mut effects, wait, ["fn main() { v0() }"; 2], 0).1;
+    }
+    let mut last = String::from("fn main() { v0() }");
+    // The rounds whose rename fell between the temporary file's stamp and its read.
+    let mut crossed = 0u64;
+    for round in 1..=500u64 {
+        let text = format!("fn main() {{ v{round}() }}");
+        let temp = root.join(format!("ws/src/.main.rs.tmp{round}"));
+        std::fs::write(&temp, &text).unwrap();
+        // Two rounds in three, the rename waits (up to 200 ms) until the watcher has stamped
+        // the temporary file and asked for its read, which is then done after the rename:
+        // the interleaving that read it as empty. The third renames at once.
+        let reads_temp = |effects: &[Effect]| {
+            effects.iter().any(|it| matches!(it, Effect::ReadAll { file, .. } if file.as_str().contains(".tmp")))
+        };
+        let began = Instant::now();
+        while round % 3 != 0 && !reads_temp(&effects) && began.elapsed() < Duration::from_millis(200) {
+            let wait = Duration::from_millis(1);
+            turn(&mut driver, &mut vfs, &mut watcher, &mut effects, wait, [&last, &text], round);
+        }
+        crossed += u64::from(reads_temp(&effects));
+        std::fs::rename(&temp, &main).unwrap();
+        // The request, at once: the watch flushed, and everything told before it looked at.
+        effects.push(Effect::Flush { watch: Tag(TAGS), tag: Tag(FLUSHES + round) });
+        let (began, mut flushed) = (Instant::now(), false);
+        while !(flushed && watcher.idle()) {
+            within(began, &format!("round {round}'s request"));
+            let wait = Duration::from_millis(20);
+            let told = turn(&mut driver, &mut vfs, &mut watcher, &mut effects, wait, [&last, &text], round).0;
+            flushed |= told == Some(FLUSHES + round);
+        }
+        let got = read(&vfs).expect("src/main.rs is never deleted");
+        assert_eq!(String::from_utf8_lossy(&got), text, "round {round}: what a request builds");
+        last = text;
+    }
+    watcher.stop(&mut effects);
+    driver.submit(&mut effects);
+    drop(driver);
+    _ = std::fs::remove_dir_all(&root);
+    assert!(crossed >= 100, "only {crossed} of 500 renames fell between a stamp and its read");
+}
+
 /// `cmp_below` is the order of a name against a directory and a `/`, and `is_below` whether it
 /// is under it, as the strings made would say.
 #[test]
