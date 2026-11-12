@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use super::{flightrec, pulse::Pulse};
 
 /// The version of [`Asked`] and [`Answer`]. A change to any type here is a new number.
-pub const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 2;
 
 /// How long the scheduler's lock is waited for.
 const WAITS_READ: Duration = Duration::from_secs(1);
@@ -137,6 +137,30 @@ pub struct Memory {
     pub admission: String,
     /// The footprint, the number the kernel enforces; `None` when it could not be read.
     pub footprint: Option<u64>,
+    /// The global heap by holder, largest first: each tag's and `outside` (no task's).
+    pub heap: Vec<Heap>,
+    /// The bytes blaze-mem's regions have committed and not purged.
+    pub regions: u64,
+    /// The footprint less the global heap's live bytes and `regions`: freed and kept, at most.
+    pub kept: u64,
+}
+
+/// One holder's part of the global heap.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct Heap {
+    /// A tag's name, or `outside`.
+    pub holder: String,
+    /// The bytes of its live blocks as asked for, from the counting allocator.
+    pub live: u64,
+    /// Its pages in the allocator, what they have committed, their live blocks' bytes, and of
+    /// the committed bytes what pages with no live block hold and what pages under a quarter
+    /// in use hold (`blaze_mem::tag::HeapPages`); all 0 where the allocator does not say.
+    pub pages: u64,
+    pub committed: u64,
+    pub used: u64,
+    pub empty: u64,
+    pub sparse: u64,
 }
 
 /// A plane task that has not ended.
@@ -363,6 +387,30 @@ pub struct Inspector {
     pub tasks: Arc<blaze_explore::Tasks>,
 }
 
+/// The global heap by holder, largest live first.
+fn heap(snapshot: &blaze_mem::tag::Snapshot) -> Vec<Heap> {
+    let pages = blaze_mem::tag::heap_pages().unwrap_or_default();
+    let holders = blaze_mem::Tag::ALL
+        .into_iter()
+        .map(|tag| (tag.name(), snapshot.get(tag).heap, pages[tag.index()]))
+        .chain([("outside", snapshot.heap_outside, pages[blaze_mem::Tag::COUNT])]);
+    // alloc: an answer, on demand
+    let mut heap: Vec<Heap> = holders
+        .filter(|(_, live, pages)| *live != 0 || pages.pages != 0)
+        .map(|(holder, live, pages)| Heap {
+            holder: holder.to_owned(), // alloc: an answer, on demand
+            live,
+            pages: pages.pages,
+            committed: pages.committed,
+            used: pages.used,
+            empty: pages.empty,
+            sparse: pages.sparse,
+        })
+        .collect();
+    heap.sort_by(|a, b| (b.committed.max(b.live), &a.holder).cmp(&(a.committed.max(a.live), &b.holder)));
+    heap
+}
+
 impl Inspector {
     /// The document, now. Waits 60 ms between its two readings of the loop's turns.
     pub fn inspect(&self, record: bool) -> Inspected {
@@ -384,6 +432,7 @@ impl Inspector {
             .filter(|(_, bytes)| *bytes != 0)
             .collect();
         tags.sort_by(|a, b| (b.1, &a.0).cmp(&(a.1, &b.0)));
+        let heap = heap(&snapshot);
         let job_waits = job_waits();
         let recorded = record.then(|| {
             flightrec::record(flightrec::Why::Asked, "blaze debug inspect --record", flightrec::WINDOW)
@@ -412,6 +461,10 @@ impl Inspector {
                 ceiling: super::ceiling::ceiling(),
                 admission: admission(footprint, limit).to_owned(),
                 footprint,
+                heap,
+                regions: snapshot.resident_committed(),
+                kept: footprint
+                    .map_or(0, |footprint| blaze_graph::arena::kept_of(&snapshot, footprint)),
             },
             schema: SCHEMA,
             longest: longest(&threads, &lock_waits),
@@ -622,6 +675,17 @@ mod tests {
                 ceiling: 0,
                 admission: admission(Some(75 << 30), 80 << 30).to_owned(),
                 footprint: Some(75 << 30),
+                heap: vec![Heap {
+                    holder: "query".to_owned(),
+                    live: 1 << 30,
+                    pages: 40_000,
+                    committed: 2 << 30,
+                    used: 1 << 30,
+                    empty: 1 << 20,
+                    sparse: 1 << 29,
+                }],
+                regions: 2 << 30,
+                kept: 1 << 30,
             },
             schema: SCHEMA,
             longest: Vec::new(),
