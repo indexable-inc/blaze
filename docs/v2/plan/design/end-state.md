@@ -606,3 +606,72 @@ under 33 dependents and for one signature edit, rows verified, rows run, rows wh
 and the readers of changed rows. If the changed set is close to everything in the 34 crates, the
 index buys little and items 3 and 5 alone are the design; otherwise the order of building is
 1, 5, 4, 6, 3, 7.
+
+## The front end as kernel steps (2026-11-12; a design for review, not yet reviewed)
+
+The kernel's API is whole (`kernel.md`: nested steps with early cutoff, a session carried across
+pins with one reverse-index proof, the session as store records, covers that seed). Nothing of
+the front end runs on it. This section says how it does, under the bar above.
+
+### The shape
+
+The world holds only what is outside blaze: a file's bytes by path, a listing, a variable, the
+toolchain's identity. Everything else is a step, and a step reads the world or other steps:
+
+| Step (keyed by) | Reads | Value | Cutoff it gives |
+|---|---|---|---|
+| `parse(file)` | the file's bytes | the tree, as a record | none (any byte changes it) |
+| `items(file)` | `parse(file)` | the file's items by stable name, each with the hash of its header and of its body, comments and positions left out; line tables apart | a comment or a body edit leaves every other item's entry equal |
+| `item(name)` | `items(file)` (its own entry only, through a keyed part of the value) | the item's header facts (signature, generics, attributes) | a body edit changes no header fact |
+| `scope(module)` | `item` headers of the module, its imports' `scope`s, macro expansions as steps | the names the module defines and what each resolves to, as a keyed table | adding a private body changes nothing; a new name changes one key |
+| `resolve(scope, name)` | one key of `scope(module)` | what the name is | readers of other names are not reached |
+| `infer(body)`, `mir(body)`, `borrowck(body)` | the body's own entry of `items(file)`, the `item` and `resolve` steps it asks | the per-function record there is today (`body_store`) | a callee's body edit reaches no caller |
+| `code(instance)` | `mir` of the bodies it instantiates and inlines, layout steps | the function's object record | a caller is redone only when what it inlined changed |
+| `unit manifest`, `program` | its functions' `code` records by key | what is linked or patched | an unchanged function is not relinked |
+
+A step's value is read **by part**: a reader of `scope(module)` names the key it read, and the
+read's digest is that key's entry (or its absence), so a table that gains a key does not reach
+readers of other keys. This is the one thing the kernel's read needs that it lacks today (a read
+of "part k of step S's value"); without it every table is a fan-out point and the floor is missed
+at the first module with many readers.
+
+### A request
+
+1. The daemon pins the file tree; the difference from the last pin is exact (the tree is a
+   Merkle tree) and is the `Changed` of the carry: paths, variables.
+2. `Kernel::carry` repairs in height order with cutoff: `parse` of each changed file, its
+   `items`, then only the items whose entries differ, then their readers.
+3. The request's roots (the certificate's outputs: programs, unit manifests) are asked. What the
+   carry did not reach is a session hit of nanoseconds; what it reached is already repaired.
+4. The certificate above it answers an unchanged request without step 1's carry at all.
+
+### Cost against the floor (to be measured; formulas now)
+
+| Operation | Floor | This design |
+|---|---|---|
+| Comment edit | reparse the file; line tables | `parse` + `items` of one file; every item entry equal: cut there; line table record rewritten |
+| Body edit | the function's infer, MIR, code; patch | the same, plus one posting lookup per reader of the body's entry (its own steps only) |
+| Signature edit, D dependents | the items that name it | the header's readers through `resolve` keys: exactly those; each reruns (floor work) |
+| New name in a module | readers of that name (none yet) and glob importers | one key of `scope`; glob importers read the key set's digest and rerun (floor work for a glob) |
+| Restart then an edit | pages of what is affected | the session's root, the postings paths the seed reaches |
+
+What does not fit the table and is said plainly: macros (an expansion is a step keyed by the
+call's tokens and the macro's definition; a proc macro that reads state it moved is one record
+for its module, as the first review decided), trait solving (a goal reads the impls of a trait
+for a type shape: a keyed part of an `impls(trait)` table; coherence-wide questions read the
+table's digest and rerun on any new impl), and glob imports (they read a scope's whole key set).
+
+### How it is built without stopping the compiler
+
+The old engine stays the compiler until a step chain is whole; each new step is checked against
+it. `parse`, `items`, `item`: pure functions of syntax, new code, tested alone, with the old
+engine's item tree as the oracle on real crates. `scope`/`resolve`: the old def map is the oracle
+per module. `infer`/`mir`: today's `body_store` records become kernel entries (their `FactRef`
+reads become step reads one kind at a time; a fact not yet a step keeps its entries always dirty,
+which is slow and never wrong). The daemon switches a query to the kernel when its chain down to
+`parse` is whole and the oracle has agreed on reth and tempo; the old query is deleted in the
+same piece (rule 66).
+
+Order: the kernel's read-by-part; `parse`/`items`/`item`; the daemon's carry driver with the
+certificate; `infer` on step reads for the facts that are syntactic; `scope`/`resolve`; the rest
+of `infer`'s facts; `code`.
