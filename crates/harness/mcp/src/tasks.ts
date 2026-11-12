@@ -29,6 +29,9 @@ export class Task {
   readonly done: Promise<Task>;
   #resolve!: (t: Task) => void;
   /** call: the agent's id for the tool call that ran this cell (Claude's tool_use id), when the client said it. */
+  /** How long the agent said it expects the cell to take, and why it is worth a long wait (patience.ts). */
+  expect_ms?: number;
+  why?: string;
   constructor(readonly id: string, readonly code: string, readonly call: string | null = null) {
     this.done = new Promise((r) => (this.#resolve = r));
   }
@@ -41,8 +44,8 @@ export class Task {
   touch() { onChange(this); }
   /** Plain record for printing. */
   view() {
-    const { id, status, code, started, elapsed_ms, logs, result } = this;
-    return { id, status, code, started, elapsed_ms, logs, result };
+    const { id, status, code, started, elapsed_ms, expect_ms, logs, result } = this;
+    return { id, status, code, started, elapsed_ms, expect_ms, logs, result };
   }
 }
 
@@ -64,6 +67,9 @@ export function newTask(code: string, call: string | null = null): Task {
 
 /** The tool call id that ran task `id` (`t3`): null when the client did not say it, undefined when this kernel ran no such task. */
 export const taskCall = (id: string): string | null | undefined => registry.get(id)?.call;
+
+/** The time every cell of this kernel has run, summed: what the session has spent waiting on cells (cells that overlap count twice). */
+export const sessionMs = (): number => { let ms = 0; for (const t of registry.values()) ms += t.elapsed_ms; return ms; };
 
 /** How many tasks this kernel has run: their ids are t1 to this. */
 export const taskCount = (): number => seq;
@@ -97,7 +103,7 @@ const preview = (s: string, n: number) => { const one = s.replace(/\s+/g, " ").t
 /** All tasks, oldest first. */
 export function tasks() {
   return table([...registry.values()].map((t) => ({
-    id: t.id, status: t.status, code: preview(t.code, 60), started: t.started, elapsed_ms: t.elapsed_ms,
+    id: t.id, status: t.status, code: preview(t.code, 60), started: t.started, elapsed_ms: t.elapsed_ms, expect_ms: t.expect_ms,
     logs: t.logs.length, result: preview(t.result, 80),
   })));
 }
