@@ -224,6 +224,22 @@
    "why": "Andrew, 2026-11-11: the comparison in the film should be \"to the existing system\" and \"data driven\"; \"more comparisons\".",
    "recommended": "Yes, as a second narrow exception beside D6.",
    "state": "in force; first numbers measured on hello-world"
+  },
+  {
+   "id": "D-S5-1",
+   "date": "2026-11-12",
+   "decision": "The blaze edition's opt-in is the manifest's `edition = \"blaze-2026.11\"`, one spelling, carried to the front end as the crate attribute `#![blaze::edition = \"2026.11\"]`; `main` takes the roots the runtime makes in its order (`&Cx`, then `Io`), by rule `entry-takes-roots`; the entry is library code (`bstd::entry::run`) called from a module appended to the root. docs/v2/plan/design/std.md, \"The blaze edition: opting in\".",
+   "why": "Andrew, 2026-11-12: bstd should be what programs use, entry `fn main(io: Io)` \"or whatever it is\", opt-in so old things compile. A cargo-readable key lost: a package of the edition is not a cargo package. Lane bstd-entry-1112.",
+   "recommended": "Yes.",
+   "state": "in force; slice 1 on bstd-entry-1112"
+  },
+  {
+   "id": "D-S5-2",
+   "date": "2026-11-12",
+   "decision": "`blaze new` defaults to the blaze edition, and `blaze::not_latest_edition` warns by default, from the day bstd ships with blaze (std.md row S5d): one switch each, `blaze_new::BSTD_SHIPS` and `ready::EDITION_SHIPS`, both false today. Until then `blaze new --bstd <PATH>` writes the edition package, `--rust` the plain one, and the lint is `allow` unless asked for. blaze's own workspace allows the lint while cargo builds blaze (D25).",
+   "why": "Andrew asked for the edition as `blaze new`'s default and a warning for packages not on it. Today a package of the edition names bstd by path into a checkout of blaze, so the default would break `blaze new` + `blaze run` on every installed blaze (the release's install check), and the warning would tell people to move to something they cannot build. Lane bstd-entry-1112; for Andrew to overrule.",
+   "recommended": "Yes, until S5d; then flip both.",
+   "state": "in force; for Andrew to confirm"
   }
  ]
 }

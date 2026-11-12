@@ -81,6 +81,24 @@
    "do": "Lanes only write: one worktree and branch each, small commits, pushed often; no VM, no cargo, no daemon. The main agent runs `python3 -I harness/v2/integrate.py '{\"branches\":[...],\"tests\":true}'`: it merges every branch into the integration worktree, builds once, and prints one table (edit loop beside Relax, stale answers, new project, restart, memory, disk, tests). Failures go back to the lane whose files they name. The script's paths are the Mac's today (integration worktree /Volumes/Projects/blaze-int-1112, Relax at /tmp/relax-src); moving it to the one build VM is open.",
    "why": "Rule fan-out-write-only as rewritten 2026-11-12: ten lanes each building in their own VM cost a cold build and hours each, and their numbers had to be redone on the combined tree anyway.",
    "state": "current"
+  },
+  {
+   "id": "H-bstd-entry-1",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-entry-1112",
+   "task": "Read your own build errors from the shared loop (`/root/loop.sh`) as a lane",
+   "do": "`ix shell lanebase-1112 --noninteractive -- bash -c \"/root/loop.sh <branch> <cmd> >/tmp/x.out 2>&1; cp /root/loop-build.log /tmp/x-build.log; head -3 /tmp/x.out; grep -nE '^error' -A18 /tmp/x-build.log | head -200\"`: the copy is taken in the same call, right after the lock is released, and the errors are grepped from it.",
+   "why": "loop.sh prints `grep -E '^(error|warning: unused)' -A12 | head -150`, and cargo's `unused_workspace_dependencies` warnings (which start `warning: unused`) fill the 150 lines before the first error; and /root/loop-build.log is overwritten by the next lane's call.",
+   "state": "current"
+  },
+  {
+   "id": "H-bstd-entry-2",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-entry-1112",
+   "task": "Build and run a package of the blaze edition (`edition = \"blaze-2026.11\"`) from a checkout",
+   "do": "`blaze new --vcs none --bstd <checkout>/crates/blaze-std hello`, copy the checkout's Cargo.lock to hello/Cargo.lock (bstd's dependencies at the tree's versions), `blaze run` in it. The end-to-end tests are `the_blaze_edition_*` and `blaze_new_then_run_*` in crates/blaze-engine/tests/repro.rs.",
+   "why": "A package of the edition names bstd by path until blaze ships it (docs/v2/plan/design/std.md, row S5d).",
+   "state": "current"
   }
  ],
  "annoyances": [
@@ -1209,6 +1227,54 @@
    "workaround": "stopped it with its own binary",
    "fix": "`--version` prints both the launcher and the version it runs; `stop` names the daemon on the socket whatever built it",
    "state": "open"
+  },
+  {
+   "id": "A-bstd-entry-1",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-entry-1112",
+   "where": "/root/loop.sh on lanebase-1112",
+   "what": "A failed build printed 150 lines of `Cargo.toml` `unused_workspace_dependencies` warnings and no error: the script's `grep -E \"^(error|warning: unused)\" -A12 ... | head -150` is filled by them. Reading /root/loop-build.log afterwards showed another lane's build.",
+   "cost": "two build rounds (about ten minutes) without seeing the three errors",
+   "cause": "the filter matches cargo's manifest warnings; the log is shared",
+   "workaround": "H-bstd-entry-1",
+   "fix": "loop.sh greps `^error` alone and writes the log to /root/loop-build.<branch>.log",
+   "state": "open"
+  },
+  {
+   "id": "A-bstd-entry-2",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-entry-1112",
+   "where": "base-db `crate_attrs` (crates/base-db/src/crate_attrs.rs:204)",
+   "what": "A crate attribute handed to `BuiltCrateData::crate_attrs` without `#![` and `]` around it panics the lowering (\"is not given with \\\"#![\\\" and \\\"]\\\" around it\"); the field's doc says so, the module's top doc reads as if the text is wrapped for you.",
+   "cost": "one build round",
+   "cause": "an invariant of a string field checked by a panic at use",
+   "workaround": "`BlazeEdition::crate_attr` returns the whole `#![..]`",
+   "fix": "a `CrateAttr` type whose constructor wraps or refuses",
+   "state": "open"
+  },
+  {
+   "id": "A-bstd-entry-3",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-entry-1112",
+   "where": "hir-ty, with `rustc_type_ir::inherent::SliceLike` in scope",
+   "what": "`Root::ALL.iter().map(|&root| ..)` on a `[Root; 2]` failed with `expected Root, found &_`: with `SliceLike as _` imported, `.iter()` on an array is the trait's, which yields values.",
+   "cost": "one build round",
+   "cause": "a blanket trait method shadowing the slice's",
+   "workaround": "`.into_iter()`",
+   "fix": "none proposed",
+   "state": "accepted"
+  },
+  {
+   "id": "A-bstd-entry-4",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-entry-1112",
+   "where": "blaze, a program's `main`",
+   "what": "Reading the entry code showed `fn main(x: u32) {}` compiled and ran with `x` whatever was in the first argument register: nothing checked `main`'s parameters (rustc's E0580).",
+   "cost": "none; found while reading",
+   "cause": "`start_shim` stores `main`'s address as a `fn() -> T` without comparing signatures, and blaze-diagnostics' `entry` check stops at finding a function",
+   "workaround": "",
+   "fix": "fixed on this branch: `hir_ty::entry::takes` refuses a `main` with parameters outside the blaze edition (crates/blaze-diagnostics/src/checks/krate.rs)",
+   "state": "fixed on bstd-entry-1112"
   }
  ]
 }
