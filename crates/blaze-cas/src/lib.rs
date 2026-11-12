@@ -2916,7 +2916,18 @@ impl Store {
     /// program may be running is never written, and what is written is the patch, whatever
     /// the file's length. Nothing of the store is read, cloned or waited for. A `to` that is
     /// not there, or on a volume that shares no blocks, fails the place, naming it.
-    pub fn place_patched(&mut self, to: FileName, file: Sparse, effects: &mut Vec<Effect>) -> Tag {
+    ///
+    /// `started` says a program is started from `to` (an executable): its clone is then asked
+    /// to hold in memory what the system holds of `to`'s file ([`Effect::Prewarm`],
+    /// `publish::Writing`), so the program's next start reads from memory what its last run
+    /// did. A file nothing starts from (a debug file) is not.
+    pub fn place_patched(
+        &mut self,
+        to: FileName,
+        file: Sparse,
+        started: bool,
+        effects: &mut Vec<Effect>,
+    ) -> Tag {
         assert!(
             !self.tiers.iter().any(|tier| to.is_under(&tier.dir)),
             "{to} is in the store: values are placed outside it"
@@ -2934,7 +2945,7 @@ impl Store {
             waits = tracing::field::Empty,
         );
         self.place_spans.insert(tag, span);
-        self.publish(tag, to, Content::Over(file), Durable::No, 0, effects);
+        self.publish(tag, to, Content::Over { file, started }, Durable::No, 0, effects);
         tag
     }
 
@@ -3060,7 +3071,7 @@ impl Store {
                 Content::File { of: None, .. }
                 | Content::Bytes(_)
                 | Content::Sparse(_)
-                | Content::Over(_) => {}
+                | Content::Over { .. } => {}
             }
             // alloc: an error, once per place refused
             let why = format!(
@@ -3076,7 +3087,10 @@ impl Store {
                 bytes: PlacedBytes::default(),
             });
         }
-        let over = matches!(content, Content::Over(_));
+        let over = match &content {
+            Content::Over { started, .. } => Some(*started),
+            _ => None,
+        };
         match content {
             Content::Bytes(bytes) => {
                 let placed = PlacedBytes { cloned: 0, written, copied: bytes.len() as u64 };
@@ -3088,7 +3102,7 @@ impl Store {
                 let op = Op::Place { asked, to, staged: None, of: None, bytes: placed };
                 self.tags.ops.insert(asked, op);
             }
-            Content::Sparse(file) | Content::Over(file) => {
+            Content::Sparse(file) | Content::Over { file, .. } => {
                 if let Err(why) = file.check() {
                     // alloc: an error, once per place refused
                     let why = format!("{to} was to be written from runs that are no file: {why}");
@@ -3114,7 +3128,9 @@ impl Store {
                     ),
                     _ => (temp, None),
                 };
-                let (writing, clear) = publish::Writing::begin(to, temp, file, over, asked);
+                let (mut writing, clear) =
+                    publish::Writing::begin(to, temp, file, over.is_some(), asked);
+                writing.warm = over == Some(true);
                 #[cfg(test)]
                 let writing = writing.planted_with(plant);
                 self.writing.insert(asked, writing);

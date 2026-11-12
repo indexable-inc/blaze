@@ -464,7 +464,7 @@ impl World {
                     store.unplace_made(&before, &mut self.effects);
                 }
                 self.allowed += self.dirty[n];
-                let tag = store.place_patched(path(n), file, &mut self.effects);
+                let tag = store.place_patched(path(n), file, n % 2 == 0, &mut self.effects);
                 let value = self.values.len();
                 self.values.push(Value { bytes, key: None });
                 let reports = Some((wrote, len.saturating_sub(wrote)));
@@ -726,7 +726,7 @@ fn a_patched_outputs_place_writes_its_patch_whatever_the_files_length() {
             }
             for to in &paths {
                 // clone: each path's writes own their runs.
-                store.place_patched(to.clone(), patch.clone(), &mut effects);
+                store.place_patched(to.clone(), patch.clone(), true, &mut effects);
             }
             drive(&mut sim, &mut store, &mut effects);
             let placed = store.placed();
@@ -781,7 +781,7 @@ fn a_patch_of_a_path_with_no_file_fails_naming_it() {
     let mut store = open(&mut sim, "store");
     let mut effects = Vec::new();
     let patch = Sparse { len: 100, runs: vec![(10, vec![1; 20])] };
-    store.place_patched(name("one/build/app"), patch, &mut effects);
+    store.place_patched(name("one/build/app"), patch, true, &mut effects);
     drive(&mut sim, &mut store, &mut effects);
     let placed = store.placed();
     let why = placed[0].result.clone().unwrap_err();

@@ -6851,8 +6851,10 @@ impl<S: Steps> Jobs<S> {
         let tag = match (made, over) {
             // clone: the patch's runs, which the path's writes own (an effect owns its
             // bytes); once per path, the edit's bytes
+            // An executable is started from its path: its clone is prewarmed. A debug file
+            // is not.
             (Made::Patch { file: patch, .. }, true) => {
-                w.store.place_patched(file, patch.clone(), w.effects)
+                w.store.place_patched(file, patch.clone(), executable, w.effects)
             }
             (Made::Patch { whole, .. }, false) => {
                 let span = tracing::info_span!(

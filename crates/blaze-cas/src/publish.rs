@@ -218,6 +218,10 @@ pub(crate) struct Writing {
     pub(crate) len: u64,
     /// Whether it starts from a clone of the path's own file ([`Content::Over`]).
     pub(crate) over: bool,
+    /// Whether that clone is prewarmed ([`Step::Warm`]): for a file a program is started
+    /// from. Any other (a debug file beside it) is read by nothing as the build ends, and a
+    /// prewarm of it would read from the disk, each edit, whatever of it the system held.
+    pub(crate) warm: bool,
     /// The runs, until the cut is made and they go to their writes.
     runs: Vec<(u64, Vec<u8>)>,
     /// The writes still in flight, and the first that failed.
@@ -309,6 +313,7 @@ impl Writing {
             temp,
             len,
             over,
+            warm: over,
             runs,
             left: 0,
             failed: None,
@@ -347,7 +352,7 @@ impl Writing {
                 Next::Going
             }
             (Step::Clear, Done::Removed) | (Step::Clone, Done::Cloned) => {
-                if step == Step::Clone {
+                if step == Step::Clone && self.warm {
                     // What the system holds in memory of the path's file, asked for in the
                     // clone: beside the cut and the writes, and before the rename.
                     // clone: the effect owns the names; once per place
@@ -514,9 +519,10 @@ pub(crate) enum Content {
     /// the path ([`Writing`]). `how`: `write runs`.
     Sparse(Sparse),
     /// The path's own file with these runs written over it, cut to the length: a clone of
-    /// it under a staged name, written and renamed onto the path ([`Writing`]). `how`:
-    /// `patch`.
-    Over(Sparse),
+    /// it under a staged name, written and renamed onto the path ([`Writing`]); `started`
+    /// when a program is started from the path, whose clone is then prewarmed
+    /// ([`Writing::warm`]). `how`: `patch`.
+    Over { file: Sparse, started: bool },
     /// `from`'s, `len` bytes that hash to `content`: cloned under a staged name and renamed
     /// onto the path. `of`, the whole file of the store's it is, counted as cloned until the
     /// clone ends. `how`: `clone`.
@@ -533,7 +539,7 @@ impl Content {
         match self {
             Content::Bytes(_) => "write",
             Content::Sparse(_) => "write runs",
-            Content::Over(_) => "patch",
+            Content::Over { .. } => "patch",
             Content::File { .. } => "clone",
             Content::Patch { .. } => "derive",
         }
@@ -665,6 +671,17 @@ mod tests {
         assert_eq!(ended, Ok(16), "{events:?}");
         assert_eq!(out_of_order(&events, false), None, "{events:?}");
         assert!(!events.contains(&Event::Asked(Step::Clone)), "{events:?}");
+        // A patch of a file no program is started from is a clone with no prewarm.
+        let name = |it: &str| FileName::new(it).unwrap();
+        let file = Sparse { len: 8, runs: Vec::new() };
+        let (mut cold, _) = Writing::begin(name("out/a.debug"), name("out/.a.placing"), file, true, Tag(1));
+        cold.warm = false;
+        let mut effects = Vec::new();
+        assert!(matches!(cold.step(Step::Clear, &Done::Removed, |_| Tag(2), &mut effects), Next::Going));
+        assert!(matches!(cold.step(Step::Clone, &Done::Cloned, |_| Tag(2), &mut effects), Next::Going));
+        assert!(matches!(cold.step(Step::Cut, &Done::Truncated, |_| Tag(2), &mut effects), Next::Going));
+        let asked: Vec<Step> = effects.iter().map(step_of).collect();
+        assert_eq!(asked, [Step::Clone, Step::Cut, Step::Rename]);
 
         for warm_first in [true, false] {
             let (events, ended) = driven(true, warm_first, false, false);
