@@ -176,6 +176,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 62. **sota-first**: Go for the state of the art right away: design the end state and build it directly,
     all its independent pieces in parallel, not a step-by-step climb through halfway versions; then
     prove it on the real targets. Skill: `changing-code`.
+63. **record-annoyances**: Whatever slows, surprises or annoys you while working, however slightly (a
+    tool's quirk, a trap in the tree, a missing command, your own repeated mistake), gets a row in
+    `docs/v2/plan/annoyances.json` when it happens, with who you are. Skill: `changing-code`.
 
 ## Code Review Rules
 

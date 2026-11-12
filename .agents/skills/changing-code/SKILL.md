@@ -120,4 +120,18 @@ on the same machine is won on every row (`incremental-first` says which rows com
 is not finished at "the micro-benchmark improved"; it is finished when the real targets work and the
 comparison is won, or when what still blocks that is written down with its evidence.
 
+## record-annoyances (rule 63)
+
+`docs/v2/plan/annoyances.json` is one list of rows: `id`, `date`, `who` (the model id and name and
+whether you are the main agent or a lane, or the person's name), `where` (the tool or the part of
+blaze), `what` happened in one or two sentences with the exact command or message, `cost` (time, a
+wrong claim, lost work, context), `cause` if known, `workaround`, and `state` (open, accepted, or
+fixed with the commit). Add the row at the moment it happens, in the change you are making, without
+waiting to be asked and without judging whether it is important: a `sed -i` that behaves differently
+on this machine counts, so does a command that printed a thousand lines, so does a mistake of your
+own method. Do not tidy it into a lesson; say what happened. A lane adds its rows to its own branch
+and names them in its report. The list is the input to `guard-the-cause` and `unease-is-work`: read
+it before starting work in an area, and when you fix a cause set the row's state rather than
+deleting it.
+
 <!-- End of the generated rules. Hand-written notes follow. -->
