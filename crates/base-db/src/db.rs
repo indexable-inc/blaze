@@ -310,6 +310,19 @@ impl Db {
         })
     }
 
+    /// The read of the file outside the VFS at `path` set to `bytes`, if any crate read it
+    /// ([`Files::included_file`]): for a file whose bytes are known before they are on disk
+    /// and that was read from disk before then (a file a build script's run left in
+    /// `OUT_DIR`, read by an `include!` resolved before the run). Unlike
+    /// [`Db::set_included_file`] it makes no read of a file nothing read. Whether a read
+    /// changed.
+    pub fn settle_included_file(&mut self, path: &AbsPath, bytes: std::sync::Arc<[u8]>) -> bool {
+        if self.files.find_included(path).is_none() {
+            return false;
+        }
+        self.set_included_file(path, bytes)
+    }
+
     /// Reads again each file outside the VFS that `include_bytes!` or `include_str!` read,
     /// through the one reader that read it first ([`Files::reload_included_file`]), and sets
     /// those whose read moved in one batch named by `trigger`: so exactly their readers run

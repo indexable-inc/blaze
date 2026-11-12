@@ -379,7 +379,7 @@ fn own_code(db: &Db, krate: Crate) -> ContentId {
     let mut hasher = Hasher::new(OWN_CODE);
     hasher.id(&krate.content(db));
     let whole = |hasher: &mut Hasher| {
-        hasher.update(&[0]).id(&db.file_content(root_file)).id(&root.content(db));
+        hasher.update(&[0]).id(&db.file_content(root_file)).id(&base_db::crate_root_content(db, krate));
         hasher.finish()
     };
     let set = root.source_root_ref(db);
@@ -497,7 +497,6 @@ const LIBRARY_KEY: &str = "blaze v2 library crate narrow 1";
 /// on: its own narrowed identity reads none of them.
 pub(crate) fn library_key(db: &Db, krate: Crate, front_end: &ContentId) -> ContentId {
     let data = krate.data(db);
-    let root = db.file_source_root(data.root_file_id).source_root_id(db);
     let mut hasher = Hasher::new(LIBRARY_KEY);
     hasher.id(front_end);
     for domain in [CODE_TEXT, INTERFACE_TEXT, OWN_NARROW] {
@@ -506,7 +505,7 @@ pub(crate) fn library_key(db: &Db, krate: Crate, front_end: &ContentId) -> Conte
     hasher
         .id(&krate.content(db))
         .id(&db.file_text(data.root_file_id).content(db))
-        .id(&db.source_root(root).content(db));
+        .id(&base_db::crate_root_content(db, krate));
     hasher.finish()
 }
 
