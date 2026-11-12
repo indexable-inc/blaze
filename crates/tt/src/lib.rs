@@ -462,6 +462,15 @@ pub struct Delimiter {
 }
 
 impl Delimiter {
+    /// Whether these are the parentheses `macro_rules!` puts around an expression it was
+    /// passed (`mbe`'s transcriber), which are not in the source and which rustc does not
+    /// have: both of the span of the fragment in the macro's body. A group a proc macro gave
+    /// the span of a group of the source it was handed, with `Group::set_span`, has one span
+    /// for both too, of the source's context, and its parentheses are the source's.
+    pub fn is_fragment_parens(&self) -> bool {
+        self.kind == DelimiterKind::Parenthesis && self.open == self.close && !self.open.ctx.is_root()
+    }
+
     pub const fn invisible_spanned(span: Span) -> Self {
         Delimiter { open: span, close: span, kind: DelimiterKind::Invisible }
     }
@@ -1041,12 +1050,8 @@ pub fn stringify<F: Fn(Span, &str) -> Option<bool> + ?Sized>(
             || adjacent(end(prev), start(next))
     }
 
-    /// Whether `subtree` is the parentheses `macro_rules!` puts around an expression it was
-    /// passed: both of the span of the fragment in the macro's body. A group a proc macro gave
-    /// the span of a group of the source it was handed, with `Group::set_span`, has one span
-    /// for both too, of the source's context, and its parentheses are the source's.
     fn expression_parens(subtree: &Subtree) -> bool {
-        subtree.delimiter.open == subtree.delimiter.close && !subtree.delimiter.open.ctx.is_root()
+        subtree.delimiter.is_fragment_parens()
     }
 
     /// rustc's `idents_would_merge`.
