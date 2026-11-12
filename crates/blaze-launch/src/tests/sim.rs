@@ -354,7 +354,8 @@ impl Sim {
                                 gate.at
                             ));
                         };
-                        match if new { Target::Body(body) } else { old } {
+                        let to = if new { Target::Body(body) } else { old };
+                        match to {
                             Target::Body(body) => self.land(thread, body)?,
                             Target::Stub => actor.at = At::Stub(slot),
                             Target::Gate { .. } => {
