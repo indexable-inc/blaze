@@ -275,7 +275,11 @@ impl Ahead {
         let id = self.id();
         self.out.push(Do::Send { id, request: Request::Cancel { id: target } });
         // What was held behind it goes on now, beside its end: no request waits for a
-        // cancelled build ahead to be over.
+        // cancelled build ahead to be over. (The planted bug keeps them, to answer each with
+        // the build ahead's end however it ends.)
+        if planted(Plant::OldAnswer) {
+            return;
+        }
         for (from, request) in self.held.drain(..) {
             self.out.push(Do::Pass { from, request });
         }

@@ -1,0 +1,13 @@
+# The smoke's member on the blaze edition: it depends on bstd (crates/blaze-std), which only
+# blaze builds, so every round's smoke compiles bstd under blaze. A change to a blaze-core enum
+# that bstd matches on with no catch-all (`Effect`, `Done`) then fails the round it lands in,
+# not the first blaze-edition test someone runs later (2026-11-12: `Effect::Prewarm`,
+# `Effect::Barrier`, `Done::Ordered` and `Done::Prewarmed` broke bstd unseen, since cargo never
+# builds it).
+[package]
+name = "smoke-edition"
+version = "0.1.0"
+edition = "blaze-2026.11"
+
+[dependencies]
+bstd = { package = "blaze-std", path = "../../../../crates/blaze-std" }

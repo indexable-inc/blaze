@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "sys"]
+members = [".", "sys", "edition"]
 
 [package]
 name = "smoke"
