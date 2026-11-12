@@ -134,9 +134,10 @@ const PACK_MOST: u64 = 1 << 30;
 #[cfg(test)]
 const PACK_MOST: u64 = 256 << 10;
 
-/// A value shorter than this stays as it is: compressing it saves less than its index slot
-/// costs. A cold kind's value is the exception once its kind has a dictionary: values of one
-/// kind share most of their bytes, which the dictionary takes out of even a short one.
+/// A value shorter than this stays as it is while its kind has no dictionary: compressed
+/// alone it saves less than its index slot costs. Once its kind has one it is moved cold as
+/// any other: values of one kind share most of their bytes, which the dictionary takes out of
+/// even a short one.
 const DEMOTE_FROM: u64 = 4 << 10;
 
 /// One [`Store::settle`] moves or copies at most this many bytes, so it stays a short step.
@@ -2855,13 +2856,15 @@ impl Store {
         let rows = self.look().rows(0, &mut bad);
         // alloc: once a settle (idle), the records it moves, sorted after
         let (mut demote, mut promote) = (Vec::new(), Vec::new());
-        // By kind code: whether a short record of the kind is listed. A cold kind's is, to be
-        // moved colder once the kind has a dictionary and, before, to be sampled while its
-        // training wants samples (after a reopen, the only way its records already kept are).
+        // By kind code: whether a short record of the kind is listed: to be moved colder once
+        // the kind has a dictionary and, before, to be sampled while its training wants
+        // samples (after a reopen, the only way its records already kept are). Every kind's
+        // is: most records of a hot kind are short too (a function's code, a small query
+        // result: 23 of hello-world's 26 MiB of them), and a dictionary takes four fifths of
+        // each.
         let short_listed: [bool; Kind::ALL.len()] = std::array::from_fn(|code| {
             Kind::from_code(code as u8).is_some_and(|kind| {
-                kind.cold()
-                    && (self.dictionary_of(kind).is_some() || self.training[code].wants_samples())
+                self.dictionary_of(kind).is_some() || self.training[code].wants_samples()
             })
         });
         // alloc: once a settle (idle), a count for each whole file a record names: a few
@@ -2874,7 +2877,9 @@ impl Store {
             }
             let Place::Pack(loc) = found.place else { continue };
             let Some(pack) = own.packs.get(loc.pack as usize) else { continue };
-            // A short record goes colder only as `short_listed` says, and never comes back hot.
+            // A short record goes colder only as `short_listed` says. One of a cold kind never
+            // comes back hot (its kind is read rarely, by its nature); one of a hot kind does,
+            // as a long one does.
             let short = loc.raw < DEMOTE_FROM;
             if pack.removed || pack.retiring || (short && !short_listed[loc.kind.code() as usize]) {
                 continue;
@@ -2896,7 +2901,9 @@ impl Store {
                 {
                     demote.push((key, loc, found.at.row()));
                 }
-                Form::Zstd | Form::Warm | Form::ColdColumns if read && before && !short => {
+                Form::Zstd | Form::Warm | Form::ColdColumns
+                    if read && before && (!short || !loc.kind.cold()) =>
+                {
                     promote.push((key, loc, found.at.row()));
                 }
                 _ => {}

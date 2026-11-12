@@ -738,6 +738,9 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// The collector of what blaze keeps on disk ([`super::gc`]): `blaze serve`'s daemon's
     /// alone ([`Daemon::collect`]), as a test's daemons share no disk of their own.
     gc: Option<super::gc::Gc>,
+    /// The store's cold moves between requests ([`super::settle`]): `None` for a daemon that
+    /// makes none (a one-shot build, most tests).
+    settles: Option<super::settle::Settles>,
     /// `blaze fetch-url`'s requests, each fetched on a thread of its own.
     fetch_urls: super::fetch_url::FetchUrls,
     /// Builds that failed for want of space, their finish held under the collector's hold id
@@ -1762,12 +1765,18 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             pressure_watched: true,
             paused_checked: Duration::ZERO,
             gc: None,
+            settles: None,
             fetch_urls: super::fetch_url::FetchUrls::new(),
             held: Vec::new(), // alloc: none until a build runs out of space
         })
     }
 
     /// Collects what blaze keeps on disk with `gc`, in the background of its turns.
+    /// Moves what its store leaves unread cold, between requests ([`super::settle`]).
+    pub fn settle(&mut self, settles: super::settle::Settles) {
+        self.settles = Some(settles);
+    }
+
     pub fn collect(&mut self, gc: super::gc::Gc) {
         self.gc = Some(gc);
     }
@@ -2088,6 +2097,14 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         // A job's wait for the store to make its puts durable has a deadline of its own.
         sooner(self.jobs.next_deadline().map(Deadline::at), Woken::Durable);
         sooner(self.observe.wait(now).map(|it| Deadline::after(now, it)), Woken::Observe);
+        if let Some(settles) = &self.settles {
+            // A batch out comes back over a channel no driver wakes for, and a plan under way
+            // takes a step a turn while the daemon is between requests.
+            if settles.out() || (self.store.settling() && self.quiet_between_requests()) {
+                sooner(Some(Deadline::after(now, Duration::from_millis(1))), Woken::Idle);
+            }
+            sooner(settles.policy.next().map(Deadline::at), Woken::Idle);
+        }
         self.submit();
         let mut done = std::mem::take(&mut self.done);
         let (until, woken) = wait;
@@ -2197,6 +2214,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             self.images.step(parts, idle);
         }
         self.between();
+        self.settle_turn();
         // A stalled job's leases end once its tasks let go of it.
         self.jobs.release_leases();
         let fetched = self.fetch_urls.take_answers();
@@ -3161,6 +3179,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
         if self.jobs.ended {
             self.jobs.ended = false;
+            if let Some(settles) = &mut self.settles {
+                settles.policy.build_ended();
+            }
             let _span = tracing::info_span!(
                 target: "blaze",
                 "between requests: collect",
@@ -3223,6 +3244,99 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             self.settling = false;
             if let Err(error) = settled {
                 self.fail(Failed::Settle(error));
+            }
+        }
+    }
+
+    /// The store's cold moves, one step a turn ([`super::settle`]): a batch that came back
+    /// compressed is put, whatever the daemon is doing (it is a copy into the store's segment);
+    /// between requests, the next batch is taken out for a worker, or what follows the cold
+    /// moves is stepped, or a period ends. Nothing here waits for zstd or for a sync.
+    fn settle_turn(&mut self) {
+        use super::settle::{FLUSH_EVERY, STEP_MOST, TAKE_MOST};
+        if self.stopping.is_some() || !self.store.ready() || self.store.broken().is_some() {
+            return;
+        }
+        let quiet = self.quiet_between_requests();
+        let Some(settles) = &mut self.settles else { return };
+        // A commit in flight holds a batch back until its head is written: the store makes
+        // its moves between commits.
+        if !self.store.committing()
+            && let Some(batch) = settles.back()
+        {
+            let bytes = batch.bytes();
+            let span = tracing::info_span!(
+                target: "blaze",
+                "store cold put",
+                kind = batch.kind(),
+                values = batch.len(),
+                bytes,
+                moved = tracing::field::Empty,
+            )
+            .entered();
+            let moved = self.store.settle_put(batch);
+            span.record("moved", moved);
+            settles.unflushed += bytes;
+        }
+        if !self.jobs.idle()
+            || self.jobs.storing() > 0
+            || self.jobs.placing_after() != 0
+            || !quiet
+            // The settle's image is being written: the two do not share the disk.
+            || self.settling
+            || settles.out()
+        {
+            return;
+        }
+        if self.store.settling() {
+            if self.store.committing() {
+                return;
+            }
+            let taken = {
+                let _span = tracing::info_span!(target: "blaze", "store cold take").entered();
+                self.store.settle_take(TAKE_MOST)
+            };
+            match taken {
+                Some(batch) => settles.compress(batch),
+                None => {
+                    let span = tracing::info_span!(
+                        target: "blaze",
+                        "store settle step",
+                        promoted = tracing::field::Empty,
+                        retired = tracing::field::Empty,
+                        more = tracing::field::Empty,
+                    )
+                    .entered();
+                    let settled = self.store.settle_step(STEP_MOST, &mut self.effects);
+                    span.record("promoted", settled.promoted);
+                    span.record("retired", settled.retired);
+                    span.record("more", settled.more);
+                }
+            }
+            if settles.unflushed >= FLUSH_EVERY {
+                settles.unflushed = 0;
+                self.store.flush(&mut self.effects);
+            }
+            return;
+        }
+        // The plan is done: what its batches moved is committed.
+        if settles.unflushed > 0 {
+            settles.unflushed = 0;
+            self.store.flush(&mut self.effects);
+            return;
+        }
+        let now = self.driver.now();
+        if settles.policy.due(now) {
+            let span = tracing::info_span!(
+                target: "blaze",
+                "store period ends",
+                ended = tracing::field::Empty,
+            )
+            .entered();
+            let ended = self.store.end_period();
+            span.record("ended", ended);
+            if ended {
+                settles.policy.ended(now);
             }
         }
     }
