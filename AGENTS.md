@@ -20,9 +20,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
    builder of blaze (check, build, unit tests), and the tree stays accepted by both; blaze still
    builds blaze as the proof, every verdict about blaze's behaviour comes from a blaze, and when
    blaze fails on blaze that failure is still the work. Skill: `build-and-test`.
-3. **no-fallback**: No fallback, ever, and failures are loud: when blaze can't do something it stops
-   with an error naming what and where; nothing is accepted and ignored, skipped quietly or answered
-   with an empty result. Skill: `runtime-code`.
+3. **no-fallback**: No fallback and no retry, ever, and failures are loud: when blaze can't do
+   something it stops with an error naming what and where; a failed build is better than one that
+   quietly tried again or took another route; nothing is accepted and ignored, skipped quietly or
+   answered with an empty result. Skill: `runtime-code`.
 4. **superset-of-rust**: Every program the pinned nightly accepts, blaze accepts and runs correctly by
    Rust's semantics; rustc's own behavior is a reference, not the definition; blaze refuses only
    rustc soundness holes, and its extensions are opt-in. Skill: `compiler-correctness`.
@@ -96,10 +97,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 34. **work-in-ix-vms**: Everything that runs on Linux runs on the one build VM, `blaze-vm`, through its
     one build queue; never a VM per lane, never AWS; the Mac is for what only macOS can show, one
     build at a time. Skill: `build-and-test`.
-35. **fan-out-write-only**: One tree, one VM, one run: lanes only write code, in the one integration
-    directory; the main agent commits it, builds the one tree once on the one build VM, and runs
-    every check that makes sense on that one binary, then hands each failure back to the lane that
-    owns the code. Skill: `build-and-test`.
+35. **fan-out-write-only**: Lanes only write code, all in the one integration directory, and run
+    nothing: no build, no test, no VM call, no waiting shell; when the writing is done the main
+    agent builds the one tree once on the one VM, runs every check at once, and hands each failure
+    back to the lane that owns the file. Skill: `build-and-test`.
 36. **worktree-per-lane**: Lanes write in the one integration directory, each in its own files, and
     everything is tested at once; a worktree is the exception, for two lanes that must change the
     same file or a variant tree; never `git stash`. Skill: `build-and-test`.
@@ -130,8 +131,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 47. **every-agent-has-a-task**: Every agent is started on one task (an objective id or a named piece of
     one) that says its outcome and its check; people follow tasks, not agents. Skill:
     `build-and-test`.
-48. **agents-are-a-cost**: Run every independent, large piece of the work at once, each in its own lane;
-    never an agent for a piece that is small, dependent on another, or only reading. Skill:
+48. **agents-are-a-cost**: Run every independent, large piece of the work at once, each in its own lane,
+    and start it now: a piece that can begin in parallel never waits in a list behind another; never
+    an agent for a piece that is small, dependent on another, or only reading. Skill:
     `build-and-test`.
 49. **docs-stay-small**: Keep docs few and short: the plan, the ledger, the bounds and one spec per
     unbuilt design; no lane notes, pass reports or indexes; delete a doc when it stops being true or
