@@ -376,6 +376,8 @@ pub(crate) fn units(
             // units of one key would build and place the same files twice.
             let mut merged: Vec<(blaze_ids::ContentId, Vec<(String, usize)>)> = Vec::new(); // alloc: a few platforms, once per load
             let links_runtime = links_dev_runtime(&graph, &packages_by_spec);
+            // alloc: a few platforms, once per load
+            let mut keyed: Vec<(BuiltFor<'_>, StdKey)> = Vec::with_capacity(platforms_used.len());
             for built_for in platforms_used {
                 let triple = built_for.platform.unwrap_or(host.triple.as_str());
                 // The wasm macros' std is planned as their units are: no rustflags, std's
@@ -401,6 +403,10 @@ pub(crate) fn units(
                     Ok(it) => it,
                     Err(error) => return Ok(Staged::Failed(error)),
                 };
+                keyed.push((built_for, key));
+            }
+            one_std_a_place(&mut keyed);
+            for (built_for, key) in keyed {
                 let id = key.id();
                 if let Some((_, roots)) = merged.iter().find(|(it, _)| *it == id) {
                     if let Err(error) = runs_as_keyed(&graph, roots, &key, id, built_for) {
@@ -414,15 +420,17 @@ pub(crate) fn units(
                         StdPlanned::Ready(std) => std,
                         StdPlanned::Failed(error) => return Ok(Staged::Failed(error)),
                     };
-                // Named by its key alone, never by the workspace: every workspace on the daemon
-                // asking for the same std names the same outputs, and builds it once.
+                // Named by what its units are made from alone ([`StdKey::placement`]), never
+                // by the workspace nor by which of its crates the build asks for: every
+                // workspace on the daemon, and every command of one (a program's build and its
+                // tests'), names each unit of one std by the same outputs, and builds it once.
                 if !Path::new(&spec.std).has_root() {
                     return Ok(fail(anyhow::anyhow!(
                         "the daemon names `{}`, no absolute directory, for the standard library's builds",
                         spec.std
                     )));
                 }
-                let out = format!("{}/{:x}", spec.std, id);
+                let out = format!("{}/{:x}", spec.std, placed(&key));
                 let roots = merge_std(
                     &mut graph,
                     &mut std_plans,
@@ -1060,6 +1068,46 @@ fn std_key(
         // clone: the key owns its strings
         codegen_backend: base.codegen_backend.clone(),
     })
+}
+
+/// The ID of the directory `key`'s units place what they make in: [`StdKey::placement`].
+fn placed(key: &StdKey) -> blaze_ids::ContentId {
+    #[cfg(test)]
+    if PLACES_BY_CRATES_ASKED.get() {
+        return key.id();
+    }
+    key.placement()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: the standard library's directory is named by its whole key,
+    /// the crates asked among it, as it was until 2026-11-11.
+    pub(crate) static PLACES_BY_CRATES_ASKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Gives the platforms of one build whose stds are placed in one directory
+/// ([`StdKey::placement`]) one key: each asks for every crate any of them asks for. Their
+/// keys are then equal, so the build has that std's units once and both platforms' units
+/// depend on them (`merged`, in the caller). Left apart, two keys of one placement would be
+/// two sets of units in one graph writing the same files, each unit they share twice. A crate
+/// one platform did not ask for is one more `--extern` its units do not name (`nounused`),
+/// as cargo's `-Zbuild-std` gives every unit every root.
+fn one_std_a_place(keyed: &mut [(BuiltFor<'_>, StdKey)]) {
+    // alloc: a few platforms' ids, once per load
+    let places: Vec<blaze_ids::ContentId> = keyed.iter().map(|(_, key)| key.placement()).collect();
+    for at in 0..keyed.len() {
+        // clone: a few crate names, once per platform per load
+        let mut crates = keyed[at].1.crates.clone();
+        for (other, (_, key)) in keyed.iter().enumerate() {
+            if other != at && places[other] == places[at] {
+                crates.extend(key.crates.iter().cloned());
+            }
+        }
+        crates.sort();
+        crates.dedup();
+        keyed[at].1.crates = crates;
+    }
 }
 
 /// Refuses std's `roots` for `built_for` when one of them runs elsewhere than `key`, of ID

@@ -786,8 +786,72 @@ pub struct StdKey {
 impl StdKey {
     pub const DOMAIN: &'static str = "blaze v2 cargo std key 5";
 
+    /// The domain of [`StdKey::placement`].
+    pub const PLACEMENT: &'static str = "blaze v2 cargo std placement 1";
+
     pub fn id(&self) -> ContentId {
         crate::load::key_id(StdKey::DOMAIN, self)
+    }
+
+    /// What names the directory its units place what they make in (`<std>/<placement>`): the
+    /// key without [`StdKey::crates`], the crates of the library a build asked for.
+    ///
+    /// Which crates are asked decides which units there are, never what one of them is made
+    /// from: a unit's outputs and `OUT_DIR` carry cargo's hash of the unit (its package,
+    /// features, profile, mode, target, the release and its dependencies' hashes,
+    /// `load::plan::hash::compute_metadata`), so two builds that differ in the crates asked
+    /// name each unit they share by the same paths and each unit only one has by paths of its
+    /// own, as every command of cargo shares one `target/debug/deps`. Until 2026-11-11 the
+    /// directory was the whole key's: a program's tests ask for `test` too, so `blaze test`
+    /// after `blaze run` planned every unit of the standard library under another directory,
+    /// which moved each one's record key (its plan's outputs) and, through `OUT_DIR`, the
+    /// front end's crate of every crate above a build script (all but `core`), and all of
+    /// the library was resolved, checked and compiled again for a build that adds four units
+    /// to it.
+    ///
+    /// Every other field stays: each is an input of every unit (the library's sources, the
+    /// platform, the profile's settings, std's features, the rustflags, where its code runs),
+    /// so two stds apart in one are never placed together (rule 21). Every field is named
+    /// here, so one added to the key is a decision.
+    pub fn placement(&self) -> ContentId {
+        let StdKey {
+            library,
+            triple,
+            profile,
+            panic,
+            opt_level,
+            debug_assertions,
+            overflow_checks,
+            debuginfo,
+            crates: _,
+            features,
+            host,
+            rustflags,
+            profile_root,
+            macro_wasm,
+            runs_here,
+            codegen_backend,
+        } = self;
+        // clone: the key's strings, once per platform per load of a plan
+        let placed = StdKey {
+            library: library.clone(),
+            triple: triple.clone(),
+            profile: profile.clone(),
+            panic: panic.clone(),
+            opt_level: opt_level.clone(),
+            debug_assertions: *debug_assertions,
+            overflow_checks: *overflow_checks,
+            debuginfo: debuginfo.clone(),
+            crates: Vec::new(), // alloc: none
+            features: features.clone(),
+            host: host.clone(),
+            rustflags: rustflags.clone(),
+            profile_root: profile_root.clone(),
+            macro_wasm: *macro_wasm,
+            runs_here: *runs_here,
+            codegen_backend: codegen_backend.clone(),
+        };
+        crate::load::key_id(StdKey::PLACEMENT, &placed)
     }
 }
 

@@ -689,9 +689,10 @@ fn a_second_workspace_plans_the_standard_library_the_first_did() {
     let first = [("ws/Cargo.toml", A), ("ws/src/lib.rs", "pub fn f() {}\n")];
     let first = ready(fixture.plan(fixture.open(&ask(&first))));
     let b = "[package]\nname = \"b\"\nversion = \"0.2.0\"\nedition = \"2021\"\n";
-    // A library too: a binary brings the dev runtime into its std (`DEV_RUNTIME`), another set
-    // of crates and so another std; what this checks is that the workspace and its target
-    // directory are not among std's inputs.
+    // A library too: a binary brings the dev runtime into its std (`DEV_RUNTIME`), one more
+    // unit of it (`a_test_build_plans_the_standard_library_the_program_build_did` is about
+    // those); what this checks is that the workspace and its target directory are not among
+    // std's inputs.
     let second = [("ws/Cargo.toml", b), ("ws/src/lib.rs", "pub fn g() {}\n")];
     let env = [("CARGO_TARGET_DIR", "/home/u/elsewhere"), ("TERM", "dumb")];
     let second = ready(fixture.plan(fixture.open(&Ask { env: &env, ..ask(&second) })));
@@ -703,6 +704,113 @@ fn a_second_workspace_plans_the_standard_library_the_first_did() {
     for (_, plan) in &first {
         assert!(plan.outputs.iter().all(|it| it.starts_with(&format!("{STD}/"))), "{plan:?}");
     }
+}
+
+/// Each unit of the standard library that both `a` and `b` plan whose plan (its outputs, its
+/// `OUT_DIR`, its variables, its hashes) is not the same in both, by package, target and mode;
+/// and how many units they share.
+fn shared_std_plans_apart<'a>(
+    a: &[((&'a str, &'a str, Mode), &UnitPlan)],
+    b: &[((&'a str, &'a str, Mode), &UnitPlan)],
+) -> (usize, Vec<(&'a str, &'a str, Mode)>) {
+    let mut shared = 0;
+    let mut apart = Vec::new();
+    for (key, plan) in a {
+        let Some((_, other)) = b.iter().find(|(it, _)| it == key) else { continue };
+        shared += 1;
+        if plan != other {
+            apart.push(*key);
+        }
+    }
+    (shared, apart)
+}
+
+/// A program and its test, in one file: `blaze run` plans the program, `blaze test` its test in
+/// libtest's harness, which asks the standard library for `test` too.
+const PROGRAM_WITH_A_TEST: [(&str, &str); 2] =
+    [("ws/Cargo.toml", A), ("ws/src/main.rs", "fn main() {}\n\n#[test]\nfn t() {}\n")];
+
+/// The invariant: a unit of the standard library is planned from what it is made from (the
+/// library, the platform, the profile's settings, std's features, the rustflags), never from
+/// which of the library's crates the build asks for. So a program's build and its tests' build
+/// give every std unit they share one plan, byte for byte: one record key, one `OUT_DIR`, one
+/// crate in the front end, and the second build makes none of it again. The tests' build has
+/// units the program's lacks (`test` and what only it depends on), each of its own.
+#[test]
+fn a_test_build_plans_the_standard_library_the_program_build_did() {
+    let fixture = Fixture::new();
+    let built = ready(fixture.plan(fixture.open(&ask(&PROGRAM_WITH_A_TEST))));
+    let test = Ask { command: Command::Test, ..ask(&PROGRAM_WITH_A_TEST) };
+    let tested = ready(fixture.plan(fixture.open(&test)));
+    let (built, tested) = (std_plans(&built), std_plans(&tested));
+    let (shared, apart) = shared_std_plans_apart(&built, &tested);
+    assert_eq!(shared, built.len(), "the tests' build has every std unit the program's has");
+    assert!(shared > 0);
+    assert_eq!(apart, [], "a std unit both builds have is planned twice");
+    let only_tested: Vec<&str> = tested
+        .iter()
+        .filter(|(key, _)| !built.iter().any(|(it, _)| it == key))
+        .map(|((_, target, _), _)| *target)
+        .collect();
+    assert!(only_tested.contains(&"test"), "{only_tested:?}");
+    for (_, plan) in &tested {
+        assert!(plan.outputs.iter().all(|it| it.starts_with(&format!("{STD}/"))), "{plan:?}");
+    }
+}
+
+/// The control of `a_test_build_plans_the_standard_library_the_program_build_did`: with the
+/// standard library's directory named by the crates asked too, as it was, every unit the two
+/// builds share is planned apart, and the oracle says each.
+#[test]
+fn the_oracle_catches_a_standard_library_placed_by_the_crates_asked() {
+    struct Planted;
+    impl Drop for Planted {
+        fn drop(&mut self) {
+            super::units::PLACES_BY_CRATES_ASKED.set(false);
+        }
+    }
+    super::units::PLACES_BY_CRATES_ASKED.set(true);
+    let _planted = Planted;
+    let fixture = Fixture::new();
+    let built = ready(fixture.plan(fixture.open(&ask(&PROGRAM_WITH_A_TEST))));
+    let test = Ask { command: Command::Test, ..ask(&PROGRAM_WITH_A_TEST) };
+    let tested = ready(fixture.plan(fixture.open(&test)));
+    let (built, tested) = (std_plans(&built), std_plans(&tested));
+    let (shared, apart) = shared_std_plans_apart(&built, &tested);
+    assert!(shared > 0);
+    assert_eq!(apart.len(), shared, "every shared unit's outputs are under another directory");
+}
+
+/// What a unit of the standard library is made from still tells two stds apart (rule 21): a
+/// build with other features of std plans no unit where the first build's are.
+#[test]
+fn another_std_feature_set_is_placed_apart() {
+    let fixture = Fixture::new();
+    let built = ready(fixture.plan(fixture.open(&ask(&PROGRAM_WITH_A_TEST))));
+    let featured = Ask {
+        args: &["-Z", "build-std=std", "-Z", "build-std-features=panic-unwind"],
+        ..ask(&PROGRAM_WITH_A_TEST)
+    };
+    let featured = ready(fixture.plan(fixture.open(&featured)));
+    let (built, featured) = (std_plans(&built), std_plans(&featured));
+    let (shared, apart) = shared_std_plans_apart(&built, &featured);
+    assert!(shared > 0);
+    assert_eq!(apart.len(), shared, "a std of other features shares no unit's plan");
+    let dir = |plans: &[((&str, &str, Mode), &UnitPlan)]| -> Vec<String> {
+        let mut dirs: Vec<String> = plans
+            .iter()
+            .flat_map(|(_, plan)| plan.outputs.iter())
+            .filter_map(|it| it.strip_prefix(&format!("{STD}/")))
+            .filter_map(|it| it.split('/').next())
+            .map(str::to_owned)
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        dirs
+    };
+    let (first, second) = (dir(&built), dir(&featured));
+    assert_eq!((first.len(), second.len()), (1, 1), "{first:?} {second:?}");
+    assert_ne!(first, second);
 }
 
 #[test]
