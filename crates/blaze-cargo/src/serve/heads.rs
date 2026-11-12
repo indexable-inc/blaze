@@ -486,6 +486,12 @@ impl Heads {
         }
     }
 
+    /// Whether a request is held until its checkouts are caught up: one whose build is
+    /// about to begin on what the watcher is committing now.
+    pub fn holds_a_request(&self) -> bool {
+        !self.held.is_empty()
+    }
+
     /// Drops the flushes told that no held request waits for.
     pub fn sweep(&mut self) {
         let held = &self.held;

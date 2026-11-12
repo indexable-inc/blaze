@@ -990,7 +990,33 @@ fn explained(words: Vec<OsString>) -> Result<(), Refusal> {
     if name == "problems" && batches.iter().all(|it| it.num_rows() == 0) {
         return no_problems(&args, shape);
     }
+    // `edit_work` with no row is a build that counted nothing, or one that is not there:
+    // said, never an empty table that reads as "the edit cost nothing" (no-fallback).
+    if name == "edit_work" && batches.iter().all(|it| it.num_rows() == 0) {
+        return no_edit_work(&args);
+    }
     print(&batches, shape)
+}
+
+/// What `blaze explain edit_work` says when its view has no row: which build it read and
+/// why a build has none, as an error in either shape.
+fn no_edit_work(args: &Map<String, Value>) -> Result<(), Refusal> {
+    let build = match args.get("build").and_then(Value::as_u64) {
+        Some(build) => Some(build),
+        // The view's own default: the last build with a span.
+        None => number("SELECT max(build_id) AS build FROM spans")?,
+    };
+    Err(Refusal::Failed(match build {
+        Some(build) => format!(
+            "`blaze explain edit_work`: build {build} counted no work in any stage: no query ran, no \
+             unit was checked, compiled or linked and no dependency was keyed in it (a build answered \
+             again with nothing to do counts none), or it is not in this history; `build=N` reads \
+             another build"
+        ),
+        None => "`blaze explain edit_work`: this history has no build, so there is nothing to read: \
+                 run a build under this daemon first (`blaze status` names its state directory)"
+            .to_owned(),
+    }))
 }
 
 /// The last build of the history.

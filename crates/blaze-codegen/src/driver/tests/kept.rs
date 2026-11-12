@@ -1110,8 +1110,8 @@ fn asked_after_a_leaf_edit(count: u32, names_no_set: bool) -> (usize, usize, usi
 
 /// The invariant: a patched walk asks of what the front end names as changed, not of what
 /// it holds. With one function edited it asks of one, among 100 functions and among 10,000.
-/// The cause removed (rule test-the-cause): a front end that names no changed set is asked
-/// of every function, and the count says so.
+/// The cause removed (rule test-the-cause): a front end that tells no view, and so names no
+/// changed set, is asked of every function, and the count says so.
 #[test]
 fn an_edit_of_one_function_asks_of_it_alone_among_a_hundred_and_ten_thousand() {
     for count in [100, 10_000] {
@@ -1174,4 +1174,42 @@ fn a_changed_count_asks_of_the_functions_of_its_instance() {
     assert_eq!(difference(&over_kept, &built(&program.copy(), WHOLE, None, None)), None);
     let work = over_kept.unwrap_or_else(|e| panic!("{e:?}")).work;
     assert_eq!((work.asked, work.named, work.held), (1, 1, 1));
+}
+
+/// A front end that tells a view and cannot name what changed since it stops the build with
+/// an error saying so and why: there is no walk that asks of every function in the changed
+/// set's place (rule no-fallback). Nothing kept is lost to the refusal: once the front end
+/// names its set again the next build patches the same walk, and asks of the one function
+/// edited.
+#[test]
+fn a_front_end_that_loses_its_changed_set_is_refused_and_no_function_is_asked() {
+    let mut program = tree(100);
+    let kept = Kept::new();
+    let build = |program: &Program| {
+        program.begin_build();
+        built(program, WHOLE, Some(&kept), None)
+    };
+    assert!(build(&program).unwrap_or_else(|e| panic!("{e:?}")).walk.whole.is_some());
+    program.functions.get_mut(&100).expect("the last leaf").body = 0x12;
+    program.touch(100);
+    program.engine.loses_its_set = true;
+    let before = program.engine.describes.load(Ordering::Relaxed);
+    let errors = match build(&program) {
+        Err(errors) => errors,
+        Ok(built) => panic!("built with no changed set: {:?}", built.walk),
+    };
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    let what = &errors[0].what;
+    assert!(what.contains("could not name what changed"), "{what}");
+    assert!(what.contains("the test's engine lost its changed set"), "the front end's reason: {what}");
+    assert_eq!(
+        program.engine.describes.load(Ordering::Relaxed),
+        before,
+        "the refused build described nothing"
+    );
+    program.engine.loses_its_set = false;
+    let edited = build(&program).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(edited.walk.whole, None, "the kept walk went back as it was");
+    assert_eq!((edited.work.asked, edited.work.named, edited.work.held), (1, 1, 1));
+    assert!(edited.work.patched, "the kept lists went back too");
 }
