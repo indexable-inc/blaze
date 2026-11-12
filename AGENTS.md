@@ -20,9 +20,10 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
    builder of blaze (check, build, unit tests), and the tree stays accepted by both; blaze still
    builds blaze as the proof, every verdict about blaze's behaviour comes from a blaze, and when
    blaze fails on blaze that failure is still the work. Skill: `build-and-test`.
-3. **no-fallback**: No fallback, ever, and failures are loud: when blaze can't do something it stops
-   with an error naming what and where; nothing is accepted and ignored, skipped quietly or answered
-   with an empty result. Skill: `runtime-code`.
+3. **no-fallback**: No fallback and no retry, ever, and failures are loud: when blaze can't do
+   something it stops with an error naming what and where; a failed build is better than one that
+   quietly tried again or took another route; nothing is accepted and ignored, skipped quietly or
+   answered with an empty result. Skill: `runtime-code`.
 4. **superset-of-rust**: Every program the pinned nightly accepts, blaze accepts and runs correctly by
    Rust's semantics; rustc's own behavior is a reference, not the definition; blaze refuses only
    rustc soundness holes, and its extensions are opt-in. Skill: `compiler-correctness`.
