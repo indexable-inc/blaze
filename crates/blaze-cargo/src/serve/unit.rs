@@ -1304,6 +1304,33 @@ impl Writer<Real> for UnitWriter {
         Ok(names)
     }
 
+    /// The paths under this build's directories of outputs that its steps read: what each
+    /// build script's kept run was checked against there ([`script::ReadBytes::paths`],
+    /// [`script::ReadBytes::listed`]), and every file and listing any unit record of this
+    /// process was filed by ([`reads::read_paths`]: `include!`d files outside the source
+    /// roots, what proc-macro expansions read). None, with the reason, when a build script's
+    /// run was not found kept by `fresh`, or a record's expansion reads do not decode.
+    fn read_outside(&self) -> Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>), String> {
+        let job = &self.job;
+        let noted = job.script_reads.lock();
+        for (unit, it) in job.units().graph.units.iter().enumerate() {
+            if it.mode == Mode::RunCustomBuild && !noted.noted(unit) {
+                // alloc: a reason, once a build
+                return Err(format!(
+                    "the paths the build script of {} read are not noted: its run was not found kept as the build began",
+                    it.pkg_id
+                ));
+            }
+        }
+        // clone: once a build that walked and made nothing
+        let (mut files, mut listed) = (noted.paths.clone(), noted.listed.clone());
+        drop(noted);
+        let (record_files, record_listed) = reads::read_paths()?;
+        files.extend(record_files);
+        listed.extend(record_listed);
+        Ok((files, listed))
+    }
+
     fn keep(mut self) -> Result<KeptLowered, ApiError> {
         // The writes still asked for are applied. With none, only that no reader is alive is
         // asked: a release that is due stays for the task that stores the front end.

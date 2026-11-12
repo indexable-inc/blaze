@@ -1,0 +1,28 @@
+about = "A checkout keeps the answer of a build with nothing changed for each shape of request, and a request of one shape drops no other's: once a build and a run have each been walked and kept, build, run, build, run are each answered as the last of its own shape was, with no walk. Until 2026-11-12 a checkout kept one answer and any walk dropped it, so `build`, `run`, `build` walked three times. The control is blaze-cargo's `an_answer_is_kept_for_each_request_shape` (the lane with one answer a checkout answers none of them)."
+drivers = ["real"]
+
+[[revision]]
+action = "build"
+
+[[revision]]
+steps = ["run", "build", "run", "build", "run"]
+action = "build"
+noop = true
+
+[[revision]]
+steps = []
+action = "run"
+prints = "2 4\n"
+noop = true
+
+[[revision]]
+steps = []
+action = "build"
+noop = true
+
+# The first test build places its binary beside the build's outputs: what the watch of that
+# directory hears is at another request's output, so the build after it is still answered.
+[[revision]]
+steps = ["test"]
+action = "build"
+noop = true

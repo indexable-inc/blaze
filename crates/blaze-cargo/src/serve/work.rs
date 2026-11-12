@@ -969,6 +969,17 @@ pub trait Writer<S: Steps>: Send + 'static {
     fn env_named(&self) -> Result<Vec<String>, String> {
         Err("its front end does not say which variables its steps read by name".to_owned()) // alloc: a reason, once a build
     }
+    /// On the loop, where [`Writer::still`] is asked: the paths under the build's directories
+    /// of outputs that its steps read beside their own units' outputs: each file a build
+    /// script's kept run was checked against or a unit record was filed by, then each
+    /// directory one of them listed or hashed whole (there, or above there). A superset is
+    /// sound. What the no-op lane never sets a change aside at (`serve::job::noop`, "What
+    /// was heard is told apart by path"). Or why they are not all known: a reason, and then
+    /// no change heard is set aside. It runs no query and reads no file. A front end that
+    /// does not say names none it can vouch for.
+    fn read_outside(&self) -> Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>), String> {
+        Err("its front end does not say which paths its steps read".to_owned()) // alloc: a reason, once a build
+    }
     /// Under `-v`: the note of what storing the kept front end this build lowered into did with
     /// the goals its build offered to the persistent goal cache. None when nothing was kept.
     fn goals_noted(&self) -> Option<blaze_api::Diagnostic>;

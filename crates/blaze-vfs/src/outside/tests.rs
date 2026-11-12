@@ -652,3 +652,199 @@ fn one_driver_per_table() {
     let _one = Outside::new(&dirs, "/", TAGS);
     let _two = Outside::new(&dirs, "/", 2 * TAGS);
 }
+
+/// The invariant: [`Dirs::only_since`] sets aside exactly the changes its caller names, and
+/// says no wherever it cannot name every change heard since: a change at another path, a lost
+/// report, a watch that stopped vouching, a round still out, and a generation from before
+/// what the table still keeps by path. A change beside what a caller rests on, in the same
+/// directory, is told from a change to it: what [`Dirs::unchanged_since`] alone cannot say.
+#[test]
+fn changes_are_set_aside_by_path_and_never_what_cannot_be_named() {
+    let dirs = Dirs::new();
+    let (mut sim, mut outside, mut effects) = confirmed(&dirs);
+    let generation = dirs.generation();
+    assert!(dirs.only_since(generation, |_| false), "nothing heard, nothing to set aside");
+    sim.change(&name("tc/lib/b.h"), b"int b;");
+    round(&mut sim, &mut outside, &mut effects);
+    assert!(!dirs.unchanged_since(path("/tc/lib/a.h"), generation), "the directory changed");
+    assert!(dirs.watched_since(path("/tc/lib/a.h"), generation), "and was watched throughout");
+    assert!(dirs.only_since(generation, |it| it == path("/tc/lib/b.h")), "the change is beside a.h");
+    // The control: the same change, asked of by whoever rests on b.h, is not set aside.
+    assert!(!dirs.only_since(generation, |it| it != path("/tc/lib/b.h")));
+    // From a generation after it was heard there is nothing to set aside.
+    assert!(dirs.only_since(dirs.generation(), |_| false));
+    // A lost report names nothing: no caller sets it aside.
+    let before = dirs.generation();
+    let lost = Done::Changed { files: Vec::new(), lost: true };
+    outside.complete(Completion { tag: Tag(TAGS + WATCH), done: lost }, &mut effects);
+    round(&mut sim, &mut outside, &mut effects);
+    assert!(!dirs.only_since(before, |_| true), "a lost report is no path");
+    // Nothing is said while a round is out.
+    let settled = dirs.generation();
+    outside.flush(&mut effects);
+    assert!(!dirs.only_since(settled, |_| true) && !dirs.watched_since(path("/tc"), settled));
+    pump(&mut sim, &mut outside, &mut effects);
+    // Past what the table keeps, a generation from before the oldest kept is refused.
+    let old = dirs.generation();
+    for at in 0..super::CHANGES_KEPT + 1 {
+        dirs.hear(old + 1 + at as u64, Some(path("/tc/lib/c.h").to_owned()));
+    }
+    assert!(!dirs.only_since(old, |_| true), "a change since then was let go of");
+    assert!(dirs.only_since(old + 1, |_| true));
+}
+
+/// The watch of `/tc` woken as Linux's wakes it for a write elsewhere on its file system: a
+/// change that names no file and lost none. Whether `/tc/lib/a.h` is still vouched for.
+fn vouched_after_an_empty_wake() -> bool {
+    let dirs = Dirs::new();
+    let (mut sim, mut outside, mut effects) = confirmed(&dirs);
+    let generation = dirs.generation();
+    let woken = Completion {
+        tag: Tag(TAGS + WATCH),
+        done: Done::Changed { files: Vec::new(), lost: false },
+    };
+    outside.complete(woken, &mut effects);
+    round(&mut sim, &mut outside, &mut effects);
+    dirs.unchanged_since(path("/tc/lib/a.h"), generation)
+}
+
+/// The invariant: a directory stops vouching only for a change under it, or for events lost.
+/// A wake of its watch that names no file and lost none (a write elsewhere on a file system
+/// marked whole) leaves every answer under it vouched for.
+#[test]
+fn a_wake_that_names_nothing_is_no_change() {
+    assert!(vouched_after_an_empty_wake());
+}
+
+/// The control: with an empty wake taken as a change, nothing under the directory is vouched
+/// for after any write on its file system.
+#[test]
+fn the_oracle_catches_an_empty_wake_taken_as_a_change() {
+    super::EMPTY_WAKE_IS_A_CHANGE.set(true);
+    let vouched = vouched_after_an_empty_wake();
+    super::EMPTY_WAKE_IS_A_CHANGE.set(false);
+    assert!(!vouched, "planted: an empty wake stops the directory vouching");
+}
+
+/// A cover of `/sdk/lib/b.h` found while `/sdk/lib` was the watched directory, then `/sdk`
+/// wanted and `/sdk/lib`'s watch retired. Whether the cover vouches once `/sdk` is confirmed
+/// and a round is in, and whether it still hears a change.
+fn a_cover_after_its_directory_retired() -> (bool, bool) {
+    let dirs = Dirs::new();
+    let mut sim = Sim::new(6, Faults::default());
+    sim.change(&name("sdk/lib/b.h"), b"int b;");
+    dirs.want(path("/sdk/lib"));
+    let mut outside = Outside::new(&dirs, "/", TAGS);
+    let mut effects = Vec::new();
+    round(&mut sim, &mut outside, &mut effects);
+    let cover = dirs.cover(path("/sdk/lib/b.h")).expect("under /sdk/lib");
+    dirs.want(path("/sdk"));
+    round(&mut sim, &mut outside, &mut effects);
+    round(&mut sim, &mut outside, &mut effects);
+    assert_eq!(dirs.dir(0).since(), UNCONFIRMED, "the first watch is retired");
+    let generation = dirs.generation();
+    let vouched = cover.unchanged_since(generation);
+    sim.change(&name("sdk/lib/b.h"), b"int c;");
+    round(&mut sim, &mut outside, &mut effects);
+    (vouched, !cover.unchanged_since(generation))
+}
+
+/// The invariant: a cover kept with an answer vouches as its path does
+/// ([`Dirs::unchanged_since`]) for the table's life, a directory wanted above its own later
+/// included: it answers by the directory that took the watch over, and hears what that hears.
+#[test]
+fn a_cover_follows_the_directory_that_took_its_watch_over() {
+    assert_eq!(a_cover_after_its_directory_retired(), (true, true));
+}
+
+/// The control: a cover that stays on its retired directory never vouches again.
+#[test]
+fn the_oracle_catches_a_cover_left_on_a_retired_directory() {
+    super::COVER_STAYS_ON_THE_RETIRED.set(true);
+    let (vouched, _) = a_cover_after_its_directory_retired();
+    super::COVER_STAYS_ON_THE_RETIRED.set(false);
+    assert!(!vouched, "planted: the cover asks its retired directory alone");
+}
+
+/// A home directory with a config file and a noisy tree under it: `/home/cfg` asked of by
+/// name while `/home/noise/x` is written again and again. What the name's check says after
+/// the noise, after a write of the file itself, after a file made beside it, and after its
+/// directory is made again; and whether the table was quiet through the noise.
+fn names_in_a_noisy_home() -> [bool; 5] {
+    let dirs = Dirs::new();
+    let mut sim = Sim::new(9, Faults::default());
+    sim.change(&name("home/cfg"), b"a = 1");
+    sim.change(&name("home/noise/x"), b"0");
+    dirs.watch_name(path("/home/cfg"));
+    let mut outside = Outside::new(&dirs, "/", TAGS);
+    let mut effects = Vec::new();
+    round(&mut sim, &mut outside, &mut effects);
+    round(&mut sim, &mut outside, &mut effects);
+    let generation = dirs.generation();
+    assert!(!dirs.unchanged_since(path("/home/cfg"), generation), "nothing is asked of whole");
+    for turn in 0..4u8 {
+        sim.change(&name("home/noise/x"), &[turn]);
+        round(&mut sim, &mut outside, &mut effects);
+    }
+    let after_noise = dirs.name_unchanged_since(path("/home/cfg"), generation);
+    let quiet = dirs.quiet_since(generation);
+    sim.change(&name("home/cfg"), b"a = 2");
+    round(&mut sim, &mut outside, &mut effects);
+    let after_write = dirs.name_unchanged_since(path("/home/cfg"), generation);
+    let generation = dirs.generation();
+    sim.change(&name("home/other"), b"1");
+    round(&mut sim, &mut outside, &mut effects);
+    let after_sibling = dirs.name_unchanged_since(path("/home/cfg"), generation);
+    // A name asked of after a generation was read is not vouched for at it.
+    let before = dirs.generation();
+    dirs.watch_name(path("/home/deep/dir/file"));
+    round(&mut sim, &mut outside, &mut effects);
+    let unasked = dirs.name_unchanged_since(path("/home/deep/dir/file"), before);
+    [after_noise, quiet, after_write, after_sibling, unasked]
+}
+
+/// The invariant: a name asked of ([`Dirs::watch_name`]) is vouched for exactly while nothing
+/// heard since the generation named it, an entry beside it, or a directory above it; what is
+/// written elsewhere under its directory moves neither it nor [`Dirs::quiet_since`]. A
+/// generation read before the name was asked of is never vouched for.
+#[test]
+fn a_name_is_vouched_for_through_noise_under_its_directory() {
+    assert_eq!(names_in_a_noisy_home(), [true, true, false, false, false]);
+}
+
+/// The control: with no name ever vouched for, the oracle's first answer is false.
+#[test]
+fn the_oracle_catches_a_name_never_vouched_for() {
+    super::NAMES_HEAR_NOTHING_BESIDE.set(true);
+    let [after_noise, ..] = names_in_a_noisy_home();
+    super::NAMES_HEAR_NOTHING_BESIDE.set(false);
+    assert!(!after_noise, "planted: the name is looked at on the disk every time");
+}
+
+/// A directory asked of whole under one watched for its names keeps hearing its own changes
+/// through that one's watch, and nothing of its siblings'.
+#[test]
+fn a_whole_directory_under_a_names_directory_hears_its_own_changes() {
+    let dirs = Dirs::new();
+    let mut sim = Sim::new(3, Faults::default());
+    sim.change(&name("home/cfg"), b"a");
+    sim.change(&name("home/out/debug/a.o"), b"1");
+    sim.change(&name("home/noise/x"), b"0");
+    dirs.watch_name(path("/home/cfg"));
+    let mut outside = Outside::new(&dirs, "/", TAGS);
+    let mut effects = Vec::new();
+    round(&mut sim, &mut outside, &mut effects);
+    dirs.want(path("/home/out"));
+    round(&mut sim, &mut outside, &mut effects);
+    round(&mut sim, &mut outside, &mut effects);
+    let generation = dirs.generation();
+    assert!(dirs.unchanged_since(path("/home/out/debug/a.o"), generation));
+    sim.change(&name("home/noise/x"), b"1");
+    round(&mut sim, &mut outside, &mut effects);
+    assert!(dirs.unchanged_since(path("/home/out/debug/a.o"), generation), "a sibling's change");
+    assert!(dirs.quiet_since(generation));
+    sim.change(&name("home/out/debug/a.o"), b"2");
+    round(&mut sim, &mut outside, &mut effects);
+    assert!(!dirs.unchanged_since(path("/home/out/debug/a.o"), generation));
+    assert!(!dirs.quiet_since(generation));
+}

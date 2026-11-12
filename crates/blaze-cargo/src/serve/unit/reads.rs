@@ -72,6 +72,65 @@ fn note_named(names: &[String]) {
     }
 }
 
+/// Every path a record's reads named in a lookup or a filing in this process
+/// ([`Reads::hash`]): the files outside every source root its crates `include!`d and the
+/// files its proc-macro expansions read, then the directories those listed; each sorted, each
+/// once. The last is set once an expansion's reads did not decode: what it read is then not
+/// known. The process's, as [`NAMED`] is, and for the same reader: a path here is one the
+/// no-op lane never takes for another request's output ([`read_paths`]).
+static PATHS: blaze_core::lock::Lock<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>, bool)> =
+    blaze_core::lock::Lock::new("serve.unit.reads.paths", (Vec::new(), Vec::new(), false));
+
+/// `path` kept in `sorted`, once.
+fn note_path(sorted: &mut Vec<std::path::PathBuf>, path: &std::path::Path) {
+    if let Err(at) = sorted.binary_search_by(|it| it.as_path().cmp(path)) {
+        sorted.insert(at, path.to_owned()); // alloc: a path, once for the process's life
+    }
+}
+
+/// What an expansion read under the first bytes of a shape verified across checkouts
+/// ([`shape_said`]).
+const VERIFIED_SHAPE: &[u8] = b"blaze v2 verified expansion reads 1\0";
+
+/// The reads of `reads` by path noted in [`PATHS`].
+fn note_paths(reads: &Reads) {
+    if reads.files.is_empty() && reads.expansions.is_empty() {
+        return;
+    }
+    let mut paths = PATHS.lock();
+    for (path, _) in &reads.files {
+        note_path(&mut paths.0, std::path::Path::new(path));
+    }
+    for (shape, _) in reads.expansions.iter().flat_map(|it| &it.shapes) {
+        let rest = match shape.strip_prefix(VERIFIED_SHAPE) {
+            Some(rest) if rest.len() >= 32 => &rest[32..],
+            _ => shape.as_slice(),
+        };
+        match blaze_usercode::index::Shape::decode(rest) {
+            Ok(it) => {
+                for file in &it.files {
+                    note_path(&mut paths.0, file);
+                }
+                for dir in &it.dirs {
+                    note_path(&mut paths.1, dir);
+                }
+            }
+            Err(_) => paths.2 = true,
+        }
+    }
+}
+
+/// The files and the directories any record's reads named in this process so far
+/// ([`PATHS`]); an error once an expansion's reads did not decode.
+pub(crate) fn read_paths() -> Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>), String> {
+    let paths = PATHS.lock();
+    if paths.2 {
+        // alloc: a reason, once a build
+        return Err("a unit record's proc-macro expansion reads do not decode: what it read is not known".to_owned());
+    }
+    Ok((paths.0.clone(), paths.1.clone())) // clone: once a build that walked and made nothing
+}
+
 /// The process variables any record's reads named in this process so far ([`NAMED`]).
 pub(crate) fn named_env() -> Vec<String> {
     NAMED.lock().clone() // clone: once a build that walked and made nothing
@@ -491,6 +550,7 @@ impl Reads {
         // Every lookup and every filing of a record by its reads passes here: the names
         // are noted for the no-op lane, which compares them of a later request.
         note_named(&self.names);
+        note_paths(self);
         for name in &self.names {
             hasher.opt_part(var(name));
         }

@@ -390,9 +390,12 @@ impl Session {
         job: JobId,
         ok: bool,
         error: Option<ApiError>,
-        mut queries: Option<ViewId>,
+        built: Option<(ViewId, ContentId)>,
         out: &mut Vec<Reply>,
     ) {
+        // The view handed over and the root it is of: the root the job built, which is what
+        // the view is kept under, not the root the request was asked on where they differ.
+        let (mut queries, built_root) = (built.map(|it| it.0), built.map(|it| it.1));
         let Some(Job::Request { serial, candidate }) =
             handle(job).and_then(|it| self.jobs.remove(it))
         else {
@@ -422,7 +425,7 @@ impl Session {
                 match best.finish(candidate, ok, ran) {
                     Some(opened) if ran => {
                         cx.vfs.close(opened.files);
-                        let opened = built_in(cx.db, opened, queries.take());
+                        let opened = built_in(cx.db, opened, queries.take(), built_root);
                         keep(&mut self.kept, cx.db, opened);
                     }
                     Some(opened) => close(cx, opened),
@@ -457,7 +460,7 @@ impl Session {
                 for opened in views.iter_mut().filter_map(Option::take) {
                     if error.is_none() && *kept == Some(opened) {
                         cx.vfs.close(opened.files);
-                        let opened = built_in(cx.db, opened, queries.take());
+                        let opened = built_in(cx.db, opened, queries.take(), built_root);
                         keep(&mut self.kept, cx.db, opened);
                     } else {
                         close(cx, opened);
@@ -1068,11 +1071,19 @@ fn incremental(work: &Work) -> bool {
 
 /// `opened` with the database view its build ran in, when the daemon handed one over: the
 /// session's own is closed for it.
-fn built_in(db: &blaze_query::Database, opened: Opened, queries: Option<ViewId>) -> Opened {
+fn built_in(
+    db: &blaze_query::Database,
+    opened: Opened,
+    queries: Option<ViewId>,
+    root: Option<ContentId>,
+) -> Opened {
     match queries {
         Some(queries) => {
             db.close(opened.queries);
-            Opened { queries, ..opened }
+            // Of the root the build ran on, when the daemon says which: [`keep`] files the
+            // view under it, so [`Request::Why`] of that root finds its build.
+            let view = View { root: root.unwrap_or(opened.view.root) };
+            Opened { queries, view, ..opened }
         }
         None => opened,
     }

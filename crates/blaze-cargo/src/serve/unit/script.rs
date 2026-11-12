@@ -789,7 +789,13 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
             let guard = blaze_cas::enter();
             // Every input the kept run is checked against is asked through this: what a
             // hit read by its bytes is noted for the no-op lane ([`ReadBytes`]).
-            let mut noting = Noting { inner: &mut start.disk, read: ReadBytes::default() };
+            let units = job.units();
+            let roots = [
+                Path::new(units.target_dir.as_str()),
+                Path::new(units.build_dir.as_str()),
+                Path::new(job.input.config.std.as_str()),
+            ];
+            let mut noting = Noting { inner: &mut start.disk, read: ReadBytes::default(), roots };
             let mut inputs = Rooted::new(prepared.spec.roots.view(), &mut noting);
             let hit = matches!(
                 blaze_usercode::index::find(
@@ -829,6 +835,14 @@ pub(crate) struct ReadBytes {
     /// what a walk of the environment sees (`UnitWriter::env_named`). A name that is not
     /// text names no variable of a request, whose environment is text.
     pub(crate) env: Vec<String>,
+    /// Each file the runs were checked against that is under one of the build's directories
+    /// (its target and build directories, the standard library's builds), there or not: a
+    /// change heard at one is never another request's output placed beside this build's
+    /// (`UnitWriter::read_outside`).
+    pub(crate) paths: Vec<std::path::PathBuf>,
+    /// Each directory under or above one of those that a run listed, looked at or hashed
+    /// whole: any path under it is one the run read.
+    pub(crate) listed: Vec<std::path::PathBuf>,
 }
 
 impl ReadBytes {
@@ -842,6 +856,8 @@ impl ReadBytes {
         self.names.extend(read.names);
         self.trees |= read.trees;
         self.env.extend(read.env);
+        self.paths.extend(read.paths);
+        self.listed.extend(read.listed);
     }
 
     /// Whether the reads of run `unit` are noted.
@@ -860,6 +876,26 @@ impl ReadBytes {
 struct Noting<'a, I> {
     inner: &'a mut I,
     read: ReadBytes,
+    /// The build's directories: its target and build directories and the standard
+    /// library's builds. A path read under one is noted ([`ReadBytes::paths`]).
+    roots: [&'a Path; 3],
+}
+
+impl<I> Noting<'_, I> {
+    /// A file asked of at `path`: noted when it is under one of the build's directories.
+    fn file_at(&mut self, path: &Path) {
+        if self.roots.iter().any(|root| path.starts_with(root)) {
+            self.read.paths.push(path.to_owned()); // alloc: a path, once a file a kept run read there
+        }
+    }
+
+    /// A directory listed, looked at or hashed whole at `path`: noted when it is under one of
+    /// the build's directories, or above one.
+    fn listed_at(&mut self, path: &Path) {
+        if self.roots.iter().any(|root| path.starts_with(root) || root.starts_with(path)) {
+            self.read.listed.push(path.to_owned()); // alloc: a path, once a directory a kept run listed there
+        }
+    }
 }
 
 impl<I: blaze_usercode::trace::Inputs> blaze_usercode::trace::Inputs for Noting<'_, I> {
@@ -872,11 +908,13 @@ impl<I: blaze_usercode::trace::Inputs> blaze_usercode::trace::Inputs for Noting<
         {
             self.read.names.push(name.to_owned()); // alloc: a name, once a Rust file a kept run read
         }
+        self.file_at(path);
         self.inner.file(path)
     }
 
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, I::Error> {
         // A listing's names, no file's bytes.
+        self.listed_at(path);
         self.inner.dir(path)
     }
 
@@ -899,16 +937,19 @@ impl<I: blaze_usercode::trace::Inputs> blaze_usercode::trace::Inputs for Noting<
         out: &mut blaze_usercode::trace::Names<'_>,
     ) -> Result<bool, I::Error> {
         self.read.trees = true;
+        self.listed_at(path);
         self.inner.names(path, out)
     }
 
     fn entry(&mut self, path: &Path) -> Result<blaze_usercode::trace::Entry, I::Error> {
         self.read.trees = true;
+        self.listed_at(path);
         self.inner.entry(path)
     }
 
     fn tree(&mut self, dir: &Path, package: bool) -> Result<Option<[u8; 32]>, I::Error> {
         self.read.trees = true;
+        self.listed_at(dir);
         self.inner.tree(dir, package)
     }
 }

@@ -39,6 +39,7 @@ pub(super) mod giving;
 mod kept;
 mod noop;
 mod slab;
+mod written;
 #[cfg(test)]
 mod tests;
 
@@ -211,8 +212,11 @@ pub enum Value<S: Steps> {
 pub enum Said {
     Report(JobId, Response),
     /// The job over, ok or not, and the database view its build ran in, handed to the session
-    /// to keep or close ([`blaze_api::session::Session::finish_in`]); none when the job opened none.
-    Finish(JobId, bool, Option<ApiError>, Option<ViewId>),
+    /// to keep or close ([`blaze_api::session::Session::finish_in`]), with the root that view
+    /// is of: the one the job built, which is not the one it was asked on where its plan's
+    /// lock files were written into its view ([`Jobs::lock_into_view`]). None when the job
+    /// opened none.
+    Finish(JobId, bool, Option<ApiError>, Option<(ViewId, ContentId)>),
 }
 
 /// What the jobs work with, lent by the loop for one call.
@@ -1371,6 +1375,20 @@ impl Vouches for Watched {
     fn absent(&self, path: &std::path::Path) -> bool {
         matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
     }
+
+    fn only_since(&self, generation: u64, aside: &dyn Fn(&std::path::Path) -> bool) -> bool {
+        blaze_vfs::outside::only_since(generation, |path| aside(path))
+    }
+
+    fn watched_since(&self, dir: &std::path::Path, generation: u64) -> bool {
+        blaze_vfs::outside::watched_since(dir, generation)
+    }
+
+    fn same_file(&self, path: &std::path::Path, was: Option<[u8; 32]>) -> bool {
+        use blaze_usercode::trace::Inputs as _;
+        let mut disk = blaze_usercode::inputs::Disk::new(Vec::new()); // alloc: none, no variables
+        disk.file(path).is_ok_and(|now| now == was)
+    }
 }
 
 /// The still text (`blaze_lower::still_text`) of the file at `path` of the open view `view`,
@@ -1581,6 +1599,27 @@ struct LastPlan {
     queries: ViewId,
     units: Arc<Units>,
     lock: Option<LockWrite>,
+    /// When its view is one a build wrote its plan's lock files into
+    /// ([`Jobs::lock_into_view`]): the key of the view that build was asked on, and the
+    /// write. A request on that view again (the lock files removed, or a head no watcher
+    /// moved) is this plan's once the same files are written into it, asked of no load: a
+    /// plan is a function of its key, and so is what it writes.
+    asked: Option<(ContentId, LockWrite)>,
+    /// The outputs of `units`, as ids: made once a plan, and carried to the plan that
+    /// replaces this one with the same units ([`Jobs::planned`]).
+    outputs: Option<Arc<Outputs>>,
+    /// The source bytes of each unit of `units` (`unit::source_bytes`), `u64::MAX` for one
+    /// not sized yet: read once a plan, not once a build ([`Jobs::build`]). With `outputs`,
+    /// kept here, a shape each, so a switch of request finds its own again: until
+    /// 2026-11-12 a checkout kept them of one plan, and `build`, `test`, `build` sized
+    /// every unit three times.
+    sized: Option<Vec<u64>>,
+}
+
+/// The plan among `kept` whose units are `units` themselves (the same `Arc`): where what is
+/// kept by the units' identity is ([`LastPlan::outputs`], [`LastPlan::sized`]).
+fn plan_of<'p>(kept: &'p mut [LastPlan], units: &Arc<Units>) -> Option<&'p mut LastPlan> {
+    kept.iter_mut().find(|it| Arc::ptr_eq(&it.units, units))
 }
 
 /// The most plans a checkout keeps ([`Roots::plans`]): the request shapes a person alternates
@@ -1858,11 +1897,6 @@ struct Roots<S: Steps> {
     /// How many of each one's front ends are being stored ([`Jobs::store_kept`]): its next
     /// job's lowering waits in [`Jobs::lowering`] until none is, and one is back in `fronts`.
     storing: Vec<u32>,
-    /// The outputs of its last units, as ids.
-    outputs: Vec<Option<Arc<Outputs>>>,
-    /// The source bytes of each unit of its last units (`unit::source_bytes`), `u64::MAX` for
-    /// one not sized yet: read once a plan, not once a build ([`Jobs::build`]).
-    sized: Vec<Option<(Arc<Units>, Vec<u64>)>>,
     /// The answers of its builds that made nothing ([`noop::LastAnswer`]), one a request shape
     /// beside that shape's plan ([`noop::Answers`], [`shape_of`]), each until a job of its own
     /// shape walks, with the view of the files its walk read; or why a shape has none.
@@ -1883,8 +1917,6 @@ impl<S: Steps> Roots<S> {
             plans: Vec::new(),   // alloc: none until the first checkout
             fronts: Vec::new(),  // alloc: none until the first checkout
             storing: Vec::new(), // alloc: none until the first checkout
-            outputs: Vec::new(), // alloc: none until the first checkout
-            sized: Vec::new(),   // alloc: none until the first checkout
             answers: Vec::new(), // alloc: none until the first checkout
             lost: Vec::new(),    // alloc: none until the first checkout
             unfinished: Vec::new(), // alloc: none until the first checkout
@@ -1900,8 +1932,6 @@ impl<S: Steps> Roots<S> {
         self.plans.push(Vec::new()); // alloc: none
         self.fronts.push(None);
         self.storing.push(0);
-        self.outputs.push(None);
-        self.sized.push(None);
         self.answers.push(Answers::new());
         self.lost.push(None);
         self.unfinished.push(None);
@@ -2318,12 +2348,15 @@ struct Job<S: Steps> {
     /// The one of `queries` its last view was made ready in: handed to the session as it
     /// finishes ([`Said::Finish`]).
     built: Option<ViewId>,
+    /// The root `built` is a view of: handed to the session with it.
+    built_root: Option<ContentId>,
     /// Views of [`Roots::plans`] it reads, which the jobs close once none reads them.
     borrowed: Vec<ViewId>,
     /// Its plan's lock files were written into its view, which was opened again with them
-    /// ([`Jobs::lock_into_view`]): a plan of that view that asks to write one again is an
-    /// error, never a second round.
-    locked: bool,
+    /// ([`Jobs::lock_into_view`]): the key of the view it was asked on ([`Viewed::key`]) and
+    /// the write. A plan of the view opened again that asks for other bytes is an error,
+    /// never a second round.
+    locked: Option<(ContentId, LockWrite)>,
     placing: usize,
     /// How the bytes of what it placed got there: cloned, written into the store, copied
     /// ([`blaze_cas::PlacedBytes`]), for its `Work` report and its span.
@@ -3034,8 +3067,9 @@ impl<S: Steps> Job<S> {
             said: HashSet::new_in(Global),
             queries: Vec::new(), // alloc: once per job
             built: None,
+            built_root: None,
             borrowed: Vec::new(), // alloc: once per job
-            locked: false,
+            locked: None,
             placing: 0,
             placed: blaze_cas::PlacedBytes::default(),
             worked: None,
@@ -3826,13 +3860,15 @@ impl<S: Steps> Jobs<S> {
         self.settling.iter().map(|it| it.placing).sum()
     }
 
-    /// Whether the checkout at `dir` has a kept answer, of any request shape, known to be of
-    /// the view `root` ([`noop::LastAnswer::files_known`]): its next build or check of the
-    /// request that answer is of is answered by the no-op lane, while nothing else it rests
-    /// on moves. What the daemon builds ahead of a save until ([`super::ahead`]).
+    /// Whether the checkout at `dir` has a kept answer of its most recently used request
+    /// shape ([`noop::Answers::latest`]) known to be of the view `root`
+    /// ([`noop::LastAnswer::files_known`]): its last build or check, sent again, is answered
+    /// by the no-op lane, while nothing else it rests on moves. What the daemon builds ahead
+    /// of a save until ([`super::ahead`]), which sends that very request: an answer of
+    /// another shape (a `check`'s, where the last request was a `run`) does not count.
     pub fn answer_known(&self, dir: &str, root: &ContentId) -> bool {
         self.roots.ids.get(dir).is_some_and(|&at| {
-            self.roots.answers[at as usize].kept().any(|answer| answer.files_known(root))
+            self.roots.answers[at as usize].latest().is_some_and(|answer| answer.files_known(root))
         })
     }
 
@@ -4141,6 +4177,26 @@ impl<S: Steps> Jobs<S> {
         };
         let Viewed { root_dir, root, config, bare, planned, key, shape } =
             Self::viewed(&self.setup, &mut self.roots, w, &job.work, &opened, library);
+        // A view whose plan is known to write lock files into it (a build of this very view
+        // did, and its plan is kept): the files are written into the view again and the
+        // view opened with them, asked of no load ([`LastPlan::asked`]).
+        if job.locked.is_none()
+            && reuses_plans(&job.work)
+            && let Some(at) = root
+        {
+            let known = self.roots.plans[at as usize].iter().find_map(|plan| {
+                // clone: the lock files' text, once a build of a view that lacks them
+                plan.asked.as_ref().filter(|(was, _)| *was == key).map(|(_, lock)| lock.clone())
+            });
+            if let Some(written) = known
+                && let Some(ops) = Self::lock_ops(&*w.vfs, &root_dir, &opened, &written)
+                && let Ok(advanced) = w.vfs.apply_owned(opened.view.root, ops)
+                && advanced != opened.view.root
+            {
+                self.open_locked(w, id, opened, advanced, key, written, asked, &root_dir);
+                return;
+            }
+        }
         let (request, drawn) = (request_id(&job.work), drawn_id(&job.work));
         // A blaze that keys as another toolchain (`BLAZE_DEV_TOOLCHAIN_AS`) says so before
         // anything else of each build or check, and refuses one whose outputs may be shipped.
@@ -4210,6 +4266,15 @@ impl<S: Steps> Jobs<S> {
         job.checkout = root.map(|at| (at, root_dir.clone()));
         if let Some(at) = root {
             use_plan(&mut self.roots.plans[at as usize], key);
+            // A view this build wrote its lock files into, whose plan was kept already: the
+            // plan learns which view leads to it.
+            if let Some(locked) = &job.locked
+                && let Some(last) = self.roots.plans[at as usize].last_mut()
+                && last.key == key
+                && last.asked.is_none()
+            {
+                last.asked = Some(locked.clone()); // clone: the lock files' text, once
+            }
         }
         if reuses_plans(&job.work)
             && let Some(at) = root
@@ -4299,6 +4364,16 @@ impl<S: Steps> Jobs<S> {
             Ok(edits) => Edited::Files(edits),
             Err(why) => Edited::Unread(*why),
         };
+        // Another request's output: a path the daemon planned an output at (every one is
+        // interned as its plan is built, [`Paths`]) that is no output of the units of this
+        // request's own plan. With no plan kept of the shape, none is known to be.
+        let (plans, planned) = (&self.roots.plans[root as usize], &self.paths.ids);
+        let mine = plans.iter().find(|it| it.shape == shape).map(|it| &it.units);
+        let other_output = |path: &std::path::Path| {
+            let (Some(mine), Some(path)) = (mine, path.to_str()) else { return false };
+            planned.contains_key(path)
+                && !mine.plans.iter().any(|plan| plan.outputs.iter().any(|it| it.as_str() == path))
+        };
         let asked = NoopAsked {
             inputs: &inputs,
             edited,
@@ -4306,6 +4381,7 @@ impl<S: Steps> Jobs<S> {
             alone,
             locals_vouched,
             unasked: &read_unasked,
+            other_output: &other_output,
         };
         // Asked of this shape's answer alone: no other request's walk dropped it, and of the
         // request's environment only what its walk read is compared.
@@ -4609,11 +4685,17 @@ impl<S: Steps> Jobs<S> {
         let (made_nothing, worked) = walked.unwrap_or((false, None));
         // Each path the walk looked at on the disk, with how often: one look is enough to
         // keep the next build from being answered again, and the refusal names the last alone.
+        let files = blaze_vfs::outside::take_file_looks();
         let looked = blaze_vfs::outside::take_named_looks();
         if !looked.is_empty() {
             // alloc: once a build that looked, the paths as text
             let paths: Vec<String> =
-                looked.iter().map(|(path, times)| format!("{} ({times})", path.display())).collect();
+                looked
+                    .iter()
+                    .map(|(path, times, by)| {
+                        format!("{} ({times} by {by}: {})", path.display(), blaze_vfs::outside::why_looked(path))
+                    })
+                    .collect();
             tracing::info!(
                 target: "blaze",
                 root = %root,
@@ -4626,6 +4708,7 @@ impl<S: Steps> Jobs<S> {
             made_nothing,
             looks: blaze_vfs::outside::looks(),
             looked_at: blaze_vfs::outside::last_look(),
+            files,
             worked,
         });
         match &last {
@@ -5576,6 +5659,9 @@ impl<S: Steps> Jobs<S> {
                 {
                     job.queries.retain(|it| *it != prep.queries);
                     job.borrowed.push(prep.queries);
+                    // What is kept by the units' identity goes on with the same units.
+                    let (outputs, sized) = plan_of(&mut self.roots.plans[root as usize], &units)
+                        .map_or((None, None), |it| (it.outputs.clone(), it.sized.take())); // clone: a refcount
                     // clone: a refcount and the lock's text, once per plan
                     let last = LastPlan {
                         key: prep.key,
@@ -5583,6 +5669,9 @@ impl<S: Steps> Jobs<S> {
                         queries: prep.queries,
                         units: units.clone(),
                         lock: lock.clone(),
+                        asked: job.locked.clone(),
+                        outputs,
+                        sized,
                     };
                     // The plan this one replaces is its own shape's (the same request on an
                     // older view), or the least recently used past the bound: never the plan
@@ -5601,8 +5690,17 @@ impl<S: Steps> Jobs<S> {
     /// Each lock file the load let job `id` write (`Cargo.lock`, `blaze.lock`) asked of the
     /// driver, then what the build says of them: a write is never silent (docs/cargo.md,
     /// "Lock files"). The job's answer waits for each write. False when the job was ended
-    /// with an error instead.
-    fn write_locks(&mut self, w: &mut World<'_, S>, id: JobId, lock: LockWrite) -> bool {
+    /// with an error instead. `root` is the root of the job's view, of the checkout at
+    /// `root_dir`: a file of a watched checkout is written only when that view holds it
+    /// already ([`written::ViewWrite`]), which is the one way a write is asked.
+    fn write_locks(
+        &mut self,
+        w: &mut World<'_, S>,
+        id: JobId,
+        lock: LockWrite,
+        root: ContentId,
+        root_dir: &str,
+    ) -> bool {
         for written in lock.files {
             let path = self.paths.intern(&written.path);
             // clone: the driver's effect owns the file's name, once per lock write
@@ -5622,11 +5720,26 @@ impl<S: Steps> Jobs<S> {
                     return false;
                 }
             };
+            let write = written::ViewWrite::new(
+                w.vfs,
+                w.heads.checkouts(),
+                root_dir,
+                root,
+                &written.path,
+                file,
+                written.text.into_bytes(),
+            );
+            let write = match write {
+                Ok(write) => write,
+                Err(what) => {
+                    self.end(w, id, false, Some(ApiError::new(what, Some(written.path))));
+                    return false;
+                }
+            };
             // A lock file is what the job is asked for: its answer waits for it.
             self.name(id, path);
             self.begin_placing(id, path);
-            // durable: the user's lock file: their own source, written whole or not at all
-            w.effects.push(Effect::Write { file, bytes: written.text.into_bytes(), tag });
+            w.effects.push(write.effect(tag));
         }
         for line in &lock.said {
             // alloc: a line of the lock write, once per plan that writes one
@@ -5658,9 +5771,10 @@ impl<S: Steps> Jobs<S> {
     ///
     /// `Ok` with the prep and the lock write still to make where nothing was taken (no lock
     /// write, an agent's view, a lock file outside the view or one the checkout's view leaves
-    /// out); `Err` when the job went on from here, opened again or ended. A plan of the view
-    /// opened again that asks for a lock file once more does not read back what it wrote: an
-    /// error naming the file, never a second round (rule bounded-progress).
+    /// out, or files the view already holds byte for byte, which change nothing in it); `Err`
+    /// when the job went on from here, opened again or ended. A plan of the view opened again
+    /// that asks for other bytes does not read back what it wrote: an error naming the file,
+    /// never a second round (rule bounded-progress).
     fn lock_into_view(
         &mut self,
         w: &mut World<'_, S>,
@@ -5672,48 +5786,9 @@ impl<S: Steps> Jobs<S> {
         if prep.root.is_none() {
             return Ok((prep, Some(written)));
         }
-        let Some(job) = self.jobs.get_mut(key_of(id)) else { return Err(()) };
-        let under = prep.root_dir.trim_end_matches('/');
-        // alloc: once a plan that writes a lock file, an op each
-        let mut ops = Vec::with_capacity(written.files.len());
-        for file in &written.files {
-            let rel = file.path.strip_prefix(under).and_then(|rest| rest.strip_prefix('/'));
-            let Some(rel) = rel.filter(|rel| !super::heads::excluded(rel)) else {
-                return Ok((prep, Some(written)));
-            };
-            // A file the view has keeps its mode, as the watcher's commit of it does.
-            let mode = match w.vfs.read(prep.opened.files, rel) {
-                Ok(Some(had)) => had.mode,
-                _ => blaze_vfs::Mode::Regular,
-            };
-            ops.push(blaze_vfs::Op::Write {
-                mode,
-                path: rel.to_owned(),                 // alloc: an op's path, once a lock file
-                bytes: file.text.as_bytes().to_vec(), // alloc: the view's own copy of the file
-            });
-        }
-        if ops.is_empty() {
+        let Some(ops) = Self::lock_ops(&*w.vfs, &prep.root_dir, &prep.opened, &written) else {
             return Ok((prep, Some(written)));
-        }
-        if job.locked {
-            // alloc: an error, once
-            let path = written.files[0].path.clone();
-            let error = ApiError::new(
-                format!(
-                    "the plan of {} asks to write {path} again after this build wrote it into its view: the                      load does not read back the lock file it writes, so no build of this checkout would settle                      (a bug in blaze)",
-                    prep.root_dir
-                ),
-                Some(path),
-            );
-            self.end(w, id, false, Some(error));
-            return Err(());
-        }
-        let writing = tracing::info_span!(
-            target: "blaze",
-            "loop: the plan's lock files written into the job's view",
-            files = written.files.len(),
-        )
-        .entered();
+        };
         let root = match w.vfs.apply_owned(prep.opened.view.root, ops) {
             Ok(root) => root,
             Err(error) => {
@@ -5724,24 +5799,100 @@ impl<S: Steps> Jobs<S> {
                 return Err(());
             }
         };
-        // The session's handles of the view asked stay its own (it closes them as the job
-        // finishes); the job reads by root, and its views are what a collection keeps
-        // ([`Jobs::roots`]).
-        let opened = Opened { view: blaze_vfs::View { root }, ..prep.opened };
-        job.locked = true;
-        if let Some(view) = job.views.iter_mut().find(|it| **it == prep.opened) {
-            *view = opened;
+        // By content: files the view holds as they would be written change nothing in it.
+        if root == prep.opened.view.root {
+            return Ok((prep, Some(written)));
+        }
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return Err(()) };
+        if job.locked.is_some() {
+            // alloc: an error, once
+            let path = written.files[0].path.clone();
+            let error = ApiError::new(
+                format!(
+                    "the plan of {} asks to write {path} with other bytes after this build wrote it into its \
+                     view: the load does not read back the lock file it writes, so no build of this checkout \
+                     would settle (a bug in blaze)",
+                    prep.root_dir
+                ),
+                Some(path),
+            );
+            self.end(w, id, false, Some(error));
+            return Err(());
         }
         // The plan asked on the view without the files is not this build's: its database
         // view goes, as one whose load asked for a fetch does.
         w.db.close(prep.queries);
         job.queries.retain(|it| *it != prep.queries);
-        if !self.write_locks(w, id, written) {
-            return Err(());
-        }
-        drop(writing);
-        self.open(w, id, opened, prep.asked);
+        self.open_locked(w, id, prep.opened, root, prep.key, written, prep.asked, &prep.root_dir);
         Err(())
+    }
+
+    /// The ops that write `lock`'s files into the view `opened` of the checkout at
+    /// `root_dir`, each whole as the watcher will commit it (with the mode the view's file
+    /// has, else regular). None when one of them is no file of the view: outside the
+    /// checkout, or under what its view leaves out ([`super::heads::excluded`]).
+    fn lock_ops(
+        vfs: &Vfs,
+        root_dir: &str,
+        opened: &Opened,
+        lock: &LockWrite,
+    ) -> Option<Vec<blaze_vfs::Op>> {
+        let under = root_dir.trim_end_matches('/');
+        // alloc: once a plan that writes a lock file, an op each
+        let mut ops = Vec::with_capacity(lock.files.len());
+        for file in &lock.files {
+            let rel = file.path.strip_prefix(under)?.strip_prefix('/')?;
+            if super::heads::excluded(rel) {
+                return None;
+            }
+            // A file the view has keeps its mode, as the watcher's commit of it does.
+            let mode = match vfs.read(opened.files, rel) {
+                Ok(Some(had)) => had.mode,
+                _ => blaze_vfs::Mode::Regular,
+            };
+            ops.push(blaze_vfs::Op::Write {
+                mode,
+                path: rel.to_owned(),                 // alloc: an op's path, once a lock file
+                bytes: file.text.as_bytes().to_vec(), // alloc: the view's own copy of the file
+            });
+        }
+        (!ops.is_empty()).then_some(ops)
+    }
+
+    /// Job `id`'s view `was`, of `key`, replaced by the view at `root`, which holds the lock
+    /// files `written`: the writes asked of the driver and said ([`Jobs::write_locks`]), the
+    /// job's view swapped, and the view opened again ([`Jobs::open`]). The session's handles
+    /// of the view asked stay its own (it closes them as the job finishes); the job reads by
+    /// root, and its views are what a collection keeps ([`Jobs::roots`]).
+    #[allow(clippy::too_many_arguments)]
+    fn open_locked(
+        &mut self,
+        w: &mut World<'_, S>,
+        id: JobId,
+        was: Opened,
+        root: ContentId,
+        key: ContentId,
+        written: LockWrite,
+        asked: HashSet<String, Global>,
+        root_dir: &str,
+    ) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        let _span = tracing::info_span!(
+            target: "blaze",
+            "loop: the plan's lock files written into the job's view",
+            files = written.files.len(),
+        )
+        .entered();
+        let opened = Opened { view: blaze_vfs::View { root }, ..was };
+        job.locked = Some((key, written.clone())); // clone: the lock files' text, once
+        if let Some(view) = job.views.iter_mut().find(|it| **it == was) {
+            *view = opened;
+        }
+        if !self.write_locks(w, id, written, root, root_dir) {
+            return;
+        }
+        drop(_span);
+        self.open(w, id, opened, asked);
     }
 
     /// The view's plan taken: its lock files that are no files of the view written, its
@@ -5780,8 +5931,15 @@ impl<S: Steps> Jobs<S> {
         // The lock files of a plan that are no files of its view (a workspace whose root is
         // above the checkout's), written where they are: one of the view was written into it
         // before the plan was kept ([`Jobs::lock_into_view`]).
+        // Not again what this job wrote as it took them into its view.
+        let wrote = self
+            .jobs
+            .get(key_of(id))
+            .and_then(|job| job.locked.as_ref())
+            .is_some_and(|(_, wrote)| Some(wrote) == lock.as_ref());
         if let Some(lock) = lock
-            && !self.write_locks(w, id, lock)
+            && !wrote
+            && !self.write_locks(w, id, lock, prep.opened.view.root, &prep.root_dir)
         {
             return;
         }
@@ -5821,6 +5979,7 @@ impl<S: Steps> Jobs<S> {
         let checkout = prep.config.invocation.root.clone(); // clone: the lowering's own copy, once
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         job.built = job.queries.contains(&prep.queries).then_some(prep.queries);
+        job.built_root = job.built.map(|_| prep.opened.view.root);
         let cargo = targets_of(&job.work).and_then(|it| it.cargo.as_ref());
         let input = JobInput {
             db: w.db.clone(), // clone: a refcount, once per view
@@ -6426,8 +6585,11 @@ impl<S: Steps> Jobs<S> {
             read = tracing::field::Empty,
         );
         let mut seen = HashMap::new_in(Global); // alloc: once per build, a directory an entry
-        let mut sizes = match root.and_then(|root| self.roots.sized[root as usize].take()) {
-            Some((of, sizes)) if Arc::ptr_eq(&of, &input.units) && sizes.len() == all.len() => sizes,
+        let kept_sizes = root
+            .and_then(|root| plan_of(&mut self.roots.plans[root as usize], &input.units))
+            .and_then(|plan| plan.sized.take());
+        let mut sizes = match kept_sizes {
+            Some(sizes) if sizes.len() == all.len() => sizes,
             _ => vec![u64::MAX; all.len()], // alloc: once a plan
         };
         let mut sized = 0u32;
@@ -6515,9 +6677,11 @@ impl<S: Steps> Jobs<S> {
         sizing.record("read", sized);
         #[cfg(test)]
         SIZED_UNITS.with_borrow_mut(|it| it.push(sized));
-        if let Some(root) = root {
-            // clone: a refcount, once per build
-            self.roots.sized[root as usize] = Some((input.units.clone(), sizes));
+        // Kept with the plan these units are of; a plan not kept (a trace's) keeps none.
+        if let Some(plan) =
+            root.and_then(|root| plan_of(&mut self.roots.plans[root as usize], &input.units))
+        {
+            plan.sized = Some(sizes);
         }
         // clone: refcounts, once per build
         let work = Step::of(
@@ -6538,12 +6702,17 @@ impl<S: Steps> Jobs<S> {
                 .collect()
         };
         let reported = BitSet::<u32>::new(units.packages.len()); // alloc: once per build
-        let outputs = match root.and_then(|root| self.roots.outputs[root as usize].as_ref()) {
-            Some(outputs) if Arc::ptr_eq(&outputs.units, units) => outputs.clone(), // clone: a refcount, once per build
-            _ => {
+        let kept_outputs = root
+            .and_then(|root| plan_of(&mut self.roots.plans[root as usize], units))
+            .and_then(|plan| plan.outputs.clone()); // clone: a refcount, once per build
+        let outputs = match kept_outputs {
+            Some(outputs) => outputs,
+            None => {
                 let made = Arc::new(self.paths.outputs(units)); // alloc: once per new units
-                if let Some(root) = root {
-                    self.roots.outputs[root as usize] = Some(made.clone()); // clone: a refcount
+                if let Some(plan) =
+                    root.and_then(|root| plan_of(&mut self.roots.plans[root as usize], units))
+                {
+                    plan.outputs = Some(made.clone()); // clone: a refcount
                 }
                 made
             }
@@ -7858,10 +8027,27 @@ impl<S: Steps> Jobs<S> {
                 names = tracing::field::Empty,
             );
             let read = named.in_scope(|| writer.env_named());
-            if let Ok(names) = &read {
-                named.record("names", names.len());
+            match &read {
+                Ok(names) => _ = named.record("names", names.len()),
+                // Counted by its own span, so a round sees how often an answer is kept
+                // that every variable is compared for, and for which script: it should be
+                // only a build script whose run was not found kept (run outside the sandbox).
+                Err(why) => tracing::info_span!(
+                    target: "blaze",
+                    "no-op answer: the variables read are not named, every variable is compared",
+                    why = %why,
+                )
+                .in_scope(|| {}),
             }
             recorded.recording.vouch_env(read);
+            // And the paths its steps read under its directories of outputs, beside its
+            // units' own: no change heard at one is set aside ([`noop::LastAnswer::read`]).
+            let read = tracing::info_span!(
+                target: "blaze",
+                "no-op answer: the paths the build's steps read under its outputs",
+            )
+            .in_scope(|| writer.read_outside());
+            recorded.recording.vouch_reads(read);
         }
         // The documentation's front end is not kept: it sets `cfg(doc)`.
         let documenting = match documents {
@@ -8302,7 +8488,7 @@ impl<S: Steps> Jobs<S> {
             self.order.retain(|it| *it != id);
             self.ended = true;
             // clone: the error, once a job the stall ends
-            w.said.push(Said::Finish(id, false, Some(error.clone()), job.built));
+            w.said.push(Said::Finish(id, false, Some(error.clone()), job.built.zip(job.built_root)));
         }
         // The lowerings of jobs the stall ended wait for nothing now.
         let jobs = &self.jobs;
@@ -8765,7 +8951,7 @@ impl<S: Steps> Jobs<S> {
             if let Some(request) = job.request {
                 self.answered.push(u64::from(request.0));
             }
-            w.said.push(Said::Finish(id, ok, error, job.built));
+            w.said.push(Said::Finish(id, ok, error, job.built.zip(job.built_root)));
         }
         // What answered jobs left to settle: each waits for the store's commit of its tickets,
         // the store flushed while any does ([`flush_for_wait`]); and is done once they are

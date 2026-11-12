@@ -14,7 +14,7 @@ use blaze_core::{
 };
 
 use super::{Watched, Watcher, cmp_below, is_below, reference};
-use crate::{Mode, Vfs, disk::Disks, section::Section};
+use crate::{Mode, Op, Vfs, disk::Disks, section::Section};
 
 /// A watcher under test: today's, or the reference it is held to.
 trait Watch {
@@ -1334,6 +1334,47 @@ fn a_name_compares_with_a_directory_as_the_joined_string_does() {
             let joined = format!("{dir}/");
             assert_eq!(cmp_below(name, dir), name.cmp(&joined), "{name:?} against {dir:?}/");
             assert_eq!(is_below(name, dir), name.starts_with(&joined), "{name:?} under {dir:?}");
+        }
+    }
+}
+
+/// The invariant: a file the daemon writes into the checkout during a build, through the
+/// build's own view (the head's root with the file written over it, which moves no head),
+/// comes back from the watcher as that view and no other: the head's root after the report is
+/// the root the build was of, byte for byte, so the next request is asked on a view a build
+/// has already seen; and the same bytes reported again commit nothing. The control is where
+/// the cause is removed: a build that recorded the view it was asked on, without the file
+/// (the daemon until 2026-11-12, which wrote lock files to the disk alone), is of a root the
+/// head has left, and the echo of its own write is a change to it.
+#[test]
+fn a_file_the_daemon_wrote_through_its_view_is_the_builds_own_when_reported() {
+    const LOCK: &str = "# a lock\n";
+    for kind in [Journal::FsEvents, Journal::Usn] {
+        for seed in 0..20 {
+            let what = format!("{kind:?} seed {seed}");
+            let mut run = Run::new(seed, kind, TREE);
+            let asked = run.vfs.head("disk").expect("the checkout's head");
+            // The build's view: the lock file written over the root it was asked on.
+            let lock =
+                Op::Write { mode: Mode::Regular, path: "Cargo.lock".into(), bytes: LOCK.into() };
+            let built = run.vfs.apply_owned(asked, vec![lock]).expect("the write applies");
+            assert_ne!(built, asked, "{what}");
+            assert_eq!(run.vfs.head("disk"), Some(asked), "{what}: a view's write moves no head");
+            // The driver writes the file; the watcher reports it later.
+            run.write("Cargo.lock", LOCK);
+            run.pump();
+            run.check(&what);
+            assert_eq!(run.vfs.head("disk"), Some(built), "{what}: the echo is the build's own view");
+            // The control: the view the build was asked on is not what the head holds now.
+            assert_ne!(run.vfs.head("disk"), Some(asked), "{what}");
+            // Reported again with the bytes the head has: no commit, the root as it was.
+            run.out.clear();
+            run.sim.advance(Duration::from_millis(1));
+            run.write("Cargo.lock", LOCK);
+            run.pump();
+            run.check(&what);
+            assert!(!run.out.iter().any(|it| matches!(it, Watched::Committed(_))), "{what}: {:?}", run.out);
+            assert_eq!(run.vfs.head("disk"), Some(built), "{what}");
         }
     }
 }

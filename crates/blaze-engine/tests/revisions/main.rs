@@ -50,6 +50,7 @@ macro_rules! real {
 }
 
 real! {
+    a_build_a_run_and_a_build_each_keep_their_answer
     a_body_edit_below_with_libraries_keyed_by_code
     a_body_edit_makes_its_crate_and_nothing_above_it
     a_body_edit_reaches_a_running_program
@@ -62,10 +63,12 @@ real! {
     a_changed_proc_macro_remakes_the_users_of_its_expansion
     a_changed_struct_layout_remakes_what_uses_it
     a_changed_trait_impl_remakes_what_resolves_to_it
+    a_cold_build_without_lock_files_then_a_build_writes_nothing
     a_comment_edit_remakes_nothing
     a_dependency_edit_reaches_only_what_uses_it
     a_feature_flip_follows_the_cfg
     a_generic_body_edit_reaches_its_instance
+    a_line_added_below_makes_nothing_above_it
     a_panic_under_the_launcher_names_its_frames
     a_renamed_function_keeps_its_code
     a_save_by_rename_is_read_whole
@@ -77,6 +80,7 @@ real! {
     a_test_after_a_build_finds_the_librarys_record
     a_touch_without_a_change
     a_variable_a_step_reads
+    a_variable_nothing_reads_keeps_the_answer
     a_variable_no_step_reads
     an_added_and_a_removed_function
     an_edit_after_a_kill

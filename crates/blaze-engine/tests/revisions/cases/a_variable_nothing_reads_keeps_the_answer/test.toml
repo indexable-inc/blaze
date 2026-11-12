@@ -1,0 +1,22 @@
+about = "A variable no step of the build reads, another at every command (nushell's CMD_DURATION_MS), does not turn a build with nothing changed into a walk: the no-op lane compares, of the request's environment, the variables the kept answer's walk read (the plan's, the set a build script's walk sees, blaze's own, and those asked for by name) and no other. Until 2026-11-12 it compared all of it. The controls are blaze-cargo's `a_variable_nothing_read_changes_and_the_answer_is_given` (the whole environment compared walks) and `the_oracle_catches_a_lane_that_ignores_a_variable_a_build_script_read`; a variable a step does read is the case `a_variable_a_step_reads`."
+drivers = ["real"]
+
+[[revision]]
+action = "build"
+
+[[revision]]
+steps = ["build", "build"]
+action = "build"
+noop = true
+
+[[revision]]
+steps = []
+action = "build"
+env = { CMD_DURATION_MS = "17" }
+noop = true
+
+[[revision]]
+steps = []
+action = "build"
+env = { CMD_DURATION_MS = "23", LAST_EXIT_CODE = "0" }
+noop = true

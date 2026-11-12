@@ -51,6 +51,14 @@
 //!   reads it again, and walks.
 //! - **The outputs**: each directory they are in has been watched since before the walk and
 //!   heard nothing since ([`Vouches::unchanged_since`]), so none was removed or replaced.
+//! - **What was heard is told apart by path** ([`LastAnswer::beside`]): where the watches
+//!   heard a change since the walk, the answer still stands when every change heard is at a
+//!   path beside what it rests on: an output the daemon planned for another request's units
+//!   ([`Asked::other_output`]: a test build's binary placed next to a build's) that no step of
+//!   this walk read ([`LastAnswer::read`]). So `build`, `test`, `build` answers the third
+//!   though the test build placed its outputs in the same directory. A change at any other
+//!   path, one with no path (a lost report, a watch that stopped), or one from before what
+//!   the watches keep by path refuses as before.
 //! - **Paths the walk found absent that no watch can be confirmed of** (the directory of a
 //!   build's layout profiles): each is looked at as the lane is asked, and is still absent
 //!   ([`Vouches::absent`]).
@@ -112,6 +120,14 @@ pub(super) trait Vouches {
     fn unchanged_since(&self, dir: &Path, generation: u64) -> bool;
     /// Whether nothing is at `path` now: a look at the disk, made as the lane is asked.
     fn absent(&self, path: &Path) -> bool;
+    /// [`blaze_vfs::outside::only_since`]: whether every change heard since `generation` is
+    /// one `aside` sets aside by its path.
+    fn only_since(&self, generation: u64, aside: &dyn Fn(&Path) -> bool) -> bool;
+    /// [`blaze_vfs::outside::watched_since`].
+    fn watched_since(&self, dir: &Path, generation: u64) -> bool;
+    /// Whether the file at `path` is what `was` says (its content's hash; none: not there):
+    /// a look at the disk, made as the lane is asked.
+    fn same_file(&self, path: &Path, was: Option<[u8; 32]>) -> bool;
 }
 
 /// What a build's answer is a function of that the daemon holds by value.
@@ -414,6 +430,8 @@ pub(super) enum NotReplayed {
     OutputsMoved(PathBuf),
     /// This path, which the answer's walk found absent, is there now.
     Appeared(PathBuf),
+    /// This file, which no watch covers and the answer's walk looked at, is another now.
+    Looked(PathBuf),
     /// This file of the checkout changed in what no code text holds, and a diagnostic of the
     /// answer names it: its quoted lines may say otherwise now, and only a walk renders
     /// them again.
@@ -440,7 +458,7 @@ impl NotReplayed {
             NotReplayed::OutputsMoved(dir) => {
                 Some(format!("the outputs under {}", dir.display()))
             }
-            NotReplayed::Appeared(path) => Some(path.display().to_string()),
+            NotReplayed::Appeared(path) | NotReplayed::Looked(path) => Some(path.display().to_string()),
             NotReplayed::Quoted(path) => {
                 Some(format!("the lines of {path} that the last build's diagnostics quote"))
             }
@@ -469,6 +487,11 @@ impl fmt::Display for NotReplayed {
             NotReplayed::Appeared(path) => {
                 write!(f, "{} is there now, and was not when the kept build ran", path.display())
             }
+            NotReplayed::Looked(path) => write!(
+                f,
+                "{}, which no watch covers, is not what it was when the kept build looked at it",
+                path.display()
+            ),
             NotReplayed::Quoted(path) => write!(
                 f,
                 "{path} changed in what no code reads, and a diagnostic of the kept answer quotes it"
@@ -498,6 +521,8 @@ pub(super) enum Plant {
     IgnoresLocals,
     /// Says an answer again though a path its walk found absent is there now.
     IgnoresAppeared,
+    /// Says an answer again though a file its walk looked at on the disk is another now.
+    IgnoresLooked,
     /// Keeps the answer of a walk that looked at a path on the disk no watch covers.
     KeepsALook,
     /// Keeps the answer of a build that made something.
@@ -518,6 +543,12 @@ pub(super) enum Plant {
     /// Compares no variable the walk's steps asked for by name: says an answer again over a
     /// variable a build script read.
     IgnoresNamed,
+    /// Sets aside every change heard at a planned output's path, this answer's own outputs
+    /// too: says an answer again though its output was deleted beside another's placement.
+    AnyOutputAside,
+    /// Sets no change aside by its path, as the lane did until 2026-11-12 (a watch a
+    /// directory): a test build's output placed beside a build's costs the build's answer.
+    NothingAside,
     /// Drops every shape's answer when a job of one shape walks, as the lane did until
     /// 2026-11-12 (one answer a checkout): `build`, `test`, `build` walks three times.
     DropsOthers,
@@ -594,6 +625,11 @@ pub(super) struct Asked<'a> {
     /// environment sees (`blaze_usercode::confine::walk_sees`), blaze's own (`BLAZE_*`).
     /// The lists are the steps' own, handed in by the daemon: a core reads none.
     pub(super) unasked: &'a dyn Fn(&str) -> bool,
+    /// Whether `path` is an output the daemon planned for some unit that is none of the
+    /// units of this request's own plan: another request's, placed beside this one's. False
+    /// for this plan's outputs, for a path that is no planned output (a build script's
+    /// `OUT_DIR`, a stranger's file), and where the request's shape has no plan kept.
+    pub(super) other_output: &'a dyn Fn(&Path) -> bool,
 }
 
 /// The answer of a checkout's last build that walked every unit and made nothing: what the
@@ -613,6 +649,9 @@ pub(super) struct LastAnswer {
     pub(super) dirs: Arc<[PathBuf]>,
     /// The paths its walk found absent, which no watch can be confirmed of.
     pub(super) absent: Arc<[PathBuf]>,
+    /// The files its walk looked at on the disk, which no watch vouched for, each with what
+    /// was there ([`Walk::files`]): looked at again as the lane is asked.
+    pub(super) looked: Arc<[(PathBuf, Option<[u8; 32]>)]>,
     /// What it said, in order, but its `Work` and its progress.
     pub(super) responses: Arc<[Response]>,
     /// Its `Work`, for a build; a check says none.
@@ -627,6 +666,12 @@ pub(super) struct LastAnswer {
     /// or why they are not known ([`Recording::vouch_env`]), and then every variable is one a
     /// step may have read.
     pub(super) named: Result<Arc<[String]>, String>,
+    /// What its walk's steps read by path under the directories it rests on, beside its
+    /// units' own outputs: each file a build script's kept run was checked against and each
+    /// file a unit record was filed by (sorted), and each directory one of them listed or
+    /// hashed whole; or why they are not known ([`Recording::vouch_reads`]), and then no
+    /// change heard is set aside.
+    pub(super) read: Result<(Arc<[PathBuf]>, Arc<[PathBuf]>), String>,
 }
 
 /// Whether `diagnostic`, or one under it, names a file whose last name is `name`: in a span,
@@ -651,6 +696,22 @@ impl LastAnswer {
             }
             Err(_) => true,
         }
+    }
+
+    /// Whether a change at `path` is beside everything the answer rests on: an output planned
+    /// for another request's units, which no step of this walk read and no directory a step
+    /// listed holds.
+    fn beside(&self, path: &Path, asked: &Asked<'_>) -> bool {
+        if planted(Plant::NothingAside) {
+            return false;
+        }
+        if planted(Plant::AnyOutputAside) {
+            return true;
+        }
+        let Ok((files, listed)) = &self.read else { return false };
+        (asked.other_output)(path)
+            && files.binary_search_by(|it| it.as_path().cmp(path)).is_err()
+            && !listed.iter().any(|dir| path.starts_with(dir))
     }
 
     /// About what keeping the answer holds of the heap, in bytes: what it said (each
@@ -680,7 +741,11 @@ impl LastAnswer {
         let invocation = &self.inputs.config.invocation;
         let env: usize = invocation.env.iter().map(|(name, value)| name.len() + value.len()).sum();
         let args: usize = invocation.args.iter().map(String::len).sum();
-        size_of::<LastAnswer>() + said + paths(&self.dirs) + paths(&self.absent) + still + named + env + args
+        let read = match &self.read {
+            Ok((files, listed)) => paths(files) + paths(listed),
+            Err(why) => why.len(),
+        };
+        size_of::<LastAnswer>() + said + paths(&self.dirs) + paths(&self.absent) + still + named + read + env + args
     }
 
     /// Whether `view` is known to hold the answer's files as every key of its walk read
@@ -766,10 +831,18 @@ impl LastAnswer {
         if !asked.locals_vouched && !planted(Plant::IgnoresLocals) {
             return Err(NotReplayed::Locals);
         }
-        if !watches.quiet_since(self.generation) && !planted(Plant::IgnoresOutside) {
+        // Something was heard since the walk: asked once whether all of it is beside what
+        // the answer rests on, by path.
+        let quiet = watches.quiet_since(self.generation);
+        let beside =
+            !quiet && watches.only_since(self.generation, &|path| self.beside(path, asked));
+        if !quiet && !beside && !planted(Plant::IgnoresOutside) {
             return Err(NotReplayed::Disturbed);
         }
-        let moved = self.dirs.iter().find(|dir| !watches.unchanged_since(dir, self.generation));
+        let moved = self.dirs.iter().find(|dir| {
+            !watches.unchanged_since(dir, self.generation)
+                && !(beside && watches.watched_since(dir, self.generation))
+        });
         if let Some(dir) = moved
             && !planted(Plant::IgnoresOutputs)
         {
@@ -779,6 +852,11 @@ impl LastAnswer {
             && !planted(Plant::IgnoresAppeared)
         {
             return Err(NotReplayed::Appeared(path.clone())); // clone: a reason, once
+        }
+        if let Some((path, _)) = self.looked.iter().find(|(path, was)| !watches.same_file(path, *was))
+            && !planted(Plant::IgnoresLooked)
+        {
+            return Err(NotReplayed::Looked(path.clone())); // clone: a reason, once
         }
         Ok(())
     }
@@ -823,6 +901,10 @@ pub(super) struct Walk {
     pub(super) looks: u64,
     /// The last path looked at ([`blaze_vfs::outside::last_look`]), for the reason.
     pub(super) looked_at: Option<PathBuf>,
+    /// Every look of the walk, when each was of a file and said one thing
+    /// ([`blaze_vfs::outside::take_file_looks`]): the answer is kept with them and each is
+    /// looked at again as the lane is asked. None: some look can't be made again so.
+    pub(super) files: Option<Vec<(PathBuf, Option<[u8; 32]>)>>,
     /// Its `Work`.
     pub(super) worked: Option<Worked>,
 }
@@ -845,6 +927,8 @@ pub(super) struct Recording {
     still: Result<Arc<[StillFile]>, String>,
     /// [`LastAnswer::named`], as its steps said ([`Recording::vouch_env`]).
     named: Result<Arc<[String]>, String>,
+    /// [`LastAnswer::read`], as its steps said ([`Recording::vouch_reads`]).
+    read: Result<(Arc<[PathBuf]>, Arc<[PathBuf]>), String>,
 }
 
 impl Recording {
@@ -870,7 +954,28 @@ impl Recording {
             still: Err("its front end was not asked which sources it held by code text".to_owned()),
             // alloc: as above
             named: Err("its steps were not asked which variables they read by name".to_owned()),
+            // alloc: as above
+            read: Err("its steps were not asked which paths they read".to_owned()),
         }
+    }
+
+    /// The paths outside every view the build's steps read, as they say once every task of
+    /// the build ended: each file (`files`) and each directory listed or hashed whole
+    /// (`listed`); or why they are not all known. Kept are those under a directory the
+    /// answer rests on (a file there, a directory there or above one): the rest are covered
+    /// by the watches as a whole, which set no change at them aside. A recording not told
+    /// keeps an answer no change heard is set aside for.
+    pub(super) fn vouch_reads(&mut self, read: Result<(Vec<PathBuf>, Vec<PathBuf>), String>) {
+        let dirs = &self.dirs;
+        self.read = read.map(|(mut files, mut listed)| {
+            files.retain(|file| dirs.iter().any(|dir| file.starts_with(dir)));
+            files.sort_unstable();
+            files.dedup();
+            listed.retain(|it| dirs.iter().any(|dir| it.starts_with(dir) || dir.starts_with(it)));
+            listed.sort_unstable();
+            listed.dedup();
+            (files.into(), listed.into())
+        });
     }
 
     /// The variables of the request's environment the build's steps asked for by name, as
@@ -932,19 +1037,30 @@ impl Recording {
         if !walk.made_nothing && !planted(Plant::KeepsWork) {
             return Err(Unkept::Made);
         }
-        if walk.looks != self.looks && !planted(Plant::KeepsALook) {
-            return Err(Unkept::Looked(walk.looked_at));
-        }
+        // The invariant: an answer is said again only while everything its walk rested on
+        // is as it was. What a watch vouched for, the watches say; a file the walk looked at
+        // on the disk (a name directly under `/`, a path through a link: what no watch can
+        // vouch for) is kept with what was there and looked at again as the lane is asked.
+        // A look of another kind keeps no answer. Until 2026-11-12 any look kept none: a
+        // build script that asked of `/root` was a walk in every build.
+        let looked = match (walk.looks != self.looks, walk.files) {
+            (false, _) => Vec::new(), // alloc: none
+            (true, Some(files)) => files,
+            (true, None) if planted(Plant::KeepsALook) => Vec::new(), // alloc: none
+            (true, None) => return Err(Unkept::Looked(walk.looked_at)),
+        };
         Ok(LastAnswer {
             inputs: self.inputs,
             generation: self.generation,
             dirs: self.dirs.into(),
             absent: self.absent.into(),
+            looked: looked.into(),
             responses: self.responses.into(),
             worked: walk.worked,
             still: self.still,
             same: None,
             named: self.named,
+            read: self.read,
         })
     }
 }
@@ -1009,6 +1125,13 @@ impl<H> Answers<H> {
     /// Every answer kept, whatever its shape.
     pub(super) fn kept(&self) -> impl Iterator<Item = &LastAnswer> + '_ {
         self.shapes.iter().filter_map(|it| it.last.as_ref().ok())
+    }
+
+    /// The answer of the shape most recently used (the last a job of the checkout walked
+    /// as, or was answered as), when one is kept of it: what the checkout's last build or
+    /// check, sent again, is asked of. What is built ahead stops at (`serve::ahead`).
+    pub(super) fn latest(&self) -> Option<&LastAnswer> {
+        self.shapes.last().and_then(|it| it.last.as_ref().ok())
     }
 
     /// [`LastAnswer::held_bytes`] of every answer kept.

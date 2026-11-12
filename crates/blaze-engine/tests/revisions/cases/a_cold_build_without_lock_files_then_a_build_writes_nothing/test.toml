@@ -1,0 +1,18 @@
+about = "A workspace with no lock file committed: the cold build writes Cargo.lock and blaze.lock into the checkout, through its own view, so the build after it with nothing changed is on the view the cold build was of: it makes no unit and writes no input of the query engine. Until 2026-11-12 the lock files were written to the disk alone, the watcher brought them back as a change, and that build planned anew on a root no build had seen (a real project's second run: 5.9 s, 1 unit made, the cause named as Cargo.lock changed). The controls are where the cause is: blaze-cargo's `a_file_the_build_writes_into_the_checkout_is_in_its_own_view` and blaze-vfs's `a_file_the_daemon_wrote_through_its_view_is_the_builds_own_when_reported`."
+drivers = ["real"]
+
+[[revision]]
+action = "build"
+
+[[revision]]
+steps = []
+action = "build"
+redone = []
+max_units = 0
+max_written = 0
+link = "none"
+
+[[revision]]
+steps = ["build"]
+action = "build"
+noop = true

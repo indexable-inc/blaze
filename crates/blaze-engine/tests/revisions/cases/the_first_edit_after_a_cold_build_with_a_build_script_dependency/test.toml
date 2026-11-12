@@ -14,6 +14,7 @@ args = ["-p", "app"]
 prints = "52 3\n"
 redone = []
 max_units = 0
+max_written = 0
 max_executed = 200
 max_verified = 2000
 
@@ -27,6 +28,11 @@ args = ["-p", "app"]
 prints = "53 3\n"
 redone = ["app::shown"]
 max_units = 1
+# The lock files are in the cold build's own view (2026-11-12), so this edit's view adds no
+# file: 4 inputs written and 2,054 results verified were seen with Cargo.lock in place before
+# the cold build (lane firstedit-1112), against 1,077,205 verified without.
+max_written = 4
+max_verified = 4000
 
 [[revision]]
 action = "run"
