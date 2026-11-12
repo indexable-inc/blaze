@@ -495,3 +495,101 @@ fn a_build_is_an_edit_a_declaration_or_a_restart() {
     // Nothing changed: nothing is said.
     assert_eq!(told(Op::Connect), [Told::Nothing]);
 }
+
+/// A record made of a compiled function (the table in `record`'s documentation): a callee
+/// and a symbol the program defines are function places the bind numbers; a symbol nothing
+/// of the program defines is an outside symbol by name; a `Direct` of the function itself
+/// is its own bytes; a datum keeps its place; and a position becomes two data, the file's
+/// name and the `Location` that points at it, with the span table it was read from noted.
+#[test]
+fn a_record_names_callees_by_place_and_carries_its_positions_as_data() {
+    use blaze_codegen::Data;
+    use blaze_format::SpanRef;
+    use blaze_launch::record::{Kind, Place, Record, To};
+    use blaze_link::{Position, SpanTable};
+
+    use crate::record::{self, Named, Positions};
+
+    struct Build {
+        anchor: ContentId,
+        table: SpanTable,
+        defined: InstanceKey,
+    }
+    impl Positions for Build {
+        fn of(&self, span: &SpanRef) -> Result<(&str, Position), String> {
+            if span.anchor != self.anchor {
+                return Err("no table of that anchor".to_owned());
+            }
+            let position = self.table.spans[span.index as usize];
+            Ok((&self.table.files[position.file as usize], position))
+        }
+
+        fn defined(&self, name: &str) -> Option<Named> {
+            (name == "__rust_enable_lse").then_some(Named::Function(self.defined))
+        }
+    }
+    let (own, callee, defined) = (key(0, 1), key(1, 1), key(2, 1));
+    let anchor = id(9, 1, 0);
+    let build = Build {
+        anchor,
+        table: SpanTable {
+            files: vec!["src/main.rs".to_owned()],
+            spans: vec![Position { file: 0, line: 4, column: 17 }],
+        },
+        defined,
+    };
+    let datum = Data { id: id(8, 1, 0), align: 1, bytes: b"boom".to_vec(), relocs: Relocs::from_iter([]), writable: false };
+    let reloc = |at: u32, kind: RelocKind, target: Target| Relocation { at, kind, target, addend: 0 };
+    let function = CompiledFunction {
+        key: own,
+        arch: Arch::Aarch64,
+        align: 4,
+        code: vec![0; 40],
+        relocs: Relocs::from_iter([
+            reloc(0, RelocKind::GotPage21, Target::Function(callee)),
+            reloc(4, RelocKind::GotPage21, Target::Extern("__rust_enable_lse".to_owned())),
+            reloc(8, RelocKind::GotPage21, Target::Extern("write".to_owned())),
+            reloc(12, RelocKind::Call26, Target::Direct(own)),
+            reloc(16, RelocKind::GotPage21, Target::Data(datum.id)),
+            reloc(20, RelocKind::GotPage21, Target::Position(SpanRef { anchor, index: 0 })),
+        ]),
+        data: vec![datum],
+        inlined: Vec::new(),
+        side: None,
+        unwind: None,
+        lines: Vec::new(),
+        coverage: None,
+        profile: None,
+    };
+    let made = record::function(&function, "hello::main", &build).expect("made");
+    assert_eq!(made.named, [Named::Function(callee), Named::Function(defined)]);
+    assert_eq!(made.anchors, [anchor]);
+    assert_eq!(made.id.0, *blake3::hash(&made.bytes).as_bytes());
+    let read = Record::decode(&made.bytes).expect("a record");
+    let places: Vec<Place<'_>> = read.places.iter().collect();
+    assert_eq!(places, [Place::Function, Place::Function, Place::Extern("write")]);
+    let to: Vec<To> = read.fixups.iter().map(|it| it.to).collect();
+    // The function's own datum is first; the position's file name and `Location` follow.
+    assert_eq!(to, [To::Place(0), To::Place(1), To::Place(2), To::Own, To::Data(0), To::Data(2)]);
+    let data: Vec<_> = read.data.iter().collect();
+    assert_eq!(data.len(), 3);
+    assert_eq!((data[0].bytes, data[1].bytes), (&b"boom"[..], &b"src/main.rs\0"[..]));
+    // The `Location`: the name's pointer (a fixup to the name's datum), its length, the line
+    // and the column.
+    let location = data[2].bytes;
+    assert_eq!(location.len(), 24);
+    assert_eq!(u64::from_le_bytes(location[8..16].try_into().expect("8 bytes")), 11);
+    assert_eq!(u32::from_le_bytes(location[16..20].try_into().expect("4 bytes")), 4);
+    assert_eq!(u32::from_le_bytes(location[20..24].try_into().expect("4 bytes")), 17);
+    let pointer: Vec<_> = data[2].fixups.iter().collect();
+    assert_eq!((pointer[0].kind, pointer[0].to, pointer[0].at), (Kind::Abs64, To::Data(1), 0));
+    // The placed length: the code, then a cell for each thing reached through a word that
+    // is no function (`write`, the datum, the location).
+    assert_eq!(made.len, 40 + 3 * 8);
+
+    // What a launcher does not take is refused by name: a relocation kind with no record kind.
+    let mut bad = function.clone(); // clone: a test's copy
+    bad.relocs = Relocs::from_iter([reloc(0, RelocKind::TlsGd32, Target::Function(callee))]);
+    let refused = record::function(&bad, "hello::main", &build).unwrap_err();
+    assert!(refused.contains("`hello::main`") && refused.contains("TlsGd32"), "{refused}");
+}

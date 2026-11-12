@@ -80,6 +80,9 @@ pub struct Shared {
     /// The address of slot 0's entry thunk.
     thunks: usize,
     inbox: Sender<Event>,
+    /// The process the launcher was made in: a forked child of it has these words and no
+    /// control thread.
+    pid: u32,
 }
 
 thread_local! {
@@ -109,6 +112,7 @@ impl Shared {
             stubs,
             thunks,
             inbox,
+            pid: std::process::id(),
         }
     }
 
@@ -308,6 +312,23 @@ pub(crate) extern "C" fn resolve(stub: usize, context: *const c_void) -> *const 
     let Some(word) = u32::try_from(slot).ok().and_then(|slot| shared.word(Slot(slot))) else {
         stop(slot, "its stub is not one of the launcher's");
     };
+    // A forked child of the program has the parent's words and stubs and none of its
+    // threads: no control thread would ever answer. It stops and says so, where it would
+    // otherwise wait for ever (a `fork` without an `exec` that reaches a function the parent
+    // never called; binding in the child is not built).
+    if std::process::id() != shared.pid {
+        const WHY: &[u8] = b"blaze: a function was first called in a forked child of the program, \
+            which has no control thread to ask the daemon for its code (the launcher does not \
+            serve a fork yet): the child stops\n";
+        // A forked child of a threaded process may hold any lock another thread held at the
+        // fork, so it says this with one `write` and ends with `_exit`, as a signal handler
+        // would.
+        // SAFETY: a write of a live constant to descriptor 2, then the process's end.
+        unsafe {
+            libc::write(2, WHY.as_ptr().cast(), WHY.len());
+            libc::_exit(127)
+        }
+    }
     let (reply, bound) = crossbeam_channel::bounded(1);
     let thread = Thread(CURRENT.with(Cell::get));
     shared.send(Event::Need { slot: Slot(slot as u32), thread, reply });

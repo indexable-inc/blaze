@@ -659,12 +659,11 @@ impl Program {
             if before.entry != image.entry {
                 restart = Some("the program's entry is another function".to_owned()); // alloc: once
             }
-            for (identity, key, code) in &image.by_identity {
+            for (identity, _, code) in &image.by_identity {
                 let Ok(at) = before.by_identity.binary_search_by_key(identity, |it| it.0) else {
                     continue;
                 };
                 let (_, _, old_code) = before.by_identity[at];
-                let _ = key;
                 // The entry (the C `main` the front end makes around the program's `fn
                 // main`) follows `fn main`'s code and has no body of its own to edit, and its
                 // one frame is the process's first: it is rebound with `fn main` and not

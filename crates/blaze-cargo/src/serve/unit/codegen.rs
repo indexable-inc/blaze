@@ -2444,7 +2444,12 @@ fn launched(
     let tiers = tiers(job, unit, generated.built, generated.policy.toolchain.arch)?;
     Ok(LinkMade {
         made: linked.first.then(|| Made::Whole(whole(&linked.file))),
-        written: Written::Bytes(linked.file),
+        // The store is given the launcher's bytes by a program's first build; every later
+        // one names what it keeps, and hashes and writes nothing.
+        written: match linked.first {
+            true => Written::Bytes(linked.file.to_vec()), // alloc: the file, once a program
+            false => Written::Kept(linked.key),
+        },
         side,
         read: Vec::new(), // alloc: none, empty
         table: None,

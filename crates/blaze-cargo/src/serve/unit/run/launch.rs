@@ -89,6 +89,8 @@ pub(crate) struct Launches {
     programs: Arc<SharedMap<[u8; 32], Arc<Held>>>,
     /// The last connection's number.
     conns: Arc<std::sync::atomic::AtomicU64>,
+    /// blaze's launcher, read once a daemon: its bytes and the store's key of them.
+    launcher: Lock<Option<(Arc<Vec<u8>>, blaze_cas::Key)>>,
 }
 
 /// The id of the program whose link is asked for at `path`: what its sidecar names.
@@ -103,7 +105,32 @@ impl Launches {
             listening: Lock::new("serve.launches.listening", false),
             programs: Arc::new(SharedMap::default()),
             conns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            launcher: Lock::new("serve.launches.launcher", None),
         }
+    }
+
+    /// blaze's launcher (`blaze-launcher`, beside blaze's own executable `blaze`): its bytes
+    /// and their key, read at the first program's link.
+    fn launcher(&self, blaze: &std::path::Path, path: &str) -> Result<(Arc<Vec<u8>>, blaze_cas::Key), String> {
+        // clone: two counts, once a link
+        if let Some(held) = self.launcher.lock().clone() {
+            return Ok(held);
+        }
+        let launcher = blaze
+            .parent()
+            .map(|it| it.join("blaze-launcher"))
+            .ok_or_else(|| format!("{} has no directory to find blaze-launcher in", blaze.display()))?;
+        // Read outside the lock: two links that race read it twice and keep one.
+        let file = std::fs::read(&launcher).map_err(|why| {
+            format!(
+                "{path} is built to run under blaze's launcher ({VAR} is on), and the launcher {} does not read: {why}",
+                launcher.display()
+            )
+        })?;
+        let key = crate::serve::unit::compile::output_key(&file);
+        let held = (Arc::new(file), key);
+        *self.launcher.lock() = Some(held.clone()); // clone: two counts
+        Ok(held)
     }
 
     fn socket(&self) -> PathBuf {
@@ -296,9 +323,12 @@ fn serve(conn: Conn, mut socket: UnixStream, programs: &SharedMap<[u8; 32], Arc<
             }
         }
     });
-    if let Err(why) = written {
-        return tracing::error!(target: "blaze", "launcher {}'s writer thread did not start: {why}", conn.0);
-    }
+    let written = match written {
+        Ok(written) => written,
+        Err(why) => {
+            return tracing::error!(target: "blaze", "launcher {}'s writer thread did not start: {why}", conn.0);
+        }
+    };
     {
         let mut core = held.core.lock();
         core.program.connected(conn);
@@ -331,21 +361,20 @@ fn serve(conn: Conn, mut socket: UnixStream, programs: &SharedMap<[u8; 32], Arc<
         let mut out = Vec::new(); // alloc: one frame
         let unheld = Tell::Unheld { why: &why };
         if unheld.encode(u64::MAX, &mut out).is_ok() {
-            // Written here, after everything queued: the writer thread may be mid-frame.
+            // Queued after everything the core decided for it: written last.
             drop(send.send(out));
-            // The writer drains its queue before the socket is shut down below: bounded by
-            // the frames queued, a handful.
-            for _ in 0..1000 {
-                if send.is_empty() {
-                    break;
-                }
-                std::thread::yield_now();
-            }
         }
     }
-    let mut core = held.core.lock();
-    core.program.disconnected(conn);
-    core.writers.retain(|it| it.0 != conn);
+    {
+        let mut core = held.core.lock();
+        core.program.disconnected(conn);
+        core.writers.retain(|it| it.0 != conn);
+    }
+    // Both senders are gone now, so the writer ends once it wrote what was queued. The wait:
+    // for that; it ends when the queue is drained or the launcher's socket refuses a write
+    // (a launcher that is alive and reads nothing holds this one thread, and nothing else).
+    drop(send);
+    drop(written.join());
     // The launcher's process is told nothing more: closing its socket ends its code service,
     // which it says by name if a stub still fires.
     drop(socket.shutdown(std::net::Shutdown::Both));
@@ -355,8 +384,9 @@ fn serve(conn: Conn, mut socket: UnixStream, programs: &SharedMap<[u8; 32], Arc<
 /// program's path, the sidecar's for each path the program runs from, and what the running
 /// launchers were told of this build.
 pub(crate) struct Linked {
-    /// The launcher binary: the file at cargo's path.
-    pub(crate) file: Vec<u8>,
+    /// The launcher binary, the file at cargo's path, and the store's key of it.
+    pub(crate) file: Arc<Vec<u8>>,
+    pub(crate) key: blaze_cas::Key,
     /// The sidecar's text, the same beside every path.
     pub(crate) sidecar: Vec<u8>,
     pub(crate) told: Vec<Told>,
@@ -380,19 +410,7 @@ pub(crate) fn link(
     let _span = tracing::info_span!(target: "blaze", "launch link", unit = %path).entered();
     let launches = &job.shared.launches;
     let socket = launches.listen()?;
-    // blaze's launcher: beside blaze's own executable.
-    let launcher = job
-        .shared
-        .launcher
-        .parent()
-        .map(|it| it.join("blaze-launcher"))
-        .ok_or_else(|| format!("{} has no directory to find blaze-launcher in", job.shared.launcher.display()))?;
-    let file = std::fs::read(&launcher).map_err(|why| {
-        format!(
-            "{path} is built to run under blaze's launcher ({VAR} is on), and the launcher {} does not read: {why}",
-            launcher.display()
-        )
-    })?;
+    let (file, key) = launches.launcher(&job.shared.launcher, path)?;
     let first = launches.programs.pin().get(&program_id(path)).is_none();
     let told = launches.built(path, generated.built, "main", |held| {
         // What `LinkInputs` says, against the snapshot the program holds: the same snapshot
@@ -426,5 +444,5 @@ pub(crate) fn link(
         let _ = write!(sidecar, "{byte:02x}");
     }
     sidecar.push('\n');
-    Ok(Linked { file, sidecar: sidecar.into_bytes(), told, first })
+    Ok(Linked { file, key, sidecar: sidecar.into_bytes(), told, first })
 }
