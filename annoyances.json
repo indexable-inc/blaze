@@ -723,9 +723,9 @@
    "where": "hir-ty-codegen's tests under cargo",
    "what": "`v2::linked::tests::a_body_edit_among_many_makes_its_own_tables` fails every time the module's tests run side by side (`2000 functions: the link before was kept`: `no link inputs are kept for this build or its base`), on the untouched tip of all-1111 (e453ac295a) and on this lane alike, three runs of three each, and passes with `--test-threads=1`.",
    "cost": "a base build of hir-ty-codegen's tests (ten minutes) to tell it from this lane's change to `linked`",
-   "cause": "my guess, unverified: the link inputs kept beside the database are four programs a process, and the tests of one process share them",
+   "cause": "the link inputs kept beside the database were four programs a process, and the tests of one process share them (confirmed by the fix)",
    "workaround": "`--test-threads=1`",
-   "state": "open"
+   "state": "fixed on edit4-1111 (2026-11-12): the kept link inputs are bounded a database (four) and 64 a process, so one test's links no longer push out another's; the module's 11 tests pass side by side"
   },
   {
    "id": "edit4-1",
@@ -836,6 +836,17 @@
    "cause": "my reading, not verified: two functions with the same body byte and as many references get one compiled template in the test's model, whose rows say which places share a target, and which of the two made it differs between the fresh build and the patched one. If so it is the model's key (rule keys-cover-every-input), not the driver",
    "workaround": "none",
    "state": "open: pin the case (draws 4, 0, 0, 0, 0, 0, 3, 1, 2, false x5, one edit 0, 0, 0) and decide whether the template key or the driver is wrong"
+  },
+  {
+   "id": "edit4-11",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+   "where": "blaze-query: a database's first changed-set walk, in a test",
+   "what": "A test that writes a file and then asks `changed_since` for the first time gets every row named: the walk is of everything written since the database was made (`written=30`, `marked=2022` among 2,000 functions), a wide level, so the link inputs' counter said 2,008 bodies moved for a one-line edit. A daemon never sees it, since each build walks (`body check: changed set`, `written=4`, `marked=0`).",
+   "cost": "two test runs and a print of `ChangedSetWork` to tell it from a real dependence on the program",
+   "cause": "nothing says a host must walk once a build before it asks; a test that models an edit has to model the build's walk too",
+   "workaround": "the tests call `walk_changed_set` each step, as a build's check does",
+   "state": "open: `changed_since`'s docs could say that the first walk of a storage names what every write since its start reaches"
   }
  ]
 }
