@@ -892,6 +892,7 @@ struct Ran {
     reentered: bool,
     unconverged: bool,
     untracked: bool,
+    stored: bool,
     durability: u8,
     changed: u32,
     round: u32,
@@ -908,6 +909,7 @@ fn ran(at: u32) -> Ran {
             reentered: frame.reentered,
             unconverged: frame.unconverged,
             untracked: frame.untracked,
+            stored: frame.stored,
             durability: frame.durability,
             changed: frame.changed,
             round: frame.round,
@@ -1167,7 +1169,9 @@ fn finish<F: Function>(
     } else {
         gained(table, id);
     }
-    let meta = durability | if done.untracked { UNTRACKED } else { 0 };
+    let meta = durability
+        | if done.untracked { UNTRACKED } else { 0 }
+        | if done.stored { row::STORED } else { 0 };
     // SAFETY: the flight holder, `RUNNING` set; the value was dropped above (rule 1).
     unsafe { put(table, row, new) };
     // A head whose last round read no row of its cycle (or a verify turned run that was met

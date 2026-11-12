@@ -3150,3 +3150,95 @@ fn the_workspaces_root_is_never_the_standard_librarys() {
     let found = crate::crates::root(&units, &mounts).unwrap();
     assert_eq!(found.dir.as_deref(), Some("/w"));
 }
+
+/// The invariant: once the surfaces are given ([`Lowered::give_surfaces`]), every crate of
+/// the plan holds the one [`Lowered::surface_of`] works out, which an image key above it
+/// reads; an edit of what no front end above reads (a plain body, a moved line, a comment)
+/// leaves every crate's as it was, and a signature moves the crate's and the one above it.
+/// Given again with nothing moved, nothing is written.
+#[test]
+fn every_crate_is_given_its_surface_and_what_no_front_end_reads_moves_none() {
+    let surfaces = |lib: &'static [u8]| {
+        let mut front = front_over(&[("a/src/lib.rs", Some(lib))]);
+        front.give_surfaces();
+        let passes = front.db().maintain_passes();
+        front.give_surfaces();
+        assert_eq!(front.db().maintain_passes(), passes, "given again, nothing is written");
+        [LIB, BIN].map(|unit| {
+            let krate = front.krate(unit).expect("the unit's crate");
+            let given = hir_def::deps::given::surface(front.db(), krate)
+                .unwrap_or_else(|| panic!("unit {unit}'s crate was given no surface"));
+            assert_eq!(given, front.surface_of(krate), "unit {unit}");
+            given
+        })
+    };
+    let [lib, bin] = surfaces(LIB_PLAIN);
+    for unread in [LIB_BODY, LIB_LINE, LIB_HEADED, LIB_COMMENTED, LIB_SPACED, LIB_ENDED] {
+        assert_eq!(surfaces(unread), [lib, bin], "{}", String::from_utf8_lossy(unread));
+    }
+    let [lib_now, bin_now] = surfaces(LIB_SIGNATURE);
+    assert_ne!(lib, lib_now, "a signature is the crate's surface");
+    assert_ne!(bin, bin_now, "and the surface of the crate above holds it");
+    // A library crate of the plan is its whole identity, whatever was narrowed: its slot is
+    // the same before any unit is identified and after.
+    let registry = |lib: &'static [u8]| {
+        let tree = MemTree::default();
+        let root = changed(&tree, &[("a/src/lib.rs", Some(lib))]);
+        let config = config(root, library(&tree));
+        let units = units_with_a_registry_lib();
+        let mut front =
+            lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+                .unwrap();
+        let before = front.surface_of(front.krate(BIN).unwrap());
+        let mut store = KeptNarrows::new();
+        for unit in [LIB, BIN] {
+            let kept =
+                |key: &ContentId| Ok(store.iter().find(|it| it.0 == *key).map(|it| it.1.clone()));
+            front.library_narrows(unit, &FRONT_END, kept).unwrap();
+        }
+        store.extend(front.take_library_narrows());
+        assert_eq!(before, front.surface_of(front.krate(BIN).unwrap()), "narrowed or not");
+        before
+    };
+    assert_ne!(registry(LIB_PLAIN), registry(LIB_BODY), "a registry crate is its bytes here");
+}
+
+/// The invariant: what a record carries of a crate's own texts ([`Lowered::own_surface`])
+/// gives, in another database of the same files, the slot a parse gives there, for the crate
+/// and for the one above it ([`Lowered::carry_own_surface`]). The control (test-the-cause):
+/// carried into a database whose file differs, which no caller may do, the slot is the
+/// carried one and not that database's own, so the fold does read what was carried and a
+/// record keyed by less than the crate's files would be stale. Bytes that are no such record
+/// are refused, naming the crate.
+#[test]
+fn a_carried_surface_is_the_one_a_parse_gives() {
+    let slots = |front: &mut Lowered| {
+        [LIB, BIN].map(|unit| {
+            let krate = front.krate(unit).expect("the unit's crate");
+            front.surface_of(krate)
+        })
+    };
+    let mut first = front_over(&[("a/src/lib.rs", Some(LIB_PLAIN))]);
+    let worked_out = slots(&mut first);
+    let lib = first.krate(LIB).expect("the lib's crate");
+    let kept = first.own_surface(lib).expect("a workspace crate has texts of its own");
+
+    let mut second = front_over(&[("a/src/lib.rs", Some(LIB_PLAIN))]);
+    let lib = second.krate(LIB).expect("the lib's crate");
+    second.carry_own_surface(lib, &kept).unwrap();
+    assert_eq!(slots(&mut second), worked_out, "carried, the slots are the ones a parse gives");
+    assert_eq!(second.own_surface(lib), Some(kept.clone()), "and it is carried on as it was");
+
+    let mut other = front_over(&[("a/src/lib.rs", Some(LIB_SIGNATURE))]);
+    let own = slots(&mut other);
+    assert_ne!(own, worked_out, "another signature is another surface");
+    let lib = other.krate(LIB).expect("the lib's crate");
+    other.carry_own_surface(lib, &kept).unwrap();
+    assert_eq!(slots(&mut other), worked_out, "the control: what is carried is taken as it is");
+
+    let refused = match other.carry_own_surface(lib, b"not one") {
+        Err(refused) => refused.to_string(),
+        Ok(()) => panic!("bytes that are no carried surface were taken"),
+    };
+    assert!(refused.contains("the surface a record carried of the crate"), "{refused}");
+}

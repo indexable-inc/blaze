@@ -44,7 +44,7 @@ pub use crate::{
         BuiltCrateData, BuiltDependency, BuiltFor, Crate, CrateBuilder, CrateBuilderId,
         CrateDataBuilder, CrateDisplayName, CrateGraphBuilder, CrateName, CrateNamed, CrateOrigin,
         CrateType, CrateTypes, CratesIdMap, CratesMap, DependencyBuilder, Env, ExtraCrateData,
-        CrateSlot, Given,
+        CrateSlot, GIVEN_MORE, Given, take_given,
         LangCrateOrigin, ProcMacroLoadingError, ProcMacroPaths, ReleaseChannel, SourceRoot,
         SourceRootId, TargetKind, UniqueCrateData, UnnamedCrate,
     },
@@ -198,9 +198,29 @@ pub fn primary_crates(db: &Db) -> std::sync::Arc<[Crate]> {
 }
 
 /// Whether `krate` is of a primary package of the build ([`PrimaryCrates`]).
+///
+/// Read from the crate's own flag ([`Crate::given`], set with the list by
+/// [`set_primary_crates`]), never from the list: the list is one input for every crate, so a
+/// request that makes another crate primary would be a write every crate that asked had read.
 pub fn is_primary(db: &Db, krate: Crate) -> bool {
     !krate.data(db).origin.is_lang()
-        && PrimaryCrates::try_get(db).is_some_and(|it| it.crates(db).binary_search(&krate).is_ok())
+        && krate.given::<PrimaryFlag, bool>(db).copied().unwrap_or(false)
+}
+
+/// The kind of a crate's flag "of a primary package" ([`Crate::give`]).
+struct PrimaryFlag;
+
+/// Gives each crate whose membership differs between `was` and `now` (both sorted) its flag.
+fn flag_primary(db: &mut Db, was: &[Crate], now: &[Crate]) {
+    let moved: Vec<(Crate, bool)> = was // alloc: the crates that became or stopped being primary, at a request that moves them
+        .iter()
+        .filter(|it| now.binary_search(it).is_err())
+        .map(|&it| (it, false))
+        .chain(now.iter().filter(|it| was.binary_search(it).is_err()).map(|&it| (it, true)))
+        .collect();
+    for (krate, primary) in moved {
+        krate.give::<PrimaryFlag>(db, Given::new(primary), Durability::MEDIUM);
+    }
 }
 
 /// Has builds from here on take `crates` as those of the primary packages ([`PrimaryCrates`]).
@@ -226,6 +246,7 @@ pub fn set_primary_crates(db: &mut Db, mut crates: Vec<Crate>) {
             let moved = read
                 .iter()
                 .any(|it| was.binary_search(it).is_ok() != crates.binary_search(it).is_ok());
+            flag_primary(db, &was, &crates);
             primary.set_crates(db).to(crates);
             if moved {
                 db.note(maintain::Note::Crates);
@@ -233,6 +254,7 @@ pub fn set_primary_crates(db: &mut Db, mut crates: Vec<Crate>) {
         }
         None => {
             // MEDIUM: of the request, like the crate graph; set again only when it moves.
+            flag_primary(db, &[], &crates);
             PrimaryCrates::new(db, Durability::MEDIUM, crates);
             db.note(maintain::Note::Crates);
         }

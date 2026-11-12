@@ -868,6 +868,9 @@ impl Crate {
                     return false;
                 }
                 slot.set_value(db).with_durability(durability).to(value);
+                // The one case that is a write of `CrateSlot` to the engine: a kind's first
+                // gift below makes the input (no write) and writes the crate's `slots`.
+                count_given(std::any::type_name::<K>());
             }
             None => {
                 let slot = CrateSlot::new(&*db, durability, value);
@@ -888,6 +891,61 @@ impl Crate {
     /// opens that crate's group and no other.
     pub fn seal_group_of(self, db: &Db) -> Option<SealGroup> {
         db.crates_map().lock().seal.get(&self).copied()
+    }
+
+    /// The seal group of the source root this crate's root file is in (`Files::seal_root`):
+    /// the group the crate's own files are inputs of, which the crate's group opens with.
+    /// `None` when the root has none yet.
+    pub fn seal_root_group_of(self, db: &Db) -> Option<SealGroup> {
+        let root = db.file_source_root(self.data(db).root_file_id).source_root_id(db);
+        db.files().lock().seal_roots.get(&root).copied()
+    }
+}
+
+/// The most kinds of [`CrateSlot`] whose writes are counted by kind ([`take_given`]); a write
+/// of a kind past them is counted under [`GIVEN_MORE`], never dropped.
+const GIVEN_KINDS: usize = 32;
+
+/// The name [`take_given`] gives the writes of kinds past [`GIVEN_KINDS`].
+pub const GIVEN_MORE: &str = "(a kind past the 32 counted)";
+
+/// Writes of crate slots since the last [`take_given`], by kind: the kind's type name, set by
+/// its first write, and its writes. Process-wide, as the query engine's counts are.
+static GIVEN: [(std::sync::OnceLock<&'static str>, std::sync::atomic::AtomicU64); GIVEN_KINDS] =
+    [const { (std::sync::OnceLock::new(), std::sync::atomic::AtomicU64::new(0)) }; GIVEN_KINDS];
+static GIVEN_PAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One write of a slot of `kind`: a [`Crate::give`] that set a slot the crate already had,
+/// which is what the engine counts as a write of `CrateSlot` (making a slot is none). Every [`CrateSlot`] is one
+/// input to the query engine, whose count of writes is by input, so who wrote a slot (a
+/// plan's proc macros, a resolution blaze published) is told by its kind, counted here.
+fn count_given(kind: &'static str) {
+    use std::sync::atomic::Ordering;
+    // Bounded: `GIVEN_KINDS` entries.
+    for (name, count) in &GIVEN {
+        if *name.get_or_init(|| kind) == kind {
+            count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+    GIVEN_PAST.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Gives `each` every kind of crate slot written since the last take with its writes (the
+/// kind as `std::any::type_name` of [`Crate::give`]'s `K`), and counts from nothing again:
+/// what a build's account attributes its `CrateSlot` writes by (blaze-profile's `account`).
+pub fn take_given(mut each: impl FnMut(&'static str, u64)) {
+    use std::sync::atomic::Ordering;
+    for (name, count) in &GIVEN {
+        let Some(name) = name.get() else { break };
+        let writes = count.swap(0, Ordering::Relaxed);
+        if writes > 0 {
+            each(name, writes);
+        }
+    }
+    let past = GIVEN_PAST.swap(0, Ordering::Relaxed);
+    if past > 0 {
+        each(GIVEN_MORE, past);
     }
 }
 

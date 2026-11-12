@@ -309,6 +309,18 @@ pub(crate) enum Plant {
     /// ([`Storage::seal_input`]'s removal taken out): the rows that read it stay behind the
     /// old group's seal, which no write of the input reaches any more.
     InputMovesWithoutRemoval,
+    /// A group's check that unwinds (a write pending, a bound that ran out) leaves the group
+    /// held, as though it had ended and found nothing ([`super::seal`]'s `Checking` guard
+    /// taken out): the claim is not made again after the write, and the group's rows are
+    /// taken as unchanged with no import looked at.
+    ClaimKeptAcrossUnwind,
+    /// A task that finds a group being checked claims it too ([`super::seal::resolve`]'s
+    /// compare-and-swap from suspect taken out): two checks of one group run at once.
+    SecondClaimAdmitted,
+    /// A check that found its group unchanged stores "held" whatever the group's state is
+    /// by then (the compare-and-swap from the claimed state taken out): a seal a walk broke
+    /// while the check ran is put back.
+    CheckStoresHeldBlindly,
 }
 
 /// The storage's part of the changed set.

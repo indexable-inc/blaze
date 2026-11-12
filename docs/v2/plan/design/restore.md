@@ -396,6 +396,24 @@ every unserved crate cold again. As built:
   and `serve_written` in `UnitWriter::apply`), and again after the identities for a key the
   harness's roots moved. A unit that waits on a build script stays awaited, with everything
   above it, until the serve after that run.
+- *A unit is never built while a crate at or below its crate is awaited* (2026-11-12, lane
+  records-1112e; written, not compiled or run by it). The serve owns it: `unit/deps.rs`
+  `serve` takes the job's `Waits` and asks about the batch's units and every ready unit
+  whose crate is blocked (`deps::asked`), then checks that no ready unit is left blocked
+  (`deps::blocked_ready`: an error at the write naming the unit and the crate). No caller
+  lists the crates (`with_blocked_ready` in `unit.rs` is deleted). `UnitWriter::began` logs
+  a unit that begins blocked with whether `Waits` had it ready, and `Unmaintained` says
+  whether a maintainer's pass or a reader outside one read the crate. **The cause of the
+  smoke failure on 3a3fde543b is not known**: no trace was taken. Read from the code: only
+  `lower_writes` makes and awaits crates (`Lowered::ran` makes none, so the earlier lane's
+  reason was wrong), and a release takes everything below what it is asked about, so a ready
+  unit that was asked about cannot have an awaited crate below it; the failing units were
+  all workspace units (smoke-sys's build script; blaze-rng, blaze-reclaim, blaze-serde-derive
+  and six more). If it fails again the three messages above say which of these holds: the
+  scheduler began a unit `Waits` did not have ready, a unit read a crate not below its own,
+  or a maintainer's pass did. Checks: blaze-cargo
+  `serve::unit::tests::awaited::a_crate_awaited_under_a_ready_unit_is_released_by_the_next_serve_whatever_it_lists`
+  with `the_control_a_serve_of_only_the_units_listed_leaves_a_ready_unit_unmaintained`.
 - Checks: hir-def `deps::awaited::tests::a_crate_is_blocked_while_it_or_one_below_it_is_awaited`;
   blaze-lower `tests::awaited::a_crate_added_to_an_awaiting_front_end_is_not_resolved_until_it_is_asked_about`
   (4 and 40 library crates: no nameres or impls record and no item-tree row after lowering,
@@ -407,29 +425,78 @@ every unserved crate cold again. As built:
   from `served_delta` (next piece); a workspace test or program crate is resolved once before
   its harness root is appended and its root's group again after.
 
-**What is left, in order (for the next lane; nothing below is built).**
+**What is left, in order** (split 2026-11-12: 1's second half is lane records-impls', 4 is
+records-items', 5 and the end-to-end revision cases are records-restart's, bodies and MIR are
+records-bodies'; 2, 3, the many-crates count test, the refinement test under random edits and
+the double resolve of harnessed crates are records-1112d's, then records-1112e's, which
+built none of them: 3 (the image not pinned whole, the duplicate write of a module's names),
+the many-crates count test, the refinement test of def-map pages under random edits and the
+double resolve are all still to do, in that order. The record keys a pin and a pack export
+cover are one list now, storegc's `hir_def::deps::front_keys` / `filing_keys` and
+blaze-cargo's `serve::collect::front_keys`: a new record kind adds its key there).
 
-1. *Impl tables as records.* `hir_ty::method_resolution::frozen` already writes a crate's
-   `TraitImpls` and `InherentImpls` whole (`encode`), read whole (`FrozenImpls`, never set in
-   a build). Make it the pages discipline: one store value a crate beside the def-map pages
-   (key: `pages_key`'s inputs and this record's layout), a table by trait and by simplified
-   self type (open-addressed slots over the FNV-1a of the key's portable bytes, as
-   `pages::Modules::name`), each entry the impl ids of that key; written by `deps::store`
-   where pages are (`store_missing_pages`), handed over by `serve_asked` as one input a crate.
-   Then `frozen::served` is true for the crate, the impls maintainer passes over it
-   (`prepare`, `run_nodes` already do), `served_delta` gives it no delta, and
-   `TraitImpls::for_crate_and_trait` / `InherentImpls::in_crate_for_self_ty` read a key's
-   entry. The candidate names (`candidate_traits`) need the same table by name. Tests: round
-   trip against `TraitImpls::for_crate`, identical bytes from two databases, layout refused
-   by name, pages touched per lookup bounded at two sizes, `scope_memo` rows after a serve 0.
-2. *One input a crate* for what a crate is read from (pages, impls, image), replacing the
-   three maps `PagedDefMaps`, `FrozenDefMaps`, `DepImages` (sealgroups-1112 asked: the input
-   takes the crate's seal group, `seal_group(self, db, group)`; the provider shape is
-   `provide::<F>(storage, fn(&Db, Key) -> Provided<Value>)`, `scope_memo` and `tail` each
-   with one).
-3. *The image not pinned whole*: its def-map part is no longer read once a crate is paged;
-   write the image without that part and read lang items and signatures through
-   `Reader::part`; remove the second write of a module's names (scope segment and entries).
+1. *Impl tables as records.* First half written 2026-11-12 (records-1112c, not compiled or
+   run by it): a crate's `TraitImpls` and `InherentImpls` as `frozen::encode` writes them are
+   kept in the store beside its image (`frozen::key`: the image's filed key and the two
+   encodings; written by `frozen::store` from blaze-cargo's `deps::store`, pinned with the
+   image for the toolchain and bstd), and given to a database in the write of the serve
+   (`frozen::serve`, called by `unit/deps.rs` `images` in one batch with `serve_deps`). A
+   crate with tables is `frozen::served`: the impls maintainer gives it no state (`prepare`,
+   `run_nodes`; `drop_served` for one it held), name resolution hands no `served_delta` of it
+   (`nameres::delta::ImplsServed`, so no scope of it is decoded at the serve), and its readers
+   decode its table. The tables go with the image (`withdraw_unimaged`, an implied write
+   after hir-def's). Checks: hir-ty
+   `method_resolution::delta::tests::tables::a_crate_given_its_impl_tables_is_not_maintained_and_answers_as_the_one_that_made_them`
+   with `the_oracle_catches_tables_kept_past_their_image`; the codec's own are hir-ty-mir's
+   `tests::frozen`. **Second half, not built**: the table is still decoded whole a crate at
+   its first lookup (every impl id interned; an impl in a body lowers that body), and
+   `FrozenImpls` is one map of every crate, so a serve that changes it re-verifies every
+   reader. Make it the pages discipline: a table by trait and by simplified self type
+   (open-addressed slots over the FNV-1a of the key's portable bytes, as
+   `pages::Modules::name`), each entry the impl ids of that key, read through
+   `PageSource`; `TraitImpls::for_crate_and_trait` and `InherentImpls::in_crate_for_self_ty`
+   read one entry; the candidate names (`in_crate_trait_value_items`) the same by name.
+   Tests then: pages touched per lookup bounded at two sizes; round trip of an entry against
+   `TraitImpls::for_crate`; layout refused by name.
+2. *A slot a crate for what a crate is read from.* **Written 2026-11-12 (records-1112d, not
+   compiled or run by it).** Five maps of every crate (`PagedDefMaps`, `FrozenDefMaps`,
+   `FrozenLangItems`, `DepImages`, hir-ty's `FrozenImpls`) stay for what runs outside
+   queries (the serves, `withdraw`, `withdraw_unimaged`, `served_crates`); each map's `set`
+   first gives every crate whose entry moved its own entry, in that write
+   (`hir_def::deps::given::give_changed`, crates in order, `HIGH`; kinds `ImageSlot`,
+   `DefMapSlot`, `LangItemsSlot`, `PagesSlot`, `ImplTablesSlot`), and every read inside a
+   query is of the slot: `deps::image_of`, `frozen::frozen_def_map`, `frozen_lang_items`,
+   `pages::paged`, hir-ty `frozen::frozen`. The four maps a serve sets are still set in one
+   write. `Awaited` stays one set: a query reads it only on `Unmaintained`'s path, and
+   `any_awaited` stays one load. Checks: hir-def
+   `nameres::frozen::pages::tests::pages_given_to_one_crate_run_no_row_of_another` with
+   `the_oracle_catches_a_gift_to_every_crate`; to measure: none of the five names among the
+   durability census's blockers. Known cost, not measured: the first gift of a kind to a
+   crate writes the crate's list of slots, which every reader of any of its slots read (one
+   re-run of each firewall row, backdated). Not built: the providers
+   (`provide::<F>(storage, fn(&Db, Key) -> Provided<Value>)` for `scope_memo` and `tail`),
+   which wait for sealgroups' hook.
+   *The double resolve of harnessed crates, read 2026-11-12, not fixed*: the first resolve
+   is needed (`harness::write` lists a crate's tests from its resolution, after its macros
+   are loaded); the second is the root file's group, because the harness is text appended
+   to the root file (`Lowered::append_roots`). The fix is in the shape, not the order: the
+   appended module as a slot of the crate (`Crate::give`), which name resolution adds to
+   the root module as one module more (a delta of one module, `nameres::delta`), so the
+   root file's text and its group are not written. Its check: `nameres crate` spans of a
+   test crate after lowering, one, with the appended text in the root file as the control.
+3. *The image not pinned whole* (records-1112d's; read 2026-11-12, not built). What pins
+   it: `ImageStore::get` gives an `ImageBuf` (`Arc<dyn Held>`, `bytes()` the whole value;
+   blaze-cargo's `InPool::get` is `Reader::pinned`), and `Image`, `PartBytes::In`,
+   `ImageRef` and every signature read borrow slices of it. The port, whole: `Held` gains
+   `read(at, len, with)` beside nothing else (as `PageSource`), `Image` keeps its parts'
+   ranges and a source, `signatures` decodes an item from one bounded read, lang items from
+   one read of their part, `frozen::unreadable` at open reads the files table alone; then
+   the image is written without its def-map part for a crate whose pages were written
+   (`deps::store`), and the scope segment of the pages names its entries by offset in place
+   of writing each name again. Tests owed with it: bytes held only for the read (a
+   `Counting` source over an image: pages touched by one signature bounded at two sizes), a
+   previous image layout refused by name. Also owed: the count test over many crates with
+   records (blaze-cargo's store fixture has one registry crate).
 4. *b3*: with 1 to 3, a crate with records makes no syntax, item tree or expansion; what
    still parses is a body asked for (`nameres::demand`).
 5. *d*: `deps::key` takes each dependency's record content hash, not its key; the first no-op
@@ -440,12 +507,425 @@ every unserved crate cold again. As built:
 every name of every module, against the resolved crate) with its control
 `the_oracle_catches_a_name_left_out_of_its_table`; `the_same_pages_from_two_databases` with
 `the_pages_of_another_source_are_other_bytes`; `a_previous_or_foreign_layout_is_refused_by_name`;
+`a_crate_read_from_pages_answers_as_the_one_resolved_under_edits_above_it` (Hegel: random edits
+of the crate above) with `the_oracle_catches_a_name_left_out_under_edits`;
 `a_lookup_reads_a_bounded_number_of_pages` (40 and 4,000 items: at most six pages each) with
 `a_whole_scope_reads_more_pages_than_a_name`;
 `a_part_of_a_value_is_that_range_of_it_wherever_it_is_kept` with
 `a_part_of_a_compressed_value_is_of_the_value_made_whole`. To measure with the switch on and
 off: idle footprint on hello-world and the six-dependency fixture, the edit rows, and how many
 `scope_memo` rows ran against how many modules std has (how lazy a real build is).
+
+## Restart reads records (d) (2026-11-12, lanes records-restart, records-restart2; D21, D29)
+
+Step d of the memory table. **Nothing of this lane was compiled or run by it**; what is quoted
+as measured is lane reth-1112's (reth, 30 packages, int-1112 `d45e70ddc`, build 43 of its home:
+the first build after a restart with nothing changed), and everything else is read from the
+code and said so.
+
+### The restart today, step by step
+
+| Step | Where | What it costs on reth |
+|---|---|---|
+| 1. `daemon start` | `serve/daemon.rs`: read the state, restore the symbols, restore the VFS, open the database, restore the plane's history, install the library's trees | not in the build's numbers. The VFS's Merkle tree comes back whole (every file's and directory's content ID) and the watcher goes on from its saved cursor and stamps, so no file is read or hashed here. The front end's database is not persisted (constraint 2, below) |
+| 2. the request's plan | watches, `std library`, `plan` | not split out in what was sent |
+| 3. a new database | `Real::lower` (`serve/unit.rs`) with nothing kept: `blaze_lower::lower_awaiting`, `lower_writes` | read: `files::Mounts::walk` takes every file of every package directory of the plan from the tree with its bytes, and `base_db::Files::set_view_root` hashes every file's bytes again to check the ID the tree gave (`content::hash_many`) and writes each as an input. **The 36,408 inputs written are here, by reading**: a text input a file, each file's source root, each root's file set, each crate's inputs. Bounded by the files of the plan's packages, not by the plan. The split by input kind is asked of reth-1112 (`blaze explain writes build=43`) |
+| 4. the keys | `deps::serve` of the ready units: `Walked::keys`, `hir_def::deps::image_key` | a hash a crate over its inputs and (path, content ID) of each file of its source root. It needs content IDs, never text; it gets them from the inputs step 3 wrote |
+| 5. the serve | `serve_asked` | a crate with an image is decoded; one without is resolved. `key::eligible` refuses a local crate and every crate that depends on one, so **every workspace crate is resolved, expanded and item-treed from source at every restart** (read). Measured self CPU of build 43: `impls warm impl` 40.5 s, `nameres collect_expansion` 19.0, `parse_macro_expansion` 17.3, `nameres resolve_round` 16.2, `nameres crate` 14.5 (19,941 spans), `nameres update` 13.8, `impls apply_impls` 13.5, `macro_expand` 8.8, `nameres records` 8.5, `file_item_tree_query` 8.2. Which of the 19,941 are workspace crates is asked |
+| 6. harness roots, identities, then a batch of writes for each build script's run and proc macro's load | `harness::write`, `identify`, `UnitWriter::apply` (`ran`, `macros`, `serve_written` twice) | each is a write that opens a view, and each row read after it is proved again. 144,686,333 verified over 6,813,023 executed is 21 a row: by reading, the views the build opens times the rows later readers re-prove, with no seal held (seals are memory only, and no host seals in a real build yet). The count of views and `verified` by query are asked |
+| 7. each unit's record | found by a key that needs the unit's identity, which needs its crate resolved | 0 units made; every workspace crate was resolved to learn that |
+| 8. the walk | describes | `body_query` 55.3 s self CPU (215,072 spans): R7, not this lane's |
+| 9. what is lost | `noop::LastAnswer`, the seals | the next no-op is a build again |
+
+191.5 s, under a load of 45; `wait` spans sum to 91,235 s of wall and `impls warm impl` to
+86,214 s, so most of the wall time is workers waiting on the impls maintainer (not explained
+here). Memory, resident from `/proc` (not footprint, which was not read at these points):
+46.7 GiB before the stop, 19.0 GiB after the restart's build. So on reth the restarted daemon
+was smaller than the one stopped; the claim that a restarted daemon is larger is hello-world's
+(6,081 against 5,143 MB, above) and is not shown for reth.
+
+**Corrected by reth-1112's rows of build 43 (measured; this replaces what steps 3 and 6 of the
+table say "by reading" about the 36,408).** An input made is not counted as written
+(`query_counts.written` counts a set of a field after the input exists), so the files a new
+database is given are not in the number at all: `FileText` is 212 of it. The 36,408 by kind:
+`PathBucket` 15,119; `Crate` 7,602; `InherentSlice` 4,375; `ScopeInput` 2,793;
+`SourceRootInput` 2,266; `CandidateSlice` 1,061; `LibraryResolutions` 1,059; `TraitImplsSlice`
+905; `CrateResolution` 451; `SliceDirectory` 329; `FileText` 212; `Resolutions` 97;
+`ProcMacros` 54; `AllCrates` 34; `DepImages`, `FrozenDefMaps`, `FrozenLangItems` 13 each;
+`KeptConsts` 12. So they are sets made *again* during the build: path buckets and source roots
+as packages and `OUT_DIR` files are added, crate inputs as runs are applied (`Crate.cfg_options`
+of libc reran 10,444 memos, of object 9,899 and 9,898, of std 6,183), and the two maintainers
+publishing scopes and impl slices of the crates they resolved (827 distinct crates had a
+`nameres crate` span, 19,941 spans; reth's own crates 33 to 49 spans each, `reth_rpc_api`
+17.5 s). The rows verified most are expansion and item-tree rows: `parse_macro_expansion`
+18.3 M (753,647 run), `ast_id_map` 18.3 M (1,049,524), `macro_arg` 16.6 M (558,793),
+`file_item_tree_query` 11.4 M (419,450), `AttrFlags::query` 11.1 M, `Modules::name` 8.5 M,
+`ModuleScope::legacy_macro` 6.6 M, `Body::of` 5.7 M. `maintain` 2 spans (23.9 s wall),
+`maintainer reads` and `maintainer apply` 204 each; `lower workspace` 51.1 s wall, 5.9 s CPU.
+The number of views opened was not obtained. Builds 45 and 47, nothing changed, same daemon:
+3.7 and 2.6 s.
+
+What this changes in the design below: nothing in its pieces, but its reasons and its expected
+numbers. The cost of step 3 is real work (every file read and hashed twice, 51 s of wall in
+`lower workspace`) that the written count never showed, so A to D are judged by that span and
+by `PathBucket`/`SourceRootInput` sets (17,385 of the 36,408), not by `FileText`. The 827
+crates resolved are far more than reth's workspace: crates with no image at all (not eligible
+because a proc macro's library was not known when they were keyed, or above a local crate, or
+refused), which is asked of the profile before E is sized. The expected "about eight a crate"
+is a guess at sets, and creations are not counted: the bound to hold is that no `PathBucket`,
+`ScopeInput`, `InherentSlice`, `TraitImplsSlice`, `CandidateSlice` or `CrateResolution` is set
+for a crate found by its records.
+
+### The restart as it must be
+
+The rule: *a restart, a second checkout and a cold start with a filled store compute, for each
+crate, a key from the plan and from content IDs the VFS already holds; a crate whose records
+are found under it is read from them and nothing of it is read from disk, hashed, parsed,
+expanded or resolved; a crate whose records are not found is resolved from source, it alone.*
+
+**A. The file-hash index is the VFS's tree, which is already persisted and verified** (the
+image's tree section and the journal; a file's ID is the hash of its bytes, a directory's the
+hash of its entries; the watcher re-reads only a file whose stamp moved). No second index is
+built. Two things were missing and are this lane's: a directory's ID without its entries
+(`blaze_vfs::Pinned::dir_id`, `blaze_query::Tree::dir`), and not hashing again what the tree
+vouches for: `set_view_root`'s check of every file's bytes against its ID goes for a file the
+tree gave (the tree is the proof; a `MemTree` in a test keeps the check).
+
+**B. The plan key** (`blaze_lower::found`, new). A hash, by domain `blaze v2 found key 1`, of
+what the plan says of a crate: the fields `hir_def::deps::key::crate_inputs` hashes, written
+with its markers so no path of the machine is in it; of each directory its package loads, the
+directory's Merkle ID and, for each path under it the load skips (`target/`, a nested package,
+another crate's `OUT_DIR`), the path; the plan keys of its dependencies in the crate's order;
+the front end's code identity. It reads the plan and one tree node a directory. A package
+whose listing holds a symlink has no plan key (the refusal names the link): what a link reaches
+is not under the directory's ID, and such a package is lowered as today.
+
+**C. The found record** (`Kind::Query`, key `found_key(plan key)`, beside `deps::pages_key`;
+layout word first). It holds: the key the crate's image is filed under; the source root's
+manifest, each file's path under the package and its content ID, sorted by path; cutoff-1112's
+surface digest of the crate (`Lowered::surface_of`), which the plan key covers since it covers
+every file, the settings and each dependency's plan key. Written once a crate's image is
+(`store kept front end`); read by the lowering. A record under the key that does not read, or
+is of another layout, stops the lowering naming the crate and the layout. Two databases of the
+same sources write the same bytes: nothing in it is an ID of a database.
+
+**D. The decision** (`lower_writes`). For a package each of whose crates in the plan has a
+found record, the source root is *declared* from the manifest
+(`base_db::Files::declare_view_root`: a file ID a path, the content ID as the file's content,
+no text), the crates are made awaited as today, and the serve fetches each image by the filed
+key the record gave. A declared file's text is read from the tree by its content ID the first
+time something asks for it (a body: `nameres::demand`); a tree that no longer holds that ID is
+an error naming the file, never an empty text. For any other package: today's path.
+
+**E. Workspace crates have records.** `eligible`'s refusal of a local crate and of a crate
+above one goes: it kept the store from churning under edits and was never needed for
+correctness, since a key covers every file. In its place, two decisions the driver makes:
+
+- *When a local crate's image is written*: when it is quiet. That is when sealgroups' pass
+  seals it (the second build in a row with no write to its inputs), and at `blaze stop` and
+  at the idle give-back for every crate with no write since its last resolve, so a stop after
+  an hour of edits leaves records for all but what was being edited. `deps::store` takes the
+  crates to write (`write: &[Crate]`, sorted).
+- *When a local crate is served from its image*: only when it was found by its plan key at a
+  lowering (a restart, a new checkout). A crate resolved in this process is never swapped for
+  its image, so an edit loop never meets `withdraw_moved`'s pass over every crate for a crate
+  it is editing. A served local crate that is then edited is withdrawn once, in that edit.
+
+A dependency enters a crate's key as its surface digest (cutoff-1112; given to the database
+as a slot a crate, read by `image_key` as a tracked read), not as its key. So after a restart
+an edit of one crate's body resolves that crate and no other: its dependents' keys did not
+move. A signature edit moves the digest and the dependents that read it.
+
+**F. Units.** A unit's record key takes, for its front-end part, the image's filed key the
+found record gives, so a no-change restart finds every unit's record with no crate resolved.
+The form is content-keys-1112's; until it lands, `identify` resolves a unit's crate from its
+image, which the pages make cheap but not free.
+
+**G. Seals and the no-op answer.** A crate served from records by its plan key starts sealed:
+its seal's imports are its dependencies' records, named by their keys, which the plan key
+already covers, so the seal needs no stamp from the stopped process. The census (groups, rows
+behind seals) is then true from the first build. A kept no-op answer can be a record only with
+F3's condition (each watch it rested on vouched again at the start), which is durable state
+deciding a build: it lands with its simulation, in noopkeep's lane, not here.
+
+**Expected, to be replaced by the runner's numbers.** A restart with nothing changed writes
+inputs by crates and roots, not files: about eight a crate (data, extra data, cfg, env,
+workspace data, its root's file set, its awaited entry, its image slot), two a root, and the
+singletons. hello-world (27 crates): about 250, against about 5,000 today (5,087 was measured
+for a change of plan). reth: about nine a crate of its plan, independent of its 36,408; the
+crate count of its plan is not known to this lane. Name-resolution, expansion and item-tree
+queries run for a crate with a found record: 0. Units made: 0.
+
+### State (2026-11-12)
+
+Written, none of it compiled by this lane (lanes records-restart, then records-restart2):
+
+- `harness/v2/restart_rows.py` (the rows above for hello-world, the six-dependency fixture and
+  the smoke workspace); the revision harness's `max_ran`; the cases
+  `a_restart_with_nothing_changed_resolves_nothing`,
+  `a_restart_then_an_edit_in_one_crate_resolves_that_crate_only` and
+  `a_copied_store_in_a_new_home_resolves_nothing`, each bound that fails today listed as known
+  with this section as its cause. Their bounds (`max_written = 400`) are guesses until the
+  runner sends numbers.
+- *A, whole.* `blaze_query::Tree::dir(root, path) -> Option<ContentId>`, required, on its five
+  implementors (`blaze_vfs::Reader` by `Pinned::dir_id`, the node's own Merkle ID; `MemTree`
+  by a hash of the files under the path, `MEM_DIR_DOMAIN`; `Breaking`, `Backwards`;
+  `ProbeFiles`, which holds no IDs and reads to make one). Not done of A: `set_view_root`
+  still hashes every file again (it goes with D's `declare_view_root`).
+- *B, whole and called by nothing.* `blaze_lower::found` (`crates/blaze-lower/src/found.rs`):
+  `dir_key(mounts, dir, skipped)` and `plan_key(&Said)`, with `NoPlanKey` naming why a crate
+  has none. Two things differ from B as written above, on purpose. (1) A directory's key
+  leaves out what its load skips: a package directory holding `target/` or a nested package
+  would otherwise move its key with every build or every edit of the nested package; a
+  directory with nothing skipped under it is one tree node, any other is listed along the
+  paths to what is skipped (and to a mount below). (2) Symlinks: a link in a listed directory
+  refuses the key, but a directory taken whole by its ID is not listed, so the *writer* of a
+  found record must refuse a package whose walk followed a link (`files::Mounts::walk` does
+  not report that yet: a `followed` flag is the next writer's, with the record's write).
+- *C, the record whole, its write and read not written.* `hir_def::deps::found`
+  (`crates/hir-def/src/deps/found.rs`): `found_key(plan key)`, `Found { filed, families,
+  own_surface, files }`, `encode`/`decode`, `FoundError`. `families` (asked by records-items)
+  says which record families the writer put under the filed key (`family::IMAGE`,
+  `DEF_MAP_PAGES`, `IMPL_TABLES`, `ITEM_PAGES`), so an image older than a family is a miss of
+  that family. `own_surface` is cutoff-1112's 101 bytes (`Lowered::own_surface`, given back
+  by `Lowered::carry_own_surface`), not the folded digest, which dies with any change below
+  the crate. Not written: the put in `serve/work.rs` `store_kept` (one put beside the image;
+  noopkeep lists that file and wants the lines first; memgive too), which also queues the key
+  for the pins (packs-1112: `crate::serve::collect::keep(TOOLCHAIN | BSTD, [Key(found_key)])`
+  for std and bstd crates, at the write AND when a build finds the record), and the read.
+- *Beside E.* `hir_def::deps::why_not_eligible(db, krate) -> Option<Ineligible>` (`key.rs`):
+  the rule of `eligible` that refused a crate and the crate it was met at. Nothing reports it
+  yet; see "The 827" below. `PlanBase`: `key.rs`'s markers for a crate in no database.
+
+**A found record is a claim, not proof (decided while writing B; changes D and F).** A plan
+key is made before any build script's run is applied, so it cannot cover what a run gives a
+crate (cfgs, variables, `OUT_DIR` files). So: the serve still makes the crate's `image_key`
+from the database (content IDs only, which declared files have; no text) and asks the store
+by *that* key; the record's `filed` and `families` are used only where they agree with it. A
+record that names another key is a miss, never an error and never an image of other inputs.
+For the same reason a crate a run applies to, and every crate above one, takes no carried
+surface (cutoff-1112's rule), and F's "unit key from the filed key" holds only for crates
+with no run below them; for the others the unit key takes the `image_key` made after the run.
+
+**A simpler D to weigh before building it as written.** `Tree::file` already gives a file's
+content ID and a handle on its bytes without reading them (the tree's `Arc` or a range of
+the mapped image), and `Mounts::walk` reads no bytes itself: by reading the code, the cost of
+step 3 is `set_view_root` hashing every file again and making a text input of each. So
+`declare_view_root` (path -> content ID, text on first read) can be used for *every* package,
+found record or not, from today's walk: a crate with no record then reads only the files it
+parses, and the manifest in the found record is needed only to skip the listing (one node a
+package in place of one a directory). Not measured: which part of `lower workspace`'s 51.1 s
+wall (5.9 s CPU) is the walk and which the hashing; ask reth-1112 for the spans under it
+before choosing.
+
+**The 827 (reth-1112, build 43; not explained).** The profile holds no reason: `Stored.refused`
+is read by nothing, and reth-1112 has added an event at the push (on its branch). What it
+does hold: five serves asked 318 crates in all and served 291 to 299; so most of about 1,100
+crate instances were never asked, which is eligibility, not refusal. By reading, the
+candidates are `Ineligible::AboveLibraryNotKnown` (a crate above a proc macro whose library
+was not known when it was keyed: most of an ecosystem is above a derive) and `AboveLocal`.
+The next step is a count by `why_not_eligible(..).kind()` at the serve, as an event field.
+
+Not written: C's put and read; D (`Files::declare_view_root` in base-db `view.rs`, the
+decision in `lower_writes`, dropping `set_view_root`'s second hash); E's switch (the two
+`is_local` terms in `key.rs`, `deps::store(.., write: &[Crate])`, the quiet-crate and
+stop/idle writes); F; G; the simulation of a restart at every point of a build; the measured
+bounds; turning `BLAZE_DEF_MAP_PAGES` on. One more for E, by reading: `crate_inputs` hashes
+`proc_macro_cwd` through the package's markers only, and a member's is its workspace root, so
+a member's image key holds this machine's path until that is written as a marker too
+(`a_copied_store_in_a_new_home_resolves_nothing` will show it once members are eligible).
+
+What the next writer needs, agreed with the lanes named:
+
+- *D.* base-db `view.rs` has no owner: `Files::declare_view_root` is this lane's; a declared
+  root's files join the root's seal group as sealgroups' hunks in `files.rs`, `input.rs` and
+  `lib.rs` do for a set one (tell it the lines). In `lower_writes` the crate's fields are
+  made after its root file is looked up in its source root; for the decision they must be
+  made first (`found::Said` lists them), and a macro-host unit reads its root's text
+  (`crates::links_proc_macro`), one file, before its cfg is known. onefront and the records
+  lane holding blaze-lower's `lib.rs` are told the lines first.
+- *C's put, agreed.* Families: `hir_def::deps::Stored::families` (records-items; the same for
+  every crate of `Stored::written`), with `family::IMPL_TABLES` ORed in where hir-ty's
+  `frozen::store` put them. Pins (storegc): in `serve/unit/deps.rs` `store(...)`, chain
+  `blaze_cas::Key(found_key(plan))` into the pin block's `crate::serve::collect::keep(name, ..)`
+  call for each std/bstd crate, both for crates this build found by their record and those it
+  put one for; `front_keys` does not cover found keys (they are not made from the filed key),
+  so the writer owes a test that every found key put for a std/bstd crate is queued to its
+  pin, or a record written and not pinned is collected. A found record without its image, or
+  the reverse, is a miss either way. The serve's check of item pages asks the store, never
+  the record.
+- *E, the surface slot (cutoff-1112, 2026-11-12; written, not compiled).* `image_key` takes a
+  dependency by `given::surface` where one is given, else by its key (key domain 7); the
+  lowering gives every crate of the plan its surface (`Lowered::give_surfaces`) at the end of
+  each write that can move one, in that write's batch (`refresh`, a run applied, proc macros
+  loaded, a root appended) or right after it (`relower`), and the driver once after
+  `set_port`. The three questions, answered by reading: (1) a surface reads inputs and parses
+  alone, nothing a maintainer keeps, so it is worked out inside an open batch; (2) a registry
+  crate's narrowed identity is given unit by unit after the first serve, so the slot never
+  holds it: a library crate's slot is its whole identity always (`slot_of`), the same in the
+  build that keeps an image and the restart that looks for it. The price: a workspace crate
+  above a registry crate that calls a function where a constant is evaluated keeps its
+  positions in its slot, so a moved line in it moves the image keys above it (a body edit
+  that keeps its lines does not); closing it needs the kept narrowed identities read before
+  the first serve; (3) `Crate::give` writes the slot and notes nothing to the maintainers, so
+  an awaited crate given a surface is not resolved (the guard is blaze-lower's
+  `a_crate_added_to_an_awaiting_front_end_is_not_resolved_until_it_is_asked_about`). Tests:
+  hir-def `a_dependency_enters_the_key_above_it_by_its_surface_where_it_was_given_one` (its
+  first half is the control), blaze-lower
+  `every_crate_is_given_its_surface_and_what_no_front_end_reads_moves_none`. Known hole, older
+  than this: a file `include_str!` reads outside its crate's source root is in no surface.
+- *E.* records-1112d handed `hir-def/src/deps/key.rs` over and holds the writer to: `eligible`
+  and `image_key` drop `!data.origin.is_local()` and keep `libraries_known`;
+  `deps::store(db, served, images, write: &[Crate])` (callers: `serve/unit/deps.rs` `store`,
+  where storegc's pin block is, and seven in `deps/tests.rs`); the tests
+  `only_crates_outside_the_workspace_are_eligible` and `a_library_on_a_member_is_not_eligible`
+  assert the old rule and are rewritten with it; a local crate's slot (`deps::given`) is
+  written at `HIGH`, so it is written when the crate is found by its plan key, never per edit.
+- *The digest.* cutoff-1112's `Lowered::surface_of(krate) -> ContentId` (blaze-lower, written,
+  not compiled), not the image's content hash: an image does not hold a `macro_rules!` body or
+  a `const fn`'s body that a dependent reads on demand. hir-def cannot call blaze-lower, so
+  the lowering gives it to the database as a slot a crate before keys are asked, and
+  `crate_inputs` reads the slot of each dependency in place of its key; cutoff adds the call
+  once the setter is named. The found record may carry the digest because the plan key covers
+  the crate's files, settings, root spelling and every dependency's plan key.
+- *Keys told to storegc and packs*: `found_key`'s form (packs was told it is coming).
+
+## Items read in place (b3; 2026-11-12, lane records-items; D21, D29)
+
+**Written, not compiled or run by this lane**: the round's results decide, and no count here is
+this lane's measurement. Inert until `deps/serve.rs` gives a crate item pages (lines sent to
+records-1112d; behind the def-map pages' switch): until then the old path is the only path.
+
+**What forces a served crate's syntax** (read from the code). No reader of a served crate asks
+for an item tree: `file_item_tree_query` is called by name resolution's collection alone, which
+F2 no longer runs. What is left makes a whole `parse`, a `file_outline` (a copy of the parse)
+or a `parse_macro_expansion` (with `macro_expand` and `decl_macro_expander`, which parses the
+defining file):
+
+| | Queries | State |
+|---|---|---|
+| A | `ImplItems::of`, `TraitItems::query_with_diagnostics` (the impl's or trait's file, and each macro call at assoc position expanded) | from the record |
+| B | `AttrFlags::query` (`file_attr_flags`: the file's outline; a macro-written item: its expansion) | from the record |
+| B | `field_attr_flags`, `generic_params_attr_flags`; the 33 attribute value queries of `attrs.rs` (`link_name` .. `block_disabled_sanitizers`, `docs`, `cfgs`, `repr_assume_has`, `target_features`, ..); stability (`own_of_def`, `own_of_fields`, `default_body_of`, `deprecation_origin`, `stability_origin`) | not built: an entry kind each |
+| B | crate-wide walks (`crate_diagnostic_items`, `crate_notable_traits`, `UnstableFeatures::query`, `ImportMap::of`) | not built: one table a crate each |
+| C | `enum_has_unsafe_fields`, `written_self_view`, `extern_block_abi`, `get_constrained_lifetimes`, `written_visibility` under `assoc_visibility`, `ExternCrateId::alias_or_name`, macro names | not built |
+| C | `with_source_map`/`relative` of each signature | lowers again from syntax by design; whether only a diagnostic of that item reaches it is not checked (the callers are the dispatchers in `expr_store.rs`, `hir/generics.rs`, `lib.rs`) |
+| D | `decl_macro_expander` (the tokens of a `macro_rules!`/`macro` a dependent calls), the hygiene keys of `nameres/def_site.rs` (`macro_def_module`, `expanded_item_key`, `use_tree_key`, `module_item_key`, `expanded_*_context`) | not built: needs token trees and spans in the record |
+| D | `include_macro_invoc` (decoded every scope) | from the record: one list a crate |
+| E | an item's range or line (`method_resolution::may_hold`, `opaques.rs`, hir-ty-mir `location.rs`, hir-ty-codegen `places.rs`, `const_check/stability.rs`), blaze-items' `item_key` and macro token forms (`key.rs`, `form.rs`), lint levels (hir-lint-levels) | not built: positions as a segment of their own, read only by units that need them (form to agree with cutoff-1112); the item key and the resolved level set as entries |
+| F | bodies: `Body::of`, `body_syntax`, `block_item_tree_query`, `block_def_map`, `nameres::demand`, MIR's `parse_macro_expansion(..).err` | lane records-bodies |
+
+**The record** (`crates/hir-def/src/nameres/frozen/items.rs`): one store value a crate, with the
+def-map pages' discipline (`PageSource`, little-endian, offsets from the record's start, a
+layout or encoding of another blaze refused by name).
+
+| Segment | Holds | Read when |
+|---|---|---|
+| header (56 bytes) | layout, encoding, where the rest is | the crate's items are first asked for |
+| slots (16 bytes each, at most half full) | FNV-1a of an entry's key, where the entry is | an entry is looked up: a window of four |
+| files | the files the segments name, with their content IDs | with the header |
+| an entry | its key, then one query's answer of one item | that query is asked of that item |
+| includes | the crate's `include!` calls and the file each reads | `include_macro_invoc` |
+
+An entry's key is the query (`What`) and the item as `deps::signatures::key::Key` writes it
+(module index, container, ast id, a macro file as its call): no parse, no database id. Values
+are `nameres::frozen`'s encoding, a segment reading without any other. Entries are laid out in
+key order, so two databases write the same bytes. A lookup is one window of slots and one
+entry, at most six pages. A served item with no entry, or an entry that does not read, is
+`frozen::Unreadable` naming the crate and the item; nothing is lowered in its place. Each
+answer calls `report_stored_read`. The per-crate slot is `items::ItemPagesSlot` (`give_changed`);
+the store key is `items_key(image key)`: the image's filed key, the layout, the encoding and
+the item key's domain, under `Kind::Query`.
+
+**Written when** the crate is first resolved from source, in `deps::store`'s task of that
+crate, from the answers that database has (its parse is in memory; the assoc items of impls no
+build asked are collected there, after the answer). Never for a crate read from an image: one
+whose image and def-map pages are found without item pages is a miss in the serve
+(`deps/serve.rs`), resolved once and written with every family; `Stored::families` says which
+families a store wrote, for the found record (`deps::found::family`).
+
+**What cannot come from this record.** An item in a block (its module exists only once its
+body is lowered) and every body: for a body owner the record is to hold the body's key
+(`deps::body_key`) and its position as the file (owning crate and path) and the item's erased
+ast id, never a byte offset; records-bodies provides the body from that (agreed with the main
+agent; not yet written into the record). A proc macro's expansion of a dependent's own call
+is the dependent's.
+
+**Checks** (hir-def `nameres::frozen::items::tests`):
+`a_crate_read_from_item_pages_answers_as_the_one_lowered` (the refinement, every entry through
+its query) with `the_oracle_catches_an_assoc_item_left_out_of_its_entry`;
+`a_crate_read_from_item_pages_makes_no_syntax_tree_or_expansion` (no query named `parse*`,
+`*item_tree*`, `*macro_expand*`, `*outline*`, `*expander*` runs) with
+`without_item_pages_the_same_asks_parse_and_expand`; `the_same_item_pages_from_two_databases`
+with `the_item_pages_of_another_source_are_other_bytes`;
+`a_previous_or_foreign_item_layout_is_refused_by_name`;
+`an_items_lookup_reads_a_bounded_number_of_pages` (40 and 4,000 impls) with
+`every_impls_items_read_more_pages_than_one`. Not written: the refinement under random edits
+elsewhere, and a blaze-cargo test that a dependent's build of a crate with item pages runs
+none of those queries for it. The old path of the three ported queries is not deleted: it is
+still the path of workspace crates and of items in blocks.
+
+## Impl tables read in place (2026-11-12, lane records-impls; D21, D29)
+
+The second half of item 1 of "What is left" above. **Written, not compiled or run by this
+lane**: the round's results decide. No switch: the whole-decode record of the first half was
+never built or run, so it is replaced, not kept beside. A crate with an image and no tables in
+the store is maintained from its def map as before (`frozen::serve` gives it nothing).
+
+**The record** (`crates/hir-ty/src/method_resolution/frozen/pages.rs`, layout 1, key
+`frozen::key`: the image's filed key, the layout and the two encodings, `Kind::Query`): a
+header of 88 bytes, the files table, then a body of segments
+(`hir_def::nameres::frozen::segments`, new: `Writer`, `files`, `reader`, the generic half of
+the def-map pages' segment code) and four open-addressed tables of 16-byte slots, at most half
+full. Every place is from the body's start; nothing is fixed up.
+
+| Table | Key | Entry | Reader |
+|---|---|---|---|
+| rows | trait, simplified self type | the impls and built-in derives | `pages::row` |
+| traits | trait | its blanket impls; where its rows are (one run) and each one's length | `pages::blanket`, `pages::trait_into` |
+| inherent | simplified self type | the inherent impls | `pages::inherent` |
+| names | a name's text | each (name, trait, function or constant) of the crate's traits | `pages::value_items` |
+
+A slot's hash is of what the key is in every database: FNV-1a of the item's syntax id
+(`ErasedFileAstId`, its kind and name), of a simplified type's kind and number, of a name's
+text. It only finds the slot; the entry holds its key as the frozen encoding writes it, which
+the reader compares. A lookup reads one window of four slots and one entry. A key that is not
+there ends at an empty slot of its window: a definite "none" from one read, and a table with
+no key answers from the head. Every reader calls `report_stored_read`.
+
+**Readers** (all in `method_resolution.rs` unless said). Of one key, for a served crate:
+`TraitImpls::in_crate_and_deps_for_trait_and_self_ty` and `in_crate_for_trait_and_self_ty`
+(a row), `blanket_in_crate_and_deps` (a trait's entry), `InherentImpls::in_crate_for_self_ty`,
+`in_crate_trait_value_items`, `delta::read::impl_row_hash` and `blanket_hash`
+(`TraitImpls::served_row`, `served_blanket`). Of one trait: `for_crate_and_trait` (the trait's
+entry and its rows' run). Of everything, the whole table decoded: `TraitImpls::for_crate`,
+`InherentImpls::for_crate`, `trait_value_items` (which `encode` and `Mode::Verify` read).
+Not ported, each still a whole-table read of a served crate when it asks one:
+`where_const::bound_refusal` (`for_crate(..).blanket_impls`), `for_crate_and_deps` and what
+goes over it (`for_each_crate_and_block*`: the solver's arm for an unresolved type variable,
+diagnostics only; hir-ty-coherence's overlap walk), `InherentImpls::for_each_crate_and_block`
+(hir), hir-ty-pure and hir-ty-suspend's `InherentImpls::for_crate(..).for_self_ty`, hir's and
+blaze-diagnostics' `TraitImpls::for_crate`. `in_crate_for_trait` and `traits.rs`'s sealed
+check read one trait whole, which is what they ask.
+
+**The input** is the crate's slot (`ImplTablesSlot`, `Tables { pages, mode }`), given in
+`frozen::set`'s write; queries read only the slot.
+
+**Checks** (hir-ty `method_resolution::frozen::pages::tests`):
+`a_crate_read_from_impl_pages_answers_as_the_one_that_found_its_impls` with
+`the_oracle_catches_rows_written_with_no_slot`;
+`a_crate_read_from_impl_pages_answers_alike_under_edits_elsewhere`;
+`the_same_impl_pages_from_two_databases` with `the_impl_pages_of_another_source_are_other_bytes`;
+`a_previous_or_foreign_impl_page_layout_is_refused_by_name`;
+`an_impl_lookup_reads_a_bounded_number_of_pages` (40 and 4,000: at most six pages) with
+`a_whole_impl_table_reads_more_pages_than_a_row` and
+`the_oracle_catches_an_absent_row_found_by_a_scan`. Still passing: hir-ty-mir `tests::frozen`
+(Check and Verify over the pages), hir-ty `delta::tests::tables`.
+
+**Not done.** An in-place edit of a crate read from pages under random edits (one in-place
+edit is `delta::tests::tables`'s); the `seal_group_whole` test that each reader's row is
+marked stored; the readers listed above; the head reads the record's whole files table, which
+checks the content of every file the crate's impls are in (one read a crate, not a lookup).
 
 ## A second kind of target, and where a restart's time goes (2026-11-11, lane share-front-1111)
 
@@ -775,16 +1255,16 @@ toolchain's, a registry or git package, a path dependency, a workspace member):
    its front end, never a clock.
 2. *Keyed by content.* Its key is `hir_def::deps::keys`' (source root file contents by path
    under the package, crate inputs, the front end's code identity; no absolute path), with
-   one change still to make: each dependency enters as the content hash of its *interface
-   record*, not as its key (content-keys-1112's rule for units: dependencies by interface
-   digest). One key rule, one store (`blaze_cas`), the same key for a unit record's front-end
+   one change still to make: each dependency enters as the parts of it this crate read, by
+   value (cutoff-1112's rule, store.md, "Early cutoff between crates": per item,
+   position-free), not as its key. One key rule, one store (`blaze_cas`), the same key for a unit record's front-end
    part.
 3. *Recorded.* Its records are in the store under that key: the interface (def map, lang
    items, signatures: today's image parts; impls by self type and trait are to be added), and
    by body key its bodies, inference and MIR (the item store).
 
-A sealed crate is, to the engine, one leaf: an input `Seal(crate)` whose value is the content
-hash of its interface record. **What a dependent's front end gets** is that interface record
+A sealed crate is, to the engine, one seal group (below): its rows are proved by one check of
+what they read from outside the crate. **What a dependent's front end gets** is that interface record
 read in place (names to items, signatures, impls), and bodies by body key when it asks
 (generic and `#[inline]` functions, constants): a read of a body is a read of that body's
 record, so a body edit below reaches the dependents that read that body and no other.
@@ -793,9 +1273,10 @@ record, so a body edit below reaches the dependents that read that body and no o
 the crate from the input (file to source root to crates: `base_db::source_root_crates`; a
 crate's own fields name it), with no walk of rows, as `hir_def::deps::withdraw_moved` does
 today for a served crate's image. Only that crate is unsealed. Its dependents stay sealed
-while its interface record's hash is the same after the edit (a body edit), and are unsealed
-by the write of `Seal(crate)` when it is not (a signature edit): that write is the host's,
-after the edited crate's interface is made again, before any dependent is asked.
+while the parts of it they read are unchanged after the edit (a body edit), and the seal of
+each dependent that read a changed part breaks (a signature edit): found by that dependent's
+one check, of the stamps of the rows it read, the first time a row of it is asked or by the
+walk. The same set is cutoff-1112's parts, there by value (`Storage::seal_group_imports`).
 
 **What an unseal costs** (the first edit of a crate, with a person waiting): the edited file
 is parsed; the crate's def map is decoded from its interface record (hello-world's `core`,
@@ -972,3 +1453,146 @@ build, and each again: after its first occurrence a request makes no unit and ru
 (`BLAZE_FRONT_END_PER_PLAN=1` puts `unkept`'s units test back; its miss is listed as known, so
 it fails when the bound stops resting on this); and `harness/v2/goal_switch.py`, the owner's
 sequence timed, each `test` held to having run.
+
+## Bodies, inference and MIR as records (2026-11-12, lane records-bodies; D21, D29)
+
+**Written, not compiled or run by this lane**: the round's results decide; nothing below is a
+measurement of this lane's.
+
+**What was stored a function, read from the code.** Two stores hold per-function results:
+
+| Store | Key | Holds | How it is read |
+|---|---|---|---|
+| `hir_ty::check_cache` (a value a dependency crate) | the crate's image key and the borrow checker's mode | each body by `body_key`: its `InferenceResult` and whether its borrow check passed | the whole part pinned for the session (`ServedBodies`); the crate's whole item table decoded at the first body (`served_items`); a body by binary search of the key column |
+| the item store (`hir_ty::body_store`, any crate) | `BodyFacts::identity`, the step, the schema, the solver version, then the values of the facts the step read | a body's inference, its BUILT MIR (an answer a MIR owner: body, closure, coroutine, by-move, an anonymous constant of the body), a passing borrow check | a shape and an answer a step, decoded into the query's memo |
+
+Stored by neither: runtime MIR, optimized MIR (`mir::persist` refuses inlined tables),
+promoted bodies, coroutine witnesses, held locals, the lowered body.
+
+**What goes after a unit stores** (`release.rs` to `hir::evict::drop_crates_after_store`): the
+crates' inference, and with `mir` every value tagged `Mir` of every crate (built, runtime,
+optimized, monomorphized, promoted, `location_literals`, witnesses) and every constant's value.
+
+**What a dependent's codegen then made again, a dependency body.** `instance_body` asks
+`db.mir(owner, MirStage::compiled(owner, options))`: the optimized body (when the options ask)
+from the runtime body (`run_passes` again) from the built body, which asks the item store.
+Three reads made even a hit cost a lowering:
+
+1. the item store's key is made from the lowered body (`identity_parts`: `Body::of`,
+   `names_of`, `Body::has_lowering_errors`), so `body_query` ran before the store was asked;
+2. decoding a stored MIR called `locations()`, so `location_literals`, so `Body::of`, and
+   `persist::read` took its bounds from the body's store;
+3. `check_cache::served_inference` called `Body::of` for `Nodes::of` before it decoded.
+
+On a miss: `build`, so `InferenceResult::of` (let go: decoded or inferred again), so the
+lowering. Each of the three stages is then a global-heap memo until the next `drop_mir`.
+
+**Built in this piece.**
+
+- *A crate's runtime MIR is one value read an entry at a time*
+  (`hir_ty::check_cache::{pages, runtime}`). Granularity: a crate, with a table by function
+  key, not a record a function by its code identity: that identity is made from the lowered
+  body, so asking for such a record costs the `body_query` it exists to avoid; a crate with
+  records is one no edit reaches, so the crate's key is exact there, and it is one key for
+  pins and exports. The item store stays the form for a crate being edited (rule 52).
+  - The container (`pages.rs`): header, buckets of four slots, entries. A key is 32 bytes of
+    a content hash; two of its words choose two buckets, a third is its tag; the writer puts
+    an entry in the emptier bucket in key order and doubles the buckets until all fit. A
+    lookup reads at most two buckets (64 bytes each) and the entry: bounded for any crate.
+  - An entry (`runtime.rs`) is one MIR owner at `MirStage::Runtime` (what `MirStage::compiled`
+    gives for options that ask nothing more, and what every optimized body is made from; no
+    `MirOptions` in the key). Its key: the owning item's `body_key` and which owner of the
+    body (tag, anonymous constant, expression, closure kind). Its bytes: `mir::persist`'s
+    words in a relocating scope, its ids, the items they name as a portable table of its own
+    (a reader decodes one body's items, never the crate's), and the counts of the body's
+    store, so `persist::read_in` bounds the spans without the store.
+  - The value's key (`runtime::key`, `Kind::Query`): the crate's image key as filed (sources
+    with the crate attributes that change MIR, cfg, features, env, target, toolchain, every
+    dependency's key, the front end's code identity), the entries' schema (the MIR words'
+    version, the type table's, the ids', `frozen::ENCODING`, the key domains) and the
+    container's layout. The runtime passes read types, layouts and drop glue of the crate
+    and what it loads, all under the image key. Not in it: lint levels, paths, options.
+  - Written from the lowering task's value: the runtime queries note each library owner they
+    build (`runtime::made`, when the database records: `runtime::record`); `runtime::encode`
+    asks each noted owner's entry, a memo of its bytes the engine keeps true (an owner whose
+    inputs moved is made again there, never written as it was).
+  - Read in `providers::compute` before anything is built (`runtime::served`): a crate given
+    its value (`runtime::serve`, a slot of the crate, `Crate::give`) answers an owner the
+    value holds from its entry and reports a stored read; the built body, the inference and
+    the lowered body of that owner are never made. Off until a driver gives a value: no
+    caller of `serve` exists yet, and with none the old path is the only path.
+  - A body that calls a location macro, or has no word in the codec, has no entry
+    (`runtime::Left`) and is built by the reader as before.
+- *A served inference lowers no body*: the bodies part keeps each body's node counts
+  (`BodyRoot` 2), and `served_inference` bounds the record by them.
+
+**Spans.** A `MirSpan` is an `ExprId`, `PatId` or `BindingId` of the body's store, never a
+position, so an entry does not change when a line is added elsewhere in its file. What is
+missing is a span's position without lowering the body (`hir-ty-codegen/places.rs` reads
+`Body::relative`): proposed to cutoff-1112 and records-items as a segment of its own a body
+(the body's key and position, and the range of each node relative to the body's start), not
+positions inside MIR. A location literal is already a hole in the words (slot 5: the
+literal's expression and its type); filling it from that segment and the build's name of the
+file, as named inputs, is what lets a located body have an entry.
+
+**What is left, in order.**
+
+1. *The driver's calls* (other lanes' files; lines sent): `record` once a front end;
+   `encode` and a put under `runtime::key(image key)` where the bodies part is stored
+   (blaze-diagnostics `cache.rs`, `deps::store`); `serve` with a `PageSource` over
+   `blaze_cas::Reader::part` in `unit/deps.rs` `images`, in the serve's batch; the key form to
+   storegc and packs; a telemetry row for the slot. Then the switch is the value's presence.
+2. *Per entry: promoted bodies and the held-locals fact.* `promoted_mir_body_query` reads the
+   built body, so a served owner with promoteds still lowers it; a coroutine's layout
+   (`layout.rs`) reads `held_locals_in` of the monomorphized runtime body. The fact (the held
+   locals, the yields, the conflicts, each held local's generic type) is of the generic body
+   only when monomorphization changes no block (monowalk-1112: `comptime::expand` and
+   `fold_if_const` add and remove blocks for `for const` and `if const` bodies): such a
+   coroutine keeps the monomorphized read, the rest read the fact and substitute through
+   `monomorphized_ty`.
+3. *The bodies part in the same container*, then the old part deleted: an entry a body
+   (inference, verdict, counts) with its own items table, so nothing is pinned for the
+   session, no crate-wide item table is decoded and a lookup is two buckets.
+4. *The item store's key before lowering* (the crate being edited): the lookup's base key
+   from the item's source content hash (records-items' body key and content) and the facts'
+   values, with the body-derived identity kept in the answer and compared after a hit, so an
+   unchanged function in an edited file is a hit with no `body_query`. `identity_parts` is
+   blaze-item-hash's; its "hir", "entries" and "names" parts are the ones made from the body.
+   With it, the answer keeps the store's counts and a located bit as an entry does.
+5. *`MirBody` in the asking task's frame.* `MirBody` is a heap tree: `Arena<BasicBlock>`,
+   `Arena<Local>`, `Vec` and `Box<[..]>` in statements, operands, switch targets and the
+   side tables, `ArenaMap`s, `SmallVec` projections. Decoding into a frame means
+   `MirBody<'db, A: Allocator>` with every nested owner over `A`. What the port touches: the
+   types in `hir-ty/src/mir.rs`; `mir/persist.rs` (`Decode` takes the frame); every pass in
+   `hir-ty-mir/src/mir/{lower,transform,optimize,early_drop,handles}` that builds or edits a
+   body; `monomorphization.rs` (it clones); the 28 MIR queries of `providers.rs` (a frame
+   value cannot be a memo: `mir_at` hands a task-scoped body, as `dispatch::body_once` does
+   for instances); and each reader that holds `&'db MirBody` past its task. Mechanical once
+   the type has the parameter (`blaze check --replace`), but one whole port (rule 24). Until
+   then a served runtime body is still a `Mir` memo between `drop_mir`s: read again from its
+   entry, never lowered again.
+6. *Optimized bodies of a library crate* are made from the served runtime body each time
+   they are asked after a `drop_mir`: an entry a `MirOptions` needs the inlined tables in the
+   codec and the callee bodies under the key (the image key covers them for a library).
+
+**Checks** (none run yet). hir-ty `check_cache::pages::tests`:
+`every_entry_written_is_found_with_its_bytes_and_no_other_key_is` with
+`the_oracle_catches_an_entry_left_out_of_its_bucket`;
+`the_same_entries_in_any_order_are_the_same_bytes`;
+`a_lookup_reads_a_bounded_number_of_pages` (40 and 40,000 entries) with
+`reading_every_entry_reads_more_pages_than_one`;
+`a_previous_or_foreign_layout_is_refused_by_name`; `two_entries_of_one_key_are_refused`.
+hir-ty `check_cache::tests`: `a_record_keeps_the_node_counts_of_its_bodys_store` with
+`the_oracle_catches_node_counts_that_are_not_the_bodys`. hir-ty-mir
+`tests::check_cache::runtime`:
+`a_runtime_entry_reads_in_another_database_as_the_body_built_there` with
+`the_oracle_catches_an_entry_of_another_owner`; `the_same_runtime_value_from_two_databases`
+with `the_runtime_value_of_another_source_is_other_bytes`;
+`a_crate_read_from_its_value_builds_no_body_it_holds` (one MIR value an owner asked, no built
+body) with `the_control_a_crate_with_no_value_builds_every_body`;
+`a_served_runtime_body_is_the_one_built_from_source`;
+`an_entry_that_does_not_read_is_a_panic_naming_the_crate`;
+`a_runtime_value_of_another_layout_is_refused_by_name`. Not written: the refinement under
+random edits elsewhere (it needs the driver's serve and withdraw), and the count on a real
+build (`query_counts` of `Body::of`, `infer_body_query`, `mir_body_query` for a dependent of a
+served crate: 0 for the owners the value holds).

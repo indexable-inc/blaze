@@ -58,7 +58,9 @@ pub use provenance::{
     Cause, LOG_MOST, Logged, LoggedRun, Outcome, Provenance, RowNamer, SAMPLE_EVERY, SAMPLED_MOST,
     Taken, log_runs, name_rows, take_log_in,
 };
-pub use seal::{SealCensus, SealGroup, SealGroupCensus, SealKind, SealPass, SealState};
+pub use seal::{
+    SealCensus, SealGroup, SealGroupCensus, SealKind, SealNotWhole, SealPass, SealState,
+};
 pub use slot::{Filled, Slot, SlotClaim, SlotError, SlotName, SlotRefused};
 pub use storage::{Database, Durability, Hook, Storage, Unread, View};
 pub use value::Value;
@@ -818,6 +820,21 @@ pub struct Untracked {
     /// What was read and why it can't be a tracked read (`"the absence of the
     /// `SourceNames` singleton"`).
     pub what: &'static str,
+}
+
+/// The running query's value was answered from a store by a key that stands for reads the
+/// run did not make (a record of an earlier process, found by content): the row is marked
+/// (`row::STORED`). Nothing about when it runs again changes: the key's inputs are inputs
+/// here, which the run read. What changes is what a list of the row's reads may be taken
+/// for: [`Storage::seal_group_whole`] says such a group's imports are not every part its
+/// rows' values rest on. With no running query it does nothing.
+pub fn report_stored_read<D: Database>(db: &D) {
+    let storage = db.storage();
+    local::with(|local| {
+        if let Some(frame) = local.recording(storage) {
+            frame.stored = true;
+        }
+    });
 }
 
 /// The running query made the read `why` names, which the engine can't see: it runs again in

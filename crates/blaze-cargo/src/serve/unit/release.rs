@@ -99,6 +99,24 @@ use blaze_query::db::{Database as _, MemoryUsage};
 #[cfg(test)]
 mod tests;
 
+/// Has every reader of `lowered`'s database unwind at its next query call
+/// (`blaze_query::db::Storage::stop_readers`): each task under way gives way
+/// (`super::cancellable`) and is posted again once the writer applied its release
+/// ([`resume_readers`]). The last thing given back for memory before a task fails
+/// (`blaze_graph::giveback::Rung::Running`); what the tasks had done is done again.
+pub(crate) fn stop_readers(lowered: &Lowered) {
+    lowered.db().storage().stop_readers();
+}
+
+/// Clears [`stop_readers`]' stop, with the front end exclusive: no reader is left, so the
+/// stop did its work, and the tasks posted next read on. Nothing where none was made.
+pub(crate) fn resume_readers(lowered: &mut Lowered) {
+    let db = lowered.served_db();
+    if db.storage().readers_stopped() {
+        db.storage_mut().resume_readers();
+    }
+}
+
 /// What codegen's tasks left on the global heap and nobody freed: with no codegen task
 /// running, that is what codegen keeps between builds, its kept walks first
 /// ([`hir_ty_codegen::v2::let_go_kept_walks`]: 13 GiB of a cold build of blaze). An estimate

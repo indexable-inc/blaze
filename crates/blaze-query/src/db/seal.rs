@@ -96,7 +96,7 @@ use super::{
     function::Verified,
     ingredient,
     reverse::Seen,
-    row::{DURABILITY, PROVISIONAL, RUNNING, UNTRACKED, VIEW_MASK, span},
+    row::{DURABILITY, PROVISIONAL, RUNNING, STORED, UNTRACKED, VIEW_MASK, span},
     storage::{
         FIELD, LOOSE, NODES, NodeRow, Restamp, Storage, Summary, input_bits, key_parts, loose, or,
     },
@@ -612,6 +612,29 @@ pub struct SealPass {
     pub shed: Option<(u64, u64)>,
 }
 
+/// Why a group's imports are not every part its rows' values rest on
+/// ([`Storage::seal_group_whole`]): how many of its rows are each.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SealNotWhole {
+    /// Rows whose last run was answered from a store by a key.
+    pub stored: u64,
+    /// Rows emptied and not made again.
+    pub emptied: u64,
+    /// Rows whose last run made an untracked read.
+    pub untracked: u64,
+}
+
+impl std::fmt::Display for SealNotWhole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} rows answered from a store by a key, {} rows emptied and not made again, {} \
+             rows with an untracked read",
+            self.stored, self.emptied, self.untracked
+        )
+    }
+}
+
 /// One group in a [`SealCensus`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SealGroupCensus {
@@ -1064,12 +1087,7 @@ impl Storage {
         // every summary holds what its row reads now.
         self.fold_reverse();
         self.complete_summaries();
-        while let Some(node) = self.seals.moved.pop() {
-            let group = (self.seals.word(node) & GROUP) as usize;
-            if group != 0 {
-                self.seals.groups[group].pending.push(node); // alloc: a word a row not behind a seal
-            }
-        }
+        self.seal_list_moved();
         let view = self.view_bits();
         // The groups this pass seals (open, quiet) or adds to (held, with rows outside).
         let mut chosen: Vec<(u16, bool)> = Vec::new(); // alloc: the pass's list, a word a group
@@ -1231,6 +1249,114 @@ impl Storage {
         pass
     }
 
+    /// Lists each row whose group changed as a run ended under its group, for a pass or a
+    /// read of the group's rows.
+    fn seal_list_moved(&mut self) {
+        while let Some(node) = self.seals.moved.pop() {
+            let group = (self.seals.word(node) & GROUP) as usize;
+            if group != 0 {
+                self.seals.groups[group].pending.push(node); // alloc: a word a row not behind a seal
+            }
+        }
+    }
+
+    /// What the rows of `group` read from outside it: every row and input field that a row
+    /// of the group read and that is not of the group, each once, in node order. For a host
+    /// that keys what it made of one crate by the parts of other crates it read (a unit's
+    /// record): the same set the group's seal is checked against, by value where the seal
+    /// goes by stamp. Works for a group that is open (a crate just made) as for a sealed one.
+    ///
+    /// A row is of a group by what it read, so a row keyed in this crate that read only a
+    /// dependency's things is not of this group: it is named here when a row of the group
+    /// read it. Reads made for the crate outside any query are no row's edges and are not
+    /// here.
+    ///
+    /// Cost: the group's rows and their edges, no other group's. With `&mut`: no run is in
+    /// flight, so the rows' edges are whole.
+    pub fn seal_group_imports(&mut self, group: SealGroup) -> Vec<super::Read> {
+        self.seal_group_imports_beyond(group, &[])
+    }
+
+    /// [`Storage::seal_group_imports`] without what is of the groups `own` either: for a
+    /// crate whose own inputs are in more groups than its own (its source root's, which its
+    /// group opens with), so what is left is other crates' alone.
+    pub fn seal_group_imports_beyond(
+        &mut self,
+        group: SealGroup,
+        own: &[SealGroup],
+    ) -> Vec<super::Read> {
+        let at = self.seal_number(group);
+        self.seal_list_moved();
+        let own_group = at as u32;
+        let outside = |word: u32| {
+            let of = word & GROUP;
+            of != own_group && !own.iter().any(|it| u32::from(it.0) == of)
+        };
+        let own = own_group;
+        let seals = &self.seals;
+        let mut nodes: Vec<u32> = Vec::new(); // alloc: the caller's answer, the group's imports
+        let of = &seals.groups[at];
+        for &node in of.members.iter().chain(&of.pending) {
+            if seals.word(node) & GROUP != own {
+                continue;
+            }
+            let Some((header, _, _)) = frontier::row_of(self, node) else { continue };
+            let read = header.edges.load(Ordering::Relaxed);
+            let (start, len) = (span::start(read), span::len(read));
+            for edge in start..start + len {
+                let read = self.edge(edge);
+                if outside(seals.word(read)) {
+                    nodes.push(read); // alloc: as above
+                }
+            }
+        }
+        nodes.sort_unstable();
+        nodes.dedup();
+        // alloc: the caller's answer
+        nodes.into_iter().map(|node| super::capture::read_of_key(self.key_of(node))).collect()
+    }
+
+    /// Whether [`Storage::seal_group_imports`] of `group` names every part its rows' values
+    /// rest on: every row of the group ran in this storage, by its own reads. `Err` says the
+    /// first reason it does not, with how many rows it is true of: a row answered from a store
+    /// by a key ([`super::report_stored_read`]), a row emptied and not made again (its run or
+    /// its cycle unwound: no edges), a row whose last run made an untracked read.
+    ///
+    /// A row that made an untracked read, or a cycle's, is of no group in the first place:
+    /// it is named among the imports of the group whose row read it, as a row of no group,
+    /// which its reader maps to a part or refuses.
+    ///
+    /// Cost: the group's rows, a header each. With `&mut`, as the imports are read.
+    pub fn seal_group_whole(&mut self, group: SealGroup) -> Result<(), SealNotWhole> {
+        let at = self.seal_number(group);
+        self.seal_list_moved();
+        let own = at as u32;
+        let seals = &self.seals;
+        let of = &seals.groups[at];
+        let (mut stored, mut emptied, mut untracked) = (0u64, 0u64, 0u64);
+        for &node in of.members.iter().chain(&of.pending) {
+            if seals.word(node) & GROUP != own {
+                continue;
+            }
+            let Some((header, _, _)) = frontier::row_of(self, node) else {
+                emptied += 1;
+                continue;
+            };
+            let meta = header.meta.load(Ordering::Relaxed);
+            if header.verified.load(Ordering::Relaxed) & VIEW_MASK == 0 {
+                emptied += 1;
+            } else if meta & UNTRACKED != 0 {
+                untracked += 1;
+            } else if meta & STORED != 0 {
+                stored += 1;
+            }
+        }
+        if stored + emptied + untracked == 0 {
+            return Ok(());
+        }
+        Err(SealNotWhole { stored, emptied, untracked })
+    }
+
     /// The rows by seal group and state ([`SealCensus`]): a walk of every node, so it runs
     /// only when asked. Exact with no run in flight.
     pub fn seal_census(&self) -> SealCensus {
@@ -1279,21 +1405,44 @@ impl Storage {
 
 /// Puts a group being checked back to suspect when its check unwinds (a write pending, a
 /// bound that ran out): the next asker checks it again.
+///
+/// The invariant: a group is held only by a check that ran to its end and found every import
+/// unchanged. A claim is a state of its own (`CHECKING`), which proves nothing to anyone; a
+/// check that does not end gives the claim back, and one whose claim a walk took away
+/// (`CHECKING` to `BROKEN`) cannot put `HELD` over it (its last step is a compare-and-swap
+/// from `CHECKING`).
 struct Checking<'a> {
     state: &'a AtomicU8,
     done: bool,
+    /// [`Plant::ClaimKeptAcrossUnwind`].
+    kept: bool,
 }
 
 impl Drop for Checking<'_> {
     fn drop(&mut self) {
         if !self.done {
-            _ = self.state.compare_exchange(
-                CHECKING,
-                SUSPECT,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            let to = if self.kept { HELD } else { SUSPECT };
+            _ = self.state.compare_exchange(CHECKING, to, Ordering::AcqRel, Ordering::Acquire);
         }
+    }
+}
+
+/// What a test sets on its own thread to interleave a check with what another task or a
+/// writer does, at a point no query's body reaches.
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        /// How many of this thread's next claims of a group unwind right after the claim, as
+        /// a check does when a write is pending ([`super::Cancelled::PendingWrite`]).
+        pub(crate) static UNWIND_CLAIMS: Cell<u32> = const { Cell::new(0) };
+        /// Called by this thread with the group it just claimed, before its check: where a
+        /// preempted checker is while another task meets the claim.
+        pub(crate) static AFTER_CLAIM: Cell<Option<fn(u16)>> = const { Cell::new(None) };
+        /// Called by this thread with the group whose check just ended, before the result
+        /// is stored: where a preempted checker is while a walk takes its claim away.
+        pub(crate) static BEFORE_RESULT: Cell<Option<fn(u16)>> = const { Cell::new(None) };
     }
 }
 
@@ -1307,14 +1456,28 @@ impl Drop for Checking<'_> {
 pub(crate) fn resolve(db: *const (), storage: &Storage, group: u16, apart: Option<&Seen>) -> bool {
     let seals = &storage.seals;
     let of = &seals.groups[group as usize];
-    if of
-        .state
-        .compare_exchange(SUSPECT, CHECKING, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
+    if let Err(now) =
+        of.state.compare_exchange(SUSPECT, CHECKING, Ordering::AcqRel, Ordering::Acquire)
     {
-        return of.state.load(Ordering::Acquire) == HELD;
+        // Another task's claim is not this one's: one check a group at a time.
+        if !(now == CHECKING && storage.frontier.plant == Plant::SecondClaimAdmitted) {
+            return now == HELD;
+        }
     }
-    let mut claim = Checking { state: &of.state, done: false };
+    let kept = storage.frontier.plant == Plant::ClaimKeptAcrossUnwind;
+    let mut claim = Checking { state: &of.state, done: false, kept };
+    #[cfg(test)]
+    if probe::UNWIND_CLAIMS.with(|left| {
+        let now = left.get();
+        left.set(now.saturating_sub(1));
+        now > 0
+    }) {
+        Cancelled::PendingWrite.throw();
+    }
+    #[cfg(test)]
+    if let Some(stop) = probe::AFTER_CLAIM.with(std::cell::Cell::get) {
+        stop(group);
+    }
     // Named: the one check that stands for every row behind the seal (rule 16).
     let span = tracing::info_span!(
         target: "blaze",
@@ -1325,6 +1488,10 @@ pub(crate) fn resolve(db: *const (), storage: &Storage, group: u16, apart: Optio
     );
     let _entered = span.enter();
     let held = check(db, storage, group, apart);
+    #[cfg(test)]
+    if let Some(stop) = probe::BEFORE_RESULT.with(std::cell::Cell::get) {
+        stop(group);
+    }
     claim.done = true;
     seals.checks.fetch_add(1, Ordering::Relaxed);
     span.record("held", held);
@@ -1334,7 +1501,14 @@ pub(crate) fn resolve(db: *const (), storage: &Storage, group: u16, apart: Optio
         seals.breaks.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    if of.state.compare_exchange(CHECKING, HELD, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    if storage.frontier.plant == Plant::CheckStoresHeldBlindly {
+        of.state.store(HELD, Ordering::Release);
+    } else if of
+        .state
+        .compare_exchange(CHECKING, HELD, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // A walk took the claim away and broke the seal: its verdict stands.
         return false;
     }
     seals.unsettled.fetch_sub(1, Ordering::AcqRel);

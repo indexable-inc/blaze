@@ -137,6 +137,8 @@ impl Lowered {
                 continue;
             }
             made.insert(file);
+            // Its root's text is another: what a record carried of its texts is let go.
+            self.carried.remove(&krate);
             self.appended.insert(file, (unit, asked));
             if self.db.file_text(file).content(&self.db) != before {
                 written += 1;
@@ -144,6 +146,8 @@ impl Lowered {
         }
         if written > 0 {
             self.identities.clear();
+            // In this batch: a root with a module appended is another text of its crate.
+            self.give_surfaces();
         }
         written
     }

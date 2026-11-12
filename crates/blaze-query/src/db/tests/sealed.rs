@@ -407,6 +407,34 @@ fn a_plan_that_adds_a_crate_unseals_nothing() {
     assert_eq!(shop.state(added), SealState::Sealed);
 }
 
+/// The invariant: a group's imports are what its rows read from outside it, each once, the
+/// same whether the group is open (a crate just made) or sealed: the application reads the
+/// library's top row and nothing else of another group; the library reads nothing from
+/// outside.
+#[test]
+fn a_groups_imports_are_what_its_rows_read_from_outside_it_open_or_sealed() {
+    let mut shop = Shop::new(Plant::None);
+    let lib = shop.group("lib", &[]);
+    let app = shop.group("app", &[lib]);
+    let (of_lib, of_app) = (shop.input(1, Some(lib)), shop.input(10, Some(app)));
+    let top = shop.row(sum(&[Dep::Input(of_lib)]));
+    shop.row(sum(&[Dep::Input(of_app), Dep::Query(top)]));
+    shop.row(sum(&[Dep::Input(of_app), Dep::Query(top)]));
+    shop.pull_all().unwrap();
+    let imports = |shop: &mut Shop, group: SealGroup| -> Vec<(u32, ReadKind)> {
+        let reads = shop.db.storage_mut().seal_group_imports(group);
+        reads.iter().map(|it| (it.key.key_index().as_u32(), it.kind)).collect()
+    };
+    let open = imports(&mut shop, app);
+    assert_eq!(open, [(node(&shop.db, top).0.as_u32(), ReadKind::Function)]);
+    assert_eq!(shop.seal().sealed, 2);
+    assert_eq!(imports(&mut shop, app), open, "sealed as open");
+    assert!(imports(&mut shop, lib).is_empty());
+    // Every row of both ran here by its own reads: the lists are whole.
+    assert_eq!(shop.db.storage_mut().seal_group_whole(app), Ok(()));
+    assert_eq!(shop.db.storage_mut().seal_group_whole(lib), Ok(()));
+}
+
 /// The quiet rule ([`SealKind::Local`]): a local crate is sealed by the pass that ends the
 /// second build in a row with no write to its inputs, and a write starts the count again.
 #[test]
@@ -472,8 +500,97 @@ fn the_oracle_catches_an_input_regrouped_with_no_removal() {
     assert!(why.contains("from scratch"), "{why}");
 }
 
+/// Runs `f`, again after each unwind a planted claim's interruption makes of it
+/// ([`crate::db::seal::probe`]), as a host runs a request again after a pending write
+/// cancelled it. Bounded: the claims left to unwind, and one.
+fn retried<T>(mut f: impl FnMut() -> T) -> T {
+    for _ in 0..=crate::db::seal::probe::UNWIND_CLAIMS.with(std::cell::Cell::get) {
+        match Cancelled::catch(AssertUnwindSafe(&mut f)) {
+            Ok(it) => return it,
+            Err(Cancelled::PendingWrite) => {}
+            Err(other) => panic!("a pull unwound with {other}"),
+        }
+    }
+    panic!("more unwinds than claims were set to unwind")
+}
+
+/// A library and a crate over it, sealed; the library's input is written, so the crate's
+/// group waits for its check; the next `interrupted` claims of a group on this thread unwind
+/// as a check does under a pending write; then the crate's row is pulled until a pull ends.
+/// Returns what the oracle says of every row.
+fn a_check_interrupted_by_a_write(plant: Plant, interrupted: u32) -> Result<(), String> {
+    let mut shop = Shop::new(plant);
+    let lib = shop.group("lib", &[]);
+    let app = shop.group("app", &[lib]);
+    let (of_lib, of_app) = (shop.input(1, Some(lib)), shop.input(10, Some(app)));
+    let top = shop.row(sum(&[Dep::Input(of_lib)]));
+    let above = shop.row(sum(&[Dep::Input(of_app), Dep::Query(top)]));
+    shop.pull_all().unwrap();
+    assert_eq!(shop.seal().sealed, 2);
+    shop.write(of_lib, 5);
+    assert_eq!(shop.state(app), SealState::Suspect);
+    crate::db::seal::probe::UNWIND_CLAIMS.with(|it| it.set(interrupted));
+    let said = retried(|| shop.pull(&[above]));
+    crate::db::seal::probe::UNWIND_CLAIMS.with(|it| it.set(0));
+    said.and_then(|()| shop.pull_all())
+}
+
+/// The invariant: a group is held only by a check that ran to its end. A check that unwinds
+/// (a write pending) gives its claim back, the group waits for its check as before, and the
+/// next asker checks it again: after one interruption and after three, the row over the
+/// changed library answers as from scratch.
+#[test]
+fn a_check_that_unwinds_gives_its_claim_back_and_is_made_again() {
+    assert_eq!(a_check_interrupted_by_a_write(Plant::None, 0), Ok(()));
+    assert_eq!(a_check_interrupted_by_a_write(Plant::None, 1), Ok(()));
+    assert_eq!(a_check_interrupted_by_a_write(Plant::None, 3), Ok(()));
+}
+
+/// The control of [`a_check_that_unwinds_gives_its_claim_back_and_is_made_again`]: a claim
+/// kept across the unwind leaves the group held with no import looked at, and the row
+/// answers its old value. With no interruption the plant changes nothing.
+#[test]
+fn the_oracle_catches_a_claim_not_made_again_after_the_write() {
+    assert_eq!(a_check_interrupted_by_a_write(Plant::ClaimKeptAcrossUnwind, 0), Ok(()));
+    let why = a_check_interrupted_by_a_write(Plant::ClaimKeptAcrossUnwind, 1)
+        .expect_err("the oracle missed a group held by a check that never ended");
+    assert!(why.contains("from scratch"), "{why}");
+}
+
+/// A walk and a pull's check of one group, interleaved on one thread at the claim: the
+/// walk's check of the suspect group is interrupted, the walk is asked again, and between
+/// the two a row of the group is pulled, whose own check runs to its end. Every answer is
+/// held to the model, and the changed set names the changed rows.
+#[test]
+fn a_walk_and_a_pull_that_check_one_group_in_turn_answer_alike() {
+    let mut shop = Shop::new(Plant::None);
+    let lib = shop.group("lib", &[]);
+    let app = shop.group("app", &[lib]);
+    let (of_lib, of_app) = (shop.input(1, Some(lib)), shop.input(10, Some(app)));
+    let top = shop.row(sum(&[Dep::Input(of_lib)]));
+    let above = shop.row(sum(&[Dep::Input(of_app), Dep::Query(top)]));
+    shop.pull_all().unwrap();
+    assert_eq!(shop.seal().sealed, 2);
+    let since = shop.db.storage().view();
+    shop.write(of_lib, 5);
+    // The walk claims the group and unwinds, as under a pending write.
+    crate::db::seal::probe::UNWIND_CLAIMS.with(|it| it.set(1));
+    let first = Cancelled::catch(AssertUnwindSafe(|| shop.ask(since)));
+    assert_eq!(first.err(), Some(Cancelled::PendingWrite), "the walk's check was interrupted");
+    assert_eq!(shop.state(app), SealState::Suspect, "the claim was given back");
+    // A pull's check of the same group, to its end: the import changed, the seal breaks.
+    shop.pull(&[above]).unwrap();
+    assert_eq!(shop.state(app), SealState::Broken);
+    // The walk again: it finds the seal broken and names the group's rows it must.
+    let (named, _) = shop.ask(since);
+    assert!(named.contains(&top), "{named:?}");
+    shop.pull_all().unwrap();
+}
+
 #[derive(Clone, Debug)]
 enum Step {
+    /// The next claims of a group on the thread unwind, as a check under a pending write.
+    Unwind(u32),
     Write(usize, u64),
     /// Changes the world an untracked read sees; a view opens with nothing written.
     World(u64),
@@ -521,12 +638,13 @@ fn program(tc: &TestCase) -> Program {
     }
     let mut steps = Vec::new();
     for _ in 0..int(1, 20) {
-        steps.push(match int(0, 11) {
+        steps.push(match int(0, 12) {
             0..=3 => Step::Write(int(0, inputs.len() - 1), tc.draw(gs::integers::<u64>().max_value(6))),
             4 => Step::World(tc.draw(gs::integers::<u64>().max_value(3))),
             5 => Step::Evict,
             6 | 7 => Step::Pull((0..int(1, 3)).map(|_| int(0, nodes - 1)).collect()),
             8 | 9 => Step::Seal,
+            10 => Step::Unwind(int(1, 3) as u32),
             _ => Step::Ask,
         });
     }
@@ -556,6 +674,7 @@ fn made(program: &Program, sealed: bool, plant: Plant) -> Shop {
 /// Runs `program` in a database with its seal groups (`plant` planted there) and in one with
 /// none, and checks both against the model after every step. `Err` says what the oracle saw.
 fn simulate(program: &Program, plant: Plant) -> Result<(), String> {
+    crate::db::seal::probe::UNWIND_CLAIMS.with(|it| it.set(0));
     let mut shops = [made(program, true, plant), made(program, false, Plant::None)];
     let rows = program.flow.len();
     let ids: BTreeMap<u32, usize> =
@@ -569,6 +688,11 @@ fn simulate(program: &Program, plant: Plant) -> Result<(), String> {
         for (which, shop) in shops.iter_mut().enumerate() {
             let said = |why: String| format!("step {at}, {}: {why}", ["sealed", "unsealed"][which]);
             match step {
+                Step::Unwind(claims) => {
+                    if which == 0 {
+                        crate::db::seal::probe::UNWIND_CLAIMS.with(|it| it.set(*claims));
+                    }
+                }
                 Step::Write(input, value) => shop.write(*input, *value),
                 Step::World(value) => {
                     shop.db.world.store(*value, Ordering::Relaxed);
@@ -577,7 +701,7 @@ fn simulate(program: &Program, plant: Plant) -> Result<(), String> {
                 Step::Evict => {
                     evict_values::<Crated>(&mut shop.db);
                 }
-                Step::Pull(pulled) => shop.pull(pulled).map_err(said)?,
+                Step::Pull(pulled) => retried(|| shop.pull(pulled)).map_err(said)?,
                 Step::Seal => {
                     if which == 0 {
                         shop.seal();
@@ -588,12 +712,13 @@ fn simulate(program: &Program, plant: Plant) -> Result<(), String> {
                 }
                 Step::Ask => {
                     let since = if which == 0 { asked.0 } else { shop.db.storage().view() };
-                    let (named, work) = shop.ask(since);
+                    let (named, work) = retried(|| shop.ask(since));
                     let rows_made = made_rows(shop);
                     if work.visited > rows_made.len() as u64 {
                         return Err(said(format!("the walk visited {} rows of {} made", work.visited, rows_made.len())));
                     }
-                    shop.pull(&rows_made.iter().copied().collect::<Vec<_>>()).map_err(said)?;
+                    let held: Vec<usize> = rows_made.iter().copied().collect();
+                    retried(|| shop.pull(&held)).map_err(said)?;
                     if which == 0 {
                         // Exact: every row made by the last ask whose value differs is named.
                         let now = evaluate(&program.flow, &shop.inputs, shop.db.world.load(Ordering::Relaxed));
@@ -671,5 +796,146 @@ fn the_simulations_oracle_catches_each_planted_seal_bug() {
     for plant in [Plant::SealSurvivesAWrite, Plant::SealedDependentsNeverSuspect] {
         let why = simulate(&program, plant).expect_err("the oracle missed the planted bug");
         assert!(why.contains("from scratch"), "{plant:?}: {why}");
+    }
+}
+
+/// Two tasks on one group, made to interleave at the check's claim every run, as
+/// `stale_head` makes its two tasks meet: the first task pulls a row behind the seal, claims
+/// the group's check and stops (right after the claim, or with its check done and its result
+/// not yet stored); the second then pulls a row of the group, or walks the changed set; then
+/// the first goes on.
+mod two_tasks {
+    use std::{cell::RefCell, time::Duration};
+
+    use crossbeam_channel::{Receiver, Sender, unbounded};
+
+    use super::*;
+    use crate::db::seal::probe;
+
+    /// The longest a task waits for the other's word before the test fails naming what it
+    /// waited for (rule 18); each wait ends in microseconds.
+    const BOUND: Duration = Duration::from_secs(60);
+
+    /// The first task's ends of the relay.
+    struct Stop {
+        reached: Sender<()>,
+        go: Receiver<()>,
+    }
+
+    std::thread_local! {
+        static STOP: RefCell<Option<Stop>> = const { RefCell::new(None) };
+    }
+
+    /// The first task's probe: says it reached its stop and waits to go on, once.
+    fn stop(_: u16) {
+        let Some(stop) = STOP.with(|it| it.borrow_mut().take()) else { return };
+        stop.reached.send(()).expect("the relay lives as long as the test");
+        stop.go.recv_timeout(BOUND).expect("the second task did its part and said so");
+    }
+
+    /// What one schedule left.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) struct Left {
+        /// Whether both tasks' rows, and then every row, answered as from scratch.
+        pub(super) right: bool,
+        /// The dependent group's state after both tasks ended.
+        pub(super) state: SealState,
+        /// Checks of a group that ran.
+        pub(super) checks: u64,
+    }
+
+    /// One schedule, drawn from `seed`: whether the library's write keeps what the dependent
+    /// reads (`keeps`), where the first task stops (`at_result`), and whether the second task
+    /// walks or pulls (`walks`); how many rows the dependent has and which each task pulls
+    /// vary with the seed too.
+    pub(super) fn run(seed: u64, plant: Plant) -> (Left, bool, bool) {
+        let (keeps, at_result, walks) = (seed & 1 != 0, seed & 2 != 0, seed & 4 != 0);
+        let rows = 1 + (seed >> 3) as usize % 3;
+        let mut shop = Shop::new(plant);
+        let lib = shop.group("lib", &[]);
+        let app = shop.group("app", &[lib]);
+        let (of_lib, of_app) = (shop.input(10, Some(lib)), shop.input(100, Some(app)));
+        let interface = shop.row(FlowNode { op: FlowOp::Mod3, deps: vec![Dep::Input(of_lib)] });
+        let first = shop.flow.len();
+        for _ in 0..rows {
+            shop.row(sum(&[Dep::Query(interface), Dep::Input(of_app)]));
+        }
+        shop.pull_all().unwrap();
+        assert_eq!(shop.seal().sealed, 2);
+        let since = shop.db.storage().view();
+        // 10 and 13 are 1 modulo 3; 11 is 2.
+        shop.write(of_lib, if keeps { 13 } else { 11 });
+        assert_eq!(shop.state(app), SealState::Suspect);
+        let pulled = [first + (seed >> 5) as usize % rows, first + (seed >> 7) as usize % rows];
+        let (reached, at_stop) = unbounded::<()>();
+        let (go, gone) = unbounded::<()>();
+        let shop = &shop;
+        let (one, two) = std::thread::scope(|scope| {
+            let one = scope.spawn(move || {
+                STOP.with(|it| *it.borrow_mut() = Some(Stop { reached, go: gone }));
+                match at_result {
+                    true => probe::BEFORE_RESULT.with(|it| it.set(Some(stop))),
+                    false => probe::AFTER_CLAIM.with(|it| it.set(Some(stop))),
+                }
+                shop.pull(&[pulled[0]])
+            });
+            let two = scope.spawn(move || {
+                at_stop.recv_timeout(BOUND).expect("the first task claimed the group's check");
+                let said = match walks {
+                    true => {
+                        shop.ask(since);
+                        Ok(())
+                    }
+                    false => shop.pull(&[pulled[1]]),
+                };
+                go.send(()).expect("the relay lives as long as the test");
+                said
+            });
+            (one.join().expect("the first task"), two.join().expect("the second task"))
+        });
+        let right = one.is_ok() && two.is_ok() && shop.pull_all().is_ok();
+        let left = Left {
+            right,
+            state: shop.state(app),
+            checks: shop.db.storage().seal_census().checks,
+        };
+        (left, keeps, walks)
+    }
+}
+
+/// The invariant, shown under two tasks on 64 schedules: a group has one check at a time (a
+/// task that meets another's claim verifies its own row by the row's edges and checks
+/// nothing), a seal a walk broke while a check ran stays broken (the check's result is
+/// stored only over its own claim), and no row answers a stale value either way. After a
+/// write that keeps what the dependent reads the group is sealed again unless a walk took the
+/// claim; after one that changes it the seal is broken.
+#[test]
+fn two_tasks_on_one_group_run_one_check_and_answer_as_from_scratch() {
+    for seed in 0..64 {
+        let (left, keeps, walks) = two_tasks::run(seed, Plant::None);
+        let state = if keeps && !walks { SealState::Sealed } else { SealState::Broken };
+        assert_eq!(left, two_tasks::Left { right: true, state, checks: 1 }, "seed {seed}");
+    }
+}
+
+/// The first control of [`two_tasks_on_one_group_run_one_check_and_answer_as_from_scratch`]:
+/// with a second claim admitted, the task that pulls while the first holds the claim checks
+/// the group too: two checks, on every schedule whose second task pulls.
+#[test]
+fn the_oracle_catches_a_second_claim_of_a_group_being_checked() {
+    for seed in (0..64).filter(|seed| seed & 4 == 0) {
+        let (left, _, _) = two_tasks::run(seed, Plant::SecondClaimAdmitted);
+        assert_eq!(left.checks, 2, "seed {seed}: {left:?}");
+    }
+}
+
+/// The second control: with the check's result stored whatever the group's state, a seal
+/// the walk broke while the check ran is held again, on every schedule whose second task
+/// walks after a write that keeps what the dependent reads.
+#[test]
+fn the_oracle_catches_a_result_stored_over_a_seal_the_walk_broke() {
+    for seed in (0..64).filter(|seed| seed & 5 == 5) {
+        let (left, _, _) = two_tasks::run(seed, Plant::CheckStoresHeldBlindly);
+        assert_eq!(left.state, SealState::Sealed, "seed {seed}: {left:?}");
     }
 }

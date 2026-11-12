@@ -40,6 +40,11 @@ mod const_macros;
 mod crates;
 mod doctests;
 mod files;
+#[expect(
+    dead_code,
+    reason = "the plan key is called by the find-records decision of `lower_writes`, piece D of restore.md's \"Restart reads records (d)\", which is not switched on yet"
+)]
+mod found;
 mod harness;
 pub mod places;
 #[cfg(test)]
@@ -216,6 +221,10 @@ pub struct Lowered {
     /// The narrowed identities [`Lowered::library_narrows`] worked out, the store having none,
     /// each with its key, for the driver to keep ([`Lowered::take_library_narrows`]).
     library_made: Vec<(ContentId, Vec<u8>)>,
+    /// What a record carried of a workspace crate's own texts ([`Lowered::carry_own_surface`]),
+    /// which [`slot_of`] takes in place of parsing the crate's files: let go for a crate in
+    /// the write that changes a file of its source root, its settings or its root's text.
+    carried: blaze_hash::HashMap<Crate, code::OwnNarrow, Global>,
     /// How cargo passes each crate's root, which the build's naming of files reads and each
     /// crate's identity covers.
     spellings: std::sync::Arc<Spellings>,
@@ -514,6 +523,7 @@ pub fn lower_into<T: blaze_query::Tree>(
         narrowed: blaze_hash::HashMap::new_in(Global),
         library: blaze_hash::HashMap::new_in(Global),
         library_made: Vec::new(), // alloc: none
+        carried: blaze_hash::HashMap::new_in(Global),
         spellings,
         appended: blaze_hash::HashMap::new_in(Global),
         loads,
@@ -1417,6 +1427,75 @@ impl Lowered {
         })
     }
 
+    /// What a front end above reads of `krate` and, through it, of every crate it depends
+    /// on, as the one digest a crate enters the image key of a crate above it by
+    /// (`hir_def::deps::given::set_surface`, [`Lowered::give_surfaces`]; restore.md, "Restart
+    /// reads records (d)", E): [`slot_of`]. Always one; made from texts and settings alone,
+    /// so asking it parses a workspace crate's files and resolves nothing.
+    ///
+    /// Not the fold a unit's narrow key holds ([`Narrowed::built`]), which takes a registry
+    /// crate by its narrowed identity once the store or a parse gave it one
+    /// ([`Lowered::library_narrows`]): that is given unit by unit as a build goes, after the
+    /// first serve, and an image key must be the same before it and after, in the build that
+    /// keeps an image and in the restart that looks for it. So here a library crate is its
+    /// whole identity, always.
+    pub fn surface_of(&mut self, krate: Crate) -> ContentId {
+        identity_of(&self.db, krate, &self.spellings, &mut self.identities);
+        // alloc: once a crate asked, a crate of its closure each
+        let mut known = blaze_hash::HashMap::new_in(Global);
+        slot_of(
+            &self.db,
+            krate,
+            &self.spellings,
+            &self.identities,
+            &self.const_macros,
+            &self.carried,
+            &mut known,
+        )
+        .digest
+    }
+
+    /// What of `krate`'s own texts and settings its surface is made of, as bytes a record
+    /// can carry (`code::OwnNarrow::kept`: its code text's, interface's and surface's
+    /// digests and what a crate above is asked of it), so a later database gives the crate
+    /// its surface with none of its files parsed ([`Lowered::carry_own_surface`]). None for a
+    /// crate with no code text of its own (a library source root's, whose surface is its
+    /// whole identity).
+    ///
+    /// It is a function of the crate's files (paths and texts, its root's alone for a crate
+    /// that reads no other), the module appended to its root, and its settings with those of
+    /// every crate below it (cfg, env, edition, target: `Crate::ported_content`). A record
+    /// that carries it must be keyed by all of those.
+    pub fn own_surface(&self, krate: Crate) -> Option<Vec<u8>> {
+        let own = match self.carried.get(&krate) {
+            Some(own) => *own,
+            None => code::own_narrow(&self.db, krate),
+        };
+        own.code.map(|_| own.kept().to_vec()) // alloc: a record's field, once a crate kept
+    }
+
+    /// Takes `kept`, what [`Lowered::own_surface`] gave of this crate in the database that
+    /// kept its record, in place of parsing the crate's files to work it out; call
+    /// [`Lowered::give_surfaces`] after the last one. The caller vouches that the record
+    /// `kept` came from is keyed by everything it is made of (see there), and so never gives
+    /// one for a crate that a build script's run applies to, or that is above one: a run's
+    /// cfgs, env and `OUT_DIR` files are in the settings and files, and in no key made before
+    /// the run. It is let go in the write that changes a file of the crate's source root or
+    /// appends to its root, and the crate is parsed then. Bytes that are no such record are
+    /// refused, naming the crate.
+    pub fn carry_own_surface(&mut self, krate: Crate, kept: &[u8]) -> Result<(), LowerError> {
+        let own = code::OwnNarrow::restored(kept).map_err(|why| {
+            let named = format!("{}", krate.named(&self.db)); // alloc: error path
+            LowerError::at(
+                // alloc: error path
+                format!("the surface a record carried of the crate {named}: {why}"),
+                named,
+            )
+        })?;
+        self.carried.insert(krate, own);
+        Ok(())
+    }
+
     /// The workspace sources a build keyed by code texts alone can vouch for
     /// ([`StillSource`]): each Rust file with text of a workspace package's source root every
     /// unit of which `narrow` says is keyed by its crate's code text, found under that key
@@ -1950,6 +2029,16 @@ impl Lowered {
         if changed {
             self.identities.clear();
             self.narrowed.clear();
+            // A run's cfgs, env and files are in the settings and files of the crates it
+            // applies to, and their settings in those of every crate above them: what a
+            // record carried of any of those is let go.
+            let db = &self.db;
+            self.carried.retain(|krate, _| {
+                !written.contains(krate)
+                    && !krate.transitive_deps(db).iter().any(|below| written.contains(below))
+            });
+            // In this run's batch: the crates given the run have other settings or files.
+            self.give_surfaces();
         }
         Ok(())
     }
@@ -2049,6 +2138,18 @@ impl Lowered {
             load.view = tree.read_view.get();
             let change = set_files(db, &load.dir, &load.built, load.set, sets, other, &loaded)?;
             removed |= !change.removed.is_empty();
+            // A crate of a source root with a file set, added or removed is parsed for its
+            // surface again: what a record carried of it is of the files before.
+            if !(change.set.is_empty()
+                && change.added.is_empty()
+                && change.removed.is_empty()
+                && change.no_text.is_empty())
+            {
+                let root = SourceRootId(load.set as u32);
+                self.carried.retain(|krate, _| {
+                    db.file_source_root(krate.data(&*db).root_file_id).source_root_id(&*db) != root
+                });
+            }
             note(paths, db, load.set, &change);
         }
         seed(db)?;
@@ -2075,6 +2176,10 @@ impl Lowered {
             }
         }
         const_macros::set_macros(&mut self.db, listed);
+        // The view's texts are set and seeded: each crate's surface as it is now, in this
+        // batch, so no image key is asked of this view before it and the maintainers run
+        // once.
+        self.give_surfaces();
         Ok(())
     }
 
@@ -2151,6 +2256,9 @@ impl Lowered {
             self.identities.clear();
             self.narrowed.clear();
         }
+        // The plan's crates, those found and those made: a crate this plan is the first to
+        // name has no surface given yet.
+        self.give_surfaces();
         Ok(Relowered::Into(placed))
     }
 
@@ -2239,6 +2347,9 @@ impl Lowered {
         if changed {
             self.identities.clear();
             self.narrowed.clear();
+            // A proc macro's crate is its code to the crates above it; the expanders loaded
+            // move nothing a surface holds, and the call writes nothing then.
+            self.give_surfaces();
         }
         Ok(())
     }
@@ -2288,6 +2399,81 @@ impl Lowered {
         self.db
             .batch(trigger, |db| hir_def::deps::serve_asked(db, asked, crates, build, images, mode))
             .map_err(LowerError::new)
+    }
+
+    /// Gives the front end the surface ([`Lowered::surface_of`]) of every crate of the plan
+    /// and of every crate they depend on (`hir_def::deps::given::set_surface`), dependencies
+    /// first: what a crate enters the image key of a crate above it by, which hir-def cannot
+    /// work out (the texts are this crate's). A digest that is the one already given writes
+    /// nothing, so after the first call only a crate whose surface moved is written, and with
+    /// it the keys above it. A library crate's at `HIGH` (its files do not change), a
+    /// workspace crate's at `LOW`.
+    ///
+    /// The invariant: whenever an image key is asked, each crate's slot holds the surface of
+    /// the files and settings the database holds. So this runs at the end of every write
+    /// that can move one, in that write's batch or right after it, once the texts are set:
+    /// [`Lowered::refresh`], [`Lowered::relower`], a run applied ([`Lowered::ran`]), proc
+    /// macros loaded ([`Lowered::macros`]), a root appended to ([`Lowered::append_roots`]);
+    /// and once after [`Lowered::set_port`] by the driver (a surface holds the crate's
+    /// settings as the port writes them, so none is worked out before the port is told).
+    /// Never inside a serve: blaze-cargo's `deps::images` takes the database's view before
+    /// it walks the keys.
+    ///
+    /// What it reads is inputs and parses alone (file texts, crate data, settings), none of
+    /// it kept by a maintainer, so it may run inside an open batch, before that batch's
+    /// maintainers ran. A gift notes nothing to the maintainers (`base_db::Crate::give`
+    /// writes the crate's slot and no other input), so giving an awaited crate its surface
+    /// does not resolve it.
+    ///
+    /// A write, as [`Lowered::ran`] is, when any digest moved; none when none did.
+    pub fn give_surfaces(&mut self) {
+        // alloc: once a write that could move a surface, the plan's crates
+        let mut crates: Vec<Crate> = self.crates.units.iter().filter_map(|it| it.krate).collect();
+        crates.sort_unstable();
+        crates.dedup();
+        // The whole identities of every crate of the closures: what a library crate's slot is.
+        for &krate in &crates {
+            identity_of(&self.db, krate, &self.spellings, &mut self.identities);
+        }
+        let db = &self.db;
+        // alloc: as above, a crate of the closure each
+        let mut known = blaze_hash::HashMap::new_in(Global);
+        for &krate in &crates {
+            slot_of(
+                db,
+                krate,
+                &self.spellings,
+                &self.identities,
+                &self.const_macros,
+                &self.carried,
+                &mut known,
+            );
+        }
+        // Dependencies first: a crate's slot is made of its dependencies', so in the order
+        // of how deep each is below the plan's crates, then by crate.
+        // alloc: as above
+        let mut given: Vec<(usize, Crate, ContentId, blaze_query::db::Durability)> = Vec::new();
+        for (&krate, slot) in &known {
+            if hir_def::deps::given::surface(db, krate) == Some(slot.digest) {
+                continue;
+            }
+            let root_file = krate.data(db).root_file_id;
+            let root = db.source_root(db.file_source_root(root_file).source_root_id(db));
+            let durability = match root.source_root_ref(db).is_library {
+                true => blaze_query::db::Durability::HIGH,
+                false => blaze_query::db::Durability::LOW,
+            };
+            given.push((slot.height, krate, slot.digest, durability));
+        }
+        if given.is_empty() {
+            return;
+        }
+        given.sort_unstable_by_key(|it| (it.0, it.1));
+        self.db.batch(Trigger::named("the crates' surfaces given"), |db| {
+            for (_, krate, surface, durability) in given {
+                hir_def::deps::given::set_surface(db, krate, surface, durability);
+            }
+        });
     }
 
     /// Whether any crate of the front end is awaited (`hir_def::deps::awaited`): a load.
@@ -2608,6 +2794,114 @@ fn narrow_of(
             at,
             Narrow { own: true, code, interface, checked, built, surface, locates, extends },
         );
+    }
+    known[&krate]
+}
+
+/// A crate's slot digest and what the crates above it are asked of it ([`slot_of`]).
+#[derive(Clone, Copy)]
+struct Slot {
+    digest: ContentId,
+    /// How many crates deep its dependencies go: 0 for a crate with none. A crate's is more
+    /// than each of its dependencies', so slots given in this order are given dependencies
+    /// first.
+    height: usize,
+    /// As [`Narrow::locates`], a library crate that is not the standard library's always
+    /// taken to.
+    locates: bool,
+    /// As [`Narrow::extends`].
+    extends: bool,
+}
+
+const NARROW_SLOT: &str = "blaze v2 crate surface slot 1";
+
+/// What a front end above reads of `krate` and of the crates below it, as the digest it is
+/// given as ([`Lowered::surface_of`]), each crate of its closure worked out once into `known`,
+/// dependencies first; `whole` holds the whole identity ([`identity_of`]) of every crate of
+/// the closure.
+///
+/// A crate with no code text of its own (a library source root's, which does not change; one
+/// that reads Rust as bytes) is its whole identity. Any other is its own text and each
+/// dependency's slot: its surface text where it has one and holds no position its tokens do
+/// not say, else its interface text, else its code text, by the rule of [`narrow_of`]
+/// (a proc macro, a build script, a program and a const-macro crate are their code; so is a
+/// crate that names blaze's extensions or is above a workspace crate that does). It reads no
+/// library crate's narrowed identity ([`Lowered::library_narrows`]): what it gives must not
+/// depend on which units were identified yet. A library crate other than the standard
+/// library's is therefore taken to give a constant its caller's position, and a workspace
+/// crate above one that calls a function where a constant is evaluated keeps its positions
+/// (its interface text): a moved line in it then moves the keys above. Sound, and coarser
+/// than a unit's key; closing it needs the narrowed identities read before the first serve.
+fn slot_of(
+    db: &Db,
+    krate: Crate,
+    spellings: &Spellings,
+    whole: &blaze_hash::HashMap<Crate, ContentId, Global>,
+    const_macros: &[const_macros::Loaded],
+    carried: &blaze_hash::HashMap<Crate, code::OwnNarrow, Global>,
+    known: &mut blaze_hash::HashMap<Crate, Slot, Global>,
+) -> Slot {
+    if let Some(slot) = known.get(&krate) {
+        return *slot;
+    }
+    let mut stack = vec![(krate, false)]; // alloc: once per crate asked between writes
+    while let Some((at, deps_known)) = stack.pop() {
+        if known.contains_key(&at) {
+            continue;
+        }
+        let data = at.data(db);
+        if !deps_known {
+            stack.push((at, true));
+            stack.extend(
+                data.dependencies
+                    .iter()
+                    .filter(|it| !known.contains_key(&it.crate_id))
+                    .map(|it| (it.crate_id, false)),
+            );
+            continue;
+        }
+        let below = |of: fn(&Slot) -> bool| data.dependencies.iter().any(|it| of(&known[&it.crate_id]));
+        let height =
+            data.dependencies.iter().map(|it| known[&it.crate_id].height + 1).max().unwrap_or(0);
+        // What a record carried of it, where one did: none of its files is parsed.
+        let own = match carried.get(&at) {
+            Some(own) => *own,
+            None => code::own_narrow(db, at),
+        };
+        let extends = own.extends || below(|it| it.extends);
+        let Some(own_code) = own.code else {
+            let locates = below(|it| it.locates) || !data.origin.is_lang();
+            known.insert(at, Slot { digest: whole[&at], height, locates, extends });
+            continue;
+        };
+        let locates_below = below(|it| it.locates);
+        let locates = locates_below || (own.tracks && own.names_location);
+        let library = matches!(data.target_kind, base_db::TargetKind::Lib { is_proc_macro: false })
+            && const_macros.iter().all(|it| it.krate != at);
+        let read_by_interface = library && !extends;
+        let (which, own_text) = match (own.surface, own.interface) {
+            (Some(surface), _) if read_by_interface && !(locates && own.calls) => (2u8, surface),
+            (_, Some(interface)) if read_by_interface => (1, interface),
+            _ => (0, own_code),
+        };
+        let mut hasher = Hasher::new(NARROW_SLOT);
+        hasher.update(&[which]).id(&own_text);
+        match spellings.of(at) {
+            None => {
+                hasher.update(&[0]);
+            }
+            Some(spelling) => {
+                hasher.update(&[1]);
+                for text in [&spelling.dir, &spelling.passed] {
+                    hasher.part(&db.files().ported(text.as_bytes()));
+                }
+            }
+        }
+        hasher.update(&(data.dependencies.len() as u64).to_le_bytes());
+        for dep in &data.dependencies {
+            hasher.id(&known[&dep.crate_id].digest);
+        }
+        known.insert(at, Slot { digest: hasher.finish(), height, locates, extends });
     }
     known[&krate]
 }

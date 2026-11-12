@@ -176,6 +176,8 @@ pub(crate) struct Frame {
     /// An inner head of its cycle did not converge this round (on the outermost head).
     pub(crate) unconverged: bool,
     pub(crate) untracked: bool,
+    /// The run was answered from a store by a key ([`super::report_stored_read`]).
+    pub(crate) stored: bool,
     /// Read a provisional row or was told [`super::unshareable_reads`]: its captures give none.
     pub(crate) unshareable: bool,
     /// Its fixpoint round, from 1.
@@ -212,6 +214,7 @@ impl Frame {
             reentered: false,
             unconverged: false,
             untracked: false,
+            stored: false,
             unshareable: false,
             round: 1,
             members_start: 0,
@@ -1103,6 +1106,7 @@ impl Local {
         frame.changed = 0;
         frame.summary = [0; 2];
         frame.untracked = false;
+        frame.stored = false;
         frame.head = NONE;
         // What its verify was handed (a cycle that met it) comes before its run's reads.
         frame.cycle.round = self.cycle_edges.len() as u32;
@@ -1254,6 +1258,7 @@ impl Frame {
             reentered: false,
             unconverged: false,
             untracked: false,
+            stored: false,
             unshareable: false,
             round: 1,
             members_start: 0,
