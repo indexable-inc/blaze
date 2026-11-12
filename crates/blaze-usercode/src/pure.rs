@@ -335,7 +335,7 @@ pub fn check(
                     "a process of its run looked at {} (a directory, or a name with nothing there), outside its package and OUT_DIR and on no library search path blaze gave it ({}), and read no file there: the search of a loader for a library (a RUNPATH of the program or of a library loaded into it, the sandbox's own among them) rather than a read its proof denies; which program and call made it is not recorded for a read that is traced. Nothing is kept: its pure key does not cover that directory (keys-cover-every-input)",
                     path.display(),
                     search.join(":")
-                ))));
+                )));
             }
             // alloc: error path
             return Err(bug(format!(
