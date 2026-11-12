@@ -1,0 +1,137 @@
+{
+ "about": "Everything that slowed, surprised or annoyed an agent or a person while working on blaze, however slightly, written down when it happens (rule record-annoyances). A row is a lead for guard-the-cause: the fix is to remove the cause, then set the row's state. Rows are never deleted; a fixed one keeps its state and the commit.",
+ "annoyances": [
+  {
+   "id": "mem2-1",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+   "where": "ix VM (the default image): systemd-run",
+   "what": "A unit started with `systemd-run` has no PATH that holds bash, git or curl: `systemd-run ... bash -c ...` fails with `bash: command not found`, and the failure is only in the unit's own log.",
+   "cost": "ten minutes: the first setup unit did nothing and the next command read an empty log",
+   "cause": "the image's binaries are on the login shell's PATH (nix profile paths), not on systemd's default",
+   "workaround": "`systemd-run -E PATH=\"$PATH\" -E HOME=/root /usr/bin/bash ...`",
+   "state": "open"
+  },
+  {
+   "id": "mem2-2",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+   "where": "the shell on a VM",
+   "what": "`pkill -f \"blaze-engine serve\"` inside `ix shell vm -- bash -c '...'` kills the bash that runs it, since its own command line holds the pattern; everything after it in the script silently does not run.",
+   "cost": "one measurement run that never started, found twenty minutes later",
+   "cause": "pattern matching on full command lines",
+   "workaround": "`pgrep -f \"engine serv[e]\" | xargs -r kill`",
+   "state": "open"
+  },
+  {
+   "id": "mem2-3",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+   "where": "blaze: `blaze debug inspect`, the memory section",
+   "what": "`memory.tags` is each tag's blaze-mem bytes only: on a daemon of 5.8 GiB resident they summed to 2.5 GiB, with nothing on the global heap (1.8 GiB live) or on what was freed and kept (1.9 GiB). The full split was only in a line of serve.log written every 30 s while the daemon works.",
+   "cost": "an hour before the first true table",
+   "cause": "the section predates the heap per tag",
+   "workaround": "none needed",
+   "state": "fixed on mem2-1111 (9137787c00: heap by holder with what its pages hold, regions, kept; schema 2)"
+  },
+  {
+   "id": "mem2-4",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+   "where": "blaze: heap samples in a cargo-built binary",
+   "what": "`memory_sites` and `held_samples` named `__rustc::__rust_alloc` and `<Counting<Heaps> as GlobalAlloc>::realloc` as the call site of 90% of the bytes: the plumbing list knew the allocator shims only by the names blaze gives them.",
+   "cost": "the attribution table could not be made until it was fixed",
+   "cause": "a list of names with no test on a binary the system linker made",
+   "workaround": "none needed",
+   "state": "fixed on mem2-1111 (276ba7e15a)"
+  },
+  {
+   "id": "mem2-5",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+   "where": "blaze: `blaze explain memory`",
+   "what": "Every memory view is of a build at its footprint's peak. An idle daemon's question (what do you hold now, after the builds) had no view: `blaze explain memory` picks the last build with memory rows, often a 2 ms store task, and prints empty tables.",
+   "cost": "several hand-written queries",
+   "cause": "the views were made for the self-build's peak",
+   "workaround": "`blaze explain memory_held_now`; the idle line in serve.log (`idle: the kept front end of ... holds`)",
+   "state": "fixed on mem2-1111 (276ba7e15a, and the idle line)"
+  },
+  {
+   "id": "mem2-6",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+   "where": "blaze-engine: mimalloc and transparent huge pages",
+   "what": "`huge.rs` set `mi_option_large_os_pages` to choose whether mimalloc is on transparent huge pages. In mimalloc 3 that option is hugetlb only; `MADV_HUGEPAGE` is under `allow_thp`, on by default, and the first arena is mapped before `main`. So BLAZE_HUGE_PAGES never decided it, and the comment's measurement (25 GiB against 60) was of something else.",
+   "cost": "one wrong build and measurement; and, before this lane, 1.0 GiB resident on every Linux daemon that mimalloc counted in no page",
+   "cause": "an option's name carried over from mimalloc 2; nothing checked the mapping's flags",
+   "workaround": "libmimalloc-sys's `no_thp` feature (MI_NO_THP)",
+   "state": "fixed on mem2-1111 (f76b910171); a test that reads /proc/self/smaps for an `hg` arena is not written"
+  },
+  {
+   "id": "mem2-7",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+   "where": "blaze-mem and blaze-cas: give-backs nobody calls",
+   "what": "`frame::trim_spare` says it is \"what a worker does when it goes idle after a burst\" and `Store::evict_pool` says it is \"what the daemon's ceiling guard asks before it gives up\"; neither had a caller outside its crate's tests. An idle daemon kept 278 MiB of frame shelves and 68 MiB of pool pages for good.",
+   "cost": "found only by the table; the comments said it was done",
+   "cause": "the function landed, the call site did not, and a doc comment in the present tense reads as built",
+   "workaround": "none",
+   "state": "trim_spare is called by the idle give-back on mem2-1111; evict_pool still has no caller (open)"
+  },
+  {
+   "id": "mem2-8",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+   "where": "cargo build of blaze (the measuring binary)",
+   "what": "A cargo build prints several hundred `cargo::missing_lints_inheritance` and rustc warnings (291 in blaze-cargo alone) before any error; a filter for `^error` with context was drowned and reported a failed build as having no error.",
+   "cost": "one build misread",
+   "cause": "the tree is linted by blaze, so cargo's own warnings are nobody's",
+   "workaround": "`RUSTFLAGS=\"--cap-lints allow\"` and grep `^error` in the kept log",
+   "state": "open"
+  },
+  {
+   "id": "mem2-9",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+   "where": "blaze: the edit loop's rows",
+   "what": "`body edit + run` run back to back is bimodal on every binary, the base included: 100 to 120 ms or 280 to 340 ms, with one of forty past a second. Each edit's build is followed by about 0.7 s of work after the answer (`store kept front end`, the release), and an edit that arrives inside it waits. Medians of 15 runs swing between 125 and 300 ms for the same binary.",
+   "cost": "three rounds of measurement before any row could be compared; the lane compares the 25th percentile and a row with a pause before each edit",
+   "cause": "the next request waits for the work the last one left; not looked into further by this lane",
+   "workaround": "read p25 and min, and the rows with a pause",
+   "state": "open"
+  },
+  {
+   "id": "mem2-10",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+   "where": "blaze-cargo under cargo",
+   "what": "`#![blaze::sans_io]` at the top of a module file does not compile in blaze-cargo under cargo (custom inner attributes are unstable; blaze-query enables the feature, blaze-cargo does not).",
+   "cost": "one failed build",
+   "cause": "the feature gate is per crate",
+   "workaround": "`#[blaze::sans_io]` on the `mod` line",
+   "state": "open"
+  },
+  {
+   "id": "mem2-11",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+   "where": "blaze: an edit's build",
+   "what": "A one-line body edit of hello-world allocates and frees about 95 MiB of the global heap: `CompiledFunction::clone` 27 MiB, the linker's `file::fill` 20, `Build::patch_lists` 13, `beside::DebugWrite::apply` 8, `codegen::debug_side` 7.5 (alloc_samples by site, eight edits). The warm loop is meant to allocate nothing there (docs/v2/plan/design/memory.md).",
+   "cost": "it is what made mimalloc on base pages 17 ms slower an edit, and it is edit time on any pages",
+   "cause": "the edit's link and the walk copy whole-program tables",
+   "workaround": "none; the lane keeps freed pages warm between edits",
+   "state": "open (codegen and link lanes)"
+  },
+  {
+   "id": "mem2-12",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+   "where": "the agent's Bash tool",
+   "what": "A command that starts with `sleep N;` is refused, and a foreground wait loop is moved to the background after three minutes, so waiting for a four-minute measurement on a VM takes two or three tool calls.",
+   "cost": "a minute each time, about fifteen times",
+   "cause": "the harness's rule against sleeping",
+   "workaround": "an `until ... do sleep 20; done` loop, read when its notification comes",
+   "state": "open"
+  }
+ ]
+}
