@@ -40,7 +40,7 @@ pub fn await_added(db: &mut Db) {
     if Awaited::try_get(&*db).is_none() {
         // alloc: the one input value, once a database
         let none = Arc::new(HashSet::new_in(Global));
-        _ = Awaited::new(db, blaze_query::db::Durability::HIGH, none);
+        _ = Awaited::new(&*db, blaze_query::db::Durability::HIGH, none);
     }
 }
 
