@@ -426,3 +426,44 @@ from a placed zygote instead), against `codegen.md`; `delivery.md` asks for a de
 machine and ends the integration branch as a way of working (rule 35 was rewritten the same day to
 the smaller form: one lane at a time onto a green head). None of them changes steps 0 to B1 of the
 programme above; they order what comes after.
+
+## Evidence from the first test runs (2026-11-12, Mac, on the green head)
+
+The engine's shortcut proofs were tested for the first time against the seal refinement test, and
+it found three stale answers in three runs. They are one class: **a proof or an index made at one
+moment and trusted after a seal's state changed**. (1) The walk gathered readers before a broken
+group's rows were indexed. (2) The settle's floor said "everything holds" without asking what the
+walk asks (a row with an untracked read had not run). (3) The reach said "everything outside
+holds" before a group broke, and a row made in a sealed group after the seal was in neither the
+seal nor the reach. In each, the seal's own check held; the stale answer came from a shortcut
+beside it. Real builds therefore do not seal (the daemon's pass is removed) until the rebuild
+below passes the refinement test with its case budget raised a hundredfold.
+
+This settles point 4 of the first review by evidence rather than census alone. The rule for the
+rebuild (from the lane that built seals; traces in its handover):
+
+1. **One proof of "unchanged without looking at its reads":** this view's walk ended and did not
+   reach the row. The floor, `reach`, summary bits and durability levels are each a second
+   statement of what the walk knows; they go, each in its own piece of work, with the refinement
+   test and the census between.
+2. **A seal's state never changes while rows are traversed.** The walk goes group by group in
+   dependency order: the written groups first, then each group above once every group it imports
+   from is done, so a check only compares stamps; a group that breaks is indexed at the break and
+   joins the traversal before any group above it is looked at.
+3. **A row is behind a seal or in the index, never between.** A row made in a sealed group counts
+   as of no group for every proof until a pass puts it behind the seal.
+4. **Every input is of exactly one group** (a world group for the unclaimed), and a change of a
+   row's group is a change.
+
+Separately, the same day's run of the engine's property tests found an old wrong answer on main:
+a fixpoint over nested cycles was made final one round early (fixed on main, #2087). It did not
+involve any shortcut proof.
+
+Other first-run results: of ten failing tests in the front-end records crate, nine were tests
+that were wrong or vacuous (a fixture that put two crates in one source root; a path literal in
+source text; a test store that never paged; controls whose counted query names matched nothing)
+and one was an unfinished feature (no name in the def map's codec for an included file outside
+the file tree). Main has 15 failing constant-evaluation tests that its known-failures list does
+not name. A constants step added today could not hit under the real facts (every evaluation reads
+per-instance MIR no fact covers) and is switched off until runtime MIR is a step of the
+per-function store.
