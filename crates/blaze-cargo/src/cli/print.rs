@@ -157,6 +157,8 @@ pub struct Printer<'a, O: Write, S: Sink> {
     sources: json::Sources,
     /// The packages a status line was printed for: a bit for each package's index.
     packages: Vec<u64>,
+    /// Warnings said that a fix exists for (`check --fix` makes them); 0 while fixing.
+    fixable: u32,
     /// The first unit that said an error, as the build's last line names it, and its
     /// package: what `blaze explain` is asked of.
     failed: Option<String>,
@@ -204,6 +206,7 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
             sources: json::Sources::new(root),
             packages: Vec::with_capacity(PACKAGES.div_ceil(64) * 16),
             failed: None,
+            fixable: 0,
             printed: HashedSet::with_capacity_in(DIAGNOSTICS, Global),
             built: None,
             work: None,
@@ -593,6 +596,9 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
         if !error && !printed {
             return Ok(());
         }
+        if !error && !self.shown.fixing && fixable(diagnostic) {
+            self.fixable += 1;
+        }
         let named = match diagnostic.unit {
             Some(unit) => self.unit(unit, error)?,
             None => None,
@@ -664,7 +670,7 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
             // What says more of the failure: all it blocks, by its package.
             false => self.failed.as_ref().map(|package| format!("blaze explain {package}")), // alloc: once a build
             // A slow build points at what says why (`blaze slow`, docs/profiling.md).
-            true if took >= SLOW_BUILD => Some("blaze slow says why".to_owned()), // alloc: as above
+            true if took >= SLOW_BUILD => Some("blaze slow".to_owned()), // alloc: as above
             true => None,
         };
         let built = blaze_screen::Built {
@@ -682,6 +688,7 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
                 })
                 .collect(),
             unbuilt: u32::try_from(self.left).unwrap_or(u32::MAX),
+            fixable: self.fixable,
             program: self
                 .built
                 .as_ref()
@@ -694,8 +701,7 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
         self.err.take(Event::Built(built));
         if let Some(why) = why {
             // alloc: a cause each, once a build
-            let root = self.root.clone(); // clone: once a build
-            self.err.take(Event::Why(why.iter().map(|it| why_of(it, &root)).collect()));
+            self.err.take(Event::Why(why.iter().map(why_of).collect()));
             // The reports whole, as `blaze why` prints them.
             if self.shown.verbose > 0 && !self.shown.quiet {
                 for report in why {
@@ -722,47 +728,38 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
     }
 }
 
-/// A report's text in plain words, its paths shown from the checkout (`root`).
-fn plain(text: &blaze_api::Text, root: &str) -> String {
+/// One cause of a build's why (`Rebuilt::summary`'s report of it), as the screen takes it:
+/// its headline as the report has it, each part with its role; the cause's own words
+/// (`src/main.rs changed`: what follows `because` in the headline); the functions compiled
+/// again for it (its `codegen` facts); and whether it is work that should not have been done
+/// (said as a warning).
+fn why_of(report: &Report) -> Why {
     use blaze_report::Span;
-    let mut out = String::new(); // alloc: once a cause, at a build's end
-    for span in &text.0 {
+    let mut cause = blaze_api::Text::new();
+    let mut found = false;
+    for span in &report.headline.0 {
         match span {
-            Span::Path(it) => out.push_str(
-                it.strip_prefix(root).map_or(it.as_str(), |below| below.trim_start_matches('/')),
-            ),
-            Span::Plain(it) | Span::Code(it) | Span::Version(it) | Span::Var(it) => out.push_str(it),
-            Span::Hash(it) => out.push_str(it.get(..8).unwrap_or(it)),
-            Span::Package { name, version } => {
-                out.push_str(name);
-                if let Some(version) = version {
-                    out.push(' ');
-                    out.push_str(version);
+            Span::Plain(words) if !found => {
+                if let Some((_, after)) = words.split_once(" because ") {
+                    found = true;
+                    if !after.is_empty() {
+                        cause.push(Span::Plain(after.to_owned())); // alloc: once a cause
+                    }
                 }
             }
-            // Writing to a String cannot fail.
-            Span::Count(n) => _ = write!(out, "{n}"),
-            Span::Took(ns) => out.push_str(&blaze_screen::text::time(ns / 1_000_000)),
+            span if found => cause.push(span.clone()), // clone: as above
+            _ => {}
         }
     }
-    out
-}
-
-/// One cause of a build's why (`Rebuilt::summary`'s report of it), as the screen takes it:
-/// the cause's own words (`src/main.rs changed`, what follows `because` in its headline), the
-/// functions compiled again for it (its `codegen` facts), and whether it is work that should
-/// not have been done (said as a warning).
-fn why_of(report: &Report, root: &str) -> Why {
-    let headline = plain(&report.headline, root);
-    let cause = headline.split_once(" because ").map_or("", |it| it.1).to_owned(); // alloc: once a cause
     let mut functions: Vec<String> = Vec::new(); // alloc: as above
     for fact in &report.facts {
-        let text = plain(&fact.text, root);
+        let text = fact.text.flat();
         let Some((step, names)) = text.split_once(": ") else { continue };
         if !step.starts_with("codegen") {
             continue;
         }
         for name in names.split(", ") {
+            let name = name.trim_matches('`');
             // `main` beside `hello::main` is the program's entry, the same function.
             let last = |it: &str| it.rsplit("::").next().unwrap_or(it).to_owned();
             if !functions.iter().any(|it| it == name || last(it) == name) {
@@ -774,20 +771,20 @@ fn why_of(report: &Report, root: &str) -> Why {
     Why {
         wasted: report.severity == Severity::Warning,
         cause,
-        headline,
+        headline: report.headline.clone(), // clone: as above
         functions,
         more: report.rule.as_ref().map(|rule| format!("blaze explain {rule}")), // alloc: as above
     }
 }
 
-/// A build at least this long ends with a pointer to `blaze slow`.
-const SLOW_BUILD: Duration = Duration::from_secs(30);
-
-/// rustc's closing lines, which cargo replaces with its own summary.
-fn summarizes(message: &str) -> bool {
-    message.starts_with("aborting due to")
-        || message.ends_with(" warning emitted")
-        || message.ends_with(" warnings emitted")
+/// cargo's `machine_applicable`: a child of the diagnostic suggests a fix `check --fix` makes.
+fn fixable(diagnostic: DiagnosticRef<'_>) -> bool {
+    diagnostic.children.iter().any(|child| {
+        child
+            .spans
+            .iter()
+            .any(|span| span.applicability == Some(blaze_api::Applicability::MachineApplicable))
+    })
 }
 
 #[cfg(test)]

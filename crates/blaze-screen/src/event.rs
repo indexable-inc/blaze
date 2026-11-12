@@ -4,6 +4,7 @@
 use alloc::{boxed::Box, string::String, vec::Vec};
 
 use blaze_protocol::now::Now;
+use blaze_report::Text;
 use serde::{Deserialize, Serialize};
 
 /// The command whose build this is.
@@ -58,6 +59,7 @@ pub enum Event {
 
 /// The build's end.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+#[serde(default)]
 pub struct Built {
     pub ok: bool,
     /// Units made again, and units replayed.
@@ -71,8 +73,11 @@ pub struct Built {
     pub unbuilt: u32,
     /// The one program the build placed, where it placed exactly one: its path.
     pub program: Option<String>,
-    /// The command that says more of a failure: `blaze explain hello`.
+    /// The command that says more: of a failure (`blaze explain hello`), or of why a build
+    /// that passed took long (`blaze slow`). A command, as the reader types it.
     pub next: Option<String>,
+    /// Warnings a fix exists for, which `blaze check --fix` makes.
+    pub fixable: u32,
     /// The build's why is still to come ([`Event::Why`]): its line waits for it.
     pub why_follows: bool,
     /// Tests run after it (`test`): the region stays for them.
@@ -96,13 +101,30 @@ pub struct Why {
     /// recorded reason): it earns a line of its own.
     pub wasted: bool,
     /// `src/main.rs changed`: the cause, without the count of steps.
-    pub cause: String,
-    /// The whole headline, as the report says it.
-    pub headline: String,
+    #[serde(deserialize_with = "text_or_words")]
+    pub cause: Text,
+    /// The whole headline, as the report says it, each part with its role.
+    #[serde(deserialize_with = "text_or_words")]
+    pub headline: Text,
     /// The functions compiled again for it.
     pub functions: Vec<String>,
-    /// `blaze explain why:input`.
+    /// The command that says more: `blaze explain why:input`.
     pub more: Option<String>,
+}
+
+/// A [`Text`], or words alone as a transcript recorded before a why carried its roles has
+/// them.
+fn text_or_words<'de, D: serde::Deserializer<'de>>(from: D) -> Result<Text, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Words(String),
+        Text(Text),
+    }
+    Ok(match Either::deserialize(from)? {
+        Either::Words(words) => Text::plain(words),
+        Either::Text(text) => text,
+    })
 }
 
 /// What became of one test.

@@ -21,6 +21,34 @@ pub fn stderr_size() -> Option<(u16, u16)> {
     (got == 0 && size.ws_col > 0 && size.ws_row > 0).then_some((size.ws_col, size.ws_row))
 }
 
+/// The terminal standard error is stops echoing the keys typed into it; what puts it back is
+/// returned, None when stderr is no terminal or its settings can't be read. Its line
+/// discipline is otherwise left as it is: Ctrl-C still interrupts, and what is typed still
+/// reaches whoever reads the terminal next.
+#[cfg(unix)]
+pub fn stderr_echo_off() -> Option<libc::termios> {
+    // SAFETY: `termios` is plain integers and arrays of them, for which zeroes are a value.
+    let mut now: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: `tcgetattr` writes one `termios` through its second argument, which `&raw mut
+    // now` is for the call; on failure it writes nothing.
+    if unsafe { libc::tcgetattr(libc::STDERR_FILENO, &raw mut now) } != 0 {
+        return None;
+    }
+    let saved = now;
+    now.c_lflag &= !libc::ECHO;
+    // SAFETY: `tcsetattr` reads one `termios` through its third argument, live for the call.
+    (unsafe { libc::tcsetattr(libc::STDERR_FILENO, libc::TCSANOW, &raw const now) } == 0)
+        .then_some(saved)
+}
+
+/// The terminal standard error is as `saved` has it ([`stderr_echo_off`]'s).
+#[cfg(unix)]
+pub fn stderr_restore(saved: &libc::termios) {
+    // SAFETY: `tcsetattr` reads one `termios` through its third argument, live for the call;
+    // a failure leaves the terminal as it is, and there is no one to tell.
+    unsafe { libc::tcsetattr(libc::STDERR_FILENO, libc::TCSANOW, std::ptr::from_ref(saved)) };
+}
+
 /// The step of the coarse real-time clock, which the kernel stamps the files it writes with.
 #[cfg(target_os = "linux")]
 pub fn coarse_clock_step() -> Option<std::time::Duration> {

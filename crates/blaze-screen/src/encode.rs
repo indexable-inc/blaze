@@ -12,25 +12,32 @@
 use alloc::string::String;
 use core::fmt::Write as _;
 
-use blaze_report::terminal::{self, Terminal};
+use blaze_report::{
+    palette::Token,
+    terminal::{self, Terminal},
+};
 
 use crate::frame::{Frame, Line, Progress, Role, Span};
 
-/// The SGR parameters of a role: a palette of the eight colours every terminal has, each
-/// readable on a light and on a dark background (no white, no black, no bright variant), with
-/// bold and faint for weight.
-fn sgr(role: Role) -> &'static str {
-    match role {
-        Role::Plain => "",
-        Role::Strong => "1",
-        Role::Running => "36",
-        Role::Done => "32",
-        Role::Waiting => "33",
-        Role::Cached => "34",
-        Role::Failed => "1;31",
-        Role::Warned => "1;33",
-        Role::Dim => "2",
-    }
+/// The SGR parameters of a role on `terminal`: the palette's value of its token
+/// (`blaze_report::palette`), for how many colours the terminal draws and its background.
+fn sgr(role: Role, terminal: &Terminal) -> &'static str {
+    let token = match role {
+        Role::Plain => return "",
+        Role::Strong => Token::Emphasis,
+        Role::Running => Token::Running,
+        Role::Done => Token::Success,
+        Role::Waiting => Token::Waiting,
+        Role::Cached => Token::Cached,
+        Role::Failed => Token::Failure,
+        Role::Warned => Token::Warning,
+        Role::Dim => Token::Dim,
+        Role::Code => Token::Code,
+        Role::Command => Token::Command,
+        Role::Path => Token::Path,
+        Role::Number => Token::Number,
+    };
+    terminal.sgr(token)
 }
 
 fn link_open(out: &mut String, url: &str) {
@@ -40,8 +47,9 @@ fn link_open(out: &mut String, url: &str) {
     out.push_str("\x1b\\");
 }
 
-fn span(out: &mut String, span: &Span, color: bool, links: bool) {
-    let code = sgr(span.role);
+fn span(out: &mut String, span: &Span, terminal: &Terminal, links: bool) {
+    let color = terminal.caps.color;
+    let code = sgr(span.role, terminal);
     let linked = links.then_some(span.link.as_deref()).flatten();
     if let Some(url) = linked {
         link_open(out, url);
@@ -51,6 +59,13 @@ fn span(out: &mut String, span: &Span, color: bool, links: bool) {
             // Writing to a String cannot fail.
             let _ = write!(out, "\x1b[{code}m{}\x1b[0m", span.text);
         }
+        // With no colour to say so, code and a command are told from the words around them by
+        // backticks.
+        false if !color && matches!(span.role, Role::Code | Role::Command) => {
+            out.push('`');
+            out.push_str(&span.text);
+            out.push('`');
+        }
         false => out.push_str(&span.text),
     }
     if linked.is_some() {
@@ -58,9 +73,9 @@ fn span(out: &mut String, span: &Span, color: bool, links: bool) {
     }
 }
 
-fn line(out: &mut String, line: &Line, color: bool, linked: bool) {
+fn line(out: &mut String, line: &Line, terminal: &Terminal, linked: bool) {
     match line {
-        Line::Spans(spans) => spans.iter().for_each(|it| span(out, it, color, linked)),
+        Line::Spans(spans) => spans.iter().for_each(|it| span(out, it, terminal, linked)),
         Line::Raw { text, links } if linked => {
             let mut at = 0;
             for mark in links {
@@ -84,9 +99,8 @@ fn line(out: &mut String, line: &Line, color: bool, linked: bool) {
 /// `frame` at the end of `out`, for `terminal`: its colour, its links, its progress report
 /// and its notifications, each only where it has one.
 pub fn encode(frame: &Frame, terminal: &Terminal, out: &mut String) {
-    let color = terminal.caps.color;
     if !frame.live {
-        frame.above.iter().for_each(|it| line(out, it, color, false));
+        frame.above.iter().for_each(|it| line(out, it, terminal, false));
         return;
     }
     let links = terminal.caps.links;
@@ -111,8 +125,8 @@ pub fn encode(frame: &Frame, terminal: &Terminal, out: &mut String) {
             Some(false) => out.push_str("\x1b[?25h"),
             None => {}
         }
-        frame.above.iter().for_each(|it| line(out, it, color, links));
-        frame.region.iter().for_each(|it| line(out, it, color, links));
+        frame.above.iter().for_each(|it| line(out, it, terminal, links));
+        frame.region.iter().for_each(|it| line(out, it, terminal, links));
         if let Some(progress) = frame.progress {
             let progress = match progress {
                 Progress::Clear => terminal::Progress::Clear,

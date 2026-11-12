@@ -21,6 +21,7 @@ use alloc::{
 };
 
 use blaze_protocol::now::{Now, Phase};
+use blaze_report::Text;
 
 use crate::{
     event::{BinaryEnd, Built, Command, Event, Test, Verdict, Why},
@@ -359,6 +360,14 @@ impl Screen {
         Some(frame)
     }
 
+    /// `text` as words alone, its paths shown from the checkout: a field of a pipe's line,
+    /// which is quoted whole.
+    fn words(&self, text: &Text) -> String {
+        let mut line = Line::new();
+        line.push_text(text, Role::Plain, self.opts.root.as_deref());
+        line.text()
+    }
+
     fn glyph(&self, unicode: &'static str, ascii: &'static str) -> &'static str {
         match self.caps.unicode {
             true => unicode,
@@ -672,6 +681,23 @@ impl Screen {
                 }
             }
         }
+        if !quiet && built.fixable > 0 {
+            let line = match self.caps.live {
+                true => Line::new()
+                    .with(Role::Dim, "  hint: ")
+                    .with(Role::Number, text::count(u64::from(built.fixable), "warning", "warnings"))
+                    .with(Role::Plain, match built.fixable {
+                        1 => " has a fix: ",
+                        _ => " have a fix: ",
+                    })
+                    .with(Role::Command, "blaze check --fix"),
+                false => Line::new().with(
+                    Role::Plain,
+                    format!("blaze: hint fixable={} run=\"blaze check --fix\"", built.fixable),
+                ), // alloc: a line, once
+            };
+            self.above.push(line); // alloc: as above
+        }
         if !quiet {
             // The same waste said once, with how many times.
             let mut said: Vec<(&Why, usize)> = Vec::new(); // alloc: once a build
@@ -689,10 +715,12 @@ impl Screen {
                 let line = match self.caps.live {
                     true => {
                         let mut line = Line::new()
-                            .with(Role::Warned, format!("{} ", self.glyph("⚠", "!"))) // alloc: as above
-                            .with(Role::Plain, format!("{}{times}", why.headline)); // alloc: as above
+                            .with(Role::Warned, format!("{} ", self.glyph("⚠", "!"))); // alloc: as above
+                        line.push_text(&why.headline, Role::Plain, self.opts.root.as_deref());
+                        line.push(Role::Plain, times);
                         if let Some(more) = &why.more {
-                            line.push(Role::Dim, format!(" {} {more}", self.dot())); // alloc: as above
+                            line.push(Role::Dim, format!(" {} ", self.dot())); // alloc: as above
+                            line.push(Role::Command, more.clone()); // clone: as above
                         }
                         line
                     }
@@ -700,7 +728,7 @@ impl Screen {
                         let more = why.more.as_ref().map_or(String::new(), |it| format!(" next={}", text::value(it))); // alloc: as above
                         Line::new().with(
                             Role::Plain,
-                            format!("blaze: wasted why={}{more}", text::value(&format!("{}{times}", why.headline))),
+                            format!("blaze: wasted why={}{more}", text::value(&format!("{}{times}", self.words(&why.headline)))),
                         ) // alloc: as above
                     }
                 };
@@ -713,7 +741,7 @@ impl Screen {
                     ); // alloc: `-v`
                 }
                 for why in whys.iter().filter(|it| !it.wasted) {
-                    let mut said = format!("  why: {}", why.headline); // alloc: `-v`
+                    let mut said = format!("  why: {}", self.words(&why.headline)); // alloc: `-v`
                     if !why.functions.is_empty() {
                         said.push_str(": ");
                         said.push_str(&why.functions.join(", ")); // alloc: `-v`
@@ -732,19 +760,23 @@ impl Screen {
         }
     }
 
-    /// `✓ hello::add recompiled in 0.70s · src/main.rs changed · tier 0`.
+    /// `✓ hello::add recompiled in 0.70s · src/main.rs changed · tier 0`: each part with its
+    /// role (the functions code, the time the line's figure, the program a path that leads to
+    /// its file, a command a command).
     fn built_line(&self, built: &Built, whys: &[Why], took: u64, noop: bool) -> Line {
         let mut line = Line::new();
         let dot = self.dot();
+        let root = self.opts.root.as_deref();
         if noop {
             line.push(Role::Dim, format!("up to date {dot} {}", text::time(took))); // alloc: the build's line, once
         } else {
             line.push(Role::Done, format!("{} ", self.glyph("✓", "ok"))); // alloc: as above
-            let (what, cause) = self.made(built, whys);
-            line.push(Role::Plain, what);
-            line.push(Role::Strong, format!(" in {}", text::time(took))); // alloc: as above
+            let cause = self.made(&mut line, built, whys);
+            line.push(Role::Plain, " in ");
+            line.push(Role::Number, text::time(took));
             if let Some(cause) = cause {
-                line.push(Role::Dim, format!(" {dot} {cause}")); // alloc: as above
+                line.push(Role::Dim, format!(" {dot} ")); // alloc: as above
+                line.push_text(cause, Role::Dim, root);
             }
             if let Some(tier) = &built.tier {
                 // `tier 0 · 0% optimized` says `tier 0` twice.
@@ -756,13 +788,16 @@ impl Screen {
             }
         }
         if self.warnings > 0 {
+            line.push(Role::Dim, format!(" {dot} ")); // alloc: as above
             line.push(
                 Role::Warned,
-                format!(" {dot} {}", text::count(u64::from(self.warnings), "warning", "warnings")),
-            ); // alloc: as above
+                text::count(u64::from(self.warnings), "warning", "warnings"),
+            );
         }
         if let Some(next) = &built.next {
-            line.push(Role::Dim, format!(" {dot} {next}")); // alloc: as above
+            line.push(Role::Dim, format!(" {dot} ")); // alloc: as above
+            line.push(Role::Command, next.clone()); // clone: as above
+            line.push(Role::Dim, " says why");
         }
         // Where the program is, for a command that does not run it.
         if matches!(self.opts.command, Command::Build | Command::Other)
@@ -771,40 +806,50 @@ impl Screen {
             let left = self.most_cols().saturating_sub(line.width() + 3);
             if left >= 12 {
                 line.push(Role::Dim, format!(" {} ", self.glyph("→", "->"))); // alloc: as above
-                line.push_link(Role::Plain, text::middle(program, left), file_url(program));
+                line.push_link(Role::Path, text::middle(program, left), file_url(program));
             }
         }
         line
     }
 
-    /// What the build made, in the words of its size: the functions for a handful, the units
-    /// otherwise; and the cause, when one cause is all of it.
-    fn made(&self, built: &Built, whys: &[Why]) -> (String, Option<String>) {
+    /// What the build made, at the end of `line`, in the words of its size: the functions for
+    /// a handful, the units otherwise. Returns the cause, when one cause is all of it.
+    fn made<'a>(&self, line: &mut Line, built: &Built, whys: &'a [Why]) -> Option<&'a Text> {
         let real: Vec<&Why> = whys.iter().filter(|it| !it.wasted).collect(); // alloc: once a build
         let functions: Vec<&str> =
             real.iter().flat_map(|it| it.functions.iter().map(String::as_str)).collect(); // alloc: as above
         let cause = match real.as_slice() {
-            [one] if !one.cause.is_empty() => Some(one.cause.clone()), // clone: as above
+            [one] if !one.cause.0.is_empty() => Some(&one.cause),
             _ => None,
         };
         let edit = built.compiled <= 2 && !functions.is_empty();
-        let what = match (edit, functions.len()) {
-            (true, 1..=NAMED) => format!("{} recompiled", functions.join(", ")), // alloc: as above
-            (true, n) => format!(
-                "{n} functions recompiled ({}, {} {} more)",
-                functions[..2].join(", "),
-                self.glyph("…", "and"),
-                n - 2
-            ), // alloc: as above
-            (false, _) => {
-                let mut what = format!("built {}", text::count(built.compiled, "unit", "units")); // alloc: as above
-                if built.cached > 0 {
-                    what.push_str(&format!(", {} cached", built.cached)); // alloc: as above
+        match (edit, functions.len()) {
+            (true, n @ 1..=NAMED) => {
+                for (at, function) in functions.iter().enumerate() {
+                    line.push(Role::Code, *function);
+                    if at + 1 < n {
+                        line.push(Role::Plain, ", ");
+                    }
                 }
-                what
+                line.push(Role::Plain, " recompiled");
             }
-        };
-        (what, cause)
+            (true, n) => {
+                line.push(Role::Number, format!("{n}")); // alloc: as above
+                line.push(Role::Plain, " functions recompiled (");
+                line.push(Role::Code, functions[0]);
+                line.push(Role::Plain, ", ");
+                line.push(Role::Code, functions[1]);
+                line.push(Role::Plain, format!(", {} {} more)", self.glyph("…", "and"), n - 2)); // alloc: as above
+            }
+            (false, _) => {
+                line.push(Role::Plain, "built ");
+                line.push(Role::Number, text::count(built.compiled, "unit", "units"));
+                if built.cached > 0 {
+                    line.push(Role::Plain, format!(", {} cached", built.cached)); // alloc: as above
+                }
+            }
+        }
+        cause
     }
 
     /// `✗ build failed in 0.31s · 1 error in hello (bin) · 2 units not built · blaze explain hello`.
@@ -839,7 +884,7 @@ impl Screen {
         }
         if let Some(next) = &built.next {
             line.push(Role::Dim, format!(" {dot} ")); // alloc: as above
-            line.push(Role::Plain, next.clone()); // clone: as above
+            line.push(Role::Command, next.clone()); // clone: as above
         }
         line
     }
@@ -870,9 +915,9 @@ impl Screen {
         }
         let real: Vec<&Why> = whys.iter().filter(|it| !it.wasted).collect(); // alloc: as above
         if let [one] = real.as_slice()
-            && !one.cause.is_empty()
+            && !one.cause.0.is_empty()
         {
-            line.push_str(&format!(" cause={}", text::value(&one.cause))); // alloc: as above
+            line.push_str(&format!(" cause={}", text::value(&self.words(&one.cause)))); // alloc: as above
         }
         let functions: Vec<&str> =
             real.iter().flat_map(|it| it.functions.iter().map(String::as_str)).collect(); // alloc: as above
@@ -1140,7 +1185,7 @@ impl Screen {
         ); // alloc: as above
         let mut lines = alloc::vec![line]; // alloc: as above
         for rerun in &tests.reruns {
-            lines.push(Line::new().with(Role::Dim, "  rerun: ").with(Role::Plain, rerun.clone())); // alloc: once a failing executable
+            lines.push(Line::new().with(Role::Dim, "  rerun: ").with(Role::Command, rerun.clone())); // alloc: once a failing executable
         }
         lines
     }

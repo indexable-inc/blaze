@@ -19,7 +19,10 @@
 //! tmux_passthrough = false
 //! ```
 
-use crate::Caps;
+use crate::{
+    Caps,
+    palette::{Depth, Ground, Token},
+};
 
 /// `auto` or `off`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -54,10 +57,14 @@ pub struct Config {
     pub hyperlinks: Auto,
     pub notify_after_secs: u64,
     pub tmux_passthrough: bool,
+    /// `background = "dark"` or `"light"`: which set of the palette is used; unset, the
+    /// terminal's `COLORFGBG` says, and with none it is dark.
+    pub background: Option<Ground>,
 }
 
 impl Config {
     pub const DEFAULT: Config = Config {
+        background: None,
         color: Color::Auto,
         notify: Notify::Failure,
         progress: Auto::Auto,
@@ -116,14 +123,22 @@ impl Config {
                         .and_then(|it| u64::try_from(it).ok())
                         .ok_or_else(|| bad("a number of seconds"))?
                 }
+                "background" => {
+                    config.background = match value.as_str() {
+                        Some("dark") => Some(Ground::Dark),
+                        Some("light") => Some(Ground::Light),
+                        Some("auto") => None,
+                        _ => return Err(bad("\"auto\", \"dark\" or \"light\"")),
+                    }
+                }
                 "tmux_passthrough" => {
                     config.tmux_passthrough = value.as_bool().ok_or_else(|| bad("true or false"))?
                 }
                 _ => {
                     // alloc: an error, once
                     return Err(format!(
-                        "config.toml's `terminal` has no `{key}`: it takes color, hyperlinks, progress, notify, \
-                         notify_after_secs and tmux_passthrough"
+                        "config.toml's `terminal` has no `{key}`: it takes color, background, hyperlinks, \
+                         progress, notify, notify_after_secs and tmux_passthrough"
                     ));
                 }
             }
@@ -154,6 +169,10 @@ pub struct Terminal {
     pub notify_after_secs: u64,
     /// Sequences other than colour go through tmux's passthrough.
     pub tmux: bool,
+    /// How many colours it draws where it draws any ([`Terminal::depth`] is what to ask).
+    pub colors: Depth,
+    /// Its background: which set of the palette is used.
+    pub ground: Ground,
 }
 
 impl Terminal {
@@ -165,7 +184,23 @@ impl Terminal {
         notify: Notify::Failure,
         notify_after_secs: 10,
         tmux: false,
+        colors: Depth::Ansi16,
+        ground: Ground::Dark,
     };
+
+    /// How many colours are written: none where colour is off ([`Caps::color`], which the
+    /// command's `--color` decides last).
+    pub fn depth(&self) -> Depth {
+        match self.caps.color {
+            true => self.colors,
+            false => Depth::None,
+        }
+    }
+
+    /// The SGR parameters of `token` on this terminal; empty for none.
+    pub fn sgr(&self, token: Token) -> &'static str {
+        crate::palette::sgr(token, self.depth(), self.ground)
+    }
 }
 
 impl Default for Terminal {
@@ -194,7 +229,26 @@ pub fn detect(
         Color::Auto if var("CLICOLOR_FORCE").is_some_and(|it| it != "0") => true,
         Color::Auto => terminal && !dumb,
     };
+    // 24-bit where the terminal says so, 256 where its name does, else the basic colours.
+    let colorterm = var("COLORTERM").unwrap_or_default();
+    let colors = match () {
+        () if colorterm == "truecolor" || colorterm == "24bit" => Depth::True,
+        () if matches!(program.as_str(), "ghostty" | "iTerm.app" | "WezTerm" | "vscode") => Depth::True,
+        () if term == "xterm-ghostty" || term == "xterm-kitty" => Depth::True,
+        () if term.contains("256color") => Depth::Ansi256,
+        () => Depth::Ansi16,
+    };
+    // `COLORFGBG` is `foreground;background` in the basic colours (rxvt, Konsole, iTerm2):
+    // white or bright white behind is a light terminal.
+    let ground = config.background.unwrap_or_else(|| {
+        match var("COLORFGBG").as_deref().and_then(|it| it.rsplit(';').next()) {
+            Some("7" | "15") => Ground::Light,
+            _ => Ground::Dark,
+        }
+    });
     let none = Terminal {
+        colors,
+        ground,
         caps: Caps { color, links: false, width: if terminal { width } else { None } },
         progress: false,
         notifier: None,
@@ -227,6 +281,8 @@ pub fn detect(
     let links = !matches!(kind, Kind::ConEmu | Kind::Other) && config.hyperlinks == Auto::Auto;
     let through = !muxed || config.tmux_passthrough;
     Terminal {
+        colors,
+        ground,
         caps: Caps { color, links: links && !muxed, width },
         progress: shows_progress && config.progress == Auto::Auto && through,
         notifier: notifier.filter(|_| through && config.notify != Notify::Off),

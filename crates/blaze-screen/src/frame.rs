@@ -22,6 +22,13 @@ pub enum Role {
     Warned,
     /// Detail: read second.
     Dim,
+    /// Code or an identifier. Where there is no colour it is put between backticks.
+    Code,
+    /// A command the reader can run as it is. Between backticks where there is no colour.
+    Command,
+    Path,
+    /// The figure of a line: a count, a time.
+    Number,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -64,6 +71,39 @@ impl Line {
     pub fn push(&mut self, role: Role, text: impl Into<String>) {
         if let Line::Spans(spans) = self {
             spans.push(Span { text: text.into(), role, link: None }); // alloc: a row's span
+        }
+    }
+
+    /// `text`'s spans at the end of the line, each with the role its type gives it; words take
+    /// `words`. A path is shown from `root` and leads to its file.
+    pub fn push_text(&mut self, text: &blaze_report::Text, words: Role, root: Option<&str>) {
+        use blaze_report::Span as S;
+        for span in &text.0 {
+            match span {
+                S::Plain(it) => self.push(words, it.as_str()),
+                S::Code(it) | S::Var(it) => self.push(Role::Code, it.as_str()),
+                S::Command(it) => self.push(Role::Command, it.as_str()),
+                S::Strong(it) => self.push(Role::Strong, it.as_str()),
+                S::Path(it) => {
+                    let shown = root
+                        .and_then(|root| it.strip_prefix(root))
+                        .map_or(it.as_str(), |below| below.trim_start_matches('/'));
+                    match it.starts_with('/') {
+                        true => self.push_link(Role::Path, shown, crate::file_url(it)),
+                        false => self.push(Role::Path, shown),
+                    }
+                }
+                S::Package { name, version } => {
+                    self.push(Role::Strong, name.as_str());
+                    if let Some(version) = version {
+                        self.push(Role::Dim, alloc::format!(" {version}")); // alloc: a span
+                    }
+                }
+                S::Version(it) => self.push(Role::Dim, it.as_str()),
+                S::Hash(it) => self.push(Role::Dim, it.get(..8).unwrap_or(it)),
+                S::Count(n) => self.push(Role::Number, alloc::format!("{n}")), // alloc: a span
+                S::Took(ns) => self.push(Role::Number, text::time(ns / 1_000_000)),
+            }
         }
     }
 

@@ -17,6 +17,11 @@
 //! or when a timer of the region is due, whether or not the daemon said anything. Off a
 //! terminal nothing has a timer, and the command's thread drives the [`Show`] itself.
 //!
+//! While a region is redrawn the terminal does not echo the keys typed into it ([`quiet_keys`]):
+//! a key echoed would land in the region and stay as a stale character. The terminal is
+//! otherwise as it was (no raw mode: Ctrl-C is still the signal), and its echo is back on
+//! every way out, before anything else writes it.
+//!
 //! `BLAZE_UI_TRANSCRIPT=<file>` records the event stream as it came, one event a line as
 //! JSON with its time ([`blaze_screen::Stamped`]): what the tests of blaze-screen replay.
 
@@ -48,6 +53,26 @@ pub trait Sink {
 /// The rows of the live region on the terminal now: what an interrupt erases.
 static REGION_ROWS: AtomicU16 = AtomicU16::new(0);
 
+/// The terminal's settings as they were before its echo was turned off, once it was.
+#[cfg(unix)]
+static ECHOED: std::sync::OnceLock<libc::termios> = std::sync::OnceLock::new();
+
+/// The terminal stops echoing typed keys, until [`echo_keys`].
+fn quiet_keys() {
+    #[cfg(unix)]
+    if let Some(saved) = crate::raw::system::stderr_echo_off() {
+        let _ = ECHOED.set(saved);
+    }
+}
+
+/// The terminal echoes typed keys again, if [`quiet_keys`] stopped it.
+fn echo_keys() {
+    #[cfg(unix)]
+    if let Some(saved) = ECHOED.get() {
+        crate::raw::system::stderr_restore(saved);
+    }
+}
+
 /// The screen of one command and the stream it is written to.
 pub struct Show<E: Write> {
     screen: Screen,
@@ -63,6 +88,8 @@ pub struct Show<E: Write> {
     transcript: Option<io::BufWriter<std::fs::File>>,
     /// Rows of the region this wrote last.
     rows: u16,
+    /// This turned the terminal's echo off, and puts it back when it is dropped.
+    quiets_keys: bool,
 }
 
 /// What stderr is for a region: its capabilities as the core takes them.
@@ -94,6 +121,8 @@ impl<E: Write> Show<E> {
         let mut show = Show::with_clock(options, caps, terminal, Box::new(clock), err); // alloc: once a command
         if caps.live {
             show.size = stderr_size;
+            show.quiets_keys = true;
+            quiet_keys();
         }
         show.transcript = std::env::var_os("BLAZE_UI_TRANSCRIPT")
             .and_then(|path| std::fs::File::create(path).ok())
@@ -119,6 +148,7 @@ impl<E: Write> Show<E> {
             size: || None,
             transcript: None,
             rows: 0,
+            quiets_keys: false,
         }
     }
 
@@ -201,6 +231,9 @@ impl<E: Write> Drop for Show<E> {
         if self.rows > 0 {
             let _ = self.write(&Frame::restore(self.rows));
         }
+        if self.quiets_keys {
+            echo_keys();
+        }
     }
 }
 
@@ -244,6 +277,7 @@ pub fn interrupted(terminal: &Terminal) -> ! {
     blaze_screen::encode(&Frame::restore(rows), terminal, &mut bytes);
     let mut err = io::stderr();
     let _ = err.write_all(bytes.as_bytes());
+    echo_keys();
     let _ = err.write_all(b"interrupted\n");
     let _ = err.flush();
     std::process::exit(blaze_core::exit::INTERRUPTED);

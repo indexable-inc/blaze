@@ -179,8 +179,15 @@ fn plan(draws: &mut impl Draws) -> Plan {
     if ok {
         steps.push(Step::Event(Event::Why(vec![Why {
             wasted: draws.below(2) == 0,
-            cause: "src/main.rs changed".to_owned(),
-            headline: "recomputed 2 steps because src/main.rs changed".to_owned(),
+            cause: blaze_report::say!(blaze_report::say::At("/w/src/main.rs"), " changed"),
+            headline: blaze_report::say!(
+                "recomputed ",
+                blaze_report::say::Count(2),
+                " steps because ",
+                blaze_report::say::At("/w/src/main.rs"),
+                " changed; run ",
+                blaze_report::say::Cmd("blaze why"),
+            ),
             functions: vec!["hello::add".to_owned()],
             more: Some("blaze explain why:input".to_owned()),
         }])));

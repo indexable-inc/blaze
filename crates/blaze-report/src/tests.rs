@@ -143,7 +143,7 @@ fn colour_styles_spans_not_lines() {
     let caps = Caps { color: true, links: true, width: None };
     assert_eq!(
         render(&report, caps, &ROOTS),
-        "\x1b[1m\x1b[91merror\x1b[0m: run \x1b[38;5;203m\x1b[48;5;236mnix develop\x1b[0m in \
+        "\x1b[1m\x1b[91merror\x1b[0m: run \x1b[1mnix develop\x1b[0m in \
          \x1b]8;;file:///w/a%20b\x1b\\\x1b[2ma b\x1b[0m\x1b]8;;\x1b\\\n"
     );
 }
