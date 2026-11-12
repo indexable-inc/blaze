@@ -190,6 +190,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     deterministic simulation by default, in process, under many seeds; a real process, daemon or
     kernel is used only for what the simulation cannot model, and a part that cannot run under
     simulation is a sans-IO gap to close. Skill: `testing`.
+65. **granular-caching**: Every cache is keyed per item (a function, a type, an impl, a name), by that
+    item's own content and exactly what it read; a key at crate level is not acceptable, and a crate
+    is only a container entries are packed in. Skill: `compiler-correctness`.
 
 ## Code Review Rules
 
