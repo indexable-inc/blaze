@@ -701,12 +701,34 @@ pub(crate) fn manifest_kind(unit: &Unit, what: &str) -> Result<TargetKind, Lower
 }
 
 /// Where a proc macro runs for the crate: the workspace's root for a member, its package's
-/// directory otherwise, as cargo runs rustc.
-pub(crate) fn proc_macro_cwd(root: &Root, package: &PackagePlan) -> String {
-    match (&root.dir, package.is_member) {
-        (Some(dir), true) => dir.clone(),
+/// directory otherwise, as cargo runs rustc. A package of the standard library (`library`,
+/// where the library is named, when the crate's unit is one of its units) is a member of the
+/// library's own workspace, which is loaded as one more workspace: its root is the library's,
+/// never the root of the workspace that asked for it.
+///
+/// The invariant: nothing of a crate of the standard library names the workspace that builds
+/// it, so its settings ([`base_db::Crate::content`]), its identity and every key made of them
+/// (dependency images, the item store, unit records) are the same in every workspace of the
+/// machine. Until 2026-11-11 the library's members were given the asking workspace's root
+/// here, so every one of the library's units missed its record in each new workspace and a
+/// new hello-world was built as a cold one (14 s where its second build takes 1 s). Test:
+/// `the_standard_library_is_keyed_the_same_whatever_workspace_builds_it`.
+pub(crate) fn proc_macro_cwd(root: &Root, package: &PackagePlan, library: Option<&str>) -> String {
+    #[cfg(test)]
+    let library = library.filter(|_| !LIBRARY_RUNS_IN_THE_WORKSPACE.get());
+    match (library, &root.dir, package.is_member) {
+        (Some(library), _, true) => library.trim_end_matches('/').to_owned(),
+        (None, Some(dir), true) => dir.clone(),
         _ => files::parent(&package.manifest_path).to_owned(),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: a member of the standard library's workspace runs its proc
+    /// macros in the root of the workspace that asked for it, as it did until 2026-11-11.
+    pub(crate) static LIBRARY_RUNS_IN_THE_WORKSPACE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// The workspace's root, as cargo finds it from a member, and what its manifest sets.
@@ -727,7 +749,24 @@ pub(crate) fn root<T: blaze_query::Tree>(
     units: &Units,
     tree: &files::Mounts<'_, T>,
 ) -> Result<Root, LowerError> {
-    let Some(member) = units.packages.iter().find(|it| it.is_member) else {
+    // A member of the workspace asked for, never of the standard library's own workspace,
+    // whose packages are members too: the first in the plan's order could be either.
+    let of_library = |package: &PackagePlan| {
+        let mut any = false;
+        for unit in units.graph.units.iter().filter(|it| it.pkg_id == package.id) {
+            if !unit.is_std {
+                return false;
+            }
+            any = true;
+        }
+        any
+    };
+    let builds = |package: &PackagePlan| {
+        units.graph.units.iter().any(|it| it.pkg_id == package.id && !it.is_std)
+    };
+    let members = || units.packages.iter().filter(|it| it.is_member);
+    let Some(member) = members().find(|it| builds(it)).or_else(|| members().find(|it| !of_library(it)))
+    else {
         return Ok(Root {
             dir: None,
             const_eval: ConstEvalBudget::default(),

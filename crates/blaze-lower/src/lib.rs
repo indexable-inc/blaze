@@ -742,7 +742,11 @@ fn lower_writes<T: blaze_query::Tree>(
                             root: macros_root,
                             const_ast_root,
                             const_ast_dir: &const_ast_dir,
-                            proc_macro_cwd: abs(&crates::proc_macro_cwd(&workspace_root, package))?,
+                            proc_macro_cwd: abs(&crates::proc_macro_cwd(
+                                &workspace_root,
+                                package,
+                                unit.is_std.then_some(config.library.as_str()),
+                            ))?,
                             durability,
                         };
                         let (made, listed) =
@@ -828,7 +832,11 @@ fn lower_writes<T: blaze_query::Tree>(
             target_kind: crates::target_kind(unit, plan, what)?,
             manifest_kind: crates::manifest_kind(unit, what)?,
             crate_types: crates::crate_types(unit, plan, what)?,
-            proc_macro_cwd: Arc::new(abs(&crates::proc_macro_cwd(&workspace_root, package))?),
+            proc_macro_cwd: Arc::new(abs(&crates::proc_macro_cwd(
+                &workspace_root,
+                package,
+                unit.is_std.then_some(config.library.as_str()),
+            ))?),
         };
         let extra = base_db::ExtraCrateData {
             version: Some(package.version.clone()),

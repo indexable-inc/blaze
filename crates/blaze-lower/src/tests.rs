@@ -2781,3 +2781,88 @@ fn a_dependency_built_with_other_features_is_keyed_apart() {
         assert_ne!(was.1, now.1, "unit {unit}");
     }
 }
+
+/// [`program_units`] as a real plan gives the standard library: its packages are members of
+/// the library's own workspace (`blaze_units` loads it as one more workspace), and its units
+/// say they are the library's.
+fn program_units_of_a_real_library() -> Units {
+    let mut units = program_units(false);
+    for package in &mut units.packages {
+        if package.name == "core" {
+            package.is_member = true;
+        }
+    }
+    assert!(units.graph.units[CORE].is_std, "the fixture's `core` is a unit of the library");
+    units
+}
+
+/// [`program_units_of_a_real_library`] lowered in a workspace whose root is `/w` (a root
+/// manifest with a `[workspace]` there) or, without one, the first member's own directory:
+/// two workspaces to every crate made with the workspace's root.
+fn lowered_in_workspace(rooted: bool) -> Built {
+    let tree = MemTree::default();
+    let manifest: &[(&'static str, Option<&'static [u8]>)] =
+        &[("Cargo.toml", Some(b"[workspace]\nmembers = [\"a\", \"b\", \"m\"]\n"))];
+    let root = changed(&tree, if rooted { manifest } else { &[] });
+    let config = config(root, library(&tree));
+    let units = program_units_of_a_real_library();
+    let lowered =
+        lower(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }).unwrap();
+    Built { lowered }
+}
+
+/// The invariant: nothing of a crate of the standard library names the workspace that builds
+/// it. Its content ID, its identity and its image's key are the same in two workspaces (two
+/// roots), so the stores answer a new project's first build with what any other project's
+/// build left. A member of the workspace itself still holds its root (where its proc macros
+/// run), so the two workspaces' own crates stay apart (rule 21).
+#[test]
+fn the_standard_library_is_keyed_the_same_whatever_workspace_builds_it() {
+    let (mut one, mut other) = (lowered_in_workspace(true), lowered_in_workspace(false));
+    assert_eq!(shared_keys(&mut one, CORE), shared_keys(&mut other, CORE));
+    assert!(shared_keys(&mut one, CORE).2.is_some(), "`core`'s image key is among them");
+    let cwd = |built: &Built, unit| {
+        let krate = krate(built, unit);
+        krate.data(built.lowered.db()).proc_macro_cwd.as_str().to_owned()
+    };
+    assert_eq!(cwd(&one, CORE), LIBRARY, "the library's own workspace's root");
+    assert_eq!(cwd(&one, BIN), "/w");
+    assert_ne!(cwd(&other, BIN), "/w", "the premise: the two workspaces have two roots");
+    let (was, now) = (shared_keys(&mut one, BIN), shared_keys(&mut other, BIN));
+    assert_ne!(was.0, now.0, "a member's settings hold its workspace's root");
+    assert_ne!(was.1, now.1);
+}
+
+/// The control: with the library's members run in the asking workspace's root, as until
+/// 2026-11-11, `core` is another crate in each workspace, and the oracle says so.
+#[test]
+fn the_oracle_catches_a_library_crate_made_with_the_workspaces_root() {
+    crate::crates::LIBRARY_RUNS_IN_THE_WORKSPACE.set(true);
+    let (mut one, mut other) = (lowered_in_workspace(true), lowered_in_workspace(false));
+    crate::crates::LIBRARY_RUNS_IN_THE_WORKSPACE.set(false);
+    let (was, now) = (shared_keys(&mut one, CORE), shared_keys(&mut other, CORE));
+    assert_ne!(was.0, now.0, "the oracle sees `core`'s content ID move with the workspace");
+    assert_ne!(was.1, now.1, "and its identity");
+}
+
+/// The workspace's root is found from a member of the workspace asked for, never from a
+/// member of the standard library's own workspace, wherever the plan's order puts each.
+#[test]
+fn the_workspaces_root_is_never_the_standard_librarys() {
+    let mut units = program_units_of_a_real_library();
+    // The library's package first, as a plan sorted by id gives it for a checkout whose path
+    // sorts after the library's.
+    let core = units.packages.iter().position(|it| it.name == "core").unwrap();
+    units.packages.swap(0, core);
+    let tree = MemTree::default();
+    let root = changed(&tree, &[("Cargo.toml", Some(b"[workspace]\nmembers = [\"a\", \"b\", \"m\"]\n"))]);
+    let config = config(root, library(&tree));
+    let mounts = crate::files::Mounts {
+        mounts: &config.mounts,
+        view: root,
+        tree: &tree,
+        read_view: std::cell::Cell::new(false),
+    };
+    let found = crate::crates::root(&units, &mounts).unwrap();
+    assert_eq!(found.dir.as_deref(), Some("/w"));
+}

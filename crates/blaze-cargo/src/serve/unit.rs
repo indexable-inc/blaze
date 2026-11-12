@@ -284,6 +284,10 @@ impl Steps for Real {
         };
         kept.flushed = Some(flushes);
         kept.stored = true;
+        // What storing ran (each dependency's signatures) is folded into the reverse edges
+        // here, after the answer and with the front end exclusive, never at the next build's
+        // first write (`Storage::pack_reverse`).
+        blaze_query::db::Database::storage_mut(kept.lowered.served_db()).pack_reverse();
         Ok(puts)
     }
 
