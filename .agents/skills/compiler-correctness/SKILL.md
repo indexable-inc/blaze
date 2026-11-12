@@ -170,4 +170,24 @@ work: extend reflection or the language with the smallest general primitive (`ow
 
 See [docs/v2/plan/design/comptime.md](../../../docs/v2/plan/design/comptime.md).
 
+## granular-caching (rule 65)
+
+Whatever blaze keeps to avoid work (a query result, a body, inference, MIR, a signature, an impl
+table, a name table, a unit record, compiled code, a seal) is keyed at the grain of the smallest
+thing that can change alone: a function, a type, an impl, a name, a module's scope. The key is that
+item's own content plus the digests of exactly what it read of other items (the signatures, types,
+macros and names it resolved, with negative reads: a name looked up and absent, an impl searched and
+not found), recorded as reads when the entry is made and checked like traced reads; it is computable
+before the work it saves. Editing one function misses that function's entries and those of the items
+that read the part that changed, and nothing else: not the rest of its crate, not the crates above.
+A key at crate level (a crate's content key, an image key, a whole-interface digest) is never the
+key of an entry; it may stand in front as a quick first check that nothing in the crate moved, and a
+crate may be the container entries are packed in for storing, pinning and exporting. Two forms for
+one thing (a coarse one for quiet crates and a fine one for edited ones) is a duplicate to merge
+into the fine one. An existing crate-keyed cache is a defect to fix when met. Test it by counts:
+edit one item of N in a crate and N-1 entries hit with none of the saved work run, with a control
+keyed by the crate that misses all N.
+
+See [docs/v2/plan/design/store.md](../../../docs/v2/plan/design/store.md).
+
 <!-- End of the generated rules. Hand-written notes follow. -->
