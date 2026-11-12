@@ -116,7 +116,7 @@ pub struct Session {
     buffers: Buffers,
 }
 
-/// The most builds ahead of saves between two requests that build ([`Session::save_ahead`]).
+/// The most builds ahead of saves between two requests that build ([`Session::head_moved`]).
 pub const SAVES_AHEAD: u32 = 8;
 
 /// How long a build ahead of a save waits for a request to take it over before it is
@@ -124,7 +124,7 @@ pub const SAVES_AHEAD: u32 = 8;
 /// that a save nobody builds holds no work.
 const SAVE_AHEAD_MS: u64 = 60_000;
 
-/// What the daemon did with a save it saw ([`Session::save_ahead`]): a typed outcome, so its
+/// What the daemon did with a save it saw ([`Session::head_moved`]): a typed outcome, so its
 /// caller says it (the session has no log).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SaveAhead {
@@ -358,15 +358,9 @@ impl Session {
         self.intents.deadline()
     }
 
-    /// The daemon moved `head` to `root` itself (the watcher's commit): intent on the head is
-    /// taken over or cancelled as by a commit request.
-    pub fn head_moved(&mut self, cx: &mut Daemon<'_>, head: &str, root: ContentId) {
-        self.intents.moved(cx.builder, head, root);
-    }
-
-    /// Builds ahead of a save: `head` moved to `root` by the watcher's commit with no
-    /// request waiting on it (the daemon calls this after [`Session::head_moved`], and not
-    /// for a move a held request's flush brought in: that request builds the root itself).
+    /// The daemon moved `head` to `root` itself (the watcher's commit of a save): intent on
+    /// the head is taken over or cancelled as by a commit request, and then the save is
+    /// built ahead.
     ///
     /// The build ahead is what pushes an edit at the save and not at the next request: the
     /// head's last build-shaped request, as [`ahead_of_a_save`] makes it, started on `root`
@@ -381,7 +375,8 @@ impl Session {
     /// job is under way, no other intent's job is at work (one this move cancelled is not),
     /// some request built this head before, and fewer than [`SAVES_AHEAD`] began since the
     /// last request that built. What it did is returned, for the daemon to say.
-    pub fn save_ahead(&mut self, cx: &mut Daemon<'_>, head: &str, root: ContentId) -> SaveAhead {
+    pub fn head_moved(&mut self, cx: &mut Daemon<'_>, head: &str, root: ContentId) -> SaveAhead {
+        self.intents.moved(cx.builder, head, root);
         let Some(work) = self.ahead.iter().find(|(it, _)| it == head).map(|(_, work)| work) else {
             return SaveAhead::NothingBuilt;
         };
@@ -970,7 +965,7 @@ impl Session {
         let root = resolve(cx.vfs, view)?;
         let opened = open(cx, root)?;
         // A request that builds a head says what a save of that head builds ahead
-        // ([`Session::save_ahead`]), and gives the saves after it their builds ahead again.
+        // ([`Session::head_moved`]), and gives the saves after it their builds ahead again.
         if let ViewRef::Head(head) = view
             && let Some(ahead) = ahead_of_a_save(&work)
         {

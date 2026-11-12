@@ -1527,7 +1527,9 @@ fn a_save_of_the_same_root_takes_it_over_and_one_of_another_cancels_it() {
     assert_eq!(world.builder.promoted, [first], "nothing on another head");
 
     let now = world.vfs.head("main").unwrap();
-    world.call(|session, cx, _| session.head_moved(cx, "elsewhere", now));
+    world.call(|session, cx, _| {
+        session.head_moved(cx, "elsewhere", now);
+    });
     assert_eq!(world.builder.cancelled, [second, elsewhere], "the watcher's move of a head");
 
     if let Request::WillSave { ops, .. } = &mut check {
@@ -1714,10 +1716,7 @@ fn random_intents_are_taken_over_or_cancelled_once_and_free_their_views() {
 /// What the session did with a move of `main` to `root` by the daemon's watcher.
 fn saved(world: &mut World, root: ContentId) -> super::SaveAhead {
     let mut did = None;
-    world.call(|session, cx, _| {
-        session.head_moved(cx, "main", root);
-        did = Some(session.save_ahead(cx, "main", root));
-    });
+    world.call(|session, cx, _| did = Some(session.head_moved(cx, "main", root)));
     did.expect("the call ran")
 }
 
