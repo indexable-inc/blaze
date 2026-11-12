@@ -39,8 +39,8 @@
    "date": "2026-11-11",
    "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
    "where": "blaze-cargo's tests under cargo on macOS",
-   "what": "`cli::tests::every_command_suggested_is_one` fails (`serve` is in COMMANDS and is no command) and `serve::why::tests::a_changed_key_part_is_named_by_subject_and_survives_a_restore` expects a torn third record to be called `record 1` where the code says `record 2`. Neither is in code this lane touched; whether both fail on the base is said in the lane's report.",
-   "cost": "minutes",
+   "what": "`cli::tests::every_command_suggested_is_one` fails (`serve` is in COMMANDS and is no command) and `serve::why::tests::a_changed_key_part_is_named_by_subject_and_survives_a_restore` expects a torn third record to be called `record 1` where the code says `record 2`. Both fail the same way on the untouched tip of all-1111 (65fafef399), run alone.",
+   "cost": "a baseline build of blaze-cargo's tests to tell them from this lane's changes",
    "cause": "not looked for",
    "workaround": "none",
    "state": "open"
@@ -110,6 +110,28 @@
    "cause": "the file was started on a branch the lanes were not cut from",
    "workaround": "rows here have ids `disk-1` up so they can be appended",
    "state": "open"
+  },
+  {
+   "id": "disk-11",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+   "where": "cargo: one CARGO_TARGET_DIR for two worktrees",
+   "what": "A second worktree of the same tree built into the same target directory (to get a baseline of the tests) left its `blaze-profile` there, and cargo then took it as fresh for the lane's worktree: blaze-cargo's tests failed to compile against the base's blaze-profile (`cannot find value DETAIL_VAR`), with nothing saying the artifact was another tree's. The first sign was an empty result file.",
+   "cost": "one wrong test run and 20 minutes",
+   "cause": "the unit's directory under `debug/build/<package>/<hash>` has the same hash for both worktrees, and freshness is by modification time",
+   "workaround": "removed the base worktree and touched the changed crates' roots",
+   "state": "open: a baseline needs its own target directory, which the disk had no room for"
+  },
+  {
+   "id": "disk-12",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+   "where": "blaze-cargo's tests under cargo on macOS",
+   "what": "About 50 of `serve::tests` fail on the base and on the lane alike, a different set each run: `the store's pool of 4096 windows of 1073741824 bytes could not reserve its pages: reserving 4398046511104 bytes of address space failed`. Each test's store reserves 4 TiB of address space and six tests at once (and what earlier ones leave reserved) pass what the process can have.",
+   "cost": "the suite cannot say whether a change to the daemon broke anything; this lane ran its own modules' tests by name",
+   "cause": "the pool's reservation is sized for a daemon, and a test's store takes the same",
+   "workaround": "ran `serve::log`, `serve::flightrec`, `serve::said`, `serve::why`, `serve::observe`, `serve::settings` by name",
+   "state": "open (the daemon-memory lane's)"
   }
  ]
 }
