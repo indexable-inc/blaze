@@ -13,7 +13,7 @@
 use blaze_graph::giveback::Rung;
 
 use super::{
-    job::giving::sim::{self, Front, Told},
+    super::job::giving::sim::{self, Front, Told},
     *,
 };
 
