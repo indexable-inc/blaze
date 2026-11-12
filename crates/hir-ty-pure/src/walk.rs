@@ -570,10 +570,84 @@ pub(crate) fn summary_in(db: &Db, env: StoredParamEnvAndCrate, instance: Instanc
     match dispatch::body_once(db, &env, of, &instance.args) {
         Ok(body) => {
             let cx = Cx::new(db, env);
+            ask_ahead(&cx, &body, &instance);
             summarize(&cx, &body, instance.def)
         }
         Err(error) => unlowered(db, &instance, &error),
     }
+}
+
+/// The fewest calls in a body, and the fewest instances they reach, for which its callees'
+/// summaries are asked ahead on the pool ([`ask_ahead`]): below it the body has one callee to
+/// go into and nothing to run beside it.
+const AHEAD: usize = 2;
+
+/// Asks the summary of each instance `body`'s calls reach, on the pool, before
+/// [`summarize`] asks them one after another on this stack: the closure of an instance is then
+/// summarized on every worker, each callee's subtree beside its siblings', where one stack of
+/// queries ran it on one (tempo's cold build, 2026-11-12: single describes of the node
+/// launcher's entry points took 57 to 106 s inside their callees' summaries, on one worker).
+///
+/// Only a hint, so it decides nothing. The instances are found by a gather that asks no
+/// summary ([`Walk::ahead`]), which takes every callee's returned value for unknown and so may
+/// list an instance the real gather does not reach, or miss one it does: one listed for
+/// nothing is a summary nobody reads, one missed is asked in its turn as before. Every value
+/// [`summarize`] reads is the summary query's own, whichever thread ran it first, and a cycle
+/// of instances is the engine's as it was: an ask that would wait on its own asker gives way
+/// and runs again on this stack ([`blaze_query::db::par_for_each`]), where the fixpoint of
+/// [`summary_in`] takes it.
+///
+/// Not under a bound of steps ([`blaze_query::db::with_steps`], a build script's proof): the
+/// bound counts the steps of its own task, and summaries run ahead on other workers would
+/// take theirs uncounted. There the closure is walked on this stack, as before.
+fn ask_ahead<'db>(cx: &Cx<'db>, body: &MirBody<'db>, instance: &Instance) {
+    #[cfg(test)]
+    if plant::asks_in_turn() {
+        return;
+    }
+    let calls = body
+        .basic_blocks
+        .iter()
+        .filter(|(_, block)| {
+            matches!(
+                block.terminator.as_ref().map(|it| &it.kind),
+                Some(TerminatorKind::Call { .. } | TerminatorKind::TailCall { .. })
+            )
+        })
+        .count();
+    if calls < AHEAD || bounded(cx.db, instance) {
+        return;
+    }
+    let mut walk = Walk::new(cx, Some(body));
+    walk.ahead = Some(Vec::new()); // alloc: none until a call reaches an instance
+    walk.gather(body);
+    let mut reached = walk.ahead.take().unwrap_or_default();
+    // Each once, in the order first reached: the same list whatever the pool.
+    let mut seen = HashSet::new_in(Global);
+    reached.retain(|it| it != instance && seen.insert(it.clone())); // clone: reference counts
+    if reached.len() < AHEAD {
+        return;
+    }
+    let (db, env, reached) = (cx.db, &cx.stored, &reached);
+    blaze_query::db::par_for_each(reached.len(), |at| {
+        // clone: the query's keys, reference counts
+        _ = summary(db, env.clone(), reached[at].clone());
+    });
+}
+
+/// Whether this task's walk is under a bound of steps: the step of `instance`, which its
+/// asker has taken already where one is set (so it costs none), is only made under one.
+fn bounded(db: &Db, instance: &Instance) -> bool {
+    let Def::Body(body) = instance.def else { return false };
+    let mut bounded = false;
+    blaze_query::db::step(
+        || {
+            bounded = true;
+            step_key(body, &instance.args)
+        },
+        || name_of(db, instance),
+    );
+    bounded
 }
 
 /// What a test plants in the walk.
@@ -583,6 +657,34 @@ pub(crate) mod plant {
 
     thread_local! {
         static KEEPS_BODIES: Cell<bool> = const { Cell::new(false) };
+        static ASKS_IN_TURN: Cell<bool> = const { Cell::new(false) };
+        static GATHERS_DRY: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn gathers_dry() -> bool {
+        GATHERS_DRY.with(Cell::get)
+    }
+
+    /// `work` with every summary run on this thread made from the gather that asks no
+    /// callee's summary.
+    pub(crate) fn gathering_dry<R>(work: impl FnOnce() -> R) -> R {
+        GATHERS_DRY.with(|it| it.set(true));
+        let made = work();
+        GATHERS_DRY.with(|it| it.set(false));
+        made
+    }
+
+    pub(super) fn asks_in_turn() -> bool {
+        ASKS_IN_TURN.with(Cell::get)
+    }
+
+    /// `work` with no summary asked ahead on the pool by a summary run on this thread: the
+    /// walk on one stack, as it was, for the test that holds the two to one answer.
+    pub(crate) fn asking_in_turn<R>(work: impl FnOnce() -> R) -> R {
+        ASKS_IN_TURN.with(|it| it.set(true));
+        let made = work();
+        ASKS_IN_TURN.with(|it| it.set(false));
+        made
     }
 
     pub(super) fn keeps_bodies() -> bool {
@@ -810,11 +912,20 @@ struct Walk<'a, 'db> {
     dyns: HashMap<Ty<'db>, bool, Global>,
     /// Per type dropped, whether a value of it owns a `dyn` ([`Walk::owns_dyn`]).
     owned_dyns: HashMap<Ty<'db>, bool, Global>,
+    /// Set for the gather of [`ask_ahead`]: the instances the body's calls reach, listed in
+    /// place of asking each one's summary.
+    ahead: Option<Vec<Instance>>,
 }
 
 fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
     let db = cx.db;
     let mut walk = Walk::new(cx, Some(body));
+    #[cfg(test)]
+    if plant::gathers_dry() {
+        // The planted bug of the ask-ahead's test: the gather that lists and asks nothing
+        // taken for the walk's own.
+        walk.ahead = Some(Vec::new());
+    }
     walk.gather(body);
     // A closure's or `async` block's `unsafe` is its function's: one scan of the function's
     // source, which holds them.
@@ -1405,6 +1516,7 @@ impl<'a, 'db> Walk<'a, 'db> {
             code: HashMap::new_in(Global),
             dyns: HashMap::new_in(Global),
             owned_dyns: HashMap::new_in(Global),
+            ahead: None,
         }
     }
 
@@ -1679,6 +1791,11 @@ impl<'a, 'db> Walk<'a, 'db> {
             return Flow::Unknown;
         }
         let instance = Instance { def, args: args.store() };
+        // The gather of [`ask_ahead`]: the instance is listed and no summary is asked.
+        if let Some(ahead) = &mut self.ahead {
+            ahead.push(instance);
+            return Flow::Unknown;
+        }
         let ret = summary(self.cx.db, self.cx.stored.clone(), instance.clone()).ret; // clone: the query's key, reference counts
         self.push(Reached::Walk(instance, spread), call);
         Flow::Ret { ret, spread }
