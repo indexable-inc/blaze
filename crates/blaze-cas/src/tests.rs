@@ -2513,39 +2513,47 @@ fn a_placed_file_with_other_bytes_is_written_again_before_it_is_cloned() {
     }
 }
 
+/// A whole file of the store removed outside the daemon: the place that would clone it is
+/// refused, naming the file, what was found and what to do, and is not made another way or
+/// tried again (rule no-fallback). The build after it writes the file afresh.
 #[test]
-fn a_placed_file_removed_outside_the_daemon_is_written_again() {
+fn a_placed_file_removed_outside_the_daemon_refuses_its_place_and_the_next_writes_it() {
     let mut sim = Sim::new(16, quiet());
     let (mut store, out, file) = placed_once(&mut sim, 160);
     sim.delete(&file);
     let placed = place_one(&mut sim, &mut store, "two/build/a");
+    let why = placed.result.expect_err("a place whose file is gone is refused");
+    assert!(why.contains(&format!("cloning {file}")), "{why}");
+    assert!(why.contains("it is not there (removed outside the daemon)"), "{why}");
+    assert!(why.contains("run the build again"), "{why}");
+    assert_eq!(placed.bytes, PlacedBytes::default());
+    assert!(!sim.exists(&name("two/build/a")), "nothing was placed another way");
+    assert!(store.problems().iter().any(|it| it.contains("it is not there")), "{:?}", store.problems());
+    // The next build's place: written again, whole.
+    let placed = place_one(&mut sim, &mut store, "two/build/a");
     assert_eq!(placed.result, Ok(()));
     assert_eq!(placed.bytes.written, out.len() as u64);
     assert_eq!(sim.contents(&name("two/build/a")), out);
-    assert!(
-        store.problems().iter().any(|it| it.contains("could not be cloned from")),
-        "{:?}",
-        store.problems()
-    );
 }
 
+/// The same of a whole file swapped for a symbolic link: refused, never cloned through, the
+/// link removed, and the next place writes a file again.
 #[test]
-fn a_placed_file_swapped_for_a_symbolic_link_is_written_again_and_never_cloned_through() {
+fn a_placed_file_swapped_for_a_symbolic_link_refuses_its_place_and_is_never_cloned_through() {
     let mut sim = Sim::new(18, quiet());
     let (mut store, out, file) = placed_once(&mut sim, 180);
     sim.change(&name("elsewhere/a"), &out);
     sim.symlink(&file, "../../elsewhere/a");
     let placed = place_one(&mut sim, &mut store, "two/build/a");
+    let why = placed.result.expect_err("a place whose file is a link is refused");
+    assert!(why.contains(blaze_core::CLONE_THROUGH_A_LINK), "{why}");
+    assert!(why.contains("is no regular file"), "{why}");
+    assert!(!sim.exists(&name("two/build/a")), "not cloned through the link");
+    let placed = place_one(&mut sim, &mut store, "two/build/a");
     assert_eq!(placed.result, Ok(()));
-    assert_eq!(
-        placed.bytes.written,
-        out.len() as u64,
-        "written again, not cloned through the link"
-    );
+    assert_eq!(placed.bytes.written, out.len() as u64, "written again by the next place");
     assert_eq!(sim.contents(&name("two/build/a")), out);
     assert_eq!(sim.mode(&file), Some(PLACED_MODE), "a file again, read-only");
-    let why = blaze_core::CLONE_THROUGH_A_LINK;
-    assert!(store.problems().iter().any(|it| it.contains(why)), "{:?}", store.problems());
 }
 
 #[test]

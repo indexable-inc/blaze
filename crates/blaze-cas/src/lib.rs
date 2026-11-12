@@ -4725,9 +4725,13 @@ impl Store {
         }
     }
 
-    /// A clone from the whole file of `content` failed with `why`: when the file is gone (removed
-    /// outside the daemon) or no regular file (a symbolic link, a FIFO), it is written again and
-    /// `waiter` placed from it, once; when it is there, the clone's failure is the place's.
+    /// A clone from the whole file of `content` failed with `why`: the place is refused, naming
+    /// the file and what was found of it. When the file is gone (removed outside the daemon) or
+    /// no regular file (a symbolic link, a FIFO), what is under its name is removed, so the
+    /// next build's place writes it afresh from the value's bytes; this place is not made
+    /// another way and not tried again (rule no-fallback: a failed build is better than one
+    /// that quietly tried again). Until 2026-11-12 the file was written again and the place
+    /// made from it, once.
     fn rechecked(
         &mut self,
         content: ContentId,
@@ -4743,20 +4747,25 @@ impl Store {
             // alloc: one waiter refused, its error naming the file it cloned
             return self.refuse_waiting(vec![waiter], &format!("cloning {file}: {why}"));
         }
-        // alloc: a problem reported
-        self.placed_problem(format!(
-            "{file} could not be cloned from ({why}), and is written again"
-        ));
-        match self.files.get_mut(&content) {
-            Some(PlacedFile::There { cloning, lost, after, .. }) => {
-                *lost = true;
-                after.push(waiter);
-                if *cloning == 0 {
-                    let after = std::mem::take(after);
-                    self.remove_file(content, after, effects);
-                }
+        let found = match link {
+            true => "what is under its name is no regular file (put there after the store wrote it)",
+            false => "it is not there (removed outside the daemon)",
+        };
+        // alloc: a problem reported, and the place's error
+        let what = format!(
+            "cloning {file}, the store's whole file of an output: {why}: {found}. The place is \
+             not made another way. What is under the name is removed, and the next build \
+             writes the file again from the value's bytes: run the build again (no command \
+             verifies or rebuilds the store's placed files on its own)"
+        );
+        self.placed_problem(what.clone()); // clone: the problem kept and the place's error
+        self.refuse_waiting(vec![waiter], &what);
+        if let Some(PlacedFile::There { cloning, lost, after, .. }) = self.files.get_mut(&content) {
+            *lost = true;
+            if *cloning == 0 {
+                let after = std::mem::take(after);
+                self.remove_file(content, after, effects);
             }
-            _ => self.place_file(content, waiter, effects),
         }
     }
 
@@ -5337,30 +5346,22 @@ impl Store {
                 }
             }
             (Op::Seal { .. }, PlacedFile::Sealing { waiting, .. }, done) => {
-                // A file not made read-only is not cloned from: it goes. Where the name was a
-                // link or no regular file (swapped in after the write or the check), it is
-                // written again for the places waiting, once each, as a clone that finds one
-                // ([`Store::rechecked`]); otherwise they are refused and the next place writes
-                // it again.
+                // A file not made read-only is not cloned from: it goes, the places waiting
+                // on it are refused naming it, whatever is under the name (a link or no
+                // regular file swapped in after the write too), and the next build's place
+                // writes it again. No place is tried a second time.
                 let why = describe(&done);
-                let swapped = why.contains(blaze_core::SEAL_THROUGH_A_LINK)
-                    || why.contains(blaze_core::SEAL_OF_NO_FILE);
-                // alloc: the places split, once per seal that fails
-                let (mut again, refused): (Vec<Waiter>, Vec<Waiter>) =
-                    waiting.into_iter().partition(|it| swapped && !it.retried);
                 // alloc: an error, once per place that fails
-                let why = format!("making {file} read-only: {why}");
-                if !refused.is_empty() {
-                    self.refuse_waiting(refused, &why);
+                let why = format!(
+                    "making {file}, the store's whole file of an output, read-only: {why}. It \
+                     is removed, and the next build writes it again: run the build again"
+                );
+                self.placed_problem(why.clone()); // clone: the problem kept and the places' error
+                if !waiting.is_empty() {
+                    self.refuse_waiting(waiting, &why);
                 }
-                if !again.is_empty() {
-                    // alloc: a problem reported
-                    self.placed_problem(format!("{why}, and is written again"));
-                    for waiter in &mut again {
-                        waiter.retried = true;
-                    }
-                }
-                self.remove_file(content, again, effects);
+                // alloc: empty, allocates nothing
+                self.remove_file(content, Vec::new(), effects);
             }
             (Op::Unplace { .. }, PlacedFile::Removing(waiting), Done::Removed) => {
                 if !waiting.is_empty() {
@@ -5613,9 +5614,10 @@ impl Store {
                     (Done::Cloned | Done::Written, _, _) => {
                         self.answer(Placed { tag: asked, to, result: Ok(()), bytes })
                     }
-                    (done, Some(Source { content, key, retried: false }), _) => {
-                        // Whether the file it cloned from is gone or no file, which is made
-                        // again once.
+                    (done, Some(Source { content, key, .. }), _) => {
+                        // Whether the file it cloned from is gone or no file is found, to
+                        // say so in the refusal ([`Store::rechecked`]): the place is not
+                        // tried again.
                         let waiter = Waiter {
                             asked,
                             to,
