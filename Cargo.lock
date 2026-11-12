@@ -1187,6 +1187,7 @@ dependencies = [
  "foldhash 0.2.0",
  "hashbrown 0.17.1",
  "hegeltest",
+ "indexmap",
  "papaya",
  "serde",
 ]
@@ -1198,6 +1199,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-core",
  "blaze-format",
+ "blaze-hash",
  "blaze-ids",
  "blaze-mem",
 ]
@@ -2031,6 +2033,7 @@ dependencies = [
  "blaze-core",
  "blaze-format",
  "blaze-hash",
+ "blaze-hashcons",
  "blaze-http",
  "blaze-ids",
  "blaze-mem",
