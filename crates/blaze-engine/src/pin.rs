@@ -246,51 +246,11 @@ pub(crate) fn pinned(manifest: &Path) -> Result<Option<String>, PinError> {
     pin_of(manifest, &table_of(manifest, &text)?)
 }
 
-/// A workspace found from a directory and what it pins ([`found`]).
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Found {
-    /// The root manifest ([`root_manifest`]); none outside any package.
-    pub(crate) manifest: Option<PathBuf>,
-    /// What it pins ([`pinned`]); none when it pins nothing.
-    pub(crate) pinned: Option<String>,
-}
-
-/// What `stat` says of a manifest: while it says this, the manifest's text is what was read.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Stamp {
-    len: u64,
-    /// Its modification time, in nanoseconds since the epoch.
-    modified_ns: u128,
-    inode: u64,
-}
-
-/// `path`'s stamp, `None` where no file is (as [`manifest_text`] reads none there). `Err` is a
-/// file whose stamp can't be had: nothing is kept of a lookup that met one.
-fn stamp(path: &Path) -> Result<Option<Stamp>, ()> {
-    let meta = match std::fs::metadata(path) {
-        Ok(meta) => meta,
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            return Ok(None);
-        }
-        Err(_) => return Err(()),
-    };
-    let modified = meta.modified().map_err(|_| ())?;
-    let modified_ns =
-        modified.duration_since(std::time::UNIX_EPOCH).map_err(|_| ())?.as_nanos();
-    #[cfg(unix)]
-    let inode = std::os::unix::fs::MetadataExt::ino(&meta);
-    #[cfg(not(unix))]
-    let inode = 0;
-    Ok(Some(Stamp { len: meta.len(), modified_ns, inode }))
-}
-
-/// The first line of a kept lookup: its format's name and version.
-const KEPT: &str = "blaze pin lookup 1";
+/// A workspace found from a directory and what it pins ([`found`]), a manifest's stamp, and
+/// the kept lookup's first line: blaze-thin's, whose reader of the kept file ([`kept`]) the thin
+/// `blaze` asks too, so the launcher and it read one file one way.
+pub(crate) use blaze_thin::pin::Found;
+use blaze_thin::pin::{Stamp, stamp};
 
 /// How old a manifest's modification must be before a lookup that read it is kept: an edit
 /// that keeps its length and inode within the file system's time step of the last one would
@@ -303,9 +263,7 @@ const SETTLED_NS: u128 = 2_000_000_000;
 /// newline in its name (the file's lines could not name it): each lookup there reads the
 /// manifests.
 fn kept_at(start: &Path) -> Option<PathBuf> {
-    let text = start.to_str().filter(|it| !it.contains(['\t', '\n']))?;
-    let name = blaze_format::hex::encode(&blaze_ids::b3::hash(text.as_bytes()));
-    Some(versions()?.parent()?.join("pins").join(name))
+    blaze_thin::pin::kept_at(versions()?.parent()?, start)
 }
 
 /// The lookup from `start` as `file` keeps it, when every manifest it read, and every place it
@@ -313,52 +271,7 @@ fn kept_at(start: &Path) -> Option<PathBuf> {
 /// is none kept, one of them moved, or the file is not what [`keep`] writes: the manifests are
 /// read then, and the file written again.
 fn kept(file: &Path, start: &Path) -> Option<Found> {
-    let text = std::fs::read_to_string(file).ok()?;
-    let mut lines = text.lines();
-    if lines.next()? != KEPT || lines.next()?.strip_prefix("start\t")? != start.to_str()? {
-        return None;
-    }
-    let (mut manifest, mut pin, mut whole) = (None, None, false);
-    for line in lines {
-        // Nothing follows the end.
-        if whole {
-            return None;
-        }
-        let mut parts = line.split('\t');
-        match parts.next()? {
-            "read" => {
-                let path = Path::new(parts.next()?);
-                let was = Stamp {
-                    len: parts.next()?.parse().ok()?,
-                    modified_ns: parts.next()?.parse().ok()?,
-                    inode: parts.next()?.parse().ok()?,
-                };
-                if stamp(path) != Ok(Some(was)) {
-                    return None;
-                }
-            }
-            "none" => {
-                if stamp(Path::new(parts.next()?)) != Ok(None) {
-                    return None;
-                }
-            }
-            "root" => manifest = Some(PathBuf::from(parts.next()?)),
-            "pin" => {
-                let version = parts.next()?;
-                if !(is_version(version) || is_channel(version)) {
-                    return None;
-                }
-                pin = Some(version.to_owned());
-            }
-            "end" => whole = true,
-            _ => return None,
-        }
-        if parts.next().is_some() {
-            return None;
-        }
-    }
-    // A pin is a root manifest's.
-    (whole && (pin.is_none() || manifest.is_some())).then_some(Found { manifest, pinned: pin })
+    blaze_thin::pin::kept(file, start, |version| is_version(version) || is_channel(version))
 }
 
 /// Keeps the lookup from `start` that read `seen` and found `found`, in `file`, for [`kept`].
@@ -374,7 +287,7 @@ fn keep(file: &Path, start: &Path, seen: &[(PathBuf, Result<Option<Stamp>, ()>)]
         path.to_str().filter(|it| !it.contains(['\t', '\n']))
     }
     let Some(start) = line(start) else { return };
-    let mut text = format!("{KEPT}\nstart\t{start}\n"); // alloc: the file's text, once a lookup kept
+    let mut text = format!("{}\nstart\t{start}\n", blaze_thin::pin::KEPT); // alloc: the file's text, once a lookup kept
     for (path, was) in seen {
         let (Ok(was), Some(named)) = (was, line(path)) else { return };
         // As it was before it was read: a manifest written meanwhile is not what was read.
@@ -519,6 +432,16 @@ pub(crate) fn installed(version: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The thin `blaze` links none of blaze-manifest, so it has the rule of blaze's home a
+    /// second time (`blaze_thin::pin::home`): held here to the launcher's.
+    #[test]
+    fn the_thin_blaze_finds_blazes_home_where_the_launcher_does() {
+        assert_eq!(
+            blaze_thin::pin::home(|name| std::env::var_os(name)),
+            blaze_manifest::user_config::home()
+        );
+    }
 
     #[test]
     fn versions_read() {

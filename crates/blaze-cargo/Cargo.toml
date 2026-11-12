@@ -109,6 +109,10 @@ blaze-live.workspace = true
 # blaze v2's daemon (`serve`): the agent API, the sans-IO core and its drivers, the VFS, the
 # query database, the store, the workspace load's queries, user code, codegen and the linker.
 blaze-api.workspace = true
+# What the thin `blaze` and this CLI must say and send alike, each written once there: the
+# status and `Finished` lines, the color rule, the request of a plain build or run, and what
+# the thin `blaze` hands a command it began to this one with (`cli/resume.rs`).
+blaze-thin.workspace = true
 blaze-core.workspace = true
 blaze-vfs.workspace = true
 blaze-query.workspace = true

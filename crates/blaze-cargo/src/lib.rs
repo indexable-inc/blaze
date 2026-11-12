@@ -41,7 +41,7 @@ pub mod unstable;
 
 /// How many of the functions blaze could not compile an error names when the request does not
 /// say ([`blaze_api::Cargo::refused`], `--refused`).
-pub const REFUSED_SHOWN: u32 = 16;
+pub const REFUSED_SHOWN: u32 = blaze_thin::request::REFUSED_SHOWN;
 /// What the first line of [`refused_error`] says, which the daemon's client finds it by.
 pub const REFUSED_SAYS: &str = "blaze could not compile";
 
