@@ -1,7 +1,8 @@
 //! What the launcher asks of the OS: memory that code runs from and that one thread writes, a
 //! thread's stack bounds and its frame pointer.
 //!
-//! [`Code`] is one mapping. The code area is one, the lazy stubs are another.
+//! [`Code`] is one mapping: a launcher has one, which holds its slot words, its lazy stubs
+//! and its code area (`drive` says why they are one).
 //!
 //! - **macOS** (AArch64): `mmap(MAP_JIT)`, readable, writable and executable in name; which of
 //!   write and execute a thread has is the thread's own switch, `pthread_jit_write_protect_np`.
@@ -63,12 +64,19 @@ pub fn page() -> Result<usize, SysError> {
 }
 
 /// One mapping that code runs from. See the module's documentation for who may write it.
+///
+/// **A mapping is never unmapped**: there is no `Drop`. A launcher's code lives as long as
+/// its process, and a thread may be in it, or hold an address of it, at any time; so an
+/// address in a mapping is good for the life of the process whatever happens to the `Code`
+/// that made it, and nothing has to prove that every thread left before a value is dropped.
+/// What a `Code` gives back is memory ([`Code::decommit`]), never addresses.
 pub struct Code {
     /// Where code runs.
     exec: NonNull<u8>,
     /// Where the same pages are writable.
     #[cfg(target_os = "linux")]
     write: NonNull<u8>,
+    /// The memfd, open for the life of the process, as its mappings are.
     #[cfg(target_os = "linux")]
     fd: std::os::fd::OwnedFd,
     len: usize,
@@ -243,15 +251,6 @@ impl Code {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl Drop for Code {
-    fn drop(&mut self) {
-        // SAFETY: the mapping `map` made. Its owner drops it only when no thread can run or
-        // name its code any more (the `Driver`'s contract).
-        unsafe { libc::munmap(self.exec.as_ptr().cast(), self.len) };
-    }
-}
-
 /// What AArch64 needs after a write and x86-64 does not (there, code that was never run is
 /// in no cache that needs telling, and a word is data).
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -387,17 +386,6 @@ impl Code {
             return Err(failed("fallocate(PUNCH_HOLE)", at, len));
         }
         Ok(())
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for Code {
-    fn drop(&mut self) {
-        // SAFETY: the mapping `map` made. Its owner drops it only when no thread can run or
-        // name its code any more (the `Driver`'s contract).
-        unsafe { libc::munmap(self.exec.as_ptr().cast(), self.len) };
-        // SAFETY: the writable mapping `map` made, which only `self` knew.
-        unsafe { libc::munmap(self.write.as_ptr().cast(), self.len) };
     }
 }
 

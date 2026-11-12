@@ -16,7 +16,7 @@
 //!
 //! # The stubs (launcher.md, section 1)
 //!
-//! One region a process: a head, then one stub a slot. A slot's word names its stub until the
+//! One region a process: a head ([`stub_head`]), then one stub a slot ([`stub`]). A slot's word names its stub until the
 //! slot is bound. A stub says which slot it is by where it is (its own address), and jumps to
 //! the head, which adds the launcher's context and jumps to [`resolver`]: that saves every
 //! register an argument can be in, calls `table::resolve` (which asks the control thread for
@@ -131,64 +131,70 @@ pub fn gate_entry(at: u64, flag: u64, old: u64, new: u64) -> Result<[u8; 40], Ou
     Ok(bytes)
 }
 
-/// The stub region of `slots` slots: the head, which hands `context` to the code at `entry`
-/// ([`resolver`]), then the stubs. Stub `n` is at [`STUB_HEAD`]` + n * `[`STUB`].
+/// The stub region's head: hands `context` to the code at `entry` ([`resolver`]).
 #[cfg(target_arch = "aarch64")]
-pub fn stubs(context: u64, entry: u64, slots: u32) -> Result<Vec<u8>, OutOfReach> {
-    use encode::{ADR_X16_HERE, BR_X15, b, ldr_literal};
+pub fn stub_head(context: u64, entry: u64) -> [u8; STUB_HEAD] {
+    use encode::{BR_X15, ldr_literal};
 
-    let len = STUB_HEAD + slots as usize * STUB;
-    if len > 1 << 27 {
-        return Err(OutOfReach { what: "a stub's branch to the head", from: len as u64, to: 0 });
-    }
-    // alloc: the region's bytes, made once a process and dropped when written.
-    let mut bytes = Vec::with_capacity(len);
-    let head = [
+    let code = [
         ldr_literal(17, 16), //  0: ldr x17, context (at 16)
         ldr_literal(15, 20), //  4: ldr x15, entry (at 24)
         BR_X15,              //  8: br  x15
         0,                   // 12: (never run)
     ];
-    for word in head {
-        bytes.extend_from_slice(&word.to_le_bytes());
+    let mut bytes = [0; STUB_HEAD];
+    for (index, word) in code.iter().enumerate() {
+        bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
     }
-    bytes.extend_from_slice(&context.to_le_bytes());
-    bytes.extend_from_slice(&entry.to_le_bytes());
-    for slot in 0..slots as usize {
-        let at = STUB_HEAD + slot * STUB;
-        // adr x16, . ; b head
-        bytes.extend_from_slice(&ADR_X16_HERE.to_le_bytes());
-        bytes.extend_from_slice(&b(-(at as i64 + 4)).to_le_bytes());
+    bytes[16..24].copy_from_slice(&context.to_le_bytes());
+    bytes[24..32].copy_from_slice(&entry.to_le_bytes());
+    bytes
+}
+
+/// The stub of `slot`, which is [`STUB_HEAD`]` + slot * `[`STUB`] bytes after the head:
+/// `adr x16, .; b head`.
+#[cfg(target_arch = "aarch64")]
+pub fn stub(slot: u32) -> Result<[u8; STUB], OutOfReach> {
+    use encode::{ADR_X16_HERE, b};
+
+    let at = STUB_HEAD as u64 + u64::from(slot) * STUB as u64;
+    if at + 4 >= 1 << 27 {
+        return Err(OutOfReach { what: "a stub's branch to the head", from: at, to: 0 });
     }
+    let mut bytes = [0; STUB];
+    bytes[0..4].copy_from_slice(&ADR_X16_HERE.to_le_bytes());
+    bytes[4..8].copy_from_slice(&b(-(at as i64 + 4)).to_le_bytes());
     Ok(bytes)
 }
 
-/// The stub region of `slots` slots: the head, which hands `context` to the code at `entry`
-/// ([`resolver`]), then the stubs. Stub `n` is at [`STUB_HEAD`]` + n * `[`STUB`].
+/// The stub region's head: hands `context` to the code at `entry` ([`resolver`]).
 #[cfg(target_arch = "x86_64")]
-pub fn stubs(context: u64, entry: u64, slots: u32) -> Result<Vec<u8>, OutOfReach> {
-    let len = STUB_HEAD + slots as usize * STUB;
-    if len > 1 << 30 {
-        return Err(OutOfReach { what: "a stub's jump to the head", from: len as u64, to: 0 });
-    }
-    // alloc: the region's bytes, made once a process and dropped when written.
-    let mut bytes = Vec::with_capacity(len);
+pub fn stub_head(context: u64, entry: u64) -> [u8; STUB_HEAD] {
+    let mut bytes = [0xcc; STUB_HEAD];
     //  0: push qword ptr [rip + 10]  ; context, at 16
-    bytes.extend_from_slice(&[0xff, 0x35, 10, 0, 0, 0]);
+    bytes[0..6].copy_from_slice(&[0xff, 0x35, 10, 0, 0, 0]);
     //  6: jmp  qword ptr [rip + 12]  ; entry, at 24
-    bytes.extend_from_slice(&[0xff, 0x25, 12, 0, 0, 0]);
-    bytes.extend_from_slice(&[0xcc; 4]);
-    bytes.extend_from_slice(&context.to_le_bytes());
-    bytes.extend_from_slice(&entry.to_le_bytes());
-    for slot in 0..slots as usize {
-        let at = STUB_HEAD + slot * STUB;
-        //  0: lea r11, [rip - 7]  ; r11 is this stub's own address
-        bytes.extend_from_slice(&[0x4c, 0x8d, 0x1d, 0xf9, 0xff, 0xff, 0xff]);
-        //  7: jmp head            ; the displacement counts from the jump's end, at 12
-        bytes.push(0xe9);
-        bytes.extend_from_slice(&(-(at as i32 + 12)).to_le_bytes());
-        bytes.extend_from_slice(&[0xcc; 4]);
-    }
+    bytes[6..12].copy_from_slice(&[0xff, 0x25, 12, 0, 0, 0]);
+    bytes[16..24].copy_from_slice(&context.to_le_bytes());
+    bytes[24..32].copy_from_slice(&entry.to_le_bytes());
+    bytes
+}
+
+/// The stub of `slot`, which is [`STUB_HEAD`]` + slot * `[`STUB`] bytes after the head:
+/// `lea r11, [rip - 7]; jmp head`.
+#[cfg(target_arch = "x86_64")]
+pub fn stub(slot: u32) -> Result<[u8; STUB], OutOfReach> {
+    let at = STUB_HEAD as u64 + u64::from(slot) * STUB as u64;
+    // The jump's displacement counts from its end, 12 bytes into the stub.
+    let Ok(back) = i32::try_from(at + 12) else {
+        return Err(OutOfReach { what: "a stub's jump to the head", from: at, to: 0 });
+    };
+    let mut bytes = [0xcc; STUB];
+    //  0: lea r11, [rip - 7]  ; r11 is this stub's own address
+    bytes[0..7].copy_from_slice(&[0x4c, 0x8d, 0x1d, 0xf9, 0xff, 0xff, 0xff]);
+    //  7: jmp head
+    bytes[7] = 0xe9;
+    bytes[8..12].copy_from_slice(&(-back).to_le_bytes());
     Ok(bytes)
 }
 
@@ -202,7 +208,7 @@ pub fn stubs(context: u64, entry: u64, slots: u32) -> Result<Vec<u8>, OutOfReach
 ///
 /// # Safety
 ///
-/// Reached only by a jump from the stub region [`stubs`] made, never called from Rust: it
+/// Reached only by a jump from a stub ([`stub`], through [`stub_head`]), never called from Rust: it
 /// does not follow the C convention on entry (its arguments are x16 and x17) or on exit (it
 /// leaves by a jump through the slot's word).
 #[cfg(target_arch = "aarch64")]
@@ -253,7 +259,7 @@ pub unsafe extern "C" fn resolver() {
 ///
 /// # Safety
 ///
-/// Reached only by a jump from the stub region [`stubs`] made, never called from Rust: it
+/// Reached only by a jump from a stub ([`stub`], through [`stub_head`]), never called from Rust: it
 /// does not follow the C convention on entry (its arguments are r11 and a word on the stack)
 /// or on exit (it leaves by a jump through the slot's word).
 #[cfg(target_arch = "x86_64")]

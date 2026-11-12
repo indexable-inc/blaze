@@ -9,7 +9,7 @@
 //! |---|---|
 //! | `Place` | asks [`Records`] for the bind's code as it must be at its address, checks its length, copies it into the area (`sys::Code::write`, which makes it runnable) |
 //! | `Gate`, `GateEntry` | writes the flag, clear, and each entry's code (`arch::gate_entry`) |
-//! | `Slot` | one atomic store of an address to the slot's word |
+//! | `Slot` | one atomic store of an address to the slot's word (and, for a slot being declared, its stub's code first) |
 //! | `Commit` | one atomic store of 1 to the gate's flag |
 //! | `Epoch` | one atomic store to the published epoch |
 //! | `Forget` | nothing yet: no unwind or symbol entry is kept until step 3 of launcher.md |
@@ -17,6 +17,21 @@
 //!
 //! An edit is the core's transaction ([`Driver::edit`]): staged, filled, committed; a failure
 //! while filling aborts it and nothing the program can reach has changed.
+//!
+//! # One mapping
+//!
+//! ```text
+//! | slot words, 8 bytes each | stub head, stubs | (to a page) | the code area ...
+//! 0                          stubs               area
+//! ```
+//!
+//! A call loads its word relative to itself (`call [rip + word]`; `adrp`, `ldr`), so every
+//! body must be within reach of the table: 2 GiB on x86-64, 4 GiB on AArch64. The table is
+//! therefore in the mapping the code is in, before it, and the whole is at most [`REACH`]:
+//! any body reaches any word, with no second copy of the table. (On macOS this also has to
+//! be so: a `MAP_JIT` mapping cannot be placed at a chosen address beside another.) The
+//! words are data that happen to lie in the code's mapping; a store to one goes through
+//! `sys::Code::store`, as a gate's flag does.
 
 use core::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -55,10 +70,15 @@ pub struct Config {
 }
 
 impl Config {
-    /// What the launcher of a program uses: a million slots (8 MiB of words, 8 or 16 MiB of
-    /// stubs, touched as used) and 64 GiB of area (launcher.md, section 1).
-    pub const PROGRAM: Config = Config { slots: 1 << 20, area: 64 << 30 };
+    /// What the launcher of a program uses: a million slots (8 MiB of words and 8 or 16 MiB
+    /// of stubs, each touched when its slot is declared) and the rest of [`REACH`] as area.
+    pub const PROGRAM: Config = Config { slots: 1 << 20, area: REACH - (32 << 20) };
 }
+
+/// The most bytes a launcher's mapping has: what a call on x86-64 reaches from its end to
+/// the first word (a signed 32-bit displacement). AArch64 reaches twice as far; one bound
+/// for both keeps a program's limits the same on every target.
+pub const REACH: u64 = 2 << 30;
 
 /// Why the driver could not do what it was asked.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -140,13 +160,16 @@ impl core::error::Error for EditError {}
 
 /// The launcher's core and its memory. See the module's documentation.
 ///
-/// Dropping a `Driver` unmaps the code area and the stubs: its owner drops it only when no
-/// thread can call through a word again or is in the area's code (in the launcher: never).
+/// Dropping a `Driver` frees its tables and unmaps nothing (`sys::Code` is never unmapped):
+/// code a thread is in, and the words it loads, outlive it.
 pub struct Driver {
     core: Launch,
+    /// The one mapping: words, stubs, area.
     code: Code,
-    /// The stub region: written once, in `new`.
-    stubs: Code,
+    /// The offset in the mapping of the stub region's head.
+    stubs: usize,
+    /// The offset in the mapping of the code area's offset 0.
+    area: usize,
     shared: Arc<Shared>,
     inbox: Receiver<Event>,
     /// The writes of the core's last call.
@@ -160,7 +183,8 @@ pub struct Driver {
 }
 
 impl Driver {
-    /// Maps the code area and the stubs, and makes the table with every word on its stub.
+    /// Maps the words, the stubs and the code area, and writes the stubs' head. No slot is
+    /// declared: every word is zero, and nothing may call through one until it is.
     pub fn new(config: Config) -> Result<Driver, Error> {
         let page = sys::page()?;
         let core = Launch::new(
@@ -174,20 +198,25 @@ impl Driver {
             },
             KEPT,
         )?;
-        let Ok(area) = usize::try_from(config.area) else {
-            return Err(Error::Core(blaze_launch::Error::Config {
-                what: "the area is longer than the address space",
-                value: config.area,
+        let slots = config.slots as usize;
+        let stubs = (slots * 8).next_multiple_of(16);
+        let area = (stubs + STUB_HEAD + slots * STUB).next_multiple_of(page);
+        let whole = area as u64 + config.area;
+        if whole > REACH {
+            return Err(Error::Reach(OutOfReach {
+                what: "the launcher's mapping is longer than a call reaches its slot's word",
+                from: whole,
+                to: REACH,
             }));
-        };
-        let code = Code::map(area)?;
-        let stub_bytes = (STUB_HEAD + config.slots as usize * STUB).next_multiple_of(page);
-        let mut stubs = Code::map(stub_bytes)?;
+        }
+        let mut code = Code::map(whole as usize)?;
+        let base = code.base();
         let (send, inbox) = crossbeam_channel::unbounded();
         let shared = Arc::new(Shared::new(
             config.slots,
-            code.base()..code.base() + area,
-            stubs.base(),
+            base,
+            base + stubs,
+            base + area..base + whole as usize,
             send,
         ));
         // The stubs hand this pointer to `table::resolve` for as long as the process runs
@@ -195,12 +224,12 @@ impl Driver {
         // happens to this `Driver`.
         let context = Arc::into_raw(Arc::clone(&shared)) as u64;
         let entry = arch::resolver as usize as u64;
-        let bytes = arch::stubs(context, entry, config.slots).map_err(Error::Reach)?;
-        stubs.write(0, &bytes)?;
+        code.write(stubs, &arch::stub_head(context, entry))?;
         Ok(Driver {
             core,
             code,
             stubs,
+            area,
             shared,
             inbox,
             out: Vec::new_in(KEPT),
@@ -217,12 +246,7 @@ impl Driver {
 
     /// The address of the code area's offset 0.
     pub fn base(&self) -> usize {
-        self.code.base()
-    }
-
-    /// The length of the stub region.
-    pub fn stub_bytes(&self) -> usize {
-        self.stubs.len()
+        self.code.base() + self.area
     }
 
     /// How many batches wait for a thread to clear them.
@@ -249,17 +273,25 @@ impl Driver {
     fn address(&self, slot: Slot, to: Target) -> usize {
         match to {
             Target::Stub => self.shared.stub(slot),
-            Target::Body(body) => self.code.base() + body.at as usize,
+            Target::Body(body) => self.base() + body.at as usize,
             Target::Gate { gate, entry } => {
-                self.code.base() + (gate.at + GATE_HEAD + u64::from(entry) * GATE_ENTRY) as usize
+                self.base() + (gate.at + GATE_HEAD + u64::from(entry) * GATE_ENTRY) as usize
             }
         }
     }
 
-    /// Declares `count` more slots, each on its stub.
+    /// Declares `count` more slots, each on its stub: writes the stubs' code, then stores
+    /// each word.
     pub fn declare(&mut self, count: u32) -> Result<Slot, Error> {
         self.out.clear();
         let first = self.core.declare(count, &mut self.out)?;
+        // The stubs of the new slots, which nothing names until the words below are stored.
+        self.scratch.clear();
+        for slot in first.0..first.0 + count {
+            self.scratch.extend_from_slice(&arch::stub(slot).map_err(Error::Reach)?);
+        }
+        let at = self.stubs + STUB_HEAD + first.0 as usize * STUB;
+        self.code.write(at, &self.scratch)?;
         self.switch("declare")?;
         Ok(first)
     }
@@ -313,7 +345,7 @@ impl Driver {
         binds: &[wire::Bind],
         records: &mut dyn Records,
     ) -> Result<(), Error> {
-        let base = self.code.base() as u64;
+        let base = self.base() as u64;
         for index in 0..self.out.len() {
             match self.out[index] {
                 Write::Place { bind, range } => {
@@ -327,19 +359,21 @@ impl Driver {
                     if got != range.len {
                         return Err(Error::Length { txn, slot, said: range.len, got });
                     }
-                    self.code.write(range.at as usize, &self.scratch)?;
+                    self.code.write(self.area + range.at as usize, &self.scratch)?;
                 }
                 // The flag, clear. The area's offsets are never used twice, so the bytes are
                 // the zeroes the mapping began with; they are written all the same, so the
                 // gate does not rest on that.
-                Write::Gate { range, .. } => self.code.write(range.at as usize, &[0; 8])?,
+                Write::Gate { range, .. } => {
+                    self.code.write(self.area + range.at as usize, &[0; 8])?;
+                }
                 Write::GateEntry { gate, entry, old, new } => {
                     let offset = gate.at + GATE_HEAD + u64::from(entry) * GATE_ENTRY;
                     let slot = binds[entry as usize].slot;
                     let old = self.address(slot, old) as u64;
                     let code = arch::gate_entry(base + offset, base + gate.at, old, base + new.at)
                         .map_err(Error::Reach)?;
-                    self.code.write(offset as usize, &code)?;
+                    self.code.write(self.area + offset as usize, &code)?;
                 }
                 write @ (Write::Slot { .. }
                 | Write::Commit { .. }
@@ -358,22 +392,22 @@ impl Driver {
     fn switch(&mut self, during: &'static str) -> Result<(), Error> {
         for index in 0..self.out.len() {
             match self.out[index] {
+                // The word is 8 bytes times the slot into the mapping; a slot past the table
+                // is past the words, which `store` cannot tell from the stubs after them.
                 Write::Slot { slot, to } => {
-                    let address = self.address(slot, to);
-                    match self.shared.words.get(slot.0 as usize) {
-                        Some(word) => word.store(address, Ordering::SeqCst),
-                        None => {
-                            return Err(Error::Write { during, write: self.out[index] });
-                        }
+                    if self.shared.word(slot).is_none() {
+                        return Err(Error::Write { during, write: self.out[index] });
                     }
+                    let address = self.address(slot, to) as u64;
+                    self.code.store(slot.0 as usize * 8, address)?;
                 }
-                Write::Commit { gate } => self.code.store(gate.at as usize, 1)?,
+                Write::Commit { gate } => self.code.store(self.area + gate.at as usize, 1)?,
                 Write::Epoch { epoch } => self.shared.epoch.store(epoch, Ordering::SeqCst),
                 // No unwind or symbol entry is kept yet (launcher.md, step 3): nothing to
                 // take back.
                 Write::Forget { .. } => {}
                 Write::Decommit { range } => {
-                    self.code.decommit(range.at as usize, range.len as usize)?;
+                    self.code.decommit(self.area + range.at as usize, range.len as usize)?;
                     self.decommitted += range.len;
                 }
                 write @ (Write::Place { .. } | Write::Gate { .. } | Write::GateEntry { .. }) => {

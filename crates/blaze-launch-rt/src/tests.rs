@@ -46,16 +46,17 @@ fn returns(n: u16) -> Vec<u8> {
 fn call_at(at: usize) -> u32 {
     // SAFETY: every caller passes the address of code this file placed, or of a stub or a
     // gate entry that leads to such code: a function `extern "C" fn() -> u32`, in a mapping
-    // that is live for the call (each test keeps its `Driver` or `Code` until its threads
-    // have ended, and the driver frees a body only once no thread can be in it).
+    // that is never unmapped (`sys::Code`), whose body the driver gives back to the system
+    // only once no thread can be in it (what these tests are about).
     let function: extern "C" fn() -> u32 = unsafe { core::mem::transmute(at) };
     function()
 }
 
 /// Calls `slot` as blaze's code does: load the word, jump.
 fn call(shared: &Shared, slot: u32) -> u32 {
-    let word = shared.word(Slot(slot)).expect("a slot of the table");
-    call_at(word.load(Ordering::Acquire))
+    let to = shared.target(Slot(slot)).expect("a slot of the table");
+    assert_ne!(to, 0, "slot {slot} was called before it was declared");
+    call_at(to)
 }
 
 /// The records of a test: code by record id.
@@ -114,8 +115,8 @@ fn until(what: &str, mut done: impl FnMut() -> bool) {
 }
 
 /// A program thread that calls in a loop until told to stop. Dropped (a test that fails
-/// included), it stops and joins the thread, so no thread is in the area when the test's
-/// driver, declared before it, unmaps it.
+/// included), it stops and joins the thread, so a failing test ends and does not leave a
+/// thread spinning.
 struct Caller {
     stop: Arc<AtomicBool>,
     /// How many rounds of calls it has made.
@@ -421,6 +422,9 @@ fn a_stub_asks_the_daemon_and_its_caller_resumes_in_the_code_it_sent() {
     );
     assert_eq!(id, 1);
     tell(&mut daemon, 1, &Tell::Welcome { slots: 2, store: "", statics: 0 });
+    // Nothing calls a slot before it is declared: the program's first call comes after the
+    // launcher took the daemon's welcome.
+    until("the launcher to declare slot 0", || shared.target(Slot(0)) != Some(0));
 
     // A thread calls slot 0, which has no code: its stub fires and the thread waits.
     let (results, result) = crossbeam_channel::bounded::<u32>(2);

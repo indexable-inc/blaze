@@ -2,7 +2,7 @@
 //! epoch, and the one queue everything a thread says goes into.
 //!
 //! A program thread does three things and no other. It **loads a word** and jumps to it
-//! (every call; in machine code, [`Shared::word`] for a caller written in Rust). It **fires a
+//! (every call; in machine code, [`Shared::target`] for a caller written in Rust). It **fires a
 //! stub** ([`resolve`]): asks the control thread for a slot's code and waits. It **reports**
 //! at a safepoint ([`Mutator::safepoint`]): the epoch it loaded, then the frames of its own
 //! stack that lie in the code area. It never writes a word, the epoch or code.
@@ -13,6 +13,7 @@
 //! of its driver (`blaze_launch::launch`, "The driver's part").
 
 use core::cell::Cell;
+use core::ffi::c_void;
 use core::marker::PhantomData;
 use core::ops::Range;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -60,8 +61,12 @@ pub enum Bound {
 
 /// The words, the epoch and the queue of one launcher.
 pub struct Shared {
-    /// By slot: the address a call of it runs. Stored only by the control thread.
-    pub(crate) words: Box<[AtomicUsize]>,
+    /// The address of slot 0's word, in the launcher's mapping: word `n` is 8 bytes times `n`
+    /// further. Stored only by the control thread (`sys::Code::store`), and only for a
+    /// declared slot; the word of a slot not yet declared is zero.
+    table: usize,
+    /// How many words the table has.
+    slots: u32,
     /// The epoch last published. Stored only by the control thread.
     pub(crate) epoch: AtomicU64,
     /// How many batches wait to be cleared: a safepoint reports only while this is not zero.
@@ -81,19 +86,19 @@ thread_local! {
 }
 
 impl Shared {
+    /// `table` is the address of `slots` words and `stubs` that of the stub region's head,
+    /// both in a `sys::Code` mapping (which is never unmapped); `area` is the code area's
+    /// addresses.
     pub(crate) fn new(
         slots: u32,
-        area: Range<usize>,
+        table: usize,
         stubs: usize,
+        area: Range<usize>,
         inbox: Sender<Event>,
     ) -> Shared {
-        // Every word names its stub from the start, so no load of a word ever finds anything
-        // but code, whatever the daemon has declared so far.
-        let words = (0..slots as usize)
-            .map(|slot| AtomicUsize::new(stubs + arch::STUB_HEAD + slot * arch::STUB))
-            .collect();
         Shared {
-            words,
+            table,
+            slots,
             epoch: AtomicU64::new(0),
             waiting: AtomicU64::new(0),
             threads: AtomicU64::new(0),
@@ -103,9 +108,24 @@ impl Shared {
         }
     }
 
-    /// The word of `slot`: what a call loads and jumps to. `None` past the table's end.
-    pub fn word(&self, slot: Slot) -> Option<&AtomicUsize> {
-        self.words.get(slot.0 as usize)
+    /// The address of `slot`'s word, which is the slot's for the life of the process: what
+    /// a call's instructions name. `None` past the table's end.
+    pub fn word(&self, slot: Slot) -> Option<usize> {
+        (slot.0 < self.slots).then(|| self.table + slot.0 as usize * 8)
+    }
+
+    /// What a call of `slot` loads from its word: the address it jumps to. Zero for a slot
+    /// not yet declared, which nothing calls. `None` past the table's end.
+    pub fn target(&self, slot: Slot) -> Option<usize> {
+        let word = self.word(slot)? as *mut usize;
+        // SAFETY: `word` is one of the table's words (`Shared::word`): in a mapping that is
+        // never unmapped, so valid for any lifetime; aligned for a `usize` (the mapping is
+        // page aligned and a word is 8 bytes); and only ever touched atomically, by this
+        // load, by the loads of machine code and by the control thread's
+        // `sys::Code::store`. This thread only loads: it could not store (the page is not
+        // writable at this address, or not on this thread).
+        let word = unsafe { AtomicUsize::from_ptr(word) };
+        Some(word.load(Ordering::Acquire))
     }
 
     /// The address of `slot`'s stub.
@@ -269,13 +289,13 @@ pub(crate) fn walk(area: &Range<usize>, frames: &mut Vec<Frame>) -> bool {
 /// the resolver jumps through. When no code can come it stops the process, naming why
 /// (launcher.md, section 4: a stub that fires on a function with an error stops the program
 /// with the diagnostic).
-pub(crate) extern "C" fn resolve(stub: usize, context: *const Shared) -> *const AtomicUsize {
+pub(crate) extern "C" fn resolve(stub: usize, context: *const c_void) -> *const usize {
     // SAFETY: `context` is the pointer `Driver::new` wrote into the stub region's head: an
     // `Arc<Shared>` whose count it leaked for exactly this, so the `Shared` lives as long as
     // the process, and a `Shared` is `Sync`.
-    let shared = unsafe { &*context };
+    let shared = unsafe { &*context.cast::<Shared>() };
     let slot = (stub - shared.stubs - arch::STUB_HEAD) / arch::STUB;
-    let Some(word) = shared.words.get(slot) else {
+    let Some(word) = u32::try_from(slot).ok().and_then(|slot| shared.word(Slot(slot))) else {
         stop(slot, "its stub is not one of the launcher's");
     };
     let (reply, bound) = crossbeam_channel::bounded(1);
@@ -285,7 +305,7 @@ pub(crate) extern "C" fn resolve(stub: usize, context: *const Shared) -> *const 
     // it ends when the daemon answers the need (code, or a refusal) or its socket closes,
     // each of which the control thread turns into an answer here.
     match bound.recv() {
-        Ok(Bound::Code) => word,
+        Ok(Bound::Code) => word as *const usize,
         Ok(Bound::Refused(diagnostic)) => stop(slot, &diagnostic),
         Ok(Bound::Lost(why)) => stop(slot, &why),
         Err(_) => stop(slot, "the launcher's control thread is gone"),
