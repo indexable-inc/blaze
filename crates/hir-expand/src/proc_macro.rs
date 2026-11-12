@@ -234,6 +234,13 @@ impl FromIterator<(CrateBuilderId, ProcMacroLoadResult)> for ProcMacrosBuilder {
     }
 }
 
+thread_local! {
+    /// A planted bug, for a test's control: [`ProcMacros::give`] writes a crate's list though
+    /// it is the one the crate has, as it did until 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static GIVES_EQUAL_LISTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct CrateProcMacros(StoredProcMacroLoadResult);
 
@@ -254,17 +261,46 @@ impl ProcMacros {
     /// change a crate's list once the crate graph is set. A crate's def map lists its proc
     /// macros' expanders, so one resolved before its list was given must resolve again, and a
     /// set that is not noted leaves it naming none.
-    pub fn give(db: &mut Db, given: impl IntoIterator<Item = (Crate, ProcMacroLoadResult)>) {
+    ///
+    /// The invariant: a crate given the list it has (each macro's name, kind and expander
+    /// equal: [`ProcMacroExpander::eq_dyn`], which for a built macro is the code it runs) is
+    /// given nothing: no input is written, nothing is noted, no def map resolves again.
+    /// Whether any crate's list changed is returned. A build loads every proc macro's
+    /// expanders again (its unit's record replayed); until 2026-11-12 each load set the
+    /// whole map at `HIGH` and noted its crate, so a build of reth with nothing changed
+    /// wrote 53 inputs and verified every row of the database.
+    pub fn give(
+        db: &mut Db,
+        given: impl IntoIterator<Item = (Crate, ProcMacroLoadResult)>,
+    ) -> bool {
         db.batch(base_db::Trigger::named("ProcMacros::give"), |db| {
             let all = ProcMacros::try_get(db)
                 .unwrap_or_else(|| ProcMacros::new(db, Durability::HIGH, Default::default()));
+            // alloc: the crates whose list is another, none when every one is given what it has
+            let mut changed: Vec<(Crate, Arc<CrateProcMacros>)> = Vec::new();
+            {
+                let held = all.by_crate(db);
+                for (krate, macros) in given {
+                    let macros = CrateProcMacros::new(macros);
+                    if held.get(&krate).is_some_and(|it| **it == macros)
+                        && !GIVES_EQUAL_LISTS.get()
+                    {
+                        continue;
+                    }
+                    changed.push((krate, Arc::new(macros))); // alloc: once per crate, when its proc macros are loaded
+                }
+            }
+            if changed.is_empty() {
+                return false;
+            }
             let mut by_crate = all.by_crate(db).clone();
-            for (krate, macros) in given {
-                by_crate.insert(krate, Arc::new(CrateProcMacros::new(macros))); // alloc: once per crate, when its proc macros are loaded
+            for (krate, macros) in changed {
+                by_crate.insert(krate, macros);
                 db.note_proc_macros(krate);
             }
             all.set_by_crate(db).with_durability(Durability::HIGH).to(by_crate);
-        });
+            true
+        })
     }
 }
 

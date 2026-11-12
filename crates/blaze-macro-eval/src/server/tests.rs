@@ -322,3 +322,37 @@ fn the_output_is_the_stream_or_the_panic_message() {
     w.str("no fields");
     assert_eq!(server.output(&panicked).unwrap().unwrap_err(), "no fields");
 }
+
+/// The invariant: what an expansion is said to have asked is a question no key covers
+/// whenever it asked one, whatever it asked before or after; else the first it asked. An
+/// expansion's reads are known exactly when every question it asked is by position
+/// ([`super::Asked::by_position`]), so a positional question noted over a span's source text
+/// would keep a unit made from text its key does not hold.
+#[test]
+fn a_question_no_key_covers_is_the_one_an_expansion_is_said_to_have_asked() {
+    use super::Asked;
+    let db = Db::new();
+    for (asks, said) in [
+        (&[Asked::Join][..], Asked::Join),
+        (&[Asked::Join, Asked::Edition], Asked::Join),
+        (&[Asked::Join, Asked::SourceText, Asked::LineColumn], Asked::SourceText),
+        (&[Asked::SourceText, Asked::Join], Asked::SourceText),
+        (&[Asked::Debug, Asked::ByteRange], Asked::Debug),
+    ] {
+        let mut server = server(&db);
+        for &asked in asks {
+            server.note_asked(asked);
+        }
+        assert_eq!(server.asked, Some(said), "{asks:?}");
+        assert_eq!(
+            said.by_position(),
+            asks.iter().all(|it| it.by_position()),
+            "{asks:?}: its reads are known only if a key covers every answer"
+        );
+    }
+    // What sees the bytes a code text leaves out, or this database's numbering, is covered
+    // by no key.
+    for asked in [Asked::SourceText, Asked::ByteRange, Asked::Debug] {
+        assert!(!asked.by_position(), "{asked:?}");
+    }
+}

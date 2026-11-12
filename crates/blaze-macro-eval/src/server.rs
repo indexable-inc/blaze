@@ -60,6 +60,29 @@ impl Asked {
         }
     }
 
+    /// Whether the answer is a function of the code texts of the calling crate and the crates
+    /// it depends on (`blaze_lower::code`): where items and tokens are by line and column,
+    /// which macro call a span is of, which edition a crate is, where a file is. A key that
+    /// holds those crates' identities covers it: a unit's record, a crate's image. So such a
+    /// question leaves the expansion's reads known; only the expansion's own key, which
+    /// numbers its anchors and contexts and says nothing of where they are, does not cover
+    /// the answer, and the expansion is kept under it by no store.
+    ///
+    /// Not so a span's source text and byte range, which see the comments and spaces a code
+    /// text leaves out, nor its `Debug` text, which is of this database's numbering: after
+    /// one of those the expansion's reads are not known.
+    pub(crate) fn by_position(self) -> bool {
+        match self {
+            Asked::Edition
+            | Asked::FilePath
+            | Asked::LineColumn
+            | Asked::Source
+            | Asked::Parent
+            | Asked::Join => true,
+            Asked::Debug | Asked::SourceText | Asked::ByteRange => false,
+        }
+    }
+
     /// Why the expansion's reads are not known, naming what it asked (rule 19).
     pub(crate) fn why(self) -> &'static str {
         match self {
@@ -120,7 +143,8 @@ pub(crate) struct Server {
     edition: Edition,
     /// Whether the calling crate enables `forced_keywords`, which gates each `k#` it lexes.
     forced_keywords: bool,
-    /// What the expansion first learned of a span that its key does not say, if anything.
+    /// What the expansion learned of a span that its key does not say, if anything: the
+    /// first question no key covers, else the first ([`Server::note_asked`]).
     pub(crate) asked: Option<Asked>,
     /// Paths given to `proc_macro::tracked_path::path`: inputs as much as files it read.
     pub(crate) tracked: Vec<String>,
@@ -362,8 +386,17 @@ impl Server {
         Ok(answer)
     }
 
+    /// Notes that the expansion learned `asked` of a span: the first question kept, and a
+    /// question no key covers ([`Asked::by_position`]) in place of one a key does.
+    fn note_asked(&mut self, asked: Asked) {
+        match self.asked {
+            Some(first) if !first.by_position() || asked.by_position() => {}
+            _ => self.asked = Some(asked),
+        }
+    }
+
     fn ask(&mut self, db: &(impl Answer + ?Sized), req: SubRequest) -> SubResponse {
-        self.asked.get_or_insert(Asked::of(&req));
+        self.note_asked(Asked::of(&req));
         match db.answer(req) {
             Ok(it) => it,
             Err(stop) => {
@@ -768,7 +801,7 @@ impl Server {
                     })
                 });
                 if asked {
-                    self.asked.get_or_insert(Asked::Edition);
+                    self.note_asked(Asked::Edition);
                 }
                 if let Some(stop) = lost {
                     self.lost.get_or_insert(stop);
@@ -842,7 +875,7 @@ impl Server {
             Method::SpanDebug => {
                 let span = self.read_span(&mut r)?;
                 // What it says is of the database's numbering, which the key does not have.
-                self.asked.get_or_insert(Asked::Debug);
+                self.note_asked(Asked::Debug);
                 let mut text = std::mem::take(&mut self.text);
                 text.clear();
                 _ = write!(text, "{span:?}");

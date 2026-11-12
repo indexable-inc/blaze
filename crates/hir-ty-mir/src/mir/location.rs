@@ -180,6 +180,14 @@ pub struct NamingRule {
     paths: std::sync::Arc<SourcePaths>,
 }
 
+/// Two rules with the same key name every file the same (the type's docs): what an input's
+/// setter compares to write nothing for an equal value.
+impl PartialEq for NamingRule {
+    fn eq(&self, other: &NamingRule) -> bool {
+        self.key == other.key
+    }
+}
+
 impl std::fmt::Debug for NamingRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("NamingRule").field(&self.key).finish()

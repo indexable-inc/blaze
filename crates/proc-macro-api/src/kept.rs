@@ -22,8 +22,10 @@
 //! one whose output, read variables or given strings still hold a root once ported ([`left`],
 //! a literal the macro made of `CARGO_MANIFEST_DIR`) is kept here alone.
 //!
-//! Not kept: an expansion that asked the database about a span (its text, file or line),
-//! since the key does not say what it was told; one whose output has an anchor or a context
+//! Not kept: an expansion that asked the database about a span (its text, file, line or
+//! join with another), since the key does not say what it was told (where the answer is a
+//! function of the calling crate's sources by position, what it read is still known, and
+//! the unit and image made from it are kept: `blaze-macro-eval`'s `Asked::by_position`); one whose output has an anchor or a context
 //! its input has not, which the next call could not be given back; one that read what can't
 //! be traced (the clock, randomness); and one that failed. `BLAZE_PROC_MACRO_CACHE=check`
 //! expands every call it finds kept anyway, and an output other than the kept one is an error

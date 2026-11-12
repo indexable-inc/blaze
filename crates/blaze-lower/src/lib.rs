@@ -1724,10 +1724,20 @@ impl Lowered {
             });
             macros
         });
-        self.identities.clear();
-        self.narrowed.clear();
         let trigger = Trigger::of("a proc macro's expanders loaded", &self.crates.units[unit].what);
-        Db::batch_in(&mut self.db, |db| db, trigger, |db| ProcMacros::give(db, [(krate, macros)]));
+        let changed = Db::batch_in(
+            &mut self.db,
+            |db| db,
+            trigger,
+            |db| ProcMacros::give(db, [(krate, macros)]),
+        );
+        // Expanders loaded again that run the code the crate's already run change nothing
+        // the front end reads: the identities made of the database stay, as after a build
+        // script's run applied again with what it gave before ([`Lowered::apply_run`]).
+        if changed {
+            self.identities.clear();
+            self.narrowed.clear();
+        }
         Ok(())
     }
 

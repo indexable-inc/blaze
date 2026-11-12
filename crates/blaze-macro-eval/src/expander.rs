@@ -207,6 +207,25 @@ struct Library {
     settled: Lock<Option<Settled>>,
 }
 
+impl Library {
+    /// Whether `other` is this library, or one loaded again of the same crate that runs the
+    /// same code ([`Library::runs`]: the crate's code and its module) for the same daemon and
+    /// toolchain, the store saying of its state what it said of this one's. Such a load gives
+    /// its crate the expanders it has: every expansion of either gives the same, so the one
+    /// the front end holds stays (with its sessions, which start again each revision) and
+    /// nothing is written (`ProcMacros::give`). A verdict that moved (a crate first seen in
+    /// the build before) is another library: its expansions report their reads otherwise.
+    fn same(self: &Arc<Library>, other: &Arc<Library>) -> bool {
+        Arc::ptr_eq(self, other)
+            || (Arc::ptr_eq(&self.macros, &other.macros)
+                && self.krate == other.krate
+                && self.toolchain == other.toolchain
+                && self.loaded == other.loaded
+                && self.runs == other.runs
+                && self.seen.verdict() == other.seen.verdict())
+    }
+}
+
 /// The settled state of a crate that settles: its digest ([`start_digest`]), and the statics,
 /// of the database `at` (a static's ID is of its database), to run a call from it.
 struct Settled {
@@ -1206,7 +1225,7 @@ impl Evaluated {
             .entered();
             self.run_on(db, calling, call, &other, &[], &this)?
         };
-        if again.asked.is_some() || again.unkeyable.is_some() || again.statics.iter().any(|it| it.2) {
+        if again.asked.is_some_and(|it| !it.by_position()) || again.unkeyable.is_some() || again.statics.iter().any(|it| it.2) {
             return Ok(Err(UNSHOWN));
         }
         // What the extra run did to the state says the crate's state too: from the settled
@@ -1429,9 +1448,13 @@ impl Evaluated {
         let unknown = |tree: tt::TopSubtree, why: &'static str| {
             done(tree, ExpansionReads::Unknown(why), state_use(verdict, false))
         };
-        if let Some(asked) = ran.asked {
+        // A question the calling crate's identity covers (`Asked::by_position`) leaves its
+        // reads known: the unit and the image made from it are kept. Its own key does not
+        // say the answer, so it is put in no store (below).
+        if let Some(asked) = ran.asked.filter(|it| !it.by_position()) {
             return unknown(output, asked.why());
         }
+        let asked = ran.asked.is_some();
         // Kept only from the state its key says, left as it was: a hit then gives what a run
         // gives and leaves the session as the run would. Otherwise it is not kept.
         let session = from.replayed || !ran.statics.is_empty() || start != Some(from.start);
@@ -1538,9 +1561,10 @@ impl Evaluated {
             Some(why) => ExpansionReads::Unknown(why),
             None => reads,
         };
-        let Some(value) = bytes.filter(|_| !session) else {
-            // Nothing is kept (no bytes to keep, or it ran with state of a crate that settles):
-            // what it read is stated as this checkout's.
+        let Some(value) = bytes.filter(|_| !session && !asked) else {
+            // Nothing is kept (no bytes to keep, it ran with state of a crate that settles, or
+            // it asked the database what its key does not say): what it read is stated as
+            // this checkout's.
             let reads = stated(ExpansionReads::Traced {
                 shape: index::Shape::of(&marked.local).encode().into(), // alloc: once, as an expansion is kept
                 values: index::VALUES.traced(&marked.local),
@@ -1659,7 +1683,11 @@ impl ProcMacroExpander for Evaluated {
         (other as &dyn std::any::Any) // dyn: as above, told apart by type
             .downcast_ref::<Evaluated>()
             .is_some_and(|other| {
-                Arc::ptr_eq(&self.library, &other.library) && self.function == other.function
+                self.library.same(&other.library)
+                    && self.function == other.function
+                    && self.index == other.index
+                    && self.kind == other.kind
+                    && self.name == other.name
             })
     }
 }
