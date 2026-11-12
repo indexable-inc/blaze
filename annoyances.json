@@ -473,6 +473,127 @@
    "cause": "not known when written; the lane's report says what the tree before the merge does",
    "workaround": "none",
    "state": "open"
+  },
+  {
+   "id": "real2-1",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real2-1111",
+   "where": "blaze: no view of a macro's expansion or of a crate's def map",
+   "what": "A proc macro's output (alloy's `sol!`) and the modules it made could not be printed from a build: no `blaze debug` command shows an expansion, a module's scope or its impls. The cause of tempo-contracts' lost impls was found only by building twelve fixtures of a local proc macro and then a unit test that dumps the def map.",
+   "cost": "about ninety minutes",
+   "cause": "the front end's dumps (`DefMap::dump`) are reachable from tests alone",
+   "workaround": "a fixture proc macro that returns a string, and `BLAZE_TRACE_HOLDERS=1` (its lines go to serve.log, not to the client)",
+   "state": "open"
+  },
+  {
+   "id": "real2-2",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real2-1111",
+   "where": "blaze: impl tables after a crate is given its proc macros",
+   "what": "A module that macros write once their crate's proc macros are built (the write changes no round-0 log) had the bodies of its `const _` never read by the impls maintainer: name resolution reported a new module as a changed module, not as bindings or touched defs. Every impl in a `const _` block of a module `sol!` wrote under tempo-contracts' `crate::sol!` wrapper was missing (E0277, E0599, E0282, E0271, thousands), and so were tokio::select!'s `_0` types in reth and tempo (E0425). An edit that leaves a module with a `const _` and no name lost its impls the same way.",
+   "cost": "the last lane's two days on tempo and reth, and this lane's first three hours",
+   "cause": "`bodies_to_read` listed touched defs, touched impls and changed bindings; nothing listed a scope that was set",
+   "workaround": "none",
+   "state": "fixed on real2-1111 (38d8565f39: `CrateDelta::scopes`, test and control in hir-ty `delta/tests/given_macros.rs`)"
+  },
+  {
+   "id": "real2-3",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real2-1111",
+   "where": "blaze: tests under cargo",
+   "what": "hir-expand's `budget_tests.rs:216` did not compile (an unescaped `}` in an assert's message), so no unit test of hir-expand could run. 22 of blaze-diagnostics' `tests::bodies` and 4 of hir-ty-borrowck's tests fail on all-1111 before any change of this lane (the same sets at 38d8565f39 and at 69bc57b021): missing-field errors gain `blaze cannot borrow-check main: TypeError(\"missing field in record literal\")`, `flow_tests` has `no function trigger_bug in the fixture`, `views_tests` find E0502.",
+   "cost": "forty minutes to tell my changes' failures from the tree's",
+   "cause": "tests landed by lanes that did not run them (real-5, rev-1)",
+   "workaround": "ran each suite on the commit before and compared the failing sets",
+   "state": "the hir-expand one fixed on real2-1111 (38d8565f39); the 26 failing tests open"
+  },
+  {
+   "id": "real2-4",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real2-1111",
+   "where": "the VM: daemons left by earlier runs",
+   "what": "Eight daemons of five binaries were alive on the VM, 130 GiB resident between them (tempo's 53, fixtures' 13 to 33 each): the first build of this lane ran `mem 22.6/40.6 GB squeezed`.",
+   "cost": "one build measured for nothing, ten minutes",
+   "cause": "a fixture's daemon outlives its script (KillMode=process, real-6) and nothing stops an idle one",
+   "workaround": "`pgrep -f \"engine serv[e]\" | xargs -r kill` before each large build",
+   "state": "open: an idle daemon holding tens of GiB should let go of it, or the lane script should stop what it started"
+  },
+  {
+   "id": "real2-5",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real2-1111",
+   "where": "blaze: `blaze explain problems`",
+   "what": "On a history of one build it failed: `Out of Range Error: Overflow in subtraction of UINT64 (1 - 5)` (`build_id > max(build_id) - $builds`).",
+   "cost": "ten minutes, on the one command the debugging skill says to run first",
+   "cause": "unsigned subtraction in the view",
+   "workaround": "`blaze debug sql` on `events_wide` and `errors`",
+   "state": "fixed on real2-1111 (a4ba9b87fd)"
+  },
+  {
+   "id": "real2-6",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real2-1111",
+   "where": "blaze: the daemon hangs up with no word",
+   "what": "`the daemon hung up on this request alone` in tempo's cold build: its log said nothing of why. The server drops a connection when more than 64 MiB of replies queue behind its send in flight (`blaze-api/src/server.rs` `MOST_QUEUED`), silently, and a unit's diagnostics are queued in one turn of the loop, before any send can end: tempo-contracts' 18,834 errors (the `errors` table of that build; its outcome `cancelled`; the client printed 2 of them) were such a burst. Not reproduced end to end: the cause is read from the code and the rows.",
+   "cost": "an hour",
+   "cause": "a bound meant for a peer that does not read, checked with no clock",
+   "workaround": "none",
+   "state": "fixed on real2-1111 (the commit after a4ba9b87fd: the bound is on a send no byte of which was taken in 30 s, sends are a megabyte each, and the hangup is an ERROR line naming the connection and the bytes)"
+  },
+  {
+   "id": "real2-7",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real2-1111",
+   "where": "blaze: unresolved-method errors",
+   "what": "Each E0599 walked every module of every crate three times for the list of all traits and probed every trait for the closest name. With 1,737 such errors in one crate that was the 12 minutes on one worker (real-8).",
+   "cost": "see real-8",
+   "cause": "a per-error cost that grows with the workspace",
+   "workaround": "none",
+   "state": "fixed on real2-1111 (69bc57b021: an index of traits by item name, made once a check)"
+  },
+  {
+   "id": "real2-8",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real2-1111",
+   "where": "blaze: wfcheck's `needs_since`",
+   "what": "Unverified guess: a region variable with only an upper bound (`'?v <= 'a`, one `VarSubReg`) is taken as equal to that bound, so `T: '?v` becomes `T: 'a`, which the least solution does not need. Found while looking for reth's E0310, which was another cause (a closure's outlives components).",
+   "cost": "none yet",
+   "cause": "`equal` takes the first constraint of either direction",
+   "workaround": "none",
+   "state": "open: the check that would settle it is a fixture where proving a bound registers `T: '?v` with `'?v` bounded above only"
+  },
+  {
+   "id": "real2-9",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real2-1111",
+   "where": "the harness (Claude Code) and the VM loop",
+   "what": "A foreground command is moved to the background after 180 s, and a cold build of a fixture that depends on alloy is 185 to 300 s, so most fixture runs took two tool calls; `git diff HEAD` leaves out new files (the first shipped test failed with `file not found for module`); `git log --format=%h` is 9 hex on the VM and 10 on the Mac, so the binary's directory had another name than the commit I quoted.",
+   "cost": "about twenty minutes in all",
+   "cause": "defaults",
+   "workaround": "`git add -N .` before the diff; `git rev-parse --short=10`; a wait loop on the job's JOB-DONE line",
+   "state": "open"
+  },
+  {
+   "id": "real2-10",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real2-1111",
+   "where": "blaze: the daemon's loop",
+   "what": "tempo's cold build on ec9b0acaba logged `loop stuck: the loop has not finished a turn for 60 s`: the main thread inside `maintain proc macros loaded, build scripts' runs ...` for 59.9 s, 11.9 s of it in the impls maintainer's reads, and 201 `loop stalled: a step of the daemon's loop ran in line past 20 ms`.",
+   "cost": "not measured here: a lead",
+   "cause": "the maintainers run in line on the loop after a batch of proc macros loads",
+   "workaround": "none",
+   "state": "open"
+  },
+  {
+   "id": "real2-11",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real2-1111",
+   "where": "my own method, and blaze's sandbox",
+   "what": "`rustc -o /dev/null` run as root on the VM (to ask the pinned rustc about a ten-line program) replaced the null device with a regular file. The next cold build of reth failed in 20 build scripts: `/dev/null: Read-only file system`, and for 16 scripts `was proved pure, but its run got what the sandbox could neither trace nor answer from its provider (Descriptor) ... a bug in blaze's purity proof`, which it was not.",
+   "cost": "a 28 minute build",
+   "cause": "rustc writes its output by rename; the sandbox binds whatever is at /dev/null and does not check that it is the device",
+   "workaround": "`rm /dev/null; mknod -m 666 /dev/null c 1 3`; `--emit=metadata -o /tmp/x` next time",
+   "state": "open: the sandbox could refuse a /dev/null that is no character device, naming it"
   }
  ]
 }
