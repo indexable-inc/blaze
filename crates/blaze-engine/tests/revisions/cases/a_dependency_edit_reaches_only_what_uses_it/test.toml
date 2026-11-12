@@ -1,0 +1,19 @@
+about = "A body edit in a dependency makes that function again and nothing of the crate over it; its public signature changed makes it and its caller in the other crate again, and not the functions beside them."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "6 10\n"
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "33 10\n"
+redone = ["dep::helper"]
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "9 10\n"
+redone = ["app::caller", "dep::helper"]

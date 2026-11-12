@@ -1,0 +1,11 @@
+about = "A constant's value changed makes the two functions that read it again, and no other."
+drivers = ["sim", "real"]
+
+[[revision]]
+action = "run"
+prints = "4 6 4\n"
+
+[[revision]]
+action = "run"
+prints = "6 10 4\n"
+redone = ["app::a", "app::b"]

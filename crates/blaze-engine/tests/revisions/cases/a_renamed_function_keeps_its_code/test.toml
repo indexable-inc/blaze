@@ -1,0 +1,15 @@
+about = "A function renamed, with its call: blaze's code identity holds no name, so the body is the code it was and no function of the library is made again."
+drivers = ["sim", "real"]
+
+[[revision]]
+action = "run"
+prints = "2 4\n"
+
+[[revision]]
+action = "run"
+prints = "2 4\n"
+reused = ["app::g", "app::renamed"]
+
+[revision.known]
+"real: outcome" = "the daemon panics at crates/hir-def/src/expr_store/body.rs:620 (`query verify` > `body_query` of a FunctionId whose ErasedFileAstId is gone) on the first build after a function is renamed, and the build fails; a clean build of the same source succeeds, and the simulated driver makes nothing again"
+"real: panics" = "the same panic, caught by the daemon"

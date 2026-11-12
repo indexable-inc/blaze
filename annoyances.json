@@ -275,6 +275,105 @@
    "cause": "the delay is one process-wide option read at each free and at each purge",
    "workaround": "purge at once, as before",
    "state": "open: why a rested edit is slower on pages kept warm is not known"
+  },
+  {
+   "id": "rev-1",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane revisions-1111",
+   "where": "blaze: tests under cargo",
+   "what": "hir-ty-codegen's unit tests did not compile on all-1111: `wasm.rs`'s test module called `iconst`, `iadd` and 28 more without `InstBuilder` in scope and `FunctionBuilder::finalize` without its argument (32 errors). No unit test of the crate could build, the edit fuzzer (`v2/edits.rs`) among them.",
+   "cost": "twenty minutes; and the fuzzer that holds incremental builds to clean ones was not running for anyone",
+   "cause": "a test module written by a lane that could not build it; nothing compiles test targets before a merge",
+   "workaround": "fixed here in three lines (the import, the two `finalize` arguments)",
+   "state": "fixed on revisions-1111; open: the gate should compile every test target (`cargo test --no-run`) of the crates a merge touches"
+  },
+  {
+   "id": "rev-2",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane revisions-1111",
+   "where": "my own method",
+   "what": "A `cargo test --no-run` of another package, run while a 6-minute suite was queued behind cargo's lock, relinked `target/release/blaze` (a `#[cfg(test)]` edit in hir-ty-codegen changes the lib's source file). A client of the new binary then told the daemon of the old one `is another build of blaze ... stopping it and starting this one`.",
+   "cost": "one suite run I had to reason about before trusting, and a rule for the rest of the session: no cargo while a real-driver suite runs",
+   "cause": "the test target's `CARGO_BIN_EXE_blaze` is the one file every build rewrites; a daemon is tied to the exact binary",
+   "workaround": "never build while the suite runs; `BLAZE_REVISIONS_BLAZE=<a copy>` runs the suite on a binary nothing rewrites",
+   "state": "open: the suite could copy the binary into its root first"
+  },
+  {
+   "id": "rev-3",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane revisions-1111",
+   "where": "blaze: stop",
+   "what": "`blaze stop` answers before the daemon's process has exited. A daemon started at once at the same home path (the old home renamed away) ended with exit 1, `USAGE: its command line was refused ... while finding its build and its state`, once in a 21-case run.",
+   "cost": "one false failure of a clean build, 15 minutes to find",
+   "cause": "stop is acknowledged before exit; what the second daemon tripped on I did not find (its log was replaced)",
+   "workaround": "the harness waits for the pid to be gone after `blaze stop`",
+   "state": "open: unknown cause; the harness works around it"
+  },
+  {
+   "id": "rev-4",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane revisions-1111",
+   "where": "blaze: no-op lane",
+   "what": "Which build is answered by the no-op lane is easy to get wrong from outside: only the third identical request in a row is (the first builds, the second walks and is kept), any difference in arguments (`--message-format=json`) or environment counts as another request, and `build` then `run` then `build` never reaches it. Nothing in a build's output says why a walk was not answered.",
+   "cost": "three wrong expectations in the first cases, 30 minutes",
+   "cause": "by design (docs/cargo.md, \"A build with nothing changed\"), but silent",
+   "workaround": "`\"build_id\": null` in `build-finished` is the only sign; the cases assert it",
+   "state": "open: `blaze why` after a walk that made nothing could say what kept the lane from answering"
+  },
+  {
+   "id": "rev-5",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane revisions-1111",
+   "where": "blaze: rustc attributes",
+   "what": "`#[rustc_clean(..)]` is refused with rustc's own text (`attribute requires -Z query-dep-graph to be enabled`) and `-Z query-dep-graph` in rustflags is refused too (`blaze does not know which cfgs -Z query-dep-graph decides`), so 88 files of rustc's `tests/incremental` cannot build unchanged under blaze by any setting.",
+   "cost": "an hour: the importer had to write the attributes over with spaces",
+   "cause": "blaze ports the gate of an attribute whose flag it has no meaning for",
+   "workaround": "the importer blanks the six assertion attributes, columns kept",
+   "state": "open: accept the attributes as inert (they assert on rustc's queries), or accept the flag"
+  },
+  {
+   "id": "rev-6",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane revisions-1111",
+   "where": "blaze: rustflags",
+   "what": "A `--cfg` in `.cargo/config.toml`'s `build.rustflags` re-keys the standard library: changing it rebuilt 147 units (`names core`, `link core` ..), about 5 s, where cargo applies rustflags to no prebuilt std. So compiletest's way of flipping a revision tests no reuse at all under blaze.",
+   "cost": "the corpus importer was redesigned to set the cfg from a build script",
+   "cause": "rustflags reach every unit, std's too",
+   "workaround": "a generated `build.rs` that prints `cargo::rustc-cfg` from a file",
+   "state": "open: is std meant to see the workspace's rustflags?"
+  },
+  {
+   "id": "rev-7",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane revisions-1111",
+   "where": "blaze: memory",
+   "what": "While four test daemons ran, one build paused with `daemon at 0.1 of 95 GiB (machine 95.0 GiB, 95.1 held by 5 other daemons: pid .. of brv-..-1/h 78.2 ..)`: a daemon serving a two-function crate was counted as holding 78 GiB.",
+   "cost": "none measured; a paused build in a timing-sensitive case",
+   "cause": "not looked into: the store pool's reservation counted as held, or a real footprint under `BLAZE_VERIFY_STORE=1`",
+   "workaround": "none",
+   "state": "open: for the daemon-memory lane"
+  },
+  {
+   "id": "rev-8",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane revisions-1111",
+   "where": "the harness (Claude Code)",
+   "what": "A build log printed whole (`--message-format=json` of a cold build is 60 KB of artifact lines, a `blaze why --all` of one is 230 KB) went into my context twice before every command of mine was piped through a filter.",
+   "cost": "context",
+   "cause": "no default cap on a command's output",
+   "workaround": "filter first; never print a build's JSON",
+   "state": "fixed in my habits"
+  },
+  {
+   "id": "rev-9",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane revisions-1111",
+   "where": "my own method",
+   "what": "Fixture texts were generated by a Python script holding Rust in Python strings inside shell heredocs: three rounds of quoting errors (an apostrophe in a cause text ended a string; an old definition later in the script silently overwrote a new one of the same name, so two cases lost a driver).",
+   "cost": "40 minutes",
+   "cause": "three languages nested",
+   "workaround": "no apostrophes in cause texts; the fixtures are plain files in the tree now, edited there",
+   "state": "fixed: the generator is not part of the tree"
   }
  ]
 }

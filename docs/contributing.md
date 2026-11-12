@@ -297,6 +297,11 @@ which tests to write and how few, property tests with Hegel (vendor/hegeltest, i
 crash-recovering, billing and data-deleting code is proven by a deterministic simulation test,
 not by a code review (rule `dst-not-review`).
 
+An incremental-build bug gets a revision test ([harness.md](harness.md#revision-tests)): a
+directory under `crates/blaze-engine/tests/revisions/cases/` with the project, the edit and what
+must be made again, run in process under seeds (`cargo test -p hir-ty-codegen --lib --
+edits::revisions`) and against a real daemon (`cargo test -p blaze-engine --test revisions`).
+
 ## Documents
 
 Every doc under `docs/` opens with front matter saying what it is (`scripts/src/bin/docs.rs` has
