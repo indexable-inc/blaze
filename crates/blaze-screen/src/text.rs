@@ -16,7 +16,9 @@ pub fn width(text: &str) -> usize {
 /// edit's line says the number that matters; from a minute on, whole seconds.
 pub fn time(ms: u64) -> String {
     match ms {
-        0..100 => format!("{ms}ms"),               // alloc: a number shown
+        // Less than the clock's step is not nothing.
+        0 => "<1ms".to_string(), // alloc: a number shown
+        1..100 => format!("{ms}ms"), // alloc: as above
         100..10_000 => format!("{}.{:02}s", ms / 1000, ms % 1000 / 10), // alloc: as above
         10_000..60_000 => format!("{}.{}s", ms / 1000, ms % 1000 / 100), // alloc: as above
         _ => format!("{}m{:02}s", ms / 60_000, ms % 60_000 / 1000), // alloc: as above
@@ -153,7 +155,40 @@ pub fn fit_path(path: &str, most: usize) -> String {
         }
     }
     flush(&mut run, &mut out);
-    middle(&out, most)
+    if width(&out) <= most {
+        return out;
+    }
+    // Still too long: whole directories go from the middle, never a part of a name and never
+    // the file's own name.
+    let parts: Vec<&str> = out.split('/').collect(); // alloc: as above
+    let Some((file, dirs)) = parts.split_last() else { return out };
+    let mut head = dirs.len().min(2);
+    let mut tail = dirs.len() - head;
+    loop {
+        let mut cut = dirs[..head].join("/"); // alloc: as above
+        if head + (dirs.len() - tail) < dirs.len() || tail > head {
+            if !cut.is_empty() {
+                cut.push('/');
+            }
+            cut.push('…');
+        }
+        for dir in &dirs[tail.max(head)..] {
+            cut.push('/');
+            cut.push_str(dir);
+        }
+        if !cut.is_empty() {
+            cut.push('/');
+        }
+        cut.push_str(file);
+        if width(&cut) <= most || (head == 0 && tail >= dirs.len()) {
+            return cut;
+        }
+        // Give up a directory before the file's first, then one after the start.
+        match tail < dirs.len() {
+            true => tail += 1,
+            false => head -= 1,
+        }
+    }
 }
 
 /// An item's path as a row names it, in at most `most` columns: what a macro's expansion

@@ -41,5 +41,5 @@
    right: 5
   note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 ✓ built 33 units, 7 cached in 26.8s · tier 0 · 29% optimized
-✗ 1 failed · 7 passed · 1 ignored · 3 binaries · 31.8s
+✗ 1 failed · 7 passed · 1 ignored · 3 binaries · 31.8s (26.8s of it the build)
   rerun: blaze test -p calc --lib

@@ -65,6 +65,10 @@ pub struct Options {
     pub footer_after_ms: u64,
 }
 
+/// A build that made no unit and still took this long was not a build with nothing to do:
+/// its line says the time was analysis, and is not drawn as the calm one.
+pub const BUSY_NOOP_MS: u64 = 100;
+
 /// A build that added at least this much to blaze's state says so on its line.
 pub const CACHE_NOTABLE_BYTES: u64 = 100_000_000;
 
@@ -741,10 +745,11 @@ impl Screen {
                 true => {
                     // A `run` or a `test` that built nothing says nothing: what follows is
                     // the program's or the tests'.
-                    let silent = noop
+                    let calm = noop && took < BUSY_NOOP_MS;
+                    let silent = calm
                         && matches!(self.opts.command, Command::Run | Command::Test)
                         && self.warnings == 0;
-                    if !silent && !(built.tests_follow && noop) {
+                    if !silent && !(built.tests_follow && calm) {
                         let line = self.built_line(&built, whys, took, noop);
                         self.above.push(line); // alloc: as above
                     }
@@ -858,8 +863,20 @@ impl Screen {
         let mut line = Line::new();
         let dot = self.dot();
         let root = self.opts.root.as_deref();
-        if noop {
-            line.push(Role::Done, format!("{} up to date", self.glyph("✓", "ok"))); // alloc: the build's line, once
+        if noop && took >= BUSY_NOOP_MS {
+            // Nothing was made and the time went somewhere: said as what it was, with the
+            // cause when the build's why has one.
+            line.push(Role::Waiting, format!("{} no unit rebuilt", self.glyph("◦", "."))); // alloc: the build's line, once
+            line.push(Role::Plain, format!(" {dot} {} of analysis redone", text::time(took))); // alloc: as above
+            if let Some(why) = whys.first() {
+                line.push(Role::Dim, format!(" {dot} ")); // alloc: as above
+                line.push_text(&why.headline, Role::Dim, root);
+            }
+            line.push(Role::Dim, format!(" {dot} ")); // alloc: as above
+            line.push(Role::Command, "blaze why");
+            line.push(Role::Dim, " says more");
+        } else if noop {
+            line.push(Role::Done, format!("{} up to date", self.glyph("✓", "ok"))); // alloc: as above
             line.push(Role::Dim, format!(" {dot} {}", text::time(took))); // alloc: as above
         } else {
             line.push(Role::Done, format!("{} ", self.glyph("✓", "ok"))); // alloc: as above
@@ -1281,6 +1298,10 @@ impl Screen {
                 line.push(Role::Strong, format!("{} failed", tests.failed)); // alloc: as above
                 line.push(Role::Plain, format!(" {dot} {} passed", tests.passed)); // alloc: as above
             }
+            // A run of no test passed nothing: never drawn as a pass.
+            false if tests.passed == 0 => {
+                line.push(Role::Warned, format!("{} no test ran", self.glyph("⚠", "!"))); // alloc: as above
+            }
             false => {
                 line.push(Role::Done, format!("{} ", self.glyph("✓", "ok"))); // alloc: as above
                 line.push(Role::Plain, format!("{} passed", tests.passed)); // alloc: as above
@@ -1300,6 +1321,10 @@ impl Screen {
                 text::time(self.now_ms)
             ),
         ); // alloc: as above
+        // The build's part of that time, when it was not nothing: the tests did not take it.
+        if self.built.is_some() && self.built_at >= BUSY_NOOP_MS {
+            line.push(Role::Dim, format!(" ({} of it the build)", text::time(self.built_at))); // alloc: as above
+        }
         let mut lines = alloc::vec![line]; // alloc: as above
         for rerun in &tests.reruns {
             lines.push(Line::new().with(Role::Dim, "  rerun: ").with(Role::Command, rerun.clone())); // alloc: once a failing executable
