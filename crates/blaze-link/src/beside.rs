@@ -442,10 +442,31 @@ impl From<String> for Stop {
     }
 }
 
+/// The side file's bytes, which whoever places the file may hold a view of
+/// ([`Kept::view`]) while the next update patches them: the update then copies them once
+/// (`Arc::make_mut`), and writes in place when no view is held, which is every update whose
+/// last file was placed by then.
+struct Bytes(std::sync::Arc<Vec<u8>>);
+
+impl std::ops::Deref for Bytes {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Vec<u8> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Bytes {
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        // clone: the whole file, only while a view of the last update's is still held
+        std::sync::Arc::make_mut(&mut self.0)
+    }
+}
+
 /// The side file as last given, and where each function's record is in it: what the next
 /// [`Kept::update`] is a patch of. Holds the file's bytes (its sections with their room).
 pub(crate) struct Kept {
-    file: Vec<u8>,
+    file: Bytes,
     /// The build id the file carries; `None` before the first.
     id: Option<[u8; 16]>,
     format: Format,
@@ -485,7 +506,8 @@ pub(crate) struct Kept {
 impl Kept {
     pub(crate) fn new() -> Kept {
         Kept {
-            file: Vec::new(),
+            // alloc: a reference count, once per image
+            file: Bytes(std::sync::Arc::new(Vec::new())),
             id: None,
             format: Format::Elf,
             // alloc: none, empty
@@ -532,6 +554,13 @@ impl Kept {
     #[cfg(test)]
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.file
+    }
+
+    /// The side file's whole bytes as last given, shared: what whoever places the file
+    /// writes when what is at its path is not the file the last update's patch is over.
+    /// Nothing is copied unless the next update finds the view still held ([`Bytes`]).
+    pub(crate) fn view(&self) -> std::sync::Arc<Vec<u8>> {
+        std::sync::Arc::clone(&self.file.0) // clone: a reference count
     }
 
     /// What brings the side file to `input`: a patch of the file last given where it fits one,

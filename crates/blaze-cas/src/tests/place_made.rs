@@ -256,7 +256,9 @@ impl World {
                             PATHS[n], placed.bytes
                         ));
                     }
-                    self.dirty[n] = if made { placed.bytes.copied } else { 0 };
+                    // What the place wrote there itself is in memory alone; a clone's
+                    // blocks are its source's, written back before it was cloned.
+                    self.dirty[n] = placed.bytes.copied;
                     // clone: the model's copy of what the path holds.
                     self.holds[n] = Some(want.clone());
                     self.last[n] = Some(value);

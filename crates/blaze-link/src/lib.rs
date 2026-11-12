@@ -969,6 +969,34 @@ impl Image {
         Ok((self.state.file_len, file::whole(&self.state)))
     }
 
+    /// The file as the last commit left it, to be read later: the state it is in, shared, so
+    /// nothing is copied until [`FileView::runs`] is asked, and a link that commits after
+    /// this leaves the view as it was. For whoever places the file from what a link wrote of
+    /// it ([`Patch::writes`]) and needs the whole only where the file before is not at hand.
+    /// The same error as [`Image::file`] before the first commit or while one is in flight.
+    pub fn file_view(&self) -> Result<FileView, LinkError> {
+        if !self.state.laid_out || self.pending.is_some() {
+            return Err(LinkError {
+                function: None,
+                refusal: None,
+                // alloc: error path
+                what: format!(
+                    "{}: no committed file to give: the image is not laid out, or a commit is in flight",
+                    self.to
+                ),
+            });
+        }
+        // clone: the state's reference counts, no allocation (`a_clone_allocates_nothing`)
+        Ok(FileView { state: self.state.clone() })
+    }
+
+    /// The image's debug side file as [`Image::debug_file`] last gave it, whole and shared:
+    /// what a writer of the file writes where the side file its patch is over is not at
+    /// the path. Empty before the first.
+    pub fn debug_file_view(&self) -> std::sync::Arc<Vec<u8>> {
+        self.beside.view()
+    }
+
     /// Each table the image keeps as `(name, elements, bytes)`, for `blaze inspect tables`
     /// (`blaze_api::Response::Tables`): `relocation` and the rest.
     pub fn tables(&self) -> Vec<(&'static str, u64, u64)> {
@@ -1177,6 +1205,19 @@ impl Image {
             .collect();
         out.sort_unstable_by_key(|it| (it.1, it.0));
         out
+    }
+}
+
+/// An image's file as one commit left it ([`Image::file_view`]).
+pub struct FileView {
+    state: state::State,
+}
+
+impl FileView {
+    /// The file's length and the runs of it that hold bytes, as [`Image::file_runs`] gives
+    /// them, made on the calling thread.
+    pub fn runs(&self) -> (u64, Vec<(u64, Vec<u8>)>) {
+        (self.state.file_len, file::whole_here(&self.state))
     }
 }
 
