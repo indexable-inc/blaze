@@ -1,0 +1,11 @@
+{
+ "id": "memstrat-12",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+ "where": "blaze: the edit loop over a long session",
+ "what": "A body edit and run is 110 to 113 ms for a daemon's first 40 edits and 207 to 210 ms for its edits 96 to 135 (two runs of main's binary, transparent huge pages; 252 to 266 ms with mimalloc on base pages). The rows everyone quotes are of the first 40.",
+ "cost": "it is the one row where this lane's allocator change is past 10%",
+ "cause": "not looked into",
+ "workaround": "none",
+ "state": "open: for the edit-path lane; `measure.py` with `\"rows\": \"idle\"` has the row (`body edit + run again`)"
+}

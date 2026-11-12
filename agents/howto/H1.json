@@ -1,0 +1,9 @@
+{
+ "id": "H1",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "task": "Build blaze in the dev loop",
+ "do": "LLVM_SYS_231_PREFIX=$HOME/.blaze/native/sha256-<the pinned LLVM> CARGO_TARGET_DIR=<a directory of your own> cargo +nightly-<date in harness/toolchain> build --release -p blaze-thin -p blaze-engine. Check with the same command and `check`. Give the built blaze its own state: BLAZE_HOME=<dir>.",
+ "why": "Rule blaze-builds-blaze: cargo is the dev-loop builder until blaze builds blaze fast (292 s cold, 3 to 25 s after a change on the 18-core Mac).",
+ "state": "current"
+}

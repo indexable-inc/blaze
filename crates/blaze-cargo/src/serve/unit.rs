@@ -33,6 +33,7 @@ mod compile;
 mod configs;
 mod deps;
 mod doc;
+mod drawn;
 mod error;
 pub(crate) mod files;
 mod graph;
@@ -1879,7 +1880,7 @@ impl Front<Real> for JobFront {
     }
 
     fn refused(&self, unit: usize, what: String) -> blaze_api::Diagnostic {
-        say::refused(what, self.0.unit_of(unit).ok(), self.0.input.color)
+        say::refused(what, self.0.unit_of(unit).ok(), compile::drawing(&self.0).color)
     }
 
     fn subject(&self, unit: usize) -> Option<(String, String)> {

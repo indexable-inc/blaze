@@ -1,0 +1,21 @@
+{
+ "id": "A39",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "my own test reruns (cargo test with a name filter); harness/v2/integrate.py's terminal-width check",
+ "what": "I reported an intermittent revision test as `main: pass 6 fail 0` and `main+edit3: pass 12 fail 0`: the test did not exist on those trees, the filter matched nothing, and `test result: ok. 0 passed` was counted as a pass. The same night the combined run's terminal-width row used `script` to make a terminal, which fails when stdin is a socket, so blaze never ran and the row said `recomputed-note=False`.",
+ "cost": "two false statements to the owner, both retracted; a wrong suspect (the handshake lane) held for an hour",
+ "cause": "my scripts grepped for a success phrase instead of checking that the named check ran",
+ "whys": [
+  "why wrong: zero tests ran and the run said ok",
+  "why possible: a filter that matches nothing is success for libtest, and my loop looked only for `test result: ok`",
+  "why not caught: nothing compares the tests run with the tests asked for",
+  "why easy: every tool here reports absence of failure, not presence of the check",
+  "property: a check that executes nothing reports success"
+ ],
+ "class": "vacuous success: any check, test run, measurement row or gate step that passes when it ran nothing (a filter matching no test, a skipped step, a command that failed before the thing measured, an empty input set)",
+ "prevention": "every check states what it expected to run and fails when it ran less: integrate.py counts tests run per named test and refuses zero; a measurement row carries the exit status and a proof the program ran (its output); `blaze test` with a filter that matches nothing is an error naming the filter; the gate refuses a step that reports zero checks. State: integrate.py's width row fixed (pty, exit status, output checked); the rest open",
+ "workaround": "count `1 passed`, not `ok`",
+ "fix": "see prevention",
+ "state": "open"
+}

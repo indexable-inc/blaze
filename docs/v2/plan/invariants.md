@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-149 invariants, 21 refinements, 12 reference models.
-By level: 125 tested, 44 simulated, 1 model-checked, 0 proved.
+150 invariants, 21 refinements, 12 reference models.
+By level: 126 tested, 44 simulated, 1 model-checked, 0 proved.
 
 ## Invariants
 
@@ -54,6 +54,8 @@ By level: 125 tested, 44 simulated, 1 model-checked, 0 proved.
   Controls: `a_release_that_lets_go_of_what_an_edit_made`, `a_release_that_holds_no_workspace_crate`.
 - **`a_records_diagnostics_kept_as_places_point_at_the_same_tokens_in_every_text_of_its_key`** *simulated* (`crates/blaze-cargo/src/serve/unit/tests.rs`): a record's diagnostics kept as places, replayed over any text of the same code text (a comment at a line's end, spaces before one, a comment after the last line added or taken away), point at the very tokens the check pointed at, and over the text they were made of are the diagnostics the check gave, byte for byte, through the record's encoding.
   Controls: `a_diagnostic_rendered_at_stale_offsets`.
+- **`a_build_for_another_client_runs_no_unit_and_shows_what_a_build_from_nothing_shows`** *tested* (`crates/blaze-cargo/src/serve/unit/tests/drawn.rs`): how a client is shown diagnostics is no input of a unit's compile. Two builds of one project that differ only in the client's width (80, 200, none), colour, short or long format and how many refused functions are named: the second runs no unit and misses nothing, and shows what a build from nothing for that client shows, byte for byte, drawn from the record the first one kept.
+  Controls: `the_width_put_back_in_the_key`.
 - **`every_recomputed_step_ends_in_a_terminal_reason`** *tested* (`crates/blaze-cargo/src/serve/why.rs`): every recomputed step of a build has a reason whose chain ends in a terminal reason other than `Unexplained`.
   Controls: `a_result_part_not_followed`, `an_unchanged_part_blamed`, `ends_in_the_order_reached`.
 - **`a_chain_blames_only_inputs_that_changed`** *tested* (`crates/blaze-cargo/src/serve/why.rs`): a chain's input is one the build's inputs really changed between the two builds, and it is called trivia exactly when no code changed in it.

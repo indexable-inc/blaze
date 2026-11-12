@@ -1,0 +1,11 @@
+{
+ "id": "A1",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "the shell",
+ "what": "`sed -i` behaves differently on macOS (BSD needs `-i ''`, cannot put a newline in a replacement) and GNU tools from nix sit first on PATH for some commands (`df -g` failed), so every in-place edit became a Python heredoc.",
+ "cost": "minutes each time, many times",
+ "cause": "two toolchains on one PATH",
+ "workaround": "edit files with the Edit tool or `python3 -I`; never `sed -i`",
+ "state": "open"
+}

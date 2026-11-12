@@ -1,0 +1,11 @@
+{
+ "id": "mem2-8",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+ "where": "cargo build of blaze (the measuring binary)",
+ "what": "A cargo build prints several hundred `cargo::missing_lints_inheritance` and rustc warnings (291 in blaze-cargo alone) before any error; a filter for `^error` with context was drowned and reported a failed build as having no error.",
+ "cost": "one build misread",
+ "cause": "the tree is linted by blaze, so cargo's own warnings are nobody's",
+ "workaround": "`RUSTFLAGS=\"--cap-lints allow\"` and grep `^error` in the kept log",
+ "state": "open"
+}

@@ -1,0 +1,11 @@
+{
+ "id": "mem2-13",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+ "where": "mimalloc 3: purge delay",
+ "what": "A forced collect (`mi_collect(true)`) purges nothing once `purge_delay` is 0 (`mi_arenas_try_purge` returns at `delay <= 0`), and with a delay a page a thread frees after the last forced purge stays scheduled until the next. Keeping freed pages for the next edit and purging them when idle therefore left 1.1 to 1.5 GiB on an idle daemon, and made an edit 3.5 s after the last 28% slower (154.6 ms against 121.0), which this lane did not explain.",
+ "cost": "four commits made and taken out again, about three hours with their measurements",
+ "cause": "the delay is one process-wide option read at each free and at each purge",
+ "workaround": "purge at once, as before",
+ "state": "open: why a rested edit is slower on pages kept warm is not known"
+}

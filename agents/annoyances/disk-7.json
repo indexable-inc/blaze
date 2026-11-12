@@ -1,0 +1,11 @@
+{
+ "id": "disk-7",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+ "where": "blaze: `blaze debug sql` in a fresh home",
+ "what": "The first `blaze debug sql` in a home downloads DuckDB into `<home>/v2/duckdb` (55 MB), a copy a home, though it is a pinned binary named by its version and hash.",
+ "cost": "55 MB a home, and the first query waits for the download",
+ "cause": "the tool directory is under the home's state, not the machine's shared directory",
+ "workaround": "none",
+ "state": "open"
+}

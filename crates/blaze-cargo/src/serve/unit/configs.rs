@@ -94,10 +94,8 @@ pub(super) fn report(job: &Job, reader: Option<UnitReader>, ok: bool, built: &[u
         sources.add(&name, Some(text));
     }
     job.mounted.add_sources(&mut sources, &diags);
-    let mut style = blaze_diagnostics::emit::Style { ansi: job.input.color, short: job.input.short, ..Default::default() };
-    if let Some(width) = job.input.width {
-        style.width = usize::try_from(width).unwrap_or(usize::MAX);
-    }
+    // Said as the job ends, of no record: drawn for its client as a unit's are.
+    let style = compile::drawing(job).style();
     let mut out = notes;
     for (unit, diag) in &said {
         let unit_of = job.unit_of(*unit as usize)?;

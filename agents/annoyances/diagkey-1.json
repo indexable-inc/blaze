@@ -1,0 +1,11 @@
+{
+ "id": "diagkey-1",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane diagkey-1111",
+ "where": "serve/unit/compile.rs: `names`, `store`",
+ "what": "A unit's compile cannot be driven in a test without a whole daemon: `compile::names`, `link` and `store` take a `Job`, which holds a `JobInput` (the database, the view's files reader, the store's reader, the macros, the plan) that only `serve::unit::Real` makes from a daemon's world. So the property \"a build for another client finds the unit's record and draws it\" could be tested in process only by its parts (the real key, the record's encoding, `reads`' filing, `drawn::draw`) with the glue between them written again in the test, and end to end only with a real daemon (the revision case).",
+ "cost": "the lane's main test is two tests, neither of the code path as it ships",
+ "cause": "the unit phases read the store, the view and the database directly through `Job` (rule sans-io-cores: no injected interface between what a phase decides and what it reads)",
+ "workaround": "`serve/unit/tests/drawn.rs` for the parts; `a_terminal_of_another_width_remakes_nothing` under the real driver for the whole",
+ "state": "open: what blocks it is `Job`/`JobInput` in crates/blaze-cargo/src/serve/unit.rs; a phase core that takes its record lookups and file texts as an interface would run under `Sim`"
+}

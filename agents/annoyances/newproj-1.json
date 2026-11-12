@@ -1,0 +1,11 @@
+{
+ "id": "newproj-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane newproj-1111",
+ "where": "a unit record's miss (`blaze explain key_part_diff`)",
+ "what": "A unit's record that missed said `its crate's settings in the front end (its root's path, cfgs, env, edition and target)` with one hash: which of a dozen settings and forty environment variables moved was not said, for any of the standard library's 26 units.",
+ "cost": "a rebuild with a part a setting before the cause could be named (the directory proc macros run in)",
+ "cause": "the crate's content ID is one hash, and the miss's parts named it whole",
+ "workaround": "none",
+ "state": "fixed on newproj-1111 (34522b6779): each setting and each variable is a part of its own"
+}

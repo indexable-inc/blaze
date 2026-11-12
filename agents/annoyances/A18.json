@@ -1,0 +1,11 @@
+{
+ "id": "A18",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "the harness (Claude Code)",
+ "what": "`pgrep -fl` matched another agent's process whose command line carries a 10 KB JSON argument, which was printed whole into my context.",
+ "cost": "context",
+ "cause": "I used `-l` with `-f`",
+ "workaround": "`ps -o pid,etime,command | cut -c1-110`",
+ "state": "fixed in my habits"
+}

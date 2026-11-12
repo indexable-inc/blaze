@@ -1,0 +1,11 @@
+{
+ "id": "memstrat-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+ "where": "ix VM: the root disk",
+ "what": "With BLAZE_HOME on the VM's root disk (xfs on /dev/vda) the same binary that measures a 17 ms no-op run on tmpfs measured 83 to 144 ms, a cold build 26 to 40 s for 14 to 18, and every row's quartiles were 2 to 3 times apart.",
+ "cost": "three baseline runs thrown away, about 40 minutes",
+ "cause": "not found: an fsync of 4 KiB there is 0.8 ms median; the daemon's own IO pattern on that disk was not profiled",
+ "workaround": "home and project on /dev/shm",
+ "state": "open: why blaze's edit loop is 5 times slower on that disk is unexplained"
+}

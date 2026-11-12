@@ -62,6 +62,7 @@ real! {
     a_save_by_rename_is_read_whole
     a_second_project_reuses_the_standard_library
     a_signature_change_remakes_the_callers
+    a_terminal_of_another_width_remakes_nothing
     a_touch_without_a_change
     an_added_and_a_removed_function
     an_edit_after_a_kill
