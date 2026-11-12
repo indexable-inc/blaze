@@ -2,6 +2,7 @@
 """diskbytes.py: every byte blaze leaves on disk after one scripted session, and what the edits cost.
 
     diskbytes.py run '<json>' | FILE | -      a fresh home, a build, the edits, then the tables
+    diskbytes.py home '<json>' | FILE | -     the tables of a home that is there, no session
     diskbytes.py tree '<json>' | FILE | -     the tables of a directory that is there (Relax's)
 
 `run` makes an empty home and an empty machine directory under `work`, a hello-world beside
@@ -36,7 +37,6 @@ The answers are one JSON object written to `out` and the tables printed. Nothing
 
 from __future__ import annotations
 
-import ctypes
 import fcntl
 import hashlib
 import json
@@ -88,6 +88,16 @@ class Run:
 
 
 @dataclass(frozen=True)
+class Home:
+    # A home that is there, and the machine directory its daemon shared (`<XDG_CACHE_HOME>/blaze`).
+    home: str
+    machine_dir: str
+    out: str
+    zstd: str
+    label: str = ""
+
+
+@dataclass(frozen=True)
 class Tree:
     # The directory to read (Relax's `target`).
     dir: str
@@ -121,31 +131,32 @@ def extents_linux(fd: int, size: int) -> list[tuple[int, int]]:
             return out
 
 
-class Log2Phys(ctypes.Structure):
-    _pack_ = 4
-    _fields_ = [("flags", ctypes.c_uint32), ("contigbytes", ctypes.c_int64), ("devoffset", ctypes.c_int64)]
-
-
 def extents_macos(fd: int, size: int) -> list[tuple[int, int]]:
-    """The physical extents of a file, by `fcntl(F_LOG2PHYS_EXT)`: (device offset, length)."""
+    """The physical extents of a file: (device offset, length). `F_LOG2PHYS_EXT` gives the device
+    offset of a file offset, but answers for a hole as if it had blocks, so the holes are found
+    first (`SEEK_DATA`, `SEEK_HOLE`) and only the data between them is asked about."""
     F_LOG2PHYS_EXT = 65
-    libc = ctypes.CDLL(None, use_errno=True)
     out: list[tuple[int, int]] = []
     at = 0
     while at < size:
-        arg = Log2Phys(0, size - at, at)
-        if libc.fcntl(fd, F_LOG2PHYS_EXT, ctypes.byref(arg)) != 0:
-            errno = ctypes.get_errno()
-            # ERANGE: a hole here. Step a block and ask again.
-            if errno == 34:
-                at += BLOCK
-                continue
-            raise OSError(errno, f"F_LOG2PHYS_EXT at {at}: {os.strerror(errno)}")
-        if arg.contigbytes <= 0:
-            raise OSError(0, f"F_LOG2PHYS_EXT at {at} gave no bytes")
-        length = min(arg.contigbytes, size - at)
-        out.append((arg.devoffset, (length + BLOCK - 1) // BLOCK * BLOCK))
-        at += length
+        try:
+            data = os.lseek(fd, at, os.SEEK_DATA)
+        except OSError as e:
+            # ENXIO: nothing but a hole from here to the end.
+            if e.errno == 6:
+                break
+            raise
+        hole = os.lseek(fd, data, os.SEEK_HOLE)
+        while data < hole:
+            # struct log2phys, packed to 4: flags, then the bytes asked about, then the offset.
+            answer = fcntl.fcntl(fd, F_LOG2PHYS_EXT, struct.pack("=Iqq", 0, hole - data, data))
+            _, contiguous, device = struct.unpack("=Iqq", answer)
+            if contiguous <= 0:
+                raise OSError(0, f"F_LOG2PHYS_EXT at {data} gave no bytes")
+            length = min(contiguous, hole - data)
+            out.append((device, length))
+            data += length
+        at = hole
     return out
 
 
@@ -658,7 +669,7 @@ def show(result: dict, title: str) -> None:
                 # A sampled kind's figures are scaled to the whole kind.
                 if n is not None and row.get("sampled_raw") and row["sampled_raw"] != row["raw"]:
                     n = int(n * row["raw"] / row["sampled_raw"])
-                line += f" {mb(n)[1:]}"
+                line += f" {mb(n)[1:]:>8}"
         print(line)
     print("\nlargest duplicates:")
     for row in result["duplicates"][:12]:
@@ -671,6 +682,14 @@ def main() -> None:
             it = parse(Run, text, SCRIPT)
             result = session(it)
             title = f"blaze {it.commit} on {result['machine']}"
+        case ["home", text]:
+            at = parse(Home, text, SCRIPT)
+            if not os.path.isdir(at.home):
+                fail(SCRIPT, f"{at.home} is no directory")
+            result = measure([(at.home, ""), (at.machine_dir, "machine")], True, at.zstd)
+            result["home"] = at.home
+            title = at.label or at.home
+            it = at
         case ["tree", text]:
             tree = parse(Tree, text, SCRIPT)
             if not os.path.isdir(tree.dir):
@@ -680,7 +699,7 @@ def main() -> None:
             title = tree.label or tree.dir
             it = tree
         case _:
-            fail(SCRIPT, "usage: diskbytes.py run|tree '<json>' | FILE | -")
+            fail(SCRIPT, "usage: diskbytes.py run|home|tree '<json>' | FILE | -")
     os.makedirs(os.path.dirname(os.path.abspath(it.out)), exist_ok=True)
     with open(it.out, "w") as f:
         json.dump(result, f, indent=1)
