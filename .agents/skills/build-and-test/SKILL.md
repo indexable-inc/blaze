@@ -77,28 +77,39 @@ See [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#wor
 
 ## fan-out-write-only (rule 35)
 
-A lane is a writer. It edits its own files in the one integration directory (`worktree-per-lane`),
-and that is all it does: it does not run cargo or blaze, does not call the build VM
-(`work-in-ix-vms`), does not start a daemon, does not poll or wait on anything, and does not run
-git; it says plainly that its code has not been compiled, lists the tests it wrote and what each
-should show, and stops or goes on writing the next piece. Waiting is the waste this rule removes:
-thirty-eight shells of lanes each waiting on its own build of its own branch is thirty-eight agents
-not writing, and their separate results had to be redone on the combined tree anyway. The main agent
-runs rounds: when the lanes say their pieces are ready (or on its own clock while they keep
-writing), it commits what is in the directory (one commit per lane's files, crediting it), pushes,
-and has the one VM build the whole tree once and run everything at once (`harness/v2/integrate.py`:
-the edit-loop table beside the reference, the stale-answer run, new project, restart, memory, disk,
-the revision tests, the unit tests of the crates touched, each test a lane named); it then sends
-every compile error and failed check to the lane whose file it names, with the tree's commit, the
-command and the output, and the lanes fix by writing; the next round follows. A lane writes so that
-a round can run: new code beside the old until it is switched over, nothing half-applied across
-files it does not own, each piece with its test. What a lane needs to see at run time (a profile's
-rows, what a command prints, whether a guess is right) it asks for as a line in its report: the main
-agent runs it in the next round and sends the answer. The exceptions are named in a lane's brief
-with the reason, and are few: one lane measuring a real project that takes minutes per run (it
-measures; it does not hold others up), and tools that need no build at all (a Python or TypeScript
-check that takes seconds). Landing: main takes the integration tree, or a part of it, when a round
-is clean on that exact commit.
+The head is always green. There is one head that has check-compiled whole (`cargo check --workspace
+--all-targets`, until blaze builds blaze fast) and a lane's piece joins it alone: its files are
+applied onto that head in one scratch checkout with a warm target, the workspace is check-compiled,
+and it is committed only if that passes; if not, the errors go back to that lane and the head does
+not move. A cut never takes several lanes' uncompiled files at once, and no lane is told to build on
+another lane's piece until that piece is in the green head. Feedback is minutes, not rounds: when a
+lane reports a piece, the main agent at once compiles and tests that one crate (`cargo test -p
+<crate>` on the Mac or the VM) and sends the errors and failures back; the full build, the test
+table and the measurements stay with the one runner on the one VM. The day's measurement table (the
+test table against main and the edit-loop table) is taken on the green head on a quiet machine
+BEFORE the first piece of the day is admitted, so every later number has a baseline. Code a redesign
+supersedes is reverted from the head, not left for nobody to build on. A lane is a writer. It edits
+its own files in the one integration directory (`worktree-per-lane`), and that is all it does: it
+does not run cargo or blaze, does not call the build VM (`work-in-ix-vms`), does not start a daemon,
+does not poll or wait on anything, and does not run git; it says plainly that its code has not been
+compiled, lists the tests it wrote and what each should show, and stops or goes on writing the next
+piece. Waiting is the waste this rule removes: thirty-eight shells of lanes each waiting on its own
+build of its own branch is thirty-eight agents not writing, and their separate results had to be
+redone on the combined tree anyway. The main agent runs rounds: when the lanes say their pieces are
+ready (or on its own clock while they keep writing), it commits what is in the directory (one commit
+per lane's files, crediting it), pushes, and has the one VM build the whole tree once and run
+everything at once (`harness/v2/integrate.py`: the edit-loop table beside the reference, the
+stale-answer run, new project, restart, memory, disk, the revision tests, the unit tests of the
+crates touched, each test a lane named); it then sends every compile error and failed check to the
+lane whose file it names, with the tree's commit, the command and the output, and the lanes fix by
+writing; the next round follows. A lane writes so that a round can run: new code beside the old
+until it is switched over, nothing half-applied across files it does not own, each piece with its
+test. What a lane needs to see at run time (a profile's rows, what a command prints, whether a guess
+is right) it asks for as a line in its report: the main agent runs it in the next round and sends
+the answer. The exceptions are named in a lane's brief with the reason, and are few: one lane
+measuring a real project that takes minutes per run (it measures; it does not hold others up), and
+tools that need no build at all (a Python or TypeScript check that takes seconds). Landing: main
+takes the integration tree, or a part of it, when a round is clean on that exact commit.
 
 ## worktree-per-lane (rule 36)
 
