@@ -1,0 +1,27 @@
+[package]
+name = "blaze-launch"
+description = "blaze's launcher under the `edit` goal (docs/v2/plan/design/launcher.md), step 1: the sans-IO core that owns a running program's slot table, its append-only code area, the retirement of replaced bodies by per-thread epochs and the all-or-nothing transaction of an edit; and the patch protocol's schema in deterministic CBOR"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# bstd (docs/v2/plan/design/std.md), and nothing of Rust's `std`: the allocator the core's
+# tables are made in (`mem::Kept`).
+blaze-std.workspace = true
+
+[dev-dependencies]
+# The oracle of `wire`'s bytes: `cbor::check` holds them to RFC 8949 4.2.1.
+blaze-protocol.workspace = true
+hegeltest.workspace = true
+
+[lints]
+workspace = true
