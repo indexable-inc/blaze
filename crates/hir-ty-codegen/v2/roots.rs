@@ -39,7 +39,7 @@ use hir_def::{
 };
 use hir_expand::name::Name;
 use hir_ty::db::HirDatabase;
-use intern::sym;
+use intern::{Symbol, sym};
 use std::alloc::Global;
 
 use super::{HirFrontend, HirInstance, HirStatic, Kind, frontend::root_in};
@@ -389,6 +389,23 @@ fn entry_fn(db: &Db, krate: Crate) -> Result<Option<FunctionId>, &'static str> {
                 return Ok(Some(func));
             }
         }
+    }
+    // A program of a blaze edition (docs/v2/plan/design/std.md, "The blaze edition: opting
+    // in"): its entry is the `main` of the module blaze appended to its root
+    // (`hir_ty::entry::module`), which calls the crate's own with the roots it takes. A root
+    // without the module has a `main` the entry rule refused, or none: the crate's checks
+    // say which, and nothing is run in its place.
+    if krate.blaze_edition(db).is_some() {
+        let entry = Name::new_symbol_root(Symbol::intern(span::BlazeEdition::ENTRY_MODULE));
+        let Some(&module) = def_map.module(db, root).children(db).get(&entry) else {
+            return Err("it is of the blaze edition and its `main` is no entry (rule \
+                        entry-takes-roots: `main` takes `&Cx`, `Io`, both in that order, or nothing)");
+        };
+        let main = def_map.module(db, module).scope(db).get(&Name::new_symbol_root(sym::main));
+        return match main.values.map(|it| it.def) {
+            Some(ModuleDefId::FunctionId(func)) => Ok(Some(func)),
+            _ => Err("its appended entry module has no `main`"),
+        };
     }
     let main = def_map.module(db, root).scope(db).get(&Name::new_symbol_root(sym::main));
     match main.values.map(|it| it.def) {

@@ -46,6 +46,7 @@ pub mod drop;
 pub mod dropck;
 pub mod dyn_compatibility;
 pub mod effects;
+pub mod entry;
 pub mod evict;
 pub mod facts;
 pub mod fn_cache;
