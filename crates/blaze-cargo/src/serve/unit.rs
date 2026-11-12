@@ -1384,8 +1384,9 @@ impl Writer<Real> for UnitWriter {
     /// what the front end's crates read that way ([`base_db::process_env_reads`]) and what the
     /// daemon read into what it keeps with the front end ([`deps::Session::env_read`]). More
     /// names than this build's own is sound (a name more is a variable more compared); a
-    /// name less is not, so: none, with the reason, when a build script's run was not found
-    /// kept by `fresh` (its reads are not noted).
+    /// name less is not, so: none, with the reason, when a build script's run was neither
+    /// found kept by `fresh` nor kept by this build (`script::ReadBytes::note_ran`): its
+    /// reads are not noted.
     fn env_named(&self) -> Result<Vec<String>, String> {
         let job = &self.job;
         let noted = job.script_reads.lock();
@@ -1393,7 +1394,7 @@ impl Writer<Real> for UnitWriter {
             if it.mode == Mode::RunCustomBuild && !noted.noted(unit) {
                 // alloc: a reason, once a build
                 return Err(format!(
-                    "the variables the build script of {} read are not noted: its run was not found kept as the build began",
+                    "the variables the build script of {} read are not noted: its run was neither found kept as the build began nor kept by this build",
                     it.pkg_id
                 ));
             }
@@ -1420,7 +1421,7 @@ impl Writer<Real> for UnitWriter {
             if it.mode == Mode::RunCustomBuild && !noted.noted(unit) {
                 // alloc: a reason, once a build
                 return Err(format!(
-                    "the paths the build script of {} read are not noted: its run was not found kept as the build began",
+                    "the paths the build script of {} read are not noted: its run was neither found kept as the build began nor kept by this build",
                     it.pkg_id
                 ));
             }
@@ -1432,6 +1433,34 @@ impl Writer<Real> for UnitWriter {
         files.extend(record_files);
         listed.extend(record_listed);
         Ok((files, listed))
+    }
+
+    /// Every read of the machine's files a build script's record rests on, with what was
+    /// there when the record held ([`script::ReadBytes::seen`], where the completeness of
+    /// the list is argued). None, naming the unit, when a build script of the build has no
+    /// trace to say it: one run outside the sandbox, one that is checked (run again whatever
+    /// is kept), one whose run was neither found kept nor kept by this build, or one whose
+    /// check walked a directory by a question no read is of.
+    fn read_seen(&self) -> Result<Vec<crate::serve::work::Seen>, String> {
+        let job = &self.job;
+        let noted = job.script_reads.lock();
+        for (unit, it) in job.units().graph.units.iter().enumerate() {
+            if it.mode == Mode::RunCustomBuild && !noted.noted(unit) {
+                // alloc: a reason, once a build
+                return Err(format!(
+                    "the build script of {} has no trace of what it read: its run was neither found kept as the build began nor kept by this build",
+                    it.pkg_id
+                ));
+            }
+        }
+        if let Some(path) = &noted.unseen {
+            // alloc: a reason, once a build
+            return Err(format!(
+                "a build script's kept run was checked against {} by its names or one entry alone, which no read of a certificate is of",
+                path.display()
+            ));
+        }
+        Ok(noted.seen.clone()) // clone: once a build, a read a file its build scripts read
     }
 
     fn keep(mut self) -> Result<KeptLowered, ApiError> {

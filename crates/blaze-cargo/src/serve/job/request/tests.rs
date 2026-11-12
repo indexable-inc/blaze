@@ -154,7 +154,9 @@ impl World {
         match read {
             Read::Node(path) => self.node(path),
             Read::Env(name) => value(self.env.get(name.as_str())),
-            Read::Outside(path) | Read::Listing(path) => value(self.outside.get(path.as_str())),
+            Read::Outside(path) | Read::Listing(path) | Read::Tree(path) | Read::Package(path) => {
+                value(self.outside.get(path.as_str()))
+            }
             Read::Drawn => Digest::Nothing,
         }
     }

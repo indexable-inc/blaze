@@ -141,6 +141,11 @@ pub(super) enum Read {
     Outside(String),
     /// A directory outside every view, by its listing.
     Listing(String),
+    /// Everything below a directory outside every view, by the hash of its walk: what a
+    /// build script that hashed a directory whole read.
+    Tree(String),
+    /// As [`Read::Tree`], walked as a package is.
+    Package(String),
     /// How the request's client is shown diagnostics: read only by a build that said one.
     Drawn,
 }
@@ -154,6 +159,8 @@ impl Read {
             Read::Outside(path) => (2, path.as_str()),
             Read::Listing(path) => (3, path.as_str()),
             Read::Drawn => (4, ""),
+            Read::Tree(path) => (5, path.as_str()),
+            Read::Package(path) => (6, path.as_str()),
         }
     }
 
@@ -179,6 +186,8 @@ impl Read {
             2 => Read::Outside(text),
             3 => Read::Listing(text),
             4 if text.is_empty() => Read::Drawn,
+            5 => Read::Tree(text),
+            6 => Read::Package(text),
             _ => return Err(Undecoded::Malformed("a read's kind")),
         })
     }
@@ -192,6 +201,8 @@ impl fmt::Display for Read {
             Read::Node(path) | Read::Outside(path) => f.write_str(path),
             Read::Env(name) => write!(f, "${name}"),
             Read::Listing(path) => write!(f, "the names in {path}"),
+            Read::Tree(path) => write!(f, "everything below {path}"),
+            Read::Package(path) => write!(f, "the package below {path}"),
             Read::Drawn => f.write_str("how diagnostics are shown"),
         }
     }

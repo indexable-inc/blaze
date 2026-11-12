@@ -1991,6 +1991,10 @@ enum Stage<S: Steps> {
         heads: Vec<(String, ContentId)>,
         store: blaze_cas::Tickets,
     },
+    /// Its request is checked against its certificate now that this daemon has looked at
+    /// the standard library ([`Jobs::certify_late`]): it waits for looks at its outputs,
+    /// and has opened no view.
+    Certify,
     Over,
 }
 
@@ -2805,6 +2809,7 @@ impl<S: Steps> std::fmt::Display for StageSaid<'_, S> {
                 "waits for its snapshot's commit ({})",
                 if ticket.is_some() { "the VFS's heads" } else { "the store's puts" }
             ),
+            Stage::Certify => f.write_str("waits for looks at its outputs: its request certificate's check"),
             Stage::Over => f.write_str("is over and waits to end"),
         }
     }
@@ -8104,7 +8109,7 @@ impl<S: Steps> Jobs<S> {
         // of every build that passed, one that compiled too.
         if ok && let Some(building) = self.certify.building.iter_mut().find(|it| it.job == id) {
             let _reads = tracing::info_span!(target: "blaze", "request certificate: what the build's steps read").entered();
-            building.steps_read(writer.env_named(), writer.read_outside());
+            building.steps_read(writer.env_named(), writer.read_outside(), writer.read_seen());
         }
         // A build that may become its checkout's kept answer and made nothing so far says
         // which sources its keys held by code text alone: what the lane answers a comment
@@ -9365,6 +9370,7 @@ fn stage_name<S: Steps>(stage: &Stage<S>) -> &'static str {
         Stage::Ahead(_) => "choosing units ahead",
         Stage::Runs(_) => "running its tests or program",
         Stage::Snapshot { .. } => "snapshotting",
+        Stage::Certify => "checking its request certificate",
         Stage::Over => "over",
     }
 }

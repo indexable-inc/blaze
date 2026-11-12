@@ -5,7 +5,7 @@ date: 2026-11-12
 ---
 # Request certificates
 
-Lanes certificate-1112, certificate2, certificate3, certificate4, certificate5. Code: `crates/blaze-cargo/src/serve/job/certificate.rs`
+Lanes certificate-1112, certificate2, certificate3, certificate4, certificate5, certificate6. Code: `crates/blaze-cargo/src/serve/job/certificate.rs`
 (the record in `blaze-record`'s form, its codec, the local evidence) and
 `serve/job/request.rs` (the request machine: the check and the write), both sans-IO, with their tests. The owner, on a repeated `blaze run` of a hello-world
 being a whole walk (1,162 `job` and `task` spans, 1,195 `admission`, 160–700 ms; reth's no-op
@@ -144,7 +144,7 @@ first request after a restart, none while the watches vouch); end to end under 2
 the client's start. reth no-op: from 2.0–2.8 s to under 50 ms (about 30 groups, a few thousand
 output stats cold). First request after a restart: the same, plus the tree's restore.
 
-## State (2026-11-12, lane certificate5)
+## State (2026-11-12, lanes certificate5, certificate6)
 
 Wired; compiled by the main agent, no test run on the wiring as of this writing: the driver
 `serve/job/certify.rs`. `Jobs::begin` checks a build or a check against its certificate before
@@ -190,13 +190,25 @@ What the wiring does not do yet (each a known gap, in the order to close them):
    hash, in the span `request certificate: hash an output no stamp vouches for`): every
    output at a daemon's first check, and each output a build wrote less than two seconds
    before its stamp was taken. Needed: a pool task, bounded, with a span.
-3. **Outside reads are valued at the build's end**, through `Disk`, for the paths the steps'
-   records name (`Writer::read_outside`, which names only paths under the build's directories
-   of outputs: a build script's read of a system header is in no list); the build's own looks
-   carry their hashes. A build in which a build script RAN (not found kept) says none of its
-   reads (`Writer::env_named`/`read_outside` are `Err`): `Untraced`, no certificate until the
-   next build. Needed: the runs' own recorded reads with their hashes
-   (`blaze-usercode/src/index.rs`, `inputs`), and a unit with none named `Untraced`.
+3. **Closed by certificate6 (uncompiled when written): a build script's reads are its
+   record's.** `Writer::read_seen` hands every read of the machine's files a traced step's
+   record rests on (`work::Seen`: a file, a listing or a tree hashed whole, by real path,
+   wherever it is: a system header too), at the value the record holds it at: for a run
+   found kept, what its check asked the disk and saw (`script::Noting`); for a run that ran,
+   its trace (`ReadBytes::note_ran`). A build in which build scripts ran writes its
+   certificate. `Read::Tree`/`Read::Package` name a tree hashed whole. A check asks the same
+   question of the same table (`blaze_usercode::inputs::Disk`). The completeness argument is
+   on `ReadBytes::seen`. Named `Untraced` (no certificate): a script run outside the
+   sandbox, one that is checked (`Mode::Verify`), one neither found kept nor kept. One read
+   a unit by its record key was not taken: valuing it is `index::find`, which needs the
+   unit's prepared run (the plan) and costs every name of every unit's shape with nothing
+   shared; by name the reads are each once a build. Still open here: the units' own records'
+   reads under the outputs (`reads::read_paths`: `include!`d files, expansions' reads) are
+   valued by a look at the build's end; reads under the checkout are named beside the node
+   that covers them (a probe each at a check; and the certificate is not relocatable while
+   they are absolute); every outside read is valued ON THE LOOP at a check (`outside_now`:
+   a table probe when a watch vouches, a stat and a whole-file hash when none does, as after
+   a restart), with a span each.
 4. **Not relocated**: the base holds the checkout's directory (`Viewed::bare`, `shape`), an
    output's path is absolute (base 0), `said` is as said. One chain a checkout directory.
 5. **One node**, the view's root (`Read::Node("")`): any change in the checkout misses, and

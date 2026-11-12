@@ -250,8 +250,10 @@ Three things recur, and each is one piece of work for all five, not five:
   the rows are dropped and the answer is not given). `Kernel::get` is a session of one
   request. In a session a value found at the top before is one get, and a child is verified
   once over all requests (`tests/cost.rs`). Test: the nested exhaustive check runs every
-  sequence in one session with a drop at every place (28,561 sequences), control
-  `a_session_that_outlives_its_pin_is_caught`.
+  sequence in one session with a drop at every place, control
+  `a_session_that_outlives_its_pin_is_caught`. The session is now in `session.rs`, is of one
+  registry of steps as well as one pin (`Kernel::registry`, `KernelError::Reregistered`), and
+  is carried from pin to pin: "Carrying a session" below.
 - **Negative reads.** Present for a key: `Seen::Gone` (`Digest::Nothing`), never equal to a
   hash. Absence over a set (no impl for a type, no such name in a scope) is a read of the set
   under its own kind, whose hash covers the set. Lacking: a read that cannot be valued now is
@@ -270,6 +272,52 @@ Three things recur, and each is one piece of work for all five, not five:
   It sits in nesting: a child run "under cover" has its reads checked against the parent's
   covering reads instead of recorded as the parent's. Nothing else may stand in front of a
   lookup.
+
+### Carrying a session
+
+Built (`session.rs`, `nest::carry`, `Kernel::carry`); the design is docs/v2/plan/design/end-state.md,
+"The bar: within 10% of the floor", item 1. A session keeps, beside its rows (identity → entry
+key, value hash, height), **postings**: a read's name → the rows whose entry's list names it. A
+read of a step's value is posted under its name like any other, and that name says which row is
+the step's own, so a row's readers are the postings of its name.
+
+`Kernel::carry(session, store, world, changed, verify)` takes the session from its pin to the
+world's. `Changed` is what the driver says differs between the two pins, total by kind of read:
+the exact names, or "any read of this kind". The carry drops and queues the rows a changed name
+reaches, then repairs the queue lowest height first: a row a step has read is looked up again by
+the ordinary lookup (a stored entry is a hit, else it runs) and its value hash compared with the
+one its readers saw; the same hash stops there, another queues its readers. A queued row no step
+has read is only dropped, and looked up when next asked for. An entry the repair never reaches
+is verified with no work: its next hit is one get.
+
+Repair is eager, inside the carry. Lazy repair needs, for a top to know that something under it
+is dirty, either a mark on every transitive reader plus each row's children in memory, or a walk
+of every reader's lists; eager needs only the postings and each read row's own key.
+
+| Invariant | Where it holds | Control (`exhaustive/nested.rs`) |
+|---|---|---|
+| I1 every row is indexed | `Session::admit` is the only place a row goes live and takes a `Posted`, which only `Session::post` makes; both are private to `session.rs` | `a_hit_admitted_without_postings_is_caught`, `a_posting_written_at_the_next_carry_is_caught` |
+| I2 the seed is complete | `Changed` is total by kind (`CarryError::Unsaid` names a kind left out); a registry that differs drops the session; that the names are all of them is the driver's to prove | `an_absence_left_out_of_the_change_set_is_caught` (the bug is in the driver's model) |
+| I3 children before parents | the queue pops the lowest; a queued row is dropped at once, so a lookup that asks for it repairs it first; a changed row queues its readers even if they were repaired | `a_parent_repaired_before_its_child_is_caught` |
+| I4 valued at the pin | `carry` takes `&mut Session`; `Moved` before and after; a change set from another pin is `CarryError::From` | `a_session_that_outlives_its_pin_is_caught` |
+| I5 covers post | not built: the cover is not built | none yet |
+
+The theorem is stated once, on `Kernel::carry` (`/// The invariant:`), and checked by
+`every_nested_sequence_in_scope_gives_what_a_fresh_run_gives`: 15^4 sequences from an empty
+store and from a store another session filled, the session carried at every moved get and at
+any step, each get against a computation with no kernel.
+
+Cost (`tests/cost.rs`, a session of 256 entries): a carry that reaches nothing reads nothing
+and values nothing; one changed fact whose entry comes out the same costs that entry's lookup
+and run; one that changes its entry costs the path to the top (each entry on it: one lookup that
+misses, one run); every other entry is one get when asked for. Against the floor (the changed
+entries and their direct readers rerun): the carry adds one missed lookup per rerun entry, a
+few gets each.
+
+Not built: the rows and postings as records of the store (they are memory of whoever holds
+the session), compaction of postings left by rows that were dropped, heights raised when a
+child grows taller without its value changing (such a parent may be repaired twice in a later
+carry; never wrongly), and the cover.
 
 ### (c) What a lookup costs
 

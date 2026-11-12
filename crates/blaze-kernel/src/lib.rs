@@ -47,14 +47,16 @@ mod entry;
 mod exhaustive;
 mod nest;
 mod reads;
+mod session;
 mod store;
 #[cfg(test)]
 mod tests;
 pub mod why;
 
 pub use crate::entry::{Entry, EntryReads, whole};
-pub use crate::nest::{MOST_NESTED, Session};
+pub use crate::nest::MOST_NESTED;
 use crate::nest::{Door, Engine, How, Lent, LentMut, Need, Now, Runner, Valued};
+pub use crate::session::{Carried, CarryError, Changed, Dropped, Session};
 pub use crate::reads::{Reads, Trace, TwoSeen};
 pub use crate::store::{Get, Put, Reading, Writing, take_lookups};
 use crate::store::{Keeping, Looking, Stopped};
@@ -392,6 +394,13 @@ pub enum KernelError {
     /// of one session, or while one ran. Nothing is answered from the session's rows, and
     /// whoever holds the session makes a new one for the world as it is now.
     Moved { pinned: Pin, now: Pin },
+    /// The kernel's registry of steps ([`Kernel::registry`]) is not the one the request's
+    /// session was verified under: a step's code, or which steps there are, is an input of
+    /// every row. Nothing is answered; a carry drops what the session verified
+    /// ([`Kernel::carry`]), or its holder makes a new one.
+    Reregistered { session: ContentId, now: ContentId },
+    /// A carry was refused before it changed anything ([`Kernel::carry`]).
+    Carry(CarryError),
     /// A step asked for a value that was being computed for it: `cycle` is the values on the
     /// way, from the one asked for again (`of`) to the one that asked. The kernel has no
     /// fixpoint: steps that need each other are one step over their whole cycle.
@@ -427,7 +436,9 @@ impl KernelError {
             | KernelError::Conflict { .. }
             | KernelError::TooManyShapes { .. }
             | KernelError::Verify(_)
-            | KernelError::Moved { .. } => false,
+            | KernelError::Moved { .. }
+            | KernelError::Reregistered { .. }
+            | KernelError::Carry(_) => false,
         }
     }
 }
@@ -477,6 +488,11 @@ impl fmt::Display for KernelError {
                 "the world moved under a session: the session is of the world pinned at {:x}, and the world is at {:x} now, so nothing was answered; make a new session for the world as it is",
                 pinned.0, now.0
             ),
+            KernelError::Reregistered { session, now } => write!(
+                f,
+                "the kernel's steps are not the ones a session was verified under: the session is of the registry {session:x}, and the kernel's is {now:x} now, so nothing was answered; carry the session (which drops what it verified) or make a new one"
+            ),
+            KernelError::Carry(error) => error.fmt(f),
             KernelError::Cycle { of, cycle } => {
                 write!(f, "{of} is asked for while it is computed: a cycle of steps, ")?;
                 for link in cycle {
@@ -529,6 +545,29 @@ struct Registered<W: ?Sized> {
 /// step is of is checked where it is registered and used, by the compiler.
 pub struct Kernel<W: ?Sized> {
     steps: blaze_hash::HashMap<StepId, Registered<W>, Global>,
+    /// What [`Kernel::registry`] gives: made again at each registration, so a request reads it.
+    registry: ContentId,
+}
+
+const REGISTRY: &str = "blaze v2 kernel registry 1";
+
+/// The digest of a registry: every step's number, name and code, and whether it may be asked
+/// for, in the order of the numbers.
+fn registry_of<W: ?Sized>(steps: &blaze_hash::HashMap<StepId, Registered<W>, Global>) -> ContentId {
+    // alloc: once a registration, the steps in the order of their numbers
+    let mut sorted: Vec<(StepId, &Registered<W>)> = steps.iter().map(|(step, it)| (*step, it)).collect();
+    sorted.sort_by_key(|(step, _)| step.0);
+    let mut hasher = Hasher::new(REGISTRY);
+    for (step, it) in sorted {
+        let name = u32::try_from(it.name.len()).expect("a step's name is short");
+        hasher
+            .update(&step.0.to_le_bytes())
+            .update(&name.to_le_bytes())
+            .update(it.name.as_bytes())
+            .id(&it.code.0)
+            .update(&[u8::from(it.asked.is_some())]);
+    }
+    hasher.finish()
 }
 
 impl<W: World + ?Sized> Default for Kernel<W> {
@@ -540,7 +579,16 @@ impl<W: World + ?Sized> Default for Kernel<W> {
 impl<W: World + ?Sized> Kernel<W> {
     pub fn new() -> Kernel<W> {
         // alloc: the registry, once a process, a few entries
-        Kernel { steps: blaze_hash::HashMap::new_in(Global) }
+        let steps = blaze_hash::HashMap::new_in(Global);
+        let registry = registry_of(&steps);
+        Kernel { steps, registry }
+    }
+
+    /// The digest of the registry as it is: every step's number, name and code, and whether
+    /// other steps may ask for it. A [`Session`] is of one registry, as it is of one pin: a
+    /// step read names its child by number and input, and the child's code is the registry's.
+    pub fn registry(&self) -> ContentId {
+        self.registry
     }
 
     /// Registers `S` with its code. A second step of one number or one name is refused.
@@ -570,6 +618,7 @@ impl<W: World + ?Sized> Kernel<W> {
         let registered = Registered { name: S::NAME, code, type_id: TypeId::of::<S>(), asked };
         // alloc: the registry, once a step
         self.steps.insert(S::ID, registered);
+        self.registry = registry_of(&self.steps);
         Ok(())
     }
 
@@ -659,7 +708,7 @@ impl<W: World + ?Sized> Kernel<W> {
         input: &S::Input,
         verify: &Setting,
     ) -> Result<Got<'s>, KernelError> {
-        session.enter(world)?;
+        session.enter(world, self.registry)?;
         self.get_at::<S, P>(session, store, world, input, verify)
     }
 
@@ -675,8 +724,7 @@ impl<W: World + ?Sized> Kernel<W> {
         let identity = self.identity::<S>(input)?;
         let valued = {
             let mut lent = LentMut(&mut *store);
-            let mut engine =
-                Engine::new(self, world, Door::Keep(&mut lent), verify, session.table());
+            let mut engine = Engine::new(self, world, Door::Keep(&mut lent), verify, session);
             engine.value::<S>(input, &identity, Need::Key)
         };
         // Before the answer, or the request's own error: a world that moved gives neither.
@@ -691,6 +739,58 @@ impl<W: World + ?Sized> Kernel<W> {
             }
             None => unreachable!("a get keeps, and what keeps finds a value or makes it"),
         }
+    }
+
+    /// Carries `session` from its pin to the pin `world` is at now, given `changed`, what
+    /// differs between the two: afterwards the session is of the new pin, and every value it
+    /// holds is the one a lookup with no session finds there. `store` is the one store the
+    /// session is of. What a request then pays for a value the carry did not reach is what it
+    /// paid before: nothing but the get of its entry.
+    ///
+    /// - **Seed.** The entries with a read `changed` names ([`Changed`], total by kind of
+    ///   read) are dropped from the session and queued, found through the postings their
+    ///   admission wrote. An entry no step has read is only dropped: it is looked up when it
+    ///   is next asked for.
+    /// - **Repair, lowest first.** The lowest queued entry is looked up again by the kernel's
+    ///   ordinary lookup at the new pin: an entry the store has for the reads as they are now
+    ///   is a hit, else it is run and kept. Its value's hash is compared with the one its
+    ///   readers saw: the same, and its readers stay verified with no work (the cutoff);
+    ///   another, and its readers are dropped and queued at their heights. An entry that
+    ///   cannot be valued at the new pin (its step refuses, a read of its world fails) is
+    ///   dropped, and its readers are queued: the failure is the error of whoever asks for it
+    ///   next.
+    /// - **Bounded** (rule 18): by the queue, and by a count of the session's rows past which
+    ///   the session is dropped whole ([`Dropped::Repairs`]).
+    ///
+    /// Refused, with the session as it was: a change set from another pin
+    /// ([`CarryError::From`]), one that leaves a kind of read unsaid ([`CarryError::Unsaid`]),
+    /// a world that is not at the change set's pin ([`KernelError::Moved`]). A kernel whose
+    /// registry is another drops the session whole ([`Dropped::Registry`]). A failure of the
+    /// store, or a world that moves during the repair, is the carry's error, and the session
+    /// then holds nothing.
+    ///
+    /// The invariant: if every entry of the session is indexed (I1: its postings were written
+    /// when it was admitted) and was valued at the old pin (I4: nothing reads the session
+    /// while it is carried, which `&mut` says), the seed covers every read whose value
+    /// differs (I2), and an entry is repaired after every queued entry it reads (I3: lowest
+    /// first, and a reader is queued whenever an entry it read comes to another hash, even
+    /// one repaired already), then every entry the session holds after the carry is what a
+    /// lookup with no session gives at the new pin. By induction on height: an entry never
+    /// queued has no read that differs and no child whose hash differs, so its list holds as
+    /// it did; a queued one was looked up after its children were final. Checked by
+    /// `exhaustive/nested.rs` (every sequence, with the pin moved under a carried session at
+    /// every place, against a computation with no kernel), with a planted bug for each of
+    /// I1 (twice), I2 and I3 that must end stale.
+    pub fn carry<P: Put + ?Sized>(
+        &self,
+        session: &mut Session,
+        store: &mut P,
+        world: &W,
+        changed: &Changed,
+        verify: &Setting,
+    ) -> Result<Carried, KernelError> {
+        let mut lent = LentMut(&mut *store);
+        nest::carry(self, session, &mut lent, world, changed, verify)
     }
 
     /// Why the store has no entry of `input` whose reads all hash the same now, against `last`:
@@ -708,7 +808,7 @@ impl<W: World + ?Sized> Kernel<W> {
         let identity = self.identity::<S>(input)?;
         let (lent, off) = (Lent(store), Setting::OFF);
         let mut session = Session::new(world);
-        let mut engine = Engine::new(self, world, Door::Look(&lent), &off, session.table());
+        let mut engine = Engine::new(self, world, Door::Look(&lent), &off, &mut session);
         let mut now = |read: Read<'_>| engine.now(read);
         Ok(why::explain(store, self, world, &identity, last, &mut now))
     }
@@ -732,7 +832,7 @@ impl<W: World + ?Sized> Kernel<W> {
         world: &W,
         input: &S::Input,
     ) -> Result<Option<Entry<'s>>, KernelError> {
-        session.enter(world)?;
+        session.enter(world, self.registry)?;
         self.find_at::<S, G>(session, store, world, input)
     }
 
@@ -746,7 +846,7 @@ impl<W: World + ?Sized> Kernel<W> {
         let identity = self.identity::<S>(input)?;
         let found = {
             let (lent, off) = (Lent(store), Setting::OFF);
-            let mut engine = Engine::new(self, world, Door::Look(&lent), &off, session.table());
+            let mut engine = Engine::new(self, world, Door::Look(&lent), &off, session);
             engine.found::<S>(input, &identity)
         };
         session.leave(world)?;
@@ -859,23 +959,41 @@ fn chain_error(of: Of, id: &ContentId, error: blaze_record::Error<Stopped>) -> K
     }
 }
 
+/// What a lookup's walk of an identity's read-lists asks of whoever walks ([`find_key`]).
+pub(crate) trait Lists<T> {
+    /// What `read` is now. A list with a read that cannot be valued does not hold, and one
+    /// with a step's value that must be run first is passed over (`Engine::lookup`).
+    fn now(&mut self, read: Read<'_>) -> Result<Now, KernelError>;
+
+    /// The entry under `key`, none where the store has nothing there: probed or read as the
+    /// caller needs (`nest::Need`), so a lookup reads the store no more than its caller uses.
+    fn answer(&mut self, key: Key) -> Result<Option<T>, KernelError>;
+
+    /// `found` is the entry of the list in `slot` of the identity's chain, whose reads are
+    /// named `names`; no slot and no names for the entry with no reads. Said once, for the
+    /// entry the walk ends with: where a session's postings are written.
+    fn held<'n>(
+        &mut self,
+        slot: Option<u32>,
+        names: &mut dyn Iterator<Item = &'n [u8]>,
+        found: &mut T,
+    );
+}
+
 /// The entry of `identity` whose reads all hash the same now: the entry with no reads, else
 /// the first read-list in the identity's chain whose reads' hashes now name an entry the store
-/// has. `now` values a read: a list with a read that cannot be valued does not hold, and one
-/// with a step's value that must be run first is passed over (`Engine::lookup`). `answer` is
-/// asked for the entry under a key, none where the store has nothing there: it probes or reads
-/// as its caller needs (`nest::Need`), so a lookup reads the store no more than its caller uses.
+/// has. `lists` values the reads, reads the answer and is told the list that held.
 fn find_key<S: Step, G: Get + ?Sized, T>(
     store: &G,
     input: &S::Input,
     identity: &Identity,
-    now: &mut dyn FnMut(Read<'_>) -> Result<Now, KernelError>,
-    answer: &mut dyn FnMut(Key) -> Result<Option<T>, KernelError>,
+    lists: &mut dyn Lists<T>,
 ) -> Result<Option<T>, KernelError> {
     let id = identity.id();
     let failed =
         |key: Key, why: String| KernelError::Store { of: of::<S>(input, identity), key, why };
-    if let Some(found) = answer(whole::key(identity))? {
+    if let Some(mut found) = lists.answer(whole::key(identity))? {
+        lists.held(None, &mut std::iter::empty(), &mut found);
         return Ok(Some(found));
     }
     let walked = walk::<_, T, Stop, _>(&Looking(store), entry::BOUNDS, &id, |at, bytes, list| {
@@ -885,7 +1003,7 @@ fn find_key<S: Step, G: Get + ?Sized, T>(
             let read = entry::named(name).ok_or(Stop::Name { at, len: name.len() })?;
             // The walk leaves the reads to its visitor: each one asked the value of is said.
             blaze_record::Store::tally(&Looking(store)).valued(1);
-            match now(read).map_err(Stop::Kernel)? {
+            match lists.now(read).map_err(Stop::Kernel)? {
                 Now::Seen(seen) => {
                     key.value(entry::digest(seen));
                 }
@@ -896,7 +1014,11 @@ fn find_key<S: Step, G: Get + ?Sized, T>(
         if !holds {
             return Ok(None);
         }
-        answer(Key(key.finish())).map_err(Stop::Kernel)
+        let Some(mut found) = lists.answer(Key(key.finish())).map_err(Stop::Kernel)? else {
+            return Ok(None);
+        };
+        lists.held(Some(at.n), &mut list.reads(), &mut found);
+        Ok(Some(found))
     });
     match walked {
         Ok(Walked::Found { found, .. }) => Ok(Some(found)),
@@ -937,6 +1059,8 @@ fn read_entry<'s, S: Step, G: Get + ?Sized>(
 pub(crate) struct Kept {
     pub key: Key,
     pub hash: Option<ContentId>,
+    /// The slot of its read-list in its identity's chain: none for an entry with no reads.
+    pub slot: Option<u32>,
 }
 
 /// Keeps `value` as the entry of `identity` and `trace`, then makes sure the trace's read-list
@@ -960,14 +1084,16 @@ fn keep<S: Step, P: Put + ?Sized>(
     if trace.is_empty() {
         let key = whole::key(identity);
         keep_entry::<S, P>(&store, input, identity, key, value, &reads)?;
-        return Ok(Kept { key, hash: None });
+        return Ok(Kept { key, hash: None, slot: None });
     }
     let entry = entry::encode(identity, trace, value);
     keep_entry::<S, P>(&store, input, identity, entry.key, &entry.bytes, &reads)?;
     let id = identity.id();
     let records = Keeping { store: &store, answers: S::KIND };
     match Filing::new(id, entry::BOUNDS).place(&records, entry.list()) {
-        Ok(Placed::Written(_) | Placed::Kept(_)) => Ok(Kept { key: entry.key, hash: Some(entry.hash) }),
+        Ok(Placed::Written(at) | Placed::Kept(at)) => {
+            Ok(Kept { key: entry.key, hash: Some(entry.hash), slot: Some(at.n) })
+        }
         Ok(Placed::Full) => Err(KernelError::TooManyShapes { of: of::<S>(input, identity) }),
         Err(error) => Err(chain_error(of::<S>(input, identity), &id, error)),
     }

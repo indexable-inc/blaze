@@ -319,3 +319,315 @@ fn a_world_that_moved_under_a_session_is_refused() {
         .to_vec();
     assert_eq!(now, [0, 9]);
 }
+
+// What a carry costs (docs/v2/plan/design/kernel.md, "Carrying a session"): a session of 256
+// entries (240 leaves that each read one fact, 15 groups of 16 leaves, one whole of the groups),
+// so that anything that touches every entry is seen at once: 240 reads valued, hundreds of gets.
+
+const TILE: ReadKind = ReadKind(2);
+const LEAVES: u8 = 240;
+const GROUPS: u8 = 15;
+
+/// 256 facts, the last 16 read by no step, and how many times one was valued.
+struct Wide {
+    facts: Vec<u8>,
+    valued: Cell<usize>,
+}
+
+impl World for Wide {
+    fn hash(&self, read: Read<'_>) -> Result<Seen, WorldError> {
+        self.valued.set(self.valued.get() + 1);
+        match (read.kind, read.key) {
+            (TILE, &[at]) => Ok(Seen::Is(ContentId::of(
+                "blaze v2 kernel cost test tile 1",
+                &[self.facts[usize::from(at)]],
+            ))),
+            _ => Err(WorldError::new(read, "no such fact")),
+        }
+    }
+
+    fn pin(&self) -> Pin {
+        Pin(ContentId::of("blaze v2 kernel cost test wide pin 1", &self.facts))
+    }
+}
+
+struct Tile;
+
+impl Fact<Wide> for Tile {
+    const KIND: ReadKind = TILE;
+    type Key = u8;
+    type Value<'w> = u8;
+
+    fn key(key: &u8, out: &mut Vec<u8>) {
+        out.push(*key);
+    }
+
+    fn get<'w>(world: &'w Wide, key: &u8) -> Result<(u8, Seen), WorldError> {
+        let seen = world.hash(Read { kind: TILE, key: &[*key] })?;
+        Ok((world.facts[usize::from(*key)], seen))
+    }
+}
+
+step!(Leaf, 0x7f41, "cost leaf");
+step!(Group, 0x7f42, "cost group");
+step!(Whole, 0x7f43, "cost whole");
+
+/// Half of one fact: two facts that halve the same leave its value as it was.
+impl Compute for Leaf {
+    type World = Wide;
+
+    fn compute(ctx: &mut Reads<'_, Wide>, input: &u8) -> Result<Vec<u8>, StepError> {
+        Ok(vec![*input, ctx.get::<Tile>(input)? / 2])
+    }
+}
+
+/// Sixteen leaves.
+impl Compute for Group {
+    type World = Wide;
+
+    fn compute(ctx: &mut Reads<'_, Wide>, input: &u8) -> Result<Vec<u8>, StepError> {
+        let mut out = Vec::new();
+        for leaf in 0..16 {
+            out.extend(ctx.step::<Leaf>(&(input * 16 + leaf))?);
+        }
+        Ok(out)
+    }
+}
+
+/// Every group.
+impl Compute for Whole {
+    type World = Wide;
+
+    fn compute(ctx: &mut Reads<'_, Wide>, _: &u8) -> Result<Vec<u8>, StepError> {
+        let mut out = Vec::new();
+        for group in 0..GROUPS {
+            out.extend(ctx.step::<Group>(&group)?);
+        }
+        Ok(out)
+    }
+}
+
+fn wide_kernel() -> Kernel<Wide> {
+    let mut kernel = Kernel::new();
+    kernel.register_ask::<Leaf>(CodeId(ContentId([41; 32]))).unwrap();
+    kernel.register_ask::<Group>(CodeId(ContentId([42; 32]))).unwrap();
+    kernel.register_ask::<Whole>(CodeId(ContentId([43; 32]))).unwrap();
+    kernel
+}
+
+/// A kernel, a store and a world, and a session that holds the whole and all it reads.
+struct Built {
+    kernel: Kernel<Wide>,
+    store: Memory,
+    world: Wide,
+    session: Session,
+}
+
+fn built() -> Built {
+    let kernel = wide_kernel();
+    let mut store = Memory::default();
+    let world = Wide { facts: vec![8; 256], valued: Cell::new(0) };
+    let mut session = Session::new(&world);
+    kernel.get_in::<Whole, _>(&mut session, &mut store, &world, &0, &Setting::OFF).unwrap();
+    assert_eq!(session.len(), usize::from(LEAVES) + usize::from(GROUPS) + 1);
+    Built { kernel, store, world, session }
+}
+
+impl Built {
+    /// Sets fact `at` to `to`: the exact change between the two pins.
+    fn set(&mut self, at: u8, to: u8) -> Changed {
+        let from = self.world.pin();
+        self.world.facts[usize::from(at)] = to;
+        let mut changed = Changed::between(from, self.world.pin());
+        changed.differs(Read { kind: TILE, key: &[at] });
+        changed
+    }
+
+    fn reset(&self) {
+        self.store.gets.set(0);
+        self.store.probes.set(0);
+        self.world.valued.set(0);
+    }
+
+    fn cost(&self) -> Cost {
+        Cost {
+            probes: self.store.probes.get(),
+            gets: self.store.gets.get(),
+            valued: self.world.valued.get(),
+        }
+    }
+
+    /// The carry, and what it cost.
+    fn carry(&mut self, changed: &Changed) -> (Carried, Cost) {
+        self.reset();
+        let carried = self
+            .kernel
+            .carry(&mut self.session, &mut self.store, &self.world, changed, &Setting::OFF)
+            .unwrap();
+        (carried, self.cost())
+    }
+
+    /// A get of the whole in the session: whether it hit, its bytes, what it cost.
+    fn whole(&mut self) -> (bool, Vec<u8>, Cost) {
+        self.reset();
+        let (hit, value) = {
+            let got = self
+                .kernel
+                .get_in::<Whole, _>(&mut self.session, &mut self.store, &self.world, &0, &Setting::OFF)
+                .unwrap();
+            (got.is_hit(), got.value().to_vec())
+        };
+        (hit, value, self.cost())
+    }
+
+    /// The whole as a computation in an empty store with no session gives it now.
+    fn fresh(&self) -> Vec<u8> {
+        let world = Wide { facts: self.world.facts.clone(), valued: Cell::new(0) };
+        let mut fresh = Memory::default();
+        let got = self.kernel.get::<Whole, _>(&mut fresh, &world, &0, &Setting::OFF);
+        got.unwrap().value().to_vec()
+    }
+}
+
+const NOTHING: Carried =
+    Carried { dropped: None, seeded: 0, repaired: 0, changed: 0, cut: 0, gone: 0 };
+
+/// A change no entry of the session read: the carry reads nothing of the store and values
+/// nothing, and every entry is a session hit after it: one get of its entry, no probe, no
+/// read-list read (so no list bytes hashed) and no read valued.
+#[test]
+fn a_carry_that_reaches_nothing_costs_nothing() {
+    let mut built = built();
+    let changed = built.set(255, 1);
+    let (carried, cost) = built.carry(&changed);
+    assert_eq!(carried, NOTHING);
+    assert_eq!(cost, Cost { probes: 0, gets: 0, valued: 0 });
+    assert_eq!(built.session.len(), 256);
+    let (hit, value, cost) = built.whole();
+    assert!(hit);
+    assert_eq!(value, built.fresh());
+    assert_eq!(cost, Cost { probes: 0, gets: 1, valued: 0 });
+}
+
+/// The cutoff: one fact of 240 changes and the one leaf that read it comes to the same bytes.
+/// The carry looks up and runs that leaf alone (its fact is valued once by the lookup and
+/// once by the run); its group, the whole and the 239 other leaves stay verified with no
+/// work, and the whole is a session hit after it.
+#[test]
+fn a_change_that_leaves_a_value_the_same_stops_at_its_entry() {
+    let mut built = built();
+    let changed = built.set(37, 9);
+    let (carried, cost) = built.carry(&changed);
+    assert_eq!(carried, Carried { seeded: 1, repaired: 1, cut: 1, ..NOTHING });
+    assert_eq!(cost.valued, 2, "{cost:?}");
+    assert!(cost.gets <= 12 && cost.probes <= 8, "one leaf's lookup, run and keep: {cost:?}");
+    assert_eq!(built.session.len(), 256);
+    let (hit, value, cost) = built.whole();
+    assert!(hit);
+    assert_eq!(value, built.fresh());
+    assert_eq!(cost, Cost { probes: 0, gets: 1, valued: 0 });
+}
+
+/// One fact of 240 changes and its leaf's value with it: the carry repairs the leaf and its
+/// group (the path), drops the whole (no step read it: it is looked up when asked for), and
+/// the next get of the whole runs it from 15 groups the session holds. The 239 other leaves
+/// and 14 other groups cost no read valued and no get of their own, in the carry or after:
+/// the bounds are of the path (16 leaves read by the group's run, 15 groups by the whole's),
+/// far under the 240 reads and hundreds of gets of looking every entry up again.
+#[test]
+fn a_change_costs_the_path_from_its_entry_to_the_top() {
+    let mut built = built();
+    let changed = built.set(37, 12);
+    let (carried, cost) = built.carry(&changed);
+    assert_eq!(carried, Carried { seeded: 1, repaired: 2, changed: 2, gone: 1, ..NOTHING });
+    assert_eq!(cost.valued, 2, "{cost:?}");
+    assert!(cost.gets <= 48 && cost.probes <= 8, "a leaf and a group of 16: {cost:?}");
+    assert_eq!(built.session.len(), 255);
+    let (hit, value, cost) = built.whole();
+    assert!(!hit, "the whole reads a group whose value changed");
+    assert_eq!(value, built.fresh());
+    assert_eq!(cost.valued, 0, "{cost:?}");
+    assert!(cost.gets <= 32 && cost.probes <= 8, "the whole and its 15 groups: {cost:?}");
+    assert_eq!(built.session.len(), 256);
+    let (hit, _, cost) = built.whole();
+    assert!(hit);
+    assert_eq!(cost, Cost { probes: 0, gets: 1, valued: 0 });
+}
+
+/// A kind with no exact difference: every entry with a read of it is looked up again, and
+/// the cutoff still holds for each one whose value is the same.
+#[test]
+fn a_kind_with_no_exact_difference_looks_up_every_entry_that_read_it() {
+    let mut built = built();
+    let from = built.world.pin();
+    built.world.facts[37] = 12;
+    let mut changed = Changed::between(from, built.world.pin());
+    changed.everything(TILE);
+    let (carried, cost) = built.carry(&changed);
+    let expected =
+        Carried { seeded: 240, repaired: 241, changed: 2, cut: 239, gone: 1, ..NOTHING };
+    assert_eq!(carried, expected);
+    assert!(cost.valued >= 240, "{cost:?}");
+    let (_, value, _) = built.whole();
+    assert_eq!(value, built.fresh());
+}
+
+/// A change set that is not total, or not from the session's pin, is refused by name and the
+/// session is as it was; a kernel with other steps is refused at a request and drops the
+/// session at a carry.
+#[test]
+fn a_carry_refuses_what_it_cannot_trust() {
+    let mut built = built();
+    let from = built.world.pin();
+    built.world.facts[37] = 12;
+    let to = built.world.pin();
+    let carry = |built: &mut Built, kernel: &Kernel<Wide>, changed: &Changed| {
+        kernel.carry(&mut built.session, &mut built.store, &built.world, changed, &Setting::OFF)
+    };
+    let kernel = wide_kernel();
+
+    let unsaid = carry(&mut built, &kernel, &Changed::between(from, to)).unwrap_err();
+    assert_eq!(unsaid, KernelError::Carry(CarryError::Unsaid { kind: TILE, names: 240 }));
+    assert!(unsaid.to_string().contains("kind 2"), "{unsaid}");
+
+    let mut other = Changed::between(to, to);
+    other.exact(TILE);
+    let refused = carry(&mut built, &kernel, &other).unwrap_err();
+    assert_eq!(refused, KernelError::Carry(CarryError::From { session: from, from: to }));
+
+    let mut steps = Changed::between(from, to);
+    steps.exact(TILE);
+    steps.differs(Read { kind: ReadKind::STEP, key: &[0x7f, 0x41, 37] });
+    let refused = carry(&mut built, &kernel, &steps).unwrap_err();
+    assert_eq!(refused, KernelError::Carry(CarryError::Steps));
+    assert_eq!((built.session.pin(), built.session.len()), (from, 256));
+
+    let mut more = wide_kernel();
+    more.register_ask::<Bare2>(CodeId(ContentId([44; 32]))).unwrap();
+    let refused = more
+        .get_in::<Whole, _>(&mut built.session, &mut built.store, &built.world, &0, &Setting::OFF)
+        .map(|_| ())
+        .unwrap_err();
+    assert!(matches!(refused, KernelError::Reregistered { .. }), "{refused}");
+    let mut exact = Changed::between(from, to);
+    exact.differs(Read { kind: TILE, key: &[37] });
+    let carried = carry(&mut built, &more, &exact).unwrap();
+    assert_eq!(carried, Carried { dropped: Some(Dropped::Registry), ..NOTHING });
+    assert_eq!((built.session.pin(), built.session.len()), (to, 0));
+    let value = more
+        .get_in::<Whole, _>(&mut built.session, &mut built.store, &built.world, &0, &Setting::OFF)
+        .unwrap()
+        .value()
+        .to_vec();
+    assert_eq!(value, built.fresh());
+}
+
+step!(Bare2, 0x7f44, "cost bare of wide");
+
+impl Compute for Bare2 {
+    type World = Wide;
+
+    fn compute(_: &mut Reads<'_, Wide>, input: &u8) -> Result<Vec<u8>, StepError> {
+        Ok(vec![*input])
+    }
+}

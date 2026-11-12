@@ -51,7 +51,7 @@ use super::{
     package_of, say,
 };
 use crate::serve::native::NativeDir;
-use crate::serve::work::{RunPuts, Runs, Writer};
+use crate::serve::work::{Looked, RunPuts, Runs, Seen, Writer};
 
 /// The job's variable that asks an inert script compiled and run as well, and checked against
 /// what elision said of it: `verify`, or unset.
@@ -843,6 +843,29 @@ pub(crate) struct ReadBytes {
     /// Each directory under or above one of those that a run listed, looked at or hashed
     /// whole: any path under it is one the run read.
     pub(crate) listed: Vec<std::path::PathBuf>,
+    /// Every read of the machine's files the noted runs' records rest on, wherever it is
+    /// (under the checkout, under the build's directories, a system header), with what was
+    /// there when the record held: what a request certificate names of a build script
+    /// (`UnitWriter::read_seen`). For a run found kept: each question its check asked the
+    /// disk and the answer the hit rests on ([`Noting`]). For a run that ran: its trace
+    /// ([`ReadBytes::note_ran`]).
+    ///
+    /// The invariant: every input of a noted run that is neither here nor in [`ReadBytes::env`]
+    /// is a function of the request's base. A record's key is its run key (the script's
+    /// code and what the plan gave it: its arguments, its given variables, its roots, all
+    /// made from the config and the units before it) and each name of its shape with its
+    /// value. A shape's names are: files, listings and trees, every one asked of the disk
+    /// through [`Noting`] and so here; marks, answered with a root's path, the plan's;
+    /// variables asked by name, in `env`; the walk of the environment, a fixed set every
+    /// certificate compares (`serve::job::read_unasked`); and what cannot be traced (the
+    /// clock, randomness), which the record is kept in spite of and a build finds it kept
+    /// with. What a script read that its trace did not see is in neither: that is the
+    /// sandbox's hole, not this list's, and the run's own record has it too.
+    pub(crate) seen: Vec<Seen>,
+    /// A directory a noted run's check walked by a question no [`Looked`] is of (its names
+    /// or one entry, asked on their own): the run's reads are not all in `seen`, and no
+    /// certificate is written of its build.
+    pub(crate) unseen: Option<std::path::PathBuf>,
 }
 
 impl ReadBytes {
@@ -858,6 +881,60 @@ impl ReadBytes {
         self.env.extend(read.env);
         self.paths.extend(read.paths);
         self.listed.extend(read.listed);
+        self.seen.extend(read.seen);
+        if self.unseen.is_none() {
+            self.unseen = read.unseen;
+        }
+    }
+
+    /// Run `unit` ran and its result is kept under what it read, `traced`, by real paths:
+    /// its reads are noted at the values its record holds them at, as [`fresh`] notes a kept
+    /// run's. A tree hashed whole is a path [`blaze_usercode::trace::walked`] reads back; a
+    /// tree or a listing that was no directory is among the files, with nothing there, as
+    /// `blaze_usercode::index::Shape::values` has it.
+    fn note_ran(&mut self, unit: usize, traced: &blaze_core::Traced) {
+        if self.noted(unit) {
+            return;
+        }
+        self.runs.push(unit as u32);
+        for (path, hash) in &traced.files {
+            match blaze_usercode::trace::walked(path) {
+                Some((dir, package)) => {
+                    self.trees = true;
+                    // alloc: a path, once a tree a run read
+                    self.seen.push(Seen { how: Looked::Tree { package }, path: dir.to_owned(), hash: *hash });
+                }
+                None => {
+                    if let Some(name) = path.file_name().and_then(|it| it.to_str())
+                        && name.ends_with(".rs")
+                    {
+                        self.names.push(name.to_owned()); // alloc: a name, once a Rust file a run read
+                    }
+                    // clone: a path, once a file a run read
+                    self.seen.push(Seen { how: Looked::File, path: path.clone(), hash: *hash });
+                }
+            }
+        }
+        for (path, hash) in &traced.dirs {
+            let (how, at) = match blaze_usercode::trace::walked(path) {
+                Some((dir, package)) => {
+                    self.trees = true;
+                    (Looked::Tree { package }, dir)
+                }
+                None => (Looked::Listing, path.as_path()),
+            };
+            // alloc: a path, once a directory a run read
+            self.seen.push(Seen { how, path: at.to_owned(), hash: Some(*hash) });
+        }
+        for (name, _) in &traced.env {
+            // The walk's own entry names no variable; a name that is not text names none of
+            // a request, whose environment is text.
+            if let Some(name) = name.to_str()
+                && name != blaze_usercode::trace::ALL_ENV_NAME
+            {
+                self.env.push(name.to_owned()); // alloc: a name, once a variable a run read
+            }
+        }
     }
 
     /// Whether the reads of run `unit` are noted.
@@ -909,13 +986,19 @@ impl<I: blaze_usercode::trace::Inputs> blaze_usercode::trace::Inputs for Noting<
             self.read.names.push(name.to_owned()); // alloc: a name, once a Rust file a kept run read
         }
         self.file_at(path);
-        self.inner.file(path)
+        let hash = self.inner.file(path)?;
+        // alloc: a path, once a file a kept run read
+        self.read.seen.push(Seen { how: Looked::File, path: path.to_owned(), hash });
+        Ok(hash)
     }
 
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, I::Error> {
         // A listing's names, no file's bytes.
         self.listed_at(path);
-        self.inner.dir(path)
+        let hash = self.inner.dir(path)?;
+        // alloc: a path, once a directory a kept run listed
+        self.read.seen.push(Seen { how: Looked::Listing, path: path.to_owned(), hash });
+        Ok(hash)
     }
 
     fn env(&mut self, name: &std::ffi::OsStr) -> Option<&std::ffi::OsStr> {
@@ -938,19 +1021,31 @@ impl<I: blaze_usercode::trace::Inputs> blaze_usercode::trace::Inputs for Noting<
     ) -> Result<bool, I::Error> {
         self.read.trees = true;
         self.listed_at(path);
+        // Asked on its own (not inside the inner's walk of a tree): no read names it.
+        if self.read.unseen.is_none() {
+            self.read.unseen = Some(path.to_owned()); // alloc: a path, once a run
+        }
         self.inner.names(path, out)
     }
 
     fn entry(&mut self, path: &Path) -> Result<blaze_usercode::trace::Entry, I::Error> {
         self.read.trees = true;
         self.listed_at(path);
+        // As `names`.
+        if self.read.unseen.is_none() {
+            self.read.unseen = Some(path.to_owned()); // alloc: a path, once a run
+        }
         self.inner.entry(path)
     }
 
     fn tree(&mut self, dir: &Path, package: bool) -> Result<Option<[u8; 32]>, I::Error> {
         self.read.trees = true;
         self.listed_at(dir);
-        self.inner.tree(dir, package)
+        // The inner walks the tree itself: one read, by its hash.
+        let hash = self.inner.tree(dir, package)?;
+        // alloc: a path, once a tree a kept run hashed
+        self.read.seen.push(Seen { how: Looked::Tree { package }, path: dir.to_owned(), hash });
+        Ok(hash)
     }
 }
 
@@ -2156,6 +2251,13 @@ impl ScriptRun {
                         // Its miss, now that what it read is known: each read a part of it.
                         if let Some(miss) = self.missed.take() {
                             self.puts.misses.push(with_reads(miss, &completed.traced));
+                        }
+                        // What it read, at the values its result is kept under, for its
+                        // build's request certificate ([`ReadBytes::seen`]). Not of a run
+                        // that is checked: a build runs that one again whatever is kept, so
+                        // no certificate answers for it.
+                        if prepared.spec.mode != blaze_usercode::run::Mode::Verify {
+                            job.script_reads.lock().note_ran(run_unit, &completed.traced);
                         }
                         let value = completed.value;
                         // A pure key's hit verified across checkouts, run again and otherwise:

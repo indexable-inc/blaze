@@ -1,0 +1,19 @@
+{
+ "id": "kernel-carry-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane kernel-carry",
+ "where": "crates/blaze-kernel/src/exhaustive/nested.rs, crates/blaze-kernel/src/nest.rs (`carry`), crates/blaze-kernel/src/session.rs",
+ "what": "The brief asked for a planted bug 'a parent repaired before its child' that ends stale. In the model as it was (Leaf, Mid, Top) no order of repair can be stale: every parent that reads the world also reads only entries the same change queues, and a queued entry is dropped at once, so the parent's lookup repairs it on demand. The hole needs a parent with a reader of its own that reads the world and a value two steps above a fact; the model had no such step, so the control could not have been written and the scope would have 'proved' an order it never exercised.",
+ "cost": "an hour of design before any code; one new step (`Over`) and one new way in the exhaustive model",
+ "whys": [
+  "why no order was stale: the model's only parent that reads the world (Mid) reads leaves directly, and the top has no reader, so it is dropped, not repaired",
+  "why the model had that shape: it was built for nesting and early cutoff, where two levels under a top are enough",
+  "why that matters: an exhaustive check proves only what its model can reach, and nothing said which invariants the model can violate"
+ ],
+ "cause": "a model's reach was implicit: each invariant's shortest violating shape was not written down beside the model",
+ "class": "an exhaustive check whose scope cannot express the bug a new invariant guards against, so its control is vacuous or impossible",
+ "prevention": "each invariant gets its control before the invariant is claimed, and the model's doc says the shape each control needs (nested.rs's header does, for `Over` and the warm start)",
+ "workaround": "",
+ "fix": "done: `Over` (reads a fact and a Mid; `Over(1)` reads `Over(0)`) and `Start::Warm` (a store another session filled, for a hit admitted then carried, which four steps from an empty store cannot reach)",
+ "state": "closed"
+}

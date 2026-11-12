@@ -19,7 +19,7 @@
 //!   run's error: a run asks only for what it needs.
 //! - **One walk.** A lookup walks its identity's lists once and values each read a list names
 //!   once: a child is looked up inside the walk, through the same store the walk reads
-//!   ([`Looker`]), and what it comes to is in the request's table for every later read of it.
+//!   ([`Looker`]), and what it comes to is in the request's session for every later read of it.
 //!   What a walk cannot do is run a child, since a run keeps and the walk holds a list of the
 //!   store: a child with no entry valid now (or whose hit the request's setting checks by a
 //!   run) is run after the walk, and only then are the lists walked a second, last time.
@@ -27,7 +27,9 @@
 //!   not hold, as a child that cannot be valued does; in a run it is the run's error.
 //! - **A session** ([`Session`]) keeps what was found valid under one pinned world, so a value
 //!   is verified once however many parents and requests ask for it; a world at another pin is
-//!   refused ([`KernelError::Moved`]).
+//!   refused ([`KernelError::Moved`]). Every admission to it writes its postings first
+//!   (`session`'s doc), which is what lets [`carry`] take it to the next pin by looking up
+//!   only what a changed read reaches.
 //! - **What a hit costs** (pinned by `tests::cost`): a step with no reads asked for at the top
 //!   is one probe and one get; with reads, the probe of the entry with no reads, its lists,
 //!   the probe of the answer and the one get of it. A child with reads is one get that finds
@@ -41,7 +43,6 @@
 //! - **A lookup that keeps nothing computes nothing** ([`Door::Look`], [`crate::Kernel::find`]):
 //!   a child with no entry valid now makes the parent's list not hold.
 
-use std::alloc::Global;
 use std::cell::RefCell;
 
 use blaze_cas::{Key, content_of};
@@ -49,9 +50,11 @@ use blaze_ids::ContentId;
 use blaze_store_check::{Hit, Recompute, RecordedRead, Setting};
 
 use crate::reads::Unfinished;
+use crate::session::{By, Known, Popped, Posted, Session};
 use crate::{
-    Ask, Compute, Entry, Get, Identity, Kernel, KernelError, Link, Put, Read, ReadKind, Reads,
-    Pin, Seen, Step, StepError, StepId, Trace, World, entry, find_key, hex, keep, of, said,
+    Ask, Carried, Changed, Compute, Dropped, Entry, Get, Identity, Kernel, KernelError, Link,
+    Lists, Put, Read, ReadKind, Reads, Seen, Step, StepError, StepId, Trace, World, entry,
+    find_key, hex, keep, of, said,
 };
 
 /// How deep steps may nest: each level is a few frames of this thread's stack, so the bound is
@@ -149,6 +152,9 @@ pub(crate) struct Found {
     pub hash: Option<ContentId>,
     /// Its value, copied, where it was needed.
     pub value: Option<Vec<u8>>,
+    /// That its list's postings are written in the session: set by the walk that found it in
+    /// the store, taken by its admission. None for a value the session knew already.
+    posted: Option<Posted>,
     /// Its reads' names and what each saw: read only by a planted bug's control.
     #[cfg(test)]
     reads: Vec<(Vec<u8>, Seen)>,
@@ -156,7 +162,8 @@ pub(crate) struct Found {
 
 /// What looking a step up inside another's walk came to.
 pub(crate) enum Looked {
-    Found(Found),
+    /// Its entry, and its row in the session.
+    Found(Found, u32),
     /// No entry of it is valid now.
     Missing,
     /// It must be run before it is known, which a walk cannot do: only where the request keeps.
@@ -169,123 +176,12 @@ struct Frame {
     identity: ContentId,
 }
 
-/// A value found valid or made under a session's pin: its entry's key and, once a parent has
-/// asked for it, the hash of its value's bytes, which is what every later read of it under
-/// that pin sees without a second lookup.
-#[derive(Clone)]
-pub(crate) struct Known {
-    key: Key,
-    /// None while only its key was needed (a value asked for at the top).
-    hash: Option<ContentId>,
-    #[cfg(test)]
-    reads: Vec<(Vec<u8>, Seen)>,
-}
-
-/// A session's rows: the values found valid or made, by identity.
-pub(crate) type Table = blaze_hash::HashMap<ContentId, Known, Global>;
-
-/// What this process verified under one pinned world, through one store: for an identity, the
-/// key of the entry valid at that pin and the hash of its value. A value in it is not looked
-/// up again: a child asked for by many parents, in one request or in many, is verified once,
-/// and a value asked for again at the top is one get.
-///
-/// It is of one pin ([`World::pin`]). A request whose world is at another pin is refused
-/// ([`KernelError::Moved`]), never answered from rows of the session's pin; a world that
-/// moved while a request ran is refused the same way, the request's answer is not given, and
-/// the rows are dropped. Whoever holds the session makes a new one for the world as it is now.
-///
-/// The invariant: a session changes no answer. Dropped or cleared between any two requests,
-/// every request gives the bytes it gives with it kept (`exhaustive/nested.rs`: every sequence
-/// with a drop at every place; control `a_session_that_outlives_its_pin_is_caught`).
-pub struct Session {
-    pin: Pin,
-    table: Table,
-}
-
-impl Session {
-    /// A session of `world` as it is now, with nothing verified.
-    pub fn new<W: World + ?Sized>(world: &W) -> Session {
-        // alloc: the session's table; empty until a value is verified
-        Session { pin: world.pin(), table: blaze_hash::HashMap::new_in(Global) }
-    }
-
-    /// The pin it is of.
-    pub fn pin(&self) -> Pin {
-        self.pin
-    }
-
-    /// How many values it holds verified.
-    pub fn len(&self) -> usize {
-        self.table.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.table.is_empty()
-    }
-
-    /// Drops what it verified. No answer changes: each value is looked up again when asked for.
-    pub fn clear(&mut self) {
-        self.table.clear();
-    }
-
-    /// Refuses a world that is not at the session's pin, before a request reads anything.
-    pub(crate) fn enter<W: World + ?Sized>(&self, world: &W) -> Result<(), KernelError> {
-        let now = world.pin();
-        if now == self.pin || Session::planted_stale() {
-            return Ok(());
-        }
-        Err(KernelError::Moved { pinned: self.pin, now })
-    }
-
-    /// Refuses a world that moved while a request ran, and drops the rows: some were verified
-    /// against a world that is no longer the pinned one.
-    pub(crate) fn leave<W: World + ?Sized>(&mut self, world: &W) -> Result<(), KernelError> {
-        let now = world.pin();
-        if now == self.pin || Session::planted_stale() {
-            return Ok(());
-        }
-        self.table.clear();
-        Err(KernelError::Moved { pinned: self.pin, now })
-    }
-
-    fn planted_stale() -> bool {
-        #[cfg(test)]
-        {
-            if planted::is(planted::Bug::StalePin) {
-                return true;
-            }
-        }
-        false
-    }
-
-    pub(crate) fn table(&mut self) -> &mut Table {
-        &mut self.table
-    }
-
-    /// Its pin and rows, for a test that goes back to an earlier state.
-    #[cfg(test)]
-    pub(crate) fn saved(&self) -> (Pin, Vec<(ContentId, Known)>) {
-        // clone: a test's copy of the rows
-        (self.pin, self.table.iter().map(|(id, known)| (*id, known.clone())).collect())
-    }
-
-    /// The session `saved` gave.
-    #[cfg(test)]
-    pub(crate) fn restored(saved: &(Pin, Vec<(ContentId, Known)>)) -> Session {
-        let mut table = blaze_hash::HashMap::new_in(Global);
-        for (id, known) in &saved.1 {
-            table.insert(*id, known.clone());
-        }
-        Session { pin: saved.0, table }
-    }
-}
-
-/// What one request has on the way, and its session's rows.
+/// What one request has on the way, and its session.
 struct State<'a> {
     /// The values being looked up or computed, outermost first.
     stack: &'a mut Vec<Frame>,
-    /// The values found valid or made, by identity.
-    table: &'a mut Table,
+    /// The values found valid or made, by identity, and who read what.
+    session: &'a mut Session,
 }
 
 impl State<'_> {
@@ -309,18 +205,11 @@ impl State<'_> {
         Ok(())
     }
 
-    fn known(&self, id: &ContentId) -> Option<Known> {
-        // clone: a key and a hash; a planted bug's reads in a test
-        self.table.get(id).cloned()
-    }
-
-    /// A row with a hash is not replaced by one without.
-    fn know(&mut self, id: ContentId, known: Known) {
-        if known.hash.is_none() && self.table.contains_key(&id) {
-            return;
-        }
-        // alloc: the session's table, one row a value
-        self.table.insert(id, known);
+    /// Admits what a lookup found in the store: its row. The postings of its list were
+    /// written by the walk that found it ([`Lists::held`]).
+    fn admit(&mut self, found: &mut Found) -> u32 {
+        let posted = found.posted.take().expect("a walk posts the list of the entry it found");
+        self.session.admit(posted, known_of(found))
     }
 }
 
@@ -331,6 +220,8 @@ pub(crate) struct Valued {
     /// alone was needed.
     pub hash: Option<ContentId>,
     pub how: How,
+    /// Its row in the session.
+    row: u32,
     /// Its reads' names and what each saw: read only by a planted bug's control.
     #[cfg(test)]
     reads: Vec<(Vec<u8>, Seen)>,
@@ -395,7 +286,12 @@ fn looked<S: Ask<World = W>, W: World + ?Sized>(
 ) -> Result<Looked, KernelError> {
     let input = input_of::<S>(key)?;
     let identity = looker.cx.kernel.identity::<S>(&input)?;
-    looker.look::<S>(&input, &identity, need)
+    let looked = looker.look::<S>(&input, &identity, need)?;
+    if let Looked::Found(_, row) = &looked {
+        // Before whoever asked is posted: the row's readers are the postings of this name.
+        looker.state.session.link(*row, S::ID, key);
+    }
+    Ok(looked)
 }
 
 /// `S` of the input `key` holds: the erased form of [`Engine::value`].
@@ -409,6 +305,8 @@ fn asked<S: Ask<World = W>, W: World + ?Sized>(
     let Some(valued) = engine.value::<S>(&input, &identity, need)? else {
         return Ok(None);
     };
+    // Before whoever asked is posted: the row's readers are the postings of this name.
+    engine.session.link(valued.row, S::ID, key);
     let value = match valued.how {
         How::Hit { value } => value,
         How::Computed { value, .. } => Some(value),
@@ -470,6 +368,7 @@ fn answer<S: Step>(
             key,
             hash: None,
             value: None,
+            posted: None,
             #[cfg(test)]
             reads: Vec::new(),
         }));
@@ -483,6 +382,7 @@ fn answer<S: Step>(
         hash: Some(entry.value_hash()),
         // alloc: a child's value, handed to the step that asked for it
         value: (need == Need::Value).then(|| entry.value.to_vec()),
+        posted: None,
         #[cfg(test)]
         reads: planted::reads(entry.reads()),
     }))
@@ -515,7 +415,7 @@ pub(crate) struct Looker<'l, W: ?Sized> {
 }
 
 impl<W: World + ?Sized> Looker<'_, W> {
-    /// `S` of `input`, looked up: from the request's table, else by one walk of its lists.
+    /// `S` of `input`, looked up: from the session, else by one walk of its lists.
     fn look<S: Step>(
         &mut self,
         input: &S::Input,
@@ -523,13 +423,13 @@ impl<W: World + ?Sized> Looker<'_, W> {
         need: Need,
     ) -> Result<Looked, KernelError> {
         let id = identity.id();
-        if let Some(known) = self.state.known(&id) {
+        if let Some((row, known)) = self.state.session.known(&id) {
             let fill = known.hash.is_none();
             let found = known_now::<S>(self.store, input, identity, known, need)?;
             if fill && found.hash.is_some() {
-                self.know(id, &found);
+                self.state.session.fill(row, known_of(&found));
             }
-            return Ok(Looked::Found(found));
+            return Ok(Looked::Found(found, row));
         }
         if self.keeps && self.cx.verify.sampled(&id) {
             // Its hit is checked by a run, which asks for its children as any run does.
@@ -542,24 +442,21 @@ impl<W: World + ?Sized> Looker<'_, W> {
         let found = self.walk::<S>(input, identity, need, &mut pending, &mut nots, false);
         self.state.stack.pop();
         match found? {
-            Some(found) => {
-                self.know(id, &found);
-                Ok(Looked::Found(found))
+            Some(mut found) => {
+                let row = self.state.admit(&mut found);
+                Ok(Looked::Found(found, row))
             }
             None if pending.is_empty() => Ok(Looked::Missing),
             None => Ok(Looked::Later),
         }
     }
 
-    fn know(&mut self, id: ContentId, found: &Found) {
-        self.state.know(id, known_of(found));
-    }
-
     /// One walk of the read-lists of `identity`: the entry whose reads all hash the same now.
     /// Each read a list names is valued once: a world's read by the world, a step's value by
     /// that step's own lookup through this same store. A child that must be run first goes to
     /// `pending` (its list is passed over) unless this is the request's `last` walk, where it
-    /// makes its list not hold; one that cannot be valued goes to `nots`.
+    /// makes its list not hold; one that cannot be valued goes to `nots`. The postings of the
+    /// list that held are written in the session before the walk ends ([`Lists::held`]).
     fn walk<S: Step>(
         &mut self,
         input: &S::Input,
@@ -569,63 +466,10 @@ impl<W: World + ?Sized> Looker<'_, W> {
         nots: &mut Vec<Vec<u8>>,
         last: bool,
     ) -> Result<Option<Found>, KernelError> {
-        let Cx { kernel, world, .. } = self.cx;
         let store = self.store;
-        find_key::<S, dyn Get, Found>(
-            store,
-            input,
-            identity,
-            &mut |read| {
-                if read.kind != ReadKind::STEP {
-                    return match world.hash(read) {
-                        Ok(seen) => Ok(Now::Seen(seen)),
-                        // The world cannot value it now: no entry whose run made this read
-                        // is the one valid now, so the list is passed over and nothing fails.
-                        Err(error) if error.not_now => Ok(Now::Not),
-                        Err(error) => Err(KernelError::World {
-                            of: of::<S>(input, identity),
-                            read: kernel.describe(world, read),
-                            why: error.why,
-                        }),
-                    };
-                }
-                if nots.iter().any(|it| it.as_slice() == read.key) {
-                    return Ok(Now::Not);
-                }
-                let looked = match self.child(read.key) {
-                    Ok(looked) => looked,
-                    // What cannot be valued in a lookup cannot be by a run after it either.
-                    Err(error) if error.unvaluable() => {
-                        // alloc: a child that cannot be valued, once a lookup
-                        nots.push(read.key.to_vec());
-                        return Ok(Now::Not);
-                    }
-                    Err(error) => return Err(error),
-                };
-                match looked {
-                    Looked::Found(found) => {
-                        let hash = found.hash.expect("a child is looked up for its value's hash");
-                        Ok(Now::Seen(step_seen(read.key, hash)))
-                    }
-                    Looked::Later if !last => {
-                        // alloc: a child to run, once a lookup
-                        pending.push(read.key.to_vec());
-                        Ok(Now::Pending)
-                    }
-                    Looked::Missing if self.keeps && !last => {
-                        // alloc: a child to run, once a lookup
-                        pending.push(read.key.to_vec());
-                        Ok(Now::Pending)
-                    }
-                    Looked::Missing | Looked::Later => {
-                        // alloc: a child that cannot be valued, once a lookup
-                        nots.push(read.key.to_vec());
-                        Ok(Now::Not)
-                    }
-                }
-            },
-            &mut |key| answer::<S>(store, input, identity, key, need),
-        )
+        let mut walk =
+            Walk::<S, W> { looker: self, input, identity, need, pending, nots, last };
+        find_key::<S, dyn Get, Found>(store, input, identity, &mut walk)
     }
 
     /// The step a read names by `key`, looked up for its value's hash.
@@ -633,6 +477,84 @@ impl<W: World + ?Sized> Looker<'_, W> {
         let (step, input) = step_of(key)?;
         let runner = self.cx.kernel.runner(step)?;
         (runner.look)(self, input, Need::Hash)
+    }
+}
+
+/// One walk of one identity's read-lists, as [`find_key`] asks it.
+struct Walk<'a, 'l, S: Step, W: ?Sized> {
+    looker: &'a mut Looker<'l, W>,
+    input: &'a S::Input,
+    identity: &'a Identity,
+    need: Need,
+    pending: &'a mut Vec<Vec<u8>>,
+    nots: &'a mut Vec<Vec<u8>>,
+    last: bool,
+}
+
+impl<S: Step, W: World + ?Sized> Lists<Found> for Walk<'_, '_, S, W> {
+    fn now(&mut self, read: Read<'_>) -> Result<Now, KernelError> {
+        let Cx { kernel, world, .. } = self.looker.cx;
+        if read.kind != ReadKind::STEP {
+            return match world.hash(read) {
+                Ok(seen) => Ok(Now::Seen(seen)),
+                // The world cannot value it now: no entry whose run made this read is the
+                // one valid now, so the list is passed over and nothing fails.
+                Err(error) if error.not_now => Ok(Now::Not),
+                Err(error) => Err(KernelError::World {
+                    of: of::<S>(self.input, self.identity),
+                    read: kernel.describe(world, read),
+                    why: error.why,
+                }),
+            };
+        }
+        if self.nots.iter().any(|it| it.as_slice() == read.key) {
+            return Ok(Now::Not);
+        }
+        let looked = match self.looker.child(read.key) {
+            Ok(looked) => looked,
+            // What cannot be valued in a lookup cannot be by a run after it either.
+            Err(error) if error.unvaluable() => {
+                // alloc: a child that cannot be valued, once a lookup
+                self.nots.push(read.key.to_vec());
+                return Ok(Now::Not);
+            }
+            Err(error) => return Err(error),
+        };
+        match looked {
+            Looked::Found(found, _) => {
+                let hash = found.hash.expect("a child is looked up for its value's hash");
+                Ok(Now::Seen(step_seen(read.key, hash)))
+            }
+            Looked::Later if !self.last => {
+                // alloc: a child to run, once a lookup
+                self.pending.push(read.key.to_vec());
+                Ok(Now::Pending)
+            }
+            Looked::Missing if self.looker.keeps && !self.last => {
+                // alloc: a child to run, once a lookup
+                self.pending.push(read.key.to_vec());
+                Ok(Now::Pending)
+            }
+            Looked::Missing | Looked::Later => {
+                // alloc: a child that cannot be valued, once a lookup
+                self.nots.push(read.key.to_vec());
+                Ok(Now::Not)
+            }
+        }
+    }
+
+    fn answer(&mut self, key: Key) -> Result<Option<Found>, KernelError> {
+        answer::<S>(self.looker.store, self.input, self.identity, key, self.need)
+    }
+
+    fn held<'n>(
+        &mut self,
+        slot: Option<u32>,
+        names: &mut dyn Iterator<Item = &'n [u8]>,
+        found: &mut Found,
+    ) {
+        let id = self.identity.id();
+        found.posted = Some(self.looker.state.session.post(id, slot, names, By::Hit));
     }
 }
 
@@ -662,6 +584,7 @@ fn known_now<S: Step>(
             key: known.key,
             hash: known.hash,
             value: None,
+            posted: None,
             #[cfg(test)]
             reads: known.reads,
         });
@@ -684,8 +607,8 @@ pub(crate) struct Engine<'e, W: ?Sized> {
     door: Door<'e>,
     /// The values being looked up or computed, outermost first.
     stack: Vec<Frame>,
-    /// The rows of the request's session.
-    table: &'e mut Table,
+    /// The request's session: the values found valid or made, and who read what.
+    session: &'e mut Session,
 }
 
 impl<'e, W: World + ?Sized> Engine<'e, W> {
@@ -694,14 +617,14 @@ impl<'e, W: World + ?Sized> Engine<'e, W> {
         world: &'e W,
         door: Door<'e>,
         verify: &'e Setting,
-        table: &'e mut Table,
+        session: &'e mut Session,
     ) -> Engine<'e, W> {
         // alloc: one request's stack, as deep as its steps nest; empty until one is entered
-        Engine { cx: Cx { kernel, world, verify }, door, stack: Vec::new(), table }
+        Engine { cx: Cx { kernel, world, verify }, door, stack: Vec::new(), session }
     }
 
     fn state(&mut self) -> State<'_> {
-        State { stack: &mut self.stack, table: &mut *self.table }
+        State { stack: &mut self.stack, session: &mut *self.session }
     }
 
     fn looker(&mut self) -> Looker<'_, W> {
@@ -709,7 +632,7 @@ impl<'e, W: World + ?Sized> Engine<'e, W> {
             cx: self.cx,
             store: self.door.get(),
             keeps: self.door.keeps(),
-            state: State { stack: &mut self.stack, table: &mut *self.table },
+            state: State { stack: &mut self.stack, session: &mut *self.session },
         }
     }
 
@@ -723,16 +646,17 @@ impl<'e, W: World + ?Sized> Engine<'e, W> {
         need: Need,
     ) -> Result<Option<Valued>, KernelError> {
         let id = identity.id();
-        if let Some(known) = self.state().known(&id) {
+        if let Some((row, known)) = self.session.known(&id) {
             let fill = known.hash.is_none();
             let found = known_now::<S>(self.door.get(), input, identity, known, need)?;
             if fill && found.hash.is_some() {
-                self.state().know(id, known_of(&found));
+                self.session.fill(row, known_of(&found));
             }
             return Ok(Some(Valued {
                 key: found.key,
                 hash: found.hash,
                 how: How::Hit { value: found.value },
+                row,
                 #[cfg(test)]
                 reads: found.reads,
             }));
@@ -740,18 +664,18 @@ impl<'e, W: World + ?Sized> Engine<'e, W> {
         self.state().enter::<S>(input, identity)?;
         let valued = self.entered::<S>(input, identity, need);
         self.stack.pop();
-        let valued = valued?;
-        if let Some(it) = &valued {
-            let known = Known {
-                key: it.key,
-                hash: it.hash,
-                // clone: a planted bug's reads, in a test
-                #[cfg(test)]
-                reads: it.reads.clone(),
-            };
-            self.state().know(id, known);
-        }
-        Ok(valued)
+        let Some((mut valued, posted)) = valued? else {
+            return Ok(None);
+        };
+        let known = Known {
+            key: valued.key,
+            hash: valued.hash,
+            // clone: a planted bug's reads, in a test
+            #[cfg(test)]
+            reads: valued.reads.clone(),
+        };
+        valued.row = self.session.admit(posted, known);
+        Ok(Some(valued))
     }
 
     /// The key of the entry of `identity` whose reads all hash the same now.
@@ -761,17 +685,17 @@ impl<'e, W: World + ?Sized> Engine<'e, W> {
         identity: &Identity,
     ) -> Result<Option<Key>, KernelError> {
         let id = identity.id();
-        if let Some(known) = self.state().known(&id) {
+        if let Some((_, known)) = self.session.known(&id) {
             return Ok(Some(known.key));
         }
         self.state().enter::<S>(input, identity)?;
         let found = self.lookup::<S>(input, identity, Need::Key);
         self.stack.pop();
-        let found = found?;
-        if let Some(found) = &found {
-            self.state().know(id, known_of(found));
-        }
-        Ok(found.map(|it| it.key))
+        let Some(mut found) = found? else {
+            return Ok(None);
+        };
+        self.state().admit(&mut found);
+        Ok(Some(found.key))
     }
 
     /// What `read` is now, for whoever explains a miss: a step's value that cannot be had now
@@ -788,21 +712,27 @@ impl<'e, W: World + ?Sized> Engine<'e, W> {
         }
     }
 
+    /// The value of `S` of `input`, found in the store or computed and kept, with the proof
+    /// that its postings are written: what [`Engine::value`] admits it by. Its row is set
+    /// there.
     fn entered<S: Compute<World = W>>(
         &mut self,
         input: &S::Input,
         identity: &Identity,
         need: Need,
-    ) -> Result<Option<Valued>, KernelError> {
-        if let Some(found) = self.lookup::<S>(input, identity, need)? {
+    ) -> Result<Option<(Valued, Posted)>, KernelError> {
+        if let Some(mut found) = self.lookup::<S>(input, identity, need)? {
             self.check::<S>(input, identity, found.key)?;
-            return Ok(Some(Valued {
+            let posted = found.posted.take().expect("a walk posts the list of the entry it found");
+            let valued = Valued {
                 key: found.key,
                 hash: found.hash,
                 how: How::Hit { value: found.value },
+                row: u32::MAX,
                 #[cfg(test)]
                 reads: found.reads,
-            }));
+            };
+            return Ok(Some((valued, posted)));
         }
         if !self.door.keeps() {
             return Ok(None);
@@ -817,19 +747,24 @@ impl<'e, W: World + ?Sized> Engine<'e, W> {
             return Ok(None);
         };
         let kept = keep::<S, dyn Put>(&mut **store, input, identity, &trace, &value, reads)?;
+        // The postings of the trace it was kept with: every step among its reads was asked
+        // for by the run, so each is in the session, linked to its name.
+        let posted = self.session.post(identity.id(), kept.slot, trace.names(), By::Keep);
         // The entry's own hash where it has one (an entry with reads); a bare value's is made
         // only for a parent that asked.
         let hash = match need {
             Need::Key => kept.hash,
             Need::Hash | Need::Value => Some(kept.hash.unwrap_or_else(|| content_of(&value))),
         };
-        Ok(Some(Valued {
+        let valued = Valued {
             key: kept.key,
             hash,
+            row: u32::MAX,
             #[cfg(test)]
             reads: planted::reads(trace.iter()),
             how: How::Computed { value, reads: trace },
-        }))
+        };
+        Ok(Some((valued, posted)))
     }
 
     /// The entry of `identity` whose reads all hash the same now, by one walk of its read-lists
@@ -991,6 +926,84 @@ impl<W: World + ?Sized> Asks for Engine<'_, W> {
     }
 }
 
+/// [`Kernel::carry`]: the seed, then the repair, lowest first.
+pub(crate) fn carry<W: World + ?Sized>(
+    kernel: &Kernel<W>,
+    session: &mut Session,
+    store: &mut dyn Put,
+    world: &W,
+    changed: &Changed,
+    verify: &Setting,
+) -> Result<Carried, KernelError> {
+    let mut carried = Carried::default();
+    let Some(mut queue) = session.seed(kernel.registry(), world.pin(), changed)? else {
+        carried.dropped = Some(Dropped::Registry);
+        return Ok(carried);
+    };
+    carried.seeded = queue.len();
+    // Bounded (rule 18): each turn takes a row out of the queue, and the queue stops giving
+    // rows past its count.
+    loop {
+        let (row, was) = match queue.pop() {
+            Popped::Row { row, was } => (row, was),
+            Popped::Empty => break,
+            Popped::Spent => {
+                session.clear();
+                carried.dropped = Some(Dropped::Repairs);
+                return Ok(carried);
+            }
+        };
+        // Only a value a step read is looked up here: it has the hash its readers saw, and
+        // the key they name it by. Any other has no reader to tell: dropped, it is looked up
+        // when it is next asked for.
+        // alloc: one repair's key, apart from the session its lookup writes in
+        let key = session.asked(row).map(<[u8]>::to_vec);
+        let (Some(key), Some(was)) = (key, was) else {
+            if !session.is_live(row) {
+                carried.gone += 1;
+            }
+            continue;
+        };
+        // A lookup since it was queued may have asked for it, and so repaired it.
+        if !session.is_live(row) {
+            carried.repaired += 1;
+            let asked = {
+                let mut engine =
+                    Engine::new(kernel, world, Door::Keep(&mut *store), verify, &mut *session);
+                engine.ask(&key, Need::Hash)
+            };
+            match asked {
+                Ok(_) => {}
+                // It cannot be valued at this pin: it is not in the session, and whoever asks
+                // for it next is told why.
+                Err(error) if error.unvaluable() => {}
+                Err(error) => {
+                    session.clear();
+                    return Err(error);
+                }
+            }
+        }
+        match session.hash_of(row) {
+            // The same bytes: its readers stay verified, with no work (the cutoff).
+            Some(now) if now == was => {
+                carried.cut += 1;
+                continue;
+            }
+            Some(_) => carried.changed += 1,
+            None => carried.gone += 1,
+        }
+        let mut n = 0;
+        while let Some(reader) = session.reader(row, n) {
+            n += 1;
+            if queue.takes(reader) {
+                session.dirty(reader, &mut queue);
+            }
+        }
+    }
+    session.leave(world)?;
+    Ok(carried)
+}
+
 /// A hit's value computed again, for lane verify's check.
 struct Again<'a, 'e, S: Compute> {
     engine: RefCell<&'a mut Engine<'e, S::World>>,
@@ -1062,6 +1075,18 @@ pub(crate) mod planted {
         IdentityOnly,
         /// A session answers whatever its world's pin is now: its rows outlive their pin.
         StalePin,
+        /// An entry found in the store is admitted with no posting: postings are written only
+        /// for what this process computed and kept (invariant I1).
+        HitUnposted,
+        /// An admission's postings are written at the end of the next carry's seed, not with
+        /// the admission (invariant I1: "never at the next boundary").
+        PostLate,
+        /// Whoever says what changed leaves out a fact that appears where nothing was
+        /// (invariant I2); the kernel is as it is, and the driver of the check has the bug.
+        AbsenceUnsaid,
+        /// A carry repairs the highest queued entry first, and one repaired is not queued
+        /// again: a parent is looked up before the child it reads (invariant I3).
+        ParentFirst,
     }
 
     thread_local! {

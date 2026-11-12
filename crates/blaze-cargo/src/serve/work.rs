@@ -857,6 +857,29 @@ pub trait Kept: Send + 'static {
     fn rest(&mut self);
 }
 
+/// How a traced step read a path of the machine's files: the question its record's check
+/// asks of [`blaze_usercode::trace::Inputs`], which is the question a later check asks again.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Looked {
+    /// `Inputs::file`: the hash of a file's bytes, the mark of a directory or of what is no
+    /// file; nothing where nothing is there (a negative probe).
+    File,
+    /// `Inputs::dir`: the hash of a directory's sorted names; nothing where no directory is.
+    Listing,
+    /// `Inputs::tree`: the hash of everything below a directory (`package`: as a package is
+    /// walked); nothing where no directory is.
+    Tree { package: bool },
+}
+
+/// One read of the machine's files by a traced step, by its real path, with what was there
+/// when the step's record held ([`Writer::read_seen`]).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Seen {
+    pub how: Looked,
+    pub path: std::path::PathBuf,
+    pub hash: Option<[u8; 32]>,
+}
+
 /// What of a job's front end only the loop writes. Its writes are asked for, then applied
 /// together by [`Writer::apply`] once no [`Steps::Reader`] of it is alive (the module's docs).
 pub trait Writer<S: Steps>: Send + 'static {
@@ -985,6 +1008,18 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// does not say names none it can vouch for.
     fn read_outside(&self) -> Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>), String> {
         Err("its front end does not say which paths its steps read".to_owned()) // alloc: a reason, once a build
+    }
+    /// On the loop, once every task of the job's build has ended: every read of the machine's
+    /// files that a traced step's record rests on ([`Seen`]), each with what was there when
+    /// that record's own check held: for a run found kept, what its check saw as the build
+    /// began; for a run that ran, what its trace recorded. These are the values the store
+    /// holds the step's result under, never a look at the build's end: a file saved under
+    /// the build after its step read it differs from them at the next request. In any order,
+    /// a read as often as steps read it. Or why they are not all known: the step that has no
+    /// trace, named; no request certificate is written of that build. It runs no query and
+    /// reads no file. A front end that does not say names none it can vouch for.
+    fn read_seen(&self) -> Result<Vec<Seen>, String> {
+        Err("its front end does not say what its traced steps read".to_owned()) // alloc: a reason, once a build
     }
     /// Under `-v`: the note of what storing the kept front end this build lowered into did with
     /// the goals its build offered to the persistent goal cache. None when nothing was kept.

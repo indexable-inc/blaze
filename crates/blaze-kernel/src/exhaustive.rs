@@ -249,6 +249,11 @@ enum Did {
     Get(u8),
     /// The session dropped what it verified (`nested`).
     Drop,
+    /// The session was carried to the world as it is (`nested`).
+    Carry,
+    /// Before the sequence: every value was kept in the store at the first world, by a
+    /// session that is gone (`nested`).
+    Warm,
 }
 
 /// What the oracle refused, with the sequence that led to it.
