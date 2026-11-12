@@ -433,6 +433,10 @@ fn kept_is_whole_of(mut program: Program, edits: &[Edit], plant: Plant) -> Resul
         program.apply(edit);
         db.set_file_text(file, &program.text());
         let frontend = HirFrontend::new(Databases::new(&db), hashes(), BuildTime::default());
+        // A build walks the engine's changed set before its link (its body check does), so
+        // each walk is of one build's writes: without it the first link's walk is of
+        // everything written since the database was made, a wide level that names every row.
+        blaze_query::db::plumbing::walk_changed_set(&db);
         let built = program.built(&db, &frontend.hashes, before.as_ref());
         let given = frontend.with(|db| inputs(db, &frontend.hashes, &built, plant))?;
         if given.serial != serial {
