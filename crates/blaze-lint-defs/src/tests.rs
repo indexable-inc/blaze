@@ -52,7 +52,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let store = Store::default();
     let lint = lint("blaze::const_impure").expect("blaze's lint");
     assert_eq!(lint.default_level, Level::Warn);
-    assert_eq!(blaze_lints().len(), 113);
+    assert_eq!(blaze_lints().len(), 114);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =
@@ -73,6 +73,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         ("blaze::proc_macro_derive", ready::REFLECTION_REPLACES_MACROS),
         ("blaze::proc_macro_attribute", ready::REFLECTION_REPLACES_MACROS),
         ("blaze::build_script_ambient", ready::CAPABILITIES_FOR_BUILD_SCRIPTS),
+        ("blaze::not_latest_edition", ready::EDITION_SHIPS),
         // Never by default: a crate or a workspace's table asks for it.
         ("blaze::std_use", false),
         ("blaze::lossy_as", false),
@@ -193,6 +194,7 @@ fn the_proc_macro_lints_are_a_group_of_the_edition_lints() {
         level("blaze::build_script_ambient"),
         ready::level(ready::CAPABILITIES_FOR_BUILD_SCRIPTS)
     );
+    assert_eq!(level("blaze::not_latest_edition"), ready::level(ready::EDITION_SHIPS));
     assert_eq!(ready::level(true), Level::Warn);
     assert_eq!(ready::level(false), Level::Allow);
 }

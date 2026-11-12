@@ -19,7 +19,16 @@ use super::{
     say,
 };
 
-const EDITIONS: [&str; 4] = ["2015", "2018", "2021", "2024"];
+/// The editions `--edition` takes: Rust's, and the blaze edition
+/// (docs/v2/plan/design/std.md, "The blaze edition: opting in"; `the_editions_are_the_ones_known`
+/// holds the last to `BlazeEdition::LATEST`).
+const EDITIONS: [&str; 5] = ["2015", "2018", "2021", "2024", "blaze-2026.11"];
+
+/// The editions `--edition` takes beside `--rust`: Rust's.
+const RUST_EDITIONS: [&str; 4] = ["2015", "2018", "2021", "2024"];
+
+/// The Rust edition `--rust` asks for when `--edition` names none: Rust's latest.
+const RUST: &str = "2024";
 
 /// cargo's shell on standard error.
 struct Said {
@@ -60,6 +69,8 @@ struct Asked {
     path: String,
     vcs: Option<VersionControl>,
     edition: Option<String>,
+    /// `--bstd <PATH>`: where bstd's package is, for a package of the blaze edition.
+    bstd: Option<String>,
 }
 
 /// A value clap refuses: the flag as its usage names it, the value, and what it may be.
@@ -98,7 +109,21 @@ fn asked(init: bool, read: &Read) -> Result<Result<Asked, Invalid>, ()> {
         // clone: the refused value, once
         return Ok(Err(Invalid { flag: "--edition <YEAR>", value: it.clone(), possible: &EDITIONS }));
     }
-    Ok(Ok(Asked { path, vcs, edition }))
+    // `--rust`: a plain Rust package, whatever the default is. With `--edition` it only says
+    // the edition must be Rust's; alone it is Rust's latest.
+    let rust = read.has("--rust");
+    if rust
+        && let Some(it) = &edition
+        && it.starts_with(span::BlazeEdition::MANIFEST_PREFIX)
+    {
+        // clone: the refused value, once
+        return Ok(Err(Invalid { flag: "--edition <YEAR>", value: it.clone(), possible: &RUST_EDITIONS }));
+    }
+    let edition = match (edition, rust) {
+        (None, true) => Some(RUST.to_owned()), // alloc: the edition, once
+        (edition, _) => edition,
+    };
+    Ok(Ok(Asked { path, vcs, edition, bstd: read.value("--bstd") }))
 }
 
 /// The package made in `cwd` with the variables `env`, what cargo says on its way said on
@@ -119,7 +144,7 @@ fn make(
         Some(registry) => Some(registry),
         None => config.get_string("registry.default")?.map(|it| it.val),
     };
-    let opts = NewOptions::new(
+    let mut opts = NewOptions::new(
         asked.vcs,
         read.has("--bin"),
         read.has("--lib"),
@@ -128,6 +153,7 @@ fn make(
         asked.edition,
         registry,
     )?;
+    opts.bstd = asked.bstd;
     let configured = match config.get_string("cargo-new.vcs")? {
         None => None,
         Some(it) => Some(VersionControl::parse(&it.val).with_context(|| {
@@ -172,6 +198,8 @@ pub fn main(init: bool, words: Vec<OsString>, color: bool) -> i32 {
         switch(&["--bin"]),
         switch(&["--lib"]),
         valued(&["--edition"]),
+        switch(&["--rust"]),
+        valued(&["--bstd"]),
         valued(&["--name"]),
         valued(&["--registry"]),
     ];
@@ -293,11 +321,13 @@ mod tests {
         }
     }
 
-    const FLAGS: [own::Flag; 6] = [
+    const FLAGS: [own::Flag; 8] = [
         valued(&["--vcs"]),
         switch(&["--bin"]),
         switch(&["--lib"]),
         valued(&["--edition"]),
+        switch(&["--rust"]),
+        valued(&["--bstd"]),
         valued(&["--name"]),
         valued(&["--registry"]),
     ];
@@ -310,6 +340,86 @@ mod tests {
     fn env(home: &Path) -> Vec<(String, String)> {
         let home = home.to_str().unwrap().to_owned();
         vec![("HOME".to_owned(), home.clone()), ("CARGO_HOME".to_owned(), format!("{home}/.cargo"))]
+    }
+
+    /// `new` with `--bstd` writes a package of the blaze edition: the opt-in in the manifest,
+    /// bstd named where it was said to be, and a `main` that takes its world and writes its
+    /// line through `Out`.
+    #[test]
+    fn new_writes_a_package_of_the_blaze_edition_where_bstd_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let read = read(&["--vcs", "none", "--bstd", "/src/blaze/crates/blaze-std", "hello"]);
+        let asked = asked(false, &read).unwrap().unwrap();
+        make(false, &read, asked, &cwd, env(&cwd), &mut Told::default()).unwrap();
+        let manifest = std::fs::read_to_string(cwd.join("hello/Cargo.toml")).unwrap();
+        assert!(manifest.contains("edition = \"blaze-2026.11\""), "{manifest}");
+        assert!(
+            manifest.contains("bstd = { package = \"blaze-std\", path = \"/src/blaze/crates/blaze-std\" }"),
+            "{manifest}"
+        );
+        let source = std::fs::read_to_string(cwd.join("hello/src/main.rs")).unwrap();
+        assert!(source.contains("fn main(cx: &Cx, io: Io) -> Result<(), Error>"), "{source}");
+        assert!(source.contains("io.need_out()?.line(cx, \"Hello, world!\")?;"), "{source}");
+        assert!(!source.contains("println"), "nothing ambient: {source}");
+        // A library of the edition has no test module yet.
+        let read = self::read(&["--vcs", "none", "--lib", "--bstd", "../bstd", "shelf"]);
+        let asked = self::asked(false, &read).unwrap().unwrap();
+        make(false, &read, asked, &cwd, env(&cwd), &mut Told::default()).unwrap();
+        let source = std::fs::read_to_string(cwd.join("shelf/src/lib.rs")).unwrap();
+        assert!(source.contains("pub fn add") && !source.contains("#[test]"), "{source}");
+    }
+
+    /// `--rust` is the plain package, byte for byte what `new` wrote before the edition, even
+    /// where bstd is named; and it refuses a blaze edition asked beside it.
+    #[test]
+    fn rust_asks_for_the_plain_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        for (name, words) in [
+            ("plain", &["--vcs", "none", "plain"][..]),
+            ("rust", &["--vcs", "none", "--rust", "rust"]),
+            ("both", &["--vcs", "none", "--rust", "--bstd", "/x", "both"]),
+        ] {
+            let read = read(words);
+            let asked = asked(false, &read).unwrap().unwrap();
+            make(false, &read, asked, &cwd, env(&cwd), &mut Told::default()).unwrap();
+            let manifest = std::fs::read_to_string(cwd.join(name).join("Cargo.toml")).unwrap();
+            assert_eq!(
+                manifest,
+                format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n"),
+            );
+            let source = std::fs::read_to_string(cwd.join(name).join("src/main.rs")).unwrap();
+            assert_eq!(source, "fn main() {\n    println!(\"Hello, world!\");\n}\n");
+        }
+        let refused =
+            asked(false, &read(&["--rust", "--edition", "blaze-2026.11", "x"])).unwrap().unwrap_err();
+        assert_eq!((refused.flag, refused.value.as_str()), ("--edition <YEAR>", "blaze-2026.11"));
+        assert_eq!(refused.possible, RUST_EDITIONS);
+    }
+
+    /// The blaze edition asked where blaze cannot say where bstd is stops, naming the flag
+    /// and the row, and writes no package that could not build. (Until `BSTD_SHIPS`.)
+    #[test]
+    fn the_blaze_edition_without_bstd_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let refused = asked_again(&cwd, &["--vcs", "none", "--edition", "blaze-2026.11", "hello"]);
+        let said = format!("{refused:#}");
+        assert!(!blaze_new::BSTD_SHIPS, "this test is of the time before bstd ships");
+        assert!(said.contains("--bstd <PATH>") && said.contains("S5d"), "{said}");
+        assert!(!cwd.join("hello/Cargo.toml").exists(), "no manifest of a package that cannot build");
+    }
+
+    /// The command line's editions are the ones blaze knows: Rust's four and every blaze
+    /// edition.
+    #[test]
+    fn the_editions_are_the_ones_known() {
+        let blaze: Vec<&str> = span::BlazeEdition::ALL.iter().map(|it| it.manifest()).collect();
+        assert_eq!(EDITIONS[..4], RUST_EDITIONS);
+        assert_eq!(EDITIONS[4..], blaze[..]);
+        assert_eq!(blaze_new::default_edition(true), span::BlazeEdition::LATEST.manifest());
+        assert_eq!(blaze_new::default_edition(false), if blaze_new::BSTD_SHIPS { "blaze-2026.11" } else { RUST });
     }
 
     #[test]

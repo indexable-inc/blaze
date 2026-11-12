@@ -107,7 +107,8 @@ Commands:
     fmt         Format the workspace's packages with blaze's own rustfmt (`--check`, `-p NAME`,
                 `--all`, `-- RUSTFMT_ARGS`), or the `.rs` files named; `blaze fmt --help`
     new, init   Create a package at <PATH>, or in the directory it is run in (`--bin`, `--lib`,
-                `--name`, `--edition`, `--vcs`), as cargo writes one
+                `--name`, `--edition`, `--vcs`): of the blaze edition where `--bstd <PATH>`
+                says where bstd is, else, or with `--rust`, as cargo writes one
     tree        The workspace's dependency graph, with cargo's flags (`-e`, `-i`, `-p`, `--depth`)
     metadata    The workspace and its resolve as `cargo metadata --format-version 1` prints them
     serve       Run the daemon the other commands are clients of

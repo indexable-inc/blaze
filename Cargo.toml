@@ -193,6 +193,10 @@ proc_macro = "deny"
 # decision of 2026-11-11 ahead of the switch (`ready::BSTD_IN_TREE` is `false`: bstd does not
 # yet build on a stage-1 blaze with an API to port to). harness/v2/std_uses.py is the worklist.
 std_use = "deny"
+# A package not on the latest blaze edition (docs/lints.md#not_latest_edition): allowed here while
+# cargo builds blaze (decision D25, docs/v2/plan/decisions.json), since no crate cargo builds can
+# say `edition = "blaze-2026.11"`. Removed when the tree moves onto the edition.
+not_latest_edition = "allow"
 # `blaze::hot` is the lints of code where the time goes, each decided here. `allow` outside
 # hot code, as docs/lints.md#profile_hot says, for the three that find what is right in cold
 # code and `large_move` (moves of over 512 bytes, and lopsided enums, "in hot code" by its own

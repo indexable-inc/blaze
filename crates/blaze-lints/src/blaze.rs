@@ -23,6 +23,7 @@ mod bounds_check_in_loop;
 mod box_large_new;
 mod boxed_recursive_node;
 mod build_script_ambient;
+mod not_latest_edition;
 mod checkfree;
 mod clone;
 mod cold_error;
@@ -280,6 +281,7 @@ pub enum Lint {
     ProcMacroAttribute,
     ProcMacroFnLike,
     BuildScriptAmbient,
+    NotLatestEdition,
     StdUse,
     ProgramLifetime,
     CouldBeProgramLifetime,
@@ -338,6 +340,8 @@ pub(crate) const EDITION_READY: &[(Lint, bool)] = &[
     (Lint::ProcMacroAttribute, ready::REFLECTION_REPLACES_MACROS),
     (Lint::ProcMacroFnLike, true),
     (Lint::BuildScriptAmbient, ready::CAPABILITIES_FOR_BUILD_SCRIPTS),
+    // Once a package of the edition builds wherever blaze runs (bstd ships with blaze).
+    (Lint::NotLatestEdition, ready::EDITION_SHIPS),
     // Never by default, in any workspace: a crate asks for it (`#![blaze::capabilities]`), a
     // workspace by its `lints-when-ready` table once `ready::BSTD_IN_TREE`, and blaze's own
     // denies it in its `lints-ratchet` ahead of the switch.
@@ -518,6 +522,7 @@ impl Lint {
         Lint::ProcMacroAttribute,
         Lint::ProcMacroFnLike,
         Lint::BuildScriptAmbient,
+        Lint::NotLatestEdition,
         Lint::StdUse,
         Lint::ProgramLifetime,
         Lint::CouldBeProgramLifetime,
@@ -602,6 +607,8 @@ impl Lint {
             | Lint::ProcMacroAttribute
             | Lint::ProcMacroFnLike
             | Lint::BuildScriptAmbient
+            // A package not on the latest blaze edition: the edition itself, asked for.
+            | Lint::NotLatestEdition
             // What blaze's standard library replaces, which the edition's `std` no longer has.
             | Lint::StdUse => Kind::Edition,
             // `blaze::hot` and its comments (`// clone:`, `// alloc:`, `// dyn:`).
@@ -794,6 +801,7 @@ impl Lint {
             Lint::ProcMacroAttribute => "proc_macro_attribute",
             Lint::ProcMacroFnLike => "proc_macro_fn_like",
             Lint::BuildScriptAmbient => "build_script_ambient",
+            Lint::NotLatestEdition => "not_latest_edition",
             Lint::StdUse => "std_use",
             Lint::ProgramLifetime => "program_lifetime",
             Lint::CouldBeProgramLifetime => "could_be_program_lifetime",
@@ -912,6 +920,7 @@ impl Lint {
                 concat!(general_docs!(), "#proc_macro")
             }
             Lint::BuildScriptAmbient => concat!(general_docs!(), "#build_script_ambient"),
+            Lint::NotLatestEdition => concat!(general_docs!(), "#not_latest_edition"),
             Lint::StdUse => concat!(general_docs!(), "#std_use"),
             Lint::ProgramLifetime | Lint::CouldBeProgramLifetime | Lint::CouldBeRef32 => {
                 concat!(general_docs!(), "#program_lifetime-could_be_program_lifetime-could_be_ref32")
@@ -1243,6 +1252,13 @@ impl Lint {
                     "nothing to change yet: the replacement is a capability the script is handed (`Fs`, `Env`, `Process`, `Net`, `Clock` of blaze's standard library, docs/v2/plan/design/std.md), which states in the script's signature what it can touch, lets blaze prove what it reads, and reruns it only when that changes; that library is not in this blaze, and this lint is `allow` by default until it is"
                 }
             }
+            Lint::NotLatestEdition => {
+                if ready::EDITION_SHIPS {
+                    "set `edition = \"blaze-2026.11\"` under `[package]` in Cargo.toml (`blaze fix --edition`, which will rewrite the sources, is planned and not in this blaze), or keep the package as it is and say so: `not_latest_edition = \"allow\"` under `[workspace.metadata.blaze.lints]`, or `#![allow(blaze::not_latest_edition)]` at the crate root"
+                } else {
+                    "nothing to change yet: the opt-in is `edition = \"blaze-2026.11\"` under `[package]` in Cargo.toml, and a package of it names bstd as a dependency until blaze ships bstd with itself (docs/v2/plan/design/std.md, row S5d), which is planned and not in this blaze; this lint is `allow` by default until it is, and `blaze fix --edition` is planned too"
+                }
+            }
             Lint::StdUse => {
                 if ready::BSTD_IN_TREE {
                     "take the capability, or write the form of blaze's standard library, that the finding names (bstd, docs/v2/plan/design/std.md): a function then says in its signature everything it can touch, wait for and allocate from; where the finding has a fix, `blaze check --fix` makes it; or say why std's stays with `#[expect(blaze::std_use, reason = \"..\")]`"
@@ -1445,6 +1461,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         stable_sort_needless::check(cx);
         lossy_as::check(cx);
         build_script_ambient::check(cx);
+        not_latest_edition::check(cx);
         std_use::check(cx);
         check_body(cx);
     }
