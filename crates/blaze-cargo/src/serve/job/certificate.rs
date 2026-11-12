@@ -34,10 +34,12 @@ use std::fmt;
 use blaze_ids::{ContentId, Hasher};
 use blaze_record::{AnswerKey, Digest, ListRef};
 
+use crate::serve::work::CodeHolder;
+
 /// The layout of a certificate's parts: the word in each read-list's note and at the head of
 /// each answer. A change of any field's meaning or order takes the next number and a line in
 /// [`PREVIOUS`].
-pub(super) const LAYOUT: u32 = 2;
+pub(super) const LAYOUT: u32 = 3;
 
 /// The first bytes of a list's note and of every answer.
 const MAGIC: &[u8; 8] = b"blzcert\n";
@@ -47,6 +49,7 @@ const MAGIC: &[u8; 8] = b"blzcert\n";
 pub(super) const PREVIOUS: &[(u32, &str)] = &[
     (0, "the draft of 2026-11-12, whose one group was the view's whole root"),
     (1, "the record of 2026-11-12 keyed by the view's root, with its outputs' stamps in its bytes"),
+    (2, "the record of 2026-11-12 whose outputs were placed files alone, not the code a launcher or a code memory holds"),
 ];
 
 /// The step a request that was not certified is under in `blaze why`.
@@ -208,15 +211,44 @@ impl fmt::Display for Read {
     }
 }
 
-/// An output of the build, by content.
+/// The base of an output that is no file: the code the launch host holds for the launcher
+/// program whose file is at the output's path ([`CodeHolder::Launcher`]).
+pub(super) const LAUNCHER: u8 = 0xF0;
+
+/// The base of an output that is no file: the code the daemon's code memory holds for the dev
+/// executable whose file is at the output's path ([`CodeHolder::Memory`]).
+pub(super) const MEMORY: u8 = 0xF1;
+
+/// The base a certificate names `holder`'s outputs under.
+pub(super) fn code_base(holder: CodeHolder) -> u8 {
+    match holder {
+        CodeHolder::Launcher => LAUNCHER,
+        CodeHolder::Memory => MEMORY,
+    }
+}
+
+/// The holder whose outputs are under `base`, or `None` for a base of files.
+pub(super) fn holder_of(base: u8) -> Option<CodeHolder> {
+    match base {
+        LAUNCHER => Some(CodeHolder::Launcher),
+        MEMORY => Some(CodeHolder::Memory),
+        _ => None,
+    }
+}
+
+/// An output of the build, by content: a file it placed, or the code a place that is no file
+/// holds for a program it built ([`holder_of`] its base), which is what a run of the program
+/// executes when the program's file is the same bytes at every build (a launcher's) or is
+/// overlaid by memory (a dev executable's).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) struct Output {
     /// Which of the daemon's bases `path` is under (the target directory, the build
-    /// directory, the standard library's builds), by index.
+    /// directory, the standard library's builds), by index; or [`LAUNCHER`] or [`MEMORY`].
     pub(super) base: u8,
     /// From that base, `/`-separated.
     pub(super) path: String,
-    /// The hash of the bytes placed there.
+    /// The hash of the bytes placed there; for a holder's output, the identity of the build
+    /// whose code it holds ([`crate::serve::work::HeldCode::Is`]).
     pub(super) content: ContentId,
 }
 

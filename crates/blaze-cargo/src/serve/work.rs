@@ -623,6 +623,44 @@ impl std::fmt::Display for OutputFields {
 pub type Leased =
     Result<Result<Vec<blaze_gc::lease::Lease>, (String, blaze_gc::lease::Wait)>, String>;
 
+/// A place the code a run executes is held in that is no file: an output of the build that
+/// placed it there, as a file is ([`Steps::held_code`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CodeHolder {
+    /// The launch host's program (`serve::unit::run::launch`): a launcher's file is the same
+    /// bytes at every build, and its code is the host's, told to each launcher.
+    Launcher,
+    /// The daemon's code memory of a dev executable (`serve::unit::run::inproc`), which its
+    /// runs map over their file.
+    Memory,
+}
+
+impl CodeHolder {
+    /// Every holder, each once.
+    pub const ALL: [CodeHolder; 2] = [CodeHolder::Launcher, CodeHolder::Memory];
+}
+
+/// The holder as errors and `blaze why` name it.
+impl std::fmt::Display for CodeHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CodeHolder::Launcher => "the launch host",
+            CodeHolder::Memory => "the daemon's code memory",
+        })
+    }
+}
+
+/// What a [`CodeHolder`] holds for a program.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HeldCode {
+    /// The code of the build of this identity: the launch host's, the unit's record key (a key
+    /// over every input of the unit); a code memory's, the key of the file it holds.
+    Is(ContentId),
+    /// Code of no build blaze can name (a launcher program's unit with no record key, or one
+    /// whose last build failed in its link): no certificate can say what runs.
+    Unnamed,
+}
+
 /// The build of one job, as the daemon has it: one value for every job. Its associated types
 /// are its front end's, so the loop holds each by its own type.
 pub trait Steps: Sized + Send + Sync + 'static {
@@ -757,6 +795,15 @@ pub trait Steps: Sized + Send + Sync + 'static {
     ) -> Result<Option<Vec<(String, String)>>, ApiError> {
         let _ = (program, pid, placed);
         Ok(None)
+    }
+    /// On the loop: the code `holder` holds now for the program whose output is at
+    /// `program`, by the identity of the build it is of; `None` where `holder` holds no
+    /// program there. What a run of that program executes, which no placed file says: a
+    /// request certificate records it as an output and a check compares it with this
+    /// (`job::certify::outputs_of`). Steps with no holder hold nothing.
+    fn held_code(&self, holder: CodeHolder, program: &str) -> Option<HeldCode> {
+        let _ = (holder, program);
+        None
     }
     /// On the loop, once at start: the queries of the daemon's database.
     fn register(&self, db: &mut Database) {

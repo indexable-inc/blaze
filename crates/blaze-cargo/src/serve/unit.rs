@@ -264,6 +264,17 @@ impl Steps for Real {
             .map_err(|what| ApiError::new(what, Some(program.to_owned())))
     }
 
+    fn held_code(
+        &self,
+        holder: crate::serve::work::CodeHolder,
+        program: &str,
+    ) -> Option<crate::serve::work::HeldCode> {
+        match holder {
+            crate::serve::work::CodeHolder::Launcher => self.shared.launches.held_code(program),
+            crate::serve::work::CodeHolder::Memory => self.shared.dev_runs.held_code(program),
+        }
+    }
+
     fn lease(
         &self,
         units: &blaze_units::query::Units,

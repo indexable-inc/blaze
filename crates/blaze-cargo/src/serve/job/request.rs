@@ -9,9 +9,11 @@
 //!    driver looks and says ([`Request::told`]): a node of the pinned view, a variable, a
 //!    file's or a listing's digest outside the views. A list that does not name a variable
 //!    read unasked that is set now is passed over: it was unset when that list's build ran.
-//! 3. The answer under the first list's bytes and those digests; then each **output**: its
-//!    stamp, and where no local evidence vouches for the content under that stamp
-//!    ([`Evidence`]), stat, hash, stat again.
+//! 3. The answer under the first list's bytes and those digests; then each **output**: a
+//!    file's stamp, and where no local evidence vouches for the content under that stamp
+//!    ([`Evidence`]), stat, hash, stat again; the code a place that is no file holds
+//!    ([`certificate::holder_of`]: the launch host's program, the daemon's code memory), by
+//!    the identity of the build it is of, asked once, with no stamp.
 //! 4. [`Next::Hit`]: what the build said is said again; no job. Or [`Next::Miss`], naming
 //!    what moved ([`Why`]): the reads whose digest is another than this checkout's last build
 //!    had. The one walk is the engine's; it is handed those names.
@@ -226,6 +228,13 @@ impl fmt::Display for Why {
             Why::Unnamed => f.write_str(
                 "an input changed since the builds on record, and this daemon has seen no build of this checkout to say which",
             ),
+            Why::Output { base, path, how } if certificate::holder_of(*base).is_some() => {
+                match (certificate::holder_of(*base), how) {
+                    (Some(holder), How::Gone) => write!(f, "{holder} holds no code of {path}, which a run of it executes"),
+                    (Some(holder), _) => write!(f, "{holder} holds the code of another build of {path} than this one left"),
+                    (None, _) => write!(f, "the output {path} is not as the build left it"),
+                }
+            }
             Why::Output { path, how: How::Gone, .. } => write!(f, "the output {path} is gone"),
             Why::Output { path, how: How::Changed, .. } => write!(f, "the output {path} holds other bytes than the build left"),
             Why::Output { path, how: How::Unsteady, .. } => write!(f, "the output {path} is being written"),
@@ -402,6 +411,10 @@ pub(super) enum Plant {
     TrustsRacyStamps,
     /// A variable read unasked that is set now and that the list does not name is let by.
     ForgetsUnasked,
+    /// A build's outputs leave out the code a place that is no file holds
+    /// (`certify::outputs_of`): the launcher's file alone is recorded, as it was until
+    /// 2026-11-12.
+    LeavesCodeOut,
 }
 
 #[cfg(test)]
@@ -410,12 +423,12 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn planted(plant: Plant) -> bool {
+pub(super) fn planted(plant: Plant) -> bool {
     PLANT.get() == plant
 }
 
 #[cfg(not(test))]
-fn planted(plant: Plant) -> bool {
+pub(super) fn planted(plant: Plant) -> bool {
     let _ = plant;
     false
 }
@@ -691,7 +704,11 @@ impl Request {
             .outputs
             .iter()
             // clone: an ask's own name, once an output a request
-            .map(|output| Ask::Stamp { base: output.base, path: output.path.clone() })
+            .map(|output| match certificate::holder_of(output.base) {
+                // The code a holder holds is read in place, once: no stamp vouches for it.
+                Some(_) => Ask::Content { base: output.base, path: output.path.clone() },
+                None => Ask::Stamp { base: output.base, path: output.path.clone() },
+            })
             .collect(); // alloc: an ask an output
         self.ask(asks, State::Stamping { found }, store, evidence)
     }
@@ -736,6 +753,13 @@ impl Request {
     ) -> Result<Next, Stopped<S::Error>> {
         let mut need = Vec::new(); // alloc: an entry an output no stamp vouches for
         for (at, output) in found.answer.outputs.iter().enumerate() {
+            if certificate::holder_of(output.base).is_some() {
+                match self.pending.content(output)? {
+                    Some(content) if content == output.content => continue,
+                    Some(_) => return Ok(self.output_miss(output, How::Changed)),
+                    None => return Ok(self.output_miss(output, How::Gone)),
+                }
+            }
             let Some(stamp) = self.pending.stamp(output)?.0 else {
                 return Ok(self.output_miss(output, How::Gone));
             };

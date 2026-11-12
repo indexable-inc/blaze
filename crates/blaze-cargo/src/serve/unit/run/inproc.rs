@@ -234,6 +234,16 @@ impl DevRuns {
         Ok(None)
     }
 
+    /// The code this daemon's memory holds for the dev executable at `path`, by the key of the
+    /// file it holds ([`Program::file`]); `None` where it holds none there. A request
+    /// certificate's output (`Steps::held_code`): a run executes the memory, whatever file is
+    /// at `path`.
+    pub(crate) fn held_code(&self, path: &str) -> Option<crate::serve::work::HeldCode> {
+        let programs = self.programs.pin();
+        let loaded = programs.get(path)?;
+        Some(crate::serve::work::HeldCode::Is(blaze_ids::ContentId(loaded.program.file())))
+    }
+
     /// The dev executable at `path` as this daemon holds it, for a run or a test queue of the
     /// daemon's own to start ([`super::Launch::InProcess`]): one this daemon did not link is an
     /// error naming it ([`unheld`]), never a run of its file.

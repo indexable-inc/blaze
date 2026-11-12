@@ -100,10 +100,7 @@ pub(crate) fn not_replayed(
     Ok(outputs.iter().any(|(path, _, executable)| {
         *executable
             && made.contains(&path.as_str())
-            && !programs.get(&program_id(path)).is_some_and(|held| {
-                let core = held.core.lock();
-                key.is_some() && core.record == key
-            })
+            && !programs.get(&program_id(path)).is_some_and(|held| key.is_some() && *held.record.lock() == key)
     }))
 }
 
@@ -112,6 +109,11 @@ struct Held {
     /// The path its link was asked for: what errors name it by.
     path: String,
     core: Lock<Core>,
+    /// The whole record key of the unit's build the program was last given: the build whose
+    /// code the core holds ([`not_replayed`], [`Launches::held_code`]). Beside the core, so a
+    /// look at it (the loop's, for a request certificate) never waits for a core's decision;
+    /// written only under the core's lock, after it.
+    record: Lock<Option<blaze_cas::Key>>,
 }
 
 struct Core {
@@ -120,9 +122,6 @@ struct Core {
     writers: Vec<(Conn, Sender<Vec<u8>>)>,
     /// The serial of the span tables the program was last given (`LinkInputs::serial`).
     spans: Option<u64>,
-    /// The whole record key of the unit's build the program was last given: the build whose
-    /// code the core holds ([`not_replayed`]).
-    record: Option<blaze_cas::Key>,
 }
 
 /// The daemon's launcher programs, by id, and the socket their launchers connect to: made
@@ -179,6 +178,20 @@ impl Launches {
         Ok(held)
     }
 
+    /// The code the program linked at `path` holds now, by the whole record key of the unit's
+    /// build it was last given ([`Held::record`]); `None` where this daemon built no such
+    /// program. A request certificate's output (`Steps::held_code`): the launcher's file is
+    /// the same bytes at every build, so this, not the file, says what a run executes.
+    pub(crate) fn held_code(&self, path: &str) -> Option<crate::serve::work::HeldCode> {
+        // clone: a count, once an output a certificate's write or check
+        let held = self.programs.pin().get(&program_id(path)).cloned()?;
+        let record = *held.record.lock();
+        Some(match record {
+            Some(key) => crate::serve::work::HeldCode::Is(key.0),
+            None => crate::serve::work::HeldCode::Unnamed,
+        })
+    }
+
     fn socket(&self) -> PathBuf {
         self.dir.join("sock")
     }
@@ -229,8 +242,9 @@ impl Launches {
                     core: Lock::new(
                         "serve.launches.program",
                         // alloc: once per program, its tables
-                        Core { program: Program::new(), writers: Vec::new(), spans: None, record: None },
+                        Core { program: Program::new(), writers: Vec::new(), spans: None },
                     ),
+                    record: Lock::new("serve.launches.program.record", None),
                 });
                 self.programs.pin().insert(id, Arc::clone(&made));
                 made
@@ -241,8 +255,8 @@ impl Launches {
         // of decisions.
         let mut core = held.core.lock();
         // Until this build is the core's, no record is the core's: a failure below leaves
-        // the next build to be made, never replayed.
-        core.record = None;
+        // the next build to be made, never replayed, and no certificate written of it.
+        *held.record.lock() = None;
         let (serial, given) = tables(core.spans)?;
         let _span = tracing::info_span!(target: "blaze", "launch link: the program takes the build").entered();
         let told = match &given {
@@ -255,7 +269,7 @@ impl Launches {
         }
         .map_err(|why| format!("{}: {why}", held.path))?;
         core.spans = Some(serial);
-        core.record = record;
+        *held.record.lock() = record;
         let mut what = Vec::with_capacity(told.len()); // alloc: once a build
         for (conn, frames, said) in told {
             if let Some((_, writer)) = core.writers.iter().find(|it| it.0 == conn)

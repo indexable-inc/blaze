@@ -45,7 +45,11 @@ use blaze_kernel::{
     Seen, Session, Step as KernelStep, StepError, StepId, Subject, WorldError, steps as ids,
 };
 use blaze_query::{QueryKind, db::View};
-use hir_def::{DefWithBodyId, ModuleDefId, ModuleId, nameres::DefMap, signatures::FunctionSignature};
+use hir_def::{
+    DefWithBodyId, ModuleDefId, ModuleId,
+    nameres::DefMap,
+    signatures::{ConstSignature, FunctionSignature, StaticSignature},
+};
 use hir_expand::name::Name;
 
 use super::{Refusal, Step, with_store};
@@ -120,6 +124,12 @@ pub trait BodyWorld: Source {
     /// The value of `fact` as the crate named `krate` sees it now: gone where it names
     /// nothing; [`WorldError::not_now`] where it cannot be hashed now.
     fn fact(&self, krate: &str, fact: FactRef) -> Result<Seen, WorldError>;
+
+    /// `fact`, of a trace of `def`'s steps, as a read every body can share: a fact the item
+    /// store lists relative to the body (lane item-hash names the body's own item by one tag,
+    /// `values::OWN`, whatever the body) with the body's own item named in its place, so its
+    /// value is one whoever asks ([`BodyWorld::fact`] is given no body). Any other fact as it is.
+    fn absolute(&self, def: DefWithBodyId, fact: FactRef) -> FactRef;
 
     /// The schema `step` of `def` is offered under in [`BodyWorld::db`], as [`BodyWorld::run`]
     /// gives it, with nothing run: what [`serve`] files an earlier step a served one read under.
@@ -387,6 +397,10 @@ fn compute<W: BodyWorld + ?Sized + 'static>(
                 )));
             }
             None => {
+                // A trace names the body's own item by a tag every body shares
+                // (`BodyWorld::absolute`): the read names the item itself, or every body of
+                // a crate would read one fact here and each be given another's value.
+                let fact = world.absolute(def, fact);
                 key.clear();
                 let kind = fact_read(fact, &input.krate, &mut key);
                 ctx.hash(Read { kind, key: &key })?;
@@ -478,10 +492,19 @@ pub struct Served {
 
 /// The served answers of one database (`super::Store::served`), all posted at one revision:
 /// a post at another revision drops every answer of the one before, so none outlives it.
+///
+/// With them, what the driver claimed of the database (`claim_serve`, `claim_keeps`), so a
+/// body is served once a revision and kept once a run, however many units reach it.
 #[derive(Default)]
 pub(super) struct Posted {
     revision: Option<View>,
     rows: blaze_hash::HashMap<(DefWithBodyId, Step, SchemaHash), Arc<Served>, Global>,
+    /// The crates a serve claimed at `revision`: cleared with the rows.
+    crates: blaze_hash::HashMap<base_db::Crate, (), Global>,
+    /// Each trace a keep claimed, by its body, step and schema: the trace itself (a counted
+    /// reference), so a run that replaced it is claimed again and nothing else is. Not cleared
+    /// at a revision: a trace is the run's, whatever revision it is read at.
+    kept: blaze_hash::HashMap<(DefWithBodyId, Step, SchemaHash), Arc<Ran>, Global>,
 }
 
 #[cfg(test)]
@@ -519,11 +542,18 @@ impl Posted {
         Some(served.clone())
     }
 
-    pub(super) fn post(&mut self, def: DefWithBodyId, step: Step, schema: SchemaHash, served: Served) {
-        if self.revision != Some(served.revision) && !any_revision() {
+    /// The rows are of `now` from here on: those of another revision are dropped, and the
+    /// crates claimed there with them.
+    fn at(&mut self, now: View) {
+        if self.revision != Some(now) && !any_revision() {
             self.rows.clear();
-            self.revision = Some(served.revision);
+            self.crates.clear();
+            self.revision = Some(now);
         }
+    }
+
+    pub(super) fn post(&mut self, def: DefWithBodyId, step: Step, schema: SchemaHash, served: Served) {
+        self.at(served.revision);
         // alloc: one answer a served step of a body, dropped at the next revision's first post
         self.rows.insert((def, step, schema), Arc::new(served));
     }
@@ -591,6 +621,59 @@ pub fn serve<W: BodyWorld + ?Sized + 'static>(
         // alloc: error path
         None => Err(format!("{key:?}: the database has no item store installed")),
     }
+}
+
+/// Claims the serve of `krate`'s bodies in `db` at its revision now: true for the first claim
+/// there, which serves them; false for every later one, which serves nothing (the bodies are
+/// posted already, or being posted by the claim's holder). The lock is held for the claim
+/// alone, never across a kernel call or a wait (rule 27). None where `db` has no item store
+/// installed (`BLAZE_ITEM_STORE=off`): nothing is served or kept there.
+pub fn claim_serve(db: &Db, krate: base_db::Crate) -> Option<bool> {
+    let (_, now) = db.nonce_and_revision();
+    with_store(db, |store| {
+        let mut posted = store.served.lock();
+        posted.at(now);
+        posted.crates.insert(krate, ()).is_none()
+    })
+}
+
+/// What [`claim_keeps`] handed over: each body's step whose run's trace no keep has claimed,
+/// with the schema it ran under, and how many runs the item store refused to trace (no entry
+/// can be kept of them; said by the driver, never dropped quietly).
+pub struct Claimed {
+    pub steps: Vec<(DefWithBodyId, Step, SchemaHash)>,
+    pub refused: usize,
+}
+
+/// Claims every trace of a served step ([`Step::served`]) in `db` that no keep claimed
+/// before: each run is kept by exactly one caller, however many units' keeps run at once. The
+/// traces are taken under their lock, then the claims made under the posts' lock: never two
+/// at once, and neither across a wait. None where `db` has no item store installed.
+pub fn claim_keeps(db: &Db) -> Option<Claimed> {
+    with_store(db, |store| {
+        // alloc: one claim's snapshot of the database's traces, a counted reference each
+        let traced: Vec<((DefWithBodyId, Step, SchemaHash), Arc<Ran>)> = store
+            .traces
+            .lock()
+            .iter()
+            .filter(|((_, step, _), _)| step.served())
+            .map(|(key, ran)| (*key, Arc::clone(ran)))
+            .collect();
+        let mut posted = store.served.lock();
+        let mut claimed = Claimed { steps: Vec::new(), refused: 0 };
+        for (key, ran) in traced {
+            if posted.kept.get(&key).is_some_and(|it| Arc::ptr_eq(it, &ran)) {
+                continue;
+            }
+            if matches!(*ran, Ran::Refused(_)) {
+                claimed.refused += 1;
+            } else {
+                claimed.steps.push(key);
+            }
+            posted.kept.insert(key, ran);
+        }
+        claimed
+    })
 }
 
 /// What differs, between two pins, of the reads body entries make, as the maintainers'
@@ -731,10 +814,10 @@ pub struct Named {
     pub name: String,
 }
 
-/// The bodies of `items`, the value of `items(file)`, in the order written: a function with a
-/// body at the file's top or in an inline module of it. Not yet: the bodies of `impl` and
-/// `trait` items, `const`s and `static`s; [`bodies`] gives how many of those it passed over,
-/// so a driver says what it did not key.
+/// The bodies of `items`, the value of `items(file)`, in the order written: a function, a
+/// `static` or a named `const` with a body at the file's top or in an inline module of it. Not
+/// yet: the bodies of `impl` and `trait` items; [`bodies`] gives how many of those it passed
+/// over, so a driver says what it did not key.
 pub fn bodies(items: &[u8]) -> Result<(Vec<Named>, usize), String> {
     // alloc: error path
     let table = Table::read(ITEMS, items).map_err(|why| format!("`items`' value: {why:?}"))?;
@@ -756,7 +839,7 @@ fn walk(
     for child in entry.children() {
         let it = entry_at(table, child)?;
         match it.kind {
-            Kind::Fn if it.has_body() => {
+            Kind::Fn | Kind::Static | Kind::Const if it.has_body() && it.name != "_" => {
                 // alloc: one body's name and modules
                 out.push(Named { item: child, kind: it.kind, modules: modules.clone(), name: it.name.to_owned() });
             }
@@ -767,7 +850,7 @@ fn walk(
                 modules.pop();
             }
             Kind::Impl | Kind::Trait => *passed += it.children().len(),
-            Kind::Const | Kind::Static if it.has_body() => *passed += 1,
+            Kind::Const if it.has_body() => *passed += 1,
             _ => {}
         }
     }
@@ -785,8 +868,9 @@ fn entry_at<'a>(table: &Table<'a>, id: ItemId) -> Result<Entry<'a>, String> {
 }
 
 /// The body `named` is in `db`, where `file_module` is the module whose file `named` is of:
-/// the module its inline modules lead to by name, and the one function of its name declared
-/// there. An error names what is not there, or that two are.
+/// the module its inline modules lead to by name, and the one function, `static` or `const`
+/// (as `named.kind` is) of its name declared there. An error names what is not there, or that
+/// two are.
 pub fn def_of(
     db: &Db,
     def_map: &DefMap,
@@ -814,16 +898,31 @@ pub fn def_of(
         // alloc: error path
         .ok_or_else(|| format!("no module {module:?} in its crate's def map"))?;
     let name = Name::new_root(&named.name);
-    let mut found = data.scope(db).declarations().filter_map(|def| match def {
-        ModuleDefId::FunctionId(it) if FunctionSignature::of(db, it).name == name => Some(it),
+    let mut found = data.scope(db).declarations().filter_map(|def| match (named.kind, def) {
+        (Kind::Fn, ModuleDefId::FunctionId(it)) if FunctionSignature::of(db, it).name == name => {
+            Some(DefWithBodyId::FunctionId(it))
+        }
+        (Kind::Static, ModuleDefId::StaticId(it)) if StaticSignature::of(db, it).name == name => {
+            Some(DefWithBodyId::StaticId(it))
+        }
+        (Kind::Const, ModuleDefId::ConstId(it))
+            if ConstSignature::of(db, it).name.as_ref() == Some(&name) =>
+        {
+            Some(DefWithBodyId::ConstId(it))
+        }
         _ => None,
     });
+    let what = match named.kind {
+        Kind::Static => "static",
+        Kind::Const => "const",
+        _ => "function",
+    };
     match (found.next(), found.next()) {
-        (Some(it), None) => Ok(DefWithBodyId::FunctionId(it)),
+        (Some(it), None) => Ok(it),
         // alloc: error path
-        (None, _) => Err(format!("no function `{}` in {module:?}", named.name)),
+        (None, _) => Err(format!("no {what} `{}` in {module:?}", named.name)),
         // alloc: error path
-        (Some(_), Some(_)) => Err(format!("two functions `{}` in {module:?}", named.name)),
+        (Some(_), Some(_)) => Err(format!("two of {what} `{}` in {module:?}", named.name)),
     }
 }
 

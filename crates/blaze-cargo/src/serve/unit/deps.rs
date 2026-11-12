@@ -40,7 +40,10 @@ use hir_ty::{body_store, next_solver::goal_store};
 use std::alloc::Global;
 
 use super::{Job, compile, graph};
-use crate::serve::work::{KeptPut, Put};
+use crate::serve::{
+    front_carry::bodies,
+    work::{KeptPut, Put},
+};
 
 pub(crate) const IMAGES: &str = "BLAZE_DEP_IMAGES";
 pub(crate) const ITEMS: &str = "BLAZE_ITEM_STORE";
@@ -1103,6 +1106,105 @@ pub(crate) fn served(db: &Db, job: &Job, session: &Session) -> Result<Vec<Served
 /// solver are in its closure, so a solver edit (in `src/` or a patch) misses both stores.
 pub(crate) fn front_end() -> Result<ContentId, ApiError> {
     crate::serve::front_end_code().map(|it| it.0).map_err(|why| ApiError::new(why, None))
+}
+
+/// Serves the bodies of unit `unit`'s crate from the store's kernel entries
+/// (`front_carry::bodies::serve`), on the unit's own task before it asks them
+/// ([`compile`]'s bodies phase): an unchanged body's inference and MIR are then answered by
+/// the entry the store keeps, after a restart too, with nothing run. The first unit of a crate
+/// at a revision serves it; the rest skip. No body's step is run: each is looked up. The
+/// `parse` and `items` of a file the store has none of (an edited file) are run, so its
+/// unedited bodies map: their puts, for the unit's `Compiled::puts`, which the loop puts (the
+/// carry's pass at the build's end finds the same entries).
+pub(crate) fn serve_bodies(job: &Job, reader: &super::UnitReader, unit: usize) -> Result<Vec<Put>, ApiError> {
+    let Some(krate) = reader.front.krate(unit) else { return Ok(Vec::new()) };
+    let span = tracing::info_span!(
+        target: "blaze",
+        "body entries served",
+        unit = unit as u64,
+        bodies = tracing::field::Empty,
+        served = tracing::field::Empty,
+        missed = tracing::field::Empty,
+        skipped = tracing::field::Empty,
+        outside = tracing::field::Empty,
+        passed = tracing::field::Empty,
+        unmapped = tracing::field::Empty,
+    );
+    let _span = span.enter();
+    let in_view = |path: &str| job.mounted.in_view(path).map(std::borrow::Cow::into_owned);
+    let (puts, did) = serve_bodies_of(&reader.front, krate, &in_view, &job.input.store)?;
+    record_did(&span, &did);
+    Ok(puts)
+}
+
+/// [`serve_bodies`] of `krate` of `front`, over `store`, the view's paths given by `in_view`.
+pub(crate) fn serve_bodies_of(
+    front: &Arc<Lowered>,
+    krate: Crate,
+    in_view: &impl Fn(&str) -> Option<String>,
+    store: &blaze_cas::Reader,
+) -> Result<(Vec<Put>, bodies::Did), ApiError> {
+    let kernel = bodies::kernel(front_end()?).map_err(body_error)?;
+    let guard = blaze_cas::enter();
+    let reading = blaze_kernel::Reading { reader: store, guard: &guard };
+    let mut overlay = crate::serve::front_carry::Overlay::new(&reading);
+    let did = bodies::serve(&kernel, front, krate, in_view, &mut overlay).map_err(body_error)?;
+    Ok((overlay.into_puts(), did))
+}
+
+/// Keeps, as kernel entries, every body's inference and MIR the database ran that no keep has
+/// yet (`front_carry::bodies::keep`), on unit `unit`'s task once its phases are done
+/// ([`compile`]'s store phase): the puts, for the unit's `Compiled::puts`, which the loop
+/// puts. A worker never writes the store.
+pub(crate) fn keep_bodies(job: &Job, reader: &super::UnitReader, unit: usize) -> Result<Vec<Put>, ApiError> {
+    let span = tracing::info_span!(
+        target: "blaze",
+        "body entries kept",
+        unit = unit as u64,
+        bodies = tracing::field::Empty,
+        kept = tracing::field::Empty,
+        missed = tracing::field::Empty,
+        refused = tracing::field::Empty,
+        outside = tracing::field::Empty,
+        passed = tracing::field::Empty,
+        unmapped = tracing::field::Empty,
+    );
+    let _span = span.enter();
+    let in_view = |path: &str| job.mounted.in_view(path).map(std::borrow::Cow::into_owned);
+    let (puts, did) = keep_bodies_of(&reader.front, &in_view, &job.input.store)?;
+    record_did(&span, &did);
+    Ok(puts)
+}
+
+/// [`keep_bodies`] of `front`, over `store`, the view's paths given by `in_view`.
+pub(crate) fn keep_bodies_of(
+    front: &Arc<Lowered>,
+    in_view: &impl Fn(&str) -> Option<String>,
+    store: &blaze_cas::Reader,
+) -> Result<(Vec<Put>, bodies::Did), ApiError> {
+    let kernel = bodies::kernel(front_end()?).map_err(body_error)?;
+    let guard = blaze_cas::enter();
+    let reading = blaze_kernel::Reading { reader: store, guard: &guard };
+    let mut overlay = crate::serve::front_carry::Overlay::new(&reading);
+    let did = bodies::keep(&kernel, front, in_view, &mut overlay).map_err(body_error)?;
+    Ok((overlay.into_puts(), did))
+}
+
+fn body_error(error: impl std::fmt::Display) -> ApiError {
+    ApiError::new(format!("body entries: {error}"), None) // alloc: an error
+}
+
+fn record_did(span: &tracing::Span, did: &bodies::Did) {
+    let bodies::Did { skipped, no_store, bodies, served, missed, kept, refused, outside, passed, unmapped } = *did;
+    span.record("skipped", skipped || no_store);
+    span.record("bodies", bodies as u64);
+    span.record("served", served as u64);
+    span.record("missed", missed as u64);
+    span.record("kept", kept as u64);
+    span.record("refused", refused as u64);
+    span.record("outside", outside as u64);
+    span.record("passed", passed as u64);
+    span.record("unmapped", unmapped as u64);
 }
 
 /// What makes unit records, by the code identity of each part ([`crate::serve::RecordMakers`]):

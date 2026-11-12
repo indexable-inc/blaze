@@ -26,7 +26,7 @@ answer.
 |---|---|---|
 | base | `base(Shape, tool)`: the request's shape (its config as the plan reads it, its config less the environment, what it says past those; each relocated: the checkout's directory is a marker, `relocated`) and the blaze that serves it. An identity: no root id, no content | the key the lists are under |
 | read-list | the names of what the build read, sorted, each once, no value (`Read`): `Node(path)` a node of the checkout's view (a package root's directory by its Merkle id: every file below and every absent name; or one file: `Cargo.toml`, `Cargo.lock`, `.cargo/config.toml`); `Env(name)` each variable a step asked for, and each variable read unasked (plan variables, `BLAZE_*`) that was set; `Outside(path)` a file outside every view; `Listing(path)` a directory outside by its listing; `Drawn` how the client is drawn, only of a build that said a diagnostic. The note is the layout's word | `list_key(base, slot)`; past the chain's bound the oldest list is no longer searched |
-| answer | `Answer`: the outputs (base, path, the hash of the bytes), the units' record keys in plan order, what a build with nothing to do says (`said`, every text relocated). Content only: equal builds are equal bytes | under the list's bytes and the digest each read had when the build read it (nothing there is a digest) |
+| answer | `Answer`: the outputs (base, path, the hash of the bytes; and under base `LAUNCHER` or `MEMORY` the code the launch host or the daemon's code memory holds for the program at the path, by the identity of its build: what a run executes, which no file says), the units' record keys in plan order, what a build with nothing to do says (`said`, every text relocated). Content only: equal builds are equal bytes | under the list's bytes and the digest each read had when the build read it (nothing there is a digest) |
 | evidence | local, never stored, never a condition (`Evidence`, one a checkout and shape): each output's stamp with the content hashed under it (kept only when seen 2 s past its change time; else hashed at each check), and the reads and digests of the checkout's last build, which is how a miss names what moved | the daemon's memory; lost at a restart, remade by one hash an output |
 
 ## Where it lives
@@ -69,7 +69,8 @@ A request misses only for (`request::Why`):
 3. `Unnamed`: as 2, where this daemon holds no build of the checkout to compare with (a restart,
    then a change): nothing is named and the engine's walk asks its own records;
 4. `Output`: an output is gone, holds other bytes or is being written: placed again from the
-   store, no read moved;
+   store, no read moved; or a holder of code (the launch host's program, the daemon's code
+   memory) holds another build's code of the program, or none (a restart): built again;
 5. `Traced`: the request asks for the build's trace.
 
 Nothing else: not a restart, not another request, not the build's own writes (the nodes are
@@ -247,6 +248,17 @@ by an event on any member), so the test is one load, not R; (b) in `inputs::File
 that values a path and returns the names it rests on, or says it is not vouched, without
 looking; (c) the unvouched rest valued by the pool task of gap 2, never on the loop; (d) the
 per-read spans replaced by one span with a count.
+
+Code held in no file is an output (found 2026-11-12: v=1, v=2, v=1 of a launcher program hit
+and ran v=2's code, since a launcher's file is the same bytes at every build). Each
+`work::CodeHolder` (`Launcher`: the launch host's program, content the unit's record key it was
+last given; `Memory`: a dev executable's code memory, content the key of its file) is asked by
+`Steps::held_code` for every plan output path, at the write (`certify::outputs_of`; a holder of
+code no build is named for writes no certificate) and at the check (`Ask::Content`, read in
+place, never stamped). Layout 3. Test: `request::tests::a_run_after_a_request_executes_the_code_of_its_source`,
+control `the_oracle_catches_the_held_code_left_out_of_the_record` (`Plant::LeavesCodeOut`).
+Not covered: blaze-lazy's runner, once wired, is a third holder; the identity is read at the
+build's end, not at its link.
 
 An output's content is the store key of its bytes (`Placement.key`): `output_key(bytes)` for a
 file hashed whole, `linked_key(root)` for one blaze's linker made (the root of

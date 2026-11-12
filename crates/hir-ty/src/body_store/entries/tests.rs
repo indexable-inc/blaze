@@ -413,6 +413,11 @@ impl BodyWorld for Tree {
         }
     }
 
+    fn absolute(&self, _: DefWithBodyId, fact: FactRef) -> FactRef {
+        // The fake facts name no body relatively.
+        fact
+    }
+
     fn fact(&self, _: &str, fact: FactRef) -> Result<Seen, WorldError> {
         match fact {
             IMPLS => Ok(Seen::Is(impls(self.db()))),

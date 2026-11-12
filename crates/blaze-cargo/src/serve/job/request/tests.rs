@@ -602,3 +602,287 @@ fn a_traced_request_builds() {
         other => panic!("{other:?}"),
     }
 }
+
+// The code a run executes, held in no file (certificate.md; found 2026-11-12 by the
+// measurement's "there and back": a launcher's file is the same bytes at every build, so a
+// certificate of files alone hit on v=1 after v=2 and the run printed v=2's 57).
+
+use super::super::certificate::{LAUNCHER, MEMORY};
+use super::super::certify::{AtPath, outputs_of};
+use crate::serve::work::{CodeHolder, HeldCode};
+
+/// The program's path: its file, and the key of every holder's program.
+const PROGRAM: &str = "/c/target/debug/app";
+
+/// What a run of the program prints for source value `v`: `src/main.rs` prints
+/// `(1..=10).sum() + v`.
+fn printed_for(v: u8) -> u32 {
+    55 + u32::from(v)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CodeOp {
+    /// `src/main.rs` written with this value.
+    Source(u8),
+    Request,
+    /// The daemon restarts: the store stays; the holder's code and the evidence go.
+    Restart,
+    /// The program's file put back by hand to what a build of this value placed there.
+    FileBack(u8),
+}
+
+/// A checkout of one program whose code a run takes from `holder`, not from its file.
+struct Program {
+    holder: CodeHolder,
+    source: u8,
+    file: Option<(ContentId, Stamp)>,
+    /// The identity of the build whose code `holder` holds ([`HeldCode::Is`]).
+    held: Option<ContentId>,
+    clock_ns: u64,
+}
+
+impl Program {
+    fn new(holder: CodeHolder) -> Program {
+        Program { holder, source: 0, file: None, held: None, clock_ns: 10 * GRANULE_NS }
+    }
+
+    /// The launcher: one file for every build of every program.
+    fn launcher() -> ContentId {
+        ContentId::of("test launcher", b"blaze-launcher")
+    }
+
+    /// The dev executable a build of source `v` links: its file, and its memory's.
+    fn image(v: u8) -> ContentId {
+        ContentId::of("test image", &[v])
+    }
+
+    /// The identity of the code a build of source `v` gives the holder: the unit's record key
+    /// (the launch host), the file its memory holds (a code memory).
+    fn code(&self, v: u8) -> ContentId {
+        match self.holder {
+            CodeHolder::Launcher => ContentId::of("test record", &[v]),
+            CodeHolder::Memory => Program::image(v),
+        }
+    }
+
+    /// What a build of source `v` places at the program's path.
+    fn file_of(&self, v: u8) -> ContentId {
+        match self.holder {
+            CodeHolder::Launcher => Program::launcher(),
+            CodeHolder::Memory => Program::image(v),
+        }
+    }
+
+    fn stamp(&self) -> Stamp {
+        Stamp { len: 32, changed_ns: self.clock_ns / GRANULE_NS * GRANULE_NS }
+    }
+
+    fn node(&self) -> Digest {
+        Digest::Is(ContentId::of("test file", &[self.source]))
+    }
+
+    fn look(&self, ask: &Ask) -> Result<Told, String> {
+        Ok(match ask {
+            Ask::Read { read: Read::Node(path), .. } if path == "src/main.rs" => Told::Read(self.node()),
+            Ask::Read { read, .. } => return Err(format!("asked for {read:?}, which no build reads")),
+            // The driver's look at a holder ([`certify`]'s `code_told`): what it holds, in place.
+            Ask::Content { base, .. } if certificate::holder_of(*base).is_some() => {
+                Told::Content(self.held.filter(|_| certificate::holder_of(*base) == Some(self.holder)))
+            }
+            Ask::Stamp { base, .. } if certificate::holder_of(*base).is_some() => {
+                return Err("a holder was stamped".to_owned());
+            }
+            Ask::Stamp { .. } => Told::Stamp { stamp: self.file.map(|it| it.1), looked_ns: self.clock_ns },
+            Ask::Content { .. } => Told::Content(self.file.map(|it| it.0)),
+        })
+    }
+
+    /// A build: the launcher's file is placed by the program's first build in this daemon and
+    /// left as it is by every later one; a dev executable's file is its memory's. The holder
+    /// takes the build's code. What it hands the machine, its outputs named by the driver's
+    /// own [`outputs_of`].
+    fn build(&mut self) -> Result<Built, String> {
+        self.clock_ns += 1;
+        let first = self.held.is_none();
+        if first || self.holder == CodeHolder::Memory {
+            self.file = Some((self.file_of(self.source), self.stamp()));
+        }
+        self.held = Some(self.code(self.source));
+        let (file, held, holder, asked_ns) = (self.file, self.held, self.holder, self.clock_ns);
+        let outputs = outputs_of(
+            [PROGRAM],
+            |_| match file {
+                Some((content, stamp)) => AtPath::Placed { content, stamp, asked_ns },
+                None => AtPath::Nothing,
+            },
+            |of, _| held.filter(|_| of == holder).map(HeldCode::Is),
+        )?;
+        Ok(Built {
+            nodes: vec!["src/main.rs".to_owned()],
+            valued: Vec::new(),
+            outputs,
+            units: Vec::new(),
+            said: b"Finished".to_vec(),
+            untraced: Vec::new(),
+        })
+    }
+
+    /// A run of the program: the code its holder holds, whatever file is at its path.
+    fn run(&self) -> Result<u32, String> {
+        let held = self.held.ok_or("the daemon holds no code of the program: the run stops")?;
+        (0..=u8::MAX)
+            .find(|v| self.code(*v) == held)
+            .map(printed_for)
+            .ok_or_else(|| "the holder holds code of no source".to_owned())
+    }
+}
+
+/// One request of `program` driven to its end, every ask answered in the seed's order.
+fn code_request(program: &mut Program, daemon: &mut Daemon, sim: &mut Sim) -> Result<Seen, String> {
+    let mut machine = Request::new(the_base(), false, Vec::new());
+    let mut missed = None;
+    for _ in 0..64 {
+        match machine.step(&daemon.shelf, &mut daemon.evidence).map_err(|why| why.to_string())? {
+            Next::Asks(mut asks) => {
+                sim.rng().shuffle(&mut asks);
+                for ask in &asks {
+                    machine.told(ask, program.look(ask)?).map_err(|why| why.to_string())?;
+                }
+            }
+            Next::Waiting { on, left } => return Err(format!("{on}: waits for {left} with everything told")),
+            Next::Hit(_) => return Ok(Seen::Hit),
+            Next::Miss(miss) => {
+                machine.built(program.build()?).map_err(|why| why.to_string())?;
+                missed = Some(miss.why);
+            }
+            Next::Written { .. } => return Ok(Seen::Miss(missed.ok_or("written with no miss before it")?)),
+            Next::Unwritten(why) => return Err(format!("a build that answered left no record: {why}")),
+        }
+    }
+    Err("the request did not end in 64 steps".to_owned())
+}
+
+/// Runs `ops` on a program held by `holder`, with `plant`; after every request the program
+/// is run, and the oracle is that it prints its source's value. What each request came to.
+fn run_code(holder: CodeHolder, ops: &[CodeOp], seed: u64, plant: Plant) -> Result<Vec<Seen>, String> {
+    PLANT.set(plant);
+    let ran = run_code_planted(holder, ops, seed);
+    PLANT.set(Plant::None);
+    ran
+}
+
+fn run_code_planted(holder: CodeHolder, ops: &[CodeOp], seed: u64) -> Result<Vec<Seen>, String> {
+    let mut sim = Sim::new(seed, Faults::default());
+    let mut program = Program::new(holder);
+    let mut daemon = Daemon { shelf: Shelf::new(), evidence: Evidence::default() };
+    let mut seen = Vec::new();
+    for (n, op) in ops.iter().enumerate() {
+        // Every stamp is steady by the next op: a stamp vouches where evidence holds it.
+        program.clock_ns += 3 * GRANULE_NS;
+        match *op {
+            CodeOp::Source(v) => program.source = v,
+            CodeOp::Restart => {
+                program.held = None;
+                daemon.evidence = Evidence::default();
+            }
+            CodeOp::FileBack(v) => program.file = Some((program.file_of(v), program.stamp())),
+            CodeOp::Request => {
+                seen.push(code_request(&mut program, &mut daemon, &mut sim).map_err(|why| format!("step {n}: {why}"))?);
+                let printed = program.run().map_err(|why| format!("step {n}: {why}"))?;
+                let want = printed_for(program.source);
+                if printed != want {
+                    return Err(format!(
+                        "step {n}: the run printed {printed}, and its source prints {want}: it ran another build's code"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(seen)
+}
+
+/// There and back, and on: v=1, v=2, v=1 (the measurement's case), v=1 again, v=2, the
+/// file put back by hand to v=1's then v=1, and a restart.
+const THERE_AND_BACK: [CodeOp; 14] = [
+    CodeOp::Source(1),
+    CodeOp::Request,
+    CodeOp::Source(2),
+    CodeOp::Request,
+    CodeOp::Source(1),
+    CodeOp::Request,
+    CodeOp::Request,
+    CodeOp::Source(2),
+    CodeOp::Request,
+    CodeOp::FileBack(1),
+    CodeOp::Source(1),
+    CodeOp::Request,
+    CodeOp::Restart,
+    CodeOp::Request,
+];
+
+fn code_miss(base: u8, how: How) -> Seen {
+    Seen::Miss(Why::Output { base, path: PROGRAM.to_owned(), how })
+}
+
+/// The invariant: a run after a request executes the code of the request's source, for a
+/// launcher's program, whose file is the same bytes at every build, and for a dev
+/// executable, whose run maps the daemon's code memory over its file; under every order of
+/// the driver's answers. A request whose holder holds another build's code, or none, misses
+/// by name and builds; one whose holder holds its build's code hits.
+#[test]
+fn a_run_after_a_request_executes_the_code_of_its_source() {
+    let moved = Seen::Miss(Why::Moved(vec![node("src/main.rs")]));
+    let launcher = [
+        Seen::Miss(Why::Unfiled),
+        moved.clone(),
+        code_miss(LAUNCHER, How::Changed),
+        Seen::Hit,
+        code_miss(LAUNCHER, How::Changed),
+        code_miss(LAUNCHER, How::Changed),
+        code_miss(LAUNCHER, How::Gone),
+    ];
+    let memory = [
+        Seen::Miss(Why::Unfiled),
+        moved,
+        code_miss(MEMORY, How::Changed),
+        Seen::Hit,
+        // The memory's file is placed at the path too: its stamp vouches for v=1's bytes.
+        code_miss(0, How::Changed),
+        code_miss(MEMORY, How::Changed),
+        code_miss(MEMORY, How::Gone),
+    ];
+    for seed in 0..16 {
+        let seen = run_code(CodeHolder::Launcher, &THERE_AND_BACK, seed, Plant::None).unwrap();
+        assert_eq!(seen, launcher, "seed {seed}");
+        let seen = run_code(CodeHolder::Memory, &THERE_AND_BACK, seed, Plant::None).unwrap();
+        assert_eq!(seen, memory, "seed {seed}");
+    }
+}
+
+/// The control (rule 23): with the holder's entry left out of the record, the launcher's
+/// v=1 after v=2 hits and runs v=2's code (step 5, the measurement's 57), and the dev
+/// executable whose file was put back by hand hits and runs its memory's v=2 (step 11).
+#[test]
+fn the_oracle_catches_the_held_code_left_out_of_the_record() {
+    for seed in 0..16 {
+        let why = run_code(CodeHolder::Launcher, &THERE_AND_BACK, seed, Plant::LeavesCodeOut)
+            .expect_err("the oracle missed the launcher's code left out");
+        assert!(why.starts_with("step 5: the run printed 57, and its source prints 56"), "{why}");
+        let why = run_code(CodeHolder::Memory, &THERE_AND_BACK, seed, Plant::LeavesCodeOut)
+            .expect_err("the oracle missed the memory's code left out");
+        assert!(why.starts_with("step 11: the run printed 57, and its source prints 56"), "{why}");
+    }
+}
+
+/// A holder that holds code of no build blaze can name leaves no certificate, by name: never
+/// a record with the entry left out.
+#[test]
+fn code_of_no_named_build_leaves_no_certificate() {
+    let why = outputs_of(
+        [PROGRAM],
+        |_| AtPath::Placed { content: Program::launcher(), stamp: Stamp { len: 1, changed_ns: 0 }, asked_ns: 0 },
+        |holder, _| (holder == CodeHolder::Launcher).then_some(HeldCode::Unnamed),
+    )
+    .expect_err("a certificate was written of code no build is named for");
+    assert!(why.contains(PROGRAM) && why.contains("no build blaze can name"), "{why}");
+}

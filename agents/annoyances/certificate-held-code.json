@@ -1,0 +1,14 @@
+{
+ "id": "certificate-held-code",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane cert-code, int-1112",
+ "where": "crates/blaze-cargo/src/serve/job/certify.rs Jobs::certify_write, serve/unit/codegen.rs launched",
+ "what": "A launcher program built at v=1, v=2, then v=1 again was answered by the request certificate with no build and ran v=2's code (printed 57, not 56; measurement runner, int-good 93fb38ff5c, m.py there-and-back). The certificate's outputs were the plan's placed files, and a launcher's file and sidecar are the same bytes at every build: what runs is the launch host's program, which no output named.",
+ "cost": "a wrong program run after a certified no-op; found only by a measurement that checks the program's output",
+ "cause": "the certificate took 'outputs' to mean 'files placed', while the code a run executes lives in places that are no file (the launch host's program, the daemon's code memory)",
+ "class": "state a run executes or reads that is not a placed file, left out of a key that answers for the run (rule 21)",
+ "prevention": "work::CodeHolder: every place code is held in is an output kind; Steps::held_code names what it holds by build identity; certify::outputs_of asks every holder for every plan output path and refuses a certificate where a holder's code has no name. A new holder (blaze-lazy's runner, once wired) is one more CodeHolder variant, and the match in Steps::held_code makes it a compile error to forget it",
+ "workaround": "none",
+ "fix": "certificate layout 3: outputs under base LAUNCHER (the unit record key the host's program was last given) and MEMORY (the code memory's file key), checked in place at each request. Test: request::tests::a_run_after_a_request_executes_the_code_of_its_source; control the_oracle_catches_the_held_code_left_out_of_the_record (Plant::LeavesCodeOut). Not covered: the no-op lane (job/noop.rs) keeps one answer per shape, so build at v=1, run at v=2, build at v=1 may be answered there while the host holds v=2's code: unchecked",
+ "state": "fixed in the certificate; the no-op lane not checked"
+}

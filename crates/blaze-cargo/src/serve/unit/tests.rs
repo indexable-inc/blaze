@@ -3283,14 +3283,21 @@ fn ask_bodies_steps(lowered: &blaze_lower::Lowered) -> usize {
     })
 }
 
+/// Every path of a test's front end is in its view, under its own name less the leading `/`:
+/// the same in both builds of a test, as a checkout's paths are.
+fn all_in_view(path: &str) -> Option<String> {
+    Some(path.trim_start_matches('/').to_owned()) // alloc: a test's path
+}
+
 /// What a build left for the store is kept though its crate has bodies alike but for their
-/// names, and the front end of the next build, of an edited tree, reads each unedited body's
-/// inference and MIR from it (persisted-state-round-trips: nothing restores empty).
+/// names, and the front end of the next build, of an edited tree, is served each unedited
+/// body's inference and MIR from the kernel entries the first kept (`deps::keep_bodies`,
+/// `deps::serve_bodies`; persisted-state-round-trips: nothing restores empty).
 ///
 /// Until 2026-11-10 `FIRST` and `SECOND` filed two shapes of their MIR under one base key in
-/// one flush, the daemon's store refused the second ("keeping the shape of the MIR of
-/// StaticId(..): two images were made under .."), and `deps::store` stopped with it: nothing
-/// the build left was kept and its front end was dropped, after every build of ripgrep.
+/// one flush, the daemon's store refused the second, and `deps::store` stopped with it. Since
+/// ce65e6d7bd the body store reads only answers the kernel served: the entries are the one
+/// route by which a body's steps outlive the build that ran them.
 #[test]
 fn what_a_build_with_bodies_alike_but_for_their_names_left_is_kept_and_read_by_the_next() {
     let mut sim = blaze_core::sim::Sim::new(1, blaze_core::sim::Faults::default());
@@ -3299,30 +3306,82 @@ fn what_a_build_with_bodies_alike_but_for_their_names_left_is_kept_and_read_by_t
     let macros = super::deps::tests::no_macros();
     let (infer, mir) = (0, 1);
 
-    // The first build runs every step and offers it.
-    let first = alike_front(ALIKE);
+    // The first build runs every step, and keeps each as a kernel entry.
+    let first = std::sync::Arc::new(alike_front(ALIKE));
     let mut session = super::deps::session(&first, &reader, &macros, &[]).unwrap();
     assert_eq!(ask_bodies_steps(&first), 5);
     let ran = session.item_steps().expect("an item store is installed unless it is turned off");
     assert_eq!((ran[infer].hits, ran[infer].ran, ran[infer].refused), (0, 5, 0), "{ran:?}");
-    assert_eq!((ran[mir].hits, ran[mir].ran, ran[mir].refused), (0, 5, 0), "{ran:?}");
+    // The MIR of `FIRST`, `SECOND` and `three` reads `layout_of_ty_query` (a `u32`'s), which no
+    // fact covers yet: those three runs are refused a trace and keep no entry. Layout as a
+    // kernel step is end-state piece 5 (docs/v2/plan/design/end-state.md); until then most
+    // real bodies' MIR is not kept across builds.
+    assert_eq!((ran[mir].hits, ran[mir].ran, ran[mir].refused), (0, 5, 3), "{ran:?}");
+    let (kept, did) = super::deps::keep_bodies_of(&first, &all_in_view, &reader).unwrap();
+    assert_eq!((did.kept, did.refused), (7, 3), "five bodies' inference, two bodies' MIR: {did:?}");
+    assert_eq!((did.outside, did.unmapped), (0, 0), "{did:?}");
     let (puts, mut flushes) = super::deps::store(&first, None, &mut session, &[], "/w")
         .unwrap_or_else(|error| panic!("what the build left was not kept: {}", error.what));
     assert_eq!(flushes.take_refusal(), None, "every record the build offered is kept");
     let items = flushes.items.as_ref().expect("the item store was flushed");
     assert_eq!((items.failed, items.slots_full), (0, 0), "{items:?}");
-    assert!(items.written >= 6, "three identities' inference and MIR at least: {items:?}");
-    assert!(!puts.is_empty());
+    // Served steps offer nothing to the flush: their kernel entries, `kept`, are how they
+    // outlive the build.
+    assert!(puts.is_empty(), "the item store flushed a served step");
+    for it in kept {
+        store.put(it.key, it.kind, &it.bytes).unwrap();
+    }
     for it in puts {
         store.put(it.put.key, it.put.kind, &it.put.bytes).unwrap();
     }
     drop((session, first));
 
-    // The next build's front end, of a tree with `three` edited, runs `three`'s steps alone.
-    let next = alike_front(&ALIKE.replace("{ 3 }", "{ 4 }"));
+    // The next build's front end, of a tree with `three` edited, is served the four unedited
+    // bodies' steps and runs `three`'s alone.
+    let next = std::sync::Arc::new(alike_front(&ALIKE.replace("{ 3 }", "{ 4 }")));
     let session = super::deps::session(&next, &reader, &macros, &[]).unwrap();
+    let krate = next.krate(0).unwrap();
+    let (_, did) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &reader).unwrap();
+    assert_eq!((did.skipped, did.no_store), (false, false), "{did:?}");
+    // Served: four unedited bodies' inference and `one`'s and `two`'s MIR. Missed: `three`'s
+    // two steps and the statics' MIR, which kept no entry.
+    assert_eq!((did.bodies, did.served, did.missed), (5, 6, 4), "{did:?}");
     assert_eq!(ask_bodies_steps(&next), 5);
     let read = session.item_steps().unwrap();
     assert_eq!((read[infer].hits, read[infer].ran), (4, 1), "inference: {read:?}");
-    assert_eq!((read[mir].hits, read[mir].ran), (4, 1), "MIR: {read:?}");
+    assert_eq!((read[mir].hits, read[mir].ran), (2, 3), "MIR: {read:?}");
+}
+
+/// A crate is served once per revision however many of its units reach it, and a step's run
+/// is kept by one keep only: the second serve of one crate at one revision skips, and a
+/// second keep finds nothing new (the claims under the item store's `served` lock).
+///
+/// The control: with no claim (a fresh front end, so a fresh item store) the same serve is
+/// not skipped.
+#[test]
+fn a_crate_is_served_and_a_run_kept_once_per_build() {
+    let mut sim = blaze_core::sim::Sim::new(2, blaze_core::sim::Faults::default());
+    let mut store = super::deps::tests::opened(&mut sim);
+    let reader = store.reader();
+    let macros = super::deps::tests::no_macros();
+
+    let first = std::sync::Arc::new(alike_front(ALIKE));
+    let session = super::deps::session(&first, &reader, &macros, &[]).unwrap();
+    assert_eq!(ask_bodies_steps(&first), 5);
+    let (kept, did) = super::deps::keep_bodies_of(&first, &all_in_view, &reader).unwrap();
+    assert_eq!((did.kept, did.refused), (7, 3), "the MIR that reads a layout keeps none: {did:?}");
+    let (again, did) = super::deps::keep_bodies_of(&first, &all_in_view, &reader).unwrap();
+    assert_eq!((did.kept, again.len()), (0, 0), "a run is kept once: {did:?}");
+    for it in kept {
+        store.put(it.key, it.kind, &it.bytes).unwrap();
+    }
+    drop((session, first));
+
+    let next = std::sync::Arc::new(alike_front(ALIKE));
+    let _session = super::deps::session(&next, &reader, &macros, &[]).unwrap();
+    let krate = next.krate(0).unwrap();
+    let (_, did) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &reader).unwrap();
+    assert_eq!((did.skipped, did.served), (false, 7), "the control, the first serve: {did:?}");
+    let (_, did) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &reader).unwrap();
+    assert_eq!((did.skipped, did.served), (true, 0), "a crate is served once a revision: {did:?}");
 }

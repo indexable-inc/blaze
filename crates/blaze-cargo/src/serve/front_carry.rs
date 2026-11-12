@@ -755,6 +755,419 @@ pub(crate) fn decode_sessions(bytes: &[u8]) -> Result<Vec<(String, Saved)>, Stri
     Ok(out)
 }
 
+/// Body entries served by the daemon (end-state.md, "The front end as kernel steps", order
+/// row 3): a body's inference and built MIR as `hir_ty::body_store::entries`' kernel entries,
+/// over the world of one unit's database ([`Bodies`]). A unit's task serves its crate's
+/// unchanged bodies from the store's entries before it asks them ([`serve`]) and keeps the
+/// entries of the steps its database ran after ([`keep`]); both on the unit's worker, each with
+/// a session of its own, never the carry's, and the keep's puts handed to the loop.
+///
+/// One set of steps with the carry: `parse` and `items` are registered under the carry's own
+/// code ([`super::code`]) and a file's `FILE` read is its blaze-vfs id
+/// (`ContentId::of(blaze_vfs::FILE_DOMAIN, ..)`, as the carry's [`super::Tree`] gives it), so a
+/// file's `items` the carry kept is the entry a body's part read finds, and the other way.
+pub(crate) mod bodies {
+    use std::{alloc::Global, collections::BTreeMap, sync::Arc};
+
+    use base_db::{Crate, Db, FileId};
+    use blaze_format::SchemaHash;
+    use blaze_front_items::{
+        Reading,
+        entry::ItemId,
+        steps::{FileKey, Items, Parse, Source, reads},
+    };
+    use blaze_ids::{ContentId, Hasher};
+    use blaze_kernel::{
+        CodeId, Got, Kernel, KernelError, Pin, Put, Read, Seen, Session, World, WorldError,
+    };
+    use blaze_lower::Lowered;
+    use blaze_store_check::Setting;
+    use hir_def::{DefWithBodyId, HasModule as _, ModuleId, nameres::crate_def_map};
+    use hir_ty::{
+        body_store::{
+            BodyFacts as _, Step,
+            entries::{self, BodyKey, BodyWorld, InferEntry, MirEntry},
+        },
+        next_solver::goal_store::FactRef,
+    };
+
+    use super::{CrateRoot, EXISTS_DOMAIN, FrontError, code};
+
+    const PIN_DOMAIN: &str = "blaze v2 body entries pin 1";
+
+    /// The steps body entries are served and kept by: the carry's `parse` and `items`, and the
+    /// three body steps of the front end `front_end` (`deps::front_end`, the item store's).
+    pub(crate) fn kernel(front_end: ContentId) -> Result<Kernel<Bodies>, KernelError> {
+        let mut kernel = Kernel::new();
+        kernel.register_ask::<Parse<Bodies>>(code(0))?;
+        kernel.register_ask::<Items<Bodies>>(code(1))?;
+        entries::register(&mut kernel, CodeId(front_end))?;
+        Ok(kernel)
+    }
+
+    /// A crate's file of the view: its file in the database, its blaze-vfs id, the module it
+    /// is the file of, and the crate's name and reading.
+    struct File {
+        id: FileId,
+        content: ContentId,
+        module: ModuleId,
+        krate_id: Crate,
+        krate: Arc<str>,
+        reading: Reading,
+    }
+
+    /// The world of one unit's task: its database (the reader's front end, at the revision the
+    /// task reads), the files of the crates asked for that are in the view, by their path in
+    /// it, and each body of those files by its key and by the database's id.
+    pub(crate) struct Bodies {
+        front: Arc<Lowered>,
+        files: BTreeMap<String, File>,
+        by_key: blaze_hash::HashMap<(String, ItemId), DefWithBodyId, Global>,
+        by_def: blaze_hash::HashMap<DefWithBodyId, BodyKey, Global>,
+        /// A body of each crate by its name: what a fact read seen from the crate is valued by
+        /// (`BodyFacts::value` takes a body of the crate that reads it).
+        seers: BTreeMap<Arc<str>, DefWithBodyId>,
+        /// What the map passed over, each counted for the span (rule 3: said, not dropped):
+        /// files outside the view, bodies of `impl`/`trait` items, bodies the syntax names and
+        /// the database does not have under that name.
+        pub(crate) outside: usize,
+        pub(crate) passed: usize,
+        pub(crate) unmapped: usize,
+    }
+
+    impl Bodies {
+        /// The world of `crates` of `front`'s database: every file of each crate (its root's
+        /// and each `mod` file's) whose path `in_view` gives a path in the view for. A crate
+        /// whose root is outside the view has none.
+        pub(crate) fn of(
+            front: Arc<Lowered>,
+            crates: &[Crate],
+            in_view: &impl Fn(&str) -> Option<String>,
+        ) -> Bodies {
+            let mut world = Bodies {
+                front,
+                files: BTreeMap::new(),
+                by_key: blaze_hash::HashMap::new_in(Global),
+                by_def: blaze_hash::HashMap::new_in(Global),
+                seers: BTreeMap::new(),
+                outside: 0,
+                passed: 0,
+                unmapped: 0,
+            };
+            // clone: a counted reference, so the world is filled while the database is read
+            let front = Arc::clone(&world.front);
+            let db = front.db();
+            let paths = front.paths();
+            for &krate in crates {
+                let data = krate.data(db);
+                let Some(root) = paths.get(&data.root_file_id).and_then(|it| in_view(it.as_str())) else {
+                    world.outside += 1;
+                    continue;
+                };
+                let extensions = krate.extensions(db);
+                // clone: once a crate a task
+                let cfg = krate.cfg_options(db).clone();
+                // alloc: the crate's stable name, once a crate a task
+                let name: Arc<str> =
+                    Arc::from(CrateRoot::new(&root, root.clone(), data.edition, cfg, extensions).name);
+                let reading = Reading { edition: data.edition, extensions };
+                let def_map = crate_def_map(db, krate);
+                for (module, module_data) in def_map.modules(db) {
+                    let Some(file) = module_data.origin.file_id() else { continue };
+                    let id = file.file_id(db);
+                    let Some(path) = paths.get(&id).and_then(|it| in_view(it.as_str())) else {
+                        world.outside += 1;
+                        continue;
+                    };
+                    let text = db.file_text(id).text(db);
+                    let content = ContentId::of(blaze_vfs::FILE_DOMAIN, text.as_str().as_bytes());
+                    // clone: a counted reference, once a file
+                    world.files.insert(path, File { id, content, module, krate_id: krate, krate: Arc::clone(&name), reading });
+                }
+            }
+            world
+        }
+
+        /// Each file's `items` got from the kernel (run where the store has none, kept into
+        /// `store`), and each body of it mapped.
+        fn map_got<P: Put + ?Sized>(
+            &mut self,
+            kernel: &Kernel<Bodies>,
+            session: &mut Session,
+            store: &mut P,
+        ) -> Result<(), FrontError> {
+            // alloc: once a task, each file's items' bytes until the world is filled from them
+            let mut found: Vec<(String, Vec<u8>)> = Vec::new();
+            for (path, file) in &self.files {
+                // clone: the step's input
+                let input = FileKey { name: path.clone(), reading: file.reading };
+                let items = kernel.get_in::<Items<Bodies>, P>(session, store, self, &input, &Setting::OFF)?.value().to_vec();
+                found.push((input.name, items));
+            }
+            self.fill(found)
+        }
+
+        /// Maps the bodies of each file's `items` (`entries::bodies`) to the database's
+        /// (`entries::def_of`, from the file's module).
+        fn fill(&mut self, found: Vec<(String, Vec<u8>)>) -> Result<(), FrontError> {
+            for (path, items) in found {
+                // alloc: an error
+                let (named, passed) = entries::bodies(&items).map_err(|why| FrontError::Tree(format!("`{path}`: {why}")))?;
+                self.passed += passed;
+                let file = &self.files[&path];
+                let (module, reading, krate) = (file.module, file.reading, file.krate_id);
+                // clone: a counted reference
+                let krate_name = Arc::clone(&file.krate);
+                let db = self.front.db();
+                let def_map = crate_def_map(db, krate);
+                for it in named {
+                    let Ok(def) = entries::def_of(db, def_map, module, &it) else {
+                        self.unmapped += 1;
+                        continue;
+                    };
+                    // clone: one body's key, in both maps
+                    let key = BodyKey { file: FileKey { name: path.clone(), reading }, item: it.item, krate: krate_name.to_string() };
+                    self.by_key.insert((path.clone(), it.item), def);
+                    self.seers.entry(Arc::clone(&krate_name)).or_insert(def);
+                    self.by_def.insert(def, key);
+                }
+            }
+            Ok(())
+        }
+
+        /// Every body mapped, by its key, in key order (rule 25).
+        fn keys(&self) -> Vec<BodyKey> {
+            // alloc: once a task, the mapped bodies' keys
+            let mut keys: Vec<BodyKey> = self.by_def.values().cloned().collect();
+            keys.sort_unstable_by(|a, b| (&a.file.name, a.item.0).cmp(&(&b.file.name, b.item.0)));
+            keys
+        }
+    }
+
+    impl World for Bodies {
+        fn hash(&self, read: Read<'_>) -> Result<Seen, WorldError> {
+            if let Some(hashed) = entries::hash(self, read) {
+                return hashed;
+            }
+            let name = || core::str::from_utf8(read.key).map_err(|_| WorldError::new(read, "a path that is not UTF-8"));
+            match read.kind {
+                reads::FILE => Ok(self.files.get(name()?).map_or(Seen::Gone, |it| Seen::Is(it.content))),
+                reads::EXISTS => Ok(match self.files.contains_key(name()?) {
+                    true => Seen::Is(ContentId::of(EXISTS_DOMAIN, b"there")),
+                    false => Seen::Gone,
+                }),
+                _ => Err(WorldError::new(read, "a kind of read the body entries' world does not answer (a crate's modules are the carry's)")),
+            }
+        }
+
+        fn pin(&self) -> Pin {
+            let mut hasher = Hasher::new(PIN_DOMAIN);
+            for (path, file) in &self.files {
+                hasher.part(path.as_bytes()).part(&file.content.0);
+            }
+            Pin(hasher.finish())
+        }
+    }
+
+    impl Source for Bodies {
+        fn file(&self, name: &str) -> Result<Option<&str>, WorldError> {
+            let db = self.front.db();
+            Ok(self.files.get(name).map(|it| db.file_text(it.id).text(db).as_str()))
+        }
+
+        fn cfg(&self, krate: &str, _: &str) -> Result<bool, WorldError> {
+            let read = Read { kind: reads::CFG, key: krate.as_bytes() };
+            Err(WorldError::new(read, "a cfg read, which no step of a body asks (a crate's modules are the carry's)"))
+        }
+    }
+
+    impl BodyWorld for Bodies {
+        fn db(&self) -> &Db {
+            self.front.db()
+        }
+
+        fn body(&self, key: &BodyKey) -> Result<DefWithBodyId, String> {
+            // clone: a map key
+            match self.by_key.get(&(key.file.name.clone(), key.item)) {
+                Some(def) => Ok(*def),
+                // alloc: error path
+                None => Err(format!("no body of {key:?} in this task's syntax")),
+            }
+        }
+
+        fn run(&self, def: DefWithBodyId, step: Step) -> Result<SchemaHash, String> {
+            let db = self.front.db();
+            match step {
+                Step::Infer => Ok(entries::run_infer(db, def)),
+                Step::Mir => entries::run_mir(db, def),
+                // alloc: error path
+                Step::Borrowck | Step::Const => Err(format!("{step:?} has no entry the daemon serves yet")),
+            }
+        }
+
+        fn absolute(&self, def: DefWithBodyId, fact: FactRef) -> FactRef {
+            match fact.subject == blaze_item_hash::values::OWN {
+                true => FactRef { subject: blaze_item_hash::values::body_key(self.front.db(), def), ..fact },
+                false => fact,
+            }
+        }
+
+        fn fact(&self, krate: &str, fact: FactRef) -> Result<Seen, WorldError> {
+            // `seer` says only which crate sees the fact: no fact here names a body
+            // relatively (`absolute`), so its value is the same from any body of the crate.
+            let Some(&seer) = self.seers.get(krate) else {
+                // alloc: error path
+                let mut key = Vec::new();
+                let kind = entries::fact_read(fact, krate, &mut key);
+                return Err(WorldError::new(Read { kind, key: &key }, "a fact seen from a crate this task mapped no body of"));
+            };
+            if fact.subject == blaze_item_hash::values::OWN {
+                // alloc: error path
+                let mut key = Vec::new();
+                let kind = entries::fact_read(fact, krate, &mut key);
+                return Err(WorldError::new(Read { kind, key: &key }, "a fact about a body's own item that names no body: an entry reads it by the item (`BodyWorld::absolute`)"));
+            }
+            let value = blaze_item_hash::Bodies.value(self.front.db(), seer, fact);
+            Ok(value.map_or(Seen::Gone, Seen::Is))
+        }
+
+        fn schema(&self, def: DefWithBodyId, step: Step) -> Result<SchemaHash, String> {
+            match step {
+                Step::Infer => Ok(entries::infer_schema()),
+                Step::Mir => entries::mir_schema(self.front.db(), def),
+                // alloc: error path
+                Step::Borrowck | Step::Const => Err(format!("{step:?} has no entry the daemon serves yet")),
+            }
+        }
+    }
+
+    /// What a serve or a keep did: its span's fields.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct Did {
+        /// The task's claim was not the first: nothing done.
+        pub(crate) skipped: bool,
+        /// The database has no item store (`BLAZE_ITEM_STORE=off`): nothing done.
+        pub(crate) no_store: bool,
+        pub(crate) bodies: usize,
+        pub(crate) served: usize,
+        pub(crate) missed: usize,
+        pub(crate) kept: usize,
+        /// Runs the item store refused to trace: no entry is kept of them.
+        pub(crate) refused: usize,
+        pub(crate) outside: usize,
+        pub(crate) passed: usize,
+        pub(crate) unmapped: usize,
+    }
+
+    impl Did {
+        fn of(world: &Bodies) -> Did {
+            Did { outside: world.outside, passed: world.passed, unmapped: world.unmapped, bodies: world.by_def.len(), ..Did::default() }
+        }
+    }
+
+    /// Serves `krate`'s bodies in `front`'s database from `store`: each body's inference and MIR
+    /// entry the store has whose reads hash the same now is posted to the item store
+    /// (`entries::serve`), and the step's query answers from it at this revision. Nothing is
+    /// run and nothing written: a lookup alone. The first serve of the crate at the revision
+    /// does it; any other is `skipped`.
+    pub(crate) fn serve<P: Put + ?Sized>(
+        kernel: &Kernel<Bodies>,
+        front: &Arc<Lowered>,
+        krate: Crate,
+        in_view: &impl Fn(&str) -> Option<String>,
+        store: &mut P,
+    ) -> Result<Did, FrontError> {
+        match entries::claim_serve(front.db(), krate) {
+            Some(true) => {}
+            Some(false) => return Ok(Did { skipped: true, ..Did::default() }),
+            None => return Ok(Did { no_store: true, ..Did::default() }),
+        }
+        // clone: a counted reference, the world's
+        let mut world = Bodies::of(Arc::clone(front), &[krate], in_view);
+        let mut session = Session::new(&world);
+        // The files' `parse` and `items` are got, so run where the store has none (an edited
+        // file's, at its new content) and kept into `store`: the unedited bodies of an edited
+        // file map, and each is served where its own entry verifies. No body's step is run
+        // here: those are looked up only.
+        world.map_got(kernel, &mut session, store)?;
+        let store: &P = store;
+        let mut did = Did::of(&world);
+        for key in world.keys() {
+            let infer = kernel.find_in::<InferEntry<Bodies>, P>(&mut session, store, &world, &key)?;
+            did.add(infer.map(|it| entries::serve(&world, &key, Step::Infer, &Got::Hit(it))).transpose().map_err(FrontError::Tree)?);
+            let mir = kernel.find_in::<MirEntry<Bodies>, P>(&mut session, store, &world, &key)?;
+            did.add(mir.map(|it| entries::serve(&world, &key, Step::Mir, &Got::Hit(it))).transpose().map_err(FrontError::Tree)?);
+        }
+        Ok(did)
+    }
+
+    impl Did {
+        fn add(&mut self, served: Option<()>) {
+            match served {
+                Some(()) => self.served += 1,
+                None => self.missed += 1,
+            }
+        }
+    }
+
+    /// Keeps the entry of every inference and MIR `front`'s database ran that no keep has
+    /// claimed (`entries::claim_keeps`), into `store`: each got from the kernel, whose run of
+    /// the step is the database's memoized query (it ran, so the memo answers), with what the
+    /// item store traced of it. A body outside the view, or that the syntax does not map, keeps
+    /// no entry and is counted.
+    pub(crate) fn keep<P: Put + ?Sized>(
+        kernel: &Kernel<Bodies>,
+        front: &Arc<Lowered>,
+        in_view: &impl Fn(&str) -> Option<String>,
+        store: &mut P,
+    ) -> Result<Did, FrontError> {
+        let db = front.db();
+        let Some(claimed) = entries::claim_keeps(db) else {
+            return Ok(Did { no_store: true, ..Did::default() });
+        };
+        if claimed.steps.is_empty() {
+            return Ok(Did { refused: claimed.refused, ..Did::default() });
+        }
+        // alloc: once a keep, the crates of the bodies it keeps, in order (rule 25)
+        let mut crates: Vec<Crate> = claimed.steps.iter().map(|(def, _, _)| def.krate(db)).collect();
+        crates.sort_unstable();
+        crates.dedup();
+        // clone: a counted reference, the world's
+        let mut world = Bodies::of(Arc::clone(front), &crates, in_view);
+        let mut session = Session::new(&world);
+        world.map_got(kernel, &mut session, store)?;
+        let mut did = Did { refused: claimed.refused, ..Did::of(&world) };
+        // alloc: once a keep, what it keeps in key order (rule 25)
+        let mut todo: Vec<(&BodyKey, Step)> = Vec::new();
+        for (def, step, _) in &claimed.steps {
+            match world.by_def.get(def) {
+                Some(key) => todo.push((key, *step)),
+                None => did.unmapped += 1,
+            }
+        }
+        todo.sort_unstable_by(|a, b| (&a.0.file.name, a.0.item.0, a.1).cmp(&(&b.0.file.name, b.0.item.0, b.1)));
+        for (key, step) in todo {
+            match step {
+                Step::Infer => {
+                    kernel.get_in::<InferEntry<Bodies>, P>(&mut session, store, &world, key, &Setting::OFF)?;
+                }
+                Step::Mir => {
+                    kernel.get_in::<MirEntry<Bodies>, P>(&mut session, store, &world, key, &Setting::OFF)?;
+                }
+                // Not served yet (the driver cannot run the borrow check: owed), and a
+                // constant's value is the item store's record: claimed, counted, not kept.
+                Step::Borrowck | Step::Const => {
+                    did.missed += 1;
+                    continue;
+                }
+            }
+            did.kept += 1;
+        }
+        Ok(did)
+    }
+
+}
+
 /// What a simulated daemon counts of the carry (rule 64): the world's reads, apart by whether
 /// the carry's task ([`in_task`]) made them, and each pass's [`Built`] as the loop took it.
 #[cfg(test)]

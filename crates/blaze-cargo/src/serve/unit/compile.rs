@@ -2412,6 +2412,9 @@ pub(crate) struct Phases {
     misses: Vec<blaze_kernel::Miss>,
     /// What [`Phase::Codegen`] made of a `Doctest` unit's examples and runner ([`doctest`]).
     doctests: Option<doctest::Generated>,
+    /// The `parse` and `items` entries [`Phase::Bodies`] ran to serve its crate's bodies
+    /// ([`super::deps::serve_bodies`]), for [`Phase::Store`] to hand the loop.
+    body_puts: Vec<Put>,
 }
 
 /// What a unit does, as [`Phase::Names`] finds it.
@@ -2838,6 +2841,10 @@ fn bodies(job: &Job, reader: &UnitReader, unit: usize, slot: &Lock<Phases>) -> R
     let db = reader.db();
     let (flags, options) = options(job, db, unit, u)?;
     let files = blaze_diagnostics::Files::new(reader.paths(), job.mounted.root());
+    // Its unchanged bodies' inference and MIR answered from the store's kernel entries before
+    // the check asks them ([`super::deps::serve_bodies`]); the first unit of a crate serves it.
+    let served = super::deps::serve_bodies(job, reader, unit)?;
+    lock(slot).body_puts.extend(served);
     let blaze_diagnostics::CrateCheck { diags, items_broken } = checking.check(db, files, &options);
     if hir_def::deps::eligible(db, krate) {
         let paths = blaze_diagnostics::cache::Paths::of(db, krate);
@@ -3242,6 +3249,10 @@ fn store(
         quoted,
     } = *making;
     puts.extend(library_puts(job));
+    // The bodies' inference and MIR this build ran, as kernel entries for the loop to put
+    // ([`super::deps::keep_bodies`]); each trace is kept by one unit only.
+    puts.extend(std::mem::take(&mut phases.body_puts));
+    puts.extend(super::deps::keep_bodies(job, reader, unit)?);
     // Under the narrow key when it holds no diagnostics; with diagnostics, all of them the
     // check's, under the narrow key and what they quote ([`quoted_key`]), their files' names
     // put in the slot a lookup reads; else under the whole one.

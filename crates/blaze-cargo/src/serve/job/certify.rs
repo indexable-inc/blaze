@@ -24,7 +24,7 @@ use super::certificate::{self, Evidence, Read, Stamp};
 use super::request::{self, Ask, Next, Told, View};
 use super::said;
 use super::*;
-use crate::serve::work::{Looked, Seen};
+use crate::serve::work::{CodeHolder, HeldCode, Looked, Seen};
 
 /// The most (checkout, shape) pairs evidence is held of; past it the oldest goes. Evidence is
 /// never a condition: without it a check hashes each output once.
@@ -370,6 +370,82 @@ fn content_of(bytes: &[u8], wanted: Option<ContentId>) -> ContentId {
     if wanted == Some(linked) { linked } else { whole }
 }
 
+/// What is at an output's path as the jobs placed it ([`outputs_of`]).
+pub(super) enum AtPath {
+    /// The build placed no file there (debug info beside an image it did not write).
+    Nothing,
+    /// A placement in flight: what the file holds is not known yet.
+    Placing,
+    /// The file placed, by the key of its bytes, with the stamp its placement's look took and
+    /// when that look was asked for.
+    Placed { content: ContentId, stamp: Stamp, asked_ns: u64 },
+}
+
+/// The outputs a build of a plan whose outputs are at `paths` left, as its certificate names
+/// them: the file placed at each path (`file`), and for each [`CodeHolder`] that holds a
+/// program at a path (`code`), what it holds, under the holder's base
+/// ([`certificate::code_base`]). That code is what a run of the program executes, and no file
+/// says which build it is of (a launcher's file is the same bytes at every build; a dev
+/// executable runs its memory over whatever file is there), so a certificate without it
+/// would answer for a build whose code is not the one held (rule 21). A holder that holds
+/// code of no build blaze can name leaves no certificate, by name: never an entry left out.
+/// A sans-IO core: the driver and the tests hand in what is placed and held.
+pub(super) fn outputs_of<'p>(
+    paths: impl IntoIterator<Item = &'p str>,
+    file: impl Fn(&str) -> AtPath,
+    code: impl Fn(CodeHolder, &str) -> Option<HeldCode>,
+) -> Result<Vec<(certificate::Output, Option<(Stamp, u64)>)>, String> {
+    let mut outputs = Vec::new(); // alloc: once a build, an entry an output
+    for path in paths {
+        match file(path) {
+            AtPath::Placed { content, stamp, asked_ns } => outputs.push((
+                // alloc: an output's own path, once a build
+                certificate::Output { base: ABSOLUTE, path: path.to_owned(), content },
+                Some((stamp, asked_ns)),
+            )),
+            AtPath::Placing => {
+                return Err(format!("no request certificate is written: the output {path} is still being placed"));
+            }
+            AtPath::Nothing => {}
+        }
+        if request::planted(request::Plant::LeavesCodeOut) {
+            continue;
+        }
+        for holder in CodeHolder::ALL {
+            match code(holder, path) {
+                Some(HeldCode::Is(content)) => outputs.push((
+                    // alloc: as above
+                    certificate::Output { base: certificate::code_base(holder), path: path.to_owned(), content },
+                    None,
+                )),
+                Some(HeldCode::Unnamed) => {
+                    return Err(format!(
+                        "no request certificate is written: the program at {path} runs the code {holder} holds, which is of no build blaze can name (its last build failed, or its unit has no record key)"
+                    ));
+                }
+                None => {}
+            }
+        }
+    }
+    Ok(outputs)
+}
+
+/// What the driver tells the machine of `ask` where it is a look at a [`CodeHolder`]: the
+/// identity of the build whose code `steps` holds there, read in place; `None` for a look at
+/// a file. A holder is never stamped: a stamp asked of one finds nothing, and the request
+/// misses and builds.
+fn code_told<S: Steps>(steps: &S, ask: &Ask) -> Option<Told> {
+    let (Ask::Stamp { base, path } | Ask::Content { base, path }) = ask else { return None };
+    let holder = certificate::holder_of(*base)?;
+    Some(match ask {
+        Ask::Content { .. } => Told::Content(match steps.held_code(holder, path) {
+            Some(HeldCode::Is(content)) => Some(content),
+            Some(HeldCode::Unnamed) | None => None,
+        }),
+        _ => Told::Stamp { stamp: None, looked_ns: wall_ns() },
+    })
+}
+
 /// Why a request is not checked.
 enum Unchecked {
     /// It has no certificate to be checked against, and is built: why.
@@ -611,7 +687,9 @@ impl<S: Steps> Jobs<S> {
     /// asked of the driver.
     fn certify_ask(&mut self, w: &mut World<'_, S>, id: JobId, at: usize, asks: Vec<Ask>) {
         for (n, ask) in asks.iter().enumerate() {
+            let held = code_told(&**w.steps, ask);
             let told = match ask {
+                _ if held.is_some() => held,
                 Ask::Read { read, view } => {
                     let checking = &self.certify.checking[at];
                     // A check reads its request's pinned view alone.
@@ -959,24 +1037,25 @@ impl<S: Steps> Jobs<S> {
         // machine keeps the stamp only where it is steady (`RACY_NS` past the change): an
         // output this build wrote is hashed once by a later check, one it found placed is a
         // stat from the first check on.
-        let mut outputs = Vec::new(); // alloc: once a build, an entry an output
+        // And what each place that is no file holds for a program of the plan: the code a run
+        // of it executes ([`outputs_of`]).
         let Some(plan) = self.roots.plans[root as usize].iter().find(|it| it.shape == shape) else {
             return Err("no request certificate is written: the checkout keeps no plan of the request's shape to name its outputs by".to_owned());
         };
-        for path in plan.units.plans.iter().flat_map(|it| it.outputs.iter()) {
-            let placed = self.paths.ids.get(path.as_str()).and_then(|id| self.paths.placed[*id as usize].as_ref());
-            match placed {
-                Some(Placement { key, meta: Some(meta), asked_ns, .. }) => outputs.push((
-                    // clone: an output's own path, once a build
-                    certificate::Output { base: ABSOLUTE, path: path.clone(), content: key.0 },
-                    Some((Stamp { len: meta.len, changed_ns: meta.modified_ns }, *asked_ns)),
-                )),
-                // A placement in flight: what the file holds is not known yet.
-                Some(_) => return Err(format!("no request certificate is written: the output {path} is still being placed")),
-                // A planned path the build writes no file at (debug info beside an image).
-                None => {}
-            }
-        }
+        let paths = &self.paths;
+        let outputs = outputs_of(
+            plan.units.plans.iter().flat_map(|it| it.outputs.iter()).map(String::as_str),
+            |path| match paths.ids.get(path).and_then(|id| paths.placed[*id as usize].as_ref()) {
+                Some(Placement { key, meta: Some(meta), asked_ns, .. }) => AtPath::Placed {
+                    content: key.0,
+                    stamp: Stamp { len: meta.len, changed_ns: meta.modified_ns },
+                    asked_ns: *asked_ns,
+                },
+                Some(_) => AtPath::Placing,
+                None => AtPath::Nothing,
+            },
+            |holder, path| w.steps.held_code(holder, path),
+        )?;
         let said = blaze_protocol::cbor::to_vec(&walked.said)
             .map_err(|error| format!("no request certificate is written: what the build said does not encode: {error}"))?;
         let tool = tool_of(&mut self.certify.tool).map_err(|why| format!("no request certificate is written: {why}"))?;
