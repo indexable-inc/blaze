@@ -207,6 +207,7 @@ impl Step {
             Step::Wait(ms) => format!("wait {ms} ms"),
             Step::Do(action) => action.word().to_owned(),
             Step::Project(name) => format!("project {name}"),
+            Step::Home(name) => format!("home {name}"),
         }
     }
 }
