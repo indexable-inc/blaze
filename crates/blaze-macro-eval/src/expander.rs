@@ -227,6 +227,14 @@ thread_local! {
     pub static FRESH_IS_NOT_TRIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+thread_local! {
+    /// A planted bug, for a test's control: a library loaded once the store has a verdict of
+    /// its crate is another than the one loaded before the store had seen it, as until
+    /// 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static VERDICT_LEARNED_IS_ANOTHER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn planted_unwritable_is_unshown() -> bool {
     UNWRITABLE_IS_UNSHOWN.get()
 }
@@ -237,8 +245,9 @@ impl Library {
     /// toolchain, the store saying of its state what it said of this one's. Such a load gives
     /// its crate the expanders it has: every expansion of either gives the same, so the one
     /// the front end holds stays (with its sessions, which start again each revision) and
-    /// nothing is written (`ProcMacros::give`). A verdict that moved (a crate first seen in
-    /// the build before) is another library: its expansions report their reads otherwise.
+    /// nothing is written (`ProcMacros::give`). A verdict the store learned since (a crate
+    /// first seen in the build before) leaves it the same library; one verdict replaced by
+    /// another (settles, then stateful) is another library.
     fn same(self: &Arc<Library>, other: &Arc<Library>) -> bool {
         Arc::ptr_eq(self, other) || self.differs(other).is_none()
     }
@@ -256,7 +265,18 @@ impl Library {
             Some("the crate's code")
         } else if self.runs != other.runs {
             Some("the module its code was built into")
-        } else if self.seen.verdict() != other.seen.verdict() {
+        } else if self.seen.verdict() != other.seen.verdict()
+            && (VERDICT_LEARNED_IS_ANOTHER.get()
+                || !(self.seen.verdict() == Verdict::Unseen || other.seen.verdict() == Verdict::Unseen))
+        {
+            // Two verdicts the store gave, not one learned: a crate the store had not seen
+            // when one of the two loaded is the same library once the store has seen it. Its
+            // calls are judged one by one whatever the verdict (each is kept only when it
+            // gives what the fresh state gives), so the verdict arriving changes no
+            // expansion. Taken as another library, every macro crate's expanders were given
+            // again in the build after the one that first ran it: a hello-world's second
+            // `blaze run` set 7 crates' macros, ran 86 expansions again and took 3.1 s where
+            // the third took 0.26 s; reth's first build after a cold one set 47.
             Some("what the store says of the state its expansions leave")
         } else {
             None

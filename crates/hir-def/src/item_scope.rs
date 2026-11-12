@@ -650,10 +650,39 @@ impl<D, I> Clone for Column<D, I> {
     }
 }
 
+/// The invariant: two columns are equal when they map the same names to the same items, in
+/// any order, as the `IndexMap` a column replaced was and as [`Keyed`] is. A column lists its
+/// names in the order they were added, which is the order imports happened to resolve in: a
+/// crate collected again (its proc macros given again, its dependencies' def maps ready this
+/// time) adds the same names in another order, and means the same. Compared in order, such a
+/// scope was a changed input: set again, every reader of the module verified again. A
+/// hello-world's second `blaze run` set 15 scopes of serde_derive, zerovec_derive,
+/// thiserror_impl and displaydoc so (each the same entries in another order), and reth's
+/// first build after a cold one 88 (2026-11-12). The order itself is still what resolution
+/// happened to do; a scope that is equal is not published again, so its listing stays.
 impl<D, I> PartialEq for Column<D, I> {
     fn eq(&self, other: &Self) -> bool {
-        self.entries == other.entries
+        if self.entries == other.entries {
+            return true;
+        }
+        if self.entries.len() != other.entries.len() || ORDER_IS_COMPARED.get() {
+            return false;
+        }
+        // A name is in a column once: sorted by name, the two are the same entries or not.
+        // alloc: only for columns of one length that differ in order or in an entry
+        let mut mine: Vec<&Entry> = self.entries.iter().collect();
+        let mut theirs: Vec<&Entry> = other.entries.iter().collect(); // alloc: as above
+        mine.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        theirs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        mine == theirs
     }
+}
+
+thread_local! {
+    /// A planted bug, for a test's control: two columns of the same entries in another order
+    /// are not equal, as until 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static ORDER_IS_COMPARED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl<D, I> Eq for Column<D, I> {}
@@ -2848,14 +2877,21 @@ mod tests {
         scope
     }
 
-    /// Equal as the maps were, but for the namespaces' order, which is what they list.
+    /// Equal as the maps were: by what each name means, in any order.
     #[test]
     fn scopes_are_equal_by_their_columns() {
         let all = names();
         let (a, b, c, d) = (all[0], all[1], all[2], all[3]);
         assert_eq!(scope_of(&[a, b], &[c, d]), scope_of(&[a, b], &[c, d]));
         assert_eq!(scope_of(&[a, b], &[c, d]), scope_of(&[a, b], &[d, c]));
-        assert_ne!(scope_of(&[a, b], &[]), scope_of(&[b, a], &[]));
+        assert_eq!(scope_of(&[a, b], &[]), scope_of(&[b, a], &[]));
+        assert_ne!(scope_of(&[a, b], &[]), scope_of(&[a, c], &[]));
+        // The control: with the order compared, as until 2026-11-12, the same names in
+        // another order are a change.
+        ORDER_IS_COMPARED.set(true);
+        let in_order = scope_of(&[a, b], &[]) == scope_of(&[b, a], &[]);
+        ORDER_IS_COMPARED.set(false);
+        assert!(!in_order, "planted: the order of names is a difference");
         assert_ne!(scope_of(&[a, b], &[c]), scope_of(&[a, b], &[d]));
         let many: Vec<_> = all[..30].to_vec();
         let mut reversed = all[10..30].to_vec();
