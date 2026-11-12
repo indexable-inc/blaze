@@ -1068,6 +1068,10 @@ pub struct Plane<M = NoMemo> {
     /// task to start now; 0 when none was held back, or only granted tasks held it back
     /// ([`Plane::short`]).
     short: u64,
+    /// What the best task held back for memory in the last dispatch is short of at the
+    /// ledger's next turn, whoever holds it: this daemon besides its grants, or another
+    /// daemon ([`Plane::wants`]).
+    wants: u64,
     /// What the machine's ledger let this daemon grant at its last turn
     /// ([`PlaneInput::Allowance`]); `u64::MAX` until one is told.
     allowance: u64,
@@ -1179,6 +1183,7 @@ impl<M: Memo> Plane<M> {
             purge: false,
             cap: None,
             short: 0,
+            wants: 0,
             allowance: u64::MAX,
             room: u64::MAX,
             leased: 0,
@@ -1300,6 +1305,15 @@ impl<M: Memo> Plane<M> {
     /// a front end), which waiting alone never would.
     pub fn short(&self) -> u64 {
         self.short
+    }
+
+    /// The bytes the best task held back for memory in the last dispatch is short of at the
+    /// ledger's next turn: what this daemon wants of the machine. Where [`Plane::short`] is
+    /// what this daemon's own kept memory could give it, this is all of it, another daemon's
+    /// holdings included: what the ledger records for the idle daemons to yield to
+    /// (`crate::ledger::Ledger::yielded`). 0 when no task was held back for memory.
+    pub fn wants(&self) -> u64 {
+        self.wants
     }
 
     /// What this daemon may hold in grants as the machine's ledger last said
@@ -2609,6 +2623,7 @@ impl<M: Memo> Plane<M> {
 
     fn dispatch(&mut self, at: u64, out: &mut Vec<PlaneOutput>) {
         self.short = 0;
+        self.wants = 0;
         self.held_back = false;
         self.room_short = false;
         for pool in [Pool::Io, Pool::Work] {
@@ -2901,6 +2916,9 @@ impl<M: Memo> Plane<M> {
             let memory = self.tasks[row_of(self.rows[unfit as usize].task)].memory;
             let at_turn = self.budget_at_turn().expect("a budget");
             let free_at_turn = at_turn.saturating_sub(self.charged());
+            // What it is short of whoever holds it: what the daemon says it wants of the
+            // machine ([`Plane::wants`], `crate::ledger::Record::wants`).
+            self.wants = memory.saturating_sub(free_at_turn);
             let held_besides = self.held.saturating_sub(self.granted);
             let by_grants = at_turn.saturating_sub(self.granted);
             // Nor is a task that asks the whole ceiling (one never measured, which runs

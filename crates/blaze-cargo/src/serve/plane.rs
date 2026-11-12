@@ -825,6 +825,13 @@ pub struct Plane<W: Work, P: Predict> {
     /// them right after a purge: what a give-back is measured by ([`Plane::reading`]).
     readings: u64,
     purged_readings: u64,
+    /// The give-back rule asked a purge ([`Plane::ask_purge`]) and no reading marked purged
+    /// came since: a purge under way that a task's end made stale is asked again for it.
+    purge_wanted: bool,
+    /// What this daemon could give back now and keep its floor, as its give-back last said
+    /// ([`Plane::set_gives`]): what the machine's ledger records for the other daemons
+    /// (`blaze_graph::ledger::Record::gives`). 0 while it has work.
+    gives: u64,
     /// The thread tasks posted and not yet taken whose kind is codegen's
     /// (`admission::tag_of`: a library's, a unit's or a program's codegen, a reach): each may
     /// walk a program over codegen's kept walks ([`Plane::walks_in_flight`]).
@@ -1004,6 +1011,8 @@ impl<W: Work, P: Predict> Plane<W, P> {
             purge_due: false,
             readings: 0,
             purged_readings: 0,
+            purge_wanted: false,
+            gives: 0,
             walking: 0,
             purging: None,
             folds: Folds::new(),
@@ -1796,11 +1805,19 @@ impl<W: Work, P: Predict> Plane<W, P> {
                 panic!("admission waits on a memory purge that cannot finish: {why}")
             });
             if done >= purging.ticket {
-                if purging.freed {
+                let needed = self.graph.held_back() || self.purge_wanted;
+                if purging.freed && needed {
                     // A task ended or gave way after the ask: what it freed, a worker that
                     // already gave back keeps, so a reading now would call kept bytes gone.
                     // Asked again; bounded, since each round needs another task to end.
                     self.purging = Some(Purging::asked());
+                } else if purging.freed {
+                    // Nothing waits for the purge any more (no work is held back for memory,
+                    // the give-back rule asked none): it is not chased. A build that made
+                    // nothing purged 45 times, once a batch of its tasks that ended, for a
+                    // wait that was over (Mac, hello-world, 2026-11-12). The reading is
+                    // taken as any other, not marked purged.
+                    self.purging = None;
                 } else {
                     self.purging = None;
                     self.measure(at, true);
@@ -1856,6 +1873,9 @@ impl<W: Work, P: Predict> Plane<W, P> {
         self.step(input).unwrap_or_else(|error| panic!("the plane refused the footprint: {error}"));
         self.readings += 1;
         self.purged_readings += u64::from(purged);
+        if purged {
+            self.purge_wanted = false;
+        }
     }
 
     /// The last footprint reading, as the give-back rule reads it
@@ -1895,11 +1915,29 @@ impl<W: Work, P: Predict> Plane<W, P> {
         }
     }
 
+    /// What this daemon wants of the machine: what its best task held back for memory is
+    /// short of (`blaze_graph::Plane::wants`), for the machine's ledger.
+    pub fn wants(&self) -> u64 {
+        self.graph.wants()
+    }
+
+    /// What this daemon could give back and keep its floor, as its give-back last said.
+    pub fn gives(&self) -> u64 {
+        self.gives
+    }
+
+    /// The give-back says what this daemon could give back now and keep its floor; 0 while
+    /// it has work.
+    pub fn set_gives(&mut self, bytes: u64) {
+        self.gives = bytes;
+    }
+
     /// The give-back rule asks a purge (`blaze_graph::giveback::Rung::Allocator`): done by
     /// the purger's thread from the next [`Plane::poll`], as one the plane asks is, and
     /// followed by a reading marked purged.
     pub fn ask_purge(&mut self) {
         self.purge_due = true;
+        self.purge_wanted = true;
     }
 
     /// What happened since the last call, in order, swapped into `into`, which is empty: the

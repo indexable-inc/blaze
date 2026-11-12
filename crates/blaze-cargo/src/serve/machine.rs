@@ -157,6 +157,9 @@ impl Machine {
             granted: 0,
             // None until its first turn: it grants nothing before one.
             lease: 0,
+            // Nor does it want or give anything before one.
+            wants: 0,
+            gives: 0,
             at_ns: wall_ns(),
             version: Label::head(
                 version.as_bytes(),
@@ -308,6 +311,9 @@ impl Machine {
         let mut ledger = read(&self.file, &self.path, &mut bytes)?;
         let seen = Seen::of(&ledger, &self.path)?;
         let turn = ledger.turn(self.me, wall_ns(), &seen, &mut Turning { plane, at })?;
+        // What this daemon is to hold at most for the others' wants: its give-back reads it
+        // (`serve::job::giving`), and gives back to it in its own order.
+        blaze_graph::admission::set_yield_to(turn.yield_to);
         says_of(&mut self.says, self.me, &ledger, &turn.allowance);
         write(&self.file, &self.path, &ledger, &mut bytes)?;
         drop(lock);
@@ -371,6 +377,14 @@ impl<W: Work, P: Predict> Admits for Turning<'_, W, P> {
 
     fn lease(&self) -> u64 {
         self.plane.lease()
+    }
+
+    fn wants(&self) -> u64 {
+        self.plane.wants()
+    }
+
+    fn gives(&self) -> u64 {
+        self.plane.gives()
     }
 }
 

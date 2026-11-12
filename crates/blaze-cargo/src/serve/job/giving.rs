@@ -29,6 +29,15 @@
 //! build asks ([`give_in_slices`]). While a give is out nothing more is planned, and the
 //! planner measures it by a reading after its return (`Planner::done`).
 //!
+//! Sharing the machine. The limit the driver gives back to is the less of the daemon's own
+//! and what the machine's ledger last told it to hold for the other daemons' wants
+//! (`blaze_graph::ledger::Ledger::yielded`, `admission::yield_to`), while it has no build
+//! under way. While it has no job at all it says, every [`GIVES_EVERY`], what it could give
+//! back and keep its floor (`Plane::set_gives`), which the ledger records for the others. An
+//! idle daemon keeps its floor (the front end of the checkout built last) for [`COLD_AFTER`]
+//! of idleness; past that, told to yield, the floor goes too: the daemon stays up, small,
+//! and its next build lowers anew. No daemon exits for being idle.
+//!
 //! Every give is a `memory give-back` span and event (what, whose, how much, why, what it
 //! costs to make again), which `blaze explain memory` reads. A front end let go keeps the
 //! span and the log line it had before this (`kept front ends let go for memory`, "is let go,
@@ -68,6 +77,15 @@ const PLAN_EVERY: Duration = Duration::from_millis(250);
 /// (`Writer::short`): whether one comes of it is the release's own rule
 /// (`blaze_graph::admission::Squeeze::short`), so the ask's source does not fall at once.
 const RUNNING_EVERY: Duration = Duration::from_secs(1);
+
+/// How often, at most, a daemon with no job says what it could give back
+/// (`Plane::set_gives`): a listing weighs every kept front end's values.
+const GIVES_EVERY: Duration = Duration::from_secs(5);
+
+/// How long a daemon has had no job before its floor may go for another daemon's want: 30
+/// minutes. Under it the front end of the checkout built last is kept whatever the others
+/// want (the edit loop's next build is seconds); past it the daemon is not in an edit loop.
+const COLD_AFTER: Duration = Duration::from_secs(30 * 60);
 
 /// The limit's line: the planner is told the limit less this part of it (a sixteenth, as the
 /// kernel's `memory.high` is set at 15/16 of `memory.max`), so the give-backs begin before
@@ -164,6 +182,9 @@ pub(super) struct Giving<S: Steps> {
     /// Since when a build has been under way, as the loop's turns saw it; restarted when its
     /// tasks are stopped for memory: the work a stop loses.
     building_since: Option<Duration>,
+    /// Since when the daemon has had no job, and when it last said what it could give.
+    idle_since: Option<Duration>,
+    gives_at: Option<Duration>,
 }
 
 impl<S: Steps> Giving<S> {
@@ -180,6 +201,8 @@ impl<S: Steps> Giving<S> {
             pressed: false,
             out: Vec::new(), // alloc: none until values are given
             building_since: None,
+            idle_since: None,
+            gives_at: None,
         }
     }
 
@@ -288,14 +311,20 @@ impl<S: Steps> Jobs<S> {
     /// What the driver decides on this turn: the limit the daemon is held to, the plane's last
     /// footprint reading, and `ask`. Under the daemon's simulation a test says them
     /// ([`sim::TOLD`]): the process's own footprint is no part of a simulated daemon.
-    fn memory(&self, w: &World<'_, S>, ask: u64) -> Memory {
+    fn memory(&self, w: &World<'_, S>, ask: u64, building: bool) -> Memory {
         #[cfg(test)]
         if let Some(memory) = sim::memory() {
             return memory;
         }
         let reading = w.plane.reading();
+        let limit = blaze_graph::admission::limit();
         Memory {
-            limit: blaze_graph::admission::limit(),
+            // With no build under way, the less of its own limit and what the machine's
+            // ledger told it to hold for the other daemons' wants.
+            limit: match building {
+                true => limit,
+                false => limit.min(blaze_graph::admission::yield_to()),
+            },
             footprint: reading.footprint,
             kept: reading.kept,
             readings: reading.readings,
@@ -317,7 +346,32 @@ impl<S: Steps> Jobs<S> {
             (false, Some(_)) => self.giving.building_since = None,
             _ => {}
         }
-        let memory = self.memory(w, ask);
+        let memory = self.memory(w, ask, building);
+        // A daemon with no job at all: since when, whether its floor is still kept, and what
+        // it could give back, said for the machine's ledger every `GIVES_EVERY`.
+        let idle = !building && self.order.is_empty();
+        match (idle, self.giving.idle_since) {
+            (true, None) => self.giving.idle_since = Some(w.now),
+            (false, Some(_)) => self.giving.idle_since = None,
+            _ => {}
+        }
+        let cold = self.giving.idle_since.is_some_and(|since| w.now.saturating_sub(since) >= COLD_AFTER);
+        if !idle {
+            if self.giving.gives_at.take().is_some() {
+                w.plane.set_gives(0);
+            }
+        } else if self.giving.gives_at.is_none_or(|at| w.now >= at + GIVES_EVERY) {
+            self.giving.gives_at = Some(w.now);
+            let mut sources = std::mem::take(&mut self.giving.sources);
+            sources.clear();
+            self.give_sources(w, memory.kept, false, cold, &mut sources);
+            let gives = sources
+                .iter()
+                .filter(|it| !(it.rung == Rung::FrontEnd && it.floor))
+                .fold(0u64, |sum, it| sum.saturating_add(it.gives));
+            w.plane.set_gives(gives);
+            self.giving.sources = sources;
+        }
         #[cfg(test)]
         if sim::PLANT_NO_PLAN.get() {
             // The planted bug, and the rule before this one: the driver gives by itself, with
@@ -367,7 +421,7 @@ impl<S: Steps> Jobs<S> {
         .entered();
         let mut sources = std::mem::take(&mut self.giving.sources);
         sources.clear();
-        self.give_sources(w, memory.kept, building, &mut sources);
+        self.give_sources(w, memory.kept, building, cold, &mut sources);
         let outcome = self.giving.planner.step(&now, &sources, &mut gives);
         match outcome {
             Outcome::Gave { rung } => {
@@ -389,7 +443,10 @@ impl<S: Steps> Jobs<S> {
             Outcome::FloorOver { over, limit, footprint, owner, kept } => {
                 span.record("outcome", "the floor does not fit");
                 self.giving.idle_until = Some(w.now + PLAN_EVERY);
-                if !std::mem::replace(&mut self.giving.floor_said, true) {
+                // Said only of the daemon's own limit: one that keeps its floor against
+                // another daemon's want is within its limit, and says nothing.
+                let yielding = memory.limit < blaze_graph::admission::limit();
+                if !yielding && !std::mem::replace(&mut self.giving.floor_said, true) {
                     let checkout = self.checkout_of(owner);
                     let line = giveback::floor_line(project(checkout), over, limit, footprint, kept);
                     tracing::warn!(
@@ -428,6 +485,7 @@ impl<S: Steps> Jobs<S> {
         w: &World<'_, S>,
         allocator_kept: u64,
         building: bool,
+        cold: bool,
         sources: &mut Vec<Source>,
     ) {
         let one = |rung, gives, grain| Source { rung, owner: 0, gives, grain, remake_ns: 0, floor: false };
@@ -449,7 +507,8 @@ impl<S: Steps> Jobs<S> {
         }
         // The floor is what the edit loop needs next: the front end of the checkout built
         // last, unless a build is under way, whose own front end (out with it) is that.
-        let floor = self.giving.last_built.filter(|_| !building);
+        // Nor is there a floor in a daemon idle past `COLD_AFTER`: it is in no edit loop.
+        let floor = self.giving.last_built.filter(|_| !building && !cold);
         for (at, front) in self.roots.fronts.iter_mut().enumerate() {
             let Some(front) = front else { continue };
             let owner = at as u32;
@@ -814,7 +873,7 @@ impl<S: Steps> Jobs<S> {
                 self.roots.lost[root as usize] = Some(line);
             }
         }
-        let now = self.memory(w, 0).now(w.now);
+        let now = self.memory(w, 0, self.building()).now(w.now);
         self.giving.planner.done(&now);
         self.lower_waiting(w, root);
     }

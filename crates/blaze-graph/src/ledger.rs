@@ -45,9 +45,23 @@
 //! | 48  | when it was written (the writer's wall clock; no decision reads it)  |
 //! | 56  | the version's hash                                                   |
 //! | 64  | the home's hash                                                      |
-//! | 72  | the version's first 24 bytes                                         |
+//! | 72  | the version's first 16 bytes                                         |
+//! | 88  | what it wants: the bytes its plane holds work back for               |
 //! | 96  | its lease: what it may grant past `max(held, granted)` with no turn  |
-//! | 104 | the home's last 24 bytes                                             |
+//! | 104 | what it gives: the bytes it could give back and keep its floor       |
+//! | 112 | the home's last 16 bytes                                             |
+//!
+//! Sharing by need. The allowance already counts what each daemon holds, not how many there
+//! are: an idle daemon that holds 0.2 GiB takes 0.2 GiB of the machine. What it did not do is
+//! make a daemon that holds a lot and does nothing give it back for one that builds: on
+//! 2026-11-12 a hello-world's daemon had 21.78 GiB of a 96 GiB Mac to build in, beside
+//! daemons idle at 22.6, 9.7 and 6.1 GiB. So each record says what its daemon wants (what
+//! its plane holds work back for) and what it gives (what it could give back and keep the
+//! floor its next edit needs), and at its turn a daemon with no work is told what to hold
+//! at most ([`Ledger::yielded`]): what it holds less its part of what the others want, the
+//! idle daemons each giving in proportion to what they can. Its give-back
+//! (`crate::giveback`) then returns that memory in its own order, and the building daemon's
+//! allowance grows by it at its next turn. A daemon with work yields nothing.
 //!
 //! The machine budget is the least that any live daemon brought: each computes its own at
 //! start (or is told it, `BLAZE_MACHINE_MEMORY_GB`), and the least is the one that holds for
@@ -68,8 +82,9 @@ mod tests;
 /// The file's first 8 bytes.
 pub const MAGIC: [u8; 8] = *b"blzledgr";
 /// The layout this module reads and writes; a file of another is refused, naming both.
-/// Layout 2 added the lease, in 8 of the bytes layout 1 kept of the home.
-pub const FORMAT: u32 = 2;
+/// Layout 2 added the lease, in 8 of the bytes layout 1 kept of the home. Layout 3 added what
+/// a daemon wants and what it gives, in 8 bytes each of the version's and the home's.
+pub const FORMAT: u32 = 3;
 /// The most daemons one machine budget is shared by: joining past it is refused.
 pub const MOST: usize = 64;
 /// The bytes of one record.
@@ -79,12 +94,20 @@ pub const HEADER: usize = 32;
 /// The bytes of the whole file.
 pub const LEN: usize = HEADER + MOST * RECORD;
 
-const VERSION: usize = 24;
-const HOME: usize = 24;
-/// Where a record's lease is, and where its home's bytes start.
+const VERSION: usize = 16;
+const HOME: usize = 16;
+/// Where a record's wants, lease and gives are, and where its home's bytes start.
+const WANTS_AT: usize = 88;
 const LEASE_AT: usize = 96;
-const HOME_AT: usize = 104;
-const _: () = assert!(HOME_AT + HOME == RECORD && LEASE_AT + 8 == HOME_AT);
+const GIVES_AT: usize = 104;
+const HOME_AT: usize = 112;
+const _: () = assert!(
+    72 + VERSION == WANTS_AT
+        && WANTS_AT + 8 == LEASE_AT
+        && LEASE_AT + 8 == GIVES_AT
+        && GIVES_AT + 8 == HOME_AT
+        && HOME_AT + HOME == RECORD
+);
 const VERSION_CUT: u8 = 1;
 const HOME_CUT: u8 = 2;
 
@@ -157,6 +180,12 @@ pub struct Record {
     /// The headroom it took at its last turn: what it may grant past `max(held, granted)`
     /// until its next ([`crate::plane::Plane::lease`]); 0 for a daemon with no work.
     pub lease: u64,
+    /// What it wants: the bytes its plane holds work back for, as its last turn left it; 0
+    /// for a daemon nothing of which waits for memory.
+    pub wants: u64,
+    /// What it gives: the bytes it could give back now and keep the floor its next edit
+    /// needs; 0 for a daemon with work, which gives nothing to another.
+    pub gives: u64,
     /// When it was last written, by the writer's wall clock: for a person reading the file.
     pub at_ns: u64,
     pub version: Label<VERSION>,
@@ -206,6 +235,15 @@ pub trait Admits {
     fn held(&self) -> u64;
     /// What its running tasks were granted.
     fn granted(&self) -> u64;
+    /// The bytes it holds work back for ([`Record::wants`]); 0 for a plane that does not say.
+    fn wants(&self) -> u64 {
+        0
+    }
+    /// The bytes it could give back and keep its floor ([`Record::gives`]); 0 for a plane
+    /// that does not say.
+    fn gives(&self) -> u64 {
+        0
+    }
 }
 
 /// What a [`Ledger::turn`] did.
@@ -218,6 +256,9 @@ pub struct Turn {
     pub charge: u64,
     /// The lease in `charge`.
     pub lease: u64,
+    /// What this daemon is to hold at most for the others' wants ([`Ledger::yielded`]);
+    /// `u64::MAX` for one that yields nothing.
+    pub yield_to: u64,
 }
 
 /// What went wrong, and in which ledger file.
@@ -387,6 +428,9 @@ pub(crate) enum Plant {
     /// [`Ledger::turn`] records no lease, whatever room the plane was given: the room past
     /// its charge is what another daemon is told is free.
     LeaseUnrecorded,
+    /// [`Ledger::yielded`] yields nothing, whatever the others want: the rule before layout 3,
+    /// under which an idle daemon keeps what it holds while one that builds is short.
+    NoYield,
 }
 
 /// The ledger, decoded: one slot a daemon, `None` free.
@@ -451,7 +495,7 @@ impl<'p> Ledger<'p> {
                 && row[7] == 0
                 && usize::from(version_kept) <= VERSION
                 && usize::from(home_kept) <= HOME
-                && row[72 + usize::from(version_kept)..LEASE_AT].iter().all(|&it| it == 0)
+                && row[72 + usize::from(version_kept)..WANTS_AT].iter().all(|&it| it == 0)
                 && row[HOME_AT + usize::from(home_kept)..RECORD].iter().all(|&it| it == 0);
             if !fields {
                 return Err(ledger.error(Why::Fields { slot }));
@@ -461,7 +505,7 @@ impl<'p> Ledger<'p> {
                 return Err(ledger.error(Why::Twice { slot, pid, start: process.start }));
             }
             let mut version = [0; VERSION];
-            version.copy_from_slice(&row[72..LEASE_AT]);
+            version.copy_from_slice(&row[72..WANTS_AT]);
             let mut home = [0; HOME];
             home.copy_from_slice(&row[HOME_AT..RECORD]);
             ledger.slots[slot] = Some(Record {
@@ -471,6 +515,8 @@ impl<'p> Ledger<'p> {
                 held: u64_at(row, 32),
                 granted: u64_at(row, 40),
                 lease: u64_at(row, LEASE_AT),
+                wants: u64_at(row, WANTS_AT),
+                gives: u64_at(row, GIVES_AT),
                 at_ns: u64_at(row, 48),
                 version: Label {
                     hash: u64_at(row, 56),
@@ -512,8 +558,10 @@ impl<'p> Ledger<'p> {
             put_u64(row, 48, record.at_ns);
             put_u64(row, 56, record.version.hash);
             put_u64(row, 64, record.home.hash);
-            row[72..LEASE_AT].copy_from_slice(&record.version.bytes);
+            row[72..WANTS_AT].copy_from_slice(&record.version.bytes);
+            put_u64(row, WANTS_AT, record.wants);
             put_u64(row, LEASE_AT, record.lease);
+            put_u64(row, GIVES_AT, record.gives);
             row[HOME_AT..RECORD].copy_from_slice(&record.home.bytes);
         }
         let sum = checksum(&out[..]);
@@ -577,6 +625,50 @@ impl<'p> Ledger<'p> {
         record.lease = lease;
         record.at_ns = at_ns;
         Ok(())
+    }
+
+    /// Rewrites what `me` wants and what it gives ([`Record::wants`], [`Record::gives`]).
+    pub fn need(&mut self, me: Process, wants: u64, gives: u64) -> Result<(), LedgerError> {
+        let slot = self.joined(me)?;
+        let record = self.slots[slot].as_mut().expect("a joined slot holds a record");
+        record.wants = wants;
+        record.gives = gives;
+        Ok(())
+    }
+
+    /// What `me` is to hold at most so that the others get what they want (the module's
+    /// "Sharing by need"); `u64::MAX` when it yields nothing: it has work (a grant, a lease or
+    /// a want of its own), it can give nothing, or no other daemon wants anything.
+    ///
+    /// The idle daemons share what is wanted in proportion to what each can give, each at
+    /// most all it can: `me`'s part is `wanted x me.gives / every idle daemon's gives`,
+    /// rounded up, and it is to hold what it holds less that. Rounded up, the parts sum to at
+    /// least what is wanted where the idle daemons can give it, so no want is left for a
+    /// rounding's sake; a daemon is never asked below `held - gives`, its floor.
+    pub fn yielded(&self, me: Process) -> Result<u64, LedgerError> {
+        let mine = self.slots[self.joined(me)?].expect("a joined slot holds a record");
+        #[cfg(test)]
+        if self.plant == Plant::NoYield {
+            return Ok(u64::MAX);
+        }
+        let idle = |it: &Record| it.granted == 0 && it.lease == 0 && it.wants == 0;
+        if !idle(&mine) || mine.gives == 0 {
+            return Ok(u64::MAX);
+        }
+        let wanted = self
+            .records()
+            .filter(|it| it.process != me)
+            .fold(0u64, |sum, it| sum.saturating_add(it.wants));
+        if wanted == 0 {
+            return Ok(u64::MAX);
+        }
+        let givable = self
+            .records()
+            .filter(|it| idle(it))
+            .fold(0u128, |sum, it| sum + u128::from(it.gives));
+        let part = (u128::from(wanted) * u128::from(mine.gives)).div_ceil(givable);
+        let part = u64::try_from(part).unwrap_or(u64::MAX).min(mine.gives);
+        Ok(mine.held.saturating_sub(part))
     }
 
     /// Frees the slot of each record whose process is gone, or whose pid another process has
@@ -643,7 +735,15 @@ impl<'p> Ledger<'p> {
         #[cfg(test)]
         let lease = if self.plant == Plant::LeaseUnrecorded { 0 } else { lease };
         self.charge(me, held, granted, lease, at_ns)?;
-        Ok(Turn { allowance, pruned, charge: held.max(granted).saturating_add(lease), lease })
+        self.need(me, plane.wants(), plane.gives())?;
+        let yield_to = self.yielded(me)?;
+        Ok(Turn {
+            allowance,
+            pruned,
+            charge: held.max(granted).saturating_add(lease),
+            lease,
+            yield_to,
+        })
     }
 
     fn find(&self, me: Process) -> Option<usize> {

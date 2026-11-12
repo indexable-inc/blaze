@@ -206,6 +206,22 @@ pub fn set_budgets(machine: u64) {
     }
 }
 
+/// What the machine's ledger last told this daemon to hold at most for the other daemons'
+/// wants ([`set_yield_to`]); `u64::MAX` for none.
+static YIELD_TO: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// What this daemon is to hold at most so that the other daemons of the machine get what
+/// they want (`crate::ledger::Ledger::yielded`): `u64::MAX` while it yields nothing. The
+/// give-back takes the less of this and [`limit`] as the limit it gives back to.
+pub fn yield_to() -> u64 {
+    YIELD_TO.load(Ordering::Relaxed)
+}
+
+/// Says what the ledger's last turn told this daemon to hold at most ([`yield_to`]).
+pub fn set_yield_to(bytes: u64) {
+    YIELD_TO.store(bytes, Ordering::Relaxed);
+}
+
 /// Whether the daemon has nothing left to give back but the work of the tasks under way
 /// ([`set_short`]).
 static SHORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -328,6 +344,21 @@ impl Squeeze {
     /// with the line at 41 (memadmit).
     pub const fn short(&self, now: Pressure) -> bool {
         now.limit != u64::MAX && now.held >= self.after
+    }
+
+    /// One that begins where a release of this daemon last left off: `after`, another's
+    /// [`Squeeze::mark`]. A build's squeeze starts from the daemon's last, never from nothing:
+    /// a daemon that sits at its limit's line (a hello-world's front end holding 19 GiB of a
+    /// limit of 21.78, 2026-11-12) otherwise stops every build for a release, whatever the
+    /// last one freed (143 ms on the loop for 0.36 GiB, then one for 0.00).
+    pub const fn starting_after(after: u64) -> Squeeze {
+        Squeeze { after }
+    }
+
+    /// What blaze must hold again before the next release is due: what it held as the last
+    /// one ended and a [`STEP`]th of the limit; 0 before any.
+    pub const fn mark(&self) -> u64 {
+        self.after
     }
 
     /// A release ended, leaving `now`: the next is due only past a [`STEP`]th more.

@@ -277,6 +277,40 @@ No lane owns that yet: restore.md gives bodies, inference and MIR to the item st
 key, and the front-end records lane's pieces stop below inference. The planner needs nothing
 new for it; until it exists the `running tasks` rung is the only give there is.
 
+**Sharing the machine by need.** Every blaze daemon of a user on a host admits against one
+machine budget through one ledger (`blaze_graph::ledger`; the file
+`/tmp/blaze-<uid>/machine.<layout>`, read and written whole under its `flock`, a dead
+daemon's record pruned by pid and start time by whoever takes the next turn). A daemon's
+allowance is the machine budget less what every other daemon holds, so the split was never
+by count: an idle daemon holding 0.2 GiB takes 0.2 GiB. What was missing is that a daemon
+holding a lot and doing nothing gave none of it back: on 2026-11-12 a hello-world's daemon
+built under 21.78 GiB of a 96 GiB Mac beside daemons idle at 22.6, 9.7 and 6.1 GiB. From
+layout 3 each record also says what its daemon wants (what its plane holds work back for,
+`Plane::wants`) and what it gives (what its give-back could return and keep its floor). At
+its turn a daemon with no work is told what to hold at most (`Ledger::yielded`): what it
+holds less its part of what the others want, the idle daemons each in proportion to what
+they can give. Its give-back takes that as its limit and gives back in its own order; the
+building daemon's allowance grows by it at its next turn, a quarter second later. A daemon
+with work yields nothing. An idle daemon keeps its floor for 30 minutes of idleness
+whatever the others want; past that, told to yield, the floor goes too. No daemon exits for
+being idle: the owner's warm daemon is never killed, and one at its floor is what costs.
+Proof: `ledger::tests`, a simulation of building and idle daemons at one ledger (the
+daemons never hold more than the machine budget; a building daemon is not short while an
+idle one holds more than its floor; an idle one gives only while another wants, never under
+its floor), with the control of idle daemons that yield nothing.
+
+**What an idle daemon holds.** The owner's hello-world daemon, idle, 2026-11-12 (rows read
+by lane reth; not measured here): 7.2 GiB resident; 3.85 GiB of it query storage after the
+idle give-back, of which 1.62 GiB is the dependency graph (143 million edge rows each way
+and 10 million nodes, for a hello-world) and the rest signatures, bodies, describes and
+memos; 2.3 GiB the link's kept images; 1.08 GiB free chunks; 0.8 GiB the flight recorder's
+decoded names. The give-back's rungs reach the values, the caches, the pool and the
+allocator's pages; they do not reach the graph, the interners or the kept images, which
+are the floor's core. So a warm hello-world idles in gigabytes until that core is records
+read from the store (the records lanes) and the graph is smaller; the only way to hundreds
+of MiB today is to let the floor go, which is done for another daemon's want after 30
+minutes idle and never otherwise.
+
 **Not built.** A front end is given whole or by its values, not yet by crate. The size of
 codegen's caches is the codegen tag's heap with no codegen task running, an upper bound.
 

@@ -451,6 +451,8 @@ impl<'p> World<'p> {
             held: config.baseline,
             granted: 0,
             lease: 0,
+            wants: 0,
+            gives: 0,
             at_ns,
             version: Label::head(b"blaze 0.0.0-sim", 1),
             home: Label::tail(b"/sim/home/.blaze", fnv1a(b"/sim/home/.blaze")),
@@ -829,6 +831,8 @@ fn record(d: &mut impl Draw, pid: u32) -> Record {
         held: d.int(0, u64::MAX),
         granted: d.int(0, u64::MAX),
         lease: d.int(0, u64::MAX),
+        wants: d.int(0, u64::MAX),
+        gives: d.int(0, u64::MAX),
         at_ns: d.int(0, u64::MAX),
         version: Label::head(&version, d.int(0, u64::MAX)),
         home: Label::tail(&home, d.int(0, u64::MAX)),
@@ -900,9 +904,28 @@ fn a_file_of_the_layout_before_the_lease_is_refused_naming_both_layouts() {
     assert!(error.why.corrupt());
     let said = error.to_string();
     assert!(
-        said.contains(PATH) && said.contains("layout 1") && said.contains("layout 2"),
+        said.contains(PATH)
+            && said.contains("layout 1")
+            && said.contains(&format!("layout {FORMAT}")),
         "{said}"
     );
+}
+
+/// A file of the layout before what a daemon wants and gives (layout 2) is refused the same
+/// way, never read as a ledger whose daemons want nothing: its version and home labels sit
+/// where layout 3 keeps those two numbers.
+#[test]
+fn a_file_of_the_layout_before_wants_and_gives_is_refused_naming_both_layouts() {
+    let path = Path::new(PATH);
+    let mut ledger = Ledger::empty(path);
+    ledger.join(record(&mut SplitMix64::new(4), 1)).expect("a free slot");
+    let mut bytes = [0; LEN];
+    ledger.encode(&mut bytes);
+    bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+    let error = Ledger::decode(path, &bytes).expect_err("layout 2");
+    assert_eq!(error.why, Why::Format { found: 2 });
+    let said = error.to_string();
+    assert!(said.contains("layout 2") && said.contains("layout 3"), "{said}");
 }
 
 /// A record's lease is part of its charge, so another daemon's allowance is less by it.
@@ -917,6 +940,8 @@ fn a_lease_counts_against_every_other_daemons_allowance() {
         held,
         granted: 0,
         lease,
+        wants: 0,
+        gives: 0,
         at_ns: 0,
         version: Label::EMPTY,
         home: Label::EMPTY,
@@ -941,4 +966,180 @@ fn joining_past_the_most_is_refused() {
     assert_eq!(error.why, Why::Full);
     let said = error.to_string();
     assert!(said.contains(PATH) && said.contains("64"), "{said}");
+}
+
+// --- Sharing by need --------------------------------------------------------------------------
+
+/// One daemon of the sharing simulation: what it holds, the floor it keeps when idle, and for
+/// one that builds what its build needs to hold in all.
+#[derive(Clone, Copy, Debug)]
+struct Peer {
+    process: Process,
+    held: u64,
+    floor: u64,
+    need: Option<u64>,
+}
+
+/// Daemons that build and daemons that idle take turns at one ledger, each as the driver does:
+/// a building one grows into its allowance and says what it is still short of; an idle one
+/// says what it could give, is told what to hold at most ([`Ledger::yielded`]) and gives down
+/// to it, never under its floor. Checked at every turn: what the daemons hold fits the machine
+/// budget; an idle daemon never goes under its floor, and gives only while another wants. At
+/// the end: no daemon that builds is short of its need while an idle one could still give.
+fn share(seed: u64, plant: Plant) -> Result<(), String> {
+    let mut random = SplitMix64::new(seed);
+    let path = Path::new(PATH);
+    let mut ledger = Ledger::empty(path);
+    ledger.plant = plant;
+    let count = 2 + random.below(5) as usize;
+    // alloc: a case's daemons
+    let mut peers: Vec<Peer> = (0..count)
+        .map(|at| {
+            let floor = 1 + random.below(8);
+            let held = floor + random.below(33);
+            // The first builds and the second idles, so every case has both; the rest by coin.
+            let builds = at == 0 || (at != 1 && random.below(2) == 0);
+            let need = builds.then(|| held + 1 + random.below(40));
+            Peer { process: Process { pid: at as u32 + 1, start: 1 }, held, floor, need }
+        })
+        .collect();
+    let machine = peers.iter().map(|it| it.held).sum::<u64>() + random.below(9);
+    for peer in &peers {
+        let record = Record {
+            process: peer.process,
+            budget: machine,
+            ceiling: machine,
+            held: peer.held,
+            granted: 0,
+            lease: 0,
+            wants: 0,
+            gives: 0,
+            at_ns: 0,
+            version: Label::EMPTY,
+            home: Label::EMPTY,
+        };
+        ledger.join(record).map_err(|error| format!("seed {seed}: {error}"))?;
+    }
+    let failed = |error: LedgerError| format!("seed {seed}: {error}");
+    for round in 0..8 {
+        for at in 0..peers.len() {
+            let peer = peers[at];
+            match peer.need {
+                Some(need) => {
+                    let allowance = ledger.allowance(peer.process).map_err(failed)?.bytes;
+                    let held = need.min(allowance).max(peer.held);
+                    peers[at].held = held;
+                    ledger.charge(peer.process, held, 0, 0, round).map_err(failed)?;
+                    ledger.need(peer.process, need - held, 0).map_err(failed)?;
+                }
+                None => {
+                    ledger.charge(peer.process, peer.held, 0, 0, round).map_err(failed)?;
+                    ledger.need(peer.process, 0, peer.held - peer.floor).map_err(failed)?;
+                    let wanted: u64 = ledger
+                        .records()
+                        .filter(|it| it.process != peer.process)
+                        .map(|it| it.wants)
+                        .sum();
+                    let target = ledger.yielded(peer.process).map_err(failed)?;
+                    if target < peer.held {
+                        if wanted == 0 {
+                            return Err(format!(
+                                "seed {seed}, round {round}: daemon {at} was told to hold {target} of {} while no daemon wants anything",
+                                peer.held
+                            ));
+                        }
+                        if target < peer.floor {
+                            return Err(format!(
+                                "seed {seed}, round {round}: daemon {at} was told to hold {target}, under its floor of {}",
+                                peer.floor
+                            ));
+                        }
+                        peers[at].held = target;
+                        ledger.charge(peer.process, target, 0, 0, round).map_err(failed)?;
+                        ledger.need(peer.process, 0, target - peer.floor).map_err(failed)?;
+                    }
+                }
+            }
+            let held: u64 = peers.iter().map(|it| it.held).sum();
+            if held > machine {
+                return Err(format!(
+                    "seed {seed}, round {round}: the daemons hold {held} of a machine budget of {machine}: {peers:?}"
+                ));
+            }
+        }
+    }
+    let givable: u64 = peers.iter().filter(|it| it.need.is_none()).map(|it| it.held - it.floor).sum();
+    for (at, peer) in peers.iter().enumerate() {
+        if let Some(need) = peer.need
+            && peer.held < need
+            && givable > 0
+        {
+            return Err(format!(
+                "seed {seed}: daemon {at} builds and holds {} of the {need} it needs while idle daemons could still give {givable}: {peers:?}",
+                peer.held
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The invariant: daemons sharing one machine budget by need never hold more than it
+/// together; a daemon that builds is not left short of what it needs while an idle one holds
+/// more than its floor; an idle daemon gives only while another wants, and never under its
+/// floor.
+#[test]
+fn a_building_daemon_is_not_short_while_an_idle_one_holds_more_than_its_floor() {
+    for seed in 0..CONTROL_SEEDS {
+        if let Err(broke) = share(seed, Plant::None) {
+            panic!("{broke}");
+        }
+    }
+}
+
+/// The control: with no yield (the rule before layout 3) a building daemon stays short beside
+/// idle daemons that hold what it needs.
+#[test]
+fn the_oracle_catches_idle_daemons_that_yield_nothing() {
+    for seed in 0..CONTROL_SEEDS {
+        if let Err(why) = share(seed, Plant::NoYield) {
+            eprintln!("Plant::NoYield caught at seed {seed}: {why}");
+            return;
+        }
+    }
+    panic!("the oracle caught Plant::NoYield at none of seeds 0..{CONTROL_SEEDS}");
+}
+
+/// The Mac of 2026-11-12 in GiB: a hello-world's daemon that builds and wants 30 more, beside
+/// daemons idle at 22.6, 9.7 and 6.1 (here 23, 10 and 6, each with a floor of 1). Each idle
+/// daemon is told its part in proportion to what it can give, the parts cover what is wanted,
+/// and the daemon that builds yields nothing.
+#[test]
+fn idle_daemons_give_in_proportion_to_what_each_can() {
+    let path = Path::new(PATH);
+    let mut ledger = Ledger::empty(path);
+    let of = |pid: u32, held: u64, wants: u64, gives: u64| Record {
+        process: Process { pid, start: 1 },
+        budget: 96,
+        ceiling: 96,
+        held,
+        granted: 0,
+        lease: 0,
+        wants,
+        gives,
+        at_ns: 0,
+        version: Label::EMPTY,
+        home: Label::EMPTY,
+    };
+    ledger.join(of(1, 20, 30, 0)).expect("a free slot");
+    ledger.join(of(2, 23, 0, 22)).expect("a free slot");
+    ledger.join(of(3, 10, 0, 9)).expect("a free slot");
+    ledger.join(of(4, 6, 0, 5)).expect("a free slot");
+    let told = |pid: u32| ledger.yielded(Process { pid, start: 1 }).expect("joined");
+    assert_eq!(told(1), u64::MAX, "the daemon that builds yields nothing");
+    // 30 wanted of 36 givable: 22 x 30/36 = 18.3 -> 19; 9 x 30/36 = 7.5 -> 8; 5 x 30/36 = 4.2 -> 5.
+    assert_eq!((told(2), told(3), told(4)), (23 - 19, 10 - 8, 6 - 5));
+    // Nobody wants: nobody yields.
+    ledger.need(Process { pid: 1, start: 1 }, 0, 0).expect("joined");
+    let told = |pid: u32| ledger.yielded(Process { pid, start: 1 }).expect("joined");
+    assert_eq!((told(2), told(3), told(4)), (u64::MAX, u64::MAX, u64::MAX));
 }
