@@ -255,7 +255,21 @@
    "decision": "What build, run, check and test show is blaze's own, not cargo's lines: on a terminal a region redrawn while the build runs and at most one line when it ends (nothing for a run that built nothing); off a terminal `blaze: progress` every 10 s and one `blaze: ok` or `blaze: failed` line of key=value fields. `Compiling`, `Finished`, `Running`, `link:` and the per-unit `generated N warnings` and `could not compile` lines are gone; the JSON messages on stdout are unchanged. A frontier (a row a unit under way with how many wait on it) over a dependency tree or a lane a worker, from frames of recorded builds. docs/terminal.md.",
    "why": "Andrew, 2026-11-12: \"can you improve the terminal output too? like `blaze run` could be more like nom + buck2 ... proper TUI thing ... reinvent, super modern\"; rule useful-not-parity.",
    "recommended": "Yes. The cost: a tool that reads cargo's human lines from blaze's stderr reads nothing it knows (the harnesses filter `blaze:` lines already and read build-finished), and the `blaze check --fix` hint that the per-unit warning line carried is not said anywhere now.",
-   "state": "built on termui-1112, not merged"
+   "state": "built on termui-1112, not merged",
+   "id": "reth-1112-D1",
+   "date": "2026-11-12",
+   "decision": "A proc-macro call whose session moved on (a stateful crate: jsonrpsee's `proc_macro_crate::CACHE`), or whose crate the store has not seen yet, has known reads when it gives, run once more from the fresh state, exactly what it gave in its session: its unit's record and its crate's image are then kept. A call that gives otherwise from the fresh state (a counter) stays unknown and its unit is made again every build, loudly (`misses` step `unit record`).",
+   "why": "lane reth-1112 (claude-fable-5-2), on the owner's `make sure reth fast as fuck`: 7 units of reth were made again in every build and 217 in the first build after a cold one for this alone. What is given up: a macro that is truly order-dependent and happens to give the fresh state's output in one build has that output kept; before, nothing of such a crate was ever kept.",
+   "recommended": "Yes; run blaze-macro-eval's tests/kept.rs and corpus.rs (BLAZE_MACRO_CORPUS) before it lands.",
+   "state": "built on reth-1112 (77c4d94579), merged into int-1112; fixtures measured, reth being measured; the owner has not seen it"
+  },
+  {
+   "id": "reth-1112-D2",
+   "date": "2026-11-12",
+   "decision": "A build script's run that read what can't be traced (the clock, randomness, the network) and whose script said what reruns it (`rerun-if-changed`, `rerun-if-env-changed`) is kept by cargo's rule and by what it read of its own package; what it read elsewhere (the checkout's other files through `git`, the toolchain's) is no input of it. A traceable run keeps every read, as before, and so does an untraceable one that named nothing.",
+   "why": "lane reth-1112: rule useful-not-parity matches cargo where real code depends on it, and reth does: its `reth-node-core` script stamps the build time and asks `git` whether the checkout is dirty, and says in its source that debug builds must not run it again. Traced, it read 2,916 files of the checkout: every build hashed them (13 s of each edit) and every edit ran it again and remade the crates above it. What is given up: such a script is not run again when a file it read outside its package changes (the `-dirty` suffix of a version string goes stale, as under cargo).",
+   "recommended": "Yes.",
+   "state": "built on reth-1112 (4787b9a562), not yet measured on reth; the owner has not seen it"
   }
  ]
 }

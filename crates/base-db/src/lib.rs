@@ -443,6 +443,21 @@ impl std::fmt::Display for ReadError {
     }
 }
 
+/// What [`IncludedFile::content_now`] last read of each path, with the generation of the
+/// watches outside every view ([`blaze_vfs::outside::generation`]) read before it looked.
+static VOUCHED: std::sync::LazyLock<
+    blaze_core::lock::Lock<blaze_hash::HashMap<std::path::PathBuf, (u64, ContentId), Global>>,
+> = std::sync::LazyLock::new(|| {
+    blaze_core::lock::Lock::new("db.included.vouched", blaze_hash::HashMap::new_in(Global))
+});
+
+thread_local! {
+    /// A planted bug, for a test's control: [`IncludedFile::content_now`] looks at the disk
+    /// on every ask, as until 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static LOOKS_EVERY_TIME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The contents of a file named by `include_bytes!` or `include_str!`, or why it can't be read.
 #[blaze_query::input(debug)]
 pub struct IncludedFile {
@@ -481,9 +496,37 @@ impl IncludedFile {
     }
 
     /// [`IncludedFile::content`] of the file at `path` as it is on disk now
-    /// ([`IncludedFile::read_now`]): what a unit record that read it is filed by.
+    /// ([`IncludedFile::read_now`]): what a unit record that read it is filed by, and what a
+    /// build compares with what it read of the file ([`Files::included_is_read`]).
+    ///
+    /// The invariant: the disk is looked at only while no watch vouches for the answer kept.
+    /// The file's directory is wanted watched ([`blaze_vfs::outside::want`]) the first time it
+    /// is asked, and the answer of a look is kept with the generation read before the look;
+    /// once a directory at or above the file has been watched without a break since, and
+    /// heard nothing, the answer kept is the answer (a file that is not there too: its
+    /// directory hears it made). Until 2026-11-12 every ask read the file: each unit of a
+    /// build asked of each file its closure includes, and a build that looked at any path no
+    /// watch covers is never answered again without a walk (the no-op lane), so reth's build
+    /// with nothing changed walked 5,305 units for one path a registry crate's `#[path]`
+    /// names that is not there.
     pub fn content_now(path: &std::path::Path) -> ContentId {
-        IncludedFile::content_of(IncludedFile::read_now(path).as_deref())
+        let kept = VOUCHED.lock().get(path).copied();
+        if let Some((generation, id)) = kept
+            && blaze_vfs::outside::unchanged_since(path, generation)
+            && !LOOKS_EVERY_TIME.get()
+        {
+            return id;
+        }
+        let generation = blaze_vfs::outside::generation();
+        if kept.is_none()
+            && let Some(dir) = path.parent()
+        {
+            blaze_vfs::outside::want(dir);
+        }
+        let id = IncludedFile::content_of(IncludedFile::read_now(path).as_deref());
+        // alloc: once per included file, its path as the key of what was read of it
+        VOUCHED.lock().insert(path.to_path_buf(), (generation, id));
+        id
     }
 
     pub fn read<'db, Db: ?Sized + blaze_query::db::Database>(

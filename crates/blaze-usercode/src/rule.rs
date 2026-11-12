@@ -2,8 +2,10 @@
 //! the network, a descriptor it was given. What it read of those can't be seen again, so what
 //! the script itself said reruns it is added to what it was seen to read: a path its
 //! `rerun-if-changed` names (a directory meaning all below it) and a variable its
-//! `rerun-if-env-changed` names. Cargo's rule is added to what it was seen to read, never put
-//! in its place: a run is never kept for longer than either would keep it.
+//! `rerun-if-env-changed` names. Cargo's rule is added to what it was seen to read of its own
+//! package, never put in its place there: a run is never kept for longer than cargo keeps it.
+//! What such a run read outside its package (the checkout's other files, through `git`; the
+//! toolchain's) is no input of a script that said what reruns it ([`widen`] says why).
 //!
 //! Cargo's default for a script that names no path, any file of its package, is added only
 //! for a run that read a file the sandbox did not see opened ([`Untraceable::Descriptor`]):
@@ -34,6 +36,11 @@ pub struct CargoRule {
     pub package: Option<PathBuf>,
     /// The variables `rerun-if-env-changed` named.
     pub env: Vec<OsString>,
+    /// The package's directory, for a script that said what reruns it (it printed a
+    /// `rerun-if-changed` or a `rerun-if-env-changed`): what a run of it that read what
+    /// can't be traced read outside this directory is no input of it ([`widen`]). None for a
+    /// rule made without the package (a test's), which narrows nothing.
+    pub said_in: Option<PathBuf>,
 }
 
 /// Adds cargo's rule to what `traced` has, as `inputs` has it now, when the run read what
@@ -45,6 +52,22 @@ pub fn widen<I: Inputs>(
 ) -> Result<(), I::Error> {
     if traced.untraceable.is_empty() {
         return Ok(());
+    }
+    // A script that said what reruns it, and read what can't be traced: what it read
+    // outside its own package is no input. Such a run is no function of what it read (the
+    // clock moves under it), so reading more of the machine makes its kept result no truer,
+    // and real projects rest on cargo's rule here: reth's `reth-node-core` stamps its build
+    // time and asks `git` whether the checkout is dirty, prints `rerun-if-changed=build.rs`,
+    // and says in its source that debug builds must not run it again. Traced, its run read
+    // 2,916 files and 590 listings of the checkout through `git`: every build hashed them
+    // all (13 s of a 38 s edit), every edit of any source ran it again, and its new time
+    // stamp made its crate and the six above it again (2026-11-12). What it read of its own
+    // package stays, with what it named: never kept for longer than cargo keeps it.
+    if let (Some(own), None) = (&rule.said_in, &rule.package)
+        && !NARROWS_NOTHING.get()
+    {
+        traced.files.retain(|(path, _)| path.starts_with(own));
+        traced.dirs.retain(|(path, _)| path.starts_with(own));
     }
     for path in &rule.paths {
         let is_dir = blaze_mem::frame::task(blaze_mem::Tag::Usercode, |frame| {
@@ -92,10 +115,33 @@ impl CargoRule {
         // alloc: the rule owns its names, made once as a run ends.
         let env = watched.env.into_iter().map(OsString::from).collect();
         if watched.whole_package {
-            return CargoRule { paths: Vec::new(), package: watched.paths.into_iter().next(), env }; // alloc: none, an empty list
+            // alloc: none, an empty list
+            return CargoRule {
+                paths: Vec::new(),
+                package: watched.paths.into_iter().next(),
+                env,
+                said_in: None,
+            };
         }
-        CargoRule { paths: watched.paths, package: None, env }
+        CargoRule { paths: watched.paths, package: None, env, said_in: None }
     }
+
+    /// The rule of a script of the package in `dir`: [`CargoRule::said_in`] set when the
+    /// script said what reruns it.
+    pub fn of_package(watched: Watched, dir: &std::path::Path) -> CargoRule {
+        let mut rule = CargoRule::of(watched);
+        if rule.package.is_none() {
+            rule.said_in = Some(dir.to_path_buf()); // alloc: once a run kept
+        }
+        rule
+    }
+}
+
+thread_local! {
+    /// A planted bug, for a test's control: [`widen`] keeps what an untraceable run that said
+    /// its reruns read outside its package, as until 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static NARROWS_NOTHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -243,4 +289,75 @@ mod tests {
         assert!(env_only.dirs.is_empty());
         assert_eq!(env_only.env, vec![("VERSION".into(), Some("1".into()))]);
     }
+    /// The run of a script that stamps its build's time and asks `git` about the checkout,
+    /// and says `rerun-if-changed=build.rs`: what it read, and the same widened by its rule.
+    fn stamped(package: Option<&Path>) -> (Traced, Traced) {
+        let output = Output {
+            rerun_if_changed: vec![PathBuf::from("build.rs")],
+            ..Output::default()
+        };
+        let watched = watched(&output, Path::new("/p"));
+        let rule = match package {
+            Some(dir) => CargoRule::of_package(watched, dir),
+            None => CargoRule::of(watched),
+        };
+        let read = Traced {
+            files: vec![
+                ("/p/src/lib.rs".into(), Some([2; 32])),
+                ("/w/.git/index".into(), Some([7; 32])),
+                ("/w/crates/other/src/lib.rs".into(), Some([8; 32])),
+            ],
+            dirs: vec![("/w/crates".into(), [9; 32])],
+            untraceable: vec![Untraceable::Clock],
+            ..Traced::default()
+        };
+        // clone: a test's trace, before and after
+        let mut widened = Traced {
+            files: read.files.clone(),
+            dirs: read.dirs.clone(),
+            env: read.env.clone(),
+            untraceable: read.untraceable.clone(),
+        };
+        widen(&mut widened, &rule, &mut fixed()).unwrap();
+        (read, widened)
+    }
+
+    /// The invariant: a run that read what can't be traced, of a script that said what
+    /// reruns it, is kept by what it named and by what it read of its own package, and by
+    /// nothing it read elsewhere: an edit of another crate's source, or `git` writing its
+    /// index, changes no input of it, so it is found kept and not run again. A run that read
+    /// nothing untraceable keeps every read: it is a function of them.
+    #[test]
+    fn an_untraceable_run_that_said_its_reruns_is_keyed_by_its_package_alone() {
+        let (_, widened) = stamped(Some(Path::new("/p")));
+        let files: Vec<&Path> = widened.files.iter().map(|it| it.0.as_path()).collect();
+        assert_eq!(files, [Path::new("/p/build.rs"), Path::new("/p/src/lib.rs")]);
+        assert!(widened.dirs.is_empty(), "{:?}", widened.dirs);
+        // Traceable: nothing is taken out, and nothing added.
+        let mut pure = Traced {
+            files: vec![("/w/.git/index".into(), Some([7; 32]))],
+            ..Traced::default()
+        };
+        let output =
+            Output { rerun_if_changed: vec![PathBuf::from("build.rs")], ..Output::default() };
+        let rule = CargoRule::of_package(watched(&output, Path::new("/p")), Path::new("/p"));
+        widen(&mut pure, &rule, &mut fixed()).unwrap();
+        assert_eq!(pure.files.len(), 1, "{:?}", pure.files);
+    }
+
+    /// The control: with nothing narrowed, as until 2026-11-12, the run is keyed by the
+    /// checkout's files it read through `git`, so any edit of any source runs it again.
+    #[test]
+    fn the_oracle_catches_an_untraceable_run_keyed_by_the_whole_checkout() {
+        NARROWS_NOTHING.set(true);
+        let (_, widened) = stamped(Some(Path::new("/p")));
+        NARROWS_NOTHING.set(false);
+        assert!(
+            widened.files.iter().any(|it| it.0 == Path::new("/w/crates/other/src/lib.rs")),
+            "planted: another crate's source is an input of the run: {:?}",
+            widened.files
+        );
+        assert!(!widened.dirs.is_empty(), "planted: the checkout's listings are inputs");
+    }
+
 }
