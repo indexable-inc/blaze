@@ -316,6 +316,111 @@ fn the_oracle_catches_a_walk_with_no_reach() {
     assert!(large.verified >= 2000, "{large:?}");
 }
 
+/// A build of a wide library under one top row with an application row and a crate-list row
+/// (as [`a_first_edit_after_a_build`]'s), settled; then a plan that adds a crate, as a build
+/// of another target of the same workspace does: a new input (the crate's source) and a new
+/// row that reads it and the library's top are made, and the crate list (input 2) is
+/// written. The host walks, then pulls what the plan asks. Then two edits, each followed by
+/// the walk and the host's pull of the rows it holds: of the application's source, and of
+/// the new crate's. Returns the rows the two edits' changed sets named, the rows their walks
+/// asked and set apart, and the rows proved unchanged from the plan's write on. Every answer
+/// is checked against a run from scratch.
+fn a_plan_that_adds_a_crate(library: usize, plant: Plant) -> (Vec<usize>, u64, u64, u64) {
+    let _one = BUILT.lock();
+    let mut flow: Vec<FlowNode> = Vec::with_capacity(2 * library + 4);
+    for at in 0..library {
+        flow.push(sum(&[Dep::Input(0), Dep::Input(3 + at % WIDE_INPUTS)]));
+        flow.push(sum(&[Dep::Query(2 * at)]));
+    }
+    let top = flow.len();
+    flow.push(sum(&(0..library).map(|at| Dep::Query(2 * at + 1)).collect::<Vec<_>>()));
+    let application = flow.len();
+    flow.push(sum(&[Dep::Input(1), Dep::Query(top)]));
+    let list = flow.len();
+    flow.push(sum(&[Dep::Input(2)]));
+    let mut db = TestDb::new();
+    db.storage_mut().plant_in_changed_set(plant);
+    *db.flow.lock() = flow.clone();
+    let mut inputs = vec![1u64, 10, 100];
+    inputs.extend((0..WIDE_INPUTS as u64).map(|at| at % 7));
+    let mut cells: Vec<Cell> = inputs.iter().map(|&value| Cell::new(&db, value, 0)).collect();
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
+    let pull = |db: &TestDb, flow: &[FlowNode], inputs: &[u64], held: &[usize]| {
+        let model = evaluate(flow, inputs, 0);
+        for &at in held {
+            assert_eq!(*fetch::<Built>(db, node(db, at)), model[at], "row {at}");
+        }
+    };
+    let every: Vec<usize> = (0..flow.len()).collect();
+    pull(&db, &flow, &inputs, &every);
+    inputs[0] = 5;
+    cells[0].set_a(&mut db, 5);
+    pull(&db, &flow, &inputs, &every);
+    db.storage_mut().settle_changed_set();
+    let before = built_verified();
+    // The plan adds a crate: its source, its row, and the crate list written.
+    let source = inputs.len();
+    inputs.push(9);
+    cells.push(Cell::new(&db, 9, 0));
+    db.cells.lock().push(cells[source].0);
+    let added = flow.len();
+    flow.push(sum(&[Dep::Input(source), Dep::Query(top)]));
+    *db.flow.lock() = flow.clone();
+    let mut since = db.storage().view();
+    inputs[2] = 101;
+    cells[2].set_a(&mut db, 101);
+    _ = changed_since::<Built>(&db, since);
+    pull(&db, &flow, &inputs, &[list, added]);
+    since = db.storage().view();
+    let (mut named, mut asked, mut marked) = (Vec::new(), 0, 0);
+    for (input, value) in [(1, 11), (source, 12)] {
+        inputs[input] = value;
+        cells[input].set_a(&mut db, value);
+        let changed = changed_since::<Built>(&db, since);
+        let Changed::Keys(keys) = changed else { panic!("unknown: {changed:?}") };
+        let work = db.storage().changed_set_work();
+        asked += work.visited;
+        marked += work.marked;
+        for key in keys {
+            let at = (0..flow.len()).find(|&at| node(&db, at) == key).expect("a row of the flow");
+            // The row's place from the flow's end, so two sizes name it alike.
+            named.push(flow.len() - at);
+        }
+        pull(&db, &flow, &inputs, &[application, top, list, added]);
+        since = db.storage().view();
+    }
+    let verified = built_verified() - before;
+    let every: Vec<usize> = (0..flow.len()).collect();
+    pull(&db, &flow, &inputs, &every);
+    (named, asked, marked, verified)
+}
+
+/// The invariant: a plan that adds a crate to a built database (new inputs, new rows over the
+/// library's, the crate list written) leaves each later edit's work bounded by what the edit
+/// reaches: the edit of the application names its row and the edit of the new crate names
+/// the new row, each walk asks one row and sets none apart, and the library's top is proved
+/// with one look each time, the same over a library of 200 rows and one of 4,000.
+#[test]
+fn an_edit_after_a_plan_adds_a_crate_costs_what_it_reaches_at_two_sizes() {
+    let small = a_plan_that_adds_a_crate(100, Plant::None);
+    let large = a_plan_that_adds_a_crate(2000, Plant::None);
+    // The application's row is third from the flow's end, the new crate's is last.
+    assert_eq!((&small.0[..], small.1, small.2), (&[3usize, 1][..], 2, 0), "{small:?}");
+    assert!(small.3 <= 12, "{small:?}");
+    assert_eq!(large, small, "an edit's work after the plan grew with the database");
+}
+
+/// The control of [`an_edit_after_a_plan_adds_a_crate_costs_what_it_reaches_at_two_sizes`]:
+/// with no reach, each edit proves the library's top by the rows it read, and the oracle
+/// says so at both sizes.
+#[test]
+fn the_oracle_catches_an_edit_after_a_plan_that_walks_the_library() {
+    let small = a_plan_that_adds_a_crate(100, Plant::WalksWithNoReach);
+    let large = a_plan_that_adds_a_crate(2000, Plant::WalksWithNoReach);
+    assert!(small.3 >= 100, "{small:?}");
+    assert!(large.3 >= 2000, "{large:?}");
+}
+
 /// Row 2 reads input 1 and row 1; row 1 reads row 0; row 0 reads input 0. Both inputs are
 /// written. The walk's first level is row 2 (it reads input 1) and row 0; row 2, the older
 /// node, is verified first and reads row 1, which is behind row 0, which is behind the
