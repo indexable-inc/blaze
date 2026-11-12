@@ -340,6 +340,12 @@ impl Storage {
         self.frontier.walked.get_mut().written.push(node); // alloc: the writes since the last walk, a word each
     }
 
+    /// The runs whose edges are not yet folded into the reverse index: what the next fold
+    /// ([`Storage::pack_reverse`], or the next view's boundary) costs.
+    pub fn runs_unfolded(&self) -> usize {
+        self.frontier.stored.len()
+    }
+
     /// What the last changed-set walk of this storage did.
     pub fn changed_set_work(&self) -> ChangedSetWork {
         self.frontier.walked.lock().work
