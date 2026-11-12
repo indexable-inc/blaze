@@ -83,13 +83,13 @@ impl Writer {
             "ProcessEnv" => Writer::Environment,
             "AllCrates" | "Crate" | "PrimaryCrates" | "LibraryRoots" | "LocalRoots"
             | "SourceRootInput" | "FileSourceRootInput" | "FrontSettings" | "NamedPaths"
-            | "PathBucket" | "ProcMacros" | "FrontEnd" => Writer::Plan,
+            | "PathBucket" | "ProcMacros" | "FrontEnd" | "Awaited" => Writer::Plan,
             "BuiltinDerives" | "CandidateSlice" | "CrateResolution" | "DepImages"
             | "DirectorySlot" | "FieldOrder" | "FrozenDefMaps" | "FrozenImpls"
             | "FrozenLangItems" | "ImplIdentities" | "ImplSlices" | "InherentSlice"
             | "KeptConsts" | "LibraryImplSlices" | "LibraryResolutions" | "Resolutions"
-            | "ScopeInput" | "ServedBodies" | "SliceDirectory" | "SourceNames"
-            | "TraitImplsSlice" => Writer::Derived,
+            | "PagedDefMaps" | "ScopeInput" | "ServedBodies" | "SliceDirectory"
+            | "SourceNames" | "TraitImplsSlice" => Writer::Derived,
             _ => Writer::Unattributed,
         }
     }
