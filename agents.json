@@ -1209,6 +1209,18 @@
    "workaround": "stopped it with its own binary",
    "fix": "`--version` prints both the launcher and the version it runs; `stop` names the daemon on the socket whatever built it",
    "state": "open"
+  },
+  {
+   "id": "A38",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+   "where": "docs/harness.md, the workflow table",
+   "what": "Two rows for `blaze.yaml` (`gate`) stood one after the other and disagreed: one said `blaze test`, only the tests the change reached, and check with `--all-targets`; the other `blaze test --workspace`, every test, and no `--all-targets`. The workflow runs every test (harness/unittests.py with no `reached`, blaze-platform.yaml:148) and both checks (blaze.yaml:439, :447). Found by the blaze-d4 session.",
+   "cost": "a current doc that was half wrong either way you read it",
+   "cause": "commit 2476469518 (2026-11-10) added the new row and left the old one; nothing checks a table for two rows with the same first cells",
+   "workaround": "merged into one true row",
+   "fix": "the docs check refuses a table with two rows whose first two cells are equal",
+   "state": "open"
   }
  ]
 }
