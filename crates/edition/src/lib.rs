@@ -171,11 +171,11 @@ impl BlazeEdition {
         }
     }
 
-    /// Its crate attribute as given on a command line (rustc's `-Z crate-attr`, no `#![` and
-    /// `]`): `blaze::edition = "2026.11"`.
+    /// Its crate attribute as a crate is given it beside its root's own (base-db's
+    /// `crate_attrs`, each with `#![` and `]` around it): `#![blaze::edition = "2026.11"]`.
     pub const fn crate_attr(self) -> &'static str {
         match self {
-            BlazeEdition::Blaze2026_11 => "blaze::edition = \"2026.11\"",
+            BlazeEdition::Blaze2026_11 => "#![blaze::edition = \"2026.11\"]",
         }
     }
 
@@ -290,7 +290,7 @@ mod blaze_edition_tests {
             assert_eq!(BlazeEdition::from_version(it.version()), Some(it));
             assert_eq!(BlazeEdition::from_manifest(it.manifest()), Ok(Some(it)));
             assert_eq!(it.manifest(), format!("{}{}", BlazeEdition::MANIFEST_PREFIX, it.version()));
-            assert_eq!(it.crate_attr(), format!("{} = \"{}\"", BlazeEdition::ATTR, it.version()));
+            assert_eq!(it.crate_attr(), format!("#![{} = \"{}\"]", BlazeEdition::ATTR, it.version()));
             assert_eq!(it.prelude(), format!("blaze_{}", it.version().replace('.', "_")));
             assert_eq!(it.to_string(), it.manifest());
         }

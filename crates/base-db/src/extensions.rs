@@ -229,8 +229,7 @@ mod tests {
         // edition twice is that edition.
         let mut said = SaidBlazeEdition::None;
         leading_blaze_edition("#![blaze::edition = \"2026.11\"]", Edition::CURRENT, &mut said);
-        let attr = format!("#![{}]", BlazeEdition::Blaze2026_11.crate_attr());
-        leading_blaze_edition(&attr, Edition::CURRENT, &mut said);
+        leading_blaze_edition(BlazeEdition::Blaze2026_11.crate_attr(), Edition::CURRENT, &mut said);
         assert_eq!(said, is, "the attribute `BlazeEdition::crate_attr` gives is the one read");
     }
 
