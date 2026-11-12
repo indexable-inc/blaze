@@ -4419,7 +4419,12 @@ impl<S: Steps> Jobs<S> {
         if !looked.is_empty() {
             // alloc: once a build that looked, the paths as text
             let paths: Vec<String> =
-                looked.iter().map(|(path, times)| format!("{} ({times})", path.display())).collect();
+                looked
+                    .iter()
+                    .map(|(path, times)| {
+                        format!("{} ({times}: {})", path.display(), blaze_vfs::outside::why_looked(path))
+                    })
+                    .collect();
             tracing::info!(
                 target: "blaze",
                 root = %root,

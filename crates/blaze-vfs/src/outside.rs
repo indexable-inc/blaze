@@ -589,6 +589,31 @@ pub fn last_look() -> Option<PathBuf> {
     (!last.as_os_str().is_empty()).then(|| last.clone())
 }
 
+/// Why no watch vouches for `path` now, for a person: the directory wanted at or above it and
+/// its two generations beside the table's, or that none is wanted. Cold: asked of the few
+/// paths a build names as looked at.
+pub fn why_looked(path: &Path) -> String {
+    let dirs = &*DIRS;
+    let settled = dirs.hot.settled.load(Ordering::Acquire);
+    let now = dirs.generation();
+    // alloc: a reason, once a path named
+    match dirs.cover(path) {
+        None => format!("no directory at or above it is wanted watched (of {} wanted; settled {settled})", dirs.len()),
+        Some(cover) => {
+            let dir = cover.dir();
+            let since = match dir.since() {
+                UNCONFIRMED => "unconfirmed".to_owned(), // alloc: as above
+                since => since.to_string(),
+            };
+            format!(
+                "under the wanted {}: watched since generation {since}, last change heard at {}, now {now}, settled {settled}",
+                dir.path().display(),
+                dir.changed()
+            )
+        }
+    }
+}
+
 /// How many looks ([`looked`]) this process has made. A stretch of work across which it did
 /// not move checked no path outside every view on the disk: each it checked was vouched for by
 /// a watch, which [`quiet_since`] then covers.
