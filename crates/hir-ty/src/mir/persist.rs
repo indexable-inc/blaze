@@ -381,11 +381,43 @@ pub(crate) fn read<'db>(
     buffer: &[u8],
     locations: Locations<'_>,
 ) -> Result<MirBody<'db>, FormatError> {
+    read_in(db, buffer, Bounds::of(locations.store), Some(locations))
+}
+
+/// How many expressions, patterns and bindings the store of a body has: what [`read_in`]
+/// checks every index of the body's store against. [`Bounds::of`] counts a store that is
+/// there; a record of a crate no edit reaches keeps the counts of the store its writer had
+/// (`check_cache::runtime`), so its reader lowers no body to have them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Bounds {
+    pub(crate) exprs: u32,
+    pub(crate) pats: u32,
+    pub(crate) bindings: u32,
+}
+
+impl Bounds {
+    pub(crate) fn of(store: &ExpressionStore) -> Bounds {
+        Bounds {
+            exprs: table_len(store.expr_count()),
+            pats: table_len(store.pat_count()),
+            bindings: table_len(store.bindings().count()),
+        }
+    }
+}
+
+/// [`read`] against `bounds`, with the location literals only when the body has any: with
+/// `None` a location slot in the words is refused by name (the writer said the body has none),
+/// and nothing of the body's store is read.
+pub(crate) fn read_in<'db>(
+    db: &'db Db,
+    buffer: &[u8],
+    bounds: Bounds,
+    locations: Option<Locations<'_>>,
+) -> Result<MirBody<'db>, FormatError> {
     let root = open_as::<MirRoot>(buffer, SCHEMA)?;
     let tys = TyTableReader::open(DbInterner::new_no_crate(db), buffer, root.tys)?;
     let allocs = root.allocs.follow(buffer)?;
     let words = root.words.follow(buffer)?;
-    let store = locations.store;
     let mut decode = Decode {
         db,
         words,
@@ -399,9 +431,9 @@ pub(crate) fn read<'db>(
         buffer,
         locals: 0,
         blocks: 0,
-        exprs: table_len(store.expr_count()),
-        pats: table_len(store.pat_count()),
-        bindings: table_len(store.bindings().count()),
+        exprs: bounds.exprs,
+        pats: bounds.pats,
+        bindings: bounds.bindings,
         locations,
     };
     let body = decode.body()?;
@@ -1319,7 +1351,8 @@ struct Decode<'a, 'db> {
     exprs: u32,
     pats: u32,
     bindings: u32,
-    locations: Locations<'a>,
+    /// The body's location literals; `None` for a body its writer said has none.
+    locations: Option<Locations<'a>>,
 }
 
 type R<T> = Result<T, FormatError>;
@@ -1868,7 +1901,11 @@ impl<'a, 'db> Decode<'a, 'db> {
         let Some(MirSpan::ExprId(expr)) = span else {
             return Err(self.invalid("a location slot with no expression"));
         };
-        let locations = self.locations;
+        let Some(locations) = self.locations else {
+            return Err(self.invalid(
+                "a location slot in a body written as one with no location literal",
+            ));
+        };
         if !locations.has(expr) {
             return Err(
                 self.invalid("a location slot of an expression that is no location literal now")

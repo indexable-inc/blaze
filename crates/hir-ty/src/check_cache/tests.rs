@@ -447,3 +447,40 @@ fn a_ported_buffer_naming_an_unknown_item_is_refused() {
     let cut = Aligned::copy_from(&cut);
     assert!(port::Reader::open(&db, interner, &cut, &mut |_| None).is_err());
 }
+
+/// What `served_inference` bounds a record's nodes by is kept in the record, so a served body
+/// is read without lowering it: the counts a part keeps of each body are those of the body's
+/// store in the database that reads it. (That no `Body::of` row runs on a served read is the
+/// build's to count: `query_counts` of a dependent whose dependency is served.)
+#[test]
+fn a_record_keeps_the_node_counts_of_its_bodys_store() {
+    let bytes = written();
+    let (db, dep) = second();
+    let aligned = Aligned::copy_from(&bytes);
+    let part = part::open(&aligned).unwrap();
+    let mut read = 0;
+    for def in crate_body_owners(&db, dep) {
+        let Some(body) = body_key(&db, def).and_then(|key| part.find(&key)) else { continue };
+        let kept = part::open_body(body).unwrap().nodes();
+        let own = Nodes::of(Body::of(&db, def));
+        assert_eq!((kept.exprs, kept.pats), (own.exprs, own.pats), "{def:?}");
+        read += 1;
+    }
+    assert!(read >= 10, "the fixture's bodies are in the part: {read}");
+}
+
+/// The control: a record whose counts are another body's is refused by the read they bound
+/// (a node past them), so the counts are what the read rests on.
+#[test]
+fn the_oracle_catches_node_counts_that_are_not_the_bodys() {
+    let bytes = written();
+    let (db, dep) = second();
+    let aligned = Aligned::copy_from(&bytes);
+    let part = part::open(&aligned).unwrap();
+    let items = part.items(&db, dep).unwrap();
+    let def = DefWithBodyId::FunctionId(function(&db, dep, "area"));
+    let body = part::open_body(part.find(&body_key(&db, def).unwrap()).unwrap()).unwrap();
+    assert!(body.inference(&db, dep, &items, body.nodes()).is_ok());
+    let none = Nodes { exprs: 0, pats: 0 };
+    assert!(body.inference(&db, dep, &items, none).is_err(), "no node is below a count of 0");
+}

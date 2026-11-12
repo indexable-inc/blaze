@@ -128,7 +128,7 @@ const SCHEMA: SchemaHash = schema_of(&[
 ]);
 
 /// What a [`place`] part is when the owner has none of it.
-const NONE: u64 = u64::MAX;
+pub(crate) const NONE: u64 = u64::MAX;
 
 #[cfg(test)]
 thread_local! {
@@ -212,7 +212,7 @@ fn place<'db>(db: &'db Db, owner: MirOwner<'db>) -> Option<(DefWithBodyId, Schem
 
 /// The body `owner` is of, and where in it when `owner` is an anonymous constant of it: its
 /// expression and whether it may use the body's generic parameters.
-fn in_body(db: &Db, owner: InferBodyId<'_>) -> Option<(DefWithBodyId, u64)> {
+pub(crate) fn in_body(db: &Db, owner: InferBodyId<'_>) -> Option<(DefWithBodyId, u64)> {
     match owner {
         InferBodyId::DefWithBodyId(def) => Some((def, NONE)),
         InferBodyId::AnonConstId(it) => {
@@ -240,7 +240,7 @@ fn schema_at(tag: u64, anon: u64, expr: u64, kind: u64) -> SchemaHash {
     ])
 }
 
-fn kind_code(kind: ClosureKind) -> u64 {
+pub(crate) fn kind_code(kind: ClosureKind) -> u64 {
     let coroutine = |kind: CoroutineKind| match kind {
         CoroutineKind::Async => 0,
         CoroutineKind::Gen => 1,
