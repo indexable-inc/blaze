@@ -140,7 +140,9 @@ fixes one version; stubs are a few hundred KB and let a build pick its floor. bl
 stub shared objects itself (blaze-link writes ELF already) from the abilist in the sysroot
 archive, so no stub file is shipped per version. The floor is glibc 2.17, rustc's own for its
 Linux GNU targets. The default is 2.28 (2018: Debian 10, RHEL 8, every distribution still
-supported in 2026), which every symbol std's Linux code links has; a workspace changes it with
+supported in 2026); std's Linux code links four symbols newer than that (`fstat64`, `stat64`,
+`lstat64` and `fstat` are `GLIBC_2.33`: before it they are wrappers of `libc_nonshared.a`), which
+the start object carries ([Cross compilation](#cross-compilation)); a workspace changes it with
 `[workspace.metadata.blaze] glibc = "2.17"`, and the version is part of the target key. A symbol a
 crate links that the chosen version lacks is a link error naming the symbol, the version that
 has it and the setting. The ELF interpreter is a constant per architecture
@@ -180,6 +182,86 @@ through stage 1's correctness. Until that lands, `blaze-llvm.json` records the h
 (rule 2) builds the sandbox interposers and llvm-sys's wrappers with blaze-cc, and the C++ runtime
 is blaze-cc's static libc++, not `$CXX -print-file-name=libstdc++.a` or `-lc++`. `brew --prefix`
 goes; the pin already refuses any LLVM but ours.
+
+## Cross compilation
+
+What `blaze build --target T` needs so that it borrows nothing from the host, as `zig cc` does,
+and what of it is built (lane cross-1112, 2026-11-12; ledger row X1, whose check is
+`scripts/src/bin/cross.rs`). It builds slice 9's link half ahead of blaze-cc, for links of Rust
+alone, and differs from the text above in two places, each with its reason.
+
+**The line.** A link whose every native input is one blaze ships is a link of Rust alone
+(`blaze_link::target`, `Target::ships`): no sanitizer runtime, no rpath, and each library a
+plain `-l` of the target's C library. It takes blaze's inputs and asks the machine nothing: no
+program is run, no file of the machine read, for a native build as for a foreign one. Any other
+link (a `-sys` crate's archive, a system library, a framework) takes the machine's C toolchain
+for all of it, as before this section, since an object compiled against the machine's libc
+goes with that libc; its files are hashed into the image's natives as they always were. That
+second kind is what slices 8 to 10 remove. Decided by the link's inputs, never by trying one
+and falling to the other.
+
+**glibc.** blaze-link ships, per architecture, which symbols each glibc library exports at each
+release 2.17 to 2.44 (`crates/blaze-link/src/target/shipped/glibc-<arch>.abilist`, 231 KB for
+both), generated from glibc's own `.abilist` files at each release tag
+(`glibc-commits.json` names the commits; `scripts --bin cross`, `glibc-list`), as Zig's
+abilists are. Names and versions only, none of glibc's code (glibc is LGPL-2.1-or-later). A link
+for release R imports each symbol at the newest version its library has at R. Differs from
+"blaze generates the stub shared objects": the list is made into the linker's model of a shared
+object directly, in memory, and no ELF stub is written, since blaze-link would only read it
+back; stub files are for C build systems' own links through lld, which is slice 8. `libgcc_s`
+is a list of the unwinder's 18 symbols, equal to a real `libgcc_s.so.1`'s on AArch64. The
+release is 2.28 for every link today: reading it from the triple (`-gnu.2.17`) or the workspace
+setting above is not built.
+
+**Start objects.** `Scrt1.o`, `crti.o`, `crtn.o`, `crtbeginS.o` and `crtendS.o` are replaced,
+for a link of Rust alone, by one object blaze-link makes in process (`shipped::start`): `_start`
+entering `__libc_start_main` with blaze's own runner of `.init_array` (every glibc calls an
+`init` it is given, and runs the array itself only when given none), the `__cxa_finalize` call
+of `crtbeginS.o`, and before 2.33 the eight `stat` wrappers of `libc_nonshared.a`. Differs from
+"crt objects built from glibc's source by our clang": that needs blaze-cc (slices 3 and 13),
+and one `Scrt1.o` per release with its `libc_nonshared.a`; these few instructions per
+architecture are written by hand in the linker, as its sanitizer constructors are, and are the
+same for every release. Links with C keep the machine's objects until the sysroot archives exist.
+
+**The interpreter.** A build with `--target` names the target ABI's path
+(`/lib64/ld-linux-x86-64.so.2`, `/lib/ld-linux-aarch64.so.1`), so its bytes are the same on
+every host. A build for the host with no `--target` (and every build script and proc macro) is
+to run here, so it names the loader blaze itself runs under, read from blaze's own image: on
+nix that is the only loader there is.
+
+**macOS.** blaze-link ships `shipped/libSystem.tbd` (20 KB, 1,122 symbols, arm64): every name
+Rust's `library/` declares (`fn`, `static`, `link_name`; the `libc` crate and std, MIT or
+Apache-2.0) that the SDK's libSystem exports, written by `scripts --bin cross`
+(`darwin-list`) on a Mac. No text of the SDK is copied; the SDK is used to drop declared
+names libSystem lacks. So a darwin build of Rust alone needs no SDK, clang or `otool`, on
+Linux or on a Mac. Whether shipping even this list is allowed is the legal question the
+paragraph above leaves to settle, and stays the owner's to answer before a release carries it;
+Zig ships Apple's whole `libSystem.tbd`. A program that names a libSystem symbol outside the
+list, a framework or another library links with the SDK.
+
+**musl, or no libc.** Not built. Decided: musl as one more pinned archive (first the pinned
+nightly's `rust-std` for the musl triple, which has `crt1.o`, `libc.a` and `libunwind.a` in
+`self-contained/` and arrives as wasi-libc does today), since a static target with its C
+runtime as a Rust crate (as `wasm64-blaze-wasip1` has) means writing what std takes from libc
+on Linux: threads and their TLS, `getaddrinfo`, `dl_iterate_phdr`, the allocator, about 300
+symbols (the 316 a hello world imports from glibc today). [sys.md](sys.md) does that for
+blaze's own crates, on bstd; user programs' std gets musl. It needs a static ELF executable
+from blaze-link (it writes only dynamic ones) and the musl triples in its targets.
+
+**C in build scripts.** Slices 3, 4 and 8 stand: blaze-cc from the pinned LLVM, not Zig as a
+fetched compiler. Zig would bring a second LLVM beside the pinned one and its own driver and
+release cadence; its sizes and target list were not measured in this lane.
+
+**LLVM for another target.** `llvm.py build` writes a link manifest into `blaze-llvm.json`
+(version, targets built, the libraries in link order, system libraries, C and C++ flags, build
+mode: what its own `llvm-config` said when the archive was built) and merges the static
+libraries into one, `libLLVMBlaze.a`; `vendor/llvm-sys` answers every question from the
+manifest and runs no `llvm-config` (`pin.rs`, `pin_answer`), so an archive for another platform
+links from any host. One static archive, not one shared library: a link takes only the members
+it reaches (blaze-engine is 302 MB against 280 MB of archives on AArch64 Linux), and a shared
+libLLVM would be loaded and bound whole at each start of the engine. The archives llvm.json
+pins today predate the manifest, so today's builds still run `llvm-config`; that path goes when
+the archives are rebuilt.
 
 ## What is an error
 
@@ -234,7 +316,8 @@ Each lands alone, keeps the tree building, and leaves no fallback behind it.
    the inherited values are dropped and said once; `[workspace.metadata.blaze.c] system-cc` is the
    keyed opt-out, and `blaze-codegen-code` `unkeyed_env` is deleted. Tested by real `-sys` crates'
    own suites (cc-rs's, openssl-sys vendored, zstd-sys, libgit2-sys) under blaze.
-9. **Linux libc from blaze.** The Linux sysroot archives (glibc headers, abilist, crt, UAPI
+9. **Linux libc from blaze.** (The link half, for links of Rust alone, is built:
+   [Cross compilation](#cross-compilation).) The Linux sysroot archives (glibc headers, abilist, crt, UAPI
    headers); blaze-link generates the glibc stubs for the key's version and takes crtbegin/crtend
    from compiler-rt; `c_driver`, `linker_dirs` and every `-print-file-name`/`-###` run are
    deleted; the interpreter is a constant; the glibc version joins the target key.
