@@ -109,9 +109,13 @@ impl State {
     /// A build of the database as it is, its puts kept. A panic is caught and counted: the
     /// daemon catches a job's too, and none is allowed.
     fn build(&mut self) -> Result<Built, String> {
-        let built = catch_unwind(AssertUnwindSafe(|| {
-            build(&self.db, &self.memo, &self.store, blaze_store_check::Setting::ALL, self.heap_to_stack)
-        }));
+        // `BLAZE_REVISIONS_STORE_CHECK=off`: a stale hit does not stop the build, so the
+        // oracle says everything that came of it (which bytes, relocations, data or lines).
+        let check = match std::env::var("BLAZE_REVISIONS_STORE_CHECK").as_deref() {
+            Ok("off") => blaze_store_check::Setting::OFF,
+            _ => blaze_store_check::Setting::ALL,
+        };
+        let built = catch_unwind(AssertUnwindSafe(|| build(&self.db, &self.memo, &self.store, check, self.heap_to_stack)));
         match built {
             Ok(built) => built,
             Err(payload) => {
@@ -425,6 +429,7 @@ sim! {
     an_edit_after_a_kill
     an_edit_after_a_restart
     an_impl_overriding_a_provided_method_changes_its_vtable
+    an_override_beside_a_required_method_changes_the_vtable
 }
 
 /// Every case that names `sim` runs here: one no list holds would never run.

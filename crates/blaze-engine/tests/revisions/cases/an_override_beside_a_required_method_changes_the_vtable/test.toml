@@ -1,0 +1,13 @@
+about = "An impl that has the trait's required method is given its own copy of a provided one, three lines above the function that coerces to the `dyn`: found by the oracle (2026-11-12) as its smallest sequence, one turn."
+drivers = ["sim"]
+seeds = 1
+
+[[revision]]
+steps = ["edit"]
+action = "run"
+prints = "160 300 0 0 0\n"
+
+[[revision]]
+steps = ["edit"]
+action = "run"
+prints = "164 300 0 0 0\n"
