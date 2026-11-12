@@ -24,6 +24,7 @@ mod inhabitedness;
 mod lowering_errors;
 mod member_hygiene;
 mod method_resolutions;
+mod nested_macro_const_impls;
 mod pattern_variants;
 mod probe_errors;
 mod qualifier_resolutions;
