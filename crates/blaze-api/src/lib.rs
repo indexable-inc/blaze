@@ -104,8 +104,8 @@ use serde::{Deserialize, Serialize};
 /// `Work` when the daemon has it by then, so its client makes one round trip. 50:
 /// [`Targets::goal`] and [`Worked::tiers`], the build goal ([`Goal`]) and how much of the code
 /// a build linked is optimized. 51: [`Worked::storage`] ([`Storage`]: what the daemon's store
-/// and its home hold against their budget, on every build's end) and `unkept` of
-/// [`Request::Gc`]. 52: [`UnitOf::primary`], by which `check --fix` edits only the packages the
+/// and its home hold against their budget, on every build's end), `unkept` of
+/// [`Request::Gc`], and [`Status::placed_by`]. 52: [`UnitOf::primary`], by which `check --fix` edits only the packages the
 /// request asked for.
 pub const SCHEMA: u32 = 52;
 
@@ -1721,6 +1721,10 @@ pub struct Status {
     pub uptime_ms: u64,
     pub budget_bytes: u64,
     pub memory_bytes: u64,
+    /// How the daemon's store places outputs, decided once as it opened (by cloning where
+    /// its file system shares blocks, else by copying), in one sentence; `None` until it has
+    /// decided, and from a daemon that says none.
+    pub placed_by: Option<String>,
 }
 
 /// One build under way ([`Status::builds`]). Its fields are declared in the order CBOR writes

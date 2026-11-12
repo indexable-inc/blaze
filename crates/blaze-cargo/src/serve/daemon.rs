@@ -417,6 +417,7 @@ macro_rules! cx {
             budget_bytes: $daemon.plane.budget().map_or(0, |it| it.bytes),
             // The driver's clock starts as the daemon does.
             uptime_ms: u64::try_from($daemon.driver.now().as_millis()).unwrap_or(u64::MAX),
+            placed_by: $daemon.store.place_by().map(|it| it.said()),
             memory: blaze_mem::tag::snapshot,
             profile: blaze_profile::flight::dump,
             hot: crate::serve::observe::hot,
@@ -2869,7 +2870,18 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 // A step of its commit answered: a wait for it to make puts durable runs out
                 // only when the commit stands still, never because placements or reads come.
                 self.jobs.commit_moved(self.driver.now(), self.store.commit_steps());
-                let placed = self.store.placed();
+                let mut placed = self.store.placed();
+                // The boundary where the store's errors become messages for a person
+                // ([`super::rooted`]): the names in them, relative to the driver's root as a
+                // core prints them, are written as paths under it.
+                for it in &mut placed {
+                    if let Err(why) = &mut it.result {
+                        let out = super::rooted::dir_of(&it.to);
+                        let dirs: Vec<&FileName> =
+                            std::iter::once(self.store.dir()).chain(out.as_ref()).collect(); // alloc: an error path
+                        *why = super::rooted::rooted(why, std::path::Path::new("/"), &dirs);
+                    }
+                }
                 let mut said = self.spare.said.pop().unwrap_or_default();
                 self.jobs.placed(&mut world!(self, said), placed);
                 self.said(said);

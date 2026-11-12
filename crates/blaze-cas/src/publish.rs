@@ -15,6 +15,11 @@
 //!   file, so nothing of the file's dirty data is forced out by it.
 //! - Every write and rename made here takes a [`Durable`], with no default ([`write`],
 //!   [`rename`]).
+//! - Whether anything is cloned at all is the store's one decision, made as it opens
+//!   ([`crate::PlaceBy`]): where its file system cannot share blocks (ext4, tmpfs) every
+//!   place is a write of the value's bytes, no whole file is kept to clone from, and a
+//!   patched place copies the path's file with what changed written. What follows is of a
+//!   store that clones.
 //! - [`crate::Store::publish`] is the one entry that makes a path hold some [`Content`]: it
 //!   picks a write, a clone or a derive (a clone of a base and its ranges written) from what
 //!   the content is, and its place's span says which (`how`). [`crate::Store::place`] is a

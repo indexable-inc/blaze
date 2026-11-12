@@ -54,6 +54,7 @@ pub(crate) mod once;
 mod plane;
 mod settle;
 mod pulse;
+mod rooted;
 pub(crate) mod said;
 pub mod settings;
 pub(crate) mod signals;

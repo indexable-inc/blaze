@@ -7207,7 +7207,10 @@ impl<S: Steps> Jobs<S> {
                     self.end_placing(id, path);
                     // alloc: an error, once
                     let error =
-                        ApiError::new(format!("placing /{to}: {why}"), Some(format!("/{to}")));
+                        ApiError::new(
+                            format!("placing {}: {why}", to.under(std::path::Path::new("/"))),
+                            Some(to.under(std::path::Path::new("/")).to_string()),
+                        );
                     self.placing_failed(id, path, error);
                 }
             }

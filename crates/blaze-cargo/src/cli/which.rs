@@ -143,6 +143,7 @@ mod tests {
                         memory_bytes: 0,
                         budget_bytes: 0,
                         uptime_ms: 40,
+                        placed_by: None,
                         build: self.build.clone(),
                         bugs: Vec::new(),
                         builds: Vec::new(),

@@ -248,6 +248,29 @@ impl fmt::Display for FileName {
     }
 }
 
+impl FileName {
+    /// The name as a path under `root`, the root of the driver that carries out its effects:
+    /// how a driver writes a name for a person. A core prints its names as they are, relative
+    /// to that root, which it does not know; where a core's message becomes one a person
+    /// reads, the driver writes each name through this.
+    pub fn under<'a>(&'a self, root: &'a std::path::Path) -> Under<'a> {
+        Under { name: self, root }
+    }
+}
+
+/// A [`FileName`] written as a path under a root ([`FileName::under`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Under<'a> {
+    name: &'a FileName,
+    root: &'a std::path::Path,
+}
+
+impl fmt::Display for Under<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.root.join(self.name.as_str()).display())
+    }
+}
+
 /// The most bytes one [`Effect::Prewarm`] asks the system to read ahead: what a program's last
 /// run held of its image is a few MiB to tens; a file held whole (one just written) is asked
 /// for up to this from its start, so no prewarm reads a large image from the disk whole.

@@ -56,6 +56,9 @@ pub struct Daemon<'a> {
     pub budget_bytes: u64,
     /// How long the daemon has run, on its driver's clock, for [`Status::uptime_ms`].
     pub uptime_ms: u64,
+    /// How the daemon's store places outputs, once its open decided, for
+    /// [`Status::placed_by`].
+    pub placed_by: Option<&'static str>,
     /// blaze-mem's counters as they are now, for [`Response::Memory`]:
     /// `blaze_mem::tag::snapshot` in the daemon, read only when asked.
     pub memory: fn() -> Snapshot,
@@ -767,6 +770,8 @@ impl Session {
                     memory_bytes: cx.memory_bytes,
                     budget_bytes: cx.budget_bytes,
                     uptime_ms: cx.uptime_ms,
+                    // alloc: the reply's own copy, once per Status.
+                    placed_by: cx.placed_by.map(str::to_owned),
                     bugs: (cx.bugs)(),
                     // clone: the reply's own copy, once per Status; none when idle.
                     builds: cx.builds.to_vec(),

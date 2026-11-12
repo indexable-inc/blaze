@@ -305,6 +305,7 @@ mod tests {
             settings: Vec::new(),
             downloads: Vec::new(),
             uptime_ms: 0,
+            placed_by: None,
             budget_bytes: 0,
             memory_bytes: 0,
         };

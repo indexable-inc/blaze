@@ -634,6 +634,7 @@ impl Gen {
                 settings: self
                     .many(depth, |g| crate::Setting { name: g.text(), value: g.maybe(Gen::text) }),
                 uptime_ms: self.wide(),
+                placed_by: self.maybe_text(),
                 budget_bytes: self.wide(),
                 memory_bytes: self.wide(),
                 builds: self.many(depth, |g| crate::Building {

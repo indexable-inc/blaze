@@ -1636,6 +1636,9 @@ pub fn status_lines(status: &Status) -> String {
     if let Some(why) = &status.history {
         lines.push_str(&format!("history: {why}\n"));
     }
+    if let Some(how) = &status.placed_by {
+        lines.push_str(&format!("placing: {how}\n"));
+    }
     // The settings it was started with that are set: what a client setting other values is
     // refused over ([`crate::serve::settings`]).
     let set: Vec<String> = status

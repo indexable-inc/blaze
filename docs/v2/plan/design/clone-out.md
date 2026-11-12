@@ -37,10 +37,20 @@ reach a stored file through a shared inode.
 - **Bounded.** `Store::unplace` runs when a job places other bytes at a path: the old
   content's placed file goes (once no clone of it is in flight), so relinking doesn't leave one
   whole file per version. Clones already placed keep their blocks.
-- **No fallback.** A clone that can't share blocks (no reflink, or across volumes) fails the
-  place, naming both files and both volumes (mount point and file system on macOS; the
-  `f_type` and the device on Linux). Nothing copies instead. The build dir and the store are
-  both under `<root>`, so they share a volume unless `--target-dir` moves the build dir.
+- **One way a store, decided once.** Whether the store's file system shares blocks is found
+  as the store opens, by one clone of a small file in its own directory
+  (`blaze_cas::PlaceBy`, `Store::ask_shares`), said once in the daemon's log and in `blaze
+  daemon status` (`placing: ...`), and every place after is made that way. Where it shares
+  blocks: clones, as below. Where it does not (ext4, tmpfs): every place writes the value's
+  bytes from the store's records, the store keeps no whole file to clone from, and a patched
+  place reads the path's file, writes what changed over it and writes that; the build dir then
+  costs its bytes. Never one tried and the other done for a file: until 2026-11-12 a first
+  place was a write and every later one a clone, so a home on tmpfs or ext4 failed every build
+  after its first. A hard link is never made: it is the store's own inode, which a patched
+  place, a program writing its output, or a `chmod` would change. A clone that still fails (a
+  path on another volume than the store's) fails its place, naming both volumes (APFS's
+  container, `f_type` and the device on Linux). The build dir and the store are both under
+  `<root>`, so they share a volume unless `--target-dir` moves the build dir.
 - **Read-only, not immutable.** On APFS, `clonefile` copies the source's mode, owner and
   flags onto the clone (checked 2026-11-02: a 0o444 + `UF_IMMUTABLE` source gives a 0o444 +
   `UF_IMMUTABLE` clone), and writing the clone leaves the source unchanged (copy on write).

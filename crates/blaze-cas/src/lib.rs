@@ -4218,6 +4218,11 @@ impl Store {
         }
     }
 
+    /// The store's own directory, as its driver names it.
+    pub fn dir(&self) -> &FileName {
+        &self.tiers[0].dir
+    }
+
     /// How this store places outputs; `None` until its open decided ([`PlaceBy`]).
     pub fn place_by(&self) -> Option<PlaceBy> {
         self.place_by
