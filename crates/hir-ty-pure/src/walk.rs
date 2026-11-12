@@ -570,7 +570,10 @@ pub(crate) fn summary_in(db: &Db, env: StoredParamEnvAndCrate, instance: Instanc
     match dispatch::body_once(db, &env, of, &instance.args) {
         Ok(body) => {
             let cx = Cx::new(db, env);
-            ask_ahead(&cx, &body, &instance);
+            // VARIANT: the ask-ahead is not made (test-the-cause for the summary_in wait cycle).
+            if false {
+                ask_ahead(&cx, &body, &instance);
+            }
             summarize(&cx, &body, instance.def)
         }
         Err(error) => unlowered(db, &instance, &error),
