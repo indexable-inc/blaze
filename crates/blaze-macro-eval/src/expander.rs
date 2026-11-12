@@ -207,6 +207,17 @@ struct Library {
     settled: Lock<Option<Settled>>,
 }
 
+thread_local! {
+    /// A planted bug, for a test's control: an output that is kept by no store is never shown
+    /// to be the same from either state, as until 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static UNWRITABLE_IS_UNSHOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn planted_unwritable_is_unshown() -> bool {
+    UNWRITABLE_IS_UNSHOWN.get()
+}
+
 impl Library {
     /// Whether `other` is this library, or one loaded again of the same crate that runs the
     /// same code ([`Library::runs`]: the crate's code and its module) for the same daemon and
@@ -1185,26 +1196,27 @@ impl Evaluated {
         call: &ProcMacroCall<'_>,
         ran: &Ran,
         from: From,
+        output: &tt::TopSubtree,
         bytes: Option<&[u8]>,
         spans: &Spans,
         demote: bool,
     ) -> Result<Result<(), &'static str>, ProcMacroExpansionError> {
-        const UNSHOWN: &str = "its macro's crate settles, and it was not shown to give the same from the fresh state as from the settled one";
         const DIFFERS: &str = "its macro's crate settles, yet it gives otherwise from the fresh state than from the settled one, or its first calls leave other states: what it gives depends on whether it ran first";
         let library = &*self.library;
-        let Some(bytes) = bytes else { return Ok(Err(UNSHOWN)) };
         let (at, _) = db.nonce_and_revision();
         // The settled state, and the statics to run the other state from: none for the fresh.
         let other: Vec<(StaticId, Vec<u8>)> = match (from.replayed, from.start) {
-            (true, _) => return Ok(Err(UNSHOWN)),
+            (true, _) => return Ok(Err(concat!("its macro's crate settles, and it was not shown to give the same from the fresh state as from the settled one", ": it ran after its session's calls before it again"))),
             // From the fresh state: the settled one is what it left, or, when it left the state
             // as it was, the one first calls left before.
-            (false, None) if ran.statics.iter().any(|it| it.2) => return Ok(Err(UNSHOWN)),
+            (false, None) if ran.statics.iter().any(|it| it.2) => return Ok(Err(concat!("its macro's crate settles, and it was not shown to give the same from the fresh state as from the settled one", ": the state it left holds an address"))),
             (false, None) if !ran.statics.is_empty() => {
                 // clone: once per first call of a session of a crate that settles
                 let statics: Vec<(StaticId, Vec<u8>)> =
                     ran.statics.iter().map(|(id, bytes, _)| (*id, bytes.clone())).collect();
-                let Some(digest) = start_digest(db, &statics) else { return Ok(Err(UNSHOWN)) };
+                let Some(digest) = start_digest(db, &statics) else {
+                    return Ok(Err(concat!("its macro's crate settles, and it was not shown to give the same from the fresh state as from the settled one", ": the state it left has no digest")));
+                };
                 let mut settled = library.settled.lock();
                 if settled.as_ref().is_some_and(|it| it.digest != digest) {
                     drop(settled);
@@ -1221,7 +1233,7 @@ impl Evaluated {
             (false, None) => match &*library.settled.lock() {
                 // clone: once per such call, the statics it runs from
                 Some(it) if it.at == at => it.statics.clone(),
-                _ => return Ok(Err(UNSHOWN)),
+                _ => return Ok(Err(concat!("its macro's crate settles, and it was not shown to give the same from the fresh state as from the settled one", ": it ran from the fresh state and left it, and no first call of this database has left the settled state yet"))),
             },
             // From the settled state: the other is the fresh one.
             (false, Some(digest)) => {
@@ -1250,7 +1262,7 @@ impl Evaluated {
             self.run_on(db, calling, call, &other, &[], &this)?
         };
         if again.asked.is_some_and(|it| !it.by_position()) || again.unkeyable.is_some() || again.statics.iter().any(|it| it.2) {
-            return Ok(Err(UNSHOWN));
+            return Ok(Err(concat!("its macro's crate settles, and it was not shown to give the same from the fresh state as from the settled one", ": its run from the other state asked what no key covers, read what can't be keyed or left an address")));
         }
         // What the extra run did to the state says the crate's state too: from the settled
         // state it changes nothing, and from the fresh one it leaves nothing or the settled
@@ -1272,8 +1284,20 @@ impl Evaluated {
             }
             return Ok(Err(DIFFERS));
         }
-        let gave = self.output(&again, call.call_site).ok().and_then(|it| written(&it, spans));
-        match gave.as_deref() == Some(bytes) {
+        // The two outputs as they are kept, or, for an output that is kept by no store (it
+        // has an anchor or a context its input has not: a span the database joined for it),
+        // the two trees themselves, which are of one database and one revision. Until
+        // 2026-11-12 such an output was never shown, so a serde derive on a struct a
+        // `macro_rules!` made (its spans joined across two items) left its unit, and every
+        // unit above it, with no record: 46 units of reth made again in every build.
+        let again_tree = self.output(&again, call.call_site).ok();
+        let same = match bytes {
+            Some(bytes) => {
+                again_tree.as_ref().and_then(|it| written(it, spans)).as_deref() == Some(bytes)
+            }
+            None => again_tree.as_ref() == Some(output) && !planted_unwritable_is_unshown(),
+        };
+        match same {
             true => Ok(Ok(())),
             false => {
                 if demote {
@@ -1554,6 +1578,7 @@ impl Evaluated {
                 &call,
                 &ran,
                 from,
+                &output,
                 bytes.as_deref(),
                 &spans,
                 true,
@@ -1568,6 +1593,7 @@ impl Evaluated {
                     &call,
                     &ran,
                     from,
+                    &output,
                     bytes.as_deref(),
                     &spans,
                     false,
