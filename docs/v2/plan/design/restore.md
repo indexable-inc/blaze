@@ -172,6 +172,132 @@ restart under 1 s, then 300 ms. The largest single part is none of the kinds: 2,
 and kept by the allocator (transparent huge pages 1,134, sparse pages 293), which records
 take down only by taking the churn off the heap.
 
+## Memory: a bounded cache over records (2026-11-12, lane memstrat-1111; D21, D29)
+
+The daemon stays. What it holds becomes a cache with a budget over records in the store; this
+section is the order the records section above is built in, with what Relax does beside it.
+
+**Measured, one machine** (18-core Mac, 2026-11-12; Relax `cea21cc` release build, blaze
+`3a58d0cbae` cargo-built; medians, n = 9 a row for Relax and 20 to 40 for blaze, every run's
+output and status checked; scripts in the lane's report). Relax's memory is the run's peak, since
+no process outlives a run; blaze's is the idle daemon after a cold build and five edits.
+
+| | Relax hello | blaze hello | Relax, six dependencies | blaze, six dependencies |
+|---|---|---|---|---|
+| cold | 0.69 s, 250 MB resident | 8.6 s | 4.4 s, 532 MB | 27.4 s |
+| no-op run | 52.5 ms, 87 MB (footprint 50) | 11.6 ms | 60.4 ms, 130 MB (66) | 36.0 ms |
+| comment edit + run | 90.2 ms, 117 MB (71) | 47.4 ms | 112.2 ms, 194 MB (113) | 102.2 ms |
+| body edit + run | 101.3 ms, 127 MB (79) | 120.4 ms | 118.8 ms, 212 MB (126) | 255.6 ms |
+| held between runs | nothing | 5,574 MB resident, footprint 3,641 | nothing | 7,212 MB, footprint 5,003 |
+| on disk | 41 MB, 1.8 MB more an edit | 765 MB | 146 MB | 1,119 MB |
+
+The 37.8 MB first quoted for Relax was a run that failed (`relax run hello` from the parent
+directory finds no manifest and exits 1). The dependencies are regex, hashbrown, bitflags, itoa,
+memchr and smallvec (Relax substitutes its own smallvec).
+
+**How Relax does it** (its code, `libs/relax/`): a process a run over content-keyed store
+files (`<target>/makepad-run/cache/*.rcs`), mapped read-only and shared
+(`compiler/src/pack.rs:41-65`), never a daemon.
+
+| Phase | Relax keeps on disk, and reads back | blaze today (hello-world, Linux) |
+|---|---|---|
+| lex, parse | a file's tokens, trees and positions as plain arrays, one image a file (`base/src/image.rs:1`, `compiler/src/front.rs:1`), read in place from the mapping: 0.0 MB of 14 MB on the heap; only files the program's names reach (`front/src/lazy.rs:1`): 174 files, 73k of its std's 134k lines | all of std parsed and expanded (24,700 item trees, 45,238 expansions run cold); heap `parse` 166 and `expand` 77 MiB held |
+| names, definitions, the type table | the whole collected program as one image (`compiler/src/cache/collected.rs:1`: 25,560 definitions, 9.4 MB), behind one certificate of every input; a changed crate and every crate above it are collected again whole (`collected.rs:62`) | def maps and name resolution's state 215 MiB heap and 238 MiB regions; an image a dependency, decoded to the same heap values after the crate was resolved from source |
+| type and borrow check | results not kept: a clean verdict a body owner (`cache.rs:61`), and a crate that an edit reaches is checked again whole (`cache.rs:96`, `:115`: one body edit in a path dependency checked both crates, 3 body owners); a dependency's body is checked when first called | 2.1 million query rows with their graph: 713 MiB of regions, 211 MiB heap |
+| IR | not kept (an in-process memo of 64 MB at most, `bmemo.rs:43`) | let go at a build's end |
+| machine code | a function's code with relocations by stable identity, keyed by its body and the closure hash of the items its names reach (`cache.rs:1`, `cache/deps.rs:1`); the start's slots as one image linked before `main` (`cache/image.rs:1`: 110 slots in 3.3 ms); everything else on first call | 60,391 MIR bodies made cold; link and codegen tables 238 MiB heap, 133 MiB regions, held |
+| the allocator | the process ends | 2,141 to 2,219 MiB freed and kept, 1,200 of it huge pages |
+
+**What Relax gives up.** Every run starts again: process, crate graph (9 to 12 ms), mappings,
+link; so its no-op is 52 ms where blaze's is 12, and it writes new images after each edit
+(28 ms of the run, 1.8 MB an edit). Its front end is incremental a crate, not an item.
+Its memory grows with the project (87 to 130 MB warm and 127 to 212 MB an edit, from 4 to 16
+crates) and nothing bounds it. It compiles its own 134k-line std, a function at its first
+call, so a dependency's body with an error is found when it runs. Not measured: its live
+session (`relax live`) and check server (`relax serve`), where a process does stay.
+
+**What blaze takes from it**: read results in place from immutable files; reach a
+dependency only through what the program names; link what did not change without the front
+end. **What blaze keeps that Relax cannot have**: no reload on a no-op, results shared by
+every project and session of the machine (Relax keeps a copy a target directory), and memory
+held to a budget, not to the project's size.
+
+**The strategy.**
+
+1. *Warm, in memory*: the workspace crates' memos (what an edit of them reads and writes), the
+   interner's part they name, the running program's patch tables, and the pool's pages read
+   since its sweep last came by. Nothing else.
+2. *Records only, through the pool on demand*: every sealed crate's front end (interface:
+   names to items, signatures, impls by self type and trait; then bodies and MIR by body key)
+   and all machine code. A sealed crate is one `HIGH` leaf; its rows have no value on the heap
+   and no edges.
+3. *Never loaded on a warm run*: a sealed crate's syntax, item trees, expansions, def-map
+   internals and the bodies nothing asks for. A sealed crate costs its interface pages the
+   workspace reads and the code the program reaches, nothing by its source size.
+4. *An edit* pages in the edited file, the workspace rows its change reaches, and the
+   interface pages those rows name; the sweep's second-chance bit keeps them for the next.
+5. *The budget* is on footprint (rule one-memory-measure): idle, hello-world holds at most
+   48 MiB (Relax peaks at 50 a run, 87 resident), of it the pool at most 32; it grows by the
+   workspace's own items (about 1 KiB an item), never by the dependencies. Working, the pool's
+   share is `Tag::Pool`'s as today. The idle give-back and the squeeze enforce it with the one
+   evictor.
+6. *The allocator's kept memory*: mimalloc on base pages (done, below); a task's scratch on
+   its frame, returned whole; what outlives a task a record, so the general heap holds only
+   workspace memos and no page is pinned by a stray live block. An allocator of blaze's own is
+   not needed by any measurement so far.
+
+**Order**, each with its measure on `measure.py` (Linux aarch64 VM of 32 cores, home and
+project on tmpfs after the VM's memory was fully added: its disk and its memory hot-add each
+moved a row by 2 to 6 times until taken out, `agents.json` memstrat-h1):
+
+| Step | What | Milestone | State |
+|---|---|---|---|
+| a | mimalloc on base pages (`no_thp`) | 1.2 GiB less resident; edit rows within the runs' spread | built |
+| c | the pool's give-back has callers: one lap of the sweep each 30 s of idleness, every unpinned page at the limit's line and on a pressure event | the pool's pages of an idle daemon go (66 MiB to 0 after 60 s); no row moves | built |
+| b0 | a library's rows not kept as readers (lane records-1111's shed, `2b173f8632`) | 100 MiB live less | measured here, left off: a comment edit 20.0 to 34.7 ms |
+| b1 | a sealed crate's tables (`Resolutions`, `ImplSlices`, the crate graph, source roots) as `HIGH` leaves apart from the workspace's; then its rows keep no edges | library rows at `HIGH` (181,865 of 2.1 million today); 320 MiB live less | not built |
+| b2 | def maps and impl tables read in place; name resolution's state dropped for a sealed crate | 470 MiB less; under 2 GB | not built |
+| b3 | syntax, item trees and expansions of a sealed crate not held; signatures not memoized | 660 MiB less; under 1 GB | not built |
+| b4 | link and codegen tables as records | 400 MiB less; under 500 MB | not built (the engine's edit path is another lane's) |
+| d | restart and cold start read records: F2 and R8, then R7 | first no-op after a restart under 300 ms; then an idle daemon may drop to the budget | not built |
+
+b2 to b4 and d are each a change of what a crate's front end is in memory (ids that mean the
+same in every process, tables read in place), a lane a kind of record; nothing short of them
+takes the 3 GiB that is live.
+
+**Built** (branch `memstrat-1111`; hello-world, medians, each cell one run; base is main
+`3a58d0cbae`; `a` is main with `no_thp` alone; `a and c` is the branch with the pool trimmed
+2 s into idleness, as it first was):
+
+| | base, four runs | a, two runs | a and c, two runs |
+|---|---|---|---|
+| resident, idle after a cold build and five edits, MB | 5,291, 5,397, 5,460, 5,317 | 4,143, 4,159 | 4,095, 4,109 |
+| of it transparent huge pages | 1,184 to 1,240 | 80, 76 | 86, 126 |
+| of it freed and kept by the allocator | 2,141 to 2,219 | 988, 961 | 972, 978 |
+| the pool's pages, MiB | 64 to 67 | 67 | 7, 8 |
+| no-op build, ms | 13.9, 13.7, 13.0, 15.7 | 12.2, 13.1 | 13.1, 15.4 |
+| no-op run | 18.2, 17.9, 16.8, 19.6 | 17.6, 16.5 | 14.7, 18.2 |
+| body edit + run (n = 40) | 108.6, 101.7, 111.2, 124.1 | 111.0, 109.7 | 108.8, 112.5 |
+| comment edit + run | 23.4, 22.7, 22.7, 22.7 | 23.7, 22.6 | 20.0, 21.2 |
+| body edit 3.5 s after the last | 115.6, 98.6, 117.7, 120.5 | 114.4, 117.4 | 121.2, 129.0 |
+| body edit 8 s after the last | 122.9, 106.2, 107.5, 127.4 | 120.2, 127.0 | 115.0, 124.4 |
+| first no-op and first edit after a restart, s | 3.8, 10.4 | not run | 4.3, 9.6 |
+| resident after the restart's builds, MB | 6,208 | not run | 4,734 |
+
+The pool trimmed 2 s into idleness shows in the 3.5 s row, so the branch as it stands trims
+each 30 s of idleness (`serve::idle::POOL_AFTER`): on a live daemon the pool is 66 MiB until
+the second lap, 60 s in, and 0 after it. With that wait an edit loop never meets the trim, so
+its rows are column `a`'s; the branch's own run of them was cut short by the VM (its first
+four rows, before that: 14.0, 15.6, 106.3 and 22.6 ms), and the 3.5 s and 8 s rows of the
+branch as it stands are not measured. Step a's price is not in this table: a daemon's edits
+96 to 135 are 207 and 210 ms on main (against 110 for its first 40, which no lane has
+explained) and 266 and 252 on base pages (`crates/blaze-engine/src/huge.rs` has that table and
+what follows if the growth stays).
+
+Tried and left out, each built and measured: a purge delay under mimalloc (300 MB more held,
+no row faster); the flight recorder's read room by bytes (the `profile` holder 64 to 76 MiB to
+58, a comment edit 22.7 to 26.6 ms).
+
 ## A second kind of target, and where a restart's time goes (2026-11-11, lane share-front-1111)
 
 Read from the profile of a hello-world on an 18-core Mac (`query_counts`, `misses`,

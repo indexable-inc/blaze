@@ -72,6 +72,33 @@
    "do": "Write it against the sans-IO core under the simulation, as a revision case where it is an edit sequence (crates/blaze-engine/tests/revisions/), with a planted-bug control; use a real daemon only for what a kernel alone shows.",
    "why": "Rule simulate-first.",
    "state": "current"
+  },
+  {
+   "id": "memstrat-h1",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+   "task": "Time blaze's edit loop on an ix VM",
+   "do": "Put BLAZE_HOME and the project on tmpfs (/dev/shm), and before the first measurement fill the VM's memory once so its hot-add is over (a script that holds about 116 GiB of bytes for a moment on a 128 GiB VM; MemTotal in /proc/meminfo stops growing). Alternate the binaries compared, at least two pairs, and compare pairs, not single runs; nothing else may run (no cargo, no second daemon). Memory numbers do not need any of this: they repeated within 2% from the first run. Check MemTotal again before each run: the host takes memory back from a VM that stops using it, and the rows are noisy while it does.",
+   "why": "On the VM's root disk a no-op run was 83 to 144 ms where tmpfs gives 17, and while virtio-mem was still adding memory (dmesg: `virtio_mem ... add_memory`, about 50 ms each, in bursts) the same binary's no-op build was 13.9 ms in one run and 81.4 in the next.",
+   "state": "current"
+  },
+  {
+   "id": "memstrat-h2",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+   "task": "Copy blaze's pinned LLVM from one ix VM to another",
+   "do": "ix shell <from> -- bash -c 'cd /root/.blaze/native && tar -cf - sha256-<hash> | zstd -9 -T8 -q' | ix shell <to> -- bash -c 'mkdir -p /root/.blaze/native && cd /root/.blaze/native && zstd -d -q | tar -xf -'",
+   "why": "Compressed in the pipe the 356 MB tree moved in under two minutes; uncompressed it took about 20 (rows records-6, edit2-3).",
+   "state": "current"
+  },
+  {
+   "id": "memstrat-h3",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+   "task": "Measure Relax",
+   "do": "Run `relax run --quiet <package>` from inside the package's directory, and check the exit status and the program's output of every run: from any other directory it prints `no Cargo.toml in ...`, exits 1 in 10 ms and still reports about 37 MB resident. `--verbose` prints each phase with its time; MAKEPAD_RUN_MEM_REPORT=1 the heap by subsystem (it raises the run's memory itself).",
+   "why": "The first Relax figure in this lane's brief (37.8 MB resident, 23.9 MB footprint, warm) was of such a failed run; a real warm run of hello-world is 87 MB resident, 50 MB footprint.",
+   "state": "current"
   }
  ],
  "annoyances": [
@@ -1152,6 +1179,138 @@
    "cause": "my guess, unverified: the link inputs kept beside the database are four programs a process, and the tests of one process share them",
    "workaround": "`--test-threads=1`",
    "state": "open"
+  },
+  {
+   "id": "memstrat-1",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+   "where": "the brief's premise: Relax's memory",
+   "what": "The brief gave Relax's warm run of hello-world as 37.8 MB resident and 23.9 MB footprint. That run had failed: `relax run --quiet hello` from the project's parent directory finds no manifest, exits 1 after 10 ms, and `/usr/bin/time -l` reports the failed process. The real warm run is 87 MB resident (footprint 50), a comment edit 117 (71), a body edit 127 (79), cold 250 (162).",
+   "cost": "the target the strategy is held to was off by a factor of two to three until measured again",
+   "cause": "an exit status and an output nobody checked (H2 says to)",
+   "workaround": "every run's status and output are checked in this lane's relax_measure.py",
+   "state": "fixed in this lane's numbers; the guard is H2 and memstrat-h3"
+  },
+  {
+   "id": "memstrat-2",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+   "where": "ix VM: the root disk",
+   "what": "With BLAZE_HOME on the VM's root disk (xfs on /dev/vda) the same binary that measures a 17 ms no-op run on tmpfs measured 83 to 144 ms, a cold build 26 to 40 s for 14 to 18, and every row's quartiles were 2 to 3 times apart.",
+   "cost": "three baseline runs thrown away, about 40 minutes",
+   "cause": "not found: an fsync of 4 KiB there is 0.8 ms median; the daemon's own IO pattern on that disk was not profiled",
+   "workaround": "home and project on /dev/shm",
+   "state": "open: why blaze's edit loop is 5 times slower on that disk is unexplained"
+  },
+  {
+   "id": "memstrat-3",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+   "where": "ix VM: memory hot-add",
+   "what": "The VM boots with 3 GB and virtio-mem adds memory in bursts as the guest uses more (dmesg: add_memory, about 50 ms each), up to its 128 GB. While that went on, edit-loop rows of one binary differed by up to 6 times between runs (no-op build 13.9 and 81.4 ms). Two hours later the host took memory back (MemTotal 132 to 121 GB, dmesg: `splits a leaf entry in vmemmap`, compact_stall 62,349) and the rows were noisy again: a cold build 25 to 35 s, a no-op 90 ms; holding 84 GiB in a process did not bring them back.",
+   "cost": "six measurement runs thrown away, about 50 minutes, an hour of believing a variant was slow, and the branch's last full run of rows",
+   "cause": "the guest is resized under the measurement",
+   "workaround": "hold about 116 GiB once before measuring (memstrat-h1); it held for about two hours",
+   "state": "open: `ix new --memory N` could plug all of N at boot, or say that it does not"
+  },
+  {
+   "id": "memstrat-4",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+   "where": "Relax on Linux arm64",
+   "what": "Relax at its main (c98d396e) does not build on Linux aarch64: 17 errors in relax-compiler (`inspect::cfi::Foreign` and others not found). Its README names Linux x86-64 and macOS arm64.",
+   "cost": "no Relax numbers on the VM; Relax and blaze were compared on the Mac instead",
+   "cause": "an unported module",
+   "workaround": "measured both on the Mac",
+   "state": "accepted"
+  },
+  {
+   "id": "memstrat-5",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+   "where": "blaze-profile: READ_KEPT",
+   "what": "The room each flight read keeps across a flush is stated in rows (16,384) with a comment saying rows are `some hundred bytes each`; a SpanRow is 2,240 bytes, so each span table keeps 36.7 MiB. Keeping 256 KiB a table instead was built and measured: the profile holder's live heap at idle 64 to 76 MiB to 58 (one run), and a comment edit and run 22.7 to 26.6 ms on that binary, so it was taken out.",
+   "cost": "one build, one run, two commits made and dropped",
+   "cause": "a bound in rows over rows of very different sizes; and a flush that grows its buffers again is on something a request waits for, which was not looked into",
+   "workaround": "none",
+   "state": "open: the room should be by bytes, once growing it again costs a request nothing"
+  },
+  {
+   "id": "memstrat-6",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+   "where": "my own method: held samples",
+   "what": "I read `held_samples` at its latest read time as the idle daemon's heap and wrote in a commit message that an idle daemon held 144 MiB of span blocks. The latest read was not an idle moment; `blaze debug inspect` before and after the change showed the profile holder 64 to 76 MiB before and 58 after, and `outside` unchanged at 135.",
+   "cost": "a wrong number in a commit message (the commit was dropped with its change)",
+   "cause": "a table's rows taken for a moment they were not sampled at",
+   "workaround": "compare `blaze debug inspect`'s heap by holder before and after",
+   "state": "open: held_samples could say what each read was taken for (a build's end, idle, asked)"
+  },
+  {
+   "id": "memstrat-7",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+   "where": "mimalloc: purge delay",
+   "what": "Built and measured, not kept: mimalloc on base pages with a purge delay of an hour (freed pages kept for the next edit, given back by the idle purge). The idle daemon was 300 MB larger (4,442 against 4,143 to 4,159 MB) and no row was faster: no-op build 21.9 ms against 12.2 to 13.1, comment edit 29.3 against 22.6 to 23.7, body edit 106.5 against 109.7 to 111.0. The same direction as mem2-13.",
+   "cost": "one build and one run, about 15 minutes",
+   "cause": "not looked into",
+   "workaround": "purge at once stays",
+   "state": "accepted: a second lane found the same; do not try it a third time without a reason from the profile"
+  },
+  {
+   "id": "memstrat-8",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+   "where": "blaze-query's tests under cargo",
+   "what": "`db::provenance::name_tests::an_id_in_a_key_reads_with_its_name_and_keeps_its_id` fails on main (3a58d0cbae) and on this lane alike, alone or with the suite: left `NamedForTheLogTest(Id(3) = serde v1.0.3`, right `NamedForTheLogTest(Id(3)`.",
+   "cost": "ten minutes telling it from this lane's change",
+   "cause": "not looked into",
+   "workaround": "ran it on main's checkout to compare (H6)",
+   "state": "open"
+  },
+  {
+   "id": "memstrat-9",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+   "where": "measure.py: the restart rows",
+   "what": "On the VM (tmpfs) the restart rows of the base binary ended `ok=False`: the first run after the restart, or the first edit after it, did not print what was expected; on the Mac the same binary's ended `ok=True`. The script does not say which of the two failed or print the output.",
+   "cost": "a restart row that cannot be trusted on the VM",
+   "cause": "not looked into; could be a stale answer after a restart, which would be a bug in blaze, or the script",
+   "workaround": "none",
+   "state": "open: for the restart lane; the script should print the failing run's output"
+  },
+  {
+   "id": "memstrat-10",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+   "where": "the task's size",
+   "what": "The scope grew mid-task to building four steps (allocator, dependency front ends as records with sealed leaves, pool eviction under a budget, restart from records). Steps b and d are a redesign of what name resolution, method resolution and the query engine hold for a dependency (ids stable across processes, def maps read in place); this lane built a and c, measured the reader shed of b and left it off, and wrote the order for the rest.",
+   "cost": "the report has to say not built for b2 to b4 and d",
+   "cause": "the size was known from the records section's own order (five steps, one built in a day)",
+   "workaround": "none",
+   "state": "open: b2 to b4 and d want lanes of their own, one a kind of record"
+  },
+  {
+   "id": "memstrat-11",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+   "where": "blaze-query: the reader shed of lane records-1111 (2b173f8632)",
+   "what": "Applied on top of this lane's branch and measured: live heap 1,470 to 1,372 MiB (the parse holder 166 to 63), resident 4,095 to 4,069 MB, and a comment edit and run 20.0 ms to 34.7 (p25 25.4, p75 47.0; base 22.7 to 23.4 over three runs).",
+   "cost": "one build and one run; the commit was left off this branch",
+   "cause": "not looked into; the pack that sheds runs 103 to 116 ms after an answer (restore.md), which back-to-back edits would meet",
+   "workaround": "none",
+   "state": "open: for whoever lands records-1111's shed: the comment-edit row has to be measured back to back"
+  },
+  {
+   "id": "memstrat-12",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+   "where": "blaze: the edit loop over a long session",
+   "what": "A body edit and run is 110 to 113 ms for a daemon's first 40 edits and 207 to 210 ms for its edits 96 to 135 (two runs of main's binary, transparent huge pages; 252 to 266 ms with mimalloc on base pages). The rows everyone quotes are of the first 40.",
+   "cost": "it is the one row where this lane's allocator change is past 10%",
+   "cause": "not looked into",
+   "workaround": "none",
+   "state": "open: for the edit-path lane; `measure.py` with `\"rows\": \"idle\"` has the row (`body edit + run again`)"
   }
  ]
 }
