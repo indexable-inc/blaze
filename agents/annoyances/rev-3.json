@@ -1,0 +1,11 @@
+{
+ "id": "rev-3",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane revisions-1111",
+ "where": "blaze: stop",
+ "what": "`blaze stop` answers before the daemon's process has exited. A daemon started at once at the same home path (the old home renamed away) ended with exit 1, `USAGE: its command line was refused ... while finding its build and its state`, once in a 21-case run.",
+ "cost": "one false failure of a clean build, 15 minutes to find",
+ "cause": "stop is acknowledged before exit; what the second daemon tripped on I did not find (its log was replaced)",
+ "workaround": "the harness waits for the pid to be gone after `blaze stop`",
+ "state": "open: unknown cause; the harness works around it"
+}

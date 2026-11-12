@@ -1,0 +1,11 @@
+{
+ "id": "redit-6",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+ "where": "blaze: crates are resolved before their build scripts have run",
+ "what": "The name resolution maintainer ends every write, so a crate the plan gives an `OUT_DIR` is resolved when the front end is lowered, before its build script ran: its `include!(concat!(env!(\"OUT_DIR\"), ..))` reads the disk, finds no file and keeps that as an input; its cfgs are the plan's, not the script's. Each run applied then resolves the crate and its dependents again (reth's cold build: 12,768 `nameres crate` spans, 320 s of CPU, for about 900 crates), and rows made in between are keyed by modules a cfg later takes away.",
+ "cost": "cold-build time; and the dead rows the changed-set walk contains with `UNWOUND_MOST`",
+ "cause": "readiness is the job graph's (`waits.ready`), and the maintainer does not ask it",
+ "workaround": "this lane settled the stale file reads when a run is applied (a344fdd9fc); the eager resolve itself stands",
+ "state": "open: resolve a crate when its unit is ready, not at every write"
+}

@@ -1,0 +1,11 @@
+{
+ "id": "mem2-1",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+ "where": "ix VM (the default image): systemd-run",
+ "what": "A unit started with `systemd-run` has no PATH that holds bash, git or curl: `systemd-run ... bash -c ...` fails with `bash: command not found`, and the failure is only in the unit's own log.",
+ "cost": "ten minutes: the first setup unit did nothing and the next command read an empty log",
+ "cause": "the image's binaries are on the login shell's PATH (nix profile paths), not on systemd's default",
+ "workaround": "`systemd-run -E PATH=\"$PATH\" -E HOME=/root /usr/bin/bash ...`",
+ "state": "open"
+}

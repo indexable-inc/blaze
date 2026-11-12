@@ -1,0 +1,11 @@
+{
+ "id": "A27",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "the shell",
+ "what": "`$$` inside a double-quoted SQL string in a script was expanded to the shell's pid, so three profile queries failed with a syntax error.",
+ "cost": "five minutes",
+ "cause": "shell quoting",
+ "workaround": "queries go in a heredoc file passed on stdin",
+ "state": "fixed in my habits"
+}

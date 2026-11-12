@@ -1,0 +1,11 @@
+{
+ "id": "real-7",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane real-1111",
+ "where": "git on the Mac",
+ "what": "`git diff` printed a rendered diff, not a patch (an external diff tool is configured): shipping it to the VM gave `No valid patches in input`.",
+ "cost": "one failed experiment",
+ "cause": "the user's `diff.external`",
+ "workaround": "`git diff --no-ext-diff`",
+ "state": "open"
+}

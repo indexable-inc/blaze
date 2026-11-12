@@ -1,0 +1,11 @@
+{
+ "id": "disk-12",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+ "where": "blaze-cargo's tests under cargo on macOS",
+ "what": "About 50 of `serve::tests` fail on the base and on the lane alike, a different set each run: `the store's pool of 4096 windows of 1073741824 bytes could not reserve its pages: reserving 4398046511104 bytes of address space failed`. Each test's store reserves 4 TiB of address space and six tests at once (and what earlier ones leave reserved) pass what the process can have.",
+ "cost": "the suite cannot say whether a change to the daemon broke anything; this lane ran its own modules' tests by name",
+ "cause": "the pool's reservation is sized for a daemon, and a test's store takes the same",
+ "workaround": "ran `serve::log`, `serve::flightrec`, `serve::said`, `serve::why`, `serve::observe`, `serve::settings` by name",
+ "state": "open (the daemon-memory lane's)"
+}

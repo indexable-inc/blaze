@@ -1,0 +1,11 @@
+{
+ "id": "A28",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "blaze: test target",
+ "what": "The first `blaze test` after `blaze run` executed 777,858 queries and took minutes; it looked exactly like the hang above.",
+ "cost": "20 minutes of misdiagnosis",
+ "cause": "std's directory was named by the set of crates asked for",
+ "workaround": "none",
+ "state": "key fix on all-1111 (2b712573eb); the database is still dropped between plans"
+}

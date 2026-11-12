@@ -1,0 +1,11 @@
+{
+ "id": "disk-3",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+ "where": "blaze-profile's tests under cargo on macOS",
+ "what": "Three tests fail on the untouched tip of all-1111 (65fafef399): `batches::tests::names_given_on_many_threads_read_back_from_parquet_as_recorded` every time, alone too (two of five threads' spans missing); `history::tests::past_the_cap_the_oldest_files_go_first` and `history::tests::a_pinned_reader_keeps_retired_files_until_it_lets_go` (and once `past_the_cap_a_build_goes_whole`) only when the suite runs in parallel, passing alone.",
+ "cost": "a baseline worktree and three extra runs to tell them from my changes",
+ "cause": "not looked for: the cap tests share something across tests in one process (the pins directory or the reaper's timing)",
+ "workaround": "ran each alone and on a detached worktree of the base",
+ "state": "open"
+}

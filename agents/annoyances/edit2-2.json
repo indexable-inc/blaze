@@ -1,0 +1,11 @@
+{
+ "id": "edit2-2",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+ "where": "cargo's target directory: which file is the thin client",
+ "what": "`target/release/blaze` is blaze-engine's second binary, not the thin client: the thin client is `target/release/blaze-thin`, which is installed as `blaze`. The measuring script takes a directory with `blaze` and `blaze-engine`; given the target directory it ran the engine under both names, the second one found a daemon of another binary, stopped it and started its own, and the script died reading `/proc/<pid>/status` of the daemon that was gone.",
+ "cost": "one baseline run (five minutes) and ten minutes finding why the daemon restarted",
+ "cause": "two binaries of one name, and a script that takes a directory",
+ "workaround": "copy `blaze-thin` as `blaze` beside `blaze-engine` into a directory of its own (`/root/install.sh`, gone with the VM)",
+ "state": "open: the measuring script should take the two paths, or check `blaze --version` says thin"
+}

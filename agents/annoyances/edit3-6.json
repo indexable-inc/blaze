@@ -1,0 +1,11 @@
+{
+ "id": "edit3-6",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+ "where": "/tmp/blaze-h2h2.py",
+ "what": "The head-to-head script checks that each run prints `hello` and exits 0, not that an edit's run prints the number the edit wrote: a run of the stale program would pass as a fast edit.",
+ "cost": "none found (every edit's number was checked in this lane's copy, and none was stale)",
+ "cause": "the check was written for the no-op rows and reused for the edit rows",
+ "workaround": "this lane's copy (`h2h2.py`) holds each edit's run to its number",
+ "state": "open: the shared script should do the same"
+}

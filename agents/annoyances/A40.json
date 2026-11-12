@@ -1,0 +1,21 @@
+{
+ "id": "A40",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "/root/loop.sh on the build VM (my script)",
+ "what": "The one build queue stood still for 22 minutes with five lanes waiting and the VM idle: `lslocks` showed `/root/loop.lock` held by `blaze-engine serve`, a daemon started by an earlier loop command. Two lanes reported it and both named the wrong holder (the first waiter); I ended that waiter's `flock`, which made it build without the lock until I stopped it.",
+ "cost": "22 minutes for five lanes; one build started outside the lock",
+ "cause": "the lock was `exec 9>lock; flock 9`, and every child inherited descriptor 9; a daemon outlives the command that started it",
+ "whys": [
+  "why stuck: a daemon held the lock",
+  "why possible: the lock is a property of an open descriptor and children inherit descriptors",
+  "why not caught: nothing said who held the lock; waiters looked the same as the holder in `ps`",
+  "why easy: the shell idiom for a lock is inheritable by default",
+  "property: a resource meant for one scope is held by whatever outlives that scope"
+ ],
+ "class": "scope leak: a lock, pipe, descriptor or lease taken for one command is inherited by a process that outlives it (the same class as a daemon holding a caller's stdout pipe open, which also happened in that script)",
+ "prevention": "loop.sh starts every child with the lock closed (9>&-), sends a command's output to a file and prints it after, stops a command at 600 s, and says who holds the lock; a watchdog ends a stray holder. Open: blaze's own daemon closes every descriptor it did not ask for when it starts (CLOEXEC by default, close_range at spawn), with a test that a daemon started from a process holding a lock does not hold it",
+ "workaround": "killed the daemon",
+ "fix": "loop.sh fixed 2026-11-12; the daemon-side close is open",
+ "state": "open"
+}
