@@ -1235,8 +1235,8 @@ and the BLAKE3 hashes of its 64 KiB chunks (`verified::root_of`). The list of ch
 fetched first and checked against the root alone; every chunk is then checked against its own
 hash as it arrives, alone, in any order, from any source. A two-level tree, not BLAKE3's internal
 1 KiB tree (Bao): a fetch of a whole object reads every chunk, so the list costs nothing extra
-(32 bytes per 64 KiB), and the check needs no access to BLAKE3's internals, which the vendored
-backend (`blake3-servil`) does not expose. A reader of one small range would do better with
+(32 bytes per 64 KiB), and the check needs no access to BLAKE3's internals (whether the vendored
+backend, `blake3-servil`, exposes its chunk states was not checked). A reader of one small range would do better with
 Bao's sibling paths; nothing here reads ranges. If the hub's file tree (`hub.md`) gains verified
 ranges, the two should become one definition (rule one-concept-one-home); today they differ.
 Hashes make the bytes the ones named. They do not make a record correct: a record is an output.
