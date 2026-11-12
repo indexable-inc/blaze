@@ -11,8 +11,8 @@
 //! - [`modules::modules`] is `modules(crate)`: the crate's file set, reading the existence of
 //!   both candidates of every declared module.
 //! - [`steps`] makes each a kernel step over a world of files and cfg.
-//! - [`table`] is how both parts are laid out: sorted (key → entry bytes), which a read of one
-//!   part of a step's value indexes.
+//! - [`table`] names the kernel's table (`blaze_kernel::table`), which every value here is:
+//!   another step reads one part (an item's entry, its body, a line row, a module).
 //!
 //! The bar (AGENTS.md rule 67): a comment edit costs the floor's reparse of the file plus one
 //! hash pass and changes 0 entries; a body edit changes that item's entry alone; inserting an
@@ -30,7 +30,6 @@
 
 extern crate alloc;
 
-pub mod builtin;
 pub mod entry;
 pub mod items;
 pub mod lines;

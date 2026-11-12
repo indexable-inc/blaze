@@ -19,19 +19,6 @@ use crate::{
     tests::{changed, id_of, items_of, rows},
 };
 
-/// The invariant: the copy of the built-in attribute names here is the old front end's table.
-#[test]
-fn the_built_in_names_are_the_old_front_ends() {
-    let mut old: Vec<&str> = hir_expand::inert_attr_macro::INERT_ATTRIBUTES
-        .iter()
-        .map(|attr| attr.name)
-        .filter(|name| !name.starts_with("rustc_"))
-        .collect();
-    old.sort_unstable();
-    old.dedup();
-    assert_eq!(crate::builtin::NAMES, old.as_slice());
-}
-
 fn kind_of(kind: SyntaxKind) -> Option<Kind> {
     Some(match kind {
         SyntaxKind::FN => Kind::Fn,
@@ -66,9 +53,9 @@ fn check_file(name: &str, text: &str) -> usize {
     for (key, bytes) in items.iter().filter(|(key, _)| !ItemId(**key).is_list() && ItemId(**key) != ItemId::ROOT) {
         let entry = Entry::read(bytes).unwrap_or_else(|what| panic!("{name}: {what}"));
         let row = ItemLines::read(&lines[key]).unwrap_or_else(|what| panic!("{name}: {what}"));
-        assert_eq!(entry.tokens as usize, row.tokens().count(), "{name}: {:?} `{}`", entry.kind, entry.name);
+        assert_eq!(entry.has_body(), items.bodies.contains_key(key), "{name}: {:?} `{}`", entry.kind, entry.name);
         if entry.kind != Kind::Variant {
-            let old = mine.insert((row.start, row.len), (entry.kind, entry.is(UNSPLIT), entry.body.is_some()));
+            let old = mine.insert((row.start, row.len), (entry.kind, entry.is(UNSPLIT), entry.has_body()));
             assert!(old.is_none(), "{name}: two entries at byte {}", row.start);
         }
     }
@@ -248,8 +235,10 @@ struct Files {
 impl ModuleReads for Files {
     type Error = String;
 
-    fn items(&mut self, file: &str) -> Result<Vec<u8>, String> {
-        Ok(items_of(self.files.get(file).ok_or_else(|| format!("no file `{file}`"))?).items)
+    fn part(&mut self, file: &str, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        let items = items_of(self.files.get(file).ok_or_else(|| format!("no file `{file}`"))?).items;
+        let table = Table::read(ITEMS, &items).map_err(|error| format!("{error}"))?;
+        Ok(table.get(key).map_err(|error| format!("{error}"))?.map(<[u8]>::to_vec))
     }
 
     fn exists(&mut self, file: &str) -> Result<bool, String> {
@@ -289,7 +278,7 @@ fn modules_follow_declarations_and_read_both_candidates() {
         let table = Table::read(MODULES, &bytes).expect("a modules table");
         let mut out: Vec<(String, Status, String)> = table
             .iter()
-            .map(|(_, bytes)| Module::read(bytes).expect("a module"))
+            .map(|row| Module::read(row.expect("a whole table").1).expect("a module"))
             .map(|module| (String::from(module.path), module.status, String::from(module.file)))
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));

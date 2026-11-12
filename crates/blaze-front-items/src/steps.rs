@@ -6,20 +6,22 @@
 //!   record. The edition and the syntax extensions are in its identity's flags (a full
 //!   parse's record does not name its edition).
 //! - [`Items`] and [`Lines`] read [`Parse`]'s value and the same text (the record shares it,
-//!   it does not hold it); their values are the two tables of [`crate::items::file_items`].
-//!   They are two steps so that a comment edit, which changes only the line part, leaves
-//!   `items(file)`'s value equal and cuts every reader of an entry off there.
-//! - [`Modules`] is [`crate::modules::modules`] over [`Items`], [`Exists`] and [`Cfg`].
+//!   it does not hold it); their values are the two tables of [`crate::items::file_items`]
+//!   (`Ask::TABLE`), read by part: an item's entry under its id, its body under
+//!   [`crate::entry::body_key`]. They are two steps so that a comment edit, which changes only
+//!   the line part, leaves `items(file)`'s value equal and cuts every reader off there.
+//! - [`Modules`] is [`crate::modules::modules`] over parts of [`Items`], [`Exists`] and
+//!   [`Cfg`]; its value is a table too, a part a module path.
 //!
-//! The step numbers are declared here ([`ids`]) because this lane may not edit
-//! `blaze_kernel::steps`, the one table of them: they move there with the wiring.
+//! The step numbers are the kernel's (`blaze_kernel::steps`, the one table of them). The
+//! kinds of read ([`reads`]) are this world's own: the kernel keeps only the kinds it
+//! answers itself.
 //!
-//! Cost against the floor (a comment edit): [`Parse`] reruns (`O(file)`: the floor's
-//! reparse), [`Items`] reruns (one read of the record, one walk) and its value is equal: cut.
-//! [`Lines`] reruns and changes. [`Modules`] is not reached. Until the kernel reads by part,
-//! a body edit reaches [`Modules`] through `items(file)`'s whole value, where it reruns and is
-//! cut off equal; with part reads it reads the list of declared modules and their entries
-//! only.
+//! Cost against the floor (`crate::cutoffs`, each number pinned there): a comment edit reruns
+//! [`Parse`] (`O(file)`: the floor's reparse) and [`Items`] (one read of the record, one
+//! walk), whose value is equal: cut, no reader reached. [`Lines`] reruns and changes: its
+//! readers only. A body edit reaches the readers of that body's part; [`Modules`] reads the
+//! list of declared modules and their entries, so it is reached by neither.
 
 #![blaze::sans_io]
 
@@ -30,7 +32,7 @@ use blaze_cas::Kind as StoreKind;
 use blaze_ids::ContentId;
 use blaze_kernel::{
     Ask, Compute, Fact, Read, ReadKind, Reads, Seen, Step, StepError, StepId, Subject, World,
-    WorldError,
+    WorldError, steps as ids,
 };
 use syntax::{Edition, Extensions};
 
@@ -39,16 +41,6 @@ use crate::{
     modules::{self, ModuleReads},
     parse::{Reading, parse, tree},
 };
-
-/// This crate's step numbers, to be moved into `blaze_kernel::steps`.
-pub mod ids {
-    use blaze_kernel::StepId;
-
-    pub const PARSE: StepId = StepId(0x0201);
-    pub const ITEMS: StepId = StepId(0x0202);
-    pub const LINES: StepId = StepId(0x0203);
-    pub const MODULES: StepId = StepId(0x0204);
-}
 
 /// The kinds of this crate's reads of the world: a [`Source`]'s `hash` answers them.
 pub mod reads {
@@ -210,7 +202,7 @@ fn text_of<'w, W: Source + ?Sized>(
 }
 
 macro_rules! file_step {
-    ($(#[$doc:meta])* $name:ident, $id:expr, $text:literal) => {
+    ($(#[$doc:meta])* $name:ident, $id:expr, $text:literal, table: $table:literal) => {
         $(#[$doc])*
         pub struct $name<W: ?Sized>(PhantomData<fn(&W)>);
 
@@ -230,6 +222,8 @@ macro_rules! file_step {
         }
 
         impl<W: Source + ?Sized + 'static> Ask for $name<W> {
+            const TABLE: bool = $table;
+
             fn key(input: &FileKey, out: &mut Vec<u8>) {
                 file_key(input, out);
             }
@@ -243,15 +237,16 @@ macro_rules! file_step {
 
 file_step!(
     /// `parse(file, edition)`: the tree's record.
-    Parse, ids::PARSE, "parse"
+    Parse, ids::PARSE, "parse", table: false
 );
 file_step!(
-    /// `items(file)`: the table of the file's items.
-    Items, ids::ITEMS, "items"
+    /// `items(file)`: the table of the file's items, an entry under each item's id and a
+    /// body under each [`crate::entry::body_key`].
+    Items, ids::ITEMS, "items", table: true
 );
 file_step!(
-    /// `lines(file)`: the file's line part.
-    Lines, ids::LINES, "lines"
+    /// `lines(file)`: the file's line part, a table: a row under each item's id.
+    Lines, ids::LINES, "lines", table: true
 );
 
 impl<W: Source + ?Sized + 'static> Compute for Parse<W> {
@@ -326,6 +321,31 @@ impl<W: Source + ?Sized + 'static> Step for Modules<W> {
     }
 }
 
+impl<W: Source + ?Sized + 'static> Ask for Modules<W> {
+    const TABLE: bool = true;
+
+    /// The crate's name, a zero byte, then the root's file key. A crate's name holds no zero
+    /// byte (it is an identifier), so the first one ends it.
+    fn key(input: &CrateKey, out: &mut Vec<u8>) {
+        out.extend_from_slice(input.krate.as_bytes());
+        out.push(0);
+        file_key(&input.root, out);
+    }
+
+    fn input(key: &[u8]) -> Result<CrateKey, String> {
+        let Some(end) = key.iter().position(|byte| *byte == 0) else {
+            // alloc: error path
+            return Err(String::from("a crate key with no zero byte after the crate's name"));
+        };
+        let Ok(krate) = core::str::from_utf8(&key[..end]) else {
+            // alloc: error path
+            return Err(String::from("a crate's name that is not UTF-8"));
+        };
+        // alloc: the input a key decodes to
+        Ok(CrateKey { krate: String::from(krate), root: file_input(&key[end + 1..])? })
+    }
+}
+
 /// [`modules::modules`]'s reads as reads of the kernel's.
 struct Asked<'c, 'w, W: Source + ?Sized + 'static> {
     ctx: &'c mut Reads<'w, W>,
@@ -335,10 +355,10 @@ struct Asked<'c, 'w, W: Source + ?Sized + 'static> {
 impl<W: Source + ?Sized + 'static> ModuleReads for Asked<'_, '_, W> {
     type Error = StepError;
 
-    fn items(&mut self, file: &str) -> Result<Vec<u8>, StepError> {
+    fn part(&mut self, file: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StepError> {
         // alloc: the key of the step asked for
-        let key = FileKey { name: String::from(file), reading: self.input.root.reading };
-        self.ctx.step::<Items<W>>(&key)
+        let input = FileKey { name: String::from(file), reading: self.input.root.reading };
+        self.ctx.part::<Items<W>>(&input, key)
     }
 
     fn exists(&mut self, file: &str) -> Result<bool, StepError> {

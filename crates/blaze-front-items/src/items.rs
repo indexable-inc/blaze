@@ -48,21 +48,24 @@
 use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
 
 use blaze_ids::Hasher;
+use blaze_kernel::table::Builder;
 use syntax::{
     NodeOrToken, SyntaxKind, TextSize, WalkEvent,
+    builtin_attrs::is_built_in,
     view::{self, AstNode as _, HasName as _},
 };
 
 use crate::{
-    builtin::is_built_in,
-    entry::{CFG, CFG_ATTR, DECLARED, EXPORTED, EntryBuf, Gate, ItemId, Kind, UNSPLIT},
+    entry::{
+        Body, CFG, CFG_ATTR, DECLARED, EXPORTED, EntryBuf, Gate, HAS_BODY, ItemId, Kind, UNSPLIT,
+        body_key,
+    },
     lines,
     table::{self, Family, Key},
 };
 
-/// The items table's family. Its layout changes with an entry's bytes, with which nodes have
-/// entries, with what any hash covers and with how an id is made.
-pub const ITEMS: Family = Family { number: 1, layout: 1, name: "items" };
+/// The items table, as an error names it.
+pub const ITEMS: Family = Family { name: "items" };
 
 const BASE_DOMAIN: &str = "blaze v2 front item base 1";
 const ID_DOMAIN: &str = "blaze v2 front item id 1";
@@ -97,21 +100,21 @@ pub fn file_items(root: view::Node<'_>) -> Result<FileItems, String> {
     // alloc: one file's rows, while its tables are made
     let mut walk = Walk {
         counts: BTreeMap::new(),
-        items: Vec::new(),
-        lines: Vec::new(),
+        items: Builder::new(),
+        lines: Builder::new(),
         lists: [const { Vec::new() }; 3],
     };
     walk.file(root)?;
     let Walk { mut items, lines: mut line_rows, lists, .. } = walk;
     let [impls, exports, mods] = lists;
-    items.push((ItemId::IMPLS.0, impls));
-    items.push((ItemId::EXPORTS.0, exports));
-    items.push((ItemId::MODS.0, mods));
-    line_rows.push((lines::LINE_STARTS, lines::line_starts(root.text())));
+    items.part(&ItemId::IMPLS.0, &impls);
+    items.part(&ItemId::EXPORTS.0, &exports);
+    items.part(&ItemId::MODS.0, &mods);
+    line_rows.part(&lines::LINE_STARTS, &lines::line_starts(root.text()));
     // alloc: error path
-    let items = table::write(ITEMS, items).map_err(|error| format!("{error}"))?;
+    let items = table::finish(ITEMS, items).map_err(|error| format!("{error}"))?;
     // alloc: error path
-    let lines = table::write(lines::LINES, line_rows).map_err(|error| format!("{error}"))?;
+    let lines = table::finish(lines::LINES, line_rows).map_err(|error| format!("{error}"))?;
     Ok(FileItems { items, lines })
 }
 
@@ -426,8 +429,9 @@ struct Walk {
     /// The next index of each base hash: how many items of exactly that scope, kind and name
     /// came before. Looked up, never walked: its order reaches no output.
     counts: BTreeMap<Key, u32>,
-    items: Vec<(Key, Vec<u8>)>,
-    lines: Vec<(Key, Vec<u8>)>,
+    /// The parts of `items(file)`: an entry under each id, a body under each [`body_key`].
+    items: Builder,
+    lines: Builder,
     /// The ids of the impls, the exported macros and the declared modules, as written.
     lists: [Vec<u8>; 3],
 }
@@ -747,14 +751,12 @@ impl Walk {
         node: view::Node<'_>,
     ) -> Result<(), String> {
         let Head { id, kind, container, name } = head;
+        let body = own.body.as_ref().map(|feed| Body { hash: feed.finish() });
         let entry = EntryBuf {
             kind,
-            flags: attrs.flags,
+            flags: attrs.flags | if body.is_some() { HAS_BODY } else { 0 },
             container,
             header: own.header.finish(),
-            body: own.body.as_ref().map(Feed::finish),
-            body_span: own.body_span,
-            tokens: own.tokens,
             name,
             gates: attrs.gates,
             children: own.children,
@@ -764,10 +766,12 @@ impl Walk {
             // alloc: error path
             format!("items of a file: {what}, at byte {}", u32::from(range.start()))
         })?;
-        // alloc: the file's rows, while its tables are made
-        self.items.push((id.0, bytes));
-        // alloc: the file's rows, while its tables are made
-        self.lines.push((id.0, lines::row(range.start().into(), range.len().into(), &own.deltas)));
+        self.items.part(&id.0, &bytes);
+        if let Some(body) = body {
+            self.items.part(&body_key(id), &body.write());
+        }
+        let row = lines::row(range.start().into(), range.len().into(), own.body_span, &own.deltas);
+        self.lines.part(&id.0, &row);
         Ok(())
     }
 }

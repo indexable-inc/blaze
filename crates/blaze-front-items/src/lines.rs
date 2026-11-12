@@ -20,8 +20,11 @@ use alloc::{format, string::String, vec::Vec};
 
 use crate::table::{Family, Key};
 
-/// The line part's family. Its layout changes with a row's bytes.
-pub const LINES: Family = Family { number: 2, layout: 1, name: "lines" };
+/// The line part's table, as an error names it.
+pub const LINES: Family = Family { name: "lines" };
+
+/// Bytes of a row before its token offsets.
+const FIXED: usize = 16;
 
 /// The key of the file's line starts.
 pub const LINE_STARTS: Key = {
@@ -30,12 +33,15 @@ pub const LINE_STARTS: Key = {
     key
 };
 
-/// One item's row: its start, its length, and `deltas` as the walk wrote them.
-pub(crate) fn row(start: u32, len: u32, deltas: &[u8]) -> Vec<u8> {
+/// One item's row: its start, its length, its body's first token and count of tokens (in the
+/// item's own tokens; `(0, 0)` for no body), and `deltas` as the walk wrote them.
+pub(crate) fn row(start: u32, len: u32, body_span: (u32, u32), deltas: &[u8]) -> Vec<u8> {
     // alloc: one item's line row, kept in the step's value
-    let mut out = Vec::with_capacity(8 + deltas.len());
+    let mut out = Vec::with_capacity(FIXED + deltas.len());
     out.extend_from_slice(&start.to_le_bytes());
     out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&body_span.0.to_le_bytes());
+    out.extend_from_slice(&body_span.1.to_le_bytes());
     out.extend_from_slice(deltas);
     out
 }
@@ -60,24 +66,30 @@ pub struct ItemLines<'a> {
     pub start: u32,
     /// How many bytes it is.
     pub len: u32,
+    /// The body's first token and its count of tokens, among the item's own tokens
+    /// ([`ItemLines::tokens`]): where the body is, which moves with the header and so is no
+    /// part of `items(file)`.
+    pub body_span: (u32, u32),
     deltas: &'a [u8],
 }
 
 impl<'a> ItemLines<'a> {
     /// The row `bytes` are; bytes that are no row are refused saying why.
     pub fn read(bytes: &'a [u8]) -> Result<ItemLines<'a>, String> {
-        if bytes.len() < 8 {
+        if bytes.len() < FIXED {
             // alloc: error path
-            return Err(format!("an item's line row of {} bytes, under its fixed 8", bytes.len()));
+            return Err(format!("an item's line row of {} bytes, under its fixed {FIXED}", bytes.len()));
         }
-        if bytes.last().is_some_and(|last| bytes.len() > 8 && last & 0x80 != 0) {
+        let word = |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+        if bytes.last().is_some_and(|last| bytes.len() > FIXED && last & 0x80 != 0) {
             // alloc: error path
             return Err(String::from("an item's line row whose last token offset is cut short"));
         }
         Ok(ItemLines {
-            start: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-            len: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-            deltas: &bytes[8..],
+            start: word(0),
+            len: word(4),
+            body_span: (word(8), word(12)),
+            deltas: &bytes[FIXED..],
         })
     }
 

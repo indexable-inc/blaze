@@ -27,7 +27,6 @@
 
 use base_db::{Crate, Db, EditionedFileId};
 use blaze_ids::{ContentId, Hasher};
-use intern::Symbol;
 use span::{AstIdMap, ErasedFileAstId, ROOT_ERASED_FILE_AST_ID};
 use syntax::{
     NodeOrToken, SyntaxKind, ast,
@@ -524,11 +523,7 @@ fn is_inert(attr: view::Attr<'_>) -> bool {
     };
     let Some(path) = path else { return false };
     let word = path.syntax().text();
-    word != "cfg_attr"
-        && !word.is_empty()
-        && word.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        && (word.starts_with("rustc_")
-            || crate::inert_attr_macro::find_builtin_attr_idx(&Symbol::intern(word)).is_some())
+    word != "cfg_attr" && syntax::builtin_attrs::is_built_in(word)
 }
 
 /// The hashes of `node`: its header with `cuts` (nodes within it, in its order, none within

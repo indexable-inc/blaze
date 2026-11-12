@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, format, string::String, vec::Vec};
 use syntax::{Edition, Extensions, SourceFile};
 
 use crate::{
-    entry::{self, CFG, CFG_ATTR, DECLARED, EXPORTED, Entry, Gate, ItemId, Kind, UNSPLIT},
+    entry::{self, Body, CFG, CFG_ATTR, DECLARED, EXPORTED, Entry, Gate, ItemId, Kind, UNSPLIT, body_key, key_item},
     items::{FileItems, ITEMS, file_items},
     lines::{self, ItemLines, LINES},
     parse::{Reading, parse, tree},
@@ -18,24 +18,66 @@ pub(crate) fn items_of(text: &str) -> FileItems {
     file_items(parsed.root()).expect("a file's items")
 }
 
-/// The rows of a table, by key.
-pub(crate) fn rows(family: Family, bytes: &[u8]) -> BTreeMap<Key, Vec<u8>> {
-    let table = Table::read(family, bytes).expect("a table this crate wrote");
-    table.iter().map(|(key, entry)| (*key, entry.to_vec())).collect()
+/// The parts of a table by item: under each 16-byte key its part (an entry, a list, a line
+/// row), which is what it derefs to, and apart the body's part of each item that has one.
+pub(crate) struct Rows {
+    heads: BTreeMap<Key, Vec<u8>>,
+    pub(crate) bodies: BTreeMap<Key, Vec<u8>>,
 }
 
-/// The keys whose entry differs between two tables, a key in only one of them included.
-pub(crate) fn changed(a: &BTreeMap<Key, Vec<u8>>, b: &BTreeMap<Key, Vec<u8>>) -> Vec<Key> {
-    let mut out: Vec<Key> =
-        a.iter().filter(|(key, entry)| b.get(*key) != Some(*entry)).map(|(key, _)| *key).collect();
+impl std::ops::Deref for Rows {
+    type Target = BTreeMap<Key, Vec<u8>>;
+
+    fn deref(&self) -> &BTreeMap<Key, Vec<u8>> {
+        &self.heads
+    }
+}
+
+/// The rows of a table whose keys are items' ids and their bodies' keys.
+pub(crate) fn rows(family: Family, bytes: &[u8]) -> Rows {
+    let table = Table::read(family, bytes).expect("a table this crate wrote");
+    let mut rows = Rows { heads: BTreeMap::new(), bodies: BTreeMap::new() };
+    for row in table.iter() {
+        let (key, part) = row.expect("a whole table");
+        let (id, body) = key_item(key).unwrap_or_else(|| panic!("a key of {} bytes", key.len()));
+        let into = if body { &mut rows.bodies } else { &mut rows.heads };
+        assert!(into.insert(id.0, part.to_vec()).is_none());
+    }
+    rows
+}
+
+fn differing(a: &BTreeMap<Key, Vec<u8>>, b: &BTreeMap<Key, Vec<u8>>, out: &mut Vec<Key>) {
+    out.extend(a.iter().filter(|(key, part)| b.get(*key) != Some(*part)).map(|(key, _)| *key));
     out.extend(b.keys().filter(|key| !a.contains_key(*key)).copied());
+}
+
+/// The items one of whose parts (its entry, its body) differs between two tables, an item in
+/// only one of them included.
+pub(crate) fn changed(a: &Rows, b: &Rows) -> Vec<Key> {
+    let mut out: Vec<Key> = Vec::new();
+    differing(&a.heads, &b.heads, &mut out);
+    differing(&a.bodies, &b.bodies, &mut out);
     out.sort_unstable();
+    out.dedup();
     out
+}
+
+/// The hash of the body of the item `id`, none where it has no body's part.
+pub(crate) fn body_of(items: &FileItems, id: ItemId) -> Option<Key> {
+    let table = Table::read(ITEMS, &items.items).expect("an items table");
+    let part = table.get(&body_key(id)).expect("a whole table")?;
+    Some(Body::read(part).expect("a body").hash)
+}
+
+/// The line row of the item `id`.
+pub(crate) fn lines_of(items: &FileItems, id: ItemId) -> ItemLines<'_> {
+    let table = Table::read(LINES, &items.lines).expect("a line table");
+    ItemLines::read(table.get(&id.0).expect("a whole table").expect("the item's row")).expect("a row")
 }
 
 /// The id of the one item of `kind` named `name`.
 pub(crate) fn id_of(items: &FileItems, kind: Kind, name: &str) -> ItemId {
-    let table = Table::read(ITEMS, &items.items).expect("an items table");
+    let table = rows(ITEMS, &items.items);
     let mut found = table.iter().filter(|(key, _)| !ItemId(**key).is_list()).filter(|(_, bytes)| {
         let entry = Entry::read(bytes).expect("an entry");
         entry.kind == kind && entry.name == name
@@ -47,13 +89,14 @@ pub(crate) fn id_of(items: &FileItems, kind: Kind, name: &str) -> ItemId {
 
 fn with_entry<T>(items: &FileItems, id: ItemId, read: impl FnOnce(Entry<'_>) -> T) -> T {
     let table = Table::read(ITEMS, &items.items).expect("an items table");
-    let bytes = table.get(&id.0).unwrap_or_else(|| panic!("no entry under {id:?}"));
+    let bytes = table.get(&id.0).expect("a whole table").unwrap_or_else(|| panic!("no entry under {id:?}"));
     read(Entry::read(bytes).expect("an entry"))
 }
 
 fn list_of(items: &FileItems, key: ItemId) -> Vec<ItemId> {
     let table = Table::read(ITEMS, &items.items).expect("an items table");
-    entry::list(table.get(&key.0).expect("a list key is always there")).expect("a list").collect()
+    let list = table.get(&key.0).expect("a whole table").expect("a list key is always there");
+    entry::list(list).expect("a list").collect()
 }
 
 /// Fifty items of several kinds, each with a body where its kind has one.
@@ -102,11 +145,10 @@ fn a_body_edit_changes_that_items_body_hash_only() {
     let after = items_of(&fifty().replace("x + 3\n", "x + 3 + 1\n"));
     let f3 = id_of(&before, Kind::Fn, "f3");
     assert_eq!(changed(&rows(ITEMS, &before.items), &rows(ITEMS, &after.items)), vec![f3.0]);
-    let (header, body) = with_entry(&before, f3, |entry| (entry.header, entry.body));
-    with_entry(&after, f3, |entry| {
-        assert_eq!(entry.header, header, "no header hash moved");
-        assert!(entry.body.is_some() && entry.body != body, "the body hash moved");
-    });
+    let (a, b) = (rows(ITEMS, &before.items), rows(ITEMS, &after.items));
+    assert_eq!(a.get(&f3.0), b.get(&f3.0), "the entry is the same bytes: the body is another part");
+    let body = body_of(&before, f3);
+    assert!(body.is_some() && body_of(&after, f3).is_some() && body_of(&after, f3) != body, "the body hash moved");
 }
 
 /// The rule: a header edit changes that item's header hash and leaves its body hash.
@@ -116,11 +158,10 @@ fn a_header_edit_changes_the_header_hash_and_not_the_body() {
     let after = items_of(&fifty().replace("pub fn f3(x: u32) -> u32", "pub fn f3(x: u32) -> u64"));
     let f3 = id_of(&before, Kind::Fn, "f3");
     assert_eq!(changed(&rows(ITEMS, &before.items), &rows(ITEMS, &after.items)), vec![f3.0]);
-    let (header, body) = with_entry(&before, f3, |entry| (entry.header, entry.body));
-    with_entry(&after, f3, |entry| {
-        assert_ne!(entry.header, header);
-        assert_eq!(entry.body, body);
-    });
+    let header = with_entry(&before, f3, |entry| entry.header);
+    with_entry(&after, f3, |entry| assert_ne!(entry.header, header));
+    let (a, b) = (rows(ITEMS, &before.items), rows(ITEMS, &after.items));
+    assert_eq!(a.bodies, b.bodies, "no body's part moved, the edited item's included");
 }
 
 const NESTED: &str = "
@@ -169,8 +210,7 @@ fn items_in_bodies_are_taken_out_and_the_container_covers_only_their_presence() 
     assert_eq!(changed(&rows(ITEMS, &before.items), &rows(ITEMS, &after.items)), vec![method.0]);
     // Taking a nested item away changes the container's body hash: it covered its presence.
     let without = items_of(&NESTED.replace("BODY", "1").replace("struct Local;", ""));
-    let body = with_entry(&before, outer, |entry| entry.body);
-    with_entry(&without, outer, |entry| assert_ne!(entry.body, body));
+    assert_ne!(body_of(&without, outer), body_of(&before, outer));
 }
 
 /// The rule: an item under an attribute that is not built in is not split: its whole token
@@ -199,7 +239,7 @@ fn an_item_under_an_attribute_macro_is_one_hash() {
     assert!(list_of(&before, ItemId::IMPLS).is_empty(), "an unsplit impl is the macro's to make");
     for key in &unsplit {
         with_entry(&before, ItemId(*key), |entry| {
-            assert!(entry.body.is_none() && entry.children().len() == 0);
+            assert!(!entry.has_body() && entry.children().len() == 0);
             assert!(entry.gates().any(|(class, _)| matches!(class, Gate::Macro | Gate::CfgAttr)));
         });
     }
@@ -208,7 +248,7 @@ fn an_item_under_an_attribute_macro_is_one_hash() {
     assert_eq!(moved.len(), 1);
     with_entry(&before, ItemId(moved[0]), |entry| assert_eq!(entry.kind, Kind::Impl));
     with_entry(&before, id_of(&before, Kind::Fn, "split"), |entry| {
-        assert!(entry.is(CFG_ATTR) && !entry.is(UNSPLIT) && entry.body.is_some());
+        assert!(entry.is(CFG_ATTR) && !entry.is(UNSPLIT) && entry.has_body());
     });
     with_entry(&before, id_of(&before, Kind::Fn, "gated"), |entry| {
         assert!(entry.is(CFG) && !entry.is(UNSPLIT));
@@ -266,45 +306,41 @@ fn a_discriminant_is_its_variants_body() {
     let before = items_of("enum E { A = 1 + 1, B(u8), C }");
     let after = items_of("enum E { A = 1 + 2, B(u8), C }");
     let a = id_of(&before, Kind::Variant, "A");
-    with_entry(&before, a, |entry| {
-        assert_eq!(entry.container, id_of(&before, Kind::Enum, "E"));
-        assert_eq!(entry.body_span, (0, 3));
-    });
+    with_entry(&before, a, |entry| assert_eq!(entry.container, id_of(&before, Kind::Enum, "E")));
+    assert_eq!(lines_of(&before, a).body_span, (0, 3));
     assert_eq!(changed(&rows(ITEMS, &before.items), &rows(ITEMS, &after.items)), vec![a.0]);
 }
 
-/// The rule: positions are in the line part, by item, and an entry's spans are in the item's
-/// own tokens: the body's first token and count find the body's bytes through the line part.
+/// The rule: positions are in the line part, by item, and the body's span is in the item's
+/// own tokens: its first token and count find the body's bytes through the row's tokens.
 #[test]
 fn the_line_part_places_an_items_tokens() {
     let text = "// above\n\nfn f(x: u8) -> u8 {\n    x\n}\n";
     let items = items_of(text);
     let f = id_of(&items, Kind::Fn, "f");
     let table = Table::read(LINES, &items.lines).expect("a line table");
-    let row = ItemLines::read(table.get(&f.0).expect("the fn's row")).expect("a row");
+    let row = lines_of(&items, f);
     assert_eq!((row.start as usize, row.len as usize), (text.find("fn").unwrap(), "fn f(x: u8) -> u8 {\n    x\n}".len()));
     let tokens: Vec<u32> = row.tokens().collect();
-    let (first, count) = with_entry(&items, f, |entry| {
-        assert_eq!(entry.tokens as usize, tokens.len());
-        entry.body_span
-    });
+    let (first, count) = row.body_span;
+    with_entry(&items, f, |entry| assert!(entry.has_body()));
     assert_eq!(count, 3, "the braces and `x`");
     assert_eq!(tokens[first as usize] as usize, text.find('{').unwrap());
-    let starts = table.get(&lines::LINE_STARTS).expect("the line starts");
+    let starts = table.get(&lines::LINE_STARTS).expect("a whole table").expect("the line starts");
     assert_eq!(lines::line_col(starts, tokens[first as usize + 1]).expect("line starts"), (3, 4));
 }
 
-/// The rule: persisted bytes of another layout are refused by name, never read as empty.
+/// The rule: bytes that are no table are refused naming the table asked for, never read as
+/// empty. (The layout is the kernel's, and a table's meaning is its step's code: the kernel's
+/// key of the value covers it.)
 #[test]
-fn a_table_of_another_layout_or_family_is_refused_by_name() {
+fn bytes_that_are_no_table_are_refused_by_name() {
     let items = items_of("fn f() {}");
-    let mut older = items.items.clone();
-    older[12..16].copy_from_slice(&0u32.to_le_bytes());
-    let error = Table::read(ITEMS, &older).expect_err("layout 0 is not read");
-    assert!(error.what.contains("layout 0"), "{error}");
-    let error = Table::read(ITEMS, &items.lines).expect_err("the line part is not the items");
-    assert!(error.what.contains("family 2"), "{error}");
-    assert!(Table::read(ITEMS, &items.items[..items.items.len() - 1]).is_err());
+    let error = Table::read(ITEMS, &items.items[..8]).expect_err("eight bytes are no table");
+    assert_eq!(error.family, "items", "{error}");
+    let mut other = items.items.clone();
+    other[0] ^= 1;
+    assert!(Table::read(ITEMS, &other).is_err(), "another magic is refused");
 }
 
 /// The rule: `parse` is the tree as its stored record: read back over the same text it is the

@@ -33,31 +33,31 @@
 
 use alloc::{format, string::String, vec::Vec};
 
-use blaze_ids::ContentId;
+use blaze_kernel::table::Builder;
 
 use crate::{
     entry::{self, DECLARED, Entry, Gate, ItemId, Kind},
     items::ITEMS,
     parse::Reading,
-    table::{self, Family, Key, Table},
+    table::{self, Family},
 };
 
 /// The modules table's family.
-pub const MODULES: Family = Family { number: 3, layout: 1, name: "modules" };
+pub const MODULES: Family = Family { name: "modules" };
 
 /// How deep a module may be declared: past it is a `#[path]` cycle, refused naming the path.
 pub const MOST_DEPTH: u32 = 128;
 /// How many modules one crate may have.
 pub const MOST_MODULES: usize = 1 << 20;
 
-const PATH_DOMAIN: &str = "blaze v2 front module path 1";
-
 /// What `modules(crate)` reads.
 pub trait ModuleReads {
     type Error;
 
-    /// The `items(file)` table of the file named `file`.
-    fn items(&mut self, file: &str) -> Result<Vec<u8>, Self::Error>;
+    /// The part under `key` of the `items(file)` table of the file named `file`; none where
+    /// the table has no such key. One part, never the table: a body edit in the file, or an
+    /// item that is no module, reaches no reader of the declared modules.
+    fn part(&mut self, file: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
     /// Whether the file named `file` exists.
     fn exists(&mut self, file: &str) -> Result<bool, Self::Error>;
     /// Whether the cfg predicate (its tokens joined by one space) holds for the crate.
@@ -94,9 +94,10 @@ pub struct Module<'a> {
     pub other: &'a str,
 }
 
-/// The key of the module at `path`.
-pub fn key(path: &str) -> Key {
-    ContentId::of(PATH_DOMAIN, path.as_bytes()).0[..16].try_into().expect("a content id is 32 bytes")
+/// The key of the module at `path` (from the crate's root, `::` between names; empty for the
+/// root): the path's own bytes, so a reader of one module names it.
+pub fn key(path: &str) -> &[u8] {
+    path.as_bytes()
 }
 
 fn write_module(module: &Module<'_>) -> Vec<u8> {
@@ -270,47 +271,60 @@ struct Todo {
 /// The crate's modules, from its root file `root`, as the table of [`MODULES`].
 pub fn modules<R: ModuleReads>(root: &str, reading: Reading, reads: &mut R) -> Result<Vec<u8>, R::Error> {
     // alloc: the crate's rows and its work list, while the table is made
-    let (mut rows, mut todo) = (Vec::new(), Vec::new());
+    let (mut rows, mut count, mut todo) = (Builder::new(), 1usize, Vec::new());
     let found = |path: &str, file: &str, owns_dir: bool| {
         write_module(&Module { status: Status::Found, owns_dir, reading, path, file, other: "" })
     };
-    rows.push((key(""), found("", root, true)));
+    rows.part(key(""), &found("", root, true));
     // alloc: the root's names, held while it is followed
     todo.push(Todo { path: String::new(), file: String::from(root), owns_dir: true, depth: 0 });
     while let Some(Todo { path, file, owns_dir, depth }) = todo.pop() {
-        if depth > MOST_DEPTH || rows.len() > MOST_MODULES {
+        if depth > MOST_DEPTH || count > MOST_MODULES {
             // alloc: error path
             return Err(R::refused(format!(
-                "module `{path}` (file `{file}`) is {depth} modules deep among {} modules: past the bound of {MOST_DEPTH} deep and {MOST_MODULES} in all, as a `#[path]` cycle is",
-                rows.len()
+                "module `{path}` (file `{file}`) is {depth} modules deep among {count} modules: past the bound of {MOST_DEPTH} deep and {MOST_MODULES} in all, as a `#[path]` cycle is"
             )));
         }
-        let bytes = reads.items(&file)?;
         // alloc: error path
-        let refuse = |what: String| R::refused(format!("items of `{file}`: {what}"));
-        let table = Table::read(ITEMS, &bytes).map_err(|error| refuse(format!("{error}")))?;
-        let entry_of = |id: ItemId| -> Result<Entry<'_>, R::Error> {
-            let bytes = table
-                .get(&id.0)
+        let refuse = |what: String| R::refused(format!("{} of `{file}`: {what}", ITEMS.name));
+        // One entry of the file's items, read as its own part.
+        let entry_of = |reads: &mut R, id: ItemId| -> Result<Vec<u8>, R::Error> {
+            reads
+                .part(&file, &id.0)?
                 // alloc: error path
-                .ok_or_else(|| refuse(format!("no entry under {id:?}, which another entry names")))?;
-            Entry::read(bytes).map_err(refuse)
+                .ok_or_else(|| refuse(format!("no entry under {id:?}, which another entry names")))
         };
-        let declared = table.get(&ItemId::MODS.0).ok_or_else(|| refuse(String::from("no list of declared modules")))?;
-        for id in entry::list(declared).map_err(refuse)? {
-            let entry = entry_of(id)?;
+        let declared = reads
+            .part(&file, &ItemId::MODS.0)?
+            .ok_or_else(|| refuse(String::from("no list of declared modules")))?;
+        for id in entry::list(&declared).map_err(refuse)? {
+            let own = entry_of(reads, id)?;
+            let entry = Entry::read(&own).map_err(refuse)?;
             if entry.kind != Kind::Mod || !entry.is(DECLARED) {
                 // alloc: error path
                 return Err(refuse(format!("{id:?} is listed as a declared module and is a {:?}", entry.kind)));
+            }
+            // The entries of what the declaration is in, innermost first, each its own part.
+            // alloc: the few containers around one declaration
+            let mut containers: Vec<Vec<u8>> = Vec::new();
+            let mut at = entry.container;
+            while at != ItemId::ROOT {
+                if containers.len() > MOST_DEPTH as usize {
+                    // alloc: error path
+                    return Err(refuse(format!("`mod {}` is in more than {MOST_DEPTH} items, as entries that contain each other are", entry.name)));
+                }
+                let bytes = entry_of(reads, at)?;
+                at = Entry::read(&bytes).map_err(refuse)?.container;
+                containers.push(bytes);
             }
             let mut gates = gated(&entry, reads)?;
             // The inline modules around the declaration, innermost first; a container that is
             // no module is a block.
             // alloc: the few modules around one declaration
             let mut around: Vec<(&str, Option<String>)> = Vec::new();
-            let (mut at, mut in_block) = (entry.container, false);
-            while at != ItemId::ROOT {
-                let container = entry_of(at)?;
+            let mut in_block = false;
+            for bytes in &containers {
+                let container = Entry::read(bytes).map_err(refuse)?;
                 if container.kind == Kind::Mod {
                     let outer = gated(&container, reads)?;
                     gates.live &= outer.live;
@@ -318,7 +332,6 @@ pub fn modules<R: ModuleReads>(root: &str, reading: Reading, reads: &mut R) -> R
                 } else {
                     in_block = true;
                 }
-                at = container.container;
             }
             if !gates.live {
                 continue;
@@ -357,12 +370,13 @@ pub fn modules<R: ModuleReads>(root: &str, reading: Reading, reads: &mut R) -> R
                     (false, false) => (lost(Status::Missing, &flat, &nested), None),
                 }
             };
-            rows.push((key(&module), row));
+            rows.part(key(&module), &row);
+            count += 1;
             if let Some((file, owns_dir)) = next {
                 todo.push(Todo { path: module, file, owns_dir, depth: depth + 1 });
             }
         }
     }
     // alloc: error path
-    table::write(MODULES, rows).map_err(|error| R::refused(format!("{error}")))
+    table::finish(MODULES, rows).map_err(|error| R::refused(format!("{error}")))
 }

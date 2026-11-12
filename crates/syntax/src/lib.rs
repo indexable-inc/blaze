@@ -41,6 +41,7 @@ mod validation;
 
 pub mod algo;
 pub mod ast;
+pub mod builtin_attrs;
 #[doc(hidden)]
 pub mod fuzz;
 pub mod hacks;

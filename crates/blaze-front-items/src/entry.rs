@@ -1,13 +1,24 @@
-//! One item's entry of `items(file)`: what it is, the hashes of its header and its body, what
-//! gates it, and the items taken out of it. Nothing in an entry is a byte position, so a
-//! comment or whitespace edit anywhere leaves every entry's bytes equal; positions are in the
-//! line part ([`crate::lines`]).
+//! One item's parts of `items(file)`. An item has two, so that a reader of its signature and
+//! a reader of its body are readers of different parts (a body edit reaches no reader of the
+//! header, a header edit none of the body):
 //!
-//! Layout, little-endian: kind (`u8`), flags (`u8`), the name's length (`u16`), how many
-//! children (`u32`), the gates' length in bytes (`u32`), the body's first token and its count
-//! of tokens (`u32` each, in the item's own tokens), the count of the item's own tokens
-//! (`u32`); then the container's id, the header's hash and the body's hash (16 bytes each,
-//! zeros for no body); then the name, the gates, and the children's ids in the order written.
+//! - under the item's id (16 bytes), its [`Entry`]: what it is, the hash of its header, what
+//!   gates it, and the items taken out of it;
+//! - under [`body_key`] (the id and the byte [`BODY`], 17 bytes), its [`Body`]: the hash of
+//!   its body. An item with no body has no such key (a read of it sees the absence).
+//!
+//! Nothing in either is a position, in bytes or in tokens, so a comment or whitespace edit
+//! anywhere leaves both equal, and an edit of the header leaves the body's part equal though
+//! the body's tokens moved: positions are in the line part ([`crate::lines`]).
+//!
+//! What the second part costs: 16 bytes of hash that only moved out of the entry, and for
+//! each item with a body one more entry of the table (the kernel's directory record of 40
+//! bytes, the 17-byte key and its place in the index).
+//!
+//! Layout of an entry, little-endian: kind (`u8`), flags (`u8`), the name's length (`u16`),
+//! how many children (`u32`), the gates' length in bytes (`u32`); then the container's id and
+//! the header's hash (16 bytes each); then the name, the gates, and the children's ids in the
+//! order written. A body's part is its hash (16 bytes).
 
 #![blaze::sans_io]
 
@@ -38,6 +49,52 @@ impl ItemId {
     /// Whether this is one of the list keys, which hold ids and not an [`Entry`].
     pub fn is_list(self) -> bool {
         self == ItemId::IMPLS || self == ItemId::EXPORTS || self == ItemId::MODS
+    }
+}
+
+/// What follows an item's id in the key of its body's part.
+pub const BODY: u8 = 1;
+
+/// The key of the part of `items(file)` that holds the body of the item `id`: what a reader of
+/// that one body reads (`Reads::part::<Items<_>>(file, &body_key(id))`).
+pub fn body_key(id: ItemId) -> [u8; 17] {
+    let mut key = [BODY; 17];
+    key[..16].copy_from_slice(&id.0);
+    key
+}
+
+/// The item a key of `items(file)` is of, and whether the key is of its body's part: none for
+/// a key of another length or another last byte.
+pub fn key_item(key: &[u8]) -> Option<(ItemId, bool)> {
+    match key {
+        [id @ .., BODY] if id.len() == 16 => Some((ItemId(id.try_into().ok()?), true)),
+        id if id.len() == 16 => Some((ItemId(id.try_into().ok()?), false)),
+        _ => None,
+    }
+}
+
+/// An item's body, as its part of `items(file)` holds it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Body {
+    /// The body's tokens, with the id of each item taken out of it where it was: the key of
+    /// the body's syntax record.
+    pub hash: Key,
+}
+
+impl Body {
+    /// The part's bytes.
+    pub fn write(&self) -> Vec<u8> {
+        // alloc: one body's part, kept in the step's value
+        self.hash.to_vec()
+    }
+
+    /// The body `bytes` are; other bytes are refused saying what is wrong with them.
+    pub fn read(bytes: &[u8]) -> Result<Body, String> {
+        match bytes.try_into() {
+            Ok(hash) => Ok(Body { hash }),
+            // alloc: error path
+            Err(_) => Err(format!("an item's body part of {} bytes, where it is 16", bytes.len())),
+        }
     }
 }
 
@@ -110,7 +167,7 @@ impl Kind {
 }
 
 /// The item has a body of its own (a `fn`'s block, a `const`'s or `static`'s value, a
-/// variant's discriminant): `body` is its hash.
+/// variant's discriminant): its hash is the part under [`body_key`].
 pub const HAS_BODY: u8 = 1;
 /// A `cfg` gates the item: its predicate is among the gates.
 pub const CFG: u8 = 2;
@@ -143,8 +200,8 @@ pub enum Gate {
 }
 
 /// Bytes before the ids and the name.
-const HEAD: usize = 24;
-const FIXED: usize = HEAD + 48;
+const HEAD: usize = 12;
+const FIXED: usize = HEAD + 32;
 
 /// An entry being written.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,11 +210,6 @@ pub struct EntryBuf {
     pub flags: u8,
     pub container: ItemId,
     pub header: Key,
-    pub body: Option<Key>,
-    /// The body's first token and its count of tokens, in the item's own tokens.
-    pub body_span: (u32, u32),
-    /// How many tokens are the item's own: its tokens outside the items taken out of it.
-    pub tokens: u32,
     pub name: String,
     /// Each gate: its class (`u8`), its count of tokens (`u32`), then each token as its length
     /// (`u32`) and its text.
@@ -182,16 +234,12 @@ impl EntryBuf {
             FIXED + self.name.len() + self.gates.len() + self.children.len() * 16,
         );
         out.push(self.kind as u8);
-        out.push(self.flags | if self.body.is_some() { HAS_BODY } else { 0 });
+        out.push(self.flags);
         out.extend_from_slice(&(self.name.len() as u16).to_le_bytes());
         out.extend_from_slice(&(self.children.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.gates.len() as u32).to_le_bytes());
-        out.extend_from_slice(&self.body_span.0.to_le_bytes());
-        out.extend_from_slice(&self.body_span.1.to_le_bytes());
-        out.extend_from_slice(&self.tokens.to_le_bytes());
         out.extend_from_slice(&self.container.0);
         out.extend_from_slice(&self.header);
-        out.extend_from_slice(&self.body.unwrap_or([0; 16]));
         out.extend_from_slice(self.name.as_bytes());
         out.extend_from_slice(&self.gates);
         for child in &self.children {
@@ -211,11 +259,6 @@ pub struct Entry<'a> {
     /// outside the items taken out of it, with the id of each item taken out where it was.
     /// Of an unsplit item ([`UNSPLIT`]), its whole token stream.
     pub header: Key,
-    /// The body's tokens, with the id of each item taken out of it where it was: the key of
-    /// the body's syntax record.
-    pub body: Option<Key>,
-    pub body_span: (u32, u32),
-    pub tokens: u32,
     pub name: &'a str,
     gates: &'a [u8],
     children: &'a [u8],
@@ -268,9 +311,6 @@ impl<'a> Entry<'a> {
             flags,
             container: ItemId(key_at(bytes, HEAD)),
             header: key_at(bytes, HEAD + 16),
-            body: (flags & HAS_BODY != 0).then(|| key_at(bytes, HEAD + 32)),
-            body_span: (u32_at(bytes, 12), u32_at(bytes, 16)),
-            tokens: u32_at(bytes, 20),
             name,
             gates: &bytes[name_end..name_end + gates_len],
             children: &bytes[name_end + gates_len..],
@@ -285,6 +325,11 @@ impl<'a> Entry<'a> {
 
     pub fn is(&self, flag: u8) -> bool {
         self.flags & flag != 0
+    }
+
+    /// Whether the item has a body: a part under [`body_key`].
+    pub fn has_body(&self) -> bool {
+        self.is(HAS_BODY)
     }
 
     /// The items taken out of this one (a module's items, an `impl`'s or a `trait`'s assoc

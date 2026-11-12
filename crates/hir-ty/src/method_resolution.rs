@@ -3033,6 +3033,9 @@ mod inert_attribute_tests {
     fn inert_attributes_as_a_linear_search() {
         let mut names: Vec<String> = Vec::new();
         for name in INERT_ATTRIBUTES {
+            // This list is a choice among the built-in attributes (those that write no
+            // item), not a second table of them: each is a row of the one table.
+            assert!(syntax::builtin_attrs::find(name).is_some(), "{name}");
             names.push((*name).to_owned());
             names.push(format!("{name}_"));
             names.push(format!("r#{name}"));

@@ -6516,6 +6516,7 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-mem",
+ "blaze-phf",
  "crossbeam-channel",
  "either",
  "expect-test",

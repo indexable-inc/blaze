@@ -9,6 +9,6 @@
  "class": "one concept in several homes (rule 30)",
  "prevention": "move the names to the bottom crate (blaze-front-items::builtin) and build hir-expand's table and hir-ty's list from it; ban the copies",
  "workaround": "the equality test",
- "fix": "none yet",
- "state": "open"
+ "fix": "2026-11-12, lane front-items2: the table is `syntax::builtin_attrs` (rows, templates, `find`, `is_built_in`); hir-expand builds its declared symbols from the same rows through `syntax::builtin_attributes!`; blaze-front-items' copy is deleted; hir-ty's list is a chosen subset, held to the table by its test",
+ "state": "fixed"
 }

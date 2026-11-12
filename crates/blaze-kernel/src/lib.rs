@@ -77,6 +77,15 @@ pub mod steps {
 
     /// blaze-codegen's dev template of a function instance (`blaze_codegen::kernel::DevTemplate`).
     pub const DEV_TEMPLATE: StepId = StepId(1);
+
+    /// blaze-front-items' `parse(file, edition)` (`blaze_front_items::steps::Parse`).
+    pub const PARSE: StepId = StepId(0x0201);
+    /// blaze-front-items' `items(file)`, a table (`blaze_front_items::steps::Items`).
+    pub const ITEMS: StepId = StepId(0x0202);
+    /// blaze-front-items' `lines(file)`, a table (`blaze_front_items::steps::Lines`).
+    pub const LINES: StepId = StepId(0x0203);
+    /// blaze-front-items' `modules(crate)`, a table (`blaze_front_items::steps::Modules`).
+    pub const MODULES: StepId = StepId(0x0204);
 }
 
 /// A compute step, by number: one number is one step for every blaze ([`steps`]).
