@@ -726,6 +726,138 @@
    "cause": "my guess, unverified: the link inputs kept beside the database are four programs a process, and the tests of one process share them",
    "workaround": "`--test-threads=1`",
    "state": "open"
+  },
+  {
+   "id": "edit3-1",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+   "where": "the task's premise: the 50 ms Status round trip",
+   "what": "The brief's spans (`client: connect to the daemon` 50.8 ms with `client: ask the daemon which blaze it is and what it keeps` inside) were of a command run with `BLAZE_DUCKDB` in its environment, as the brief's one fixed environment has it. Any `BLAZE_*` but `BLAZE_HOME` makes the thin blaze hand the command line to the engine before it connects (`blaze --thin-route run -q` says `engine: the environment sets BLAZE_DUCKDB`), and the engine's client does its own Status and a second connect. The timed row (no such variable) never ran that path: there the thin blaze asked one Status, answered at once (`request: read to reply` of request 1, 0.0 ms), and handed over after 25 ms. So the profile that was read was of another client than the one timed.",
+   "cost": "the first hour looked for a Status that queues behind the loop; there was none on the timed path",
+   "cause": "the daemon keeps `BLAZE_DUCKDB` for its life and refuses a client whose value differs, so the measuring environment sets it, and the thin blaze leaves every `BLAZE_*` to the engine (`blaze_thin::route::refuses`)",
+   "workaround": "start the daemon with `BLAZE_DUCKDB` set, time commands without it, and run `debug sql` with it",
+   "state": "open: a measuring environment that changes which client runs is a trap; `blaze debug sql` could take the daemon's DuckDB when the client sets none (it does), so the brief's line can drop the variable from the timed commands"
+  },
+  {
+   "id": "edit3-2",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+   "where": "macOS: the first exec of a program after each edit",
+   "what": "A clone (`clonefile`) shares its source's blocks and none of its cached pages. The first `exec` of hello world's 158 MB dev image after each edit's place (a clone of the path's file with the patch written) read 755 pages in 93 runs from the disk: 30 to 45 ms, against 4 ms for a second run and 7 ms for a whole copy. It was the largest single part of the body-edit row and was in no span: it is the program's own start, after blaze's answer.",
+   "cost": "40 ms of every edit's run on macOS",
+   "cause": "today's patch placement (a clone of the path's own file) was measured on Linux only; on APFS a clone is cold",
+   "workaround": "none needed",
+   "state": "fixed in 6fb586a779 (`Effect::Prewarm`: the clone is asked to hold what the page cache holds of the path's file; first exec 7 ms)"
+  },
+  {
+   "id": "edit3-3",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+   "where": "APFS: writing into a clone just made",
+   "what": "On APFS the first `pwrite` into a file cloned a moment ago takes 3.5 ms whatever its size (4 KiB or 2.6 MB), and renaming that file over another takes 3.6 ms; a clone made 300 ms earlier takes 0.3 to 1 ms for the write and 0.3 ms for the rename, and a new sparse file 0.3 and 0.3 (python, 15 to 30 turns each, quiet disk). `F_FULLFSYNC` of any other file meanwhile makes them 10 and 7.5 ms. So an edit's place by clone, write, rename has a floor near 7 ms a file on a quiet disk.",
+   "cost": "about 6 ms of every edit's answer on macOS (`the job's answer waits for what it still does: its outputs, being placed` 8.1 ms after this lane)",
+   "cause": "my guess, unverified: the clone's transaction is still open when the write comes; the check is the same timing with the clone made earlier, which is fast",
+   "workaround": "none",
+   "state": "open: make the next edit's clone as the last place ends (off the answer's path), so an edit's place is its writes and one rename; needs the store to hold a staged clone per path, checked against the path's file as it is used"
+  },
+  {
+   "id": "edit3-4",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+   "where": "macOS: the watch's flush (FSEvents cookie)",
+   "what": "`the request waits for the watches to hear every change made before it` is 0.7 to 12 ms on an idle machine (223 requests: min 0.7, p25 2.3, median 6.2, p75 11.5), whatever the edit: the cookie file's event comes back through fseventsd that late. The loop is idle in `kevent` the whole time.",
+   "cost": "6 ms median, 12 ms at worst, of every request that reads a checkout, no-ops included",
+   "cause": "my guess, unverified: the kernel hands fseventsd its events in batches up to 10 ms apart (the wait looks uniform between 1 and 12 ms); the check is the distribution of the wait against the time since the last event",
+   "workaround": "none",
+   "state": "open: start the job on the view as it is while the flush is in flight, hold its replies until the flush is told, and run it again if the head moved meanwhile; the wait is then beside the build, not before it. Not built in this lane (the job's cancel and a second run under one request need care in `job.rs`)"
+  },
+  {
+   "id": "edit3-5",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+   "where": "blaze: synced bookkeeping beside an edit's build",
+   "what": "Three writes with a sync ran while an edit's build ran and its outputs were placed, on the same disk: the profile history flushed as each build started (104 to 174 ms of writes and `F_FULLFSYNC` from the build's first task), `blaze why`'s ledger was appended and synced as each build ended (7 ms), and on a volume under its floor (this Mac: 0.6% free) each build started an urgent collector run whose ledger was written as it ended (5 to 10 ms, 195 at worst). The placement beside them took 24 to 63 ms against 6 to 8 alone.",
+   "cost": "20 to 55 ms of an edit's answer, and most of its spread",
+   "cause": "each was written to be out of the answer's way on the loop, and none was on the loop; what they shared with the answer was the disk",
+   "workaround": "none needed",
+   "state": "fixed in ae5fcaa6c3 (held until the builds are quiet: `observe::Held`, `why::File::write_all`, the collector's `ledger_after_builds`)"
+  },
+  {
+   "id": "edit3-6",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+   "where": "/tmp/blaze-h2h2.py",
+   "what": "The head-to-head script checks that each run prints `hello` and exits 0, not that an edit's run prints the number the edit wrote: a run of the stale program would pass as a fast edit.",
+   "cost": "none found (every edit's number was checked in this lane's copy, and none was stale)",
+   "cause": "the check was written for the no-op rows and reused for the edit rows",
+   "workaround": "this lane's copy (`h2h2.py`) holds each edit's run to its number",
+   "state": "open: the shared script should do the same"
+  },
+  {
+   "id": "edit3-7",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+   "where": "the Mac: other lanes' builds while measuring",
+   "what": "Another lane's cargo build ran on the Mac for about half an hour of this lane's measurements (load average 20 to 55 on 18 cores): `/usr/bin/true` went from 1.9 to 4.5 ms and every row about doubled, Relax's too. `/tmp/blaze-inst`, which the brief named as the baseline binaries, was replaced by another build at 23:18.",
+   "cost": "two measurement runs thrown away, and a build of the base for the before rows",
+   "cause": "the Mac is shared by lanes that build and lanes that time",
+   "workaround": "check `/usr/bin/true`'s median before each run and report the load average with the rows; build the base into this lane's own install directory",
+   "state": "open"
+  },
+  {
+   "id": "edit3-8",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+   "where": "blaze's tests under cargo on macOS",
+   "what": "blaze-core's test target did not compile (`kqueue::tests::the_memory_pressure_filter_is_there` called `poll` with a `Duration`), and blaze-cas's `place_made::a_made_output_is_placed_with_no_clone_and_no_wait_for_a_write_back` failed before it tested anything: its generator drew two runs at offset 0 for a patch of a 1-byte file, which the place refuses as no file (found with the prewarm removed too; not run on the untouched base).",
+   "cost": "half an hour to tell them from this lane's changes",
+   "cause": "tests that are not run under cargo on macOS in any gate",
+   "workaround": "none",
+   "state": "fixed in 9c279f4ef0 and 6fb586a779; five more of blaze-cas and six of blaze-cargo's `serve` and five of its `cli` fail here as the rows before say (edit2-5, disk-4, disk-12)"
+  },
+  {
+   "id": "edit3-9",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+   "where": "the thin blaze: frameworks loaded at start",
+   "what": "The cargo-built thin blaze loads CoreFoundation, CoreServices and libiconv (`otool -L`), which it uses nothing of: blaze-core's `fsevents.rs` names the frameworks on an extern block, and the linker keeps every library named. Two programs that print one line, one with those two frameworks named, start in 5.1 and 7.1 ms median (200 runs each, a loaded machine; 3.8 and 5.7 at best): about 2 ms of every command the thin blaze answers.",
+   "cost": "2 ms of each row, not removed in this lane",
+   "cause": "a `#[link(kind = \"framework\")]` in a crate links the framework into every program that depends on the crate",
+   "workaround": "none",
+   "state": "open: mark the frameworks `+as-needed` (blaze's linker drops an as-needed library nothing uses; whether a blaze-built thin blaze already loads them is not checked: `otool -L` of one says), and for a cargo build `-dead_strip_dylibs`, which blaze's link-argument rules do not take yet"
+  },
+  {
+   "id": "edit3-10",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+   "where": "blaze: an output a build does not name, right after its answer",
+   "what": "`blaze build -q` answered, and an `exec` of `<build dir>/debug/build/hello/<id>/out/hello` (the path the `link:` line prints) 0.3 s later failed once in four with `Permission denied` on the base binaries: the answer waits for the files it names (`debug/hello`) and places the rest after, and a file being placed is a clone with a new file's mode until its mode is set.",
+   "cost": "one measurement script that died",
+   "cause": "the `link:` line names a path the answer does not wait for",
+   "workaround": "run `debug/hello`, the path the build names",
+   "state": "open: the `link:` line should name the path the answer waits for, or the staged file should have its mode before the rename"
+  },
+  {
+   "id": "edit3-11",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+   "where": "the prewarm: what it reads",
+   "what": "The prewarm asks for every page the cache holds of the path's file, and a file written whole by a first link is held whole, so each later clone is asked for all of the image's data again (hello world: about 1100 pages, 18 MB, a path an edit) though a run touches 755. `mincore`'s referenced bit is set for read-ahead pages too on macOS, so the pages a run touched cannot be told from those only read ahead.",
+   "cost": "18 MB of read-ahead a path an edit, off the answer's path; capped at 256 MiB for a large image",
+   "cause": "the system says what is in memory, not what was used",
+   "workaround": "none",
+   "state": "open: remember the ranges the last runs faulted (the daemon's dev-run hook could say), or lower the cap once measured on a large image"
+  },
+  {
+   "id": "edit3-12",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+   "where": "the thin blaze: builds it answers have no client rows",
+   "what": "A build the thin blaze answers has the daemon's rows alone in the profile: `builds.client_started_ns` and `client_ended_ns` are null, so the time from the command's start to the request and from the answer to the program is in no row. With an edit's build now answered by the thin blaze, that is every edit.",
+   "cost": "the split in this lane's report took wall-clock stamps around the command and the daemon's `started_unix_ns`",
+   "cause": "the thin blaze links no flight recorder, by design, and `ClientRows` takes Arrow tables",
+   "workaround": "stamp the command from outside, as `one.py` does",
+   "state": "open: the launch request could carry the command's start, for the daemon to write the two times"
   }
  ]
 }

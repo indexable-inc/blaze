@@ -323,7 +323,13 @@ pub(crate) fn write_back(path: &Path) -> io::Result<()> {
 #[expect(unsafe_code, reason = "mmap, mincore and the read-ahead call, which std does not wrap")]
 pub(crate) fn prewarm(like: &Path, file: &Path, most: u64) -> io::Result<u64> {
     use std::os::fd::AsRawFd as _;
-    let (like, file) = (File::open(like)?, File::open(file)?);
+    let file = File::open(file)?;
+    // A `like` that is not there (the first file placed at a path) holds nothing in memory.
+    let like = match File::open(like) {
+        Ok(like) => like,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
     // What both hold: a range past either's end is no page of `like` to ask about or no byte
     // of `file` to read.
     let len = like.metadata()?.len().min(file.metadata()?.len());
@@ -405,8 +411,7 @@ fn read_ahead(fd: std::os::fd::RawFd, at: u64, len: u64) -> io::Result<()> {
 /// Both files are opened, so one that is not there fails as elsewhere.
 #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 pub(crate) fn prewarm(like: &Path, file: &Path, most: u64) -> io::Result<u64> {
-    let _ = most;
-    std::fs::File::open(like)?;
+    let _ = (most, like);
     std::fs::File::open(file)?;
     Ok(0)
 }
@@ -1165,7 +1170,8 @@ mod tests {
     /// [`prewarm`] asks for what the cache holds of `like`, and no more than `most`: a file
     /// just written is held whole, so all of it is asked for in the other; a `most` under its
     /// length is all that is asked for; a file that holds nothing in memory to learn from (it
-    /// is empty) asks for nothing; and a file that is not there fails, naming nothing read.
+    /// is empty, or is not there) asks for nothing; and a file to read ahead in that is not
+    /// there fails.
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     #[test]
     fn a_prewarm_asks_for_what_the_cache_holds_up_to_its_most() {
@@ -1181,7 +1187,8 @@ mod tests {
         assert_eq!(prewarm(&like, &file, u64::MAX).unwrap(), 12345);
         std::fs::write(&file, b"").unwrap();
         assert_eq!(prewarm(&like, &file, u64::MAX).unwrap(), 0);
-        assert!(prewarm(&root.join("none"), &file, u64::MAX).is_err());
+        // A `like` that is not there holds nothing; a `file` that is not there fails.
+        assert_eq!(prewarm(&root.join("none"), &file, u64::MAX).unwrap(), 0);
         assert!(prewarm(&like, &root.join("none"), u64::MAX).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }

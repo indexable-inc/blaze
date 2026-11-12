@@ -508,8 +508,9 @@ pub enum Effect {
     /// [`PREWARM_MOST`] bytes are asked for, from the file's start. macOS: `mincore` of a
     /// mapping of `like`, then `F_RDADVISE` a run; Linux: `mincore`, then
     /// `posix_fadvise(WILLNEED)` a run; Windows asks for nothing and says 0 bytes (no call that
-    /// says which ranges of another file the cache holds is used there). A file that is not
-    /// there fails.
+    /// says which ranges of another file the cache holds is used there). A `like` that is not
+    /// there holds nothing, and 0 bytes are asked for (the first file placed at a path); a
+    /// `file` that is not there fails.
     Prewarm {
         like: FileName,
         file: FileName,

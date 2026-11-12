@@ -1794,14 +1794,16 @@ impl Sim {
                     false => Done::Failed(IoError(format!("{file}: no such file or directory"))),
                 }
             }
-            // A hint to the page cache, which the simulation has none of: both files are
-            // there, and nothing of either changes. What the order of it is to the rename
+            // A hint to the page cache, which the simulation has none of: the file to read
+            // ahead in is there (one it is like that is not holds nothing), and nothing of
+            // either changes. What the order of it is to the rename
             // that follows is the asker's to hold (`blaze_cas::publish::Writing`).
             Effect::Prewarm { like, file, .. } => {
-                match [&like, &file].into_iter().find(|it| !self.files.contains_key(*it)) {
+                let _ = like;
+                match self.files.contains_key(&file) {
+                    true => Done::Prewarmed { bytes: 0 },
                     // alloc: an error's message.
-                    Some(missing) => Done::Failed(IoError(format!("{missing}: no such file"))),
-                    None => Done::Prewarmed { bytes: 0 },
+                    false => Done::Failed(IoError(format!("{file}: no such file"))),
                 }
             }
             Effect::Clone { from, to, .. } | Effect::Link { from, to, .. }

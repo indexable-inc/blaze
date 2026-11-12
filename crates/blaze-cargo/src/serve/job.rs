@@ -6750,6 +6750,8 @@ impl<S: Steps> Jobs<S> {
             self.placing_failed(id, path, error);
             return;
         };
+        // An executable is started from its path: a clone placed there is prewarmed.
+        w.store.starts(&file, executable);
         match w.store.place(&key, file, w.effects) {
             Some(tag) => {
                 self.placing.insert(tag, Placing { job: id, path, key, executable });
