@@ -21,6 +21,12 @@
 //! `&mut Vec<T>`), an owned `Vec<T>`, a range of indices, or [`chunks`], [`chunks_mut`],
 //! [`windows`], [`zip`] and [`enumerate`] of them. Every loop takes each item once, so an
 //! owned item is moved into its call or dropped, never leaked, but on a panic.
+//!
+//! A loop of a few items predicted to cost less than its dispatch would buy runs on the
+//! calling thread alone ([`Small`]): no job is submitted, so nothing is stolen and no worker
+//! is woken. That is the path of an edit's own chain (the one file parsed again, the one body
+//! checked again, the one function described again), whose loops hold one to a few items
+//! (docs/v2/plan/design/scheduler.md, "Hundreds of cores": a batch is worth its dispatch).
 
 use std::{
     any::Any,
@@ -29,8 +35,9 @@ use std::{
     ops::Range,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     ptr, slice,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     thread,
+    time::Instant,
 };
 
 use crossbeam_queue::SegQueue;
@@ -559,6 +566,120 @@ pub fn for_each_giving_way(
     again
 }
 
+/// The most items a loop runs on its calling thread as a small loop ([`Small`]).
+pub const SMALL_ITEMS: usize = 32;
+
+/// A loop predicted to cost less than this, in nanoseconds, runs on its calling thread: a
+/// few milliseconds, under which a dispatch (a job pushed, a worker woken, the caller parked
+/// and woken again) is a large share of the work and its wake-ups are most of the latency.
+pub const SMALL_NS: u64 = 2_000_000;
+
+/// One loop site's prediction of what a small run of it costs, and so where it runs: on the
+/// calling thread, with no job submitted, when it has at most [`SMALL_ITEMS`] items and their
+/// predicted cost is under [`SMALL_NS`]; on the pool otherwise.
+///
+/// The prediction is the count times the mean cost of one item, learned from this site's own
+/// runs of at most [`SMALL_ITEMS`] items (an exponential mean, a quarter the newest run): a
+/// run of more items says nothing of what an edit's few cost (a cold build's first items pay
+/// for what every later one finds made). A site with no small run yet predicts no cost, so
+/// its first small run is here; a run on the pool is measured too (its wall time over its
+/// items, which is at least an item's share), so a site whose items were dear comes back
+/// once they are cheap.
+///
+/// Where a loop runs changes no result (rule deterministic-output): the same items run once
+/// each, an item that gave way runs again on the caller after the others as on the pool, and
+/// what a loop makes is in its items' order. The one word is an atomic: a site is a `static`
+/// shared by every thread, and two runs at once each store a mean of their own run and the
+/// last, either of which is a fair prediction.
+pub struct Small {
+    what: &'static str,
+    /// The mean cost of one item of this site's small runs, in nanoseconds; 0 for none yet.
+    item_ns: AtomicU64,
+    /// Small runs of this site made here, and made on the pool: what a test and a span read.
+    here: AtomicU64,
+    pooled: AtomicU64,
+}
+
+impl Small {
+    /// The site named `what`: what its loop does, as a span would say it.
+    pub const fn new(what: &'static str) -> Small {
+        Small {
+            what,
+            item_ns: AtomicU64::new(0),
+            here: AtomicU64::new(0),
+            pooled: AtomicU64::new(0),
+        }
+    }
+
+    pub fn what(&self) -> &'static str {
+        self.what
+    }
+
+    /// What a run of `count` items is predicted to cost, in nanoseconds: 0 with no small run
+    /// measured yet.
+    pub fn predicted_ns(&self, count: usize) -> u64 {
+        self.item_ns.load(Ordering::Relaxed).saturating_mul(count as u64)
+    }
+
+    /// Whether a run of `count` items runs on its calling thread.
+    pub fn here(&self, count: usize) -> bool {
+        count <= SMALL_ITEMS && self.predicted_ns(count) < SMALL_NS
+    }
+
+    /// A run of `count` items took `ns` nanoseconds of wall time, `here` or on the pool.
+    pub fn ran(&self, count: usize, ns: u64, here: bool) {
+        if count == 0 || count > SMALL_ITEMS {
+            return;
+        }
+        let made = if here { &self.here } else { &self.pooled };
+        made.fetch_add(1, Ordering::Relaxed);
+        // At least 1: 0 is "none yet".
+        let item = (ns / count as u64).max(1);
+        let was = self.item_ns.load(Ordering::Relaxed);
+        let now = if was == 0 { item } else { (was - was / 4).saturating_add(item / 4).max(1) };
+        self.item_ns.store(now, Ordering::Relaxed);
+    }
+
+    /// How many small runs of this site ran on their calling thread, and how many on the
+    /// pool, since the process began.
+    pub fn runs(&self) -> (u64, u64) {
+        (self.here.load(Ordering::Relaxed), self.pooled.load(Ordering::Relaxed))
+    }
+}
+
+/// [`map`], run on the calling thread alone where `small` predicts the loop costs less than
+/// its dispatch ([`Small::here`]): no job is submitted. An item that gives way runs again
+/// after the others, as in any loop here.
+pub fn map_small<I, R>(small: &Small, items: I, f: impl Fn(I::Item) -> R + Sync) -> Vec<R>
+where
+    I: IntoSource,
+    R: Send,
+{
+    let items = items.into_source();
+    let len = items.len();
+    let here = small.here(len);
+    let began = Instant::now();
+    // alloc: the loop's result, sized once
+    let mut out: Vec<R> = Vec::with_capacity(len);
+    let to = Out(out.as_mut_ptr());
+    let threads = if here { 1 } else { pool::threads_here() };
+    split_on(threads, len, <I::Source as Source>::AGAIN, || (), |(), range| {
+        for at in range {
+            // SAFETY: as in `for_each`.
+            let made = f(unsafe { items.item(at) });
+            // SAFETY: `at` is within the capacity reserved above, and written once: a call
+            // that unwound wrote nothing.
+            unsafe { to.write(at, made) };
+        }
+    });
+    // SAFETY: every index was taken; nothing from `len` on was.
+    unsafe { items.rest(len) };
+    // SAFETY: `split_on` returned, so it ran every index of `0..len`, each written once above.
+    unsafe { out.set_len(len) };
+    small.ran(len, began.elapsed().as_nanos() as u64, here);
+    out
+}
+
 /// Runs `run` over ranges that cover `0..len` once, each with the state its thread's
 /// `init` made (once per thread that claims a range), on the pool a loop called here runs on.
 ///
@@ -579,7 +700,22 @@ fn split<St>(
     if len == 0 {
         return;
     }
-    let threads = pool::threads_here();
+    split_on(pool::threads_here(), len, again, init, run);
+}
+
+/// [`split`] across at most `threads` threads, this one among them: with 1, every range is
+/// claimed here and no job is submitted (a loop of one job runs here alone).
+fn split_on<St>(
+    threads: usize,
+    len: usize,
+    again: bool,
+    init: impl Fn() -> St + Sync,
+    run: impl Fn(&mut St, Range<usize>) + Sync,
+) {
+    if len == 0 {
+        return;
+    }
+    let threads = threads.max(1);
     let grain = len.div_ceil(threads * RANGES).max(1);
     let jobs = len.div_ceil(grain).min(threads);
     if jobs <= 1 && !again {
@@ -1631,5 +1767,34 @@ mod tests {
             pool.install(|| super::map(0..100usize, |it| it + 1)),
             (1..101).collect::<Vec<_>>()
         );
+    }
+
+    /// A map of a few items at a site that predicts them cheap runs every item on the
+    /// calling thread, in order, with no job submitted: what an edit's own loops do. A map
+    /// of many items is no small run, and teaches the site nothing.
+    #[test]
+    fn a_small_map_runs_on_its_calling_thread_and_a_large_one_is_not_counted() {
+        let small = super::Small::new("test: a small map");
+        let me = std::thread::current().id();
+        let items: Vec<u32> = (0..super::SMALL_ITEMS as u32).collect();
+        let made = super::map_small(&small, &items, |it| {
+            assert_eq!(std::thread::current().id(), me, "item {it} left its caller's thread");
+            it * 2
+        });
+        assert_eq!(made, items.iter().map(|it| it * 2).collect::<Vec<_>>());
+        assert_eq!(small.runs(), (1, 0));
+        assert!(super::map_small(&small, &Vec::<u32>::new(), |it| *it).is_empty());
+
+        let many: Vec<u32> = (0..1000).collect();
+        let made = super::map_small(&small, &many, |it| it + 1);
+        assert_eq!(made, (1..=1000).collect::<Vec<u32>>());
+        assert_eq!(small.runs(), (1, 0), "a loop of 1000 is no small run");
+
+        // A site whose small runs were dear hands the same few items to the pool.
+        small.ran(1, 64 * super::SMALL_NS, true);
+        assert!(!small.here(1));
+        let made = super::map_small(&small, &items, |it| it + 1);
+        assert_eq!(made, items.iter().map(|it| it + 1).collect::<Vec<_>>());
+        assert_eq!(small.runs().1, 1, "run on the pool");
     }
 }

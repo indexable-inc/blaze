@@ -13,7 +13,10 @@ use blaze_ids::ContentId;
 use crate::build::{Builder, JobId, Opened};
 
 struct Intent {
-    conn: Conn,
+    /// The connection that declared it; `None` for the daemon's own, a build ahead of a
+    /// save it saw ([`Intents::add_saved`]), which no connection's end or newer intent
+    /// cancels.
+    conn: Option<Conn>,
     opened: Opened,
     /// The head a [`crate::Request::WillSave`] will move.
     head: Option<String>,
@@ -51,11 +54,33 @@ impl Intents {
         head: Option<String>,
         wait_ms: u64,
     ) {
-        self.cancel_where(builder, |intent| intent.conn == conn);
+        self.cancel_where(builder, |intent| intent.conn == Some(conn));
         let deadline_ns = self.now_ns.saturating_add(wait_ms.saturating_mul(1_000_000));
+        let conn = Some(conn);
         let intent =
             Intent { conn, opened, head, deadline_ns: Some(deadline_ns), cancelled: false };
         self.started.push((job, intent));
+    }
+
+    /// `job`, started on `opened` by the daemon itself as `head` moved to its root (a save
+    /// the watcher committed): an intent of no connection. A request that builds its root
+    /// takes it over, a move of `head` to another root cancels it, and so does its wait
+    /// passing, as any intent's.
+    pub(super) fn add_saved(&mut self, job: JobId, opened: Opened, head: String, wait_ms: u64) {
+        let deadline_ns = self.now_ns.saturating_add(wait_ms.saturating_mul(1_000_000));
+        let intent = Intent {
+            conn: None,
+            opened,
+            head: Some(head),
+            deadline_ns: Some(deadline_ns),
+            cancelled: false,
+        };
+        self.started.push((job, intent));
+    }
+
+    /// Whether no intent's job is at work: each one not yet finished was cancelled.
+    pub(super) fn idle(&self) -> bool {
+        self.started.iter().all(|(_, intent)| intent.cancelled)
     }
 
     /// A request builds `root`: every open intent on it is taken over.
@@ -77,7 +102,7 @@ impl Intents {
 
     // dyn: as `add`'s.
     pub(super) fn gone(&mut self, builder: &mut dyn Builder, conn: Conn) {
-        self.cancel_where(builder, |intent| intent.conn == conn);
+        self.cancel_where(builder, |intent| intent.conn == Some(conn));
     }
 
     /// The clock is `now_ns`: every open intent whose deadline it reached is cancelled.

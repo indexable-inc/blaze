@@ -421,6 +421,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         check: &[CheckRoot<FrontInstance<B>, FrontStatic<B>>],
         policy: ContentId,
         view: Option<u64>,
+        refused: &mut Option<String>,
     ) -> Result<Patched<B>, &'static str> {
         let Some(kept) = self.kept else { return Err("the build keeps no walk") };
         if self.frontend.closes() {
@@ -443,25 +444,39 @@ impl<'a, B: Prepare> Build<'a, B> {
         if self.frontend.stopped() {
             return Err("the build stopped before its walk");
         }
-        let Walked { nodes, mut statics, mut keep, seen, .. } = walked;
+        // Who is asked: the functions and statics asked each build, and what the walk holds
+        // of those the front end names as changed since the kept walk's view. Each name is
+        // a lookup; one the walk does not hold is of no item of this program.
+        //
+        // A front end that tells no view ([`Frontend::view`] is `None`) says by that that
+        // every function and static is asked each build: `named` is `None` and every item
+        // the walk holds is asked, which is that front end's contract and no sweep in a
+        // changed set's place. A front end that tells a view and then cannot name what
+        // changed since it has lost the changed set: asking of everything the walk holds
+        // would be right, cost the program on every edit and say so only on a span, so the
+        // build is refused with the front end's reason (`refused`; rule no-fallback), and
+        // the kept walk goes back as it was, so the refusal stands until its cause is gone.
+        let seen = walked.seen;
+        let named = match seen {
+            Some(seen) => match self.frontend.changed_since(seen) {
+                Changed::Unknown(why) => {
+                    *refused = Some(why);
+                    kept.keep_walk(program, walked);
+                    return Err("the front end tells a view and named no changed set since it");
+                }
+                named @ Changed::Named { .. } => Some(named),
+            },
+            None => None,
+        };
+        let Walked { nodes, mut statics, mut keep, .. } = walked;
         // clone: the directory of the kept walk's nodes, when the build that made it lives
         let mut nodes = Arc::try_unwrap(nodes).unwrap_or_else(|shared| (*shared).clone());
         let mut work = Work::default();
-
-        // Who is asked: the functions and statics asked each build, and what the walk holds
-        // of those the front end names as changed since the kept walk's view. Each name is
-        // a lookup; one the walk does not hold is of no item of this program. Where the
-        // front end names no set (its typed answer, with why), everything the walk holds.
-        let named = match seen {
-            Some(seen) => self.frontend.changed_since(seen),
-            // alloc: once a build, of a walk kept with no view
-            None => Changed::Unknown("the kept walk holds no view of the front end".to_owned()),
-        };
         // clone: per build, the functions and the statics it asks of each time
         let (mut asks, mut static_asks) = (keep.each_build.clone(), keep.each_build_statics.clone());
         work.each_build = asks.len() + static_asks.len();
-        let unknown = match named {
-            Changed::Named { functions, counted, statics } => {
+        let every = match named {
+            Some(Changed::Named { functions, counted, statics }) => {
                 work.named = functions.len() + counted.len() + statics.len();
                 // alloc: per build, the items its changed set names
                 let mut held: Vec<u32> = Vec::with_capacity(functions.len());
@@ -479,13 +494,15 @@ impl<'a, B: Prepare> Build<'a, B> {
                 work.held = held.len() + held_statics.len();
                 asks.extend(held);
                 static_asks.extend(held_statics);
-                None
+                false
             }
-            Changed::Unknown(why) => {
-                // Linear in the walk, as a whole walk is: the front end named nothing.
+            // Refused above: a front end with a view names its set or the build stops.
+            Some(Changed::Unknown(_)) => unreachable!("an unnamed changed set is refused before any ask"),
+            None => {
+                // Linear in the walk, as a whole walk is: the front end tells no view.
                 asks.extend(keep.functions.values());
                 static_asks.extend(keep.values.values());
-                Some(why)
+                true
             }
         };
         asks.sort_unstable();
@@ -506,13 +523,15 @@ impl<'a, B: Prepare> Build<'a, B> {
             named = work.named,
             held = work.held,
             each_build = work.each_build,
-            unknown = tracing::field::Empty,
+            // The front end tells no view: every item the walk holds is asked, by its contract.
+            every,
         )
         .entered();
-        if let Some(why) = &unknown {
-            asking.record("unknown", tracing::field::display(why));
-        }
-        let answers: Vec<Result<Answer<_, _>, &'static str>> = par::map(&asks, |item| {
+        // An edit's asks are a few (what it changed, what is asked each build): where they
+        // are predicted to cost less than a dispatch they run on this thread, no job
+        // submitted ([`par::Small`]).
+        static ASKS: par::Small = par::Small::new("codegen walk: ask functions");
+        let answers: Vec<Result<Answer<_, _>, &'static str>> = par::map_small(&ASKS, &asks, |item| {
             let Some(it) = keep.function(*item) else {
                 return Err("a kept walk asks of a function it does not hold");
             };
@@ -685,7 +704,9 @@ impl<'a, B: Prepare> Build<'a, B> {
                     Fresh::Static(_) => None,
                 })
                 .collect();
-            let described = par::map(&functions, |(_, asked)| {
+            // The functions an edit brought in: a few, run here where that is cheaper.
+            static NEW: par::Small = par::Small::new("codegen walk: describe new functions");
+            let described = par::map_small(&NEW, &functions, |(_, asked)| {
                 let described = self.described(asked, 0, &counts)?;
                 let node = self.node(&asked.0, asked.1, described)?;
                 let counted = self.frontend.counted(std::slice::from_ref(asked));
