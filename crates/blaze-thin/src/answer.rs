@@ -91,7 +91,14 @@ impl Plain {
     /// command began: the frame blaze-screen's core makes of the build's end, as the bytes
     /// `terminal` takes. Nothing where the screen says nothing (a `run`
     /// on a terminal, `-q`).
-    pub fn said(&self, options: Options, caps: Caps, terminal: &Terminal, took: Duration) -> String {
+    pub fn said(
+        &self,
+        options: Options,
+        caps: Caps,
+        terminal: &Terminal,
+        took: Duration,
+        size: Option<u64>,
+    ) -> String {
         let mut screen = Screen::new(options, caps);
         screen.advance_clock(u64::try_from(took.as_millis()).unwrap_or(u64::MAX));
         screen.take(Event::Built(Built {
@@ -110,6 +117,7 @@ impl Plain {
                 })
                 .collect(),
             program: placed(&self.artifacts).map(str::to_owned), // alloc: a path, once a command
+            size_bytes: size,
             ..Built::default()
         }));
         let mut out = String::with_capacity(160); // alloc: once a command, what it prints
@@ -117,6 +125,11 @@ impl Plain {
             blaze_screen::encode(&frame, terminal, &mut out);
         }
         out
+    }
+
+    /// What the build placed.
+    pub fn artifacts(&self) -> &[Artifact] {
+        &self.artifacts
     }
 
     /// The one program a plain `run` (no `--bin`, no `--example`) runs of what was built:
@@ -147,6 +160,22 @@ pub fn placed(artifacts: &[Artifact]) -> Option<&str> {
         Some(_) => None,
         None => one.executable.as_deref(),
     }
+}
+
+/// What the file at `path` takes on disk, in bytes: the blocks it holds, which is what a
+/// person means by a program's size (a dev executable's length is mostly room for patches
+/// that holds nothing). None where it can't be asked. The one read of the answer's printing,
+/// done by its caller: [`Plain::said`] is given the number.
+#[cfg(unix)]
+pub fn on_disk(path: &str) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(path).ok().map(|it| it.blocks().saturating_mul(512))
+}
+
+/// Off Unix a file's length is what there is to ask.
+#[cfg(not(unix))]
+pub fn on_disk(path: &str) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|it| it.len())
 }
 
 /// The executable as cargo runs it from `cwd`: below it, relative, and `./foo` for one in it.
@@ -231,14 +260,14 @@ mod tests {
         plain.links = vec![Linked { how: LinkHow::Unchanged, path: "/w/target/debug/a".to_owned() }];
         plain.found = 32;
         let took = Duration::from_millis(10);
-        let piped = plain.said(Options::of(Command::Build), Caps::PIPE, &Terminal::PIPE, took);
+        let piped = plain.said(Options::of(Command::Build), Caps::PIPE, &Terminal::PIPE, took, None);
         assert_eq!(piped, "blaze: ok built=0 cached=32 warnings=0 elapsed_ms=10\n");
         let caps = Caps { live: true, cols: 80, rows: 24, unicode: true };
-        let build = plain.said(Options::of(Command::Build), caps, &Terminal::PIPE, took);
+        let build = plain.said(Options::of(Command::Build), caps, &Terminal::PIPE, took, None);
         assert!(build.contains("up to date · 10ms"), "{build:?}");
-        assert_eq!(plain.said(Options::of(Command::Run), caps, &Terminal::PIPE, took), "");
+        assert_eq!(plain.said(Options::of(Command::Run), caps, &Terminal::PIPE, took, None), "");
         let quiet = Options { quiet: true, ..Options::of(Command::Build) };
-        assert_eq!(plain.said(quiet, Caps::PIPE, &Terminal::PIPE, took), "");
+        assert_eq!(plain.said(quiet, Caps::PIPE, &Terminal::PIPE, took, None), "");
         assert_eq!(plain.program(), None);
         let again = Response::Built { members: 1, profile: String::new(), artifacts: Vec::new() };
         assert!(matches!(plain.take(again), Step::HandOver(_)));

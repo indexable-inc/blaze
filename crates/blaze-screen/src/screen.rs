@@ -56,11 +56,15 @@ pub struct Options {
     pub verbose: bool,
     /// The checkout's root, for a diagnostic's path to become a link.
     pub root: Option<String>,
+    /// The directory the command ran in and the home: a path is shown from the first when
+    /// inside it, else from the second as `~/..` ([`text::shown_path`]).
+    pub cwd: Option<String>,
+    pub home: Option<String>,
 }
 
 impl Options {
     pub fn of(command: Command) -> Options {
-        Options { command, quiet: false, verbose: false, root: None }
+        Options { command, quiet: false, verbose: false, root: None, cwd: None, home: None }
     }
 }
 
@@ -768,12 +772,12 @@ impl Screen {
         let dot = self.dot();
         let root = self.opts.root.as_deref();
         if noop {
-            line.push(Role::Dim, format!("up to date {dot} {}", text::time(took))); // alloc: the build's line, once
+            line.push(Role::Done, format!("{} up to date", self.glyph("✓", "ok"))); // alloc: the build's line, once
+            line.push(Role::Dim, format!(" {dot} {}", text::time(took))); // alloc: as above
         } else {
             line.push(Role::Done, format!("{} ", self.glyph("✓", "ok"))); // alloc: as above
             let cause = self.made(&mut line, built, whys);
-            line.push(Role::Plain, " in ");
-            line.push(Role::Number, text::time(took));
+            line.push(Role::Dim, format!(" in {}", text::time(took))); // alloc: as above
             if let Some(cause) = cause {
                 line.push(Role::Dim, format!(" {dot} ")); // alloc: as above
                 line.push_text(cause, Role::Dim, root);
@@ -803,10 +807,19 @@ impl Screen {
         if matches!(self.opts.command, Command::Build | Command::Other)
             && let Some(program) = &built.program
         {
-            let left = self.most_cols().saturating_sub(line.width() + 3);
+            // The path as a person reads it, cut only when the line would not fit; the link
+            // leads to the whole one.
+            let size = built.size_bytes.map(|it| format!(" {dot} {}", text::size(it))); // alloc: as above
+            let taken = line.width() + 3 + size.as_ref().map_or(0, |it| text::width(it));
+            let left = self.most_cols().saturating_sub(taken);
             if left >= 12 {
+                let shown =
+                    text::shown_path(program, self.opts.cwd.as_deref(), self.opts.home.as_deref());
                 line.push(Role::Dim, format!(" {} ", self.glyph("→", "->"))); // alloc: as above
-                line.push_link(Role::Path, text::middle(program, left), file_url(program));
+                line.push_link(Role::Path, text::fit_path(&shown, left), file_url(program));
+                if let Some(size) = size {
+                    line.push(Role::Dim, size);
+                }
             }
         }
         line
@@ -929,6 +942,9 @@ impl Screen {
         }
         if let Some(program) = &built.program {
             line.push_str(&format!(" program={}", text::value(program))); // alloc: as above
+        }
+        if let Some(size) = built.size_bytes {
+            line.push_str(&format!(" size_bytes={size}")); // alloc: as above
         }
         if let Some(next) = &built.next {
             line.push_str(&format!(" next={}", text::value(next))); // alloc: as above

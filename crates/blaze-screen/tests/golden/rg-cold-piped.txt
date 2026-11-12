@@ -21,5 +21,5 @@ warning: unused import: `self::SummaryKind::*`
     |             ^^^^^^^^^^^^^^^^^^^^
 
 blaze: progress phase=compiling done=419/423 running=1 elapsed_ms=33331 longest="bodies ripgrep 15.2.0 bin rg (host)" for_ms=274
-blaze: ok built=81 cached=4 warnings=3 elapsed_ms=45828 tier="tier 0 · 0% optimized" program=/root/home9/build/ripgrep-2869fcc03106fcd9eadd9b7a1fd4d4e4/debug/rg next="blaze slow says why"
+blaze: ok built=81 cached=4 warnings=3 elapsed_ms=45828 tier="tier 0 · 0% optimized" program=/root/home9/build/ripgrep-2869fcc03106fcd9eadd9b7a1fd4d4e4/debug/rg next="blaze slow"
 blaze: wasted why="1 step recomputed for no recorded reason: a blaze bug (blaze why --unexplained) (3 times)" next="blaze explain why:unexplained"

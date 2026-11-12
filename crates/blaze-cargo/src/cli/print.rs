@@ -673,7 +673,13 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
             true if took >= SLOW_BUILD => Some("blaze slow".to_owned()), // alloc: as above
             true => None,
         };
+        let program = self
+            .built
+            .as_ref()
+            .and_then(|built| blaze_thin::answer::placed(&built.artifacts))
+            .map(str::to_owned); // alloc: a path, once a build
         let built = blaze_screen::Built {
+            size_bytes: program.as_deref().and_then(blaze_thin::answer::on_disk),
             ok,
             compiled: work.map_or(0, |it| it.built),
             cached: work.map_or(0, |it| it.replayed),
@@ -689,11 +695,7 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
                 .collect(),
             unbuilt: u32::try_from(self.left).unwrap_or(u32::MAX),
             fixable: self.fixable,
-            program: self
-                .built
-                .as_ref()
-                .and_then(|built| blaze_thin::answer::placed(&built.artifacts))
-                .map(str::to_owned), // alloc: a path, once a build
+            program,
             next,
             why_follows: why.is_some(),
             tests_follow: tests,

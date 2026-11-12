@@ -743,6 +743,7 @@ fn the_thin_blaze_prints_a_plain_answer_as_this_cli_does() {
             blaze_screen::Caps::PIPE,
             &blaze_report::terminal::Terminal::PIPE,
             std::time::Duration::ZERO,
+            None,
         );
 
         let mut api = FakeApi::answering(plain_answer());

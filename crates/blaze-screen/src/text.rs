@@ -96,6 +96,66 @@ pub fn middle(text: &str, most: usize) -> String {
     out
 }
 
+/// A size on disk for a person: `812 B`, `4.1 MB`, `1.3 GB` (decimal units, as a file
+/// manager counts).
+pub fn size(bytes: u64) -> String {
+    match bytes {
+        0..1000 => format!("{bytes} B"), // alloc: a number shown
+        1000..1_000_000 => format!("{}.{} kB", bytes / 1000, bytes % 1000 / 100), // alloc: as above
+        1_000_000..1_000_000_000 => format!("{}.{} MB", bytes / 1_000_000, bytes % 1_000_000 / 100_000), // alloc: as above
+        _ => format!("{}.{} GB", bytes / 1_000_000_000, bytes % 1_000_000_000 / 100_000_000), // alloc: as above
+    }
+}
+
+/// A path as a person reads it, the one rule for every path shown: from the directory the
+/// command ran in when it is inside it (`target/debug/hello`), else from the home as `~/..`,
+/// else whole.
+pub fn shown_path(path: &str, cwd: Option<&str>, home: Option<&str>) -> String {
+    let below = |root: Option<&str>| {
+        let root = root?.trim_end_matches('/');
+        let rest = path.strip_prefix(root)?;
+        (!root.is_empty() && rest.starts_with('/')).then(|| &rest[1..])
+    };
+    match (below(cwd), below(home)) {
+        (Some(inside), _) => inside.to_string(), // alloc: a path shown
+        (None, Some(inside)) => format!("~/{inside}"), // alloc: as above
+        (None, None) => path.to_string(), // alloc: as above
+    }
+}
+
+/// `path` in at most `most` columns: whole when it fits; else each long run of hex digits in
+/// it (a hash in a directory's name) cut to its ends, `hello-world-5373…6112`; else its
+/// middle cut. Only where a line would not fit: a pipe and a link's target get it whole.
+pub fn fit_path(path: &str, most: usize) -> String {
+    if width(path) <= most {
+        return path.to_string(); // alloc: a path shown
+    }
+    let mut out = String::with_capacity(path.len()); // alloc: as above
+    let mut run = String::new(); // alloc: as above
+    let flush = |run: &mut String, out: &mut String| {
+        match run.len() >= 16 {
+            true => {
+                out.push_str(&run[..4]);
+                out.push('…');
+                out.push_str(&run[run.len() - 4..]);
+            }
+            false => out.push_str(run),
+        }
+        run.clear();
+    };
+    for c in path.chars() {
+        match c.is_ascii_hexdigit() {
+            true => run.push(c),
+            false => {
+                flush(&mut run, &mut out);
+                out.push(c);
+            }
+        }
+    }
+    flush(&mut run, &mut out);
+    middle(&out, most)
+}
+
 /// An item's path as a row names it, in at most `most` columns: what a macro's expansion
 /// nested into it is said once (`<impl#0 in macro call 3ca1.0 in macro call 3ca1.0 ..>`
 /// becomes `<impl#0 in macro>`), and a path still too long keeps its crate and its last

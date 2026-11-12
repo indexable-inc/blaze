@@ -73,6 +73,9 @@ pub struct Built {
     pub unbuilt: u32,
     /// The one program the build placed, where it placed exactly one: its path.
     pub program: Option<String>,
+    /// What that program takes on disk, in bytes: the blocks it holds, not its length (a dev
+    /// executable is long and mostly room for patches that holds nothing).
+    pub size_bytes: Option<u64>,
     /// The command that says more: of a failure (`blaze explain hello`), or of why a build
     /// that passed took long (`blaze slow`). A command, as the reader types it.
     pub next: Option<String>,

@@ -16,7 +16,7 @@ and no escape byte.
 | `run` or `test` that built nothing | nothing: the program's output, the tests' summary |
 | `build` or `check` that built nothing | `up to date · 21ms → /home/me/.cache/…/debug/hello` (dim; the program's path, cut in its middle) |
 | an edit | `✓ hello::add recompiled in 0.70s · src/main.rs changed · tier 0` |
-| a larger build | `✓ built 81 units, 4 cached in 45.8s · tier 0 · 3 warnings · blaze slow says why` |
+| a larger build | `✓ built 81 units, 4 cached in 45.8s · tier 0 · 3 warnings · blaze slow says why`, and `hint: 2 warnings have a fix: blaze check --fix` when some do |
 | a failure | the diagnostics, then `✗ run failed in 0.14s · 1 error in hello (bin) · blaze explain hello` |
 | tests | each failure as it happens (name, executable, its last 40 lines of output), then `✗ 1 failed · 7 passed · 1 ignored · 3 binaries · 31.8s` and `rerun: blaze test -p calc --lib` |
 
@@ -55,11 +55,9 @@ every size):
   recompiled, a step with no recorded reason, an image linked whole though one was kept) always;
   a note (why the build made again what it did, each link, each unit) only under `-v`. `-q`
   says errors only.
-- **Colour** says nothing a glyph and a word do not: `▶` running (cyan), `✓` done (green), `✗`
-  failed (bold red), `⚠` warned (bold yellow), `◦` waiting (yellow), faint for detail. Eight
-  basic colours, no white or black, so a light and a dark background both read. `NO_COLOR`,
-  `CLICOLOR`, `--color` and `[terminal] color` decide it; without a UTF-8 locale the glyphs
-  are ASCII (`>`, `ok`, `x`, `!`).
+- **Colour** says nothing a glyph and a word do not (`▶` running, `✓` done, `✗` failed, `⚠`
+  warned, `◦` waiting); without a UTF-8 locale the glyphs are ASCII (`>`, `ok`, `x`, `!`).
+  [The palette](#rich-text-and-the-palette) picks the values.
 - **Motion**: a frame when an event changed what is shown, and once a second for the timers.
   No spinner.
 
@@ -79,6 +77,41 @@ region's rows are erased one at a time (EL), never to the end of the screen (ED)
 an ED from its top-left corner for a clear and copies the screen into its history. Not used: the window title (no terminal restores it reliably) and prompt
 marks (OSC 133 is the shell's).
 
+## Rich text and the palette
+
+A message is never a string with backticks for a renderer to guess at. It is a
+`blaze_report::Text`: spans, each with what it is (words, code, a command the reader can run, a
+path, a package, a count, a time, a hash, emphasis). It is written as easily as `format!`, and
+an argument's type picks its role, so no fragment is untyped:
+
+```rust
+say!(Code(name), " recompiled in ", took, " · ", Cmd("blaze explain why:input"))
+```
+
+A literal is words; `Code`, `Cmd`, `At` (a path), `Pkg`, `Count`, a `Duration` and `Strong` are
+the roles; a `String` is no part, and prose known only at run time says so as `Words`. Each
+reader draws the same value: a terminal draws code and commands in their colours with no
+backticks, a path from the checkout as a link to its file; without colour (`NO_COLOR`, a
+pipe) code and commands get their backticks back; JSON carries the spans with their roles
+(`{"Code":"hello::add"}`), so an agent parses no prose. The screen's own lines, a build's why
+and blaze's reports are this type. What is not yet: the messages that still format an
+interpolation between backticks by hand, 5,036 in 95 crates when the type was made
+(`crates/blaze-report/tests/backticks.txt`, a crate a row; its test holds each crate to its
+number, which only goes down), a diagnostic of code among them (`blaze_diagnostics::Diag`'s
+message is a string).
+
+Code names what a colour means (`blaze_report::palette::Token`: success, failure, warning,
+running, waiting, cached, code, command, path, number, dim, emphasis), never a colour. The
+value is picked for the terminal: 24-bit where `COLORTERM` says `truecolor` or `24bit` or the
+terminal is Ghostty, kitty, iTerm2, WezTerm or VS Code's; 256 where `TERM` says `256color`;
+else the eight basic colours with bold and underline. The background is `[terminal]
+background = "dark"` or `"light"` of blaze's `config.toml`, else what `COLORFGBG` says, else
+dark. The 24-bit values meet WCAG AA (4.5 or more) against black, `#1c1c1c`, `#1e1e1e`,
+`#282c34` and `#002b36` (dark; the least is cached, 4.55) and white, `#f5f5f5`, `#fefefe` and
+`#fdf6e3` (light; the least is path, 5.84). Under simulated protanopia and deuteranopia,
+success and failure, and running and waiting, are a few ΔE apart: hue does not tell them
+apart, their glyph and word do, and failure is bold. A command is underlined at every depth.
+
 ## Off a terminal
 
 A pipe, a file, CI, `TERM=dumb`, `BLAZE_UI=plain`, `--message-format json`. An agent needs to
@@ -92,7 +125,8 @@ blaze: failed errors=1 warnings=0 unbuilt=0 elapsed_ms=15 unit="hello (bin)" nex
 ```
 
 `progress` every 10 s of a build under way, never sooner; the diagnostics as before; one `ok`
-or `failed` line always, `key=value` with a value quoted when it is not one word. No start
+or `failed` line always (and `blaze: hint fixable=2 run="blaze check --fix"` when warnings
+have a fix), `key=value` with a value quoted when it is not one word. No start
 line: it says nothing its reader did not type. stdout is the program's and the JSON messages',
 unchanged. Test executables write libtest's own output.
 
@@ -111,6 +145,7 @@ daemon beyond what a diagnostic is drawn with, which no key holds.
 The driver is `crates/blaze-cargo/src/cli/show.rs`: it reads the clock and the size, writes
 the bytes, and on a terminal runs on a thread of its own so timers turn while the daemon says
 nothing. `Printer::clear` is the one call for "the build is over": it returns once nothing
-live is on the terminal. A drop, a panic's unwind and an interrupt put the terminal back. The
+live is on the terminal. While a region is up the terminal does not echo typed keys (they
+would land in it); a drop, a panic's unwind and an interrupt put the terminal back. The
 thin `blaze` shows a no-op answer through the same core. `BLAZE_UI_TRANSCRIPT=<file>` records
 the events, one a line as JSON; the tests replay such transcripts into a reference terminal.

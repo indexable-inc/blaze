@@ -276,13 +276,16 @@ mod unix {
             _ => blaze_screen::Caps::PIPE,
         };
         let options = blaze_screen::Options {
+            cwd: place.cwd.to_str().map(str::to_owned),
+            home: var("HOME"),
             quiet: asked.quiet,
             ..blaze_screen::Options::of(match asked.command {
                 Command::Build => blaze_screen::Command::Build,
                 Command::Run => blaze_screen::Command::Run,
             })
         };
-        let said = plain.said(options, caps, &detected, started.elapsed());
+        let size = blaze_thin::answer::placed(plain.artifacts()).and_then(blaze_thin::answer::on_disk);
+        let said = plain.said(options, caps, &detected, started.elapsed(), size);
         if asked.command == Command::Build {
             return Ok(wrote(&said));
         }
