@@ -778,6 +778,15 @@ fn relocate(
         };
         let apply =
             reloc::of_kind(reloc.kind, output.format, output.arch, in_code).map_err(at_fail)?;
+        // A TLS descriptor in an executable is relaxed, to local exec for all but an import
+        // ([`reloc::in_output`], [`reloc::known`]).
+        let apply = reloc::in_output(apply, output.format, &output.kind);
+        let apply = match resolved[row.target as usize] {
+            Resolved::Sym(sym) => {
+                reloc::known(apply, matches!(def_value(image, sym), Ok(Value::Import)))
+            }
+            _ => apply,
+        };
         let p = linked + start + u64::from(reloc.at);
         let (s, g, tp, slid) = match resolved[row.target as usize] {
             Resolved::Own(offset) if reloc::got_kind(apply).is_none() => (linked + offset, 0, None, true),
