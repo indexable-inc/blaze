@@ -1710,6 +1710,9 @@ impl Tree for Breaking {
     fn read_dir(&self, root: ContentId, path: &str, read: &mut dyn FnMut(Lent<'_, '_>)) -> bool {
         self.files.read_dir(root, path, read)
     }
+    fn dir(&self, root: ContentId, path: &str) -> Option<ContentId> {
+        self.files.dir(root, path)
+    }
 }
 
 #[test]
@@ -1854,6 +1857,9 @@ impl Tree for Backwards {
         names.reverse();
         read(&mut names.iter().map(|(name, dir)| (name.as_str(), *dir)));
         true
+    }
+    fn dir(&self, root: ContentId, path: &str) -> Option<ContentId> {
+        self.0.dir(root, path)
     }
 }
 

@@ -401,6 +401,7 @@ impl Real {
             // No build ran, so no unit was made, whether or not a `blaze-work` line said so.
             seen.units = Some(seen.units.unwrap_or(0));
             (seen.written, seen.unkept, seen.described) = (Some(0), Some(0), Some(0));
+            seen.ran = Some(BTreeMap::new());
             seen.why = "answered as the last build was (the no-op lane)".to_owned();
             // No build ran, so there is no work to account for.
             seen.account = Some(Vec::new());
@@ -473,7 +474,8 @@ impl Real {
             && (revision.expect.max_executed.is_some()
                 || revision.expect.max_verified.is_some()
                 || revision.expect.max_written.is_some()
-                || revision.expect.max_described.is_some())
+                || revision.expect.max_described.is_some()
+                || !revision.expect.max_ran.is_empty())
         {
             let work = self.blaze(&["explain", "edit_work", &format!("build={build}"), "limit=500", "--json"], &none);
             for line in work.stdout.lines() {
@@ -499,6 +501,27 @@ impl Real {
             }
             if seen.executed.is_none() {
                 seen.why.push_str(&format!("`blaze explain edit_work build={build}` said: {}{}\n", work.stdout, work.stderr));
+            }
+        }
+        if let Some(build) = build
+            && !revision.expect.max_ran.is_empty()
+        {
+            // Each query that ran in the build, by name (`query_counts`).
+            let counts = self.blaze(&["explain", "counts_by_cause", &format!("build={build}"), "limit=5000", "--json"], &none);
+            let mut ran = BTreeMap::new();
+            let mut rows = 0;
+            for line in counts.stdout.lines() {
+                let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                rows += 1;
+                if let (Some(query), Some(executed)) = (row["query"].as_str(), row["executed"].as_u64()) {
+                    *ran.entry(query.to_owned()).or_insert(0) += executed;
+                }
+            }
+            // A view that failed or said nothing is not a build that ran nothing: only a
+            // build whose engine work was read as none (above) has no rows by right.
+            match counts.ok && (rows > 0 || seen.executed == Some(0)) {
+                true => seen.ran = Some(ran),
+                false => seen.why.push_str(&format!("`blaze explain counts_by_cause build={build}` said: {}{}\n", counts.stdout, counts.stderr)),
             }
         }
         seen
@@ -616,6 +639,7 @@ impl Real {
             Step::Wait(ms) => std::thread::sleep(std::time::Duration::from_millis(*ms)),
             Step::Project(name) => self.enter(Some(name)),
             Step::Home(name) => self.rehome(name),
+            Step::Packed(name) => self.repack(name, env),
             Step::Do(action) => {
                 // The revision's own arguments: a request that differs in them is another
                 // request to the no-op lane.
@@ -658,6 +682,29 @@ impl Real {
         }
         (self.home, self.cache) = (home, cache);
         self.log_read = 0;
+    }
+
+    /// Commands run under the home `h-<name>` and the machine directory `c-<name>` from here
+    /// on (`packed NAME`), as [`Self::rehome`], but the new home's store starts empty and is
+    /// given the first home's records as a pack: exported whole from the first home with its
+    /// daemon stopped, imported under the new one before any daemon starts there. The pack
+    /// is unsigned and imported on this driver's word (`--unsigned`), as a file a user names.
+    fn repack(&mut self, name: &str, env: &BTreeMap<String, String>) {
+        self.stop();
+        let pack = self.root.join(format!("k-{name}"));
+        let at = pack.to_str().expect("the driver's paths are UTF-8");
+        let out = self.blaze(&["store", "export", "--all", "--pin", "build", "--out", at], env);
+        assert!(out.ok, "`packed {name}`: the export failed:\n{}", out.stderr);
+        let (home, cache) = (self.root.join(format!("h-{name}")), self.root.join(format!("c-{name}")));
+        for dir in [&self.home, &self.cache, &pack] {
+            if !self.others.contains(dir) {
+                self.others.push(dir.clone()); // clone: a path, once a home
+            }
+        }
+        (self.home, self.cache) = (home, cache);
+        self.log_read = 0;
+        let out = self.blaze(&["store", "import", at, "--pin", "build", "--unsigned"], env);
+        assert!(out.ok, "`packed {name}`: the import failed:\n{}", out.stderr);
     }
 
     /// The homes and every checkout set aside under `as_`, so the next build starts from

@@ -13,8 +13,10 @@ redone = ["main", "two::main"]
 max_units = 1
 max_records = 1
 max_executed = 20000
+max_written = 400
 
 [revision.known]
+max_written = "a checkout's database is written every file of the standard library again: about 5,000 inputs (2026-11-12); expected about 250, by its crates, once a package found by its records is declared and not read (docs/v2/plan/design/restore.md, \"Restart reads records (d)\", pieces A to D)"
 max_executed = "each checkout has a front end's database of its own (F1, docs/v2/plan/design/restore.md): the second project's first build runs about 2.3 million engine memos, the library's name resolution, impls and describes again, though it makes no unit of the library (2026-11-11)"
 
 [[revision]]

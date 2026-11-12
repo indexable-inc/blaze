@@ -26,6 +26,15 @@ pub trait Tree: Send + Sync {
     /// file. The database hashes a listing as it is lent, copying nothing, and stops naming
     /// the root and directory at a name out of order.
     fn read_dir(&self, root: ContentId, path: &str, read: &mut dyn FnMut(Names<'_, '_>)) -> bool; // dyn: one call a directory per view, and `Tree` is a trait object
+    /// The content ID of the directory at `path` under `root` (`""`: `root` itself, when this
+    /// tree has it); `None` for none, a file, or a root this tree does not have. It stands
+    /// for every file below the directory, by path under it, mode and content: two
+    /// directories of one tree with the same ID hold the same files, and the same files give
+    /// the same ID wherever the directory is. No file's bytes are read and nothing is listed
+    /// to the caller, so a key made of it costs the path's depth, not the directory's size
+    /// (restore.md, "Restart reads records (d)", A). IDs of two kinds of tree are not
+    /// compared: each hashes by its own domain.
+    fn dir(&self, root: ContentId, path: &str) -> Option<ContentId>;
 
     /// [`Tree::read_dir`]'s names, owned: for a caller that keeps them.
     fn list(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
@@ -62,6 +71,11 @@ impl Tree for blaze_vfs::Reader {
         let Some(mut names) = pinned.list(root, path) else { return false };
         read(&mut names);
         true
+    }
+
+    fn dir(&self, root: ContentId, path: &str) -> Option<ContentId> {
+        // The node's own Merkle ID: the tree made it when the directory was built.
+        self.dir_id(root, path)
     }
 }
 
@@ -124,9 +138,25 @@ impl MemRoot {
         }
         self.dirs.get(path).map(Vec::as_slice)
     }
+
+    /// [`Tree::dir`] of a directory below the root: the hash of each file under `path`, by
+    /// its path under `path`, its mode and its content ID, in path order; `None` where
+    /// `path` is no directory. The files are already keyed by path, so none is read.
+    fn dir(&self, path: &str) -> Option<ContentId> {
+        self.names(path)?;
+        let mut hasher = Hasher::new(MEM_DIR_DOMAIN);
+        let below = format!("{path}/"); // alloc: `MemTree` is the tree of tests and what-ifs, off every hot path
+        for (file, (id, mode, _)) in self.files.range::<str, _>(below.as_str()..) {
+            let Some(under) = file.strip_prefix(below.as_str()) else { break };
+            hasher.part(under.as_bytes()).update(&mode.git().to_le_bytes()).id(id);
+        }
+        Some(hasher.finish())
+    }
 }
 
 pub const MEM_ROOT_DOMAIN: &str = "blaze v2 db memory root 2";
+/// A [`MemTree`] directory's ID ([`Tree::dir`]): the files below it by path under it.
+pub const MEM_DIR_DOMAIN: &str = "blaze v2 db memory directory 1";
 
 impl MemTree {
     /// The root holding exactly `files`, as `(path, bytes)`, each a regular file.
@@ -182,11 +212,41 @@ impl Tree for MemTree {
         read(&mut names.iter().map(|(name, dir)| (name.as_str(), *dir)));
         true
     }
+
+    fn dir(&self, root: ContentId, path: &str) -> Option<ContentId> {
+        let files = self.files(root)?;
+        if path.is_empty() {
+            return Some(root);
+        }
+        files.dir(path)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::MemTree;
+    use super::{MemTree, Tree as _};
+
+    /// The invariant: a directory's ID is equal exactly when the files below it are (path
+    /// under it, mode, content), wherever the directory is and whatever is beside it.
+    #[test]
+    fn a_directorys_id_is_its_files_and_nothing_beside_it() {
+        let tree = MemTree::default();
+        let one = tree.root(&[("a/x.rs", b"1"), ("a/sub/y.rs", b"2"), ("a.rs", b"9"), ("b/x.rs", b"1")]);
+        let moved = tree.root(&[("deep/er/x.rs", b"1"), ("deep/er/sub/y.rs", b"2"), ("other", b"3")]);
+        let edited = tree.root(&[("a/x.rs", b"1"), ("a/sub/y.rs", b"two"), ("a.rs", b"9")]);
+        let renamed = tree.root(&[("a/x.rs", b"1"), ("a/sub/z.rs", b"2")]);
+        let a = tree.dir(one, "a").expect("a directory");
+        assert_eq!(tree.dir(one, ""), Some(one), "the root is its own ID");
+        assert_eq!(tree.dir(moved, "deep/er"), Some(a), "the same files elsewhere");
+        assert_ne!(tree.dir(edited, "a"), Some(a), "a file's content below it");
+        assert_ne!(tree.dir(renamed, "a"), Some(a), "a file's name below it");
+        assert_ne!(tree.dir(one, "b"), Some(a), "`a.rs` and `a/sub` are not in `b`");
+        assert_eq!(tree.dir(one, "a/sub"), tree.dir(moved, "deep/er/sub"));
+        assert_eq!(tree.dir(one, "a/x.rs"), None, "a file");
+        assert_eq!(tree.dir(one, "a/"), None, "a path is spelled without its last `/`");
+        assert_eq!(tree.dir(one, "nowhere"), None);
+        assert_eq!(tree.dir(a, ""), None, "a directory's ID is not a root this tree has");
+    }
 
     #[test]
     fn a_listing_is_sorted_by_name_and_sees_only_its_directory() {

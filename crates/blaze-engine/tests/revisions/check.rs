@@ -35,7 +35,7 @@ fn most(check: &'static str, bound: Option<u64>, got: Option<u64>, what: &str, i
 /// The checks the simulated driver does not see, because its pipeline ends at code records:
 /// nothing is linked or run, no unit is counted, and no engine memo counts are read. It
 /// skips them and says so in each row; every other check it holds.
-pub const SIM_BLIND: &[&str] = &["prints", "says", "max_units", "max_records", "max_runs", "max_executed", "max_verified", "max_written", "max_unkept", "max_described", "max_ms", "noop", "link", "account"];
+pub const SIM_BLIND: &[&str] = &["prints", "says", "max_units", "max_records", "max_runs", "max_executed", "max_verified", "max_written", "max_unkept", "max_described", "max_ran", "max_ms", "noop", "link", "account"];
 
 /// The standing expectation's check: every revision's build has an account that names no
 /// alarm (blaze-profile's `account`: no unexplained work, every sum held, work in proportion
@@ -175,6 +175,26 @@ fn all(revision: &Revision, seen: &Observed, clean: Option<&Observed>) -> Vec<Fa
     most("max_written", expect.max_written, seen.written, "engine inputs written", &mut failed);
     most("max_unkept", expect.max_unkept, seen.unkept, "units made whose record was not kept", &mut failed);
     most("max_described", expect.max_described, seen.described, "describes the codegen walk asked for", &mut failed);
+    for (name, bound) in &expect.max_ran {
+        match &seen.ran {
+            None => failed.push(Failure {
+                check: "max_ran",
+                wanted: format!("at most {bound} runs of the queries named `..{name}..`"),
+                got: "the driver does not see them".to_owned(),
+            }),
+            Some(ran) => {
+                let of: Vec<(&String, &u64)> = ran.iter().filter(|(query, runs)| query.contains(name.as_str()) && **runs > 0).collect();
+                let total: u64 = of.iter().map(|it| *it.1).sum();
+                if total > *bound {
+                    failed.push(Failure {
+                        check: "max_ran",
+                        wanted: format!("at most {bound} runs of the queries named `..{name}..`"),
+                        got: format!("{total}: {of:?}"),
+                    });
+                }
+            }
+        }
+    }
     most("max_ms", expect.max_ms, Some(seen.ms as u64), "ms", &mut failed);
     if expect.noop && seen.noop != Some(true) {
         failed.push(Failure {

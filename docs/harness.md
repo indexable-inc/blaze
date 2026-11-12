@@ -578,7 +578,7 @@ revision's overlay is that project's files whole; the real driver only), and `ch
 this), `prints`, `says`, `redone` (exactly), `redone_has`, `reused`, `max_units`, `max_records` (units whose record
 missed, compiled or not), `max_executed`,
 `max_verified`, `max_written` (the engine's input writes: 0 for a request that changes nothing),
-`max_unkept` (units made whose record was not kept, so the next build makes them again), `max_ms`, `noop` (answered as the last build was, with no walk), `link` (`first`,
+`max_unkept` (units made whose record was not kept, so the next build makes them again), `max_ran` (a table from a text to the most runs of the queries whose name holds it, summed: `{ item_tree = 0 }`; the real driver reads `blaze explain counts_by_cause`), `max_ms`, `noop` (answered as the last build was, with no walk), `link` (`first`,
 `spliced`, `unchanged`, `full`, `none`), `bytes` (the linked bytes equal a clean build's), `env`
 (variables of every command from that revision on), `args`, `remove`. A key the harness does
 not know is refused. `known` lists checks that fail today, each with its cause (`"real: check"`

@@ -779,6 +779,70 @@ fn every_directory_lists_the_same_lent_owned_and_through_the_vfs() {
     }
 }
 
+/// The invariant: a directory's ID ([`Reader::dir_id`]) is equal exactly when the files below
+/// it are, wherever the directory is and in whichever root: the same files written under
+/// another path of another tree give the same ID, one changed file below gives another, and
+/// a file, a path under a file and a missing path have none. The root's is the root.
+#[test]
+fn a_directorys_id_is_its_files_wherever_it_is() {
+    for seed in 0..8 {
+        let (mut vfs, root, dirs, files) = listing_fixture(seed, 120);
+        let reader = vfs.reader();
+        assert_eq!(reader.dir_id(root, ""), Some(root), "seed {seed}: the root");
+        // The same tree again under `moved/here/`, beside one more file, in a root of its own.
+        let mut ops: Vec<Op> =
+            files.iter().map(|path| write(&format!("moved/here/{path}"), path)).collect();
+        ops.push(write("beside", "x"));
+        let empty = vfs.empty();
+        let moved = vfs.commit("m", empty, &ops).unwrap().root;
+        let reader = vfs.reader();
+        assert_eq!(reader.dir_id(moved, "moved/here"), Some(root), "seed {seed}: the whole tree");
+        let mut ids = BTreeMap::new();
+        for dir in &dirs[1..] {
+            let id = reader.dir_id(root, dir);
+            assert!(id.is_some(), "seed {seed}: {dir:?} is a directory");
+            assert_eq!(pinned_dir(&reader, root, dir), id, "seed {seed}: {dir:?} under a pin");
+            assert_eq!(reader.dir_id(moved, &format!("moved/here/{dir}")), id, "seed {seed}: {dir:?} moved");
+            ids.insert(dir.clone(), id);
+        }
+        // One file's bytes changed: every directory above it has another ID, no other has.
+        let edited = &files[files.len() / 2];
+        let after = vfs.commit("w", root, &[write(edited, "other bytes")]).unwrap().root;
+        let reader = vfs.reader();
+        assert_ne!(after, root);
+        for dir in &dirs[1..] {
+            let above = edited.starts_with(&format!("{dir}/"));
+            assert_eq!(reader.dir_id(after, dir) != ids[dir], above, "seed {seed}: {dir:?} above {edited:?}");
+        }
+        let under = files.iter().map(|it| format!("{it}/x"));
+        for path in files.iter().cloned().chain(under).chain(["nope".into(), "a/nope/x".into()]) {
+            assert_eq!(reader.dir_id(root, &path), None, "seed {seed}: {path:?}");
+        }
+    }
+}
+
+fn pinned_dir(reader: &Reader, root: ContentId, path: &str) -> Option<ContentId> {
+    reader.pin().dir_id(root, path)
+}
+
+/// A directory's ID is read from its node: asking for every directory's allocates nothing
+/// and, being no listing, touches no entry of it.
+#[test]
+fn a_directorys_id_allocates_nothing() {
+    use blaze_alloc_count::assert_at_most;
+
+    assert!(blaze_alloc_count::installed());
+    let (vfs, root, dirs, _) = listing_fixture(3, 200);
+    let reader = vfs.reader();
+    // The first read registers this thread with the reclaimer; reads after it are measured.
+    let _ = reader.pin().dir_id(root, "");
+    let found = assert_at_most(0, "every directory's ID under one pin", || {
+        let pinned = reader.pin();
+        dirs.iter().filter(|dir| pinned.dir_id(root, dir).is_some()).count()
+    });
+    assert_eq!(found, dirs.len());
+}
+
 /// A listing through a pin lends the tree's names in place: listing every directory of a tree,
 /// under one pin or a pin each, allocates nothing.
 #[test]

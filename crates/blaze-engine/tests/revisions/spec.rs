@@ -115,6 +115,12 @@ pub enum Step {
     /// `project NAME` before it, the same sources in another directory under another home.
     /// Only the real driver has homes.
     Home(String),
+    /// As `home NAME`, but the new home starts with an empty store into which a pack is
+    /// imported: the daemon is stopped, `blaze store export --all` writes every record of
+    /// the first home's store that may travel as one pack, and `blaze store import` reads
+    /// it under the new home (docs/remote-cache.md, "Packs"; lane packs-1112). Only the real
+    /// driver has homes.
+    Packed(String),
     /// `run`, started and left running: the program keeps running across the revisions that
     /// follow, until [`Step::End`] or the test's end. Only the real driver has a process.
     Start,
@@ -172,6 +178,10 @@ pub struct Expect {
     /// describe read from a store record does not count
     /// (docs/v2/plan/design/store.md, "Describe records").
     pub max_described: Option<u64>,
+    /// The most runs of the queries whose name holds each text, summed over them
+    /// (`query_counts.executed` by query, as `blaze explain counts_by_cause` lists it):
+    /// `max_ran = { item_tree = 0 }` holds a build to no item tree made. Sorted by text.
+    pub max_ran: Vec<(String, u64)>,
     /// The longest the action may take, in milliseconds: a bound a hang or a storm of
     /// retries misses, generous enough that a loaded machine does not.
     pub max_ms: Option<u64>,
@@ -207,6 +217,8 @@ pub struct Observed {
     pub unkept: Option<u64>,
     /// The describes the codegen walk asked for ([`Expect::max_described`]).
     pub described: Option<u64>,
+    /// Each query that ran, with its runs ([`Expect::max_ran`]).
+    pub ran: Option<BTreeMap<String, u64>>,
     pub noop: Option<bool>,
     pub link: Option<String>,
     /// Panics the daemon caught since the revision before.
@@ -250,6 +262,7 @@ impl Step {
             Step::Do(action) => action.word().to_owned(),
             Step::Project(name) => format!("project {name}"),
             Step::Home(name) => format!("home {name}"),
+            Step::Packed(name) => format!("packed {name}"),
             Step::Start => "start".to_owned(),
             Step::Await { within_ms, text } => format!("await {within_ms} {text}"),
             Step::Count { times, text } => format!("count {times} {text}"),
@@ -311,6 +324,13 @@ fn step(word: &str, at: &str) -> Step {
                 );
                 Step::Home(name.to_owned())
             }
+            Some(("packed", name)) => {
+                assert!(
+                    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                    "{at}: `packed NAME` names a home beside the first, by letters, digits and `_`, not `{name}`"
+                );
+                Step::Packed(name.to_owned())
+            }
             Some(("wait", ms)) => Step::Wait(
                 ms.strip_suffix(" ms")
                     .and_then(|it| it.parse().ok())
@@ -351,7 +371,7 @@ fn step(word: &str, at: &str) -> Step {
             _ => Step::Do(Action::of(word).unwrap_or_else(|| {
                 panic!(
                     "{at}: no step `{word}`: `edit`, `edit by rename`, `edit by truncate then write`, `edit twice`, \
-                     `stop`, `kill`, `touch PATH`, `wait N ms`, `project NAME`, `beside NAME`, `home NAME`, \
+                     `stop`, `kill`, `touch PATH`, `wait N ms`, `project NAME`, `beside NAME`, `home NAME`, `packed NAME`, \
                      `cancel build after N ms`, `start`, `await MS TEXT`, `count TIMES TEXT`, `end`, `check`, \
                      `build`, `run`, `test`"
                 )
@@ -361,9 +381,9 @@ fn step(word: &str, at: &str) -> Step {
 }
 
 /// Every key a revision's table may hold: another is a typo, and is refused.
-const KEYS: [&str; 26] = [
+const KEYS: [&str; 27] = [
     "action", "args", "env", "steps", "remove", "fails", "prints", "says", "redone", "redone_within", "redone_has", "reused",
-    "max_units", "max_records", "max_runs", "max_executed", "max_verified", "max_written", "max_unkept", "max_described", "max_ms", "noop", "link", "bytes", "known", "about",
+    "max_units", "max_records", "max_runs", "max_executed", "max_verified", "max_written", "max_unkept", "max_described", "max_ran", "max_ms", "noop", "link", "bytes", "known", "about",
 ];
 
 fn files(dir: &Path, under: &Path, into: &mut Vec<Change>) {
@@ -464,6 +484,18 @@ impl Test {
                     max_written: count(row, "max_written", &at),
                     max_unkept: count(row, "max_unkept", &at),
                     max_described: count(row, "max_described", &at),
+                    max_ran: match row.get("max_ran") {
+                        None => Vec::new(),
+                        Some(toml::Value::Table(bounds)) => bounds
+                            .iter()
+                            .map(|(name, bound)| match bound.as_integer() {
+                                // clone: the case's text, read once
+                                Some(n) if n >= 0 => (name.clone(), n as u64),
+                                _ => panic!("{at}: `max_ran.{name}` is a count, not {bound}"),
+                            })
+                            .collect(),
+                        Some(other) => panic!("{at}: `max_ran` is a table from a text of a query's name to the most runs, not {other}"),
+                    },
                     max_ms: count(row, "max_ms", &at),
                     noop: flag(row, "noop", &at),
                     link: text(row, "link", &at),
