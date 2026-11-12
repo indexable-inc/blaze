@@ -1787,6 +1787,7 @@ fn delta<'a>(
         binds: &[],
         same_names: true,
         same_regions: true,
+        same_places: true,
         written,
         from,
     }
@@ -1932,8 +1933,11 @@ fn relinks_as_loaded(image: &Fixture, synthesis: u64, delta: &Delta<'_>) -> Vec<
     let relinked = image.build(&image.writer, synthesis, Some(delta));
     let fresh = Elf { output: image.writer.output.clone(), last: None };
     let built = image.build(&fresh, synthesis, None);
-    assert_eq!(relinked.1, built.1, "the file's parts");
     let apart = [Class::Synthetic(super::RELA_DYN), Class::Synthetic(super::DYNAMIC)];
+    // The headers hold `.rela.dyn`'s length: a table with an empty slot is longer.
+    if table(&relinked.0, super::RELA_DYN).len() == table(&built.0, super::RELA_DYN).len() {
+        assert_eq!(relinked.1, built.1, "the file's parts");
+    }
     for ((class, kept), (_, whole)) in relinked.0.iter().zip(&built.0) {
         if !apart.contains(class) {
             assert_eq!(kept, whole, "{class:?}");

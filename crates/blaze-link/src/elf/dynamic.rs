@@ -734,9 +734,11 @@ fn rela_dyn(
         return Ok((CowBytes::from_vec(rela_bytes(&relocations)), relative, tpoff));
     };
     let last = std::mem::replace(&mut kept.synthesis, 0);
+    // An entry is of its address and the 8 bytes there: the regions' places decide it, not
+    // their sizes, which an edit that fills the patch regions changes.
     let patches = placed
         .delta
-        .filter(|delta| last != 0 && slotted(&writer.output) && delta.patches(last, &[]));
+        .filter(|delta| last != 0 && slotted(&writer.output) && delta.from == last && delta.same_places);
     #[cfg(test)]
     let patches = patches.filter(|delta| !kept.whole || delta.rebase.iter().all(|it| it.same_len()));
     if let Some(delta) = patches {

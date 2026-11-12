@@ -349,7 +349,8 @@ impl<'a> Stage<'a> {
         let arena = self.arena;
         self.new.synthesis = next_synthesis();
         let written = self.written();
-        let same_regions = same_regions(&self.old.spaces, &parts.regions);
+        let same_places = same_places(&self.old.spaces, &parts.regions);
+        let same_regions = same_places && same_sizes(&self.old.spaces, &parts.regions);
         let (old, new) = (&self.old.resolved, &self.new.resolved);
         let same_names = Arc::ptr_eq(&old.imports, &new.imports)
             && Arc::ptr_eq(&old.libraries, &new.libraries)
@@ -365,7 +366,8 @@ impl<'a> Stage<'a> {
             let paged = collect_in(contents.iter().map(|it| it.1), arena);
             let resolver = self.resolver(&parts.regions);
             let symbol = |name: &str| resolver.address_of(name);
-            let delta = delta(changes.as_ref(), from, same_names, same_regions, &pieces);
+            let same = (same_names, same_regions, same_places);
+            let delta = delta(changes.as_ref(), from, same, &pieces);
             let placed = parts.placed(&self, &refs, &paged, &symbol, delta.as_ref(), &[]);
             self.writer.synthesize(&placed)?
         };
@@ -429,7 +431,8 @@ impl<'a> Stage<'a> {
             }
             let resolver = self.resolver(&parts.regions);
             let symbol = |name: &str| resolver.address_of(name);
-            let delta = delta(changes.as_ref(), from, same_names, same_regions, &written_all);
+            let same = (same_names, same_regions, same_places);
+            let delta = delta(changes.as_ref(), from, same, &written_all);
             let placed = parts.placed(&self, &refs, &paged, &symbol, delta.as_ref(), &[]);
             let offsets =
                 collect_in(parts.regions.iter().map(|it| self.writer.offset(&placed, it)), arena);
@@ -610,25 +613,29 @@ impl<'a> Stage<'a> {
     }
 }
 
-/// Whether no region moved or changed its room, nor its size but for a synthetic one, whose
-/// size the writer makes: `old` the last link's, `new` this one's, by index.
-fn same_regions(old: &[Space], new: &[Region]) -> bool {
+/// Whether no region moved or changed its room ([`Delta::same_places`]): `old` the last
+/// link's, `new` this one's, by index.
+fn same_places(old: &[Space], new: &[Region]) -> bool {
     old.len() == new.len()
         && old.iter().zip(new).all(|(old, new)| {
             let old = &old.region;
-            old.class == new.class
-                && old.addr == new.addr
-                && old.capacity == new.capacity
-                && (old.size == new.size || matches!(new.class, Class::Synthetic(_)))
+            old.class == new.class && old.addr == new.addr && old.capacity == new.capacity
         })
+}
+
+/// Whether no region of the same places ([`same_places`]) changed its size, but for a
+/// synthetic one, whose size the writer makes: with it, [`Delta::same_regions`].
+fn same_sizes(old: &[Space], new: &[Region]) -> bool {
+    old.iter().zip(new).all(|(old, new)| {
+        old.region.size == new.size || matches!(new.class, Class::Synthetic(_))
+    })
 }
 
 /// The [`Delta`] of `changes`, the runs a stage's splices replaced, from synthesis `from`.
 fn delta<'d>(
     changes: Option<&'d Changes<'_>>,
     from: u64,
-    same_names: bool,
-    same_regions: bool,
+    (same_names, same_regions, same_places): (bool, bool, bool),
     written: &'d [(u64, u64)],
 ) -> Option<Delta<'d>> {
     let changes = changes?;
@@ -639,6 +646,7 @@ fn delta<'d>(
         binds: &changes.binds,
         same_names,
         same_regions,
+        same_places,
         written,
         from,
     })
