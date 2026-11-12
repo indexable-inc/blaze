@@ -172,7 +172,6 @@ impl Lowered {
 /// i18n-embed): waiting for it left the crate's wasm module without its glue, built and
 /// linked, and every `fl!` failed on a module with no `blaze_proc_macro_alloc`.
 pub fn macros_loaded(db: &Db, krate: Crate) -> bool {
-    let by_crate = ProcMacros::get(db).by_crate(db);
     // alloc: once a test crate a write, its closure walked
     let mut seen: HashSet<Crate, Global> = HashSet::new_in(Global);
     let mut stack = vec![krate]; // alloc: as `seen`
@@ -181,7 +180,7 @@ pub fn macros_loaded(db: &Db, krate: Crate) -> bool {
             if !seen.insert(dep.crate_id) {
                 continue;
             }
-            let unbuilt = by_crate.get(&dep.crate_id).is_some_and(|it| {
+            let unbuilt = ProcMacros::given(db, dep.crate_id).is_some_and(|it| {
                 matches!(it.get_error(), Some(base_db::ProcMacroLoadingError::NotYetBuilt))
             });
             if unbuilt {

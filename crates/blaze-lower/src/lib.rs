@@ -326,8 +326,25 @@ struct Applied {
 }
 
 /// The crate graph, source roots and files of `lower.units` in a new database.
+///
+/// For a test or a tool that holds no store: every crate is resolved from source in the write
+/// that adds it, and [`Lowered::serve_deps`] refuses the front end. A driver with a store (the
+/// daemon, always) lowers with [`lower_awaiting`].
 pub fn lower<T: blaze_query::Tree>(lower: Lower<'_, T>) -> Result<Lowered, LowerError> {
     lower_into(Db::new(), lower)
+}
+
+/// [`lower`] for a driver that asks its store for the records of every crate before anything
+/// reads one ([`Lowered::serve_deps`], with each unit's crate among `asked` once the unit is
+/// ready): the database awaits the crates added to it (`hir_def::deps::awaited`), so neither
+/// this lowering nor a later plan's ([`Lowered::relower`]) resolves a crate; the serve that
+/// asks about a crate reads it from its records, or gives it its first run from source when
+/// the store has none. A crate read before it was asked about stops its reader with an error
+/// naming the crate awaited.
+pub fn lower_awaiting<T: blaze_query::Tree>(lower: Lower<'_, T>) -> Result<Lowered, LowerError> {
+    let mut db = Db::new();
+    hir_def::deps::await_added(&mut db);
+    lower_into(db, lower)
 }
 
 /// What a front end keeps of every plan lowered into it, so that a plan is a view over one
@@ -806,7 +823,6 @@ fn lower_writes<T: blaze_query::Tree>(
     graph.excluded.clone_from(&excluded);
 
     if first {
-        ProcMacros::init_default(db, Durability::HIGH);
         // rustc compiles, checks and evaluates what a builtin derive expands to: the impls it
         // writes have bodies, which recording them without expanding (rust-analyzer's fast
         // path) leaves out.
@@ -1203,6 +1219,9 @@ fn lower_writes<T: blaze_query::Tree>(
     // After the crates there, which keep their places: the write is the list alone, and a
     // plan found whole writes none.
     base_db::add_crates(db, &all, Durability::MEDIUM);
+    // In a front end lowered awaiting ([`lower_awaiting`]) the crates made are awaited: this
+    // write's pass resolves none of them. Nothing is written for a plan found whole.
+    hir_def::deps::await_crates(db, &all);
     if first {
         // The first plan's graph is a change of the whole graph to every maintainer, as it
         // was when the list was set whole.
@@ -2236,18 +2255,45 @@ impl Lowered {
     /// the image away already, in that write, as it has of every served crate depending on it
     /// (`hir_def::deps`' implied write). An image that does not read is an error naming its
     /// crate. A write, as [`Lowered::ran`] is.
+    ///
+    /// `asked` is every crate the driver asks about now, eligible or not (each ready unit's
+    /// crate); `crates` those of them to fetch. `asked` and all they depend on are released
+    /// from the awaited set in the same write (`hir_def::deps::serve_asked`): the ones with
+    /// an image are never resolved, the others get their first run here. With an empty
+    /// `crates` it only releases, and writes nothing when none of `asked` was awaited.
+    ///
+    /// Only a front end lowered awaiting ([`lower_awaiting`]) is served: one from [`lower`]
+    /// resolved every crate when it was added, so serving it would be the path where a crate
+    /// with records is resolved first; it is refused by name.
     pub fn serve_deps(
         &mut self,
+        asked: &[Crate],
         crates: &[Crate],
         build: ContentId,
         // dyn: the driver's store, one call per crate per front end
         images: &dyn hir_def::deps::ImageStore,
         mode: hir_def::deps::Mode,
     ) -> Result<hir_def::deps::Served, LowerError> {
+        if !hir_def::deps::awaits_added(&self.db) {
+            // alloc: an error
+            return Err(LowerError::new(
+                "the dependencies' images are served into a front end that awaits no crate: \
+                 it was lowered with `blaze_lower::lower`, which resolves every crate from \
+                 source as it is added; a driver with a store lowers with \
+                 `blaze_lower::lower_awaiting`"
+                    .to_owned(),
+            ));
+        }
         let trigger = Trigger::named("the dependencies' images served");
         self.db
-            .batch(trigger, |db| hir_def::deps::serve(db, crates, build, images, mode))
+            .batch(trigger, |db| hir_def::deps::serve_asked(db, asked, crates, build, images, mode))
             .map_err(LowerError::new)
+    }
+
+    /// Whether any crate of the front end is awaited (`hir_def::deps::awaited`): a load.
+    /// While true, a serve of ready units has crates to release whether or not a key moved.
+    pub fn any_awaited(&self) -> bool {
+        hir_def::deps::any_awaited(&self.db)
     }
 
     /// The images of the crates `served` keyed and found none of, written to `images` from
@@ -2385,14 +2431,15 @@ pub struct Narrowed {
     /// builds code, which reads every body it reaches.
     pub code: ContentId,
     /// What a check of the crate can observe: its own code text, and of each crate it depends
-    /// on only its interface (each body no other crate's check can read as its shape too).
+    /// on only its surface ([`code::CodeText::surface`]: each body no other crate's front end
+    /// reads as a mark, and no position a line alone moves).
     /// For a unit that only checks. Equal to `code` wherever a check may read more: a crate
     /// that names blaze's extensions or reads files by path.
     pub checked: ContentId,
     /// What a library's build that stops at the crate boundary can observe (store.md, "Early
     /// cutoff between crates"): its own code text, and of each crate it depends on only its
-    /// interface, which holds whole every body a dependent compiles a copy of (a generic, an
-    /// `#[inline]` function, a default method, a `const fn`) and each other body as its shape.
+    /// surface ([`code::CodeText::surface`]): what a front end reads of it, with no position
+    /// in it but the ones a constant can hold, and an `#[inline(always)]` body whole.
     /// For a unit that makes a library with no MIR inlining across crates, whose record names
     /// no function of another crate (blaze-cargo's `narrow_identity` says which units those
     /// are). Equal to `code` wherever `checked` is.
@@ -2415,14 +2462,30 @@ struct Narrow {
     checked: ContentId,
     /// [`Narrowed::built`].
     built: ContentId,
+    /// What another crate's front end observes of it and, through it, of what it depends on,
+    /// with no position but the ones a constant can hold: its surface text and its
+    /// dependencies' surfaces ([`code::CodeText::surface`]). `interface` where it has no
+    /// surface, or could hold a position its surface does not say (`locates` and its own
+    /// calls).
+    surface: ContentId,
+    /// Whether it or a crate it depends on could give a constant of a crate above its
+    /// caller's position: it has a `#[track_caller]` `const fn` ([`code::CodeText::tracks`])
+    /// and names `Location` or is above a crate that gives positions (a tracked function
+    /// that calls one passes its own caller's on). A library crate with no code text of its
+    /// own is taken to, unless it is the standard library's, whose one such function is
+    /// named where it is called (`Location::caller`, which the surface holds with its place).
+    locates: bool,
     /// Whether it or a workspace crate it depends on names blaze's extensions.
     extends: bool,
 }
 
 const NARROW_CODE: &str = "blaze v2 cargo unit narrow code 2";
 const NARROW_INTERFACE: &str = "blaze v2 cargo unit narrow interface 2";
-const NARROW_CHECKED: &str = "blaze v2 cargo unit narrow checked 2";
-const NARROW_BUILT: &str = "blaze v2 cargo unit narrow built 1";
+/// 3: a dependency by its surface.
+const NARROW_CHECKED: &str = "blaze v2 cargo unit narrow checked 3";
+/// 2: a dependency by its surface.
+const NARROW_BUILT: &str = "blaze v2 cargo unit narrow built 2";
+const NARROW_SURFACE: &str = "blaze v2 cargo unit narrow surface 1";
 
 /// [`Lowered::narrowed`] of `krate`, each crate of its closure worked out once into `known`,
 /// dependencies first, with a stack of its own; `whole` holds the whole identity
@@ -2464,15 +2527,27 @@ fn narrow_of(
             None => code::own_narrow(db, at),
         };
         let extends = own.extends || data.dependencies.iter().any(|it| known[&it.crate_id].extends);
+        let locates_below = data.dependencies.iter().any(|it| known[&it.crate_id].locates);
         let Some(own_code) = own.code else {
             // A crate that keeps its whole text is its whole identity to everything.
             let id = whole[&at];
+            let locates = locates_below || !data.origin.is_lang();
             known.insert(
                 at,
-                Narrow { own: false, code: id, interface: id, checked: id, built: id, extends },
+                Narrow {
+                    own: false,
+                    code: id,
+                    interface: id,
+                    checked: id,
+                    built: id,
+                    surface: id,
+                    locates,
+                    extends,
+                },
             );
             continue;
         };
+        let locates = locates_below || (own.tracks && (own.names_location || locates_below));
         // Of `own_text` and each dependency by `of`, with how cargo passes the root, which
         // the crate's code says of its files, as the whole identity has it.
         let folded = |domain: &'static str, own_text: ContentId, of: fn(&Narrow) -> ContentId| {
@@ -2508,9 +2583,18 @@ fn narrow_of(
             }
             _ => code,
         };
+        // A constant of this crate made by a call of a function that gives its caller's
+        // position holds a position no token says: then the interface, which holds them all.
+        let positioned = locates && own.calls && !code::planted(code::Plant::Located);
+        let surface = match own.surface {
+            Some(own_surface) if library && !extends && !positioned => {
+                folded(NARROW_SURFACE, own_surface, |it| it.surface)
+            }
+            _ => interface,
+        };
         let checked = match extends || own.reaches || code::planted(code::Plant::Deep) {
             true => code,
-            false => folded(NARROW_CHECKED, own_code, |it| it.interface),
+            false => folded(NARROW_CHECKED, own_code, |it| it.surface),
         };
         // A library built up to the crate boundary reads of a dependency what a check does,
         // and compiles of it only the bodies its interface holds whole: the same fold as
@@ -2518,9 +2602,12 @@ fn narrow_of(
         // taken away (the planted control) it is the deep code identity again.
         let built = match extends || own.reaches || code::planted(code::Plant::Uncut) {
             true => code,
-            false => folded(NARROW_BUILT, own_code, |it| it.interface),
+            false => folded(NARROW_BUILT, own_code, |it| it.surface),
         };
-        known.insert(at, Narrow { own: true, code, interface, checked, built, extends });
+        known.insert(
+            at,
+            Narrow { own: true, code, interface, checked, built, surface, locates, extends },
+        );
     }
     known[&krate]
 }

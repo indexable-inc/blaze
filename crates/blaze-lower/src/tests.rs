@@ -22,6 +22,8 @@ use triomphe::Arc;
 
 use super::{Appended, Db, Lower, LowerError, Lowered, Ran, crates, files, lower};
 
+mod awaited;
+
 const HOST: &str = "x86_64-unknown-linux-gnu";
 const LIBRARY: &str = "/rustc/abc/library";
 const OUT_DIR: &str = "/w/target/debug/build/a-1/out";
@@ -1943,8 +1945,8 @@ fn library_with_proc_macro(tree: &MemTree) -> ContentId {
 
 /// The const macros of `krate`'s macro crate, by name.
 fn const_macros_of(db: &Db, krate: Crate) -> Vec<String> {
-    let all = hir_expand::proc_macro::ProcMacros::get(db);
-    let macros = all.by_crate(db).get(&krate).cloned().expect("the macro crate has macros");
+    let macros = hir_expand::proc_macro::ProcMacros::given(db, krate)
+        .expect("the macro crate has macros");
     macros.macros().expect("listed").iter().map(|it| it.name.as_str().to_owned()).collect()
 }
 
@@ -2550,7 +2552,9 @@ const LIB_SIGNATURE: &[u8] = b"pub fn gen() -> u16 {\n    1\n}\n";
 
 /// What an edit of the lib's root from [`LIB_PLAIN`] to `lib` must leave as it was and must
 /// move, of the lib's keys and of the bin's above it: the oracle of the narrowed identities.
-/// `comment`: the edit is of comments alone. `body`: of a plain body, keeping its lines.
+/// `comment`: the edit is of comments alone. `body`: of what no front end above reads, a
+/// plain body or the lines of the file (a comment on a line of its own, a line more in a
+/// body): the crates above hold the lib's surface, which has no position in it.
 /// Any other edit is one every reader observes.
 fn check_edit(lib: &'static [u8], comment: bool, body: bool) -> Result<(), String> {
     let [(lib_whole, lib_was), (bin_whole, bin_was)] = narrowed_over(LIB_PLAIN);
@@ -2571,8 +2575,8 @@ fn check_edit(lib: &'static [u8], comment: bool, body: bool) -> Result<(), Strin
     if comment != (lib_was.checked == lib_now.checked) {
         return said("the lib's own check's identity");
     }
-    // What a check of the bin can observe of the lib: its interface, which a comment and a
-    // plain body leave as it was.
+    // What a check of the bin can observe of the lib: its surface, which a comment, a plain
+    // body and a moved line leave as it was.
     if (comment || body) != (bin_was.checked == bin_now.checked) {
         return said("the identity of the bin's check, which reads the lib's interface");
     }
@@ -2600,11 +2604,26 @@ fn a_dependents_key_moves_only_with_what_it_observes_of_a_dependency() {
     assert_eq!(check_edit(LIB_COMMENTED, true, false), Ok(()));
     assert_eq!(check_edit(LIB_SPACED, true, false), Ok(()));
     assert_eq!(check_edit(LIB_ENDED, true, false), Ok(()));
-    assert_eq!(check_edit(LIB_HEADED, false, false), Ok(()));
+    assert_eq!(check_edit(LIB_HEADED, false, true), Ok(()));
     assert_eq!(check_edit(LIB_DOCUMENTED, false, false), Ok(()));
     assert_eq!(check_edit(LIB_BODY, false, true), Ok(()));
-    assert_eq!(check_edit(LIB_LINE, false, false), Ok(()));
+    assert_eq!(check_edit(LIB_LINE, false, true), Ok(()));
     assert_eq!(check_edit(LIB_SIGNATURE, false, false), Ok(()));
+}
+
+/// With a surface that keeps a left-out body's count of lines, a line added to a plain body
+/// moves the key of the check above it: the cutoff of positions is gone, and the oracle says
+/// where (the cause removed: the line before passes).
+#[test]
+fn the_oracle_catches_a_dependents_key_that_holds_a_bodys_lines() {
+    assert_eq!(check_edit(LIB_LINE, false, true), Ok(()));
+    assert_eq!(
+        crate::code::planting(crate::code::Plant::Lines, || check_edit(LIB_LINE, false, true)),
+        Err(format!(
+            "{}: the identity of the bin's check, which reads the lib's interface",
+            String::from_utf8_lossy(LIB_LINE)
+        ))
+    );
 }
 
 /// With a check keyed by its dependencies' code, a plain body's edit moves the checking
@@ -2651,11 +2670,12 @@ fn the_oracle_catches_a_library_built_under_its_dependencies_code() {
 }
 
 /// The invariant: what a library's build up to the crate boundary is keyed by moves with
-/// every body of a crate below it that the build compiles a copy of or evaluates (a generic,
-/// an `#[inline]` function, a `const fn`, a default method, a constant's value, a macro's
-/// tokens), with a signature and with a line moved, and with nothing else of that crate: a
-/// plain function's body that keeps its lines leaves it as it was, and so does a comment. The
-/// lib's own build's key moves with each of them but the comment.
+/// what its front end reads of a crate below it (a signature, a `const fn`'s body, a
+/// constant's value, a macro's tokens) and with an `#[inline(always)]` body, which is built
+/// into its own code, and with nothing else of that crate: a plain, generic, `#[inline]` or
+/// default-method body, a line moved and a comment leave it as it was (the copies of a
+/// generic are functions of their own, in no library's record). The lib's own build's key
+/// moves with each of them but the comment.
 #[test]
 fn a_library_built_over_a_crate_is_keyed_by_what_it_compiles_of_it() {
     let built = |lib: &'static [u8]| {
@@ -2663,18 +2683,23 @@ fn a_library_built_over_a_crate_is_keyed_by_what_it_compiles_of_it() {
         (lib.built, over.built)
     };
     // (before, after, whether a library over the lib observes the edit)
-    let cases: [(&'static [u8], &'static [u8], bool); 9] = [
+    let cases: [(&'static [u8], &'static [u8], bool); 10] = [
         (LIB_PLAIN, LIB_BODY, false),
         (LIB_PLAIN, LIB_SIGNATURE, true),
-        (LIB_PLAIN, LIB_LINE, true),
+        (LIB_PLAIN, LIB_LINE, false),
         (
             b"pub fn gen<T>(_t: T) -> u8 {\n    1\n}\n",
             b"pub fn gen<T>(_t: T) -> u8 {\n    2\n}\n",
-            true,
+            false,
         ),
         (
             b"#[inline]\npub fn gen() -> u8 {\n    1\n}\n",
             b"#[inline]\npub fn gen() -> u8 {\n    2\n}\n",
+            false,
+        ),
+        (
+            b"#[inline(always)]\npub fn gen() -> u8 {\n    1\n}\n",
+            b"#[inline(always)]\npub fn gen() -> u8 {\n    2\n}\n",
             true,
         ),
         (
@@ -2685,7 +2710,7 @@ fn a_library_built_over_a_crate_is_keyed_by_what_it_compiles_of_it() {
         (
             b"pub trait Gen {\n    fn gen(&self) -> u8 {\n        1\n    }\n}\npub fn gen() -> u8 {\n    1\n}\n",
             b"pub trait Gen {\n    fn gen(&self) -> u8 {\n        2\n    }\n}\npub fn gen() -> u8 {\n    1\n}\n",
-            true,
+            false,
         ),
         (
             b"pub const N: u8 = 1;\npub fn gen() -> u8 {\n    1\n}\n",
@@ -2722,11 +2747,19 @@ fn a_crate_whose_bodies_a_check_may_read_gives_no_interface() {
     assert_ne!(pure.checked, pure_body.checked, "an effect is proved over the body");
     let [_, (_, inline)] = narrowed_over(b"#[inline]\npub fn gen() -> u8 {\n    1\n}\n");
     let [_, (_, inline_body)] = narrowed_over(b"#[inline]\npub fn gen() -> u8 {\n    2\n}\n");
-    assert_ne!(inline.checked, inline_body.checked, "an `#[inline]` body");
+    assert_eq!(
+        inline.checked, inline_body.checked,
+        "an `#[inline]` body is no front end's to read: its copies are functions of their own"
+    );
     // A library built over it is cut off, and not, by the same things.
     assert_eq!(plain.built, body.built);
     assert_ne!(pure.built, pure_body.built, "an effect is proved over the body");
-    assert_ne!(inline.built, inline_body.built, "an `#[inline]` body is compiled into its user");
+    assert_eq!(inline.built, inline_body.built);
+    let [_, (_, always)] = narrowed_over(b"#[inline(always)]\npub fn gen() -> u8 {\n    1\n}\n");
+    let [_, (_, always_body)] =
+        narrowed_over(b"#[inline(always)]\npub fn gen() -> u8 {\n    2\n}\n");
+    assert_ne!(always.checked, always_body.checked, "an `#[inline(always)]` body");
+    assert_ne!(always.built, always_body.built, "which is built into its callers' own code");
 }
 
 /// The edited crate's own unit, directed: an edit of its root that moves no token and no

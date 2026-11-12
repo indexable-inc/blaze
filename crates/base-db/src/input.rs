@@ -819,6 +819,49 @@ pub struct Crate {
     #[get(lint_options_field)]
     #[set(set_lint_options_field)]
     lint_options: LintOptions,
+    /// The crate's proc macros, as hir-expand gives them (`ProcMacros::give`): a field of the
+    /// crate, never an entry of one map of every crate, so giving one crate its macros writes
+    /// that crate's input alone and no row of another crate reads it
+    /// (`blaze_query::db::seal`: the field is an input of the crate's own seal group). Not in
+    /// its content ID, as the map was not.
+    #[default]
+    #[returns(ref)]
+    pub given_proc_macros: Given,
+}
+
+/// What a crate above base-db gives one crate and base-db only keeps: a value of a type of
+/// that crate's, behind one field of the [`Crate`] it is of. Two are equal when they are the
+/// same value (the same allocation) or both nothing: whoever gives one compares what it
+/// holds first (a set of an equal value opens no view, `InputSetter::to`).
+#[derive(Clone, Default)]
+pub struct Given(Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>); // dyn: a type of a crate above this one, read back by that crate alone
+
+impl Given {
+    /// `value`, given.
+    pub fn new<T: std::any::Any + Send + Sync>(value: T) -> Given {
+        Given(Some(std::sync::Arc::new(value))) // alloc: once per value given to a crate
+    }
+
+    /// The value given, if one was and it is a `T`.
+    pub fn get<T: std::any::Any>(&self) -> Option<&T> {
+        self.0.as_deref()?.downcast_ref()
+    }
+}
+
+impl PartialEq for Given {
+    fn eq(&self, other: &Given) -> bool {
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Debug for Given {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.0.is_some() { "Given(..)" } else { "Given(nothing)" })
+    }
 }
 
 impl Crate {
@@ -1659,8 +1702,8 @@ impl Walk<'_, '_> {
             krate.env.clone(),
             InputId(content),
         );
-        seal_crate(db, &mut *self.crates, input);
         let changed = self.crates.note(input, root, true);
+        seal_crate(db, &mut *self.crates, input);
         (input, changed)
     }
 }

@@ -4,7 +4,7 @@ use core::fmt;
 use std::any::Any;
 use std::{panic::RefUnwindSafe, sync};
 
-use base_db::{Crate, CrateBuilderId, CratesIdMap, Db, Env, ProcMacroLoadingError};
+use base_db::{Crate, CrateBuilderId, CratesIdMap, Db, Env, Given, ProcMacroLoadingError};
 use blaze_hash::HashMap;
 use blaze_query::db::{Durability, Setter};
 use intern::Symbol;
@@ -220,19 +220,14 @@ impl ProcMacrosBuilder {
         );
     }
 
-    /// Builds [`ProcMacros`] and adds id to `db`
+    /// Gives each crate its proc macros ([`ProcMacros`]).
     pub(crate) fn build_in(self, db: &mut Db, crates_id_map: &CratesIdMap) {
-        let mut map = self
-            .0
-            .into_iter()
-            .map(|(krate, proc_macro)| (crates_id_map[&krate], proc_macro))
-            .collect::<HashMap<_, _, Global>>();
-        map.shrink_to_fit();
-        ProcMacros::try_get(db)
-            .unwrap_or_else(|| ProcMacros::new(db, Durability::HIGH, Default::default()))
-            .set_by_crate(db)
-            .with_durability(Durability::HIGH)
-            .to(map);
+        for (krate, proc_macro) in self.0 {
+            crates_id_map[&krate]
+                .set_given_proc_macros(db)
+                .with_durability(Durability::HIGH)
+                .to(Given::new(proc_macro));
+        }
         db.note_crates_changed();
     }
 }
@@ -257,16 +252,21 @@ thread_local! {
 #[derive(Debug, PartialEq, Eq)]
 pub struct CrateProcMacros(StoredProcMacroLoadResult);
 
-/// The proc macros. Do not use [`Self::get`]! Use [`Self::get_for_crate`] instead.
-#[blaze_query::input(singleton, debug)]
-pub struct ProcMacros {
-    #[returns(ref)]
-    pub by_crate: HashMap<Crate, Arc<CrateProcMacros>, Global>,
-}
+/// The proc macros: each crate's are a field of that crate's own input
+/// (`base_db::Crate::given_proc_macros`, of kind `HIGH`), read with
+/// [`ProcMacros::get_for_crate`] and written with [`ProcMacros::give`].
+///
+/// The invariant: giving one crate its macros writes that crate's input and no other, so no
+/// row that read another crate's macros verifies again, and the crate's seal group is the one
+/// group the write opens. Until 2026-11-12 one map held every crate's (a `HIGH` singleton),
+/// and a new proc-macro crate, or a list loaded again, was a write every crate's expansion
+/// had read.
+pub struct ProcMacros;
 
 impl ProcMacros {
-    pub fn init_default(db: &mut Db, durability: Durability) {
-        _ = Self::new(db, durability, Default::default());
+    /// The macros `krate` was given, outside any query: no read is recorded.
+    pub fn given(db: &Db, krate: Crate) -> Option<Arc<CrateProcMacros>> {
+        krate.given_proc_macros(db).get::<Arc<CrateProcMacros>>().cloned()
     }
 
     /// Gives each crate of `given` its proc macros (or why it has none) in place of those it
@@ -288,32 +288,20 @@ impl ProcMacros {
         given: impl IntoIterator<Item = (Crate, ProcMacroLoadResult)>,
     ) -> bool {
         db.batch(base_db::Trigger::named("ProcMacros::give"), |db| {
-            let all = ProcMacros::try_get(db)
-                .unwrap_or_else(|| ProcMacros::new(db, Durability::HIGH, Default::default()));
-            // alloc: the crates whose list is another, none when every one is given what it has
-            let mut changed: Vec<(Crate, Arc<CrateProcMacros>)> = Vec::new();
-            {
-                let held = all.by_crate(db);
-                for (krate, macros) in given {
-                    let macros = CrateProcMacros::new(macros);
-                    if held.get(&krate).is_some_and(|it| !macros.replaces(it))
-                        && !GIVES_EQUAL_LISTS.get()
-                    {
-                        continue;
-                    }
-                    changed.push((krate, Arc::new(macros))); // alloc: once per crate, when its proc macros are loaded
+            let mut any = false;
+            for (krate, macros) in given {
+                let macros = CrateProcMacros::new(macros);
+                let held = krate.given_proc_macros(&*db).get::<Arc<CrateProcMacros>>();
+                if held.is_some_and(|it| !macros.replaces(it)) && !GIVES_EQUAL_LISTS.get() {
+                    continue;
                 }
-            }
-            if changed.is_empty() {
-                return false;
-            }
-            let mut by_crate = all.by_crate(db).clone();
-            for (krate, macros) in changed {
-                by_crate.insert(krate, macros);
+                // alloc: once per crate, when its proc macros are loaded
+                let macros = Given::new(Arc::new(macros));
+                krate.set_given_proc_macros(db).with_durability(Durability::HIGH).to(macros);
                 db.note_proc_macros(krate);
+                any = true;
             }
-            all.set_by_crate(db).with_durability(Durability::HIGH).to(by_crate);
-            true
+            any
         })
     }
 }
@@ -323,7 +311,7 @@ impl ProcMacros {
     /// Incrementality query to prevent queries from directly depending on [`Self::get`].
     #[blaze_query::tracked(returns(as_ref), mem_tag = Expand)]
     pub fn get_for_crate(db: &Db, krate: Crate) -> Option<Arc<CrateProcMacros>> {
-        Self::get(db).by_crate(db).get(&krate).cloned()
+        krate.given_proc_macros(db).get::<Arc<CrateProcMacros>>().cloned()
     }
 }
 
