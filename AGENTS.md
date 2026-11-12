@@ -199,6 +199,11 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     from first principles (with how the best existing systems do it), have it reviewed by someone
     outside the work, and rebuild that part; a fast path bolted onto a slow default is the sign.
     Skill: `changing-code`.
+67. **within-ten-percent-of-the-floor**: Design only what is within 10% of the theoretical best in time,
+    memory and disk: a design states the floor of each operation it serves (an oracle that redoes
+    only what changed and its direct readers, plus the I/O nobody avoids) and its own cost against
+    it, and every measurement reports the ratio; what cannot reach the floor is said plainly, not
+    built around. Skill: `changing-code`.
 
 ## Code Review Rules
 

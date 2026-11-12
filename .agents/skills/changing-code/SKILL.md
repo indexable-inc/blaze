@@ -184,4 +184,27 @@ speed of the next fix is never a reason to keep the design.
 
 See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
 
+## within-ten-percent-of-the-floor (rule 67)
+
+The floor is what an oracle that already knows exactly which results changed would do: redo those
+and the direct readers of each changed value (a reader must rerun to learn whether its own value
+changed), plus unavoidable I/O (a process start, a socket round trip, the bytes of the result). The
+bar is bookkeeping of at most max(10% of that work, a few milliseconds); under a few milliseconds a
+percentage means nothing. Before building: (1) write the floor for each operation the design serves
+(no-op, comment edit, body edit, interface edit under many dependents, restart, idle memory, peak
+memory, bytes on disk) and the design's cost beside it as a formula in the things that grow
+(entries, reads, files, dependents), and reject a cost that grows with what is reachable where the
+floor grows with what changed; (2) count constants too: a check that costs microseconds where a mark
+costs nanoseconds is off by a hundred before any asymptotics; (3) where two measures trade (an index
+that buys time for memory or disk; small when idle against instant after idle), pick the point and
+say which measure pays; (4) say plainly what no design reaches (direct readers rerun; every
+instantiation of an edited generic is recompiled; a restart on Linux stats every file) so nobody
+designs around it. After building: every edit-loop measurement reports results changed, direct
+readers rerun, everything else touched, and the ratio of the last to the first two; a ratio over 1.1
+is a defect with an owner. The compiler's own throughput (type checking, LLVM) has no theoretical
+best and is compared with the best existing tools instead. An outside review of the cost table comes
+before the build (end-state-not-hill-climb).
+
+See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
+
 <!-- End of the generated rules. Hand-written notes follow. -->
