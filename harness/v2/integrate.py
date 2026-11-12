@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """One tree, one build, one table: merge every lane branch into an integration worktree, build once
 with cargo, and run every check against that one binary. Input: one JSON value (`Input`):
 
@@ -13,7 +12,14 @@ as `INVALID: <why>`, never as a number, and the script then exits 1. `named` rer
 names, each run expected to run exactly those: a name that matches no test is INVALID, not a pass
 (agents.json A39).
 """
-import json, os, re, shutil, subprocess, sys, time
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -60,7 +66,8 @@ BAD: list[str] = []
 
 
 def sh(args: list[str], cwd: Path | str = REPO, env: dict[str, str] | None = None, timeout: int = 3600) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+    # check=False: each caller holds the exit status itself (`must`, or a row that says it).
+    return subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
 
 
 def row(k: str, v: str, ok: bool = True) -> None:
@@ -170,7 +177,8 @@ def once(label: str, command: Command, proof: Proof) -> ran.Ran:
     return r
 
 
-def series(label: str, command: Command, proof: Proof, n: int, edit=None, warm: int = 0, proof_of=None) -> None:
+def series(label: str, command: Command, proof: Proof, n: int, edit: Callable[[int], None] | None = None, warm: int = 0,
+           proof_of: Callable[[int], Proof] | None = None) -> None:
     row(label, ran.series(label, command, proof, n, warm, edit, proof_of).text)
 
 
@@ -211,7 +219,8 @@ def measure() -> None:
     main_rs = A + "/src/main.rs"
     hello = Proof(stdout="hello")
     # The program prints `hello: <the edit's number + 1>`: the proof that this edit's code ran.
-    says = lambda value: Proof(stdout=f"hello: {value + 1}")
+    def says(value: int) -> Proof:
+        return Proof(stdout=f"hello: {value + 1}")
     r = once("cold first run (fresh home)", blaze("run", "-q", cwd=A), says(1))
     if r.invalid:
         print(r.stderr[-3000:])
@@ -338,7 +347,24 @@ def named() -> None:
             row(label, f"pass {passed} fail {failed} of {it.runs} runs, each of which ran its {len(it.tests)} named tests", ok=failed == 0)
 
 
+def generated() -> None:
+    """Each generated file is what its generator writes from this tree. A generator that failed
+    and left its old output behind (a parse error read past, agents.json) shows here: each check
+    is held to its exit status and to the line it prints only when it ran to its end."""
+    env = dict(os.environ, LLVM_SYS_231_PREFIX=LLVM, CARGO_TARGET_DIR=TARGET)
+    scripts = ("cargo", "+nightly-2026-10-27", "run", "-q", "--release", "-p", "scripts", "--bin")
+    checks: tuple[tuple[str, tuple[str, ...], Proof], ...] = (
+        ("AGENTS.md and the skills (rules.ts)", ("bun", "tools/agents/rules.ts", "--check"), Proof(stdout="skills are what")),
+        ("docs/README.md and the docs (docs.rs)", (*scripts, "docs", "--", "check"), Proof(stdout="docs hold")),
+        ("library/DIGEST (library.py)", ("uv", "run", "--frozen", "python", "harness/library.py", "check", "{}"), Proof(stdout="is the digest of library/")),
+    )
+    for label, args, proof in checks:
+        r = ran.run(Command(args, str(WT), env, timeout=2400), proof)
+        row(f"generated: {label}", f"INVALID: {r.invalid}" if r.invalid else "fresh, its check ran to its end")
+
+
 merge()
+generated()
 if build():
     measure()
     if IN.tests:

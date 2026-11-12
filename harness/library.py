@@ -20,6 +20,9 @@
     library.py digest '{}'
         writes library/DIGEST, the digest blaze knows the library by (the store's key of the
         standard library; `toolchain/library.rs` computes the same): after any change to library/.
+    library.py check '{}'
+        fails when library/DIGEST is not the digest of library/ as it is: a change to library/
+        without `digest` after it (the gate runs this; agents.json H7).
     library.py archive '{"out": "<dir>"}'
         writes <dir>/library-<digest>.tar.xz, the asset of a release a blaze without a checkout
         downloads the library from once, checking its files against the digest.
@@ -415,9 +418,19 @@ def do_archive(args):
     print(out)
 
 
+def do_check(args):
+    kept = open(DIGEST).read().strip() if os.path.isfile(DIGEST) else None
+    now = digest_of(LIBRARY)
+    if kept != now:
+        sys.exit(f"library.py: library/DIGEST is stale: it says {kept}, and library/ is {now}: "
+                 "run `uv run --frozen python harness/library.py digest '{}'` and commit it")
+    # Said, so that a reader of the last line sees that the check ran and what it held.
+    print(f"library.py: library/DIGEST is the digest of library/ ({now})")
+
+
 def main():
     commands = {"import": (Nightly, do_import), "merge": (Nightly, do_merge), "snapshot": (Empty, do_snapshot),
-                "digest": (Empty, do_digest),
+                "digest": (Empty, do_digest), "check": (Empty, do_check),
                 "archive": (Archive, do_archive)}
     if len(sys.argv) not in (2, 3) or sys.argv[1] not in commands:
         sys.exit(f"usage: library.py {{{'|'.join(commands)}}} '<json>'\n\n{__doc__}")

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """ran.py: a check or a measurement counts only with proof that the thing ran.
 
 The class it closes is vacuous success (agents.json A39, A4): a timing row for a wrapper that
@@ -25,9 +24,22 @@ exits 1 when the row is INVALID. `selftest` needs no blaze: it runs each rule on
 and, beside it, the planted bug (the reading that looks only for a failure) that the rule
 refuses.
 """
-import dataclasses, fcntl, json, os, pty, re, struct, subprocess, sys, termios, time, types, typing
+import dataclasses
+import fcntl
+import json
+import os
+import pty
+import re
+import struct
+import subprocess
+import sys
+import termios
+import time
+import types
+import typing
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -90,8 +102,9 @@ def spawn(command: Command) -> tuple[int | None, str, str]:
     env = dict(command.env)
     if command.terminal is None:
         try:
+            # check=False: the exit status is the caller's to hold to the one it expects (`run`).
             done = subprocess.run(list(command.args), cwd=command.cwd, env=env, capture_output=True, text=True,
-                                  errors="replace", timeout=command.timeout, stdin=subprocess.DEVNULL)
+                                  errors="replace", timeout=command.timeout, stdin=subprocess.DEVNULL, check=False)
         except subprocess.TimeoutExpired as e:
             out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
             err = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
@@ -243,9 +256,9 @@ class Tested:
         return counts + ("  " + ", ".join(self.failures)[:400] if self.failures else "")
 
 
-RESULT = re.compile(r"^test result: \S+ (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out", re.M)
+RESULT = re.compile(r"^test result: \S+ (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out", re.MULTILINE)
 COLOR = re.compile(r"\x1b\[[0-9;]*m")
-TEST = re.compile(r"^test (\S+)(?: - .*)? \.\.\. (ok|FAILED|ignored)", re.M)
+TEST = re.compile(r"^test (\S+)(?: - .*)? \.\.\. (ok|FAILED|ignored)", re.MULTILINE)
 
 
 def tests(stdout: str, exit: int | None, expect: Tests) -> Tested:
@@ -280,47 +293,54 @@ def parsed[T](cls: type[T], value: object, where: str = "the input") -> T:
     """`value` (decoded JSON) as the frozen dataclass `cls`: unknown fields, missing fields and
     values of another type are refused, naming the field (rule scripts-take-typed-input)."""
     if not isinstance(value, dict):
-        raise ValueError(f"{where} is a JSON object for {cls.__name__}, not {json.dumps(value)[:80]}")
+        # A ValueError like every other refusal of the input: `main` reports them the same way.
+        raise ValueError(f"{where} is a JSON object for {cls.__name__}, not {json.dumps(value)[:80]}")  # noqa: TRY004
+    given = typing.cast(dict[str, object], value)
     hints = typing.get_type_hints(cls)
-    known = {f.name: f for f in dataclasses.fields(cls)}  # type: ignore[arg-type]
-    for key in value:
+    known = {f.name: f for f in dataclasses.fields(typing.cast(typing.Any, cls))}
+    for key in given:
         if key not in known:
             raise ValueError(f"{where}: `{key}` is not a field of {cls.__name__} ({', '.join(sorted(known))})")
     made: dict[str, object] = {}
     for name, f in known.items():
-        if name not in value:
+        if name not in given:
             if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING:
                 raise ValueError(f"{where}: {cls.__name__} needs `{name}`")
             continue
-        made[name] = fitted(hints[name], value[name], f"{where}.{name}")
+        made[name] = fitted(hints[name], given[name], f"{where}.{name}")
     return cls(**made)
 
 
 def fitted(hint: object, value: object, where: str) -> object:
+    """`value` as a field of type `hint`: a dataclass, a tuple of strings or of dataclasses, an
+    object of strings, an int, a str or a bool, or any of those or null."""
+    shown = json.dumps(value)[:80]
     origin = typing.get_origin(hint)
     if origin in (typing.Union, types.UnionType):
-        options = typing.get_args(hint)
+        options: tuple[object, ...] = typing.get_args(hint)
         if value is None and type(None) in options:
             return None
         for option in options:
             if option is not type(None):
                 return fitted(option, value, where)
-    if dataclasses.is_dataclass(hint) and isinstance(hint, type):
+    if isinstance(hint, type) and dataclasses.is_dataclass(hint):
         return parsed(hint, value, where)
     if origin is tuple:
-        of = typing.get_args(hint)[0]
-        if dataclasses.is_dataclass(of) and isinstance(of, type) and isinstance(value, list):
-            return tuple(parsed(of, it, f"{where}[{at}]") for at, it in enumerate(value))
-        if of is not str or not isinstance(value, list) or not all(isinstance(it, str) for it in value):
-            raise ValueError(f"{where} is a list of {getattr(of, '__name__', of)}, not {json.dumps(value)[:80]}")
-        return tuple(value)
+        of: object = typing.get_args(hint)[0]
+        items = typing.cast(list[object], value) if isinstance(value, list) else None
+        if items is not None and isinstance(of, type) and dataclasses.is_dataclass(of):
+            return tuple(parsed(of, it, f"{where}[{at}]") for at, it in enumerate(items))
+        if of is not str or items is None or not all(isinstance(it, str) for it in items):
+            raise ValueError(f"{where} is a list of {'str' if of is str else of}, not {shown}")
+        return tuple(items)
     if origin in (Mapping, dict):
-        if not isinstance(value, dict) or not all(isinstance(it, str) for it in value.values()):
-            raise ValueError(f"{where} is an object of strings, not {json.dumps(value)[:80]}")
-        return dict(value)
-    if hint in (int, str, bool):
+        pairs = typing.cast(dict[str, object], value) if isinstance(value, dict) else None
+        if pairs is None or not all(isinstance(it, str) for it in pairs.values()):
+            raise ValueError(f"{where} is an object of strings, not {shown}")
+        return dict(pairs)
+    if hint is int or hint is str or hint is bool:
         if type(value) is not hint:
-            raise ValueError(f"{where} is a {hint.__name__}, not {json.dumps(value)[:80]}")
+            raise ValueError(f"{where} is a {'int' if hint is int else 'str' if hint is str else 'bool'}, not {shown}")
         return value
     raise ValueError(f"{where}: ran.py reads no field of type {hint}")
 
@@ -339,9 +359,13 @@ def selftest() -> None:
     """Each rule on a shell command, and beside it the planted bug the rule refuses: the reading
     that looks only for a failure, which passes the same input."""
     env = {"PATH": "/usr/bin:/bin"}
-    sh = lambda script, **more: Command(("/bin/sh", "-c", script), "/", env, **more)
     checks: list[tuple[str, bool]] = []
-    check = lambda name, held: checks.append((name, bool(held)))
+
+    def sh(script: str, timeout: int = 900, exit: int = 0, terminal: Terminal | None = None) -> Command:
+        return Command(("/bin/sh", "-c", script), "/", env, timeout, exit, terminal)
+
+    def check(name: str, held: object) -> None:
+        checks.append((name, bool(held)))
 
     # A run that ran: a number.
     row = series("says hello", sh("echo hello"), Proof(stdout="hello"), n=3, warm=1)
@@ -405,13 +429,16 @@ def selftest() -> None:
     check("a coloured result line is read", tests(colored, 0, Tests()).passed == 1)
 
     # The typed input.
-    good = {"label": "x", "command": {"args": ["/bin/echo", "hi"], "cwd": "/", "env": {"PATH": "/bin"}}, "proof": {"stdout": "hi"}, "n": 2}
+    good: dict[str, object] = {"label": "x", "command": {"args": ["/bin/echo", "hi"], "cwd": "/", "env": {"PATH": "/bin"}}, "proof": {"stdout": "hi"}, "n": 2}
     made = parsed(Input, good)
     check("the input is read into frozen dataclasses", made.command.args == ("/bin/echo", "hi") and made.proof.stdout == "hi" and made.n == 2)
-    for bad, said in (({**good, "retries": 3}, "`retries` is not a field of Input"),
-                      ({**good, "n": "2"}, "the input.n is a int"),
-                      ({"label": "x", "proof": {}}, "Input needs `command`"),
-                      ({**good, "proof": {"stdout": "hi", "grep": "ok"}}, "`grep` is not a field of Proof")):
+    refused: tuple[tuple[dict[str, object], str], ...] = (
+        ({**good, "retries": 3}, "`retries` is not a field of Input"),
+        ({**good, "n": "2"}, "the input.n is a int"),
+        ({"label": "x", "proof": {}}, "Input needs `command`"),
+        ({**good, "proof": {"stdout": "hi", "grep": "ok"}}, "`grep` is not a field of Proof"),
+    )
+    for bad, said in refused:
         try:
             parsed(Input, bad)
             check(f"refused: {said}", False)
@@ -435,7 +462,7 @@ def main(argv: list[str]) -> None:
         sys.exit("usage: ran.py selftest | ran.py '<one JSON object>' (see the top of the file)")
     if argv[0] == "selftest":
         return selftest()
-    text = sys.stdin.read() if argv[0] == "-" else open(argv[0]).read() if os.path.isfile(argv[0]) else argv[0]
+    text = sys.stdin.read() if argv[0] == "-" else Path(argv[0]).read_text() if os.path.isfile(argv[0]) else argv[0]
     try:
         asked = parsed(Input, json.loads(text))
     except (json.JSONDecodeError, ValueError) as e:

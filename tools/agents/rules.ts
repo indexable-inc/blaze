@@ -679,6 +679,8 @@ switch (flag) {
 			const tail = skillTail(id, await readIfExists(skillPath(id)));
 			await Bun.write(skillPath(id), skillHead(id) + tail);
 		}
+		// The last line says what was done: a reader of only that line sees this, or an error.
+		console.log(`tools/agents/rules.ts: wrote AGENTS.md and ${skillIds.length} skills from ${rules.length} rules`);
 		break;
 	case "--check": {
 		const stale: string[] = [];
@@ -691,6 +693,7 @@ switch (flag) {
 			console.error(`stale: ${stale.join(", ")}: run \`bun tools/agents/rules.ts --write\` and commit them`);
 			process.exit(1);
 		}
+		console.log(`tools/agents/rules.ts: AGENTS.md and ${skillIds.length} skills are what ${rules.length} rules generate`);
 		break;
 	}
 	default:
