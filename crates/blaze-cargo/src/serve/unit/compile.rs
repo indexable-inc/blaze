@@ -525,7 +525,8 @@ fn places(job: &Job, edition: ::span::Edition, said: &Said) -> Option<drawn::Pla
     placed_from(|name| quoted_text(job, name), edition, &shown).map(|it| it.files)
 }
 
-/// [`placed`] of every one of `diags`, each file's text as `read` gives it by the name the
+/// `diags` with the place of each end of each of their spans ([`Placed`]; none as
+/// [`places`] says), each file's text as `read` gives it by the name the
 /// diagnostics give the file.
 pub(super) fn placed_from(
     read: impl Fn(&str) -> Option<String>,
