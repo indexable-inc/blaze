@@ -1930,6 +1930,113 @@ struct Roots<S: Steps> {
     /// is answered, none again once one ends well. Its next build says it first and takes it
     /// as a row `blaze why` says ([`Job::ended`]).
     unfinished: Vec<Option<Unfinished>>,
+    /// Its front-end carry ([`super::front_carry`]): one kernel session kept across its
+    /// builds, carried to each build's pin ([`carry_front`]).
+    carries: Vec<CarryOf>,
+}
+
+/// A checkout's front-end carry and the plan whose crates it was last given.
+#[derive(Default)]
+struct CarryOf {
+    state: CarryState,
+    /// The plan `crates` are of, held so its address names it while it is compared.
+    units: Option<Arc<blaze_units::query::Units>>,
+    crates: Vec<super::front_carry::CrateRoot>,
+}
+
+#[derive(Default)]
+enum CarryState {
+    /// No session yet: the next build with crates seeds one.
+    #[default]
+    None,
+    Held(super::front_carry::Carry),
+    /// A carry failed: said on every build after it, never tried again (rule 3) until the
+    /// daemon restarts.
+    Failed(String),
+}
+
+/// The front end's carry of one build of a checkout ([`super::front_carry`]): its session
+/// carried from the last build's pin to `input.root`'s, in the span "front end carry" with
+/// what the carry did (seeded, repaired, changed, cut, gone; the paths the pins differ in,
+/// the crates, the files held as roots) and its time in `ns`. The crates are asked of the
+/// front once a plan. A failure is an error event naming it, and every later build's span
+/// says it.
+fn carry_front<S: Steps>(
+    of: &mut CarryOf,
+    vfs: &mut Vfs,
+    store: &mut Store,
+    input: &JobInput,
+    front: &S::Front,
+) {
+    let span = tracing::info_span!(
+        target: "blaze",
+        "front end carry",
+        seeded = tracing::field::Empty,
+        repaired = tracing::field::Empty,
+        changed = tracing::field::Empty,
+        cut = tracing::field::Empty,
+        gone = tracing::field::Empty,
+        ns = tracing::field::Empty,
+        first = tracing::field::Empty,
+        dropped = tracing::field::Empty,
+        paths = tracing::field::Empty,
+        crates = tracing::field::Empty,
+        files = tracing::field::Empty,
+        ran = tracing::field::Empty,
+        error = tracing::field::Empty,
+    );
+    let _entered = span.enter();
+    let start = blaze_profile::clock::mono_ns();
+    if !of.units.as_ref().is_some_and(|it| Arc::ptr_eq(it, &input.units)) {
+        match <S::Front as Front<S>>::view_crates(front) {
+            Ok(crates) => of.crates = crates,
+            Err(why) => of.state = CarryState::Failed(why),
+        }
+        of.units = Some(Arc::clone(&input.units));
+    }
+    let done = match std::mem::take(&mut of.state) {
+        CarryState::Failed(why) => Err(why),
+        CarryState::None if of.crates.is_empty() => Ok(super::front_carry::Built::default()),
+        CarryState::None => match super::front_carry::Carry::seed(vfs, store, input.root, &of.crates) {
+            Ok((carry, built)) => {
+                of.state = CarryState::Held(carry);
+                Ok(built)
+            }
+            Err(error) => Err(error.to_string()),
+        },
+        CarryState::Held(mut carry) => match carry.build(vfs, store, input.root, &of.crates) {
+            Ok(built) => {
+                of.state = CarryState::Held(carry);
+                Ok(built)
+            }
+            Err(error) => {
+                carry.close(vfs);
+                Err(error.to_string())
+            }
+        },
+    };
+    span.record("ns", blaze_profile::clock::mono_ns().saturating_sub(start));
+    match done {
+        Ok(built) => {
+            let carried = built.carried;
+            span.record("seeded", carried.seeded as u64);
+            span.record("repaired", carried.repaired as u64);
+            span.record("changed", carried.changed as u64);
+            span.record("cut", carried.cut as u64);
+            span.record("gone", carried.gone as u64);
+            span.record("first", built.first);
+            span.record("dropped", tracing::field::debug(carried.dropped));
+            span.record("paths", built.paths as u64);
+            span.record("crates", built.crates as u64);
+            span.record("files", built.files as u64);
+            span.record("ran", built.ran as u64);
+        }
+        Err(why) => {
+            tracing::error!(target: "blaze", error = %why, "the front end's carry failed: no build of this checkout carries again until the daemon restarts");
+            span.record("error", why.as_str());
+            of.state = CarryState::Failed(why);
+        }
+    }
 }
 
 impl<S: Steps> Roots<S> {
@@ -1942,6 +2049,7 @@ impl<S: Steps> Roots<S> {
             answers: Vec::new(), // alloc: none until the first checkout
             lost: Vec::new(),    // alloc: none until the first checkout
             unfinished: Vec::new(), // alloc: none until the first checkout
+            carries: Vec::new(),    // alloc: none until the first checkout
         }
     }
 
@@ -1957,6 +2065,7 @@ impl<S: Steps> Roots<S> {
         self.answers.push(Answers::new());
         self.lost.push(None);
         self.unfinished.push(None);
+        self.carries.push(CarryOf::default());
         id
     }
 }
@@ -6604,6 +6713,10 @@ impl<S: Steps> Jobs<S> {
             return;
         };
         let cancelled = job.cancelled.clone(); // clone: a refcount, once per build
+        // The front end's session carried to this build's pin, once a build of a checkout.
+        if let Some(at) = root {
+            carry_front::<S>(&mut self.roots.carries[at as usize], w.vfs, w.store, &input, &front);
+        }
         // A build of the units a view's front end applies ([`Jobs::next`]): the job's plane
         // request stays open after it.
         let applying = job.applying.is_some();
@@ -6774,7 +6887,9 @@ impl<S: Steps> Jobs<S> {
                 // A program's codegen and link are each admitted by what that program's held,
                 // one never measured alone.
                 match program.zip(super::unit::program_key(unit, all_roots.contains(&at), phase)) {
-                    Some((kind, key)) => _ = w.plane.push_program(&mut nodes, spec, kind, arg, key),
+                    Some((kind, key)) => {
+                        _ = w.plane.push_program(&mut nodes, spec, kind, arg, key, source)
+                    }
                     None => {
                         let learn = super::unit::cost_key(unit, Some(phase));
                         _ = w.plane.push_sized(

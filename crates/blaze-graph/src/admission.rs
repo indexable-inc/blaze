@@ -631,7 +631,8 @@ impl Prediction {
 /// What the plane asks for a node's [`Prediction`] and tells what the node then did. A
 /// prediction orders and admits work only: it never changes what is built.
 pub trait Predict: Send {
-    /// What a task of `kind` with `key` is predicted to cost.
+    /// What a task of `kind` with `key` is predicted to cost: its key's own record, or, with
+    /// none, its kind's prediction (what one ask with no key says), so one ask a node is enough.
     fn predict(&self, kind: TaskKind, key: Option<crate::Key>) -> Prediction;
     /// A task of `kind` with `key` ran for `ran_ns` of its own (not its waits) and held `peak`
     /// bytes at most.

@@ -423,6 +423,7 @@ blaze-client-c = { path = "crates/blaze-client-c" }
 blaze-napi = { path = "crates/blaze-napi" }
 blaze-cas = { path = "crates/blaze-cas" }
 blaze-kernel = { path = "crates/blaze-kernel" }
+blaze-front-items = { path = "crates/blaze-front-items" }
 blaze-gc = { path = "crates/blaze-gc" }
 blaze-check = { path = "crates/blaze-check" }
 blaze-spin = { path = "crates/blaze-spin" }

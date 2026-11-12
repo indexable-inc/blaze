@@ -191,7 +191,7 @@ pub(super) struct TestFacts {
 }
 
 impl TestFacts {
-    fn new(db: &Db, defs: &Defs, refuse: Option<&'static str>) -> TestFacts {
+    pub(super) fn new(db: &Db, defs: &Defs, refuse: Option<&'static str>) -> TestFacts {
         TestFacts {
             defs: defs.clone(),
             main: crate_named(db, "main"),
@@ -202,7 +202,7 @@ impl TestFacts {
     }
 }
 
-fn is_impl_table(name: &str) -> bool {
+pub(super) fn is_impl_table(name: &str) -> bool {
     name.contains("Impls")
         || name.contains("impls")
         || name.contains("value_item")
@@ -210,10 +210,10 @@ fn is_impl_table(name: &str) -> bool {
 }
 
 /// The key of a body's own item in its records: no hash, so no item's portable form has it.
-const OWN: ContentId = ContentId(*b"body store test: the body itself");
+pub(super) const OWN: ContentId = ContentId(*b"body store test: the body itself");
 
 /// `body`'s own item as a record names it.
-fn own<'db>(body: DefWithBodyId) -> SolverDefId<'db> {
+pub(super) fn own<'db>(body: DefWithBodyId) -> SolverDefId<'db> {
     match body {
         DefWithBodyId::FunctionId(it) => SolverDefId::FunctionId(it),
         DefWithBodyId::ConstId(it) => SolverDefId::ConstId(it),
@@ -222,7 +222,7 @@ fn own<'db>(body: DefWithBodyId) -> SolverDefId<'db> {
     }
 }
 
-fn portable(def: SolverDefId<'_>) -> (u8, PortableIds) {
+pub(super) fn portable(def: SolverDefId<'_>) -> (u8, PortableIds) {
     let mut ids = PortableIds::new();
     let tag = match def {
         SolverDefId::FunctionId(it) => (ids.index(it), 0).1,

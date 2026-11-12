@@ -70,6 +70,14 @@ pub trait BodyFacts: Send + Sync + 'static {
     /// crates it loads); `None` when it cannot be hashed now.
     fn value(&self, db: &Db, def: DefWithBodyId, fact: FactRef) -> Option<ContentId>;
 
+    /// The earlier step of the body itself that `fact` stands for, where it is one (a body's
+    /// MIR reads its own inference): a kernel entry reads that step's entry for it
+    /// ([`super::entries`]), not a fact of the world. `None` for every other fact.
+    fn own_step(&self, fact: FactRef) -> Option<Step> {
+        let _ = fact;
+        None
+    }
+
     /// The key of a definition `body`'s record names: `body` itself and what it owns (closures
     /// with their kind, coroutines, opaque types) as "self", relative to `body`; anything else,
     /// an item one of its paths names among them, by its plain item key, the same in every

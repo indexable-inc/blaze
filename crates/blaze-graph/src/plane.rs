@@ -206,8 +206,13 @@ pub enum PlaneInput {
     /// The task the plane asked to run as `id` gave way with no result, as a
     /// [`PlaneOutput::Yield`] asked: its thread and memory are free again and its nodes ready
     /// again, each in its own request (skipped, of a request cancelled, or failed and not
-    /// keeping going).
-    Yielded { at_ns: u64, id: NodeId },
+    /// keeping going). `needs` is what the task was known to need as it gave way (its
+    /// account's peak, or what it asked of the ceiling's gate when the gate gave it way; 0 for
+    /// nothing learned): its forecast for its next start is raised to it, at most the
+    /// configured budget. A task that gave way at the gate and came back asking what it asked
+    /// before re-grew to the same gate and gave way again, with the task it gave way to waiting
+    /// on it for good (`crate::footprint`'s simulation, 2026-11-12: two tasks never ended).
+    Yielded { at_ns: u64, id: NodeId, needs: u64 },
     /// Nodes of the request, besides those it had. Their deps are nodes of the same request.
     Add { at_ns: u64, request: RequestId, nodes: Vec<Spec> },
     /// [`PlaneInput::Add`] of a run of ids as columns, one allocation a column rather than
@@ -1622,10 +1627,10 @@ impl<M: Memo> Plane<M> {
                         .retain(|&task| rows[tasks[row_of(task)].runner as usize].request != r);
                 }
             }
-            PlaneInput::Yielded { id, .. } => {
+            PlaneInput::Yielded { id, needs, .. } => {
                 let task = self.running_task(id)?;
                 self.charge.ended(task, None);
-                self.yielded(at, task, out, touched);
+                self.yielded(at, task, needs, out, touched);
             }
             PlaneInput::Add { request, nodes, .. } => {
                 let r = self.open_request(request)?;
@@ -2511,6 +2516,7 @@ impl<M: Memo> Plane<M> {
         &mut self,
         at: u64,
         task: TaskHandle,
+        needs: u64,
         out: &mut Vec<PlaneOutput>,
         touched: &mut Vec<u32>,
     ) {
@@ -2522,6 +2528,11 @@ impl<M: Memo> Plane<M> {
             self.yielding[p] -= 1;
             self.yielding_memory -= t.memory;
         }
+        // What it was known to need as it gave way is its forecast from now on
+        // ([`PlaneInput::Yielded`]), never more than the configured budget ([`too_big`]
+        // judges what it was added with).
+        let most = self.config.budget.as_ref().map_or(u64::MAX, |it| it.bytes);
+        self.tasks[row_of(task)].memory = t.memory.max(needs.min(most));
         self.idle_running.retain(|&it| it != task);
         self.tasks[row_of(task)].running = false;
         self.tasks[row_of(task)].yielding = false;

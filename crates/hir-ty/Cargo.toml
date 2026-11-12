@@ -46,6 +46,9 @@ tracing-tree.workspace = true
 # local deps
 blaze-dbsp.workspace = true
 blaze-format.workspace = true
+blaze-cas.workspace = true
+blaze-front-items.workspace = true
+blaze-kernel.workspace = true
 blaze-hashcons.workspace = true
 blaze-ids.workspace = true
 blaze-phf.workspace = true
@@ -76,6 +79,7 @@ blaze-check.workspace = true
 # source edit (`blaze_codegen_code::fixture`).
 blaze-codegen-code.workspace = true
 blaze-alloc-count.workspace = true
+blaze-store-check.workspace = true
 crossbeam-channel.workspace = true
 expect-test.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }

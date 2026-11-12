@@ -386,9 +386,9 @@ impl<M: Memo> Plane<M> {
                     self.idle_running.retain(|&task| nodes[tasks[task].runner].request != r);
                 }
             }
-            PlaneInput::Yielded { id, .. } => {
+            PlaneInput::Yielded { id, needs, .. } => {
                 let task = self.running_task(id)?;
-                self.yielded(at, task, &mut out, &mut touched);
+                self.yielded(at, task, needs, &mut out, &mut touched);
             }
         }
         self.after(at, out, touched)
@@ -416,13 +416,17 @@ impl<M: Memo> Plane<M> {
         &mut self,
         at: u64,
         task: usize,
+        needs: u64,
         out: &mut Vec<PlaneOutput>,
         touched: &mut Vec<usize>,
     ) {
+        let most = self.config.budget.as_ref().map_or(u64::MAX, |it| it.bytes);
         let t = &mut self.tasks[task];
         let (p, memory, yielding, runner) = (pool_at(t.pool), t.memory, t.yielding, t.runner);
         t.running = false;
         t.yielding = false;
+        // What it needed as it gave way is its forecast from now on, at most the budget.
+        t.memory = memory.max(needs.min(most));
         self.running[p] -= 1;
         self.granted -= memory;
         if yielding {

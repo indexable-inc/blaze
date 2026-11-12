@@ -35,7 +35,9 @@
 //! At the end every other task has been built within [`MOST_TICKS`]: no deadlock
 //! (bounded-progress).
 //!
-//! Three plants ([`Plant`]) prove the oracle catches what it claims to, each in a control.
+//! Four plants ([`Plant`]) prove the oracle catches what it claims to, each in a control.
+//! A task the gate gives way tells the plane what it needed (`PlaneInput::Yielded`'s `needs`),
+//! which it is forecast when it starts again.
 //! Replay: a control or [`replay_one_seed`] names a seed of [`plan_of`]; the Hegel test prints
 //! its plan.
 
@@ -84,6 +86,11 @@ enum Plant {
     /// (`Plane::alone_needs_purge`). With nothing running and such a reading owed by the
     /// driver, a ready task waits: the liveness oracle's control.
     AloneNeedsPurge,
+    /// A driver that tells the plane nothing of what a task given way at the gate needed
+    /// (`needs` 0): it comes back on the grant it outgrew, re-grows to the same gate and gives
+    /// way again while the task it gave way to waits on it, so neither ends (bounded progress,
+    /// [`MOST_TICKS`]).
+    ForgetsNeeds,
 }
 
 // --- The plan ------------------------------------------------------------------------------
@@ -218,6 +225,9 @@ struct Job {
     step: u64,
     /// Waits at the gate.
     waiting: bool,
+    /// What it asked to hold as it last waited at the gate: what it needs, told the plane if
+    /// it gives way ([`PlaneInput::Yielded`]'s `needs`).
+    asks: u64,
     /// The driver purged for its growth since what the allocator keeps last grew.
     tried: bool,
     /// When it started, against the others: the newest gives way.
@@ -345,6 +355,7 @@ impl<'p> Sim<'p> {
                         holds: 0,
                         step: 0,
                         waiting: false,
+                        asks: 0,
                         tried: false,
                         stamp: self.stamps,
                         past,
@@ -577,6 +588,7 @@ impl<'p> Sim<'p> {
             }
             Step::Wait => {
                 self.jobs[j].waiting = true;
+                self.jobs[j].asks = level;
                 Ok(())
             }
             Step::GiveWay(id) => {
@@ -586,9 +598,17 @@ impl<'p> Sim<'p> {
                 if !(at == j || self.jobs[at].waiting) {
                     return Err(oracle(format_args!("the gate gave way to {id}, which waits not")));
                 }
+                // What it needs: what it asks now, or asked as it waited. The plane forecasts
+                // its next start by it; told nothing, it came back on the grant it outgrew,
+                // re-grew to this gate and gave way again, for good.
+                let needs = match self.plant {
+                    Plant::ForgetsNeeds => 0,
+                    _ if at == j => level,
+                    _ => self.jobs[at].asks.max(self.jobs[at].holds),
+                };
                 let gone = self.jobs.swap_remove(at);
                 self.free(gone.holds);
-                self.step(PlaneInput::Yielded { at_ns: self.clock, id })
+                self.step(PlaneInput::Yielded { at_ns: self.clock, id, needs })
             }
             Step::Fail(too_big) => {
                 if too_big.id != job.id || !self.alone_passes(level) {
@@ -687,6 +707,13 @@ fn the_oracle_catches_a_gate_that_never_purges() {
 #[test]
 fn the_oracle_catches_a_task_alone_that_waits_for_a_purged_reading() {
     control(Plant::AloneNeedsPurge);
+}
+
+/// The progress oracle's control: a task given way that comes back asking what it outgrew
+/// gives way again for good.
+#[test]
+fn the_oracle_catches_a_give_way_that_forgets_what_the_task_needed() {
+    control(Plant::ForgetsNeeds);
 }
 
 /// One seeded plan, [`REPLAY`]'s: set it to a seed a failure names to run that case alone.

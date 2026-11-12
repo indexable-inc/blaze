@@ -1240,6 +1240,11 @@ impl Front<Fake> for FakeFront {
         }))
     }
 
+    /// The fake lowers no crates: the front-end carry has none of its builds.
+    fn view_crates(&self) -> Result<Vec<crate::serve::front_carry::CrateRoot>, String> {
+        Ok(Vec::new())
+    }
+
     fn refused(&self, _: usize, what: String) -> Diagnostic {
         Diagnostic {
             level: Level::Error,

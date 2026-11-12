@@ -1285,6 +1285,15 @@ struct Model {
     running: Vec<u32>,
     running_keys: HashSet<Key, Global>, // alloc: a test's model
     granted: u64,
+    /// The pressure cap told the plane, while there is one: the budget is held to it.
+    cap: Option<u64>,
+    /// What each running task was granted, by the node it runs as: its ask, or the budget now
+    /// where it asked more (started alone, `Plane::start`), at least a byte.
+    grants: HashMap<u32, u64, Global>, // alloc: a test's model
+    /// What a task that gave way asks when it starts again, by its key (or its node, unkeyed):
+    /// the grant it gave back, which the plane keeps as its ask.
+    asks_by_key: HashMap<Key, u64, Global>, // alloc: a test's model
+    asks_by_node: HashMap<u32, u64, Global>, // alloc: a test's model
     /// What the database has: keys whose task ended well, some that failed, less those
     /// dropped since.
     db: ModelDb,
@@ -1401,6 +1410,10 @@ impl Model {
                         if state.settled() && holding == Some(NodeId(*id)) {
                             held_settled = true;
                         }
+                        // An unkeyed task is its one node's: settled, its ask is gone with it.
+                        if state.settled() && self.specs[id].key.is_none() {
+                            self.asks_by_node.remove(id);
+                        }
                         self.states.insert(*id, state.clone());
                     }
                     Event::Critical { path } => {
@@ -1453,7 +1466,24 @@ impl Model {
                             "seed {seed}: #{id} runs a key the database has"
                         );
                     }
-                    self.granted += spec.memory;
+                    let asked = spec
+                        .key
+                        .and_then(|it| self.asks_by_key.get(&it).copied())
+                        .or_else(|| self.asks_by_node.get(&id.0).copied())
+                        .unwrap_or(spec.memory);
+                    let whole =
+                        self.budget.map(|it| crate::pressure::budget_under(it, self.cap));
+                    let grant = match whole {
+                        Some(whole) if asked > whole => whole.max(1),
+                        _ => asked,
+                    };
+                    assert_eq!(
+                        plane.admitted(*id).map(|it| it.granted),
+                        Some(grant),
+                        "seed {seed}: #{id} asks {asked} of a budget now of {whole:?}"
+                    );
+                    self.grants.insert(id.0, grant);
+                    self.granted += grant;
                     if let Some(budget) = self.budget {
                         assert!(self.granted <= budget, "seed {seed}: {} granted", self.granted);
                     }
@@ -1544,7 +1574,11 @@ impl Model {
         self.running.retain(|&it| it != id);
         self.yielding.remove(&id);
         let spec = &self.specs[&id];
-        self.granted -= spec.memory;
+        self.granted -= self.grants.remove(&id).expect("a running task's grant");
+        self.asks_by_node.remove(&id);
+        if let Some(key) = spec.key {
+            self.asks_by_key.remove(&key);
+        }
         let key = spec.key?;
         self.running_keys.remove(&key);
         (keep_failure || !matches!(outcome, Outcome::Failed { .. } | Outcome::FailedOpen { .. }))
@@ -1556,7 +1590,12 @@ impl Model {
         self.running.retain(|&it| it != id);
         self.yielding.remove(&id);
         let spec = &self.specs[&id];
-        self.granted -= spec.memory;
+        let grant = self.grants.remove(&id).expect("a running task's grant");
+        self.granted -= grant;
+        match spec.key {
+            Some(key) => _ = self.asks_by_key.insert(key, grant),
+            None => _ = self.asks_by_node.insert(id, grant),
+        }
         if let Some(key) = spec.key {
             self.running_keys.remove(&key);
         }
@@ -1757,6 +1796,7 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
             if random.one_in(5) {
                 capped = !capped;
                 let bytes = capped.then(|| random.below(budget + budget / 4));
+                model.cap = bytes;
                 driver.act(Act::Step(PlaneInput::Cap { at_ns: at, bytes }), next_id)
             } else {
                 let bytes = if random.one_in(10) {
@@ -1831,6 +1871,7 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
             } else if capped && model.running.is_empty() {
                 // The pressure passes: what waited for it starts.
                 capped = false;
+                model.cap = None;
                 driver.act(Act::Step(PlaneInput::Cap { at_ns: at, bytes: None }), next_id)
             } else {
                 assert!(
@@ -1843,7 +1884,7 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
             let id = model.running[random.below(model.running.len() as u64) as usize];
             if model.yielding.contains(&id) && !random.one_in(4) {
                 model.yielded(id);
-                driver.act(Act::Step(PlaneInput::Yielded { at_ns: at, id: NodeId(id) }), next_id)
+                driver.act(Act::Step(PlaneInput::Yielded { at_ns: at, id: NodeId(id), needs: 0 }), next_id)
             } else {
                 let outcome = match random.below(10) {
                     0 => Outcome::Failed { why: "boom".to_owned() },
@@ -2271,9 +2312,9 @@ fn a_yield_frees_the_thread_for_the_foreground() {
     assert_eq!(yields(&out), [10]);
     let held = plane.step(PlaneInput::Held { at_ns: 0, bytes: 0 }).unwrap();
     assert!(yields(&held).is_empty(), "asked once");
-    let not_running = PlaneInput::Yielded { at_ns: 1, id: NodeId(11) };
+    let not_running = PlaneInput::Yielded { at_ns: 1, id: NodeId(11), needs: 0 };
     assert_eq!(plane.step(not_running), Err(Error::NotRunning(NodeId(11))));
-    let out = plane.step(PlaneInput::Yielded { at_ns: 1, id: NodeId(10) }).unwrap();
+    let out = plane.step(PlaneInput::Yielded { at_ns: 1, id: NodeId(10), needs: 0 }).unwrap();
     assert_eq!(moves(&out)[0], (10, NodeState::Ready));
     assert_eq!(runs(&out), [1]);
     assert_eq!(plane.stats(RequestId(2)).unwrap().ran, 0);
@@ -2360,7 +2401,7 @@ fn a_busy_idle_request_does_not_delay_the_foreground() {
             theirs.extend(out);
             let Some(id) = asked.pop() else { break };
             gave_way += 1;
-            out = beside.step(PlaneInput::Yielded { at_ns, id: NodeId(id) }).unwrap();
+            out = beside.step(PlaneInput::Yielded { at_ns, id: NodeId(id), needs: 0 }).unwrap();
         }
     }
     assert_eq!(finished(&mine), [(0, true)]);

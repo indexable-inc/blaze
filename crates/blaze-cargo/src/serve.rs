@@ -24,6 +24,8 @@ mod daemon;
 pub mod dev_toolchain;
 mod fetch;
 mod fetch_url;
+#[blaze::sans_io]
+pub(crate) mod front_carry;
 pub(crate) mod flightrec;
 mod collect;
 mod gc;

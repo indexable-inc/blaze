@@ -1125,6 +1125,12 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
     /// The error that unit `unit` can't be made, saying `what`: a diagnostic of the unit,
     /// named and rendered as its others are, for a compile that panicked.
     fn refused(&self, unit: usize, what: String) -> Diagnostic;
+    /// On the loop, once a plan: the crates of this front end whose roots are in the job's
+    /// view, as the daemon's front-end carry asks for them ([`super::front_carry`]): each
+    /// unit's crate with its root's path in the view, its edition and the cfg it was lowered
+    /// with. A crate outside the view (a dependency's, the standard library's) is not one.
+    /// Empty for a front that lowered no crates.
+    fn view_crates(&self) -> Result<Vec<super::front_carry::CrateRoot>, String>;
     /// On a worker, as a phase task of unit `unit` starts: the unit's crate (its target's
     /// name) and the unit as its phase spans name it (`serde v1.0.219 (lib)`), for its `task`
     /// span. `None` for a front that names no units.

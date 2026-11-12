@@ -124,6 +124,8 @@ blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-record.workspace = true
 blaze-kernel.workspace = true
+# the front end as kernel steps, carried by the daemon across builds (serve/front_carry.rs)
+blaze-front-items.workspace = true
 blaze-usercode.workspace = true
 blaze-codegen.workspace = true
 blaze-store-check.workspace = true

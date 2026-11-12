@@ -281,6 +281,20 @@ impl Crates {
     pub fn is_proc_macro(&self, unit: usize) -> bool {
         self.units.get(unit).is_some_and(|it| it.proc_macro)
     }
+
+    /// The cfg unit `unit`'s crate was lowered with, before any build script's run applied its
+    /// `cargo:rustc-cfg`s: what the daemon's front-end carry driver evaluates a `mod`'s gates
+    /// against (`blaze_cargo::serve::front_carry`). None for a `RunCustomBuild` unit or an
+    /// index past the units.
+    pub fn cfg(&self, unit: usize) -> Option<&CfgOptions> {
+        self.units.get(unit).filter(|it| it.krate.is_some()).map(|it| &it.cfg)
+    }
+}
+
+/// The Rust edition unit `unit`'s crate is parsed in ([`crates::edition`]: a blaze edition's
+/// Rust edition), for a caller outside the lowering: the daemon's front-end carry driver.
+pub fn unit_edition(unit: &Unit) -> Result<span::Edition, LowerError> {
+    crates::edition(unit, &unit.target.name)
 }
 
 /// One unit as lowered.

@@ -1,0 +1,14 @@
+{
+ "id": "carry-driver-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane carry-driver",
+ "where": "crates/blaze-kernel/src/session.rs (`Session::asked`), the carry loop in blaze-kernel's nest (`carry`), crates/blaze-cargo/src/serve/front_carry.rs",
+ "what": "A carry repairs a reached row in place only when another step read it (`Session::asked` gives its key); a root that no step reads (front-items' `lines(file)`, `modules(crate)` in the daemon) is dropped and counted `gone`, even when its value would be equal. That is said only in `asked`'s one-line doc. The lane predicted every reached root repaired, five of six pinned counts were wrong, and the driver silently lost an edited file's `lines` until it asked them again.",
+ "cost": "one compile-and-test round trip with the main agent",
+ "cause": "the kernel compares a repaired row's value under the key its readers name it by; a root has no such key, so the carry has nothing to compare it under",
+ "class": "a semantic of a core API stated only where it is implemented, not on the entry point callers read (`Kernel::carry`, `Carried::gone`)",
+ "prevention": "`Kernel::carry`'s and `Carried::gone`'s docs say a reached root with no reader is dropped and must be asked again",
+ "workaround": "the driver asks each edited file's `items` and `lines` again after the carry (`Built::ran` counts the reruns)",
+ "fix": "none yet: a doc line on `Kernel::carry`, or the kernel repairing readerless roots under their own key",
+ "state": "open"
+}

@@ -631,6 +631,24 @@ impl Session {
         self.live == 0
     }
 
+    /// How many rows are posted under at least one read of `kind`, each once: what a carry
+    /// whose change set says any read of `kind` may differ ([`Changed::everything`]) seeds.
+    /// A driver reports its always-dirty kinds by this count, each by name. The kind's
+    /// postings are read in from `store` where they are not all in memory.
+    pub fn readers_of<G: Get + ?Sized>(&mut self, store: &G, kind: ReadKind) -> Result<usize, KernelError> {
+        self.load_kind(store, kind.0)?;
+        let Some(names) = self.kinds.get(&kind.0) else { return Ok(0) };
+        // alloc: one count's rows, freed when it returns
+        let mut rows: Vec<u32> = names
+            .names
+            .iter()
+            .flat_map(|&at| self.posts.get_index(at as usize).expect("a name by its place").1.readers.iter().copied())
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        Ok(rows.len())
+    }
+
     /// Drops what it verified, postings too. No answer changes: each value is looked up again
     /// when asked for.
     pub fn clear(&mut self) {

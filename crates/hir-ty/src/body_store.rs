@@ -17,6 +17,10 @@
 //! - Under [`Mode::Verify`] a hit runs the step as well, and a result that differs from the
 //!   stored one is the build's error, naming the body and the step.
 //!
+//! - Each offer also keeps the run's trace (its facts and answer) per body, step and schema,
+//!   which the kernel entries of the three steps read ([`entries`]): a carry then reaches
+//!   exactly the bodies whose syntax record, identity or a fact changed.
+//!
 //! With no store installed for a database, every entry point is one load and a branch. A
 //! record that does not open under its key or a store that cannot be read is an error naming
 //! the body, reported by the next flush; the step is run then, which gives the same result. A
@@ -24,6 +28,7 @@
 //! refuses) is named in what the flush did ([`Flushed::failure`]) and keeps no other step out.
 //! A miss is a miss.
 
+pub mod entries;
 mod facts;
 mod infer;
 mod konst;
@@ -160,6 +165,11 @@ struct Store {
     /// open under its key, a stored result that differs from running the step under
     /// [`Mode::Verify`]): [`Installed::flush`] stops with it.
     error: Lock<Option<String>>,
+    /// The trace of the last run of each body's step in this database, by the body, the step
+    /// and the schema it was offered under: what a kernel entry of the step reads
+    /// ([`entries`]). A run of the step replaces it, so it is always of the run that made the
+    /// value the database holds for the step now.
+    traces: Lock<blaze_hash::HashMap<(DefWithBodyId, Step, SchemaHash), Arc<entries::Ran>, std::alloc::Global>>,
 }
 
 /// The buffers an offer fills, kept for the thread's next one. Taken out for the offer and put
@@ -319,9 +329,15 @@ impl Store {
         scratch.facts.clear();
         scratch.values.clear();
         scratch.answer.clear();
-        if let Err(refusal) = self.offered(db, def, step, schema, reads, write, &mut scratch) {
-            self.pending.refused(step, refusal);
-        }
+        let offered = self.offered(db, def, step, schema, reads, write, &mut scratch);
+        let ran = match offered {
+            Ok(()) => Ok((&scratch.facts[..], &scratch.answer[..])),
+            Err(refusal) => {
+                self.pending.refused(step, refusal);
+                Err(refusal)
+            }
+        };
+        self.trace(def, step, schema, ran);
         SCRATCH.set(scratch);
     }
 
@@ -386,6 +402,30 @@ impl Store {
             answer: &scratch.answer,
         });
         Ok(())
+    }
+
+    /// Keeps what the run of `step` of `def` under `schema` just made as its trace
+    /// ([`entries::Ran`]), replacing the trace of the run before.
+    fn trace(
+        &self,
+        def: DefWithBodyId,
+        step: Step,
+        schema: SchemaHash,
+        ran: Result<(&[FactRef], &[u8]), Refusal>,
+    ) {
+        let ran = match ran {
+            // alloc: one trace a body's step run, replacing the one before
+            Ok((facts, answer)) => entries::Ran::Kept { facts: facts.into(), answer: answer.into() },
+            Err(refusal) => entries::Ran::Refused(refusal),
+        };
+        // alloc: one trace a body's step, kept while the store is installed
+        self.traces.lock().insert((def, step, schema), Arc::new(ran));
+    }
+
+    /// The trace of the last run of `step` of `def` under `schema` in this database.
+    fn traced(&self, def: DefWithBodyId, step: Step, schema: SchemaHash) -> Option<Arc<entries::Ran>> {
+        // clone: a counted reference
+        self.traces.lock().get(&(def, step, schema)).cloned()
     }
 
     #[cold]
@@ -710,6 +750,7 @@ pub fn install(
         full_lookups: AtomicUsize::new(0),
         lookups: [const { blaze_record::Tally::new() }; Step::COUNT],
         error: Lock::new("ty.body_store.error", None),
+        traces: Lock::new("ty.body_store.traces", blaze_hash::HashMap::new_in(std::alloc::Global)),
     }));
     for (at, slot) in REGISTRY.iter().enumerate() {
         if slot

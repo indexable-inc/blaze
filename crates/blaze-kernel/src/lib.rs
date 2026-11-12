@@ -86,6 +86,13 @@ pub mod steps {
     pub const LINES: StepId = StepId(0x0203);
     /// blaze-front-items' `modules(crate)`, a table (`blaze_front_items::steps::Modules`).
     pub const MODULES: StepId = StepId(0x0204);
+
+    /// hir-ty's body entries (`hir_ty::body_store::entries`): a body's inference.
+    pub const BODY_INFER: StepId = StepId(0x0301);
+    /// A body's built MIR (`hir_ty::body_store::entries::MirEntry`).
+    pub const BODY_MIR: StepId = StepId(0x0302);
+    /// That a body's borrow check passed (`hir_ty::body_store::entries::BorrowckEntry`).
+    pub const BODY_BORROWCK: StepId = StepId(0x0303);
 }
 
 /// A compute step, by number: one number is one step for every blaze ([`steps`]).

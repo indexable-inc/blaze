@@ -194,7 +194,7 @@ fn stored<'db>(db: &'db Db, owner: MirOwner<'db>, run: impl FnOnce() -> Built<'d
 
 /// The body `owner`'s record is filed under, and the schema of its answers: [`SCHEMA`] with
 /// which MIR owner of the body it is and its place there. `None` for an owner of no body.
-fn place<'db>(db: &'db Db, owner: MirOwner<'db>) -> Option<(DefWithBodyId, SchemaHash)> {
+pub(super) fn place<'db>(db: &'db Db, owner: MirOwner<'db>) -> Option<(DefWithBodyId, SchemaHash)> {
     let (tag, closure): (u64, InternedClosure<'db>) = match owner {
         MirOwner::Body(body) => {
             let (def, anon) = in_body(db, body)?;

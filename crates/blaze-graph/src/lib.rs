@@ -46,6 +46,7 @@ pub mod build;
 #[allow(unsafe_code)]
 pub mod exec;
 pub mod footprint;
+pub mod forecast;
 pub mod giveback;
 pub mod ledger;
 pub mod lines;
