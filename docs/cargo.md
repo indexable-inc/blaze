@@ -877,7 +877,9 @@ two (two `StdKey`s, two directories): the host's units run where they are built,
 is compiled for this machine's own CPU, while the target's, which may be shipped, is compiled
 for the target's baseline (`blaze_units::schema::runs_here`, the one rule both codegen and
 `StdKey` read). In a release build both run elsewhere, so they are one key and share one set
-of std units. Its
+of std units. A std's directory is named by its key without the crates asked of it
+(`StdKey::placement`): a program's build and its tests' build, which asks for `test` too, name
+every std unit they share by the same files, and the second compiles only what it adds. Its
 own units abort too: a profile's `panic = "unwind"`, cargo's default, gets no `-C panic` from
 cargo, so blaze builds each unit with its target's own strategy, as rustc does
 (`crates/blaze-units/src/load/units.rs`). The standard library the macros link is their own

@@ -67,6 +67,83 @@ a reboot, takes about as long as the same answer from a warm daemon, plus a few 
   `Persist` values, the work [query-unify](../../plan.md) names.
 
 
+## A second kind of target, and where a restart's time goes (2026-11-11, lane share-front-1111)
+
+Read from the profile of a hello-world on an 18-core Mac (`query_counts`, `misses`,
+`key_parts`, the spans), then from the code. Nothing of this lane was compiled or run by it.
+
+**`blaze test` after `blaze run` rebuilt the standard library: fixed.** A test in libtest's
+harness asks std for `test` too (`std_key`, `crates/blaze-units/src/load/units.rs`), and the
+directory of every std unit's outputs and `OUT_DIR` was named by the whole `StdKey`, the crates
+asked among it. So all 31 std units missed, 27 of them for their `plan` alone (the outputs'
+paths), and each crate above a build script (all but `core`) was another crate to the front end
+(its `OUT_DIR`), with other content IDs up to `std`. The directory is now
+`StdKey::placement`, the key without the crates asked; a unit's own paths already carry cargo's
+hash of what it is made from. Tests: `a_test_build_plans_the_standard_library_the_program_build_did`
+(blaze-units), `a_dependency_is_keyed_the_same_whatever_kind_of_target_uses_it` (blaze-lower),
+each with its control.
+
+**What is left of it (F1): the front end is one database a plan.** `unkept`
+(`crates/blaze-cargo/src/serve/unit.rs`) lets the kept front end go when the plan's units are
+not equal, and `blaze_lower::lower` makes a new `Db`. With the fix above the second build then
+costs what a restart does (below), not a cold build; it does not yet cost only the crate under
+test. The design: a checkout keeps one database, and a plan is lowered into it.
+`blaze_lower::Lowered` keeps across plans what `lower_writes` now makes per plan:
+
+| Kept across plans | So that |
+|---|---|
+| each load's source root ID, by the load's directory, with one allocator for package roots and doctests' (`other` no longer the count of sets) | a file keeps its `FileId` and its root |
+| `made`: every crate by its root file with what it was made of, its `workspace` compared by content and its runs by their classes' unit IDs (never unit indexes, which are a plan's) | a unit whose crate inputs are equal gets the same `Crate`, and its memos stand |
+| `applied` by run class unit ID; the proc macros given | a crate kept is not given `NotYetBuilt` or its base cfg again |
+| the session's keys (`deps::Session`) | a kept crate is not asked of the store again |
+
+`all_crates` is the plan's crates; a crate of an earlier plan stays, unread, until the database
+holds more of them than a bound and is let go by name. Two things below it must change first, or
+the kept database buys little: a crate graph change (`Written::crates`) runs every crate of the
+name-resolution and impls maintainers from empty (`unreached`, `crates/hir-def/src/nameres/delta.rs`;
+R8 is the same cause for a serve), so a plan that adds four crates must name them; and
+`const_macros`, doctests' crates and macro hosts are made per plan and need the same find-or-make.
+Its check: lower a fixture as a program, then as its tests, into one front end, and count the
+runs of a dependency's rows: none (the engine's `Counts::executed` by crate).
+
+**Where a restart's 6.7 s goes** (same binary's state, everything built; build 175 of the
+profile). Before the daemon listens, 2.6 s: the profile history's two `profile fsync`s (0.72 s),
+`restore blaze why's ledger` (0.39 s, `crates/blaze-cargo/src/serve/why/file.rs`), `daemon
+start` itself 0.19 s. Then the request, 7.8 s:
+
+| Span | Time | What it is |
+|---|---|---|
+| the watches, `std library`, `plan` | 0.45 s | |
+| `lower workspace` > `maintain` (`the build lowered`) | 3.83 s | the lowering's batch ends in a pass over every crate from its source: name resolution 2.95 s (`core` 1.39 s, then `std` 1.06 s, a layer at a time), impls 0.88 s. No image is in the database yet: `deps::serve` runs after `blaze_lower::lower` returns (`Steps::lower`), so each crate an image is then found for was resolved for nothing |
+| `maintain` (`the dependencies' images served`) | 0.90 s | the five crates no build script reaches |
+| `maintain` x 3, after std's and compiler_builtins' runs are applied and the other 23 crates are served | 0.98 s | every crate again each time (`note_crates_changed`, R8) |
+| the walk, the link, `store kept front end` | 0.5 s | |
+
+777,858 queries ran, none of them inference or MIR: the item store answered those. So a
+restart recomputes exactly what the store already holds as records (the def maps), because
+the order asks the store last.
+
+**F2: no crate is resolved before the store was asked for it.** The lowering's batch takes the
+images of every crate whose key is known, and the std scripts' runs (blaze's own ports,
+`blaze_units::stdlib::scripts`, pure functions of the plan) are applied in it, so every crate of
+std is keyed there. Two things stand in the way and are the work: `withdraw_moved`
+(`crates/hir-def/src/deps/serve.rs`) takes away any image served in a batch that also wrote its
+crate's files, by design, so a serve has to say which crates it keyed after the batch's file
+writes; and a crate whose key waits on a run not yet applied has to be left unmaintained (a
+third state beside served and resolved) until its serve says hit or miss, with a reader of it
+before then an error naming the crate. The budget: the lowering's pass after a restart is the
+decode of the served maps (the 0.9 s pass, less R8), and no `nameres crate` span is of a crate
+with an image.
+
+**F3: the no-op after a restart is the answer said again.** A running daemon answers a no-op
+from `noop::LastAnswer` in 20 to 50 ms with no plan and no lowering; a restart loses it (memory
+only), and its safety rests on watches that vouch without a gap, which a restart breaks. Kept in
+the image, it is said again only after each thing a watch vouched for is checked once at the
+start: the view's root (the journal), each output's and each outside path's stat against what
+the answer recorded. That is durable state deciding a build, so it lands with its simulation
+(a crash and an edit between the stop and the start, the oracle that no answer is said over a
+changed input), not before.
+
 ## A restore that cannot be trusted (2026-11-11)
 
 On 2026-11-10 a daemon restored a bad `<state>/db` and failed builds of unrelated crates with
