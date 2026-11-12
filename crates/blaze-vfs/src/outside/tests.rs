@@ -652,3 +652,36 @@ fn one_driver_per_table() {
     let _one = Outside::new(&dirs, "/", TAGS);
     let _two = Outside::new(&dirs, "/", 2 * TAGS);
 }
+
+/// The watch of `/tc` woken as Linux's wakes it for a write elsewhere on its file system: a
+/// change that names no file and lost none. Whether `/tc/lib/a.h` is still vouched for.
+fn vouched_after_an_empty_wake() -> bool {
+    let dirs = Dirs::new();
+    let (mut sim, mut outside, mut effects) = confirmed(&dirs);
+    let generation = dirs.generation();
+    let woken = Completion {
+        tag: Tag(TAGS + WATCH),
+        done: Done::Changed { files: Vec::new(), lost: false },
+    };
+    outside.complete(woken, &mut effects);
+    round(&mut sim, &mut outside, &mut effects);
+    dirs.unchanged_since(path("/tc/lib/a.h"), generation)
+}
+
+/// The invariant: a directory stops vouching only for a change under it, or for events lost.
+/// A wake of its watch that names no file and lost none (a write elsewhere on a file system
+/// marked whole) leaves every answer under it vouched for.
+#[test]
+fn a_wake_that_names_nothing_is_no_change() {
+    assert!(vouched_after_an_empty_wake());
+}
+
+/// The control: with an empty wake taken as a change, nothing under the directory is vouched
+/// for after any write on its file system.
+#[test]
+fn the_oracle_catches_an_empty_wake_taken_as_a_change() {
+    super::EMPTY_WAKE_IS_A_CHANGE.set(true);
+    let vouched = vouched_after_an_empty_wake();
+    super::EMPTY_WAKE_IS_A_CHANGE.set(false);
+    assert!(!vouched, "planted: an empty wake stops the directory vouching");
+}

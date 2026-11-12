@@ -809,6 +809,17 @@ impl<'d> Outside<'d> {
         let round = self.round;
         let watch = &mut self.watches[at];
         match (kind, completion.done) {
+            // A wake that names nothing and lost nothing is no change under this directory.
+            // Linux's watch is a mark of the whole file system (`blaze_core::fanotify`), so
+            // every write anywhere on it wakes every watch, and one whose events were all
+            // outside its directory completes with no file. Taken as a change, each build's
+            // own outputs made every watched directory "changed" (the toolchain's, glibc's in
+            // the nix store, which nothing writes): no answer was ever vouched for on Linux,
+            // and no build was answered again without a walk (2026-11-12, `blaze_vfs::
+            // outside::why_looked`: `watched since generation 6, last change heard at 3124,
+            // now 3128`).
+            (WATCH, Done::Changed { files, lost: false })
+                if files.is_empty() && !EMPTY_WAKE_IS_A_CHANGE.get() => {}
             (WATCH, Done::Changed { files, lost }) => {
                 dir.entry.changed.fetch_max(dirs.disturb(), Ordering::AcqRel);
                 let replaced = lost || watch.file.as_ref().is_some_and(|it| files.contains(it));
@@ -947,6 +958,13 @@ impl<'d> Outside<'d> {
         }
         FileName::new(rest)
     }
+}
+
+thread_local! {
+    /// A planted bug, for a test's control: a watch's wake that names no file and lost none
+    /// is taken as a change under its directory, as until 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static EMPTY_WAKE_IS_A_CHANGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Every directory stops vouching once nothing drives it.
