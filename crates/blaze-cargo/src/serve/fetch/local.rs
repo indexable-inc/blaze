@@ -57,6 +57,27 @@ pub fn absent(at: &str) -> bool {
     )
 }
 
+/// Whether the watches vouch that the file at `at`, a local mount read alone at `generation`
+/// ([`read_at`]), is what it was then ([`blaze_vfs::outside::name_unchanged_since`]).
+///
+/// The invariant: a local that is one file is read again only when a change was heard that
+/// names it, an entry beside it or a directory above it, or its watch broke. Until
+/// 2026-11-12 one file was read again by every job (`no watch vouches for it`), and a build
+/// that reads a local again is never answered again without a walk: a hello-world with a
+/// path dependency into another workspace mounts that workspace's `Cargo.toml` alone, so
+/// every `blaze run` of it walked (the owner's, 275 to 613 ms each where an answered one is
+/// tens).
+pub fn vouched_file(at: &str, generation: u64) -> bool {
+    !FILE_IS_NEVER_VOUCHED.get() && blaze_vfs::outside::name_unchanged_since(Path::new(at), generation)
+}
+
+thread_local! {
+    /// A planted bug, for a test's control: a local that is one file is never vouched for, as
+    /// until 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static FILE_IS_NEVER_VOUCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The path `at` read exactly where it is: a directory whole, a file alone, or absent. What a
 /// local mount is read again as.
 pub fn read_at(at: &str) -> Result<LocalRead, ApiError> {
@@ -95,6 +116,14 @@ pub fn read_at(at: &str) -> Result<LocalRead, ApiError> {
             Ok(LocalRead { at: at.to_owned(), source: Source { files, under: String::new() }, watched, generation })
         }
         Some(meta) => {
+            // A file alone is asked of by name, before the generation is read and the file
+            // after it, as a directory is wanted: a check against the generation later
+            // vouches for what the watch heard of that name from before the read on
+            // ([`vouched_file`]). Only a path with no link in it: a watch hears nothing of
+            // where a link leads.
+            if std::fs::canonicalize(path).is_ok_and(|it| it == path) {
+                blaze_vfs::outside::watch_name(path);
+            }
             let generation = blaze_vfs::outside::generation();
             let bytes = SourceFile::read(path, meta.len()).map_err(|error| failed(format!("reading `{at}`: {error}")))?;
             let mode = match is_executable(&meta) {

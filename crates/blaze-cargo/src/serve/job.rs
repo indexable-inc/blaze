@@ -1489,7 +1489,19 @@ fn read_unasked(name: &str) -> bool {
 /// Whether the watch of `dir`, a path dependency's directory outside the view, vouches that
 /// nothing under it changed since `generation` was read ([`Mounts::stale_locals`]).
 fn vouched_local(dir: &str, generation: u64) -> bool {
-    blaze_vfs::outside::unchanged_since(std::path::Path::new(dir), generation)
+    let dir = std::path::Path::new(dir);
+    let vouched = blaze_vfs::outside::unchanged_since(dir, generation);
+    if !vouched {
+        // Said: a local no watch vouches for is read again by the job and keeps every
+        // build from being answered again; the watch's own state says why (rule 19).
+        tracing::info!(
+            target: "blaze",
+            dir = %dir.display(),
+            why = %blaze_vfs::outside::why_changed(dir, generation),
+            "a path outside the view that is mounted where it is has no watch vouching for it"
+        );
+    }
+    vouched
 }
 
 /// The directory of a build's layout profiles under its target directory
@@ -4095,7 +4107,7 @@ impl<S: Steps> Jobs<S> {
         // Paths outside the view read where they are on the disk ([`Mounts::mount_local`]):
         // each the watch can't vouch for is read again before the view's configuration takes
         // its mount, so the build reads what is on the disk now, never a stale copy.
-        let ats = w.mounts.stale_locals(vouched_local, super::fetch::local::absent);
+        let ats = w.mounts.stale_locals(vouched_local, super::fetch::local::vouched_file, super::fetch::local::absent);
         if !ats.is_empty() {
             let work = Step::of(&job.cancelled, Does::Locals { steps: w.steps.clone(), ats }); // clone: a refcount, once
             let fresh = lone(w.plane, NodeKind::Fetch, "paths outside the view, read again", Pool::Io, None, kinds::FETCH);
@@ -4359,7 +4371,18 @@ impl<S: Steps> Jobs<S> {
         // What answered jobs left to settle is no job: the kept answer is of a build that
         // made nothing, and stands while that settles.
         let alone = self.order.is_empty();
-        let locals_vouched = w.mounts.stale_locals(vouched_local, super::fetch::local::absent).is_empty();
+        let stale = w.mounts.stale_locals(vouched_local, super::fetch::local::vouched_file, super::fetch::local::absent);
+        if !stale.is_empty() {
+            // Said by name: one local no watch vouches for keeps every build of the checkout
+            // from being answered again (rule 19).
+            tracing::info!(
+                target: "blaze",
+                locals = %stale.join(", "),
+                count = stale.len(),
+                "no-op answer: these paths outside the view are read again by every build: a file alone, a directory named through a link, or one whose watch does not vouch"
+            );
+        }
+        let locals_vouched = stale.is_empty();
         let edited = match &read {
             Ok(edits) => Edited::Files(edits),
             Err(why) => Edited::Unread(*why),

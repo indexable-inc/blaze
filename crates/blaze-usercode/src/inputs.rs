@@ -119,6 +119,9 @@ pub struct Files {
     entries: blaze_core::lock::Lock<
         blaze_hash::HashMap<PathBuf, (u64, Entry), std::alloc::Global>,
     >,
+    /// What [`Inputs::names`] last listed of a directory (each name and whether it is a
+    /// directory), with the generation read before it listed.
+    listings: blaze_core::lock::Lock<blaze_hash::HashMap<PathBuf, Listed, std::alloc::Global>>,
     dirs: &'static Dirs,
 }
 
@@ -128,6 +131,20 @@ thread_local! {
     /// outside a test.
     #[doc(hidden)]
     pub static MISSING_PARENT_IS_UNVOUCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A directory's listing as kept: the generation read before it was listed, and each name
+/// with whether it is a directory.
+type Listed = (u64, std::sync::Arc<[(OsString, bool)]>);
+
+/// The name a listing's watch is asked of: one no entry of a directory has (a NUL in it).
+const LISTING: &str = "\0the listing";
+
+thread_local! {
+    /// A planted bug, for a test's control: a directory is listed off the disk on every ask,
+    /// as until 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static LISTING_LOOKS_EVERY_TIME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 thread_local! {
@@ -286,6 +303,10 @@ impl Files {
             vouched: Sharded::new(),
             entries: blaze_core::lock::Lock::new(
                 "usercode.inputs.entries",
+                blaze_hash::HashMap::new_in(std::alloc::Global),
+            ),
+            listings: blaze_core::lock::Lock::new(
+                "usercode.inputs.listings",
                 blaze_hash::HashMap::new_in(std::alloc::Global),
             ),
             dirs,
@@ -651,26 +672,60 @@ impl Inputs for Now<'_> {
         // alloc: error path
         let unreadable =
             |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
-        // Listed on the disk every time: no watch vouches for a listing.
+        // The invariant: the disk is listed only while no watch vouches for the listing kept.
+        // A listing is the names directly in the directory and whether each is a directory:
+        // it moves only with a change that names an entry of it, the directory itself or
+        // one above it, which is what the watches keep of a name in it
+        // ([`Dirs::watch_name`], asked here of a name no entry has). Kept for a directory
+        // whose own name has no link in it and that lists no link (what a link leads to is
+        // not in its directory). Until 2026-11-12 every ask listed: a build script that
+        // globs its sources (ring's `crypto/**`, zstd-sys's `zstd/lib/*`) kept every build
+        // of anything above it from being answered again without a walk.
+        let asked = path.join(LISTING);
+        let kept = self.files.listings.lock().get(path).cloned(); // clone: an `Arc`
+        if let Some((generation, names)) = &kept
+            && self.files.dirs.name_unchanged_since(&asked, *generation)
+            && !LISTING_LOOKS_EVERY_TIME.get()
+        {
+            for (name, dir) in names.iter() {
+                out.push(name, *dir);
+            }
+            out.sort();
+            return Ok(true);
+        }
+        let generation = self.files.dirs.generation();
         blaze_vfs::outside::looked(path);
         let entries = match std::fs::read_dir(path) {
             Ok(entries) => entries,
             Err(error) if missing(&error) => return Ok(false),
             Err(error) => return Err(unreadable(error)),
         };
+        // alloc: the listing kept, once a directory listed off the disk
+        let mut listed: Vec<(OsString, bool)> = Vec::new();
+        let mut links = false;
         for entry in entries {
             let entry = entry.map_err(unreadable)?;
             // The listing says what each entry is, without a `stat`; a link is what it leads
             // to, as the program that opens it sees, which only a `stat` of it says.
             let kind = entry.file_type().map_err(unreadable)?;
+            links |= kind.is_symlink();
             let dir = match kind.is_symlink() {
                 true => std::fs::metadata(entry.path()).is_ok_and(|it| it.is_dir()),
                 false => kind.is_dir(),
             };
             // alloc: std's listing owns each name: a walk of the disk allocates what `read_dir` does.
-            out.push(&entry.file_name(), dir);
+            let name = entry.file_name();
+            out.push(&name, dir);
+            listed.push((name, dir));
         }
         out.sort();
+        if !links && std::fs::canonicalize(path).is_ok_and(|it| it == path) {
+            if kept.is_none() {
+                self.files.dirs.watch_name(&asked);
+            }
+            // alloc: once a directory listed off the disk, its path as the key
+            self.files.listings.lock().insert(path.to_path_buf(), (generation, listed.into()));
+        }
         Ok(true)
     }
 
