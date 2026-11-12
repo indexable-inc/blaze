@@ -2926,7 +2926,7 @@ impl<'a> Stage<'a> {
             }
             scratch.fixups.push(Fixup {
                 at: f.at,
-                apply: f.apply,
+                apply: crate::reloc::in_output(f.apply, self.output.format, &self.output.kind),
                 target,
                 addend: f.addend,
                 minus: f.minus.map(|m| parsed.sym(m)),

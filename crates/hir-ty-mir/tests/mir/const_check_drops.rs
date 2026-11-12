@@ -257,9 +257,21 @@ const fn dropped(mut s: S, keep: bool) {{
 #[test]
 fn a_value_borrowed_and_then_moved_out_of_is_not_dropped() {
     let src = borrowed_then_moved();
-    for name in ["through_a_call", "through_a_binding"] {
-        assert_eq!(reported(&check("sized, copy", &src, func(name))), NONE, "{name}");
-    }
+    assert_eq!(reported(&check("sized, copy", &src, func("through_a_call"))), NONE);
+}
+
+/// EXPECTED DIFFERENCE from rustc, an open item: the pinned nightly refuses `let r = &mut s;
+/// r.keep = keep; s` in a `const fn` (E0493 at `mut s`, checked with the ten-line program
+/// under nightly-2026-10-27) and blaze accepts it. The owner's rule is that what blaze accepts
+/// builds with rustc unless an extension is opted into, so this is to become rustc's answer:
+/// the exact mirror of `State::join`'s short circuit (the borrowed set joined into a block's
+/// entry only by a join that leaves the qualifs as they were, in rustc's order of blocks),
+/// which refuses this form and still accepts `through_a_call`. When that lands this test
+/// expects `[("E0493", destructor of `S`, "mut s", ..)]`.
+#[test]
+fn expected_difference_a_borrow_bound_to_a_name_then_a_move_is_accepted_where_rustc_refuses() {
+    let src = borrowed_then_moved();
+    assert_eq!(reported(&check("sized, copy", &src, func("through_a_binding"))), NONE);
 }
 
 /// The control of the invariant above: borrowed and not moved out of, the value is dropped

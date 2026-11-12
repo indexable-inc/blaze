@@ -380,6 +380,15 @@ pub(crate) enum Apply {
     A64TlsDescLo12,
     A64TlsDescAdd12,
     A64TlsDescCall,
+    /// A TLS descriptor's sequence in an executable ([`crate::reloc::in_output`]), where no
+    /// descriptor is needed: relaxed to initial exec, `adrp x0, G; ldr x0, [x0, G]; nop;
+    /// nop` with `G` the GOT cell holding the offset from the thread pointer, when the
+    /// target is imported.
+    A64TlsDescIe(TlsDescStep),
+    /// The same relaxed to local exec, `movz x0, #hi16, lsl #16; movk x0, #lo16; nop; nop`
+    /// of the offset from the thread pointer, when the link knows it
+    /// ([`crate::reloc::known`]). No reader emits it and no fixup holds it.
+    A64TlsDescLe(TlsDescStep),
     /// Mach-O TLV (`TLVP_LOAD_*`): the page and low 12 bits (an `LDR`) of a GOT cell holding
     /// the address of `S`'s descriptor (`S` itself for a native one in `__thread_vars`, the one
     /// the core makes in [`Class::ThreadVars`] for a thread-local static).
@@ -395,6 +404,16 @@ pub(crate) enum Apply {
     TpOff64,
     /// A relocation only the format's writer applies ([`Writer::apply`]), by its own type.
     Native(u32),
+}
+
+/// Which instruction of a TLS descriptor's four (`adrp x0; ldr x1, [x0]; add x0, x0; blr x1`)
+/// a relaxed relocation is on: `TLSDESC_ADR_PAGE21`, `_LD64_LO12`, `_ADD_LO12`, `_CALL`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum TlsDescStep {
+    Page,
+    Load,
+    Add,
+    Call,
 }
 
 /// One relocation of a piece.

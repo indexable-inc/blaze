@@ -908,6 +908,7 @@ impl<'a> Stage<'a> {
         for (row, reloc) in relocs.rows().iter().zip(relocs.iter()) {
             let apply = reloc::of_kind(reloc.kind, self.output.format, self.arch(), in_code)
                 .map_err(|it| error(function, it))?;
+            let apply = reloc::in_output(apply, self.output.format, &self.output.kind);
             let target = syms[row.target as usize];
             let addend = match reloc.target {
                 Target::Counter(key) => {

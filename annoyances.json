@@ -374,6 +374,105 @@
    "cause": "three languages nested",
    "workaround": "no apostrophes in cause texts; the fixtures are plain files in the tree now, edited there",
    "state": "fixed: the generator is not part of the tree"
+  },
+  {
+   "id": "real-1",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real-1111",
+   "where": "the VM: nix",
+   "what": "The nix store paths used for `m4`, libclang and glibc's headers were garbage-collected mid-session: the next cold builds of reth and tempo failed in gmp-mpfr-sys (`No usable m4`) and bindgen (`Unable to find libclang`).",
+   "cost": "two wasted 10-25 minute builds",
+   "cause": "fetched by the previous lane with no GC root",
+   "workaround": "`nix build ... --out-link /root/nixroots/<name>` so they are roots",
+   "state": "open: a lane's VM setup should make roots"
+  },
+  {
+   "id": "real-2",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real-1111",
+   "where": "blaze: native store",
+   "what": "A build script may only link from `<HOME>/.blaze/native`, so with one HOME per project and compiler build the LLVM blaze unpacked under `/root/.blaze/native` was refused (`sandbox: link-dir`) for reth's llvm-sys.",
+   "cost": "one failed reth build and a copy step in every run script",
+   "cause": "the native store is per home; nothing shares a layout between homes",
+   "workaround": "`cp -al` the layout into each home's `.blaze/native`",
+   "state": "open"
+  },
+  {
+   "id": "real-3",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real-1111",
+   "where": "the VM: bindgen",
+   "what": "nix's libclang has no default include path: bindgen failed with `'assert.h' file not found` until `BINDGEN_EXTRA_CLANG_ARGS` named glibc's and clang's include directories.",
+   "cost": "one failed build",
+   "cause": "an unwrapped libclang",
+   "workaround": "set it in the fixed environment",
+   "state": "open: belongs in the lane setup"
+  },
+  {
+   "id": "real-4",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real-1111",
+   "where": "the VM: memory",
+   "what": "Three cold builds at once (tempo, reth, a copy of reth), each with a 200 GB ceiling, drove the 251 GB VM to 225 GB used; every daemon sat `over the limit` with 0 of 62 workers busy for about 20 minutes.",
+   "cost": "about 25 minutes",
+   "cause": "each daemon sees the others only as pressure",
+   "workaround": "one big build at a time",
+   "state": "open"
+  },
+  {
+   "id": "real-5",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real-1111",
+   "where": "blaze: tests under cargo",
+   "what": "Tests that had never compiled under cargo (`hir-ty-codegen` wasm lowering tests, `blaze-link` `tests.rs:1797`, a duplicate call in `blaze-macro-eval`'s wasm tests) and a control that failed since it was written (`the_oracle_catches_a_given_crate_whose_root_runs_again_only_for_its_log`).",
+   "cost": "a detour in four fixes",
+   "cause": "landed by lanes that could not build or run them",
+   "workaround": "fixed each where met",
+   "state": "fixed where met; unrun tests landing is open"
+  },
+  {
+   "id": "real-6",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real-1111",
+   "where": "systemd-run on the VM",
+   "what": "A unit from `systemd-run` has an empty PATH, and its end kills the blaze daemon the script started (same cgroup), so the next command met a cold daemon; a unit name reused while that daemon lives is refused.",
+   "cost": "a failed first run and several cold restarts",
+   "cause": "systemd's defaults",
+   "workaround": "`export PATH` first; `-p KillMode=process`; a unique unit name per run",
+   "state": "open: vm.sh could do this"
+  },
+  {
+   "id": "real-7",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real-1111",
+   "where": "git on the Mac",
+   "what": "`git diff` printed a rendered diff, not a patch (an external diff tool is configured): shipping it to the VM gave `No valid patches in input`.",
+   "cost": "one failed experiment",
+   "cause": "the user's `diff.external`",
+   "workaround": "`git diff --no-ext-diff`",
+   "state": "open"
+  },
+  {
+   "id": "real-8",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real-1111",
+   "where": "blaze: unresolved method diagnostics",
+   "what": "tempo-contracts' body check spent more than 15 minutes on one worker in `unresolved_method_call::similar_candidate` (a probe over every trait per unresolved call, 0.2-1.1 s each) for diagnostics the build then did not print.",
+   "cost": "a 30 minute build in place of 13",
+   "cause": "the suggestion is computed before it is known the diagnostic is kept",
+   "workaround": "none",
+   "state": "open"
+  },
+  {
+   "id": "real-9",
+   "date": "2026-11-11",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane real-1111",
+   "where": "blaze: edit loop on reth",
+   "what": "After a cold build of reth-node-ethereum's closure in a copy of reth, one edit of `snap/run.rs` and a build on b0a935736e panicked in dozens of units: `deps/signatures/key.rs:166: module ... vec of an item is not in its crate's def map` and `nameres.rs:1074 ModuleId not found in ModulesMap`. The same loop on a small tokio fixture is fine.",
+   "cost": "stopped the reduction of two reth errors by editing, and the incremental measurements",
+   "cause": "not known when written; the lane's report says what the tree before the merge does",
+   "workaround": "none",
+   "state": "open"
   }
  ]
 }

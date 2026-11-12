@@ -252,6 +252,7 @@ fn trees_of(iter: &mut tt::iter::TtIter<'_>) -> Vec<Tree> {
                 let open = subtree.delimiter.open;
                 let close = subtree.delimiter.close;
                 let span = DelimSpan { open, close, entire: open.cover_or_self(close) };
+                let mut inner = fragment_in_parens(&subtree, &inner).unwrap_or(inner);
                 let inner = trees_of(&mut inner);
                 Tree::Group {
                     delimiter: subtree.delimiter.kind,
@@ -270,6 +271,33 @@ fn trees_of(iter: &mut tt::iter::TtIter<'_>) -> Vec<Tree> {
         trees.push(tree);
     }
     trees
+}
+
+/// The tokens of an expression `macro_rules!` passed on, when `content` is that of `group`,
+/// the fragment's group without delimiters, and holds them in parentheses. The parentheses
+/// are blaze's (`mbe`'s transcriber puts them there, with the group's span, because blaze's
+/// parser reads a group without delimiters as its tokens); rustc has none, and a macro can
+/// tell: `syn` parses `(a = b)` as `Expr::Paren`, not the `Expr::Assign` of `a = b`. So a
+/// macro is given the fragment as rustc gives it, a group without delimiters of the
+/// expression's own tokens. In its output such a group is read as its tokens, as rustc reads
+/// a proc macro's group without delimiters.
+fn fragment_in_parens<'a>(
+    group: &tt::Subtree,
+    content: &tt::iter::TtIter<'a>,
+) -> Option<tt::iter::TtIter<'a>> {
+    if group.delimiter.kind != tt::DelimiterKind::Invisible {
+        return None;
+    }
+    // clone: a cursor, two indices.
+    let mut content = content.clone();
+    let Some(tt::iter::TtElement::Subtree(parens, fragment)) = content.next() else {
+        return None;
+    };
+    let is_fragment = content.next().is_none()
+        && parens.delimiter.is_fragment_parens()
+        && parens.delimiter.open == group.delimiter.open
+        && parens.delimiter.open == group.delimiter.close;
+    is_fragment.then_some(fragment)
 }
 
 /// The lexer's spacing of a group's opening delimiter: `JointHidden` when its first tree
@@ -466,6 +494,68 @@ mod tests {
             builder.push(leaf);
         }
         builder.build()
+    }
+
+    /// A span of a macro's body in an expansion: not of the root context.
+    fn in_expansion(start: u32, end: u32) -> Span {
+        Span { ctx: SyntaxContext::from_u32(1), ..at(start, end) }
+    }
+
+    /// `left = x` in a group without delimiters at `group`, in parentheses at `parens`: the
+    /// one tree of a call's input.
+    fn assignment_in(group: Span, parens: (Span, Span)) -> tt::TopSubtree {
+        let mut builder = tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(at(0, 0)));
+        builder.open(tt::DelimiterKind::Invisible, group);
+        builder.open(tt::DelimiterKind::Parenthesis, parens.0);
+        builder.push(ident("left", at(10, 14)));
+        builder.push(punct('=', at(15, 16)));
+        builder.push(ident("x", at(17, 18)));
+        builder.close(parens.1);
+        builder.close(group);
+        builder.build()
+    }
+
+    /// The delimiter of the one tree of `stream` and the delimiters of the groups in it.
+    fn group_and_inner(stream: &Stream) -> (Delimiter, Vec<Delimiter>, usize) {
+        let [Tree::Group { delimiter, stream: inner, .. }] = stream.trees() else {
+            panic!("the stream is one group: {stream:?}");
+        };
+        let groups = inner
+            .trees()
+            .iter()
+            .filter_map(|it| match it {
+                Tree::Group { delimiter, .. } => Some(*delimiter),
+                _ => None,
+            })
+            .collect(); // alloc: a test's list
+        (*delimiter, groups, inner.trees().len())
+    }
+
+    /// age 0.11.5's `wfl!(f, "id", left = a, right = b)` passes each `$args:expr` on to
+    /// `i18n_embed_fl::fl!`, which asks `syn` for an `ExprAssign`: in parentheses the
+    /// fragment is an `Expr::Paren`, and the macro answers "unexpected token".
+    #[test]
+    fn a_macro_is_given_an_expression_fragment_without_the_transcribers_parentheses() {
+        let fragment = in_expansion(40, 45);
+        let stream = Stream::of_call(&assignment_in(fragment, (fragment, fragment)));
+        // `left = x`, in a group without delimiters, with no group in it.
+        assert_eq!(group_and_inner(&stream), (Delimiter::Invisible, vec![], 3));
+    }
+
+    /// The control: parentheses that are not the transcriber's stay. The source's have two
+    /// spans; a group the macro's body wrote around `( .. )` has its own span.
+    #[test]
+    fn parentheses_that_are_not_the_transcribers_are_given_as_they_are() {
+        let kept = (Delimiter::Invisible, vec![Delimiter::Parenthesis], 1);
+        let fragment = in_expansion(40, 45);
+        let written = (in_expansion(50, 51), in_expansion(60, 61));
+        let stream = Stream::of_call(&assignment_in(fragment, written));
+        assert_eq!(group_and_inner(&stream), kept, "parentheses written in the macro's body");
+        let stream = Stream::of_call(&assignment_in(at(40, 45), (at(40, 45), at(40, 45))));
+        assert_eq!(group_and_inner(&stream), kept, "of the source's context");
+        let other = in_expansion(70, 75);
+        let stream = Stream::of_call(&assignment_in(fragment, (other, other)));
+        assert_eq!(group_and_inner(&stream), kept, "of another span than the group's");
     }
 
     #[test]
