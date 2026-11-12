@@ -80,6 +80,30 @@ Lean semantics in the same pull request.
 
 See [docs/v2/plan/design/formal-verification.md](../../../docs/v2/plan/design/formal-verification.md).
 
+## simulate-first (rule 64)
+
+Default to the simulation. When you test behaviour over time (an edit after a build, a restart, a
+crash, two requests at once, a file replaced under a watcher, a cache hit after a key change, a
+retry, a timeout), write the test against the sans-IO core driven by `blaze_core::sim::Sim` (virtual
+clock, simulated filesystem and network that can be slow, fail, tear or reorder, crashes at any
+step), not against a spawned daemon, real files, real sleeps or real threads. Such a test is
+declarative (the steps and what must hold after each), runs under many seeds, prints the seed and
+the step on failure so it replays exactly, checks an oracle that states the invariant, and has a
+planted bug the oracle catches (`dst-not-review`). For incremental behaviour the shape is the
+revision test: a small project and a sequence of source revisions with state kept between them,
+asserting after each what was redone, what was reused, and that the result equals a clean build of
+that revision byte for byte. Reach for a real process only for what a kernel alone can show (the
+order file events really arrive in, executing a built program, signals, code signing, a real
+socket), keep those tests few, and say in each which fact needed the real thing. When the code you
+need to test cannot run under the simulation (it starts threads, opens sockets, reads the clock,
+spawns a process or touches the filesystem directly), that is the finding: it breaks
+`sans-io-cores`; cut the seam (a core with an injected effect interface and a thin driver) as part
+of the change, or record exactly what blocks it and where, and do not paper over it with a slower,
+flakier end-to-end test. A bug found by hand or in production gets a simulated reproduction before
+its fix, minimized to the smallest revision sequence or transcript that shows it. Prefer a property
+over examples, a reference model over assertions about internals, and comparison with a clean build
+over expected output typed by hand.
+
 <!-- End of the generated rules. Hand-written notes follow. -->
 
 This skill is the one home for how blaze tests its own code. Other skills and docs point here:
