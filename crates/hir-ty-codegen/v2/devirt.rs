@@ -270,13 +270,13 @@ impl State {
                 .map_err(|what| refused_of(db, krate, kind, what))
         })?;
         let held = self.held.get().map(|it| it.world().id);
-        // alloc: the error's message
         let others = |id: DevirtWorld, found: String| {
             frontend.with(|db| {
                 refused_of(
                     db,
                     krate,
                     kind,
+                    // alloc: the error's message
                     format!(
                         "the walk of the program against its dyn facts {id:?} found others \
                          ({found}); the facts may not change with what is built against them"
@@ -296,6 +296,7 @@ impl State {
                     // ones are the ones the bodies are now built against, and this walk runs
                     // again over them as it would over its own; others are refused.
                     Err(refused) if refused.kept.world().id == id => Ok(true),
+                    // alloc: the error's message
                     Err(refused) => Err(others(refused.kept.world().id, format!("{id:?}"))),
                 }
             }

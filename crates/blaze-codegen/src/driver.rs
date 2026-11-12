@@ -2122,8 +2122,8 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut statics = static_roots.to_vec(); // alloc: as above
         for root in check {
             match root {
-                // clone: per build, the walk's handle of a check root
                 CheckRoot::Function(instance, origin) => {
+                    // clone: per build, the walk's handle of a check root
                     functions.push((instance.clone(), *origin))
                 }
                 CheckRoot::Static(value) => statics.push(value.clone()), // clone: as above
