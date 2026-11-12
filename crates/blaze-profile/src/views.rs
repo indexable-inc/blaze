@@ -67,8 +67,12 @@ impl ArgType {
     }
 }
 
+/// The last build: the last row of `builds`, never the greatest id a span has. What a build
+/// does after its answer (storing what it left) is recorded under the id after its own, which
+/// is no build: with that as the default, `blaze explain edit_work` after any build said
+/// `build 4 counted no work in any stage` and `writes` said `0 rows` (2026-11-12).
 const BUILD: Arg =
-    Arg { name: "build", ty: ArgType::U64, default: Some("(SELECT max(build_id) FROM spans)") };
+    Arg { name: "build", ty: ArgType::U64, default: Some("(SELECT max(build_id) FROM builds)") };
 /// A build for a view over its wall time: by default the last to end, as one still running has
 /// only its start's `builds` row, with no end to bound it.
 const ENDED_BUILD: Arg = Arg {
@@ -656,7 +660,7 @@ mod tests {
         let view = find("slowest_queries").unwrap();
         let sql = render(view, &args(json!({}))).unwrap();
         assert!(
-            sql.contains("build_id = (SELECT max(build_id) FROM spans)"),
+            sql.contains("build_id = (SELECT max(build_id) FROM builds)"),
             "a missing argument takes its default: {sql}"
         );
         assert!(sql.ends_with("LIMIT 20"), "{sql}");
