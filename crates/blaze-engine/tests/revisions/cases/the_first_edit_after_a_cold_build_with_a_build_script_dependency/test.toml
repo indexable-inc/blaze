@@ -1,0 +1,21 @@
+about = "The first edit after a cold build, in a workspace with a library package whose build script leaves a file in OUT_DIR: the edit makes the one edited function again and no unit but its own, as the second edit does. The build script's crate is not keyed by what its own run left, so nothing asks the store for the standard library's images mid-life, and every crate keeps the module ids it was resolved with."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "52 3\n"
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "53 3\n"
+redone = ["app::shown"]
+max_units = 1
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "54 3\n"
+redone = ["app::shown"]
+max_units = 1
