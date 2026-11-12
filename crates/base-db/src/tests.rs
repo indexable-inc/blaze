@@ -1588,14 +1588,23 @@ fn a_parse_after_random_edits_is_the_whole_parse() {
         let mut rng = Rng::new(seed);
         let mut text = source.to_owned();
         let start = reparsed();
+        // An edit that gives the text the file has writes nothing, so nothing is parsed.
+        let mut changed = 0;
         for step in 0..80 {
-            text = random_edit(&mut rng, &text);
+            let edited = random_edit(&mut rng, &text);
+            changed += usize::from(edited != text);
+            text = edited;
             db.set_file_text(file, &text);
             let parse = id.parse(&db);
             assert_eq!(parse.root().text(), text, "step {step}");
             assert_whole(parse, db.file_text(file).text(&db), Edition::Edition2021, library);
         }
-        assert_eq!(reparsed() - start, 80, "seed {seed}: every edit after a kept parse reparses");
+        assert!(changed >= 70, "seed {seed}: {changed} of 80 edits changed the text");
+        assert_eq!(
+            reparsed() - start,
+            changed,
+            "seed {seed}: every edit after a kept parse that changes the text reparses, and no other"
+        );
     }
 }
 

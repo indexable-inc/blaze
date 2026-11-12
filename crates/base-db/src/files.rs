@@ -739,9 +739,20 @@ impl Files {
         };
         match existing {
             Some(input) => {
-                let reparse = input.reparse_field(&*db).after(&text, file);
-                set(input.set_reparse_field(db), durability, reparse);
-                set(input.set_text_field(db), durability, text);
+                // A file given the text it has keeps its text and what its parse is made
+                // from: nothing is written (a slot made anew for an equal text would be a
+                // write of `reparse`, and every reader of the file would verify again).
+                if *input.text_field(&*db) != text {
+                    let reparse = input.reparse_field(&*db).after(&text, file);
+                    set(input.set_reparse_field(db), durability, reparse);
+                    set(input.set_text_field(db), durability, text);
+                } else if durability.is_some() {
+                    // Its durability may be another: the text it has, by the handle its
+                    // parse is made from, set again (a write only when the durability moves).
+                    // clone: a refcount
+                    let held = input.text_field(&*db).clone();
+                    set(input.set_text_field(db), durability, held);
+                }
                 if input.content(&*db) != content {
                     set(input.set_content_field(db), durability, InputId(content));
                 }

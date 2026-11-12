@@ -2291,18 +2291,27 @@ fn written_value(fields: &mut (u64,)) -> &mut u64 {
 }
 
 /// What `query_counts.written` holds: each setter's write of an input's field counts once
-/// against that input, an equal value too (it opens a view all the same), and making one
-/// counts nothing. harness/incremental.py names a no-op build's re-runs by it.
+/// against that input, and making one counts nothing; a set of the value the field holds, at
+/// its durability, is no write (it opens no view), and a set of an equal value at another
+/// durability is one. harness/incremental.py names a no-op build's re-runs by it.
 #[test]
-fn each_set_of_an_input_is_counted_as_written() {
+fn each_write_of_an_input_is_counted_as_written_and_an_equal_set_is_none() {
     let mut db = TestDb::new();
     let id = input_new::<Written, 1>(db.storage(), (1,), [Durability::LOW]);
     assert_eq!(counts_of("Written").written, 0, "made, not written");
     input_set::<Written, u64>(db.storage_mut(), id, 0, written_value).to(2);
-    input_set::<Written, u64>(db.storage_mut(), id, 0, written_value).to(2);
+    let view = db.storage().view();
+    let old = input_set::<Written, u64>(db.storage_mut(), id, 0, written_value).to(2);
+    assert_eq!(old, 2, "the old value of an equal set is the value");
+    assert_eq!(db.storage().view(), view, "an equal set opens no view");
     let counts = counts_of("Written");
-    assert_eq!(counts.written, 2, "two writes, the second of an equal value: {counts:?}");
+    assert_eq!(counts.written, 1, "one write, and one set of an equal value: {counts:?}");
     assert_eq!(counts.executed, 0, "{counts:?}");
+    input_set::<Written, u64>(db.storage_mut(), id, 0, written_value)
+        .with_durability(Durability::HIGH)
+        .to(2);
+    assert_ne!(db.storage().view(), view, "an equal value at another durability is a write");
+    assert_eq!(counts_of("Written").written, 1);
 }
 
 /// Asks for one key of `F` in two views, then for two other keys in a third, and opens a
@@ -3337,3 +3346,144 @@ fn after_editing_one_input_every_rerun_memos_cause_chain_leads_back_to_it(tc: Te
 mod changed;
 mod small;
 mod stale_head;
+
+/// One request of the no-op simulation ([`requests_cost_what_they_change`]).
+#[derive(Clone, Copy, Debug)]
+enum Request {
+    /// The host gives every input again the value it holds, as a build of an unchanged tree
+    /// does (its environment, each proc macro's expanders, each build script's run).
+    Unchanged,
+    /// One input is given another value; every other is given the value it holds.
+    Edit(usize),
+}
+
+/// The nodes of `graph` that read input `input`, through any number of nodes.
+fn reached(graph: &[GNode], input: usize) -> Vec<bool> {
+    let mut reads = vec![false; graph.len()];
+    for (at, spec) in graph.iter().enumerate() {
+        reads[at] = spec.deps.iter().any(|&dep| match dep {
+            Dep::Input(it) => it == input,
+            Dep::Query(it) => reads[it],
+        });
+    }
+    reads
+}
+
+/// Runs `requests` over `graph` with `inputs` inputs, every node asked after each, and holds
+/// each to what it changed; an error names the request that cost more.
+///
+/// The invariant: a request that changes nothing writes no input (no view opens), runs no
+/// row and leaves every value as it was, whatever the size of the graph; a request that
+/// changes one input runs only rows that read it, each at most once; and every value is the
+/// one a run from scratch gives.
+fn requests_cost_what_they_change(
+    inputs: usize,
+    graph: Vec<GNode>,
+    requests: &[Request],
+    plant: super::frontier::Plant,
+) -> Result<(), String> {
+    let queries = graph.len();
+    let mut values: Vec<u64> = (0..inputs).map(|i| i as u64).collect();
+    let mut db = TestDb::made(None, graph);
+    db.storage_mut().plant_in_changed_set(plant);
+    let cells: Vec<Cell> = values.iter().map(|&value| Cell::new(&db, value, 0)).collect();
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
+    let ask = |db: &TestDb, values: &[u64]| -> Result<(), String> {
+        let expected = evaluate(&db.graph, values);
+        for at in 0..queries {
+            let got = *fetch::<Graph>(db, node(db, at));
+            if got != expected[at] {
+                return Err(format!("node {at} is {got}, and from scratch {}", expected[at]));
+            }
+        }
+        Ok(())
+    };
+    ask(&db, &values)?;
+    for (step, &request) in requests.iter().enumerate() {
+        let view = db.storage().view();
+        let ran = db.log.lock().len();
+        if let Request::Edit(input) = request {
+            values[input] += 1;
+        }
+        // The host does not know what changed: it gives every input.
+        for (cell, &value) in cells.iter().zip(&values) {
+            cell.set_a(&mut db, value);
+        }
+        ask(&db, &values).map_err(|why| format!("request {step} ({request:?}): {why}"))?;
+        let runs: Vec<u32> = db.log.lock()[ran..].iter().map(|it| it.1).collect();
+        match request {
+            Request::Unchanged => {
+                if db.storage().view() != view {
+                    return Err(format!(
+                        "request {step} changed nothing and opened a view: it wrote an input"
+                    ));
+                }
+                if !runs.is_empty() {
+                    return Err(format!("request {step} changed nothing and ran {} rows", runs.len()));
+                }
+            }
+            Request::Edit(input) => {
+                let reads = reached(&db.graph, input);
+                let may: Vec<u32> = (0..queries)
+                    .filter(|&at| reads[at])
+                    .map(|at| node(&db, at).0.as_u32())
+                    .collect();
+                if let Some(other) = runs.iter().find(|it| !may.contains(it)) {
+                    return Err(format!(
+                        "request {step} edited input {input} and ran row {other}, which does not read it"
+                    ));
+                }
+                if runs.len() > may.len() {
+                    return Err(format!(
+                        "request {step} edited input {input} and ran {} rows of the {} that read it",
+                        runs.len(),
+                        may.len()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The invariant of [`requests_cost_what_they_change`], over random graphs and requests.
+#[hegel::test]
+fn a_request_that_changes_nothing_writes_no_input_and_an_edit_runs_what_reads_it(tc: TestCase) {
+    let (inputs, graph) = random_graph(&tc);
+    let count: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(12));
+    let requests: Vec<Request> = (0..count)
+        .map(|_| match tc.draw(gs::booleans()) {
+            true => Request::Unchanged,
+            false => Request::Edit(tc.draw(gs::integers::<usize>().max_value(inputs - 1))),
+        })
+        .collect();
+    if let Err(why) = requests_cost_what_they_change(inputs, graph, &requests, super::frontier::Plant::None) {
+        panic!("{why}");
+    }
+}
+
+/// A graph and requests the invariant holds over, for the control below.
+fn two_nodes() -> (Vec<GNode>, [Request; 3]) {
+    let graph = vec![
+        GNode { op: Op::Sum, deps: vec![Dep::Input(0), Dep::Input(1)] },
+        GNode { op: Op::Max, deps: vec![Dep::Query(0), Dep::Input(1)] },
+    ];
+    (graph, [Request::Edit(0), Request::Unchanged, Request::Edit(1)])
+}
+
+#[test]
+fn two_nodes_cost_what_their_requests_change() {
+    let (graph, requests) = two_nodes();
+    assert_eq!(requests_cost_what_they_change(2, graph, &requests, super::frontier::Plant::None), Ok(()));
+}
+
+/// The control: with a set of an equal value opening a view, as every set did until
+/// 2026-11-12, the request that changes nothing repaints each field it sets, and the rows
+/// that read them run again on the values they had: the graph's own check of a rerun, which
+/// comes before the oracle's count of views, names the first.
+#[test]
+#[should_panic(expected = "ran again though nothing it read changed")]
+fn the_oracle_catches_an_equal_set_that_opens_a_view() {
+    let (graph, requests) = two_nodes();
+    _ = requests_cost_what_they_change(2, graph, &requests, super::frontier::Plant::EqualSetsWrite);
+}

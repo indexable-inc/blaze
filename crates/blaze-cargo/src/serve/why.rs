@@ -739,6 +739,16 @@ impl Ledger {
             if last.unfinished {
                 return RebuildCause::Unfinished { since };
             }
+            // A part that is in no hash of the key and moved (what a unit's narrow key holds
+            // of a crate, under which its record is looked up first) is the reason, named.
+            let changed = changed(&last.parts, &miss.parts, self.planted(1));
+            if !changed.is_empty() {
+                return RebuildCause::Parts {
+                    parts: u32::try_from(miss.parts.len()).unwrap_or(u32::MAX),
+                    since,
+                    changed,
+                };
+            }
             return match miss.beyond {
                 Some(what) => RebuildCause::Beyond { what: what.to_owned(), since },
                 None => RebuildCause::Lost { since },

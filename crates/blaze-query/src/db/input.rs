@@ -326,7 +326,7 @@ pub struct InputSetter<'s, I: Input, T> {
 }
 
 /// The setter of `field` of input `id`, which `at` finds in its fields.
-pub fn input_set<'s, I: Input, T>(
+pub fn input_set<'s, I: Input, T: PartialEq>(
     storage: &'s mut Storage,
     id: Id,
     field: u32,
@@ -336,7 +336,7 @@ pub fn input_set<'s, I: Input, T>(
     InputSetter { storage, id, field, durability: None, at }
 }
 
-impl<I: Input, T> Setter for InputSetter<'_, I, T> {
+impl<I: Input, T: PartialEq> Setter for InputSetter<'_, I, T> {
     type FieldTy = T;
 
     fn with_durability(mut self, durability: Durability) -> Self {
@@ -344,11 +344,32 @@ impl<I: Input, T> Setter for InputSetter<'_, I, T> {
         self
     }
 
+    /// The invariant: a set of the value the field holds, at the durability it has, writes
+    /// nothing: no view opens, no row verifies again, nothing is counted as written. So a
+    /// host that gives an input again what it gave before (a request's environment, a crate's
+    /// proc macros loaded again, a build script's run applied again) costs nothing, whatever
+    /// the database holds: a request that changes nothing writes no input. Until 2026-11-12
+    /// every set opened a view of the field's durability, and each caller had to compare
+    /// first; the one that did not (`ProcMacros::give`, at `HIGH`) made a build of reth with
+    /// nothing changed verify 23 million rows.
     fn to(self, value: T) -> T {
         let node = row::<I>(self.storage, self.id).first.load(Ordering::Relaxed) + self.field;
         let old =
             Durability(((*self.storage.node_mut(node).color_mut() >> 32) as u32 & !FIELD) as u8);
         let durability = self.durability.unwrap_or(old);
+        if durability == old && !self.storage.planted_equal_sets_write() {
+            let row = row::<I>(self.storage, self.id);
+            // SAFETY: `&mut` of the storage: no reference to the fields lives, and nobody
+            // else writes them.
+            let fields = unsafe { (*row.fields.get()).assume_init_mut() };
+            let held = (self.at)(fields);
+            if *held == value {
+                // The field takes the value given and the one it held is returned, as a
+                // write does (a caller that takes a value out to edit it in place and set
+                // it back gets the very one it set): equal, so nothing that read it differs.
+                return std::mem::replace(held, value);
+            }
+        }
         let view = self.storage.new_view(old.max(durability), input_bits(node));
         let row = row::<I>(self.storage, self.id);
         // SAFETY: `&mut` of the storage: no reference to the fields lives, and nobody else

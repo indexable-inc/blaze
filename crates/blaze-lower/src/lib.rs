@@ -1562,18 +1562,36 @@ impl Lowered {
     /// refused unless they make the identity the front end holds, so they never describe
     /// another identity than the one a key was made from; the files are those of the source
     /// root whose content that identity holds.
-    pub fn identity_parts(&self, unit: usize) -> Result<Vec<IdentityPart>, String> {
+    ///
+    /// `looked` is the identity the record was looked up under: parts are named only of it.
+    /// When the crate's identity now is another, a write since the lookup moved it, and that
+    /// is the error.
+    pub fn identity_parts(
+        &self,
+        unit: usize,
+        looked: ContentId,
+    ) -> Result<Vec<IdentityPart>, String> {
         let db = &self.db;
         let Some(krate) = self.crates.krate(unit) else {
             return Err("it has no crate in the front end".to_owned()); // alloc: error path
         };
-        let Some(known) = self.identities.get(&krate).copied() else {
+        // The identities worked out since the last write, and the rest of this crate's
+        // closure worked out here: a write between a record's lookup and its miss being
+        // named (a build script's run applied, a proc macro's expanders given) lets them go,
+        // and the parts are of the database as it is now. Until 2026-11-12 that was an error
+        // (`its crate's identity was not worked out since the front end's last write`), the
+        // reason given for most of the units reth made again. The caller holds the parts to
+        // the key the record was looked up under, so parts of other inputs are never named.
+        // clone: the identities known, once a miss
+        let mut identities = self.identities.clone();
+        let known = identity_of(db, krate, &self.spellings, &mut identities);
+        if known != looked {
             // alloc: error path
             return Err(
-                "its crate's identity was not worked out since the front end's last write"
+                "its crate's identity moved after its record was looked up (a build script's run or a proc macro's expanders were applied to it or to a crate it depends on in this build), so its parts now would not describe the key it missed under"
                     .to_owned(),
             );
-        };
+        }
         let data = krate.data(db);
         let root_file = data.root_file_id;
         let root = db.source_root(db.file_source_root(root_file).source_root_id(db));
@@ -1667,13 +1685,7 @@ impl Lowered {
         parts.push(IdentityPart::Spelling(spelled.finish()));
         hasher.update(&(data.dependencies.len() as u64).to_le_bytes());
         for dep in &data.dependencies {
-            let Some(identity) = self.identities.get(&dep.crate_id).copied() else {
-                // alloc: error path
-                return Err(format!(
-                    "the identity of `{}`, a crate it depends on, was not worked out since the front end's last write",
-                    dep.name
-                ));
-            };
+            let identity = identity_of(db, dep.crate_id, &self.spellings, &mut identities);
             hasher.id(&identity);
             parts.push(IdentityPart::Dependency {
                 krate: dep.crate_id,
@@ -1689,6 +1701,42 @@ impl Lowered {
             );
         }
         Ok(parts)
+    }
+
+    /// What unit `unit`'s narrowed identity ([`Lowered::narrowed`]) holds of each crate of
+    /// its closure, by the crate's name, sorted: what of the crate alone can be observed
+    /// ([`code::OwnNarrow`]) as one id, and where it is from (a library crate's from the
+    /// store or a full parse, [`Lowered::library_narrows`]; one not given, which is then its
+    /// whole text; a workspace crate's code text). For `blaze why`: a unit's record is looked
+    /// up under its narrow key first, so a narrowed identity that moved while the whole one
+    /// stayed (a library crate narrowed in one build and not in the next) is otherwise a
+    /// miss with no part that changed. Asked on a miss only; it works out what a write let go.
+    pub fn narrow_parts(&self, unit: usize) -> Vec<(String, ContentId)> {
+        let db = &self.db;
+        let Some(krate) = self.crates.krate(unit) else { return Vec::new() }; // alloc: none
+        // alloc: once a miss, a crate of its closure each
+        let mut parts: Vec<(String, ContentId)> = krate
+            .transitive_deps(db)
+            .iter()
+            .map(|&at| {
+                let (own, from) = match self.library.get(&at) {
+                    Some((_, own)) => (*own, "narrowed from the store or a full parse"),
+                    None if code::library_narrowed(db, at) => {
+                        (code::own_narrow(db, at), "a library crate not narrowed: its whole text")
+                    }
+                    None => (code::own_narrow(db, at), "its own code text"),
+                };
+                // Where it is from is in the id, not the name: a crate narrowed in one build
+                // and not in the next is one part that changed.
+                let id =
+                    Hasher::new(IDENTITY_PART).part(from.as_bytes()).part(&own.kept()).finish();
+                // alloc: as above, a part's name
+                (format!("what its narrow key holds of the crate {}", at.named(db)), id)
+            })
+            .collect();
+        parts.sort_unstable();
+        parts.dedup();
+        parts
     }
 
     /// The first variable of the process that a crate of the front end read through `env!` or
@@ -2116,10 +2164,20 @@ impl Lowered {
             });
             macros
         });
-        self.identities.clear();
-        self.narrowed.clear();
         let trigger = Trigger::of("a proc macro's expanders loaded", &self.crates.units[unit].what);
-        Db::batch_in(&mut self.db, |db| db, trigger, |db| ProcMacros::give(db, [(krate, macros)]));
+        let changed = Db::batch_in(
+            &mut self.db,
+            |db| db,
+            trigger,
+            |db| ProcMacros::give(db, [(krate, macros)]),
+        );
+        // Expanders loaded again that run the code the crate's already run change nothing
+        // the front end reads: the identities made of the database stay, as after a build
+        // script's run applied again with what it gave before ([`Lowered::apply_run`]).
+        if changed {
+            self.identities.clear();
+            self.narrowed.clear();
+        }
         Ok(())
     }
 

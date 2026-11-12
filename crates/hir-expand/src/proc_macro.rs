@@ -64,6 +64,19 @@ pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + Any {
     /// What any call gives is what it gives in order: a run ahead only saves time.
     fn speculate(&self, _db: &Db, _calling_crate: Crate, _call: ProcMacroCall<'_>) {}
 
+    /// Whether this expander, loaded for a crate that has `held`, takes `held`'s place: when
+    /// they are not equal, unless a crate's expanders built two ways are told apart here.
+    /// One proc-macro crate is one crate of the front end and may be two units of a build
+    /// (two profiles: a module each), each of which gives the crate its expanders as it
+    /// ends: taken in turn, the crate's expanders were those of whichever unit ended last,
+    /// an input written and every user resolved again twice a build, with nothing changed.
+    /// An expander that says no here leaves the crate with `held` whichever was loaded
+    /// first, so the crate's expanders are a function of the build, not of its timing.
+    fn replaces(&self, held: &dyn ProcMacroExpander) -> bool {
+        // dyn: the database's expander trait, compared when a crate's macros are set
+        !self.eq_dyn(held)
+    }
+
     /// The content ID of the code the macro runs: its library's, and the compiled module it
     /// runs in when it runs in one, which the front end's code identity does not cover. What
     /// the key of a crate that uses it covers (`hir_def::deps`, the goal store's facts). `None`
@@ -234,6 +247,13 @@ impl FromIterator<(CrateBuilderId, ProcMacroLoadResult)> for ProcMacrosBuilder {
     }
 }
 
+thread_local! {
+    /// A planted bug, for a test's control: [`ProcMacros::give`] writes a crate's list though
+    /// it is the one the crate has, as it did until 2026-11-12. Never set outside a test.
+    #[doc(hidden)]
+    pub static GIVES_EQUAL_LISTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct CrateProcMacros(StoredProcMacroLoadResult);
 
@@ -254,17 +274,47 @@ impl ProcMacros {
     /// change a crate's list once the crate graph is set. A crate's def map lists its proc
     /// macros' expanders, so one resolved before its list was given must resolve again, and a
     /// set that is not noted leaves it naming none.
-    pub fn give(db: &mut Db, given: impl IntoIterator<Item = (Crate, ProcMacroLoadResult)>) {
+    ///
+    /// The invariant: a crate given the list it has (each macro's name, kind and expander
+    /// equal: [`ProcMacroExpander::eq_dyn`], which for a built macro is the code it runs),
+    /// or one that does not replace it ([`ProcMacroExpander::replaces`]: the same code built
+    /// another way, by another unit of the crate), is given nothing: no input is written, nothing is noted, no def map resolves again.
+    /// Whether any crate's list changed is returned. A build loads every proc macro's
+    /// expanders again (its unit's record replayed); until 2026-11-12 each load set the
+    /// whole map at `HIGH` and noted its crate, so a build of reth with nothing changed
+    /// wrote 53 inputs and verified every row of the database.
+    pub fn give(
+        db: &mut Db,
+        given: impl IntoIterator<Item = (Crate, ProcMacroLoadResult)>,
+    ) -> bool {
         db.batch(base_db::Trigger::named("ProcMacros::give"), |db| {
             let all = ProcMacros::try_get(db)
                 .unwrap_or_else(|| ProcMacros::new(db, Durability::HIGH, Default::default()));
+            // alloc: the crates whose list is another, none when every one is given what it has
+            let mut changed: Vec<(Crate, Arc<CrateProcMacros>)> = Vec::new();
+            {
+                let held = all.by_crate(db);
+                for (krate, macros) in given {
+                    let macros = CrateProcMacros::new(macros);
+                    if held.get(&krate).is_some_and(|it| !macros.replaces(it))
+                        && !GIVES_EQUAL_LISTS.get()
+                    {
+                        continue;
+                    }
+                    changed.push((krate, Arc::new(macros))); // alloc: once per crate, when its proc macros are loaded
+                }
+            }
+            if changed.is_empty() {
+                return false;
+            }
             let mut by_crate = all.by_crate(db).clone();
-            for (krate, macros) in given {
-                by_crate.insert(krate, Arc::new(CrateProcMacros::new(macros))); // alloc: once per crate, when its proc macros are loaded
+            for (krate, macros) in changed {
+                by_crate.insert(krate, macros);
                 db.note_proc_macros(krate);
             }
             all.set_by_crate(db).with_durability(Durability::HIGH).to(by_crate);
-        });
+            true
+        })
     }
 }
 
@@ -280,6 +330,21 @@ impl ProcMacros {
 impl CrateProcMacros {
     pub fn new(macros: ProcMacroLoadResult) -> Self {
         CrateProcMacros(macros.map(Vec::into_boxed_slice))
+    }
+
+    /// Whether this list, loaded for a crate that has `held`, takes its place: when they are
+    /// not equal, unless both loaded the same macros (each one's name, kind and whether it
+    /// is disabled) and no expander of this one replaces the one `held` has for it
+    /// ([`ProcMacroExpander::replaces`]).
+    fn replaces(&self, held: &CrateProcMacros) -> bool {
+        let (Ok(new), Ok(old)) = (&self.0, &held.0) else { return self != held };
+        new.len() != old.len()
+            || new.iter().zip(old.iter()).any(|(new, old)| {
+                new.name != old.name
+                    || new.kind != old.kind
+                    || new.disabled != old.disabled
+                    || new.expander.replaces(&*old.expander)
+            })
     }
 
     /// The macros of the crate, when they loaded.

@@ -281,6 +281,10 @@ pub(crate) enum Plant {
     /// The reach stops at the readers of what was written and said ([`reach`]'s closure
     /// taken out): a row behind a row that is behind is taken as unreached.
     ReachesOneLevel,
+    /// A set of the value an input field already holds opens a view, as every set did until
+    /// 2026-11-12: a request that changes nothing then verifies every row of the field's
+    /// durability or below.
+    EqualSetsWrite,
 }
 
 /// The storage's part of the changed set.
@@ -401,6 +405,12 @@ impl Storage {
     #[doc(hidden)]
     pub fn plant_forgotten_readers_of_written(&mut self) {
         self.frontier.plant = Plant::ForgetsReadersOfWritten;
+    }
+
+    /// Whether [`Plant::EqualSetsWrite`] is planted: an input's setter asks before it
+    /// compares what it is given with what it holds.
+    pub(crate) fn planted_equal_sets_write(&self) -> bool {
+        self.frontier.plant == Plant::EqualSetsWrite
     }
 
     /// An input field's node was written (with `&mut`: its setter).

@@ -383,6 +383,68 @@ impl Reads {
         self.hash(env, primary, |at, shape, _| now(&given[at], shape), |path, _| Ok(file_now(path)))
     }
 
+    /// Each read by name with the id of its value, in the order [`Reads::hash`] hashes them,
+    /// for a person: what `blaze why` and the `unit_reads` view name when a record whose key
+    /// is as it was is not found (the values `expansion` and `file` give: those the reads
+    /// had as they were made, or those they have now). An expansion is named by what its
+    /// shape reads ([`shape_said`]).
+    pub(crate) fn named_values(
+        &self,
+        env: &[(String, String)],
+        primary: &dyn Fn(&str) -> bool,
+        mut expansion: impl FnMut(usize, &[u8], Option<ContentId>) -> Result<ContentId, String>,
+        mut file: impl FnMut(&str, Option<ContentId>) -> Result<ContentId, String>,
+    ) -> Result<Vec<(String, ContentId)>, String> {
+        let var =
+            |name: &str| env.iter().find(|(it, _)| it == name).map(|(_, value)| value.as_bytes());
+        let value = |it: Option<&[u8]>| Hasher::new(DOMAIN).opt_part(it).finish();
+        // alloc: once a record filed or missed, a read each
+        let mut out = Vec::new();
+        for name in &self.names {
+            out.push((format!("the process variable {name}"), value(var(name)))); // alloc: as above
+        }
+        for manifest in &self.primary {
+            let it = match primary(manifest) {
+                true => Some(b"1".as_slice()),
+                false => var(base_db::PRIMARY_PACKAGE),
+            };
+            // alloc: as above
+            out.push((format!("CARGO_PRIMARY_PACKAGE of {manifest}"), value(it)));
+        }
+        for (at, it) in self.expansions.iter().enumerate() {
+            let of = it
+                .env
+                .iter()
+                .find(|(name, _)| name == "CARGO_MANIFEST_PATH")
+                .map_or("a crate with no CARGO_MANIFEST_PATH", |(_, path)| path.as_str());
+            for (shape, then) in &it.shapes {
+                // alloc: as above
+                let name = format!("a proc-macro expansion of {of} that read {}", shape_said(shape));
+                out.push((name, expansion(at, shape, *then)?));
+            }
+        }
+        for (path, then) in &self.files {
+            out.push((format!("the included file {path}"), file(path, *then)?)); // alloc: as above
+        }
+        Ok(out)
+    }
+
+    /// [`Reads::named_values`] with the values the reads had as they were made; an error for
+    /// reads decoded from a slot.
+    pub(crate) fn named_then(
+        &self,
+        env: &[(String, String)],
+        primary: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<(String, ContentId)>, String> {
+        let unknown = || "a record's reads read from the store, named as if made here".to_owned();
+        self.named_values(
+            env,
+            primary,
+            |_, _, then| then.ok_or_else(unknown),
+            |_, then| then.ok_or_else(unknown),
+        )
+    }
+
     /// The hash of the values `env` gives the variables, an unset one apart from every value,
     /// then `CARGO_PRIMARY_PACKAGE` of each crate that read it (`1` when `primary` says its
     /// package is primary, else the process's, as [`base_db::env_var`] reads it), then of each
@@ -421,6 +483,90 @@ impl Reads {
         }
         Ok(hasher.finish())
     }
+}
+
+/// What an expansion's shape reads, for a person: its files, listings and variables by name
+/// (the first few of each), or that it is of an expansion verified across checkouts, whose
+/// value moves when the record that retracts it is put.
+fn shape_said(shape: &[u8]) -> String {
+    const SHOWN: usize = 4;
+    const VERIFIED: &[u8] = b"blaze v2 verified expansion reads 1\0";
+    let (verified, rest) = match shape.strip_prefix(VERIFIED) {
+        Some(rest) if rest.len() >= 32 => (true, &rest[32..]),
+        _ => (false, shape),
+    };
+    let listed = |what: &str, all: Vec<String>| match all.len() {
+        0 => String::new(), // alloc: none
+        // alloc: once a read named
+        n if n > SHOWN => format!(" {what} {} and {} more;", all[..SHOWN].join(", "), n - SHOWN),
+        _ => format!(" {what} {};", all.join(", ")), // alloc: as above
+    };
+    let said = match blaze_usercode::index::Shape::decode(rest) {
+        Ok(it) => {
+            let paths = |all: &[std::path::PathBuf]| -> Vec<String> {
+                all.iter().map(|it| it.display().to_string()).collect() // alloc: as above
+            };
+            let env = it.env.iter().map(|it| it.to_string_lossy().into_owned()).collect();
+            let untraceable = it.untraceable.iter().map(|it| format!("{it:?}")).collect();
+            let all = [
+                listed("files", paths(&it.files)),
+                listed("listings", paths(&it.dirs)),
+                listed("variables", env),
+                listed("untraceable", untraceable),
+            ]
+            .concat();
+            match all.is_empty() {
+                true => "nothing by name".to_owned(), // alloc: as above
+                false => all.trim().trim_end_matches(';').to_owned(), // alloc: as above
+            }
+        }
+        // alloc: as above
+        Err(_) => format!("a shape of {} bytes that does not decode", rest.len()),
+    };
+    match verified {
+        // alloc: as above
+        true => format!("{said} (verified across checkouts: its value moves when it is retracted)"),
+        false => said,
+    }
+}
+
+/// Each slot of `base` that `get` gives with its reads named and the values they have now
+/// ([`Reads::named_values`]), as [`find`] works them out: what a record whose key is as it
+/// was and that is not found was looked for under. A slot that does not decode, or whose
+/// values can't be worked out, is an error naming it.
+pub(crate) fn looked_under<'g>(
+    base: Key,
+    env: &[(String, String)],
+    primary: &dyn Fn(&str) -> bool,
+    mut now: impl FnMut(&base_db::Env, &[u8]) -> Result<ContentId, String>,
+    mut file_now: impl FnMut(&str) -> ContentId,
+    mut get: impl FnMut(&Key) -> Option<&'g [u8]>,
+) -> Result<Vec<(u32, Vec<(String, ContentId)>)>, String> {
+    let mut out = Vec::new(); // alloc: once a miss, a slot each
+    for n in 0..SLOTS {
+        let Some(record) = get(&slot(base, n)) else { break };
+        let reads = Reads::decode(record)
+            .map_err(|why| format!("slot {n} of record key {base:?}: {why}"))?;
+        let given: Vec<base_db::Env> = (reads.expansions.iter())
+            .map(|it| {
+                let manifest = it.env.iter().find(|(name, _)| name == "CARGO_MANIFEST_PATH");
+                // clone: a crate's variables, once per slot named
+                let own: base_db::Env = it.env.iter().cloned().collect();
+                base_db::given_macro_env(&own, manifest.is_some_and(|(_, path)| primary(path)))
+                    .into_owned()
+            })
+            .collect();
+        let named = reads
+            .named_values(
+                env,
+                primary,
+                |at, shape, _| now(&given[at], shape),
+                |path, _| Ok(file_now(path)),
+            )
+            .map_err(|why| format!("slot {n} of record key {base:?}: {why}"))?;
+        out.push((n, named));
+    }
+    Ok(out)
 }
 
 /// Slot `n` of base key `base`: where the `n`th set of names its records read is kept.

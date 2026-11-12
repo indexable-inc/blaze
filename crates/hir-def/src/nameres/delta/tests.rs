@@ -1386,6 +1386,39 @@ fn the_oracle_catches_a_woken_group_whose_log_is_not_read_again() {
     ProcMacros::give(&mut loaded.db, [(pm, Ok(given))]);
 }
 
+/// The invariant: a crate given the proc macros it has is given nothing: `give` says nothing
+/// changed, no input is written (the view is the one before) and no maintainer runs, so no
+/// def map resolves again. A build loads every proc macro's expanders again; a build of reth
+/// with nothing changed wrote the map of every crate's macros 53 times, at `HIGH`.
+#[test]
+fn a_crate_given_the_macros_it_has_is_given_nothing() {
+    use hir_expand::proc_macro::ProcMacros;
+    let (mut loaded, main, pm, given) = a_macro_that_declares_a_module();
+    assert!(ProcMacros::give(&mut loaded.db, [(pm, Ok(given.clone()))]), "its first macros");
+    assert_eq!(imports_from_the_made_module(&loaded.db, main), [true, true]);
+    let (view, passes) = (blaze_query::db::Database::storage(&loaded.db).view(), loaded.db.maintain_passes());
+    assert!(!ProcMacros::give(&mut loaded.db, [(pm, Ok(given))]), "the macros it has");
+    assert_eq!(blaze_query::db::Database::storage(&loaded.db).view(), view, "an input was written");
+    assert_eq!(loaded.db.maintain_passes(), passes, "the maintainers ran");
+    assert_eq!(imports_from_the_made_module(&loaded.db, main), [true, true]);
+}
+
+/// The control of the invariant above: with `give` writing a list though it is the one the
+/// crate has, as it did until 2026-11-12, it says the crate's list changed and the
+/// maintainers run for it.
+#[test]
+fn the_oracle_catches_a_crate_given_the_macros_it_has_as_a_change() {
+    use hir_expand::proc_macro::{GIVES_EQUAL_LISTS, ProcMacros};
+    let (mut loaded, _, pm, given) = a_macro_that_declares_a_module();
+    assert!(ProcMacros::give(&mut loaded.db, [(pm, Ok(given.clone()))]));
+    let passes = loaded.db.maintain_passes();
+    GIVES_EQUAL_LISTS.set(true);
+    let changed = ProcMacros::give(&mut loaded.db, [(pm, Ok(given))]);
+    GIVES_EQUAL_LISTS.set(false);
+    assert!(changed, "planted: an equal list is given as a change");
+    assert!(loaded.db.maintain_passes() > passes, "planted: the maintainers run for it");
+}
+
 /// The expanders of the macros `names` of the proc-macro crate `pm`, in its own map: whether
 /// each is one the crate's list gave.
 fn own_expanders(db: &Db, pm: Crate, names: &[&str]) -> Vec<bool> {

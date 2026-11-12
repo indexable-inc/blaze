@@ -157,6 +157,12 @@ pub struct Expect {
     /// The most engine memos run, and proved unchanged without running.
     pub max_executed: Option<u64>,
     pub max_verified: Option<u64>,
+    /// The most writes of inputs of the query engine (`query_counts.written`): 0 for a
+    /// request that changes nothing.
+    pub max_written: Option<u64>,
+    /// The most units made whose record was not kept (`blaze why`'s `unit record` steps), so
+    /// that the next build makes them again whatever changed.
+    pub max_unkept: Option<u64>,
     /// The longest the action may take, in milliseconds: a bound a hang or a storm of
     /// retries misses, generous enough that a loaded machine does not.
     pub max_ms: Option<u64>,
@@ -184,6 +190,10 @@ pub struct Observed {
     pub records: Option<u64>,
     pub executed: Option<u64>,
     pub verified: Option<u64>,
+    /// The engine's input writes ([`Expect::max_written`]).
+    pub written: Option<u64>,
+    /// The units made whose record was not kept ([`Expect::max_unkept`]).
+    pub unkept: Option<u64>,
     pub noop: Option<bool>,
     pub link: Option<String>,
     /// Panics the daemon caught since the revision before.
@@ -331,9 +341,9 @@ fn step(word: &str, at: &str) -> Step {
 }
 
 /// Every key a revision's table may hold: another is a typo, and is refused.
-const KEYS: [&str; 22] = [
+const KEYS: [&str; 24] = [
     "action", "args", "env", "steps", "remove", "fails", "prints", "says", "redone", "redone_within", "redone_has", "reused",
-    "max_units", "max_records", "max_executed", "max_verified", "max_ms", "noop", "link", "bytes", "known", "about",
+    "max_units", "max_records", "max_executed", "max_verified", "max_written", "max_unkept", "max_ms", "noop", "link", "bytes", "known", "about",
 ];
 
 fn files(dir: &Path, under: &Path, into: &mut Vec<Change>) {
@@ -430,6 +440,8 @@ impl Test {
                     max_records: count(row, "max_records", &at),
                     max_executed: count(row, "max_executed", &at),
                     max_verified: count(row, "max_verified", &at),
+                    max_written: count(row, "max_written", &at),
+                    max_unkept: count(row, "max_unkept", &at),
                     max_ms: count(row, "max_ms", &at),
                     noop: flag(row, "noop", &at),
                     link: text(row, "link", &at),

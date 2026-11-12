@@ -42,6 +42,19 @@ pub struct Reparse {
     from: Option<(Arc<Slot>, TextEdit)>,
 }
 
+/// The same text's slot, edited from the same one, by their handles: what an input's setter
+/// compares to write nothing for an equal value. A slot made anew for an equal text is another.
+impl PartialEq for Reparse {
+    fn eq(&self, other: &Reparse) -> bool {
+        Arc::ptr_eq(&self.slot, &other.slot)
+            && match (&self.from, &other.from) {
+                (None, None) => true,
+                (Some((a, _)), Some((b, _))) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
+}
+
 /// One text of a file and the parses made of it.
 struct Slot {
     /// The text, shared with its `FileText` and its parse's tree.
