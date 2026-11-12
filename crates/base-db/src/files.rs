@@ -1187,9 +1187,11 @@ impl Files {
     }
 
     /// Whether the file on disk is what was read of it.
+    /// Asked through [`IncludedFile::content_now`]: no look at the disk while a watch vouches
+    /// for what was last read of it.
     pub fn included_is_read(&self, db: &Db, path: &AbsPath) -> bool {
         let Some(file) = self.find_included(path) else { return false };
-        *file.read(db) == self.read_included(path)
+        file.content_field(db).id() == IncludedFile::content_now(&self.on_disk(path.as_ref()))
     }
 
     /// Reads the file again, and says whether it changed. The text `include!` parses of it
