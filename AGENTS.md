@@ -130,8 +130,9 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
 47. **every-agent-has-a-task**: Every agent is started on one task (an objective id or a named piece of
     one) that says its outcome and its check; people follow tasks, not agents. Skill:
     `build-and-test`.
-48. **agents-are-a-cost**: Run every independent, large piece of the work at once, each in its own lane;
-    never an agent for a piece that is small, dependent on another, or only reading. Skill:
+48. **agents-are-a-cost**: Run every independent, large piece of the work at once, each in its own lane,
+    and start it now: a piece that can begin in parallel never waits in a list behind another; never
+    an agent for a piece that is small, dependent on another, or only reading. Skill:
     `build-and-test`.
 49. **docs-stay-small**: Keep docs few and short: the plan, the ledger, the bounds and one spec per
     unbuilt design; no lane notes, pass reports or indexes; delete a doc when it stops being true or

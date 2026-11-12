@@ -150,9 +150,18 @@ that splits into independent, large pieces is done in parallel, all of it at onc
 one lane per piece, each with its own worktree and a brief that states its outcome and check, as
 many as the work has independent pieces and the machines can build. What bounds the number is
 independence (two lanes in one file cost more than they save) and the coordinator's ability to merge
-and verify what comes back, not a fixed count.
+and verify what comes back, not a fixed count. Do not give one lane a numbered list of pieces that
+do not depend on each other: it will do the first and the rest wait unstarted for hours. When you
+write such a list, ask of each item whether it needs another item's result; each one that does not
+is its own lane, started in the same message, with its own files (`worktree-per-lane` says how lanes
+share one directory) and its own check. The same holds for you: when you say a piece is "queued",
+"next" or "when a lane frees up", and nothing it needs is missing, start it instead. What bounds the
+number of lanes is what can actually run at once (builds on the one VM, files that would collide,
+your ability to merge and check what comes back), not a count; say which of those is the limit when
+you hold something back. Review the lanes' lists when they report: a "not started" item that could
+have run beside the others is moved to a lane of its own at once.
 
-See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
+See [docs/v2/plan.md#how-the-work-is-run Andrew, 2026-11-12, on hearing that four of the five pieces of the content-keyed store were "not started" after two hours because one lane held all five in order: "mention in AGENTS.md: if something can be done in parallel, do it instead of waiting for it to start (and here do them in parallel, as you said, not started)".](../../../docs/v2/plan.md#how-the-work-is-run Andrew, 2026-11-12, on hearing that four of the five pieces of the content-keyed store were "not started" after two hours because one lane held all five in order: "mention in AGENTS.md: if something can be done in parallel, do it instead of waiting for it to start (and here do them in parallel, as you said, not started)".).
 
 <!-- End of the generated rules. Hand-written notes follow. -->
 
