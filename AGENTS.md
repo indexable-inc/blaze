@@ -174,7 +174,8 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     `perf-and-tracing`.
 61. **claims-from-evidence**: State as fact only what a tool call in this session showed (a query's
     rows, a command's output, the code read); anything else is said as a guess or as not measured,
-    never as a cause, a number or a status. Skill: `debugging`.
+    never as a cause, a number or a status; a pass counts only with proof that the check ran. Skill:
+    `debugging`.
 62. **sota-first**: Go for the state of the art right away: design the end state and build it directly,
     all its independent pieces in parallel, not a step-by-step climb through halfway versions; then
     prove it on the real targets. Skill: `changing-code`.
