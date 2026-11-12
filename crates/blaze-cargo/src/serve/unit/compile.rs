@@ -924,6 +924,51 @@ fn with_record_inputs<T>(
     then(&inputs)
 }
 
+/// The most reads of one unit's record named at once ([`say_reads`]).
+const READS_SAID: usize = 64;
+
+/// Says each read a unit's record is filed by, with the id of its value: an event a read
+/// (`a unit record's read`; fields `unit`, `when`: `filed` as the record is kept or `looked`
+/// as a record whose key is as it was is not found, `slot`, `read`, `value`), the first
+/// [`READS_SAID`] of them and how many more. The `unit_reads` view sets a build's `looked`
+/// beside the last build's `filed`: the read whose value differs is why the unit was made
+/// again, where `misses` said only `beyond` (2026-11-12: every unit a build of reth with
+/// nothing changed made again).
+fn say_reads(
+    unit: &str,
+    when: &'static str,
+    slot: Option<u32>,
+    named: Result<Vec<(String, ContentId)>, String>,
+) {
+    let named = match named {
+        Ok(it) => it,
+        Err(why) => {
+            tracing::warn!(target: "blaze", unit, when, why = %why, "a unit record's reads could not be named");
+            return;
+        }
+    };
+    for (read, value) in named.iter().take(READS_SAID) {
+        tracing::info!(
+            target: "blaze",
+            unit,
+            when,
+            slot = slot.map_or(-1, i64::from),
+            read = %read,
+            value = %format_args!("{:x}", value),
+            "a unit record's read"
+        );
+    }
+    if named.len() > READS_SAID {
+        tracing::info!(
+            target: "blaze",
+            unit,
+            when,
+            more = named.len() - READS_SAID,
+            "a unit record's reads past the first 64 are not named"
+        );
+    }
+}
+
 /// The step a unit's record that is not kept is under in `blaze why`: the unit is made again
 /// in every build until the reason goes.
 pub(crate) const UNKEPT_STEP: &str = "unit record";
@@ -1044,10 +1089,40 @@ fn missed(job: &Job, reader: &UnitReader, unit: usize) -> blaze_kernel::Miss {
         .map_err(|error| error.what)?;
         // In place of its crate's identity as one part: what that identity is made of, so the
         // file, setting or dependency that changed is the one named.
-        parts.extend(identity_named(job, unit, reader.identity_parts(unit)?)?);
+        parts.extend(identity_named(job, unit, reader.identity_parts(unit, identity)?)?);
+        // And what its narrow key, under which its record is looked up first, holds of each
+        // crate of its closure: a part of none of its whole key's hashes, named so that a
+        // narrowed identity that moved alone is the part that changed.
+        parts.extend(
+            reader
+                .narrow_parts(unit)
+                .into_iter()
+                .map(|(name, id)| blaze_kernel::Part::new(name, Some(id))),
+        );
         if key != looked {
             // alloc: once a miss
             return Err("its inputs changed between its record's lookup and now (a profile it reads was rewritten during the build), so its parts would not describe the key it missed under".to_owned());
+        }
+        // What the record was looked for under past its key: each slot's reads with the
+        // values they have now, said for the `unit_reads` view.
+        {
+            let guard = blaze_cas::enter();
+            let slots = reads::looked_under(
+                looked,
+                &job.input.config.invocation.env,
+                &|manifest| job.units().is_primary_manifest(manifest),
+                |env, shape| job.input.macros.keeps().reads_now(env, shape),
+                |path| base_db::IncludedFile::content_now(std::path::Path::new(path)),
+                |slot| job.input.store.get(&guard, slot).ok().flatten().map(|it| it.bytes),
+            );
+            match slots {
+                Ok(slots) => {
+                    for (slot, named) in slots {
+                        say_reads(&item, "looked", Some(slot), Ok(named));
+                    }
+                }
+                Err(why) => say_reads(&item, "looked", None, Err(why)),
+            }
         }
         let mut miss = Miss::of_parts("unit", subject, item.clone(), key.0, parts); // clone: once a miss
         miss.beyond = Some(FILED_BEYOND);
@@ -2948,7 +3023,11 @@ fn store(
     };
     // A unit made whose record is not kept is made again in every build, and the next build's
     // miss finds its key as it was: say so here, where the reason is known (rules 3 and 19).
-    if filing.is_none() && key.is_some() && !script::pure::built_nothing(job, unit) {
+    // (`key` is none already when its reads are not known.)
+    if filing.is_none()
+        && (key.is_some() || read.is_err())
+        && !script::pure::built_nothing(job, unit)
+    {
         let why = match &read {
             Err(why) => why.clone(), // clone: once per unit whose record is not kept
             // alloc: as above
@@ -2958,6 +3037,14 @@ fn store(
             ),
         };
         compiled.misses.push(unkept(job, u, why));
+    }
+    if let (Some(_), Ok(read)) = (&filing, &read)
+        && !read.is_empty()
+    {
+        let named = read.named_then(&job.input.config.invocation.env, &|manifest| {
+            job.units().is_primary_manifest(manifest)
+        });
+        say_reads(&span_unit(u), "filed", None, named);
     }
     if let Some(reads::Filing { key, slot }) = filing {
         let record = RecordRef {

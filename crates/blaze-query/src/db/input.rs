@@ -364,8 +364,10 @@ impl<I: Input, T: PartialEq> Setter for InputSetter<'_, I, T> {
             let fields = unsafe { (*row.fields.get()).assume_init_mut() };
             let held = (self.at)(fields);
             if *held == value {
-                // The value given is returned as the old one: it is equal to it.
-                return value;
+                // The field takes the value given and the one it held is returned, as a
+                // write does (a caller that takes a value out to edit it in place and set
+                // it back gets the very one it set): equal, so nothing that read it differs.
+                return std::mem::replace(held, value);
             }
         }
         let view = self.storage.new_view(old.max(durability), input_bits(node));

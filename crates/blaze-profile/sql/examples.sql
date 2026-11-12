@@ -1180,6 +1180,34 @@ WHERE (calls.on_thread LIKE $thread
 ORDER BY calls.began_ns, calls.seen_as
 LIMIT $limit
 
+-- name: unit_reads
+-- says: why a unit whose record key is as it was (`misses.cause` `beyond`) was made again: each read its record is filed by past its key (a process variable `env!` read, a file `include!` read outside every source root, what a proc-macro expansion read) whose value when the build looked its record up (`looked`) is not the value the last build that kept the record filed it under (`filed`, in build `filed_in`); a read with no `filed` was in no record kept before, and one unit with every read listed and none filed had no record kept at all (`misses` of step `unit record` says why). Events `a unit record's read` (blaze-cargo's `serve/unit/compile.rs`, `say_reads`)
+WITH said AS (
+    SELECT
+        e.build_id AS said_build,
+        max(v.value_text) FILTER (WHERE v.key = 'unit') AS unit,
+        max(v.value_text) FILTER (WHERE v.key = 'when') AS said_when,
+        max(v.value_text) FILTER (WHERE v.key = 'read') AS read,
+        max(v.value_text) FILTER (WHERE v.key = 'value') AS read_value
+    FROM events AS e
+    JOIN event_values AS v ON v.process = e.process AND v.event_id = e.event_id
+    WHERE e.build_id <= $build AND e.message = 'a unit record''s read'
+    GROUP BY e.build_id, e.process, e.event_id
+), looked AS (
+    SELECT DISTINCT unit, read, read_value FROM said WHERE said_when = 'looked' AND said_build = $build
+), filed AS (
+    SELECT unit, read, read_value, said_build,
+        row_number() OVER (PARTITION BY unit, read ORDER BY said_build DESC) AS nth
+    FROM said
+    WHERE said_when = 'filed' AND said_build < $build
+)
+SELECT looked.unit, looked.read, filed.read_value AS filed, filed.said_build AS filed_in, looked.read_value AS looked
+FROM looked
+LEFT JOIN filed ON filed.unit = looked.unit AND filed.read = looked.read AND filed.nth = 1
+WHERE filed.read_value IS DISTINCT FROM looked.read_value
+ORDER BY looked.unit, looked.read
+LIMIT $limit
+
 -- name: edit_work
 -- says: the work a build did, by stage, as each stage counted it: how many things it visited, asked of or made again, which after an edit should be the edit's size and not the program's (rule incremental-first). `engine memos` are the query engine's rows run (`executed`) and proved unchanged without running (`verified`), from `query_counts`; `changed set` is the engine's walk from what was written (`visited` rows verified, `changed` the rows whose value moved); `body check` is each unit's plan (`visited_bodies` and `visited_modules` got a task, `held_*` is the crate, `whole` counts plans that visited everything); `codegen walk` is each program's walk (`asked` functions asked of again, `described` made again, `replaced` rows of the kept lists, `whole` walks from the roots); `dependency image keys` are the keys a serve asked of the database (`asked`), those that moved (`moved`) and those made again (`computed`); `link` is each link's rows made again (`rows`) and the names and patchable functions it went over (`symbols`, `patchable`, the part that still follows the program). `total` sums a counter over the build, `times` is how many units or walks said it; a counter nothing said has no row. Events `edit work` (crates/blaze-query/src/db/edit_work.rs names the stages)
 WITH said AS (

@@ -775,8 +775,15 @@ impl UnitReader {
     pub(crate) fn identity_parts(
         &self,
         unit: usize,
+        looked: blaze_ids::ContentId,
     ) -> Result<Vec<blaze_lower::IdentityPart>, String> {
-        self.front.identity_parts(unit)
+        self.front.identity_parts(unit, looked)
+    }
+
+    /// What unit `unit`'s narrowed identity holds of each crate of its closure
+    /// ([`Lowered::narrow_parts`]), for `blaze why`.
+    pub(crate) fn narrow_parts(&self, unit: usize) -> Vec<(String, blaze_ids::ContentId)> {
+        self.front.narrow_parts(unit)
     }
 
     pub(crate) fn checks(&self) -> &blaze_diagnostics::cache::Served {
