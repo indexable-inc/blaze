@@ -178,7 +178,8 @@ Each rule below is one line; its full text, with how-to, is in the skill named a
     prove it on the real targets. Skill: `changing-code`.
 63. **record-annoyances**: Whatever slows, surprises or annoys you while working, however slightly (a
     tool's quirk, a trap in the tree, a missing command, your own repeated mistake), gets a row in
-    `docs/v2/plan/annoyances.json` when it happens, with who you are. Skill: `changing-code`.
+    `annoyances.json` (at the top of the repository) when it happens, with who you are. Skill:
+    `changing-code`.
 
 ## Code Review Rules
 
