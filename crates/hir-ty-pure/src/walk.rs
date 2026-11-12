@@ -554,27 +554,65 @@ fn step_key(body: Body, args: &StoredGenericArgs) -> u128 {
     reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
 )]
 pub(crate) fn summary_in(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Summary {
-    let Some(body) = body_of(db, &env, &instance) else { return Summary::default() };
-    match body {
+    let Def::Body(of) = instance.def else { return Summary::default() };
+    // The body is read here once and only the summary is kept: made for this run and dropped
+    // with it ([`dispatch::body_once`]), never the memo [`body_of`] reads, which would keep one
+    // monomorphized body an instance the walk reaches until the build lets every MIR go.
+    #[cfg(test)]
+    if plant::keeps_bodies() {
+        // The planted bug of the held-count test: the memoized body, as until 2026-11-12.
+        // clone: the body query's keys, reference counts
+        return match dispatch::body_of(db, env.clone(), of, instance.args.clone()) {
+            Ok(body) => summarize(&Cx::new(db, env), body, instance.def),
+            Err(error) => unlowered(db, &instance, &error),
+        };
+    }
+    match dispatch::body_once(db, &env, of, &instance.args) {
         Ok(body) => {
             let cx = Cx::new(db, env);
-            summarize(&cx, body, instance.def)
+            summarize(&cx, &body, instance.def)
         }
-        Err(error) => {
-            let what = format!("has a body that does not lower to MIR: {error:?}"); // alloc: an impure script's reason, once
-            let trust = effect_attrs::crate_trust(db, def_crate(db, instance.def));
-            let mut own = Own::trusted(trust);
-            own.add(EffectSet::one(Rule::Unchecked), &what, None, trust);
-            let (sets, witnesses) = own.into_sets();
-            Summary {
-                impure: Some(Box::new(Impure { what, through: Vec::new() })), // alloc: an impure summary's reason, kept out of line
-                kinds: EffectSet::one(Rule::Unchecked),
-                sets,
-                witnesses,
-                memory: MemoryEffects::UNKNOWN,
-                ..Summary::default()
-            }
-        }
+        Err(error) => unlowered(db, &instance, &error),
+    }
+}
+
+/// What a test plants in the walk.
+#[cfg(test)]
+pub(crate) mod plant {
+    use std::cell::Cell;
+
+    thread_local! {
+        static KEEPS_BODIES: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn keeps_bodies() -> bool {
+        KEEPS_BODIES.with(Cell::get)
+    }
+
+    /// `work` with every summary made on this thread reading its body from the memo that
+    /// keeps it.
+    pub(crate) fn keeping_bodies<R>(work: impl FnOnce() -> R) -> R {
+        KEEPS_BODIES.with(|it| it.set(true));
+        let made = work();
+        KEEPS_BODIES.with(|it| it.set(false));
+        made
+    }
+}
+
+/// The summary of an instance whose body did not lower to MIR, for `error`.
+fn unlowered(db: &Db, instance: &Instance, error: &MirLowerError<'_>) -> Summary {
+    let what = format!("has a body that does not lower to MIR: {error:?}"); // alloc: an impure script's reason, once
+    let trust = effect_attrs::crate_trust(db, def_crate(db, instance.def));
+    let mut own = Own::trusted(trust);
+    own.add(EffectSet::one(Rule::Unchecked), &what, None, trust);
+    let (sets, witnesses) = own.into_sets();
+    Summary {
+        impure: Some(Box::new(Impure { what, through: Vec::new() })), // alloc: an impure summary's reason, kept out of line
+        kinds: EffectSet::one(Rule::Unchecked),
+        sets,
+        witnesses,
+        memory: MemoryEffects::UNKNOWN,
+        ..Summary::default()
     }
 }
 

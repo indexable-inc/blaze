@@ -27,6 +27,7 @@ use hir_ty::{
     dyn_compatibility::generics_require_sized_self,
     intrinsic::{Intrinsic, UnknownIntrinsic, intrinsic_of},
     method_resolution::{NoImplMethod, is_dyn_method},
+    mir::{MirOwner, MirStage},
     next_solver::{
         DbInterner, GenericArg, GenericArgs, Region, RegionExt as _, StoredGenericArgs, TraitRef,
         Ty, TyKind, infer::InferCtxt,
@@ -88,6 +89,34 @@ pub fn body_of<'db>(
             env,
         ),
     }
+}
+
+/// [`body_of`], made for the caller and kept by nothing: the generic runtime body from its memo
+/// (one per body, whatever its instances), instantiated into a value the caller owns and drops.
+/// For a walk that reads each instance's body once and keeps only what it worked out of it (a
+/// summary): [`body_of`] keeps one monomorphized body per instance on the global heap until the
+/// build lets every MIR go, which for a walk over a program's instances is the program
+/// (tempo's cold build, 2026-11-12: 4,197,786 bodies held under one unit's codegen, the top
+/// allocation site of 18.85 GiB of `mir`). The interpreter, which runs one instance's body many
+/// times, is what [`body_of`]'s memo is for.
+///
+/// The same value as [`body_of`]'s: both instantiate the runtime body's memo by
+/// [`monomorphization::monomorphized`](super::monomorphization::monomorphized). A body that
+/// needs itself to lower is the generic memo's error ([`MirLowerError::Loop`]), as there.
+pub fn body_once<'db>(
+    db: &'db Db,
+    env: &StoredParamEnvAndCrate,
+    body: Body,
+    args: &StoredGenericArgs,
+) -> Result<MirBody<'db>, MirLowerError<'db>> {
+    let owner = match body {
+        Body::Fn(func) => MirOwner::Body(InferBodyId::from(func)),
+        Body::Closure(id) => MirOwner::Closure(InternedClosureId::from_id(id)),
+        Body::Coroutine(id) => MirOwner::Coroutine(InternedCoroutineId::from_id(id)),
+        Body::CoroutineByMove(id) => MirOwner::CoroutineByMove(InternedCoroutineId::from_id(id)),
+    };
+    let generic = db.mir(owner, MirStage::Runtime)?;
+    super::monomorphization::monomorphized(db, generic, args, env)
 }
 
 /// The body that is the `poll` of the future `ty`, when that is one of an `async` block, and
