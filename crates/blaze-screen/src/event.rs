@@ -83,6 +83,12 @@ pub struct Built {
     pub next: Option<String>,
     /// Warnings a fix exists for, which `blaze check --fix` makes.
     pub fixable: u32,
+    /// The bytes this build added to blaze's state (store, build directory, image) and the
+    /// total, as the daemon counts what it wrote (never a walk of the home); and the free
+    /// space of the volume they are on.
+    pub store_delta_bytes: Option<u64>,
+    pub store_bytes: Option<u64>,
+    pub volume_free_bytes: Option<u64>,
     /// The build's why is still to come ([`Event::Why`]): its line waits for it.
     pub why_follows: bool,
     /// Tests run after it (`test`): the region stays for them.

@@ -65,6 +65,12 @@ pub struct Options {
     pub footer_after_ms: u64,
 }
 
+/// A build that added at least this much to blaze's state says so on its line.
+pub const CACHE_NOTABLE_BYTES: u64 = 100_000_000;
+
+/// A volume with less than this free is said, with the command that frees space.
+pub const VOLUME_LOW_BYTES: u64 = 20_000_000_000;
+
 /// [`Options::footer_after_ms`] unless set: a run of a second or more.
 pub const FOOTER_AFTER_MS: u64 = 1000;
 
@@ -749,6 +755,23 @@ impl Screen {
                 }
             }
         }
+        if let Some(free) = built.volume_free_bytes
+            && free < VOLUME_LOW_BYTES
+            && self.caps.live
+            && !quiet
+        {
+            let mut line = Line::new()
+                .with(Role::Warned, format!("{} ", self.glyph("⚠", "!"))) // alloc: a line, once
+                .with(Role::Number, text::size(free))
+                .with(Role::Plain, " free on the volume blaze builds on");
+            if let Some(total) = built.store_bytes {
+                line.push(Role::Plain, format!(", {} of it blaze's", text::size(total))); // alloc: as above
+            }
+            line.push(Role::Dim, format!(" {} ", self.dot())); // alloc: as above
+            line.push(Role::Command, "blaze cache gc");
+            line.push(Role::Dim, " frees space");
+            self.above.push(line); // alloc: as above
+        }
         if !quiet && built.fixable > 0 {
             let line = match self.caps.live {
                 true => Line::new()
@@ -866,6 +889,14 @@ impl Screen {
             line.push(Role::Dim, format!(" {dot} ")); // alloc: as above
             line.push(Role::Command, next.clone()); // clone: as above
             line.push(Role::Dim, " says why");
+        }
+        // What the build added to blaze's state, only when it is much; never for a `run`.
+        if let Some(added) = built.store_delta_bytes
+            && added >= CACHE_NOTABLE_BYTES
+            && self.opts.command != Command::Run
+        {
+            let total = built.store_bytes.map_or(String::new(), |it| format!(" ({})", text::size(it))); // alloc: as above
+            line.push(Role::Dim, format!(" {dot} +{} cache{total}", text::size(added))); // alloc: as above
         }
         // Where the program is, for a command that does not run it.
         if matches!(self.opts.command, Command::Build | Command::Other)
@@ -1009,6 +1040,12 @@ impl Screen {
         }
         if let Some(size) = built.size_bytes {
             line.push_str(&format!(" size_bytes={size}")); // alloc: as above
+        }
+        if let Some(added) = built.store_delta_bytes {
+            line.push_str(&format!(" store_delta_bytes={added}")); // alloc: as above
+        }
+        if let Some(total) = built.store_bytes {
+            line.push_str(&format!(" store_bytes={total}")); // alloc: as above
         }
         if let Some(next) = &built.next {
             line.push_str(&format!(" next={}", text::value(next))); // alloc: as above
