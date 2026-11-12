@@ -1290,6 +1290,18 @@
    "workaround": "none before the fix",
    "fix": "fixed for the scope (UnitOf::primary, commit a0a553886 on bstd-builds-1112); the two wrong fixes are still wrong and would show with `--fix -p blaze-sys` and `--fix -p quinn-proto`: a what-if error should name the suggestion that caused it (lint and span), which the fixer can find by bisecting the ops",
    "state": "fixed for the scope with a0a553886; the wrong fixes open"
+  },
+  {
+   "id": "bstd-7",
+   "date": "2026-11-12",
+   "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-builds-1112",
+   "where": "blaze-lints, `blaze::unmarked_*`'s fix",
+   "what": "`blaze check --fix` wrote `    #[blaze::nopanic]` and then the function at column 0 for every method with no doc comment above it (331 in bstd), and I committed the first two passes before reading a raw hunk: my summary of the diff stripped leading whitespace, so the damage showed as identical removed and added lines.",
+   "cost": "a repair script, a lint fix and one more round of the shared build",
+   "cause": "a function is linted by its body's anchor, whose text starts at the function, so the line's indentation is not in the text the fix reads (`Cx::text`); nothing formats or checks the layout of what `--fix` writes",
+   "workaround": "the fix reads the closing brace's line when the function starts the text (commit on bstd-builds-1112); bstd reindented by script",
+   "fix": "`BodySyntax` says its anchor's column (and compares it), so every fix that writes a new line can indent it; `--fix` runs `blaze fmt` on the lines it wrote, or the what-if refuses a suggestion that leaves a file unformatted where it was formatted",
+   "state": "open: the lint is fixed, the anchor's column is not there"
   }
  ]
 }
