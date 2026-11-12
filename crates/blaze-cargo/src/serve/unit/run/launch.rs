@@ -392,12 +392,22 @@ fn serve(conn: Conn, mut socket: UnixStream, programs: &SharedMap<[u8; 32], Arc<
         let said = {
             let mut core = held.core.lock();
             let mut out = Vec::new(); // alloc: the frames of one answer
-            core.program.said(conn, &message, &mut out).map(|()| {
+            let said = core.program.said(conn, &message, &mut out).map(|()| {
                 if !out.is_empty() {
                     // Queued under the lock: in the order the core decided.
                     drop(send.send(out));
                 }
-            })
+            });
+            // A start that could not be made one message is the same start, slower: said
+            // where what was slow is read.
+            if let Some(why) = core.program.unimaged() {
+                tracing::warn!(
+                    target: "blaze",
+                    "{}: its launchers are sent its start as records, not as an image of placed code: {why}",
+                    held.path
+                );
+            }
+            said
         };
         if let Err(why) = said {
             break Err(why);

@@ -229,6 +229,19 @@ impl Launcher {
             }
             Tell::Refused { slot, diagnostic } => panic!("slot {} refused: {diagnostic}", slot.0),
             Tell::Unheld { why } => panic!("unheld: {why}"),
+            // Its whole start in one message: the slots declared, the bodies bound, started.
+            Tell::Image { bytes } => {
+                let image = blaze_launch::image::Image::decode(bytes).expect("an image of placed code");
+                assert_eq!(self.declared, 0, "an image is sent to a launcher that has declared nothing");
+                self.declared = image.slots;
+                self.bound.resize(image.slots as usize, None);
+                for body in &image.bodies {
+                    assert!(body.slot.0 < self.declared, "an image binds a slot it does not declare");
+                    // A bind's code identity is its record's id (`Program::edit`).
+                    self.bound[body.slot.0 as usize] = Some(RecordId(body.code.0));
+                }
+                self.started = true;
+            }
             Tell::Probe { .. } => panic!("a probe, which this daemon does not send"),
         }
         drop(self.inbound.drain(..took));
@@ -626,4 +639,87 @@ fn a_record_names_callees_by_place_and_carries_its_positions_as_data() {
     bad.relocs = Relocs::from_iter([reloc(0, RelocKind::TlsGd32, Target::Function(callee))]);
     let refused = record::function(&bad, "hello::main", &build).unwrap_err();
     assert!(refused.contains("`hello::main`") && refused.contains("TlsGd32"), "{refused}");
+}
+
+/// Three launchers of one build: a first run that calls the entry and what it calls, then
+/// the first launcher of the answer for that set, which is sent the frames, then the second,
+/// which is sent one message. Gives the last two, and whether the program had an image.
+fn framed_and_imaged(plant: Plant) -> (Launcher, Launcher, Option<String>) {
+    let mut program = Program::new();
+    program.plant = plant;
+    let source = Source { bodies: vec![1, 1, 1], statics: vec![7, 7] };
+    program.built(&build(&source, &[]), "main", Tables::Whole(&[])).expect("built");
+    let connect = |program: &mut Program, conn: u64| {
+        program.connected(Conn(conn));
+        let mut launcher = Launcher { conn, ..Launcher::default() };
+        launcher.say(&Ask::Hello {
+            program: ProgramId([0; 32]),
+            pid: 1,
+            arch: wire::Arch::Aarch64,
+            os: wire::Os::Linux,
+            page: 4096,
+        });
+        launcher
+    };
+    // The daemon hears everything the launcher said; the launcher reads everything it was sent.
+    let settle = |program: &mut Program, launcher: &mut Launcher| {
+        loop {
+            let mut moved = launcher.step();
+            if let Some(message) = launcher.outbound.pop_front() {
+                let mut out = Vec::new();
+                program.said(Conn(launcher.conn), &message, &mut out).expect("heard");
+                launcher.inbound.extend(out);
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+    };
+    let mut first = connect(&mut program, 1);
+    settle(&mut program, &mut first);
+    for slot in [0, 1] {
+        first.waiting.push(slot);
+        first.say(&Ask::Need { slot: Slot(slot), thread: Thread(1) });
+        settle(&mut program, &mut first);
+    }
+    assert!(first.waiting.is_empty());
+    let mut framed = connect(&mut program, 2);
+    settle(&mut program, &mut framed);
+    assert!(framed.started && framed.bound[0].is_some() && framed.bound[1].is_some());
+    let mut imaged = connect(&mut program, 3);
+    let hello = imaged.outbound.pop_front().expect("its hello");
+    let mut out = Vec::new();
+    program.said(Conn(3), &hello, &mut out).expect("heard");
+    let unimaged = program.unimaged();
+    if unimaged.is_none() {
+        let (item, took) = wire::split(&out).expect("a frame").expect("a whole frame");
+        assert_eq!(took, out.len(), "one message");
+        assert!(matches!(Tell::decode(item), Ok((_, Tell::Image { .. }))));
+    }
+    imaged.inbound.extend(out);
+    settle(&mut program, &mut imaged);
+    (framed, imaged, unimaged)
+}
+
+/// The refinement: a launcher started from the image is the launcher started from the frames.
+/// The second launcher of an answer is sent one message, an image of placed code, and holds
+/// what the first, sent the frames, holds: the same slots declared, the same record in each
+/// bound slot, the program started.
+#[test]
+fn a_second_launcher_of_an_answer_starts_from_an_image_and_is_bound_as_the_first() {
+    let (framed, imaged, unimaged) = framed_and_imaged(Plant::None);
+    assert_eq!(unimaged, None, "the program's start has an image");
+    assert!(imaged.started);
+    assert_eq!(imaged.declared, framed.declared);
+    assert_eq!(imaged.bound, framed.bound);
+}
+
+/// A control of [`a_second_launcher_of_an_answer_starts_from_an_image_and_is_bound_as_the_first`]:
+/// an image that leaves out a body its frames bind is caught by the bound slots.
+#[test]
+fn the_oracle_catches_an_image_that_binds_less_than_the_frames() {
+    let (framed, imaged, unimaged) = framed_and_imaged(Plant::ShortImage);
+    assert_eq!(unimaged, None);
+    assert_ne!(imaged.bound, framed.bound);
 }

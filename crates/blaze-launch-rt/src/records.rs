@@ -25,6 +25,7 @@
 use std::collections::BTreeMap;
 use std::ffi::CString;
 
+use blaze_launch::image::{Bases, Image, StaticAt};
 use blaze_launch::place::{self, Bound};
 use blaze_launch::record::{Place as Named, Record, What};
 use blaze_launch::wire::{self, Arch, RecordId};
@@ -81,16 +82,7 @@ pub struct Loaded {
     bodies: BTreeMap<u64, Body>,
     /// One datum's or static's bytes on their way into the data mapping.
     scratch: Vec<u8>,
-    /// Where the program's backtraces find the names of placed code (`symbols`): made when
-    /// the first body is placed, which is when the code mapping's address is first told.
-    symbols: Names,
 }
-
-#[cfg(target_os = "linux")]
-type Names = Option<crate::symbols::Symbols>;
-/// Not built on macOS: its standard library asks dyld's image list (`symbols`).
-#[cfg(not(target_os = "linux"))]
-type Names = ();
 
 // SAFETY: the raw pointers in `statics` are to `tls::Var`s this value leaked: plain data
 // that lives as long as the process and is never written again, so they may be read from
@@ -122,7 +114,6 @@ impl Loaded {
             thread_locals: 0,
             bodies: BTreeMap::new(),
             scratch: Vec::new(), // alloc: as above
-            symbols: Names::default(),
         })
     }
 
@@ -387,7 +378,7 @@ impl Records for Loaded {
         at: Place,
         into: &mut Vec<u8>,
     ) -> Result<(), String> {
-        let Loaded { held, data, placed, statics, externs, bodies, scratch, symbols, .. } = self;
+        let Loaded { held, data, placed, statics, externs, bodies, scratch, .. } = self;
         let record = Loaded::held(held, &bind.record)?;
         let pool = place::pool(&record, KEPT).map_err(|why| format!("`{}`: {why}", record.name))?;
         if pool.len != bind.len {
@@ -420,16 +411,9 @@ impl Records for Loaded {
             }
         };
         // Named before it is placed: a backtrace can only ask once a thread is in it.
+        // Not on macOS: its standard library asks dyld's image list (`symbols`).
         #[cfg(target_os = "linux")]
-        {
-            let symbols = match symbols {
-                Some(symbols) => symbols,
-                none => none.insert(crate::symbols::Symbols::new(at.words as usize, crate::drive::REACH as usize)?),
-            };
-            symbols.add(at.at - at.words, bind.len, record.name)?;
-        }
-        #[cfg(not(target_os = "linux"))]
-        let () = *symbols;
+        crate::symbols::add(at.words as usize, crate::drive::REACH as usize, at.at - at.words, bind.len, record.name);
         let body = Body { len: bind.len, name: record.name.into(), frame, registered: false };
         bodies.insert(at.at, body);
         Ok(())
@@ -462,6 +446,90 @@ impl Records for Loaded {
             Some(Static::At(address)) => Some(address as usize),
             Some(Static::Tls(_)) | None => None,
         }
+    }
+
+    fn image(&mut self, image: &mut Image, place: Place, area: u64) -> Result<(), String> {
+        let Loaded { held, data, placed, statics, externs, thread_locals, bodies, .. } = self;
+        if data.used() != 0 || !statics.is_empty() || !bodies.is_empty() || !held.is_empty() {
+            return Err("these records hold a program already: an image is a launcher's start".to_owned()); // alloc: an error
+        }
+        // The data's bytes are the mapping's first: an offset in the image is an offset here.
+        let base = data
+            .reserve(image.data.len(), 1)
+            .map_err(|why| format!("the image's data: {why}"))?;
+        if base != data.base() {
+            // alloc: an error
+            return Err(format!("the image's data was given {base:#x}, which is not the mapping's first byte"));
+        }
+        // alloc (each list below): once a process, for the length of this call
+        let mut outside = Vec::with_capacity(image.outside.len());
+        for (name, weak) in &image.outside {
+            outside.push(match (Loaded::outside(externs, name), *weak) {
+                (Some(address), _) => address,
+                (None, true) => 0,
+                (None, false) => {
+                    // alloc: an error
+                    return Err(format!(
+                        "the program names the outside symbol `{name}`, which no library of this process defines"
+                    ));
+                }
+            });
+        }
+        let mut vars: Vec<*const tls::Var> = Vec::with_capacity(image.tls.len());
+        #[cfg(not(target_arch = "aarch64"))]
+        if !image.tls.is_empty() {
+            return Err("the image has thread-local statics, and the launcher has none on this instruction set yet".to_owned()); // alloc: an error
+        }
+        for var in &image.tls {
+            tls::key().map_err(|errno| {
+                format!("pthread_key_create for the program's thread-locals failed with errno {errno}")
+            })?;
+            let (Ok(size), Ok(align), Ok(init_len)) =
+                (usize::try_from(var.size), usize::try_from(var.align), usize::try_from(var.init_len))
+            else {
+                return Err("a thread-local of the image is past the address space".to_owned()); // alloc: an error
+            };
+            // The initial bytes are the image's, in the data mapping: written below, before
+            // any code that names the static is where a thread can run it, never written
+            // again and never unmapped.
+            let init = match init_len {
+                0 => core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const(),
+                _ => (base + var.init as usize) as *const u8,
+            };
+            // alloc: one `Var` a thread-local static, leaked: threads read it for as long
+            // as the process runs.
+            let var = Box::leak(Box::new(tls::Var { index: *thread_locals, size, align, init, init_len }));
+            *thread_locals += 1;
+            vars.push(var);
+        }
+        let args: Vec<u64> = vars.iter().map(|it| *it as u64).collect();
+        #[cfg(target_arch = "aarch64")]
+        let tls_thunk = tls::thunk as *const () as u64;
+        #[cfg(not(target_arch = "aarch64"))]
+        let tls_thunk = 0;
+        let bases = Bases { code: place.words, data: base as u64, outside: &outside, tls_thunk, tls: &args };
+        image.rebase(&bases).map_err(|why| why.to_string())?;
+        data.fill(base, &image.data).map_err(|why| format!("the image's data: {why}"))?;
+        for of in &image.statics {
+            statics.push(match of {
+                None => None,
+                Some(StaticAt::Data(at)) => Some(Static::At(base as u64 + at)),
+                Some(StaticAt::Tls(var)) => Some(Static::Tls(vars[*var as usize])),
+            });
+        }
+        for (id, at) in &image.datums {
+            placed.insert(*id, base as u64 + at);
+        }
+        for body in &image.bodies {
+            let frame = body.frame.map(|(entry, fde)| (base + entry as usize, fde as usize));
+            let at = area + body.at;
+            // Not on macOS: its standard library asks dyld's image list (`symbols`).
+            #[cfg(target_os = "linux")]
+            crate::symbols::add(place.words as usize, crate::drive::REACH as usize, at - place.words, body.len, &body.name);
+            // clone: the body's name, kept for the life of the body
+            bodies.insert(at, Body { len: body.len, name: body.name.clone().into(), frame, registered: false });
+        }
+        Ok(())
     }
 
     fn forget(&mut self, at: u64) {

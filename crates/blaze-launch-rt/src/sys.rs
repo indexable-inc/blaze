@@ -517,6 +517,16 @@ impl Data {
         }
     }
 
+    /// The address of the mapping's first byte.
+    pub fn base(&self) -> usize {
+        self.base.as_ptr() as usize
+    }
+
+    /// How many bytes were handed out, alignment's gaps included.
+    pub fn used(&self) -> usize {
+        self.end
+    }
+
     /// Hands out `size` bytes aligned to `align` (a power of two), zeroed, and gives their
     /// address. ENOMEM when the reservation has no room: the program is started again.
     pub fn reserve(&mut self, size: usize, align: usize) -> Result<usize, SysError> {

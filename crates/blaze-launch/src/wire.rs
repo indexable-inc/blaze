@@ -32,7 +32,7 @@ use crate::{CodeId, Slot, Thread, Tier, Txn};
 /// The version of the schema of every body. A reader of another refuses the message by name
 /// rather than guess at its fields; a launcher and a daemon of two schemas restart the
 /// program (launcher.md, section 4).
-pub const SCHEMA: u32 = 2;
+pub const SCHEMA: u32 = 3;
 
 /// The longest item a frame carries, as blaze-protocol's.
 pub const LONGEST_FRAME: u32 = 16 << 20;
@@ -384,6 +384,12 @@ pub enum Tell<'a> {
     /// The answer to an [`Ask::Hello`] for a program this daemon holds no code of, and why:
     /// the launcher stops, naming it.
     Unheld { why: &'a str },
+    /// The answer to an [`Ask::Hello`] in one message, for a launcher that has declared and
+    /// placed nothing: an image of placed code ([`crate::image`]), which is what a
+    /// [`Tell::Welcome`], the [`Tell::Statics`], the first [`Tell::Edit`] and the
+    /// [`Tell::Start`] of this build leave in a launcher's memory. The launcher copies it in,
+    /// moves its addresses to its own and runs the program.
+    Image { bytes: &'a [u8] },
 }
 
 impl<'a> Ask<'a> {
@@ -611,6 +617,11 @@ impl<'a> Tell<'a> {
                 to.text("why");
                 to.text(why);
             }
+            Tell::Image { bytes } => {
+                variant(to, "Image", 1);
+                to.text("bytes");
+                to.bytes(bytes);
+            }
         })
     }
 
@@ -687,6 +698,11 @@ impl<'a> Tell<'a> {
                 from.map(1, "Unheld, a map of 1")?;
                 from.key("why")?;
                 Tell::Unheld { why: from.text()? }
+            }
+            "Image" => {
+                from.map(1, "Image, a map of 1")?;
+                from.key("bytes")?;
+                Tell::Image { bytes: from.bytes()? }
             }
             _ => return Err(WireError::Variant { at: named }),
         };

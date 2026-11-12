@@ -449,9 +449,16 @@ control thread; `Command`'s children run, since nothing they call before `exec` 
   replayed, which kept every no-op `run` out of the no-op lane and, once other projects had
   been built, walked the whole program again (12 s).
 - Test binaries stay dev executables.
-- `RUST_BACKTRACE` prints no frames: std's symbolizer does not know placed code (the
-  launcher has each body's name, `Loaded::named`, and nothing asks it yet). A panic's
-  message has its file, line and column.
+- `RUST_BACKTRACE` names the program's frames on Linux (written 2026-11-12, case
+  `a_panic_under_the_launcher_names_its_frames`, not yet run): the program's
+  `dl_iterate_phdr` is the launcher's (`blaze-launch-rt/src/symbols.rs`), which reports the
+  code mapping as one more image whose file, a memfd, is an ELF symbol table of the placed
+  bodies; std's symbolizer reads it as it reads any image's. Not given: a file and a line
+  a frame (no DWARF line table is made; the panic's message has its own), a body placed
+  after the process's first backtrace (std asks for the images once and keeps the symbols
+  it parsed, so a test binary's later panics miss functions first called after its first),
+  and macOS (std there asks dyld's image list and reads Mach-O: the same idea through
+  `_dyld_image_count` and its three siblings, not written).
 - The launcher's file is not an input of the unit's record: a new blaze with another
   launcher places it only for a program it builds first.
 - x86-64: the call sequences and the placement are tested as bytes and the launcher's
@@ -571,6 +578,111 @@ The revision driver holds this: `a_body_edit_reaches_a_running_program`
 (`crates/blaze-engine/tests/revisions`; steps `start`, `await MS TEXT`, `count TIMES TEXT`,
 `end`) keeps one program running through two body edits, bounds the save-to-output time and
 counts its starts; without the switch it fails at the first `await`.
+
+## Placed code kept across runs (written 2026-11-12; not yet compiled or run)
+
+A launcher that starts is sent its statics and the functions the runs before it called,
+641 KB in 210 records for hello world, and hashes, decodes and places each: about 1.7 ms of
+the program's 2.84 ms, the same work every run of one build. All of it is a function of
+what the daemon sends. So the daemon does it once and keeps the outcome, an **image**
+(`blaze-launch/src/image.rs`):
+
+- **What it is.** The bytes of the code area from its first offset and of the program's
+  data, placed against the addresses of no process (the code mapping at 0, the data at
+  2^44); the list of their words that hold an absolute address, each with what it is an
+  address of (the code mapping, the data, an outside symbol by name, the thread-local
+  thunk, a thread-local); and the tables a launcher keeps of what it placed (each body's
+  slot, range, code identity, name and unwind entry; each datum by id; each static by
+  number). Placed code is position-independent but for those words: a body reaches a slot's
+  word, an entry thunk and its own pool relative to itself, all in the launcher's one
+  mapping, and anything else through a pool cell. `place::absolutes` names the cells; a
+  fixup relative to something outside the mapping is refused, and then there is no image.
+- **Who makes it, and where it lives.** The daemon (`blaze-launch-host`, `start_image`),
+  with the launcher's own placement code (`blaze_launch::place`, pure), from its own
+  records, when the second launcher of a kept `Hello` answer asks: the first run after a
+  build is sent the records as before and waits for no image. It lives beside the kept
+  answer, in the daemon's memory, keyed as the answer is (the build and the set of
+  functions run so far) and by the launcher's system and page size. It is not a file: a
+  launched program does not outlive its daemon's code (`Tell::Unheld`), so nothing would
+  read one. When programs replay after a daemon restart, the image becomes a store record
+  under the build's record key, the launcher binary's key and the set: the same content it
+  is now, with a key.
+- **How it reaches the launcher.** One message, `Tell::Image { bytes }` (schema 3), in
+  place of `Welcome`, the records, `Statics`, the first `Edit` and `Start`.
+- **What the launcher verifies before using it** (`Driver::image`, `Loaded::image`): the
+  layout version; its instruction set, system and page size; that the entry thunks' and
+  the area's offsets in the mapping are its own; that it has declared and placed nothing;
+  that its core hands every body the range the image has it at; that every outside symbol
+  is in the process; every offset in the image's tables against the bytes it is into
+  (`Image::decode`). It does not hash the bytes: they arrive on the socket every record
+  arrives on, from the daemon that made them from its records. Any failure stops the
+  program by name; a launcher is never sent an image and then the records.
+- **What it then does.** Declares the slots, fills the data with one copy, resolves each
+  outside symbol once, adds each mapping's address to the listed words, copies the code
+  with one write and one barrier, registers the unwind entries, and commits as an edit of
+  every body does.
+- **When there is none.** A static or datum aligned past a page, a thread-local on x86-64,
+  code relative to data, or an image past a frame's 16 MiB: the launchers of that answer
+  are sent the records, and the daemon's log says why (`Program::unimaged`). This is the
+  one place two routes lead to one state; it is in the log because the second is slower.
+
+Held to: `blaze-launch` `tests/image.rs` (the refinement: an image rebased to a process's
+addresses is byte for byte what placing the same records there gives; a control that
+leaves the outside symbols' words out; refusals of other layouts), `blaze-launch-rt`
+`tests.rs` (a launcher started from an image runs its function and holds its static; an
+image of another geometry is refused), `blaze-launch-host` `tests.rs` (the second launcher
+of an answer is bound as the first, with a planted short image). None of it has been
+compiled: this lane writes and does not run (rule 35 as of 2026-11-12).
+
+Not known, to be measured with the phase timings of branch `launch3-1111-probe`: what the
+1.7 ms was made of, and what a start from an image costs. Expected to remain, from the
+code: the launcher's own start (two threads, a 2 GiB and a 4 GiB reservation, the stub
+head), the connect and the round trip of `Hello`, about 700 KB through the socket and
+three copies of it (the reader's buffer, the frame, the area and data), one `dlsym` an
+outside symbol, one `__register_frame` a body. If the socket's copies show, the image goes
+by descriptor (a sealed memfd on Linux, passed with the message) and is copied once.
+
+## More than one changed body, and a changed signature (design; not built)
+
+Today one changed body is applied to a running program and anything else starts it again
+(`blaze-launch-host`, `Program::built`). What it takes to apply more, and one shortcut
+that looks right and is not.
+
+**The slot is a path and an ABI** (section 1). A function whose signature changes gets
+another slot: its old body stays bound in the old slot for the frames of old callers still
+on a stack, the new body is bound in a new slot, and every caller is a changed body that
+names the new slot. So with the ABI in a slot's identity, a changed signature needs no
+`Probe` and no restart: it is an added function plus its callers' body edits, switched
+together through a gate. What is then left to start again for is what it is today for a
+static (another value or type) and for the entry's own frame.
+
+**The fingerprint** is what a caller's code assumes of the callee beyond its address:
+the calling convention, each argument's and the result's passing mode, and the layout of
+every type the signature names, through references and pointers to sized types too (a
+`&Foo` argument is read by the callee at `Foo`'s offsets), closures by their captures'
+layouts, generics by their arguments. It is a fact of the front end's describe
+(`blaze_codegen::backend::Described`, made in `hir-ty-codegen`): one more field, an id,
+beside `identity`. The host then keys a slot by `subject` and that id where it keys it by
+`subject` now, and the classifier's rule "more than one body" becomes "a body whose slot
+identity is the same": every such body is rebound, together when there are several.
+`Described` and its makers are other lanes' files; this lane's part is the host's table
+and its simulation, written once the field exists.
+
+**The shortcut that is not sound.** A function's code hash takes its callees by their
+interface, so it is tempting to read the fingerprint off the hashes: "a changed body whose
+caller did not change has the interface it had". Take `g`, which builds a `Foo` and hands
+`&Foo` to `h`, which hands it on to `f`, which reads it; an edit changes `Foo`'s layout.
+`g` and `f` change (each reads the layout); `h` does not (it passes a reference). By the
+shortcut `f`'s interface is unchanged, since its caller `h` is unchanged, and the edit is
+applied live. A thread that is inside old `g` then calls, through `h`, new `f` with a
+reference to an old-layout `Foo`. Today's rule starts the program again for this edit (two
+bodies), which is right; the shortcut would not. The fingerprint must name layouts, so it
+must come from the front end.
+
+**Test binaries** (step 5 for them) wait on what lane reth-1112 reports is linked whole a
+test binary; nothing is written. What is known from this lane's files: `launch::launched`
+takes a binary's or an example's unit only, and a test binary's run goes through
+`blaze test`'s own runner, not `blaze run`'s exec of the file.
 
 ## The lazy path: the seam (design; not built)
 

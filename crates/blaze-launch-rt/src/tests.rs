@@ -524,6 +524,142 @@ fn a_stub_asks_the_daemon_and_its_caller_resumes_in_the_code_it_sent() {
     assert_eq!(call(&shared, 0), 2);
 }
 
+/// A launcher's start from an image of placed code (`blaze_launch::image`): the daemon's one
+/// message declares the slots, defines the static and binds the function, and the program's
+/// main thread is given the entry's thunk and the initializer's address. The image is made
+/// as the daemon makes it, against the addresses of no process; the function runs and the
+/// static holds its value where this process has them.
+#[test]
+fn a_launcher_starts_from_an_image_of_placed_code() {
+    use blaze_launch::image::{Bases, Input, lay};
+    use blaze_launch::record::{Record, What};
+
+    let (ours, mut daemon) = UnixStream::pair().expect("a socket pair");
+    daemon.set_read_timeout(Some(PATIENCE)).expect("a read timeout");
+    // A program's own launcher: an image is made for its mapping, not a test's small one.
+    let driver = Driver::new(Config::PROGRAM).expect("a launcher's mapping");
+    let shared = driver.shared();
+    let (ready, entry) = crossbeam_channel::bounded(1);
+    let control = std::thread::spawn(move || {
+        let mut records = crate::Loaded::new().expect("the program's data mapping");
+        let stay = |why: &str| format!("a test's launcher does not restart: {why}");
+        crate::run(driver, ours, ProgramId([7; 32]), &mut records, ready, stay).1
+    });
+    let item = next_frame(&mut daemon);
+    let Ok((_, Ask::Hello { arch, os, page, .. })) = Ask::decode(&item) else {
+        panic!("the launcher's first message is no hello");
+    };
+
+    let code = returns(7);
+    let value = 0x1122_3344_5566_7788u64.to_le_bytes();
+    let function = Record {
+        arch,
+        what: What::Code,
+        align: 16,
+        size: code.len() as u64,
+        bytes: &code,
+        fixups: List::of(&[]),
+        places: List::of(&[]),
+        data: List::of(&[]),
+        unwind: None,
+        name: "app::seven",
+    };
+    let holds = Record {
+        arch,
+        what: What::Static { mutable: false, thread_local: false },
+        align: 8,
+        size: 8,
+        bytes: &value,
+        fixups: List::of(&[]),
+        places: List::of(&[]),
+        data: List::of(&[]),
+        unwind: None,
+        name: "app::VALUE",
+    };
+    let statics = [wire::StaticDef { number: 0, record: RecordId([1; 32]), refs: List::of(&[]) }];
+    let binds = [wire::Bind {
+        slot: Slot(1),
+        record: RecordId([2; 32]),
+        code: CodeId([2; 32]),
+        tier: Tier::Zero,
+        // Its code, then its pool, which begins at a multiple of 8 and holds nothing.
+        len: (code.len() as u64).next_multiple_of(8),
+        align: 16,
+        refs: List::of(&[]),
+    }];
+    let input = Input {
+        arch,
+        os,
+        page: u64::from(page),
+        slots: 2,
+        statics: &statics,
+        binds: &binds,
+        entry: Slot(1),
+        inits: &[0],
+    };
+    let records = |id: &RecordId| match id.0[0] {
+        1 => Some(holds),
+        2 => Some(function),
+        _ => None,
+    };
+    let image = lay(&input, &records, &Bases::NONE).unwrap_or_else(|why| panic!("{why}"));
+    let mut bytes = Vec::new();
+    image.encode(&mut bytes);
+    tell(&mut daemon, 1, &Tell::Image { bytes: &bytes });
+
+    let start = entry.recv_timeout(PATIENCE).expect("the launcher answers its image").expect("the image is taken");
+    assert_eq!(start.entry, shared.thunk(Slot(1)).expect("a slot"));
+    assert_eq!(start.inits.len(), 1);
+    // SAFETY: the address the launcher gave for the static the image defines: 8 bytes of the
+    // program's data mapping, written before the launcher answered and never unmapped.
+    assert_eq!(unsafe { (start.inits[0] as *const u64).read_unaligned() }, u64::from_le_bytes(value));
+    // Slot 1 is bound to the image's body; slot 0 is declared and has no code.
+    let birth = shared.birth();
+    let caller = std::thread::spawn(move || {
+        let me = birth.begin();
+        let got = (call(me.shared(), 1), call_at(me.shared().thunk(Slot(1)).expect("a slot")));
+        me.safepoint();
+        got
+    });
+    assert_eq!(caller.join().expect("the caller ended"), (7, 7));
+    shared.stop();
+    assert_eq!(control.join().expect("the control thread ended"), Ok(()));
+}
+
+/// An image made for another mapping than this launcher's is refused by name, and the thread
+/// that waits to run the program is told why: nothing of it is used.
+#[test]
+fn an_image_of_another_geometry_is_refused() {
+    use blaze_launch::image::{Bases, Input, lay};
+
+    let (ours, mut daemon) = UnixStream::pair().expect("a socket pair");
+    daemon.set_read_timeout(Some(PATIENCE)).expect("a read timeout");
+    let driver = Driver::new(Config::PROGRAM).expect("a launcher's mapping");
+    let shared = driver.shared();
+    let (ready, entry) = crossbeam_channel::bounded(1);
+    let control = std::thread::spawn(move || {
+        let mut records = crate::Loaded::new().expect("the program's data mapping");
+        let stay = |why: &str| format!("a test's launcher does not restart: {why}");
+        crate::run(driver, ours, ProgramId([7; 32]), &mut records, ready, stay).1
+    });
+    let item = next_frame(&mut daemon);
+    let Ok((_, Ask::Hello { arch, os, page, .. })) = Ask::decode(&item) else {
+        panic!("the launcher's first message is no hello");
+    };
+    let input =
+        Input { arch, os, page: u64::from(page), slots: 1, statics: &[], binds: &[], entry: Slot(0), inits: &[] };
+    let none = |_: &RecordId| -> Option<blaze_launch::record::Record<'static>> { None };
+    let mut image = lay(&input, &none, &Bases::NONE).unwrap_or_else(|why| panic!("{why}"));
+    image.geometry.area += u64::from(page);
+    let mut bytes = Vec::new();
+    image.encode(&mut bytes);
+    tell(&mut daemon, 1, &Tell::Image { bytes: &bytes });
+    let why = entry.recv_timeout(PATIENCE).expect("the launcher answers its image").expect_err("refused");
+    assert!(why.contains("made for a mapping whose thunks are at"), "{why}");
+    shared.stop();
+    assert!(control.join().expect("the control thread ended").is_err());
+}
+
 /// A safepoint's walk of its own stack reaches the stack's end where frames keep a frame
 /// record. AArch64 only: there every frame of this test keeps one (on macOS by the ABI); on
 /// x86-64 the test's own frames keep one only when built to (`table::walk` says what the

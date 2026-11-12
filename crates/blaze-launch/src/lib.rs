@@ -13,6 +13,8 @@
 //! | [`launch`] | [`Launch`]: the slot table, the bodies, an edit staged and committed all or nothing (through a gate when its binds must switch together), and the retirement of replaced bodies by per-thread epochs |
 //! | [`record`] | one function's code or one static's value as the launcher takes it: position- and process-independent bytes with the places an address goes, by place |
 //! | [`place`] | a record made code at an address: its pool of cells, each fixup written against what its place is in this process |
+//! | [`frame`] | a placed function's unwind entry as bytes, and where its addresses are in them |
+//! | [`image`] | what a launcher's first edit leaves in its memory, made once by the daemon against the addresses of no process: the bytes, the words to move, the launcher's tables |
 //! | [`wire`] | the patch protocol between the launcher and the daemon: one versioned schema in deterministic CBOR, written and read without an allocator of its own |
 //!
 //! [`Launch`] is one sans-IO core: a synchronous state machine that maps no memory, writes no
@@ -43,6 +45,8 @@
 extern crate alloc;
 
 pub mod area;
+pub mod frame;
+pub mod image;
 pub mod launch;
 pub mod place;
 pub mod record;

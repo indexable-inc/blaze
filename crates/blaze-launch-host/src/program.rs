@@ -53,6 +53,8 @@ use blaze_codegen::{Arch, CompiledFunction, InstanceKey, StaticId};
 use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_items::CodeHash;
+use blaze_launch::image as placed;
+use blaze_launch::record::Record;
 use blaze_launch::wire::{self, Ask, List, RecordId, Tell};
 use blaze_launch::{CodeId, Slot, Tier, Txn};
 use blaze_link::Position;
@@ -215,10 +217,31 @@ struct Launcher {
 struct Welcome {
     /// `Program::builds` and `Program::needed.len()` when it was made.
     of: (u64, usize),
+    /// The system and the page size of the launcher it was made for.
+    os: wire::Os,
+    page: u32,
     frames: Vec<u8>,
     declared: u32,
     bound: Vec<Option<RecordId>>,
     statics: Vec<StaticId>,
+    /// The slots the frames bind before the program starts, in their order, and the entry's.
+    prefetch: Vec<u32>,
+    entry: u32,
+    /// The same start as one message.
+    start: Start,
+}
+
+/// A kept answer as one message, an image of placed code (`blaze_launch::image`): what the
+/// frames leave in a launcher's memory, made once and copied in by every launcher after the
+/// first. The first launcher of a build is sent the frames, so an edit's first run waits
+/// for no image; the second asks for it.
+enum Start {
+    /// No second launcher asked yet.
+    Unasked,
+    /// The frame of the `Tell::Image`.
+    Image(Vec<u8>),
+    /// There is none, and why: every launcher of this answer is sent the frames.
+    Frames,
 }
 
 /// Why the program cannot serve a launcher.
@@ -252,6 +275,9 @@ pub struct Program {
     /// bound. A second run of an unchanged program is then told a copy of bytes (the
     /// answer was 0.8 to 1.0 ms of a launcher's 3.2 ms start, measured 2026-11-12).
     welcome: Option<Welcome>,
+    /// Why the last answer has no image of placed code, until the driver takes it to say
+    /// ([`Program::unimaged`]).
+    unimaged: Option<String>,
     /// The last transaction's number, over every launcher.
     txn: u64,
     /// The last message's id.
@@ -271,6 +297,8 @@ pub(crate) enum Plant {
     NoRestart,
     /// An edit counts the slots it declares before its records name their callees.
     DeclareFirst,
+    /// An image of a start leaves out the last body its frames bind.
+    ShortImage,
 }
 
 impl Default for Program {
@@ -303,10 +331,100 @@ impl Program {
             is_needed: Vec::new(), // alloc: as above
             builds: 0,
             welcome: None,
+            unimaged: None,
             txn: 0,
             said: 0,
             plant: Plant::None,
         }
+    }
+
+    /// Why the answer to the last `Hello` could not be made one message (an image of placed
+    /// code), once: the launchers of that answer are sent its frames, which is the same
+    /// start and slower, so the driver says it where a person reads what was slow.
+    pub fn unimaged(&mut self) -> Option<String> {
+        self.unimaged.take()
+    }
+
+    /// `kept`'s start as one message: the image of what its frames place, for a launcher of
+    /// `arch`, as a `Tell::Image` frame. A refusal says what of the program an image cannot
+    /// hold (`blaze_launch::image::lay`).
+    fn start_image(&mut self, arch: wire::Arch, kept: &Welcome) -> Result<Vec<u8>, Refusal> {
+        let (statics, inits): (Vec<Made>, Vec<u32>) = match &self.image {
+            // clone: each static's record and a few numbers, once an image
+            Some(image) => (image.statics.iter().map(|it| it.1.clone()).collect(), image.inits.clone()),
+            None => return Err("no build of the program is held".to_owned()), // alloc: an error
+        };
+        // alloc (each list below): once an image
+        let mut refs: Vec<Vec<u32>> = Vec::with_capacity(statics.len() + kept.prefetch.len());
+        for made in &statics {
+            refs.push(self.refs(made)?);
+        }
+        let prefetch = match self.plant {
+            Plant::ShortImage => &kept.prefetch[..kept.prefetch.len().saturating_sub(1)],
+            _ => &kept.prefetch[..],
+        };
+        let mut functions: Vec<Arc<Made>> = Vec::with_capacity(prefetch.len());
+        for slot in prefetch {
+            let made = self.record(*slot)?;
+            refs.push(self.refs(&made)?);
+            functions.push(made);
+        }
+        // The frames gave every function these records name its slot: none is given here.
+        if self.identities.len() as u32 != kept.declared {
+            return Err(format!(
+                "the kept answer declares {} slots and its records now name {}",
+                kept.declared,
+                self.identities.len()
+            ));
+        }
+        let defs: Vec<wire::StaticDef<'_>> = statics
+            .iter()
+            .enumerate()
+            .zip(&refs)
+            .map(|((number, made), refs)| wire::StaticDef {
+                number: number as u32,
+                record: made.id,
+                refs: List::of(refs),
+            })
+            .collect();
+        let binds: Vec<wire::Bind<'_>> = prefetch
+            .iter()
+            .zip(&functions)
+            .zip(&refs[statics.len()..])
+            .map(|((slot, made), refs)| wire::Bind {
+                slot: Slot(*slot),
+                record: made.id,
+                code: CodeId(made.id.0),
+                tier: Tier::Zero,
+                len: made.len,
+                align: made.align,
+                refs: List::of(refs),
+            })
+            .collect();
+        let mut decoded: Vec<(RecordId, Record<'_>)> = Vec::with_capacity(statics.len() + functions.len());
+        for made in statics.iter().chain(functions.iter().map(|it| &**it)) {
+            let record = Record::decode(&made.bytes).map_err(|why| format!("a record of the program's: {why}"))?;
+            decoded.push((made.id, record));
+        }
+        decoded.sort_unstable_by_key(|it| it.0.0);
+        let records =
+            |id: &RecordId| decoded.binary_search_by_key(&id.0, |it| it.0.0).ok().map(|at| decoded[at].1);
+        let input = placed::Input {
+            arch,
+            os: kept.os,
+            page: u64::from(kept.page),
+            slots: kept.declared,
+            statics: &defs,
+            binds: &binds,
+            entry: Slot(kept.entry),
+            inits: &inits,
+        };
+        let image = placed::lay(&input, &records, &placed::Bases::NONE).map_err(|why| why.to_string())?;
+        let mut bytes = Vec::new();
+        image.encode(&mut bytes);
+        let mut frame = Vec::new();
+        self.frame(&Tell::Image { bytes: &bytes }, &mut frame)?;
+        Ok(frame)
     }
 
     /// How many launchers are connected.
@@ -523,7 +641,7 @@ impl Program {
             return Ok(());
         }
         match ask {
-            Ask::Hello { arch, .. } => {
+            Ask::Hello { arch, os, page, .. } => {
                 let Some(image) = &self.image else {
                     return Err("a launcher said hello and no build of its program is held".to_owned()); // alloc: an error
                 };
@@ -535,13 +653,29 @@ impl Program {
                     return Err(format!("a launcher of {arch:?} asked for a program built for {ours:?}"));
                 }
                 let of = (self.builds, self.needed.len());
-                if let Some(kept) = self.welcome.as_ref().filter(|it| it.of == of) {
-                    out.extend_from_slice(&kept.frames);
+                if self.welcome.as_ref().is_some_and(|it| it.of == of && it.os == os && it.page == page) {
+                    let Some(mut kept) = self.welcome.take() else { return Ok(()) };
+                    // A second launcher of this answer: its start as one message, made now
+                    // and kept, or why there is none.
+                    if let Start::Unasked = kept.start {
+                        kept.start = match self.start_image(arch, &kept) {
+                            Ok(frame) => Start::Image(frame),
+                            Err(why) => {
+                                self.unimaged = Some(why);
+                                Start::Frames
+                            }
+                        };
+                    }
+                    match &kept.start {
+                        Start::Image(frame) => out.extend_from_slice(frame),
+                        Start::Frames | Start::Unasked => out.extend_from_slice(&kept.frames),
+                    }
                     let launcher = &mut self.launchers[at];
                     launcher.declared = kept.declared;
                     launcher.bound = kept.bound.clone(); // clone: a launcher's own table
                     launcher.statics = kept.statics.clone(); // clone: as above
                     launcher.welcomed = true;
+                    self.welcome = Some(kept);
                     return Ok(());
                 }
                 let began = out.len();
@@ -577,6 +711,11 @@ impl Program {
                 let launcher = &self.launchers[at];
                 self.welcome = Some(Welcome {
                     of,
+                    os,
+                    page,
+                    prefetch,
+                    entry,
+                    start: Start::Unasked,
                     frames: out[began..].to_vec(), // alloc: the kept answer, once an image
                     declared: launcher.declared,
                     bound: launcher.bound.clone(),     // clone: the kept answer's table

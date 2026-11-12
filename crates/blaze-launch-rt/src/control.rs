@@ -23,6 +23,7 @@
 //! | `Refused { slot, diagnostic }` | gives the diagnostic to the threads in that slot's stub, which stop the program with it |
 //! | `Restart { txn, why }` | says `Restarting` and starts the program again in place (the caller's `restart`) |
 //! | `Probe` | not built (launcher.md, step 5): a failure that says so |
+//! | `Image { bytes }` | its whole start in one message: declares the image's slots, copies its data and its code in with their addresses moved to this process's ([`Driver::image`]), and gives the waiting thread its initializers and its entry |
 //!
 //! A failure (the socket ends, a message is not of the schema, the driver breaks) does not
 //! end the loop: program threads may still be running and reporting, and one may yet fire a
@@ -414,6 +415,18 @@ impl Control<'_> {
                 }
             }
             Tell::Unheld { why } => return Err(ControlError::Unheld { why: why.to_owned() }),
+            Tell::Image { bytes } => {
+                // The whole start in one message: what `Welcome`, `Statics`, the first `Edit`
+                // and `Start` leave, copied in.
+                let image = blaze_launch::image::Image::decode(bytes)
+                    .map_err(|why| ControlError::Store(why.to_string()))?;
+                let started = self.driver.image(image, &mut *self.records);
+                self.records.release();
+                let (entry, inits) = started?;
+                // The program's main thread waits for this; were it gone, the process is
+                // ending and there is no one to tell.
+                drop(self.ready.send(Ok(Start { entry, inits })));
+            }
             Tell::Probe { .. } => {
                 return Err(ControlError::NotBuilt { what: "Probe (launcher.md, step 5)" });
             }

@@ -114,6 +114,82 @@ pub fn pool<A: Allocator + Clone>(record: &Record<'_>, alloc: A) -> Result<Pool<
     Ok(pool)
 }
 
+/// What a word of a placed body holds that is an address as it is, 8 bytes, and so is
+/// another number in another process ([`absolutes`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Abs {
+    /// An address in the body itself: its code or its pool.
+    Own,
+    /// The address of what the record names: a function's is its entry thunk.
+    Of(To),
+    /// The launcher's thunk for thread-locals.
+    TlsThunk,
+    /// What names the thread-local static `To` is to that thunk.
+    TlsArg(To),
+}
+
+/// Every word of the body [`place`] makes of `record` that holds an absolute address: its
+/// offset in the body, and what the address is of. Everything else [`place`] writes is
+/// relative to the field, and all of it stays in the launcher's one mapping (the body, a
+/// slot's word, an entry thunk), so a body moved with that mapping differs in these words
+/// alone. A fixup relative to anything outside the mapping (a static, a datum or an outside
+/// symbol reached with no word between) is refused: such a body cannot be moved.
+pub fn absolutes<A: Allocator>(
+    record: &Record<'_>,
+    pool: &Pool<A>,
+    mut each: impl FnMut(u64, Abs),
+) -> Result<(), PlaceError> {
+    for entry in pool.entries.iter() {
+        match entry.through {
+            Through::Direct => {}
+            Through::Got => each(
+                entry.at,
+                match entry.to {
+                    To::Own => Abs::Own,
+                    to => Abs::Of(to),
+                },
+            ),
+            // The cell holds the address of the descriptor after it.
+            Through::Tlv => {
+                each(entry.at, Abs::Own);
+                each(entry.at + 8, Abs::TlsThunk);
+                each(entry.at + 16, Abs::TlsArg(entry.to));
+            }
+            Through::TlsDesc => {
+                each(entry.at, Abs::TlsThunk);
+                each(entry.at + 8, Abs::TlsArg(entry.to));
+            }
+        }
+    }
+    for fixup in record.fixups.iter() {
+        match (fixup.kind, fixup.kind.through()) {
+            (Kind::Abs64, _) => each(
+                u64::from(fixup.at),
+                match fixup.to {
+                    To::Own => Abs::Own,
+                    to => Abs::Of(to),
+                },
+            ),
+            (_, Through::Direct) => {
+                let within = match fixup.to {
+                    To::Own => true,
+                    To::Data(_) => false,
+                    To::Place(place) => {
+                        record.places.iter().nth(place as usize) == Some(Place::Function)
+                    }
+                };
+                if !within {
+                    let what = "is relative to something outside the launcher's code mapping";
+                    return Err(refuse(&fixup, what, fixup.kind as u64));
+                }
+            }
+            // Through a pool entry or a slot's word: in the mapping.
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// The address a fixup against `to` names when it names the target itself.
 fn address(
     fixup: &Fixup,

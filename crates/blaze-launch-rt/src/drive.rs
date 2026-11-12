@@ -36,6 +36,7 @@
 use core::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use blaze_launch::image::Image;
 use blaze_launch::wire;
 use blaze_launch::{
     Committed, Edit, Frame, KEPT, Kept, Launch, Placed, Slot, Target, Txn, Write,
@@ -83,6 +84,17 @@ pub trait Records {
 
     /// The address of static `number`, when it is defined and is no thread-local.
     fn static_at(&self, number: u32) -> Option<usize>;
+
+    /// The daemon's [`wire::Tell::Image`], for records that hold nothing yet: takes the
+    /// image's data, statics, thread-locals and outside symbols as its own, moves the
+    /// image's addresses to this process's ([`Image::rebase`]: `place` gives the code
+    /// mapping's, `area` the address of the code area's first byte) and keeps what it knows
+    /// of each body, as [`Records::code`] does of one. The image's code is then what the
+    /// driver copies into the area. Refused by records that are a test's table.
+    fn image(&mut self, image: &mut Image, place: Place, area: u64) -> Result<(), String> {
+        let _ = (image, place, area);
+        Err("these records take no image of placed code".to_owned()) // alloc: an error
+    }
 }
 
 /// Where a bind's code goes, and the addresses its fixups name.
@@ -147,6 +159,8 @@ pub enum Error {
     Write { during: &'static str, write: Write },
     /// An event only a control thread serves arrived where there is none.
     Unserved { what: &'static str },
+    /// An image of placed code this launcher cannot take, and why.
+    Image { why: String },
 }
 
 impl core::fmt::Display for Error {
@@ -169,6 +183,7 @@ impl core::fmt::Display for Error {
             Error::Unserved { what } => {
                 write!(f, "{what} arrived and no control thread is running to serve it")
             }
+            Error::Image { why } => write!(f, "the daemon's image of placed code: {why}"),
         }
     }
 }
@@ -400,6 +415,96 @@ impl Driver {
         };
         self.switch("commit", records).map_err(EditError::Broken)?;
         Ok(committed)
+    }
+
+    /// A launcher's whole start from an image of placed code (`blaze_launch::image`), for a
+    /// driver that has declared and placed nothing: declares the image's slots, has
+    /// `records` take its data and move its addresses to this process's, checks that the
+    /// core hands each body the range the image has it at, copies the code in with one
+    /// write, and commits as an edit of every body does. Gives the address of the entry's
+    /// thunk and of each initializer static.
+    ///
+    /// What is checked before a byte is used: the image is for this instruction set, system
+    /// and page size; the table's and the area's offsets in the mapping are this driver's;
+    /// every range is the core's. A failure leaves the process with no program to run, and
+    /// says why (rule `no-fallback`): the daemon made the image for this launcher.
+    pub fn image(&mut self, mut image: Image, records: &mut dyn Records) -> Result<(usize, Vec<usize>), Error> {
+        let refuse = |why: String| Error::Image { why };
+        let page = sys::page()?;
+        if self.core.declared() != 0 {
+            return Err(refuse(format!("{} slots are declared already: an image is a launcher's start", self.core.declared())));
+        }
+        #[cfg(target_arch = "aarch64")]
+        let arch = wire::Arch::Aarch64;
+        #[cfg(target_arch = "x86_64")]
+        let arch = wire::Arch::X86_64;
+        #[cfg(target_os = "macos")]
+        let os = wire::Os::Macos;
+        #[cfg(target_os = "linux")]
+        let os = wire::Os::Linux;
+        if (image.arch, image.os, image.page) != (arch, os, page as u64) {
+            return Err(refuse(format!(
+                "made for {:?} on {:?} in pages of {}, and this launcher is {arch:?} on {os:?} in pages of {page}",
+                image.arch, image.os, image.page
+            )));
+        }
+        let geometry = image.geometry;
+        if (geometry.thunks, geometry.thunk, geometry.area) != (self.thunks as u64, THUNK as u64, self.area as u64) {
+            return Err(refuse(format!(
+                "made for a mapping whose thunks are at {} ({} bytes each) and whose area is at {}, and this                  launcher's are at {} ({THUNK} bytes each) and {}",
+                geometry.thunks, geometry.thunk, geometry.area, self.thunks, self.area
+            )));
+        }
+        self.declare(image.slots)?;
+        let base = self.base() as u64;
+        records.image(&mut image, self.place(), base).map_err(refuse)?;
+        if !image.bodies.is_empty() {
+            // The image's own transaction: the daemon numbers its edits from 1.
+            let txn = Txn(0);
+            self.binds.clear();
+            self.binds.extend(image.bodies.iter().map(|body| blaze_launch::Bind {
+                slot: body.slot,
+                len: body.len,
+                align: u64::from(body.align),
+                tier: body.tier,
+                code: body.code,
+            }));
+            self.out.clear();
+            self.core.stage(&Edit { txn, binds: &self.binds, together: false }, &mut self.out)?;
+            for write in self.out.iter() {
+                let Write::Place { bind, range } = *write else {
+                    return Err(Error::Write { during: "stage of an image", write: *write });
+                };
+                let body = &image.bodies[bind as usize];
+                if (range.at, range.len) != (body.at, body.len) {
+                    return Err(refuse(format!(
+                        "`{}` is at {} of the area in the image ({} bytes), and this launcher's core puts it at {}                          ({} bytes)",
+                        body.name, body.at, body.len, range.at, range.len
+                    )));
+                }
+            }
+            // One write of every body, none of which a word names yet, and one barrier.
+            self.code.copy(self.area, &image.area)?;
+            self.code.settle()?;
+            for body in &image.bodies {
+                records.placed(base + body.at, body.len).map_err(refuse)?;
+            }
+            self.out.clear();
+            self.core.commit(txn, &mut self.out)?;
+            self.switch("commit of an image", records)?;
+        }
+        let Some(entry) = self.thunk(image.entry) else {
+            return Err(refuse(format!("its entry is slot {}, which is not declared", image.entry.0)));
+        };
+        // alloc: the addresses of the program's initializer statics, once a process
+        let mut inits = Vec::with_capacity(image.inits.len());
+        for number in &image.inits {
+            match records.static_at(*number) {
+                Some(address) => inits.push(address),
+                None => return Err(refuse(format!("static {number} is an initializer and has no address here"))),
+            }
+        }
+        Ok((entry, inits))
     }
 
     /// Carries out the writes of a `stage`: code and gates into ranges nothing names.

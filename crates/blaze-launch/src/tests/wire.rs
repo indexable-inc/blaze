@@ -31,6 +31,7 @@ enum Owned {
     Probe { txn: u64, slots: Vec<Slot> },
     Restart { txn: u64, why: String },
     Unheld { why: String },
+    Image { bytes: Vec<u8> },
 }
 
 /// A bind without its refs: every bind of a drawn edit shares the edit's one list.
@@ -137,6 +138,7 @@ impl Owned {
             }
             Owned::Restart { txn, why } => Message::Tell(Tell::Restart { txn: Txn(*txn), why }),
             Owned::Unheld { why } => Message::Tell(Tell::Unheld { why }),
+            Owned::Image { bytes } => Message::Tell(Tell::Image { bytes }),
         }
     }
 }
@@ -178,7 +180,8 @@ fn slots(tc: &TestCase) -> Vec<Slot> {
 }
 
 fn owned(tc: &TestCase) -> Owned {
-    match pick(tc, 15) {
+    match pick(tc, 16) {
+        16 => Owned::Image { bytes: (0..pick(tc, 300)).map(|at| at as u8).collect() },
         0 => Owned::Hello {
             program: id(tc),
             pid: number(tc),
@@ -288,7 +291,7 @@ const NEED: [u8; 43] = [
     0xa2, //
     0x64, b's', b'l', b'o', b't', 0x03, //
     0x66, b't', b'h', b'r', b'e', b'a', b'd', 0x07, //
-    0x66, b's', b'c', b'h', b'e', b'm', b'a', 0x02,
+    0x66, b's', b'c', b'h', b'e', b'm', b'a', 0x03,
 ];
 
 #[test]
@@ -297,7 +300,7 @@ fn a_need_is_these_bytes() {
     let mut out = Vec::new();
     need.encode(1, &mut out).expect("encoded");
     assert_eq!(out, NEED);
-    assert_eq!(SCHEMA, 2, "the bytes above say schema 2");
+    assert_eq!(SCHEMA, 3, "the bytes above say schema 3");
     assert_eq!(Ask::decode(&NEED[4..]), Ok((1, need)));
 }
 
