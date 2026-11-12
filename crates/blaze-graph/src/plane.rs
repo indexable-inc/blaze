@@ -2883,8 +2883,9 @@ impl<M: Memo> Plane<M> {
             // checkout's kept front end as its program's codegen waited for the units before
             // it to end, and the next edit of the first project lowered anew (13 s where an
             // edit takes 1 s; the daemon's log said "a task waits for 7.45 GiB", 2026-11-12).
-            // Memory that is short in fact is the pressure cap's and the ceiling guard's to
-            // answer, by a measure, where this is a guess.
+            // Memory that is short in fact is answered by a measure, the system's pressure
+            // signal (`PlaneInput::Cap`, and the driver's release of every kept front end as
+            // it arrives), where this is a guess.
             if memory <= by_grants && memory < ceiling {
                 self.short = memory.saturating_sub(free_at_turn).min(held_besides);
             }
