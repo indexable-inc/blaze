@@ -542,10 +542,16 @@ impl Ledger {
                 let why = why(format!("it says {len} bytes, and {} are left", body.len())); // alloc: error path
                 return Restored { ledger, records, fault: Some(Fault::Tail { keep, why }) };
             };
-            let record: Record = match cbor::from_slice(item) {
+            // alloc: a record's CBOR, once a record of a restore
+            let record = zstd::stream::decode_all(item)
+                .map_err(|error| format!("its zstd frame does not read: {error}"))
+                .and_then(|body| {
+                    cbor::from_slice::<Record>(&body).map_err(|error| format!("it does not decode: {error}"))
+                });
+            let record = match record {
                 Ok(it) => it,
                 Err(error) => {
-                    let why = why(format!("it does not decode: {error}")); // alloc: error path
+                    let why = why(error);
                     return Restored { ledger, records, fault: Some(Fault::Corrupt { why }) };
                 }
             };
@@ -1041,7 +1047,7 @@ pub fn version() -> ContentId {
     };
     let record = Record { gap: Some(1), build: 1, items: vec![last], dropped: Some(1) };
     let bytes = cbor::to_vec(&record).expect("a ledger record is plain data, which CBOR encodes");
-    Hasher::new("blaze v2 why ledger version 3").part(&bytes).part(&NAMING.to_le_bytes()).finish()
+    Hasher::new("blaze v2 why ledger version 4, records zstd").part(&bytes).part(&NAMING.to_le_bytes()).finish()
 }
 
 /// The parts whose hashes differ between `was` and `now`, by name, in name order: both are
@@ -1379,9 +1385,15 @@ fn because(ends: &[Reason], count: u64, steps_word: &str) -> (Text, (bool, &'sta
     (text, rule)
 }
 
-/// `record` framed: its length, then its deterministic CBOR.
+/// zstd's level for a record: written once a build on the history's thread.
+const LEVEL: i32 = 3;
+
+/// `record` framed: its length, then its deterministic CBOR as one zstd frame. The CBOR is
+/// subjects' paths and part names over and over: hello-world's ledger after a cold build and
+/// five edits was 15.3 MB of it, 2.3 MB as zstd (2026-11-11).
 fn frame(record: &Record) -> Vec<u8> {
     let body = cbor::to_vec(record).expect("a ledger record is plain data, which CBOR encodes");
+    let body = zstd::bulk::compress(&body, LEVEL).expect("zstd compresses any bytes into memory it allocates");
     // alloc: once a record, on the history's thread
     let mut out = Vec::with_capacity(4 + body.len());
     out.extend_from_slice(

@@ -16,8 +16,11 @@
 //!
 //! The file: [`MAGIC`], [`FORMAT`] as a `u32` LE, then one [`Recording`] in deterministic CBOR
 //! (`blaze_protocol::cbor`; every struct here declares its fields in the order of their keys'
-//! encoding, shorter names first, then bytewise). A file of another format is refused naming
-//! both formats ([`decode`]); nothing reads it as this one. Its `trace` is the recorder's last
+//! encoding, shorter names first, then bytewise) as one zstd frame (format 2; a trace is JSON
+//! of a few hundred names: the four recordings of format 1 a day's work left, 12.5 MB to
+//! 37.0 MB, are 0.48 MB to 1.78 MB at this level, 21 to 26 times smaller). A file of format 1, the same CBOR not compressed, is read as it is; one of
+//! any other format is refused naming both formats ([`decode`]); nothing reads it as this
+//! one. Its `trace` is the recorder's last
 //! [`Recording::window_ms`] as the Chrome trace `blaze debug profile` writes (ui.perfetto.dev
 //! opens it): every span with its name, item and `awaits`, every event, the CPU samples. It is
 //! bounded: a trace past [`TRACE_MOST`] is taken again over half the window until it fits, and
@@ -41,13 +44,27 @@ pub const DIR: &str = "flightrec";
 /// What every recording starts with.
 pub const MAGIC: [u8; 16] = *b"blaze flightrec\n";
 
-/// The layout of [`Recording`]. A change to any field is a new number.
-pub const FORMAT: u32 = 1;
+/// The layout of [`Recording`]. A change to any field is a new number. Format 2 is format
+/// 1's CBOR as one zstd frame.
+pub const FORMAT: u32 = 2;
+
+/// The format before zstd, still read: the CBOR as it is.
+const FORMAT_PLAIN: u32 = 1;
+
+/// zstd's level for a recording: written as the daemon goes down or stalls, once, so the
+/// level that costs tens of milliseconds for 12 MB, not the densest.
+const LEVEL: i32 = 3;
+
+/// The most bytes a recording's CBOR is taken to be when read: the trace's bound and room for
+/// the threads, so a file that claims more is refused before it is inflated.
+const BODY_MOST: usize = TRACE_MOST + (64 << 20);
 
 /// The most bytes a recording's trace holds.
 pub const TRACE_MOST: usize = 64 << 20;
 
-/// How many recordings the directory keeps, newest first.
+/// How many recordings the directory keeps, newest first: a day's work is a handful (two in
+/// the day measured 2026-11-11, four of 12 MB to 37 MB in format 1), and at format 2's size
+/// (a twentieth of that) sixteen of the largest seen are under 30 MB.
 pub const KEPT: usize = 16;
 
 /// How much of the recorder a recording takes: the stall watchdog's two minutes.
@@ -170,7 +187,7 @@ impl std::fmt::Display for Refused {
                 "it is a flight recording of format {format}, and this blaze reads format {FORMAT}: \
                  read it with the blaze that wrote it"
             ),
-            Refused::Body(why) => write!(f, "its recording of format {FORMAT} does not decode: {why}"),
+            Refused::Body(why) => write!(f, "its recording does not decode: {why}"),
         }
     }
 }
@@ -205,6 +222,8 @@ impl Recording {
     pub fn encode(&self) -> Vec<u8> {
         let body = blaze_protocol::cbor::to_vec(self)
             .expect("a flight recording is plain data, which CBOR encodes");
+        let body = zstd::bulk::compress(&body, LEVEL)
+            .expect("zstd compresses any bytes into memory it allocates");
         let mut out = Vec::with_capacity(MAGIC.len() + 4 + body.len()); // alloc: the file, once
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&FORMAT.to_le_bytes());
@@ -222,10 +241,20 @@ impl Recording {
             return Err(Refused::NotOne);
         }
         let format = u32::from_le_bytes(format.try_into().expect("four bytes"));
-        if format != FORMAT {
-            return Err(Refused::Format(format));
+        let cbor = |body: &[u8]| {
+            blaze_protocol::cbor::from_slice(body).map_err(|why| Refused::Body(why.to_string()))
+        };
+        match format {
+            FORMAT => {
+                let body = zstd::bulk::decompress(body, BODY_MOST).map_err(|why| {
+                    // alloc: an error
+                    Refused::Body(format!("its zstd frame (at most {BODY_MOST} bytes inflated): {why}"))
+                })?;
+                cbor(&body)
+            }
+            FORMAT_PLAIN => cbor(body),
+            format => Err(Refused::Format(format)),
         }
-        blaze_protocol::cbor::from_slice(body).map_err(|why| Refused::Body(why.to_string()))
     }
 
     /// Its file's name: `<pid>-<unix ms>.cbor`.
@@ -347,6 +376,8 @@ pub fn on_panic(caught: fn() -> bool) {
     // alloc: the hook, once a daemon
     std::panic::set_hook(Box::new(move |info| {
         before(info);
+        // A panic's printing is the log's largest line by far: the log is bounded after it.
+        super::log::check();
         if !caught() {
             _ = record(Why::Panic, &info.to_string(), WINDOW);
         }
@@ -404,7 +435,8 @@ mod tests {
         assert_eq!(path, state.join(DIR).join("41-1700000000000.cbor"));
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(bytes, first.encode(), "the same recording encodes to the same bytes");
-        blaze_protocol::cbor::check(&bytes[MAGIC.len() + 4..]).unwrap();
+        let body = zstd::bulk::decompress(&bytes[MAGIC.len() + 4..], BODY_MOST).unwrap();
+        blaze_protocol::cbor::check(&body).unwrap();
         assert_eq!(Recording::decode(&bytes).unwrap(), first);
 
         let newest = write(&state, &second).unwrap();
@@ -419,17 +451,55 @@ mod tests {
     #[test]
     fn a_file_of_another_format_is_refused_naming_both() {
         let mut old = recording(41, 1).encode();
-        old[MAGIC.len()..MAGIC.len() + 4].copy_from_slice(&(FORMAT - 1).to_le_bytes());
+        old[MAGIC.len()..MAGIC.len() + 4].copy_from_slice(&0u32.to_le_bytes());
         let refused = Recording::decode(&old).unwrap_err();
-        assert_eq!(refused, Refused::Format(FORMAT - 1));
+        assert_eq!(refused, Refused::Format(0));
         let said = refused.to_string();
-        assert!(said.contains("format 0") && said.contains("reads format 1"), "{said}");
+        assert!(said.contains("format 0") && said.contains("reads format 2"), "{said}");
+        let mut newer = recording(41, 1).encode();
+        newer[MAGIC.len()..MAGIC.len() + 4].copy_from_slice(&(FORMAT + 1).to_le_bytes());
+        assert_eq!(Recording::decode(&newer), Err(Refused::Format(FORMAT + 1)));
 
         assert_eq!(Recording::decode(b"{\"traceEvents\":[]}"), Err(Refused::NotOne));
         assert_eq!(Recording::decode(b"short"), Err(Refused::NotOne));
         let whole = recording(41, 1).encode();
         let cut = &whole[..whole.len() - 3];
         assert!(matches!(Recording::decode(cut), Err(Refused::Body(_))));
+    }
+
+    /// A file of the previous layout is read: format 1, the CBOR not compressed, as blaze
+    /// wrote it until 2026-11-11, decodes to the recording format 2's file does.
+    #[test]
+    fn a_file_of_format_1_reads_as_the_recording_it_is() {
+        let recording = recording(41, 9);
+        let mut plain = MAGIC.to_vec();
+        plain.extend_from_slice(&FORMAT_PLAIN.to_le_bytes());
+        plain.extend_from_slice(&blaze_protocol::cbor::to_vec(&recording).unwrap());
+        assert_eq!(Recording::decode(&plain), Ok(recording.clone()));
+        assert_eq!(Recording::decode(&recording.encode()), Ok(recording));
+    }
+
+    /// What format 2 is for: a trace the size the daemon's was (12 MB of Chrome trace events,
+    /// a few hundred distinct names) is a file under a quarter of it, and reads back equal.
+    /// The timestamps and durations here are a generator's, with none of a real trace's
+    /// order: real recordings are 21 to 26 times smaller (the module's note).
+    #[test]
+    fn a_trace_of_12_mb_is_a_file_under_a_quarter_of_it() {
+        let mut trace = String::from("{\"traceEvents\":[");
+        let mut at = 0u64;
+        while trace.len() < 12 << 20 {
+            // A cheap generator, so durations and timestamps are not all alike.
+            at = at.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            trace.push_str(&format!(
+                "{{\"name\":\"query {}\",\"ph\":\"X\",\"pid\":1,\"tid\":{},\"ts\":{},\"dur\":{},\"args\":{{\"item\":\"crate::module_{}::function_{}\"}}}},",
+                at >> 56, (at >> 40) % 26, at >> 24, (at >> 8) % 100_000, (at >> 50) % 64, (at >> 44) % 512,
+            ));
+        }
+        trace.push_str("]}");
+        let recording = Recording { trace: trace.into_bytes(), ..recording(41, 9) };
+        let file = recording.encode();
+        assert!(file.len() * 4 < recording.trace.len(), "{} bytes of {}", file.len(), recording.trace.len());
+        assert_eq!(Recording::decode(&file), Ok(recording));
     }
 
     /// The directory is bounded: past [`KEPT`] recordings the oldest go, whichever process

@@ -60,9 +60,27 @@ several readers.
     file's; `blaze slow` still reads every file, as its recorder counts take the last counter
     before the build.
 
-    **The cap.** Past `history::CAP_BYTES` the history deletes its oldest builds whole, every
-    table of a build at once, never one table of a build; files of no build (an idle daemon's
-    flushes) go one at a time. A flush is named for the highest build of its rows, so while
+    **The cap.** Past `history::CAP_BYTES` (256 MiB; `BLAZE_PROFILE_CAP_MB` in the daemon's
+    environment sets another, and 4096 is what it was until 2026-11-11) the history first
+    deletes its files of no build (what a daemon wrote between builds), oldest first, and only
+    then its oldest builds whole, every table of a build at once, never one table of a build:
+    a daemon left idle never writes a build's rows out of the history while rows of no build
+    are left to go. Hello-world's cold build is 18 MiB and an edit 0.3 MiB, so the default
+    holds a small project's cold build and several hundred edits, and of a large workspace its
+    newest builds.
+
+    **Between builds.** What a default profile records while no build runs is lean
+    (2026-11-11: an idle daemon wrote 1.2 MB a minute, now 0.15 MB). A thread blocked inside
+    a span of no build is not sampled while no build runs (`sampler::samples_blocked`; an idle
+    daemon's 21 parked threads were 51,821 off-CPU samples a minute); a thread on the CPU
+    always is, and during a build every blocked thread is, the loop's too. The timer's flush
+    of a quiet history (no build running, none whose row waits) is held up to a minute
+    (`history::IDLE_EVERY`), since each flush is a file a table of several KiB whatever it
+    holds; a reader's ask, a build's start and end, and `FLUSH_ROWS` drained still flush at
+    once, so no reader sees the difference, and a daemon that dies meanwhile leaves the rows
+    in its rings. What a default profile can therefore not answer: where a thread was blocked
+    between builds, by stack (its wait span still says what it waited on and for how long).
+    `BLAZE_PROFILE_DETAIL=full` in the daemon's environment samples them as before. A flush is named for the highest build of its rows, so while
     builds run at once a file named for one holds another's rows: the unit that goes is every
     build whose files chain together through the builds their rows are of (the manifest's
     `builds` of each file), all at once. A unit is as old as its newest flush. Two are never
@@ -1409,15 +1427,19 @@ holds an exclusive lock on (`flight/postmortem.rs`):
 Recording is unchanged: a thread writes its own store with the same atomics, with no system
 call and no allocation, and no row holds an address. Rings made before the history persisted
 move into the file, each by its own thread as it next writes (a ring no thread holds moves at
-once). The file is reserved whole as it is made: its fixed part (about 19.3 MiB) and a store
-for each of the first 256 rings (`MAPPED_RINGS`; each 2 MiB of rows and a 4 KiB head, about
-532 MiB in all), with `posix_fallocate` on Linux and `F_PREALLOCATE` on macOS, so a full disk
-is an error at persist time naming the file and why, never a SIGBUS later. A ring past persist
-takes its store with no system call. There is no heap fallback: a process with more than 256
-rings as it persists refuses to persist (the error names the file), and after it persists a
-thread past the 256th gets no ring (its spans count as ringless) and the next flush reports the
-store as full. The map and the crash records (`crash.<pid>`) count against the history's cap
-(4 GiB), so the files the history keeps plus them stay under it, the newest build excepted. On
+once). The file is mapped with room for 256 stores (`MAPPED_RINGS`; each 2 MiB of rows and a
+4 KiB head) and ends after the last store handed out: its fixed part (about 3.3 MiB) is
+reserved on disk as it is made, a store for each ring there is at persist time, and each later
+ring's store as it is handed out (one system call a ring, `posix_fallocate` on Linux and
+`F_PREALLOCATE` asked for all or nothing on macOS), so no byte of the mapping is written before
+the disk under it is reserved: a full disk is an error naming the file and why, never a SIGBUS
+later. Until 2026-11-11 all 256 stores were reserved up front, 516 MiB a daemon; a daemon on 18
+cores uses 26 rings, 56 MiB. There is no heap fallback: a process with more than 256 rings as
+it persists refuses to persist (the error names the file), and after it persists a thread
+whose store the disk has no room for, or past the 256th, gets no ring (its spans count as
+ringless) and the next flush reports why. The map and the crash records (`crash.<pid>`) count
+against the history's cap (256 MiB, as long as they were at its last recount), so the files the
+history keeps plus them stay under it, the newest build excepted. On
 Windows the history says it can't persist and records as before.
 
 Each flush marks in every store the row it wrote to. A history that opens (and `blaze slow`

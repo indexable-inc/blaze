@@ -258,6 +258,28 @@ moved; the daemon keeps `function -> tests` to find them. This replaces the arme
 | 7 | Selection by marks and traces | a save reruns exactly the tests whose set changed (`blaze-testsel`'s oracle) | `blaze-testsel`'s reached-set path |
 | 8 | Promotion in band 3 and its retreat on an edit | tiers.md's DST | `blaze_stencil::tier`, `Mode::Tiered`, `Choice::then`, `Build::tier_up` |
 
+### What the patch room costs on disk (measured 2026-11-11, lane disk-1111)
+
+Hello-world's `edit` executable on arm64 macOS is 158.5 MB long and holds 23.2 MB on disk:
+`__TEXT` is 83.67 MiB (19.7 MiB of code and its patch region), `__DATA` 64.73 MiB (0.7 MiB and
+its patch region), `__LINKEDIT` 2.57 MiB. The two patch regions are 128 MiB of the file, all
+holes. Each is sized by `blaze-link/src/place.rs` as the image's own code (or data) clamped to
+`PATCH` (64 MiB) below and `PATCH_MAX` (1 GiB) above, so for any program under 64 MiB of code
+the room is a constant 128 MiB whatever the program is, and past that it doubles the file. The
+holes cost nothing on APFS, ext4 or btrfs, and everything where a file is copied without them:
+`cp` without `-c`, an archive, `rsync` without `--sparse`, a network file system, an upload.
+The build directory holds the file twice (`debug/hello` and `debug/build/hello/<id>/out/hello`,
+each its own 23.2 MB on disk, and each `.dSYM` its own 8.1 MB), and the store's
+`placed/*.derived` files are clones of it (450 MB as `du` counts them, 9.6 MB of their own).
+
+Does `edit` still need the room once functions are reached through entry slots? No: from step
+4 a body is bound into the launcher's area in the running process and from step 5 an edit
+replaces a slot's word, so no edit writes new code or data into the executable, and step 5's
+row deletes the patch room and the dev splice for `edit` builds. Until step 5 lands the room
+is what an in-place patch writes into, so it stays; `max` builds' live images keep theirs.
+When step 5 deletes it, the check to add is the file's length: hello-world's `edit`
+executable is under 25 MB long, not 158 MB, and the build directory holds it once.
+
 ## Step 1 as built
 
 `crates/blaze-launch` (`no_std`, on `core` and `alloc`; on bstd once rustc accepts bstd or blaze

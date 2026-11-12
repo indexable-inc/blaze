@@ -547,3 +547,46 @@ fn the_oracle_catches_a_walk_that_runs_a_levels_rows() {
     assert_eq!(take_ran_on(&db).len(), NARROW, "a narrow level's rows run in the walk");
     assert_eq!(db.storage().changed_set_work().marked, 0);
 }
+
+/// 40 rows that read one input, in a level under the walk's serial bound, whose runs all
+/// panic once the input is written: what rows keyed by something an edit removed do (`fn
+/// main` replaced by another function was 83 such rows in a hello-world). Returns the walk's
+/// work and how many of the rows it named.
+fn a_walk_over_rows_whose_runs_panic(plant: Plant) -> (crate::db::ChangedSetWork, usize) {
+    const DEAD: usize = 40;
+    let flow: Vec<FlowNode> = (0..DEAD).map(|_| sum(&[Dep::Input(0)])).collect();
+    let mut db = TestDb::new();
+    db.storage_mut().plant_in_changed_set(plant);
+    *db.flow.lock() = flow;
+    let cells: Vec<Cell> = (0..2).map(|_| Cell::new(&db, 1, 0)).collect();
+    db.cells.lock().extend(cells.iter().map(|it| it.0));
+    for at in 0..DEAD {
+        assert_eq!(*fetch::<Flow>(&db, node(&db, at)), 1);
+    }
+    let since = db.storage().view();
+    // What each row is keyed by is gone: its run reads an input that is not there, and panics.
+    for spec in db.flow.lock().iter_mut() {
+        spec.deps = vec![Dep::Input(0), Dep::Input(99)];
+    }
+    cells[0].set_a(&mut db, 7);
+    let changed = changed_since::<Flow>(&db, since);
+    let Changed::Keys(keys) = changed else { panic!("unknown: {changed:?}") };
+    (db.storage().changed_set_work(), keys.len())
+}
+
+/// The invariant: one walk contains the unwinding of at most 8 verifications (rule 18); the
+/// rows it reaches after that are marked, not run, and every row is still named as changed.
+/// Of 40 rows whose runs panic, 8 are run and 32 marked.
+#[test]
+fn a_walk_contains_at_most_eight_unwinds_and_marks_the_rest() {
+    let (work, named) = a_walk_over_rows_whose_runs_panic(Plant::None);
+    assert_eq!((work.unwound, work.marked, named), (8, 32, 40), "{work:?}");
+}
+
+/// The control of [`a_walk_contains_at_most_eight_unwinds_and_marks_the_rest`]: with the
+/// bound taken out the walk runs every row, and each run panics.
+#[test]
+fn the_oracle_catches_a_walk_that_contains_every_unwind() {
+    let (work, named) = a_walk_over_rows_whose_runs_panic(Plant::ContainsEveryUnwind);
+    assert_eq!((work.unwound, work.marked, named), (40, 0, 40), "{work:?}");
+}

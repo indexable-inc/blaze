@@ -4,7 +4,11 @@
 //! the `git` command as cargo runs it under `net.git-fetch-with-cli`, with the submodules cargo
 //! checks out. It is cloned into a `$CARGO_HOME` of its own under the fetcher's scratch
 //! directory, read whole (every file with its mode, but each `.git`: the clone's own, not the
-//! tree's) and removed; the VFS mounts the tree where the load names it, in cargo's layout under
+//! tree's) and removed. In place of the clone's `.git` the tree has the repository
+//! blaze-registry keeps of a checkout (`git/repository.rs`): the commit, its trees and an
+//! index, the same bytes from every fetch, so that a build script of the package that asks
+//! git for its commit is answered as in cargo's checkout. The VFS mounts the tree where the
+//! load names it, in cargo's layout under
 //! blaze's own sources (`<sources>/git/checkouts/...`), and the daemon writes it there on disk
 //! ([`super::keep_on_disk`]). Nothing is written to the user's `$CARGO_HOME` and no lock
 //! is taken: the plane fetches each source once at a time, and no two fetches share a
@@ -71,7 +75,14 @@ fn checkout<H: Http + 'static>(
             fetch.at
         );
     }
-    read_tree(&checkout.root, |_| false)
+    let mut files = read_tree(&checkout.root, |_| false)?;
+    // The repository kept with the tree, read from the clone before it goes.
+    for (path, bytes) in checkout.repository()? {
+        let bytes = Bytes::copy_kept(blaze_mem::Tag::Vfs, &bytes);
+        files.push(SourceFile { path, bytes, mode: Mode::Regular });
+    }
+    blaze_ids::names::sort_by_name(&mut files, |it| it.path.as_bytes());
+    Ok(files)
 }
 
 /// One fetch's own `$CARGO_HOME`, removed when the fetch is over.

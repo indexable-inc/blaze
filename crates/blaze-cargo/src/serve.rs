@@ -31,6 +31,15 @@ mod image;
 #[cfg(all(unix, feature = "native"))]
 pub(crate) mod inspect;
 mod job;
+#[cfg(unix)]
+pub(crate) mod log;
+/// Where no daemon is started with its output in `serve.log` (the start is unix's,
+/// `blaze_client::start`), there is no log to bound.
+#[cfg(not(unix))]
+pub(crate) mod log {
+    pub fn bound(_state: &std::path::Path) {}
+    pub fn check() {}
+}
 #[cfg(all(unix, feature = "native"))]
 mod machine;
 mod mounts;
@@ -1072,6 +1081,7 @@ pub(crate) fn engine(
     // Where its flight recordings go (`flightrec`): written by whichever thread finds the
     // daemon going down, or by `blaze debug inspect --record`.
     flightrec::arm(&state);
+    log::bound(&state);
     if let Some(parent) = serving.socket.as_deref().and_then(Path::parent) {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("making the socket's directory {}", parent.display()))?;

@@ -365,7 +365,19 @@ and begun afresh, never silently.
 
 - Eviction inside a store (`crates/blaze-cas` units and packs, least recently used): it needs the
   store to drop units from its index before their packs go; settling already retires half-dead
-  packs.
+  packs. What it costs today (measured 2026-11-11, lane disk-1111): the daemon's store
+  (`<root>/v2/store`) only grows. Hello-world's after a cold build and five edits is 174 MB:
+  six whole files of front-end records (`Query`, kept as files of their own: 85.7 MB, the
+  largest 51.6 MB), one whole `Derived` file (21.1 MB) and a pack of 93 MB (`Query` 43.5 MB in
+  13,304 records, `Code` 26.3 MB in 12,207 of which 6.5 MB repeat another record's content,
+  `Derived` recipes 21.7 MB in 20, about 1.1 MB an edit, `Debug` 1.3 MB). Nothing in it is
+  compressed (the cold tier has not settled anything yet): zstd -3 takes the pack to 18.3 MB
+  and the largest file to 5.7 MB. Every record's key covers the code of what made it, so a
+  rebuilt blaze reads none of an older one's: a home used by rebuilt compilers for a day held
+  2.2 GB, 85 whole files of 54 MB each among them, none of which any installed blaze could
+  read. The design that fits: the store's directory named for the makers' identity
+  (`v2/store-<makers>`, as `std/<makers>` is), so a store no installed blaze reads is a
+  directory the collector already knows how to lease, age out and trash whole.
 - A build out of space is recognised by the OS error's code in its error's text (`(os error
   28)`); one whose error lost that text is not held. The code does not travel through the API's
   error type, so the volume is found from the error's place (`ApiError::at`), and an error

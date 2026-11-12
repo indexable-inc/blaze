@@ -16,6 +16,8 @@
 //! each run after the first makes its own, from the check the one before kept or, where that
 //! one unwound, from the check it was made from, which its drop puts back. What codegen
 //! reached before is not told to the new plan: it orders the check and changes none of it.
+//! The same holds for a first run that begins in a later view than the one the [`Checking`]
+//! was made in: a plan that keeps runs only in its own view ([`Plan::made_in`]).
 
 use std::sync::{
     Arc,
@@ -67,23 +69,33 @@ impl Checking {
     /// body is checked; a codegen beside it is told, from then, whether it failed.
     ///
     /// One run at a time, as a unit's [`Phase::Bodies`](crate::serve::work::Phase) is one
-    /// task. A run after one that began (it gave way and was posted again) checks with a plan
-    /// of its own, made here in the view it runs in: the module says why.
+    /// task. A run after one that began (it gave way and was posted again), and a first run
+    /// in a later view than `new`'s, checks with a plan of its own, made here in the view it
+    /// runs in: the module says why.
     pub(crate) fn check(&self, db: &Db, files: Files<'_>, options: &Options) -> CrateCheck {
-        let plan = if self.begun.swap(true, Ordering::AcqRel) {
-            // The spent plan goes first, so the kept check it holds, if its run unwound, is
-            // back before the next plan asks for it.
-            let spent = self.plan.lock().take();
-            drop(spent);
-            // alloc: once per run of a unit's check posted again
-            let plan = Arc::new(Plan::of_every_body(db, &[self.krate], false));
-            // clone: a refcount, once per run posted again
-            *self.plan.lock() = Some(plan.clone());
-            plan
-        } else {
+        // The plan `new` made is of the view the unit's names were done in. Its check starts
+        // when a worker takes it, and by then the database may be at a later view (another
+        // unit's sources were set: a cold build of a large workspace does it between the two
+        // for some unit), where that plan does not run: what it visits is the changed set up
+        // to its own view.
+        let made = match self.begun.swap(true, Ordering::AcqRel) {
+            true => None,
             // clone: a refcount, once per unit checked
-            let plan = self.plan.lock().clone();
-            plan.expect("a check's first run finds the plan it was made with")
+            false => self.plan.lock().clone().filter(|plan| plan.made_in(db)),
+        };
+        let plan = match made {
+            Some(plan) => plan,
+            None => {
+                // The spent or stale plan goes first, so the kept check it holds, if its run
+                // unwound or never began, is back before the next plan asks for it.
+                let spent = self.plan.lock().take();
+                drop(spent);
+                // alloc: once per run of a unit's check posted again or begun in a later view
+                let plan = Arc::new(Plan::of_every_body(db, &[self.krate], false));
+                // clone: a refcount, once per such run
+                *self.plan.lock() = Some(plan.clone());
+                plan
+            }
         };
         let check = blaze_diagnostics::check_planned(db, self.krate, &*plan, files, options);
         if failed(&check.diags) {

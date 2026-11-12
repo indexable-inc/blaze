@@ -37,7 +37,8 @@
 //! edit removed): a pull would never run it. So a verification that unwinds for any reason
 //! but the caller's own (a write pending, its fuel) is contained: the engine's guard puts the
 //! row's word back, the walk counts it, names it as changed and goes on, and does not ask it
-//! again until something else brought it up to date ([`Walked::apart`]).
+//! again until something else brought it up to date ([`Walked::apart`]). A walk contains at
+//! most [`UNWOUND_MOST`] of them: past that it marks what it reaches, verifying nothing.
 //!
 //! Persistence: none. The storage is memory (a restart makes another storage), and the index
 //! is made from the rows' own edges: empty with an empty storage, it holds the invariant from
@@ -47,7 +48,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::{
         Arc,
-        atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -148,6 +149,25 @@ fn merge_oldest(log: &mut Vec<Arc<Found>>) {
 /// too, which may be unchanged (a name too many costs its host one ask).
 const WIDE: usize = 64;
 
+/// The verifications one walk contains the unwinding of before it stops verifying: from the
+/// row after the last of them it marks, as past a wide level ([`WIDE`]), and warns once.
+///
+/// Why. A row the walk reaches may be keyed by something an edit removed (a function taken
+/// out of a file, a module gone from a def map): nothing would ask for it, its run panics,
+/// and so does the run of every row that reads it. Each panic costs its hook (a stack
+/// walked and written to the daemon's log and the flight recorder), and nothing bounded how
+/// many one walk met: `fn main` replaced by another function in a hello-world was 83 in one
+/// build (2026-11-11, 54 "Can't find ast id" and 29 "is outside fn bodies"), and the first
+/// edit after a restart, whose build rewrites 4,722 input fields that 551,000 rows read, was
+/// 40,903 in a request that did not answer in 45 s (30,939 "module ... of an item is not in
+/// its crate's def map", 9,356 "ModuleId not found in ModulesMap"). A walk that has met this
+/// many is looking at rows of something removed: the rest are left to whoever asks for them,
+/// who asks only for rows of things that are still there.
+///
+/// What stays true is what [`WIDE`] keeps: a marked row is never taken as clean and is named
+/// as changed. Bounded progress (rule 18): the unwinds a walk contains are at most this.
+const UNWOUND_MOST: u64 = 8;
+
 /// What the walks keep between them. Its vectors are taken out by the walker (the holder of
 /// the walk's flight) and put back, so the lock is held for moves only.
 #[derive(Default)]
@@ -188,7 +208,8 @@ pub struct ChangedSetWork {
     /// Verifications that unwound and were contained.
     pub unwound: u64,
     /// Rows marked unverified: those of the first wide level ([`WIDE`] rows) and every row
-    /// reached past it. 0 for an edit whose every level is narrow.
+    /// reached past it, or past the walk's most unwinds ([`UNWOUND_MOST`]). 0 for an edit
+    /// whose every level is narrow and whose rows verify.
     pub marked: u64,
 }
 
@@ -213,6 +234,9 @@ pub(crate) enum Plant {
     /// written nor those of a row a pull ran and found changed are asked, so nothing the
     /// walk alone would find is found.
     ForgetsReadersOfWritten,
+    /// The walk goes on verifying however many verifications unwound ([`UNWOUND_MOST`]
+    /// taken out): a panic a row for everything keyed by what an edit removed.
+    ContainsEveryUnwind,
 }
 
 /// The storage's part of the changed set.
@@ -728,8 +752,13 @@ fn walk(db: *const (), storage: &Storage) {
     // The rows set apart, by node: those kept from the walks before and this walk's.
     let mut apart_now = Seen::with_hasher(blaze_hash::FixedState);
     apart_now.extend(unwound.iter().map(|it| it.0)); // alloc: as above
-    // Whether a wide level was met: from it on the walk marks and verifies nothing.
+    // Whether a wide level was met, or the walk's most unwinds: from then on it marks and
+    // verifies nothing.
     let mut broad = false;
+    let unwound_most = match plant {
+        Plant::ContainsEveryUnwind => u64::MAX,
+        _ => UNWOUND_MOST,
+    };
     let mut first = true;
     loop {
         // What said it changed, by this walk's verifications or by any pull since the last.
@@ -785,23 +814,47 @@ fn walk(db: *const (), storage: &Storage) {
             suspects.clear();
             continue;
         }
-        let seen: Vec<AtomicU8> = suspects.iter().map(|_| AtomicU8::new(0)).collect(); // alloc: as above
-        let one = |at: usize| {
-            seen[at].store(verify(db, storage, suspects[at], plant) as u8, Ordering::Relaxed);
-        };
-        (0..suspects.len()).for_each(one);
-        for (at, &node) in suspects.iter().enumerate() {
-            let seen = seen[at].load(Ordering::Relaxed);
-            if seen == Seen1::Unsure as u8 || seen == Seen1::Unwound as u8 {
+        // A narrow level: verified here, one row after the other, until the walk has
+        // contained its most unwinds ([`UNWOUND_MOST`]); the rows after that are marked.
+        let view_bits = storage.view_bits();
+        for &node in &suspects {
+            if work.unwound >= unwound_most {
+                let Some((header, _, _)) = row_of(storage, node) else { continue };
+                let word = header.verified.load(Ordering::Acquire);
+                if word & (VIEW_MASK | RUNNING | PROVISIONAL) == 0 {
+                    continue;
+                }
+                if word & (RUNNING | PROVISIONAL) == 0 && word & VIEW_MASK == view_bits {
+                    continue;
+                }
+                changed.push(node);
+                found.push(node);
+                if apart_now.insert(node) {
+                    unwound.push((node, word)); // alloc: as above
+                }
+                work.marked += 1;
+                continue;
+            }
+            let seen = verify(db, storage, node, plant);
+            if seen == Seen1::Unsure || seen == Seen1::Unwound {
                 changed.push(node);
                 found.push(node);
             }
-            if seen == Seen1::Unwound as u8 {
+            if seen == Seen1::Unwound {
                 work.unwound += 1;
                 if let Some((header, _, _)) = row_of(storage, node)
                     && apart_now.insert(node)
                 {
                     unwound.push((node, header.verified.load(Ordering::Acquire))); // alloc: as above
+                }
+                if work.unwound == unwound_most {
+                    broad = true;
+                    tracing::warn!(
+                        target: "blaze",
+                        view,
+                        unwound = work.unwound,
+                        "the changed-set walk contained its most verifications that unwound: the rows it reaches from here are marked, not verified, and left to whoever asks for them"
+                    );
                 }
             }
         }
